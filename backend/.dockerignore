@@ -5,5 +5,8 @@ target
 *.iml
 **/.env
 **/.env.*
-!.env.example
+**/*.env.local
+**/fixtures/customer-issuer-*.jwks.json
+!**/.env.example
+!**/*.env.example
 .DS_Store

@@ -76,6 +76,28 @@ docker compose --env-file infrastructure/.env -f infrastructure/compose.yaml ps
 
 Admin: http://localhost:3000. API: http://localhost:8080. Demo: http://localhost:3001. Readiness includes database connectivity; an unavailable callback destination does not make the backend unready.
 
+## Stripe Sandbox configuration (Stage 5A preparation)
+
+The optional Sandbox overlay prepares backend configuration only. It does not establish a working Stripe backend until the Stage 5A adapter is implemented and verified. The default Compose file continues to use Fake without Stripe keys; the overlay also retains `PAYMENT_PROVIDER=fake` while enabling the separate Sandbox marker and `local,stripe-sandbox` profiles. Fake subscriptions continue to work; Stripe subscriptions require Stage 5B. This setup never enables live payments, Connect, Managed Payments, or business activation for real money.
+
+Create the separate private file from the project root:
+
+```bash
+node infrastructure/init-stripe-sandbox-env.mjs
+```
+
+The initializer prints only `created` or `preserved`, creates new files exclusively with mode `0600`, and preserves existing regular files byte for byte. Symlinks and other file types are rejected. If an existing file has broader permissions, it warns without changing them; restrict permissions to `0600` before adding or loading keys. The destination is fixed relative to the initializer, independent of the current directory. This command never reads or changes `infrastructure/.env`.
+
+Fill in `infrastructure/stripe-sandbox.env.local` using a local editor: `PAYMENT_STRIPE_SANDBOX_SECRET_KEY` (Sandbox secret key), `PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY` (Sandbox publishable key), and `PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET` (Sandbox webhook signing secret). Use only test credentials from the intended Stripe Sandbox. Never send values in chat, commit the file, or expose keys through shell tracing, arguments, URLs, browser code, logs, or reports. The file is ignored by Git and excluded from every Docker build context, along with local issuer fixtures; example templates remain publishable.
+
+After the adapter is available, explicitly opt in by supplying both environment files and the overlay. Preserve your existing base configuration:
+
+```bash
+docker compose --env-file infrastructure/.env --env-file infrastructure/stripe-sandbox.env.local -f infrastructure/compose.yaml -f infrastructure/compose.stripe-sandbox.yaml config --quiet
+```
+
+All three Sandbox values are required and passed only to the backend; Admin and demo receive none. `config --quiet` validates without printing an expanded configuration. Do not run plain `config` with private credentials. Starting the Sandbox stack or executing Stripe smoke requires the separately reviewed adapter and an explicit opt-in with agreed test fixtures.
+
 ## Admin, SDK and payment journeys
 
 1. Authenticate in the admin and select an existing FAKE/SANDBOX account (or provision one through the admin account API).
