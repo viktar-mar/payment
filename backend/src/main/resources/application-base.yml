@@ -1,0 +1,61 @@
+spring:
+  application:
+    name: payment-platform-backend
+  datasource:
+    url: ${PAYMENT_DB_URL:jdbc:postgresql://localhost:5432/payment}
+    username: ${PAYMENT_DB_USERNAME:payment}
+    password: ${PAYMENT_DB_PASSWORD:}
+  flyway:
+    enabled: true
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate.jdbc.time_zone: UTC
+  jackson:
+    time-zone: UTC
+    property-naming-strategy: SNAKE_CASE
+    deserialization:
+      fail-on-unknown-properties: true
+  mvc:
+    problemdetails:
+      enabled: true
+
+logging:
+  pattern:
+    correlation: "[request_id=%X{request_id:-}]"
+
+management:
+  health:
+    # EMAIL_OTP has a bounded configuration-only readiness check below. The
+    # auto-configured mail indicator would open an SMTP connection during a
+    # health request, which is deliberately forbidden for readiness.
+    mail:
+      enabled: false
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,db,customerEmailOtpReadiness
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+payment:
+  provider: ${PAYMENT_PROVIDER:fake}
+  telemetry:
+    # Finite deployment allowlist: configure every active Site key (env PAYMENT_TELEMETRY_SITEKEYS).
+    # Empty deliberately fails payment creation/confirmation closed before durable side effects.
+    site-keys: []
+  security:
+    secure-cookie: ${PAYMENT_SECURE_COOKIE:true}
+    idle-timeout: PT8H
+    absolute-timeout: PT24H
+  admin:
+    bootstrap:
+      username: ${PAYMENT_ADMIN_BOOTSTRAP_USERNAME:}
+      password: ${PAYMENT_ADMIN_BOOTSTRAP_PASSWORD:}

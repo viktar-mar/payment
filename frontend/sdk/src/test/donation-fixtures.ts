@@ -1,0 +1,6 @@
+import { wire } from './fixtures.js';
+export const donationInput = { siteKey: 'test-site', campaignKey: 'help-campaign', amountMinor: 4999 };
+export const campaignWire = () => ({ key: 'help-campaign', display_name: 'Help <everyone>', purpose_description: '<b>Plain text</b>', currency: 'EUR', suggested_amounts: [4999, 1000], minimum_amount: 100, maximum_amount: 10000, custom_amount_allowed: true, anonymous_allowed: true });
+export const donationWire = () => ({ ...wire('CREATED'), price: null, donation: { donation_id: '44444444-4444-4444-8444-444444444444', campaign_key: 'help-campaign', campaign_version: 2 } });
+export const donationReadWire = (status = 'PROCESSING') => { const { checkout_token: ignored, donation: context, ...rest } = donationWire(); return { ...rest, status }; };
+export const donationHistoryWire = () => ({ donation_id: '44444444-4444-4444-8444-444444444444', payment_id: '22222222-2222-4222-8222-222222222222', campaign_id: '55555555-5555-4555-8555-555555555555', campaign_key: 'help-campaign', campaign_version: 2, amount_minor: 4999, currency: 'EUR', status: 'SUCCEEDED', message_state: 'PRESENT', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z' });

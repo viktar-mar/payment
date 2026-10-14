@@ -1,0 +1,115 @@
+name: payment-stage-1
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: payment
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: ${PAYMENT_DB_PASSWORD:?set PAYMENT_DB_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment -d payment"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:${PAYMENT_POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - payment-postgres:/var/lib/postgresql
+
+  backend:
+    build: ../backend
+    environment:
+      PAYMENT_DB_URL: jdbc:postgresql://postgres:5432/payment
+      PAYMENT_DB_USERNAME: payment
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD:?set PAYMENT_DB_PASSWORD}
+      PAYMENT_PROVIDER: fake
+      SPRING_PROFILES_ACTIVE: local
+      PAYMENT_CALLBACK_LOCAL_ALLOWED_HOSTS: localhost,127.0.0.1,callback-receiver
+      PAYMENT_DATA_ENCRYPTION_KEY: ${PAYMENT_DATA_ENCRYPTION_KEY:?set local-only PAYMENT_DATA_ENCRYPTION_KEY}
+      PAYMENT_DATA_ENCRYPTION_KEY_VERSION: ${PAYMENT_DATA_ENCRYPTION_KEY_VERSION:-local-v1}
+      PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY: ${PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY:?set local-only PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY}
+      PAYMENT_DONATION_MESSAGE_FINGERPRINT_VERSION: ${PAYMENT_DONATION_MESSAGE_FINGERPRINT_VERSION:-v1}
+      PAYMENT_CUSTOMER_DIGEST_KEY_V1: ${PAYMENT_CUSTOMER_DIGEST_KEY_V1:?set local-only PAYMENT_CUSTOMER_DIGEST_KEY_V1}
+      PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1: ${PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1:?set local-only PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1}
+      PAYMENT_CUSTOMER_DIGEST_ACTIVE_VERSION: ${PAYMENT_CUSTOMER_DIGEST_ACTIVE_VERSION:-v1}
+      PAYMENT_CUSTOMER_HISTORY_CURSOR_ACTIVE_VERSION: ${PAYMENT_CUSTOMER_HISTORY_CURSOR_ACTIVE_VERSION:-v1}
+      PAYMENT_CUSTOMER_LOCAL_ISSUER_ENABLED: "true"
+      PAYMENT_CUSTOMER_LOCAL_ISSUER_PRIVATE_JWK_SET: /app/local-fixtures/customer-issuer-private.jwks.json
+      PAYMENT_SMTP_HOST: mailpit
+      PAYMENT_SMTP_PORT: 1025
+      PAYMENT_SMTP_SENDER_REF: local-default
+      PAYMENT_SMTP_FROM_ADDRESS: no-reply@payment.local
+      PAYMENT_SMTP_STARTTLS: "false"
+      PAYMENT_SMTP_SSL: "false"
+      PAYMENT_FAKE_AUTO_SUCCESS: ${PAYMENT_FAKE_AUTO_SUCCESS:-false}
+      PAYMENT_TELEMETRY_SITEKEYS: ${PAYMENT_TELEMETRY_SITEKEYS:-demo}
+      PAYMENT_SECURE_COOKIE: "false"
+      PAYMENT_ADMIN_BOOTSTRAP_USERNAME: ${PAYMENT_ADMIN_BOOTSTRAP_USERNAME:?set PAYMENT_ADMIN_BOOTSTRAP_USERNAME}
+      PAYMENT_ADMIN_BOOTSTRAP_PASSWORD: ${PAYMENT_ADMIN_BOOTSTRAP_PASSWORD:?set PAYMENT_ADMIN_BOOTSTRAP_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+    volumes:
+      - ./fixtures/customer-issuer-private.jwks.json:/app/local-fixtures/customer-issuer-private.jwks.json:ro
+    ports:
+      - "127.0.0.1:${PAYMENT_BACKEND_HOST_PORT:-8080}:8080"
+
+  mailpit:
+    image: axllent/mailpit:v1.27
+    environment:
+      MP_MAX_MESSAGES: 100
+      MP_DATABASE: /tmp/mailpit.db
+    ports:
+      - "127.0.0.1:${PAYMENT_MAILPIT_HOST_PORT:-28025}:8025"
+      - "127.0.0.1:${PAYMENT_MAILPIT_SMTP_HOST_PORT:-21025}:1025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  admin:
+    build:
+      context: ../frontend
+      dockerfile: admin/Dockerfile
+    environment:
+      BACKEND_INTERNAL_URL: http://backend:8080
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PAYMENT_ADMIN_HOST_PORT:-3000}:3000"
+
+  demo-site:
+    build:
+      context: ..
+      dockerfile: examples/demo-site/Dockerfile
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PAYMENT_DEMO_HOST_PORT:-3001}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  callback-receiver:
+    image: node:24-alpine
+    profiles: ["smoke"]
+    user: node
+    working_dir: /app
+    command: ["node", "/app/callback-receiver.mjs"]
+    volumes:
+      - ./callback-receiver.mjs:/app/callback-receiver.mjs:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  payment-postgres:

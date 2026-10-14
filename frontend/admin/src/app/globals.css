@@ -1,0 +1,110 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    @apply bg-slate-100 text-slate-900 antialiased;
+    font-family: Arial, Helvetica, sans-serif;
+  }
+  h1 {
+    @apply text-3xl font-semibold tracking-tight;
+  }
+  h2 {
+    @apply mb-3 text-xl font-semibold;
+  }
+  h3 {
+    @apply font-semibold;
+  }
+  a {
+    @apply text-blue-800 underline underline-offset-4;
+  }
+  button {
+    @apply rounded-md bg-slate-900 px-4 py-2 font-medium text-white disabled:cursor-wait disabled:opacity-50;
+  }
+  input:not([type="checkbox"]),
+  select,
+  textarea {
+    @apply mt-1 block w-full rounded-md border border-slate-400 bg-white px-3 py-2 text-base;
+  }
+  input[type="checkbox"] {
+    @apply size-4 accent-blue-700;
+  }
+  label,
+  legend {
+    @apply font-medium;
+  }
+  :focus-visible {
+    @apply outline-3 outline-offset-3 outline-blue-600;
+  }
+  [role="alert"] {
+    @apply rounded-md border border-red-300 bg-red-50 p-3 text-red-900;
+  }
+}
+@layer components {
+  .surface {
+    @apply rounded-lg border border-slate-200 bg-white p-5 sm:p-6;
+  }
+  .form-stack {
+    @apply flex max-w-xl flex-col gap-4;
+  }
+  .check {
+    @apply mt-2 flex items-center gap-2;
+  }
+  .details {
+    @apply mt-4 grid grid-cols-1 gap-x-6 gap-y-1 text-sm sm:grid-cols-[9rem_1fr];
+  }
+  .details dt {
+    @apply font-medium text-slate-600;
+  }
+  .details dd {
+    @apply break-words;
+  }
+  .price-row {
+    @apply my-4 space-y-2 rounded-md border border-slate-300 p-4;
+  }
+  .badge {
+    @apply inline-block rounded bg-slate-200 px-2 py-1 text-xs font-bold text-slate-800;
+  }
+  .status-draft {
+    @apply bg-amber-100 text-amber-900;
+  }
+  .status-published {
+    @apply bg-emerald-100 text-emerald-900;
+  }
+  .status-archived {
+    @apply bg-slate-200 text-slate-700;
+  }
+  .status-created, .status-pending, .status-processing { @apply bg-blue-100 text-blue-900; }
+  .status-requires_payment_method, .status-requires_action, .status-unknown { @apply bg-amber-100 text-amber-900; }
+  .status-succeeded, .status-delivered { @apply bg-emerald-100 text-emerald-900; }
+  .status-partially_refunded, .status-refunded { @apply bg-violet-100 text-violet-900; }
+  .status-failed, .status-dead { @apply bg-red-100 text-red-900; }
+  .status-cancelled, .status-fallback { @apply bg-slate-200 text-slate-800; }
+  .filter-grid { @apply grid gap-4 sm:grid-cols-2; }
+  .detail-pair { display: contents; }
+  .payment-table-wrap { overflow-wrap: anywhere; }
+  .payment-table { width: 100%; border-collapse: collapse; }
+  .payment-table caption { text-align: left; font-weight: bold; margin-bottom: 1rem; }
+  .payment-table th, .payment-table td { text-align: left; padding: .5rem; border-bottom: 1px solid #cbd5e1; }
+  @media (max-width: 640px) {
+    /* One semantic representation: the labelled table becomes stacked rows, with no duplicate links/content. */
+    .payment-table thead { position: absolute; width: 1px; height: 1px; clip-path: inset(50%); overflow: hidden; }
+    .payment-table tbody, .payment-table tr, .payment-table td { display: block; }
+    .payment-table tr { border: 1px solid #cbd5e1; margin-bottom: 1rem; }
+    .payment-table td::before { content: attr(data-label) ": "; font-weight: bold; }
+  }
+  .hint {
+    @apply text-sm text-slate-600;
+  }
+  .dialog {
+    @apply fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4;
+  }
+  .dialog .surface {
+    @apply max-h-[90vh] w-full max-w-lg space-y-4 overflow-y-auto;
+  }
+  .skip-link {
+    @apply sr-only focus:not-sr-only focus:absolute focus:z-50 focus:bg-white focus:p-4;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}

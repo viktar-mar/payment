@@ -1,0 +1,34 @@
+package dev.genericpayments.platform.subscriptions.application.service;
+import dev.genericpayments.platform.subscriptions.application.port.in.SetupSubscriptionMethodUseCase;
+import dev.genericpayments.platform.subscriptions.application.model.SubscriptionOperationResult;
+import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
+import dev.genericpayments.platform.subscriptions.application.port.in.GetSubscriptionActionUseCase;
+import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionProviderRegistry;
+import dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation;
+@org.springframework.stereotype.Service
+public class SubscriptionMethodService implements SetupSubscriptionMethodUseCase {
+    private final SubscriptionInteractionTransaction phases;private final SubscriptionProviderRegistry providers;private final GetSubscriptionActionUseCase actions;
+    public SubscriptionMethodService(SubscriptionInteractionTransaction phases,SubscriptionProviderRegistry providers,GetSubscriptionActionUseCase actions){this.phases=phases;this.providers=providers;this.actions=actions;}
+    public SubscriptionOperationResult setup(Command command){
+        SubscriptionInteractionTransaction.validateKey(command.context());
+        if(!command.recurringConsent())throw SubscriptionRuleErrors.conflict();
+        var original=phases.originalCreate(command.context(),command.subscriptionId());
+        if(original!=null){
+            var action=actions.get(new GetSubscriptionActionUseCase.Query(command.context(),command.subscriptionId(),original.operation().id()));
+            if(action!=null)return SubscriptionInteractionTransaction.result(original.operation(),action);
+            if(original.operation().status()!=SubscriptionOperation.Status.FAILED)return SubscriptionInteractionTransaction.result(original.operation(),null);
+            return dispatch(command,original);
+        }
+        var candidate=phases.candidate(command.context(),command.subscriptionId());
+        if(!providers.forAccount(candidate.account()).capabilities(candidate.account()).setup())throw SubscriptionRuleErrors.conflict();
+        var r=phases.reserve(command.context(),command.subscriptionId(),SubscriptionOperation.Kind.SETUP,
+            SubscriptionInteractionTransaction.request(command.context(),"SETUP",command.subscriptionId(),true),candidate);
+        if(!r.owner())return SubscriptionInteractionTransaction.result(r.operation(),actions.get(new GetSubscriptionActionUseCase.Query(command.context(),command.subscriptionId(),r.operation().id())));
+        return dispatch(command,r);
+    }
+    private SubscriptionOperationResult dispatch(Command c,SubscriptionInteractionTransaction.State r){
+        Reply reply;try{reply=providers.forAccount(r.account()).setup(SubscriptionInteractionTransaction.command(r));}
+        catch(RuntimeException uncertain){reply=new Reply(Outcome.UNKNOWN,r.subscription().providerReference(),null);}
+        return phases.reply(c.context(),r,reply);
+    }
+}

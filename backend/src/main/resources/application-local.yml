@@ -1,0 +1,24 @@
+payment:
+  customer-local-issuer:
+    enabled: ${PAYMENT_CUSTOMER_LOCAL_ISSUER_ENABLED:false}
+    private-jwk-set: ${PAYMENT_CUSTOMER_LOCAL_ISSUER_PRIVATE_JWK_SET:}
+  callbacks:
+    local-host-allowlist: [localhost, 127.0.0.1, callback-receiver]
+  customer-email-otp:
+    smtp:
+      host: mailpit
+      port: 1025
+      username: ""
+      password: ""
+      sender-ref: local-default
+      from-address: no-reply@payment.local
+      start-tls-enabled: false
+      ssl-enabled: false
+spring:
+  mail:
+    host: mailpit
+    port: 1025
+    properties:
+      mail.smtp.auth: false
+      mail.smtp.starttls.enable: false
+      mail.smtp.ssl.enable: false

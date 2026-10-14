@@ -1,0 +1,29 @@
+{
+  "name": "@generic-payments/sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/jest-dom": "6.10.0",
+    "@testing-library/user-event": "14.6.7",
+    "jsdom": "27.4.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  }
+}

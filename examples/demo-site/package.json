@@ -1,0 +1,22 @@
+{
+  "name": "@generic-payments/demo-site",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "dev": "vite --host 127.0.0.1 --port 4173 --strictPort",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@generic-payments/sdk": "file:../../frontend/sdk"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "25.9.6",
+    "postgres": "3.4.7",
+    "typescript": "5.9.3",
+    "vite": "8.3.0"
+  },
+  "packageManager": "pnpm@11.1.3"
+}

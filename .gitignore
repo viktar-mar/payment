@@ -1,0 +1,84 @@
+# Dependencies and package-manager caches
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/cache/
+.yarn/unplugged/
+
+# Maven, Next.js, SDK/demo builds and incremental caches
+target/
+.next/
+out/
+dist/
+build/
+.cache/
+.turbo/
+.vite/
+*.tsbuildinfo
+*.class
+*.hprof
+
+# Local credentials: commit only explicitly named example templates
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!*.env.example
+secrets/
+credentials/
+.aws/
+.ssh/
+.stripe/
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.kdbx
+
+# Generate local-only issuer keys after cloning; never publish private material
+/infrastructure/fixtures/customer-issuer-private.jwks.json
+/infrastructure/fixtures/customer-issuer-public.jwks.json
+
+# Local execution/review evidence and agent-specific state
+.superpowers/
+.agents/
+.codex/
+
+# Test results can contain authentication, customer or payment information
+coverage/
+.nyc_output/
+.vitest/
+test-results/
+playwright-report/
+blob-report/
+traces/
+screenshots/
+videos/
+*.webm
+*.trace
+
+# Runtime data, database backups and temporary files
+*.log
+*.pid
+*.pid.lock
+*.tmp
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sql.gz
+*.dump
+/tmp/
+/temp/
+
+# Workstation/editor files
+.DS_Store
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~

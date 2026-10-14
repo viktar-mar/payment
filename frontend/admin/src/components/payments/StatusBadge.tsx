@@ -1,0 +1,2 @@
+const known = new Set(["CREATED", "REQUIRES_PAYMENT_METHOD", "REQUIRES_ACTION", "PROCESSING", "SUCCEEDED", "FAILED", "CANCELLED", "PARTIALLY_REFUNDED", "REFUNDED", "UNKNOWN", "PENDING", "DELIVERED", "DEAD"]);
+export function StatusBadge({ status }: { status?: string }) { return <span className={`badge status-${status && known.has(status) ? status.toLowerCase() : "fallback"}`}>{status ?? "Unknown"}</span>; }

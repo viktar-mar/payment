@@ -1,0 +1,12 @@
+**/node_modules
+**/.next
+**/target
+**/*.tsbuildinfo
+.git
+**/.idea
+**/.vscode
+**/*.iml
+**/.env
+**/.env.*
+!**/.env.example
+**/.DS_Store

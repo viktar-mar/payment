@@ -1,0 +1,10 @@
+export const base = "https://api.test";
+export const customerToken = "C".repeat(43);
+export const authInput = { siteKey: "test-site", providerKey: "site-token", token: "source-secret", intent: "AUTHENTICATE" as const };
+export const id = "11111111-1111-4111-8111-111111111111";
+export const future = () => new Date(Date.now() + 3600000).toISOString();
+export const customerScopes = ['CUSTOMER_READ', 'CHECKOUT_CREATE', 'IDENTITY_LINK'] as const;
+export const subscriptionCustomerScopes = [...customerScopes, 'SUBSCRIPTION_READ', 'SUBSCRIPTION_MANAGE'] as const;
+export const customerWire = () => ({ session_token: customerToken, expires_at: future(), scopes: [...customerScopes], customer: { id, status: "ACTIVE", masked_email: null } });
+export const sessionKey = () => `generic-payments:customer:v1:${encodeURIComponent(base)}:test-site:${encodeURIComponent(location.origin)}`;
+export const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });

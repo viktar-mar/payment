@@ -1,0 +1,108 @@
+<!doctype html>
+<html
+  lang="en"
+  data-api-base-url="http://127.0.0.1:8080"
+  data-site-key="replace-with-a-public-site-key"
+  data-price-key="one-time-demo-price"
+  data-locale="en-GB"
+>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="referrer" content="no-referrer" />
+    <meta
+      name="description"
+      content="A minimal integration example for the Generic Payments one-time checkout widget."
+    />
+    <title>Generic Payments one-time checkout demo</title>
+  </head>
+  <body>
+    <main class="demo-shell">
+      <header class="demo-header">
+        <p class="eyebrow">Generic Payments SDK</p>
+        <h1>One-time payment demo</h1>
+        <p class="lede">
+          This page mounts the real SDK widget against the public checkout API. Reloading
+          the page resumes an unexpired checkout from this browser session.
+        </p>
+      </header>
+
+      <section id="customer-access" class="product-card" aria-labelledby="customer-title">
+        <h2 id="customer-title">Customer access</h2>
+        <p>Email sign-in is optional. Your host Site owns any Google, Apple or other OAuth screens.</p>
+        <generic-email-otp id="customer-login"></generic-email-otp>
+        <p id="customer-summary" role="status" aria-live="polite">Not signed in.</p>
+        <div class="customer-actions">
+          <button id="customer-pay" type="button" disabled>Pay as Customer</button>
+          <button id="guest-pay" type="button">Pay as guest</button>
+          <button id="customer-history" type="button" disabled>Load my payments</button>
+          <button id="customer-donation-history" type="button" disabled>Load my donations</button>
+          <button id="customer-logout" type="button" disabled>Log out</button>
+        </div>
+        <p id="customer-action-status" role="status" aria-live="polite"></p>
+        <ul id="customer-payments" aria-label="My payments"></ul>
+        <ul id="customer-donations" aria-label="My donations"></ul>
+      </section>
+
+      <section id="donation-section" class="product-card" aria-labelledby="donation-title" hidden>
+        <h2 id="donation-title">One-time donation</h2>
+        <p>Default mode uses a valid Customer login, or donates anonymously when none exists. Invalid sessions fail closed.</p>
+        <label><input id="donation-anonymous" type="checkbox" /> Intentionally donate anonymously</label>
+        <generic-donation id="donation-widget"></generic-donation>
+        <p>Creation is local checkout preparation, not payment success. Reload restores Customer login, but starts a new Donation checkout. Donor messages are never stored in this browser.</p>
+      </section>
+
+      <section class="product-card" aria-labelledby="product-title">
+        <div class="product-summary">
+          <div>
+            <p class="section-label">Example product</p>
+            <h2 id="product-title">Single purchase</h2>
+            <p class="product-copy">A display-only product summary for this integration example.</p>
+          </div>
+          <p class="price" aria-label="49 euros and 99 cents">
+            <data value="49.99">€49.99</data>
+            <abbr title="Euro">EUR</abbr>
+          </p>
+        </div>
+
+        <p class="price-note">
+          The displayed amount is never submitted by the browser. The server resolves the
+          configured price key.
+        </p>
+
+        <div class="checkout-frame">
+          <generic-payment-widget id="checkout-widget"></generic-payment-widget>
+        </div>
+
+        <p id="configuration-message" class="configuration-message" hidden>
+          The public demo configuration is invalid. Check the documented setup values.
+        </p>
+        <p id="checkout-explanation" class="checkout-explanation">
+          The widget reports checkout progress without exposing checkout credentials.
+        </p>
+      </section>
+
+      <aside id="integration-boundary" class="trust-note" aria-labelledby="trust-title">
+        <h2 id="trust-title">Integration boundary</h2>
+        <p>Fulfillment must wait for trusted server-side payment status.</p>
+        <p>Confirm fulfillment through a trusted signed callback or Partner API read on your server.</p>
+        <p>Browser success is user experience feedback, not fulfillment authority.</p>
+      </aside>
+
+      <section id="integration-reference" class="integration-reference" aria-labelledby="reference-title">
+        <h2 id="reference-title">Integration reference</h2>
+        <p>
+          Configure only the public API base URL, public site key, server-owned price key,
+          and locale. Keep fulfillment and every administrative credential on a trusted server.
+        </p>
+      </section>
+
+      <nav class="docs-links" aria-label="Integration documentation">
+        <a href="#integration-reference">SDK integration reference</a>
+        <a href="#integration-boundary">Payment trust boundary</a>
+      </nav>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

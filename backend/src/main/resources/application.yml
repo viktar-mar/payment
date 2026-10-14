@@ -1,0 +1,97 @@
+spring:
+  config:
+    import: classpath:application-base.yml
+  mail:
+    host: ${PAYMENT_SMTP_HOST:localhost}
+    port: ${PAYMENT_SMTP_PORT:587}
+    username: ${PAYMENT_SMTP_USERNAME:}
+    password: ${PAYMENT_SMTP_PASSWORD:}
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: ${PAYMENT_SMTP_STARTTLS:true}
+      mail.smtp.ssl.enable: ${PAYMENT_SMTP_SSL:false}
+      mail.smtp.connectiontimeout: ${PAYMENT_SMTP_CONNECT_TIMEOUT_MS:2000}
+      mail.smtp.timeout: ${PAYMENT_SMTP_READ_TIMEOUT_MS:5000}
+      mail.smtp.writetimeout: ${PAYMENT_SMTP_WRITE_TIMEOUT_MS:5000}
+payment:
+  donation-message-fingerprint:
+    key-base64: ${PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY:}
+    key-version: ${PAYMENT_DONATION_MESSAGE_FINGERPRINT_VERSION:v1}
+  customer-security:
+    active-key-version: ${PAYMENT_CUSTOMER_DIGEST_ACTIVE_VERSION:v1}
+    known-keys:
+      v1: ${PAYMENT_CUSTOMER_DIGEST_KEY_V1:}
+    # Honored only when every active profile is explicitly local/test; production never permits it.
+    local-jwks-hosts: ""
+  customer-history:
+    cursor:
+      active-key-version: ${PAYMENT_CUSTOMER_HISTORY_CURSOR_ACTIVE_VERSION:v1}
+      known-keys:
+        v1: ${PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1:}
+  customer-authentication:
+    rate-limit:
+      # Per-minute values are both burst capacity and refill per 60s: 1..10000; max-keys: 1..100000.
+      oidc-begin-per-minute: 20
+      oidc-exchange-per-minute: 30
+      site-token-exchange-per-minute: 30
+      site-token-link-proof-per-minute: 20
+      max-keys: 10000
+  customer-email-otp:
+    ttl: PT10M
+    max-attempts: 5
+    resend-cooldown: PT60S
+    trusted-proxy-cidrs: []
+    rate-limit:
+      site-requests: 60
+      email-requests: 5
+      source-ip-requests: 10
+      window: PT10M
+      cleanup-batch: 1000
+    outbox:
+      batch-size: 50
+      lease: PT60S
+      max-attempts: 8
+      maximum-backoff: PT30M
+      terminal-retention: P7D
+      cleanup-batch: 1000
+      challenge-retention: PT24H
+      challenge-cleanup-batch: 1000
+      worker-enabled: true
+      delay: PT1S
+    smtp:
+      host: ${PAYMENT_SMTP_HOST:}
+      port: ${PAYMENT_SMTP_PORT:587}
+      username: ${PAYMENT_SMTP_USERNAME:}
+      password: ${PAYMENT_SMTP_PASSWORD:}
+      sender-ref: ${PAYMENT_SMTP_SENDER_REF:}
+      from-address: ${PAYMENT_SMTP_FROM_ADDRESS:}
+      start-tls-enabled: ${PAYMENT_SMTP_STARTTLS:true}
+      ssl-enabled: ${PAYMENT_SMTP_SSL:false}
+      connect-timeout-ms: ${PAYMENT_SMTP_CONNECT_TIMEOUT_MS:2000}
+      read-timeout-ms: ${PAYMENT_SMTP_READ_TIMEOUT_MS:5000}
+      write-timeout-ms: ${PAYMENT_SMTP_WRITE_TIMEOUT_MS:5000}
+    templates:
+      otp-default:
+        subject: "Your verification code"
+        body: "Your verification code is {{code}}. It expires in {{ttl_minutes}} minutes."
+  callbacks:
+    scheduling-enabled: true
+    batch-size: 20
+    lease-seconds: 120
+    delay-ms: 1000
+    connect-timeout-ms: 2000
+    request-timeout-ms: 5000
+    cleanup-cron: "0 0 4 * * *"
+  public-api:
+    rate-limit:
+      create-per-minute: 20
+      confirm-per-minute: 30
+      read-per-minute: 120
+      max-keys: 10000
+  fake:
+    auto-success: ${PAYMENT_FAKE_AUTO_SUCCESS:false}
+  idempotency:
+    cleanup-cron: "0 0 3 * * *"
+  data-encryption:
+    key-base64: ${PAYMENT_DATA_ENCRYPTION_KEY:}
+    key-version: ${PAYMENT_DATA_ENCRYPTION_KEY_VERSION:local-v1}

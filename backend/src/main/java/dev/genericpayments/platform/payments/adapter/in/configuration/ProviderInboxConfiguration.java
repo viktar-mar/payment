@@ -1,0 +1,18 @@
+package dev.genericpayments.platform.payments.adapter.in.configuration;
+import dev.genericpayments.platform.payments.application.port.out.*;
+import dev.genericpayments.platform.payments.application.service.*;
+import dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort;
+import dev.genericpayments.platform.sites.application.port.out.LoadSitePort;
+import dev.genericpayments.platform.shared.application.port.out.*;
+import java.time.*;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.*;
+@Configuration(proxyBeanMethods=false)
+public class ProviderInboxConfiguration {
+    @Bean ProviderInboxService providerInboxService(ProviderInboxPort inbox,PaymentTransitionPort tx,DigestPort digest,Stage2TelemetryPort telemetry){return new ProviderInboxService(inbox,tx,digest,telemetry);}
+    @Bean RefundTransitionService refundTransitionService(PaymentTransitionPort tx,LoadRefundPort refunds,SaveRefundPort saveRefunds,SavePaymentPort payments,AppendPaymentEventPort events,PaymentOutboxPort outbox,Stage2TelemetryPort telemetry,DigestPort digest,Clock clock){return new RefundTransitionService(tx,refunds,saveRefunds,payments,events,outbox,telemetry,digest,clock);}
+    @Bean RefundCoordinator refundCoordinator(PaymentTransitionPort tx,LoadPaymentPort payments,LoadRefundPort refunds,SaveRefundPort save,LoadSitePort sites,LoadPaymentAccountPort accounts,PaymentProviderRegistry providers,IdempotencyService idem,AppendPaymentEventPort events,AdminPaymentAuditPort audit,RefundTransitionService transitions,Stage2TelemetryPort telemetry,Clock clock){return new RefundCoordinator(tx,payments,refunds,save,sites,accounts,providers,idem,events,audit,transitions,telemetry,clock);}
+    @Bean PaymentTransitionService paymentTransitionService(PaymentTransitionPort tx,ProviderInboxPort inbox,LoadPaymentPort load,SavePaymentPort save,LoadPaymentAttemptPort attempts,SavePaymentAttemptPort saveAttempts,AppendPaymentEventPort events,PaymentOutboxPort outbox,LoadSitePort sites,LoadPaymentAccountPort accounts,Stage2TelemetryPort telemetry,DigestPort digest,Clock clock,RefundTransitionService refunds){var service=new PaymentTransitionService(tx,inbox,load,save,attempts,saveAttempts,events,outbox,sites,accounts,telemetry,digest,clock);service.refunds(refunds);return service;}
+    @Bean ProviderInboxWorker providerInboxWorker(ProviderInboxPort inbox,PaymentTransitionService transitions,PaymentTransitionPort tx,Stage2TelemetryPort telemetry,Clock clock,@Value("${payment.inbox.batch-size:20}")int batch,@Value("${payment.inbox.lease-seconds:30}")long seconds){if(batch<1||batch>100||seconds<1||seconds>600)throw new IllegalArgumentException("Invalid inbox configuration");return new ProviderInboxWorker(inbox,transitions,tx,telemetry,clock,batch,Duration.ofSeconds(seconds));}
+    @Bean ReconcilePaymentService reconcilePaymentService(PaymentTransitionService transitions,PaymentProviderRegistry providers,Stage2TelemetryPort telemetry,Clock clock,@Value("${payment.reconciliation.lease-seconds:30}")long seconds,LoadRefundPort refunds,RefundTransitionService refundTransitions,RefundCoordinator coordinator){var service=new ReconcilePaymentService(transitions,providers,telemetry,clock,Duration.ofSeconds(seconds));service.refunds(refunds,refundTransitions,coordinator);return service;}
+}

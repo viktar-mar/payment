@@ -1,0 +1,5 @@
+package dev.genericpayments.platform.subscriptions.adapter.in.web;
+import dev.genericpayments.platform.subscriptions.application.port.in.*;
+import org.springframework.stereotype.Component;
+@Component
+public record SubscriptionHttpUseCases(QuerySubscriptionsUseCase query,CreateSubscriptionUseCase create,PreviewSubscriptionChangeUseCase preview,ChangeSubscriptionPlanUseCase change,ClearSubscriptionChangeUseCase clear,CancelSubscriptionUseCase cancel,WithdrawSubscriptionCancellationUseCase withdraw,SetupSubscriptionMethodUseCase setup,RecoverSubscriptionUseCase recover,ResumeSubscriptionUseCase resume,GetSubscriptionActionUseCase action,ConfirmSubscriptionActionUseCase confirm,CreateSubscriptionPortalUseCase portal,ReconcileSubscriptionUseCase reconcile){}

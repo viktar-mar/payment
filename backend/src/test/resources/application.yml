@@ -1,0 +1,59 @@
+# Load shared production defaults without shadowing or filesystem dependencies.
+spring:
+  config:
+    import: classpath:application-base.yml
+  mail:
+    host: localhost
+    port: 2525
+    username: test-user
+    password: test-password
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+# Explicit test-only overrides; never packaged into the production artifact.
+payment:
+  subscriptions:
+    scheduling-enabled: false
+  donation-message-fingerprint:
+    key-base64: Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M=
+    key-version: v1
+  customer-security:
+    active-key-version: v1
+    known-keys:
+      v1: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+    local-jwks-hosts: ""
+  customer-history:
+    cursor:
+      active-key-version: v2
+      known-keys:
+        v1: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=
+        v2: QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=
+  callbacks:
+    scheduling-enabled: false
+  inbox:
+    scheduling-enabled: false
+  data-encryption:
+    key-base64: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+    key-version: test-v1
+  idempotency:
+    cleanup-cron: "-"
+  customer-email-otp:
+    trusted-proxy-cidrs: []
+    templates:
+      otp-default:
+        subject: "Your verification code"
+        body: "Your verification code is {{code}}. It expires in {{ttl_minutes}} minutes."
+      otp-alternate:
+        subject: "Alternate verification code"
+        body: "Your alternate code {{code}} expires in {{ttl_minutes}} minutes."
+    outbox:
+      worker-enabled: false
+    smtp:
+      host: localhost
+      port: 2525
+      username: test-user
+      password: test-password
+      sender-ref: test-default
+      from-address: no-reply@example.test
+      start-tls-enabled: true
+      ssl-enabled: false
