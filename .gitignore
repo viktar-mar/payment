@@ -8,7 +8,9 @@ node_modules/
 # Maven, Next.js, SDK/demo builds and incremental caches
 target/
 .next/
-out/
+# Anchor export directories: Java hexagonal adapter/out and port/out are source.
+/out/
+/frontend/admin/out/
 dist/
 build/
 .cache/
