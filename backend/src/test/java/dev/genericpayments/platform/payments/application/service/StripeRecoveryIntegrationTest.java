@@ -24,6 +24,74 @@ class StripeRecoveryIntegrationTest extends StripeInboxFixture {
     @Autowired StripeRecoveryService recovery;
     @Autowired ProviderOperationStore operations;
     @Autowired ProviderRecoveryProofPort proofs;
+    @Autowired PaymentTransitionPort recoveryTransactions;
+
+    @ParameterizedTest
+    @ValueSource(strings = {"payment", "refund"})
+    void manualBindingAndFinancialRecoveryCompleteWithoutOpposingRowLocks(String kind) throws Exception {
+        var refund = kind.equals("refund") ? refundAck("re_concurrent") : null;
+        callback();
+        var operation = refund == null
+                ? operations.findById(operationId()).orElseThrow()
+                : operations.find(account.id(), refund.providerOperationKey()).orElseThrow();
+        var lease = transitions.acquireRecovery(site, original.id(), "concurrent-recovery");
+        if (refund == null) snapshot("succeeded", "ch_paid");
+        else refundTruth(refund, "re_concurrent");
+        var proof = proofs.retrieve(operation);
+        int networkCalls = http.calls().size();
+        var manualPid = new CompletableFuture<Integer>();
+        var continueManual = new CountDownLatch(1);
+
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            var manual = pool.submit(() -> recoveryTransactions.transaction(() -> {
+                // Pause after the real manual boundary's operation -> Account lock prefix.
+                jdbc.queryForObject("select id from provider_operations where id=? for update",
+                        UUID.class, operation.id());
+                jdbc.queryForObject("select id from payment_accounts where id=? for share",
+                        UUID.class, account.id().value());
+                manualPid.complete(jdbc.queryForObject("select pg_backend_pid()", Integer.class));
+                try {
+                    assertThat(continueManual.await(10, TimeUnit.SECONDS)).isTrue();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(interrupted);
+                }
+                operations.lockRecovery(operation);
+                return operations.bindRecoveredInTransaction(
+                        operation, operation.providerReference(), operation.fingerprint());
+            }));
+            int blocker = manualPid.get(5, TimeUnit.SECONDS);
+            var financial = pool.submit(() ->
+                    transitions.reconcileRecovered(lease, proof, "concurrent-recovery"));
+            try {
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                        assertThat(jdbc.queryForObject("""
+                            select exists(select 1 from pg_stat_activity
+                                where ? = any(pg_blocking_pids(pid))
+                                  and wait_event_type='Lock' and query like '%payment_accounts%')
+                            """, Boolean.class, blocker)).isTrue());
+            } finally {
+                continueManual.countDown();
+            }
+            assertThatCode(() -> {
+                assertThat(manual.get(10, TimeUnit.SECONDS)).isEqualTo(operation);
+                assertThat(financial.get(10, TimeUnit.SECONDS).changed()).isTrue();
+            }).doesNotThrowAnyException();
+        }
+
+        assertThat(current().providerPaymentReference()).isEqualTo("pi_owned");
+        assertThat(current().status()).isEqualTo(
+                refund == null ? PaymentStatus.SUCCEEDED : PaymentStatus.PARTIALLY_REFUNDED);
+        assertThat(current().refundedAmountMinor()).isEqualTo(refund == null ? 0 : 700);
+        if (refund != null) {
+            assertThat(refunds.findById(site, refund.id()).orElseThrow().value().providerRefundReference())
+                    .isEqualTo("re_concurrent");
+        }
+        assertThat(count("payment_events")).isEqualTo(1);
+        assertThat(count("outbox_events")).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select reconciliation_lease_owner from payments", String.class)).isNull();
+        assertThat(http.calls()).hasSize(networkCalls);
+    }
 
     Refund refundAck(String reference){
         mapped();original=save.save(original.succeeded(INITIAL_TIME));var id=new RefundId(UUID.randomUUID());

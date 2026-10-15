@@ -175,9 +175,10 @@ public final class PaymentTransitionService {
     public Result reconcileRecovered(Lease lease,ResolvedProviderRecovery proof,String requestId) {
         if(proof.operation().kind()==ProviderOperation.Kind.REFUND_CREATE)return refundTransitions.reconcileRecovered(lease,proof,requestId);
         return tx.transaction(()->{
+            // Match manual recovery's Account -> resource lock order before holding Payment.
+            var account=recoveryAccounts.findByIdForUpdate(lease.payment().paymentAccountId()).orElseThrow(PaymentTransitionService::mismatch);
             var p=load.findByIdForUpdate(lease.payment().siteId(),lease.payment().id()).orElseThrow(PartnerPaymentRules::notFound);
             tx.verifyLease(p,lease.owner(),referenceClock.instant());tx.requireProvider(p.paymentAccountId(),PaymentProviderType.STRIPE);
-            var account=recoveryAccounts.findByIdForUpdate(p.paymentAccountId()).orElseThrow(PaymentTransitionService::mismatch);
             var operation=operations.find(account.id(),ProviderOperationKeys.prepare(p.id())).orElseThrow(PaymentTransitionService::mismatch);
             if(!account.equals(lease.account())||!account.equals(proof.verifiedAccount())||account.status()!=PaymentAccountStatus.ACTIVE
                     ||!sameVerifiedRequest(p,lease.payment())||!sameVerifiedRequest(p,proof.verifiedPayment())
