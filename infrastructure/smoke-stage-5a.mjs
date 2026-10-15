@@ -9,6 +9,7 @@ import {promisify} from 'node:util';
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const KEY=/^[a-z0-9][a-z0-9-]{2,62}$/;
+const INTENT=/^pi_[A-Za-z0-9]{1,252}$/;
 const CASES=['success','decline','sca'];
 const PHASES=['READY','PREPARING','CONFIRMING','RETRYING','SERVER_CONFIRMED'];
 const fail=code=>{throw new Error('stripe_sandbox_'+code);};
@@ -23,7 +24,7 @@ function endpoint(value) {
   try {const u=new URL(value);return u.protocol==='http:'&&u.hostname==='127.0.0.1'&&u.port&&u.origin===value&&!u.username&&!u.password&&!u.search&&!u.hash;}catch{return false;}
 }
 function validate(s,runId) {
-  check(exact(s,['version','runId','owners','endpoints','account','site','price','cases','refunds'])&&s.version===1&&UUID.test(runId)&&s.runId===runId,'STATE');
+  check(exact(s,['version','runId','owners','endpoints','account','site','price','cases','refunds','declineProof'])&&s.version===2&&UUID.test(runId)&&s.runId===runId,'STATE');
   check(exact(s.owners,['project','backend','demo','receiver'])&&/^stripe-[a-z0-9-]{3,50}$/.test(s.owners.project)
     &&['backend','demo','receiver'].every(k=>/^[a-f0-9]{64}$/.test(s.owners[k])),'STATE');
   check(exact(s.endpoints,['backend','demo','receiver'])&&Object.values(s.endpoints).every(endpoint),'STATE');
@@ -32,6 +33,11 @@ function validate(s,runId) {
   check(exact(s.cases,CASES)&&CASES.every(k=>exact(s.cases[k],['paymentId','checkoutId','phase'])&&UUID.test(s.cases[k].paymentId)
     &&UUID.test(s.cases[k].checkoutId)&&PHASES.includes(s.cases[k].phase)),'STATE');
   check(new Set(CASES.map(k=>s.cases[k].paymentId)).size===3&&new Set(CASES.map(k=>s.cases[k].checkoutId)).size===3,'STATE');
+  const proof=s.declineProof,phase=s.cases.decline.phase;
+  if(['READY','PREPARING'].includes(phase))check(proof===null,'STATE');
+  else check(exact(proof,['operationId','intentReference','attemptId','attemptNumber','failedVerified'])&&UUID.test(proof.operationId)
+    &&INTENT.test(proof.intentReference)&&UUID.test(proof.attemptId)&&Number.isSafeInteger(proof.attemptNumber)&&proof.attemptNumber>0
+    &&proof.failedVerified===(phase!=='CONFIRMING'),'STATE');
   check(Array.isArray(s.refunds)&&s.refunds.length===2&&s.refunds.every((r,i)=>exact(r,['amount','key','phase','id'])&&r.amount===[700,1300][i]
     &&UUID.test(r.key)&&['READY','DISPATCHING','ACKNOWLEDGED','CONFIRMED'].includes(r.phase)&&(r.id===null||UUID.test(r.id))
     &&(r.phase!=='READY'||r.id===null)&&(!['ACKNOWLEDGED','CONFIRMED'].includes(r.phase)||r.id!==null))&&s.refunds[0].key!==s.refunds[1].key,'STATE');
@@ -68,7 +74,7 @@ export async function initializeStripeSandboxState(metadata,options={}) {
   let lock,dir;
   try {
     check(exact(metadata,['runId','owners','endpoints','account','site','price','cases']),'STATE');
-    const state={...structuredClone(metadata),version:1,cases:Object.fromEntries(CASES.map(k=>[k,{...metadata.cases[k],phase:'READY'}])),
+    const state={...structuredClone(metadata),version:2,declineProof:null,cases:Object.fromEntries(CASES.map(k=>[k,{...metadata.cases[k],phase:'READY'}])),
       refunds:[700,1300].map(amount=>({amount,key:randomUUID(),phase:'READY',id:null}))};validate(state,state.runId);
     dir=await directory(options.rootDirectory??ROOT,state.runId,true);lock=await open(join(dir,'lock'),'wx',0o600);
     try{await lstat(join(dir,'state.json'));fail('STATE');}catch(e){if(e.code!=='ENOENT')throw e;}
@@ -162,7 +168,32 @@ export async function openStripeSandboxFixture(options={}) {
     }
     async function paymentProof(name,deadline) {
       const d=await detail(name,deadline);
-      return ['SUCCEEDED','PARTIALLY_REFUNDED','REFUNDED'].includes(d.payment.status)&&await eventProof(d,'PAYMENT_SUCCEEDED',2000,undefined,deadline);
+      let reference;
+      if(name==='decline') {
+        check(['RETRYING','SERVER_CONFIRMED'].includes(s.cases.decline.phase)&&s.declineProof?.failedVerified,'PENDING_BROWSER');
+        const original=await declineOperation(deadline);requireDeclineAttempts(d,original.reference);
+        const baseline=d.attempts.find(a=>a.id===s.declineProof.attemptId);
+        check(baseline?.attempt_number===s.declineProof.attemptNumber&&baseline.status==='FAILED'&&baseline.provider_intent_reference===original.reference,'PROOF');
+        reference=original.reference;
+        check(d.events.filter(e=>e.event_type==='PAYMENT_SUCCEEDED').every(e=>e.provider_object_id===reference),'PROOF');
+      }
+      return ['SUCCEEDED','PARTIALLY_REFUNDED','REFUNDED'].includes(d.payment.status)&&await eventProof(d,'PAYMENT_SUCCEEDED',2000,reference,deadline);
+    }
+    async function declineOperation(deadline) {
+      const id=s.cases.decline.paymentId,operations=await read('/api/v1/admin/provider-operations?payment_id='+id,{deadline});
+      check(Array.isArray(operations)&&operations.length<=100,'PROOF');
+      const preparations=operations.filter(o=>o.kind==='PAYMENT_PREPARE');check(preparations.length===1,'PROOF');
+      const op=preparations[0];
+      check(UUID.test(op.operation_id)&&op.payment_id===id&&op.resource_id===id&&op.account_id===s.account.id&&op.account_mode==='SANDBOX'
+        &&op.site_id===s.site.id&&op.status==='ACKNOWLEDGED'&&op.manual_review_required===false&&INTENT.test(op.reference),'BINDING');
+      if(s.declineProof)check(op.operation_id===s.declineProof.operationId&&op.reference===s.declineProof.intentReference,'BINDING');
+      return op;
+    }
+    function requireDeclineAttempts(d,reference) {
+      check(d.attempts.every(a=>UUID.test(a.id)&&Number.isSafeInteger(a.attempt_number)&&a.attempt_number>0
+        &&(a.provider_intent_reference===null||a.provider_intent_reference===reference))
+        &&new Set(d.attempts.map(a=>a.id)).size===d.attempts.length
+        &&new Set(d.attempts.map(a=>a.attempt_number)).size===d.attempts.length,'PROOF');
     }
     async function confirm(name) {
       await poll(budget=>paymentProof(name,budget),'PENDING_PAYMENT');s.cases[name].phase='SERVER_CONFIRMED';await durable(dir,s);return true;
@@ -186,8 +217,24 @@ export async function openStripeSandboxFixture(options={}) {
     }
     async function markPay(name,retry=false) {
       check(CASES.includes(name));const c=s.cases[name];check(c.phase===(retry?'CONFIRMING':'PREPARING'),'PENDING_BROWSER');
-      if(retry)await poll(async budget=>{const d=await detail(name,budget);return d.payment.status==='REQUIRES_PAYMENT_METHOD'&&d.attempts.some(a=>a.status==='FAILED')
-        &&new Set(d.attempts.map(a=>a.provider_intent_reference).filter(Boolean)).size===1;},'MANUAL_CHECK_DECLINE');
+      check(!retry||name==='decline','PENDING_BROWSER');
+      if(name==='decline'&&!retry) {
+        const original=await declineOperation(),d=await detail(name);requireDeclineAttempts(d,original.reference);
+        check(['CREATED','REQUIRES_PAYMENT_METHOD'].includes(d.payment.status)&&d.events.every(e=>e.event_type!=='PAYMENT_SUCCEEDED'),'PENDING_BROWSER');
+        const current=d.attempts.filter(a=>!['SUCCEEDED','FAILED','CANCELLED'].includes(a.status));
+        check(current.length===1&&['CREATED','REQUIRES_PAYMENT_METHOD'].includes(current[0].status)
+          &&current[0].attempt_number===Math.max(...d.attempts.map(a=>a.attempt_number))&&current[0].provider_intent_reference===original.reference,'PENDING_BROWSER');
+        s.declineProof={operationId:original.operation_id,intentReference:original.reference,attemptId:current[0].id,attemptNumber:current[0].attempt_number,failedVerified:false};
+      }
+      if(retry) {
+        await poll(async budget=>{
+          const original=await declineOperation(budget),d=await detail(name,budget);requireDeclineAttempts(d,original.reference);
+          const baseline=d.attempts.find(a=>a.id===s.declineProof.attemptId);
+          return d.payment.status==='REQUIRES_PAYMENT_METHOD'&&d.events.every(e=>e.event_type!=='PAYMENT_SUCCEEDED')
+            &&baseline?.attempt_number===s.declineProof.attemptNumber&&baseline.status==='FAILED'&&baseline.provider_intent_reference===original.reference;
+        },'MANUAL_CHECK_DECLINE');
+        s.declineProof.failedVerified=true;
+      }
       c.phase=retry?'RETRYING':'CONFIRMING';await durable(dir,s);
     }
     async function refunds() {

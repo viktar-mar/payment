@@ -72,7 +72,7 @@ Supply `PAYMENT_SANDBOX_ADMIN_USERNAME`, `PAYMENT_SANDBOX_ADMIN_PASSWORD` and
 `PAYMENT_SANDBOX_SCA_CHECKOUT_TOKEN` through the explicit process environment. Never put values in
 argv, chat, URL, source, logs or the state file. State is fixed at repository-root
 `test-results/stripe-sandbox/<run UUID>/state.json`, mode 0600 in an owner-only directory. It retains
-only safe identity, fixed refund keys, safe refund IDs and phases. Node and browser share its exclusive
+only safe identity, fixed refund keys, safe refund IDs, phases and server-derived decline proof. Node and browser share its exclusive
 lock; no concurrent run and no automatic stale-lock removal. After a crash, establish that the old
 owner has stopped and inspect the state before manually releasing its lock; preserve all keys/phases.
 
@@ -91,6 +91,16 @@ as manual-check/PENDING; no mocked success fallback. Browser recovery uses the e
 catalog read/explicit Resume; its checkout token is only in the ephemeral browser context. PREPARING
 is persisted before navigation/client-session, CONFIRMING/RETRYING before each Pay. Interrupted phases
 permit server proof inspection only; they never automatically repeat preparation or confirmation.
+
+State version 2 records the decline journey's original protected `PAYMENT_PREPARE` operation ID/intent
+reference and unique current attempt ID/number before the first Pay. That same nonterminal attempt must
+become server-verified FAILED before retry is authorized; historical failed attempts do not count.
+Every non-null attempt reference and the final success journal reference must match the original intent,
+including proof-only restarts. Completion requires durable verified-decline evidence and RETRYING or
+SERVER_CONFIRMED phase; success after an interrupted first Pay is not a completed decline/retry journey.
+Old version 1 state is rejected before ownership checks or login, with no automatic migration/reset.
+Keep it and any original keys/IDs for manual PENDING inspection; do not recreate fixtures or generate new
+keys to work around an uncertain prior action. No client secret is parsed or retained for this proof.
 
 The Node runner checks original Account/Site/source/Price/EUR 2000 minor units and joins each success journal ID
 to the identical delivered outbox ID, successful delivery and signature-verified receiver event ID/type.

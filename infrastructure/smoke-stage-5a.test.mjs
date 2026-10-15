@@ -17,9 +17,11 @@ async function fixture(t,{alter,redirect=false,oversize=false,never=false,accoun
   const metadata={runId:randomUUID(),owners:{project:'stripe-acceptance-fixture',backend:'a'.repeat(64),demo:'b'.repeat(64),receiver:'c'.repeat(64)},
     endpoints:{backend:'',demo:'http://127.0.0.1:4173',receiver:''},account:{id:randomUUID(),key:'stripe-acceptance',externalId:'acct_owned'},
     site:{id:randomUUID(),key:'stripe-acceptance'},price:{id:randomUUID(),key:'stripe-price'},cases:{}};
-  const details={},requests=[];
+  const details={},operations={},requests=[];
   for(const name of ['success','decline','sca']) {
     const paymentId=randomUUID(),checkoutId=randomUUID(),event=randomUUID();metadata.cases[name]={paymentId,checkoutId};
+    operations[name]=[{operation_id:randomUUID(),payment_id:paymentId,account_id:metadata.account.id,account_mode:'SANDBOX',kind:'PAYMENT_PREPARE',status:'ACKNOWLEDGED',reference:'pi_'+name,
+      first_dispatched_at:'2026-10-15T10:00:00Z',retry_before:'2026-10-16T09:00:00Z',next_attempt_at:null,safe_error_code:null,resource_id:paymentId,site_id:metadata.site.id,manual_review_required:false}];
     details[name]={payment:{payment_id:paymentId,site_id:metadata.site.id,payment_account_id:metadata.account.id,provider:'STRIPE',source:'CATALOG',price_id:metadata.price.id,
       price_key:metadata.price.key,amount_minor:2000,currency:'EUR',status:'SUCCEEDED',refunded_amount_minor:0},attempts:[],refunds:[],
       events:[{id:event,event_type:'PAYMENT_SUCCEEDED',amount_minor:2000,currency:'EUR',provider_object_id:'pi_'+name}],
@@ -40,6 +42,8 @@ async function fixture(t,{alter,redirect=false,oversize=false,never=false,accoun
     if(req.url==='/api/admin/v1/sites')return reply(200,[{id:metadata.site.id,key:metadata.site.key,payment_account_id:metadata.account.id,status:'ACTIVE',allowed_origins:[metadata.endpoints.demo]}]);
     if(req.url===`/api/admin/v1/sites/${metadata.site.id}/catalog`)return reply(200,{prices:[{id:metadata.price.id,price_key:metadata.price.key,type:'ONE_TIME',status:'PUBLISHED',amount_minor:2000,currency:'EUR'}]});
     if(req.url==='/inspection')return reply(200,{events:verified()});
+    const operationName=Object.keys(operations).find(n=>req.url==='/api/v1/admin/provider-operations?payment_id='+metadata.cases[n].paymentId);
+    if(operationName)return reply(200,operations[operationName]);
     const name=Object.keys(details).find(n=>req.url.startsWith('/api/v1/admin/payments/'+metadata.cases[n].paymentId));
     if(name) {
       const d=details[name];
@@ -64,8 +68,102 @@ async function fixture(t,{alter,redirect=false,oversize=false,never=false,accoun
   const env={...flags,PAYMENT_STRIPE_SANDBOX_RUN_ID:metadata.runId,PAYMENT_SANDBOX_ADMIN_USERNAME:'synthetic-admin',PAYMENT_SANDBOX_ADMIN_PASSWORD:'synthetic-password'};
   const options={env,rootDirectory:directory,verifyOwnership:async()=>true,pollAttempts:2,pollDelayMs:1};
   await sandbox.initializeStripeSandboxState(metadata,options);
-  return {directory,metadata,options,details,requests,statePath:join(directory,'test-results','stripe-sandbox',metadata.runId,'state.json')};
+  return {directory,metadata,options,details,operations,requests,statePath:join(directory,'test-results','stripe-sandbox',metadata.runId,'state.json')};
 }
+
+function declineReady(f) {
+  const d=f.details.decline,settlement=structuredClone(d);
+  d.payment.status='REQUIRES_PAYMENT_METHOD';d.events=[];d.outbox_events=[];d.deliveries=[];
+  const attempt=(number,status)=>({id:randomUUID(),attempt_number:number,status,provider_intent_reference:'pi_decline',payment_method_family:'CARD',result_code:status==='FAILED'?'PROVIDER_FAILED':null,
+    created_at:'2026-10-15T10:00:00Z',updated_at:'2026-10-15T10:00:01Z'});
+  d.attempts=[attempt(1,'FAILED'),attempt(2,'CREATED')];
+  return {d,settle(reference='pi_decline'){Object.assign(d,{...settlement,attempts:d.attempts});d.events[0].provider_object_id=reference;}};
+}
+
+test('unchanged historical FAILED attempt cannot authorize a second Pay',async t=>{
+  const f=await fixture(t);declineReady(f);const session=await sandbox.openStripeSandboxFixture(f.options);
+  try {await session.beginBrowser('decline');await session.markPay('decline');
+    await assert.rejects(session.markPay('decline',true),e=>e.message==='stripe_sandbox_MANUAL_CHECK_DECLINE');
+    assert.equal(JSON.parse(await readFile(f.statePath,'utf8')).cases.decline.phase,'CONFIRMING');
+  }finally{await session.close();}
+});
+test('different-intent settlement cannot complete a freshly verified decline retry',async t=>{
+  const f=await fixture(t),journey=declineReady(f),session=await sandbox.openStripeSandboxFixture(f.options);
+  try {await session.beginBrowser('decline');await session.markPay('decline');journey.d.attempts[1].status='FAILED';
+    await session.markPay('decline',true);journey.settle('pi_other');
+    await assert.rejects(session.confirm('decline'),e=>/^stripe_sandbox_[A-Z_]+$/.test(e.message));
+    assert.equal(JSON.parse(await readFile(f.statePath,'utf8')).cases.decline.phase,'RETRYING');
+  }finally{await session.close();}
+});
+
+async function verifiedDecline(f) {
+  const journey=declineReady(f),session=await sandbox.openStripeSandboxFixture(f.options);
+  try {await session.beginBrowser('decline');await session.markPay('decline');
+    journey.d.attempts[1].status='FAILED';await session.markPay('decline',true);journey.settle();
+  }finally{await session.close();}
+  return journey;
+}
+test('same-intent decline proof is durable before Pay and resumes with no browser replay',async t=>{
+  const f=await fixture(t),journey=declineReady(f),session=await sandbox.openStripeSandboxFixture(f.options);
+  try {await session.beginBrowser('decline');await session.markPay('decline');
+    const state=JSON.parse(await readFile(f.statePath,'utf8'));
+    assert.equal(state.version,2);assert.equal(state.declineProof.intentReference,'pi_decline');
+    assert.equal(state.declineProof.operationId,f.operations.decline[0].operation_id);
+    assert.equal(state.declineProof.attemptId,journey.d.attempts[1].id);assert.equal(state.declineProof.failedVerified,false);
+    journey.d.attempts[1].status='FAILED';await session.markPay('decline',true);journey.settle();
+  }finally{await session.close();}
+  const resumed=await sandbox.openStripeSandboxFixture(f.options);
+  try {assert.equal(await resumed.beginBrowser('decline'),false);assert.equal(await resumed.confirm('decline'),true);
+    await assert.rejects(resumed.markPay('decline'),e=>e.message==='stripe_sandbox_PENDING_BROWSER');
+  }finally{await resumed.close();}
+  assert.equal(f.requests.some(r=>r.path.includes('client-session')||r.path.endsWith('/refunds')),false);
+});
+for(const mismatch of ['reference','operation','account','site'])test('protected original '+mismatch+' change cannot pass resumed decline proof',async t=>{
+  const f=await fixture(t);await verifiedDecline(f);
+  const op=f.operations.decline[0];if(mismatch==='reference')op.reference='pi_other';if(mismatch==='operation')op.operation_id=randomUUID();
+  if(mismatch==='account')op.account_id=randomUUID();if(mismatch==='site')op.site_id=randomUUID();
+  const resumed=await sandbox.openStripeSandboxFixture(f.options);
+  try{await assert.rejects(resumed.beginBrowser('decline'),e=>/^stripe_sandbox_[A-Z_]+$/.test(e.message));}finally{await resumed.close();}
+  assert.equal(f.requests.some(r=>r.path.includes('client-session')||r.path.endsWith('/refunds')),false);
+});
+test('foreign historical intent reference prevents pre-Pay authorization',async t=>{
+  const f=await fixture(t),journey=declineReady(f);journey.d.attempts[0].provider_intent_reference='pi_other';
+  const session=await sandbox.openStripeSandboxFixture(f.options);
+  try{await session.beginBrowser('decline');await assert.rejects(session.markPay('decline'),e=>/^stripe_sandbox_[A-Z_]+$/.test(e.message));}
+  finally{await session.close();}
+  assert.equal(JSON.parse(await readFile(f.statePath,'utf8')).cases.decline.phase,'PREPARING');
+});
+test('old state cannot be migrated or touch ownership and login',async t=>{
+  const f=await fixture(t),state=JSON.parse(await readFile(f.statePath,'utf8'));state.version=1;delete state.declineProof;
+  await writeFile(f.statePath,JSON.stringify(state),{mode:0o600});let ownershipReads=0;f.options.verifyOwnership=async()=>{ownershipReads++;return true;};
+  await assert.rejects(sandbox.openStripeSandboxFixture(f.options),e=>e.message==='stripe_sandbox_STATE');
+  assert.equal(ownershipReads,0);assert.equal(f.requests.length,0);
+  assert.equal(JSON.parse(await readFile(f.statePath,'utf8')).version,1);
+});
+for(const invalid of ['terminal-only','multiple-current','not-latest'])test('pre-Pay baseline refuses '+invalid+' attempts',async t=>{
+  const f=await fixture(t),journey=declineReady(f);
+  if(invalid==='terminal-only')journey.d.attempts[1].status='FAILED';
+  if(invalid==='multiple-current')journey.d.attempts[0].status='CREATED';
+  if(invalid==='not-latest')journey.d.attempts[0].attempt_number=3;
+  const session=await sandbox.openStripeSandboxFixture(f.options);
+  try{await session.beginBrowser('decline');await assert.rejects(session.markPay('decline'),e=>e.message==='stripe_sandbox_PENDING_BROWSER');}
+  finally{await session.close();}
+});
+test('interrupted first Pay cannot be replayed or credited as completed decline retry',async t=>{
+  const f=await fixture(t),journey=declineReady(f),session=await sandbox.openStripeSandboxFixture(f.options);
+  await session.beginBrowser('decline');await session.markPay('decline');await session.close();journey.settle();
+  const resumed=await sandbox.openStripeSandboxFixture(f.options);
+  try{await assert.rejects(resumed.beginBrowser('decline'),e=>e.message==='stripe_sandbox_PENDING_BROWSER');
+    await assert.rejects(resumed.confirm('decline'),e=>e.message==='stripe_sandbox_PENDING_BROWSER');
+    await assert.rejects(resumed.markPay('decline'),e=>e.message==='stripe_sandbox_PENDING_BROWSER');
+  }finally{await resumed.close();}
+  assert.equal(f.requests.some(r=>r.path.includes('client-session')||r.path.endsWith('/refunds')),false);
+});
+test('same journal intent cannot hide a foreign final attempt reference',async t=>{
+  const f=await fixture(t),journey=await verifiedDecline(f);journey.d.attempts[0].provider_intent_reference='pi_other';
+  const resumed=await sandbox.openStripeSandboxFixture(f.options);
+  try{await assert.rejects(resumed.confirm('decline'),e=>e.message==='stripe_sandbox_PROOF');}finally{await resumed.close();}
+});
 
 for (const flags of [{}, {PAYMENT_STRIPE_SANDBOX_ENABLED:'true'}, {PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'},
   {PAYMENT_STRIPE_SANDBOX_ENABLED:'TRUE',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'}]) {
@@ -79,7 +177,7 @@ for (const flags of [{}, {PAYMENT_STRIPE_SANDBOX_ENABLED:'true'}, {PAYMENT_STRIP
 }
 
 test('actual bounded HTTP joins journal, delivered outbox and signature-verified receiver IDs before each refund',async t=>{
-  const f=await fixture(t);assert.deepEqual(await runStripeSandboxSmoke(f.options),{paymentConfirmed:true,refundConfirmed:true,callbackVerified:true});
+  const f=await fixture(t);await verifiedDecline(f);assert.deepEqual(await runStripeSandboxSmoke(f.options),{paymentConfirmed:true,refundConfirmed:true,callbackVerified:true});
   assert.equal(f.requests.filter(r=>r.path.endsWith('/refunds')).length,2);
   const state=JSON.parse(await readFile(f.statePath,'utf8'));assert.deepEqual(state.refunds.map(r=>r.phase),['CONFIRMED','CONFIRMED']);
   assert.equal((await stat(f.statePath)).mode&0o777,0o600);
@@ -96,7 +194,7 @@ for(const accountPatch of [{mode:'LIVE'},{provider:'FAKE'},{external_account_id:
   assert.equal(f.requests.filter(r=>r.path.startsWith('/api/v1/admin/payments')).length,0);
 });
 test('lost refund response persists uncertainty and cannot dispatch again on restart',async t=>{
-  const f=await fixture(t,{lostRefundReply:true});await assert.rejects(runStripeSandboxSmoke(f.options),e=>e.message==='stripe_sandbox_HTTP');
+  const f=await fixture(t,{lostRefundReply:true});await verifiedDecline(f);await assert.rejects(runStripeSandboxSmoke(f.options),e=>e.message==='stripe_sandbox_HTTP');
   const state=JSON.parse(await readFile(f.statePath,'utf8'));assert.equal(state.refunds[0].phase,'DISPATCHING');assert.equal(state.refunds[0].id,null);
   await assert.rejects(runStripeSandboxSmoke(f.options),e=>e.message==='stripe_sandbox_PENDING_REFUND');
   assert.equal(f.requests.filter(r=>r.path.endsWith('/refunds')).length,1);
@@ -146,17 +244,17 @@ for(const condition of ['redirect','oversize','owner','live','nonloopback','miss
   assert.equal(f.requests.filter(r=>r.path.endsWith('/refunds')).length,0);
 });
 test('unknown refund without recorded ID stays pending on resumed runs and retains its original key',async t=>{
-  const f=await fixture(t),state=JSON.parse(await readFile(f.statePath,'utf8'));state.refunds[0].phase='DISPATCHING';
+  const f=await fixture(t);await verifiedDecline(f);const state=JSON.parse(await readFile(f.statePath,'utf8'));state.refunds[0].phase='DISPATCHING';
   await writeFile(f.statePath,JSON.stringify(state),{mode:0o600});
   await assert.rejects(runStripeSandboxSmoke(f.options),e=>e.message==='stripe_sandbox_PENDING_REFUND');
   assert.equal(f.requests.filter(r=>r.path.endsWith('/refunds')).length,0);
   assert.equal(JSON.parse(await readFile(f.statePath,'utf8')).refunds[0].key,state.refunds[0].key);
 });
 test('pending acknowledged refund exhausts finite reads without another POST or remaining refund',async t=>{
-  const f=await fixture(t,{never:true});await assert.rejects(runStripeSandboxSmoke(f.options),e=>e.message==='stripe_sandbox_PENDING_REFUND');
+  const f=await fixture(t,{never:true});await verifiedDecline(f);await assert.rejects(runStripeSandboxSmoke(f.options),e=>e.message==='stripe_sandbox_PENDING_REFUND');
   assert.equal(f.requests.filter(r=>r.path.endsWith('/refunds')).length,1);
   const before=f.requests.length;await assert.rejects(runStripeSandboxSmoke(f.options),e=>e.message==='stripe_sandbox_PENDING_REFUND');
-  assert.equal(f.requests.filter(r=>r.path.endsWith('/refunds')).length,1);assert.equal(f.requests.length-before,13);
+  assert.equal(f.requests.filter(r=>r.path.endsWith('/refunds')).length,1);assert.equal(f.requests.length-before,14);
 });
 test('PREPARING is durable before browser handoff and interrupted preparation is never replayed',async t=>{
   const f=await fixture(t);f.details.success.events=[];f.details.success.outbox_events=[];f.details.success.payment.status='REQUIRES_PAYMENT_METHOD';
