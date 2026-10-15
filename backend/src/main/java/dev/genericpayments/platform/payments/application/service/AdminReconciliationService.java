@@ -17,8 +17,9 @@ public final class AdminReconciliationService {
     public AdminReconciliationService(AdminPaymentReadPort reads,PaymentTransitionPort tx,IdempotencyService idem,AdminPaymentAuditPort audit,ReconcilePaymentService reconcile,LoadSitePort sites,LoadPaymentAccountPort accounts,PaymentProviderRegistry providers,Stage2TelemetryPort telemetry){this.reads=reads;this.tx=tx;this.idem=idem;this.audit=audit;this.reconcile=reconcile;this.sites=sites;this.accounts=accounts;this.providers=providers;this.telemetry=telemetry;}
     public void reconcile(PaymentId id,UUID actor,String key,String requestId){
         if(tx.hasAmbientTransaction())throw new IllegalStateException("Provider coordinator requires no ambient transaction");SafeFactJson.text(key,255);SafeFactJson.text(requestId,128);
-        var siteId=tx.transaction(()->{var p=reads.details(id.value()).orElseThrow(PartnerPaymentRules::notFound).payment();var site=sites.findById(new SiteId(p.siteId())).filter(s->s.status()==SiteStatus.ACTIVE&&s.paymentAccountId().value().equals(p.paymentAccountId())).orElseThrow(PartnerPaymentRules::state);
-            var account=accounts.findById(site.paymentAccountId()).filter(a->a.status()==PaymentAccountStatus.ACTIVE).orElseThrow(PartnerPaymentRules::state);
+        var siteId=tx.transaction(()->{var p=reads.details(id.value()).orElseThrow(PartnerPaymentRules::notFound).payment();
+            var account=accounts.findById(new PaymentAccountId(p.paymentAccountId())).filter(a->a.status()==PaymentAccountStatus.ACTIVE).orElseThrow(PartnerPaymentRules::state);
+            var site=sites.findById(new SiteId(p.siteId())).filter(s->s.status()==SiteStatus.ACTIVE&&(account.provider()==PaymentProviderType.STRIPE||s.paymentAccountId().value().equals(p.paymentAccountId()))).orElseThrow(PartnerPaymentRules::state);
             try{providers.select(account);}catch(IllegalStateException unavailable){throw PartnerPaymentRules.state();}PartnerPaymentRules.preflight(telemetry,site,account);
             var outcome=idem.begin(IdempotencyRecord.Scope.admin(site.id().value(),actor,Stage2TelemetryPort.Operation.RECONCILE),key,idem.fingerprint(Map.of("payment_id",id.value())));
             if(outcome instanceof IdempotencyService.Conflict)throw RefundCoordinator.conflict();

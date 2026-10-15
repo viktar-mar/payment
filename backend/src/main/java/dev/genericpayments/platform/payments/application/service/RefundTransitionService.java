@@ -6,6 +6,7 @@ import dev.genericpayments.platform.shared.application.port.out.*;
 import dev.genericpayments.platform.paymentaccounts.domain.*;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
+import dev.genericpayments.platform.provider.application.model.ResolvedProviderRecovery;
 import dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore;
 import dev.genericpayments.platform.sites.application.port.out.LoadSitePort;
 import java.time.*;
@@ -18,6 +19,8 @@ public final class RefundTransitionService {
     private final SavePaymentPort payments;private final AppendPaymentEventPort events;private final PaymentOutboxPort outbox;
     private final Stage2TelemetryPort telemetry;private final DigestPort digest;private final Clock clock;
     private LoadPaymentPort load;private LoadPaymentAccountPort accounts;private LoadSitePort sites;private ProviderOperationStore operations;private Clock referenceClock;
+    private dev.genericpayments.platform.paymentaccounts.application.port.out.LockPaymentAccountPort recoveryAccounts;
+    public void recoveryAccounts(dev.genericpayments.platform.paymentaccounts.application.port.out.LockPaymentAccountPort accounts){this.recoveryAccounts=accounts;}
     public RefundTransitionService(PaymentTransitionPort tx,LoadRefundPort refunds,SaveRefundPort saveRefunds,SavePaymentPort payments,AppendPaymentEventPort events,PaymentOutboxPort outbox,Stage2TelemetryPort telemetry,DigestPort digest,Clock clock){this.tx=tx;this.refunds=refunds;this.saveRefunds=saveRefunds;this.payments=payments;this.events=events;this.outbox=outbox;this.telemetry=telemetry;this.digest=digest;this.clock=clock;}
     public void verifiedReceipts(LoadPaymentPort load,LoadPaymentAccountPort accounts,LoadSitePort sites,ProviderOperationStore operations,Clock referenceClock) {
         this.load=Objects.requireNonNull(load);this.accounts=Objects.requireNonNull(accounts);this.sites=Objects.requireNonNull(sites);
@@ -105,6 +108,25 @@ public final class RefundTransitionService {
             tx.verifyLease(p,lease.owner(),referenceClock.instant());
             if(!load.releaseReconciliationLease(p.siteId(),p.id(),lease.owner()))throw PartnerPaymentRules.state();
             return result;
+        });
+    }
+    public PaymentTransitionService.Result reconcileRecovered(PaymentTransitionService.Lease lease,ResolvedProviderRecovery proof,String requestId) {
+        return tx.transaction(()->{
+            var p=load.findByIdForUpdate(lease.payment().siteId(),lease.payment().id()).orElseThrow(PartnerPaymentRules::notFound);
+            tx.verifyLease(p,lease.owner(),referenceClock.instant());tx.requireProvider(p.paymentAccountId(),PaymentProviderType.STRIPE);
+            var account=recoveryAccounts.findByIdForUpdate(p.paymentAccountId()).orElseThrow(RefundTransitionService::mismatch);
+            if(!account.equals(lease.account())||!account.equals(proof.verifiedAccount())||!ProviderEvidenceValidator.samePayment(p,lease.payment())||!ProviderEvidenceValidator.samePayment(p,proof.verifiedPayment()))throw mismatch();
+            var id=new RefundId(proof.operation().resourceId());var stored=refunds.findByIdForUpdate(p.siteId(),id).orElseThrow(RefundTransitionService::unresolved);
+            var operation=operations.find(account.id(),ProviderOperationKeys.refund(id)).orElseThrow(RefundTransitionService::unresolved);
+            if(!operation.equals(proof.operation()))throw mismatch();
+            requireOperation(account,stored.value(),proof.state());
+            var r=stored.value();
+            if(r.providerRefundReference()==null)stored=saveRefunds.save(new LoadRefundPort.StoredRefund(r.withProviderRefundReference(proof.state().reference(),max(clock.instant(),r.updatedAt())),stored.version()));
+            ProviderEvidenceValidator.requireRefund(account,p,stored.value(),proof.state());
+            var now=clock.instant();var result=applyVerified(p,stored,proof.state(),lease.context(),UUID.randomUUID(),PaymentEventSource.RECONCILIATION,null,now,now,requestId);
+            tx.verifyLease(p,lease.owner(),referenceClock.instant());
+            if(!load.releaseReconciliationLease(p.siteId(),p.id(),lease.owner()))throw PartnerPaymentRules.state();
+            return new PaymentTransitionService.Result(result.payment(),p.status(),lease.context(),now,result.changed(),result.refund().status());
         });
     }
     public Result acknowledge(Payment p,LoadRefundPort.StoredRefund stored,ProviderResult result,Stage2TelemetryPort.Context context,String requestId){

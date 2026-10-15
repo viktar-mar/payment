@@ -49,8 +49,7 @@ public class StripeCatalogProviderAdapter implements CatalogProviderPort {
 
     private ProviderProductRef ensureVerifiedProduct(PaymentAccount account, Product product) {
         String key = "catalog_product_" + account.id().value() + "_" + product.id().value();
-        String fingerprint = fingerprint(account, product.id().value().toString(), product.siteId().value().toString(),
-            product.key().value(), product.name(), product.description());
+        String fingerprint = productFingerprint(account,product);
         return new ProviderProductRef(dispatch(account, ProviderOperation.Kind.PRODUCT_CREATE, product.id().value(),
             key, fingerprint, options -> {
                 var params = ProductCreateParams.builder().setName(product.name())
@@ -84,16 +83,25 @@ public class StripeCatalogProviderAdapter implements CatalogProviderPort {
             params.setRecurring(recurring.build());
         }
         String key = "catalog_price_" + account.id().value() + "_" + price.id().value() + "_v" + price.version();
-        String fingerprint = fingerprint(account, price.id().value().toString(), price.siteId().value().toString(),
-            product.id().value().toString(), productRef.value(), price.key().value(), Integer.toString(price.version()),
-            price.type().name(), Long.toString(price.money().minorUnits()), price.money().currency(),
-            price.billingInterval() == null ? null : price.billingInterval().name(), Integer.toString(price.trialDays()),
-            price.trialPaymentMethodPolicy().name(), price.taxMode().name(), price.taxCode());
+        String fingerprint = priceFingerprint(account,product,price,productRef.value());
         return new ProviderPriceRef(dispatch(account, ProviderOperation.Kind.PRICE_CREATE, price.id().value(),
             key, fingerprint, options -> {
                 var result = clients.create(credentials.resolve(account)).v1().prices().create(params.build(), options);
                 return reference(result.getId(), result.getLivemode(), "price_");
             }));
+    }
+
+    @Transactional(propagation=Propagation.SUPPORTS,readOnly=true)
+    String productFingerprint(PaymentAccount account,Product product) {
+        return fingerprint(account,product.id().value().toString(),product.siteId().value().toString(),product.key().value(),product.name(),product.description());
+    }
+    @Transactional(propagation=Propagation.SUPPORTS,readOnly=true)
+    String priceFingerprint(PaymentAccount account,Product product,Price price,String productReference) {
+        return fingerprint(account, price.id().value().toString(), price.siteId().value().toString(),
+            product.id().value().toString(), productReference, price.key().value(), Integer.toString(price.version()),
+            price.type().name(), Long.toString(price.money().minorUnits()), price.money().currency(),
+            price.billingInterval() == null ? null : price.billingInterval().name(), Integer.toString(price.trialDays()),
+            price.trialPaymentMethodPolicy().name(), price.taxMode().name(), price.taxCode());
     }
 
     private String dispatch(PaymentAccount account, ProviderOperation.Kind kind, UUID resource, String key,

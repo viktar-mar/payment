@@ -12,7 +12,7 @@ public record IdempotencyRecord(UUID id, String scope, String key, String finger
 
     public enum Status { IN_PROGRESS, COMPLETED }
     public enum SecretState { NONE, LIVE, EXPIRED }
-    public enum ResourceType { PAYMENT, CHECKOUT, HANDOFF, REFUND, OUTBOX_EVENT, OUTBOX_RETRY_REQUEST, DONATION_CAMPAIGN, ATTEMPT }
+    public enum ResourceType { PAYMENT, CHECKOUT, HANDOFF, REFUND, OUTBOX_EVENT, OUTBOX_RETRY_REQUEST, DONATION_CAMPAIGN, ATTEMPT, PROVIDER_OPERATION }
     public enum Actor { PUBLIC, PARTNER, ADMIN }
     public record Resource(ResourceType type, UUID id) {
         public Resource { Objects.requireNonNull(type); Objects.requireNonNull(id); }

@@ -77,8 +77,10 @@ class StripeRefundIntegrationTest extends StripeInboxFixture {
     }
     @Test void originalStripeAcquisitionUsesRealBoundedLeaseAfterSiteReassignment(){
         paid();var other=UUID.randomUUID();jdbc.update("insert into payment_accounts values (?,'other-reconcile-account','FAKE','SANDBOX','ACTIVE','other','other-ref',?,0)",other,java.sql.Timestamp.from(INITIAL_TIME));jdbc.update("update sites set payment_account_id=? where id=?",other,site.value());
-        var lease=transitions.acquire(site,original.id(),"historical-refund",Duration.ofSeconds(1));assertThat(lease.account().id()).isEqualTo(account.id());
-        assertThat(jdbc.queryForObject("select reconciliation_lease_expires_at>clock_timestamp()+interval '110 seconds' and reconciliation_lease_expires_at<=clock_timestamp()+interval '120 seconds' from payments where id=?",Boolean.class,original.id().value())).isTrue();
+        var referenceClock=context.getBean("providerReferenceClock",Clock.class);
+        var before=referenceClock.instant();var lease=transitions.acquire(site,original.id(),"historical-refund",Duration.ofSeconds(1));var after=referenceClock.instant();assertThat(lease.account().id()).isEqualTo(account.id());
+        var expiry=jdbc.queryForObject("select reconciliation_lease_expires_at from payments where id=?",java.sql.Timestamp.class,original.id().value()).toInstant();
+        assertThat(expiry).isBetween(before.plusSeconds(120),after.plusSeconds(120));
     }
     @Test void paymentReconciliationExpiryAfterJournalRollsBackFinancialWrites(){
         mapped();callback();var lease=transitions.acquire(site,original.id(),"late-payment",Duration.ofSeconds(30));snapshot("succeeded","ch_paid");var proof=provider.retrievePayment(ProviderPaymentLookup.forPayment(currentAccount(),original.id(),"pi_owned"));

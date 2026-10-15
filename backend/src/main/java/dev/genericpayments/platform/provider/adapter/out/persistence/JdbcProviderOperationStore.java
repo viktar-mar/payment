@@ -120,7 +120,31 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     }
 
     @Override
+    @Transactional(propagation=Propagation.REQUIRES_NEW,readOnly=true)
+    public Optional<ProviderOperation> findById(UUID id) {
+        return jdbc.query("select * from provider_operations where id=?",this::operation,id).stream().findFirst();
+    }
+    @Override
+    @Transactional(propagation=Propagation.MANDATORY)
+    public ProviderOperation lockRecovery(ProviderOperation expected) {
+        var current=lock(expected.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+        if(!current.equals(expected))throw conflict();
+        requirePinnedAccount(current);requireResource(current.accountId(),current.kind(),current.resourceId());
+        return current;
+    }
+    @Override
+    @Transactional(propagation=Propagation.MANDATORY)
+    public ProviderOperation bindRecoveredInTransaction(ProviderOperation expected,String reference,String fingerprint) {
+        var result=bind(expected,reference,fingerprint);
+        if(result.kind()==Kind.PRODUCT_CREATE||result.kind()==Kind.PRICE_CREATE)
+            jdbc.update("update provider_operations set manual_review_required=true,safe_error_code='PUBLICATION_REQUIRED' where id=?",result.id());
+        return result;
+    }
+    @Override
     public ProviderOperation bindRecovered(ProviderOperation expected, String reference, String fingerprint) {
+        return bind(expected,reference,fingerprint);
+    }
+    private ProviderOperation bind(ProviderOperation expected, String reference, String fingerprint) {
         text(reference, 255);
         text(fingerprint, 255);
         if (expected == null || expected.id() == null) throw conflict();

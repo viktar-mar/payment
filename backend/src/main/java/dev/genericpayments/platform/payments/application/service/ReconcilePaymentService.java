@@ -44,6 +44,8 @@ public final class ReconcilePaymentService implements ReconcilePaymentUseCase {
         catch(RuntimeException failure){telemetry.providerCall(acquired.context(),Stage2TelemetryPort.ProviderOperation.RETRIEVE_REFUND,Stage2TelemetryPort.ProviderResult.TEMPORARILY_UNAVAILABLE,Duration.ofNanos(Math.max(0,System.nanoTime()-start)));throw failure;}
         var outcome=switch(state.status()){case SUCCEEDED->Stage2TelemetryPort.ProviderResult.SUCCEEDED;case FAILED->Stage2TelemetryPort.ProviderResult.FAILED;case CANCELLED->Stage2TelemetryPort.ProviderResult.CANCELLED;case PROCESSING,PENDING->Stage2TelemetryPort.ProviderResult.PROCESSING;default->Stage2TelemetryPort.ProviderResult.UNKNOWN;};
         telemetry.providerCall(acquired.context(),Stage2TelemetryPort.ProviderOperation.RETRIEVE_REFUND,outcome,Duration.ofNanos(Math.max(0,System.nanoTime()-start)));
+        // Unsupported provider status is unresolved, not successful pending recovery.
+        if(state.status()==ProviderState.Status.UNKNOWN)throw new IllegalStateException("UNRESOLVED_OBJECT");
         var result=refundTransitions.reconcile(acquired,refundId,state,requestId);refundTransitions.emit(result);return result.refund();
     }
 }

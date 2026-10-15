@@ -17,6 +17,10 @@ public interface ProviderOperationStore {
     ProviderOperation reserve(PaymentAccount account, ProviderOperation.Kind kind,
         UUID resourceId, String key, String fingerprint);
     Optional<ProviderOperation> find(PaymentAccountId account, String key);
+    Optional<ProviderOperation> findById(UUID id);
+    /** Join manual recovery transaction; lock operation, original Account, resource in that order. */
+    ProviderOperation lockRecovery(ProviderOperation expected);
+    ProviderOperation bindRecoveredInTransaction(ProviderOperation expected,String reference,String fingerprint);
 
     /** Use real UTC, a fresh owner token per acquisition, and a 60-second lease. Returns its fencing version. */
     Optional<ProviderOperation> claim(UUID id, String owner, Instant now, Duration lease);

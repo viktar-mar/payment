@@ -12,6 +12,9 @@ spring:
       mail.smtp.starttls.enable: true
 # Explicit test-only overrides; never packaged into the production artifact.
 payment:
+  stripe:
+    recovery:
+      scheduling-enabled: false
   subscriptions:
     scheduling-enabled: false
   donation-message-fingerprint:

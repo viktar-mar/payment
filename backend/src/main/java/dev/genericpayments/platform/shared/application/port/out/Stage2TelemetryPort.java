@@ -8,7 +8,7 @@ public interface Stage2TelemetryPort {
     enum Operation {
         CHECKOUT_CREATE("checkouts:create"), CHECKOUT_CONFIRM("checkouts:confirm"), CHECKOUT_CLIENT_SESSION("checkouts:client-session"), PAYMENT_CREATE("payments:create"),
         HANDOFF_ISSUE("handoffs:issue"), HANDOFF_EXCHANGE("handoffs:exchange"), REFUND_CREATE("refunds:create"),
-        RECONCILE("payments:reconcile"), CALLBACK_RETRY("callbacks:retry"), FAKE_EVENT("payments:fake-event"),
+        RECONCILE("payments:reconcile"), PROVIDER_RECOVERY("provider-operations:recover"), CALLBACK_RETRY("callbacks:retry"), FAKE_EVENT("payments:fake-event"),
         CAMPAIGN_CREATE("donation-campaigns:create"), CAMPAIGN_UPDATE("donation-campaigns:update"), CAMPAIGN_STATUS("donation-campaigns:status"),
         DONATION_CHECKOUT_CREATE("donation-checkouts:create"), DONATION_MESSAGE_REDACT("donation-messages:redact");
         private final String scope;

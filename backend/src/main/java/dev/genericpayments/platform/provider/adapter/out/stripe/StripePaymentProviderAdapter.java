@@ -103,6 +103,7 @@ public class StripePaymentProviderAdapter implements PaymentProviderPort {
     }
 
     /** Stable handoff for recovery: account prefix, then payment/site/source/amount/currency/tax. */
+    @Transactional(propagation=Propagation.SUPPORTS,readOnly=true)
     String fingerprint(PaymentAccount account, Payment payment) {
         return StripeRequestFingerprint.of(digest, account, payment.id().value().toString(), payment.siteId().value().toString(),
             payment.source().name(), Long.toString(payment.money().minorUnits()), payment.money().currency(), payment.taxMode().name());
@@ -184,6 +185,7 @@ public class StripePaymentProviderAdapter implements PaymentProviderPort {
         return new ProviderResult.Accepted(operation.providerReference(),false);
     }
     /** Persisted suffix order is part of the recovery contract; reuse the original shared encoder. */
+    @Transactional(propagation=Propagation.SUPPORTS,readOnly=true)
     String refundFingerprint(PaymentAccount account,Payment payment,Refund refund) {
         return StripeRequestFingerprint.of(digest,account,payment.id().value().toString(),payment.siteId().value().toString(),
             payment.source().name(),Long.toString(payment.money().minorUnits()),payment.money().currency(),payment.taxMode().name(),

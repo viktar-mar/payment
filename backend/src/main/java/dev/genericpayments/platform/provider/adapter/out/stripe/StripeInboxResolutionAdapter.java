@@ -6,6 +6,7 @@ import dev.genericpayments.platform.payments.application.model.*;
 import dev.genericpayments.platform.payments.application.port.out.*;
 import dev.genericpayments.platform.payments.domain.*;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
+import dev.genericpayments.platform.provider.application.model.ResolvedProviderRecovery;
 import dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore;
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
 import java.util.*;
@@ -32,16 +33,28 @@ public class StripeInboxResolutionAdapter implements ProviderInboxResolutionPort
         this.payments=payments;this.transitions=transitions;this.operations=operations;this.provider=provider;this.refunds=refunds;
     }
     @Override public ResolvedProviderReceipt resolve(ProviderReferenceReceipt receipt) {
-        if(receipt.objectType()==ProviderReferenceReceipt.ObjectType.REFUND)return resolveRefund(receipt);
-        var account=accounts.findById(receipt.accountId()).orElseThrow(StripeInboxResolutionAdapter::unresolved);
+        var proof=receipt.objectType()==ProviderReferenceReceipt.ObjectType.REFUND?resolveRefund(receipt.accountId(),receipt.objectId()):resolvePayment(receipt.accountId(),receipt.objectId());
+        return new ResolvedProviderReceipt(receipt,proof.verifiedPayment().id(),proof.state().refundProof()==null?null:proof.state().refundProof().refund().id(),proof.state(),proof.operation().fingerprint(),proof.verifiedAccount(),proof.verifiedPayment());
+    }
+    public ResolvedProviderRecovery resolveRecovery(ProviderOperation operation) {
+        var proof=switch(operation.kind()) {
+            case PAYMENT_PREPARE -> resolvePayment(operation.accountId(),operation.providerReference());
+            case REFUND_CREATE -> resolveRefund(operation.accountId(),operation.providerReference());
+            default -> throw unresolved();
+        };
+        if(!operation.equals(proof.operation()))throw unresolved();
+        return proof;
+    }
+    private ResolvedProviderRecovery resolvePayment(PaymentAccountId accountId,String reference) {
+        var account=accounts.findById(accountId).orElseThrow(StripeInboxResolutionAdapter::unresolved);
         var binding=credentials.resolve(account);
         if(account.status()!=PaymentAccountStatus.ACTIVE)throw StripePaymentSnapshotMapper.mismatch();
         verification.verify(account);
         try {
             var client=clients.create(binding);
-            var intent=client.v1().paymentIntents().retrieve(receipt.objectId());
-            if(intent==null||!receipt.objectId().equals(intent.getId()))throw StripePaymentSnapshotMapper.mismatch();
-            var identity=transitions.resolve(account.id(),receipt.objectId());
+            var intent=client.v1().paymentIntents().retrieve(reference);
+            if(intent==null||!reference.equals(intent.getId()))throw StripePaymentSnapshotMapper.mismatch();
+            var identity=transitions.resolve(account.id(),reference);
             PaymentId id;
             if(identity.isPresent())id=identity.get().paymentId();
             else {
@@ -56,13 +69,13 @@ public class StripeInboxResolutionAdapter implements ProviderInboxResolutionPort
             if(operation.kind()!=ProviderOperation.Kind.PAYMENT_PREPARE||!operation.resourceId().equals(id.value())
                     ||!operation.accountId().equals(account.id())||!operation.operationKey().equals(ProviderOperationKeys.prepare(id))
                     ||!operation.externalAccountId().equals(account.externalAccountId())||!operation.credentialsRef().equals(account.credentialsRef())
-                    ||!fingerprint.equals(operation.fingerprint())||!receipt.objectId().equals(operation.providerReference())
-                    ||payment.providerPaymentReference()!=null&&!receipt.objectId().equals(payment.providerPaymentReference()))throw StripePaymentSnapshotMapper.mismatch();
+                    ||!fingerprint.equals(operation.fingerprint())||!reference.equals(operation.providerReference())
+                    ||payment.providerPaymentReference()!=null&&!reference.equals(payment.providerPaymentReference()))throw StripePaymentSnapshotMapper.mismatch();
             if(intent.getMetadata()==null||!id.value().toString().equals(intent.getMetadata().get("payment_id"))
                     ||!payment.siteId().value().toString().equals(intent.getMetadata().get("site_id"))
                     ||!payment.source().name().equals(intent.getMetadata().get("source")))throw StripePaymentSnapshotMapper.mismatch();
             // Only the in-memory projection is bound here. Final mapping repair is fenced under the Payment lock.
-            var bound=payment.withProviderPaymentReference(receipt.objectId(),payment.updatedAt());
+            var bound=payment.withProviderPaymentReference(reference,payment.updatedAt());
             StripePaymentSnapshotMapper.requireIntent(account,bound,intent);
             String latest=intent.getLatestCharge(),failed=StripePaymentSnapshotMapper.failedReference(intent);
             String selected=latest!=null?latest:failed;
@@ -75,19 +88,19 @@ public class StripeInboxResolutionAdapter implements ProviderInboxResolutionPort
                 state=new ProviderState(state.reference(),state.status(),new ProviderEvidence(e.provider(),e.accountId(),e.mode(),e.externalAccountId(),
                     e.money(),e.paymentReference(),e.chargeReference(),failedCharge.getId(),e.captured()));
             }
-            return new ResolvedProviderReceipt(receipt,id,null,state,fingerprint,account,payment);
+            return new ResolvedProviderRecovery(operation,account,payment,state);
         } catch(PaymentApplicationException safe){throw safe;}
         catch(IllegalStateException safe){if("UNRESOLVED_OBJECT".equals(safe.getMessage()))throw safe;throw unavailable();}
         catch(Exception unsafe){throw unavailable();}
     }
-    private ResolvedProviderReceipt resolveRefund(ProviderReferenceReceipt receipt) {
-        var account=accounts.findById(receipt.accountId()).orElseThrow(StripeInboxResolutionAdapter::unresolved);
+    private ResolvedProviderRecovery resolveRefund(PaymentAccountId accountId,String reference) {
+        var account=accounts.findById(accountId).orElseThrow(StripeInboxResolutionAdapter::unresolved);
         var binding=credentials.resolve(account);if(account.status()!=PaymentAccountStatus.ACTIVE)throw StripePaymentSnapshotMapper.mismatch();
         verification.verify(account);
         try {
-            var client=clients.create(binding);var remote=client.v1().refunds().retrieve(receipt.objectId());
-            if(remote==null||!receipt.objectId().equals(remote.getId()))throw StripePaymentSnapshotMapper.mismatch();
-            var identity=transitions.resolveRefund(account.id(),receipt.objectId());PaymentId paymentId;RefundId refundId;
+            var client=clients.create(binding);var remote=client.v1().refunds().retrieve(reference);
+            if(remote==null||!reference.equals(remote.getId()))throw StripePaymentSnapshotMapper.mismatch();
+            var identity=transitions.resolveRefund(account.id(),reference);PaymentId paymentId;RefundId refundId;
             if(identity.isPresent()){paymentId=identity.get().payment().paymentId();refundId=identity.get().refundId();}
             else {
                 // Metadata selects existing candidates only; the original ACK and fingerprint authorize binding.
@@ -96,8 +109,9 @@ public class StripeInboxResolutionAdapter implements ProviderInboxResolutionPort
             }
             var payment=payments.findByAccountAndId(account.id(),paymentId).orElseThrow(StripeInboxResolutionAdapter::unresolved);
             var refund=refunds.findById(payment.siteId(),refundId).orElseThrow(StripeInboxResolutionAdapter::unresolved).value();
-            var state=provider.refundState(account,payment,refund,receipt.objectId(),remote,client);
-            return new ResolvedProviderReceipt(receipt,paymentId,refundId,state,state.refundProof().requestFingerprint(),account,payment);
+            var state=provider.refundState(account,payment,refund,reference,remote,client);
+            var operation=operations.find(account.id(),ProviderOperationKeys.refund(refundId)).orElseThrow(StripeInboxResolutionAdapter::unresolved);
+            return new ResolvedProviderRecovery(operation,account,payment,state);
         } catch(PaymentApplicationException safe){throw safe;}
         catch(IllegalStateException safe){if("UNRESOLVED_OBJECT".equals(safe.getMessage()))throw safe;throw unavailable();}
         catch(Exception unsafe){throw unavailable();}

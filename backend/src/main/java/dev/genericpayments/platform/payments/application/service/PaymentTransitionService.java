@@ -8,6 +8,7 @@ import dev.genericpayments.platform.sites.application.port.out.LoadSitePort;
 import dev.genericpayments.platform.sites.domain.*;
 import dev.genericpayments.platform.shared.application.port.out.*;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
+import dev.genericpayments.platform.provider.application.model.ResolvedProviderRecovery;
 import dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore;
 import java.time.*;
 import java.util.*;
@@ -24,6 +25,8 @@ public final class PaymentTransitionService {
     private ClientPaymentAttemptPort clientAttempts;
     private ProviderChargeReceiptPort charges;
     private Clock referenceClock;
+    private dev.genericpayments.platform.paymentaccounts.application.port.out.LockPaymentAccountPort recoveryAccounts;
+    public void recoveryAccounts(dev.genericpayments.platform.paymentaccounts.application.port.out.LockPaymentAccountPort accounts){this.recoveryAccounts=accounts;}
     public void verifiedReceipts(ProviderOperationStore operations,ClientPaymentAttemptPort clientAttempts,ProviderChargeReceiptPort charges,Clock referenceClock) {
         this.operations=Objects.requireNonNull(operations);this.clientAttempts=Objects.requireNonNull(clientAttempts);
         this.charges=Objects.requireNonNull(charges);this.referenceClock=Objects.requireNonNull(referenceClock);
@@ -148,16 +151,46 @@ public final class PaymentTransitionService {
     private static IllegalStateException mismatch(){return new IllegalStateException("IDENTITY_MISMATCH");}
     private static Instant max(Instant a,Instant b){return a.isBefore(b)?b:a;}
     public Lease acquire(SiteId siteId,PaymentId id,String requestId,Duration duration) {
+        return acquire(siteId,id,requestId,duration,false);
+    }
+    public Lease acquireRecovery(SiteId siteId,PaymentId id,String requestId) {
+        return acquire(siteId,id,requestId,Duration.ofSeconds(120),true);
+    }
+    private Lease acquire(SiteId siteId,PaymentId id,String requestId,Duration duration,boolean recovery) {
         SafeFactJson.text(requestId,128);return tx.transaction(() -> {
             var p=load.findByIdForUpdate(siteId,id).orElseThrow(PartnerPaymentRules::notFound);
             var account=accounts.findById(p.paymentAccountId()).filter(a -> a.status()==PaymentAccountStatus.ACTIVE).orElseThrow(PartnerPaymentRules::state);
             var site=sites.findById(siteId).filter(s -> s.status()==SiteStatus.ACTIVE&&(p.source()==PaymentSource.SUBSCRIPTION||account.provider()==PaymentProviderType.STRIPE||s.paymentAccountId().equals(p.paymentAccountId()))).orElseThrow(PartnerPaymentRules::state);
-            if(p.providerPaymentReference()==null)throw PartnerPaymentRules.state();
+            if(recovery&&account.provider()!=PaymentProviderType.STRIPE||p.providerPaymentReference()==null&&!recovery)throw PartnerPaymentRules.state();
             var context=new Stage2TelemetryPort.Context(site.key().value(),Stage2TelemetryPort.Provider.valueOf(account.provider().name()));telemetry.requireContext(context);
             var now=account.provider()==PaymentProviderType.STRIPE?referenceClock.instant():clock.instant();
             var leaseDuration=account.provider()==PaymentProviderType.STRIPE?Duration.ofSeconds(120):duration;
             String owner=UUID.randomUUID().toString();if(!load.tryAcquireReconciliationLease(siteId,id,owner,now,now.plus(leaseDuration)))throw PartnerPaymentRules.state();
             return new Lease(load.findByIdForUpdate(siteId,id).orElseThrow(),account,owner,context);
+        });
+    }
+    public void releaseRecovery(Lease lease) {
+        tx.transaction(()->load.releaseReconciliationLease(lease.payment().siteId(),lease.payment().id(),lease.owner()));
+    }
+    public Result reconcileRecovered(Lease lease,ResolvedProviderRecovery proof,String requestId) {
+        if(proof.operation().kind()==ProviderOperation.Kind.REFUND_CREATE)return refundTransitions.reconcileRecovered(lease,proof,requestId);
+        return tx.transaction(()->{
+            var p=load.findByIdForUpdate(lease.payment().siteId(),lease.payment().id()).orElseThrow(PartnerPaymentRules::notFound);
+            tx.verifyLease(p,lease.owner(),referenceClock.instant());tx.requireProvider(p.paymentAccountId(),PaymentProviderType.STRIPE);
+            var account=recoveryAccounts.findByIdForUpdate(p.paymentAccountId()).orElseThrow(PaymentTransitionService::mismatch);
+            var operation=operations.find(account.id(),ProviderOperationKeys.prepare(p.id())).orElseThrow(PaymentTransitionService::mismatch);
+            if(!account.equals(lease.account())||!account.equals(proof.verifiedAccount())||account.status()!=PaymentAccountStatus.ACTIVE
+                    ||!sameVerifiedRequest(p,lease.payment())||!sameVerifiedRequest(p,proof.verifiedPayment())
+                    ||!operation.equals(proof.operation())||operation.status()!=ProviderOperation.Status.ACKNOWLEDGED
+                    ||operation.kind()!=ProviderOperation.Kind.PAYMENT_PREPARE||!operation.resourceId().equals(p.id().value())
+                    ||!operation.providerReference().equals(proof.state().reference())
+                    ||p.providerPaymentReference()!=null&&!p.providerPaymentReference().equals(operation.providerReference()))throw mismatch();
+            if(p.providerPaymentReference()==null)p=save.save(p.withProviderPaymentReference(operation.providerReference(),max(clock.instant(),p.updatedAt())));
+            ProviderEvidenceValidator.requirePayment(account,p,proof.state());
+            var now=clock.instant();var result=applyVerified(p,account,proof.state(),lease.context(),UUID.randomUUID(),PaymentEventSource.RECONCILIATION,null,now,now,requestId);
+            tx.verifyLease(p,lease.owner(),referenceClock.instant());
+            if(!load.releaseReconciliationLease(p.siteId(),p.id(),lease.owner()))throw PartnerPaymentRules.state();
+            return result;
         });
     }
     public Result reconcile(Lease lease,ProviderState state,String requestId) {
