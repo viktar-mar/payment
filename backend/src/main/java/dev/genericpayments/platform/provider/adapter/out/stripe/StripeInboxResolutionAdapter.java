@@ -24,15 +24,15 @@ public class StripeInboxResolutionAdapter implements ProviderInboxResolutionPort
     private final PaymentTransitionPort transitions;
     private final ProviderOperationStore operations;
     private final StripePaymentProviderAdapter provider;
+    private final LoadRefundPort refunds;
     public StripeInboxResolutionAdapter(StripeCredentialResolver credentials,StripeClientFactory clients,
             PaymentAccountVerificationPort verification,LoadPaymentAccountPort accounts,LoadPaymentPort payments,
-            PaymentTransitionPort transitions,ProviderOperationStore operations,StripePaymentProviderAdapter provider) {
+            PaymentTransitionPort transitions,ProviderOperationStore operations,StripePaymentProviderAdapter provider,LoadRefundPort refunds) {
         this.credentials=credentials;this.clients=clients;this.verification=verification;this.accounts=accounts;
-        this.payments=payments;this.transitions=transitions;this.operations=operations;this.provider=provider;
+        this.payments=payments;this.transitions=transitions;this.operations=operations;this.provider=provider;this.refunds=refunds;
     }
     @Override public ResolvedProviderReceipt resolve(ProviderReferenceReceipt receipt) {
-        // Task 10 must supply verified refund-specific money/ownership proof before this family can apply.
-        if(receipt.objectType()!=ProviderReferenceReceipt.ObjectType.PAYMENT)throw unresolved();
+        if(receipt.objectType()==ProviderReferenceReceipt.ObjectType.REFUND)return resolveRefund(receipt);
         var account=accounts.findById(receipt.accountId()).orElseThrow(StripeInboxResolutionAdapter::unresolved);
         var binding=credentials.resolve(account);
         if(account.status()!=PaymentAccountStatus.ACTIVE)throw StripePaymentSnapshotMapper.mismatch();
@@ -76,6 +76,28 @@ public class StripeInboxResolutionAdapter implements ProviderInboxResolutionPort
                     e.money(),e.paymentReference(),e.chargeReference(),failedCharge.getId(),e.captured()));
             }
             return new ResolvedProviderReceipt(receipt,id,null,state,fingerprint,account,payment);
+        } catch(PaymentApplicationException safe){throw safe;}
+        catch(IllegalStateException safe){if("UNRESOLVED_OBJECT".equals(safe.getMessage()))throw safe;throw unavailable();}
+        catch(Exception unsafe){throw unavailable();}
+    }
+    private ResolvedProviderReceipt resolveRefund(ProviderReferenceReceipt receipt) {
+        var account=accounts.findById(receipt.accountId()).orElseThrow(StripeInboxResolutionAdapter::unresolved);
+        var binding=credentials.resolve(account);if(account.status()!=PaymentAccountStatus.ACTIVE)throw StripePaymentSnapshotMapper.mismatch();
+        verification.verify(account);
+        try {
+            var client=clients.create(binding);var remote=client.v1().refunds().retrieve(receipt.objectId());
+            if(remote==null||!receipt.objectId().equals(remote.getId()))throw StripePaymentSnapshotMapper.mismatch();
+            var identity=transitions.resolveRefund(account.id(),receipt.objectId());PaymentId paymentId;RefundId refundId;
+            if(identity.isPresent()){paymentId=identity.get().payment().paymentId();refundId=identity.get().refundId();}
+            else {
+                // Metadata selects existing candidates only; the original ACK and fingerprint authorize binding.
+                try{paymentId=new PaymentId(UUID.fromString(remote.getMetadata().get("payment_id")));refundId=new RefundId(UUID.fromString(remote.getMetadata().get("refund_id")));}
+                catch(RuntimeException invalid){throw unresolved();}
+            }
+            var payment=payments.findByAccountAndId(account.id(),paymentId).orElseThrow(StripeInboxResolutionAdapter::unresolved);
+            var refund=refunds.findById(payment.siteId(),refundId).orElseThrow(StripeInboxResolutionAdapter::unresolved).value();
+            var state=provider.refundState(account,payment,refund,receipt.objectId(),remote,client);
+            return new ResolvedProviderReceipt(receipt,paymentId,refundId,state,state.refundProof().requestFingerprint(),account,payment);
         } catch(PaymentApplicationException safe){throw safe;}
         catch(IllegalStateException safe){if("UNRESOLVED_OBJECT".equals(safe.getMessage()))throw safe;throw unavailable();}
         catch(Exception unsafe){throw unavailable();}

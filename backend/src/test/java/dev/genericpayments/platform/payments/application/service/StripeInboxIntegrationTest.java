@@ -252,8 +252,11 @@ class StripeInboxIntegrationTest extends StripeInboxFixture {
         assertThat(count("provider_charge_receipts")).isZero();assertThat(count("payment_events")).isZero();assertThat(count("payment_attempts")).isZero();
     }
     @Test void refundReceiptRemainsUnresolvedUntilRefundEvidenceExists(){
-        mapped();int before=http.calls().size();inbox.insertReference(new ProviderReferenceReceipt(PaymentProviderType.STRIPE,account.id(),"evt_refund","re_owned",ProviderReferenceReceipt.ObjectType.REFUND,"refund.updated","2026-09-30.endive",INITIAL_TIME,Instant.now()));worker.runOnce();
-        assertThat(inboxStatus()).isEqualTo("FAILED");assertThat(current().status()).isEqualTo(PaymentStatus.CREATED);assertThat(count("payment_events")).isZero();assertThat(http.calls()).hasSize(before);
+        mapped();int before=http.calls().size();identity();http.enqueue("GET","/v1/refunds/re_owned",200,"{\"id\":\"re_owned\",\"object\":\"refund\",\"amount\":700,\"currency\":\"eur\",\"payment_intent\":\"pi_owned\",\"charge\":\"ch_paid\",\"status\":\"succeeded\",\"metadata\":{}}");
+        inbox.insertReference(new ProviderReferenceReceipt(PaymentProviderType.STRIPE,account.id(),"evt_refund","re_owned",ProviderReferenceReceipt.ObjectType.REFUND,"refund.updated","2026-09-30.endive",INITIAL_TIME,Instant.now()));worker.runOnce();
+        assertThat(inboxStatus()).isEqualTo("FAILED");assertThat(current().status()).isEqualTo(PaymentStatus.CREATED);assertThat(count("payment_events")).isZero();
+        assertThat(count("payment_attempts")).isZero();assertThat(count("provider_charge_receipts")).isZero();assertThat(count("outbox_events")).isZero();
+        assertThat(http.calls().subList(before,http.calls().size())).extracting(StripeHttpFixture.Call::path).containsExactly("/v1/account","/v1/refunds/re_owned");
     }
     @Test void unverifiedStripeRefundReconciliationCannotInventRefundMoney(){
         mapped();original=save.save(original.succeeded(INITIAL_TIME));var id=new RefundId(UUID.randomUUID());

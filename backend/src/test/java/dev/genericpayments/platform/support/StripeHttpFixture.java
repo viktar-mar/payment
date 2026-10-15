@@ -14,6 +14,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Function;
 
 /** Memory-only SDK fixture. Never print requests, headers, forms, or response bodies. */
 public final class StripeHttpFixture implements AutoCloseable {
@@ -35,15 +36,19 @@ public final class StripeHttpFixture implements AutoCloseable {
 
     public void enqueue(String method, String path, int status, String json,
                         Map<String, String> headers, long delayMillis) {
-        responses.add(new Response(method, path, status, json, headers, delayMillis, 0, false));
+        responses.add(new Response(method, path, status, ignored -> json, headers, delayMillis, 0, false));
+    }
+
+    public void enqueue(String method, String path, int status, Function<Call,String> json) {
+        responses.add(new Response(method, path, status, json, Map.of(), 0, 0, false));
     }
 
     public void enqueueDelayedBody(String method, String path, int status, String json, long bodyDelayMillis) {
-        responses.add(new Response(method, path, status, json, Map.of(), 0, bodyDelayMillis, false));
+        responses.add(new Response(method, path, status, ignored -> json, Map.of(), 0, bodyDelayMillis, false));
     }
 
     public void disconnectNext(String method, String path) {
-        responses.add(new Response(method, path, 0, "", Map.of(), 0, 0, true));
+        responses.add(new Response(method, path, 0, ignored -> "", Map.of(), 0, 0, true));
     }
 
     public List<Call> calls() { return List.copyOf(calls); }
@@ -61,8 +66,9 @@ public final class StripeHttpFixture implements AutoCloseable {
                     form.put(decode(parts[0]), parts.length == 2 ? decode(parts[1]) : "");
                 }
             }
-            calls.add(new Call(exchange.getRequestMethod(), exchange.getRequestURI().getPath(),
-                Map.copyOf(headers), Map.copyOf(form)));
+            var call = new Call(exchange.getRequestMethod(), exchange.getRequestURI().getPath(),
+                Map.copyOf(headers), Map.copyOf(form));
+            calls.add(call);
             Response response = responses.poll();
             if (response == null || !response.method.equals(exchange.getRequestMethod())
                     || !response.path.equals(exchange.getRequestURI().getPath())) {
@@ -76,7 +82,7 @@ public final class StripeHttpFixture implements AutoCloseable {
             }
             exchange.getResponseHeaders().set("Content-Type", "application/json");
             response.headers.forEach((name, value) -> exchange.getResponseHeaders().set(name, value));
-            byte[] bytes = response.json.getBytes(StandardCharsets.UTF_8);
+            byte[] bytes = response.json.apply(call).getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(response.status, bytes.length);
             if (response.bodyDelayMillis > 0) {
                 // Flush headers and a partial body so the client has definitely entered body consumption.
@@ -102,7 +108,7 @@ public final class StripeHttpFixture implements AutoCloseable {
         @Override public String toString() { return "StripeHttpFixture.Call[redacted]"; }
     }
 
-    private record Response(String method, String path, int status, String json,
+    private record Response(String method, String path, int status, Function<Call,String> json,
                             Map<String, String> headers, long delayMillis, long bodyDelayMillis, boolean disconnect) {
         @Override public String toString() { return "StripeHttpFixture.Response[redacted]"; }
     }

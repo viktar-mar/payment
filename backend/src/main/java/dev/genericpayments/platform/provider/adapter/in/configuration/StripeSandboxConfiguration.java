@@ -61,7 +61,7 @@ public class StripeSandboxConfiguration {
 
     @Bean @Lazy StripePaymentProviderAdapter stripePaymentProvider(StripeCredentialResolver credentials, StripeClientFactory clients,
             PaymentAccountVerificationPort verification, ProviderOperationStore operations, DigestPort digest,
-            LoadSitePort sites, LoadPaymentPort payments, LoadPaymentAccountPort accounts) {
-        return new StripePaymentProviderAdapter(credentials, clients, verification, operations, digest, sites, payments, accounts);
+            LoadSitePort sites, LoadPaymentPort payments, LoadPaymentAccountPort accounts,dev.genericpayments.platform.payments.application.port.out.LoadRefundPort refunds) {
+        return new StripePaymentProviderAdapter(credentials, clients, verification, operations, digest, sites, payments, accounts,refunds);
     }
 }

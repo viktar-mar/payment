@@ -150,11 +150,13 @@ public final class PaymentTransitionService {
     public Lease acquire(SiteId siteId,PaymentId id,String requestId,Duration duration) {
         SafeFactJson.text(requestId,128);return tx.transaction(() -> {
             var p=load.findByIdForUpdate(siteId,id).orElseThrow(PartnerPaymentRules::notFound);
-            var site=sites.findById(siteId).filter(s -> s.status()==SiteStatus.ACTIVE&&(p.source()==PaymentSource.SUBSCRIPTION||s.paymentAccountId().equals(p.paymentAccountId()))).orElseThrow(PartnerPaymentRules::state);
             var account=accounts.findById(p.paymentAccountId()).filter(a -> a.status()==PaymentAccountStatus.ACTIVE).orElseThrow(PartnerPaymentRules::state);
+            var site=sites.findById(siteId).filter(s -> s.status()==SiteStatus.ACTIVE&&(p.source()==PaymentSource.SUBSCRIPTION||account.provider()==PaymentProviderType.STRIPE||s.paymentAccountId().equals(p.paymentAccountId()))).orElseThrow(PartnerPaymentRules::state);
             if(p.providerPaymentReference()==null)throw PartnerPaymentRules.state();
             var context=new Stage2TelemetryPort.Context(site.key().value(),Stage2TelemetryPort.Provider.valueOf(account.provider().name()));telemetry.requireContext(context);
-            String owner=UUID.randomUUID().toString();if(!load.tryAcquireReconciliationLease(siteId,id,owner,clock.instant(),clock.instant().plus(duration)))throw PartnerPaymentRules.state();
+            var now=account.provider()==PaymentProviderType.STRIPE?referenceClock.instant():clock.instant();
+            var leaseDuration=account.provider()==PaymentProviderType.STRIPE?Duration.ofSeconds(120):duration;
+            String owner=UUID.randomUUID().toString();if(!load.tryAcquireReconciliationLease(siteId,id,owner,now,now.plus(leaseDuration)))throw PartnerPaymentRules.state();
             return new Lease(load.findByIdForUpdate(siteId,id).orElseThrow(),account,owner,context);
         });
     }
@@ -162,7 +164,7 @@ public final class PaymentTransitionService {
         if(state==null||!lease.payment().providerPaymentReference().equals(state.reference()))throw PartnerPaymentRules.state();
         return tx.transaction(() -> {
             var p=load.findByIdForUpdate(lease.payment().siteId(),lease.payment().id()).orElseThrow(PartnerPaymentRules::notFound);
-            tx.verifyLease(p,lease.owner(),clock.instant());tx.requireProvider(p.paymentAccountId(),lease.account().provider());
+            tx.verifyLease(p,lease.owner(),lease.account().provider()==PaymentProviderType.STRIPE?referenceClock.instant():clock.instant());tx.requireProvider(p.paymentAccountId(),lease.account().provider());
             if(!p.paymentAccountId().equals(lease.account().id())||!state.reference().equals(p.providerPaymentReference()))throw PartnerPaymentRules.state();
             var currentAccount=accounts.findById(p.paymentAccountId()).orElseThrow(PartnerPaymentRules::state);
             if(currentAccount.provider()==PaymentProviderType.STRIPE||lease.account().provider()==PaymentProviderType.STRIPE) {
@@ -176,6 +178,7 @@ public final class PaymentTransitionService {
                 ?applyVerified(p,currentAccount,state,lease.context(),UUID.randomUUID(),PaymentEventSource.RECONCILIATION,null,now,now,requestId)
                 :apply(p,state.status(),lease.context(),UUID.randomUUID(),PaymentEventSource.RECONCILIATION,null,state.reference(),now,now,requestId,digest.sha256Hex(SafeFactJson.json(Map.of("state",state.status().name()))));
             if(currentAccount.provider()!=PaymentProviderType.STRIPE&&!result.changed()&&state.status()!=ProviderState.Status.UNKNOWN&&state.status()!=ProviderState.Status.CREATED)resolveUnknown(p,state.status(),now);
+            if(currentAccount.provider()==PaymentProviderType.STRIPE)tx.verifyLease(p,lease.owner(),referenceClock.instant());
             if(!load.releaseReconciliationLease(p.siteId(),p.id(),lease.owner()))throw PartnerPaymentRules.state();
             return new Result(load.findByIdForUpdate(p.siteId(),p.id()).orElseThrow(),result.previous(),result.context(),now,result.changed());
         });
