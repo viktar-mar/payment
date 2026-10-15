@@ -10,6 +10,7 @@ it('imports the SDK and constructs its headless client in Node without browser g
     const sdk = await import('../index.js');
     const client = sdk.createGenericPaymentClient({ apiBaseUrl: 'https://api.test' });
     expect(client.subscriptions.get).toBeTypeOf('function');
+    expect(client.prepareClientPayment).toBeTypeOf('function');
     expect(sdk.watchSubscriptionOperation).toBeTypeOf('function');
     expect(sdk.confirmSubscriptionAction).toBeTypeOf('function');
   } finally { if (storage) Object.defineProperty(globalThis, 'sessionStorage', storage); }

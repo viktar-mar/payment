@@ -6,7 +6,7 @@ export interface DonationCampaignInput { siteKey: string; campaignKey: string; s
 export interface DonationCheckoutInput extends DonationCampaignInput { amountMinor: number; message?: string; customerSession?: 'auto' | 'omit'; idempotencyKey?: string; }
 export interface DonationCampaign { campaignKey: string; displayName: string; purposeDescription: string | null; currency: string; suggestedAmounts: number[]; minimumAmount: number; maximumAmount: number; customAmountAllowed: boolean; anonymousAllowed: boolean; }
 export interface DonationContext { donationId: string; campaignKey: string; campaignVersion: number; }
-export interface DonationCheckoutSession extends CheckoutSession { donation: DonationContext; }
+export type DonationCheckoutSession = CheckoutSession & { donation: DonationContext; };
 export interface CustomerDonation extends DonationContext { paymentId: string; campaignId: string; amountMinor: number; currency: string; status: Exclude<PaymentStatus, 'UNKNOWN' | 'EXPIRED'>; messageState: 'PRESENT' | 'ABSENT' | 'REDACTED'; createdAt: string; updatedAt: string; }
 export interface CustomerDonationHistory { items: CustomerDonation[]; nextCursor: string | null; }
 const positive = (n: unknown): n is number => Number.isSafeInteger(n) && (n as number) > 0;

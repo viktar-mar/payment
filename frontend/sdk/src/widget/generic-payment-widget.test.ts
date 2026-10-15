@@ -84,7 +84,7 @@ for (const prior of ["ready", "succeeded"]) {
     else {
       if (loss === "expired") { record.expiresAt = "2000-01-01T00:00:00Z"; record.state.expiresAt = record.expiresAt; }
       if (loss === "mismatched") record.siteKey = "other-site";
-      if (loss === "unsupported") record.version = 2;
+      if (loss === "unsupported") record.version = 3;
       target.setItem(recordKey, JSON.stringify(record));
     }
     const before = requests.length; const events: string[] = [];
