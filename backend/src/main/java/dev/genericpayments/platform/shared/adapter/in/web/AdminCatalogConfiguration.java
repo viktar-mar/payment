@@ -11,8 +11,9 @@ import org.springframework.context.annotation.*;
 
 @Configuration(proxyBeanMethods = false)
 class AdminCatalogConfiguration {
-    @Bean CreatePaymentAccountService createPaymentAccountService(LoadPaymentAccountPort load, SavePaymentAccountPort save) {
-        return new CreatePaymentAccountService(load, save);
+    @Bean CreatePaymentAccountService createPaymentAccountService(LoadPaymentAccountPort load, SavePaymentAccountPort save,
+                                                                 PaymentAccountVerificationPort verification) {
+        return new CreatePaymentAccountService(load, save, verification);
     }
     @Bean SiteService siteService(LoadSitePort load, SaveSitePort save, LoadPaymentAccountPort accounts) {
         return new SiteService(load, save, accounts);

@@ -1,5 +1,27 @@
 # Local development through Stage 4
 
+## Stripe Sandbox credential binding (Stage 5A)
+
+Stripe remains disabled by default. Opt in with `PAYMENT_STRIPE_SANDBOX_ENABLED=true` and the fixed
+`stripe-sandbox-default` credential reference. Supply `PAYMENT_STRIPE_SANDBOX_SECRET_KEY`,
+`PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY`, and `PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET` through the
+owning process environment. The only allowed active profiles are `local` and/or `test`, with the
+optional `stripe-sandbox` marker. Every other active profile, including `prod` and `production`,
+fails startup when enabled. Test/restricted-test server keys and test publishable keys are required;
+key syntax validation does not prove validity or permissions. Never commit private credentials.
+
+Creating a Stripe Sandbox Payment Account reads `/v1/account` and checks its identity before saving.
+This does not establish that the publishable key matches: verify that separately in the opted-in
+Sandbox/UI checks. The runtime endpoint is fixed to `https://api.stripe.com`, redirects are refused,
+the SDK is `stripe-java:34.0.0` with its default API `2026-09-30.endive`, and automatic SDK retries
+are disabled. Account verification suspends the existing Admin save/audit transaction during the
+network read.
+
+A restricted key needs Account read, Products/Prices read+write, PaymentIntents read+write,
+Charges read, Refunds read+write, and Events read for manual recovery. Treat these permissions as
+unverified until those operations have passed the explicit real Sandbox checks; successful account
+identity lookup alone does not make a restricted key ready for payment operations.
+
 ## Stage 4 subscription rollout and acceptance
 
 Stage 4 is local Fake-provider functionality, not Stripe readiness. Enable subscriptions for the Site, publish a subscription Price, define explicit same-Product/currency transitions, then authenticate Customers again. Existing persisted sessions and Partner keys retain their old scopes; use new Customer sessions and new least-privilege `subscriptions:read` (including access checks) and/or `subscriptions:manage` Partner keys. Deploy the strict current SDK with its matching backend; do not infer authority from browser events or access hints. The SDK guide shows the Customer manager and trusted Partner access integration.
