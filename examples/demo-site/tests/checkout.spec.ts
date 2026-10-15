@@ -229,8 +229,11 @@ test.describe("one-time checkout demo", () => {
     await expect(widgetStatus(page)).toContainText("Ready to pay");
     const payment = await admin.waitForSinglePayment(fixture.siteId);
 
-    expect(await inspectStorage(page)).toEqual({
-      entryCount: 1,
+    expect(await inspectStorage(page, { apiBaseUrl: admin.backendUrl, siteKey: fixture.siteKey,
+      priceKey: fixture.priceKey, locale: "en", paymentId: payment.payment_id })).toEqual({
+      entryCount: 2,
+      recoveryEntryCount: 1,
+      publicConfigurationIsExact: true,
       keyIsNamespaced: true,
       hasExpectedFields: true,
       tokenLooksOpaque: true,
@@ -307,32 +310,41 @@ async function inspectEvents(page: Page): Promise<EventInspection> {
   });
 }
 
-async function inspectStorage(page: Page): Promise<Record<string, boolean | number>> {
-  return page.evaluate(() => {
+async function inspectStorage(page: Page, expected: { apiBaseUrl: string; siteKey: string; priceKey: string;
+  locale: string; paymentId: string }): Promise<Record<string, boolean | number>> {
+  return page.evaluate((expected) => {
     const entries = Object.entries(sessionStorage);
-    const [key, raw] = entries[0] ?? ["", ""];
-    let record: Record<string, unknown> = {};
-    try {
-      record = JSON.parse(raw) as Record<string, unknown>;
-    } catch {
-      // The returned booleans make malformed persistence fail without exposing its contents.
+    const recovery = entries.filter(([key]) => key.startsWith("generic-payments:v1:"));
+    const [key, raw] = recovery[0] ?? ["", ""];
+    function object(raw: string): Record<string, unknown> {
+      try { const value: unknown = JSON.parse(raw);
+        return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+      } catch { return {}; } // Booleans only: malformed persistence never exposes its contents.
     }
+    const record = object(raw);
+    const publicConfiguration = object(sessionStorage.getItem("demo:public-return-configuration:v1") ?? "");
     return {
       entryCount: entries.length,
-      keyIsNamespaced: key.startsWith("generic-payments:v1:"),
+      recoveryEntryCount: recovery.length,
+      publicConfigurationIsExact: Object.keys(publicConfiguration).sort().join(",") === "apiBaseUrl,locale,priceKey,siteKey" &&
+        publicConfiguration.apiBaseUrl === expected.apiBaseUrl && publicConfiguration.siteKey === expected.siteKey &&
+        publicConfiguration.priceKey === expected.priceKey && publicConfiguration.locale === expected.locale,
+      keyIsNamespaced: key === `generic-payments:v1:${encodeURIComponent(expected.apiBaseUrl)}:${expected.siteKey}:${expected.priceKey}`,
       hasExpectedFields:
-        Object.keys(record).sort().join(",") === "apiBaseUrl,checkoutId,checkoutToken,expiresAt,priceKey,siteKey,state,version" &&
-        ["version", "checkoutId", "checkoutToken", "expiresAt", "apiBaseUrl", "siteKey", "priceKey", "state"].every(
+        Object.keys(record).sort().join(",") === "apiBaseUrl,checkoutId,checkoutToken,confirmationMode,expiresAt,priceKey,providerType,siteKey,state,version" &&
+        ["version", "checkoutId", "checkoutToken", "expiresAt", "apiBaseUrl", "siteKey", "priceKey", "state", "providerType", "confirmationMode"].every(
           (field) => field in record,
         ) &&
+        record.version === 2 && record.providerType === "FAKE" && record.confirmationMode === "SERVER" &&
+        record.apiBaseUrl === expected.apiBaseUrl && record.siteKey === expected.siteKey && record.priceKey === expected.priceKey &&
         typeof record.state === "object" &&
         record.state !== null &&
-        "paymentId" in record.state &&
+        "paymentId" in record.state && record.state.paymentId === expected.paymentId &&
         "status" in record.state,
       tokenLooksOpaque: typeof record.checkoutToken === "string" && /^[A-Za-z0-9_-]{43}$/.test(record.checkoutToken),
       localStorageIsEmpty: localStorage.length === 0,
     };
-  });
+  }, expected);
 }
 
 async function expectNoSensitivePresentation(page: Page): Promise<void> {

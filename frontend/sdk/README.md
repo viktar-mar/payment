@@ -280,3 +280,16 @@ Exports include `GenericDonation`, `defineGenericDonation`, `DonationEventDetail
 Composed bubbling `donation-created`, `donation-state`, `donation-succeeded` events contain ONLY a fresh frozen `{donationId,paymentId,checkoutId,status}`. Creation/replay never emits `donation-succeeded`; a replay may return the current financial status, and a processing replay immediately resumes the common watcher. Only a subsequent common financial read/confirmation/watch transition emits that completion event. Trusted server-side completion is still required for fulfillment. The component clears its message input and captured intent/body references immediately after successful LOCAL creation, before waiting for payment. No message/Donation session is written to storage. Host code must likewise release its own inputs. Safe error copy never echoes the server body.
 
 Isolated CSS tokens: `--generic-donation-accent`, `--generic-donation-text`, `--generic-donation-background`, `--generic-donation-button-text`, `--generic-donation-border`, `--generic-donation-radius`, `--generic-donation-padding`, `--generic-donation-focus`, `--generic-donation-error`. No motion is introduced. Static demo accepts public `campaign_key` query configuration; it shows the existing catalog flow, optional email login, intentional anonymous toggle and real owned Donation history. Never put messages, tokens, email or administrative credentials in public configuration/URLs.
+# Stripe Sandbox acceptance boundary
+
+Default tests use controlled HTTP/browser fixtures and do not prove real Stripe acceptance.
+The demo's separate `playwright.stripe-sandbox.config.ts` requires both explicit opt-in flags,
+owned preprovisioned checkout identities and process-only credentials. It uses the actual
+Payment Element with official test cards, one worker and zero financial retries. Interrupted
+prepare/confirmation requires inspection of the original operation; never create another checkout
+to bypass uncertainty. Browser success and refund202 are not money facts: the server journal,
+signed callback and individual refund evidence must agree. Anonymous Donation authority remains
+memory-only and cannot be recovered from a Stripe return query.
+
+See [local acceptance and fixture handoff](../../docs/local-development.md#stage-5a-offline-regression-and-explicit-sandbox-acceptance).
+Real Sandbox, Donation, 3DS, matching-key and missed-webhook checks remain pending until executed.

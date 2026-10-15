@@ -1,5 +1,123 @@
 # Local development through Stage 4
 
+## Stage 5A offline regression and explicit Sandbox acceptance
+
+The default Maven suite includes `@stripe-sandbox` Cucumber scenarios using real PostgreSQL,
+application HTTP boundaries and the official Stripe SDK against an owned loopback HTTP fixture.
+Their generated synthetic credentials cannot establish real Stripe interoperability. Default
+Playwright excludes `stripe-sandbox.spec.ts`; Fake payment, Donation and subscription coverage and
+the built nginx privacy suite remain in default discovery. Fresh clones need only the local issuer
+generation described below, installed project dependencies and Docker—not ignored execution helpers.
+
+Final offline checks are backend `./mvnw verify`; SDK `pnpm test --run`, `pnpm typecheck`,
+`pnpm build`; Admin `pnpm test --run`, `pnpm typecheck`, `pnpm lint`, `pnpm build`; demo
+`pnpm exec vitest run src/payment-return.test.ts src/vite-return-privacy.test.ts`, `pnpm build`,
+`pnpm test:e2e --workers=1 --retries=0`; root
+`node --test --test-timeout=30000 --test-concurrency=1 infrastructure/*.test.mjs`.
+Default browser acceptance needs its own Fake backend/PostgreSQL/Mailpit/Admin/demo and explicit
+Stage 4 test clock inputs described below. A listening localhost port is not evidence of ownership.
+
+Real Sandbox acceptance is **PENDING until actually executed**. Key readiness alone does not authorize
+financial operations. Both commands require explicit local process flags
+`PAYMENT_STRIPE_SANDBOX_ENABLED=true` and `PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS=true`.
+The tooling never reads a Stripe env file, calls Stripe directly, installs/logs into the CLI, starts a
+listener, creates catalog/Account/Site fixtures, or changes an account's API version. Server keys stay
+in the backend. Keep `DEBUG`, `NODE_DEBUG` and `PWDEBUG` disabled.
+
+Before an authorized real run, prepare one owned Compose project named `stripe-…`, with backend,
+demo-site and callback-receiver published on distinct `http://127.0.0.1:<port>` origins. The receiver
+needs an explicit loopback host binding for its internal port 8080; default Compose does not publish it.
+Record each full container ID; the runner checks exact project/service labels, running state and host
+port mappings before sending credentials. Never reuse an unrelated listener. This
+acceptance tooling supports local POSIX Docker only: it rejects remote contexts/endpoints and pins
+each inspection to the validated local Unix socket without inherited Docker endpoint overrides.
+This prevents accidental remote-context confusion, not same-user OS-level socket impersonation. The Site
+callback points to that receiver's `/callback`, and its one-time returned signing secret is delivered
+to `/configure` in memory only. Do not rotate/recreate it merely to make a resumed run convenient.
+
+Provision through existing protected Admin APIs after separate authorization:
+
+1. Before each first write, record its stable resource key/name and idempotency key in an owner-only,
+   Git-ignored `test-results/stripe-sandbox/provisioning.json` ledger. Record returned safe IDs only
+   after a known response. Account/Site creation returns server-assigned UUIDs and does not offer a
+   general caller-ID/idempotency contract. An unknown outcome therefore requires inspection by the
+   original key; do not blindly retry or replace the key. Never store credentials, tokens or PII here.
+2. Create a STRIPE/SANDBOX Account using `stripe-sandbox-default`, the expected Sandbox `acct_…`
+   and server identity verification; create an active Site with the owned demo origin in its allowlist
+   and telemetry allowlist. Set its exact `/payment-return.html` URL through protected return-URL
+   policy with the current expected version. Publish one EUR 2000-minor-unit ONE_TIME Price, NONE/INCLUSIVE tax.
+3. Configure the owned callback receiver once. Create three distinct catalog checkouts using fixed
+   persisted creation keys: `success`, `decline`, `sca`. Record their safe Payment/checkout UUIDs.
+   Keep their checkout tokens only in the owning process environment; unknown create stops for
+   inspection of the SAME operation. Do not use a fresh checkout to bypass an uncertain result.
+4. Initialize the runner state once with the safe metadata below. The explicit initialization only
+   writes local state; it does not provision anything. It refuses an existing state. Supply the JSON
+   through `PAYMENT_SANDBOX_FIXTURE_JSON` (public fixture identity only), and a fresh UUID through
+   `PAYMENT_STRIPE_SANDBOX_RUN_ID`. Metadata is exactly:
+   `{runId, owners:{project,backend,demo,receiver}, endpoints:{backend,demo,receiver},
+   account:{id,key,externalId}, site:{id,key}, price:{id,key},
+   cases:{success:{paymentId,checkoutId},decline:{paymentId,checkoutId},sca:{paymentId,checkoutId}}`.
+
+```bash
+# Repository root; both explicit opt-in flags already set in this process.
+node --input-type=module <<'NODE'
+import {initializeStripeSandboxState} from './infrastructure/smoke-stage-5a.mjs';
+await initializeStripeSandboxState(JSON.parse(process.env.PAYMENT_SANDBOX_FIXTURE_JSON));
+console.log('Sandbox fixture state initialized; no platform operation executed.');
+NODE
+```
+
+Supply `PAYMENT_SANDBOX_ADMIN_USERNAME`, `PAYMENT_SANDBOX_ADMIN_PASSWORD` and
+`PAYMENT_SANDBOX_SUCCESS_CHECKOUT_TOKEN`, `PAYMENT_SANDBOX_DECLINE_CHECKOUT_TOKEN`,
+`PAYMENT_SANDBOX_SCA_CHECKOUT_TOKEN` through the explicit process environment. Never put values in
+argv, chat, URL, source, logs or the state file. State is fixed at repository-root
+`test-results/stripe-sandbox/<run UUID>/state.json`, mode 0600 in an owner-only directory. It retains
+only safe identity, fixed refund keys, safe refund IDs and phases. Node and browser share its exclusive
+lock; no concurrent run and no automatic stale-lock removal. After a crash, establish that the old
+owner has stopped and inspect the state before manually releasing its lock; preserve all keys/phases.
+
+```bash
+# examples/demo-site, against the explicitly owned, already running platform
+pnpm exec playwright test --config playwright.stripe-sandbox.config.ts
+# repository root, after browser/server confirmation
+node infrastructure/smoke-stage-5a.mjs
+```
+
+The separate browser configuration uses one worker, zero retries, no trace/screenshots/video,
+no retained output, and a fixed-line reporter that never prints errors, iframe URLs or payloads.
+It uses real Stripe-hosted fields and [official Stripe test cards](https://docs.stripe.com/testing):
+success, decline followed by success on the SAME intent, and 3DS. Selector or challenge changes fail
+as manual-check/PENDING; no mocked success fallback. Browser recovery uses the existing authorized
+catalog read/explicit Resume; its checkout token is only in the ephemeral browser context. PREPARING
+is persisted before navigation/client-session, CONFIRMING/RETRYING before each Pay. Interrupted phases
+permit server proof inspection only; they never automatically repeat preparation or confirmation.
+
+The Node runner checks original Account/Site/source/Price/EUR 2000 minor units and joins each success journal ID
+to the identical delivered outbox ID, successful delivery and signature-verified receiver event ID/type.
+Receiver transport duplicates are allowed; the financial fact remains exactly one. Only then may it
+submit the fixed 700 partial and 1300 remaining refunds, each with its previously persisted key and a
+durable DISPATCHING marker. A 202 response is not success. Each individual Refund reference, money,
+journal/callback and the final 2000 aggregate must be confirmed. Unknown dispatch without a recorded
+refund UUID stays PENDING: inspect the original operation and manually record only a verified owned
+UUID; never infer binding from amount or invent another key. Known IDs resume read-only. All reads
+refuse redirects, cap bodies at 64 KiB and complete within 10s; polling is at most 30 probes/45s per phase.
+Successful output contains only `paymentConfirmed`, `refundConfirmed`, `callbackVerified` booleans.
+
+External acceptance also requires separately recorded real anonymous/identified Donation evidence,
+matching publishable/server key behavior, Dashboard Site/source/amount attribution, and a genuinely
+missed webhook recovered by the existing Admin reconcile command. For that recovery evidence,
+record an initially absent success journal, intentionally controlled listener interruption, verified
+provider success and the subsequent reconciliation journal/callback; an already-succeeded no-op
+reconcile proves nothing. Listener handling and these financial fixtures need explicit authorization.
+These items remain PENDING when only the three catalog tests or offline fixtures were run.
+
+Before starting an authorized listener, verify its Sandbox/default snapshot API version is exactly
+`2026-09-30.endive`; stop if it differs. The [CLI listen reference](https://docs.stripe.com/cli/listen)
+does not supply an exact-version pin flag; `--latest` is not verification. Never change a production
+account/default version for this check. Use only the approved filtered events and Account-key URL
+documented below. Preserve fixtures, database volumes and operation state; stop only this run's
+recorded services/listener. No Sandbox result establishes live-payment readiness.
+
 ## Stripe Sandbox credential binding (Stage 5A)
 
 Stripe remains disabled by default. Opt in with `PAYMENT_STRIPE_SANDBOX_ENABLED=true` and the fixed

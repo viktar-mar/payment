@@ -6,6 +6,7 @@ const externalOrigin = process.env.PAYMENT_E2E_DEMO_ORIGIN;
 
 export default defineConfig({
   testDir: "./tests",
+  testIgnore: "stripe-sandbox.spec.ts",
   fullyParallel: false,
   workers: 1,
   retries: 1,
