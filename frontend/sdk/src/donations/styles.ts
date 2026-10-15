@@ -1,6 +1,7 @@
 export const donationStyles = `
 :host { display:block; color:var(--generic-donation-text,#17243a); font:inherit; }
 * { box-sizing:border-box; } [hidden] { display:none!important; }
+.payment-element { min-width:0; }
 form { display:grid; gap:1rem; padding:var(--generic-donation-padding,1rem); border:1px solid var(--generic-donation-border,#c2cad6); border-radius:var(--generic-donation-radius,.75rem); background:var(--generic-donation-background,#fff); }
 fieldset { display:flex; flex-wrap:wrap; gap:.6rem; border:0; padding:0; margin:0; }
 legend { margin-bottom:.5rem; font-weight:600; } label { display:block; }

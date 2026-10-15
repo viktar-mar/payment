@@ -140,6 +140,10 @@ packages:
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
 
+  '@stripe/stripe-js@10.1.0':
+    resolution: {integrity: sha512-sLRPukMKMxvRVrgV3Za8LM0Yd2azrixQjfaiuzS8Fivlu/Gt7VbBuRiRZJIvfL3XxAw+FdfdmhHSvjAfLG3lkA==}
+    engines: {node: '>=12.16'}
+
   '@types/node@25.9.6':
     resolution: {integrity: sha512-JR6Q/PV5DKFvjrGFVqQJdeG0qvsqQQLDa3TzFrqVwhqRXqwNaxPo2KYCtCQXpOdIulCouKwT7a6in9nFthBAzw==}
 
@@ -331,7 +335,9 @@ packages:
 
 snapshots:
 
-  '@generic-payments/sdk@file:../../frontend/sdk': {}
+  '@generic-payments/sdk@file:../../frontend/sdk':
+    dependencies:
+      '@stripe/stripe-js': 10.1.0
 
   '@oxc-project/types@0.152.0': {}
 
@@ -385,6 +391,8 @@ snapshots:
     optional: true
 
   '@rolldown/pluginutils@1.0.1': {}
+
+  '@stripe/stripe-js@10.1.0': {}
 
   '@types/node@25.9.6':
     dependencies:

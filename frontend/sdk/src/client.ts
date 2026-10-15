@@ -10,6 +10,7 @@ import { donationInput, parseCampaign, parseDonationContext } from './donations/
 import type { DonationCheckoutInput, DonationCheckoutSession } from './donations/contracts.js';
 import { createSubscriptionClient } from './subscriptions/client.js';
 import { parseClientPaymentSession, parseClientSessionJson } from './providers/client-session.js';
+import { captureCheckoutCustomer } from './customer/session-lifecycle.js';
 const binding = (parsed: ReturnType<typeof parseWire>) => parsed.providerType === 'FAKE' ? { providerType: 'FAKE', confirmationMode: 'SERVER' } as const : { providerType: 'STRIPE', confirmationMode: 'CLIENT_PROVIDER' } as const;
 function snapshotSession<T extends CheckoutSession>(session: T): T { return { ...session, state: safeState(session.state), ...(session.donation ? { donation: { ...session.donation } } : {}) }; }
 function assertUnchangedSession(session: CheckoutSession, snapshot: CheckoutSession): void {
@@ -56,22 +57,25 @@ export function createGenericPaymentClient(options: ClientOptions): GenericPayme
   async function createDonation(input: DonationCheckoutInput): Promise<DonationCheckoutSession> {
     donationInput(input, true);
     const owned = input.customerSession !== 'omit' ? customer.catalog(input.siteKey) : undefined;
-    let intentKey = input.idempotencyKey ?? donationIntents.get(input);
-    if (!intentKey) { intentKey = crypto.randomUUID(); donationIntents.set(input, intentKey); }
-    const path = `/api/v1/public/sites/${encodeURIComponent(input.siteKey)}/donation-campaigns/${encodeURIComponent(input.campaignKey)}/checkouts`;
-    const body: { amount_minor: number; message?: string } = { amount_minor: input.amountMinor };
-    if (input.message !== undefined) body.message = input.message.normalize('NFC');
-    let raw: unknown;
-    try { raw = owned ? await customer.authorized(owned, path, 'POST', body, input.signal, [201], intentKey, 'CHECKOUT_CREATE', undefined, 32768) : await request(path, 'POST', body, { kind: 'none' }, intentKey, input.signal, [201]); }
-    catch (error) { if (error instanceof PaymentSdkError && ['INVALID_SESSION', 'SESSION_EXPIRED'].includes(error.code)) donationIntents.delete(input); throw error; }
-    finally { delete body.message; }
-    if (!object(raw) || raw.price !== null) throw new PaymentSdkError('INVALID_RESPONSE');
-    const { donation: context, ...checkout } = raw; const donation = parseDonationContext(context);
-    if (donation.campaignKey !== input.campaignKey) throw new PaymentSdkError('INVALID_RESPONSE');
-    const parsed = parseWire(checkout, true);
-    if (parsed.state.amountMinor !== input.amountMinor) throw new PaymentSdkError('INVALID_RESPONSE');
-    const session: DonationCheckoutSession = { checkoutId: parsed.state.checkoutId, checkoutToken: parsed.checkoutToken!, expiresAt: parsed.state.expiresAt, apiBaseUrl: base, siteKey: input.siteKey, priceKey: input.campaignKey, state: parsed.state, donation, ...binding(parsed), providerClientPayload: {} };
-    checkAbort(signalFor(input.signal)); checkSession(session); return session;
+    const lifecycle = captureCheckoutCustomer(owned);
+    try {
+      let intentKey = input.idempotencyKey ?? donationIntents.get(input);
+      if (!intentKey) { intentKey = crypto.randomUUID(); donationIntents.set(input, intentKey); }
+      const path = `/api/v1/public/sites/${encodeURIComponent(input.siteKey)}/donation-campaigns/${encodeURIComponent(input.campaignKey)}/checkouts`;
+      const body: { amount_minor: number; message?: string } = { amount_minor: input.amountMinor };
+      if (input.message !== undefined) body.message = input.message.normalize('NFC');
+      let raw: unknown;
+      try { raw = owned ? await customer.authorized(owned, path, 'POST', body, input.signal, [201], intentKey, 'CHECKOUT_CREATE', undefined, 32768) : await request(path, 'POST', body, { kind: 'none' }, intentKey, input.signal, [201]); }
+      catch (error) { if (error instanceof PaymentSdkError && ['INVALID_SESSION', 'SESSION_EXPIRED'].includes(error.code)) donationIntents.delete(input); throw error; }
+      finally { delete body.message; }
+      if (!object(raw) || raw.price !== null) throw new PaymentSdkError('INVALID_RESPONSE');
+      const { donation: context, ...checkout } = raw; const donation = parseDonationContext(context);
+      if (donation.campaignKey !== input.campaignKey) throw new PaymentSdkError('INVALID_RESPONSE');
+      const parsed = parseWire(checkout, true);
+      if (parsed.state.amountMinor !== input.amountMinor) throw new PaymentSdkError('INVALID_RESPONSE');
+      const session: DonationCheckoutSession = { checkoutId: parsed.state.checkoutId, checkoutToken: parsed.checkoutToken!, expiresAt: parsed.state.expiresAt, apiBaseUrl: base, siteKey: input.siteKey, priceKey: input.campaignKey, state: parsed.state, donation, ...binding(parsed), providerClientPayload: {} };
+      checkAbort(signalFor(input.signal)); checkSession(session); lifecycle.bind(session); return session;
+    } finally { lifecycle.release(); }
   }
   function validInput(input: CatalogCheckoutInput | HandoffInput, handoff: boolean): void {
     const allowed = ["siteKey", "priceKey", "signal", ...(handoff ? ["handoffToken"] : ["customerSession"])];
@@ -82,10 +86,13 @@ export function createGenericPaymentClient(options: ClientOptions): GenericPayme
   async function created(input: CatalogCheckoutInput | HandoffInput, handoff: boolean): Promise<CheckoutSession> {
     validInput(input, handoff);
     const owned = !handoff && (input as CatalogCheckoutInput).customerSession !== "omit" ? customer.catalog(input.siteKey) : undefined;
-    const raw = owned ? await customer.authorized(owned, `/api/v1/public/sites/${encodeURIComponent(input.siteKey)}/checkouts`, "POST", { price_key: input.priceKey }, input.signal, [201], crypto.randomUUID(), "CHECKOUT_CREATE", undefined, 32768) : await request(handoff ? "/api/v1/public/handoffs" : `/api/v1/public/sites/${encodeURIComponent(input.siteKey)}/checkouts`, "POST", handoff ? { handoff_token: (input as HandoffInput).handoffToken } : { price_key: input.priceKey }, undefined, handoff ? undefined : crypto.randomUUID(), input.signal);
-    const parsed = parseWire(raw, true);
-    const session: CheckoutSession = { checkoutId: parsed.state.checkoutId, checkoutToken: parsed.checkoutToken!, expiresAt: parsed.state.expiresAt, apiBaseUrl: base, siteKey: input.siteKey, priceKey: input.priceKey, state: parsed.state, ...binding(parsed), providerClientPayload: {} };
-    checkAbort(signalFor(input.signal)); checkSession(session); saveCheckout(session); return session;
+    const lifecycle = captureCheckoutCustomer(owned);
+    try {
+      const raw = owned ? await customer.authorized(owned, `/api/v1/public/sites/${encodeURIComponent(input.siteKey)}/checkouts`, "POST", { price_key: input.priceKey }, input.signal, [201], crypto.randomUUID(), "CHECKOUT_CREATE", undefined, 32768) : await request(handoff ? "/api/v1/public/handoffs" : `/api/v1/public/sites/${encodeURIComponent(input.siteKey)}/checkouts`, "POST", handoff ? { handoff_token: (input as HandoffInput).handoffToken } : { price_key: input.priceKey }, undefined, handoff ? undefined : crypto.randomUUID(), input.signal);
+      const parsed = parseWire(raw, true);
+      const session: CheckoutSession = { checkoutId: parsed.state.checkoutId, checkoutToken: parsed.checkoutToken!, expiresAt: parsed.state.expiresAt, apiBaseUrl: base, siteKey: input.siteKey, priceKey: input.priceKey, state: parsed.state, ...binding(parsed), providerClientPayload: {} };
+      checkAbort(signalFor(input.signal)); checkSession(session); lifecycle.bind(session); saveCheckout(session); return session;
+    } finally { lifecycle.release(); }
   }
   async function update(session: CheckoutSession, method: "GET" | "POST", signal?: AbortSignal): Promise<CheckoutState> {
     checkSession(session);

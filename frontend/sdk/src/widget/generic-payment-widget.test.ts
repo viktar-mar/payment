@@ -1,4 +1,8 @@
 import { it, expect, vi } from "vitest";
+vi.mock('../providers/stripe-loader.js', () => ({ loadStripeClient: vi.fn() }));
+import { stripeUiProvider, stripeWire, stripeReadWire, stripeCapability } from '../test/stripe-ui-fixtures.js';
+import { createGenericPaymentClient } from '../client.js';
+import { authInput, customerWire } from '../test/customer-fixtures.js';
 import userEvent from "@testing-library/user-event";
 import { defineGenericPaymentWidget, GenericPaymentWidget } from "./generic-payment-widget.js";
 import { wire, readWire, json, token } from "../test/fixtures.js";
@@ -6,7 +10,130 @@ defineGenericPaymentWidget();
 function mount() { const el = document.createElement("generic-payment-widget") as GenericPaymentWidget; el.siteKey = "test-site"; el.priceKey = "lifetime"; el.apiBaseUrl = "https://api.test"; document.body.append(el); return el; }
 const button = (el: GenericPaymentWidget) => el.shadowRoot!.querySelector("button")!;
 const status = (el: GenericPaymentWidget) => el.shadowRoot!.querySelector('[role="status"]')!;
+function stripeApi(backend = 'CREATED') {
+  const requests: Request[] = [];
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { requests.push(new Request(url, init)); return json(url.endsWith('/client-session') ? stripeCapability() : init.method === 'GET' ? stripeReadWire(backend) : stripeWire(), url.endsWith('/checkouts') ? 201 : 200); });
+  return requests;
+}
+async function stripeReady(el: GenericPaymentWidget, p: ReturnType<typeof stripeUiProvider>) {
+  button(el).click(); await vi.waitFor(() => expect(el.shadowRoot!.querySelector('iframe')).toBe(p.frame)); p.emit('ready'); await until(el, 'ready');
+}
 async function until(el: GenericPaymentWidget, state: string) { await vi.waitFor(() => expect(el.state).toBe(state)); }
+it('does not expose provider values or perform network work before authorization', () => {
+  const fetch = vi.fn(); vi.stubGlobal('fetch', fetch); const el = mount(); expect(el.shadowRoot!.innerHTML).not.toMatch(/clientSecret|pk_test_|pi_.*_secret/); expect(fetch).not.toHaveBeenCalled();
+});
+it('expires the Stripe capability immediately with safe status and no new operation', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true }); const p = stripeUiProvider(), requests = stripeApi(), el = mount(); await stripeReady(el, p);
+  await vi.advanceTimersByTimeAsync(Date.parse(wire().expires_at) - Date.now() + 1);
+  expect(el.state).toBe('expired'); expect(p.element.destroy).toHaveBeenCalledOnce(); expect(el.shadowRoot!.querySelector('iframe')).toBeNull(); expect(requests).toHaveLength(2);
+});
+it('offers explicit same-handle action after a later verified REQUIRES_ACTION without replaying automatically', async () => {
+  const p = stripeUiProvider(), requests = stripeApi(), el = mount(); await stripeReady(el, p); button(el).click(); await until(el, 'checking');
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { requests.push(new Request(url, init)); return json(stripeReadWire('REQUIRES_ACTION')); });
+  button(el).click(); await until(el, 'ready'); expect(button(el).textContent).toBe('Pay'); expect(p.stripe.confirmPayment).toHaveBeenCalledOnce(); expect(requests).toHaveLength(4);
+});
+it('suppresses late Stripe confirmation after configuration change without a refresh or success event', async () => {
+  const p = stripeUiProvider(), requests = stripeApi('SUCCEEDED'), el = mount(); await stripeReady(el, p); let finish!: (value: unknown) => void;
+  p.stripe.confirmPayment.mockImplementation(() => new Promise(r => { finish = r; })); const succeeded = vi.fn(); el.addEventListener('succeeded', succeeded); button(el).click(); el.priceKey = 'other-key'; finish({}); await Promise.resolve(); await Promise.resolve();
+  expect(requests).toHaveLength(2); expect(succeeded).not.toHaveBeenCalled(); expect(el.state).toBe('idle');
+});
+it.each(['CREATED', 'REQUIRES_PAYMENT_METHOD', 'REQUIRES_ACTION'])('does not retry failed Stripe preparation on status checking %s', async backend => {
+  const p = stripeUiProvider(), requests: Request[] = [];
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { requests.push(new Request(url, init)); if (url.endsWith('/client-session')) throw new TypeError('raw secret'); return json(init.method === 'GET' ? stripeReadWire(backend) : stripeWire()); });
+  const el = mount(); button(el).click(); await until(el, 'unknown'); expect(requests).toHaveLength(2); button(el).click(); await until(el, 'checking'); await vi.waitFor(() => expect(button(el)).toBeEnabled()); expect(button(el).textContent).toBe('Check status'); expect(requests.map(r => r.method)).toEqual(['POST', 'POST', 'GET']); expect(p.stripe.elements).not.toHaveBeenCalled();
+});
+it('gates Stripe Pay on ready and preserves the secure host across status and presentation updates', async () => {
+  const p = stripeUiProvider(), requests = stripeApi('SUCCEEDED'), el = mount();
+  button(el).click(); await vi.waitFor(() => expect(el.shadowRoot!.querySelector('iframe')).toBe(p.frame));
+  expect(button(el).textContent).not.toBe('Pay'); expect(button(el)).toBeDisabled(); const host = p.frame.parentElement;
+  el.locale = 'pt-PT'; el.style.setProperty('--gp-accent', '#abcdef'); el.dispatchEvent(new Event('payment-theme-change'));
+  p.emit('ready'); await until(el, 'ready'); expect(p.frame.parentElement).toBe(host); expect(p.elements.update).toHaveBeenLastCalledWith(expect.objectContaining({ locale: 'pt', appearance: expect.objectContaining({ variables: expect.objectContaining({ colorPrimary: '#abcdef' }) }) }));
+  const user = userEvent.setup(); button(el).focus(); await user.keyboard('{Enter}'); await until(el, 'succeeded');
+  expect(requests.map(r => r.method)).toEqual(['POST', 'POST', 'GET']); expect(p.stripe.confirmPayment).toHaveBeenCalledOnce(); expect(p.element.destroy).toHaveBeenCalledOnce();
+  expect(el.shadowRoot!.innerHTML + JSON.stringify({ ...sessionStorage })).not.toMatch(/pk_test_fixture|pi_fixture|clientSecret/);
+});
+it.each(['unknown', 'refresh-failure', 'unsettled'])('keeps Stripe %s checking without a second financial operation or immediate redundant read', async kind => {
+  const p = stripeUiProvider(), requests = stripeApi(), el = mount(); await stripeReady(el, p);
+  if (kind === 'unknown') p.stripe.confirmPayment.mockRejectedValue(new Error('pi_fixture_secret_sensitive'));
+  if (kind === 'refresh-failure') vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { requests.push(new Request(url, init)); throw new TypeError('raw secret'); });
+  button(el).click(); button(el).dispatchEvent(new MouseEvent('click'));
+  await vi.waitFor(() => expect(status(el).textContent).toContain('Checking payment')); expect(button(el).textContent).toBe('Check status');
+  expect(requests.map(r => r.method)).toEqual(['POST', 'POST', 'GET']); expect(p.stripe.confirmPayment).toHaveBeenCalledOnce();
+  await Promise.resolve(); expect(requests).toHaveLength(3); expect(el.shadowRoot!.textContent).not.toContain('secret');
+  vi.stubGlobal('fetch', async () => json(stripeReadWire('CREATED'))); button(el).click(); await vi.waitFor(() => expect(button(el)).toBeEnabled()); expect(button(el).textContent).toBe('Check status');
+  vi.stubGlobal('fetch', async () => json(stripeReadWire('REQUIRES_PAYMENT_METHOD'))); button(el).click(); await until(el, 'ready'); expect(button(el).textContent).toBe('Pay');
+});
+it('keeps Stripe input decline ready on the same live card and never emits failed', async () => {
+  const p = stripeUiProvider(), requests = stripeApi(), el = mount(); await stripeReady(el, p); const failed = vi.fn(); el.addEventListener('failed', failed);
+  p.stripe.confirmPayment.mockResolvedValue({ error: { type: 'validation_error', message: 'raw sensitive' } }); button(el).click();
+  await vi.waitFor(() => expect(p.element.focus).toHaveBeenCalledOnce()); await vi.waitFor(() => expect(button(el)).toBeEnabled()); expect(el.state).toBe('ready'); expect(el.shadowRoot!.activeElement).toBe(p.frame); expect(failed).not.toHaveBeenCalled(); expect(requests).toHaveLength(3);
+});
+it('lets backend success win over browser card error exactly once', async () => {
+  const p = stripeUiProvider(), requests = stripeApi('SUCCEEDED'), el = mount(); await stripeReady(el, p); const success = vi.fn(); el.addEventListener('succeeded', success);
+  p.stripe.confirmPayment.mockResolvedValue({ error: { type: 'card_error' } }); button(el).click(); await until(el, 'succeeded'); expect(success).toHaveBeenCalledOnce(); expect(requests).toHaveLength(3);
+});
+it.each(['site-key', 'api-base-url', 'price-key', 'disconnect'])('destroys pending Stripe readiness on %s and suppresses late ready', async change => {
+  const p = stripeUiProvider(); stripeApi(); const el = mount(); button(el).click(); await vi.waitFor(() => expect(el.shadowRoot!.querySelector('iframe')).toBeTruthy());
+  if (change === 'disconnect') el.remove(); else el.setAttribute(change, change === 'api-base-url' ? 'https://other.test' : 'other-key');
+  expect(p.element.destroy).toHaveBeenCalledOnce(); p.emit('ready'); await Promise.resolve(); expect(el.shadowRoot!.querySelector('iframe')).toBeNull(); if (change !== 'disconnect') expect(el.state).toBe('idle');
+});
+it.each([['same-instance-unknown', 'CREATED'], ['fresh', 'CREATED'], ['fresh', 'REQUIRES_PAYMENT_METHOD'], ['fresh', 'REQUIRES_ACTION']])('recovered Stripe %s %s requires explicit Resume then separate ready Pay on the same checkout', async (kind, backend) => {
+  const p = stripeUiProvider(), requests = stripeApi(backend), first = mount(); await stripeReady(first, p);
+  if (kind === 'same-instance-unknown') { p.stripe.confirmPayment.mockRejectedValue(new Error('offline')); button(first).click(); await until(first, 'checking'); }
+  first.remove(); const el = kind === 'fresh' ? mount() : first; if (kind !== 'fresh') document.body.append(el);
+  await until(el, 'checking'); const expected = kind === 'fresh' ? 3 : 4; expect(requests).toHaveLength(expected); expect(requests.at(-1)!.method).toBe('GET'); expect(p.frame.isConnected).toBe(false);
+  const resume = [...el.shadowRoot!.querySelectorAll('button')].find(b => b.textContent === 'Resume existing payment'); expect(resume).toBeDefined(); await vi.waitFor(() => expect(resume).toBeEnabled()); expect(resume).toBeVisible(); resume!.click(); resume!.click();
+  await vi.waitFor(() => expect(el.shadowRoot!.querySelector('iframe')).toBe(p.frame)); expect(requests).toHaveLength(expected + 1); expect(requests.at(-1)!.url).toMatch(/11111111-1111-4111-8111-111111111111\/client-session$/); expect(p.stripe.confirmPayment).toHaveBeenCalledTimes(kind === 'fresh' ? 0 : 1); expect(button(el).textContent).not.toBe('Pay');
+  p.emit('ready'); await until(el, 'ready'); expect(button(el).textContent).toBe('Pay'); expect(requests.filter(r => r.url.endsWith('/sites/test-site/checkouts'))).toHaveLength(1);
+});
+it('failed explicit Stripe recovery stays checking with no automatic retry', async () => {
+  const p = stripeUiProvider(), requests = stripeApi(), first = mount(); await stripeReady(first, p); first.remove(); const el = mount(); await until(el, 'checking');
+  const resume = el.shadowRoot!.querySelectorAll('button')[1]; await vi.waitFor(() => expect(resume).toBeEnabled());
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { requests.push(new Request(url, init)); throw new TypeError('sensitive'); }); resume.click(); await vi.waitFor(() => expect(button(el)).toBeEnabled()); expect(el.state).toBe('checking'); expect(requests).toHaveLength(4); expect(p.stripe.confirmPayment).not.toHaveBeenCalled();
+});
+it('backend checkout expiry during a manual check destroys the live Stripe form', async () => {
+  const p = stripeUiProvider(); stripeApi(); const el = mount(); await stripeReady(el, p); button(el).click(); await until(el, 'checking');
+  vi.stubGlobal('fetch', async () => json({ code: 'CHECKOUT_EXPIRED' }, 410)); button(el).click(); await until(el, 'expired'); expect(p.element.destroy).toHaveBeenCalledOnce(); expect(el.shadowRoot!.querySelector('iframe')).toBeNull();
+});
+it('a recovered processing checkout that becomes actionable offers Resume without an automatic POST', async () => {
+  const p = stripeUiProvider(); stripeApi(); const first = mount(); await stripeReady(first, p); first.remove(); let reads = 0;
+  vi.stubGlobal('fetch', async () => json(stripeReadWire(++reads === 1 ? 'PROCESSING' : 'REQUIRES_PAYMENT_METHOD'))); const recovered = mount();
+  await vi.waitFor(() => expect(reads).toBe(2)); await vi.waitFor(() => expect(button(recovered)).toBeEnabled()); expect(recovered.state).toBe('checking'); expect(button(recovered).textContent).toBe('Check status'); const resume = recovered.shadowRoot!.querySelectorAll('button')[1]; expect(resume).toBeVisible(); expect(p.frame.isConnected).toBe(false);
+});
+it('conservatively invalidates recovered Stripe namespace on Customer logout', async () => {
+  const client = createGenericPaymentClient({ apiBaseUrl: 'https://api.test' }); vi.stubGlobal('fetch', async () => json(customerWire())); const customer = await client.exchangeSiteToken(authInput);
+  const p = stripeUiProvider(); stripeApi(); const first = mount(); await stripeReady(first, p); first.remove(); const recovered = mount(); await until(recovered, 'checking');
+  vi.stubGlobal('fetch', () => new Promise<Response>(() => {})); void client.logoutCustomerSession(customer).catch(() => {}); expect(recovered.state).toBe('idle'); expect(button(recovered).textContent).toBe('Start checkout');
+});
+it.each(['logout', 'replacement', 'memory-only'])('cleans original Customer Stripe capability immediately on %s', async kind => {
+  const p = stripeUiProvider(), client = createGenericPaymentClient({ apiBaseUrl: 'https://api.test' }); vi.stubGlobal('fetch', async () => json(customerWire()));
+  const storage = kind === 'memory-only' ? vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw Error('quota'); }) : undefined;
+  const customer = await client.exchangeSiteToken(authInput); storage?.mockRestore(); stripeApi();
+  // Memory-only fallback belongs to the authenticating client; catalog consumer here
+  // uses persistent authority in normal cases. Direct creation covers memory below.
+  if (kind === 'memory-only') {
+    vi.stubGlobal('fetch', async () => json(stripeWire(), 201)); const session = await client.createCatalogCheckout({ siteKey: 'test-site', priceKey: 'lifetime' });
+    const { subscribeCheckoutCustomer } = await import('../customer/session-lifecycle.js'); let invalidated = false; const unsubscribe = subscribeCheckoutCustomer(session, () => { invalidated = true; });
+    vi.stubGlobal('fetch', () => new Promise<Response>(() => {})); void client.logoutCustomerSession(customer).catch(() => {}); expect(invalidated).toBe(true); unsubscribe(); return;
+  }
+  const el = mount(); await stripeReady(el, p);
+  vi.stubGlobal('fetch', kind === 'replacement' ? async () => json({ ...customerWire(), session_token: 'N'.repeat(43) }) : () => new Promise<Response>(() => {}));
+  if (kind === 'replacement') await client.exchangeSiteToken(authInput); else void client.logoutCustomerSession(customer).catch(() => {});
+  expect(p.element.destroy).toHaveBeenCalledOnce(); expect(el.shadowRoot!.querySelector('iframe')).toBeNull(); expect(button(el).textContent).not.toBe('Pay');
+});
+it('stale old-token logout cannot destroy a newer known checkout', async () => {
+  const client = createGenericPaymentClient({ apiBaseUrl: 'https://api.test' }); vi.stubGlobal('fetch', async () => json(customerWire())); const old = await client.exchangeSiteToken(authInput);
+  vi.stubGlobal('fetch', async () => json({ ...customerWire(), session_token: 'N'.repeat(43) })); await client.exchangeSiteToken(authInput);
+  const p = stripeUiProvider(); stripeApi(); const el = mount(); await stripeReady(el, p);
+  vi.stubGlobal('fetch', async () => new Response(null, { status: 204 })); await client.logoutCustomerSession(old); expect(p.element.destroy).not.toHaveBeenCalled(); expect(button(el)).toBeEnabled();
+});
+it.each(['logout', 'replacement'])('suppresses old Customer checkout response when %s occurs during creation', async kind => {
+  const client = createGenericPaymentClient({ apiBaseUrl: 'https://api.test' }); vi.stubGlobal('fetch', async () => json(customerWire())); const customer = await client.exchangeSiteToken(authInput);
+  const p = stripeUiProvider(); let release!: (r: Response) => void; vi.stubGlobal('fetch', () => new Promise<Response>(r => { release = r; })); const el = mount(); button(el).click();
+  vi.stubGlobal('fetch', async () => kind === 'logout' ? new Response(null, { status: 204 }) : json({ ...customerWire(), session_token: 'N'.repeat(43) }));
+  if (kind === 'logout') await client.logoutCustomerSession(customer); else await client.exchangeSiteToken(authInput);
+  release(json(stripeWire(), 201)); await vi.waitFor(() => expect(el.state).not.toBe('loading')); expect(el.state).not.toBe('ready'); expect(p.stripe.elements).not.toHaveBeenCalled();
+});
 it("registers idempotently, renders idle shadow UI with labels, focus, theme and reduced motion", () => {
   defineGenericPaymentWidget(); const el = mount(); expect(el.state).toBe("idle"); expect(button(el).textContent).toBe("Start checkout"); expect(status(el).getAttribute("aria-live")).toBe("polite");
   expect(el.shadowRoot!.querySelector("style")!.textContent).toContain("--gp-accent"); expect(el.shadowRoot!.querySelector("style")!.textContent).toContain("prefers-reduced-motion"); expect(el.shadowRoot!.querySelector("style")!.textContent).toContain(":focus-visible");
