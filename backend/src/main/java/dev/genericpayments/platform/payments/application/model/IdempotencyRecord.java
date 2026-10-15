@@ -12,7 +12,7 @@ public record IdempotencyRecord(UUID id, String scope, String key, String finger
 
     public enum Status { IN_PROGRESS, COMPLETED }
     public enum SecretState { NONE, LIVE, EXPIRED }
-    public enum ResourceType { PAYMENT, CHECKOUT, HANDOFF, REFUND, OUTBOX_EVENT, OUTBOX_RETRY_REQUEST, DONATION_CAMPAIGN }
+    public enum ResourceType { PAYMENT, CHECKOUT, HANDOFF, REFUND, OUTBOX_EVENT, OUTBOX_RETRY_REQUEST, DONATION_CAMPAIGN, ATTEMPT }
     public enum Actor { PUBLIC, PARTNER, ADMIN }
     public record Resource(ResourceType type, UUID id) {
         public Resource { Objects.requireNonNull(type); Objects.requireNonNull(id); }
@@ -22,7 +22,7 @@ public record IdempotencyRecord(UUID id, String scope, String key, String finger
         public Scope {
             Objects.requireNonNull(actor); Objects.requireNonNull(siteId); Objects.requireNonNull(operation);
             if ((actor == Actor.ADMIN) != (actorId != null)) throw new IllegalArgumentException("Invalid scope actor");
-            if (operation == Operation.CHECKOUT_CONFIRM && subjectId == null)
+            if ((operation == Operation.CHECKOUT_CONFIRM || operation == Operation.CHECKOUT_CLIENT_SESSION) && subjectId == null)
                 throw new IllegalArgumentException("Checkout confirmation scope requires its checkout identity");
         }
         public static Scope partner(UUID site, Operation operation) { return new Scope(Actor.PARTNER,site,null,operation,null); }

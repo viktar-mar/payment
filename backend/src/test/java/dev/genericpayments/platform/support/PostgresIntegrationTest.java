@@ -40,7 +40,7 @@ public abstract class PostgresIntegrationTest {
               email_otp_challenges, oidc_authentication_attempts, consumed_site_token_jtis,
               customer_rate_limit_buckets, customer_sessions, customer_identity_subject_aliases, customer_identities, identity_provider_configurations,
               outbox_deliveries, outbox_retry_requests, outbox_events, provider_inbox, provider_operations, fake_provider_operations, fake_provider_objects,
-              checkout_sessions, idempotency_records, site_callback_configs,
+              checkout_return_urls, checkout_sessions, idempotency_records, site_callback_configs,
               site_callback_secret_versions, site_api_keys, payment_events, payment_event_sequences,
               refunds, provider_charge_receipts, payment_client_attempts, payment_attempts, payments, donations, donation_campaign_suggested_amounts,
               donation_campaigns, customers, admin_sessions, admin_users, audit_log,

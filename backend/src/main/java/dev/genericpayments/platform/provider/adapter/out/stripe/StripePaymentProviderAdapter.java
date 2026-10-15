@@ -43,7 +43,8 @@ public class StripePaymentProviderAdapter implements PaymentProviderPort {
         this.accounts=accounts;
     }
 
-    @Override public PaymentProviderCapabilities capabilities(PaymentAccount account) {
+    @Override @Transactional(propagation = Propagation.SUPPORTS, readOnly = true)
+    public PaymentProviderCapabilities capabilities(PaymentAccount account) {
         credentials.resolve(account);
         return new PaymentProviderCapabilities(Set.of(TaxMode.NONE, TaxMode.INCLUSIVE), Set.of(PaymentMethod.CARD),
             PaymentProviderCapabilities.ConfirmationMode.CLIENT_PROVIDER);

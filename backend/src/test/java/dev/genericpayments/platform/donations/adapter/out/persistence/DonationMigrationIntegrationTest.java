@@ -62,7 +62,7 @@ class DonationMigrationIntegrationTest extends PostgresIntegrationTest {
             assertThatThrownBy(()->jdbc.update("update site_api_keys set scopes=?::jsonb where id=?",invalid,key))
                 .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
         assertThat(jdbc.queryForList("select version from flyway_schema_history where success and version is not null order by installed_rank",String.class))
-            .containsExactly("1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22");
+            .containsExactly("1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","23");
     }
 
     UUID campaign,donation;

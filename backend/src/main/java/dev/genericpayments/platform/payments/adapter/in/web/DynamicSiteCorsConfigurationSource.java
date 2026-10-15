@@ -11,7 +11,7 @@ import org.springframework.web.cors.*;
 
 public final class DynamicSiteCorsConfigurationSource implements CorsConfigurationSource {
     private static final Pattern CREATE = Pattern.compile("^/api/v1/public/sites/([^/]+)/checkouts$");
-    private static final Pattern CHECKOUT = Pattern.compile("^/api/v1/public/checkouts/([^/]+)(/confirm)?$");
+    private static final Pattern CHECKOUT = Pattern.compile("^/api/v1/public/checkouts/([^/]+)(/(?:confirm|client-session))?$");
     private final CheckoutAuthorizationService authorization;
     private final dev.genericpayments.platform.sites.application.port.out.LoadSitePort sites;
     public DynamicSiteCorsConfigurationSource(CheckoutAuthorizationService authorization, dev.genericpayments.platform.sites.application.port.out.LoadSitePort sites) { this.authorization = authorization; this.sites = sites; }

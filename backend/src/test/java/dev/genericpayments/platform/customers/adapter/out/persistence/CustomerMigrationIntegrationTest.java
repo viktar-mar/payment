@@ -48,7 +48,7 @@ class CustomerMigrationIntegrationTest extends PostgresIntegrationTest {
         jdbc.update("update site_api_keys set scopes='[\"customers:read\",\"customers:manage\"]' where id=?",key);
         for (String invalid : new String[]{"[]", "{}", "[\"admin\"]", "[\"customers:read\",null]"})
             assertThatThrownBy(() -> jdbc.update("update site_api_keys set scopes=?::jsonb where id=?",invalid,key)).isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
-        assertThat(jdbc.queryForList("select version from flyway_schema_history where success and version is not null order by installed_rank",String.class)).containsExactly("1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22");
+        assertThat(jdbc.queryForList("select version from flyway_schema_history where success and version is not null order by installed_rank",String.class)).containsExactly("1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","23");
         assertThat(jdbc.queryForList("select column_name from information_schema.columns where table_schema=? and table_name='email_otp_challenges'",String.class,schema))
             .contains("provider_key");
     }
