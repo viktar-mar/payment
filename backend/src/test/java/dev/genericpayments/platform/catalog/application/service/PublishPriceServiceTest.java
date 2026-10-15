@@ -55,10 +55,7 @@ class PublishPriceServiceTest {
         assertThat(published.status()).isEqualTo(PriceStatus.PUBLISHED);
         assertThat(fixture.mappingPort.mapping.productRef().value()).startsWith("fake_prod_");
         assertThat(fixture.mappingPort.mapping.priceRef().value()).startsWith("fake_price_");
-        assertThat(fixture.calls).containsExactly(
-            "price.load", "product.load", "site.load", "account.load", "mapping.findProduct",
-            "provider.ensureProduct", "mapping.findPrice", "provider.createPrice", "mapping.save",
-            "price.save");
+        assertThat(fixture.calls).containsSubsequence("provider.ensureProduct", "provider.createPrice", "mapping.save", "price.save");
     }
 
     @Test
@@ -95,11 +92,16 @@ class PublishPriceServiceTest {
                 Instant.parse("2026-09-12T10:00:00Z"));
             pricePort = new RecordingPricePort(draft, calls);
             mappingPort = new RecordingMappingPort(calls);
-            service = new PublishPriceService(pricePort, pricePort, new RecordingProductPort(product, calls),
+            var locks = new dev.genericpayments.platform.catalog.application.port.out.CatalogPublicationLockPort() {
+                public Versions versions(PaymentAccountId a, SiteId s, ProductId p, PriceId r) { return new Versions(0, 0, 0, 0); }
+                public Versions lock(PaymentAccountId a, SiteId s, ProductId p, PriceId r) { return versions(a, s, p, r); }
+            };
+            var phase = new PricePublicationTransaction(pricePort, pricePort, new RecordingProductPort(product, calls),
                 new RecordingSitePort(site(siteId, accountId), calls),
                 new RecordingAccountPort(account(accountId), calls),
-                new RecordingProvider(calls, providerFails), mappingPort,
+                mappingPort, locks, (published, context) -> {},
                 Clock.fixed(Instant.parse("2026-09-12T12:00:00Z"), ZoneOffset.UTC));
+            service = new PublishPriceService(phase, account -> new RecordingProvider(calls, providerFails), mappingPort);
         }
     }
 

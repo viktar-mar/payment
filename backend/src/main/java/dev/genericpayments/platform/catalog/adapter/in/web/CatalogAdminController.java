@@ -61,12 +61,11 @@ public class CatalogAdminController {
             Map.of("price_key", price.key().value(), "version", Integer.toString(price.version())));
         return PriceResponse.from(price, null);
     }
-    @PostMapping("/prices/{priceId}/publish") @Transactional @Operation(operationId = "publishPrice")
+    @PostMapping("/prices/{priceId}/publish") @Operation(operationId = "publishPrice")
     public PriceResponse publishPrice(@PathVariable UUID priceId, @AuthenticationPrincipal AuthenticatedAdmin actor,
                                       HttpServletRequest request) {
-        var price = publishPrice.publish(new PriceId(priceId));
-        audit.record(AuditAction.PRICE_PUBLISHED, "price", price.id().value(), actor, request,
-            Map.of("price_key", price.key().value(), "version", Integer.toString(price.version())));
+        var price = publishPrice.publish(new PriceId(priceId), new PricePublicationAudit(actor.id().value(),
+            dev.genericpayments.platform.shared.adapter.in.web.RequestIdFilter.requestId(request), request.getRemoteAddr()));
         return response(price);
     }
     @GetMapping("/sites/{siteId}/catalog") @Transactional(readOnly = true) @Operation(operationId = "getCatalog")
