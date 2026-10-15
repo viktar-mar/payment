@@ -25,5 +25,8 @@
     "jsdom": "27.4.0",
     "typescript": "5.9.3",
     "vitest": "4.1.11"
+  },
+  "dependencies": {
+    "@stripe/stripe-js": "10.1.0"
   }
 }
