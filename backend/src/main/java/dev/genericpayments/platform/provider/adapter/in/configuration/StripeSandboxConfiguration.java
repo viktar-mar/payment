@@ -17,6 +17,12 @@ import org.springframework.core.env.Environment;
 
 @Configuration(proxyBeanMethods = false)
 public class StripeSandboxConfiguration {
+    @Bean(name="providerReferenceClock",defaultCandidate=false)
+    java.time.Clock providerReferenceClock() {return java.time.Clock.systemUTC();}
+
+    @Bean StripeWebhookVerifier stripeWebhookVerifier(StripeCredentialResolver credentials) {
+        return new StripeWebhookVerifier(credentials);
+    }
     @Bean StripeSandboxProperties stripeSandboxProperties(Environment environment) {
         String enabledValue = property(environment, "enabled", "ENABLED", "false");
         if (!Set.of("true", "false").contains(enabledValue)) {

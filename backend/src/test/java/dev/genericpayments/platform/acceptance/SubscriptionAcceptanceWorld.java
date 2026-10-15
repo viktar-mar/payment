@@ -220,7 +220,7 @@ public class SubscriptionAcceptanceWorld {
     void validateMigration() {
         var before=subscription();var cash=jdbc.queryForList("select * from payments where site_id=?",site.value());
         var flyway=bean(org.flywaydb.core.Flyway.class);flyway.validate();assertThat(flyway.migrate().migrationsExecuted).isZero();
-        assertThat(Arrays.stream(flyway.info().applied()).map(i->i.getVersion().toString()).toList()).containsExactlyElementsOf(java.util.stream.IntStream.rangeClosed(1,23).mapToObj(Integer::toString).toList());
+        assertThat(Arrays.stream(flyway.info().applied()).map(i->i.getVersion().toString()).toList()).containsExactlyElementsOf(java.util.stream.IntStream.rangeClosed(1,24).mapToObj(Integer::toString).toList());
         assertThat(subscription()).isEqualTo(before);assertThat(jdbc.queryForList("select * from payments where site_id=?",site.value())).isEqualTo(cash);
     }
     void callbacks() {bean(dev.genericpayments.platform.webhooks.application.port.out.CallbackConfigurationPort.class).configure(site.value(),"https://example.test/callback",true);}
