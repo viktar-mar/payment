@@ -73,6 +73,58 @@ class StripeClientSessionIntegrationTest extends CheckoutTestFixture {
     }
     void snapshot(String status) { identity();http.enqueue("GET","/v1/payment_intents/pi_fixture",200,intent(status)); }
 
+    // Omitting this DTO from schema normalization must fail against a real response,
+    // even though the runtime serializer and strict SDK remain independently correct.
+    @Test void servedClientSessionSchemaMatchesActualSerializedWireFields() throws Exception {
+        var mapper=context.getBean(tools.jackson.databind.ObjectMapper.class);
+        var c=stripeCheckout();policy();snapshot("requires_payment_method");snapshot("requires_payment_method");
+        var wire=mapper.readTree(mvc.perform(session(c,"schema-wire")).andExpect(status().isOk())
+            .andExpect(content().contentTypeCompatibleWith("application/json"))
+            .andReturn().getResponse().getContentAsString());
+        var doc=mapper.readTree(mvc.perform(get("/v3/api-docs")).andExpect(status().isOk())
+            .andReturn().getResponse().getContentAsString());
+        var schema=doc.path("components").path("schemas").path("ClientPaymentSessionResponse");
+        var fields=List.of("checkout_id","payment_id","attempt_id","provider_type","confirmation_mode",
+            "publishable_key","client_secret","expires_at","return_url");
+        assertThat(wire.propertyNames()).containsExactlyInAnyOrderElementsOf(fields);
+        assertThat(schema.path("properties").propertyNames()).containsExactlyInAnyOrderElementsOf(wire.propertyNames());
+        var required=new ArrayList<String>();schema.path("required").forEach(field->required.add(field.asText()));
+        assertThat(required).containsExactlyInAnyOrderElementsOf(fields);
+        assertThat(schema.path("properties").path("provider_type").path("enum").toString()).isEqualTo("[\"STRIPE\"]");
+        assertThat(schema.path("properties").path("confirmation_mode").path("enum").toString()).isEqualTo("[\"CLIENT_PROVIDER\"]");
+        assertThat(schema.toString()).doesNotContain(secret,"pk_test_");
+        var response=doc.path("paths").path("/api/v1/public/checkouts/{checkoutId}/client-session")
+            .path("post").path("responses").path("200").path("content");
+        assertThat(response.propertyNames()).containsExactly("application/json");
+        assertThat(response.path("application/json").path("schema").path("$ref").asText())
+            .isEqualTo("#/components/schemas/ClientPaymentSessionResponse");
+    }
+
+    // Removing the endpoint's documentation-only body/header/security rules must
+    // fail; existing runtime authority/empty-body tests below stay authoritative.
+    @Test void servedClientSessionOperationRequiresCheckoutAuthorityAndEmptyBody() throws Exception {
+        var mapper=context.getBean(tools.jackson.databind.ObjectMapper.class);
+        var doc=mapper.readTree(mvc.perform(get("/v3/api-docs")).andExpect(status().isOk())
+            .andReturn().getResponse().getContentAsString());
+        var operation=doc.path("paths").path("/api/v1/public/checkouts/{checkoutId}/client-session").path("post");
+        var headers=new HashMap<String,tools.jackson.databind.JsonNode>();
+        for(var parameter:operation.path("parameters"))if(parameter.path("in").asText().equals("header"))
+            headers.put(parameter.path("name").asText(),parameter);
+        var bearer=doc.path("components").path("securitySchemes").path("checkoutBearer");
+        org.assertj.core.api.SoftAssertions.assertSoftly(soft->{
+            soft.assertThat(operation.has("requestBody")).as("empty-body-only operation").isFalse();
+            soft.assertThat(headers.keySet()).containsExactlyInAnyOrder("Origin","Idempotency-Key");
+            for(var header:headers.values())soft.assertThat(header.path("required").asBoolean()).isTrue();
+            if(headers.containsKey("Idempotency-Key"))soft.assertThat(headers.get("Idempotency-Key").path("schema").path("maxLength").asInt()).isEqualTo(255);
+            soft.assertThat(operation.path("security").toString()).isEqualTo("[{\"checkoutBearer\":[]}]");
+            soft.assertThat(bearer.path("type").asText()).isEqualTo("http");
+            soft.assertThat(bearer.path("scheme").asText()).isEqualTo("bearer");
+            soft.assertThat(bearer.path("description").asText()).contains("checkout","43");
+        });
+        assertThat(doc.path("paths").path("/api/v1/admin/payments").path("get").path("security").toString())
+            .doesNotContain("checkoutBearer");
+    }
+
     @Test void issuesEphemeralSecretAndReusesAttemptAcrossKeysWithoutSecretStorage() throws Exception {
         var c=stripeCheckout();policy(); snapshot("requires_payment_method");snapshot("requires_payment_method");
         var response=mvc.perform(session(c,"first")).andExpect(status().isOk())

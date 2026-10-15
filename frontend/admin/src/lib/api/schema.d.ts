@@ -237,6 +237,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
+        /** @description Prepare an ephemeral client capability using this checkout's confirm-scoped bearer, exact allowed Origin and idempotency key. The request body must be empty. */
         post: operations["prepareClientPaymentSession"];
         delete?: never;
         options?: never;
@@ -2216,19 +2217,21 @@ export interface components {
         };
         ClientPaymentSessionResponse: {
             /** Format: uuid */
-            checkoutId?: string;
+            checkout_id: string;
             /** Format: uuid */
-            paymentId?: string;
+            payment_id: string;
             /** Format: uuid */
-            attemptId?: string;
-            providerType?: string;
-            confirmationMode?: string;
-            publishableKey?: string;
-            clientSecret?: string;
+            attempt_id: string;
+            /** @enum {string} */
+            provider_type: "STRIPE";
+            /** @enum {string} */
+            confirmation_mode: "CLIENT_PROVIDER";
+            publishable_key: string;
+            client_secret: string;
             /** Format: date-time */
-            expiresAt?: string;
+            expires_at: string;
             /** Format: uri */
-            returnUrl?: string;
+            return_url: string;
         };
         SubscriptionCreateRequest: {
             /** Format: uuid */
@@ -3733,17 +3736,18 @@ export interface operations {
     prepareClientPaymentSession: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Exactly one Origin matching this checkout's allowed Site origin. */
+                Origin: string;
+                /** @description Exactly one nonblank key, without ISO control characters; reuse for the same operation. */
+                "Idempotency-Key": string;
+            };
             path: {
                 checkoutId: string;
             };
             cookie?: never;
         };
-        requestBody?: {
-            content: {
-                "application/json": string;
-            };
-        };
+        requestBody?: never;
         responses: {
             /** @description OK */
             200: {
@@ -3751,7 +3755,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "*/*": components["schemas"]["ClientPaymentSessionResponse"];
+                    "application/json": components["schemas"]["ClientPaymentSessionResponse"];
                 };
             };
         };

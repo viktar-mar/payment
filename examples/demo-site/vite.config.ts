@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig, type PreviewServer, type ViteDevServer } from "vite";
 
 function isPrivateReturnTarget(target: string | undefined): boolean {
   if (!target) return false;
@@ -13,24 +13,27 @@ function isPrivateReturnTarget(target: string | undefined): boolean {
   }
 }
 
+function protectReturnRequests(server: ViteDevServer | PreviewServer): void {
+  // Connect logs originalUrl before .use middleware, so sanitize its entry.
+  // This typed handle boundary is tied to pinned Vite/Connect: run the actual
+  // privacy suite on upgrades. Node HTTP wire-debug dumps must stay disabled.
+  const handle = server.middlewares.handle.bind(server.middlewares);
+  server.middlewares.handle = (request, response, next) => {
+    const original = request as typeof request & {originalUrl?: string};
+    // An embedding parent can rewrite one field but preserve the other.
+    if (isPrivateReturnTarget(request.url) || isPrivateReturnTarget(original.originalUrl)) {
+      request.url = request.url?.split(/[?#]/, 1)[0];
+      original.originalUrl = original.originalUrl?.split(/[?#]/, 1)[0];
+    }
+    return handle(request, response, next);
+  };
+}
+
 export default defineConfig({
   plugins: [{
     name: 'private-payment-return-request',
-    configureServer(server) {
-      // Connect logs originalUrl before .use middleware, so sanitize its entry.
-      // This typed handle boundary is tied to pinned Vite/Connect: run the actual
-      // privacy suite on upgrades. Node HTTP wire-debug dumps must stay disabled.
-      const handle = server.middlewares.handle.bind(server.middlewares);
-      server.middlewares.handle = (request, response, next) => {
-        const original = request as typeof request & {originalUrl?: string};
-        // An embedding parent can rewrite one field but preserve the other.
-        if (isPrivateReturnTarget(request.url) || isPrivateReturnTarget(original.originalUrl)) {
-          request.url = request.url?.split(/[?#]/, 1)[0];
-          original.originalUrl = original.originalUrl?.split(/[?#]/, 1)[0];
-        }
-        return handle(request, response, next);
-      };
-    },
+    configureServer: protectReturnRequests,
+    configurePreviewServer: protectReturnRequests,
   }],
   build: { rollupOptions: { input: {main:'index.html',paymentReturn:'payment-return.html'} } },
   server: {

@@ -245,6 +245,8 @@ The sole custom event is `customer-authenticated`, which bubbles and is composed
 
 ## One-time Donations
 
+This headless confirmation example is Fake-only. For Stripe Donation sessions, use the Payment Element continuation described above through the `generic-donation` component below.
+
 ```js
 const campaign = await client.getDonationCampaign({siteKey:'my-shop',campaignKey:'community'});
 // Keep one input object (or one explicit idempotencyKey) for the same live intent/retry.
