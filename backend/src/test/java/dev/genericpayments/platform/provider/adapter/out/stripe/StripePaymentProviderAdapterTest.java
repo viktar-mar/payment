@@ -352,6 +352,110 @@ public class StripePaymentProviderAdapterTest extends CheckoutTestFixture {
     }
 
     PaymentProviderPort stripe() { return registry.select(stripeAccount); }
+    @Test void retrieveVerifiesCapturedChargeWithoutConsumingReceiptOrFinancialFacts() {
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        identity();snapshot("succeeded","ch_current",null);chargeSnapshot("ch_current",true,"pi_fixture");
+        var result=stripe().retrievePayment(ProviderPaymentLookup.forPayment(stripeAccount,p.id(),"pi_fixture"));
+        assertThat(result.status()).isEqualTo(ProviderState.Status.SUCCEEDED);
+        assertThat(result.evidence().money()).isEqualTo(Money.of(2000,"EUR"));
+        assertThat(result.evidence().chargeReference()).isEqualTo("ch_current");
+        assertThat(http.calls()).extracting(c -> c.path()).containsExactly("/v1/account","/v1/payment_intents/pi_fixture","/v1/charges/ch_current");
+        assertThat(count("provider_charge_receipts")).isZero();assertThat(count("payment_events")).isZero();
+        assertThat(load.findById(site,p.id()).orElseThrow().status()).isEqualTo(PaymentStatus.CREATED);
+    }
+    @Test void retrieveOldFailedChargeAgainDoesNotProduceAnotherReceiptOrTerminalFailure() {
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        for(int n=0;n<2;n++) {
+            identity();snapshot("requires_payment_method","ch_declined","ch_declined");chargeSnapshot("ch_declined",false,"pi_fixture");
+            var result=stripe().retrievePayment(ProviderPaymentLookup.forPayment(stripeAccount,p.id(),"pi_fixture"));
+            assertThat(result.status()).isEqualTo(ProviderState.Status.REQUIRES_PAYMENT_METHOD);
+            assertThat(result.evidence().failedChargeReference()).isEqualTo("ch_declined");
+        }
+        assertThat(count("provider_charge_receipts")).isZero();assertThat(count("payment_events")).isZero();
+    }
+    @Test void retrieveWithoutNewChargeDoesNotCreateReceipt() {
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        identity();snapshot("requires_payment_method",null,null);
+        assertThat(stripe().retrievePayment(ProviderPaymentLookup.forPayment(stripeAccount,p.id(),"pi_fixture")).status())
+            .isEqualTo(ProviderState.Status.REQUIRES_PAYMENT_METHOD);
+        assertThat(count("provider_charge_receipts")).isZero();assertThat(http.calls()).hasSize(2);
+    }
+    @Test void retrieveWrongCurrentServerAccountStopsBeforeIntentAndReceipt() {
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        http.enqueue("GET","/v1/account",200,"{\"id\":\"acct_wrong\",\"object\":\"account\"}");
+        assertThatThrownBy(() -> stripe().retrievePayment(ProviderPaymentLookup.forPayment(stripeAccount,p.id(),"pi_fixture"))).isInstanceOf(RuntimeException.class);
+        assertThat(http.calls()).singleElement().satisfies(c -> assertThat(c.path()).isEqualTo("/v1/account"));
+        assertThat(count("provider_charge_receipts")).isZero();assertThat(count("payment_events")).isZero();
+    }
+    @Test void directRetrieveFakeOrInvalidAliasCannotReachNoopVerifierOrReceipts() {
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        var adapter=stripe();
+        var invalid=PaymentAccount.create(account.id(),"test-account",PaymentProviderType.STRIPE,PaymentAccountMode.SANDBOX,"acct_expected","unavailable-alias");
+        for(var binding:java.util.List.of(account,invalid))
+            assertThatThrownBy(() -> adapter.retrievePayment(ProviderPaymentLookup.forPayment(binding,p.id(),"pi_fixture"))).isInstanceOf(RuntimeException.class);
+        assertThat(http.calls()).isEmpty();assertThat(count("provider_charge_receipts")).isZero();
+    }
+    @Test void foreignFailedChargePreventsAnyReceiptEvenWhenSuccessChargeIsValid() {
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        identity();snapshot("succeeded","ch_success","ch_old");chargeSnapshot("ch_success",true,"pi_fixture");chargeSnapshot("ch_old",false,"pi_foreign");
+        assertThatThrownBy(() -> stripe().retrievePayment(ProviderPaymentLookup.forPayment(stripeAccount,p.id(),"pi_fixture"))).isInstanceOf(RuntimeException.class);
+        assertThat(http.calls()).extracting(c -> c.path()).containsExactly("/v1/account","/v1/payment_intents/pi_fixture","/v1/charges/ch_success","/v1/charges/ch_old");
+        assertThat(count("provider_charge_receipts")).isZero();
+    }
+    @Test void distinctPriorFailedChargeIsRetrievedAndVerifiedUnderOriginalAccount() {
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        identity();snapshot("succeeded","ch_success","ch_old");chargeSnapshot("ch_success",true,"pi_fixture");chargeSnapshot("ch_old",false,"pi_fixture");
+        var result=stripe().retrievePayment(ProviderPaymentLookup.forPayment(stripeAccount,p.id(),"pi_fixture"));
+        assertThat(result.status()).isEqualTo(ProviderState.Status.SUCCEEDED);
+        assertThat(result.evidence().chargeReference()).isEqualTo("ch_success");
+        assertThat(result.evidence().failedChargeReference()).isEqualTo("ch_old");
+        assertThat(http.calls()).extracting(c -> c.path()).containsExactly("/v1/account","/v1/payment_intents/pi_fixture","/v1/charges/ch_success","/v1/charges/ch_old");
+        assertThat(http.calls()).allSatisfy(c -> assertThat(c.header("Stripe-Account")).isNull());
+        assertThat(count("provider_charge_receipts")).isZero();assertThat(count("payment_events")).isZero();
+    }
+    @Test void retrieveUsesOriginalPaymentEvenAfterSiteAccountChanges() {
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        var other=java.util.UUID.randomUUID();
+        jdbc.update("insert into payment_accounts values (?,'another-account','FAKE','SANDBOX','ACTIVE','fake-other','other-ref',?,0)",other,java.sql.Timestamp.from(INITIAL_TIME));
+        jdbc.update("update sites set payment_account_id=? where id=?",other,site.value());
+        identity();snapshot("succeeded","ch_current",null);chargeSnapshot("ch_current",true,"pi_fixture");
+        assertThat(stripe().retrievePayment(ProviderPaymentLookup.forPayment(stripeAccount,p.id(),"pi_fixture")).evidence().accountId()).isEqualTo(account.id());
+    }
+    @Test void retrieveRequiresStoredBindingRatherThanCallerSuppliedIdentity() {
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        jdbc.update("update payment_accounts set external_account_id='acct_changed' where id=?",account.id().value());
+        assertThatThrownBy(() -> stripe().retrievePayment(ProviderPaymentLookup.forPayment(stripeAccount,p.id(),"pi_fixture"))).isInstanceOf(RuntimeException.class);
+        assertThat(http.calls()).isEmpty();assertThat(count("provider_charge_receipts")).isZero();
+    }
+    @Test void retrieveUnderAmbientTransactionCannotContactStripe() {
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        assertThatThrownBy(() -> new TransactionTemplate(transactions).execute(tx -> stripe().retrievePayment(ProviderPaymentLookup.forPayment(stripeAccount,p.id(),"pi_fixture")))).isInstanceOf(RuntimeException.class);
+        assertThat(http.calls()).isEmpty();assertThat(count("provider_charge_receipts")).isZero();
+    }
+    @ParameterizedTest @ValueSource(strings={"server-error","malformed","null"})
+    void retrieveSdkFailureDoesNotExposeResponseOrPersistFacts(String failure) {
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));identity();
+        http.enqueue("GET","/v1/payment_intents/pi_fixture",failure.equals("server-error")?500:200,
+            failure.equals("server-error")?"{\"error\":{\"type\":\"api_error\",\"message\":\"private-snapshot-marker\"}}":failure.equals("null")?"null":"private-snapshot-marker");
+        var error=catchThrowable(() -> stripe().retrievePayment(ProviderPaymentLookup.forPayment(stripeAccount,p.id(),"pi_fixture")));
+        assertThat(error).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class)
+            .hasNoCause().hasMessageNotContaining("private-snapshot-marker");
+        assertThat(count("provider_charge_receipts")).isZero();assertThat(count("payment_events")).isZero();
+    }
+    void snapshot(String status,String latest,String failed) {
+        http.enqueue("GET","/v1/payment_intents/pi_fixture",200,"""
+            {"id":"pi_fixture","object":"payment_intent","livemode":false,"status":"%s",
+             "amount":2000,"amount_received":%d,"currency":"eur","capture_method":"automatic",
+             "payment_method_types":["card"],"latest_charge":%s,"last_payment_error":%s}
+            """.formatted(status,status.equals("succeeded")?2000:0,latest==null?"null":"\""+latest+"\"",failed==null?"null":"{\"charge\":\""+failed+"\"}"));
+    }
+    void chargeSnapshot(String reference,boolean paid,String intent) {
+        http.enqueue("GET","/v1/charges/"+reference,200,"""
+            {"id":"%s","object":"charge","livemode":false,"payment_intent":"%s","amount":2000,
+             "amount_captured":%d,"currency":"eur","paid":%s,"captured":%s,"status":"%s",
+             "payment_method_details":{"type":"card"}}
+            """.formatted(reference,intent,paid?2000:0,paid,paid,paid?"succeeded":"failed"));
+    }
     @Override protected ProviderPaymentRequest request(Payment p) { return new ProviderPaymentRequest(stripeAccount, p, ProviderOperationKeys.prepare(p.id())); }
     Payment dynamic(long amount, String currency, TaxMode tax) {
         return Payment.dynamic(payment().id(), site, account.id(), "owned-order-" + java.util.UUID.randomUUID(), Money.of(amount, currency), tax, Map.of(), INITIAL_TIME);

@@ -4,6 +4,7 @@ import com.stripe.exception.StripeException;
 import com.stripe.net.RequestOptions;
 import dev.genericpayments.platform.catalog.domain.TaxMode;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.PaymentAccountVerificationPort;
+import dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
 import dev.genericpayments.platform.payments.application.model.*;
 import dev.genericpayments.platform.payments.application.port.out.*;
@@ -31,13 +32,15 @@ public class StripePaymentProviderAdapter implements PaymentProviderPort {
     private final DigestPort digest;
     private final LoadSitePort sites;
     private final LoadPaymentPort payments;
+    private final LoadPaymentAccountPort accounts;
     private final ProviderOperationGuard guard = new ProviderOperationGuard();
 
     public StripePaymentProviderAdapter(StripeCredentialResolver credentials, StripeClientFactory clients,
             PaymentAccountVerificationPort verification, ProviderOperationStore operations, DigestPort digest,
-            LoadSitePort sites, LoadPaymentPort payments) {
+            LoadSitePort sites, LoadPaymentPort payments, LoadPaymentAccountPort accounts) {
         this.credentials = credentials; this.clients = clients; this.verification = verification;
         this.operations = operations; this.digest = digest; this.sites = sites; this.payments = payments;
+        this.accounts=accounts;
     }
 
     @Override public PaymentProviderCapabilities capabilities(PaymentAccount account) {
@@ -122,6 +125,38 @@ public class StripePaymentProviderAdapter implements PaymentProviderPort {
 
     @Override public ProviderResult confirmPayment(ProviderConfirmationRequest request) { throw StripePaymentRequests.unavailable(); }
     @Override public ProviderResult requestRefund(ProviderRefundRequest request) { throw StripePaymentRequests.unavailable(); }
-    @Override public ProviderState retrievePayment(ProviderPaymentLookup lookup) { throw StripePaymentRequests.unavailable(); }
+    @Override public ProviderState retrievePayment(ProviderPaymentLookup lookup) {
+        credentials.resolve(lookup.account());
+        var account=accounts.findById(lookup.account().id()).orElseThrow(StripePaymentSnapshotMapper::mismatch);
+        if(!account.equals(lookup.account()))throw StripePaymentSnapshotMapper.mismatch();
+        var binding=credentials.resolve(account);
+        var payment=payments.findByAccountAndId(account.id(),lookup.paymentId()).orElseThrow(StripePaymentSnapshotMapper::mismatch);
+        if(!lookup.reference().equals(payment.providerPaymentReference())||!validReference(lookup.reference()))throw StripePaymentSnapshotMapper.mismatch();
+        verification.verify(account);
+        try {
+            var client=clients.create(binding);
+            var intent=client.v1().paymentIntents().retrieve(lookup.reference());
+            StripePaymentSnapshotMapper.requireIntent(account,payment,intent);
+            String latest=intent.getLatestCharge();
+            String failed=StripePaymentSnapshotMapper.failedReference(intent);
+            String selected=latest!=null?latest:failed;
+            var charge=selected==null?null:client.v1().charges().retrieve(selected);
+            var result=StripePaymentSnapshotMapper.payment(account,payment,intent,charge);
+            var failedCharge=failed==null?null:failed.equals(selected)?charge:client.v1().charges().retrieve(failed);
+            if(failedCharge!=null) {
+                StripePaymentSnapshotMapper.requireFailedCharge(payment,intent,failedCharge);
+                var e=result.evidence();
+                result=new ProviderState(result.reference(),result.status(),new ProviderEvidence(e.provider(),e.accountId(),e.mode(),
+                    e.externalAccountId(),e.money(),e.paymentReference(),e.chargeReference(),failedCharge.getId(),e.captured()));
+            }
+            // Lookup never consumes a Charge: the financial transaction owns receipt insertion and application.
+            return result;
+        } catch(PaymentApplicationException failure) {
+            throw failure;
+        } catch(StripeException|RuntimeException failure) {
+            // Never retain SDK exception causes, raw response bodies, or client capabilities.
+            throw new PaymentApplicationException("PROVIDER_TEMPORARILY_UNAVAILABLE",503,"Provider temporarily unavailable");
+        }
+    }
     @Override public ProviderState retrieveRefund(ProviderRefundLookup lookup) { throw StripePaymentRequests.unavailable(); }
 }

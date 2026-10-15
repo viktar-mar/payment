@@ -13,4 +13,6 @@ public interface LoadPaymentAttemptPort {
  /** Caller must hold a transaction; acknowledgement locks the parent Payment before the Attempt. */
  Optional<StoredAttempt> findByIdForUpdate(SiteId siteId, PaymentAttemptId id);
  List<StoredAttempt> findByPayment(SiteId siteId, PaymentId id);
+ /** Only attempts with a durable client baseline; existing Fake attempts remain separate. */
+ List<StoredAttempt> findClientAttemptsByPayment(SiteId siteId, PaymentId id);
 }

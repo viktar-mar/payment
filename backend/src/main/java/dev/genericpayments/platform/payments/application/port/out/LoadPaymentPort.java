@@ -25,6 +25,7 @@ public interface LoadPaymentPort {
  }
  Optional<StoredPayment> findStateById(SiteId siteId, PaymentId id);
  Optional<Payment> findById(SiteId siteId, PaymentId id);
+ Optional<Payment> findByAccountAndId(dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId accountId, PaymentId id);
  List<Payment> findBySiteId(SiteId siteId);
  /** Exact Customer ownership query ordered by created_at DESC, id DESC; boundary values are both null or both present. */
  List<Payment> findCustomerHistory(SiteId siteId, UUID customerId, Instant beforeCreatedAt,

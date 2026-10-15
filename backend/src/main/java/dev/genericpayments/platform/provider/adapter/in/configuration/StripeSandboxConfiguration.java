@@ -3,6 +3,7 @@ package dev.genericpayments.platform.provider.adapter.in.configuration;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.PaymentAccountVerificationPort;
 import dev.genericpayments.platform.provider.adapter.out.stripe.*;
 import dev.genericpayments.platform.payments.application.port.out.LoadPaymentPort;
+import dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort;
 import dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore;
 import dev.genericpayments.platform.shared.application.port.out.DigestPort;
 import dev.genericpayments.platform.sites.application.port.out.LoadSitePort;
@@ -54,7 +55,7 @@ public class StripeSandboxConfiguration {
 
     @Bean @Lazy StripePaymentProviderAdapter stripePaymentProvider(StripeCredentialResolver credentials, StripeClientFactory clients,
             PaymentAccountVerificationPort verification, ProviderOperationStore operations, DigestPort digest,
-            LoadSitePort sites, LoadPaymentPort payments) {
-        return new StripePaymentProviderAdapter(credentials, clients, verification, operations, digest, sites, payments);
+            LoadSitePort sites, LoadPaymentPort payments, LoadPaymentAccountPort accounts) {
+        return new StripePaymentProviderAdapter(credentials, clients, verification, operations, digest, sites, payments, accounts);
     }
 }

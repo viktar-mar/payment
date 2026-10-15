@@ -56,6 +56,13 @@ public final class PaymentTransitionService {
             var p=load.findByIdForUpdate(lease.payment().siteId(),lease.payment().id()).orElseThrow(PartnerPaymentRules::notFound);
             tx.verifyLease(p,lease.owner(),clock.instant());tx.requireProvider(p.paymentAccountId(),lease.account().provider());
             if(!p.paymentAccountId().equals(lease.account().id())||!state.reference().equals(p.providerPaymentReference()))throw PartnerPaymentRules.state();
+            var currentAccount=accounts.findById(p.paymentAccountId()).orElseThrow(PartnerPaymentRules::state);
+            if(currentAccount.provider()==PaymentProviderType.STRIPE||lease.account().provider()==PaymentProviderType.STRIPE) {
+                if(currentAccount.status()!=PaymentAccountStatus.ACTIVE||currentAccount.provider()!=lease.account().provider()
+                        ||currentAccount.mode()!=lease.account().mode()||!currentAccount.externalAccountId().equals(lease.account().externalAccountId())
+                        ||!currentAccount.credentialsRef().equals(lease.account().credentialsRef()))throw PartnerPaymentRules.state();
+                ProviderEvidenceValidator.requirePayment(currentAccount,p,state);
+            }
             telemetry.requireContext(lease.context());Instant now=clock.instant();
             var result=apply(p,state.status(),lease.context(),UUID.randomUUID(),PaymentEventSource.RECONCILIATION,null,state.reference(),now,now,requestId,digest.sha256Hex(SafeFactJson.json(Map.of("state",state.status().name()))));
             if(!result.changed()&&state.status()!=ProviderState.Status.UNKNOWN&&state.status()!=ProviderState.Status.CREATED)resolveUnknown(p,state.status(),now);
