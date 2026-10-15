@@ -125,16 +125,7 @@ public class StripeCatalogProviderAdapter implements CatalogProviderPort {
     }
 
     private String fingerprint(PaymentAccount account, String... facts) {
-        var canonical = new StringBuilder();
-        for (String fact : new String[]{account.id().value().toString(), account.externalAccountId(), account.credentialsRef(),
-                account.provider().name(), account.mode().name()}) append(canonical, fact);
-        for (String fact : facts) append(canonical, fact);
-        return digest.sha256Hex(canonical.toString());
-    }
-
-    private static void append(StringBuilder target, String value) {
-        target.append(value == null ? -1 : value.length()).append(':');
-        if (value != null) target.append(value);
+        return StripeRequestFingerprint.of(digest, account, facts);
     }
 
     private static String reference(String id, Boolean live, String prefix) {

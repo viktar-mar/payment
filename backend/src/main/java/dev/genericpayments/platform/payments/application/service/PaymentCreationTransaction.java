@@ -2,6 +2,7 @@ package dev.genericpayments.platform.payments.application.service;
 import dev.genericpayments.platform.payments.application.model.*;
 import dev.genericpayments.platform.payments.application.port.out.*;
 import dev.genericpayments.platform.payments.domain.*;
+import dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType;
 import org.springframework.transaction.annotation.*;
 import java.util.Objects;
 public class PaymentCreationTransaction {
@@ -18,9 +19,7 @@ public class PaymentCreationTransaction {
   support.ownership(c.payment().siteId(),c.account(),c.siteKey());
   var old=load.findByIdForUpdate(c.payment().siteId(),c.payment().id());
   if(old.isPresent()){
-   var p=old.get();var expected=c.payment();
-   if(!p.paymentAccountId().equals(expected.paymentAccountId())||p.source()!=expected.source()||!p.money().equals(expected.money())||p.taxMode()!=expected.taxMode()
-    ||!Objects.equals(p.externalOrderId(),expected.externalOrderId())||!Objects.equals(p.priceSnapshot(),expected.priceSnapshot())||!Objects.equals(p.customerId(),expected.customerId())||!Objects.equals(p.donationId(),expected.donationId())||!Objects.equals(p.donationSnapshot(),expected.donationSnapshot())||!Objects.equals(p.subscriptionContext(),expected.subscriptionContext())||!Objects.equals(p.taxAmountMinor(),expected.taxAmountMinor())||!p.technicalMetadata().equals(expected.technicalMetadata()))throw new IllegalArgumentException("Payment creation conflict");
+   var p=old.get();requireSameImmutable(p,c.payment());
    return new Created(p,false);
   }
   var p=c.payment();var now=support.now();
@@ -33,11 +32,25 @@ public class PaymentCreationTransaction {
   var locked=load.findForAttemptStart(c.payment().siteId(),c.payment().id()).orElseThrow();var p=locked.value();
   if(!p.paymentAccountId().equals(c.account().id()))throw new IllegalArgumentException("Payment ownership mismatch");
   var key=ProviderOperationKeys.prepare(p.id());String phase="prepared_"+result.kind();
+  // Preserve Fake's existing early duplicate-event semantics.
+  if(c.account().provider()!=PaymentProviderType.STRIPE&&support.hasEvent(p,key,phase))return new PaymentPhaseSupport.Change(p,p.status(),false);
+  if(c.account().provider()==PaymentProviderType.STRIPE){support.ownership(p.siteId(),c.account(),c.siteKey());requireSameImmutable(p,c.payment());}
+  if(locked.hasLiveLease(support.now()))throw new IllegalStateException("PAYMENT_STATE_CONFLICT");
+  boolean stripeAccepted=c.account().provider()==PaymentProviderType.STRIPE&&result instanceof ProviderResult.Accepted;
+  if(stripeAccepted&&p.providerPaymentReference()!=null&&!p.providerPaymentReference().equals(result.reference()))throw new IllegalStateException("PAYMENT_STATE_CONFLICT");
+  if(stripeAccepted&&!p.canStartAttempt()&&p.providerPaymentReference()==null)throw new IllegalStateException("PAYMENT_STATE_CONFLICT");
   if(support.hasEvent(p,key,phase))return new PaymentPhaseSupport.Change(p,p.status(),false);
   // A delayed preparation acknowledgement must not overwrite a later confirmation/reconciliation.
-  if(locked.hasLiveLease(support.now())||!p.canStartAttempt())throw new IllegalStateException("PAYMENT_STATE_CONFLICT");
+  if(!p.canStartAttempt()){
+   if(stripeAccepted&&p.providerPaymentReference()!=null&&p.providerPaymentReference().equals(result.reference()))return new PaymentPhaseSupport.Change(p,p.status(),false);
+   throw new IllegalStateException("PAYMENT_STATE_CONFLICT");
+  }
   var next=support.apply(p,result,false);next=save.save(next);
   support.event(next,key,phase,support.type(result,false),c.requestId(),c.idempotencyKey(),result);
   return new PaymentPhaseSupport.Change(next,p.status(),p.status()!=next.status());
+ }
+ private static void requireSameImmutable(Payment p,Payment expected){
+  if(!p.id().equals(expected.id())||!p.siteId().equals(expected.siteId())||!p.paymentAccountId().equals(expected.paymentAccountId())||p.source()!=expected.source()||!p.money().equals(expected.money())||p.taxMode()!=expected.taxMode()
+   ||!Objects.equals(p.priceId(),expected.priceId())||!Objects.equals(p.externalOrderId(),expected.externalOrderId())||!Objects.equals(p.priceSnapshot(),expected.priceSnapshot())||!Objects.equals(p.customerId(),expected.customerId())||!Objects.equals(p.donationId(),expected.donationId())||!Objects.equals(p.donationSnapshot(),expected.donationSnapshot())||!Objects.equals(p.subscriptionContext(),expected.subscriptionContext())||!Objects.equals(p.taxAmountMinor(),expected.taxAmountMinor())||!p.technicalMetadata().equals(expected.technicalMetadata()))throw new IllegalArgumentException("Payment creation conflict");
  }
 }
