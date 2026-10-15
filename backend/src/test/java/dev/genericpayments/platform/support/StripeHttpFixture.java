@@ -35,11 +35,15 @@ public final class StripeHttpFixture implements AutoCloseable {
 
     public void enqueue(String method, String path, int status, String json,
                         Map<String, String> headers, long delayMillis) {
-        responses.add(new Response(method, path, status, json, headers, delayMillis, false));
+        responses.add(new Response(method, path, status, json, headers, delayMillis, 0, false));
+    }
+
+    public void enqueueDelayedBody(String method, String path, int status, String json, long bodyDelayMillis) {
+        responses.add(new Response(method, path, status, json, Map.of(), 0, bodyDelayMillis, false));
     }
 
     public void disconnectNext(String method, String path) {
-        responses.add(new Response(method, path, 0, "", Map.of(), 0, true));
+        responses.add(new Response(method, path, 0, "", Map.of(), 0, 0, true));
     }
 
     public List<Call> calls() { return List.copyOf(calls); }
@@ -74,7 +78,14 @@ public final class StripeHttpFixture implements AutoCloseable {
             response.headers.forEach((name, value) -> exchange.getResponseHeaders().set(name, value));
             byte[] bytes = response.json.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(response.status, bytes.length);
-            exchange.getResponseBody().write(bytes);
+            if (response.bodyDelayMillis > 0) {
+                // Flush headers and a partial body so the client has definitely entered body consumption.
+                exchange.getResponseBody().write(bytes, 0, 1);
+                exchange.getResponseBody().flush();
+                try { Thread.sleep(response.bodyDelayMillis); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+                exchange.getResponseBody().write(bytes, 1, bytes.length-1);
+            } else exchange.getResponseBody().write(bytes);
         }
     }
 
@@ -92,7 +103,7 @@ public final class StripeHttpFixture implements AutoCloseable {
     }
 
     private record Response(String method, String path, int status, String json,
-                            Map<String, String> headers, long delayMillis, boolean disconnect) {
+                            Map<String, String> headers, long delayMillis, long bodyDelayMillis, boolean disconnect) {
         @Override public String toString() { return "StripeHttpFixture.Response[redacted]"; }
     }
 }

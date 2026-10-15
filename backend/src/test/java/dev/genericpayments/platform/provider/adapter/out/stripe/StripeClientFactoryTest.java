@@ -14,6 +14,59 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class StripeClientFactoryTest {
+    @Test void requestDeadlineIncludesBodyAfterImmediateHeaders() throws Exception {
+        try(var http=new StripeHttpFixture()) {
+            http.enqueueDelayedBody("GET","/v1/account",200,"{\"id\":\"acct_delayed\",\"object\":\"account\"}",1000);
+            var client=fixtureFactory(http.baseUri()).create(credentials("A"));
+            long started=System.nanoTime();
+            var failure=catchThrowable(() -> client.v1().accounts().retrieveCurrent(RequestOptions.builder().setReadTimeout(100).build()));
+            long elapsed=java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-started);
+            assertThat(elapsed).as("Complete request deadline must include response body").isLessThan(700);
+            assertThat(failure).isInstanceOf(com.stripe.exception.ApiConnectionException.class);
+            assertThat(http.calls()).hasSize(1);
+        }
+    }
+    @Test void transparentDisconnectedGetRetryStaysWithinOneLogicalSdkRead() throws Exception {
+        try(var http=new StripeHttpFixture()) {
+            http.disconnectNext("GET","/v1/account");
+            http.enqueue("GET","/v1/account",200,"{\"id\":\"acct_retry\",\"object\":\"account\"}");
+            var client=fixtureFactory(http.baseUri()).create(credentials("A"));
+            assertThat(client.v1().accounts().retrieveCurrent(RequestOptions.builder().setReadTimeout(1000).build()).getId()).isEqualTo("acct_retry");
+            // Characterized JDK behavior, distinct from the SDK's configured maxNetworkRetries=0.
+            assertThat(http.calls()).hasSize(2);
+        }
+    }
+    @Test void bodyTimeoutCancelsExchangeAndNextRequestCanSucceed() throws Exception {
+        try(var http=new StripeHttpFixture()) {
+            var client=fixtureFactory(http.baseUri()).create(credentials("A"));
+            http.enqueueDelayedBody("GET","/v1/account",200,"{\"id\":\"acct_stalled\",\"object\":\"account\"}",1500);
+            assertThatThrownBy(() -> client.v1().accounts().retrieveCurrent(RequestOptions.builder().setReadTimeout(100).build()))
+                .isInstanceOf(com.stripe.exception.ApiConnectionException.class).hasNoCause();
+            http.enqueue("GET","/v1/account",200,"{\"id\":\"acct_next\",\"object\":\"account\"}");
+            long started=System.nanoTime();
+            assertThat(client.v1().accounts().retrieveCurrent(RequestOptions.builder().setReadTimeout(500).build()).getId()).isEqualTo("acct_next");
+            assertThat(java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-started)).isLessThan(1000);
+            assertThat(http.calls()).hasSize(2);
+        }
+    }
+    @Test void interruptionCancelsExchangeAndPreservesCallerInterrupt() throws Exception {
+        try(var http=new StripeHttpFixture()) {
+            var client=fixtureFactory(http.baseUri()).create(credentials("A"));
+            http.enqueueDelayedBody("GET","/v1/account",200,"{\"id\":\"acct_stalled\",\"object\":\"account\"}",1500);
+            var result=new java.util.concurrent.atomic.AtomicReference<Throwable>();
+            var interrupted=new java.util.concurrent.atomic.AtomicBoolean();
+            var caller=new Thread(() -> {
+                result.set(catchThrowable(() -> client.v1().accounts().retrieveCurrent(RequestOptions.builder().setReadTimeout(5000).build())));
+                interrupted.set(Thread.currentThread().isInterrupted());
+            });
+            try {
+                caller.start();org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(() -> http.calls().size()==1);
+                caller.interrupt();caller.join(700);
+                assertThat(caller.isAlive()).isFalse();assertThat(interrupted).isTrue();
+                assertThat(result.get()).isInstanceOf(com.stripe.exception.ApiConnectionException.class).hasNoCause();
+            } finally {caller.interrupt();caller.join(2000);}
+        }
+    }
     @Test void instanceClientsSendTheirOwnKeysAndTheSdkVersionPin() throws Exception {
         try (var http = new StripeHttpFixture()) {
             http.enqueue("GET", "/v1/account", 200, "{\"id\":\"acct_first\",\"object\":\"account\"}");

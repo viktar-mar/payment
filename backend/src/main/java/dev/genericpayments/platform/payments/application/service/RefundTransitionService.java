@@ -13,6 +13,10 @@ public final class RefundTransitionService {
     private final SavePaymentPort payments;private final AppendPaymentEventPort events;private final PaymentOutboxPort outbox;
     private final Stage2TelemetryPort telemetry;private final DigestPort digest;private final Clock clock;
     public RefundTransitionService(PaymentTransitionPort tx,LoadRefundPort refunds,SaveRefundPort saveRefunds,SavePaymentPort payments,AppendPaymentEventPort events,PaymentOutboxPort outbox,Stage2TelemetryPort telemetry,DigestPort digest,Clock clock){this.tx=tx;this.refunds=refunds;this.saveRefunds=saveRefunds;this.payments=payments;this.events=events;this.outbox=outbox;this.telemetry=telemetry;this.digest=digest;this.clock=clock;}
+    /** Refund-specific current-object evidence belongs to Task 10; payment evidence cannot settle a refund. */
+    public PaymentTransitionService.Result processVerified(ResolvedProviderReceipt receipt) {
+        throw new IllegalStateException("UNRESOLVED_OBJECT");
+    }
     public Result process(ProviderInboxPort.Fact fact){
         var e=fact.envelope();var identity=tx.resolveRefund(e.accountId(),e.objectId()).orElseThrow(()->new IllegalStateException("UNRESOLVED_OBJECT"));
         telemetry.requireContext(identity.payment().context());var p=tx.lock(identity.payment());
@@ -23,6 +27,8 @@ public final class RefundTransitionService {
         return apply(p,stored,target,identity.payment().context(),fact.id(),PaymentEventSource.PROVIDER_EVENT,e.eventId(),e.objectId(),e.occurredAt(),e.receivedAt(),"inbox_"+fact.id(),fact.payloadHash());
     }
     public Result reconcile(PaymentTransitionService.Lease lease,RefundId id,ProviderState state,String requestId){
+        if(lease.account().provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE)
+            throw new IllegalStateException("UNRESOLVED_OBJECT");
         return tx.transaction(()->{
             var p=tx.lock(new PaymentTransitionPort.Identity(lease.payment().siteId(),lease.payment().id(),lease.context()));tx.verifyLease(p,lease.owner(),clock.instant());
             var stored=refunds.findByIdForUpdate(p.siteId(),id).orElseThrow(PartnerPaymentRules::notFound);
