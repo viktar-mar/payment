@@ -2,6 +2,24 @@
 import { NextRequest } from "next/server";
 import { afterEach, expect, it, vi } from "vitest";
 import { forward } from "./forward";
+it('admits only the exact safe Stripe operation and return policy surfaces', async () => {
+  const id='10000000-0000-0000-0000-000000000001';
+  const calls:string[]=[];
+  vi.stubGlobal('fetch',async(url:URL)=>{calls.push(url.pathname);return Response.json([]);});
+  for(const [path,method,query] of [
+    ['v1/admin/provider-operations','GET',`?payment_id=${id}`],
+    ['v1/admin/provider-operations/unresolved','GET',`?after=${id}&limit=20`],
+    ['v1/admin/provider-operations/dead-references','GET',''],
+    [`v1/admin/provider-operations/${id}/recover`,'POST',''],
+    [`v1/admin/sites/${id}/checkout-return-urls`,'PUT',''],
+  ]) expect((await forward(new NextRequest(`http://admin/api/backend/${path}${query}`,{method}),path.split('/'))).status).toBe(200);
+  const count=calls.length;
+  for(const query of ['?payment_id=bad',`?payment_id=${id}&payment_id=${id}`,`?payment_id=${id}&token=private`])
+    expect((await forward(new NextRequest(`http://admin/api/backend/v1/admin/provider-operations${query}`),['v1','admin','provider-operations'])).status).toBe(400);
+  expect((await forward(new NextRequest('http://admin/api/backend/v1/admin/provider-operations/unresolved?limit=101'),['v1','admin','provider-operations','unresolved'])).status).toBe(400);
+  expect((await forward(new NextRequest('http://admin/api/backend/v1/admin/provider-operations/not-a-uuid/recover',{method:'POST'}),['v1','admin','provider-operations','not-a-uuid','recover'])).status).toBe(404);
+  expect(calls).toHaveLength(count);
+});
 it("forwards only the explicit idempotency header and strips arbitrary/unsafe headers and response reflection", async () => {
   let forwarded: Headers | undefined;
   vi.stubGlobal("fetch", async (_url: unknown, init: RequestInit) => { forwarded = new Headers(init.headers); return Response.json({}, { headers: { "idempotency-key": "intent", "x-arbitrary": "no" } }); });

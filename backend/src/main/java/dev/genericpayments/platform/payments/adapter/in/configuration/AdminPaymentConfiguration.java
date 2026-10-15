@@ -8,6 +8,7 @@ import java.time.Clock;
 import org.springframework.context.annotation.*;
 @Configuration(proxyBeanMethods=false)
 public class AdminPaymentConfiguration {
+    @Bean CheckoutReturnUrlAdminService checkoutReturnUrlAdminService(CheckoutReturnUrlAdminPort policies,LoadSitePort sites,dev.genericpayments.platform.admin.application.port.out.AuditLogPort audit,Clock clock){return new CheckoutReturnUrlAdminService(policies,sites,audit,clock);}
     @Bean AdminPaymentQueryService adminPaymentQueryService(AdminPaymentReadPort reads){return new AdminPaymentQueryService(reads);}
     @Bean SimulateFakeEventService simulateFakeEventService(AdminPaymentReadPort reads,PaymentTransitionPort tx,LoadSitePort sites,LoadPaymentAccountPort accounts,LoadRefundPort refunds,FakeEventControlPort control,IdempotencyService idem,AdminPaymentAuditPort audit,Stage2TelemetryPort telemetry,Clock clock){return new SimulateFakeEventService(reads,tx,sites,accounts,refunds,control,idem,audit,telemetry,clock);}
     @Bean AdminReconciliationService adminReconciliationService(AdminPaymentReadPort reads,PaymentTransitionPort tx,IdempotencyService idem,AdminPaymentAuditPort audit,ReconcilePaymentService reconcile,LoadSitePort sites,LoadPaymentAccountPort accounts,PaymentProviderRegistry providers,Stage2TelemetryPort telemetry){return new AdminReconciliationService(reads,tx,idem,audit,reconcile,sites,accounts,providers,telemetry);}

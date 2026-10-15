@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta name="referrer" content="no-referrer" />
+    <script>history.replaceState(null,'',location.pathname)</script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sandbox payment return</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/payment-return.ts"></script>
+  </head>
+  <body>
+    <main class="demo-shell">
+      <p class="eyebrow">Sandbox · test payments only</p>
+      <h1>Payment return</h1>
+      <p>This return does not identify a payment. Redirect parameters do not prove success.</p>
+      <p id="return-status" role="status">Checking for a saved checkout session.</p>
+      <button id="read-saved-payment" hidden>Check previously saved catalog payment</button>
+      <p>Anonymous Donation checkout authority is kept only in memory and is unavailable after a redirect. Sign in to inspect history where available.</p>
+      <a href="/#customer-access">Sign in and inspect history</a>
+      <p><a href="/">Return to checkout recovery</a></p>
+    </main>
+  </body>
+</html>

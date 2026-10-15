@@ -122,6 +122,18 @@ All three Sandbox values are required and passed only to the backend; Admin and 
 
 ## Admin, SDK and payment journeys
 
+### Stripe inspection and return recovery
+
+Admin **Provider operations** lists bounded unresolved operations separately from dead provider-reference receipts (which may have no local Payment). A catalog acknowledgement still needs the existing audited catalog publication action. Manual recovery requires the original provider reference and creation-event proof; acceptance is a binding acknowledgement, never settlement. After an uncertain response, inspect and retry the same proof with the retained key. No new PaymentIntent or Refund is created by recovery.
+
+Site integration now provisions exact checkout return URLs with optimistic versions and audit. Register the demo's exact origin and `/payment-return` URL; initial creation uses version `-1`, then read the current version before editing. Configure Sandbox Site/catalog/Donation fixtures on the backend and pass only public API/Site/Price/Campaign keys to the demo. No `VITE_*` Stripe key is used.
+
+The return entry clears all query/fragment parameters before modules, sends no referrer and has no access logging. A redirect cannot identify a saved checkout, so this page makes no automatic backend request and shows no automatic success. **Check previously saved catalog payment** explicitly reads the original saved checkout and labels it as saved catalog state, which may be unrelated to this return. Anonymous Donation authority is memory-only and cannot be recovered from Stripe URL parameters; use login/history where available. Public recovery configuration storage is optional and never contains Stripe secrets.
+
+Customer/guest demo Stripe creation hands the same checkout to the existing widget's explicit Resume/ready Pay flow. If recovery storage failed, the demo shows an existing-session-unavailable message and does not create another checkout. Fake direct confirmation is unchanged.
+
+The demo CSP allows card-only Stripe.js and 3DS origins from the [official Stripe security guide](https://docs.stripe.com/security/guide#content-security-policy), exact SDK style hashes and one exact cleanup-script hash. Connections allow only self, `api.stripe.com` and the existing localhost/127.0.0.1 API ports; cloud deployment must explicitly add its trusted API origin. Arbitrary HTTPS API origins are no longer allowed. No Link, Maps, Connect, Checkout, crypto or unsafe-inline/eval permissions are added. From `examples/demo-site`, `pnpm build` followed by `pnpm exec playwright test --config playwright.offline.config.ts` runs an owned ephemeral nginx/browser policy test with external requests intercepted. This proves offline browser/policy behavior, not real Stripe interoperability; real Sandbox smoke still needs explicit opt-in.
+
 1. Authenticate in the admin and select an existing FAKE/SANDBOX account (or provision one through the admin account API).
 2. Create a Site with a unique key, allowed demo origin, SITE_TOKEN and AUTOMATIC policy. Add its key to the finite telemetry setting and recreate the backend before payment use.
 3. For the preserved one-time journey, create a Product and a ONE_TIME Price with positive integer minor units, uppercase currency, trial_days 0 and tax mode; publish it. For subscriptions use the Stage4 rollout above.

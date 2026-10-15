@@ -18,7 +18,7 @@ COPY examples/demo-site/package.json examples/demo-site/pnpm-lock.yaml ./example
 RUN cd examples/demo-site \
     && pnpm install --frozen-lockfile
 
-COPY examples/demo-site/index.html examples/demo-site/tsconfig.json examples/demo-site/vite.config.ts ./examples/demo-site/
+COPY examples/demo-site/index.html examples/demo-site/payment-return.html examples/demo-site/tsconfig.json examples/demo-site/vite.config.ts ./examples/demo-site/
 COPY examples/demo-site/src ./examples/demo-site/src
 RUN cd examples/demo-site \
     && pnpm build

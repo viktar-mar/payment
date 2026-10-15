@@ -1,6 +1,7 @@
 package dev.genericpayments.platform.payments.adapter.out.persistence;
 
 import dev.genericpayments.platform.payments.application.port.out.CheckoutReturnUrlPort;
+import dev.genericpayments.platform.payments.application.port.out.CheckoutReturnUrlAdminPort;
 import dev.genericpayments.platform.payments.application.service.PartnerPaymentRules;
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
 import dev.genericpayments.platform.sites.domain.SiteId;
@@ -10,9 +11,22 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
 @Repository
-public class CheckoutReturnUrlPersistenceAdapter implements CheckoutReturnUrlPort {
+public class CheckoutReturnUrlPersistenceAdapter implements CheckoutReturnUrlPort, CheckoutReturnUrlAdminPort {
     private final JdbcTemplate jdbc;
     public CheckoutReturnUrlPersistenceAdapter(JdbcTemplate jdbc) { this.jdbc=jdbc; }
+    @Override public List<CheckoutReturnUrlPolicy> list(SiteId site) {
+        return jdbc.query("select origin,return_url,version from checkout_return_urls where site_id=? order by origin",
+            (rs,n) -> new CheckoutReturnUrlPolicy(URI.create(rs.getString("origin")),validated(URI.create(rs.getString("origin")),rs.getString("return_url")),rs.getLong("version")),site.value());
+    }
+    @Override @org.springframework.transaction.annotation.Transactional(propagation=org.springframework.transaction.annotation.Propagation.MANDATORY)
+    public boolean compareAndSet(SiteId site,URI origin,URI returnUrl,long expectedVersion) {
+        validated(origin,returnUrl.toString());
+        if(expectedVersion == -1) return jdbc.update("insert into checkout_return_urls(site_id,origin,return_url) values (?,?,?) on conflict do nothing",
+            site.value(),origin.toString(),returnUrl.toString())==1;
+        if(expectedVersion < 0 || expectedVersion == Long.MAX_VALUE) throw unavailable();
+        return jdbc.update("update checkout_return_urls set return_url=?,version=version+1 where site_id=? and origin=? and version=?",
+            returnUrl.toString(),site.value(),origin.toString(),expectedVersion)==1;
+    }
     @Override public Optional<URI> find(SiteId site, URI origin) {
         return jdbc.query("select return_url from checkout_return_urls where site_id=? and origin=?",
             (rs,n) -> validated(origin,rs.getString(1)),site.value(),origin.toString()).stream().findFirst();

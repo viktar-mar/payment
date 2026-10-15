@@ -12,7 +12,8 @@ import org.springframework.context.annotation.*;
 public class PaymentAdminOpenApiConfiguration {
     @Bean OpenApiCustomizer paymentAdminSchemas(){return api->{
         var schemas=api.getComponents().getSchemas();
-        for(String name:List.of("RefundRequest","RefundResponse","FakeRequest","ApiValidationProblem","Projection","Page","Attempt","Event","RefundView","Outbox","Delivery","Details","Accepted")){
+        for(String name:List.of("RefundRequest","RefundResponse","FakeRequest","ApiValidationProblem","Projection","Page","Attempt","Event","RefundView","Outbox","Delivery","Details","Accepted",
+                "ProviderOperationView","DeadProviderReferenceView","RecoveryRequest","RecoveryAccepted","UpdateReturnUrl","CheckoutReturnUrlPolicy")){
             Schema<?> schema=schemas.get(name);if(schema==null||schema.getProperties()==null)continue;
             var properties=new LinkedHashMap<String,Schema>();
             schema.getProperties().forEach((key,value)->properties.put(snake(key),value));schema.setProperties(properties);
