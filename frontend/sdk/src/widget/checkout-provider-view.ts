@@ -37,7 +37,10 @@ export class CheckoutProviderView {
         const handle = await mountStripePayment({ container: this.host, capability, signal: controller.signal, ...initial, refresh: () => this.client.get(session, controller.signal) });
         checkAbort(controller.signal); this.#handle = handle;
         // A locale/theme change during loader/readiness uses this same capability.
-        if (initial !== this.#presentation) await handle.updatePresentation(this.#presentation);
+        if (initial !== this.#presentation) {
+          try { await handle.updatePresentation(this.#presentation); }
+          catch { checkAbort(controller.signal); } // A visual failure cannot discard a ready payment form.
+        }
       }
       checkAbort(controller.signal); this.#ready = true;
     } catch (error) { if (this.#controller === controller) this.destroy(); throw error; }

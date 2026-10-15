@@ -19,6 +19,29 @@ async function stripeReady(el: GenericPaymentWidget, p: ReturnType<typeof stripe
   button(el).click(); await vi.waitFor(() => expect(el.shadowRoot!.querySelector('iframe')).toBe(p.frame)); p.emit('ready'); await until(el, 'ready');
 }
 async function until(el: GenericPaymentWidget, state: string) { await vi.waitFor(() => expect(el.state).toBe(state)); }
+it.each(['PROCESSING', 'UNKNOWN'])('recovered Fake %s regains original explicit confirmation after becoming actionable', async pending => {
+  const p = stripeUiProvider(), requests: Request[] = []; let reads = 0;
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { requests.push(new Request(url, init)); return json(init.method === 'GET' ? readWire(++reads === 1 ? pending : 'REQUIRES_PAYMENT_METHOD') : url.endsWith('/confirm') ? readWire('SUCCEEDED') : wire(pending), url.endsWith('/checkouts') ? 201 : 200); });
+  await createGenericPaymentClient({ apiBaseUrl: 'https://api.test' }).createCatalogCheckout({ siteKey: 'test-site', priceKey: 'lifetime' });
+  const el = mount(); await until(el, 'ready'); await vi.waitFor(() => expect(button(el)).toBeEnabled()); expect(button(el).textContent).toBe('Pay');
+  expect(requests.map(r => r.method)).toEqual(['POST', 'GET', 'GET']); button(el).click(); await until(el, 'succeeded');
+  expect(requests.map(r => r.method)).toEqual(['POST', 'GET', 'GET', 'POST']); expect(requests[3].url).toBe('https://api.test/api/v1/public/checkouts/11111111-1111-4111-8111-111111111111/confirm'); expect(p.elements.create).not.toHaveBeenCalled();
+});
+it.each(['reject', 'throw'])('initial Stripe presentation %s does not publish payment uncertainty or replace the ready form', async failure => {
+  const p = stripeUiProvider(), requests = stripeApi('SUCCEEDED'), el = mount(), unknown = vi.fn(), failed = vi.fn(); el.addEventListener('unknown', unknown); el.addEventListener('failed', failed);
+  button(el).click(); await vi.waitFor(() => expect(el.shadowRoot!.querySelector('iframe')).toBe(p.frame)); const host = p.frame.parentElement;
+  p.elements.update.mockImplementationOnce(() => { if (failure === 'throw') throw Error('sensitive'); return Promise.reject(Error('sensitive')); });
+  el.locale = 'pt-PT'; p.emit('ready'); await until(el, 'ready'); expect(button(el)).toBeEnabled(); expect(p.frame.parentElement).toBe(host); expect(p.element.destroy).not.toHaveBeenCalled(); expect(unknown).not.toHaveBeenCalled(); expect(failed).not.toHaveBeenCalled(); expect(requests).toHaveLength(2);
+  button(el).click(); await until(el, 'succeeded'); expect(requests).toHaveLength(3);
+});
+it('configuration change cancels initial presentation catch-up without late ready or financial events', async () => {
+  const p = stripeUiProvider(), requests = stripeApi(), el = mount(); let reject!: (reason: unknown) => void;
+  button(el).click(); await vi.waitFor(() => expect(el.shadowRoot!.querySelector('iframe')).toBe(p.frame));
+  p.elements.update.mockImplementationOnce(() => new Promise<void>((_, no) => { reject = no; })); el.locale = 'pt-PT'; p.emit('ready');
+  await vi.waitFor(() => expect(reject).toBeTypeOf('function')); const ready = vi.fn(), unknown = vi.fn(); el.addEventListener('ready', ready); el.addEventListener('unknown', unknown);
+  el.priceKey = 'other-key'; reject(Error('late sensitive')); await Promise.resolve(); await Promise.resolve();
+  expect(el.state).toBe('idle'); expect(el.shadowRoot!.querySelector('iframe')).toBeNull(); expect(p.element.destroy).toHaveBeenCalledOnce(); expect(ready).not.toHaveBeenCalled(); expect(unknown).not.toHaveBeenCalled(); expect(requests).toHaveLength(2);
+});
 it('does not expose provider values or perform network work before authorization', () => {
   const fetch = vi.fn(); vi.stubGlobal('fetch', fetch); const el = mount(); expect(el.shadowRoot!.innerHTML).not.toMatch(/clientSecret|pk_test_|pi_.*_secret/); expect(fetch).not.toHaveBeenCalled();
 });

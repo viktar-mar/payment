@@ -81,7 +81,7 @@ export class GenericPaymentWidget extends ElementBase {
     this.#expiry = setTimeout(() => { if (!this.#current(generation) || this.#session !== session) return; this.#apply({ ...session.state, status: 'EXPIRED' }); }, Math.min(2147483647, Math.max(0, Date.parse(session.expiresAt) - Date.now())));
   }
   async #mountProvider(generation: number): Promise<void> {
-    if (!this.#session || !['CREATED', 'REQUIRES_PAYMENT_METHOD', 'REQUIRES_ACTION'].includes(this.#session.state.status)) return;
+    if (!this.#session || (this.#session.providerType === 'STRIPE' && !['CREATED', 'REQUIRES_PAYMENT_METHOD', 'REQUIRES_ACTION'].includes(this.#session.state.status))) return;
     this.#providerView?.destroy(); this.#providerHost?.remove(); this.#providerReady = false;
     this.#providerHost = document.createElement('div'); this.#providerHost.className = 'payment-element'; this.#button.before(this.#providerHost);
     this.#providerView = new CheckoutProviderView(this.#client!, this.#providerHost); this.#presentation();

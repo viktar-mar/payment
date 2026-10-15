@@ -15,6 +15,14 @@ function mount(attributes: Record<string, string> = {}) {
 const root = (e: HTMLElement) => { expect(e.shadowRoot, 'Donation must expose accessible isolated controls').not.toBeNull(); return e.shadowRoot! as unknown as HTMLElement; };
 const ready = async (e: HTMLElement) => { await waitFor(() => expect(getByRole(root(e), 'button', { name: 'Create donation' })).toBeEnabled()); return root(e); };
 const api = () => vi.stubGlobal('fetch', async (url: string) => json(url.endsWith('/checkouts') ? donationWire() : url.includes('/checkouts/') ? donationReadWire() : campaignWire(), url.endsWith('/checkouts') ? 201 : 200));
+it.each(['PROCESSING', 'UNKNOWN'])('Fake Donation created %s regains original explicit confirmation after becoming actionable', async pending => {
+  const p = stripeUiProvider(), requests: Request[] = [];
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { requests.push(new Request(url, init)); return json(url.endsWith('/checkouts') ? { ...donationWire(), status: pending } : url.endsWith('/confirm') ? donationReadWire('SUCCEEDED') : url.includes('/checkouts/') ? donationReadWire('REQUIRES_PAYMENT_METHOD') : campaignWire(), url.endsWith('/checkouts') ? 201 : 200); });
+  const e = mount(), r = await ready(e); fireEvent.click(getByRole(r, 'button', { name: 'Create donation' }));
+  await waitFor(() => expect(getByRole(r, 'button', { name: 'Pay' })).toBeEnabled()); expect(requests.map(r => r.method)).toEqual(['GET', 'POST', 'GET']);
+  fireEvent.click(getByRole(r, 'button', { name: 'Pay' })); await waitFor(() => expect(getByRole(r, 'status')).toHaveTextContent('Payment succeeded'));
+  expect(requests.map(r => r.method)).toEqual(['GET', 'POST', 'GET', 'POST']); expect(requests[3].url).toBe('https://api.test/api/v1/public/checkouts/11111111-1111-4111-8111-111111111111/confirm'); expect(p.elements.create).not.toHaveBeenCalled();
+});
 const stripeDonationWire = (status = 'CREATED') => ({ ...donationWire(), status, provider_type: 'STRIPE', confirmation_mode: 'CLIENT_PROVIDER' });
 const stripeDonationRead = (status = 'CREATED') => ({ ...donationReadWire(status), provider_type: 'STRIPE', confirmation_mode: 'CLIENT_PROVIDER' });
 function stripeApi(backend = 'CREATED') {
@@ -24,6 +32,21 @@ function stripeApi(backend = 'CREATED') {
 async function stripeReady(e: HTMLElement, p: ReturnType<typeof stripeUiProvider>) {
   const r = await ready(e); fireEvent.click(getByRole(r, 'button', { name: 'Create donation' })); await waitFor(() => expect(r.querySelector('iframe')).toBe(p.frame)); p.emit('ready'); await waitFor(() => expect(getByRole(r, 'button', { name: 'Pay' })).toBeEnabled()); return r;
 }
+it.each(['reject', 'throw'])('Donation initial Stripe presentation %s retains ready Pay without financial error events', async failure => {
+  const p = stripeUiProvider(), requests = stripeApi('SUCCEEDED'), e = mount(), r = await ready(e), states: string[] = []; e.addEventListener('donation-state', event => states.push((event as CustomEvent).detail.status));
+  fireEvent.click(getByRole(r, 'button', { name: 'Create donation' })); await waitFor(() => expect(r.querySelector('iframe')).toBe(p.frame)); const host = p.frame.parentElement;
+  p.elements.update.mockImplementationOnce(() => { if (failure === 'throw') throw Error('sensitive'); return Promise.reject(Error('sensitive')); });
+  e.setAttribute('locale', 'en-US'); e.dispatchEvent(new Event('payment-theme-change')); p.emit('ready');
+  await waitFor(() => expect(getByRole(r, 'button', { name: 'Pay' })).toBeEnabled()); expect(p.frame.parentElement).toBe(host); expect(p.element.destroy).not.toHaveBeenCalled(); expect(states).toEqual(['CREATED']); expect(requests).toHaveLength(3);
+  fireEvent.click(getByRole(r, 'button', { name: 'Pay' })); await waitFor(() => expect(getByRole(r, 'status')).toHaveTextContent('Payment succeeded')); expect(requests).toHaveLength(4);
+});
+it('Donation disconnect cancels initial presentation catch-up without late financial events', async () => {
+  const p = stripeUiProvider(), requests = stripeApi(), e = mount(), r = await ready(e); let reject!: (reason: unknown) => void;
+  fireEvent.click(getByRole(r, 'button', { name: 'Create donation' })); await waitFor(() => expect(r.querySelector('iframe')).toBe(p.frame));
+  p.elements.update.mockImplementationOnce(() => new Promise<void>((_, no) => { reject = no; })); e.setAttribute('locale', 'pt-PT'); p.emit('ready');
+  await waitFor(() => expect(reject).toBeTypeOf('function')); const states = vi.fn(); e.addEventListener('donation-state', states); e.remove(); reject(Error('late sensitive')); await Promise.resolve(); await Promise.resolve();
+  expect(r.querySelector('iframe')).toBeNull(); expect(p.element.destroy).toHaveBeenCalledOnce(); expect(states).not.toHaveBeenCalled(); expect(requests).toHaveLength(3);
+});
 it('Donation expiry removes the live capability without another request', async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true }); const p = stripeUiProvider(), requests = stripeApi(), e = mount(), r = await stripeReady(e, p);
   await vi.advanceTimersByTimeAsync(Date.parse(stripeCapability().expires_at) - Date.now() + 1); expect(getByRole(r, 'status')).toHaveTextContent('Checkout expired'); expect(p.element.destroy).toHaveBeenCalledOnce(); expect(requests).toHaveLength(3);
