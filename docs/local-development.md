@@ -228,6 +228,44 @@ Admin: http://localhost:3000. API: http://localhost:8080. Demo: http://localhost
 
 ## Stripe Sandbox configuration (Stage 5A preparation)
 
+The recovery helper `infrastructure/stripe-sandbox-bootstrap.mjs` exports
+`createOwnedSandboxBootstrap(options, dependencies)` without an entrypoint. An operator
+supplies the approved fresh lowercase run ID, exact committed source SHA, pinned Unix
+Docker daemon, six distinct loopback ports, account/API binding and both explicit opt-ins.
+It never generates or adopts a run ID. Its private run tree is
+`test-results/stripe-sandbox/<runId>`; generated credentials, issuer keys and runtime
+evidence stay there. It preserves existing local configuration and resources.
+
+The controlled invocation order is `prepare({signal, deadline})`, then construct the
+existing CLI adapter from `resources().cliDirectory`, `verifyForwardTarget` and
+`persistWebhookSecret`. The root operator separately performs the approved login,
+`validateBinding`, and `startListener`; only then call bootstrap `start` and `verify`
+with their own finite absolute Unix-millisecond deadlines. The two CLI callbacks and
+`withAdminCredentials(callback)` retain the original preparation deadline and signal,
+including the later human login budget; expiry never extends the run. The admin callback
+receives only `{username, password}`, requires verified live ownership, and must return
+exactly `true` after its separately bounded work. Bootstrap performs no authentication,
+provisioning, browser or financial actions.
+
+Before startup, the forwarding callback proves the complete recorded stopped topology
+and a currently free backend port. This is planned ownership evidence, not a socket
+reservation or readiness; the port can change after the check. The placeholder backend
+never starts. A never-started container may have an empty operational network ID only
+with the exact configured network name/mode and a fresh full owned-network proof.
+After the listener secret is durably stored in both the fixed private
+Stripe env file and final run env, one verified pre-live replacement installs that env.
+Live verification then requires the final running IDs, images, network, mounts, health
+and all six exact `127.0.0.1` bindings, including both Mailpit ports. Same-user socket
+impersonation is not solved by point-in-time checks.
+
+Every uncertain result latches `PENDING`; do not repeat preparation, replace services,
+rotate a conflicting webhook secret or retry financial work. Stop the exact CLI listener
+first, then call bootstrap `stop({signal, deadline})`. Cleanup stops only recorded,
+freshly verified containers and preserves containers, volumes, network and private audit
+files. It never uses Compose down, prune, default Docker configuration or global stops.
+Synthetic tests establish local behavior only; real Stage 5A acceptance remains pending
+until the root operator completes the separately approved runtime checks.
+
 The optional Sandbox overlay prepares backend configuration only. It does not establish a working Stripe backend until the Stage 5A adapter is implemented and verified. The default Compose file continues to use Fake without Stripe keys; the overlay also retains `PAYMENT_PROVIDER=fake` while enabling the separate Sandbox marker and `local` profile. Fake subscriptions continue to work; Stripe subscriptions require Stage 5B. This setup never enables live payments, Connect, Managed Payments, or business activation for real money.
 
 Create the separate private file from the project root:

@@ -3,6 +3,8 @@ target
 .idea
 .vscode
 *.iml
+**/test-results
+**/.superpowers
 **/.env
 **/.env.*
 **/*.env.local

@@ -1,0 +1,582 @@
+import test,{after,mock} from 'node:test';
+import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import net from 'node:net';
+import filesystem from 'node:fs/promises';
+import {syncBuiltinESMExports} from 'node:module';
+import {constants} from 'node:fs';
+import {dirname,resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {EventEmitter} from 'node:events';
+import {createOwnedSandboxBootstrap} from './stripe-sandbox-bootstrap.mjs';
+
+// Guard the builtin defaults as well as each fixture's raw process boundary.
+const forbidden=()=>{throw new Error('synthetic_test_forbids_real_process');};
+mock.method(childProcess,'execFile',forbidden);
+mock.method(childProcess,'spawn',forbidden);
+mock.method(net,'createServer',forbidden);
+mock.method(globalThis,'fetch',forbidden);
+const actualOpen=filesystem.open,actualReadFile=filesystem.readFile;
+mock.method(filesystem,'open',(path,...args)=>{if(String(path).endsWith('/infrastructure/stripe-sandbox.env.local'))return forbidden();return actualOpen(path,...args);});
+mock.method(filesystem,'readFile',(path,...args)=>{if(String(path).endsWith('/infrastructure/stripe-sandbox.env.local'))return forbidden();return actualReadFile(path,...args);});
+syncBuiltinESMExports();
+after(()=>{mock.restoreAll();syncBuiltinESMExports();});
+
+const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
+const RUN='11111111-2222-4333-8444-555555555555',PROJECT='stripe-'+RUN;
+const DIR=ROOT+'/test-results/stripe-sandbox/'+RUN,USERFILE=ROOT+'/infrastructure/stripe-sandbox.env.local';
+const PORTS={backend:18080,demo:18081,receiver:18082,postgres:15432,mailpitHttp:18025,mailpitSmtp:11025};
+const SERVICES=['postgres','mailpit','backend','demo-site','callback-receiver'];
+const SECRET='whsec_A00112233445566778899';
+const USERBYTES='# private synthetic test input\r\nPAYMENT_STRIPE_SANDBOX_SECRET_KEY=sk_test_A00112233445566778899\r\nPAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY="pk_test_B00112233445566778899"\r\nPAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET=\r\n';
+const LIMIT=()=>({deadline:Date.now()+120000});
+const turn=()=>new Promise(resolveTurn=>setImmediate(resolveTurn));
+const rejects=(promise,code)=>assert.rejects(promise,{message:'stripe_sandbox_bootstrap_'+code});
+const id=n=>n.toString(16).padStart(64,'0');
+const image=n=>'sha256:'+id(n);
+const labels=kind=>({'payment.sandbox.project':PROJECT,'payment.sandbox.run':RUN,'payment.sandbox.kind':kind});
+const cLabels=service=>({...labels('container'),'com.docker.compose.project':PROJECT,'com.docker.compose.service':service});
+const mapping=service=>Object.fromEntries(({
+  postgres:[['5432/tcp',PORTS.postgres]],mailpit:[['8025/tcp',PORTS.mailpitHttp],['1025/tcp',PORTS.mailpitSmtp]],
+  backend:[['8080/tcp',PORTS.backend]],'demo-site':[['8080/tcp',PORTS.demo]],'callback-receiver':[['8080/tcp',PORTS.receiver]],
+}[service]??[]).map(([port,value])=>[port,[{HostIp:'127.0.0.1',HostPort:String(value)}]]));
+const mounts=service=>({postgres:[{Type:'volume',Name:PROJECT+'-postgres',Source:'/var/lib/docker/volumes/owned/_data',Destination:'/var/lib/postgresql',RW:true}],
+  backend:[{Type:'volume',Name:PROJECT+'-issuer',Source:'/var/lib/docker/volumes/issuer/_data',Destination:'/app/local-fixtures',RW:false}],
+  'callback-receiver':[{Type:'bind',Source:ROOT+'/infrastructure/callback-receiver.mjs',Destination:'/app/callback-receiver.mjs',RW:false}],
+  'issuer-installer':[{Type:'bind',Source:DIR+'/issuer.jwks.json',Destination:'/input/issuer.json',RW:false},{Type:'volume',Name:PROJECT+'-issuer',Source:'/var/lib/docker/volumes/issuer/_data',Destination:'/issuer',RW:true}],
+  'issuer-probe':[{Type:'volume',Name:PROJECT+'-issuer',Source:'/var/lib/docker/volumes/issuer/_data',Destination:'/issuer',RW:false}],
+}[service]??[]);
+
+function fixture(overrides={}) {
+  const events=[],files=new Map(),containers=new Map(),volumes=new Map(),images=new Map(),timers=new Map();
+  let serial=10,timerSerial=0,randomSerial=0,network=null;
+  const add=(path,directory,contents='')=>files.set(path,{directory,contents:Buffer.from(contents),mode:directory?0o40700:0o100600,uid:process.getuid(),nlink:1,ino:++serial,dev:1});
+  for(let path=ROOT;path!=='/';path=dirname(path))add(path,true);
+  add('/',true);add(ROOT+'/infrastructure',true);add(ROOT+'/backend',true);
+  const ignore='**/test-results\n**/.superpowers\n**/*.env.local\n**/fixtures/customer-issuer-*.jwks.json\n';
+  add(ROOT+'/.dockerignore',false,ignore);add(ROOT+'/backend/.dockerignore',false,ignore);add(USERFILE,false,USERBYTES);
+  const stat=entry=>({...entry,size:entry.contents.length,isDirectory:()=>entry.directory,isFile:()=>!entry.directory,isSymbolicLink:()=>Boolean(entry.symlink)});
+  const need=path=>{const entry=files.get(path);if(!entry)throw null;return entry;};
+  const env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',DOCKER_HOST:'never-inherit',STRIPE_API_KEY:'never-inherit'};
+  const options={runId:RUN,expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports:{...PORTS},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},env,...overrides};
+  function container(service) {
+    const helper=service.startsWith('issuer-'),name=PROJECT+'-'+service;
+    const value={Id:id(++serial),Name:'/'+name,Image:images.get(helper?'backend':service),Labels:cLabels(service),
+      State:{Status:'created',Running:false,ExitCode:0,StartedAt:'0001-01-01T00:00:00Z',Health:''},Mounts:mounts(service),
+      Networks:helper?{none:{NetworkID:''}}:{[PROJECT+'-network']:{NetworkID:network.Id}},PortBindings:mapping(service),Ports:{},
+      User:helper?(service==='issuer-installer'?'0:0':'10001:10001'):(service==='backend'?'payment':service==='demo-site'?'101:101':service==='callback-receiver'?'node':''),
+      ReadonlyRootfs:helper,NetworkMode:helper?'none':PROJECT+'-network',CapAdd:service==='issuer-installer'?['CHOWN','DAC_OVERRIDE']:[],CapDrop:helper?['ALL']:[],
+      StripeKeyPresent:service==='backend'&&events.some(e=>e.type==='open'&&e.path===DIR+'/final.env'),
+      SandboxDisabled:!events.some(e=>e.type==='open'&&e.path===DIR+'/final.env')};
+    containers.set(value.Id,value);return value;
+  }
+  const dependencies={
+    execFile:forbidden,now:Date.now,setTimeout:(callback,ms)=>{const key=++timerSerial;timers.set(key,{callback,ms});return key;},clearTimeout:key=>timers.delete(key),
+    preflight:async input=>{events.push({type:'preflight',input});return {status:'READY'};},portAvailable:async(port,host,context)=>{events.push({type:'port',port,host,context});return true;},
+    lstat:async path=>{events.push({type:'lstat',path});return stat(need(path));},realpath:async path=>{need(path);return path;},
+    readFile:async(path)=>{events.push({type:'readFile',path});return Buffer.from(need(path).contents);},
+    readdir:async path=>[...files.keys()].filter(p=>dirname(p)===path).map(p=>p.slice(path.length+1)),
+    mkdir:async(path,settings)=>{events.push({type:'mkdir',path,settings});if(files.has(path))throw null;need(dirname(path));add(path,true);},
+    rename:async(from,to)=>{events.push({type:'rename',from,to});need(from);files.set(to,files.get(from));files.delete(from);},
+    unlink:async path=>{events.push({type:'unlink',path});need(path);files.delete(path);},
+    open:async(path,flags,mode)=>{
+      events.push({type:'open',path,flags,mode});
+      if(flags&constants.O_CREAT) {if(files.has(path)&&(flags&constants.O_EXCL))throw null;need(dirname(path));if(!files.has(path))add(path,false);}
+      const entry=need(path);
+      if(entry.symlink&&(flags&constants.O_NOFOLLOW))throw null;
+      if(flags&constants.O_TRUNC)entry.contents=Buffer.alloc(0);
+      return {stat:async()=>stat(entry),writeFile:async contents=>{events.push({type:'write',path});entry.contents=Buffer.from(contents);},
+        readFile:async()=>{events.push({type:'read',path});return Buffer.from(entry.contents);},
+        read:async(buffer,offset,length,position)=>{events.push({type:'read',path});const bytesRead=Math.min(length,entry.contents.length-position);entry.contents.copy(buffer,offset,position,position+bytesRead);return {bytesRead,buffer};},
+        sync:async()=>{events.push({type:'sync',path});},close:async()=>{events.push({type:'close',path});}};
+    },
+    randomBytes:size=>Buffer.alloc(size,++randomSerial),generateKeyPairSync:(kind,options)=>{events.push({type:'crypto',kind,options});return {privateKey:{export:()=>kind==='rsa'?{kty:'RSA',n:'n',e:'AQAB',d:'d'}:{kty:'EC',crv:'P-256',x:'x',y:'y',d:'d'}}};},
+    health:async(url,context)=>{events.push({type:'health',url,context});return true;},
+    execute:async(file,args,settings)=>{
+      events.push({type:'process',file,args,settings});
+      if(file==='/usr/bin/git')return {stdout:args.includes('rev-parse')?'e'.repeat(40)+'\n':'',stderr:''};
+      const a=args.slice(4),[verb,sub]=a;
+      let stdout='';
+      if(verb==='compose') {
+        const create=a.indexOf('create');
+        if(a.includes('build')) {images.set('backend',image(1));images.set('demo-site',image(2));}
+        if(create!==-1)for(const service of a.slice(create+1).filter(value=>SERVICES.includes(value)))container(service);
+        if(a.includes('config'))stdout=JSON.stringify({services:Object.fromEntries(SERVICES.map(service=>[service,{
+          image:service==='backend'?PROJECT+'-backend:latest':service==='demo-site'?PROJECT+'-demo-site:latest':service==='postgres'?'postgres:18-alpine':service==='mailpit'?'axllent/mailpit:v1.27':'node:24-alpine',
+          container_name:PROJECT+'-'+service,labels:labels('container'),networks:{default:null},environment:service==='backend'?{PAYMENT_STRIPE_SANDBOX_ENABLED:'false'}:{},
+          ports:Object.entries(mapping(service)).map(([port,binding])=>({target:Number(port.split('/')[0]),published:binding[0].HostPort,host_ip:binding[0].HostIp,protocol:'tcp',mode:'ingress'})),
+          volumes:mounts(service).map(m=>({type:m.Type,source:m.Type==='bind'?m.Source:service==='backend'?'owned-issuer':'payment-postgres',target:m.Destination,read_only:!m.RW})),
+        }])),networks:{default:{external:true,name:PROJECT+'-network'}},volumes:{'payment-postgres':{external:true,name:PROJECT+'-postgres'},'owned-issuer':{external:true,name:PROJECT+'-issuer'}}});
+      } else if(verb==='pull') {
+        const tag=a.at(-1);images.set(tag==='postgres:18-alpine'?'postgres':tag==='axllent/mailpit:v1.27'?'mailpit':'callback-receiver',image(images.size+3));
+      } else if(verb==='image'&&sub==='inspect') {
+        const tag=a.at(-1),service=tag.includes('demo-site')?'demo-site':tag.includes('backend')?'backend':tag==='postgres:18-alpine'?'postgres':tag==='axllent/mailpit:v1.27'?'mailpit':'callback-receiver';
+        stdout=JSON.stringify({Id:images.get(service),User:service==='backend'?'payment':service==='demo-site'?'101:101':''});
+      } else if(verb==='network'&&sub==='create') {network={Id:id(++serial),Name:PROJECT+'-network',Labels:labels('network'),Driver:'bridge',Scope:'local'};stdout=network.Id;
+      } else if(verb==='network'&&sub==='inspect')stdout=JSON.stringify(network);
+      else if(verb==='volume'&&sub==='create') {const name=a.at(-1),kind=name.endsWith('-issuer')?'issuer':'postgres';volumes.set(name,{Name:name,CreatedAt:'2026-10-16T12:00:00Z',Driver:'local',Scope:'local',Labels:labels(kind)});stdout=name;
+      } else if(verb==='volume'&&sub==='inspect')stdout=JSON.stringify(volumes.get(a.at(-1)));
+      else if(verb==='container'&&sub==='create') {const name=a[a.indexOf('--name')+1],service=name.endsWith('-issuer-installer')?'issuer-installer':'issuer-probe';stdout=container(service).Id;
+      } else if(verb==='container'&&sub==='inspect') {const selector=a.at(-1),value=containers.get(selector)??[...containers.values()].find(c=>c.Name==='/'+selector);if(!value)throw null;stdout=JSON.stringify(value);
+      } else if(verb==='container'&&sub==='start') {const value=containers.get(a.at(-1));assert.ok(value);value.State={Status:value.Name.includes('issuer-')?'exited':'running',Running:!value.Name.includes('issuer-'),ExitCode:0,StartedAt:'2026-10-16T12:01:00Z',Health:value.Name.includes('issuer-')?'':'healthy'};
+        value.Ports=structuredClone(value.PortBindings);if(value.Name.endsWith('-mailpit'))value.Ports['1110/tcp']=null;
+        if(value.NetworkMode==='none')value.Networks={none:{NetworkID:id(900)}};
+      } else if(verb==='container'&&sub==='wait')stdout='0';
+      else if(verb==='container'&&sub==='stop') {const value=containers.get(a.at(-1));assert.ok(value);value.State.Running=false;value.State.Status='exited';}
+      else if(verb==='container'&&sub==='rm') {assert.equal(a.length,3);assert.ok(containers.delete(a.at(-1)));stdout=a.at(-1);}
+      else if(verb==='ps'&&a.includes('--filter'))stdout=[...containers.values()].map(c=>c.Id).join('\n');
+      return {stdout,stderr:''};
+    },
+  };
+  return {options,dependencies,events,files,containers,volumes,images,timers,get network(){return network;},stat};
+}
+async function setup(overrides) {const f=fixture(overrides);f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);return f;}
+async function prepared() {const f=await setup();assert.equal(await f.adapter.prepare(LIMIT()),true);return f;}
+
+test('constructor rejects invalid input before accessing dependencies and snapshots approved values',async()=>{
+  for(const update of [{runId:'2f3f49b1-df07-41b1-b978-bc884b390813'},{expectedSource:'bad'},{ports:{...PORTS,backend:PORTS.demo}},{daemon:'tcp://localhost:2375'},{approvedBinding:{externalAccountId:'acct_other',apiVersion:'2026-09-30.endive'}},{env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',DEBUG:'1'}}]) {
+    const f=fixture(update);let getters=0;
+    await rejects(createOwnedSandboxBootstrap(f.options,new Proxy({},{get(){getters++;throw null;}})),'INPUTS_CONFIGURATION');assert.equal(getters,0);
+  }
+  const f=await setup();f.options.ports.backend=65530;f.options.approvedBinding.externalAccountId='acct_mutated';f.options.runId='mutated';
+  const resources=f.adapter.resources();assert.equal(resources.runId,RUN);assert.equal(resources.ports.backend,18080);assert.ok(Object.isFrozen(resources.ports));assert.ok(Object.isFrozen(f.adapter));assert.equal(f.events.length,0);
+});
+
+test('R1 failure and invalid deadlines stop before all private access, writes, crypto and processes',async()=>{
+  const f=await setup();f.dependencies.preflight=async()=>({status:'READY'});
+  await rejects(f.adapter.prepare({deadline:NaN}),'PREPARE_PENDING');assert.equal(f.events.length,0);
+  const g=fixture();g.dependencies.preflight=async()=>({status:'PENDING'});g.adapter=await createOwnedSandboxBootstrap(g.options,g.dependencies);
+  await rejects(g.adapter.prepare(LIMIT()),'PREPARE_PENDING');assert.equal(g.events.length,0);
+  await rejects(g.adapter.prepare(LIMIT()),'PREPARE_PENDING');assert.equal(g.events.length,0);
+});
+
+test('prepare builds without credentials and records UID-safe issuer proof before creating five stopped services',async()=>{
+  const f=await prepared(),metadata=f.adapter.resources();
+  assert.equal(metadata.status,'PREPARED');assert.equal(metadata.cliDirectory,DIR+'/cli');assert.equal(metadata.siteKey,'s5a-11111111222243338444555555555555');
+  assert.deepEqual(Object.keys(metadata.containers).sort(),[...SERVICES,'issuer-installer','issuer-probe'].sort());
+  assert.equal(f.events.filter(e=>e.type==='read'&&e.path===USERFILE).length,0);
+  const build=f.events.find(e=>e.type==='process'&&e.args.includes('build'));
+  assert.ok(build);assert.ok(build.args.includes('--quiet'));assert.ok(!build.args.includes(ROOT+'/infrastructure/compose.stripe-sandbox.yaml'));
+  assert.ok(f.events.indexOf(build)<f.events.findIndex(e=>e.type==='open'&&e.path===DIR+'/issuer.jwks.json'));
+  for(const event of f.events.filter(e=>e.type==='process')) {
+    assert.equal(event.file,'/Applications/Docker.app/Contents/Resources/bin/docker');assert.deepEqual(event.args.slice(0,4),['--config','/private/var/empty','--host','unix:///Users/test/docker.sock']);
+    assert.equal(event.settings.cwd,ROOT);assert.equal(event.settings.shell,false);assert.equal(event.settings.maxBuffer,65536);assert.ok(event.settings.signal instanceof AbortSignal);
+    assert.deepEqual(Object.keys(event.settings.env).sort(),['LANG','LC_ALL','PATH']);assert.ok(event.settings.timeout<=1200000);
+  }
+  const createCalls=f.events.filter(e=>e.type==='process'&&e.args.includes('compose')&&e.args.includes('create'));
+  assert.equal(createCalls.length,1);assert.deepEqual(createCalls[0].args.slice(-5),SERVICES);
+  for(const service of SERVICES)assert.equal(metadata.containers[service].status,'created');
+  const installer=f.events.find(e=>e.type==='process'&&e.args.includes('create')&&e.args.includes(PROJECT+'-issuer-installer'));
+  assert.ok(installer.args.includes('--read-only'));assert.ok(installer.args.includes('CHOWN'));assert.ok(installer.args.includes('DAC_OVERRIDE'));
+  assert.ok(installer.args.at(-1).includes('chown 10001:10001'));assert.ok(installer.args.at(-1).includes('chmod 0600'));
+  const probe=f.events.find(e=>e.type==='process'&&e.args.includes('create')&&e.args.includes(PROJECT+'-issuer-probe'));
+  assert.ok(probe.args.includes('10001:10001'));assert.ok(probe.args.at(-1).includes('stat'));
+  assert.equal(f.files.get(DIR+'/issuer.jwks.json').mode&0o777,0o600);
+  for(const path of [DIR,DIR+'/cli',DIR+'/cli/home',DIR+'/cli/config',DIR+'/cli/config/stripe'])assert.equal(f.files.get(path).mode&0o777,0o700);
+  const ledger=JSON.parse(f.files.get(DIR+'/runtime.json').contents);assert.equal(ledger.webhookReady,false);assert.ok(!JSON.stringify(ledger).includes('sk_test_'));
+});
+
+test('stopped forwarding admission proves planned ownership and a free port without granting admin or readiness',async()=>{
+  const f=await prepared();assert.equal(await f.adapter.verifyForwardTarget(),true);
+  assert.equal(f.adapter.resources().status,'PREPARED');assert.equal(f.events.filter(e=>e.type==='health').length,0);
+  let invoked=false;await rejects(f.adapter.withAdminCredentials(()=>{invoked=true;}),'ADMIN_PENDING');assert.equal(invoked,false);
+  const g=await prepared();const backend=g.containers.get(g.adapter.resources().containers.backend.id);backend.PortBindings['8080/tcp'][0].HostIp='0.0.0.0';
+  await rejects(g.adapter.verifyForwardTarget(),'FORWARD_PENDING');
+});
+
+test('secret callback preserves user bytes and durably saves both stores before acknowledging',async()=>{
+  const f=await prepared();assert.equal(await f.adapter.persistWebhookSecret(SECRET),true);
+  assert.equal(f.files.get(USERFILE).contents.toString(),USERBYTES.replace('PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET=\r\n','PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET='+SECRET+'\r\n'));
+  const final=f.files.get(DIR+'/final.env').contents.toString();assert.ok(final.includes('PAYMENT_STRIPE_SANDBOX_SECRET_KEY=sk_test_A00112233445566778899\n'));assert.ok(final.includes(SECRET));
+  assert.equal(f.adapter.resources().webhookReady,true);
+  const userRename=f.events.findIndex(e=>e.type==='rename'&&e.to===USERFILE),finalWrite=f.events.findIndex(e=>e.type==='write'&&e.path===DIR+'/final.env');
+  assert.ok(userRename>=0&&finalWrite>userRename);assert.ok(f.events.slice(userRename+1).some(e=>e.type==='sync'&&e.path===ROOT+'/infrastructure'));
+  assert.ok(f.events.slice(finalWrite+1).some(e=>e.type==='sync'&&e.path===DIR+'/final.env'));
+  const safe=JSON.stringify(f.adapter.resources());for(const value of [SECRET,'sk_test_','pk_test_','privateKey','password','PAYMENT_DB_PASSWORD'])assert.ok(!safe.includes(value));
+  const ledger=JSON.parse(f.files.get(DIR+'/runtime.json').contents);assert.equal(ledger.webhookReady,true);
+});
+
+test('secret validation rejects unequal, duplicate, unknown, live and synthetic assignments without changing user bytes',async()=>{
+  for(const bytes of [USERBYTES.replace('WEBHOOK_SECRET=','WEBHOOK_SECRET=whsec_A99999999999999999999'),USERBYTES+'PAYMENT_STRIPE_SANDBOX_SECRET_KEY=sk_test_duplicate\n',
+    USERBYTES+'OTHER=value\n',USERBYTES.replace('sk_test_','sk_live_'),USERBYTES.replace('sk_test_A00112233445566778899','sk_test_synthetic')]) {
+    const f=await prepared();f.files.get(USERFILE).contents=Buffer.from(bytes);
+    await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.files.get(USERFILE).contents.toString(),bytes);assert.equal(f.adapter.resources().webhookReady,false);
+  }
+  const g=await prepared();await rejects(g.adapter.persistWebhookSecret('sk_test_notWebhook'),'PERSIST_PENDING');assert.equal(g.events.filter(e=>e.type==='read'&&e.path===USERFILE).length,0);
+});
+
+test('equal webhook secret leaves user inode and bytes unchanged while saving final private environment',async()=>{
+  const f=await prepared(),entry=f.files.get(USERFILE);entry.contents=Buffer.from(USERBYTES.replace('WEBHOOK_SECRET=','WEBHOOK_SECRET='+SECRET));const before=Buffer.from(entry.contents);
+  assert.equal(await f.adapter.persistWebhookSecret(SECRET),true);assert.equal(f.files.get(USERFILE),entry);assert.deepEqual(entry.contents,before);
+  assert.equal(f.events.filter(e=>e.type==='rename'&&e.to===USERFILE).length,0);assert.ok(f.files.has(DIR+'/final.env'));
+});
+
+test('start retires only the never-started backend, records its replacement, then starts exact IDs in dependency order',async()=>{
+  const f=await prepared(),old=f.adapter.resources().containers.backend.id;
+  assert.equal(await f.adapter.persistWebhookSecret(SECRET),true);assert.equal(await f.adapter.start(LIMIT()),true);
+  const metadata=f.adapter.resources(),fresh=metadata.containers.backend.id;assert.notEqual(fresh,old);assert.equal(metadata.retiredBackend.id,old);assert.ok(!f.containers.has(old));
+  assert.deepEqual(f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='start').slice(-5).map(e=>e.args.at(-1)),SERVICES.map(s=>metadata.containers[s].id));
+  const creates=f.events.filter(e=>e.type==='process'&&e.args.includes('compose')&&e.args.includes('create'));assert.equal(creates.length,2);
+  assert.deepEqual(creates[1].args.slice(-1),['backend']);assert.equal(creates[1].args.at(creates[1].args.indexOf('-f',creates[1].args.indexOf('-f')+2)+1),DIR+'/owned.yaml');
+  assert.ok(creates[1].args.includes(ROOT+'/infrastructure/compose.stripe-sandbox.yaml'));assert.ok(creates[1].args.includes(DIR+'/final.env'));
+  assert.equal(await f.adapter.verify(LIMIT()),true);assert.equal(await f.adapter.verifyForwardTarget(),true);
+  let credentials;assert.equal(await f.adapter.withAdminCredentials(value=>{credentials=value;return true;}),true);
+  assert.deepEqual(Object.keys(credentials).sort(),['password','username']);assert.ok(Object.isFrozen(credentials));
+  assert.equal(f.events.filter(e=>e.type==='process'&&e.args.includes('container')&&e.args.includes('rm')).length,1);
+  await rejects(f.adapter.start(LIMIT()),'START_PENDING');
+});
+
+test('cleanup verifies exact identities, stops only recorded IDs and retains all resource and private evidence',async()=>{
+  const f=await prepared();await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(LIMIT());const before=f.adapter.resources();
+  assert.equal(await f.adapter.stop(LIMIT()),true);assert.equal(f.adapter.resources().status,'STOPPED');
+  assert.equal(f.containers.size,7);assert.equal(f.volumes.size,2);assert.equal(f.network.Id,before.network.Id);assert.ok(f.files.has(DIR+'/issuer.jwks.json'));assert.ok(f.files.has(DIR+'/runtime.json'));
+  const calls=f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='stop');assert.deepEqual(calls.map(e=>e.args.at(-1)).sort(),SERVICES.map(s=>before.containers[s].id).sort());
+  assert.ok(f.events.some(e=>e.type==='close'&&e.path===DIR+'/owner.lock'));
+  const g=await prepared(),backend=g.containers.get(g.adapter.resources().containers.backend.id);backend.Labels['payment.sandbox.run']='foreign';
+  await rejects(g.adapter.stop(LIMIT()),'STOP_PENDING');assert.equal(g.events.filter(e=>e.type==='process'&&e.args[5]==='stop').length,0);
+});
+
+test('issuer chmod precedes chown so its minimal capabilities suffice, and Docker label key order is immaterial',async()=>{
+  const f=fixture(),execute=f.dependencies.execute;
+  f.dependencies.execute=async(...args)=>{
+    const result=await execute(...args);
+    if(args[1][5]==='inspect'&&['network','volume'].includes(args[1][4])) {
+      const value=JSON.parse(result.stdout);value.Labels=Object.fromEntries(Object.entries(value.Labels).sort());result.stdout=JSON.stringify(value);
+    }
+    return result;
+  };
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);assert.equal(await f.adapter.prepare(LIMIT()),true);
+  const command=f.events.find(e=>e.type==='process'&&e.args.includes(PROJECT+'-issuer-installer')&&e.args.includes('create')).args.at(-1);
+  assert.ok(command.indexOf('chmod 0600')<command.indexOf('chown 10001:10001'));
+});
+
+test('every private creation checks exclusive nofollow flags, inode ownership, file sync and directory sync before acknowledgement',async()=>{
+  const f=await prepared();await f.adapter.persistWebhookSecret(SECRET);
+  for(const event of f.events.filter(e=>e.type==='open'&&(e.flags&constants.O_CREAT))) {
+    assert.equal(event.flags&(constants.O_EXCL|constants.O_NOFOLLOW),constants.O_EXCL|constants.O_NOFOLLOW);assert.equal(event.mode,0o600);
+    const index=f.events.indexOf(event),next=f.events.slice(index+1);assert.ok(next.some(e=>e.type==='sync'&&e.path===event.path));assert.ok(next.some(e=>e.type==='sync'&&e.path===dirname(event.path)));
+  }
+  for(const event of f.events.filter(e=>e.type==='rename')) {
+    const before=f.events.slice(0,f.events.indexOf(event));assert.ok(before.some(e=>e.type==='sync'&&e.path===event.from));assert.ok(before.some(e=>e.type==='close'&&e.path===event.from));
+  }
+  const g=fixture(),open=g.dependencies.open;
+  g.dependencies.open=async(...args)=>{const file=await open(...args);if(args[0]===DIR+'/owner.lock')file.stat=async()=>({...g.stat(g.files.get(args[0])),uid:process.getuid()+1});return file;};
+  g.adapter=await createOwnedSandboxBootstrap(g.options,g.dependencies);await rejects(g.adapter.prepare(LIMIT()),'PREPARE_PENDING');
+  assert.equal(g.events.filter(e=>e.type==='process').length,0);assert.ok(g.events.some(e=>e.type==='close'&&e.path===DIR+'/owner.lock'));
+});
+
+test('existing run, symlinked run parent and missing build ignore coverage refuse all Docker writes',async()=>{
+  for(const mutate of [f=>f.files.set(DIR,{...f.files.get(ROOT),contents:Buffer.alloc(0)}),
+    f=>{f.files.get(ROOT+'/backend/.dockerignore').contents=Buffer.from('**/*.env.local\n');},
+    f=>{f.files.get(ROOT).symlink=true;}]) {
+    const f=fixture();mutate(f);f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);
+    await rejects(f.adapter.prepare(LIMIT()),'PREPARE_PENDING');assert.equal(f.events.filter(e=>e.type==='process').length,0);
+  }
+});
+
+test('unknown create outcome preserves DISPATCHING evidence, blocks later work and never adopts or retries',async()=>{
+  const f=fixture(),execute=f.dependencies.execute;let failed=false;
+  f.dependencies.execute=async(...args)=>{const value=await execute(...args);if(args[1][4]==='network'&&args[1][5]==='create'){failed=true;throw new Proxy({},{get(){throw new Error('must_not_traverse');}});}return value;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.prepare(LIMIT()),'PREPARE_PENDING');assert.equal(failed,true);
+  const ledger=JSON.parse(f.files.get(DIR+'/runtime.json').contents);assert.equal(ledger.intents.at(-1).status,'DISPATCHING');assert.equal(f.adapter.resources().status,'PENDING');
+  const count=f.events.length;await rejects(f.adapter.prepare(LIMIT()),'PREPARE_PENDING');assert.equal(f.events.length,count);await rejects(f.adapter.stop(LIMIT()),'STOP_PENDING');
+  assert.ok(f.files.has(DIR+'/owner.lock'));assert.equal(f.containers.size,0);
+});
+
+test('issuer probe failure prevents service creation and every user Stripe file read',async()=>{
+  const f=fixture(),execute=f.dependencies.execute;
+  f.dependencies.execute=async(...args)=>{const result=await execute(...args);if(args[1][5]==='wait'&&[...f.containers.values()].find(c=>c.Id===args[1].at(-1))?.Name.endsWith('issuer-probe'))result.stdout='1\n';return result;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.prepare(LIMIT()),'PREPARE_PENDING');
+  assert.equal(f.events.filter(e=>e.type==='process'&&e.args[4]==='compose'&&e.args.includes('create')).length,0);
+  await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.events.filter(e=>e.path===USERFILE).length,0);
+});
+
+test('foreign image, extra network, issuer mount and either Mailpit binding invalidate stopped ownership',async()=>{
+  for(const mutate of [f=>{f.containers.get(f.adapter.resources().containers.backend.id).Image=image(999);},
+    f=>{f.containers.get(f.adapter.resources().containers.backend.id).Networks.foreign={NetworkID:id(999)};},
+    f=>{f.containers.get(f.adapter.resources().containers.backend.id).Mounts[0].Name='foreign';},
+    f=>{delete f.containers.get(f.adapter.resources().containers.mailpit.id).PortBindings['1025/tcp'];},
+    f=>{f.containers.get(f.adapter.resources().containers.mailpit.id).PortBindings['8025/tcp'].push({HostIp:'::1',HostPort:'12345'});},
+    f=>{f.containers.get(f.adapter.resources().containers.backend.id).State.StartedAt='2026-10-16T12:00:00Z';},
+    f=>{f.volumes.get(PROJECT+'-issuer').CreatedAt='2026-10-17T12:00:00Z';},
+    f=>{f.containers.set(id(999),{Id:id(999)});},
+    f=>{f.containers.get(f.adapter.resources().containers['demo-site'].id).StripeKeyPresent=true;}]) {
+    const f=await prepared();mutate(f);await rejects(f.adapter.verifyForwardTarget(),'FORWARD_PENDING');assert.equal(f.events.filter(e=>e.type==='health').length,0);
+  }
+});
+
+test('unsafe user file metadata, duplicate writer lock and concurrent bytes fail before replacement',async()=>{
+  for(const mutate of [f=>{f.files.get(USERFILE).mode=0o100640;},f=>{f.files.get(USERFILE).nlink=2;},f=>{f.files.get(USERFILE).uid++;},f=>{f.files.get(USERFILE).symlink=true;},
+    f=>{f.files.set(ROOT+'/test-results/stripe-sandbox/user-env.lock',{...f.files.get(USERFILE),contents:Buffer.alloc(0)});}]) {
+    const f=await prepared();mutate(f);await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.events.filter(e=>e.type==='rename'&&e.to===USERFILE).length,0);
+  }
+  const f=fixture(),open=f.dependencies.open;
+  f.dependencies.open=async(...args)=>{const file=await open(...args);if(args[0]===DIR+'/stripe-user.env.tmp'){const sync=file.sync;file.sync=async()=>{await sync();f.files.get(USERFILE).contents=Buffer.from(USERBYTES+'# concurrent\n');};}return file;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await f.adapter.prepare(LIMIT());await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');
+  assert.equal(f.files.get(USERFILE).contents.toString(),USERBYTES+'# concurrent\n');assert.equal(f.files.has(DIR+'/final.env'),false);assert.equal(f.adapter.resources().webhookReady,false);
+});
+
+test('failure syncing final private store never acknowledges the webhook or allows replacement',async()=>{
+  const f=fixture(),open=f.dependencies.open;
+  f.dependencies.open=async(...args)=>{const file=await open(...args);if(args[0]===DIR+'/final.env')file.sync=async()=>{throw null;};return file;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await f.adapter.prepare(LIMIT());await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');
+  assert.equal(f.adapter.resources().webhookReady,false);await rejects(f.adapter.start(LIMIT()),'START_PENDING');assert.equal(f.events.filter(e=>e.type==='process'&&e.args[5]==='rm').length,0);
+});
+
+test('callbacks retain original prepare deadline and cancellation after prepare returns',async()=>{
+  const f=fixture();let now=1000;f.dependencies.now=()=>now;f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);
+  await f.adapter.prepare({deadline:5000});now=5000;await rejects(f.adapter.verifyForwardTarget(),'FORWARD_PENDING');
+  const g=await setup(),controller=new AbortController();await g.adapter.prepare({...LIMIT(),signal:controller.signal});controller.abort();
+  const before=g.events.length;await rejects(g.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(g.events.length,before);
+});
+
+test('abort during a command awaits its completion and prevents every subsequent action',async()=>{
+  const f=fixture(),controller=new AbortController(),execute=f.dependencies.execute;let release,entered;
+  const started=new Promise(resolveStarted=>{entered=resolveStarted;});
+  f.dependencies.execute=async(...args)=>{if(args[1].includes('build')) {entered(args[2]);await new Promise(resolveRelease=>{release=resolveRelease;});}return execute(...args);};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);let finished=false;
+  const prepare=f.adapter.prepare({...LIMIT(),signal:controller.signal}).finally(()=>{finished=true;});const settings=await started;controller.abort();await turn();
+  assert.equal(settings.signal.aborted,true);assert.equal(finished,false);await rejects(f.adapter.verifyForwardTarget(),'OPERATION_BUSY');release();await rejects(prepare,'PREPARE_PENDING');
+  assert.ok(f.events.filter(e=>e.type==='process').at(-1).args.includes('build'));assert.equal(f.files.has(DIR+'/issuer.jwks.json'),false);
+});
+
+test('builtin raw exec wrapper waits for close after abort callback and never falls through to a real process',async()=>{
+  const f=fixture(),controller=new AbortController(),child=new EventEmitter();let callback,settings,entered;
+  const started=new Promise(resolveStarted=>{entered=resolveStarted;});delete f.dependencies.execute;
+  f.dependencies.execFile=(file,args,options,done)=>{assert.equal(file,'/Applications/Docker.app/Contents/Resources/bin/docker');settings=options;callback=done;entered();return child;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);let finished=false;
+  const prepare=f.adapter.prepare({...LIMIT(),signal:controller.signal}).finally(()=>{finished=true;});await started;controller.abort();callback(new Error('raw private error'),'secret','secret');await turn();
+  assert.equal(settings.signal.aborted,true);assert.equal(finished,false);child.emit('close',null,'SIGTERM');await rejects(prepare,'PREPARE_PENDING');assert.equal(f.events.filter(e=>e.type==='read'&&e.path===USERFILE).length,0);
+});
+
+test('oversized process output and nested errors are redacted and permanently stop the instance',async()=>{
+  for(const broken of [()=>({stdout:'x'.repeat(65537),stderr:''}),()=>{throw new Proxy({},{get(){throw new Error('private');}});}]) {
+    const f=fixture();f.dependencies.execute=async()=>broken();f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);
+    await rejects(f.adapter.prepare(LIMIT()),'PREPARE_PENDING');assert.equal(f.adapter.resources().status,'PENDING');assert.equal(f.files.has(DIR+'/issuer.jwks.json'),false);
+  }
+});
+
+test('preexisting project resources and owned image tags refuse the build before any Docker mutation',async()=>{
+  for(const kind of ['network','image','ps']) {
+    const f=fixture(),execute=f.dependencies.execute;
+    f.dependencies.execute=async(...args)=>{const result=await execute(...args);if(args[1][4]===kind&&(args[1].includes('ls')||kind==='ps'))result.stdout=id(999)+'\n';return result;};
+    f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.prepare(LIMIT()),'PREPARE_PENDING');
+    assert.equal(f.events.filter(e=>e.type==='process'&&e.args.includes('build')).length,0);
+  }
+});
+
+test('synthetic merged Compose proof verifies exact override mounts and all six ports before service creation',async()=>{
+  const f=await prepared(),config=f.events.find(e=>e.type==='process'&&e.args.includes('config')&&e.args[4]==='compose');
+  assert.ok(config);assert.ok(config.args.includes(DIR+'/build.env'));assert.ok(!config.args.includes(DIR+'/app.env'));
+  const g=fixture(),execute=g.dependencies.execute;
+  g.dependencies.execute=async(...args)=>{const result=await execute(...args);if(args[1][4]==='compose'&&args[1].includes('config')){const body=JSON.parse(result.stdout);body.services.backend.volumes.push({type:'bind',source:'/foreign',target:'/app/local-fixtures/customer-issuer-private.jwks.json',read_only:true});result.stdout=JSON.stringify(body);}return result;};
+  g.adapter=await createOwnedSandboxBootstrap(g.options,g.dependencies);await rejects(g.adapter.prepare(LIMIT()),'PREPARE_PENDING');assert.equal(g.events.filter(e=>e.type==='process'&&e.args.includes('compose')&&e.args.includes('create')).length,0);
+});
+
+test('changed private directory or hardlinked ledger is refused before private replacement',async()=>{
+  for(const mutate of [f=>{f.files.get(DIR).symlink=true;},f=>{f.files.get(DIR+'/runtime.json').nlink=2;}]) {
+    const f=await prepared();mutate(f);await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.resources().status,'PENDING');
+  }
+});
+
+test('admin callback deadline cannot leave an unbounded capability or restore readiness from late completion',async()=>{
+  const f=await prepared();await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(LIMIT());let release,entered,finished=false;
+  const started=new Promise(resolveStarted=>{entered=resolveStarted;});
+  const operation=f.adapter.withAdminCredentials(()=>{entered();return new Promise(resolveRelease=>{release=resolveRelease;});}).finally(()=>{finished=true;});
+  const rejected=rejects(operation,'ADMIN_PENDING');await started;const timer=[...f.timers.values()][0];assert.ok(timer);timer.callback();await turn();const bounded=finished;
+  release(true);await rejected;assert.equal(bounded,true);await rejects(f.adapter.verify(LIMIT()),'VERIFY_PENDING');
+});
+
+test('network-none helpers accept Docker builtin none topology while refusing any connected helper network',async()=>{
+  const f=fixture(),execute=f.dependencies.execute;
+  f.dependencies.execute=async(...args)=>{const result=await execute(...args);if(args[1][4]==='container'&&args[1][5]==='inspect') {
+    const body=JSON.parse(result.stdout);if(body.NetworkMode==='none'){body.Networks={none:{NetworkID:id(900)}};result.stdout=JSON.stringify(body);}
+  }return result;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);assert.equal(await f.adapter.prepare(LIMIT()),true);
+  const g=fixture(),other=g.dependencies.execute;
+  g.dependencies.execute=async(...args)=>{const result=await other(...args);if(args[1][4]==='container'&&args[1][5]==='inspect') {
+    const body=JSON.parse(result.stdout);if(body.NetworkMode==='none'){body.Networks={bridge:{NetworkID:id(901)}};result.stdout=JSON.stringify(body);}
+  }return result;};
+  g.adapter=await createOwnedSandboxBootstrap(g.options,g.dependencies);await rejects(g.adapter.prepare(LIMIT()),'PREPARE_PENDING');
+});
+
+test('generated local credentials are distinct Base64 inputs and issuer algorithms match the backend contract',async()=>{
+  const f=await prepared(),values=Object.fromEntries(f.files.get(DIR+'/app.env').contents.toString().trim().split('\n').map(line=>{const offset=line.indexOf('=');return [line.slice(0,offset),line.slice(offset+1)];}));
+  const secrets=['PAYMENT_DB_PASSWORD','PAYMENT_ADMIN_BOOTSTRAP_PASSWORD','PAYMENT_DATA_ENCRYPTION_KEY','PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY','PAYMENT_CUSTOMER_DIGEST_KEY_V1','PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1'].map(name=>values[name]);
+  assert.equal(new Set(secrets).size,6);for(const value of secrets){assert.equal(Buffer.from(value,'base64').byteLength,32);assert.equal(Buffer.from(value,'base64').toString('base64'),value);}
+  assert.equal(values.PAYMENT_FAKE_AUTO_SUCCESS,'false');assert.equal(values.PAYMENT_TELEMETRY_SITEKEYS,'s5a-11111111222243338444555555555555');
+  const keys=JSON.parse(f.files.get(DIR+'/issuer.jwks.json').contents).keys;assert.deepEqual(keys.map(k=>[k.kid,k.alg,k.use]),[['local-fixture-rs','RS256','sig'],['local-fixture-es','ES256','sig']]);
+  assert.deepEqual(f.events.filter(e=>e.type==='crypto').map(e=>[e.kind,e.options]),[['rsa',{modulusLength:2048}],['ec',{namedCurve:'prime256v1'}]]);
+});
+
+test('replacement identity is durably recorded before its first start and uncertain create never retries',async()=>{
+  const f=fixture(),execute=f.dependencies.execute;let checked=false;
+  f.dependencies.execute=async(...args)=>{
+    if(args[1][4]==='container'&&args[1][5]==='start') {
+      const ledger=JSON.parse(f.files.get(DIR+'/runtime.json').contents),backend=ledger.containers.backend;
+      if(backend&&args[1].at(-1)===backend.id) {assert.ok(ledger.retiredBackend);assert.notEqual(backend.id,ledger.retiredBackend.id);assert.ok(ledger.intents.some(i=>i.action==='CREATE_FINAL_BACKEND'&&i.status==='ACKNOWLEDGED'));checked=true;}
+    }
+    return execute(...args);
+  };
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await f.adapter.prepare(LIMIT());await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(LIMIT());assert.equal(checked,true);
+  const g=fixture(),other=g.dependencies.execute;
+  g.dependencies.execute=async(...args)=>{const value=await other(...args);if(args[1].includes('create')&&args[1].includes(ROOT+'/infrastructure/compose.stripe-sandbox.yaml'))throw null;return value;};
+  g.adapter=await createOwnedSandboxBootstrap(g.options,g.dependencies);await g.adapter.prepare(LIMIT());await g.adapter.persistWebhookSecret(SECRET);await rejects(g.adapter.start(LIMIT()),'START_PENDING');
+  const count=g.events.length;await rejects(g.adapter.start(LIMIT()),'START_PENDING');assert.equal(g.events.length,count);assert.equal(g.events.filter(e=>e.type==='process'&&e.args[5]==='rm').length,1);
+  assert.equal(g.events.filter(e=>e.type==='process'&&e.args[5]==='start').length,2);await rejects(g.adapter.stop(LIMIT()),'STOP_PENDING');
+});
+
+test('live verification rejects extra actual bindings before health or admin calls',async()=>{
+  const f=await prepared();await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(LIMIT());
+  const backend=f.containers.get(f.adapter.resources().containers.backend.id);backend.Ports={...backend.Ports,'9090/tcp':[{HostIp:'127.0.0.1',HostPort:'19090'}]};
+  const health=f.events.filter(e=>e.type==='health').length;await rejects(f.adapter.verify(LIMIT()),'VERIFY_PENDING');assert.equal(f.events.filter(e=>e.type==='health').length,health);
+  let invoked=false;await rejects(f.adapter.withAdminCredentials(()=>{invoked=true;return true;}),'ADMIN_PENDING');assert.equal(invoked,false);
+});
+
+test('startup waits for each current service health without requiring later services to be running',async()=>{
+  const f=fixture(),execute=f.dependencies.execute;let entered;
+  const starting=new Promise(resolveStarted=>{entered=resolveStarted;});
+  f.dependencies.execute=async(...args)=>{const value=await execute(...args);if(args[1][5]==='start') {
+    const container=f.containers.get(args[1].at(-1));if(container.Name===('/'+PROJECT+'-postgres')){container.State.Health='starting';entered(container);}
+  }return value;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await f.adapter.prepare(LIMIT());await f.adapter.persistWebhookSecret(SECRET);const start=f.adapter.start(LIMIT());
+  const postgres=await starting;await turn();const timer=[...f.timers.values()].find(t=>t.ms===1000);assert.ok(timer);
+  assert.equal(f.containers.get(f.adapter.resources().containers.mailpit.id).State.Running,false);postgres.State.Health='healthy';timer.callback();assert.equal(await start,true);
+});
+
+test('default HTTP health enforces redirects, bounded body and an abort signal without any network',async()=>{
+  const f=fixture();delete f.dependencies.health;const calls=[];
+  const guard=globalThis.fetch;globalThis.fetch=async(url,options)=>{calls.push({url,options});return {status:200,body:new ReadableStream({start(controller){controller.enqueue(new Uint8Array([1]));controller.close();}})};};
+  try {
+    f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await f.adapter.prepare(LIMIT());await f.adapter.persistWebhookSecret(SECRET);assert.equal(await f.adapter.start(LIMIT()),true);
+    assert.equal(calls.length,3);for(const call of calls){assert.equal(call.options.redirect,'error');assert.ok(call.options.signal instanceof AbortSignal);assert.ok(call.url.startsWith('http://127.0.0.1:'));}
+    globalThis.fetch=async()=>({status:200,body:new ReadableStream({start(controller){controller.enqueue(new Uint8Array(65537));controller.close();}})});
+    await rejects(f.adapter.verify(LIMIT()),'VERIFY_PENDING');
+  } finally {globalThis.fetch=guard;}
+});
+
+test('default free-port check retains its timer until verified close and fails closed on missing close',async()=>{
+  const f=fixture();delete f.dependencies.portAvailable;let entered,close;
+  const waiting=new Promise(resolveStarted=>{entered=resolveStarted;});
+  f.dependencies.createServer=()=>({on(){return this;},listen(options,callback){queueMicrotask(callback);},close(callback){close=callback;entered();}});
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);const prepare=f.adapter.prepare(LIMIT());const rejected=rejects(prepare,'PREPARE_PENDING');
+  await waiting;const timer=[...f.timers.values()].find(t=>t.ms===3000);assert.ok(timer);timer.callback();await rejected;close();
+  assert.equal(f.events.filter(e=>e.type==='mkdir').length,0);
+});
+
+test('never-started services admit empty configured NetworkID with exact owned mode, map and fresh network proof',async()=>{
+  const f=fixture(),execute=f.dependencies.execute;
+  f.dependencies.execute=async(...args)=>{const value=await execute(...args);if(args[1][4]==='container'&&args[1][5]==='inspect') {
+    const body=JSON.parse(value.stdout);if(SERVICES.includes(body.Labels['com.docker.compose.service'])&&body.State.Status==='created') {
+      body.Networks[PROJECT+'-network'].NetworkID='';body.NetworkMode=f.network.Id;value.stdout=JSON.stringify(body);
+    }
+  }return value;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);assert.equal(await f.adapter.prepare(LIMIT()),true);assert.equal(await f.adapter.verifyForwardTarget(),true);
+  await f.adapter.persistWebhookSecret(SECRET);assert.equal(await f.adapter.start(LIMIT()),true);assert.equal(await f.adapter.verify(LIMIT()),true);
+});
+
+test('wrong nonempty initial network ID, foreign mode and absent configured map always refuse preparation',async()=>{
+  for(const mutate of [body=>{body.Networks[PROJECT+'-network'].NetworkID=id(999);},body=>{body.NetworkMode='bridge';},body=>{body.Networks={};}]) {
+    const f=fixture(),execute=f.dependencies.execute;
+    f.dependencies.execute=async(...args)=>{const value=await execute(...args);if(args[1][4]==='container'&&args[1][5]==='inspect') {
+      const body=JSON.parse(value.stdout);if(body.Labels['com.docker.compose.service']==='backend'){mutate(body);value.stdout=JSON.stringify(body);}
+    }return value;};
+    f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.prepare(LIMIT()),'PREPARE_PENDING');
+  }
+});
+
+test('empty live NetworkID fails before health or admin and cleanup-only cleared IDs never grant live or restart authority',async()=>{
+  const f=await prepared();await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(LIMIT());
+  f.containers.get(f.adapter.resources().containers.backend.id).Networks[PROJECT+'-network'].NetworkID='';
+  const health=f.events.filter(e=>e.type==='health').length;await rejects(f.adapter.verify(LIMIT()),'VERIFY_PENDING');assert.equal(f.events.filter(e=>e.type==='health').length,health);
+  let invoked=false;await rejects(f.adapter.withAdminCredentials(()=>{invoked=true;return true;}),'ADMIN_PENDING');assert.equal(invoked,false);
+  const g=fixture(),execute=g.dependencies.execute;
+  g.dependencies.execute=async(...args)=>{const value=await execute(...args);if(args[1][4]==='container'&&args[1][5]==='stop') {
+    const container=g.containers.get(args[1].at(-1));container.Networks[PROJECT+'-network'].NetworkID='';
+  }return value;};
+  g.adapter=await createOwnedSandboxBootstrap(g.options,g.dependencies);await g.adapter.prepare(LIMIT());await g.adapter.persistWebhookSecret(SECRET);await g.adapter.start(LIMIT());
+  assert.equal(await g.adapter.stop(LIMIT()),true);const starts=g.events.filter(e=>e.type==='process'&&e.args[5]==='start').length;
+  await rejects(g.adapter.start(LIMIT()),'START_PENDING');await rejects(g.adapter.verify(LIMIT()),'VERIFY_PENDING');assert.equal(g.events.filter(e=>e.type==='process'&&e.args[5]==='start').length,starts);
+});
+
+test('I1 created helpers accept empty builtin none ID, and cleared exited helper IDs grant cleanup only',async()=>{
+  const f=await prepared(),metadata=f.adapter.resources();assert.equal(metadata.containers['issuer-probe'].status,'exited');
+  for(const helper of ['issuer-installer','issuer-probe'])f.containers.get(metadata.containers[helper].id).Networks.none.NetworkID='';
+  assert.equal(await f.adapter.stop(LIMIT()),true);const count=f.events.length;
+  await rejects(f.adapter.start(LIMIT()),'START_PENDING');assert.equal(f.events.length,count);
+  for(const mutate of [body=>{body.Networks={bridge:{NetworkID:id(900)}};},body=>{body.Networks.none.NetworkID='partial';},body=>{body.State.Status='running';body.State.Running=true;}]) {
+    const g=fixture(),execute=g.dependencies.execute;
+    g.dependencies.execute=async(...args)=>{const result=await execute(...args);if(args[1][4]==='container'&&args[1][5]==='inspect') {
+      const body=JSON.parse(result.stdout);if(body.NetworkMode==='none'){mutate(body);result.stdout=JSON.stringify(body);}
+    }return result;};
+    g.adapter=await createOwnedSandboxBootstrap(g.options,g.dependencies);await rejects(g.adapter.prepare(LIMIT()),'PREPARE_PENDING');
+    assert.equal(g.events.filter(e=>e.type==='process'&&e.args[5]==='start').length,0);
+  }
+});
+
+test('I2 official Node image default is empty while the receiver must explicitly run as node',async()=>{
+  const f=await prepared();assert.equal(f.adapter.resources().images['callback-receiver'].user,'');
+  assert.equal(f.containers.get(f.adapter.resources().containers['callback-receiver'].id).User,'node');
+  const g=fixture(),execute=g.dependencies.execute;
+  g.dependencies.execute=async(...args)=>{const result=await execute(...args);if(args[1][4]==='container'&&args[1][5]==='inspect') {
+    const body=JSON.parse(result.stdout);if(body.Labels['com.docker.compose.service']==='callback-receiver'){body.User='';result.stdout=JSON.stringify(body);}
+  }return result;};
+  g.adapter=await createOwnedSandboxBootstrap(g.options,g.dependencies);await rejects(g.adapter.prepare(LIMIT()),'PREPARE_PENDING');
+});
+
+test('I3 only known unpublished Mailpit 1110 null is allowed alongside the exact six live host bindings',async()=>{
+  const f=await prepared();await f.adapter.persistWebhookSecret(SECRET);assert.equal(await f.adapter.start(LIMIT()),true);
+  const mailpit=f.containers.get(f.adapter.resources().containers.mailpit.id);assert.equal(mailpit.Ports['1110/tcp'],null);assert.equal(await f.adapter.verify(LIMIT()),true);
+  for(const mutate of [c=>{c.Ports['1110/tcp']=[{HostIp:'127.0.0.1',HostPort:'11110'}];},
+    c=>{c.Ports['8025/tcp'][0].HostIp='::1';},c=>{c.Ports['1025/tcp'][0].HostIp='0.0.0.0';},
+    c=>{c.Ports['8025/tcp'].push({HostIp:'127.0.0.1',HostPort:'18026'});},c=>{delete c.Ports['1025/tcp'];},
+    c=>{c.Ports['9090/tcp']=null;}]) {
+    const g=await prepared();await g.adapter.persistWebhookSecret(SECRET);await g.adapter.start(LIMIT());mutate(g.containers.get(g.adapter.resources().containers.mailpit.id));
+    const before=g.events.filter(e=>e.type==='health').length;await rejects(g.adapter.verify(LIMIT()),'VERIFY_PENDING');assert.equal(g.events.filter(e=>e.type==='health').length,before);
+  }
+  const g=await prepared();g.containers.get(g.adapter.resources().containers.mailpit.id).PortBindings['1110/tcp']=null;
+  await rejects(g.adapter.verifyForwardTarget(),'FORWARD_PENDING');
+  const h=await prepared();await h.adapter.persistWebhookSecret(SECRET);await h.adapter.start(LIMIT());h.containers.get(h.adapter.resources().containers.backend.id).Ports['1110/tcp']=null;
+  await rejects(h.adapter.verify(LIMIT()),'VERIFY_PENDING');
+});
+
+test('I4 writer FD stays held through checked unlink and durable parent sync',async()=>{
+  const f=await prepared();assert.equal(await f.adapter.persistWebhookSecret(SECRET),true);
+  const path=ROOT+'/test-results/stripe-sandbox/user-env.lock';
+  const removed=f.events.findIndex(e=>e.type==='unlink'&&e.path===path),closed=f.events.findIndex(e=>e.type==='close'&&e.path===path);
+  const directorySync=f.events.findIndex((e,index)=>index>removed&&e.type==='sync'&&e.path===dirname(path));
+  assert.ok(removed>=0&&directorySync>removed&&closed>directorySync);
+});
+
+test('I4 replaced, missing or unsafe writer paths refuse release without unlinking the foreign lock',async()=>{
+  const path=ROOT+'/test-results/stripe-sandbox/user-env.lock';
+  for(const mutate of [f=>{const prior=f.files.get(path);f.files.set(path,{...prior,ino:prior.ino+1000,contents:Buffer.from('foreign writer\n')});},
+    f=>{f.files.delete(path);},f=>{f.files.get(path).mode=0o100640;},f=>{f.files.get(path).uid++;},f=>{f.files.get(path).nlink=2;},
+    f=>{f.files.get(dirname(path)).symlink=true;}]) {
+    const f=fixture(),open=f.dependencies.open;let changed=false,expected;
+    f.dependencies.open=async(...args)=>{const file=await open(...args);if(args[0]===DIR+'/final.env'){const sync=file.sync;file.sync=async()=>{await sync();mutate(f);expected=f.files.get(path);changed=true;};}return file;};
+    f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await f.adapter.prepare(LIMIT());await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');
+    assert.equal(changed,true);assert.equal(f.events.filter(e=>e.type==='unlink'&&e.path===path).length,0);assert.equal(f.adapter.resources().status,'PENDING');
+    assert.ok(f.files.has(DIR+'/runtime.json'));assert.equal(f.files.get(path),expected);
+  }
+});
+
+test('I4 held writer metadata must still match its recorded inode and current private ownership',async()=>{
+  const f=fixture(),path=ROOT+'/test-results/stripe-sandbox/user-env.lock',open=f.dependencies.open;let releasing=false;
+  f.dependencies.open=async(...args)=>{const file=await open(...args);
+    if(args[0]===path){const stat=file.stat;file.stat=async()=>{const value=await stat();return releasing?{...value,dev:value.dev+1}:value;};}
+    if(args[0]===DIR+'/final.env'){const sync=file.sync;file.sync=async()=>{await sync();releasing=true;};}return file;
+  };
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await f.adapter.prepare(LIMIT());await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');
+  assert.ok(f.files.has(path));assert.equal(f.events.filter(e=>e.type==='unlink'&&e.path===path).length,0);
+});
+
+test('both opt-ins precede every configuration and dependency getter',async()=>{
+  for(const env of [{},{PAYMENT_STRIPE_SANDBOX_ENABLED:'true'},{PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'}]) {
+    let touched=0;
+    const options={env};Object.defineProperty(options,'runId',{get(){touched++;throw null;}});
+    const dependencies=new Proxy({execFile:forbidden},{get(){touched++;throw null;}});
+    await assert.rejects(createOwnedSandboxBootstrap(options,dependencies),{message:'stripe_sandbox_bootstrap_OPT_IN_REQUIRED'});
+    assert.equal(touched,0);
+  }
+});
