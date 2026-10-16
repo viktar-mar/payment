@@ -35,6 +35,31 @@ This prevents accidental remote-context confusion, not same-user OS-level socket
 callback points to that receiver's `/callback`, and its one-time returned signing secret is delivered
 to `/configure` in memory only. Do not rotate/recreate it merely to make a resumed run convenient.
 
+### Separate owned Sandbox provisioner
+
+`infrastructure/stripe-sandbox-provision.mjs` is an inert capability for the separately approved
+owned run. Construct `createOwnedSandboxProvisioner({env, bootstrap, verifyProviderBinding})`
+with both explicit Sandbox flags, the reviewed live bootstrap capability and the reviewed
+provider-binding callback. Only `provision({signal, deadline})` performs I/O; it requires a finite
+absolute deadline, freshly verifies ownership before each HTTP request, and uses generated Admin
+credentials only after releasing the bootstrap callback. Backend session cookies and CSRF stay
+on the backend origin; the receiver gets only its one-time callback secret in memory.
+
+This separate capability creates the Account, Site, return policy, EUR 20.00 (2000 minor units) CARD catalog Price,
+EMAIL_OTP configuration, fixed EUR 5.00 (500 minor units) Donation campaign and four anonymous catalog checkouts
+(`success`, `decline`, `sca`, `missed`). Its owner-only run directory retains `provisioning.json`
+with durable DISPATCHING records before every write and safe returned identities afterwards.
+Existing ledgers/locks and uncertain outcomes permanently refuse replay; preserve their evidence
+and original keys. Price publication is the first Stripe catalog write; Account creation already
+crosses the fixture mutation boundary. No payment confirmation or Donation checkout occurs here.
+
+After all four known checkout responses and final binding checks, it invokes the existing v2
+state initializer with the original three catalog cases. `resources()` exposes frozen safe
+identities. Synchronous exact-true callbacks `withCatalogEnvironment` and `withMissedCheckout`
+hand off the generated Admin/three catalog tokens and original fourth token respectively; never
+serialize or log these snapshots. Runtime startup, listener ownership and financial/browser work
+remain separate. There is no automatic entrypoint, resume, retry or replacement operation key.
+
 Provision through existing protected Admin APIs after separate authorization:
 
 1. Before each first write, record its stable resource key/name and idempotency key in an owner-only,
