@@ -245,6 +245,80 @@ test('typed Docker container identity projects Id with legitimately absent optio
   assert.equal(f.events.some(event=>event.path===USERFILE),false);
 });
 
+// Catches removal of JSON whitespace before the first Go action (the invalid {{{ opening).
+test('container format separates the literal JSON opening from its first Go action through owned forwarding',async()=>{
+  const f=typedInspectFixture('container'),execute=f.dependencies.execute;let inspections=0,malformedOpening=false;
+  f.dependencies.execute=async(file,args,settings)=>{
+    if(args[4]==='container'&&args[5]==='inspect') {
+      const format=args[7];assert.equal(args[6],'--format');inspections++;
+      // Characterize only the observed installed-parser rejection, not a Go interpreter.
+      if(format.startsWith('{{{')) {malformedOpening=true;throw Object.assign(new Error('synthetic_invalid_go_action_opening'),{code:64});}
+      assert.match(format,/^\{[ \t\r\n]+\{\{/);
+    }
+    return execute(file,args,settings);
+  };
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);
+  try {assert.equal(await f.adapter.prepare(LIMIT()),true);}
+  catch(error) {assert.fail(error.message+'; malformedOpening='+malformedOpening);}
+  const metadata=f.adapter.resources();assert.equal(metadata.status,'PREPARED');
+  for(const service of [...SERVICES,'issuer-installer','issuer-probe'])assert.equal(metadata.containers[service].id,[...f.containers.values()].find(value=>value.Name==='/'+PROJECT+'-'+service).Id);
+  const before=inspections;assert.equal(await f.adapter.verifyForwardTarget(),true);assert.ok(inspections>before);
+  assert.equal(metadata.webhookReady,false);assert.equal(f.events.some(event=>event.type==='health'||event.path===USERFILE),false);
+  let admin=false;await rejects(f.adapter.withAdminCredentials(()=>{admin=true;}),'ADMIN_PENDING');assert.equal(admin,false);
+});
+
+// Catches rejecting Docker's two exact CAP_ aliases or broadening/reordering the allowlist.
+test('helper CapAdd admits bare canonical and mixed aliases with no probe additions',async t=>{
+  for(const [name,capAdd] of [['bare',['CHOWN','DAC_OVERRIDE']],['canonical',['CAP_CHOWN','CAP_DAC_OVERRIDE']],
+    ['mixed CHOWN',['CHOWN','CAP_DAC_OVERRIDE']],['mixed DAC_OVERRIDE',['CAP_CHOWN','DAC_OVERRIDE']]])await t.test(name,async()=>{
+    const f=fixture(),execute=f.dependencies.execute;
+    f.dependencies.execute=async(...args)=>{
+      const result=await execute(...args);
+      if(args[1][4]==='container'&&args[1][5]==='inspect') {
+        const value=JSON.parse(result.stdout);if(value.Name.endsWith('-issuer-installer')){value.CapAdd=capAdd;result.stdout=JSON.stringify(value);}
+      }
+      return result;
+    };
+    f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);assert.equal(await f.adapter.prepare(LIMIT()),true);
+    assert.equal(f.adapter.resources().containers['issuer-probe'].status,'exited');assert.equal(await f.adapter.verifyForwardTarget(),true);
+    assert.equal(f.adapter.resources().webhookReady,false);assert.equal(f.events.some(event=>event.type==='health'||event.path===USERFILE),false);
+  });
+});
+
+test('helper CapAdd aliases retain exact capability and CapDrop gates before helper start or authority',async()=>{
+  const installer='issuer-installer',probe='issuer-probe';
+  const cases=[
+    ['missing',installer,{CapAdd:['CAP_CHOWN']}],['extra',installer,{CapAdd:['CAP_CHOWN','CAP_DAC_OVERRIDE','CAP_SYS_ADMIN']}],
+    ['duplicate',installer,{CapAdd:['CAP_CHOWN','CAP_CHOWN']}],['duplicate alias',installer,{CapAdd:['CHOWN','CAP_CHOWN','DAC_OVERRIDE']}],
+    ['wrong order',installer,{CapAdd:['CAP_DAC_OVERRIDE','CAP_CHOWN']}],['privileged',installer,{CapAdd:['CHOWN','SYS_ADMIN']}],
+    ['unknown prefixed privilege',installer,{CapAdd:['CAP_CHOWN','CAP_SYS_ADMIN']}],['unknown case',installer,{CapAdd:['cap_chown','DAC_OVERRIDE']}],
+    ['unknown prefix',installer,{CapAdd:['CAP_CAP_CHOWN','DAC_OVERRIDE']}],
+    ...[null,0,true,{}].map(value=>['nonstring '+JSON.stringify(value),installer,{CapAdd:[value,'DAC_OVERRIDE']}]),
+    ['nonarray',installer,{CapAdd:'CHOWN,DAC_OVERRIDE'}],
+    ...[['CAP_ALL'],['all'],[],['ALL','CHOWN']].map(value=>['CapDrop '+JSON.stringify(value),installer,{CapDrop:value}]),
+    ['probe bare addition',probe,{CapAdd:['CHOWN']}],['probe canonical addition',probe,{CapAdd:['CAP_CHOWN']}],
+  ];
+  for(const [name,service,fields] of cases) {
+    const f=fixture(),execute=f.dependencies.execute;
+    f.dependencies.execute=async(...args)=>{
+      const result=await execute(...args);
+      if(args[1][4]==='container'&&args[1][5]==='inspect') {
+        const value=JSON.parse(result.stdout);if(value.Name.endsWith('-'+service))result.stdout=JSON.stringify({...value,...fields});
+      }
+      return result;
+    };
+    f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.prepare(LIMIT()),'PREPARE_PENDING');
+    const helper=[...f.containers.values()].find(value=>value.Name.endsWith('-'+service));assert.ok(helper,name);
+    assert.equal(f.events.some(event=>event.type==='process'&&event.args[4]==='container'&&event.args[5]==='start'&&event.args.at(-1)===helper.Id),false,name);
+    assert.equal(f.events.some(event=>event.type==='process'&&event.args[4]==='compose'&&event.args.includes('create')),false,name);
+    assert.equal(f.events.some(event=>event.type==='health'||event.path===USERFILE),false,name);assert.equal(f.adapter.resources().webhookReady,false,name);
+    const before=f.events.length;let admin=false;
+    await rejects(f.adapter.start(LIMIT()),'START_PENDING');await rejects(f.adapter.verifyForwardTarget(),'FORWARD_PENDING');
+    await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');await rejects(f.adapter.verify(LIMIT()),'VERIFY_PENDING');
+    await rejects(f.adapter.withAdminCredentials(()=>{admin=true;}),'ADMIN_PENDING');assert.equal(admin,false,name);assert.equal(f.events.length,before,name);
+  }
+});
+
 test('image proof still rejects missing or malformed User and identity fields',async()=>{
   for(const proof of [{Id:image(1)},{Id:image(1),User:null},{Id:image(1),User:0},{User:''},
     {Id:null,User:''},{Id:'sha256:1234',User:''},{Id:id(1),User:''}]) {

@@ -71,7 +71,7 @@ const STRIPE_PREDICATE='{{$present := false}}{{$disabled := false}}{{range .Conf
   '{{if or (eq $n "PAYMENT_STRIPE_SANDBOX_SECRET_KEY") (eq $n "PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY") (eq $n "PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET")}}{{$present = true}}{{end}}'+
   '{{if eq . "PAYMENT_STRIPE_SANDBOX_ENABLED=false"}}{{$disabled = true}}{{end}}{{end}}'+
   '"StripeKeyPresent":{{$present}},"SandboxDisabled":{{$disabled}}';
-const CONTAINER_FORMAT='{'+STRIPE_PREDICATE+',"Id":{{json .ID}},"Name":{{json .Name}},"Image":{{json .Image}},"Labels":{{json .Config.Labels}},'+
+const CONTAINER_FORMAT='{ '+STRIPE_PREDICATE+',"Id":{{json .ID}},"Name":{{json .Name}},"Image":{{json .Image}},"Labels":{{json .Config.Labels}},'+
   '"State":{"Status":{{json .State.Status}},"Running":{{json .State.Running}},"ExitCode":{{json .State.ExitCode}},"StartedAt":{{json .State.StartedAt}},'+
   '"Health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}}},"Mounts":{{json .Mounts}},'+
   '"Networks":{ {{$first := true}}{{range $name, $network := .NetworkSettings.Networks}}{{if not $first}},{{end}}{{$first = false}}{{json $name}}:{"NetworkID":{{json $network.NetworkID}}}{{end}} },'+
@@ -408,7 +408,10 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     if(service==='backend'&&(retired?(!value.StripeKeyPresent||value.SandboxDisabled):value.StripeKeyPresent||!value.SandboxDisabled))fail();
     const expectedUser=helper?(service==='issuer-installer'?'0:0':'10001:10001'):service==='callback-receiver'?'node':sourceImage.user;
     if(value.User!==expectedUser||value.ReadonlyRootfs!==helper)fail();
-    if(helper&&(!same(value.CapDrop,['ALL'])||!same(value.CapAdd??[],service==='issuer-installer'?['CHOWN','DAC_OVERRIDE']:[])))fail();
+    if(helper) {
+      const capAdd=Array.isArray(value.CapAdd)?value.CapAdd.map(cap=>cap==='CAP_CHOWN'?'CHOWN':cap==='CAP_DAC_OVERRIDE'?'DAC_OVERRIDE':cap):value.CapAdd;
+      if(!same(value.CapDrop,['ALL'])||!same(capAdd??[],service==='issuer-installer'?['CHOWN','DAC_OVERRIDE']:[]))fail();
+    }
     if(!object(value.State)||typeof value.State.Running!=='boolean'||typeof value.State.Status!=='string'||typeof value.State.StartedAt!=='string')fail();
     if(neverStarted&&(value.State.Running||value.State.Status!=='created'||value.State.StartedAt!=='0001-01-01T00:00:00Z'))fail();
     if(liveRequired) {if(!value.State.Running||value.State.Status!=='running'||value.State.Health!=='healthy')fail();livePortProof(value.Ports,service);}
