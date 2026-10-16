@@ -137,6 +137,43 @@ function fixture(overrides={}) {
 async function setup(overrides) {const f=fixture(overrides);f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);return f;}
 async function prepared() {const f=await setup();assert.equal(await f.adapter.prepare(LIMIT()),true);return f;}
 
+function typedInspectFixture(kind,{backendUser='payment'}={}) {
+  const f=fixture(),execute=f.dependencies.execute,proofs=[];
+  f.dependencies.execute=async(file,args,settings)=>{
+    const result=await execute(file,args,settings);
+    if(args[4]!==kind||args[5]!=='inspect')return result;
+    const format=args[7],value=JSON.parse(result.stdout),typed={ID:value.Id};
+    assert.equal(args[6],'--format');
+    const proof={selector:args.at(-1),format};proofs.push(proof);
+    if(kind==='image') {
+      const user=args.at(-1)===PROJECT+'-backend:latest'?backendUser:value.User;
+      // Only these two image contracts are characterized, not a Go template interpreter.
+      if(format==='{"Id":{{json .Id}},"User":{{json .Config.User}}}') {
+        const raw={Id:typed.ID,Config:user===''?{}:{User:user}};
+        proof.fallback=true;
+        if(!Object.hasOwn(raw.Config,'User')) {proof.missingRawUser=true;throw new Error('synthetic_strict_raw_image_user_missing');}
+        result.stdout=JSON.stringify({Id:raw.Id,User:raw.Config.User});
+      } else {
+        assert.equal(format,'{"Id":{{json .ID}},"User":{{json .Config.User}}}');
+        result.stdout=JSON.stringify({Id:typed.ID,User:user});
+      }
+    } else {
+      // Literal command-boundary contracts protect typed projection, not source spelling.
+      assert.ok(format.includes('"Id":{{json .ID}}'),'typed '+kind+' identity selector required');
+      if(kind==='network')assert.equal(format,'{"Id":{{json .ID}},"Name":{{json .Name}},"Labels":{{json .Labels}},"Driver":{{json .Driver}},"Scope":{{json .Scope}}}');
+      else {
+        assert.ok(format.includes('"Health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}}'));
+        const state={...value.State};if(state.Health==='')delete state.Health;
+        proof.absentHealth=!Object.hasOwn(state,'Health');
+        value.State={...state,Health:state.Health??''};
+      }
+      result.stdout=JSON.stringify({...value,Id:typed.ID});
+    }
+    return result;
+  };
+  f.proofs=proofs;return f;
+}
+
 const diagnostic=f=>JSON.parse(f.files.get(DIR+'/runtime.json').contents).buildDiagnostic;
 async function terminal(f) {
   const count=f.events.length;
@@ -164,6 +201,60 @@ test('buildOnly is inert until invoked and ends after one synthetic build and tw
     assert.ok(f.events.slice(0,f.events.indexOf(event)).some(e=>e.type==='sync'&&e.path===DIR+'/buildx'));
   }
   await terminal(f);
+});
+
+// Catches imageProof .ID -> .Id: strict raw fallback cannot read omitted optional User.
+test('typed Docker image identity accepts empty and nonempty User without raw fallback',async()=>{
+  for(const user of ['','payment']) {
+    const f=typedInspectFixture('image',{backendUser:user});
+    f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);
+    try {assert.equal(await f.adapter.buildOnly(LIMIT()),true);}
+    catch(error) {assert.fail(error.message+'; proof='+JSON.stringify(diagnostic(f))+'; boundary='+JSON.stringify(f.proofs));}
+    assert.equal(f.adapter.resources().images.backend.user,user);
+    assert.equal(f.adapter.resources().images.backend.id,'sha256:0000000000000000000000000000000000000000000000000000000000000001');
+    assert.equal(f.adapter.resources().images['demo-site'].user,'101:101');
+    assert.equal(f.proofs.length,2);assert.equal(f.proofs.some(proof=>proof.fallback),false);
+    assert.equal(f.events.some(event=>event.path===USERFILE),false);
+    await terminal(f);
+  }
+});
+
+// Catches NETWORK_FORMAT .ID -> .Id while exercising recorded ownership proofs.
+test('typed Docker network identity projects Id through preparation and repeated ownership proof',async()=>{
+  const f=typedInspectFixture('network');f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);
+  assert.equal(await f.adapter.prepare(LIMIT()),true);
+  assert.equal(f.adapter.resources().network.Id,f.network.Id);
+  assert.equal(await f.adapter.verifyForwardTarget(),true);
+  assert.ok(f.proofs.length>1);
+  assert.ok(f.proofs.some(proof=>proof.selector===PROJECT+'-network'));
+  assert.ok(f.proofs.some(proof=>proof.selector===f.network.Id));
+  assert.equal(f.events.some(event=>event.path===USERFILE),false);
+});
+
+// Catches CONTAINER_FORMAT .ID -> .Id; optional absent Health must still project "".
+test('typed Docker container identity projects Id with legitimately absent optional health',async()=>{
+  const f=typedInspectFixture('container');f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);
+  assert.equal(await f.adapter.prepare(LIMIT()),true);
+  const metadata=f.adapter.resources();
+  for(const service of [...SERVICES,'issuer-installer','issuer-probe']) {
+    const value=f.containers.get(metadata.containers[service].id);
+    assert.ok(value);assert.equal(metadata.containers[service].id,value.Id);
+  }
+  assert.ok(f.proofs.some(proof=>proof.absentHealth));
+  assert.equal(await f.adapter.verifyForwardTarget(),true);
+  assert.equal(f.events.some(event=>event.path===USERFILE),false);
+});
+
+test('image proof still rejects missing or malformed User and identity fields',async()=>{
+  for(const proof of [{Id:image(1)},{Id:image(1),User:null},{Id:image(1),User:0},{User:''},
+    {Id:null,User:''},{Id:'sha256:1234',User:''},{Id:id(1),User:''}]) {
+    const f=fixture(),execute=f.dependencies.execute;
+    f.dependencies.execute=async(...args)=>{const result=await execute(...args);if(args[1][4]==='image'&&args[1][5]==='inspect')result.stdout=JSON.stringify(proof);return result;};
+    f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);
+    await rejects(f.adapter.buildOnly(LIMIT()),'BUILD_PENDING');
+    assert.deepEqual(diagnostic(f),{stage:'BACKEND_IMAGE_PROOF',result:'FAILED',category:'INVALID_IMAGE_PROOF'});
+    assert.equal(f.adapter.resources().images.backend,undefined);await terminal(f);
+  }
 });
 
 test('Buildx directory rejects mode, symlink, UID and canonical substitution before any Docker dispatch',async()=>{

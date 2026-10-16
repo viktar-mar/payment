@@ -71,13 +71,13 @@ const STRIPE_PREDICATE='{{$present := false}}{{$disabled := false}}{{range .Conf
   '{{if or (eq $n "PAYMENT_STRIPE_SANDBOX_SECRET_KEY") (eq $n "PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY") (eq $n "PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET")}}{{$present = true}}{{end}}'+
   '{{if eq . "PAYMENT_STRIPE_SANDBOX_ENABLED=false"}}{{$disabled = true}}{{end}}{{end}}'+
   '"StripeKeyPresent":{{$present}},"SandboxDisabled":{{$disabled}}';
-const CONTAINER_FORMAT='{'+STRIPE_PREDICATE+',"Id":{{json .Id}},"Name":{{json .Name}},"Image":{{json .Image}},"Labels":{{json .Config.Labels}},'+
+const CONTAINER_FORMAT='{'+STRIPE_PREDICATE+',"Id":{{json .ID}},"Name":{{json .Name}},"Image":{{json .Image}},"Labels":{{json .Config.Labels}},'+
   '"State":{"Status":{{json .State.Status}},"Running":{{json .State.Running}},"ExitCode":{{json .State.ExitCode}},"StartedAt":{{json .State.StartedAt}},'+
   '"Health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}}},"Mounts":{{json .Mounts}},'+
   '"Networks":{ {{$first := true}}{{range $name, $network := .NetworkSettings.Networks}}{{if not $first}},{{end}}{{$first = false}}{{json $name}}:{"NetworkID":{{json $network.NetworkID}}}{{end}} },'+
   '"PortBindings":{{json .HostConfig.PortBindings}},"Ports":{{json .NetworkSettings.Ports}},"User":{{json .Config.User}},'+
   '"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"NetworkMode":{{json .HostConfig.NetworkMode}},"CapAdd":{{json .HostConfig.CapAdd}},"CapDrop":{{json .HostConfig.CapDrop}}}';
-const NETWORK_FORMAT='{"Id":{{json .Id}},"Name":{{json .Name}},"Labels":{{json .Labels}},"Driver":{{json .Driver}},"Scope":{{json .Scope}}}';
+const NETWORK_FORMAT='{"Id":{{json .ID}},"Name":{{json .Name}},"Labels":{{json .Labels}},"Driver":{{json .Driver}},"Scope":{{json .Scope}}}';
 const VOLUME_FORMAT='{"Name":{{json .Name}},"CreatedAt":{{json .CreatedAt}},"Driver":{{json .Driver}},"Scope":{{json .Scope}},"Labels":{{json .Labels}}}';
 
 async function available(port,host,context,io) {
@@ -286,7 +286,7 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
   function portInputs() {return {PAYMENT_BACKEND_HOST_PORT:ports.backend,PAYMENT_DEMO_HOST_PORT:ports.demo,PAYMENT_POSTGRES_HOST_PORT:ports.postgres,
     PAYMENT_MAILPIT_HOST_PORT:ports.mailpitHttp,PAYMENT_MAILPIT_SMTP_HOST_PORT:ports.mailpitSmtp};}
   async function imageProof(service,context) {
-    const value=await inspect('image',tags[service],'{"Id":{{json .Id}},"User":{{json .Config.User}}}',context);
+    const value=await inspect('image',tags[service],'{"Id":{{json .ID}},"User":{{json .Config.User}}}',context);
     if(!imageId(value.Id)||typeof value.User!=='string') {if(buildDiagnostic)throw diagnosticFailure('INVALID_IMAGE_PROOF');fail();}
     recorded.images[service]={tag:tags[service],id:value.Id,user:value.User};
   }
