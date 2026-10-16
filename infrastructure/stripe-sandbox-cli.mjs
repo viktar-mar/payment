@@ -253,5 +253,10 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
       return Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze([...args,'login']),options:Object.freeze({cwd:ROOT,env,shell:false,
         stdio:Object.freeze(['pipe','pipe','pipe']),timeout:180000,maxBuffer:65536})});
     }),
+    completeLoginInvocation:limits=>operation('LOGIN',limits,async context=>{
+      await privateTree(context);await privateFile(cliDirectory+'/config/stripe/oauth_pending.json');check(context);
+      return Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze([...args,'login','--complete-device']),options:Object.freeze({cwd:ROOT,env,shell:false,
+        stdio:Object.freeze(['pipe','pipe','pipe']),timeout:180000,maxBuffer:65536})});
+    }),
   });
 }

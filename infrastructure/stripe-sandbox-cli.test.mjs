@@ -237,6 +237,73 @@ test('login invocation is a frozen isolated descriptor with no process execution
   assert.deepEqual(login.options,{cwd:ROOT,env:{PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C',HOME:DIR+'/home',XDG_CONFIG_HOME:DIR+'/config',NO_COLOR:'1'},shell:false,stdio:['pipe','pipe','pipe'],timeout:180000,maxBuffer:65536});assert.equal(f.calls.length,0);
   const g=fixture();g.dependencies.lstat=async()=>stat(false);const a=await createSandboxCliAdapter(g.options,g.dependencies);await rejects(a.loginInvocation(LIMIT()),'LOGIN');assert.equal(g.calls.length,0);
 });
+// Returning initiation argv or mutable caller state must never dispatch completion.
+test('login completion returns only the frozen isolated device descriptor and metadata access',async()=>{
+  for(const size of [0,65536]) {
+    const f=fixture(),paths=[],opened=[],closed=[];
+    f.dependencies.lstat=async path=>{paths.push(path);const s=stat(!path.endsWith('.toml')&&!path.endsWith('.json'));if(path.endsWith('/oauth_pending.json'))s.size=size;return s;};
+    f.dependencies.open=async(path,flags)=>{opened.push(path);assert.equal(flags,constants.O_RDONLY|constants.O_NOFOLLOW);return {stat:async()=>({...stat(),size}),close:async()=>{closed.push(path);},get readFile(){assert.fail('completion must not read contents');}};};
+    const a=await createSandboxCliAdapter(f.options,f.dependencies);
+    f.options.cliDirectory='/mutated';f.options.runId='mutated';f.options.env.HOME='/mutated';f.options.approvedBinding.externalAccountId='acct_mutated';
+    f.dependencies.lstat=async()=>assert.fail('dependencies must be snapshotted');
+    const complete=await a.completeLoginInvocation({...LIMIT(),command:'arbitrary',cliDirectory:'/arbitrary'});
+    assert.deepEqual(complete,{file:'/usr/bin/sandbox-exec',args:['-p','(version 1)(allow default)(deny process-exec (literal "/usr/bin/security"))','/opt/homebrew/bin/stripe','--config',DIR+'/config/stripe/config.toml','--project-name','default','--color','off','--log-level','error','login','--complete-device'],options:{cwd:ROOT,env:{PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C',HOME:DIR+'/home',XDG_CONFIG_HOME:DIR+'/config',NO_COLOR:'1'},shell:false,stdio:['pipe','pipe','pipe'],timeout:180000,maxBuffer:65536}});
+    for(const value of [a,complete,complete.args,complete.options,complete.options.env,complete.options.stdio])assert.ok(Object.isFrozen(value));
+    assert.throws(()=>complete.args.push('--arbitrary'),TypeError);assert.throws(()=>complete.options.env.HOME='/mutated',TypeError);
+    assert.deepEqual(paths,[DIR,DIR+'/home',DIR+'/config',DIR+'/config/stripe',DIR+'/config/stripe/config.toml',DIR+'/config/stripe/oauth_pending.json']);
+    assert.deepEqual(opened,[DIR+'/config/stripe/config.toml',DIR+'/config/stripe/oauth_pending.json']);assert.deepEqual(closed,opened);
+    assert.equal(f.calls.length,0);assert.equal(f.children.length,0);assert.equal(f.timers.size,0);
+  }
+});
+// Omitting any pending-file metadata guard would admit an unsafe OAuth session.
+test('login completion refuses missing or unsafe pending metadata before any process',async()=>{
+  const pending=DIR+'/config/stripe/oauth_pending.json';
+  for(const stage of ['lstat','fstat'])for(const bad of ['missing','directory','symlink','hardlink','uid','mode','special-mode','oversize','negative-size','fractional-size','canonical']) {
+    if(stage==='fstat'&&bad==='canonical')continue;
+    const f=fixture();let pendingOpens=0,pendingCloses=0;
+    const metadata=()=>{if(bad==='missing')throw new Error('synthetic missing');const s=stat();if(bad==='directory')s.isFile=()=>false;if(bad==='symlink')s.isSymbolicLink=()=>true;if(bad==='hardlink')s.nlink=2;if(bad==='uid')s.uid++;if(bad==='mode')s.mode=0o100644;if(bad==='special-mode')s.mode=0o104600;if(bad==='oversize')s.size=65537;if(bad==='negative-size')s.size=-1;if(bad==='fractional-size')s.size=0.5;return s;};
+    const lstat=f.dependencies.lstat;f.dependencies.lstat=async path=>path===pending&&stage==='lstat'?metadata():lstat(path);
+    f.dependencies.realpath=async path=>path===pending&&bad==='canonical'?path+'/different':path;
+    f.dependencies.open=async(path,flags)=>{assert.equal(flags,constants.O_RDONLY|constants.O_NOFOLLOW);if(path===pending)pendingOpens++;return {stat:async()=>path===pending&&stage==='fstat'?metadata():stat(),close:async()=>{if(path===pending)pendingCloses++;}};};
+    const a=await createSandboxCliAdapter(f.options,f.dependencies);await rejects(a.completeLoginInvocation(LIMIT()),'LOGIN');
+    assert.equal(pendingOpens,stage==='fstat'?1:0);assert.equal(pendingCloses,pendingOpens);assert.equal(f.calls.length,0);assert.equal(f.children.length,0);assert.equal(f.timers.size,0);
+  }
+});
+test('login completion rechecks private tree and optional credential metadata',async()=>{
+  for(const bad of ['tree','config','credentials']) {
+    const f=fixture(),lstat=f.dependencies.lstat;let pendingAccess=0;
+    f.dependencies.readdir=async()=>['config.toml','credentials.json'];
+    f.dependencies.lstat=async path=>{if(path.endsWith('/oauth_pending.json'))pendingAccess++;const s=await lstat(path);if(path===(bad==='tree'?DIR:DIR+'/config/stripe/'+(bad==='config'?'config.toml':'credentials.json')))s.mode=0o755;return s;};
+    const a=await createSandboxCliAdapter(f.options,f.dependencies);await rejects(a.completeLoginInvocation(LIMIT()),'LOGIN');assert.equal(pendingAccess,0);assert.equal(f.calls.length,0);assert.equal(f.children.length,0);
+  }
+});
+// A completion call must not bypass operation admission or retain cancellation.
+test('login completion refuses invalid limits without filesystem or process access',async()=>{
+  const aborted=new AbortController();aborted.abort();
+  for(const limits of [undefined,{}, {deadline:Date.now()-1},{deadline:Infinity},{deadline:NaN},{...LIMIT(),signal:{}},{...LIMIT(),signal:aborted.signal}]) {
+    const f=fixture();let accesses=0;f.dependencies.lstat=async()=>{accesses++;return stat(true);};
+    const a=await createSandboxCliAdapter(f.options,f.dependencies);await rejects(a.completeLoginInvocation(limits),'LOGIN');assert.equal(accesses,0);assert.equal(f.calls.length,0);assert.equal(f.children.length,0);assert.equal(f.timers.size,0);
+  }
+});
+test('login completion serializes and rechecks cancellation after pending metadata',async()=>{
+  for(const cancel of ['signal','deadline']) {
+    const f=fixture(),abort=new AbortController();let release,closed=0;
+    f.dependencies.open=async path=>({stat:async()=>path.endsWith('/oauth_pending.json')&&!release?new Promise(resolveStat=>{release=()=>resolveStat(stat());}):stat(),close:async()=>{if(path.endsWith('/oauth_pending.json'))closed++;}});
+    const a=await createSandboxCliAdapter(f.options,f.dependencies),completing=a.completeLoginInvocation({...LIMIT(),signal:abort.signal});await turn();
+    await rejects(a.loginInvocation(LIMIT()),'BUSY');await rejects(a.completeLoginInvocation(LIMIT()),'BUSY');
+    if(cancel==='signal')abort.abort();else [...f.timers.values()][0].callback();
+    release();await rejects(completing,'LOGIN');assert.equal(closed,1);assert.equal(f.calls.length,0);assert.equal(f.children.length,0);assert.equal(f.timers.size,0);
+    assert.deepEqual((await a.completeLoginInvocation(LIMIT())).args.slice(11),['login','--complete-device']);
+  }
+});
+test('login completion admission flags precede every private or dependency getter',async()=>{
+  for(const env of [{},{PAYMENT_STRIPE_SANDBOX_ENABLED:'true'},{PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'}]) {
+    let touched=0;const options={env};
+    for(const key of ['runId','cliDirectory','approvedBinding','persistWebhookSecret','completeLoginInvocation'])Object.defineProperty(options,key,{get(){touched++;throw new Error('private');}});
+    const dependencies=new Proxy({}, {get(){touched++;throw new Error('private');}});
+    await assert.rejects(createSandboxCliAdapter(options,dependencies),{message:'stripe_sandbox_cli_OPT_IN_REQUIRED'});assert.equal(touched,0);
+  }
+});
 test('cumulative pre-Ready output is bounded while running output is drained without history',async()=>{
   const f=await setup(),pending=f.adapter.startListener(LIMIT());await turn();f.children[0].stdout.write(('x'.repeat(1000)+'\n').repeat(66));await rejects(pending,'LISTENER');assert.deepEqual(f.children[0].signals,['SIGINT']);
   const g=await setup();await start(g);g.children[0].stdout.write(('x'.repeat(1000)+'\n').repeat(100));assert.equal(await g.adapter.bindMissedIntent(proof()),true);await stop(g);
