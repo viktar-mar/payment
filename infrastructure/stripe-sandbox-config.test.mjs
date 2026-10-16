@@ -160,7 +160,7 @@ function compose(directory, environment, overlay = true, quiet = false) {
   return spawnSync('docker', args, {
     cwd: root, encoding: 'utf8', timeout: 20_000, maxBuffer: 1024 * 1024,
     // Deliberately do not inherit PAYMENT_*, COMPOSE_* or DOTENV settings.
-    env: { PATH: process.env.PATH, HOME: process.env.HOME, DOCKER_CONFIG: process.env.DOCKER_CONFIG },
+    env: { PATH: process.env.PATH, HOME: directory, DOCKER_CONFIG: directory },
   });
 }
 
@@ -177,7 +177,10 @@ test('opt-in Compose binds Sandbox keys only to backend and preserves default Fa
     const backend = services.backend.environment;
     assert.equal(backend.PAYMENT_PROVIDER, 'fake');
     assert.equal(backend.PAYMENT_STRIPE_SANDBOX_ENABLED, 'true');
-    assert.equal(backend.SPRING_PROFILES_ACTIVE, 'local,stripe-sandbox');
+    assert.equal(backend.PAYMENT_CUSTOMER_LOCAL_ISSUER_ENABLED, 'true');
+    const profiles = backend.SPRING_PROFILES_ACTIVE.split(',');
+    assert.ok(profiles.length > 0 && profiles.every(profile => ['local', 'test'].includes(profile)),
+      'Sandbox profiles must admit the enabled local issuer and local email capability');
     for (const [key, value] of Object.entries(sandboxKeys)) assert.equal(backend[key], value);
     for (const [name, service] of Object.entries(services)) {
       if (name === 'backend') continue;

@@ -5,13 +5,17 @@ import static org.assertj.core.api.Assertions.*;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.PaymentAccountVerificationPort;
 import dev.genericpayments.platform.paymentaccounts.domain.*;
 import dev.genericpayments.platform.provider.adapter.in.configuration.StripeSandboxConfiguration;
+import dev.genericpayments.platform.customers.adapter.in.localfixture.LocalCustomerIssuerGuard;
 import dev.genericpayments.platform.shared.domain.DomainValidationException;
+import java.io.IOException;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.core.env.MapPropertySource;
+import org.springframework.core.io.FileSystemResource;
 
 class StripeSandboxConfigurationTest {
     static final String SECRET = "sk_test_" + "A".repeat(32);
@@ -92,6 +96,30 @@ class StripeSandboxConfigurationTest {
             "PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET=" + WEBHOOK).run(context -> {
                 assertThat(context).hasNotFailed();
                 assertThat(context.getBean(StripeSandboxProperties.class).enabled()).isTrue();
+            });
+    }
+
+    @Test void publicComposeSandboxProfilesAdmitRealLocalIssuerGuardAndStripeConfiguration() throws IOException {
+        var yaml = new YamlPropertySourceLoader();
+        var base = yaml.load("public-compose-base", new FileSystemResource("../infrastructure/compose.yaml")).getFirst();
+        var overlay = yaml.load("public-compose-sandbox", new FileSystemResource("../infrastructure/compose.stripe-sandbox.yaml")).getFirst();
+        String prefix = "services.backend.environment.";
+        assertThat(base.getProperty(prefix + "PAYMENT_CUSTOMER_LOCAL_ISSUER_ENABLED")).isEqualTo("true");
+        assertThat(overlay.getProperty(prefix + "PAYMENT_STRIPE_SANDBOX_ENABLED")).isEqualTo("true");
+        runner.withUserConfiguration(LocalCustomerIssuerGuard.class)
+            .withPropertyValues("spring.profiles.active=" + overlay.getProperty(prefix + "SPRING_PROFILES_ACTIVE"),
+                "PAYMENT_CUSTOMER_LOCAL_ISSUER_ENABLED=" + base.getProperty(prefix + "PAYMENT_CUSTOMER_LOCAL_ISSUER_ENABLED"),
+                "PAYMENT_STRIPE_SANDBOX_ENABLED=" + overlay.getProperty(prefix + "PAYMENT_STRIPE_SANDBOX_ENABLED"),
+                "PAYMENT_STRIPE_SANDBOX_SECRET_KEY=" + SECRET,
+                "PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY=" + PUBLIC,
+                "PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET=" + WEBHOOK)
+            .run(context -> {
+                assertThat(context).hasNotFailed();
+                assertThat(context).hasSingleBean(LocalCustomerIssuerGuard.class);
+                assertThat(context.getBean(StripeSandboxProperties.class).enabled()).isTrue();
+                assertThat(context.getBean(StripeCredentialResolver.class).resolve(
+                    account(PaymentProviderType.STRIPE, PaymentAccountMode.SANDBOX, "stripe-sandbox-default"))
+                    .secretKey()).isEqualTo(SECRET);
             });
     }
 
