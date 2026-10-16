@@ -20,7 +20,10 @@ const actualOpen=filesystem.open,actualReadFile=filesystem.readFile;
 mock.method(filesystem,'open',(path,...args)=>{if(String(path).endsWith('/infrastructure/stripe-sandbox.env.local'))return forbidden();return actualOpen(path,...args);});
 mock.method(filesystem,'readFile',(path,...args)=>{if(String(path).endsWith('/infrastructure/stripe-sandbox.env.local'))return forbidden();return actualReadFile(path,...args);});
 syncBuiltinESMExports();
-after(()=>{mock.restoreAll();syncBuiltinESMExports();});
+const actualEnvironment=process.env;
+const privateEnvironment=name=>/^(?:HOME|DOCKER_.*|BUILDX_.*|STRIPE_.*|PAYMENT_STRIPE_SANDBOX_(?:SECRET_KEY|PUBLISHABLE_KEY|WEBHOOK_SECRET)|HTTPS?_PROXY|ALL_PROXY)$/i.test(String(name));
+process.env=new Proxy(actualEnvironment,{get(target,name){if(privateEnvironment(name))return forbidden();return Reflect.get(target,name);}});
+after(()=>{process.env=actualEnvironment;mock.restoreAll();syncBuiltinESMExports();});
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const RUN='11111111-2222-4333-8444-555555555555',PROJECT='stripe-'+RUN;
@@ -57,7 +60,8 @@ function fixture(overrides={}) {
   add(ROOT+'/.dockerignore',false,ignore);add(ROOT+'/backend/.dockerignore',false,ignore);add(USERFILE,false,USERBYTES);
   const stat=entry=>({...entry,size:entry.contents.length,isDirectory:()=>entry.directory,isFile:()=>!entry.directory,isSymbolicLink:()=>Boolean(entry.symlink)});
   const need=path=>{const entry=files.get(path);if(!entry)throw null;return entry;};
-  const env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',DOCKER_HOST:'never-inherit',STRIPE_API_KEY:'never-inherit'};
+  const env=new Proxy({PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'},
+    {get(target,name){if(privateEnvironment(name))return forbidden();return Reflect.get(target,name);}});
   const options={runId:RUN,expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports:{...PORTS},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},env,...overrides};
   function container(service) {
     const helper=service.startsWith('issuer-'),name=PROJECT+'-'+service;
@@ -90,7 +94,7 @@ function fixture(overrides={}) {
         read:async(buffer,offset,length,position)=>{events.push({type:'read',path});const bytesRead=Math.min(length,entry.contents.length-position);entry.contents.copy(buffer,offset,position,position+bytesRead);return {bytesRead,buffer};},
         sync:async()=>{events.push({type:'sync',path});},close:async()=>{events.push({type:'close',path});}};
     },
-    randomBytes:size=>Buffer.alloc(size,++randomSerial),generateKeyPairSync:(kind,options)=>{events.push({type:'crypto',kind,options});return {privateKey:{export:()=>kind==='rsa'?{kty:'RSA',n:'n',e:'AQAB',d:'d'}:{kty:'EC',crv:'P-256',x:'x',y:'y',d:'d'}}};},
+    randomBytes:size=>{events.push({type:'random',size});return Buffer.alloc(size,++randomSerial);},generateKeyPairSync:(kind,options)=>{events.push({type:'crypto',kind,options});return {privateKey:{export:()=>kind==='rsa'?{kty:'RSA',n:'n',e:'AQAB',d:'d'}:{kty:'EC',crv:'P-256',x:'x',y:'y',d:'d'}}};},
     health:async(url,context)=>{events.push({type:'health',url,context});return true;},
     execute:async(file,args,settings)=>{
       events.push({type:'process',file,args,settings});
@@ -133,6 +137,217 @@ function fixture(overrides={}) {
 async function setup(overrides) {const f=fixture(overrides);f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);return f;}
 async function prepared() {const f=await setup();assert.equal(await f.adapter.prepare(LIMIT()),true);return f;}
 
+const diagnostic=f=>JSON.parse(f.files.get(DIR+'/runtime.json').contents).buildDiagnostic;
+async function terminal(f) {
+  const count=f.events.length;
+  for(const [invoke,code] of [[()=>f.adapter.buildOnly(LIMIT()),'BUILD_PENDING'],[()=>f.adapter.prepare(LIMIT()),'PREPARE_PENDING'],
+    [()=>f.adapter.start(LIMIT()),'START_PENDING'],[()=>f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING'],
+    [()=>f.adapter.verifyForwardTarget(),'FORWARD_PENDING'],[()=>f.adapter.withAdminCredentials(forbidden),'ADMIN_PENDING'],
+    [()=>f.adapter.verify(LIMIT()),'VERIFY_PENDING'],[()=>f.adapter.stop(LIMIT()),'STOP_PENDING']])await rejects(invoke(),code);
+  assert.equal(f.events.length,count);
+}
+
+test('buildOnly is inert until invoked and ends after one synthetic build and two image proofs',async()=>{
+  const f=await setup();assert.equal(f.events.length,0);assert.equal(await f.adapter.buildOnly(LIMIT()),true);
+  const commands=f.events.filter(e=>e.type==='process'),builds=commands.filter(e=>e.args.includes('build'));
+  assert.equal(builds.length,1);assert.deepEqual(builds[0].args.slice(-4),['build','--quiet','backend','demo-site']);
+  assert.deepEqual(commands.filter(e=>e.args[4]==='image'&&e.args[5]==='inspect').map(e=>e.args.at(-1)),[PROJECT+'-backend:latest',PROJECT+'-demo-site:latest']);
+  assert.equal(commands.length,9);assert.equal(commands.some(e=>['pull','create','start','stop','rm'].includes(e.args[4])||e.args.includes('create')),false);
+  assert.equal(f.events.some(e=>e.type==='crypto'||e.type==='random'||e.type==='health'||e.path===USERFILE||e.type==='unlink'),false);
+  assert.equal(f.files.has(DIR+'/issuer.jwks.json'),false);assert.equal(f.files.has(DIR+'/app.env'),false);assert.equal(f.files.has(DIR+'/cli'),false);
+  assert.equal(f.adapter.resources().status,'BUILD_ONLY_COMPLETE');assert.equal(f.adapter.resources().webhookReady,false);
+  assert.deepEqual(diagnostic(f),{stage:'FINAL_RECORD',result:'SUCCEEDED',category:'NONE'});
+  assert.equal(f.events.filter(e=>e.type==='close'&&e.path===DIR+'/owner.lock').length,1);assert.ok(f.files.has(DIR+'/owner.lock'));
+  assert.equal(f.files.get(DIR+'/buildx').mode&0o7777,0o700);
+  for(const event of commands) {
+    assert.deepEqual(event.settings.env,{PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C',DOCKER_CONFIG:'/private/var/empty',BUILDX_CONFIG:DIR+'/buildx'});
+    assert.ok(f.events.slice(0,f.events.indexOf(event)).some(e=>e.type==='sync'&&e.path===DIR+'/buildx'));
+  }
+  await terminal(f);
+});
+
+test('Buildx directory rejects mode, symlink, UID and canonical substitution before any Docker dispatch',async()=>{
+  for(const mutate of [f=>{f.files.get(DIR+'/buildx').mode=0o40750;},f=>{f.files.get(DIR+'/buildx').symlink=true;},
+    f=>{f.files.get(DIR+'/buildx').uid++;},f=>{f.files.get(DIR+'/buildx').canonicalForeign=true;}]) {
+    const f=fixture(),mkdir=f.dependencies.mkdir;f.dependencies.mkdir=async(...args)=>{await mkdir(...args);if(args[0]===DIR+'/buildx')mutate(f);};
+    const realpath=f.dependencies.realpath;f.dependencies.realpath=async path=>f.files.has(DIR+'/buildx')&&f.files.get(DIR+'/buildx').canonicalForeign?DIR+'/foreign':realpath(path);
+    f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.buildOnly(LIMIT()),'BUILD_PENDING');
+    assert.equal(f.events.filter(e=>e.type==='process').length,0);await terminal(f);
+  }
+});
+
+test('Buildx identity is proved again at the build boundary after resource checks',async()=>{
+  const f=fixture(),execute=f.dependencies.execute;
+  f.dependencies.execute=async(...args)=>{const value=await execute(...args);if(args[1][4]==='image'&&args[1][5]==='ls'&&args[1].includes('reference='+PROJECT+'-demo-site:latest'))f.files.get(DIR+'/buildx').ino++;return value;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.buildOnly(LIMIT()),'BUILD_PENDING');
+  assert.equal(f.events.some(e=>e.type==='process'&&e.args.includes('build')),false);await terminal(f);
+});
+
+test('Buildx fsync refuses a substituted open directory descriptor before Docker',async()=>{
+  const f=fixture(),open=f.dependencies.open;
+  f.dependencies.open=async(...args)=>{const file=await open(...args);if(args[0]===DIR+'/buildx')file.stat=async()=>({...f.stat(f.files.get(DIR+'/buildx')),ino:999999});return file;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.buildOnly(LIMIT()),'BUILD_PENDING');
+  assert.equal(f.events.some(e=>e.type==='process'),false);await terminal(f);
+});
+
+test('untrusted build rejection is UNKNOWN without reading its properties or exposing any raw data',async()=>{
+  const f=fixture(),execute=f.dependencies.execute;let getters=0;
+  f.dependencies.execute=async(...args)=>{const value=await execute(...args);if(args[1].includes('build'))throw new Proxy({},{get(){getters++;throw null;}});return value;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.buildOnly(LIMIT()),'BUILD_PENDING');
+  assert.equal(getters,0);assert.deepEqual(diagnostic(f),{stage:'BUILD_COMMAND',result:'UNCONFIRMED',category:'UNKNOWN'});
+  assert.equal(f.events.filter(e=>e.type==='process'&&e.args.includes('build')).length,1);await terminal(f);
+});
+
+test('arbitrary image dependency rejections remain UNKNOWN even when null or SyntaxError shaped',async()=>{
+  for(const rejection of [null,new SyntaxError('synthetic-private'),new Proxy({},{getPrototypeOf:forbidden,get:forbidden})]) {
+    const f=fixture(),execute=f.dependencies.execute;
+    f.dependencies.execute=async(...args)=>{if(args[1][4]==='image'&&args[1][5]==='inspect')throw rejection;return execute(...args);};
+    f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.buildOnly(LIMIT()),'BUILD_PENDING');
+    assert.deepEqual(diagnostic(f),{stage:'BACKEND_IMAGE_PROOF',result:'UNCONFIRMED',category:'UNKNOWN'});await terminal(f);
+  }
+});
+
+test('synchronous spawn failure is terminal and retains only a normalized category',async()=>{
+  const f=fixture(),execute=f.dependencies.execute;delete f.dependencies.execute;
+  f.dependencies.execFile=(file,args,settings,done)=>{
+    if(args.includes('build'))throw Object.assign(new Error('synthetic-private-spawn'),{code:'ENOENT'});
+    const child=new EventEmitter();queueMicrotask(async()=>{const value=await execute(file,args,settings);done(null,value.stdout,value.stderr);child.emit('close',0,null);});return child;
+  };
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.buildOnly(LIMIT()),'BUILD_PENDING');
+  assert.deepEqual(diagnostic(f),{stage:'BUILD_COMMAND',result:'FAILED',category:'SPAWN_FAILURE'});await terminal(f);
+});
+
+test('buildOnly deadline expiry cannot settle while actual child close remains unknown',async()=>{
+  const f=fixture(),execute=f.dependencies.execute,child=new EventEmitter();let callback,entered,settings,settled=false;
+  const started=new Promise(resolveStarted=>{entered=resolveStarted;});delete f.dependencies.execute;
+  f.dependencies.execFile=(file,args,options,done)=>{
+    if(args.includes('build')) {callback=done;settings=options;entered();return child;}
+    const immediate=new EventEmitter();queueMicrotask(async()=>{const value=await execute(file,args,options);done(null,value.stdout,value.stderr);immediate.emit('close',0,null);});return immediate;
+  };
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);const operation=f.adapter.buildOnly(LIMIT()).finally(()=>{settled=true;}),rejected=rejects(operation,'BUILD_PENDING');
+  await started;[...f.timers.values()][0].callback();callback(Object.assign(new Error('synthetic-private-timeout'),{code:'ABORT_ERR'}),'','');await turn();
+  assert.equal(settings.signal.aborted,true);assert.equal(settled,false);assert.equal(diagnostic(f).result,'RUNNING');
+  child.emit('close',null,'SIGTERM');await rejected;assert.equal(f.adapter.resources().buildDiagnostic.category,'TIMEOUT');await terminal(f);
+});
+
+test('buildOnly differentiates invalid image proofs and output limits after the build',async()=>{
+  for(const [service,stdout,category] of [['backend','{"Id":"invalid","User":"payment"}','INVALID_IMAGE_PROOF'],
+    ['demo-site','not JSON','INVALID_IMAGE_PROOF'],['backend','x'.repeat(65537),'OUTPUT_LIMIT']]) {
+    const f=fixture(),execute=f.dependencies.execute;
+    f.dependencies.execute=async(...args)=>{const value=await execute(...args);if(args[1][4]==='image'&&args[1][5]==='inspect'&&args[1].at(-1)===PROJECT+'-'+service+':latest')value.stdout=stdout;return value;};
+    f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.buildOnly(LIMIT()),'BUILD_PENDING');
+    assert.deepEqual(diagnostic(f),{stage:service==='backend'?'BACKEND_IMAGE_PROOF':'DEMO_IMAGE_PROOF',result:'FAILED',category});await terminal(f);
+  }
+});
+
+test('native child failures normalize only safe metadata and wait for actual close before recording',async()=>{
+  for(const [metadata,category,exitCode] of [[{code:17},'NONZERO_EXIT',17],[{code:'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'},'OUTPUT_LIMIT'],
+    [{killed:true,signal:'SIGTERM'},'TIMEOUT'],[{code:'ABORT_ERR'},'ABORT'],[{code:'ENOENT'},'SPAWN_FAILURE'],[{},'UNKNOWN']]) {
+    const f=fixture(),execute=f.dependencies.execute,child=new EventEmitter();let callback,entered,settled=false;
+    const started=new Promise(resolveStarted=>{entered=resolveStarted;});delete f.dependencies.execute;
+    f.dependencies.execFile=(file,args,settings,done)=>{
+      if(args.includes('build')) {f.events.push({type:'process',file,args,settings});callback=done;entered();return child;}
+      const immediate=new EventEmitter();queueMicrotask(async()=>{const value=await execute(file,args,settings);done(null,value.stdout,value.stderr);immediate.emit('close',0,null);});return immediate;
+    };
+    f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);
+    const operation=f.adapter.buildOnly(LIMIT()).finally(()=>{settled=true;}),rejected=rejects(operation,'BUILD_PENDING');await started;
+    callback(Object.assign(new Error('synthetic-private-error'),metadata),'synthetic-private-output','synthetic-private-stderr');await turn();
+    assert.equal(settled,false);assert.equal(f.events.some(e=>e.type==='process'&&e.args[5]==='inspect'),false);
+    child.emit('close',exitCode??null,metadata.signal??null);await rejected;
+    assert.deepEqual(diagnostic(f),{stage:'BUILD_COMMAND',result:category==='UNKNOWN'?'UNCONFIRMED':'FAILED',category,...(exitCode===undefined?{}:{exitCode})});
+    assert.equal(JSON.stringify(f.adapter.resources()).includes('synthetic-private'),false);await terminal(f);
+  }
+});
+
+test('successful callback cannot start image proofs or settle buildOnly until close',async()=>{
+  const f=fixture(),execute=f.dependencies.execute,child=new EventEmitter();let callback,entered,settled=false;
+  const started=new Promise(resolveStarted=>{entered=resolveStarted;});delete f.dependencies.execute;
+  f.dependencies.execFile=(file,args,settings,done)=>{
+    if(args.includes('build')) {callback=done;execute(file,args,settings).then(()=>entered());return child;}
+    const immediate=new EventEmitter();queueMicrotask(async()=>{const value=await execute(file,args,settings);done(null,value.stdout,value.stderr);immediate.emit('close',0,null);});return immediate;
+  };
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);const operation=f.adapter.buildOnly(LIMIT()).finally(()=>{settled=true;});await started;
+  callback(null,'','');await turn();assert.equal(settled,false);assert.equal(f.events.some(e=>e.type==='process'&&e.args[5]==='inspect'),false);
+  child.emit('close',0,null);assert.equal(await operation,true);await terminal(f);
+});
+
+test('aborted buildOnly waits for dispatched work then refuses proofs and all promotion',async()=>{
+  const f=fixture(),execute=f.dependencies.execute,controller=new AbortController();let release,entered;
+  const started=new Promise(resolveStarted=>{entered=resolveStarted;});
+  f.dependencies.execute=async(...args)=>{if(args[1].includes('build')) {entered();await new Promise(resolveRelease=>{release=resolveRelease;});}return execute(...args);};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);let settled=false;
+  const operation=f.adapter.buildOnly({...LIMIT(),signal:controller.signal}).finally(()=>{settled=true;}),rejected=rejects(operation,'BUILD_PENDING');await started;
+  controller.abort();await turn();assert.equal(settled,false);release();await rejected;
+  assert.equal(f.adapter.resources().buildDiagnostic.category,'ABORT');assert.equal(f.adapter.resources().status,'PENDING');
+  assert.equal(f.events.some(e=>e.type==='process'&&e.args[5]==='inspect'),false);await terminal(f);
+});
+
+test('failed admission or invalid deadline consumes buildOnly without private IO and cannot be promoted',async()=>{
+  for(const limits of [{deadline:NaN},{deadline:Date.now()-1},LIMIT()]) {
+    const f=fixture();f.dependencies.preflight=async()=>({status:'PENDING'});f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);
+    await rejects(f.adapter.buildOnly(limits),'BUILD_PENDING');assert.equal(f.events.length,0);await terminal(f);
+  }
+});
+
+test('failed final record never reports build success and retains the lock file and both images',async()=>{
+  const f=fixture(),open=f.dependencies.open;
+  f.dependencies.open=async(...args)=>{const file=await open(...args);if(args[0].includes('/runtime.json.tmp-')) {
+    const write=file.writeFile;file.writeFile=async bytes=>{if(JSON.parse(bytes).buildDiagnostic?.result==='SUCCEEDED')throw null;return write(bytes);};
+  }return file;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.buildOnly(LIMIT()),'BUILD_PENDING');
+  assert.equal(f.adapter.resources().status,'PENDING');assert.equal(f.adapter.resources().buildDiagnostic.result,'UNCONFIRMED');
+  assert.notEqual(diagnostic(f).result,'SUCCEEDED');assert.ok(f.files.has(DIR+'/owner.lock'));assert.equal(f.images.size,2);await terminal(f);
+});
+
+test('checked durable build completion remains authoritative when the deadline ticks before outer return',async()=>{
+  const f=fixture(),open=f.dependencies.open,deadline=5000;let now=1000,finalSynced=false,checks=0,boundaryEvents;
+  f.dependencies.open=async(...args)=>{const file=await open(...args);if(args[0]===DIR) {
+    const sync=file.sync;file.sync=async()=>{await sync();if(f.files.has(DIR+'/runtime.json')&&diagnostic(f)?.result==='SUCCEEDED')finalSynced=true;};
+  }return file;};
+  f.dependencies.now=()=>{
+    if(finalSynced&&++checks===2) {boundaryEvents=f.events.length;now=deadline;return deadline-1;}
+    return now;
+  };
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);
+  assert.equal(await f.adapter.buildOnly({deadline}),true);
+  assert.equal(now,deadline);assert.equal(checks,2);assert.equal(f.events.length,boundaryEvents);
+  const retained=JSON.parse(f.files.get(DIR+'/runtime.json').contents);
+  assert.equal(retained.status,'BUILD_ONLY_COMPLETE');assert.equal(f.adapter.resources().status,'BUILD_ONLY_COMPLETE');
+  assert.deepEqual(retained.buildDiagnostic,{stage:'FINAL_RECORD',result:'SUCCEEDED',category:'NONE'});
+  assert.deepEqual(f.adapter.resources().buildDiagnostic,retained.buildDiagnostic);await terminal(f);
+});
+
+test('expiry before final record rename rejects without late IO and retains unconfirmed evidence',async()=>{
+  const f=fixture(),open=f.dependencies.open,deadline=5000;let now=1000,boundaryEvents;
+  f.dependencies.now=()=>now;
+  f.dependencies.open=async(...args)=>{const file=await open(...args);if(args[0].includes('/runtime.json.tmp-')) {
+    const write=file.writeFile;file.writeFile=async bytes=>{await write(bytes);if(JSON.parse(bytes).buildDiagnostic?.result==='SUCCEEDED') {now=deadline;boundaryEvents=f.events.length;}};
+  }return file;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.buildOnly({deadline}),'BUILD_PENDING');
+  // Closing the already-open temporary file is the only filesystem action after expiry.
+  assert.deepEqual(f.events.slice(boundaryEvents).map(e=>e.type),['close']);
+  assert.equal(f.adapter.resources().status,'PENDING');assert.equal(f.adapter.resources().buildDiagnostic.result,'UNCONFIRMED');
+  assert.notEqual(diagnostic(f).result,'SUCCEEDED');await terminal(f);
+});
+
+test('failed final directory sync records UNCONFIRMED within the original remaining budget',async()=>{
+  const f=fixture(),open=f.dependencies.open;let failed=false;
+  f.dependencies.open=async(...args)=>{const file=await open(...args);if(args[0]===DIR) {
+    const sync=file.sync;file.sync=async()=>{
+      if(!failed&&f.files.has(DIR+'/runtime.json')&&diagnostic(f)?.result==='SUCCEEDED'){failed=true;throw null;}await sync();
+    };
+  }return file;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.buildOnly(LIMIT()),'BUILD_PENDING');
+  assert.equal(failed,true);assert.deepEqual(diagnostic(f),{stage:'FINAL_RECORD',result:'UNCONFIRMED',category:'UNKNOWN'});await terminal(f);
+});
+
+test('owner lock close failure records an unconfirmed terminal result and never removes the file',async()=>{
+  const f=fixture(),open=f.dependencies.open;
+  f.dependencies.open=async(...args)=>{const file=await open(...args);if(args[0]===DIR+'/owner.lock')file.close=async()=>{throw null;};return file;};
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.buildOnly(LIMIT()),'BUILD_PENDING');
+  assert.equal(diagnostic(f).result,'UNCONFIRMED');assert.equal(f.files.has(DIR+'/owner.lock'),true);await terminal(f);
+});
+
 test('constructor rejects invalid input before accessing dependencies and snapshots approved values',async()=>{
   for(const update of [{runId:'2f3f49b1-df07-41b1-b978-bc884b390813'},{expectedSource:'bad'},{ports:{...PORTS,backend:PORTS.demo}},{daemon:'tcp://localhost:2375'},{approvedBinding:{externalAccountId:'acct_other',apiVersion:'2026-09-30.endive'}},{env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',DEBUG:'1'}}]) {
     const f=fixture(update);let getters=0;
@@ -161,7 +376,8 @@ test('prepare builds without credentials and records UID-safe issuer proof befor
   for(const event of f.events.filter(e=>e.type==='process')) {
     assert.equal(event.file,'/Applications/Docker.app/Contents/Resources/bin/docker');assert.deepEqual(event.args.slice(0,4),['--config','/private/var/empty','--host','unix:///Users/test/docker.sock']);
     assert.equal(event.settings.cwd,ROOT);assert.equal(event.settings.shell,false);assert.equal(event.settings.maxBuffer,65536);assert.ok(event.settings.signal instanceof AbortSignal);
-    assert.deepEqual(Object.keys(event.settings.env).sort(),['LANG','LC_ALL','PATH']);assert.ok(event.settings.timeout<=1200000);
+    assert.deepEqual(Object.keys(event.settings.env).sort(),['BUILDX_CONFIG','DOCKER_CONFIG','LANG','LC_ALL','PATH']);
+    assert.equal(event.settings.env.DOCKER_CONFIG,'/private/var/empty');assert.equal(event.settings.env.BUILDX_CONFIG,DIR+'/buildx');assert.ok(event.settings.timeout<=1200000);
   }
   const createCalls=f.events.filter(e=>e.type==='process'&&e.args.includes('compose')&&e.args.includes('create'));
   assert.equal(createCalls.length,1);assert.deepEqual(createCalls[0].args.slice(-5),SERVICES);

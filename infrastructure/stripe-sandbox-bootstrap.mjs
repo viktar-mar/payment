@@ -16,7 +16,7 @@ const STRIPE_NAMES=['PAYMENT_STRIPE_SANDBOX_SECRET_KEY','PAYMENT_STRIPE_SANDBOX_
 const EXHAUSTED=new Set(['2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-429f-a34c-e4f69ba2ce18']);
 const CHILD_ENV=Object.freeze({PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C'});
 const ERRORS=new Set(['OPT_IN_REQUIRED','INPUTS_CONFIGURATION','OPERATION_BUSY',
-  'PREPARE_PENDING','FORWARD_PENDING','PERSIST_PENDING','START_PENDING','VERIFY_PENDING','ADMIN_PENDING','STOP_PENDING']);
+  'BUILD_PENDING','PREPARE_PENDING','FORWARD_PENDING','PERSIST_PENDING','START_PENDING','VERIFY_PENDING','ADMIN_PENDING','STOP_PENDING']);
 const fixed=code=>new Error('stripe_sandbox_bootstrap_'+(ERRORS.has(code)?code:'INPUTS_CONFIGURATION'));
 const fail=()=>{throw null;};
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
@@ -28,6 +28,22 @@ function canonical(value) {
   return value;
 }
 const same=(a,b)=>JSON.stringify(canonical(a))===JSON.stringify(canonical(b));
+// Only internally created failures carry diagnostic metadata. Never traverse a dependency rejection.
+const failures=new WeakMap();
+function diagnosticFailure(category,exitCode) {
+  const error=Object.create(null);failures.set(error,{category,...(Number.isSafeInteger(exitCode)?{exitCode}:{})});return error;
+}
+function childFailure(error,signal) {
+  try {
+    if(signal.aborted)return diagnosticFailure('ABORT');
+    if(error.code==='ERR_CHILD_PROCESS_STDIO_MAXBUFFER')return diagnosticFailure('OUTPUT_LIMIT');
+    if(error.code==='ABORT_ERR')return diagnosticFailure('ABORT');
+    if(Number.isSafeInteger(error.code))return diagnosticFailure('NONZERO_EXIT',error.code);
+    if(error.killed===true&&error.signal==='SIGTERM')return diagnosticFailure('TIMEOUT');
+    if(['ENOENT','EACCES','ENOEXEC','EAGAIN'].includes(error.code))return diagnosticFailure('SPAWN_FAILURE');
+  } catch {}
+  return diagnosticFailure('UNKNOWN');
+}
 function frozen(value) {
   if(value&&typeof value==='object') {for(const child of Object.values(value))frozen(child);Object.freeze(value);}
   return value;
@@ -36,12 +52,17 @@ function frozen(value) {
 // execFile's abort callback can precede close. Never dispatch the next command then.
 function executeAwaited(execute,file,args,settings) {
   return new Promise((resolveExecution,rejectExecution)=>{
-    let callbackDone=false,closed=false,failed=false,result;
-    const finish=()=>{if(callbackDone&&closed) {if(failed)rejectExecution(null);else resolveExecution(result);}};
-    const child=execute(file,args,settings,(error,stdout,stderr)=>{
-      failed=Boolean(error);result={stdout,stderr};callbackDone=true;finish();
-    });
-    child.once('close',()=>{closed=true;finish();});
+    let callbackDone=false,closed=false,failure=null,result,closeCode,closeSignal;
+    const finish=()=>{if(callbackDone&&closed) {
+      if(!failure&&(closeCode!==0||closeSignal))failure=diagnosticFailure(Number.isSafeInteger(closeCode)&&closeCode!==0?'NONZERO_EXIT':'UNKNOWN',closeCode);
+      if(failure)rejectExecution(failure);else resolveExecution(result);
+    }};
+    try {
+      const child=execute(file,args,settings,(error,stdout,stderr)=>{
+        failure=error?childFailure(error,settings.signal):null;result={stdout,stderr};callbackDone=true;finish();
+      });
+      child.once('close',(code,signal)=>{closeCode=code;closeSignal=signal;closed=true;finish();});
+    } catch(error) {rejectExecution(childFailure(error,settings.signal));}
   });
 }
 
@@ -129,15 +150,21 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     postgres:'postgresql://127.0.0.1:'+ports.postgres,mailpitHttp:'http://127.0.0.1:'+ports.mailpitHttp,mailpitSmtp:'smtp://127.0.0.1:'+ports.mailpitSmtp});
   let busy=false,pending=false,status='NEW',startup=null,lock=null,sequence=0,issuerProved=false,webhookReady=false,live=false,retired=false;
   let inputs=null,admin=null;
+  let terminalBuild=false,buildDiagnostic=null,buildxIdentity=null;
+  const buildxDirectory=directory+'/buildx',dockerEnvironment=Object.freeze({...CHILD_ENV,DOCKER_CONFIG:'/private/var/empty',BUILDX_CONFIG:buildxDirectory});
   const recorded={images:{},network:null,volumes:{},containers:{},retiredBackend:null},intents=[],privateIdentities=new Map();
   const ownLabels=kind=>({'payment.sandbox.project':project,'payment.sandbox.run':runId,'payment.sandbox.kind':kind});
   const containerLabels=service=>({...ownLabels('container'),'com.docker.compose.project':project,'com.docker.compose.service':service});
-  function check(context) {if(context.signal.aborted||io.now()>=context.deadline)fail();}
+  function check(context) {
+    if(context.signal.aborted)throw diagnosticFailure(context.externalSignal?.aborted?'ABORT':'TIMEOUT');
+    if(io.now()>=context.deadline)throw diagnosticFailure('TIMEOUT');
+  }
   function resources() {
     return frozen(JSON.parse(JSON.stringify({runId,expectedSource,daemon,project,siteKey,ports,cliDirectory:directory+'/cli',endpoints,
-      status:pending?'PENDING':status,webhookReady,...recorded})));
+      status:pending?'PENDING':status,webhookReady,...recorded,...(buildDiagnostic?{buildDiagnostic}:{})})));
   }
-  async function operation(phase,limits,body,{cleanup=false}={}) {
+  async function operation(phase,limits,body,{cleanup=false,diagnostic=false}={}) {
+    if(terminalBuild&&!diagnostic)throw fixed(phase+'_PENDING');
     if(busy)throw fixed('OPERATION_BUSY');busy=true;
     const controller=new AbortController();let timer,external,onAbort;
     try {
@@ -146,24 +173,32 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
       external=limits.signal;onAbort=()=>controller.abort();external?.addEventListener('abort',onAbort,{once:true});if(external?.aborted)controller.abort();
       timer=io.setTimeout(onAbort,Math.min(limits.deadline-io.now(),2147483647));
       const context={deadline:limits.deadline,signal:controller.signal,externalSignal:external};check(context);
-      const result=await body(context);check(context);return result;
+      const result=await body(context);
+      if(!diagnostic||context.buildCompleted!==true)check(context);return result;
     } catch {pending=true;throw fixed(phase+'_PENDING');}
     finally {io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);busy=false;}
   }
   async function execute(file,args,settings,context) {
     check(context);
-    const result=await io.execute(file,args,{...settings,signal:context.signal,timeout:Math.min(settings.timeout,Math.max(1,context.deadline-io.now()))});
+    let result;
+    try {result=await io.execute(file,args,{...settings,signal:context.signal,timeout:Math.min(settings.timeout,Math.max(1,context.deadline-io.now()))});}
+    catch(error) {check(context);throw error;}
     check(context);
-    if(typeof result?.stdout!=='string'||typeof result.stderr!=='string'||Buffer.byteLength(result.stdout)+Buffer.byteLength(result.stderr)>65536)fail();
+    if(typeof result?.stdout!=='string'||typeof result.stderr!=='string')fail();
+    if(Buffer.byteLength(result.stdout)+Buffer.byteLength(result.stderr)>65536)throw diagnosticFailure('OUTPUT_LIMIT');
     return result;
   }
   async function docker(args,context,budget=30000) {
-    return execute(DOCKER,['--config','/private/var/empty','--host',daemon,...args],{cwd:ROOT,env:CHILD_ENV,shell:false,
+    await buildxProof(context);
+    return execute(DOCKER,['--config','/private/var/empty','--host',daemon,...args],{cwd:ROOT,env:dockerEnvironment,shell:false,
       stdio:['ignore','pipe','pipe'],timeout:budget,maxBuffer:65536},context);
   }
   async function inspect(kind,selector,format,context) {
     const result=await docker([kind,'inspect','--format',format,selector],context,10000);
-    if(result.stderr!=='')fail();const value=JSON.parse(result.stdout);if(!object(value))fail();return value;
+    const invalid=()=>{if(buildDiagnostic&&kind==='image')throw diagnosticFailure('INVALID_IMAGE_PROOF');fail();};
+    if(result.stderr!=='')invalid();
+    let value;try {value=JSON.parse(result.stdout);}catch {invalid();}
+    if(!object(value))invalid();return value;
   }
   function composeArgs(envFile,action,{override=true,stripe=false}={}) {
     return ['compose','-p',project,'--project-directory',ROOT+'/infrastructure','--env-file',envFile,'-f',ROOT+'/infrastructure/compose.yaml',
@@ -174,10 +209,19 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     check(context);const s=await io.lstat(path);
     if(!s.isDirectory()||s.isSymbolicLink()||(s.uid!==0&&s.uid!==process.getuid())||await io.realpath(path)!==path
       ||(privateMode&&(s.uid!==process.getuid()||(s.mode&0o7777)!==0o700)))fail();check(context);
+    return s;
   }
-  async function syncDirectory(path,context) {
+  async function buildxProof(context) {
+    const actual=await directoryProof(buildxDirectory,context,true);
+    if(!buildxIdentity||actual.ino!==buildxIdentity.ino||actual.dev!==buildxIdentity.dev)fail();
+  }
+  async function syncDirectory(path,context,identity=null) {
     check(context);const file=await io.open(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_DIRECTORY);
-    try {const s=await file.stat();if(!s.isDirectory()||s.isSymbolicLink()||(s.uid!==0&&s.uid!==process.getuid()))fail();await file.sync();}
+    try {
+      const s=await file.stat();if(!s.isDirectory()||s.isSymbolicLink()||(s.uid!==0&&s.uid!==process.getuid()))fail();
+      if(identity&&(s.ino!==identity.ino||s.dev!==identity.dev||s.uid!==process.getuid()||(s.mode&0o7777)!==0o700))fail();
+      await file.sync();
+    }
     finally {await file.close();}check(context);
   }
   async function exclusiveFile(path,contents,context,hold=false) {
@@ -193,16 +237,18 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
       check(context);retain=hold;return file;
     } finally {if(!retain)await file.close();}
   }
-  async function atomicPrivate(path,contents,context) {
+  async function atomicPrivate(path,contents,context,terminalDiagnostic=false) {
     const temporary=path+'.tmp-'+(++sequence);await exclusiveFile(temporary,contents,context);
     const expected=privateIdentities.get(path);
     if(expected) {const current=await io.lstat(path);if(!validFile(current)||current.ino!==expected.ino||current.dev!==expected.dev||await io.realpath(path)!==path)fail();}
     else if((await io.readdir(dirname(path))).includes(path.slice(dirname(path).length+1)))fail();
     check(context);await io.rename(temporary,path);privateIdentities.set(path,privateIdentities.get(temporary));privateIdentities.delete(temporary);
     await syncDirectory(dirname(path),context);check(context);
+    // This checked, durable diagnostic commit is its one terminal decision boundary.
+    if(terminalDiagnostic)context.buildCompleted=true;
   }
-  async function ledger(context) {
-    await atomicPrivate(directory+'/runtime.json',JSON.stringify({...resources(),intents})+'\n',context);
+  async function ledger(context,terminalDiagnostic=false) {
+    await atomicPrivate(directory+'/runtime.json',JSON.stringify({...resources(),intents})+'\n',context,terminalDiagnostic);
   }
   async function intent(action,name,context) {intents.push({action,name,status:'DISPATCHING'});await ledger(context);}
   async function acknowledgement(context) {intents.at(-1).status='ACKNOWLEDGED';await ledger(context);}
@@ -232,20 +278,31 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     }
     await io.mkdir(directory,{mode:0o700});await directoryProof(directory,context,true);await syncDirectory(dirname(directory),context);
     lock=await exclusiveFile(directory+'/owner.lock',runId+'\n',context,true);await ledger(context);
+    await io.mkdir(buildxDirectory,{mode:0o700});
+    const owned=await directoryProof(buildxDirectory,context,true);buildxIdentity={ino:owned.ino,dev:owned.dev};
+    await syncDirectory(buildxDirectory,context,buildxIdentity);await syncDirectory(directory,context);await buildxProof(context);
   }
   function envText(values) {return Object.entries(values).map(([name,value])=>name+'='+value+'\n').join('');}
   function portInputs() {return {PAYMENT_BACKEND_HOST_PORT:ports.backend,PAYMENT_DEMO_HOST_PORT:ports.demo,PAYMENT_POSTGRES_HOST_PORT:ports.postgres,
     PAYMENT_MAILPIT_HOST_PORT:ports.mailpitHttp,PAYMENT_MAILPIT_SMTP_HOST_PORT:ports.mailpitSmtp};}
   async function imageProof(service,context) {
     const value=await inspect('image',tags[service],'{"Id":{{json .Id}},"User":{{json .Config.User}}}',context);
-    if(!imageId(value.Id)||typeof value.User!=='string')fail();recorded.images[service]={tag:tags[service],id:value.Id,user:value.User};
+    if(!imageId(value.Id)||typeof value.User!=='string') {if(buildDiagnostic)throw diagnosticFailure('INVALID_IMAGE_PROOF');fail();}
+    recorded.images[service]={tag:tags[service],id:value.Id,user:value.User};
   }
   async function build(context) {
     const synthetic={PAYMENT_DB_PASSWORD:'buildOnly',PAYMENT_ADMIN_BOOTSTRAP_USERNAME:'buildOnly',PAYMENT_ADMIN_BOOTSTRAP_PASSWORD:'buildOnly',
       PAYMENT_DATA_ENCRYPTION_KEY:'buildOnly',PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY:'buildOnly',PAYMENT_CUSTOMER_DIGEST_KEY_V1:'buildOnly',PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1:'buildOnly',...portInputs()};
     await exclusiveFile(directory+'/build.env',envText(synthetic),context);await intent('BUILD','backend+demo-site',context);
+    if(buildDiagnostic) {buildDiagnostic.stage='BUILD_COMMAND';await ledger(context);}
     await docker(composeArgs(directory+'/build.env',['build','--quiet','backend','demo-site'],{override:false}),context,1200000);
-    await imageProof('backend',context);await imageProof('demo-site',context);await acknowledgement(context);
+    for(const service of ['backend','demo-site']) {
+      if(buildDiagnostic) {buildDiagnostic.stage=service==='backend'?'BACKEND_IMAGE_PROOF':'DEMO_IMAGE_PROOF';await ledger(context);}
+      await imageProof(service,context);
+    }
+    await acknowledgement(context);
+  }
+  async function pullImages(context) {
     for(const service of ['postgres','mailpit','callback-receiver']) {
       await intent('PULL',service,context);await docker(['pull','--quiet',tags[service]],context);await imageProof(service,context);await acknowledgement(context);
     }
@@ -429,12 +486,34 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
   }
   async function prepare(context) {
     if(status!=='NEW')fail();startup={deadline:context.deadline,signal:context.externalSignal};
-    await sourceGate(context);await privateTree(context);await noPriorResources(context);await build(context);await generate(context);await infrastructure(context);await issuer(context);
+    await sourceGate(context);await privateTree(context);await noPriorResources(context);await build(context);await pullImages(context);await generate(context);await infrastructure(context);await issuer(context);
     await exclusiveFile(directory+'/owned.yaml',overrideText(),context);await configProof(context);await sourceGate(context);
     await intent('CREATE_STOPPED',project,context);
     await docker(composeArgs(directory+'/app.env',['create','--no-build','--no-deps','--pull','never',...SERVICES]),context);
     for(const service of SERVICES) {const proof=await containerProof(service,project+'-'+service,context,{neverStarted:true});recorded.containers[service]=proof.safe;}
     await topology(context,false,true);await acknowledgement(context);status='PREPARED';await ledger(context);return true;
+  }
+
+  async function buildOnly(context) {
+    let failure=null;
+    try {
+      await sourceGate(context);buildDiagnostic.stage='PRIVATE';await privateTree(context);await noPriorResources(context);await build(context);
+    } catch(error) {failure=failures.get(error)??{category:'UNKNOWN'};}
+    finally {
+      if(lock) {try {await lock.close();} catch {failure={category:'UNKNOWN'};}finally {lock=null;}}
+    }
+    if(failure) {
+      pending=true;buildDiagnostic={stage:buildDiagnostic.stage,result:failure.category==='UNKNOWN'?'UNCONFIRMED':'FAILED',...failure};
+      if(privateIdentities.has(directory+'/runtime.json'))await ledger(context);
+      fail();
+    }
+    buildDiagnostic={stage:'FINAL_RECORD',result:'SUCCEEDED',category:'NONE'};status='BUILD_ONLY_COMPLETE';
+    try {await ledger(context,true);} catch {
+      pending=true;buildDiagnostic={stage:'FINAL_RECORD',result:'UNCONFIRMED',category:'UNKNOWN'};
+      // A rename can precede a failed directory fsync. Re-record uncertainty if the original budget permits.
+      try {await ledger(context);}catch {}fail();
+    }
+    return true;
   }
 
   async function boundedRead(file,context) {
@@ -576,6 +655,12 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
   }
 
   return Object.freeze({
+    buildOnly:async limits=>{
+      if(terminalBuild||busy||pending||status!=='NEW')throw fixed(busy?'OPERATION_BUSY':'BUILD_PENDING');
+      terminalBuild=true;buildDiagnostic={stage:'ADMISSION',result:'RUNNING',category:'NONE'};
+      try {return await operation('BUILD',limits,buildOnly,{diagnostic:true});}
+      catch(error) {if(buildDiagnostic.result==='RUNNING')buildDiagnostic={stage:buildDiagnostic.stage,result:'UNCONFIRMED',category:'UNKNOWN'};throw error;}
+    },
     prepare:limits=>operation('PREPARE',limits,prepare),
     verifyForwardTarget:()=>operation('FORWARD',startup,async context=>{if(status!=='PREPARED'&&!live)fail();await sourceIdentity(context);await topology(context,live,!live);
       if(!live) {await sourceGate(context);if(await io.portAvailable(ports.backend,'127.0.0.1',context)!==true)fail();}return true;}),

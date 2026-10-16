@@ -261,6 +261,63 @@ It never generates or adopts a run ID. Its private run tree is
 `test-results/stripe-sandbox/<runId>`; generated credentials, issuer keys and runtime
 evidence stay there. It preserves existing local configuration and resources.
 
+For a separately approved BUILD-only diagnosis, call the same inert factory's
+`buildOnly({deadline, signal})` once. Inputs are explicit public values:
+`{runId, expectedSource, daemon, ports:{backend,demo,receiver,postgres,mailpitHttp,mailpitSmtp},
+approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},
+env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'}}`.
+Use a fresh lowercase UUID, a clean checkout at the exact committed source SHA, the
+approved local Unix daemon, six distinct available loopback ports in 1024–65535,
+and the original finite absolute Unix-millisecond deadline; optional `signal` is an
+AbortSignal. The fixed binding is public fixture identity, with no provider validation.
+Do not supply keys, home configuration or inherited process environment. Construction
+performs no I/O; admission reuses the credential-free source/daemon/port checks.
+
+R3 Docker dispatches keep outer `--config /private/var/empty` and explicitly set
+`DOCKER_CONFIG=/private/var/empty` for nested plugins plus
+`BUILDX_CONFIG=<owned-run>/buildx`. The run and its exclusively created Buildx directory
+are canonical, nonsymlink, current-UID, mode 0700 directories; the Buildx directory is
+synced before dispatch and its original identity is proved again before every R3 Docker
+command, including the build boundary. PATH/language are fixed; HOME, global Docker
+auth/config, Stripe, DEBUG and proxy environment are never inherited. R1 retains its
+separate reviewed empty-config arguments.
+
+After admission and absence checks, `buildOnly` dispatches exactly one synthetic
+backend+demo-site Compose build, then proves both resulting images. It stops before
+Postgres/Mailpit/Node pulls, random credentials, issuer/JWK/Admin generation, service
+creation/start, private Stripe env reads, CLI/login/listener, provisioning, browser,
+mail, provider, financial or reconcile work. The existing 20-minute build command
+ceiling is clipped to the original remaining deadline; output is bounded to 64 KiB,
+and a callback alone cannot settle the operation before actual child close.
+
+The call is terminal for this object/run on success, failure or uncertainty. Success
+returns `true` with status `BUILD_ONLY_COMPLETE`, no webhook/stack/financial readiness,
+and a safe `buildDiagnostic` projection in `resources()` and mode-0600 `runtime.json`.
+Its fixed stages distinguish admission/private preparation/build command/backend image
+proof/demo image proof/final recording; results are RUNNING/SUCCEEDED/FAILED/UNCONFIRMED.
+Categories are NONE/UNKNOWN/OUTPUT_LIMIT/TIMEOUT/ABORT/NONZERO_EXIT/SPAWN_FAILURE/
+INVALID_IMAGE_PROOF, optionally with an integer exit code. No raw error, captured
+output or configuration text is retained in this projection. Unknown dependency
+rejections stay UNKNOWN; this does not establish the original failed BUILD's cause.
+If recording, cancellation or child close cannot be confirmed, retain PENDING/manual
+inspection status; a last RUNNING ledger is unconfirmed evidence. Final uncertainty
+is recorded only within the original remaining budget, never by extending it.
+
+BUILD-only completion is decided at the final durable ledger record's last deadline/
+cancellation check, after its directory fsync. That check must pass on the original
+budget, then synchronously marks the diagnostic complete. No further filesystem or
+child I/O follows. A clock tick or cancellation after this confirmed boundary does
+not reverse the successful API result or the matching SUCCEEDED ledger; only this
+completed diagnostic skips the generic later post-body check. Expiry/cancellation
+before that boundary still refuses completion without renewing the deadline. Other
+bootstrap operations retain their existing post-body check.
+
+Only the held owner.lock handle is closed; its file, build.env, runtime evidence,
+Buildx state, images and any cache effects remain. Subsequent build/prepare/start/
+persist/forward/Admin/verify/stop calls dispatch no I/O; there is no retry, adoption,
+cleanup or automatic promotion to a financial run. A successful BUILD-only diagnosis
+is not full Sandbox acceptance and supplies no authorization for a later run.
+
 The controlled invocation order is `prepare({signal, deadline})`, then construct the
 existing CLI adapter from `resources().cliDirectory`, `verifyForwardTarget` and
 `persistWebhookSecret`. The root operator separately performs the approved login,
