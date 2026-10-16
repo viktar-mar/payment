@@ -395,6 +395,21 @@ One highest-precedence RequestCorrelationFilter preserves the RequestIdFilter ac
 
 ## Native and browser verification
 
+The owned Stage 5A parent can import `createSandboxAcceptanceExtras` from
+`infrastructure/stripe-sandbox-extras.mjs` after reviewed bootstrap and provisioning
+are live. Pass `{env,bootstrap,provisioner,cli}`, then `open({signal,deadline})` with
+an explicit future Unix-millisecond deadline and both Sandbox flags exactly `true`.
+Donation create/Pay and OTP challenge/verify dispatch handoffs must precede their
+single genuine browser actions; ACK only the observed safe response projections.
+`missedFixture(limits)` supplies only the original fourth `success` checkout to the
+existing card driver, retaining that finite deadline; its `refunds()` is unsupported.
+Close that fixture and the extras capability after confirmation. Errors retain
+private `extras.json`/`extras.lock` evidence and require manual review; never retry
+with another key, payment, recipient or listener. This library has no standalone
+runtime entrypoint. Its offline check is
+`node --test infrastructure/stripe-sandbox-extras.test.mjs`; real invocation still
+requires the independently reviewed parent and root's final runtime release.
+
 ```bash
 (cd backend && ./mvnw clean verify)
 (cd frontend && pnpm --filter admin lint && pnpm --filter admin typecheck && pnpm --filter admin test --run --maxWorkers=1 && pnpm --filter admin build)
