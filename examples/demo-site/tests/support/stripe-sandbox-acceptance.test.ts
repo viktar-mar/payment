@@ -1,0 +1,176 @@
+import test,{after,mock} from 'node:test';
+import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import net from 'node:net';
+import filesystem from 'node:fs/promises';
+import {syncBuiltinESMExports} from 'node:module';
+import type {Route,Request,Response,Page,Browser} from '@playwright/test';
+import type {SandboxAcceptanceExtras} from '../../../../infrastructure/stripe-sandbox-extras.mjs';
+// @ts-expect-error Native Node 25 type erasure requires the source extension.
+import {forwardDonationCreate,acknowledgeDonationResponse,runDonationOtp,withOwnedCardContexts,runOwnedSandboxDonations} from './stripe-sandbox-acceptance.ts';
+
+const forbidden=()=>{throw new Error('synthetic_test_forbids_external_boundary');};
+for(const name of ['execFile','exec','spawn','fork','execSync','execFileSync','spawnSync'] as const)mock.method(childProcess,name,forbidden);
+for(const name of ['createServer','connect','createConnection'] as const)mock.method(net,name,forbidden);
+mock.method(globalThis,'fetch',forbidden);
+for(const name of ['open','readFile','lstat','realpath','readdir','mkdir','rename','unlink'] as const)mock.method(filesystem,name,forbidden);
+syncBuiltinESMExports();after(()=>{mock.restoreAll();syncBuiltinESMExports();});
+const binding={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:14173',receiver:'http://127.0.0.1:18090'},
+  site:{id:'00000000-0000-4000-8000-000000000002',key:'s5a-site'},campaign:{id:'00000000-0000-4000-8000-000000000006',key:'s5a-donate',status:'ACTIVE',version:1},
+  price:{id:'00000000-0000-4000-8000-000000000004',key:'s5a-price',version:1}};
+const endpoint=binding.endpoints.backend+'/api/v1/public/sites/s5a-site/donation-campaigns/s5a-donate/checkouts';
+const limits=()=>({deadline:Date.now()+120000,signal:new AbortController().signal});
+function request(method='POST',body='{"amount_minor":500}',headers:Record<string,string>={origin:binding.endpoints.demo,'content-type':'application/json','idempotency-key':'sdk-original','x-original':'preserved'}) {
+  return {url:()=>endpoint,method:()=>method,postData:()=>body,allHeaders:async()=>headers,redirectedFrom:()=>null} as unknown as Request;
+}
+// Break: forwarding before durable key, or replacing the body/auth headers changes the genuine SDK write.
+test('genuine donation POST forwards the original wire with only the durable key replaced',async()=>{
+  const events:string[]=[],original=request();let forwarded:unknown;
+  const route={request:()=>original,continue:async value=>{events.push('continue');forwarded=value;},abort:async()=>{events.push('abort');}} as Pick<Route,'request'|'continue'|'abort'>;
+  const extras:Pick<SandboxAcceptanceExtras,'beforeDonationCreate'>={beforeDonationCreate:async(kind,facts)=>{events.push('durable');assert.equal(kind,'anonymous');assert.deepEqual(facts,{siteKey:'s5a-site',campaignKey:'s5a-donate',amountMinor:500,hasCustomerAuthority:false});return 's5a:original:donation:anonymous';}};
+  await forwardDonationCreate(route,extras,'anonymous',binding,limits());
+  assert.deepEqual(events,['durable','continue']);assert.deepEqual(forwarded,{headers:{origin:binding.endpoints.demo,'content-type':'application/json','idempotency-key':'s5a:original:donation:anonymous','x-original':'preserved'}});
+});
+// Break: allowing a failed, altered or unauthorized POST through is a new uncontrolled financial write.
+test('bad donation POST aborts before key acquisition and exposes only a fixed failure',async()=>{
+  for(const original of [request('POST','{"amount_minor":501}'),request('POST','{"amount_minor":500,"message":""}'),request('GET'),request('POST','{"amount_minor":500}',{origin:binding.endpoints.demo,authorization:'Bearer private'})]){
+    const events:string[]=[];
+    const route={request:()=>original,continue:async()=>{events.push('continue');},abort:async()=>{events.push('abort');}} as Pick<Route,'request'|'continue'|'abort'>;
+    const extras={beforeDonationCreate:async()=>{events.push('durable');return 'key';}} as unknown as SandboxAcceptanceExtras;
+    await assert.rejects(forwardDonationCreate(route,extras,'anonymous',binding,limits()),{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});assert.deepEqual(events,['abort']);
+  }
+});
+// Break: treating OPTIONS as a mutation consumes an operation key before the actual SDK write.
+test('genuine CORS preflight continues unchanged without a financial key',async()=>{
+  let options:unknown='unset';const route={request:()=>request('OPTIONS'),continue:async value=>{options=value;},abort:forbidden} as Pick<Route,'request'|'continue'|'abort'>;
+  await forwardDonationCreate(route,{beforeDonationCreate:forbidden} as unknown as SandboxAcceptanceExtras,'anonymous',binding,limits());assert.equal(options,undefined);
+});
+// Break: using a different/replayed response or passing capabilities into ACK can certify the wrong Donation.
+test('only the original successful genuine response yields the safe donation ACK',async()=>{
+  const original=request(),acks:unknown[]=[];
+  const value={checkout_id:'00000000-0000-4000-8000-000000000010',payment_id:'00000000-0000-4000-8000-000000000020',checkout_token:'private-memory-only',
+    amount_minor:500,currency:'EUR',price:null,provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',provider_client_payload:{},status:'CREATED',expires_at:new Date(Date.now()+120000).toISOString(),
+    donation:{donation_id:'00000000-0000-4000-8000-000000000030',campaign_key:'s5a-donate',campaign_version:1}};
+  const response={request:()=>original,url:()=>endpoint,status:()=>201,body:async()=>Buffer.from(JSON.stringify(value))} as Pick<Response,'request'|'url'|'status'|'body'>;
+  const extras:Pick<SandboxAcceptanceExtras,'ackDonationCreate'>={ackDonationCreate:async(kind,identity)=>{acks.push({kind,identity});return true;}};
+  await acknowledgeDonationResponse(response,original,extras,'anonymous',binding,limits());
+  assert.deepEqual(acks,[{kind:'anonymous',identity:{checkoutId:value.checkout_id,paymentId:value.payment_id,donationId:value.donation.donation_id,campaignKey:'s5a-donate',campaignVersion:1,amountMinor:500,currency:'EUR'}}]);
+  await assert.rejects(acknowledgeDonationResponse({...response,request:()=>request()},original,extras,'anonymous',binding,limits()),{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});assert.equal(acks.length,1);
+});
+
+// Break: an OTP retry, early ACK or session injection bypasses the actual original challenge.
+test('OTP sends and verifies once with original genuine responses before the safe customer ACK',async()=>{
+  const events:string[]=[],challenge='00000000-0000-4000-8000-000000000040',customer='00000000-0000-4000-8000-000000000050',expires=new Date(Date.now()+120000).toISOString();
+  const challengeUrl=binding.endpoints.backend+'/api/v1/public/customer-auth/email-otp/challenges',verifyUrl=challengeUrl+'/'+challenge+'/verify';
+  const genuine=(url:string,status:number,body:object,requestBody:object)=>({url:()=>url,status:()=>status,body:async()=>Buffer.from(JSON.stringify(body)),request:()=>({method:()=>url.endsWith('/me')?'GET':'POST',url:()=>url,postData:()=>JSON.stringify(requestBody),redirectedFrom:()=>null})}) as unknown as Response;
+  const responses=[genuine(challengeUrl,202,{challenge_id:challenge,expires_at:expires},{site_key:'s5a-site',email:'synthetic@example.test',intent:'AUTHENTICATE'}),
+    genuine(verifyUrl,200,{session_token:'s'.repeat(43),expires_at:expires,scopes:['CUSTOMER_READ','CHECKOUT_CREATE'],customer:{id:customer,status:'ACTIVE',masked_email:'***@***'}},{site_key:'s5a-site',code:'123456'}),
+    genuine(binding.endpoints.backend+'/api/v1/customer/me',200,{id:customer,status:'ACTIVE',masked_email:'***@***',authentication_modes:['EMAIL_OTP'],session_expires_at:expires},{})];
+  let observe:(request:Request)=>void=()=>{};
+  const page={locator:()=>({first(){return this;},getByRole:(_role:string,settings:{name:string})=>({evaluate:async(_fn:unknown,value:unknown)=>{events.push(settings.name==='Email'?'email-entry':'code-entry');assert.ok(value==='synthetic@example.test'||value==='123456');return true;},click:async()=>{events.push(settings.name==='Request code'?'send-click':'verify-click');observe(responses[settings.name==='Request code'?0:1]!.request());}})}),
+    waitForResponse:async(predicate:(response:Response)=>boolean)=>{const response=responses.find(predicate);assert.ok(response);return response;},waitForFunction:async()=>{events.push('active-session');},on:(_event:string,fn:(request:Request)=>void)=>{observe=fn;},off:()=>{}} as unknown as Page;
+  const extras:Pick<SandboxAcceptanceExtras,'beginOtp'|'ackOtpChallenge'|'withOtpCode'|'beforeOtpVerify'|'ackOtpVerification'>={beginOtp:async cb=>{events.push('challenge-intent');assert.equal(cb(Object.freeze({email:'synthetic@example.test',siteKey:'s5a-site'})),true);return true;},
+    ackOtpChallenge:async value=>{events.push('challenge-ack');assert.equal(value.challengeId,challenge);return true;},withOtpCode:async cb=>{events.push('mail-code');assert.equal(cb('123456'),true);return true;},
+    beforeOtpVerify:async()=>{events.push('verify-intent');return true;},ackOtpVerification:async value=>{events.push('verify-ack');assert.deepEqual(value,{challengeId:challenge,customerId:customer});return true;}};
+  await runDonationOtp(page,extras,binding,limits());
+  assert.deepEqual(events,['challenge-intent','email-entry','send-click','challenge-ack','mail-code','code-entry','verify-intent','verify-click','active-session','verify-ack']);
+});
+test('expired OTP browser phase dispatches no challenge',async()=>{
+  await assert.rejects(runDonationOtp({locator:forbidden,off:()=>{}} as unknown as Page,{beginOtp:forbidden} as unknown as SandboxAcceptanceExtras,binding,{deadline:Date.now()-1}),{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});
+});
+test('card callback abort closes only contexts created by that owning callback before it settles',async()=>{
+  const foreign={close:forbidden},controller=new AbortController();let owned:unknown,closed=0;
+  const browser={contexts:()=>owned?[foreign,owned]:[foreign]} as unknown as Browser;
+  await assert.rejects(withOwnedCardContexts(browser,{deadline:Date.now()+120000,signal:controller.signal},async()=>{
+    owned={close:async()=>{closed++;}};controller.abort();await new Promise(resolve=>setImmediate(resolve));
+  }),{message:'stripe_sandbox_MANUAL_CHECK_BROWSER'});assert.equal(closed,1);
+});
+test('expired donation response consumes no body or ACK',async()=>{
+  const original=request();let reads=0;
+  const response={request:()=>original,url:()=>endpoint,status:()=>201,body:async()=>{reads++;return Buffer.from('{}');}} as Pick<Response,'request'|'url'|'status'|'body'>;
+  await assert.rejects(acknowledgeDonationResponse(response,original,{ackDonationCreate:forbidden} as unknown as SandboxAcceptanceExtras,'anonymous',binding,{deadline:Date.now()-1}),{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});assert.equal(reads,0);
+});
+function admissionClock() {
+  const native=globalThis.setTimeout,alarms:{fire:()=>void;handle:ReturnType<typeof setTimeout>}[]=[];
+  const timer=mock.method(globalThis,'setTimeout',(fn:(...args:unknown[])=>void,delay?:number,...args:unknown[])=>{
+    if(delay!==15000)return native(fn,delay,...args);
+    const handle=native(()=>{},1000000);alarms.push({fire:()=>fn(...args),handle});return handle;
+  });
+  return {count:()=>alarms.length,fire(index:number){const alarm=alarms[index];assert.ok(alarm);clearTimeout(alarm.handle);alarm.fire();},
+    close(){timer.mock.restore();for(const alarm of alarms)clearTimeout(alarm.handle);}};
+}
+// I2: local admission expiry abandons ownership even while the original deadline is open.
+test('late donation context after local timeout is closed before the failed owner settles',async()=>{
+  const clock=admissionClock();let create!: (context:unknown)=>void,finishClose!:()=>void,closes=0,settled=false;
+  const creation=new Promise(resolve=>{create=resolve;}),closing=new Promise<void>(resolve=>{finishClose=resolve;});
+  const browser={newContext:()=>creation} as unknown as Browser;
+  const running=runOwnedSandboxDonations(browser,{} as SandboxAcceptanceExtras,binding,limits()).finally(()=>{settled=true;});running.catch(()=>{});
+  try {
+    await new Promise(resolve=>setImmediate(resolve));clock.fire(0);await new Promise(resolve=>setImmediate(resolve));
+    const settledBeforeCreation=settled;
+    create({close:async()=>{closes++;await closing;}});await new Promise(resolve=>setImmediate(resolve));
+    const settledBeforeClose=settled;finishClose();
+    await assert.rejects(running,{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});
+    assert.equal(settledBeforeCreation,false);assert.equal(settledBeforeClose,false);assert.equal(closes,1);
+  }finally{finishClose();clock.close();}
+});
+test('late donation context with rejecting close remains a fixed failed owner',async()=>{
+  const clock=admissionClock();let create!:(context:unknown)=>void,closes=0;
+  const browser={newContext:()=>new Promise(resolve=>{create=resolve;})} as unknown as Browser;
+  const running=runOwnedSandboxDonations(browser,{} as SandboxAcceptanceExtras,binding,limits());running.catch(()=>{});
+  try {
+    await new Promise(resolve=>setImmediate(resolve));clock.fire(0);await new Promise(resolve=>setImmediate(resolve));
+    create({close:async()=>{closes++;throw new Error('synthetic-private-close');}});
+    await assert.rejects(running,{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});assert.equal(closes,1);
+  }finally{clock.close();}
+});
+test('late donation context with pending close ends at the independent cleanup bound',async()=>{
+  const clock=admissionClock();let create!:(context:unknown)=>void,closes=0;
+  const browser={newContext:()=>new Promise(resolve=>{create=resolve;})} as unknown as Browser;
+  const running=runOwnedSandboxDonations(browser,{} as SandboxAcceptanceExtras,binding,limits());running.catch(()=>{});
+  try {
+    await new Promise(resolve=>setImmediate(resolve));clock.fire(0);await new Promise(resolve=>setImmediate(resolve));
+    create({close:async()=>{closes++;await new Promise(()=>{});}});await new Promise(resolve=>setImmediate(resolve));
+    const cleanupAlarms=clock.count();if(cleanupAlarms>1)clock.fire(1);
+    await assert.rejects(running,{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});assert.equal(cleanupAlarms,2);assert.equal(closes,1);
+  }finally{clock.close();}
+});
+test('creation beyond cleanup bound stays abandoned and its eventual context still closes once',async()=>{
+  const clock=admissionClock();let create!:(context:unknown)=>void,closes=0;
+  const browser={newContext:()=>new Promise(resolve=>{create=resolve;})} as unknown as Browser;
+  const running=runOwnedSandboxDonations(browser,{} as SandboxAcceptanceExtras,binding,limits());running.catch(()=>{});
+  try {
+    await new Promise(resolve=>setImmediate(resolve));clock.fire(0);await new Promise(resolve=>setImmediate(resolve));
+    const cleanupAlarms=clock.count();if(cleanupAlarms>1)clock.fire(1);
+    await assert.rejects(running,{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});
+    create({close:async()=>{closes++;}});await new Promise(resolve=>setImmediate(resolve));assert.equal(cleanupAlarms,2);assert.equal(closes,1);
+  }finally{clock.close();}
+});
+test('malformed donation expiry refuses the safe ACK',async()=>{
+  const original=request();let acks=0;
+  const value={checkout_id:'00000000-0000-4000-8000-000000000010',payment_id:'00000000-0000-4000-8000-000000000020',checkout_token:'s'.repeat(43),
+    amount_minor:500,currency:'EUR',price:null,provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',provider_client_payload:{},status:'CREATED',expires_at:'not-a-date',
+    donation:{donation_id:'00000000-0000-4000-8000-000000000030',campaign_key:'s5a-donate',campaign_version:1}};
+  const response={request:()=>original,url:()=>endpoint,status:()=>201,body:async()=>Buffer.from(JSON.stringify(value))} as Pick<Response,'request'|'url'|'status'|'body'>;
+  await assert.rejects(acknowledgeDonationResponse(response,original,{ackDonationCreate:async()=>{acks++;return true;}},'anonymous',binding,limits()),{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});
+  assert.equal(acks,0);
+});
+
+// I2: successful acquisition must enter its finalizer before handoff admission can fail.
+for(const boundary of ['deadline','cancellation'] as const)test(`${boundary} at successful donation context handoff closes once before any page or authority`,async()=>{
+  const controller=new AbortController(),nativeNow=Date.now,nativeListen=controller.signal.addEventListener.bind(controller.signal);
+  let now=nativeNow(),registrations=0,closes=0,pages=0,authority=0;
+  const deadline=now+120000;
+  const clock=mock.method(Date,'now',()=>now);
+  const listen=mock.method(controller.signal,'addEventListener',(...args:Parameters<AbortSignal['addEventListener']>)=>{
+    // The first registration protects acquisition; the second is the acquired owner's handoff.
+    if(++registrations===2){if(boundary==='deadline')now=deadline;else controller.abort();}
+    nativeListen(...args);
+  });
+  const browser={newContext:async()=>({close:async()=>{closes++;},newPage:async()=>{pages++;throw new Error('synthetic-page-forbidden');}})} as unknown as Browser;
+  const extras=new Proxy({},{get(){authority++;throw new Error('synthetic-authority-forbidden');}}) as SandboxAcceptanceExtras;
+  try {
+    await assert.rejects(runOwnedSandboxDonations(browser,extras,binding,{deadline,signal:controller.signal}),{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});
+    assert.equal(closes,1);assert.equal(pages,0);assert.equal(authority,0);
+  }finally{listen.mock.restore();clock.mock.restore();}
+});

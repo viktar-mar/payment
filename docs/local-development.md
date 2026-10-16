@@ -291,6 +291,32 @@ files. It never uses Compose down, prune, default Docker configuration or global
 Synthetic tests establish local behavior only; real Stage 5A acceptance remains pending
 until the root operator completes the separately approved runtime checks.
 
+The separate `playwright.stripe-sandbox.config.ts` retains its manual three-card workflow
+unless `PAYMENT_STRIPE_SANDBOX_OWNED_RUN=true`. The owned mode uses
+`openOwnedSandboxAcceptance({env,runId,expectedSource,daemon,ports}, {deadline,signal})`
+in `beforeAll`, before browser creation. After independent review, the root operator
+must supply both existing opt-ins, that owned-mode flag, a fresh
+`PAYMENT_STRIPE_SANDBOX_RUN_ID`, final committed `PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE`,
+the approved Unix `PAYMENT_STRIPE_SANDBOX_DAEMON`, and six distinct approved port values:
+`PAYMENT_STRIPE_SANDBOX_PORT_BACKEND`, `_DEMO`, `_RECEIVER`, `_POSTGRES`, `_MAILPITHTTP`,
+`_MAILPITSMTP` (each suffix has the same `PAYMENT_STRIPE_SANDBOX_PORT` prefix).
+Then invoke `pnpm exec playwright test --config playwright.stripe-sandbox.config.ts`
+from `examples/demo-site`. Do not enable DEBUG, NODE_DEBUG or PWDEBUG.
+
+One safe terminal handoff displays the genuine Stripe authorization URL and code for
+human completion; the parent executes only the fixed isolated CLI descriptors. The
+original 45-minute budget includes build, human authorization, setup and all journeys;
+later stages cannot renew it. Up to two further minutes allow cleanup only. The sequence
+is three original card journeys, their existing EUR 7.00 + 13.00 refunds, anonymous and
+EMAIL_OTP EUR 5.00 donations, then the original fourth EUR 20.00 missed-webhook journey.
+Financial success requires protected server proof and confirmed owned cleanup. Any
+unknown outcome stops later writes and retains evidence; never rerun or change keys.
+The browser uses genuine SDK requests and forwards donation create once with its durable
+original operation key. SDK browser cancellation/32 KiB bounds and enclosing context
+termination remain distinct from the parent’s fresh-ownership/10-second/64 KiB Node
+transport bounds. Browser artifacts remain off. Demo output is `examples/demo-site/test-results`;
+durable owned evidence remains repository-root `test-results/stripe-sandbox/<runId>`.
+
 The optional Sandbox overlay prepares backend configuration only. It does not establish a working Stripe backend until the Stage 5A adapter is implemented and verified. The default Compose file continues to use Fake without Stripe keys; the overlay also retains `PAYMENT_PROVIDER=fake` while enabling the separate Sandbox marker and `local` profile. Fake subscriptions continue to work; Stripe subscriptions require Stage 5B. This setup never enables live payments, Connect, Managed Payments, or business activation for real money.
 
 Create the separate private file from the project root:
