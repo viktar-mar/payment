@@ -211,7 +211,7 @@ export async function createOwnedSandboxProvisioner(options,dependencies={}) {
   function checkoutProof(value){
     if(!object(value)||!uuid(value.checkout_id)||!uuid(value.payment_id)||value.checkout_id===value.payment_id||!token(value.checkout_token)
       ||value.amount_minor!==2000||value.currency!=='EUR'||value.provider_type!=='STRIPE'||value.confirmation_mode!=='CLIENT_PROVIDER'
-      ||value.status!=='CREATED'||!object(value.provider_client_payload)||Object.keys(value.provider_client_payload).length!==0
+      ||value.status!=='REQUIRES_PAYMENT_METHOD'||!object(value.provider_client_payload)||Object.keys(value.provider_client_payload).length!==0
       ||typeof value.expires_at!=='string'||!Number.isFinite(Date.parse(value.expires_at))||Date.parse(value.expires_at)<=io.now())fail();
     const p=value.price;
     if(!object(p)||!uuid(p.price_id)||p.price_id!==price.id||p.price_key!==price.key||p.version!==price.version||p.amount_minor!==2000||p.currency!=='EUR'||p.tax_mode!=='NONE')fail();

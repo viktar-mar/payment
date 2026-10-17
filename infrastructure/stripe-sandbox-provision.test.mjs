@@ -28,7 +28,7 @@ const TOKEN=n=>Buffer.alloc(32,n).toString('base64url');
 const rejects=(promise,code='PROVISION_PENDING')=>assert.rejects(promise,{message:'stripe_sandbox_provision_'+code});
 const turn=()=>new Promise(resolveTurn=>setImmediate(resolveTurn));
 function fixture() {
-  const events=[],files=new Map();let serial=0,held=false,checkout=0,accountCreated=false,siteCreated=false,pricePublished=false,providerCreated=false,campaignActive=false;
+  const events=[],files=new Map(),checkoutStatuses=[];let serial=0,held=false,checkout=0,accountCreated=false,siteCreated=false,pricePublished=false,providerCreated=false,campaignActive=false;
   const add=(path,directory,contents='')=>files.set(path,{directory,contents:Buffer.from(contents),uid:process.getuid(),mode:directory?0o40700:0o100600,nlink:1,dev:1,ino:++serial});
   for(let path=DIR;path!=='/';path=dirname(path))add(path,true);add('/',true);
   const info=entry=>({...entry,size:entry.contents.length,isDirectory:()=>entry.directory,isFile:()=>!entry.directory,isSymbolicLink:()=>Boolean(entry.symlink)});
@@ -76,7 +76,7 @@ function fixture() {
     if(path.endsWith('/donation-campaigns'))return response(201,campaign());
     if(path.endsWith('/status')){campaignActive=true;return response(200,campaign());}
     if(path.endsWith('/donation-campaigns/'+CAMPAIGN))return response(200,campaign());
-    if(path.endsWith('/checkouts')){checkout++;return response(201,{checkout_id:uuid(10+checkout),checkout_token:TOKEN(checkout),payment_id:uuid(20+checkout),amount_minor:2000,currency:'EUR',price:{price_id:PRICE,price_key:'s5a-price-'+SUFFIX,version:1,amount_minor:2000,currency:'EUR',tax_mode:'NONE'},provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',provider_client_payload:{},status:'CREATED',expires_at:new Date(Date.now()+3600000).toISOString()});}
+    if(path.endsWith('/checkouts')){checkout++;const value={checkout_id:uuid(10+checkout),checkout_token:TOKEN(checkout),payment_id:uuid(20+checkout),amount_minor:2000,currency:'EUR',price:{price_id:PRICE,price_key:'s5a-price-'+SUFFIX,version:1,amount_minor:2000,currency:'EUR',tax_mode:'NONE'},provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',provider_client_payload:{},status:'REQUIRES_PAYMENT_METHOD',expires_at:new Date(Date.now()+3600000).toISOString()};checkoutStatuses.push(value.status);return response(201,value);}
     throw new Error('unexpected synthetic route');
   },lstat:async path=>info(need(path)),realpath:async path=>{need(path);return path;},
     open:async(path,flags,mode)=>{events.push({type:'open',path,flags,mode});
@@ -85,7 +85,7 @@ function fixture() {
       return {stat:async()=>info(entry),writeFile:async text=>{events.push({type:'write',path});entry.contents=Buffer.from(text);},sync:async()=>events.push({type:'sync',path}),close:async()=>events.push({type:'close',path})};
     },rename:async(from,to)=>{events.push({type:'rename',from,to});files.set(to,need(from));files.delete(from);},unlink:async path=>{events.push({type:'unlink',path});need(path);files.delete(path);},
     initializeState:async(metadata,settings)=>{events.push({type:'initialize',metadata,settings});},now:Date.now,setTimeout,clearTimeout};
-  return {options,dependencies,events,files,resource,response,account,site,product,price,provider,campaign};
+  return {options,dependencies,events,files,resource,response,account,site,product,price,provider,campaign,checkoutStatuses};
 }
 
 test('both opt-ins precede every other option and dependency getter',async()=>{
@@ -126,8 +126,17 @@ test('successful provisioning records each durable intent before HTTP and initia
   assert.equal(ledger.intents.some(i=>i.name==='identity-provider'||i.name==='site'),false);
   const http=f.events.filter(e=>e.type==='http'),init=f.events.find(e=>e.type==='initialize');
   assert.equal(http.filter(e=>e.path.endsWith('/checkouts')).length,4);
+  assert.deepEqual(f.checkoutStatuses,['REQUIRES_PAYMENT_METHOD','REQUIRES_PAYMENT_METHOD','REQUIRES_PAYMENT_METHOD','REQUIRES_PAYMENT_METHOD']);
+  const checkoutIntents=ledger.intents.filter(i=>i.name.startsWith('checkout:'));
+  assert.deepEqual(checkoutIntents.map(i=>[i.name,i.identity.paymentId,i.identity.checkoutId]),[
+    ['checkout:success',uuid(21),uuid(11)],['checkout:decline',uuid(22),uuid(12)],
+    ['checkout:sca',uuid(23),uuid(13)],['checkout:missed',uuid(24),uuid(14)]]);
+  assert.equal(f.events.filter(e=>e.type==='initialize').length,1);
+  assert.ok(f.events.indexOf(http.filter(e=>e.path.endsWith('/checkouts')).at(-1))<f.events.indexOf(init));
   assert.deepEqual(Object.keys(init.metadata.cases),['success','decline','sca']);
-  assert.equal(init.metadata.cases.success.checkoutId,uuid(11));assert.equal(init.metadata.owners.backend,'3'.repeat(64));
+  assert.deepEqual(init.metadata.cases,{success:{checkoutId:uuid(11),paymentId:uuid(21)},
+    decline:{checkoutId:uuid(12),paymentId:uuid(22)},sca:{checkoutId:uuid(13),paymentId:uuid(23)}});
+  assert.equal(init.metadata.owners.backend,'3'.repeat(64));
   assert.equal(init.settings.env.PAYMENT_STRIPE_SANDBOX_ENABLED,'true');
   assert.equal(http[0].path,'/api/admin/v1/auth/sessions');
   for(const e of http){assert.equal(e.settings.redirect,'error');assert.ok(e.settings.signal instanceof AbortSignal);
@@ -155,6 +164,28 @@ test('successful provisioning records each durable intent before HTTP and initia
   assert.deepEqual(missed,{checkoutToken:TOKEN(4),checkoutId:uuid(14),paymentId:uuid(24)});assert.equal(Object.isFrozen(missed),true);
   assert.equal(Object.isFrozen(p.resources().cases),true);assert.equal(JSON.stringify(p.resources()).includes(TOKEN(4)),false);
   await rejects(p.provision(LIMIT()));
+});
+
+test('prepared catalog checkout status is required at every durable checkout position',async()=>{
+  for(const invalidStatus of ['CREATED',null,1,'SUCCEEDED'])for(const checkoutPosition of [1,2,3,4]){
+    const f=fixture(),fetcher=f.dependencies.fetch;let checkoutRequests=0;
+    f.dependencies.fetch=async(url,settings)=>{
+      const response=await fetcher(url,settings);
+      if(!url.endsWith('/checkouts')||++checkoutRequests!==checkoutPosition)return response;
+      const value=await new Response(response.body).json();value.status=invalidStatus;return f.response(201,value);
+    };
+    const p=await createOwnedSandboxProvisioner(f.options,f.dependencies);
+    await rejects(p.provision(LIMIT()));
+    assert.equal(f.events.some(e=>e.type==='initialize'),false);
+    const intents=JSON.parse(f.files.get(DIR+'/provisioning.json').contents).intents;
+    const intent=intents.find(entry=>entry.name==='checkout:'+['success','decline','sca','missed'][checkoutPosition-1]);
+    assert.equal(intent.status,'DISPATCHING');assert.equal(intent.identity,undefined);
+    assert.equal(checkoutRequests,checkoutPosition);
+    const checkoutEvents=f.events.filter(e=>e.type==='http'&&e.path.endsWith('/checkouts'));
+    assert.equal(checkoutEvents.length,checkoutPosition);
+    assert.deepEqual(checkoutEvents.map(e=>e.settings.headers['Idempotency-Key']),
+      ['success','decline','sca','missed'].slice(0,checkoutPosition).map(n=>'s5a:'+RUN+':checkout:'+n));
+  }
 });
 
 test('lost writer ownership stops before the next fixture write and retains the foreign lock',async()=>{
