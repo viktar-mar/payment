@@ -7,7 +7,7 @@ import {syncBuiltinESMExports} from 'node:module';
 import {EventEmitter} from 'node:events';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {openOwnedSandboxAcceptance,formatSandboxAuthorization} from './stripe-sandbox-acceptance.mjs';
+import {openOwnedSandboxAcceptance,formatSandboxAuthorization,formatSandboxDiagnostic} from './stripe-sandbox-acceptance.mjs';
 
 const forbidden=()=>{throw new Error('synthetic_test_forbids_external_boundary');};
 for(const name of ['execFile','exec','spawn','fork','execSync','spawnSync','execFileSync'])mock.method(childProcess,name,forbidden);
@@ -71,15 +71,271 @@ function fixture() {
   return {events,commands,children,output,setup,deps,bootstrap,cli,provisioner,extras,journeys,descriptor};
 }
 async function quietOpen(f,opts=options()) {
-  const write=captureOutput();
-  try{return await openOwnedSandboxAcceptance(opts,f.setup,f.deps);}finally{write.mock.restore();}
+  const write=captureOutput(f.output);let owned;
+  try{owned=await openOwnedSandboxAcceptance(opts,f.setup,f.deps);}finally{write.mock.restore();}
+  const quiet=method=>async(...args)=>{const output=captureOutput(f.output);try{return await owned[method](...args);}finally{output.mock.restore();}};
+  return Object.freeze({...owned,run:quiet('run'),close:quiet('close')});
 }
+const diagnostics=wire=>wire.map(line=>JSON.parse(line)).filter(value=>value.tag==='stripe_sandbox_diagnostic');
+const expectedDiagnostic=(phase,code='OPERATION_FAILED',exitCode=null,cleanupConfirmed=true)=>({tag:'stripe_sandbox_diagnostic',phase,code,exitCode,cleanupConfirmed});
+async function reportFrames(frames,owned=true,exercisePrivateChannels=false){
+  const {default:Reporter}=await import('../examples/demo-site/tests/support/stripe-sandbox-reporter.ts');
+  const old=process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN;
+  if(owned)process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN='true';else delete process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN;
+  const reporter=new Reporter(),lines=[],write=captureOutput(lines);
+  try {
+    for(const frame of frames)reporter.onStdOut(frame);
+    if(exercisePrivateChannels){
+      const hostile=new Proxy({},{get(){throw new Error('private-getter');}});
+      reporter.onStdErr('private-stderr');reporter.onError(hostile);
+      reporter.onTestEnd(hostile,{status:'failed',error:hostile,errors:[hostile],attachments:[hostile],stdout:['private-out'],stderr:['private-err']});
+    }
+    return {lines,result:await reporter.onEnd({status:'passed'})};
+  }finally{write.mock.restore();if(old===undefined)delete process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN;else process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN=old;}
+}
+
+// Break: trusting callback data instead of actual close/state invents unsafe process diagnoses.
+test('owned process diagnostics classify close evidence and opaque callback or spawn failures',async()=>{
+  let reads=0;
+  const hostile=new Proxy({},{get(){reads++;throw new Error('private-getter');}});
+  for(const sample of [
+    {kind:'close',error:hostile,exit:7,signal:null,code:'PROCESS_EXIT_NONZERO',wantExit:7},
+    {kind:'close',error:null,exit:255,signal:null,code:'PROCESS_EXIT_NONZERO',wantExit:255},
+    {kind:'close',error:hostile,exit:0,signal:null,code:'PROCESS_FAILED',wantExit:null},
+    {kind:'close',error:'private-error',exit:null,signal:null,code:'PROCESS_FAILED',wantExit:null},
+    {kind:'close',error:false,exit:0,signal:null,code:'PROCESS_FAILED',wantExit:null},
+    {kind:'close',error:null,exit:null,signal:'SIGTERM',code:'PROCESS_SIGNALLED',wantExit:null},
+    {kind:'close',error:hostile,exit:256,signal:null,code:'PROCESS_FAILED',wantExit:null},
+    {kind:'spawn',error:hostile,code:'PROCESS_FAILED',wantExit:null},
+  ]){
+    const f=fixture();
+    f.deps.execFile=(file,args,opts,callback)=>{if(sample.kind==='spawn')throw sample.error;
+      const child=new EventEmitter();queueMicrotask(()=>{callback(sample.error,'private-stdout','private-stderr');child.emit('close',sample.exit,sample.signal);});return child;};
+    await assert.rejects(quietOpen(f),{message:'stripe_sandbox_acceptance_LOGIN_PENDING'});
+    assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN',sample.code,sample.wantExit)]);
+    assert.equal(f.output.join('').includes('private-'),false);assert.equal(f.events.includes('complete-descriptor'),false);
+    assert.equal(f.events.includes('start'),false);
+  }
+  assert.equal(reads,0);
+});
+test('failed process callback waits for close before diagnostic or cleanup and retains actual exit',async()=>{
+  const f=fixture();let child,callbackDone=false,settled=false;
+  f.deps.execFile=(file,args,opts,callback)=>{child=new EventEmitter();queueMicrotask(()=>{callbackDone=true;callback(new Error('private-error'),'private-out','private-err');});return child;};
+  const opening=quietOpen(f).finally(()=>{settled=true;});opening.catch(()=>{});
+  await new Promise(resolve=>setImmediate(resolve));assert.equal(callbackDone,true);assert.equal(settled,false);
+  assert.deepEqual(f.output,[]);assert.equal(f.events.includes('stop-services'),false);assert.equal(f.events.includes('complete-descriptor'),false);
+  child.emit('close',9);await assert.rejects(opening,{message:'stripe_sandbox_acceptance_LOGIN_PENDING'});
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN','PROCESS_EXIT_NONZERO',9)]);
+});
+test('child error event alone cannot release ownership or become raw diagnostic data',async()=>{
+  const f=fixture();let child,callback,reads=0;
+  const hostile=new Proxy({},{get(){reads++;throw new Error('private-event-error');}});
+  f.deps.execFile=(file,args,opts,done)=>{child=new EventEmitter();callback=done;return child;};
+  const opening=quietOpen(f);opening.catch(()=>{});await new Promise(resolve=>setImmediate(resolve));
+  child.emit('error',hostile);callback(null,json(),'');await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(f.output,[]);assert.equal(f.events.includes('stop-services'),false);assert.equal(f.events.includes('complete-descriptor'),false);
+  child.emit('close',0);await assert.rejects(opening,{message:'stripe_sandbox_acceptance_LOGIN_PENDING'});
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN','PROCESS_FAILED')]);assert.equal(reads,0);
+});
+test('owned abort before close waits for acknowledgement and records ABORTED without process text',async()=>{
+  const f=fixture(),controller=new AbortController();f.setup.signal=controller.signal;let child,settled=false;
+  f.deps.execFile=(file,args,opts,callback)=>{child=new EventEmitter();opts.signal.addEventListener('abort',()=>callback('private-abort','private-out','private-err'),{once:true});return child;};
+  const opening=quietOpen(f).finally(()=>{settled=true;});opening.catch(()=>{});
+  await new Promise(resolve=>setImmediate(resolve));controller.abort();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(settled,false);assert.deepEqual(f.output,[]);assert.equal(f.events.includes('stop-services'),false);
+  child.emit('close',null,'SIGTERM');await assert.rejects(opening,{message:'stripe_sandbox_acceptance_LOGIN_PENDING'});
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN','ABORTED')]);assert.equal(f.output.join('').includes('SIGTERM'),false);
+});
+test('proven bounded nonzero close survives callback failure even when the owned context aborts',async()=>{
+  const f=fixture(),controller=new AbortController();f.setup.signal=controller.signal;
+  f.deps.execFile=(file,args,opts,callback)=>{const child=new EventEmitter();queueMicrotask(()=>{
+    controller.abort();callback(new Error('private-abort'),'private-out','private-err');child.emit('close',5);
+  });return child;};
+  await assert.rejects(quietOpen(f),{message:'stripe_sandbox_acceptance_LOGIN_PENDING'});
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN','PROCESS_EXIT_NONZERO',5)]);
+});
+test('owned clock reaching the original deadline produces DEADLINE_REACHED',async()=>{
+  const f=fixture();let now=Date.now();f.deps.now=()=>now;
+  f.deps.execFile=(file,args,opts,callback)=>{const child=new EventEmitter();queueMicrotask(()=>{now=f.setup.deadline;callback(null,json(),'');child.emit('close',0);});return child;};
+  await assert.rejects(quietOpen(f),{message:'stripe_sandbox_acceptance_LOGIN_PENDING'});
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN','DEADLINE_REACHED')]);assert.equal(f.events.includes('complete-descriptor'),false);
+});
+
+// Break: traversing a dependency rejection lets it forge a diagnostic or execute private getters.
+test('unknown dependencies remain opaque and first setup stage survives cleanup refusal',async()=>{
+  let reads=0;const hostile=new Proxy({},{get(){reads++;throw new Error('private-getter');}});
+  for(const phase of ['PREPARE','BINDING','LISTENER','START','PROVISION']){
+    for(const error of [hostile,'private-rejection',{tag:'stripe_sandbox_diagnostic',phase:'LOGIN',code:'PROCESS_EXIT_NONZERO',exitCode:13,cleanupConfirmed:true}]){
+      const f=fixture();
+      const [target,method]=({PREPARE:[f.bootstrap,'prepare'],BINDING:[f.cli,'validateBinding'],LISTENER:[f.cli,'startListener'],START:[f.bootstrap,'start'],PROVISION:[f.provisioner,'provision']})[phase];
+      target[method]=async()=>{throw error;};f.cli.stopListener=async()=>false;f.bootstrap.stop=async()=>{f.events.push('stop-services');return false;};
+      await assert.rejects(quietOpen(f),{message:`stripe_sandbox_acceptance_${phase}_PENDING_CLEANUP_UNCONFIRMED`});
+      assert.deepEqual(diagnostics(f.output),[expectedDiagnostic(phase,'OPERATION_FAILED',null,false)]);
+      assert.equal(f.output.join('').includes('private-'),false);assert.ok(f.events.includes('stop-services'));
+      assert.equal(f.events.includes('open-cards'),false);
+    }
+  }
+  assert.equal(reads,0);
+});
+test('run failure and cleanup-only failure emit once and preserve original error API',async()=>{
+  for(const kind of ['cards','cleanup','close']){
+    const f=fixture(),owned=await quietOpen(f);f.cli.stopListener=async()=>false;
+    if(kind==='cards')f.journeys.cards=async()=>{throw {code:'PROCESS_EXIT_NONZERO',exitCode:22,message:'private-error'};};
+    const operation=()=>kind==='close'?owned.close(limits()):owned.run(f.journeys,limits());
+    const message=kind==='cards'?'stripe_sandbox_acceptance_CARDS_PENDING_CLEANUP_UNCONFIRMED':'stripe_sandbox_acceptance_CLEANUP_UNCONFIRMED';
+    await assert.rejects(operation(),{message});
+    assert.deepEqual(diagnostics(f.output),[expectedDiagnostic(kind==='cards'?'CARDS':'CLEANUP','OPERATION_FAILED',null,false)]);
+    if(kind==='cards')await assert.rejects(operation(),{message});else await assert.rejects(owned.close(limits()),{message});
+    assert.equal(diagnostics(f.output).length,1);assert.equal(f.output.join('').includes('private-'),false);
+    assert.equal(owned.resources().accepted,false);assert.equal(owned.resources().cleanup.services,true);
+  }
+});
+test('diagnostic sink failure cannot replace setup failure or skip owned cleanup',async()=>{
+  const f=fixture();f.bootstrap.prepare=async()=>false;let attempts=0;
+  const sink=mock.method(process.stdout,'write',()=>{attempts++;throw new Error('private-sink');});
+  try{await assert.rejects(openOwnedSandboxAcceptance(options(),f.setup,f.deps),{message:'stripe_sandbox_acceptance_PREPARE_PENDING'});}
+  finally{sink.mock.restore();}
+  assert.equal(attempts,1);assert.ok(f.events.includes('stop-services'));
+});
+
+// Break: coercion/accessors/extra fields could turn private payload into terminal output.
+test('diagnostic formatter exactly allowlists primitives without invoking getters',()=>{
+  assert.equal(formatSandboxDiagnostic(expectedDiagnostic('LOGIN_COMPLETE','PROCESS_EXIT_NONZERO',1)),
+    'sandbox_diagnostic phase=LOGIN_COMPLETE code=PROCESS_EXIT_NONZERO exit=1 cleanup=confirmed\n');
+  assert.equal(formatSandboxDiagnostic(expectedDiagnostic('CLEANUP','OPERATION_FAILED',null,false)),
+    'sandbox_diagnostic phase=CLEANUP code=OPERATION_FAILED exit=none cleanup=unconfirmed\n');
+  for(const phase of ['PREPARE','LOGIN','LOGIN_COMPLETE','BINDING','LISTENER','START','PROVISION','READY','CARDS','REFUNDS','DONATIONS','MISSED','CONFIRMED','CLEANUP'])
+    assert.equal(formatSandboxDiagnostic(expectedDiagnostic(phase)),`sandbox_diagnostic phase=${phase} code=OPERATION_FAILED exit=none cleanup=confirmed\n`);
+  for(const code of ['OPERATION_FAILED','PROCESS_SIGNALLED','PROCESS_FAILED','ABORTED','DEADLINE_REACHED'])
+    assert.equal(formatSandboxDiagnostic(expectedDiagnostic('LOGIN',code)),`sandbox_diagnostic phase=LOGIN code=${code} exit=none cleanup=confirmed\n`);
+  const base=expectedDiagnostic('LOGIN');let reads=0;
+  for(const value of [null,[],true,'private',{},Object.create(base),{...base,private:'private-marker'},
+    {...base,[Symbol('private')]:true},Object.defineProperty({...base},'hidden',{value:'private-marker'}),
+    {...base,phase:'LOGIN\nprivate-marker'},{...base,phase:new String('LOGIN')},{...base,code:'UNKNOWN'},
+    {...base,cleanupConfirmed:1},{...base,exitCode:0},{...base,exitCode:1},
+    ...[0,256,-1,1.5,'1',null,NaN,Infinity].map(exitCode=>({...base,code:'PROCESS_EXIT_NONZERO',exitCode})),
+    Object.defineProperty({...base},'code',{get(){reads++;throw new Error('private-getter');}}),
+    new Proxy({},{ownKeys(){throw new Error('private-proxy');}})])assert.equal(formatSandboxDiagnostic(value),null);
+  assert.equal(reads,0);
+});
+
+// Break: JSON key duplication or escaped transport tags can bypass terminal failure/refusal.
+test('reporter refuses duplicate diagnostic fields',async()=>{
+  const frame=JSON.stringify(expectedDiagnostic('LOGIN'));
+  const duplicated=frame.slice(0,-1)+',"phase":"LOGIN_COMPLETE"}\n';
+  const refused=await reportFrames([duplicated]);
+  assert.ok(refused.lines.includes('sandbox_diagnostic_failed_manual_check\n'));
+  assert.deepEqual(refused.result,{status:'failed'});
+  assert.equal(refused.lines.some(line=>line.startsWith('sandbox_diagnostic phase=')),false);
+});
+test('reporter accepts a decoded exact diagnostic tag',async()=>{
+  const frame=JSON.stringify(expectedDiagnostic('LOGIN'));
+  const escaped=frame.replace('stripe_sandbox_diagnostic','stripe_sandbox_diag\\u006eostic')+'\n';
+  const accepted=await reportFrames([escaped]);
+  assert.ok(accepted.lines.includes('sandbox_diagnostic phase=LOGIN code=OPERATION_FAILED exit=none cleanup=confirmed\n'));
+  assert.deepEqual(accepted.result,{status:'failed'});
+});
+test('reporter refuses diagnostic-shaped unknown tags and keeps refusal distinct from authorization',async()=>{
+  for(const frame of [JSON.stringify({...expectedDiagnostic('LOGIN'),tag:'unknown'})+'\n',
+    JSON.stringify({...expectedDiagnostic('LOGIN'),tag:undefined})+'\n',
+    '{"tag":"stripe_sandbox_diagnostic","private":"stripe_sandbox_authorization private-marker"',
+    '{"tag":"stripe_sandbox_diagnostic","private":"stripe_sandbox_authorization private-marker'+'x'.repeat(4096)+'"}\n']){
+    const {lines,result}=await reportFrames([frame]);
+    assert.deepEqual(result,{status:'failed'});assert.ok(lines.includes('sandbox_diagnostic_failed_manual_check\n'));
+    assert.equal(lines.join('').includes('private-'),false);assert.equal(lines.includes('sandbox_authorization_failed_manual_check\n'),false);
+  }
+});
+// Break: an erroneous authorization tag must not turn malformed diagnostics into a second handoff.
+for(const order of ['before','after'])test(`reporter refuses diagnostic shape claiming authorization ${order} a valid handoff`,async()=>{
+  const auth=JSON.stringify(authorization)+'\n';
+  const malformed={...expectedDiagnostic('LOGIN','OPERATION_FAILED',null,false),tag:'stripe_sandbox_authorization'};
+  for(const value of [malformed,{...malformed,private:'private-marker'}]){
+    const diagnostic=JSON.stringify(value)+'\n';
+    const {lines,result}=await reportFrames(order==='before'?[diagnostic,auth]:[auth,diagnostic]);
+    assert.ok(lines.includes('sandbox_diagnostic_failed_manual_check\n'));
+    assert.equal(lines.includes('sandbox_authorization_failed_manual_check\n'),false);
+    assert.deepEqual(result,{status:'failed'});assert.ok(lines.includes('sandbox_result_failed cases=0 failures=1\n'));
+    assert.equal(lines.includes(formatSandboxAuthorization(authorization)),order==='after');
+    assert.equal(lines.some(line=>line.startsWith('sandbox_diagnostic phase=')),false);
+    assert.equal(lines.join('').includes('private-marker'),false);
+  }
+});
+test('reporter refuses malformed private diagnostic frames with only fixed output and final failure',async()=>{
+  const base=expectedDiagnostic('LOGIN');
+  const invalid=[
+    {tag:'stripe_sandbox_diagnostic',private:'private-marker'},
+    {...base,private:'private-marker'},{...base,tag:'stripe_sandbox_diagnostic_unknown'},
+    {...base,phase:'unknown'},{...base,phase:'LOGIN\nprivate-marker'},
+    {...base,code:'private-marker'},{...base,exitCode:'1'},
+    {...base,code:'PROCESS_EXIT_NONZERO',exitCode:0},
+    {...base,code:'PROCESS_EXIT_NONZERO',exitCode:256},
+    {...base,code:'PROCESS_EXIT_NONZERO',exitCode:null},
+    {...base,code:'PROCESS_SIGNALLED',exitCode:1},
+    {...base,cleanupConfirmed:'true'},
+  ].map(value=>JSON.stringify(value)+'\n');
+  invalid.push('{"tag":"stripe_sandbox_diagnostic",private-marker}\n',
+    '{"tag":"stripe_sandbox_diagnostic","private":"private-marker'+ 'x'.repeat(4096)+'"}\n',
+    '{"private":"'+ 'x'.repeat(4096)+'","tag":"stripe_sandbox_diagnostic"}\n',
+    '{"tag":"stripe_sandbox_diagnostic","private":"private-marker"');
+  for(const frame of invalid){
+    const {lines,result}=await reportFrames([frame.slice(0,11),Buffer.from(frame.slice(11))]);
+    assert.deepEqual(result,{status:'failed'});assert.ok(lines.includes('sandbox_diagnostic_failed_manual_check\n'));
+    assert.equal(lines.some(line=>line.startsWith('sandbox_diagnostic phase=')),false);
+    assert.equal(lines.join('').includes('private-'),false);
+    assert.ok(lines.includes('sandbox_result_failed cases=0 failures=1\n'));
+  }
+});
+test('reporter keeps authorization immediate on either side of a diagnostic and rejects repeat diagnostics',async()=>{
+  const auth=JSON.stringify(authorization)+'\n',diag=JSON.stringify(expectedDiagnostic('BINDING'))+'\n';
+  for(const frames of [[diag,auth],[auth,diag]]){
+    const {lines,result}=await reportFrames(frames);
+    assert.deepEqual(result,{status:'failed'});
+    assert.ok(lines.includes(formatSandboxAuthorization(authorization)));
+    assert.equal(lines.includes('sandbox_authorization_failed_manual_check\n'),false);
+    assert.equal(lines.filter(line=>line.startsWith('sandbox_diagnostic phase=')).length,1);
+  }
+  const duplicate=await reportFrames([diag,auth,diag]);
+  assert.equal(duplicate.lines.filter(line=>line.startsWith('sandbox_diagnostic phase=')).length,1);
+  assert.ok(duplicate.lines.includes('sandbox_diagnostic_failed_manual_check\n'));
+  assert.deepEqual(duplicate.result,{status:'failed'});
+  const privateChannels=await reportFrames([diag],true,true);
+  assert.deepEqual(privateChannels.result,{status:'failed'});assert.equal(privateChannels.lines.join('').includes('private-'),false);
+});
+test('non-owned reporter suppresses all diagnostic and authorization input',async()=>{
+  const {lines,result}=await reportFrames([JSON.stringify(expectedDiagnostic('LOGIN'))+'\n',
+    JSON.stringify(authorization)+'\n','stripe_sandbox_diagnostic private-marker'+'x'.repeat(4096)],false);
+  assert.equal(result,undefined);assert.deepEqual(lines,['sandbox_result_passed cases=0 failures=0\n']);
+});
+
+// Break: suppressing a proven completion failure loses its stage at the real reporter boundary.
+test('failed login completion forwards one proven safe diagnostic from parent through reporter',async()=>{
+  const f=fixture(),wire=[],original=f.deps.execFile;
+  f.deps.execFile=(file,args,opts,callback)=>args.at(-1)!=='--complete-device'?original(file,args,opts,callback):
+    (()=>{const child=new EventEmitter();queueMicrotask(()=>{callback(new Error('private-error'),'private-stdout','private-stderr');child.emit('close',1);});return child;})();
+  const producer=captureOutput(wire);
+  try{await assert.rejects(openOwnedSandboxAcceptance(options(),f.setup,f.deps),{message:'stripe_sandbox_acceptance_LOGIN_COMPLETE_PENDING'});}
+  finally{producer.mock.restore();}
+  assert.equal(f.events.includes('binding'),false);assert.equal(f.events.includes('start'),false);
+  assert.ok(f.events.includes('stop-services'));
+  const {default:Reporter}=await import('../examples/demo-site/tests/support/stripe-sandbox-reporter.ts');
+  const old=process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN;process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN='true';
+  const reporter=new Reporter(),lines=[],consumer=captureOutput(lines);
+  try {
+    for(const frame of wire){reporter.onStdOut(frame.slice(0,17));reporter.onStdOut(Buffer.from(frame.slice(17)));}
+    assert.ok(lines.includes('sandbox_diagnostic phase=LOGIN_COMPLETE code=PROCESS_EXIT_NONZERO exit=1 cleanup=confirmed\n'));
+    assert.deepEqual(await reporter.onEnd({status:'passed'}),{status:'failed'});
+    assert.equal(lines.join('').includes('private-'),false);
+    for(const privateValue of [ROOT,'sandbox-exec','--complete-device','--config','whsec_synthetic'])assert.equal(lines.join('').includes(privateValue),false);
+  }finally{consumer.mock.restore();if(old===undefined)delete process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN;else process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN=old;}
+});
 
 // Break: moving any capability getter before opt-in opens private setup without authority.
 test('missing owned opt-in rejects before every other getter',async()=>{
   let touched=0;const trap=new Proxy({},{get(){touched++;throw null;}});
-  await assert.rejects(openOwnedSandboxAcceptance(new Proxy({env:{}},{get(t,k){if(k==='env')return t.env;touched++;throw null;}}),trap,trap),{message:'stripe_sandbox_acceptance_OPT_IN_REQUIRED'});
-  assert.equal(touched,0);
+  const lines=[],write=captureOutput(lines);
+  try{await assert.rejects(openOwnedSandboxAcceptance(new Proxy({env:{}},{get(t,k){if(k==='env')return t.env;touched++;throw null;}}),trap,trap),{message:'stripe_sandbox_acceptance_OPT_IN_REQUIRED'});}
+  finally{write.mock.restore();}
+  assert.equal(touched,0);assert.deepEqual(lines,[]);
 });
 // Break: accepting arbitrary redirect/next-step allows an unreviewed authorization destination.
 test('human handoff accepts pinned hosts without guessing their path and rejects capability material',()=>{
@@ -125,10 +381,14 @@ test('reporter buffers one bounded owned authorization envelope and suppresses a
 });
 
 test('debug guards and invalid supplied identity reject before all capability factories',async()=>{
-  for(const mutate of [o=>o.env.DEBUG='*',o=>o.env.NODE_DEBUG='http',o=>o.env.PWDEBUG='1',o=>o.runId='not-a-run',o=>o.expectedSource='HEAD',o=>o.daemon='http://localhost',o=>o.ports.demo=o.ports.backend,o=>o.ports.extra=18000]){
-    const opts=options();mutate(opts);let touched=0;const deps=new Proxy({},{get(){touched++;throw null;}});
-    await assert.rejects(openOwnedSandboxAcceptance(opts,limits(),deps),{message:'stripe_sandbox_acceptance_CONFIGURATION'});assert.equal(touched,0);
-  }
+  const lines=[],write=captureOutput(lines);
+  try{
+    for(const mutate of [o=>o.env.DEBUG='*',o=>o.env.NODE_DEBUG='http',o=>o.env.PWDEBUG='1',o=>o.runId='not-a-run',o=>o.expectedSource='HEAD',o=>o.daemon='http://localhost',o=>o.ports.demo=o.ports.backend,o=>o.ports.extra=18000]){
+      const opts=options();mutate(opts);let touched=0;const deps=new Proxy({},{get(){touched++;throw null;}});
+      await assert.rejects(openOwnedSandboxAcceptance(opts,limits(),deps),{message:'stripe_sandbox_acceptance_CONFIGURATION'});assert.equal(touched,0);
+    }
+  }finally{write.mock.restore();}
+  assert.deepEqual(lines,[]);
 });
 test('unsafe or ambiguous initiation never obtains completion or starts services',async()=>{
   for(const value of ['{}',json()+'\n'+json(),JSON.stringify({browser_url:authorization.browser_url,verification_code:'ABCD-EFGH',next_step:'stripe login --interactive'}),
@@ -237,6 +497,7 @@ test('run and close reject overlap without disrupting the one original browser c
   await assert.rejects(owned.run(f.journeys,limits()),{message:'stripe_sandbox_acceptance_BUSY'});
   await assert.rejects(owned.close(limits()),{message:'stripe_sandbox_acceptance_BUSY'});release();assert.equal(await running,true);
   assert.equal(f.events.filter(value=>value==='cards').length,1);
+  assert.deepEqual(diagnostics(f.output),[]);
 });
 test('old transport cancellation aborts the full original response body and stops later writes',async()=>{
   const f=fixture(),controller=new AbortController();let requestSignal,reads=0;

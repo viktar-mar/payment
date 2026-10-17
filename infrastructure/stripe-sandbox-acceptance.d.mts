@@ -50,3 +50,4 @@ export interface OwnedSandboxDependencies {
 }
 export function openOwnedSandboxAcceptance(options:OwnedSandboxOptions,limits:OwnedSandboxLimits,dependencies?:OwnedSandboxDependencies):Promise<OwnedSandboxAcceptance>;
 export function formatSandboxAuthorization(value:unknown):string|null;
+export function formatSandboxDiagnostic(value:unknown):string|null;

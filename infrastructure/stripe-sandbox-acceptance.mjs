@@ -38,6 +38,23 @@ export function formatSandboxAuthorization(value) {
   }catch{return null;}
 }
 
+/** Flat public failure observation. Accessors and unknown fields are never consumed. */
+export function formatSandboxDiagnostic(value) {
+  try {
+    if(!object(value))return null;
+    const keys=['tag','phase','code','exitCode','cleanupConfirmed'];
+    if(Reflect.ownKeys(value).length!==keys.length)return null;
+    const descriptors=Object.getOwnPropertyDescriptors(value);
+    if(keys.some(key=>!Object.hasOwn(descriptors,key)||!Object.hasOwn(descriptors[key],'value')))return null;
+    const {tag,phase,code,exitCode,cleanupConfirmed}=Object.fromEntries(keys.map(key=>[key,descriptors[key].value]));
+    if(tag!=='stripe_sandbox_diagnostic'||!['PREPARE','LOGIN','LOGIN_COMPLETE','BINDING','LISTENER','START','PROVISION','READY','CARDS','REFUNDS','DONATIONS','MISSED','CONFIRMED','CLEANUP'].includes(phase)
+      ||!['OPERATION_FAILED','PROCESS_EXIT_NONZERO','PROCESS_SIGNALLED','PROCESS_FAILED','ABORTED','DEADLINE_REACHED'].includes(code)
+      ||typeof cleanupConfirmed!=='boolean')return null;
+    if(code==='PROCESS_EXIT_NONZERO'? !Number.isInteger(exitCode)||exitCode<1||exitCode>255 : exitCode!==null)return null;
+    return `sandbox_diagnostic phase=${phase} code=${code} exit=${exitCode===null?'none':exitCode} cleanup=${cleanupConfirmed?'confirmed':'unconfirmed'}\n`;
+  }catch{return null;}
+}
+
 /** One owned run. Factories are reviewed capability boundaries, never command plugins. */
 export async function openOwnedSandboxAcceptance(options,limits,dependencies={}) {
   let enabled=false;
@@ -75,12 +92,25 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
   originalSignal?.addEventListener('abort',abortLifetime,{once:true});
   const lifetimeTimer=io.setTimeout(abortLifetime,Math.max(1,originalDeadline-io.now()));
   const setup={deadline:originalDeadline,signal:lifetime.signal};
-  let busy=true,phase='PREPARE',failure=null,acceptedProof=false,cleanupConfirmed=false,closed=false,processUncertain=false,browserUncertain=false;
+  let busy=true,phase='PREPARE',failure=null,failureDiagnostic=null,cleanupDiagnostic=null,diagnosticEmitted=false,acceptedProof=false,cleanupConfirmed=false,closed=false,processUncertain=false,browserUncertain=false;
+  // Only tokens created inside this owner carry process provenance; dependency errors are opaque.
+  const diagnostics=new WeakMap();
+  function observedFailure(code,exitCode=null){const token=Object.freeze(Object.create(null));diagnostics.set(token,{code,exitCode});return token;}
   let bootstrap=null,cli=null,provisioner=null,extras=null,cards=null,missed=null,catalogEnv=null,publicBinding=null,activeContext=setup,activeJourney=null;
   const cleanup={cards:false,missed:false,extras:false,listener:false,services:false};
   const proof={cards:false,refunds:false,anonymous:false,emailOtp:false,otp:false,missed:false};
-  function check(context){if(context.signal.aborted||io.now()>=context.deadline)fail();}
-  function recordFailure(){if(failure===null)failure=phase;}
+  function contextFailure(ctx){
+    if(io.now()>=ctx.deadline)return observedFailure('DEADLINE_REACHED');
+    if(ctx.signal.aborted)return observedFailure('ABORTED');return null;
+  }
+  function check(ctx){const error=contextFailure(ctx);if(error)throw error;}
+  const evidence=(error,ctx)=>diagnostics.get(error)??diagnostics.get(ctx?contextFailure(ctx):null)??{code:'OPERATION_FAILED',exitCode:null};
+  function recordFailure(error,ctx=setup){if(failure===null){failure=phase;failureDiagnostic=evidence(error,ctx);}}
+  function emitDiagnostic(){
+    if(diagnosticEmitted)return;diagnosticEmitted=true;
+    const envelope={tag:'stripe_sandbox_diagnostic',phase:failure??'CLEANUP',...(failureDiagnostic??cleanupDiagnostic??{code:'OPERATION_FAILED',exitCode:null}),cleanupConfirmed};
+    try{process.stdout.write(JSON.stringify(envelope)+'\n');}catch{}
+  }
   function resources(){return snapshot({runId:configuration.runId,phase,failure,proof,accepted:acceptedProof&&cleanupConfirmed,cleanupConfirmed,cleanup,
     ...(publicBinding??{})});}
   function context(limits,cleanupOnly=false) {
@@ -95,10 +125,10 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
   function controlled(ctx,body) {
     check(ctx);
     return new Promise((resolveWait,rejectWait)=>{
-      const abort=()=>rejectWait(null);ctx.signal.addEventListener('abort',abort,{once:true});
+      const abort=()=>rejectWait(contextFailure(ctx));ctx.signal.addEventListener('abort',abort,{once:true});
       Promise.resolve().then(()=>{check(ctx);return body();}).then(value=>{
-        ctx.signal.removeEventListener('abort',abort);try{check(ctx);resolveWait(value);}catch{rejectWait(null);}
-      },()=>{ctx.signal.removeEventListener('abort',abort);rejectWait(null);});
+        ctx.signal.removeEventListener('abort',abort);try{check(ctx);resolveWait(value);}catch(error){rejectWait(error);}
+      },error=>{ctx.signal.removeEventListener('abort',abort);rejectWait(diagnostics.has(error)?error:contextFailure(ctx));});
       if(ctx.signal.aborted)abort();
     });
   }
@@ -106,7 +136,7 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
   async function journey(ctx,body){
     activeJourney=Promise.resolve().then(body);activeJourney.catch(()=>{});
     try{if(await controlled(ctx,()=>activeJourney)!==true)fail();}
-    catch{browserUncertain=true;throw null;}
+    catch(error){browserUncertain=true;throw error;}
     finally{if(!ctx.signal.aborted)activeJourney=null;}
   }
   const ownership=ctx=>requireTrue(ctx,()=>bootstrap.verify({deadline:ctx.deadline,signal:ctx.signal}));
@@ -127,19 +157,22 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
     check(ctx);
     // Unlike an abort race, callback completion alone never means the process has exited.
     const result=await new Promise((resolveExecution,rejectExecution)=>{
-      let callbackDone=false,closedProcess=false,failed=false,stdout='',stderr='',grace;
+      let callbackDone=false,closedProcess=false,failed=false,stdout='',stderr='',grace,closeCode,closeSignal;
+      const processFailure=()=>Number.isInteger(closeCode)&&closeCode>=1&&closeCode<=255
+        ?observedFailure('PROCESS_EXIT_NONZERO',closeCode)
+        :contextFailure(ctx)??observedFailure(typeof closeSignal==='string'&&closeSignal!==''?'PROCESS_SIGNALLED':'PROCESS_FAILED');
       const finish=()=>{if(callbackDone&&closedProcess){io.clearTimeout(grace);ctx.signal.removeEventListener('abort',onAbort);
-        if(failed)rejectExecution(null);else resolveExecution({stdout,stderr});}};
-      const onAbort=()=>{failed=true;grace=io.setTimeout(()=>{processUncertain=true;rejectExecution(null);},10000);};
+        if(failed)rejectExecution(processFailure());else resolveExecution({stdout,stderr});}};
+      const onAbort=()=>{failed=true;grace=io.setTimeout(()=>{processUncertain=true;rejectExecution(processFailure());},10000);};
       ctx.signal.addEventListener('abort',onAbort,{once:true});
       try {
         const child=io.execFile(value.file,value.args,{...value.options,signal:ctx.signal,timeout:Math.max(1,Math.min(180000,ctx.deadline-io.now()))},(error,out,err)=>{
-          failed=failed||Boolean(error);stdout=out;stderr=err;callbackDone=true;finish();
+          failed=failed||(error!==null&&error!==undefined);stdout=out;stderr=err;callbackDone=true;finish();
         });
-        child.once('close',code=>{closedProcess=true;failed=failed||code!==0;finish();});
+        child.once('close',(code,signal)=>{closedProcess=true;closeCode=code;closeSignal=signal;failed=failed||code!==0||(typeof signal==='string'&&signal!=='');finish();});
         child.once('error',()=>{failed=true;});
         if(ctx.signal.aborted)onAbort();
-      }catch{ctx.signal.removeEventListener('abort',onAbort);rejectExecution(null);}
+      }catch{ctx.signal.removeEventListener('abort',onAbort);rejectExecution(processFailure());}
     });
     check(ctx);
     if(typeof result.stdout!=='string'||typeof result.stderr!=='string'||Buffer.byteLength(result.stdout)+Buffer.byteLength(result.stderr)>65536)fail();
@@ -197,11 +230,11 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
 
   async function cleanupOwned(limits) {
     let ctx;
-    try {ctx=context(limits,true);}catch{cleanupConfirmed=false;return false;}
+    try {ctx=context(limits,true);}catch(error){cleanupDiagnostic??=evidence(error);cleanupConfirmed=false;return false;}
     let confirmed=!processUncertain&&!browserUncertain;
     if(activeJourney){
       // Settlement only orders Node cleanup. It never clears uncertain browser ownership.
-      try{await controlled(ctx,()=>activeJourney.then(()=>true,()=>true));}catch{confirmed=false;}
+      try{await controlled(ctx,()=>activeJourney.then(()=>true,()=>true));}catch(error){cleanupDiagnostic??=evidence(error,ctx);confirmed=false;}
       activeJourney=null;
     }
     for(const [name,capability,method,withLimits] of [['cards',cards,'close',false],['missed',missed,'close',false],['extras',extras,'close',true],
@@ -210,7 +243,7 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
       if(!capability){cleanup[name]=true;continue;}
       try {const value=await controlled(ctx,()=>withLimits?capability[method]({deadline:ctx.deadline,signal:ctx.signal}):capability[method]());
         if(withLimits&&value!==true)fail();cleanup[name]=true;
-      }catch{confirmed=false;}
+      }catch(error){cleanupDiagnostic??=evidence(error,ctx);confirmed=false;}
     }
     ctx.dispose();cleanupConfirmed=confirmed&&!browserUncertain&&Object.values(cleanup).every(Boolean);closed=true;catalogEnv=null;
     io.clearTimeout(lifetimeTimer);originalSignal?.removeEventListener('abort',abortLifetime);
@@ -242,7 +275,7 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
     if(provisioner.withCatalogEnvironment(value=>{if(++handoffs!==1||!Object.isFrozen(value))fail();catalogEnv=Object.freeze({...value});return true;})!==true||handoffs!==1)fail();
     phase='READY';
   }
-  try {await setupOwned();}catch{recordFailure();await cleanupOwned({deadline:io.now()+120000});throw fixed(failure+'_PENDING'+(cleanupConfirmed?'':'_CLEANUP_UNCONFIRMED'));}
+  try {await setupOwned();}catch(error){recordFailure(error);await cleanupOwned({deadline:io.now()+120000});emitDiagnostic();throw fixed(failure+'_PENDING'+(cleanupConfirmed?'':'_CLEANUP_UNCONFIRMED'));}
   finally{busy=false;}
   return Object.freeze({resources,
     run:async(browserJourneys,limits)=>{
@@ -266,15 +299,15 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
         await journey(ctx,()=>browserJourneys.missed(missed));
         if(extras.resources().missed?.confirmed!==true)fail();proof.missed=true;
         await controlled(ctx,()=>missed.close());cleanup.missed=true;missed=null;acceptedProof=true;phase='CONFIRMED';
-      }catch{recordFailure();}
+      }catch(error){recordFailure(error,ctx??setup);}
       finally{ctx?.dispose();await cleanupOwned({deadline:io.now()+120000});busy=false;}
-      if(failure)throw fixed(failure+'_PENDING'+(cleanupConfirmed?'':'_CLEANUP_UNCONFIRMED'));
-      if(!cleanupConfirmed)throw fixed('CLEANUP_UNCONFIRMED');return true;
+      if(failure){emitDiagnostic();throw fixed(failure+'_PENDING'+(cleanupConfirmed?'':'_CLEANUP_UNCONFIRMED'));}
+      if(!cleanupConfirmed){emitDiagnostic();throw fixed('CLEANUP_UNCONFIRMED');}return true;
     },
     close:async limits=>{
       if(busy)throw fixed('BUSY');busy=true;
       try{if(closed){if(!cleanupConfirmed)throw fixed('CLEANUP_UNCONFIRMED');return true;}
-        if(!await cleanupOwned(limits))throw fixed('CLEANUP_UNCONFIRMED');return true;
+        if(!await cleanupOwned(limits)){emitDiagnostic();throw fixed('CLEANUP_UNCONFIRMED');}return true;
       }finally{busy=false;}
     },
   });

@@ -381,6 +381,20 @@ termination remain distinct from the parent’s fresh-ownership/10-second/64 KiB
 transport bounds. Browser artifacts remain off. Demo output is `examples/demo-site/test-results`;
 durable owned evidence remains repository-root `test-results/stripe-sandbox/<runId>`.
 
+After an admitted owned run fails, the parent emits at most one bounded diagnostic after
+cleanup. The fixed reporter displays only the first failed phase, an allowlisted failure
+code, a proven child exit code (1–255) or `none`, and `cleanup=confirmed|unconfirmed`.
+Unknown dependency failures remain `OPERATION_FAILED`; callback/spawn failures remain
+`PROCESS_FAILED` unless actual close arguments or the owned abort/deadline prove more.
+A termination signal alone is `PROCESS_SIGNALLED`, never evidence of a timeout.
+Raw errors, process output, arguments, paths, browser URLs and private fields are excluded
+from diagnostics. The separate public authorization handoff still appears immediately.
+Malformed, duplicate, oversized or unfinished diagnostics produce the fixed
+`sandbox_diagnostic_failed_manual_check` marker and force final failure; a valid diagnostic
+also forces failure. Successful runs emit no diagnostic. These observations neither
+establish account/payment success nor authorize a retry, and do not diagnose historical
+failures. No new Sandbox execution is authorized by this instrumentation.
+
 The optional Sandbox overlay prepares backend configuration only. It does not establish a working Stripe backend until the Stage 5A adapter is implemented and verified. The default Compose file continues to use Fake without Stripe keys; the overlay also retains `PAYMENT_PROVIDER=fake` while enabling the separate Sandbox marker and `local` profile. Fake subscriptions continue to work; Stripe subscriptions require Stage 5B. This setup never enables live payments, Connect, Managed Payments, or business activation for real money.
 
 Create the separate private file from the project root:
