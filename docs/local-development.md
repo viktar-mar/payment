@@ -49,6 +49,13 @@ This separate capability creates the Account, Site, return policy, EUR 20.00 (20
 EMAIL_OTP configuration, fixed EUR 5.00 (500 minor units) Donation campaign and four anonymous catalog checkouts
 (`success`, `decline`, `sca`, `missed`). Its owner-only run directory retains `provisioning.json`
 with durable DISPATCHING records before every write and safe returned identities afterwards.
+The Site POST includes optional `email_otp_provider` with `provider_key`, `sender_ref` and
+`template_key`; EMAIL_OTP must be enabled on the Site. The existing Admin transaction commits
+the Site, its READY provider and both creation audits together, or rolls everything back.
+Omitting the field preserves legacy creation, including readiness failure for an incomplete
+EMAIL_OTP Site. The provisioner records one `site-and-email-provider` intent, then discovers
+and checks the exact provider through existing list/get routes under normal ownership and
+readiness verification; it sends no separate provider POST.
 Existing ledgers/locks and uncertain outcomes permanently refuse replay; preserve their evidence
 and original keys. Price publication is the first Stripe catalog write; Account creation already
 crosses the fixture mutation boundary. No payment confirmation or Donation checkout occurs here.

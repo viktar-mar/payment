@@ -245,9 +245,15 @@ export async function createOwnedSandboxProvisioner(options,dependencies={}) {
     const createdAccount=await mutation('account',keys.account,'/api/admin/v1/payment-accounts',context,{method:'POST',expected:201,
       body:{key:keys.account,provider:'STRIPE',mode:'SANDBOX',external_account_id:'acct_1UPiMpELswAd8tpR',credentials_ref:'stripe-sandbox-default'}},accountProof,v=>({id:v.id,key:v.key}));
     account={id:createdAccount.id,key:keys.account,externalId:'acct_1UPiMpELswAd8tpR'};
-    const createdSite=await mutation('site',keys.site,'/api/admin/v1/sites',context,{method:'POST',expected:201,
-      body:{key:keys.site,display_name:'Stage5A Sandbox acceptance',payment_account_id:account.id,allowed_origins:[topology.endpoints.demo],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']}}},siteProof,v=>({id:v.id,key:v.key}));
+    const createdSite=await mutation('site-and-email-provider',keys.site,'/api/admin/v1/sites',context,{method:'POST',expected:201,
+      body:{key:keys.site,display_name:'Stage5A Sandbox acceptance',payment_account_id:account.id,allowed_origins:[topology.endpoints.demo],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']},
+        email_otp_provider:{provider_key:keys.provider,sender_ref:'local-default',template_key:'otp-default'}}},siteProof,v=>({id:v.id,key:v.key}));
     site={id:createdSite.id,key:keys.site};const sitePath='/api/v1/admin/sites/'+site.id;
+    const createdProviders=await read(sitePath+'/identity-providers',context);
+    if(!Array.isArray(createdProviders)||createdProviders.length!==1)fail();
+    providerProof(createdProviders[0]);
+    identityProvider={id:createdProviders[0].id,key:keys.provider,mode:'EMAIL_OTP',status:'ACTIVE',readiness:'READY',version:0};
+    providerProof(await read(sitePath+'/identity-providers/'+identityProvider.id,context));
     const returnPath=sitePath+'/checkout-return-urls',policies=await read(returnPath,context);
     if(!Array.isArray(policies)||policies.length)fail();
     await mutation('return-url',stable('return-url'),returnPath,context,{method:'PUT',expected:204,
@@ -267,10 +273,6 @@ export async function createOwnedSandboxProvisioner(options,dependencies={}) {
       if(!object(v)||!uuid(v.site_id)||v.site_id!==site.id||v.endpoint_url!=='http://callback-receiver:8080/callback'||v.enabled!==true||v.secret_version!==1||!token(v.secret))fail();
     },v=>({siteId:v.site_id,secretVersion:v.secret_version}));
     await mutation('receiver',stable('receiver'),'/configure',context,{method:'POST',expected:204,receiver:true,body:{secret:callback.secret,secret_version:callback.secret_version}},v=>{if(v!==null)fail();},()=>({secretVersion:1}));
-    const createdProvider=await mutation('identity-provider',keys.provider,sitePath+'/identity-providers',context,{method:'POST',expected:201,
-      body:{provider_key:keys.provider,mode:'EMAIL_OTP',sender_ref:'local-default',template_key:'otp-default'}},providerProof,v=>({id:v.id,key:v.provider_key}));
-    identityProvider={id:createdProvider.id,key:keys.provider,mode:'EMAIL_OTP',status:'ACTIVE',readiness:'READY',version:0};
-    providerProof(await read(sitePath+'/identity-providers/'+identityProvider.id,context));
     const createdCampaign=await mutation('campaign',stable('campaign:create'),sitePath+'/donation-campaigns',context,{method:'POST',expected:201,key:stable('campaign:create'),
       body:{key:keys.campaign,display_name:'Stage5A Donation acceptance',purpose_description:null,currency:'EUR',suggested_amounts:[500],minimum_amount:500,maximum_amount:500,custom_amount_allowed:false,anonymous_allowed:true}},v=>campaignProof(v,false),v=>({id:v.id,key:v.key,version:v.version}));
     campaign={id:createdCampaign.id,key:keys.campaign,status:'DRAFT',version:0};

@@ -47,7 +47,7 @@ function fixture() {
     const bytes=Buffer.from(value===null?'':JSON.stringify(value));
     return {status,headers:{getSetCookie:()=>cookies},body:new ReadableStream({start(controller){if(bytes.length)controller.enqueue(bytes);controller.close();}})};
   }
-  const bootstrap={resources:()=>resource,verify:async context=>{assert.equal(held,false,'R3 callback lock released before verify');events.push({type:'verify',context});return true;},
+  const bootstrap={resources:()=>resource,verify:async context=>{assert.equal(held,false,'R3 callback lock released before verify');events.push({type:'verify',context});return !siteCreated||providerCreated;},
     withAdminCredentials:async callback=>{held=true;events.push({type:'credentials'});try {assert.equal(callback(Object.freeze({username:'generated-admin',password:'synthetic-password'})),true);return true;}finally{held=false;}}};
   const options={env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',STRIPE_API_KEY:'must-not-leak'},bootstrap,
     verifyProviderBinding:async context=>{events.push({type:'binding',context});return true;}};
@@ -56,7 +56,13 @@ function fixture() {
     events.push({type:'http',url,path,method,body,settings});
     if(path==='/api/admin/v1/auth/sessions')return response(204,null,['PAYMENT_ADMIN_SESSION=session-test; Path=/; HttpOnly; SameSite=Strict','XSRF-TOKEN=csrf-test; Path=/']);
     if(path==='/api/admin/v1/payment-accounts'){if(method==='GET')return response(200,accountCreated?[account()]:[]);accountCreated=true;return response(201,account());}
-    if(path==='/api/admin/v1/sites'){if(method==='GET')return response(200,siteCreated?[site()]:[]);siteCreated=true;return response(201,site());}
+    if(path==='/api/admin/v1/sites'){
+      if(method==='GET')return response(200,siteCreated?[site()]:[]);
+      const inline=body.email_otp_provider!=null;
+      if(inline&&JSON.stringify(body.email_otp_provider)!==JSON.stringify({provider_key:'s5a-email-'+SUFFIX,sender_ref:'local-default',template_key:'otp-default'}))return response(400);
+      if(inline&&(!Array.isArray(body.authentication_modes)||!body.authentication_modes.includes('EMAIL_OTP')))return response(400);
+      siteCreated=true;providerCreated=inline;return response(201,site());
+    }
     if(path.endsWith('/checkout-return-urls'))return method==='PUT'?response(204):response(200,events.some(e=>e.type==='http'&&e.path===path&&e.method==='PUT')?[{origin:resource.endpoints.demo,return_url:resource.endpoints.demo+'/payment-return.html',version:0}]:[]);
     if(path.endsWith('/products'))return response(201,product());
     if(path.endsWith('/prices'))return response(201,price());
@@ -65,7 +71,7 @@ function fixture() {
     if(path==='/inspection')return response(200,{count:0,duplicates:0,events:[]});
     if(path.endsWith('/callback'))return response(200,{site_id:SITE,endpoint_url:'http://callback-receiver:8080/callback',enabled:true,secret_version:1,secret:SECRET});
     if(path==='/configure')return response(204);
-    if(path.endsWith('/identity-providers')){providerCreated=true;return response(201,provider());}
+    if(path.endsWith('/identity-providers')){assert.equal(method,'GET','provider is created only in the atomic Site request');return response(200,providerCreated?[provider()]:[]);}
     if(path.endsWith('/identity-providers/'+PROVIDER)){assert.equal(providerCreated,true);return response(200,provider());}
     if(path.endsWith('/donation-campaigns'))return response(201,campaign());
     if(path.endsWith('/status')){campaignActive=true;return response(200,campaign());}
@@ -104,10 +110,10 @@ test('constructor snapshots approved inputs without I/O and rejects unsafe topol
 test('successful provisioning records each durable intent before HTTP and initializes original three after four',async()=>{
   const f=fixture(),fetcher=f.dependencies.fetch;
   f.dependencies.fetch=async(url,settings)=>{
+    assert.equal(f.events.at(-1).type,'verify','fresh normal verification precedes every HTTP request');
     if(settings.method!=='GET'&&!url.endsWith('/auth/sessions')){
       const ledger=JSON.parse(f.files.get(DIR+'/provisioning.json').contents);
       assert.equal(ledger.intents.at(-1).status,'DISPATCHING');
-      assert.equal(f.events.at(-1).type,'verify');
     }
     return fetcher(url,settings);
   };
@@ -115,7 +121,9 @@ test('successful provisioning records each durable intent before HTTP and initia
   assert.equal(await p.provision(LIMIT()),true);
   assert.equal(p.resources().status,'READY');assert.equal(f.files.has(DIR+'/provisioning.lock'),false);
   const ledger=JSON.parse(f.files.get(DIR+'/provisioning.json').contents);
-  assert.equal(ledger.intents.every(i=>i.status==='ACKNOWLEDGED'),true);assert.equal(ledger.intents.length,16);
+  assert.equal(ledger.intents.every(i=>i.status==='ACKNOWLEDGED'),true);assert.equal(ledger.intents.length,15);
+  assert.deepEqual(ledger.intents[1],{name:'site-and-email-provider',key:'s5a-'+SUFFIX,status:'ACKNOWLEDGED',identity:{id:SITE,key:'s5a-'+SUFFIX}});
+  assert.equal(ledger.intents.some(i=>i.name==='identity-provider'||i.name==='site'),false);
   const http=f.events.filter(e=>e.type==='http'),init=f.events.find(e=>e.type==='initialize');
   assert.equal(http.filter(e=>e.path.endsWith('/checkouts')).length,4);
   assert.deepEqual(Object.keys(init.metadata.cases),['success','decline','sca']);
@@ -134,7 +142,9 @@ test('successful provisioning records each durable intent before HTTP and initia
   assert.deepEqual(http.find(e=>e.method==='PUT'&&e.path.endsWith('/checkout-return-urls')).body,{origin:'http://127.0.0.1:18081',return_url:'http://127.0.0.1:18081/payment-return.html',expected_version:-1});
   assert.deepEqual(http.find(e=>e.path==='/configure').body,{secret:SECRET,secret_version:1});
   assert.equal(http.find(e=>e.path.endsWith('/callback')).body.endpoint_url,'http://callback-receiver:8080/callback');
-  assert.deepEqual(http.find(e=>e.path.endsWith('/identity-providers')).body,{provider_key:'s5a-email-'+SUFFIX,mode:'EMAIL_OTP',sender_ref:'local-default',template_key:'otp-default'});
+  assert.deepEqual(http.find(e=>e.path==='/api/admin/v1/sites'&&e.method==='POST').body.email_otp_provider,{provider_key:'s5a-email-'+SUFFIX,sender_ref:'local-default',template_key:'otp-default'});
+  assert.equal(http.filter(e=>e.path==='/api/admin/v1/sites'&&e.method==='POST').length,1);
+  assert.equal(http.filter(e=>e.path.includes('/identity-providers')).every(e=>e.method==='GET'),true);
   assert.deepEqual(http.filter(e=>e.path.endsWith('/checkouts')).map(e=>e.settings.headers['Idempotency-Key']),['success','decline','sca','missed'].map(n=>'s5a:'+RUN+':checkout:'+n));
   for(const forbiddenText of [SECRET,TOKEN(1),'generated-admin','synthetic-password','session-test','csrf-test','must-not-leak'])assert.equal(f.files.get(DIR+'/provisioning.json').contents.includes(forbiddenText),false);
   let environment,missed;
@@ -222,7 +232,7 @@ test('invalid deadlines, cancellation and overlapping calls cannot start another
 });
 
 test('every uncertain mutation retains DISPATCHING and stops later writes without a replacement key',async()=>{
-  for(let failAt=1;failAt<=15;failAt++){
+  for(let failAt=1;failAt<=14;failAt++){
     const f=fixture(),fetcher=f.dependencies.fetch;let mutations=0,lastLedger;
     f.dependencies.fetch=async(url,settings)=>{
       if(settings.method!=='GET'&&!url.endsWith('/auth/sessions')&&++mutations===failAt){
@@ -236,6 +246,100 @@ test('every uncertain mutation retains DISPATCHING and stops later writes withou
     assert.equal(f.events.some(e=>e.type==='initialize'||e.type==='unlink'),false);const before=f.events.length;
     await rejects(p.provision(LIMIT()));assert.equal(f.events.length,before);
     assert.throws(()=>p.withMissedCheckout(()=>true),{message:'stripe_sandbox_provision_HANDOFF_PENDING'});
+  }
+});
+
+test('atomic Site request preserves readiness and records compound intent before its only dispatch',async()=>{
+  const f=fixture(),fetcher=f.dependencies.fetch;let sitePosts=0;
+  f.dependencies.fetch=async(url,settings)=>{
+    if(new URL(url).pathname==='/api/admin/v1/sites'&&settings.method==='POST'){
+      sitePosts++;
+      const intent=JSON.parse(f.files.get(DIR+'/provisioning.json').contents).intents.at(-1);
+      assert.deepEqual(intent,{name:'site-and-email-provider',key:'s5a-'+SUFFIX,status:'DISPATCHING'});
+      assert.deepEqual(JSON.parse(settings.body),{key:'s5a-'+SUFFIX,display_name:'Stage5A Sandbox acceptance',payment_account_id:ACCOUNT,
+        allowed_origins:['http://127.0.0.1:18081'],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']},
+        email_otp_provider:{provider_key:'s5a-email-'+SUFFIX,sender_ref:'local-default',template_key:'otp-default'}});
+    }
+    const response=await fetcher(url,settings);
+    if(sitePosts)assert.equal(await f.options.bootstrap.verify(LIMIT()),true,'atomic commit remains operationally ready');
+    return response;
+  };
+  const p=await createOwnedSandboxProvisioner(f.options,f.dependencies);await p.provision(LIMIT());
+  assert.equal(sitePosts,1);assert.equal(p.resources().status,'READY');
+  assert.equal(p.resources().identityProvider.id,PROVIDER);
+});
+
+test('missing or malformed inline mutation cannot continue past the backend readiness refusal',async()=>{
+  for(const provider of [undefined,null,{}, {provider_key:'foreign',sender_ref:'local-default',template_key:'otp-default'}]){
+    const f=fixture(),fetcher=f.dependencies.fetch;let atSite;
+    f.dependencies.fetch=async(url,settings)=>{
+      if(new URL(url).pathname==='/api/admin/v1/sites'&&settings.method==='POST'){
+        const body=JSON.parse(settings.body);if(provider===undefined)delete body.email_otp_provider;else body.email_otp_provider=provider;
+        const response=await fetcher(url,{...settings,body:JSON.stringify(body)});atSite=f.events.filter(e=>e.type==='http').length;return response;
+      }return fetcher(url,settings);
+    };
+    const p=await createOwnedSandboxProvisioner(f.options,f.dependencies);await rejects(p.provision(LIMIT()));
+    assert.equal(f.events.filter(e=>e.type==='http').length,atSite);
+    const intents=JSON.parse(f.files.get(DIR+'/provisioning.json').contents).intents;
+    assert.equal(intents.length,2);assert.equal(intents[1].name,'site-and-email-provider');
+    assert.equal(intents[1].status,provider==null?'ACKNOWLEDGED':'DISPATCHING');
+    assert.equal(f.events.some(e=>e.type==='initialize'),false);
+  }
+});
+
+test('provider discovery and exact readback refuse missing duplicate foreign nonready or malformed configurations before later writes',async()=>{
+  const changes=[v=>v.id='bad',v=>v.id=[PROVIDER],v=>v.provider_key='foreign',v=>v.mode='SITE_TOKEN',v=>v.status='DISABLED',
+    v=>v.readiness='NOT_SELECTED',v=>v.readiness='CONFIGURATION_UNAVAILABLE',v=>v.version=1,v=>v.version='0',v=>v.sender_ref='foreign',v=>v.template_key='foreign',
+    v=>v.issuer='https://foreign.test',v=>v.audiences=['foreign'],v=>v.allowed_algorithms=['RS256'],v=>v.jwks_source_type='REMOTE',v=>v.keys=[{kid:'foreign'}]];
+  for(const route of ['list','get'])for(const change of changes){
+    const f=fixture(),fetcher=f.dependencies.fetch;let stoppedAt;
+    f.dependencies.fetch=async(url,settings)=>{
+      const response=await fetcher(url,settings),path=new URL(url).pathname;
+      if(path!=='/api/v1/admin/sites/'+SITE+'/identity-providers'+(route==='get'?'/'+PROVIDER:''))return response;
+      assert.equal(settings.method,'GET');const value=await new Response(response.body).json();change(route==='list'?value[0]:value);
+      stoppedAt=f.events.filter(e=>e.type==='http').length;return f.response(200,value);
+    };
+    const p=await createOwnedSandboxProvisioner(f.options,f.dependencies);await rejects(p.provision(LIMIT()));
+    assert.equal(f.events.filter(e=>e.type==='http').length,stoppedAt);assert.equal(f.events.some(e=>e.type==='initialize'),false);
+    const intents=JSON.parse(f.files.get(DIR+'/provisioning.json').contents).intents;
+    assert.equal(intents.length,2);assert.equal(intents.at(-1).name,'site-and-email-provider');assert.equal(intents.at(-1).status,'ACKNOWLEDGED');
+  }
+  for(const kind of ['missing','duplicate','foreign-extra','object','null','foreign-get-id']){
+    const f=fixture(),fetcher=f.dependencies.fetch;let stoppedAt;
+    f.dependencies.fetch=async(url,settings)=>{
+      const response=await fetcher(url,settings),list=url.endsWith('/identity-providers'),get=url.endsWith('/identity-providers/'+PROVIDER);
+      if(!(kind==='foreign-get-id'?get:list))return response;
+      const value=kind==='missing'?[]:kind==='duplicate'?[f.provider(),f.provider()]:kind==='foreign-extra'?[f.provider(),{...f.provider(),id:uuid(999),provider_key:'foreign'}]:kind==='object'?{}:kind==='null'?null:{...f.provider(),id:uuid(999)};
+      stoppedAt=f.events.filter(e=>e.type==='http').length;return f.response(200,value);
+    };
+    const p=await createOwnedSandboxProvisioner(f.options,f.dependencies);await rejects(p.provision(LIMIT()));
+    assert.equal(f.events.filter(e=>e.type==='http').length,stoppedAt);assert.equal(f.events.some(e=>e.type==='initialize'),false);
+  }
+});
+
+test('lost compound response and compound durability failures retain original key and stop all later requests',async()=>{
+  for(const failure of ['response','dispatch-sync','ack-sync']){
+    const f=fixture(),fetcher=f.dependencies.fetch,open=f.dependencies.open;let sitePosts=0,requestsAtFailure;
+    f.dependencies.fetch=async(url,settings)=>{
+      const response=await fetcher(url,settings);
+      if(new URL(url).pathname==='/api/admin/v1/sites'&&settings.method==='POST'){
+        sitePosts++;requestsAtFailure=f.events.filter(e=>e.type==='http').length;
+        if(failure==='response')throw new Error('synthetic lost compound response');
+      }return response;
+    };
+    f.dependencies.open=async(path,...args)=>{
+      const handle=await open(path,...args);
+      if(path.endsWith('/.provisioning-'+(failure==='dispatch-sync'?4:5)+'.tmp')&&failure!=='response')
+        handle.sync=async()=>{requestsAtFailure=f.events.filter(e=>e.type==='http').length;throw new Error('synthetic compound sync refusal');};
+      return handle;
+    };
+    const p=await createOwnedSandboxProvisioner(f.options,f.dependencies);await rejects(p.provision(LIMIT()));
+    assert.equal(sitePosts,failure==='dispatch-sync'?0:1);assert.equal(f.events.filter(e=>e.type==='http').length,requestsAtFailure);
+    const ledger=JSON.parse(f.files.get(DIR+'/provisioning.json').contents),intent=ledger.intents.at(-1);
+    assert.equal(ledger.intents.length,failure==='dispatch-sync'?1:2);
+    if(failure!=='dispatch-sync')assert.deepEqual(intent,{name:'site-and-email-provider',key:'s5a-'+SUFFIX,status:'DISPATCHING'});
+    const before=f.events.length;await rejects(p.provision(LIMIT()));assert.equal(f.events.length,before);
+    assert.equal(f.files.has(DIR+'/provisioning.lock'),true);assert.equal(f.events.some(e=>e.type==='initialize'||e.type==='unlink'),false);
   }
 });
 
@@ -351,8 +455,6 @@ test('Account Site Product Price callback EMAIL_OTP and campaign response mismat
     ['/publish','POST',v=>v.id=uuid(999)],['/publish','POST',v=>v.provider_price_id=''],
     ['/callback','PUT',v=>v.site_id=uuid(999)],['/callback','PUT',v=>v.endpoint_url='http://127.0.0.1:18082/callback'],
     ['/callback','PUT',v=>v.secret_version=2],['/callback','PUT',v=>v.secret='A'.repeat(42)+'B'],
-    ['/identity-providers','POST',v=>v.mode='TOKEN'],['/identity-providers','POST',v=>v.status='DISABLED'],
-    ['/identity-providers','POST',v=>v.readiness='NOT_READY'],['/identity-providers','POST',v=>v.sender_ref='foreign'],
     ['/donation-campaigns','POST',v=>v.status='ACTIVE'],['/donation-campaigns','POST',v=>v.minimum_amount=100],
     ['/status','POST',v=>v.version=0],['/status','POST',v=>v.activated_once=false],['/status','POST',v=>v.site_id=uuid(999)],
   ];
@@ -433,7 +535,7 @@ test('debug options and missing either opt-in cannot access protected dependenci
 });
 
 test('I1 every external resource UUID must be a string before acknowledgement or subsequent requests',async()=>{
-  for(const suffix of ['/payment-accounts','/sites','/products','/prices','/identity-providers','/donation-campaigns']){
+  for(const suffix of ['/payment-accounts','/sites','/products','/prices','/donation-campaigns']){
     const f=fixture(),fetcher=f.dependencies.fetch;let responseRequests,malformedId;
     f.dependencies.fetch=async(url,settings)=>{
       const response=await fetcher(url,settings);

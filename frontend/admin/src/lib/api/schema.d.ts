@@ -2753,6 +2753,12 @@ export interface components {
             allowed_origins: string[];
             authentication_modes: ("SITE_TOKEN" | "OIDC_TOKEN" | "EMAIL_OTP")[];
             payment_method_policy: components["schemas"]["Policy"];
+            email_otp_provider?: components["schemas"]["EmailOtpProvider"];
+        };
+        EmailOtpProvider: {
+            provider_key: string;
+            sender_ref: string;
+            template_key: string;
         };
         Policy: {
             /** @enum {string} */
