@@ -395,6 +395,15 @@ also forces failure. Successful runs emit no diagnostic. These observations neit
 establish account/payment success nor authorize a retry, and do not diagnose historical
 failures. No new Sandbox execution is authorized by this instrumentation.
 
+Recognized card-driver failures may append the literal pair `browser_case` and
+`browser_step`, for example `sandbox_diagnostic phase=CARDS code=OPERATION_FAILED
+exit=none cleanup=unconfirmed browser_case=success browser_step=NAVIGATE`.
+Only `CARDS` (success/decline/sca) or `MISSED` (success) operation failures carry
+this pair. The first recognized step survives cleanup failures; deadlines and
+aborts retain their original classification. Legacy diagnostics keep their exact
+format. Browser exceptions remain opaque, failed journeys keep cleanup unconfirmed,
+and this observation supplies no financial proof or cause for a historical failure.
+
 The optional Sandbox overlay prepares backend configuration only. It does not establish a working Stripe backend until the Stage 5A adapter is implemented and verified. The default Compose file continues to use Fake without Stripe keys; the overlay also retains `PAYMENT_PROVIDER=fake` while enabling the separate Sandbox marker and `local` profile. Fake subscriptions continue to work; Stripe subscriptions require Stage 5B. This setup never enables live payments, Connect, Managed Payments, or business activation for real money.
 
 Create the separate private file from the project root:

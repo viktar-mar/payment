@@ -1,0 +1,54 @@
+import test,{after,mock} from 'node:test';
+import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import net from 'node:net';
+import filesystem from 'node:fs/promises';
+import {syncBuiltinESMExports} from 'node:module';
+import type {Browser} from '@playwright/test';
+import type {SandboxFixture,SandboxCase} from '../../../../infrastructure/smoke-stage-5a.mjs';
+// @ts-expect-error Native Node 25 type erasure requires the source extension.
+import {runSandboxCard} from './stripe-sandbox-fixtures.ts';
+
+const forbidden=()=>{throw new Error('synthetic_test_forbids_external_boundary');};
+for(const name of ['execFile','exec','spawn','fork','execSync','execFileSync','spawnSync'] as const)mock.method(childProcess,name,forbidden);
+for(const name of ['createServer','connect','createConnection'] as const)mock.method(net,name,forbidden);
+mock.method(globalThis,'fetch',forbidden);
+for(const name of ['open','readFile','lstat','realpath','readdir','mkdir','rename','unlink'] as const)mock.method(filesystem,name,forbidden);
+syncBuiltinESMExports();after(()=>{mock.restoreAll();syncBuiltinESMExports();});
+
+function cardBoundary(begin=true,postalVisible=true){
+  const events:unknown[][]=[],record={synthetic:'session'},identity={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:14173'},site:{key:'synthetic-site'},price:{key:'synthetic-price'}};
+  const add=(...args:unknown[])=>{events.push(args);};
+  const frame={locator:(selector:string)=>({fill:async(...args:unknown[])=>add('fill',selector,...args),isVisible:async()=>{add('visible',selector);return postalVisible;}})};
+  const widget={first(){add('first');return this;},getByRole:(...args:unknown[])=>({click:async(...options:unknown[])=>add('click',...args,...options)}),frameLocator:(...args:unknown[])=>{add('frame',...args);return frame;}};
+  const challenge={frameLocator:(...args:unknown[])=>{add('challenge-frame',...args);return {getByRole:(...role:unknown[])=>({click:async(...options:unknown[])=>add('complete',...role,...options)})};}};
+  const page={goto:async(...args:unknown[])=>add('goto',...args),locator:(...args:unknown[])=>{add('widget',...args);return widget;},frameLocator:(...args:unknown[])=>{add('challenge',...args);return challenge;}};
+  const context={addInitScript:async(body:unknown,argument:unknown)=>{assert.equal(typeof body,'function');add('install',argument);},newPage:async()=>{add('new-page');return page;},close:async()=>add('close')};
+  const browser={newContext:async(...args:unknown[])=>{add('new-context',...args);return context;}} as unknown as Browser;
+  const fixture={identity,beginBrowser:async(...args:unknown[])=>{add('begin',...args);return begin;},browserSession:async(...args:unknown[])=>{add('checkout',...args);return record;},markPay:async(...args:unknown[])=>add('mark',...args),confirm:async(...args:unknown[])=>add('confirm',...args)} as unknown as SandboxFixture;
+  return {browser,fixture,events,record};
+}
+const card=(number:string,postal=true)=>[
+  ['fill','input[name="number"]',number,{timeout:15000}],['fill','input[name="expiry"]','1230'],['fill','input[name="cvc"]','123'],
+  ['visible','input[name="postalCode"]'],...(postal?[['fill','input[name="postalCode"]','10001']]:[]),
+];
+// Break: diagnostic wrappers must not change selectors, arguments, retry ordering or the server confirmation boundary.
+for(const name of ['success','decline','sca'] as const)test(`real ${name} driver preserves original boundary calls and arguments`,async()=>{
+  const f=cardBoundary();await runSandboxCard(f.browser,f.fixture,name);
+  assert.deepEqual(f.events,[['begin',name],['new-context',{serviceWorkers:'block'}],['checkout',name],['install',{record:f.record,origin:'http://127.0.0.1:14173'}],['new-page'],
+    ['goto','http://127.0.0.1:14173/?api_base_url=http%3A%2F%2F127.0.0.1%3A18080&site_key=synthetic-site&price_key=synthetic-price&locale=en',{timeout:15000}],
+    ['widget','generic-payment-widget'],['first'],['click','button',{name:'Resume existing payment',exact:true},{timeout:15000}],['frame','iframe[title="Secure payment input frame"]'],
+    ...card(name==='decline'?'4000000000000002':name==='sca'?'4000002500003155':'4242424242424242'),['mark',name],['click','button',{name:'Pay',exact:true},{timeout:15000}],
+    ...(name==='decline'?[['mark','decline',true],...card('4242424242424242'),['click','button',{name:'Pay',exact:true},{timeout:15000}]]:[]),
+    ...(name==='sca'?[['challenge','iframe[name="stripe-challenge-frame"]'],['challenge-frame','iframe[name="acsFrame"]'],['complete','button',{name:'Complete',exact:true},{timeout:20000}]]:[]),
+    ['confirm',name],['close']]);
+});
+test('beginBrowser false performs no browser acquisition or payment operation for every case',async()=>{
+  for(const name of ['success','decline','sca'] as SandboxCase[]){const f=cardBoundary(false);await runSandboxCard(f.browser,f.fixture,name);assert.deepEqual(f.events,[['begin',name]]);}
+});
+test('invisible postal input is never filled before either original or retry Pay',async()=>{
+  const f=cardBoundary(true,false);await runSandboxCard(f.browser,f.fixture,'decline');
+  assert.equal(f.events.filter(event=>event[0]==='visible').length,2);
+  assert.equal(f.events.some(event=>event[0]==='fill'&&event[1]==='input[name="postalCode"]'),false);
+  assert.deepEqual(f.events.filter(event=>['mark','confirm','close'].includes(String(event[0]))),[['mark','decline'],['mark','decline',true],['confirm','decline'],['close']]);
+});

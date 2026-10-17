@@ -1,6 +1,7 @@
 import type {Browser,BrowserContext,Request,Response,Route,Page} from '@playwright/test';
 import type {SandboxAcceptanceExtras,SandboxDonationKind,SandboxDonationIdentity} from '../../../../infrastructure/stripe-sandbox-extras.mjs';
 import type {OwnedSandboxLimits,OwnedSandboxPublicBinding} from '../../../../infrastructure/stripe-sandbox-acceptance.mjs';
+import {rethrowSandboxBrowserFailure} from '../../../../infrastructure/stripe-sandbox-acceptance.mjs';
 // @ts-expect-error Native Node 25 test execution uses the existing source directly.
 import {enterPrivateText} from './private-entry.ts';
 
@@ -17,7 +18,7 @@ function timeout(limits:OwnedSandboxLimits,maximum=15000):number {
 /** Lifetime only: pass the actual Browser and fixture unchanged to the existing card driver. */
 export async function withOwnedCardContexts(browser:Browser,limits:OwnedSandboxLimits,journey:()=>Promise<void>):Promise<true> {
   const before=new Set(browser.contexts()),closing=new Map<BrowserContext,Promise<void>>();
-  let closingFailed=false;
+  let closingFailed=false,failed=false,primary:unknown;
   const closeCreated=()=>{
     try{for(const context of browser.contexts())if(!before.has(context)&&!closing.has(context)){
       const promise=Promise.resolve().then(()=>context.close());promise.catch(()=>{});closing.set(context,promise);
@@ -28,14 +29,16 @@ export async function withOwnedCardContexts(browser:Browser,limits:OwnedSandboxL
   try {
     limits.signal?.addEventListener('abort',abort,{once:true});timer=setTimeout(abort,timeout(limits,2700000));
     if(limits.signal?.aborted)abort();
-    await journey();timeout(limits);if(aborted||closingFailed)throw null;return true;
-  }catch{throw new Error('stripe_sandbox_MANUAL_CHECK_BROWSER');}
+    await journey();timeout(limits);if(aborted||closingFailed)throw null;
+  }catch(error){failed=true;primary=error;}
   finally {
     clearTimeout(timer);clearTimeout(stopScanning);clearInterval(interval);limits.signal?.removeEventListener('abort',abort);closeCreated();
     try{await bounded(async()=>{await Promise.all(closing.values());},{deadline:Date.now()+15000});}
-    catch{throw new Error('stripe_sandbox_MANUAL_CHECK_BROWSER');}
-    if(closingFailed)throw new Error('stripe_sandbox_MANUAL_CHECK_BROWSER');
+    catch(error){if(!failed){failed=true;primary=error;}}
+    if(closingFailed&&!failed){failed=true;primary=null;}
   }
+  if(failed)rethrowSandboxBrowserFailure(primary);
+  return true;
 }
 async function bounded<T>(body:()=>Promise<T>,limits:OwnedSandboxLimits,maximum=15000):Promise<T> {
   let timer:ReturnType<typeof setTimeout>|undefined,abort:()=>void=()=>{};

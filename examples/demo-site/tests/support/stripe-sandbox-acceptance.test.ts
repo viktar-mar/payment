@@ -6,6 +6,7 @@ import filesystem from 'node:fs/promises';
 import {syncBuiltinESMExports} from 'node:module';
 import type {Route,Request,Response,Page,Browser} from '@playwright/test';
 import type {SandboxAcceptanceExtras} from '../../../../infrastructure/stripe-sandbox-extras.mjs';
+import {runSandboxBrowserStep,rethrowSandboxBrowserFailure} from '../../../../infrastructure/stripe-sandbox-acceptance.mjs';
 // @ts-expect-error Native Node 25 type erasure requires the source extension.
 import {forwardDonationCreate,acknowledgeDonationResponse,runDonationOtp,withOwnedCardContexts,runOwnedSandboxDonations} from './stripe-sandbox-acceptance.ts';
 
@@ -20,6 +21,25 @@ const binding={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.
   price:{id:'00000000-0000-4000-8000-000000000004',key:'s5a-price',version:1}};
 const endpoint=binding.endpoints.backend+'/api/v1/public/sites/s5a-site/donation-campaigns/s5a-donate/checkouts';
 const limits=()=>({deadline:Date.now()+120000,signal:new AbortController().signal});
+// Break: a later owned context close rejection must not replace the first trusted card failure.
+test('card owner preserves trusted first failure while awaiting rejecting created-context cleanup',async()=>{
+  const contexts:unknown[]=[],events:string[]=[];
+  const browser={contexts:()=>contexts} as unknown as Browser;
+  let primary:unknown;
+  try{await runSandboxBrowserStep('success','RESUME',async()=>{throw null;});}catch(error){primary=error;}
+  await assert.rejects(withOwnedCardContexts(browser,limits(),async()=>{
+    contexts.push({close:async()=>{events.push('cleanup-start');await Promise.resolve();events.push('cleanup-end');throw new Error('private-cleanup');}});
+    events.push('journey-failed');rethrowSandboxBrowserFailure(primary);
+  }),error=>error===primary);
+  assert.deepEqual(events,['journey-failed','cleanup-start','cleanup-end']);
+});
+test('card owner keeps arbitrary hostile journey failures opaque through rejecting cleanup',async()=>{
+  let reads=0,closes=0;const contexts:unknown[]=[],hostile=new Proxy({},{get(){reads++;throw null;},ownKeys(){reads++;throw null;}});
+  await assert.rejects(withOwnedCardContexts({contexts:()=>contexts} as unknown as Browser,limits(),async()=>{
+    contexts.push({close:async()=>{closes++;throw hostile;}});throw hostile;
+  }),{message:'stripe_sandbox_MANUAL_CHECK_BROWSER'});
+  assert.equal(reads,0);assert.equal(closes,1);
+});
 function request(method='POST',body='{"amount_minor":500}',headers:Record<string,string>={origin:binding.endpoints.demo,'content-type':'application/json','idempotency-key':'sdk-original','x-original':'preserved'}) {
   return {url:()=>endpoint,method:()=>method,postData:()=>body,allHeaders:async()=>headers,redirectedFrom:()=>null} as unknown as Request;
 }

@@ -34,9 +34,9 @@ export default class StripeSandboxReporter implements Reporter {
         const diagnosticShape=typeof envelope==='object'&&envelope!==null&&['phase','code','exitCode','cleanupConfirmed'].some(key=>Object.hasOwn(envelope,key));
         if(diagnosticShape||(!authorization&&(typeof tag==='string'&&tag.startsWith('stripe_sandbox_diagnostic')||line.includes('stripe_sandbox_diagnostic')))){
           try{if(this.diagnostic)throw null;const formatted=formatSandboxDiagnostic(envelope);if(formatted===null)throw null;
-            // Validated fields are flat primitives with no colon in any allowed string.
-            // Five separators prove none of those five fields appeared twice on the wire.
-            if(line.match(/:/g)?.length!==5)throw null;
+            // Validated envelopes contain only flat primitives without colons. A
+            // separator per decoded key also rejects escaped duplicate JSON names.
+            if(line.match(/:/g)?.length!==Object.keys(envelope as object).length)throw null;
             this.diagnostic=true;this.failures++;process.stdout.write(formatted);
           }catch{this.rejectDiagnostic();return;}
           continue;

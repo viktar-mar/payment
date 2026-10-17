@@ -1,5 +1,9 @@
 import type {SandboxFixture} from './smoke-stage-5a.mjs';
 import type {SandboxAcceptanceExtras,SandboxExtrasOptions} from './stripe-sandbox-extras.mjs';
+export type SandboxBrowserCase='success'|'decline'|'sca';
+export type SandboxBrowserStep='BEGIN_BROWSER'|'NEW_CONTEXT'|'CHECKOUT_SESSION'|'INSTALL_SESSION'|'NEW_PAGE'|'NAVIGATE'|'RESUME'|'CARD_NUMBER'|'CARD_EXPIRY'|'CARD_CVC'|'POSTAL_CHECK'|'POSTAL_FILL'|'MARK_PAY'|'PAY'|'MARK_RETRY'|'RETRY_CARD_NUMBER'|'RETRY_CARD_EXPIRY'|'RETRY_CARD_CVC'|'RETRY_POSTAL_CHECK'|'RETRY_POSTAL_FILL'|'RETRY_PAY'|'SCA_COMPLETE'|'SERVER_CONFIRM'|'CLOSE_CONTEXT';
+export function runSandboxBrowserStep<T>(browserCase:SandboxBrowserCase,browserStep:SandboxBrowserStep,body:()=>Promise<T>):Promise<T>;
+export function rethrowSandboxBrowserFailure(error:unknown):never;
 export interface OwnedSandboxLimits {deadline:number;signal?:AbortSignal}
 export interface OwnedSandboxOptions {
   env:Record<string,string|undefined>;runId:string;expectedSource:string;daemon:string;

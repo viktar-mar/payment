@@ -19,6 +19,24 @@ const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value)
 const exact=(value,keys)=>object(value)&&Object.keys(value).sort().join(',')===[...keys].sort().join(',');
 function freeze(value){if(value&&typeof value==='object'){for(const child of Object.values(value))freeze(child);Object.freeze(value);}return value;}
 const snapshot=value=>freeze(JSON.parse(JSON.stringify(value)));
+const BROWSER_CASES=['success','decline','sca'];
+const BROWSER_STEPS=['BEGIN_BROWSER','NEW_CONTEXT','CHECKOUT_SESSION','INSTALL_SESSION','NEW_PAGE','NAVIGATE','RESUME','CARD_NUMBER','CARD_EXPIRY','CARD_CVC','POSTAL_CHECK','POSTAL_FILL','MARK_PAY','PAY','MARK_RETRY','RETRY_CARD_NUMBER','RETRY_CARD_EXPIRY','RETRY_CARD_CVC','RETRY_POSTAL_CHECK','RETRY_POSTAL_FILL','RETRY_PAY','SCA_COMPLETE','SERVER_CONFIRM','CLOSE_CONTEXT'];
+const browserFailures=new WeakMap();
+const browserPair=(phase,code,exitCode,browserCase,browserStep)=>code==='OPERATION_FAILED'&&exitCode===null
+  &&(phase==='CARDS'||phase==='MISSED'&&browserCase==='success')&&BROWSER_CASES.includes(browserCase)&&BROWSER_STEPS.includes(browserStep);
+
+/** Only private identity carries browser provenance; foreign rejections are never inspected. */
+export async function runSandboxBrowserStep(browserCase,browserStep,body) {
+  if(!BROWSER_CASES.includes(browserCase)||!BROWSER_STEPS.includes(browserStep))rethrowSandboxBrowserFailure(null);
+  try{return await body();}catch(error){
+    if(browserFailures.has(error))throw error;
+    const token=Object.freeze(Object.create(null));browserFailures.set(token,{browserCase,browserStep});throw token;
+  }
+}
+export function rethrowSandboxBrowserFailure(error) {
+  if(browserFailures.has(error))throw error;
+  throw new Error('stripe_sandbox_MANUAL_CHECK_BROWSER');
+}
 
 /** Pure public human handoff. No inferred device pathname or executable next_step. */
 export function formatSandboxAuthorization(value) {
@@ -43,15 +61,17 @@ export function formatSandboxDiagnostic(value) {
   try {
     if(!object(value))return null;
     const keys=['tag','phase','code','exitCode','cleanupConfirmed'];
+    if(Reflect.ownKeys(value).length===7)keys.push('browserCase','browserStep');
     if(Reflect.ownKeys(value).length!==keys.length)return null;
     const descriptors=Object.getOwnPropertyDescriptors(value);
     if(keys.some(key=>!Object.hasOwn(descriptors,key)||!Object.hasOwn(descriptors[key],'value')))return null;
-    const {tag,phase,code,exitCode,cleanupConfirmed}=Object.fromEntries(keys.map(key=>[key,descriptors[key].value]));
+    const {tag,phase,code,exitCode,cleanupConfirmed,browserCase,browserStep}=Object.fromEntries(keys.map(key=>[key,descriptors[key].value]));
     if(tag!=='stripe_sandbox_diagnostic'||!['PREPARE','LOGIN','LOGIN_COMPLETE','BINDING','LISTENER','START','PROVISION','READY','CARDS','REFUNDS','DONATIONS','MISSED','CONFIRMED','CLEANUP'].includes(phase)
       ||!['OPERATION_FAILED','PROCESS_EXIT_NONZERO','PROCESS_SIGNALLED','PROCESS_FAILED','ABORTED','DEADLINE_REACHED'].includes(code)
       ||typeof cleanupConfirmed!=='boolean')return null;
     if(code==='PROCESS_EXIT_NONZERO'? !Number.isInteger(exitCode)||exitCode<1||exitCode>255 : exitCode!==null)return null;
-    return `sandbox_diagnostic phase=${phase} code=${code} exit=${exitCode===null?'none':exitCode} cleanup=${cleanupConfirmed?'confirmed':'unconfirmed'}\n`;
+    if(keys.length===7&&!browserPair(phase,code,exitCode,browserCase,browserStep))return null;
+    return `sandbox_diagnostic phase=${phase} code=${code} exit=${exitCode===null?'none':exitCode} cleanup=${cleanupConfirmed?'confirmed':'unconfirmed'}${keys.length===7?` browser_case=${browserCase} browser_step=${browserStep}`:''}\n`;
   }catch{return null;}
 }
 
@@ -104,7 +124,11 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
     if(ctx.signal.aborted)return observedFailure('ABORTED');return null;
   }
   function check(ctx){const error=contextFailure(ctx);if(error)throw error;}
-  const evidence=(error,ctx)=>diagnostics.get(error)??diagnostics.get(ctx?contextFailure(ctx):null)??{code:'OPERATION_FAILED',exitCode:null};
+  const evidence=(error,ctx)=>{
+    const observation=diagnostics.get(error)??diagnostics.get(ctx?contextFailure(ctx):null)??{code:'OPERATION_FAILED',exitCode:null};
+    const pair=browserFailures.get(error);
+    return pair&&browserPair(phase,observation.code,observation.exitCode,pair.browserCase,pair.browserStep)?{...observation,...pair}:observation;
+  };
   function recordFailure(error,ctx=setup){if(failure===null){failure=phase;failureDiagnostic=evidence(error,ctx);}}
   function emitDiagnostic(){
     if(diagnosticEmitted)return;diagnosticEmitted=true;
@@ -128,7 +152,7 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
       const abort=()=>rejectWait(contextFailure(ctx));ctx.signal.addEventListener('abort',abort,{once:true});
       Promise.resolve().then(()=>{check(ctx);return body();}).then(value=>{
         ctx.signal.removeEventListener('abort',abort);try{check(ctx);resolveWait(value);}catch(error){rejectWait(error);}
-      },error=>{ctx.signal.removeEventListener('abort',abort);rejectWait(diagnostics.has(error)?error:contextFailure(ctx));});
+      },error=>{ctx.signal.removeEventListener('abort',abort);rejectWait(diagnostics.has(error)?error:contextFailure(ctx)??(browserFailures.has(error)?error:null));});
       if(ctx.signal.aborted)abort();
     });
   }

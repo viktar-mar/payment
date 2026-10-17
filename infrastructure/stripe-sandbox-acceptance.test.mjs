@@ -78,6 +78,25 @@ async function quietOpen(f,opts=options()) {
 }
 const diagnostics=wire=>wire.map(line=>JSON.parse(line)).filter(value=>value.tag==='stripe_sandbox_diagnostic');
 const expectedDiagnostic=(phase,code='OPERATION_FAILED',exitCode=null,cleanupConfirmed=true)=>({tag:'stripe_sandbox_diagnostic',phase,code,exitCode,cleanupConfirmed});
+// Break: erasing a real browser failure in either catch layer loses the only safe substep.
+test('real card navigation failure survives driver owner parent and split reporter transport',async()=>{
+  const {runSandboxCard}=await import('../examples/demo-site/tests/support/stripe-sandbox-fixtures.ts');
+  const {withOwnedCardContexts}=await import('../examples/demo-site/tests/support/stripe-sandbox-acceptance.ts');
+  const f=fixture(),events=[],contexts=[];
+  const context={addInitScript:async()=>events.push('install'),newPage:async()=>({goto:async()=>{events.push('navigate');throw new Error('private-navigation');}}),
+    close:async()=>{events.push('close-context');contexts.splice(0);}};
+  const browser={contexts:()=>contexts,newContext:async()=>{contexts.push(context);return context;}};
+  const cardFixture={beginBrowser:async()=>true,browserSession:async()=>({}),identity:{endpoints:{demo:'http://127.0.0.1:14173',backend:'http://127.0.0.1:18080'},site:{key:'synthetic'},price:{key:'synthetic'}},
+    markPay:forbidden,confirm:forbidden,close:async()=>{events.push('close-fixture');}};
+  f.deps.openStripeSandboxFixture=async()=>cardFixture;
+  f.journeys.cards=async actual=>withOwnedCardContexts(browser,limits(),()=>runSandboxCard(browser,actual,'success'));
+  const owned=await quietOpen(f);
+  await assert.rejects(owned.run(f.journeys,limits()),{message:'stripe_sandbox_acceptance_CARDS_PENDING_CLEANUP_UNCONFIRMED'});
+  const result=await reportFrames(f.output.flatMap(frame=>[frame.slice(0,17),Buffer.from(frame.slice(17))]));
+  assert.ok(result.lines.includes('sandbox_diagnostic phase=CARDS code=OPERATION_FAILED exit=none cleanup=unconfirmed browser_case=success browser_step=NAVIGATE\n'));
+  assert.deepEqual(events,['install','navigate','close-context','close-fixture']);
+  assert.equal(f.events.includes('refunds'),false);assert.equal(result.lines.join('').includes('private-'),false);
+});
 async function reportFrames(frames,owned=true,exercisePrivateChannels=false){
   const {default:Reporter}=await import('../examples/demo-site/tests/support/stripe-sandbox-reporter.ts');
   const old=process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN;
@@ -93,6 +112,136 @@ async function reportFrames(frames,owned=true,exercisePrivateChannels=false){
     return {lines,result:await reporter.onEnd({status:'passed'})};
   }finally{write.mock.restore();if(old===undefined)delete process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN;else process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN=old;}
 }
+
+const browserSteps=['BEGIN_BROWSER','NEW_CONTEXT','CHECKOUT_SESSION','INSTALL_SESSION','NEW_PAGE','NAVIGATE','RESUME','CARD_NUMBER','CARD_EXPIRY','CARD_CVC','POSTAL_CHECK','POSTAL_FILL','MARK_PAY','PAY','MARK_RETRY','RETRY_CARD_NUMBER','RETRY_CARD_EXPIRY','RETRY_CARD_CVC','RETRY_POSTAL_CHECK','RETRY_POSTAL_FILL','RETRY_PAY','SCA_COMPLETE','SERVER_CONFIRM','CLOSE_CONTEXT'];
+function syntheticCard(failAt,closeFails=false){
+  const events=[],contexts=[];let retry=false;
+  const operation=async(step,args)=>{events.push({step,args});if(step===failAt||step==='CLOSE_CONTEXT'&&closeFails)throw new Proxy({},{get(){throw new Error('private-must-not-read');}});};
+  const frame={locator:selector=>({fill:async(...args)=>operation((retry?'RETRY_':'')+({'input[name="number"]':'CARD_NUMBER','input[name="expiry"]':'CARD_EXPIRY','input[name="cvc"]':'CARD_CVC','input[name="postalCode"]':'POSTAL_FILL'})[selector],args),
+    isVisible:async()=>{await operation((retry?'RETRY_':'')+'POSTAL_CHECK',[]);return true;}})};
+  const widget={first(){return this;},frameLocator:()=>frame,getByRole:(_role,options)=>({click:async(...args)=>operation(options.name==='Pay'?(retry?'RETRY_PAY':'PAY'):'RESUME',args)})};
+  const challenge={frameLocator(){return this;},getByRole:()=>({click:async(...args)=>operation('SCA_COMPLETE',args)})};
+  const page={goto:async(...args)=>operation('NAVIGATE',args),locator:()=>widget,frameLocator:()=>challenge};
+  const context={addInitScript:async(...args)=>operation('INSTALL_SESSION',args),newPage:async()=>{await operation('NEW_PAGE',[]);return page;},close:async()=>{try{await operation('CLOSE_CONTEXT',[]);}finally{contexts.splice(0);}}};
+  const browser={contexts:()=>contexts,newContext:async(...args)=>{await operation('NEW_CONTEXT',args);contexts.push(context);return context;}};
+  const fixture={identity:{endpoints:{demo:'http://127.0.0.1:14173',backend:'http://127.0.0.1:18080'},site:{key:'synthetic-site'},price:{key:'synthetic-price'}},
+    beginBrowser:async(...args)=>{await operation('BEGIN_BROWSER',args);return true;},browserSession:async(...args)=>{await operation('CHECKOUT_SESSION',args);return {synthetic:'session'};},
+    markPay:async(...args)=>{if(args[1])retry=true;await operation(retry?'MARK_RETRY':'MARK_PAY',args);},confirm:async(...args)=>operation('SERVER_CONFIRM',args),close:async()=>events.push({step:'FIXTURE_CLOSE',args:[]})};
+  return {browser,fixture,events};
+}
+// Break: a missing/mislabelled boundary, reordered write or overwritten primary failure changes emitted evidence.
+test('every real browser boundary emits its exact case step and stops later authority',async()=>{
+  const {runSandboxCard}=await import('../examples/demo-site/tests/support/stripe-sandbox-fixtures.ts');
+  const {withOwnedCardContexts}=await import('../examples/demo-site/tests/support/stripe-sandbox-acceptance.ts');
+  for(const step of browserSteps){
+    const name=step.includes('RETRY')?'decline':step==='SCA_COMPLETE'?'sca':'success';
+    const f=fixture(),card=syntheticCard(step);f.deps.openStripeSandboxFixture=async()=>card.fixture;
+    f.journeys.cards=async actual=>withOwnedCardContexts(card.browser,limits(),()=>runSandboxCard(card.browser,actual,name));
+    const owned=await quietOpen(f);
+    await assert.rejects(owned.run(f.journeys,limits()),{message:'stripe_sandbox_acceptance_CARDS_PENDING_CLEANUP_UNCONFIRMED'});
+    assert.deepEqual(diagnostics(f.output),[{...expectedDiagnostic('CARDS','OPERATION_FAILED',null,false),browserCase:name,browserStep:step}],step);
+    const steps=card.events.map(event=>event.step),failure=steps.indexOf(step);
+    assert.ok(failure>=0);assert.ok(steps.slice(failure+1).every(value=>['CLOSE_CONTEXT','FIXTURE_CLOSE'].includes(value)),step);
+    if(!['BEGIN_BROWSER','NEW_CONTEXT'].includes(step))assert.equal(steps.filter(value=>value==='CLOSE_CONTEXT').length,1);
+    assert.equal(steps.at(-1),'FIXTURE_CLOSE');assert.equal(f.events.includes('refunds'),false);
+    const result=await reportFrames(f.output);assert.deepEqual(result.result,{status:'failed'});
+    assert.ok(result.lines.includes(`sandbox_diagnostic phase=CARDS code=OPERATION_FAILED exit=none cleanup=unconfirmed browser_case=${name} browser_step=${step}\n`));
+  }
+});
+test('real primary browser failure survives rejecting context cleanup and fixture cleanup',async()=>{
+  const {runSandboxCard}=await import('../examples/demo-site/tests/support/stripe-sandbox-fixtures.ts');
+  const {withOwnedCardContexts}=await import('../examples/demo-site/tests/support/stripe-sandbox-acceptance.ts');
+  const f=fixture(),card=syntheticCard('CARD_NUMBER',true);card.fixture.close=async()=>{throw null;};
+  f.deps.openStripeSandboxFixture=async()=>card.fixture;f.journeys.cards=async actual=>withOwnedCardContexts(card.browser,limits(),()=>runSandboxCard(card.browser,actual,'success'));
+  const owned=await quietOpen(f);await assert.rejects(owned.run(f.journeys,limits()));
+  assert.deepEqual(diagnostics(f.output),[{...expectedDiagnostic('CARDS','OPERATION_FAILED',null,false),browserCase:'success',browserStep:'CARD_NUMBER'}]);
+  assert.ok(f.events.includes('stop-services'));assert.equal(owned.resources().accepted,false);
+});
+test('shared browser provenance rejects hostile or invalid input without property reads and keeps nested first token',async()=>{
+  const {runSandboxBrowserStep,rethrowSandboxBrowserFailure}=await import('./stripe-sandbox-acceptance.mjs');
+  let reads=0,calls=0;const hostile=new Proxy({},{get(){reads++;throw null;},ownKeys(){reads++;throw null;}});
+  for(const value of [hostile,null,undefined,1,'private-sentinel',{browserCase:'success',browserStep:'NAVIGATE'},new Error('private-sentinel')])
+    assert.throws(()=>rethrowSandboxBrowserFailure(value),{message:'stripe_sandbox_MANUAL_CHECK_BROWSER'});
+  for(const [name,step] of [['other','NAVIGATE'],['success','other'],[hostile,'NAVIGATE'],['success',hostile]])
+    await assert.rejects(runSandboxBrowserStep(name,step,async()=>{calls++;}));
+  assert.equal(calls,0);assert.equal(reads,0);
+  assert.equal(await runSandboxBrowserStep('success','NAVIGATE',async()=>{calls++;return 17;}),17);assert.equal(calls,1);
+  let token;try{await runSandboxBrowserStep('success','CARD_NUMBER',async()=>{throw hostile;});}catch(error){token=error;}
+  assert.throws(()=>rethrowSandboxBrowserFailure(token),error=>error===token);
+  await assert.rejects(runSandboxBrowserStep('decline','PAY',async()=>{throw token;}),error=>error===token);assert.equal(reads,0);
+});
+test('MISSED only preserves success browser evidence and deadlines or aborts retain precedence',async()=>{
+  const {runSandboxCard}=await import('../examples/demo-site/tests/support/stripe-sandbox-fixtures.ts');
+  const {withOwnedCardContexts}=await import('../examples/demo-site/tests/support/stripe-sandbox-acceptance.ts');
+  for(const name of ['success','decline','sca']){
+    const f=fixture(),card=syntheticCard('RESUME');f.extras.missedFixture=async()=>card.fixture;
+    f.journeys.missed=async actual=>withOwnedCardContexts(card.browser,limits(),()=>runSandboxCard(card.browser,actual,name));
+    const owned=await quietOpen(f);await assert.rejects(owned.run(f.journeys,limits()));
+    assert.deepEqual(diagnostics(f.output),[{...expectedDiagnostic('MISSED','OPERATION_FAILED',null,false),...(name==='success'?{browserCase:'success',browserStep:'RESUME'}:{})}]);
+    assert.equal(owned.resources().accepted,false);
+    const result=await reportFrames(f.output);assert.deepEqual(result.result,{status:'failed'});
+  }
+  for(const boundary of ['deadline','abort']){
+    const f=fixture(),card=syntheticCard('NAVIGATE'),controller=new AbortController();let now=Date.now();f.deps.now=()=>now;
+    const original=card.fixture.browserSession;
+    card.fixture.browserSession=async(...args)=>{if(boundary==='deadline')now=f.setup.deadline;else controller.abort();return original(...args);};
+    f.deps.openStripeSandboxFixture=async()=>card.fixture;
+    f.journeys.cards=async actual=>withOwnedCardContexts(card.browser,limits(),()=>runSandboxCard(card.browser,actual,'success'));
+    const owned=await quietOpen(f);await assert.rejects(owned.run(f.journeys,{deadline:f.setup.deadline,signal:controller.signal}));
+    assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('CARDS',boundary==='deadline'?'DEADLINE_REACHED':'ABORTED',null,false)]);
+    assert.ok(card.events.some(event=>event.step==='CLOSE_CONTEXT'));assert.equal(f.events.includes('refunds'),false);
+  }
+});
+test('browser evidence cannot label unrelated parent phases',async()=>{
+  const {runSandboxBrowserStep}=await import('./stripe-sandbox-acceptance.mjs');
+  const f=fixture();f.journeys.donations=async()=>runSandboxBrowserStep('success','NAVIGATE',async()=>{throw null;});
+  const owned=await quietOpen(f);await assert.rejects(owned.run(f.journeys,limits()));
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('DONATIONS','OPERATION_FAILED',null,false)]);
+});
+test('extended formatter and reporter accept only the bounded paired browser contract',async()=>{
+  const base={...expectedDiagnostic('CARDS','OPERATION_FAILED',null,false),browserCase:'success',browserStep:'NAVIGATE'};
+  for(const name of ['success','decline','sca'])for(const step of browserSteps){
+    assert.equal(formatSandboxDiagnostic({...base,browserCase:name,browserStep:step}),`sandbox_diagnostic phase=CARDS code=OPERATION_FAILED exit=none cleanup=unconfirmed browser_case=${name} browser_step=${step}\n`);
+  }
+  let reads=0;
+  const invalid=[
+    {...expectedDiagnostic('CARDS'),browserCase:'success'},{...expectedDiagnostic('CARDS'),browserStep:'NAVIGATE'},
+    {...base,browserCase:'unknown'},{...base,browserStep:'unknown'},{...base,browserCase:'success\nprivate-sentinel'},
+    {...base,browserStep:'NAVIGATE\u0000private-sentinel'},{...base,browserCase:1},{...base,browserStep:true},
+    {...base,phase:'LOGIN'},{...base,phase:'MISSED',browserCase:'decline'},{...base,phase:'MISSED',browserCase:'sca'},
+    ...['ABORTED','DEADLINE_REACHED','PROCESS_FAILED','PROCESS_SIGNALLED','PROCESS_EXIT_NONZERO'].map(code=>({...base,code,exitCode:code==='PROCESS_EXIT_NONZERO'?1:null})),
+    {...base,exitCode:1},{...base,private:'private-sentinel'},
+  ];
+  for(const value of invalid){
+    assert.equal(formatSandboxDiagnostic(value),null);
+    const result=await reportFrames([JSON.stringify(value)+'\n']);
+    assert.deepEqual(result.result,{status:'failed'});assert.ok(result.lines.includes('sandbox_diagnostic_failed_manual_check\n'));
+    assert.equal(result.lines.join('').includes('private-'),false);
+  }
+  for(const key of ['browserCase','browserStep'])assert.equal(formatSandboxDiagnostic(Object.defineProperty({...base},key,{get(){reads++;throw null;}})),null);
+  assert.equal(formatSandboxDiagnostic({...base,browserCase:new String('success')}),null);
+  assert.equal(formatSandboxDiagnostic({...base,browserStep:new String('NAVIGATE')}),null);
+  assert.equal(formatSandboxDiagnostic({...base,[Symbol('private')]:true}),null);assert.equal(reads,0);
+  const wire=JSON.stringify(base),auth=JSON.stringify(authorization)+'\n';
+  for(const [plain,escaped,value] of [['browserCase','browser\\u0043ase','success'],['browserStep','browser\\u0053tep','NAVIGATE'],['tag','t\\u0061g','stripe_sandbox_diagnostic'],['phase','ph\\u0061se','CARDS']]){
+    for(const key of [plain,escaped]){
+      const result=await reportFrames([auth,wire.slice(0,-1)+`,"${key}":"${value}"}\n`]);
+      assert.deepEqual(result.result,{status:'failed'});assert.ok(result.lines.includes('sandbox_diagnostic_failed_manual_check\n'));
+      assert.equal(result.lines.some(line=>line.startsWith('sandbox_diagnostic phase=')),false);
+      assert.ok(result.lines.includes(formatSandboxAuthorization(authorization)));
+    }
+  }
+  for(const malformed of [wire,wire.slice(0,-1)+',"private":"private-sentinel'+'x'.repeat(4096)+'"}\n']){
+    const result=await reportFrames([malformed.slice(0,13),Buffer.from(malformed.slice(13))]);
+    assert.deepEqual(result.result,{status:'failed'});assert.ok(result.lines.includes('sandbox_diagnostic_failed_manual_check\n'));assert.equal(result.lines.join('').includes('private-'),false);
+  }
+  for(const frames of [[wire+'\n',auth],[auth,wire.slice(0,23),Buffer.from(wire.slice(23)+'\n')]]){
+    const result=await reportFrames(frames);assert.deepEqual(result.result,{status:'failed'});
+    assert.ok(result.lines.includes(formatSandboxAuthorization(authorization)));
+    assert.equal(result.lines.filter(line=>line.startsWith('sandbox_diagnostic phase=')).length,1);
+  }
+  const suppressed=await reportFrames([wire+'\n',auth],false);assert.deepEqual(suppressed.lines,['sandbox_result_passed cases=0 failures=0\n']);
+});
 
 // Break: trusting callback data instead of actual close/state invents unsafe process diagnoses.
 test('owned process diagnostics classify close evidence and opaque callback or spawn failures',async()=>{
