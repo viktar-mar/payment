@@ -4,7 +4,7 @@ import childProcess from 'node:child_process';
 import net from 'node:net';
 import filesystem from 'node:fs/promises';
 import {syncBuiltinESMExports} from 'node:module';
-import {EventEmitter} from 'node:events';
+import {EventEmitter,getEventListeners} from 'node:events';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {openOwnedSandboxAcceptance,formatSandboxAuthorization,formatSandboxDiagnostic} from './stripe-sandbox-acceptance.mjs';
@@ -47,7 +47,7 @@ function fixture() {
   function descriptor(complete=false) {
     return frozen({file:'/usr/bin/sandbox-exec',args:['-p','(version 1)(allow default)(deny process-exec (literal "/usr/bin/security"))','/opt/homebrew/bin/stripe',
       '--config',topology.cliDirectory+'/config/stripe/config.toml','--project-name','default','--color','off','--log-level','error','login',...(complete?['--complete-device']:[])],
-      options:{cwd:ROOT,env:{PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C',HOME:topology.cliDirectory+'/home',XDG_CONFIG_HOME:topology.cliDirectory+'/config',NO_COLOR:'1'},shell:false,stdio:['pipe','pipe','pipe'],timeout:180000,maxBuffer:65536}});
+      options:{cwd:ROOT,env:{PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C',HOME:topology.cliDirectory+'/home',XDG_CONFIG_HOME:topology.cliDirectory+'/config',NO_COLOR:'1'},shell:false,stdio:['pipe','pipe','pipe'],timeout:complete?600000:180000,maxBuffer:65536}});
   }
   let capturedCliOptions;
   const cli={loginInvocation:async context=>{events.push('login-descriptor');return descriptor();},completeLoginInvocation:async context=>{events.push('complete-descriptor');return descriptor(true);},
@@ -78,6 +78,148 @@ async function quietOpen(f,opts=options()) {
 }
 const diagnostics=wire=>wire.map(line=>JSON.parse(line)).filter(value=>value.tag==='stripe_sandbox_diagnostic');
 const expectedDiagnostic=(phase,code='OPERATION_FAILED',exitCode=null,cleanupConfirmed=true)=>({tag:'stripe_sandbox_diagnostic',phase,code,exitCode,cleanupConfirmed});
+// External work is replaced at the raw process/time boundaries, keeping the real owner.
+function timedFixture(budget=1200000) {
+  const f=fixture(),alarms=new Map(),processes=[];let now=Date.now(),id=0,setupSignal;
+  f.setup.deadline=now+budget;
+  const prepare=f.bootstrap.prepare;
+  f.bootstrap.prepare=async ctx=>{setupSignal=ctx.signal;return prepare(ctx);};
+  f.deps.now=()=>now;
+  f.deps.setTimeout=(callback,delay)=>{const key=++id;alarms.set(key,{at:now+delay,callback});return key;};
+  f.deps.clearTimeout=key=>alarms.delete(key);
+  f.deps.execFile=(file,args,opts,callback)=>{
+    const child=new EventEmitter(),record={child,opts,callback};processes.push(record);
+    if(processes.length===1)queueMicrotask(()=>{callback(null,json(),'');child.emit('close',0);});
+    return child;
+  };
+  return {...f,processes,alarms,get setupSignal(){return setupSignal;},
+    advance(ms){const end=now+ms;for(;;){const due=[...alarms].filter(([,a])=>a.at<=end).sort((a,b)=>a[1].at-b[1].at||a[0]-b[0])[0];if(!due)break;
+      alarms.delete(due[0]);now=due[1].at;due[1].callback();}now=end;},
+    jump(ms){now+=ms;},now:()=>now};
+}
+const turn=()=>new Promise(resolve=>setImmediate(resolve));
+// Break: the old three-minute completion cap refuses a still-pending authorized CLI.
+test('completion can succeed after three minutes within its ten-minute cap',async()=>{
+  const f=timedFixture(),opening=quietOpen(f);opening.catch(()=>{});await turn();
+  assert.equal(f.processes.length,2);assert.equal(f.processes[0].opts.timeout,0);assert.equal(f.processes[1].opts.timeout,0);
+  f.advance(180001);await turn();assert.equal(f.processes[1].opts.signal.aborted,false);
+  f.processes[1].callback(null,'','');f.processes[1].child.emit('close',0);
+  const owned=await opening;assert.equal(await owned.close({deadline:f.now()+120000}),true);
+  assert.equal(f.alarms.size,0);assert.equal(getEventListeners(f.setupSignal,'abort').length,0);
+  for(const p of f.processes){assert.equal(p.child.listenerCount('close'),0);assert.equal(p.child.listenerCount('error'),0);}
+});
+test('only exact phase-specific login descriptor caps are admitted',async()=>{
+  for(const [complete,cap] of [[false,600000],[false,179999],[true,180000],[true,600001]]){
+    const f=fixture(),bad=structuredClone(f.descriptor(complete));bad.options.timeout=cap;
+    f.cli[complete?'completeLoginInvocation':'loginInvocation']=async()=>frozen(bad);
+    await assert.rejects(quietOpen(f),{message:`stripe_sandbox_acceptance_${complete?'LOGIN_COMPLETE':'LOGIN'}_PENDING`});
+    assert.equal(f.commands.length,complete?1:0);assert.equal(f.events.includes('listen'),false);
+  }
+});
+// Break: native timeout/error shape or elapsed time cannot establish executor provenance.
+for(const phase of ['LOGIN','LOGIN_COMPLETE'])test(`executor-owned ${phase} cap proves timeout only after callback and close`,async()=>{
+  const f=timedFixture(),controller=new AbortController();f.setup.signal=controller.signal;
+  if(phase==='LOGIN')f.deps.execFile=(file,args,opts,callback)=>{const child=new EventEmitter();f.processes.push({child,opts,callback});return child;};
+  let settled=false;const opening=quietOpen(f).finally(()=>{settled=true;});opening.catch(()=>{});await turn();
+  const p=f.processes.at(-1);f.advance(phase==='LOGIN'?180000:600000);await turn();
+  assert.equal(p.opts.signal.aborted,true);assert.equal(controller.signal.aborted,false);assert.equal(settled,false);
+  p.callback({code:'ETIMEDOUT',killed:true},'private-stdout','private-stderr');await turn();
+  assert.equal(settled,false);assert.equal(f.events.includes('stop-services'),false);
+  p.child.emit('close',null,'SIGTERM');await assert.rejects(opening,{message:`stripe_sandbox_acceptance_${phase}_PENDING`});
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic(phase,'PROCESS_TIMEOUT')]);
+  assert.equal(f.alarms.size,0);assert.equal(getEventListeners(controller.signal,'abort').length,0);assert.equal(getEventListeners(f.setupSignal,'abort').length,0);
+  assert.equal(p.child.listenerCount('close'),0);assert.equal(p.child.listenerCount('error'),0);
+  const wire=f.output.join('');p.callback(null,'private-late','private-late');p.child.emit('close',0);f.advance(2000000);await turn();assert.equal(f.output.join(''),wire);
+  const reported=await reportFrames(f.output.flatMap(frame=>[frame.slice(0,19),Buffer.from(frame.slice(19))]),true,true);
+  assert.ok(reported.lines.includes(`sandbox_diagnostic phase=${phase} code=PROCESS_TIMEOUT exit=none cleanup=confirmed\n`));
+  assert.equal(reported.lines.join('').includes('private-'),false);
+});
+for(const budget of [90000,600000])test(`completion local wait clips to original remaining ${budget}ms deadline`,async()=>{
+  const f=timedFixture(budget),opening=quietOpen(f);opening.catch(()=>{});await turn();
+  const p=f.processes.at(-1);assert.equal(f.processes.length,2);
+  f.advance(budget);assert.equal(p.opts.signal.aborted,true);
+  p.callback(null,'','');p.child.emit('close',null,'SIGTERM');await assert.rejects(opening,{message:'stripe_sandbox_acceptance_LOGIN_COMPLETE_PENDING'});
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN_COMPLETE','DEADLINE_REACHED')]);assert.equal(f.alarms.size,0);
+});
+test('original abort wins a coincident local cap and acknowledgement never starts later phases',async()=>{
+  const f=timedFixture(),controller=new AbortController();f.setup.signal=controller.signal;
+  const opening=quietOpen(f);opening.catch(()=>{});await turn();const p=f.processes.at(-1);
+  f.jump(600000);controller.abort();f.advance(0);p.child.emit('close',null,'SIGTERM');p.callback({timedOut:true},'private-out','private-err');
+  await assert.rejects(opening,{message:'stripe_sandbox_acceptance_LOGIN_COMPLETE_PENDING'});
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN_COMPLETE','ABORTED')]);assert.equal(f.events.includes('listen'),false);assert.equal(f.alarms.size,0);
+});
+for(const boundary of ['deadline','abort'])test(`original ${boundary} during local-timeout acknowledgement grace retains precedence`,async()=>{
+  const f=timedFixture(boundary==='deadline'?605000:1200000),controller=new AbortController();f.setup.signal=controller.signal;
+  const opening=quietOpen(f);opening.catch(()=>{});await turn();const p=f.processes.at(-1);
+  f.advance(600000);assert.equal(p.opts.signal.aborted,true);
+  if(boundary==='deadline')f.advance(5000);else controller.abort();
+  p.callback(null,'','');p.child.emit('close',13);await assert.rejects(opening,{message:'stripe_sandbox_acceptance_LOGIN_COMPLETE_PENDING'});
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN_COMPLETE',boundary==='deadline'?'DEADLINE_REACHED':'ABORTED')]);assert.equal(f.alarms.size,0);
+});
+test('time consumed by initial login reduces the original remaining completion wait',async()=>{
+  const f=timedFixture(90000),execute=f.deps.execFile;
+  f.deps.execFile=(file,args,opts,callback)=>{const child=execute(file,args,opts,callback);if(args.at(-1)==='login')f.jump(30000);return child;};
+  const opening=quietOpen(f);opening.catch(()=>{});await turn();const p=f.processes.at(-1);
+  f.advance(59999);assert.equal(p.opts.signal.aborted,false);f.advance(1);assert.equal(p.opts.signal.aborted,true);
+  p.callback(null,'','');p.child.emit('close',null,'SIGTERM');await assert.rejects(opening,{message:'stripe_sandbox_acceptance_LOGIN_COMPLETE_PENDING'});
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN_COMPLETE','DEADLINE_REACHED')]);assert.equal(f.alarms.size,0);
+});
+test('synchronous opaque spawn failure disposes cap timers and original abort listeners',async()=>{
+  const f=timedFixture(),controller=new AbortController();f.setup.signal=controller.signal;let reads=0;
+  f.deps.execFile=()=>{throw new Proxy({},{get(){reads++;throw null;}});};
+  await assert.rejects(quietOpen(f),{message:'stripe_sandbox_acceptance_LOGIN_PENDING'});
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN','PROCESS_FAILED')]);assert.equal(reads,0);assert.equal(f.alarms.size,0);
+  assert.equal(getEventListeners(controller.signal,'abort').length,0);assert.equal(getEventListeners(f.setupSignal,'abort').length,0);
+});
+test('foreign timeout-shaped callback and elapsed-clock guesses stay opaque',async()=>{
+  for(const late of [false,true]){
+    const f=timedFixture(),opening=quietOpen(f);opening.catch(()=>{});await turn();const p=f.processes.at(-1);let reads=0;
+    const foreign=new Proxy({code:'ETIMEDOUT',timedOut:true,killed:true},{get(){reads++;throw null;}});
+    if(late)f.jump(600001);
+    p.callback(foreign,'private-out','private-err');p.child.emit('close',0);
+    await assert.rejects(opening,{message:'stripe_sandbox_acceptance_LOGIN_COMPLETE_PENDING'});
+    assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN_COMPLETE','PROCESS_FAILED')]);assert.equal(reads,0);assert.equal(f.alarms.size,0);
+  }
+});
+for(const proof of ['callback','close','error','timeout'])test(`missing process acknowledgement after ${proof} is bounded and cleanup remains unconfirmed`,async()=>{
+  const f=timedFixture(),opening=quietOpen(f);opening.catch(()=>{});await turn();const p=f.processes.at(-1);
+  let abortError;
+  p.opts.signal.addEventListener('abort',()=>{try{p.child.emit('error',new Error('private-abort-event'));}catch(error){abortError=error;}},{once:true});
+  if(proof==='callback')p.callback(null,'','');
+  if(proof==='close')p.child.emit('close',0);
+  if(proof==='error')p.child.emit('error',new Proxy({},{get(){throw null;}}));
+  if(proof==='timeout')f.advance(600000);
+  f.advance(10000);await assert.rejects(opening,{message:'stripe_sandbox_acceptance_LOGIN_COMPLETE_PENDING_CLEANUP_UNCONFIRMED'});
+  assert.equal(p.opts.signal.aborted,true);assert.equal(f.events.includes('listen'),false);
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN_COMPLETE',proof==='timeout'?'PROCESS_TIMEOUT':'PROCESS_FAILED',null,false)]);
+  assert.equal(f.alarms.size,0);assert.equal(getEventListeners(f.setupSignal,'abort').length,0);
+  assert.equal(abortError,undefined);
+  if(proof!=='close')assert.doesNotThrow(()=>p.child.emit('error',new Error('private-late-error')));
+  const wire=f.output.join('');p.callback(null,'','');p.child.emit('close',0);f.advance(2000000);await turn();assert.equal(f.output.join(''),wire);
+  assert.equal(p.child.listenerCount('close'),0);assert.equal(p.child.listenerCount('error'),0);
+});
+test('close before callback retains ownership and clears its acknowledgement grace on success',async()=>{
+  const f=timedFixture(),opening=quietOpen(f);opening.catch(()=>{});await turn();const p=f.processes.at(-1);
+  p.child.emit('close',0);await turn();assert.equal(f.events.includes('listen'),false);
+  f.advance(9999);p.callback(null,'','');const owned=await opening;assert.equal(await owned.close({deadline:f.now()+120000}),true);assert.equal(f.alarms.size,0);
+});
+test('actual close before the local cap prevents timeout relabeling while callback is missing',async()=>{
+  const f=timedFixture(),opening=quietOpen(f);opening.catch(()=>{});await turn();const p=f.processes.at(-1);
+  f.advance(599999);p.child.emit('close',null,'SIGTERM');f.advance(10000);
+  await assert.rejects(opening,{message:'stripe_sandbox_acceptance_LOGIN_COMPLETE_PENDING_CLEANUP_UNCONFIRMED'});
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('LOGIN_COMPLETE','PROCESS_SIGNALLED',null,false)]);assert.equal(f.alarms.size,0);
+});
+test('timeout formatter permits only the flat null-exit envelope and reporter refuses forgeries',async()=>{
+  const base=expectedDiagnostic('LOGIN_COMPLETE','PROCESS_TIMEOUT');
+  assert.equal(formatSandboxDiagnostic(base),'sandbox_diagnostic phase=LOGIN_COMPLETE code=PROCESS_TIMEOUT exit=none cleanup=confirmed\n');
+  let reads=0;const getter={...base};Object.defineProperty(getter,'exitCode',{get(){reads++;throw null;}});
+  for(const bad of [{...base,exitCode:1},{...base,browserCase:'success',browserStep:'NAVIGATE'},{...base,stdout:'private-out'},{...base,error:'private-error'},getter])assert.equal(formatSandboxDiagnostic(bad),null);
+  assert.equal(reads,0);
+  for(const bad of [{...base,exitCode:1},{...base,browserCase:'success',browserStep:'NAVIGATE'},{...base,stderr:'private-err'}]){
+    const result=await reportFrames([JSON.stringify(bad)+'\n'],true,true);
+    assert.deepEqual(result.result,{status:'failed'});assert.ok(result.lines.includes('sandbox_diagnostic_failed_manual_check\n'));assert.equal(result.lines.join('').includes('private-'),false);
+  }
+});
 // Break: erasing a real browser failure in either catch layer loses the only safe substep.
 test('real card navigation failure survives driver owner parent and split reporter transport',async()=>{
   const {runSandboxCard}=await import('../examples/demo-site/tests/support/stripe-sandbox-fixtures.ts');

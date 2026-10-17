@@ -369,7 +369,17 @@ from `examples/demo-site`. Do not enable DEBUG, NODE_DEBUG or PWDEBUG.
 
 One safe terminal handoff displays the genuine Stripe authorization URL and code for
 human completion; the parent executes only the fixed isolated CLI descriptors. The
-original 45-minute budget includes build, human authorization, setup and all journeys;
+initial `login` descriptor allows up to three minutes locally; `login --complete-device`
+allows up to ten minutes. Both waits are clipped to the original remaining setup
+deadline. The longer completion wait does not extend Stripe's authorization-code
+lifetime or approve another attempt after failure or expiry. The executor owns the
+per-child timer and abort controller; the competing native process timeout is disabled.
+It requires both the process callback and actual child close before confirming completion.
+Missing acknowledgement is bounded by a ten-second grace and leaves cleanup unconfirmed;
+late callbacks or closes cannot restore that proof. Timers and parent abort listeners
+are disposed on settlement. An unclosed uncertain child retains only its owned error
+drain and close handler until actual close, then removes both.
+The original 45-minute budget includes build, human authorization, setup and all journeys;
 later stages cannot renew it. Up to two further minutes allow cleanup only. The sequence
 is three original card journeys, their existing EUR 7.00 + 13.00 refunds, anonymous and
 EMAIL_OTP EUR 5.00 donations, then the original fourth EUR 20.00 missed-webhook journey.
@@ -387,6 +397,11 @@ code, a proven child exit code (1–255) or `none`, and `cleanup=confirmed|uncon
 Unknown dependency failures remain `OPERATION_FAILED`; callback/spawn failures remain
 `PROCESS_FAILED` unless actual close arguments or the owned abort/deadline prove more.
 A termination signal alone is `PROCESS_SIGNALLED`, never evidence of a timeout.
+`PROCESS_TIMEOUT` is emitted only when the executor's own per-child timer fires while
+the child is still open. It has exit `none` and no browser fields. Original deadline
+expiry or abort takes precedence over this local timeout. Foreign error fields and
+elapsed-clock guesses cannot establish timeout provenance; existing proven nonzero
+close diagnostics retain their established behavior outside the local-timeout path.
 Raw errors, process output, arguments, paths, browser URLs and private fields are excluded
 from diagnostics. The separate public authorization handoff still appears immediately.
 Malformed, duplicate, oversized or unfinished diagnostics produce the fixed

@@ -276,8 +276,14 @@ test('Sandbox reporter emits failure status but never errors, iframe URLs, stdou
   const {default:Reporter}=await import('../examples/demo-site/tests/support/stripe-sandbox-reporter.ts');
   const reporter=new Reporter(),lines=[],original=process.stdout.write;
   const secret='https://js.stripe.com/frame?client_secret=private-fixture-marker';
-  process.stdout.write=function(value){lines.push(String(value));return true;};
+  process.stdout.write=function(...args){
+    if(typeof args[0]!=='string')return original.apply(this,args);
+    lines.push(args[0]);return true;
+  };
   try {
+    // A zero-byte binary write exercises protocol forwarding without adding protocol data.
+    let binaryCallback=false;process.stdout.write(Buffer.alloc(0),()=>{binaryCallback=true;});
+    await new Promise(resolve=>setImmediate(resolve));assert.equal(binaryCallback,true);
     reporter.onStdOut?.(secret);reporter.onStdErr?.(secret);reporter.onError?.({message:secret});
     reporter.onTestEnd?.({title:secret},{status:'failed',errors:[{message:secret}],attachments:[{body:Buffer.from(secret)}]});
     reporter.onEnd?.({status:'failed'});

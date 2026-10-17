@@ -33,11 +33,11 @@ type Bootstrap=SandboxExtrasOptions['bootstrap'] & {
   prepare(limits:OwnedSandboxLimits):Promise<true>;start(limits:OwnedSandboxLimits):Promise<true>;stop(limits:OwnedSandboxLimits):Promise<true>;
   verifyForwardTarget():Promise<true>;persistWebhookSecret(secret:string):Promise<true>;
 };
-interface LoginDescriptor {readonly file:string;readonly args:readonly string[];readonly options:Readonly<{
-  cwd:string;env:Readonly<Record<string,string>>;shell:false;stdio:readonly ['pipe','pipe','pipe'];timeout:180000;maxBuffer:65536;
+interface LoginDescriptor<Cap extends 180000|600000> {readonly file:string;readonly args:readonly string[];readonly options:Readonly<{
+  cwd:string;env:Readonly<Record<string,string>>;shell:false;stdio:readonly ['pipe','pipe','pipe'];timeout:Cap;maxBuffer:65536;
 }>}
 type Cli=SandboxExtrasOptions['cli'] & {startListener(limits:OwnedSandboxLimits):Promise<true>;
-  loginInvocation(limits:OwnedSandboxLimits):Promise<LoginDescriptor>;completeLoginInvocation(limits:OwnedSandboxLimits):Promise<LoginDescriptor>};
+  loginInvocation(limits:OwnedSandboxLimits):Promise<LoginDescriptor<180000>>;completeLoginInvocation(limits:OwnedSandboxLimits):Promise<LoginDescriptor<600000>>};
 type Provisioner=SandboxExtrasOptions['provisioner'] & {provision(limits:OwnedSandboxLimits):Promise<true>;
   withCatalogEnvironment(callback:(env:Readonly<Record<string,string>>)=>true):true};
 type Binding=Readonly<{externalAccountId:'acct_1UPiMpELswAd8tpR';apiVersion:'2026-09-30.endive'}>;

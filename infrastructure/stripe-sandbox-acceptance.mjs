@@ -67,7 +67,7 @@ export function formatSandboxDiagnostic(value) {
     if(keys.some(key=>!Object.hasOwn(descriptors,key)||!Object.hasOwn(descriptors[key],'value')))return null;
     const {tag,phase,code,exitCode,cleanupConfirmed,browserCase,browserStep}=Object.fromEntries(keys.map(key=>[key,descriptors[key].value]));
     if(tag!=='stripe_sandbox_diagnostic'||!['PREPARE','LOGIN','LOGIN_COMPLETE','BINDING','LISTENER','START','PROVISION','READY','CARDS','REFUNDS','DONATIONS','MISSED','CONFIRMED','CLEANUP'].includes(phase)
-      ||!['OPERATION_FAILED','PROCESS_EXIT_NONZERO','PROCESS_SIGNALLED','PROCESS_FAILED','ABORTED','DEADLINE_REACHED'].includes(code)
+      ||!['OPERATION_FAILED','PROCESS_EXIT_NONZERO','PROCESS_SIGNALLED','PROCESS_FAILED','PROCESS_TIMEOUT','ABORTED','DEADLINE_REACHED'].includes(code)
       ||typeof cleanupConfirmed!=='boolean')return null;
     if(code==='PROCESS_EXIT_NONZERO'? !Number.isInteger(exitCode)||exitCode<1||exitCode>255 : exitCode!==null)return null;
     if(keys.length===7&&!browserPair(phase,code,exitCode,browserCase,browserStep))return null;
@@ -173,7 +173,7 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
     if(!exact(value,['file','args','options'])||!Object.isFrozen(value)||!Object.isFrozen(value.args)||!Object.isFrozen(value.options)||!Object.isFrozen(value.options.env)
       ||value.file!=='/usr/bin/sandbox-exec'||JSON.stringify(value.args)!==JSON.stringify(expectedArgs)
       ||!exact(value.options,['cwd','env','shell','stdio','timeout','maxBuffer'])||value.options.cwd!==ROOT||value.options.shell!==false
-      ||JSON.stringify(value.options.stdio)!==JSON.stringify(['pipe','pipe','pipe'])||value.options.timeout!==180000||value.options.maxBuffer!==65536
+      ||JSON.stringify(value.options.stdio)!==JSON.stringify(['pipe','pipe','pipe'])||value.options.timeout!==(complete?600000:180000)||value.options.maxBuffer!==65536
       ||!exact(value.options.env,Object.keys(expectedEnv))||Object.entries(expectedEnv).some(([key,v])=>value.options.env[key]!==v))fail();
     return value;
   }
@@ -181,22 +181,49 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
     check(ctx);
     // Unlike an abort race, callback completion alone never means the process has exited.
     const result=await new Promise((resolveExecution,rejectExecution)=>{
-      let callbackDone=false,closedProcess=false,failed=false,stdout='',stderr='',grace,closeCode,closeSignal;
-      const processFailure=()=>Number.isInteger(closeCode)&&closeCode>=1&&closeCode<=255
+      let callbackDone=false,closedProcess=false,failed=false,settled=false,localTimeout=false,stdout='',stderr='',grace,cap,child,closeCode,closeSignal;
+      const controller=new AbortController();
+      const processFailure=()=>localTimeout?contextFailure(ctx)??observedFailure('PROCESS_TIMEOUT')
+        :Number.isInteger(closeCode)&&closeCode>=1&&closeCode<=255
         ?observedFailure('PROCESS_EXIT_NONZERO',closeCode)
         :contextFailure(ctx)??observedFailure(typeof closeSignal==='string'&&closeSignal!==''?'PROCESS_SIGNALLED':'PROCESS_FAILED');
-      const finish=()=>{if(callbackDone&&closedProcess){io.clearTimeout(grace);ctx.signal.removeEventListener('abort',onAbort);
-        if(failed)rejectExecution(processFailure());else resolveExecution({stdout,stderr});}};
-      const onAbort=()=>{failed=true;grace=io.setTimeout(()=>{processUncertain=true;rejectExecution(processFailure());},10000);};
+      const disposeChild=()=>{child?.removeListener('close',onClose);child?.removeListener('error',onError);};
+      const settle=(error,abandon=false)=>{
+        if(settled)return;settled=true;io.clearTimeout(cap);io.clearTimeout(grace);ctx.signal.removeEventListener('abort',onAbort);
+        // Abort can synchronously emit error. Drain an unclosed child until its eventual close.
+        if(abandon)controller.abort();
+        if(!abandon||closedProcess)disposeChild();
+        if(error)rejectExecution(error);else resolveExecution({stdout,stderr});
+      };
+      const awaitProof=()=>{
+        if(grace!==undefined||settled)return;
+        grace=io.setTimeout(()=>{
+          // A callback, error or close alone never proves complete process ownership.
+          processUncertain=true;settle(processFailure(),true);
+        },10000);
+      };
+      const finish=()=>{if(callbackDone&&closedProcess)settle(failed?processFailure():null);else awaitProof();};
+      const onAbort=()=>{if(settled)return;failed=true;io.clearTimeout(cap);awaitProof();controller.abort();};
+      const onClose=(code,signal)=>{
+        closedProcess=true;if(settled){disposeChild();return;}
+        io.clearTimeout(cap);closeCode=code;closeSignal=signal;failed=failed||code!==0||(typeof signal==='string'&&signal!=='');finish();
+      };
+      const onError=()=>{if(!settled){failed=true;awaitProof();}};
       ctx.signal.addEventListener('abort',onAbort,{once:true});
       try {
-        const child=io.execFile(value.file,value.args,{...value.options,signal:ctx.signal,timeout:Math.max(1,Math.min(180000,ctx.deadline-io.now()))},(error,out,err)=>{
+        // Own the cap and abort provenance; execFile's opaque native timer is disabled.
+        cap=io.setTimeout(()=>{
+          if(settled)return;
+          if(contextFailure(ctx)){onAbort();return;}
+          localTimeout=true;failed=true;awaitProof();controller.abort();
+        },Math.max(1,Math.min(value.options.timeout,ctx.deadline-io.now())));
+        child=io.execFile(value.file,value.args,{...value.options,signal:controller.signal,timeout:0},(error,out,err)=>{
+          if(settled)return;
           failed=failed||(error!==null&&error!==undefined);stdout=out;stderr=err;callbackDone=true;finish();
         });
-        child.once('close',(code,signal)=>{closedProcess=true;closeCode=code;closeSignal=signal;failed=failed||code!==0||(typeof signal==='string'&&signal!=='');finish();});
-        child.once('error',()=>{failed=true;});
+        child.once('close',onClose);child.on('error',onError);
         if(ctx.signal.aborted)onAbort();
-      }catch{ctx.signal.removeEventListener('abort',onAbort);rejectExecution(processFailure());}
+      }catch{settle(processFailure());}
     });
     check(ctx);
     if(typeof result.stdout!=='string'||typeof result.stderr!=='string'||Buffer.byteLength(result.stdout)+Buffer.byteLength(result.stderr)>65536)fail();
