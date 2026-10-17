@@ -49,6 +49,7 @@ const mounts=service=>({postgres:[{Type:'volume',Name:PROJECT+'-postgres',Source
   'issuer-installer':[{Type:'bind',Source:DIR+'/issuer.jwks.json',Destination:'/input/issuer.json',RW:false},{Type:'volume',Name:PROJECT+'-issuer',Source:'/var/lib/docker/volumes/issuer/_data',Destination:'/issuer',RW:true}],
   'issuer-probe':[{Type:'volume',Name:PROJECT+'-issuer',Source:'/var/lib/docker/volumes/issuer/_data',Destination:'/issuer',RW:false}],
 }[service]??[]);
+const stoppedCompose=event=>event.type==='process'&&event.args[4]==='compose'&&(event.args.includes('up')||event.args.includes('create'));
 
 function fixture(overrides={}) {
   const events=[],files=new Map(),containers=new Map(),volumes=new Map(),images=new Map(),timers=new Map();
@@ -102,9 +103,16 @@ function fixture(overrides={}) {
       const a=args.slice(4),[verb,sub]=a;
       let stdout='';
       if(verb==='compose') {
-        const create=a.indexOf('create');
+        const action=a.findIndex(value=>['create','up'].includes(value));
+        if(action!==-1) {
+          const envFile=a[a.indexOf('--env-file')+1];
+          assert.ok([DIR+'/app.env',DIR+'/final.env'].includes(envFile),'stopped Compose environment must be selected explicitly');
+          const services=envFile===DIR+'/app.env'?['postgres','mailpit','backend','demo-site','callback-receiver']:['backend'];
+          assert.deepEqual(a.slice(action),['up','--no-start','--no-deps','--no-build','--pull','never',...services],
+            'stopped Compose contract requires supported up, no start, no dependencies, no build, no pull and exact services');
+          for(const service of services)container(service);
+        }
         if(a.includes('build')) {images.set('backend',image(1));images.set('demo-site',image(2));}
-        if(create!==-1)for(const service of a.slice(create+1).filter(value=>SERVICES.includes(value)))container(service);
         if(a.includes('config'))stdout=JSON.stringify({services:Object.fromEntries(SERVICES.map(service=>[service,{
           image:service==='backend'?PROJECT+'-backend:latest':service==='demo-site'?PROJECT+'-demo-site:latest':service==='postgres'?'postgres:18-alpine':service==='mailpit'?'axllent/mailpit:v1.27':'node:24-alpine',
           container_name:PROJECT+'-'+service,labels:labels('container'),networks:{default:null},environment:service==='backend'?{PAYMENT_STRIPE_SANDBOX_ENABLED:'false'}:{},
@@ -189,7 +197,7 @@ test('buildOnly is inert until invoked and ends after one synthetic build and tw
   const commands=f.events.filter(e=>e.type==='process'),builds=commands.filter(e=>e.args.includes('build'));
   assert.equal(builds.length,1);assert.deepEqual(builds[0].args.slice(-4),['build','--quiet','backend','demo-site']);
   assert.deepEqual(commands.filter(e=>e.args[4]==='image'&&e.args[5]==='inspect').map(e=>e.args.at(-1)),[PROJECT+'-backend:latest',PROJECT+'-demo-site:latest']);
-  assert.equal(commands.length,9);assert.equal(commands.some(e=>['pull','create','start','stop','rm'].includes(e.args[4])||e.args.includes('create')),false);
+  assert.equal(commands.length,9);assert.equal(commands.some(e=>['pull','create','start','stop','rm'].includes(e.args[4])||e.args.includes('create')||stoppedCompose(e)),false);
   assert.equal(f.events.some(e=>e.type==='crypto'||e.type==='random'||e.type==='health'||e.path===USERFILE||e.type==='unlink'),false);
   assert.equal(f.files.has(DIR+'/issuer.jwks.json'),false);assert.equal(f.files.has(DIR+'/app.env'),false);assert.equal(f.files.has(DIR+'/cli'),false);
   assert.equal(f.adapter.resources().status,'BUILD_ONLY_COMPLETE');assert.equal(f.adapter.resources().webhookReady,false);
@@ -310,7 +318,7 @@ test('helper CapAdd aliases retain exact capability and CapDrop gates before hel
     f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.prepare(LIMIT()),'PREPARE_PENDING');
     const helper=[...f.containers.values()].find(value=>value.Name.endsWith('-'+service));assert.ok(helper,name);
     assert.equal(f.events.some(event=>event.type==='process'&&event.args[4]==='container'&&event.args[5]==='start'&&event.args.at(-1)===helper.Id),false,name);
-    assert.equal(f.events.some(event=>event.type==='process'&&event.args[4]==='compose'&&event.args.includes('create')),false,name);
+    assert.equal(f.events.some(stoppedCompose),false,name);
     assert.equal(f.events.some(event=>event.type==='health'||event.path===USERFILE),false,name);assert.equal(f.adapter.resources().webhookReady,false,name);
     const before=f.events.length;let admin=false;
     await rejects(f.adapter.start(LIMIT()),'START_PENDING');await rejects(f.adapter.verifyForwardTarget(),'FORWARD_PENDING');
@@ -544,9 +552,17 @@ test('prepare builds without credentials and records UID-safe issuer proof befor
     assert.deepEqual(Object.keys(event.settings.env).sort(),['BUILDX_CONFIG','DOCKER_CONFIG','LANG','LC_ALL','PATH']);
     assert.equal(event.settings.env.DOCKER_CONFIG,'/private/var/empty');assert.equal(event.settings.env.BUILDX_CONFIG,DIR+'/buildx');assert.ok(event.settings.timeout<=1200000);
   }
-  const createCalls=f.events.filter(e=>e.type==='process'&&e.args.includes('compose')&&e.args.includes('create'));
-  assert.equal(createCalls.length,1);assert.deepEqual(createCalls[0].args.slice(-5),SERVICES);
-  for(const service of SERVICES)assert.equal(metadata.containers[service].status,'created');
+  const createCalls=f.events.filter(stoppedCompose);
+  assert.equal(createCalls.length,1);assert.deepEqual(createCalls[0].args.slice(createCalls[0].args.indexOf('up')),
+    ['up','--no-start','--no-deps','--no-build','--pull','never','postgres','mailpit','backend','demo-site','callback-receiver']);
+  for(const service of SERVICES) {
+    const proof=metadata.containers[service],actual=f.containers.get(proof.id);
+    assert.equal(proof.status,'created');assert.equal(actual.State.Running,false);assert.equal(actual.State.StartedAt,'0001-01-01T00:00:00Z');
+    assert.deepEqual(actual.Networks,{[PROJECT+'-network']:{NetworkID:metadata.network.Id}});assert.deepEqual(actual.Mounts,mounts(service));
+    assert.deepEqual(actual.PortBindings,mapping(service));assert.deepEqual(actual.Labels,cLabels(service));
+  }
+  assert.equal(f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='start').length,2);
+  assert.equal(f.events.some(e=>e.type==='health'||e.path===USERFILE),false);
   const installer=f.events.find(e=>e.type==='process'&&e.args.includes('create')&&e.args.includes(PROJECT+'-issuer-installer'));
   assert.ok(installer.args.includes('--read-only'));assert.ok(installer.args.includes('CHOWN'));assert.ok(installer.args.includes('DAC_OVERRIDE'));
   assert.ok(installer.args.at(-1).includes('chown 10001:10001'));assert.ok(installer.args.at(-1).includes('chmod 0600'));
@@ -555,6 +571,11 @@ test('prepare builds without credentials and records UID-safe issuer proof befor
   assert.equal(f.files.get(DIR+'/issuer.jwks.json').mode&0o777,0o600);
   for(const path of [DIR,DIR+'/cli',DIR+'/cli/home',DIR+'/cli/config',DIR+'/cli/config/stripe'])assert.equal(f.files.get(path).mode&0o777,0o700);
   const ledger=JSON.parse(f.files.get(DIR+'/runtime.json').contents);assert.equal(ledger.webhookReady,false);assert.ok(!JSON.stringify(ledger).includes('sk_test_'));
+  const creation=f.events.indexOf(createCalls[0]);
+  assert.ok(f.events.slice(0,creation).some(e=>e.type==='process'&&e.args[5]==='wait'&&e.args.at(-1)===metadata.containers['issuer-probe'].id));
+  assert.equal(ledger.intents.find(i=>i.action==='CREATE_STOPPED').status,'ACKNOWLEDGED');
+  let invoked=false;await rejects(f.adapter.withAdminCredentials(()=>{invoked=true;return true;}),'ADMIN_PENDING');assert.equal(invoked,false);
+  await rejects(f.adapter.verify(LIMIT()),'VERIFY_PENDING');assert.equal(f.events.some(e=>e.type==='health'||e.path===USERFILE),false);
 });
 
 test('stopped forwarding admission proves planned ownership and a free port without granting admin or readiness',async()=>{
@@ -593,13 +614,17 @@ test('equal webhook secret leaves user inode and bytes unchanged while saving fi
 });
 
 test('start retires only the never-started backend, records its replacement, then starts exact IDs in dependency order',async()=>{
-  const f=await prepared(),old=f.adapter.resources().containers.backend.id;
+  const f=await prepared(),before=f.adapter.resources(),old=before.containers.backend.id;
   assert.equal(await f.adapter.persistWebhookSecret(SECRET),true);assert.equal(await f.adapter.start(LIMIT()),true);
   const metadata=f.adapter.resources(),fresh=metadata.containers.backend.id;assert.notEqual(fresh,old);assert.equal(metadata.retiredBackend.id,old);assert.ok(!f.containers.has(old));
   assert.deepEqual(f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='start').slice(-5).map(e=>e.args.at(-1)),SERVICES.map(s=>metadata.containers[s].id));
-  const creates=f.events.filter(e=>e.type==='process'&&e.args.includes('compose')&&e.args.includes('create'));assert.equal(creates.length,2);
-  assert.deepEqual(creates[1].args.slice(-1),['backend']);assert.equal(creates[1].args.at(creates[1].args.indexOf('-f',creates[1].args.indexOf('-f')+2)+1),DIR+'/owned.yaml');
+  const creates=f.events.filter(stoppedCompose);assert.equal(creates.length,2);
+  assert.deepEqual(creates[1].args.slice(creates[1].args.indexOf('up')),['up','--no-start','--no-deps','--no-build','--pull','never','backend']);
+  assert.equal(creates[1].args.at(creates[1].args.indexOf('-f',creates[1].args.indexOf('-f')+2)+1),DIR+'/owned.yaml');
   assert.ok(creates[1].args.includes(ROOT+'/infrastructure/compose.stripe-sandbox.yaml'));assert.ok(creates[1].args.includes(DIR+'/final.env'));
+  for(const [service,container] of Object.entries(before.containers))if(service!=='backend')assert.equal(metadata.containers[service].id,container.id);
+  assert.equal(f.containers.size,7);assert.deepEqual([...f.containers.keys()].sort(),Object.values(metadata.containers).map(c=>c.id).sort());
+  assert.deepEqual(metadata.images,before.images);assert.deepEqual(metadata.network,before.network);assert.deepEqual(metadata.volumes,before.volumes);
   assert.equal(await f.adapter.verify(LIMIT()),true);assert.equal(await f.adapter.verifyForwardTarget(),true);
   let credentials;assert.equal(await f.adapter.withAdminCredentials(value=>{credentials=value;return true;}),true);
   assert.deepEqual(Object.keys(credentials).sort(),['password','username']);assert.ok(Object.isFrozen(credentials));
@@ -668,7 +693,7 @@ test('issuer probe failure prevents service creation and every user Stripe file 
   const f=fixture(),execute=f.dependencies.execute;
   f.dependencies.execute=async(...args)=>{const result=await execute(...args);if(args[1][5]==='wait'&&[...f.containers.values()].find(c=>c.Id===args[1].at(-1))?.Name.endsWith('issuer-probe'))result.stdout='1\n';return result;};
   f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await rejects(f.adapter.prepare(LIMIT()),'PREPARE_PENDING');
-  assert.equal(f.events.filter(e=>e.type==='process'&&e.args[4]==='compose'&&e.args.includes('create')).length,0);
+  assert.equal(f.events.filter(stoppedCompose).length,0);
   await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.events.filter(e=>e.path===USERFILE).length,0);
 });
 
@@ -751,7 +776,7 @@ test('synthetic merged Compose proof verifies exact override mounts and all six 
   assert.ok(config);assert.ok(config.args.includes(DIR+'/build.env'));assert.ok(!config.args.includes(DIR+'/app.env'));
   const g=fixture(),execute=g.dependencies.execute;
   g.dependencies.execute=async(...args)=>{const result=await execute(...args);if(args[1][4]==='compose'&&args[1].includes('config')){const body=JSON.parse(result.stdout);body.services.backend.volumes.push({type:'bind',source:'/foreign',target:'/app/local-fixtures/customer-issuer-private.jwks.json',read_only:true});result.stdout=JSON.stringify(body);}return result;};
-  g.adapter=await createOwnedSandboxBootstrap(g.options,g.dependencies);await rejects(g.adapter.prepare(LIMIT()),'PREPARE_PENDING');assert.equal(g.events.filter(e=>e.type==='process'&&e.args.includes('compose')&&e.args.includes('create')).length,0);
+  g.adapter=await createOwnedSandboxBootstrap(g.options,g.dependencies);await rejects(g.adapter.prepare(LIMIT()),'PREPARE_PENDING');assert.equal(g.events.filter(stoppedCompose).length,0);
 });
 
 test('changed private directory or hardlinked ledger is refused before private replacement',async()=>{
@@ -790,21 +815,59 @@ test('generated local credentials are distinct Base64 inputs and issuer algorith
   assert.deepEqual(f.events.filter(e=>e.type==='crypto').map(e=>[e.kind,e.options]),[['rsa',{modulusLength:2048}],['ec',{namedCurve:'prime256v1'}]]);
 });
 
-test('replacement identity is durably recorded before its first start and uncertain create never retries',async()=>{
+test('replacement proof and durable identity precede the first exact-ID application start',async()=>{
   const f=fixture(),execute=f.dependencies.execute;let checked=false;
   f.dependencies.execute=async(...args)=>{
     if(args[1][4]==='container'&&args[1][5]==='start') {
       const ledger=JSON.parse(f.files.get(DIR+'/runtime.json').contents),backend=ledger.containers.backend;
-      if(backend&&args[1].at(-1)===backend.id) {assert.ok(ledger.retiredBackend);assert.notEqual(backend.id,ledger.retiredBackend.id);assert.ok(ledger.intents.some(i=>i.action==='CREATE_FINAL_BACKEND'&&i.status==='ACKNOWLEDGED'));checked=true;}
+      if(ledger.retiredBackend&&!checked) {
+        assert.equal(args[1].at(-1),ledger.containers.postgres.id);assert.notEqual(backend.id,ledger.retiredBackend.id);
+        assert.ok(ledger.intents.some(i=>i.action==='CREATE_FINAL_BACKEND'&&i.status==='ACKNOWLEDGED'));
+        const replacement=f.events.findLastIndex(stoppedCompose),after=f.events.slice(replacement+1);
+        for(const service of ['postgres','mailpit','backend','demo-site','callback-receiver']) {
+          assert.ok(after.some(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='inspect'&&e.args.at(-1)===ledger.containers[service].id));
+          assert.equal(f.containers.get(ledger.containers[service].id).State.Running,false);
+        }
+        const rename=after.findLastIndex(e=>e.type==='rename'&&e.to===DIR+'/runtime.json');assert.ok(rename>=0);
+        assert.ok(after.slice(rename+1).some(e=>e.type==='sync'&&e.path===DIR));checked=true;
+      }
     }
     return execute(...args);
   };
   f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);await f.adapter.prepare(LIMIT());await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(LIMIT());assert.equal(checked,true);
-  const g=fixture(),other=g.dependencies.execute;
-  g.dependencies.execute=async(...args)=>{const value=await other(...args);if(args[1].includes('create')&&args[1].includes(ROOT+'/infrastructure/compose.stripe-sandbox.yaml'))throw null;return value;};
-  g.adapter=await createOwnedSandboxBootstrap(g.options,g.dependencies);await g.adapter.prepare(LIMIT());await g.adapter.persistWebhookSecret(SECRET);await rejects(g.adapter.start(LIMIT()),'START_PENDING');
-  const count=g.events.length;await rejects(g.adapter.start(LIMIT()),'START_PENDING');assert.equal(g.events.length,count);assert.equal(g.events.filter(e=>e.type==='process'&&e.args[5]==='rm').length,1);
-  assert.equal(g.events.filter(e=>e.type==='process'&&e.args[5]==='start').length,2);await rejects(g.adapter.stop(LIMIT()),'STOP_PENDING');
+});
+
+for(const phase of ['initial','replacement'])for(const dispatched of [false,true])test(phase+' stopped Compose '+(dispatched?'uncertain':'failed')+' result retains dispatch evidence without adoption, retry, start or authority',async()=>{
+  const f=fixture(),execute=f.dependencies.execute;let dispatch;
+  f.dependencies.execute=async(file,args,settings)=>{
+    const event={type:'process',file,args,settings};
+    if(stoppedCompose(event)&&args.includes(DIR+(phase==='initial'?'/app.env':'/final.env'))) {
+      dispatch=event;
+      if(dispatched)await execute(file,args,settings);else f.events.push(event);
+      throw dispatched?new Proxy({},{get(){throw new Error('must_not_traverse_uncertain_result');}}):new Error('synthetic_compose_failure');
+    }
+    return execute(file,args,settings);
+  };
+  f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);
+  if(phase==='replacement') {await f.adapter.prepare(LIMIT());await f.adapter.persistWebhookSecret(SECRET);await rejects(f.adapter.start(LIMIT()),'START_PENDING');}
+  else await rejects(f.adapter.prepare(LIMIT()),'PREPARE_PENDING');
+  assert.ok(dispatch);assert.equal(f.adapter.resources().status,'PENDING');
+  const ledger=JSON.parse(f.files.get(DIR+'/runtime.json').contents),intent=ledger.intents.at(-1);
+  assert.deepEqual(intent,{action:phase==='initial'?'CREATE_STOPPED':'CREATE_FINAL_BACKEND',name:phase==='initial'?PROJECT:PROJECT+'-backend',status:'DISPATCHING'});
+  assert.equal(Object.hasOwn(ledger.containers,'backend'),false);assert.equal(Object.hasOwn(f.adapter.resources().containers,'backend'),false);
+  if(phase==='replacement')assert.ok(ledger.retiredBackend);else assert.equal(f.events.some(e=>e.path===USERFILE),false);
+  const commands=f.events.filter(e=>e.type==='process');assert.deepEqual(commands.at(-1).args,dispatch.args);
+  assert.equal(f.containers.size,(phase==='initial'?2:6)+(dispatched?(phase==='initial'?5:1):0));
+  assert.equal(commands.filter(e=>e.args[4]==='container'&&e.args[5]==='start').length,2);assert.equal(f.events.some(e=>e.type==='health'),false);
+  const count=f.events.length;let invoked=false;
+  await rejects(f.adapter.prepare(LIMIT()),'PREPARE_PENDING');await rejects(f.adapter.start(LIMIT()),'START_PENDING');
+  await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');await rejects(f.adapter.verifyForwardTarget(),'FORWARD_PENDING');
+  await rejects(f.adapter.verify(LIMIT()),'VERIFY_PENDING');await rejects(f.adapter.withAdminCredentials(()=>{invoked=true;return true;}),'ADMIN_PENDING');
+  assert.equal(invoked,false);assert.equal(f.events.length,count);await rejects(f.adapter.stop(LIMIT()),'STOP_PENDING');
+  assert.equal(f.events.filter(stoppedCompose).length,phase==='initial'?1:2);
+  assert.equal(f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='start').length,2);
+  assert.equal(f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='rm').length,phase==='initial'?0:1);
+  assert.ok(f.files.has(DIR+'/owner.lock'));assert.deepEqual(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents.at(-1),intent);
 });
 
 test('live verification rejects extra actual bindings before health or admin calls',async()=>{

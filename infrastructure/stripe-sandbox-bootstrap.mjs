@@ -492,7 +492,7 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     await sourceGate(context);await privateTree(context);await noPriorResources(context);await build(context);await pullImages(context);await generate(context);await infrastructure(context);await issuer(context);
     await exclusiveFile(directory+'/owned.yaml',overrideText(),context);await configProof(context);await sourceGate(context);
     await intent('CREATE_STOPPED',project,context);
-    await docker(composeArgs(directory+'/app.env',['create','--no-build','--no-deps','--pull','never',...SERVICES]),context);
+    await docker(composeArgs(directory+'/app.env',['up','--no-start','--no-deps','--no-build','--pull','never',...SERVICES]),context);
     for(const service of SERVICES) {const proof=await containerProof(service,project+'-'+service,context,{neverStarted:true});recorded.containers[service]=proof.safe;}
     await topology(context,false,true);await acknowledgement(context);status='PREPARED';await ledger(context);return true;
   }
@@ -621,7 +621,7 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     const removed=await docker(['container','rm',old.id],context);if(removed.stdout.trim()!==old.id)fail();
     recorded.retiredBackend=old;delete recorded.containers.backend;retired=true;await projectProof(context);await acknowledgement(context);
     await intent('CREATE_FINAL_BACKEND',project+'-backend',context);
-    await docker(composeArgs(directory+'/final.env',['create','--no-deps','--no-build','--pull','never','backend'],{stripe:true}),context);
+    await docker(composeArgs(directory+'/final.env',['up','--no-start','--no-deps','--no-build','--pull','never','backend'],{stripe:true}),context);
     const proof=await containerProof('backend',project+'-backend',context,{neverStarted:true});recorded.containers.backend=proof.safe;
     await topology(context,false,true);await acknowledgement(context);
     for(const service of SERVICES) {
