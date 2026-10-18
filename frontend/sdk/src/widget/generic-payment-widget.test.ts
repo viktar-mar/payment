@@ -6,6 +6,8 @@ import { authInput, customerWire } from '../test/customer-fixtures.js';
 import userEvent from "@testing-library/user-event";
 import { defineGenericPaymentWidget, GenericPaymentWidget } from "./generic-payment-widget.js";
 import { wire, readWire, json, token } from "../test/fixtures.js";
+import { loadStripeClient } from '../providers/stripe-loader.js';
+import * as sandboxDriver from '../../../../examples/demo-site/tests/support/stripe-sandbox-fixtures.ts';
 defineGenericPaymentWidget();
 function mount() { const el = document.createElement("generic-payment-widget") as GenericPaymentWidget; el.siteKey = "test-site"; el.priceKey = "lifetime"; el.apiBaseUrl = "https://api.test"; document.body.append(el); return el; }
 const button = (el: GenericPaymentWidget) => el.shadowRoot!.querySelector("button")!;
@@ -19,6 +21,58 @@ async function stripeReady(el: GenericPaymentWidget, p: ReturnType<typeof stripe
   button(el).click(); await vi.waitFor(() => expect(el.shadowRoot!.querySelector('iframe')).toBe(p.frame)); p.emit('ready'); await until(el, 'ready');
 }
 async function until(el: GenericPaymentWidget, state: string) { await vi.waitFor(() => expect(el.state).toBe(state)); }
+// Break: probing text, capabilities or child-frame content leaks data; projecting the wrong local lifecycle hides the failing boundary.
+const observeForm = (el: Element) => (sandboxDriver as unknown as {observeSandboxPaymentForm?:(el:Element)=>unknown}).observeSandboxPaymentForm?.(el);
+it.each(['capability-pending','capability-rejected','loader-pending','loader-rejected','elements-throw','mount-throw','frame-pending','loaderror','ready'])('safe form observation characterizes resumed initialization %s without confirming or recreating',async stage=>{
+  const p=stripeUiProvider(),requests=stripeApi();
+  await createGenericPaymentClient({apiBaseUrl:'https://api.test'}).createCatalogCheckout({siteKey:'test-site',priceKey:'lifetime'});
+  const el=mount();await until(el,'checking');const resume=el.shadowRoot!.querySelectorAll('button')[1];await vi.waitFor(()=>expect(resume).toBeEnabled());
+  let release=()=>{};
+  if(stage.startsWith('capability-')){
+    const original=globalThis.fetch;
+    vi.stubGlobal('fetch',async(url:string,init:RequestInit)=>{
+      if(!url.endsWith('/client-session'))return original(url,init);
+      requests.push(new Request(url,init));
+      return stage==='capability-rejected'?json({code:'REQUEST_FAILED'},503):new Promise<Response>(resolve=>{release=()=>resolve(json(stripeCapability()));});
+    });
+  }
+  if(stage==='loader-pending')vi.mocked(loadStripeClient).mockReturnValueOnce(new Promise(resolve=>{release=()=>resolve(null);}));
+  if(stage==='loader-rejected')vi.mocked(loadStripeClient).mockRejectedValueOnce(new Error('private-loader-sentinel'));
+  if(stage==='elements-throw')p.stripe.elements.mockImplementationOnce(()=>{throw new Error('private-elements-sentinel');});
+  if(stage==='mount-throw')vi.spyOn(p.element,'mount').mockImplementationOnce(()=>{throw new Error('private-mount-sentinel');});
+  resume.click();
+  try{
+    if(['capability-rejected','loader-rejected','elements-throw','mount-throw'].includes(stage))await vi.waitFor(()=>{expect(el.state).toBe('checking');expect(button(el)).toBeEnabled();});
+    else if(['frame-pending','loaderror','ready'].includes(stage)){
+      await vi.waitFor(()=>expect(el.shadowRoot!.querySelector('iframe')).toBe(p.frame));
+      if(stage!=='frame-pending'){p.emit(stage);await until(el,stage==='ready'?'ready':'checking');}
+    }else await vi.waitFor(()=>expect(requests.filter(r=>r.url.endsWith('/client-session'))).toHaveLength(1));
+    const failed=['capability-rejected','loader-rejected','elements-throw','mount-throw','loaderror'].includes(stage);
+    expect(observeForm(el)).toEqual({widgetState:stage==='ready'?'ready':failed?'checking':'loading',elementState:['frame-pending','ready'].includes(stage)?'FRAME':'EMPTY',payState:stage==='ready'?'ENABLED':'ABSENT'});
+    expect(requests.filter(r=>r.url.endsWith('/sites/test-site/checkouts'))).toHaveLength(1);
+    expect(requests.filter(r=>r.url.endsWith('/client-session'))).toHaveLength(1);expect(p.stripe.confirmPayment).not.toHaveBeenCalled();
+  }finally{el.remove();release();await Promise.resolve();await Promise.resolve();}
+});
+it('safe form observation is serializable and never reads markup frame URLs values or arbitrary state',()=>{
+  const el=document.createElement('div'),root=el.attachShadow({mode:'open'}),host=document.createElement('div'),frame=document.createElement('iframe'),pay=document.createElement('button');
+  host.className='payment-element';host.append(frame);pay.setAttribute('aria-label','Pay');root.append(host,pay);
+  let reads=0;const forbidden=()=>{reads++;throw new Error('private-dom-sentinel');};
+  for(const [target,key] of [[el,'innerHTML'],[root,'innerHTML'],[root,'textContent'],[frame,'src'],[frame,'contentDocument'],[pay,'value']] as const)Object.defineProperty(target,key,{get:forbidden});
+  Object.defineProperty(el,'state',{value:new Proxy({},{get:forbidden}),configurable:true});
+  const fn=(sandboxDriver as unknown as {observeSandboxPaymentForm?:(el:Element)=>unknown}).observeSandboxPaymentForm;
+  const transported=fn?Function('return ('+fn.toString()+')')():()=>undefined;
+  expect(transported(el)).toEqual({widgetState:'UNAVAILABLE',elementState:'FRAME',payState:'ENABLED'});
+  pay.disabled=true;expect(observeForm(el)).toEqual({widgetState:'UNAVAILABLE',elementState:'FRAME',payState:'DISABLED'});
+  pay.hidden=true;expect(observeForm(el)).toEqual({widgetState:'UNAVAILABLE',elementState:'FRAME',payState:'HIDDEN'});
+  Object.defineProperty(el,'state',{get:forbidden});expect(observeForm(el)).toEqual({widgetState:'UNAVAILABLE',elementState:'UNAVAILABLE',payState:'UNAVAILABLE'});
+  expect(observeForm(document.createElement('div'))).toEqual({widgetState:'UNAVAILABLE',elementState:'UNAVAILABLE',payState:'UNAVAILABLE'});expect(reads).toBe(1);
+});
+it('safe form observation distinguishes no host from an empty owned host without probing provider content',()=>{
+  const el=document.createElement('div'),root=el.attachShadow({mode:'open'});Object.defineProperty(el,'state',{value:'idle'});
+  expect(observeForm(el)).toEqual({widgetState:'idle',elementState:'NO_HOST',payState:'ABSENT'});
+  const host=document.createElement('div');host.className='payment-element';root.append(host);
+  expect(observeForm(el)).toEqual({widgetState:'idle',elementState:'EMPTY',payState:'ABSENT'});
+});
 it.each(['PROCESSING', 'UNKNOWN'])('recovered Fake %s regains original explicit confirmation after becoming actionable', async pending => {
   const p = stripeUiProvider(), requests: Request[] = []; let reads = 0;
   vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { requests.push(new Request(url, init)); return json(init.method === 'GET' ? readWire(++reads === 1 ? pending : 'REQUIRES_PAYMENT_METHOD') : url.endsWith('/confirm') ? readWire('SUCCEEDED') : wire(pending), url.endsWith('/checkouts') ? 201 : 200); });

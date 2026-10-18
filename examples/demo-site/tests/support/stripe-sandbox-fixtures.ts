@@ -5,9 +5,24 @@ import {runSandboxBrowserStep,rethrowSandboxBrowserFailure,type SandboxBrowserSt
 export {openStripeSandboxFixture};
 export type {SandboxFixture};
 
+/** Self-contained browser callback: only public state and owned DOM presence/flags, never markup, URLs or frame contents. */
+export function observeSandboxPaymentForm(element:Element) {
+  const unavailable={widgetState:'UNAVAILABLE',elementState:'UNAVAILABLE',payState:'UNAVAILABLE'};
+  try{
+    const state=(element as Element&{state?:unknown}).state,root=element.shadowRoot;
+    if(!root)return unavailable;
+    const host=root.querySelector('.payment-element'),pay=root.querySelector<HTMLButtonElement>('button[aria-label="Pay"]');
+    return {
+      widgetState:['idle','loading','ready','checking','processing','requires_action','succeeded','failed','unknown','expired'].includes(state as string)?state:'UNAVAILABLE',
+      elementState:host?(host.querySelector('iframe')?'FRAME':'EMPTY'):'NO_HOST',
+      payState:!pay?'ABSENT':pay.hidden?'HIDDEN':pay.disabled?'DISABLED':'ENABLED',
+    };
+  }catch{return unavailable;}
+}
+
 /** Actual Stripe-hosted Element. No route interception or browser-result financial assertions. */
 export async function runSandboxCard(browser:Browser,fixture:SandboxFixture,name:SandboxCase):Promise<void> {
-  const step=<T>(boundary:SandboxBrowserStep,body:()=>Promise<T>)=>runSandboxBrowserStep(name,boundary,body);
+  const step=<T>(boundary:SandboxBrowserStep,body:()=>Promise<T>,observeFailure?:()=>Promise<unknown>)=>runSandboxBrowserStep(name,boundary,body,observeFailure);
   if(!await step('BEGIN_BROWSER',()=>fixture.beginBrowser(name)))return;
   const context=await step('NEW_CONTEXT',()=>browser.newContext({serviceWorkers:'block'}));
   let failed=false,primary:unknown;
@@ -27,7 +42,8 @@ export async function runSandboxCard(browser:Browser,fixture:SandboxFixture,name
     const frame=widget.frameLocator('iframe[title="Secure payment input frame"]');
     async function card(number:string,retry=false) {
       // Resume starts asynchronous mounting; a click is not provider-readiness proof.
-      await step(retry?'RETRY_PAYMENT_FORM_READY':'PAYMENT_FORM_READY',()=>widget.locator('button[aria-label="Pay"]:enabled').waitFor({state:'visible',timeout:15000}));
+      await step(retry?'RETRY_PAYMENT_FORM_READY':'PAYMENT_FORM_READY',()=>widget.locator('button[aria-label="Pay"]:enabled').waitFor({state:'visible',timeout:15000}),
+        ()=>widget.evaluate(observeSandboxPaymentForm,undefined,{timeout:1000}));
       await step(retry?'RETRY_CARD_FRAME':'CARD_FRAME',()=>widget.locator('iframe[title="Secure payment input frame"]').waitFor({state:'visible',timeout:15000}));
       await step(retry?'RETRY_CARD_NUMBER_READY':'CARD_NUMBER_READY',()=>frame.locator('input[name="number"]').waitFor({state:'visible',timeout:15000}));
       await step(retry?'RETRY_CARD_NUMBER':'CARD_NUMBER',()=>frame.locator('input[name="number"]').fill(number,{timeout:15000}));

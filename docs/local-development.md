@@ -415,6 +415,19 @@ existing `CARD_NUMBER` fill/actionability failure without exposing DOM, URLs or 
 Selectors and card values remain unchanged. Offline tests do not establish Stripe's
 current iframe DOM or uniquely explain an earlier Sandbox failure; real acceptance still
 requires a separately approved run, with no automatic retry of retained operations.
+Only a failed original/retry `PAYMENT_FORM_READY` may additionally report three finite
+observations: `widget_state` (the public SDK state or `UNAVAILABLE`), `element_state`
+(`NO_HOST`, `EMPTY`, `FRAME`, `UNAVAILABLE`) and `pay_state` (`ABSENT`, `HIDDEN`,
+`DISABLED`, `ENABLED`, `UNAVAILABLE`). The one best-effort snapshot is capped at one second,
+does not renew the original deadline, and cannot replace the primary failure if its own
+read fails, returns malformed data, or finishes late. Successful gates collect nothing.
+It reads only SDK-owned DOM presence and native button flags, never markup/text, URLs,
+frame contents, input values, provider responses or error objects. `ENABLED` does not
+prove CSS visibility, current readiness, or payment; this is a snapshot after failure.
+For example, `loading/FRAME/ABSENT` means an outer iframe exists while Pay is unavailable;
+`checking/EMPTY/ABSENT` is compatible with multiple initialization failures, not a unique
+loader/client-session/provider diagnosis. Earlier failures cannot be reconstructed from it.
+No production SDK/backend/payment behavior or existing 15-second readiness wait is changed.
 Malformed, duplicate, oversized or unfinished diagnostics produce the fixed
 `sandbox_diagnostic_failed_manual_check` marker and force final failure; a valid diagnostic
 also forces failure. Successful runs emit no diagnostic. These observations neither

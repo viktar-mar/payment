@@ -16,11 +16,11 @@ mock.method(globalThis,'fetch',forbidden);
 for(const name of ['open','readFile','lstat','realpath','readdir','mkdir','rename','unlink'] as const)mock.method(filesystem,name,forbidden);
 syncBuiltinESMExports();after(()=>{mock.restoreAll();syncBuiltinESMExports();});
 
-function cardBoundary(begin=true,postalVisible=true,onWait?:(kind:'form'|'frame'|'number')=>Promise<void>){
+function cardBoundary(begin=true,postalVisible=true,onWait?:(kind:'form'|'frame'|'number')=>Promise<void>,observe?:(body:unknown,arg:unknown,options:unknown)=>Promise<unknown>){
   const events:unknown[][]=[],record={synthetic:'session'},identity={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:14173'},site:{key:'synthetic-site'},price:{key:'synthetic-price'}};
   const add=(...args:unknown[])=>{events.push(args);};
   const frame={locator:(selector:string)=>({waitFor:async(...args:unknown[])=>{add('field-wait',selector,...args);await onWait?.('number');},fill:async(...args:unknown[])=>add('fill',selector,...args),isVisible:async()=>{add('visible',selector);return postalVisible;}})};
-  const widget={first(){add('first');return this;},locator:(selector:string)=>({waitFor:async(...args:unknown[])=>{add('widget-wait',selector,...args);await onWait?.(selector.startsWith('button')?'form':'frame');}}),getByRole:(...args:unknown[])=>({click:async(...options:unknown[])=>add('click',...args,...options)}),frameLocator:(...args:unknown[])=>{add('frame',...args);return frame;}};
+  const widget={first(){add('first');return this;},evaluate:async(body:unknown,arg:unknown,options:unknown)=>{if(!observe)throw null;return observe(body,arg,options);},locator:(selector:string)=>({waitFor:async(...args:unknown[])=>{add('widget-wait',selector,...args);await onWait?.(selector.startsWith('button')?'form':'frame');}}),getByRole:(...args:unknown[])=>({click:async(...options:unknown[])=>add('click',...args,...options)}),frameLocator:(...args:unknown[])=>{add('frame',...args);return frame;}};
   const challenge={frameLocator:(...args:unknown[])=>{add('challenge-frame',...args);return {getByRole:(...role:unknown[])=>({click:async(...options:unknown[])=>add('complete',...role,...options)})};}};
   const page={goto:async(...args:unknown[])=>add('goto',...args),locator:(...args:unknown[])=>{add('widget',...args);return widget;},frameLocator:(...args:unknown[])=>{add('challenge',...args);return challenge;}};
   const context={addInitScript:async(body:unknown,argument:unknown)=>{assert.equal(typeof body,'function');add('install',argument);},newPage:async()=>{add('new-page');return page;},close:async()=>add('close')};
@@ -35,6 +35,25 @@ const card=(number:string,postal=true)=>[
   ['fill','input[name="number"]',number,{timeout:15000}],['fill','input[name="expiry"]','1230'],['fill','input[name="cvc"]','123'],
   ['visible','input[name="postalCode"]'],...(postal?[['fill','input[name="postalCode"]','10001']]:[]),
 ];
+// Break: losing the failed form's safe observation makes all initialization failures indistinguishable.
+for(const retry of [false,true])test(`failed ${retry?'retry':'initial'} form observes once before close without further fields or payment`,async()=>{
+  let forms=0,observations=0,reads=0;const hostile=new Proxy({},{get(){reads++;throw null;}});
+  const f=cardBoundary(true,true,async kind=>{if(kind==='form'&&++forms===(retry?2:1))throw hostile;},async(body,arg,options)=>{
+    observations++;assert.equal(typeof body,'function');assert.equal(arg,undefined);assert.deepEqual(options,{timeout:1000});
+    assert.notEqual(f.events.at(-1)?.[0],'close');return {widgetState:'checking',elementState:'EMPTY',payState:'ABSENT'};
+  });
+  await assert.rejects(runSandboxCard(f.browser,f.fixture,retry?'decline':'success'));
+  assert.equal(observations,1);assert.equal(reads,0);assert.deepEqual(f.events.at(-1),['close']);
+  assert.equal(f.events.filter(e=>e[0]==='fill'&&e[1]==='input[name="number"]').length,retry?1:0);
+  assert.equal(f.events.filter(e=>e[0]==='click'&&(e[2] as {name?:string})?.name==='Pay').length,retry?1:0);
+  assert.equal(f.events.some(e=>e[0]==='confirm'),false);
+});
+test('successful card entry and failed non-form boundaries never collect a form observation',async()=>{
+  let calls=0;const observe=async()=>{calls++;throw null;};
+  const success=cardBoundary(true,true,undefined,observe);await runSandboxCard(success.browser,success.fixture,'decline');
+  for(const gate of ['frame','number'] as const){const f=cardBoundary(true,true,async kind=>{if(kind===gate)throw null;},observe);await assert.rejects(runSandboxCard(f.browser,f.fixture,'success'));}
+  assert.equal(calls,0);
+});
 // Break: proceeding on Resume's click rather than provider readiness can reach fields or Pay too early.
 for(const retry of [false,true])test(`card driver waits for ${retry?'retry':'initial'} form readiness before filling or further authority`,async()=>{
   let release!:()=>void,forms=0;const pending=new Promise<void>(resolve=>{release=resolve;});

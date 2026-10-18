@@ -256,12 +256,12 @@ async function reportFrames(frames,owned=true,exercisePrivateChannels=false){
 }
 
 const browserSteps=['BEGIN_BROWSER','NEW_CONTEXT','CHECKOUT_SESSION','INSTALL_SESSION','NEW_PAGE','NAVIGATE','RESUME','PAYMENT_FORM_READY','CARD_FRAME','CARD_NUMBER_READY','CARD_NUMBER','CARD_EXPIRY','CARD_CVC','POSTAL_CHECK','POSTAL_FILL','MARK_PAY','PAY','MARK_RETRY','RETRY_PAYMENT_FORM_READY','RETRY_CARD_FRAME','RETRY_CARD_NUMBER_READY','RETRY_CARD_NUMBER','RETRY_CARD_EXPIRY','RETRY_CARD_CVC','RETRY_POSTAL_CHECK','RETRY_POSTAL_FILL','RETRY_PAY','SCA_COMPLETE','SERVER_CONFIRM','CLOSE_CONTEXT'];
-function syntheticCard(failAt,closeFails=false){
+function syntheticCard(failAt,closeFails=false,formObservation){
   const events=[],contexts=[];let retry=false;
   const operation=async(step,args)=>{events.push({step,args});if(step===failAt||step==='CLOSE_CONTEXT'&&closeFails)throw new Proxy({},{get(){throw new Error('private-must-not-read');}});};
   const frame={locator:selector=>({waitFor:async(...args)=>operation((retry?'RETRY_':'')+'CARD_NUMBER_READY',args),fill:async(...args)=>operation((retry?'RETRY_':'')+({'input[name="number"]':'CARD_NUMBER','input[name="expiry"]':'CARD_EXPIRY','input[name="cvc"]':'CARD_CVC','input[name="postalCode"]':'POSTAL_FILL'})[selector],args),
     isVisible:async()=>{await operation((retry?'RETRY_':'')+'POSTAL_CHECK',[]);return true;}})};
-  const widget={first(){return this;},locator:selector=>({waitFor:async(...args)=>operation((retry?'RETRY_':'')+(selector.startsWith('button')?'PAYMENT_FORM_READY':'CARD_FRAME'),args)}),frameLocator:()=>frame,getByRole:(_role,options)=>({click:async(...args)=>operation(options.name==='Pay'?(retry?'RETRY_PAY':'PAY'):'RESUME',args)})};
+  const widget={first(){return this;},evaluate:async(body,arg,options)=>{assert.equal(typeof body,'function');assert.equal(arg,undefined);assert.deepEqual(options,{timeout:1000});if(formObservation===undefined)throw null;return formObservation;},locator:selector=>({waitFor:async(...args)=>operation((retry?'RETRY_':'')+(selector.startsWith('button')?'PAYMENT_FORM_READY':'CARD_FRAME'),args)}),frameLocator:()=>frame,getByRole:(_role,options)=>({click:async(...args)=>operation(options.name==='Pay'?(retry?'RETRY_PAY':'PAY'):'RESUME',args)})};
   const challenge={frameLocator(){return this;},getByRole:()=>({click:async(...args)=>operation('SCA_COMPLETE',args)})};
   const page={goto:async(...args)=>operation('NAVIGATE',args),locator:()=>widget,frameLocator:()=>challenge};
   const context={addInitScript:async(...args)=>operation('INSTALL_SESSION',args),newPage:async()=>{await operation('NEW_PAGE',[]);return page;},close:async()=>{try{await operation('CLOSE_CONTEXT',[]);}finally{contexts.splice(0);}}};
@@ -272,6 +272,103 @@ function syntheticCard(failAt,closeFails=false){
   return {browser,fixture,events};
 }
 // Break: a missing/mislabelled boundary, reordered write or overwritten primary failure changes emitted evidence.
+test('failed form observation survives the real driver owner and split reporter with no later authority',async()=>{
+  const {runSandboxCard}=await import('../examples/demo-site/tests/support/stripe-sandbox-fixtures.ts');
+  const {withOwnedCardContexts}=await import('../examples/demo-site/tests/support/stripe-sandbox-acceptance.ts');
+  const observation={widgetState:'checking',elementState:'EMPTY',payState:'ABSENT'};
+  for(const [phase,name,step] of [['CARDS','success','PAYMENT_FORM_READY'],['CARDS','decline','RETRY_PAYMENT_FORM_READY'],['MISSED','success','PAYMENT_FORM_READY']]){
+    const f=fixture(),card=syntheticCard(step,true,observation);card.fixture.close=async()=>{throw null;};
+    if(phase==='CARDS')f.deps.openStripeSandboxFixture=async()=>card.fixture;else f.extras.missedFixture=async()=>card.fixture;
+    f.journeys[phase==='CARDS'?'cards':'missed']=async actual=>withOwnedCardContexts(card.browser,limits(),()=>runSandboxCard(card.browser,actual,name));
+    const owned=await quietOpen(f);await assert.rejects(owned.run(f.journeys,limits()));
+    assert.deepEqual(diagnostics(f.output),[{...expectedDiagnostic(phase,'OPERATION_FAILED',null,false),browserCase:name,browserStep:step,...observation}]);
+    assert.equal(owned.resources().accepted,false);assert.equal(card.events.some(e=>e.step==='SERVER_CONFIRM'),false);
+    if(phase==='CARDS')assert.equal(f.events.includes('refunds'),false);
+    const result=await reportFrames(f.output.map(line=>[line.slice(0,21),Buffer.from(line.slice(21))]).flat());
+    assert.deepEqual(result.result,{status:'failed'});
+    assert.ok(result.lines.includes(`sandbox_diagnostic phase=${phase} code=OPERATION_FAILED exit=none cleanup=unconfirmed browser_case=${name} browser_step=${step} widget_state=checking element_state=EMPTY pay_state=ABSENT\n`));
+  }
+});
+// Break: accepting arbitrary DOM/error strings or partial triples can disclose capabilities through the safe reporter.
+test('form formatter and reporter strictly allowlist the complete readiness observation',async()=>{
+  const base={...expectedDiagnostic('CARDS','OPERATION_FAILED',null,false),browserCase:'success',browserStep:'PAYMENT_FORM_READY',widgetState:'loading',elementState:'FRAME',payState:'ABSENT'};
+  assert.equal(formatSandboxDiagnostic(base),'sandbox_diagnostic phase=CARDS code=OPERATION_FAILED exit=none cleanup=unconfirmed browser_case=success browser_step=PAYMENT_FORM_READY widget_state=loading element_state=FRAME pay_state=ABSENT\n');
+  let reads=0;
+  const invalid=[{...base,widgetState:'private-sentinel'},{...base,elementState:'private-sentinel'},{...base,payState:'private-sentinel'},
+    {...base,widgetState:new String('loading')},{...base,widgetState:[]},{...base,payState:true},{...base,private:'private-sentinel'},
+    {...base,phase:'DONATIONS'},{...base,browserStep:'CARD_NUMBER'},{...base,phase:'MISSED',browserCase:'decline'},
+    {...base,code:'ABORTED'},{...base,code:'PROCESS_EXIT_NONZERO',exitCode:2},...['widgetState','elementState','payState'].map(key=>{const v={...base};delete v[key];return v;}),
+    {...base,[Symbol('private')]:true}];
+  for(const key of ['widgetState','elementState','payState'])invalid.push(Object.defineProperty({...base},key,{get(){reads++;throw null;}}));
+  for(const value of invalid)assert.equal(formatSandboxDiagnostic(value),null);
+  assert.equal(reads,0);
+  // JSON normalizes boxed strings into valid primitives; direct formatter rejection above is the applicable boundary for that case.
+  for(const value of invalid.filter(v=>!Reflect.ownKeys(v).some(k=>typeof k==='symbol'||!Object.hasOwn(Object.getOwnPropertyDescriptor(v,k),'value'))&&![v.widgetState,v.elementState,v.payState].some(field=>field instanceof String))){
+    const result=await reportFrames([JSON.stringify(value)+'\n']);assert.deepEqual(result.result,{status:'failed'});
+    assert.ok(result.lines.includes('sandbox_diagnostic_failed_manual_check\n'));assert.equal(result.lines.join('').includes('private-'),false);
+  }
+  const wire=JSON.stringify(base);
+  for(const [key,escaped] of [['widgetState','widget\\u0053tate'],['elementState','element\\u0053tate'],['payState','pay\\u0053tate']]){
+    for(const duplicate of [key,escaped]){const result=await reportFrames([wire.slice(0,-1)+`,"${duplicate}":"${base[key]}"}\n`]);
+      assert.ok(result.lines.includes('sandbox_diagnostic_failed_manual_check\n'));assert.equal(result.lines.some(v=>v.startsWith('sandbox_diagnostic phase=')),false);}
+  }
+  for(const malformed of [wire,JSON.stringify({...base,widgetState:'private-'+'x'.repeat(4096)})+'\n']){
+    const result=await reportFrames([malformed.slice(0,19),Buffer.from(malformed.slice(19))]);
+    assert.ok(result.lines.includes('sandbox_diagnostic_failed_manual_check\n'));assert.equal(result.lines.join('').includes('private-'),false);
+  }
+});
+// Break: optional diagnostic failure, invalid data or a late result must never replace the trusted original failure.
+test('unavailable malformed or hostile form observations retain the primary pair without reading error or data getters',async()=>{
+  const {runSandboxBrowserStep}=await import('./stripe-sandbox-acceptance.mjs');let reads=0;
+  const hostile=new Proxy({},{get(){reads++;throw null;}}),good={widgetState:'loading',elementState:'EMPTY',payState:'ABSENT'};
+  const bad=[null,[],{...good,widgetState:'private-sentinel'},{...good,extra:'private-sentinel'},Object.defineProperty({...good},'payState',{get(){reads++;throw null;}})];
+  const observers=[...bad.map(value=>async()=>value),async()=>{throw hostile;}];
+  for(const observer of observers){
+    const f=fixture();f.journeys.cards=async()=>runSandboxBrowserStep('success','PAYMENT_FORM_READY',async()=>{throw hostile;},observer);
+    const owned=await quietOpen(f);await assert.rejects(owned.run(f.journeys,limits()));
+    assert.deepEqual(diagnostics(f.output),[{...expectedDiagnostic('CARDS','OPERATION_FAILED',null,false),browserCase:'success',browserStep:'PAYMENT_FORM_READY'}]);
+    assert.equal(f.events.includes('refunds'),false);assert.ok(f.events.includes('stop-services'));
+  }
+  assert.equal(reads,0);
+});
+test('form observation timeout is bounded and a late result cannot revise the original failed report',async()=>{
+  const {runSandboxBrowserStep}=await import('./stripe-sandbox-acceptance.mjs');
+  const nativeSet=globalThis.setTimeout,nativeClear=globalThis.clearTimeout,alarms=[];
+  const timer=mock.method(globalThis,'setTimeout',(body,delay,...args)=>{
+    const handle=nativeSet(()=>{},1000000);if(delay!==1000){nativeClear(handle);return nativeSet(body,delay,...args);}
+    alarms.push({fire:()=>body(...args),handle});return handle;
+  });
+  let release,reads=0;const hostile=new Proxy({},{get(){reads++;throw null;}}),pending=new Promise(resolve=>{release=resolve;});
+  const f=fixture();f.journeys.cards=async()=>runSandboxBrowserStep('success','PAYMENT_FORM_READY',async()=>{throw hostile;},()=>pending);
+  try{
+    const owned=await quietOpen(f),running=owned.run(f.journeys,limits());running.catch(()=>{});
+    await new Promise(resolve=>setImmediate(resolve));assert.equal(alarms.length,1);assert.equal(diagnostics(f.output).length,0);
+    alarms[0].fire();await assert.rejects(running);const before=[...f.output];
+    release({widgetState:'ready',elementState:'FRAME',payState:'ENABLED'});await new Promise(resolve=>setImmediate(resolve));
+    assert.deepEqual(f.output,before);assert.deepEqual(diagnostics(f.output),[{...expectedDiagnostic('CARDS','OPERATION_FAILED',null,false),browserCase:'success',browserStep:'PAYMENT_FORM_READY'}]);
+    assert.equal(f.events.filter(x=>x==='stop-services').length,1);assert.equal(reads,0);assert.equal(f.events.includes('refunds'),false);
+  }finally{timer.mock.restore();for(const alarm of alarms)nativeClear(alarm.handle);release(null);}
+});
+test('observers run only on a new failed readiness boundary and nested primary evidence cannot be replaced',async()=>{
+  const {runSandboxBrowserStep}=await import('./stripe-sandbox-acceptance.mjs');let calls=0,token;
+  const observe=async()=>{calls++;return {widgetState:'ready',elementState:'FRAME',payState:'ENABLED'};};
+  assert.equal(await runSandboxBrowserStep('success','PAYMENT_FORM_READY',async()=>17,observe),17);
+  try{await runSandboxBrowserStep('success','CARD_NUMBER',async()=>{throw null;},observe);}catch(error){token=error;}
+  const f=fixture();f.journeys.cards=async()=>runSandboxBrowserStep('decline','RETRY_PAYMENT_FORM_READY',async()=>{throw token;},observe);
+  const owned=await quietOpen(f);await assert.rejects(owned.run(f.journeys,limits()));
+  assert.equal(calls,0);assert.deepEqual(diagnostics(f.output),[{...expectedDiagnostic('CARDS','OPERATION_FAILED',null,false),browserCase:'success',browserStep:'CARD_NUMBER'}]);
+});
+for(const boundary of ['deadline','abort'])test(`original ${boundary} during form observation retains precedence over UI evidence`,async()=>{
+  const {runSandboxBrowserStep}=await import('./stripe-sandbox-acceptance.mjs');
+  const f=fixture(),controller=new AbortController();let now=Date.now();f.deps.now=()=>now;
+  f.journeys.cards=async()=>runSandboxBrowserStep('success','PAYMENT_FORM_READY',async()=>{throw null;},async()=>{
+    if(boundary==='deadline')now=f.setup.deadline;else controller.abort();
+    return {widgetState:'loading',elementState:'FRAME',payState:'ABSENT'};
+  });
+  const owned=await quietOpen(f);await assert.rejects(owned.run(f.journeys,{deadline:f.setup.deadline,signal:controller.signal}));
+  assert.deepEqual(diagnostics(f.output),[expectedDiagnostic('CARDS',boundary==='deadline'?'DEADLINE_REACHED':'ABORTED',null,false)]);
+  assert.equal(f.events.includes('refunds'),false);
+});
 test('every real browser boundary emits its exact case step and stops later authority',async()=>{
   const {runSandboxCard}=await import('../examples/demo-site/tests/support/stripe-sandbox-fixtures.ts');
   const {withOwnedCardContexts}=await import('../examples/demo-site/tests/support/stripe-sandbox-acceptance.ts');

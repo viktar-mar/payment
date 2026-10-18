@@ -21,16 +21,35 @@ function freeze(value){if(value&&typeof value==='object'){for(const child of Obj
 const snapshot=value=>freeze(JSON.parse(JSON.stringify(value)));
 const BROWSER_CASES=['success','decline','sca'];
 const BROWSER_STEPS=['BEGIN_BROWSER','NEW_CONTEXT','CHECKOUT_SESSION','INSTALL_SESSION','NEW_PAGE','NAVIGATE','RESUME','PAYMENT_FORM_READY','CARD_FRAME','CARD_NUMBER_READY','CARD_NUMBER','CARD_EXPIRY','CARD_CVC','POSTAL_CHECK','POSTAL_FILL','MARK_PAY','PAY','MARK_RETRY','RETRY_PAYMENT_FORM_READY','RETRY_CARD_FRAME','RETRY_CARD_NUMBER_READY','RETRY_CARD_NUMBER','RETRY_CARD_EXPIRY','RETRY_CARD_CVC','RETRY_POSTAL_CHECK','RETRY_POSTAL_FILL','RETRY_PAY','SCA_COMPLETE','SERVER_CONFIRM','CLOSE_CONTEXT'];
+const FORM_STEPS=['PAYMENT_FORM_READY','RETRY_PAYMENT_FORM_READY'];
+function formObservation(value) {
+  try{
+    const keys=['widgetState','elementState','payState'];
+    if(!object(value)||Reflect.ownKeys(value).length!==3)return null;
+    const descriptors=Object.getOwnPropertyDescriptors(value);
+    if(keys.some(key=>!Object.hasOwn(descriptors,key)||!Object.hasOwn(descriptors[key],'value')))return null;
+    const [widgetState,elementState,payState]=keys.map(key=>descriptors[key].value);
+    if(!['idle','loading','ready','checking','processing','requires_action','succeeded','failed','unknown','expired','UNAVAILABLE'].includes(widgetState)
+      ||!['NO_HOST','EMPTY','FRAME','UNAVAILABLE'].includes(elementState)||!['ABSENT','HIDDEN','DISABLED','ENABLED','UNAVAILABLE'].includes(payState))return null;
+    return Object.freeze({widgetState,elementState,payState});
+  }catch{return null;}
+}
 const browserFailures=new WeakMap();
 const browserPair=(phase,code,exitCode,browserCase,browserStep)=>code==='OPERATION_FAILED'&&exitCode===null
   &&(phase==='CARDS'||phase==='MISSED'&&browserCase==='success')&&BROWSER_CASES.includes(browserCase)&&BROWSER_STEPS.includes(browserStep);
 
 /** Only private identity carries browser provenance; foreign rejections are never inspected. */
-export async function runSandboxBrowserStep(browserCase,browserStep,body) {
+export async function runSandboxBrowserStep(browserCase,browserStep,body,observeFailure) {
   if(!BROWSER_CASES.includes(browserCase)||!BROWSER_STEPS.includes(browserStep))rethrowSandboxBrowserFailure(null);
   try{return await body();}catch(error){
     if(browserFailures.has(error))throw error;
-    const token=Object.freeze(Object.create(null));browserFailures.set(token,{browserCase,browserStep});throw token;
+    let observation=null,timer;
+    if(FORM_STEPS.includes(browserStep)&&typeof observeFailure==='function'){
+      try{observation=formObservation(await Promise.race([Promise.resolve().then(observeFailure),new Promise(resolve=>{timer=setTimeout(()=>resolve(null),1000);})]));}
+      catch{/* An unavailable observation never replaces the original opaque failure. */}
+      finally{clearTimeout(timer);}
+    }
+    const token=Object.freeze(Object.create(null));browserFailures.set(token,{browserCase,browserStep,...(observation??{})});throw token;
   }
 }
 export function rethrowSandboxBrowserFailure(error) {
@@ -61,17 +80,20 @@ export function formatSandboxDiagnostic(value) {
   try {
     if(!object(value))return null;
     const keys=['tag','phase','code','exitCode','cleanupConfirmed'];
-    if(Reflect.ownKeys(value).length===7)keys.push('browserCase','browserStep');
+    const count=Reflect.ownKeys(value).length;
+    if(count===7||count===10)keys.push('browserCase','browserStep');
+    if(count===10)keys.push('widgetState','elementState','payState');
     if(Reflect.ownKeys(value).length!==keys.length)return null;
     const descriptors=Object.getOwnPropertyDescriptors(value);
     if(keys.some(key=>!Object.hasOwn(descriptors,key)||!Object.hasOwn(descriptors[key],'value')))return null;
-    const {tag,phase,code,exitCode,cleanupConfirmed,browserCase,browserStep}=Object.fromEntries(keys.map(key=>[key,descriptors[key].value]));
+    const {tag,phase,code,exitCode,cleanupConfirmed,browserCase,browserStep,widgetState,elementState,payState}=Object.fromEntries(keys.map(key=>[key,descriptors[key].value]));
     if(tag!=='stripe_sandbox_diagnostic'||!['PREPARE','LOGIN','LOGIN_COMPLETE','BINDING','LISTENER','START','PROVISION','READY','CARDS','REFUNDS','DONATIONS','MISSED','CONFIRMED','CLEANUP'].includes(phase)
       ||!['OPERATION_FAILED','PROCESS_EXIT_NONZERO','PROCESS_SIGNALLED','PROCESS_FAILED','PROCESS_TIMEOUT','ABORTED','DEADLINE_REACHED'].includes(code)
       ||typeof cleanupConfirmed!=='boolean')return null;
     if(code==='PROCESS_EXIT_NONZERO'? !Number.isInteger(exitCode)||exitCode<1||exitCode>255 : exitCode!==null)return null;
-    if(keys.length===7&&!browserPair(phase,code,exitCode,browserCase,browserStep))return null;
-    return `sandbox_diagnostic phase=${phase} code=${code} exit=${exitCode===null?'none':exitCode} cleanup=${cleanupConfirmed?'confirmed':'unconfirmed'}${keys.length===7?` browser_case=${browserCase} browser_step=${browserStep}`:''}\n`;
+    if(keys.length>=7&&!browserPair(phase,code,exitCode,browserCase,browserStep))return null;
+    if(keys.length===10&&(!FORM_STEPS.includes(browserStep)||!formObservation({widgetState,elementState,payState})))return null;
+    return `sandbox_diagnostic phase=${phase} code=${code} exit=${exitCode===null?'none':exitCode} cleanup=${cleanupConfirmed?'confirmed':'unconfirmed'}${keys.length>=7?` browser_case=${browserCase} browser_step=${browserStep}`:''}${keys.length===10?` widget_state=${widgetState} element_state=${elementState} pay_state=${payState}`:''}\n`;
   }catch{return null;}
 }
 
