@@ -53,6 +53,49 @@ it.each(['capability-pending','capability-rejected','loader-pending','loader-rej
     expect(requests.filter(r=>r.url.endsWith('/client-session'))).toHaveLength(1);expect(p.stripe.confirmPayment).not.toHaveBeenCalled();
   }finally{el.remove();release();await Promise.resolve();await Promise.resolve();}
 });
+// Break: treating an outer iframe or ready event as completion can hide a pending presentation catch-up.
+it.each(['resolve','disconnect'])('resumed pending presentation keeps loading/FRAME/ABSENT until %s without confirming or recreating',async outcome=>{
+  const p=stripeUiProvider(),requests=stripeApi();
+  await createGenericPaymentClient({apiBaseUrl:'https://api.test'}).createCatalogCheckout({siteKey:'test-site',priceKey:'lifetime'});
+  const el=mount();await until(el,'checking');const resume=el.shadowRoot!.querySelectorAll('button')[1];await vi.waitFor(()=>expect(resume).toBeEnabled());
+  const ready=vi.fn();el.addEventListener('ready',ready);let release=()=>{};
+  p.elements.update.mockImplementationOnce(()=>new Promise<void>(resolve=>{release=resolve;}));
+  try{
+    resume.click();await vi.waitFor(()=>expect(el.shadowRoot!.querySelector('iframe')).toBe(p.frame));
+    el.locale='pt-PT';p.emit('ready');await vi.waitFor(()=>expect(p.elements.update).toHaveBeenCalledOnce());
+    expect(observeForm(el)).toEqual({widgetState:'loading',elementState:'FRAME',payState:'ABSENT'});
+    expect(ready).not.toHaveBeenCalled();
+    if(outcome==='disconnect'){
+      el.remove();release();await Promise.resolve();await Promise.resolve();
+      expect(el.shadowRoot!.querySelector('iframe')).toBeNull();expect(ready).not.toHaveBeenCalled();
+      expect(p.element.destroy).toHaveBeenCalledOnce();
+    }else{
+      release();await until(el,'ready');
+      expect(observeForm(el)).toEqual({widgetState:'ready',elementState:'FRAME',payState:'ENABLED'});
+      expect(ready).toHaveBeenCalledOnce();expect(el.shadowRoot!.querySelector('iframe')).toBe(p.frame);
+      expect(p.element.destroy).not.toHaveBeenCalled();
+    }
+    expect(requests.map(request=>request.method)).toEqual(['POST','GET','POST']);
+    expect(requests.filter(request=>request.url.endsWith('/sites/test-site/checkouts'))).toHaveLength(1);
+    expect(requests.filter(request=>request.url.endsWith('/client-session'))).toHaveLength(1);
+    expect(p.stripe.confirmPayment).not.toHaveBeenCalled();
+  }finally{el.remove();release();await Promise.resolve();await Promise.resolve();}
+});
+// Break: registering ready after mount loses a synchronous provider event and strands a recovered checkout.
+it('resumed synchronous ready during Element mount enables Pay on the same checkout without confirmation',async()=>{
+  const p=stripeUiProvider(),requests=stripeApi();
+  await createGenericPaymentClient({apiBaseUrl:'https://api.test'}).createCatalogCheckout({siteKey:'test-site',priceKey:'lifetime'});
+  const el=mount();await until(el,'checking');const resume=el.shadowRoot!.querySelectorAll('button')[1];await vi.waitFor(()=>expect(resume).toBeEnabled());
+  vi.spyOn(p.element,'mount').mockImplementationOnce(host=>{host.append(p.frame);p.emit('ready');});
+  try{
+    resume.click();await until(el,'ready');
+    expect(observeForm(el)).toEqual({widgetState:'ready',elementState:'FRAME',payState:'ENABLED'});
+    expect(requests.map(request=>request.method)).toEqual(['POST','GET','POST']);
+    expect(requests.filter(request=>request.url.endsWith('/sites/test-site/checkouts'))).toHaveLength(1);
+    expect(requests.filter(request=>request.url.endsWith('/client-session'))).toHaveLength(1);
+    expect(p.stripe.confirmPayment).not.toHaveBeenCalled();
+  }finally{el.remove();}
+});
 it('safe form observation is serializable and never reads markup frame URLs values or arbitrary state',()=>{
   const el=document.createElement('div'),root=el.attachShadow({mode:'open'}),host=document.createElement('div'),frame=document.createElement('iframe'),pay=document.createElement('button');
   host.className='payment-element';host.append(frame);pay.setAttribute('aria-label','Pay');root.append(host,pay);

@@ -425,6 +425,11 @@ It reads only SDK-owned DOM presence and native button flags, never markup/text,
 frame contents, input values, provider responses or error objects. `ENABLED` does not
 prove CSS visibility, current readiness, or payment; this is a snapshot after failure.
 For example, `loading/FRAME/ABSENT` means an outer iframe exists while Pay is unavailable;
+it does not prove whether the driver's `ready` wait is still pending or a presentation
+change during initialization is awaiting its post-ready catch-up. Both paths can produce
+that snapshot in offline characterization tests. The observation itself does not record
+either event, so it cannot select between them in an actual failed run. `FRAME` means any
+iframe under the owned host, not proof of the titled card frame or accessible card inputs.
 `checking/EMPTY/ABSENT` is compatible with multiple initialization failures, not a unique
 loader/client-session/provider diagnosis. Earlier failures cannot be reconstructed from it.
 No production SDK/backend/payment behavior or existing 15-second readiness wait is changed.
