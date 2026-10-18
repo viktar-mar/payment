@@ -26,6 +26,10 @@ export async function runSandboxCard(browser:Browser,fixture:SandboxFixture,name
     await step('RESUME',()=>widget.getByRole('button',{name:'Resume existing payment',exact:true}).click({timeout:15000}));
     const frame=widget.frameLocator('iframe[title="Secure payment input frame"]');
     async function card(number:string,retry=false) {
+      // Resume starts asynchronous mounting; a click is not provider-readiness proof.
+      await step(retry?'RETRY_PAYMENT_FORM_READY':'PAYMENT_FORM_READY',()=>widget.locator('button[aria-label="Pay"]:enabled').waitFor({state:'visible',timeout:15000}));
+      await step(retry?'RETRY_CARD_FRAME':'CARD_FRAME',()=>widget.locator('iframe[title="Secure payment input frame"]').waitFor({state:'visible',timeout:15000}));
+      await step(retry?'RETRY_CARD_NUMBER_READY':'CARD_NUMBER_READY',()=>frame.locator('input[name="number"]').waitFor({state:'visible',timeout:15000}));
       await step(retry?'RETRY_CARD_NUMBER':'CARD_NUMBER',()=>frame.locator('input[name="number"]').fill(number,{timeout:15000}));
       await step(retry?'RETRY_CARD_EXPIRY':'CARD_EXPIRY',()=>frame.locator('input[name="expiry"]').fill('1230'));
       await step(retry?'RETRY_CARD_CVC':'CARD_CVC',()=>frame.locator('input[name="cvc"]').fill('123'));

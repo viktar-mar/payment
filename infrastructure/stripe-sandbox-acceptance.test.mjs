@@ -255,13 +255,13 @@ async function reportFrames(frames,owned=true,exercisePrivateChannels=false){
   }finally{write.mock.restore();if(old===undefined)delete process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN;else process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN=old;}
 }
 
-const browserSteps=['BEGIN_BROWSER','NEW_CONTEXT','CHECKOUT_SESSION','INSTALL_SESSION','NEW_PAGE','NAVIGATE','RESUME','CARD_NUMBER','CARD_EXPIRY','CARD_CVC','POSTAL_CHECK','POSTAL_FILL','MARK_PAY','PAY','MARK_RETRY','RETRY_CARD_NUMBER','RETRY_CARD_EXPIRY','RETRY_CARD_CVC','RETRY_POSTAL_CHECK','RETRY_POSTAL_FILL','RETRY_PAY','SCA_COMPLETE','SERVER_CONFIRM','CLOSE_CONTEXT'];
+const browserSteps=['BEGIN_BROWSER','NEW_CONTEXT','CHECKOUT_SESSION','INSTALL_SESSION','NEW_PAGE','NAVIGATE','RESUME','PAYMENT_FORM_READY','CARD_FRAME','CARD_NUMBER_READY','CARD_NUMBER','CARD_EXPIRY','CARD_CVC','POSTAL_CHECK','POSTAL_FILL','MARK_PAY','PAY','MARK_RETRY','RETRY_PAYMENT_FORM_READY','RETRY_CARD_FRAME','RETRY_CARD_NUMBER_READY','RETRY_CARD_NUMBER','RETRY_CARD_EXPIRY','RETRY_CARD_CVC','RETRY_POSTAL_CHECK','RETRY_POSTAL_FILL','RETRY_PAY','SCA_COMPLETE','SERVER_CONFIRM','CLOSE_CONTEXT'];
 function syntheticCard(failAt,closeFails=false){
   const events=[],contexts=[];let retry=false;
   const operation=async(step,args)=>{events.push({step,args});if(step===failAt||step==='CLOSE_CONTEXT'&&closeFails)throw new Proxy({},{get(){throw new Error('private-must-not-read');}});};
-  const frame={locator:selector=>({fill:async(...args)=>operation((retry?'RETRY_':'')+({'input[name="number"]':'CARD_NUMBER','input[name="expiry"]':'CARD_EXPIRY','input[name="cvc"]':'CARD_CVC','input[name="postalCode"]':'POSTAL_FILL'})[selector],args),
+  const frame={locator:selector=>({waitFor:async(...args)=>operation((retry?'RETRY_':'')+'CARD_NUMBER_READY',args),fill:async(...args)=>operation((retry?'RETRY_':'')+({'input[name="number"]':'CARD_NUMBER','input[name="expiry"]':'CARD_EXPIRY','input[name="cvc"]':'CARD_CVC','input[name="postalCode"]':'POSTAL_FILL'})[selector],args),
     isVisible:async()=>{await operation((retry?'RETRY_':'')+'POSTAL_CHECK',[]);return true;}})};
-  const widget={first(){return this;},frameLocator:()=>frame,getByRole:(_role,options)=>({click:async(...args)=>operation(options.name==='Pay'?(retry?'RETRY_PAY':'PAY'):'RESUME',args)})};
+  const widget={first(){return this;},locator:selector=>({waitFor:async(...args)=>operation((retry?'RETRY_':'')+(selector.startsWith('button')?'PAYMENT_FORM_READY':'CARD_FRAME'),args)}),frameLocator:()=>frame,getByRole:(_role,options)=>({click:async(...args)=>operation(options.name==='Pay'?(retry?'RETRY_PAY':'PAY'):'RESUME',args)})};
   const challenge={frameLocator(){return this;},getByRole:()=>({click:async(...args)=>operation('SCA_COMPLETE',args)})};
   const page={goto:async(...args)=>operation('NAVIGATE',args),locator:()=>widget,frameLocator:()=>challenge};
   const context={addInitScript:async(...args)=>operation('INSTALL_SESSION',args),newPage:async()=>{await operation('NEW_PAGE',[]);return page;},close:async()=>{try{await operation('CLOSE_CONTEXT',[]);}finally{contexts.splice(0);}}};

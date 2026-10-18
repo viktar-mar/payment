@@ -114,6 +114,21 @@ it('failed explicit Stripe recovery stays checking with no automatic retry', asy
   const resume = el.shadowRoot!.querySelectorAll('button')[1]; await vi.waitFor(() => expect(resume).toBeEnabled());
   vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { requests.push(new Request(url, init)); throw new TypeError('sensitive'); }); resume.click(); await vi.waitFor(() => expect(button(el)).toBeEnabled()); expect(el.state).toBe('checking'); expect(requests).toHaveLength(4); expect(p.stripe.confirmPayment).not.toHaveBeenCalled();
 });
+// Characterization: iframe presence after Resume is not the SDK's ready-to-Pay contract.
+it.each(['ready', 'loaderror'])('exposes the acceptance Pay readiness gate only for resumed Stripe ready, not %s alone', async event => {
+  const p = stripeUiProvider(), requests = stripeApi(), first = mount(); await stripeReady(first, p); first.remove();
+  const el = mount(); await until(el, 'checking'); const resume = el.shadowRoot!.querySelectorAll('button')[1];
+  await vi.waitFor(() => expect(resume).toBeEnabled()); resume.click();
+  await vi.waitFor(() => expect(el.shadowRoot!.querySelector('iframe')).toBe(p.frame));
+  expect(el.state).toBe('loading'); expect(el.shadowRoot!.querySelector('button[aria-label="Pay"]:enabled')).toBeNull();
+  expect(p.stripe.confirmPayment).not.toHaveBeenCalled();
+  p.emit(event); await until(el, event === 'ready' ? 'ready' : 'checking');
+  const pay = el.shadowRoot!.querySelector('button[aria-label="Pay"]:enabled');
+  if (event === 'ready') expect(pay).toBeVisible(); else expect(pay).toBeNull();
+  expect(requests.filter(r => r.url.endsWith('/sites/test-site/checkouts'))).toHaveLength(1);
+  expect(requests.filter(r => r.url.endsWith('/client-session'))).toHaveLength(2);
+  expect(p.stripe.confirmPayment).not.toHaveBeenCalled();
+});
 it('backend checkout expiry during a manual check destroys the live Stripe form', async () => {
   const p = stripeUiProvider(); stripeApi(); const el = mount(); await stripeReady(el, p); button(el).click(); await until(el, 'checking');
   vi.stubGlobal('fetch', async () => json({ code: 'CHECKOUT_EXPIRED' }, 410)); button(el).click(); await until(el, 'expired'); expect(p.element.destroy).toHaveBeenCalledOnce(); expect(el.shadowRoot!.querySelector('iframe')).toBeNull();

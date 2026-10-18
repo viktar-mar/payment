@@ -16,11 +16,11 @@ mock.method(globalThis,'fetch',forbidden);
 for(const name of ['open','readFile','lstat','realpath','readdir','mkdir','rename','unlink'] as const)mock.method(filesystem,name,forbidden);
 syncBuiltinESMExports();after(()=>{mock.restoreAll();syncBuiltinESMExports();});
 
-function cardBoundary(begin=true,postalVisible=true){
+function cardBoundary(begin=true,postalVisible=true,onWait?:(kind:'form'|'frame'|'number')=>Promise<void>){
   const events:unknown[][]=[],record={synthetic:'session'},identity={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:14173'},site:{key:'synthetic-site'},price:{key:'synthetic-price'}};
   const add=(...args:unknown[])=>{events.push(args);};
-  const frame={locator:(selector:string)=>({fill:async(...args:unknown[])=>add('fill',selector,...args),isVisible:async()=>{add('visible',selector);return postalVisible;}})};
-  const widget={first(){add('first');return this;},getByRole:(...args:unknown[])=>({click:async(...options:unknown[])=>add('click',...args,...options)}),frameLocator:(...args:unknown[])=>{add('frame',...args);return frame;}};
+  const frame={locator:(selector:string)=>({waitFor:async(...args:unknown[])=>{add('field-wait',selector,...args);await onWait?.('number');},fill:async(...args:unknown[])=>add('fill',selector,...args),isVisible:async()=>{add('visible',selector);return postalVisible;}})};
+  const widget={first(){add('first');return this;},locator:(selector:string)=>({waitFor:async(...args:unknown[])=>{add('widget-wait',selector,...args);await onWait?.(selector.startsWith('button')?'form':'frame');}}),getByRole:(...args:unknown[])=>({click:async(...options:unknown[])=>add('click',...args,...options)}),frameLocator:(...args:unknown[])=>{add('frame',...args);return frame;}};
   const challenge={frameLocator:(...args:unknown[])=>{add('challenge-frame',...args);return {getByRole:(...role:unknown[])=>({click:async(...options:unknown[])=>add('complete',...role,...options)})};}};
   const page={goto:async(...args:unknown[])=>add('goto',...args),locator:(...args:unknown[])=>{add('widget',...args);return widget;},frameLocator:(...args:unknown[])=>{add('challenge',...args);return challenge;}};
   const context={addInitScript:async(body:unknown,argument:unknown)=>{assert.equal(typeof body,'function');add('install',argument);},newPage:async()=>{add('new-page');return page;},close:async()=>add('close')};
@@ -29,9 +29,33 @@ function cardBoundary(begin=true,postalVisible=true){
   return {browser,fixture,events,record};
 }
 const card=(number:string,postal=true)=>[
+  ['widget-wait','button[aria-label="Pay"]:enabled',{state:'visible',timeout:15000}],
+  ['widget-wait','iframe[title="Secure payment input frame"]',{state:'visible',timeout:15000}],
+  ['field-wait','input[name="number"]',{state:'visible',timeout:15000}],
   ['fill','input[name="number"]',number,{timeout:15000}],['fill','input[name="expiry"]','1230'],['fill','input[name="cvc"]','123'],
   ['visible','input[name="postalCode"]'],...(postal?[['fill','input[name="postalCode"]','10001']]:[]),
 ];
+// Break: proceeding on Resume's click rather than provider readiness can reach fields or Pay too early.
+for(const retry of [false,true])test(`card driver waits for ${retry?'retry':'initial'} form readiness before filling or further authority`,async()=>{
+  let release!:()=>void,forms=0;const pending=new Promise<void>(resolve=>{release=resolve;});
+  const f=cardBoundary(true,true,async kind=>{if(kind==='form'&&++forms===(retry?2:1))await pending;});
+  const running=runSandboxCard(f.browser,f.fixture,retry?'decline':'success');
+  await new Promise(resolve=>setImmediate(resolve));
+  try{
+    assert.equal(f.events.filter(e=>e[0]==='fill'&&e[1]==='input[name="number"]').length,retry?1:0);
+    assert.equal(f.events.some(e=>e[0]==='confirm'),false);
+    assert.equal(f.events.filter(e=>e[0]==='click'&&(e[2] as {name?:string})?.name==='Pay').length,retry?1:0);
+  }finally{release();await running;}
+  assert.deepEqual(f.events.at(-2),['confirm',retry?'decline':'success']);assert.deepEqual(f.events.at(-1),['close']);
+});
+for(const retry of [false,true])for(const gate of ['form','frame','number'] as const)test(`${retry?'retry':'initial'} ${gate} gate failure stops later fields and financial actions`,async()=>{
+  let forms=0,reads=0;const hostile=new Proxy({},{get(){reads++;throw null;}});
+  const f=cardBoundary(true,true,async kind=>{if(kind==='form')forms++;if(kind===gate&&forms===(retry?2:1))throw hostile;});
+  await assert.rejects(runSandboxCard(f.browser,f.fixture,retry?'decline':'success'));
+  assert.equal(reads,0);assert.equal(f.events.filter(e=>e[0]==='fill'&&e[1]==='input[name="number"]').length,retry?1:0);
+  assert.equal(f.events.some(e=>e[0]==='confirm'),false);assert.deepEqual(f.events.at(-1),['close']);
+  assert.equal(f.events.filter(e=>e[0]==='click'&&(e[2] as {name?:string})?.name==='Pay').length,retry?1:0);
+});
 // Break: diagnostic wrappers must not change selectors, arguments, retry ordering or the server confirmation boundary.
 for(const name of ['success','decline','sca'] as const)test(`real ${name} driver preserves original boundary calls and arguments`,async()=>{
   const f=cardBoundary();await runSandboxCard(f.browser,f.fixture,name);

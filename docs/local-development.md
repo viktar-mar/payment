@@ -404,6 +404,17 @@ elapsed-clock guesses cannot establish timeout provenance; existing proven nonze
 close diagnostics retain their established behavior outside the local-timeout path.
 Raw errors, process output, arguments, paths, browser URLs and private fields are excluded
 from diagnostics. The separate public authorization handoff still appears immediately.
+Before each original/retry card fill, the driver waits separately for an enabled visible
+Pay action (`PAYMENT_FORM_READY`), the existing exact iframe (`CARD_FRAME`) and its visible
+number field (`CARD_NUMBER_READY`); retry labels use `RETRY_`. Each condition is bounded
+at 15 seconds and does not renew the original run deadline. Resume's click only starts
+asynchronous mounting; it is not provider-readiness proof. A failed condition stops later
+field writes, Pay and subsequent journeys. UI readiness is never financial confirmation.
+These labels distinguish form readiness, frame visibility, field visibility and the
+existing `CARD_NUMBER` fill/actionability failure without exposing DOM, URLs or values.
+Selectors and card values remain unchanged. Offline tests do not establish Stripe's
+current iframe DOM or uniquely explain an earlier Sandbox failure; real acceptance still
+requires a separately approved run, with no automatic retry of retained operations.
 Malformed, duplicate, oversized or unfinished diagnostics produce the fixed
 `sandbox_diagnostic_failed_manual_check` marker and force final failure; a valid diagnostic
 also forces failure. Successful runs emit no diagnostic. These observations neither
