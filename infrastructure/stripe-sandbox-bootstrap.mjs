@@ -5,7 +5,7 @@ import {randomBytes,generateKeyPairSync} from 'node:crypto';
 import {createServer} from 'node:net';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {preflightOwnedSandbox} from './stripe-sandbox-owned.mjs';
+import {preflightOwnedSandbox,preflightOwnedFormDiagnostic,formDiagnosticOptIn} from './stripe-sandbox-owned.mjs';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const DOCKER='/Applications/Docker.app/Contents/Resources/bin/docker';
@@ -113,8 +113,17 @@ async function publicHealth(url,context) {
 
 /** Inert constructor. Root alone owns login, listener, provisioning and financial work. */
 export async function createOwnedSandboxBootstrap(options,dependencies={}) {
+  return createBootstrap(options,dependencies,false);
+}
+
+export async function createOwnedFormDiagnosticBootstrap(options,dependencies={}) {
+  return createBootstrap(options,dependencies,true);
+}
+
+async function createBootstrap(options,dependencies,diagnostic) {
   let enabled=false;
-  try {const env=options?.env;enabled=env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true';} catch {}
+  try {const env=options?.env;enabled=diagnostic?formDiagnosticOptIn(env):env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'
+    &&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY!=='true';} catch {}
   if(!enabled)throw fixed('OPT_IN_REQUIRED');
   let runId,expectedSource,daemon,ports,env,io;
   try {
@@ -129,12 +138,13 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     if(typeof daemon!=='string'||/[\s\x00-\x1f\x7f%]/.test(daemon))fail();
     const url=new URL(daemon);
     if(url.protocol!=='unix:'||url.host||url.username||url.password||url.search||url.hash||url.pathname.length<2||url.href!==daemon||daemon!=='unix://'+url.pathname)fail();
-    const binding=options.approvedBinding;
+    const binding=diagnostic?{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'}:options.approvedBinding;
     if(!object(binding)||Object.keys(binding).sort().join(',')!=='apiVersion,externalAccountId'
       ||binding.externalAccountId!=='acct_1UPiMpELswAd8tpR'||binding.apiVersion!=='2026-09-30.endive')fail();
-    env=Object.freeze({PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',DEBUG:flags.DEBUG,NODE_DEBUG:flags.NODE_DEBUG,PWDEBUG:flags.PWDEBUG});
+    env=Object.freeze(diagnostic?{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}:
+      {PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',DEBUG:flags.DEBUG,NODE_DEBUG:flags.NODE_DEBUG,PWDEBUG:flags.PWDEBUG});
     const raw=dependencies.execFile??execFile;
-    io=Object.freeze({execute:dependencies.execute??((...args)=>executeAwaited(raw,...args)),preflight:dependencies.preflight??preflightOwnedSandbox,
+    io=Object.freeze({execute:dependencies.execute??((...args)=>executeAwaited(raw,...args)),preflight:dependencies.preflight??(diagnostic?preflightOwnedFormDiagnostic:preflightOwnedSandbox),
       lstat:dependencies.lstat??lstat,realpath:dependencies.realpath??realpath,readFile:dependencies.readFile??readFile,readdir:dependencies.readdir??readdir,
       mkdir:dependencies.mkdir??mkdir,open:dependencies.open??open,rename:dependencies.rename??rename,unlink:dependencies.unlink??unlink,
       randomBytes:dependencies.randomBytes??randomBytes,generateKeyPairSync:dependencies.generateKeyPairSync??generateKeyPairSync,
@@ -149,7 +159,7 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
   const endpoints=frozen({backend:'http://127.0.0.1:'+ports.backend,demo:'http://127.0.0.1:'+ports.demo,receiver:'http://127.0.0.1:'+ports.receiver,
     postgres:'postgresql://127.0.0.1:'+ports.postgres,mailpitHttp:'http://127.0.0.1:'+ports.mailpitHttp,mailpitSmtp:'smtp://127.0.0.1:'+ports.mailpitSmtp});
   let busy=false,pending=false,status='NEW',startup=null,lock=null,sequence=0,issuerProved=false,webhookReady=false,live=false,retired=false;
-  let inputs=null,admin=null;
+  let inputs=null,admin=null,providerKeys=null,diagnosticConfigured=false;
   let terminalBuild=false,buildDiagnostic=null,buildxIdentity=null;
   const buildxDirectory=directory+'/buildx',dockerEnvironment=Object.freeze({...CHILD_ENV,DOCKER_CONFIG:'/private/var/empty',BUILDX_CONFIG:buildxDirectory});
   const recorded={images:{},network:null,volumes:{},containers:{},retiredBackend:null},intents=[],privateIdentities=new Map();
@@ -161,7 +171,7 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
   }
   function resources() {
     return frozen(JSON.parse(JSON.stringify({runId,expectedSource,daemon,project,siteKey,ports,cliDirectory:directory+'/cli',endpoints,
-      status:pending?'PENDING':status,webhookReady,...recorded,...(buildDiagnostic?{buildDiagnostic}:{})})));
+      status:pending?'PENDING':status,webhookReady,...(diagnostic?{mode:'FORM_DIAGNOSTIC'}:{}),...recorded,...(buildDiagnostic?{buildDiagnostic}:{})})));
   }
   async function operation(phase,limits,body,{cleanup=false,diagnostic=false}={}) {
     if(terminalBuild&&!diagnostic)throw fixed(phase+'_PENDING');
@@ -295,7 +305,7 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
       PAYMENT_DATA_ENCRYPTION_KEY:'buildOnly',PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY:'buildOnly',PAYMENT_CUSTOMER_DIGEST_KEY_V1:'buildOnly',PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1:'buildOnly',...portInputs()};
     await exclusiveFile(directory+'/build.env',envText(synthetic),context);await intent('BUILD','backend+demo-site',context);
     if(buildDiagnostic) {buildDiagnostic.stage='BUILD_COMMAND';await ledger(context);}
-    await docker(composeArgs(directory+'/build.env',['build','--quiet','backend','demo-site'],{override:false}),context,1200000);
+    await docker(composeArgs(directory+'/build.env',['build','--quiet',...(diagnostic?['--build-arg','PAYMENT_DEMO_BUILD_MODE=form-diagnostic']:[]),'backend','demo-site'],{override:false}),context,1200000);
     for(const service of ['backend','demo-site']) {
       if(buildDiagnostic) {buildDiagnostic.stage=service==='backend'?'BACKEND_IMAGE_PROOF':'DEMO_IMAGE_PROOF';await ledger(context);}
       await imageProof(service,context);
@@ -318,10 +328,10 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     const keys=[{...rsa.privateKey.export({format:'jwk'}),kid:'local-fixture-rs',alg:'RS256',use:'sig'},
       {...ec.privateKey.export({format:'jwk'}),kid:'local-fixture-es',alg:'ES256',use:'sig'}];
     await exclusiveFile(directory+'/app.env',envText(inputs),context);await exclusiveFile(directory+'/issuer.jwks.json',JSON.stringify({keys})+'\n',context);
-    for(const suffix of ['/cli','/cli/home','/cli/config','/cli/config/stripe']) {
+    if(!diagnostic)for(const suffix of ['/cli','/cli/home','/cli/config','/cli/config/stripe']) {
       await io.mkdir(directory+suffix,{mode:0o700});await directoryProof(directory+suffix,context,true);await syncDirectory(dirname(directory+suffix),context);
     }
-    await exclusiveFile(directory+'/cli/config/stripe/config.toml','',context);
+    if(!diagnostic)await exclusiveFile(directory+'/cli/config/stripe/config.toml','',context);
   }
   async function absent(args,context) {if((await docker(args,context)).stdout.trim()!=='')fail();}
   async function noPriorResources(context) {
@@ -405,7 +415,7 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     portProof(value.PortBindings,expectedPorts(service));
     if(typeof value.StripeKeyPresent!=='boolean'||typeof value.SandboxDisabled!=='boolean')fail();
     if(service!=='backend'&&value.StripeKeyPresent)fail();
-    if(service==='backend'&&(retired?(!value.StripeKeyPresent||value.SandboxDisabled):value.StripeKeyPresent||!value.SandboxDisabled))fail();
+    if(service==='backend'&&((retired||diagnosticConfigured)?(!value.StripeKeyPresent||value.SandboxDisabled):value.StripeKeyPresent||!value.SandboxDisabled))fail();
     const expectedUser=helper?(service==='issuer-installer'?'0:0':'10001:10001'):service==='callback-receiver'?'node':sourceImage.user;
     if(value.User!==expectedUser||value.ReadonlyRootfs!==helper)fail();
     if(helper) {
@@ -491,8 +501,9 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     if(status!=='NEW')fail();startup={deadline:context.deadline,signal:context.externalSignal};
     await sourceGate(context);await privateTree(context);await noPriorResources(context);await build(context);await pullImages(context);await generate(context);await infrastructure(context);await issuer(context);
     await exclusiveFile(directory+'/owned.yaml',overrideText(),context);await configProof(context);await sourceGate(context);
+    if(diagnostic)await configureDiagnostic(context);
     await intent('CREATE_STOPPED',project,context);
-    await docker(composeArgs(directory+'/app.env',['up','--no-start','--no-deps','--no-build','--pull','never',...SERVICES]),context);
+    await docker(composeArgs(directory+(diagnostic?'/final.env':'/app.env'),['up','--no-start','--no-deps','--no-build','--pull','never',...SERVICES],{stripe:diagnostic}),context);
     for(const service of SERVICES) {const proof=await containerProof(service,project+'-'+service,context,{neverStarted:true});recorded.containers[service]=proof.safe;}
     await topology(context,false,true);await acknowledgement(context);status='PREPARED';await ledger(context);return true;
   }
@@ -541,6 +552,24 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     if(!validFile(current)||!validFile(held)||current.ino!==original.stat.ino||current.dev!==original.stat.dev
       ||held.ino!==original.stat.ino||held.dev!==original.stat.dev||await io.realpath(USERFILE)!==USERFILE
       ||!(await boundedRead(original.file,context)).equals(original.bytes))fail();
+  }
+  async function configureDiagnostic(context) {
+    const original=await userFile(context);
+    try {
+      // Accept the existing verifier as opaque input; never publish it or rewrite user configuration.
+      const text=original.bytes.toString('utf8'),values={};
+      if(!Buffer.from(text).equals(original.bytes)||text.includes('\0'))fail();
+      for(const line of text.split(/\r?\n/)) {
+        if(/^\s*(?:#.*)?$/.test(line))continue;
+        const m=/^([A-Z_]+)=(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s'"\r\n]*))$/.exec(line);
+        if(!m||!STRIPE_NAMES.includes(m[1])||Object.hasOwn(values,m[1]))fail();values[m[1]]=m[2]??m[3]??m[4];
+      }
+      if(Object.keys(values).length!==3||! /^(?:sk|rk)_test_[A-Za-z0-9]+$/.test(values[STRIPE_NAMES[0]])
+        ||!/^pk_test_[A-Za-z0-9]+$/.test(values[STRIPE_NAMES[1]])||Object.values(values).some(v=>/replace_me|your_key|synthetic|sentinel|example/i.test(v)))fail();
+      await unchanged(original,context);providerKeys=Object.freeze({secretKey:values[STRIPE_NAMES[0]],publishableKey:values[STRIPE_NAMES[1]]});
+      const verifier='whsec_'+io.randomBytes(32).toString('hex');if(!/^whsec_[a-f0-9]{64}$/.test(verifier))fail();
+      await exclusiveFile(directory+'/final.env',envText({...inputs,...values,[STRIPE_NAMES[2]]:verifier}),context);diagnosticConfigured=true;
+    }finally{await original.file.close();}
   }
   function parsedUser(bytes,secret) {
     const text=bytes.toString('utf8');if(!Buffer.from(text).equals(bytes)||text.includes('\0'))fail();
@@ -613,17 +642,17 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     }
   }
   async function start(context) {
-    if(status!=='PREPARED'||!webhookReady||!issuerProved||retired||live)fail();
+    if(status!=='PREPARED'||!(diagnostic?diagnosticConfigured:webhookReady)||!issuerProved||retired||live)fail();
     await sourceIdentity(context);await topology(context,false,true);
     for(const port of Object.values(ports))if(await io.portAvailable(port,'127.0.0.1',context)!==true)fail();
-    const old=recorded.containers.backend;await containerProof('backend',old.id,context,{neverStarted:true});
+    if(!diagnostic){const old=recorded.containers.backend;await containerProof('backend',old.id,context,{neverStarted:true});
     await intent('RETIRE_PLACEHOLDER',old.id,context);
     const removed=await docker(['container','rm',old.id],context);if(removed.stdout.trim()!==old.id)fail();
     recorded.retiredBackend=old;delete recorded.containers.backend;retired=true;await projectProof(context);await acknowledgement(context);
     await intent('CREATE_FINAL_BACKEND',project+'-backend',context);
     await docker(composeArgs(directory+'/final.env',['up','--no-start','--no-deps','--no-build','--pull','never','backend'],{stripe:true}),context);
     const proof=await containerProof('backend',project+'-backend',context,{neverStarted:true});recorded.containers.backend=proof.safe;
-    await topology(context,false,true);await acknowledgement(context);
+    await topology(context,false,true);await acknowledgement(context);}
     for(const service of SERVICES) {
       await topology(context);await containerProof(service,recorded.containers[service].id,context,{neverStarted:true});
       await intent('START_SERVICE',recorded.containers[service].id,context);await docker(['container','start',recorded.containers[service].id],context);
@@ -657,7 +686,7 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
     live=false;status='STOPPED';await ledger(context);if(lock) {await lock.close();lock=null;}return true;
   }
 
-  return Object.freeze({
+  const capabilities={
     buildOnly:async limits=>{
       if(terminalBuild||busy||pending||status!=='NEW')throw fixed(busy?'OPERATION_BUSY':'BUILD_PENDING');
       terminalBuild=true;buildDiagnostic={stage:'ADMISSION',result:'RUNNING',category:'NONE'};
@@ -674,5 +703,13 @@ export async function createOwnedSandboxBootstrap(options,dependencies={}) {
       if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({username:admin.username,password:admin.password}));}),context)!==true)fail();return true;
     }),
     stop:limits=>operation('STOP',limits,stop,{cleanup:true}),
-  });
+  };
+  if(diagnostic) return Object.freeze({prepare:capabilities.prepare,start:capabilities.start,verify:capabilities.verify,resources,
+    withAdminCredentials:capabilities.withAdminCredentials,stop:capabilities.stop,
+    withProviderCredentials:callback=>operation('ADMIN',startup,async context=>{
+      if(typeof callback!=='function'||!diagnosticConfigured||!providerKeys)fail();
+      await sourceIdentity(context);await topology(context,live,!live);
+      if(await controlled(Promise.resolve().then(()=>{check(context);return callback(providerKeys);}),context)!==true)fail();return true;
+    })});
+  return Object.freeze(capabilities);
 }

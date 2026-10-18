@@ -18,10 +18,11 @@ COPY examples/demo-site/package.json examples/demo-site/pnpm-lock.yaml ./example
 RUN cd examples/demo-site \
     && pnpm install --frozen-lockfile
 
-COPY examples/demo-site/index.html examples/demo-site/payment-return.html examples/demo-site/tsconfig.json examples/demo-site/vite.config.ts ./examples/demo-site/
+COPY examples/demo-site/index.html examples/demo-site/payment-return.html examples/demo-site/form-load-diagnostic.html examples/demo-site/tsconfig.json examples/demo-site/vite.config.ts ./examples/demo-site/
 COPY examples/demo-site/src ./examples/demo-site/src
+ARG PAYMENT_DEMO_BUILD_MODE=production
 RUN cd examples/demo-site \
-    && pnpm build
+    && pnpm build --mode "$PAYMENT_DEMO_BUILD_MODE"
 
 FROM nginxinc/nginx-unprivileged:1.29.5-alpine3.23
 

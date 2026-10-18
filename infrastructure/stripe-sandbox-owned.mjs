@@ -49,10 +49,31 @@ function portAvailable(port,host,dependencies) {
  * A later bootstrap must recheck ownership/availability immediately before its own actions.
  */
 export async function preflightOwnedSandbox(options,dependencies={}) {
+  return preflight(options,dependencies,false);
+}
+
+// This gate runs before consulting dependencies or any private configuration.
+export function formDiagnosticOptIn(env) {
+  try {return env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'
+    &&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'
+    &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS)
+    &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_FULL_RUN)
+    &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN)
+    &&[undefined,''].includes(env.DEBUG)&&[undefined,''].includes(env.NODE_DEBUG)
+    &&[undefined,'','0'].includes(env.PWDEBUG)&&[undefined,'','off'].includes(env.PW_TRACE);}
+  catch {return false;}
+}
+
+export async function preflightOwnedFormDiagnostic(options,dependencies={}) {
+  return preflight(options,dependencies,true);
+}
+
+async function preflight(options,dependencies,diagnostic) {
   let phase='OPT_IN',code='OPT_IN_REQUIRED';
   try {
     const env=options?.env;
-    if(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true')return pending(phase,code);
+    if(diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'
+      ||env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'||env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'))return pending(phase,code);
     phase='INPUTS';code='CONFIGURATION';
     if(![undefined,''].includes(env.DEBUG)||![undefined,''].includes(env.NODE_DEBUG)||![undefined,'','0'].includes(env.PWDEBUG))return pending(phase,code);
     const {runId,expectedSource,daemon,ports}=options;

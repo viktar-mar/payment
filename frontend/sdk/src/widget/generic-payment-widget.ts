@@ -5,6 +5,7 @@ import { recoverCheckout } from "../storage.js";
 import { widgetStyles } from "./styles.js";
 import { CheckoutProviderView, checkoutPresentation } from './checkout-provider-view.js';
 import { subscribeCheckoutCustomer } from '../customer/session-lifecycle.js';
+import { registerFormLoadWidget, configureFormLoadWidget, disconnectFormLoadWidget, resumeFormLoadWidget, bindFormLoadDiagnostic, markFormLoad } from '../diagnostics/form-load-observer.js';
 export type WidgetState = "idle" | "loading" | "ready" | "checking" | "processing" | "requires_action" | "succeeded" | "failed" | "unknown" | "expired";
 // Importing ESM in non-DOM build tooling does not evaluate a missing HTMLElement.
 const ElementBase = (typeof HTMLElement === "undefined" ? class {} : HTMLElement) as typeof HTMLElement;
@@ -40,6 +41,7 @@ export class GenericPaymentWidget extends ElementBase {
   set locale(value: string) { this.setAttribute("locale", value); }
   constructor() {
     super();
+    registerFormLoadWidget(this);
     const root = this.attachShadow({ mode: "open" });
     const style = document.createElement("style"); style.textContent = widgetStyles;
     const section = document.createElement("section"); section.setAttribute("aria-label", "Payment checkout");
@@ -51,7 +53,7 @@ export class GenericPaymentWidget extends ElementBase {
     section.append(this.#status, this.#button, this.#resumeButton); root.append(style, section); this.#render();
   }
   connectedCallback(): void { this.#configure(false); }
-  disconnectedCallback(): void { this.#generation++; this.#controller?.abort(); this.#cleanup(); this.#busy = false; this.#client = undefined; this.#session = undefined; }
+  disconnectedCallback(): void { disconnectFormLoadWidget(this); this.#generation++; this.#controller?.abort(); this.#cleanup(); this.#busy = false; this.#client = undefined; this.#session = undefined; }
   attributeChangedCallback(name: string, oldValue: string | null, newValue: string | null): void {
     if (oldValue !== newValue && this.isConnected) {
       if (name === "locale") { this.#render(); this.#presentation(); }
@@ -60,6 +62,7 @@ export class GenericPaymentWidget extends ElementBase {
   }
   #current(generation: number): boolean { return generation === this.#generation && this.isConnected && !this.#controller?.signal.aborted; }
   #configure(reset: boolean): void {
+    configureFormLoadWidget(this);
     this.#generation++; this.#controller?.abort(); this.#cleanup(); this.#controller = new AbortController(); this.#busy = false; this.#session = undefined; this.#client = undefined;
     if (reset) this.#state = "idle";
     const generation = this.#generation;
@@ -84,9 +87,10 @@ export class GenericPaymentWidget extends ElementBase {
     if (!this.#session || (this.#session.providerType === 'STRIPE' && !['CREATED', 'REQUIRES_PAYMENT_METHOD', 'REQUIRES_ACTION'].includes(this.#session.state.status))) return;
     this.#providerView?.destroy(); this.#providerHost?.remove(); this.#providerReady = false;
     this.#providerHost = document.createElement('div'); this.#providerHost.className = 'payment-element'; this.#button.before(this.#providerHost);
+    const diagnostic = bindFormLoadDiagnostic(this, this.#providerHost, generation);
     this.#providerView = new CheckoutProviderView(this.#client!, this.#providerHost); this.#presentation();
     await this.#providerView.mount(this.#session, this.#controller!.signal);
-    if (this.#current(generation)) this.#providerReady = true;
+    if (this.#current(generation)) { this.#providerReady = true; markFormLoad(diagnostic, 'widget_completed'); }
   }
   #transition(state: WidgetState, safe?: CheckoutState, focus = false): void {
     const changed = this.#state !== state; this.#state = state; this.#render();
@@ -141,6 +145,7 @@ export class GenericPaymentWidget extends ElementBase {
     finally { if (this.#current(generation)) { this.#busy = false; this.#render(); } }
   }
   async #act(resume = false): Promise<void> {
+    if (resume) resumeFormLoadWidget(this);
     if (this.#busy || !this.isConnected || (resume && !this.#resumeAvailable)) return;
     const generation = this.#generation; this.#busy = true;
     let confirming = false;

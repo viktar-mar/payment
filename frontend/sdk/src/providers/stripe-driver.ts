@@ -4,6 +4,7 @@ import { object, safeState } from '../contracts.js';
 import { PaymentSdkError } from '../errors.js';
 import { strictAppearance } from './stripe-appearance.js';
 import { loadStripeClient } from './stripe-loader.js';
+import { formLoadBinding, markFormLoad, failFormLoad, denyFormLoadConfirmation } from '../diagnostics/form-load-observer.js';
 export interface StripePresentation { appearance: StripeElementsOptions['appearance']; locale?: 'en' | 'pt'; }
 export interface MountStripePaymentOptions extends StripePresentation {
   container: HTMLElement; capability: ClientPaymentSession; signal: AbortSignal;
@@ -31,6 +32,7 @@ const aborted = () => new DOMException('Aborted', 'AbortError');
 
 export async function mountStripePayment(options: MountStripePaymentOptions): Promise<StripePaymentHandle> {
   const { container, signal } = options;
+  const diagnostic = formLoadBinding(container);
   if (signal.aborted) throw aborted();
   const initialPresentation = presentation({ appearance: options.appearance, locale: options.locale });
   let capability: ClientPaymentSession | undefined = options.capability;
@@ -100,33 +102,38 @@ export async function mountStripePayment(options: MountStripePaymentOptions): Pr
   signal.addEventListener('abort', destroy, { once: true });
   try {
     checkActive();
+    markFormLoad(diagnostic, 'loader_started');
     const loaded = await guarded(loadStripeClient(capability.publishableKey));
     if (!loaded) throw 0;
+    markFormLoad(diagnostic, 'loader_ready');
     stripe = loaded;
     elements = stripe.elements({ clientSecret: capability.clientSecret, ...initialPresentation });
     returnUrl = capability.returnUrl;
     capability = undefined;
     checkActive();
     element = elements.create('payment', { wallets: { applePay: 'never', googlePay: 'never', link: 'never' } });
+    markFormLoad(diagnostic, 'element_created');
     checkActive();
     const readiness = new Promise<void>((resolve, reject) => {
-      ready = () => { if (active && !signal.aborted) resolve(); };
-      loadFailed = () => { if (active) reject(new PaymentSdkError('PROVIDER_TEMPORARILY_UNAVAILABLE')); };
+      ready = () => { if (active && !signal.aborted) { markFormLoad(diagnostic, 'ready_seen'); resolve(); } };
+      loadFailed = () => { if (active && !signal.aborted) { markFormLoad(diagnostic, 'loaderror_seen'); reject(new PaymentSdkError('PROVIDER_TEMPORARILY_UNAVAILABLE')); } };
     });
     // Attach before mount: the provider may synchronously signal readiness.
     element.on('ready', ready); element.on('loaderror', loadFailed);
     void readiness.catch(() => {});
-    element.mount(container);
+    markFormLoad(diagnostic, 'mount_called'); element.mount(container); markFormLoad(diagnostic, 'mount_returned');
     await guarded(readiness);
     detachReadyListeners();
   } catch {
     const wasAborted = !active || signal.aborted;
+    failFormLoad(diagnostic, wasAborted);
     destroy();
     if (wasAborted) throw aborted();
     throw new PaymentSdkError('PROVIDER_TEMPORARILY_UNAVAILABLE');
   }
   return {
     async confirm(): Promise<CheckoutState> {
+      denyFormLoadConfirmation(diagnostic);
       checkActive();
       if (confirming) throw new PaymentSdkError('PAYMENT_STATE_CONFLICT');
       confirming = true;

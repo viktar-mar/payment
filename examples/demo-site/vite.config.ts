@@ -1,4 +1,5 @@
-import { defineConfig, type PreviewServer, type ViteDevServer } from "vite";
+import { defineConfig, type PreviewServer, type ViteDevServer, type UserConfig } from "vite";
+import {fileURLToPath} from 'node:url';
 
 function isPrivateReturnTarget(target: string | undefined): boolean {
   if (!target) return false;
@@ -29,13 +30,14 @@ function protectReturnRequests(server: ViteDevServer | PreviewServer): void {
   };
 }
 
-export default defineConfig({
+export default defineConfig(({mode}):UserConfig=>({
+  resolve: mode==='form-diagnostic'?{alias:{'@generic-payments/sdk':fileURLToPath(new URL('../../frontend/sdk/src/index.ts',import.meta.url))}}:undefined,
   plugins: [{
     name: 'private-payment-return-request',
     configureServer: protectReturnRequests,
     configurePreviewServer: protectReturnRequests,
   }],
-  build: { rollupOptions: { input: {main:'index.html',paymentReturn:'payment-return.html'} } },
+  build: { rollupOptions: { input: mode==='form-diagnostic'?{formDiagnostic:'form-load-diagnostic.html'}:{main:'index.html',paymentReturn:'payment-return.html'} } },
   server: {
     host: "127.0.0.1",
     port: 4173,
@@ -47,4 +49,4 @@ export default defineConfig({
     port: 4173,
     strictPort: true,
   },
-});
+}));

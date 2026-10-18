@@ -8,6 +8,7 @@ import {constants} from 'node:fs';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createOwnedSandboxProvisioner} from './stripe-sandbox-provision.mjs';
+const diagnosticModule=await import('./stripe-form-diagnostic-provision.mjs').catch(()=>({}));
 
 const forbidden=()=>{throw new Error('synthetic_test_forbids_external_boundary');};
 mock.method(childProcess,'execFile',forbidden);mock.method(childProcess,'spawn',forbidden);
@@ -87,6 +88,42 @@ function fixture() {
     initializeState:async(metadata,settings)=>{events.push({type:'initialize',metadata,settings});},now:Date.now,setTimeout,clearTimeout};
   return {options,dependencies,events,files,resource,response,account,site,product,price,provider,campaign,checkoutStatuses};
 }
+
+test('prepare-only provisioner creates one anonymous checkout and validates zero then first Attempt without financial capabilities',async()=>{
+  assert.equal(typeof diagnosticModule.createFormDiagnosticProvisioner,'function');
+  const f=fixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};
+  f.resource.mode='FORM_DIAGNOSTIC';f.resource.webhookReady=false;
+  let attempts=0;const fetcher=f.dependencies.fetch;
+  f.dependencies.fetch=async(url,settings)=>{
+    const path=new URL(url).pathname;
+    if(path==='/api/v1/admin/payments')return f.response(200,{items:[diagnosticDetail(attempts).payment],total:1,page:0,size:2,sort:'CREATED_DESC'});
+    if(path.startsWith('/api/v1/admin/payments/'))return f.response(200,diagnosticDetail(attempts));
+    if(path==='/api/v1/admin/provider-operations')return f.response(200,[diagnosticOperation()]);
+    return fetcher(url,settings);
+  };
+  const p=await diagnosticModule.createFormDiagnosticProvisioner(f.options,f.dependencies),limits=LIMIT();
+  const {session}=await p.prepare(limits);assert.equal(session.version,2);assert.equal(session.state.paymentId,uuid(21));
+  assert.equal(f.events.filter(e=>e.type==='http'&&e.path.endsWith('/checkouts')).length,1);
+  assert.equal(f.events.some(e=>e.type==='initialize'||e.path?.includes('campaign')||e.path==='/configure'||e.path?.endsWith('/callback')),false);
+  assert.deepEqual(Object.keys(p).sort(),['close','prepare','verifyNoConfirmation'].sort());
+  attempts=1;assert.equal((await p.verifyNoConfirmation(limits)).reference,'pi_TestOnly');await p.close({...limits,deadline:limits.deadline+120000});
+});
+
+function diagnosticOperation(){return {operation_id:uuid(40),payment_id:uuid(21),resource_id:uuid(21),account_id:ACCOUNT,account_mode:'SANDBOX',site_id:SITE,kind:'PAYMENT_PREPARE',status:'ACKNOWLEDGED',manual_review_required:false,reference:'pi_TestOnly'};}
+function diagnosticDetail(attempts=0){return {payment:{payment_id:uuid(21),site_id:SITE,payment_account_id:ACCOUNT,provider:'STRIPE',source:'CATALOG',price_id:PRICE,price_key:'s5a-price-'+SUFFIX,price_version:1,amount_minor:2000,currency:'EUR',tax_mode:'NONE',refunded_amount_minor:0,refundable_amount_minor:0,status:'REQUIRES_PAYMENT_METHOD',customer_id:null,donation_id:null,subscription_id:null},
+  attempts:Array.from({length:attempts},(_,i)=>({id:uuid(50+i),attempt_number:i+1,status:'REQUIRES_PAYMENT_METHOD',provider_intent_reference:'pi_TestOnly',payment_method_family:'CARD',result_code:null})),
+  events:[{id:uuid(60),event_type:'PAYMENT_CREATED'},{id:uuid(61),event_type:'PAYMENT_METHOD_REQUIRED'},...Array.from({length:attempts},(_,i)=>({id:uuid(62+i),event_type:'ATTEMPT_CREATED'}))],refunds:[],outbox_events:[],deliveries:[]};}
+
+for(const [name,mutate] of [['second Attempt',v=>v.attempts.push({...v.attempts[0],id:uuid(90),attempt_number:2})],['wrong amount',v=>v.payment.amount_minor=1],['Customer',v=>v.payment.customer_id=uuid(99)],['success event',v=>v.events.push({event_type:'PAYMENT_SUCCEEDED'})],['refund',v=>v.refunds.push({})]])
+test('prepare-only final proof rejects '+name,async()=>{
+  assert.equal(typeof diagnosticModule.createFormDiagnosticProvisioner,'function');const f=fixture();
+  f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};f.resource.mode='FORM_DIAGNOSTIC';f.resource.webhookReady=false;
+  let final=false;const fetcher=f.dependencies.fetch;f.dependencies.fetch=async(url,settings)=>{const path=new URL(url).pathname;
+    if(path==='/api/v1/admin/payments')return f.response(200,{items:[diagnosticDetail(final?1:0).payment],total:1,page:0,size:2,sort:'CREATED_DESC'});
+    if(path.startsWith('/api/v1/admin/payments/')){const value=diagnosticDetail(final?1:0);if(final)mutate(value);return f.response(200,value);}
+    if(path==='/api/v1/admin/provider-operations')return f.response(200,[diagnosticOperation()]);return fetcher(url,settings);};
+  const p=await diagnosticModule.createFormDiagnosticProvisioner(f.options,f.dependencies),limits=LIMIT();await p.prepare(limits);final=true;await assert.rejects(p.verifyNoConfirmation(limits));
+});
 
 test('both opt-ins precede every other option and dependency getter',async()=>{
   let touched=0;

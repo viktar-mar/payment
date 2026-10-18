@@ -258,6 +258,52 @@ docker compose --env-file infrastructure/.env -f infrastructure/compose.yaml ps
 
 Admin: http://localhost:3000. API: http://localhost:8080. Demo: http://localhost:3001. Readiness includes database connectivity; an unavailable callback destination does not make the backend unready.
 
+## Limited form-load diagnostic (offline implementation; separate launch approval)
+
+The separate `playwright.form-diagnostic.config.ts` / `tests/form-load-diagnostic.spec.ts`
+entry observes one genuine SDK widget load, not payment acceptance. It is excluded
+from ordinary Playwright discovery. The diagnostic demo is built only in Vite mode
+`form-diagnostic` (Docker build arg `PAYMENT_DEMO_BUILD_MODE=form-diagnostic`);
+the normal demo entry and default production build are unchanged. Its constructor
+and internal observer share the SDK source graph; foreign instrumentation fails closed.
+
+All three opt-ins must be exactly `true`: `PAYMENT_STRIPE_SANDBOX_ENABLED`,
+`PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC`, `PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY`.
+Full-run/allow-test-operations and diagnostic flags cannot be mixed; debugging is
+rejected before private/runtime access. Do not enable them as part of ordinary builds.
+No actual diagnostic run is authorized by its source, tests, commit or this guide.
+
+A future separately authorized attempt owns fresh resources and one original
+15-minute active deadline, with cleanup capped at that original deadline +2 minutes.
+Cold preparation is limited to one Product/Price, anonymous EUR20 ONE_TIME/NONE
+Checkout/Intent and the first client-session Attempt. There is no CLI login/listener,
+card entry, Pay, confirmation, retry, refunds, campaigns, OTP delivery or reconciliation.
+Private test keys stay in ignored `infrastructure/stripe-sandbox.env.local`; the mode
+does not print them or change the user's webhook secret. A private unregistered
+verifier can satisfy backend configuration; it is not a listener/delivery proof.
+Bounded `/v1/account` checks the secret's approved account/default API version without
+Connect/version overrides; it does not establish publishable-key/account pairing.
+
+The driver clicks Resume once, observes at most60 seconds (15-second checkpoint)
+within the original active window, and emits at most two strict finite frames.
+If no complete observation can settle before the strict local ceiling, the last
+finite flags may be retained as AT_LIMIT with an opaque operation failure; they
+are not a fresh pending-state or readiness proof at/after60 seconds. A delayed
+visibility response cannot retroactively count as readiness before15 seconds.
+`FRAME` is only an outer iframe-presence observation. `WAITING_ELEMENT_READY` and
+`WAITING_PRESENTATION_CATCHUP` identify distinct pending boundaries, not a verified
+network/CSP/provider cause. Snapshot flags cannot replace visible+enabled Pay proof.
+Confirmation is latched off in the actual view and Stripe handle even after observer
+closure. No provider events, frame contents, input, URLs, errors, trace, screenshot,
+video, HAR or console payloads are collected in the diagnostic output.
+
+Exit0 requires FORM_READY_BEFORE_15S/FORM_READY_AFTER_15S **and** independent no-charge,
+browser/context closure and owned-runtime stop proofs. Other results require manual
+inspection, never an automatic repeat. Financial/cleanup uncertainty is failure;
+ready does not mean payment succeeded or Stage5A accepted. Retain all containers,
+volumes, networks, provider objects, data and audit evidence. This implementation
+does not reinterpret historical failed attempts or their unconfirmed cleanup.
+
 ## Stripe Sandbox configuration (Stage 5A preparation)
 
 The recovery helper `infrastructure/stripe-sandbox-bootstrap.mjs` exports

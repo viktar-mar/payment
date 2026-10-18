@@ -100,7 +100,8 @@ export function formatSandboxDiagnostic(value) {
 /** One owned run. Factories are reviewed capability boundaries, never command plugins. */
 export async function openOwnedSandboxAcceptance(options,limits,dependencies={}) {
   let enabled=false;
-  try {const env=options?.env;enabled=env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env?.PAYMENT_STRIPE_SANDBOX_OWNED_RUN==='true';}catch{}
+  try {const env=options?.env;enabled=env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env?.PAYMENT_STRIPE_SANDBOX_OWNED_RUN==='true'
+    &&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY!=='true';}catch{}
   if(!enabled)throw fixed('OPT_IN_REQUIRED');
   let configuration,io,originalDeadline,originalSignal;
   try {

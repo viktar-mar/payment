@@ -9,6 +9,8 @@ import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {EventEmitter} from 'node:events';
 import {createOwnedSandboxBootstrap} from './stripe-sandbox-bootstrap.mjs';
+import * as bootstrapModule from './stripe-sandbox-bootstrap.mjs';
+import {createFormDiagnosticRuntime} from './stripe-form-diagnostic-runtime.mjs';
 
 // Guard the builtin defaults as well as each fixture's raw process boundary.
 const forbidden=()=>{throw new Error('synthetic_test_forbids_real_process');};
@@ -107,7 +109,7 @@ function fixture(overrides={}) {
         if(action!==-1) {
           const envFile=a[a.indexOf('--env-file')+1];
           assert.ok([DIR+'/app.env',DIR+'/final.env'].includes(envFile),'stopped Compose environment must be selected explicitly');
-          const services=envFile===DIR+'/app.env'?['postgres','mailpit','backend','demo-site','callback-receiver']:['backend'];
+          const services=envFile===DIR+'/app.env'||options.env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'?['postgres','mailpit','backend','demo-site','callback-receiver']:['backend'];
           assert.deepEqual(a.slice(action),['up','--no-start','--no-deps','--no-build','--pull','never',...services],
             'stopped Compose contract requires supported up, no start, no dependencies, no build, no pull and exact services');
           for(const service of services)container(service);
@@ -144,6 +146,177 @@ function fixture(overrides={}) {
 }
 async function setup(overrides) {const f=fixture(overrides);f.adapter=await createOwnedSandboxBootstrap(f.options,f.dependencies);return f;}
 async function prepared() {const f=await setup();assert.equal(await f.adapter.prepare(LIMIT()),true);return f;}
+
+test('prepare-only bootstrap has a separate inert factory and rejects full-mode flags before dependency access',async()=>{
+  assert.equal(typeof bootstrapModule.createOwnedFormDiagnosticBootstrap,'function');
+  let touched=0;const deps=new Proxy({},{get(){touched++;throw null;}});
+  await assert.rejects(bootstrapModule.createOwnedFormDiagnosticBootstrap({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'}},deps));
+  assert.equal(touched,0);
+});
+
+test('prepare-only bootstrap creates the final backend once without listener, user-env mutation or removal',async()=>{
+  assert.equal(typeof bootstrapModule.createOwnedFormDiagnosticBootstrap,'function');
+  const f=fixture({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}});
+  const original=Buffer.from(f.files.get(USERFILE).contents),b=await bootstrapModule.createOwnedFormDiagnosticBootstrap(f.options,f.dependencies),limits=LIMIT();
+  assert.deepEqual(Object.keys(b).sort(),['prepare','resources','start','stop','verify','withAdminCredentials','withProviderCredentials'].sort());
+  await b.prepare(limits);await b.start(limits);assert.equal(await b.verify(limits),true);
+  assert.equal(b.resources().webhookReady,false);assert.equal(b.resources().mode,'FORM_DIAGNOSTIC');
+  assert.deepEqual(f.files.get(USERFILE).contents,original);
+  assert.equal(f.events.some(e=>e.type==='process'&&e.args.includes('rm')),false);
+  assert.equal(f.events.some(e=>e.type==='mkdir'&&e.path.includes('/cli')),false);
+  assert.ok(f.events.some(e=>e.type==='process'&&e.args.includes('PAYMENT_DEMO_BUILD_MODE=form-diagnostic')));
+  let keys;await b.withProviderCredentials(value=>{keys=value;return true;});
+  assert.deepEqual(Object.keys(keys).sort(),['publishableKey','secretKey']);
+  await b.stop({...limits,deadline:limits.deadline+120000});
+});
+
+function formFixture() {
+  const env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};
+  const f=fixture({env});delete f.options.approvedBinding;
+  const suffix=RUN.replaceAll('-',''),uid=n=>'00000000-0000-4000-8000-'+String(n).padStart(12,'0');
+  const account={id:uid(1),key:'stripe-sandbox-default',provider:'STRIPE',mode:'SANDBOX',status:'ACTIVE',external_account_id:'acct_1UPiMpELswAd8tpR'};
+  const site={id:uid(2),key:'s5a-'+suffix,status:'ACTIVE',payment_account_id:uid(1),allowed_origins:['http://127.0.0.1:18081'],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']}};
+  const provider={id:uid(3),provider_key:'s5a-email-'+suffix,mode:'EMAIL_OTP',status:'ACTIVE',readiness:'READY',version:0,sender_ref:'local-default',template_key:'otp-default',issuer:null,audiences:[],allowed_algorithms:[],jwks_source_type:null,keys:[]};
+  const product={id:uid(4),site_id:site.id,key:'s5a-product-'+suffix,name:'Stage5A one-time acceptance',description:null,status:'ACTIVE'};
+  const price={id:uid(5),site_id:site.id,product_id:product.id,price_key:'s5a-price-'+suffix,version:1,type:'ONE_TIME',amount_minor:2000,currency:'EUR',billing_interval:null,trial_days:0,trial_payment_method_policy:'OPTIONAL_DURING_TRIAL',tax_mode:'NONE',tax_code:null,status:'DRAFT',provider_price_id:null};
+  const checkout={checkout_id:uid(6),payment_id:uid(7),checkout_token:Buffer.alloc(32,23).toString('base64url'),amount_minor:2000,currency:'EUR',provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',provider_client_payload:{},status:'REQUIRES_PAYMENT_METHOD',expires_at:new Date(Date.now()+3600000).toISOString(),price:{price_id:price.id,price_key:price.price_key,version:1,amount_minor:2000,currency:'EUR',tax_mode:'NONE'}};
+  const operation={operation_id:uid(8),payment_id:checkout.payment_id,resource_id:checkout.payment_id,account_id:account.id,account_mode:'SANDBOX',site_id:site.id,kind:'PAYMENT_PREPARE',status:'ACKNOWLEDGED',manual_review_required:false,reference:'pi_TestOnly'};
+  const intent={id:'pi_TestOnly',object:'payment_intent',livemode:false,status:'requires_payment_method',amount:2000,currency:'eur',amount_received:0,payment_method:null,latest_charge:null,customer:null,setup_future_usage:null,on_behalf_of:null,transfer_data:null};
+  const detail={payment:{payment_id:checkout.payment_id,site_id:site.id,payment_account_id:account.id,provider:'STRIPE',source:'CATALOG',price_id:price.id,price_key:price.price_key,price_version:1,amount_minor:2000,currency:'EUR',tax_mode:'NONE',refunded_amount_minor:0,refundable_amount_minor:0,status:'REQUIRES_PAYMENT_METHOD',customer_id:null,donation_id:null,subscription_id:null},attempts:[],events:[{id:uid(9),event_type:'PAYMENT_CREATED'},{id:uid(10),event_type:'PAYMENT_METHOD_REQUIRED'}],refunds:[],outbox_events:[],deliveries:[]};
+  const payments=[detail.payment];let accountCreated=false,siteCreated=false,policy=[];
+  const http=[];
+  const response=(value,status=200,headers={})=>{const h=new Headers();for(const [name,values] of Object.entries(headers))for(const value of Array.isArray(values)?values:[values])h.append(name,value);return new Response(status===204?null:JSON.stringify(value),{status,headers:h});};
+  const fetcher=async(url,settings)=>{
+    const path=new URL(url).pathname,method=settings.method,body=settings.body?JSON.parse(settings.body):undefined;http.push({url,path,method,body,settings});
+    if(url.startsWith('https://api.stripe.com/'))return response(path==='/v1/account'?{id:'acct_1UPiMpELswAd8tpR',object:'account'}:intent,200,{'Stripe-Version':'2026-09-30.endive'});
+    if(method!=='GET') {const ledger=JSON.parse(f.files.get(DIR+'/form-provisioning.json').contents);assert.equal(ledger.intents.at(-1).status,'DISPATCHING');}
+    if(path.endsWith('/auth/sessions'))return response(null,204,{'Set-Cookie':['PAYMENT_ADMIN_SESSION=session; Path=/; HttpOnly','XSRF-TOKEN=csrf; Path=/']});
+    if(path.endsWith('/payment-accounts')){if(method==='GET')return response(accountCreated?[account]:[]);accountCreated=true;return response(account,201);}
+    if(path==='/api/admin/v1/sites'){if(method==='GET')return response(siteCreated?[site]:[]);siteCreated=true;return response(site,201);}
+    if(path.endsWith('/identity-providers'))return response([provider]);if(path.endsWith('/identity-providers/'+provider.id))return response(provider);
+    if(path.endsWith('/checkout-return-urls')){if(method==='GET')return response(policy);policy=[{origin:site.allowed_origins[0],return_url:site.allowed_origins[0]+'/payment-return.html',version:0}];return response(null,204);}
+    if(path.endsWith('/products'))return response(product,201);if(path.endsWith('/prices'))return response(price,201);
+    if(path.endsWith('/publish')){price.status='PUBLISHED';price.provider_price_id='price_TestOnly';return response(price);}
+    if(path.endsWith('/catalog'))return response({products:[product],prices:[price]});
+    if(path.endsWith('/checkouts'))return response(checkout,201);
+    if(path==='/api/v1/admin/payments'){
+      assert.equal(new URL(url).search,'?site_id='+site.id+'&page=0&size=2&sort=CREATED_DESC');
+      return response({items:payments,total:payments.length,page:0,size:2,sort:'CREATED_DESC'});
+    }
+    if(path.endsWith('/payments/'+checkout.payment_id))return response(detail);
+    if(path.endsWith('/provider-operations'))return response([operation]);throw new Error('Unexpected synthetic route');
+  };
+  const lstat=f.dependencies.lstat;f.dependencies.lstat=async path=>{if(!f.files.has(path))throw Object.assign(new Error(),{code:'ENOENT'});return lstat(path);};
+  const deps={bootstrap:f.dependencies,provider:{fetch:fetcher},provision:{...f.dependencies,fetch:fetcher}};
+  return {...f,deps,http,detail,intent,operation,payments,resume(){detail.attempts=[{id:uid(11),attempt_number:1,status:'REQUIRES_PAYMENT_METHOD',provider_intent_reference:'pi_TestOnly',payment_method_family:'CARD',result_code:null}];detail.events.push({id:uid(12),event_type:'ATTEMPT_CREATED'});}};
+}
+
+test('real prepare-only runtime completes one synthetic bootstrap/provision/provider lifecycle and closes only owned resources',async()=>{
+  const f=formFixture(),r=await createFormDiagnosticRuntime(f.options,f.deps),limits=LIMIT();
+  const h=await r.prepare(limits);assert.deepEqual(Object.keys(h).sort(),['endpoint','expectedSource','runId','session']);
+  assert.equal(h.session.version,2);assert.equal(h.session.state.price.taxMode,'NONE');assert.ok(Object.isFrozen(h.session.state.price));
+  f.resume();assert.equal(await r.verifyNoConfirmation(limits),true);assert.equal(await r.close({...limits,deadline:limits.deadline+120000}),true);
+  assert.equal(f.http.filter(v=>v.path.endsWith('/checkouts')).length,1);
+  assert.equal(f.http.filter(v=>v.path.startsWith('/v1/payment_intents/')).length,2);
+  assert.equal(f.http.some(v=>/confirm|refund|customer|campaign|callback|inspection|client-session/.test(v.path)),false);
+  assert.equal(f.events.some(v=>v.type==='process'&&(v.args.includes('rm')||v.args.includes('stripe'))),false);
+});
+
+test('runtime consumes a rejected renewed final proof and cannot retry it with the original deadline',async()=>{
+  const f=formFixture(),r=await createFormDiagnosticRuntime(f.options,f.deps),limits=LIMIT();await r.prepare(limits);f.resume();
+  const reads=f.http.length;await assert.rejects(r.verifyNoConfirmation({...limits,deadline:limits.deadline+1}));
+  await assert.rejects(r.verifyNoConfirmation(limits));assert.equal(f.http.length,reads);
+});
+test('runtime never certifies a final zero-Attempt state as completed form preparation',async()=>{
+  const f=formFixture(),r=await createFormDiagnosticRuntime(f.options,f.deps),limits=LIMIT();await r.prepare(limits);
+  await assert.rejects(r.verifyNoConfirmation(limits));await assert.rejects(r.verifyNoConfirmation(limits));
+});
+for(const phase of ['baseline','final'])
+test('I2 runtime rejects an extra owned-Site payment at '+phase+' despite valid selected detail',async()=>{
+  const f=formFixture(),r=await createFormDiagnosticRuntime(f.options,f.deps),limits=LIMIT();
+  if(phase==='final'){await r.prepare(limits);f.resume();}
+  f.payments.push({...f.detail.payment,payment_id:'00000000-0000-4000-8000-000000000099'});
+  await assert.rejects(phase==='baseline'?r.prepare(limits):r.verifyNoConfirmation(limits));
+});
+test('runtime abort cannot hang on an unsettled private boundary and cleanup stays unconfirmed',async()=>{
+  const f=formFixture();f.dependencies.preflight=async()=>new Promise(()=>{});const controller=new AbortController();
+  const r=await createFormDiagnosticRuntime(f.options,f.deps),limits={...LIMIT(),signal:controller.signal};
+  const preparing=r.prepare(limits);await turn();controller.abort();
+  const result=await Promise.race([preparing.then(()=>false,()=>true),new Promise(resolve=>setTimeout(()=>resolve(false),50))]);
+  assert.equal(result,true);await assert.rejects(r.close({deadline:limits.deadline+120000}));
+});
+test('I1 abort during late provisioning lock open cannot certify cleanup and the late handle closes',async()=>{
+  const f=formFixture(),original=f.deps.provision.open,controller=new AbortController();let release,entered;
+  const gate=new Promise(resolve=>release=resolve),reached=new Promise(resolve=>entered=resolve);
+  f.deps.provision.open=async(path,...args)=>{if(path===DIR+'/form-provisioning.lock'){entered();await gate;}return original(path,...args);};
+  const r=await createFormDiagnosticRuntime(f.options,f.deps),limits={...LIMIT(),signal:controller.signal},preparing=r.prepare(limits);
+  await reached;controller.abort();await assert.rejects(preparing);await assert.rejects(r.close({deadline:limits.deadline+120000}));
+  release();await turn();await turn();
+  assert.equal(f.events.filter(e=>e.type==='close'&&e.path===DIR+'/form-provisioning.lock').length,1);
+  assert.equal(f.http.some(e=>e.path.endsWith('/auth/sessions')),false);
+});
+test('I1 aborted backend body read permanently prevents cleanup certification',async()=>{
+  const f=formFixture(),fetcher=f.deps.provision.fetch,controller=new AbortController();let final=false,entered,cancelled=0;
+  const reached=new Promise(resolve=>entered=resolve);
+  f.deps.provision.fetch=async(url,settings)=>{if(final&&url.includes('/api/v1/admin/payments/'))return new Response(new ReadableStream({pull(){entered();},cancel(){cancelled++;}}));return fetcher(url,settings);};
+  const r=await createFormDiagnosticRuntime(f.options,f.deps),limits={...LIMIT(),signal:controller.signal};await r.prepare(limits);f.resume();final=true;
+  const proof=r.verifyNoConfirmation(limits);await reached;controller.abort();await assert.rejects(proof);
+  await assert.rejects(r.close({deadline:limits.deadline+120000}));await turn();assert.equal(cancelled,1);
+  assert.equal(f.events.filter(e=>e.type==='close'&&e.path===DIR+'/form-provisioning.lock').length,1);
+});
+test('I1 late provider fetch remains uncertain and disposes its eventual response body',async()=>{
+  const f=formFixture(),fetcher=f.deps.provider.fetch,controller=new AbortController();let final=false,release,entered,cancelled=0;
+  const gate=new Promise(resolve=>release=resolve),reached=new Promise(resolve=>entered=resolve);
+  f.deps.provider.fetch=async(url,settings)=>{if(final){entered();await gate;return new Response(new ReadableStream({cancel(){cancelled++;}}));}return fetcher(url,settings);};
+  const r=await createFormDiagnosticRuntime(f.options,f.deps),limits={...LIMIT(),signal:controller.signal};await r.prepare(limits);f.resume();final=true;
+  const proof=r.verifyNoConfirmation(limits);await reached;controller.abort();await assert.rejects(proof);await turn();
+  await assert.rejects(r.close({deadline:limits.deadline+120000}));release();await turn();await turn();assert.equal(cancelled,1);
+});
+test('I1 late lock acquisition after the original cleanup ceiling causes no late disposal dispatch',async()=>{
+  const f=formFixture(),original=f.deps.provision.open,controller=new AbortController();let release,entered,time=Date.now();
+  const gate=new Promise(resolve=>release=resolve),reached=new Promise(resolve=>entered=resolve);
+  f.deps.now=f.dependencies.now=f.deps.provision.now=f.deps.provider.now=()=>time;
+  f.deps.provision.open=async(path,...args)=>{if(path===DIR+'/form-provisioning.lock'){entered();await gate;}return original(path,...args);};
+  const r=await createFormDiagnosticRuntime(f.options,f.deps),limits={deadline:time+120000,signal:controller.signal},preparing=r.prepare(limits);
+  await reached;controller.abort();await assert.rejects(preparing);await assert.rejects(r.close({deadline:limits.deadline+120000}));
+  time=limits.deadline+120001;release();await turn();await turn();
+  assert.equal(f.events.some(e=>e.type==='close'&&e.path===DIR+'/form-provisioning.lock'),false);
+  await assert.rejects(r.close({deadline:time+120000}));
+});
+test('I1 unsettled response disposal remains uncertain after every business intent is acknowledged',async()=>{
+  const f=formFixture(),fetcher=f.deps.provision.fetch,controller=new AbortController();let final=false,entered,release;
+  const gate=new Promise(resolve=>release=resolve),reached=new Promise(resolve=>entered=resolve);
+  f.deps.provision.fetch=async(url,settings)=>{if(final&&url.includes('/api/v1/admin/payments/'))return new Response(new ReadableStream({pull(){entered();},cancel(){return gate;}}));return fetcher(url,settings);};
+  const r=await createFormDiagnosticRuntime(f.options,f.deps),limits={...LIMIT(),signal:controller.signal};await r.prepare(limits);f.resume();final=true;
+  const proof=r.verifyNoConfirmation(limits);await reached;controller.abort();await assert.rejects(proof);await turn();
+  await assert.rejects(r.close({deadline:limits.deadline+120000}));release();await turn();await turn();
+  await assert.rejects(r.close({deadline:limits.deadline+120000}));
+});
+test('runtime rejects redirected backend proof even with an otherwise valid body',async()=>{
+  const f=formFixture(),fetcher=f.deps.provision.fetch;f.deps.provision.fetch=async(url,settings)=>{const response=await fetcher(url,settings);
+    if(url.includes('/api/v1/admin/payments/'))Object.defineProperty(response,'redirected',{value:true});return response;};
+  const r=await createFormDiagnosticRuntime(f.options,f.deps);await assert.rejects(r.prepare(LIMIT()));
+});
+test('runtime refuses an unacknowledged checkout response without replay and cannot confirm cleanup',async()=>{
+  const f=formFixture(),fetcher=f.deps.provision.fetch;f.deps.provision.fetch=async(url,settings)=>{const response=await fetcher(url,settings);if(url.endsWith('/checkouts'))throw new Error('opaque synthetic uncertain response');return response;};
+  const r=await createFormDiagnosticRuntime(f.options,f.deps),limits=LIMIT();await assert.rejects(r.prepare(limits));await assert.rejects(r.prepare(limits));
+  assert.equal(f.http.filter(v=>v.path.endsWith('/checkouts')).length,1);
+  await assert.rejects(r.close({...limits,deadline:limits.deadline+120000}));
+  const ledger=JSON.parse(f.files.get(DIR+'/form-provisioning.json').contents);assert.equal(ledger.intents.at(-1).status,'DISPATCHING');
+});
+test('runtime rejects foreign owned resources before final HTTP and never stops that foreign container',async()=>{
+  const f=formFixture(),r=await createFormDiagnosticRuntime(f.options,f.deps),limits=LIMIT();await r.prepare(limits);f.resume();
+  const backend=[...f.containers.values()].find(v=>v.Name.endsWith('-backend'));backend.Labels['payment.sandbox.run']='foreign';const count=f.http.length;
+  await assert.rejects(r.verifyNoConfirmation(limits));assert.equal(f.http.length,count);await assert.rejects(r.close({...limits,deadline:limits.deadline+120000}));assert.equal(backend.State.Running,true);
+});
+for(const suffix of ['/payment-accounts','/sites','/products','/prices','/publish'])
+test('runtime latches unknown '+suffix+' mutation outcome with its original durable intent',async()=>{
+  const f=formFixture(),fetcher=f.deps.provision.fetch;let dispatched=0;
+  f.deps.provision.fetch=async(url,settings)=>{const response=await fetcher(url,settings);if(settings.method==='POST'&&url.endsWith(suffix)){dispatched++;throw new Error('unknown synthetic response');}return response;};
+  const r=await createFormDiagnosticRuntime(f.options,f.deps),limits=LIMIT();await assert.rejects(r.prepare(limits));await assert.rejects(r.prepare(limits));assert.equal(dispatched,1);
+  const ledger=JSON.parse(f.files.get(DIR+'/form-provisioning.json').contents);assert.equal(ledger.intents.at(-1).status,'DISPATCHING');
+  assert.equal(f.http.some(v=>v.path.endsWith('/checkouts')),false);await assert.rejects(r.close({...limits,deadline:limits.deadline+120000}));
+});
 
 function typedInspectFixture(kind,{backendUser='payment'}={}) {
   const f=fixture(),execute=f.dependencies.execute,proofs=[];

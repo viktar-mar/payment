@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {createServer} from 'node:net';
 import {EventEmitter} from 'node:events';
 import {fileURLToPath} from 'node:url';
-import {preflightOwnedSandbox} from './stripe-sandbox-owned.mjs';
+import {preflightOwnedSandbox,preflightOwnedFormDiagnostic} from './stripe-sandbox-owned.mjs';
 
 const root=fileURLToPath(new URL('../',import.meta.url)).replace(/\/$/,'');
 const source='a'.repeat(40),daemon='unix:///tmp/owned-docker.sock';
@@ -30,6 +30,14 @@ function fixture({head=source+'\n',status='',docker='"linux"\n',metadata={},cano
 }
 function pending(phase,code) {return {status:'PENDING',phase,code};}
 function safe(result,want) {assert.deepEqual(result,want);assert.equal(Object.isFrozen(result),true);assert.equal(JSON.stringify(result).includes('PRIVATE_CANARY'),false);}
+
+test('diagnostic preflight uses dedicated flags while full preflight refuses mixed modes',async()=>{
+  const env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'},f=fixture();
+  safe(await preflightOwnedFormDiagnostic(options({env}),f.dependencies),{status:'READY'});
+  let touched=0;const trap=new Proxy({},{get(){touched++;throw null;}});
+  safe(await preflightOwnedSandbox(options({env:{...flags,...env}}),trap),pending('OPT_IN','OPT_IN_REQUIRED'));
+  safe(await preflightOwnedFormDiagnostic(options({env:{...flags,...env}}),trap),pending('OPT_IN','OPT_IN_REQUIRED'));assert.equal(touched,0);
+});
 
 for(const absent of ['both',...Object.keys(flags)])
   test(`missing opt-ins (${absent}) never touch dependency, non-admission or private getters`,async()=>{

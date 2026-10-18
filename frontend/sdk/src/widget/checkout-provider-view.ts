@@ -4,6 +4,8 @@ import { PaymentSdkError } from '../errors.js';
 import { mountStripePayment } from '../providers/stripe-driver.js';
 import type { StripePaymentHandle, StripePresentation } from '../providers/stripe-driver.js';
 import { strictAppearance } from '../providers/stripe-appearance.js';
+import { formLoadBinding, markFormLoad, markFormLoadCatchup, failFormLoad, denyFormLoadConfirmation } from '../diagnostics/form-load-observer.js';
+import type { FormLoadBinding } from '../diagnostics/form-load-observer.js';
 const checkAbort = (signal: AbortSignal) => { if (signal.aborted) throw new DOMException('Aborted', 'AbortError'); };
 
 // Only finite supported presentation values cross into the provider iframe.
@@ -24,7 +26,8 @@ export class CheckoutProviderView {
   #ready = false;
   #presentation: StripePresentation = { appearance: {}, locale: 'en' };
   #detach?: () => void;
-  constructor(private readonly client: GenericPaymentClient, private readonly host: HTMLElement) {}
+  readonly #diagnostic: FormLoadBinding | undefined;
+  constructor(private readonly client: GenericPaymentClient, private readonly host: HTMLElement) { this.#diagnostic = formLoadBinding(host); }
   async mount(session: CheckoutSession, signal: AbortSignal): Promise<void> {
     this.destroy(); checkAbort(signal);
     const controller = new AbortController(); this.#controller = controller; this.#session = session;
@@ -32,20 +35,24 @@ export class CheckoutProviderView {
     this.#detach = () => signal.removeEventListener('abort', abort);
     try {
       if (session.providerType === 'STRIPE') {
+        markFormLoad(this.#diagnostic, 'capability_started');
         const capability = await this.client.prepareClientPayment(session, { signal: controller.signal }); checkAbort(controller.signal);
+        markFormLoad(this.#diagnostic, 'capability_ready');
         const initial = this.#presentation;
         const handle = await mountStripePayment({ container: this.host, capability, signal: controller.signal, ...initial, refresh: () => this.client.get(session, controller.signal) });
         checkAbort(controller.signal); this.#handle = handle;
         // A locale/theme change during loader/readiness uses this same capability.
         if (initial !== this.#presentation) {
-          try { await handle.updatePresentation(this.#presentation); }
-          catch { checkAbort(controller.signal); } // A visual failure cannot discard a ready payment form.
+          markFormLoadCatchup(this.#diagnostic, 'PENDING');
+          try { await handle.updatePresentation(this.#presentation); markFormLoadCatchup(this.#diagnostic, 'RESOLVED'); }
+          catch { markFormLoadCatchup(this.#diagnostic, controller.signal.aborted ? 'ABORTED' : 'REJECTED'); checkAbort(controller.signal); } // A visual failure cannot discard a ready payment form.
         }
       }
-      checkAbort(controller.signal); this.#ready = true;
-    } catch (error) { if (this.#controller === controller) this.destroy(); throw error; }
+      checkAbort(controller.signal); this.#ready = true; markFormLoad(this.#diagnostic, 'view_completed');
+    } catch (error) { failFormLoad(this.#diagnostic, controller.signal.aborted); if (this.#controller === controller) this.destroy(); throw error; }
   }
   async confirm(): Promise<CheckoutState> {
+    denyFormLoadConfirmation(this.#diagnostic);
     const session = this.#session;
     if (session && Date.parse(session.expiresAt) <= Date.now()) { this.destroy(); throw new PaymentSdkError('CHECKOUT_EXPIRED'); }
     if (!this.#ready || !session) throw new PaymentSdkError('PAYMENT_STATE_CONFLICT');
