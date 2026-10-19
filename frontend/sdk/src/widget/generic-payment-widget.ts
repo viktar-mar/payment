@@ -5,6 +5,7 @@ import { recoverCheckout } from "../storage.js";
 import { widgetStyles } from "./styles.js";
 import { CheckoutProviderView, checkoutPresentation } from './checkout-provider-view.js';
 import { subscribeCheckoutCustomer } from '../customer/session-lifecycle.js';
+import { createProviderMount, type OwnedProviderMount } from './provider-mount.js';
 import { registerFormLoadWidget, configureFormLoadWidget, disconnectFormLoadWidget, resumeFormLoadWidget, bindFormLoadDiagnostic, markFormLoad } from '../diagnostics/form-load-observer.js';
 export type WidgetState = "idle" | "loading" | "ready" | "checking" | "processing" | "requires_action" | "succeeded" | "failed" | "unknown" | "expired";
 // Importing ESM in non-DOM build tooling does not evaluate a missing HTMLElement.
@@ -18,7 +19,7 @@ export class GenericPaymentWidget extends ElementBase {
   #generation = 0;
   #busy = false;
   #providerView?: CheckoutProviderView;
-  #providerHost?: HTMLDivElement;
+  #providerMount?: OwnedProviderMount;
   #providerReady = false;
   #checking = false;
   #actionReady = false;
@@ -77,7 +78,7 @@ export class GenericPaymentWidget extends ElementBase {
     this.#render();
     if (this.#session) queueMicrotask(() => { if (this.#current(generation)) void this.#resume(generation); });
   }
-  #cleanup(): void { this.#providerView?.destroy(); this.#providerView = undefined; this.#providerHost?.remove(); this.#providerHost = undefined; this.#providerReady = false; this.#checking = false; this.#actionReady = false; this.#resumeAvailable = false; clearTimeout(this.#expiry); this.#unsubscribe?.(); this.#unsubscribe = undefined; }
+  #cleanup(): void { this.#providerView?.destroy(); this.#providerView = undefined; this.#providerMount?.destroy(); this.#providerMount = undefined; this.#providerReady = false; this.#checking = false; this.#actionReady = false; this.#resumeAvailable = false; clearTimeout(this.#expiry); this.#unsubscribe?.(); this.#unsubscribe = undefined; }
   #bindSession(session: CheckoutSession, generation: number): void {
     const unsubscribe = subscribeCheckoutCustomer(session, () => { if (!this.#current(generation)) return; this.#client?.clear(session); this.#configure(true); });
     if (!this.#current(generation)) { unsubscribe(); return; } this.#unsubscribe = unsubscribe;
@@ -85,10 +86,10 @@ export class GenericPaymentWidget extends ElementBase {
   }
   async #mountProvider(generation: number): Promise<void> {
     if (!this.#session || (this.#session.providerType === 'STRIPE' && !['CREATED', 'REQUIRES_PAYMENT_METHOD', 'REQUIRES_ACTION'].includes(this.#session.state.status))) return;
-    this.#providerView?.destroy(); this.#providerHost?.remove(); this.#providerReady = false;
-    this.#providerHost = document.createElement('div'); this.#providerHost.className = 'payment-element'; this.#button.before(this.#providerHost);
-    const diagnostic = bindFormLoadDiagnostic(this, this.#providerHost, generation);
-    this.#providerView = new CheckoutProviderView(this.#client!, this.#providerHost); this.#presentation();
+    this.#providerView?.destroy(); this.#providerMount?.destroy(); this.#providerReady = false;
+    this.#providerMount = createProviderMount(this, this.#button, this.#session.providerType);
+    const diagnostic = bindFormLoadDiagnostic(this, this.#providerMount.host, generation);
+    this.#providerView = new CheckoutProviderView(this.#client!, this.#providerMount.host); this.#presentation();
     await this.#providerView.mount(this.#session, this.#controller!.signal);
     if (this.#current(generation)) { this.#providerReady = true; markFormLoad(diagnostic, 'widget_completed'); }
   }

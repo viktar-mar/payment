@@ -8,6 +8,7 @@ import { mountStripePayment } from '../providers/stripe-driver.js';
 import { createGenericPaymentClient } from '../client.js';
 import { stripeUiProvider, stripeWire, stripeReadWire, stripeCapability } from '../test/stripe-ui-fixtures.js';
 import { json } from '../test/fixtures.js';
+import { createProviderMount } from '../widget/provider-mount.js';
 
 defineGenericPaymentWidget();
 const observations = new Set<{ close(): void }>();
@@ -33,15 +34,17 @@ async function setup() {
   await vi.waitFor(() => expect(resume).toBeEnabled());
   return { api, p, callbacks, requests, client, session, widget, observation, resume };
 }
-async function atFrame(f: Awaited<ReturnType<typeof setup>>) { f.resume.click(); await vi.waitFor(() => expect(f.widget.shadowRoot!.querySelector('iframe')).toBe(f.p.frame)); }
+async function atFrame(f: Awaited<ReturnType<typeof setup>>) { f.resume.click(); await vi.waitFor(() => expect(f.widget.querySelector('iframe')).toBe(f.p.frame)); }
 async function cleanup(f: Awaited<ReturnType<typeof setup>>) { f.observation.close(); f.widget.remove(); await Promise.resolve(); }
 
 async function readinessFixture() {
   const api = await observer(); const widget = document.createElement('div');
   api.registerFormLoadWidget(widget);
   const observation = api.armFormLoadDiagnostic(widget); observations.add(observation);
-  const host = document.createElement('div'); widget.attachShadow({ mode: 'open' }).append(host);
-  return { api, widget, host, observation, bind() { document.body.append(widget); return api.bindFormLoadDiagnostic(widget, host, 1); } };
+  const anchor = document.createElement('button'); widget.attachShadow({ mode: 'open' }).append(anchor);
+  // Arm while detached, then create the same internal lease used by the real widgets.
+  document.body.append(widget); const { host } = createProviderMount(widget, anchor, 'STRIPE');
+  return { api, widget, host, observation, bind() { return api.bindFormLoadDiagnostic(widget, host, 1); } };
 }
 
 // Break: folding loaderstart into the legacy snapshot changes its serialized wire contract.
@@ -148,7 +151,7 @@ it.each(['remove', 'reconfigure', 'repeat', 'resume', 'host-remove'])('permanent
 });
 // Break: view/handle confirm after close or destruction must reject before every monetary or refresh boundary.
 it.each(['view-stripe', 'view-fake', 'handle'])('retains immutable %s deny after close and destruction', async target => {
-  const f = await setup(); const host = document.createElement('div'); f.widget.shadowRoot!.append(host);
+  const f = await setup(); const { host } = createProviderMount(f.widget, f.resume, 'STRIPE');
   f.api.bindFormLoadDiagnostic(f.widget, host, 1);
   const controller = new AbortController(); const view = new CheckoutProviderView(f.client, host);
   let confirm: () => Promise<unknown>; let destroy: () => void;
@@ -181,6 +184,27 @@ it('records a first confirmation attempt after observation close', async () => {
   expect(f.observation.snapshot().operation).toBe('FAILED'); expect(f.requests).toHaveLength(before); expect(f.p.stripe.confirmPayment).not.toHaveBeenCalled();
   await cleanup(f);
 });
+// Break: a temporarily detached host or reconnected widget reviving an old diagnostic session.
+it.each(['host-reinsert', 'widget-reconnect'])('retains the immutable deny after real widget %s loses its lease', async action => {
+  const f = await setup(); await atFrame(f); f.p.emit('ready'); await vi.waitFor(() => expect(f.widget.state).toBe('ready'));
+  const oldHost = f.p.frame.parentElement!, before = f.requests.length;
+  if (action === 'host-reinsert') { oldHost.remove(); f.widget.append(oldHost); }
+  else { f.widget.remove(); document.body.append(f.widget); }
+  expect(f.observation.snapshot().binding).toBe('LOST');
+  if (action === 'host-reinsert') {
+    f.widget.shadowRoot!.querySelector('button')!.click();
+    await vi.waitFor(() => expect(f.observation.snapshot().confirmation_blocked).toBe(true));
+    expect(f.requests).toHaveLength(before);
+  } else {
+    await vi.waitFor(() => expect(f.widget.state).toBe('checking')); f.resume.click();
+    await vi.waitFor(() => expect(f.p.frame.isConnected).toBe(true)); expect(f.p.frame.parentElement).not.toBe(oldHost);
+    f.p.emit('ready'); await vi.waitFor(() => expect(f.widget.state).toBe('ready'));
+    expect(f.observation.snapshot()).toMatchObject({ binding: 'LOST', ready_seen: true });
+    f.widget.shadowRoot!.querySelector('button')!.click();
+    await vi.waitFor(() => expect(f.observation.snapshot().confirmation_blocked).toBe(true));
+  }
+  expect(f.p.stripe.confirmPayment).not.toHaveBeenCalled(); await cleanup(f);
+});
 it('records loaderror without inspecting even accessor event payloads', async () => {
   const f = await setup(); await atFrame(f); const getter = vi.fn(() => { throw new Error('private payload read'); });
   const payload = Object.defineProperty({}, 'error', { get: getter });
@@ -189,7 +213,7 @@ it('records loaderror without inspecting even accessor event payloads', async ()
   expect(getter).not.toHaveBeenCalled(); expect(f.observation.snapshot()).toMatchObject({ loaderror_seen: true, ready_seen: false }); await cleanup(f);
 });
 it('denies view confirmation while capability is still pending', async () => {
-  const f = await setup(); const host = document.createElement('div'); f.widget.shadowRoot!.append(host); f.api.bindFormLoadDiagnostic(f.widget, host, 1);
+  const f = await setup(); const { host } = createProviderMount(f.widget, f.resume, 'STRIPE'); f.api.bindFormLoadDiagnostic(f.widget, host, 1);
   const pending = deferred<Response>(); vi.stubGlobal('fetch', () => pending.promise);
   const view = new CheckoutProviderView(f.client, host), controller = new AbortController();
   const mounting = view.mount(f.session, controller.signal); const outcome = mounting.catch(error => error);

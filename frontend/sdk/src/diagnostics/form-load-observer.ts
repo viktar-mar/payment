@@ -1,4 +1,5 @@
 // Internal only. No SDK entry-point export, provider data, events, callbacks or I/O.
+import { ownedProviderHost } from '../widget/provider-mount.js';
 export interface FormLoadSnapshot {
   version: 1;
   binding: 'ARMED' | 'BOUND' | 'LOST' | 'CLOSED';
@@ -46,7 +47,7 @@ export function resumeFormLoadWidget(widget: HTMLElement): void {
 }
 function current(binding: FormLoadBinding | undefined): binding is FormLoadBinding {
   if (!binding || binding.state.binding !== 'BOUND') return false;
-  if (!binding.widget.isConnected || !binding.host?.isConnected || binding.host.getRootNode() !== binding.widget.shadowRoot) lose(binding);
+  if (!binding.host || ownedProviderHost(binding.widget) !== binding.host) lose(binding);
   return binding.state.binding === 'BOUND';
 }
 export function armFormLoadDiagnostic(widget: HTMLElement): { snapshot(): Readonly<FormLoadSnapshot>; readinessSnapshot(): Readonly<{ loaderstart_seen: boolean }>; close(): void } {

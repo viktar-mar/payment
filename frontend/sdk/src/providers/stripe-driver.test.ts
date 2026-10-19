@@ -5,6 +5,7 @@ import { loadStripeClient } from './stripe-loader.js';
 import { mountStripePayment } from './stripe-driver.js';
 import type { CheckoutState, ClientPaymentSession } from '../contracts.js';
 import { armFormLoadDiagnostic, bindFormLoadDiagnostic, registerFormLoadWidget } from '../diagnostics/form-load-observer.js';
+import { createProviderMount } from '../widget/provider-mount.js';
 
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (reason: unknown) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 const secret = 'pi_fixture_secret_sensitive';
@@ -50,10 +51,11 @@ describe('internal loaderstart observation', () => {
   function diagnosticSetup() {
     const f = setup(); const widget = document.createElement('div'); registerFormLoadWidget(widget);
     const observation = armFormLoadDiagnostic(widget);
-    widget.attachShadow({ mode: 'open' }).append(f.container); document.body.append(widget);
-    bindFormLoadDiagnostic(widget, f.container, 1);
-    cleanups.push(() => { f.controller.abort(); observation.close(); widget.remove(); });
-    return { ...f, observation };
+    const anchor = document.createElement('button'); widget.attachShadow({ mode: 'open' }).append(anchor); document.body.append(widget);
+    const lease = createProviderMount(widget, anchor, 'STRIPE'), container = lease.host;
+    bindFormLoadDiagnostic(widget, container, 1);
+    cleanups.push(() => { f.controller.abort(); observation.close(); lease.destroy(); widget.remove(); });
+    return { ...f, container, options: { ...f.options, container }, observation };
   }
   // Break: registering after mount misses a synchronous event; resolving on it invents readiness.
   it.each(['synchronous', 'delayed'])('observes %s loaderstart without inspecting payload or resolving mount', async timing => {

@@ -5,6 +5,7 @@ import type { DonationCampaign, DonationCheckoutInput, DonationCheckoutSession }
 import { donationStyles } from './styles.js';
 import { CheckoutProviderView, checkoutPresentation } from '../widget/checkout-provider-view.js';
 import { subscribeCheckoutCustomer } from '../customer/session-lifecycle.js';
+import { createProviderMount, type OwnedProviderMount } from '../widget/provider-mount.js';
 const copy = {
   en: { amount: 'Donation amount', custom: 'Custom amount (minor units)', message: 'Optional message', create: 'Create donation', pay: 'Pay', check: 'Check status', loading: 'Loading campaign', ready: 'Choose a donation amount.', pending: 'Please wait.', local: 'Donation checkout created. Ready to pay.', processing: 'Payment is processing', succeeded: 'Payment succeeded', unknown: 'Payment result unknown. Check status.', failed: 'Payment could not be completed.', expired: 'Checkout expired.', signIn: 'Sign in required', anonymous: 'Anonymous donations allowed', invalidAmount: 'Choose a permitted amount.', invalidMessage: 'Use at most 500 characters.', auth: 'Sign in is required for this campaign.', error: 'Unable to complete donation. Please try again.', session: 'Customer session unavailable. Sign in again.' },
   pt: { amount: 'Valor do donativo', custom: 'Valor personalizado (unidades mínimas)', message: 'Mensagem opcional', create: 'Criar donativo', pay: 'Pagar', check: 'Verificar estado', loading: 'A carregar campanha', ready: 'Escolha o valor do donativo.', pending: 'Aguarde.', local: 'Donativo criado. Pronto para pagar.', processing: 'Pagamento em processamento', succeeded: 'Pagamento concluído', unknown: 'Resultado desconhecido. Verifique o estado.', failed: 'Não foi possível concluir o pagamento.', expired: 'Pagamento expirado.', signIn: 'Inicie sessão', anonymous: 'Donativos anónimos permitidos', invalidAmount: 'Escolha um valor permitido.', invalidMessage: 'Use no máximo 500 caracteres.', auth: 'Inicie sessão para esta campanha.', error: 'Não foi possível concluir o donativo. Tente novamente.', session: 'Sessão indisponível. Inicie sessão novamente.' },
@@ -26,7 +27,7 @@ export class GenericDonation extends ElementBase {
   #invalid?: 'amount' | 'message';
   #status?: PaymentStatus;
   #providerView?: CheckoutProviderView;
-  #providerHost?: HTMLDivElement;
+  #providerMount?: OwnedProviderMount;
   #providerReady = false;
   #checking = false;
   #actionReady = false;
@@ -82,7 +83,7 @@ export class GenericDonation extends ElementBase {
   attributeChangedCallback(name: string, old: string | null, value: string | null): void { if (old === value || !this.isConnected) return; if (name === 'locale') { this.#render(); this.#presentation(); } else void this.#configure(); }
   #changed(): void { if (this.#intent) delete this.#intent.message; this.#intent = undefined; this.#error = undefined; this.#invalid = undefined; }
   #reset(): void { ++this.#generation; this.#controller?.abort(); this.#cleanup(); this.#controller = undefined; this.#client = undefined; this.#campaign = undefined; this.#session = undefined; this.#changed(); this.#message.value = ''; this.#customInput.value = ''; this.#custom = false; this.#amount = 0; this.#busy = false; this.#status = undefined; }
-  #cleanup(): void { this.#providerView?.destroy(); this.#providerView = undefined; this.#providerHost?.remove(); this.#providerHost = undefined; this.#providerReady = false; this.#checking = false; this.#actionReady = false; this.#resumeAvailable = false; clearTimeout(this.#expiry); this.#unsubscribe?.(); this.#unsubscribe = undefined; }
+  #cleanup(): void { this.#providerView?.destroy(); this.#providerView = undefined; this.#providerMount?.destroy(); this.#providerMount = undefined; this.#providerReady = false; this.#checking = false; this.#actionReady = false; this.#resumeAvailable = false; clearTimeout(this.#expiry); this.#unsubscribe?.(); this.#unsubscribe = undefined; }
   #bindSession(session: DonationCheckoutSession, g: number): void {
     const unsubscribe = subscribeCheckoutCustomer(session, () => { if (!this.#current(g)) return; this.#reset(); this.#error = 'session'; this.#render(); this.#live.focus(); });
     if (!this.#current(g)) { unsubscribe(); return; } this.#unsubscribe = unsubscribe;
@@ -90,9 +91,9 @@ export class GenericDonation extends ElementBase {
   }
   async #mountProvider(g: number): Promise<void> {
     if (!this.#session || (this.#session.providerType === 'STRIPE' && !['CREATED', 'REQUIRES_PAYMENT_METHOD', 'REQUIRES_ACTION'].includes(this.#session.state.status))) return;
-    this.#providerView?.destroy(); this.#providerHost?.remove(); this.#providerReady = false;
-    this.#providerHost = document.createElement('div'); this.#providerHost.className = 'payment-element'; this.#submit.before(this.#providerHost);
-    this.#providerView = new CheckoutProviderView(this.#client!, this.#providerHost); this.#presentation();
+    this.#providerView?.destroy(); this.#providerMount?.destroy(); this.#providerReady = false;
+    this.#providerMount = createProviderMount(this, this.#submit, this.#session.providerType);
+    this.#providerView = new CheckoutProviderView(this.#client!, this.#providerMount.host); this.#presentation();
     await this.#providerView.mount(this.#session, this.#controller!.signal);
     if (this.#current(g)) this.#providerReady = true;
   }
