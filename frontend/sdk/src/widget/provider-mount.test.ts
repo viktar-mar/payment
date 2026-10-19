@@ -122,6 +122,22 @@ it('revokes ownership when a temporary competing slot reassigns the host', async
   ownSlot.before(competing); expect(lease.host.assignedSlot).toBe(competing); competing.remove();
   expect(api.ownedProviderHost(widget)).toBeUndefined(); lease.destroy();
 });
+// Break: classifying historical slot mutations by their target's current root misses detached ancestors.
+it.each(['resolver', 'observer'] as const)('revokes a competing slot in a detached ancestor through the %s path', async path => {
+  const api = await mountApi(), widget = document.createElement('div'), anchor = document.createElement('button'), foreign = document.createElement('div');
+  const root = widget.attachShadow({ mode: 'open' }); root.append(foreign, anchor); registerFormLoadWidget(widget);
+  const observation = armFormLoadDiagnostic(widget); observations.add(observation); document.body.append(widget);
+  const lease = api.createProviderMount(widget, anchor, 'STRIPE'); bindFormLoadDiagnostic(widget, lease.host, 1);
+  expect(observation.snapshot().binding).toBe('BOUND');
+  const ownSlot = root.querySelector('slot')!, competing = document.createElement('slot'); competing.name = ownSlot.name;
+  foreign.append(competing); expect(lease.host.assignedSlot).toBe(competing);
+  foreign.remove(); expect(lease.host.assignedSlot).toBe(ownSlot);
+  if (path === 'observer') await Promise.resolve();
+  expect(api.ownedProviderHost(widget)).toBeUndefined();
+  expect(observation.snapshot().binding).toBe('LOST');
+  root.prepend(foreign); foreign.remove();
+  expect(api.ownedProviderHost(widget)).toBeUndefined(); lease.destroy();
+});
 // Break: arbitrary shadow nodes receiving a positive diagnostic binding.
 it('rejects a forged diagnostic host while retaining its captured deny association', async () => {
   const { formLoadBinding, denyFormLoadConfirmation } = await import('../diagnostics/form-load-observer.js');

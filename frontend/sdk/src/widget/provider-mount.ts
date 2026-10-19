@@ -35,26 +35,28 @@ export function createProviderMount(widget: HTMLElement, anchor: HTMLElement, pr
   anchor.before(wrapper);
   let retired = false;
   const protectedNodes: Node[] = slot ? [widget, host, wrapper, slot] : [widget, host];
-  const revoke = () => { retired = true; observer.disconnect(); };
-  const inspect = (records: MutationRecord[]) => {
+  const revoke = () => { retired = true; observer.disconnect(); projectionObserver.disconnect(); };
+  const inspect = (records: MutationRecord[], shadowProjection = false) => {
     for (const record of records) {
       if ((record.type === 'attributes' && (record.target === host || record.target === slot))
-        // A foreign slot can temporarily steal projection even if removed before this check.
-        || (stripe && (record.target === root || record.target.getRootNode() === root)
+        // Observer provenance survives detached targets; their current root does not.
+        || (stripe && shadowProjection
           && ((record.type === 'attributes' && (record.target as Element).localName === 'slot')
-            || Array.from(record.addedNodes).some(node => node.nodeType === 1 && ((node as Element).localName === 'slot' || (node as Element).querySelector('slot')))))
+            || [...record.addedNodes, ...record.removedNodes].some(node => node.nodeType === 1 && ((node as Element).localName === 'slot' || (node as Element).querySelector('slot')))))
         || Array.from(record.removedNodes).some(node => protectedNodes.some(owned => node === owned || node.contains(owned)))) { revoke(); return; }
     }
   };
-  const observer = new MutationObserver(inspect);
+  const observer = new MutationObserver(records => inspect(records));
+  const projectionObserver = new MutationObserver(records => inspect(records, true));
   observer.observe(doc, { childList: true, subtree: true });
   observer.observe(widget, { childList: true, subtree: true, attributes: true, attributeFilter: ['slot'] });
-  observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['name'] });
+  projectionObserver.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['name'] });
   const lease: Lease = {
     host,
     current() {
       // Drain queued records before a positive answer, including detach/reinsert in this turn.
       inspect(observer.takeRecords());
+      inspect(projectionObserver.takeRecords(), true);
       if (retired || leases.get(widget) !== lease) return false;
       if (!widget.isConnected || !host.isConnected || wrapper.parentNode !== parent || wrapper.getRootNode() !== root
         || (stripe ? host.parentElement !== widget || host.getRootNode() !== doc || !doc.documentElement.contains(host)
