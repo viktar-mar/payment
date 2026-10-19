@@ -304,6 +304,16 @@ ready does not mean payment succeeded or Stage5A accepted. Retain all containers
 volumes, networks, provider objects, data and audit evidence. This implementation
 does not reinterpret historical failed attempts or their unconfirmed cleanup.
 
+Cleanup starts the single owned context-close attempt before browser closure and
+allows independent completion strictly before a grace cutoff of at most five
+seconds, shortened to reserve ten seconds for attempting browser closure within
+the original cleanup ceiling. Rejection, expiry or no remaining grace latches
+context cleanup uncertainty and triggers browser fallback. Late fulfillment or
+browser-driven context closure cannot restore that independent proof; the grace
+and reserve do not extend the ceiling or guarantee successful closure. A context
+already closing or closed when its owned attempt dispatches remains unconfirmed;
+its no-op close cannot establish independent closure.
+
 ## Stripe Sandbox configuration (Stage 5A preparation)
 
 The recovery helper `infrastructure/stripe-sandbox-bootstrap.mjs` exports

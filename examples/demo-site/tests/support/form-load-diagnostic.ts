@@ -50,13 +50,18 @@ export async function runFormLoadBrowser(browserType:Pick<BrowserType,'launch'>,
   let lastObservation:Readonly<FormDiagnosticSample>|undefined;
   let browserUncertain=false,contextUncertain=false;
   const acquisitions=new Set<Promise<unknown>>(),closures=new Set<Promise<unknown>>(),closed=new WeakSet<object>();
-  function closeOwned(resource:Browser|BrowserContext,kind:'browser'|'context'):Promise<void> {
+  function closeOwned(resource:Browser|BrowserContext,kind:'browser'|'context',proofDeadline=cleanupDeadline):Promise<void> {
     if(closed.has(resource))return Promise.resolve();closed.add(resource);
     const task=bounded(Promise.resolve().then(()=>{
       if(Date.now()>=cleanupDeadline)throw DEADLINE;
+      // Playwright close() fulfills without work for closing/closed contexts.
+      // Check at dispatch so an external close cannot manufacture owned proof.
+      if(kind==='context'&&(resource as BrowserContext).isClosed())throw FAILED;
       return resource.close();
     }),cleanupDeadline).then(()=>{
-      if(kind==='browser')browserClosed=true;else contextClosed=true;
+      if(kind==='browser')browserClosed=true;
+      else if(Date.now()>=proofDeadline){uncertain=true;contextUncertain=true;}
+      else if(!contextUncertain)contextClosed=true;
     },()=>{uncertain=true;if(kind==='browser')browserUncertain=true;else contextUncertain=true;});
     closures.add(task);task.finally(()=>closures.delete(task));return task;
   }
@@ -139,7 +144,16 @@ export async function runFormLoadBrowser(browserType:Pick<BrowserType,'launch'>,
     // closed when settled, and can never turn uncertain cleanup into certainty.
     closing=true;
     try {
-      if(context)void closeOwned(context,'context');
+      if(context){
+        // Grant one independent context attempt up to five seconds, reserving
+        // ten seconds for browser fallback inside the original cleanup ceiling.
+        const graceDeadline=Math.min(Date.now()+5000,cleanupDeadline-10000);
+        const attempt=closeOwned(context,'context',graceDeadline);
+        if(Date.now()<graceDeadline){try {await bounded(attempt,graceDeadline);}catch {}}
+        // closeOwned drains failures into fulfillment. Only its independent
+        // proof counts; fallback uncertainty survives all later settlement.
+        if(!contextClosed||contextUncertain){uncertain=true;contextUncertain=true;}
+      }
       if(browser)void closeOwned(browser,'browser');
       while(acquisitions.size||closures.size)await bounded(Promise.allSettled([...acquisitions,...closures]),cleanupDeadline);
     }catch {uncertain=true;}
