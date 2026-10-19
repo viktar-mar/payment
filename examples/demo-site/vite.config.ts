@@ -37,7 +37,7 @@ export default defineConfig(({mode}):UserConfig=>({
     configureServer: protectReturnRequests,
     configurePreviewServer: protectReturnRequests,
   }],
-  build: { rollupOptions: { input: mode==='form-diagnostic'?{formDiagnostic:'form-load-diagnostic.html'}:{main:'index.html',paymentReturn:'payment-return.html'} } },
+  build: { rollupOptions: { input: mode==='form-diagnostic'?{formDiagnostic:'form-load-diagnostic.html',formManual:'form-load-manual.html'}:{main:'index.html',paymentReturn:'payment-return.html'} } },
   server: {
     host: "127.0.0.1",
     port: 4173,

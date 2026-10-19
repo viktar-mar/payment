@@ -14,7 +14,7 @@ test('actual Vite config isolates diagnostic entry and preserves ordinary entrie
   const normal=await loadConfigFromFile({command:'build',mode:'production'},root+'/vite.config.ts',root);
   const diagnostic=await loadConfigFromFile({command:'build',mode:'form-diagnostic'},root+'/vite.config.ts',root);
   assert.deepEqual(normal?.config.build?.rollupOptions?.input,{main:'index.html',paymentReturn:'payment-return.html'});
-  assert.deepEqual(diagnostic?.config.build?.rollupOptions?.input,{formDiagnostic:'form-load-diagnostic.html'});
+  assert.deepEqual(diagnostic?.config.build?.rollupOptions?.input,{formDiagnostic:'form-load-diagnostic.html',formManual:'form-load-manual.html'});
   const aliases=diagnostic?.config.resolve?.alias as Record<string,string>;
   assert.ok(aliases['@generic-payments/sdk']?.endsWith('/frontend/sdk/src/index.ts'));
 });
@@ -22,6 +22,9 @@ test('normal Playwright discovery explicitly excludes diagnostic and Node-only s
   assert.ok(Array.isArray(normalPlaywright.testIgnore));
   assert.ok(normalPlaywright.testIgnore.includes('form-load-diagnostic.spec.ts'));
   assert.ok(normalPlaywright.testIgnore.includes('**/support/form-load-diagnostic*.test.ts'));
+  assert.ok(normalPlaywright.testIgnore.includes('**/support/form-load-manual*.test.ts'));
+  for(const file of ['form-load-manual.test.ts','form-load-manual-build.test.ts'])assert.ok(normalPlaywright.testIgnore.some(
+    pattern=>typeof pattern==='string'&&matchesGlob('tests/support/'+file,pattern)));
   assert.ok(normalPlaywright.testIgnore.some(pattern=>typeof pattern==='string'&&matchesGlob(
     'tests/support/form-load-diagnostic-environment.test.ts',pattern)));
 });
@@ -48,13 +51,13 @@ test('actual diagnostic and owned spec entrypoints forward the raw manual flag b
   };
   const hooks=registerHooks({resolve(specifier,context,nextResolve){
     if(context.parentURL?.includes('/tests/')&&/\/(form-load-diagnostic|stripe-sandbox)\.spec\.ts/.test(context.parentURL)&&Object.hasOwn(stubs,specifier))
-      return {url:stubs[specifier],shortCircuit:true};return nextResolve(specifier,context);
+      return {url:stubs[specifier]!,shortCircuit:true};return nextResolve(specifier,context);
   }});
   try{
     process.env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC='true';process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN='true';
     for(const spec of ['form-load-diagnostic','stripe-sandbox']){
       state.callbacks.length=0;await import(new URL('../'+spec+'.spec.ts?manual-admission-test',import.meta.url).href);
-      await assert.rejects(state.callbacks[0]());
+      await assert.rejects(state.callbacks[0]!());
     }
     assert.deepEqual(state.environments.map(env=>env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC),['true','true']);
   }finally{
