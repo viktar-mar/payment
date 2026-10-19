@@ -601,6 +601,82 @@ docker compose --env-file infrastructure/.env --env-file infrastructure/stripe-s
 
 All three Sandbox values are required and passed only to the backend; Admin and demo receive none. `config --quiet` validates without printing an expanded configuration. Do not run plain `config` with private credentials. Starting the Sandbox stack or executing Stripe smoke requires the separately reviewed adapter and an explicit opt-in with agreed test fixtures.
 
+## Manual Stripe form diagnostic (implementation only)
+
+This mode is implemented and verified offline only. No Sandbox launch, Docker/Stripe
+operation or real browser attempt is authorized by this guide, its tests or a commit.
+The original Sandbox missing-ready cause remains **UNKNOWN**; this mode does not
+establish Stage 5A acceptance. A future attempt requires separate explicit permission,
+fresh source/ownership checks and one fresh anonymous EUR 20.00 ONE_TIME/NONE fixture:
+one unconfirmed Intent and at most one first Attempt. Zero Attempts can prove no
+confirmation but cannot prove form readiness. There is no automatic repeat, retry,
+reconciliation, refund, replacement port or reuse of an earlier fixture.
+
+Only after that future approval, the exact command template from the repository root
+is below. Values are placeholders, not commands to execute now. Use a fresh UUID, the
+final reviewed commit SHA, the approved local Unix Docker daemon, six distinct approved
+free loopback ports and a seventh distinct approved gateway port (1024–65535). Keep
+provider/admin credentials inside the existing private runtime boundary; none belong
+in this command, terminal output or chat. No positional or optional CLI arguments are
+accepted. The direct CLI copies only allowlisted raw environment fields into its
+strict manual admission record.
+
+```bash
+env -i PATH="<APPROVED_NODE_AND_SYSTEM_PATH>" LANG=C LC_ALL=C NO_COLOR=1 \
+  PAYMENT_STRIPE_SANDBOX_ENABLED=true \
+  PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC=true \
+  PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY=true \
+  PAYMENT_STRIPE_SANDBOX_RUN_ID="<FRESH_UUID>" \
+  PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE="<REVIEWED_COMMIT_SHA>" \
+  PAYMENT_STRIPE_SANDBOX_DAEMON="<APPROVED_UNIX_DAEMON>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_BACKEND="<BACKEND_PORT>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_DEMO="<DEMO_PORT>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_RECEIVER="<RECEIVER_PORT>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_POSTGRES="<POSTGRES_PORT>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_MAILPITHTTP="<MAILPIT_HTTP_PORT>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_MAILPITSMTP="<MAILPIT_SMTP_PORT>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_MANUAL="<GATEWAY_PORT>" \
+  node infrastructure/stripe-manual-form.mjs
+```
+
+Automatic FORM_DIAGNOSTIC, full-run, owned-run and allow-test-operations modes are
+incompatible. DEBUG, NODE_DEBUG, PWDEBUG and PW_TRACE must remain disabled. One original
+15-minute active deadline starts at entry; cleanup is bounded by that deadline plus
+two minutes. New manual starts stop two minutes before the active deadline. Observation
+ends at the earlier of the original session grant plus 60 seconds and the active
+deadline minus 60 seconds; waiting, errors and cleanup never renew these limits.
+
+After approval and successful preparation, stdout prints only the fixed
+`http://127.0.0.1:<GATEWAY_PORT>/form-load-manual.html` URL and one finite JSON report.
+The URL contains no capability, query or fragment. Open it once in an ordinary browser,
+without an extension or DevTools. Click **«Загрузить форму» exactly once**. Do not enter
+card details, press Pay, reload, open another tab or retry. The page says
+«Ручная проверка — без оплаты» and warns «Не вводите карту и не нажимайте Pay. Не
+обновляйте страницу». If ready is reported, inspect only whether the real fields are
+visible; nothing should be typed. Early ready leaves the form visible until the
+original observation cutoff. Afterwards, close only this tab and separately tell the
+operator whether the fields were visible. No console/Network/HAR/trace/iframe payload
+or screenshot collection is requested.
+
+The report is version 1, mode `MANUAL_FORM_DIAGNOSTIC`, at most 4096 bytes. It exposes
+`observation`, `end`, a finite `sample` (or null), and `no_confirmation`, `gateway_closed`,
+`runtime_closed`. Its provenance is always `BROWSER_REPORTED`; `browser_closure` is
+always `NOT_OWNED`. `READY_REPORTED` requires a coherent SDK sample and visible/enabled
+Pay; an iframe alone, no report or an AT_LIMIT sample cannot establish readiness. A
+historical ready sample can remain alongside `end=FAILED`. Exit 0 requires
+`end=READY_REPORTED` and all three positive owned proofs, and means only that this
+bounded experiment completed. It is no payment-success, independent browser or
+environment proof. Unknown financial facts or unconfirmed owned cleanup give exit 1.
+
+The controller closes gateway admission, attempts exactly one financial read under
+the original remaining authority, then closes only its verified owned runtime. Failed
+prepare/open/wait/output/close paths still attempt that read while authority remains.
+Late acquisitions and unfinished closes remain owned and cannot produce positive
+closure until they settle. The external browser is not process-owned; no automatic
+browser-closure claim is made. Containers are stopped only through their verified
+ownership boundary; networks, volumes, database data and provider objects are retained.
+Any failure ends the attempt and requires review plus new permission before a new run.
+
 ## Admin, SDK and payment journeys
 
 ### Stripe inspection and return recovery
