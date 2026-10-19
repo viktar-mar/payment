@@ -16,3 +16,13 @@ export interface ManualFormDependencies {
 export interface ManualFormResult {readonly report:Readonly<ManualFormReport>;readonly exitCode:0|1;}
 export function runManualFormDiagnostic(options:ManualFormOptions,limits:FormDiagnosticLimits,dependencies?:ManualFormDependencies):Promise<Readonly<ManualFormResult>>;
 export function runManualFormCli(input:{readonly env:unknown;readonly args:readonly string[]},dependencies?:ManualFormDependencies):Promise<Readonly<ManualFormResult>>;
+/** Direct-entry capabilities are explicit; importing the module never grants exit authority. */
+export interface ManualFormEntryCapabilities {
+  readonly stdout:{
+    once(event:'error',listener:()=>void):unknown;
+    removeListener(event:'error',listener:()=>void):unknown;
+    write(text:string,callback:(error?:Error|null)=>void):unknown;
+  };
+  readonly exit:(code:0|1)=>void;
+}
+export function runManualFormEntry(input:{readonly env:unknown;readonly args:readonly string[]},capabilities:ManualFormEntryCapabilities,dependencies?:ManualFormDependencies):Promise<void>;

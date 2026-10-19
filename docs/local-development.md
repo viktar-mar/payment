@@ -646,6 +646,15 @@ two minutes. New manual starts stop two minutes before the active deadline. Obse
 ends at the earlier of the original session grant plus 60 seconds and the active
 deadline minus 60 seconds; waiting, errors and cleanup never renew these limits.
 
+Final output uses only the remainder of that original cleanup ceiling. Rejected
+admission gets at most one second for its failure report, without runtime authority.
+An interrupt or stalled output gives exit 1 and removes the invocation's signal
+subscriptions. The direct command then exits its own Node process; a blocked stdout
+may leave the sole report incomplete or missing. Output is never retried, and a printed
+report alone is not successful completion: check the exit status too. Imported CLI
+calls return without exiting the host process or destroying its shared stdout; a
+pending write remains observed for late errors and is not claimed to have flushed.
+
 After approval and successful preparation, stdout prints only the fixed
 `http://127.0.0.1:<GATEWAY_PORT>/form-load-manual.html` URL and one finite JSON report.
 The URL contains no capability, query or fragment. Open it once in an ordinary browser,

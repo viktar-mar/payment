@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
+import {EventEmitter} from 'node:events';
 const subject=await import('./stripe-manual-form.mjs').catch(error=>{if(error.code==='ERR_MODULE_NOT_FOUND')return {};throw error;});
 const flags={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};
 const options=()=>({env:{...flags},runId:'11111111-2222-4333-8444-555555555555',expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',manualPort:18083,
@@ -168,12 +169,10 @@ test('abort or expired final authority cannot renew proof; cleanup retains origi
     assert.equal(f.calls.some(x=>x[0]==='proof'),false);assert.equal(f.calls.find(x=>x[0]==='runtime-close')[1].deadline,1021000);
   }
 });
-test('import is inert and direct missing opt-in emits only finite report under sanitized child env',()=>{
+test('import is inert under sanitized child env',()=>{
   const childEnv={PATH:'/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C',NO_COLOR:'1'};
   const imported=spawnSync(process.execPath,['--input-type=module','-e',"await import('./infrastructure/stripe-manual-form.mjs')"],{cwd:new URL('..',import.meta.url),env:childEnv,encoding:'utf8',timeout:5000,maxBuffer:8192});
   assert.equal(imported.status,0);assert.equal(imported.stdout,'');assert.equal(imported.stderr,'');
-  const direct=spawnSync(process.execPath,['infrastructure/stripe-manual-form.mjs'],{cwd:new URL('..',import.meta.url),env:childEnv,encoding:'utf8',timeout:5000,maxBuffer:8192});
-  assert.equal(direct.status,1);assert.equal(direct.stderr,'');const value=JSON.parse(direct.stdout);assert.equal(value.version,1);assert.equal(value.end,'FAILED');assert.equal(value.browser_closure,'NOT_OWNED');
 });
 test('CLI snapshots only allowlisted raw env and prints URL plus strict final report',async()=>{
   assert.equal(typeof subject.runManualFormCli,'function');const f=fixture();let touched=0;
@@ -208,4 +207,134 @@ test('CLI final write failure preserves only dominant end '+originalEnd,async()=
   assert.equal(value.report.end,['ABORTED','ACTIVE_DEADLINE'].includes(originalEnd)?originalEnd:'FAILED');
   assert.equal(value.report.browser_closure,'NOT_OWNED');assert.equal(value.report.provenance,'BROWSER_REPORTED');
   assert.equal(f.writes.join('').includes('PRIVATE_SESSION'),false);
+});
+
+function cliInput(admitted=true){
+  const env={...flags,PAYMENT_STRIPE_SANDBOX_RUN_ID:options().runId,PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE:options().expectedSource,
+    PAYMENT_STRIPE_SANDBOX_DAEMON:options().daemon,PAYMENT_STRIPE_SANDBOX_PORT_MANUAL:'18083'};
+  for(const [key,value] of Object.entries(options().ports))env['PAYMENT_STRIPE_SANDBOX_PORT_'+key.toUpperCase()]=String(value);
+  return {env:admitted?env:{},args:[]};
+}
+// Break: final output outlives the original ceiling/abort, retains subscriptions,
+// retries on late rejection, or upgrades an already returned failure.
+for(const admitted of [true,false])for(const boundary of ['deadline','abort'])for(const late of ['resolve','reject'])
+test(`CLI pending final writer releases ${admitted?'admitted':'rejected'} invocation on ${boundary}, ignores late ${late}`,async()=>{
+  const f=fixture(),pending=defer();let stop,subscriptions=0,finalWrites=0,settled=false,value;
+  f.dependencies.subscribe=callback=>{stop=callback;subscriptions++;return ()=>{subscriptions--;};};
+  f.dependencies.write=text=>{f.writes.push(text);if(text.startsWith('http://'))return;finalWrites++;return pending.promise;};
+  const promise=subject.runManualFormCli(cliInput(admitted),f.dependencies).then(result=>{settled=true;value=result;return result;});
+  await f.tick(1000);
+  assert.equal(finalWrites,1);assert.equal(settled,false);
+  if(boundary==='abort'){
+    assert.equal(typeof stop,'function','final emission must remain interruptible after rejected admission too');
+    stop();await f.tick(1001);
+  }else{
+    await f.tick(admitted?1020999:1999);assert.equal(settled,false,'no renewed or shortened original budget');
+    await f.tick(admitted?1021000:2000);
+  }
+  assert.equal(settled,true,'pending output must release CLI without writer settlement');
+  await promise;
+  assert.equal(subscriptions,0);assert.equal(f.timers.size,0);assert.equal(value.exitCode,1);
+  assert.equal(value.report.end,boundary==='abort'?'ABORTED':admitted?'ACTIVE_DEADLINE':'FAILED');
+  assert.equal(value.report.observation,admitted?'READY_REPORTED':'NOT_STARTED');
+  assert.equal(value.report.no_confirmation,admitted);assert.equal(value.report.gateway_closed,admitted);assert.equal(value.report.runtime_closed,admitted);
+  assert.equal(value.report.browser_closure,'NOT_OWNED');assert.equal(value.report.provenance,'BROWSER_REPORTED');
+  const frozen=JSON.stringify(value),calls=f.calls.map(x=>x[0]);
+  assert.deepEqual(calls,admitted?['preflight','runtime','prepare','gateway','open','wait','gateway-close','proof','runtime-close']:[]);
+  pending[late](late==='reject'?new Error('private output failure'):undefined);await f.tick(1021001);
+  assert.equal(finalWrites,1);assert.equal(JSON.stringify(value),frozen);assert.deepEqual(f.calls.map(x=>x[0]),calls);
+  assert.equal(f.writes.join('').includes('PRIVATE_SESSION'),false);
+});
+
+// Break: final emission starts a new budget after slow cleanup, or erases an
+// already dominant reason when a later output timeout/abort wins.
+for(const originalEnd of ['ABORTED','ACTIVE_DEADLINE'])
+test('CLI pending final writer preserves original '+originalEnd+' through output cutoff',async()=>{
+  const f=fixture(),pending=defer();let stop,subscriptions=0,finalWrites=0,settled=false,value;
+  f.dependencies.subscribe=callback=>{stop=callback;subscriptions++;return ()=>{subscriptions--;};};
+  f.dependencies.preflight=async()=>{if(originalEnd==='ABORTED')stop();else await f.tick(901000);return {status:'READY'};};
+  f.dependencies.write=()=>{finalWrites++;return pending.promise;};
+  const promise=subject.runManualFormCli(cliInput(),f.dependencies).then(result=>{settled=true;value=result;});
+  await f.tick(1000);await f.tick(901000);await f.tick(1021000);
+  assert.equal(settled,true,'dominant failure cannot wait indefinitely for final output');await promise;
+  assert.equal(value.report.end,originalEnd);assert.equal(value.exitCode,1);assert.equal(finalWrites,1);assert.equal(subscriptions,0);assert.equal(f.timers.size,0);
+  pending.reject(new Error('late failure'));await f.tick(1021001);assert.equal(value.report.end,originalEnd);assert.equal(finalWrites,1);
+});
+
+test('CLI final writer completing after active deadline fails even before its original cleanup ceiling',async()=>{
+  const f=fixture(),pending=defer();f.dependencies.subscribe=()=>()=>{};
+  f.dependencies.write=text=>text.startsWith('http://')?undefined:pending.promise;
+  const promise=subject.runManualFormCli(cliInput(),f.dependencies);await f.tick(1000);await f.tick(901000);pending.resolve();await f.tick(901001);
+  const value=await promise;assert.equal(value.exitCode,1);assert.equal(value.report.end,'ACTIVE_DEADLINE');assert.equal(f.timers.size,0);
+});
+
+test('CLI slow runtime cleanup leaves only the remainder of the original final output budget',async()=>{
+  const f=fixture(),closing=defer(),writing=defer();let settled=false,finalWrites=0,value;
+  f.dependencies.subscribe=()=>()=>{};f.runtime.close=()=>closing.promise;
+  f.dependencies.write=text=>{if(text.startsWith('http://'))return;finalWrites++;return writing.promise;};
+  const promise=subject.runManualFormCli(cliInput(),f.dependencies).then(result=>{value=result;settled=true;});
+  await f.tick(1000);await f.tick(1020990);closing.resolve(true);await f.tick(1020990);
+  assert.equal(finalWrites,1);assert.equal(settled,false);await f.tick(1021000);
+  assert.equal(settled,true,'final output cannot renew budget after runtime cleanup');await promise;
+  assert.equal(value.exitCode,1);assert.equal(value.report.end,'ACTIVE_DEADLINE');assert.equal(value.report.runtime_closed,true);assert.equal(f.timers.size,0);
+  writing.resolve();await f.tick(1021001);assert.equal(finalWrites,1);
+});
+
+// Break: the direct entry only sets exitCode while an unsettled own stdout write
+// holds it alive, or removes foreign/error listeners as if a race proved flush.
+for(const admitted of [true,false])for(const finish of ['success','error','abort'])
+test(`direct entry releases ${admitted?'admitted':'rejected'} pending stdout with late ${finish}`,async()=>{
+  assert.equal(typeof subject.runManualFormEntry,'function');
+  const f=fixture(),stream=new EventEmitter(),exits=[];let callback,stop,settled=false;
+  const foreign=()=>{};stream.on('error',foreign);
+  stream.write=(text,done)=>{f.writes.push(text);if(text.startsWith('http://'))done();else callback=done;};
+  f.dependencies.subscribe=cb=>{stop=cb;return ()=>{stop=null;};};
+  const promise=subject.runManualFormEntry(cliInput(admitted),{stdout:stream,exit:code=>exits.push(code)},f.dependencies).then(()=>{settled=true;});
+  await f.tick(1000);assert.equal(typeof callback,'function');assert.equal(settled,false);assert.deepEqual(exits,[]);
+  if(finish==='abort'){stop();await f.tick(1001);}else await f.tick(admitted?1021000:2000);
+  assert.equal(settled,true);await promise;assert.deepEqual(exits,[1]);assert.equal(stop,null);
+  assert.equal(stream.listenerCount('error'),2,'pending write still owns its late error observer');
+  if(finish==='error'){callback(new Error('private'));stream.emit('error',new Error('private'));}
+  else callback();
+  await f.tick(1021001);assert.deepEqual(exits,[1]);assert.deepEqual(stream.listeners('error'),[foreign]);assert.equal(f.timers.size,0);
+  assert.equal(f.writes.length,admitted?2:1);assert.equal(f.calls.filter(x=>x[0]==='proof').length,admitted?1:0);
+});
+test('direct entry waits for actual final stdout callback before successful exit',async()=>{
+  assert.equal(typeof subject.runManualFormEntry,'function');
+  const f=fixture(),stream=new EventEmitter(),exits=[];let callback;
+  stream.write=(text,done)=>{if(text.startsWith('http://'))done();else callback=done;};
+  f.dependencies.subscribe=()=>()=>{};
+  const promise=subject.runManualFormEntry(cliInput(),{stdout:stream,exit:code=>exits.push(code)},f.dependencies);
+  await f.tick(1000);assert.deepEqual(exits,[]);callback();await f.tick(1001);await promise;
+  assert.deepEqual(exits,[0]);assert.equal(stream.listenerCount('error'),0);assert.equal(f.timers.size,0);
+});
+test('direct missing opt-in emits only finite report through synthetic stdout and exit',async()=>{
+  assert.equal(typeof subject.runManualFormEntry,'function');
+  const f=fixture(),stream=new EventEmitter(),exits=[];
+  stream.write=(text,done)=>{f.writes.push(text);done();};f.dependencies.subscribe=()=>()=>{};
+  await subject.runManualFormEntry(cliInput(false),{stdout:stream,exit:code=>exits.push(code)},f.dependencies);
+  assert.deepEqual(exits,[1]);assert.deepEqual(f.calls,[]);assert.equal(f.writes.length,1);
+  const value=JSON.parse(f.writes[0]);assert.equal(value.version,1);assert.equal(value.end,'FAILED');assert.equal(value.browser_closure,'NOT_OWNED');
+});
+test('direct rejected admission does not read lifecycle capabilities while wiring stdout',async()=>{
+  const f=fixture(),stream=new EventEmitter(),exits=[];let touched=0;
+  for(const key of ['preflight','createRuntime','createGateway'])Object.defineProperty(f.dependencies,key,{enumerable:true,get(){touched++;throw null;}});
+  stream.write=(text,done)=>{f.writes.push(text);done();};f.dependencies.subscribe=()=>()=>{};
+  await subject.runManualFormEntry(cliInput(false),{stdout:stream,exit:code=>exits.push(code)},f.dependencies);
+  assert.equal(touched,0);assert.deepEqual(exits,[1]);assert.equal(f.writes.length,1);
+});
+// Break: output cutoff replaces a valid terminal/invalid observation with EMPTY
+// because those pairs require FAILED even when a later abort/deadline occurs.
+for(const observation of ['INVALID_REPORT','TERMINAL_REPORTED'])for(const boundary of ['abort','deadline'])
+test(`CLI output ${boundary} retains ${observation} failure and established owned proofs`,async()=>{
+  const f=fixture(),pending=defer();let stop,settled=false,value;
+  f.dependencies.subscribe=callback=>{stop=callback;return ()=>{};};
+  f.gateway.wait=async()=>observation==='INVALID_REPORT'?null:result({observation,end:'FAILED',sample:{...ready,confirmation_blocked:true}});
+  f.dependencies.write=text=>text.startsWith('http://')?undefined:pending.promise;
+  const promise=subject.runManualFormCli(cliInput(),f.dependencies).then(result=>{value=result;settled=true;});
+  await f.tick(1000);if(boundary==='abort')stop();await f.tick(boundary==='abort'?1001:1021000);
+  assert.equal(settled,true);await promise;assert.equal(value.exitCode,1);assert.equal(value.report.end,'FAILED');
+  assert.equal(value.report.observation,observation);assert.equal(value.report.no_confirmation,true);assert.equal(value.report.gateway_closed,true);assert.equal(value.report.runtime_closed,true);
+  if(observation==='TERMINAL_REPORTED')assert.equal(value.report.sample.confirmation_blocked,true);
+  pending.resolve();await f.tick(1021001);assert.equal(value.report.observation,observation);assert.equal(f.timers.size,0);
 });

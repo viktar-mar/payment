@@ -27,10 +27,21 @@ function gatewayObservation(value){
   const r=validateManualFormReport({...EMPTY,...o,no_confirmation:true,gateway_closed:true,runtime_closed:true});
   return r?{observation:r.observation,end:r.end,sample:r.sample}:null;
 }
-const stdout=text=>new Promise((accept,reject)=>{
-  const error=()=>reject();process.stdout.once('error',error);
-  process.stdout.write(text,failed=>{if(failed){reject();return;}process.stdout.removeListener('error',error);accept();});
-});
+function stdoutWriter(stream){
+  return text=>new Promise((accept,reject)=>{
+    const error=()=>reject();
+    stream.once('error',error);
+    try{
+      stream.write(text,failed=>{
+        // A failed write callback can precede the stream's error event. Keep
+        // observing that event, even if the caller's output bound has expired.
+        if(failed){reject();return;}
+        stream.removeListener('error',error);accept();
+      });
+    }catch{stream.removeListener('error',error);reject();}
+  });
+}
+const stdout=text=>stdoutWriter(process.stdout)(text);
 
 /** One invocation owns one original budget, one fixture, one gateway and one final financial read. */
 export async function runManualFormDiagnostic(options,originalLimits,dependencies={}){
@@ -155,32 +166,72 @@ export async function runManualFormCli(input,dependencies={}){
   let selected,started;
   try{
     const env=Object.fromEntries(FLAGS.map(key=>[key,rawData(input.env,key)]));
-    if(!manualFormOptIn(env)||!Array.isArray(input.args)||input.args.length!==0)return await emit(failed());
+    if(!manualFormOptIn(env)||!Array.isArray(input.args)||input.args.length!==0)throw null;
     started=(dependencies.now??Date.now)();
     const number=key=>{const value=rawData(input.env,key);if(typeof value!=='string'||! /^[1-9][0-9]{3,4}$/.test(value))throw null;return Number(value);};
     selected=validateManualFormOptions({env,runId:rawData(input.env,'PAYMENT_STRIPE_SANDBOX_RUN_ID'),expectedSource:rawData(input.env,'PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE'),
       daemon:rawData(input.env,'PAYMENT_STRIPE_SANDBOX_DAEMON'),ports:Object.fromEntries(PORTS.map(key=>[key,number('PAYMENT_STRIPE_SANDBOX_PORT_'+key.toUpperCase())])),manualPort:number('PAYMENT_STRIPE_SANDBOX_PORT_MANUAL')});
-    if(!selected)return await emit(failed());
-  }catch{return emit(failed());}
+  }catch{selected=null;}
   const controller=new AbortController();
   const stop=()=>controller.abort();
   // Signal ownership exists only during an explicit direct invocation.
   const subscribe=dependencies.subscribe??(callback=>{process.once('SIGINT',callback);process.once('SIGTERM',callback);return ()=>{process.removeListener('SIGINT',callback);process.removeListener('SIGTERM',callback);};});
-  let unsubscribe;
+  let unsubscribe,value=failed();
   try{
-    unsubscribe=subscribe(stop);
-    return await emit(await runManualFormDiagnostic(selected,{deadline:started+900000,signal:controller.signal},dependencies));
-  }catch{return emit(failed());}
+    try{
+      unsubscribe=subscribe(stop);
+      if(selected)value=await runManualFormDiagnostic(selected,{deadline:started+900000,signal:controller.signal},dependencies);
+    }catch{/* Still attempt the single bounded failure report. */}
+    return await emit(value);
+  }
   finally{unsubscribe?.();}
   async function emit(value){
-    try{await (dependencies.write??stdout)(formatManualFormReport(value.report));return value;}
-    catch{
-      const end=['ABORTED','ACTIVE_DEADLINE'].includes(value.report.end)?value.report.end:'FAILED';
-      return Object.freeze({report:validateManualFormReport({...value.report,end})??EMPTY,exitCode:1});
-    }
+    const now=dependencies.now??Date.now;
+    let wrote=false;
+    try{
+      const setTimer=dependencies.setTimeout??setTimeout,clearTimer=dependencies.clearTimeout??clearTimeout;
+      // Rejected admission gains only an output allowance, never lifecycle authority.
+      const deadline=selected?started+1020000:now()+1000;
+      wrote=await new Promise(accept=>{
+        let timer,done=false;
+        const finish=ok=>{
+          if(done)return;done=true;
+          clearTimer(timer);controller.signal.removeEventListener('abort',abort);accept(ok);
+        };
+        const abort=()=>finish(false);
+        controller.signal.addEventListener('abort',abort,{once:true});
+        try{
+          timer=setTimer(abort,Math.max(1,deadline-now()));
+          // Exactly one attempt, including an already aborted/expired result.
+          // Its late settlement is observed but cannot change the frozen result.
+          Promise.resolve((dependencies.write??stdout)(formatManualFormReport(value.report)))
+            .then(()=>finish(now()<deadline&&!controller.signal.aborted),abort);
+          if(now()>=deadline||controller.signal.aborted)abort();
+        }catch{abort();}
+      });
+    }catch{/* Output failure cannot re-enter lifecycle or retry emission. */}
+    const dominant=['ABORTED','ACTIVE_DEADLINE'].includes(value.report.end)?value.report.end
+      :['INVALID_REPORT','TERMINAL_REPORTED'].includes(value.report.observation)?'FAILED'
+      :controller.signal.aborted?'ABORTED':selected&&now()>=started+900000?'ACTIVE_DEADLINE':null;
+    if(wrote&&!dominant)return value;
+    if(wrote&&dominant===value.report.end)return value;
+    return Object.freeze({report:validateManualFormReport({...value.report,end:dominant??'FAILED'})??EMPTY,exitCode:1});
   }
+}
+/** Only the direct entry receives authority to exit its own process. */
+export async function runManualFormEntry(input,capabilities,dependencies={}){
+  let exitCode=1;
+  try{
+    const outputDependencies=Object.create(dependencies,{write:{value:stdoutWriter(capabilities.stdout)}});
+    const value=await runManualFormCli(input,outputDependencies);
+    exitCode=value.exitCode;
+  }catch{/* No raw errors or second output attempt. */}
+  // A pending stdout write may hold Node alive. This can truncate output after
+  // timeout/abort; it is not proof of flush, browser closure, or owned cleanup.
+  capabilities.exit(exitCode);
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
   // No arbitrary flags, inherited child environments, private values or raw errors.
-  runManualFormCli({env:process.env,args:process.argv.slice(2)}).then(value=>{process.exitCode=value.exitCode;},()=>{process.exitCode=1;});
+  void runManualFormEntry({env:process.env,args:process.argv.slice(2)},
+    {stdout:process.stdout,exit:code=>process.exit(code)});
 }
