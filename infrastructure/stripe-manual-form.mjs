@@ -174,7 +174,10 @@ export async function runManualFormCli(input,dependencies={}){
   finally{unsubscribe?.();}
   async function emit(value){
     try{await (dependencies.write??stdout)(formatManualFormReport(value.report));return value;}
-    catch{return Object.freeze({report:validateManualFormReport({...value.report,end:'FAILED'})??EMPTY,exitCode:1});}
+    catch{
+      const end=['ABORTED','ACTIVE_DEADLINE'].includes(value.report.end)?value.report.end:'FAILED';
+      return Object.freeze({report:validateManualFormReport({...value.report,end})??EMPTY,exitCode:1});
+    }
   }
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){

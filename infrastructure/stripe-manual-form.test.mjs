@@ -185,3 +185,27 @@ test('CLI snapshots only allowlisted raw env and prints URL plus strict final re
   assert.equal(f.writes.length,2);assert.equal(f.writes[0],'http://127.0.0.1:18083/form-load-manual.html\n');assert.equal(JSON.parse(f.writes[1]).provenance,'BROWSER_REPORTED');
   assert.equal(f.writes.join('').includes('PRIVATE_SESSION'),false);
 });
+// Break: a final output error replaces original abort/deadline provenance, or retains a successful/local result.
+for(const originalEnd of ['ABORTED','ACTIVE_DEADLINE','READY_REPORTED','LOCAL_LIMIT'])
+test('CLI final write failure preserves only dominant end '+originalEnd,async()=>{
+  const f=fixture(),raw={...flags,PAYMENT_STRIPE_SANDBOX_RUN_ID:options().runId,PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE:options().expectedSource,
+    PAYMENT_STRIPE_SANDBOX_DAEMON:options().daemon,PAYMENT_STRIPE_SANDBOX_PORT_MANUAL:'18083'};
+  for(const [key,value] of Object.entries(options().ports))raw['PAYMENT_STRIPE_SANDBOX_PORT_'+key.toUpperCase()]=String(value);
+  let stop,finalWrites=0,reportedEnd;
+  f.dependencies.subscribe=callback=>{stop=callback;return ()=>{};};
+  if(['ABORTED','ACTIVE_DEADLINE'].includes(originalEnd))f.dependencies.preflight=async()=>{
+    if(originalEnd==='ABORTED')stop();else await f.tick(901000);
+    return {status:'READY'};
+  };
+  if(originalEnd==='LOCAL_LIMIT')f.gateway.wait=async()=>result({observation:'NO_REPORT',end:'LOCAL_LIMIT',sample:null});
+  f.dependencies.write=async text=>{
+    f.writes.push(text);if(text.startsWith('http://'))return;
+    finalWrites++;reportedEnd=JSON.parse(text).end;
+    throw new Proxy({},{get(){assert.fail('raw output failure inspected');}});
+  };
+  const value=await subject.runManualFormCli({env:raw,args:[]},f.dependencies);
+  assert.equal(finalWrites,1);assert.equal(reportedEnd,originalEnd);assert.equal(value.exitCode,1);
+  assert.equal(value.report.end,['ABORTED','ACTIVE_DEADLINE'].includes(originalEnd)?originalEnd:'FAILED');
+  assert.equal(value.report.browser_closure,'NOT_OWNED');assert.equal(value.report.provenance,'BROWSER_REPORTED');
+  assert.equal(f.writes.join('').includes('PRIVATE_SESSION'),false);
+});
