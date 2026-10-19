@@ -8,6 +8,11 @@ import {constants} from 'node:fs';
 import {dirname, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createSandboxAcceptanceExtras} from './stripe-sandbox-extras.mjs';
+test('full extras refuse manual flag before configuration/dependency access',async()=>{
+  let touched=0;const trap=new Proxy({},{get(){touched++;throw null;}});
+  await assert.rejects(createSandboxAcceptanceExtras({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true'},get bootstrap(){touched++;throw null;}},trap),{message:'stripe_sandbox_extras_OPT_IN_REQUIRED'});
+  assert.equal(touched,0);
+});
 
 const forbidden = () => { throw new Error('synthetic_test_forbids_external_boundary'); };
 for (const name of ['execFile', 'spawn']) mock.method(childProcess, name, forbidden);

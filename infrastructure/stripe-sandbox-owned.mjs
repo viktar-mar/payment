@@ -4,12 +4,12 @@ import {lstat,realpath} from 'node:fs/promises';
 import {createServer} from 'node:net';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {manualFormOptIn,validateManualFormOptions,validateFormDiagnosticTopology} from './stripe-manual-form-options.mjs';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const DOCKER='/Applications/Docker.app/Contents/Resources/bin/docker';
 const CONFIG='/private/var/empty';
 const PORTS=['backend','demo','receiver','postgres','mailpitHttp','mailpitSmtp'];
-const EXHAUSTED=new Set(['2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-429f-a34c-e4f69ba2ce18']);
 const executeFile=promisify(execFile);
 const pending=(phase,code)=>Object.freeze({status:'PENDING',phase,code});
 // Nothing is inherited. Git status cannot refresh the index or invoke a configured fsmonitor.
@@ -59,6 +59,7 @@ export function formDiagnosticOptIn(env) {
     &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS)
     &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_FULL_RUN)
     &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN)
+    &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC)
     &&[undefined,''].includes(env.DEBUG)&&[undefined,''].includes(env.NODE_DEBUG)
     &&[undefined,'','0'].includes(env.PWDEBUG)&&[undefined,'','off'].includes(env.PW_TRACE);}
   catch {return false;}
@@ -67,24 +68,27 @@ export function formDiagnosticOptIn(env) {
 export async function preflightOwnedFormDiagnostic(options,dependencies={}) {
   return preflight(options,dependencies,true);
 }
+export async function preflightOwnedManualFormDiagnostic(options,dependencies={}) {
+  // Inspect the env data descriptor without invoking a hostile option accessor.
+  let env;
+  try {env=Object.getOwnPropertyDescriptor(options,'env')?.value;}catch{}
+  if(!manualFormOptIn(env))return pending('OPT_IN','OPT_IN_REQUIRED');
+  const selected=validateManualFormOptions(options);
+  if(!selected)return pending('INPUTS','CONFIGURATION');
+  return preflight(selected,dependencies,'manual');
+}
 
 async function preflight(options,dependencies,diagnostic) {
   let phase='OPT_IN',code='OPT_IN_REQUIRED';
   try {
     const env=options?.env;
-    if(diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'
-      ||env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'||env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'))return pending(phase,code);
+    if(diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'
+      ||env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'||env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC==='true'))return pending(phase,code);
     phase='INPUTS';code='CONFIGURATION';
     if(![undefined,''].includes(env.DEBUG)||![undefined,''].includes(env.NODE_DEBUG)||![undefined,'','0'].includes(env.PWDEBUG))return pending(phase,code);
-    const {runId,expectedSource,daemon,ports}=options;
-    if(typeof runId!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(runId)||EXHAUSTED.has(runId)
-      ||typeof expectedSource!=='string'||!/^[0-9a-f]{40}$/.test(expectedSource))return pending(phase,code);
-    if(!ports||typeof ports!=='object'||Array.isArray(ports)||Object.keys(ports).sort().join(',')!==[...PORTS].sort().join(','))return pending(phase,code);
-    const selectedPorts=PORTS.map(name=>ports[name]);
-    if(selectedPorts.some(port=>!Number.isInteger(port)||port<1024||port>65535)||new Set(selectedPorts).size!==6)return pending(phase,code);
-    if(typeof daemon!=='string'||/[\s\x00-\x1f\x7f%]/.test(daemon))return pending(phase,code);
-    const url=new URL(daemon);
-    if(url.protocol!=='unix:'||url.host||url.username||url.password||url.search||url.hash||!url.pathname.startsWith('/')||url.pathname.length<2||url.href!==daemon||daemon!=='unix://'+url.pathname)return pending(phase,code);
+    const topology=validateFormDiagnosticTopology(options);if(!topology)return pending(phase,code);
+    const {expectedSource,daemon,ports}=topology,url=new URL(daemon);
+    const selectedPorts=PORTS.map(name=>ports[name]);if(diagnostic==='manual')selectedPorts.push(options.manualPort);
 
     phase='SOURCE';code='SOURCE_MISMATCH';
     const execute=dependencies.execute??executeFile;

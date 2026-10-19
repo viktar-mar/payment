@@ -8,6 +8,11 @@ import {PassThrough} from 'node:stream';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createSandboxCliAdapter} from './stripe-sandbox-cli.mjs';
+test('full CLI refuses manual flag before configuration/dependency access',async()=>{
+  let touched=0;const trap=new Proxy({},{get(){touched++;throw null;}});
+  await assert.rejects(createSandboxCliAdapter({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true'},get runId(){touched++;throw null;}},trap),{message:'stripe_sandbox_cli_OPT_IN_REQUIRED'});
+  assert.equal(touched,0);
+});
 
 // A broken injection seam must never fall through to the pinned real CLI in RED.
 mock.method(childProcess,'execFile',()=>{throw new Error('synthetic_test_forbids_real_process');});

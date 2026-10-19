@@ -123,7 +123,7 @@ export async function createOwnedFormDiagnosticBootstrap(options,dependencies={}
 async function createBootstrap(options,dependencies,diagnostic) {
   let enabled=false;
   try {const env=options?.env;enabled=diagnostic?formDiagnosticOptIn(env):env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'
-    &&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY!=='true';} catch {}
+    &&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
   if(!enabled)throw fixed('OPT_IN_REQUIRED');
   let runId,expectedSource,daemon,ports,env,io;
   try {

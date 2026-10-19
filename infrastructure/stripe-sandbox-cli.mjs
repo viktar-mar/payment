@@ -28,7 +28,7 @@ const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value)
 /** No entrypoint or implicit I/O: only fixed, isolated, read-only CLI capabilities. */
 export async function createSandboxCliAdapter(options,dependencies={}) {
   let enabled=false;
-  try {const optIn=options?.env;enabled=optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true';} catch {}
+  try {const optIn=options?.env;enabled=optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {

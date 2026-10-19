@@ -1,4 +1,6 @@
 import type {CheckoutState} from '../frontend/sdk/src/contracts.js';
+import type {ManualFormOptions} from './stripe-manual-form-options.mjs';
+export type {ManualFormOptions} from './stripe-manual-form-options.mjs';
 export interface FormDiagnosticLimits {deadline:number;signal?:AbortSignal;}
 export interface FormDiagnosticOptions {
   env:Readonly<Record<string,string|undefined>>;runId:string;expectedSource:string;daemon:string;
@@ -15,3 +17,10 @@ export interface FormDiagnosticRuntime {
   close(limits:FormDiagnosticLimits):Promise<true>;
 }
 export function createFormDiagnosticRuntime(options:FormDiagnosticOptions,dependencies?:Record<string,unknown>):Promise<Readonly<FormDiagnosticRuntime>>;
+export interface ManualFormHandoff extends FormDiagnosticHandoff {readonly assetEndpoint:string;}
+export interface ManualFormRuntime {
+  prepare(limits:FormDiagnosticLimits):Promise<Readonly<ManualFormHandoff>>;
+  verifyNoConfirmation(limits:FormDiagnosticLimits):Promise<true>;
+  close(limits:FormDiagnosticLimits):Promise<true>;
+}
+export function createManualFormDiagnosticRuntime(options:ManualFormOptions,dependencies?:Record<string,unknown>):Promise<Readonly<ManualFormRuntime>>;

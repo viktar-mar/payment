@@ -11,6 +11,7 @@ import {EventEmitter} from 'node:events';
 import {createOwnedSandboxBootstrap} from './stripe-sandbox-bootstrap.mjs';
 import * as bootstrapModule from './stripe-sandbox-bootstrap.mjs';
 import {createFormDiagnosticRuntime} from './stripe-form-diagnostic-runtime.mjs';
+import * as formRuntime from './stripe-form-diagnostic-runtime.mjs';
 
 // Guard the builtin defaults as well as each fixture's raw process boundary.
 const forbidden=()=>{throw new Error('synthetic_test_forbids_real_process');};
@@ -170,12 +171,12 @@ test('prepare-only bootstrap creates the final backend once without listener, us
   await b.stop({...limits,deadline:limits.deadline+120000});
 });
 
-function formFixture() {
+function formFixture(browserOrigin='http://127.0.0.1:18081') {
   const env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};
   const f=fixture({env});delete f.options.approvedBinding;
   const suffix=RUN.replaceAll('-',''),uid=n=>'00000000-0000-4000-8000-'+String(n).padStart(12,'0');
   const account={id:uid(1),key:'stripe-sandbox-default',provider:'STRIPE',mode:'SANDBOX',status:'ACTIVE',external_account_id:'acct_1UPiMpELswAd8tpR'};
-  const site={id:uid(2),key:'s5a-'+suffix,status:'ACTIVE',payment_account_id:uid(1),allowed_origins:['http://127.0.0.1:18081'],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']}};
+  const site={id:uid(2),key:'s5a-'+suffix,status:'ACTIVE',payment_account_id:uid(1),allowed_origins:[browserOrigin],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']}};
   const provider={id:uid(3),provider_key:'s5a-email-'+suffix,mode:'EMAIL_OTP',status:'ACTIVE',readiness:'READY',version:0,sender_ref:'local-default',template_key:'otp-default',issuer:null,audiences:[],allowed_algorithms:[],jwks_source_type:null,keys:[]};
   const product={id:uid(4),site_id:site.id,key:'s5a-product-'+suffix,name:'Stage5A one-time acceptance',description:null,status:'ACTIVE'};
   const price={id:uid(5),site_id:site.id,product_id:product.id,price_key:'s5a-price-'+suffix,version:1,type:'ONE_TIME',amount_minor:2000,currency:'EUR',billing_interval:null,trial_days:0,trial_payment_method_policy:'OPTIONAL_DURING_TRIAL',tax_mode:'NONE',tax_code:null,status:'DRAFT',provider_price_id:null};
@@ -220,6 +221,49 @@ test('real prepare-only runtime completes one synthetic bootstrap/provision/prov
   assert.equal(f.http.filter(v=>v.path.startsWith('/v1/payment_intents/')).length,2);
   assert.equal(f.http.some(v=>/confirm|refund|customer|campaign|callback|inspection|client-session/.test(v.path)),false);
   assert.equal(f.events.some(v=>v.type==='process'&&(v.args.includes('rm')||v.args.includes('stripe'))),false);
+});
+
+const manualEnv={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};
+function manualFixture(){const f=formFixture('http://127.0.0.1:18083');return {...f,options:{...f.options,env:{...manualEnv},manualPort:18083}};}
+for(const attempts of [0,1])test('manual runtime preserves Docker ownership, gateway provisioning and final '+attempts+' Attempt proof',async()=>{
+  assert.equal(typeof formRuntime.createManualFormDiagnosticRuntime,'function');const f=manualFixture();
+  const r=await formRuntime.createManualFormDiagnosticRuntime(f.options,f.deps),limits=LIMIT(),h=await r.prepare(limits);
+  assert.deepEqual(Object.keys(h).sort(),['assetEndpoint','endpoint','expectedSource','runId','session']);
+  assert.equal(h.endpoint,'http://127.0.0.1:18083');assert.equal(h.assetEndpoint,'http://127.0.0.1:18081');
+  assert.equal(h.session.state.amountMinor,2000);assert.equal(h.session.state.currency,'EUR');assert.equal(h.session.state.price.taxMode,'NONE');
+  assert.equal(f.http.find(v=>v.path==='/api/admin/v1/sites'&&v.method==='POST').body.allowed_origins[0],'http://127.0.0.1:18083');
+  assert.deepEqual(f.http.find(v=>v.path.endsWith('/checkout-return-urls')&&v.method==='PUT').body,
+    {origin:'http://127.0.0.1:18083',return_url:'http://127.0.0.1:18083/payment-return.html',expected_version:-1});
+  assert.equal(f.http.find(v=>v.path.endsWith('/checkouts')).settings.headers.Origin,'http://127.0.0.1:18083');
+  const ledger=JSON.parse(f.files.get(DIR+'/runtime.json').contents);assert.equal(ledger.endpoints.demo,'http://127.0.0.1:18081');assert.deepEqual(ledger.ports,PORTS);
+  assert.equal(f.events.find(v=>v.type==='preflight').input.env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC,'true');
+  assert.equal(f.events.find(v=>v.type==='preflight').input.env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC,undefined);
+  if(attempts)f.resume();assert.equal(await r.verifyNoConfirmation(limits),true);
+  const reads=f.http.length;await assert.rejects(r.verifyNoConfirmation(limits));await assert.rejects(r.prepare(limits));assert.equal(f.http.length,reads);
+  assert.equal(await r.close({...limits,deadline:limits.deadline+120000}),true);await assert.rejects(r.close({...limits,deadline:limits.deadline+120000}));
+  assert.equal(f.http.filter(v=>v.path.endsWith('/checkouts')).length,1);
+  assert.equal(f.http.some(v=>/confirm|refund|customer|campaign|callback|inspection|client-session/.test(v.path)),false);
+});
+for(const [name,mutate] of [['second Attempt',f=>{f.resume();f.detail.attempts.push({...f.detail.attempts[0],id:'00000000-0000-4000-8000-000000000099',attempt_number:2});}],
+  ['unknown provider state',f=>f.intent.status='processing'],['charge',f=>f.intent.latest_charge='ch_unexpected'],['binding changed',f=>f.operation.reference='pi_Foreign']])
+test('manual runtime rejects '+name+' and consumes final proof',async()=>{
+  assert.equal(typeof formRuntime.createManualFormDiagnosticRuntime,'function');const f=manualFixture(),r=await formRuntime.createManualFormDiagnosticRuntime(f.options,f.deps),limits=LIMIT();
+  await r.prepare(limits);mutate(f);await assert.rejects(r.verifyNoConfirmation(limits));const reads=f.http.length;
+  await assert.rejects(r.verifyNoConfirmation(limits));assert.equal(f.http.length,reads);
+});
+test('manual runtime refuses renewed active and cleanup deadlines without further private operations',async()=>{
+  assert.equal(typeof formRuntime.createManualFormDiagnosticRuntime,'function');const f=manualFixture(),r=await formRuntime.createManualFormDiagnosticRuntime(f.options,f.deps),limits=LIMIT();
+  await r.prepare(limits);const reads=f.http.length;await assert.rejects(r.verifyNoConfirmation({...limits,deadline:limits.deadline+1}));
+  await assert.rejects(r.verifyNoConfirmation(limits));assert.equal(f.http.length,reads);
+  await assert.rejects(r.close({...limits,deadline:limits.deadline+120001}));
+});
+
+test('full and automatic bootstrap reject manual flag before configuration or dependencies',async()=>{
+  let touched=0;const trap=new Proxy({},{get(){touched++;throw null;}});
+  for(const [factory,env] of [[createOwnedSandboxBootstrap,{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'}],
+    [bootstrapModule.createOwnedFormDiagnosticBootstrap,{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}]])
+    await assert.rejects(factory({env:{...env,PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true'},get ports(){touched++;throw null;}},trap),{message:'stripe_sandbox_bootstrap_OPT_IN_REQUIRED'});
+  assert.equal(touched,0);
 });
 
 test('runtime consumes a rejected renewed final proof and cannot retry it with the original deadline',async()=>{

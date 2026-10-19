@@ -1,14 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createServer} from 'node:net';
 import {EventEmitter} from 'node:events';
 import {fileURLToPath} from 'node:url';
 import {preflightOwnedSandbox,preflightOwnedFormDiagnostic} from './stripe-sandbox-owned.mjs';
+import * as owned from './stripe-sandbox-owned.mjs';
 
 const root=fileURLToPath(new URL('../',import.meta.url)).replace(/\/$/,'');
 const source='a'.repeat(40),daemon='unix:///tmp/owned-docker.sock';
 const flags={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'};
 const ports={backend:56121,demo:56122,receiver:56123,postgres:56124,mailpitHttp:56125,mailpitSmtp:56126};
+const manualFlags={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};
+const manualOptions=()=>options({env:{...manualFlags},manualPort:56127});
 function options(patch={}) {return {runId:'11111111-1111-4111-8111-111111111111',expectedSource:source,daemon,env:{...flags},ports:{...ports},...patch};}
 function fixture({head=source+'\n',status='',docker='"linux"\n',metadata={},canonical='/tmp/owned-docker.sock',executeError,portResult=true}={}) {
   const calls=[];
@@ -37,6 +39,27 @@ test('diagnostic preflight uses dedicated flags while full preflight refuses mix
   let touched=0;const trap=new Proxy({},{get(){touched++;throw null;}});
   safe(await preflightOwnedSandbox(options({env:{...flags,...env}}),trap),pending('OPT_IN','OPT_IN_REQUIRED'));
   safe(await preflightOwnedFormDiagnostic(options({env:{...flags,...env}}),trap),pending('OPT_IN','OPT_IN_REQUIRED'));assert.equal(touched,0);
+});
+test('manual preflight admits exactly seven distinct ports and full/auto retain six',async()=>{
+  assert.equal(typeof owned.preflightOwnedManualFormDiagnostic,'function');const f=fixture();
+  safe(await owned.preflightOwnedManualFormDiagnostic(manualOptions(),f.dependencies),{status:'READY'});
+  assert.deepEqual(f.calls.filter(c=>c.type==='port').map(c=>c.port),[56121,56122,56123,56124,56125,56126,56127]);
+  const auto=fixture();await preflightOwnedFormDiagnostic(options({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}}),auto.dependencies);
+  assert.equal(auto.calls.filter(c=>c.type==='port').length,6);
+});
+test('manual port collision fails without selecting a replacement or reading configuration on invalid admission',async()=>{
+  assert.equal(typeof owned.preflightOwnedManualFormDiagnostic,'function');const f=fixture();f.dependencies.portAvailable=async port=>{f.calls.push({type:'port',port});return port!==56127;};
+  safe(await owned.preflightOwnedManualFormDiagnostic(manualOptions(),f.dependencies),pending('PORTS','PORT_UNAVAILABLE'));
+  assert.deepEqual(f.calls.filter(c=>c.type==='port').map(c=>c.port),[56121,56122,56123,56124,56125,56126,56127]);
+  let touched=0;const trap=new Proxy({},{get(){touched++;throw null;}});
+  safe(await owned.preflightOwnedManualFormDiagnostic({...manualOptions(),manualPort:56121},trap),pending('INPUTS','CONFIGURATION'));
+  safe(await owned.preflightOwnedManualFormDiagnostic({env:{},get ports(){touched++;throw null;}},trap),pending('OPT_IN','OPT_IN_REQUIRED'));assert.equal(touched,0);
+});
+test('full and auto preflight reject manual flag before source/dependency getters',async()=>{
+  let touched=0;const trap=new Proxy({},{get(){touched++;throw null;}});
+  for(const [entry,env] of [[preflightOwnedSandbox,flags],[preflightOwnedFormDiagnostic,{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}]])
+    safe(await entry({env:{...env,PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true'},get ports(){touched++;throw null;}},trap),pending('OPT_IN','OPT_IN_REQUIRED'));
+  assert.equal(touched,0);
 });
 
 for(const absent of ['both',...Object.keys(flags)])
@@ -136,7 +159,7 @@ test('port errors become only a fixed safe failure',async()=>{
 });
 
 // Exercise the real default probe state machine; only TCP/timer primitives are controlled.
-function controlledProbe({listenError=false,closeError=false,immediate=false}={}) {
+function controlledProbe({listenError=false,closeError=false,immediate=false,manual=false,holdPort}={}) {
   const f=fixture(),active=new Set(),servers=[];let entered;
   const closing=new Promise(resolve=>{entered=resolve;});
   delete f.dependencies.portAvailable;
@@ -145,14 +168,14 @@ function controlledProbe({listenError=false,closeError=false,immediate=false}={}
   f.dependencies.createServer=handler=>{
     assert.equal(typeof handler,'function');const server=new EventEmitter();servers.push(server);
     server.listen=(opts,callback)=>{
-      assert.equal(opts.host,'127.0.0.1');assert.equal(opts.exclusive,true);assert.equal(opts.port,Object.values(ports)[servers.length-1]);
-      server.signal=opts.signal;
+      assert.equal(opts.host,'127.0.0.1');assert.equal(opts.exclusive,true);assert.equal(opts.port,[...Object.values(ports),...(manual?[56127]:[])][servers.length-1]);
+      server.signal=opts.signal;server.port=opts.port;
       queueMicrotask(()=>listenError?server.emit('error',Object.assign(new Error('PRIVATE_CANARY'),{code:'EADDRINUSE'})):callback());
       return server;
     };
     server.close=callback=>{
       server.closeCalls=(server.closeCalls??0)+1;server.closed=callback;entered();
-      if(immediate||servers.length>1)callback(closeError?new Error('PRIVATE_CANARY'):undefined);
+      if((immediate||servers.length>1)&&server.port!==holdPort)callback(closeError?new Error('PRIVATE_CANARY'):undefined);
       return server;
     };
     return server;
@@ -202,33 +225,33 @@ test('listen refusal keeps cleanup bounded and can never become READY',async()=>
   }finally {f.servers[0].closed();await run;}
 });
 
-const close=server=>new Promise(resolve=>server.close(resolve));
-async function reservations(t) {
-  const servers=[];
-  t.after(async()=>{for(const server of servers)if(server.listening)await close(server);});
-  for(let n=0;n<6;n++) {
-    const server=createServer();servers.push(server);
-    await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
-  }
-  return {servers,actualPorts:Object.fromEntries(Object.keys(ports).map((name,i)=>[name,servers[i].address().port]))};
+// Synthetic OS socket boundary: exercise the production exclusive bind/close state machine.
+function reservationProbe(occupied=[]) {
+  const f=fixture(),reservations=new Map(occupied.map(port=>[port,'foreign'])),servers=[];delete f.dependencies.portAvailable;
+  f.dependencies.createServer=()=>{
+    const server=new EventEmitter();servers.push(server);
+    server.listen=(settings,callback)=>{assert.equal(settings.host,'127.0.0.1');assert.equal(settings.exclusive,true);server.port=settings.port;
+      queueMicrotask(()=>{if(reservations.has(server.port))server.emit('error',new Error('occupied'));else{reservations.set(server.port,server);callback();}});return server;};
+    server.close=callback=>{server.closeCalls=(server.closeCalls??0)+1;if(reservations.get(server.port)===server)reservations.delete(server.port);queueMicrotask(callback);return server;};
+    return server;
+  };return {...f,reservations,servers};
 }
-test('real occupied loopback port remains untouched and earlier owned probe closes',async t=>{
-  const {servers,actualPorts}=await reservations(t),occupying=servers[1];
-  let connections=0;occupying.on('connection',socket=>{connections++;socket.destroy();});
-  for(const server of servers)if(server!==occupying)await close(server);
-  const f=fixture();delete f.dependencies.portAvailable;
-  safe(await preflightOwnedSandbox(options({ports:actualPorts}),f.dependencies),pending('PORTS','PORT_UNAVAILABLE'));
-  assert.equal(occupying.listening,true);assert.equal(connections,0);
-  const rebind=createServer();await new Promise((resolve,reject)=>{rebind.once('error',reject);rebind.listen(actualPorts.backend,'127.0.0.1',resolve);});
-  await close(rebind);
+test('synthetic occupied loopback port remains untouched and earlier owned probe closes',async()=>{
+  const f=reservationProbe([56122]);safe(await preflightOwnedSandbox(options(),f.dependencies),pending('PORTS','PORT_UNAVAILABLE'));
+  assert.deepEqual([...f.reservations],[[56122,'foreign']]);assert.equal(f.servers.length,2);assert.ok(f.servers.every(s=>s.closeCalls===1));
+  assert.equal(f.reservations.has(56121),false,'earlier own probe released its reservation');
 });
-test('all six real available ports admit READY and every owned probe has closed',async t=>{
-  const {servers,actualPorts}=await reservations(t);
-  for(const server of servers)await close(server);
-  const f=fixture();delete f.dependencies.portAvailable;
-  safe(await preflightOwnedSandbox(options({ports:actualPorts}),f.dependencies),{status:'READY'});
-  for(const port of Object.values(actualPorts)) {
-    const rebind=createServer();await new Promise((resolve,reject)=>{rebind.once('error',reject);rebind.listen(port,'127.0.0.1',resolve);});
-    await close(rebind);
-  }
+test('all six synthetic available ports admit READY and every owned probe has closed',async()=>{
+  const f=reservationProbe();safe(await preflightOwnedSandbox(options(),f.dependencies),{status:'READY'});
+  assert.equal(f.reservations.size,0);assert.equal(f.servers.length,6);assert.ok(f.servers.every(s=>s.closeCalls===1));
+});
+test('manual seventh port cannot admit before verified close and unconfirmed close fails',async()=>{
+  assert.equal(typeof owned.preflightOwnedManualFormDiagnostic,'function');const f=controlledProbe({manual:true,immediate:true,holdPort:56127});
+  let settled=false;const result=owned.preflightOwnedManualFormDiagnostic(manualOptions(),f.dependencies).then(value=>{settled=true;return value;});
+  for(let n=0;n<40&&f.servers.length<7;n++)await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(f.servers.length,7);assert.equal(settled,false);assert.equal(f.active.size,1);
+  f.servers[6].closed();safe(await result,{status:'READY'});assert.equal(f.active.size,0);
+  const expired=controlledProbe({manual:true,immediate:true,holdPort:56127}),pendingResult=owned.preflightOwnedManualFormDiagnostic(manualOptions(),expired.dependencies);
+  for(let n=0;n<40&&expired.servers.length<7;n++)await new Promise(resolve=>setImmediate(resolve));
+  expired.expire();safe(await pendingResult,pending('PORTS','PORT_UNAVAILABLE'));expired.servers[6].closed();assert.equal(expired.servers.length,7);
 });

@@ -3,6 +3,7 @@ import {lstat,realpath,open,rename} from 'node:fs/promises';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {formDiagnosticOptIn} from './stripe-sandbox-owned.mjs';
+import {manualFormOptIn} from './stripe-manual-form-options.mjs';
 import {createFormDiagnosticSettlement} from './stripe-form-diagnostic-settlement.mjs';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
@@ -24,14 +25,31 @@ const credential=value=>typeof value==='string'&&value.length>0&&value.length<=1
 
 /** Private one-run preparation and read proofs. No confirmation/cleanup deletion capability. */
 export async function createFormDiagnosticProvisioner(options,dependencies={}) {
-  let enabled=false;
-  try {const env=options?.env;enabled=formDiagnosticOptIn(env);}catch{}
-  if(!enabled)throw fixed('OPT_IN_REQUIRED');
-  let topology,verify,adminCredentials,io;
+  return createProvisioner(options,dependencies,false);
+}
+export async function createManualFormDiagnosticProvisioner(options,dependencies={}) {
+  return createProvisioner(options,dependencies,true);
+}
+async function createProvisioner(options,dependencies,manual) {
+  let enabled=false,descriptors;
   try {
-    const flags=options.env;
+    if(manual)descriptors=Object.getOwnPropertyDescriptors(options);
+    const env=manual?descriptors.env?.value:options?.env;enabled=manual?manualFormOptIn(env):formDiagnosticOptIn(env);
+  }catch{}
+  if(!enabled)throw fixed('OPT_IN_REQUIRED');
+  let topology,verify,adminCredentials,io,browserOrigin;
+  try {
+    if(!manual&&Object.hasOwn(options,'browserOrigin'))fail();
+    if(manual){
+      const descriptor=descriptors.browserOrigin;if(!descriptor||!Object.hasOwn(descriptor,'value'))fail();
+      browserOrigin=descriptor.value;
+      if(typeof browserOrigin!=='string')fail();const url=new URL(browserOrigin);
+      if(url.protocol!=='http:'||url.hostname!=='127.0.0.1'||!Number.isInteger(Number(url.port))||Number(url.port)<1024||Number(url.port)>65535||url.origin!==browserOrigin)fail();
+    }
+    const flags=manual?descriptors.env.value:options.env;
     if(![undefined,''].includes(flags.DEBUG)||![undefined,''].includes(flags.NODE_DEBUG)||![undefined,'','0'].includes(flags.PWDEBUG))fail();
-    const bootstrap=options.bootstrap;
+    if(manual&&(!descriptors.bootstrap||!Object.hasOwn(descriptors.bootstrap,'value')))fail();
+    const bootstrap=manual?descriptors.bootstrap.value:options.bootstrap;
     if(typeof bootstrap?.resources!=='function'||typeof bootstrap.verify!=='function'||typeof bootstrap.withAdminCredentials!=='function')fail();
     const safe=bootstrap.resources(),runId=safe.runId;
     if(typeof runId!=='string'||!UUID.test(runId)||EXHAUSTED.has(runId)||safe.status!=='LIVE'||(safe.webhookReady!==false||safe.mode!=='FORM_DIAGNOSTIC')||typeof safe.expectedSource!=='string'||!/^[0-9a-f]{40}$/.test(safe.expectedSource)
@@ -46,6 +64,8 @@ export async function createFormDiagnosticProvisioner(options,dependencies={}) {
     const endpoints=Object.fromEntries(['backend','demo','receiver'].map(name=>{
       const expected='http://127.0.0.1:'+ports[name];if(safe.endpoints?.[name]!==expected)fail();return [name,expected];
     }));
+    if(manual&&Object.values(ports).includes(Number(new URL(browserOrigin).port)))fail();
+    if(!manual)browserOrigin=endpoints.demo;
     const owners={project:safe.project};
     for(const [name,service] of [['backend','backend'],['demo','demo-site'],['receiver','callback-receiver']]){
       const id=safe.containers?.[service]?.id;if(typeof id!=='string'||!/^[0-9a-f]{64}$/.test(id))fail();owners[name]=id;
@@ -145,7 +165,7 @@ export async function createFormDiagnosticProvisioner(options,dependencies={}) {
       const protectedAdmin=!receiver&&!login&&(path.startsWith('/api/admin/')||path.startsWith('/api/v1/admin/'));
       const headers={Accept:'application/json',...(body!==undefined?{'Content-Type':'application/json'}:{}),...(key?{'Idempotency-Key':key}:{}),
         ...(protectedAdmin?{Cookie:cookie,...(method!=='GET'?{'X-XSRF-TOKEN':csrf}:{})}:{}),
-        ...(!receiver&&path.startsWith('/api/v1/public/')?{Origin:topology.endpoints.demo}:{})};
+        ...(!receiver&&path.startsWith('/api/v1/public/')?{Origin:browserOrigin}:{})};
       if(protectedAdmin&&(!cookie||!csrf))fail();
       const response=await settlement.call(operation,()=>io.fetch(origin+path,{method,headers,redirect:'error',signal:operation.signal,...(body!==undefined?{body:JSON.stringify(body)}:{})}),value=>value.body?.cancel());
       let size=0;const chunks=[];
@@ -172,7 +192,7 @@ export async function createFormDiagnosticProvisioner(options,dependencies={}) {
   }
   function siteProof(value){
     if(!object(value)||!uuid(value.id)||value.key!==keys.site||value.status!=='ACTIVE'||!uuid(value.payment_account_id)||value.payment_account_id!==account.id
-      ||!same(value.allowed_origins,[topology.endpoints.demo])||!same(value.authentication_modes,['EMAIL_OTP'])
+      ||!same(value.allowed_origins,[browserOrigin])||!same(value.authentication_modes,['EMAIL_OTP'])
       ||value.payment_method_policy?.mode!=='ALLOWLIST'||!same(value.payment_method_policy.methods,['CARD'])||(site&&value.id!==site.id))fail();
   }
   function productProof(value){
@@ -237,7 +257,7 @@ export async function createFormDiagnosticProvisioner(options,dependencies={}) {
       body:{key:keys.account,provider:'STRIPE',mode:'SANDBOX',external_account_id:'acct_1UPiMpELswAd8tpR',credentials_ref:'stripe-sandbox-default'}},accountProof,v=>({id:v.id,key:v.key}));
     account={id:createdAccount.id,key:keys.account,externalId:'acct_1UPiMpELswAd8tpR'};
     const createdSite=await mutation('site-and-email-provider',keys.site,'/api/admin/v1/sites',context,{method:'POST',expected:201,
-      body:{key:keys.site,display_name:'Stage5A Sandbox acceptance',payment_account_id:account.id,allowed_origins:[topology.endpoints.demo],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']},
+      body:{key:keys.site,display_name:'Stage5A Sandbox acceptance',payment_account_id:account.id,allowed_origins:[browserOrigin],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']},
         email_otp_provider:{provider_key:keys.provider,sender_ref:'local-default',template_key:'otp-default'}}},siteProof,v=>({id:v.id,key:v.key}));
     site={id:createdSite.id,key:keys.site};const sitePath='/api/v1/admin/sites/'+site.id;
     const createdProviders=await read(sitePath+'/identity-providers',context);
@@ -248,9 +268,9 @@ export async function createFormDiagnosticProvisioner(options,dependencies={}) {
     const returnPath=sitePath+'/checkout-return-urls',policies=await read(returnPath,context);
     if(!Array.isArray(policies)||policies.length)fail();
     await mutation('return-url',stable('return-url'),returnPath,context,{method:'PUT',expected:204,
-      body:{origin:topology.endpoints.demo,return_url:topology.endpoints.demo+'/payment-return.html',expected_version:-1}},v=>{if(v!==null)fail();},()=>({origin:topology.endpoints.demo}));
+      body:{origin:browserOrigin,return_url:browserOrigin+'/payment-return.html',expected_version:-1}},v=>{if(v!==null)fail();},()=>({origin:browserOrigin}));
     const policy=await read(returnPath,context);
-    if(!Array.isArray(policy)||policy.length!==1||!same(policy[0],{origin:topology.endpoints.demo,return_url:topology.endpoints.demo+'/payment-return.html',version:0}))fail();
+    if(!Array.isArray(policy)||policy.length!==1||!same(policy[0],{origin:browserOrigin,return_url:browserOrigin+'/payment-return.html',version:0}))fail();
     const createdProduct=await mutation('product',keys.product,'/api/admin/v1/sites/'+site.id+'/products',context,{method:'POST',expected:201,
       body:{key:keys.product,name:'Stage5A one-time acceptance',description:null}},productProof,v=>({id:v.id,key:v.key}));product={id:createdProduct.id,key:keys.product};
     const createdPrice=await mutation('price',keys.price,'/api/admin/v1/products/'+product.id+'/prices',context,{method:'POST',expected:201,
@@ -286,7 +306,7 @@ export async function createFormDiagnosticProvisioner(options,dependencies={}) {
     if(!object(page)||page.total!==1||page.page!==0||page.size!==2||page.sort!=='CREATED_DESC'
       ||!Array.isArray(page.items)||page.items.length!==1||!same(page.items[0],p))fail();
     if(!['attempts','events','refunds','outbox_events','deliveries'].every(k=>Array.isArray(d[k])&&d[k].length<=100)
-      ||d.refunds.length||d.outbox_events.length||d.deliveries.length||d.attempts.length!==(baseline?0:1))fail();
+      ||d.refunds.length||d.outbox_events.length||d.deliveries.length||(baseline?d.attempts.length!==0:manual?d.attempts.length>1:d.attempts.length!==1))fail();
     const operations=await read('/api/v1/admin/provider-operations?payment_id='+checkout.payment_id,context);
     if(!Array.isArray(operations)||operations.length!==1)fail();const op=operations[0];
     if(!uuid(op.operation_id)||op.payment_id!==checkout.payment_id||op.resource_id!==checkout.payment_id||op.account_id!==account.id||op.account_mode!=='SANDBOX'

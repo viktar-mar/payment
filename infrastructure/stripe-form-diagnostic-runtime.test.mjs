@@ -11,6 +11,10 @@ test('diagnostic admission rejects '+Object.keys(patch)[0]+' before dependency a
   await assert.rejects(module.createFormDiagnosticRuntime({...options(),env:{...flags,...patch}},new Proxy({},{get(){touched++;throw null;}})));
   assert.equal(touched,0);
 });
+test('automatic runtime refuses manual mode before dependency access',async()=>{
+  let touched=0;await assert.rejects(module.createFormDiagnosticRuntime({...options(),env:{...flags,PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true'}},new Proxy({},{get(){touched++;throw null;}})));
+  assert.equal(touched,0);
+});
 test('runtime factory is inert and returns only one-shot prepare/proof/close capabilities',async()=>{
   assert.equal(typeof module.createFormDiagnosticRuntime,'function');const r=await module.createFormDiagnosticRuntime(options());
   assert.deepEqual(Object.keys(r).sort(),['close','prepare','verifyNoConfirmation']);assert.ok(Object.isFrozen(r));

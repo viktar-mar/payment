@@ -41,7 +41,7 @@ export async function createSandboxAcceptanceExtras(options, dependencies = {}) 
   let enabled = false;
   try {
     const env = options?.env;
-    enabled = env?.PAYMENT_STRIPE_SANDBOX_ENABLED === 'true' && env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS === 'true';
+    enabled = env?.PAYMENT_STRIPE_SANDBOX_ENABLED === 'true' && env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS === 'true' && env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC !== 'true';
   } catch {}
   if (!enabled) throw fixed('OPT_IN_REQUIRED');
   let topology, binding, bootstrap, provisioner, cli, io;

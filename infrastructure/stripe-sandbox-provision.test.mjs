@@ -9,6 +9,13 @@ import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createOwnedSandboxProvisioner} from './stripe-sandbox-provision.mjs';
 const diagnosticModule=await import('./stripe-form-diagnostic-provision.mjs').catch(()=>({}));
+test('full and automatic provisioners refuse manual mode before bootstrap/dependency access',async()=>{
+  let touched=0;const trap=new Proxy({},{get(){touched++;throw null;}});
+  for(const [factory,env] of [[createOwnedSandboxProvisioner,{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'}],
+    [diagnosticModule.createFormDiagnosticProvisioner,{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}]])
+    await assert.rejects(factory({env:{...env,PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true'},get bootstrap(){touched++;throw null;}},trap),{message:factory===createOwnedSandboxProvisioner?'stripe_sandbox_provision_OPT_IN_REQUIRED':'stripe_form_diagnostic_provision_OPT_IN_REQUIRED'});
+  assert.equal(touched,0);
+});
 
 const forbidden=()=>{throw new Error('synthetic_test_forbids_external_boundary');};
 mock.method(childProcess,'execFile',forbidden);mock.method(childProcess,'spawn',forbidden);
@@ -28,7 +35,7 @@ const SECRET=Buffer.alloc(32,17).toString('base64url');
 const TOKEN=n=>Buffer.alloc(32,n).toString('base64url');
 const rejects=(promise,code='PROVISION_PENDING')=>assert.rejects(promise,{message:'stripe_sandbox_provision_'+code});
 const turn=()=>new Promise(resolveTurn=>setImmediate(resolveTurn));
-function fixture() {
+function fixture({browserOrigin}={}) {
   const events=[],files=new Map(),checkoutStatuses=[];let serial=0,held=false,checkout=0,accountCreated=false,siteCreated=false,pricePublished=false,providerCreated=false,campaignActive=false;
   const add=(path,directory,contents='')=>files.set(path,{directory,contents:Buffer.from(contents),uid:process.getuid(),mode:directory?0o40700:0o100600,nlink:1,dev:1,ino:++serial});
   for(let path=DIR;path!=='/';path=dirname(path))add(path,true);add('/',true);
@@ -39,7 +46,7 @@ function fixture() {
     endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081',receiver:'http://127.0.0.1:18082',postgres:'postgresql://127.0.0.1:15432',mailpitHttp:'http://127.0.0.1:18025',mailpitSmtp:'smtp://127.0.0.1:11025'},
     status:'LIVE',webhookReady:true,containers:Object.fromEntries(['postgres','mailpit','backend','demo-site','callback-receiver'].map((name,i)=>[name,{id:String(i+1).repeat(64)}]))};
   const account=()=>({id:ACCOUNT,key:'stripe-sandbox-default',provider:'STRIPE',mode:'SANDBOX',status:'ACTIVE',external_account_id:'acct_1UPiMpELswAd8tpR'});
-  const site=()=>({id:SITE,key:'s5a-'+SUFFIX,display_name:'Stage5A Sandbox acceptance',status:'ACTIVE',payment_account_id:ACCOUNT,allowed_origins:[resource.endpoints.demo],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']}});
+  const site=()=>({id:SITE,key:'s5a-'+SUFFIX,display_name:'Stage5A Sandbox acceptance',status:'ACTIVE',payment_account_id:ACCOUNT,allowed_origins:[browserOrigin??resource.endpoints.demo],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']}});
   const product=()=>({id:PRODUCT,site_id:SITE,key:'s5a-product-'+SUFFIX,name:'Stage5A one-time acceptance',description:null,status:'ACTIVE'});
   const price=()=>({id:PRICE,site_id:SITE,product_id:PRODUCT,price_key:'s5a-price-'+SUFFIX,version:1,type:'ONE_TIME',amount_minor:2000,currency:'EUR',billing_interval:null,trial_days:0,trial_payment_method_policy:'OPTIONAL_DURING_TRIAL',tax_mode:'NONE',tax_code:null,status:pricePublished?'PUBLISHED':'DRAFT',provider_price_id:pricePublished?'price_synthetic_original':null});
   const provider=()=>({id:PROVIDER,provider_key:'s5a-email-'+SUFFIX,mode:'EMAIL_OTP',status:'ACTIVE',version:0,issuer:null,audiences:[],allowed_algorithms:[],jwks_source_type:null,readiness:'READY',keys:[],sender_ref:'local-default',template_key:'otp-default',last_successful_refresh_at:null,jwks_refresh_state:'NOT_APPLICABLE'});
@@ -64,7 +71,7 @@ function fixture() {
       if(inline&&(!Array.isArray(body.authentication_modes)||!body.authentication_modes.includes('EMAIL_OTP')))return response(400);
       siteCreated=true;providerCreated=inline;return response(201,site());
     }
-    if(path.endsWith('/checkout-return-urls'))return method==='PUT'?response(204):response(200,events.some(e=>e.type==='http'&&e.path===path&&e.method==='PUT')?[{origin:resource.endpoints.demo,return_url:resource.endpoints.demo+'/payment-return.html',version:0}]:[]);
+    if(path.endsWith('/checkout-return-urls'))return method==='PUT'?response(204):response(200,events.some(e=>e.type==='http'&&e.path===path&&e.method==='PUT')?[{origin:browserOrigin??resource.endpoints.demo,return_url:(browserOrigin??resource.endpoints.demo)+'/payment-return.html',version:0}]:[]);
     if(path.endsWith('/products'))return response(201,product());
     if(path.endsWith('/prices'))return response(201,price());
     if(path.endsWith('/publish')){pricePublished=true;return response(200,price());}
@@ -113,6 +120,39 @@ function diagnosticOperation(){return {operation_id:uuid(40),payment_id:uuid(21)
 function diagnosticDetail(attempts=0){return {payment:{payment_id:uuid(21),site_id:SITE,payment_account_id:ACCOUNT,provider:'STRIPE',source:'CATALOG',price_id:PRICE,price_key:'s5a-price-'+SUFFIX,price_version:1,amount_minor:2000,currency:'EUR',tax_mode:'NONE',refunded_amount_minor:0,refundable_amount_minor:0,status:'REQUIRES_PAYMENT_METHOD',customer_id:null,donation_id:null,subscription_id:null},
   attempts:Array.from({length:attempts},(_,i)=>({id:uuid(50+i),attempt_number:i+1,status:'REQUIRES_PAYMENT_METHOD',provider_intent_reference:'pi_TestOnly',payment_method_family:'CARD',result_code:null})),
   events:[{id:uuid(60),event_type:'PAYMENT_CREATED'},{id:uuid(61),event_type:'PAYMENT_METHOD_REQUIRED'},...Array.from({length:attempts},(_,i)=>({id:uuid(62+i),event_type:'ATTEMPT_CREATED'}))],refunds:[],outbox_events:[],deliveries:[]};}
+
+test('automatic provisioner rejects browserOrigin override before bootstrap/dependency access',async()=>{
+  let touched=0;const trap=new Proxy({},{get(){touched++;throw null;}});
+  await assert.rejects(diagnosticModule.createFormDiagnosticProvisioner({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'},
+    browserOrigin:'http://127.0.0.1:18083',get bootstrap(){touched++;throw null;}},trap));assert.equal(touched,0);
+});
+for(const name of ['env','browserOrigin','bootstrap'])test('manual provisioner rejects hostile '+name+' accessor without executing it or dependency getters',async()=>{
+  assert.equal(typeof diagnosticModule.createManualFormDiagnosticProvisioner,'function');let touched=0;
+  const input={env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'},browserOrigin:'http://127.0.0.1:18083',bootstrap:{}};
+  Object.defineProperty(input,name,{enumerable:true,get(){touched++;throw null;}});
+  await assert.rejects(diagnosticModule.createManualFormDiagnosticProvisioner(input,new Proxy({},{get(){touched++;throw null;}})));assert.equal(touched,0);
+});
+for(const browserOrigin of ['http://localhost:18083','http://127.0.0.1:18081','http://127.0.0.1:80','https://127.0.0.1:18083','http://127.0.0.1:18083/','http://127.0.0.1:18083?x',undefined])
+test('manual provisioner refuses noncanonical/owned browser origin '+browserOrigin+' before dependencies/credentials',async()=>{
+  assert.equal(typeof diagnosticModule.createManualFormDiagnosticProvisioner,'function');const f=fixture();let touched=0;
+  f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};
+  f.resource.mode='FORM_DIAGNOSTIC';f.resource.webhookReady=false;f.options.browserOrigin=browserOrigin;
+  await assert.rejects(diagnosticModule.createManualFormDiagnosticProvisioner(f.options,new Proxy({},{get(){touched++;throw null;}})));assert.equal(touched,0);assert.equal(f.events.length,0);
+});
+for(const attempts of [0,1,2])test('manual provisioner final '+attempts+' Attempts under original immutable origin',async()=>{
+  assert.equal(typeof diagnosticModule.createManualFormDiagnosticProvisioner,'function');const f=fixture({browserOrigin:'http://127.0.0.1:18083'});
+  f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};
+  f.resource.mode='FORM_DIAGNOSTIC';f.resource.webhookReady=false;f.options.browserOrigin='http://127.0.0.1:18083';
+  let final=false;const fetcher=f.dependencies.fetch;
+  f.dependencies.fetch=async(url,settings)=>{const path=new URL(url).pathname,value=diagnosticDetail(final?attempts:0);
+    if(path==='/api/v1/admin/payments')return f.response(200,{items:[value.payment],total:1,page:0,size:2,sort:'CREATED_DESC'});
+    if(path.startsWith('/api/v1/admin/payments/'))return f.response(200,value);
+    if(path==='/api/v1/admin/provider-operations')return f.response(200,[diagnosticOperation()]);return fetcher(url,settings);};
+  const p=await diagnosticModule.createManualFormDiagnosticProvisioner(f.options,f.dependencies),limits=LIMIT();await p.prepare(limits);final=true;
+  if(attempts<2)assert.equal((await p.verifyNoConfirmation(limits)).attempts,attempts);else await assert.rejects(p.verifyNoConfirmation(limits));
+  assert.equal(f.resource.endpoints.demo,'http://127.0.0.1:18081');assert.equal(f.events.find(e=>e.path?.endsWith('/checkouts')).settings.headers.Origin,'http://127.0.0.1:18083');
+  await assert.rejects(p.verifyNoConfirmation(limits));
+});
 
 for(const [name,mutate] of [['second Attempt',v=>v.attempts.push({...v.attempts[0],id:uuid(90),attempt_number:2})],['wrong amount',v=>v.payment.amount_minor=1],['Customer',v=>v.payment.customer_id=uuid(99)],['success event',v=>v.events.push({event_type:'PAYMENT_SUCCEEDED'})],['refund',v=>v.refunds.push({})]])
 test('prepare-only final proof rejects '+name,async()=>{
