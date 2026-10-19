@@ -691,10 +691,21 @@ without an extension or DevTools. Click **«Загрузить форму» exac
 card details, press Pay, reload, open another tab or retry. The page says
 «Ручная проверка — без оплаты» and warns «Не вводите карту и не нажимайте Pay. Не
 обновляйте страницу». If ready is reported, inspect only whether the real fields are
-visible; nothing should be typed. Early ready leaves the form visible until the
+visible; nothing should be typed. Early ready keeps the widget mounted until the
 original observation cutoff. Afterwards, close only this tab and separately tell the
 operator whether the fields were visible. No console/Network/HAR/trace/iframe payload
 or screenshot collection is requested.
+
+The ready status explicitly distinguishes the diagnostic snapshot from the current
+display: «Диагностический снимок отражает этот момент и больше не обновляется.
+Проверьте, видны ли поля сейчас; ничего не вводите». The snapshot is taken at the
+first coherent SDK-ready report, after the provider event and the SDK view/widget
+handoff, not necessarily at the exact instant of the raw Stripe `ready` event.
+Evidence collection then closes, while the widget remains mounted for human
+inspection until the original cutoff. A later style change does not rewrite that
+snapshot or send another observation. Thus `frame_visibility=HIDDEN` can coexist
+with fields seen later, and `VISIBLE` is not a promise that they remain visible.
+The message describes local capture, not acknowledgement of the report POST.
 
 The report is version 2, mode `MANUAL_FORM_DIAGNOSTIC`, at most 4096 UTF-8 bytes. Manual
 observations are exactly `{version:2,sample,evidence}`; the nested SDK sample remains
@@ -716,7 +727,10 @@ are `ABSENT`, `ZERO_AREA`, `POSITIVE_AREA`, or `UNAVAILABLE`; only the frame may
 be `MULTIPLE`. Dimensions are discarded immediately. Host/frame visibility is
 `ABSENT`, `VISIBLE`, `HIDDEN`, or `UNAVAILABLE`: `VISIBLE` means only the checked
 layout/style conditions, including the assigned slot, shadow wrapper and widget
-ancestors. Multiple frames
+ancestors. `HIDDEN` records a checked hiding condition at capture, not a pixel-level
+verdict about the cross-origin contents or the later screen. The precise CSS
+predicate/property and its ancestor are not retained; a category alone cannot
+establish a particular Stripe animation or rendering cause. Multiple frames
 have unavailable visibility and load evidence. `frame_load` is `NO_FRAME`, `NOT_SEEN`,
 `SEEN`, or `UNAVAILABLE`, applies only to the current single iframe, and resets when
 that frame changes. A missed/unknown load does not establish failure.

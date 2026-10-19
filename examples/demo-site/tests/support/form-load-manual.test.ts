@@ -43,7 +43,7 @@ if(isMainThread&&process.argv[1]===fileURLToPath(import.meta.url))test('manual p
       return pathToFileURL(join(output,'manual.mjs')).href;
     };
     const entry=await bundle('control');
-    for(const scenario of ['no-click','synchronous-ready','delayed-ready','after-checkpoint','frame-only','pay-only','late-ready','slow-session','late-session','late-body','expired-start','malformed','missing','expired','exchange-failure','recovery-failure','late-recovery','close','pagehide','abort','evidence-positive','evidence-hidden','evidence-slot-hidden','evidence-wrapper-hidden','evidence-foreign-host','evidence-host-reinsert','evidence-host-replace','evidence-absent','evidence-multiple','evidence-replaced','evidence-load','evidence-loaderstart','evidence-csp','evidence-untrusted','evidence-abort','evidence-close','evidence-no-host','evidence-unavailable','evidence-csp-unavailable','evidence-late-replaced','evidence-late-load','widget-loss-detach','widget-loss-replace','widget-loss-detach-immediate','widget-loss-replace-immediate','widget-loss-reinsert-immediate'])
+    for(const scenario of ['no-click','synchronous-ready','delayed-ready','ready-snapshot-hidden-to-visible','ready-snapshot-visible-to-hidden','after-checkpoint','frame-only','pay-only','late-ready','slow-session','late-session','late-body','expired-start','malformed','missing','expired','exchange-failure','recovery-failure','late-recovery','close','pagehide','abort','evidence-positive','evidence-hidden','evidence-slot-hidden','evidence-wrapper-hidden','evidence-foreign-host','evidence-host-reinsert','evidence-host-replace','evidence-absent','evidence-multiple','evidence-replaced','evidence-load','evidence-loaderstart','evidence-csp','evidence-untrusted','evidence-abort','evidence-close','evidence-no-host','evidence-unavailable','evidence-csp-unavailable','evidence-late-replaced','evidence-late-load','widget-loss-detach','widget-loss-replace','widget-loss-detach-immediate','widget-loss-replace-immediate','widget-loss-reinsert-immediate'])
       await t.test(scenario,()=>exercise(entry,scenario,false,true));
     for(const [mutation,scenario,reason] of [['deny','synchronous-ready','deny_view_after_observer_close'],['one-shot','delayed-ready','one_shot_exchange'],['expired-start','expired-start','expired_start_operation']])
       await t.test('in-memory mutation is detected: '+mutation,async()=>{
@@ -62,6 +62,7 @@ if(!isMainThread){
   const {JSDOM}=sdkRequire('jsdom') as {JSDOM:new(html:string,options:{url:string})=>{window:Window&typeof globalThis}};
   const dom=new JSDOM(workerData.automatic?'<main id="manual-form"></main>':'<main id="fixture"></main>',{url:'http://127.0.0.1:14174/form-load-manual.html'});
   const window=dom.window,scenario=workerData.scenario as string;
+  const temporalReady=scenario.startsWith('ready-snapshot-'),initiallyHidden=scenario==='ready-snapshot-hidden-to-visible';
   for(const name of ['window','document','HTMLElement','HTMLButtonElement','ShadowRoot','customElements','sessionStorage','location','navigator','CustomEvent','MutationObserver','getComputedStyle'] as const)
     Object.defineProperty(globalThis,name,{value:name==='window'?window:window[name],configurable:true});
   const tick=()=>new Promise<void>(resolve=>setImmediate(resolve));
@@ -277,18 +278,31 @@ if(!isMainThread){
           for(const callback of lateCsp)callback(csp(true,'script-src','enforce'));
           for(const callback of lateLoad)callback({isTrusted:true,target:frame});
         }else{
-        if(['delayed-ready','close','pagehide','abort'].includes(scenario))listeners.get('ready')?.();
+        if(temporalReady)frame.style.opacity=initiallyHidden?'0':'1';
+        if(['delayed-ready','close','pagehide','abort'].includes(scenario)||temporalReady)listeners.get('ready')?.();
         if(scenario==='pay-only'){const pay=widget.shadowRoot!.querySelector('button')!;pay.hidden=false;pay.disabled=false;pay.setAttribute('aria-label','Pay');}
         if(scenario==='after-checkpoint'){
           await advance(1015000);assert.equal(reports.length,1);assert.equal(reports[0]!.bucket,'AFTER_15S');assert.equal(reports[0]!.ready_seen,false);
           await advance(1020000);listeners.get('ready')?.();await until(()=>widget.state==='ready');await tick();
           assert.equal(reports.length,2);assert.equal(reports[1]!.bucket,'AFTER_15S');assert.equal(reports[1]!.ready_seen,true);
           await advance(1059999);assert.equal(frame.isConnected,true);await advance(1060000);
-        }else if(['synchronous-ready','delayed-ready','close','pagehide','abort'].includes(scenario)){
+        }else if(['synchronous-ready','delayed-ready','close','pagehide','abort'].includes(scenario)||temporalReady){
           await until(()=>widget.state==='ready');await advance(1000100);
           assert.equal(reports.length,1);assert.equal(reports[0]!.ready_seen,true);
           assert.equal(capturedCsp.size,0,'ready_csp_cleanup');assert.equal(capturedLoad.size,0,'ready_load_cleanup');assert.equal(reports[0]!.bucket,'BEFORE_15S');
-          assert.ok(root.textContent?.includes('Форма сообщила о готовности. Проверьте, видны ли поля; ничего не вводите'));
+          const readyStatus=root.querySelector('[role="status"]')!.textContent!;
+          assert.match(readyStatus,/готовности/);assert.match(readyStatus,/ничего не вводите/);
+          let history:string|undefined;
+          if(temporalReady){
+            assert.equal(evidenceReports[0]!.host_visibility,'VISIBLE');
+            assert.equal(evidenceReports[0]!.frame_visibility,initiallyHidden?'HIDDEN':'VISIBLE','ready_snapshot_style_at_capture');
+            history=JSON.stringify({reports,evidenceReports});
+            frame.style.opacity=initiallyHidden?'1':'0';await tick();
+            assert.equal(window.getComputedStyle(frame).opacity,initiallyHidden?'1':'0');
+            assert.equal(JSON.stringify({reports,evidenceReports}),history,'late_style_cannot_rewrite_ready_history');
+            assert.match(readyStatus,/снимок.*момент.*не обновляется/isu,'ready_snapshot_is_historical');
+            assert.match(readyStatus,/видны ли поля сейчас/iu,'human_visibility_is_current_not_reported');
+          }
           if(workerData.instrumented){
             const captured=globalThis as typeof globalThis&{__manualView:{confirm():Promise<unknown>};__manualHandle:{confirm():Promise<unknown>};__manualTrace:{widget_state:string;widget_completed:boolean;operation:string;result:string}[]};
             // The page closes the observer after its ready report; both captured real layers must still deny.
@@ -302,6 +316,7 @@ if(!isMainThread){
           if(scenario==='abort')controller.abort();
           if(['close','pagehide','abort'].includes(scenario))assert.equal(frame.isConnected,false);
           else{await advance(1059999);assert.equal(frame.isConnected,true);await advance(1060000);}
+          if(temporalReady){assert.equal(reports.length,1,'no_extra_terminal_snapshot');assert.equal(JSON.stringify({reports,evidenceReports}),history,'cutoff_keeps_ready_history');}
         }else{
           await advance(1014999);assert.equal(reports.length,0);await advance(1015000);
           assert.equal(reports.length,1);assert.equal(reports[0]!.ready_seen,false);assert.equal(reports[0]!.bucket,'AFTER_15S');

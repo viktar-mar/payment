@@ -82,7 +82,7 @@ export function mountManualFormPage(root:HTMLElement,dependencies:ManualPageDepe
     const value=sample();if(!value||!resumed)return;
     const result=classifyFormDiagnosticSample(value);
     if(result.startsWith('FORM_READY_')){
-      status.textContent='Форма сообщила о готовности. Проверьте, видны ли поля; ничего не вводите';
+      status.textContent='Форма сообщила о готовности. Диагностический снимок отражает этот момент и больше не обновляется. Проверьте, видны ли поля сейчас; ничего не вводите';
       report(value,true);readiness?.close();observation?.close();
     }else if(['CONFIRMATION_BLOCKED','BINDING_LOST','ABORTED','OPERATION_FAILED','ELEMENT_LOADERROR'].includes(result)){
       report(value,true);status.textContent='Проверка формы завершена. Закройте эту вкладку.';close();

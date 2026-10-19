@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {readdir} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {matchesGlob} from 'node:path';
 import {registerHooks} from 'node:module';
@@ -27,6 +28,13 @@ test('normal Playwright discovery explicitly excludes diagnostic and Node-only s
     pattern=>typeof pattern==='string'&&matchesGlob('tests/support/'+file,pattern)));
   assert.ok(normalPlaywright.testIgnore.some(pattern=>typeof pattern==='string'&&matchesGlob(
     'tests/support/form-load-diagnostic-environment.test.ts',pattern)));
+});
+test('normal Playwright discovery excludes the offline manual snapshot browser regression',async()=>{
+  const files=(await readdir(root+'/tests/support')).filter(file=>file.endsWith('-snapshot-browser.test.ts'));
+  assert.equal(files.length,1,'one offline snapshot regression must be present');
+  assert.ok(Array.isArray(normalPlaywright.testIgnore));
+  for(const file of files)assert.ok(normalPlaywright.testIgnore.some(pattern=>typeof pattern==='string'&&matchesGlob(
+    'tests/support/'+file,pattern)),'offline_snapshot_is_node_only');
 });
 test('separate Playwright config has no auto browser, repetition or artifact capture',()=>{
   assert.equal(diagnosticPlaywright.testMatch,'form-load-diagnostic.spec.ts');
