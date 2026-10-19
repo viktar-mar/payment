@@ -4,7 +4,7 @@ import { object, safeState } from '../contracts.js';
 import { PaymentSdkError } from '../errors.js';
 import { strictAppearance } from './stripe-appearance.js';
 import { loadStripeClient } from './stripe-loader.js';
-import { formLoadBinding, markFormLoad, failFormLoad, denyFormLoadConfirmation } from '../diagnostics/form-load-observer.js';
+import { formLoadBinding, markFormLoad, markFormLoadLoaderStart, failFormLoad, denyFormLoadConfirmation } from '../diagnostics/form-load-observer.js';
 export interface StripePresentation { appearance: StripeElementsOptions['appearance']; locale?: 'en' | 'pt'; }
 export interface MountStripePaymentOptions extends StripePresentation {
   container: HTMLElement; capability: ClientPaymentSession; signal: AbortSignal;
@@ -52,10 +52,12 @@ export async function mountStripePayment(options: MountStripePaymentOptions): Pr
   void cancellation.catch(() => {});
   let ready!: () => void;
   let loadFailed!: () => void;
+  let loaderStarted!: () => void;
   function detachReadyListeners(): void {
     if (!element) return;
     try { element.off('ready', ready); } catch { /* best-effort provider cleanup */ }
     try { element.off('loaderror', loadFailed); } catch { /* best-effort provider cleanup */ }
+    try { element.off('loaderstart', loaderStarted); } catch { /* best-effort provider cleanup */ }
   }
   function destroy(): void {
     const wasActive = active;
@@ -119,7 +121,8 @@ export async function mountStripePayment(options: MountStripePaymentOptions): Pr
       loadFailed = () => { if (active && !signal.aborted) { markFormLoad(diagnostic, 'loaderror_seen'); reject(new PaymentSdkError('PROVIDER_TEMPORARILY_UNAVAILABLE')); } };
     });
     // Attach before mount: the provider may synchronously signal readiness.
-    element.on('ready', ready); element.on('loaderror', loadFailed);
+    loaderStarted = () => { if (active && !signal.aborted) markFormLoadLoaderStart(diagnostic); };
+    element.on('ready', ready); element.on('loaderror', loadFailed); element.on('loaderstart', loaderStarted);
     void readiness.catch(() => {});
     markFormLoad(diagnostic, 'mount_called'); element.mount(container); markFormLoad(diagnostic, 'mount_returned');
     await guarded(readiness);

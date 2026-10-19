@@ -21,6 +21,7 @@ const known = new WeakSet<HTMLElement>();
 const used = new WeakSet<HTMLElement>();
 const widgets = new WeakMap<HTMLElement, FormLoadBinding>();
 const hosts = new WeakMap<HTMLElement, FormLoadBinding>();
+const loaderStarts = new WeakSet<FormLoadBinding>();
 let armed: FormLoadBinding | undefined;
 
 export function registerFormLoadWidget(widget: HTMLElement): void { known.add(widget); }
@@ -48,7 +49,7 @@ function current(binding: FormLoadBinding | undefined): binding is FormLoadBindi
   if (!binding.widget.isConnected || !binding.host?.isConnected || binding.host.getRootNode() !== binding.widget.shadowRoot) lose(binding);
   return binding.state.binding === 'BOUND';
 }
-export function armFormLoadDiagnostic(widget: HTMLElement): { snapshot(): Readonly<FormLoadSnapshot>; close(): void } {
+export function armFormLoadDiagnostic(widget: HTMLElement): { snapshot(): Readonly<FormLoadSnapshot>; readinessSnapshot(): Readonly<{ loaderstart_seen: boolean }>; close(): void } {
   if (!known.has(widget) || used.has(widget) || widget.isConnected || widgets.has(widget) || armed) throw new Error('INSTRUMENTATION_UNAVAILABLE');
   const binding: FormLoadBinding = { widget, state: {
     version: 1, binding: 'ARMED', capability_started: false, capability_ready: false,
@@ -59,6 +60,7 @@ export function armFormLoadDiagnostic(widget: HTMLElement): { snapshot(): Readon
   widgets.set(widget, binding); armed = binding;
   return Object.freeze({
     snapshot(): Readonly<FormLoadSnapshot> { current(binding); return Object.freeze({ ...binding.state }); },
+    readinessSnapshot(): Readonly<{ loaderstart_seen: boolean }> { current(binding); return Object.freeze({ loaderstart_seen: loaderStarts.has(binding) }); },
     close(): void { binding.state.binding = 'CLOSED'; if (armed === binding) armed = undefined; },
   });
 }
@@ -75,6 +77,9 @@ export function markFormLoad(binding: FormLoadBinding | undefined, flag: Flag): 
   if (!current(binding) || binding.state.operation !== 'PENDING') return;
   binding.state[flag] = true;
   if (flag === 'widget_completed') binding.state.operation = 'COMPLETED';
+}
+export function markFormLoadLoaderStart(binding: FormLoadBinding | undefined): void {
+  if (current(binding) && binding.state.operation === 'PENDING') loaderStarts.add(binding);
 }
 export function markFormLoadCatchup(binding: FormLoadBinding | undefined, state: FormLoadSnapshot['catchup']): void {
   if (current(binding) && binding.state.operation === 'PENDING') binding.state.catchup = state;

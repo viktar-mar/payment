@@ -1,9 +1,10 @@
 import type { Stripe } from '@stripe/stripe-js';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('./stripe-loader.js', () => ({ loadStripeClient: vi.fn() }));
 import { loadStripeClient } from './stripe-loader.js';
 import { mountStripePayment } from './stripe-driver.js';
 import type { CheckoutState, ClientPaymentSession } from '../contracts.js';
+import { armFormLoadDiagnostic, bindFormLoadDiagnostic, registerFormLoadWidget } from '../diagnostics/form-load-observer.js';
 
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (reason: unknown) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 const secret = 'pi_fixture_secret_sensitive';
@@ -42,6 +43,59 @@ async function ready(f: ReturnType<typeof setup>) {
   f.emit('ready'); return pending;
 }
 beforeEach(() => { vi.mocked(loadStripeClient).mockReset(); });
+
+describe('internal loaderstart observation', () => {
+  const cleanups: (() => void)[] = [];
+  afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
+  function diagnosticSetup() {
+    const f = setup(); const widget = document.createElement('div'); registerFormLoadWidget(widget);
+    const observation = armFormLoadDiagnostic(widget);
+    widget.attachShadow({ mode: 'open' }).append(f.container); document.body.append(widget);
+    bindFormLoadDiagnostic(widget, f.container, 1);
+    cleanups.push(() => { f.controller.abort(); observation.close(); widget.remove(); });
+    return { ...f, observation };
+  }
+  // Break: registering after mount misses a synchronous event; resolving on it invents readiness.
+  it.each(['synchronous', 'delayed'])('observes %s loaderstart without inspecting payload or resolving mount', async timing => {
+    const f = diagnosticSetup(); let resolved = false;
+    const getter = vi.fn(() => { throw new Error('provider payload read'); });
+    const payload = Object.defineProperty({}, 'elementType', { get: getter });
+    function loaderstart() {
+      expect(f.listeners.get('loaderstart')?.size, 'loaderstart listener must precede mount').toBe(1);
+      for (const listener of f.listeners.get('loaderstart')!) (listener as (value: unknown) => void)(payload);
+    }
+    if (timing === 'synchronous') f.element.mount.mockImplementationOnce(() => { loaderstart(); });
+    const pending = mountStripePayment(f.options).then(handle => { resolved = true; return handle; });
+    void pending.catch(() => {});
+    await vi.waitFor(() => expect(f.element.mount).toHaveBeenCalledOnce());
+    if (timing === 'delayed') loaderstart();
+    // Synchronous provider exceptions are safely mapped by the driver, so verify registration here too.
+    expect(f.element.on.mock.calls.some(([event]) => event === 'loaderstart')).toBe(true);
+    expect(f.observation.readinessSnapshot()).toEqual({ loaderstart_seen: true });
+    expect(getter).not.toHaveBeenCalled(); await Promise.resolve(); expect(resolved).toBe(false);
+    expect(f.observation.snapshot()).toMatchObject({ ready_seen: false, operation: 'PENDING' });
+    f.emit('ready'); const handle = await pending;
+    expect(resolved).toBe(true); expect(f.listeners.get('loaderstart')?.size).toBe(0); handle.destroy();
+  });
+  // Break: inferring loaderstart from ready or leaving listeners attached falsifies later evidence.
+  it.each(['ready', 'loaderror', 'abort', 'mount-throw'])('keeps absent loaderstart false and removes its listener after %s', async outcome => {
+    const f = diagnosticSetup(); let late: (() => void) | undefined;
+    if (outcome === 'mount-throw') f.element.mount.mockImplementationOnce(() => { late = [...(f.listeners.get('loaderstart') ?? [])][0]; throw new Error('provider mount failure'); });
+    const pending = mountStripePayment(f.options); const result = pending.catch(error => error);
+    await vi.waitFor(() => expect(f.element.mount).toHaveBeenCalledOnce());
+    expect(f.element.on.mock.calls.some(([event]) => event === 'loaderstart'), 'loaderstart listener must be registered').toBe(true);
+    late ??= [...(f.listeners.get('loaderstart') ?? [])][0];
+    if (outcome === 'abort') f.controller.abort();
+    if (outcome === 'ready' || outcome === 'loaderror') f.emit(outcome);
+    const value = await result;
+    if (outcome === 'ready') value.destroy();
+    else expect(value).toMatchObject(outcome === 'abort' ? { name: 'AbortError' } : { code: 'PROVIDER_TEMPORARILY_UNAVAILABLE' });
+    expect(f.listeners.get('loaderstart')?.size).toBe(0);
+    late?.(); f.emit('loaderstart');
+    expect(f.observation.readinessSnapshot()).toEqual({ loaderstart_seen: false });
+    expect(f.stripe.confirmPayment).not.toHaveBeenCalled(); expect(f.refresh).not.toHaveBeenCalled();
+  });
+});
 
 describe('Stripe mount readiness and cleanup', () => {
   it('resolves only on actual ready and disables every wallet', async () => {

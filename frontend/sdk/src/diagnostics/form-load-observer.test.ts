@@ -36,6 +36,48 @@ async function setup() {
 async function atFrame(f: Awaited<ReturnType<typeof setup>>) { f.resume.click(); await vi.waitFor(() => expect(f.widget.shadowRoot!.querySelector('iframe')).toBe(f.p.frame)); }
 async function cleanup(f: Awaited<ReturnType<typeof setup>>) { f.observation.close(); f.widget.remove(); await Promise.resolve(); }
 
+async function readinessFixture() {
+  const api = await observer(); const widget = document.createElement('div');
+  api.registerFormLoadWidget(widget);
+  const observation = api.armFormLoadDiagnostic(widget); observations.add(observation);
+  const host = document.createElement('div'); widget.attachShadow({ mode: 'open' }).append(host);
+  return { api, widget, host, observation, bind() { document.body.append(widget); return api.bindFormLoadDiagnostic(widget, host, 1); } };
+}
+
+// Break: folding loaderstart into the legacy snapshot changes its serialized wire contract.
+it('defaults the separate immutable readiness snapshot to false without changing legacy keys', async () => {
+  const f = await readinessFixture();
+  expect(f.observation.readinessSnapshot, 'separate readiness snapshot must exist').toBeTypeOf('function');
+  const snapshot = f.observation.readinessSnapshot();
+  expect(snapshot).toEqual({ loaderstart_seen: false }); expect(Object.isFrozen(snapshot)).toBe(true);
+  expect(() => Object.assign(snapshot, { loaderstart_seen: true })).toThrow();
+  expect(Object.keys(f.observation.snapshot())).toEqual(['version', 'binding', 'capability_started', 'capability_ready', 'loader_started', 'loader_ready', 'element_created', 'mount_called', 'mount_returned', 'ready_seen', 'loaderror_seen', 'catchup', 'view_completed', 'widget_completed', 'confirmation_blocked', 'operation']);
+});
+// Break: dropping the loaderstart mark or treating it as ready loses or overstates evidence.
+it('records loaderstart only in the current bound pending readiness snapshot', async () => {
+  const f = await readinessFixture(); const binding = f.bind();
+  expect(f.api.markFormLoadLoaderStart, 'internal loaderstart hook must exist').toBeTypeOf('function');
+  const before = f.observation.readinessSnapshot(); const legacy = f.observation.snapshot();
+  f.api.markFormLoadLoaderStart(binding);
+  expect(f.observation.readinessSnapshot()).toEqual({ loaderstart_seen: true });
+  expect(before).toEqual({ loaderstart_seen: false }); expect(f.observation.snapshot()).toEqual(legacy);
+});
+// Break: accepting stale, unbound or terminal marks allows late events to improve evidence.
+it.each(['unbound', 'lost', 'closed', 'aborted', 'failed', 'completed', 'repeat', 'host-removed'])('ignores loaderstart for a %s observation', async status => {
+  const f = await readinessFixture();
+  expect(f.api.markFormLoadLoaderStart, 'internal loaderstart hook must exist').toBeTypeOf('function');
+  const binding = status === 'unbound' ? undefined : f.bind();
+  if (status === 'lost') f.api.disconnectFormLoadWidget(f.widget);
+  if (status === 'closed') f.observation.close();
+  if (status === 'aborted' || status === 'failed') f.api.failFormLoad(binding, status === 'aborted');
+  if (status === 'completed') f.api.markFormLoad(binding, 'widget_completed');
+  if (status === 'repeat') f.api.bindFormLoadDiagnostic(f.widget, f.host, 2);
+  if (status === 'host-removed') f.host.remove();
+  f.api.markFormLoadLoaderStart(binding);
+  expect(f.observation.readinessSnapshot()).toEqual({ loaderstart_seen: false });
+  if (status === 'closed') expect(() => f.api.denyFormLoadConfirmation(binding)).toThrow('CONFIRMATION_BLOCKED');
+});
+
 // Break: accepting arbitrary or already-connected nodes defeats the singleton/fresh-widget handshake.
 it('rejects foreign, duplicate-registry, previously connected and second armed widgets', async () => {
   const api = await observer();
