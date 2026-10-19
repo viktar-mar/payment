@@ -38,6 +38,33 @@ function fake(sample=ready) {
   return {type,browser,context,page,locator,events,writes,realm,handlers,retained,cspListeners};
 }
 const limits=()=>({deadline:Date.now()+900000,signal:new AbortController().signal});
+// Break caught: malformed/noncanonical origins reach launch or become opaque browser errors.
+test('both distinct owned origins are validated before any browser launch',async()=>{
+  for(const origin of ['malformed','http://127.0.0.1:1023','http://127.0.0.1:65536','http://127.0.0.1:18080/',
+    'http://127.0.0.1:18080?private=sentinel','http://user@127.0.0.1:18080','https://127.0.0.1:18080','http://localhost:18080',handoff.endpoint]){
+    const f=fake(),input={...handoff,session:{...handoff.session,apiBaseUrl:origin}};
+    const result=await runFormLoadBrowser(f.type,input,limits());
+    assert.deepEqual(f.events,[],origin);assert.equal(result.observationEnd,'INSTRUMENTATION_UNAVAILABLE',origin);
+    assert.equal(result.outcome,'INSTRUMENTATION_UNAVAILABLE');
+  }
+});
+// Break caught: local limit and opaque browser rejection collapse to the same provenance.
+test('actual driver distinguishes local limit, read rejection, abort, deadline and bootstrap absence',async t=>{
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000000});
+  for(const ending of ['local','read','abort','deadline','bootstrap'] as const){
+    const f=fake({...pending} as typeof ready),controller=new AbortController();
+    if(ending==='read')f.page.evaluate=async()=>{throw new Proxy({},{get(){assert.fail('external error inspected');}});};
+    if(ending==='bootstrap')runInContext('delete __formLoadDiagnostic',f.realm);
+    const original={deadline:Date.now()+900000,signal:controller.signal};
+    const run=runFormLoadBrowser(f.type,handoff,original);await immediate();
+    if(ending==='local')t.mock.timers.tick(60000);
+    if(ending==='abort')controller.abort();
+    if(ending==='deadline')t.mock.timers.tick(900000);
+    const result=await run;
+    assert.equal(result.observationEnd,({local:'LOCAL_LIMIT',read:'BROWSER_OPERATION_FAILED',abort:'ABORTED',deadline:'ACTIVE_DEADLINE',bootstrap:'INSTRUMENTATION_UNAVAILABLE'} as const)[ending]);
+    assert.equal(result.outcome,ending==='abort'?'ABORTED':ending==='deadline'?'DEADLINE_REACHED':ending==='bootstrap'?'INSTRUMENTATION_UNAVAILABLE':'FAILED');
+  }
+});
 // Only external resource operations are synthetic; the driver, parent and schema run.
 function throughParent(f:ReturnType<typeof fake>,original=limits()) {
   return runFormLoadDiagnostic({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'},
@@ -49,7 +76,7 @@ function throughParent(f:ReturnType<typeof fake>,original=limits()) {
   });
 }
 // Break: unavailable SDK bootstrap hides CSP evidence and starts a client session.
-for(const sdk of ['missing','throwing','accessor'] as const)test(`${sdk} SDK preserves enforced CSP script evidence in opaque wire2 without Resume`,async()=>{
+for(const sdk of ['missing','throwing','accessor'] as const)test(`${sdk} SDK preserves enforced CSP script evidence in opaque wire3 without Resume`,async()=>{
   const f=fake();let reads=0;
   if(sdk==='missing')runInContext('delete globalThis.__formLoadDiagnostic',f.realm);
   else if(sdk==='throwing')f.realm.__formLoadDiagnostic={handshake(){throw Symbol();}};
@@ -57,7 +84,7 @@ for(const sdk of ['missing','throwing','accessor'] as const)test(`${sdk} SDK pre
   const goto=f.page.goto;
   f.page.goto=async()=>{await goto();assert.equal(f.cspListeners.length,1);f.cspListeners[0]!({isTrusted:true,effectiveDirective:'script-src-elem',disposition:'enforce'});};
   const result=await throughParent(f),frame=result.frames[0]!;
-  assert.equal(result.exitCode,1);assert.equal(frame.version,2);assert.equal(frame.result,'INSTRUMENTATION_UNAVAILABLE');
+  assert.equal(result.exitCode,1);assert.equal(frame.version,3);assert.equal(frame.result,'INSTRUMENTATION_UNAVAILABLE');
   assert.equal(frame.csp_observation,'OBSERVED');assert.equal(frame.csp_enforced_mask,1);
   assert.equal(frame.environment_freshness,'CACHED');assert.equal(Object.hasOwn(frame,'binding'),false);
   assert.equal(f.events.includes('resume'),false);assert.equal(reads,0);
@@ -78,7 +105,7 @@ test('CSP failure preserves distinct transport document, HTTP404 script and HTTP
 test('independent masks do not cancel actual sample1 readiness and all closure proofs',async()=>{
   const f=fake(),goto=f.page.goto;f.page.goto=async()=>{await goto();f.handlers.get('response')!({status:()=>404,request:()=>({resourceType:()=> 'script'})});};
   const result=await throughParent(f),frame=result.frames[0]!;
-  assert.equal(result.exitCode,0);assert.equal(frame.version,2);assert.equal(frame.resource_http_4xx_mask,1);
+  assert.equal(result.exitCode,0);assert.equal(frame.version,3);assert.equal(frame.resource_http_4xx_mask,1);
   assert.equal(frame.environment_freshness,'SAMPLED');assert.equal(frame.result,'FORM_READY_BEFORE_15S');
 });
 // Break: partial evidence after Resume suppresses an independently observed primary SDK failure.
@@ -89,6 +116,13 @@ for(const [change,want] of [[{operation:'FAILED'},'OPERATION_FAILED'],[{operatio
   const result=await throughParent(f);
   assert.equal(result.exitCode,1);assert.equal(result.frames[0]!.result,want);
   assert.equal(result.frames[0]!.resource_observation,'UNAVAILABLE');
+  assert.equal(result.frames[0]!.fetch_failure_destination,'UNAVAILABLE');assert.equal(result.frames[0]!.fetch_failure_code,'UNAVAILABLE');
+  assert.equal(result.frames[0]!.observation_end,'SDK_TERMINAL');
+});
+test('actual terminal loaderror retains SDK_TERMINAL through the parent wire3 producer',async()=>{
+  const f=fake({...ready,loaderror_seen:true}),result=await throughParent(f);
+  assert.equal(result.exitCode,1);assert.equal(result.frames[0]!.result,'ELEMENT_LOADERROR');
+  assert.equal(result.frames[0]!.observation_end,'SDK_TERMINAL');
 });
 // Break: the parent paints checkpoint with later masks, or failure publishes a new read.
 test('checkpoint owns its environment while latest complete observation is cached after abort',async t=>{
@@ -108,28 +142,45 @@ test('checkpoint owns its environment while latest complete observation is cache
   assert.equal(checkpoint!.result,'WAITING_ELEMENT_READY');assert.equal(checkpoint!.csp_enforced_mask,1);
   assert.equal(checkpoint!.csp_report_only_mask,0);assert.equal(checkpoint!.resource_http_5xx_mask,0);
   assert.equal(checkpoint!.environment_freshness,'SAMPLED');assert.equal(final!.result,'ABORTED');
+  assert.equal(checkpoint!.observation_end,'OBSERVING');assert.equal(final!.observation_end,'ABORTED');
   assert.equal(final!.csp_enforced_mask,1);assert.equal(final!.csp_report_only_mask,2);
   assert.equal(final!.resource_http_4xx_mask,1);assert.equal(final!.resource_http_5xx_mask,4);
   assert.equal(final!.environment_freshness,'CACHED');assert.equal(Object.hasOwn(final!,'bucket'),false);
 });
+// Break caught: Node categories are lost or mixed across actual driver/parent snapshots and teardown.
+test('driver carries latest same-event fetch pair from navigation through frozen checkpoint and cached abort',async t=>{
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000000});
+  const f=fake({...pending} as typeof ready),goto=f.page.goto,controller=new AbortController();
+  f.page.goto=async()=>{await goto();f.handlers.get('requestfailed')!({resourceType:()=> 'fetch',url:()=>handoff.session.apiBaseUrl+'/private?secret=sentinel',failure:()=>({errorText:'net::ERR_ABORTED'})});};
+  const run=throughParent(f,{deadline:1900000,signal:controller.signal});await immediate();
+  t.mock.timers.tick(15000);await immediate();
+  f.handlers.get('requestfailed')!({resourceType:()=> 'xhr',url:()=> 'https://api.stripe.com/private',failure:()=>({errorText:'net::ERR_NAME_NOT_RESOLVED'})});
+  t.mock.timers.tick(100);await immediate();controller.abort();const result=await run;
+  assert.deepEqual(result.frames.map(frame=>[frame.fetch_failure_destination,frame.fetch_failure_code]),[['OWN_APP','ABORTED'],['STRIPE_API','NAME_NOT_RESOLVED']]);
+  assert.deepEqual(result.frames.map(frame=>frame.resource_transport_failure_mask),[4,4]);
+  assert.deepEqual(result.frames.map(frame=>frame.observation_end),['OBSERVING','ABORTED']);
+  assert.deepEqual(result.frames.map(frame=>frame.environment_freshness),['SAMPLED','CACHED']);
+  assert.equal(JSON.stringify(result).includes('sentinel'),false);
+});
 // Break: retained callbacks consume late payloads or private CSP bits alter frozen output.
-for(const end of ['abort','local'] as const)test(`retained actual CSP callback after ${end} can change only private bits; resource callbacks/readers stay inert`,async t=>{
+for(const end of ['abort','local','deadline'] as const)test(`retained actual CSP callback after ${end} can change only private bits; resource callbacks/readers stay inert`,async t=>{
   t.mock.timers.enable({apis:['Date','setTimeout'],now:1000000});
   const f=fake({...pending} as typeof ready),controller=new AbortController(),evaluate=f.page.evaluate;let reads=0,payloadReads=0;
   f.page.evaluate=async(fn:Function,arg?:unknown)=>{reads++;return evaluate(fn,arg);};
   const run=throughParent(f,{deadline:1900000,signal:controller.signal});await immediate();
   const before=reads,poison=new Proxy({},{get(){payloadReads++;throw null;}});
-  if(end==='abort')controller.abort();else t.mock.timers.setTime(1060000);
+  if(end==='abort')controller.abort();else t.mock.timers.setTime(end==='local'?1060000:1900000);
   f.retained.get('response')!(poison);f.retained.get('requestfailed')!(poison);
   f.cspListeners[0]!({isTrusted:true,effectiveDirective:'script-src',disposition:'enforce'});
-  if(end==='local')t.mock.timers.tick(0);
+  if(end!=='abort')t.mock.timers.tick(0);
   const result=await run,wire=JSON.stringify(result);
   assert.equal(reads,before);assert.equal(payloadReads,0);
   assert.equal(result.frames[0]!.environment_freshness,'CACHED');assert.equal(result.frames[0]!.csp_enforced_mask,0);
-  assert.equal(runInContext('__formDiagnosticCsp.snapshot().csp_enforced_mask',f.realm),1);
+  assert.equal(result.frames[0]!.observation_end,end==='abort'?'ABORTED':end==='local'?'LOCAL_LIMIT':'ACTIVE_DEADLINE');
+  assert.equal(runInContext('__formDiagnosticCsp.snapshot().csp_enforced_mask',f.realm),end==='deadline'?0:1);
   f.retained.get('response')!(poison);f.retained.get('requestfailed')!(poison);
   f.cspListeners[0]!({isTrusted:true,effectiveDirective:'connect-src',disposition:'enforce'});
-  assert.equal(runInContext('__formDiagnosticCsp.snapshot().csp_enforced_mask',f.realm),5);
+  assert.equal(runInContext('__formDiagnosticCsp.snapshot().csp_enforced_mask',f.realm),end==='deadline'?0:5);
   assert.equal(JSON.stringify(result),wire);assert.equal(reads,before);assert.equal(payloadReads,0);
 });
 test('failed resource subscription retains CSP baseline and never authorizes Resume',async()=>{
@@ -375,6 +426,7 @@ test('uncertain context cleanup stays unconfirmed even after successful browser 
   const f=fake();f.context.close=async()=>{throw null;};
   const result=await runFormLoadBrowser(f.type,handoff,limits());assert.equal(result.contextClosed,false);assert.equal(result.browserClosed,true);
   assert.equal(result.outcome,'FAILED');
+  assert.equal(result.observationEnd,'FORM_READY');
 });
 test('hanging context close cannot prevent browser close and parent cleanup keeps the original ceiling',async t=>{
   t.mock.timers.enable({apis:['Date','setTimeout'],now:1000000});
@@ -445,6 +497,7 @@ for(const boundary of [60000,60001])for(const stage of ['snapshot','visibility']
     await immediate();t.mock.timers.tick(100);await immediate();
     const result=await run;
     assert.equal(result.outcome,'FAILED');assert.equal(result.observations.length,1);
+    assert.equal(result.observationEnd,'LOCAL_LIMIT');
     assert.equal(result.observations[0]?.sample?.bucket,'AT_LIMIT');assert.equal(result.observations[0]?.sample?.ready_seen,false);
     assert.equal(result.observations[0]?.sample?.pay_visible,false);
     assert.equal(payReads,stage==='snapshot'?1:2);

@@ -1,5 +1,7 @@
 import type {Page,Request,Response} from '@playwright/test';
 import type {FormResourceEvidence} from '../../../../infrastructure/stripe-form-diagnostic-environment.mjs';
+import {classifyFormFetchDestination,classifyFormFetchFailure} from '../../../../infrastructure/stripe-form-diagnostic-network.mjs';
+import type {FormFetchDestination,FormFetchFailureCode} from '../../../../infrastructure/stripe-form-diagnostic-network.mjs';
 
 /** Serialized as an init script: keep every dependency inside this function. */
 export function installFormCspObserver(args:{ownedOrigin:string;activeDeadline:number}):void {
@@ -83,12 +85,13 @@ export function readDiagnosticPageEvidence(includeForm:boolean):unknown {
 }
 
 /** Own-page finite events only. No event payload survives the synchronous call. */
-export function createFormResourceObserver(page:Pick<Page,'on'|'off'>,isActive:()=>boolean):{
+export function createFormResourceObserver(page:Pick<Page,'on'|'off'>,isActive:()=>boolean,ownedOrigins:readonly string[]):{
   snapshot():Readonly<FormResourceEvidence>;stop():void;
 } {
   let available=true,stopped=false,transport=0,http4xx=0,http5xx=0;
+  let pair:readonly [FormFetchDestination,FormFetchFailureCode]=['NONE','NONE'];
   let attemptedRequest=false,attemptedResponse=false;
-  const invalidate=()=>{available=false;transport=0;http4xx=0;http5xx=0;};
+  const invalidate=()=>{available=false;transport=0;http4xx=0;http5xx=0;pair=['UNAVAILABLE','UNAVAILABLE'];};
   function active():boolean {
     if(stopped||!available)return false;
     try {return isActive()===true;}catch {invalidate();return false;}
@@ -102,6 +105,12 @@ export function createFormResourceObserver(page:Pick<Page,'on'|'off'>,isActive:(
       const type=request.resourceType();
       if(typeof type!=='string'){invalidate();return;}
       transport|=bit(type);
+      if(type==='fetch'||type==='xhr') {
+        let destination:FormFetchDestination='UNKNOWN',code:FormFetchFailureCode='UNKNOWN';
+        try {destination=classifyFormFetchDestination(request.url(),ownedOrigins);}catch {}
+        try {code=classifyFormFetchFailure(request.failure());}catch {}
+        pair=[destination,code];
+      }
     }catch {invalidate();}
   }
   function response(response:Response):void {
@@ -127,5 +136,6 @@ export function createFormResourceObserver(page:Pick<Page,'on'|'off'>,isActive:(
     attemptedResponse=true;page.on('response',response);
   }catch {invalidate();stop();}
   return {snapshot:()=>Object.freeze({resource_observation:available?'OBSERVED':'UNAVAILABLE',
-    resource_transport_failure_mask:transport,resource_http_4xx_mask:http4xx,resource_http_5xx_mask:http5xx}),stop};
+    resource_transport_failure_mask:transport,resource_http_4xx_mask:http4xx,resource_http_5xx_mask:http5xx,
+    fetch_failure_destination:pair[0],fetch_failure_code:pair[1]}),stop};
 }

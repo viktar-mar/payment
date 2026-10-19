@@ -3,15 +3,19 @@ import {unavailableFormEnvironmentEvidence} from './stripe-form-diagnostic-envir
 import {formDiagnosticOptIn} from './stripe-sandbox-owned.mjs';
 
 const OUTCOMES=['OBSERVING','FAILED','ABORTED','DEADLINE_REACHED','INSTRUMENTATION_UNAVAILABLE','UNEXPECTED_ACTIVITY'];
+const END_OUTCOMES={FORM_READY:['OBSERVING','FAILED'],SDK_TERMINAL:['OBSERVING','FAILED'],LOCAL_LIMIT:['FAILED'],
+  ABORTED:['ABORTED'],ACTIVE_DEADLINE:['DEADLINE_REACHED'],INSTRUMENTATION_UNAVAILABLE:['OBSERVING','INSTRUMENTATION_UNAVAILABLE','FAILED'],
+  BROWSER_OPERATION_FAILED:['FAILED']};
 function browserResult(value) {
   try {
     if(value===null||typeof value!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(value)))return null;
     const descriptors=Object.getOwnPropertyDescriptors(value),names=Reflect.ownKeys(descriptors);
-    const keys=['observations','outcome','browserClosed','contextClosed'];
+    const keys=['observations','outcome','browserClosed','contextClosed','observationEnd'];
     if(names.length!==keys.length||names.some(key=>typeof key!=='string'||!keys.includes(key)))return null;
     const data={};
     for(const key of keys){if(!Object.hasOwn(descriptors[key],'value')||!descriptors[key].enumerable)return null;data[key]=descriptors[key].value;}
-    if(!OUTCOMES.includes(data.outcome)||typeof data.browserClosed!=='boolean'||typeof data.contextClosed!=='boolean'
+    if(!OUTCOMES.includes(data.outcome)||typeof data.observationEnd!=='string'||!Object.hasOwn(END_OUTCOMES,data.observationEnd)
+      ||!END_OUTCOMES[data.observationEnd].includes(data.outcome)||typeof data.browserClosed!=='boolean'||typeof data.contextClosed!=='boolean'
       ||!Array.isArray(data.observations))return null;
     const entries=Object.getOwnPropertyDescriptors(data.observations),length=entries.length?.value;
     if(!Number.isInteger(length)||length<0||length>2||Reflect.ownKeys(entries).length!==length+1)return null;
@@ -28,6 +32,7 @@ function browserResult(value) {
 /** Separate prepare-only lifecycle; never imports/calls full acceptance or CLI. */
 export async function runFormLoadDiagnostic(options,originalLimits,dependencies={}) {
   let runtime,outcome='FAILED',observations=[],browserClosed=false,contextClosed=false,noConfirmation=false,runtimeClosed=false;
+  let observationEnd='BROWSER_NOT_STARTED';
   let limits,cleanupDeadline;
   try {
     if(!formDiagnosticOptIn(options?.env))throw null;
@@ -38,9 +43,10 @@ export async function runFormLoadDiagnostic(options,originalLimits,dependencies=
     const createRuntime=dependencies.createRuntime??(await import('./stripe-form-diagnostic-runtime.mjs')).createFormDiagnosticRuntime;
     runtime=await createRuntime(options);
     const handoff=await runtime.prepare(limits);
+    observationEnd='BROWSER_OPERATION_FAILED';
     const observation=browserResult(await dependencies.runBrowser(handoff,limits));
-    if(!observation){outcome='INSTRUMENTATION_UNAVAILABLE';throw null;}
-    ({observations,outcome,browserClosed,contextClosed}=observation);
+    if(!observation){outcome='INSTRUMENTATION_UNAVAILABLE';observationEnd='INSTRUMENTATION_UNAVAILABLE';throw null;}
+    ({observations,outcome,browserClosed,contextClosed,observationEnd}=observation);
   }catch {
     if(limits?.signal.aborted)outcome='ABORTED';
     else if(limits&&Date.now()>=limits.deadline)outcome='DEADLINE_REACHED';
@@ -69,7 +75,7 @@ export async function runFormLoadDiagnostic(options,originalLimits,dependencies=
   // A prior checkpoint retains its historical stage. Only the final frame
   // carries the settled lifecycle outcome, which alone controls success.
   if(!observations.length)observations=[{sample:null,environment:unavailableFormEnvironmentEvidence()}];
-  const frames=Object.freeze(observations.map(({sample,environment},index)=>buildFormDiagnosticFrame(sample,index===observations.length-1?outcome:'OBSERVING',proofs,environment)));
+  const frames=Object.freeze(observations.map(({sample,environment},index)=>buildFormDiagnosticFrame(sample,index===observations.length-1?outcome:'OBSERVING',proofs,environment,index===observations.length-1?observationEnd:'OBSERVING')));
   const last=frames.at(-1);
   const success=last&&['FORM_READY_BEFORE_15S','FORM_READY_AFTER_15S'].includes(last.result)
     &&Object.values(proofs).every(value=>value===true);

@@ -19,6 +19,7 @@ const RESULTS = ['FORM_READY_BEFORE_15S','FORM_READY_AFTER_15S','WAITING_CLIENT_
   'ELEMENT_SETUP_INCOMPLETE','WAITING_ELEMENT_READY','WAITING_PRESENTATION_CATCHUP','WIDGET_HANDOFF_INCOMPLETE','ELEMENT_LOADERROR',...FAILURES];
 const OUTCOMES = {FAILED:'OPERATION_FAILED',ABORTED:'ABORTED',DEADLINE_REACHED:'DEADLINE_REACHED',
   INSTRUMENTATION_UNAVAILABLE:'INSTRUMENTATION_UNAVAILABLE',UNEXPECTED_ACTIVITY:'UNEXPECTED_ACTIVITY'};
+const ENDS=['OBSERVING','FORM_READY','SDK_TERMINAL','LOCAL_LIMIT','ABORTED','ACTIVE_DEADLINE','INSTRUMENTATION_UNAVAILABLE','BROWSER_OPERATION_FAILED','BROWSER_NOT_STARTED'];
 const encoder = new TextEncoder();
 
 function exactData(value, keys) {
@@ -103,21 +104,35 @@ function safeProofs(value) {
   return Object.fromEntries(PROOF_KEYS.map(key => [key, copy !== null && copy[key] === true]));
 }
 
-export function buildFormDiagnosticFrame(value, outcome, proofs, evidence) {
+function compatibleEnd(result,end) {
+  if(!ENDS.includes(end))return false;
+  if(FAILURES.includes(result))return end!=='OBSERVING';
+  if(result==='FORM_READY_BEFORE_15S'||result==='FORM_READY_AFTER_15S')return end==='FORM_READY';
+  if(result==='ELEMENT_LOADERROR')return end==='SDK_TERMINAL';
+  return end==='OBSERVING';
+}
+
+export function buildFormDiagnosticFrame(value, outcome, proofs, evidence, observationEnd) {
   const sample = validateFormDiagnosticSample(value);
   const environment=validateFormEnvironmentEvidence(evidence)??unavailableFormEnvironmentEvidence();
   let result = classifyFormDiagnosticSample(sample,outcome);
   const sampled=sampledEnvironment(environment);
   if(!sampled&&!FAILURES.includes(result))result='INSTRUMENTATION_UNAVAILABLE';
-  const stage=sample&&sampled?Object.fromEntries(STAGE_KEYS.map(key=>[key,sample[key]])):{};
-  return Object.freeze({version:2,...stage,result,...safeProofs(proofs),...environment});
+  const validReason=compatibleEnd(result,observationEnd);
+  if(!validReason) {
+    observationEnd='INSTRUMENTATION_UNAVAILABLE';
+    if(!FAILURES.includes(result))result='INSTRUMENTATION_UNAVAILABLE';
+  }
+  const stage=sample&&sampled&&validReason?Object.fromEntries(STAGE_KEYS.map(key=>[key,sample[key]])):{};
+  return Object.freeze({version:3,...stage,result,...safeProofs(proofs),...environment,observation_end:observationEnd});
 }
 
 function validateFrame(value) {
-  const shortKeys = ['version','result',...PROOF_KEYS,...ENVIRONMENT_KEYS];
-  const longKeys = ['version',...STAGE_KEYS,'result',...PROOF_KEYS,...ENVIRONMENT_KEYS];
+  const shortKeys = ['version','result',...PROOF_KEYS,...ENVIRONMENT_KEYS,'observation_end'];
+  const longKeys = ['version',...STAGE_KEYS,'result',...PROOF_KEYS,...ENVIRONMENT_KEYS,'observation_end'];
   const data = exactData(value,shortKeys) ?? exactData(value,longKeys);
-  if (!data || data.version !== 2 || !RESULTS.includes(data.result) || PROOF_KEYS.some(key => typeof data[key] !== 'boolean')) return null;
+  if (!data || data.version !== 3 || !RESULTS.includes(data.result) || !compatibleEnd(data.result,data.observation_end)
+    || PROOF_KEYS.some(key => typeof data[key] !== 'boolean')) return null;
   const environment=validateFormEnvironmentEvidence(Object.fromEntries(ENVIRONMENT_KEYS.map(key=>[key,data[key]])));
   if(!environment)return null;
   if (!Object.hasOwn(data,'bucket')) return FAILURES.includes(data.result) ? Object.freeze(data) : null;

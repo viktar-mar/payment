@@ -9,8 +9,8 @@ import {installFormCspObserver,readDiagnosticPageEvidence,createFormResourceObse
 type Callback=(value:unknown)=>void;
 const cspZero={csp_observation:'OBSERVED',csp_enforced_mask:0,csp_report_only_mask:0};
 const cspUnavailable={csp_observation:'UNAVAILABLE',csp_enforced_mask:0,csp_report_only_mask:0};
-const resourceZero={resource_observation:'OBSERVED',resource_transport_failure_mask:0,resource_http_4xx_mask:0,resource_http_5xx_mask:0};
-const resourceUnavailable={resource_observation:'UNAVAILABLE',resource_transport_failure_mask:0,resource_http_4xx_mask:0,resource_http_5xx_mask:0};
+const resourceZero={resource_observation:'OBSERVED',resource_transport_failure_mask:0,resource_http_4xx_mask:0,resource_http_5xx_mask:0,fetch_failure_destination:'NONE',fetch_failure_code:'NONE'};
+const resourceUnavailable={resource_observation:'UNAVAILABLE',resource_transport_failure_mask:0,resource_http_4xx_mask:0,resource_http_5xx_mask:0,fetch_failure_destination:'UNAVAILABLE',fetch_failure_code:'UNAVAILABLE'};
 const sdkSample={version:1,binding:'BOUND',capability_started:true,capability_ready:true,loader_started:true,loader_ready:true,
   element_created:true,mount_called:true,mount_returned:true,ready_seen:true,loaderror_seen:false,view_completed:true,
   widget_completed:true,confirmation_blocked:false,catchup:'NOT_STARTED',operation:'COMPLETED',
@@ -49,7 +49,27 @@ function pageBoundary() {
   return {page:page as unknown as Pick<Page,'on'|'off'>,emitter,captured,removed,
     registrationFailure:(event:string)=>{registrationFailure=event;},unsubscribeFailure:(event:string)=>{unsubscribeFailure=event;}};
 }
-function request(type:unknown) {return trapped({resourceType:()=>type},['resourceType']);}
+function request(type:unknown) {return trapped({resourceType:()=>type,url:()=> 'https://api.stripe.com/private?sentinel',failure:()=>({errorText:'net::ERR_FAILED'})},['resourceType','url','failure']);}
+const ownedOrigins=Object.freeze(['http://127.0.0.1:19000','http://127.0.0.1:18080']);
+// Break caught: mixing categories from different events or losing the independent metadata read.
+test('fetch failures replace one same-event pair and preserve frozen checkpoints',()=>{
+  const p=pageBoundary(),observer=createFormResourceObserver(p.page,()=>true,ownedOrigins);
+  const emit=(url:()=>unknown,failure:()=>unknown,type='fetch')=>{
+    const req=trapped({resourceType:()=>type,url,failure},['resourceType','url','failure']);
+    p.emitter.emit('requestfailed',req.value);assert.deepEqual(req.reads,['resourceType','url','failure']);
+  };
+  emit(()=>ownedOrigins[0]+'/private?secret=sentinel',()=>({errorText:'net::ERR_ABORTED'}));
+  const first=observer.snapshot();assert.equal(first.fetch_failure_destination,'OWN_APP');assert.equal(first.fetch_failure_code,'ABORTED');
+  emit(()=> 'https://api.stripe.com/private',()=>({errorText:'net::ERR_NAME_NOT_RESOLVED'}),'xhr');
+  assert.equal(observer.snapshot().resource_transport_failure_mask,4);
+  assert.equal(observer.snapshot().fetch_failure_destination,'STRIPE_API');assert.equal(observer.snapshot().fetch_failure_code,'NAME_NOT_RESOLVED');
+  assert.ok(Object.isFrozen(first));assert.equal(first.fetch_failure_destination,'OWN_APP');assert.equal(first.fetch_failure_code,'ABORTED');
+  emit(()=>{throw poison();},()=>({errorText:'net::ERR_ABORTED'}));
+  assert.equal(observer.snapshot().fetch_failure_destination,'UNKNOWN');assert.equal(observer.snapshot().fetch_failure_code,'ABORTED');
+  emit(()=> 'https://js.stripe.com/v3',()=>{throw poison();});
+  assert.equal(observer.snapshot().fetch_failure_destination,'STRIPE_JS');assert.equal(observer.snapshot().fetch_failure_code,'UNKNOWN');
+  assert.equal(JSON.stringify(observer.snapshot()).includes('sentinel'),false);
+});
 function response(status:unknown,type:unknown) {
   const req=request(type),res=trapped({status:()=>status,request:()=>req.value},['status','request']);
   return {value:res.value,reads:res.reads,requestReads:req.reads};
@@ -184,22 +204,23 @@ for(const nullPrototype of [false,true])test(`serialized reader copies finite ${
 });
 // Break caught: wrong resource mapping or HTTP errors confused with transport failures.
 test('resource observer accumulates literal masks with only synchronous allowed reads',()=>{
-  const p=pageBoundary(),observer=createFormResourceObserver(p.page,()=>true);assert.deepEqual(observer.snapshot(),resourceZero);
+  const p=pageBoundary(),observer=createFormResourceObserver(p.page,()=>true,ownedOrigins);assert.deepEqual(observer.snapshot(),resourceZero);
   p.emitter.emit('response',response(404,'script').value);p.emitter.emit('response',response(503,'fetch').value);p.emitter.emit('requestfailed',request('document').value);
-  assert.deepEqual(observer.snapshot(),{resource_observation:'OBSERVED',resource_transport_failure_mask:2,resource_http_4xx_mask:1,resource_http_5xx_mask:4});
+  assert.deepEqual(observer.snapshot(),{...resourceZero,resource_transport_failure_mask:2,resource_http_4xx_mask:1,resource_http_5xx_mask:4});
   for(const [type,bit] of [['script',1],['document',2],['fetch',4],['xhr',4],['image',8],['',8]] as const) {
-    const boundary=pageBoundary(),source=createFormResourceObserver(boundary.page,()=>true),req=request(type),res=response(499,type);
+    const boundary=pageBoundary(),source=createFormResourceObserver(boundary.page,()=>true,ownedOrigins),req=request(type),res=response(499,type);
     boundary.emitter.emit('requestfailed',req.value);boundary.emitter.emit('requestfailed',req.value);boundary.emitter.emit('response',res.value);boundary.emitter.emit('response',response(599,type).value);
-    assert.deepEqual(source.snapshot(),{resource_observation:'OBSERVED',resource_transport_failure_mask:bit,resource_http_4xx_mask:bit,resource_http_5xx_mask:bit});
-    assert.deepEqual(req.reads,['resourceType','resourceType']);assert.deepEqual(res.reads,['status','request']);assert.deepEqual(res.requestReads,['resourceType']);
+    assert.deepEqual(source.snapshot(),{...resourceZero,resource_transport_failure_mask:bit,resource_http_4xx_mask:bit,resource_http_5xx_mask:bit,
+      ...(bit===4?{fetch_failure_destination:'STRIPE_API',fetch_failure_code:'GENERIC_FAILED'}:{})});
+    assert.deepEqual(req.reads,bit===4?['resourceType','url','failure','resourceType','url','failure']:['resourceType','resourceType']);assert.deepEqual(res.reads,['status','request']);assert.deepEqual(res.requestReads,['resourceType']);
   }
   for(const type of ['script','document','xhr','other'])for(const status of [400,500])p.emitter.emit('response',response(status,type).value);
   for(const type of ['script','document','fetch','other'])p.emitter.emit('requestfailed',request(type).value);
-  assert.deepEqual(observer.snapshot(),{resource_observation:'OBSERVED',resource_transport_failure_mask:15,resource_http_4xx_mask:15,resource_http_5xx_mask:15});
+  assert.deepEqual(observer.snapshot(),{...resourceZero,resource_transport_failure_mask:15,resource_http_4xx_mask:15,resource_http_5xx_mask:15,fetch_failure_destination:'STRIPE_API',fetch_failure_code:'GENERIC_FAILED'});
 });
 // Break caught: success/redirect sets error bits or invalid source fails to latch unavailable.
 test('resources distinguish ordinary statuses and latch invalid status/type/getter failures',()=>{
-  const p=pageBoundary(),observer=createFormResourceObserver(p.page,()=>true);
+  const p=pageBoundary(),observer=createFormResourceObserver(p.page,()=>true,ownedOrigins);
   for(const status of [100,200,302,399])p.emitter.emit('response',response(status,'script').value);
   assert.deepEqual(observer.snapshot(),resourceZero);
   const invalid:unknown[]=[...['200',NaN,Infinity,99,600,400.5].map(status=>response(status,'script').value),response(400,null).value,
@@ -207,22 +228,22 @@ test('resources distinguish ordinary statuses and latch invalid status/type/gett
     {status:()=>400,request(){throw poison();}}, {status:()=>400,request:()=>({get resourceType(){throw poison();}})},
     {status:()=>400,request:()=>({resourceType(){throw poison();}})}];
   for(const value of invalid) {
-    const boundary=pageBoundary(),source=createFormResourceObserver(boundary.page,()=>true);boundary.emitter.emit('requestfailed',request('script').value);
+    const boundary=pageBoundary(),source=createFormResourceObserver(boundary.page,()=>true,ownedOrigins);boundary.emitter.emit('requestfailed',request('script').value);
     boundary.emitter.emit('response',value);assert.deepEqual(source.snapshot(),resourceUnavailable);
     const later=request('script');boundary.emitter.emit('requestfailed',later.value);assert.deepEqual(later.reads,[]);
   }
   for(const value of [request(null).value,{get resourceType(){throw poison();}},{resourceType(){throw poison();}}]) {
-    const boundary=pageBoundary(),source=createFormResourceObserver(boundary.page,()=>true);boundary.emitter.emit('requestfailed',value);assert.deepEqual(source.snapshot(),resourceUnavailable);
+    const boundary=pageBoundary(),source=createFormResourceObserver(boundary.page,()=>true,ownedOrigins);boundary.emitter.emit('requestfailed',value);assert.deepEqual(source.snapshot(),resourceUnavailable);
   }
 });
 // Break caught: stopped/aborted/late callbacks read events, failed off reopens gate, foreign listeners removed.
 test('resource gates precede all reads and stop closes before scoped cleanup even on off failure',()=>{
-  const p=pageBoundary();let active=true;const observer=createFormResourceObserver(p.page,()=>active),saved=observer.snapshot();
+  const p=pageBoundary();let active=true;const observer=createFormResourceObserver(p.page,()=>active,ownedOrigins),saved=observer.snapshot();
   const foreign=()=>{};p.emitter.on('response',foreign);p.emitter.emit('response',response(404,'script').value);
   assert.ok(Object.isFrozen(saved));assert.deepEqual(saved,resourceZero);const published=observer.snapshot();active=false;
   const inactive=request('document');p.emitter.emit('requestfailed',inactive.value);assert.deepEqual(inactive.reads,[]);
   active=true;p.unsubscribeFailure('requestfailed');observer.stop();observer.stop();
-  const late=request('document');p.captured.get('requestfailed')?.(late.value);const lateResponse=response(503,'fetch');p.captured.get('response')?.(lateResponse.value);
+  const late=request('fetch');p.captured.get('requestfailed')?.(late.value);const lateResponse=response(503,'fetch');p.captured.get('response')?.(lateResponse.value);
   assert.deepEqual(late.reads,[]);assert.deepEqual(lateResponse.reads,[]);assert.deepEqual(observer.snapshot(),published);
   assert.deepEqual(p.removed,['requestfailed','response']);assert.ok(p.emitter.listeners('response').includes(foreign));
   assert.equal(p.emitter.listenerCount('requestfailed'),1); // Failure is not proof of listener removal.
@@ -230,7 +251,7 @@ test('resource gates precede all reads and stop closes before scoped cleanup eve
 // Break caught: partial on failure leaves captured callback live or prevents second cleanup attempt.
 test('partial resource registration failure latches unavailable and cleans up both owned listeners',()=>{
   for(const event of ['requestfailed','response']) {
-    const p=pageBoundary();p.registrationFailure(event);const observer=createFormResourceObserver(p.page,()=>true);
+    const p=pageBoundary();p.registrationFailure(event);const observer=createFormResourceObserver(p.page,()=>true,ownedOrigins);
     assert.deepEqual(observer.snapshot(),resourceUnavailable);const late=request('script');p.captured.get('requestfailed')?.(late.value);assert.deepEqual(late.reads,[]);
     observer.stop();assert.ok(p.removed.includes(event));assert.equal(p.emitter.listenerCount('requestfailed'),0);assert.equal(p.emitter.listenerCount('response'),0);
   }
@@ -239,16 +260,16 @@ test('partial resource registration failure latches unavailable and cleans up bo
 test('abort, original deadline and local end gates suppress captured resource callbacks before reads',()=>{
   for(const ending of ['abort','deadline','local']) {
     const p=pageBoundary(),controller=new AbortController();let now=100,localEnd=180;
-    const observer=createFormResourceObserver(p.page,()=>!controller.signal.aborted&&now<200&&now<localEnd);
+    const observer=createFormResourceObserver(p.page,()=>!controller.signal.aborted&&now<200&&now<localEnd,ownedOrigins);
     p.emitter.emit('requestfailed',request('script').value);const saved=observer.snapshot();
     if(ending==='abort')controller.abort();else if(ending==='deadline')now=200;else localEnd=100;
-    const req=request('document'),res=response(503,'fetch');p.captured.get('requestfailed')?.(req.value);p.captured.get('response')?.(res.value);
+    const req=request('fetch'),res=response(503,'fetch');p.captured.get('requestfailed')?.(req.value);p.captured.get('response')?.(res.value);
     assert.deepEqual(req.reads,[]);assert.deepEqual(res.reads,[]);assert.deepEqual(observer.snapshot(),saved);observer.stop();
   }
   const callbacks=new Map<string,Callback>(),reads:string[]=[];
   const page={on(event:string,fn:Callback){callbacks.set(event,fn);return page;},off(event:string){
     callbacks.get(event)?.(new Proxy({},{get(_target,key){reads.push(String(key));throw poison();}}));return page;
   }};
-  const observer=createFormResourceObserver(page as unknown as Pick<Page,'on'|'off'>,()=>true);observer.stop();
+  const observer=createFormResourceObserver(page as unknown as Pick<Page,'on'|'off'>,()=>true,ownedOrigins);observer.stop();
   assert.deepEqual(reads,[]);assert.deepEqual(observer.snapshot(),resourceZero);
 });

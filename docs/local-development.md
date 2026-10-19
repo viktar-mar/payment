@@ -286,11 +286,12 @@ Connect/version overrides; it does not establish publishable-key/account pairing
 
 The driver clicks Resume once, observes at most60 seconds (15-second checkpoint)
 within the original active window, and emits at most two strict finite frames.
-The diagnostic-only wire format is version2, a breaking change: the reporter
-rejects version1, mixed versions and incomplete frames. Historical evidence stays
+The diagnostic-only wire format is version3, a breaking change: the reporter
+rejects version1/version2, mixed versions and incomplete frames. Historical evidence stays
 in its original format. Internal SDK samples remain version1. Each wire frame is
-at most4096 UTF-8 bytes and contains only validated stage/proof fields and eight
-finite environment fields; an opaque failure has no stage fields.
+at most4096 UTF-8 bytes and contains only validated stage/proof fields, ten
+finite environment fields and `observation_end`; an opaque failure without a
+fresh complete sample has no stage fields.
 
 Before navigation, independent collectors observe CSP violations of the owned
 top-level document and resource events of its owned page. A post-navigation
@@ -307,8 +308,28 @@ cross-origin iframe or prove the complete applied policy.
 `resource_transport_failure_mask`, `resource_http_4xx_mask` and
 `resource_http_5xx_mask` are separate observations: SCRIPT=1, DOCUMENT=2,
 FETCH_XHR=4, OTHER=8. They cover events available for the whole owned page,
-including its subframes. They carry no URL/origin attribution, request count,
-Stripe provenance, key-validity judgment or DNS/TLS/CSP cause.
+including its subframes and navigation before Resume. For active failed fetch/xhr
+only, the collector reads URL and failure once each, synchronously, and keeps
+only the latest same-event pair of finite categories. No raw metadata is retained
+or printed. Script/document/other failures and HTTP responses do not read these
+metadata. Both exact canonical demo/backend loopback origins are validated and
+frozen before browser launch.
+
+`fetch_failure_destination` is OWN_APP for either exact owned origin, STRIPE_API
+for HTTPS `api.stripe.com` on the default port, STRIPE_JS for HTTPS `js.stripe.com`
+or its subdomains on the default port, OTHER for other valid HTTP(S) destinations,
+and UNKNOWN for invalid/unreadable metadata. `fetch_failure_code` uses only exact
+Chromium error strings to yield ABORTED, NAME_NOT_RESOLVED, CONNECTION_REFUSED,
+CONNECTION_RESET, TIMED_OUT, CERTIFICATE, BLOCKED_BY_CLIENT, GENERIC_FAILED or
+UNKNOWN. A failure reading one category leaves the other independently available.
+GENERIC_FAILED does not establish CORS, CSP, a Stripe fault or a bad key.
+
+The pair is NONE/NONE when an OBSERVED source has no FETCH_XHR transport bit,
+and UNAVAILABLE/UNAVAILABLE when the resource source is unavailable. UNKNOWN
+means the relevant metadata could not be classified. Later failures replace both
+categories together; earlier frozen checkpoints retain their original pair.
+This is not a request history, request count, causal diagnosis, iframe attribution,
+Stripe ownership assertion for OTHER, or publishable-key/account pairing check.
 
 `csp_observation` and `resource_observation` are OBSERVED only when that collector
 is installed and its snapshot is available. Zero masks mean no recorded bit at
@@ -319,7 +340,19 @@ UNAVAILABLE when both sources are unavailable. The composite is not an atomic
 causal measurement. A checkpoint owns its environment evidence; later masks do
 not rewrite it. Cached/partial evidence cannot establish an ordinary stage or
 readiness. Nonzero masks do not cancel actual proved readiness or override a
-primary operation/control/financial/cleanup failure.
+primary operation/control/financial/cleanup failure. NONE/UNKNOWN and zero masks
+do not prove a healthy network.
+
+`observation_end` describes why observation ended independently of final `result`
+and cleanup/financial proofs: FORM_READY, SDK_TERMINAL, LOCAL_LIMIT, ABORTED,
+ACTIVE_DEADLINE, INSTRUMENTATION_UNAVAILABLE or BROWSER_OPERATION_FAILED.
+BROWSER_NOT_STARTED means the parent never called browser observation (for
+example, preparation failed). The first pending checkpoint uses OBSERVING;
+the final frame uses the actual end reason. LOCAL_LIMIT distinguishes the original
+60-second window from an opaque failed browser action/read. A later financial,
+active-deadline or closure failure can make `result` fail while retaining
+FORM_READY as the historical observation reason. No category extends a deadline,
+adds browser operations or grants a new launch authority.
 
 Node reads and resource callbacks stop at abort, the local limit, the original
 deadline or teardown. The CSP listener's private bounded bits can continue until

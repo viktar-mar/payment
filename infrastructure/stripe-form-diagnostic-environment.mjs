@@ -1,6 +1,8 @@
 const CSP_MASKS=['csp_enforced_mask','csp_report_only_mask'];
 const RESOURCE_MASKS=['resource_transport_failure_mask','resource_http_4xx_mask','resource_http_5xx_mask'];
-const KEYS=['csp_observation',...CSP_MASKS,'resource_observation',...RESOURCE_MASKS,'environment_freshness'];
+const KEYS=['csp_observation',...CSP_MASKS,'resource_observation',...RESOURCE_MASKS,'fetch_failure_destination','fetch_failure_code','environment_freshness'];
+const DESTINATIONS=['OWN_APP','STRIPE_API','STRIPE_JS','OTHER','UNKNOWN'];
+const CODES=['ABORTED','NAME_NOT_RESOLVED','CONNECTION_REFUSED','CONNECTION_RESET','TIMED_OUT','CERTIFICATE','BLOCKED_BY_CLIENT','GENERIC_FAILED','UNKNOWN'];
 
 /** Copy only exact, own enumerable scalar data; never invoke a payload getter. */
 export function validateFormEnvironmentEvidence(value) {
@@ -21,6 +23,12 @@ export function validateFormEnvironmentEvidence(value) {
       if(!['OBSERVED','UNAVAILABLE'].includes(copy[source+'_observation']))return null;
       if(copy[source+'_observation']==='UNAVAILABLE'&&masks.some(key=>copy[key]!==0))return null;
     }
+    const destination=copy.fetch_failure_destination,code=copy.fetch_failure_code;
+    if(copy.resource_observation==='UNAVAILABLE') {
+      if(destination!=='UNAVAILABLE'||code!=='UNAVAILABLE')return null;
+    } else if(copy.resource_transport_failure_mask&4) {
+      if(!DESTINATIONS.includes(destination)||!CODES.includes(code))return null;
+    } else if(destination!=='NONE'||code!=='NONE')return null;
     const missing=copy.csp_observation==='UNAVAILABLE'&&copy.resource_observation==='UNAVAILABLE';
     if(missing?copy.environment_freshness!=='UNAVAILABLE':!['SAMPLED','CACHED'].includes(copy.environment_freshness))return null;
     return Object.freeze(copy);
@@ -29,5 +37,5 @@ export function validateFormEnvironmentEvidence(value) {
 export function unavailableFormEnvironmentEvidence() {
   return Object.freeze({csp_observation:'UNAVAILABLE',csp_enforced_mask:0,csp_report_only_mask:0,
     resource_observation:'UNAVAILABLE',resource_transport_failure_mask:0,resource_http_4xx_mask:0,
-    resource_http_5xx_mask:0,environment_freshness:'UNAVAILABLE'});
+    resource_http_5xx_mask:0,fetch_failure_destination:'UNAVAILABLE',fetch_failure_code:'UNAVAILABLE',environment_freshness:'UNAVAILABLE'});
 }
