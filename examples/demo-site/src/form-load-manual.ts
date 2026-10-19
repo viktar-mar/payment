@@ -21,7 +21,7 @@ export function mountManualFormPage(root:HTMLElement,dependencies:ManualPageDepe
   const start=document.createElement('button');start.type='button';start.textContent='Загрузить форму';
   const status=document.createElement('p');status.setAttribute('role','status');status.setAttribute('aria-live','polite');
   const host=document.createElement('div');root.append(title,warning,start,status,host);
-  let started=false,closed=false,startTime=0,terminal=false,pendingSent=false,resumed=false,allowResume=false,ownedKey:string|undefined;
+  let started=false,closed=false,startTime=0,terminal=false,pendingSent=false,resumed=false,allowResume=false,widgetWasConnected=false,ownedKey:string|undefined;
   let widget:GenericPaymentWidget|undefined,observation:ReturnType<typeof armFormLoadDiagnostic>|undefined,changes:MutationObserver|undefined;
   let checkpoint:ReturnType<typeof setTimeout>|undefined,limit:ReturnType<typeof setTimeout>|undefined;
   let readiness:ReturnType<typeof createManualFormReadinessObserver>|undefined;
@@ -32,6 +32,12 @@ export function mountManualFormPage(root:HTMLElement,dependencies:ManualPageDepe
     if(ownedKey)try{sessionStorage.removeItem(ownedKey);}catch{/* Best-effort owned recovery disposal. */}
     start.removeEventListener('click',begin);window.removeEventListener('pagehide',onPageHide);dependencies.signal?.removeEventListener('abort',onAbort);
     widget?.removeEventListener('click',guard,true);
+  }
+  function lostOwnedWidget():boolean{
+    // The observer is intentionally armed before connection. Once connected,
+    // detachment revokes this generation, including callbacks before DOM delivery.
+    if(!widgetWasConnected||widget?.isConnected)return false;
+    close();return true;
   }
   function sample():Readonly<FormDiagnosticSample>|null{
     if(!widget?.isConnected||!observation||!widget.shadowRoot)return null;
@@ -65,7 +71,7 @@ export function mountManualFormPage(root:HTMLElement,dependencies:ManualPageDepe
     event.preventDefault();event.stopImmediatePropagation();
   }
   function inspect():void{
-    if(closed||!widget)return;if(now()-startTime>=60000){finish();return;}
+    if(closed||!widget||lostOwnedWidget())return;if(now()-startTime>=60000){finish();return;}
     if(!resumed){
       const resume=widget.shadowRoot?.querySelectorAll('button')[1];
       if(resume&&!resume.hidden&&!resume.disabled){resumed=true;allowResume=true;try{resume.click();}finally{allowResume=false;}}
@@ -83,7 +89,8 @@ export function mountManualFormPage(root:HTMLElement,dependencies:ManualPageDepe
   }
   async function begin():Promise<void>{
     if(started||closed)return;started=true;start.disabled=true;startTime=now();
-    readiness=createManualFormReadinessObserver({getWidget:()=>widget,isActive:()=>!closed&&!terminal&&now()-startTime<60000,
+    readiness=createManualFormReadinessObserver({getWidget:()=>widget,isActive:()=>!closed&&!lostOwnedWidget()&&!terminal
+      &&observation?.snapshot().binding!=='LOST'&&now()-startTime<60000,
       readinessSnapshot:()=>observation?.readinessSnapshot()});
     // The original local window starts before the first asynchronous handoff.
     checkpoint=setTimeout(()=>{if(now()-startTime>=60000){finish();return;}inspect();},15000);
@@ -107,7 +114,8 @@ export function mountManualFormPage(root:HTMLElement,dependencies:ManualPageDepe
       widget.apiBaseUrl=session.apiBaseUrl;widget.siteKey=session.siteKey;widget.priceKey=session.priceKey;widget.locale='en';
       observation=armFormLoadDiagnostic(widget);readiness.snapshot();widget.addEventListener('click',guard,true);
       changes=new MutationObserver(inspect);changes.observe(widget.shadowRoot!,{subtree:true,attributes:true,childList:true});
-      host.append(widget);inspect();
+      changes.observe(document,{subtree:true,childList:true});
+      host.append(widget);widgetWasConnected=widget.isConnected;inspect();
     }catch{if(!closed){status.textContent='Не удалось загрузить форму. Закройте эту вкладку.';close();}}
   }
   function onPageHide():void{close();}
