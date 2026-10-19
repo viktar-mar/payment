@@ -36,6 +36,16 @@ test('normal Playwright discovery excludes the offline manual snapshot browser r
   for(const file of files)assert.ok(normalPlaywright.testIgnore.some(pattern=>typeof pattern==='string'&&matchesGlob(
     'tests/support/'+file,pattern)),'offline_snapshot_is_node_only');
 });
+test('normal Playwright excludes the Node provider-mount regression without hiding ordinary journeys',()=>{
+  assert.ok(Array.isArray(normalPlaywright.testIgnore));
+  for(const [file,excluded] of [
+    ['tests/support/provider-mount-browser.test.ts',true],
+    ['tests/checkout.spec.ts',false],
+    ['tests/donations.spec.ts',false],
+    ['tests/subscriptions.spec.ts',false],
+  ] as const)assert.equal(normalPlaywright.testIgnore.some(pattern=>typeof pattern==='string'&&matchesGlob(file,pattern)),
+    excluded,'normal_playwright_discovery: '+file);
+});
 test('separate Playwright config has no auto browser, repetition or artifact capture',()=>{
   assert.equal(diagnosticPlaywright.testMatch,'form-load-diagnostic.spec.ts');
   assert.equal(diagnosticPlaywright.workers,1);assert.equal(diagnosticPlaywright.retries,0);
