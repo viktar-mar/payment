@@ -36,10 +36,12 @@ test('normal Playwright discovery excludes the offline manual snapshot browser r
   for(const file of files)assert.ok(normalPlaywright.testIgnore.some(pattern=>typeof pattern==='string'&&matchesGlob(
     'tests/support/'+file,pattern)),'offline_snapshot_is_node_only');
 });
-test('normal Playwright excludes the Node provider-mount regression without hiding ordinary journeys',()=>{
+test('normal Playwright excludes Node-only support regressions without hiding ordinary journeys or helpers',()=>{
   assert.ok(Array.isArray(normalPlaywright.testIgnore));
   for(const [file,excluded] of [
     ['tests/support/provider-mount-browser.test.ts',true],
+    ['tests/support/stripe-sandbox-fixtures.test.ts',true],
+    ['tests/support/stripe-sandbox-fixtures.ts',false],
     ['tests/checkout.spec.ts',false],
     ['tests/donations.spec.ts',false],
     ['tests/subscriptions.spec.ts',false],
