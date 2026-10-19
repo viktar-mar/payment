@@ -1,6 +1,6 @@
 # Безопасные категории FETCH/XHR и причина окончания наблюдения
 
-Статус: пользователь подтвердил офлайн-расширение диагностики с тестами и независимым review. Независимый builder-check: «nothing important left»; root проверил покрытие и интерфейсы плана. Этот addendum фиксирует инженерные решения для плана; перед реализацией ожидается review/подтверждение плана пользователем. Реализация и новый Sandbox-запуск ещё не выполнены. Baseline: `59c795fbed441240db0c1e566c8decc797c97e09`, существующая linked worktree и ветка `codex/stripe-sandbox-5a`. Primary `main` не меняется.
+Статус: это офлайн-дополнение реализовано по подтверждённому пользователем плану. Обе задачи выполнены отдельными субагентами; независимые review каждой задачи и финальное scoped review завершены без замечаний. Свежий итоговый gate: 221/221 тест, TypeScript `--noEmit` exit0, без fail/cancel/skip/stderr/warnings. Коммиты реализации: `22dce4f` и `09acae2`; execution baseline `27564f9` (code baseline `59c795f`). Sandbox/actual browser/API/CLI/OAuth/Docker не запускались; runtime acceptance и причина прежней загрузки остаются UNKNOWN. Linked worktree и ветка `codex/stripe-sandbox-5a` сохранены локально; primary `main` не меняется.
 
 ## Зачем и что не является диагнозом
 
