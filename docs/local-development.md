@@ -612,6 +612,15 @@ one unconfirmed Intent and at most one first Attempt. Zero Attempts can prove no
 confirmation but cannot prove form readiness. There is no automatic repeat, retry,
 reconciliation, refund, replacement port or reuse of an earlier fixture.
 
+The offline packaging regression is in
+`examples/demo-site/tests/support/form-load-manual-build.test.ts`. It stages the demo
+Dockerfile's build-stage COPY inputs with the current `.dockerignore`, links only
+already installed dependencies, rebuilds the staged SDK and runs real TypeScript/Vite
+checks for both build modes. It does not run Docker, install dependencies, start a
+server or contact Stripe; it proves the isolated source inputs, not an actual image
+build or form readiness. Only the five required public diagnostic module/declaration
+files are copied from `infrastructure`, never private local inputs or the whole folder.
+
 Only after that future approval, the exact command template from the repository root
 is below. Values are placeholders, not commands to execute now. Use a fresh UUID, the
 final reviewed commit SHA, the approved local Unix Docker daemon, six distinct approved
