@@ -7,6 +7,7 @@ import { CheckoutProviderView, checkoutPresentation } from './checkout-provider-
 import { subscribeCheckoutCustomer } from '../customer/session-lifecycle.js';
 import { createProviderMount, type OwnedProviderMount } from './provider-mount.js';
 import { registerFormLoadWidget, configureFormLoadWidget, disconnectFormLoadWidget, resumeFormLoadWidget, bindFormLoadDiagnostic, markFormLoad } from '../diagnostics/form-load-observer.js';
+import { registerManualPaymentWidget, configureManualPaymentWidget, invalidateManualPaymentWidget, bindManualPayment } from '../diagnostics/manual-payment-authorization.js';
 export type WidgetState = "idle" | "loading" | "ready" | "checking" | "processing" | "requires_action" | "succeeded" | "failed" | "unknown" | "expired";
 // Importing ESM in non-DOM build tooling does not evaluate a missing HTMLElement.
 const ElementBase = (typeof HTMLElement === "undefined" ? class {} : HTMLElement) as typeof HTMLElement;
@@ -43,6 +44,7 @@ export class GenericPaymentWidget extends ElementBase {
   constructor() {
     super();
     registerFormLoadWidget(this);
+    registerManualPaymentWidget(this);
     const root = this.attachShadow({ mode: "open" });
     const style = document.createElement("style"); style.textContent = widgetStyles;
     const section = document.createElement("section"); section.setAttribute("aria-label", "Payment checkout");
@@ -54,7 +56,7 @@ export class GenericPaymentWidget extends ElementBase {
     section.append(this.#status, this.#button, this.#resumeButton); root.append(style, section); this.#render();
   }
   connectedCallback(): void { this.#configure(false); }
-  disconnectedCallback(): void { disconnectFormLoadWidget(this); this.#generation++; this.#controller?.abort(); this.#cleanup(); this.#busy = false; this.#client = undefined; this.#session = undefined; }
+  disconnectedCallback(): void { disconnectFormLoadWidget(this); invalidateManualPaymentWidget(this); this.#generation++; this.#controller?.abort(); this.#cleanup(); this.#busy = false; this.#client = undefined; this.#session = undefined; }
   attributeChangedCallback(name: string, oldValue: string | null, newValue: string | null): void {
     if (oldValue !== newValue && this.isConnected) {
       if (name === "locale") { this.#render(); this.#presentation(); }
@@ -64,6 +66,7 @@ export class GenericPaymentWidget extends ElementBase {
   #current(generation: number): boolean { return generation === this.#generation && this.isConnected && !this.#controller?.signal.aborted; }
   #configure(reset: boolean): void {
     configureFormLoadWidget(this);
+    configureManualPaymentWidget(this);
     this.#generation++; this.#controller?.abort(); this.#cleanup(); this.#controller = new AbortController(); this.#busy = false; this.#session = undefined; this.#client = undefined;
     if (reset) this.#state = "idle";
     const generation = this.#generation;
@@ -89,6 +92,7 @@ export class GenericPaymentWidget extends ElementBase {
     this.#providerView?.destroy(); this.#providerMount?.destroy(); this.#providerReady = false;
     this.#providerMount = createProviderMount(this, this.#button, this.#session.providerType);
     const diagnostic = bindFormLoadDiagnostic(this, this.#providerMount.host, generation);
+    bindManualPayment(this, this.#providerMount.host, generation);
     this.#providerView = new CheckoutProviderView(this.#client!, this.#providerMount.host); this.#presentation();
     await this.#providerView.mount(this.#session, this.#controller!.signal);
     if (this.#current(generation)) { this.#providerReady = true; markFormLoad(diagnostic, 'widget_completed'); }

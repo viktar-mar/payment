@@ -1,5 +1,6 @@
 // Internal only. No SDK entry-point export, provider data, events, callbacks or I/O.
 import { ownedProviderHost } from '../widget/provider-mount.js';
+import { hasManualPaymentAuthorization } from './manual-payment-authorization.js';
 export interface FormLoadSnapshot {
   version: 1;
   binding: 'ARMED' | 'BOUND' | 'LOST' | 'CLOSED';
@@ -26,6 +27,7 @@ const loaderStarts = new WeakSet<FormLoadBinding>();
 let armed: FormLoadBinding | undefined;
 
 export function registerFormLoadWidget(widget: HTMLElement): void { known.add(widget); }
+export function hasFormLoadDiagnostic(widget: HTMLElement): boolean { return widgets.has(widget); }
 function lose(binding: FormLoadBinding): void {
   if (binding.state.binding === 'CLOSED' || binding.state.binding === 'LOST') return;
   binding.state.binding = 'LOST';
@@ -51,7 +53,7 @@ function current(binding: FormLoadBinding | undefined): binding is FormLoadBindi
   return binding.state.binding === 'BOUND';
 }
 export function armFormLoadDiagnostic(widget: HTMLElement): { snapshot(): Readonly<FormLoadSnapshot>; readinessSnapshot(): Readonly<{ loaderstart_seen: boolean }>; close(): void } {
-  if (!known.has(widget) || used.has(widget) || widget.isConnected || widgets.has(widget) || armed) throw new Error('INSTRUMENTATION_UNAVAILABLE');
+  if (!known.has(widget) || used.has(widget) || widget.isConnected || widgets.has(widget) || armed || hasManualPaymentAuthorization(widget)) throw new Error('INSTRUMENTATION_UNAVAILABLE');
   const binding: FormLoadBinding = { widget, state: {
     version: 1, binding: 'ARMED', capability_started: false, capability_ready: false,
     loader_started: false, loader_ready: false, element_created: false, mount_called: false,

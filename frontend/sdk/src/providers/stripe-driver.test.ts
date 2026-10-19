@@ -6,6 +6,10 @@ import { mountStripePayment } from './stripe-driver.js';
 import type { CheckoutState, ClientPaymentSession } from '../contracts.js';
 import { armFormLoadDiagnostic, bindFormLoadDiagnostic, registerFormLoadWidget } from '../diagnostics/form-load-observer.js';
 import { createProviderMount } from '../widget/provider-mount.js';
+import { GenericPaymentWidget, defineGenericPaymentWidget } from '../widget/generic-payment-widget.js';
+import { armManualPayment, bindManualPayment, consumeManualPaymentConfirmation } from '../diagnostics/manual-payment-authorization.js';
+
+defineGenericPaymentWidget();
 
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (reason: unknown) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 const secret = 'pi_fixture_secret_sensitive';
@@ -44,6 +48,64 @@ async function ready(f: ReturnType<typeof setup>) {
   f.emit('ready'); return pending;
 }
 beforeEach(() => { vi.mocked(loadStripeClient).mockReset(); });
+
+describe('internal manual confirmation dispatch', () => {
+  const cleanups: (() => void)[] = [];
+  afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
+  function manualSetup(authorize: () => Promise<true>) {
+    const f = setup(), widget = new GenericPaymentWidget();
+    const lease = armManualPayment(widget, { deadline: Date.now() + 60000, authorize });
+    document.body.append(widget);
+    const mount = createProviderMount(widget, widget.shadowRoot!.querySelector('button')!, 'STRIPE');
+    bindManualPayment(widget, mount.host, 1);
+    cleanups.push(() => { f.controller.abort(); lease.close(); mount.destroy(); widget.remove(); });
+    return { ...f, widget, lease, container: mount.host, options: { ...f.options, container: mount.host } };
+  }
+  // Break: consuming at a wrapper instead of the dispatch boundary lets direct handles bypass permission.
+  it('matches one pending authorization to one Stripe call despite concurrent and later handle confirmation', async () => {
+    const permission = deferred<true>(), authorize = vi.fn(() => permission.promise), f = manualSetup(authorize), handle = await ready(f);
+    const first = handle.confirm();
+    expect(f.stripe.confirmPayment).toHaveBeenCalledTimes(0); expect(f.refresh).not.toHaveBeenCalled();
+    await expect(handle.confirm()).rejects.toMatchObject({ code: 'PAYMENT_STATE_CONFLICT' });
+    expect(authorize).toHaveBeenCalledTimes(1); permission.resolve(true); await expect(first).resolves.toBe(state);
+    await expect(handle.confirm()).rejects.toMatchObject({ code: 'CONFIRMATION_BLOCKED' });
+    expect(f.stripe.confirmPayment).toHaveBeenCalledTimes(1); expect(f.refresh).toHaveBeenCalledTimes(1); expect(authorize).toHaveBeenCalledTimes(1);
+  });
+  // Break: authorization failures handled as provider outcomes trigger an unauthorized refresh or retry.
+  it('spends a rejected authorization without exposing its error, refreshing, or retrying', async () => {
+    const authorize = vi.fn(async (): Promise<true> => { throw new Error('private authorization sentinel'); }), f = manualSetup(authorize), handle = await ready(f);
+    const error = await handle.confirm().catch(error => error);
+    expect(error).toMatchObject({ code: 'CONFIRMATION_BLOCKED' }); expect(String(error)).not.toContain('sentinel'); expect(error.cause).toBeUndefined();
+    await expect(handle.confirm()).rejects.toMatchObject({ code: 'CONFIRMATION_BLOCKED' });
+    expect(authorize).toHaveBeenCalledTimes(1); expect(f.stripe.confirmPayment).toHaveBeenCalledTimes(0); expect(f.refresh).not.toHaveBeenCalled();
+  });
+  // Break: allowing the permit's continuation after provider teardown dispatches a stale captured handle.
+  it.each(['abort', 'destroy'])('denies a late grant after driver %s', async action => {
+    const permission = deferred<true>(), authorize = vi.fn(() => permission.promise), f = manualSetup(authorize), handle = await ready(f);
+    const pending = handle.confirm(); const result = pending.catch(error => error);
+    if (action === 'abort') f.controller.abort(); else handle.destroy();
+    permission.resolve(true); expect(await result).toMatchObject({ name: 'AbortError' });
+    expect(f.stripe.confirmPayment).toHaveBeenCalledTimes(0); expect(f.refresh).not.toHaveBeenCalled();
+  });
+  // Break: the cancellation race adds microtasks after consume's validation and before dispatch.
+  it.each(['close', 'host-reinsert', 'expired'])('rechecks %s in the continuation gap immediately before Stripe dispatch', async action => {
+    const permission = deferred<true>(), f = manualSetup(() => permission.promise), handle = await ready(f);
+    const result = handle.confirm().catch(error => error);
+    void permission.promise.then(() => queueMicrotask(() => {
+      if (action === 'close') f.lease.close();
+      if (action === 'host-reinsert') { f.container.remove(); f.widget.append(f.container); }
+      if (action === 'expired') vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60001);
+    }));
+    permission.resolve(true); const outcome = await result;
+    expect(f.stripe.confirmPayment).toHaveBeenCalledTimes(0); expect(f.refresh).not.toHaveBeenCalled();
+    expect(outcome).toMatchObject({ code: 'CONFIRMATION_BLOCKED' });
+  });
+  it('leaves an ordinary unarmed binding inert', async () => {
+    await expect(consumeManualPaymentConfirmation(undefined)).resolves.toBeUndefined();
+    const f = setup(), handle = await ready(f); await handle.confirm(); await handle.confirm();
+    expect(f.stripe.confirmPayment).toHaveBeenCalledTimes(2); handle.destroy();
+  });
+});
 
 describe('internal loaderstart observation', () => {
   const cleanups: (() => void)[] = [];

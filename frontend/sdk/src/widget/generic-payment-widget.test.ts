@@ -8,6 +8,7 @@ import { defineGenericPaymentWidget, GenericPaymentWidget } from "./generic-paym
 import { wire, readWire, json, token } from "../test/fixtures.js";
 import { loadStripeClient } from '../providers/stripe-loader.js';
 import * as sandboxDriver from '../../../../examples/demo-site/tests/support/stripe-sandbox-fixtures.ts';
+import { armManualPayment } from '../diagnostics/manual-payment-authorization.js';
 defineGenericPaymentWidget();
 function mount() { const el = document.createElement("generic-payment-widget") as GenericPaymentWidget; el.siteKey = "test-site"; el.priceKey = "lifetime"; el.apiBaseUrl = "https://api.test"; document.body.append(el); return el; }
 const button = (el: GenericPaymentWidget) => el.shadowRoot!.querySelector("button")!;
@@ -21,6 +22,23 @@ async function stripeReady(el: GenericPaymentWidget, p: ReturnType<typeof stripe
   button(el).click(); await vi.waitFor(() => expect(el.querySelector('iframe')).toBe(p.frame)); p.emit('ready'); await until(el, 'ready');
 }
 async function until(el: GenericPaymentWidget, state: string) { await vi.waitFor(() => expect(el.state).toBe(state)); }
+// Break: treating the initial recovery read/Resume as a rearm blocks the single manual payment flow.
+it('resumes the existing Catalog checkout under one manual lease and authorizes only the later Pay', async () => {
+  const p = stripeUiProvider(), requests = stripeApi('CREATED');
+  await createGenericPaymentClient({ apiBaseUrl: 'https://api.test' }).createCatalogCheckout({ siteKey: 'test-site', priceKey: 'lifetime' });
+  const el = new GenericPaymentWidget(); el.siteKey = 'test-site'; el.priceKey = 'lifetime'; el.apiBaseUrl = 'https://api.test';
+  const authorize = vi.fn(async () => true as const), lease = armManualPayment(el, { deadline: Date.now() + 60000, authorize });
+  try {
+    document.body.append(el); await until(el, 'checking'); const resume = el.shadowRoot!.querySelectorAll('button')[1]!;
+    await vi.waitFor(() => expect(resume).toBeEnabled()); resume.click();
+    await vi.waitFor(() => expect(el.querySelector('iframe')).toBe(p.frame));
+    expect(authorize).not.toHaveBeenCalled(); expect(p.stripe.confirmPayment).toHaveBeenCalledTimes(0);
+    p.emit('ready'); await until(el, 'ready'); button(el).click(); await until(el, 'checking');
+    expect(authorize).toHaveBeenCalledTimes(1); expect(p.stripe.confirmPayment).toHaveBeenCalledTimes(1);
+    expect(requests.map(request => request.method)).toEqual(['POST', 'GET', 'POST', 'GET']);
+    expect(requests.filter(request => request.url.endsWith('/sites/test-site/checkouts'))).toHaveLength(1);
+  } finally { lease.close(); el.remove(); }
+});
 // Break: probing text, capabilities or child-frame content leaks data; projecting the wrong local lifecycle hides the failing boundary.
 const observeForm = (el: Element) => (sandboxDriver as unknown as {observeSandboxPaymentForm?:(el:Element)=>unknown}).observeSandboxPaymentForm?.(el);
 it.each(['capability-pending','capability-rejected','loader-pending','loader-rejected','elements-throw','mount-throw','frame-pending','loaderror','ready'])('safe form observation characterizes resumed initialization %s without confirming or recreating',async stage=>{

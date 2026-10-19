@@ -5,6 +5,7 @@ import { PaymentSdkError } from '../errors.js';
 import { strictAppearance } from './stripe-appearance.js';
 import { loadStripeClient } from './stripe-loader.js';
 import { formLoadBinding, markFormLoad, markFormLoadLoaderStart, failFormLoad, denyFormLoadConfirmation } from '../diagnostics/form-load-observer.js';
+import { manualPaymentBinding, consumeManualPaymentConfirmation, assertManualPaymentConfirmation } from '../diagnostics/manual-payment-authorization.js';
 export interface StripePresentation { appearance: StripeElementsOptions['appearance']; locale?: 'en' | 'pt'; }
 export interface MountStripePaymentOptions extends StripePresentation {
   container: HTMLElement; capability: ClientPaymentSession; signal: AbortSignal;
@@ -33,6 +34,7 @@ const aborted = () => new DOMException('Aborted', 'AbortError');
 export async function mountStripePayment(options: MountStripePaymentOptions): Promise<StripePaymentHandle> {
   const { container, signal } = options;
   const diagnostic = formLoadBinding(container);
+  const manual = manualPaymentBinding(container);
   if (signal.aborted) throw aborted();
   const initialPresentation = presentation({ appearance: options.appearance, locale: options.locale });
   let capability: ClientPaymentSession | undefined = options.capability;
@@ -141,6 +143,9 @@ export async function mountStripePayment(options: MountStripePaymentOptions): Pr
       if (confirming) throw new PaymentSdkError('PAYMENT_STATE_CONFLICT');
       confirming = true;
       try {
+        if (manual) { await guarded(consumeManualPaymentConfirmation(manual)); checkActive(); }
+        // No await between this authority recheck and the sole provider dispatch.
+        assertManualPaymentConfirmation(manual);
         let category: 'none' | 'actionable' | 'unknown' = 'unknown';
         try {
           category = await guarded(stripe!.confirmPayment({
