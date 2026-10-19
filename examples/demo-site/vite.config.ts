@@ -31,13 +31,13 @@ function protectReturnRequests(server: ViteDevServer | PreviewServer): void {
 }
 
 export default defineConfig(({mode}):UserConfig=>({
-  resolve: mode==='form-diagnostic'?{alias:{'@generic-payments/sdk':fileURLToPath(new URL('../../frontend/sdk/src/index.ts',import.meta.url))}}:undefined,
+  resolve: ['form-diagnostic','manual-payment'].includes(mode)?{alias:{'@generic-payments/sdk':fileURLToPath(new URL('../../frontend/sdk/src/index.ts',import.meta.url))}}:undefined,
   plugins: [{
     name: 'private-payment-return-request',
     configureServer: protectReturnRequests,
     configurePreviewServer: protectReturnRequests,
   }],
-  build: { rollupOptions: { input: mode==='form-diagnostic'?{formDiagnostic:'form-load-diagnostic.html',formManual:'form-load-manual.html'}:{main:'index.html',paymentReturn:'payment-return.html'} } },
+  build: { manifest:mode==='manual-payment',rollupOptions: { input: mode==='manual-payment'?{manualPayment:'manual-payment.html'}:mode==='form-diagnostic'?{formDiagnostic:'form-load-diagnostic.html',formManual:'form-load-manual.html'}:{main:'index.html',paymentReturn:'payment-return.html'} } },
   server: {
     host: "127.0.0.1",
     port: 4173,

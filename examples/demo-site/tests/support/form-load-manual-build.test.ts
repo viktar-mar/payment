@@ -42,7 +42,7 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
     'frontend/sdk/package.json','frontend/sdk',
     'examples/demo-site/package.json','examples/demo-site/pnpm-lock.yaml',
     'examples/demo-site/index.html','examples/demo-site/payment-return.html',
-    'examples/demo-site/form-load-diagnostic.html','examples/demo-site/form-load-manual.html',
+    'examples/demo-site/form-load-diagnostic.html','examples/demo-site/form-load-manual.html','examples/demo-site/manual-payment.html',
     'examples/demo-site/tsconfig.json','examples/demo-site/vite.config.ts','examples/demo-site/src',
     ...publicInfrastructure.map(name=>'infrastructure/'+name),
   ]);
@@ -111,13 +111,17 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
     // Rebuild the copied SDK; demo package resolution must not fall back to a
     // stale SDK installation or source files outside the staged COPY tree.
     typecheck('frontend/sdk',['-p','tsconfig.json']);
-    for(const mode of ['form-diagnostic','production'])await t.test(mode,async()=>{
+    for(const mode of ['manual-payment','form-diagnostic','production'])await t.test(mode,async()=>{
       typecheck('examples/demo-site',['--noEmit']);
       assert.deepEqual((await readdir(join(directory,'infrastructure'))).sort(),[...publicInfrastructure].sort());
       const demo=join(directory,'examples/demo-site');
       await build({root:demo,configFile:join(demo,'vite.config.ts'),mode,logLevel:'silent'});
       const documents=await readdir(join(demo,'dist'));
-      if(mode==='form-diagnostic'){
+      if(mode==='manual-payment'){
+        assert.deepEqual(documents.sort(),['.vite','assets','manual-payment.html']);
+        const manifest=JSON.parse(await readFile(join(demo,'dist/.vite/manifest.json'),'utf8'));
+        assert.equal(manifest['manual-payment.html'].isEntry,true);
+      }else if(mode==='form-diagnostic'){
         assert.ok(documents.includes('form-load-manual.html'));assert.ok(documents.includes('form-load-diagnostic.html'));
         assert.equal(documents.includes('index.html'),false);
       }else{
