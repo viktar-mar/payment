@@ -24,8 +24,10 @@ function fake(sample=ready) {
     click:async()=>{events.push('resume');}};
   const handlers=new Map<string,Function>(),retained=new Map<string,Function>();
   const cspListeners:Function[]=[];
-  const realm=createContext({Date,location:{origin:handoff.endpoint},document:{addEventListener:(_name:string,fn:Function)=>cspListeners.push(fn)},sessionStorage:{setItem:()=>{}},__formLoadDiagnostic:{handshake:()=>true,snapshot:()=>sample}});
-  runInContext('globalThis.top=globalThis',realm);
+  const realm=createContext({Date,location:{origin:handoff.endpoint},document:{addEventListener:(_name:string,fn:Function)=>cspListeners.push(fn)},sessionStorage:{setItem:()=>{}},syntheticSample:sample});
+  // Preserve mutable host fixtures, but return same-realm records with their original descriptors intact.
+  runInContext(`globalThis.top=globalThis;globalThis.__formLoadDiagnostic={handshake(){return true},
+    snapshot(){return Object.defineProperties({},Object.getOwnPropertyDescriptors(syntheticSample))}}`,realm);
   const page={on:(name:string,fn:Function)=>{handlers.set(name,fn);retained.set(name,fn);return page;},off:(name:string)=>{handlers.delete(name);return page;},goto:async()=>{events.push('goto');},evaluate:async(fn:Function,arg?:unknown)=>structuredClone(runInContext('('+fn.toString()+')',realm)(arg)),
     locator:(selector:string)=>{assert.equal(selector,'generic-payment-widget');return {count:async()=>1,
       getByRole:(_role:string,query:{name:string;exact:boolean})=>{assert.deepEqual(query,{name:'Resume existing payment',exact:true});return locator;},
@@ -49,7 +51,7 @@ function throughParent(f:ReturnType<typeof fake>,original=limits()) {
 // Break: unavailable SDK bootstrap hides CSP evidence and starts a client session.
 for(const sdk of ['missing','throwing','accessor'] as const)test(`${sdk} SDK preserves enforced CSP script evidence in opaque wire2 without Resume`,async()=>{
   const f=fake();let reads=0;
-  if(sdk==='missing')delete f.realm.__formLoadDiagnostic;
+  if(sdk==='missing')runInContext('delete globalThis.__formLoadDiagnostic',f.realm);
   else if(sdk==='throwing')f.realm.__formLoadDiagnostic={handshake(){throw Symbol();}};
   else Object.defineProperty(f.realm,'__formLoadDiagnostic',{get(){reads++;throw Symbol();}});
   const goto=f.page.goto;
@@ -162,6 +164,35 @@ test('unexpected prototype-spelled stage key cannot disappear into a ready obser
   };
   const result=await throughParent(f);
   assert.equal(result.exitCode,1);assert.equal(result.frames[0]!.result,'INSTRUMENTATION_UNAVAILABLE');assert.equal(payReads,0);
+});
+// Break: getters/hidden keys disappear through normal evaluate cloning and manufacture readiness.
+for(const source of ['sample','csp'] as const)for(const kind of ['returning getter','throwing getter','prototype-spelled','hidden','symbol','nested','invalid domain'] as const)
+test(`normal serialized ${source} facade rejects ${kind} without Pay or false readiness`,async()=>{
+  const f=fake(),evaluate=f.page.evaluate;let payReads=0;
+  f.locator.count=async()=>{payReads++;return 1;};
+  const field=source==='sample'?'version':'csp_enforced_mask',scalar=source==='sample'?1:0;
+  const mutation=kind==='returning getter'?`Object.defineProperty(snapshot,'${field}',{enumerable:true,get(){getterReads++;return ${scalar}}})`
+    :kind==='throwing getter'?`Object.defineProperty(snapshot,'${field}',{enumerable:true,get(){getterReads++;throw poison}})`
+    :kind==='prototype-spelled'?`Object.defineProperty(snapshot,'__proto__',{enumerable:true,value:null})`
+    :kind==='hidden'?`Object.defineProperty(snapshot,'extra',{value:0})`
+    :kind==='symbol'?`snapshot[Symbol('extra')]=0`
+    :kind==='nested'?`snapshot.${field}={get valueOf(){forbiddenReads++;throw poison},get toJSON(){forbiddenReads++;throw poison}}`
+    :`snapshot.${field}=Infinity`;
+  runInContext(`globalThis.getterReads=0;globalThis.forbiddenReads=0;globalThis.calls=0;
+    globalThis.poison={get message(){forbiddenReads++;throw 1}};
+    globalThis.snapshot=${JSON.stringify(source==='sample'?ready:composite(null).csp)};${mutation};
+    ${source==='sample'?`__formLoadDiagnostic.snapshot=()=>snapshot`:
+      `globalThis.__formDiagnosticCsp={snapshot(){return ++calls===1?{csp_observation:'OBSERVED',csp_enforced_mask:0,csp_report_only_mask:0}:snapshot}}`}`,f.realm);
+  const transferred:unknown[]=[];
+  // Observe the normal evaluate result; malformed records enter only through the VM facade methods.
+  f.page.evaluate=async(fn:Function,arg?:unknown)=>{const value=await evaluate(fn,arg);transferred.push(value);return value;};
+  const result=await throughParent(f),frame=result.frames[0]!;
+  assert.equal(runInContext('getterReads',f.realm),0);assert.equal(runInContext('forbiddenReads',f.realm),0);
+  assert.equal(result.exitCode,1);assert.equal(frame.result,'INSTRUMENTATION_UNAVAILABLE');
+  assert.equal(frame.environment_freshness,'CACHED');assert.equal(frame.csp_observation,'OBSERVED');
+  assert.equal(frame.resource_observation,'OBSERVED');assert.equal(Object.hasOwn(frame,'bucket'),false);assert.equal(payReads,0);
+  assert.deepEqual(transferred[1],{handshake:true,sample:source==='sample'?null:ready,
+    csp:source==='csp'?null:composite(null).csp});
 });
 // Break caught: browser shutdown invalidates otherwise successful deferred context work.
 // Playwright context.close yields before its channel close; browser shutdown can

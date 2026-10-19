@@ -11,6 +11,10 @@ const cspZero={csp_observation:'OBSERVED',csp_enforced_mask:0,csp_report_only_ma
 const cspUnavailable={csp_observation:'UNAVAILABLE',csp_enforced_mask:0,csp_report_only_mask:0};
 const resourceZero={resource_observation:'OBSERVED',resource_transport_failure_mask:0,resource_http_4xx_mask:0,resource_http_5xx_mask:0};
 const resourceUnavailable={resource_observation:'UNAVAILABLE',resource_transport_failure_mask:0,resource_http_4xx_mask:0,resource_http_5xx_mask:0};
+const sdkSample={version:1,binding:'BOUND',capability_started:true,capability_ready:true,loader_started:true,loader_ready:true,
+  element_created:true,mount_called:true,mount_returned:true,ready_seen:true,loaderror_seen:false,view_completed:true,
+  widget_completed:true,confirmation_blocked:false,catchup:'NOT_STARTED',operation:'COMPLETED',
+  widget_state:'ready',element_state:'FRAME',pay_state:'ENABLED'};
 // Synthetic external boundary only; actual serialized production functions execute.
 function realm(options:{origin?:string;top?:boolean;now?:number;installThrows?:boolean}={}) {
   let callback:Callback|undefined,registrations=0,now=options.now??100;
@@ -108,24 +112,75 @@ test('CSP keeps its original deadline and late private events cannot mutate save
 });
 // Break caught: shared catch/accessor reads hide the independent facade or includeForm=false calls SDK snapshot.
 test('serialized page reader guards facade data descriptors independently',()=>{
-  const r=realm();r.install();vm.runInContext(`globalThis.snapshotCalls=0;globalThis.__formLoadDiagnostic={handshake(){return true},snapshot(){snapshotCalls++;return {stage:1}}}`,r.context);
+  const r=realm();r.install();vm.runInContext(`globalThis.snapshotCalls=0;globalThis.__formLoadDiagnostic={handshake(){return true},snapshot(){snapshotCalls++;return ${JSON.stringify(sdkSample)}}}`,r.context);
   assert.equal(r.read(false).handshake,true);assert.equal(r.read(false).sample,null);assert.equal(vm.runInContext('snapshotCalls',r.context),0);
-  assert.deepEqual(JSON.parse(JSON.stringify(r.read())),{handshake:true,sample:{stage:1},csp:cspZero});
+  assert.deepEqual(JSON.parse(JSON.stringify(r.read())),{handshake:true,sample:sdkSample,csp:cspZero});
   vm.runInContext(`__formLoadDiagnostic.handshake=()=>{throw {get message(){throw 1}}}`,r.context);
-  assert.deepEqual(JSON.parse(JSON.stringify(r.read())),{handshake:false,sample:{stage:1},csp:cspZero});
+  assert.deepEqual(JSON.parse(JSON.stringify(r.read())),{handshake:false,sample:sdkSample,csp:cspZero});
   vm.runInContext(`__formLoadDiagnostic.snapshot=()=>{throw {get message(){throw 1}}}`,r.context);
   assert.deepEqual(JSON.parse(JSON.stringify(r.read())),{handshake:false,sample:null,csp:cspZero});
   for(const property of ['__formLoadDiagnostic','__formDiagnosticCsp']) {
-    const isolated=realm();vm.runInContext(`globalThis.getterCalls=0;Object.defineProperty(globalThis,'${property}',{get(){getterCalls++;throw 1}});globalThis.${property==='__formLoadDiagnostic'?'__formDiagnosticCsp':'__formLoadDiagnostic'}=${property==='__formLoadDiagnostic'?'{snapshot(){return {csp:1}}}':'{handshake(){return true},snapshot(){return {stage:1}}}'}`,isolated.context);
+    const isolated=realm();vm.runInContext(`globalThis.getterCalls=0;Object.defineProperty(globalThis,'${property}',{get(){getterCalls++;throw 1}});globalThis.${property==='__formLoadDiagnostic'?'__formDiagnosticCsp':'__formLoadDiagnostic'}=${property==='__formLoadDiagnostic'?`{snapshot(){return ${JSON.stringify(cspZero)}}}`:`{handshake(){return true},snapshot(){return ${JSON.stringify(sdkSample)}}}`}`,isolated.context);
     const read=isolated.read();assert.equal(vm.runInContext('getterCalls',isolated.context),0);
-    if(property==='__formLoadDiagnostic')assert.deepEqual(JSON.parse(JSON.stringify(read)),{handshake:false,sample:null,csp:{csp:1}});
-    else assert.deepEqual(JSON.parse(JSON.stringify(read)),{handshake:true,sample:{stage:1},csp:null});
+    if(property==='__formLoadDiagnostic')assert.deepEqual(JSON.parse(JSON.stringify(read)),{handshake:false,sample:null,csp:cspZero});
+    else assert.deepEqual(JSON.parse(JSON.stringify(read)),{handshake:true,sample:sdkSample,csp:null});
   }
   const getters=realm();vm.runInContext(`globalThis.getterCalls=0;globalThis.__formLoadDiagnostic={get handshake(){getterCalls++;throw 1},get snapshot(){getterCalls++;throw 1}};globalThis.__formDiagnosticCsp={get snapshot(){getterCalls++;throw 1}}`,getters.context);
   assert.deepEqual(JSON.parse(JSON.stringify(getters.read())),{handshake:false,sample:null,csp:null});assert.equal(vm.runInContext('getterCalls',getters.context),0);
   const missing=realm();assert.deepEqual(JSON.parse(JSON.stringify(missing.read())),{handshake:false,sample:null,csp:null});
-  const throwingCsp=realm();vm.runInContext(`globalThis.__formLoadDiagnostic={handshake(){return true},snapshot(){return {stage:1}}};globalThis.__formDiagnosticCsp={snapshot(){throw {get message(){throw 1}}}}`,throwingCsp.context);
-  assert.deepEqual(JSON.parse(JSON.stringify(throwingCsp.read())),{handshake:true,sample:{stage:1},csp:null});
+  const throwingCsp=realm();vm.runInContext(`globalThis.__formLoadDiagnostic={handshake(){return true},snapshot(){return ${JSON.stringify(sdkSample)}}};globalThis.__formDiagnosticCsp={snapshot(){throw {get message(){throw 1}}}}`,throwingCsp.context);
+  assert.deepEqual(JSON.parse(JSON.stringify(throwingCsp.read())),{handshake:true,sample:sdkSample,csp:null});
+});
+// Break caught: external cloning executes getters or erases malformed snapshot keys before rejection.
+for(const source of ['sample','csp'] as const) {
+  const field=source==='sample'?'version':'csp_enforced_mask',scalar=source==='sample'?1:0;
+  const mutations=[
+    ['returning getter',`Object.defineProperty(snapshot,'${field}',{enumerable:true,get(){getterReads++;return ${scalar}}})`],
+    ['throwing getter',`Object.defineProperty(snapshot,'${field}',{enumerable:true,get(){getterReads++;throw poison}})`],
+    ['prototype-spelled key',`Object.defineProperty(snapshot,'__proto__',{enumerable:true,value:null})`],
+    ['hidden key',`Object.defineProperty(snapshot,'extra',{value:0})`],
+    ['symbol key',`snapshot[Symbol('extra')]=0`],
+    ['hidden allowed field',`Object.defineProperty(snapshot,'${field}',{enumerable:false})`],
+    ['nested field',`snapshot.${field}={get toJSON(){forbiddenReads++;throw poison},get valueOf(){forbiddenReads++;throw poison}}`],
+    ['toJSON key',`Object.defineProperty(snapshot,'toJSON',{enumerable:true,get(){forbiddenReads++;throw poison}})`],
+    ['missing field',`delete snapshot.${field}`],
+    ['non-record prototype',`Object.setPrototypeOf(snapshot,{})`],
+    ...['NaN','Infinity','-1','0.5','16',"'1'",'null','undefined','true'].map(value=>[`invalid ${value}`,`snapshot.${field}=${value}`]),
+    ...(source==='sample'?[
+      ['invalid flag',`snapshot.ready_seen=1`],['invalid binding',`snapshot.binding='UNKNOWN'`],
+      ['invalid catchup',`snapshot.catchup='UNKNOWN'`],['invalid operation',`snapshot.operation='UNKNOWN'`],
+      ['invalid widget state',`snapshot.widget_state='UNKNOWN'`],['invalid element state',`snapshot.element_state='UNKNOWN'`],
+      ['invalid pay state',`snapshot.pay_state='UNKNOWN'`],['Node-only bucket',`snapshot.bucket='BEFORE_15S'`],
+      ['Node-only Pay',`snapshot.pay_visible=true`],
+    ]:[['invalid observation',`snapshot.csp_observation='UNKNOWN'`],
+      ['unavailable nonzero masks',`snapshot.csp_observation='UNAVAILABLE';snapshot.csp_enforced_mask=1`],
+      ['invalid report mask',`snapshot.csp_report_only_mask=16`]]),
+  ];
+  for(const [name,mutation] of mutations)test(`serialized reader rejects ${source} ${name} before cloning and preserves independent source`,()=>{
+    const r=realm();vm.runInContext(`globalThis.getterReads=0;globalThis.forbiddenReads=0;
+      globalThis.poison={get message(){forbiddenReads++;throw 1}};
+      globalThis.goodSample=${JSON.stringify(sdkSample)};globalThis.goodCsp=${JSON.stringify(cspZero)};
+      globalThis.snapshot=${source==='sample'?'goodSample':'goodCsp'};${mutation};
+      globalThis.__formLoadDiagnostic={handshake(){return true},snapshot(){return goodSample}};
+      globalThis.__formDiagnosticCsp={snapshot(){return goodCsp}}`,r.context);
+    let result:unknown='CLONE_FAILED';
+    try {result=structuredClone(r.read());}catch { /* Never hand an opaque thrown fixture to test-runner formatting. */ }
+    assert.equal(vm.runInContext('getterReads',r.context),0);
+    assert.equal(vm.runInContext('forbiddenReads',r.context),0);
+    assert.deepEqual(result,{handshake:true,sample:source==='sample'?null:sdkSample,csp:source==='csp'?null:cspZero});
+  });
+}
+// Break caught: accepted records retain source identity or reject genuine null-prototype scalar snapshots.
+for(const nullPrototype of [false,true])test(`serialized reader copies finite ${nullPrototype?'null-prototype':'plain'} records before cloning`,()=>{
+  const r=realm();vm.runInContext(`globalThis.sample=${JSON.stringify(sdkSample)};globalThis.csp=${JSON.stringify(cspZero)};
+    ${nullPrototype?'Object.setPrototypeOf(sample,null);Object.setPrototypeOf(csp,null);':''}
+    globalThis.__formLoadDiagnostic={handshake(){return true},snapshot(){return sample}};
+    globalThis.__formDiagnosticCsp={snapshot(){return csp}}`,r.context);
+  const raw=r.read(),cloned=structuredClone(raw);
+  assert.notEqual(raw.sample,vm.runInContext('sample',r.context));assert.notEqual(raw.csp,vm.runInContext('csp',r.context));
+  assert.ok(Object.isFrozen(raw.sample));assert.ok(Object.isFrozen(raw.csp));
+  vm.runInContext(`sample.ready_seen=false;csp.csp_enforced_mask=15`,r.context);
+  assert.deepEqual(structuredClone(raw),{handshake:true,sample:sdkSample,csp:cspZero});assert.deepEqual(cloned,structuredClone(raw));
 });
 // Break caught: wrong resource mapping or HTTP errors confused with transport failures.
 test('resource observer accumulates literal masks with only synchronous allowed reads',()=>{

@@ -45,10 +45,40 @@ export function readDiagnosticPageEvidence(includeForm:boolean):unknown {
         ?descriptor.value.call(api)??null:null;
     } catch {return null;}
   }
+  // Validate before Playwright can read accessors or discard hidden/symbol keys.
+  // Only the page snapshot shape is accepted; Node owns Pay visibility/bucket.
+  function snapshot(value:unknown,domains:Record<string,readonly unknown[]>):Readonly<Record<string,unknown>>|null {
+    try {
+      if(value===null||typeof value!=='object')return null;
+      const prototype=Object.getPrototypeOf(value);
+      if(prototype!==Object.prototype&&prototype!==null)return null;
+      const descriptors=Object.getOwnPropertyDescriptors(value),names=Reflect.ownKeys(descriptors),keys=Object.keys(domains);
+      if(names.length!==keys.length||names.some(key=>typeof key!=='string'||!Object.hasOwn(domains,key)))return null;
+      const copy:Record<string,unknown>=Object.create(null);
+      for(const key of keys) {
+        const descriptor=descriptors[key];
+        if(!descriptor||!Object.hasOwn(descriptor,'value')||!descriptor.enumerable||!domains[key]!.includes(descriptor.value))return null;
+        copy[key]=descriptor.value;
+      }
+      return Object.freeze(copy);
+    } catch {return null;}
+  }
+  const sampleDomains:Record<string,readonly unknown[]>={
+    version:[1],binding:['ARMED','BOUND','LOST','CLOSED'],
+    catchup:['NOT_STARTED','PENDING','RESOLVED','REJECTED','ABORTED'],operation:['PENDING','COMPLETED','FAILED','ABORTED'],
+    widget_state:['idle','loading','ready','checking','processing','requires_action','succeeded','failed','unknown','expired','UNAVAILABLE'],
+    element_state:['UNAVAILABLE','NO_HOST','EMPTY','FRAME'],pay_state:['UNAVAILABLE','ABSENT','HIDDEN','DISABLED','ENABLED'],
+  };
+  for(const key of ['capability_started','capability_ready','loader_started','loader_ready','element_created',
+    'mount_called','mount_returned','ready_seen','loaderror_seen','view_completed','widget_completed','confirmation_blocked'])sampleDomains[key]=[false,true];
   const sdk=facade('__formLoadDiagnostic');
   const handshake=invoke(sdk,'handshake')===true;
-  const sample=includeForm?invoke(sdk,'snapshot'):null;
-  const csp=invoke(facade('__formDiagnosticCsp'),'snapshot');
+  const sample=includeForm?snapshot(invoke(sdk,'snapshot'),sampleDomains):null;
+  const masks=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15];
+  let csp=snapshot(invoke(facade('__formDiagnosticCsp'),'snapshot'),{
+    csp_observation:['OBSERVED','UNAVAILABLE'],csp_enforced_mask:masks,csp_report_only_mask:masks,
+  });
+  if(csp?.csp_observation==='UNAVAILABLE'&&(csp.csp_enforced_mask!==0||csp.csp_report_only_mask!==0))csp=null;
   return {handshake,sample,csp};
 }
 
