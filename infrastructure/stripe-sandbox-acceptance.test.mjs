@@ -18,7 +18,7 @@ syncBuiltinESMExports();after(()=>{mock.restoreAll();syncBuiltinESMExports();});
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const RUN='11111111-2222-4333-8444-555555555555';
 const ENV={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_OWNED_RUN:'true'};
-for(const flag of ['PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY','PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC'])
+for(const flag of ['PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT','PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY','PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC'])
 test('full acceptance rejects mixed '+flag+' before dependency or limits access',async()=>{
   let touched=0;const trap=new Proxy({},{get(){touched++;throw null;}});
   await assert.rejects(openOwnedSandboxAcceptance({env:{...ENV,[flag]:'true'}},trap,trap),{message:'stripe_sandbox_acceptance_OPT_IN_REQUIRED'});

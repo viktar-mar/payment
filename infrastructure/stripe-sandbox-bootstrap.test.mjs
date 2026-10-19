@@ -36,7 +36,42 @@ const SERVICES=['postgres','mailpit','backend','demo-site','callback-receiver'];
 const SECRET='whsec_A00112233445566778899';
 const USERBYTES='# private synthetic test input\r\nPAYMENT_STRIPE_SANDBOX_SECRET_KEY=sk_test_A00112233445566778899\r\nPAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY="pk_test_B00112233445566778899"\r\nPAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET=\r\n';
 const LIMIT=()=>({deadline:Date.now()+120000});
+test('manual payment named factory builds separate assets and still requires verified listener',async()=>{
+  assert.equal(typeof bootstrapModule.createOwnedManualPaymentBootstrap,'function');const f=fixture();
+  f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT='true';f.options.manualPort=18083;delete f.options.approvedBinding;
+  const b=await bootstrapModule.createOwnedManualPaymentBootstrap(f.options,f.dependencies),limits=LIMIT();
+  assert.equal(b.withProviderCredentials,undefined);await b.prepare(limits);assert.equal(b.resources().mode,'MANUAL_PAYMENT');assert.equal(b.resources().webhookReady,false);
+  const build=f.events.find(e=>e.type==='process'&&e.args.includes('build')&&e.args.includes('--quiet'));assert.ok(build.args.includes('PAYMENT_DEMO_BUILD_MODE=manual-payment'));
+  await assert.rejects(b.start(limits));assert.equal(b.resources().webhookReady,false);
+});
 const turn=()=>new Promise(resolveTurn=>setImmediate(resolveTurn));
+async function manualPaymentPrepared(){const f=fixture();f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT='true';f.options.manualPort=18083;delete f.options.approvedBinding;
+  const execute=f.dependencies.execute;f.dependencies.execute=async(file,args,settings)=>{const result=await execute(file,args,settings);if(f.unknownBackendCreate&&args.includes('up')&&args.at(-1)==='backend')throw null;if(f.foreignBackendName&&args.some(a=>a.startsWith('name=^/')))return {stdout:id(999),stderr:''};return result;};
+  f.adapter=await bootstrapModule.createOwnedManualPaymentBootstrap(f.options,f.dependencies);f.limits=LIMIT();await f.adapter.prepare(f.limits);return f;}
+test('manual backend is absent until durable listener configuration then created once with no removal',async()=>{
+  const f=await manualPaymentPrepared();assert.equal(f.adapter.resources().containers.backend,undefined);assert.equal(await f.adapter.verifyForwardTarget(),true);
+  await f.adapter.persistWebhookSecret(SECRET);assert.equal(f.adapter.resources().containers.backend,undefined);assert.equal(await f.adapter.start(f.limits),true);
+  const before=f.adapter.resources();assert.equal(before.status,'LIVE');assert.equal(before.webhookReady,true);assert.ok(before.containers.backend);
+  await f.adapter.stop({deadline:f.limits.deadline+120000});assert.equal(f.containers.has(before.containers.backend.id),true);
+  assert.equal(f.events.filter(stoppedCompose).filter(e=>e.args.slice(e.args.indexOf('up')).includes('backend')).length,1);
+  assert.equal(f.events.some(e=>e.type==='process'&&e.args.includes('rm')),false);
+});
+test('manual backend final private store substitution refuses creation or retry',async()=>{
+  const f=await manualPaymentPrepared();await f.adapter.persistWebhookSecret(SECRET);
+  f.files.get(DIR+'/final.env').mode=0o100644;await assert.rejects(f.adapter.start(f.limits));const after=f.events.length;await assert.rejects(f.adapter.start(f.limits));assert.equal(f.events.length,after);assert.equal(f.adapter.resources().containers.backend,undefined);
+});
+test('manual backend unknown creation retains original dispatch and refuses retry or adoption',async()=>{
+  const f=await manualPaymentPrepared();await f.adapter.persistWebhookSecret(SECRET);f.unknownBackendCreate=true;
+  await assert.rejects(f.adapter.start(f.limits));assert.equal(f.adapter.resources().containers.backend,undefined);const n=f.events.length;await assert.rejects(f.adapter.start(f.limits));assert.equal(f.events.length,n);
+  const ledger=JSON.parse(f.files.get(DIR+'/runtime.json').contents);assert.equal(ledger.intents.at(-1).action,'CREATE_FINAL_BACKEND');assert.equal(ledger.intents.at(-1).status,'DISPATCHING');
+  await assert.rejects(f.adapter.stop({deadline:f.limits.deadline+120000}));assert.ok([...f.containers.values()].some(c=>c.Name==='/'+PROJECT+'-backend'));assert.equal(f.events.some(e=>e.type==='process'&&e.args.includes('rm')),false);
+});
+test('manual forwarding refuses a foreign planned backend name before listener authority',async()=>{const f=await manualPaymentPrepared();f.foreignBackendName=true;await assert.rejects(f.adapter.verifyForwardTarget());assert.equal(f.adapter.resources().containers.backend,undefined);
+});
+test('manual bootstrap cannot renew active authority after preparation',async()=>{
+  const f=await manualPaymentPrepared();await f.adapter.persistWebhookSecret(SECRET);await assert.rejects(f.adapter.start({deadline:f.limits.deadline+1}));assert.equal(f.adapter.resources().containers.backend,undefined);
+});
+test('manual ownership verification accepts a clipped request budget inside original authority',async()=>{const f=await manualPaymentPrepared();await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(f.limits);assert.equal(await f.adapter.verify({deadline:Date.now()+10000}),true);await f.adapter.stop({deadline:f.limits.deadline+120000});});
 const rejects=(promise,code)=>assert.rejects(promise,{message:'stripe_sandbox_bootstrap_'+code});
 const id=n=>n.toString(16).padStart(64,'0');
 const image=n=>'sha256:'+id(n);
@@ -110,7 +145,7 @@ function fixture(overrides={}) {
         if(action!==-1) {
           const envFile=a[a.indexOf('--env-file')+1];
           assert.ok([DIR+'/app.env',DIR+'/final.env'].includes(envFile),'stopped Compose environment must be selected explicitly');
-          const services=envFile===DIR+'/app.env'||options.env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'?['postgres','mailpit','backend','demo-site','callback-receiver']:['backend'];
+          const services=envFile===DIR+'/app.env'?SERVICES.filter(s=>options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true'||s!=='backend'):options.env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'?SERVICES:['backend'];
           assert.deepEqual(a.slice(action),['up','--no-start','--no-deps','--no-build','--pull','never',...services],
             'stopped Compose contract requires supported up, no start, no dependencies, no build, no pull and exact services');
           for(const service of services)container(service);
@@ -139,7 +174,7 @@ function fixture(overrides={}) {
       } else if(verb==='container'&&sub==='wait')stdout='0';
       else if(verb==='container'&&sub==='stop') {const value=containers.get(a.at(-1));assert.ok(value);value.State.Running=false;value.State.Status='exited';}
       else if(verb==='container'&&sub==='rm') {assert.equal(a.length,3);assert.ok(containers.delete(a.at(-1)));stdout=a.at(-1);}
-      else if(verb==='ps'&&a.includes('--filter'))stdout=[...containers.values()].map(c=>c.Id).join('\n');
+      else if(verb==='ps'&&a.includes('--filter')){const filter=a[a.indexOf('--filter')+1];stdout=[...containers.values()].filter(c=>!filter.startsWith('name=')||c.Name==='/'+PROJECT+'-backend').map(c=>c.Id).join('\n');}
       return {stdout,stderr:''};
     },
   };

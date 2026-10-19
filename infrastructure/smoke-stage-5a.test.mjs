@@ -11,6 +11,7 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {fileURLToPath} from 'node:url';
 const flags={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'};
+test('smoke rejects new payment authority before fixture/private getters',async()=>{let touched=0;await assert.rejects(runStripeSandboxSmoke({env:{...flags,PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT:'true'},get statePath(){touched++;throw null;}}));assert.equal(touched,0);});
 
 async function fixture(t,{alter,redirect=false,oversize=false,never=false,accountPatch={},slowBody=false,lostRefundReply=false}={}) {
   const directory=await mkdtemp(join(tmpdir(),'task16-smoke-'));

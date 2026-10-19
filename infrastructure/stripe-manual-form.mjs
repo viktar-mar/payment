@@ -5,7 +5,7 @@ import {validateManualFormReport,formatManualFormReport} from './stripe-manual-f
 const EMPTY=Object.freeze({version:2,mode:'MANUAL_FORM_DIAGNOSTIC',observation:'NOT_STARTED',end:'FAILED',sample:null,evidence:null,
   no_confirmation:false,gateway_closed:false,runtime_closed:false,browser_closure:'NOT_OWNED',provenance:'BROWSER_REPORTED'});
 const failed=()=>Object.freeze({report:EMPTY,exitCode:1});
-const FLAGS=['PAYMENT_STRIPE_SANDBOX_ENABLED','PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY',
+const FLAGS=['PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT','PAYMENT_STRIPE_SANDBOX_ENABLED','PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY',
   'PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_FULL_RUN','PAYMENT_STRIPE_SANDBOX_OWNED_RUN','PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS',
   'DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE'];
 const PORTS=['backend','demo','receiver','postgres','mailpitHttp','mailpitSmtp'];

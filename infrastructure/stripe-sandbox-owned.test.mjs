@@ -11,6 +11,12 @@ const flags={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_
 const ports={backend:56121,demo:56122,receiver:56123,postgres:56124,mailpitHttp:56125,mailpitSmtp:56126};
 const manualFlags={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};
 const manualOptions=()=>options({env:{...manualFlags},manualPort:56127});
+test('manual payment preflight requires original source, daemon and all seven available ports',async()=>{
+  assert.equal(typeof owned.preflightOwnedManualPayment,'function');const input=options({env:{...flags,PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT:'true'},manualPort:56127});
+  const good=fixture();safe(await owned.preflightOwnedManualPayment(input,good.dependencies),{status:'READY'});assert.equal(good.calls.filter(c=>c.type==='port').length,7);
+  for(const config of [{status:' M tracked\n'},{head:'b'.repeat(40)},{canonical:'/other.sock'}]){const f=fixture(config);assert.equal((await owned.preflightOwnedManualPayment(input,f.dependencies)).status,'PENDING');}
+  const f=fixture();f.dependencies.portAvailable=async port=>port!==56127;safe(await owned.preflightOwnedManualPayment(input,f.dependencies),pending('PORTS','PORT_UNAVAILABLE'));
+});
 function options(patch={}) {return {runId:'11111111-1111-4111-8111-111111111111',expectedSource:source,daemon,env:{...flags},ports:{...ports},...patch};}
 function fixture({head=source+'\n',status='',docker='"linux"\n',metadata={},canonical='/tmp/owned-docker.sock',executeError,portResult=true}={}) {
   const calls=[];

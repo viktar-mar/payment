@@ -17,7 +17,7 @@ const check=(value,code='CONFIGURATION')=>{if(!value)fail(code);};
 const exact=(v,keys)=>v&&typeof v==='object'&&!Array.isArray(v)&&Object.keys(v).sort().join(',')===[...keys].sort().join(',');
 const safeCredential=v=>typeof v==='string'&&v.length>0&&v.length<=512&&!/[\r\n\x00-\x1f\x7f]|(?:sk|rk|pk)_live_/.test(v);
 function guard(env) {
-  check(env.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true','OPT_IN_REQUIRED');
+  check(env.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true','OPT_IN_REQUIRED');
   check(!env.DEBUG&&!env.NODE_DEBUG&&(!env.PWDEBUG||env.PWDEBUG==='0'),'DEBUG_DISABLED_REQUIRED');
 }
 function endpoint(value) {

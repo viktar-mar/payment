@@ -1,0 +1,148 @@
+import test,{after,mock} from 'node:test';
+import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import net from 'node:net';
+import filesystem from 'node:fs/promises';
+import {syncBuiltinESMExports} from 'node:module';
+import {constants} from 'node:fs';
+import {dirname,resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {createOwnedSandboxProvisioner} from './stripe-sandbox-provision.mjs';
+const diagnosticModule=await import('./stripe-form-diagnostic-provision.mjs').catch(()=>({}));
+const forbidden=()=>{throw new Error('synthetic_test_forbids_external_boundary');};
+mock.method(childProcess,'execFile',forbidden);mock.method(childProcess,'spawn',forbidden);
+mock.method(net,'createServer',forbidden);mock.method(globalThis,'fetch',forbidden);
+const actualOpen=filesystem.open,actualReadFile=filesystem.readFile;
+mock.method(filesystem,'open',(path,...args)=>String(path).endsWith('/infrastructure/stripe-sandbox.env.local')?forbidden():actualOpen(path,...args));
+mock.method(filesystem,'readFile',(path,...args)=>String(path).endsWith('/infrastructure/stripe-sandbox.env.local')?forbidden():actualReadFile(path,...args));
+syncBuiltinESMExports();after(()=>{mock.restoreAll();syncBuiltinESMExports();});
+
+const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
+const RUN='11111111-2222-4333-8444-555555555555',SUFFIX='11111111222243338444555555555555';
+const DIR=ROOT+'/test-results/stripe-sandbox/'+RUN;
+const LIMIT=()=>({deadline:Date.now()+120000});
+const uuid=n=>'00000000-0000-4000-8000-'+String(n).padStart(12,'0');
+const ACCOUNT=uuid(1),SITE=uuid(2),PRODUCT=uuid(3),PRICE=uuid(4),PROVIDER=uuid(5),CAMPAIGN=uuid(6);
+const SECRET=Buffer.alloc(32,17).toString('base64url');
+const TOKEN=n=>Buffer.alloc(32,n).toString('base64url');
+const rejects=(promise,code='PROVISION_PENDING')=>assert.rejects(promise,{message:'stripe_sandbox_provision_'+code});
+const turn=()=>new Promise(resolveTurn=>setImmediate(resolveTurn));
+function fixture({browserOrigin}={}) {
+  const events=[],files=new Map(),checkoutStatuses=[];let serial=0,held=false,checkout=0,accountCreated=false,siteCreated=false,pricePublished=false,providerCreated=false,campaignActive=false;
+  const add=(path,directory,contents='')=>files.set(path,{directory,contents:Buffer.from(contents),uid:process.getuid(),mode:directory?0o40700:0o100600,nlink:1,dev:1,ino:++serial});
+  for(let path=DIR;path!=='/';path=dirname(path))add(path,true);add('/',true);
+  const info=entry=>({...entry,size:entry.contents.length,isDirectory:()=>entry.directory,isFile:()=>!entry.directory,isSymbolicLink:()=>Boolean(entry.symlink)});
+  const need=path=>{const entry=files.get(path);if(!entry)throw Object.assign(new Error(),{code:'ENOENT'});return entry;};
+  const resource={runId:RUN,expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',project:'stripe-'+RUN,siteKey:'s5a-'+SUFFIX,
+    ports:{backend:18080,demo:18081,receiver:18082,postgres:15432,mailpitHttp:18025,mailpitSmtp:11025},
+    endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081',receiver:'http://127.0.0.1:18082',postgres:'postgresql://127.0.0.1:15432',mailpitHttp:'http://127.0.0.1:18025',mailpitSmtp:'smtp://127.0.0.1:11025'},
+    status:'LIVE',webhookReady:true,containers:Object.fromEntries(['postgres','mailpit','backend','demo-site','callback-receiver'].map((name,i)=>[name,{id:String(i+1).repeat(64)}]))};
+  const account=()=>({id:ACCOUNT,key:'stripe-sandbox-default',provider:'STRIPE',mode:'SANDBOX',status:'ACTIVE',external_account_id:'acct_1UPiMpELswAd8tpR'});
+  const site=()=>({id:SITE,key:'s5a-'+SUFFIX,display_name:'Stage5A Sandbox acceptance',status:'ACTIVE',payment_account_id:ACCOUNT,allowed_origins:[browserOrigin??resource.endpoints.demo],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']}});
+  const product=()=>({id:PRODUCT,site_id:SITE,key:'s5a-product-'+SUFFIX,name:'Stage5A one-time acceptance',description:null,status:'ACTIVE'});
+  const price=()=>({id:PRICE,site_id:SITE,product_id:PRODUCT,price_key:'s5a-price-'+SUFFIX,version:1,type:'ONE_TIME',amount_minor:2000,currency:'EUR',billing_interval:null,trial_days:0,trial_payment_method_policy:'OPTIONAL_DURING_TRIAL',tax_mode:'NONE',tax_code:null,status:pricePublished?'PUBLISHED':'DRAFT',provider_price_id:pricePublished?'price_synthetic_original':null});
+  const provider=()=>({id:PROVIDER,provider_key:'s5a-email-'+SUFFIX,mode:'EMAIL_OTP',status:'ACTIVE',version:0,issuer:null,audiences:[],allowed_algorithms:[],jwks_source_type:null,readiness:'READY',keys:[],sender_ref:'local-default',template_key:'otp-default',last_successful_refresh_at:null,jwks_refresh_state:'NOT_APPLICABLE'});
+  const campaign=()=>({id:CAMPAIGN,site_id:SITE,key:'s5a-donate-'+SUFFIX,display_name:'Stage5A Donation acceptance',purpose_description:null,currency:'EUR',suggested_amounts:[500],minimum_amount:500,maximum_amount:500,custom_amount_allowed:false,anonymous_allowed:true,status:campaignActive?'ACTIVE':'DRAFT',activated_once:campaignActive,version:campaignActive?1:0,created_at:'2026-10-16T00:00:00Z',updated_at:'2026-10-16T00:00:00Z'});
+  function response(status,value=null,cookies=[]) {
+    const bytes=Buffer.from(value===null?'':JSON.stringify(value));
+    return {status,headers:{getSetCookie:()=>cookies},body:new ReadableStream({start(controller){if(bytes.length)controller.enqueue(bytes);controller.close();}})};
+  }
+  const bootstrap={resources:()=>resource,verify:async context=>{assert.equal(held,false,'R3 callback lock released before verify');events.push({type:'verify',context});return !siteCreated||providerCreated;},
+    withAdminCredentials:async callback=>{held=true;events.push({type:'credentials'});try {assert.equal(callback(Object.freeze({username:'generated-admin',password:'synthetic-password'})),true);return true;}finally{held=false;}}};
+  const options={env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',STRIPE_API_KEY:'must-not-leak'},bootstrap,
+    verifyProviderBinding:async context=>{events.push({type:'binding',context});return true;}};
+  const dependencies={execFile:forbidden,fetch:async(url,settings)=>{
+    assert.equal(held,false);const path=new URL(url).pathname,method=settings.method,body=settings.body?JSON.parse(settings.body):null;
+    events.push({type:'http',url,path,method,body,settings});
+    if(path==='/api/admin/v1/auth/sessions')return response(204,null,['PAYMENT_ADMIN_SESSION=session-test; Path=/; HttpOnly; SameSite=Strict','XSRF-TOKEN=csrf-test; Path=/']);
+    if(path==='/api/admin/v1/payment-accounts'){if(method==='GET')return response(200,accountCreated?[account()]:[]);accountCreated=true;return response(201,account());}
+    if(path==='/api/admin/v1/sites'){
+      if(method==='GET')return response(200,siteCreated?[site()]:[]);
+      const inline=body.email_otp_provider!=null;
+      if(inline&&JSON.stringify(body.email_otp_provider)!==JSON.stringify({provider_key:'s5a-email-'+SUFFIX,sender_ref:'local-default',template_key:'otp-default'}))return response(400);
+      if(inline&&(!Array.isArray(body.authentication_modes)||!body.authentication_modes.includes('EMAIL_OTP')))return response(400);
+      siteCreated=true;providerCreated=inline;return response(201,site());
+    }
+    if(path.endsWith('/checkout-return-urls'))return method==='PUT'?response(204):response(200,events.some(e=>e.type==='http'&&e.path===path&&e.method==='PUT')?[{origin:browserOrigin??resource.endpoints.demo,return_url:(browserOrigin??resource.endpoints.demo)+'/payment-return.html',version:0}]:[]);
+    if(path.endsWith('/products'))return response(201,product());
+    if(path.endsWith('/prices'))return response(201,price());
+    if(path.endsWith('/publish')){pricePublished=true;return response(200,price());}
+    if(path.endsWith('/catalog'))return response(200,{products:[product()],prices:[price()]});
+    if(path==='/inspection')return response(200,{count:0,duplicates:0,events:[]});
+    if(path.endsWith('/callback'))return response(200,{site_id:SITE,endpoint_url:'http://callback-receiver:8080/callback',enabled:true,secret_version:1,secret:SECRET});
+    if(path==='/configure')return response(204);
+    if(path.endsWith('/identity-providers')){assert.equal(method,'GET','provider is created only in the atomic Site request');return response(200,providerCreated?[provider()]:[]);}
+    if(path.endsWith('/identity-providers/'+PROVIDER)){assert.equal(providerCreated,true);return response(200,provider());}
+    if(path.endsWith('/donation-campaigns'))return response(201,campaign());
+    if(path.endsWith('/status')){campaignActive=true;return response(200,campaign());}
+    if(path.endsWith('/donation-campaigns/'+CAMPAIGN))return response(200,campaign());
+    if(path.endsWith('/checkouts')){checkout++;const value={checkout_id:uuid(10+checkout),checkout_token:TOKEN(checkout),payment_id:uuid(20+checkout),amount_minor:2000,currency:'EUR',price:{price_id:PRICE,price_key:'s5a-price-'+SUFFIX,version:1,amount_minor:2000,currency:'EUR',tax_mode:'NONE'},provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',provider_client_payload:{},status:'REQUIRES_PAYMENT_METHOD',expires_at:new Date(Date.now()+3600000).toISOString()};checkoutStatuses.push(value.status);return response(201,value);}
+    throw new Error('unexpected synthetic route');
+  },lstat:async path=>info(need(path)),realpath:async path=>{need(path);return path;},
+    open:async(path,flags,mode)=>{events.push({type:'open',path,flags,mode});
+      if(flags&constants.O_CREAT){if(files.has(path)&&(flags&constants.O_EXCL))throw null;if(!files.has(path)){need(dirname(path));add(path,false);}}
+      const entry=need(path);if(entry.symlink&&(flags&constants.O_NOFOLLOW))throw null;
+      return {stat:async()=>info(entry),writeFile:async text=>{events.push({type:'write',path});entry.contents=Buffer.from(text);},sync:async()=>events.push({type:'sync',path}),close:async()=>events.push({type:'close',path})};
+    },rename:async(from,to)=>{events.push({type:'rename',from,to});files.set(to,need(from));files.delete(from);},unlink:async path=>{events.push({type:'unlink',path});need(path);files.delete(path);},
+    initializeState:async(metadata,settings)=>{events.push({type:'initialize',metadata,settings});},now:Date.now,setTimeout,clearTimeout};
+  return {options,dependencies,events,files,resource,response,account,site,product,price,provider,campaign,checkoutStatuses};
+}
+
+function diagnosticOperation(){return {operation_id:uuid(40),payment_id:uuid(21),resource_id:uuid(21),account_id:ACCOUNT,account_mode:'SANDBOX',site_id:SITE,kind:'PAYMENT_PREPARE',status:'ACKNOWLEDGED',manual_review_required:false,reference:'pi_TestOnly'};}
+function diagnosticDetail(attempts=0){return {payment:{payment_id:uuid(21),site_id:SITE,payment_account_id:ACCOUNT,provider:'STRIPE',source:'CATALOG',price_id:PRICE,price_key:'s5a-price-'+SUFFIX,price_version:1,amount_minor:2000,currency:'EUR',tax_mode:'NONE',refunded_amount_minor:0,refundable_amount_minor:0,status:'REQUIRES_PAYMENT_METHOD',customer_id:null,donation_id:null,subscription_id:null},
+  attempts:Array.from({length:attempts},(_,i)=>({id:uuid(50+i),attempt_number:i+1,status:'REQUIRES_PAYMENT_METHOD',provider_intent_reference:'pi_TestOnly',payment_method_family:'CARD',result_code:null})),
+  events:[{id:uuid(60),event_type:'PAYMENT_CREATED'},{id:uuid(61),event_type:'PAYMENT_METHOD_REQUIRED'},...Array.from({length:attempts},(_,i)=>({id:uuid(62+i),event_type:'ATTEMPT_CREATED'}))],refunds:[],outbox_events:[],deliveries:[]};}
+
+
+const paymentEnv={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT:'true'};
+function paymentFixture(){
+ const f=fixture({browserOrigin:'http://127.0.0.1:18083'});f.options.env={...paymentEnv};f.options.browserOrigin='http://127.0.0.1:18083';f.resource.mode='MANUAL_PAYMENT';
+ f.actions=[];const rename=f.dependencies.rename,open=f.dependencies.open;
+ f.delays=[];f.probes=0;f.dependencies.setTimeout=(callback,ms)=>{f.delays.push(ms);if(f.fastPoll&&ms===1500){queueMicrotask(callback);return 0;}return setTimeout(callback,ms);};
+ f.dependencies.rename=async(from,to)=>{if(f.failRename)throw null;return rename(from,to);};
+ f.dependencies.open=async(path,...args)=>{const handle=await open(path,...args),sync=handle.sync;handle.sync=async()=>{if(f.failSync)throw null;await sync();if(path===DIR&&f.files.get(DIR+'/form-provisioning.json')?.contents.includes('"status":"CONFIRMING"'))f.actions.push('DURABLE_CONFIRMING');};return handle;};
+ f.attempts=0;f.success=false;f.mutate=()=>{};const fetcher=f.dependencies.fetch;
+ f.dependencies.fetch=async(url,settings)=>{const path=new URL(url).pathname,d=diagnosticDetail(f.attempts);
+  if(f.success){d.payment.status='SUCCEEDED';d.payment.refundable_amount_minor=2000;d.attempts[0].status='SUCCEEDED';d.attempts[0].result_code='succeeded';
+   d.events.push({id:uuid(70),event_type:'PAYMENT_SUCCEEDED',source:'PROVIDER_EVENT',provider_event_id:'evt_original',provider_object_id:'pi_TestOnly',amount_minor:2000,currency:'EUR'});
+   d.outbox_events=[{id:uuid(70),callback_type:'payment.succeeded',status:'DELIVERED'}];d.deliveries=[{outbox_event_id:uuid(70),status:'SUCCEEDED',http_status:204},{outbox_event_id:uuid(70),status:'SUCCEEDED',http_status:204}];}
+  f.mutate(d);
+  if(path==='/api/v1/admin/payments')return f.response(200,{items:[d.payment],total:f.total??1,page:0,size:2,sort:'CREATED_DESC'});
+  if(path.startsWith('/api/v1/admin/payments/')){f.probes++;return f.response(200,d);}
+  if(path==='/api/v1/admin/provider-operations')return f.response(200,[{...diagnosticOperation(),...f.operation}]);
+  if(path==='/inspection'&&f.success)return f.response(200,f.inspection??{count:1,duplicates:1,events:[{event_id:uuid(70),event_type:'payment.succeeded',count:2}]});
+  return fetcher(url,settings);};
+ return f;
+}
+async function prepared(){assert.equal(typeof diagnosticModule.createManualPaymentProvisioner,'function');const f=paymentFixture();f.p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies);f.limits=LIMIT();f.handoff=await f.p.prepare(f.limits);return f;}
+const writes=f=>f.events.filter(e=>e.type==='http'&&e.method!=='GET').length;
+test('one payment prepares one original Intent and durable permit precedes reply',async()=>{
+ const f=await prepared();assert.equal(f.events.filter(e=>e.path?.endsWith('/checkouts')).length,1);
+ assert.equal(f.handoff.binding.intentId,'pi_TestOnly');assert.equal(f.handoff.binding.priceId,PRICE);assert.equal(f.handoff.binding.paymentAccountId,ACCOUNT);
+ assert.equal(f.events.filter(e=>e.path?.endsWith('/callback')).length,1);assert.equal(f.events.filter(e=>e.path==='/configure').length,1);
+ assert.equal(f.events.find(e=>e.path?.endsWith('/checkouts')).settings.headers.Origin,'http://127.0.0.1:18083');assert.equal(f.resource.endpoints.demo,'http://127.0.0.1:18081');
+ assert.ok(![...f.files.values()].some(e=>e.contents.includes(SECRET)));
+ f.attempts=1;const before=writes(f);assert.equal(await f.p.markConfirmation(f.limits),true);f.actions.push('PERMIT_REPLY');assert.ok(f.actions.indexOf('DURABLE_CONFIRMING')>=0&&f.actions.indexOf('DURABLE_CONFIRMING')<f.actions.indexOf('PERMIT_REPLY'));
+ const ledger=JSON.parse(f.files.get(DIR+'/form-provisioning.json').contents);assert.equal(ledger.status,'CONFIRMING');assert.equal(ledger.operationProof.reference,'pi_TestOnly');
+ await assert.rejects(f.p.markConfirmation(f.limits));assert.equal(writes(f),before);
+});
+test('concurrent grants and unknown durable write never grant replacement',async()=>{
+ const f=await prepared();f.attempts=1;const n=writes(f);const one=f.p.markConfirmation(f.limits);await assert.rejects(f.p.markConfirmation(f.limits));await assert.rejects(one);assert.equal(writes(f),n);
+});
+for(const [name,mutate] of [['zero attempt',f=>f.attempts=0],['second attempt',f=>f.attempts=2],['second payment',f=>f.total=2],['changed Intent',f=>f.operation={reference:'pi_other'}],['dispatching preparation',f=>f.operation={status:'DISPATCHING'}],['wrong account',f=>f.mutate=d=>d.payment.payment_account_id=uuid(99)],['wrong price',f=>f.mutate=d=>d.payment.price_id=uuid(99)],['wrong owner',f=>f.resource.containers.backend.id='f'.repeat(64)],['wrong host',f=>f.resource.endpoints.backend='http://127.0.0.1:19999'],['Customer',f=>f.mutate=d=>d.payment.customer_id=uuid(99)],['refund',f=>f.mutate=d=>d.refunds.push({})]])
+test('permit refuses '+name+' without financial writes',async()=>{const f=await prepared();f.attempts=1;mutate(f);const n=writes(f);await assert.rejects(f.p.markConfirmation(f.limits));await assert.rejects(f.p.markConfirmation(f.limits));assert.equal(writes(f),n);});
+for(const kind of ['Rename','Sync'])test('failed ledger '+kind+' consumes permit before reply',async()=>{const f=await prepared();f.attempts=1;f['fail'+kind]=true;const n=writes(f);await assert.rejects(f.p.markConfirmation(f.limits));await assert.rejects(f.p.markConfirmation(f.limits));assert.equal(writes(f),n);assert.equal(f.actions.includes('PERMIT_REPLY'),false);});
+test('exact server journal callback join accepts transport duplicates',async()=>{const f=await prepared();f.attempts=1;await f.p.markConfirmation(f.limits);f.success=true;const n=writes(f);
+ assert.deepEqual(await f.p.verifyPayment(f.limits),{paymentConfirmed:true,webhookVerified:true,journalVerified:true,callbackVerified:true,providerEventId:'evt_original'});assert.equal(writes(f),n);
+ assert.equal(await f.p.close({deadline:f.limits.deadline+120000}),true);await assert.rejects(f.p.verifyPayment(f.limits));});
+for(const [name,mutate] of [['reconciliation',d=>d.events.at(-1).source='RECONCILIATION'],['duplicate fact',d=>d.events.push({...d.events.at(-1),id:uuid(71)})],['wrong Intent',d=>d.events.at(-1).provider_object_id='pi_other'],['missing event',d=>delete d.events.at(-1).provider_event_id],['wrong outbox',d=>d.outbox_events[0].id=uuid(72)],['Customer',d=>d.payment.customer_id=uuid(99)],['refund',d=>d.refunds.push({})]])
+test('authoritative proof refuses '+name+' with zero subsequent writes',async()=>{const f=await prepared();f.attempts=1;await f.p.markConfirmation(f.limits);f.success=true;f.mutate=mutate;const n=writes(f);await assert.rejects(f.p.verifyPayment(f.limits));assert.equal(writes(f),n);});
+test('unused proof accepts only original unpaid payment without grant',async()=>{const f=await prepared();assert.equal(await f.p.verifyUnused(f.limits),true);await assert.rejects(f.p.markConfirmation(f.limits));});
+test('unused proof refuses activity or a consumed permit',async()=>{const f=await prepared();f.attempts=1;await f.p.markConfirmation(f.limits);await assert.rejects(f.p.verifyUnused(f.limits));});
+test('successful server proof refuses a changed original Attempt identity',async()=>{const f=await prepared();f.attempts=1;await f.p.markConfirmation(f.limits);f.success=true;f.mutate=d=>d.attempts[0].id=uuid(99);await assert.rejects(f.p.verifyPayment(f.limits));});
+test('unknown Checkout reply preserves DISPATCHING and never creates another checkout',async()=>{const f=paymentFixture(),fetch=f.dependencies.fetch;f.dependencies.fetch=async(url,settings)=>{const result=await fetch(url,settings);if(new URL(url).pathname.endsWith('/checkouts'))throw null;return result;};
+ const p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies),limits=LIMIT();await assert.rejects(p.prepare(limits));const n=writes(f);await assert.rejects(p.prepare(limits));assert.equal(writes(f),n);assert.equal(f.events.filter(e=>e.path?.endsWith('/checkouts')).length,1);const ledger=JSON.parse(f.files.get(DIR+'/form-provisioning.json').contents);assert.equal(ledger.intents.at(-1).status,'DISPATCHING');});
+test('server payment proof polls at most thirty times within a forty-five second child budget',async()=>{const f=await prepared();f.attempts=1;await f.p.markConfirmation(f.limits);f.fastPoll=true;const n=f.probes,financial=writes(f);await assert.rejects(f.p.verifyPayment(f.limits));assert.equal(f.probes-n,30);assert.ok(f.delays.includes(45000));assert.equal(writes(f),financial);await assert.rejects(f.p.verifyPayment(f.limits));});
+test('a legitimate processing callback cannot hide the unique joined success callback',async()=>{const f=await prepared();f.attempts=1;await f.p.markConfirmation(f.limits);f.success=true;
+ f.mutate=d=>{d.events.splice(-1,0,{id:uuid(69),event_type:'PAYMENT_PROCESSING'});d.outbox_events.unshift({id:uuid(69),callback_type:'payment.processing',status:'DELIVERED'});d.deliveries.unshift({outbox_event_id:uuid(69),status:'SUCCEEDED',http_status:204});};
+ f.inspection={count:2,duplicates:1,events:[{event_id:uuid(69),event_type:'payment.processing',count:1},{event_id:uuid(70),event_type:'payment.succeeded',count:2}]};assert.equal((await f.p.verifyPayment(f.limits)).providerEventId,'evt_original');});

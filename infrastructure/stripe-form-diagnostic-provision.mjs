@@ -4,6 +4,7 @@ import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {formDiagnosticOptIn} from './stripe-sandbox-owned.mjs';
 import {manualFormOptIn} from './stripe-manual-form-options.mjs';
+import {manualPaymentOptIn} from './stripe-manual-payment-options.mjs';
 import {createFormDiagnosticSettlement} from './stripe-form-diagnostic-settlement.mjs';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
@@ -30,14 +31,18 @@ export async function createFormDiagnosticProvisioner(options,dependencies={}) {
 export async function createManualFormDiagnosticProvisioner(options,dependencies={}) {
   return createProvisioner(options,dependencies,true);
 }
+export async function createManualPaymentProvisioner(options,dependencies={}) {
+  return createProvisioner(options,dependencies,'payment');
+}
 async function createProvisioner(options,dependencies,manual) {
+  const payment=manual==='payment';
   let enabled=false,descriptors;
   try {
     if(manual)descriptors=Object.getOwnPropertyDescriptors(options);
-    const env=manual?descriptors.env?.value:options?.env;enabled=manual?manualFormOptIn(env):formDiagnosticOptIn(env);
+    const env=manual?descriptors.env?.value:options?.env;enabled=payment?manualPaymentOptIn(env):manual?manualFormOptIn(env):formDiagnosticOptIn(env);
   }catch{}
   if(!enabled)throw fixed('OPT_IN_REQUIRED');
-  let topology,verify,adminCredentials,io,browserOrigin;
+  let topology,verify,adminCredentials,io,browserOrigin,providerBinding,bootstrap;
   try {
     if(!manual&&Object.hasOwn(options,'browserOrigin'))fail();
     if(manual){
@@ -49,10 +54,11 @@ async function createProvisioner(options,dependencies,manual) {
     const flags=manual?descriptors.env.value:options.env;
     if(![undefined,''].includes(flags.DEBUG)||![undefined,''].includes(flags.NODE_DEBUG)||![undefined,'','0'].includes(flags.PWDEBUG))fail();
     if(manual&&(!descriptors.bootstrap||!Object.hasOwn(descriptors.bootstrap,'value')))fail();
-    const bootstrap=manual?descriptors.bootstrap.value:options.bootstrap;
+    bootstrap=manual?descriptors.bootstrap.value:options.bootstrap;
+    if(payment){const descriptor=descriptors.verifyProviderBinding;if(!descriptor||!Object.hasOwn(descriptor,'value')||typeof descriptor.value!=='function')fail();providerBinding=descriptor.value;}
     if(typeof bootstrap?.resources!=='function'||typeof bootstrap.verify!=='function'||typeof bootstrap.withAdminCredentials!=='function')fail();
     const safe=bootstrap.resources(),runId=safe.runId;
-    if(typeof runId!=='string'||!UUID.test(runId)||EXHAUSTED.has(runId)||safe.status!=='LIVE'||(safe.webhookReady!==false||safe.mode!=='FORM_DIAGNOSTIC')||typeof safe.expectedSource!=='string'||!/^[0-9a-f]{40}$/.test(safe.expectedSource)
+    if(typeof runId!=='string'||!UUID.test(runId)||EXHAUSTED.has(runId)||safe.status!=='LIVE'||(payment?(safe.webhookReady!==true||safe.mode!=='MANUAL_PAYMENT'):(safe.webhookReady!==false||safe.mode!=='FORM_DIAGNOSTIC'))||typeof safe.expectedSource!=='string'||!/^[0-9a-f]{40}$/.test(safe.expectedSource)
       ||safe.project!=='stripe-'+runId||safe.siteKey!=='s5a-'+runId.replaceAll('-',''))fail();
     if(!object(safe.ports)||Object.keys(safe.ports).sort().join(',')!==[...PORT_NAMES].sort().join(','))fail();
     const ports=Object.fromEntries(PORT_NAMES.map(name=>[name,safe.ports[name]]));
@@ -84,7 +90,7 @@ async function createProvisioner(options,dependencies,manual) {
     price:'s5a-price-'+suffix,provider:'s5a-email-'+suffix};
   const intents=[],identities=new Map(),cases={};
   let status='NEW',busy=false,pending=false,sequence=0,lock=null,admin=null,cookie='',csrf='';
-  let account=null,site=null,product=null,price=null,identityProvider=null,checkout=null,operationProof=null,originalDeadline=null,finalUsed=false,closed=false;
+  let account=null,site=null,product=null,price=null,identityProvider=null,checkout=null,operationProof=null,originalDeadline=null,finalUsed=false,closed=false,permitUsed=false,permitGranted=false,paymentAttempt=null;
   const stable=name=>'s5a:'+topology.runId+':'+name;
   const settlement=createFormDiagnosticSettlement(io);
   const resources=()=>snapshot({...topology,status:pending?'PENDING':status,account,site,product,price,identityProvider,cases,operationProof});
@@ -157,7 +163,14 @@ async function createProvisioner(options,dependencies,manual) {
   async function acknowledge(value,context){
     const intent=intents.at(-1);intent.status='ACKNOWLEDGED';if(value!==undefined)intent.identity=value;await save(context);
   }
-  async function ownership(context){if(await call(context,verify,{signal:context.signal,deadline:context.deadline})!==true)fail();}
+  async function ownership(context){
+    if(payment){const current=bootstrap.resources();
+      if(current.mode!=='MANUAL_PAYMENT'||current.webhookReady!==true||current.status!=='LIVE'||current.runId!==topology.runId||current.expectedSource!==topology.expectedSource||current.daemon!==topology.daemon||current.project!==topology.project||current.siteKey!==topology.siteKey||!same(current.ports,topology.ports)
+        ||['backend','demo','receiver'].some(name=>current.endpoints?.[name]!==topology.endpoints[name])
+        ||[['backend','backend'],['demo','demo-site'],['receiver','callback-receiver']].some(([name,service])=>current.containers?.[service]?.id!==topology.owners[name]))fail();
+    }
+    if(await call(context,verify,{signal:context.signal,deadline:context.deadline})!==true)fail();
+  }
   async function request(path,context,{method='GET',body,expected=200,key,receiver=false,login=false}={}){
     return bounded(context,async operation=>{
       await ownership(operation);
@@ -240,6 +253,7 @@ async function createProvisioner(options,dependencies,manual) {
   }
   async function provision(context){
     await bounded(context,ownership);
+    if(payment&&await call(context,providerBinding,{deadline:context.deadline,signal:context.signal})!==true)fail();
     await bounded(context,async operation=>{
       await ownership(operation);
       if(await call(operation,adminCredentials,value=>{
@@ -278,6 +292,14 @@ async function createProvisioner(options,dependencies,manual) {
     price={id:createdPrice.id,key:keys.price,version:createdPrice.version};
     const published=await mutation('publish-price',stable('publish-price'),'/api/admin/v1/prices/'+price.id+'/publish',context,{method:'POST'},v=>priceProof(v,true),v=>({id:v.id,key:v.price_key,providerPriceId:v.provider_price_id}));
     price={...price,providerPriceId:published.provider_price_id};await catalogProof(context);
+    if(payment){
+      const inspection=await read('/inspection',context,{receiver:true});
+      if(!object(inspection)||Object.keys(inspection).sort().join(',')!=='count,duplicates,events'||inspection.count!==0||inspection.duplicates!==0||!same(inspection.events,[]))fail();
+      const callback=await mutation('callback',stable('callback'),sitePath+'/callback',context,{method:'PUT',body:{endpoint_url:'http://callback-receiver:8080/callback',enabled:true}},v=>{
+        if(!object(v)||v.site_id!==site.id||v.endpoint_url!=='http://callback-receiver:8080/callback'||v.enabled!==true||v.secret_version!==1||!token(v.secret))fail();
+      },v=>({siteId:v.site_id,secretVersion:1}));
+      await mutation('receiver',stable('receiver'),'/configure',context,{method:'POST',expected:204,receiver:true,body:{secret:callback.secret,secret_version:1}},v=>{if(v!==null)fail();},()=>({secretVersion:1}));
+    }
     checkout=await mutation('checkout',stable('checkout'),'/api/v1/public/sites/'+site.key+'/checkouts',context,
       {method:'POST',expected:201,key:stable('checkout'),body:{price_key:price.key}},checkoutProof,v=>({checkoutId:v.checkout_id,paymentId:v.payment_id}));
     cases.form={checkoutId:checkout.checkout_id,paymentId:checkout.payment_id};
@@ -285,13 +307,14 @@ async function createProvisioner(options,dependencies,manual) {
     if(!Array.isArray(finalAccounts)||finalAccounts.length!==1||!Array.isArray(finalSites)||finalSites.length!==1)fail();accountProof(finalAccounts[0]);siteProof(finalSites[0]);
     await catalogProof(context);await bounded(context,ownership);
     await noConfirmation(context,true);status='READY';await save(context);
-    return snapshot({reference:operationProof.reference,session:{version:2,apiBaseUrl:topology.endpoints.backend,siteKey:site.key,priceKey:price.key,
+    return snapshot({...(payment?{binding:paymentBinding()}:{reference:operationProof.reference}),session:{version:2,apiBaseUrl:topology.endpoints.backend,siteKey:site.key,priceKey:price.key,
       checkoutId:checkout.checkout_id,checkoutToken:checkout.checkout_token,expiresAt:checkout.expires_at,
       providerType:'STRIPE',confirmationMode:'CLIENT_PROVIDER',
       state:{checkoutId:checkout.checkout_id,paymentId:checkout.payment_id,amountMinor:2000,currency:'EUR',status:'REQUIRES_PAYMENT_METHOD',expiresAt:checkout.expires_at,
         price:{priceId:price.id,priceKey:price.key,version:1,amountMinor:2000,currency:'EUR',taxMode:'NONE'}}}});
   }
-  async function noConfirmation(context,baseline=false) {
+  function paymentBinding(){return {paymentId:checkout.payment_id,siteId:site.id,paymentAccountId:account.id,operationId:operationProof.operationId,intentId:operationProof.reference,priceId:price.id,priceKey:price.key,amountMinor:2000,currency:'EUR',externalAccountId:'acct_1UPiMpELswAd8tpR'};}
+  async function noConfirmation(context,baseline=false,successful=false) {
     if(!checkout)fail();
     const accounts=await read('/api/admin/v1/payment-accounts',context),sites=await read('/api/admin/v1/sites',context);
     if(!Array.isArray(accounts)||accounts.length!==1||!Array.isArray(sites)||sites.length!==1)fail();
@@ -299,14 +322,14 @@ async function createProvisioner(options,dependencies,manual) {
     const d=await read('/api/v1/admin/payments/'+checkout.payment_id,context),p=d?.payment;
     if(!object(p)||p.payment_id!==checkout.payment_id||p.site_id!==site.id||p.payment_account_id!==account.id||p.provider!=='STRIPE'
       ||p.source!=='CATALOG'||p.price_id!==price.id||p.price_key!==price.key||p.price_version!==1||p.amount_minor!==2000||p.currency!=='EUR'
-      ||p.tax_mode!=='NONE'||p.status!=='REQUIRES_PAYMENT_METHOD'||p.refunded_amount_minor!==0||p.refundable_amount_minor!==0
+      ||p.tax_mode!=='NONE'||p.status!==(successful?'SUCCEEDED':'REQUIRES_PAYMENT_METHOD')||p.refunded_amount_minor!==0||p.refundable_amount_minor!==(successful?2000:0)
       ||p.customer_id!==null||p.donation_id!==null||p.subscription_id!==null)fail();
     // Filter by the owned Site only: filtering by the selected payment would hide another checkout.
     const page=await read('/api/v1/admin/payments?site_id='+site.id+'&page=0&size=2&sort=CREATED_DESC',context);
     if(!object(page)||page.total!==1||page.page!==0||page.size!==2||page.sort!=='CREATED_DESC'
       ||!Array.isArray(page.items)||page.items.length!==1||!same(page.items[0],p))fail();
     if(!['attempts','events','refunds','outbox_events','deliveries'].every(k=>Array.isArray(d[k])&&d[k].length<=100)
-      ||d.refunds.length||d.outbox_events.length||d.deliveries.length||(baseline?d.attempts.length!==0:manual?d.attempts.length>1:d.attempts.length!==1))fail();
+      ||d.refunds.length||(!successful&&(d.outbox_events.length||d.deliveries.length))||(baseline?d.attempts.length!==0:payment?(successful||permitUsed?d.attempts.length!==1:d.attempts.length>1):manual?d.attempts.length>1:d.attempts.length!==1))fail();
     const operations=await read('/api/v1/admin/provider-operations?payment_id='+checkout.payment_id,context);
     if(!Array.isArray(operations)||operations.length!==1)fail();const op=operations[0];
     if(!uuid(op.operation_id)||op.payment_id!==checkout.payment_id||op.resource_id!==checkout.payment_id||op.account_id!==account.id||op.account_mode!=='SANDBOX'
@@ -314,13 +337,29 @@ async function createProvisioner(options,dependencies,manual) {
       ||typeof op.reference!=='string'||!/^pi_[A-Za-z0-9]{1,249}$/.test(op.reference))fail();
     const binding={operationId:op.operation_id,reference:op.reference};if(operationProof&&!same(binding,operationProof))fail();
     if(!operationProof)operationProof=binding;
-    if(d.attempts.some(a=>!uuid(a.id)||a.attempt_number!==1||a.status!=='REQUIRES_PAYMENT_METHOD'||a.provider_intent_reference!==op.reference
-      ||a.payment_method_family!=='CARD'||a.result_code!==null))fail();
-    if(d.events.some(e=>!uuid(e.id)||!['PAYMENT_CREATED','PAYMENT_METHOD_REQUIRED','ATTEMPT_CREATED'].includes(e.event_type))
+    if(d.attempts.some(a=>!uuid(a.id)||a.attempt_number!==1||a.status!==(successful?'SUCCEEDED':'REQUIRES_PAYMENT_METHOD')||a.provider_intent_reference!==op.reference
+      ||a.payment_method_family!=='CARD'||(!successful&&a.result_code!==null)))fail();
+    if(payment&&d.attempts.length){if(paymentAttempt!==null&&d.attempts[0].id!==paymentAttempt)fail();paymentAttempt=d.attempts[0].id;}
+    if(d.events.some(e=>!uuid(e.id)||!(successful?['PAYMENT_CREATED','PAYMENT_METHOD_REQUIRED','ATTEMPT_CREATED','PAYMENT_PROCESSING','PAYMENT_SUCCEEDED']:['PAYMENT_CREATED','PAYMENT_METHOD_REQUIRED','ATTEMPT_CREATED']).includes(e.event_type))
       ||new Set(d.events.map(e=>e.id)).size!==d.events.length
       ||d.events.filter(e=>e.event_type==='PAYMENT_CREATED').length!==1
       ||d.events.filter(e=>e.event_type==='ATTEMPT_CREATED').length!==d.attempts.length)fail();
-    return snapshot({...binding,attempts:d.attempts.length});
+    return successful?d:snapshot({...binding,attempts:d.attempts.length});
+  }
+  async function paymentProof(context){
+    const d=await noConfirmation(context,false,true),success=d.events.filter(e=>e.event_type==='PAYMENT_SUCCEEDED');
+    if(success.length!==1)fail();const event=success[0];
+    if(event.source!=='PROVIDER_EVENT'||typeof event.provider_event_id!=='string'||!/^evt_[A-Za-z0-9_]{1,200}$/.test(event.provider_event_id)||event.provider_object_id!==operationProof.reference||event.amount_minor!==2000||event.currency!=='EUR')fail();
+    const callbacks={PAYMENT_PROCESSING:'payment.processing',PAYMENT_SUCCEEDED:'payment.succeeded'};
+    if(new Set(d.outbox_events.map(v=>v.id)).size!==d.outbox_events.length||d.outbox_events.some(v=>!d.events.some(e=>e.id===v.id&&callbacks[e.event_type]===v.callback_type)))fail();
+    const out=d.outbox_events.filter(v=>v.id===event.id&&v.callback_type==='payment.succeeded');if(out.length!==1)fail();
+    if(out[0].status!=='DELIVERED'||!d.deliveries.some(v=>v.outbox_event_id===event.id&&v.status==='SUCCEEDED'&&Number.isInteger(v.http_status)&&v.http_status>=200&&v.http_status<300))return null;
+    if(d.deliveries.some(v=>!d.outbox_events.some(o=>o.id===v.outbox_event_id)))fail();
+    const inspected=await read('/inspection',context,{receiver:true});
+    if(!object(inspected)||!Array.isArray(inspected.events)||inspected.events.length>100)fail();
+    if(inspected.events.some(v=>!d.outbox_events.some(o=>o.id===v.event_id&&o.callback_type===v.event_type)||!Number.isSafeInteger(v.count)||v.count<1)||new Set(inspected.events.map(v=>v.event_id)).size!==inspected.events.length)fail();
+    const received=inspected.events.filter(v=>v.event_id===event.id&&v.event_type==='payment.succeeded');if(received.length!==1)return null;
+    return snapshot({paymentConfirmed:true,webhookVerified:true,journalVerified:true,callbackVerified:true,providerEventId:event.provider_event_id});
   }
   async function run(limits,body,{cleanup=false}={}) {
     if(busy) {pending=true;throw fixed('OPERATION_BUSY');}busy=true;
@@ -336,7 +375,7 @@ async function createProvisioner(options,dependencies,manual) {
     }catch{pending=true;throw fixed('PROVISION_PENDING');}
     finally{busy=false;io.clearTimeout(timer);limits?.signal?.removeEventListener('abort',abort);}
   }
-  return Object.freeze({
+  const capabilities={
     prepare:limits=>run(limits,async context=>{if(pending||status!=='NEW'||closed)fail();status='PREPARING';return provision(context);}),
     verifyNoConfirmation:limits=>run(limits,async context=>{if(finalUsed||closed||!checkout||!operationProof)fail();finalUsed=true;
       const proof=await noConfirmation(context);await save(context);return proof;}),
@@ -344,5 +383,23 @@ async function createProvisioner(options,dependencies,manual) {
       let ownership=true;
       try{if(lock){await directoryProof(context);await fileProof(lockPath,lock,context);await close(lock,context);lock=null;}}catch{ownership=false;}
       if(!settlement.close(context)||!ownership||intents.some(i=>i.status!=='ACKNOWLEDGED'))fail();return true;},{cleanup:true}),
+  };
+  if(payment)return Object.freeze({prepare:capabilities.prepare,
+    markConfirmation:limits=>run(limits,async context=>{
+      if(pending||closed||status!=='READY'||permitUsed||finalUsed)fail();permitUsed=true;
+      const baseline=await noConfirmation(context);if(baseline.attempts!==1||pending)fail();
+      status='CONFIRMING';await save(context);check(context);if(pending)fail();permitGranted=true;return true;
+    }),
+    verifyPayment:limits=>run(limits,async context=>{
+      if(pending||closed||!permitGranted||finalUsed)fail();finalUsed=true;
+      return bounded(context,async polling=>{for(let n=0;n<30;n++){
+        const value=await read('/api/v1/admin/payments/'+checkout.payment_id,polling);
+        if(value?.payment?.status==='SUCCEEDED'){const proof=await paymentProof(polling);if(proof)return proof;}
+        if(n<29)await call(polling,()=>new Promise(resolveWait=>io.setTimeout(resolveWait,Math.min(1500,Math.max(1,polling.deadline-io.now())))));
+      }fail();},45000);
+    }),
+    verifyUnused:limits=>run(limits,async context=>{if(pending||closed||permitUsed||finalUsed||status!=='READY')fail();finalUsed=true;await noConfirmation(context);return true;}),
+    close:capabilities.close,
   });
+  return Object.freeze(capabilities);
 }

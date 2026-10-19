@@ -5,7 +5,8 @@ import {randomBytes,generateKeyPairSync} from 'node:crypto';
 import {createServer} from 'node:net';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {preflightOwnedSandbox,preflightOwnedFormDiagnostic,formDiagnosticOptIn} from './stripe-sandbox-owned.mjs';
+import {preflightOwnedSandbox,preflightOwnedFormDiagnostic,preflightOwnedManualPayment,formDiagnosticOptIn} from './stripe-sandbox-owned.mjs';
+import {manualPaymentOptIn,validateManualPaymentOptions} from './stripe-manual-payment-options.mjs';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const DOCKER='/Applications/Docker.app/Contents/Resources/bin/docker';
@@ -120,9 +121,15 @@ export async function createOwnedFormDiagnosticBootstrap(options,dependencies={}
   return createBootstrap(options,dependencies,true);
 }
 
-async function createBootstrap(options,dependencies,diagnostic) {
+export async function createOwnedManualPaymentBootstrap(options,dependencies={}) {
+  let env;try{env=Object.getOwnPropertyDescriptor(options,'env')?.value;}catch{}
+  if(!manualPaymentOptIn(env))throw fixed('OPT_IN_REQUIRED');
+  const selected=validateManualPaymentOptions(options);if(!selected)throw fixed('INPUTS_CONFIGURATION');
+  return createBootstrap(selected,dependencies,false,true);
+}
+async function createBootstrap(options,dependencies,diagnostic,manualPayment=false) {
   let enabled=false;
-  try {const env=options?.env;enabled=diagnostic?formDiagnosticOptIn(env):env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'
+  try {const env=options?.env;enabled=manualPayment?manualPaymentOptIn(env):diagnostic?formDiagnosticOptIn(env):env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true'
     &&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
   if(!enabled)throw fixed('OPT_IN_REQUIRED');
   let runId,expectedSource,daemon,ports,env,io;
@@ -138,13 +145,13 @@ async function createBootstrap(options,dependencies,diagnostic) {
     if(typeof daemon!=='string'||/[\s\x00-\x1f\x7f%]/.test(daemon))fail();
     const url=new URL(daemon);
     if(url.protocol!=='unix:'||url.host||url.username||url.password||url.search||url.hash||url.pathname.length<2||url.href!==daemon||daemon!=='unix://'+url.pathname)fail();
-    const binding=diagnostic?{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'}:options.approvedBinding;
+    const binding=diagnostic||manualPayment?{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'}:options.approvedBinding;
     if(!object(binding)||Object.keys(binding).sort().join(',')!=='apiVersion,externalAccountId'
       ||binding.externalAccountId!=='acct_1UPiMpELswAd8tpR'||binding.apiVersion!=='2026-09-30.endive')fail();
-    env=Object.freeze(diagnostic?{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}:
+    env=Object.freeze(manualPayment?options.env:diagnostic?{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}:
       {PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',DEBUG:flags.DEBUG,NODE_DEBUG:flags.NODE_DEBUG,PWDEBUG:flags.PWDEBUG});
     const raw=dependencies.execFile??execFile;
-    io=Object.freeze({execute:dependencies.execute??((...args)=>executeAwaited(raw,...args)),preflight:dependencies.preflight??(diagnostic?preflightOwnedFormDiagnostic:preflightOwnedSandbox),
+    io=Object.freeze({execute:dependencies.execute??((...args)=>executeAwaited(raw,...args)),preflight:dependencies.preflight??(manualPayment?preflightOwnedManualPayment:diagnostic?preflightOwnedFormDiagnostic:preflightOwnedSandbox),
       lstat:dependencies.lstat??lstat,realpath:dependencies.realpath??realpath,readFile:dependencies.readFile??readFile,readdir:dependencies.readdir??readdir,
       mkdir:dependencies.mkdir??mkdir,open:dependencies.open??open,rename:dependencies.rename??rename,unlink:dependencies.unlink??unlink,
       randomBytes:dependencies.randomBytes??randomBytes,generateKeyPairSync:dependencies.generateKeyPairSync??generateKeyPairSync,
@@ -158,7 +165,7 @@ async function createBootstrap(options,dependencies,diagnostic) {
   const tags={backend:project+'-backend:latest','demo-site':project+'-demo-site:latest',postgres:'postgres:18-alpine',mailpit:'axllent/mailpit:v1.27','callback-receiver':'node:24-alpine'};
   const endpoints=frozen({backend:'http://127.0.0.1:'+ports.backend,demo:'http://127.0.0.1:'+ports.demo,receiver:'http://127.0.0.1:'+ports.receiver,
     postgres:'postgresql://127.0.0.1:'+ports.postgres,mailpitHttp:'http://127.0.0.1:'+ports.mailpitHttp,mailpitSmtp:'smtp://127.0.0.1:'+ports.mailpitSmtp});
-  let busy=false,pending=false,status='NEW',startup=null,lock=null,sequence=0,issuerProved=false,webhookReady=false,live=false,retired=false;
+  let busy=false,pending=false,status='NEW',startup=null,lock=null,sequence=0,issuerProved=false,webhookReady=false,live=false,retired=false,manualDeadline=null;
   let inputs=null,admin=null,providerKeys=null,diagnosticConfigured=false;
   let terminalBuild=false,buildDiagnostic=null,buildxIdentity=null;
   const buildxDirectory=directory+'/buildx',dockerEnvironment=Object.freeze({...CHILD_ENV,DOCKER_CONFIG:'/private/var/empty',BUILDX_CONFIG:buildxDirectory});
@@ -171,7 +178,7 @@ async function createBootstrap(options,dependencies,diagnostic) {
   }
   function resources() {
     return frozen(JSON.parse(JSON.stringify({runId,expectedSource,daemon,project,siteKey,ports,cliDirectory:directory+'/cli',endpoints,
-      status:pending?'PENDING':status,webhookReady,...(diagnostic?{mode:'FORM_DIAGNOSTIC'}:{}),...recorded,...(buildDiagnostic?{buildDiagnostic}:{})})));
+      status:pending?'PENDING':status,webhookReady,...(manualPayment?{mode:'MANUAL_PAYMENT',manualPort:options.manualPort}:diagnostic?{mode:'FORM_DIAGNOSTIC'}:{}),...recorded,...(buildDiagnostic?{buildDiagnostic}:{})})));
   }
   async function operation(phase,limits,body,{cleanup=false,diagnostic=false}={}) {
     if(terminalBuild&&!diagnostic)throw fixed(phase+'_PENDING');
@@ -180,6 +187,10 @@ async function createBootstrap(options,dependencies,diagnostic) {
     try {
       if(pending&&!cleanup)fail();
       if(!Number.isSafeInteger(limits?.deadline)||limits.deadline<=io.now()||(limits.signal!==undefined&&!(limits.signal instanceof AbortSignal)))fail();
+      if(manualPayment){
+        if(manualDeadline===null){if(limits.deadline>io.now()+45*60000)fail();manualDeadline=limits.deadline;}
+        if(cleanup?limits.deadline>manualDeadline+120000:phase==='VERIFY'?limits.deadline>manualDeadline:limits.deadline!==manualDeadline)fail();
+      }
       external=limits.signal;onAbort=()=>controller.abort();external?.addEventListener('abort',onAbort,{once:true});if(external?.aborted)controller.abort();
       timer=io.setTimeout(onAbort,Math.min(limits.deadline-io.now(),2147483647));
       const context={deadline:limits.deadline,signal:controller.signal,externalSignal:external};check(context);
@@ -263,10 +274,10 @@ async function createBootstrap(options,dependencies,diagnostic) {
   async function intent(action,name,context) {intents.push({action,name,status:'DISPATCHING'});await ledger(context);}
   async function acknowledgement(context) {intents.at(-1).status='ACKNOWLEDGED';await ledger(context);}
   async function sourceGate(context,portsCheck=true) {
-    const result=await io.preflight({runId,expectedSource,daemon,ports,env},{lstat:io.lstat,realpath:io.realpath,
+    const result=await io.preflight({runId,expectedSource,daemon,ports,env,...(manualPayment?{manualPort:options.manualPort}:{})},{lstat:io.lstat,realpath:io.realpath,
       execute:(file,args,settings)=>execute(file,args,settings,context),portAvailable:(port,host)=>io.portAvailable(port,host,context)});
     check(context);if(!object(result)||Object.keys(result).length!==1||result.status!=='READY')fail();
-    if(portsCheck)for(const port of Object.values(ports)) {check(context);if(await io.portAvailable(port,'127.0.0.1',context)!==true)fail();}
+    if(portsCheck)for(const port of [...Object.values(ports),...(manualPayment?[options.manualPort]:[])]) {check(context);if(await io.portAvailable(port,'127.0.0.1',context)!==true)fail();}
   }
   async function sourceIdentity(context) {
     const settings={cwd:ROOT,env:{...CHILD_ENV,GIT_OPTIONAL_LOCKS:'0',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_SYSTEM:'/dev/null'},shell:false,timeout:10000,maxBuffer:65536};
@@ -305,7 +316,7 @@ async function createBootstrap(options,dependencies,diagnostic) {
       PAYMENT_DATA_ENCRYPTION_KEY:'buildOnly',PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY:'buildOnly',PAYMENT_CUSTOMER_DIGEST_KEY_V1:'buildOnly',PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1:'buildOnly',...portInputs()};
     await exclusiveFile(directory+'/build.env',envText(synthetic),context);await intent('BUILD','backend+demo-site',context);
     if(buildDiagnostic) {buildDiagnostic.stage='BUILD_COMMAND';await ledger(context);}
-    await docker(composeArgs(directory+'/build.env',['build','--quiet',...(diagnostic?['--build-arg','PAYMENT_DEMO_BUILD_MODE=form-diagnostic']:[]),'backend','demo-site'],{override:false}),context,1200000);
+    await docker(composeArgs(directory+'/build.env',['build','--quiet',...(manualPayment?['--build-arg','PAYMENT_DEMO_BUILD_MODE=manual-payment']:diagnostic?['--build-arg','PAYMENT_DEMO_BUILD_MODE=form-diagnostic']:[]),'backend','demo-site'],{override:false}),context,1200000);
     for(const service of ['backend','demo-site']) {
       if(buildDiagnostic) {buildDiagnostic.stage=service==='backend'?'BACKEND_IMAGE_PROOF':'DEMO_IMAGE_PROOF';await ledger(context);}
       await imageProof(service,context);
@@ -437,8 +448,26 @@ async function createBootstrap(options,dependencies,diagnostic) {
   }
   async function topology(context,liveRequired=false,neverStarted=false) {
     await infrastructureProof(context);await projectProof(context);
-    if(SERVICES.some(service=>!recorded.containers[service]))fail();
-    for(const service of SERVICES)await containerProof(service,recorded.containers[service].id,context,{liveRequired,neverStarted});
+    const delayed=manualPayment&&!recorded.containers.backend&&!liveRequired;
+    if(delayed)await plannedBackend(context);
+    const services=delayed?SERVICES.filter(service=>service!=='backend'):SERVICES;
+    if(services.some(service=>!recorded.containers[service]))fail();
+    for(const service of services)await containerProof(service,recorded.containers[service].id,context,{liveRequired,neverStarted});
+  }
+  async function plannedBackend(context) {
+    if(!manualPayment||recorded.containers.backend||live||retired)fail();
+    await sourceIdentity(context);await configProof(context);
+    const image=await inspect('image',tags.backend,'{"Id":{{json .ID}},"User":{{json .Config.User}}}',context);
+    if(image.Id!==recorded.images.backend.id||image.User!==recorded.images.backend.user)fail();
+    await absent(['ps','--all','--no-trunc','--filter','name=^/'+project+'-backend$','--format','{{.ID}}'],context);
+    if(await io.portAvailable(ports.backend,'127.0.0.1',context)!==true)fail();
+  }
+  async function finalEnvironment(context){
+    const path=directory+'/final.env',expected=privateIdentities.get(path);if(!expected)fail();
+    await directoryProof(directory,context,true);const handle=await io.open(path,constants.O_RDONLY|constants.O_NOFOLLOW);
+    try{const held=await handle.stat(),named=await io.lstat(path);
+      if(!validFile(held)||!validFile(named)||held.ino!==expected.ino||held.dev!==expected.dev||named.ino!==expected.ino||named.dev!==expected.dev||await io.realpath(path)!==path)fail();check(context);
+    }finally{await handle.close();}
   }
   async function helper(service,command,context) {
     const installer=service==='issuer-installer',name=project+'-'+service;await intent('CREATE_HELPER',name,context);
@@ -503,8 +532,9 @@ async function createBootstrap(options,dependencies,diagnostic) {
     await exclusiveFile(directory+'/owned.yaml',overrideText(),context);await configProof(context);await sourceGate(context);
     if(diagnostic)await configureDiagnostic(context);
     await intent('CREATE_STOPPED',project,context);
-    await docker(composeArgs(directory+(diagnostic?'/final.env':'/app.env'),['up','--no-start','--no-deps','--no-build','--pull','never',...SERVICES],{stripe:diagnostic}),context);
-    for(const service of SERVICES) {const proof=await containerProof(service,project+'-'+service,context,{neverStarted:true});recorded.containers[service]=proof.safe;}
+    const services=manualPayment?SERVICES.filter(service=>service!=='backend'):SERVICES;
+    await docker(composeArgs(directory+(diagnostic?'/final.env':'/app.env'),['up','--no-start','--no-deps','--no-build','--pull','never',...services],{stripe:diagnostic}),context);
+    for(const service of services) {const proof=await containerProof(service,project+'-'+service,context,{neverStarted:true});recorded.containers[service]=proof.safe;}
     await topology(context,false,true);await acknowledgement(context);status='PREPARED';await ledger(context);return true;
   }
 
@@ -645,10 +675,11 @@ async function createBootstrap(options,dependencies,diagnostic) {
     if(status!=='PREPARED'||!(diagnostic?diagnosticConfigured:webhookReady)||!issuerProved||retired||live)fail();
     await sourceIdentity(context);await topology(context,false,true);
     for(const port of Object.values(ports))if(await io.portAvailable(port,'127.0.0.1',context)!==true)fail();
-    if(!diagnostic){const old=recorded.containers.backend;await containerProof('backend',old.id,context,{neverStarted:true});
+    if(!diagnostic){if(!manualPayment){const old=recorded.containers.backend;await containerProof('backend',old.id,context,{neverStarted:true});
     await intent('RETIRE_PLACEHOLDER',old.id,context);
     const removed=await docker(['container','rm',old.id],context);if(removed.stdout.trim()!==old.id)fail();
     recorded.retiredBackend=old;delete recorded.containers.backend;retired=true;await projectProof(context);await acknowledgement(context);
+    }else{await plannedBackend(context);await finalEnvironment(context);retired=true;}
     await intent('CREATE_FINAL_BACKEND',project+'-backend',context);
     await docker(composeArgs(directory+'/final.env',['up','--no-start','--no-deps','--no-build','--pull','never','backend'],{stripe:true}),context);
     const proof=await containerProof('backend',project+'-backend',context,{neverStarted:true});recorded.containers.backend=proof.safe;

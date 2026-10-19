@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {runFormLoadDiagnostic} from './stripe-form-diagnostic.mjs';
 
 const options={env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}};
+test('automatic diagnostic rejects new payment flag before dependencies',async()=>{let touched=0;const result=await runFormLoadDiagnostic({env:{...options.env,PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT:'true'}},null,new Proxy({},{get(){touched++;throw null;}}));assert.equal(result.exitCode,1);assert.equal(touched,0);});
 const limits=()=>({deadline:Date.now()+900000,signal:new AbortController().signal});
 const ready={version:1,binding:'BOUND',capability_started:true,capability_ready:true,loader_started:true,loader_ready:true,
   element_created:true,mount_called:true,mount_returned:true,ready_seen:true,loaderror_seen:false,view_completed:true,widget_completed:true,

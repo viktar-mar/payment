@@ -24,7 +24,7 @@ const credential=value=>typeof value==='string'&&value.length>0&&value.length<=1
 /** Inert, one-run provisioning capability. Root owns runtime and financial execution. */
 export async function createOwnedSandboxProvisioner(options,dependencies={}) {
   let enabled=false;
-  try {const env=options?.env;enabled=env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';}catch{}
+  try {const env=options?.env;enabled=env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true';}catch{}
   if(!enabled)throw fixed('OPT_IN_REQUIRED');
   let topology,verify,adminCredentials,providerBinding,io,env;
   try {

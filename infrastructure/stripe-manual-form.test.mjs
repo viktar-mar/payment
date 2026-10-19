@@ -31,7 +31,7 @@ test('missing/mixed opt-in and hostile options reject before dependency or priva
   assert.equal(typeof subject.runManualFormDiagnostic,'function');let touched=0;
   const trap=new Proxy({},{get(){touched++;throw null;}});
   for(const patch of [{PAYMENT_STRIPE_SANDBOX_ENABLED:''},{PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:''},{PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:''},
-    {PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true'},{PAYMENT_STRIPE_SANDBOX_FULL_RUN:'true'},{PAYMENT_STRIPE_SANDBOX_OWNED_RUN:'true'},{PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'},{DEBUG:'PRIVATE'}, {NODE_DEBUG:'http'},{PWDEBUG:'1'},{PW_TRACE:'on'}]){
+    {PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT:'true'},{PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true'},{PAYMENT_STRIPE_SANDBOX_FULL_RUN:'true'},{PAYMENT_STRIPE_SANDBOX_OWNED_RUN:'true'},{PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'},{DEBUG:'PRIVATE'}, {NODE_DEBUG:'http'},{PWDEBUG:'1'},{PW_TRACE:'on'}]){
     const value=await subject.runManualFormDiagnostic({...options(),env:{...flags,...patch}},null,trap);assert.equal(value.exitCode,1);assert.equal(value.report.end,'FAILED');
   }
   const input=options();Object.defineProperty(input,'env',{enumerable:true,get(){touched++;throw null;}});

@@ -5,6 +5,7 @@ import {createServer} from 'node:net';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {manualFormOptIn,validateManualFormOptions,validateFormDiagnosticTopology} from './stripe-manual-form-options.mjs';
+import {manualPaymentOptIn,validateManualPaymentOptions} from './stripe-manual-payment-options.mjs';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const DOCKER='/Applications/Docker.app/Contents/Resources/bin/docker';
@@ -56,6 +57,7 @@ export async function preflightOwnedSandbox(options,dependencies={}) {
 export function formDiagnosticOptIn(env) {
   try {return env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'
     &&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'
+    &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT)
     &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS)
     &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_FULL_RUN)
     &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN)
@@ -78,17 +80,23 @@ export async function preflightOwnedManualFormDiagnostic(options,dependencies={}
   return preflight(selected,dependencies,'manual');
 }
 
+export async function preflightOwnedManualPayment(options,dependencies={}) {
+  let env;try{env=Object.getOwnPropertyDescriptor(options,'env')?.value;}catch{}
+  if(!manualPaymentOptIn(env))return pending('OPT_IN','OPT_IN_REQUIRED');
+  const selected=validateManualPaymentOptions(options);if(!selected)return pending('INPUTS','CONFIGURATION');
+  return preflight(selected,dependencies,'payment');
+}
 async function preflight(options,dependencies,diagnostic) {
   let phase='OPT_IN',code='OPT_IN_REQUIRED';
   try {
     const env=options?.env;
-    if(diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'
+    if(diagnostic==='payment'?!manualPaymentOptIn(env):diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'
       ||env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'||env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC==='true'))return pending(phase,code);
     phase='INPUTS';code='CONFIGURATION';
     if(![undefined,''].includes(env.DEBUG)||![undefined,''].includes(env.NODE_DEBUG)||![undefined,'','0'].includes(env.PWDEBUG))return pending(phase,code);
     const topology=validateFormDiagnosticTopology(options);if(!topology)return pending(phase,code);
     const {expectedSource,daemon,ports}=topology,url=new URL(daemon);
-    const selectedPorts=PORTS.map(name=>ports[name]);if(diagnostic==='manual')selectedPorts.push(options.manualPort);
+    const selectedPorts=PORTS.map(name=>ports[name]);if(diagnostic==='manual'||diagnostic==='payment')selectedPorts.push(options.manualPort);
 
     phase='SOURCE';code='SOURCE_MISMATCH';
     const execute=dependencies.execute??executeFile;

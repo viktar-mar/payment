@@ -3,6 +3,7 @@ import {lstat,realpath,readdir,open} from 'node:fs/promises';
 import {constants} from 'node:fs';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {manualPaymentOptIn} from './stripe-manual-payment-options.mjs';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const ACCOUNT='acct_1UPiMpELswAd8tpR',VERSION='2026-09-30.endive';
@@ -28,7 +29,7 @@ const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value)
 /** No entrypoint or implicit I/O: only fixed, isolated, read-only CLI capabilities. */
 export async function createSandboxCliAdapter(options,dependencies={}) {
   let enabled=false;
-  try {const optIn=options?.env;enabled=optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
+  try {const optIn=options?.env;enabled=optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {
@@ -49,6 +50,7 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
   const env=Object.freeze({PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C',HOME:cliDirectory+'/home',XDG_CONFIG_HOME:cliDirectory+'/config',NO_COLOR:'1'});
   const args=Object.freeze([...PREFIX,'--config',cliDirectory+'/config/stripe/config.toml','--project-name','default','--color','off','--log-level','error']);
   let busy=false,owner=null,uncertain=false,originalSecret=null,latched=null,latchedOwner=null;
+  let manual=null,manualOwner=null,manualDeadline=null,manualBindUsed=false,manualPermitRead=false,manualFinalUsed=false,manualFailed=false;
 
   function check(context) {if(context.signal.aborted||Date.now()>=context.deadline)fail();}
   async function operation(code,limits,body) {
@@ -86,7 +88,7 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
   async function command(commandArgs,context) {
     await privateTree(context);check(context);
     const result=await io.execute('/usr/bin/sandbox-exec',[...args,...commandArgs],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe'],
-      timeout:Math.min(20000,Math.max(1,context.deadline-Date.now())),maxBuffer:65536,signal:context.signal});
+      timeout:Math.min(context.manual?10000:20000,Math.max(1,context.deadline-Date.now())),maxBuffer:65536,signal:context.signal});
     check(context);
     if(typeof result.stdout!=='string'||typeof result.stderr!=='string'||Buffer.byteLength(result.stdout)+Buffer.byteLength(result.stderr)>65536)fail();
     return result;
@@ -220,7 +222,7 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
     if(busy)throw fixed('BUSY');
     busy=true;
     try {
-      if(uncertain||latched!==null||owner===null||!owner.ready||!owner.valid||owner.exited)fail();
+      if(manualBindUsed||uncertain||latched!==null||owner===null||!owner.ready||!owner.valid||owner.exited)fail();
       const fields=['paymentId','siteId','operationId','intentId','amountMinor','currency','source','externalAccountId'];
       if(!object(original)||Reflect.ownKeys(original).some(key=>typeof key!=='string')||Object.getOwnPropertyNames(original).sort().join(',')!==[...fields].sort().join(','))fail();
       const snapshot=Object.fromEntries(fields.map(key=>[key,original[key]]));
@@ -242,12 +244,73 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
       ||c.status!=='succeeded'||c.paid!==true||c.captured!==true||c.amount!==2000||c.amount_captured!==2000||c.currency!=='eur'||c.payment_method_details?.type!=='card')fail();
     return Object.freeze({captured:true});
   }
+  function manualListener(context){
+    context.manual=true;
+    if(manualFailed||uncertain||!owner||!owner.ready||!owner.valid||owner.invalidated||owner.exited||owner.stopping||owner.explicitStop||owner!==manualOwner||context.deadline!==manualDeadline)fail();
+    check(context);
+  }
+  async function manualRead(context,body){
+    try{manualListener(context);await binding(context);manualListener(context);const result=await body();manualListener(context);return result;}
+    catch{manualFailed=true;throw null;}
+  }
+  async function originalIntent(context){
+    const p=parseBody(await command(['get','/v1/payment_intents/'+manual.intentId,'--expand','latest_charge.refunds'],context));
+    if(p.id!==manual.intentId||p.object!=='payment_intent'||p.livemode!==false||p.amount!==2000||p.currency!=='eur'||p.capture_method!=='automatic'
+      ||!Array.isArray(p.payment_method_types)||p.payment_method_types.length!==1||p.payment_method_types[0]!=='card'||p.customer!==null
+      ||!object(p.metadata)||p.metadata.payment_id!==manual.paymentId||p.metadata.site_id!==manual.siteId||p.metadata.source!=='CATALOG')fail();
+    return p;
+  }
+  async function unpaid(context){const p=await originalIntent(context);
+    if(p.status!=='requires_payment_method'||p.amount_received!==0||p.payment_method!==null||p.latest_charge!==null)fail();return true;
+  }
+  async function bindManualPayment(original,context){
+    if(manualBindUsed||latched!==null)fail();manualBindUsed=true;manualDeadline=context.deadline;manualOwner=owner;
+    try{
+      const fields=['paymentId','siteId','paymentAccountId','operationId','intentId','priceId','priceKey','amountMinor','currency','externalAccountId'];
+      if(!object(original)||![Object.prototype,null].includes(Object.getPrototypeOf(original)))fail();const d=Object.getOwnPropertyDescriptors(original);
+      if(Reflect.ownKeys(d).length!==fields.length)fail();const selected={};
+      for(const key of fields){const p=d[key];if(!p||!p.enumerable||!Object.hasOwn(p,'value'))fail();selected[key]=p.value;}
+      if(!['paymentId','siteId','paymentAccountId','operationId','priceId'].every(key=>typeof selected[key]==='string'&&UUID.test(selected[key]))
+        ||typeof selected.intentId!=='string'||!/^pi_[A-Za-z0-9_]{1,200}$/.test(selected.intentId)||typeof selected.priceKey!=='string'||!/^s5a-price-[a-z0-9-]{1,100}$/.test(selected.priceKey)
+        ||selected.amountMinor!==2000||selected.currency!=='EUR'||selected.externalAccountId!==ACCOUNT)fail();
+      manual=Object.freeze(selected);return await manualRead(context,()=>unpaid(context));
+    }catch{manualFailed=true;throw null;}
+  }
+  async function verifyManualPaymentBaseline(context){
+    if(!manual||manualPermitRead||manualFinalUsed)fail();manualPermitRead=true;
+    return manualRead(context,()=>unpaid(context));
+  }
+  async function inspectManualPayment(eventId,context){
+    if(!manual||manualFinalUsed)fail();manualFinalUsed=true;
+    return manualRead(context,async()=>{
+      if(typeof eventId!=='string'||!/^evt_[A-Za-z0-9_]{1,200}$/.test(eventId))fail();
+      const p=await originalIntent(context),c=p.latest_charge;
+      if(p.status!=='succeeded'||p.amount_received!==2000||!object(c)||!/^ch_[A-Za-z0-9_]{1,200}$/.test(c.id)||c.object!=='charge'||c.livemode!==false||c.customer!==null
+        ||c.payment_intent!==manual.intentId||c.status!=='succeeded'||c.paid!==true||c.captured!==true||c.amount!==2000||c.amount_captured!==2000||c.currency!=='eur'
+        ||c.payment_method_details?.type!=='card'||c.refunded!==false||c.amount_refunded!==0||c.refunds?.object!=='list'||!Array.isArray(c.refunds.data)||c.refunds.data.length||c.refunds.has_more!==false)fail();
+      const e=parseBody(await command(['get','/v1/events/'+eventId],context)),ep=e.data?.object;
+      if(e.id!==eventId||e.object!=='event'||e.type!=='payment_intent.succeeded'||e.api_version!==VERSION||e.livemode!==false
+        ||(e.account!==undefined&&e.account!==ACCOUNT)||!object(ep)||ep.id!==manual.intentId||ep.object!=='payment_intent'||ep.livemode!==false
+        ||ep.status!=='succeeded'||ep.amount!==2000||ep.amount_received!==2000||ep.currency!=='eur'||ep.latest_charge!==c.id||ep.customer!==null||ep.capture_method!=='automatic'
+        ||!Array.isArray(ep.payment_method_types)||ep.payment_method_types.length!==1||ep.payment_method_types[0]!=='card'
+        ||ep.metadata?.payment_id!==manual.paymentId||ep.metadata?.site_id!==manual.siteId||ep.metadata?.source!=='CATALOG')fail();
+      return Object.freeze({captured:true,eventVerified:true});
+    });
+  }
+  async function inspectUnusedManualPayment(context){
+    if(!manual||manualFinalUsed)fail();manualFinalUsed=true;return manualRead(context,()=>unpaid(context));
+  }
+  const manualOperation=(code,limits,body)=>operation(code,limits,body).catch(()=>{manualFailed=true;throw fixed(code);});
   return Object.freeze({
     validateBinding:limits=>operation('BINDING',limits,binding),
     startListener:limits=>operation('LISTENER',limits,startListener),
     stopListener:limits=>operation('STOP',limits,stopListener),
     bindMissedIntent,
     inspectIntent:limits=>operation('INTENT',limits,inspectIntent),
+    bindManualPayment:(value,limits)=>manualOperation('PAYMENT_BINDING',limits,context=>bindManualPayment(value,context)),
+    verifyManualPaymentBaseline:limits=>manualOperation('PAYMENT_BASELINE',limits,verifyManualPaymentBaseline),
+    inspectManualPayment:(eventId,limits)=>manualOperation('PAYMENT',limits,context=>inspectManualPayment(eventId,context)),
+    inspectUnusedManualPayment:limits=>manualOperation('UNUSED',limits,inspectUnusedManualPayment),
     loginInvocation:limits=>operation('LOGIN',limits,async context=>{
       await privateTree(context);
       return Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze([...args,'login']),options:Object.freeze({cwd:ROOT,env,shell:false,
