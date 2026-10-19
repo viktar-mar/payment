@@ -22,7 +22,7 @@ test('actual Vite graph shares SDK across manual/automatic entries and excludes 
     await build({root,configFile:root+'/vite.config.ts',mode:'production',logLevel:'silent',build:{outDir:directory,emptyOutDir:true}});
     const documents=await readdir(directory);assert.ok(documents.includes('index.html'));assert.ok(documents.includes('payment-return.html'));
     assert.equal(documents.includes('form-load-manual.html'),false);assert.equal(documents.includes('form-load-diagnostic.html'),false);
-    for(const name of await readdir(join(directory,'assets')))assert.doesNotMatch(await readFile(join(directory,'assets',name),'utf8'),/manual-session|manual-observation|Ручная проверка/);
+    for(const name of await readdir(join(directory,'assets')))assert.doesNotMatch(await readFile(join(directory,'assets',name),'utf8'),/manual-session|manual-observation|Ручная проверка|__formLoadDiagnostic|__formDiagnosticSession/);
   }finally{await rm(directory,{recursive:true,force:true});}
 });
 
@@ -127,7 +127,7 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
       for(const name of await readdir(join(demo,'dist/assets'))){
         const code=await readFile(join(demo,'dist/assets',name),'utf8');
         assert.doesNotMatch(code,/node:http|node:crypto|createManualFormGateway|PAYMENT_STRIPE_SANDBOX_SECRET_KEY/);
-        if(mode==='production')assert.doesNotMatch(code,/manual-session|manual-observation|Ручная проверка/);
+        if(mode==='production')assert.doesNotMatch(code,/manual-session|manual-observation|Ручная проверка|__formLoadDiagnostic|__formDiagnosticSession/);
       }
     });
   }finally{await rm(directory,{recursive:true,force:true});}

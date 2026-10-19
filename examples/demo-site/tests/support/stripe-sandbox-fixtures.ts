@@ -11,7 +11,12 @@ export function observeSandboxPaymentForm(element:Element) {
   try{
     const state=(element as Element&{state?:unknown}).state,root=element.shadowRoot;
     if(!root)return unavailable;
-    const host=root.querySelector('.payment-element'),pay=root.querySelector<HTMLButtonElement>('button[aria-label="Pay"]');
+    // Public finite DOM description only: this callback is serialized by
+    // Playwright and carries no SDK lease or binding authority.
+    const wrapper=root.querySelector('.payment-element'),slot=wrapper?.querySelector('slot');
+    const projected=slot?.assignedElements();
+    const host=slot?(projected?.length===1&&projected[0]?.parentElement===element?projected[0]:null):wrapper;
+    const pay=root.querySelector<HTMLButtonElement>('button[aria-label="Pay"]');
     return {
       widgetState:['idle','loading','ready','checking','processing','requires_action','succeeded','failed','unknown','expired'].includes(state as string)?state:'UNAVAILABLE',
       elementState:host?(host.querySelector('iframe')?'FRAME':'EMPTY'):'NO_HOST',

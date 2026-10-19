@@ -1,5 +1,6 @@
 import {defineGenericPaymentWidget,GenericPaymentWidget} from '@generic-payments/sdk';
 import {armFormLoadDiagnostic} from '../../../frontend/sdk/src/diagnostics/form-load-observer';
+import {ownedProviderHost} from '../../../frontend/sdk/src/widget/provider-mount';
 
 type Identity={readonly apiBaseUrl:string;readonly siteKey:string;readonly priceKey:string};
 const stateDomain=['idle','loading','ready','checking','processing','requires_action','succeeded','failed','unknown','expired'];
@@ -18,7 +19,7 @@ try {
     snapshot:()=>{
       if(!widget.isConnected||document.querySelectorAll('generic-payment-widget').length!==1)return null;
       const shadow=widget.shadowRoot;if(!shadow)return null;
-      const host=shadow.querySelector('.payment-element'),pay=shadow.querySelector<HTMLButtonElement>('button[aria-label="Pay"]');
+      const host=ownedProviderHost(widget),pay=shadow.querySelector<HTMLButtonElement>('button[aria-label="Pay"]');
       return Object.freeze({...observation.snapshot(),widget_state:stateDomain.includes(widget.state)?widget.state:'UNAVAILABLE',
         element_state:host?(host.querySelector('iframe')?'FRAME':'EMPTY'):'NO_HOST',
         pay_state:!pay?'ABSENT':pay.hidden?'HIDDEN':pay.disabled?'DISABLED':'ENABLED'});

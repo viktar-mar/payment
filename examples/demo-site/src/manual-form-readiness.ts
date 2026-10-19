@@ -1,5 +1,6 @@
 import {unavailableManualFormEvidence} from '../../../infrastructure/stripe-manual-form-evidence.mjs';
 import type {ManualFormReadinessEvidence} from '../../../infrastructure/stripe-manual-form-evidence.mjs';
+import {ownedProviderHost} from '../../../frontend/sdk/src/widget/provider-mount';
 
 interface Options {
   readonly getWidget:()=>HTMLElement|undefined;
@@ -12,7 +13,7 @@ interface Options {
 export function createManualFormReadinessObserver(options:Options):{
   snapshot():Readonly<ManualFormReadinessEvidence>;close():void;
 }{
-  let closed=false,root:ShadowRoot|undefined,current:Element|undefined,loaded=false;
+  let closed=false,root:Document|undefined,current:Element|undefined,loaded=false;
   let csp:ManualFormReadinessEvidence['csp_observation']='UNAVAILABLE',enforced=0,reportOnly=0;
   let last=unavailableManualFormEvidence();
   const active=():boolean=>{try{return !closed&&options.isActive();}catch{return false;}};
@@ -33,9 +34,9 @@ export function createManualFormReadinessObserver(options:Options):{
     }catch{/* Event detail is never inspected or retained. */}
   }
   function identify():{host:Element|null;frames:NodeListOf<HTMLIFrameElement>|undefined}{
-    const next=options.getWidget()?.shadowRoot??undefined;
+    const widget=options.getWidget(),next=widget?.ownerDocument??document;
     if(root!==next){root?.removeEventListener('load',onLoad,true);root=next;root?.addEventListener('load',onLoad,true);current=undefined;loaded=false;}
-    const host=root?.querySelector('.payment-element')??null,frames=host?.querySelectorAll('iframe');
+    const host=widget?ownedProviderHost(widget)??null:null,frames=host?.querySelectorAll('iframe');
     const frame=frames?.length===1?frames[0]:undefined;
     if(current!==frame){current=frame;loaded=false;}
     return {host,frames};
@@ -54,7 +55,7 @@ export function createManualFormReadinessObserver(options:Options):{
       for(let current:Element|null=node;current;){
         const style=getComputedStyle(current);
         if(current.hasAttribute('hidden')||style.display==='none'||style.visibility==='hidden'||style.visibility==='collapse'||style.opacity==='0')return 'HIDDEN';
-        const tree=current.getRootNode();current=current.parentElement??(tree instanceof ShadowRoot?tree.host:null);
+        const tree=current.getRootNode();current=current.assignedSlot??current.parentElement??(tree instanceof ShadowRoot?tree.host:null);
       }
       return node.isConnected?'VISIBLE':'UNAVAILABLE';
     }catch{return 'UNAVAILABLE';}

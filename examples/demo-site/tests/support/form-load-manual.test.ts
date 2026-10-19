@@ -26,7 +26,11 @@ if(isMainThread&&process.argv[1]===fileURLToPath(import.meta.url))test('manual p
       await build({root,configFile:false,logLevel:'silent',resolve:{alias:{'@generic-payments/sdk':root+'/../../frontend/sdk/src/index.ts'}},
         plugins:[{name:'test-only-real-path-observation',enforce:'pre',transform(code,id){
           if(id.endsWith('/checkout-provider-view.ts'))code=code.replace('this.#diagnostic = formLoadBinding(host);','this.#diagnostic = formLoadBinding(host);globalThis.__manualView=this;');
-          if(id.endsWith('/manual-form-readiness.ts'))code=code.replace('return Object.freeze({snapshot,close});','return globalThis.__manualReadiness=Object.freeze({snapshot,close});');
+          if(id.endsWith('/manual-form-readiness.ts')){
+            code=code.replace('return Object.freeze({snapshot,close});','return globalThis.__manualReadiness=Object.freeze({snapshot,close});');
+            if(mutation==='projection')code=code.replace('current.assignedSlot??','');
+            if(mutation==='owned-reader')code=code.replace('ownedProviderHost(widget)','widget.shadowRoot?.querySelector(".payment-element")');
+          }
           if(id.endsWith('/stripe-driver.ts'))code=code.replace('return {\n    async confirm()', 'return globalThis.__manualHandle = {\n    async confirm()');
           if(id.endsWith('/form-load-manual.ts')){
             code=code.replace('const result=classifyFormDiagnosticSample(value);','const result=classifyFormDiagnosticSample(value);(globalThis.__manualTrace??=[]).push({widget_state:value.widget_state,widget_completed:value.widget_completed,operation:value.operation,result});');
@@ -39,12 +43,16 @@ if(isMainThread&&process.argv[1]===fileURLToPath(import.meta.url))test('manual p
       return pathToFileURL(join(output,'manual.mjs')).href;
     };
     const entry=await bundle('control');
-    for(const scenario of ['no-click','synchronous-ready','delayed-ready','after-checkpoint','frame-only','pay-only','late-ready','slow-session','late-session','late-body','expired-start','malformed','missing','expired','exchange-failure','recovery-failure','late-recovery','close','pagehide','abort','evidence-positive','evidence-hidden','evidence-absent','evidence-multiple','evidence-replaced','evidence-load','evidence-loaderstart','evidence-csp','evidence-untrusted','evidence-abort','evidence-close','evidence-no-host','evidence-unavailable','evidence-csp-unavailable','evidence-late-replaced','evidence-late-load','widget-loss-detach','widget-loss-replace','widget-loss-detach-immediate','widget-loss-replace-immediate','widget-loss-reinsert-immediate'])
+    for(const scenario of ['no-click','synchronous-ready','delayed-ready','after-checkpoint','frame-only','pay-only','late-ready','slow-session','late-session','late-body','expired-start','malformed','missing','expired','exchange-failure','recovery-failure','late-recovery','close','pagehide','abort','evidence-positive','evidence-hidden','evidence-slot-hidden','evidence-wrapper-hidden','evidence-foreign-host','evidence-host-reinsert','evidence-host-replace','evidence-absent','evidence-multiple','evidence-replaced','evidence-load','evidence-loaderstart','evidence-csp','evidence-untrusted','evidence-abort','evidence-close','evidence-no-host','evidence-unavailable','evidence-csp-unavailable','evidence-late-replaced','evidence-late-load','widget-loss-detach','widget-loss-replace','widget-loss-detach-immediate','widget-loss-replace-immediate','widget-loss-reinsert-immediate'])
       await t.test(scenario,()=>exercise(entry,scenario,false,true));
     for(const [mutation,scenario,reason] of [['deny','synchronous-ready','deny_view_after_observer_close'],['one-shot','delayed-ready','one_shot_exchange'],['expired-start','expired-start','expired_start_operation']])
       await t.test('in-memory mutation is detected: '+mutation,async()=>{
         const mutant=await bundle(mutation!);
         await assert.rejects(exercise(mutant,scenario!,false,true),error=>{assert.ok(error instanceof Error);assert.ok(error.message.includes(reason!),error.message);t.diagnostic(mutation+' RED detected: '+error.message.split('\n')[0]);return true;});
+      });
+    for(const [mutation,scenario,reason] of [['projection','evidence-wrapper-hidden','composed_host_visibility'],['owned-reader','evidence-load','owned_host_frame_geometry']])
+      await t.test('reader regression mutation is detected: '+mutation,async()=>{
+        const mutant=await bundle(mutation!);await assert.rejects(exercise(mutant,scenario!,false,true),error=>error instanceof Error&&error.message.includes(reason!));
       });
   }finally{await rm(directory,{recursive:true,force:true});}
 });
@@ -85,12 +93,14 @@ if(!isMainThread){
   window.EventTarget.prototype.addEventListener=function(type,listener,options){
     if(type==='securitypolicyviolation'&&scenario==='evidence-csp-unavailable')throw Error('listener_unavailable');
     if(type==='securitypolicyviolation'){capturedCsp.add(listener as (event:unknown)=>void);lateCsp.push(listener as (event:unknown)=>void);}
-    if(type==='load'&&this instanceof window.ShadowRoot){capturedLoad.add(listener as (event:unknown)=>void);lateLoad.push(listener as (event:unknown)=>void);assert.equal(options,true);}
+    // Synthetic load delivery is explicit here; the native browser regression
+    // separately exercises actual trusted iframe load in document Light DOM.
+    if(type==='load'&&this===window.document){capturedLoad.add(listener as (event:unknown)=>void);lateLoad.push(listener as (event:unknown)=>void);assert.equal(options,true);return;}
     return nativeAdd.call(this,type,listener,options);
   };
   window.EventTarget.prototype.removeEventListener=function(type,listener,options){
     if(type==='securitypolicyviolation')capturedCsp.delete(listener as (event:unknown)=>void);
-    if(type==='load'&&this instanceof window.ShadowRoot)capturedLoad.delete(listener as (event:unknown)=>void);
+    if(type==='load'&&this===window.document)capturedLoad.delete(listener as (event:unknown)=>void);
     return nativeRemove.call(this,type,listener,options);
   };
   if(scenario==='evidence-unavailable'){
@@ -105,7 +115,7 @@ if(!isMainThread){
     return event;
   };
   const element={on:(name:string,callback:()=>void)=>{listeners.set(name,callback);return element;},off:(name:string)=>{listeners.delete(name);return element;},
-    mount:(host:HTMLElement)=>{mounts++;assert.equal(host.isConnected,true);assert.equal(host.getRootNode(),window.document.querySelector('generic-payment-widget')!.shadowRoot);host.append(frame);
+    mount:(host:HTMLElement)=>{mounts++;assert.equal(host.isConnected,true);assert.equal(host.getRootNode(),window.document);assert.equal(host.parentElement,window.document.querySelector('generic-payment-widget'));assert.ok(host.assignedSlot);host.append(frame);
       if(['evidence-load','evidence-late-replaced'].includes(scenario)){assert.equal(capturedLoad.size,1,'capture_before_mount');for(const callback of capturedLoad)callback({isTrusted:true,target:frame});}
       if(scenario==='evidence-loaderstart')listeners.get('loaderstart')?.();
       if(scenario==='synchronous-ready')listeners.get('ready')?.();},
@@ -204,8 +214,19 @@ if(!isMainThread){
           if(scenario.includes('reinsert')){assert.equal(reports[1]!.binding,'LOST');assert.deepEqual(evidenceReports[1],before,'lost_generation_terminal_keeps_frozen_evidence');}
         }else if(scenario.startsWith('evidence-')){
           assert.equal(capturedCsp.size,scenario==='evidence-csp-unavailable'?0:1);assert.equal(capturedLoad.size,1);
-          const beforeHostLoss=scenario==='evidence-no-host'?(globalThis as typeof globalThis&{__manualReadiness:{snapshot():Readonly<Record<string,unknown>>}}).__manualReadiness.snapshot():undefined;
+          const hostLoss=['evidence-no-host','evidence-host-reinsert','evidence-host-replace'].includes(scenario);
+          const beforeHostLoss=hostLoss?(globalThis as typeof globalThis&{__manualReadiness:{snapshot():Readonly<Record<string,unknown>>}}).__manualReadiness.snapshot():undefined;
           if(scenario==='evidence-hidden')root.hidden=true;
+          if(scenario==='evidence-slot-hidden')frame.parentElement!.assignedSlot!.hidden=true;
+          if(scenario==='evidence-wrapper-hidden')frame.parentElement!.assignedSlot!.parentElement!.hidden=true;
+          if(scenario==='evidence-foreign-host'){
+            const foreign=window.document.createElement('div');foreign.className='payment-element';foreign.hidden=true;foreign.append(window.document.createElement('iframe'));widget.prepend(foreign);
+          }
+          if(scenario==='evidence-host-reinsert'){
+            const owned=frame.parentElement!;owned.remove();widget.append(owned);
+          }
+          if(scenario==='evidence-host-replace')frame.parentElement!.replaceWith(frame.parentElement!.cloneNode(true));
+          if(hostLoss&&scenario!=='evidence-no-host')for(const callback of lateCsp)callback(csp(true,'connect-src','enforce'));
           if(scenario==='evidence-absent')frame.remove();
           if(scenario==='evidence-no-host')frame.parentElement!.remove();
           if(scenario==='evidence-multiple')frame.parentElement!.append(window.document.createElement('iframe'));
@@ -229,9 +250,9 @@ if(!isMainThread){
             assert.deepEqual(Object.keys(evidence).sort(),['loaderstart_seen','host_box','frame_box','host_visibility','frame_visibility','frame_load','csp_observation','csp_enforced_mask','csp_report_only_mask'].sort());
             if(beforeHostLoss)assert.deepEqual(evidence,beforeHostLoss,'lost_host_freezes_evidence');else{
             assert.equal(evidence.host_box,scenario==='evidence-no-host'?'ABSENT':scenario==='evidence-unavailable'?'UNAVAILABLE':scenario==='evidence-positive'?'POSITIVE_AREA':'ZERO_AREA');
-            assert.equal(evidence.host_visibility,scenario==='evidence-no-host'?'ABSENT':scenario==='evidence-unavailable'?'UNAVAILABLE':scenario==='evidence-hidden'?'HIDDEN':'VISIBLE');
-            assert.equal(evidence.frame_box,['evidence-absent','evidence-no-host'].includes(scenario)?'ABSENT':scenario==='evidence-multiple'?'MULTIPLE':scenario==='evidence-unavailable'?'UNAVAILABLE':scenario==='evidence-positive'?'POSITIVE_AREA':'ZERO_AREA');
-            assert.equal(evidence.frame_visibility,['evidence-absent','evidence-no-host'].includes(scenario)?'ABSENT':['evidence-multiple','evidence-unavailable'].includes(scenario)?'UNAVAILABLE':scenario==='evidence-hidden'?'HIDDEN':'VISIBLE');
+            assert.equal(evidence.host_visibility,scenario==='evidence-no-host'?'ABSENT':scenario==='evidence-unavailable'?'UNAVAILABLE':['evidence-hidden','evidence-slot-hidden','evidence-wrapper-hidden'].includes(scenario)?'HIDDEN':'VISIBLE','composed_host_visibility');
+            assert.equal(evidence.frame_box,['evidence-absent','evidence-no-host'].includes(scenario)?'ABSENT':scenario==='evidence-multiple'?'MULTIPLE':scenario==='evidence-unavailable'?'UNAVAILABLE':scenario==='evidence-positive'?'POSITIVE_AREA':'ZERO_AREA','owned_host_frame_geometry');
+            assert.equal(evidence.frame_visibility,['evidence-absent','evidence-no-host'].includes(scenario)?'ABSENT':['evidence-multiple','evidence-unavailable'].includes(scenario)?'UNAVAILABLE':['evidence-hidden','evidence-slot-hidden','evidence-wrapper-hidden'].includes(scenario)?'HIDDEN':'VISIBLE');
             assert.equal(evidence.frame_load,['evidence-absent','evidence-no-host'].includes(scenario)?'NO_FRAME':scenario==='evidence-multiple'?'UNAVAILABLE':['evidence-load','evidence-late-replaced'].includes(scenario)?'SEEN':'NOT_SEEN');
             }
             assert.equal(evidence.loaderstart_seen,scenario==='evidence-loaderstart');
@@ -244,7 +265,8 @@ if(!isMainThread){
               else for(const callback of capturedLoad)callback({isTrusted:true,target:frame});
               await tick();
             }
-            await advance(1060000);assert.equal(reports.length,scenario==='evidence-no-host'?1:2);
+            await advance(1060000);assert.equal(reports.length,hostLoss?1:2);
+            if(hostLoss)assert.equal(reports[0]!.binding,'LOST');
             if(['evidence-late-replaced','evidence-late-load'].includes(scenario)){
               assert.equal(evidenceReports[0]!.csp_enforced_mask,0,'checkpoint_is_immutable');
               assert.equal(evidenceReports[1]!.csp_enforced_mask,4,'retain_last_active_csp');
@@ -299,5 +321,5 @@ if(!isMainThread){
     }
     assert.equal(window.sessionStorage.getItem('unrelated'),'preserve');
     parentPort?.postMessage('PASS');
-  }finally{Date.now=actualNow;window.close();}
+  }finally{Date.now=actualNow;frame.remove();window.close();}
 }

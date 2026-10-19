@@ -621,6 +621,26 @@ server or contact Stripe; it proves the isolated source inputs, not an actual im
 build or form readiness. Only the five required public diagnostic module/declaration
 files are copied from `infrastructure`, never private local inputs or the whole folder.
 
+Catalog and Donation now mount Stripe's provider container as a child of their own
+widget in document Light DOM, projected through a named slot into the existing
+shadow wrapper. Fake keeps its shadow container. A widget embedded in another
+ShadowRoot rejects Stripe mounting before requesting a provider capability; global
+portals are not supported. Internal generation ownership, rather than class names
+or slot attributes, selects diagnostic geometry and frames. Removing/replacing the
+owned host, slot, or wrapper permanently loses the diagnostic lease, including a
+same-turn remove/reinsert. Pay is still read only inside that widget's ShadowRoot.
+
+`examples/demo-site/tests/support/provider-mount-browser.test.ts` characterizes this
+DOM contract in installed headless Chromium using locally bundled SDK bytes and
+synthetic in-process page/API/provider responses. All other requests and WebSockets
+are denied, service workers blocked, and no browser artifacts are collected. It
+checks actual slot projection, outer geometry, native iframe load, independent
+Catalog/Donation cleanup and the Fake path. Run it from the repository root with
+the installed Node: `node --test examples/demo-site/tests/support/provider-mount-browser.test.ts`.
+This is offline DOM compatibility evidence, not real Stripe ready or Sandbox
+acceptance. A provider iframe and its native load do not establish rendered fields;
+the coherent provider-ready/SDK/Pay checks and immutable confirmation deny remain.
+
 Only after that future approval, the exact command template from the repository root
 is below. Values are placeholders, not commands to execute now. Use a fresh UUID, the
 final reviewed commit SHA, the approved local Unix Docker daemon, six distinct approved
@@ -695,7 +715,8 @@ owned Stripe loader event; it does not establish `ready`. `host_box` and `frame_
 are `ABSENT`, `ZERO_AREA`, `POSITIVE_AREA`, or `UNAVAILABLE`; only the frame may also
 be `MULTIPLE`. Dimensions are discarded immediately. Host/frame visibility is
 `ABSENT`, `VISIBLE`, `HIDDEN`, or `UNAVAILABLE`: `VISIBLE` means only the checked
-layout/style conditions, including ancestors across the shadow host. Multiple frames
+layout/style conditions, including the assigned slot, shadow wrapper and widget
+ancestors. Multiple frames
 have unavailable visibility and load evidence. `frame_load` is `NO_FRAME`, `NOT_SEEN`,
 `SEEN`, or `UNAVAILABLE`, applies only to the current single iframe, and resets when
 that frame changes. A missed/unknown load does not establish failure.

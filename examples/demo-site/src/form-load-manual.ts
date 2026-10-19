@@ -1,5 +1,6 @@
 import {defineGenericPaymentWidget,GenericPaymentWidget} from '@generic-payments/sdk';
 import {armFormLoadDiagnostic} from '../../../frontend/sdk/src/diagnostics/form-load-observer';
+import {ownedProviderHost} from '../../../frontend/sdk/src/widget/provider-mount';
 import {recoverCheckout,storageKey} from '../../../frontend/sdk/src/storage';
 import {exact,object,validateSession} from '../../../frontend/sdk/src/contracts';
 import type {CheckoutSession} from '../../../frontend/sdk/src/contracts';
@@ -42,7 +43,7 @@ export function mountManualFormPage(root:HTMLElement,dependencies:ManualPageDepe
   function sample():Readonly<FormDiagnosticSample>|null{
     if(!widget?.isConnected||!observation||!widget.shadowRoot)return null;
     try{
-      const shadow=widget.shadowRoot,element=shadow.querySelector('.payment-element'),pay=shadow.querySelector<HTMLButtonElement>('button[aria-label="Pay"]');
+      const shadow=widget.shadowRoot,element=ownedProviderHost(widget),pay=shadow.querySelector<HTMLButtonElement>('button[aria-label="Pay"]');
       const visible=(node:HTMLElement):boolean=>{
         for(let current:HTMLElement|null=node;current;current=current.parentElement??(current.getRootNode() instanceof ShadowRoot?(current.getRootNode() as ShadowRoot).host as HTMLElement:null)){
           const style=getComputedStyle(current);if(current.hidden||style.display==='none'||style.visibility==='hidden'||style.visibility==='collapse'||style.opacity==='0')return false;
@@ -114,6 +115,7 @@ export function mountManualFormPage(root:HTMLElement,dependencies:ManualPageDepe
       widget.apiBaseUrl=session.apiBaseUrl;widget.siteKey=session.siteKey;widget.priceKey=session.priceKey;widget.locale='en';
       observation=armFormLoadDiagnostic(widget);readiness.snapshot();widget.addEventListener('click',guard,true);
       changes=new MutationObserver(inspect);changes.observe(widget.shadowRoot!,{subtree:true,attributes:true,childList:true});
+      changes.observe(widget,{subtree:true,attributes:true,childList:true});
       changes.observe(document,{subtree:true,childList:true});
       host.append(widget);widgetWasConnected=widget.isConnected;inspect();
     }catch{if(!closed){status.textContent='Не удалось загрузить форму. Закройте эту вкладку.';close();}}

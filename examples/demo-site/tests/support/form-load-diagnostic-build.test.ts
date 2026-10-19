@@ -20,7 +20,7 @@ if(isMainThread)test('actual diagnostic ESM build preserves its registry and rea
       return new Promise<unknown>((resolve,reject)=>{
         const timer=setTimeout(()=>reject(new Error('offline_graph_check_timeout')),10000);
         worker.once('message',value=>{clearTimeout(timer);resolve(value);});
-        worker.once('error',()=>{clearTimeout(timer);reject(new Error('offline_graph_check_failed'));});
+        worker.once('error',error=>{clearTimeout(timer);reject(error);});
       }).finally(()=>worker.terminate());
     };
     await t.test('bootstrap alone has no network or provider authority',async()=>{
@@ -28,6 +28,12 @@ if(isMainThread)test('actual diagnostic ESM build preserves its registry and rea
     });
     for(const scenario of ['delayed-ready','synchronous-ready'])await t.test(scenario,async()=>{
       assert.deepEqual(await run(scenario),{widget:'ready',operation:'COMPLETED',payEnabled:true,requests:['GET','POST'],confirmations:0});
+    });
+    await t.test('iframe-only remains pending through the packaged reader',async()=>{
+      assert.deepEqual(await run('frame-only'),{widget:'loading',operation:'PENDING',element:'FRAME',ready:false,confirmations:0});
+    });
+    await t.test('same-turn host reinsertion permanently loses the packaged binding',async()=>{
+      assert.deepEqual(await run('host-loss'),{binding:'LOST',element:'NO_HOST',ready:false,confirmations:0});
     });
   }finally {await rm(directory,{recursive:true,force:true});}
 });
@@ -60,7 +66,9 @@ else if(!isMainThread){
         on:(name:string,callback:()=>void)=>{listeners.set(name,callback);return element;},
         off:(name:string)=>{listeners.delete(name);return element;},
         mount:(host:HTMLElement)=>{
-          assert.equal(host.isConnected,true);assert.equal(host.getRootNode(),window.document.querySelector('generic-payment-widget')!.shadowRoot);
+          const widget=window.document.querySelector('generic-payment-widget')!;
+          assert.equal(host.isConnected,true);assert.equal(host.getRootNode(),window.document);
+          assert.equal(host.parentElement,widget);assert.equal(host.assignedSlot?.getRootNode(),widget.shadowRoot);
           host.append(frame);
           assert.equal(snapshot().ready_seen,false);
           if(workerData.scenario==='synchronous-ready'){
@@ -107,6 +115,15 @@ else if(!isMainThread){
       await until(()=>!resume.hidden&&!resume.disabled);
       assert.equal(snapshot().binding,'ARMED');resume.click();
       await until(()=>frame.isConnected);
+      assert.equal(snapshot().element_state,'FRAME');
+      if(workerData.scenario==='frame-only'){
+        assert.equal(widget.shadowRoot!.querySelector('button[aria-label="Pay"]:enabled'),null);
+        parentPort?.postMessage({widget:widget.state,operation:snapshot().operation,element:snapshot().element_state,ready:snapshot().ready_seen,confirmations});
+      }else if(workerData.scenario==='host-loss'){
+        const host=frame.parentElement!;host.remove();widget.append(host);
+        const lost=snapshot();listeners.get('ready')?.();
+        parentPort?.postMessage({binding:lost.binding,element:lost.element_state,ready:snapshot().ready_seen,confirmations});
+      }else{
       if(workerData.scenario==='delayed-ready'){
         assert.equal(widget.state,'loading');
         assert.equal(widget.shadowRoot!.querySelector('button[aria-label="Pay"]:enabled'),null);
@@ -116,12 +133,14 @@ else if(!isMainThread){
       }
       await until(()=>widget.state==='ready');
       const sample=snapshot();
+      assert.equal(sample.element_state,'FRAME','automatic reader resolves the owned Light DOM host');
       for(const flag of ['capability_started','capability_ready','loader_started','loader_ready','element_created',
         'mount_called','mount_returned','ready_seen','view_completed','widget_completed'])assert.equal(sample[flag],true,flag);
       assert.equal(sample.binding,'BOUND');assert.equal(sample.loaderror_seen,false);
       assert.equal(sample.operation,'COMPLETED');
       const pay=widget.shadowRoot!.querySelector('button[aria-label="Pay"]') as HTMLButtonElement;
       parentPort?.postMessage({widget:widget.state,operation:sample.operation,payEnabled:!pay.hidden&&!pay.disabled,requests,confirmations});
+      }
     }else{
       await import(workerData.entry);
       const descriptor=Object.getOwnPropertyDescriptor(globalThis,'__formLoadDiagnostic');
