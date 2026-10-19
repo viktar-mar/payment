@@ -22,7 +22,8 @@ COPY examples/demo-site/index.html examples/demo-site/payment-return.html exampl
 COPY examples/demo-site/src ./examples/demo-site/src
 # Pure browser diagnostic schema and its transitive runtime/type dependencies.
 # Never copy the infrastructure directory (it also holds private local inputs).
-COPY infrastructure/stripe-form-diagnostic-schema.mjs infrastructure/stripe-form-diagnostic-schema.d.mts \
+COPY infrastructure/stripe-manual-form-evidence.mjs infrastructure/stripe-manual-form-evidence.d.mts \
+    infrastructure/stripe-form-diagnostic-schema.mjs infrastructure/stripe-form-diagnostic-schema.d.mts \
     infrastructure/stripe-form-diagnostic-environment.mjs infrastructure/stripe-form-diagnostic-environment.d.mts \
     infrastructure/stripe-form-diagnostic-network.d.mts ./infrastructure/
 ARG PAYMENT_DEMO_BUILD_MODE=production

@@ -1,5 +1,6 @@
 import {validateFormDiagnosticSample,classifyFormDiagnosticSample} from './stripe-form-diagnostic-schema.mjs';
-const KEYS=['version','mode','observation','end','sample','no_confirmation','gateway_closed','runtime_closed','browser_closure','provenance'];
+import {validateManualFormEvidence} from './stripe-manual-form-evidence.mjs';
+const KEYS=['version','mode','observation','end','sample','evidence','no_confirmation','gateway_closed','runtime_closed','browser_closure','provenance'];
 const PROOFS=['no_confirmation','gateway_closed','runtime_closed'];
 const OVERRIDES=['ABORTED','ACTIVE_DEADLINE','FAILED'];
 const encoder=new TextEncoder();
@@ -15,10 +16,11 @@ function exact(value){
 /** Browser provenance only; historical ready is allowed with a dominant failed end. */
 export function validateManualFormReport(value){
   const r=exact(value);
-  if(!r||r.version!==1||r.mode!=='MANUAL_FORM_DIAGNOSTIC'||r.browser_closure!=='NOT_OWNED'||r.provenance!=='BROWSER_REPORTED'
+  if(!r||r.version!==2||r.mode!=='MANUAL_FORM_DIAGNOSTIC'||r.browser_closure!=='NOT_OWNED'||r.provenance!=='BROWSER_REPORTED'
     ||PROOFS.some(key=>typeof r[key]!=='boolean'))return null;
   const s=r.sample===null?null:validateFormDiagnosticSample(r.sample);
-  if(r.sample!==null&&!s)return null;r.sample=s;
+  const e=r.evidence===null?null:validateManualFormEvidence(r.evidence);
+  if((r.sample!==null&&!s)||(r.evidence!==null&&!e)||(s===null)!==(e===null))return null;r.sample=s;r.evidence=e;
   const classification=s?classifyFormDiagnosticSample(s):null;
   let ends;
   switch(r.observation){
@@ -48,8 +50,8 @@ export function parseManualFormReport(wire){
   if(typeof wire!=='string'||!wire.endsWith('\n')||wire.slice(0,-1).includes('\n')||encoder.encode(wire).byteLength>4096)return null;
   try{
     const report=validateManualFormReport(JSON.parse(wire));if(!report)return null;
-    // Finite decoded keys and values contain no colons; count nested sample keys too.
-    if((wire.match(/:/g)??[]).length!==KEYS.length+(report.sample?Object.keys(report.sample).length:0))return null;
+    // Finite decoded keys and values contain no colons; count nested sample/evidence keys too.
+    if((wire.match(/:/g)??[]).length!==KEYS.length+(report.sample?Object.keys(report.sample).length:0)+(report.evidence?Object.keys(report.evidence).length:0))return null;
     return report;
   }catch{return null;}
 }

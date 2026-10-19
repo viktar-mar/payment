@@ -2,6 +2,7 @@ import type {IncomingMessage,Server,ServerResponse} from 'node:http';
 import type {FormDiagnosticLimits,ManualFormHandoff} from './stripe-form-diagnostic-runtime.mjs';
 import type {FormDiagnosticSample} from './stripe-form-diagnostic-schema.mjs';
 
+import type {ManualFormReadinessEvidence} from './stripe-manual-form-evidence.mjs';
 export type ManualGatewayObservationKind='NOT_STARTED'|'READY_REPORTED'|'PENDING_REPORTED'|'TERMINAL_REPORTED'|'NO_REPORT'|'INVALID_REPORT';
 export type ManualGatewayEnd='READY_REPORTED'|'LOCAL_LIMIT'|'NOT_STARTED'|'ABORTED'|'ACTIVE_DEADLINE'|'FAILED';
 /** Finite browser reports, never independent browser/financial proof.
@@ -12,6 +13,7 @@ export interface ManualGatewayObservation {
   readonly observation:ManualGatewayObservationKind;
   readonly end:ManualGatewayEnd;
   readonly sample:Readonly<FormDiagnosticSample>|null;
+  readonly evidence:Readonly<ManualFormReadinessEvidence>|null;
 }
 export interface ManualFormGatewayOptions {
   readonly origin:string;

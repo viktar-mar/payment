@@ -38,7 +38,7 @@ if(isMainThread&&process.argv[1]===fileURLToPath(import.meta.url))test('manual p
       return pathToFileURL(join(output,'manual.mjs')).href;
     };
     const entry=await bundle('control');
-    for(const scenario of ['no-click','synchronous-ready','delayed-ready','after-checkpoint','frame-only','pay-only','late-ready','slow-session','late-session','late-body','expired-start','malformed','missing','expired','exchange-failure','recovery-failure','late-recovery','close','pagehide','abort'])
+    for(const scenario of ['no-click','synchronous-ready','delayed-ready','after-checkpoint','frame-only','pay-only','late-ready','slow-session','late-session','late-body','expired-start','malformed','missing','expired','exchange-failure','recovery-failure','late-recovery','close','pagehide','abort','evidence-positive','evidence-hidden','evidence-absent','evidence-multiple','evidence-replaced','evidence-load','evidence-loaderstart','evidence-csp','evidence-untrusted','evidence-abort','evidence-close','evidence-no-host','evidence-unavailable','evidence-csp-unavailable','evidence-late-replaced','evidence-late-load'])
       await t.test(scenario,()=>exercise(entry,scenario,false,true));
     for(const [mutation,scenario,reason] of [['deny','synchronous-ready','deny_view_after_observer_close'],['one-shot','delayed-ready','one_shot_exchange'],['expired-start','expired-start','expired_start_operation']])
       await t.test('in-memory mutation is detected: '+mutation,async()=>{
@@ -75,8 +75,38 @@ if(!isMainThread){
   const calls:string[]=[],reports:Record<string,unknown>[]=[],listeners=new Map<string,()=>void>();
   let confirmations=0,mounts=0,resumes=0,releaseSession:((value:Response)=>void)|undefined,releaseBody:((value:string)=>void)|undefined,releaseRecovery:(()=>void)|undefined;
   const frame=window.document.createElement('iframe');
+  let forbiddenReads=0;
+  const evidenceReports:Record<string,unknown>[]=[];
+  const capturedCsp=new Set<(event:unknown)=>void>(),capturedLoad=new Set<(event:unknown)=>void>();
+  const lateCsp:((event:unknown)=>void)[]=[],lateLoad:((event:unknown)=>void)[]=[];
+  const nativeAdd=window.EventTarget.prototype.addEventListener,nativeRemove=window.EventTarget.prototype.removeEventListener;
+  window.EventTarget.prototype.addEventListener=function(type,listener,options){
+    if(type==='securitypolicyviolation'&&scenario==='evidence-csp-unavailable')throw Error('listener_unavailable');
+    if(type==='securitypolicyviolation'){capturedCsp.add(listener as (event:unknown)=>void);lateCsp.push(listener as (event:unknown)=>void);}
+    if(type==='load'&&this instanceof window.ShadowRoot){capturedLoad.add(listener as (event:unknown)=>void);lateLoad.push(listener as (event:unknown)=>void);assert.equal(options,true);}
+    return nativeAdd.call(this,type,listener,options);
+  };
+  window.EventTarget.prototype.removeEventListener=function(type,listener,options){
+    if(type==='securitypolicyviolation')capturedCsp.delete(listener as (event:unknown)=>void);
+    if(type==='load'&&this instanceof window.ShadowRoot)capturedLoad.delete(listener as (event:unknown)=>void);
+    return nativeRemove.call(this,type,listener,options);
+  };
+  if(scenario==='evidence-unavailable'){
+    window.HTMLElement.prototype.getBoundingClientRect=function(){throw Error('layout_unavailable');};
+    const nativeStyle=globalThis.getComputedStyle;Object.defineProperty(globalThis,'getComputedStyle',{configurable:true,value:(node:Element,pseudo?:string|null)=>{if(node.classList.contains('payment-element')||node.tagName==='IFRAME')throw Error('style_unavailable');return nativeStyle(node,pseudo);}});
+  }
+  if(scenario==='evidence-positive')window.HTMLElement.prototype.getBoundingClientRect=function(){return {width:8,height:4} as DOMRect;};
+  for(const name of ['src','contentWindow','contentDocument'])Object.defineProperty(frame,name,{get(){forbiddenReads++;throw Error('forbidden_frame_read_'+name);}});
+  const csp=(trusted:boolean,directive:string,disposition:string)=>{
+    const event={isTrusted:trusted,effectiveDirective:directive,disposition};
+    for(const key of ['blockedURI','sourceFile','sample'])Object.defineProperty(event,key,{get(){forbiddenReads++;throw Error('forbidden_csp_read_'+key);}});
+    return event;
+  };
   const element={on:(name:string,callback:()=>void)=>{listeners.set(name,callback);return element;},off:(name:string)=>{listeners.delete(name);return element;},
-    mount:(host:HTMLElement)=>{mounts++;assert.equal(host.isConnected,true);assert.equal(host.getRootNode(),window.document.querySelector('generic-payment-widget')!.shadowRoot);host.append(frame);if(scenario==='synchronous-ready')listeners.get('ready')?.();},
+    mount:(host:HTMLElement)=>{mounts++;assert.equal(host.isConnected,true);assert.equal(host.getRootNode(),window.document.querySelector('generic-payment-widget')!.shadowRoot);host.append(frame);
+      if(['evidence-load','evidence-late-replaced'].includes(scenario)){assert.equal(capturedLoad.size,1,'capture_before_mount');for(const callback of capturedLoad)callback({isTrusted:true,target:frame});}
+      if(scenario==='evidence-loaderstart')listeners.get('loaderstart')?.();
+      if(scenario==='synchronous-ready')listeners.get('ready')?.();},
     destroy:()=>frame.remove(),focus:()=>{}};
   Object.defineProperty(window,'Stripe',{value:Object.assign((key:string)=>{
     assert.equal(key,'pk_test_fixture');return {elements:(options:{clientSecret:string})=>{assert.equal(options.clientSecret,secret);return {create:(kind:string)=>{assert.equal(kind,'payment');return element;},update:()=>{}};},
@@ -88,6 +118,7 @@ if(!isMainThread){
       assert.equal(init?.method,'POST');assert.equal(init?.credentials,'same-origin');assert.equal(init?.cache,'no-store');
       if(url.pathname==='/manual-session'){
         assert.equal(init?.body,'{}');assert.equal(now,1000000);
+        if(scenario==='evidence-csp'){assert.equal(capturedCsp.size,1,'collector_before_session_handoff');for(const callback of capturedCsp)callback(csp(true,'script-src','enforce'));}
         if(['late-session','slow-session','expired-start'].includes(scenario))return new Promise<Response>(resolve=>{releaseSession=resolve;});
         if(scenario==='exchange-failure')throw Error(secret);
         if(scenario==='missing')return Response.json(null);
@@ -97,7 +128,10 @@ if(!isMainThread){
         return Response.json(session);
       }
       assert.equal(url.pathname,'/manual-observation');
-      const sample=JSON.parse(String(init?.body)) as Record<string,unknown>;reports.push(sample);
+      const envelope=JSON.parse(String(init?.body)) as {version:number;sample:Record<string,unknown>;evidence:Record<string,unknown>};
+      assert.deepEqual(Object.keys(envelope).sort(),['evidence','sample','version']);assert.equal(envelope.version,2);
+      assert.equal(typeof envelope.evidence.loaderstart_seen,'boolean');evidenceReports.push(envelope.evidence);
+      const sample=envelope.sample;reports.push(sample);
       assert.deepEqual(Object.keys(sample).sort(),['version','binding','capability_started','capability_ready','loader_started','loader_ready','element_created','mount_called','mount_returned','ready_seen','loaderror_seen','view_completed','widget_completed','confirmation_blocked','catchup','operation','widget_state','element_state','pay_state','pay_visible','bucket'].sort());
       assert.ok(JSON.stringify(sample).length<4096);return new Response(null,{status:204});
     }
@@ -137,6 +171,56 @@ if(!isMainThread){
       }else{
         await until(()=>frame.isConnected);assert.equal(mounts,1);assert.equal(resumes,1);
         const widget=root.querySelector('generic-payment-widget') as HTMLElement&{state:string};
+        if(scenario.startsWith('evidence-')){
+          assert.equal(capturedCsp.size,scenario==='evidence-csp-unavailable'?0:1);assert.equal(capturedLoad.size,1);
+          if(scenario==='evidence-hidden')root.hidden=true;
+          if(scenario==='evidence-absent')frame.remove();
+          if(scenario==='evidence-no-host')frame.parentElement!.remove();
+          if(scenario==='evidence-multiple')frame.parentElement!.append(window.document.createElement('iframe'));
+          if(scenario==='evidence-replaced'){
+            for(const callback of capturedLoad)callback({isTrusted:true,target:frame});
+            const replacement=window.document.createElement('iframe');frame.replaceWith(replacement);
+            for(const callback of capturedLoad)callback({isTrusted:true,target:frame});
+          }
+          if(scenario==='evidence-csp')for(const callback of capturedCsp){callback(csp(true,'script-src-elem','enforce'));callback(csp(true,'child-src','enforce'));callback(csp(true,'connect-src','report'));callback(csp(true,'style-src','report'));}
+          if(scenario==='evidence-untrusted'){
+            for(const callback of capturedCsp)callback(csp(false,'script-src','enforce'));
+            for(const callback of capturedLoad)callback({isTrusted:false,target:frame});
+          }
+          if(scenario==='evidence-abort')controller.abort();
+          if(scenario==='evidence-close')page?.close();
+          if(['evidence-abort','evidence-close'].includes(scenario)){
+            assert.equal(capturedCsp.size,0);assert.equal(capturedLoad.size,0);
+          }else{
+            await advance(1015000);
+            const evidence=evidenceReports[0]!;
+            assert.deepEqual(Object.keys(evidence).sort(),['loaderstart_seen','host_box','frame_box','host_visibility','frame_visibility','frame_load','csp_observation','csp_enforced_mask','csp_report_only_mask'].sort());
+            assert.equal(evidence.host_box,scenario==='evidence-no-host'?'ABSENT':scenario==='evidence-unavailable'?'UNAVAILABLE':scenario==='evidence-positive'?'POSITIVE_AREA':'ZERO_AREA');
+            assert.equal(evidence.host_visibility,scenario==='evidence-no-host'?'ABSENT':scenario==='evidence-unavailable'?'UNAVAILABLE':scenario==='evidence-hidden'?'HIDDEN':'VISIBLE');
+            assert.equal(evidence.frame_box,['evidence-absent','evidence-no-host'].includes(scenario)?'ABSENT':scenario==='evidence-multiple'?'MULTIPLE':scenario==='evidence-unavailable'?'UNAVAILABLE':scenario==='evidence-positive'?'POSITIVE_AREA':'ZERO_AREA');
+            assert.equal(evidence.frame_visibility,['evidence-absent','evidence-no-host'].includes(scenario)?'ABSENT':['evidence-multiple','evidence-unavailable'].includes(scenario)?'UNAVAILABLE':scenario==='evidence-hidden'?'HIDDEN':'VISIBLE');
+            assert.equal(evidence.frame_load,['evidence-absent','evidence-no-host'].includes(scenario)?'NO_FRAME':scenario==='evidence-multiple'?'UNAVAILABLE':['evidence-load','evidence-late-replaced'].includes(scenario)?'SEEN':'NOT_SEEN');
+            assert.equal(evidence.loaderstart_seen,scenario==='evidence-loaderstart');
+            assert.equal(evidence.csp_observation,scenario==='evidence-csp-unavailable'?'UNAVAILABLE':'OBSERVED');assert.equal(evidence.csp_enforced_mask,scenario==='evidence-csp'?3:0);assert.equal(evidence.csp_report_only_mask,scenario==='evidence-csp'?12:0);
+            assert.equal(reports[0]!.ready_seen,false);
+            if(['evidence-late-replaced','evidence-late-load'].includes(scenario)){
+              await advance(1020000);
+              for(const callback of capturedCsp)callback(csp(true,'connect-src','enforce'));
+              if(scenario==='evidence-late-replaced')frame.replaceWith(window.document.createElement('iframe'));
+              else for(const callback of capturedLoad)callback({isTrusted:true,target:frame});
+              await tick();
+            }
+            await advance(1060000);assert.equal(reports.length,scenario==='evidence-no-host'?1:2);
+            if(['evidence-late-replaced','evidence-late-load'].includes(scenario)){
+              assert.equal(evidenceReports[0]!.csp_enforced_mask,0,'checkpoint_is_immutable');
+              assert.equal(evidenceReports[1]!.csp_enforced_mask,4,'retain_last_active_csp');
+              assert.equal(evidenceReports[1]!.frame_load,scenario==='evidence-late-replaced'?'NOT_SEEN':'SEEN','retain_current_frame_load');
+            }
+          }
+          assert.equal(capturedCsp.size,0);assert.equal(capturedLoad.size,0);
+          for(const callback of lateCsp)callback(csp(true,'script-src','enforce'));
+          for(const callback of lateLoad)callback({isTrusted:true,target:frame});
+        }else{
         if(['delayed-ready','close','pagehide','abort'].includes(scenario))listeners.get('ready')?.();
         if(scenario==='pay-only'){const pay=widget.shadowRoot!.querySelector('button')!;pay.hidden=false;pay.disabled=false;pay.setAttribute('aria-label','Pay');}
         if(scenario==='after-checkpoint'){
@@ -146,7 +230,8 @@ if(!isMainThread){
           await advance(1059999);assert.equal(frame.isConnected,true);await advance(1060000);
         }else if(['synchronous-ready','delayed-ready','close','pagehide','abort'].includes(scenario)){
           await until(()=>widget.state==='ready');await advance(1000100);
-          assert.equal(reports.length,1);assert.equal(reports[0]!.ready_seen,true);assert.equal(reports[0]!.bucket,'BEFORE_15S');
+          assert.equal(reports.length,1);assert.equal(reports[0]!.ready_seen,true);
+          assert.equal(capturedCsp.size,0,'ready_csp_cleanup');assert.equal(capturedLoad.size,0,'ready_load_cleanup');assert.equal(reports[0]!.bucket,'BEFORE_15S');
           assert.ok(root.textContent?.includes('Форма сообщила о готовности. Проверьте, видны ли поля; ничего не вводите'));
           if(workerData.instrumented){
             const captured=globalThis as typeof globalThis&{__manualView:{confirm():Promise<unknown>};__manualHandle:{confirm():Promise<unknown>};__manualTrace:{widget_state:string;widget_completed:boolean;operation:string;result:string}[]};
@@ -167,12 +252,14 @@ if(!isMainThread){
           if(scenario==='late-ready'){now=1060000;listeners.get('ready')?.();await tick();}
           await advance(1060000);assert.equal(reports.length,2);assert.equal(reports[1]!.bucket,'AT_LIMIT');
         }
+        }
         assert.equal(frame.isConnected,false);assert.equal(root.querySelector('generic-payment-widget'),null);
         assert.equal(calls.filter(path=>path.endsWith('/client-session')).length,1);assert.equal(resumes,1);
         listeners.get('ready')?.();await tick();assert.equal(root.querySelector('generic-payment-widget'),null);
       }
+      assert.equal(capturedCsp.size,0,'collector_csp_cleanup');assert.equal(capturedLoad.size,0,'collector_load_cleanup');
       page?.close();assert.equal(window.sessionStorage.getItem(ownedKey),null);assert.equal([...timers.values()].filter(timer=>timer.at>now).length,0);
-      assert.equal(confirmations,0);
+      assert.equal(confirmations,0);assert.equal(forbiddenReads,0,'forbidden_detail_reads');
       const safe=JSON.stringify(reports)+root.outerHTML+window.location.href;
       for(const value of [token,secret,checkout])assert.equal(safe.includes(value),false);
     }

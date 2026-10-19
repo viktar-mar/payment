@@ -676,8 +676,12 @@ original observation cutoff. Afterwards, close only this tab and separately tell
 operator whether the fields were visible. No console/Network/HAR/trace/iframe payload
 or screenshot collection is requested.
 
-The report is version 1, mode `MANUAL_FORM_DIAGNOSTIC`, at most 4096 bytes. It exposes
-`observation`, `end`, a finite `sample` (or null), and `no_confirmation`, `gateway_closed`,
+The report is version 2, mode `MANUAL_FORM_DIAGNOSTIC`, at most 4096 UTF-8 bytes. Manual
+observations are exactly `{version:2,sample,evidence}`; the nested SDK sample remains
+version 1. Legacy/manual mixed formats, duplicate decoded keys at any depth, unknown
+fields, and partial evidence are rejected. Automated diagnostic formats are unchanged.
+The final report exposes `observation`, `end`, a finite `sample` and `evidence` (both
+null when no sample was accepted), and `no_confirmation`, `gateway_closed`,
 `runtime_closed`. Its provenance is always `BROWSER_REPORTED`; `browser_closure` is
 always `NOT_OWNED`. `READY_REPORTED` requires a coherent SDK sample and visible/enabled
 Pay; an iframe alone, no report or an AT_LIMIT sample cannot establish readiness. A
@@ -685,6 +689,31 @@ historical ready sample can remain alongside `end=FAILED`. Exit 0 requires
 `end=READY_REPORTED` and all three positive owned proofs, and means only that this
 bounded experiment completed. It is no payment-success, independent browser or
 environment proof. Unknown financial facts or unconfirmed owned cleanup give exit 1.
+
+Manual evidence contains only finite categories. `loaderstart_seen` records the SDK's
+owned Stripe loader event; it does not establish `ready`. `host_box` and `frame_box`
+are `ABSENT`, `ZERO_AREA`, `POSITIVE_AREA`, or `UNAVAILABLE`; only the frame may also
+be `MULTIPLE`. Dimensions are discarded immediately. Host/frame visibility is
+`ABSENT`, `VISIBLE`, `HIDDEN`, or `UNAVAILABLE`: `VISIBLE` means only the checked
+layout/style conditions, including ancestors across the shadow host. Multiple frames
+have unavailable visibility and load evidence. `frame_load` is `NO_FRAME`, `NOT_SEEN`,
+`SEEN`, or `UNAVAILABLE`, applies only to the current single iframe, and resets when
+that frame changes. A missed/unknown load does not establish failure.
+
+`csp_observation` is `OBSERVED` while the owned violation listener is available, or
+`UNAVAILABLE` with zero masks. `csp_enforced_mask` and `csp_report_only_mask` separately
+combine script=1, frame/child=2, connect=4, and other directives=8, using only trusted
+events' directive and disposition. No blocked URL, source, sample, frame URL/document,
+resource timing, or cross-origin contents are inspected. Evidence collection starts
+at the single Start before session exchange and stops on SDK ready, page close,
+abort, or the original deadline. Missing observations remain unknown. Active DOM
+changes and trusted CSP/load events refresh the finite cache;
+the deadline uses its last active snapshot. An already sent 15-second checkpoint
+stays unchanged; only the next permitted terminal/limit observation uses newer evidence.
+No extra observation or additional time is granted. Unavailable evidence remains
+unknown and cannot upgrade readiness or authorize another attempt. This change
+does not fix Stripe rendering or prove that Stripe card fields rendered. Browser
+evidence always remains `BROWSER_REPORTED`.
 
 The controller closes gateway admission, attempts exactly one financial read under
 the original remaining authority, then closes only its verified owned runtime. Failed

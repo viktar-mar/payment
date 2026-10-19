@@ -2,7 +2,7 @@ import {resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {manualFormOptIn,validateManualFormOptions} from './stripe-manual-form-options.mjs';
 import {validateManualFormReport,formatManualFormReport} from './stripe-manual-form-schema.mjs';
-const EMPTY=Object.freeze({version:1,mode:'MANUAL_FORM_DIAGNOSTIC',observation:'NOT_STARTED',end:'FAILED',sample:null,
+const EMPTY=Object.freeze({version:2,mode:'MANUAL_FORM_DIAGNOSTIC',observation:'NOT_STARTED',end:'FAILED',sample:null,evidence:null,
   no_confirmation:false,gateway_closed:false,runtime_closed:false,browser_closure:'NOT_OWNED',provenance:'BROWSER_REPORTED'});
 const failed=()=>Object.freeze({report:EMPTY,exitCode:1});
 const FLAGS=['PAYMENT_STRIPE_SANDBOX_ENABLED','PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY',
@@ -23,9 +23,9 @@ function limitSnapshot(value){
   return Object.freeze(l);
 }
 function gatewayObservation(value){
-  const o=exact(value,['observation','end','sample']);if(!o)return null;
+  const o=exact(value,['observation','end','sample','evidence']);if(!o)return null;
   const r=validateManualFormReport({...EMPTY,...o,no_confirmation:true,gateway_closed:true,runtime_closed:true});
-  return r?{observation:r.observation,end:r.end,sample:r.sample}:null;
+  return r?{observation:r.observation,end:r.end,sample:r.sample,evidence:r.evidence}:null;
 }
 function stdoutWriter(stream){
   return text=>new Promise((accept,reject)=>{
@@ -57,7 +57,7 @@ export async function runManualFormDiagnostic(options,originalLimits,dependencie
   const cleanup=Object.freeze({deadline:limits.deadline+120000}),latestStart=limits.deadline-120000;
   const canonical='http://127.0.0.1:'+selected.manualPort+'/form-load-manual.html';
   let runtime,gateway,runtimeCloseUsed=false,gatewayCloseTask,gatewayCreationStarted=false,cleanupStarted=false,finalized=false,hasFailed=false;
-  let noConfirmation=false,gatewayClosed=false,runtimeClosed=false,observation={observation:'NOT_STARTED',end:'FAILED',sample:null};
+  let noConfirmation=false,gatewayClosed=false,runtimeClosed=false,observation={observation:'NOT_STARTED',end:'FAILED',sample:null,evidence:null};
   const owned=new Set(),runtimeWork=new Set();
   function authority(){return !limits.signal?.aborted&&now()<limits.deadline;}
   function dominant(){return limits.signal?.aborted?'ABORTED':now()>=limits.deadline?'ACTIVE_DEADLINE':null;}
@@ -121,9 +121,9 @@ export async function runManualFormDiagnostic(options,originalLimits,dependencie
     const opened=await bounded(start(()=>callBefore(gateway.open,gateway,[]),'gateway'),latestStart,limits.signal);
     if(exact(opened,['url'])?.url!==canonical)throw null;
     await bounded(start(()=>callBefore(dependencies.write??stdout,null,[canonical+'\n'],limits.deadline-60000)),limits.deadline-60000,limits.signal);
-    observation={observation:'NO_REPORT',end:'FAILED',sample:null};
+    observation={observation:'NO_REPORT',end:'FAILED',sample:null,evidence:null};
     const observed=gatewayObservation(await bounded(start(()=>callBefore(gateway.wait,gateway,[],limits.deadline-60000)),limits.deadline-60000,limits.signal));
-    if(!observed){observation={observation:'INVALID_REPORT',end:'FAILED',sample:null};throw null;}
+    if(!observed){observation={observation:'INVALID_REPORT',end:'FAILED',sample:null,evidence:null};throw null;}
     observation=observed;
   }catch{hasFailed=true;}
   finally{

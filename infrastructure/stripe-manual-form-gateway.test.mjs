@@ -12,6 +12,8 @@ const ready=()=>({version:1,binding:'BOUND',capability_started:true,capability_r
   widget_completed:true,confirmation_blocked:false,catchup:'RESOLVED',operation:'COMPLETED',widget_state:'ready',
   element_state:'FRAME',pay_state:'ENABLED',pay_visible:true,bucket:'BEFORE_15S'});
 const pending=()=>({...ready(),ready_seen:false,view_completed:false,widget_completed:false,catchup:'NOT_STARTED',operation:'PENDING',widget_state:'loading',pay_state:'ABSENT',pay_visible:false,bucket:'AFTER_15S'});
+const evidence={loaderstart_seen:true,host_box:'POSITIVE_AREA',frame_box:'POSITIVE_AREA',host_visibility:'VISIBLE',frame_visibility:'VISIBLE',frame_load:'SEEN',csp_observation:'OBSERVED',csp_enforced_mask:2,csp_report_only_mask:4};
+const wire=sample=>JSON.stringify({version:2,sample,evidence});
 const validSession=()=>({version:2,apiBaseUrl:'http://127.0.0.1:18080',siteKey:'site-test',priceKey:'price-test',checkoutId:'11111111-2222-4333-8444-555555555555',
   checkoutToken:TOKEN,expiresAt:'2099-01-01T00:00:00.000Z',providerType:'STRIPE',confirmationMode:'CLIENT_PROVIDER',
   state:{checkoutId:'11111111-2222-4333-8444-555555555555',paymentId:'22222222-2222-4333-8444-555555555555',amountMinor:2000,currency:'EUR',status:'REQUIRES_PAYMENT_METHOD',expiresAt:'2099-01-01T00:00:00.000Z',
@@ -89,7 +91,7 @@ test('authenticated malformed or oversized exchange consumes handoff and fails w
   const f=fixture();await f.gateway.open();const doc=await f.document(),cookie=doc.headers['set-cookie'].split(';')[0];
   assert.ok([400,413].includes((await f.send('POST','/manual-session',{headers:f.auth(cookie),body})).statusCode));
   assert.equal((await f.send('POST','/manual-session',{headers:f.auth(cookie)})).statusCode,410);
-  assert.deepEqual(await f.gateway.wait(),{observation:'NO_REPORT',end:'FAILED',sample:null});await f.gateway.close({deadline:f.limits.deadline+120000});
+  assert.deepEqual(await f.gateway.wait(),{observation:'NO_REPORT',end:'FAILED',sample:null,evidence:null});await f.gateway.close({deadline:f.limits.deadline+120000});
 });
 test('session consumption precedes partial delivery and stalled response offers no retry',async()=>{
   const f=fixture();await f.gateway.open();const doc=await f.document(),cookie=doc.headers['set-cookie'].split(';')[0];
@@ -122,49 +124,49 @@ test('invalid gateway configuration rejects before dependency getters: '+JSON.st
 });
 test('ready is browser reported and wait preserves its original visual inspection cutoff',async()=>{
   const f=fixture();await f.gateway.open();const {cookie}=await f.grant();let settled=false;const waiting=f.gateway.wait().then(value=>{settled=true;return value;});
-  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(ready())})).statusCode,204);
+  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(ready())})).statusCode,204);
   await f.advance(60999);assert.equal(settled,false);await f.advance(61000);
-  assert.deepEqual(await waiting,{observation:'READY_REPORTED',end:'READY_REPORTED',sample:ready()});
-  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(ready())})).statusCode,410);await f.gateway.close({deadline:f.limits.deadline+120000});
+  assert.deepEqual(await waiting,{observation:'READY_REPORTED',end:'READY_REPORTED',sample:ready(),evidence});
+  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(ready())})).statusCode,410);await f.gateway.close({deadline:f.limits.deadline+120000});
 });
 test('one pending checkpoint and terminal report are accepted, a second pending is refused',async()=>{
   const f=fixture();await f.gateway.open();const {cookie}=await f.grant();await f.advance(16000);
-  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(pending())})).statusCode,204);
-  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(pending())})).statusCode,410);
-  const sample={...ready(),bucket:'AFTER_15S'};assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(sample)})).statusCode,204);
-  await f.advance(61000);assert.deepEqual(await f.gateway.wait(),{observation:'READY_REPORTED',end:'READY_REPORTED',sample});await f.gateway.close({deadline:f.limits.deadline+120000});
+  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(pending())})).statusCode,204);
+  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(pending())})).statusCode,410);
+  const sample={...ready(),bucket:'AFTER_15S'};assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(sample)})).statusCode,204);
+  await f.advance(61000);assert.deepEqual(await f.gateway.wait(),{observation:'READY_REPORTED',end:'READY_REPORTED',sample,evidence});await f.gateway.close({deadline:f.limits.deadline+120000});
 });
-for(const [index,sample] of [{...ready(),pay_visible:false},{...ready(),pay_state:'DISABLED'},{...ready(),loader_started:false},{...ready(),unknown:TOKEN},{sample:ready()},
+for(const [index,sample] of [{...ready(),pay_visible:false},{...ready(),pay_state:'DISABLED'},{...ready(),loader_started:false},{...ready(),unknown:TOKEN},{sample:ready(),evidence},
   {...pending(),bucket:'BEFORE_15S'},{...ready(),bucket:'AT_LIMIT'}].entries())
 test('malformed or incoherent report cannot manufacture ready: case '+index,async()=>{
-  const f=fixture();await f.gateway.open();const {cookie}=await f.grant();assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(sample)})).statusCode,400);
-  assert.deepEqual(await f.gateway.wait(),{observation:'INVALID_REPORT',end:'FAILED',sample:null});await f.gateway.close({deadline:f.limits.deadline+120000});
+  const f=fixture();await f.gateway.open();const {cookie}=await f.grant();assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(sample)})).statusCode,400);
+  assert.deepEqual(await f.gateway.wait(),{observation:'INVALID_REPORT',end:'FAILED',sample:null,evidence:null});await f.gateway.close({deadline:f.limits.deadline+120000});
 });
 test('browser AFTER_15S sample is valid before gateway15s because client clock starts before exchange',async()=>{
   const f=fixture();await f.gateway.open();const {cookie}=await f.grant();
-  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(pending())})).statusCode,204);
-  const sample={...ready(),bucket:'AFTER_15S'};assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(sample)})).statusCode,204);
-  await f.advance(61000);assert.deepEqual(await f.gateway.wait(),{observation:'READY_REPORTED',end:'READY_REPORTED',sample});await f.gateway.close({deadline:f.limits.deadline+120000});
+  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(pending())})).statusCode,204);
+  const sample={...ready(),bucket:'AFTER_15S'};assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(sample)})).statusCode,204);
+  await f.advance(61000);assert.deepEqual(await f.gateway.wait(),{observation:'READY_REPORTED',end:'READY_REPORTED',sample,evidence});await f.gateway.close({deadline:f.limits.deadline+120000});
 });
 test('observation rejects duplicate JSON keys and over 4096 bytes without reflecting private payload',async()=>{
-  for(const body of ['{"version":1,'+JSON.stringify(ready()).slice(1),' '.repeat(4097)]){
+  for(const body of ['{"version":1,'+wire(ready()).slice(1),' '.repeat(4097)]){
     const f=fixture();await f.gateway.open();const {cookie}=await f.grant();const res=await f.send('POST','/manual-observation',{headers:f.auth(cookie),body});
     assert.ok([400,413].includes(res.statusCode));assert.equal(res.text.includes(TOKEN),false);assert.equal((await f.gateway.wait()).observation,'INVALID_REPORT');await f.gateway.close({deadline:f.limits.deadline+120000});
   }
 });
 test('no start times out at admission cutoff and no reads or writes occur after it',async()=>{
-  const f=fixture();await f.gateway.open();await f.advance(f.limits.deadline-120000);assert.deepEqual(await f.gateway.wait(),{observation:'NOT_STARTED',end:'NOT_STARTED',sample:null});
+  const f=fixture();await f.gateway.open();await f.advance(f.limits.deadline-120000);assert.deepEqual(await f.gateway.wait(),{observation:'NOT_STARTED',end:'NOT_STARTED',sample:null,evidence:null});
   const before=f.calls.length;assert.equal((await f.document()).statusCode,410);assert.equal(f.calls.length,before);await f.gateway.close({deadline:f.limits.deadline+120000});
 });
 test('started timeout has no invented sample and abort has precedence over historical ready',async()=>{
-  const f=fixture();await f.gateway.open();await f.grant();await f.advance(61000);assert.deepEqual(await f.gateway.wait(),{observation:'NO_REPORT',end:'LOCAL_LIMIT',sample:null});await f.gateway.close({deadline:f.limits.deadline+120000});
-  const g=fixture();await g.gateway.open();const {cookie}=await g.grant();await g.send('POST','/manual-observation',{headers:g.auth(cookie),body:JSON.stringify(ready())});g.controller.abort();
-  assert.deepEqual(await g.gateway.wait(),{observation:'READY_REPORTED',end:'ABORTED',sample:ready()});await g.gateway.close({deadline:g.limits.deadline+120000});
+  const f=fixture();await f.gateway.open();await f.grant();await f.advance(61000);assert.deepEqual(await f.gateway.wait(),{observation:'NO_REPORT',end:'LOCAL_LIMIT',sample:null,evidence:null});await f.gateway.close({deadline:f.limits.deadline+120000});
+  const g=fixture();await g.gateway.open();const {cookie}=await g.grant();await g.send('POST','/manual-observation',{headers:g.auth(cookie),body:wire(ready())});g.controller.abort();
+  assert.deepEqual(await g.gateway.wait(),{observation:'READY_REPORTED',end:'ABORTED',sample:ready(),evidence});await g.gateway.close({deadline:g.limits.deadline+120000});
 });
 test('an authenticated stalled body cannot cross original cutoff into a session handoff',async()=>{
   const f=fixture();await f.gateway.open();const doc=await f.document(),cookie=doc.headers['set-cookie'].split(';')[0],stream=new Readable({read(){}});
   const {res}=f.request('POST','/manual-session',{headers:f.auth(cookie),stream});await turn();await f.advance(61000);stream.push('{}');stream.push(null);await turn();
-  assert.equal(res.text.includes(TOKEN),false);assert.deepEqual(await f.gateway.wait(),{observation:'NO_REPORT',end:'LOCAL_LIMIT',sample:null});await f.gateway.close({deadline:f.limits.deadline+120000});
+  assert.equal(res.text.includes(TOKEN),false);assert.deepEqual(await f.gateway.wait(),{observation:'NO_REPORT',end:'LOCAL_LIMIT',sample:null,evidence:null});await f.gateway.close({deadline:f.limits.deadline+120000});
 });
 test('delayed first authenticated body spends authority before an overlapping valid exchange',async()=>{
   const f=fixture();await f.gateway.open();const doc=await f.document(),cookie=doc.headers['set-cookie'].split(';')[0],stream=new Readable({read(){}});
@@ -215,13 +217,13 @@ test('close proves owned socket and response settlement independently of destroy
 });
 test('premature response close spends the lease and fails rather than allowing later ready proof',async()=>{
   const f=fixture();await f.gateway.open();const {cookie,reply}=await (async()=>{const doc=await f.document(),cookie=doc.headers['set-cookie'].split(';')[0];return {cookie,reply:await f.send('POST','/manual-session',{headers:f.auth(cookie),hold:true})};})();
-  reply.emit('close');await turn();assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(ready())})).statusCode,410);
-  assert.deepEqual(await f.gateway.wait(),{observation:'NO_REPORT',end:'FAILED',sample:null});await f.gateway.close({deadline:f.limits.deadline+120000});
+  reply.emit('close');await turn();assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(ready())})).statusCode,410);
+  assert.deepEqual(await f.gateway.wait(),{observation:'NO_REPORT',end:'FAILED',sample:null,evidence:null});await f.gateway.close({deadline:f.limits.deadline+120000});
 });
 test('owned response error is sanitized and closes without an unhandled error event',async()=>{
   const f=fixture();await f.gateway.open();const doc=await f.document(),cookie=doc.headers['set-cookie'].split(';')[0];
   const reply=await f.send('POST','/manual-session',{headers:f.auth(cookie),hold:true});assert.doesNotThrow(()=>reply.emit('error',Error(TOKEN)));
-  assert.deepEqual(await f.gateway.wait(),{observation:'NO_REPORT',end:'FAILED',sample:null});reply.emit('close');await f.gateway.close({deadline:f.limits.deadline+120000});
+  assert.deepEqual(await f.gateway.wait(),{observation:'NO_REPORT',end:'FAILED',sample:null,evidence:null});reply.emit('close');await f.gateway.close({deadline:f.limits.deadline+120000});
 });
 test('synchronous listen refusal is bounded and never leaks raw errors or unhandled rejection',async()=>{
   const f=fixture();f.server.listen=()=>{throw Error(TOKEN);};await assert.rejects(f.gateway.open(),error=>!String(error).includes(TOKEN));await turn();
@@ -254,18 +256,18 @@ test('duplicate Host, Origin and cookie header lines never consume an otherwise 
 });
 test('pending checkpoint followed by finite terminal/limit preserves exact final sample without readiness',async()=>{
   for(const terminal of [{...pending(),bucket:'AT_LIMIT'},{...pending(),operation:'FAILED'}]){
-    const f=fixture();await f.gateway.open();const {cookie}=await f.grant();await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(pending())});
-    assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(terminal)})).statusCode,204);
-    assert.deepEqual(await f.gateway.wait(),{observation:terminal.operation==='FAILED'?'TERMINAL_REPORTED':'PENDING_REPORTED',end:terminal.operation==='FAILED'?'FAILED':'LOCAL_LIMIT',sample:terminal});
+    const f=fixture();await f.gateway.open();const {cookie}=await f.grant();await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(pending())});
+    assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(terminal)})).statusCode,204);
+    assert.deepEqual(await f.gateway.wait(),{observation:terminal.operation==='FAILED'?'TERMINAL_REPORTED':'PENDING_REPORTED',end:terminal.operation==='FAILED'?'FAILED':'LOCAL_LIMIT',sample:terminal,evidence});
     await f.gateway.close({deadline:f.limits.deadline+120000});
   }
 });
 test('spent exchange alone cannot establish observation authority before session response finishes',async()=>{
   const f=fixture();await f.gateway.open();const doc=await f.document(),cookie=doc.headers['set-cookie'].split(';')[0],stream=new Readable({read(){}});
   const {res}=f.request('POST','/manual-session',{headers:f.auth(cookie),stream});await turn();
-  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(ready())})).statusCode,409);
+  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(ready())})).statusCode,409);
   stream.push('{}');stream.push(null);await turn();assert.equal(res.writableFinished,true);
-  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(ready())})).statusCode,204);
+  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(ready())})).statusCode,204);
   await f.advance(61000);assert.equal((await f.gateway.wait()).observation,'READY_REPORTED');await f.gateway.close({deadline:f.limits.deadline+120000});
 });
 test('at most two observation bodies reserve read authority before await; concurrent pending and ready are supported',async()=>{
@@ -273,25 +275,43 @@ test('at most two observation bodies reserve read authority before await; concur
   const a=f.request('POST','/manual-observation',{headers:f.auth(cookie),stream:first}),b=f.request('POST','/manual-observation',{headers:f.auth(cookie),stream:second});await turn();
   let reads=0;const third=new Readable({read(){reads++;}}),c=f.request('POST','/manual-observation',{headers:f.auth(cookie),stream:third});await turn();
   assert.equal(c.res.statusCode,410);assert.equal(reads,0);
-  first.push(JSON.stringify(pending()));first.push(null);await turn();assert.equal(a.res.statusCode,204);
-  second.push(JSON.stringify(ready()));second.push(null);await turn();assert.equal(b.res.statusCode,204);
-  await f.advance(61000);assert.deepEqual(await f.gateway.wait(),{observation:'READY_REPORTED',end:'READY_REPORTED',sample:ready()});await f.gateway.close({deadline:f.limits.deadline+120000});
+  first.push(wire(pending()));first.push(null);await turn();assert.equal(a.res.statusCode,204);
+  second.push(wire(ready()));second.push(null);await turn();assert.equal(b.res.statusCode,204);
+  await f.advance(61000);assert.deepEqual(await f.gateway.wait(),{observation:'READY_REPORTED',end:'READY_REPORTED',sample:ready(),evidence});await f.gateway.close({deadline:f.limits.deadline+120000});
 });
 test('a previously admitted slow pending body cannot overwrite an accepted ready sample',async()=>{
   const f=fixture();await f.gateway.open();const {cookie}=await f.grant(),stream=new Readable({read(){}});
   const {res}=f.request('POST','/manual-observation',{headers:f.auth(cookie),stream});await turn();
-  await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(ready())});stream.push(JSON.stringify(pending()));stream.push(null);await turn();assert.equal(res.statusCode,410);
-  await f.advance(61000);assert.deepEqual(await f.gateway.wait(),{observation:'READY_REPORTED',end:'READY_REPORTED',sample:ready()});await f.gateway.close({deadline:f.limits.deadline+120000});
+  await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(ready())});stream.push(wire(pending()));stream.push(null);await turn();assert.equal(res.statusCode,410);
+  await f.advance(61000);assert.deepEqual(await f.gateway.wait(),{observation:'READY_REPORTED',end:'READY_REPORTED',sample:ready(),evidence});await f.gateway.close({deadline:f.limits.deadline+120000});
 });
 test('already admitted malformed body fails while retaining historical ready sample, never restoring readiness',async()=>{
   const f=fixture();await f.gateway.open();const {cookie}=await f.grant(),stream=new Readable({read(){}});
   const {res}=f.request('POST','/manual-observation',{headers:f.auth(cookie),stream});await turn();
-  await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:JSON.stringify(ready())});stream.push('{');stream.push(null);await turn();assert.equal(res.statusCode,400);
-  assert.deepEqual(await f.gateway.wait(),{observation:'READY_REPORTED',end:'FAILED',sample:ready()});await f.advance(61000);
+  await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(ready())});stream.push('{');stream.push(null);await turn();assert.equal(res.statusCode,400);
+  assert.deepEqual(await f.gateway.wait(),{observation:'READY_REPORTED',end:'FAILED',sample:ready(),evidence});await f.advance(61000);
   assert.equal((await f.gateway.wait()).end,'FAILED');await f.gateway.close({deadline:f.limits.deadline+120000});
 });
 test('expired admission consults only the clock before rejecting listener/fetch/random dependency access',async()=>{
   let forbidden=0;const deps=new Proxy({now:()=>1000},{get(target,key){if(key==='now')return target.now;forbidden++;throw Error(TOKEN);}});
   const gateway=subject.createManualFormGateway({origin:ORIGIN,assetEndpoint:ASSETS,session:validSession()},{deadline:500},deps);
   await assert.rejects(gateway.open(),error=>!String(error).includes(TOKEN));assert.equal(forbidden,0);
+});
+
+test('manual legacy samples and mixed or nested duplicate envelopes fail without evidence',async()=>{
+  const valid=wire(ready());
+  for(const body of [JSON.stringify(ready()),valid.replace('"version":2','"version":1'),valid.replace('"evidence":{','"evidence":{"loaderstart_seen":true,'),valid.replace('"sample":{','"sample":{"ver\\u0073ion":1,')]){
+    const f=fixture();await f.gateway.open();const {cookie}=await f.grant();
+    assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body})).statusCode,400);
+    assert.deepEqual(await f.gateway.wait(),{observation:'INVALID_REPORT',end:'FAILED',sample:null,evidence:null});
+    await f.gateway.close({deadline:f.limits.deadline+120000});
+  }
+});
+test('cutoff retains accepted checkpoint evidence and rejects a late replacement',async()=>{
+  const f=fixture();await f.gateway.open();const {cookie}=await f.grant();
+  await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(pending())});
+  await f.advance(61000);
+  assert.equal((await f.send('POST','/manual-observation',{headers:f.auth(cookie),body:wire(ready())})).statusCode,410);
+  assert.deepEqual(await f.gateway.wait(),{observation:'PENDING_REPORTED',end:'LOCAL_LIMIT',sample:pending(),evidence});
+  await f.gateway.close({deadline:f.limits.deadline+120000});
 });

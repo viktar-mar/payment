@@ -32,6 +32,7 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
   const root=fileURLToPath(new URL('../..',import.meta.url)),repository=resolve(root,'../..');
   const directory=await mkdtemp(join(tmpdir(),'payment-manual-docker-'));
   const publicInfrastructure=[
+    'stripe-manual-form-evidence.mjs','stripe-manual-form-evidence.d.mts',
     'stripe-form-diagnostic-schema.mjs','stripe-form-diagnostic-schema.d.mts',
     'stripe-form-diagnostic-environment.mjs','stripe-form-diagnostic-environment.d.mts',
     'stripe-form-diagnostic-network.d.mts',

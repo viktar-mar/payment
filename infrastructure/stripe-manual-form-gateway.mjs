@@ -1,7 +1,8 @@
 import {createServer as httpServer} from 'node:http';
 import {randomBytes as secureRandomBytes} from 'node:crypto';
-import {validateFormDiagnosticSample,classifyFormDiagnosticSample} from './stripe-form-diagnostic-schema.mjs';
+import {classifyFormDiagnosticSample} from './stripe-form-diagnostic-schema.mjs';
 
+import {parseManualFormObservation} from './stripe-manual-form-evidence.mjs';
 const failure=()=>new Error('stripe_manual_form_GATEWAY_UNCONFIRMED');
 const DOCUMENT='/form-load-manual.html';
 // Kept identical to examples/demo-site/nginx.conf; upstream cannot weaken policy.
@@ -53,7 +54,7 @@ export function createManualFormGateway(options,limits,dependencies={}) {
   }catch{throw failure();}
   let server,used=false,io,closing=false,stopped=false,documentUsed=false,sessionUsed=false,cookie=null,uncertain=false;
   let listenPending=false,listenSettled=false,serverClosed=false,closeRequested=false,timer,cutoff=deadline-120000;
-  let observation='NOT_STARTED',end='NOT_STARTED',sample=null,pendingUsed=false,terminalUsed=false;
+  let observation='NOT_STARTED',end='NOT_STARTED',sample=null,evidence=null,pendingUsed=false,terminalUsed=false;
   let sessionResponse=null,sessionDelivered=false,reportReservations=0;
   let resolveWait,resolveOpen,rejectOpen,cleanupTimer,cleanupAbort,cleanupPromise,cleanupResolve;
   const resultPromise=new Promise(resolve=>{resolveWait=resolve;});
@@ -61,7 +62,7 @@ export function createManualFormGateway(options,limits,dependencies={}) {
   const cleanupChanges=new Set();
   function changed(){for(const notify of cleanupChanges)notify();}
   function tracked(promise){tasks.add(promise);promise.then(()=>{tasks.delete(promise);changed();},()=>{tasks.delete(promise);changed();});return promise;}
-  function view(){return Object.freeze({observation,end,sample});}
+  function view(){return Object.freeze({observation,end,sample,evidence});}
   function stop(cause) {
     if(stopped)return;stopped=true;end=cause;session=null;cookie=null;sessionResponse=null;
     if(observation==='NOT_STARTED'&&sessionUsed)observation='NO_REPORT';
@@ -206,10 +207,10 @@ export function createManualFormGateway(options,limits,dependencies={}) {
       if(!sessionDelivered){reply(res,409);return;}
       if(terminalUsed){reply(res,410);return;}
       if(reportReservations>=2){reply(res,410);return;}reportReservations++;
-      let body,value,accepted=false;
+      let body,value,accepted=false,report;
       try {
-        body=await readBody(req,4096);value=validateFormDiagnosticSample(JSON.parse(body));
-        if(!value||(body.match(/:/g)??[]).length!==Object.keys(value).length)throw 400;
+        body=await readBody(req,4096);report=parseManualFormObservation(body);
+        if(!report)throw 400;value=report.sample;
         const classification=classifyFormDiagnosticSample(value);
         const isReady=classification.startsWith('FORM_READY_')&&value.bucket!=='AT_LIMIT';
         const isPending=classification.startsWith('WAITING_')||['ELEMENT_SETUP_INCOMPLETE','WIDGET_HANDOFF_INCOMPLETE'].includes(classification);
@@ -218,15 +219,15 @@ export function createManualFormGateway(options,limits,dependencies={}) {
         if(!check()||terminalUsed){reply(res,410);return;}
         if(isPending&&value.bucket!=='AT_LIMIT'){
           if(value.bucket!=='AFTER_15S')throw 400;
-          if(pendingUsed){reply(res,410);return;}pendingUsed=true;accepted=true;sample=value;observation='PENDING_REPORTED';reply(res,204);return;
+          if(pendingUsed){reply(res,410);return;}pendingUsed=true;accepted=true;sample=value;evidence=report.evidence;observation='PENDING_REPORTED';reply(res,204);return;
         }
-        terminalUsed=true;accepted=true;sample=value;
+        terminalUsed=true;accepted=true;sample=value;evidence=report.evidence;
         if(isReady){observation='READY_REPORTED';end='READY_REPORTED';reply(res,204);return;}
         observation=isTerminal?'TERMINAL_REPORTED':'PENDING_REPORTED';reply(res,204);stop(isTerminal?'FAILED':'LOCAL_LIMIT');
       }catch(error){
         if(!check()){reply(res,410);return;}
         // An already admitted malformed body cannot replace historical ready.
-        if(!terminalUsed){observation='INVALID_REPORT';sample=null;}
+        if(!terminalUsed){observation='INVALID_REPORT';sample=null;evidence=null;}
         stop('FAILED');reply(res,error===413?413:400);
       }finally{if(!accepted)reportReservations--;}
     }catch{stop('FAILED');reply(res,500);}finally{requests.delete(req);changed();}

@@ -9,7 +9,8 @@ const options=()=>({env:{...flags},runId:'11111111-2222-4333-8444-555555555555',
 const ready={version:1,binding:'BOUND',capability_started:true,capability_ready:true,loader_started:true,loader_ready:true,
   element_created:true,mount_called:true,mount_returned:true,ready_seen:true,loaderror_seen:false,view_completed:true,widget_completed:true,
   confirmation_blocked:false,catchup:'NOT_STARTED',operation:'COMPLETED',widget_state:'ready',element_state:'FRAME',pay_state:'ENABLED',pay_visible:true,bucket:'BEFORE_15S'};
-const result=patch=>({observation:'READY_REPORTED',end:'READY_REPORTED',sample:ready,...patch});
+const evidence={loaderstart_seen:true,host_box:'POSITIVE_AREA',frame_box:'POSITIVE_AREA',host_visibility:'VISIBLE',frame_visibility:'VISIBLE',frame_load:'SEEN',csp_observation:'OBSERVED',csp_enforced_mask:2,csp_report_only_mask:4};
+const result=patch=>({evidence:patch?.sample===null?null:evidence,observation:'READY_REPORTED',end:'READY_REPORTED',sample:ready,...patch});
 const defer=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject};};
 function fixture(){
   let time=1000;const timers=new Map(),calls=[],writes=[],signal=new AbortController();
@@ -81,7 +82,7 @@ test('historical ready with FAILED end and each negative owned proof stays faile
     if(fail==='proof')f.runtime.verifyNoConfirmation=async()=>false;
     if(fail==='gateway-close')f.gateway.close=async()=>false;
     if(fail==='runtime-close')f.runtime.close=async()=>false;
-    const value=await run(f);assert.equal(value.exitCode,1);assert.equal(value.report.end,'FAILED');assert.equal(value.report.observation,'READY_REPORTED');assert.deepEqual(value.report.sample,ready);
+    const value=await run(f);assert.equal(value.exitCode,1);assert.equal(value.report.end,'FAILED');assert.equal(value.report.observation,'READY_REPORTED');assert.deepEqual(value.report.sample,ready);assert.deepEqual(value.report.evidence,evidence);
   }
 });
 test('malformed, accessor, null and AT_LIMIT gateway samples fail closed',async()=>{
@@ -314,7 +315,7 @@ test('direct missing opt-in emits only finite report through synthetic stdout an
   stream.write=(text,done)=>{f.writes.push(text);done();};f.dependencies.subscribe=()=>()=>{};
   await subject.runManualFormEntry(cliInput(false),{stdout:stream,exit:code=>exits.push(code)},f.dependencies);
   assert.deepEqual(exits,[1]);assert.deepEqual(f.calls,[]);assert.equal(f.writes.length,1);
-  const value=JSON.parse(f.writes[0]);assert.equal(value.version,1);assert.equal(value.end,'FAILED');assert.equal(value.browser_closure,'NOT_OWNED');
+  const value=JSON.parse(f.writes[0]);assert.equal(value.version,2);assert.equal(value.end,'FAILED');assert.equal(value.browser_closure,'NOT_OWNED');
 });
 test('direct rejected admission does not read lifecycle capabilities while wiring stdout',async()=>{
   const f=fixture(),stream=new EventEmitter(),exits=[];let touched=0;
