@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {fileURLToPath} from 'node:url';
+import {matchesGlob} from 'node:path';
 import {loadConfigFromFile} from 'vite';
 // @ts-expect-error Native Node source type erasure.
 import normalPlaywright from '../../playwright.config.ts';
@@ -20,6 +21,8 @@ test('normal Playwright discovery explicitly excludes diagnostic and Node-only s
   assert.ok(Array.isArray(normalPlaywright.testIgnore));
   assert.ok(normalPlaywright.testIgnore.includes('form-load-diagnostic.spec.ts'));
   assert.ok(normalPlaywright.testIgnore.includes('**/support/form-load-diagnostic*.test.ts'));
+  assert.ok(normalPlaywright.testIgnore.some(pattern=>typeof pattern==='string'&&matchesGlob(
+    'tests/support/form-load-diagnostic-environment.test.ts',pattern)));
 });
 test('separate Playwright config has no auto browser, repetition or artifact capture',()=>{
   assert.equal(diagnosticPlaywright.testMatch,'form-load-diagnostic.spec.ts');
