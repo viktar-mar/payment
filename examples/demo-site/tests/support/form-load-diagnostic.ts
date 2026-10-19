@@ -1,10 +1,13 @@
 import type {Browser,BrowserContext,BrowserType} from '@playwright/test';
 import type {FormDiagnosticHandoff} from '../../../../infrastructure/stripe-form-diagnostic-runtime.mjs';
-import type {FormDiagnosticSample,FormDiagnosticOutcome} from '../../../../infrastructure/stripe-form-diagnostic-schema.mjs';
+import type {FormDiagnosticObservation,FormDiagnosticOutcome} from '../../../../infrastructure/stripe-form-diagnostic-schema.mjs';
 import {classifyFormDiagnosticSample,validateFormDiagnosticSample} from '../../../../infrastructure/stripe-form-diagnostic-schema.mjs';
+import {validateFormEnvironmentEvidence,unavailableFormEnvironmentEvidence} from '../../../../infrastructure/stripe-form-diagnostic-environment.mjs';
+// @ts-expect-error Native Node source type erasure.
+import {installFormCspObserver,readDiagnosticPageEvidence,createFormResourceObserver} from './form-load-diagnostic-environment.ts';
 
 export interface FormLoadBrowserResult {
-  readonly samples: readonly Readonly<FormDiagnosticSample>[];
+  readonly observations: readonly Readonly<FormDiagnosticObservation>[];
   readonly outcome: FormDiagnosticOutcome;
   readonly browserClosed: boolean;
   readonly contextClosed: boolean;
@@ -33,21 +36,39 @@ function check(limits:FormLoadLimits):void {
   if(limits.signal.aborted)throw ABORTED;
   if(!Number.isSafeInteger(limits.deadline)||Date.now()>=limits.deadline)throw DEADLINE;
 }
-function handshake():boolean {
-  const api=(globalThis as typeof globalThis&{__formLoadDiagnostic?:{handshake:()=>boolean}}).__formLoadDiagnostic;
-  return api?.handshake()===true;
-}
-function readSnapshot():unknown {
-  const api=(globalThis as typeof globalThis&{__formLoadDiagnostic?:{snapshot:()=>unknown}}).__formLoadDiagnostic;
-  return api?.snapshot();
+function dataRecord(value:unknown,keys?:readonly string[]):Record<string,unknown>|null {
+  try {
+    if(value===null||typeof value!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(value)))return null;
+    const descriptors=Object.getOwnPropertyDescriptors(value),names=Reflect.ownKeys(descriptors);
+    if(names.some(key=>typeof key!=='string')||(keys&&(names.length!==keys.length||names.some(key=>!keys.includes(key as string)))))return null;
+    const data:Record<string,unknown>=Object.create(null);
+    for(const key of names as string[]){const descriptor=descriptors[key]!;if(!Object.hasOwn(descriptor,'value')||!descriptor.enumerable)return null;data[key]=descriptor.value;}
+    return data;
+  }catch {return null;}
 }
 
 /** Exactly one owned launch, context and Resume. No payment/input/frame APIs are held here. */
 export async function runFormLoadBrowser(browserType:Pick<BrowserType,'launch'>,handoff:FormDiagnosticHandoff,limits:FormLoadLimits):Promise<FormLoadBrowserResult> {
-  const cleanupDeadline=limits.deadline+120000,samples:Readonly<FormDiagnosticSample>[]=[];
+  const cleanupDeadline=limits.deadline+120000,observations:Readonly<FormDiagnosticObservation>[]=[];
   let browser:Browser|undefined,context:BrowserContext|undefined,outcome:FormDiagnosticOutcome='OBSERVING',closing=false;
   let browserClosed=false,contextClosed=false,uncertain=false;
-  let lastObservation:Readonly<FormDiagnosticSample>|undefined;
+  let lastObservation:Readonly<FormDiagnosticObservation>|undefined;
+  let localEnd:number|undefined,collector:ReturnType<typeof createFormResourceObserver>|undefined;
+  const active=()=>!closing&&!limits.signal.aborted&&Date.now()<limits.deadline&&(localEnd===undefined||Date.now()<localEnd);
+  function environment(csp:unknown) {
+    const source=dataRecord(csp,['csp_observation','csp_enforced_mask','csp_report_only_mask']);
+    const unavailable=unavailableFormEnvironmentEvidence();
+    const resource=collector?.snapshot()??{resource_observation:'UNAVAILABLE',resource_transport_failure_mask:0,resource_http_4xx_mask:0,resource_http_5xx_mask:0};
+    const missingCsp={csp_observation:unavailable.csp_observation,csp_enforced_mask:0,csp_report_only_mask:0};
+    const combine=(cspData:Record<string,unknown>)=>validateFormEnvironmentEvidence({...cspData,...resource,
+      environment_freshness:cspData.csp_observation==='UNAVAILABLE'&&resource.resource_observation==='UNAVAILABLE'?'UNAVAILABLE':'SAMPLED'});
+    return (source&&combine(source))||combine(missingCsp)||unavailable;
+  }
+  function pageEvidence(raw:unknown) {
+    const data=dataRecord(raw,['handshake','sample','csp']);
+    if(!data||typeof data.handshake!=='boolean')throw UNAVAILABLE;
+    return data;
+  }
   let browserUncertain=false,contextUncertain=false;
   const acquisitions=new Set<Promise<unknown>>(),closures=new Set<Promise<unknown>>(),closed=new WeakSet<object>();
   function closeOwned(resource:Browser|BrowserContext,kind:'browser'|'context',proofDeadline=cleanupDeadline):Promise<void> {
@@ -86,12 +107,18 @@ export async function runFormLoadBrowser(browserType:Pick<BrowserType,'launch'>,
       sessionStorage.setItem(key,JSON.stringify(record));
       Object.defineProperty(globalThis,'__formDiagnosticSession',{value:Object.freeze({apiBaseUrl:record.apiBaseUrl,siteKey:record.siteKey,priceKey:record.priceKey}),writable:false,configurable:false});
     },{record:handoff.session,origin:handoff.endpoint}),limits.deadline,limits.signal);check(limits);
+    await bounded(context.addInitScript(installFormCspObserver,{ownedOrigin:handoff.endpoint,activeDeadline:limits.deadline}),limits.deadline,limits.signal);check(limits);
     const page=await bounded(context.newPage(),limits.deadline,limits.signal);check(limits);
+    collector=createFormResourceObserver(page,active);check(limits);
     await bounded(page.goto(handoff.endpoint+'/form-load-diagnostic.html',{timeout:Math.min(15000,limits.deadline-Date.now())}),limits.deadline,limits.signal);check(limits);
-    if(await bounded(page.evaluate(handshake),limits.deadline,limits.signal)!==true)throw UNAVAILABLE;
+    const baseline=pageEvidence(await bounded(page.evaluate(readDiagnosticPageEvidence,false),limits.deadline,limits.signal));check(limits);
+    lastObservation=Object.freeze({sample:null,environment:environment(baseline.csp)});
+    if(baseline.handshake!==true||baseline.sample!==null||lastObservation.environment.environment_freshness!=='SAMPLED'
+      ||lastObservation.environment.csp_observation!=='OBSERVED'||lastObservation.environment.resource_observation!=='OBSERVED')throw UNAVAILABLE;
     const widget=page.locator('generic-payment-widget');
     if(await bounded(widget.count(),limits.deadline,limits.signal)!==1)throw UNAVAILABLE;
     const start=Date.now(),end=Math.min(start+60000,limits.deadline);
+    localEnd=end;
     const checkFormWindow=()=>{check(limits);if(Date.now()>=end)throw FORM_LIMIT;};
     const observe=async<T>(read:()=>Promise<T>):Promise<T>=>{
       checkFormWindow();
@@ -105,16 +132,14 @@ export async function runFormLoadBrowser(browserType:Pick<BrowserType,'launch'>,
     for(;;) {
       checkFormWindow();
       if(await observe(()=>widget.count())!==1)throw UNAVAILABLE;
-      const raw=await observe(()=>page.evaluate(readSnapshot));
-      let data:Record<string,unknown>={};
-      try {
-        if(!raw||typeof raw!=='object'||Array.isArray(raw))throw UNAVAILABLE;
-        const descriptors=Object.getOwnPropertyDescriptors(raw);
-        if(Reflect.ownKeys(raw).length!==Object.keys(descriptors).length)throw UNAVAILABLE;
-        for(const [key,descriptor] of Object.entries(descriptors)){
-          if(!('value'in descriptor))throw UNAVAILABLE;data[key]=descriptor.value;
-        }
-      }catch {throw UNAVAILABLE;}
+      const raw=pageEvidence(await observe(()=>page.evaluate(readDiagnosticPageEvidence,true)));
+      const data=dataRecord(raw.sample);
+      // Validate SDK scalar data before any subsequent capability read. The
+      // internal SDK sample stays version1; Node alone supplies Pay and bucket.
+      if(raw.handshake!==true||!data||Object.hasOwn(data,'pay_visible')||Object.hasOwn(data,'bucket')
+        ||!validateFormDiagnosticSample({...data,pay_visible:false,bucket:'BEFORE_15S'}))throw UNAVAILABLE;
+      const csp=dataRecord(raw.csp,['csp_observation','csp_enforced_mask','csp_report_only_mask']);
+      if(!csp)throw UNAVAILABLE;
       const pay=widget.locator('button[aria-label="Pay"]:enabled');
       const payVisible=await observe(()=>pay.count())===1
         &&await observe(()=>pay.isEnabled({timeout:Math.max(1,Math.min(1000,end-Date.now()))}))
@@ -123,12 +148,16 @@ export async function runFormLoadBrowser(browserType:Pick<BrowserType,'launch'>,
       const elapsed=Date.now()-start;
       const sample=validateFormDiagnosticSample({...data,pay_visible:payVisible,bucket:elapsed<15000?'BEFORE_15S':'AFTER_15S'});
       if(!sample)throw UNAVAILABLE;
-      checkFormWindow();lastObservation=sample;
+      checkFormWindow();
+      const evidence=environment(csp);checkFormWindow();
+      lastObservation=Object.freeze({sample,environment:evidence});
       const result=classifyFormDiagnosticSample(sample,'OBSERVING');
+      const primary=['BINDING_LOST','CONFIRMATION_BLOCKED','OPERATION_FAILED','ABORTED'].includes(result);
+      if(!primary&&(evidence.environment_freshness!=='SAMPLED'||evidence.csp_observation!=='OBSERVED'||evidence.resource_observation!=='OBSERVED'))throw UNAVAILABLE;
       const ready=result==='FORM_READY_BEFORE_15S'||result==='FORM_READY_AFTER_15S';
       const terminal=ready||['BINDING_LOST','CONFIRMATION_BLOCKED','ELEMENT_LOADERROR','OPERATION_FAILED','ABORTED','INSTRUMENTATION_UNAVAILABLE'].includes(result);
-      if(terminal){samples.push(sample);break;}
-      if(!checkpoint&&elapsed>=15000){samples.push(sample);checkpoint=true;}
+      if(terminal){observations.push(lastObservation);break;}
+      if(!checkpoint&&elapsed>=15000){observations.push(lastObservation);checkpoint=true;}
       const next=checkpoint?end:Math.min(start+15000,end);
       await bounded(new Promise<void>(resolve=>setTimeout(resolve,Math.max(0,Math.min(100,next-Date.now())))),limits.deadline,limits.signal);
     }
@@ -137,9 +166,15 @@ export async function runFormLoadBrowser(browserType:Pick<BrowserType,'launch'>,
     // The limit frame preserves only an earlier complete observation. Its
     // failure provenance forbids treating cached flags as a fresh pending or
     // ready diagnosis; no page read receives authority after the local window.
-    if(error===FORM_LIMIT&&lastObservation)samples.push(Object.freeze({...lastObservation,bucket:'AT_LIMIT'}));
+    if(lastObservation){
+      const sample=error===FORM_LIMIT&&lastObservation.sample?Object.freeze({...lastObservation.sample,bucket:'AT_LIMIT'}):lastObservation.sample;
+      const evidence=lastObservation.environment;
+      observations.push(Object.freeze({sample,environment:Object.freeze({...evidence,
+        environment_freshness:evidence.environment_freshness==='UNAVAILABLE'?'UNAVAILABLE':'CACHED'})}));
+    }
   }
   finally {
+    collector?.stop();Object.freeze(observations);
     // Freeze all observations before any teardown. Late acquisitions are owned,
     // closed when settled, and can never turn uncertain cleanup into certainty.
     closing=true;
@@ -159,5 +194,5 @@ export async function runFormLoadBrowser(browserType:Pick<BrowserType,'launch'>,
     }catch {uncertain=true;}
   }
   if(uncertain&&outcome==='OBSERVING')outcome='FAILED';
-  return Object.freeze({samples:Object.freeze(samples),outcome,browserClosed:browserClosed&&!browserUncertain,contextClosed:contextClosed&&!contextUncertain});
+  return Object.freeze({observations,outcome,browserClosed:browserClosed&&!browserUncertain,contextClosed:contextClosed&&!contextUncertain});
 }

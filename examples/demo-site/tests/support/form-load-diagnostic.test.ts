@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type {BrowserType} from '@playwright/test';
 import type {FormDiagnosticHandoff} from '../../../../infrastructure/stripe-form-diagnostic-runtime.mjs';
+import {createContext,runInContext} from 'node:vm';
 import {setImmediate as immediate} from 'node:timers/promises';
 // @ts-expect-error Native Node source type erasure.
 import {runFormLoadBrowser} from './form-load-diagnostic.ts';
@@ -16,18 +17,23 @@ const ready={...pending,ready_seen:true,view_completed:true,widget_completed:tru
 const handoff:FormDiagnosticHandoff={runId:'00000000-0000-4000-8000-000000000001',expectedSource:'a'.repeat(40),endpoint:'http://127.0.0.1:14173',
   session:{version:2,apiBaseUrl:'http://127.0.0.1:18080',siteKey:'site',priceKey:'price',checkoutId:'00000000-0000-4000-8000-000000000002',checkoutToken:'a'.repeat(43),
     expiresAt:'2099-01-01T00:00:00.000Z',providerType:'STRIPE',confirmationMode:'CLIENT_PROVIDER',state:{checkoutId:'00000000-0000-4000-8000-000000000002',paymentId:'00000000-0000-4000-8000-000000000003',status:'REQUIRES_PAYMENT_METHOD',amountMinor:2000,currency:'EUR',price:null,expiresAt:'2099-01-01T00:00:00.000Z'}}};
+const composite=(sample:unknown,includeForm=true)=>({handshake:true,sample:includeForm?sample:null,csp:{csp_observation:'OBSERVED',csp_enforced_mask:0,csp_report_only_mask:0}});
 function fake(sample=ready) {
   const events:string[]=[],writes:unknown[]=[];
   const locator={count:async()=>sample.pay_state==='ENABLED'?1:0,isEnabled:async()=>sample.pay_state==='ENABLED',isVisible:async()=>sample.pay_state==='ENABLED',
     click:async()=>{events.push('resume');}};
-  const page={goto:async()=>{events.push('goto');},evaluate:async(fn:Function)=>fn.name==='handshake'?true:sample,
+  const handlers=new Map<string,Function>(),retained=new Map<string,Function>();
+  const cspListeners:Function[]=[];
+  const realm=createContext({Date,location:{origin:handoff.endpoint},document:{addEventListener:(_name:string,fn:Function)=>cspListeners.push(fn)},sessionStorage:{setItem:()=>{}},__formLoadDiagnostic:{handshake:()=>true,snapshot:()=>sample}});
+  runInContext('globalThis.top=globalThis',realm);
+  const page={on:(name:string,fn:Function)=>{handlers.set(name,fn);retained.set(name,fn);return page;},off:(name:string)=>{handlers.delete(name);return page;},goto:async()=>{events.push('goto');},evaluate:async(fn:Function,arg?:unknown)=>structuredClone(runInContext('('+fn.toString()+')',realm)(arg)),
     locator:(selector:string)=>{assert.equal(selector,'generic-payment-widget');return {count:async()=>1,
       getByRole:(_role:string,query:{name:string;exact:boolean})=>{assert.deepEqual(query,{name:'Resume existing payment',exact:true});return locator;},
       locator:(selector:string)=>{assert.equal(selector,'button[aria-label="Pay"]:enabled');return locator;}};}};
-  const context={addInitScript:async(_fn:Function,value:unknown)=>{writes.push(value);events.push('init');},newPage:async()=>page,isClosed:()=>false,close:async()=>{events.push('context-close');}};
+  const context={addInitScript:async(_fn:Function,value:unknown)=>{writes.push(value);events.push('init');runInContext('('+_fn.toString()+')',realm)(value);},newPage:async()=>page,isClosed:()=>false,close:async()=>{events.push('context-close');}};
   const browser={newContext:async(options:unknown)=>{assert.deepEqual(options,{serviceWorkers:'block',acceptDownloads:false});events.push('context');return context;},close:async()=>{events.push('browser-close');}};
   const type={launch:async(options:unknown)=>{assert.equal((options as {headless:boolean}).headless,true);events.push('launch');return browser;}} as unknown as Pick<BrowserType,'launch'>;
-  return {type,browser,context,page,locator,events,writes};
+  return {type,browser,context,page,locator,events,writes,realm,handlers,retained,cspListeners};
 }
 const limits=()=>({deadline:Date.now()+900000,signal:new AbortController().signal});
 // Only external resource operations are synthetic; the driver, parent and schema run.
@@ -40,6 +46,123 @@ function throughParent(f:ReturnType<typeof fake>,original=limits()) {
     runBrowser:(h:FormDiagnosticHandoff,l:ReturnType<typeof limits>)=>runFormLoadBrowser(f.type,h,l),
   });
 }
+// Break: unavailable SDK bootstrap hides CSP evidence and starts a client session.
+for(const sdk of ['missing','throwing','accessor'] as const)test(`${sdk} SDK preserves enforced CSP script evidence in opaque wire2 without Resume`,async()=>{
+  const f=fake();let reads=0;
+  if(sdk==='missing')delete f.realm.__formLoadDiagnostic;
+  else if(sdk==='throwing')f.realm.__formLoadDiagnostic={handshake(){throw Symbol();}};
+  else Object.defineProperty(f.realm,'__formLoadDiagnostic',{get(){reads++;throw Symbol();}});
+  const goto=f.page.goto;
+  f.page.goto=async()=>{await goto();assert.equal(f.cspListeners.length,1);f.cspListeners[0]!({isTrusted:true,effectiveDirective:'script-src-elem',disposition:'enforce'});};
+  const result=await throughParent(f),frame=result.frames[0]!;
+  assert.equal(result.exitCode,1);assert.equal(frame.version,2);assert.equal(frame.result,'INSTRUMENTATION_UNAVAILABLE');
+  assert.equal(frame.csp_observation,'OBSERVED');assert.equal(frame.csp_enforced_mask,1);
+  assert.equal(frame.environment_freshness,'CACHED');assert.equal(Object.hasOwn(frame,'binding'),false);
+  assert.equal(f.events.includes('resume'),false);assert.equal(reads,0);
+});
+// Break: one failed collector hides another source or partial instrumentation is accepted.
+test('CSP failure preserves distinct transport document, HTTP404 script and HTTP503 fetch masks without Resume',async()=>{
+  const f=fake(),goto=f.page.goto;
+  f.page.goto=async()=>{await goto();f.cspListeners[0]!({isTrusted:true,effectiveDirective:'script-src',disposition:'invalid'});
+    f.handlers.get('requestfailed')!({resourceType:()=> 'document'});
+    for(const [status,type] of [[404,'script'],[503,'fetch']] as const)f.handlers.get('response')!({status:()=>status,request:()=>({resourceType:()=>type})});
+  };
+  const result=await throughParent(f),frame=result.frames[0]!;
+  assert.equal(frame.result,'INSTRUMENTATION_UNAVAILABLE');assert.equal(frame.csp_observation,'UNAVAILABLE');
+  assert.equal(frame.resource_observation,'OBSERVED');assert.equal(frame.resource_transport_failure_mask,2);
+  assert.equal(frame.resource_http_4xx_mask,1);assert.equal(frame.resource_http_5xx_mask,4);
+  assert.equal(result.exitCode,1);assert.equal(f.events.includes('resume'),false);
+});
+test('independent masks do not cancel actual sample1 readiness and all closure proofs',async()=>{
+  const f=fake(),goto=f.page.goto;f.page.goto=async()=>{await goto();f.handlers.get('response')!({status:()=>404,request:()=>({resourceType:()=> 'script'})});};
+  const result=await throughParent(f),frame=result.frames[0]!;
+  assert.equal(result.exitCode,0);assert.equal(frame.version,2);assert.equal(frame.resource_http_4xx_mask,1);
+  assert.equal(frame.environment_freshness,'SAMPLED');assert.equal(frame.result,'FORM_READY_BEFORE_15S');
+});
+// Break: partial evidence after Resume suppresses an independently observed primary SDK failure.
+for(const [change,want] of [[{operation:'FAILED'},'OPERATION_FAILED'],[{operation:'ABORTED'},'ABORTED'],
+  [{confirmation_blocked:true},'CONFIRMATION_BLOCKED']] as const)test(`late source failure cannot hide ${want}`,async()=>{
+  const f=fake({...ready,...change} as typeof ready),click=f.locator.click;
+  f.locator.click=async()=>{await click();f.handlers.get('response')!({status:()=>NaN});};
+  const result=await throughParent(f);
+  assert.equal(result.exitCode,1);assert.equal(result.frames[0]!.result,want);
+  assert.equal(result.frames[0]!.resource_observation,'UNAVAILABLE');
+});
+// Break: the parent paints checkpoint with later masks, or failure publishes a new read.
+test('checkpoint owns its environment while latest complete observation is cached after abort',async t=>{
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000000});
+  const f=fake({...pending} as typeof ready),controller=new AbortController(),evaluate=f.page.evaluate;let reads=0;
+  f.page.evaluate=async(fn:Function,arg?:unknown)=>{reads++;return evaluate(fn,arg);};
+  const run=throughParent(f,{deadline:1900000,signal:controller.signal});await immediate();
+  f.cspListeners[0]!({isTrusted:true,effectiveDirective:'script-src',disposition:'enforce'});
+  f.handlers.get('response')!({status:()=>404,request:()=>({resourceType:()=> 'script'})});
+  t.mock.timers.tick(15000);await immediate();
+  f.cspListeners[0]!({isTrusted:true,effectiveDirective:'frame-src',disposition:'report'});
+  f.handlers.get('response')!({status:()=>503,request:()=>({resourceType:()=> 'fetch'})});
+  t.mock.timers.tick(100);await immediate();const before=reads;controller.abort();
+  const result=await run;
+  assert.equal(reads,before);assert.equal(result.exitCode,1);assert.equal(result.frames.length,2);
+  const [checkpoint,final]=result.frames;
+  assert.equal(checkpoint!.result,'WAITING_ELEMENT_READY');assert.equal(checkpoint!.csp_enforced_mask,1);
+  assert.equal(checkpoint!.csp_report_only_mask,0);assert.equal(checkpoint!.resource_http_5xx_mask,0);
+  assert.equal(checkpoint!.environment_freshness,'SAMPLED');assert.equal(final!.result,'ABORTED');
+  assert.equal(final!.csp_enforced_mask,1);assert.equal(final!.csp_report_only_mask,2);
+  assert.equal(final!.resource_http_4xx_mask,1);assert.equal(final!.resource_http_5xx_mask,4);
+  assert.equal(final!.environment_freshness,'CACHED');assert.equal(Object.hasOwn(final!,'bucket'),false);
+});
+// Break: retained callbacks consume late payloads or private CSP bits alter frozen output.
+for(const end of ['abort','local'] as const)test(`retained actual CSP callback after ${end} can change only private bits; resource callbacks/readers stay inert`,async t=>{
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000000});
+  const f=fake({...pending} as typeof ready),controller=new AbortController(),evaluate=f.page.evaluate;let reads=0,payloadReads=0;
+  f.page.evaluate=async(fn:Function,arg?:unknown)=>{reads++;return evaluate(fn,arg);};
+  const run=throughParent(f,{deadline:1900000,signal:controller.signal});await immediate();
+  const before=reads,poison=new Proxy({},{get(){payloadReads++;throw null;}});
+  if(end==='abort')controller.abort();else t.mock.timers.setTime(1060000);
+  f.retained.get('response')!(poison);f.retained.get('requestfailed')!(poison);
+  f.cspListeners[0]!({isTrusted:true,effectiveDirective:'script-src',disposition:'enforce'});
+  if(end==='local')t.mock.timers.tick(0);
+  const result=await run,wire=JSON.stringify(result);
+  assert.equal(reads,before);assert.equal(payloadReads,0);
+  assert.equal(result.frames[0]!.environment_freshness,'CACHED');assert.equal(result.frames[0]!.csp_enforced_mask,0);
+  assert.equal(runInContext('__formDiagnosticCsp.snapshot().csp_enforced_mask',f.realm),1);
+  f.retained.get('response')!(poison);f.retained.get('requestfailed')!(poison);
+  f.cspListeners[0]!({isTrusted:true,effectiveDirective:'connect-src',disposition:'enforce'});
+  assert.equal(runInContext('__formDiagnosticCsp.snapshot().csp_enforced_mask',f.realm),5);
+  assert.equal(JSON.stringify(result),wire);assert.equal(reads,before);assert.equal(payloadReads,0);
+});
+test('failed resource subscription retains CSP baseline and never authorizes Resume',async()=>{
+  const f=fake(),on=f.page.on;
+  f.page.on=(name:string,fn:Function)=>{on(name,fn);throw Symbol();};
+  const result=await throughParent(f),frame=result.frames[0]!;
+  assert.equal(result.exitCode,1);assert.equal(frame.result,'INSTRUMENTATION_UNAVAILABLE');
+  assert.equal(frame.resource_observation,'UNAVAILABLE');assert.equal(frame.csp_observation,'OBSERVED');
+  assert.equal(f.events.includes('resume'),false);
+});
+for(const part of ['outer','sample','csp'] as const)test(`${part} data accessors are rejected before Pay and final evidence uses baseline cache`,async()=>{
+  const f=fake(),evaluate=f.page.evaluate;let getterReads=0,payReads=0,reads=0;
+  f.locator.count=async()=>{payReads++;return 1;};
+  f.page.evaluate=async(fn:Function,includeForm?:unknown)=>{
+    reads++;if(!includeForm)return evaluate(fn,includeForm);
+    const raw=composite({...ready}),target=part==='outer'?raw:part==='sample'?raw.sample:raw.csp;
+    Object.defineProperty(target!,part==='outer'?'handshake':part==='sample'?'version':'csp_enforced_mask',
+      {enumerable:true,get(){getterReads++;throw Symbol();}});
+    return raw;
+  };
+  const result=await throughParent(f),frame=result.frames[0]!;
+  assert.equal(frame.result,'INSTRUMENTATION_UNAVAILABLE');assert.equal(frame.environment_freshness,'CACHED');
+  assert.equal(Object.hasOwn(frame,'bucket'),false);assert.equal(getterReads,0);assert.equal(payReads,0);assert.equal(reads,2);
+});
+// Break: copying an unexpected __proto__ key through a setter silently removes it before validation.
+test('unexpected prototype-spelled stage key cannot disappear into a ready observation',async()=>{
+  const f=fake(),evaluate=f.page.evaluate;let payReads=0;
+  f.locator.count=async()=>{payReads++;return 1;};
+  f.page.evaluate=async(fn:Function,includeForm?:unknown)=>{
+    if(!includeForm)return evaluate(fn,includeForm);
+    const raw=composite({...ready});Object.defineProperty(raw.sample!,'__proto__',{value:null,enumerable:true});return raw;
+  };
+  const result=await throughParent(f);
+  assert.equal(result.exitCode,1);assert.equal(result.frames[0]!.result,'INSTRUMENTATION_UNAVAILABLE');assert.equal(payReads,0);
+});
 // Break caught: browser shutdown invalidates otherwise successful deferred context work.
 // Playwright context.close yields before its channel close; browser shutdown can
 // dispose that dispatcher and emit context Close without completing this attempt.
@@ -58,7 +181,7 @@ for(const deferred of [false,true])test(`${deferred?'deferred':'immediate'} inde
   assert.equal(result.frames[0]?.runtime_closed,true);
   const frame=result.frames[0];assert.ok(frame&&'ready_seen'in frame);assert.equal(frame.ready_seen,true);
   assert.ok(Object.isFrozen(result.frames[0]));
-  assert.deepEqual(f.events,['launch','context','init','goto','resume','context-close-start','context-close-fulfilled','browser-close','runtime-close']);
+  assert.deepEqual(f.events,['launch','context','init','init','goto','resume','context-close-start','context-close-fulfilled','browser-close','runtime-close']);
 });
 // Break caught: the first owned close is a fulfilled no-op after external closure,
 // manufacturing independent context proof and parent exit0 from a ready snapshot.
@@ -88,7 +211,7 @@ for(const externalState of ['closing','closed'] as const)test(`externally ${exte
   assert.equal(result.frames[0]?.runtime_closed,true);assert.equal(Date.now(),1000000);
   const frame=result.frames[0];assert.ok(frame&&'ready_seen'in frame);
   assert.equal(frame.ready_seen,true);assert.equal(frame.pay_visible,true);assert.ok(Object.isFrozen(frame));
-  assert.deepEqual(f.events,['launch','context','init','goto','resume','external-context-'+externalState,'browser-close','runtime-close']);
+  assert.deepEqual(f.events,['launch','context','init','init','goto','resume','external-context-'+externalState,'browser-close','runtime-close']);
 });
 // Break caught: success at/after grace wins when the timer callback has not run.
 for(const [elapsed,wantContext,wantExit] of [[4999,true,0],[5000,false,1],[5001,false,1]] as const){
@@ -199,16 +322,16 @@ for(const kind of ['browser','context'] as const)test(`late ${kind} acquired aft
 });
 test('one ready load uses exactly one Resume and closes context before browser; no payment capability',async()=>{
   const f=fake(),result=await runFormLoadBrowser(f.type,handoff,limits());
-  assert.equal(result.outcome,'OBSERVING');assert.equal(result.samples.length,1);
-  assert.equal(result.samples[0]?.bucket,'BEFORE_15S');assert.equal(result.samples[0]?.pay_visible,true);
-  assert.equal(result.browserClosed,true);assert.equal(result.contextClosed,true);assert.ok(Object.isFrozen(result.samples[0]));
-  assert.deepEqual(f.events,['launch','context','init','goto','resume','context-close','browser-close']);
+  assert.equal(result.outcome,'OBSERVING');assert.equal(result.observations.length,1);
+  assert.equal(result.observations[0]?.sample?.bucket,'BEFORE_15S');assert.equal(result.observations[0]?.sample?.pay_visible,true);
+  assert.equal(result.browserClosed,true);assert.equal(result.contextClosed,true);assert.ok(Object.isFrozen(result.observations[0]));
+  assert.deepEqual(f.events,['launch','context','init','init','goto','resume','context-close','browser-close']);
   assert.equal(JSON.stringify(result).includes(handoff.session.checkoutToken),false);
 });
 test('unavailable instrumentation and opaque page failure do not become waiting diagnoses',async()=>{
   const f=fake();f.page.evaluate=async()=>false as never;
   const result=await runFormLoadBrowser(f.type,handoff,limits());
-  assert.equal(result.outcome,'INSTRUMENTATION_UNAVAILABLE');assert.deepEqual(result.samples,[]);
+  assert.equal(result.outcome,'INSTRUMENTATION_UNAVAILABLE');assert.deepEqual(result.observations,[]);
   assert.equal(f.events.includes('resume'),false);assert.equal(result.browserClosed,true);
   const g=fake();let reads=0;g.page.goto=async()=>{throw new Proxy({},{get(){reads++;throw null;}});};
   const failed=await runFormLoadBrowser(g.type,handoff,limits());assert.equal(failed.outcome,'FAILED');assert.equal(reads,0);
@@ -251,62 +374,62 @@ test('pending checkpoint then late ready yields two bounded snapshots and one Re
   const sample={...pending},f=fake(sample as typeof ready),run=runFormLoadBrowser(f.type,handoff,limits());
   await immediate();t.mock.timers.tick(15000);await immediate();
   Object.assign(sample,ready);t.mock.timers.tick(5000);await immediate();
-  const result=await run;assert.equal(result.samples.length,2);
-  assert.deepEqual(result.samples.map(s=>s.bucket),['AFTER_15S','AFTER_15S']);
-  assert.equal(result.samples[0]?.ready_seen,false);assert.equal(result.samples[1]?.pay_visible,true);
+  const result=await run;assert.equal(result.observations.length,2);
+  assert.deepEqual(result.observations.map(s=>s.sample?.bucket),['AFTER_15S','AFTER_15S']);
+  assert.equal(result.observations[0]?.sample?.ready_seen,false);assert.equal(result.observations[1]?.sample?.pay_visible,true);
   assert.equal(f.events.filter(s=>s==='resume').length,1);
 });
 test('pending form stops at original60s window, without retry or new capability',async t=>{
   t.mock.timers.enable({apis:['Date','setTimeout'],now:1000000});
   const f=fake({...pending} as typeof ready),run=runFormLoadBrowser(f.type,handoff,limits());
   await immediate();t.mock.timers.tick(15000);await immediate();t.mock.timers.tick(45000);await immediate();
-  const result=await run;assert.equal(result.outcome,'FAILED');assert.equal(result.samples.length,2);
-  assert.equal(result.samples[1]?.bucket,'AT_LIMIT');assert.equal(f.events.filter(s=>s==='resume').length,1);
-  assert.equal(classifyFormDiagnosticSample(result.samples[1],result.outcome),'OPERATION_FAILED');
+  const result=await run;assert.equal(result.outcome,'FAILED');assert.equal(result.observations.length,2);
+  assert.equal(result.observations[1]?.sample?.bucket,'AT_LIMIT');assert.equal(f.events.filter(s=>s==='resume').length,1);
+  assert.equal(classifyFormDiagnosticSample(result.observations[1]?.sample,result.outcome),'OPERATION_FAILED');
 });
 test('readiness bucket includes completion of the actual Pay visibility proof across15s',async t=>{
   t.mock.timers.enable({apis:['Date','setTimeout'],now:1000000});
-  const f=fake();f.page.evaluate=async(fn:Function)=>{
-    if(fn.name==='handshake')return true;
-    t.mock.timers.setTime(1014999);return ready;
+  const f=fake();f.page.evaluate=async(fn:Function,includeForm?:unknown)=>{
+    if(!includeForm)return composite(null,false);
+    t.mock.timers.setTime(1014999);return composite(ready);
   };
   f.locator.isVisible=async()=>{t.mock.timers.setTime(1015001);return true;};
   const result=await runFormLoadBrowser(f.type,handoff,limits());
-  assert.equal(result.outcome,'OBSERVING');assert.equal(result.samples.length,1);
-  assert.equal(classifyFormDiagnosticSample(result.samples[0]),'FORM_READY_AFTER_15S');
+  assert.equal(result.outcome,'OBSERVING');assert.equal(result.observations.length,1);
+  assert.equal(classifyFormDiagnosticSample(result.observations[0]?.sample),'FORM_READY_AFTER_15S');
 });
 for(const boundary of [60000,60001])for(const stage of ['snapshot','visibility']){
   test(`${stage} settlement at ${boundary}ms cannot beat the local deadline timer or promote readiness`,async t=>{
     t.mock.timers.enable({apis:['Date','setTimeout'],now:1000000});
     const sample={...pending},f=fake(sample as typeof ready);let reads=0,payReads=0;
     const payCount=f.locator.count;f.locator.count=async()=>{payReads++;return payCount();};
-    f.page.evaluate=async(fn:Function)=>{
-      if(fn.name==='handshake')return true;
-      if(++reads===1)return {...pending};
+    f.page.evaluate=async(fn:Function,includeForm?:unknown)=>{
+      if(!includeForm)return composite(null,false);
+      if(++reads===1)return composite({...pending});
       Object.assign(sample,ready);
-      t.mock.timers.setTime(1000000+(stage==='snapshot'?boundary:59999));return {...ready};
+      t.mock.timers.setTime(1000000+(stage==='snapshot'?boundary:59999));return composite({...ready});
     };
     f.locator.isVisible=async()=>{t.mock.timers.setTime(1000000+boundary);return true;};
     const run=runFormLoadBrowser(f.type,handoff,limits());
     await immediate();t.mock.timers.tick(100);await immediate();
     const result=await run;
-    assert.equal(result.outcome,'FAILED');assert.equal(result.samples.length,1);
-    assert.equal(result.samples[0]?.bucket,'AT_LIMIT');assert.equal(result.samples[0]?.ready_seen,false);
-    assert.equal(result.samples[0]?.pay_visible,false);
+    assert.equal(result.outcome,'FAILED');assert.equal(result.observations.length,1);
+    assert.equal(result.observations[0]?.sample?.bucket,'AT_LIMIT');assert.equal(result.observations[0]?.sample?.ready_seen,false);
+    assert.equal(result.observations[0]?.sample?.pay_visible,false);
     assert.equal(payReads,stage==='snapshot'?1:2);
-    assert.equal(classifyFormDiagnosticSample(result.samples[0],result.outcome),'OPERATION_FAILED');
+    assert.equal(classifyFormDiagnosticSample(result.observations[0]?.sample,result.outcome),'OPERATION_FAILED');
     assert.equal(result.contextClosed,true);assert.equal(result.browserClosed,true);
   });
 }
 test('expired local window admits no new snapshot even with ample original active time',async t=>{
   t.mock.timers.enable({apis:['Date','setTimeout'],now:1000000});
   const sample={...pending},f=fake(sample as typeof ready);let reads=0;
-  f.page.evaluate=async(fn:Function)=>fn.name==='handshake'?true:(reads++,{...sample});
+  f.page.evaluate=async(_fn:Function,includeForm?:unknown)=>!includeForm?composite(null,false):(reads++,composite({...sample}));
   const run=runFormLoadBrowser(f.type,handoff,limits());await immediate();
   Object.assign(sample,ready);t.mock.timers.tick(60000);await immediate();
   const result=await run;
   assert.equal(reads,1);assert.equal(result.outcome,'FAILED');
-  assert.equal(result.samples[0]?.bucket,'AT_LIMIT');assert.equal(result.samples[0]?.ready_seen,false);
+  assert.equal(result.observations[0]?.sample?.bucket,'AT_LIMIT');assert.equal(result.observations[0]?.sample?.ready_seen,false);
 });
 test('late browser acquisition is closed and never upgrades uncertainty to success',async t=>{
   t.mock.timers.enable({apis:['Date','setTimeout'],now:1000000});
@@ -321,7 +444,7 @@ test('late browser acquisition is closed and never upgrades uncertainty to succe
 test('a hung local observation cannot extend the60s window to the15min active ceiling',async t=>{
   t.mock.timers.enable({apis:['Date','setTimeout'],now:1000000});
   const f=fake({...pending} as typeof ready),controller=new AbortController();let reads=0,settled=false;
-  f.page.evaluate=async(fn:Function)=>fn.name==='handshake'?true:++reads<3?pending:await new Promise(()=>{}) as never;
+  f.page.evaluate=async(_fn:Function,includeForm?:unknown)=>!includeForm?composite(null,false):++reads<3?composite(pending):await new Promise(()=>{}) as never;
   const run=runFormLoadBrowser(f.type,handoff,{deadline:Date.now()+900000,signal:controller.signal}).then(result=>{settled=true;return result;});
   await immediate();t.mock.timers.tick(15000);await immediate();t.mock.timers.tick(100);await immediate();
   t.mock.timers.tick(44900);await immediate();
@@ -342,7 +465,7 @@ test('abort during local observation preserves frozen checkpoint and prevents la
   const sample={...pending},f=fake(sample as typeof ready),controller=new AbortController();
   const run=runFormLoadBrowser(f.type,handoff,{deadline:Date.now()+900000,signal:controller.signal});
   await immediate();t.mock.timers.tick(15000);await immediate();controller.abort();Object.assign(sample,ready);
-  const result=await run;assert.equal(result.outcome,'ABORTED');assert.equal(result.samples.length,1);
-  assert.equal(result.samples[0]?.ready_seen,false);assert.equal(result.samples[0]?.pay_visible,false);
+  const result=await run;assert.equal(result.outcome,'ABORTED');assert.equal(result.observations.length,2);
+  assert.equal(result.observations[0]?.sample?.ready_seen,false);assert.equal(result.observations[1]?.environment.environment_freshness,'CACHED');assert.equal(result.observations[1]?.sample?.pay_visible,false);
   assert.equal(result.contextClosed,true);assert.equal(result.browserClosed,true);
 });

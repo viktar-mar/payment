@@ -12,7 +12,8 @@ interface ReporterAPI {
   onTestEnd(test:TestCase,result:TestResult):void;
   onEnd(result:FullResult):Promise<{status:'passed'|'failed'}>;
 }
-const ready=()=>({version:1,result:'FORM_READY_BEFORE_15S',binding:'BOUND',capability_started:true,capability_ready:true,
+const environment={csp_observation:'OBSERVED',csp_enforced_mask:0,csp_report_only_mask:0,resource_observation:'OBSERVED',resource_transport_failure_mask:0,resource_http_4xx_mask:0,resource_http_5xx_mask:0,environment_freshness:'SAMPLED'};
+const ready=()=>({version:2,...environment,result:'FORM_READY_BEFORE_15S',binding:'BOUND',capability_started:true,capability_ready:true,
   loader_started:true,loader_ready:true,element_created:true,mount_called:true,mount_returned:true,
   ready_seen:true,loaderror_seen:false,view_completed:true,widget_completed:true,confirmation_blocked:false,
   catchup:'RESOLVED',operation:'COMPLETED',widget_state:'ready',element_state:'FRAME',pay_state:'ENABLED',pay_visible:true,bucket:'BEFORE_15S',
@@ -64,7 +65,8 @@ test('raw stdout stderr error getters titles and attachments never escape',async
 // Break: malformed or duplicate frames, truncated transport or output overflow becomes success.
 test('duplicate escaped keys duplicate frames extra fields overflow and truncation fail closed',async()=>{
   const valid=wire(ready());
-  const cases=[valid.replace('"version":1','"version":1,"\\u0076ersion":1'),
+  const cases=[valid.replace('"version":2','"version":2,"\\u0076ersion":1'),
+    wire({...ready(),version:1}),wire({...ready(),csp_enforced_mask:16}),wire({...ready(),environment_freshness:'CACHED'}),
     wire({...ready(),secret:'private-sentinel'}),valid+valid,valid+wire(pending())+valid,
     'private-sentinel'.repeat(400),valid.trimEnd(),'{}\n'];
   for(const value of cases)await capture(async(reporter,lines)=>{
@@ -74,6 +76,16 @@ test('duplicate escaped keys duplicate frames extra fields overflow and truncati
     assert.ok(lines.filter(line=>line.startsWith('{')).length<=2);
   });
 });
+
+// Break: a valid opaque failure drops the only available bootstrap evidence or leaks raw payloads.
+test('opaque wire2 CSP baseline is printed as validated finite failure and never passes',async()=>capture(async(reporter,lines)=>{
+  const frame={version:2,...environment,environment_freshness:'CACHED',csp_enforced_mask:1,
+    result:'INSTRUMENTATION_UNAVAILABLE',no_confirmation:true,browser_closed:true,context_closed:true,runtime_closed:true};
+  reporter.onStdOut(wire(frame));caseEnd(reporter);
+  assert.deepEqual(await reporter.onEnd(passed),{status:'failed'});
+  assert.deepEqual(JSON.parse(lines[0]!),frame);assert.equal(lines.length,2);
+  assert.equal(lines[1],'form_diagnostic_failed_manual_check\n');
+}));
 
 // Break: UI readiness is treated as financial, cleanup, or Playwright pass proof.
 test('final readiness needs all four proofs and exactly one passed test and passed run',async()=>{
@@ -91,7 +103,7 @@ test('final readiness needs all four proofs and exactly one passed test and pass
 
 // Break: later readiness erases a primary failure or post-final output corruption.
 test('opaque failure remains failed even after a subsequent ready frame',async()=>capture(async(reporter)=>{
-  reporter.onStdOut(wire({version:1,result:'OPERATION_FAILED',no_confirmation:true,browser_closed:true,context_closed:true,runtime_closed:true}));
+  reporter.onStdOut(wire({version:2,...environment,result:'OPERATION_FAILED',no_confirmation:true,browser_closed:true,context_closed:true,runtime_closed:true}));
   reporter.onStdOut(wire(ready()));caseEnd(reporter);
   assert.deepEqual(await reporter.onEnd(passed),{status:'failed'});
 }));

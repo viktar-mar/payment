@@ -11,6 +11,40 @@ const ready = () => ({version:1,binding:'BOUND',capability_started:true,capabili
   catchup:'RESOLVED',operation:'COMPLETED',widget_state:'ready',element_state:'FRAME',pay_state:'ENABLED',
   pay_visible:true,bucket:'BEFORE_15S'});
 const proofs = {no_confirmation:true,browser_closed:true,context_closed:true,runtime_closed:true};
+const environment=()=>({csp_observation:'OBSERVED',csp_enforced_mask:0,csp_report_only_mask:0,
+  resource_observation:'OBSERVED',resource_transport_failure_mask:0,resource_http_4xx_mask:0,
+  resource_http_5xx_mask:0,environment_freshness:'SAMPLED'});
+
+// Break: sample v1 accidentally becomes a v1 wire success, or absent evidence fabricates readiness.
+test('literal sample1 needs sampled independent environment and emits wire2 only',()=>{
+  const sample=ready();assert.equal(validate(sample).version,1);
+  const frame=build(sample,'OBSERVING',proofs,environment());
+  assert.equal(frame.version,2);assert.equal(frame.result,'FORM_READY_BEFORE_15S');
+  assert.equal(frame.environment_freshness,'SAMPLED');assert.deepEqual(parse(format(frame)),frame);
+  assert.equal(build(sample,'OBSERVING',proofs,{...environment(),csp_enforced_mask:1}).result,'FORM_READY_BEFORE_15S');
+  for(const env of [undefined,{...environment(),environment_freshness:'CACHED'},
+    {...environment(),csp_observation:'UNAVAILABLE'}]){
+    const unavailable=build(sample,'OBSERVING',proofs,env);
+    assert.equal(unavailable.result,'INSTRUMENTATION_UNAVAILABLE');assert.equal(Object.hasOwn(unavailable,'bucket'),false);
+  }
+  assert.equal(parse(JSON.stringify({...frame,version:1})+'\n'),null);
+});
+
+// Break: observation accessors or an obsolete wire sample transports private data.
+test('composite boundary freezes independent copies and rejects accessors and invalid sample versions',()=>{
+  const validateObservation=schema.validateFormDiagnosticObservation;
+  assert.equal(typeof validateObservation,'function');
+  const original={sample:ready(),environment:environment()},copy=validateObservation(original);
+  assert.deepEqual(copy,original);assert.ok(Object.isFrozen(copy));assert.ok(Object.isFrozen(copy.sample));
+  assert.ok(Object.isFrozen(copy.environment));assert.notEqual(copy.environment,original.environment);
+  let reads=0;const accessor={sample:ready()};Object.defineProperty(accessor,'environment',{enumerable:true,get(){reads++;throw null;}});
+  for(const value of [accessor,{...original,extra:'private-sentinel'},{...original,sample:{...ready(),version:2}},
+    {...original,environment:{...environment(),resource_http_4xx_mask:NaN}},{...original,sample:undefined}])assert.equal(validateObservation(value),null);
+  assert.equal(reads,0);assert.equal(validateObservation({...original,sample:null}).sample,null);
+  const frame=build(ready(),'OBSERVING',proofs,environment()),hidden={...frame};Object.defineProperty(hidden,'private',{value:'private-sentinel'});
+  const envAccessor={...frame};Object.defineProperty(envAccessor,'csp_enforced_mask',{enumerable:true,get(){reads++;throw null;}});
+  assert.equal(format(hidden),null);assert.equal(format(envAccessor),null);assert.equal(reads,0);
+});
 
 // Break: absent API cannot enforce the public privacy boundary.
 test('schema exposes a validator, classifier and bounded wire boundary', () => {
@@ -73,11 +107,11 @@ test('validation returns a frozen scalar copy and rejects malformed hostile inpu
 
 // Break: serializer invokes toJSON or fabricates observations on missing samples.
 test('builder uses exact sampled or opaque-failure shape with independently validated proofs', () => {
-  const frame=build(ready(),'OBSERVING',proofs);
+  const frame=build(ready(),'OBSERVING',proofs,environment());
   assert.ok(Object.isFrozen(frame));assert.equal(frame.result,'FORM_READY_BEFORE_15S');
-  assert.deepEqual(build(null,'FAILED',proofs),{version:1,result:'OPERATION_FAILED',...proofs});
-  assert.deepEqual(build(null,'OBSERVING',proofs),{version:1,result:'INSTRUMENTATION_UNAVAILABLE',...proofs});
-  assert.equal(build(ready(),'OBSERVING',{...proofs,no_confirmation:'true'}).no_confirmation,false);
+  assert.deepEqual(build(null,'FAILED',proofs,environment()),{version:2,result:'OPERATION_FAILED',...proofs,...environment()});
+  assert.deepEqual(build(null,'OBSERVING',proofs,environment()),{version:2,result:'INSTRUMENTATION_UNAVAILABLE',...proofs,...environment()});
+  assert.equal(build(ready(),'OBSERVING',{...proofs,no_confirmation:'true'},environment()).no_confirmation,false);
   assert.equal(format({...frame,toJSON(){throw Error('private-sentinel');}}),null);
   assert.equal(format({...frame,result:'WAITING_CLIENT_SESSION'}),null);
   assert.equal(format({version:1,result:'FORM_READY_BEFORE_15S',...proofs}),null);
@@ -85,13 +119,13 @@ test('builder uses exact sampled or opaque-failure shape with independently vali
 
 // Break: ambiguous duplicate keys, escaped duplicates and trailing bytes bypass validation.
 test('wire parser accepts only one bounded flat finite JSON frame without duplicate keys', () => {
-  const frame=build(ready(),'OBSERVING',proofs),wire=format(frame);
+  const frame=build(ready(),'OBSERVING',proofs,environment()),wire=format(frame);
   assert.ok(wire.endsWith('\n'));assert.ok(Buffer.byteLength(wire)<=4096);
   assert.deepEqual(parse(wire),frame);
   const body=wire.trimEnd();
   assert.equal(parse(body),null);
-  for (const value of [body.slice(0,-1),body+'\n'+body,body.replace('"version":1','"version":1,"version":1'),
-    body.replace('"version":1','"version":1,"\\u0076ersion":1'),body.replace('"version":1','"version":1,"secret":"private-sentinel"'),
+  for (const value of [body.slice(0,-1),body+'\n'+body,body.replace('"version":2','"version":2,"version":1'),
+    body.replace('"version":2','"version":2,"\\u0076ersion":1'),body.replace('"version":2','"version":2,"secret":"private-sentinel"'),
     ' '.repeat(4097)+body,'null','[]','{"version":1}',body+'private-sentinel']) assert.equal(parse(value+'\n'),null);
   assert.equal(parse(new Proxy({},{get(){throw null;}})),null);
   assert.equal(format(new Proxy({},{ownKeys(){throw null;}})),null);

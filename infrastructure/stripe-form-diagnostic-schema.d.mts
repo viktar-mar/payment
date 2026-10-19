@@ -1,3 +1,4 @@
+import type {FormEnvironmentEvidence} from './stripe-form-diagnostic-environment.mjs';
 export type FormDiagnosticOutcome = 'OBSERVING'|'FAILED'|'ABORTED'|'DEADLINE_REACHED'|'INSTRUMENTATION_UNAVAILABLE'|'UNEXPECTED_ACTIVITY';
 export type FormDiagnosticResult = 'FORM_READY_BEFORE_15S'|'FORM_READY_AFTER_15S'|'WAITING_CLIENT_SESSION'|'WAITING_STRIPE_LOADER'|
   'ELEMENT_SETUP_INCOMPLETE'|'WAITING_ELEMENT_READY'|'WAITING_PRESENTATION_CATCHUP'|'WIDGET_HANDOFF_INCOMPLETE'|'ELEMENT_LOADERROR'|
@@ -31,10 +32,15 @@ export interface FormDiagnosticProofs {
   readonly context_closed:boolean;
   readonly runtime_closed:boolean;
 }
-export type FormDiagnosticFrame = Readonly<{version:1;result:FormDiagnosticResult} & FormDiagnosticProofs> |
-  Readonly<FormDiagnosticSample & {result:FormDiagnosticResult} & FormDiagnosticProofs>;
+export interface FormDiagnosticObservation {
+  readonly sample:Readonly<FormDiagnosticSample>|null;
+  readonly environment:Readonly<FormEnvironmentEvidence>;
+}
+export type FormDiagnosticFrame = Readonly<{version:2;result:FormDiagnosticResult} & FormDiagnosticProofs & FormEnvironmentEvidence> |
+  Readonly<Omit<FormDiagnosticSample,'version'> & {version:2;result:FormDiagnosticResult} & FormDiagnosticProofs & FormEnvironmentEvidence>;
 export function validateFormDiagnosticSample(value:unknown):Readonly<FormDiagnosticSample>|null;
+export function validateFormDiagnosticObservation(value:unknown):Readonly<FormDiagnosticObservation>|null;
 export function classifyFormDiagnosticSample(value:unknown,outcome?:FormDiagnosticOutcome):FormDiagnosticResult;
-export function buildFormDiagnosticFrame(sample:FormDiagnosticSample|null,outcome:FormDiagnosticOutcome,proofs:FormDiagnosticProofs):FormDiagnosticFrame;
+export function buildFormDiagnosticFrame(sample:FormDiagnosticSample|null,outcome:FormDiagnosticOutcome,proofs:FormDiagnosticProofs,environment:FormEnvironmentEvidence):FormDiagnosticFrame;
 export function formatFormDiagnosticFrame(value:unknown):string|null;
 export function parseFormDiagnosticFrame(wire:string):FormDiagnosticFrame|null;

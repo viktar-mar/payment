@@ -1,4 +1,5 @@
 /** Pure finite data boundary shared by the browser, owner and safe reporter. */
+import {validateFormEnvironmentEvidence,unavailableFormEnvironmentEvidence} from './stripe-form-diagnostic-environment.mjs';
 const FLAGS = ['capability_started','capability_ready','loader_started','loader_ready','element_created',
   'mount_called','mount_returned','ready_seen','loaderror_seen','view_completed','widget_completed','confirmation_blocked'];
 const DOMAINS = {
@@ -10,6 +11,8 @@ const DOMAINS = {
 };
 for (const key of FLAGS) DOMAINS[key] = [false,true];
 const SAMPLE_KEYS = ['version','binding',...FLAGS,'catchup','operation','widget_state','element_state','pay_state','pay_visible','bucket'];
+const STAGE_KEYS = SAMPLE_KEYS.filter(key=>key!=='version');
+const ENVIRONMENT_KEYS = Object.keys(unavailableFormEnvironmentEvidence());
 const PROOF_KEYS = ['no_confirmation','browser_closed','context_closed','runtime_closed'];
 const FAILURES = ['OPERATION_FAILED','ABORTED','DEADLINE_REACHED','INSTRUMENTATION_UNAVAILABLE','BINDING_LOST','CONFIRMATION_BLOCKED','UNEXPECTED_ACTIVITY'];
 const RESULTS = ['FORM_READY_BEFORE_15S','FORM_READY_AFTER_15S','WAITING_CLIENT_SESSION','WAITING_STRIPE_LOADER',
@@ -40,6 +43,20 @@ export function validateFormDiagnosticSample(value) {
   const copy = exactData(value,SAMPLE_KEYS);
   if (!copy || SAMPLE_KEYS.some(key => !DOMAINS[key].includes(copy[key]))) return null;
   return Object.freeze(copy);
+}
+
+export function validateFormDiagnosticObservation(value) {
+  const data=exactData(value,['sample','environment']);
+  if(!data)return null;
+  const sample=data.sample===null?null:validateFormDiagnosticSample(data.sample);
+  const environment=validateFormEnvironmentEvidence(data.environment);
+  if((data.sample!==null&&!sample)||!environment)return null;
+  return Object.freeze({sample,environment});
+}
+
+function sampledEnvironment(environment) {
+  return environment.environment_freshness==='SAMPLED'&&environment.csp_observation==='OBSERVED'
+    &&environment.resource_observation==='OBSERVED';
 }
 
 function cause(outcome) {
@@ -86,22 +103,26 @@ function safeProofs(value) {
   return Object.fromEntries(PROOF_KEYS.map(key => [key, copy !== null && copy[key] === true]));
 }
 
-export function buildFormDiagnosticFrame(value, outcome, proofs) {
+export function buildFormDiagnosticFrame(value, outcome, proofs, evidence) {
   const sample = validateFormDiagnosticSample(value);
-  const result = classifyFormDiagnosticSample(sample,outcome);
-  return Object.freeze(sample ? {...sample,result,...safeProofs(proofs)} : {
-    version:1,result:FAILURES.includes(result) ? result : 'INSTRUMENTATION_UNAVAILABLE',...safeProofs(proofs),
-  });
+  const environment=validateFormEnvironmentEvidence(evidence)??unavailableFormEnvironmentEvidence();
+  let result = classifyFormDiagnosticSample(sample,outcome);
+  const sampled=sampledEnvironment(environment);
+  if(!sampled&&!FAILURES.includes(result))result='INSTRUMENTATION_UNAVAILABLE';
+  const stage=sample&&sampled?Object.fromEntries(STAGE_KEYS.map(key=>[key,sample[key]])):{};
+  return Object.freeze({version:2,...stage,result,...safeProofs(proofs),...environment});
 }
 
 function validateFrame(value) {
-  const shortKeys = ['version','result',...PROOF_KEYS];
-  const longKeys = [...SAMPLE_KEYS,'result',...PROOF_KEYS];
+  const shortKeys = ['version','result',...PROOF_KEYS,...ENVIRONMENT_KEYS];
+  const longKeys = ['version',...STAGE_KEYS,'result',...PROOF_KEYS,...ENVIRONMENT_KEYS];
   const data = exactData(value,shortKeys) ?? exactData(value,longKeys);
-  if (!data || data.version !== 1 || !RESULTS.includes(data.result) || PROOF_KEYS.some(key => typeof data[key] !== 'boolean')) return null;
+  if (!data || data.version !== 2 || !RESULTS.includes(data.result) || PROOF_KEYS.some(key => typeof data[key] !== 'boolean')) return null;
+  const environment=validateFormEnvironmentEvidence(Object.fromEntries(ENVIRONMENT_KEYS.map(key=>[key,data[key]])));
+  if(!environment)return null;
   if (!Object.hasOwn(data,'bucket')) return FAILURES.includes(data.result) ? Object.freeze(data) : null;
-  const sample = validateFormDiagnosticSample(Object.fromEntries(SAMPLE_KEYS.map(key => [key,data[key]])));
-  if (!sample) return null;
+  const sample = validateFormDiagnosticSample({version:1,...Object.fromEntries(STAGE_KEYS.map(key => [key,data[key]]))});
+  if (!sample||!sampledEnvironment(environment)) return null;
   // Failure provenance is an opaque discriminator. Stage and readiness results
   // must be independently reproducible from the finite snapshot.
   if (!FAILURES.includes(data.result) && classifyFormDiagnosticSample(sample) !== data.result) return null;
@@ -122,7 +143,7 @@ export function parseFormDiagnosticFrame(wire) {
     const value = JSON.parse(wire);
     const frame = validateFrame(value);
     if (!frame) return null;
-    // Every accepted value is a flat enum/boolean/1. Such values and allowed
+    // Every accepted value is flat finite scalar data. Values and allowed
     // decoded keys contain no colon, so each colon must delimit one key.
     // Counting before decoding also rejects escaped duplicate key spellings.
     if ((wire.match(/:/g) ?? []).length !== Object.keys(frame).length) return null;

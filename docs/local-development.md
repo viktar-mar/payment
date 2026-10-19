@@ -286,6 +286,50 @@ Connect/version overrides; it does not establish publishable-key/account pairing
 
 The driver clicks Resume once, observes at most60 seconds (15-second checkpoint)
 within the original active window, and emits at most two strict finite frames.
+The diagnostic-only wire format is version2, a breaking change: the reporter
+rejects version1, mixed versions and incomplete frames. Historical evidence stays
+in its original format. Internal SDK samples remain version1. Each wire frame is
+at most4096 UTF-8 bytes and contains only validated stage/proof fields and eight
+finite environment fields; an opaque failure has no stage fields.
+
+Before navigation, independent collectors observe CSP violations of the owned
+top-level document and resource events of its owned page. A post-navigation
+baseline retains available environment evidence even when SDK bootstrap is absent.
+Resume requires a valid handshake and both sources OBSERVED with SAMPLED evidence;
+partial instrumentation ends without creating a client session.
+
+`csp_enforced_mask` and `csp_report_only_mask` use SCRIPT=1, FRAME=2, CONNECT=4,
+OTHER=8. Script directives include `script-src`, `script-src-elem`, `script-src-attr`;
+frame directives include `frame-src` and `child-src`. Report-only bits record
+reports, not enforced blocking. This collector does not inspect CSP within a
+cross-origin iframe or prove the complete applied policy.
+
+`resource_transport_failure_mask`, `resource_http_4xx_mask` and
+`resource_http_5xx_mask` are separate observations: SCRIPT=1, DOCUMENT=2,
+FETCH_XHR=4, OTHER=8. They cover events available for the whole owned page,
+including its subframes. They carry no URL/origin attribution, request count,
+Stripe provenance, key-validity judgment or DNS/TLS/CSP cause.
+
+`csp_observation` and `resource_observation` are OBSERVED only when that collector
+is installed and its snapshot is available. Zero masks mean no recorded bit at
+the snapshot, not a healthy environment. UNAVAILABLE source masks are zero.
+`environment_freshness` is SAMPLED for a composite observation within the original
+window, CACHED for retained evidence after failure or the local limit, and
+UNAVAILABLE when both sources are unavailable. The composite is not an atomic
+causal measurement. A checkpoint owns its environment evidence; later masks do
+not rewrite it. Cached/partial evidence cannot establish an ordinary stage or
+readiness. Nonzero masks do not cancel actual proved readiness or override a
+primary operation/control/financial/cleanup failure.
+
+Node reads and resource callbacks stop at abort, the local limit, the original
+deadline or teardown. The CSP listener's private bounded bits can continue until
+the original deadline or document teardown; no subsequent page read or report
+publication uses them. This does not claim external-operation cancellation.
+These collectors and their synthetic offline tests do not authorize runtime
+validation. A future prepare-only Sandbox attempt still needs separate approval
+for its fresh provider writes. Without new positive evidence, the cause remains
+UNKNOWN; zero masks do not localize the cause to Stripe or justify CSP changes.
+
 If no complete observation can settle before the strict local ceiling, the last
 finite flags may be retained as AT_LIMIT with an opaque operation failure; they
 are not a fresh pending-state or readiness proof at/after60 seconds. A delayed
