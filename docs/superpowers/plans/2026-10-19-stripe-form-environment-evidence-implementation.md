@@ -10,7 +10,7 @@
 
 **Spec:** [Согласованный design addendum](../specs/2026-10-19-stripe-form-environment-evidence-design.md), дополняющий [исходный ограниченный режим](../specs/2026-10-18-stripe-form-load-diagnostic-design.md).
 
-**Status/authority:** Пользователь подтвердил автоматическое продолжение офлайн-реализации с субагентами и независимым review. Tasks1–2 реализованы и отдельно одобрены; свежий общий gate132/132 и demo tsc exit0. Финальное review всего дополнения и feature-only публикация ещё не завершены. Actual runtime не разрешён и не запускался; причина прежней загрузки UNKNOWN. Source baseline — `17b4d08e44f7310068b1d3e390da8261ff216960`, implementation baseline — `2bd8b7aee8b69a6edc95bedbdcd30d02e42d3d59`; работа только в существующей linked worktree/ветке `codex/stripe-sandbox-5a`, primary main не меняется.
+**Status/authority:** Офлайн-реализация завершена по подтверждённому пользователем автоматическому продолжению. Tasks1–2 отдельно одобрены; единственное Important замечание финального review о проверке снимков до сериализации закрыто RED/GREEN и scoped re-review, новых замечаний нет. Свежий общий gate198/198 и demo tsc exit0. Feature-only публикация исходного кода подтверждена remote hash readback. Actual runtime не разрешён и не запускался; причина прежней загрузки UNKNOWN. Source baseline — `17b4d08e44f7310068b1d3e390da8261ff216960`, implementation baseline — `2bd8b7aee8b69a6edc95bedbdcd30d02e42d3d59`; работа только в существующей linked worktree/ветке `codex/stripe-sandbox-5a`, primary main не меняется.
 
 ## Global Constraints
 
@@ -162,7 +162,7 @@ buildFormDiagnosticFrame(sample: FormDiagnosticSample|null, outcome: FormDiagnos
   env -i PATH="$PATH" LANG=C LC_ALL=C NO_COLOR=1 node node_modules/typescript/bin/tsc --noEmit
   ```
 
-- [ ] **8. Независимое scoped review и публикация**. Review всего addendum Tasks1–2 на frozen hashes, без повторного исторического Stage5A review/тех же suites; полученные findings проверить и закрыть. ROOT проверяет spec coverage, descriptors/privacy/version/deadline/proof, exact changed-file manifest, diffcheck/secret candidates; коммитит и пушит только feature branch по standing authority с remote hash readback. Main/evidence/resources сохраняются, PR/merge/archive не делать. Финал явно говорит «только офлайн; причина UNKNOWN до новых сведений; Sandbox не запускался».
+- [x] **8. Независимое scoped review и публикация**. Review всего addendum Tasks1–2 на frozen hashes, без повторного исторического Stage5A review/тех же suites; полученные findings проверить и закрыть. ROOT проверяет spec coverage, descriptors/privacy/version/deadline/proof, exact changed-file manifest, diffcheck/secret candidates; коммитит и пушит только feature branch по standing authority с remote hash readback. Main/evidence/resources сохраняются, PR/merge/archive не делать. Финал явно говорит «только офлайн; причина UNKNOWN до новых сведений; Sandbox не запускался».
 
 ## Что сознательно не входит
 
@@ -176,4 +176,4 @@ Spec coverage: CSP/resource domains, allowed reads, states/freshness и неза
 
 Независимый builder-check нашёл один существенный вопрос: остановка CSP realm при Node abort/local end. Это не пользовательский product choice, а разрешённое инженерное уточнение: private fixed bits могут жить до active deadline/document teardown, но Node reads/publication прекращаются и frozen evidence не меняется. Решение включено в spec/Tasks1–2; дополнительный RPC/control API не нужен. Иных consequential questions не предъявлено. Новые design choices (masks, wire2, частичная instrumentation, две задачи) представлены пользователю для approval, не выдаются за ранее согласованные.
 
-Офлайн-реализация подтверждена и проверена по задачам. Оставшийся финальный gate не разрешает actual runtime; для будущей попытки требуется отдельное согласование.
+Офлайн-реализация, финальное review с закрытием замечания и feature-only публикация завершены. Эти результаты не разрешают actual runtime; для будущей попытки требуется отдельное согласование.

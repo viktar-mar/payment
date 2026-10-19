@@ -1,6 +1,6 @@
 # Конечные признаки окружения для диагностики Stripe-формы
 
-Статус: **согласована офлайн-реализация**, обе задачи реализованы с RED/GREEN и отдельным независимым review; свежий общий gate132/132, demo tsc exit0. Финальное review всего дополнения и feature-only публикация пока ожидаются. Пользователь подтвердил автоматическое продолжение, но не browser/runtime/API или новую Sandbox-попытку. Причина прежнего сбоя UNKNOWN. База проекта: `17b4d08e44f7310068b1d3e390da8261ff216960`, implementation baseline `2bd8b7aee8b69a6edc95bedbdcd30d02e42d3d59`, существующая ветка `codex/stripe-sandbox-5a`; primary main не меняется.
+Статус: **офлайн-реализация завершена**, обе задачи реализованы с RED/GREEN и отдельным независимым review; единственное Important замечание финального review о проверке снимков до сериализации закрыто дополнительным RED/GREEN и scoped re-review. Свежий общий gate198/198, demo tsc exit0; feature-only публикация исходного кода подтверждена remote hash readback. Пользователь подтвердил автоматическое продолжение, но не browser/runtime/API или новую Sandbox-попытку. Причина прежнего сбоя UNKNOWN. База проекта: `17b4d08e44f7310068b1d3e390da8261ff216960`, implementation baseline `2bd8b7aee8b69a6edc95bedbdcd30d02e42d3d59`, существующая ветка `codex/stripe-sandbox-5a`; primary main не меняется.
 
 ## Цель и известная граница
 
