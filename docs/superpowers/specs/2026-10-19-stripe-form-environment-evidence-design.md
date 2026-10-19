@@ -1,6 +1,6 @@
 # Конечные признаки окружения для диагностики Stripe-формы
 
-Статус: **предложение на согласование**, подготовлен только план. Пользователь разрешил подготовку узкого плана без Sandbox; это не разрешение на реализацию, browser/runtime/API или новую попытку. База проекта: `17b4d08e44f7310068b1d3e390da8261ff216960`, существующая ветка `codex/stripe-sandbox-5a`.
+Статус: **согласована офлайн-реализация**, обе задачи реализованы с RED/GREEN и отдельным независимым review; свежий общий gate132/132, demo tsc exit0. Финальное review всего дополнения и feature-only публикация пока ожидаются. Пользователь подтвердил автоматическое продолжение, но не browser/runtime/API или новую Sandbox-попытку. Причина прежнего сбоя UNKNOWN. База проекта: `17b4d08e44f7310068b1d3e390da8261ff216960`, implementation baseline `2bd8b7aee8b69a6edc95bedbdcd30d02e42d3d59`, существующая ветка `codex/stripe-sandbox-5a`; primary main не меняется.
 
 ## Цель и известная граница
 
@@ -10,7 +10,7 @@
 
 ## Выбор подхода и границы
 
-Это мой инженерный выбор для согласования: два изолированных сборщика без изменения SDK/backend/CSP и версия 2 публичного диагностического отчёта. Новые зависимости не нужны. Дополнительный `loaderstart` пока не нужен: ещё одна отметка этапа сама по себе не различает блокировку и ошибку загрузки. Сбор полных логов, URL, provider payload, trace/HAR и изменение timeout не рассматриваются.
+Согласованный инженерный выбор: два изолированных сборщика без изменения SDK/backend/CSP и версия 2 публичного диагностического отчёта. Новые зависимости не нужны. Дополнительный `loaderstart` пока не нужен: ещё одна отметка этапа сама по себе не различает блокировку и ошибку загрузки. Сбор полных логов, URL, provider payload, trace/HAR и изменение timeout не рассматриваются.
 
 Сборщики пассивны: не добавляют запросы, не перехватывают/исправляют ответы, не создают retry, DOM/iframe inspectors, payment capabilities или SDK events. Количество событий не накапливается: только OR конечных битов, постоянный размер памяти, без списков Request/Response/Event и их сохранения в замыканиях/отложенной работе.
 
@@ -71,9 +71,9 @@ Node callbacks и page reads ограничены прежним deadline/abort/
 
 ## Полномочия и проверки
 
-Сейчас только документы. Последующая реализация потребует подтверждения этого дизайна/плана; тесты будут офлайн, внешние event/process/Stripe границы синтетические, реальные collector/driver/parent/schema/reporter выполняются. Нужны meaningful RED→GREEN, связанные regression/typechecks, проверка сериализации init-script без module closures и независимое review после каждой из двух задач. Новая instrumentation не является доказательством реального browser поведения до отдельной проверки.
+Пользователь подтвердил офлайн-реализацию дизайна/плана. Внешние event/process/Stripe границы в тестах синтетические, реальные collector/driver/parent/schema/reporter выполняются. Meaningful RED→GREEN, связанные regression/typechecks, сериализация init-script без module closures и независимое review проверены после каждой из двух задач. Новая instrumentation не является доказательством реального browser поведения до отдельной проверки.
 
-В обоих будущих implementation tasks запрещены actual browser, Sandbox/API/CLI/OAuth, Docker/appstack, чтение private keys/env/JWK/mail/OTP/runtime logs, порты/run UUID/allowance, удаление/переиспользование ресурсов и платежи. Не меняются SDK/backend, nginx/CSP, selectors, Stripe ready timeout, provider binding, финансовые proof, default/full/Fake режимы. UI/SDK не получают новые события/exports.
+В обеих implementation tasks и последующих офлайн-проверках запрещены actual browser, Sandbox/API/CLI/OAuth, Docker/appstack, чтение private keys/env/JWK/mail/OTP/runtime logs, порты/run UUID/allowance, удаление/переиспользование ресурсов и платежи. Не меняются SDK/backend, nginx/CSP, selectors, Stripe ready timeout, provider binding, финансовые proof, default/full/Fake режимы. UI/SDK не получают новые события/exports.
 
 Возможный будущий запуск — отдельное разрешение на одну прежнюю prepare-only попытку: без карты, Pay/confirm/retry/refund/OTP, без CLI login/listener. Она всё ещё требует свежего неподтверждённого EUR20 Intent и прежних ограниченных Product/Price/Checkout/Attempt; «не платить» не означает отсутствие provider writes. Утверждение документов/коммит не разрешают такую попытку. После неясного результата — отчёт/manual check, не автоматический повтор. При всех нулевых masks причина остаётся UNKNOWN, не делается вывод «проблема внутри Stripe» и не ослабляется CSP.
 
