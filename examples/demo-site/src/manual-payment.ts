@@ -3,6 +3,7 @@ import {armManualPayment} from '../../../frontend/sdk/src/diagnostics/manual-pay
 import {exact,object,validateSession} from '../../../frontend/sdk/src/contracts';
 import type {CheckoutSession} from '../../../frontend/sdk/src/contracts';
 interface ManualPaymentDependencies {readonly signal?:AbortSignal;readonly now?:()=>number;readonly fetch?:typeof fetch;}
+type LoadFailureCode='SESSION_HTTP_FORBIDDEN'|'SESSION_HTTP_GONE'|'SESSION_HTTP_ERROR'|'SESSION_HTTP_UNAVAILABLE'|'SESSION_JSON_INVALID'|'SESSION_INVALID'|'WIDGET_SETUP_FAILED'|'AUTHORIZATION_BINDING_FAILED'|'WIDGET_MOUNT_FAILED';
 
 /** Human-owned one-shot page. Neither card fields nor provider error details are read. */
 export function mountManualPaymentPage(root:HTMLElement,dependencies:ManualPaymentDependencies={}):{close():void}{
@@ -23,7 +24,7 @@ export function mountManualPaymentPage(root:HTMLElement,dependencies:ManualPayme
   function finish(message='Попытка завершена. Окончательный результат проверяет оператор по серверному отчёту. Закройте эту вкладку.'):void{if(closed)return;status.textContent=message;close();}
   function expire():void{finish('Время истекло. Повторная оплата недоступна. Закройте эту вкладку.');}
   function active():boolean{if(closed)return false;if(!Number.isFinite(now())||now()>=deadline||widgetWasConnected&&!widget?.isConnected){expire();return false;}return true;}
-  async function post(path:string):Promise<string>{
+  async function post(path:string,httpFailure?:(status:number)=>void):Promise<string>{
     // Headers and body share one immutable HTTP budget, including late delivery.
     const httpDeadline=Math.min(now()+10000,deadline),controller=new AbortController();
     const abort=()=>controller.abort();exchange.signal.addEventListener('abort',abort,{once:true});if(exchange.signal.aborted)abort();
@@ -31,7 +32,7 @@ export function mountManualPaymentPage(root:HTMLElement,dependencies:ManualPayme
     const check=()=>{if(controller.signal.aborted||!active()||now()>=httpDeadline)throw null;};
     const work=(async()=>{
       check();const response=await request(path,{method:'POST',credentials:'same-origin',cache:'no-store',headers:{'Content-Type':'application/json'},body:'{}',signal:controller.signal});
-      try{check();if(!response.ok)throw null;const wire=await response.text();check();return wire;}
+      try{check();if(!response.ok){httpFailure?.(response.status);throw null;}const wire=await response.text();check();return wire;}
       catch{if(response.body)void response.body.cancel().catch(()=>{});throw null;}
     })();
     try{
@@ -64,22 +65,27 @@ export function mountManualPaymentPage(root:HTMLElement,dependencies:ManualPayme
   }
   async function begin():Promise<void>{
     if(started||!active())return;started=true;start.disabled=true;status.textContent='Загрузка формы…';
+    // Only locally assigned stages and numeric HTTP statuses reach the terminal UI.
+    let loadFailure:LoadFailureCode='SESSION_HTTP_UNAVAILABLE';
     try{
-      const wire=await post('/manual-payment-session');if(!active())return;if(wire.length>8192)throw null;const record:unknown=JSON.parse(wire);
+      const wire=await post('/manual-payment-session',status=>{loadFailure=status===403?'SESSION_HTTP_FORBIDDEN':status===410?'SESSION_HTTP_GONE':'SESSION_HTTP_ERROR';});if(!active())return;
+      if(wire.length>8192){loadFailure='SESSION_INVALID';throw null;}loadFailure='SESSION_JSON_INVALID';const record:unknown=JSON.parse(wire);loadFailure='SESSION_INVALID';
       if(!object(record)||!exact(record,['version','apiBaseUrl','siteKey','priceKey','checkoutId','checkoutToken','expiresAt','providerType','confirmationMode','state'])||record.version!==2||record.providerType!=='STRIPE'||record.confirmationMode!=='CLIENT_PROVIDER')throw null;
       const session={...record,providerClientPayload:{}} as unknown as CheckoutSession;validateSession(session);
       if(!/^http:\/\/127\.0\.0\.1:[1-9][0-9]{3,4}$/.test(session.apiBaseUrl)||Number(new URL(session.apiBaseUrl).port)<1024||Number(new URL(session.apiBaseUrl).port)>65535||session.apiBaseUrl===location.origin
         ||session.state.status!=='REQUIRES_PAYMENT_METHOD'||session.state.amountMinor!==2000||session.state.currency!=='EUR'||session.state.price?.version!==1||session.state.price.taxMode!=='NONE'||Date.parse(session.expiresAt)<=now())throw null;
       deadline=Math.min(deadline,Date.parse(session.expiresAt));clearTimeout(timer);timer=setTimeout(expire,Math.max(0,deadline-now()));
+      loadFailure='WIDGET_SETUP_FAILED';
       defineGenericPaymentWidget();widget=new GenericPaymentWidget();widget.apiBaseUrl=session.apiBaseUrl;widget.siteKey=session.siteKey;widget.priceKey=session.priceKey;widget.locale='en';
       // A separate SDK graph is unknown to this internal registry and fails here.
-      lease=armManualPayment(widget,{deadline,authorize,session});widget.addEventListener('click',guard,true);widget.addEventListener('keydown',guard,true);
+      loadFailure='AUTHORIZATION_BINDING_FAILED';lease=armManualPayment(widget,{deadline,authorize,session});
+      loadFailure='WIDGET_MOUNT_FAILED';widget.addEventListener('click',guard,true);widget.addEventListener('keydown',guard,true);
       for(const name of ['ready','succeeded','failed','unknown','expired','requires-action','processing'])widget.addEventListener(name,()=>{
         if(attempted&&!authorizing&&name==='ready')finish();else inspect();
       });
       changes=new MutationObserver(inspect);changes.observe(widget.shadowRoot!,{subtree:true,attributes:true,childList:true});changes.observe(document,{subtree:true,childList:true});
       host.append(widget);widgetWasConnected=widget.isConnected;status.textContent='Введите только тестовую карту. Нажмите Pay один раз.';inspect();
-    }catch{finish('Не удалось загрузить форму. Повторная оплата недоступна. Закройте эту вкладку.');}
+    }catch{finish('Не удалось загрузить форму. Повторная оплата недоступна. Закройте эту вкладку. '+loadFailure);}
   }
   start.addEventListener('click',begin);window.addEventListener('pagehide',close);dependencies.signal?.addEventListener('abort',close,{once:true});if(dependencies.signal?.aborted)close();
   return Object.freeze({close});

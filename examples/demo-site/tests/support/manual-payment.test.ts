@@ -8,6 +8,16 @@ import {createRequire} from 'node:module';
 import {Worker,isMainThread,parentPort,workerData} from 'node:worker_threads';
 import {build} from 'vite';
 const root=fileURLToPath(new URL('../..',import.meta.url));
+// These literals catch wrong phase/status classification and accidental raw-data exposure.
+const loadFailures:Record<string,string>={
+  'session-forbidden':'SESSION_HTTP_FORBIDDEN','session-gone':'SESSION_HTTP_GONE','session-error':'SESSION_HTTP_ERROR',
+  'session-fetch-rejected':'SESSION_HTTP_UNAVAILABLE','session-body-rejected':'SESSION_HTTP_UNAVAILABLE',
+  'session-http-timeout':'SESSION_HTTP_UNAVAILABLE','session-body-http-timeout':'SESSION_HTTP_UNAVAILABLE',
+  'session-json-invalid':'SESSION_JSON_INVALID','session-oversized':'SESSION_INVALID','session-contract-invalid':'SESSION_INVALID',
+  malformed:'SESSION_INVALID','mixed-session':'SESSION_INVALID',expired:'SESSION_INVALID',instrumentation:'AUTHORIZATION_BINDING_FAILED',
+  'widget-registration':'WIDGET_SETUP_FAILED','widget-construction':'WIDGET_SETUP_FAILED','widget-configuration':'WIDGET_SETUP_FAILED',
+  'mount-observer-construction':'WIDGET_MOUNT_FAILED','mount-observer-observe':'WIDGET_MOUNT_FAILED','mount-append':'WIDGET_MOUNT_FAILED','mount-inspection':'WIDGET_MOUNT_FAILED',
+};
 export async function exercise(entry:string,scenario:string,automatic=false):Promise<void>{
   const worker=new Worker(new URL(import.meta.url),{workerData:{entry,scenario,automatic}});
   try{await new Promise<void>((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('offline_manual_payment_timeout')),10000);worker.once('message',value=>{clearTimeout(timer);assert.equal(value,'PASS');resolve();});worker.once('error',error=>{clearTimeout(timer);reject(error);});});}finally{await worker.terminate();}
@@ -26,6 +36,7 @@ if(isMainThread&&process.argv[1]===fileURLToPath(import.meta.url))test('real SDK
         }}],build:{outDir:output,lib:{entry:root+'/src/manual-payment.ts',formats:['es'],fileName:()=> 'manual.mjs'}}});return pathToFileURL(join(output,'manual.mjs')).href;
     };
     const entry=await bundle();for(const scenario of ['no-click','success','validation','grant-rejected','grant-closed','grant-malformed','late-grant','pagehide','close','expired','mixed-session','malformed','late-session','expired-start','programmatic','enter','detached','session-http-timeout','session-body-http-timeout','permit-http-timeout','permit-body-http-timeout',...['get','post','refresh'].flatMap(stage=>['headers','body','pagehide','detached','late'].map(phase=>`sdk-${stage}-${phase}`)),'sdk-post-host','sdk-refresh-host'])await t.test(scenario,()=>exercise(entry,scenario));
+    for(const scenario of Object.keys(loadFailures).filter(name=>!['malformed','mixed-session','expired','instrumentation','session-http-timeout','session-body-http-timeout'].includes(name)))await t.test(scenario,()=>exercise(entry,scenario));
     const mixed=await bundle('mixed');await t.test('missing module instrumentation fails before Pay',()=>exercise(mixed,'instrumentation'));
     const mutant=await bundle('start-latch');await t.test('behavioral start latch mutation is detected',async()=>{
       await assert.rejects(exercise(mutant,'success'),error=>error instanceof Error&&error.message.includes('one_shot_session_exchange'));
@@ -45,6 +56,8 @@ if(!isMainThread){
   const tick=()=>new Promise<void>(resolve=>setImmediate(resolve));const until=async(predicate:()=>boolean)=>{for(let n=0;n<100;n++){if(predicate())return;await tick();}assert.fail('manual payment did not settle: '+scenario);};
   const advance=async(target:number)=>{while(true){const next=[...timers].filter(([,v])=>v.at<=target).sort((a,b)=>a[1].at-b[1].at)[0];if(!next)break;now=next[1].at;timers.delete(next[0]);next[1].callback();await tick();}now=target;await tick();};
   const checkout='11111111-1111-4111-8111-111111111111',payment='22222222-2222-4222-8222-222222222222',api='http://127.0.0.1:18080',token='x'.repeat(43),secret='pi_fixture_secret_sensitive',expiresAt='2099-01-01T00:00:00Z';
+  const canary='private_cookie_header_body_url_session_key_token_error_stack_card_canary';
+  const sensitiveError=()=>{const error=new Error(canary);Object.defineProperties(error,{status:{get(){assert.fail('caught_error_status_read');}},code:{get(){assert.fail('caught_error_code_read');}}});return error;};
   const price={priceId:'33333333-3333-4333-8333-333333333333',priceKey:'test-price',version:1,amountMinor:2000,currency:'EUR',taxMode:'NONE'};
   const session={version:2,apiBaseUrl:api,siteKey:'test-site',priceKey:'test-price',checkoutId:checkout,checkoutToken:token,expiresAt,providerType:'STRIPE',confirmationMode:'CLIENT_PROVIDER',state:{checkoutId:checkout,paymentId:payment,amountMinor:2000,currency:'EUR',price,status:'REQUIRES_PAYMENT_METHOD',expiresAt}};
   // Count throughout the lifetime; never retain or print credential-bearing writes.
@@ -60,6 +73,12 @@ if(!isMainThread){
     const url=new URL(String(input),window.location.href);calls.push(url.pathname);
     if(url.origin===window.location.origin){assert.equal(init?.method,'POST');assert.equal(init?.body,'{}');assert.equal(init?.credentials,'same-origin');assert.equal(init?.cache,'no-store');
       if(url.pathname==='/manual-payment-session'){
+        if(['session-forbidden','session-gone','session-error'].includes(scenario))return new Response(canary,{status:scenario==='session-forbidden'?403:scenario==='session-gone'?410:503});
+        if(scenario==='session-fetch-rejected')throw sensitiveError();
+        if(scenario==='session-body-rejected'){const response=new Response(canary);response.text=async()=>{throw sensitiveError();};return response;}
+        if(scenario==='session-json-invalid')return new Response('{'+canary);
+        if(scenario==='session-oversized')return new Response(canary.repeat(300));
+        if(scenario==='session-contract-invalid')return Response.json({...session,checkoutToken:canary,state:{...session.state,amountMinor:-1}});
         if(scenario==='late-session'||scenario==='session-http-timeout'){httpSignal=init?.signal??undefined;return new Promise<Response>(resolve=>{releaseSession=resolve;});}
         if(scenario==='session-body-http-timeout'){httpSignal=init?.signal??undefined;return new Promise<Response>(resolve=>{releaseSession=()=>resolve({ok:true,text:()=>new Promise<string>(yes=>{releaseBody=yes;})} as Response);});}
         if(scenario==='malformed')return Response.json({...session,extra:secret});if(scenario==='mixed-session')return Response.json({...session,providerType:'FAKE'});
@@ -79,6 +98,29 @@ if(!isMainThread){
     return Response.json(reply);
   };
   window.fetch=globalThis.fetch;
+  // Fault only browser/platform boundaries; page orchestration and SDK authority stay real.
+  let failedWidget:HTMLElement|undefined;
+  const define=window.customElements.define.bind(window.customElements);
+  window.customElements.define=((name:string,constructor:CustomElementConstructor,options?:ElementDefinitionOptions)=>{
+    if(name==='generic-payment-widget'&&scenario==='widget-registration')throw sensitiveError();
+    return define(name,constructor,options);
+  }) as typeof window.customElements.define;
+  const attachShadow=window.HTMLElement.prototype.attachShadow;
+  window.HTMLElement.prototype.attachShadow=function(options:ShadowRootInit){
+    if(this.localName==='generic-payment-widget'){failedWidget=this;if(scenario==='widget-construction')throw sensitiveError();}
+    return attachShadow.call(this,options);
+  };
+  const setAttribute=window.HTMLElement.prototype.setAttribute;
+  window.HTMLElement.prototype.setAttribute=function(name:string,value:string){if(this.localName==='generic-payment-widget'&&name==='api-base-url'&&scenario==='widget-configuration')throw sensitiveError();return setAttribute.call(this,name,value);};
+  const NativeObserver=window.MutationObserver;
+  Object.defineProperty(globalThis,'MutationObserver',{configurable:true,value:class extends NativeObserver{
+    constructor(callback:MutationCallback){if(scenario==='mount-observer-construction')throw sensitiveError();super(callback);}
+    observe(target:Node,options?:MutationObserverInit){if(scenario==='mount-observer-observe')throw sensitiveError();return super.observe(target,options);}
+  }});
+  const append=window.HTMLElement.prototype.append;
+  window.HTMLElement.prototype.append=function(...nodes:(Node|string)[]){if(scenario==='mount-append'&&nodes.some(node=>typeof node!=='string'&&(node as Element).localName==='generic-payment-widget'))throw sensitiveError();return append.apply(this,nodes);};
+  const querySelectorAll=window.ShadowRoot.prototype.querySelectorAll;
+  window.ShadowRoot.prototype.querySelectorAll=function(selectors:string){if(scenario==='mount-inspection'&&selectors==='button')throw sensitiveError();return querySelectorAll.call(this,selectors);};
   try{
     const module=await import(workerData.entry),root=window.document.querySelector(workerData.automatic?'#manual-payment':'#fixture');const page=workerData.automatic?undefined:module.mountManualPaymentPage(root);
     const start=root.querySelector('button');assert.ok(start);await tick();assert.equal(calls.length,0);
@@ -107,7 +149,7 @@ if(!isMainThread){
         await until(()=>!!releaseSession||!!releaseBody);if(scenario==='session-body-http-timeout'){await advance(1008000);releaseSession!(Response.json(session));await until(()=>!!releaseBody);}await advance(1010000);assert.equal(httpSignal?.aborted,true,'session_http_10s_abort');assert.match(root.querySelector('[role="status"]').textContent,/Закройте/);await advance(1016000);
         releaseSession?.(Response.json(session));releaseBody?.(JSON.stringify(session));await tick();start.click();assert.equal(mounts,0);assert.equal(calls.filter(path=>path==='/manual-payment-session').length,1);assert.equal(fakeStripe.confirmCalls,0);
       }
-      else if(['malformed','mixed-session','expired','expired-start','instrumentation'].includes(scenario)){await until(()=>root.querySelector('[role="status"]').textContent.includes('Закройте'));assert.equal(fakeStripe.confirmCalls,0);assert.equal(mounts,0);}
+      else if(loadFailures[scenario]||scenario==='expired-start'){await until(()=>root.querySelector('[role="status"]').textContent.includes('Закройте'));assert.equal(fakeStripe.confirmCalls,0);assert.equal(mounts,0);}
       else if(scenario==='late-session'){await until(()=>!!releaseSession);await advance(1300000);releaseSession!(Response.json(session));await tick();assert.equal(mounts,0);}
       else{
         await until(()=>root.querySelector('generic-payment-widget')?.state==='ready');const widget=root.querySelector('generic-payment-widget');assert.equal(mounts,1);assert.equal(getCalls,1);
@@ -128,6 +170,14 @@ if(!isMainThread){
       }
       assert.equal(calls.filter(path=>path==='/manual-payment-session').length,scenario==='expired-start'?0:1,'one_shot_session_exchange');
     }
-    page?.close();assert.equal(forbiddenReads,0);assert.equal(credentialWrites,0,'zero_credential_storage_writes_throughout_lifetime');assert.equal(window.sessionStorage.length,0);for(const privateValue of [token,secret,checkout])assert.equal((root.outerHTML+window.location.href).includes(privateValue),false);parentPort?.postMessage('PASS');
+    if(loadFailures[scenario]){
+      const status=root.querySelector('[role="status"]'),terminal=status.textContent;
+      assert.equal(terminal,'Не удалось загрузить форму. Повторная оплата недоступна. Закройте эту вкладку. '+loadFailures[scenario]);
+      assert.equal(start.disabled,true);assert.equal(root.querySelector('generic-payment-widget'),null);assert.equal(calls.filter(path=>path==='/manual-payment-confirmation').length,0);
+      const before=calls.length;start.disabled=false;start.click();start.click();
+      for(const name of ['ready','succeeded','failed','unknown','expired','requires-action','processing'])failedWidget?.dispatchEvent(new window.CustomEvent(name));
+      await advance(1301000);await tick();assert.equal(status.textContent,terminal,'late_callbacks_preserve_terminal_code');assert.equal(calls.length,before,'closed_page_cannot_reopen');assert.equal(fakeStripe.confirmCalls,0);
+    }
+    page?.close();assert.equal(forbiddenReads,0);assert.equal(credentialWrites,0,'zero_credential_storage_writes_throughout_lifetime');assert.equal(window.sessionStorage.length,0);for(const privateValue of [token,secret,checkout,canary])assert.equal((root.outerHTML+window.location.href).includes(privateValue),false);parentPort?.postMessage('PASS');
   }finally{Date.now=actualNow;frame.remove();window.close();}
 }

@@ -968,6 +968,21 @@ inspection, screenshots, console/Network/HAR/trace collection or secret screensh
 are part of this workflow. Close this tab afterwards and report that human observation
 separately; the controller always reports `browser_closure=NOT_OWNED`.
 
+If the form cannot load, the existing terminal error appends one fixed code:
+`SESSION_HTTP_FORBIDDEN` (session HTTP 403), `SESSION_HTTP_GONE` (410),
+`SESSION_HTTP_ERROR` (another non-success HTTP response), `SESSION_HTTP_UNAVAILABLE`
+(session fetch/body rejection or HTTP timeout), `SESSION_JSON_INVALID` (JSON parsing),
+`SESSION_INVALID` (session size, record or validation), `WIDGET_SETUP_FAILED`
+(widget registration, construction or configuration), `AUTHORIZATION_BINDING_FAILED`
+(one-shot lease arming), or `WIDGET_MOUNT_FAILED` (observer, append or initial
+inspection). Report only that UI observation to the operator and stop. These codes
+are local stage hints, not proof of a provider/network cause, financial permission,
+payment outcome or server report evidence. They expose no additional Pay result.
+The previous Chrome load failure's cause remains unproven. Do not collect cookies,
+headers, bodies, raw errors, DevTools output or other browser data for this diagnostic.
+These offline changes do not authorize another live attempt; the existing one-shot
+and deadline instructions still apply.
+
 Permission is committed durably before the one Stripe confirmation. A browser success
 message is only a browser observation. The final JSON report (at most 4096 bytes)
 independently records confirmation permission, original server payment, original

@@ -24,6 +24,7 @@ test('actual manual payment graph emits only its page and owned manifest; old bu
       {deadline:Date.now()+2700000},{fetch:async(input)=>{assert.equal(input,'http://127.0.0.1:18081/.vite/manifest.json');return Response.json(manifest);},createServer:()=>server as never});
     assert.deepEqual(await gateway.open(),{url:'http://127.0.0.1:18083/manual-payment.html'});assert.equal(await gateway.close({deadline:Date.now()+1000}),true);
     const entry=pathToFileURL(join(directory,manifest['manual-payment.html'].file)).href;await t.test('real emitted page',()=>exercise(entry,'success',true));
+    for(const scenario of ['session-forbidden','session-json-invalid','widget-configuration','mount-append'])await t.test('real emitted page '+scenario,()=>exercise(entry,scenario,true));
     for(const mode of ['production','form-diagnostic']){
       await build({root,configFile:root+'/vite.config.ts',mode,logLevel:'silent',build:{outDir:directory,emptyOutDir:true}});
       assert.equal((await readdir(directory)).includes('manual-payment.html'),false);
