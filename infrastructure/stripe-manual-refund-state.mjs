@@ -6,63 +6,18 @@ import {dirname,resolve,parse as parsePath} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {timingSafeEqual} from 'node:crypto';
 import {validateManualRefundOptions} from './stripe-manual-refund-options.mjs';
+import {parseRefundRetainedJSON as strictJSON,decodeOriginalRefundTarget,decodeOriginalRefundEnv} from './stripe-manual-refund-retained.mjs';
 import {createFormDiagnosticSettlement} from './stripe-form-diagnostic-settlement.mjs';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const ORIGINAL_RUN='031b5ae7-6603-4339-b1b3-77231291ff34',ORIGINAL_SOURCE='f0620e40004162d2b3eededa60512f50a492f4cc';
-const PROJECT='stripe-'+ORIGINAL_RUN,SITEKEY='s5a-'+ORIGINAL_RUN.replaceAll('-','');
-const SERVICES=['postgres','mailpit','backend','demo-site','callback-receiver'],RESTORE=['postgres','mailpit','callback-receiver','demo-site','backend'];
-const PORTS=['backend','demo','receiver','postgres','mailpitHttp','mailpitSmtp'];
+const RESTORE=['postgres','mailpit','callback-receiver','demo-site','backend'];
 const fail=()=>{throw null;},fixed=()=>new Error('stripe_manual_refund_state_PENDING');
 const uuid=v=>typeof v==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(v);
-const fullId=v=>typeof v==='string'&&/^[0-9a-f]{64}$/.test(v);
 const provider=(v,prefix)=>typeof v==='string'&&new RegExp('^'+prefix+'[A-Za-z0-9_]{1,249}$').test(v);
 function exact(v,keys){if(!v||typeof v!=='object'||Array.isArray(v)||![Object.prototype,null].includes(Object.getPrototypeOf(v)))fail();const d=Object.getOwnPropertyDescriptors(v);if(Reflect.ownKeys(d).length!==keys.length||keys.some(k=>!d[k]?.enumerable||!Object.hasOwn(d[k],'value')))fail();return Object.fromEntries(keys.map(k=>[k,d[k].value]));}
 function canonical(v){return Array.isArray(v)?v.map(canonical):v&&typeof v==='object'?Object.fromEntries(Object.keys(v).sort().map(k=>[k,canonical(v[k])])):v;}
 const same=(a,b)=>JSON.stringify(canonical(a))===JSON.stringify(canonical(b));
-function frozen(v){if(v&&typeof v==='object'){for(const child of Object.values(v))frozen(child);Object.freeze(v);}return v;}
-
-/** JSON.parse alone loses duplicate members. Tokenize and reject them at every depth. */
-function strictJSON(text){
-  const tokens=text.match(/"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null|[{}\[\],:]|[ \t\r\n]+|./gs)?.filter(v=>!(/^[ \t\r\n]+$/).test(v))??[];let i=0;
-  function value(depth=0){if(depth>32)fail();const token=tokens[i++];if(token==='{'){const result=Object.create(null),seen=new Set();if(tokens[i]==='}'){i++;return result;}for(;;){const key=JSON.parse(tokens[i++]);if(typeof key!=='string'||seen.has(key)||tokens[i++]!==':')fail();seen.add(key);result[key]=value(depth+1);const end=tokens[i++];if(end==='}')return result;if(end!==',')fail();}}
-    if(token==='['){const result=[];if(tokens[i]===']'){i++;return result;}for(;;){result.push(value(depth+1));const end=tokens[i++];if(end===']')return result;if(end!==',')fail();}}
-    const result=JSON.parse(token);if(typeof result==='object'&&result!==null||typeof result==='number'&&!Number.isFinite(result))fail();return result;
-  }
-  const result=value();if(i!==tokens.length)fail();return result;
-}
-function expectedPorts(service,ports){return Object.fromEntries(({postgres:[['5432/tcp',ports.postgres]],mailpit:[['8025/tcp',ports.mailpitHttp],['1025/tcp',ports.mailpitSmtp]],backend:[['8080/tcp',ports.backend]],'demo-site':[['8080/tcp',ports.demo]],'callback-receiver':[['8080/tcp',ports.receiver]]}[service]??[]).map(([port,host])=>[port,[{HostIp:'127.0.0.1',HostPort:String(host)}]]));}
-function expectedMounts(service,root,directory){return {postgres:[{Type:'volume',Name:PROJECT+'-postgres',Destination:'/var/lib/postgresql',RW:true}],backend:[{Type:'volume',Name:PROJECT+'-issuer',Destination:'/app/local-fixtures',RW:false}],'callback-receiver':[{Type:'bind',Source:root+'/infrastructure/callback-receiver.mjs',Destination:'/app/callback-receiver.mjs',RW:false}],'issuer-installer':[{Type:'bind',Source:directory+'/issuer.jwks.json',Destination:'/input/issuer.json',RW:false},{Type:'volume',Name:PROJECT+'-issuer',Destination:'/issuer',RW:true}],'issuer-probe':[{Type:'volume',Name:PROJECT+'-issuer',Destination:'/issuer',RW:false}]}[service]??[];}
-const labels=kind=>({'payment.sandbox.project':PROJECT,'payment.sandbox.run':ORIGINAL_RUN,'payment.sandbox.kind':kind});
-function decodeRuntime(raw,root,directory,options){
-  const r=exact(raw,['runId','expectedSource','daemon','project','siteKey','ports','cliDirectory','endpoints','status','webhookReady','mode','manualPort','images','network','volumes','containers','retiredBackend','intents']);
-  if(r.runId!==ORIGINAL_RUN||r.expectedSource!==ORIGINAL_SOURCE||r.daemon!==options.daemon||r.project!==PROJECT||r.siteKey!==SITEKEY||r.cliDirectory!==directory+'/cli'||r.status!=='STOPPED'||r.webhookReady!==true||r.mode!=='MANUAL_PAYMENT'||r.retiredBackend!==null)fail();
-  exact(r.ports,PORTS);if(Object.values(r.ports).some(v=>!Number.isInteger(v)||v<1024||v>65535)||new Set(Object.values(r.ports)).size!==6||!Number.isInteger(r.manualPort)||r.manualPort<1024||r.manualPort>65535||Object.values(r.ports).includes(r.manualPort))fail();
-  const endpoints=Object.fromEntries(PORTS.map(k=>[k,({postgres:'postgresql',mailpitSmtp:'smtp'}[k]??'http')+'://127.0.0.1:'+r.ports[k]]));if(!same(r.endpoints,endpoints))fail();
-  exact(r.images,SERVICES);const tags={backend:PROJECT+'-backend:latest','demo-site':PROJECT+'-demo-site:latest',postgres:'postgres:18-alpine',mailpit:'axllent/mailpit:v1.27','callback-receiver':'node:24-alpine'};
-  for(const service of SERVICES){const image=exact(r.images[service],['tag','id','user']);if(image.tag!==tags[service]||typeof image.id!=='string'||!/^sha256:[0-9a-f]{64}$/.test(image.id)||typeof image.user!=='string'||!/^[-A-Za-z0-9_:]{0,128}$/.test(image.user))fail();}
-  exact(r.network,['Id','Name','Labels','Driver','Scope']);if(!fullId(r.network.Id)||r.network.Name!==PROJECT+'-network'||r.network.Driver!=='bridge'||r.network.Scope!=='local'||!same(r.network.Labels,labels('network')))fail();
-  exact(r.volumes,['postgres','issuer']);for(const kind of ['postgres','issuer']){const v=exact(r.volumes[kind],['Name','CreatedAt','Driver','Scope','Labels']);if(v.Name!==PROJECT+'-'+kind||v.Driver!=='local'||v.Scope!=='local'||typeof v.CreatedAt!=='string'||!Number.isFinite(Date.parse(v.CreatedAt))||!same(v.Labels,labels(kind)))fail();}
-  exact(r.containers,[...SERVICES,'issuer-installer','issuer-probe']);const ids=new Set();for(const [service,raw] of Object.entries(r.containers)){const c=exact(raw,['id','name','image','service','status','startedAt','networkId','mounts','ports']);if(!fullId(c.id)||ids.has(c.id)||c.name!==PROJECT+'-'+service||c.service!==service||c.image!==r.images[service.startsWith('issuer-')?'backend':service].id||c.status!=='exited'||typeof c.startedAt!=='string'||!Number.isFinite(Date.parse(c.startedAt))||Date.parse(c.startedAt)<=0||c.networkId!==(service.startsWith('issuer-')?null:r.network.Id)||!same(c.mounts,expectedMounts(service,root,directory))||!same(c.ports,expectedPorts(service,r.ports)))fail();ids.add(c.id);}
-  const pairs=[['BUILD','backend+demo-site'],...['postgres','mailpit','callback-receiver'].map(v=>['PULL',v]),['CREATE_NETWORK',PROJECT+'-network'],['CREATE_VOLUME',PROJECT+'-postgres'],['CREATE_VOLUME',PROJECT+'-issuer'],...['issuer-installer','issuer-probe'].flatMap(v=>[['CREATE_HELPER',PROJECT+'-'+v],['START_HELPER',r.containers[v].id]]),['CREATE_STOPPED',PROJECT],['PERSIST_WEBHOOK','backend-key-persistence'],['CREATE_FINAL_BACKEND',PROJECT+'-backend'],...SERVICES.map(v=>['START_SERVICE',r.containers[v].id])];
-  if(!same(r.intents,pairs.map(([action,name])=>({action,name,status:'ACKNOWLEDGED'}))))fail();return r;
-}
-function decodeProvision(raw,r){
-  const p=exact(raw,['version','runId','expectedSource','daemon','project','siteKey','ports','endpoints','owners','status','account','site','product','price','identityProvider','cases','operationProof','intents']);
-  for(const key of ['runId','expectedSource','daemon','project','siteKey','ports'])if(!same(p[key],r[key]))fail();if(p.version!==1||p.status!=='CONFIRMING'||!same(p.endpoints,Object.fromEntries(['backend','demo','receiver'].map(k=>[k,r.endpoints[k]])))||!same(p.owners,{project:PROJECT,backend:r.containers.backend.id,demo:r.containers['demo-site'].id,receiver:r.containers['callback-receiver'].id}))fail();
-  const suffix=ORIGINAL_RUN.replaceAll('-','');exact(p.account,['id','key','externalId']);exact(p.site,['id','key']);exact(p.product,['id','key']);exact(p.price,['id','key','version','providerPriceId']);exact(p.identityProvider,['id','key','mode','status','readiness','version']);exact(p.cases,['form']);exact(p.cases.form,['checkoutId','paymentId']);exact(p.operationProof,['operationId','reference']);
-  const ids=[p.account.id,p.site.id,p.product.id,p.price.id,p.identityProvider.id,p.cases.form.checkoutId,p.cases.form.paymentId,p.operationProof.operationId];if(ids.some(v=>!uuid(v))||new Set(ids).size!==ids.length||p.account.key!=='stripe-sandbox-default'||p.account.externalId!=='acct_1UPiMpELswAd8tpR'||p.site.key!==SITEKEY||p.product.key!=='s5a-product-'+suffix||p.price.key!=='s5a-price-'+suffix||p.price.version!==1||!provider(p.price.providerPriceId,'price_')||!provider(p.operationProof.reference,'pi_')||!same(p.identityProvider,{id:p.identityProvider.id,key:'s5a-email-'+suffix,mode:'EMAIL_OTP',status:'ACTIVE',readiness:'READY',version:0}))fail();
-  const stable=name=>'s5a:'+ORIGINAL_RUN+':'+name,entries=[['admin-session',stable('admin-session')],['account',p.account.key,{id:p.account.id,key:p.account.key}],['site-and-email-provider',p.site.key,{id:p.site.id,key:p.site.key}],['return-url',stable('return-url'),{origin:'http://127.0.0.1:'+r.manualPort}],['product',p.product.key,{id:p.product.id,key:p.product.key}],['price',p.price.key,{id:p.price.id,key:p.price.key,version:1}],['publish-price',stable('publish-price'),{id:p.price.id,key:p.price.key,providerPriceId:p.price.providerPriceId}],['callback',stable('callback'),{siteId:p.site.id,secretVersion:1}],['receiver',stable('receiver'),{secretVersion:1}],['checkout',stable('checkout'),p.cases.form]];
-  if(!same(p.intents,entries.map(([name,key,identity])=>({name,key,status:'ACKNOWLEDGED',...(identity?{identity}:{})}))))fail();return p;
-}
-const PRIVATE=['PAYMENT_DB_PASSWORD','PAYMENT_ADMIN_BOOTSTRAP_USERNAME','PAYMENT_ADMIN_BOOTSTRAP_PASSWORD','PAYMENT_DATA_ENCRYPTION_KEY','PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY','PAYMENT_CUSTOMER_DIGEST_KEY_V1','PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1'];
-const PUBLIC=['PAYMENT_FAKE_AUTO_SUCCESS','PAYMENT_TELEMETRY_SITEKEYS','PAYMENT_BACKEND_HOST_PORT','PAYMENT_DEMO_HOST_PORT','PAYMENT_POSTGRES_HOST_PORT','PAYMENT_MAILPIT_HOST_PORT','PAYMENT_MAILPIT_SMTP_HOST_PORT'];
-const STRIPE=['PAYMENT_STRIPE_SANDBOX_SECRET_KEY','PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY','PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET'];
-function decodeEnv(text,final,r){const result=Object.create(null);if(!text.endsWith('\n')||text.includes('\r'))fail();for(const line of text.slice(0,-1).split('\n')){const match=/^([A-Z][A-Z0-9_]*)=([A-Za-z0-9_+/=:-]+)$/.exec(line);if(!match||Object.hasOwn(result,match[1]))fail();result[match[1]]=match[2];}exact(result,[...PRIVATE,...PUBLIC,...(final?STRIPE:[])]);
-  for(const key of PRIVATE.filter(k=>k!=='PAYMENT_ADMIN_BOOTSTRAP_USERNAME')){const value=result[key];if(!/^[A-Za-z0-9+/]{43}=$/.test(value)||Buffer.from(value,'base64').toString('base64')!==value)fail();}if(!/^s5a-[0-9a-f]{32}$/.test(result.PAYMENT_ADMIN_BOOTSTRAP_USERNAME)||result.PAYMENT_FAKE_AUTO_SUCCESS!=='false'||result.PAYMENT_TELEMETRY_SITEKEYS!==SITEKEY)fail();
-  for(const [key,port] of [['PAYMENT_BACKEND_HOST_PORT','backend'],['PAYMENT_DEMO_HOST_PORT','demo'],['PAYMENT_POSTGRES_HOST_PORT','postgres'],['PAYMENT_MAILPIT_HOST_PORT','mailpitHttp'],['PAYMENT_MAILPIT_SMTP_HOST_PORT','mailpitSmtp']])if(result[key]!==String(r.ports[port]))fail();
-  if(final&&(!/^sk_test_[A-Za-z0-9_]{16,256}$/.test(result[STRIPE[0]])||!/^pk_test_[A-Za-z0-9_]{16,256}$/.test(result[STRIPE[1]])||!/^whsec_[A-Za-z0-9_]{16,256}$/.test(result[STRIPE[2]])))fail();return result;
-}
 
 /** Private one-shot state authority. No runtime, HTTP, provider or credential getter capability. */
 export async function openManualRefundState(input,limits,dependencies={}){
@@ -77,10 +32,9 @@ export async function openManualRefundState(input,limits,dependencies={}){
     limits=Object.freeze(validateLimits(limits));if(limits.deadline>io.now()+1800000)fail();settlement=createFormDiagnosticSettlement(io);settlement.bind(limits.deadline);
     await admit(limits);
     await directoryProof(original,limits);
-    const runtime=decodeRuntime(strictJSON(await readRetained(original+'/runtime.json',limits)),root,original,options),provision=decodeProvision(strictJSON(await readRetained(original+'/form-provisioning.json',limits)),runtime);
-    const app=decodeEnv(await readRetained(original+'/app.env',limits),false,runtime),final=decodeEnv(await readRetained(original+'/final.env',limits),true,runtime);for(const key of [...PRIVATE,...PUBLIC])if(app[key]!==final[key])fail();
-    admin=Object.freeze({username:app.PAYMENT_ADMIN_BOOTSTRAP_USERNAME,password:app.PAYMENT_ADMIN_BOOTSTRAP_PASSWORD});verifier=final[STRIPE[2]];
-    target=frozen({originalRunId:ORIGINAL_RUN,originalSource:ORIGINAL_SOURCE,project:PROJECT,containers:runtime.containers,images:runtime.images,network:runtime.network,volumes:runtime.volumes,ports:runtime.ports,endpoints:runtime.endpoints,account:provision.account,site:provision.site,price:provision.price,paymentId:provision.cases.form.paymentId,operationId:provision.operationProof.operationId,intentId:provision.operationProof.reference,callbackVersion:1,amountMinor:2000,currency:'EUR',source:'CATALOG'});
+    target=decodeOriginalRefundTarget({runtime:strictJSON(await readRetained(original+'/runtime.json',limits)),provision:strictJSON(await readRetained(original+'/form-provisioning.json',limits))},{root,originalDirectory:original,daemon:options.daemon});
+    const app=decodeOriginalRefundEnv(await readRetained(original+'/app.env',limits),false,target.ports),final=decodeOriginalRefundEnv(await readRetained(original+'/final.env',limits),true,target.ports);for(const key of Object.keys(app))if(app[key]!==final[key])fail();
+    admin=Object.freeze({username:app.PAYMENT_ADMIN_BOOTSTRAP_USERNAME,password:app.PAYMENT_ADMIN_BOOTSTRAP_PASSWORD});verifier=final.PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET;
     await absent(directory,limits);await absent(lockPath,limits);lock=await exclusive(lockPath,JSON.stringify({version:1,runId:options.runId,expectedSource:options.expectedSource})+'\n',limits,true);
     await call(limits,()=>io.mkdir(directory,{mode:0o700}));await directoryProof(directory,limits);await syncDirectory(dirname(directory),limits);
     state={version:1,mode:'MANUAL_REFUND',runId:options.runId,expectedSource:options.expectedSource,originalRunId:ORIGINAL_RUN,originalSource:ORIGINAL_SOURCE,deadline:limits.deadline,siteId:target.site.id,paymentId:target.paymentId,pending:false,restore:RESTORE.map(service=>({service,phase:'READY'})),rotation:{phase:'READY',version:null},configure:{phase:'READY',version:null},legs:[700,1300].map((amountMinor,index)=>({amountMinor,key:'s5a-refund:'+options.runId+':'+(index?'remainder':'partial'),phase:'READY',refundId:null,providerReference:null}))};await save(limits);

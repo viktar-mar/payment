@@ -1,0 +1,13 @@
+import * as fs from 'node:fs/promises';
+import assert from 'node:assert/strict';
+import {fixture as originalFixture} from './stripe-manual-refund-state-fixture.mjs';
+const PRIOR='34941d87-12d3-4c74-8c5a-b62b7c914390',SOURCE='d'.repeat(40),RESTORE=['postgres','mailpit','callback-receiver','demo-site','backend'];
+export async function fixture(t){
+ const f=await originalFixture(t),now=Date.now(),priorDirectory=f.root+'/test-results/stripe-sandbox/'+PRIOR;await fs.mkdir(priorDirectory,{mode:0o700});
+ const prior={version:1,mode:'MANUAL_REFUND',runId:PRIOR,expectedSource:SOURCE,originalRunId:f.data.runtime.runId,originalSource:f.data.runtime.expectedSource,deadline:now-120001,siteId:f.data.provision.site.id,paymentId:f.data.provision.cases.form.paymentId,pending:true,restore:RESTORE.map(service=>({service,phase:'ACKNOWLEDGED'})),rotation:{phase:'ACKNOWLEDGED',version:2},configure:{phase:'ACKNOWLEDGED',version:2},legs:[{amountMinor:700,key:'s5a-refund:'+PRIOR+':partial',phase:'ACKNOWLEDGED',refundId:'aaaaaaaa-bbbb-4ccc-8ddd-000000000020',providerReference:null},{amountMinor:1300,key:'s5a-refund:'+PRIOR+':remainder',phase:'READY',refundId:null,providerReference:null}]};
+ const priorState=priorDirectory+'/manual-refund.json',oldLock=f.original+'/manual-refund.lock';await fs.writeFile(priorState,JSON.stringify(prior)+'\n',{mode:0o600});await fs.writeFile(oldLock,JSON.stringify({version:1,runId:PRIOR,expectedSource:SOURCE})+'\n',{mode:0o600});
+ f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER:'true'};f.deps.now=()=>now;
+ f.deps.execute=async(file,args)=>{assert.equal(file,'/usr/bin/git');f.executed.push(args);if(args.join(' ')==='rev-parse HEAD')return {stdout:f.options.expectedSource+'\n',stderr:''};if(args.includes('status'))return {stdout:'',stderr:''};if(args[0]==='merge-base'&&args[1]==='--is-ancestor'&&[f.data.runtime.expectedSource,SOURCE].includes(args[2])&&args[3]===f.options.expectedSource)return {stdout:'',stderr:''};throw Error('unexpected_process');};
+ const api=await import('../stripe-manual-refund-remainder-state.mjs');
+ return {...f,prior,priorState,oldLock,statePath:f.root+'/test-results/stripe-sandbox/'+f.options.runId+'/manual-refund-remainder.json',lockPath:f.original+'/manual-refund-remainder.lock',priorPaths:['runtime.json','form-provisioning.json','app.env','final.env','manual-refund.lock'].map(v=>f.original+'/'+v).concat(priorState),create(){assert.equal(typeof api.createManualRefundRemainderState,'function');return api.createManualRefundRemainderState(this.options,this.deps);}};
+}
