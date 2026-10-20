@@ -1,3 +1,11 @@
+// Inspect the new flag before any legacy normalization or configuration access.
+function remainderExcluded(env){
+  try{
+    if(!env||typeof env!=='object')return false;
+    const key='PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',d=Object.getOwnPropertyDescriptor(env,key);
+    return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);
+  }catch{return false;}
+}
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {lstat,realpath} from 'node:fs/promises';
@@ -55,7 +63,7 @@ export async function preflightOwnedSandbox(options,dependencies={}) {
 
 // This gate runs before consulting dependencies or any private configuration.
 export function formDiagnosticOptIn(env) {
-  try {return env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'
+  try {return remainderExcluded(env)&&env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'
     &&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'
     &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT)
     &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND)
@@ -90,7 +98,8 @@ export async function preflightOwnedManualPayment(options,dependencies={}) {
 async function preflight(options,dependencies,diagnostic) {
   let phase='OPT_IN',code='OPT_IN_REQUIRED';
   try {
-    const env=options?.env;
+    const env=Object.getOwnPropertyDescriptor(options??{},'env')?.value;
+    if(!remainderExcluded(env))return pending(phase,code);
     if(env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'||(diagnostic==='payment'?!manualPaymentOptIn(env):diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'
       ||env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'||env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC==='true')))return pending(phase,code);
     phase='INPUTS';code='CONFIGURATION';

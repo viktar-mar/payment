@@ -1,5 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+
+// Break: new-mode exclusion after normalization or evaluating an accessor.
+test('remainder exclusion precedes snapshots configuration and dependencies',async()=>{
+  const {runFormLoadDiagnostic:accept}=await import('./stripe-form-diagnostic.mjs');const base={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};
+  let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}});
+  for(const shape of ['true','malformed','boolean','accessor','hidden','inherited']){
+    const raw=shape==='inherited'?Object.assign(Object.create({PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER:'true'}),base):{...base};
+    if(shape!=='inherited')Object.defineProperty(raw,'PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',shape==='accessor'?{enumerable:true,get(){reads++;throw null;}}:{enumerable:shape!=='hidden',value:shape==='true'||shape==='hidden'?'true':shape==='boolean'?false:{private:'canary'}});
+    const value=await accept({env:raw},{deadline:Date.now()+1000,signal:new AbortController().signal},trap);assert.equal(value.exitCode,1);assert.equal(value.frames.at(-1).observation_end,'BROWSER_NOT_STARTED');
+  }
+  assert.equal(reads,0);
+});
+test('automatic diagnostic refuses env-container accessors without evaluation',async()=>{
+  let touched=0;const value=await runFormLoadDiagnostic({get env(){touched++;throw 'secret_canary';}},null,new Proxy({},{get(){touched++;throw null;}}));
+  assert.equal(value.exitCode,1);assert.equal(value.frames.at(-1).observation_end,'BROWSER_NOT_STARTED');assert.equal(touched,0);
+});
 import {runFormLoadDiagnostic} from './stripe-form-diagnostic.mjs';
 
 const options={env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}};

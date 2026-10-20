@@ -1,5 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+
+// Break: new-mode exclusion after normalization or evaluating an accessor.
+test('remainder exclusion precedes snapshots configuration and dependencies',async()=>{
+  const {preflightOwnedSandbox:accept,formDiagnosticOptIn}=await import('./stripe-sandbox-owned.mjs'); const base={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'};
+  let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}});
+  for(const shape of ['true','malformed','boolean','accessor','hidden','inherited']){
+    const raw=shape==='inherited'?Object.assign(Object.create({PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER:'true'}),base):{...base};
+    if(shape!=='inherited')Object.defineProperty(raw,'PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',shape==='accessor'?{enumerable:true,get(){reads++;throw null;}}:{enumerable:shape!=='hidden',value:shape==='true'||shape==='hidden'?'true':shape==='boolean'?false:{private:'canary'}});
+    assert.deepEqual(await accept({env:raw,get runId(){reads++;throw null;}},trap),{status:'PENDING',phase:'OPT_IN',code:'OPT_IN_REQUIRED'});
+    const diagnostic=Object.create(Object.getPrototypeOf(raw),Object.getOwnPropertyDescriptors(raw));
+    Object.assign(diagnostic,{PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:undefined});
+    assert.equal(formDiagnosticOptIn(diagnostic),false);
+  }
+  assert.equal(reads,0);
+});
 import {EventEmitter} from 'node:events';
 import {fileURLToPath} from 'node:url';
 import {preflightOwnedSandbox,preflightOwnedFormDiagnostic} from './stripe-sandbox-owned.mjs';

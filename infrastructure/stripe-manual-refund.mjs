@@ -5,10 +5,10 @@ import {validateManualRefundReport,formatManualRefundReport,validateManualRefund
 
 const ROOT=fileURLToPath(new URL('..',import.meta.url)).replace(/\/$/,'');
 const ORIGINAL='031b5ae7-6603-4339-b1b3-77231291ff34';
-const FLAGS=['ENABLED','ALLOW_TEST_OPERATIONS','MANUAL_REFUND','FULL_RUN','OWNED_RUN','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT'].map(k=>'PAYMENT_STRIPE_SANDBOX_'+k).concat(['DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE']);
+const FLAGS=['MANUAL_REFUND_REMAINDER','ENABLED','ALLOW_TEST_OPERATIONS','MANUAL_REFUND','FULL_RUN','OWNED_RUN','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT'].map(k=>'PAYMENT_STRIPE_SANDBOX_'+k).concat(['DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE']);
 const EMPTY=Object.freeze({version:1,mode:'MANUAL_REFUND',result:'FAILED',phase:'ADMISSION',target_verified:false,callback_rotated:false,partial_confirmed:false,remainder_confirmed:false,provider_verified:false,webhook_verified:false,journal_verified:false,callback_verified:false,listener_closed:false,runtime_closed:false,provenance:'CONTROLLER_REPORTED'});
 const rejected=()=>Object.freeze({report:EMPTY,exitCode:1});
-function data(value,key){const d=Object.getOwnPropertyDescriptor(value,key);if(d&&(!d.enumerable||!Object.hasOwn(d,'value')))throw null;return d?.value;}
+function data(value,key){const d=Object.getOwnPropertyDescriptor(value,key);if(d&&(!d.enumerable||!Object.hasOwn(d,'value'))||!d&&key in value)throw null;return d?.value;}
 function exact(value,keys){
   if(!value||typeof value!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(value)))throw null;
   const d=Object.getOwnPropertyDescriptors(value);if(Reflect.ownKeys(d).length!==keys.length)throw null;

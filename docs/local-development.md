@@ -1003,6 +1003,74 @@ second. Signal, stalled stdout or write failure gives exit 1 without a second ou
 attempt. The direct entry exits only its own process, so a timed-out write can leave
 an incomplete or missing report; check the actual exit code as well as printed text.
 
+## Separate one-shot remainder of the retained Sandbox refund
+
+Actual remainder Sandbox acceptance is **PENDING**. This is a future invocation
+template, not a development prerequisite or runtime permission. The approved design
+and offline implementation do not authorize a real attempt. A separate authorization
+must name restoration/listener startup, one callback rotation expecting version3,
+and one EUR13 refund of the fixed retained payment.
+
+The previous EUR7 acknowledgement, server delivery and later read-only confirmation
+are historical evidence. Its old PENDING report, original `manual-refund.lock`, state,
+and all retained artifacts remain unchanged. The new mode freshly proves the exact
+prior EUR7 Refund and delivery before any mutation; it cannot recreate its old HMAC
+receipt or repeat its callback. Only the new EUR13 callback receives a new signature
+proof. There are no Chrome, browser, card, Checkout or new-payment steps.
+
+After separate runtime approval, substitute only the approved restricted Node/system
+PATH, fresh lowercase UUID, reviewed clean controller HEAD and canonical owned Unix
+Docker socket. Do not derive a new source SHA or UUID during execution. Supply exactly
+the three opt-ins below and zero arguments. Do not supply keys, target IDs, amounts,
+ports, URLs or credential paths:
+
+```bash
+env -i PATH="<APPROVED_NODE_AND_SYSTEM_PATH>" LANG=C LC_ALL=C NO_COLOR=1 \
+  PAYMENT_STRIPE_SANDBOX_ENABLED=true \
+  PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS=true \
+  PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER=true \
+  PAYMENT_STRIPE_SANDBOX_RUN_ID="<FRESH_REMAINDER_UUID>" \
+  PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE="<REVIEWED_CLEAN_CONTROLLER_HEAD>" \
+  PAYMENT_STRIPE_SANDBOX_DAEMON="<CANONICAL_OWNED_UNIX_DAEMON>" \
+  node infrastructure/stripe-manual-refund-remainder.mjs
+```
+
+Every old mode and debug flag is incompatible; all old entries reject the remainder
+flag before normalization. The dedicated entry reuses only the prior unused financial
+remainder key. Its new exclusive `manual-refund-remainder.lock` remains sticky after
+success or uncertain admission, and another UUID does not grant a second attempt.
+There is no automatic repeat, retry, reset, reconcile, cancellation, resource deletion
+or cleanup deletion of either lock. A false report boolean means unverified, not that
+money did not move.
+
+Only the original isolated CLI credentials are used. Missing/expired credentials,
+Account/API/version mismatch or a changed retained verifier stops before rotation and
+refund. Any new OAuth authorization needs separate approval. The listener verifier is
+compared in memory, never printed or replaced. After fresh server/provider baseline
+proof, the sole rotation's response must prove version3 and the retained callback
+endpoint/enabled state. These checks happen after the write: a mismatch may mean the
+rotation already occurred, and permanently leaves PENDING with zero refund POSTs.
+There is no rotation retry or repair. The returned secret configures only the exact
+owned receiver in memory. Exactly one EUR13 POST can follow durable rotation/configure
+acknowledgement, repeated baseline checks and the synchronous live-listener fence.
+
+One active authority lasts at most 30 minutes from this entry; independent cleanup
+ends at that same deadline plus 2 minutes. No late factory, response, body disposal or
+child callback renews it. Session, listener, restored runtime and state cleanup are
+checked independently; actual child/process settlement is required. Session work
+unresponsive at the fixed active deadline plus 1 minute permits only last-resort
+runtime shutdown with PENDING and `runtime_closed=false`. In-flight restore/start
+must settle before shutdown. Docker stop grace10s has at most20s transport within the
+same cleanup ceiling. Issuer helpers are never restarted. All resources and audit
+evidence are retained.
+
+The one final JSON line is bounded to4096 bytes. It separately records freshly
+verified prior partial/delivery and new provider/webhook/journal/signature/aggregate
+proofs. Only `SUCCEEDED`, all twelve booleans true, and actual exit0 establish this
+experiment's success; they do not declare all Stage5A complete. The first copied
+finite diagnostic and PENDING are sticky. Failed or stalled stdout yields actual
+exit1 without a second output attempt, even if a success line was already printed.
+
 ## Separate manual refund of the retained Sandbox payment
 
 Runtime acceptance is **PENDING**. The following is only a future invocation template;

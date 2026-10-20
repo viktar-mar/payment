@@ -1,3 +1,11 @@
+// Inspect the new flag before any legacy normalization or configuration access.
+function remainderExcluded(env){
+  try{
+    if(!env||typeof env!=='object')return false;
+    const key='PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',d=Object.getOwnPropertyDescriptor(env,key);
+    return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);
+  }catch{return false;}
+}
 import {constants} from 'node:fs';
 import {open,mkdir,lstat,realpath,rename,unlink} from 'node:fs/promises';
 import {dirname,join,resolve} from 'node:path';
@@ -17,6 +25,7 @@ const check=(value,code='CONFIGURATION')=>{if(!value)fail(code);};
 const exact=(v,keys)=>v&&typeof v==='object'&&!Array.isArray(v)&&Object.keys(v).sort().join(',')===[...keys].sort().join(',');
 const safeCredential=v=>typeof v==='string'&&v.length>0&&v.length<=512&&!/[\r\n\x00-\x1f\x7f]|(?:sk|rk|pk)_live_/.test(v);
 function guard(env) {
+  check(remainderExcluded(env),'OPT_IN_REQUIRED');
   check(env.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true','OPT_IN_REQUIRED');
   check(!env.DEBUG&&!env.NODE_DEBUG&&(!env.PWDEBUG||env.PWDEBUG==='0'),'DEBUG_DISABLED_REQUIRED');
 }
@@ -82,6 +91,7 @@ export async function initializeStripeSandboxState(metadata,options={}) {
   }catch{fail('STATE');}finally{if(lock){await lock.close();await unlink(join(dir,'lock'));}}
 }
 export async function verifyStripeSandboxOwnership(state,env=process.env,execute=promisify(execFile)) {
+  check(remainderExcluded(env),'OPT_IN_REQUIRED');
   try {
   const childEnv=Object.fromEntries(['PATH','HOME','USER','LOGNAME','LANG','LC_ALL','TMPDIR'].filter(k=>env[k]).map(k=>[k,env[k]]));
   const options={timeout:10000,maxBuffer:16384,env:childEnv};

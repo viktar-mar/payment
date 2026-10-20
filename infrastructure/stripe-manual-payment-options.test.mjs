@@ -1,5 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+
+// Break: new-mode exclusion after normalization or evaluating an accessor.
+test('remainder exclusion precedes snapshots configuration and dependencies',async()=>{
+  const {manualPaymentOptIn:accept}=await import('./stripe-manual-payment-options.mjs'); const base={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT:'true'};
+  let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}});
+  for(const shape of ['true','malformed','boolean','accessor','hidden','inherited']){
+    const raw=shape==='inherited'?Object.assign(Object.create({PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER:'true'}),base):{...base};
+    if(shape!=='inherited')Object.defineProperty(raw,'PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',shape==='accessor'?{enumerable:true,get(){reads++;throw null;}}:{enumerable:shape!=='hidden',value:shape==='true'||shape==='hidden'?'true':shape==='boolean'?false:{private:'canary'}});
+    assert.equal(accept(raw),false);
+  }
+  assert.equal(reads,0);
+});
 const options=await import('./stripe-manual-payment-options.mjs').catch(()=>({}));
 import {manualFormOptIn} from './stripe-manual-form-options.mjs';
 import {formDiagnosticOptIn,preflightOwnedSandbox} from './stripe-sandbox-owned.mjs';

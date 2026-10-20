@@ -1,3 +1,11 @@
+// Inspect the new flag before any legacy normalization or configuration access.
+function remainderExcluded(env){
+  try{
+    if(!env||typeof env!=='object')return false;
+    const key='PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',d=Object.getOwnPropertyDescriptor(env,key);
+    return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);
+  }catch{return false;}
+}
 import {constants} from 'node:fs';
 import {lstat,realpath,open,rename,unlink} from 'node:fs/promises';
 import {dirname,resolve} from 'node:path';
@@ -23,6 +31,7 @@ const credential=value=>typeof value==='string'&&value.length>0&&value.length<=1
 
 /** Inert, one-run provisioning capability. Root owns runtime and financial execution. */
 export async function createOwnedSandboxProvisioner(options,dependencies={}) {
+  if(!remainderExcluded(Object.getOwnPropertyDescriptor(options??{},'env')?.value))throw fixed('OPT_IN_REQUIRED');
   let enabled=false;
   try {const env=options?.env;enabled=env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true';}catch{}
   if(!enabled)throw fixed('OPT_IN_REQUIRED');

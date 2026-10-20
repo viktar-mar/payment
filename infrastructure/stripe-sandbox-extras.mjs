@@ -1,3 +1,11 @@
+// Inspect the new flag before any legacy normalization or configuration access.
+function remainderExcluded(env){
+  try{
+    if(!env||typeof env!=='object')return false;
+    const key='PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',d=Object.getOwnPropertyDescriptor(env,key);
+    return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);
+  }catch{return false;}
+}
 import {constants} from 'node:fs';
 import {lstat, realpath, open, rename, unlink} from 'node:fs/promises';
 import {dirname, resolve} from 'node:path';
@@ -38,6 +46,7 @@ const snapshot = value => freeze(JSON.parse(JSON.stringify(value)));
 
 /** One-run acceptance evidence. Construction is inert; all authority stays in owned capabilities. */
 export async function createSandboxAcceptanceExtras(options, dependencies = {}) {
+  if(!remainderExcluded(Object.getOwnPropertyDescriptor(options??{},'env')?.value))throw fixed('OPT_IN_REQUIRED');
   let enabled = false;
   try {
     const env = options?.env;

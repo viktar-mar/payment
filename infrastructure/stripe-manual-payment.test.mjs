@@ -1,5 +1,21 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
+
+// Break: new-mode exclusion after normalization or evaluating an accessor.
+test('remainder exclusion precedes snapshots configuration and dependencies',async()=>{
+  const {runManualPaymentCli:accept}=await import('./stripe-manual-payment.mjs'); const base={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'};
+  let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}});
+  for(const shape of ['true','malformed','boolean','accessor','hidden','inherited']){
+    const raw=shape==='inherited'?Object.assign(Object.create({PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER:'true'}),base):{...base};
+    if(shape!=='inherited')Object.defineProperty(raw,'PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',shape==='accessor'?{enumerable:true,get(){reads++;throw null;}}:{enumerable:shape!=='hidden',value:shape==='true'||shape==='hidden'?'true':shape==='boolean'?false:{private:'canary'}});
+    Object.assign(raw,{PAYMENT_STRIPE_SANDBOX_RUN_ID:'11111111-2222-4333-8444-555555555555',PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE:'e'.repeat(40),PAYMENT_STRIPE_SANDBOX_DAEMON:'unix:///Users/synthetic/docker.sock',PAYMENT_STRIPE_SANDBOX_PORT_MANUAL:'18087'});
+    for(const [index,name]of ['BACKEND','DEMO','RECEIVER','POSTGRES','MAILPITHTTP','MAILPITSMTP'].entries())raw['PAYMENT_STRIPE_SANDBOX_PORT_'+name]=String(18080+index);
+    const denied=()=>{reads++;throw null;};
+    const value=await accept({env:raw,args:[]},{write:async()=>{},subscribe:()=>()=>{},openState:denied,createRuntime:denied});
+    assert.equal(value.exitCode,1);
+  }
+  assert.equal(reads,0);
+});
 import {EventEmitter} from 'node:events';
 import {authorizeManualPaymentCli} from './stripe-manual-payment-auth.mjs';
 const module=await import('./stripe-manual-payment.mjs').catch(()=>({}));

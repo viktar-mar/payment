@@ -35,7 +35,7 @@ export async function runFormLoadDiagnostic(options,originalLimits,dependencies=
   let observationEnd='BROWSER_NOT_STARTED';
   let limits,cleanupDeadline;
   try {
-    if(!formDiagnosticOptIn(options?.env))throw null;
+    if(!formDiagnosticOptIn(Object.getOwnPropertyDescriptor(options??{},'env')?.value))throw null;
     const {deadline,signal}=originalLimits;
     if(!Number.isSafeInteger(deadline)||Date.now()>=deadline||!signal||typeof signal.aborted!=='boolean')throw null;
     limits=Object.freeze({deadline,signal});cleanupDeadline=deadline+120000;

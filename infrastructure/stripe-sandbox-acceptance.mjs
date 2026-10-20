@@ -1,3 +1,11 @@
+// Inspect the new flag before any legacy normalization or configuration access.
+function remainderExcluded(env){
+  try{
+    if(!env||typeof env!=='object')return false;
+    const key='PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',d=Object.getOwnPropertyDescriptor(env,key);
+    return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);
+  }catch{return false;}
+}
 import {execFile} from 'node:child_process';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -99,6 +107,7 @@ export function formatSandboxDiagnostic(value) {
 
 /** One owned run. Factories are reviewed capability boundaries, never command plugins. */
 export async function openOwnedSandboxAcceptance(options,limits,dependencies={}) {
+  if(!remainderExcluded(Object.getOwnPropertyDescriptor(options??{},'env')?.value))throw fixed('OPT_IN_REQUIRED');
   let enabled=false;
   try {const env=options?.env;enabled=env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env?.PAYMENT_STRIPE_SANDBOX_OWNED_RUN==='true'
     &&env.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND!=='true'&&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true';}catch{}

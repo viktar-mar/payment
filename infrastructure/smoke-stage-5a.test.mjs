@@ -1,5 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+
+test('all smoke exports reject raw remainder mode before any private or execute access',async()=>{
+  let reads=0;const api=await import('./smoke-stage-5a.mjs');
+  for(const shape of ['true','malformed','accessor','hidden','inherited']){
+    const env=shape==='inherited'?Object.create({PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER:'true'}):{};
+    if(shape!=='inherited')Object.defineProperty(env,'PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',shape==='accessor'?{enumerable:true,get(){reads++;throw null;}}:{enumerable:shape!=='hidden',value:shape==='malformed'?false:'true'});
+    Object.assign(env,{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'});
+    for(const key of ['PATH','HOME','PAYMENT_STRIPE_SANDBOX_RUN_ID','PAYMENT_SANDBOX_ADMIN_USERNAME'])Object.defineProperty(env,key,{get(){reads++;throw null;}});
+    const input={env,get rootDirectory(){reads++;throw null;},get fetch(){reads++;throw null;}};
+    for(const call of [()=>api.initializeStripeSandboxState({},input),()=>api.openStripeSandboxFixture(input),()=>api.runStripeSandboxSmoke(input),()=>api.verifyStripeSandboxOwnership({},env,()=>{reads++;throw null;})])await assert.rejects(call,/OPT_IN_REQUIRED/);
+  }
+  assert.equal(reads,0);
+});
 import {runStripeSandboxSmoke} from './smoke-stage-5a.mjs';
 import * as sandbox from './smoke-stage-5a.mjs';
 import {mkdtemp,readFile,writeFile,symlink,stat} from 'node:fs/promises';
