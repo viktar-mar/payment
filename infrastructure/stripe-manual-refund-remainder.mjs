@@ -31,166 +31,307 @@ function writer(stream){
 }
 
 /** One authority, including raw late factories and independent cleanup obligations. */
-export async function runManualRefundRemainder(options,originalLimits,deps={}){
-  const selected=validateManualRefundRemainderOptions(options);let input;
-  try{
-    input=exact(originalLimits,Object.hasOwn(originalLimits??{},'signal')?['deadline','signal']:['deadline']);
-    if(!selected||!Number.isSafeInteger(input.deadline)||input.deadline<=0||input.signal!==undefined&&!(input.signal instanceof AbortSignal)||input.signal?.aborted)return rejected();
-  }catch{return rejected();}
-  let now,setTimer,clearTimer;
-  try{
-    now=deps.now??Date.now;const start=now();
-    if(!Number.isSafeInteger(start)||input.deadline<=start||input.deadline>start+1800000)return rejected();
-    setTimer=deps.setTimeout??setTimeout;clearTimer=deps.clearTimeout??clearTimeout;
-  }catch{return rejected();}
-  const controller=new AbortController(),abort=()=>controller.abort();
-  const limits=Object.freeze({deadline:input.deadline,signal:controller.signal});
-  const cleanup=Object.freeze({deadline:input.deadline+120000}),httpCutoff=input.deadline+60000;
-  input.signal?.addEventListener('abort',abort,{once:true});
-  const timer=setTimer(abort,Math.max(1,limits.deadline-now()));
-  const proof={...EMPTY},resources={},attempted=new Set(),active=new Set(),runtimeWork=new Set(),httpWork=new Set(),all=new Set(),closures=new Map(),settledClosures=new Set();
-  let phase='ADMISSION',pending=false,denied=false,closing=false,runtimeReleased=false,stateReleased=false,diagnostic=null,baseline;
+export async function runManualRefundRemainder(options, originalLimits, deps = {}) {
+  const selected = validateManualRefundRemainderOptions(options);
+  let input;
+  try {
+    input = exact(originalLimits, Object.hasOwn(originalLimits ?? {}, 'signal') ? ['deadline', 'signal'] : ['deadline']);
+    if (!selected || !Number.isSafeInteger(input.deadline) || input.deadline <= 0
+      || input.signal !== undefined && !(input.signal instanceof AbortSignal)
+      || input.signal?.aborted) return rejected();
+  } catch {
+    return rejected();
+  }
+  let now,
+    setTimer,
+    clearTimer;
+  try {
+    now = deps.now ?? Date.now;
+    const start = now();
+    if (!Number.isSafeInteger(start) || input.deadline <= start || input.deadline > start + 1800000) return rejected();
+    setTimer = deps.setTimeout ?? setTimeout;
+    clearTimer = deps.clearTimeout ?? clearTimeout;
+  } catch {
+    return rejected();
+  }
+  const controller = new AbortController(),
+    abort = () => controller.abort();
+  const limits = Object.freeze({deadline: input.deadline, signal: controller.signal});
+  const cleanup = Object.freeze({deadline: input.deadline + 120000}),
+    httpCutoff = input.deadline + 60000;
+  input.signal?.addEventListener('abort', abort, {once: true});
+  const timer = setTimer(abort, Math.max(1, limits.deadline - now()));
+  const proof = {...EMPTY},
+    resources = {},
+    attempted = new Set(),
+    active = new Set(),
+    runtimeWork = new Set(),
+    httpWork = new Set(),
+    all = new Set(),
+    closures = new Map(),
+    settledClosures = new Set();
+  let phase = 'ADMISSION',
+    pending = false,
+    denied = false,
+    closing = false,
+    runtimeReleased = false,
+    stateReleased = false,
+    diagnostic = null,
+    baseline;
 
-  function remember(){
-    if(diagnostic||!resources.session)return;
-    try{const inspect=data(resources.session,'diagnostic');if(typeof inspect==='function')diagnostic=validateManualRefundDiagnostic(inspect.call(resources.session));}catch{}
+  function remember() {
+    if (diagnostic || !resources.session) return;
+    try {
+      const inspect = data(resources.session, 'diagnostic');
+      if (typeof inspect === 'function') diagnostic = validateManualRefundDiagnostic(inspect.call(resources.session));
+    } catch {}
   }
-  function uncertain(){pending=true;remember();}
-  function check(){if(closing||pending||controller.signal.aborted||now()>=limits.deadline)fail();}
-  function track(body,kind,operation=true){
-    const promise=Promise.resolve().then(body);all.add(promise);
-    if(operation){active.add(promise);if(kind==='runtime')runtimeWork.add(promise);else httpWork.add(promise);}
-    const settle=()=>{
-      all.delete(promise);active.delete(promise);runtimeWork.delete(promise);httpWork.delete(promise);
-      if(closing&&runtimeReleased&&!runtimeWork.size)close('runtime');
+  function uncertain() {
+    pending = true;
+    remember();
+  }
+  function check() {
+    if (closing || pending || controller.signal.aborted || now() >= limits.deadline) fail();
+  }
+  function track(body, kind, operation = true) {
+    const promise = Promise.resolve().then(body);
+    all.add(promise);
+    if (operation) {
+      active.add(promise);
+      if (kind === 'runtime') runtimeWork.add(promise);
+      else httpWork.add(promise);
+    }
+    const settle = () => {
+      all.delete(promise);
+      active.delete(promise);
+      runtimeWork.delete(promise);
+      httpWork.delete(promise);
+      if (closing && runtimeReleased && !runtimeWork.size) close('runtime');
     };
-    promise.then(settle,settle);promise.catch(()=>{});return promise;
-  }
-  function wait(promise,deadline,signal){
-    return new Promise((accept,reject)=>{
-      let done=false,timer;
-      const finish=(ok,value)=>{if(done)return;done=true;clearTimer(timer);signal?.removeEventListener('abort',cancel);ok?accept(value):reject();};
-      const cancel=()=>finish(false);
-      Promise.resolve(promise).then(value=>finish(now()<deadline&&!signal?.aborted,value),cancel);
-      if(now()>=deadline||signal?.aborted){cancel();return;}
-      signal?.addEventListener('abort',cancel,{once:true});timer=setTimer(cancel,Math.max(1,deadline-now()));
-    });
-  }
-  function acquire(kind,value){
-    resources[kind]=value;
-    if(closing&&(kind==='session'||kind==='cli'||kind==='runtime'&&runtimeReleased&&!runtimeWork.size||kind==='state'&&stateReleased))close(kind);
-  }
-  function operation(body,kind,onAcquire){
-    check();
-    const raw=track(async()=>{check();const value=await body();onAcquire?.(value);return value;},kind);
-    return wait(raw,limits.deadline,limits.signal);
-  }
-  async function requireTrue(body,kind){if(await operation(body,kind)!==true)fail();check();}
-  async function factory(kind,body){
-    attempted.add(kind);
-    await operation(body,kind,value=>acquire(kind,value));check();
-  }
-  function close(kind){
-    if(kind==='runtime'&&runtimeWork.size)return;
-    if(!resources[kind]||closures.has(kind)||now()>=cleanup.deadline)return closures.get(kind);
-    const method={state:'close',runtime:'stop',cli:'stopListener',session:'close'}[kind];
-    const promise=track(async()=>{
-      if(now()>=cleanup.deadline)fail();
-      if(await resources[kind][method](cleanup)!==true||now()>=cleanup.deadline)fail();
-      return true;
-    },kind,false);
-    closures.set(kind,promise);
-    promise.then(()=>settledClosures.add(kind),()=>{settledClosures.add(kind);uncertain();});
+    promise.then(settle, settle);
+    promise.catch(() => {});
     return promise;
   }
-  async function drain(set,deadline){
-    try{while(set.size)await wait(Promise.allSettled([...set]),deadline);}catch{uncertain();}
+  function wait(promise, deadline, signal) {
+    return new Promise((accept, reject) => {
+      let done = false,
+        timer;
+      const finish = (ok, value) => {
+        if (done) return;
+        done = true;
+        clearTimer(timer);
+        signal?.removeEventListener('abort', cancel);
+        ok ? accept(value) : reject();
+      };
+      const cancel = () => finish(false);
+      Promise.resolve(promise).then(value => finish(now() < deadline && !signal?.aborted, value), cancel);
+      if (now() >= deadline || signal?.aborted) {
+        cancel();
+        return;
+      }
+      signal?.addEventListener('abort', cancel, {once: true});
+      timer = setTimer(cancel, Math.max(1, deadline - now()));
+    });
   }
-  async function certify(kind,field,deadline=cleanup.deadline){
-    if(!attempted.has(kind)){if(field)proof[field]=true;return;}
-    try{
-      const promise=close(kind);if(!promise||await wait(promise,deadline)!==true)fail();
-      if(field)proof[field]=true;
-    }catch{uncertain();}
+  function acquire(kind, value) {
+    resources[kind] = value;
+    if (closing
+      && (kind === 'session' || kind === 'cli' || kind === 'runtime' && runtimeReleased && !runtimeWork.size || kind === 'state' && stateReleased)) close(kind);
   }
-  function acceptFinancial(value,prior){
-    const last=prior?'callbackDeliveryVerified':'callbackSignatureVerified';
-    const p=exact(value,['refundId','providerReference','providerEventId','cashEventId','amountMinor','totalMinor','providerVerified','webhookVerified','journalVerified',last]);
-    const uuid=value=>typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
-    if(!uuid(p.refundId)||!uuid(p.cashEventId)||typeof p.providerReference!=='string'||!/^re_[A-Za-z0-9_]{1,249}$/.test(p.providerReference)||typeof p.providerEventId!=='string'||!/^evt_[A-Za-z0-9_]{1,249}$/.test(p.providerEventId)||p.amountMinor!==(prior?700:1300)||p.totalMinor!==(prior?700:2000)||['providerVerified','webhookVerified','journalVerified',last].some(key=>p[key]!==true))fail();
-    if(prior?p.refundId!==resources.state.target().priorRefundId:p.refundId===baseline.refundId||p.providerReference===baseline.providerReference||p.providerEventId===baseline.providerEventId||p.cashEventId===baseline.cashEventId)fail();
+  function operation(body, kind, onAcquire) {
+    check();
+    const raw = track(async () => {
+      check();
+      const value = await body();
+      onAcquire?.(value);
+      return value;
+    }, kind);
+    return wait(raw, limits.deadline, limits.signal);
+  }
+  async function requireTrue(body, kind) {
+    if (await operation(body, kind) !== true) fail();
+    check();
+  }
+  async function factory(kind, body) {
+    attempted.add(kind);
+    await operation(body, kind, value => acquire(kind, value));
+    check();
+  }
+  function close(kind) {
+    if (kind === 'runtime' && runtimeWork.size) return;
+    if (!resources[kind] || closures.has(kind) || now() >= cleanup.deadline) return closures.get(kind);
+    const method = {state: 'close', runtime: 'stop', cli: 'stopListener', session: 'close'}[kind];
+    const promise = track(async () => {
+      if (now() >= cleanup.deadline) fail();
+      if (await resources[kind][method](cleanup) !== true || now() >= cleanup.deadline) fail();
+      return true;
+    }, kind, false);
+    closures.set(kind, promise);
+    promise.then(() => settledClosures.add(kind), () => {
+      settledClosures.add(kind);
+      uncertain();
+    });
+    return promise;
+  }
+  async function drain(set, deadline) {
+    try {
+      while (set.size) await wait(Promise.allSettled([...set]), deadline);
+    } catch {
+      uncertain();
+    }
+  }
+  async function certify(kind, field, deadline = cleanup.deadline) {
+    if (!attempted.has(kind)) {
+      if (field) proof[field] = true;
+      return;
+    }
+    try {
+      const promise = close(kind);
+      if (!promise || await wait(promise, deadline) !== true) fail();
+      if (field) proof[field] = true;
+    } catch {
+      uncertain();
+    }
+  }
+  function acceptFinancial(value, prior) {
+    const last = prior ? 'callbackDeliveryVerified' : 'callbackSignatureVerified';
+    const p = exact(value, [
+      'refundId',
+      'providerReference',
+      'providerEventId',
+      'cashEventId',
+      'amountMinor',
+      'totalMinor',
+      'providerVerified',
+      'webhookVerified',
+      'journalVerified',
+      last
+    ]);
+    const uuid = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
+    if (!uuid(p.refundId) || !uuid(p.cashEventId) || typeof p.providerReference !== 'string'
+      || !/^re_[A-Za-z0-9_]{1,249}$/.test(p.providerReference)
+      || typeof p.providerEventId !== 'string'
+      || !/^evt_[A-Za-z0-9_]{1,249}$/.test(p.providerEventId)
+      || p.amountMinor !== (prior ? 700 : 1300)
+      || p.totalMinor !== (prior ? 700 : 2000)
+      || ['providerVerified', 'webhookVerified', 'journalVerified', last].some(key => p[key] !== true)) fail();
+    if (prior ? p.refundId !== resources.state.target().priorRefundId : p.refundId === baseline.refundId || p.providerReference === baseline.providerReference
+      || p.providerEventId === baseline.providerEventId
+      || p.cashEventId === baseline.cashEventId) fail();
     return Object.freeze(p);
   }
-  try{
-    await factory('state',async()=>{
-      const create=deps.createState??(await import('./stripe-manual-refund-remainder-state.mjs')).createManualRefundRemainderState;
+  try {
+    await factory('state', async () => {
+      const create = deps.createState ?? (await import('./stripe-manual-refund-remainder-state.mjs')).createManualRefundRemainderState;
       return create(selected);
     });
-    const admission=await operation(()=>resources.state.admit(limits),'state');
-    if(admission==='DENIED'){denied=true;}
-    else{
-      if(admission!=='READY')fail();check();
-      phase='RESTORE';
-      await factory('runtime',async()=>{
-        const create=deps.createRuntime??(await import('./stripe-manual-refund-remainder-runtime.mjs')).createOwnedManualRefundRemainderRuntime;
-        return create(Object.freeze({options:selected,state:resources.state}));
-      });
-      await requireTrue(()=>resources.runtime.restore(limits),'runtime');
-      phase='BINDING';
-      await factory('cli',async()=>{
-        const create=deps.createCli??(await import('./stripe-manual-refund-remainder-cli.mjs')).createManualRefundRemainderCliAdapter;
-        return create(Object.freeze({env:selected.env,originalRunId:ORIGINAL,priorRunId:PRIOR,cliDirectory:ROOT+'/test-results/stripe-sandbox/'+ORIGINAL+'/cli',backendPort:resources.state.target().original.ports.backend,verifyForwardTarget:resources.runtime.verifyForwardTarget,persistWebhookSecret:resources.runtime.verifyWebhookSecret,approvedBinding:Object.freeze({externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'})}));
-      });
-      await requireTrue(()=>resources.cli.validateBinding(limits),'cli');
-      phase='LISTENER';await requireTrue(()=>resources.cli.startListener(limits),'cli');
-      phase='BASELINE';await requireTrue(()=>resources.cli.bindRemainderTarget(resources.state.target(),limits),'cli');
-      await factory('session',async()=>{
-        const create=deps.createSession??(await import('./stripe-manual-refund-remainder-session.mjs')).createManualRefundRemainderSession;
-        return create(Object.freeze({runtime:resources.runtime,cli:resources.cli,state:resources.state}));
-      });
-      baseline=acceptFinancial(await operation(()=>resources.session.verifyBaseline(limits),'session'),true);check();
-      proof.target_verified=true;proof.prior_partial_verified=true;proof.prior_callback_delivery_verified=true;
-      phase='ROTATION';await requireTrue(()=>resources.session.rotateCallback(limits),'session');proof.callback_rotated=true;
-      phase='REMAINDER';acceptFinancial(await operation(()=>resources.session.refundRemainder(limits),'session'),false);check();
-      proof.remainder_confirmed=true;proof.provider_verified=true;proof.webhook_verified=true;proof.journal_verified=true;proof.callback_signature_verified=true;
-      phase='VERIFY';
-      const final=exact(await operation(()=>resources.session.verifyFinal(limits),'session'),['priorPartialVerified','priorCallbackDeliveryVerified','remainderConfirmed','providerVerified','webhookVerified','journalVerified','callbackSignatureVerified','finalTotalVerified']);
-      if(Object.values(final).some(value=>value!==true))fail();check();proof.final_total_verified=true;
+    const admission = await operation(() => resources.state.admit(limits), 'state');
+    if (admission === 'DENIED') {
+      denied = true;
     }
-  }catch{uncertain();}
-  finally{
-    if(!pending&&!denied)phase='CLEANUP';
-    closing=true;controller.abort();
+    else {
+      if (admission !== 'READY') fail();
+      check();
+      phase = 'RESTORE';
+      await factory('runtime', async () => {
+        const create = deps.createRuntime ?? (await import('./stripe-manual-refund-remainder-runtime.mjs')).createOwnedManualRefundRemainderRuntime;
+        return create(Object.freeze({options: selected, state: resources.state}));
+      });
+      await requireTrue(() => resources.runtime.restore(limits), 'runtime');
+      phase = 'BINDING';
+      await factory('cli', async () => {
+        const create = deps.createCli ?? (await import('./stripe-manual-refund-remainder-cli.mjs')).createManualRefundRemainderCliAdapter;
+        return create(Object.freeze({
+          env: selected.env,
+          originalRunId: ORIGINAL,
+          priorRunId: PRIOR,
+          cliDirectory: ROOT + '/test-results/stripe-sandbox/' + ORIGINAL + '/cli',
+          backendPort: resources.state.target().original.ports.backend,
+          verifyForwardTarget: resources.runtime.verifyForwardTarget,
+          persistWebhookSecret: resources.runtime.verifyWebhookSecret,
+          approvedBinding: Object.freeze({externalAccountId: 'acct_1UPiMpELswAd8tpR', apiVersion: '2026-09-30.endive'})
+        }));
+      });
+      await requireTrue(() => resources.cli.validateBinding(limits), 'cli');
+      phase = 'LISTENER';
+      await requireTrue(() => resources.cli.startListener(limits), 'cli');
+      phase = 'BASELINE';
+      await requireTrue(() => resources.cli.bindRemainderTarget(resources.state.target(), limits), 'cli');
+      await factory('session', async () => {
+        const create = deps.createSession ?? (await import('./stripe-manual-refund-remainder-session.mjs')).createManualRefundRemainderSession;
+        return create(Object.freeze({runtime: resources.runtime, cli: resources.cli, state: resources.state}));
+      });
+      baseline = acceptFinancial(await operation(() => resources.session.verifyBaseline(limits), 'session'), true);
+      check();
+      proof.target_verified = true;
+      proof.prior_partial_verified = true;
+      proof.prior_callback_delivery_verified = true;
+      phase = 'ROTATION';
+      await requireTrue(() => resources.session.rotateCallback(limits), 'session');
+      proof.callback_rotated = true;
+      phase = 'REMAINDER';
+      acceptFinancial(await operation(() => resources.session.refundRemainder(limits), 'session'), false);
+      check();
+      proof.remainder_confirmed = true;
+      proof.provider_verified = true;
+      proof.webhook_verified = true;
+      proof.journal_verified = true;
+      proof.callback_signature_verified = true;
+      phase = 'VERIFY';
+      const final = exact(await operation(() => resources.session.verifyFinal(limits), 'session'), [
+        'priorPartialVerified',
+        'priorCallbackDeliveryVerified',
+        'remainderConfirmed',
+        'providerVerified',
+        'webhookVerified',
+        'journalVerified',
+        'callbackSignatureVerified',
+        'finalTotalVerified'
+      ]);
+      if (Object.values(final).some(value => value !== true)) fail();
+      check();
+      proof.final_total_verified = true;
+    }
+  } catch {
+    uncertain();
+  }
+  finally {
+    if (!pending && !denied) phase = 'CLEANUP';
+    closing = true;
+    controller.abort();
     // Cancellation starts immediately; raw bodies/acquisitions remain owned.
-    close('session');close('cli');
-    await drain(httpWork,httpCutoff);
-    let httpUnsettled=httpWork.size>0;
-    if(httpUnsettled)uncertain();
-    await certify('session',undefined,httpCutoff);
-    if(closures.has('session')&&!settledClosures.has('session'))httpUnsettled=true;
-    await certify('cli','listener_closed',Math.min(cleanup.deadline,now()+10000));
+    close('session');
+    close('cli');
+    await drain(httpWork, httpCutoff);
+    let httpUnsettled = httpWork.size > 0;
+    if (httpUnsettled) uncertain();
+    await certify('session', undefined, httpCutoff);
+    if (closures.has('session') && !settledClosures.has('session')) httpUnsettled = true;
+    await certify('cli', 'listener_closed', Math.min(cleanup.deadline, now() + 10000));
     // Restore starts must settle before stop. Reserve transport time only within
     // the original ceiling; a late settlement still retains its stop obligation.
-    await drain(runtimeWork,cleanup.deadline-20000);
-    runtimeReleased=true;
-    if(!runtimeWork.size)close('runtime');
-    await drain(active,cleanup.deadline-10000);
-    if(runtimeWork.size||active.size)uncertain();
-    if(!runtimeWork.size)close('runtime');
-    stateReleased=true;close('state');
+    await drain(runtimeWork, cleanup.deadline - 20000);
+    runtimeReleased = true;
+    if (!runtimeWork.size) close('runtime');
+    await drain(active, cleanup.deadline - 10000);
+    if (runtimeWork.size || active.size) uncertain();
+    if (!runtimeWork.size) close('runtime');
+    stateReleased = true;
+    close('state');
     // State/file closure owns an independent opportunity even if runtime stop
     // remains unsettled. Both raw closures are still awaited to the same ceiling.
-    await Promise.all([certify('runtime',httpUnsettled?undefined:'runtime_closed'),certify('state')]);
-    await drain(all,cleanup.deadline);
-    for(const kind of attempted)if(!resources[kind])uncertain();
-    clearTimer(timer);input.signal?.removeEventListener('abort',abort);
+    await Promise.all([certify('runtime', httpUnsettled ? undefined : 'runtime_closed'), certify('state')]);
+    await drain(all, cleanup.deadline);
+    for (const kind of attempted) if (!resources[kind]) uncertain();
+    clearTimer(timer);
+    input.signal?.removeEventListener('abort', abort);
   }
-  if(input.signal?.aborted||now()>=cleanup.deadline||all.size)uncertain();
+  if (input.signal?.aborted || now() >= cleanup.deadline || all.size) uncertain();
   remember();
-  if(pending&&diagnostic)proof.diagnostic=diagnostic;
-  const result=pending?'PENDING':denied?'FAILED':'SUCCEEDED';
-  const report=validateManualRefundRemainderReport({...proof,result,phase})??validateManualRefundRemainderReport({...EMPTY,result:'PENDING',phase:'CLEANUP'});
-  return Object.freeze({report,exitCode:report.result==='SUCCEEDED'?0:1});
+  if (pending && diagnostic) proof.diagnostic = diagnostic;
+  const result = pending ? 'PENDING' : denied ? 'FAILED' : 'SUCCEEDED';
+  const report = validateManualRefundRemainderReport({...proof, result, phase}) ?? validateManualRefundRemainderReport({...EMPTY, result: 'PENDING', phase: 'CLEANUP'});
+  return Object.freeze({report, exitCode: report.result === 'SUCCEEDED' ? 0 : 1});
 }
 
 /** Snapshot only public raw data, after every raw flag and zero-argument check. */

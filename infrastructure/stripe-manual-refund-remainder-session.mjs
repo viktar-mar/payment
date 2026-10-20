@@ -203,16 +203,135 @@ export async function createManualRefundRemainderSession({runtime,cli,state},dep
   const history={facts:current.found[1],operations:current.operations,outbox:current.d.outbox_events,deliveries:current.d.deliveries};
   if(remainder&&(!same(value,{refundId:remainder.refundId,providerReference:remainder.providerReference,providerEventId:remainder.providerEventId,amountMinor:1300,totalMinor:2000})||current.found[1].success.id!==remainder.cashEventId)||remainderHistory&&!same(history,remainderHistory))deny();
   remainderHistory??=structuredClone(history);return Object.freeze({...value,cashEventId:current.found[1].success.id,providerVerified:true,webhookVerified:true,journalVerified:true,callbackSignatureVerified:true});}
- async function refundRemainder(c){
-  if(!rotation||dispatchUsed)deny();dispatchUsed=true;
-  await phase(c,async(c,until)=>{await refresh(c,until);stage='DISPATCH';const leg=await call(c,()=>state.beginRemainder(c));if(!Object.isFrozen(leg)||leg.phase!=='DISPATCHING'||leg.amountMinor!==1300||leg.key!==target.remainderKey||leg.refundId!==null||leg.providerReference!==null)deny();
-   const ack=await read(paymentPath+'/refunds',c,{method:'POST',expected:202,key:leg.key,guard:true,body:{amount_minor:1300,currency:'EUR',reason_code:'REQUESTED_BY_CUSTOMER'},until});
-   if(!uuid(ack?.refund_id)||ack.refund_id===target.priorRefundId||ack.payment_id!==t.paymentId||ack.amount_minor!==1300||ack.currency!=='EUR'||!['PENDING','PROCESSING','SUCCEEDED'].includes(ack.status))deny();stage='ACKNOWLEDGEMENT';if(await call(c,()=>state.ackRemainder(Object.freeze({refundId:ack.refund_id}),c))!==true)deny();refundId=ack.refund_id;
+ async function refundRemainder(c) {
+  if (!rotation || dispatchUsed) deny();
+  dispatchUsed = true;
+  await phase(c, async (c, until) => {
+   await refresh(c, until);
+   stage = 'DISPATCH';
+   const leg = await call(c, () => state.beginRemainder(c));
+   if (!Object.isFrozen(leg) || leg.phase !== 'DISPATCHING' || leg.amountMinor !== 1300
+    || leg.key !== target.remainderKey || leg.refundId !== null || leg.providerReference !== null) deny();
+   const ack = await read(paymentPath + '/refunds', c, {
+    method: 'POST',
+    expected: 202,
+    key: leg.key,
+    guard: true,
+    body: {amount_minor: 1300, currency: 'EUR', reason_code: 'REQUESTED_BY_CUSTOMER'},
+    until
+   });
+   if (!uuid(ack?.refund_id) || ack.refund_id === target.priorRefundId || ack.payment_id !== t.paymentId
+    || ack.amount_minor !== 1300 || ack.currency !== 'EUR' || !['PENDING', 'PROCESSING', 'SUCCEEDED'].includes(ack.status)) deny();
+   stage = 'ACKNOWLEDGEMENT';
+   if (await call(c, () => state.ackRemainder(Object.freeze({refundId: ack.refund_id}), c)) !== true) deny();
+   refundId = ack.refund_id;
   });
-  return phase(c,async(c,until)=>{let proof;for(let n=0;n<30&&now()<until;n++){probes=n+1;proof=await prove(c,until);if(proof)break;const delay=dependencies.probeDelay??100;if(!Number.isInteger(delay)||delay<0||delay>250)deny();if(delay)await call(c,()=>new Promise(r=>setTimer(r,Math.min(delay,Math.max(0,until-now())))));}if(!proof)deny(now()>=until?'DEADLINE':'EXHAUSTED');stage='PROVIDER';const v=await call(c,()=>cli.inspectRemainder(Object.freeze({refundId:proof.refundId,providerReference:proof.providerReference,providerEventId:proof.providerEventId,amountMinor:1300,totalMinor:2000}),c));if(v?.providerVerified!==true||v.webhookVerified!==true)deny();stage='CONFIRMATION';if(await call(c,()=>state.confirmRemainder(proof,c))!==true)deny();remainder=proof;return proof;});
+  return phase(c, async (c, until) => {
+   let proof;
+   for (let n = 0; n < 30 && now() < until; n++) {
+    probes = n + 1;
+    proof = await prove(c, until);
+    if (proof) break;
+    const delay = dependencies.probeDelay ?? 100;
+    if (!Number.isInteger(delay) || delay < 0 || delay > 250) deny();
+    if (delay) await call(c, () => new Promise(r => setTimer(r, Math.min(delay, Math.max(0, until - now())))));
+   }
+   if (!proof) deny(now() >= until ? 'DEADLINE' : 'EXHAUSTED');
+   stage = 'PROVIDER';
+   const v = await call(c, () => cli.inspectRemainder(Object.freeze({
+    refundId: proof.refundId,
+    providerReference: proof.providerReference,
+    providerEventId: proof.providerEventId,
+    amountMinor: 1300,
+    totalMinor: 2000
+   }), c));
+   if (v?.providerVerified !== true || v.webhookVerified !== true) deny();
+   stage = 'CONFIRMATION';
+   if (await call(c, () => state.confirmRemainder(proof, c)) !== true) deny();
+   remainder = proof;
+   return proof;
+  });
  }
- async function verifyFinal(c){if(!remainder)deny();return phase(c,async(c,until)=>{await binding(c,until);if(!await prove(c,until))deny();stage='PROVIDER';const v=await call(c,()=>cli.inspectRemainder(Object.freeze({refundId:remainder.refundId,providerReference:remainder.providerReference,providerEventId:remainder.providerEventId,amountMinor:1300,totalMinor:2000}),c));if(v?.providerVerified!==true||v.webhookVerified!==true)deny();const proof=Object.freeze({priorPartialVerified:true,priorCallbackDeliveryVerified:true,remainderConfirmed:true,providerVerified:true,webhookVerified:true,journalVerified:true,callbackSignatureVerified:true,finalTotalVerified:true});stage='FINAL';if(await call(c,()=>state.confirmFinal(proof,c))!==true)deny();return proof;});}
- async function run(value,body,nextStage){if(busy){remember('UNCONFIRMED');failed=true;throw fixed();}busy=true;if(!failed){stage=nextStage;probes=0;}let c;try{c=limits(value);check(c);const v=await io.wait(c,()=>track(()=>body(c)));check(c);return v;}catch(error){remember(error,c);failed=true;throw fixed();}finally{busy=false;}}
- async function close(value){if(closeUsed)throw fixed();closeUsed=true;closed=true;for(const controller of controllers)controller.abort();try{if(deadline===null)return true;const c=limits(value,true);for(;;){for(const response of resources.keys())release(response).catch(()=>{});if(!work.size)break;await io.wait(c,()=>Promise.allSettled([...work]));}if(resources.size||disposalFailed)deny();return true;}catch(error){if(!diagnostic)stage='CLEANUP';remember(error);failed=true;throw fixed();}finally{cookie='';csrf='';actor=null;}}
+ async function verifyFinal(c) {
+  if (!remainder) deny();
+  return phase(c, async (c, until) => {
+   await binding(c, until);
+   if (!await prove(c, until)) deny();
+   stage = 'PROVIDER';
+   const v = await call(c, () => cli.inspectRemainder(Object.freeze({
+    refundId: remainder.refundId,
+    providerReference: remainder.providerReference,
+    providerEventId: remainder.providerEventId,
+    amountMinor: 1300,
+    totalMinor: 2000
+   }), c));
+   if (v?.providerVerified !== true || v.webhookVerified !== true) deny();
+   const proof = Object.freeze({
+    priorPartialVerified: true,
+    priorCallbackDeliveryVerified: true,
+    remainderConfirmed: true,
+    providerVerified: true,
+    webhookVerified: true,
+    journalVerified: true,
+    callbackSignatureVerified: true,
+    finalTotalVerified: true
+   });
+   stage = 'FINAL';
+   if (await call(c, () => state.confirmFinal(proof, c)) !== true) deny();
+   return proof;
+  });
+ }
+ async function run(value, body, nextStage) {
+  if (busy) {
+   remember('UNCONFIRMED');
+   failed = true;
+   throw fixed();
+  }
+  busy = true;
+  if (!failed) {
+   stage = nextStage;
+   probes = 0;
+  }
+  let c;
+  try {
+   c = limits(value);
+   check(c);
+   const v = await io.wait(c, () => track(() => body(c)));
+   check(c);
+   return v;
+  } catch (error) {
+   remember(error, c);
+   failed = true;
+   throw fixed();
+  } finally {
+   busy = false;
+  }
+ }
+ async function close(value) {
+  if (closeUsed) throw fixed();
+  closeUsed = true;
+  closed = true;
+  for (const controller of controllers) controller.abort();
+  try {
+   if (deadline === null) return true;
+   const c = limits(value, true);
+   for (;;) {
+    for (const response of resources.keys()) release(response).catch(() => {});
+    if (!work.size) break;
+    await io.wait(c, () => Promise.allSettled([...work]));
+   }
+   if (resources.size || disposalFailed) deny();
+   return true;
+  } catch (error) {
+   if (!diagnostic) stage = 'CLEANUP';
+   remember(error);
+   failed = true;
+   throw fixed();
+  } finally {
+   cookie = '';
+   csrf = '';
+   actor = null;
+  }
+ }
  return Object.freeze({verifyBaseline:v=>run(v,verifyBaseline,'BASELINE'),rotateCallback:v=>run(v,rotateCallback,'ROTATION'),refundRemainder:v=>run(v,refundRemainder,'DISPATCH'),verifyFinal:v=>run(v,verifyFinal,'FINAL'),diagnostic:()=>diagnostic,close});
 }
