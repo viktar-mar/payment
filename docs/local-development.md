@@ -206,30 +206,29 @@ Run from the project root. Use Docker Engine/Desktop with Compose v2, Bash, Node
 
 Copy `infrastructure/.env.example` to `infrastructure/.env` only if you do not already have a local configuration. Preserve existing credentials and the database. Bootstrap credentials initialize the first administrator; changing the file does not rotate an existing administrator's password.
 
-After a fresh clone, create the local-only Customer issuer fixture before starting Compose or running backend integration tests. Run this from the project root with Node.js. The command preserves an existing fixture, writes new private material with owner-only permissions, and never prints keys:
+After a fresh clone, create the local-only Customer issuer fixture before starting Compose or running backend integration tests. Run this from the project root with Node.js. The helper resolves its fixture destination from its own location, preserves an existing regular fixture, rejects symlinks, writes new private material with owner-only permissions, and never prints keys:
 
 ```bash
-node --input-type=module <<'NODE'
-import { generateKeyPairSync } from 'node:crypto';
-import { existsSync, writeFileSync } from 'node:fs';
-
-const file = 'infrastructure/fixtures/customer-issuer-private.jwks.json';
-if (existsSync(file)) {
-  console.log('Existing local issuer fixture preserved.');
-} else {
-  const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 });
-  const ec = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
-  const keys = [
-    { ...rsa.privateKey.export({ format: 'jwk' }), kid: 'local-fixture-rs', alg: 'RS256', use: 'sig' },
-    { ...ec.privateKey.export({ format: 'jwk' }), kid: 'local-fixture-es', alg: 'ES256', use: 'sig' },
-  ];
-  writeFileSync(file, JSON.stringify({ keys }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
-  console.log('Local-only issuer fixture created.');
-}
-NODE
+node infrastructure/init-local-customer-issuer.mjs
 ```
 
 The fixture and real `.env` files are intentionally ignored by Git. Do not force-add them or reuse local fixture/example keys in production. Public issuer keys are derived by the protected local endpoint; no checked-in private or public fixture file is required.
+
+### Secret-free CI coverage
+
+[Offline CI](../.github/workflows/ci.yml) runs on pushes, pull requests and manual dispatch with
+Node 24, JDK 25, pnpm 11.1.3 and Docker. Its three bounded jobs run default Maven verification
+(including synthetic Stripe adapter/Cucumber fixtures), SDK and Admin tests/typechecks/builds,
+Admin lint, demo return-unit tests/build, native Node synthetic support tests, the separate
+offline Chromium return/privacy suite and all infrastructure Node tests. Dependencies use frozen
+lockfiles; fresh backend jobs create their own ignored local issuer fixture. No repository secrets
+or private env files are needed. Traces, screenshots, video and artifact uploads are disabled.
+
+The browser job uses only `playwright.offline.config.ts`; it does not run full Fake backend
+acceptance, which requires the separately owned Stage 4 clock/runtime harness described above.
+Real Stripe Sandbox/live acceptance, listener setup, financial operations, deployment and package
+publication remain outside ordinary CI. A local checkpoint does not prove that GitHub-hosted
+execution has passed; the workflow must run remotely to establish that result.
 
 | Variable | Purpose |
 | --- | --- |

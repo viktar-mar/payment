@@ -101,7 +101,44 @@ test('stalled gateway cleanup cannot consume the independent cleanup attempts',a
 });
 test('inert imports neither read private credentials nor launch any subprocess or listener',async()=>{
   const {spawnSync}=await import('node:child_process');
-  const script="import {syncBuiltinESMExports} from 'node:module';import cp from 'node:child_process';import fs from 'node:fs';import fsp from 'node:fs/promises';import http from 'node:http';import net from 'node:net';const trap=()=>{throw Error('private boundary touched');};cp.execFile=cp.spawn=cp.spawnSync=trap;fs.readFileSync=trap;fsp.readFile=trap;http.createServer=net.createServer=trap;globalThis.fetch=trap;syncBuiltinESMExports();await import('./infrastructure/stripe-manual-payment.mjs');await import('./infrastructure/stripe-manual-payment-auth.mjs');";
+  const script=`
+    import assert from 'node:assert/strict';
+    import {registerHooks,syncBuiltinESMExports} from 'node:module';
+    import {pathToFileURL} from 'node:url';
+    import cp from 'node:child_process';import fs from 'node:fs';
+    import fsp from 'node:fs/promises';import http from 'node:http';import net from 'node:net';
+    const trap=()=>{throw Error('private boundary touched');};
+    // Node 24's ESM loader uses public readFileSync. Supply only these actual
+    // transitive module sources through a loader hook; evaluated code still
+    // receives the unconditional filesystem trap, even for a source filename.
+    const root=pathToFileURL(process.cwd()+'/');
+    const sources=new Set([
+      'stripe-manual-payment.mjs','stripe-manual-payment-options.mjs',
+      'stripe-manual-payment-schema.mjs','stripe-manual-payment-auth.mjs',
+      'stripe-manual-form-options.mjs','stripe-sandbox-acceptance.mjs',
+      'stripe-sandbox-bootstrap.mjs','stripe-sandbox-owned.mjs',
+      'stripe-sandbox-cli.mjs','stripe-sandbox-provision.mjs',
+      'stripe-sandbox-extras.mjs','smoke-stage-5a.mjs',
+    ].map(name=>new URL('infrastructure/'+name,root).href));
+    const readSource=fs.readFileSync;
+    registerHooks({load(url,context,nextLoad){
+      if(url.startsWith('node:'))return nextLoad(url,context);
+      if(!sources.has(url))return trap();
+      return {format:'module',source:readSource(new URL(url),'utf8'),shortCircuit:true};
+    }});
+    cp.execFile=cp.spawn=cp.spawnSync=trap;fs.readFileSync=trap;fsp.readFile=trap;
+    http.createServer=net.createServer=trap;globalThis.fetch=trap;syncBuiltinESMExports();
+    await import('./infrastructure/stripe-manual-payment.mjs');
+    await import('./infrastructure/stripe-manual-payment-auth.mjs');
+    // Negative probes never read the filesystem, including an otherwise allowed
+    // source path. No private path is exempted by suffix or repository prefix.
+    for(const file of ['infrastructure/.env','infrastructure/fixtures/customer-issuer-private.jwks.json',
+      'test-results/stripe-sandbox/synthetic/state.json','docs/local-development.md',
+      'infrastructure/stripe-manual-payment.mjs']){
+      assert.throws(()=>fs.readFileSync(new URL(file,root)),/private boundary touched/);
+      await assert.rejects(async()=>fsp.readFile(new URL(file,root)),/private boundary touched/);
+    }
+  `;
   const result=spawnSync(process.execPath,['--input-type=module','-e',script],{cwd:new URL('..',import.meta.url),env:{PATH:'/usr/bin:/bin',LANG:'C',LC_ALL:'C',NO_COLOR:'1'},encoding:'utf8'});assert.equal(result.status,0,result.stderr);assert.equal(result.stdout,'');
 });
 function cliInput(){return {args:[],env:{...options.env,PAYMENT_STRIPE_SANDBOX_RUN_ID:runId,PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE:expectedSource,PAYMENT_STRIPE_SANDBOX_DAEMON:options.daemon,...Object.fromEntries(Object.entries(options.ports).map(([key,value])=>['PAYMENT_STRIPE_SANDBOX_PORT_'+key.toUpperCase(),String(value)])),PAYMENT_STRIPE_SANDBOX_PORT_MANUAL:String(options.manualPort)}};}
