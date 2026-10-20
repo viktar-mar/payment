@@ -1,11 +1,4 @@
-// Inspect the new flag before any legacy normalization or configuration access.
-function remainderExcluded(env){
-  try{
-    if(!env||typeof env!=='object')return false;
-    const key='PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',d=Object.getOwnPropertyDescriptor(env,key);
-    return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);
-  }catch{return false;}
-}
+import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
 import {proveOwnedContainer,proveOwnedPorts as portProof,CONTAINER_FORMAT,NETWORK_FORMAT,VOLUME_FORMAT} from './stripe-sandbox-ownership.mjs';
 import {execFile} from 'node:child_process';
 import {constants} from 'node:fs';
@@ -123,14 +116,16 @@ export async function createOwnedManualPaymentBootstrap(options,dependencies={})
   return createBootstrap(selected,dependencies,false,true);
 }
 async function createBootstrap(options,dependencies,diagnostic,manualPayment=false) {
-  if(!remainderExcluded(Object.getOwnPropertyDescriptor(options??{},'env')?.value))throw fixed('OPT_IN_REQUIRED');
+  const descriptor=Object.getOwnPropertyDescriptor(options??{},'env');
+  const rawEnv=descriptor?.enumerable&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined;
+  if(!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
   let enabled=false;
-  try {const env=options?.env;enabled=env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPayment?manualPaymentOptIn(env):diagnostic?formDiagnosticOptIn(env):env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true'
+  try {const env=rawEnv;enabled=env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPayment?manualPaymentOptIn(env):diagnostic?formDiagnosticOptIn(env):env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true'
     &&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
   if(!enabled)throw fixed('OPT_IN_REQUIRED');
   let runId,expectedSource,daemon,ports,env,io;
   try {
-    const flags=options.env;
+    const flags=rawEnv;
     if(![undefined,''].includes(flags.DEBUG)||![undefined,''].includes(flags.NODE_DEBUG)||![undefined,'','0'].includes(flags.PWDEBUG))fail();
     runId=options.runId;expectedSource=options.expectedSource;daemon=options.daemon;
     if(typeof runId!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(runId)||EXHAUSTED.has(runId)
@@ -144,7 +139,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     const binding=diagnostic||manualPayment?{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'}:options.approvedBinding;
     if(!object(binding)||Object.keys(binding).sort().join(',')!=='apiVersion,externalAccountId'
       ||binding.externalAccountId!=='acct_1UPiMpELswAd8tpR'||binding.apiVersion!=='2026-09-30.endive')fail();
-    env=Object.freeze(manualPayment?options.env:diagnostic?{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}:
+    env=Object.freeze(manualPayment?rawEnv:diagnostic?{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}:
       {PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',DEBUG:flags.DEBUG,NODE_DEBUG:flags.NODE_DEBUG,PWDEBUG:flags.PWDEBUG});
     const raw=dependencies.execFile??execFile;
     io=Object.freeze({execute:dependencies.execute??((...args)=>executeAwaited(raw,...args)),preflight:dependencies.preflight??(manualPayment?preflightOwnedManualPayment:diagnostic?preflightOwnedFormDiagnostic:preflightOwnedSandbox),

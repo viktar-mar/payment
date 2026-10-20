@@ -1,6 +1,18 @@
 import test,{after,mock} from 'node:test';
 import assert from 'node:assert/strict';
 
+test('factory reuses one own-data env capture despite a substituting Proxy get trap',async()=>{
+  const {createOwnedSandboxProvisioner:create}=await import('./stripe-sandbox-provision.mjs');
+  for(const exotic of [false,true]){
+    let gets=0,captures=0,configuration=0,dependencies=0;
+    const env=Object.assign(exotic?Object.create({unrelated:'ignored'}):{},{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_OWNED_RUN:'true'});
+    const input=new Proxy({env,get bootstrap(){configuration++;throw null;}},{get(target,key){if(key==='env'){gets++;return {};}return Reflect.get(target,key);},getOwnPropertyDescriptor(target,key){if(key==='env')captures++;return Reflect.getOwnPropertyDescriptor(target,key);}});
+    const trap=new Proxy({},{get(){dependencies++;throw null;}});
+    await assert.rejects(()=>create(input,trap,trap));
+    assert.equal(gets,0);assert.equal(captures,1);assert.equal(configuration,1);assert.equal(dependencies,0);
+  }
+});
+
 // Break: new-mode exclusion after normalization or evaluating an accessor.
 test('remainder exclusion precedes snapshots configuration and dependencies',async()=>{
   const {createOwnedSandboxProvisioner:accept}=await import('./stripe-sandbox-provision.mjs'); const base={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_OWNED_RUN:'true'};

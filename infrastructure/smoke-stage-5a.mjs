@@ -1,11 +1,4 @@
-// Inspect the new flag before any legacy normalization or configuration access.
-function remainderExcluded(env){
-  try{
-    if(!env||typeof env!=='object')return false;
-    const key='PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',d=Object.getOwnPropertyDescriptor(env,key);
-    return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);
-  }catch{return false;}
-}
+import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
 import {constants} from 'node:fs';
 import {open,mkdir,lstat,realpath,rename,unlink} from 'node:fs/promises';
 import {dirname,join,resolve} from 'node:path';
@@ -28,6 +21,11 @@ function guard(env) {
   check(remainderExcluded(env),'OPT_IN_REQUIRED');
   check(env.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true','OPT_IN_REQUIRED');
   check(!env.DEBUG&&!env.NODE_DEBUG&&(!env.PWDEBUG||env.PWDEBUG==='0'),'DEBUG_DISABLED_REQUIRED');
+}
+function entryEnv(options){
+  const descriptor=Object.getOwnPropertyDescriptor(options,'env');
+  check(descriptor?descriptor.enumerable&&Object.hasOwn(descriptor,'value'):!('env' in options),'OPT_IN_REQUIRED');
+  return descriptor?.value??process.env;
 }
 function endpoint(value) {
   try {const u=new URL(value);return u.protocol==='http:'&&u.hostname==='127.0.0.1'&&u.port&&u.origin===value&&!u.username&&!u.password&&!u.search&&!u.hash;}catch{return false;}
@@ -79,7 +77,7 @@ async function durable(dir,state,initial=false) {
 }
 /** Explicit local initialization only, after separately authorized known-success provisioning. Never creates platform resources. */
 export async function initializeStripeSandboxState(metadata,options={}) {
-  const env=options.env??process.env;guard(env);
+  const env=entryEnv(options);guard(env);
   let lock,dir;
   try {
     check(exact(metadata,['runId','owners','endpoints','account','site','price','cases']),'STATE');
@@ -118,7 +116,7 @@ export async function verifyStripeSandboxOwnership(state,env=process.env,execute
 }
 /** Shared exclusive command session. Unit tests inject only transport/ownership boundaries. */
 export async function openStripeSandboxFixture(options={}) {
-  const env=options.env??process.env;guard(env);let lock,dir;
+  const env=entryEnv(options);guard(env);let lock,dir;
   try {
     dir=await directory(options.rootDirectory??ROOT,env.PAYMENT_STRIPE_SANDBOX_RUN_ID);
     lock=await open(join(dir,'lock'),'wx',0o600);

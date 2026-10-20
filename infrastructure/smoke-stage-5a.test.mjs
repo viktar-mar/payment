@@ -1,6 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+test('smoke entries reject changing throwing and inherited env containers before guards or private access',async t=>{
+  const api=await import('./smoke-stage-5a.mjs');
+  for(const entry of ['initializeStripeSandboxState','openStripeSandboxFixture','runStripeSandboxSmoke'])for(const shape of ['throwing','changing','inherited'])await t.test(entry+'/'+shape,async()=>{
+    let reads=0,privateReads=0;
+    const flags={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER:'true'};
+    const getter=()=>{reads++;if(shape==='throwing')throw 'secret_canary';return reads===1?{}:flags;};
+    const input=shape==='inherited'?Object.create({get env(){reads++;return flags;}}):Object.defineProperty({},'env',{enumerable:true,get:getter});
+    Object.defineProperty(input,'rootDirectory',{get(){privateReads++;throw null;}});
+    const call=()=>entry==='initializeStripeSandboxState'?api[entry]({},input):api[entry](input);
+    await assert.rejects(call,/OPT_IN_REQUIRED/);
+    assert.equal(reads,0,entry+'/'+shape);assert.equal(privateReads,0,entry+'/'+shape);
+  });
+  for(const entry of ['initializeStripeSandboxState','openStripeSandboxFixture','runStripeSandboxSmoke']){
+    let captures=0,gets=0;
+    const input=new Proxy({env:{PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER:'true'}},{get(target,key){if(key==='env'){gets++;throw null;}return Reflect.get(target,key);},getOwnPropertyDescriptor(target,key){if(key==='env')captures++;return Reflect.getOwnPropertyDescriptor(target,key);}});
+    await assert.rejects(()=>entry==='initializeStripeSandboxState'?api[entry]({},input):api[entry](input),/OPT_IN_REQUIRED/);
+    assert.equal(captures,1);assert.equal(gets,0);
+  }
+});
+
 test('all smoke exports reject raw remainder mode before any private or execute access',async()=>{
   let reads=0;const api=await import('./smoke-stage-5a.mjs');
   for(const shape of ['true','malformed','accessor','hidden','inherited']){

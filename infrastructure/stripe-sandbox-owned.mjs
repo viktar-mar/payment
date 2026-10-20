@@ -1,11 +1,4 @@
-// Inspect the new flag before any legacy normalization or configuration access.
-function remainderExcluded(env){
-  try{
-    if(!env||typeof env!=='object')return false;
-    const key='PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',d=Object.getOwnPropertyDescriptor(env,key);
-    return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);
-  }catch{return false;}
-}
+import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {lstat,realpath} from 'node:fs/promises';

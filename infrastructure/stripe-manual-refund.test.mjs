@@ -1,6 +1,30 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+test('CLI rejects changing throwing and inherited env containers without reading them',async t=>{
+  const {runManualRefundCli:accept}=await import('./stripe-manual-refund.mjs');
+  const flags={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER:'true',PAYMENT_STRIPE_SANDBOX_RUN_ID:'11111111-2222-4333-8444-555555555555',PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE:'e'.repeat(40),PAYMENT_STRIPE_SANDBOX_DAEMON:'unix:///Users/synthetic/docker.sock',PAYMENT_STRIPE_SANDBOX_PORT_MANUAL:'18087'};
+  for(const [index,name]of ['BACKEND','DEMO','RECEIVER','POSTGRES','MAILPITHTTP','MAILPITSMTP'].entries())flags['PAYMENT_STRIPE_SANDBOX_PORT_'+name]=String(18080+index);
+  for(const shape of ['throwing','changing','inherited'])await t.test(shape,async()=>{
+    let reads=0,factories=0;
+    const getter=()=>{reads++;if(shape==='throwing')throw 'secret_canary';return reads===1?{}:flags;};
+    const input=shape==='inherited'?Object.assign(Object.create({get env(){reads++;return flags;}}),{args:[]}):Object.defineProperty({args:[]},'env',{enumerable:true,get:getter});
+    const denied=()=>{factories++;throw null;};
+    const result=await accept(input,{write:async()=>{},subscribe:()=>()=>{},preflight:denied,createBootstrap:denied,openState:denied,createRuntime:denied});
+    assert.equal(result.exitCode,1);assert.equal(reads,0,shape);assert.equal(factories,0,shape);
+  });
+  let captures=0,gets=0;
+  const input=new Proxy({env:flags,args:[]},{get(target,key){if(key==='env'){gets++;throw null;}return Reflect.get(target,key);},getOwnPropertyDescriptor(target,key){if(key==='env')captures++;return Reflect.getOwnPropertyDescriptor(target,key);}});
+  assert.equal((await accept(input,{write:async()=>{},subscribe:()=>()=>{}})).exitCode,1);
+  assert.equal(captures,1);assert.equal(gets,0);
+  let authority=0;
+  const admitted=new Proxy({env:{...flags,PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER:undefined},args:[]},{get(target,key){if(key==='env'){gets++;throw null;}return Reflect.get(target,key);},getOwnPropertyDescriptor(target,key){if(key==='env')captures++;return Reflect.getOwnPropertyDescriptor(target,key);}});
+  captures=0;
+  const denied=()=>{authority++;throw null;};
+  assert.equal((await accept(admitted,{write:async()=>{},subscribe:()=>()=>{},preflight:denied,createBootstrap:denied,openState:denied,createRuntime:denied})).exitCode,1);
+  assert.equal(captures,1);assert.equal(gets,0);assert.equal(authority,1);
+});
+
 // Break: new-mode exclusion after normalization or evaluating an accessor.
 test('remainder exclusion precedes snapshots configuration and dependencies',async()=>{
   const {runManualRefundCli:accept}=await import('./stripe-manual-refund.mjs'); const base={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'};
@@ -11,7 +35,7 @@ test('remainder exclusion precedes snapshots configuration and dependencies',asy
     Object.assign(raw,{PAYMENT_STRIPE_SANDBOX_RUN_ID:'11111111-2222-4333-8444-555555555555',PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE:'e'.repeat(40),PAYMENT_STRIPE_SANDBOX_DAEMON:'unix:///Users/synthetic/docker.sock',PAYMENT_STRIPE_SANDBOX_PORT_MANUAL:'18087'});
     for(const [index,name]of ['BACKEND','DEMO','RECEIVER','POSTGRES','MAILPITHTTP','MAILPITSMTP'].entries())raw['PAYMENT_STRIPE_SANDBOX_PORT_'+name]=String(18080+index);
     const denied=()=>{reads++;throw null;};
-    const value=await accept({env:raw,args:[]},{write:async()=>{},subscribe:()=>()=>{},openState:denied,createRuntime:denied});
+    const value=await accept({env:raw,args:[]},{write:async()=>{},subscribe:()=>()=>{},preflight:denied,createBootstrap:denied,openState:denied,createRuntime:denied});
     assert.equal(value.exitCode,1);
   }
   assert.equal(reads,0);

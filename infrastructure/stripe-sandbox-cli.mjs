@@ -1,11 +1,4 @@
-// Inspect the new flag before any legacy normalization or configuration access.
-function remainderExcluded(env){
-  try{
-    if(!env||typeof env!=='object')return false;
-    const key='PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER',d=Object.getOwnPropertyDescriptor(env,key);
-    return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);
-  }catch{return false;}
-}
+import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
 import {execFile,spawn} from 'node:child_process';
 import {lstat,realpath,readdir,open} from 'node:fs/promises';
 import {constants} from 'node:fs';
@@ -74,13 +67,15 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
 }
 async function createCliAdapter(options,dependencies,purpose) {
   const remainderMode=purpose===REMAINDER,refundMode=purpose===REFUND||remainderMode;
-  if(!remainderMode&&!remainderExcluded(Object.getOwnPropertyDescriptor(options??{},'env')?.value))throw fixed('OPT_IN_REQUIRED');
+  const descriptor=Object.getOwnPropertyDescriptor(options??{},'env');
+  const rawEnv=descriptor?.enumerable&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined;
+  if(!remainderMode&&!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
   let enabled=false,manualPaymentMode=false;
-  try {const optIn=options?.env;manualPaymentMode=!refundMode&&optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=remainderMode?manualRefundRemainderOptIn(optIn):refundMode?manualRefundOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
+  try {const optIn=rawEnv;manualPaymentMode=!refundMode&&optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=remainderMode?manualRefundRemainderOptIn(optIn):refundMode?manualRefundOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {
-    const env=options.env;
+    const env=rawEnv;
     if(![undefined,''].includes(env.DEBUG)||![undefined,''].includes(env.NODE_DEBUG)||![undefined,'','0'].includes(env.PWDEBUG))fail();
     runId=options.runId;cliDirectory=options.cliDirectory;backendPort=options.backendPort;
     const binding=options.approvedBinding;

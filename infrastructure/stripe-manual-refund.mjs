@@ -210,9 +210,9 @@ export async function runManualRefund(options,originalLimits,deps={}){
 /** Zero arguments, flags and new authority only. No private environment snapshot. */
 export async function runManualRefundCli(input,deps={}){
   let selected,started;
-  try{const env=Object.fromEntries(FLAGS.map(k=>[k,data(input.env,k)]));
+  try{const rawEnv=data(input,'env');const env=Object.fromEntries(FLAGS.map(k=>[k,data(rawEnv,k)]));
     if(!manualRefundOptIn(env)||!Array.isArray(input.args)||input.args.length)throw null;
-    selected=validateManualRefundOptions({env,runId:data(input.env,'PAYMENT_STRIPE_SANDBOX_RUN_ID'),expectedSource:data(input.env,'PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE'),daemon:data(input.env,'PAYMENT_STRIPE_SANDBOX_DAEMON')});
+    selected=validateManualRefundOptions({env,runId:data(rawEnv,'PAYMENT_STRIPE_SANDBOX_RUN_ID'),expectedSource:data(rawEnv,'PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE'),daemon:data(rawEnv,'PAYMENT_STRIPE_SANDBOX_DAEMON')});
     if(selected)started=(deps.now??Date.now)();
   }catch{selected=null;}
   const controller=new AbortController();let unsubscribe,value=rejected();

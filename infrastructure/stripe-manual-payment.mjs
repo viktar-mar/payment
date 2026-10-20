@@ -143,11 +143,12 @@ function rawData(env,key){const d=Object.getOwnPropertyDescriptor(env,key);if(d&
 export async function runManualPaymentCli(input,deps={}){
   let selected,started;
   try{
-    const env=Object.fromEntries(FLAGS.map(key=>[key,rawData(input.env,key)]));
+    const rawEnv=rawData(input,'env');
+    const env=Object.fromEntries(FLAGS.map(key=>[key,rawData(rawEnv,key)]));
     if(!manualPaymentOptIn(env)||!Array.isArray(input.args)||input.args.length)throw null;
     started=(deps.now??Date.now)();
-    const number=key=>{const raw=rawData(input.env,key);if(typeof raw!=='string'||!/^[1-9][0-9]{3,4}$/.test(raw))throw null;return Number(raw);};
-    selected=validateManualPaymentOptions({env,runId:rawData(input.env,'PAYMENT_STRIPE_SANDBOX_RUN_ID'),expectedSource:rawData(input.env,'PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE'),daemon:rawData(input.env,'PAYMENT_STRIPE_SANDBOX_DAEMON'),ports:Object.fromEntries(PORTS.map(key=>[key,number('PAYMENT_STRIPE_SANDBOX_PORT_'+key.toUpperCase())])),manualPort:number('PAYMENT_STRIPE_SANDBOX_PORT_MANUAL')});
+    const number=key=>{const raw=rawData(rawEnv,key);if(typeof raw!=='string'||!/^[1-9][0-9]{3,4}$/.test(raw))throw null;return Number(raw);};
+    selected=validateManualPaymentOptions({env,runId:rawData(rawEnv,'PAYMENT_STRIPE_SANDBOX_RUN_ID'),expectedSource:rawData(rawEnv,'PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE'),daemon:rawData(rawEnv,'PAYMENT_STRIPE_SANDBOX_DAEMON'),ports:Object.fromEntries(PORTS.map(key=>[key,number('PAYMENT_STRIPE_SANDBOX_PORT_'+key.toUpperCase())])),manualPort:number('PAYMENT_STRIPE_SANDBOX_PORT_MANUAL')});
   }catch{selected=null;}
   const controller=new AbortController(),stop=()=>controller.abort();
   const subscribe=deps.subscribe??(callback=>{process.once('SIGINT',callback);process.once('SIGTERM',callback);return ()=>{process.removeListener('SIGINT',callback);process.removeListener('SIGTERM',callback);};});

@@ -165,12 +165,13 @@ function rawData(env,key){
 export async function runManualFormCli(input,dependencies={}){
   let selected,started;
   try{
-    const env=Object.fromEntries(FLAGS.map(key=>[key,rawData(input.env,key)]));
+    const rawEnv=rawData(input,'env');
+    const env=Object.fromEntries(FLAGS.map(key=>[key,rawData(rawEnv,key)]));
     if(!manualFormOptIn(env)||!Array.isArray(input.args)||input.args.length!==0)throw null;
     started=(dependencies.now??Date.now)();
-    const number=key=>{const value=rawData(input.env,key);if(typeof value!=='string'||! /^[1-9][0-9]{3,4}$/.test(value))throw null;return Number(value);};
-    selected=validateManualFormOptions({env,runId:rawData(input.env,'PAYMENT_STRIPE_SANDBOX_RUN_ID'),expectedSource:rawData(input.env,'PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE'),
-      daemon:rawData(input.env,'PAYMENT_STRIPE_SANDBOX_DAEMON'),ports:Object.fromEntries(PORTS.map(key=>[key,number('PAYMENT_STRIPE_SANDBOX_PORT_'+key.toUpperCase())])),manualPort:number('PAYMENT_STRIPE_SANDBOX_PORT_MANUAL')});
+    const number=key=>{const value=rawData(rawEnv,key);if(typeof value!=='string'||! /^[1-9][0-9]{3,4}$/.test(value))throw null;return Number(value);};
+    selected=validateManualFormOptions({env,runId:rawData(rawEnv,'PAYMENT_STRIPE_SANDBOX_RUN_ID'),expectedSource:rawData(rawEnv,'PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE'),
+      daemon:rawData(rawEnv,'PAYMENT_STRIPE_SANDBOX_DAEMON'),ports:Object.fromEntries(PORTS.map(key=>[key,number('PAYMENT_STRIPE_SANDBOX_PORT_'+key.toUpperCase())])),manualPort:number('PAYMENT_STRIPE_SANDBOX_PORT_MANUAL')});
   }catch{selected=null;}
   const controller=new AbortController();
   const stop=()=>controller.abort();
