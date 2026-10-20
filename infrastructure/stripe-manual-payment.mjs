@@ -2,6 +2,7 @@ import {resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {manualPaymentOptIn,validateManualPaymentOptions} from './stripe-manual-payment-options.mjs';
 import {validateManualPaymentReport,formatManualPaymentReport} from './stripe-manual-payment-schema.mjs';
+import {formatManualPaymentAuthDiagnostic} from './stripe-manual-payment-auth.mjs';
 const ROOT=fileURLToPath(new URL('..',import.meta.url)).replace(/\/$/,'');
 const EMPTY=Object.freeze({version:1,mode:'MANUAL_PAYMENT',result:'FAILED',phase:'ADMISSION',confirmation_granted:false,payment_confirmed:false,provider_confirmed:false,webhook_verified:false,journal_verified:false,callback_verified:false,gateway_closed:false,listener_closed:false,runtime_closed:false,browser_closure:'NOT_OWNED',provenance:'CONTROLLER_REPORTED'});
 const rejected=()=>Object.freeze({report:EMPTY,exitCode:1});
@@ -27,6 +28,7 @@ export async function runManualPayment(options,originalLimits,deps={}){
   const origin='http://127.0.0.1:'+selected.manualPort,canonical=origin+'/manual-payment.html';
   let phase='PREPARE',failed=false,closing=false,grantUsed=false,granted=false,unused=false,authStarted=false,authCompleted=false,bootstrap,cli,provisioner,gateway;
   let gatewayAttempted=false,cliAttempted=false,bootstrapAttempted=false;
+  let authDiagnostic,authDiagnosticFinalized=false;
   const proof={...EMPTY},work=new Set(),runtimeWork=new Set(),childWork=new Set(),closeTasks=new Map();let runtimeStopReleased=false;
   function active(){return !lifetime.signal.aborted&&!input.signal?.aborted&&now()<limits.deadline;}
   function check(){if(failed||closing||!active())throw null;}
@@ -61,7 +63,7 @@ export async function runManualPayment(options,originalLimits,deps={}){
     await operation(()=>createCli(Object.freeze({env:selected.env,runId:selected.runId,cliDirectory:safe.cliDirectory,backendPort:selected.ports.backend,accountKey:'stripe-sandbox-default',approvedBinding:Object.freeze({externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'}),persistWebhookSecret:bootstrap.persistWebhookSecret,verifyForwardTarget:bootstrap.verifyForwardTarget})),acquired('cli','stopListener',value=>{cli=value;}));
     phase='AUTHORIZATION';authStarted=true;
     const authorize=deps.authorizeCli??(await import('./stripe-manual-payment-auth.mjs')).authorizeManualPaymentCli;
-    await requireTrue(()=>authorize({cli,runId:selected.runId},limits,line=>operation(()=>(deps.write??stdout)(line))),'children');
+    await requireTrue(async()=>{try{return await authorize({cli,runId:selected.runId},limits,line=>operation(()=>(deps.write??stdout)(line)));}catch(error){if(!authDiagnosticFinalized)authDiagnostic??=formatManualPaymentAuthDiagnostic(error);throw null;}},'children');
     authCompleted=true;
     phase='BINDING';await requireTrue(()=>cli.validateBinding(limits),'children');
     phase='LISTENER';await requireTrue(()=>cli.startListener(limits),'children');
@@ -120,6 +122,14 @@ export async function runManualPayment(options,originalLimits,deps={}){
     // All late work is observed. Positive closure requires it to have settled;
     // timeout still leaves each acquired capability's one close attempt owned.
     try{while(work.size)await bounded(Promise.allSettled([...work]),cleanup.deadline);}catch{failed=true;}
+    // Keep timeout fallback provisional until the existing child/work drain can
+    // deliver its first classified failure; later settlement cannot change it.
+    if(authStarted&&!authCompleted)authDiagnostic??=formatManualPaymentAuthDiagnostic(undefined);
+    authDiagnosticFinalized=true;
+    if(authDiagnostic&&deps.writeAuthDiagnostic){
+      const diagnosticDeadline=Math.min(cleanup.deadline,now()+1000);
+      try{if(now()>=diagnosticDeadline)throw null;await bounded(Promise.resolve().then(()=>{if(now()>=diagnosticDeadline)throw null;return deps.writeAuthDiagnostic(authDiagnostic);}),diagnosticDeadline);}catch{failed=true;}
+    }
     clearTimer(timer);input.signal?.removeEventListener('abort',abort);
   }
   if(input.signal?.aborted)failed=true;
@@ -156,7 +166,7 @@ export async function runManualPaymentCli(input,deps={}){
   }finally{unsubscribe?.();}
 }
 export async function runManualPaymentEntry(input,capabilities,deps={}){
-  let code=1;try{const value=await runManualPaymentCli(input,Object.create(deps,{write:{value:stdoutWriter(capabilities.stdout)}}));code=value.exitCode;}catch{}
+  let code=1;try{const value=await runManualPaymentCli(input,Object.create(deps,{write:{value:stdoutWriter(capabilities.stdout)},...(capabilities.stderr?{writeAuthDiagnostic:{value:stdoutWriter(capabilities.stderr)}}:{})}));code=value.exitCode;}catch{}
   capabilities.exit(code);
 }
-if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))void runManualPaymentEntry({env:process.env,args:process.argv.slice(2)},{stdout:process.stdout,exit:code=>process.exit(code)});
+if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))void runManualPaymentEntry({env:process.env,args:process.argv.slice(2)},{stdout:process.stdout,stderr:process.stderr,exit:code=>process.exit(code)});

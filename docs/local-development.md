@@ -922,6 +922,30 @@ be printed first: use only that exact handoff, then keep the original terminal o
 An expired code is a stopped attempt, never permission to run another login. No
 global credentials, Keychain, live flag or arbitrary `next_step` command is used.
 
+Completion permits at most one exact stdout line from pinned CLI `1.52.0`:
+`Warning: the system keyring is unavailable. Your credentials have been stored unencrypted in <ROOT>/test-results/stripe-sandbox/<RUN_ID>/cli/config/stripe/credentials.json`.
+`<ROOT>` is this checkout's fixed root and `<RUN_ID>` is the original invocation's
+UUID. Raw type, size and control checks run first; both channels together remain
+bounded to 65536 bytes. Other warning paths, extra text on that line, duplicates,
+stderr warnings and login-init JSON receive no exception. Remaining output still
+passes the credential-marker scan. This warning never proves authorization or
+account identity: callback success, actual child close exit 0 and independent
+account binding remain required. Offline synthetic coverage does not establish
+that this warning was the sole cause of a prior failure or that a live run succeeds.
+
+If authorization fails, the direct entry attempts one stderr JSON line after its
+independent cleanup attempts and before the unchanged final report. Its only fields
+are `tag="stripe_manual_payment_auth_diagnostic"`, `stage` and `reason`; it is at
+most 256 UTF-8 bytes. Stages are LOGIN, HANDOFF, COMPLETE or UNKNOWN. Reasons are
+DESCRIPTOR_INVALID, PROCESS_FAILED, CHILD_CLOSE_UNCONFIRMED, TIMEOUT, ABORTED,
+OUTPUT_INVALID, OUTPUT_UNSAFE, HANDOFF_INVALID, HANDOFF_FAILED or INTERNAL.
+Unknown errors map to UNKNOWN/INTERNAL. The diagnostic uses only module-owned finite
+classifications, never raw output, error messages/stacks, paths, account identifiers,
+credentials or device codes. Successful authorization and later binding failures
+produce no authorization diagnostic. Emission has at most one second, clipped to
+the original cleanup ceiling; a failed or stalled write remains PENDING/exit 1 and
+cannot renew authority, retry authorization or enable financial work.
+
 The original active deadline is 45 minutes from entry, including build and human CLI
 authorization; cleanup ends at that same deadline plus two minutes. Login has at most
 three minutes, completion ten minutes, and actual child-close proof ten seconds of

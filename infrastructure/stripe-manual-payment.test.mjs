@@ -1,5 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
+import {EventEmitter} from 'node:events';
+import {authorizeManualPaymentCli} from './stripe-manual-payment-auth.mjs';
 const module=await import('./stripe-manual-payment.mjs').catch(()=>({}));
 const {runManualPayment=async()=>({report:{result:'FAILED'},exitCode:1}),runManualPaymentCli=async()=>({exitCode:1})}=module;
 const runId='7deaf3e1-1247-4d80-9cf5-67ebcd24429a',expectedSource='a'.repeat(40);
@@ -154,4 +156,72 @@ test('listener lost after fresh baseline denies durable dispatch and a Promise c
     const f=fixture();f.cli.assertManualPaymentListener=assertion;const value=await runManualPayment(options,f.limits,f.deps);
     assert.equal(value.report.result,'PENDING');assert.equal(value.report.confirmation_granted,false);assert.ok(!f.calls.includes('durablePermit'));assert.ok(!f.calls.includes('unusedProvider'));
   }
+});
+function actualAuth(f,settings={}){
+  const root=new URL('..',import.meta.url).pathname.replace(/\/$/,''),directory=root+'/test-results/stripe-sandbox/'+runId+'/cli';let dispatches=0;
+  const descriptor=complete=>Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze(['-p','(version 1)(allow default)(deny process-exec (literal "/usr/bin/security"))','/opt/homebrew/bin/stripe','--config',directory+'/config/stripe/config.toml','--project-name','default','--color','off','--log-level','error','login',...(complete?['--complete-device']:[])]),options:Object.freeze({cwd:root,env:Object.freeze({PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C',HOME:directory+'/home',XDG_CONFIG_HOME:directory+'/config',NO_COLOR:'1'}),shell:false,stdio:Object.freeze(['pipe','pipe','pipe']),timeout:complete?600000:180000,maxBuffer:65536})});
+  f.cli.loginInvocation=async()=>descriptor(false);f.cli.completeLoginInvocation=async()=>descriptor(true);
+  f.deps.authorizeCli=(input,limits,handoff)=>authorizeManualPaymentCli(input,limits,handoff,{now:f.deps.now,setTimeout:f.deps.setTimeout,clearTimeout:f.deps.clearTimeout,execFile:(file,args,options,callback)=>{
+    const child=new EventEmitter(),complete=++dispatches===2;queueMicrotask(()=>{if(complete&&settings.onCompletion){settings.onCompletion({child,callback});return;}callback(null,complete?(settings.completion??'Done.\n'):JSON.stringify({browser_url:'https://dashboard.stripe.com/stripecli/confirm_auth?t=synthetic',verification_code:'alpha-bravo',next_step:'stripe login --complete-device'}),'');child.emit('close',complete?(settings.closeCode??0):0,null);});return child;
+  }});return ()=>dispatches;
+}
+test('real auth through controller and entry emits one safe stderr diagnostic after cleanup before final report',async()=>{
+  const f=fixture(),dispatches=actualAuth(f,{completion:'password=synthetic-private'}),out=[],err=[],order=[];let code;
+  const stream=(lines,name)=>Object.assign(new EventEmitter(),{write(text,done){lines.push(text);order.push(name);done();return true;}});
+  f.deps.subscribe=()=>()=>{};const stop=f.bootstrap.stop;f.bootstrap.stop=async limits=>{const value=await stop(limits);order.push('stop');return value;};
+  await module.runManualPaymentEntry(cliInput(),{stdout:stream(out,'stdout'),stderr:stream(err,'stderr'),exit:value=>{code=value;}},f.deps);
+  assert.equal(code,1);assert.equal(dispatches(),2);assert.equal(err.length,1);assert.deepEqual(JSON.parse(err[0]),{tag:'stripe_manual_payment_auth_diagnostic',stage:'COMPLETE',reason:'OUTPUT_UNSAFE'});
+  assert.ok(order.indexOf('stop')<order.indexOf('stderr'));assert.equal(order.at(-1),'stdout');assert.equal(out.filter(line=>line.startsWith('{')).length,1);assert.ok(!out.join('').includes('synthetic-private'));assert.ok(!f.calls.includes('binding'));assert.ok(!f.calls.includes('provision'));assert.equal(JSON.parse(out.at(-1)).listener_closed,false);
+});
+for(const settings of [{},{closeCode:1}])test('actual auth close determines binding and diagnostic independently '+JSON.stringify(settings),async()=>{
+  const f=fixture(),err=[];actualAuth(f,settings);f.deps.writeAuthDiagnostic=async line=>err.push(line);const value=await runManualPayment(options,f.limits,f.deps);
+  assert.equal(value.exitCode,settings.closeCode?1:0);assert.equal(err.length,settings.closeCode?1:0);assert.equal(f.calls.includes('binding'),!settings.closeCode);if(settings.closeCode)assert.equal(JSON.parse(err[0]).reason,'PROCESS_FAILED');
+});
+test('later binding failure emits no fabricated authorization diagnostic',async()=>{
+  const f=fixture({fail:'binding'}),err=[];actualAuth(f);f.deps.writeAuthDiagnostic=async line=>err.push(line);const value=await runManualPayment(options,f.limits,f.deps);assert.equal(value.exitCode,1);assert.equal(err.length,0);
+});
+test('hostile authorization rejection emits finite fallback without property reads',async()=>{
+  const f=fixture(),err=[];let reads=0;f.deps.authorizeCli=async()=>{throw new Proxy({},{get(){reads++;throw null;},getPrototypeOf(){reads++;throw null;}});};f.deps.writeAuthDiagnostic=async line=>err.push(line);
+  const value=await runManualPayment(options,f.limits,f.deps);assert.equal(value.exitCode,1);assert.equal(reads,0);assert.deepEqual(JSON.parse(err[0]),{tag:'stripe_manual_payment_auth_diagnostic',stage:'UNKNOWN',reason:'INTERNAL'});
+});
+for(const mode of ['reject','stall','ceiling'])test('diagnostic writer '+mode+' retains proof one final report and original bounds',async()=>{
+  const f=fixture(),writes=[],diagnostics=[];actualAuth(f,{completion:'password=synthetic-private'});f.deps.subscribe=()=>()=>{};f.deps.write=async line=>writes.push(line);
+  const stop=f.bootstrap.stop;f.bootstrap.stop=async limits=>{const value=await stop(limits);if(mode==='ceiling')f.clock.value=2820500;return value;};
+  f.deps.writeAuthDiagnostic=line=>{diagnostics.push(line);if(mode==='reject')throw null;return new Promise(()=>{});};
+  let settled=false;const task=runManualPaymentCli(cliInput(),f.deps).then(value=>{settled=true;return value;});await f.tick(1000);
+  assert.equal(diagnostics.length,1);if(mode!=='reject'){assert.equal(settled,false);await f.tick(mode==='ceiling'?2821000:2000);}
+  const value=await task;assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(value.report.listener_closed,false);assert.equal(value.report.runtime_closed,mode!=='ceiling');assert.equal(writes.filter(line=>line.startsWith('{')).length,1);assert.ok(!f.calls.includes('binding'));assert.ok(!f.calls.includes('provision'));assert.equal(f.timers.size,0);
+});
+for(const mode of ['reject','stall'])test('entry stderr '+mode+' cannot prevent sole final stdout attempt',async()=>{
+  const f=fixture(),out=[];actualAuth(f,{completion:'password=synthetic-private'});f.deps.subscribe=()=>()=>{};let writes=0,code;
+  const stdout=Object.assign(new EventEmitter(),{write(text,done){out.push(text);done();}}),stderr=Object.assign(new EventEmitter(),{write(text,done){writes++;if(mode==='reject')done(Error('synthetic write failure'));}});
+  const task=module.runManualPaymentEntry(cliInput(),{stdout,stderr,exit:value=>{code=value;}},f.deps);await f.tick(1000);if(mode==='stall')await f.tick(2000);await task;
+  assert.equal(code,1);assert.equal(writes,1);assert.equal(out.filter(line=>line.startsWith('{')).length,1);assert.equal(JSON.parse(out.at(-1)).payment_confirmed,false);assert.ok(!f.calls.includes('binding'));assert.equal(f.timers.size,0);
+});
+for(const window of ['one-second','cleanup'])test('diagnostic deferred dispatch rechecks the original '+window+' cutoff when the clock crosses after scheduling',async()=>{
+  const f=fixture(),diagnostics=[],writes=[];actualAuth(f,{completion:'password=synthetic-private'});f.deps.subscribe=()=>()=>{};f.deps.write=async line=>writes.push(line);f.deps.writeAuthDiagnostic=async line=>diagnostics.push({at:f.clock.value,line});
+  if(window==='cleanup'){const stop=f.bootstrap.stop;f.bootstrap.stop=async limits=>{const value=await stop(limits);f.clock.value=2820500;return value;};}
+  const schedule=f.deps.setTimeout;let crossed=false;
+  f.deps.setTimeout=(fn,delay)=>{if(!crossed&&delay===(window==='cleanup'?500:1000)&&f.calls.includes('stop')){crossed=true;f.clock.value=window==='cleanup'?2821000:2000;}return schedule(fn,delay);};
+  const value=await runManualPaymentCli(cliInput(),f.deps);
+  assert.equal(crossed,true);assert.equal(diagnostics.length,0);assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(writes.filter(line=>line.startsWith('{')).length,1);assert.ok(!f.calls.includes('binding'));assert.ok(!f.calls.includes('provision'));assert.equal(f.timers.size,0);
+});
+test('real authorization retains its first completion failure arriving during original close grace after controller timeout',async()=>{
+  const f=fixture(),diagnostics=[];f.limits.deadline=401000;let completion;let reads=0;
+  const dispatches=actualAuth(f,{onCompletion:value=>{completion=value;}});f.deps.writeAuthDiagnostic=async line=>diagnostics.push(line);
+  const task=runManualPayment(options,f.limits,f.deps);await f.tick(1000);assert.equal(dispatches(),2);
+  await f.tick(400999);completion.callback(new Proxy({},{get(){reads++;throw null;},getPrototypeOf(){reads++;throw null;}}),'','');
+  await f.tick(401000);assert.equal(diagnostics.length,0);assert.ok(!f.calls.includes('stop'));
+  await f.tick(410999);const value=await task;
+  assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(value.report.listener_closed,false);assert.equal(value.report.runtime_closed,true);assert.equal(reads,0);
+  assert.equal(diagnostics.length,1);assert.deepEqual(JSON.parse(diagnostics[0]),{tag:'stripe_manual_payment_auth_diagnostic',stage:'COMPLETE',reason:'PROCESS_FAILED'});assert.ok(!f.calls.includes('binding'));assert.ok(!f.calls.includes('provision'));
+  completion.callback(null,'Done.\n','');completion.child.emit('close',0,null);await f.tick(411000);assert.equal(diagnostics.length,1);assert.equal(value.report.result,'PENDING');assert.equal(dispatches(),2);assert.equal(f.timers.size,0);
+});
+test('real authorization late success cannot revive expired controller authority or emit after final report',async()=>{
+  const f=fixture(),diagnostics=[];f.limits.deadline=401000;let completion;
+  const dispatches=actualAuth(f,{onCompletion:value=>{completion=value;}});f.deps.writeAuthDiagnostic=async line=>diagnostics.push(line);
+  const task=runManualPayment(options,f.limits,f.deps);await f.tick(1000);await f.tick(401000);assert.equal(diagnostics.length,0);
+  completion.callback(null,'Done.\n','');completion.child.emit('close',0,null);await f.tick(401001);const value=await task;
+  assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(value.report.listener_closed,false);assert.equal(diagnostics.length,1);assert.deepEqual(JSON.parse(diagnostics[0]),{tag:'stripe_manual_payment_auth_diagnostic',stage:'COMPLETE',reason:'ABORTED'});assert.ok(!f.calls.includes('binding'));assert.ok(!f.calls.includes('provision'));
+  await f.tick(521000);assert.equal(diagnostics.length,1);assert.equal(dispatches(),2);assert.equal(f.timers.size,0);
 });
