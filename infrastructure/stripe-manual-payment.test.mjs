@@ -118,6 +118,7 @@ test('inert imports neither read private credentials nor launch any subprocess o
       'stripe-manual-form-options.mjs','stripe-sandbox-acceptance.mjs',
       'stripe-sandbox-bootstrap.mjs','stripe-sandbox-owned.mjs',
       'stripe-sandbox-cli.mjs','stripe-sandbox-provision.mjs',
+      'stripe-sandbox-ownership.mjs','stripe-manual-refund-options.mjs',
       'stripe-sandbox-extras.mjs','smoke-stage-5a.mjs',
     ].map(name=>new URL('infrastructure/'+name,root).href));
     const readSource=fs.readFileSync;

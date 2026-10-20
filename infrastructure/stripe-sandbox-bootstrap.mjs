@@ -1,3 +1,4 @@
+import {proveOwnedContainer,proveOwnedPorts as portProof,CONTAINER_FORMAT,NETWORK_FORMAT,VOLUME_FORMAT} from './stripe-sandbox-ownership.mjs';
 import {execFile} from 'node:child_process';
 import {constants} from 'node:fs';
 import {lstat,realpath,readFile,readdir,mkdir,open,rename,unlink} from 'node:fs/promises';
@@ -66,20 +67,6 @@ function executeAwaited(execute,file,args,settings) {
     } catch(error) {rejectExecution(childFailure(error,settings.signal));}
   });
 }
-
-// Only booleans derived inside the daemon, never Config.Env or any value, cross this boundary.
-const STRIPE_PREDICATE='{{$present := false}}{{$disabled := false}}{{range .Config.Env}}{{$n := index (split . "=") 0}}'+
-  '{{if or (eq $n "PAYMENT_STRIPE_SANDBOX_SECRET_KEY") (eq $n "PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY") (eq $n "PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET")}}{{$present = true}}{{end}}'+
-  '{{if eq . "PAYMENT_STRIPE_SANDBOX_ENABLED=false"}}{{$disabled = true}}{{end}}{{end}}'+
-  '"StripeKeyPresent":{{$present}},"SandboxDisabled":{{$disabled}}';
-const CONTAINER_FORMAT='{ '+STRIPE_PREDICATE+',"Id":{{json .ID}},"Name":{{json .Name}},"Image":{{json .Image}},"Labels":{{json .Config.Labels}},'+
-  '"State":{"Status":{{json .State.Status}},"Running":{{json .State.Running}},"ExitCode":{{json .State.ExitCode}},"StartedAt":{{json .State.StartedAt}},'+
-  '"Health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}}},"Mounts":{{json .Mounts}},'+
-  '"Networks":{ {{$first := true}}{{range $name, $network := .NetworkSettings.Networks}}{{if not $first}},{{end}}{{$first = false}}{{json $name}}:{"NetworkID":{{json $network.NetworkID}}}{{end}} },'+
-  '"PortBindings":{{json .HostConfig.PortBindings}},"Ports":{{json .NetworkSettings.Ports}},"User":{{json .Config.User}},'+
-  '"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"NetworkMode":{{json .HostConfig.NetworkMode}},"CapAdd":{{json .HostConfig.CapAdd}},"CapDrop":{{json .HostConfig.CapDrop}}}';
-const NETWORK_FORMAT='{"Id":{{json .ID}},"Name":{{json .Name}},"Labels":{{json .Labels}},"Driver":{{json .Driver}},"Scope":{{json .Scope}}}';
-const VOLUME_FORMAT='{"Name":{{json .Name}},"CreatedAt":{{json .CreatedAt}},"Driver":{{json .Driver}},"Scope":{{json .Scope}},"Labels":{{json .Labels}}}';
 
 async function available(port,host,context,io) {
   return new Promise(resolveProbe=>{
@@ -372,17 +359,6 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       backend:[['8080/tcp',ports.backend]],'demo-site':[['8080/tcp',ports.demo]],'callback-receiver':[['8080/tcp',ports.receiver]]}[service]??[];
     return Object.fromEntries(pairs.map(([container,host])=>[container,[{HostIp:'127.0.0.1',HostPort:String(host)}]]));
   }
-  function portProof(actual,expected) {
-    if(actual===null&&Object.keys(expected).length===0)return;
-    if(!object(actual)||Object.keys(actual).sort().join(',')!==Object.keys(expected).sort().join(','))fail();
-    for(const key of Object.keys(expected))if(!same(actual[key],expected[key]))fail();
-  }
-  function livePortProof(actual,service) {
-    if(!object(actual))fail();
-    // Mailpit exposes POP3 without publishing it. No other extra port is admitted.
-    const published=Object.fromEntries(Object.entries(actual).filter(([port,binding])=>!(service==='mailpit'&&port==='1110/tcp'&&binding===null)));
-    portProof(published,expectedPorts(service));
-  }
   function expectedMounts(service) {
     return {postgres:[{Type:'volume',Name:volumeNames.postgres,Destination:'/var/lib/postgresql',RW:true}],
       backend:[{Type:'volume',Name:volumeNames.issuer,Destination:'/app/local-fixtures',RW:false}],
@@ -395,51 +371,12 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     for(const volume of Object.values(recorded.volumes))if(!same(await inspect('volume',volume.Name,VOLUME_FORMAT,context),volume))fail();
   }
   async function containerProof(service,selector,context,{liveRequired=false,neverStarted=false,cleanupOnly=false}={}) {
-    const value=await inspect('container',selector,CONTAINER_FORMAT,context),helper=service.startsWith('issuer-');
-    const recordedContainer=recorded.containers[service],sourceImage=recorded.images[helper?'backend':service];
-    if(!fullId(value.Id)||(recordedContainer&&value.Id!==recordedContainer.id)||value.Name!=='/'+project+'-'+service||value.Image!==sourceImage.id||!object(value.Labels))fail();
-    for(const [key,label] of Object.entries(containerLabels(service)))if(value.Labels[key]!==label)fail();
-    if(!Array.isArray(value.Mounts)||value.Mounts.length!==expectedMounts(service).length)fail();
-    for(const expected of expectedMounts(service)) {
-      const mount=value.Mounts.find(candidate=>candidate.Destination===expected.Destination);
-      if(!mount||Object.entries(expected).some(([key,want])=>mount[key]!==want))fail();
-    }
-    if(!object(value.Networks))fail();
-    if(helper) {
-      const names=Object.keys(value.Networks);
-      const planned=neverStarted&&!liveRequired&&value.State?.Status==='created'&&value.State.Running===false&&value.State.StartedAt==='0001-01-01T00:00:00Z';
-      const stoppedCleanup=cleanupOnly&&!liveRequired&&value.State?.Status==='exited'&&value.State.Running===false&&value.State.ExitCode===0
-        &&recordedContainer?.status==='exited'&&recordedContainer.startedAt!=='0001-01-01T00:00:00Z'&&recordedContainer.startedAt===value.State.StartedAt;
-      const actual=value.Networks.none?.NetworkID;
-      if(names.length>1||(names.length===1&&(names[0]!=='none'||(!fullId(actual)&&!(actual===''&&(planned||stoppedCleanup))))))fail();
-    } else {
-      if(Object.keys(value.Networks).length!==1||!object(value.Networks[networkName]))fail();
-      const actual=value.Networks[networkName].NetworkID;
-      const planned=!liveRequired&&value.State?.Status==='created'&&value.State.Running===false&&value.State.StartedAt==='0001-01-01T00:00:00Z';
-      const stoppedCleanup=cleanupOnly&&!liveRequired&&value.State?.Status==='exited'&&value.State.Running===false
-        &&recordedContainer?.startedAt!=='0001-01-01T00:00:00Z'&&recordedContainer?.startedAt===value.State.StartedAt;
-      if(actual!==recorded.network.Id&&!(actual===''&&(planned||stoppedCleanup)))fail();
-      if(![networkName,recorded.network.Id].includes(value.NetworkMode))fail();
-      if(planned||stoppedCleanup)await infrastructureProof(context);
-    }
-    if(helper&&value.NetworkMode!=='none')fail();
-    portProof(value.PortBindings,expectedPorts(service));
-    if(typeof value.StripeKeyPresent!=='boolean'||typeof value.SandboxDisabled!=='boolean')fail();
-    if(service!=='backend'&&value.StripeKeyPresent)fail();
-    if(service==='backend'&&((retired||diagnosticConfigured)?(!value.StripeKeyPresent||value.SandboxDisabled):value.StripeKeyPresent||!value.SandboxDisabled))fail();
-    const expectedUser=helper?(service==='issuer-installer'?'0:0':'10001:10001'):service==='callback-receiver'?'node':sourceImage.user;
-    if(value.User!==expectedUser||value.ReadonlyRootfs!==helper)fail();
-    if(helper) {
-      const capAdd=Array.isArray(value.CapAdd)?value.CapAdd.map(cap=>cap==='CAP_CHOWN'?'CHOWN':cap==='CAP_DAC_OVERRIDE'?'DAC_OVERRIDE':cap):value.CapAdd;
-      if(!same(value.CapDrop,['ALL'])||!same(capAdd??[],service==='issuer-installer'?['CHOWN','DAC_OVERRIDE']:[]))fail();
-    }
-    if(!object(value.State)||typeof value.State.Running!=='boolean'||typeof value.State.Status!=='string'||typeof value.State.StartedAt!=='string')fail();
-    if(neverStarted&&(value.State.Running||value.State.Status!=='created'||value.State.StartedAt!=='0001-01-01T00:00:00Z'))fail();
-    if(liveRequired) {if(!value.State.Running||value.State.Status!=='running'||value.State.Health!=='healthy')fail();livePortProof(value.Ports,service);}
-    const safe={id:value.Id,name:value.Name.slice(1),image:value.Image,service,status:value.State.Status,startedAt:value.State.StartedAt,
-      networkId:helper?null:recorded.network.Id,mounts:expectedMounts(service),ports:expectedPorts(service)};
-    if(recordedContainer)recorded.containers[service]=safe;
-    return {safe,state:value.State};
+    const value=await inspect('container',selector,CONTAINER_FORMAT,context),recordedContainer=recorded.containers[service];
+    const proof=proveOwnedContainer(value,{service,project,runId,network:recorded.network,sourceImage:recorded.images[service.startsWith('issuer-')?'backend':service],
+      recordedContainer,expectedMounts:expectedMounts(service),expectedPorts:expectedPorts(service),liveRequired,neverStarted,cleanupOnly,backendStripeEnabled:Boolean(retired||diagnosticConfigured)});
+    if(proof.infrastructureRequired)await infrastructureProof(context);
+    if(recordedContainer)recorded.containers[service]=proof.safe;
+    return {safe:proof.safe,state:proof.state};
   }
   async function projectProof(context) {
     const output=await docker(['ps','--all','--no-trunc','--filter','label=com.docker.compose.project='+project,'--format','{{.ID}}'],context,10000);

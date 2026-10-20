@@ -4,6 +4,7 @@ import {constants} from 'node:fs';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {manualPaymentOptIn} from './stripe-manual-payment-options.mjs';
+import {manualRefundOptIn} from './stripe-manual-refund-options.mjs';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const ACCOUNT='acct_1UPiMpELswAd8tpR',VERSION='2026-09-30.endive';
@@ -26,10 +27,24 @@ const fail=()=>{throw null;};
 const fixed=code=>new Error('stripe_sandbox_cli_'+code);
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 
+/** Separate, read-only retained credential capability; mode is never operator selected. */
+export async function createManualRefundCliAdapter(options,dependencies={}) {
+  try{
+    const optIn=Object.getOwnPropertyDescriptor(options??{},'env');if(!optIn?.enumerable||!Object.hasOwn(optIn,'value')||!manualRefundOptIn(optIn.value))throw fixed('OPT_IN_REQUIRED');
+    const keys=['env','originalRunId','cliDirectory','backendPort','verifyForwardTarget','persistWebhookSecret','approvedBinding'],d=Object.getOwnPropertyDescriptors(options);
+    if(![Object.prototype,null].includes(Object.getPrototypeOf(options))||Reflect.ownKeys(d).length!==keys.length||keys.some(k=>!d[k]?.enumerable||!Object.hasOwn(d[k],'value'))||d.originalRunId.value!=='031b5ae7-6603-4339-b1b3-77231291ff34')fail();
+    const selected=Object.fromEntries(keys.map(k=>[k,d[k].value]));
+    return await createCliAdapter({...selected,runId:selected.originalRunId,accountKey:'stripe-sandbox-default'},dependencies,true);
+  }catch{throw fixed('REFUND_CONFIGURATION');}
+}
+
 /** No entrypoint or implicit I/O: only fixed, isolated, read-only CLI capabilities. */
 export async function createSandboxCliAdapter(options,dependencies={}) {
+  return createCliAdapter(options,dependencies,false);
+}
+async function createCliAdapter(options,dependencies,refundMode) {
   let enabled=false,manualPaymentMode=false;
-  try {const optIn=options?.env;manualPaymentMode=optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
+  try {const optIn=options?.env;manualPaymentMode=!refundMode&&optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=refundMode?manualRefundOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {
@@ -51,6 +66,7 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
   const args=Object.freeze([...PREFIX,'--config',cliDirectory+'/config/stripe/config.toml','--project-name','default','--color','off','--log-level','error']);
   let busy=false,owner=null,uncertain=false,originalSecret=null,latched=null,latchedOwner=null;
   let manual=null,manualOwner=null,manualDeadline=null,manualBindUsed=false,manualPermitRead=false,manualFinalUsed=false,manualFailed=false;
+  let refundDeadline=null,refundOwner=null,refundBinding=null,refundBindUsed=false,refundFailed=false,refundStarted=false,refundCharge=null,partialReference=null,partialRefundId=null;
 
   function check(context) {if(context.signal.aborted||Date.now()>=context.deadline)fail();}
   async function operation(code,limits,body) {
@@ -60,6 +76,7 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
     try {
       const deadline=limits?.deadline;external=limits?.signal;
       if(!Number.isFinite(deadline)||deadline<=Date.now()||(external!==undefined&&!(external instanceof AbortSignal)))fail();
+      if(refundMode){if(refundDeadline===null){if(deadline>Date.now()+1800000)fail();refundDeadline=deadline;}if(code==='STOP'?deadline>refundDeadline+120000:deadline!==refundDeadline)fail();}
       onAbort=()=>controller.abort();external?.addEventListener('abort',onAbort,{once:true});
       if(external?.aborted)controller.abort();
       timer=io.setTimeout(onAbort,Math.min(deadline-Date.now(),2147483647));
@@ -88,7 +105,7 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
   async function command(commandArgs,context) {
     await privateTree(context);check(context);
     const result=await io.execute('/usr/bin/sandbox-exec',[...args,...commandArgs],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe'],
-      timeout:Math.min(context.manual?10000:20000,Math.max(1,context.deadline-Date.now())),maxBuffer:65536,signal:context.signal});
+      timeout:Math.min(context.manual||refundMode?10000:20000,Math.max(1,context.deadline-Date.now())),maxBuffer:65536,signal:context.signal});
     check(context);
     if(typeof result.stdout!=='string'||typeof result.stderr!=='string'||Buffer.byteLength(result.stdout)+Buffer.byteLength(result.stderr)>65536)fail();
     return result;
@@ -123,13 +140,13 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
     });
   }
   async function waitExit(record,ms) {
-    if(record.exited)return true;
+    if(refundMode?record.closed:record.exited)return true;
     let timer;
     try {return await Promise.race([record.termination.then(()=>true),new Promise(resolveWait=>{timer=io.setTimeout(()=>resolveWait(false),ms);})]);}
     finally {io.clearTimeout(timer);}
   }
   async function terminate(record,budget=10000) {
-    if(record.exited)return true;
+    if(refundMode?record.closed:record.exited)return true;
     // The process object and positive PID are captured once; no PID-based/global kill.
     if(owner!==record||record.child.pid!==record.pid) {uncertain=true;return false;}
     try {record.child.kill('SIGINT');} catch {}
@@ -146,13 +163,14 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
     const pid=child.pid;
     if(!Number.isInteger(pid)||pid<=0) {uncertain=true;child.on('error',()=>{});fail();}
     let resolveReady,rejectReady,resolveExit;
-    const record={child,pid,exited:false,ready:false,valid:true,invalidated:false,stopping:false,explicitStop:false,persisting:false,persisted:false,bytes:0,buffers:['','']};
+    const record={child,pid,exited:false,closed:false,ready:false,valid:true,invalidated:false,stopping:false,explicitStop:false,persisting:false,persisted:false,bytes:0,buffers:['','']};
     record.readiness=new Promise((resolveWait,rejectWait)=>{resolveReady=resolveWait;rejectReady=rejectWait;});
     record.readiness.catch(()=>{});
     record.termination=new Promise(resolveWait=>{resolveExit=resolveWait;});
     owner=record;
     const invalidate=()=>{record.valid=false;record.invalidated=true;rejectReady(null);};
-    child.on('exit',()=>{record.exited=true;record.valid=false;if(!record.stopping)record.invalidated=true;rejectReady(null);resolveExit();});
+    child.on('exit',()=>{record.exited=true;record.valid=false;if(!record.stopping)record.invalidated=true;rejectReady(null);if(!refundMode)resolveExit();});
+    if(refundMode)child.on('close',()=>{record.closed=true;record.exited=true;record.valid=false;rejectReady(null);resolveExit();});
     child.on('error',invalidate);
     function line(raw) {
       const text=raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'').replace(/\r$/,'');
@@ -163,7 +181,7 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
       if(record.persisting||record.persisted)return;
       originalSecret=match[1];record.persisting=true;
       // Await durable storage before releasing readiness. No reconnect callback retry.
-      Promise.resolve().then(()=>{if(!record.valid||record.exited)fail();return persistSecret(originalSecret);}).then(result=>{
+      Promise.resolve().then(()=>{if(!record.valid||record.exited)fail();return persistSecret(originalSecret,...(refundMode?[context]:[]));}).then(result=>{
         record.persisting=false;
         if(result!==true||!record.valid||record.exited||context.signal.aborted) {uncertain=true;invalidate();return;}
         record.persisted=true;record.ready=true;resolveReady(true);
@@ -190,7 +208,7 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
   }
   async function startListener(context) {
     if(uncertain||latched!==null||(owner!==null&&(!owner.exited||owner.invalidated)))fail();
-    if(await controlled(Promise.resolve().then(()=>verifyTarget()),context)!==true)fail();
+    if(await controlled(Promise.resolve().then(()=>verifyTarget(...(refundMode?[context]:[]))),context)!==true)fail();
     await binding(context);await privateTree(context);check(context);
     let record;
     try {
@@ -314,6 +332,39 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
     if(!manual||manualFinalUsed)fail();manualFinalUsed=true;return manualRead(context,()=>unpaid(context));
   }
   const manualOperation=(code,limits,body)=>operation(code,limits,body).catch(()=>{manualFailed=true;throw fixed(code);});
+  function refundListener(context){
+    if(refundFailed||uncertain||!refundOwner||owner!==refundOwner||owner.child.pid!==owner.pid||!owner.ready||!owner.valid||owner.invalidated||owner.exited||owner.stopping||owner.explicitStop||context.deadline!==refundDeadline)fail();check(context);
+  }
+  function assertRefundListener(limits){try{if(busy||!refundBinding)fail();const d=Object.getOwnPropertyDescriptors(limits??{}),keys=Reflect.ownKeys(d);if(!object(limits)||![Object.prototype,null].includes(Object.getPrototypeOf(limits))||keys.length<1||keys.length>2||keys.some(k=>!['deadline','signal'].includes(k))||!d.deadline?.enumerable||!Object.hasOwn(d.deadline,'value')||!Number.isSafeInteger(d.deadline.value)||d.signal&&(!d.signal.enumerable||!Object.hasOwn(d.signal,'value')||d.signal.value!==undefined&&!(d.signal.value instanceof AbortSignal)))fail();refundListener({deadline:d.deadline.value,signal:d.signal?.value??{aborted:false}});return true;}catch{refundFailed=true;throw fixed('REFUND_LISTENER');}}
+  async function refundRead(context,body){refundListener(context);await binding(context);refundListener(context);const result=await body();refundListener(context);return result;}
+  async function captured(context,total,expectedReferences,currentRefundId){
+    const p=parseBody(await command(['get','/v1/payment_intents/'+refundBinding.intentId,'--expand','latest_charge.refunds'],context)),c=p.latest_charge;
+    if(p.id!==refundBinding.intentId||p.object!=='payment_intent'||p.livemode!==false||p.status!=='succeeded'||p.amount!==2000||p.amount_received!==2000||p.currency!=='eur'||p.capture_method!=='automatic'||p.customer!==null||!Array.isArray(p.payment_method_types)||p.payment_method_types.length!==1||p.payment_method_types[0]!=='card'||p.metadata?.payment_id!==refundBinding.paymentId||p.metadata?.site_id!==refundBinding.siteId||p.metadata?.source!=='CATALOG')fail();
+    if(!object(c)||typeof c.id!=='string'||!/^ch_[A-Za-z0-9_]{1,200}$/.test(c.id)||refundCharge!==null&&c.id!==refundCharge||c.object!=='charge'||c.livemode!==false||c.customer!==null||c.payment_intent!==refundBinding.intentId||c.status!=='succeeded'||c.paid!==true||c.captured!==true||c.amount!==2000||c.amount_captured!==2000||c.currency!=='eur'||c.payment_method_details?.type!=='card'||c.amount_refunded!==total||c.refunded!==(total===2000)||c.refunds?.object!=='list'||c.refunds.has_more!==false||!Array.isArray(c.refunds.data)||c.refunds.data.length!==expectedReferences.length||new Set(c.refunds.data.map(r=>r.id)).size!==expectedReferences.length||c.refunds.data.some(r=>!expectedReferences.includes(r.id)))fail();
+    for(const r of c.refunds.data)refundObject(r,r.id,r.id===partialReference?700:total===700?700:1300,c.id,r.id===partialReference?partialRefundId:currentRefundId);
+    refundCharge??=c.id;return c;
+  }
+  function refundObject(r,reference,amount,charge,refundId){if(!object(r)||r.id!==reference||r.object!=='refund'||r.status!=='succeeded'||r.amount!==amount||r.currency!=='eur'||r.charge!==charge||r.payment_intent!==refundBinding.intentId||r.livemode!==undefined&&r.livemode!==false||r.metadata?.payment_id!==refundBinding.paymentId||r.metadata?.refund_id!==refundId)fail();}
+  async function bindCapturedPayment(original,context){
+    if(refundBindUsed)fail();refundBindUsed=true;
+    const data=(objectValue,fields)=>{if(!object(objectValue)||![Object.prototype,null].includes(Object.getPrototypeOf(objectValue)))fail();const d=Object.getOwnPropertyDescriptors(objectValue);if(Reflect.ownKeys(d).length!==fields.length||fields.some(k=>!d[k]?.enumerable||!Object.hasOwn(d[k],'value')))fail();return Object.fromEntries(fields.map(k=>[k,d[k].value]));};
+    const target=data(original,['originalRunId','originalSource','project','containers','images','network','volumes','ports','endpoints','account','site','price','paymentId','operationId','intentId','callbackVersion','amountMinor','currency','source']);
+    const account=data(target.account,['id','key','externalId']),site=data(target.site,['id','key']),price=data(target.price,['id','key','version','providerPriceId']);
+    if(target.originalRunId!=='031b5ae7-6603-4339-b1b3-77231291ff34'||target.originalSource!=='f0620e40004162d2b3eededa60512f50a492f4cc'||target.project!=='stripe-'+target.originalRunId||account.key!=='stripe-sandbox-default'||target.source!=='CATALOG'||target.callbackVersion!==1||price.version!==1||typeof price.providerPriceId!=='string'||!/^price_[A-Za-z0-9_]{1,200}$/.test(price.providerPriceId))fail();
+    const value={paymentId:target.paymentId,siteId:site.id,paymentAccountId:account.id,operationId:target.operationId,intentId:target.intentId,priceId:price.id,priceKey:price.key,amountMinor:target.amountMinor,currency:target.currency,externalAccountId:account.externalId};
+    if(!['paymentId','siteId','paymentAccountId','operationId','priceId'].every(k=>typeof value[k]==='string'&&UUID.test(value[k]))||typeof value.intentId!=='string'||!/^pi_[A-Za-z0-9_]{1,200}$/.test(value.intentId)||typeof value.priceKey!=='string'||!/^s5a-price-[a-z0-9-]{1,100}$/.test(value.priceKey)||value.amountMinor!==2000||value.currency!=='EUR'||value.externalAccountId!==ACCOUNT)fail();refundBinding=Object.freeze(value);await refundRead(context,()=>captured(context,0,[]));return true;
+  }
+  async function inspectRefund(value,context){
+    if(!refundBinding)fail();const keys=['refundId','providerReference','providerEventId','amountMinor','totalMinor'];if(!object(value)||![Object.prototype,null].includes(Object.getPrototypeOf(value)))fail();const d=Object.getOwnPropertyDescriptors(value);if(Reflect.ownKeys(d).length!==keys.length||keys.some(k=>!d[k]?.enumerable||!Object.hasOwn(d[k],'value')))fail();const v=Object.fromEntries(keys.map(k=>[k,d[k].value]));
+    if(typeof v.refundId!=='string'||!UUID.test(v.refundId)||typeof v.providerReference!=='string'||!/^re_[A-Za-z0-9_]{1,200}$/.test(v.providerReference)||typeof v.providerEventId!=='string'||!/^evt_[A-Za-z0-9_]{1,200}$/.test(v.providerEventId)||!(v.amountMinor===700&&v.totalMinor===700||v.amountMinor===1300&&v.totalMinor===2000)||v.totalMinor===2000&&(!partialReference||partialReference===v.providerReference)||v.totalMinor===700&&partialReference&&partialReference!==v.providerReference)fail();
+    return refundRead(context,async()=>{const c=await captured(context,v.totalMinor,v.totalMinor===700?[v.providerReference]:[partialReference,v.providerReference],v.refundId);const r=parseBody(await command(['get','/v1/refunds/'+v.providerReference],context));refundObject(r,v.providerReference,v.amountMinor,c.id,v.refundId);const e=parseBody(await command(['get','/v1/events/'+v.providerEventId],context));if(e.id!==v.providerEventId||e.object!=='event'||!['refund.created','refund.updated'].includes(e.type)||e.api_version!==VERSION||e.livemode!==false||e.account!==undefined&&e.account!==ACCOUNT)fail();refundObject(e.data?.object,v.providerReference,v.amountMinor,c.id,v.refundId);if(v.totalMinor===700){partialReference=v.providerReference;partialRefundId=v.refundId;}return Object.freeze({providerVerified:true,webhookVerified:true});});
+  }
+  const refundOperation=(code,limits,body)=>{if(refundFailed)return Promise.reject(fixed(code));return operation(code,limits,body).catch(()=>{refundFailed=true;throw fixed(code);});};
+  if(refundMode)return Object.freeze({validateBinding:limits=>refundOperation('BINDING',limits,binding),
+    startListener:limits=>refundOperation('LISTENER',limits,async context=>{if(refundStarted||refundFailed)fail();refundStarted=true;await startListener(context);refundOwner=owner;return true;}),
+    stopListener:limits=>operation('STOP',limits,async context=>{refundFailed=true;return stopListener(context);}),
+    bindCapturedPayment:(value,limits)=>refundOperation('REFUND_BINDING',limits,context=>bindCapturedPayment(value,context)),assertRefundListener,
+    inspectRefund:(value,limits)=>refundOperation('REFUND',limits,context=>inspectRefund(value,context))});
   return Object.freeze({
     validateBinding:limits=>operation('BINDING',limits,binding),
     startListener:limits=>operation('LISTENER',limits,startListener),
