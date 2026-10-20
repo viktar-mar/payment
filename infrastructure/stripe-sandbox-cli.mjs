@@ -28,8 +28,8 @@ const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value)
 
 /** No entrypoint or implicit I/O: only fixed, isolated, read-only CLI capabilities. */
 export async function createSandboxCliAdapter(options,dependencies={}) {
-  let enabled=false;
-  try {const optIn=options?.env;enabled=optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
+  let enabled=false,manualPaymentMode=false;
+  try {const optIn=options?.env;manualPaymentMode=optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {
@@ -249,6 +249,19 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
     if(manualFailed||uncertain||!owner||!owner.ready||!owner.valid||owner.invalidated||owner.exited||owner.stopping||owner.explicitStop||owner!==manualOwner||context.deadline!==manualDeadline)fail();
     check(context);
   }
+  /** Synchronous R12 dispatch assertion: no I/O, read, rebind or renewed authority. */
+  function assertManualPaymentListener(limits){
+    try{
+      if(!manualPaymentMode||busy||!manual||!manualBindUsed||!manualPermitRead||manualFinalUsed
+        ||!object(limits)||![Object.prototype,null].includes(Object.getPrototypeOf(limits)))fail();
+      const d=Object.getOwnPropertyDescriptors(limits),keys=Reflect.ownKeys(d);
+      if(keys.length<1||keys.length>2||keys.some(key=>!['deadline','signal'].includes(key))
+        ||!d.deadline?.enumerable||!Object.hasOwn(d.deadline,'value')||!Number.isSafeInteger(d.deadline.value)
+        ||d.signal&&(!d.signal.enumerable||!Object.hasOwn(d.signal,'value')||d.signal.value!==undefined&&!(d.signal.value instanceof AbortSignal)))fail();
+      manualListener({deadline:d.deadline.value,signal:d.signal?.value??{aborted:false}});
+      if(owner.child.pid!==owner.pid)fail();return true;
+    }catch{manualFailed=true;throw fixed('PAYMENT_LISTENER');}
+  }
   async function manualRead(context,body){
     try{manualListener(context);await binding(context);manualListener(context);const result=await body();manualListener(context);return result;}
     catch{manualFailed=true;throw null;}
@@ -309,6 +322,7 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
     inspectIntent:limits=>operation('INTENT',limits,inspectIntent),
     bindManualPayment:(value,limits)=>manualOperation('PAYMENT_BINDING',limits,context=>bindManualPayment(value,context)),
     verifyManualPaymentBaseline:limits=>manualOperation('PAYMENT_BASELINE',limits,verifyManualPaymentBaseline),
+    assertManualPaymentListener,
     inspectManualPayment:(eventId,limits)=>manualOperation('PAYMENT',limits,context=>inspectManualPayment(eventId,context)),
     inspectUnusedManualPayment:limits=>manualOperation('UNUSED',limits,inspectUnusedManualPayment),
     loginInvocation:limits=>operation('LOGIN',limits,async context=>{

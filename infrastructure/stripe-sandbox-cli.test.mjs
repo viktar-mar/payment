@@ -8,6 +8,7 @@ import {PassThrough} from 'node:stream';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createSandboxCliAdapter} from './stripe-sandbox-cli.mjs';
+import {runManualPayment} from './stripe-manual-payment.mjs';
 test('full CLI refuses manual flag before configuration/dependency access',async()=>{
   let touched=0;const trap=new Proxy({},{get(){touched++;throw null;}});
   await assert.rejects(createSandboxCliAdapter({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC:'true'},get runId(){touched++;throw null;}},trap),{message:'stripe_sandbox_cli_OPT_IN_REQUIRED'});
@@ -66,7 +67,7 @@ async function start(f,line=READY) {const ready=f.adapter.startListener(LIMIT())
 async function stop(f) {return f.adapter.stopListener(LIMIT());}
 const rejects=(promise,code)=>assert.rejects(promise,{message:'stripe_sandbox_cli_'+code});
 const paymentProof=()=>{const {source,...p}=proof();return {...p,paymentAccountId:'44444444-5555-4666-8777-888888888888',priceId:'55555555-6666-4777-8888-999999999999',priceKey:'s5a-price-test'};};
-async function paymentSetup(){const f=await setup();f.paid=false;f.mutate=()=>{};const execute=f.dependencies.execute;
+async function paymentSetup({autoStart=true,autoReady=false}={}){const f=await setup({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT:'true'}});f.paid=false;f.mutate=()=>{};const execute=f.dependencies.execute;
   // Recreate adapter after installing transport responses; no real process is ever used.
   f.dependencies.execute=async(file,args,settings)=>{
     if(args.some(a=>a.startsWith('/v1/payment_intents/'))){f.calls.push({file,args,settings});const p=intent();p.customer=null;p.latest_charge.customer=null;p.latest_charge.refunded=false;p.latest_charge.amount_refunded=0;
@@ -74,7 +75,9 @@ async function paymentSetup(){const f=await setup();f.paid=false;f.mutate=()=>{}
       if(!f.paid){p.status='requires_payment_method';p.amount_received=0;p.payment_method=null;p.latest_charge=null;}
       f.mutate(p);return {stdout:JSON.stringify(p),stderr:''};}
     if(args.some(a=>a.startsWith('/v1/events/'))){f.calls.push({file,args,settings});const e={id:'evt_original',object:'event',type:'payment_intent.succeeded',api_version:VERSION,livemode:false,data:{object:{id:'pi_syntheticOriginal',object:'payment_intent',livemode:false,status:'succeeded',amount:2000,amount_received:2000,currency:'eur',latest_charge:'ch_reference',customer:null,capture_method:'automatic',payment_method_types:['card'],metadata:{payment_id:RUN,site_id:'22222222-3333-4444-8555-666666666666',source:'CATALOG'}}}};f.mutateEvent?.(e);return {stdout:JSON.stringify(e),stderr:''};}
-    return execute(file,args,settings);};f.adapter=await createSandboxCliAdapter(f.options,f.dependencies);f.limits=LIMIT();await start(f);return f;}
+    return execute(file,args,settings);};
+  if(autoReady){const spawn=f.dependencies.spawn;f.dependencies.spawn=(...args)=>{const child=spawn(...args);queueMicrotask(()=>child.stderr.write(READY));return child;};}
+  f.adapter=await createSandboxCliAdapter(f.options,f.dependencies);f.limits=LIMIT();if(autoStart)await start(f);return f;}
 test('manual CLI binds unpaid original then verifies exact event with active original listener',async()=>{
   const f=await paymentSetup();assert.equal(typeof f.adapter.bindManualPayment,'function');assert.equal(await f.adapter.bindManualPayment(paymentProof(),f.limits),true);await f.adapter.verifyManualPaymentBaseline(f.limits);f.paid=true;
   assert.deepEqual(await f.adapter.inspectManualPayment('evt_original',f.limits),{captured:true,eventVerified:true});
@@ -91,6 +94,50 @@ for(const [name,mutate] of [['wrong account',e=>e.account='acct_other'],['wrong 
 test('manual event proof refuses '+name,async()=>{const f=await paymentSetup();await f.adapter.bindManualPayment(paymentProof(),f.limits);await f.adapter.verifyManualPaymentBaseline(f.limits);f.paid=true;f.mutateEvent=mutate;await rejects(f.adapter.inspectManualPayment('evt_original',f.limits),'PAYMENT');await stop(f);});
 test('manual command reads are clipped to ten seconds and original authority',async()=>{const f=await paymentSetup();await f.adapter.bindManualPayment(paymentProof(),f.limits);await f.adapter.verifyManualPaymentBaseline(f.limits);assert.ok(f.calls.filter(c=>!c.child).slice(-8).every(c=>c.settings.timeout<=10000));await stop(f);});
 test('pre-permit baseline leaves independent unused-final inspection available',async()=>{const f=await paymentSetup();await f.adapter.bindManualPayment(paymentProof(),f.limits);await f.adapter.verifyManualPaymentBaseline(f.limits);assert.equal(await f.adapter.inspectUnusedManualPayment(f.limits),true);await rejects(f.adapter.inspectManualPayment('evt_original',f.limits),'PAYMENT');await stop(f);});
+test('manual listener assertion is synchronous and performs no IO timer or baseline renewal',async()=>{
+  const f=await paymentSetup();await f.adapter.bindManualPayment(paymentProof(),f.limits);await f.adapter.verifyManualPaymentBaseline(f.limits);
+  assert.equal(typeof f.adapter.assertManualPaymentListener,'function');const calls=f.calls.length,timers=f.timers.size;
+  assert.equal(f.adapter.assertManualPaymentListener(f.limits),true);assert.equal(f.adapter.assertManualPaymentListener(f.limits),true);assert.equal(f.calls.length,calls);assert.equal(f.timers.size,timers);
+  f.paid=true;assert.deepEqual(await f.adapter.inspectManualPayment('evt_original',f.limits),{captured:true,eventVerified:true});await stop(f);
+});
+for(const [name,change] of [
+  ['lost',async f=>f.children.at(-1).emit('exit',1)],
+  ['invalidated',async f=>f.children.at(-1).emit('error',Error('synthetic'))],
+  ['closed',async f=>stop(f)],
+  ['replacement owner',async f=>{await stop(f);await start(f);} ],
+  ['replacement PID',async f=>{f.children.at(-1).pid++;}],
+  ['manual failed',async f=>rejects(f.adapter.verifyManualPaymentBaseline(f.limits),'PAYMENT_BASELINE')],
+  ['final inspection consumed',async f=>f.adapter.inspectUnusedManualPayment(f.limits)],
+  ['renewed deadline',async f=>{f.limits={deadline:f.limits.deadline+1};}],
+  ['expired deadline',async f=>{f.limits={deadline:Date.now()-1};}],
+  ['aborted signal',async f=>{const c=new AbortController();c.abort();f.limits={deadline:f.limits.deadline,signal:c.signal};}],
+  ['invalid signal',async f=>{f.limits={deadline:f.limits.deadline,signal:{aborted:false}};}],
+])test('manual listener assertion refuses '+name+' without any command or authority renewal',async()=>{
+  const f=await paymentSetup();await f.adapter.bindManualPayment(paymentProof(),f.limits);await f.adapter.verifyManualPaymentBaseline(f.limits);await change(f);
+  assert.equal(typeof f.adapter.assertManualPaymentListener,'function');const calls=f.calls.length,timers=f.timers.size;
+  assert.throws(()=>f.adapter.assertManualPaymentListener(f.limits),{message:'stripe_sandbox_cli_PAYMENT_LISTENER'});assert.equal(f.calls.length,calls);assert.equal(f.timers.size,timers);
+  assert.throws(()=>f.adapter.assertManualPaymentListener(LIMIT()),{message:'stripe_sandbox_cli_PAYMENT_LISTENER'});assert.equal(f.calls.length,calls);
+});
+test('manual listener assertion refuses unbound unfresh and ordinary-mode adapters',async()=>{
+  const ordinary=await setup();assert.equal(typeof ordinary.adapter.assertManualPaymentListener,'function');assert.throws(()=>ordinary.adapter.assertManualPaymentListener(LIMIT()),{message:'stripe_sandbox_cli_PAYMENT_LISTENER'});assert.equal(ordinary.calls.length,0);
+  for(const bound of [false,true]){const f=await paymentSetup();if(bound)await f.adapter.bindManualPayment(paymentProof(),f.limits);const calls=f.calls.length;
+    assert.throws(()=>f.adapter.assertManualPaymentListener(f.limits),{message:'stripe_sandbox_cli_PAYMENT_LISTENER'});assert.equal(f.calls.length,calls);await stop(f);}
+});
+test('real original CLI listener loss during controller durable await denies every browser permit',async()=>{
+  const f=await paymentSetup({autoStart:false,autoReady:true}),limits={deadline:Date.now()+2700000};let markEntered,finishMark,authorize,browserPermits=0;
+  const entered=new Promise(resolveWait=>{markEntered=resolveWait;}),durable=new Promise(resolveWait=>{finishMark=resolveWait;});
+  const ports={backend:18080,demo:18081,receiver:18082,postgres:15432,mailpitHttp:18025,mailpitSmtp:11025};
+  const configuration={env:f.options.env,runId:RUN,expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports,manualPort:18083};
+  const bootstrap={prepare:async()=>true,resources:()=>({runId:RUN,status:'PREPARED',cliDirectory:DIR,ports}),start:async()=>true,verify:async()=>true,stop:async()=>true,persistWebhookSecret:async()=>true,verifyForwardTarget:async()=>true};
+  const provisioner={prepare:async()=>({binding:paymentProof(),session:{}}),markConfirmation:()=>{markEntered();return durable;},verifyPayment:async()=>{assert.fail('server proof after lost original listener');},close:async()=>true};
+  const gateway={open:async()=>({url:'http://127.0.0.1:18083/manual-payment.html'}),wait:async()=>{try{await authorize();browserPermits++;return {outcome:'CONFIRMATION_GRANTED'};}catch{return {outcome:'FAILED'};}},close:async()=>true};
+  const task=runManualPayment(configuration,limits,{preflight:async()=>({status:'READY'}),createBootstrap:async()=>bootstrap,createCli:async()=>f.adapter,authorizeCli:async()=>true,createProvisioner:async()=>provisioner,createGateway:async options=>{authorize=options.authorizeConfirmation;return gateway;},write:async()=>{}});
+  assert.equal(await Promise.race([entered.then(()=>true),task.then(()=>false)]),true);assert.equal(f.children.length,1);
+  f.children[0].emit('exit',1);finishMark(true);const value=await task;
+  assert.equal(browserPermits,0);assert.equal(value.report.confirmation_granted,true);assert.equal(value.report.result,'PENDING');assert.equal(value.exitCode,1);
+  assert.equal(f.calls.filter(call=>call.args.some(arg=>arg.startsWith('/v1/payment_intents/'))).length,2,'one original bind read plus one fresh permit baseline only');
+  assert.ok(f.calls.every(call=>!call.args.some(arg=>arg.startsWith('/v1/events/'))));await assert.rejects(authorize());assert.equal(browserPermits,0);
+});
 
 // A removed opt-in gate must fail before any dependency/private getter runs.
 test('missing opt-ins reject before accessing configuration or dependencies', async () => {

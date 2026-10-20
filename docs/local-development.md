@@ -876,6 +876,93 @@ For the historical guest-only Playwright selection, recreate backend with PAYMEN
 
 When PAYMENT_E2E_DEMO_ORIGIN is set, Playwright uses that running Compose service rather than starting Vite. Exactly six accepted journeys check success, recoverable decline, processing, UNKNOWN/reconciliation, terminal failure and 320px reload recovery, with request/URL/console/storage/DOM sink audits. The private fixture's fake-state SQL control is test-only; browser code has no database access.
 
+## One manual Stripe Sandbox payment
+
+The separate `infrastructure/stripe-manual-payment.mjs` entry prepares one fresh,
+anonymous CATALOG payment for EUR20, tax NONE, ONE_TIME, CARD. It requires all offline
+gates, independent task and whole-change review, a clean committed source and explicit
+authorization for one fresh run. It is a bounded manual experiment; its report does
+not establish full Stage 5A acceptance or live readiness. Imports do not start a run.
+
+Before that single invocation, verify the reviewed SHA, canonical owned Unix Docker
+socket, disk/network capacity, previous owned closures and seven distinct free loopback
+ports in 1024–65535. Use the existing isolated recovery worktree and a fresh lowercase
+UUID. Source, ownership, identity, secret conflict or port failures stop the attempt;
+preserve the resources and evidence for inspection. Do not delete resources, change
+ports, reuse fixtures, renew an expired run or start an automatic replacement.
+
+This is an invocation template, with placeholders only. Provider and Admin credentials
+stay in the existing ignored private configuration boundary and never belong in this
+command, argv, URLs, output, chat or Git. There are zero positional or optional CLI
+arguments. The entry snapshots only these allowlisted raw environment fields.
+
+```bash
+env -i PATH="<APPROVED_NODE_AND_SYSTEM_PATH>" LANG=C LC_ALL=C NO_COLOR=1 \
+  PAYMENT_STRIPE_SANDBOX_ENABLED=true \
+  PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS=true \
+  PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT=true \
+  PAYMENT_STRIPE_SANDBOX_RUN_ID="<FRESH_UUID>" \
+  PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE="<REVIEWED_COMMIT_SHA>" \
+  PAYMENT_STRIPE_SANDBOX_DAEMON="<APPROVED_UNIX_DAEMON>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_BACKEND="<BACKEND_PORT>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_DEMO="<DEMO_PORT>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_RECEIVER="<RECEIVER_PORT>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_POSTGRES="<POSTGRES_PORT>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_MAILPITHTTP="<MAILPIT_HTTP_PORT>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_MAILPITSMTP="<MAILPIT_SMTP_PORT>" \
+  PAYMENT_STRIPE_SANDBOX_PORT_MANUAL="<GATEWAY_PORT>" \
+  node infrastructure/stripe-manual-payment.mjs
+```
+
+FULL_RUN, OWNED_RUN, FORM_DIAGNOSTIC, MANUAL_FORM_DIAGNOSTIC and ALLOW_PREPARE_ONLY
+are incompatible. DEBUG, NODE_DEBUG, PWDEBUG and PW_TRACE must remain disabled. The
+binding is fixed to account `acct_1UPiMpELswAd8tpR`, API `2026-09-30.endive`, CLI
+`1.52.0` and test mode. A genuine isolated CLI authorization URL and device code may
+be printed first: use only that exact handoff, then keep the original terminal open.
+An expired code is a stopped attempt, never permission to run another login. No
+global credentials, Keychain, live flag or arbitrary `next_step` command is used.
+
+The original active deadline is 45 minutes from entry, including build and human CLI
+authorization; cleanup ends at that same deadline plus two minutes. Login has at most
+three minutes, completion ten minutes, and actual child-close proof ten seconds of
+grace, all under the original authority. The page has at most five minutes, clipped
+to Checkout expiry and the active deadline minus 90 seconds; a fresh page allowance
+requires the full five minutes plus 90 seconds to remain. Financial verification uses
+at most 30 probes in 45 seconds, HTTP requests at most ten seconds, clipped to that
+original active deadline. Waiting, failure and cleanup never renew these windows.
+
+After preparation the terminal prints the actual fixed
+`http://127.0.0.1:<GATEWAY_PORT>/manual-payment.html` URL once. Copy and paste that URL
+into an ordinary human-owned Chrome tab. Open it once and click «Загрузить форму»
+once. The page warns: «Только Stripe Sandbox. Один тестовый платёж €20. Реальную карту
+не вводите». Enter the official Stripe test card `4242 4242 4242 4242`, a future expiry
+date and any three-digit CVC, then press Pay exactly once. Do not use a real card,
+reload, reopen, retry, correct the card after a failed Pay, or resume after an error.
+Stop and report the observation to the operator. No browser automation, iframe/card
+inspection, screenshots, console/Network/HAR/trace collection or secret screenshots
+are part of this workflow. Close this tab afterwards and report that human observation
+separately; the controller always reports `browser_closure=NOT_OWNED`.
+
+Permission is committed durably before the one Stripe confirmation. A browser success
+message is only a browser observation. The final JSON report (at most 4096 bytes)
+independently records confirmation permission, original server payment, original
+provider Intent/Event, webhook, journal, signed callback and owned cleanup evidence.
+Only `result=SUCCEEDED`, every proof/cleanup boolean true and process exit 0 establish
+this single successful experiment. `NOT_STARTED` requires both original unused server
+and provider proofs and exits 1. False means unverified, not proof that payment did
+not happen. Any failed/unknown operation latches `PENDING` and exits 1; later unused
+reads or browser messages cannot turn it green. Keep the report and original evidence
+for manual review. Do not issue refunds, cancel, reconcile, create another Checkout,
+or rerun the entry to resolve a pending result.
+
+The controller closes/drains its gateway and provisioner, stops its listener/children,
+then stops only freshly verified owned runtime containers. Containers, networks,
+volumes, provider objects and audit evidence are retained. The sole final report write
+uses only the original remaining cleanup ceiling; rejected admission gets at most one
+second. Signal, stalled stdout or write failure gives exit 1 without a second output
+attempt. The direct entry exits only its own process, so a timed-out write can leave
+an incomplete or missing report; check the actual exit code as well as printed text.
+
 ## Stop and persisted data
 
 ```bash
