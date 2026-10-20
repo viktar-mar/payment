@@ -61,6 +61,71 @@ test('host/origin/cookie/method rejection cannot expose a private session',async
   const headers={host:'127.0.0.1:18083',...f.auth(cookie)};for(const key of ['host','origin','cookie'])assert.equal((await f.send('POST','/manual-payment-session',{headers:f.auth(cookie),rawHeaders:[...Object.entries(headers).flat(),key,headers[key]]})).statusCode,403);
   assert.equal((await f.send('POST','/manual-payment-session',{headers:f.auth(cookie)})).statusCode,200);await f.gateway.close({deadline:f.deadline+120000});
 });
+test('well-formed unrelated cookies preserve the sole session and confirmation authority',async t=>{
+  // Rejecting a valid cookie list, confusing substrings with names, or spending
+  // authority twice must fail these public-route assertions.
+  const owned='payment_manual_payment='+'11'.repeat(32);
+  const cases=[
+    ['unrelated before',`theme=dark; ${owned}`],
+    ['unrelated after',`${owned}; theme=dark`],
+    ['multiple without spaces',`first=1;${owned};last=2`],
+    ['separator spaces and tabs',`first=1; \t${owned};\t last=2`],
+    ['owned-name substrings',`prefix_payment_manual_payment=other; ${owned}; note=payment_manual_payment=other; payment_manual_payment_suffix=other`],
+    ['equals and quoted values',`encoded=a=b==; quoted="a=b=="; empty=; quoted_empty=""; ${owned}`],
+    ['case-sensitive unrelated name',`Payment_manual_payment=other; ${owned}`],
+    ['maximum ASCII length',`padding=${'a'.repeat(8095)}; ${owned}`],
+  ];
+  for(const [name,cookie]of cases)await t.test(name,async()=>{
+    let authorizations=0;const f=fixture({authorize:async()=>{authorizations++;return true;}});await f.gateway.open();
+    try{
+      const doc=await f.send('GET','/manual-payment.html');assert.equal(doc.statusCode,200);
+      assert.equal(cookie.length<=8192,true);if(name==='maximum ASCII length')assert.equal(cookie.length,8192);
+      const response=await f.send('POST','/manual-payment-session',{headers:f.auth(cookie)});
+      assert.equal(response.statusCode,200,'valid cookie list allows session');assert.deepEqual(JSON.parse(response.text),session());assert.equal(response.headers['set-cookie'],undefined);assert.equal(authorizations,0);
+      assert.equal((await f.send('POST','/manual-payment-session',{headers:f.auth(cookie)})).statusCode,410);
+      const permit=await f.send('POST','/manual-payment-confirmation',{headers:f.auth(cookie)});
+      assert.equal(permit.statusCode,200,'valid cookie list allows confirmation');assert.equal(permit.text,'{"authorized":true}');assert.equal(permit.headers['set-cookie'],undefined);
+      assert.equal((await f.send('POST','/manual-payment-confirmation',{headers:f.auth(cookie)})).statusCode,410);assert.equal(authorizations,1);
+      assert.deepEqual(await f.gateway.wait(),{outcome:'CONFIRMATION_GRANTED'});
+    }finally{assert.equal(await f.gateway.close({deadline:f.deadline+120000}),true);}
+  });
+});
+test('invalid cookie lists deny both routes without exposing or spending authority',async t=>{
+  const owned='payment_manual_payment='+'11'.repeat(32),wrong='payment_manual_payment='+'22'.repeat(32);
+  const cases=[
+    ['missing owned','theme=dark'],['empty header',''],['empty owned','payment_manual_payment='],['wrong owned',wrong],
+    ['quoted owned','payment_manual_payment="'+'11'.repeat(32)+'"'],['wrong case','Payment_manual_payment='+'11'.repeat(32)],
+    ['upper-case value','payment_manual_payment='+'AB'.repeat(32)],['encoded value','payment_manual_payment=%31'+'11'.repeat(31)+'1'],
+    ['duplicate identical',`${owned}; ${owned}`],['conflict valid first',`${owned}; ${wrong}`],['conflict valid last',`${wrong}; ${owned}`],
+    ['owned value leading space','payment_manual_payment= '+'11'.repeat(32)],['owned value trailing space',owned+' '],
+    ['leading header space',' '+owned],['leading header tab','\t'+owned],['trailing header tab',owned+'\t'],
+    ['space before separator',`${owned} ; theme=dark`],['tab before separator',`${owned}\t; theme=dark`],
+    ['unrelated space before separator',`theme=dark ; ${owned}`],['name padding',`payment_manual_payment =${'11'.repeat(32)}`],
+    ['owned value internal space','payment_manual_payment='+'11'.repeat(16)+' '+'11'.repeat(16)],
+    ['leading empty segment',`; ${owned}`],['trailing empty segment',`${owned};`],['middle empty segment',`a=b;;${owned}`],
+    ['missing equals',`broken; ${owned}`],['empty name',`=value; ${owned}`],['name whitespace',`bad name=value; ${owned}`],['name colon',`bad:name=value; ${owned}`],
+    ['unquoted whitespace',`bad=some value; ${owned}`],['quoted whitespace',`bad="some value"; ${owned}`],['unterminated quote',`bad="value; ${owned}`],
+    ['suffix after quote',`bad="value"suffix; ${owned}`],['escaped value',`bad=back\\slash; ${owned}`],['comma value',`bad=a,b; ${owned}`],
+    ['non-ASCII value',`bad=caf\u00e9; ${owned}`],['non-ASCII name',`caf\u00e9=value; ${owned}`],
+    ['NUL',`bad=a\u0000b; ${owned}`],['CR',`bad=a\rb; ${owned}`],['LF',`bad=a\nb; ${owned}`],['DEL',`bad=a\u007fb; ${owned}`],['tab inside value',`bad=a\tb; ${owned}`],
+    ['over maximum ASCII length',`padding=${'a'.repeat(8096)}; ${owned}`],
+    ['array header',[owned]],['absent header',undefined],
+    ['duplicate header lines',owned,'duplicate'],['missing raw header',owned,'missing'],
+  ];
+  for(const [name,cookie,rawMode]of cases)await t.test(name,async()=>{
+    let authorizations=0;const f=fixture({authorize:async()=>{authorizations++;return true;}});await f.gateway.open();
+    try{
+      await f.send('GET','/manual-payment.html');
+      const headers={host:'127.0.0.1:18083',...f.auth(cookie)};if(cookie===undefined)delete headers.cookie;
+      const rawHeaders=rawMode==='duplicate'?[...Object.entries(headers).flat(),'Cookie',owned]:rawMode==='missing'?['host',headers.host,'origin',headers.origin,'content-type','application/json']:undefined;
+      const deny=async path=>{const response=await f.send('POST',path,{headers,rawHeaders});assert.equal(response.statusCode,403,'invalid cookie list is forbidden');assert.equal(response.text,'');assert.equal(response.headers['set-cookie'],undefined);assert.equal(authorizations,0);};
+      await deny('/manual-payment-session');
+      assert.equal((await f.send('POST','/manual-payment-session',{headers:f.auth(owned)})).statusCode,200,'denial does not consume session');
+      await deny('/manual-payment-confirmation');
+      const permit=await f.send('POST','/manual-payment-confirmation',{headers:f.auth(owned)});assert.equal(permit.statusCode,200,'denial does not consume confirmation');assert.equal(permit.text,'{"authorized":true}');assert.equal(authorizations,1);
+    }finally{assert.equal(await f.gateway.close({deadline:f.deadline+120000}),true);}
+  });
+});
 test('invalid/duplicate/oversize bodies spend exchange authority irreversibly',async()=>{
   for(const body of ['{"x":1}','{"x":1,"x":1}','[]','{',' '.repeat(33)+'{}']){
     const f=fixture();await f.gateway.open();const doc=await f.send('GET','/manual-payment.html'),cookie=doc.headers['set-cookie'].split(';')[0];

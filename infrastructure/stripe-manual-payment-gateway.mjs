@@ -46,6 +46,18 @@ function manifestAssets(wire){
   }
   visit('manual-payment.html');if(seen.size!==Object.keys(manifest).length)throw failure();return assets;
 }
+function ownsCookie(raw,expected){
+  if(typeof raw!=='string'||raw.length===0||raw.length>8192||/[^\x09\x20-\x7E]/.test(raw))return false;
+  let found=false;const pairs=raw.split(';');
+  for(let n=0;n<pairs.length;n++){
+    // Only separator whitespace is optional; never normalize a cookie value.
+    const pair=n===0?pairs[n]:pairs[n].replace(/^[ \t]+/,'');
+    const parsed=/^([!#$%&'*+\-.^_`|~0-9A-Za-z]+)=([\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]*|"[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]*")$/.exec(pair);
+    if(!parsed)return false;
+    if(parsed[1]==='payment_manual_payment'){if(found||parsed[2]!==expected)return false;found=true;}
+  }
+  return found;
+}
 /** Fixed local handoff. A grant records permission only, never payment success. */
 export function createManualPaymentGateway(options,limits,dependencies={}){
   let origin,assetEndpoint,session,authorizeConfirmation,deadline,signal,port,expiresAt;
@@ -72,7 +84,7 @@ export function createManualPaymentGateway(options,limits,dependencies={}){
   function dispose(){closeListener();for(const controller of controllers)controller.abort();for(const owned of [...requests,...responses,...sockets])try{owned.destroy();}catch{uncertain=true;}}
   function reply(res,status,body='',type='text/plain; charset=utf-8'){if(res.destroyed||res.writableFinished)return;res.statusCode=status;res.setHeader('Content-Type',type);res.end(body);}
   function header(req,key){const raw=req.rawHeaders;if(!Array.isArray(raw)||raw.length%2)return null;let count=0;for(let n=0;n<raw.length;n+=2)if(typeof raw[n]==='string'&&raw[n].toLowerCase()===key)count++;const value=req.headers?.[key];return count===1&&typeof value==='string'?value:null;}
-  function authenticated(req){const raw=header(req,'cookie');return header(req,'origin')===origin&&cookie&&raw===`payment_manual_payment=${cookie}`;}
+  function authenticated(req){return header(req,'origin')===origin&&cookie&&ownsCookie(header(req,'cookie'),cookie);}
   async function bounded(operation,budget=io.now()+10000){
     const controller=new AbortController();controllers.add(controller);const expiry=Math.min(budget,cutoff,deadline);let timeout,onAbort;
     const work=track(Promise.resolve().then(()=>{if(!check()||controller.signal.aborted||io.now()>=expiry)throw failure();return operation(controller.signal,expiry);}));
