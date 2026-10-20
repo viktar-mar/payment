@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {createHmac} from 'node:crypto';
+import {spawnSync} from 'node:child_process';
 import {createReceiver} from './callback-receiver.mjs';
 import {fixture} from './fixtures/stripe-manual-refund-state-fixture.mjs';
 import {createManualRefundSession} from './stripe-manual-refund-session.mjs';
@@ -313,4 +314,54 @@ test('independent provider read cannot extend the original 45 second proof phase
   assert.equal(providerLimits.deadline,h.limits.deadline);assert.equal(cancelled,true,'phase expiration must abort delegated provider work');
   assert.equal(lateProviderReads,0);
   await assert.rejects(h.session.refundRemainder(h.limits),fail);assert.deepEqual(h.posts,[700]);
+});
+
+test('closed live session releases credential-bearing Responses after settled disposal',()=>{
+  for(const mode of ['valid-close','invalid-close','rejected-disposal']) {
+    // A fresh GC-enabled child isolates reachability from the parent test runner.
+    // Keep the actual session alive: collecting the entire session would hide
+    // its release-cache leak. Only the returned login Response is weakly held.
+    const source=`
+      import {createManualRefundSession} from ${JSON.stringify(new URL('./stripe-manual-refund-session.mjs',import.meta.url).href)};
+      const mode=${JSON.stringify(mode)};
+      const limits={deadline:Date.now()+120000};
+      let observed,cancellations=0;
+      const target={endpoints:{backend:'http://127.0.0.1:18080',receiver:'http://127.0.0.1:18082'},
+        site:{id:'aaaaaaaa-bbbb-4ccc-8ddd-000000000002'},paymentId:'aaaaaaaa-bbbb-4ccc-8ddd-000000000007',callbackVersion:1};
+      const session=await createManualRefundSession({state:{target},cli:{},runtime:{
+        verify:async()=>true,
+        withAdminCredentials:async callback=>callback({username:'synthetic',password:'synthetic'})
+      }},{fetch:async url=>{
+        if(!url.endsWith('/auth/sessions'))return new Response(JSON.stringify({id:'invalid_actor'}));
+        const headers=new Headers();
+        headers.append('set-cookie','PAYMENT_ADMIN_SESSION=private_session_canary; Path=/');
+        headers.append('set-cookie','XSRF-TOKEN=private_csrf_canary; Path=/');
+        const broken=mode==='rejected-disposal';
+        const body=broken?new ReadableStream({cancel(){cancellations++;throw Error('synthetic_disposal_failure');}}):null;
+        const response=new Response(body,{status:broken?500:204,headers});
+        observed=new WeakRef(response);return response;
+      }});
+      await session.verifyBaseline(limits).catch(()=>{});
+      let closeRejected=false;
+      try{await session.close(mode==='invalid-close'?{deadline:limits.deadline+120001}:{deadline:limits.deadline+120000});}
+      catch{closeRejected=true;}
+      globalThis.keptRefundSession=session;
+      let collected=false;
+      for(let attempt=0;attempt<30;attempt++) {
+        await new Promise(resolve=>setImmediate(resolve));
+        globalThis.gc();
+        await new Promise(resolve=>setImmediate(resolve));
+        if(observed.deref()===undefined){collected=true;break;}
+      }
+      process.stdout.write(JSON.stringify({collected,closeRejected,cancellations}));
+    `;
+    const result=spawnSync(process.execPath,['--expose-gc','--input-type=module','-e',source],{
+      cwd:new URL('..',import.meta.url),env:{PATH:'/usr/bin:/bin',LANG:'C',LC_ALL:'C',NO_COLOR:'1'},
+      encoding:'utf8',timeout:5000,maxBuffer:8192
+    });
+    assert.equal(result.status,0,result.stderr);
+    assert.equal(result.stderr,'');
+    assert.deepEqual(JSON.parse(result.stdout),{collected:true,closeRejected:mode!=='valid-close',
+      cancellations:mode==='rejected-disposal'?1:0},mode);
+  }
 });

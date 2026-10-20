@@ -13,7 +13,7 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
   const target=state.target,fetcher=dependencies.fetch??globalThis.fetch;
   const now=dependencies.now??Date.now;
   const settlement=createFormDiagnosticSettlement({now,setTimeout:dependencies.setTimeout,clearTimeout:dependencies.clearTimeout});
-  const work=new Set(),bodies=new Set(),resources=new Map(),releases=new Map(),controllers=new Set();
+  const work=new Set(),bodies=new Set(),resources=new Map(),releases=new WeakMap(),controllers=new Set();
   const proofs=[],acknowledged=[];
   let deadline=null,busy=false,failed=false,closed=false,closeUsed=false,resourceFailure=false;
   let baseline=false,rotated=false,rotationUsed=false,cookie='',csrf='',actor=null,original=null;
@@ -62,7 +62,10 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
     const dispose=resources.get(response);if(!dispose)fail();
     const promise=track(async()=>{
       if(now()>=deadline+120000)fail();
-      await dispose();resources.delete(response);
+      // Pending disposal stays strongly owned by work/resources. Once it has
+      // settled, keep only the weak idempotency entry, even on rejection;
+      // resourceFailure still prevents cleanup from being certified.
+      try {await dispose();}finally {resources.delete(response);}
     });
     releases.set(response,promise);promise.catch(()=>{resourceFailure=true;});return promise;
   }
