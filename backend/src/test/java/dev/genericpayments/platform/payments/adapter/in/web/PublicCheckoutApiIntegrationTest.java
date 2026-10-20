@@ -19,10 +19,10 @@ class PublicCheckoutApiIntegrationTest extends CheckoutTestFixture {
     MockMvc mvc;
     String ip;
     final String create = "/api/v1/public/sites/test-site/checkouts";
-    @BeforeEach void http() { mvc = new AdminApiClient(context).mvc; ip = UUID.randomUUID().toString(); }
+    @BeforeEach void http() { ip = UUID.randomUUID().toString(); mvc = new AdminApiClient(context, ip).mvc; }
     ResultActions create(String key, String body) throws Exception {
         return mvc.perform(post(create).header("Origin", "https://shop.test").header("Idempotency-Key", key)
-            .header("X-Request-Id", "public-test").contentType("application/json").content(body).with(r -> { r.setRemoteAddr(ip); return r; }));
+            .header("X-Request-Id", "public-test").contentType("application/json").content(body));
     }
     Map<String, Object> checkout() throws Exception {
         return JsonPath.read(create("create-" + UUID.randomUUID(), "{\"price_key\":\"lifetime\"}")
