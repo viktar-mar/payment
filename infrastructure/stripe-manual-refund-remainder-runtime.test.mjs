@@ -215,7 +215,7 @@ test('captured ordinary StartedAt cannot flap during durable record or before an
 });
 for(const state of ['future live','regressive live','flapping live'])test(state+' StartedAt cannot authorize acknowledgement or a later start',async()=>{
  const f=fixture(),execute=f.deps.execute;let inspect=0;f.deps.execute=async(file,args,...rest)=>{const r=await execute(file,args,...rest);if(args[2]==='container'&&args[3]==='start'){if(state==='future live')f.projected.postgres.State.StartedAt=new Date(Date.now()+60000).toISOString();if(state==='regressive live')f.projected.postgres.State.StartedAt=f.target.containers.postgres.startedAt;}if(state==='flapping live'&&f.started.length&&args[2]==='container'&&args[3]==='inspect'&&args.at(-1)===f.target.containers.postgres.id&&++inspect===2){const v=JSON.parse(r.stdout);v.State.StartedAt=new Date(Date.now()-500).toISOString();r.stdout=JSON.stringify(v);}return r;};
- // Invalid live proof consumes its finite retries without a wall-clock delay.
+ // Readiness delays use the synthetic timer; ownership failures must not retry.
  const timer=f.deps.setTimeout;f.deps.setTimeout=(fn,ms)=>ms===1500?setTimeout(fn,0):(timer??setTimeout)(fn,ms);
  const runtime=await f.open();await assert.rejects(runtime.restore(f.limits));assert.deepEqual(f.started,['postgres']);assert.equal(f.events.includes('ack:postgres'),false);
 });
@@ -315,4 +315,43 @@ test('construction is inert and the capability cannot restore twice or renew cle
  await runtime.restore(f.limits);const count=f.calls.length;await assert.rejects(runtime.restore(f.limits));assert.equal(f.calls.length,count);
  await assert.rejects(runtime.stop({deadline:f.limits.deadline+120001}));assert.equal(f.calls.length,count);
  await runtime.stop({deadline:f.limits.deadline+120000});
+});
+// Break caught: a second clean projection cannot erase observed ownership or transport failure.
+for(const kind of ['ID','image','label','mount','network','timestamp','transport','starting port'])test('readiness permanently rejects transient '+kind+' failure',async()=>{
+ const f=fixture(),execute=f.deps.execute;let observations=0;
+ f.deps.execute=async(file,args,...rest)=>{const result=await execute(file,args,...rest);
+  if(f.started.length===1&&args[2]==='container'&&args[3]==='inspect'&&args.at(-1)===f.target.containers.postgres.id&&++observations===1){
+   if(kind==='transport')throw Error('SYNTHETIC_PRIVATE_TRANSPORT');const value=JSON.parse(result.stdout);
+   if(kind==='ID')value.Id=id(999);if(kind==='image')value.Image='sha256:'+id(999);if(kind==='label')value.Labels['payment.sandbox.run']='other';
+   if(kind==='mount')value.Mounts[0].RW=false;if(kind==='network')value.Networks[PROJECT+'-network'].NetworkID=id(999);if(kind==='timestamp')value.State.StartedAt=f.target.containers.postgres.startedAt;
+   if(kind==='starting port'){value.State.Health='starting';value.Ports['5432/tcp'][0].HostPort='19999';}result.stdout=JSON.stringify(value);
+  }return result;
+ };
+ f.deps.setTimeout=(callback,ms)=>setTimeout(callback,ms===1500?0:ms);
+ const runtime=await f.open();await assert.rejects(runtime.restore(f.limits),{message:'stripe_manual_refund_remainder_runtime_PENDING'});
+ assert.equal(observations,1);assert.equal(f.events.includes('ack:postgres'),false);assert.deepEqual(f.started,['postgres']);
+ await runtime.stop({deadline:f.limits.deadline+120000});
+});
+test('owned running service with starting health can become healthy on the next readiness observation',async()=>{
+ const f=fixture(),execute=f.deps.execute;let observations=0;
+ f.deps.execute=async(file,args,...rest)=>{const result=await execute(file,args,...rest);if(f.started.length===1&&args[2]==='container'&&args[3]==='inspect'&&args.at(-1)===f.target.containers.postgres.id&&++observations===1){const value=JSON.parse(result.stdout);value.State.Health='starting';result.stdout=JSON.stringify(value);}return result;};
+ f.deps.setTimeout=(callback,ms)=>setTimeout(callback,ms===1500?0:ms);const runtime=await f.open();await runtime.restore(f.limits);assert.ok(observations>=2);assert.deepEqual(f.started,ORDER);assert.equal(f.events.includes('ack:postgres'),true);await runtime.stop({deadline:f.limits.deadline+120000});
+});
+test('starting health pins the new timestamp before the subsequent healthy observation',async()=>{
+ const f=fixture(),execute=f.deps.execute;let observations=0;
+ f.deps.execute=async(file,args,...rest)=>{const result=await execute(file,args,...rest);if(f.started.length===1&&args[2]==='container'&&args[3]==='inspect'&&args.at(-1)===f.target.containers.postgres.id){const value=JSON.parse(result.stdout);observations++;if(observations===1)value.State.Health='starting';else value.State.StartedAt=new Date(Date.parse(value.State.StartedAt)-1).toISOString();result.stdout=JSON.stringify(value);}return result;};
+ f.deps.setTimeout=(callback,ms)=>setTimeout(callback,ms===1500?0:ms);const runtime=await f.open();await assert.rejects(runtime.restore(f.limits));assert.equal(observations,2);assert.equal(f.events.includes('ack:postgres'),false);assert.deepEqual(f.started,['postgres']);
+});
+test('Docker nanosecond stopped regression within one millisecond denies capture',async()=>{
+ const f=fixture();f.target.containers.postgres.startedAt='2026-10-19T10:00:00.123900000Z';f.projected.postgres.State.StartedAt='2026-10-19T10:00:00.123100000Z';
+ const runtime=await f.open();await assert.rejects(runtime.restore(f.limits));assert.deepEqual(f.snapshots,[]);assert.deepEqual(f.started,[]);
+});
+test('Docker nanosecond later start within one millisecond is acknowledged and stopped',async()=>{
+ const f=fixture(),execute=f.deps.execute;f.target.containers.postgres.startedAt='2026-10-19T10:00:00.123100000Z';f.projected.postgres.State.StartedAt='2026-10-19T10:00:00.123100000Z';
+ f.deps.execute=async(file,args,...rest)=>{const result=await execute(file,args,...rest);if(args[2]==='container'&&args[3]==='start'&&args.at(-1)===f.target.containers.postgres.id)f.projected.postgres.State.StartedAt='2026-10-19T10:00:00.123900000Z';return result;};
+ const runtime=await f.open();assert.equal(await runtime.restore(f.limits),true);assert.deepEqual(f.started,ORDER);assert.equal(f.events.includes('ack:postgres'),true);assert.equal(await runtime.stop({deadline:f.limits.deadline+120000}),true);
+});
+test('Docker nanosecond future within the current millisecond denies capture',async()=>{
+ const f=fixture(),now=Date.parse('2026-10-20T12:00:00.123Z');f.deps.now=()=>now;f.limits.deadline=now+60000;f.projected.postgres.State.StartedAt='2026-10-20T12:00:00.123000001Z';
+ const runtime=await f.open();await assert.rejects(runtime.restore(f.limits));assert.deepEqual(f.snapshots,[]);assert.deepEqual(f.started,[]);
 });

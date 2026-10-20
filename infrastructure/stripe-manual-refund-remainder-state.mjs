@@ -19,6 +19,14 @@ function exact(v,keys){if(!v||typeof v!=='object'||Array.isArray(v)||![Object.pr
 function copy(v,depth=0){if(depth>32)fail();if(v===null||['string','boolean','number'].includes(typeof v))return v;if(!v||typeof v!=='object')fail();const d=Object.getOwnPropertyDescriptors(v);if(Array.isArray(v)){if(Reflect.ownKeys(d).length!==v.length+1)fail();return Array.from({length:v.length},(_,i)=>{const p=d[i];if(!p?.enumerable||!Object.hasOwn(p,'value'))fail();return copy(p.value,depth+1);});}if(![Object.prototype,null].includes(Object.getPrototypeOf(v)))fail();return Object.fromEntries(Reflect.ownKeys(d).map(k=>{if(typeof k!=='string'||!d[k].enumerable||!Object.hasOwn(d[k],'value'))fail();return [k,copy(d[k].value,depth+1)];}));}
 function canonical(v){return Array.isArray(v)?v.map(canonical):v&&typeof v==='object'?Object.fromEntries(Object.keys(v).sort().map(k=>[k,canonical(v[k])])):v;}
 const same=(a,b)=>JSON.stringify(canonical(a))===JSON.stringify(canonical(b));
+function timestamp(value){
+ if(typeof value!=='string')fail();
+ const match=/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z$/.exec(value);
+ if(!match)fail();
+ const seconds=Date.parse(match[1]+'Z');
+ if(!Number.isFinite(seconds)||new Date(seconds).toISOString().slice(0,19)!==match[1])fail();
+ return BigInt(seconds)*1000000n+BigInt((match[2]??'').padEnd(9,'0'));
+}
 function frozen(v){if(v&&typeof v==='object'){for(const child of Object.values(v))frozen(child);Object.freeze(v);}return v;}
 function priorState(raw,target,oldLock,now){
  const p=exact(raw,['version','mode','runId','expectedSource','originalRunId','originalSource','deadline','siteId','paymentId','pending','restore','rotation','configure','legs']),l=exact(oldLock,['version','runId','expectedSource']);
@@ -421,9 +429,22 @@ export function createManualRefundRemainderState(input,dependencies={}){
      return true;
  }
  return Object.freeze({admit,target(){if(!ready||pending||closed)throw fixed();return targetValue;},
-  recordStopped:(value,limits)=>transition(limits,()=>{if(state.stopped!==null)fail();const stopped=copy(value);exact(stopped,RESTORE);for(const service of RESTORE){const c=stopped[service],originalContainer=targetValue.original.containers[service];exact(c,Object.keys(originalContainer));if(typeof c.startedAt!=='string'||!Number.isFinite(Date.parse(c.startedAt))||Date.parse(c.startedAt)<Date.parse(originalContainer.startedAt)||Date.parse(c.startedAt)>io.now()||!same({...c,startedAt:originalContainer.startedAt},originalContainer))fail();}state.stopped=stopped;}),
+  recordStopped:(value,limits)=>transition(limits,()=>{
+   if(state.stopped!==null)fail();const stopped=copy(value);exact(stopped,RESTORE);
+   for(const service of RESTORE){
+    const c=stopped[service],originalContainer=targetValue.original.containers[service];exact(c,Object.keys(originalContainer));
+    const current=timestamp(c.startedAt);
+    if(current<timestamp(originalContainer.startedAt)||current>BigInt(io.now())*1000000n
+      ||!same({...c,startedAt:originalContainer.startedAt},originalContainer))fail();
+   }
+   state.stopped=stopped;
+  }),
   beginRestore:(service,limits)=>transition(limits,()=>{if(!state.stopped)fail();const i=RESTORE.indexOf(service),item=state.restore[i];if(i<0||state.restore.slice(0,i).some(v=>v.phase!=='ACKNOWLEDGED'))fail();phase(item,'READY');item.phase='DISPATCHING';}),
-  ackRestore:(service,startedAt,limits)=>transition(limits,()=>{const item=state.restore.find(v=>v.service===service);if(!item||typeof startedAt!=='string'||!Number.isFinite(Date.parse(startedAt))||Date.parse(startedAt)<=Date.parse(state.stopped[service].startedAt)||Date.parse(startedAt)>io.now())fail();phase(item,'DISPATCHING');item.phase='ACKNOWLEDGED';item.startedAt=startedAt;}),
+  ackRestore:(service,startedAt,limits)=>transition(limits,()=>{
+   const item=state.restore.find(v=>v.service===service);if(!item)fail();const current=timestamp(startedAt);
+   if(current<=timestamp(state.stopped[service].startedAt)||current>BigInt(io.now())*1000000n)fail();
+   phase(item,'DISPATCHING');item.phase='ACKNOWLEDGED';item.startedAt=startedAt;
+  }),
   confirmBaseline:(value,limits)=>transition(limits,()=>{if(state.baseline!==null||state.restore.some(v=>v.phase!=='ACKNOWLEDGED'))fail();state.baseline=proof(value,true);}),
   beginRotation:limits=>transition(limits,()=>{if(!state.baseline)fail();phase(state.rotation,'READY');state.rotation.phase='DISPATCHING';}),
   ackRotation:(version,limits)=>transition(limits,()=>{if(version!==3)fail();phase(state.rotation,'DISPATCHING');state.rotation={phase:'ACKNOWLEDGED',version:3};}),

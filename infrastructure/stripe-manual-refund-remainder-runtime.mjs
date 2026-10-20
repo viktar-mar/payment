@@ -6,7 +6,7 @@ import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {validateManualRefundRemainderOptions} from './stripe-manual-refund-remainder-options.mjs';
 import {createFormDiagnosticSettlement} from './stripe-form-diagnostic-settlement.mjs';
-import {proveOwnedContainer,sameOwnedProjection as same,CONTAINER_FORMAT,NETWORK_FORMAT,VOLUME_FORMAT} from './stripe-sandbox-ownership.mjs';
+import {proveOwnedContainer,proveOwnedPorts,sameOwnedProjection as same,CONTAINER_FORMAT,NETWORK_FORMAT,VOLUME_FORMAT} from './stripe-sandbox-ownership.mjs';
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..'),DOCKER='/Applications/Docker.app/Contents/Resources/bin/docker';
 const ORIGINAL='031b5ae7-6603-4339-b1b3-77231291ff34',SOURCE='f0620e40004162d2b3eededa60512f50a492f4cc';
 const ORDER=['postgres','mailpit','callback-receiver','demo-site','backend'],ALL=[...ORDER,'issuer-installer','issuer-probe'];
@@ -179,11 +179,14 @@ export async function createOwnedManualRefundRemainderRuntime(input,dependencies
     }
   }
   function timestamp(value){
-    if(typeof value!=='string'||!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value)||!Number.isFinite(Date.parse(value)))fail();
-    if(new Date(Date.parse(value)).toISOString().slice(0,19)!==value.slice(0,19))fail();
-    return Date.parse(value);
+    if(typeof value!=='string')fail();
+    const match=/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z$/.exec(value);
+    if(!match)fail();
+    const seconds=Date.parse(match[1]+'Z');
+    if(!Number.isFinite(seconds)||new Date(seconds).toISOString().slice(0,19)!==match[1])fail();
+    return BigInt(seconds)*1000000n+BigInt((match[2]??'').padEnd(9,'0'));
   }
-  async function container(service,context,{live=false,cleanup=false,capture=false}={}){
+  async function container(service,context,{live=false,cleanup=false,capture=false,readiness=false}={}){
     const retained=target.containers[service];
     const value=await inspect('container',retained.id,CONTAINER_FORMAT,context,cleanup);
     const helper=service.startsWith('issuer-'),current=timestamp(value?.State?.StartedAt);
@@ -191,7 +194,7 @@ export async function createOwnedManualRefundRemainderRuntime(input,dependencies
     if(helper){
       if(value.State.Running||value.State.Status!=='exited'||value.State.ExitCode!==0||value.State.StartedAt!==retained.startedAt)fail();
     }else{
-      if(current<timestamp(retained.startedAt)||current>io.now())fail();
+      if(current<timestamp(retained.startedAt)||current>BigInt(io.now())*1000000n)fail();
       if(capture){
         if(value.State.Running||value.State.Status!=='exited')fail();
       }else if(started){
@@ -205,12 +208,19 @@ export async function createOwnedManualRefundRemainderRuntime(input,dependencies
     // Only the one-shot mode captures a historically advanced mutable timestamp.
     // The shared proof still checks every immutable property and disconnected network.
     const recorded=started??stopped??{...retained,startedAt:value.State.StartedAt};
+    const pendingHealth=live&&readiness&&value.State.Running===true&&value.State.Status==='running'
+      &&['','starting'].includes(value.State.Health);
     const proof=proveOwnedContainer(value,{service,project:target.project,runId:ORIGINAL,
       network:target.network,sourceImage:target.images[helper?'backend':service],
       recordedContainer:recorded,expectedMounts:retained.mounts,
-      expectedPorts:retained.ports,liveRequired:live,cleanupOnly:true,backendStripeEnabled:true});
+      expectedPorts:retained.ports,liveRequired:live&&!pendingHealth,cleanupOnly:true,backendStripeEnabled:true});
+    if(pendingHealth){
+      if(!value.Ports||typeof value.Ports!=='object'||Array.isArray(value.Ports))fail();
+      proveOwnedPorts(Object.fromEntries(Object.entries(value.Ports).filter(([port,binding])=>
+        !(service==='mailpit'&&port==='1110/tcp'&&binding===null))),retained.ports);
+    }
     if(proof.infrastructureRequired)await infrastructure(context,cleanup);
-    return proof;
+    return {...proof,ready:!pendingHealth};
   }
   async function topology(context,capture=false){
     await source(context);
@@ -347,15 +357,15 @@ export async function createOwnedManualRefundRemainderRuntime(input,dependencies
       let ready=false;
       for(let probe=0;probe<30&&io.now()<until;probe++){
         check(proofContext);
-        try{
-          const proof=await container(service,proofContext,{live:true});
-          startedRecords.set(service,proof.safe);
+        const proof=await container(service,proofContext,{live:true,readiness:true});
+        // Even an owned starting-health observation pins this controller's new timestamp.
+        startedRecords.set(service,proof.safe);
+        if(proof.ready){
           ready=true;
           break;
-        }catch{
-          if(probe===29||io.now()+1500>=until)fail();
-          await call(proofContext,()=>new Promise(resolveWait=>io.setTimeout(resolveWait,1500)));
         }
+        if(probe===29||io.now()+1500>=until)fail();
+        await call(proofContext,()=>new Promise(resolveWait=>io.setTimeout(resolveWait,1500)));
       }
       if(!ready)fail();
       running.add(service);
