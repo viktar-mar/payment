@@ -8,6 +8,10 @@ import { mountStripePayment } from '../providers/stripe-driver.js';
 import { createProviderMount } from '../widget/provider-mount.js';
 import { stripeUiProvider, stripeWire, stripeReadWire, stripeCapability } from '../test/stripe-ui-fixtures.js';
 import { json } from '../test/fixtures.js';
+import type { CheckoutSession } from '../contracts.js';
+import { parseWire } from '../contracts.js';
+import { saveCheckout, recoverCheckout } from '../storage.js';
+import { armManualPayment } from './manual-payment-authorization.js';
 
 defineGenericPaymentWidget();
 type Api = {
@@ -116,4 +120,84 @@ it.each(['view', 'handle'])('retains old form-only %s denial after a different m
   await expect(confirm()).rejects.toMatchObject({ code: 'CONFIRMATION_BLOCKED' });
   controller.abort(); await expect(confirm()).rejects.toMatchObject({ code: 'CONFIRMATION_BLOCKED' });
   expect(authorize).not.toHaveBeenCalled(); expect(p.stripe.confirmPayment).toHaveBeenCalledTimes(0);
+});
+
+let capabilityNumber = 0;
+function manualSession(): CheckoutSession {
+  const parsed = parseWire(stripeWire('REQUIRES_PAYMENT_METHOD'), true);
+  return { checkoutId: parsed.state.checkoutId, checkoutToken: `MANUAL_SYNTHETIC_${++capabilityNumber}`.padEnd(43, 'x'), expiresAt: parsed.state.expiresAt,
+    apiBaseUrl: 'https://api.test', siteKey: 'test-site', priceKey: 'lifetime', state: parsed.state,
+    providerType: 'STRIPE', confirmationMode: 'CLIENT_PROVIDER', providerClientPayload: {} };
+}
+function manualWidget(session: CheckoutSession, deadline = Date.now() + 60000) {
+  const widget = new GenericPaymentWidget(); widget.apiBaseUrl = session.apiBaseUrl; widget.siteKey = session.siteKey; widget.priceKey = session.priceKey;
+  const lease = armManualPayment(widget, { session, deadline, authorize: async () => true }); leases.add(lease);
+  return { widget, lease };
+}
+
+// Break: clearing a weak object marker at close lets a refreshed/copied credential persist.
+it('never persists manual copies before connection, after refresh or after close; ordinary recovery still persists', async () => {
+  const session = manualSession(), f = manualWidget(session), storage = sessionStorage;
+  let credentialWrites = 0;
+  vi.stubGlobal('sessionStorage', { getItem: storage.getItem.bind(storage), removeItem: storage.removeItem.bind(storage), clear: storage.clear.bind(storage),
+    setItem(key: string, value: string) { if (value.includes(session.checkoutToken)) credentialWrites++; storage.setItem(key, value); } });
+  const fetcher = vi.fn(async () => json(stripeReadWire('REQUIRES_PAYMENT_METHOD'))); vi.stubGlobal('fetch', fetcher);
+  saveCheckout({ ...session }); expect(credentialWrites).toBe(0);
+  document.body.append(f.widget); await vi.waitFor(() => expect(f.widget.state).toBe('checking'));
+  expect(fetcher).toHaveBeenCalledTimes(1); expect(credentialWrites).toBe(0);
+  f.lease.close(); saveCheckout({ ...session, state: { ...session.state, status: 'SUCCEEDED' } }); expect(credentialWrites).toBe(0);
+  const ordinary = manualSession(); saveCheckout(ordinary);
+  expect(recoverCheckout(ordinary)?.checkoutId).toBe(ordinary.checkoutId); expect(credentialWrites).toBe(0);
+});
+
+// Break: a new client used with a copied manual capability bypasses the original widget binding.
+it('rejects copied manual sessions in unrelated clients, including after closure', async () => {
+  const session = manualSession(), f = manualWidget(session), fetcher = vi.fn(); vi.stubGlobal('fetch', fetcher);
+  const client = createGenericPaymentClient({ apiBaseUrl: session.apiBaseUrl });
+  await expect(client.get({ ...session })).rejects.toMatchObject({ code: 'TRANSPORT_UNAVAILABLE' });
+  f.lease.close(); await expect(client.prepareClientPayment({ ...session } as import('../contracts.js').StripeCheckoutSession)).rejects.toMatchObject({ code: 'TRANSPORT_UNAVAILABLE' });
+  expect(fetcher).not.toHaveBeenCalled();
+});
+
+// Break: the per-request budget renews the page/Checkout authority when less than 10s remains.
+it.each(['page', 'checkout'])('clips pending recovery to the original %s authority and never accepts its late result', async boundary => {
+  vi.useFakeTimers();
+  const session = manualSession(), now = Date.now();
+  if (boundary === 'checkout') { session.expiresAt = new Date(now + 2000).toISOString(); session.state.expiresAt = session.expiresAt; }
+  const f = manualWidget(session, now + (boundary === 'page' ? 2000 : 60000)), pending = deferred<Response>();
+  let signal: AbortSignal | undefined; const fetcher = vi.fn((_url: string, init: RequestInit) => { signal = init.signal!; return pending.promise; }); vi.stubGlobal('fetch', fetcher);
+  document.body.append(f.widget); await vi.advanceTimersByTimeAsync(0); expect(fetcher).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(1999); expect(signal?.aborted).toBe(false);
+  await vi.advanceTimersByTimeAsync(1); expect(signal?.aborted).toBe(true);
+  pending.resolve(json({ ...stripeReadWire('REQUIRES_PAYMENT_METHOD'), expires_at: session.expiresAt })); await vi.advanceTimersByTimeAsync(0);
+  pay(f.widget).click(); await vi.advanceTimersByTimeAsync(0); expect(fetcher).toHaveBeenCalledTimes(1);
+});
+
+// Break: watch uses a fresh unbounded transport after the authorized recovery read.
+it('bounds the real widget watch read and never polls again after its late body', async () => {
+  vi.useFakeTimers();
+  const session = manualSession(), f = manualWidget(session), body = deferred<string>();
+  let signal: AbortSignal | undefined, count = 0;
+  const fetcher = vi.fn(async (_url: string, init: RequestInit) => {
+    if (++count === 1) return json(stripeReadWire('PROCESSING'));
+    signal = init.signal!; return { ok: true, status: 200, text: () => body.promise } as Response;
+  }); vi.stubGlobal('fetch', fetcher);
+  document.body.append(f.widget); await vi.advanceTimersByTimeAsync(0); expect(fetcher).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(10000); expect(signal?.aborted).toBe(true);
+  body.resolve(JSON.stringify(stripeReadWire('PROCESSING'))); await vi.advanceTimersByTimeAsync(20000);
+  expect(fetcher).toHaveBeenCalledTimes(2); expect(f.widget.querySelector('iframe')).toBeNull();
+});
+
+// Break: a spent/missing handoff leaves an ordinary client able to create another Checkout.
+it.each(['closed-before-connect', 'reconfigure', 'reconnect'])('never starts a new capability after %s loses the handoff', async loss => {
+  const session = manualSession(), f = manualWidget(session);
+  const fetcher = vi.fn(async () => json(stripeReadWire('REQUIRES_PAYMENT_METHOD'))); vi.stubGlobal('fetch', fetcher);
+  if (loss === 'closed-before-connect') f.lease.close();
+  document.body.append(f.widget);
+  if (loss !== 'closed-before-connect') await vi.waitFor(() => expect(f.widget.state).toBe('checking'));
+  if (loss === 'reconfigure') f.widget.priceKey = 'other';
+  if (loss === 'reconnect') { f.widget.remove(); document.body.append(f.widget); }
+  const before = fetcher.mock.calls.length; pay(f.widget).click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(fetcher).toHaveBeenCalledTimes(before);
 });

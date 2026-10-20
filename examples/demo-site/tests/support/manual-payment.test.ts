@@ -25,7 +25,7 @@ if(isMainThread&&process.argv[1]===fileURLToPath(import.meta.url))test('real SDK
           return code;
         }}],build:{outDir:output,lib:{entry:root+'/src/manual-payment.ts',formats:['es'],fileName:()=> 'manual.mjs'}}});return pathToFileURL(join(output,'manual.mjs')).href;
     };
-    const entry=await bundle();for(const scenario of ['no-click','success','validation','grant-rejected','grant-closed','grant-malformed','late-grant','pagehide','close','expired','mixed-session','malformed','late-session','expired-start','programmatic','enter','detached','session-http-timeout','session-body-http-timeout','permit-http-timeout','permit-body-http-timeout'])await t.test(scenario,()=>exercise(entry,scenario));
+    const entry=await bundle();for(const scenario of ['no-click','success','validation','grant-rejected','grant-closed','grant-malformed','late-grant','pagehide','close','expired','mixed-session','malformed','late-session','expired-start','programmatic','enter','detached','session-http-timeout','session-body-http-timeout','permit-http-timeout','permit-body-http-timeout',...['get','post','refresh'].flatMap(stage=>['headers','body','pagehide','detached','late'].map(phase=>`sdk-${stage}-${phase}`)),'sdk-post-host','sdk-refresh-host'])await t.test(scenario,()=>exercise(entry,scenario));
     const mixed=await bundle('mixed');await t.test('missing module instrumentation fails before Pay',()=>exercise(mixed,'instrumentation'));
     const mutant=await bundle('start-latch');await t.test('behavioral start latch mutation is detected',async()=>{
       await assert.rejects(exercise(mutant,'success'),error=>error instanceof Error&&error.message.includes('one_shot_session_exchange'));
@@ -47,6 +47,10 @@ if(!isMainThread){
   const checkout='11111111-1111-4111-8111-111111111111',payment='22222222-2222-4222-8222-222222222222',api='http://127.0.0.1:18080',token='x'.repeat(43),secret='pi_fixture_secret_sensitive',expiresAt='2099-01-01T00:00:00Z';
   const price={priceId:'33333333-3333-4333-8333-333333333333',priceKey:'test-price',version:1,amountMinor:2000,currency:'EUR',taxMode:'NONE'};
   const session={version:2,apiBaseUrl:api,siteKey:'test-site',priceKey:'test-price',checkoutId:checkout,checkoutToken:token,expiresAt,providerType:'STRIPE',confirmationMode:'CLIENT_PROVIDER',state:{checkoutId:checkout,paymentId:payment,amountMinor:2000,currency:'EUR',price,status:'REQUIRES_PAYMENT_METHOD',expiresAt}};
+  // Count throughout the lifetime; never retain or print credential-bearing writes.
+  let credentialWrites=0;const originalSet=window.Storage.prototype.setItem;
+  window.Storage.prototype.setItem=function(key:string,value:string){if(value.includes(token)||value.includes(secret))credentialWrites++;return originalSet.call(this,key,value);};
+  let releaseSdk:((value:Response)=>void)|undefined,releaseSdkBody:((value:string)=>void)|undefined,sdkSignal:AbortSignal|undefined,sdkReply:unknown;
   const calls:string[]=[],listeners=new Map<string,()=>void>();let forbiddenReads=0,mounts=0,resumes=0,getCalls=0,releaseGrant:((value:Response)=>void)|undefined,releaseSession:((value:Response)=>void)|undefined,releaseBody:((value:string)=>void)|undefined,httpSignal:AbortSignal|undefined;
   const frame=window.document.createElement('iframe');for(const key of ['src','contentWindow','contentDocument'])Object.defineProperty(frame,key,{get(){forbiddenReads++;throw Error('forbidden_card_read');}});
   const element={on:(name:string,callback:()=>void)=>{listeners.set(name,callback);return element;},off:(name:string)=>{listeners.delete(name);return element;},mount:(host:HTMLElement)=>{mounts++;host.append(frame);listeners.get('ready')?.();},destroy:()=>frame.remove(),focus:()=>{}};
@@ -66,8 +70,13 @@ if(!isMainThread){
       if(scenario==='permit-body-http-timeout'){httpSignal=init?.signal??undefined;return new Promise<Response>(resolve=>{releaseGrant=()=>resolve({ok:true,text:()=>new Promise<string>(yes=>{releaseBody=yes;})} as Response);});}return Response.json({authorized:true});
     }
     assert.equal(url.origin,api,'all external HTTP denied');assert.equal(url.pathname.startsWith('/api/v1/public/checkouts/'+checkout),true);assert.equal(init?.headers instanceof Headers?init.headers.get('Authorization'):(init?.headers as Record<string,string>)?.Authorization,'Bearer '+token);
-    if(url.pathname.endsWith('/client-session'))return Response.json({checkout_id:checkout,payment_id:payment,attempt_id:'44444444-4444-4444-8444-444444444444',provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',publishable_key:'pk_test_fixture',client_secret:secret,expires_at:expiresAt,return_url:'http://127.0.0.1:14174/payment-return.html'});
-    getCalls++;return Response.json({checkout_id:checkout,payment_id:payment,amount_minor:2000,currency:'EUR',price:{price_id:price.priceId,price_key:price.priceKey,version:1,amount_minor:2000,currency:'EUR',tax_mode:'NONE'},provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',provider_client_payload:{},status:fakeStripe.confirmCalls&&scenario!=='validation'?'SUCCEEDED':'REQUIRES_PAYMENT_METHOD',expires_at:expiresAt});
+    const preparing=url.pathname.endsWith('/client-session');if(!preparing)getCalls++;
+    const reply=preparing?{checkout_id:checkout,payment_id:payment,attempt_id:'44444444-4444-4444-8444-444444444444',provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',publishable_key:'pk_test_fixture',client_secret:secret,expires_at:expiresAt,return_url:'http://127.0.0.1:14174/payment-return.html'}:{checkout_id:checkout,payment_id:payment,amount_minor:2000,currency:'EUR',price:{price_id:price.priceId,price_key:price.priceKey,version:1,amount_minor:2000,currency:'EUR',tax_mode:'NONE'},provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',provider_client_payload:{},status:fakeStripe.confirmCalls&&scenario!=='validation'?'SUCCEEDED':'REQUIRES_PAYMENT_METHOD',expires_at:expiresAt};
+    if(scenario.startsWith(`sdk-${preparing?'post':getCalls===1?'get':'refresh'}-`)){
+      sdkSignal=init?.signal??undefined;sdkReply=reply;
+      return new Promise<Response>(resolve=>{releaseSdk=scenario.endsWith('-body')?()=>resolve({ok:true,status:200,text:()=>new Promise<string>(yes=>{releaseSdkBody=yes;})} as Response):resolve;});
+    }
+    return Response.json(reply);
   };
   window.fetch=globalThis.fetch;
   try{
@@ -76,7 +85,25 @@ if(!isMainThread){
     if(scenario!=='no-click'){
       if(scenario==='expired-start')now=1300000;start.click();start.click();
       assert.equal(calls.filter(path=>path==='/manual-payment-session').length,scenario==='expired-start'?0:1,'one_shot_session_exchange');
-      if(scenario.startsWith('session-')&&scenario.endsWith('http-timeout')){
+      if(scenario.startsWith('sdk-')){
+        if(scenario.startsWith('sdk-refresh-')){await until(()=>root.querySelector('generic-payment-widget')?.state==='ready');root.querySelector('generic-payment-widget').shadowRoot.querySelector('button[aria-label="Pay"]').click();}
+        await until(()=>!!releaseSdk);const before=calls.length;
+        if(scenario.endsWith('-body')){await advance(1008000);releaseSdk!(Response.json(sdkReply));await until(()=>!!releaseSdkBody);}
+        if(scenario.endsWith('-pagehide'))window.dispatchEvent(new window.Event('pagehide'));
+        else if(scenario.endsWith('-detached'))root.querySelector('generic-payment-widget').remove();
+        else if(scenario.endsWith('-host'))root.querySelector('generic-payment-widget > div').replaceWith(document.createElement('div'));
+        else if(scenario.endsWith('-late'))now=1011000; // Delayed event loop: completion checks must also enforce the deadline.
+        else await advance(1010000);
+        if(!scenario.endsWith('-late')&&!scenario.endsWith('-host'))assert.equal(sdkSignal?.aborted,true,'sdk_http_or_lifetime_abort');
+        if(!scenario.endsWith('-host'))now=1011000;releaseSdk!(Response.json(sdkReply));releaseSdkBody?.(JSON.stringify(sdkReply));await tick();await tick();
+        assert.equal(calls.length,before,'late_sdk_completion_cannot_start_next_capability');
+        assert.equal(mounts,scenario.startsWith('sdk-refresh-')?1:0,'late_sdk_completion_cannot_mount_provider');
+        assert.equal(fakeStripe.confirmCalls,scenario.startsWith('sdk-refresh-')?1:0);
+        await until(()=>root.querySelector('generic-payment-widget')===null);
+        const captured=(globalThis as typeof globalThis&{__manualHandle?:{confirm():Promise<unknown>}}).__manualHandle;if(captured)await assert.rejects(captured.confirm());
+        start.click();assert.equal(calls.length,before);
+      }
+      else if(scenario.startsWith('session-')&&scenario.endsWith('http-timeout')){
         await until(()=>!!releaseSession||!!releaseBody);if(scenario==='session-body-http-timeout'){await advance(1008000);releaseSession!(Response.json(session));await until(()=>!!releaseBody);}await advance(1010000);assert.equal(httpSignal?.aborted,true,'session_http_10s_abort');assert.match(root.querySelector('[role="status"]').textContent,/Закройте/);await advance(1016000);
         releaseSession?.(Response.json(session));releaseBody?.(JSON.stringify(session));await tick();start.click();assert.equal(mounts,0);assert.equal(calls.filter(path=>path==='/manual-payment-session').length,1);assert.equal(fakeStripe.confirmCalls,0);
       }
@@ -101,6 +128,6 @@ if(!isMainThread){
       }
       assert.equal(calls.filter(path=>path==='/manual-payment-session').length,scenario==='expired-start'?0:1,'one_shot_session_exchange');
     }
-    page?.close();assert.equal(forbiddenReads,0);assert.equal(window.sessionStorage.length,0);for(const privateValue of [token,secret,checkout])assert.equal((root.outerHTML+window.location.href).includes(privateValue),false);parentPort?.postMessage('PASS');
+    page?.close();assert.equal(forbiddenReads,0);assert.equal(credentialWrites,0,'zero_credential_storage_writes_throughout_lifetime');assert.equal(window.sessionStorage.length,0);for(const privateValue of [token,secret,checkout])assert.equal((root.outerHTML+window.location.href).includes(privateValue),false);parentPort?.postMessage('PASS');
   }finally{Date.now=actualNow;frame.remove();window.close();}
 }

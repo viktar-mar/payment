@@ -2,6 +2,7 @@ import { createGenericPaymentClient } from "../client.js";
 import type { CheckoutSession, CheckoutState, GenericPaymentClient } from "../contracts.js";
 import { isAbort, PaymentSdkError } from "../errors.js";
 import { recoverCheckout } from "../storage.js";
+import { takeManualPaymentSession, bindManualPaymentClient, isManualPaymentSession } from '../diagnostics/manual-payment-session.js';
 import { widgetStyles } from "./styles.js";
 import { CheckoutProviderView, checkoutPresentation } from './checkout-provider-view.js';
 import { subscribeCheckoutCustomer } from '../customer/session-lifecycle.js';
@@ -71,8 +72,8 @@ export class GenericPaymentWidget extends ElementBase {
     if (reset) this.#state = "idle";
     const generation = this.#generation;
     try {
-      this.#client = createGenericPaymentClient({ apiBaseUrl: this.apiBaseUrl, signal: this.#controller.signal });
-      this.#session = recoverCheckout({ apiBaseUrl: this.apiBaseUrl, siteKey: this.siteKey, priceKey: this.priceKey }) ?? undefined;
+      this.#client = createGenericPaymentClient(bindManualPaymentClient(this, { apiBaseUrl: this.apiBaseUrl, signal: this.#controller.signal }));
+      this.#session = takeManualPaymentSession(this) ?? recoverCheckout({ apiBaseUrl: this.apiBaseUrl, siteKey: this.siteKey, priceKey: this.priceKey }) ?? undefined;
     } catch { this.#state = "idle"; }
     if (!this.#session) this.#state = "idle";
     else { this.#checking = this.#session.checkoutId === this.#unresolvedCheckout; this.#bindSession(this.#session, generation); }
@@ -118,6 +119,9 @@ export class GenericPaymentWidget extends ElementBase {
     if (error instanceof PaymentSdkError && error.code === "CHECKOUT_EXPIRED") {
       if (this.#session) this.#apply({ ...this.#session.state, status: 'EXPIRED' }, true);
       else this.#transition("expired");
+    } else if (this.#session && isManualPaymentSession(this.#session)) {
+      // Manual preparation/transport failure is terminal, including Resume.
+      invalidateManualPaymentWidget(this); this.#transition('unknown', { ...this.#session.state, status: 'UNKNOWN' }, true);
     } else if (confirming && this.#session?.providerType === 'STRIPE') {
       if (error instanceof PaymentSdkError && error.code === 'PROVIDER_DECLINED') { this.#checking = false; this.#apply(this.#session.state); }
       else { this.#checking = true; this.#unresolvedCheckout = this.#session.checkoutId; this.#transition('checking', undefined, true); }

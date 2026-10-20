@@ -11,6 +11,7 @@ import type { DonationCheckoutInput, DonationCheckoutSession } from './donations
 import { createSubscriptionClient } from './subscriptions/client.js';
 import { parseClientPaymentSession, parseClientSessionJson } from './providers/client-session.js';
 import { captureCheckoutCustomer } from './customer/session-lifecycle.js';
+import { manualPaymentRequest } from './diagnostics/manual-payment-session.js';
 const binding = (parsed: ReturnType<typeof parseWire>) => parsed.providerType === 'FAKE' ? { providerType: 'FAKE', confirmationMode: 'SERVER' } as const : { providerType: 'STRIPE', confirmationMode: 'CLIENT_PROVIDER' } as const;
 function snapshotSession<T extends CheckoutSession>(session: T): T { return { ...session, state: safeState(session.state), ...(session.donation ? { donation: { ...session.donation } } : {}) }; }
 function assertUnchangedSession(session: CheckoutSession, snapshot: CheckoutSession): void {
@@ -21,7 +22,8 @@ export function createGenericPaymentClient(options: ClientOptions): GenericPayme
   const base = normalizeApiBase(options.apiBaseUrl);
   const signalFor = (signal?: AbortSignal) => signal && options.signal ? AbortSignal.any([signal, options.signal]) : signal ?? options.signal;
   async function request(path: string, method: "GET" | "POST" | "DELETE", body?: object, capability: RequestCapability = { kind: "none" }, idempotency?: string, signal?: AbortSignal, expected?: readonly number[], cap = 32768, rule?: ResponseRule, parseSuccess?: (raw: string) => unknown): Promise<unknown> {
-    const activeSignal = signalFor(signal); checkAbort(activeSignal);
+    return manualPaymentRequest(options, capability.kind === 'checkout' ? capability.token : undefined, signalFor(signal), async activeSignal => {
+    checkAbort(activeSignal);
     const headers = new Headers({ Accept: "application/json, application/problem+json" });
     if (body) headers.set("Content-Type", "application/json");
     if (capability.kind !== "none") headers.set("Authorization", `Bearer ${capability.token}`);
@@ -47,6 +49,7 @@ export function createGenericPaymentClient(options: ClientOptions): GenericPayme
     if (!response.ok) { if (capability.kind === "customer" && response.status === 401) throw new PaymentSdkError("INVALID_SESSION"); throw problemError(data); }
     if (rule && !rule(response.status, data)) throw new PaymentSdkError("INVALID_RESPONSE");
     return data;
+    });
   }
   const customer = createCustomerClient(base, request, signalFor);
   // Weak identity owns only a random key; no captured donor text or request bodies.

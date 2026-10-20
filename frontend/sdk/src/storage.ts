@@ -1,6 +1,7 @@
 import { exact, key, normalizeApiBase, object, safeState, validateSession } from "./contracts.js";
 import type { CheckoutSession, RecoveryIdentity } from "./contracts.js";
 import { PaymentSdkError } from "./errors.js";
+import { isManualPaymentSession } from './diagnostics/manual-payment-session.js';
 const recoveryCandidates = new WeakSet<CheckoutSession>();
 /** Internal workflow markers; neither persisted authority nor public SDK API. */
 export function needsRecoveryRead(session: CheckoutSession): boolean { return recoveryCandidates.has(session); }
@@ -12,7 +13,7 @@ export function storageKey(identity: RecoveryIdentity): string {
 function storage(): Storage | undefined { try { return globalThis.sessionStorage; } catch { return undefined; } }
 export function saveCheckout(session: CheckoutSession): void {
   validateSession(session);
-  if (session.donation) return;
+  if (session.donation || isManualPaymentSession(session)) return;
   if (Date.parse(session.expiresAt) <= Date.now()) { clearCheckout(session); return; }
   const record = { version: 2, checkoutId: session.checkoutId, checkoutToken: session.checkoutToken, expiresAt: session.expiresAt, apiBaseUrl: session.apiBaseUrl, siteKey: session.siteKey, priceKey: session.priceKey, state: safeState(session.state), providerType: session.providerType, confirmationMode: session.confirmationMode };
   try { storage()?.setItem(storageKey(session), JSON.stringify(record)); } catch { /* Memory capability still works when storage is blocked. */ }
