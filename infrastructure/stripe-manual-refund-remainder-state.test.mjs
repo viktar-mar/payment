@@ -13,6 +13,56 @@ const partial=()=>({refundId:'aaaaaaaa-bbbb-4ccc-8ddd-000000000020',providerRefe
 const complete=()=>({refundId:'aaaaaaaa-bbbb-4ccc-8ddd-000000000021',providerReference:'re_REMAINDER',providerEventId:'evt_REMAINDER',cashEventId:'aaaaaaaa-bbbb-4ccc-8ddd-000000000031',amountMinor:1300,totalMinor:2000,providerVerified:true,webhookVerified:true,journalVerified:true,callbackSignatureVerified:true});
 async function restored(f,s){await s.recordStopped(Object.fromEntries(SERVICES.map(k=>[k,structuredClone(s.target().original.containers[k])])),f.limits);for(const service of SERVICES){await s.beginRestore(service,f.limits);await s.ackRestore(service,'2026-10-19T11:00:00Z',f.limits);}}
 async function configured(f,s){await restored(f,s);await s.confirmBaseline(partial(),f.limits);await s.beginRotation(f.limits);await s.ackRotation(3,f.limits);await s.beginConfigure(3,f.limits);await s.ackConfigure(3,f.limits);}
+test('admission signal cannot be omitted or replaced after idle cancellation',async t=>{
+ for(const replacement of [false,true])await t.test(replacement?'replacement signal':'omitted signal',async t=>{
+  const f=await fixture(t),admission=new AbortController(),s=f.create();
+  const cleanup={deadline:f.limits.deadline+120000};
+  t.after(()=>s.close(cleanup).catch(()=>{}));
+  assert.equal(await s.admit({...f.limits,signal:admission.signal}),'READY');
+  await configured(f,s);
+  admission.abort();
+  const limits=replacement?{...f.limits,signal:new AbortController().signal}:f.limits;
+  await assert.rejects(s.beginRemainder(limits),{message:'stripe_manual_refund_remainder_state_PENDING'});
+  assert.equal(JSON.parse(await fs.readFile(f.statePath,'utf8')).remainder.phase,'READY');
+  assert.equal(await s.close(cleanup),true);
+  assert.ok(await fs.stat(f.lockPath));
+ });
+});
+test('admission signal cancels asynchronous continuation and additional signals can narrow it',async t=>{
+ for(const kind of ['omitted','replacement','additional'])await t.test(kind,async t=>{
+  const f=await fixture(t),admission=new AbortController(),additional=new AbortController();
+  let armed=false,enter,unblock,renames=0;
+  const entered=new Promise(resolve=>{enter=resolve;}),blocked=new Promise(resolve=>{unblock=resolve;}),handles=new Set();
+  f.deps.open=async(...args)=>{
+   const h=await fs.open(...args);handles.add(h);
+   const wrapped=new Proxy(h,{get(o,k){return k==='close'?async()=>{await o.close();handles.delete(o);}:typeof o[k]==='function'?o[k].bind(o):o[k];}});
+   if(armed&&args[0]===f.statePath){armed=false;enter();await blocked;}
+   return wrapped;
+  };
+  f.deps.rename=async(...args)=>{renames++;return fs.rename(...args);};
+  const s=f.create(),cleanup={deadline:f.limits.deadline+120000};
+  t.after(async()=>{unblock();await s.close(cleanup).catch(()=>{});});
+  assert.equal(await s.admit({...f.limits,signal:admission.signal}),'READY');
+  await configured(f,s);
+  const before=renames;armed=true;
+  const limits=kind==='omitted'?f.limits:{...f.limits,signal:additional.signal};
+  let settled=false;
+  const dispatch=s.beginRemainder(limits).then(value=>({value}),error=>({error})).finally(()=>{settled=true;});
+  await entered;
+  if(kind==='additional')additional.abort();else admission.abort();
+  await new Promise(resolve=>setImmediate(resolve));
+  const cancelledWhileBlocked=settled;
+  unblock();
+  const outcome=await dispatch;
+  await s.close(cleanup).catch(()=>{});
+  assert.equal(cancelledWhileBlocked,true);
+  assert.equal(outcome.error?.message,'stripe_manual_refund_remainder_state_PENDING');
+  assert.equal(renames,before);
+  assert.equal(JSON.parse(await fs.readFile(f.statePath,'utf8')).remainder.phase,'READY');
+  assert.equal(handles.size,0);
+  assert.ok(await fs.stat(f.lockPath));
+ });
+});
 test('admission reads only pinned prior700ACK/1300READY after clean source and canonical socket',async t=>{const f=await fixture(t),s=f.create();assert.throws(()=>s.target());assert.equal(await s.admit(f.limits),'READY');assert.equal(s.target().priorRefundId,f.prior.legs[0].refundId);assert.equal(s.target().remainderKey,'s5a-refund:34941d87-12d3-4c74-8c5a-b62b7c914390:remainder');assert.ok(Object.isFrozen(s.target().original.containers.backend));await s.close({deadline:f.limits.deadline+120000});});
 test('invalid-option admission remains closable without accessing dependencies',async()=>{let reads=0;const deps=new Proxy({},{get(){reads++;throw Error('CANARY');}}),s=createManualRefundRemainderState({},deps);assert.equal(reads,0);assert.equal(await s.admit({deadline:Date.now()+10000}),'DENIED');assert.equal(reads,0);assert.equal(await s.close({deadline:Date.now()+10000}),true);assert.throws(()=>s.target());assert.equal(reads,0);});
 test('expired prior budget and matching old lock are mandatory',async t=>{for(const kind of ['deadline','lock','phase','proof','key','source','amount','restore','rotation'])await t.test(kind,async t=>{const f=await fixture(t);if(kind==='deadline')f.prior.deadline=f.limits.deadline;if(kind==='phase')f.prior.legs[1].phase='DISPATCHING';if(kind==='proof')f.prior.legs[0].proof={};if(kind==='key')f.prior.legs[1].key='wrong';if(kind==='source')f.prior.expectedSource='c'.repeat(40);if(kind==='amount')f.prior.legs[0].amountMinor=1300;if(kind==='restore')f.prior.restore[0].phase='READY';if(kind==='rotation')f.prior.rotation.version=3;await fs.writeFile(f.priorState,JSON.stringify(f.prior)+'\n');if(kind==='lock')await fs.writeFile(f.oldLock,'{}\n');const s=f.create();assert.equal(await s.admit(f.limits),'DENIED');await s.close({deadline:f.limits.deadline+120000});await assert.rejects(fs.stat(f.lockPath),{code:'ENOENT'});});});
