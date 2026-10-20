@@ -333,38 +333,148 @@ async function createCliAdapter(options,dependencies,refundMode) {
   }
   const manualOperation=(code,limits,body)=>operation(code,limits,body).catch(()=>{manualFailed=true;throw fixed(code);});
   function refundListener(context){
-    if(refundFailed||uncertain||!refundOwner||owner!==refundOwner||owner.child.pid!==owner.pid||!owner.ready||!owner.valid||owner.invalidated||owner.exited||owner.stopping||owner.explicitStop||context.deadline!==refundDeadline)fail();check(context);
+    if(refundFailed||uncertain||!refundOwner||owner!==refundOwner
+      ||owner.child.pid!==owner.pid||!owner.ready||!owner.valid||owner.invalidated
+      ||owner.exited||owner.stopping||owner.explicitStop||context.deadline!==refundDeadline)fail();
+    check(context);
   }
-  function assertRefundListener(limits){try{if(busy||!refundBinding)fail();const d=Object.getOwnPropertyDescriptors(limits??{}),keys=Reflect.ownKeys(d);if(!object(limits)||![Object.prototype,null].includes(Object.getPrototypeOf(limits))||keys.length<1||keys.length>2||keys.some(k=>!['deadline','signal'].includes(k))||!d.deadline?.enumerable||!Object.hasOwn(d.deadline,'value')||!Number.isSafeInteger(d.deadline.value)||d.signal&&(!d.signal.enumerable||!Object.hasOwn(d.signal,'value')||d.signal.value!==undefined&&!(d.signal.value instanceof AbortSignal)))fail();refundListener({deadline:d.deadline.value,signal:d.signal?.value??{aborted:false}});return true;}catch{refundFailed=true;throw fixed('REFUND_LISTENER');}}
-  async function refundRead(context,body){refundListener(context);await binding(context);refundListener(context);const result=await body();refundListener(context);return result;}
+  function assertRefundListener(limits){
+    try{
+      if(busy||!refundBinding)fail();
+      const d=Object.getOwnPropertyDescriptors(limits??{}),keys=Reflect.ownKeys(d);
+      if(!object(limits)||![Object.prototype,null].includes(Object.getPrototypeOf(limits))
+        ||keys.length<1||keys.length>2||keys.some(k=>!['deadline','signal'].includes(k))
+        ||!d.deadline?.enumerable||!Object.hasOwn(d.deadline,'value')
+        ||!Number.isSafeInteger(d.deadline.value)
+        ||d.signal&&(!d.signal.enumerable||!Object.hasOwn(d.signal,'value')
+          ||d.signal.value!==undefined&&!(d.signal.value instanceof AbortSignal)))fail();
+      refundListener({deadline:d.deadline.value,signal:d.signal?.value??{aborted:false}});
+      return true;
+    }catch{refundFailed=true;throw fixed('REFUND_LISTENER');}
+  }
+  async function refundRead(context,body){
+    refundListener(context);
+    await binding(context);
+    refundListener(context);
+    const result=await body();
+    refundListener(context);
+    return result;
+  }
   async function captured(context,total,expectedReferences,currentRefundId){
-    const p=parseBody(await command(['get','/v1/payment_intents/'+refundBinding.intentId,'--expand','latest_charge.refunds'],context)),c=p.latest_charge;
-    if(p.id!==refundBinding.intentId||p.object!=='payment_intent'||p.livemode!==false||p.status!=='succeeded'||p.amount!==2000||p.amount_received!==2000||p.currency!=='eur'||p.capture_method!=='automatic'||p.customer!==null||!Array.isArray(p.payment_method_types)||p.payment_method_types.length!==1||p.payment_method_types[0]!=='card'||p.metadata?.payment_id!==refundBinding.paymentId||p.metadata?.site_id!==refundBinding.siteId||p.metadata?.source!=='CATALOG')fail();
-    if(!object(c)||typeof c.id!=='string'||!/^ch_[A-Za-z0-9_]{1,200}$/.test(c.id)||refundCharge!==null&&c.id!==refundCharge||c.object!=='charge'||c.livemode!==false||c.customer!==null||c.payment_intent!==refundBinding.intentId||c.status!=='succeeded'||c.paid!==true||c.captured!==true||c.amount!==2000||c.amount_captured!==2000||c.currency!=='eur'||c.payment_method_details?.type!=='card'||c.amount_refunded!==total||c.refunded!==(total===2000)||c.refunds?.object!=='list'||c.refunds.has_more!==false||!Array.isArray(c.refunds.data)||c.refunds.data.length!==expectedReferences.length||new Set(c.refunds.data.map(r=>r.id)).size!==expectedReferences.length||c.refunds.data.some(r=>!expectedReferences.includes(r.id)))fail();
-    for(const r of c.refunds.data)refundObject(r,r.id,r.id===partialReference?700:total===700?700:1300,c.id,r.id===partialReference?partialRefundId:currentRefundId);
-    refundCharge??=c.id;return c;
+    const p=parseBody(await command(['get','/v1/payment_intents/'+refundBinding.intentId,
+      '--expand','latest_charge.refunds'],context));
+    const c=p.latest_charge;
+    if(p.id!==refundBinding.intentId||p.object!=='payment_intent'||p.livemode!==false
+      ||p.status!=='succeeded'||p.amount!==2000||p.amount_received!==2000||p.currency!=='eur'
+      ||p.capture_method!=='automatic'||p.customer!==null
+      ||!Array.isArray(p.payment_method_types)||p.payment_method_types.length!==1
+      ||p.payment_method_types[0]!=='card'||p.metadata?.payment_id!==refundBinding.paymentId
+      ||p.metadata?.site_id!==refundBinding.siteId||p.metadata?.source!=='CATALOG')fail();
+    if(!object(c)||typeof c.id!=='string'||!/^ch_[A-Za-z0-9_]{1,200}$/.test(c.id)
+      ||refundCharge!==null&&c.id!==refundCharge||c.object!=='charge'||c.livemode!==false
+      ||c.customer!==null||c.payment_intent!==refundBinding.intentId||c.status!=='succeeded'
+      ||c.paid!==true||c.captured!==true||c.amount!==2000||c.amount_captured!==2000
+      ||c.currency!=='eur'||c.payment_method_details?.type!=='card'||c.amount_refunded!==total
+      ||c.refunded!==(total===2000)||c.refunds?.object!=='list'||c.refunds.has_more!==false
+      ||!Array.isArray(c.refunds.data)||c.refunds.data.length!==expectedReferences.length
+      ||new Set(c.refunds.data.map(r=>r.id)).size!==expectedReferences.length
+      ||c.refunds.data.some(r=>!expectedReferences.includes(r.id)))fail();
+    for(const r of c.refunds.data){
+      refundObject(r,r.id,r.id===partialReference?700:total===700?700:1300,c.id,
+        r.id===partialReference?partialRefundId:currentRefundId);
+    }
+    refundCharge??=c.id;
+    return c;
   }
-  function refundObject(r,reference,amount,charge,refundId){if(!object(r)||r.id!==reference||r.object!=='refund'||r.status!=='succeeded'||r.amount!==amount||r.currency!=='eur'||r.charge!==charge||r.payment_intent!==refundBinding.intentId||r.livemode!==undefined&&r.livemode!==false||r.metadata?.payment_id!==refundBinding.paymentId||r.metadata?.refund_id!==refundId)fail();}
+  function refundObject(r,reference,amount,charge,refundId){
+    if(!object(r)||r.id!==reference||r.object!=='refund'||r.status!=='succeeded'
+      ||r.amount!==amount||r.currency!=='eur'||r.charge!==charge
+      ||r.payment_intent!==refundBinding.intentId||r.livemode!==undefined&&r.livemode!==false
+      ||r.metadata?.payment_id!==refundBinding.paymentId||r.metadata?.refund_id!==refundId)fail();
+  }
   async function bindCapturedPayment(original,context){
-    if(refundBindUsed)fail();refundBindUsed=true;
-    const data=(objectValue,fields)=>{if(!object(objectValue)||![Object.prototype,null].includes(Object.getPrototypeOf(objectValue)))fail();const d=Object.getOwnPropertyDescriptors(objectValue);if(Reflect.ownKeys(d).length!==fields.length||fields.some(k=>!d[k]?.enumerable||!Object.hasOwn(d[k],'value')))fail();return Object.fromEntries(fields.map(k=>[k,d[k].value]));};
-    const target=data(original,['originalRunId','originalSource','project','containers','images','network','volumes','ports','endpoints','account','site','price','paymentId','operationId','intentId','callbackVersion','amountMinor','currency','source']);
-    const account=data(target.account,['id','key','externalId']),site=data(target.site,['id','key']),price=data(target.price,['id','key','version','providerPriceId']);
-    if(target.originalRunId!=='031b5ae7-6603-4339-b1b3-77231291ff34'||target.originalSource!=='f0620e40004162d2b3eededa60512f50a492f4cc'||target.project!=='stripe-'+target.originalRunId||account.key!=='stripe-sandbox-default'||target.source!=='CATALOG'||target.callbackVersion!==1||price.version!==1||typeof price.providerPriceId!=='string'||!/^price_[A-Za-z0-9_]{1,200}$/.test(price.providerPriceId))fail();
-    const value={paymentId:target.paymentId,siteId:site.id,paymentAccountId:account.id,operationId:target.operationId,intentId:target.intentId,priceId:price.id,priceKey:price.key,amountMinor:target.amountMinor,currency:target.currency,externalAccountId:account.externalId};
-    if(!['paymentId','siteId','paymentAccountId','operationId','priceId'].every(k=>typeof value[k]==='string'&&UUID.test(value[k]))||typeof value.intentId!=='string'||!/^pi_[A-Za-z0-9_]{1,200}$/.test(value.intentId)||typeof value.priceKey!=='string'||!/^s5a-price-[a-z0-9-]{1,100}$/.test(value.priceKey)||value.amountMinor!==2000||value.currency!=='EUR'||value.externalAccountId!==ACCOUNT)fail();refundBinding=Object.freeze(value);await refundRead(context,()=>captured(context,0,[]));return true;
+    if(refundBindUsed)fail();
+    refundBindUsed=true;
+    const data=(objectValue,fields)=>{
+      if(!object(objectValue)||![Object.prototype,null].includes(Object.getPrototypeOf(objectValue)))fail();
+      const d=Object.getOwnPropertyDescriptors(objectValue);
+      if(Reflect.ownKeys(d).length!==fields.length
+        ||fields.some(k=>!d[k]?.enumerable||!Object.hasOwn(d[k],'value')))fail();
+      return Object.fromEntries(fields.map(k=>[k,d[k].value]));
+    };
+    const target=data(original,['originalRunId','originalSource','project','containers','images',
+      'network','volumes','ports','endpoints','account','site','price','paymentId','operationId',
+      'intentId','callbackVersion','amountMinor','currency','source']);
+    const account=data(target.account,['id','key','externalId']);
+    const site=data(target.site,['id','key']);
+    const price=data(target.price,['id','key','version','providerPriceId']);
+    if(target.originalRunId!=='031b5ae7-6603-4339-b1b3-77231291ff34'
+      ||target.originalSource!=='f0620e40004162d2b3eededa60512f50a492f4cc'
+      ||target.project!=='stripe-'+target.originalRunId||account.key!=='stripe-sandbox-default'
+      ||target.source!=='CATALOG'||target.callbackVersion!==1||price.version!==1
+      ||typeof price.providerPriceId!=='string'||!/^price_[A-Za-z0-9_]{1,200}$/.test(price.providerPriceId))fail();
+    const value={paymentId:target.paymentId,siteId:site.id,paymentAccountId:account.id,
+      operationId:target.operationId,intentId:target.intentId,priceId:price.id,priceKey:price.key,
+      amountMinor:target.amountMinor,currency:target.currency,externalAccountId:account.externalId};
+    if(!['paymentId','siteId','paymentAccountId','operationId','priceId']
+      .every(k=>typeof value[k]==='string'&&UUID.test(value[k]))
+      ||typeof value.intentId!=='string'||!/^pi_[A-Za-z0-9_]{1,200}$/.test(value.intentId)
+      ||typeof value.priceKey!=='string'||!/^s5a-price-[a-z0-9-]{1,100}$/.test(value.priceKey)
+      ||value.amountMinor!==2000||value.currency!=='EUR'||value.externalAccountId!==ACCOUNT)fail();
+    refundBinding=Object.freeze(value);
+    await refundRead(context,()=>captured(context,0,[]));
+    return true;
   }
   async function inspectRefund(value,context){
-    if(!refundBinding)fail();const keys=['refundId','providerReference','providerEventId','amountMinor','totalMinor'];if(!object(value)||![Object.prototype,null].includes(Object.getPrototypeOf(value)))fail();const d=Object.getOwnPropertyDescriptors(value);if(Reflect.ownKeys(d).length!==keys.length||keys.some(k=>!d[k]?.enumerable||!Object.hasOwn(d[k],'value')))fail();const v=Object.fromEntries(keys.map(k=>[k,d[k].value]));
-    if(typeof v.refundId!=='string'||!UUID.test(v.refundId)||typeof v.providerReference!=='string'||!/^re_[A-Za-z0-9_]{1,200}$/.test(v.providerReference)||typeof v.providerEventId!=='string'||!/^evt_[A-Za-z0-9_]{1,200}$/.test(v.providerEventId)||!(v.amountMinor===700&&v.totalMinor===700||v.amountMinor===1300&&v.totalMinor===2000)||v.totalMinor===2000&&(!partialReference||partialReference===v.providerReference)||v.totalMinor===700&&partialReference&&partialReference!==v.providerReference)fail();
-    return refundRead(context,async()=>{const c=await captured(context,v.totalMinor,v.totalMinor===700?[v.providerReference]:[partialReference,v.providerReference],v.refundId);const r=parseBody(await command(['get','/v1/refunds/'+v.providerReference],context));refundObject(r,v.providerReference,v.amountMinor,c.id,v.refundId);const e=parseBody(await command(['get','/v1/events/'+v.providerEventId],context));if(e.id!==v.providerEventId||e.object!=='event'||!['refund.created','refund.updated'].includes(e.type)||e.api_version!==VERSION||e.livemode!==false||e.account!==undefined&&e.account!==ACCOUNT)fail();refundObject(e.data?.object,v.providerReference,v.amountMinor,c.id,v.refundId);if(v.totalMinor===700){partialReference=v.providerReference;partialRefundId=v.refundId;}return Object.freeze({providerVerified:true,webhookVerified:true});});
+    if(!refundBinding)fail();
+    const keys=['refundId','providerReference','providerEventId','amountMinor','totalMinor'];
+    if(!object(value)||![Object.prototype,null].includes(Object.getPrototypeOf(value)))fail();
+    const d=Object.getOwnPropertyDescriptors(value);
+    if(Reflect.ownKeys(d).length!==keys.length
+      ||keys.some(k=>!d[k]?.enumerable||!Object.hasOwn(d[k],'value')))fail();
+    const v=Object.fromEntries(keys.map(k=>[k,d[k].value]));
+    if(typeof v.refundId!=='string'||!UUID.test(v.refundId)
+      ||typeof v.providerReference!=='string'||!/^re_[A-Za-z0-9_]{1,200}$/.test(v.providerReference)
+      ||typeof v.providerEventId!=='string'||!/^evt_[A-Za-z0-9_]{1,200}$/.test(v.providerEventId)
+      ||!(v.amountMinor===700&&v.totalMinor===700||v.amountMinor===1300&&v.totalMinor===2000)
+      ||v.totalMinor===2000&&(!partialReference||partialReference===v.providerReference)
+      ||v.totalMinor===700&&partialReference&&partialReference!==v.providerReference)fail();
+    return refundRead(context,async()=>{
+      const c=await captured(context,v.totalMinor,
+        v.totalMinor===700?[v.providerReference]:[partialReference,v.providerReference],v.refundId);
+      const r=parseBody(await command(['get','/v1/refunds/'+v.providerReference],context));
+      refundObject(r,v.providerReference,v.amountMinor,c.id,v.refundId);
+      const e=parseBody(await command(['get','/v1/events/'+v.providerEventId],context));
+      if(e.id!==v.providerEventId||e.object!=='event'
+        ||!['refund.created','refund.updated'].includes(e.type)||e.api_version!==VERSION
+        ||e.livemode!==false||e.account!==undefined&&e.account!==ACCOUNT)fail();
+      refundObject(e.data?.object,v.providerReference,v.amountMinor,c.id,v.refundId);
+      if(v.totalMinor===700){partialReference=v.providerReference;partialRefundId=v.refundId;}
+      return Object.freeze({providerVerified:true,webhookVerified:true});
+    });
   }
-  const refundOperation=(code,limits,body)=>{if(refundFailed)return Promise.reject(fixed(code));return operation(code,limits,body).catch(()=>{refundFailed=true;throw fixed(code);});};
-  if(refundMode)return Object.freeze({validateBinding:limits=>refundOperation('BINDING',limits,binding),
-    startListener:limits=>refundOperation('LISTENER',limits,async context=>{if(refundStarted||refundFailed)fail();refundStarted=true;await startListener(context);refundOwner=owner;return true;}),
-    stopListener:limits=>operation('STOP',limits,async context=>{refundFailed=true;return stopListener(context);}),
-    bindCapturedPayment:(value,limits)=>refundOperation('REFUND_BINDING',limits,context=>bindCapturedPayment(value,context)),assertRefundListener,
-    inspectRefund:(value,limits)=>refundOperation('REFUND',limits,context=>inspectRefund(value,context))});
+  const refundOperation=(code,limits,body)=>{
+    if(refundFailed)return Promise.reject(fixed(code));
+    return operation(code,limits,body).catch(()=>{refundFailed=true;throw fixed(code);});
+  };
+  if(refundMode)return Object.freeze({
+    validateBinding:limits=>refundOperation('BINDING',limits,binding),
+    startListener:limits=>refundOperation('LISTENER',limits,async context=>{
+      if(refundStarted||refundFailed)fail();
+      refundStarted=true;
+      await startListener(context);
+      refundOwner=owner;
+      return true;
+    }),
+    stopListener:limits=>operation('STOP',limits,async context=>{
+      refundFailed=true;
+      return stopListener(context);
+    }),
+    bindCapturedPayment:(value,limits)=>refundOperation('REFUND_BINDING',limits,
+      context=>bindCapturedPayment(value,context)),
+    assertRefundListener,
+    inspectRefund:(value,limits)=>refundOperation('REFUND',limits,context=>inspectRefund(value,context)),
+  });
   return Object.freeze({
     validateBinding:limits=>operation('BINDING',limits,binding),
     startListener:limits=>operation('LISTENER',limits,startListener),

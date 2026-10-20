@@ -71,3 +71,95 @@ test('actual retained private loader and durable state integrate with exact runt
   let credentials=0;assert.equal(await runtime.withAdminCredentials(value=>{assert.equal(value.username,retained.data.app.PAYMENT_ADMIN_BOOTSTRAP_USERNAME);credentials++;return true;},retained.limits),true);assert.equal(credentials,1);assert.equal(await runtime.verifyWebhookSecret(retained.data.final.PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET,retained.limits),true);await assert.rejects(runtime.verifyWebhookSecret('whsec_DIFFERENT_0011223344556677',retained.limits));assert.equal(runtime.webhookSecret,undefined);
   await runtime.stop({deadline:retained.limits.deadline+120000});await state.close({retain:true},{deadline:retained.limits.deadline+120000});for(const [name,value] of [['runtime.json',retained.data.runtime],['form-provisioning.json',retained.data.provision]])assert.deepEqual(JSON.parse(await fs.readFile(retained.original+'/'+name,'utf8')),value);assert.equal(await fs.readFile(retained.original+'/final.env','utf8'),Object.entries(retained.data.final).map(([k,v])=>k+'='+v+'\n').join(''));
 });
+
+const deferred=()=>{let resolve;const promise=new Promise(r=>{resolve=r;});return {promise,resolve};};
+const turn=()=>new Promise(resolve=>setImmediate(resolve));
+test('stop during second raw start drains it and independently stops every earlier dispatched service',async()=>{
+  const f=fixture(),execute=f.deps.execute,entered=deferred(),blocked=deferred();
+  f.deps.execute=async(file,args,...rest)=>{
+    if(args[2]==='container'&&args[3]==='start'&&args.at(-1)===f.target.containers.mailpit.id){entered.resolve();await blocked.promise;}
+    return execute(file,args,...rest);
+  };
+  const runtime=await f.open(),restoring=runtime.restore(f.limits);restoring.catch(()=>{});
+  await entered.promise;let stopSettled=false;
+  const closing=runtime.stop({deadline:f.limits.deadline+120000}).then(value=>{stopSettled=true;return value;},error=>{stopSettled=true;throw error;});closing.catch(()=>{});
+  try{
+    await turn();assert.equal(stopSettled,false,'stop must await the actual second start');
+    blocked.resolve();await assert.rejects(restoring);assert.equal(await closing,true);
+    assert.deepEqual(f.started,['postgres','mailpit']);assert.deepEqual([...f.stopped].sort(),['mailpit','postgres']);
+    assert.deepEqual(ALL.filter(service=>f.projected[service].State.Running),[]);
+  }finally{blocked.resolve();await Promise.allSettled([restoring,closing]);}
+});
+test('aborted verification raw Git must actually settle before stop can finish cleanup',async()=>{
+  const f=fixture(),execute=f.deps.execute,entered=deferred(),blocked=deferred();let armed=false,readSettled=false;
+  f.deps.execute=async(file,args,...rest)=>{if(armed&&file==='/usr/bin/git'&&args[0]==='rev-parse'){entered.resolve();await blocked.promise;readSettled=true;}return execute(file,args,...rest);};
+  const runtime=await f.open();await runtime.restore(f.limits);armed=true;const abort=new AbortController();
+  const verifying=runtime.verify({...f.limits,signal:abort.signal});await entered.promise;abort.abort();await assert.rejects(verifying);
+  let stopSettled=false;const closing=runtime.stop({deadline:f.limits.deadline+120000}).then(value=>{stopSettled=true;return value;},error=>{stopSettled=true;throw error;});closing.catch(()=>{});
+  try{
+    await turn();assert.equal(readSettled,false);assert.equal(stopSettled,false,'aborted wait is not raw Git settlement');
+    blocked.resolve();await assert.rejects(closing,{message:'stripe_manual_refund_runtime_UNCONFIRMED'});assert.equal(readSettled,true);
+    assert.deepEqual([...f.stopped].sort(),[...ORDER].sort());assert.deepEqual(ALL.filter(service=>f.projected[service].State.Running),[]);
+  }finally{blocked.resolve();await Promise.allSettled([verifying,closing]);}
+});
+
+for(const kind of ['lstat','realpath'])test('overlapping stop drains raw '+kind+' before certifying cleanup',async()=>{
+  const f=fixture(),primitive=f.deps[kind],entered=deferred(),blocked=deferred();let armed=false,settled=false;
+  f.deps[kind]=async(...args)=>{if(armed){armed=false;entered.resolve();await blocked.promise;settled=true;}return primitive(...args);};
+  const runtime=await f.open();await runtime.restore(f.limits);armed=true;
+  const verifying=runtime.verify(f.limits);verifying.catch(()=>{});await entered.promise;
+  let stopSettled=false;const closing=runtime.stop({deadline:f.limits.deadline+120000}).finally(()=>{stopSettled=true;});closing.catch(()=>{});
+  try{await turn();assert.equal(stopSettled,false);assert.equal(settled,false);blocked.resolve();await assert.rejects(verifying);assert.equal(await closing,true);assert.equal(settled,true);assert.deepEqual([...f.stopped].sort(),[...ORDER].sort());}
+  finally{blocked.resolve();await Promise.allSettled([verifying,closing]);}
+});
+
+for(const kind of ['late open','close'])test('stop drains '+kind+' and disposes an owned receiver descriptor exactly once',async()=>{
+  const f=fixture(),open=f.deps.open,entered=deferred(),blocked=deferred();let armed=false,closes=0,disposed=false;
+  f.deps.open=async(...args)=>{
+    const file=await open(...args);if(!armed)return file;armed=false;
+    const close=file.close;file.close=async()=>{closes++;if(kind==='close'){entered.resolve();await blocked.promise;}await close();disposed=true;};
+    if(kind==='late open'){entered.resolve();await blocked.promise;}
+    return file;
+  };
+  const runtime=await f.open();await runtime.restore(f.limits);armed=true;const abort=new AbortController();
+  const verifying=runtime.verify({...f.limits,signal:abort.signal});await entered.promise;abort.abort();await assert.rejects(verifying);
+  let stopSettled=false;const closing=runtime.stop({deadline:f.limits.deadline+120000}).finally(()=>{stopSettled=true;});closing.catch(()=>{});
+  try{await turn();assert.equal(stopSettled,false);assert.equal(disposed,false);blocked.resolve();await assert.rejects(closing);assert.equal(disposed,true);assert.equal(closes,1);assert.deepEqual([...f.stopped].sort(),[...ORDER].sort());}
+  finally{blocked.resolve();await Promise.allSettled([verifying,closing]);}
+});
+
+function clockFixture(){
+  const f=fixture(),timers=new Map();let now=Date.now(),sequence=0;
+  f.limits.deadline=now+60000;f.deps.now=()=>now;
+  f.deps.setTimeout=(callback,ms)=>{const id=++sequence;timers.set(id,{callback,at:now+ms});return id;};
+  f.deps.clearTimeout=id=>timers.delete(id);
+  return {f,advance(value){now=value;for(const [id,timer] of [...timers])if(timer.at<=now){timers.delete(id);timer.callback();}}};
+}
+test('an unsettled second start cannot consume earlier cleanup or renew any late stop after the original ceiling',async()=>{
+  const {f,advance}=clockFixture(),execute=f.deps.execute,entered=deferred(),blocked=deferred();
+  f.deps.execute=async(file,args,...rest)=>{if(args[2]==='container'&&args[3]==='start'&&args.at(-1)===f.target.containers.mailpit.id){entered.resolve();await blocked.promise;}return execute(file,args,...rest);};
+  const runtime=await f.open(),restoring=runtime.restore(f.limits);restoring.catch(()=>{});await entered.promise;
+  const ceiling=f.limits.deadline+120000,closing=runtime.stop({deadline:ceiling});closing.catch(()=>{});
+  try{
+    await turn();assert.deepEqual(f.stopped,['postgres']);advance(ceiling+1);await assert.rejects(closing);await assert.rejects(restoring);
+    const calls=f.calls.length;blocked.resolve();await turn();await turn();assert.deepEqual(f.started,['postgres','mailpit']);assert.deepEqual(f.stopped,['postgres']);assert.equal(f.calls.length,calls+1,'only the already dispatched raw start may settle late');
+    await assert.rejects(runtime.stop({deadline:ceiling+60000}));assert.equal(f.calls.length,calls+1);
+  }finally{blocked.resolve();await Promise.allSettled([restoring,closing]);}
+});
+test('abandoned raw read uncertainty and cleanup disposal cannot become success after the original ceiling',async()=>{
+  const {f,advance}=clockFixture(),execute=f.deps.execute,entered=deferred(),blocked=deferred();let armed=false;
+  f.deps.execute=async(file,args,...rest)=>{if(armed&&file==='/usr/bin/git'&&args[0]==='rev-parse'){entered.resolve();await blocked.promise;}return execute(file,args,...rest);};
+  const runtime=await f.open();await runtime.restore(f.limits);armed=true;const abort=new AbortController();
+  const verifying=runtime.verify({...f.limits,signal:abort.signal});await entered.promise;abort.abort();await assert.rejects(verifying);
+  const ceiling=f.limits.deadline+120000,closing=runtime.stop({deadline:ceiling});closing.catch(()=>{});
+  try{await turn();assert.deepEqual([...f.stopped].sort(),[...ORDER].sort());advance(ceiling+1);await assert.rejects(closing);const calls=f.calls.length;blocked.resolve();await turn();await turn();assert.equal(f.calls.length,calls+1);await assert.rejects(runtime.verify(f.limits));await assert.rejects(runtime.stop({deadline:ceiling+60000}));assert.equal(f.calls.length,calls+1);}
+  finally{blocked.resolve();await Promise.allSettled([verifying,closing]);}
+});
+test('cleanup rechecks the original ceiling inside deferred raw primitive dispatch',async()=>{
+  const {f,advance}=clockFixture(),timer=f.deps.setTimeout,lstat=f.deps.lstat;let armed=false,triggered=false,lateIO=0;
+  const ceiling=f.limits.deadline+120000;
+  f.deps.setTimeout=(callback,ms)=>{const id=timer(callback,ms);if(armed&&!triggered){triggered=true;queueMicrotask(()=>queueMicrotask(()=>advance(ceiling+1)));}return id;};
+  f.deps.lstat=async(...args)=>{if(f.deps.now()>=ceiling)lateIO++;return lstat(...args);};
+  const runtime=await f.open();await runtime.restore(f.limits);armed=true;
+  await assert.rejects(runtime.stop({deadline:ceiling}));assert.equal(triggered,true);assert.equal(lateIO,0);
+});
