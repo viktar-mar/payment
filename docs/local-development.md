@@ -1060,11 +1060,14 @@ dispatch with the same/new key, rerun with a fresh UUID, reconcile, cancel or de
 anything to resolve it. Existing state or the original-target lock rejects replay.
 A read-only investigation of PENDING requires a separate operator decision.
 
-One active deadline is at most 30 minutes from entry; cleanup ends at that original
-deadline plus 2 minutes. There is no renewed authority. Cleanup drains HTTP/session
-work, closes the CLI listener/children and independently stops only exact freshly
-verified ordinary containers restored by this controller. A failed listener close
-does not skip the runtime stop. Issuer helpers are not restarted. Containers, images,
+One active deadline is at most 30 minutes from entry; cleanup authority ends at that
+original deadline plus 2 minutes. There is no renewed authority. The controller aborts
+active work and attempts bounded HTTP/session/listener drains, then independently
+attempts to stop only exact freshly verified ordinary containers restored by this
+controller. A failed session or listener close does not skip the runtime stop attempt.
+Indefinitely unresponsive cleanup can remain unsettled; closure remains unverified and
+the report is PENDING with exit 1. Full drain before shutdown is not guaranteed.
+Issuer helpers are not restarted. Containers, images,
 volumes, networks, credentials, provider objects, state and audit history are retained;
 an uncertain original-target lock remains for inspection. No resource deletion or
 recreation is part of this workflow.

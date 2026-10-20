@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node24 ESM, native node:test/strict assert, существующие pinned Docker/Stripe CLI adapters; Java/backend/API/DB и browser SDK не меняются.
 
-**Spec:** [Ограниченный возврат уже оплаченных EUR20 в Sandbox](../specs/2026-10-20-manual-refund-design.md). Объём и one-Site rotation подтверждены в чате; этот подробный план ожидает проверки пользователя до реализации. Sandbox по-прежнему запрещён.
+**Spec:** [Ограниченный возврат уже оплаченных EUR20 в Sandbox](../specs/2026-10-20-manual-refund-design.md). Объём, one-Site rotation и этот подробный план подтверждены пользователем в чате 2026-10-20; офлайн-реализация разрешена. Запуск Sandbox по-прежнему запрещён и требует отдельного явного разрешения.
 
 ## Global Constraints
 
