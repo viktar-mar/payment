@@ -78,6 +78,23 @@ Endpoint нельзя угадать или принять из произвол
 
 Вывод — один finite JSON ≤4096 bytes, mode MANUAL_REFUND/version1, без IDs/PII/secrets/raw errors. Фиксированные phase ADMISSION/RESTORE/BINDING/LISTENER/BASELINE/ROTATION/PARTIAL/REMAINDER/VERIFY/CLEANUP; result FAILED/PENDING/SUCCEEDED; booleans target_verified, callback_rotated, partial_confirmed, remainder_confirmed, provider_verified, webhook_verified, journal_verified, callback_verified, listener_closed, runtime_closed; provenance CONTROLLER_REPORTED. Только SUCCEEDED + все booleans true + реальный exit0 подтверждает этот эксперимент. False означает unverified, не «возврата не было». Ошибка после любого неизвестного действия навсегда защёлкивает PENDING, даже если поздний cleanup/read успешен.
 
+Approved bounded offline correction: an optional `diagnostic` on unconfirmed version-1 reports
+contains only own data `{stage, reason, probes}`. Stages: BASELINE, ROTATION, DISPATCH,
+ACKNOWLEDGEMENT, DETAIL, CALLBACK, PROVIDER, CONFIRMATION, FINAL, CLEANUP. Reasons:
+INTEGRITY, UNCONFIRMED, EXHAUSTED, ABORTED, DEADLINE. Probes are an integer 0–30;
+the shared validator copies and freezes the projection without evaluating getters.
+The first session failure survives close; it cannot change proof booleans or promote
+the historical run. Old version-1 report inputs remain valid.
+
+Separate detail/list reads may straddle only the acknowledged leg's exact forward
+transition: `(SUCCEEDED,0,1300)` → `(PARTIALLY_REFUNDED,700,1300)` for the first leg,
+and `(PARTIALLY_REFUNDED,700,0)` → `(REFUNDED,2000,0)` for the remainder, where the
+numbers are refunded and available minor units. Pending reservations reduce available
+money before success. All immutable projection facts must match; the straddled probe
+is incomplete and a fresh coherent probe plus all existing proof is mandatory.
+Already observed terminal/foreign/reconciliation-only facts remain hard failures.
+No request retry, renewed budget, authority, or runtime acceptance follows from this correction.
+
 В finally сначала прекращаются/дожидаются работы HTTP и listener/children, затем отдельно останавливаются только exact freshly-verified ordinary containers, запущенные этим refund controller. Отказ listener close не отменяет независимую попытку runtime stop. Helpers не запускаются/не останавливаются повторно. Исходные и новые volumes/network/images/containers/provider objects/credentials/state сохраняются; нет down -v/prune/rm. Невозможность доказать закрытие отражается в report, не маскируется.
 
 ## 10. Офлайн gates и передача

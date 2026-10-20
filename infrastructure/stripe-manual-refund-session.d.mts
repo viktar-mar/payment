@@ -1,5 +1,6 @@
 import type {Limits,StateCapability,RefundProof} from './stripe-manual-refund-state.mjs';
 import type {RefundRuntime} from './stripe-manual-refund-runtime.mjs';
+import type {ManualRefundDiagnostic} from './stripe-manual-refund-schema.mjs';
 export interface RefundCli {
   validateBinding(limits:Limits):Promise<true>;
   assertRefundListener(limits:Limits):true;
@@ -12,6 +13,8 @@ export interface RefundSession {
   refundRemainder(limits:Limits):Promise<Readonly<RefundProof>>;
   verifyFinal(limits:Limits):Promise<Readonly<{partialConfirmed:true;remainderConfirmed:true;providerVerified:true;webhookVerified:true;journalVerified:true;callbackVerified:true}>>;
   close(cleanupLimits:Limits):Promise<true>;
+  /** Inert first-failure projection retained after close; does not certify proof. */
+  diagnostic():Readonly<ManualRefundDiagnostic>|null;
 }
 /** CLI must already have its captured payment bound; construction performs no IO. */
 export function createManualRefundSession(input:Readonly<{runtime:RefundRuntime;cli:RefundCli;state:StateCapability}>,dependencies?:Record<string,unknown>):Promise<Readonly<RefundSession>>;

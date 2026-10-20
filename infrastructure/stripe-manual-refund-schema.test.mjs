@@ -19,3 +19,23 @@ test('success requires every proof and remainder cannot precede confirmed partia
   assert.equal(validateManualRefundReport({...report(),partial_confirmed:true,provider_verified:false}),null);
   assert.equal(validateManualRefundReport({...report(),result:'FAILED'}),null);
 });
+
+test('optional diagnostic projects only finite own data while legacy reports remain valid',()=>{
+  const diagnostic={stage:'CALLBACK',reason:'EXHAUSTED',probes:30};
+  const r=validateManualRefundReport({...report(),diagnostic});
+  assert.ok(r);assert.deepEqual(r.diagnostic,diagnostic);assert.ok(Object.isFrozen(r.diagnostic));
+  assert.notEqual(r.diagnostic,diagnostic);assert.ok(validateManualRefundReport(report()));
+  assert.ok(Buffer.byteLength(formatManualRefundReport({...report(),diagnostic}))<=4096);
+  for(const bad of [null,undefined,{...diagnostic,stage:'private_path_canary'},
+    {...diagnostic,reason:'secret_canary'},{...diagnostic,probes:-1},{...diagnostic,probes:31},
+    {...diagnostic,probes:1.5},{...diagnostic,probes:Infinity},{...diagnostic,error:'raw_error_canary'},
+    Object.assign(Object.create({private:'canary'}),diagnostic),{...diagnostic,[Symbol('secret')]:true}])
+    assert.equal(validateManualRefundReport({...report(),diagnostic:bad}),null);
+  let reads=0;
+  for(const key of ['stage','reason','probes']) {
+    const hostile={...diagnostic};Object.defineProperty(hostile,key,{enumerable:true,get(){reads++;throw Error('getter_canary');}});
+    assert.equal(validateManualRefundReport({...report(),diagnostic:hostile}),null);
+  }
+  const hostile=report();Object.defineProperty(hostile,'diagnostic',{enumerable:true,get(){reads++;throw Error('getter_canary');}});
+  assert.equal(validateManualRefundReport(hostile),null);assert.equal(reads,0);
+});

@@ -1085,6 +1085,25 @@ it never proves that no money moved. PENDING remains latched after any unknown w
 even if later reads or cleanup succeed. Stalled/failed stdout gives actual exit 1
 without a second report attempt; a printed success line without exit 0 is insufficient.
 
+The offline proof-observer correction permits only an exact forward transition between
+separate detail/list reads for the acknowledged leg. Pending reservations already reduce
+availability: the EUR7 leg moves from `(SUCCEEDED, refunded=0, available=1300)` to
+`(PARTIALLY_REFUNDED, refunded=700, available=1300)`; the EUR13 leg moves from
+`(PARTIALLY_REFUNDED, refunded=700, available=0)` to `(REFUNDED, refunded=2000, available=0)`.
+All immutable projection facts must agree. Such a straddled read proves nothing by itself;
+a fresh coherent probe and every existing provider/webhook/journal/callback check are
+still required within the original 30-probe/45-second budget. Terminal refunds, changed
+identities/reasons, impossible money, regressions and reconciliation-only success fail
+closed. The observer never repeats a refund POST or rotation.
+
+An unconfirmed report may include the optional copied `diagnostic` object with exactly
+`stage`, `reason`, and integer `probes` (0–30). Stage is one of BASELINE, ROTATION,
+DISPATCH, ACKNOWLEDGEMENT, DETAIL, CALLBACK, PROVIDER, CONFIRMATION, FINAL, CLEANUP;
+reason is INTEGRITY, UNCONFIRMED, EXHAUSTED, ABORTED, or DEADLINE. The first session
+failure survives cleanup. Diagnostics contain only these static values, certify no
+financial proof, and identify a future observed boundary rather than the cause of any
+historical attempt. Legacy version-1 reports without diagnostics remain valid.
+
 ## Stop and persisted data
 
 ```bash

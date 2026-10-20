@@ -1,9 +1,10 @@
 import {createFormDiagnosticSettlement} from './stripe-form-diagnostic-settlement.mjs';
+import {validateManualRefundDiagnostic} from './stripe-manual-refund-schema.mjs';
 
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const provider=(value,prefix)=>typeof value==='string'&&new RegExp('^'+prefix+'[A-Za-z0-9_]{1,200}$').test(value);
 const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
-const fail=()=>{throw null;};
+const fail=(reason='INTEGRITY')=>{throw reason;};
 const fixed=()=>new Error('stripe_manual_refund_session_UNCONFIRMED');
 const unique=values=>new Set(values).size===values.length;
 const validId=value=>typeof value==='string'&&UUID.test(value);
@@ -17,6 +18,13 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
   const proofs=[],acknowledged=[];
   let deadline=null,busy=false,failed=false,closed=false,closeUsed=false,resourceFailure=false;
   let baseline=false,rotated=false,rotationUsed=false,cookie='',csrf='',actor=null,original=null;
+  let stage='BASELINE',probes=0,diagnostic=null;
+  function remember(error,context) {
+    if(diagnostic)return;
+    const reason=context?.signal?.aborted?'ABORTED':context&&now()>=context.deadline?'DEADLINE':error;
+    diagnostic=validateManualRefundDiagnostic({stage,reason,probes})
+      ??validateManualRefundDiagnostic({stage,reason:'UNCONFIRMED',probes});
+  }
   const attempted=[false,false];
   const backend=target.endpoints.backend,receiver=target.endpoints.receiver;
   const paymentPath='/api/v1/admin/payments/'+target.paymentId;
@@ -32,8 +40,11 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
   function limits(value,cleanup=false) {
     const keys=Object.keys(value??{});
     if(keys.some(k=>!['deadline','signal'].includes(k))||!Number.isSafeInteger(value?.deadline)
-      ||value.deadline<=now()||value.signal!==undefined&&!(value.signal instanceof AbortSignal)
-      ||value.signal?.aborted)fail();
+      ||value.signal!==undefined&&!(value.signal instanceof AbortSignal))fail();
+    // Preserve a finite reason at validation: a rejected context is never
+    // assigned to the caller, and catch must not inspect raw input again.
+    if(value.signal?.aborted)fail('ABORTED');
+    if(value.deadline<=now())fail('DEADLINE');
     if(deadline===null) {
       if(cleanup||value.deadline>now()+1800000)fail();
       deadline=value.deadline;settlement.bind(deadline);
@@ -42,7 +53,9 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
     return Object.freeze({...value});
   }
   function check(context) {
-    if(closed||failed||context.signal?.aborted||now()>=context.deadline)fail();
+    if(context.signal?.aborted)fail('ABORTED');
+    if(now()>=context.deadline)fail('DEADLINE');
+    if(closed||failed)fail('UNCONFIRMED');
   }
   function track(body,set=work) {
     const promise=Promise.resolve().then(body);set.add(promise);
@@ -203,6 +216,7 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
       &&!d.refunds.some(refund=>refund.provider_refund_reference===event.provider_object_id)))fail();
   }
   async function detail(context,total,ids,proofDeadline=context.deadline) {
+    stage='DETAIL';
     const d=await read(paymentPath,context,{proofDeadline}),p=d?.payment;
     if(!p||p.payment_id!==target.paymentId||p.site_id!==target.site.id||p.payment_account_id!==target.account.id
       ||p.provider!=='STRIPE'||p.source!=='CATALOG'||p.price_id!==target.price.id||p.price_key!==target.price.key
@@ -216,7 +230,24 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
       ||attempt.provider_intent_reference!==target.intentId||attempt.payment_method_family!=='CARD')fail();
     const page=await read('/api/v1/admin/payments?site_id='+target.site.id+'&page=0&size=2&sort=CREATED_DESC',context,{proofDeadline});
     if(page?.total!==1||page.page!==0||page.size!==2||page.sort!=='CREATED_DESC'
-      ||!Array.isArray(page.items)||page.items.length!==1||!same(page.items[0],p))fail();
+      ||!Array.isArray(page.items)||page.items.length!==1)fail();
+    const next=page.items[0],prior=total===2000?700:0;
+    // Acknowledged reservations already reduce availability before the
+    // webhook updates the succeeded total. These are exact leg tuples.
+    const tuple=(value,amount)=>value?.status===(amount===0?'SUCCEEDED':amount===700?'PARTIALLY_REFUNDED':'REFUNDED')
+      &&value.refunded_amount_minor===amount&&value.refundable_amount_minor===2000-total;
+    if(!tuple(p,prior)&&!tuple(p,total)||!tuple(next,prior)&&!tuple(next,total))fail();
+    const coherent=same(next,p);
+    if(!coherent) {
+      // Separate reads may straddle only the current acknowledged leg's
+      // forward money transition. All other projection facts remain exact.
+      const stable=value=>Object.fromEntries(Object.entries(value).filter(([key])=>
+        !['status','refunded_amount_minor','refundable_amount_minor','updated_at'].includes(key)));
+      if(!total||ids.length!==(total===700?1:2)||!next||typeof next!=='object'
+        ||!same(stable(p),stable(next))||!tuple(p,prior)||!tuple(next,total)
+        ||!Number.isFinite(Date.parse(p.updated_at))||!Number.isFinite(Date.parse(next.updated_at))
+        ||Date.parse(next.updated_at)<Date.parse(p.updated_at))fail();
+    }
     const operations=await read('/api/v1/admin/provider-operations?payment_id='+target.paymentId,context,{proofDeadline});
     if(!Array.isArray(operations)||operations.length!==d.refunds.length+1
       ||!unique(operations.map(o=>o.operation_id))||!unique(operations.map(o=>o.resource_id)))fail();
@@ -248,9 +279,10 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
       ||d.deliveries.some(v=>!d.outbox_events.some(o=>o.id===v.outbox_event_id)))fail();
     refundHistory(d,ids,success[0]);
     const status=total===0?'SUCCEEDED':total===700?'PARTIALLY_REFUNDED':'REFUNDED';
-    return {d,complete:p.status===status&&p.refunded_amount_minor===total&&p.refundable_amount_minor===2000-total&&d.refunds.length===ids.length};
+    return {d,complete:coherent&&p.status===status&&p.refunded_amount_minor===total&&p.refundable_amount_minor===2000-total&&d.refunds.length===ids.length};
   }
   async function receipts(d,context,proofDeadline) {
+    stage='CALLBACK';
     const inspection=await read('/inspection',context,{receiverRequest:true,proofDeadline});
     if(!Array.isArray(inspection?.events)||inspection.events.length>100||inspection.count!==inspection.events.length
       ||!Number.isSafeInteger(inspection.duplicates)||inspection.duplicates<0||!unique(inspection.events.map(e=>e.event_id))
@@ -264,6 +296,19 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
     const successes=d.events.filter(e=>e.event_type==='REFUND_SUCCEEDED');
     if(successes.length>ids.length||!unique(successes.map(e=>e.provider_event_id))
       ||!unique(successes.map(e=>e.provider_object_id)))fail();
+    // Incomplete projection/callback evidence permits waiting, never hiding
+    // terminal or contradictory facts already returned by the detail read.
+    for(const refund of d.refunds) {
+      if(!['PENDING','PROCESSING','SUCCEEDED'].includes(refund.status)||refund.reason_code!=='REQUESTED_BY_CUSTOMER'
+        ||refund.provider_refund_reference!==null&&!provider(refund.provider_refund_reference,'re_'))fail();
+      const events=successes.filter(e=>e.provider_object_id===refund.provider_refund_reference);
+      if(events.length>1||(refund.status==='SUCCEEDED'||events.length>0)
+        &&!provider(refund.provider_refund_reference,'re_'))fail();
+      for(const event of events)cashEvent(d,event,refund.amount_minor,refund.provider_refund_reference);
+      const prior=proofs[ids.indexOf(refund.id)];
+      if(prior&&(refund.status!=='SUCCEEDED'||refund.provider_refund_reference!==prior.identity.providerReference
+        ||events.length!==1||events[0].id!==prior.eventId||events[0].provider_event_id!==prior.identity.providerEventId))fail();
+    }
     if(!complete)return null;
     const received=await receipts(d,context,proofDeadline);
     const found=[];
@@ -307,6 +352,7 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
   async function rotateCallback(context) {
     if(!baseline||rotationUsed)fail();rotationUsed=true;
     await binding(context);const current=await detail(context,0,[]);if(!current.complete)fail();
+    stage='ROTATION';
     if(await call(context,()=>state.beginRotation(context))!==true)fail();
     let reveal=await read('/api/v1/admin/sites/'+target.site.id+'/callback/rotate-secret',context,{method:'POST',guard:true});
     try {
@@ -331,31 +377,38 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
     if(!Object.isFrozen(leg)||leg.phase!=='DISPATCHING'||leg.amountMinor!==(index?1300:700)
       ||typeof leg.key!=='string'||leg.key.length<1||leg.key.length>255||/[^A-Za-z0-9:_-]/.test(leg.key)
       ||leg.refundId!==null||leg.providerReference!==null)fail();
+    stage='DISPATCH';
     const result=await read(paymentPath+'/refunds',context,{method:'POST',expected:202,key:leg.key,guard:true,
       body:{amount_minor:leg.amountMinor,currency:'EUR',reason_code:'REQUESTED_BY_CUSTOMER'}});
     if(!validId(result?.refund_id)||result.payment_id!==target.paymentId||result.amount_minor!==leg.amountMinor
       ||result.currency!=='EUR'||!['PENDING','PROCESSING','SUCCEEDED'].includes(result.status)
       ||acknowledged.includes(result.refund_id))fail();
+    stage='ACKNOWLEDGEMENT';
     if(await call(context,()=>state.ackRefund(index,{refundId:result.refund_id},context))!==true)fail();
     acknowledged[index]=result.refund_id;
     const phase=proofPhase(context);
     try {
       let found;
       for(let probe=0;probe<30&&now()<phase.until;probe++) {
+        probes=probe+1;
         check(context);found=await call(phase.wait,()=>localProof(phase.delegate,index,phase.until));
         if(found)break;
         const delay=dependencies.probeDelay??100;
         if(!Number.isInteger(delay)||delay<0||delay>250)fail();
         if(delay)await call(phase.wait,()=>new Promise(resolve=>setTimeout(resolve,Math.min(delay,Math.max(0,phase.until-now())))));
       }
-      if(!found||now()>=phase.until)fail();
+      if(now()>=phase.until)fail('DEADLINE');
+      if(!found)fail('EXHAUSTED');
       const current=found[index];
+      stage='PROVIDER';
       const providerProof=await call(phase.wait,()=>cli.inspectRefund(Object.freeze({...current.identity}),phase.delegate));
       if(providerProof?.providerVerified!==true||providerProof.webhookVerified!==true)fail();
       const proof=Object.freeze({...current.identity,providerVerified:true,webhookVerified:true,journalVerified:true,callbackVerified:true});
+      stage='CONFIRMATION';
       if(await call(phase.wait,()=>state.confirmRefund(index,proof,phase.delegate))!==true)fail();
       proofs[index]=current;return proof;
-    }finally {phase.close();}
+    }catch(error){remember(error,{deadline:phase.until,signal:context.signal});throw error;}
+    finally {phase.close();}
   }
   async function verifyFinal(context) {
     if(!proofs[0]||!proofs[1])fail();
@@ -363,19 +416,23 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
     try {
       await call(phase.wait,()=>binding(phase.delegate));
       if(!await call(phase.wait,()=>localProof(phase.delegate,1,phase.until)))fail();
+      stage='PROVIDER';
       const proof=await call(phase.wait,()=>cli.inspectRefund(Object.freeze({...proofs[1].identity}),phase.delegate));
       if(proof?.providerVerified!==true||proof.webhookVerified!==true)fail();
       return Object.freeze({partialConfirmed:true,remainderConfirmed:true,providerVerified:true,
         webhookVerified:true,journalVerified:true,callbackVerified:true});
-    }finally {phase.close();}
+    }catch(error){remember(error,{deadline:phase.until,signal:context.signal});throw error;}
+    finally {phase.close();}
   }
-  async function run(value,body) {
-    if(busy){failed=true;throw fixed();}busy=true;
+  async function run(value,body,initialStage) {
+    if(busy){remember(null);failed=true;throw fixed();}busy=true;
+    if(!failed){stage=initialStage;probes=0;}
+    let context;
     try {
-      const context=limits(value);check(context);
+      context=limits(value);check(context);
       const result=await settlement.wait(context,()=>track(()=>body(context),bodies));
       check(context);return result;
-    }catch {failed=true;throw fixed();}
+    }catch(error) {remember(error,context);failed=true;throw fixed();}
     finally {busy=false;}
   }
   async function close(value) {
@@ -393,10 +450,10 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
         await settlement.wait(context,()=>Promise.allSettled(waiting));
       }
       if(resources.size||resourceFailure)fail();return true;
-    }catch {failed=true;throw fixed();}
+    }catch(error) {if(!diagnostic)stage='CLEANUP';remember(error);failed=true;throw fixed();}
     finally {cookie='';csrf='';actor=null;}
   }
-  return Object.freeze({verifyBaseline:value=>run(value,verifyBaseline),rotateCallback:value=>run(value,rotateCallback),
-    refundPartial:value=>run(value,context=>refund(0,context)),refundRemainder:value=>run(value,context=>refund(1,context)),
-    verifyFinal:value=>run(value,verifyFinal),close});
+  return Object.freeze({verifyBaseline:value=>run(value,verifyBaseline,'BASELINE'),rotateCallback:value=>run(value,rotateCallback,'ROTATION'),
+    refundPartial:value=>run(value,context=>refund(0,context),'DISPATCH'),refundRemainder:value=>run(value,context=>refund(1,context),'DISPATCH'),
+    verifyFinal:value=>run(value,verifyFinal,'FINAL'),diagnostic:()=>diagnostic,close});
 }

@@ -1,7 +1,7 @@
 import {resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {manualRefundOptIn,validateManualRefundOptions} from './stripe-manual-refund-options.mjs';
-import {validateManualRefundReport,formatManualRefundReport} from './stripe-manual-refund-schema.mjs';
+import {validateManualRefundReport,formatManualRefundReport,validateManualRefundDiagnostic} from './stripe-manual-refund-schema.mjs';
 
 const ROOT=fileURLToPath(new URL('..',import.meta.url)).replace(/\/$/,'');
 const ORIGINAL='031b5ae7-6603-4339-b1b3-77231291ff34';
@@ -194,6 +194,15 @@ export async function runManualRefund(options,originalLimits,deps={}){
     input.signal?.removeEventListener('abort',abort);
   }
   if(input.signal?.aborted||now()>=cleanup.deadline)pending=true;
+  // The session retains its first failure across close. Ignore untrusted or
+  // absent diagnostic capabilities without changing the financial outcome.
+  if(pending&&session)try{
+    const inspect=data(session,'diagnostic');
+    if(typeof inspect==='function'){
+      const diagnostic=validateManualRefundDiagnostic(inspect());
+      if(diagnostic)proof.diagnostic=diagnostic;
+    }
+  }catch{}
   const report=validateManualRefundReport({...proof,result:pending?'PENDING':'SUCCEEDED',phase:pending?phase:'CLEANUP'})??validateManualRefundReport({...proof,result:'PENDING',phase:'CLEANUP'});
   return Object.freeze({report,exitCode:report?.result==='SUCCEEDED'?0:1});
 }

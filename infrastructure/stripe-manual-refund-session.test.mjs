@@ -12,6 +12,22 @@ const secret = Buffer.alloc(32,25).toString('base64url');
 const fail = /stripe_manual_refund_session_UNCONFIRMED/;
 const clone = value => structuredClone(value);
 
+function fakeClock() {
+  let time=Date.now();const timers=new Map();
+  return {now:()=>time,setTimeout:(fn,delay)=>{const id={};timers.set(id,{fn,at:time+delay});return id;},
+    clearTimeout:id=>timers.delete(id),advance:by=>{time+=by;for(const [id,timer] of [...timers])if(timer.at<=time){timers.delete(id);timer.fn();}}};
+}
+// A coherent first-leg acknowledgement before the success webhook commits.
+function processingSnapshot(d,index=0) {
+  const value=clone(d),ids=value.events.filter(e=>e.event_type==='REFUND_SUCCEEDED'&&e.amount_minor===(index?1300:700)).map(e=>e.id);
+  Object.assign(value.payment,{status:index?'PARTIALLY_REFUNDED':'SUCCEEDED',refunded_amount_minor:index?700:0,refundable_amount_minor:index?0:1300});
+  value.refunds[index].status='PROCESSING';
+  value.events=value.events.filter(e=>!ids.includes(e.id));
+  value.outbox_events=value.outbox_events.filter(e=>!ids.includes(e.id));
+  value.deliveries=value.deliveries.filter(e=>!ids.includes(e.outbox_event_id));
+  return value;
+}
+
 // Complete transport shapes follow AdminPaymentViews, ProviderOperationView,
 // AdminAuthController, CallbackAdminController and receiver /inspection.
 async function harness(t, changes={}) {
@@ -169,6 +185,168 @@ test('inert constructor then durable rotation and ordered complete financial pro
   assert.equal(h.trace.filter(v=>v.endsWith('/rotate-secret')).length,1);
   assert.equal(h.trace.filter(v=>v==='POST /configure').length,1);
   assert.ok(!JSON.stringify(JSON.parse(await readFile(h.f.statePath))).includes(secret));
+});
+
+// Break caught: treating a valid projection transition between separate reads
+// as a permanent integrity failure, rather than requiring a fresh coherent probe.
+for(const mode of ['pending completion','delayed callback','straddled projection'])test('observer converges after '+mode+' without another mutation',async t=>{
+  const clock=fakeClock();let dispatched=false,details=0,inspections=0,pending;
+  const h=await harness(t,{dependencies:clock,afterRefund:({d})=>{dispatched=true;pending=processingSnapshot(d);if(mode==='pending completion')pending.refunds[0].status='PENDING';},
+    transport:({path,d})=>{
+      if(!dispatched)return;
+      if(path.endsWith('/'+d.payment.payment_id)) {
+        details++;clock.advance(1);
+        if(details===1&&mode!=='delayed callback')return new Response(JSON.stringify(pending));
+      }
+      if(path.startsWith('/api/v1/admin/payments?')&&details===1&&mode==='pending completion')
+        return new Response(JSON.stringify({items:[pending.payment],total:1,page:0,size:2,sort:'CREATED_DESC'}));
+      if(path==='/inspection'&&++inspections===1&&mode==='delayed callback')return new Response(JSON.stringify({count:0,duplicates:0,events:[]}));
+    }});
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  const proof=await h.session.refundPartial(h.limits);
+  assert.equal(proof.callbackVerified,true);assert.equal(details,2);
+  assert.deepEqual(h.posts,[700]);assert.equal(h.trace.filter(v=>v.endsWith('/rotate-secret')).length,1);
+  assert.equal(JSON.parse(await readFile(h.f.statePath)).legs[0].phase,'CONFIRMED');
+});
+
+test('observer rejects a straddled foreign money projection immediately',async t=>{
+  const clock=fakeClock();let dispatched=false,details=0;
+  const h=await harness(t,{dependencies:clock,afterRefund:()=>{dispatched=true;},transport:({path,d})=>{
+    if(dispatched&&path.endsWith('/'+d.payment.payment_id))details++;
+    if(dispatched&&path.startsWith('/api/v1/admin/payments?'))return new Response(JSON.stringify({items:[{...d.payment,refunded_amount_minor:800,refundable_amount_minor:1200}],total:1,page:0,size:2,sort:'CREATED_DESC'}));
+  }});
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  await assert.rejects(h.session.refundPartial(h.limits),fail);await assert.rejects(h.session.refundRemainder(h.limits),fail);
+  assert.equal(details,1);assert.deepEqual(h.posts,[700]);
+});
+
+test('observer requires a fresh coherent remainder probe after its exact reservation transition',async t=>{
+  let dispatched=false,details=0;
+  const h=await harness(t,{dependencies:fakeClock(),afterRefund:({i})=>{if(i===1)dispatched=true;},transport:({path,d})=>{
+    if(dispatched&&path.endsWith('/'+d.payment.payment_id)&&++details===1)return new Response(JSON.stringify(processingSnapshot(d,1)));
+  }});
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  await h.session.refundPartial(h.limits);const proof=await h.session.refundRemainder(h.limits);
+  assert.equal(details,2);assert.equal(proof.totalMinor,2000);assert.deepEqual(h.posts,[700,1300]);
+  assert.equal(JSON.parse(await readFile(h.f.statePath)).legs[1].phase,'CONFIRMED');
+});
+
+for(const [name,mutate] of [
+  ['foreign identity',(snapshot,page)=>{page.site_id=uuid(499);}],
+  ['foreign currency',(snapshot,page)=>{page.currency='USD';}],
+  ['changed original fact',(snapshot,page)=>{page.price_version=2;}],
+  ['status regression',(snapshot,page,d)=>{Object.assign(snapshot.payment,d.payment);Object.assign(page,processingSnapshot(d).payment);}],
+  ['coherent impossible money',(snapshot,page)=>{Object.assign(snapshot.payment,{refunded_amount_minor:800,refundable_amount_minor:1200});Object.assign(page,snapshot.payment);}],
+  ['terminal refund',snapshot=>{snapshot.refunds[0].status='FAILED';}],
+  ['changed refund reason',snapshot=>{snapshot.refunds[0].reason_code='OTHER';}],
+  ['reconciliation success',(snapshot,page,d)=>{
+    const success=clone(d.events.find(e=>e.event_type==='REFUND_SUCCEEDED'));success.source='RECONCILIATION';snapshot.events.push(success);
+  }],
+])test('observer does not hide '+name+' behind a straddled transition',async t=>{
+  let dispatched=false,details=0,snapshot,page;
+  const h=await harness(t,{dependencies:fakeClock(),afterRefund:({d})=>{
+    dispatched=true;snapshot=processingSnapshot(d);page=clone(d.payment);mutate(snapshot,page,d);
+  },transport:({path,d})=>{
+    if(!dispatched)return;
+    if(path.endsWith('/'+d.payment.payment_id)&&++details===1)return new Response(JSON.stringify(snapshot));
+    if(path.startsWith('/api/v1/admin/payments?')&&details===1)return new Response(JSON.stringify({items:[page],total:1,page:0,size:2,sort:'CREATED_DESC'}));
+  }});
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  await assert.rejects(h.session.refundPartial(h.limits),fail);await assert.rejects(h.session.refundRemainder(h.limits),fail);
+  assert.equal(details,1);assert.deepEqual(h.posts,[700]);
+});
+
+test('observer never confirms an endlessly straddled valid transition',async t=>{
+  let dispatched=false,details=0;
+  const h=await harness(t,{dependencies:fakeClock(),afterRefund:()=>{dispatched=true;},transport:({path,d})=>{
+    if(dispatched&&path.endsWith('/'+d.payment.payment_id)){details++;return new Response(JSON.stringify(processingSnapshot(d)));}
+  }});
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  await assert.rejects(h.session.refundPartial(h.limits),fail);await assert.rejects(h.session.refundRemainder(h.limits),fail);
+  assert.equal(details,30);assert.deepEqual(h.posts,[700]);assert.equal(h.session.diagnostic().reason,'EXHAUSTED');
+});
+
+// Break: null refund and operation references must not turn a success event's
+// missing provider identity into an incomplete observation that later heals.
+for(const [status,successEvidence] of [['SUCCEEDED',true],['SUCCEEDED',false],['PENDING',true],['PROCESSING',true]])
+test('review I1 rejects '+status+' null reference with success evidence '+successEvidence+' before a coherent retry',async t=>{
+  let dispatched=false,details=0,snapshot,operations;
+  const h=await harness(t,{dependencies:fakeClock(),afterRefund:({d,operations:actual})=>{
+    dispatched=true;snapshot=clone(d);operations=clone(actual);
+    Object.assign(snapshot.payment,{status:'SUCCEEDED',refunded_amount_minor:0,refundable_amount_minor:1300});
+    Object.assign(snapshot.refunds[0],{status,provider_refund_reference:null});
+    for(const event of snapshot.events)if(['REFUND_PROCESSING','REFUND_SUCCEEDED'].includes(event.event_type))event.provider_object_id=null;
+    operations.find(op=>op.kind==='REFUND_CREATE').reference=null;
+    if(!successEvidence){
+      const ids=snapshot.events.filter(e=>e.event_type==='REFUND_SUCCEEDED').map(e=>e.id);
+      snapshot.events=snapshot.events.filter(e=>!ids.includes(e.id));
+      snapshot.outbox_events=snapshot.outbox_events.filter(e=>!ids.includes(e.id));
+      snapshot.deliveries=snapshot.deliveries.filter(e=>!ids.includes(e.outbox_event_id));
+    }
+  },transport:({path,d})=>{
+    if(!dispatched)return;
+    if(path.endsWith('/'+d.payment.payment_id)&&++details===1)return new Response(JSON.stringify(snapshot));
+    if(path.startsWith('/api/v1/admin/provider-operations?')&&details===1)return new Response(JSON.stringify(operations));
+  }});
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  await assert.rejects(h.session.refundPartial(h.limits),fail);
+  assert.equal(details,1);assert.deepEqual(h.session.diagnostic(),{stage:'DETAIL',reason:'INTEGRITY',probes:1});
+  assert.equal(JSON.parse(await readFile(h.f.statePath)).legs[0].phase,'ACKNOWLEDGED');
+  await assert.rejects(h.session.refundRemainder(h.limits),fail);await assert.rejects(h.session.refundPartial(h.limits),fail);
+  assert.equal(details,1);assert.deepEqual(h.posts,[700]);
+});
+
+for(const status of ['PENDING','PROCESSING'])test('review I1 still observes '+status+' null reference without success evidence',async t=>{
+  let dispatched=false,details=0,snapshot,operations;
+  const h=await harness(t,{dependencies:fakeClock(),afterRefund:({d,operations:actual})=>{
+    dispatched=true;snapshot=processingSnapshot(d);operations=clone(actual);
+    Object.assign(snapshot.refunds[0],{status,provider_refund_reference:null});
+    snapshot.events.find(e=>e.event_type==='REFUND_PROCESSING').provider_object_id=null;
+    operations.find(op=>op.kind==='REFUND_CREATE').reference=null;
+  },transport:({path,d})=>{
+    if(!dispatched)return;
+    if(path.endsWith('/'+d.payment.payment_id)&&++details===1)return new Response(JSON.stringify(snapshot));
+    if(path.startsWith('/api/v1/admin/provider-operations?')&&details===1)return new Response(JSON.stringify(operations));
+  }});
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  assert.equal((await h.session.refundPartial(h.limits)).amountMinor,700);
+  assert.equal(details,2);assert.deepEqual(h.posts,[700]);
+  assert.equal(JSON.parse(await readFile(h.f.statePath)).legs[0].phase,'CONFIRMED');
+});
+
+for(const mode of ['pre-aborted','expired admission','expired cleanup'])test('review M1 classifies '+mode+' without acquiring authority or renewing cleanup',async t=>{
+  const clock=fakeClock(),abort=new AbortController(),h=await harness(t,{dependencies:clock});
+  let context=h.limits;
+  if(mode==='expired cleanup'){
+    await h.session.verifyBaseline(context);clock.advance(h.limits.deadline+120000-clock.now());
+    await assert.rejects(h.session.close({deadline:h.limits.deadline+120000}),fail);
+  }else{
+    if(mode==='pre-aborted'){abort.abort();context={...context,signal:abort.signal};}
+    else context={deadline:clock.now()-1};
+    await assert.rejects(h.session.verifyBaseline(context),fail);assert.deepEqual(h.trace,[]);
+  }
+  const diagnostic=h.session.diagnostic();
+  assert.deepEqual(diagnostic,{stage:mode==='expired cleanup'?'CLEANUP':'BASELINE',reason:mode==='pre-aborted'?'ABORTED':'DEADLINE',probes:0});
+  await assert.rejects(h.session.refundPartial(h.limits),fail);
+  assert.deepEqual(h.session.diagnostic(),diagnostic);assert.deepEqual(h.posts,[]);
+});
+
+for(const mode of ['exhausted','aborted','deadline'])test('observer '+mode+' retains its first safe diagnostic through close',async t=>{
+  const clock=fakeClock(),abort=new AbortController();let dispatched=false,details=0;
+  const h=await harness(t,{dependencies:clock,afterRefund:({receipt})=>{dispatched=true;receipt.events=[];receipt.count=0;},transport:({path,d})=>{
+    if(dispatched&&path.endsWith('/'+d.payment.payment_id)) {
+      details++;if(mode==='aborted')abort.abort();if(mode==='deadline')clock.advance(45000);
+    }
+  }});
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  await assert.rejects(h.session.refundPartial({...h.limits,signal:abort.signal}),fail);
+  const diagnostic=h.session.diagnostic();
+  assert.deepEqual(diagnostic,{stage:mode==='exhausted'?'CALLBACK':'DETAIL',reason:mode==='exhausted'?'EXHAUSTED':mode==='aborted'?'ABORTED':'DEADLINE',probes:mode==='exhausted'?30:1});
+  assert.ok(Object.isFrozen(diagnostic));assert.equal(details,mode==='exhausted'?30:1);
+  await assert.rejects(h.session.refundRemainder(h.limits),fail);
+  assert.equal(await h.session.close({deadline:h.limits.deadline+120000}),true);
+  assert.deepEqual(h.session.diagnostic(),diagnostic);assert.deepEqual(h.posts,[700]);
+  assert.equal(JSON.parse(await readFile(h.f.statePath)).legs[0].phase,'ACKNOWLEDGED');
 });
 
 // Break: admitting reservation labels without validating their non-success facts.

@@ -32,6 +32,33 @@ function fixture(){
   const tick=async at=>{time=at;for(const [id,t] of [...timers])if(t.at<=time){timers.delete(id);t.fn();}await turn();};
   return {calls,seen,timers,abort,limits,state,runtime,cli,session,deps,turn,tick,proof};
 }
+
+test('controller retains safe session failure diagnostic after cleanup without promoting proof',async()=>{
+  const f=fixture();let closed=false;
+  f.session.refundPartial=async()=>{throw Error('private_exception_canary');};
+  f.session.close=async()=>{closed=true;return true;};
+  f.session.diagnostic=()=>{assert.equal(closed,true);return {stage:'DETAIL',reason:'INTEGRITY',probes:1};};
+  const value=await runManualRefund(options,f.limits,f.deps);
+  assert.equal(value.report.result,'PENDING');assert.equal(value.report.phase,'PARTIAL');
+  assert.equal(value.report.partial_confirmed,false);assert.equal(value.report.remainder_confirmed,false);
+  assert.deepEqual(value.report.diagnostic,{stage:'DETAIL',reason:'INTEGRITY',probes:1});
+  assert.equal(f.calls.includes('remainder'),false);assert.equal(JSON.stringify(value).includes('canary'),false);
+});
+for(const mode of ['method getter','value getter','arbitrary error','throwing diagnostic'])test('controller ignores '+mode+' in diagnostics without reading private data',async()=>{
+  const f=fixture();let reads=0;f.session.refundPartial=async()=>{throw Error('private_exception_canary');};
+  if(mode==='method getter')Object.defineProperty(f.session,'diagnostic',{get(){reads++;throw Error('private_getter_canary');}});
+  else f.session.diagnostic=()=>{
+    if(mode==='throwing diagnostic')throw Error('private_diagnostic_canary');
+    const value={stage:'DETAIL',reason:'INTEGRITY',probes:1};
+    if(mode==='value getter')Object.defineProperty(value,'reason',{enumerable:true,get(){reads++;throw Error('private_getter_canary');}});
+    else value.error='private_error_canary';
+    return value;
+  };
+  const value=await runManualRefund(options,f.limits,f.deps);
+  assert.equal(value.report.result,'PENDING');assert.equal(value.report.phase,'PARTIAL');
+  assert.equal(Object.hasOwn(value.report,'diagnostic'),false);assert.equal(reads,0);
+  assert.equal(JSON.stringify(value).includes('canary'),false);assert.equal(f.calls.includes('remainder'),false);
+});
 // Break: reordering, extra capabilities, wrong original CLI directory or renewed authority.
 test('controller composes accepted capabilities once and emits only complete proof',async()=>{
   const f=fixture(),value=await runManualRefund(options,f.limits,f.deps);
