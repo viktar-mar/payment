@@ -98,3 +98,39 @@ test('real provider Event contradiction prevents rotation and refund despite loc
 test('proof45-second timer cancels delegated provider work and late success cannot confirm',async t=>{let time=Date.now(),release,entered,providerSignal;const timers=new Map(),ready=new Promise(r=>{entered=r;});const h=await harness(t,{dependencies:{now:()=>time,setTimeout:(fn,delay)=>{const id={};timers.set(id,{fn,at:time+delay});return id;},clearTimeout:id=>timers.delete(id)},finalProvider:async()=>{entered();await new Promise(r=>{release=r;});}});await admit(h);const rejected=assert.rejects(h.session.refundRemainder(h.limits),failure);await ready;time+=45000;for(const[id,timer]of[...timers])if(timer.at<=time){timers.delete(id);timer.fn();}await rejected;release();await new Promise(r=>setImmediate(r));assert.equal(h.session.diagnostic().reason,'DEADLINE');assert.equal(h.phase(),'ACK');await assert.rejects(h.session.verifyFinal(h.limits),failure);});
 test('straddled updated_at may not move backwards within one millisecond',async t=>{let dispatched=false,count=0;const h=await harness(t,{afterRefund:({d})=>{dispatched=true;d.payment.updated_at='2026-10-19T10:00:02.000000001Z';},transport:({path,d})=>{if(dispatched&&path.endsWith('/'+d.payment.payment_id)&&++count===1){const v=pending(d);v.payment.updated_at='2026-10-19T10:00:02.000000002Z';return response(v);}}});await admit(h);await assert.rejects(h.session.refundRemainder(h.limits),failure);assert.equal(count,1);});
 for(const status of ['SUCCEEDED','PENDING','PROCESSING'])test('straddled '+status+' null reference with a success event fails before a repaired probe',async t=>{let dispatched=false,count=0;const h=await harness(t,{afterRefund:()=>{dispatched=true;},transport:({path,d,operations})=>{if(dispatched&&path.endsWith('/'+d.payment.payment_id)&&++count===1){const v=clone(d);Object.assign(v.payment,pending(d).payment);Object.assign(v.refunds[1],{status,provider_refund_reference:null});v.events.at(-1).provider_object_id=null;return response(v);}if(dispatched&&count===1&&path.startsWith('/api/v1/admin/provider-operations?')){const v=clone(operations);v.at(-1).reference=null;return response(v);}}});await admit(h);await assert.rejects(h.session.refundRemainder(h.limits),failure);assert.equal(count,1);});
+for(const status of ['DEAD','UNKNOWN'])for(const straddled of [false,true])test(`${straddled?'straddled':'coherent'} ${status} outbox stops on its first probe without repaired data`,async t=>{
+ let dispatched=false,reads=0;
+ const h=await harness(t,{afterRefund:()=>{dispatched=true;},transport:({path,d})=>{
+  if(!dispatched||!path.endsWith('/'+d.payment.payment_id))return;
+  reads++;if(reads!==1)throw Error('second_detail_forbidden');
+  const value=clone(d);value.outbox_events.find(o=>o.id===uid(32)).status=status;
+  if(straddled)Object.assign(value.payment,pending(d).payment);
+  return response(value);
+ }});
+ await admit(h);await assert.rejects(h.session.refundRemainder(h.limits),failure);
+ assert.equal(reads,1);assert.equal(h.phase(),'ACK');
+ await assert.rejects(h.session.refundRemainder(h.limits),failure);
+ assert.equal(reads,1);assert.equal(posts(h).length,1);
+ assert.equal(h.requests.filter(r=>r.path.endsWith('/rotate-secret')).length,1);
+ assert.equal(h.requests.filter(r=>r.path==='/configure').length,1);
+});
+for(const straddled of [false,true])test(`${straddled?'straddled':'coherent'} PENDING outbox may reach DELIVERED on a fresh probe`,async t=>{
+ let dispatched=false,reads=0;
+ const h=await harness(t,{afterRefund:()=>{dispatched=true;},transport:({path,d})=>{
+  if(!dispatched||!path.endsWith('/'+d.payment.payment_id)||++reads!==1)return;
+  const value=clone(d);value.outbox_events.find(o=>o.id===uid(32)).status='PENDING';
+  value.deliveries=value.deliveries.filter(v=>v.outbox_event_id!==uid(32));
+  if(straddled)Object.assign(value.payment,pending(d).payment);
+  return response(value);
+ }});
+ await admit(h);assert.equal((await h.session.refundRemainder(h.limits)).callbackSignatureVerified,true);
+ assert.equal(reads,2);assert.equal(h.phase(),'CONFIRMED');assert.equal(posts(h).length,1);
+ assert.equal((await h.session.verifyFinal(h.limits)).finalTotalVerified,true);
+ assert.equal(h.requests.filter(r=>r.path.endsWith('/rotate-secret')).length,1);
+ assert.equal(h.requests.filter(r=>r.path==='/configure').length,1);
+});
+for(const status of ['PENDING','DEAD','UNKNOWN'])test(`historical700 ${status} outbox cannot admit a baseline`,async t=>{
+ const h=await harness(t);h.d.outbox_events.find(o=>o.id===uid(22)).status=status;
+ await assert.rejects(h.session.verifyBaseline(h.limits),failure);
+ assert.equal(posts(h).length,0);assert.equal(h.requests.some(r=>r.path.endsWith('/rotate-secret')),false);
+});

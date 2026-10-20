@@ -118,7 +118,8 @@ export async function createManualRefundRemainderSession({runtime,cli,state},dep
  function cash(d,e,amount,reference){
   if(!e||e.source!=='PROVIDER_EVENT'||!provider(e.provider_event_id,'evt_')||e.provider_object_id!==reference||e.amount_minor!==amount||e.currency!=='EUR')deny();
   const out=d.outbox_events.filter(o=>o.id===e.id&&o.callback_type===(e.event_type==='PAYMENT_SUCCEEDED'?'payment.succeeded':'refund.succeeded'));
-  if(out.length!==1||out[0].status!=='DELIVERED')return false;
+  if(out.length!==1||out[0].status==='PENDING')return false;
+  if(out[0].status!=='DELIVERED')deny();
   // Current Admin views have no secret-version field. Delivery204 is server evidence only.
   return d.deliveries.some(v=>v.outbox_event_id===e.id&&v.status==='SUCCEEDED'&&v.http_status===204);
  }
@@ -127,7 +128,8 @@ export async function createManualRefundRemainderSession({runtime,cli,state},dep
   stage='DETAIL';const d=await read(paymentPath,c,{until}),p=d?.payment,ids=full?[target.priorRefundId,refundId]:[target.priorRefundId];
   if(!p||p.payment_id!==t.paymentId||p.site_id!==t.site.id||p.payment_account_id!==t.account.id||p.provider!=='STRIPE'||p.source!=='CATALOG'||p.price_id!==t.price.id||p.price_key!==t.price.key||p.price_version!==1||p.amount_minor!==2000||p.currency!=='EUR'||p.tax_mode!=='NONE'
    ||p.customer_id!==null||p.donation_id!==null||p.subscription_id!==null||p.external_order_id!==null||!['attempts','events','refunds','outbox_events','deliveries'].every(k=>Array.isArray(d[k])&&d[k].length<=100)
-   ||!unique(d.events.map(e=>e.id))||!unique(d.refunds.map(r=>r.id))||!unique(d.outbox_events.map(o=>o.id))||!unique(d.deliveries.map(v=>v.id))||d.attempts.length!==1||d.refunds.some(r=>!ids.includes(r.id)))deny();
+   ||!unique(d.events.map(e=>e.id))||!unique(d.refunds.map(r=>r.id))||!unique(d.outbox_events.map(o=>o.id))||!unique(d.deliveries.map(v=>v.id))||d.attempts.length!==1||d.refunds.some(r=>!ids.includes(r.id))
+   ||d.outbox_events.some(o=>!['PENDING','DELIVERED'].includes(o.status)))deny();
   const attempt=d.attempts[0];if(!uuid(attempt.id)||attempt.attempt_number!==1||attempt.status!=='SUCCEEDED'||attempt.provider_intent_reference!==t.intentId||attempt.payment_method_family!=='CARD')deny();
   if(d.events.some((e,i)=>!uuid(e.id)||!Number.isSafeInteger(e.sequence)||e.sequence<1||i>0&&e.sequence<=d.events[i-1].sequence||!['PAYMENT_CREATED','PAYMENT_METHOD_REQUIRED','ATTEMPT_CREATED','PAYMENT_PROCESSING','PAYMENT_SUCCEEDED','REFUND_REQUESTED','REFUND_PROCESSING','REFUND_SUCCEEDED'].includes(e.event_type))
    ||d.events.filter(e=>e.event_type==='PAYMENT_CREATED').length!==1||d.events.filter(e=>e.event_type==='ATTEMPT_CREATED').length!==1)deny();
