@@ -250,8 +250,10 @@ All published bindings are loopback-only. If a port belongs to an unrelated proc
 
 Compose sets the local Spring profile, the local callback host list (localhost, 127.0.0.1, callback-receiver), FAKE provider and insecure cookies only for local HTTP. The callback URL policy independently enforces that fixed local-only list and approved ports; arbitrary additional hosts are not trusted. Outside local development use private keys/credentials, HTTPS and secure cookies. Environment files are excluded from image contexts; do not put secrets in shell tracing, command arguments, URLs, browser code, logs or reports.
 
+For default local startup on Linux or macOS, use the [local Compose launcher](../infrastructure/local-compose.mjs). It adds a local-only overlay changing only the backend user to the current process's POSIX UID/GID, allowing it to read the host-owned mode0600 issuer fixture without changing the host file or its permissions. It derives IDs rather than trusting inherited `PAYMENT_LOCAL_UID`/`PAYMENT_LOCAL_GID`, and selects the repository's `.env`, base Compose and local user overlay from any working directory. Use your ordinary non-root user without sudo; root and Windows are unsupported. The default provider remains Fake. `up` builds, detaches and waits for readiness:
+
 ```bash
-docker compose --env-file infrastructure/.env -f infrastructure/compose.yaml up --build -d --wait
+node infrastructure/local-compose.mjs up
 docker compose --env-file infrastructure/.env -f infrastructure/compose.yaml ps
 ```
 
@@ -989,10 +991,10 @@ an incomplete or missing report; check the actual exit code as well as printed t
 ## Stop and persisted data
 
 ```bash
-docker compose --profile smoke --env-file infrastructure/.env -f infrastructure/compose.yaml down
+node infrastructure/local-compose.mjs stop
 ```
 
-This stops only project containers/network and retains payment-stage-1_payment-postgres. The project name intentionally remains payment-stage-1 for in-place V4 migration and prior data. PostgreSQL 18 mounts /var/lib/postgresql and uses version-aware PGDATA beneath it. Never use down --volumes or volume removal to solve port conflicts. A destructive database reset erases all payment/catalog/admin/journal data and requires explicit authorization and a recoverable backup; it is not part of ordinary stop or this verification.
+This stops the default local project while retaining its containers, network and payment-stage-1_payment-postgres volume. For separately owned smoke/Sandbox harness runs, follow their explicit ownership and stop instructions above. The project name intentionally remains payment-stage-1 for in-place V4 migration and prior data. PostgreSQL 18 mounts /var/lib/postgresql and uses version-aware PGDATA beneath it. Never use down --volumes or volume removal to solve port conflicts. A destructive database reset erases all payment/catalog/admin/journal data and requires explicit authorization and a recoverable backup; it is not part of ordinary stop or this verification.
 
 Stage 1 historical execution reports remain under .superpowers/sdd/2026-09-12-foundation-catalog-implementation; their old counts/running-stack claims are historical, not current runtime state. Fresh Stage 3A verification and the preserved Stage 1–2 compatibility evidence are recorded in .superpowers/sdd/2026-10-10-customer-access/task-13-report.md and review.md; final gate status belongs to the controller-owned progress ledger.
 

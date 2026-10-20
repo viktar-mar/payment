@@ -133,5 +133,7 @@ jobs:
           pnpm --dir frontend install --frozen-lockfile
           pnpm --dir frontend/sdk build
           pnpm --dir examples/demo-site install --frozen-lockfile
+      - name: Prepare public Linux permission fixture image
+        run: docker pull node:24-alpine
       - name: Verify offline infrastructure
         run: node --test --test-timeout=30000 --test-concurrency=1 infrastructure/*.test.mjs

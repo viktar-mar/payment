@@ -25,6 +25,7 @@ const gates = {
   infrastructure: [
     'pnpm --dir frontend install --frozen-lockfile', 'pnpm --dir frontend/sdk build',
     'pnpm --dir examples/demo-site install --frozen-lockfile',
+    'docker pull node:24-alpine',
     'node --test --test-timeout=30000 --test-concurrency=1 infrastructure/*.test.mjs',
   ],
 };
