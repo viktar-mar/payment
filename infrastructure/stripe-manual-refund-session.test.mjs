@@ -112,7 +112,14 @@ async function harness(t, changes={}) {
       const refundId=uuid(20+i),ref='re_SYNTHETIC'+i;
       d.refunds.push({id:refundId,amount_minor:amount,currency:'EUR',status:'SUCCEEDED',
         provider_refund_reference:ref,reason_code:'REQUESTED_BY_CUSTOMER',created_at:p.created_at,updated_at:p.updated_at});
-      const e=event(30+i,'REFUND_SUCCEEDED',amount,ref);d.events.push(e);d.outbox_events.push(out(e));d.deliveries.push(delivery(e));
+      // reserve() always appends ADMIN/REFUND_REQUESTED with no provider IDs.
+      // A processing acknowledgement may follow before the provider webhook.
+      const requested={...event(20+i*10,'REFUND_REQUESTED',amount,null),source:'ADMIN',provider_event_id:null};
+      const processing={...event(21+i*10,'REFUND_PROCESSING',amount,ref),source:'API',provider_event_id:null};
+      const e=event(22+i*10,'REFUND_SUCCEEDED',amount,ref);
+      d.events.push(requested,processing,e);
+      d.outbox_events.push({...out(processing),callback_type:'refund.processing'},out(e));
+      d.deliveries.push(delivery(processing),delivery(e));
       receipt.events.push({event_id:e.id,event_type:'refund.succeeded',count:2});receipt.count++;receipt.duplicates++;
       if(receiverOrigin) {
         const body=JSON.stringify({schema_version:1,event_id:e.id,event_type:'refund.succeeded',site_id:site.id,
@@ -162,6 +169,64 @@ test('inert constructor then durable rotation and ordered complete financial pro
   assert.equal(h.trace.filter(v=>v.endsWith('/rotate-secret')).length,1);
   assert.equal(h.trace.filter(v=>v==='POST /configure').length,1);
   assert.ok(!JSON.stringify(JSON.parse(await readFile(h.f.statePath))).includes(secret));
+});
+
+// Break: admitting reservation labels without validating their non-success facts.
+for(const [name,mutate] of [
+  ['wrong source',e=>{e.source='PROVIDER_EVENT';}],
+  ['provider event masquerading as reservation',e=>{e.provider_event_id='evt_FOREIGN';}],
+  ['provider object on reservation',e=>{e.provider_object_id='re_FOREIGN';}],
+  ['foreign amount',e=>{e.amount_minor=800;}],
+  ['foreign currency',e=>{e.currency='USD';}],
+  ['reservation after success',e=>{e.sequence=99;}],
+])test('invalid reservation '+name+' blocks the next refund',async t=>{
+  const h=await harness(t,{afterRefund:({d})=>mutate(d.events.find(e=>e.event_type==='REFUND_REQUESTED'))});
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  await assert.rejects(h.session.refundPartial(h.limits),fail);
+  await assert.rejects(h.session.refundRemainder(h.limits),fail);
+  assert.deepEqual(h.posts,[700]);
+});
+for(const [name,mutate] of [
+  ['missing reservation',d=>{d.events=d.events.filter(e=>e.event_type!=='REFUND_REQUESTED');}],
+  ['duplicate reservation',d=>{d.events.push({...d.events.find(e=>e.event_type==='REFUND_REQUESTED'),id:uuid(499),sequence:19});}],
+  ['foreign processing',d=>{d.events.find(e=>e.event_type==='REFUND_PROCESSING').provider_object_id='re_FOREIGN';}],
+  ['wrong processing amount',d=>{d.events.find(e=>e.event_type==='REFUND_PROCESSING').amount_minor=1300;}],
+])test(name+' cannot supply a valid refund history',async t=>{
+  const h=await harness(t,{afterRefund:({d})=>mutate(d)});
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  await assert.rejects(h.session.refundPartial(h.limits),fail);
+  await assert.rejects(h.session.refundRemainder(h.limits),fail);
+  assert.deepEqual(h.posts,[700]);
+});
+test('acknowledgement without a processing transition still proves both reserved refunds',async t=>{
+  const h=await harness(t,{afterRefund:({d})=>{
+    const processing=d.events.filter(e=>e.event_type==='REFUND_PROCESSING').map(e=>e.id);
+    d.events=d.events.filter(e=>!processing.includes(e.id));
+    d.outbox_events=d.outbox_events.filter(e=>!processing.includes(e.id));
+    d.deliveries=d.deliveries.filter(e=>!processing.includes(e.outbox_event_id));
+  }});
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  await h.session.refundPartial(h.limits);await h.session.refundRemainder(h.limits);
+  assert.equal((await h.session.verifyFinal(h.limits)).journalVerified,true);
+  assert.deepEqual(h.posts,[700,1300]);
+});
+test('a replaced first reservation cannot authorize the second refund',async t=>{
+  const h=await harness(t);
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  await h.session.refundPartial(h.limits);
+  h.d.events.find(e=>e.event_type==='REFUND_REQUESTED').id=uuid(499);
+  await assert.rejects(h.session.refundRemainder(h.limits),fail);
+  assert.deepEqual(h.posts,[700]);
+});
+test('a contradictory second reservation cannot certify either final proof',async t=>{
+  const h=await harness(t,{afterRefund:({d,i})=>{
+    if(i===1)d.events.find(e=>e.event_type==='REFUND_REQUESTED'&&e.amount_minor===1300).source='API';
+  }});
+  await h.session.verifyBaseline(h.limits);await h.session.rotateCallback(h.limits);
+  await h.session.refundPartial(h.limits);
+  await assert.rejects(h.session.refundRemainder(h.limits),fail);
+  await assert.rejects(h.session.verifyFinal(h.limits),fail);
+  assert.deepEqual(h.posts,[700,1300]);
 });
 
 for(const [name,changes] of [

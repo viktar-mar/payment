@@ -1062,11 +1062,17 @@ A read-only investigation of PENDING requires a separate operator decision.
 
 One active deadline is at most 30 minutes from entry; cleanup authority ends at that
 original deadline plus 2 minutes. There is no renewed authority. The controller aborts
-active work and attempts bounded HTTP/session/listener drains, then independently
-attempts to stop only exact freshly verified ordinary containers restored by this
-controller. A failed session or listener close does not skip the runtime stop attempt.
-Indefinitely unresponsive cleanup can remain unsettled; closure remains unverified and
-the report is PENDING with exit 1. Full drain before shutdown is not guaranteed.
+active work and waits for actual HTTP/session work, including late session acquisition
+and response-body disposal, before stopping runtime. A settled session failure or a
+failed listener close still allows the independent runtime stop attempt. The HTTP
+settlement cutoff is fixed at the original active deadline plus 1 minute, reserving
+the final minute of the same cleanup ceiling for shutdown; an early error does not
+move this cutoff. Only work still unresponsive at that cutoff permits last-resort
+shutdown with HTTP work unsettled. That fallback permanently reports PENDING, exit 1
+and `runtime_closed=false`, even if containers later stop. An in-flight runtime
+restore/start must still settle before shutdown can begin. Shutdown targets only exact
+freshly verified ordinary containers restored by this controller, and no cleanup or
+financial authority is renewed after the original ceiling.
 Issuer helpers are not restarted. Containers, images,
 volumes, networks, credentials, provider objects, state and audit history are retained;
 an uncertain original-target lock remains for inspection. No resource deletion or

@@ -164,6 +164,44 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
     return d.deliveries.some(v=>v.outbox_event_id===event.id&&v.status==='SUCCEEDED'
       &&Number.isInteger(v.http_status)&&v.http_status>=200&&v.http_status<300);
   }
+  function refundHistory(d,ids,paymentSuccess) {
+    const requested=d.events.filter(event=>event.event_type==='REFUND_REQUESTED');
+    if(requested.length!==d.refunds.length)fail();
+    for(const refund of d.refunds) {
+      const index=ids.indexOf(refund.id),amount=index===0?700:1300;
+      if(index<0||refund.amount_minor!==amount||refund.currency!=='EUR')fail();
+      // AdminPaymentViews omits the reservation payload's refund_id. The two
+      // fixed, distinct amounts bind these facts to the acknowledged refunds.
+      const reservations=requested.filter(event=>event.amount_minor===amount);
+      if(reservations.length!==1)fail();
+      const reservation=reservations[0];
+      if(reservation.source!=='ADMIN'||reservation.currency!=='EUR'
+        ||reservation.provider_event_id!==null||reservation.provider_object_id!==null
+        ||reservation.sequence<=paymentSuccess.sequence)fail();
+      if(proofs[index]&&!same(reservation,proofs[index].reservation))fail();
+      const transitions=d.events.filter(event=>['REFUND_PROCESSING','REFUND_SUCCEEDED'].includes(event.event_type)
+        &&event.provider_object_id===refund.provider_refund_reference);
+      const processing=transitions.filter(event=>event.event_type==='REFUND_PROCESSING');
+      const succeeded=transitions.find(event=>event.event_type==='REFUND_SUCCEEDED');
+      if(processing.length>1)fail();
+      for(const event of transitions) {
+        if(event.amount_minor!==amount||event.currency!=='EUR'||event.sequence<=reservation.sequence)fail();
+        if(event.event_type==='REFUND_PROCESSING') {
+          if(!['API','PROVIDER_EVENT','RECONCILIATION'].includes(event.source)
+            ||(event.source==='PROVIDER_EVENT'?!provider(event.provider_event_id,'evt_'):event.provider_event_id!==null)
+            ||succeeded&&event.sequence>=succeeded.sequence)fail();
+        }
+      }
+      if(index===1) {
+        const first=d.refunds.find(value=>value.id===ids[0]);
+        const firstSuccess=d.events.find(event=>event.event_type==='REFUND_SUCCEEDED'
+          &&event.provider_object_id===first?.provider_refund_reference);
+        if(!firstSuccess||reservation.sequence<=firstSuccess.sequence)fail();
+      }
+    }
+    if(d.events.some(event=>['REFUND_PROCESSING','REFUND_SUCCEEDED'].includes(event.event_type)
+      &&!d.refunds.some(refund=>refund.provider_refund_reference===event.provider_object_id)))fail();
+  }
   async function detail(context,total,ids,proofDeadline=context.deadline) {
     const d=await read(paymentPath,context,{proofDeadline}),p=d?.payment;
     if(!p||p.payment_id!==target.paymentId||p.site_id!==target.site.id||p.payment_account_id!==target.account.id
@@ -199,13 +237,16 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
     const immutable={attempt,success:success[0],events:d.events.filter(e=>!e.event_type.startsWith('REFUND_'))};
     if(original&&!same(immutable,original))fail();
     if(!original)original=structuredClone(immutable);
-    if(d.events.some(e=>!validId(e.id)||!['PAYMENT_CREATED','PAYMENT_METHOD_REQUIRED','ATTEMPT_CREATED',
-      'PAYMENT_PROCESSING','PAYMENT_SUCCEEDED','REFUND_PROCESSING','REFUND_SUCCEEDED'].includes(e.event_type))
+    if(d.events.some((e,index)=>!validId(e.id)||!Number.isSafeInteger(e.sequence)||e.sequence<1
+      ||index>0&&e.sequence<=d.events[index-1].sequence
+      ||!['PAYMENT_CREATED','PAYMENT_METHOD_REQUIRED','ATTEMPT_CREATED',
+      'PAYMENT_PROCESSING','PAYMENT_SUCCEEDED','REFUND_REQUESTED','REFUND_PROCESSING','REFUND_SUCCEEDED'].includes(e.event_type))
       ||d.events.filter(e=>e.event_type==='PAYMENT_CREATED').length!==1
       ||d.events.filter(e=>e.event_type==='ATTEMPT_CREATED').length!==1
       ||d.outbox_events.some(o=>!d.events.some(e=>e.id===o.id&&({PAYMENT_PROCESSING:'payment.processing',
         PAYMENT_SUCCEEDED:'payment.succeeded',REFUND_PROCESSING:'refund.processing',REFUND_SUCCEEDED:'refund.succeeded'})[e.event_type]===o.callback_type))
       ||d.deliveries.some(v=>!d.outbox_events.some(o=>o.id===v.outbox_event_id)))fail();
+    refundHistory(d,ids,success[0]);
     const status=total===0?'SUCCEEDED':total===700?'PARTIALLY_REFUNDED':'REFUNDED';
     return {d,complete:p.status===status&&p.refunded_amount_minor===total&&p.refundable_amount_minor===2000-total&&d.refunds.length===ids.length};
   }
@@ -239,7 +280,8 @@ export async function createManualRefundSession({runtime,cli,state},dependencies
       const value={refundId:refund.id,providerReference:refund.provider_refund_reference,
         providerEventId:event.provider_event_id,amountMinor:amount,totalMinor:i?2000:700};
       if(proofs[i]&&!same(value,proofs[i].identity))fail();
-      found.push({identity:value,eventId:event.id});
+      found.push({identity:value,eventId:event.id,
+        reservation:structuredClone(d.events.find(event=>event.event_type==='REFUND_REQUESTED'&&event.amount_minor===amount))});
       if(proofs[i]&&proofs[i].eventId!==event.id)fail();
     }
     return found;

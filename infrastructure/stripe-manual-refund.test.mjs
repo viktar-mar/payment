@@ -4,6 +4,7 @@ import {EventEmitter} from 'node:events';
 import {Writable} from 'node:stream';
 import {spawnSync} from 'node:child_process';
 import {runManualRefund,runManualRefundCli,runManualRefundEntry} from './stripe-manual-refund.mjs';
+import {createManualRefundSession} from './stripe-manual-refund-session.mjs';
 import {manualPaymentOptIn} from './stripe-manual-payment-options.mjs';
 import {manualFormOptIn} from './stripe-manual-form-options.mjs';
 import {formDiagnosticOptIn} from './stripe-sandbox-owned.mjs';
@@ -82,11 +83,133 @@ for(const [owner,method,phase] of [['runtime','restore','RESTORE'],['cli','valid
     assert.deepEqual(f.seen.find(([n])=>n==='state-close')[1][0],{retain:true});
   });
 }
-test('hung cleanup attempts do not consume independent runtime and state closure opportunities',async()=>{
+test('unresponsive session cleanup releases runtime only at the original reserved cutoff and never certifies closure',async()=>{
   const f=fixture(),sessionClose=defer(),listenerClose=defer();f.session.close=()=>sessionClose.promise;f.cli.stopListener=()=>listenerClose.promise;
   const running=runManualRefund(options,f.limits,f.deps);await f.turn();await f.tick(11000);await f.tick(21000);
-  assert.ok(f.calls.includes('runtime-stop'));await f.tick(31000);assert.ok(f.calls.includes('state-close'));
-  sessionClose.resolve(true);listenerClose.resolve(true);const v=await running;assert.equal(v.report.result,'PENDING');assert.equal(v.report.runtime_closed,true);assert.equal(v.report.listener_closed,false);
+  assert.equal(f.calls.includes('runtime-stop'),false);
+  await f.tick(1860999);assert.equal(f.calls.includes('runtime-stop'),false);
+  await f.tick(1861000);assert.ok(f.calls.includes('runtime-stop'));
+  sessionClose.resolve(true);listenerClose.resolve(true);
+  const v=await running;
+  assert.equal(v.report.result,'PENDING');assert.equal(v.report.runtime_closed,false);assert.equal(v.report.listener_closed,false);
+  assert.equal(f.seen.find(([n])=>n==='runtime-stop')[1][0].deadline,1921000);
+});
+for(const kind of ['body','close'])test('session '+kind+' settling after ten seconds gates runtime until actual settlement',async()=>{
+  const f=fixture(),late=defer();
+  if(kind==='body')f.session.rotateCallback=()=>late.promise;
+  else f.session.close=()=>{f.calls.push('session-close');return late.promise;};
+  const running=runManualRefund(options,f.limits,f.deps);
+  await f.turn();
+  if(kind==='body'){f.abort.abort();await f.turn();}
+  await f.tick(11000);await f.tick(21000);await f.tick(41000);
+  assert.equal(f.calls.includes('runtime-stop'),false);
+  late.resolve(true);
+  const v=await running;
+  assert.equal(v.report.result,kind==='body'?'PENDING':'SUCCEEDED');
+  assert.equal(v.report.runtime_closed,true);
+  if(kind==='body')assert.equal(f.calls.includes('partial'),false);
+});
+test('listener-only unresponsiveness does not hold runtime behind the HTTP cutoff',async()=>{
+  const f=fixture(),late=defer();f.cli.stopListener=()=>late.promise;
+  const running=runManualRefund(options,f.limits,f.deps);
+  await f.turn();await f.tick(11000);
+  assert.ok(f.calls.includes('runtime-stop'));
+  late.resolve(true);
+  const v=await running;assert.equal(v.report.result,'PENDING');assert.equal(v.report.runtime_closed,true);
+});
+test('an unsettled session body at fixed cutoff stays PENDING even after late settlement',async()=>{
+  const f=fixture(),late=defer();f.session.rotateCallback=()=>late.promise;
+  const running=runManualRefund(options,f.limits,f.deps);
+  await f.turn();await f.tick(501000);f.abort.abort();await f.turn();
+  await f.tick(521000);assert.equal(f.calls.includes('runtime-stop'),false);
+  await f.tick(1860999);assert.equal(f.calls.includes('runtime-stop'),false);
+  await f.tick(1861000);assert.ok(f.calls.includes('runtime-stop'));
+  late.resolve(true);
+  const v=await running;
+  assert.equal(v.report.result,'PENDING');assert.equal(v.report.runtime_closed,false);
+  assert.equal(f.calls.includes('partial'),false);assert.equal(f.calls.includes('remainder'),false);
+});
+test('the fixed HTTP cutoff does not release an unsettled restore or grant work after the ceiling',async()=>{
+  const f=fixture(),late=defer();f.runtime.restore=()=>late.promise;
+  const running=runManualRefund(options,f.limits,f.deps);
+  await f.turn();f.abort.abort();await f.turn();
+  await f.tick(11000);await f.tick(21000);await f.tick(1861000);
+  assert.equal(f.calls.includes('runtime-stop'),false);
+  await f.tick(1921000);const v=await running;
+  assert.equal(v.report.runtime_closed,false);assert.equal(v.report.result,'PENDING');
+  late.resolve(true);await f.turn();
+  assert.equal(f.calls.includes('runtime-stop'),false);assert.equal(f.calls.includes('cli'),false);
+});
+test('late session factory and its asynchronous close remain owned before runtime shutdown',async()=>{
+  const f=fixture(),factory=defer(),closing=defer();
+  f.deps.createSession=()=>factory.promise;
+  f.session.close=()=>{f.calls.push('session-close');return closing.promise;};
+  const running=runManualRefund(options,f.limits,f.deps);
+  await f.turn();f.abort.abort();await f.turn();
+  await f.tick(41000);assert.equal(f.calls.includes('runtime-stop'),false);
+  factory.resolve(f.session);await f.turn();
+  assert.equal(f.calls.filter(name=>name==='session-close').length,1);
+  assert.equal(f.calls.includes('runtime-stop'),false);
+  closing.resolve(true);
+  const v=await running;
+  assert.equal(v.report.runtime_closed,true);assert.equal(v.report.result,'PENDING');
+  assert.equal(f.calls.includes('baseline'),false);assert.equal(f.calls.includes('rotation'),false);
+});
+test('runtime restoration settling after the HTTP cutoff still receives only the original cleanup ceiling',async()=>{
+  const f=fixture(),late=defer();f.runtime.restore=()=>late.promise;
+  const running=runManualRefund(options,f.limits,f.deps);
+  await f.turn();f.abort.abort();await f.turn();await f.tick(1861000);
+  assert.equal(f.calls.includes('runtime-stop'),false);
+  late.resolve(true);await f.turn();
+  const v=await running;
+  assert.equal(f.calls.filter(name=>name==='runtime-stop').length,1);
+  assert.equal(f.seen.find(([n])=>n==='runtime-stop')[1][0].deadline,1921000);
+  assert.equal(v.report.result,'PENDING');assert.equal(f.calls.includes('cli'),false);
+});
+test('genuinely unresponsive HTTP ends at the original ceiling without late dispatch or renewed cleanup',async()=>{
+  const f=fixture(),late=defer();f.session.rotateCallback=()=>late.promise;
+  const running=runManualRefund(options,f.limits,f.deps);
+  await f.turn();f.abort.abort();await f.turn();await f.tick(1861000);
+  assert.equal(f.calls.filter(name=>name==='runtime-stop').length,1);
+  await f.tick(1871000);await f.tick(1921000);
+  const v=await running;
+  assert.equal(v.report.result,'PENDING');assert.equal(v.report.runtime_closed,false);
+  const calls=[...f.calls];late.resolve(true);await f.turn();
+  assert.deepEqual(f.calls,calls);assert.equal(f.calls.includes('partial'),false);
+});
+test('real session drains a canceled HTTP response body beyond ten seconds before runtime stop',async()=>{
+  const f=fixture(),reading=defer(),canceling=defer(),disposed=defer();
+  Object.assign(f.state.target,{
+    paymentId:'aaaaaaaa-bbbb-4ccc-8ddd-000000000007',
+    site:{id:'aaaaaaaa-bbbb-4ccc-8ddd-000000000002'},callbackVersion:1,
+    endpoints:{backend:'http://127.0.0.1:18080',receiver:'http://127.0.0.1:18082'}
+  });
+  f.runtime.withAdminCredentials=callback=>callback({username:'synthetic',password:'synthetic'});
+  f.cli.assertRefundListener=()=>true;
+  f.deps.createSession=capabilities=>createManualRefundSession(capabilities,{
+    now:f.deps.now,setTimeout:f.deps.setTimeout,clearTimeout:f.deps.clearTimeout,
+    fetch:async(url,init)=>{
+      assert.equal(init.redirect,'error');
+      if(url.endsWith('/auth/sessions')) {
+        const headers=new Headers();
+        headers.append('set-cookie','PAYMENT_ADMIN_SESSION=synthetic; Path=/');
+        headers.append('set-cookie','XSRF-TOKEN=synthetic; Path=/');
+        return new Response(null,{status:204,headers});
+      }
+      assert.ok(url.endsWith('/auth/session'));
+      return new Response(new ReadableStream({
+        pull(){reading.resolve();},
+        cancel(){canceling.resolve();return disposed.promise;}
+      }));
+    }
+  });
+  const running=runManualRefund(options,f.limits,f.deps);
+  await reading.promise;f.abort.abort();await canceling.promise;await f.turn();
+  await f.tick(11000);await f.tick(41000);
+  assert.equal(f.calls.includes('runtime-stop'),false);
+  disposed.resolve();const v=await running;
+  assert.equal(v.report.result,'PENDING');assert.equal(v.report.runtime_closed,true);
+  assert.equal(f.calls.includes('rotation'),false);assert.equal(f.calls.includes('partial'),false);
 });
 test('signal during final stdout forces exit1 while preserving one report attempt',async()=>{
   const f=fixture(),output=defer();let stop,removed=false,writes=0;

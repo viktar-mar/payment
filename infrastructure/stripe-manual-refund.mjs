@@ -35,7 +35,8 @@ export async function runManualRefund(options,originalLimits,deps={}){
   input.signal?.addEventListener('abort',abort,{once:true});
   const timer=setTimer(abort,Math.max(1,input.deadline-now()));
   const limits=Object.freeze({deadline:input.deadline,signal:controller.signal}),cleanup=Object.freeze({deadline:input.deadline+120000});
-  const proof={...EMPTY},work=new Set(),bodies=new Set(),runtimeWork=new Set(),closures=new Map(),cleanupAttempts=new Set();
+  const httpSettlementCutoff=cleanup.deadline-60000;
+  const proof={...EMPTY},work=new Set(),bodies=new Set(),runtimeWork=new Set(),sessionWork=new Set(),closures=new Map(),cleanupAttempts=new Set();
   let phase='RESTORE',pending=false,closing=false,runtimeReleased=false,state,runtime,cli,session;
   let stateAttempted=false,runtimeAttempted=false,cliAttempted=false;
   function check(){if(closing||pending||controller.signal.aborted||now()>=limits.deadline)throw null;}
@@ -43,9 +44,11 @@ export async function runManualRefund(options,originalLimits,deps={}){
     const p=Promise.resolve().then(body);
     work.add(p);
     if(kind==='runtime')runtimeWork.add(p);
+    if(kind==='session')sessionWork.add(p);
     const settled=()=>{
       work.delete(p);
       runtimeWork.delete(p);
+      sessionWork.delete(p);
       if(closing&&runtimeReleased&&runtimeWork.size===0&&runtime)close('runtime',runtime,'stop');
     };
     p.then(settled,settled);
@@ -68,7 +71,7 @@ export async function runManualRefund(options,originalLimits,deps={}){
       onAcquire?.(value);
       return value;
     },kind);
-    bodies.add(p);
+    if(kind!=='session'&&kind!=='runtime')bodies.add(p);
     p.then(()=>bodies.delete(p),()=>bodies.delete(p));
     return wait(p,limits.deadline,limits.signal);
   }
@@ -80,7 +83,7 @@ export async function runManualRefund(options,originalLimits,deps={}){
       return kind==='state'
         ?value.close(Object.freeze({retain:pending||work.size>1}),cleanup)
         :value[method](cleanup);
-    });
+    },kind==='session'?'session':undefined);
     closures.set(kind,p);
     p.catch(()=>{pending=true;});
     return p;
@@ -139,21 +142,21 @@ export async function runManualRefund(options,originalLimits,deps={}){
     await operation(async()=>{
       const create=deps.createSession??(await import('./stripe-manual-refund-session.mjs')).createManualRefundSession;
       return create(Object.freeze({runtime,cli,state}));
-    },acquired('session','close',v=>{session=v;}));
-    await requireTrue(()=>session.verifyBaseline(limits));
+    },acquired('session','close',v=>{session=v;}),'session');
+    await requireTrue(()=>session.verifyBaseline(limits),'session');
     proof.target_verified=true;
 
     phase='ROTATION';
-    await requireTrue(()=>session.rotateCallback(limits));
+    await requireTrue(()=>session.rotateCallback(limits),'session');
     proof.callback_rotated=true;
     phase='PARTIAL';
-    acceptProof(await operation(()=>session.refundPartial(limits)),700,700);
+    acceptProof(await operation(()=>session.refundPartial(limits),undefined,'session'),700,700);
     proof.partial_confirmed=true;
     phase='REMAINDER';
-    acceptProof(await operation(()=>session.refundRemainder(limits)),1300,2000);
+    acceptProof(await operation(()=>session.refundRemainder(limits),undefined,'session'),1300,2000);
     proof.remainder_confirmed=true;
     phase='VERIFY';
-    const final=exact(await operation(()=>session.verifyFinal(limits)),[
+    const final=exact(await operation(()=>session.verifyFinal(limits),undefined,'session'),[
       'partialConfirmed','remainderConfirmed','providerVerified','webhookVerified','journalVerified','callbackVerified'
     ]);
     if(Object.values(final).some(v=>v!==true))throw null;
@@ -163,20 +166,25 @@ export async function runManualRefund(options,originalLimits,deps={}){
     if(!pending)phase='CLEANUP';
     closing=true;
     controller.abort();
-    await cleanupOne('session',session,'close');
+    // Start HTTP cancellation immediately. Its actual close/body/factory
+    // settlement is tracked separately from listener failure or timeout.
+    if(session)close('session',session,'close');
     await cleanupOne('cli',cli,'stopListener','listener_closed');
     if(!cliAttempted)proof.listener_closed=true;
-    // The wait's cancellation is distinct from its body's settlement. Give
-    // canceled HTTP/CLI bodies and late factories a bounded drain opportunity
-    // before stopping runtime; newly acquired children still own one close.
+    // CLI bodies and late non-session factories retain their own bounded
+    // cleanup opportunity; they cannot shorten the HTTP settlement window.
     await drain(bodies,Math.min(cleanup.deadline,now()+10000));
-    await cleanupOne('session',session,'close');
     await cleanupOne('cli',cli,'stopListener','listener_closed');
+    await drain(sessionWork,httpSettlementCutoff);
+    const httpDrainUnverified=sessionWork.size>0;
+    if(httpDrainUnverified)pending=true;
+    else await cleanupOne('session',session,'close');
     // A failed listener close cannot suppress the separate exact-runtime stop.
-    // An in-flight restore must settle before that stop can be released.
+    // Only the fixed original cutoff permits an unresponsive HTTP fallback.
+    // Even then, restore/start work must settle before stop can be released.
     await drain(runtimeWork,Math.min(cleanup.deadline,now()+10000));
     runtimeReleased=true;
-    if(runtimeWork.size===0)await cleanupOne('runtime',runtime,'stop','runtime_closed');
+    if(runtimeWork.size===0)await cleanupOne('runtime',runtime,'stop',httpDrainUnverified?undefined:'runtime_closed');
     if(!runtimeAttempted)proof.runtime_closed=true;
     await drain(work,Math.min(cleanup.deadline,now()+10000));
     await cleanupOne('state',state,'close');
