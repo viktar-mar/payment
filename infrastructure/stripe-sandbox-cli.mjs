@@ -5,6 +5,7 @@ import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {manualPaymentOptIn} from './stripe-manual-payment-options.mjs';
 import {manualRefundOptIn} from './stripe-manual-refund-options.mjs';
+import {manualRefundRemainderOptIn} from './stripe-manual-refund-remainder-options.mjs';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const ACCOUNT='acct_1UPiMpELswAd8tpR',VERSION='2026-09-30.endive';
@@ -26,6 +27,27 @@ function executeAwaited(execute,file,args,options) {
 const fail=()=>{throw null;};
 const fixed=code=>new Error('stripe_sandbox_cli_'+code);
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
+// Closed purposes are private capabilities, never caller-supplied modes or flags.
+const SANDBOX=Symbol('sandbox'),REFUND=Symbol('refund'),REMAINDER=Symbol('remainder');
+const ORIGINAL='031b5ae7-6603-4339-b1b3-77231291ff34',PRIOR='34941d87-12d3-4c74-8c5a-b62b7c914390';
+function exactData(value,keys){
+  if(!object(value)||![Object.prototype,null].includes(Object.getPrototypeOf(value)))fail();
+  const d=Object.getOwnPropertyDescriptors(value);
+  if(Reflect.ownKeys(d).length!==keys.length||keys.some(k=>!d[k]?.enumerable||!Object.hasOwn(d[k],'value')))fail();
+  return Object.fromEntries(keys.map(k=>[k,d[k].value]));
+}
+
+/** Retained partial proof has its own admission and no OAuth/write surface. */
+export async function createManualRefundRemainderCliAdapter(options,dependencies={}){
+  try{
+    const optIn=Object.getOwnPropertyDescriptor(options??{},'env');
+    if(!optIn?.enumerable||!Object.hasOwn(optIn,'value')||!manualRefundRemainderOptIn(optIn.value))fail();
+    const selected=exactData(options,['env','originalRunId','priorRunId','cliDirectory','backendPort','verifyForwardTarget','persistWebhookSecret','approvedBinding']);
+    if(selected.originalRunId!==ORIGINAL||selected.priorRunId!==PRIOR)fail();
+    exactData(selected.approvedBinding,['externalAccountId','apiVersion']);
+    return await createCliAdapter({...selected,runId:ORIGINAL,accountKey:'stripe-sandbox-default'},dependencies,REMAINDER);
+  }catch{throw fixed('REMAINDER_CONFIGURATION');}
+}
 
 /** Separate, read-only retained credential capability; mode is never operator selected. */
 export async function createManualRefundCliAdapter(options,dependencies={}) {
@@ -34,17 +56,18 @@ export async function createManualRefundCliAdapter(options,dependencies={}) {
     const keys=['env','originalRunId','cliDirectory','backendPort','verifyForwardTarget','persistWebhookSecret','approvedBinding'],d=Object.getOwnPropertyDescriptors(options);
     if(![Object.prototype,null].includes(Object.getPrototypeOf(options))||Reflect.ownKeys(d).length!==keys.length||keys.some(k=>!d[k]?.enumerable||!Object.hasOwn(d[k],'value'))||d.originalRunId.value!=='031b5ae7-6603-4339-b1b3-77231291ff34')fail();
     const selected=Object.fromEntries(keys.map(k=>[k,d[k].value]));
-    return await createCliAdapter({...selected,runId:selected.originalRunId,accountKey:'stripe-sandbox-default'},dependencies,true);
+    return await createCliAdapter({...selected,runId:selected.originalRunId,accountKey:'stripe-sandbox-default'},dependencies,REFUND);
   }catch{throw fixed('REFUND_CONFIGURATION');}
 }
 
 /** No entrypoint or implicit I/O: only fixed, isolated, read-only CLI capabilities. */
 export async function createSandboxCliAdapter(options,dependencies={}) {
-  return createCliAdapter(options,dependencies,false);
+  return createCliAdapter(options,dependencies,SANDBOX);
 }
-async function createCliAdapter(options,dependencies,refundMode) {
+async function createCliAdapter(options,dependencies,purpose) {
+  const remainderMode=purpose===REMAINDER,refundMode=purpose===REFUND||remainderMode;
   let enabled=false,manualPaymentMode=false;
-  try {const optIn=options?.env;manualPaymentMode=!refundMode&&optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=refundMode?manualRefundOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
+  try {const optIn=options?.env;manualPaymentMode=!refundMode&&optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=remainderMode?manualRefundRemainderOptIn(optIn):refundMode?manualRefundOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {
@@ -67,8 +90,10 @@ async function createCliAdapter(options,dependencies,refundMode) {
   let busy=false,owner=null,uncertain=false,originalSecret=null,latched=null,latchedOwner=null;
   let manual=null,manualOwner=null,manualDeadline=null,manualBindUsed=false,manualPermitRead=false,manualFinalUsed=false,manualFailed=false;
   let refundDeadline=null,refundOwner=null,refundBinding=null,refundBindUsed=false,refundFailed=false,refundStarted=false,refundCharge=null,partialReference=null,partialRefundId=null;
+  let remainderTarget=null,priorIdentity=null,priorEventType=null,remainderIdentity=null,remainderEventType=null;
+  const remainderSignals=new Set();
 
-  function check(context) {if(context.signal.aborted||Date.now()>=context.deadline)fail();}
+  function check(context) {if(context.signal.aborted||Date.now()>=(context.proofDeadline??context.deadline)||remainderMode&&!context.cleanup&&[...remainderSignals].some(s=>s.aborted))fail();}
   async function operation(code,limits,body) {
     if(busy)throw fixed('BUSY');
     busy=true;let timer,external,onAbort;
@@ -77,10 +102,14 @@ async function createCliAdapter(options,dependencies,refundMode) {
       const deadline=limits?.deadline;external=limits?.signal;
       if(!Number.isFinite(deadline)||deadline<=Date.now()||(external!==undefined&&!(external instanceof AbortSignal)))fail();
       if(refundMode){if(refundDeadline===null){if(deadline>Date.now()+1800000)fail();refundDeadline=deadline;}if(code==='STOP'?deadline>refundDeadline+120000:deadline!==refundDeadline)fail();}
+      if(remainderMode&&code!=='STOP'&&external)remainderSignals.add(external);
+      if(remainderMode&&code!=='STOP'&&remainderSignals.size)external=AbortSignal.any([...remainderSignals]);
       onAbort=()=>controller.abort();external?.addEventListener('abort',onAbort,{once:true});
       if(external?.aborted)controller.abort();
-      timer=io.setTimeout(onAbort,Math.min(deadline-Date.now(),2147483647));
-      const context={deadline,signal:controller.signal};check(context);
+      const boundedProof=remainderMode&&['PRIOR_PARTIAL','REMAINDER'].includes(code);
+      const proofDeadline=boundedProof?Math.min(deadline,Date.now()+45000):deadline;
+      timer=io.setTimeout(onAbort,Math.min(proofDeadline-Date.now(),2147483647));
+      const context={deadline,signal:controller.signal,...(boundedProof?{proofDeadline}:{}),...(code==='STOP'?{cleanup:true}:{})};check(context);
       return await body(context);
     } catch {throw fixed(code);}
     finally {try {io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);} catch {} busy=false;}
@@ -104,9 +133,11 @@ async function createCliAdapter(options,dependencies,refundMode) {
   }
   async function command(commandArgs,context) {
     await privateTree(context);check(context);
+    if(remainderMode&&refundBinding)refundListener(context);
     const result=await io.execute('/usr/bin/sandbox-exec',[...args,...commandArgs],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe'],
-      timeout:Math.min(context.manual||refundMode?10000:20000,Math.max(1,context.deadline-Date.now())),maxBuffer:65536,signal:context.signal});
+      timeout:Math.min(context.manual||refundMode?10000:20000,Math.max(1,(context.proofDeadline??context.deadline)-Date.now())),maxBuffer:65536,signal:context.signal});
     check(context);
+    if(remainderMode&&refundBinding)refundListener(context);
     if(typeof result.stdout!=='string'||typeof result.stderr!=='string'||Buffer.byteLength(result.stdout)+Buffer.byteLength(result.stderr)>65536)fail();
     return result;
   }
@@ -392,22 +423,13 @@ async function createCliAdapter(options,dependencies,refundMode) {
       ||r.payment_intent!==refundBinding.intentId||r.livemode!==undefined&&r.livemode!==false
       ||r.metadata?.payment_id!==refundBinding.paymentId||r.metadata?.refund_id!==refundId)fail();
   }
-  async function bindCapturedPayment(original,context){
-    if(refundBindUsed)fail();
-    refundBindUsed=true;
-    const data=(objectValue,fields)=>{
-      if(!object(objectValue)||![Object.prototype,null].includes(Object.getPrototypeOf(objectValue)))fail();
-      const d=Object.getOwnPropertyDescriptors(objectValue);
-      if(Reflect.ownKeys(d).length!==fields.length
-        ||fields.some(k=>!d[k]?.enumerable||!Object.hasOwn(d[k],'value')))fail();
-      return Object.fromEntries(fields.map(k=>[k,d[k].value]));
-    };
-    const target=data(original,['originalRunId','originalSource','project','containers','images',
+  function capturedBinding(original){
+    const target=exactData(original,['originalRunId','originalSource','project','containers','images',
       'network','volumes','ports','endpoints','account','site','price','paymentId','operationId',
       'intentId','callbackVersion','amountMinor','currency','source']);
-    const account=data(target.account,['id','key','externalId']);
-    const site=data(target.site,['id','key']);
-    const price=data(target.price,['id','key','version','providerPriceId']);
+    const account=exactData(target.account,['id','key','externalId']);
+    const site=exactData(target.site,['id','key']);
+    const price=exactData(target.price,['id','key','version','providerPriceId']);
     if(target.originalRunId!=='031b5ae7-6603-4339-b1b3-77231291ff34'
       ||target.originalSource!=='f0620e40004162d2b3eededa60512f50a492f4cc'
       ||target.project!=='stripe-'+target.originalRunId||account.key!=='stripe-sandbox-default'
@@ -421,9 +443,70 @@ async function createCliAdapter(options,dependencies,refundMode) {
       ||typeof value.intentId!=='string'||!/^pi_[A-Za-z0-9_]{1,200}$/.test(value.intentId)
       ||typeof value.priceKey!=='string'||!/^s5a-price-[a-z0-9-]{1,100}$/.test(value.priceKey)
       ||value.amountMinor!==2000||value.currency!=='EUR'||value.externalAccountId!==ACCOUNT)fail();
-    refundBinding=Object.freeze(value);
+    return Object.freeze(value);
+  }
+  async function bindCapturedPayment(original,context){
+    if(refundBindUsed)fail();
+    refundBindUsed=true;
+    refundBinding=capturedBinding(original);
     await refundRead(context,()=>captured(context,0,[]));
     return true;
+  }
+  function bindRemainderTarget(value,context){
+    if(refundBindUsed)fail();refundBindUsed=true;
+    refundListener(context);
+    const target=exactData(value,['original','priorRunId','priorSource','priorRefundId','remainderKey','callbackVersionBefore','callbackVersionAfter']);
+    if(target.priorRunId!==PRIOR||typeof target.priorSource!=='string'||!/^[0-9a-f]{40}$/.test(target.priorSource)
+      ||target.priorSource==='f0620e40004162d2b3eededa60512f50a492f4cc'||typeof target.priorRefundId!=='string'||!UUID.test(target.priorRefundId)
+      ||target.remainderKey!=='s5a-refund:'+PRIOR+':remainder'||target.callbackVersionBefore!==2||target.callbackVersionAfter!==3)fail();
+    refundBinding=capturedBinding(target.original);
+    remainderTarget=Object.freeze({priorRefundId:target.priorRefundId});
+    return true;
+  }
+  function remainderValue(value,partial){
+    if(!remainderTarget)fail();
+    const v=exactData(value,partial?['refundId','providerReference','providerEventId']:['refundId','providerReference','providerEventId','amountMinor','totalMinor']);
+    if(typeof v.refundId!=='string'||!UUID.test(v.refundId)||typeof v.providerReference!=='string'||!/^re_[A-Za-z0-9_]{1,200}$/.test(v.providerReference)
+      ||typeof v.providerEventId!=='string'||!/^evt_[A-Za-z0-9_]{1,200}$/.test(v.providerEventId))fail();
+    if(partial){
+      if(v.refundId!==remainderTarget.priorRefundId||priorIdentity&&Object.keys(v).some(k=>v[k]!==priorIdentity[k]))fail();
+    }else if(!priorIdentity||v.refundId===priorIdentity.refundId||v.providerReference===priorIdentity.providerReference||v.providerEventId===priorIdentity.providerEventId
+      ||v.amountMinor!==1300||v.totalMinor!==2000||remainderIdentity&&Object.keys(v).some(k=>v[k]!==remainderIdentity[k]))fail();
+    return Object.freeze(v);
+  }
+  async function refundEvidence(v,amount,charge,context,eventType=null){
+    const r=parseBody(await command(['get','/v1/refunds/'+v.providerReference],context));
+    refundObject(r,v.providerReference,amount,charge,v.refundId);
+    const e=parseBody(await command(['get','/v1/events/'+v.providerEventId],context));
+    if(e.id!==v.providerEventId||e.object!=='event'||!['refund.created','refund.updated'].includes(e.type)
+      ||eventType!==null&&e.type!==eventType||e.api_version!==VERSION||e.livemode!==false||e.account!==undefined&&e.account!==ACCOUNT)fail();
+    refundObject(e.data?.object,v.providerReference,amount,charge,v.refundId);
+    return e.type;
+  }
+  async function verifyPriorPartial(value,context){
+    const v=remainderValue(value,true);let eventType;
+    const result=await refundRead(context,async()=>{
+      const c=await captured(context,700,[v.providerReference],v.refundId);
+      eventType=await refundEvidence(v,700,c.id,context,priorEventType);
+      return Object.freeze({providerVerified:true,webhookVerified:true});
+    });
+    // No caller field or failed/late proof may populate this private seed.
+    priorIdentity=v;priorEventType=eventType;partialReference=v.providerReference;partialRefundId=v.refundId;
+    return result;
+  }
+  async function inspectRemainder(value,context){
+    const v=remainderValue(value,false);let eventType;
+    const result=await refundRead(context,async()=>{
+      const c=await captured(context,2000,[priorIdentity.providerReference,v.providerReference],v.refundId);
+      await refundEvidence(priorIdentity,700,c.id,context,priorEventType);
+      eventType=await refundEvidence(v,1300,c.id,context,remainderEventType);
+      return Object.freeze({providerVerified:true,webhookVerified:true});
+    });
+    remainderIdentity=v;remainderEventType=eventType;return result;
+  }
+  function assertRemainderListener(limits){
+    if(!priorIdentity){refundFailed=true;throw fixed('REFUND_LISTENER');}
+    return assertRefundListener(limits);
   }
   async function inspectRefund(value,context){
     if(!refundBinding)fail();
@@ -470,10 +553,15 @@ async function createCliAdapter(options,dependencies,refundMode) {
       refundFailed=true;
       return stopListener(context);
     }),
-    bindCapturedPayment:(value,limits)=>refundOperation('REFUND_BINDING',limits,
+    ...(remainderMode?{
+      bindRemainderTarget:(value,limits)=>refundOperation('REMAINDER_BINDING',limits,context=>bindRemainderTarget(value,context)),
+      assertRemainderListener,
+      verifyPriorPartial:(value,limits)=>refundOperation('PRIOR_PARTIAL',limits,context=>verifyPriorPartial(value,context)),
+      inspectRemainder:(value,limits)=>refundOperation('REMAINDER',limits,context=>inspectRemainder(value,context)),
+    }:{bindCapturedPayment:(value,limits)=>refundOperation('REFUND_BINDING',limits,
       context=>bindCapturedPayment(value,context)),
     assertRefundListener,
-    inspectRefund:(value,limits)=>refundOperation('REFUND',limits,context=>inspectRefund(value,context)),
+    inspectRefund:(value,limits)=>refundOperation('REFUND',limits,context=>inspectRefund(value,context)),}),
   });
   return Object.freeze({
     validateBinding:limits=>operation('BINDING',limits,binding),
