@@ -24,7 +24,7 @@ function frozen(v){if(v&&typeof v==='object'){for(const child of Object.values(v
 
 /** JSON.parse alone loses duplicate members. Tokenize and reject them at every depth. */
 function strictJSON(text){
-  const tokens=text.match(/"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null|[{}\[\],:]|\s+|./gs)?.filter(v=>!/^\s+$/.test(v))??[];let i=0;
+  const tokens=text.match(/"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null|[{}\[\],:]|[ \t\r\n]+|./gs)?.filter(v=>!(/^[ \t\r\n]+$/).test(v))??[];let i=0;
   function value(depth=0){if(depth>32)fail();const token=tokens[i++];if(token==='{'){const result=Object.create(null),seen=new Set();if(tokens[i]==='}'){i++;return result;}for(;;){const key=JSON.parse(tokens[i++]);if(typeof key!=='string'||seen.has(key)||tokens[i++]!==':')fail();seen.add(key);result[key]=value(depth+1);const end=tokens[i++];if(end==='}')return result;if(end!==',')fail();}}
     if(token==='['){const result=[];if(tokens[i]===']'){i++;return result;}for(;;){result.push(value(depth+1));const end=tokens[i++];if(end===']')return result;if(end!==',')fail();}}
     const result=JSON.parse(token);if(typeof result==='object'&&result!==null||typeof result==='number'&&!Number.isFinite(result))fail();return result;
@@ -67,7 +67,7 @@ function decodeEnv(text,final,r){const result=Object.create(null);if(!text.endsW
 /** Private one-shot state authority. No runtime, HTTP, provider or credential getter capability. */
 export async function openManualRefundState(input,limits,dependencies={}){
   const options=validateManualRefundOptions(input);if(!options)throw fixed();
-  let io,root,original,directory,lockPath,statePath,settlement,target,admin=null,verifier=null,lock=null,busy=false,pending=false,closed=false,sequence=0,state;
+  let io,root,original,directory,lockPath,statePath,settlement,target,admin=null,verifier=null,lock=null,busy=false,pending=false,closed=false,cleanupContext=null,sequence=0,state;
   const identities=new Map(),directories=new Map(),retained=new Map();
   const identity=s=>({ino:s.ino,dev:s.dev});
   const stable=s=>({ino:s.ino,dev:s.dev,size:s.size,mtimeMs:s.mtimeMs,ctimeMs:s.ctimeMs});
@@ -86,8 +86,8 @@ export async function openManualRefundState(input,limits,dependencies={}){
     state={version:1,mode:'MANUAL_REFUND',runId:options.runId,expectedSource:options.expectedSource,originalRunId:ORIGINAL_RUN,originalSource:ORIGINAL_SOURCE,deadline:limits.deadline,siteId:target.site.id,paymentId:target.paymentId,pending:false,restore:RESTORE.map(service=>({service,phase:'READY'})),rotation:{phase:'READY',version:null},configure:{phase:'READY',version:null},legs:[700,1300].map((amountMinor,index)=>({amountMinor,key:'s5a-refund:'+options.runId+':'+(index?'remainder':'partial'),phase:'READY',refundId:null,providerReference:null}))};await save(limits);
   }catch{pending=true;admin=null;verifier=null;if(lock){try{await settlement.release(lock);}catch{}lock=null;}throw fixed();}
   function validateLimits(value,cleanup=false,read=false){const selected=exact(value,Object.hasOwn(Object.getOwnPropertyDescriptors(value),'signal')?['deadline','signal']:['deadline']);if(!Number.isSafeInteger(selected.deadline)||selected.deadline<=io.now()||selected.signal!==undefined&&!(selected.signal instanceof AbortSignal)||selected.signal?.aborted)fail();if(state&&(cleanup?selected.deadline>state.deadline+120000:read?selected.deadline>state.deadline:selected.deadline!==state.deadline))fail();return selected;}
-  function check(context){if(context.signal?.aborted||io.now()>=context.deadline)fail();}
-  async function call(context,fn,dispose){check(context);return settlement.call(context,fn,dispose);}
+  function check(context){if(closed&&context!==cleanupContext||context.signal?.aborted||io.now()>=context.deadline)fail();}
+  async function call(context,fn,dispose){check(context);return settlement.call(context,()=>{check(context);return fn();},dispose);}
   async function handle(path,flags,context,mode){return call(context,()=>io.open(path,flags,mode),file=>file.close());}
   async function release(file){await settlement.release(file);}
   function fileInfo(s){if(!s.isFile()||s.isSymbolicLink()||s.uid!==process.getuid()||(s.mode&0o7777)!==0o600||s.nlink!==1||!Number.isSafeInteger(s.size)||s.size>65536)fail();}
@@ -96,7 +96,7 @@ export async function openManualRefundState(input,limits,dependencies={}){
     for(const current of paths){const info=await call(context,()=>io.lstat(current));if(!info.isDirectory()||info.isSymbolicLink()||![0,process.getuid()].includes(info.uid)||await call(context,()=>io.realpath(current))!==current)fail();if(current===root||current.startsWith(root+'/')){if(info.uid!==process.getuid()||current!==root&&(info.mode&0o7777)!==0o700)fail();const prior=directories.get(current);if(prior&&!same(identity(info),prior))fail();directories.set(current,identity(info));}}
   }
   async function fileProof(path,file,context,expected=identities.get(path)){await directoryProof(dirname(path),context);const held=await call(context,()=>file.stat()),named=await call(context,()=>io.lstat(path));fileInfo(held);fileInfo(named);if(!same(stable(held),stable(named))||expected&&!same(identity(held),expected)||await call(context,()=>io.realpath(path))!==path)fail();return held;}
-  async function readRetained(path,context){const before=await call(context,()=>io.lstat(path));fileInfo(before);const file=await handle(path,constants.O_RDONLY|constants.O_NOFOLLOW,context);try{const held=await fileProof(path,file,context,identity(before));const bytes=Buffer.alloc(held.size+1);const read=await call(context,()=>file.read(bytes,0,bytes.length,0));if(read.bytesRead!==held.size)fail();const after=await fileProof(path,file,context,identity(held));if(!same(stable(held),stable(after)))fail();retained.set(path,stable(after));return new TextDecoder('utf-8',{fatal:true}).decode(bytes.subarray(0,read.bytesRead));}finally{await release(file);}}
+  async function readRetained(path,context){const before=await call(context,()=>io.lstat(path));fileInfo(before);const file=await handle(path,constants.O_RDONLY|constants.O_NOFOLLOW,context);try{const held=await fileProof(path,file,context,identity(before));const bytes=Buffer.alloc(held.size+1);const read=await call(context,()=>file.read(bytes,0,bytes.length,0));if(read.bytesRead!==held.size)fail();const after=await fileProof(path,file,context,identity(held));if(!same(stable(held),stable(after)))fail();retained.set(path,stable(after));return new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes.subarray(0,read.bytesRead));}finally{await release(file);}}
   async function retainedProof(context){for(const [path,prior] of retained){const current=await call(context,()=>io.lstat(path));fileInfo(current);if(!same(stable(current),prior)||await call(context,()=>io.realpath(path))!==path)fail();}}
   async function absent(path,context){await call(context,async()=>{try{await io.lstat(path);}catch(error){if(error?.code==='ENOENT')return;throw error;}fail();});}
   async function syncDirectory(path,context){await directoryProof(path,context);const file=await handle(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_DIRECTORY,context);try{const held=await call(context,()=>file.stat());if(!held.isDirectory()||!same(identity(held),directories.get(path)))fail();await call(context,()=>file.sync());await directoryProof(path,context);}finally{await release(file);}}
@@ -117,6 +117,25 @@ export async function openManualRefundState(input,limits,dependencies={}){
   const transition=(context,body)=>operation(context,async active=>{body();await save(active);return true;});
   function phase(record,expected){if(record.phase!==expected)fail();}
   function leg(index){if(index!==0&&index!==1)fail();if(index===1&&state.legs[0].phase!=='CONFIRMED')fail();return state.legs[index];}
+  async function disposeTerminal(){
+    // Rejected caller Limits cannot renew disposal or suppress it while original authority remains.
+    const disposal=Object.freeze({deadline:state.deadline+120000});if(io.now()>=disposal.deadline)return false;
+    const held=lock;lock=null;const releasing=held?settlement.release(held):Promise.resolve();releasing.catch(()=>{});
+    try{settlement.close(disposal);await settlement.wait(disposal,()=>releasing);return settlement.close(disposal);}catch{return false;}
+  }
+  async function terminalClose(value,context){
+    const overlapping=busy,repeated=closed;closed=true;admin=null;verifier=null;
+    let failed=false,ownsBusy=false;
+    try{
+      if(overlapping||repeated)fail();const active=Object.freeze(validateLimits(context,true));cleanupContext=active;busy=true;ownsBusy=true;
+      const selected=exact(value,['retain']);if(typeof selected.retain!=='boolean')fail();await ownedState(active);
+      const uncertain=pending||state.restore.some(v=>v.phase==='DISPATCHING')||state.rotation.phase==='DISPATCHING'||state.configure.phase==='DISPATCHING'||state.legs.some(v=>['DISPATCHING','ACKNOWLEDGED'].includes(v.phase))||state.rotation.phase!=='READY'&&state.legs.some(v=>v.phase!=='CONFIRMED');
+      await fileProof(lockPath,lock,active);await release(lock);lock=null;
+      if(!selected.retain&&!uncertain&&!pending){const named=await call(active,()=>io.lstat(lockPath));fileInfo(named);if(!same(identity(named),identities.get(lockPath)))fail();await call(active,()=>{if(pending)fail();return io.unlink(lockPath);});await syncDirectory(original,active);}
+    }catch{failed=true;pending=true;state.pending=true;}
+    finally{if(!await disposeTerminal()){failed=true;pending=true;state.pending=true;}if(ownsBusy)busy=false;}
+    if(failed)throw fixed();return true;
+  }
   return Object.freeze({target,
     beginRestore:(service,context)=>transition(context,()=>{const item=state.restore.find(v=>v.service===service);if(!item||state.restore.slice(0,state.restore.indexOf(item)).some(v=>v.phase!=='ACKNOWLEDGED'))fail();phase(item,'READY');item.phase='DISPATCHING';}),
     ackRestore:(service,context)=>transition(context,()=>{const item=state.restore.find(v=>v.service===service);if(!item)fail();phase(item,'DISPATCHING');item.phase='ACKNOWLEDGED';}),
@@ -129,11 +148,6 @@ export async function openManualRefundState(input,limits,dependencies={}){
     confirmRefund:(index,value,context)=>transition(context,()=>{const item=leg(index);phase(item,'ACKNOWLEDGED');const p=exact(value,['refundId','providerReference','providerEventId','amountMinor','totalMinor','providerVerified','webhookVerified','journalVerified','callbackVerified']);if(p.refundId!==item.refundId||!provider(p.providerReference,'re_')||!provider(p.providerEventId,'evt_')||p.amountMinor!==item.amountMinor||p.totalMinor!==(index?2000:700)||['providerVerified','webhookVerified','journalVerified','callbackVerified'].some(k=>p[k]!==true)||state.legs.some(v=>v!==item&&v.providerReference===p.providerReference))fail();item.phase='CONFIRMED';item.providerReference=p.providerReference;item.proof=p;}),
     withRetainedAdmin:(callback,context)=>operation(context,async active=>{if(typeof callback!=='function'||!admin||await call(active,()=>callback(admin))!==true)fail();return true;},{read:true}),
     verifyRetainedWebhookSecret:(candidate,context)=>operation(context,async()=>{if(typeof candidate!=='string'||!/^whsec_[A-Za-z0-9_]{16,256}$/.test(candidate)||!verifier)fail();const a=Buffer.from(candidate),b=Buffer.from(verifier);if(a.length!==b.length||!timingSafeEqual(a,b))fail();return true;},{read:true}),
-    close:(value,context)=>operation(context,async active=>{
-      try{const selected=exact(value,['retain']);if(typeof selected.retain!=='boolean')fail();await ownedState(active);const uncertain=pending||state.restore.some(v=>v.phase==='DISPATCHING')||state.rotation.phase==='DISPATCHING'||state.configure.phase==='DISPATCHING'||state.legs.some(v=>['DISPATCHING','ACKNOWLEDGED'].includes(v.phase))||state.rotation.phase!=='READY'&&state.legs.some(v=>v.phase!=='CONFIRMED');
-        await fileProof(lockPath,lock,active);await release(lock);lock=null;
-        if(!selected.retain&&!uncertain){const named=await call(active,()=>io.lstat(lockPath));fileInfo(named);if(!same(identity(named),identities.get(lockPath)))fail();await call(active,()=>io.unlink(lockPath));await syncDirectory(original,active);}closed=true;if(!settlement.close(active))fail();return true;
-      }finally{admin=null;verifier=null;closed=true;if(lock){const held=lock;lock=null;await release(held);}settlement.close(active);}
-    },{cleanup:true}),
+    close:terminalClose,
   });
 }
