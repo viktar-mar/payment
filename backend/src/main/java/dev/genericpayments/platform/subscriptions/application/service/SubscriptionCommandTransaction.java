@@ -48,7 +48,8 @@ public class SubscriptionCommandTransaction {
         var terms=catalog.terms(context.siteId(),command.priceId());
         var policy=policies.load(context.siteId());
         boolean trial=trialChoice(context,terms,false);
-        var now=clock.instant();var id=UUID.randomUUID();
+        // PostgreSQL retains microseconds; keep operation times stable across claim/save round trips.
+        var now=clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MICROS);var id=UUID.randomUUID();
         var candidate=new SubscriptionOperation(id,context.siteId(),context.customerId(),null,SubscriptionOperation.Kind.CREATE,
             SubscriptionOperation.Status.RESERVED,principal,CreateSubscriptionFingerprint.digest(context.idempotencyKey()),
             CreateSubscriptionFingerprint.encode(command,principal,terms,0,policy.version(),trial),
@@ -141,7 +142,7 @@ public class SubscriptionCommandTransaction {
     /** Internal continuation after authorized reservation; never a public unauthenticated lookup endpoint. */
     public SubscriptionOperationResult readResult(UUID operation){return tx.required(()->result(operations.lock(operation),null));}
     private SubscriptionOperation saveOperation(SubscriptionOperation o,UUID subscription,SubscriptionOperation.Status status,String reference,String failure) {
-        return operations.save(new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),subscription,o.kind(),status,o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),reference,failure,o.createdAt(),clock.instant(),o.version()+1),o.version());
+        return operations.save(new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),subscription,o.kind(),status,o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),reference,failure,o.createdAt(),clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MICROS),o.version()+1),o.version());
     }
     private static SubscriptionOperationResult result(SubscriptionOperation o,SubscriptionProviderModels.NextAction action){return new SubscriptionOperationResult(o.id(),o.subscriptionId(),o.status(),action);}
     private static String principal(SubscriptionCommandContext c) {
