@@ -71,6 +71,8 @@
 
 ## Final offline checkpoint
 
-- [ ] Root independently verifies both task reviews, the exact tree, complete offline infrastructure suite and native demo support fixtures; run demo typecheck/build and SDK tests/typecheck/build with existing dependencies. Do not run backend Maven: no backend changes; the previously authorized checkpoint policy uses relevant regression here.
-- [ ] Fresh combined reviewer evaluates both changes and unchanged caller boundaries using the task reports and combined diff. Any Critical/Important finding is fixed and scoped re-reviewed before completion.
-- [ ] Keep the worktree/branch and operational evidence. Report local commits, fresh test counts, independent review outcome, any remaining uncertainty and that Sandbox was not run. Do not claim the original Chrome failure is fixed or the payment accepted based on offline evidence.
+- [x] Root independently verifies both task reviews, the exact tree, complete offline infrastructure suite and native demo support fixtures; run demo typecheck/build and SDK tests/typecheck/build with existing dependencies. Do not run backend Maven: no backend changes; the previously authorized checkpoint policy uses relevant regression here.
+- [x] Fresh combined reviewer evaluates both changes and unchanged caller boundaries using the task reports and combined diff. Any Critical/Important finding is fixed and scoped re-reviewed before completion.
+- [x] Keep the worktree/branch and operational evidence. Report local commits, fresh test counts, independent review outcome, any remaining uncertainty and that Sandbox was not run. Do not claim the original Chrome failure is fixed or the payment accepted based on offline evidence.
+
+Completed offline on 2026-10-20. Cookie repair `787d263`, diagnostics `c658448`; independent task reviews and combined review approved with no findings. Fresh root verification: infrastructure1033/1033, native support321/321, SDK772/772, demo/SDK types and builds passed. The initial restricted-permission and sanitized-PATH test setup failures were retained and resolved without product workarounds. No Sandbox/CLI/provider payment, push, merge or PR was performed. Earlier Chrome cause and Stage5A operational acceptance remain unproven.
