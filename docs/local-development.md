@@ -915,7 +915,7 @@ env -i PATH="<APPROVED_NODE_AND_SYSTEM_PATH>" LANG=C LC_ALL=C NO_COLOR=1 \
   node infrastructure/stripe-manual-payment.mjs
 ```
 
-FULL_RUN, OWNED_RUN, FORM_DIAGNOSTIC, MANUAL_FORM_DIAGNOSTIC and ALLOW_PREPARE_ONLY
+MANUAL_REFUND, FULL_RUN, OWNED_RUN, FORM_DIAGNOSTIC, MANUAL_FORM_DIAGNOSTIC and ALLOW_PREPARE_ONLY
 are incompatible. DEBUG, NODE_DEBUG, PWDEBUG and PW_TRACE must remain disabled. The
 binding is fixed to account `acct_1UPiMpELswAd8tpR`, API `2026-09-30.endive`, CLI
 `1.52.0` and test mode. A genuine isolated CLI authorization URL and device code may
@@ -1002,6 +1002,79 @@ uses only the original remaining cleanup ceiling; rejected admission gets at mos
 second. Signal, stalled stdout or write failure gives exit 1 without a second output
 attempt. The direct entry exits only its own process, so a timed-out write can leave
 an incomplete or missing report; check the actual exit code as well as printed text.
+
+## Separate manual refund of the retained Sandbox payment
+
+Runtime acceptance is **PENDING**. The following is only a future invocation template;
+offline tests and review do not authorize execution. After all offline gates and fresh
+independent review, separately authorize one bounded attempt to restore the original
+paid run, rotate its Site callback key once, refund EUR7, and refund EUR13 only after
+independent confirmation of the first refund. Use the existing recovery worktree and
+a clean, reviewed controller commit. Imports of `infrastructure/stripe-manual-refund.mjs`
+are inert.
+
+The target is fixed internally to the retained successful manual-payment run and its
+original source, Site, Account, Payment, Intent and Price. Its recorded six ports and
+CLI credential directory are derived from retained evidence. They are not operator
+inputs. The new UUID and controller SHA establish one new authority; they do not renew
+the original payment attempt. No browser, Chrome, card entry, new payment, Checkout or
+PaymentIntent is involved. No backend or Stripe key belongs in this command.
+
+After separate runtime consent, replace only these placeholders with the approved Node
+path, fresh lowercase UUID, reviewed clean controller SHA and canonical owned Unix
+Docker socket. There are zero positional or optional arguments and exactly three opt-ins:
+
+```bash
+env -i PATH="<APPROVED_NODE_AND_SYSTEM_PATH>" LANG=C LC_ALL=C NO_COLOR=1 \
+  PAYMENT_STRIPE_SANDBOX_ENABLED=true \
+  PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS=true \
+  PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND=true \
+  PAYMENT_STRIPE_SANDBOX_RUN_ID="<FRESH_REFUND_UUID>" \
+  PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE="<REVIEWED_CLEAN_CONTROLLER_SHA>" \
+  PAYMENT_STRIPE_SANDBOX_DAEMON="<CANONICAL_OWNED_UNIX_DAEMON>" \
+  node infrastructure/stripe-manual-refund.mjs
+```
+
+MANUAL_PAYMENT, FULL_RUN, OWNED_RUN, FORM_DIAGNOSTIC, MANUAL_FORM_DIAGNOSTIC and
+ALLOW_PREPARE_ONLY are incompatible. Leave DEBUG, NODE_DEBUG, PWDEBUG and PW_TRACE
+disabled. The old modes also reject MANUAL_REFUND. No target IDs, amounts, ports,
+endpoint URLs, credential paths or secrets can be supplied to this entry.
+
+Only the retained isolated CLI authorization is used. Missing or expired credentials,
+wrong account/API/CLI version, mismatched retained webhook verifier, changed topology,
+occupied original ports or nonzero prior refunds stop the attempt before rotation or
+refunds. There is no automatic login or OAuth handoff. Any later CLI authorization
+needs a separate decision. The listener secret is compared in memory against the
+retained backend verifier; it is never printed, replaced or persisted by this entry.
+
+After the fresh baseline, exactly one rotation affects only the original Site. Its
+response must preserve the original callback URL/enabled state and produce version2.
+The returned plaintext goes only to the verified owned receiver in memory. Unknown
+rotation/configure outcomes, changed configuration or invalid replies permanently
+produce PENDING and permit zero refund POSTs. There is no rotation retry or rollback.
+
+The first EUR7 refund needs independent provider, webhook, journal and signed callback
+proof before the EUR13 POST is allowed. Lost responses, timeouts, 5xx, aborted work or
+uncertain durable commits permanently stop progression. Do not retry an unknown
+dispatch with the same/new key, rerun with a fresh UUID, reconcile, cancel or delete
+anything to resolve it. Existing state or the original-target lock rejects replay.
+A read-only investigation of PENDING requires a separate operator decision.
+
+One active deadline is at most 30 minutes from entry; cleanup ends at that original
+deadline plus 2 minutes. There is no renewed authority. Cleanup drains HTTP/session
+work, closes the CLI listener/children and independently stops only exact freshly
+verified ordinary containers restored by this controller. A failed listener close
+does not skip the runtime stop. Issuer helpers are not restarted. Containers, images,
+volumes, networks, credentials, provider objects, state and audit history are retained;
+an uncertain original-target lock remains for inspection. No resource deletion or
+recreation is part of this workflow.
+
+The entry attempts exactly one final JSON line, at most 4096 bytes, with no target IDs,
+PII, secrets or raw errors. Only `result=SUCCEEDED`, every report boolean `true`, and
+the actual process exit 0 confirm the experiment. A `false` boolean means unverified;
+it never proves that no money moved. PENDING remains latched after any unknown work,
+even if later reads or cleanup succeed. Stalled/failed stdout gives actual exit 1
+without a second report attempt; a printed success line without exit 0 is insufficient.
 
 ## Stop and persisted data
 

@@ -58,6 +58,7 @@ export function formDiagnosticOptIn(env) {
   try {return env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'
     &&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'
     &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT)
+    &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND)
     &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS)
     &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_FULL_RUN)
     &&[undefined,'','false'].includes(env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN)
@@ -90,8 +91,8 @@ async function preflight(options,dependencies,diagnostic) {
   let phase='OPT_IN',code='OPT_IN_REQUIRED';
   try {
     const env=options?.env;
-    if(diagnostic==='payment'?!manualPaymentOptIn(env):diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'
-      ||env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'||env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC==='true'))return pending(phase,code);
+    if(env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'||(diagnostic==='payment'?!manualPaymentOptIn(env):diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'
+      ||env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'||env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC==='true')))return pending(phase,code);
     phase='INPUTS';code='CONFIGURATION';
     if(![undefined,''].includes(env.DEBUG)||![undefined,''].includes(env.NODE_DEBUG)||![undefined,'','0'].includes(env.PWDEBUG))return pending(phase,code);
     const topology=validateFormDiagnosticTopology(options);if(!topology)return pending(phase,code);

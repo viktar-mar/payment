@@ -1,6 +1,6 @@
 import {validateFormDiagnosticTopology} from './stripe-manual-form-options.mjs';
 const REQUIRED=['PAYMENT_STRIPE_SANDBOX_ENABLED','PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS','PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT'];
-const EXCLUDED=['PAYMENT_STRIPE_SANDBOX_FULL_RUN','PAYMENT_STRIPE_SANDBOX_OWNED_RUN','PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY'];
+const EXCLUDED=['PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND','PAYMENT_STRIPE_SANDBOX_FULL_RUN','PAYMENT_STRIPE_SANDBOX_OWNED_RUN','PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY'];
 function descriptors(value){if(!value||typeof value!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(value)))throw null;return Object.getOwnPropertyDescriptors(value);}
 function data(d,key){const p=d[key];if(!p||!p.enumerable||!Object.hasOwn(p,'value'))throw null;return p.value;}
 export function manualPaymentOptIn(env){

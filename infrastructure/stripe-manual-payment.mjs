@@ -6,7 +6,7 @@ import {formatManualPaymentAuthDiagnostic} from './stripe-manual-payment-auth.mj
 const ROOT=fileURLToPath(new URL('..',import.meta.url)).replace(/\/$/,'');
 const EMPTY=Object.freeze({version:1,mode:'MANUAL_PAYMENT',result:'FAILED',phase:'ADMISSION',confirmation_granted:false,payment_confirmed:false,provider_confirmed:false,webhook_verified:false,journal_verified:false,callback_verified:false,gateway_closed:false,listener_closed:false,runtime_closed:false,browser_closure:'NOT_OWNED',provenance:'CONTROLLER_REPORTED'});
 const rejected=()=>Object.freeze({report:EMPTY,exitCode:1});
-const FLAGS=['PAYMENT_STRIPE_SANDBOX_ENABLED','PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS','PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT','PAYMENT_STRIPE_SANDBOX_FULL_RUN','PAYMENT_STRIPE_SANDBOX_OWNED_RUN','PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY','DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE'];
+const FLAGS=['PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND','PAYMENT_STRIPE_SANDBOX_ENABLED','PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS','PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT','PAYMENT_STRIPE_SANDBOX_FULL_RUN','PAYMENT_STRIPE_SANDBOX_OWNED_RUN','PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY','DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE'];
 const PORTS=['backend','demo','receiver','postgres','mailpitHttp','mailpitSmtp'];
 function exact(value,keys){
   try{if(!value||typeof value!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(value)))return null;
