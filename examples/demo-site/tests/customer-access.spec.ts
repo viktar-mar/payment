@@ -3,6 +3,7 @@ import { ownedContainerCommand } from '../../../infrastructure/smoke-stage-4.mjs
 import type { Page } from "@playwright/test";
 import { adminLogin, adminUrl, challenge, customerFixture, demoPath, localEmail, signIn } from "./support/customer-api";
 import { enterPrivateText } from './support/private-entry';
+import { alternateLoopbackOrigin } from './support/loopback-origin.mjs';
 
 test.use({ trace: "off", screenshot: "off", video: "off" });
 
@@ -320,7 +321,7 @@ test("actual browser CORS preflight rejects cross-Site, exact-Origin and separat
     return Boolean(s.sessionToken);
   },{base:api.backendUrl});expect(denied).toBe(true);
   const token=await page.evaluate(()=>{const t=(window as any).originTestToken;delete (window as any).originTestToken;return t as string;});
-  const deniedOrigin=await page.context().newPage();await deniedOrigin.goto("http://localhost:4173");
+  const deniedOrigin=await page.context().newPage();await deniedOrigin.goto(alternateLoopbackOrigin(page.url()));
   const blocked=await deniedOrigin.evaluate(async({base,token})=>{try {const r=await fetch(base+"/api/v1/customer/me",{headers:{Authorization:"Bearer "+token}});return !r.ok;}catch{return true;}},{base:api.backendUrl,token});
   expect(blocked).toBe(true);await deniedOrigin.close();
 });
