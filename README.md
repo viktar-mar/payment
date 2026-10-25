@@ -46,6 +46,8 @@ Keep the named PostgreSQL volume, local configuration and issuer fixture for sub
 
 The Fake provider covers local one-time payments, donations and subscriptions, including recovery and callback flows. Stage 5A Stripe form readiness has been observed, but complete real Sandbox payment, refund and callback acceptance remains **pending**. Offline fixtures and browser UX do not establish financial fulfillment or live-payment readiness.
 
+Historical notes also describe a successful EUR20 test payment and a verified EUR7 refund; the current EUR13 remainder outcome is unresolved. Do not repeat a refund based on missing local evidence. The [Stage 5A acceptance matrix](docs/stage-5a-acceptance.md) separates implementation, historical observations, fresh test results and remaining gates. Further recovery diagnostic development is frozen.
+
 Stage 5B Stripe Billing/subscriptions and Customer Portal, then Stage 5C expanded reconciliation, payment methods and cloud readiness remain future work. See the [Stage 5 roadmap](docs/superpowers/specs/2026-10-14-stripe-sandbox-design.md#1-последовательность-этапа) and the [acceptance boundaries](docs/local-development.md#stage-5a-offline-regression-and-explicit-sandbox-acceptance).
 
 ## Checks and guides
