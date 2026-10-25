@@ -1,6 +1,8 @@
 import * as fs from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import {openManualRefundState} from '../stripe-manual-refund-state.mjs';
 const RUN='031b5ae7-6603-4339-b1b3-77231291ff34',SOURCE='f0620e40004162d2b3eededa60512f50a492f4cc',NEW='11111111-2222-4333-8444-555555555555',PROJECT='stripe-'+RUN,SITEKEY='s5a-'+RUN.replaceAll('-','');
 const SERVICES=['postgres','mailpit','backend','demo-site','callback-receiver'],RESTORE=['postgres','mailpit','callback-receiver','demo-site','backend'];
@@ -26,7 +28,7 @@ function manifests(root,original,daemon){
 }
 export const envText=obj=>Object.entries(obj).map(([k,v])=>k+'='+v+'\n').join('');
 export async function fixture(t){
-  const root=await fs.realpath(await fs.mkdtemp('/private/tmp/refund-state-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));await fs.mkdir(root+'/test-results',{mode:0o700});await fs.mkdir(root+'/test-results/stripe-sandbox',{mode:0o700});await fs.mkdir(root+'/infrastructure',{mode:0o700});
+  const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'refund-state-')));t.after(()=>fs.rm(root,{recursive:true,force:true}));await fs.mkdir(root+'/test-results',{mode:0o700});await fs.mkdir(root+'/test-results/stripe-sandbox',{mode:0o700});await fs.mkdir(root+'/infrastructure',{mode:0o700});
   const original=root+'/test-results/stripe-sandbox/'+RUN;await fs.mkdir(original,{mode:0o700});const socket=root+'/docker.sock',server=net.createServer();await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(socket,resolve);});t.after(()=>new Promise(resolve=>server.close(resolve)));const daemon='unix://'+socket;
   const data=manifests(root,original,daemon);const write=async(name,value)=>fs.writeFile(original+'/'+name,typeof value==='string'?value:JSON.stringify(value)+'\n',{mode:0o600});await write('runtime.json',data.runtime);await write('form-provisioning.json',data.provision);await write('app.env',envText(data.app));await write('final.env',envText(data.final));
   const options={env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND:'true'},runId:NEW,expectedSource:'e'.repeat(40),daemon};const limits={deadline:Date.now()+120000};

@@ -5,6 +5,8 @@ import * as fs from 'node:fs/promises';
 import filesystem from 'node:fs/promises';
 import childProcess from 'node:child_process';
 import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import {syncBuiltinESMExports} from 'node:module';
 import {constants} from 'node:fs';
 import {openManualRefundState} from './stripe-manual-refund-state.mjs';
@@ -17,6 +19,23 @@ const uuid=n=>`aaaaaaaa-bbbb-4ccc-8ddd-${String(n).padStart(12,'0')}`;
 const durable=async f=>JSON.parse(await fs.readFile(f.statePath,'utf8'));
 const proof=(index=0)=>({refundId:uuid(20+index),providerReference:'re_SYNTHETIC'+index,providerEventId:'evt_SYNTHETIC'+index,amountMinor:index?1300:700,totalMinor:index?2000:700,providerVerified:true,webhookVerified:true,journalVerified:true,callbackVerified:true});
 async function configured(f,s){for(const service of RESTORE){await s.beginRestore(service,f.limits);await s.ackRestore(service,f.limits);}await s.beginRotation(f.limits);await s.ackRotation(2,f.limits);await s.beginConfigure(2,f.limits);await s.ackConfigure(2,f.limits);}
+// Break caught: hardcoded platform temp paths ignore the OS-selected owned parent.
+test('fixture creates fresh canonical roots and real sockets under the OS temp directory',async t=>{
+  const parent=await fs.mkdtemp(path.join(await fs.realpath('/tmp'),'rf-'));
+  t.after(()=>fs.rm(parent,{recursive:true,force:true}));
+  t.mock.method(os,'tmpdir',()=>parent);
+  const first=await fixture(t),second=await fixture(t);
+  assert.equal(path.dirname(first.root),parent);
+  assert.equal(path.dirname(second.root),parent);
+  assert.notEqual(first.root,second.root);
+  for(const f of [first,second]){
+    assert.equal(await fs.realpath(f.root),f.root);
+    assert.equal((await fs.lstat(f.root+'/docker.sock')).isSocket(),true);
+    const stat=await fs.stat(f.root);
+    assert.equal(stat.uid,process.getuid());
+    assert.equal(stat.mode&0o777,0o700);
+  }
+});
 // Break caught: loading credentials before admission or accepting mutable source/socket authority.
 test('admission fails before retained reads for bad flags, source, socket or renewed authority',async t=>{
   for(const variant of ['flags','source','dirty','socket','deadline'])await t.test(variant,async t=>{const f=await fixture(t);let reads=0;f.deps.open=()=>{reads++;throw Error('PRIVATE_CANARY');};if(variant==='flags')f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND='false';if(variant==='source')f.deps.execute=async()=>({stdout:'a'.repeat(40)+'\n',stderr:''});if(variant==='dirty')f.deps.execute=async(_file,args)=>({stdout:args.includes('status')?' M tracked.mjs\n':'e'.repeat(40)+'\n',stderr:''});if(variant==='socket')f.options.daemon='unix://'+f.root+'/missing.sock';if(variant==='deadline')f.limits.deadline=Date.now()+1801000;await assert.rejects(f.open(),/^Error: stripe_manual_refund_state_/);assert.equal(reads,0);});
