@@ -48,12 +48,16 @@ The Fake provider covers local one-time payments, donations and subscriptions, i
 
 Historical notes also describe a successful EUR20 test payment and a verified EUR7 refund; the current EUR13 remainder outcome is unresolved. Do not repeat a refund based on missing local evidence. The [Stage 5A acceptance matrix](docs/stage-5a-acceptance.md) separates implementation, historical observations, fresh test results and remaining gates. Further recovery diagnostic development is frozen.
 
+Subsequent authorized Docker cleanup removed 39 stopped/created synthetic containers, 10 one-run images and 4 empty Fake networks. Controller metadata checks confirmed the seven original Stripe containers remained exited and all volumes and other Docker objects were preserved; generated configs/logs and test evidence remain. These observations were not reproduced during this documentation update. Provider-only observation still needs a usable local test server key and the exact original PaymentIntent binding; the old local journal, outbox and Flyway state remain unobserved. Task 16 and Stage 5A remain incomplete.
+
 Stage 5B Stripe Billing/subscriptions and Customer Portal, then Stage 5C expanded reconciliation, payment methods and cloud readiness remain future work. See the [Stage 5 roadmap](docs/superpowers/specs/2026-10-14-stripe-sandbox-design.md#1-последовательность-этапа) and the [acceptance boundaries](docs/local-development.md#stage-5a-offline-regression-and-explicit-sandbox-acceptance).
 
 ## Checks and guides
 
 [Offline CI](.github/workflows/ci.yml) runs default Maven verification (including synthetic Stripe adapter/Cucumber fixtures), SDK and Admin tests/typechecks/builds, Admin lint, demo return-unit tests/build, native Node synthetic support tests, the separate offline Chromium return/privacy suite and all infrastructure Node tests. It installs dependencies with frozen lockfiles and requires no repository secrets or real Stripe opt-in.
 
-Full owned Fake end-to-end acceptance needs the separate Stage 4 clock/runtime harness and is outside this first pipeline. Real Sandbox acceptance is also outside CI. Local verification results do not establish a successful GitHub-hosted workflow run. For exact commands and ownership requirements, see [CI coverage](docs/local-development.md#secret-free-ci-coverage) and the workflow above.
+The completed [hosted run 40207944787](https://github.com/viktar-mar/payment/actions/runs/40207944787) passed all three jobs for exact source commit `319af884c212401623841e8f768636e9a9b83e8a`. Earlier hosted failures remain recorded in the acceptance matrix. That success does not cover this subsequent documentation commit; its exact-commit hosted CI remains pending.
+
+Full owned Fake end-to-end acceptance uses the separate Stage 4 clock/runtime harness and is outside this pipeline; its completed local result is recorded in the acceptance matrix. Real Sandbox acceptance is also outside CI. Local and hosted synthetic results do not establish financial acceptance or readiness to merge. For exact commands and ownership requirements, see [CI coverage](docs/local-development.md#secret-free-ci-coverage) and the workflow above.
 
 Use the [Admin guide](frontend/README.md), [SDK guide](frontend/sdk/README.md), [demo source](examples/demo-site/) and [local development guide](docs/local-development.md) for integration and advanced testing.
