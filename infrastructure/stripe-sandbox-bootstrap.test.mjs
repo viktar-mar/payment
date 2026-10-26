@@ -36,6 +36,7 @@ import {createOwnedSandboxBootstrap} from './stripe-sandbox-bootstrap.mjs';
 import * as bootstrapModule from './stripe-sandbox-bootstrap.mjs';
 import {createFormDiagnosticRuntime} from './stripe-form-diagnostic-runtime.mjs';
 import * as formRuntime from './stripe-form-diagnostic-runtime.mjs';
+import {createManualPaymentProvisioner} from './stripe-form-diagnostic-provision.mjs';
 
 // Guard the builtin defaults as well as each fixture's raw process boundary.
 const forbidden=()=>{throw new Error('synthetic_test_forbids_real_process');};
@@ -270,6 +271,129 @@ function formFixture(browserOrigin='http://127.0.0.1:18081') {
   const deps={bootstrap:f.dependencies,provider:{fetch:fetcher},provision:{...f.dependencies,fetch:fetcher}};
   return {...f,deps,http,detail,intent,operation,payments,resume(){detail.attempts=[{id:uid(11),attempt_number:1,status:'REQUIRES_PAYMENT_METHOD',provider_intent_reference:'pi_TestOnly',payment_method_family:'CARD',result_code:null}];detail.events.push({id:uid(12),event_type:'ATTEMPT_CREATED'});}};
 }
+
+// Keep the real credential capability and full bootstrap proofs; only the guarded
+// filesystem/process/HTTP boundaries below are artificial.
+async function manualCredentialLive(configure=()=>{}) {
+  const f=fixture();f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT='true';f.options.manualPort=18083;delete f.options.approvedBinding;
+  f.clock={now:1000};f.dependencies.now=()=>f.clock.now;f.limits={deadline:121000};
+  configure(f);f.adapter=await bootstrapModule.createOwnedManualPaymentBootstrap(f.options,f.dependencies);
+  await f.adapter.prepare(f.limits);await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(f.limits);return f;
+}
+for(const threeDSecure of [false,true])for(const latency of [0,230,500])test(`manual credential composition ${threeDSecure?'selected 3DS':'ordinary'} at ${latency}ms preserves original child budgets`,async()=>{
+  const f=formFixture('http://127.0.0.1:18083');f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT:'true',...(threeDSecure?{PAYMENT_STRIPE_SANDBOX_MANUAL_3DS:'true'}:{})};
+  f.options.manualPort=18083;let now=1000,simulate=false;const execute=f.dependencies.execute;
+  f.dependencies.now=()=>now;f.dependencies.execute=async(...args)=>{const result=await execute(...args);if(simulate)now+=latency;return result;};
+  const b=await bootstrapModule.createOwnedManualPaymentBootstrap(f.options,f.dependencies),limits={deadline:121000};
+  await b.prepare(limits);await b.persistWebhookSecret(SECRET);await b.start(limits);
+  const fetcher=f.deps.provision.fetch;let firstHttp=null;
+  const dependencies={...f.dependencies,fetch:async(url,settings)=>{
+    if(firstHttp===null){firstHttp={path:new URL(url).pathname,now};simulate=false;}
+    const path=new URL(url).pathname;
+    if(path==='/inspection')return new Response(JSON.stringify({count:0,duplicates:0,events:[]}));
+    if(path.endsWith('/callback'))return new Response(JSON.stringify({site_id:'00000000-0000-4000-8000-000000000002',endpoint_url:'http://callback-receiver:8080/callback',enabled:true,secret_version:1,secret:Buffer.alloc(32,17).toString('base64url')}));
+    if(path==='/configure')return new Response(null,{status:204});return fetcher(url,settings);
+  }};
+  let binding=false;const p=await createManualPaymentProvisioner({env:f.options.env,bootstrap:b,browserOrigin:'http://127.0.0.1:18083',verifyProviderBinding:async()=>{binding=true;return true;}},dependencies);
+  simulate=true;
+  if(latency===500){
+    await assert.rejects(p.prepare(limits),/PROVISION_PENDING/);assert.equal(firstHttp,null);assert.equal(binding,false);assert.equal(f.files.has(DIR+'/form-provisioning.json'),false);assert.equal(b.resources().status,'PENDING');
+    const before=f.events.length;await assert.rejects(p.prepare(limits));assert.equal(f.events.length,before);
+  }else{
+    const handoff=await p.prepare(limits);assert.equal(handoff.binding.intentId,'pi_TestOnly');assert.equal(firstHttp.path,'/api/admin/v1/auth/sessions');
+    assert.equal(binding,true);assert.equal(b.resources().status,'LIVE');assert.ok(f.files.has(DIR+'/form-provisioning.json'));
+    assert.ok(f.events.filter(e=>e.type==='health').every(e=>e.context.deadline<=limits.deadline));
+    assert.ok(f.events.filter(e=>e.type==='process').every(e=>e.settings.timeout<=120000));
+  }
+});
+
+for(const trigger of ['child abort','child expiry','startup abort'])test(`manual credential child ${trigger} cancels held proof and denies late exposure`,async()=>{
+  const startup=new AbortController(),child=new AbortController();let release,entered,hold=false;
+  const started=new Promise(resolveStarted=>{entered=resolveStarted;});
+  const f=await manualCredentialLive(f=>{
+    f.limits.signal=startup.signal;const execute=f.dependencies.execute;
+    f.dependencies.execute=async(...args)=>{if(hold){hold=false;entered(args[2]);await new Promise(resolveRelease=>{release=resolveRelease;});}return execute(...args);};
+  });
+  let exposed=false,finished=false;hold=true;
+  const result=f.adapter.withAdminCredentials(()=>{exposed=true;return true;},{deadline:11000,signal:child.signal}).then(()=>true,()=>false).finally(()=>{finished=true;});
+  const settings=await started;
+  const timer=[...f.timers.values()][0];
+  if(trigger==='child abort')child.abort();else if(trigger==='startup abort')startup.abort();else {f.clock.now=11000;timer.callback();}
+  await turn();const aborted=settings.signal.aborted,settledEarly=finished;release();const succeeded=await result;
+  assert.equal(timer.ms,10000);assert.equal(settings.timeout,10000);assert.equal(aborted,true);assert.equal(settledEarly,false,'a held process remains owned until settlement');assert.equal(succeeded,false);assert.equal(exposed,false);assert.equal(f.adapter.resources().status,'PENDING');
+  const before=f.events.length;await rejects(f.adapter.withAdminCredentials(()=>{exposed=true;return true;}),'ADMIN_PENDING');await rejects(f.adapter.verify({deadline:121000}),'VERIFY_PENDING');assert.equal(f.events.length,before);assert.equal(exposed,false);
+});
+for(const [name,limits] of [
+  ['extended',()=>({deadline:121001})],['expired',()=>({deadline:1000})],['nonfinite',()=>({deadline:NaN})],['fractional',()=>({deadline:1000.5})],['missing',()=>({})],['null',()=>null],
+  ['aborted',()=>({deadline:11000,signal:AbortSignal.abort()})],['invalid signal',()=>({deadline:11000,signal:{}})],
+  ['inherited',()=>Object.create({deadline:11000})],['inherited signal',()=>Object.assign(Object.create({signal:AbortSignal.abort()}),{deadline:11000})],
+  ['extra field',()=>({deadline:11000,renew:true})],['symbol field',()=>({deadline:11000,[Symbol('authority')]:true})],['array',()=>Object.assign([],{deadline:11000})],
+  ['accessor',()=>Object.defineProperty({},'deadline',{get(){throw new Error('untrusted limit getter');}})],
+])test(`manual credential child rejects ${name} authority before proofs and permanently denies exposure`,async()=>{
+  const f=await manualCredentialLive();let exposed=false;const before=f.events.length;
+  await rejects(f.adapter.withAdminCredentials(()=>{exposed=true;return true;},limits()),'ADMIN_PENDING');assert.equal(exposed,false);assert.equal(f.events.length,before);
+  await rejects(f.adapter.withAdminCredentials(()=>{exposed=true;return true;}),'ADMIN_PENDING');assert.equal(f.events.length,before);assert.equal(exposed,false);
+});
+test('manual callback-only credentials retain original authority and arity',async()=>{
+  const f=await manualCredentialLive();assert.equal(f.adapter.withAdminCredentials.length,1);let exposed=false;
+  assert.equal(await f.adapter.withAdminCredentials(value=>{exposed=Object.keys(value).sort().join(',')==='password,username';return true;}),true);assert.equal(exposed,true);assert.equal(f.adapter.resources().status,'LIVE');
+});
+test('nonmanual callback-only credential contract ignores an extra child argument',async()=>{
+  const f=await prepared();await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(LIMIT());let exposed=false;
+  assert.equal(f.adapter.withAdminCredentials.length,1);
+  assert.equal(await f.adapter.withAdminCredentials(()=>{exposed=true;return true;},{deadline:0,signal:AbortSignal.abort()}),true);assert.equal(exposed,true);
+});
+test('manual credential child without a signal denies callback when proof reaches its deadline',async()=>{
+  let expire=false;const f=await manualCredentialLive(f=>{const health=f.dependencies.health;f.dependencies.health=async(...args)=>{const result=await health(...args);if(expire&&args[0]==='http://127.0.0.1:18082/health')f.clock.now=11000;return result;};});
+  expire=true;let exposed=false;await rejects(f.adapter.withAdminCredentials(()=>{exposed=true;return true;},{deadline:11000}),'ADMIN_PENDING');assert.equal(exposed,false);assert.equal(f.adapter.resources().status,'PENDING');
+});
+test('manual credential limits capture rejects accessors without evaluating them',async()=>{
+  const f=await manualCredentialLive();let reads=0,exposed=false;
+  await rejects(f.adapter.withAdminCredentials(()=>{exposed=true;return true;},Object.defineProperty({},'deadline',{get(){reads++;return 11000;}})),'ADMIN_PENDING');assert.equal(reads,0);assert.equal(exposed,false);
+});
+test('manual provision child expiry aborts real verification and retains unsettled cleanup ownership',async()=>{
+  let entered,release,hold=false;const started=new Promise(resolveStarted=>{entered=resolveStarted;});
+  const f=await manualCredentialLive(f=>{const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{if(hold){hold=false;entered(args[2]);await new Promise(resolveRelease=>{release=resolveRelease;});}return execute(...args);};});
+  let exposed=false;const b=f.adapter,bootstrap={...b,withAdminCredentials:(callback,...args)=>{hold=true;return b.withAdminCredentials(value=>{exposed=true;return callback(value);},...args);}};
+  const p=await createManualPaymentProvisioner({env:f.options.env,bootstrap,browserOrigin:'http://127.0.0.1:18083',verifyProviderBinding:async()=>true},{...f.dependencies,fetch:forbidden});
+  const result=p.prepare(f.limits).then(()=>true,()=>false);const settings=await started;
+  [...f.timers.values()].find(timer=>timer.ms===10000).callback();assert.equal(await result,false);await turn();const aborted=settings.signal.aborted;
+  await assert.rejects(p.close({deadline:f.limits.deadline+120000}));await rejects(b.stop({deadline:f.limits.deadline+120000}),'OPERATION_BUSY');
+  release();await turn();assert.equal(aborted,true);assert.equal(exposed,false);assert.equal(f.files.has(DIR+'/form-provisioning.json'),false);assert.equal(b.resources().status,'PENDING');
+  const before=f.events.length;await assert.rejects(p.prepare(f.limits));await rejects(b.withAdminCredentials(()=>{exposed=true;return true;}),'ADMIN_PENDING');assert.equal(f.events.length,before);assert.equal(exposed,false);
+});
+
+for(const [field,mutate] of [
+  ['source',f=>{f.changedSource=true;}],['image',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Image=image(999);}],['network',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Networks[PROJECT+'-network'].NetworkID=id(999);}],
+  ['volume',f=>{f.volumes.get(PROJECT+'-issuer').CreatedAt='2026-10-17T12:00:00Z';}],['mount',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Mounts[0].RW=true;}],
+  ['port',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Ports['8080/tcp'][0].HostPort='19000';}],['health',f=>{f.changedHealth=true;}],
+])test(`manual credential composition retains complete ${field} proof after provider binding`,async()=>{
+  const f=await manualCredentialLive(f=>{
+    const execute=f.dependencies.execute,health=f.dependencies.health;
+    f.dependencies.execute=async(...args)=>{const result=await execute(...args);return f.changedSource&&args[0]==='/usr/bin/git'&&args[1].includes('rev-parse')?{stdout:'f'.repeat(40)+'\n',stderr:''}:result;};
+    f.dependencies.health=async(...args)=>await health(...args)&&!f.changedHealth;
+  });
+  let exposed=false;const b=f.adapter,bootstrap={...b,withAdminCredentials:(callback,...args)=>b.withAdminCredentials(value=>{exposed=true;return callback(value);},...args)};
+  const p=await createManualPaymentProvisioner({env:f.options.env,bootstrap,browserOrigin:'http://127.0.0.1:18083',verifyProviderBinding:async()=>{mutate(f);return true;}},{...f.dependencies,fetch:forbidden});
+  await assert.rejects(p.prepare(f.limits),/PROVISION_PENDING/);assert.equal(exposed,false);assert.equal(f.files.has(DIR+'/form-provisioning.json'),false);assert.equal(b.resources().status,'PENDING');
+});
+
+for(const boundary of ['before capability','inside callback'])for(const [field,mutate] of [
+  ['mode',s=>s.mode='FORM_DIAGNOSTIC'],['listener',s=>s.webhookReady=false],['status',s=>s.status='PENDING'],['run',s=>s.runId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+  ['source',s=>s.expectedSource='f'.repeat(40)],['daemon',s=>s.daemon='unix:///foreign.sock'],['project',s=>s.project='foreign'],['site',s=>s.siteKey='foreign'],['ports',s=>s.ports.backend++],
+  ...['backend','demo','receiver'].map(name=>[name+' endpoint',s=>s.endpoints[name]='http://127.0.0.1:19000']),
+  ...['backend','demo-site','callback-receiver'].map(name=>[name+' owner',s=>s.containers[name].id=id(999)]),
+])test(`manual credential snapshot refuses changed ${field} ${boundary}`,async()=>{
+  let afterBinding=false,substitute=false;
+  const f=await manualCredentialLive(f=>{const health=f.dependencies.health;f.dependencies.health=async(...args)=>{const result=await health(...args);if(afterBinding&&args[0]==='http://127.0.0.1:18082/health')substitute=true;return result;};});
+  const b=f.adapter,bootstrap={...b,resources:()=>{const safe=structuredClone(b.resources());if(substitute)mutate(safe);return safe;}};
+  const eventStart=f.events.length;
+  const p=await createManualPaymentProvisioner({env:f.options.env,bootstrap,browserOrigin:'http://127.0.0.1:18083',verifyProviderBinding:async()=>{afterBinding=true;if(boundary==='before capability')substitute=true;return true;}},{...f.dependencies,fetch:forbidden});
+  await assert.rejects(p.prepare(f.limits),/PROVISION_PENDING/);assert.equal(f.files.has(DIR+'/form-provisioning.json'),false);
+  const before=f.events.length;await assert.rejects(p.prepare(f.limits));assert.equal(f.events.length,before);
+  const health=f.events.slice(eventStart).filter(e=>e.type==='health'&&e.context.deadline===11000);
+  assert.equal(health.length,boundary==='before capability'?3:6,'initial proof stays; callback proof completes exactly once before snapshot rejection');
+});
 
 test('real prepare-only runtime completes one synthetic bootstrap/provision/provider lifecycle and closes only owned resources',async()=>{
   const f=formFixture(),r=await createFormDiagnosticRuntime(f.options,f.deps),limits=LIMIT();

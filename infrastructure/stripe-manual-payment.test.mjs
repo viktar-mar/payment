@@ -42,6 +42,7 @@ test('remainder exclusion precedes snapshots configuration and dependencies',asy
 });
 import {EventEmitter} from 'node:events';
 import {authorizeManualPaymentCli} from './stripe-manual-payment-auth.mjs';
+import {createManualPaymentProvisioner} from './stripe-form-diagnostic-provision.mjs';
 const module=await import('./stripe-manual-payment.mjs').catch(()=>({}));
 const {runManualPayment=async()=>({report:{result:'FAILED'},exitCode:1}),runManualPaymentCli=async()=>({exitCode:1})}=module;
 const runId='7deaf3e1-1247-4d80-9cf5-67ebcd24429a',expectedSource='a'.repeat(40);
@@ -155,6 +156,7 @@ test('inert imports neither read private credentials nor launch any subprocess o
     const sources=new Set([
       'stripe-manual-payment.mjs','stripe-manual-payment-options.mjs',
       'stripe-manual-payment-schema.mjs','stripe-manual-payment-auth.mjs',
+      'stripe-form-diagnostic-provision.mjs','stripe-form-diagnostic-settlement.mjs',
       'stripe-manual-form-options.mjs','stripe-sandbox-acceptance.mjs',
       'stripe-sandbox-bootstrap.mjs','stripe-sandbox-owned.mjs',
       'stripe-sandbox-cli.mjs','stripe-sandbox-provision.mjs',
@@ -324,4 +326,44 @@ test('real authorization late success cannot revive expired controller authority
   completion.callback(null,'Done.\n','');completion.child.emit('close',0,null);await f.tick(401001);const value=await task;
   assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(value.report.listener_closed,false);assert.equal(diagnostics.length,1);assert.deepEqual(JSON.parse(diagnostics[0]),{tag:'stripe_manual_payment_auth_diagnostic',stage:'COMPLETE',reason:'ABORTED'});assert.ok(!f.calls.includes('binding'));assert.ok(!f.calls.includes('provision'));
   await f.tick(521000);assert.equal(diagnostics.length,1);assert.equal(dispatches(),2);assert.equal(f.timers.size,0);
+});
+
+// Break: classifying unrelated failures, emitting before cleanup, or changing the report schema.
+for(const threeDSecure of [false,true])test('actual provision factory failure reaches entry stderr after cleanup before unchanged '+(threeDSecure?'3DS':'ordinary')+' report',async()=>{
+ const f=fixture(),out=[],err=[],order=[];let code;const input=cliInput();if(threeDSecure)input.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';
+ f.deps.subscribe=()=>()=>{};f.deps.createProvisioner=value=>createManualPaymentProvisioner({...value,browserOrigin:'https://password-synthetic-private.invalid'});
+ const stop=f.bootstrap.stop;f.bootstrap.stop=async limits=>{const value=await stop(limits);order.push('stop');return value;};
+ const stream=(lines,name)=>Object.assign(new EventEmitter(),{write(text,done){lines.push(text);order.push(name);done();return true;}});
+ await module.runManualPaymentEntry(input,{stdout:stream(out,'stdout'),stderr:stream(err,'stderr'),exit:value=>{code=value;}},f.deps);
+ assert.equal(code,1);assert.deepEqual(err,['{"tag":"stripe_manual_payment_provision_diagnostic","stage":"ADMISSION"}\n']);assert.ok(order.indexOf('stop')<order.indexOf('stderr'));assert.equal(order.at(-1),'stdout');
+ assert.equal(out.length,1);const report=JSON.parse(out[0]);assert.equal(report.result,'PENDING');assert.equal(report.phase,'PROVISION');assert.equal(report.gateway_closed,true);assert.equal(report.listener_closed,true);assert.equal(report.runtime_closed,true);assert.equal(report.mode,threeDSecure?'MANUAL_3DS':'MANUAL_PAYMENT');
+ assert.deepEqual(Object.keys(report).sort(),['version','mode','result','phase','confirmation_granted','payment_confirmed','provider_confirmed','webhook_verified','journal_verified','callback_verified','gateway_closed','listener_closed','runtime_closed','browser_closure','provenance',...(threeDSecure?['three_ds_verified']:[])].sort());assert.equal(f.financialRetries,0);assert.ok(!f.calls.includes('bindPayment'));
+});
+test('hostile prepare failure emits UNKNOWN only after every independently owned cleanup',async()=>{
+ const f=fixture(),diagnostics=[];let reads=0;f.provisioner.prepare=async()=>{throw new Proxy({},{get(){reads++;throw null;},getPrototypeOf(){reads++;throw null;}});};
+ f.deps.writeProvisionDiagnostic=async line=>{assert.ok(f.calls.includes('closeProvisioner'));assert.ok(f.calls.includes('stopListener'));assert.ok(f.calls.includes('stop'));diagnostics.push(line);};
+ const value=await runManualPayment(options,f.limits,f.deps);assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(reads,0);assert.deepEqual(diagnostics,['{"tag":"stripe_manual_payment_provision_diagnostic","stage":"UNKNOWN"}\n']);assert.equal(f.financialRetries,0);
+});
+for(const fail of [undefined,'auth','binding','bindPayment','server','provider'])test('no provision diagnostic outside failed construction or prepare '+String(fail),async()=>{
+ const f=fixture({fail}),diagnostics=[];f.deps.writeProvisionDiagnostic=async line=>diagnostics.push(line);await runManualPayment(options,f.limits,f.deps);assert.equal(diagnostics.length,0);
+});
+for(const mode of ['reject','stall','ceiling','expired'])test('provision diagnostic '+mode+' keeps sole output within original cleanup authority',async()=>{
+ const f=fixture({fail:'provision'}),writes=[],diagnostics=[];f.deps.subscribe=()=>()=>{};f.deps.write=async line=>writes.push(line);
+ const stop=f.bootstrap.stop;f.bootstrap.stop=async limits=>{const value=await stop(limits);if(mode==='ceiling')f.clock.value=2820500;if(mode==='expired')f.clock.value=2821000;return value;};
+ f.deps.writeProvisionDiagnostic=line=>{assert.ok(f.calls.includes('stop'));diagnostics.push(line);if(mode==='reject')throw Error('password=synthetic-private');return new Promise(()=>{});};
+ let settled=false;const task=runManualPaymentCli(cliInput(),f.deps).then(value=>{settled=true;return value;});await f.tick(1000);
+ assert.equal(diagnostics.length,mode==='expired'?0:1);if(mode==='stall'||mode==='ceiling'){assert.equal(settled,false);await f.tick(mode==='ceiling'?2821000:2000);}
+ const value=await task;assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(writes.length,1);assert.ok(!f.calls.includes('bindPayment'));assert.equal(f.financialRetries,0);assert.equal(f.timers.size,0);
+});
+for(const window of ['one-second','cleanup'])test('provision diagnostic deferred dispatch rechecks '+window+' cutoff',async()=>{
+ const f=fixture({fail:'provision'}),diagnostics=[];f.deps.writeProvisionDiagnostic=async line=>diagnostics.push(line);
+ if(window==='cleanup'){const stop=f.bootstrap.stop;f.bootstrap.stop=async limits=>{const value=await stop(limits);f.clock.value=2820500;return value;};}
+ const schedule=f.deps.setTimeout;let crossed=false;f.deps.setTimeout=(fn,delay)=>{if(!crossed&&delay===(window==='cleanup'?500:1000)&&f.calls.includes('stop')){crossed=true;f.clock.value=window==='cleanup'?2821000:2000;}return schedule(fn,delay);};
+ const value=await runManualPayment(options,f.limits,f.deps);assert.equal(crossed,true);assert.equal(diagnostics.length,0);assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(f.timers.size,0);
+});
+for(const mode of ['reject','stall'])test('provision entry stderr '+mode+' cannot prevent sole final stdout',async()=>{
+ const f=fixture({fail:'provision'}),out=[];f.deps.subscribe=()=>()=>{};let writes=0,code;
+ const stdout=Object.assign(new EventEmitter(),{write(text,done){out.push(text);done();}}),stderr=Object.assign(new EventEmitter(),{write(text,done){writes++;if(mode==='reject')done(Error('synthetic write failure'));}});
+ const task=module.runManualPaymentEntry(cliInput(),{stdout,stderr,exit:value=>{code=value;}},f.deps);await f.tick(1000);if(mode==='stall')await f.tick(2000);await task;
+ assert.equal(code,1);assert.equal(writes,1);assert.equal(out.length,1);assert.equal(JSON.parse(out[0]).result,'PENDING');assert.equal(f.timers.size,0);
 });

@@ -13,6 +13,11 @@ const PORT_NAMES=['backend','demo','receiver','postgres','mailpitHttp','mailpitS
 const EXHAUSTED=new Set(['2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-429f-a34c-e4f69ba2ce18']);
 const ERRORS=new Set(['OPT_IN_REQUIRED','INPUTS_CONFIGURATION','OPERATION_BUSY','PROVISION_PENDING','HANDOFF_PENDING']);
 const fixed=code=>new Error('stripe_form_diagnostic_provision_'+(ERRORS.has(code)?code:'INPUTS_CONFIGURATION'));
+const provisionDiagnostics=new WeakMap();
+/** Fixed initial-boundary metadata only; dependency errors are never inspected. */
+export function formatManualPaymentProvisionDiagnostic(error){
+  return JSON.stringify({tag:'stripe_manual_payment_provision_diagnostic',stage:provisionDiagnostics.get(error)??'UNKNOWN'})+'\n';
+}
 const fail=()=>{throw null;};
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 const uuid=value=>typeof value==='string'&&UUID.test(value);
@@ -36,13 +41,14 @@ export async function createManualPaymentProvisioner(options,dependencies={}) {
 }
 async function createProvisioner(options,dependencies,manual) {
   const payment=manual==='payment';
+  const admission=code=>{const error=fixed(code);if(payment)provisionDiagnostics.set(error,'ADMISSION');return error;};
   let enabled=false,threeDSecure=false,descriptors;
   try {
     if(manual)descriptors=Object.getOwnPropertyDescriptors(options);
     const env=manual?descriptors.env?.value:options?.env;enabled=payment?manualPaymentOptIn(env):manual?manualFormOptIn(env):formDiagnosticOptIn(env);
     if(enabled&&payment)threeDSecure=Object.getOwnPropertyDescriptor(env,'PAYMENT_STRIPE_SANDBOX_MANUAL_3DS')?.value==='true';
   }catch{enabled=false;}
-  if(!enabled)throw fixed('OPT_IN_REQUIRED');
+  if(!enabled)throw admission('OPT_IN_REQUIRED');
   let topology,verify,adminCredentials,io,browserOrigin,providerBinding,bootstrap;
   try {
     if(!manual&&Object.hasOwn(options,'browserOrigin'))fail();
@@ -84,7 +90,7 @@ async function createProvisioner(options,dependencies,manual) {
       rename:dependencies.rename??rename,fetch:dependencies.fetch??globalThis.fetch,
       now:dependencies.now??Date.now,
       setTimeout:dependencies.setTimeout??setTimeout,clearTimeout:dependencies.clearTimeout??clearTimeout});
-  }catch{throw fixed('INPUTS_CONFIGURATION');}
+  }catch{throw admission('INPUTS_CONFIGURATION');}
 
   const directory=ROOT+'/test-results/stripe-sandbox/'+topology.runId,ledgerPath=directory+'/form-provisioning.json',lockPath=directory+'/form-provisioning.lock';
   const suffix=topology.runId.replaceAll('-',''),keys={account:'stripe-sandbox-default',site:topology.siteKey,product:'s5a-product-'+suffix,
@@ -164,12 +170,15 @@ async function createProvisioner(options,dependencies,manual) {
   async function acknowledge(value,context){
     const intent=intents.at(-1);intent.status='ACKNOWLEDGED';if(value!==undefined)intent.identity=value;await save(context);
   }
-  async function ownership(context){
+  function paymentSnapshot(){
     if(payment){const current=bootstrap.resources();
       if(current.mode!=='MANUAL_PAYMENT'||current.webhookReady!==true||current.status!=='LIVE'||current.runId!==topology.runId||current.expectedSource!==topology.expectedSource||current.daemon!==topology.daemon||current.project!==topology.project||current.siteKey!==topology.siteKey||!same(current.ports,topology.ports)
         ||['backend','demo','receiver'].some(name=>current.endpoints?.[name]!==topology.endpoints[name])
         ||[['backend','backend'],['demo','demo-site'],['receiver','callback-receiver']].some(([name,service])=>current.containers?.[service]?.id!==topology.owners[name]))fail();
     }
+  }
+  async function ownership(context){
+    paymentSnapshot();
     if(await call(context,verify,{signal:context.signal,deadline:context.deadline})!==true)fail();
   }
   async function request(path,context,{method='GET',body,expected=200,key,receiver=false,login=false}={}){
@@ -252,15 +261,24 @@ async function createProvisioner(options,dependencies,manual) {
     if(!values.PAYMENT_ADMIN_SESSION||!values['XSRF-TOKEN'])fail();
     cookie='PAYMENT_ADMIN_SESSION='+values.PAYMENT_ADMIN_SESSION+'; XSRF-TOKEN='+values['XSRF-TOKEN'];csrf=values['XSRF-TOKEN'];
   }
-  async function provision(context){
+  async function provision(context,initial){
+    if(initial)initial.stage='OWNERSHIP';
     await bounded(context,ownership);
+    if(initial)initial.stage='PROVIDER_BINDING';
     if(payment&&await call(context,providerBinding,{deadline:context.deadline,signal:context.signal})!==true)fail();
+    if(initial)initial.stage='ADMIN_CREDENTIALS';
     await bounded(context,async operation=>{
-      await ownership(operation);
-      if(await call(operation,adminCredentials,value=>{
-        check(operation);if(!credential(value?.username)||!credential(value?.password))fail();admin=Object.freeze({username:value.username,password:value.password});return true;
+      // Manual credentials perform their own complete bootstrap verification.
+      // Keep the captured payment ownership proof on both sides of that boundary.
+      if(!payment)await ownership(operation);
+      const capture=value=>{
+        check(operation);paymentSnapshot();if(!credential(value?.username)||!credential(value?.password))fail();admin=Object.freeze({username:value.username,password:value.password});return true;
+      };
+      if(await call(operation,()=>{
+        paymentSnapshot();return payment?adminCredentials(capture,operation):adminCredentials(capture);
       })!==true||!admin)fail();
     });
+    if(initial)initial.stage='UNKNOWN';
     await directoryProof(context);await absent(ledgerPath,context);await absent(lockPath,context);
     lock=await exclusive(lockPath,JSON.stringify({runId:topology.runId})+'\n',context,true);status='PROVISIONING';await save(context);
     await dispatch('admin-session',stable('admin-session'),context);
@@ -364,7 +382,7 @@ async function createProvisioner(options,dependencies,manual) {
     const received=inspected.events.filter(v=>v.event_id===event.id&&v.event_type==='payment.succeeded');if(received.length!==1)return null;
     return snapshot({paymentConfirmed:true,webhookVerified:true,journalVerified:true,callbackVerified:true,providerEventId:event.provider_event_id});
   }
-  async function run(limits,body,{cleanup=false}={}) {
+  async function run(limits,body,{cleanup=false,initial}={}) {
     if(busy) {pending=true;throw fixed('OPERATION_BUSY');}busy=true;
     const controller=new AbortController();let timer,abort,context;
     try {
@@ -375,11 +393,13 @@ async function createProvisioner(options,dependencies,manual) {
       abort=()=>controller.abort();limits.signal?.addEventListener('abort',abort,{once:true});if(limits.signal?.aborted)abort();
       context={deadline:limits.deadline,signal:controller.signal};timer=io.setTimeout(abort,Math.min(2147483647,limits.deadline-io.now()));
       return await controlled(context,()=>body(context));
-    }catch{pending=true;throw fixed('PROVISION_PENDING');}
+    }catch{pending=true;const error=fixed('PROVISION_PENDING');if(initial)provisionDiagnostics.set(error,initial.stage);throw error;}
     finally{busy=false;io.clearTimeout(timer);limits?.signal?.removeEventListener('abort',abort);}
   }
   const capabilities={
-    prepare:limits=>run(limits,async context=>{if(pending||status!=='NEW'||closed)fail();status='PREPARING';return provision(context);}),
+    prepare:limits=>{const initial=payment?{stage:'ADMISSION'}:null;
+      return run(limits,async context=>{if(pending||status!=='NEW'||closed)fail();status='PREPARING';return provision(context,initial);},{initial});
+    },
     verifyNoConfirmation:limits=>run(limits,async context=>{if(finalUsed||closed||!checkout||!operationProof)fail();finalUsed=true;
       const proof=await noConfirmation(context);await save(context);return proof;}),
     close:limits=>run(limits,async context=>{if(closed)fail();closed=true;

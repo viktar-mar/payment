@@ -3,6 +3,7 @@ import {fileURLToPath} from 'node:url';
 import {manualPaymentOptIn,validateManualPaymentOptions} from './stripe-manual-payment-options.mjs';
 import {validateManualPaymentReport,formatManualPaymentReport} from './stripe-manual-payment-schema.mjs';
 import {formatManualPaymentAuthDiagnostic} from './stripe-manual-payment-auth.mjs';
+import {formatManualPaymentProvisionDiagnostic} from './stripe-form-diagnostic-provision.mjs';
 const ROOT=fileURLToPath(new URL('..',import.meta.url)).replace(/\/$/,'');
 const EMPTY=Object.freeze({version:1,mode:'MANUAL_PAYMENT',result:'FAILED',phase:'ADMISSION',confirmation_granted:false,payment_confirmed:false,provider_confirmed:false,webhook_verified:false,journal_verified:false,callback_verified:false,gateway_closed:false,listener_closed:false,runtime_closed:false,browser_closure:'NOT_OWNED',provenance:'CONTROLLER_REPORTED'});
 const rejected=()=>Object.freeze({report:EMPTY,exitCode:1});
@@ -29,6 +30,7 @@ export async function runManualPayment(options,originalLimits,deps={}){
   let phase='PREPARE',failed=false,closing=false,grantUsed=false,granted=false,unused=false,authStarted=false,authCompleted=false,bootstrap,cli,provisioner,gateway;
   let gatewayAttempted=false,cliAttempted=false,bootstrapAttempted=false;
   let authDiagnostic,authDiagnosticFinalized=false;
+  let provisionDiagnostic,provisionDiagnosticFinalized=false,provisionStarted=false,provisionPrepared=false;
   const threeDSecure=selected.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS==='true';
   const proof={...EMPTY,...(threeDSecure?{mode:'MANUAL_3DS',three_ds_verified:false}:{})},work=new Set(),runtimeWork=new Set(),childWork=new Set(),closeTasks=new Map();let runtimeStopReleased=false;
   function active(){return !lifetime.signal.aborted&&!input.signal?.aborted&&now()<limits.deadline;}
@@ -71,8 +73,11 @@ export async function runManualPayment(options,originalLimits,deps={}){
     phase='START';await requireTrue(()=>bootstrap.start(limits),'runtime');await requireTrue(()=>bootstrap.verify(limits));
     phase='PROVISION';
     const createProvisioner=deps.createProvisioner??(await import('./stripe-form-diagnostic-provision.mjs')).createManualPaymentProvisioner;
-    await operation(()=>createProvisioner(Object.freeze({env:selected.env,bootstrap,browserOrigin:origin,verifyProviderBinding:cli.validateBinding})),acquired('provisioner','close',value=>{provisioner=value;}));
-    const prepared=exact(await operation(()=>provisioner.prepare(limits)),['session','binding']);if(!prepared)throw null;
+    provisionStarted=true;
+    const provisionAttempt=async body=>{try{return await body();}catch(error){if(!provisionDiagnosticFinalized)provisionDiagnostic??=formatManualPaymentProvisionDiagnostic(error);throw null;}};
+    await operation(()=>provisionAttempt(()=>createProvisioner(Object.freeze({env:selected.env,bootstrap,browserOrigin:origin,verifyProviderBinding:cli.validateBinding}))),acquired('provisioner','close',value=>{provisioner=value;}));
+    const prepared=exact(await operation(()=>provisionAttempt(()=>provisioner.prepare(limits))),['session','binding']);if(!prepared)throw null;
+    provisionPrepared=true;
     await requireTrue(()=>cli.bindManualPayment(prepared.binding,limits),'children');
     phase='HANDOFF';gatewayAttempted=true;
     const createGateway=deps.createGateway??(await import('./stripe-manual-payment-gateway.mjs')).createManualPaymentGateway;
@@ -131,6 +136,12 @@ export async function runManualPayment(options,originalLimits,deps={}){
       const diagnosticDeadline=Math.min(cleanup.deadline,now()+1000);
       try{if(now()>=diagnosticDeadline)throw null;await bounded(Promise.resolve().then(()=>{if(now()>=diagnosticDeadline)throw null;return deps.writeAuthDiagnostic(authDiagnostic);}),diagnosticDeadline);}catch{failed=true;}
     }
+    if(provisionStarted&&!provisionPrepared)provisionDiagnostic??=formatManualPaymentProvisionDiagnostic(undefined);
+    provisionDiagnosticFinalized=true;
+    if(provisionDiagnostic&&deps.writeProvisionDiagnostic){
+      const diagnosticDeadline=Math.min(cleanup.deadline,now()+1000);
+      try{if(now()>=diagnosticDeadline)throw null;await bounded(Promise.resolve().then(()=>{if(now()>=diagnosticDeadline)throw null;return deps.writeProvisionDiagnostic(provisionDiagnostic);}),diagnosticDeadline);}catch{failed=true;}
+    }
     clearTimer(timer);input.signal?.removeEventListener('abort',abort);
   }
   if(input.signal?.aborted)failed=true;
@@ -168,7 +179,7 @@ export async function runManualPaymentCli(input,deps={}){
   }finally{unsubscribe?.();}
 }
 export async function runManualPaymentEntry(input,capabilities,deps={}){
-  let code=1;try{const value=await runManualPaymentCli(input,Object.create(deps,{write:{value:stdoutWriter(capabilities.stdout)},...(capabilities.stderr?{writeAuthDiagnostic:{value:stdoutWriter(capabilities.stderr)}}:{})}));code=value.exitCode;}catch{}
+  let code=1;try{const value=await runManualPaymentCli(input,Object.create(deps,{write:{value:stdoutWriter(capabilities.stdout)},...(capabilities.stderr?{writeAuthDiagnostic:{value:stdoutWriter(capabilities.stderr)},writeProvisionDiagnostic:{value:stdoutWriter(capabilities.stderr)}}:{})}));code=value.exitCode;}catch{}
   capabilities.exit(code);
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))void runManualPaymentEntry({env:process.env,args:process.argv.slice(2)},{stdout:process.stdout,stderr:process.stderr,exit:code=>process.exit(code)});

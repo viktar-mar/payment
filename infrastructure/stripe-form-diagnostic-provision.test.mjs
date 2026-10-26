@@ -115,6 +115,37 @@ function paymentFixture(){
  return f;
 }
 async function prepared({threeDSecure=false}={}){assert.equal(typeof diagnosticModule.createManualPaymentProvisioner,'function');const f=paymentFixture();if(threeDSecure)f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';f.p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies);f.limits=LIMIT();f.handoff=await f.p.prepare(f.limits);return f;}
+// Break: leaking dependency errors or losing the actual initial failure boundary.
+for(const stage of ['ADMISSION','OWNERSHIP','PROVIDER_BINDING','ADMIN_CREDENTIALS'])test('manual provision diagnostic brands actual '+stage+' failure',async()=>{
+ const f=paymentFixture(),canary=Error('password=synthetic-private sk_test_canary');
+ if(stage==='ADMISSION')f.options.browserOrigin='https://secret.invalid';
+ if(stage==='OWNERSHIP')f.options.bootstrap.verify=async()=>{throw canary;};
+ if(stage==='PROVIDER_BINDING')f.options.verifyProviderBinding=async()=>{throw canary;};
+ if(stage==='ADMIN_CREDENTIALS')f.options.bootstrap.withAdminCredentials=async()=>{throw canary;};
+ let failure;try{const p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies);await p.prepare(LIMIT());}catch(error){failure=error;}
+ assert.ok(failure);assert.equal(typeof diagnosticModule.formatManualPaymentProvisionDiagnostic,'function');
+ const wire=diagnosticModule.formatManualPaymentProvisionDiagnostic(failure);
+ assert.equal(wire,'{"tag":"stripe_manual_payment_provision_diagnostic","stage":"'+stage+'"}\n');assert.ok(Buffer.byteLength(wire)<=256);
+ assert.equal(f.events.filter(e=>e.type==='http').length,0);
+});
+test('unbranded hostile provision errors are UNKNOWN without any reads',()=>{
+ assert.equal(typeof diagnosticModule.formatManualPaymentProvisionDiagnostic,'function');let reads=0;
+ const trap=()=>{reads++;throw Error('sk_test_canary');},accessor=Object.defineProperties({stage:'OWNERSHIP'},{message:{get:trap},stack:{get:trap},toJSON:{get:trap}});
+ const revoked=Proxy.revocable({},{});revoked.revoke();
+ for(const error of [null,undefined,false,42,1n,Symbol('sk_test_canary'),'password=synthetic-private',Error('sk_test_canary'),accessor,new Proxy({},{get:trap,getPrototypeOf:trap,ownKeys:trap,getOwnPropertyDescriptor:trap}),revoked.proxy]){
+  assert.equal(diagnosticModule.formatManualPaymentProvisionDiagnostic(error),'{"tag":"stripe_manual_payment_provision_diagnostic","stage":"UNKNOWN"}\n');
+ }assert.equal(reads,0);
+});
+test('nonmanual failures cannot impersonate a manual initial boundary',async()=>{
+ let failure;try{await diagnosticModule.createFormDiagnosticProvisioner({env:{}});}catch(error){failure=error;}
+ assert.equal(typeof diagnosticModule.formatManualPaymentProvisionDiagnostic,'function');assert.equal(JSON.parse(diagnosticModule.formatManualPaymentProvisionDiagnostic(failure)).stage,'UNKNOWN');
+});
+for(const threeDSecure of [false,true])test(`manual ${threeDSecure?'selected 3DS':'ordinary'} credentials receive the existing ten-second child`,async()=>{
+ const f=paymentFixture();if(threeDSecure)f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';let child;
+ const credentials=f.options.bootstrap.withAdminCredentials;f.options.bootstrap.withAdminCredentials=(callback,limits)=>{child=limits;return credentials(callback);};
+ f.dependencies.now=()=>1000;const p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies);
+ await p.prepare({deadline:121000});assert.equal(child.deadline,11000);assert.ok(child.signal instanceof AbortSignal);assert.equal(child.signal.aborted,false);
+});
 const writes=f=>f.events.filter(e=>e.type==='http'&&e.method!=='GET').length;
 test('one payment prepares one original Intent and durable permit precedes reply',async()=>{
  const f=await prepared();assert.equal(f.events.filter(e=>e.path?.endsWith('/checkouts')).length,1);

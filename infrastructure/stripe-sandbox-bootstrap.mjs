@@ -171,24 +171,32 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     return frozen(JSON.parse(JSON.stringify({runId,expectedSource,daemon,project,siteKey,ports,cliDirectory:directory+'/cli',endpoints,
       status:pending?'PENDING':status,webhookReady,...(manualPayment?{mode:'MANUAL_PAYMENT',manualPort:options.manualPort}:diagnostic?{mode:'FORM_DIAGNOSTIC'}:{}),...recorded,...(buildDiagnostic?{buildDiagnostic}:{})})));
   }
-  async function operation(phase,limits,body,{cleanup=false,diagnostic=false}={}) {
+  async function operation(phase,limits,body,{cleanup=false,diagnostic=false,adminChild=false}={}) {
     if(terminalBuild&&!diagnostic)throw fixed(phase+'_PENDING');
     if(busy)throw fixed('OPERATION_BUSY');busy=true;
-    const controller=new AbortController();let timer,external,onAbort;
+    const controller=new AbortController();let timer,external,original,onAbort;
     try {
       if(pending&&!cleanup)fail();
+      if(adminChild){
+        if(!object(limits)||![Object.prototype,null].includes(Object.getPrototypeOf(limits)))fail();const fields=Object.getOwnPropertyDescriptors(limits);
+        if(Reflect.ownKeys(fields).some(key=>!['deadline','signal'].includes(key))||!fields.deadline
+          ||!Object.hasOwn(fields.deadline,'value')||(fields.signal&&!Object.hasOwn(fields.signal,'value')))fail();
+        limits={deadline:fields.deadline.value,signal:fields.signal?.value};
+      }
       if(!Number.isSafeInteger(limits?.deadline)||limits.deadline<=io.now()||(limits.signal!==undefined&&!(limits.signal instanceof AbortSignal)))fail();
       if(manualPayment){
         if(manualDeadline===null){if(limits.deadline>io.now()+45*60000)fail();manualDeadline=limits.deadline;}
-        if(cleanup?limits.deadline>manualDeadline+120000:phase==='VERIFY'?limits.deadline>manualDeadline:limits.deadline!==manualDeadline)fail();
+        if(cleanup?limits.deadline>manualDeadline+120000:phase==='VERIFY'||adminChild?limits.deadline>manualDeadline:limits.deadline!==manualDeadline)fail();
       }
       external=limits.signal;onAbort=()=>controller.abort();external?.addEventListener('abort',onAbort,{once:true});if(external?.aborted)controller.abort();
+      // A clipped manual child supplements the captured startup authority.
+      original=adminChild?startup?.signal:undefined;original?.addEventListener('abort',onAbort,{once:true});if(original?.aborted)controller.abort();
       timer=io.setTimeout(onAbort,Math.min(limits.deadline-io.now(),2147483647));
       const context={deadline:limits.deadline,signal:controller.signal,externalSignal:external};check(context);
       const result=await body(context);
       if(!diagnostic||context.buildCompleted!==true)check(context);return result;
     } catch {pending=true;throw fixed(phase+'_PENDING');}
-    finally {io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);busy=false;}
+    finally {io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);original?.removeEventListener('abort',onAbort);busy=false;}
   }
   async function execute(file,args,settings,context) {
     check(context);
@@ -670,10 +678,10 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       if(!live) {await sourceGate(context);if(await io.portAvailable(ports.backend,'127.0.0.1',context)!==true)fail();}return true;}),
     persistWebhookSecret:secret=>operation('PERSIST',startup,context=>persist(secret,context)),
     start:limits=>operation('START',limits,start),verify:limits=>operation('VERIFY',limits,verify),resources,
-    withAdminCredentials:callback=>operation('ADMIN',startup,async context=>{
+    withAdminCredentials:(callback,childLimits=undefined)=>operation('ADMIN',manualPayment&&childLimits!==undefined?childLimits:startup,async context=>{
       if(typeof callback!=='function'||!live||status!=='LIVE')fail();await verify(context);
       if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({username:admin.username,password:admin.password}));}),context)!==true)fail();return true;
-    }),
+    },{adminChild:manualPayment&&childLimits!==undefined}),
     stop:limits=>operation('STOP',limits,stop,{cleanup:true}),
   };
   if(diagnostic) return Object.freeze({prepare:capabilities.prepare,start:capabilities.start,verify:capabilities.verify,resources,
