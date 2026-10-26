@@ -128,6 +128,49 @@ for(const stage of ['ADMISSION','OWNERSHIP','PROVIDER_BINDING','ADMIN_CREDENTIAL
  assert.equal(wire,'{"tag":"stripe_manual_payment_provision_diagnostic","stage":"'+stage+'"}\n');assert.ok(Buffer.byteLength(wire)<=256);
  assert.equal(f.events.filter(e=>e.type==='http').length,0);
 });
+// Break: resetting post-credential metadata to UNKNOWN hides a known preparation boundary.
+for(const threeDSecure of [false,true])for(const [stage,mutationCount,checkoutCount] of [
+ ['PRIVATE_STORAGE',0,0],['ADMIN_SESSION',1,0],['FIXTURE_SETUP',1,0],['CHECKOUT',10,1],['FINAL_BASELINE',10,1],
+])test(`manual ${threeDSecure?'selected 3DS':'ordinary'} provision diagnostic brands actual ${stage} failure without resuming`,async()=>{
+ const f=paymentFixture(),canary=Error('password=synthetic-private sk_test_canary');
+ if(threeDSecure)f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';
+ let injected=0,accountReads=0;
+ if(stage==='PRIVATE_STORAGE')f.dependencies.lstat=async()=>{injected++;throw canary;};
+ else {
+  const fetcher=f.dependencies.fetch;
+  f.dependencies.fetch=async(url,settings)=>{
+   const result=await fetcher(url,settings),path=new URL(url).pathname;
+   if((stage==='ADMIN_SESSION'&&path==='/api/admin/v1/auth/sessions')
+     ||(stage==='FIXTURE_SETUP'&&path==='/api/admin/v1/payment-accounts'&&settings.method==='GET')
+     ||(stage==='CHECKOUT'&&path.endsWith('/checkouts'))
+     ||(stage==='FINAL_BASELINE'&&path==='/api/admin/v1/payment-accounts'&&settings.method==='GET'&&++accountReads===2)){
+    injected++;throw canary;
+   }
+   return result;
+  };
+ }
+ const p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies),limits=LIMIT();
+ let failure;try{await p.prepare(limits);}catch(error){failure=error;}
+ assert.ok(failure);assert.equal(failure.message,'stripe_form_diagnostic_provision_PROVISION_PENDING');assert.equal(injected,1);
+ const wire=diagnosticModule.formatManualPaymentProvisionDiagnostic(failure);
+ assert.equal(wire,'{"tag":"stripe_manual_payment_provision_diagnostic","stage":"'+stage+'"}\n');assert.ok(Buffer.byteLength(wire)<=256);
+ assert.equal(f.events.filter(e=>e.type==='credentials').length,1);
+ assert.equal(f.events.filter(e=>e.type==='http'&&e.method!=='GET').length,mutationCount);
+ assert.equal(f.events.filter(e=>e.path?.endsWith('/checkouts')).length,checkoutCount);
+ const stoppedEvents=[...f.events];await assert.rejects(p.prepare(limits),{message:'stripe_form_diagnostic_provision_PROVISION_PENDING'});
+ assert.deepEqual(f.events,stoppedEvents);assert.equal(injected,1);
+});
+for(const threeDSecure of [false,true])test(`manual ${threeDSecure?'selected 3DS':'ordinary'} post-credential hostile throw uses only module-owned metadata`,async()=>{
+ const f=paymentFixture();if(threeDSecure)f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';let reads=0;
+ const trap=()=>{reads++;throw Error('password=synthetic-private sk_test_canary');};
+ const hostile=new Proxy({},{get:trap,getPrototypeOf:trap,ownKeys:trap,getOwnPropertyDescriptor:trap});
+ f.dependencies.lstat=async()=>{throw hostile;};
+ const p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies);let failure;
+ try{await p.prepare(LIMIT());}catch(error){failure=error;}
+ assert.ok(failure);assert.equal(f.events.filter(e=>e.type==='credentials').length,1);
+ assert.equal(diagnosticModule.formatManualPaymentProvisionDiagnostic(failure),'{"tag":"stripe_manual_payment_provision_diagnostic","stage":"PRIVATE_STORAGE"}\n');
+ assert.equal(reads,0);assert.equal(f.events.filter(e=>e.type==='http').length,0);
+});
 test('unbranded hostile provision errors are UNKNOWN without any reads',()=>{
  assert.equal(typeof diagnosticModule.formatManualPaymentProvisionDiagnostic,'function');let reads=0;
  const trap=()=>{reads++;throw Error('sk_test_canary');},accessor=Object.defineProperties({stage:'OWNERSHIP'},{message:{get:trap},stack:{get:trap},toJSON:{get:trap}});

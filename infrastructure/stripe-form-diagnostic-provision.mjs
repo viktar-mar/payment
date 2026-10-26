@@ -14,7 +14,7 @@ const EXHAUSTED=new Set(['2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-4
 const ERRORS=new Set(['OPT_IN_REQUIRED','INPUTS_CONFIGURATION','OPERATION_BUSY','PROVISION_PENDING','HANDOFF_PENDING']);
 const fixed=code=>new Error('stripe_form_diagnostic_provision_'+(ERRORS.has(code)?code:'INPUTS_CONFIGURATION'));
 const provisionDiagnostics=new WeakMap();
-/** Fixed initial-boundary metadata only; dependency errors are never inspected. */
+/** Fixed preparation-boundary metadata only; dependency errors are never inspected. */
 export function formatManualPaymentProvisionDiagnostic(error){
   return JSON.stringify({tag:'stripe_manual_payment_provision_diagnostic',stage:provisionDiagnostics.get(error)??'UNKNOWN'})+'\n';
 }
@@ -278,12 +278,14 @@ async function createProvisioner(options,dependencies,manual) {
         paymentSnapshot();return payment?adminCredentials(capture,operation):adminCredentials(capture);
       })!==true||!admin)fail();
     });
-    if(initial)initial.stage='UNKNOWN';
+    if(initial)initial.stage='PRIVATE_STORAGE';
     await directoryProof(context);await absent(ledgerPath,context);await absent(lockPath,context);
     lock=await exclusive(lockPath,JSON.stringify({runId:topology.runId})+'\n',context,true);status='PROVISIONING';await save(context);
+    if(initial)initial.stage='ADMIN_SESSION';
     await dispatch('admin-session',stable('admin-session'),context);
     const login=await request('/api/admin/v1/auth/sessions',context,{method:'POST',body:admin,expected:204,login:true});captureCookies(login.cookies);
     await acknowledge(undefined,context);
+    if(initial)initial.stage='FIXTURE_SETUP';
     const accounts=await read('/api/admin/v1/payment-accounts',context),sites=await read('/api/admin/v1/sites',context);
     if(!Array.isArray(accounts)||accounts.length||!Array.isArray(sites)||sites.length)fail();
     const createdAccount=await mutation('account',keys.account,'/api/admin/v1/payment-accounts',context,{method:'POST',expected:201,
@@ -319,9 +321,11 @@ async function createProvisioner(options,dependencies,manual) {
       },v=>({siteId:v.site_id,secretVersion:1}));
       await mutation('receiver',stable('receiver'),'/configure',context,{method:'POST',expected:204,receiver:true,body:{secret:callback.secret,secret_version:1}},v=>{if(v!==null)fail();},()=>({secretVersion:1}));
     }
+    if(initial)initial.stage='CHECKOUT';
     checkout=await mutation('checkout',stable('checkout'),'/api/v1/public/sites/'+site.key+'/checkouts',context,
       {method:'POST',expected:201,key:stable('checkout'),body:{price_key:price.key}},checkoutProof,v=>({checkoutId:v.checkout_id,paymentId:v.payment_id}));
     cases.form={checkoutId:checkout.checkout_id,paymentId:checkout.payment_id};
+    if(initial)initial.stage='FINAL_BASELINE';
     const finalAccounts=await read('/api/admin/v1/payment-accounts',context),finalSites=await read('/api/admin/v1/sites',context);
     if(!Array.isArray(finalAccounts)||finalAccounts.length!==1||!Array.isArray(finalSites)||finalSites.length!==1)fail();accountProof(finalAccounts[0]);siteProof(finalSites[0]);
     await catalogProof(context);await bounded(context,ownership);
