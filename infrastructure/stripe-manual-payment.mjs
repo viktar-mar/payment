@@ -32,7 +32,7 @@ export async function runManualPayment(options,originalLimits,deps={}){
   let authDiagnostic,authDiagnosticFinalized=false;
   let provisionDiagnostic,provisionDiagnosticFinalized=false,provisionStarted=false,provisionPrepared=false;
   const threeDSecure=selected.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS==='true';
-  const proof={...EMPTY,...(threeDSecure?{mode:'MANUAL_3DS',three_ds_verified:false}:{})},work=new Set(),runtimeWork=new Set(),childWork=new Set(),closeTasks=new Map();let runtimeStopReleased=false;
+  const proof={...EMPTY,...(threeDSecure?{mode:'MANUAL_3DS',three_ds_verified:false}:{})},work=new Set(),runtimeWork=new Set(),childWork=new Set(),closeTasks=new Map();let runtimeStopReleased=false,runtimeStopClosedAt;
   function active(){return !lifetime.signal.aborted&&!input.signal?.aborted&&now()<limits.deadline;}
   function check(){if(failed||closing||!active())throw null;}
   function bounded(promise,deadline,signal){return new Promise((accept,reject)=>{let done=false,timer;const finish=(ok,value)=>{if(done)return;done=true;clearTimer(timer);signal?.removeEventListener('abort',abort);ok?accept(value):reject();};const abort=()=>finish(false);
@@ -45,7 +45,7 @@ export async function runManualPayment(options,originalLimits,deps={}){
     if(!value)return null;if(closeTasks.has(kind))return closeTasks.get(kind);
     // Late acquisitions remain owned under the original cleanup ceiling. They
     // cannot improve the already frozen report or renew financial authority.
-    const p=start(()=>value[method](cleanup));closeTasks.set(kind,p);p.catch(()=>{failed=true;});return p;
+    const p=start(()=>value[method](cleanup),kind==='bootstrap'?ok=>{if(ok===true)runtimeStopClosedAt=now();}:undefined);closeTasks.set(kind,p);p.catch(()=>{failed=true;});return p;
   }
   function acquired(kind,method,set){return value=>{set(value);if(closing&&(kind!=='bootstrap'||runtimeStopReleased&&runtimeWork.size===0))close(kind,value,method)?.catch(()=>{});};}
   async function cleanupOne(kind,value,method,field){
@@ -145,6 +145,9 @@ export async function runManualPayment(options,originalLimits,deps={}){
     clearTimer(timer);input.signal?.removeEventListener('abort',abort);
   }
   if(input.signal?.aborted)failed=true;
+  // The cached stop may finish during the existing final drain after its close
+  // slice expired. Only its own timely true settlement proves runtime closure.
+  if(runtimeStopClosedAt<cleanup.deadline)proof.runtime_closed=true;
   const closed=proof.gateway_closed&&proof.listener_closed&&proof.runtime_closed;
   const result=!failed&&closed?(granted?'SUCCEEDED':unused?'NOT_STARTED':'PENDING'):'PENDING';
   const report=validateManualPaymentReport({...proof,result,phase:result==='SUCCEEDED'?'SUCCEEDED':failed?phase:'VERIFY'})??EMPTY;

@@ -239,6 +239,63 @@ test('failed listener stop preserves independent runtime stop proof and exact ta
   assert.equal(value.exitCode,1);assert.equal(value.report.listener_closed,false);assert.equal(value.report.runtime_closed,true);
   assert.ok(f.calls.indexOf('stopListener')<f.calls.indexOf('stop'));assert.equal(f.calls.filter(x=>x==='stop').length,1);
 });
+// Break: discarding the cached stop's direct true settlement after its first
+// slice, accepting non-true/late evidence, or promoting the latched failure.
+for(const threeDSecure of [false,true])for(const scenario of [
+  {name:'true during final drain',at:32000,value:true,closed:true},
+  {name:'true just before ceiling',at:2820999,value:true,closed:true},
+  {name:'false',at:32000,value:false,closed:false},
+  {name:'non-literal true',at:32000,value:{closed:true},closed:false},
+  {name:'rejection',at:32000,reject:true,closed:false},
+  {name:'true exactly at ceiling',at:2821000,value:true,closed:false},
+  {name:'true after ceiling',at:2821001,value:true,closed:false},
+  {name:'never settled',closed:false},
+  {name:'true after report',postReport:true,closed:false},
+])test('cached runtime stop '+scenario.name+' preserves pending '+(threeDSecure?'3DS':'ordinary')+' report',async()=>{
+  const f=fixture({fail:'provision'}),pending=defer(),stops=[];
+  f.bootstrap.stop=function(limits){stops.push({target:this,limits,at:f.clock.value});f.calls.push('stop');return pending.promise;};
+  const selected=threeDSecure?{...options,env:{...options.env,PAYMENT_STRIPE_SANDBOX_MANUAL_3DS:'true'}}:options;
+  let settled=false;
+  const task=runManualPayment(selected,f.limits,f.deps).then(value=>{settled=true;return value;});
+  await f.tick(1000);
+  assert.equal(stops.length,1);assert.equal(stops[0].target,f.bootstrap);assert.equal(stops[0].at,1000);
+  assert.deepEqual(stops[0].limits,{deadline:2821000});assert.equal(Object.isFrozen(stops[0].limits),true);
+  assert.equal([...f.timers.values()].some(timer=>timer.at===31000),true);
+  await f.tick(31000);assert.equal(settled,false);
+  assert.equal([...f.timers.values()].some(timer=>timer.at===31000),false);
+  if(scenario.at!==undefined){
+    f.clock.value=scenario.at;
+    if(scenario.reject)pending.reject(Error('synthetic stop failure'));else pending.resolve(scenario.value);
+    await f.tick(scenario.at);
+  }else await f.tick(2821000);
+  const value=await task,wire=JSON.stringify(value.report);
+  assert.equal(value.report.runtime_closed,scenario.closed);
+  assert.equal(value.report.result,'PENDING');assert.equal(value.report.phase,'PROVISION');assert.equal(value.exitCode,1);
+  assert.equal(value.report.mode,threeDSecure?'MANUAL_3DS':'MANUAL_PAYMENT');
+  for(const key of ['confirmation_granted','payment_confirmed','provider_confirmed','webhook_verified','journal_verified','callback_verified'])assert.equal(value.report[key],false,key);
+  assert.equal(value.report.gateway_closed,true);assert.equal(value.report.listener_closed,true);
+  if(threeDSecure)assert.equal(value.report.three_ds_verified,false);
+  assert.deepEqual(f.calls,['preflight','bootstrap','prepare','cli','auth','binding','listener','start','verify','provisioner','provision','closeProvisioner','stopListener','stop']);
+  assert.equal(stops.length,1);assert.equal(f.financialRetries,0);assert.equal(f.limits.deadline,2701000);assert.equal(f.timers.size,0);
+  assert.equal(Object.isFrozen(value),true);assert.equal(Object.isFrozen(value.report),true);
+  if(scenario.postReport){pending.resolve(true);await f.tick(2821001);}
+  assert.equal(JSON.stringify(value.report),wire);assert.equal(stops.length,1);
+});
+for(const threeDSecure of [false,true])test('successful financial proof cannot erase a stop slice timeout '+(threeDSecure?'3DS':'ordinary'),async()=>{
+  const f=fixture(),pending=defer(),stops=[];
+  if(threeDSecure)f.cli.inspectManualPayment=async()=>{f.calls.push('provider');return {captured:true,eventVerified:true,threeDSecureAuthenticated:true};};
+  f.bootstrap.stop=function(limits){stops.push({target:this,limits,at:f.clock.value});f.calls.push('stop');return pending.promise;};
+  const selected=threeDSecure?{...options,env:{...options.env,PAYMENT_STRIPE_SANDBOX_MANUAL_3DS:'true'}}:options;
+  const task=runManualPayment(selected,f.limits,f.deps);await f.tick(1000);await f.tick(31000);
+  pending.resolve(true);await f.tick(32000);const value=await task;
+  assert.equal(value.report.runtime_closed,true);assert.equal(value.report.gateway_closed,true);assert.equal(value.report.listener_closed,true);
+  assert.equal(value.report.result,'PENDING');assert.equal(value.report.phase,'VERIFY');assert.equal(value.exitCode,1);
+  for(const key of ['confirmation_granted','payment_confirmed','provider_confirmed','webhook_verified','journal_verified','callback_verified'])assert.equal(value.report[key],true,key);
+  if(threeDSecure)assert.equal(value.report.three_ds_verified,true);
+  assert.equal(f.calls.filter(name=>name==='durablePermit').length,1);assert.equal(f.calls.filter(name=>name==='provider').length,1);
+  assert.equal(stops.length,1);assert.equal(stops[0].target,f.bootstrap);assert.equal(stops[0].at,1000);assert.deepEqual(stops[0].limits,{deadline:2821000});
+  assert.equal(f.financialRetries,0);assert.equal(f.timers.size,0);
+});
 test('aborted authorization child work receives original close grace before runtime stop',async()=>{
   const f=fixture(),pending=defer(),controller=new AbortController();f.limits.signal=controller.signal;f.deps.authorizeCli=()=>pending.promise;
   const task=runManualPayment(options,f.limits,f.deps);await f.tick(1000);controller.abort();await f.tick(1001);assert.ok(!f.calls.includes('stop'));
@@ -292,7 +349,9 @@ for(const mode of ['reject','stall','ceiling'])test('diagnostic writer '+mode+' 
   f.deps.writeAuthDiagnostic=line=>{diagnostics.push(line);if(mode==='reject')throw null;return new Promise(()=>{});};
   let settled=false;const task=runManualPaymentCli(cliInput(),f.deps).then(value=>{settled=true;return value;});await f.tick(1000);
   assert.equal(diagnostics.length,1);if(mode!=='reject'){assert.equal(settled,false);await f.tick(mode==='ceiling'?2821000:2000);}
-  const value=await task;assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(value.report.listener_closed,false);assert.equal(value.report.runtime_closed,mode!=='ceiling');assert.equal(writes.filter(line=>line.startsWith('{')).length,1);assert.ok(!f.calls.includes('binding'));assert.ok(!f.calls.includes('provision'));assert.equal(f.timers.size,0);
+  // Even the ceiling case directly observes stop=true at2820500, before the
+  // original2821000 ceiling; the missed slice/diagnostic timeout stays failed.
+  const value=await task;assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(value.report.listener_closed,false);assert.equal(value.report.runtime_closed,true);assert.equal(writes.filter(line=>line.startsWith('{')).length,1);assert.ok(!f.calls.includes('binding'));assert.ok(!f.calls.includes('provision'));assert.equal(f.timers.size,0);
 });
 for(const mode of ['reject','stall'])test('entry stderr '+mode+' cannot prevent sole final stdout attempt',async()=>{
   const f=fixture(),out=[];actualAuth(f,{completion:'password=synthetic-private'});f.deps.subscribe=()=>()=>{};let writes=0,code;
