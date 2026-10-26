@@ -65,8 +65,11 @@ export async function runSandboxCard(browser:Browser,fixture:SandboxFixture,name
       await step('RETRY_PAY',()=>widget.getByRole('button',{name:'Pay',exact:true}).click({timeout:15000}));
     }
     if(name==='sca') {
-      // Third-party selectors may change: timeout is a manual-check failure, never replaced by a mock.
-      await step('SCA_COMPLETE',()=>page.frameLocator('iframe[name="stripe-challenge-frame"]').frameLocator('iframe[name="acsFrame"]')
+      // Stripe's private lightbox owns the issuer frame; it is not a page-level
+      // child. Restrict the wrapper to the official 3DS app, not other Elements.
+      // Third-party markup drift remains a manual-check failure, never a mock.
+      await step('SCA_COMPLETE',()=>page.frameLocator('iframe[name^="__privateStripeFrame"][src^="https://js.stripe.com/v3/three-ds-2-challenge-"]')
+        .frameLocator('iframe[name="stripe-challenge-frame"]').frameLocator('iframe[name="acsFrame"]')
         .getByRole('button',{name:'Complete',exact:true}).click({timeout:20000}));
     }
     await step('SERVER_CONFIRM',()=>fixture.confirm(name));

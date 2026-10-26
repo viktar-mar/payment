@@ -5,7 +5,10 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {build} from 'vite';
-import {chromium} from '@playwright/test';
+import {chromium,type Browser} from '@playwright/test';
+import type {SandboxFixture} from './stripe-sandbox-fixtures';
+// @ts-expect-error Native Node type erasure requires the source extension.
+import {runSandboxCard} from './stripe-sandbox-fixtures.ts';
 
 // DOM compatibility only. No Stripe service, Sandbox, card fields or financial
 // confirmation are exercised. Every HTTP and WebSocket boundary is intercepted.
@@ -122,4 +125,54 @@ test('native Chromium projects real Catalog/Donation provider mounts and retires
     assert.equal(denied,0,'no unexpected HTTP boundary');assert.equal(sockets,0,'no WebSocket boundary');
     await context.close();
   }finally{await browser?.close();await rm(directory,{recursive:true,force:true});}
+});
+
+// Break: looking for the issuer frame at page level skips Stripe's private
+// lightbox wrapper. Exercise the actual driver and frame traversal, not a mock
+// that accepts any frameLocator chain. All documents below are artificial.
+test('native Chromium completes nested SCA without selecting unrelated private frames',async()=>{
+  const origin='http://127.0.0.1:14177';
+  const outer='https://js.stripe.com/v3/three-ds-2-challenge-synthetic.html';
+  const documents=new Map<string,string>([
+    [origin+'/',`<!doctype html><generic-payment-widget><button>Resume existing payment</button><iframe title="Secure payment input frame" src="${origin}/card"></iframe><button aria-label="Pay" id="pay">Pay</button></generic-payment-widget>
+      <iframe name="__privateStripeFrameUnrelated" src="${origin}/decoy"></iframe>
+      <script>document.querySelector('#pay').onclick=()=>{const frame=document.createElement('iframe');frame.name='__privateStripeFrameSynthetic';frame.src='${outer}';document.body.append(frame);};
+      window.addEventListener('message',event=>{if(event.origin==='${origin}'&&event.data==='synthetic-sca-complete')document.body.dataset.scaComplete='yes';});</script>`],
+    [origin+'/card','<!doctype html><input name="number"><input name="expiry"><input name="cvc">'],
+    [origin+'/decoy','<!doctype html><button>Complete</button>'],
+    [outer,`<!doctype html><iframe id="challengeFrame" name="stripe-challenge-frame" title="3DS Challenge" src="${origin}/issuer"></iframe>`],
+    [origin+'/issuer',`<!doctype html><iframe name="acsFrame" src="${origin}/acs"></iframe>`],
+    [origin+'/acs',`<!doctype html><button id="complete">Complete</button><script>document.querySelector('#complete').onclick=()=>window.top.postMessage('synthetic-sca-complete','${origin}');</script>`],
+  ]);
+  const requests:string[]=[],actions:string[]=[];let denied=0,sockets=0,confirmed=false;
+  const browser=await chromium.launch({headless:true,args:['--disable-background-networking','--disable-component-update','--no-first-run']});
+  try{
+    const isolated={newContext:async(options:Parameters<Browser['newContext']>[0])=>{
+      const context=await browser.newContext({...options,acceptDownloads:false});
+      await context.routeWebSocket('**/*',socket=>{sockets++;socket.close();});
+      await context.route('**/*',async route=>{
+        const request=route.request(),url=new URL(request.url());
+        const document=url.origin===origin&&url.pathname==='/'?origin+'/':url.href,body=documents.get(document);
+        if(request.method()==='GET'&&body!==undefined){requests.push(document);return route.fulfill({contentType:'text/html',body});}
+        denied++;await route.abort('blockedbyclient');
+      });
+      return context;
+    }} as Browser;
+    const fixture={identity:{endpoints:{backend:origin,demo:origin},site:{key:'synthetic-site'},price:{key:'synthetic-price'}},
+      beginBrowser:async(name:string)=>{actions.push('begin:'+name);return true;},
+      browserSession:async()=>({apiBaseUrl:origin,siteKey:'synthetic-site',priceKey:'synthetic-price'}),
+      markPay:async(name:string)=>{actions.push('pay:'+name);},
+      confirm:async(name:string)=>{
+        const page=browser.contexts()[0]!.pages()[0]!;
+        await page.waitForFunction(()=>document.body.dataset.scaComplete==='yes',undefined,{timeout:1000});
+        actions.push('confirm:'+name);confirmed=true;
+      }} as unknown as SandboxFixture;
+    let completed=false;
+    try{await runSandboxCard(isolated,fixture,'sca');completed=true;}catch{/* No raw browser failure or frame URL is reported. */}
+    assert.deepEqual(actions.slice(0,2),['begin:sca','pay:sca'],'reach the real SCA boundary before testing its traversal');
+    assert.equal(completed,true,'the actual driver must cross the private wrapper before server confirmation');
+    assert.equal(confirmed,true);assert.deepEqual(actions,['begin:sca','pay:sca','confirm:sca']);
+    assert.deepEqual(requests.sort(),[origin+'/',origin+'/card',origin+'/decoy',outer,origin+'/issuer',origin+'/acs'].sort());
+    assert.equal(denied,0);assert.equal(sockets,0);assert.equal(browser.contexts().length,0);
+  }finally{await browser.close();}
 });

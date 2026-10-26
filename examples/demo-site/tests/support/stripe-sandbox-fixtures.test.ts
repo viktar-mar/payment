@@ -22,7 +22,8 @@ function cardBoundary(begin=true,postalVisible=true,onWait?:(kind:'form'|'frame'
   const frame={locator:(selector:string)=>({waitFor:async(...args:unknown[])=>{add('field-wait',selector,...args);await onWait?.('number');},fill:async(...args:unknown[])=>add('fill',selector,...args),isVisible:async()=>{add('visible',selector);return postalVisible;}})};
   const widget={first(){add('first');return this;},evaluate:async(body:unknown,arg:unknown,options:unknown)=>{if(!observe)throw null;return observe(body,arg,options);},locator:(selector:string)=>({waitFor:async(...args:unknown[])=>{add('widget-wait',selector,...args);await onWait?.(selector.startsWith('button')?'form':'frame');}}),getByRole:(...args:unknown[])=>({click:async(...options:unknown[])=>add('click',...args,...options)}),frameLocator:(...args:unknown[])=>{add('frame',...args);return frame;}};
   const challenge={frameLocator:(...args:unknown[])=>{add('challenge-frame',...args);return {getByRole:(...role:unknown[])=>({click:async(...options:unknown[])=>add('complete',...role,...options)})};}};
-  const page={goto:async(...args:unknown[])=>add('goto',...args),locator:(...args:unknown[])=>{add('widget',...args);return widget;},frameLocator:(...args:unknown[])=>{add('challenge',...args);return challenge;}};
+  const lightbox={frameLocator:(...args:unknown[])=>{add('challenge-container',...args);return challenge;}};
+  const page={goto:async(...args:unknown[])=>add('goto',...args),locator:(...args:unknown[])=>{add('widget',...args);return widget;},frameLocator:(...args:unknown[])=>{add('challenge',...args);return lightbox;}};
   const context={addInitScript:async(body:unknown,argument:unknown)=>{assert.equal(typeof body,'function');add('install',argument);},newPage:async()=>{add('new-page');return page;},close:async()=>add('close')};
   const browser={newContext:async(...args:unknown[])=>{add('new-context',...args);return context;}} as unknown as Browser;
   const fixture={identity,beginBrowser:async(...args:unknown[])=>{add('begin',...args);return begin;},browserSession:async(...args:unknown[])=>{add('checkout',...args);return record;},markPay:async(...args:unknown[])=>add('mark',...args),confirm:async(...args:unknown[])=>add('confirm',...args)} as unknown as SandboxFixture;
@@ -83,7 +84,7 @@ for(const name of ['success','decline','sca'] as const)test(`real ${name} driver
     ['widget','generic-payment-widget'],['first'],['click','button',{name:'Resume existing payment',exact:true},{timeout:15000}],['frame','iframe[title="Secure payment input frame"]'],
     ...card(name==='decline'?'4000000000000002':name==='sca'?'4000002500003155':'4242424242424242'),['mark',name],['click','button',{name:'Pay',exact:true},{timeout:15000}],
     ...(name==='decline'?[['mark','decline',true],...card('4242424242424242'),['click','button',{name:'Pay',exact:true},{timeout:15000}]]:[]),
-    ...(name==='sca'?[['challenge','iframe[name="stripe-challenge-frame"]'],['challenge-frame','iframe[name="acsFrame"]'],['complete','button',{name:'Complete',exact:true},{timeout:20000}]]:[]),
+    ...(name==='sca'?[['challenge','iframe[name^="__privateStripeFrame"][src^="https://js.stripe.com/v3/three-ds-2-challenge-"]'],['challenge-container','iframe[name="stripe-challenge-frame"]'],['challenge-frame','iframe[name="acsFrame"]'],['complete','button',{name:'Complete',exact:true},{timeout:20000}]]:[]),
     ['confirm',name],['close']]);
 });
 test('beginBrowser false performs no browser acquisition or payment operation for every case',async()=>{
