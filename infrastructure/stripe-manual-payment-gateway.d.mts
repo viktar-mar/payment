@@ -9,7 +9,7 @@ export interface ManualPaymentGatewayDependencies {
   readonly setTimeout?:(callback:()=>void,delay:number)=>unknown;
   readonly clearTimeout?:(handle:unknown)=>void;
 }
-export function createManualPaymentGateway(options:{readonly origin:string;readonly assetEndpoint:string;readonly session:PrivateSession;readonly authorizeConfirmation:()=>Promise<true>},limits:Limits,deps?:ManualPaymentGatewayDependencies):{
+export function createManualPaymentGateway(options:{readonly origin:string;readonly assetEndpoint:string;readonly session:PrivateSession;readonly threeDSecure?:true;readonly authorizeConfirmation:()=>Promise<true>},limits:Limits,deps?:ManualPaymentGatewayDependencies):{
   open():Promise<{readonly url:string}>;
   /** A single durable permission grant is not payment or delivery proof. */
   wait():Promise<{readonly outcome:'CONFIRMATION_GRANTED'|'NOT_STARTED'|'FAILED'}>;

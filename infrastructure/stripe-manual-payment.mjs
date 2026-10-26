@@ -6,7 +6,7 @@ import {formatManualPaymentAuthDiagnostic} from './stripe-manual-payment-auth.mj
 const ROOT=fileURLToPath(new URL('..',import.meta.url)).replace(/\/$/,'');
 const EMPTY=Object.freeze({version:1,mode:'MANUAL_PAYMENT',result:'FAILED',phase:'ADMISSION',confirmation_granted:false,payment_confirmed:false,provider_confirmed:false,webhook_verified:false,journal_verified:false,callback_verified:false,gateway_closed:false,listener_closed:false,runtime_closed:false,browser_closure:'NOT_OWNED',provenance:'CONTROLLER_REPORTED'});
 const rejected=()=>Object.freeze({report:EMPTY,exitCode:1});
-const FLAGS=['PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER','PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND','PAYMENT_STRIPE_SANDBOX_ENABLED','PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS','PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT','PAYMENT_STRIPE_SANDBOX_FULL_RUN','PAYMENT_STRIPE_SANDBOX_OWNED_RUN','PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY','DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE'];
+const FLAGS=['PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND_REMAINDER','PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND','PAYMENT_STRIPE_SANDBOX_ENABLED','PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS','PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT','PAYMENT_STRIPE_SANDBOX_MANUAL_3DS','PAYMENT_STRIPE_SANDBOX_FULL_RUN','PAYMENT_STRIPE_SANDBOX_OWNED_RUN','PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY','DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE'];
 const PORTS=['backend','demo','receiver','postgres','mailpitHttp','mailpitSmtp'];
 function exact(value,keys){
   try{if(!value||typeof value!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(value)))return null;
@@ -29,7 +29,8 @@ export async function runManualPayment(options,originalLimits,deps={}){
   let phase='PREPARE',failed=false,closing=false,grantUsed=false,granted=false,unused=false,authStarted=false,authCompleted=false,bootstrap,cli,provisioner,gateway;
   let gatewayAttempted=false,cliAttempted=false,bootstrapAttempted=false;
   let authDiagnostic,authDiagnosticFinalized=false;
-  const proof={...EMPTY},work=new Set(),runtimeWork=new Set(),childWork=new Set(),closeTasks=new Map();let runtimeStopReleased=false;
+  const threeDSecure=selected.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS==='true';
+  const proof={...EMPTY,...(threeDSecure?{mode:'MANUAL_3DS',three_ds_verified:false}:{})},work=new Set(),runtimeWork=new Set(),childWork=new Set(),closeTasks=new Map();let runtimeStopReleased=false;
   function active(){return !lifetime.signal.aborted&&!input.signal?.aborted&&now()<limits.deadline;}
   function check(){if(failed||closing||!active())throw null;}
   function bounded(promise,deadline,signal){return new Promise((accept,reject)=>{let done=false,timer;const finish=(ok,value)=>{if(done)return;done=true;clearTimer(timer);signal?.removeEventListener('abort',abort);ok?accept(value):reject();};const abort=()=>finish(false);
@@ -75,7 +76,7 @@ export async function runManualPayment(options,originalLimits,deps={}){
     await requireTrue(()=>cli.bindManualPayment(prepared.binding,limits),'children');
     phase='HANDOFF';gatewayAttempted=true;
     const createGateway=deps.createGateway??(await import('./stripe-manual-payment-gateway.mjs')).createManualPaymentGateway;
-    await operation(()=>createGateway(Object.freeze({origin,assetEndpoint:'http://127.0.0.1:'+selected.ports.demo,session:prepared.session,authorizeConfirmation:async()=>{
+    await operation(()=>createGateway(Object.freeze({origin,assetEndpoint:'http://127.0.0.1:'+selected.ports.demo,session:prepared.session,...(threeDSecure?{threeDSecure:true}:{}),authorizeConfirmation:async()=>{
       try{
         check();if(grantUsed)throw null;grantUsed=true;
         await requireTrue(()=>cli.verifyManualPaymentBaseline(limits),'children');check();
@@ -95,8 +96,8 @@ export async function runManualPayment(options,originalLimits,deps={}){
       const server=exact(await operation(()=>provisioner.verifyPayment(limits)),['paymentConfirmed','webhookVerified','journalVerified','callbackVerified','providerEventId']);
       if(!server||['paymentConfirmed','webhookVerified','journalVerified','callbackVerified'].some(key=>server[key]!==true)||typeof server.providerEventId!=='string'||!/^evt_[A-Za-z0-9_]{1,200}$/.test(server.providerEventId))throw null;
       proof.payment_confirmed=true;proof.webhook_verified=true;proof.journal_verified=true;proof.callback_verified=true;
-      const provider=exact(await operation(()=>cli.inspectManualPayment(server.providerEventId,limits),undefined,'children'),['captured','eventVerified']);
-      if(provider?.captured!==true||provider.eventVerified!==true)throw null;proof.provider_confirmed=true;
+      const provider=exact(await operation(()=>cli.inspectManualPayment(server.providerEventId,limits),undefined,'children'),['captured','eventVerified',...(threeDSecure?['threeDSecureAuthenticated']:[])]);
+      if(provider?.captured!==true||provider.eventVerified!==true||threeDSecure&&provider.threeDSecureAuthenticated!==true)throw null;proof.provider_confirmed=true;if(threeDSecure)proof.three_ds_verified=true;
     }else{
       if(grantUsed)throw null;await requireTrue(()=>provisioner.verifyUnused(limits));await requireTrue(()=>cli.inspectUnusedManualPayment(limits),'children');unused=true;
     }

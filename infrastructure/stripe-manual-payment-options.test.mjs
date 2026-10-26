@@ -33,3 +33,22 @@ test('only exact exclusive flags admit payment',()=>{
   for(const key of ['PAYMENT_STRIPE_SANDBOX_FULL_RUN','PAYMENT_STRIPE_SANDBOX_OWNED_RUN','PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC','PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY','DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE'])assert.equal(options.manualPaymentOptIn({...env,[key]:'true'}),false);
   const hostile={...env};let touched=0;Object.defineProperty(hostile,'DEBUG',{get(){touched++;throw null;}});assert.equal(options.manualPaymentOptIn(hostile),false);assert.equal(touched,0);
 });
+// Break: silently discarding 3DS selection or accepting hostile mode values.
+test('manual 3DS preserves only exact selected authority and rejects invalid data without getters',()=>{
+  const key='PAYMENT_STRIPE_SANDBOX_MANUAL_3DS';
+  for(const mode of [undefined,'','false','true']){
+    const input=value();if(mode!==undefined)input.env[key]=mode;
+    const selected=options.validateManualPaymentOptions(input);assert.ok(selected);
+    assert.deepEqual(selected.env,mode==='true'?{...env,[key]:'true'}:env);
+  }
+});
+test('3DS admission rejects malformed flags and missing manual opt-ins without property reads',()=>{
+  const key='PAYMENT_STRIPE_SANDBOX_MANUAL_3DS';
+  for(const mode of ['TRUE',true,false,null,0,{},' true','true '])assert.equal(options.manualPaymentOptIn({...env,[key]:mode}),false);
+  for(const required of Object.keys(env))for(const mode of [undefined,'','false','TRUE',true])assert.equal(options.manualPaymentOptIn({...env,[key]:'true',[required]:mode}),false);
+  let reads=0;
+  for(const descriptor of [{enumerable:true,get(){reads++;throw null;}},{enumerable:false,value:'true'}]){
+    const hostile={...env};Object.defineProperty(hostile,key,descriptor);assert.equal(options.manualPaymentOptIn(hostile),false);assert.equal(options.validateManualPaymentOptions({...value(),env:hostile}),null);
+  }
+  assert.equal(reads,0);
+});

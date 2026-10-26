@@ -60,9 +60,10 @@ function ownsCookie(raw,expected){
 }
 /** Fixed local handoff. A grant records permission only, never payment success. */
 export function createManualPaymentGateway(options,limits,dependencies={}){
-  let origin,assetEndpoint,session,authorizeConfirmation,deadline,signal,port,expiresAt;
+  let origin,assetEndpoint,session,authorizeConfirmation,threeDSecure,deadline,signal,port,expiresAt;
   try{
-    ({origin,assetEndpoint,session,authorizeConfirmation}=exact(options,['origin','assetEndpoint','session','authorizeConfirmation']));port=endpoint(origin);endpoint(assetEndpoint);session=snapshot(session);
+    const selected=Object.hasOwn(options??{},'threeDSecure');
+    ({origin,assetEndpoint,session,authorizeConfirmation,threeDSecure}=exact(options,['origin','assetEndpoint','session','authorizeConfirmation',...(selected?['threeDSecure']:[])]));if(selected&&threeDSecure!==true)throw failure();port=endpoint(origin);endpoint(assetEndpoint);session=snapshot(session);
     const parsed=JSON.parse(session);expiresAt=Date.parse(parsed.expiresAt);if(origin===assetEndpoint||origin===parsed.apiBaseUrl||assetEndpoint===parsed.apiBaseUrl||typeof authorizeConfirmation!=='function')throw failure();
     const keys=Reflect.ownKeys(Object.getOwnPropertyDescriptors(limits??{}));if(!keys.includes('deadline')||keys.some(key=>!['deadline','signal'].includes(key)))throw failure();({deadline,signal}=exact(limits,keys));
     if(!Number.isSafeInteger(deadline)||deadline<=0||(signal!==undefined&&!(signal instanceof AbortSignal)))throw failure();
@@ -144,7 +145,7 @@ export function createManualPaymentGateway(options,limits,dependencies={}){
         if(sessionUsed){reply(res,410);return;}sessionUsed=true;
         if(io.now()+390000>deadline||io.now()>=expiresAt){stop('NOT_STARTED');reply(res,410);return;}
         cutoff=Math.min(io.now()+300000,expiresAt,deadline-90000);arm();const wire=session;session=null;
-        await emptyBody(req,httpDeadline);if(!check()||io.now()>=httpDeadline){reply(res,410);return;}sessionResponse=res;reply(res,200,wire,'application/json; charset=utf-8');return;
+        await emptyBody(req,httpDeadline);if(!check()||io.now()>=httpDeadline){reply(res,410);return;}sessionResponse=res;if(threeDSecure)res.setHeader('X-Payment-Scenario','3DS');reply(res,200,wire,'application/json; charset=utf-8');return;
       }
       if(!sessionDelivered){reply(res,409);return;}if(permitUsed){reply(res,410);return;}
       // Reserve irreversibly before body await; durable callback commits before reply.

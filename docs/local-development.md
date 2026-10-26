@@ -956,6 +956,20 @@ requires the full five minutes plus 90 seconds to remain. Financial verification
 at most 30 probes in 45 seconds, HTTP requests at most ten seconds, clipped to that
 original active deadline. Waiting, failure and cleanup never renew these windows.
 
+For a future, separately authorized human-operated 3DS experiment, add
+`PAYMENT_STRIPE_SANDBOX_MANUAL_3DS=true` to the same invocation template. It requires
+all three existing opt-ins above; absent, empty or `false` keeps ordinary manual
+payment, and any other value is rejected. This is offline preparation only: no new
+runtime, authorization URL/code, Checkout or payment has been created or authorized
+by these instructions. A new run requires fresh explicit runtime/financial authority
+after the offline gates and review.
+
+The controller selects 3DS through the protected session response's exact
+`X-Payment-Scenario: 3DS` header. There is no browser URL, storage or form selector.
+Before loading, the page gives neutral instructions; after session selection it
+shows the appropriate card. An unexpected present scenario header stops before
+widget/lease mounting with the existing fixed `SESSION_INVALID` code.
+
 After preparation the terminal prints the actual fixed
 `http://127.0.0.1:<GATEWAY_PORT>/manual-payment.html` URL once. Copy and paste that URL
 into an ordinary human-owned Chrome tab. Open it once and click «Загрузить форму»
@@ -967,6 +981,25 @@ Stop and report the observation to the operator. No browser automation, iframe/c
 inspection, screenshots, console/Network/HAR/trace collection or secret screenshots
 are part of this workflow. Close this tab afterwards and report that human observation
 separately; the controller always reports `browser_closure=NOT_OWNED`.
+
+For selected 3DS, follow the page's official test card `4000 0025 0000 3155`, future
+expiry and synthetic three-digit CVC instead. Press Pay once, then promptly complete
+the genuine Stripe challenge yourself. The provider widget stays visible and
+connected while checking, processing or requiring action; the page retires it on a
+terminal result, expiry or close. No challenge click or iframe/card inspection is
+automated. The existing server verification window starts after the one permit and
+still ends within 45 seconds/30 probes. Complete the human challenge within that
+window; the five-minute page allowance does not extend it. A late, failed or unknown
+outcome stays `PENDING` with no retry. Do not press Pay again, reopen, or rerun to
+resolve it; any future attempt needs new explicit authority.
+
+A repeated action-required snapshot can make the SDK show `ready` again. After the
+one Pay this is not another authorization: the selected page keeps the same visible
+provider generation and spent lease, denies any further confirmation, and does not
+restart polling. The server report remains authoritative; close/expiry and terminal
+errors still retire the page. Selected server verification accepts the bound
+action-required journal/callback history without dropping its unique success and
+delivered success-callback requirements.
 
 If the form cannot load, the existing terminal error appends one fixed code:
 `SESSION_HTTP_FORBIDDEN` (session HTTP 403), `SESSION_HTTP_GONE` (410),
@@ -994,6 +1027,16 @@ not happen. Any failed/unknown operation latches `PENDING` and exits 1; later un
 reads or browser messages cannot turn it green. Keep the report and original evidence
 for manual review. Do not issue refunds, cancel, reconcile, create another Checkout,
 or rerun the entry to resolve a pending result.
+
+Ordinary reports retain `mode=MANUAL_PAYMENT`. Only selected 3DS reports use
+`mode=MANUAL_3DS` and add `three_ds_verified`. Their `SUCCEEDED` result requires all
+the same server payment, incoming signed provider event, journal, outbox/callback,
+capture and cleanup proofs, plus `three_ds_verified=true`. That additional proof
+comes from the same captured charge's 3DS result `authenticated`, flow `challenge`
+and a valid `2.x.x` version, read through the existing exact Intent/Event inspection.
+Missing, malformed, frictionless or failed 3DS evidence is unverified and cannot be
+promoted to success. Browser success alone never supplies any of these proofs.
+Stage 5A remains **NOT_ACCEPTED**; this mode does not complete its wider lifecycle.
 
 The controller closes/drains its gateway and provisioner, stops its listener/children,
 then stops only freshly verified owned runtime containers. Containers, networks,

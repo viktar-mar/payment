@@ -36,11 +36,12 @@ export async function createManualPaymentProvisioner(options,dependencies={}) {
 }
 async function createProvisioner(options,dependencies,manual) {
   const payment=manual==='payment';
-  let enabled=false,descriptors;
+  let enabled=false,threeDSecure=false,descriptors;
   try {
     if(manual)descriptors=Object.getOwnPropertyDescriptors(options);
     const env=manual?descriptors.env?.value:options?.env;enabled=payment?manualPaymentOptIn(env):manual?manualFormOptIn(env):formDiagnosticOptIn(env);
-  }catch{}
+    if(enabled&&payment)threeDSecure=Object.getOwnPropertyDescriptor(env,'PAYMENT_STRIPE_SANDBOX_MANUAL_3DS')?.value==='true';
+  }catch{enabled=false;}
   if(!enabled)throw fixed('OPT_IN_REQUIRED');
   let topology,verify,adminCredentials,io,browserOrigin,providerBinding,bootstrap;
   try {
@@ -340,7 +341,7 @@ async function createProvisioner(options,dependencies,manual) {
     if(d.attempts.some(a=>!uuid(a.id)||a.attempt_number!==1||a.status!==(successful?'SUCCEEDED':'REQUIRES_PAYMENT_METHOD')||a.provider_intent_reference!==op.reference
       ||a.payment_method_family!=='CARD'||(!successful&&a.result_code!==null)))fail();
     if(payment&&d.attempts.length){if(paymentAttempt!==null&&d.attempts[0].id!==paymentAttempt)fail();paymentAttempt=d.attempts[0].id;}
-    if(d.events.some(e=>!uuid(e.id)||!(successful?['PAYMENT_CREATED','PAYMENT_METHOD_REQUIRED','ATTEMPT_CREATED','PAYMENT_PROCESSING','PAYMENT_SUCCEEDED']:['PAYMENT_CREATED','PAYMENT_METHOD_REQUIRED','ATTEMPT_CREATED']).includes(e.event_type))
+    if(d.events.some(e=>!uuid(e.id)||!(successful?['PAYMENT_CREATED','PAYMENT_METHOD_REQUIRED','ATTEMPT_CREATED','PAYMENT_PROCESSING','PAYMENT_SUCCEEDED',...(threeDSecure&&permitGranted?['CUSTOMER_ACTION_REQUIRED']:[])]:['PAYMENT_CREATED','PAYMENT_METHOD_REQUIRED','ATTEMPT_CREATED']).includes(e.event_type))
       ||new Set(d.events.map(e=>e.id)).size!==d.events.length
       ||d.events.filter(e=>e.event_type==='PAYMENT_CREATED').length!==1
       ||d.events.filter(e=>e.event_type==='ATTEMPT_CREATED').length!==d.attempts.length)fail();
@@ -349,8 +350,10 @@ async function createProvisioner(options,dependencies,manual) {
   async function paymentProof(context){
     const d=await noConfirmation(context,false,true),success=d.events.filter(e=>e.event_type==='PAYMENT_SUCCEEDED');
     if(success.length!==1)fail();const event=success[0];
-    if(event.source!=='PROVIDER_EVENT'||typeof event.provider_event_id!=='string'||!/^evt_[A-Za-z0-9_]{1,200}$/.test(event.provider_event_id)||event.provider_object_id!==operationProof.reference||event.amount_minor!==2000||event.currency!=='EUR')fail();
-    const callbacks={PAYMENT_PROCESSING:'payment.processing',PAYMENT_SUCCEEDED:'payment.succeeded'};
+    const signed=[event,...d.events.filter(e=>e.event_type==='CUSTOMER_ACTION_REQUIRED')];
+    if(signed.some(e=>e.source!=='PROVIDER_EVENT'||typeof e.provider_event_id!=='string'||!/^evt_[A-Za-z0-9_]{1,200}$/.test(e.provider_event_id)||e.provider_object_id!==operationProof.reference||e.amount_minor!==2000||e.currency!=='EUR')
+      ||new Set(signed.map(e=>e.provider_event_id)).size!==signed.length)fail();
+    const callbacks={PAYMENT_PROCESSING:'payment.processing',PAYMENT_SUCCEEDED:'payment.succeeded',...(threeDSecure&&permitGranted?{CUSTOMER_ACTION_REQUIRED:'payment.requires_action'}:{})};
     if(new Set(d.outbox_events.map(v=>v.id)).size!==d.outbox_events.length||d.outbox_events.some(v=>!d.events.some(e=>e.id===v.id&&callbacks[e.event_type]===v.callback_type)))fail();
     const out=d.outbox_events.filter(v=>v.id===event.id&&v.callback_type==='payment.succeeded');if(out.length!==1)fail();
     if(out[0].status!=='DELIVERED'||!d.deliveries.some(v=>v.outbox_event_id===event.id&&v.status==='SUCCEEDED'&&Number.isInteger(v.http_status)&&v.http_status>=200&&v.http_status<300))return null;

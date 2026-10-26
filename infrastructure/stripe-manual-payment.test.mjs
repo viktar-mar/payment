@@ -183,6 +183,28 @@ test('inert imports neither read private credentials nor launch any subprocess o
   const result=spawnSync(process.execPath,['--input-type=module','-e',script],{cwd:new URL('..',import.meta.url),env:{PATH:'/usr/bin:/bin',LANG:'C',LC_ALL:'C',NO_COLOR:'1'},encoding:'utf8'});assert.equal(result.status,0,result.stderr);assert.equal(result.stdout,'');
 });
 function cliInput(){return {args:[],env:{...options.env,PAYMENT_STRIPE_SANDBOX_RUN_ID:runId,PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE:expectedSource,PAYMENT_STRIPE_SANDBOX_DAEMON:options.daemon,...Object.fromEntries(Object.entries(options.ports).map(([key,value])=>['PAYMENT_STRIPE_SANDBOX_PORT_'+key.toUpperCase(),String(value)])),PAYMENT_STRIPE_SANDBOX_PORT_MANUAL:String(options.manualPort)}};}
+// Break: promoting ordinary provider evidence, omitting old proof/cleanup gates or dropping selection at entry.
+test('selected 3DS controller requires exact provider evidence plus every old server and cleanup proof',async()=>{
+  const selected={...options,env:{...options.env,PAYMENT_STRIPE_SANDBOX_MANUAL_3DS:'true'}};
+  for(const provider of [{captured:true,eventVerified:true},{captured:true,eventVerified:true,threeDSecureAuthenticated:false},{captured:false,eventVerified:true,threeDSecureAuthenticated:true},{captured:true,eventVerified:false,threeDSecureAuthenticated:true},{captured:true,eventVerified:true,threeDSecureAuthenticated:true,extra:true}]){
+    const f=fixture();f.cli.inspectManualPayment=async()=>provider;const result=await runManualPayment(selected,f.limits,f.deps);assert.equal(result.report.mode,'MANUAL_3DS');assert.equal(result.report.result,'PENDING');assert.equal(result.report.three_ds_verified,false);
+  }
+  for(const failed of [undefined,'paymentConfirmed','webhookVerified','journalVerified','callbackVerified','gatewayClosed','listenerClosed','runtimeClosed']){
+    const settings=failed?.endsWith('Closed')?{[failed]:false}:{},f=fixture(settings);f.cli.inspectManualPayment=async()=>({captured:true,eventVerified:true,threeDSecureAuthenticated:true});
+    if(failed&&!failed.endsWith('Closed'))f.provisioner.verifyPayment=async()=>({paymentConfirmed:true,webhookVerified:true,journalVerified:true,callbackVerified:true,providerEventId:'evt_original',[failed]:false});
+    const result=await runManualPayment(selected,f.limits,f.deps);assert.equal(result.report.mode,'MANUAL_3DS');assert.equal(result.report.result,failed?'PENDING':'SUCCEEDED');assert.equal(result.exitCode,failed?1:0);
+    assert.equal(f.argumentsSeen.find(x=>x[0]==='gateway')[1][0].threeDSecure,true);assert.equal(f.argumentsSeen.find(x=>x[0]==='cli')[1][0].env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS,'true');assert.equal(f.timers.size,0);
+  }
+  const ordinary=fixture(),value=await runManualPayment(options,ordinary.limits,ordinary.deps);assert.equal(value.report.result,'SUCCEEDED');assert.equal(Object.hasOwn(value.report,'three_ds_verified'),false);assert.equal(Object.hasOwn(ordinary.argumentsSeen.find(x=>x[0]==='gateway')[1][0],'threeDSecure'),false);
+});
+test('CLI snapshots exact 3DS opt-in and rejects hostile selection before private dependencies',async()=>{
+  const f=fixture();f.cli.inspectManualPayment=async()=>({captured:true,eventVerified:true,threeDSecureAuthenticated:true});f.deps.subscribe=()=>()=>{};
+  const input=cliInput();input.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';const value=await runManualPaymentCli(input,f.deps);assert.equal(value.report.mode,'MANUAL_3DS');assert.equal(value.report.three_ds_verified,true);
+  let reads=0;for(const selection of ['TRUE',true,null,'accessor']){
+    const hostile=cliInput();Object.defineProperty(hostile.env,'PAYMENT_STRIPE_SANDBOX_MANUAL_3DS',selection==='accessor'?{enumerable:true,get(){reads++;throw null;}}:{enumerable:true,value:selection});
+    const denied=()=>{reads++;throw null;};const result=await runManualPaymentCli(hostile,{write:async()=>{},subscribe:()=>()=>{},preflight:denied,createBootstrap:denied,createCli:denied});assert.equal(result.report.phase,'ADMISSION');
+  }assert.equal(reads,0);
+});
 test('signal during stalled final stdout ends its sole output attempt without renewing lifecycle',async()=>{
   const f=fixture();let stop,writes=0,removed=0,settled=false;
   f.deps.subscribe=callback=>{stop=callback;return ()=>removed++;};

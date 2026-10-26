@@ -70,7 +70,13 @@ async function createCliAdapter(options,dependencies,purpose) {
   const descriptor=Object.getOwnPropertyDescriptor(options??{},'env');
   const rawEnv=descriptor?.enumerable&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined;
   if(!remainderMode&&!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
-  let enabled=false,manualPaymentMode=false;
+  let enabled=false,manualPaymentMode=false,threeDSecure=false;
+  try{
+    const key='PAYMENT_STRIPE_SANDBOX_MANUAL_3DS',selected=Object.getOwnPropertyDescriptor(rawEnv??{},key);
+    if(selected&&(!selected.enumerable||!Object.hasOwn(selected,'value'))||!selected&&rawEnv&&key in rawEnv)fail();
+    if(![undefined,'','false','true'].includes(selected?.value))fail();
+    threeDSecure=selected?.value==='true';if(threeDSecure&&(refundMode||!manualPaymentOptIn(rawEnv)))fail();
+  }catch{throw fixed('OPT_IN_REQUIRED');}
   try {const optIn=rawEnv;manualPaymentMode=!refundMode&&optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=remainderMode?manualRefundRemainderOptIn(optIn):refundMode?manualRefundOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
@@ -360,7 +366,11 @@ async function createCliAdapter(options,dependencies,purpose) {
         ||ep.status!=='succeeded'||ep.amount!==2000||ep.amount_received!==2000||ep.currency!=='eur'||ep.latest_charge!==c.id||ep.customer!==null||ep.capture_method!=='automatic'
         ||!Array.isArray(ep.payment_method_types)||ep.payment_method_types.length!==1||ep.payment_method_types[0]!=='card'
         ||ep.metadata?.payment_id!==manual.paymentId||ep.metadata?.site_id!==manual.siteId||ep.metadata?.source!=='CATALOG')fail();
-      return Object.freeze({captured:true,eventVerified:true});
+      if(threeDSecure){
+        const evidence=c.payment_method_details.card?.three_d_secure;
+        if(!object(evidence)||evidence.result!=='authenticated'||evidence.authentication_flow!=='challenge'||typeof evidence.version!=='string'||!/^2\.[0-9]+\.[0-9]+$/.test(evidence.version)||/[\r\n]/.test(evidence.version))fail();
+      }
+      return Object.freeze({captured:true,eventVerified:true,...(threeDSecure?{threeDSecureAuthenticated:true}:{})});
     });
   }
   async function inspectUnusedManualPayment(context){

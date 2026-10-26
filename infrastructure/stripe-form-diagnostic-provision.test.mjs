@@ -114,7 +114,7 @@ function paymentFixture(){
   return fetcher(url,settings);};
  return f;
 }
-async function prepared(){assert.equal(typeof diagnosticModule.createManualPaymentProvisioner,'function');const f=paymentFixture();f.p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies);f.limits=LIMIT();f.handoff=await f.p.prepare(f.limits);return f;}
+async function prepared({threeDSecure=false}={}){assert.equal(typeof diagnosticModule.createManualPaymentProvisioner,'function');const f=paymentFixture();if(threeDSecure)f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';f.p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies);f.limits=LIMIT();f.handoff=await f.p.prepare(f.limits);return f;}
 const writes=f=>f.events.filter(e=>e.type==='http'&&e.method!=='GET').length;
 test('one payment prepares one original Intent and durable permit precedes reply',async()=>{
  const f=await prepared();assert.equal(f.events.filter(e=>e.path?.endsWith('/checkouts')).length,1);
@@ -146,3 +146,67 @@ test('server payment proof polls at most thirty times within a forty-five second
 test('a legitimate processing callback cannot hide the unique joined success callback',async()=>{const f=await prepared();f.attempts=1;await f.p.markConfirmation(f.limits);f.success=true;
  f.mutate=d=>{d.events.splice(-1,0,{id:uuid(69),event_type:'PAYMENT_PROCESSING'});d.outbox_events.unshift({id:uuid(69),callback_type:'payment.processing',status:'DELIVERED'});d.deliveries.unshift({outbox_event_id:uuid(69),status:'SUCCEEDED',http_status:204});};
  f.inspection={count:2,duplicates:1,events:[{event_id:uuid(69),event_type:'payment.processing',count:1},{event_id:uuid(70),event_type:'payment.succeeded',count:2}]};assert.equal((await f.p.verifyPayment(f.limits)).providerEventId,'evt_original');});
+
+// A signed action-required receipt is an intermediate fact, never the final proof.
+function actionHistory(d){
+ d.events.splice(-1,0,{id:uuid(68),event_type:'CUSTOMER_ACTION_REQUIRED',source:'PROVIDER_EVENT',provider_event_id:'evt_action',provider_object_id:'pi_TestOnly',amount_minor:2000,currency:'EUR'});
+ d.outbox_events.unshift({id:uuid(68),callback_type:'payment.requires_action',status:'DELIVERED'});
+ d.deliveries.unshift({outbox_event_id:uuid(68),status:'SUCCEEDED',http_status:204});
+}
+function actionInspection(){return {count:2,duplicates:1,events:[{event_id:uuid(68),event_type:'payment.requires_action',count:1},{event_id:uuid(70),event_type:'payment.succeeded',count:2}]};}
+test('selected 3DS accepts signed action history and joined callbacks before its unique success',async()=>{
+ const f=await prepared({threeDSecure:true});f.attempts=1;await f.p.markConfirmation(f.limits);f.success=true;f.mutate=actionHistory;f.inspection=actionInspection();
+ // Selection is the validated construction-time environment, never a later choice.
+ f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='false';const n=writes(f);
+ assert.deepEqual(await f.p.verifyPayment(f.limits),{paymentConfirmed:true,webhookVerified:true,journalVerified:true,callbackVerified:true,providerEventId:'evt_original'});assert.equal(writes(f),n);
+});
+for(const [name,mutate,inspect] of [
+ ['action reconciliation',d=>d.events.at(-2).source='RECONCILIATION'],
+ ['action missing source',d=>delete d.events.at(-2).source],
+ ['action wrong Intent',d=>d.events.at(-2).provider_object_id='pi_other'],
+ ['action wrong amount',d=>d.events.at(-2).amount_minor=1999],
+ ['action wrong currency',d=>d.events.at(-2).currency='USD'],
+ ['action missing provider event',d=>delete d.events.at(-2).provider_event_id],
+ ['action malformed provider event',d=>d.events.at(-2).provider_event_id='invalid'],
+ ['action reuses final provider event',d=>d.events.at(-2).provider_event_id='evt_original'],
+ ['action malformed journal ID',d=>d.events.at(-2).id='invalid'],
+ ['action duplicate journal ID',d=>d.events.at(-2).id=uuid(70)],
+ ['action duplicate provider event',d=>d.events.splice(-1,0,{...d.events.at(-2),id:uuid(67)})],
+ ['action wrong outbox ID',d=>d.outbox_events[0].id=uuid(67)],
+ ['action wrong callback type',d=>d.outbox_events[0].callback_type='payment.processing'],
+ ['action duplicate outbox ID',d=>d.outbox_events.push({...d.outbox_events[0]})],
+ ['action wrong delivery join',d=>d.deliveries[0].outbox_event_id=uuid(67)],
+ ['action wrong receiver join',()=>{},i=>i.events[0].event_id=uuid(67)],
+ ['action wrong receiver type',()=>{},i=>i.events[0].event_type='payment.processing'],
+ ['action duplicate receiver ID',()=>{},i=>i.events.push({...i.events[0]})],
+ ['missing final success',d=>d.events.pop()],
+ ['duplicate final success',d=>d.events.push({...d.events.at(-1),id:uuid(71)})],
+ ['final reconciliation',d=>d.events.at(-1).source='RECONCILIATION'],
+ ['final wrong Intent',d=>d.events.at(-1).provider_object_id='pi_other'],
+ ['final wrong amount',d=>d.events.at(-1).amount_minor=1999],
+ ['final wrong currency',d=>d.events.at(-1).currency='USD'],
+ ['final missing provider event',d=>delete d.events.at(-1).provider_event_id],
+ ['missing final outbox',d=>{d.outbox_events.pop();d.deliveries=d.deliveries.slice(0,1);}],
+ ['undelivered final outbox',d=>d.outbox_events[1].status='PENDING'],
+ ['missing final HTTP delivery',d=>d.deliveries=d.deliveries.slice(0,1)],
+ ['unsuccessful final HTTP delivery',d=>{for(const v of d.deliveries.slice(1))v.http_status=503;}],
+ ['missing final receiver',()=>{},i=>i.events.pop()],
+])test('selected 3DS action history refuses '+name+' without writes',async()=>{
+ const f=await prepared({threeDSecure:true});f.attempts=1;await f.p.markConfirmation(f.limits);f.success=true;f.fastPoll=true;
+ f.mutate=d=>{actionHistory(d);mutate(d);};f.inspection=actionInspection();inspect?.(f.inspection);const n=writes(f);
+ await assert.rejects(f.p.verifyPayment(f.limits));assert.equal(writes(f),n);
+});
+test('ordinary mode cannot select action history by mutating the environment after construction',async()=>{
+ const f=await prepared();f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';f.attempts=1;await f.p.markConfirmation(f.limits);f.success=true;f.mutate=actionHistory;f.inspection=actionInspection();const n=writes(f);
+ await assert.rejects(f.p.verifyPayment(f.limits));assert.equal(writes(f),n);
+});
+test('failure while snapshotting validated 3DS selection cannot downgrade admission',async()=>{
+ const f=paymentFixture();let selectionReads=0;
+ f.options.env=new Proxy({...paymentEnv,PAYMENT_STRIPE_SANDBOX_MANUAL_3DS:'true'},{getOwnPropertyDescriptor(target,key){if(key==='PAYMENT_STRIPE_SANDBOX_MANUAL_3DS'&&++selectionReads===2)throw null;return Reflect.getOwnPropertyDescriptor(target,key);}});
+ await assert.rejects(diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies),{message:'stripe_form_diagnostic_provision_OPT_IN_REQUIRED'});assert.equal(f.events.length,0);
+});
+for(const threeDSecure of [false,true])for(const operation of ['permit','unused'])test(`${threeDSecure?'selected 3DS':'ordinary'} ${operation} refuses action history before permission`,async()=>{
+ const f=await prepared({threeDSecure});f.attempts=operation==='permit'?1:0;
+ f.mutate=d=>d.events.push({id:uuid(68),event_type:'CUSTOMER_ACTION_REQUIRED',source:'PROVIDER_EVENT',provider_event_id:'evt_action',provider_object_id:'pi_TestOnly',amount_minor:2000,currency:'EUR'});const n=writes(f);
+ await assert.rejects(operation==='permit'?f.p.markConfirmation(f.limits):f.p.verifyUnused(f.limits));assert.equal(writes(f),n);
+});

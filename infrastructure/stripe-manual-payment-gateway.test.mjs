@@ -15,7 +15,7 @@ class Reply extends EventEmitter {
   destroy(){this.destroyed=true;this.emit('close');}
   get text(){return Buffer.concat(this.chunks).toString();}
 }
-function fixture({authorize=async()=>true,fetcher,listenPending=false,closePending=false,deadline=2701000,factory=subject.createManualPaymentGateway}={}){
+function fixture({authorize=async()=>true,fetcher,listenPending=false,closePending=false,deadline=2701000,factory=subject.createManualPaymentGateway,gatewayOptions={}}={}){
   let now=1000,handler,serial=0;const timers=new Map(),calls=[],server=new EventEmitter();
   server.listen=options=>{calls.push(['listen',options]);if(!listenPending)queueMicrotask(()=>server.emit('listening'));};
   server.close=callback=>{server.closedCallback=callback;if(!closePending)queueMicrotask(()=>callback());};
@@ -25,7 +25,7 @@ function fixture({authorize=async()=>true,fetcher,listenPending=false,closePendi
       if(url.endsWith('manifest.json'))return Response.json({'manual-payment.html':{file:'assets/manualPayment-abc.js',isEntry:true,css:['assets/manual-abc.css'],imports:['_shared.js']},'_shared.js':{file:'assets/shared-abc.js'}});
       return new Response(url.endsWith('.html')?'<html>Manual payment</html>':'export default 1',{headers:{'Content-Type':url.endsWith('.html')?'text/html':url.endsWith('.css')?'text/css':'application/javascript'}});}};
   assert.equal(typeof subject.createManualPaymentGateway,'function','manual gateway must exist');
-  const gateway=factory({origin:ORIGIN,assetEndpoint:ASSETS,session:session(),authorizeConfirmation:authorize},{deadline},deps);
+  const gateway=factory({origin:ORIGIN,assetEndpoint:ASSETS,session:session(),authorizeConfirmation:authorize,...gatewayOptions},{deadline},deps);
   const request=(method,path,{headers={},body=method==='POST'?'{}':'',stream,hold=false,rawHeaders}={})=>{
     const req=stream??Readable.from(body?[Buffer.from(body)]:[]);req.method=method;req.url=path;req.headers={host:'127.0.0.1:18083',...headers};req.rawHeaders=rawHeaders??Object.entries(req.headers).flat();
     const res=new Reply();res.hold=hold;handler(req,res);return {req,res};};
@@ -44,6 +44,26 @@ test('one document/session/permit; durable authorization completes before the so
   const second=await f.send('POST','/manual-payment-confirmation',{headers:f.auth(cookie)});assert.equal(second.statusCode,410);
   durable.resolve(true);await turn();const permitReplies=[first.res,second].filter(reply=>reply.statusCode===200&&reply.text==='{"authorized":true}').length;assert.equal(permitReplies,1);
   assert.deepEqual(await f.gateway.wait(),{outcome:'CONFIRMATION_GRANTED'});assert.equal(await f.gateway.close({deadline:f.deadline+120000}),true);
+});
+// Break: trusting request selection, leaking selection beyond the protected exchange or regranting.
+test('3DS scenario is only the selected protected session header with unchanged body and one grant',async()=>{
+  for(const selected of [false,true]){
+    let grants=0;const f=fixture({gatewayOptions:selected?{threeDSecure:true}:{},authorize:async()=>{grants++;return true;}});await f.gateway.open();
+    try{
+      const doc=await f.send('GET','/manual-payment.html');assert.equal(doc.headers['x-payment-scenario'],undefined);const cookie=doc.headers['set-cookie'].split(';')[0];
+      const denied=await f.send('POST','/manual-payment-session',{headers:f.auth('wrong=1')});assert.equal(denied.statusCode,403);assert.equal(denied.headers['x-payment-scenario'],undefined);
+      const query=await f.send('POST','/manual-payment-session?scenario=3DS',{headers:f.auth(cookie)});assert.equal(query.statusCode,404);assert.equal(query.headers['x-payment-scenario'],undefined);
+      const exchange=await f.send('POST','/manual-payment-session',{headers:{...f.auth(cookie),'x-payment-scenario':selected?'ordinary':'3DS'}});assert.equal(exchange.statusCode,200);assert.deepEqual(JSON.parse(exchange.text),session());assert.equal(exchange.headers['x-payment-scenario'],selected?'3DS':undefined);
+      const repeated=await f.send('POST','/manual-payment-session',{headers:f.auth(cookie)});assert.equal(repeated.statusCode,410);assert.equal(repeated.headers['x-payment-scenario'],undefined);
+      for(const path of ['/assets/shared-abc.js','/payment-return.html'])assert.equal((await f.send('GET',path)).headers['x-payment-scenario'],undefined);
+      const permit=await f.send('POST','/manual-payment-confirmation',{headers:f.auth(cookie)});assert.equal(permit.text,'{"authorized":true}');assert.equal(permit.headers['x-payment-scenario'],undefined);assert.equal((await f.send('POST','/manual-payment-confirmation',{headers:f.auth(cookie)})).statusCode,410);assert.equal(grants,1);
+    }finally{assert.equal(await f.gateway.close({deadline:f.deadline+120000}),true);}
+  }
+});
+test('gateway rejects nonliteral or accessor 3DS selection without acquiring IO',()=>{
+  let reads=0;for(const value of [false,'true',undefined,null])assert.throws(()=>fixture({gatewayOptions:{threeDSecure:value}}),/GATEWAY_UNCONFIRMED/);
+  const options={origin:ORIGIN,assetEndpoint:ASSETS,session:session(),authorizeConfirmation:async()=>true};Object.defineProperty(options,'threeDSecure',{enumerable:true,get(){reads++;return true;}});
+  assert.throws(()=>subject.createManualPaymentGateway(options,{deadline:2701000},new Proxy({},{get(){reads++;throw null;}})),/GATEWAY_UNCONFIRMED/);assert.equal(reads,0);
 });
 test('only manifest-owned assets and sanitized fixed return are served, never ordinary recovery',async()=>{
   const f=fixture();await f.gateway.open();const privateQueryCanary='PRIVATE_RETURN_CANARY';
