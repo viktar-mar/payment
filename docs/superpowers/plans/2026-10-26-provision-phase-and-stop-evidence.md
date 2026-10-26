@@ -31,11 +31,11 @@ Historical reports stay immutable; UNKNOWN does not establish a historical root 
 
 **Interfaces:** Existing formatManualPaymentProvisionDiagnostic(error) remains exactly one {tag,stage} line. Existing prepare(limits), session/binding and controller report shapes stay unchanged. Add stages PRIVATE_STORAGE, ADMIN_SESSION, FIXTURE_SETUP, CHECKOUT, FINAL_BASELINE as described in the spec; all original labels/fallback remain.
 
-- [ ] Add table-driven behavioral tests injecting failures into the real provisioner at each of the five boundaries, for ordinary and selected 3DS. Expect the literal corresponding stage, exit/failure and no later provisioning mutation; repeat prepare must not resume or create another checkout. Include a post-credential hostile throw and unchanged unbranded UNKNOWN/redaction coverage.
-- [ ] Run the new tests against unchanged production; record expected UNKNOWN-versus-named-stage failures (RED).
-- [ ] Set markers immediately before directory proof, admin-session dispatch, initial empty baseline, checkout mutation and final baseline respectively. No helper/framework or provisioning behavior changes.
-- [ ] Run provisioner and manual controller tests; record GREEN and self-review. Update runbook/acceptance docs with exact labels, fallback limits and historical uncertainty; no acceptance claim.
-- [ ] Commit only Task 1's exact source/test/doc paths after verification. Independent task reviewer must approve spec and quality before Task 2.
+- [x] Add table-driven behavioral tests injecting failures into the real provisioner at each of the five boundaries, for ordinary and selected 3DS. Expect the literal corresponding stage, exit/failure and no later provisioning mutation; repeat prepare must not resume or create another checkout. Include a post-credential hostile throw and unchanged unbranded UNKNOWN/redaction coverage.
+- [x] Run the new tests against unchanged production; record expected UNKNOWN-versus-named-stage failures (RED).
+- [x] Set markers immediately before directory proof, admin-session dispatch, initial empty baseline, checkout mutation and final baseline respectively. No helper/framework or provisioning behavior changes.
+- [x] Run provisioner and manual controller tests; record GREEN and self-review. Update runbook/acceptance docs with exact labels, fallback limits and historical uncertainty; no acceptance claim.
+- [x] Commit only Task 1's exact source/test/doc paths after verification. Independent task reviewer must approve spec and quality before Task 2.
 
 ### Task 2: Reconcile directly observed stop fulfillment
 
@@ -43,14 +43,14 @@ Historical reports stay immutable; UNKNOWN does not establish a historical root 
 
 **Interfaces:** Existing cached bootstrap.stop(cleanup) returns true only on its own verified closure. Record its literal-true settlement with observation time and reconcile runtime_closed before final report construction iff strictly before original cleanup ceiling. No new calls, waits, status reads, report fields or extensions. Task 1's marker formatter/report contracts are unchanged.
 
-- [ ] Add virtual-time deferred-stop regression: preparation fails; stop starts once at t=1000; its first slice expires at t=31000; literal true settles at t=32000 before ceiling 2821000. Expect runtime_closed=true but result=PENDING/phase=PROVISION/exit1, no gateway/financial continuation or retry. Test ordinary and selected 3DS.
-- [ ] Add negative cases false/rejection, exact-ceiling, after-ceiling, never-settled and post-report late fulfillment; runtime_closed remains false and returned report immutable. Check original stop deadline and once-only stop; preserve existing late-gateway semantics.
-- [ ] Run new tests before implementation and record RED; implement minimal cached-stop settlement evidence and pre-report reconciliation only.
-- [ ] Run manual controller/provisioner/bootstrap tests, record GREEN/self-review and update docs explaining conservative evidence versus persisted STOPPED. No historical report rewriting or live-cause claim.
-- [ ] Commit Task 2's exact paths after verification and obtain independent spec/quality review.
+- [x] Add virtual-time deferred-stop regression: preparation fails; stop starts once at t=1000; its first slice expires at t=31000; literal true settles at t=32000 before ceiling 2821000. Expect runtime_closed=true but result=PENDING/phase=PROVISION/exit1, no gateway/financial continuation or retry. Test ordinary and selected 3DS.
+- [x] Add negative cases false/rejection, exact-ceiling, after-ceiling, never-settled and post-report late fulfillment; runtime_closed remains false and returned report immutable. Check original stop deadline and once-only stop; preserve existing late-gateway semantics.
+- [x] Run new tests before implementation and record RED; implement minimal cached-stop settlement evidence and pre-report reconciliation only.
+- [x] Run manual controller/provisioner/bootstrap tests, record GREEN/self-review and update docs explaining conservative evidence versus persisted STOPPED. No historical report rewriting or live-cause claim.
+- [x] Commit Task 2's exact paths after verification and obtain independent spec/quality review.
 
 ## Final gates
 
-- [ ] Run node --test --test-concurrency=1 --test-timeout=30000 --test-skip-pattern='Docker context excludes|rendered local backend identity|opt-in Compose' infrastructure/*.test.mjs; require exit0 and report actual counters. No recursive recovery tests or real Docker checks.
-- [ ] Fresh independent final review of this request's complete diff from bb78702335e6bc04e02bec543adca1edfdebc25c, requirements and evidence; resolve findings and verify amended tests.
-- [ ] Verify exact changed paths/whitespace, preserve unrelated files and private evidence, report proven corrections versus unproven live cause. No push or Sandbox launch.
+- [x] Run node --test --test-concurrency=1 --test-timeout=30000 --test-skip-pattern='Docker context excludes|rendered local backend identity|opt-in Compose' infrastructure/*.test.mjs; require exit0 and report actual counters. No recursive recovery tests or real Docker checks.
+- [x] Fresh independent final review of this request's complete diff from bb78702335e6bc04e02bec543adca1edfdebc25c, requirements and evidence; resolve findings and verify amended tests.
+- [x] Verify exact changed paths/whitespace, preserve unrelated files and private evidence, report proven corrections versus unproven live cause. No push or Sandbox launch.
