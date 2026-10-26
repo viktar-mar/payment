@@ -286,14 +286,18 @@ async function reportFrames(frames,owned=true,exercisePrivateChannels=false){
 }
 
 const browserSteps=['BEGIN_BROWSER','NEW_CONTEXT','CHECKOUT_SESSION','INSTALL_SESSION','NEW_PAGE','NAVIGATE','RESUME','PAYMENT_FORM_READY','CARD_FRAME','CARD_NUMBER_READY','CARD_NUMBER','CARD_EXPIRY','CARD_CVC','POSTAL_CHECK','POSTAL_FILL','MARK_PAY','PAY','MARK_RETRY','RETRY_PAYMENT_FORM_READY','RETRY_CARD_FRAME','RETRY_CARD_NUMBER_READY','RETRY_CARD_NUMBER','RETRY_CARD_EXPIRY','RETRY_CARD_CVC','RETRY_POSTAL_CHECK','RETRY_POSTAL_FILL','RETRY_PAY','SCA_COMPLETE','SERVER_CONFIRM','CLOSE_CONTEXT'];
+const scaFrameSteps=['SCA_WRAPPER_FRAME','SCA_CHALLENGE_FRAME','SCA_ISSUER_FRAME'];
 function syntheticCard(failAt,closeFails=false,formObservation){
   const events=[],contexts=[];let retry=false;
   const operation=async(step,args)=>{events.push({step,args});if(step===failAt||step==='CLOSE_CONTEXT'&&closeFails)throw new Proxy({},{get(){throw new Error('private-must-not-read');}});};
   const frame={locator:selector=>({waitFor:async(...args)=>operation((retry?'RETRY_':'')+'CARD_NUMBER_READY',args),fill:async(...args)=>operation((retry?'RETRY_':'')+({'input[name="number"]':'CARD_NUMBER','input[name="expiry"]':'CARD_EXPIRY','input[name="cvc"]':'CARD_CVC','input[name="postalCode"]':'POSTAL_FILL'})[selector],args),
     isVisible:async()=>{await operation((retry?'RETRY_':'')+'POSTAL_CHECK',[]);return true;}})};
   const widget={first(){return this;},evaluate:async(body,arg,options)=>{assert.equal(typeof body,'function');assert.equal(arg,undefined);assert.deepEqual(options,{timeout:1000});if(formObservation===undefined)throw null;return formObservation;},locator:selector=>({waitFor:async(...args)=>operation((retry?'RETRY_':'')+(selector.startsWith('button')?'PAYMENT_FORM_READY':'CARD_FRAME'),args)}),frameLocator:()=>frame,getByRole:(_role,options)=>({click:async(...args)=>operation(options.name==='Pay'?(retry?'RETRY_PAY':'PAY'):'RESUME',args)})};
-  const challenge={frameLocator(){return this;},getByRole:()=>({click:async(...args)=>operation('SCA_COMPLETE',args)})};
-  const page={goto:async(...args)=>operation('NAVIGATE',args),locator:()=>widget,frameLocator:()=>challenge};
+  const wait=step=>({waitFor:async(...args)=>operation(step,args)});
+  const issuer={getByRole:()=>({click:async(...args)=>operation('SCA_COMPLETE',args)})};
+  const challenge={locator:()=>wait('SCA_ISSUER_FRAME'),frameLocator:()=>issuer};
+  const lightbox={locator:()=>wait('SCA_CHALLENGE_FRAME'),frameLocator:()=>challenge};
+  const page={goto:async(...args)=>operation('NAVIGATE',args),locator:selector=>selector==='generic-payment-widget'?widget:wait('SCA_WRAPPER_FRAME'),frameLocator:()=>lightbox};
   const context={addInitScript:async(...args)=>operation('INSTALL_SESSION',args),newPage:async()=>{await operation('NEW_PAGE',[]);return page;},close:async()=>{try{await operation('CLOSE_CONTEXT',[]);}finally{contexts.splice(0);}}};
   const browser={contexts:()=>contexts,newContext:async(...args)=>{await operation('NEW_CONTEXT',args);contexts.push(context);return context;}};
   const fixture={identity:{endpoints:{demo:'http://127.0.0.1:14173',backend:'http://127.0.0.1:18080'},site:{key:'synthetic-site'},price:{key:'synthetic-price'}},
@@ -416,6 +420,45 @@ test('every real browser boundary emits its exact case step and stops later auth
     const result=await reportFrames(f.output);assert.deepEqual(result.result,{status:'failed'});
     assert.ok(result.lines.includes(`sandbox_diagnostic phase=CARDS code=OPERATION_FAILED exit=none cleanup=unconfirmed browser_case=${name} browser_step=${step}\n`));
   }
+});
+
+// Break: collapsing structural SCA failures back into SCA_COMPLETE hides the failed boundary.
+test('SCA frame provenance survives driver owner split reporter and rejecting cleanup without later authority',async()=>{
+  const {runSandboxCard}=await import('../examples/demo-site/tests/support/stripe-sandbox-fixtures.ts');
+  const {withOwnedCardContexts}=await import('../examples/demo-site/tests/support/stripe-sandbox-acceptance.ts');
+  for(const step of scaFrameSteps){
+    const f=fixture(),card=syntheticCard(step,true);card.fixture.close=async()=>{throw null;};
+    f.deps.openStripeSandboxFixture=async()=>card.fixture;
+    f.journeys.cards=async actual=>withOwnedCardContexts(card.browser,limits(),()=>runSandboxCard(card.browser,actual,'sca'));
+    const owned=await quietOpen(f);await assert.rejects(owned.run(f.journeys,limits()));
+    assert.deepEqual(diagnostics(f.output),[{...expectedDiagnostic('CARDS','OPERATION_FAILED',null,false),browserCase:'sca',browserStep:step}]);
+    const steps=card.events.map(e=>e.step),failed=steps.indexOf(step);assert.ok(failed>=0);
+    assert.ok(steps.slice(failed+1).every(s=>['CLOSE_CONTEXT','FIXTURE_CLOSE'].includes(s)));
+    assert.equal(steps.includes('SCA_COMPLETE'),false);assert.equal(steps.includes('SERVER_CONFIRM'),false);
+    assert.equal(f.events.includes('refunds'),false);assert.equal(f.events.includes('donations'),false);assert.equal(f.events.includes('missed'),false);
+    assert.equal(owned.resources().accepted,false);assert.equal(owned.resources().cleanupConfirmed,false);
+    const reported=await reportFrames(f.output.flatMap(line=>[line.slice(0,19),Buffer.from(line.slice(19))]));
+    assert.deepEqual(reported.result,{status:'failed'});
+    assert.ok(reported.lines.includes(`sandbox_diagnostic phase=CARDS code=OPERATION_FAILED exit=none cleanup=unconfirmed browser_case=sca browser_step=${step}\n`));
+    assert.equal(reported.lines.join('').includes('private-'),false);
+  }
+});
+test('new SCA frame codes are case phase and own-data restricted without arbitrary observer reads',async()=>{
+  const {runSandboxBrowserStep}=await import('./stripe-sandbox-acceptance.mjs');let calls=0,reads=0;
+  const hostile=new Proxy({},{get(){reads++;throw null;},ownKeys(){reads++;throw null;}});
+  for(const step of scaFrameSteps){
+    for(const name of ['success','decline']){
+      await assert.rejects(runSandboxBrowserStep(name,step,async()=>{calls++;}));
+      assert.equal(formatSandboxDiagnostic({...expectedDiagnostic('CARDS','OPERATION_FAILED',null,false),browserCase:name,browserStep:step}),null);
+    }
+    const base={...expectedDiagnostic('CARDS','OPERATION_FAILED',null,false),browserCase:'sca',browserStep:step};
+    assert.equal(formatSandboxDiagnostic(base),`sandbox_diagnostic phase=CARDS code=OPERATION_FAILED exit=none cleanup=unconfirmed browser_case=sca browser_step=${step}\n`);
+    for(const bad of [{...base,phase:'MISSED'},{...base,phase:'DONATIONS'},{...base,error:hostile},{...base,frameUrl:'private-url'},{...base,widgetState:'loading',elementState:'FRAME',payState:'ENABLED'},Object.defineProperty({...base},'browserStep',{get(){reads++;throw null;}})])assert.equal(formatSandboxDiagnostic(bad),null);
+    const f=fixture();f.journeys.cards=async()=>runSandboxBrowserStep('sca',step,async()=>{throw hostile;},()=>{calls++;throw hostile;});
+    const owned=await quietOpen(f);await assert.rejects(owned.run(f.journeys,limits()));
+    assert.deepEqual(diagnostics(f.output),[base]);
+  }
+  assert.equal(calls,0);assert.equal(reads,0);
 });
 test('real primary browser failure survives rejecting context cleanup and fixture cleanup',async()=>{
   const {runSandboxCard}=await import('../examples/demo-site/tests/support/stripe-sandbox-fixtures.ts');

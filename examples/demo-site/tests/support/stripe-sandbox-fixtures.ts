@@ -68,9 +68,21 @@ export async function runSandboxCard(browser:Browser,fixture:SandboxFixture,name
       // Stripe's private lightbox owns the issuer frame; it is not a page-level
       // child. Restrict the wrapper to the official 3DS app, not other Elements.
       // Third-party markup drift remains a manual-check failure, never a mock.
-      await step('SCA_COMPLETE',()=>page.frameLocator('iframe[name^="__privateStripeFrame"][src^="https://js.stripe.com/v3/three-ds-2-challenge-"]')
-        .frameLocator('iframe[name="stripe-challenge-frame"]').frameLocator('iframe[name="acsFrame"]')
-        .getByRole('button',{name:'Complete',exact:true}).click({timeout:20000}));
+      const wrapper='iframe[name^="__privateStripeFrame"][src^="https://js.stripe.com/v3/three-ds-2-challenge-"]';
+      const inner='iframe[name="stripe-challenge-frame"]',issuer='iframe[name="acsFrame"]';
+      // These are structural visibility boundaries, not issuer/provider success.
+      // Share the old20s bound: never reset it per frame or pass timeout0 (infinite).
+      const deadline=performance.now()+20000;
+      const remaining=()=>{
+        const value=Math.floor(deadline-performance.now());
+        if(!Number.isSafeInteger(value)||value<1||value>20000)throw null;
+        return value;
+      };
+      const lightbox=()=>page.frameLocator(wrapper),challenge=()=>lightbox().frameLocator(inner);
+      await step('SCA_WRAPPER_FRAME',()=>page.locator(wrapper).waitFor({state:'visible',timeout:remaining()}));
+      await step('SCA_CHALLENGE_FRAME',()=>lightbox().locator(inner).waitFor({state:'visible',timeout:remaining()}));
+      await step('SCA_ISSUER_FRAME',()=>challenge().locator(issuer).waitFor({state:'visible',timeout:remaining()}));
+      await step('SCA_COMPLETE',()=>challenge().frameLocator(issuer).getByRole('button',{name:'Complete',exact:true}).click({timeout:remaining()}));
     }
     await step('SERVER_CONFIRM',()=>fixture.confirm(name));
   }catch(error){failed=true;primary=error;}

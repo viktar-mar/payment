@@ -1,7 +1,7 @@
 import type {SandboxFixture} from './smoke-stage-5a.mjs';
 import type {SandboxAcceptanceExtras,SandboxExtrasOptions} from './stripe-sandbox-extras.mjs';
 export type SandboxBrowserCase='success'|'decline'|'sca';
-export type SandboxBrowserStep='BEGIN_BROWSER'|'NEW_CONTEXT'|'CHECKOUT_SESSION'|'INSTALL_SESSION'|'NEW_PAGE'|'NAVIGATE'|'RESUME'|'PAYMENT_FORM_READY'|'CARD_FRAME'|'CARD_NUMBER_READY'|'CARD_NUMBER'|'CARD_EXPIRY'|'CARD_CVC'|'POSTAL_CHECK'|'POSTAL_FILL'|'MARK_PAY'|'PAY'|'MARK_RETRY'|'RETRY_PAYMENT_FORM_READY'|'RETRY_CARD_FRAME'|'RETRY_CARD_NUMBER_READY'|'RETRY_CARD_NUMBER'|'RETRY_CARD_EXPIRY'|'RETRY_CARD_CVC'|'RETRY_POSTAL_CHECK'|'RETRY_POSTAL_FILL'|'RETRY_PAY'|'SCA_COMPLETE'|'SERVER_CONFIRM'|'CLOSE_CONTEXT';
+export type SandboxBrowserStep='BEGIN_BROWSER'|'NEW_CONTEXT'|'CHECKOUT_SESSION'|'INSTALL_SESSION'|'NEW_PAGE'|'NAVIGATE'|'RESUME'|'PAYMENT_FORM_READY'|'CARD_FRAME'|'CARD_NUMBER_READY'|'CARD_NUMBER'|'CARD_EXPIRY'|'CARD_CVC'|'POSTAL_CHECK'|'POSTAL_FILL'|'MARK_PAY'|'PAY'|'MARK_RETRY'|'RETRY_PAYMENT_FORM_READY'|'RETRY_CARD_FRAME'|'RETRY_CARD_NUMBER_READY'|'RETRY_CARD_NUMBER'|'RETRY_CARD_EXPIRY'|'RETRY_CARD_CVC'|'RETRY_POSTAL_CHECK'|'RETRY_POSTAL_FILL'|'RETRY_PAY'|'SCA_WRAPPER_FRAME'|'SCA_CHALLENGE_FRAME'|'SCA_ISSUER_FRAME'|'SCA_COMPLETE'|'SERVER_CONFIRM'|'CLOSE_CONTEXT';
 /** Read-only, best-effort, bounded failure observer; only the two form-readiness steps can emit its finite projection. */
 export function runSandboxBrowserStep<T>(browserCase:SandboxBrowserCase,browserStep:SandboxBrowserStep,body:()=>Promise<T>,observeFailure?:()=>Promise<unknown>):Promise<T>;
 export function rethrowSandboxBrowserFailure(error:unknown):never;

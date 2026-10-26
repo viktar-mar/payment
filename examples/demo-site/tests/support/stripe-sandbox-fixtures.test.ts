@@ -16,14 +16,15 @@ mock.method(globalThis,'fetch',forbidden);
 for(const name of ['open','readFile','lstat','realpath','readdir','mkdir','rename','unlink'] as const)mock.method(filesystem,name,forbidden);
 syncBuiltinESMExports();after(()=>{mock.restoreAll();syncBuiltinESMExports();});
 
-function cardBoundary(begin=true,postalVisible=true,onWait?:(kind:'form'|'frame'|'number')=>Promise<void>,observe?:(body:unknown,arg:unknown,options:unknown)=>Promise<unknown>){
+function cardBoundary(begin=true,postalVisible=true,onWait?:(kind:'form'|'frame'|'number')=>Promise<void>,observe?:(body:unknown,arg:unknown,options:unknown)=>Promise<unknown>,onSca?:(kind:'wrapper'|'challenge'|'issuer'|'complete')=>Promise<void>){
   const events:unknown[][]=[],record={synthetic:'session'},identity={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:14173'},site:{key:'synthetic-site'},price:{key:'synthetic-price'}};
   const add=(...args:unknown[])=>{events.push(args);};
   const frame={locator:(selector:string)=>({waitFor:async(...args:unknown[])=>{add('field-wait',selector,...args);await onWait?.('number');},fill:async(...args:unknown[])=>add('fill',selector,...args),isVisible:async()=>{add('visible',selector);return postalVisible;}})};
   const widget={first(){add('first');return this;},evaluate:async(body:unknown,arg:unknown,options:unknown)=>{if(!observe)throw null;return observe(body,arg,options);},locator:(selector:string)=>({waitFor:async(...args:unknown[])=>{add('widget-wait',selector,...args);await onWait?.(selector.startsWith('button')?'form':'frame');}}),getByRole:(...args:unknown[])=>({click:async(...options:unknown[])=>add('click',...args,...options)}),frameLocator:(...args:unknown[])=>{add('frame',...args);return frame;}};
-  const challenge={frameLocator:(...args:unknown[])=>{add('challenge-frame',...args);return {getByRole:(...role:unknown[])=>({click:async(...options:unknown[])=>add('complete',...role,...options)})};}};
-  const lightbox={frameLocator:(...args:unknown[])=>{add('challenge-container',...args);return challenge;}};
-  const page={goto:async(...args:unknown[])=>add('goto',...args),locator:(...args:unknown[])=>{add('widget',...args);return widget;},frameLocator:(...args:unknown[])=>{add('challenge',...args);return lightbox;}};
+  const scaWait=(kind:'wrapper'|'challenge'|'issuer')=>({waitFor:async(...args:unknown[])=>{add('sca-wait',kind,...args);await onSca?.(kind);}});
+  const challenge={locator:(selector:string)=>{add('sca-child',selector);return scaWait('issuer');},frameLocator:(...args:unknown[])=>{add('challenge-frame',...args);return {getByRole:(...role:unknown[])=>({click:async(...options:unknown[])=>{add('complete',...role,...options);await onSca?.('complete');}})};}};
+  const lightbox={locator:(selector:string)=>{add('sca-child',selector);return scaWait('challenge');},frameLocator:(...args:unknown[])=>{add('challenge-container',...args);return challenge;}};
+  const page={goto:async(...args:unknown[])=>add('goto',...args),locator:(selector:string)=>{add(selector==='generic-payment-widget'?'widget':'sca-owner',selector);return selector==='generic-payment-widget'?widget:scaWait('wrapper');},frameLocator:(...args:unknown[])=>{add('challenge',...args);return lightbox;}};
   const context={addInitScript:async(body:unknown,argument:unknown)=>{assert.equal(typeof body,'function');add('install',argument);},newPage:async()=>{add('new-page');return page;},close:async()=>add('close')};
   const browser={newContext:async(...args:unknown[])=>{add('new-context',...args);return context;}} as unknown as Browser;
   const fixture={identity,beginBrowser:async(...args:unknown[])=>{add('begin',...args);return begin;},browserSession:async(...args:unknown[])=>{add('checkout',...args);return record;},markPay:async(...args:unknown[])=>add('mark',...args),confirm:async(...args:unknown[])=>add('confirm',...args)} as unknown as SandboxFixture;
@@ -77,15 +78,64 @@ for(const retry of [false,true])for(const gate of ['form','frame','number'] as c
   assert.equal(f.events.filter(e=>e[0]==='click'&&(e[2] as {name?:string})?.name==='Pay').length,retry?1:0);
 });
 // Break: diagnostic wrappers must not change selectors, arguments, retry ordering or the server confirmation boundary.
-for(const name of ['success','decline','sca'] as const)test(`real ${name} driver preserves original boundary calls and arguments`,async()=>{
+for(const name of ['success','decline','sca'] as const)test(`real ${name} driver preserves selectors payment order and bounded SCA gates`,async()=>{
+  const clock=name==='sca'?mock.method(performance,'now',()=>0):undefined;
+  try{
   const f=cardBoundary();await runSandboxCard(f.browser,f.fixture,name);
   assert.deepEqual(f.events,[['begin',name],['new-context',{serviceWorkers:'block'}],['checkout',name],['install',{record:f.record,origin:'http://127.0.0.1:14173'}],['new-page'],
     ['goto','http://127.0.0.1:14173/?api_base_url=http%3A%2F%2F127.0.0.1%3A18080&site_key=synthetic-site&price_key=synthetic-price&locale=en',{timeout:15000}],
     ['widget','generic-payment-widget'],['first'],['click','button',{name:'Resume existing payment',exact:true},{timeout:15000}],['frame','iframe[title="Secure payment input frame"]'],
     ...card(name==='decline'?'4000000000000002':name==='sca'?'4000002500003155':'4242424242424242'),['mark',name],['click','button',{name:'Pay',exact:true},{timeout:15000}],
     ...(name==='decline'?[['mark','decline',true],...card('4242424242424242'),['click','button',{name:'Pay',exact:true},{timeout:15000}]]:[]),
-    ...(name==='sca'?[['challenge','iframe[name^="__privateStripeFrame"][src^="https://js.stripe.com/v3/three-ds-2-challenge-"]'],['challenge-container','iframe[name="stripe-challenge-frame"]'],['challenge-frame','iframe[name="acsFrame"]'],['complete','button',{name:'Complete',exact:true},{timeout:20000}]]:[]),
+    ...(name==='sca'?[
+      ['sca-owner','iframe[name^="__privateStripeFrame"][src^="https://js.stripe.com/v3/three-ds-2-challenge-"]'],['sca-wait','wrapper',{state:'visible',timeout:20000}],
+      ['challenge','iframe[name^="__privateStripeFrame"][src^="https://js.stripe.com/v3/three-ds-2-challenge-"]'],['sca-child','iframe[name="stripe-challenge-frame"]'],['sca-wait','challenge',{state:'visible',timeout:20000}],
+      ['challenge','iframe[name^="__privateStripeFrame"][src^="https://js.stripe.com/v3/three-ds-2-challenge-"]'],['challenge-container','iframe[name="stripe-challenge-frame"]'],['sca-child','iframe[name="acsFrame"]'],['sca-wait','issuer',{state:'visible',timeout:20000}],
+      ['challenge','iframe[name^="__privateStripeFrame"][src^="https://js.stripe.com/v3/three-ds-2-challenge-"]'],['challenge-container','iframe[name="stripe-challenge-frame"]'],['challenge-frame','iframe[name="acsFrame"]'],['complete','button',{name:'Complete',exact:true},{timeout:20000}],
+    ]:[]),
     ['confirm',name],['close']]);
+  }finally{clock?.mock.restore();}
+});
+
+// Break: a failed structural wait must stop before every later frame/button and server confirmation.
+for(const gate of ['wrapper','challenge','issuer','complete'] as const)test(`SCA ${gate} failure closes without later SCA or financial actions`,async()=>{
+  let reads=0;const seen:string[]=[],hostile=new Proxy({},{get(){reads++;throw null;},ownKeys(){reads++;throw null;}});
+  const f=cardBoundary(true,true,undefined,undefined,async kind=>{seen.push(kind);if(kind===gate)throw hostile;});
+  await assert.rejects(runSandboxCard(f.browser,f.fixture,'sca'));
+  assert.deepEqual(seen,['wrapper','challenge','issuer','complete'].slice(0,['wrapper','challenge','issuer','complete'].indexOf(gate)+1));
+  assert.equal(reads,0);assert.equal(f.events.some(e=>e[0]==='confirm'),false);assert.deepEqual(f.events.at(-1),['close']);
+  assert.equal(f.events.filter(e=>e[0]==='click'&&(e[2] as {name?:string})?.name==='Pay').length,1);
+  assert.equal(f.events.filter(e=>e[0]==='complete').length,gate==='complete'?1:0);
+});
+
+// Break: giving each frame its own20s silently multiplies the old bound; wall-clock changes must not reset it.
+test('SCA frame waits and Complete share one monotonic20s budget across wall-clock jumps',async()=>{
+  let now=1000,wall=Date.now();const clock=mock.method(performance,'now',()=>now),wallClock=mock.method(Date,'now',()=>wall);
+  const f=cardBoundary(true,true,undefined,undefined,async kind=>{wall+=kind==='challenge'?-86400000:86400000;now={wrapper:6000,challenge:13000,issuer:20999,complete:20999}[kind];});
+  try{
+    await runSandboxCard(f.browser,f.fixture,'sca');
+    const budgets=f.events.filter(e=>e[0]==='sca-wait'||e[0]==='complete').map(e=>(e.at(-1) as {timeout:number}).timeout);
+    assert.deepEqual(budgets,[20000,15000,8000,1]);assert.equal(f.events.filter(e=>e[0]==='complete').length,1);assert.deepEqual(f.events.at(-2),['confirm','sca']);
+  }finally{wallClock.mock.restore();clock.mock.restore();}
+});
+for(const gate of ['wrapper','challenge','issuer'] as const)test(`SCA budget consumed at ${gate} never dispatches Complete or timeout0`,async()=>{
+  let now=0;const clock=mock.method(performance,'now',()=>now),seen:string[]=[];
+  const f=cardBoundary(true,true,undefined,undefined,async kind=>{seen.push(kind);if(kind===gate)now=20000;});
+  try{
+    await assert.rejects(runSandboxCard(f.browser,f.fixture,'sca'));
+    assert.deepEqual(seen,['wrapper','challenge','issuer'].slice(0,['wrapper','challenge','issuer'].indexOf(gate)+1));
+    assert.equal(f.events.some(e=>e[0]==='complete'||e[0]==='confirm'),false);
+    for(const event of f.events.filter(e=>e[0]==='sca-wait'))assert.ok((event.at(-1) as {timeout:number}).timeout>0);
+    assert.deepEqual(f.events.at(-1),['close']);
+  }finally{clock.mock.restore();}
+});
+for(const value of [20000,-1,NaN,Infinity])test(`invalid or exhausted SCA clock ${String(value)} performs no frame wait or Complete`,async()=>{
+  let reads=0;const clock=mock.method(performance,'now',()=>++reads===1?0:value),f=cardBoundary();
+  try{
+    await assert.rejects(runSandboxCard(f.browser,f.fixture,'sca'));
+    assert.equal(f.events.some(e=>['sca-wait','complete','confirm'].includes(String(e[0]))),false);
+    assert.deepEqual(f.events.at(-1),['close']);
+  }finally{clock.mock.restore();}
 });
 test('beginBrowser false performs no browser acquisition or payment operation for every case',async()=>{
   for(const name of ['success','decline','sca'] as SandboxCase[]){const f=cardBoundary(false);await runSandboxCard(f.browser,f.fixture,name);assert.deepEqual(f.events,[['begin',name]]);}

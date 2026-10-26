@@ -21,7 +21,8 @@ const exact=(value,keys)=>object(value)&&Object.keys(value).sort().join(',')===[
 function freeze(value){if(value&&typeof value==='object'){for(const child of Object.values(value))freeze(child);Object.freeze(value);}return value;}
 const snapshot=value=>freeze(JSON.parse(JSON.stringify(value)));
 const BROWSER_CASES=['success','decline','sca'];
-const BROWSER_STEPS=['BEGIN_BROWSER','NEW_CONTEXT','CHECKOUT_SESSION','INSTALL_SESSION','NEW_PAGE','NAVIGATE','RESUME','PAYMENT_FORM_READY','CARD_FRAME','CARD_NUMBER_READY','CARD_NUMBER','CARD_EXPIRY','CARD_CVC','POSTAL_CHECK','POSTAL_FILL','MARK_PAY','PAY','MARK_RETRY','RETRY_PAYMENT_FORM_READY','RETRY_CARD_FRAME','RETRY_CARD_NUMBER_READY','RETRY_CARD_NUMBER','RETRY_CARD_EXPIRY','RETRY_CARD_CVC','RETRY_POSTAL_CHECK','RETRY_POSTAL_FILL','RETRY_PAY','SCA_COMPLETE','SERVER_CONFIRM','CLOSE_CONTEXT'];
+const SCA_FRAME_STEPS=['SCA_WRAPPER_FRAME','SCA_CHALLENGE_FRAME','SCA_ISSUER_FRAME'];
+const BROWSER_STEPS=['BEGIN_BROWSER','NEW_CONTEXT','CHECKOUT_SESSION','INSTALL_SESSION','NEW_PAGE','NAVIGATE','RESUME','PAYMENT_FORM_READY','CARD_FRAME','CARD_NUMBER_READY','CARD_NUMBER','CARD_EXPIRY','CARD_CVC','POSTAL_CHECK','POSTAL_FILL','MARK_PAY','PAY','MARK_RETRY','RETRY_PAYMENT_FORM_READY','RETRY_CARD_FRAME','RETRY_CARD_NUMBER_READY','RETRY_CARD_NUMBER','RETRY_CARD_EXPIRY','RETRY_CARD_CVC','RETRY_POSTAL_CHECK','RETRY_POSTAL_FILL','RETRY_PAY',...SCA_FRAME_STEPS,'SCA_COMPLETE','SERVER_CONFIRM','CLOSE_CONTEXT'];
 const FORM_STEPS=['PAYMENT_FORM_READY','RETRY_PAYMENT_FORM_READY'];
 function formObservation(value) {
   try{
@@ -37,11 +38,12 @@ function formObservation(value) {
 }
 const browserFailures=new WeakMap();
 const browserPair=(phase,code,exitCode,browserCase,browserStep)=>code==='OPERATION_FAILED'&&exitCode===null
-  &&(phase==='CARDS'||phase==='MISSED'&&browserCase==='success')&&BROWSER_CASES.includes(browserCase)&&BROWSER_STEPS.includes(browserStep);
+  &&(phase==='CARDS'||phase==='MISSED'&&browserCase==='success')&&BROWSER_CASES.includes(browserCase)&&BROWSER_STEPS.includes(browserStep)
+  &&(!SCA_FRAME_STEPS.includes(browserStep)||browserCase==='sca');
 
 /** Only private identity carries browser provenance; foreign rejections are never inspected. */
 export async function runSandboxBrowserStep(browserCase,browserStep,body,observeFailure) {
-  if(!BROWSER_CASES.includes(browserCase)||!BROWSER_STEPS.includes(browserStep))rethrowSandboxBrowserFailure(null);
+  if(!BROWSER_CASES.includes(browserCase)||!BROWSER_STEPS.includes(browserStep)||SCA_FRAME_STEPS.includes(browserStep)&&browserCase!=='sca')rethrowSandboxBrowserFailure(null);
   try{return await body();}catch(error){
     if(browserFailures.has(error))throw error;
     let observation=null,timer;
