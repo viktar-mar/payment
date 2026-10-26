@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-Offline only; no Docker commands, Sandbox/Stripe/network, installation, Python, keys/config, old payment/refund/archive or raw runtime-log reads. Use injected artificial fixtures.
+Offline only; no Docker commands, Sandbox/Stripe/external network, installation, Python, keys/config, old payment/refund/archive or raw runtime-log reads. Use injected artificial fixtures; the existing offline suite may use its own ephemeral synthetic loopback HTTP fixtures, never existing application services.
 Preserve all existing security/financial predicates, report version/shape, once-only operations, 45-minute active authority, original plus two-minute cleanup ceiling, 30-second per-close slice, 10-second child, 45-second/30-probe financial proof and five-minute page.
 Diagnostic remains exactly {tag,stage}, at most 256 UTF-8 bytes, module-owned finite labels only; no dependency-error inspection or raw content.
 Historical reports stay immutable; UNKNOWN does not establish a historical root cause, and Stage5A remains NOT_ACCEPTED. No push or runtime launch.

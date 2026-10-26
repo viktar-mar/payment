@@ -17,7 +17,7 @@ Capture the existing, once-only bootstrap-stop promise's literal-true fulfillmen
 
 ## Constraints and non-goals
 
-Offline only; no Docker commands, Sandbox/Stripe/network, installation, Python, keys/config, old payment/refund/archive or raw runtime-log reads. Use injected artificial fixtures. Preserve source/account/API/ownership/cookie/financial/journal/callback predicates, report version/shape and all existing limits (45-minute active authority, original plus two-minute cleanup ceiling, 30-second per-close slice, 10-second child, 45-second/30-probe financial proof, five-minute page). No new diagnostic subsystem or dependencies. Do not rerun or rewrite historical evidence or claim live root cause/5A acceptance. Reuse the current isolated feature worktree and preserve unrelated changes.
+Offline only; no Docker commands, Sandbox/Stripe/external network, installation, Python, keys/config, old payment/refund/archive or raw runtime-log reads. Use injected artificial fixtures; the existing offline regression suite may use its own ephemeral loopback HTTP fixtures with synthetic data, never existing application services. Preserve source/account/API/ownership/cookie/financial/journal/callback predicates, report version/shape and all existing limits (45-minute active authority, original plus two-minute cleanup ceiling, 30-second per-close slice, 10-second child, 45-second/30-probe financial proof, five-minute page). No new diagnostic subsystem or dependencies. Do not rerun or rewrite historical evidence or claim live root cause/5A acceptance. Reuse the current isolated feature worktree and preserve unrelated changes.
 
 ## Verification
 
