@@ -57,8 +57,8 @@ async function jsonResponse(response:Pick<Response,'body'>,limits:OwnedSandboxLi
   try {const value:unknown=JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(bytes));if(!object(value))fail();return value as Record<string,unknown>;}catch{fail();}
 }
 
-/** Original SDK request only. No replacement body, synthetic response, replay or provider route. */
-export async function forwardDonationCreate(route:Pick<Route,'request'|'continue'|'abort'>,extras:Pick<SandboxAcceptanceExtras,'beforeDonationCreate'>,kind:SandboxDonationKind,
+/** Original SDK request only: no replacement body, synthetic response or replay. The owner captures failure before abort. */
+export async function forwardDonationCreate(route:Pick<Route,'request'|'continue'>,extras:Pick<SandboxAcceptanceExtras,'beforeDonationCreate'>,kind:SandboxDonationKind,
   binding:OwnedSandboxPublicBinding,limits:OwnedSandboxLimits):Promise<void> {
   try {
     timeout(limits);const request=route.request();
@@ -74,7 +74,7 @@ export async function forwardDonationCreate(route:Pick<Route,'request'|'continue
     timeout(limits);
     // Playwright preserves the original method/body and every unmodified original header.
     await bounded(()=>route.continue({headers:{...headers,'idempotency-key':key}}),limits);
-  }catch(error){try{await bounded(()=>route.abort('failed'),{deadline:Date.now()+15000});}catch{}rethrowSandboxBrowserFailure(error,'DONATION_PENDING');}
+  }catch(error){rethrowSandboxBrowserFailure(error,'DONATION_PENDING');}
 }
 
 export async function acknowledgeDonationResponse(response:Pick<Response,'request'|'url'|'status'|'body'>,request:Request,extras:Pick<SandboxAcceptanceExtras,'ackDonationCreate'>,
@@ -170,8 +170,11 @@ async function donationContext(browser:Browser,limits:OwnedSandboxLimits):Promis
 export async function runOwnedSandboxDonations(browser:Browser,extras:SandboxAcceptanceExtras,binding:OwnedSandboxPublicBinding,limits:OwnedSandboxLimits):Promise<true> {
   for(const kind of ['anonymous','emailOtp'] as const) {
     const owner=await runSandboxBrowserStep(kind,'DONATION_SETUP',()=>donationContext(browser,limits)),context=owner.context;
-    const abort=()=>{void owner.close().catch(()=>{});};
     let timer:ReturnType<typeof setTimeout>|undefined,failed=false,primary:unknown;
+    const routes={closing:false,pending:new Set<Promise<void>>(),
+      fail(error:unknown){if(!failed){failed=true;primary=error;}return primary;},
+      check(){if(failed)rethrowSandboxBrowserFailure(primary,'DONATION_PENDING');}};
+    const abort=()=>{routes.closing=true;void owner.close().catch(()=>{});};
     try {
       const page=await runSandboxBrowserStep(kind,'DONATION_SETUP',async()=>{
         limits.signal?.addEventListener('abort',abort,{once:true});
@@ -184,35 +187,45 @@ export async function runOwnedSandboxDonations(browser:Browser,extras:SandboxAcc
         else if(!await page.evaluate(()=>!Object.keys(sessionStorage).some(key=>key.startsWith('generic-payments:customer:'))))fail();
         return page;
       });
-      await donationPayment(page,context,extras,kind,binding,limits);
-    }catch(error){failed=true;primary=error;}
+      await donationPayment(page,context,extras,kind,binding,limits,routes);
+    }catch(error){routes.fail(error);}
     finally{
-      clearTimeout(timer);limits.signal?.removeEventListener('abort',abort);
-      try{await runSandboxBrowserStep(kind,'DONATION_CLOSE_CONTEXT',()=>bounded(()=>owner.close(),{deadline:Date.now()+15000}));}
-      catch(error){if(!failed){failed=true;primary=error;}}
+      routes.closing=true;clearTimeout(timer);limits.signal?.removeEventListener('abort',abort);
+      // Close and every owned route callback share this one existing cleanup ceiling.
+      try{await runSandboxBrowserStep(kind,'DONATION_CLOSE_CONTEXT',()=>bounded(async()=>{
+        try{await runSandboxBrowserStep(kind,'DONATION_CLOSE_CONTEXT',()=>owner.close());}catch(error){routes.fail(error);}
+        while(routes.pending.size)await Promise.allSettled([...routes.pending]);
+      },{deadline:Date.now()+15000}));}
+      catch(error){routes.fail(error);}
     }
     if(failed)rethrowSandboxBrowserFailure(primary,'DONATION_PENDING');
   }
   return true;
 }
 
-async function donationPayment(page:Page,context:BrowserContext,extras:SandboxAcceptanceExtras,kind:SandboxDonationKind,binding:OwnedSandboxPublicBinding,limits:OwnedSandboxLimits):Promise<void> {
-  let posts=0,responses=0,original:Request|undefined,routeFailure=false,firstRouteFailure:unknown;
-  const checkRouteFailure=()=>{if(routeFailure)rethrowSandboxBrowserFailure(firstRouteFailure,'DONATION_PENDING');};
+async function donationPayment(page:Page,context:BrowserContext,extras:SandboxAcceptanceExtras,kind:SandboxDonationKind,binding:OwnedSandboxPublicBinding,limits:OwnedSandboxLimits,
+  routes:{closing:boolean;pending:Set<Promise<void>>;fail(error:unknown):unknown;check():void}):Promise<void> {
+  let posts=0,responses=0,original:Request|undefined,routeFailure=false;
+  const checkRouteFailure=()=>routes.check();
   let resolveForward!:()=>void,rejectForward!:(error:unknown)=>void;
   const forwarded=new Promise<void>((resolve,reject)=>{resolveForward=resolve;rejectForward=reject;});
   forwarded.catch(()=>{});
-  await runSandboxBrowserStep(kind,'DONATION_SETUP',()=>context.route(endpoint(binding),async route=>{
-    if(route.request().method()==='OPTIONS'){
-      try{await runSandboxBrowserStep(kind,'DONATION_DISPATCH',()=>forwardDonationCreate(route,extras,kind,binding,limits));}
-      catch(error){if(!routeFailure)firstRouteFailure=error;routeFailure=true;rejectForward(firstRouteFailure);}return;
-    }
-    try {
-      await runSandboxBrowserStep(kind,'DONATION_DISPATCH',async()=>{
-        if(++posts!==1||route.request().method()!=='POST')fail();original=route.request();
-        await forwardDonationCreate(route,extras,kind,binding,limits);
-      });resolveForward();
-    }catch(error){if(!routeFailure)firstRouteFailure=error;routeFailure=true;rejectForward(firstRouteFailure);try{await bounded(()=>route.abort('failed'),{deadline:Date.now()+15000});}catch{}}
+  await runSandboxBrowserStep(kind,'DONATION_SETUP',()=>context.route(endpoint(binding),route=>{
+    const work=(async()=>{
+      try {
+        let preflight=false;
+        await runSandboxBrowserStep(kind,'DONATION_DISPATCH',async()=>{
+          if(routes.closing)fail();checkRouteFailure();
+          preflight=route.request().method()==='OPTIONS';
+          if(!preflight){if(++posts!==1||route.request().method()!=='POST')fail();original=route.request();}
+          await forwardDonationCreate(route,extras,kind,binding,limits);
+        });if(!preflight)resolveForward();
+      }catch(error){
+        routeFailure=true;rejectForward(routes.fail(error));
+        try{await bounded(()=>route.abort('failed'),{deadline:Date.now()+15000});}catch{}
+      }
+    })();
+    routes.pending.add(work);work.then(()=>routes.pending.delete(work),()=>routes.pending.delete(work));return work;
   }));
   const observe=(response:Response)=>{if(response.url()===endpoint(binding)&&response.request().method()==='POST')responses++;};
   page.on('response',observe);
@@ -229,7 +242,7 @@ async function donationPayment(page:Page,context:BrowserContext,extras:SandboxAc
       try{
         await widget.getByRole('button',{name:'Create donation',exact:true}).click({timeout:timeout(limits)});
         await bounded(()=>forwarded,limits);checkRouteFailure();
-      }catch(error){rethrowSandboxBrowserFailure(routeFailure?firstRouteFailure:error,'DONATION_PENDING');}
+      }catch(error){checkRouteFailure();rethrowSandboxBrowserFailure(error,'DONATION_PENDING');}
       return {genuine};
     });
     await runSandboxBrowserStep(kind,'DONATION_RESPONSE',async()=>{
@@ -258,6 +271,6 @@ async function donationPayment(page:Page,context:BrowserContext,extras:SandboxAc
       checkRouteFailure();
       if(await extras.confirmDonation(kind,{deadline:Math.min(limits.deadline,Date.now()+45000),signal:limits.signal})!==true||posts!==1||responses!==1||routeFailure)fail();
     });
-  }catch(error){rethrowSandboxBrowserFailure(routeFailure?firstRouteFailure:error,'DONATION_PENDING');}
+  }catch(error){rethrowSandboxBrowserFailure(routes.fail(error),'DONATION_PENDING');}
   finally{page.off('response',observe);}
 }

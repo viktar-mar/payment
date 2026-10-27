@@ -437,14 +437,19 @@ async function reportFrames(frames,owned=true,exercisePrivateChannels=false){
 // Break: collapsing the create/response/ACK boundary or rejecting cleanup loses the first safe failure.
 test('donation failures survive the real helper owner and split reporter without later writes',async()=>{
   const {runOwnedSandboxDonations}=await import('../examples/demo-site/tests/support/stripe-sandbox-acceptance.ts');
-  for(const [fault,step] of [['forward','DONATION_DISPATCH'],['lateOptions','DONATION_DISPATCH'],['missing','DONATION_RESPONSE'],['non201','DONATION_RESPONSE'],['malformed','DONATION_RESPONSE'],['partial','DONATION_RESPONSE'],['bodyReject','DONATION_RESPONSE'],['oversized','DONATION_RESPONSE'],['identity','DONATION_RESPONSE'],['ack','DONATION_ACK'],['ackFalse','DONATION_ACK'],['setup','DONATION_SETUP'],['payment','DONATION_PAYMENT'],['close','DONATION_CLOSE_CONTEXT']]){
+  for(const [fault,step] of [['forward','DONATION_DISPATCH'],['lateOptions','DONATION_DISPATCH'],['pendingAbort','DONATION_DISPATCH'],['missing','DONATION_RESPONSE'],['non201','DONATION_RESPONSE'],['malformed','DONATION_RESPONSE'],['partial','DONATION_RESPONSE'],['bodyReject','DONATION_RESPONSE'],['oversized','DONATION_RESPONSE'],['identity','DONATION_RESPONSE'],['ack','DONATION_ACK'],['ackFalse','DONATION_ACK'],['setup','DONATION_SETUP'],['payment','DONATION_PAYMENT'],['close','DONATION_CLOSE_CONTEXT']]){
     const f=fixture(),events=[];let reads=0,routeHandler,responseObserver=()=>{},keyCalls=0,ackCalls=0,posts=0,contexts=0;
+    let releaseAbort,lateRoute;const aborted=new Promise(resolve=>{releaseAbort=resolve;});
     const hostile=new Proxy({},{get(){reads++;throw new Error('private-secret');},ownKeys(){reads++;throw null;}});
     const url='http://127.0.0.1:18080/api/v1/public/sites/s5a-site/donation-campaigns/s5a-donate/checkouts';
     const request={url:()=>url,method:()=> 'POST',redirectedFrom:()=>null,postData:()=>'{"amount_minor":500}',allHeaders:async()=>({origin:'http://127.0.0.1:14173','content-type':'application/json'})};
     const value={checkout_id:'00000000-0000-4000-8000-000000000010',payment_id:'00000000-0000-4000-8000-000000000020',checkout_token:'private-secret',amount_minor:500,currency:'EUR',price:null,provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',provider_client_payload:{},status:'CREATED',expires_at:new Date(Date.now()+120000).toISOString(),donation:{donation_id:'00000000-0000-4000-8000-000000000030',campaign_key:'s5a-donate',campaign_version:1}};
     const response={url:()=>url,request:()=>fault==='identity'?{...request}:request,status:()=>fault==='non201'?500:201,body:async()=>{
       if(fault==='bodyReject')throw hostile;
+      if(fault==='pendingAbort'){
+        lateRoute=routeHandler({request:()=>({...request,method:()=> 'OPTIONS'}),continue:async()=>{throw hostile;},abort:()=>aborted});lateRoute.catch(()=>{});
+        await new Promise(resolve=>setImmediate(resolve));
+      }
       return Buffer.from(fault==='malformed'?'{private-secret':fault==='partial'?'{}':fault==='oversized'?'x'.repeat(65537):JSON.stringify(value));
     }};
     const route={request:()=>request,continue:async()=>{events.push('forward');if(fault==='forward')throw hostile;responseObserver(response);},abort:async()=>{events.push('abort');throw hostile;}};
@@ -456,7 +461,7 @@ test('donation failures survive the real helper owner and split reporter without
       frameLocator:()=>({locator:()=>({fill:async()=>{events.push('fill');if(fault==='payment')throw hostile;},isVisible:async()=>false})})};
     const page={goto:async()=>{if(fault==='setup')throw hostile;},evaluate:async()=>true,locator:()=>widget,
       waitForResponse:()=>fault==='missing'?Promise.reject(hostile):Promise.resolve(response),on:(_event,fn)=>{responseObserver=fn;},off:()=>{}};
-    const browser={newContext:async()=>{contexts++;return {newPage:async()=>page,route:async(_url,fn)=>{routeHandler=fn;},close:async()=>{events.push('close');throw hostile;}};}};
+    const browser={newContext:async()=>{contexts++;return {newPage:async()=>page,route:async(_url,fn)=>{routeHandler=fn;},close:async()=>{events.push('close');if(fault==='pendingAbort'){releaseAbort();await lateRoute;}throw hostile;}};}};
     const binding={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:14173',receiver:'http://127.0.0.1:18090'},site:{key:'s5a-site'},price:{key:'s5a-price'},campaign:{key:'s5a-donate',version:1}};
     // This models the real ambiguity: persisted OPEN/DISPATCHING can coexist with in-memory PENDING.
     const durable={status:'OPEN',donations:{anonymous:{phase:'NEW'}}},memory={status:'OPEN'};

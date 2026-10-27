@@ -69,13 +69,27 @@ test('genuine donation POST forwards the original wire with only the durable key
   await forwardDonationCreate(route,extras,'anonymous',binding,limits());
   assert.deepEqual(events,['durable','continue']);assert.deepEqual(forwarded,{headers:{origin:binding.endpoints.demo,'content-type':'application/json','idempotency-key':'s5a:original:donation:anonymous','x-original':'preserved'}});
 });
+const invalidDonationRequests=()=>[request('POST','{"amount_minor":501}'),request('POST','{"amount_minor":500,"message":""}'),request('GET'),request('POST','{"amount_minor":500}',{origin:binding.endpoints.demo,authorization:'Bearer private'})];
 // Break: allowing a failed, altered or unauthorized POST through is a new uncontrolled financial write.
-test('bad donation POST aborts before key acquisition and exposes only a fixed failure',async()=>{
-  for(const original of [request('POST','{"amount_minor":501}'),request('POST','{"amount_minor":500,"message":""}'),request('GET'),request('POST','{"amount_minor":500}',{origin:binding.endpoints.demo,authorization:'Bearer private'})]){
+test('bad donation POST rejects before key acquisition for its owning route to abort',async()=>{
+  for(const original of invalidDonationRequests()){
     const events:string[]=[];
     const route={request:()=>original,continue:async()=>{events.push('continue');},abort:async()=>{events.push('abort');}} as Pick<Route,'request'|'continue'|'abort'>;
     const extras={beforeDonationCreate:async()=>{events.push('durable');return 'key';}} as unknown as SandboxAcceptanceExtras;
-    await assert.rejects(forwardDonationCreate(route,extras,'anonymous',binding,limits()),{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});assert.deepEqual(events,['abort']);
+    await assert.rejects(forwardDonationCreate(route,extras,'anonymous',binding,limits()),{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});assert.deepEqual(events,[]);
+  }
+});
+test('owning donation route aborts each bad request once before any key or continue',async()=>{
+  for(const original of invalidDonationRequests()){
+    const events:string[]=[];let contexts=0,handle!:(route:unknown)=>Promise<void>;
+    const route={request:()=>original,continue:async()=>{events.push('continue');},abort:async()=>{events.push('abort');}};
+    const widget={first(){return this;},locator:()=>({click:async()=>{},evaluate:async()=>true}),getByRole:(_role:string,{name}:{name:string})=>({click:async()=>{events.push(name);await handle(route);}})};
+    const page={goto:async()=>{},evaluate:async()=>true,locator:()=>widget,waitForResponse:()=>new Promise(()=>{}),on:()=>{},off:()=>{}};
+    const browser={newContext:async()=>{contexts++;return {route:async(_url:string,callback:typeof handle)=>{handle=callback;},newPage:async()=>page,close:async()=>{events.push('close');}};}} as unknown as Browser;
+    const extras={beforeDonationCreate:async()=>{events.push('durable');return 'key';},ackDonationCreate:async()=>{events.push('ack');return true;},
+      beforeDonationPay:async()=>{events.push('before-pay');return true;},confirmDonation:async()=>{events.push('confirm');return true;}} as unknown as SandboxAcceptanceExtras;
+    await assert.rejects(runOwnedSandboxDonations(browser,extras,binding,limits()),trustedFailure);
+    assert.deepEqual(events,['Create donation','abort','close']);assert.equal(contexts,1);
   }
 });
 // Break: treating OPTIONS as a mutation consumes an operation key before the actual SDK write.
@@ -137,15 +151,14 @@ function admissionClock() {
   return {count:()=>alarms.length,fire(index:number){const alarm=alarms[index];assert.ok(alarm);clearTimeout(alarm.handle);alarm.fire();},
     close(){timer.mock.restore();for(const alarm of alarms)clearTimeout(alarm.handle);}};
 }
-// Break: awaiting a stalled second abort before rejecting forwarding delays the primary failure or loses it.
-test('failed forwarding reports its original token before the bounded second abort settles',async()=>{
-  const clock=admissionClock(),events:string[]=[];let primary:unknown,reads=0,keys=0,posts=0,closes=0,aborts=0,abortAlarm=-1,routeSettled=false;
+// Break: a sole-owner abort must be bounded and drained without replacing the first failure or releasing ownership early.
+test('failed forwarding retains its original token through the sole bounded owner abort',async()=>{
+  const clock=admissionClock(),events:string[]=[];let primary:unknown,reads=0,keys=0,posts=0,closes=0,aborts=0,abortAlarm=-1,routeSettled=false,settled=false;
   const hostile=new Proxy({},{get(){reads++;throw null;},ownKeys(){reads++;throw null;}});
   try{await runSandboxBrowserStep('anonymous','DONATION_DISPATCH',async()=>{throw hostile;});}catch(error){primary=error;}
   let handle!:(route:unknown)=>Promise<void>,routeWork:Promise<void>|undefined;
   const route={request:()=>request(),continue:async()=>{events.push('forward');throw primary;},abort:async()=>{
-    if(++aborts===1)throw hostile;
-    abortAlarm=clock.count()-1;await new Promise(()=>{});
+    aborts++;abortAlarm=clock.count()-1;await new Promise(()=>{});
   }};
   const widget={first(){return this;},locator:()=>({click:async()=>{},evaluate:async()=>true}),getByRole:(_role:string,{name}:{name:string})=>({click:async()=>{
     events.push(name);assert.equal(name,'Create donation');posts++;routeWork=handle(route).then(()=>{routeSettled=true;});
@@ -154,11 +167,13 @@ test('failed forwarding reports its original token before the bounded second abo
   const page={goto:async()=>{},evaluate:async()=>true,locator:()=>widget,waitForResponse:()=>new Promise(()=>{}),on:()=>{},off:()=>{}};
   const browser={newContext:async()=>({route:async(_url:string,callback:typeof handle)=>{handle=callback;},newPage:async()=>page,close:async()=>{closes++;}})} as unknown as Browser;
   const extras={beforeDonationCreate:async()=>{keys++;return 'synthetic-key';},ackDonationCreate:forbidden,beforeDonationPay:forbidden,confirmDonation:forbidden} as unknown as SandboxAcceptanceExtras;
+  const running=runOwnedSandboxDonations(browser,extras,binding,limits()).finally(()=>{settled=true;});running.catch(()=>{});
   try{
-    await assert.rejects(runOwnedSandboxDonations(browser,extras,binding,limits()),error=>error===primary);
-    assert.equal(routeSettled,false);assert.equal(aborts,2);assert.ok(abortAlarm>=0);assert.equal(posts,1);assert.equal(keys,1);assert.equal(closes,1);
+    await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(settled,false);assert.equal(routeSettled,false);assert.equal(aborts,1);assert.ok(abortAlarm>=0);assert.equal(posts,1);assert.equal(keys,1);assert.equal(closes,1);
     assert.deepEqual(events,['Create donation','forward']);assert.equal(reads,0);
-    clock.fire(abortAlarm);await routeWork;assert.equal(routeSettled,true);assert.equal(aborts,2);assert.equal(keys,1);assert.equal(posts,1);
+    clock.fire(abortAlarm);await routeWork;await assert.rejects(running,error=>error===primary);
+    assert.equal(routeSettled,true);assert.equal(aborts,1);assert.equal(keys,1);assert.equal(posts,1);
   }finally{clock.close();}
 });
 // Break: a resolved POST promise cannot carry a later OPTIONS failure to response/ACK/payment consumers.
@@ -200,6 +215,56 @@ for(const [at,wantAcks,wantFills,wantBeforePay,wantPays,wantConfirms] of [
   assert.equal(bodyReads,at==='response'||at==='responseReject'?0:1);
 });
 // I2: local admission expiry abandons ownership even while the original deadline is open.
+// Break: the first abort can hide a late failure until after payment or until the owning close has finished.
+for(const at of ['body','bodyBound','cleanupBound','postBody','close','unsettled'] as const)test(`pending first abort at ${at} stays owned and cannot escape into another donation`,async()=>{
+  const clock=admissionClock();let primary:unknown,received:unknown,reads=0,keys=0,posts=0,acks=0,pays=0,confirms=0,contexts=0,closes=0,aborts=0,abortAlarm=-1,cleanupAlarm=-1,settled=false,routeSettled=false;
+  const hostile=new Proxy({},{get(){reads++;throw null;},ownKeys(){reads++;throw null;}});
+  try{await runSandboxBrowserStep('anonymous','DONATION_DISPATCH',async()=>{throw hostile;});}catch(error){primary=error;}
+  let handle!:(route:unknown)=>Promise<void>,observe:((response:unknown)=>void)=()=>{},releaseAbort!:()=>void,rejectContinuation!:(error:unknown)=>void,routeWork:Promise<void>|undefined;
+  const aborted=new Promise<void>(resolve=>{releaseAbort=resolve;}),continuation=new Promise<void>((_resolve,reject)=>{rejectContinuation=reject;}),original=request();
+  const startLate=()=>{
+    assert.equal(posts,1);assert.equal(routeWork,undefined);
+    routeWork=handle({request:()=>request('OPTIONS'),continue:async()=>{if(at==='close'||at==='unsettled')return continuation;throw primary;},abort:async()=>{aborts++;abortAlarm=clock.count()-1;await aborted;}}).then(()=>{routeSettled=true;});routeWork.catch(()=>{});
+  };
+  const value={checkout_id:'00000000-0000-4000-8000-000000000010',payment_id:'00000000-0000-4000-8000-000000000020',checkout_token:'private-memory-only',
+    amount_minor:500,currency:'EUR',price:null,provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',provider_client_payload:{},status:'CREATED',expires_at:new Date(Date.now()+120000).toISOString(),
+    donation:{donation_id:'00000000-0000-4000-8000-000000000030',campaign_key:'s5a-donate',campaign_version:1}};
+  const response={request:()=>original,url:()=>endpoint,status:()=>201,body:async()=>{
+    if(at==='body'||at==='bodyBound'||at==='cleanupBound'){startLate();await new Promise(resolve=>setImmediate(resolve));}
+    else if(at==='close'||at==='unsettled')startLate();
+    return Buffer.from(JSON.stringify(value));
+  }};
+  const widget={first(){return this;},locator:()=>({click:async()=>{},evaluate:async()=>true}),getByRole:(_role:string,{name}:{name:string})=>({click:async()=>{
+    if(name==='Create donation'){posts++;await handle({request:()=>original,continue:async()=>observe(response),abort:forbidden});}else{assert.equal(name,'Pay');pays++;}
+  }}),frameLocator:()=>({locator:()=>({fill:async()=>{},isVisible:async()=>false})})};
+  const page={goto:async()=>{},evaluate:async()=>true,locator:()=>widget,waitForResponse:async()=>response,on:(_event:string,callback:typeof observe)=>{observe=callback;},
+    off:()=>{if(at==='postBody')startLate();}};
+  const browser={newContext:async()=>{
+    if(++contexts!==1)throw hostile;
+    return {route:async(_url:string,callback:typeof handle)=>{handle=callback;},newPage:async()=>page,close:async()=>{
+      closes++;cleanupAlarm=clock.count()-1;if(at==='close')rejectContinuation(primary);await new Promise(resolve=>setImmediate(resolve));
+      if(at!=='bodyBound'&&at!=='cleanupBound'&&at!=='unsettled'){releaseAbort();await routeWork;}
+    }};
+  }} as unknown as Browser;
+  const extras={beforeDonationCreate:async()=>{keys++;return 'synthetic-key';},ackDonationCreate:async()=>{acks++;return true;},beforeDonationPay:async()=>true,
+    confirmDonation:async()=>{confirms++;return true;}} as unknown as SandboxAcceptanceExtras;
+  const running=runOwnedSandboxDonations(browser,extras,binding,limits()).finally(()=>{settled=true;});running.catch(error=>{received=error;});
+  try{
+    await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));
+    if(at==='bodyBound'){
+      assert.equal(settled,false,'the owner must retain the pending route through cleanup');assert.equal(aborts,1);assert.ok(abortAlarm>=0);clock.fire(abortAlarm);
+    }else if(at==='cleanupBound'||at==='unsettled'){
+      assert.equal(settled,false);assert.equal(routeSettled,false);assert.ok(cleanupAlarm>=0);clock.fire(cleanupAlarm);
+    }
+    await assert.rejects(running,at==='unsettled'?trustedFailure:error=>error===primary);
+    if(at==='cleanupBound'){assert.equal(routeSettled,false);clock.fire(abortAlarm);await routeWork;}
+    else if(at==='unsettled'){
+      const first=received;assert.notEqual(first,primary);rejectContinuation(primary);releaseAbort();await routeWork;assert.equal(received,first);
+    }
+    assert.equal(contexts,1);assert.equal(closes,1);assert.equal(posts,1);assert.equal(keys,1);assert.equal(aborts,1);assert.equal(reads,0);
+    const finishedBeforeFailure=at==='postBody'||at==='close'||at==='unsettled';assert.equal(acks,finishedBeforeFailure?1:0);assert.equal(pays,finishedBeforeFailure?1:0);assert.equal(confirms,finishedBeforeFailure?1:0);
+  }finally{releaseAbort();await running.catch(()=>{});await routeWork;clock.close();}
+});
 test('late donation context after local timeout is closed before the failed owner settles',async()=>{
   const clock=admissionClock();let create!: (context:unknown)=>void,finishClose!:()=>void,closes=0,settled=false;
   const creation=new Promise(resolve=>{create=resolve;}),closing=new Promise<void>(resolve=>{finishClose=resolve;});
