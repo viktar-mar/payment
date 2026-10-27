@@ -198,6 +198,7 @@ export async function runOwnedSandboxDonations(browser:Browser,extras:SandboxAcc
 
 async function donationPayment(page:Page,context:BrowserContext,extras:SandboxAcceptanceExtras,kind:SandboxDonationKind,binding:OwnedSandboxPublicBinding,limits:OwnedSandboxLimits):Promise<void> {
   let posts=0,responses=0,original:Request|undefined,routeFailure=false,firstRouteFailure:unknown;
+  const checkRouteFailure=()=>{if(routeFailure)rethrowSandboxBrowserFailure(firstRouteFailure,'DONATION_PENDING');};
   let resolveForward!:()=>void,rejectForward!:(error:unknown)=>void;
   const forwarded=new Promise<void>((resolve,reject)=>{resolveForward=resolve;rejectForward=reject;});
   forwarded.catch(()=>{});
@@ -227,24 +228,36 @@ async function donationPayment(page:Page,context:BrowserContext,extras:SandboxAc
       genuine.catch(()=>{});
       try{
         await widget.getByRole('button',{name:'Create donation',exact:true}).click({timeout:timeout(limits)});
-        await bounded(()=>forwarded,limits);
+        await bounded(()=>forwarded,limits);checkRouteFailure();
       }catch(error){rethrowSandboxBrowserFailure(routeFailure?firstRouteFailure:error,'DONATION_PENDING');}
       return {genuine};
     });
     await runSandboxBrowserStep(kind,'DONATION_RESPONSE',async()=>{
+      checkRouteFailure();
       const response=await bounded(()=>genuine,limits);
+      checkRouteFailure();
       if(!original||posts!==1||responses!==1||routeFailure)fail();
-      await acknowledgeDonationResponse(response,original,extras,kind,binding,limits);
+      await acknowledgeDonationResponse(response,original,{ackDonationCreate:(ackKind,identity,ackLimits)=>{
+        checkRouteFailure();return extras.ackDonationCreate(ackKind,identity,ackLimits);
+      }},kind,binding,limits);
+      checkRouteFailure();
     });
     await runSandboxBrowserStep(kind,'DONATION_PAYMENT',async()=>{
+      checkRouteFailure();
       const frame=widget.frameLocator('iframe[title="Secure payment input frame"]');
       await frame.locator('input[name="number"]').fill('4242424242424242',{timeout:timeout(limits)});
+      checkRouteFailure();
       await frame.locator('input[name="expiry"]').fill('1230',{timeout:timeout(limits)});
+      checkRouteFailure();
       await frame.locator('input[name="cvc"]').fill('123',{timeout:timeout(limits)});
-      const postal=frame.locator('input[name="postalCode"]');if(await postal.isVisible())await postal.fill('10001',{timeout:timeout(limits)});
+      checkRouteFailure();
+      const postal=frame.locator('input[name="postalCode"]');if(await postal.isVisible()){checkRouteFailure();await postal.fill('10001',{timeout:timeout(limits)});}
+      checkRouteFailure();
       if(await extras.beforeDonationPay(kind,limits)!==true||posts!==1||responses!==1||routeFailure)fail();
       await widget.getByRole('button',{name:'Pay',exact:true}).click({timeout:timeout(limits)});
+      checkRouteFailure();
       if(await extras.confirmDonation(kind,{deadline:Math.min(limits.deadline,Date.now()+45000),signal:limits.signal})!==true||posts!==1||responses!==1||routeFailure)fail();
     });
-  }finally{page.off('response',observe);}
+  }catch(error){rethrowSandboxBrowserFailure(routeFailure?firstRouteFailure:error,'DONATION_PENDING');}
+  finally{page.off('response',observe);}
 }

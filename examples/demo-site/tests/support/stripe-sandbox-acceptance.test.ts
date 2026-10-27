@@ -161,6 +161,44 @@ test('failed forwarding reports its original token before the bounded second abo
     clock.fire(abortAlarm);await routeWork;assert.equal(routeSettled,true);assert.equal(aborts,2);assert.equal(keys,1);assert.equal(posts,1);
   }finally{clock.close();}
 });
+// Break: a resolved POST promise cannot carry a later OPTIONS failure to response/ACK/payment consumers.
+for(const [at,wantAcks,wantFills,wantBeforePay,wantPays,wantConfirms] of [
+  ['response',0,0,0,0,0],['responseReject',0,0,0,0,0],['body',0,0,0,0,0],['bodyReject',0,0,0,0,0],
+  ['ack',1,0,0,0,0],['ackReject',1,0,0,0,0],['fill',1,1,0,0,0],['fillReject',1,1,0,0,0],
+  ['beforePay',1,3,1,0,0],['beforePayReject',1,3,1,0,0],['pay',1,3,1,1,0],['payReject',1,3,1,1,0],
+  ['confirm',1,3,1,1,1],['confirmReject',1,3,1,1,1],
+] as const)test(`late forwarding failure before ${at} retains the first token and stops later authority`,async()=>{
+  let primary:unknown,reads=0,keys=0,posts=0,preflights=0,acks=0,fills=0,beforePay=0,pays=0,confirms=0,contexts=0,closes=0,bodyReads=0,forwarded=false;
+  const hostile=new Proxy({},{get(){reads++;throw null;},ownKeys(){reads++;throw null;}});
+  try{await runSandboxBrowserStep('anonymous','DONATION_DISPATCH',async()=>{throw hostile;});}catch(error){primary=error;}
+  const original=request();let handle!:(route:unknown)=>Promise<void>,observe:((response:unknown)=>void)=()=>{},receive!:(response:unknown)=>void,rejectReceipt!:(error:unknown)=>void;
+  const receipt=new Promise((resolve,reject)=>{receive=resolve;rejectReceipt=reject;});
+  const failPreflight=async()=>{
+    assert.equal(forwarded,true,'the original POST has already forwarded');preflights++;
+    await handle({request:()=>request('OPTIONS'),continue:async()=>{throw primary;},abort:async()=>{throw hostile;}});
+  };
+  const visit=async(stage:string)=>{if(at===stage||at===stage+'Reject'){await failPreflight();if(at.endsWith('Reject'))throw hostile;}};
+  const value={checkout_id:'00000000-0000-4000-8000-000000000010',payment_id:'00000000-0000-4000-8000-000000000020',checkout_token:'private-memory-only',
+    amount_minor:500,currency:'EUR',price:null,provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',provider_client_payload:{},status:'CREATED',expires_at:new Date(Date.now()+120000).toISOString(),
+    donation:{donation_id:'00000000-0000-4000-8000-000000000030',campaign_key:'s5a-donate',campaign_version:1}};
+  const response={request:()=>original,url:()=>endpoint,status:()=>201,body:async()=>{bodyReads++;await visit('body');return Buffer.from(JSON.stringify(value));}};
+  const widget={first(){return this;},locator:()=>({click:async()=>{},evaluate:async()=>true}),getByRole:(_role:string,{name}:{name:string})=>({click:async()=>{
+    if(name==='Create donation'){
+      posts++;await handle({request:()=>original,continue:async()=>{forwarded=true;observe(response);},abort:forbidden});
+      // Returning from the POST callback proves its forwarded promise has resolved before the late failure.
+      if(at==='response'||at==='responseReject')await failPreflight();
+      if(at==='responseReject')rejectReceipt(hostile);else receive(response);
+    }else{assert.equal(name,'Pay');pays++;await visit('pay');}
+  }}),frameLocator:()=>({locator:()=>({fill:async()=>{fills++;await visit('fill');},isVisible:async()=>false})})};
+  const page={goto:async()=>{},evaluate:async()=>true,locator:()=>widget,waitForResponse:()=>receipt,on:(_event:string,callback:typeof observe)=>{observe=callback;},off:()=>{}};
+  const browser={newContext:async()=>{contexts++;return {route:async(_url:string,callback:typeof handle)=>{handle=callback;},newPage:async()=>page,close:async()=>{closes++;throw hostile;}};}} as unknown as Browser;
+  const extras={beforeDonationCreate:async()=>{keys++;return 'synthetic-key';},ackDonationCreate:async()=>{acks++;await visit('ack');return true;},
+    beforeDonationPay:async()=>{beforePay++;await visit('beforePay');return true;},confirmDonation:async()=>{confirms++;await visit('confirm');return true;}} as unknown as SandboxAcceptanceExtras;
+  await assert.rejects(runOwnedSandboxDonations(browser,extras,binding,limits()),error=>error===primary);
+  assert.equal(posts,1);assert.equal(keys,1);assert.equal(preflights,1);assert.equal(contexts,1);assert.equal(closes,1);assert.equal(reads,0);
+  assert.equal(acks,wantAcks);assert.equal(fills,wantFills);assert.equal(beforePay,wantBeforePay);assert.equal(pays,wantPays);assert.equal(confirms,wantConfirms);
+  assert.equal(bodyReads,at==='response'||at==='responseReject'?0:1);
+});
 // I2: local admission expiry abandons ownership even while the original deadline is open.
 test('late donation context after local timeout is closed before the failed owner settles',async()=>{
   const clock=admissionClock();let create!: (context:unknown)=>void,finishClose!:()=>void,closes=0,settled=false;
