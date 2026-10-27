@@ -1042,6 +1042,25 @@ test('cleanup verifies exact identities, stops only recorded IDs and retains all
   await rejects(g.adapter.stop(LIMIT()),'STOP_PENDING');assert.equal(g.events.filter(e=>e.type==='process'&&e.args[5]==='stop').length,0);
 });
 
+// Break: clearing the failure latch during cleanup or treating persisted PENDING as failed stop proof.
+test('successful stop after an operation failure preserves PENDING resources and durable ledger and refuses later work',async()=>{
+  const f=await manualCredentialLive();
+  await rejects(f.adapter.withAdminCredentials(async()=>{throw new Error('synthetic operation failure');}),'ADMIN_PENDING');
+  assert.equal(f.adapter.resources().status,'PENDING');
+  assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);
+  assert.equal(f.adapter.resources().status,'PENDING');
+  const ledger=JSON.parse(f.files.get(DIR+'/runtime.json').contents);
+  assert.equal(ledger.status,'PENDING');
+  assert.ok(ledger.intents.every(intent=>intent.status==='ACKNOWLEDGED'));
+  assert.equal([...f.containers.values()].every(container=>container.State.Running===false),true);
+  assert.ok(f.events.some(event=>event.type==='close'&&event.path===DIR+'/owner.lock'));
+  const before=f.events.length;
+  await rejects(f.adapter.start(f.limits),'START_PENDING');
+  await rejects(f.adapter.verify(f.limits),'VERIFY_PENDING');
+  assert.equal(f.events.length,before);
+  assert.equal(JSON.parse(f.files.get(DIR+'/runtime.json').contents).status,'PENDING');
+});
+
 test('issuer chmod precedes chown so its minimal capabilities suffice, and Docker label key order is immaterial',async()=>{
   const f=fixture(),execute=f.dependencies.execute;
   f.dependencies.execute=async(...args)=>{

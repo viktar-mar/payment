@@ -232,3 +232,27 @@ A bounded private-ledger projection inspected only intent names/status: admin-se
 Only three module-owned literal stages are added: RETURN_POLICY_READ for that post-PUT reread, RETURN_POLICY_PROOF for its existing validation and PRODUCT_DISPATCH for product durable dispatch/save. Successful product dispatch restores FIXTURE_SETUP immediately before product HTTP, proof and acknowledgement. Nonmanual failures stay unbranded/UNKNOWN. The provision diagnostic remains exactly tag and stage, at most 256 UTF-8 bytes, after independent cleanup and before the unchanged final report; it includes no raw errors, HTTP data, status, IDs, paths, timing or counters, and never reads hostile error properties. Artificial ordinary/selected 3DS failures exercise the real provisioner and controller, pending latch, no later product/checkout/grant/proof/gateway, independent cleanup even on rejection and exact final reports. Existing success tests retain the successful path.
 
 This offline change adds diagnostic precision only. It changes no equality/proof predicate, request, one-shot capability, deadline, cleanup limit, report schema or native output mechanism, and performs no new runtime or provider operation. It neither fixes the unknown runtime cause nor renews authority for another attempt. Stage 5A remains **NOT_ACCEPTED**.
+
+## Offline prior-metadata inventory correction — 2026-10-27
+
+The auxiliary one-off admission predicate required every prior manifest to say
+`STOPPED`, conflating retained failure status with stopped resources. A synthetic
+test of the real bootstrap confirms that an injected operation failure followed by
+`stop` returning `true` retains `PENDING` in both resources and the durable ledger;
+later start and verify still fail without further effects. This failure latch is
+unchanged, and no historical manifest or report was read or rewritten for this fix.
+
+The pure `priorRuntimeInventory` helper now checks exact metadata identity, a trusted
+expected status limited to `PENDING` or `STOPPED`, the exact six/seven roles and full
+lowercase container IDs. It returns immutable unverified inventory, with no I/O,
+closure proof or READY decision. The corrected non-executable local reference pins
+`PENDING` only to prior run `75456a71-342e-4549-a5b2-b7dfd605ade3` at source
+`398ee98fbb70c86727d3301da8e38cc4690518ea`; its other three prior rows still require
+`STOPPED`. An unrelated `PENDING` row is refused when `STOPPED` is expected.
+
+The reference preserves process absence, all 40 exact-ID state/PID/ownership checks,
+private-file reads, capacity checks and native preflight. It was neither executed
+nor imported. The retained failed candidate configuration grants no resume authority;
+a future attempt requires a fresh candidate/source and new explicit runtime
+authorization. This correction used synthetic tests only. Actual Docker/process
+state remains unverified, no runtime is admitted, and Stage 5A remains **NOT_ACCEPTED**.

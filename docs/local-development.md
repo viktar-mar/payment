@@ -489,6 +489,18 @@ files. It never uses Compose down, prune, default Docker configuration or global
 Synthetic tests establish local behavior only; real Stage 5A acceptance remains pending
 until the root operator completes the separately approved runtime checks.
 
+An operation failure keeps bootstrap resources and the durable ledger `PENDING` even
+when `stop` subsequently returns `true`. That status retains the failure latch and
+never permits another start or verify. The pure `priorRuntimeInventory` helper checks
+parsed metadata against an exact trusted run/source/daemon/project, expected
+`PENDING` or `STOPPED` status, role set and full container IDs. Its frozen records
+identify unverified resources; they prove neither stopped state nor closure or READY.
+An unrelated `PENDING` row still fails a `STOPPED` expectation. Live admission still
+requires process absence, every exact-ID state/PID/ownership check, private-file and
+capacity checks, and native preflight. The 2026-10-27 correction was tested offline
+only; current runtime state remains unverified and a new attempt needs separate
+explicit authorization with a fresh candidate/source.
+
 The separate `playwright.stripe-sandbox.config.ts` retains its manual three-card workflow
 unless `PAYMENT_STRIPE_SANDBOX_OWNED_RUN=true`. The owned mode uses
 `openOwnedSandboxAcceptance({env,runId,expectedSource,daemon,ports}, {deadline,signal})`
