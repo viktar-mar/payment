@@ -111,8 +111,8 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
     // Rebuild the copied SDK; demo package resolution must not fall back to a
     // stale SDK installation or source files outside the staged COPY tree.
     typecheck('frontend/sdk',['-p','tsconfig.json']);
+    typecheck('examples/demo-site',['--noEmit']);
     for(const mode of ['manual-payment','form-diagnostic','production'])await t.test(mode,async()=>{
-      typecheck('examples/demo-site',['--noEmit']);
       assert.deepEqual((await readdir(join(directory,'infrastructure'))).sort(),[...publicInfrastructure].sort());
       const demo=join(directory,'examples/demo-site');
       await build({root:demo,configFile:join(demo,'vite.config.ts'),mode,logLevel:'silent'});

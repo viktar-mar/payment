@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test,{after,before,describe} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -6,7 +6,6 @@ import {join} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {createRequire} from 'node:module';
 import {Worker,isMainThread,parentPort,workerData} from 'node:worker_threads';
-import {build} from 'vite';
 
 const root=fileURLToPath(new URL('../..',import.meta.url));
 export async function exercise(entry:string,scenario:string,automatic=false,instrumented=false):Promise<void>{
@@ -18,43 +17,43 @@ export async function exercise(entry:string,scenario:string,automatic=false,inst
   });}finally{await worker.terminate();}
 }
 
-if(isMainThread&&process.argv[1]===fileURLToPath(import.meta.url))test('manual page uses the real SDK with bounded one-shot recovery',async t=>{
-  const directory=await mkdtemp(join(tmpdir(),'payment-manual-source-'));
-  try{
-    const bundle=async(mutation:string)=>{
-      const output=join(directory,mutation);
-      await build({root,configFile:false,logLevel:'silent',resolve:{alias:{'@generic-payments/sdk':root+'/../../frontend/sdk/src/index.ts'}},
-        plugins:[{name:'test-only-real-path-observation',enforce:'pre',transform(code,id){
-          if(id.endsWith('/checkout-provider-view.ts'))code=code.replace('this.#diagnostic = formLoadBinding(host);','this.#diagnostic = formLoadBinding(host);globalThis.__manualView=this;');
-          if(id.endsWith('/manual-form-readiness.ts')){
-            code=code.replace('return Object.freeze({snapshot,close});','return globalThis.__manualReadiness=Object.freeze({snapshot,close});');
-            if(mutation==='projection')code=code.replace('current.assignedSlot??','');
-            if(mutation==='owned-reader')code=code.replace('ownedProviderHost(widget)','widget.shadowRoot?.querySelector(".payment-element")');
-          }
-          if(id.endsWith('/stripe-driver.ts'))code=code.replace('return {\n    async confirm()', 'return globalThis.__manualHandle = {\n    async confirm()');
-          if(id.endsWith('/form-load-manual.ts')){
-            code=code.replace('const result=classifyFormDiagnosticSample(value);','const result=classifyFormDiagnosticSample(value);(globalThis.__manualTrace??=[]).push({widget_state:value.widget_state,widget_completed:value.widget_completed,operation:value.operation,result});');
-            if(mutation==='one-shot')code=code.replace('if(started||closed)return;','if(closed)return;');
-            if(mutation==='expired-start')code=code.replaceAll('||now()-startTime>=60000','').replaceAll('if(now()-startTime>=60000){finish();return;}','');
-          }
-          if(mutation==='deny'&&id.endsWith('/form-load-observer.ts'))code=code.replace('if (!binding) return;\n  // Captured binding identity','return;\n  // Captured binding identity');
-          return code;
-        }}],build:{outDir:output,lib:{entry:root+'/src/form-load-manual.ts',formats:['es'],fileName:()=> 'manual.mjs'}}});
-      return pathToFileURL(join(output,'manual.mjs')).href;
-    };
-    const entry=await bundle('control');
-    for(const scenario of ['no-click','synchronous-ready','delayed-ready','ready-snapshot-hidden-to-visible','ready-snapshot-visible-to-hidden','after-checkpoint','frame-only','pay-only','late-ready','slow-session','late-session','late-body','expired-start','malformed','missing','expired','exchange-failure','recovery-failure','late-recovery','close','pagehide','abort','evidence-positive','evidence-hidden','evidence-slot-hidden','evidence-wrapper-hidden','evidence-foreign-host','evidence-host-reinsert','evidence-host-replace','evidence-absent','evidence-multiple','evidence-replaced','evidence-load','evidence-loaderstart','evidence-csp','evidence-untrusted','evidence-abort','evidence-close','evidence-no-host','evidence-unavailable','evidence-csp-unavailable','evidence-late-replaced','evidence-late-load','widget-loss-detach','widget-loss-replace','widget-loss-detach-immediate','widget-loss-replace-immediate','widget-loss-reinsert-immediate'])
-      await t.test(scenario,()=>exercise(entry,scenario,false,true));
-    for(const [mutation,scenario,reason] of [['deny','synchronous-ready','deny_view_after_observer_close'],['one-shot','delayed-ready','one_shot_exchange'],['expired-start','expired-start','expired_start_operation']])
-      await t.test('in-memory mutation is detected: '+mutation,async()=>{
-        const mutant=await bundle(mutation!);
-        await assert.rejects(exercise(mutant,scenario!,false,true),error=>{assert.ok(error instanceof Error);assert.ok(error.message.includes(reason!),error.message);t.diagnostic(mutation+' RED detected: '+error.message.split('\n')[0]);return true;});
-      });
-    for(const [mutation,scenario,reason] of [['projection','evidence-wrapper-hidden','composed_host_visibility'],['owned-reader','evidence-load','owned_host_frame_geometry']])
-      await t.test('reader regression mutation is detected: '+mutation,async()=>{
-        const mutant=await bundle(mutation!);await assert.rejects(exercise(mutant,scenario!,false,true),error=>error instanceof Error&&error.message.includes(reason!));
-      });
-  }finally{await rm(directory,{recursive:true,force:true});}
+if(isMainThread&&process.argv[1]===fileURLToPath(import.meta.url))describe('manual page uses the real SDK with bounded one-shot recovery',{concurrency:1},()=>{
+  let directory='',entry='';
+  const bundle=async(mutation:string)=>{
+    const {build}=await import('vite');
+    const output=join(directory,mutation);
+    await build({root,configFile:false,logLevel:'silent',resolve:{alias:{'@generic-payments/sdk':root+'/../../frontend/sdk/src/index.ts'}},
+      plugins:[{name:'test-only-real-path-observation',enforce:'pre',transform(code,id){
+        if(id.endsWith('/checkout-provider-view.ts'))code=code.replace('this.#diagnostic = formLoadBinding(host);','this.#diagnostic = formLoadBinding(host);globalThis.__manualView=this;');
+        if(id.endsWith('/manual-form-readiness.ts')){
+          code=code.replace('return Object.freeze({snapshot,close});','return globalThis.__manualReadiness=Object.freeze({snapshot,close});');
+          if(mutation==='projection')code=code.replace('current.assignedSlot??','');
+          if(mutation==='owned-reader')code=code.replace('ownedProviderHost(widget)','widget.shadowRoot?.querySelector(".payment-element")');
+        }
+        if(id.endsWith('/stripe-driver.ts'))code=code.replace('return {\n    async confirm()', 'return globalThis.__manualHandle = {\n    async confirm()');
+        if(id.endsWith('/form-load-manual.ts')){
+          code=code.replace('const result=classifyFormDiagnosticSample(value);','const result=classifyFormDiagnosticSample(value);(globalThis.__manualTrace??=[]).push({widget_state:value.widget_state,widget_completed:value.widget_completed,operation:value.operation,result});');
+          if(mutation==='one-shot')code=code.replace('if(started||closed)return;','if(closed)return;');
+          if(mutation==='expired-start')code=code.replaceAll('||now()-startTime>=60000','').replaceAll('if(now()-startTime>=60000){finish();return;}','');
+        }
+        if(mutation==='deny'&&id.endsWith('/form-load-observer.ts'))code=code.replace('if (!binding) return;\n  // Captured binding identity','return;\n  // Captured binding identity');
+        return code;
+      }}],build:{outDir:output,lib:{entry:root+'/src/form-load-manual.ts',formats:['es'],fileName:()=> 'manual.mjs'}}});
+    return pathToFileURL(join(output,'manual.mjs')).href;
+  };
+  before(async()=>{directory=await mkdtemp(join(tmpdir(),'payment-manual-source-'));entry=await bundle('control');});
+  after(async()=>{if(directory)await rm(directory,{recursive:true,force:true});});
+  for(const scenario of ['no-click','synchronous-ready','delayed-ready','ready-snapshot-hidden-to-visible','ready-snapshot-visible-to-hidden','after-checkpoint','frame-only','pay-only','late-ready','slow-session','late-session','late-body','expired-start','malformed','missing','expired','exchange-failure','recovery-failure','late-recovery','close','pagehide','abort','evidence-positive','evidence-hidden','evidence-slot-hidden','evidence-wrapper-hidden','evidence-foreign-host','evidence-host-reinsert','evidence-host-replace','evidence-absent','evidence-multiple','evidence-replaced','evidence-load','evidence-loaderstart','evidence-csp','evidence-untrusted','evidence-abort','evidence-close','evidence-no-host','evidence-unavailable','evidence-csp-unavailable','evidence-late-replaced','evidence-late-load','widget-loss-detach','widget-loss-replace','widget-loss-detach-immediate','widget-loss-replace-immediate','widget-loss-reinsert-immediate'])
+    test(scenario,()=>exercise(entry,scenario,false,true));
+  for(const [mutation,scenario,reason] of [['deny','synchronous-ready','deny_view_after_observer_close'],['one-shot','delayed-ready','one_shot_exchange'],['expired-start','expired-start','expired_start_operation']])
+    test('in-memory mutation is detected: '+mutation,async t=>{
+      const mutant=await bundle(mutation!);
+      await assert.rejects(exercise(mutant,scenario!,false,true),error=>{assert.ok(error instanceof Error);assert.ok(error.message.includes(reason!),error.message);t.diagnostic(mutation+' RED detected: '+error.message.split('\n')[0]);return true;});
+    });
+  for(const [mutation,scenario,reason] of [['projection','evidence-wrapper-hidden','composed_host_visibility'],['owned-reader','evidence-load','owned_host_frame_geometry']])
+    test('reader regression mutation is detected: '+mutation,async()=>{
+      const mutant=await bundle(mutation!);await assert.rejects(exercise(mutant,scenario!,false,true),error=>error instanceof Error&&error.message.includes(reason!));
+    });
 });
 
 if(!isMainThread){

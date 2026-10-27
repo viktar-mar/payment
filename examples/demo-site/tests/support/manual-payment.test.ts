@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test,{after,before,describe} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -6,7 +6,6 @@ import {join} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {createRequire} from 'node:module';
 import {Worker,isMainThread,parentPort,workerData} from 'node:worker_threads';
-import {build} from 'vite';
 const root=fileURLToPath(new URL('../..',import.meta.url));
 // These literals catch wrong phase/status classification and accidental raw-data exposure.
 const loadFailures:Record<string,string>={
@@ -24,29 +23,31 @@ export async function exercise(entry:string,scenario:string,automatic=false):Pro
   const worker=new Worker(new URL(import.meta.url),{workerData:{entry,scenario,automatic}});
   try{await new Promise<void>((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('offline_manual_payment_timeout')),10000);worker.once('message',value=>{clearTimeout(timer);assert.equal(value,'PASS');resolve();});worker.once('error',error=>{clearTimeout(timer);reject(error);});});}finally{await worker.terminate();}
 }
-if(isMainThread&&process.argv[1]===fileURLToPath(import.meta.url))test('real SDK manual payment page spends one permit and never retries after any outcome',async t=>{
-  const directory=await mkdtemp(join(tmpdir(),'manual-payment-source-'));
-  try{
-    const bundle=async(mutation='control')=>{
-      const output=join(directory,mutation);
-      await build({root,configFile:false,logLevel:'silent',resolve:{alias:{'@generic-payments/sdk':root+'/../../frontend/sdk/src/index.ts'}},
-        plugins:[{name:'capture-real-handle',enforce:'pre',transform(code,id){
-          if(id.endsWith('/stripe-driver.ts'))code=code.replace('return {\n    async confirm()', 'return globalThis.__manualHandle = {\n    async confirm()');
-          if(mutation==='mixed'&&id.endsWith('/manual-payment.ts'))code=code.replace("from '../../../frontend/sdk/src/diagnostics/manual-payment-authorization'", "from '../../../frontend/sdk/src/diagnostics/manual-payment-authorization?separate-graph'");
-          if(mutation==='start-latch'&&id.endsWith('/manual-payment.ts'))code=code.replace('if(started||!active())return;','if(!active())return;').replace('started=true;start.disabled=true;','started=true;');
-          return code;
-        }}],build:{outDir:output,lib:{entry:root+'/src/manual-payment.ts',formats:['es'],fileName:()=> 'manual.mjs'}}});return pathToFileURL(join(output,'manual.mjs')).href;
-    };
-    const entry=await bundle();for(const scenario of ['no-click','success','ordinary-ready','validation','grant-rejected','grant-closed','grant-malformed','late-grant','pagehide','close','expired','mixed-session','malformed','late-session','expired-start','programmatic','enter','detached','session-http-timeout','session-body-http-timeout','permit-http-timeout','permit-body-http-timeout',...['get','post','refresh'].flatMap(stage=>['headers','body','pagehide','detached','late'].map(phase=>`sdk-${stage}-${phase}`)),'sdk-post-host','sdk-refresh-host'])await t.test(scenario,()=>exercise(entry,scenario));
-    for(const scenario of ['success','failed','unknown','expired','checking','processing','requires_action','pagehide','close','abort','detached','timeout'])await t.test('3ds-challenge-'+scenario,()=>exercise(entry,'3ds-challenge-'+scenario));
-    for(const sequence of ['repeated-action','processing-action'])for(const end of ['close','expiry'])await t.test(`3ds-challenge-${sequence}-${end}`,()=>exercise(entry,`3ds-challenge-${sequence}-${end}`));
-    for(const scenario of ['no-click','success','validation','grant-rejected','grant-closed','grant-malformed','late-grant','permit-http-timeout','permit-body-http-timeout'])await t.test('3ds-'+scenario,()=>exercise(entry,'3ds-'+scenario));
-    for(const scenario of Object.keys(loadFailures).filter(name=>!['malformed','mixed-session','expired','instrumentation','session-http-timeout','session-body-http-timeout'].includes(name)))await t.test(scenario,()=>exercise(entry,scenario));
-    const mixed=await bundle('mixed');await t.test('missing module instrumentation fails before Pay',()=>exercise(mixed,'instrumentation'));
-    const mutant=await bundle('start-latch');await t.test('behavioral start latch mutation is detected',async()=>{
-      await assert.rejects(exercise(mutant,'success'),error=>error instanceof Error&&error.message.includes('one_shot_session_exchange'));
-    });
-  }finally{await rm(directory,{recursive:true,force:true});}
+if(isMainThread&&process.argv[1]===fileURLToPath(import.meta.url))describe('real SDK manual payment page spends one permit and never retries after any outcome',{concurrency:1},()=>{
+  let directory='',entry='';
+  const bundle=async(mutation='control')=>{
+    const {build}=await import('vite');
+    const output=join(directory,mutation);
+    await build({root,configFile:false,logLevel:'silent',resolve:{alias:{'@generic-payments/sdk':root+'/../../frontend/sdk/src/index.ts'}},
+      plugins:[{name:'capture-real-handle',enforce:'pre',transform(code,id){
+        if(id.endsWith('/stripe-driver.ts'))code=code.replace('return {\n    async confirm()', 'return globalThis.__manualHandle = {\n    async confirm()');
+        if(mutation==='mixed'&&id.endsWith('/manual-payment.ts'))code=code.replace("from '../../../frontend/sdk/src/diagnostics/manual-payment-authorization'", "from '../../../frontend/sdk/src/diagnostics/manual-payment-authorization?separate-graph'");
+        if(mutation==='start-latch'&&id.endsWith('/manual-payment.ts'))code=code.replace('if(started||!active())return;','if(!active())return;').replace('started=true;start.disabled=true;','started=true;');
+        return code;
+      }}],build:{outDir:output,lib:{entry:root+'/src/manual-payment.ts',formats:['es'],fileName:()=> 'manual.mjs'}}});return pathToFileURL(join(output,'manual.mjs')).href;
+  };
+  before(async()=>{directory=await mkdtemp(join(tmpdir(),'manual-payment-source-'));entry=await bundle();});
+  after(async()=>{if(directory)await rm(directory,{recursive:true,force:true});});
+  for(const scenario of ['no-click','success','ordinary-ready','validation','grant-rejected','grant-closed','grant-malformed','late-grant','pagehide','close','expired','mixed-session','malformed','late-session','expired-start','programmatic','enter','detached','session-http-timeout','session-body-http-timeout','permit-http-timeout','permit-body-http-timeout',...['get','post','refresh'].flatMap(stage=>['headers','body','pagehide','detached','late'].map(phase=>`sdk-${stage}-${phase}`)),'sdk-post-host','sdk-refresh-host'])test(scenario,()=>exercise(entry,scenario));
+  for(const scenario of ['success','failed','unknown','expired','checking','processing','requires_action','pagehide','close','abort','detached','timeout'])test('3ds-challenge-'+scenario,()=>exercise(entry,'3ds-challenge-'+scenario));
+  for(const sequence of ['repeated-action','processing-action'])for(const end of ['close','expiry'])test(`3ds-challenge-${sequence}-${end}`,()=>exercise(entry,`3ds-challenge-${sequence}-${end}`));
+  for(const scenario of ['no-click','success','validation','grant-rejected','grant-closed','grant-malformed','late-grant','permit-http-timeout','permit-body-http-timeout'])test('3ds-'+scenario,()=>exercise(entry,'3ds-'+scenario));
+  for(const scenario of Object.keys(loadFailures).filter(name=>!['malformed','mixed-session','expired','instrumentation','session-http-timeout','session-body-http-timeout'].includes(name)))test(scenario,()=>exercise(entry,scenario));
+  test('missing module instrumentation fails before Pay',async()=>{const mixed=await bundle('mixed');await exercise(mixed,'instrumentation');});
+  test('behavioral start latch mutation is detected',async()=>{
+    const mutant=await bundle('start-latch');
+    await assert.rejects(exercise(mutant,'success'),error=>error instanceof Error&&error.message.includes('one_shot_session_exchange'));
+  });
 });
 if(!isMainThread){
   const require=createRequire(new URL('../../../../frontend/sdk/package.json',import.meta.url));const {JSDOM}=require('jsdom');
