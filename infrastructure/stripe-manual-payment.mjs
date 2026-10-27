@@ -15,6 +15,13 @@ function exact(value,keys){
     const copy={};for(const key of keys){if(!d[key]?.enumerable||!Object.hasOwn(d[key],'value'))return null;copy[key]=d[key].value;}return copy;
   }catch{return null;}
 }
+function preflightDiagnosticLine(reply){
+  const codes={OPT_IN:'OPT_IN_REQUIRED',INPUTS:'CONFIGURATION',SOURCE:'SOURCE_MISMATCH',DAEMON:'DAEMON_UNCONFIRMED',PORTS:'PORT_UNAVAILABLE'};
+  const value=exact(reply,['status','phase','code']);
+  const known=value?.status==='PENDING'&&typeof value.phase==='string'&&Object.hasOwn(codes,value.phase)&&value.code===codes[value.phase];
+  const phase=known?value.phase:'UNKNOWN',code=known?codes[phase]:'UNKNOWN';
+  return JSON.stringify({tag:'stripe_manual_payment_preflight_diagnostic',phase,code})+'\n';
+}
 function stdoutWriter(stream){return text=>new Promise((accept,reject)=>{const error=()=>reject();stream.once('error',error);try{stream.write(text,failed=>{if(failed){reject();return;}stream.removeListener('error',error);accept();});}catch{stream.removeListener('error',error);reject();}});}
 const stdout=text=>stdoutWriter(process.stdout)(text);
 
@@ -29,6 +36,7 @@ export async function runManualPayment(options,originalLimits,deps={}){
   const origin='http://127.0.0.1:'+selected.manualPort,canonical=origin+'/manual-payment.html';
   let phase='PREPARE',failed=false,closing=false,grantUsed=false,granted=false,unused=false,authStarted=false,authCompleted=false,bootstrap,cli,provisioner,gateway;
   let gatewayAttempted=false,cliAttempted=false,bootstrapAttempted=false;
+  let preflightDiagnostic;
   let authDiagnostic,authDiagnosticFinalized=false;
   let provisionDiagnostic,provisionDiagnosticFinalized=false,provisionStarted=false,provisionPrepared=false;
   const threeDSecure=selected.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS==='true';
@@ -53,8 +61,11 @@ export async function runManualPayment(options,originalLimits,deps={}){
     try{const ok=await bounded(close(kind,value,method),Math.min(cleanup.deadline,now()+30000));if(field)proof[field]=ok===true&&now()<cleanup.deadline;if(ok!==true)failed=true;}catch{failed=true;}
   }
   try{
-    const preflight=deps.preflight??(await import('./stripe-sandbox-owned.mjs')).preflightOwnedManualPayment;
-    if(exact(await operation(()=>preflight(selected)),['status'])?.status!=='READY')throw null;
+    try{
+      const preflight=deps.preflight??(await import('./stripe-sandbox-owned.mjs')).preflightOwnedManualPayment;
+      const reply=await operation(()=>preflight(selected));
+      if(exact(reply,['status'])?.status!=='READY'){preflightDiagnostic=preflightDiagnosticLine(reply);throw null;}
+    }catch{preflightDiagnostic??=preflightDiagnosticLine(undefined);throw null;}
     bootstrapAttempted=true;
     const createBootstrap=deps.createBootstrap??(await import('./stripe-sandbox-bootstrap.mjs')).createOwnedManualPaymentBootstrap;
     await operation(()=>createBootstrap(selected),acquired('bootstrap','stop',value=>{bootstrap=value;}),'runtime');
@@ -128,6 +139,16 @@ export async function runManualPayment(options,originalLimits,deps={}){
     // All late work is observed. Positive closure requires it to have settled;
     // timeout still leaves each acquired capability's one close attempt owned.
     try{while(work.size)await bounded(Promise.allSettled([...work]),cleanup.deadline);}catch{failed=true;}
+    if(preflightDiagnostic){
+      try{
+        const writeDiagnostic=deps.writePreflightDiagnostic;
+        if(writeDiagnostic){
+          const diagnosticDeadline=Math.min(cleanup.deadline,now()+1000);
+          if(now()>=diagnosticDeadline)throw null;
+          await bounded(Promise.resolve().then(()=>{if(now()>=diagnosticDeadline)throw null;return writeDiagnostic(preflightDiagnostic);}),diagnosticDeadline);
+        }
+      }catch{failed=true;}
+    }
     // Keep timeout fallback provisional until the existing child/work drain can
     // deliver its first classified failure; later settlement cannot change it.
     if(authStarted&&!authCompleted)authDiagnostic??=formatManualPaymentAuthDiagnostic(undefined);
@@ -182,7 +203,7 @@ export async function runManualPaymentCli(input,deps={}){
   }finally{unsubscribe?.();}
 }
 export async function runManualPaymentEntry(input,capabilities,deps={}){
-  let code=1;try{const value=await runManualPaymentCli(input,Object.create(deps,{write:{value:stdoutWriter(capabilities.stdout)},...(capabilities.stderr?{writeAuthDiagnostic:{value:stdoutWriter(capabilities.stderr)},writeProvisionDiagnostic:{value:stdoutWriter(capabilities.stderr)}}:{})}));code=value.exitCode;}catch{}
+  let code=1;try{const value=await runManualPaymentCli(input,Object.create(deps,{write:{value:stdoutWriter(capabilities.stdout)},...(capabilities.stderr?{writePreflightDiagnostic:{value:stdoutWriter(capabilities.stderr)},writeAuthDiagnostic:{value:stdoutWriter(capabilities.stderr)},writeProvisionDiagnostic:{value:stdoutWriter(capabilities.stderr)}}:{})}));code=value.exitCode;}catch{}
   capabilities.exit(code);
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))void runManualPaymentEntry({env:process.env,args:process.argv.slice(2)},{stdout:process.stdout,stderr:process.stderr,exit:code=>process.exit(code)});

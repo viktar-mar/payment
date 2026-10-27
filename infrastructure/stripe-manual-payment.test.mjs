@@ -43,6 +43,7 @@ test('remainder exclusion precedes snapshots configuration and dependencies',asy
 import {EventEmitter} from 'node:events';
 import {authorizeManualPaymentCli} from './stripe-manual-payment-auth.mjs';
 import {createManualPaymentProvisioner} from './stripe-form-diagnostic-provision.mjs';
+import {preflightOwnedManualPayment} from './stripe-sandbox-owned.mjs';
 const module=await import('./stripe-manual-payment.mjs').catch(()=>({}));
 const {runManualPayment=async()=>({report:{result:'FAILED'},exitCode:1}),runManualPaymentCli=async()=>({exitCode:1})}=module;
 const runId='7deaf3e1-1247-4d80-9cf5-67ebcd24429a',expectedSource='a'.repeat(40);
@@ -425,4 +426,66 @@ for(const mode of ['reject','stall'])test('provision entry stderr '+mode+' canno
  const stdout=Object.assign(new EventEmitter(),{write(text,done){out.push(text);done();}}),stderr=Object.assign(new EventEmitter(),{write(text,done){writes++;if(mode==='reject')done(Error('synthetic write failure'));}});
  const task=module.runManualPaymentEntry(cliInput(),{stdout,stderr,exit:value=>{code=value;}},f.deps);await f.tick(1000);if(mode==='stall')await f.tick(2000);await task;
  assert.equal(code,1);assert.equal(writes,1);assert.equal(out.length,1);assert.equal(JSON.parse(out[0]).result,'PENDING');assert.equal(f.timers.size,0);
+});
+
+// Break: discarding the initial refusal, accepting a non-READY reply, or extending its authority.
+function initialPendingReport(threeDSecure=false){return {version:1,mode:threeDSecure?'MANUAL_3DS':'MANUAL_PAYMENT',result:'PENDING',phase:'PREPARE',confirmation_granted:false,payment_confirmed:false,provider_confirmed:false,webhook_verified:false,journal_verified:false,callback_verified:false,gateway_closed:true,listener_closed:true,runtime_closed:true,browser_closure:'NOT_OWNED',provenance:'CONTROLLER_REPORTED',...(threeDSecure?{three_ds_verified:false}:{})};}
+for(const [phase,code]of [['OPT_IN','OPT_IN_REQUIRED'],['INPUTS','CONFIGURATION'],['SOURCE','SOURCE_MISMATCH'],['DAEMON','DAEMON_UNCONFIRMED'],['PORTS','PORT_UNAVAILABLE']])
+ for(const threeDSecure of [false,true])test('initial preflight refusal retains safe '+phase+' code for '+(threeDSecure?'3DS':'ordinary')+' without later capabilities',async()=>{
+  const f=fixture(),diagnostics=[];f.deps.preflight=async()=>{f.calls.push('preflight');return {status:'PENDING',phase,code};};f.deps.writePreflightDiagnostic=async line=>diagnostics.push(line);
+  const selected={...options,env:{...options.env,...(threeDSecure?{PAYMENT_STRIPE_SANDBOX_MANUAL_3DS:'true'}:{})}};
+  const value=await runManualPayment(selected,f.limits,f.deps);
+  assert.equal(value.exitCode,1);assert.deepEqual(value.report,initialPendingReport(threeDSecure));assert.deepEqual(f.calls,['preflight']);assert.equal(f.financialRetries,0);assert.equal(f.timers.size,0);
+  assert.equal(diagnostics.length,1);assert.deepEqual(JSON.parse(diagnostics[0]),{tag:'stripe_manual_payment_preflight_diagnostic',phase,code});assert.ok(Buffer.byteLength(diagnostics[0])<=256);assert.ok(diagnostics[0].endsWith('\n'));
+ });
+test('initial preflight malformed replies emit only UNKNOWN without evaluating accessors or copying private fields',async()=>{
+ let reads=0;const known={status:'PENDING',phase:'SOURCE',code:'SOURCE_MISMATCH'};
+ const accessor=Object.defineProperty({status:'PENDING',code:'SOURCE_MISMATCH'},'phase',{enumerable:true,get(){reads++;throw Error('synthetic-private');}});
+ const hidden=Object.defineProperty({...known},'code',{enumerable:false,value:'SOURCE_MISMATCH'});
+ for(const reply of [null,undefined,'synthetic-private',{...known,status:'READY'},{...known,code:'PORT_UNAVAILABLE'},{...known,phase:'synthetic-private'},{...known,code:'synthetic-private'},{...known,private:'synthetic-private'},{...known,[Symbol('synthetic-private')]:true},Object.create(known),accessor,hidden,new Proxy({},{ownKeys(){throw Error('synthetic-private');}})]){
+  const f=fixture(),diagnostics=[];f.deps.preflight=async()=>{f.calls.push('preflight');return reply;};f.deps.writePreflightDiagnostic=async line=>diagnostics.push(line);
+  const value=await runManualPayment(options,f.limits,f.deps);assert.deepEqual(value.report,initialPendingReport());assert.equal(value.exitCode,1);assert.deepEqual(f.calls,['preflight']);assert.equal(f.timers.size,0);
+  assert.deepEqual(diagnostics,['{"tag":"stripe_manual_payment_preflight_diagnostic","phase":"UNKNOWN","code":"UNKNOWN"}\n']);
+ }
+ assert.equal(reads,0);
+});
+test('initial preflight hostile rejection is not inspected and cannot suppress the safe diagnostic or final report',async()=>{
+ const f=fixture(),diagnostics=[],writes=[];let reads=0;f.deps.subscribe=()=>()=>{};f.deps.write=async line=>writes.push(line);
+ f.deps.preflight=async()=>{f.calls.push('preflight');throw new Proxy({},{get(){reads++;throw null;},getPrototypeOf(){reads++;throw null;},ownKeys(){reads++;throw null;}});};f.deps.writePreflightDiagnostic=async line=>diagnostics.push(line);
+ const value=await runManualPaymentCli(cliInput(),f.deps);assert.equal(reads,0);assert.equal(value.exitCode,1);assert.deepEqual(value.report,initialPendingReport());assert.deepEqual(f.calls,['preflight']);assert.equal(writes.length,1);assert.deepEqual(JSON.parse(writes[0]),initialPendingReport());assert.equal(f.timers.size,0);
+ assert.deepEqual(diagnostics,['{"tag":"stripe_manual_payment_preflight_diagnostic","phase":"UNKNOWN","code":"UNKNOWN"}\n']);
+});
+for(const phase of ['SOURCE','DAEMON','PORTS'])for(const threeDSecure of [false,true])test('real initial admission '+phase+' refusal reaches entry stderr before sole unchanged '+(threeDSecure?'3DS':'ordinary')+' report',async()=>{
+ const f=fixture(),out=[],err=[],order=[],input=cliInput();let code;if(threeDSecure)input.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';f.deps.subscribe=()=>()=>{};
+ f.deps.preflight=async selected=>{f.calls.push('preflight');return preflightOwnedManualPayment(selected,{
+  execute:async(file,args)=>({stdout:file.endsWith('/git')?(args.includes('rev-parse')?(phase==='SOURCE'?'b'.repeat(40):expectedSource)+'\n':''):phase==='DAEMON'?'"windows"\n':'"linux"\n',stderr:''}),
+  lstat:async path=>{if(path==='/private/var/empty/config.json')throw Object.assign(Error('synthetic absent'),{code:'ENOENT'});return path==='/private/var/empty'?{isDirectory:()=>true,isSymbolicLink:()=>false,uid:0,mode:0o40755}:{isSocket:()=>true,isSymbolicLink:()=>false,uid:process.getuid()};},
+  realpath:async path=>path,portAvailable:async()=>phase!=='PORTS'
+ });};
+ const stream=(lines,name)=>Object.assign(new EventEmitter(),{write(text,done){lines.push(text);order.push(name);done();return true;}});
+ await module.runManualPaymentEntry(input,{stdout:stream(out,'stdout'),stderr:stream(err,'stderr'),exit:value=>{code=value;}},f.deps);
+ assert.equal(code,1);assert.deepEqual(f.calls,['preflight']);assert.deepEqual(order,['stderr','stdout']);assert.equal(out.length,1);assert.deepEqual(JSON.parse(out[0]),initialPendingReport(threeDSecure));
+ const expectedCode={SOURCE:'SOURCE_MISMATCH',DAEMON:'DAEMON_UNCONFIRMED',PORTS:'PORT_UNAVAILABLE'}[phase];assert.equal(err.length,1);assert.deepEqual(JSON.parse(err[0]),{tag:'stripe_manual_payment_preflight_diagnostic',phase,code:expectedCode});assert.equal(f.timers.size,0);
+});
+for(const fail of [undefined,'prepare','auth','binding','provision','server'])test('no initial preflight diagnostic after READY even for later '+String(fail),async()=>{
+ const f=fixture({fail}),diagnostics=[];f.deps.writePreflightDiagnostic=async line=>diagnostics.push(line);await runManualPayment(options,f.limits,f.deps);assert.deepEqual(diagnostics,[]);assert.equal(f.timers.size,0);
+});
+for(const mode of ['reject','stall','ceiling','expired'])test('initial preflight diagnostic '+mode+' cannot suppress sole final stdout or renew original bounds',async()=>{
+ const f=fixture(),writes=[],diagnostics=[];f.deps.subscribe=()=>()=>{};f.deps.write=async line=>writes.push(line);
+ f.deps.preflight=async()=>{f.calls.push('preflight');if(mode==='ceiling')f.clock.value=2820500;if(mode==='expired')f.clock.value=2821000;return {status:'PENDING',phase:'PORTS',code:'PORT_UNAVAILABLE'};};
+ f.deps.writePreflightDiagnostic=line=>{diagnostics.push(line);if(mode==='reject')throw Error('synthetic-private');return new Promise(()=>{});};
+ let settled=false;const task=runManualPaymentCli(cliInput(),f.deps).then(value=>{settled=true;return value;});await f.tick(1000);
+ assert.equal(diagnostics.length,mode==='expired'?0:1);if(mode==='stall'||mode==='ceiling'){assert.equal(settled,false);await f.tick(mode==='ceiling'?2821000:2000);}
+ const value=await task;assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(writes.length,1);assert.deepEqual(f.calls,['preflight']);assert.equal(f.timers.size,0);assert.ok(!writes.join('').includes('synthetic-private'));
+});
+for(const window of ['one-second','cleanup'])test('initial preflight diagnostic deferred dispatch rechecks '+window+' cutoff',async()=>{
+ const f=fixture(),diagnostics=[];f.deps.preflight=async()=>{f.calls.push('preflight');if(window==='cleanup')f.clock.value=2820500;return {status:'PENDING',phase:'PORTS',code:'PORT_UNAVAILABLE'};};f.deps.writePreflightDiagnostic=async line=>diagnostics.push(line);
+ const schedule=f.deps.setTimeout;let crossed=false;f.deps.setTimeout=(fn,delay)=>{if(!crossed&&delay===(window==='cleanup'?500:1000)&&f.calls.includes('preflight')){crossed=true;f.clock.value=window==='cleanup'?2821000:2000;}return schedule(fn,delay);};
+ const value=await runManualPayment(options,f.limits,f.deps);assert.equal(crossed,true);assert.deepEqual(diagnostics,[]);assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.deepEqual(f.calls,['preflight']);assert.equal(f.timers.size,0);
+});
+for(const mode of ['reject','stall'])test('initial preflight entry stderr '+mode+' still attempts one final stdout without retries',async()=>{
+ const f=fixture(),out=[];let writes=0,code;f.deps.subscribe=()=>()=>{};f.deps.preflight=async()=>{f.calls.push('preflight');return {status:'PENDING',phase:'SOURCE',code:'SOURCE_MISMATCH'};};
+ const stdout=Object.assign(new EventEmitter(),{write(text,done){out.push(text);done();}}),stderr=Object.assign(new EventEmitter(),{write(text,done){writes++;if(mode==='reject')done(Error('synthetic-private'));}});
+ const task=module.runManualPaymentEntry(cliInput(),{stdout,stderr,exit:value=>{code=value;}},f.deps);await f.tick(1000);if(mode==='stall')await f.tick(2000);await task;
+ assert.equal(code,1);assert.equal(writes,1);assert.equal(out.length,1);assert.deepEqual(JSON.parse(out[0]),initialPendingReport());assert.deepEqual(f.calls,['preflight']);assert.equal(f.timers.size,0);
 });

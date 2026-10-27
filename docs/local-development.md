@@ -934,6 +934,24 @@ account identity: callback success, actual child close exit 0 and independent
 account binding remain required. Offline synthetic coverage does not establish
 that this warning was the sole cause of a prior failure or that a live run succeeds.
 
+If the initial manual-payment preflight refuses admission, the direct entry attempts
+one stderr JSON line after existing cleanup attempts and before the unchanged final
+stdout report. It contains only `tag="stripe_manual_payment_preflight_diagnostic"`,
+`phase` and `code`, at most 256 UTF-8 bytes. Exact known PENDING pairs retain
+OPT_IN/OPT_IN_REQUIRED, INPUTS/CONFIGURATION, SOURCE/SOURCE_MISMATCH,
+DAEMON/DAEMON_UNCONFIRMED or PORTS/PORT_UNAVAILABLE. A malformed/unrecognized reply,
+exception or controller timeout maps to UNKNOWN/UNKNOWN without inspecting error
+properties or printing the reply. There are no raw logs, paths, IDs, keys or other
+private values. A READY preflight and any later failure emit no initial-preflight
+diagnostic. Admission still requires exactly the original single-field READY reply;
+refusal cannot create the bootstrap, CLI, listener, fixtures or payment permission.
+In this early-refusal report, closure=true may mean the capability was never acquired,
+not that an existing runtime was inspected or stopped. The diagnostic gets at most
+one second clipped to the original cleanup ceiling; failed/stalled output cannot
+renew authority, retry or suppress the one final report attempt. An absent diagnostic
+is not proof that preflight passed. Historical PREPARE reports without it remain
+unclassified, even if an earlier standalone check was READY.
+
 If authorization fails, the direct entry attempts one stderr JSON line after its
 independent cleanup attempts and before the unchanged final report. Its only fields
 are `tag="stripe_manual_payment_auth_diagnostic"`, `stage` and `reason`; it is at
