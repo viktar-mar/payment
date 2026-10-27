@@ -170,6 +170,7 @@ if(!isMainThread){
       else if(scenario==='late-session'){await until(()=>!!releaseSession);assert.doesNotMatch(root.textContent,/4242|3155/,'pending_session_keeps_neutral_instructions');await advance(1300000);releaseSession!(Response.json(session));await tick();assert.equal(mounts,0);}
       else{
         await until(()=>root.querySelector('generic-payment-widget')?.state==='ready');const widget=root.querySelector('generic-payment-widget');assert.equal(mounts,1);assert.equal(getCalls,1);
+        assert.equal(widget.isConnected,true,'initial_ready_keeps_form_connected');assert.equal(frame.isConnected,true);assert.equal(destroys,0);
         if(!challenge)assert.match(root.textContent,selected3DS?/4000 0025 0000 3155/:/4242 4242 4242 4242/,'trusted_scenario_selects_card');
         if(selected3DS&&!challenge){assert.doesNotMatch(root.textContent,/4242/);assert.match(root.textContent,/45/);}
         assert.equal(calls.filter(path=>path.endsWith('/client-session')).length,1);resumes=mounts;
@@ -177,7 +178,7 @@ if(!isMainThread){
         if(!workerData.automatic)assert.ok(captured,'real_driver_handle_was_captured');
         if(challenge){
           pay.click();await until(()=>!!completeChallenge);
-          if(scenario==='challenge-success')assert.equal(widget.hidden,false,'human_challenge_remains_visible');assert.equal(widget.isConnected,true);assert.equal(frame.isConnected,true);assert.equal(destroys,0);
+          assert.equal(widget.hidden,false,'human_challenge_remains_visible');assert.equal(widget.isConnected,true);assert.equal(frame.isConnected,true);assert.equal(destroys,0);
           const rejectRepeat=async()=>{pay.disabled=false;pay.click();pay.dispatchEvent(new window.KeyboardEvent('keydown',{key:'Enter',bubbles:true,composed:true}));if(captured)await assert.rejects(captured.confirm());await tick();assert.equal(fakeStripe.confirmCalls,1,'one_provider_confirmation');assert.equal(calls.filter(path=>path==='/manual-payment-confirmation').length,1,'one_durable_permit');};
           await rejectRepeat();
           if(scenario==='challenge-pagehide')window.dispatchEvent(new window.Event('pagehide'));
@@ -191,9 +192,11 @@ if(!isMainThread){
               await until(()=>!!releaseWatch);assert.equal(widget.state,scenario.startsWith('challenge-processing-action-')?'processing':'requires_action');
               assert.equal(widget.isConnected,true);assert.equal(widget.hidden,false);assert.equal(frame.isConnected,true);await rejectRepeat();
               releaseWatch!();await until(()=>widget.state==='ready');await tick();
-              assert.equal(widget.isConnected,true,'action_ready_preserves_provider_generation');assert.equal(widget.hidden,false);assert.equal(frame.isConnected,true);assert.equal(destroys,0);await rejectRepeat();
+              assert.equal(widget.isConnected,false,'post_attempt_ready_retires_form');assert.equal(frame.isConnected,false);assert.equal(destroys,1);await rejectRepeat();
+              assert.equal(root.querySelector('[role="status"]').textContent,'Попытка завершена. Окончательный результат проверяет оператор по серверному отчёту. Закройте эту вкладку.','post_attempt_ready_defers_to_server_report');
+              start.disabled=false;start.click();start.click();
               const before=calls.length;await advance(1005000);assert.equal(calls.length,before,'action_ready_does_not_restart_watch');
-              assert.equal(widget.isConnected,true);assert.equal(frame.isConnected,true);assert.equal(destroys,0);await rejectRepeat();
+              assert.equal(widget.isConnected,false);assert.equal(frame.isConnected,false);assert.equal(destroys,1);await rejectRepeat();
               if(scenario.endsWith('-expiry'))await advance(1300000);else page?.close();
             }
             else if(['challenge-checking','challenge-processing','challenge-requires_action'].includes(scenario)){
@@ -206,6 +209,7 @@ if(!isMainThread){
           }
           await until(()=>root.querySelector('generic-payment-widget')===null);await tick();
           const terminal=root.querySelector('[role="status"]').textContent,before=calls.length;completeChallenge!({});await tick();await tick();
+          if(actionReady)for(const name of ['ready','succeeded','failed','unknown','expired','requires-action','processing'])widget.dispatchEvent(new window.CustomEvent(name));
           page?.close();pageController.abort();window.dispatchEvent(new window.Event('pagehide'));await advance(1301000);
           assert.equal(root.querySelector('[role="status"]').textContent,terminal);assert.equal(calls.length,before,'late_challenge_cannot_continue_after_retirement');assert.equal(destroys,1,'provider_retires_once');if(captured)await assert.rejects(captured.confirm());
           if(scenario!=='challenge-success'&&scenario!=='challenge-processing'&&scenario!=='challenge-requires_action')assert.doesNotMatch(terminal,/Браузер сообщил об успехе/);

@@ -1015,20 +1015,21 @@ separately; the controller always reports `browser_closure=NOT_OWNED`.
 For selected 3DS, follow the page's official test card `4000 0025 0000 3155`, future
 expiry and synthetic three-digit CVC instead. Press Pay once, then promptly complete
 the genuine Stripe challenge yourself. The provider widget stays visible and
-connected while checking, processing or requiring action; the page retires it on a
-terminal result, expiry or close. No challenge click or iframe/card inspection is
-automated. The existing server verification window starts after the one permit and
+connected while the challenge is pending, checking, processing or requiring action;
+the page retires it on a terminal result, post-attempt ready, expiry or close. No
+challenge click or iframe/card inspection is automated. The existing server
+verification window starts after the one permit and
 still ends within 45 seconds/30 probes. Complete the human challenge within that
 window; the five-minute page allowance does not extend it. A late, failed or unknown
 outcome stays `PENDING` with no retry. Do not press Pay again, reopen, or rerun to
 resolve it; any future attempt needs new explicit authority.
 
 A repeated action-required snapshot can make the SDK show `ready` again. After the
-one Pay this is not another authorization: the selected page keeps the same visible
-provider generation and spent lease, denies any further confirmation, and does not
-restart polling. The server report remains authoritative; close/expiry and terminal
-errors still retire the page. Selected server verification accepts the bound
-action-required journal/callback history without dropping its unique success and
+one Pay the selected page removes the form once and shows the existing neutral
+message that the operator checks the final result in the server report. This does
+not claim browser success, permit another confirmation or restart polling. Initial
+ready still permits the sole Pay. The server report remains authoritative. Selected
+server verification accepts the bound action-required journal/callback history without dropping its unique success and
 delivered success-callback requirements.
 
 If the form cannot load, the existing terminal error appends one fixed code:

@@ -86,9 +86,9 @@ export function mountManualPaymentPage(root:HTMLElement,dependencies:ManualPayme
       // A separate SDK graph is unknown to this internal registry and fails here.
       loadFailure='AUTHORIZATION_BINDING_FAILED';lease=armManualPayment(widget,{deadline,authorize,session});
       loadFailure='WIDGET_MOUNT_FAILED';widget.addEventListener('click',guard,true);widget.addEventListener('keydown',guard,true);
-      // The SDK maps repeated REQUIRES_ACTION to ready; selected attempts retain their spent lease.
+      // After the sole attempt, SDK ready retires neutrally rather than offering another Pay.
       for(const name of ['ready','succeeded','failed','unknown','expired','requires-action','processing'])widget.addEventListener(name,()=>{
-        if(attempted&&!authorizing&&!threeDSecure&&name==='ready')finish();else inspect();
+        if(attempted&&!authorizing&&name==='ready')finish();else inspect();
       });
       changes=new MutationObserver(inspect);changes.observe(widget.shadowRoot!,{subtree:true,attributes:true,childList:true});changes.observe(document,{subtree:true,childList:true});
       host.append(widget);widgetWasConnected=widget.isConnected;status.textContent='Введите только тестовую карту. Нажмите Pay один раз.';inspect();
