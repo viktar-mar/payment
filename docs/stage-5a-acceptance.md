@@ -262,3 +262,16 @@ state remains unverified, no runtime is admitted, and Stage 5A remains **NOT_ACC
 The separately authorized historical run `ee2d51d4-5a42-4fe8-9109-43b417644d91` at source `84601bb`, native final `8645c6`, exited 0 with `MANUAL_3DS/SUCCEEDED`: payment, provider, webhook, journal, callback and 3DS proof plus gateway/listener/runtime closure were all true; browser closure remained `NOT_OWNED`. The human observed COMPLETE followed by a ready form. This establishes that single historical manual 3DS result, separately from the older failed attempts and the wider unfinished lifecycle.
 
 The subsequent offline UI correction retires selected post-attempt SDK `ready` once with the existing neutral server-report message, including repeated `REQUIRES_ACTION` and `PROCESSING` → `REQUIRES_ACTION` sequences. Initial ready and a pending challenge/checking/processing/requires_action remain connected; one Load/permit/Pay/provider confirmation and all existing deadlines and server proofs remain unchanged. This patch has no actual-provider run and supplies no new success evidence or retry authority. Stage 5A remains **NOT_ACCEPTED**.
+
+## Remaining-only lifecycle runner prepared offline (2026-10-27)
+
+The separate [remaining-only operator entry](local-development.md#remaining-only-5a-sandbox-mode)
+prepares a future fresh owned run of EUR20 payment → EUR7 then EUR13 refunds on that
+payment → EUR5 anonymous donation → EUR5 EMAIL_OTP donation → separate EUR20 missed-webhook
+payment/reconciliation, with existing server proofs and owned cleanup. It performs no
+decline or 3DS card journey and never targets the retained payment. Its report distinguishes
+`mode: 'REMAINING_5A'` / `remainingAccepted` from full acceptance: `accepted` and
+`proof.cards` remain false. Local synthetic tests and list-only discovery do not establish
+provider compatibility or financial success. No Sandbox run occurred in this implementation;
+publication, exact-source green hosted CI and fresh admission/runtime authorization remain
+prerequisites. Historical evidence is unchanged and Stage 5A remains **NOT_ACCEPTED**.

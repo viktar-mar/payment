@@ -29,6 +29,28 @@ export interface OwnedSandboxAcceptance {
   close(limits:OwnedSandboxLimits):Promise<true>;
   resources():OwnedSandboxResources;
 }
+/** Revoked after the payment callback; no refund, close, retry or alternate-card authority. */
+export interface SandboxRemainingPaymentFixture {
+  readonly identity:Readonly<{endpoints:Readonly<SandboxFixture['identity']['endpoints']>;site:Readonly<SandboxFixture['identity']['site']>;price:Readonly<SandboxFixture['identity']['price']>}>;
+  beginBrowser(name:'success'):Promise<boolean>;
+  browserSession(name:'success'):Promise<Record<string,unknown>>;
+  markPay(name:'success'):Promise<void>;
+  confirm(name:'success'):Promise<boolean>;
+}
+export interface OwnedSandboxRemainingResources extends Omit<OwnedSandboxResources,'accepted'|'proof'> {
+  readonly mode:'REMAINING_5A';readonly remainingAccepted:boolean;readonly accepted:false;
+  readonly proof:Readonly<{cards:false;payment:boolean;refunds:boolean;anonymous:boolean;emailOtp:boolean;otp:boolean;missed:boolean}>;
+}
+export interface OwnedSandboxRemainingJourneys {
+  payment(fixture:SandboxRemainingPaymentFixture):Promise<true>;
+  donations(extras:SandboxAcceptanceExtras):Promise<true>;
+  missed(fixture:SandboxFixture):Promise<true>;
+}
+export interface OwnedSandboxRemainingAcceptance {
+  run(journeys:OwnedSandboxRemainingJourneys,limits:OwnedSandboxLimits):Promise<true>;
+  close(limits:OwnedSandboxLimits):Promise<true>;
+  resources():OwnedSandboxRemainingResources;
+}
 /** Reviewed factories plus raw process/HTTP/time boundaries, for guarded synthetic tests only. */
 type Bootstrap=SandboxExtrasOptions['bootstrap'] & {
   prepare(limits:OwnedSandboxLimits):Promise<true>;start(limits:OwnedSandboxLimits):Promise<true>;stop(limits:OwnedSandboxLimits):Promise<true>;
@@ -54,5 +76,6 @@ export interface OwnedSandboxDependencies {
   now?:()=>number;setTimeout?:typeof globalThis.setTimeout;clearTimeout?:typeof globalThis.clearTimeout;
 }
 export function openOwnedSandboxAcceptance(options:OwnedSandboxOptions,limits:OwnedSandboxLimits,dependencies?:OwnedSandboxDependencies):Promise<OwnedSandboxAcceptance>;
+export function openOwnedSandboxRemainingAcceptance(options:OwnedSandboxOptions,limits:OwnedSandboxLimits,dependencies?:OwnedSandboxDependencies):Promise<OwnedSandboxRemainingAcceptance>;
 export function formatSandboxAuthorization(value:unknown):string|null;
 export function formatSandboxDiagnostic(value:unknown):string|null;

@@ -158,7 +158,7 @@ test('inert imports neither read private credentials nor launch any subprocess o
       'stripe-manual-payment.mjs','stripe-manual-payment-options.mjs',
       'stripe-manual-payment-schema.mjs','stripe-manual-payment-auth.mjs',
       'stripe-form-diagnostic-provision.mjs','stripe-form-diagnostic-settlement.mjs',
-      'stripe-manual-form-options.mjs','stripe-sandbox-acceptance.mjs',
+      'stripe-manual-form-options.mjs','stripe-sandbox-acceptance.mjs','stripe-sandbox-remaining-options.mjs',
       'stripe-sandbox-bootstrap.mjs','stripe-sandbox-owned.mjs',
       'stripe-sandbox-cli.mjs','stripe-sandbox-provision.mjs',
       'stripe-sandbox-ownership.mjs','stripe-manual-refund-options.mjs','stripe-manual-refund-remainder-options.mjs',

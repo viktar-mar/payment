@@ -48,6 +48,8 @@ The Fake provider covers local one-time payments, donations and subscriptions, i
 
 Historical notes also describe a successful EUR20 test payment and a verified EUR7 refund; the current EUR13 remainder outcome is unresolved. Do not repeat a refund based on missing local evidence. The [Stage 5A acceptance matrix](docs/stage-5a-acceptance.md) separates implementation, historical observations, fresh test results and remaining gates. Further recovery diagnostic development is frozen.
 
+A separate [remaining-only 5A runner](docs/local-development.md#remaining-only-5a-sandbox-mode) is prepared locally for a future fresh owned run. It has not run against Sandbox and cannot establish full three-card acceptance or authorize work on the retained payment.
+
 Subsequent authorized Docker cleanup removed 39 stopped/created synthetic containers, 10 one-run images and 4 empty Fake networks. Controller metadata checks confirmed the seven original Stripe containers remained exited and all volumes and other Docker objects were preserved; generated configs/logs and test evidence remain. These observations were not reproduced during this documentation update. Provider-only observation still needs a usable local test server key and the exact original PaymentIntent binding; the old local journal, outbox and Flyway state remain unobserved. Task 16 and Stage 5A remain incomplete.
 
 Stage 5B Stripe Billing/subscriptions and Customer Portal, then Stage 5C expanded reconciliation, payment methods and cloud readiness remain future work. See the [Stage 5 roadmap](docs/superpowers/specs/2026-10-14-stripe-sandbox-design.md#1-последовательность-этапа) and the [acceptance boundaries](docs/local-development.md#stage-5a-offline-regression-and-explicit-sandbox-acceptance).

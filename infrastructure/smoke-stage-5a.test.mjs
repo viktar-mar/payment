@@ -85,6 +85,9 @@ async function fixture(t,{alter,redirect=false,oversize=false,never=false,accoun
         const state=JSON.parse(await readFile(join(directory,'test-results','stripe-sandbox',metadata.runId,'state.json'),'utf8'));
         const input=JSON.parse(Buffer.concat(body).toString()),index=input.amount_minor===700?0:1;
         assert.equal(state.refunds[index].phase,'DISPATCHING');assert.equal(state.refunds[index].key,req.headers['idempotency-key']);
+        requests.at(-1).amount=input.amount_minor;
+        assert.equal(state.refunds[0].phase,index===0?'DISPATCHING':'CONFIRMED');
+        if(index===0)assert.equal(state.refunds[1].phase,'READY');
         const id=randomUUID(),event=randomUUID(),reference='re_owned'+index;
         d.refunds.push({id,amount_minor:input.amount_minor,currency:'EUR',provider_refund_reference:reference,status:never?'PENDING':'SUCCEEDED'});
         if(!never){d.payment.refunded_amount_minor+=input.amount_minor;d.payment.status=index===0?'PARTIALLY_REFUNDED':'REFUNDED';
@@ -217,6 +220,33 @@ test('actual bounded HTTP joins journal, delivered outbox and signature-verified
   assert.equal((await stat(f.statePath)).mode&0o777,0o600);
   assert.equal((await readFile(f.statePath,'utf8')).includes('synthetic-password'),false);
   await runStripeSandboxSmoke(f.options);assert.equal(f.requests.filter(r=>r.path.endsWith('/refunds')).length,2);
+});
+// Remaining mode composes these real methods on the same fixture, without the full-card smoke predicate.
+test('success-only server proof composes durable 700 then 1300 refunds without decline or SCA confirmation',async t=>{
+  const f=await fixture(t),session=await sandbox.openStripeSandboxFixture(f.options);
+  try{assert.equal(await session.confirm('success'),true);assert.equal(await session.refunds(),true);}finally{await session.close();}
+  const state=JSON.parse(await readFile(f.statePath,'utf8'));
+  assert.equal(state.cases.success.phase,'SERVER_CONFIRMED');assert.equal(state.cases.decline.phase,'READY');assert.equal(state.cases.sca.phase,'READY');
+  assert.deepEqual(state.refunds.map(({amount,phase})=>({amount,phase})),[{amount:700,phase:'CONFIRMED'},{amount:1300,phase:'CONFIRMED'}]);
+  const posts=f.requests.filter(r=>r.method==='POST'&&r.path.endsWith('/refunds'));
+  assert.deepEqual(posts.map(r=>r.amount),[700,1300]);
+  assert.deepEqual(posts.map(r=>r.path),Array(2).fill('/api/v1/admin/payments/'+f.metadata.cases.success.paymentId+'/refunds'));
+  assert.deepEqual(posts.map(r=>r.key),state.refunds.map(r=>r.key));assert.notEqual(posts[0].key,posts[1].key);
+  for(const name of ['decline','sca'])assert.equal(f.requests.some(r=>r.path.includes(f.metadata.cases[name].paymentId)),false);
+  assert.equal(f.details.success.payment.status,'REFUNDED');assert.equal(f.details.success.payment.refunded_amount_minor,2000);
+});
+for(const missing of ['provider-reference','journal','callback','delivery','pending'])test('success-only composition refuses '+missing+' first-refund proof before second dispatch',async t=>{
+  const f=await fixture(t,{never:missing==='pending',alter:(d,name)=>{if(name!=='success'||d.refunds.length===0)return;
+    if(missing==='provider-reference')d.refunds[0].provider_refund_reference='re_foreign';
+    if(missing==='journal')d.events=d.events.filter(e=>e.event_type!=='REFUND_SUCCEEDED');
+    if(missing==='callback')d.outbox_events=d.outbox_events.filter(e=>e.callback_type!=='refund.succeeded');
+    if(missing==='delivery')d.deliveries=d.deliveries.filter(e=>e.outbox_event_id===d.events[0].id);
+  }}),session=await sandbox.openStripeSandboxFixture(f.options);
+  try{assert.equal(await session.confirm('success'),true);await assert.rejects(session.refunds(),/^Error: stripe_sandbox_(?:PROOF|PENDING_REFUND)$/);}finally{await session.close();}
+  const state=JSON.parse(await readFile(f.statePath,'utf8'));
+  assert.equal(f.requests.filter(r=>r.method==='POST'&&r.path.endsWith('/refunds')).length,1);
+  assert.equal(state.refunds[0].phase,'ACKNOWLEDGED');assert.equal(state.refunds[1].phase,'READY');
+  assert.equal(state.cases.decline.phase,'READY');assert.equal(state.cases.sca.phase,'READY');
 });
 test('complete-response deadline includes delayed body after successful response headers',async t=>{
   const f=await fixture(t,{slowBody:true});f.options.requestTimeoutMs=50;

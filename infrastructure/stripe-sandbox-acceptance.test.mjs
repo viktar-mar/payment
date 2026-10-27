@@ -106,6 +106,155 @@ async function quietOpen(f,opts=options()) {
   const quiet=method=>async(...args)=>{const output=captureOutput(f.output);try{return await owned[method](...args);}finally{output.mock.restore();}};
   return Object.freeze({...owned,run:quiet('run'),close:quiet('close')});
 }
+const remainingOptions=()=>({...options(),env:{...ENV,PAYMENT_STRIPE_SANDBOX_REMAINING_ONLY:'true'}});
+async function quietRemaining(f,opts=remainingOptions()) {
+  const api=await import('./stripe-sandbox-acceptance.mjs');
+  assert.equal(typeof api.openOwnedSandboxRemainingAcceptance,'function','remaining-only owner is exported');
+  const output=captureOutput(f.output);let owned;
+  try{owned=await api.openOwnedSandboxRemainingAcceptance(opts,f.setup,f.deps);}finally{output.mock.restore();}
+  const quiet=method=>async(...args)=>{const write=captureOutput(f.output);try{return await owned[method](...args);}finally{write.mock.restore();}};
+  return Object.freeze({...owned,run:quiet('run'),close:quiet('close')});
+}
+function remainingFixture() {
+  const f=fixture();let saved;
+  const card={identity:{endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:14173',receiver:'http://127.0.0.1:18090'},
+    site:{id:'00000000-0000-4000-8000-000000000002',key:'synthetic-site'},price:{id:'00000000-0000-4000-8000-000000000004',key:'synthetic-price'},private:'must-not-forward'},
+    beginBrowser:async name=>{assert.equal(name,'success');f.events.push('begin-success');return true;},
+    browserSession:async name=>{assert.equal(name,'success');f.events.push('session-success');return {version:2};},
+    markPay:async(...args)=>{assert.deepEqual(args,['success']);f.events.push('pay-success');},
+    confirm:async name=>{assert.equal(name,'success');f.events.push('confirm-success');return true;},
+    refunds:async()=>{f.events.push('same-fixture-refunds');return true;},close:async()=>{f.events.push('close-cards');}};
+  f.deps.openStripeSandboxFixture=async opts=>{assert.equal(opts.env.PAYMENT_STRIPE_SANDBOX_REMAINING_ONLY,undefined);f.events.push('open-cards');return card;};
+  f.deps.runStripeSandboxSmoke=forbidden;
+  const create=f.deps.createOwnedSandboxBootstrap;
+  f.deps.createOwnedSandboxBootstrap=async opts=>{assert.equal(opts.env.PAYMENT_STRIPE_SANDBOX_REMAINING_ONLY,undefined);assert.equal(opts.env.PAYMENT_STRIPE_SANDBOX_FULL_RUN,undefined);return create(opts);};
+  const journeys={payment:async facade=>{saved=facade;f.events.push('payment');assert.deepEqual(Object.keys(facade).sort(),['beginBrowser','browserSession','confirm','identity','markPay']);
+    assert.equal(facade.identity.private,undefined);assert.equal(await facade.beginBrowser('success'),true);await facade.browserSession('success');await facade.markPay('success');
+    assert.equal(await facade.confirm('success'),true);return true;},donations:f.journeys.donations,missed:f.journeys.missed};
+  return {...f,card,journeys,get saved(){return saved;}};
+}
+
+// Break: accepting selector accessors, inherited flags or competing authority reaches private setup.
+test('remaining selector requires own enumerable canonical flags before configuration limits or dependencies',async()=>{
+  const api=await import('./stripe-sandbox-acceptance.mjs');assert.equal(typeof api.openOwnedSandboxRemainingAcceptance,'function');
+  let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}});
+  for(const shape of ['absent','false','boolean','malformed','accessor','hidden','inherited','env-accessor']){
+    const env={...ENV};
+    if(shape==='inherited')Object.setPrototypeOf(env,{PAYMENT_STRIPE_SANDBOX_REMAINING_ONLY:'true'});
+    else if(!['absent','env-accessor'].includes(shape))Object.defineProperty(env,'PAYMENT_STRIPE_SANDBOX_REMAINING_ONLY',shape==='accessor'?{enumerable:true,get(){reads++;throw null;}}:{enumerable:shape!=='hidden',value:shape==='boolean'?true:shape==='malformed'?{}:shape==='false'?'false':'true'});
+    const opts={env,get runId(){reads++;throw null;}};
+    if(shape==='env-accessor')Object.defineProperty(opts,'env',{enumerable:true,get(){reads++;throw null;}});
+    await assert.rejects(api.openOwnedSandboxRemainingAcceptance(opts,trap,trap),/OPT_IN_REQUIRED/);
+  }
+  for(const key of ['ENABLED','ALLOW_TEST_OPERATIONS','OWNED_RUN','MANUAL_REFUND','MANUAL_REFUND_REMAINDER','FULL_RUN','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT']){
+    for(const shape of ['true','hidden','accessor','inherited','malformed']){
+      const env={...remainingOptions().env},name='PAYMENT_STRIPE_SANDBOX_'+key;delete env[name];
+      if(shape==='inherited')Object.setPrototypeOf(env,{[name]:'true'});
+      else Object.defineProperty(env,name,shape==='accessor'?{enumerable:true,get(){reads++;throw null;}}:{enumerable:shape!=='hidden',value:shape==='malformed'?{}:['ENABLED','ALLOW_TEST_OPERATIONS','OWNED_RUN'].includes(key)?'false':'true'});
+      await assert.rejects(api.openOwnedSandboxRemainingAcceptance({env,get runId(){reads++;throw null;}},trap,trap),/OPT_IN_REQUIRED/);
+    }
+  }
+  assert.equal(reads,0);
+});
+test('full owner rejects remaining selector without touching configuration or dependencies',async()=>{
+  let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}});
+  for(const shape of ['true','malformed','accessor','hidden','inherited']){
+    const env={...ENV};if(shape==='inherited')Object.setPrototypeOf(env,{PAYMENT_STRIPE_SANDBOX_REMAINING_ONLY:'true'});
+    else Object.defineProperty(env,'PAYMENT_STRIPE_SANDBOX_REMAINING_ONLY',shape==='accessor'?{enumerable:true,get(){reads++;throw null;}}:{enumerable:shape!=='hidden',value:shape==='malformed'?false:'true'});
+    await assert.rejects(openOwnedSandboxAcceptance({env,get runId(){reads++;throw null;}},trap,trap),/OPT_IN_REQUIRED/);
+  }assert.equal(reads,0);
+});
+test('remaining descriptor admission tolerates an unrelated env prototype without reading ambient getters',async()=>{
+  const {remainingOnlyEnvironment}=await import('./stripe-sandbox-remaining-options.mjs');let reads=0;
+  const env=Object.assign(Object.create({get unrelated(){reads++;throw null;}}),remainingOptions().env);
+  Object.defineProperty(env,'STRIPE_SECRET_KEY',{get(){reads++;throw null;}});
+  assert.deepEqual(remainingOnlyEnvironment(env),{...ENV,DEBUG:undefined,NODE_DEBUG:undefined,PWDEBUG:undefined});assert.equal(reads,0);
+});
+test('remaining owner independently proves same payment then refunds before donations and missed, with truthful immutable report',async()=>{
+  const f=remainingFixture(),owned=await quietRemaining(f),before=owned.resources();
+  assert.equal(await owned.run(f.journeys,limits()),true);
+  assert.deepEqual(f.events.filter(x=>['payment','begin-success','session-success','pay-success','confirm-success','same-fixture-refunds','close-cards','donations','missed','close-missed','close-extras','stop-listener','stop-services'].includes(x)),
+    ['payment','begin-success','session-success','pay-success','confirm-success','confirm-success','same-fixture-refunds','close-cards','donations','missed','close-missed','close-extras','stop-listener','stop-services']);
+  const report=owned.resources();assert.equal(report.mode,'REMAINING_5A');assert.equal(report.remainingAccepted,true);assert.equal(report.accepted,false);assert.equal(report.proof.cards,false);
+  assert.equal(report.proof.payment,true);assert.equal(report.proof.refunds,true);assert.equal(report.proof.missed,true);assert.equal(report.cleanupConfirmed,true);
+  assert.equal(before.remainingAccepted,false);assert.equal(before.proof.payment,false);assert.ok(Object.isFrozen(report));assert.ok(Object.isFrozen(report.proof));assert.notEqual(report,owned.resources());
+  await assert.rejects(owned.run(f.journeys,limits()));assert.equal(await owned.close(limits()),true);
+  assert.deepEqual(owned.resources(),report);
+  for(const method of ['beginBrowser','browserSession','markPay','confirm'])await assert.rejects(f.saved[method]('success'));
+  assert.equal(f.events.filter(x=>x==='pay-success').length,1);assert.equal(f.events.filter(x=>x==='same-fixture-refunds').length,1);
+});
+for(const misuse of ['decline','sca','retry','second-begin','second-pay','session-before-begin','confirm-before-pay','second-confirm'])test('remaining payment facade refuses '+misuse+' even when browser catches rejection',async()=>{
+  const f=remainingFixture(),owned=await quietRemaining(f);let denied=false;
+  const catchDenied=async promise=>{try{await promise;}catch{denied=true;}};
+  f.journeys.payment=async facade=>{
+    if(['decline','sca'].includes(misuse))await catchDenied(facade.beginBrowser(misuse));
+    else if(misuse==='session-before-begin')await catchDenied(facade.browserSession('success'));
+    else if(misuse==='confirm-before-pay')await catchDenied(facade.confirm('success'));
+    else if(misuse==='second-confirm'){await facade.beginBrowser('success');await facade.browserSession('success');await facade.markPay('success');await facade.confirm('success');await catchDenied(facade.confirm('success'));}
+    else {await facade.beginBrowser('success');if(misuse==='second-begin')await catchDenied(facade.beginBrowser('success'));
+      else {await facade.browserSession('success');await facade.markPay('success');await catchDenied(facade.markPay('success',...(misuse==='retry'?[true]:[])));}}
+    return true;
+  };
+  await assert.rejects(owned.run(f.journeys,limits()),/CARDS_PENDING/);assert.equal(denied,true);assert.equal(f.events.includes('same-fixture-refunds'),false);assert.equal(f.events.includes('donations'),false);
+});
+for(const method of ['beginBrowser','browserSession','markPay','confirm'])test('remaining browser cannot conceal rejected '+method+' or leave it pending',async()=>{
+  for(const pending of [false,true]){
+    const f=remainingFixture(),owned=await quietRemaining(f);let release;
+    f.card[method]=async()=>{if(pending)return new Promise(resolve=>{release=resolve;});throw new Error('private-method-refusal');};
+    f.journeys.payment=async facade=>{
+      for(const step of ['beginBrowser','browserSession','markPay','confirm']){
+        const result=facade[step]('success');
+        if(step===method){if(!pending)await assert.rejects(result);else result.catch(()=>{});return true;}
+        await result;
+      }return true;
+    };
+    const running=owned.run(f.journeys,limits());running.catch(()=>{});await turn();release?.(true);
+    await assert.rejects(running,/CARDS_PENDING/);assert.equal(f.events.includes('same-fixture-refunds'),false);
+  }
+});
+test('remaining revoked pending fixture cannot reacquire HTTP authority after owned cleanup',async()=>{
+  const f=remainingFixture();let settings,release,finish,lateAllowed=false,fetches=0;
+  const blocked=new Promise(resolve=>{release=resolve;}),finished=new Promise(resolve=>{finish=resolve;}),open=f.deps.openStripeSandboxFixture;
+  f.deps.openStripeSandboxFixture=async opts=>{settings=opts;return open(opts);};
+  f.deps.fetch=async()=>{fetches++;return new Response(null,{status:204});};
+  f.card.confirm=async()=>{await blocked;try{await settings.fetch('http://127.0.0.1:18080/api/admin/v1/auth/sessions',{method:'POST',redirect:'error'});lateAllowed=true;}catch{}finally{finish();}return true;};
+  const owned=await quietRemaining(f);
+  f.journeys.payment=async facade=>{await facade.beginBrowser('success');await facade.browserSession('success');await facade.markPay('success');facade.confirm('success').catch(()=>{});return true;};
+  await assert.rejects(owned.run(f.journeys,limits()),/CARDS_PENDING_CLEANUP_UNCONFIRMED/);release();await finished;
+  assert.equal(lateAllowed,false);assert.equal(fetches,0);assert.equal(owned.resources().remainingAccepted,false);
+});
+for(const failure of ['browser-lie','browser-false','server-false','server-throw','refund-false','refund-pending','donations-false','donations-proof','missed-false','missed-proof'])test('remaining first failure stops later stages: '+failure,async()=>{
+  const f=remainingFixture(),owned=await quietRemaining(f);let phase='CARDS';
+  if(failure==='browser-lie')f.journeys.payment=async()=>true;
+  if(failure==='browser-false')f.journeys.payment=async()=>false;
+  if(failure.startsWith('server-')){let confirmations=0;f.card.confirm=async()=>{if(++confirmations===1)return true;if(failure==='server-throw')throw new Error('private');return false;};}
+  if(failure.startsWith('refund-')){phase='REFUNDS';f.card.refunds=async()=>{if(failure==='refund-pending')throw new Error('pending');return false;};}
+  if(failure.startsWith('donations-')){phase='DONATIONS';f.journeys.donations=async()=>failure==='donations-proof';}
+  if(failure.startsWith('missed-')){phase='MISSED';f.journeys.missed=async()=>failure==='missed-proof';}
+  await assert.rejects(owned.run(f.journeys,limits()),new RegExp(phase+'_PENDING'));
+  assert.equal(owned.resources().failure,phase);assert.equal(owned.resources().remainingAccepted,false);assert.equal(owned.resources().accepted,false);assert.equal(owned.resources().proof.cards,false);
+  if(phase==='CARDS')assert.equal(f.events.includes('same-fixture-refunds'),false);
+  if(['CARDS','REFUNDS'].includes(phase))assert.equal(f.events.includes('open-extras'),false);
+  if(phase!=='MISSED')assert.equal(f.events.includes('missed-fixture'),false);
+});
+test('remaining cleanup uncertainty prevents acceptance and preserves first failure',async()=>{
+  for(const failed of [false,true]){
+    const f=remainingFixture(),owned=await quietRemaining(f);f.cli.stopListener=async()=>false;
+    if(failed)f.card.refunds=async()=>false;
+    await assert.rejects(owned.run(f.journeys,limits()),failed?/REFUNDS_PENDING_CLEANUP_UNCONFIRMED/:/CLEANUP_UNCONFIRMED/);
+    assert.equal(owned.resources().remainingAccepted,false);assert.equal(owned.resources().failure,failed?'REFUNDS':null);assert.equal(owned.resources().cleanup.services,true);
+  }
+});
+for(const boundary of ['deadline','abort'])test('remaining facade retains original '+boundary+' and revokes after bounded journey failure',async()=>{
+  const f=remainingFixture(),controller=new AbortController();f.setup.signal=controller.signal;let now=Date.now();f.deps.now=()=>now;
+  const owned=await quietRemaining(f);let saved;
+  f.journeys.payment=async facade=>{saved=facade;await facade.beginBrowser('success');await facade.browserSession('success');if(boundary==='abort')controller.abort();else now=f.setup.deadline;
+    await assert.rejects(facade.markPay('success'));return true;};
+  await assert.rejects(owned.run(f.journeys,{deadline:f.setup.deadline+100000}),/CARDS_PENDING/);
+  assert.equal(f.events.includes('pay-success'),false);assert.equal(f.events.includes('same-fixture-refunds'),false);await assert.rejects(saved.confirm('success'));
+  assert.equal(owned.resources().remainingAccepted,false);
+  assert.equal(diagnostics(f.output)[0].code,boundary==='abort'?'ABORTED':'DEADLINE_REACHED');
+});
 const diagnostics=wire=>wire.map(line=>JSON.parse(line)).filter(value=>value.tag==='stripe_sandbox_diagnostic');
 const expectedDiagnostic=(phase,code='OPERATION_FAILED',exitCode=null,cleanupConfirmed=true)=>({tag:'stripe_sandbox_diagnostic',phase,code,exitCode,cleanupConfirmed});
 // External work is replaced at the raw process/time boundaries, keeping the real owner.

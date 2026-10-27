@@ -26,7 +26,12 @@ export function observeSandboxPaymentForm(element:Element) {
 }
 
 /** Actual Stripe-hosted Element. No route interception or browser-result financial assertions. */
-export async function runSandboxCard(browser:Browser,fixture:SandboxFixture,name:SandboxCase):Promise<void> {
+type SandboxCardFixture<Case extends SandboxCase>={
+  readonly identity:Readonly<{endpoints:Readonly<SandboxFixture['identity']['endpoints']>;site:Readonly<SandboxFixture['identity']['site']>;price:Readonly<SandboxFixture['identity']['price']>}>;
+  beginBrowser(name:Case):Promise<boolean>;browserSession(name:Case):Promise<Record<string,unknown>>;
+  markPay(name:Case,retry?:boolean):Promise<void>;confirm(name:Case):Promise<boolean>;
+};
+export async function runSandboxCard<Case extends SandboxCase>(browser:Browser,fixture:SandboxCardFixture<Case>,name:Case):Promise<void> {
   const step=<T>(boundary:SandboxBrowserStep,body:()=>Promise<T>,observeFailure?:()=>Promise<unknown>)=>runSandboxBrowserStep(name,boundary,body,observeFailure);
   if(!await step('BEGIN_BROWSER',()=>fixture.beginBrowser(name)))return;
   const context=await step('NEW_CONTEXT',()=>browser.newContext({serviceWorkers:'block'}));

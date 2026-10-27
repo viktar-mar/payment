@@ -5,7 +5,7 @@
 The default Maven suite includes `@stripe-sandbox` Cucumber scenarios using real PostgreSQL,
 application HTTP boundaries and the official Stripe SDK against an owned loopback HTTP fixture.
 Their generated synthetic credentials cannot establish real Stripe interoperability. Default
-Playwright excludes `stripe-sandbox.spec.ts`; Fake payment, Donation and subscription coverage and
+Playwright excludes both `stripe-sandbox.spec.ts` and `stripe-sandbox-remaining.spec.ts`, and native support tests; Fake payment, Donation and subscription coverage and
 the built nginx privacy suite remain in default discovery. Fresh clones need only the local issuer
 generation described below, installed project dependencies and Docker—not ignored execution helpers.
 
@@ -159,6 +159,69 @@ does not supply an exact-version pin flag; `--latest` is not verification. Never
 account/default version for this check. Use only the approved filtered events and Account-key URL
 documented below. Preserve fixtures, database volumes and operation state; stop only this run's
 recorded services/listener. No Sandbox result establishes live-payment readiness.
+
+### Remaining-only 5A Sandbox mode
+
+`playwright.stripe-sandbox-remaining.config.ts` selects one serial owned run for the
+remaining lifecycle proofs. This implementation was prepared and tested locally with
+synthetic boundaries and discovery only; no Sandbox run was performed. Publication,
+green hosted CI for the exact reviewed committed source, fresh credential-free
+source/daemon/port admission, and fresh explicit runtime authorization are still
+required before the future command below. Admission is not a port reservation or
+financial authorization. Use a fresh run UUID, empty new owned run state and newly
+provisioned Site/catalog/campaign; this mode accepts no old-payment target or imported
+historical evidence. Both branches of the older Sandbox entry reject this selector.
+
+From `examples/demo-site`, only after those prerequisites and with the approved local
+Unix daemon and six distinct free loopback ports, the future command is:
+
+```bash
+PAYMENT_STRIPE_SANDBOX_ENABLED=true \
+PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS=true \
+PAYMENT_STRIPE_SANDBOX_OWNED_RUN=true \
+PAYMENT_STRIPE_SANDBOX_REMAINING_ONLY=true \
+PAYMENT_STRIPE_SANDBOX_RUN_ID="<FRESH_RUN_UUID>" \
+PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE="<REVIEWED_EXACT_COMMIT_SHA>" \
+PAYMENT_STRIPE_SANDBOX_DAEMON="<APPROVED_UNIX_DAEMON>" \
+PAYMENT_STRIPE_SANDBOX_PORT_BACKEND="<BACKEND_PORT>" \
+PAYMENT_STRIPE_SANDBOX_PORT_DEMO="<DEMO_PORT>" \
+PAYMENT_STRIPE_SANDBOX_PORT_RECEIVER="<RECEIVER_PORT>" \
+PAYMENT_STRIPE_SANDBOX_PORT_POSTGRES="<POSTGRES_PORT>" \
+PAYMENT_STRIPE_SANDBOX_PORT_MAILPITHTTP="<MAILPIT_HTTP_PORT>" \
+PAYMENT_STRIPE_SANDBOX_PORT_MAILPITSMTP="<MAILPIT_SMTP_PORT>" \
+pnpm exec playwright test --config playwright.stripe-sandbox-remaining.config.ts
+```
+
+All four opt-ins must be exact `true` own enumerable environment values. Leave
+`PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND`, `_MANUAL_REFUND_REMAINDER`, `_FULL_RUN`,
+`_FORM_DIAGNOSTIC`, `_MANUAL_FORM_DIAGNOSTIC`, `_ALLOW_PREPARE_ONLY` and `_MANUAL_PAYMENT`
+unset or `false` (every suffix uses the full `PAYMENT_STRIPE_SANDBOX` prefix).
+Keep `DEBUG`, `NODE_DEBUG`, `PWDEBUG` and `PW_TRACE` disabled. The entry validates the
+raw flags before setup and the owner validates them independently. The existing owned
+setup retains its human CLI authorization, original source/account/API/ownership checks,
+45-minute total deadline and up to two minutes for owned cleanup; no automatic web server,
+installation or default-CI execution is added. Browser trace, screenshot and video stay
+off, output is not retained, and the existing redacting reporter remains in use.
+
+The strict order and total budget are four new successful payments: one EUR20 catalog
+payment, EUR5 anonymous donation, EUR5 EMAIL_OTP donation, then a separate EUR20 catalog
+payment for missed-webhook recovery. Refund only the first payment: EUR7 once with its
+durable key; require exact successful provider-reference/event/journal/signed-delivered-
+callback and 700-refunded proof before EUR13 once with its separate durable key. Final
+proof requires REFUNDED/2000 and exactly those two refunds. Every payment retains the
+existing account/site/source/operation/payment/signed-webhook/journal/outbox/delivered-
+callback joins; donation customer/campaign/Mailpit OTP proof and the missed journey's
+negative baselines, owned listener stop, provider capture, single stable-key reconcile
+and new unique RECONCILIATION fact remain mandatory. A raced webhook fails closed.
+Unused provisioned decline/SCA checkouts are never paid to satisfy full-mode predicates.
+
+Stop on the first failure or unknown/pending/lost acknowledgement. Never retry, resume,
+rotate keys, recreate fixtures, delete evidence or apply this workflow to the retained
+payment. A successful narrow resource report is `mode: 'REMAINING_5A'` with
+`remainingAccepted: true` only after every proof and confirmed cleanup; `accepted: false`
+and `proof.cards: false` always remain. `proof.payment` records only the new success
+payment. This supplies no new decline/3DS proof and cannot claim full 5A acceptance;
+Stage 5A remains **NOT_ACCEPTED** until its separate acceptance gates are satisfied.
 
 ## Stripe Sandbox credential binding (Stage 5A)
 

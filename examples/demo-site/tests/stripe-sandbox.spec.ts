@@ -2,6 +2,7 @@ import {test} from '@playwright/test';
 import {openStripeSandboxFixture,runSandboxCard,type SandboxFixture} from './support/stripe-sandbox-fixtures';
 import {openOwnedSandboxAcceptance,type OwnedSandboxAcceptance,type OwnedSandboxPublicBinding} from '../../../infrastructure/stripe-sandbox-acceptance.mjs';
 import {runOwnedSandboxDonations,withOwnedCardContexts} from './support/stripe-sandbox-acceptance';
+import {remainingOnlyExcluded} from '../../../infrastructure/stripe-sandbox-remaining-options.mjs';
 
 const ownedMode=process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN==='true';
 if(ownedMode)test.describe.serial('owned Stripe Sandbox lifecycle acceptance',()=>{
@@ -9,6 +10,7 @@ if(ownedMode)test.describe.serial('owned Stripe Sandbox lifecycle acceptance',()
   let owned:OwnedSandboxAcceptance;
   test.beforeAll(async()=>{
     const env=process.env;
+    if(!remainingOnlyExcluded(env))throw new Error('stripe_sandbox_OPT_IN_REQUIRED');
     const ports={backend:0,demo:0,receiver:0,postgres:0,mailpitHttp:0,mailpitSmtp:0};
     for(const name of Object.keys(ports) as (keyof typeof ports)[]){
       const value=env['PAYMENT_STRIPE_SANDBOX_PORT_'+name.toUpperCase()];ports[name]=typeof value==='string'&&/^\d{4,5}$/.test(value)?Number(value):0;
@@ -38,7 +40,7 @@ if(ownedMode)test.describe.serial('owned Stripe Sandbox lifecycle acceptance',()
 else test.describe.serial('explicitly owned Stripe Sandbox acceptance',()=>{
   let fixture:SandboxFixture;
   // Runs before browser/page setup: both flags, durable state, container ownership and platform binding checks.
-  test.beforeAll(async()=>{fixture=await openStripeSandboxFixture();});
+  test.beforeAll(async()=>{if(!remainingOnlyExcluded(process.env))throw new Error('stripe_sandbox_OPT_IN_REQUIRED');fixture=await openStripeSandboxFixture();});
   test.afterAll(async()=>{await fixture?.close();});
   for(const name of ['success','decline','sca'] as const)
     test(`Sandbox ${name} server-confirmed card journey`,async({browser})=>{await runSandboxCard(browser,fixture,name);});

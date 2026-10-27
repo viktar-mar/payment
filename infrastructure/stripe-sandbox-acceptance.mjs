@@ -1,4 +1,5 @@
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
+import {remainingOnlyEnvironment,remainingOnlyExcluded} from './stripe-sandbox-remaining-options.mjs';
 import {execFile} from 'node:child_process';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -102,16 +103,24 @@ export function formatSandboxDiagnostic(value) {
 
 /** One owned run. Factories are reviewed capability boundaries, never command plugins. */
 export async function openOwnedSandboxAcceptance(options,limits,dependencies={}) {
+  return openOwned(options,limits,dependencies,false);
+}
+/** Explicit narrow acceptance; it never establishes the full three-card predicate. */
+export async function openOwnedSandboxRemainingAcceptance(options,limits,dependencies={}) {
+  return openOwned(options,limits,dependencies,true);
+}
+async function openOwned(options,limits,dependencies,remaining) {
   const descriptor=Object.getOwnPropertyDescriptor(options??{},'env');
   const rawEnv=descriptor?.enumerable&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined;
-  if(!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
+  const remainingEnv=remaining?remainingOnlyEnvironment(rawEnv):null;
+  if(remaining?!remainingEnv:!remainingOnlyExcluded(rawEnv)||!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
   let enabled=false;
-  try {const env=rawEnv;enabled=env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env?.PAYMENT_STRIPE_SANDBOX_OWNED_RUN==='true'
+  try {const env=remainingEnv??rawEnv;enabled=env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env?.PAYMENT_STRIPE_SANDBOX_OWNED_RUN==='true'
     &&env.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND!=='true'&&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true';}catch{}
   if(!enabled)throw fixed('OPT_IN_REQUIRED');
   let configuration,io,originalDeadline,originalSignal;
   try {
-    const flags=rawEnv;
+    const flags=remainingEnv??rawEnv;
     if(![undefined,''].includes(flags.DEBUG)||![undefined,''].includes(flags.NODE_DEBUG)||![undefined,'','0'].includes(flags.PWDEBUG))fail();
     const {runId,expectedSource,daemon}=options;
     if(typeof runId!=='string'||!UUID.test(runId)||EXHAUSTED.has(runId)||typeof expectedSource!=='string'||!/^[0-9a-f]{40}$/.test(expectedSource)
@@ -133,7 +142,7 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
       createOwnedSandboxProvisioner:dependencies.createOwnedSandboxProvisioner??createOwnedSandboxProvisioner,
       createSandboxAcceptanceExtras:dependencies.createSandboxAcceptanceExtras??createSandboxAcceptanceExtras,
       openStripeSandboxFixture:dependencies.openStripeSandboxFixture??openStripeSandboxFixture,
-      runStripeSandboxSmoke:dependencies.runStripeSandboxSmoke??runStripeSandboxSmoke,execFile:dependencies.execFile??execFile,
+      runStripeSandboxSmoke:remaining?null:dependencies.runStripeSandboxSmoke??runStripeSandboxSmoke,execFile:dependencies.execFile??execFile,
       fetch:dependencies.fetch??globalThis.fetch,now:dependencies.now??Date.now,setTimeout:dependencies.setTimeout??setTimeout,clearTimeout:dependencies.clearTimeout??clearTimeout});
   }catch{throw fixed('CONFIGURATION');}
 
@@ -147,7 +156,7 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
   function observedFailure(code,exitCode=null){const token=Object.freeze(Object.create(null));diagnostics.set(token,{code,exitCode});return token;}
   let bootstrap=null,cli=null,provisioner=null,extras=null,cards=null,missed=null,catalogEnv=null,publicBinding=null,activeContext=setup,activeJourney=null;
   const cleanup={cards:false,missed:false,extras:false,listener:false,services:false};
-  const proof={cards:false,refunds:false,anonymous:false,emailOtp:false,otp:false,missed:false};
+  const proof={cards:false,...(remaining?{payment:false}:{}),refunds:false,anonymous:false,emailOtp:false,otp:false,missed:false};
   function contextFailure(ctx){
     if(io.now()>=ctx.deadline)return observedFailure('DEADLINE_REACHED');
     if(ctx.signal.aborted)return observedFailure('ABORTED');return null;
@@ -164,7 +173,8 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
     const envelope={tag:'stripe_sandbox_diagnostic',phase:failure??'CLEANUP',...(failureDiagnostic??cleanupDiagnostic??{code:'OPERATION_FAILED',exitCode:null}),cleanupConfirmed};
     try{process.stdout.write(JSON.stringify(envelope)+'\n');}catch{}
   }
-  function resources(){return snapshot({runId:configuration.runId,phase,failure,proof,accepted:acceptedProof&&cleanupConfirmed,cleanupConfirmed,cleanup,
+  function resources(){return snapshot({runId:configuration.runId,phase,failure,proof,accepted:!remaining&&acceptedProof&&cleanupConfirmed,
+    ...(remaining?{mode:'REMAINING_5A',remainingAccepted:acceptedProof&&cleanupConfirmed}:{}),cleanupConfirmed,cleanup,
     ...(publicBinding??{})});}
   function context(limits,cleanupOnly=false) {
     const deadline=limits?.deadline,signal=limits?.signal;
@@ -191,6 +201,25 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
     try{if(await controlled(ctx,()=>activeJourney)!==true)fail();}
     catch(error){browserUncertain=true;throw error;}
     finally{if(!ctx.signal.aborted)activeJourney=null;}
+  }
+  function paymentCapability(ctx,fixture) {
+    let active=true,invalid=false,pending=false,begun=false,session=false,paid=false,confirmed=false;
+    const controller=new AbortController(),paymentContext={deadline:ctx.deadline,signal:AbortSignal.any([ctx.signal,controller.signal])};
+    const {endpoints,site,price}=fixture.identity;
+    const identity=snapshot({endpoints:{backend:endpoints.backend,demo:endpoints.demo,receiver:endpoints.receiver},site:{id:site.id,key:site.key},price:{id:price.id,key:price.key}});
+    async function invoke(args,allowed,body) {
+      if(!active||invalid||pending||args.length!==1||args[0]!=='success'||!allowed){invalid=true;fail();}
+      pending=true;
+      try{return await controlled(paymentContext,body);}catch(error){invalid=true;throw error;}finally{pending=false;}
+    }
+    const facade=Object.freeze({identity,
+      beginBrowser:async(...args)=>invoke(args,!begun,async()=>{if(await fixture.beginBrowser('success')!==true)fail();begun=true;return true;}),
+      browserSession:async(...args)=>invoke(args,begun&&!session&&!paid,async()=>{const value=await fixture.browserSession('success');session=true;return value;}),
+      markPay:async(...args)=>{await invoke(args,begun&&session&&!paid,async()=>{await fixture.markPay('success');paid=true;});},
+      confirm:async(...args)=>invoke(args,paid&&!confirmed,async()=>{if(await fixture.confirm('success')!==true)fail();confirmed=true;return true;}),
+    });
+    return {facade,context:paymentContext,revoke(){active=false;if(pending){invalid=true;browserUncertain=true;}controller.abort();},
+      verify(){if(invalid||!begun||!session||!paid||!confirmed)fail();}};
   }
   const ownership=ctx=>requireTrue(ctx,()=>bootstrap.verify({deadline:ctx.deadline,signal:ctx.signal}));
 
@@ -277,6 +306,8 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
   }
 
   async function gatedFetch(input,settings={}) {
+    // A revoked, unfinished browser invocation cannot inherit a later parent context.
+    if(remaining&&(closed||failure||browserUncertain))throw fixed('HTTP_PENDING');
     const ctx=context({deadline:Math.min(activeContext.deadline,io.now()+10000),signal:activeContext.signal});
     const external=settings.signal;
     // Use a linked request controller: signals from the old runner remain authoritative too.
@@ -359,15 +390,26 @@ export async function openOwnedSandboxAcceptance(options,limits,dependencies={})
   finally{busy=false;}
   return Object.freeze({resources,
     run:async(browserJourneys,limits)=>{
-      if(busy)throw fixed('BUSY');busy=true;let ctx;
+      if(busy)throw fixed('BUSY');
+      if(remaining&&(closed||failure||phase!=='READY'))throw fixed((failure??phase)+'_PENDING');
+      busy=true;let ctx;
       try {
-        if(closed||failure||phase!=='READY'||!exact(browserJourneys,['cards','donations','missed'])||Object.values(browserJourneys).some(fn=>typeof fn!=='function'||fn.constructor.name!=='AsyncFunction'))fail();
+        if(closed||failure||phase!=='READY'||!exact(browserJourneys,[remaining?'payment':'cards','donations','missed'])||Object.values(browserJourneys).some(fn=>typeof fn!=='function'||fn.constructor.name!=='AsyncFunction'))fail();
         ctx=context(limits);activeContext=ctx;check(ctx);phase='CARDS';await ownership(ctx);
         cards=await controlled(ctx,()=>io.openStripeSandboxFixture(fixtureOptions()));
-        await journey(ctx,()=>browserJourneys.cards(cards));proof.cards=true;
-        await controlled(ctx,()=>cards.close());cleanup.cards=true;cards=null;
-        phase='REFUNDS';const refunds=await controlled(ctx,()=>io.runStripeSandboxSmoke(fixtureOptions()));
-        if(refunds?.paymentConfirmed!==true||refunds.refundConfirmed!==true||refunds.callbackVerified!==true)fail();proof.refunds=true;
+        if(remaining){
+          const payment=paymentCapability(ctx,cards);
+          activeContext=payment.context;
+          try{await journey(ctx,()=>browserJourneys.payment(payment.facade));}finally{payment.revoke();activeContext=ctx;}
+          payment.verify();await requireTrue(ctx,()=>cards.confirm('success'));proof.payment=true;
+          phase='REFUNDS';await requireTrue(ctx,()=>cards.refunds());proof.refunds=true;
+          await controlled(ctx,()=>cards.close());cleanup.cards=true;cards=null;
+        }else{
+          await journey(ctx,()=>browserJourneys.cards(cards));proof.cards=true;
+          await controlled(ctx,()=>cards.close());cleanup.cards=true;cards=null;
+          phase='REFUNDS';const refunds=await controlled(ctx,()=>io.runStripeSandboxSmoke(fixtureOptions()));
+          if(refunds?.paymentConfirmed!==true||refunds.refundConfirmed!==true||refunds.callbackVerified!==true)fail();proof.refunds=true;
+        }
         phase='DONATIONS';await ownership(ctx);
         extras=await controlled(ctx,()=>io.createSandboxAcceptanceExtras(Object.freeze({env:configuration.env,bootstrap,provisioner,cli})));
         await requireTrue(ctx,()=>extras.open({deadline:ctx.deadline,signal:ctx.signal}));
