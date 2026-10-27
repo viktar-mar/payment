@@ -190,6 +190,42 @@ for(const threeDSecure of [false,true])test(`manual ${threeDSecure?'selected 3DS
  await p.prepare({deadline:121000});assert.equal(child.deadline,11000);assert.ok(child.signal instanceof AbortSignal);assert.equal(child.signal.aborted,false);
 });
 const writes=f=>f.events.filter(e=>e.type==='http'&&e.method!=='GET').length;
+// Break: losing the actual verification boundary, guessing timeout, or extending the consumed proof.
+for(const threeDSecure of [false,true])for(const boundary of ['admission','status','proof','status-limit','proof-limit'])test(`verify diagnostic brands actual ${boundary} ${threeDSecure?'3DS':'ordinary'} failure without another proof`,async()=>{
+ const f=await prepared({threeDSecure});
+ if(boundary!=='admission'){f.attempts=1;await f.p.markConfirmation(f.limits);}
+ f.fastPoll=true;const before=f.probes,financial=writes(f);let reads=0;
+ if(boundary==='status')f.mutate=()=>{throw new Proxy({},{get(){reads++;throw Error('private');}});};
+ if(boundary==='proof'||boundary==='proof-limit'){f.success=true;f.mutate=d=>{if(boundary==='proof')d.events.at(-1).provider_object_id='pi_wrong';else d.deliveries=[];};}
+ let error;try{await f.p.verifyPayment(f.limits);}catch(failure){error=failure;}
+ assert.ok(error);assert.equal(typeof diagnosticModule.formatManualPaymentVerifyDiagnostic,'function');
+ Object.defineProperties(error,{stage:{get(){reads++;throw null;}},reason:{get(){reads++;throw null;}},message:{get(){reads++;throw null;}},stack:{get(){reads++;throw null;}}});
+ const stage=boundary==='admission'?'ADMISSION':boundary.startsWith('proof')?'SERVER_PROOF':'STATUS_POLL',reason=boundary.endsWith('limit')?'PROBE_LIMIT':'UNCONFIRMED';
+ const line=diagnosticModule.formatManualPaymentVerifyDiagnostic(error);
+ assert.equal(line,'{"tag":"stripe_manual_payment_verify_diagnostic","stage":"'+stage+'","reason":"'+reason+'"}\n');assert.ok(Buffer.byteLength(line)<=256);
+ assert.equal(f.probes-before,boundary==='admission'||boundary==='status'?0:boundary==='proof'?2:boundary==='proof-limit'?60:30);assert.equal(writes(f),financial);
+ await assert.rejects(f.p.verifyPayment(f.limits));assert.equal(writes(f),financial);assert.equal(diagnosticModule.formatManualPaymentVerifyDiagnostic(error),line);
+ assert.equal(reads,0);
+});
+test('verify diagnostic formats arbitrary hostile unbranded errors without any property read',()=>{
+ assert.equal(typeof diagnosticModule.formatManualPaymentVerifyDiagnostic,'function');let reads=0;const trap=()=>{reads++;throw null;};
+ const revoked=Proxy.revocable({},{});revoked.revoke();const accessor=Object.defineProperties({stage:'SERVER_PROOF',reason:'PROBE_LIMIT'},{message:{get:trap},stack:{get:trap},toJSON:{get:trap}});
+ for(const error of [null,undefined,1,1n,false,Symbol('private'),'password=private',Error('private'),accessor,new Proxy({},{get:trap,ownKeys:trap,getPrototypeOf:trap,getOwnPropertyDescriptor:trap}),revoked.proxy])assert.equal(diagnosticModule.formatManualPaymentVerifyDiagnostic(error),'{"tag":"stripe_manual_payment_verify_diagnostic","stage":"UNKNOWN","reason":"UNCONFIRMED"}\n');
+ assert.equal(reads,0);
+});
+for(const threeDSecure of [false,true])test(`real provisioner verify brand reaches ${threeDSecure?'3DS':'ordinary'} controller after independent cleanup`,async()=>{
+ const {runManualPayment}=await import('./stripe-manual-payment.mjs');const f=paymentFixture();if(threeDSecure)f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';
+ const p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies),lines=[],order=[];let authorize,permits=0;const close=p.close;
+ const selected={env:f.options.env,runId:RUN,expectedSource:f.resource.expectedSource,daemon:f.resource.daemon,ports:f.resource.ports,manualPort:18083};
+ const value=await runManualPayment(selected,{deadline:Date.now()+2700000},{preflight:async()=>({status:'READY'}),
+  createBootstrap:async()=>({prepare:async()=>true,resources:()=>({...f.resource,status:'PREPARED',cliDirectory:DIR+'/cli'}),start:async()=>true,verify:async()=>true,stop:async()=>{order.push('runtime');return true;}}),
+  createCli:async()=>({validateBinding:async()=>true,startListener:async()=>true,bindManualPayment:async()=>true,verifyManualPaymentBaseline:async()=>true,assertManualPaymentListener:()=>true,stopListener:async()=>{order.push('listener');return true;},inspectManualPayment:async()=>{assert.fail('provider cannot run after rejected server proof');}}),authorizeCli:async()=>true,
+  createProvisioner:async()=>({...p,markConfirmation:async limits=>{permits++;return p.markConfirmation(limits);},close:async limits=>{order.push('provisioner');return close(limits);}}),
+  createGateway:async options=>{authorize=options.authorizeConfirmation;return {open:async()=>({url:'http://127.0.0.1:18083/manual-payment.html'}),wait:async()=>{f.attempts=1;await authorize();f.success=true;f.mutate=d=>{d.events.at(-1).source='RECONCILIATION';};return {outcome:'CONFIRMATION_GRANTED'};},close:async()=>{order.push('gateway');return true;}};},
+  write:async()=>{},writeVerifyDiagnostic:async line=>{lines.push(line);order.push('diagnostic');}});
+ assert.deepEqual(lines,['{"tag":"stripe_manual_payment_verify_diagnostic","stage":"SERVER_PROOF","reason":"UNCONFIRMED"}\n']);assert.deepEqual(order,['gateway','provisioner','listener','runtime','diagnostic']);
+ assert.equal(permits,1);assert.equal(f.events.filter(e=>e.path?.endsWith('/checkouts')).length,1);assert.equal(value.report.result,'PENDING');assert.equal(value.report.phase,'VERIFY');assert.equal(value.report.confirmation_granted,true);assert.equal(value.report.payment_confirmed,false);assert.equal(value.report.provider_confirmed,false);assert.equal(value.report.mode,threeDSecure?'MANUAL_3DS':'MANUAL_PAYMENT');assert.equal(value.exitCode,1);
+});
 test('one payment prepares one original Intent and durable permit precedes reply',async()=>{
  const f=await prepared();assert.equal(f.events.filter(e=>e.path?.endsWith('/checkouts')).length,1);
  assert.equal(f.handoff.binding.intentId,'pi_TestOnly');assert.equal(f.handoff.binding.priceId,PRICE);assert.equal(f.handoff.binding.paymentAccountId,ACCOUNT);

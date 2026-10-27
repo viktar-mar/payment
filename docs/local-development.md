@@ -1046,6 +1046,29 @@ reads or browser messages cannot turn it green. Keep the report and original evi
 for manual review. Do not issue refunds, cancel, reconcile, create another Checkout,
 or rerun the entry to resolve a pending result.
 
+For a future separately authorized invocation, a failure of granted verification
+may add one stderr JSON line after existing independent cleanup/drain and before
+the sole final stdout report. Its exact fields are `tag`, `stage` and `reason`,
+with tag `stripe_manual_payment_verify_diagnostic`; it is at most 256 UTF-8 bytes.
+Actual provisioner failures carry immutable module-owned stages `ADMISSION`,
+`STATUS_POLL` or `SERVER_PROOF`. A rejected exact server reply is `SERVER_REPLY`;
+a rejected or thrown provider inspection is `PROVIDER`. Unbranded errors and
+unclassified outer timeouts/rejections fall back to `UNKNOWN` without reading
+error properties. The reason is `UNCONFIRMED`, except that exhaustion of the
+existing thirty-probe loop gives `PROBE_LIMIT` with its last actual stage.
+Neither reason establishes a precise timeout or a financial/provider outcome.
+There are no IDs, paths, amounts, counters, credentials, raw replies or errors.
+
+The first classified failure can arrive while the original pending work drains;
+finalization prevents later settlement from changing the diagnostic or report.
+Success, unused/no-grant verification, earlier failures and cleanup-only failure
+after accepted full verification produce no verification diagnostic. Emission
+gets at most one second clipped to the original cleanup ceiling and rechecks
+that ceiling before dispatch. Rejected, stalled or expired output cannot suppress
+the sole final report attempt or authorize a retry. An absent line does not prove
+verification succeeded. Every existing authority, one-shot permission, proof gate,
+deadline and report field remains unchanged; this diagnostic authorizes no run.
+
 Ordinary reports retain `mode=MANUAL_PAYMENT`. Only selected 3DS reports use
 `mode=MANUAL_3DS` and add `three_ds_verified`. Their `SUCCEEDED` result requires all
 the same server payment, incoming signed provider event, journal, outbox/callback,

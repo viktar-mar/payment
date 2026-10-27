@@ -388,6 +388,75 @@ test('real authorization late success cannot revive expired controller authority
   await f.tick(521000);assert.equal(diagnostics.length,1);assert.equal(dispatches(),2);assert.equal(f.timers.size,0);
 });
 
+// Break: discarding verification failures or confusing a cleanup-only failure with verification failure.
+async function actualVerifyAdmissionFailure(f){
+ const safe={...options,status:'LIVE',mode:'MANUAL_PAYMENT',webhookReady:true,project:'stripe-'+runId,siteKey:'s5a-'+runId.replaceAll('-',''),endpoints:Object.fromEntries(['backend','demo','receiver'].map(key=>[key,'http://127.0.0.1:'+options.ports[key]])),containers:Object.fromEntries(['backend','demo-site','callback-receiver'].map((key,i)=>[key,{id:String(i+1).repeat(64)}]))};
+ const p=await createManualPaymentProvisioner({env:options.env,browserOrigin:'http://127.0.0.1:18107',bootstrap:{resources:()=>safe,verify:async()=>true,withAdminCredentials:async()=>{assert.fail('verification admission must not acquire credentials');}},verifyProviderBinding:async()=>true},{now:f.deps.now,setTimeout:f.deps.setTimeout,clearTimeout:f.deps.clearTimeout,fetch:()=>assert.fail('verification admission must not fetch')});
+ try{await p.verifyPayment(f.limits);}catch(error){return error;}assert.fail('unprepared verification must reject');
+}
+for(const boundary of ['branded-server','server-reply','provider'])for(const timing of ['during-drain','after-finalization'])test(`verify diagnostic retains ${boundary} ${timing} without reviving financial work`,async()=>{
+ const f=fixture(),pending=defer(),lines=[];f.limits.deadline=401000;const branded=await actualVerifyAdmissionFailure(f);
+ if(boundary==='provider')f.cli.inspectManualPayment=()=>pending.promise;else f.provisioner.verifyPayment=()=>pending.promise;
+ f.deps.writeVerifyDiagnostic=async line=>lines.push(line);const task=runManualPayment(options,f.limits,f.deps);await f.tick(1000);await f.tick(401000);assert.deepEqual(lines,[]);
+ if(timing==='after-finalization')await f.tick(521000);
+ const settle=()=>boundary==='server-reply'?pending.resolve({}):pending.reject(branded);
+ if(timing==='during-drain'){settle();await f.tick(401001);}
+ const value=await task,snapshot=JSON.stringify(value.report);
+ if(timing==='during-drain')assert.deepEqual(lines,['{"tag":"stripe_manual_payment_verify_diagnostic","stage":"'+(boundary==='branded-server'?'ADMISSION':boundary==='server-reply'?'SERVER_REPLY':'PROVIDER')+'","reason":"UNCONFIRMED"}\n']);
+ else {assert.deepEqual(lines,[]);settle();await f.tick(521001);assert.deepEqual(lines,[]);}
+ assert.equal(JSON.stringify(value.report),snapshot);assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(value.report.phase,'VERIFY');assert.equal(value.report.provider_confirmed,false);assert.equal(f.calls.filter(x=>x==='durablePermit').length,1);assert.equal(f.financialRetries,0);assert.equal(f.timers.size,0);
+});
+for(const boundary of ['server','provider'])test('verify diagnostic remains UNKNOWN when timed-out '+boundary+' succeeds only during drain',async()=>{
+ const f=fixture(),pending=defer(),lines=[];f.limits.deadline=401000;
+ if(boundary==='server')f.provisioner.verifyPayment=()=>pending.promise;else f.cli.inspectManualPayment=()=>pending.promise;
+ f.deps.writeVerifyDiagnostic=async line=>lines.push(line);const task=runManualPayment(options,f.limits,f.deps);await f.tick(1000);await f.tick(401000);assert.deepEqual(lines,[]);
+ pending.resolve(boundary==='server'?{paymentConfirmed:true,webhookVerified:true,journalVerified:true,callbackVerified:true,providerEventId:'evt_original'}:{captured:true,eventVerified:true});await f.tick(401001);
+ const value=await task;assert.deepEqual(lines,['{"tag":"stripe_manual_payment_verify_diagnostic","stage":"UNKNOWN","reason":"UNCONFIRMED"}\n']);assert.equal(value.report.result,'PENDING');assert.equal(value.report.payment_confirmed,boundary==='provider');assert.equal(value.report.provider_confirmed,false);assert.equal(f.calls.filter(x=>x==='durablePermit').length,1);assert.equal(f.financialRetries,0);assert.equal(f.timers.size,0);
+});
+for(const cleanupOnly of [false,true])test('selected 3DS accepted full verification stays silent even for cleanup-only failure '+cleanupOnly,async()=>{
+ const f=fixture({runtimeClosed:!cleanupOnly}),lines=[];f.cli.inspectManualPayment=async()=>({captured:true,eventVerified:true,threeDSecureAuthenticated:true});f.deps.writeVerifyDiagnostic=async line=>lines.push(line);
+ const value=await runManualPayment({...options,env:{...options.env,PAYMENT_STRIPE_SANDBOX_MANUAL_3DS:'true'}},f.limits,f.deps);
+ assert.deepEqual(lines,[]);assert.equal(value.report.three_ds_verified,true);assert.equal(value.report.provider_confirmed,true);assert.equal(value.report.result,cleanupOnly?'PENDING':'SUCCEEDED');assert.equal(value.exitCode,cleanupOnly?1:0);assert.equal(f.timers.size,0);
+});
+for(const threeDSecure of [false,true])for(const boundary of ['server-reply','server-throw','provider-reply','provider-throw'])test(`verify diagnostic reports ${boundary} for ${threeDSecure?'3DS':'ordinary'} entry after cleanup before sole final report`,async()=>{
+ const f=fixture(),out=[],err=[],order=[],input=cliInput();if(threeDSecure)input.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';let reads=0,code;
+ const hostile=new Proxy({},{get(){reads++;throw Error('private');},getPrototypeOf(){reads++;throw null;},ownKeys(){reads++;throw null;}});
+ if(boundary==='server-reply')f.provisioner.verifyPayment=async()=>({paymentConfirmed:false,webhookVerified:true,journalVerified:true,callbackVerified:true,providerEventId:'evt_private'});
+ if(boundary==='server-throw')f.provisioner.verifyPayment=async()=>{throw hostile;};
+ if(boundary==='provider-reply')f.cli.inspectManualPayment=async()=>({captured:true,eventVerified:true,...(threeDSecure?{threeDSecureAuthenticated:false}:{private:'canary'})});
+ if(boundary==='provider-throw')f.cli.inspectManualPayment=async()=>{throw hostile;};
+ f.deps.subscribe=()=>()=>{};const stop=f.bootstrap.stop;f.bootstrap.stop=async limits=>{const ok=await stop(limits);order.push('cleanup');return ok;};
+ const stream=(lines,name)=>Object.assign(new EventEmitter(),{write(text,done){lines.push(text);order.push(name);done();}});
+ await module.runManualPaymentEntry(input,{stdout:stream(out,'stdout'),stderr:stream(err,'stderr'),exit:value=>{code=value;}},f.deps);
+ const stage=boundary==='server-reply'?'SERVER_REPLY':boundary==='server-throw'?'UNKNOWN':'PROVIDER';
+ assert.deepEqual(err,['{"tag":"stripe_manual_payment_verify_diagnostic","stage":"'+stage+'","reason":"UNCONFIRMED"}\n']);assert.ok(Buffer.byteLength(err[0])<=256);assert.equal(reads,0);assert.equal(code,1);
+ assert.ok(order.indexOf('cleanup')<order.indexOf('stderr'));assert.equal(order.at(-1),'stdout');assert.equal(out.filter(line=>line.startsWith('{')).length,1);
+ const report=JSON.parse(out.at(-1));assert.equal(report.phase,'VERIFY');assert.equal(report.result,'PENDING');assert.equal(report.confirmation_granted,true);assert.equal(report.payment_confirmed,boundary.startsWith('provider'));assert.equal(report.provider_confirmed,false);assert.equal(f.calls.filter(x=>x==='durablePermit').length,1);assert.equal(f.financialRetries,0);assert.equal(f.timers.size,0);
+});
+for(const settings of [{},{outcome:'NOT_STARTED'},{fail:'auth'},{fail:'bindPayment'},{runtimeClosed:false},{listenerClosed:false},{gatewayClosed:false}])test('verify diagnostic stays silent for success unused earlier failure or cleanup-only '+JSON.stringify(settings),async()=>{
+ const f=fixture(settings),lines=[];f.deps.writeVerifyDiagnostic=async line=>lines.push(line);await runManualPayment(options,f.limits,f.deps);assert.deepEqual(lines,[]);assert.equal(f.financialRetries,0);assert.equal(f.timers.size,0);
+});
+for(const mode of ['reject','stall','ceiling','expired'])test('verify diagnostic '+mode+' cannot suppress sole final stdout or extend cleanup',async()=>{
+ const f=fixture({fail:'server'}),lines=[],out=[];f.deps.subscribe=()=>()=>{};f.deps.write=async line=>out.push(line);
+ const stop=f.bootstrap.stop;f.bootstrap.stop=async limits=>{const ok=await stop(limits);if(mode==='ceiling')f.clock.value=2820500;if(mode==='expired')f.clock.value=2821000;return ok;};
+ f.deps.writeVerifyDiagnostic=line=>{assert.ok(f.calls.includes('stop'));lines.push(line);if(mode==='reject')throw Error('private');return new Promise(()=>{});};
+ let settled=false;const task=runManualPaymentCli(cliInput(),f.deps).then(value=>{settled=true;return value;});await f.tick(1000);assert.equal(lines.length,mode==='expired'?0:1);
+ if(mode==='stall'||mode==='ceiling'){assert.equal(settled,false);await f.tick(mode==='ceiling'?2821000:2000);}
+ const value=await task;assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(out.filter(line=>line.startsWith('{')).length,1);assert.equal(f.calls.filter(x=>x==='durablePermit').length,1);assert.equal(f.financialRetries,0);assert.equal(f.timers.size,0);
+});
+for(const window of ['one-second','cleanup'])test('verify diagnostic deferred dispatch rechecks '+window+' cutoff',async()=>{
+ const f=fixture({fail:'server'}),lines=[];f.deps.writeVerifyDiagnostic=async line=>lines.push(line);
+ if(window==='cleanup'){const stop=f.bootstrap.stop;f.bootstrap.stop=async limits=>{const ok=await stop(limits);f.clock.value=2820500;return ok;};}
+ const schedule=f.deps.setTimeout;let crossed=false;f.deps.setTimeout=(fn,delay)=>{if(!crossed&&delay===(window==='cleanup'?500:1000)&&f.calls.includes('stop')){crossed=true;f.clock.value=window==='cleanup'?2821000:2000;}return schedule(fn,delay);};
+ const value=await runManualPayment(options,f.limits,f.deps);assert.equal(crossed,true);assert.equal(lines.length,0);assert.equal(value.exitCode,1);assert.equal(value.report.result,'PENDING');assert.equal(f.timers.size,0);
+});
+for(const mode of ['reject','stall'])test('verify entry stderr '+mode+' still attempts sole final stdout',async()=>{
+ const f=fixture({fail:'server'}),out=[];f.deps.subscribe=()=>()=>{};let count=0,code;
+ const stdout=Object.assign(new EventEmitter(),{write(text,done){out.push(text);done();}}),stderr=Object.assign(new EventEmitter(),{write(text,done){count++;if(mode==='reject')done(Error('private'));}});
+ const task=module.runManualPaymentEntry(cliInput(),{stdout,stderr,exit:value=>{code=value;}},f.deps);await f.tick(1000);if(mode==='stall')await f.tick(2000);await task;
+ assert.equal(code,1);assert.equal(count,1);assert.equal(out.filter(line=>line.startsWith('{')).length,1);assert.equal(JSON.parse(out.at(-1)).result,'PENDING');assert.equal(f.timers.size,0);
+});
+
 // Break: classifying unrelated failures, emitting before cleanup, or changing the report schema.
 for(const threeDSecure of [false,true])test('actual provision factory failure reaches entry stderr after cleanup before unchanged '+(threeDSecure?'3DS':'ordinary')+' report',async()=>{
  const f=fixture(),out=[],err=[],order=[];let code;const input=cliInput();if(threeDSecure)input.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';

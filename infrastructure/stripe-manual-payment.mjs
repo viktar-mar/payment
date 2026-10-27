@@ -3,7 +3,7 @@ import {fileURLToPath} from 'node:url';
 import {manualPaymentOptIn,validateManualPaymentOptions} from './stripe-manual-payment-options.mjs';
 import {validateManualPaymentReport,formatManualPaymentReport} from './stripe-manual-payment-schema.mjs';
 import {formatManualPaymentAuthDiagnostic} from './stripe-manual-payment-auth.mjs';
-import {formatManualPaymentProvisionDiagnostic} from './stripe-form-diagnostic-provision.mjs';
+import {formatManualPaymentProvisionDiagnostic,formatManualPaymentVerifyDiagnostic} from './stripe-form-diagnostic-provision.mjs';
 const ROOT=fileURLToPath(new URL('..',import.meta.url)).replace(/\/$/,'');
 const EMPTY=Object.freeze({version:1,mode:'MANUAL_PAYMENT',result:'FAILED',phase:'ADMISSION',confirmation_granted:false,payment_confirmed:false,provider_confirmed:false,webhook_verified:false,journal_verified:false,callback_verified:false,gateway_closed:false,listener_closed:false,runtime_closed:false,browser_closure:'NOT_OWNED',provenance:'CONTROLLER_REPORTED'});
 const rejected=()=>Object.freeze({report:EMPTY,exitCode:1});
@@ -22,6 +22,7 @@ function preflightDiagnosticLine(reply){
   const phase=known?value.phase:'UNKNOWN',code=known?codes[phase]:'UNKNOWN';
   return JSON.stringify({tag:'stripe_manual_payment_preflight_diagnostic',phase,code})+'\n';
 }
+const verifyDiagnosticLine=stage=>JSON.stringify({tag:'stripe_manual_payment_verify_diagnostic',stage,reason:'UNCONFIRMED'})+'\n';
 function stdoutWriter(stream){return text=>new Promise((accept,reject)=>{const error=()=>reject();stream.once('error',error);try{stream.write(text,failed=>{if(failed){reject();return;}stream.removeListener('error',error);accept();});}catch{stream.removeListener('error',error);reject();}});}
 const stdout=text=>stdoutWriter(process.stdout)(text);
 
@@ -39,6 +40,8 @@ export async function runManualPayment(options,originalLimits,deps={}){
   let preflightDiagnostic;
   let authDiagnostic,authDiagnosticFinalized=false;
   let provisionDiagnostic,provisionDiagnosticFinalized=false,provisionStarted=false,provisionPrepared=false;
+  let verifyDiagnostic,verifyDiagnosticFinalized=false,verifyStarted=false,verifyCompleted=false;
+  function retainVerifyDiagnostic(line){if(!verifyDiagnosticFinalized)verifyDiagnostic??=line;}
   const threeDSecure=selected.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS==='true';
   const proof={...EMPTY,...(threeDSecure?{mode:'MANUAL_3DS',three_ds_verified:false}:{})},work=new Set(),runtimeWork=new Set(),childWork=new Set(),closeTasks=new Map();let runtimeStopReleased=false,runtimeStopClosedAt;
   function active(){return !lifetime.signal.aborted&&!input.signal?.aborted&&now()<limits.deadline;}
@@ -109,11 +112,19 @@ export async function runManualPayment(options,originalLimits,deps={}){
     if(!outcome||!['CONFIRMATION_GRANTED','NOT_STARTED','FAILED'].includes(outcome.outcome)||outcome.outcome==='FAILED'||(outcome.outcome==='CONFIRMATION_GRANTED')!==granted)throw null;
     phase='VERIFY';
     if(granted){
-      const server=exact(await operation(()=>provisioner.verifyPayment(limits)),['paymentConfirmed','webhookVerified','journalVerified','callbackVerified','providerEventId']);
-      if(!server||['paymentConfirmed','webhookVerified','journalVerified','callbackVerified'].some(key=>server[key]!==true)||typeof server.providerEventId!=='string'||!/^evt_[A-Za-z0-9_]{1,200}$/.test(server.providerEventId))throw null;
+      verifyStarted=true;
+      const server=await operation(async()=>{
+        let reply;try{reply=await provisioner.verifyPayment(limits);}catch(error){retainVerifyDiagnostic(formatManualPaymentVerifyDiagnostic(error));throw null;}
+        const server=exact(reply,['paymentConfirmed','webhookVerified','journalVerified','callbackVerified','providerEventId']);
+        if(!server||['paymentConfirmed','webhookVerified','journalVerified','callbackVerified'].some(key=>server[key]!==true)||typeof server.providerEventId!=='string'||!/^evt_[A-Za-z0-9_]{1,200}$/.test(server.providerEventId)){retainVerifyDiagnostic(verifyDiagnosticLine('SERVER_REPLY'));throw null;}
+        return server;
+      });
       proof.payment_confirmed=true;proof.webhook_verified=true;proof.journal_verified=true;proof.callback_verified=true;
-      const provider=exact(await operation(()=>cli.inspectManualPayment(server.providerEventId,limits),undefined,'children'),['captured','eventVerified',...(threeDSecure?['threeDSecureAuthenticated']:[])]);
-      if(provider?.captured!==true||provider.eventVerified!==true||threeDSecure&&provider.threeDSecureAuthenticated!==true)throw null;proof.provider_confirmed=true;if(threeDSecure)proof.three_ds_verified=true;
+      await operation(async()=>{try{
+        const provider=exact(await cli.inspectManualPayment(server.providerEventId,limits),['captured','eventVerified',...(threeDSecure?['threeDSecureAuthenticated']:[])]);
+        if(provider?.captured!==true||provider.eventVerified!==true||threeDSecure&&provider.threeDSecureAuthenticated!==true)throw null;
+      }catch{retainVerifyDiagnostic(verifyDiagnosticLine('PROVIDER'));throw null;}},undefined,'children');
+      proof.provider_confirmed=true;if(threeDSecure)proof.three_ds_verified=true;verifyCompleted=true;
     }else{
       if(grantUsed)throw null;await requireTrue(()=>provisioner.verifyUnused(limits));await requireTrue(()=>cli.inspectUnusedManualPayment(limits),'children');unused=true;
     }
@@ -163,6 +174,14 @@ export async function runManualPayment(options,originalLimits,deps={}){
       const diagnosticDeadline=Math.min(cleanup.deadline,now()+1000);
       try{if(now()>=diagnosticDeadline)throw null;await bounded(Promise.resolve().then(()=>{if(now()>=diagnosticDeadline)throw null;return deps.writeProvisionDiagnostic(provisionDiagnostic);}),diagnosticDeadline);}catch{failed=true;}
     }
+    // Original work can deliver its classified failure during the existing drain.
+    // Once finalized, later settlement cannot revise diagnostic or report evidence.
+    if(verifyStarted&&!verifyCompleted)verifyDiagnostic??=verifyDiagnosticLine('UNKNOWN');
+    verifyDiagnosticFinalized=true;
+    if(verifyDiagnostic&&deps.writeVerifyDiagnostic){
+      const diagnosticDeadline=Math.min(cleanup.deadline,now()+1000);
+      try{if(now()>=diagnosticDeadline)throw null;await bounded(Promise.resolve().then(()=>{if(now()>=diagnosticDeadline)throw null;return deps.writeVerifyDiagnostic(verifyDiagnostic);}),diagnosticDeadline);}catch{failed=true;}
+    }
     clearTimer(timer);input.signal?.removeEventListener('abort',abort);
   }
   if(input.signal?.aborted)failed=true;
@@ -203,7 +222,7 @@ export async function runManualPaymentCli(input,deps={}){
   }finally{unsubscribe?.();}
 }
 export async function runManualPaymentEntry(input,capabilities,deps={}){
-  let code=1;try{const value=await runManualPaymentCli(input,Object.create(deps,{write:{value:stdoutWriter(capabilities.stdout)},...(capabilities.stderr?{writePreflightDiagnostic:{value:stdoutWriter(capabilities.stderr)},writeAuthDiagnostic:{value:stdoutWriter(capabilities.stderr)},writeProvisionDiagnostic:{value:stdoutWriter(capabilities.stderr)}}:{})}));code=value.exitCode;}catch{}
+  let code=1;try{const value=await runManualPaymentCli(input,Object.create(deps,{write:{value:stdoutWriter(capabilities.stdout)},...(capabilities.stderr?{writePreflightDiagnostic:{value:stdoutWriter(capabilities.stderr)},writeAuthDiagnostic:{value:stdoutWriter(capabilities.stderr)},writeProvisionDiagnostic:{value:stdoutWriter(capabilities.stderr)},writeVerifyDiagnostic:{value:stdoutWriter(capabilities.stderr)}}:{})}));code=value.exitCode;}catch{}
   capabilities.exit(code);
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))void runManualPaymentEntry({env:process.env,args:process.argv.slice(2)},{stdout:process.stdout,stderr:process.stderr,exit:code=>process.exit(code)});

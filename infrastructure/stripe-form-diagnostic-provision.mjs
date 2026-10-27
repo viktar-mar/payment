@@ -14,9 +14,15 @@ const EXHAUSTED=new Set(['2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-4
 const ERRORS=new Set(['OPT_IN_REQUIRED','INPUTS_CONFIGURATION','OPERATION_BUSY','PROVISION_PENDING','HANDOFF_PENDING']);
 const fixed=code=>new Error('stripe_form_diagnostic_provision_'+(ERRORS.has(code)?code:'INPUTS_CONFIGURATION'));
 const provisionDiagnostics=new WeakMap();
+const verifyDiagnostics=new WeakMap();
 /** Fixed preparation-boundary metadata only; dependency errors are never inspected. */
 export function formatManualPaymentProvisionDiagnostic(error){
   return JSON.stringify({tag:'stripe_manual_payment_provision_diagnostic',stage:provisionDiagnostics.get(error)??'UNKNOWN'})+'\n';
+}
+/** Only immutable, module-owned verification metadata can supply a named boundary. */
+export function formatManualPaymentVerifyDiagnostic(error){
+  const diagnostic=verifyDiagnostics.get(error);
+  return JSON.stringify({tag:'stripe_manual_payment_verify_diagnostic',stage:diagnostic?.stage??'UNKNOWN',reason:diagnostic?.reason??'UNCONFIRMED'})+'\n';
 }
 const fail=()=>{throw null;};
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
@@ -386,8 +392,9 @@ async function createProvisioner(options,dependencies,manual) {
     const received=inspected.events.filter(v=>v.event_id===event.id&&v.event_type==='payment.succeeded');if(received.length!==1)return null;
     return snapshot({paymentConfirmed:true,webhookVerified:true,journalVerified:true,callbackVerified:true,providerEventId:event.provider_event_id});
   }
-  async function run(limits,body,{cleanup=false,initial}={}) {
-    if(busy) {pending=true;throw fixed('OPERATION_BUSY');}busy=true;
+  async function run(limits,body,{cleanup=false,initial,verification}={}) {
+    const verificationError=code=>{const error=fixed(code);if(verification)verifyDiagnostics.set(error,Object.freeze({...verification}));return error;};
+    if(busy) {pending=true;throw verificationError('OPERATION_BUSY');}busy=true;
     const controller=new AbortController();let timer,abort,context;
     try {
       if(!Number.isSafeInteger(limits?.deadline)||limits.deadline<=io.now()||(limits.signal!==undefined&&!(limits.signal instanceof AbortSignal)))fail();
@@ -397,7 +404,7 @@ async function createProvisioner(options,dependencies,manual) {
       abort=()=>controller.abort();limits.signal?.addEventListener('abort',abort,{once:true});if(limits.signal?.aborted)abort();
       context={deadline:limits.deadline,signal:controller.signal};timer=io.setTimeout(abort,Math.min(2147483647,limits.deadline-io.now()));
       return await controlled(context,()=>body(context));
-    }catch{pending=true;const error=fixed('PROVISION_PENDING');if(initial)provisionDiagnostics.set(error,initial.stage);throw error;}
+    }catch{pending=true;const error=verificationError('PROVISION_PENDING');if(initial)provisionDiagnostics.set(error,initial.stage);throw error;}
     finally{busy=false;io.clearTimeout(timer);limits?.signal?.removeEventListener('abort',abort);}
   }
   const capabilities={
@@ -417,14 +424,15 @@ async function createProvisioner(options,dependencies,manual) {
       const baseline=await noConfirmation(context);if(baseline.attempts!==1||pending)fail();
       status='CONFIRMING';await save(context);check(context);if(pending)fail();permitGranted=true;return true;
     }),
-    verifyPayment:limits=>run(limits,async context=>{
+    verifyPayment:limits=>{const verification={stage:'ADMISSION',reason:'UNCONFIRMED'};return run(limits,async context=>{
       if(pending||closed||!permitGranted||finalUsed)fail();finalUsed=true;
       return bounded(context,async polling=>{for(let n=0;n<30;n++){
+        verification.stage='STATUS_POLL';
         const value=await read('/api/v1/admin/payments/'+checkout.payment_id,polling);
-        if(value?.payment?.status==='SUCCEEDED'){const proof=await paymentProof(polling);if(proof)return proof;}
+        if(value?.payment?.status==='SUCCEEDED'){verification.stage='SERVER_PROOF';const proof=await paymentProof(polling);if(proof)return proof;}
         if(n<29)await call(polling,()=>new Promise(resolveWait=>io.setTimeout(resolveWait,Math.min(1500,Math.max(1,polling.deadline-io.now())))));
-      }fail();},45000);
-    }),
+      }verification.reason='PROBE_LIMIT';fail();},45000);
+    },{verification});},
     verifyUnused:limits=>run(limits,async context=>{if(pending||closed||permitUsed||finalUsed||status!=='READY')fail();finalUsed=true;await noConfirmation(context);return true;}),
     close:capabilities.close,
   });
