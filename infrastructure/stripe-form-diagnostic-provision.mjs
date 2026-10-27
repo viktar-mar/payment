@@ -211,8 +211,11 @@ async function createProvisioner(options,dependencies,manual) {
     });
   }
   const read=async(path,context,settings)=>(await request(path,context,settings)).value;
-  async function mutation(name,key,path,context,settings,predicate,identity){
-    await dispatch(name,key,context);const value=await read(path,context,settings);predicate(value);
+  async function mutation(name,key,path,context,settings,predicate,identity,initial){
+    if(initial)initial.stage='PRODUCT_DISPATCH';
+    await dispatch(name,key,context);
+    if(initial)initial.stage='FIXTURE_SETUP';
+    const value=await read(path,context,settings);predicate(value);
     await acknowledge(identity(value),context);return value;
   }
   function accountProof(value){
@@ -310,10 +313,12 @@ async function createProvisioner(options,dependencies,manual) {
     if(!Array.isArray(policies)||policies.length)fail();
     await mutation('return-url',stable('return-url'),returnPath,context,{method:'PUT',expected:204,
       body:{origin:browserOrigin,return_url:browserOrigin+'/payment-return.html',expected_version:-1}},v=>{if(v!==null)fail();},()=>({origin:browserOrigin}));
+    if(initial)initial.stage='RETURN_POLICY_READ';
     const policy=await read(returnPath,context);
+    if(initial)initial.stage='RETURN_POLICY_PROOF';
     if(!Array.isArray(policy)||policy.length!==1||!same(policy[0],{origin:browserOrigin,return_url:browserOrigin+'/payment-return.html',version:0}))fail();
     const createdProduct=await mutation('product',keys.product,'/api/admin/v1/sites/'+site.id+'/products',context,{method:'POST',expected:201,
-      body:{key:keys.product,name:'Stage5A one-time acceptance',description:null}},productProof,v=>({id:v.id,key:v.key}));product={id:createdProduct.id,key:keys.product};
+      body:{key:keys.product,name:'Stage5A one-time acceptance',description:null}},productProof,v=>({id:v.id,key:v.key}),initial);product={id:createdProduct.id,key:keys.product};
     const createdPrice=await mutation('price',keys.price,'/api/admin/v1/products/'+product.id+'/prices',context,{method:'POST',expected:201,
       body:{price_key:keys.price,type:'ONE_TIME',amount_minor:2000,currency:'EUR',billing_interval:null,trial_days:0,tax_mode:'NONE',tax_code:null}},v=>priceProof(v,false),v=>({id:v.id,key:v.price_key,version:v.version}));
     price={id:createdPrice.id,key:keys.price,version:createdPrice.version};

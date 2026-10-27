@@ -115,6 +115,80 @@ function paymentFixture(){
  return f;
 }
 async function prepared({threeDSecure=false}={}){assert.equal(typeof diagnosticModule.createManualPaymentProvisioner,'function');const f=paymentFixture();if(threeDSecure)f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';f.p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies);f.limits=LIMIT();f.handoff=await f.p.prepare(f.limits);return f;}
+function fixtureBoundaryFailure(f,boundary,error){
+ const state={injected:0},fetcher=f.dependencies.fetch,open=f.dependencies.open;
+ f.dependencies.fetch=async(url,settings)=>{
+  const result=await fetcher(url,settings),path=new URL(url).pathname;
+  if(path.endsWith('/checkout-return-urls')&&settings.method==='GET'&&f.events.some(e=>e.path===path&&e.method==='PUT')){
+   if(boundary==='RETURN_POLICY_READ'){state.injected++;throw error;}
+   if(boundary==='RETURN_POLICY_PROOF'){state.injected++;return f.response(200,[{origin:'synthetic-private-policy-canary',return_url:'synthetic-private-policy-canary',version:0}]);}
+  }
+  if(path.endsWith('/products')){
+   if(boundary==='product-http'){state.injected++;throw error;}
+   if(boundary==='product-proof'){state.injected++;return f.response(201,{...f.product(),status:'synthetic-private-product-canary'});}
+  }
+  return result;
+ };
+ f.dependencies.open=async(path,...args)=>{
+  const handle=await open(path,...args),write=handle.writeFile;
+  handle.writeFile=async text=>{
+   const intent=JSON.parse(text).intents?.at(-1);
+   if(intent?.name==='product'&&((boundary==='PRODUCT_DISPATCH'&&intent.status==='DISPATCHING')||(boundary==='product-ack'&&intent.status==='ACKNOWLEDGED'))){state.injected++;throw error;}
+   return write(text);
+  };
+  return handle;
+ };
+ return state;
+}
+// Break: the return-policy read/proof and durable product dispatch lose their exact bounded stage.
+for(const threeDSecure of [false,true])for(const stage of ['RETURN_POLICY_READ','RETURN_POLICY_PROOF','PRODUCT_DISPATCH'])for(const hostile of stage==='RETURN_POLICY_PROOF'?[false]:[false,true])test(`fixture boundary ${stage} ${threeDSecure?'3DS':'ordinary'} ${hostile?'hostile':'canary'} failure is safe and cannot resume`,async()=>{
+ const f=paymentFixture();if(threeDSecure)f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';let reads=0;
+ const trap=()=>{reads++;throw Error('synthetic-private-error-canary');};
+ const error=hostile?new Proxy({},{get:trap,ownKeys:trap,getPrototypeOf:trap,getOwnPropertyDescriptor:trap}):Error('synthetic-private-error-canary');
+ const state=fixtureBoundaryFailure(f,stage,error),p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies),limits=LIMIT();let failure;
+ try{await p.prepare(limits);}catch(caught){failure=caught;}
+ assert.ok(failure);assert.equal(failure.message,'stripe_form_diagnostic_provision_PROVISION_PENDING');assert.equal(state.injected,1);
+ assert.equal(reads,0);assert.equal(f.events.filter(e=>e.path?.endsWith('/products')||e.path?.endsWith('/checkouts')).length,0);
+ const before=[...f.events];await assert.rejects(p.prepare(limits));assert.deepEqual(f.events,before);assert.equal(state.injected,1);
+ const wire=diagnosticModule.formatManualPaymentProvisionDiagnostic(failure);
+ assert.equal(wire,'{"tag":"stripe_manual_payment_provision_diagnostic","stage":"'+stage+'"}\n');assert.ok(Buffer.byteLength(wire)<=256);assert.equal(reads,0);
+});
+// Break: PRODUCT_DISPATCH escapes its durable-save boundary and mislabels later product failures.
+for(const threeDSecure of [false,true])for(const boundary of ['product-http','product-proof','product-ack'])test(`fixture boundary completed dispatch resets for ${boundary} ${threeDSecure?'3DS':'ordinary'}`,async()=>{
+ const f=paymentFixture();if(threeDSecure)f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';
+ const state=fixtureBoundaryFailure(f,boundary,Error('synthetic-private-error-canary')),p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies),limits=LIMIT();let failure;
+ try{await p.prepare(limits);}catch(error){failure=error;}
+ assert.ok(failure);assert.equal(state.injected,1);assert.equal(f.events.filter(e=>e.path?.endsWith('/products')).length,1);assert.equal(f.events.filter(e=>e.path?.endsWith('/checkouts')).length,0);
+ const ledger=JSON.parse(f.files.get(DIR+'/form-provisioning.json').contents);assert.equal(ledger.intents.at(-1).name,'product');assert.equal(ledger.intents.at(-1).status,'DISPATCHING');
+ const before=[...f.events];await assert.rejects(p.prepare(limits));assert.deepEqual(f.events,before);
+ assert.equal(diagnosticModule.formatManualPaymentProvisionDiagnostic(failure),'{"tag":"stripe_manual_payment_provision_diagnostic","stage":"FIXTURE_SETUP"}\n');
+});
+for(const stage of ['RETURN_POLICY_READ','RETURN_POLICY_PROOF','PRODUCT_DISPATCH'])test('fixture boundary nonmanual '+stage+' failure stays unbranded',async()=>{
+ const f=fixture();f.resource.mode='FORM_DIAGNOSTIC';f.resource.webhookReady=false;f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};
+ const state=fixtureBoundaryFailure(f,stage,Error('synthetic-private-error-canary')),p=await diagnosticModule.createFormDiagnosticProvisioner(f.options,f.dependencies);let failure;
+ try{await p.prepare(LIMIT());}catch(error){failure=error;}
+ assert.ok(failure);assert.equal(state.injected,1);assert.equal(f.events.filter(e=>e.path?.endsWith('/products')||e.path?.endsWith('/checkouts')).length,0);
+ assert.equal(diagnosticModule.formatManualPaymentProvisionDiagnostic(failure),'{"tag":"stripe_manual_payment_provision_diagnostic","stage":"UNKNOWN"}\n');
+});
+// Break: actual provisioner brands fail to reach the sole safe line after independent cleanup and before the native final report.
+for(const threeDSecure of [false,true])for(const stage of ['RETURN_POLICY_READ','RETURN_POLICY_PROOF','PRODUCT_DISPATCH'])test(`fixture boundary real ${stage} reaches ${threeDSecure?'3DS':'ordinary'} controller cleanup and final report`,async()=>{
+ const {runManualPaymentCli}=await import('./stripe-manual-payment.mjs'),f=paymentFixture();if(threeDSecure)f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_3DS='true';
+ let reads=0;const trap=()=>{reads++;throw Error('synthetic-private-error-canary');};
+ const state=fixtureBoundaryFailure(f,stage,new Proxy({},{get:trap,ownKeys:trap,getPrototypeOf:trap,getOwnPropertyDescriptor:trap}));
+ const p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies),lines=[],reports=[],order=[],close=p.close;
+ const env={...f.options.env,PAYMENT_STRIPE_SANDBOX_RUN_ID:RUN,PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE:f.resource.expectedSource,PAYMENT_STRIPE_SANDBOX_DAEMON:f.resource.daemon,PAYMENT_STRIPE_SANDBOX_PORT_MANUAL:'18083',...Object.fromEntries(Object.entries(f.resource.ports).map(([key,value])=>['PAYMENT_STRIPE_SANDBOX_PORT_'+key.toUpperCase(),String(value)]))};
+ const unreachable=()=>assert.fail('no gateway, grant, verification or provider capability after failed preparation');
+ const value=await runManualPaymentCli({env,args:[]},{subscribe:()=>()=>{},preflight:async()=>({status:'READY'}),
+  createBootstrap:async()=>({prepare:async()=>true,resources:()=>({...f.resource,status:'PREPARED',cliDirectory:DIR+'/cli'}),start:async()=>true,verify:async()=>true,stop:async()=>{order.push('runtime');return true;}}),
+  createCli:async()=>({validateBinding:async()=>true,startListener:async()=>true,stopListener:async()=>{order.push('listener');if(threeDSecure)throw null;return true;},inspectManualPayment:unreachable}),authorizeCli:async()=>true,
+  createProvisioner:async()=>({...p,markConfirmation:unreachable,verifyPayment:unreachable,verifyUnused:unreachable,close:async limits=>{order.push('provisioner');return close(limits);}}),createGateway:unreachable,
+  writeProvisionDiagnostic:async line=>{lines.push(line);order.push('diagnostic');},write:async line=>{reports.push(line);order.push('report');}});
+ assert.equal(state.injected,1);assert.equal(reads,0);assert.equal(f.events.filter(e=>e.path?.endsWith('/products')||e.path?.endsWith('/checkouts')).length,0);
+ assert.deepEqual(order,['provisioner','listener','runtime','diagnostic','report']);
+ assert.deepEqual(value.report,{version:1,mode:threeDSecure?'MANUAL_3DS':'MANUAL_PAYMENT',result:'PENDING',phase:'PROVISION',confirmation_granted:false,payment_confirmed:false,provider_confirmed:false,webhook_verified:false,journal_verified:false,callback_verified:false,...(threeDSecure?{three_ds_verified:false}:{}),gateway_closed:true,listener_closed:!threeDSecure,runtime_closed:true,browser_closure:'NOT_OWNED',provenance:'CONTROLLER_REPORTED'});
+ assert.equal(value.exitCode,1);assert.equal(reports.length,1);assert.deepEqual(JSON.parse(reports[0]),value.report);
+ assert.deepEqual(lines,['{"tag":"stripe_manual_payment_provision_diagnostic","stage":"'+stage+'"}\n']);assert.ok(Buffer.byteLength(lines[0])<=256);
+});
 // Break: leaking dependency errors or losing the actual initial failure boundary.
 for(const stage of ['ADMISSION','OWNERSHIP','PROVIDER_BINDING','ADMIN_CREDENTIALS'])test('manual provision diagnostic brands actual '+stage+' failure',async()=>{
  const f=paymentFixture(),canary=Error('password=synthetic-private sk_test_canary');
