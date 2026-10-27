@@ -402,6 +402,11 @@ test('unknown create dispatch and failed durable ACK cannot retry, rekey or rele
     if(mode==='duplicate')await rejects(e.beforeDonationCreate('anonymous',facts,limits()));
     else {breakSync=true;f.details.set(uuid(30),f.payment(uuid(30)));await rejects(e.ackDonationCreate('anonymous',{checkoutId:uuid(32),paymentId:uuid(30),donationId:uuid(31),campaignKey:f.provisioned.campaign.key,campaignVersion:1,amountMinor:500,currency:'EUR'},limits()));}
     assert.equal(f.ledger().donations.anonymous.phase,'DISPATCHING');assert.equal(f.ledger().donations.anonymous.key,key);
+    // Durable OPEN is the last saved state, not evidence that the failed in-memory run can resume.
+    assert.equal(f.ledger().status,'OPEN');assert.equal(e.resources().status,'PENDING');
+    const calls=f.events.length;
+    await rejects(e.beforeDonationCreate('anonymous',facts,limits()));await rejects(e.beforeDonationPay('anonymous',limits()));await rejects(e.missedFixture(limits()));
+    assert.equal(f.events.length,calls);assert.equal(f.ledger().donations.anonymous.key,key);assert.equal(f.ledger().donations.anonymous.phase,'DISPATCHING');
     await rejects(e.close(limits()));assert.equal(f.files.has(DIR+'/extras.lock'),true);assert.equal(e.resources().status,'PENDING');
   }
 });

@@ -21,6 +21,24 @@ const binding={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.
   price:{id:'00000000-0000-4000-8000-000000000004',key:'s5a-price',version:1}};
 const endpoint=binding.endpoints.backend+'/api/v1/public/sites/s5a-site/donation-campaigns/s5a-donate/checkouts';
 const limits=()=>({deadline:Date.now()+120000,signal:new AbortController().signal});
+const trustedFailure=(error:unknown):boolean=>{
+  assert.ok(Object.isFrozen(error));assert.equal(Object.getPrototypeOf(error),null);assert.deepEqual(Reflect.ownKeys(error as object),[]);
+  assert.throws(()=>rethrowSandboxBrowserFailure(error),actual=>actual===error);return true;
+};
+// Break: an inner trusted failure must keep identity through acquisition, bounded waits and forwarding cleanup.
+test('donation helpers preserve authenticated first token identity through their catches',async()=>{
+  let primary:unknown,reads=0,closes=0;
+  const hostile=new Proxy({},{get(){reads++;throw null;},ownKeys(){reads++;throw null;}});
+  try{await runSandboxBrowserStep('anonymous','DONATION_SETUP',async()=>{throw hostile;});}catch(error){primary=error;}
+  trustedFailure(primary);
+  const same=(error:unknown)=>error===primary;
+  await assert.rejects(runOwnedSandboxDonations({newContext:async()=>{throw primary;}} as unknown as Browser,{} as SandboxAcceptanceExtras,binding,limits()),same);
+  await assert.rejects(runOwnedSandboxDonations({newContext:async()=>({newPage:async()=>{throw primary;},close:async()=>{closes++;throw hostile;}})} as unknown as Browser,{} as SandboxAcceptanceExtras,binding,limits()),same);
+  const route={request:()=>request(),continue:forbidden,abort:async()=>{throw hostile;}} as Pick<Route,'request'|'continue'|'abort'>;
+  await assert.rejects(forwardDonationCreate(route,{beforeDonationCreate:async()=>{throw primary;}},'anonymous',binding,limits()),same);
+  await assert.rejects(runDonationOtp({locator:()=>({first(){return this;}}),on:()=>{},off:()=>{}} as unknown as Page,{beginOtp:async()=>{throw primary;}} as unknown as SandboxAcceptanceExtras,binding,limits()),same);
+  assert.equal(closes,1);assert.equal(reads,0);
+});
 // Break: a later owned context close rejection must not replace the first trusted card failure.
 test('card owner preserves trusted first failure while awaiting rejecting created-context cleanup',async()=>{
   const contexts:unknown[]=[],events:string[]=[];
@@ -119,6 +137,30 @@ function admissionClock() {
   return {count:()=>alarms.length,fire(index:number){const alarm=alarms[index];assert.ok(alarm);clearTimeout(alarm.handle);alarm.fire();},
     close(){timer.mock.restore();for(const alarm of alarms)clearTimeout(alarm.handle);}};
 }
+// Break: awaiting a stalled second abort before rejecting forwarding delays the primary failure or loses it.
+test('failed forwarding reports its original token before the bounded second abort settles',async()=>{
+  const clock=admissionClock(),events:string[]=[];let primary:unknown,reads=0,keys=0,posts=0,closes=0,aborts=0,abortAlarm=-1,routeSettled=false;
+  const hostile=new Proxy({},{get(){reads++;throw null;},ownKeys(){reads++;throw null;}});
+  try{await runSandboxBrowserStep('anonymous','DONATION_DISPATCH',async()=>{throw hostile;});}catch(error){primary=error;}
+  let handle!:(route:unknown)=>Promise<void>,routeWork:Promise<void>|undefined;
+  const route={request:()=>request(),continue:async()=>{events.push('forward');throw primary;},abort:async()=>{
+    if(++aborts===1)throw hostile;
+    abortAlarm=clock.count()-1;await new Promise(()=>{});
+  }};
+  const widget={first(){return this;},locator:()=>({click:async()=>{},evaluate:async()=>true}),getByRole:(_role:string,{name}:{name:string})=>({click:async()=>{
+    events.push(name);assert.equal(name,'Create donation');posts++;routeWork=handle(route).then(()=>{routeSettled=true;});
+    await new Promise(resolve=>setImmediate(resolve));
+  }})};
+  const page={goto:async()=>{},evaluate:async()=>true,locator:()=>widget,waitForResponse:()=>new Promise(()=>{}),on:()=>{},off:()=>{}};
+  const browser={newContext:async()=>({route:async(_url:string,callback:typeof handle)=>{handle=callback;},newPage:async()=>page,close:async()=>{closes++;}})} as unknown as Browser;
+  const extras={beforeDonationCreate:async()=>{keys++;return 'synthetic-key';},ackDonationCreate:forbidden,beforeDonationPay:forbidden,confirmDonation:forbidden} as unknown as SandboxAcceptanceExtras;
+  try{
+    await assert.rejects(runOwnedSandboxDonations(browser,extras,binding,limits()),error=>error===primary);
+    assert.equal(routeSettled,false);assert.equal(aborts,2);assert.ok(abortAlarm>=0);assert.equal(posts,1);assert.equal(keys,1);assert.equal(closes,1);
+    assert.deepEqual(events,['Create donation','forward']);assert.equal(reads,0);
+    clock.fire(abortAlarm);await routeWork;assert.equal(routeSettled,true);assert.equal(aborts,2);assert.equal(keys,1);assert.equal(posts,1);
+  }finally{clock.close();}
+});
 // I2: local admission expiry abandons ownership even while the original deadline is open.
 test('late donation context after local timeout is closed before the failed owner settles',async()=>{
   const clock=admissionClock();let create!: (context:unknown)=>void,finishClose!:()=>void,closes=0,settled=false;
@@ -130,7 +172,7 @@ test('late donation context after local timeout is closed before the failed owne
     const settledBeforeCreation=settled;
     create({close:async()=>{closes++;await closing;}});await new Promise(resolve=>setImmediate(resolve));
     const settledBeforeClose=settled;finishClose();
-    await assert.rejects(running,{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});
+    await assert.rejects(running,trustedFailure);
     assert.equal(settledBeforeCreation,false);assert.equal(settledBeforeClose,false);assert.equal(closes,1);
   }finally{finishClose();clock.close();}
 });
@@ -141,7 +183,7 @@ test('late donation context with rejecting close remains a fixed failed owner',a
   try {
     await new Promise(resolve=>setImmediate(resolve));clock.fire(0);await new Promise(resolve=>setImmediate(resolve));
     create({close:async()=>{closes++;throw new Error('synthetic-private-close');}});
-    await assert.rejects(running,{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});assert.equal(closes,1);
+    await assert.rejects(running,trustedFailure);assert.equal(closes,1);
   }finally{clock.close();}
 });
 test('late donation context with pending close ends at the independent cleanup bound',async()=>{
@@ -152,7 +194,7 @@ test('late donation context with pending close ends at the independent cleanup b
     await new Promise(resolve=>setImmediate(resolve));clock.fire(0);await new Promise(resolve=>setImmediate(resolve));
     create({close:async()=>{closes++;await new Promise(()=>{});}});await new Promise(resolve=>setImmediate(resolve));
     const cleanupAlarms=clock.count();if(cleanupAlarms>1)clock.fire(1);
-    await assert.rejects(running,{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});assert.equal(cleanupAlarms,2);assert.equal(closes,1);
+    await assert.rejects(running,trustedFailure);assert.equal(cleanupAlarms,2);assert.equal(closes,1);
   }finally{clock.close();}
 });
 test('creation beyond cleanup bound stays abandoned and its eventual context still closes once',async()=>{
@@ -162,7 +204,7 @@ test('creation beyond cleanup bound stays abandoned and its eventual context sti
   try {
     await new Promise(resolve=>setImmediate(resolve));clock.fire(0);await new Promise(resolve=>setImmediate(resolve));
     const cleanupAlarms=clock.count();if(cleanupAlarms>1)clock.fire(1);
-    await assert.rejects(running,{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});
+    await assert.rejects(running,trustedFailure);
     create({close:async()=>{closes++;}});await new Promise(resolve=>setImmediate(resolve));assert.equal(cleanupAlarms,2);assert.equal(closes,1);
   }finally{clock.close();}
 });
@@ -190,7 +232,7 @@ for(const boundary of ['deadline','cancellation'] as const)test(`${boundary} at 
   const browser={newContext:async()=>({close:async()=>{closes++;},newPage:async()=>{pages++;throw new Error('synthetic-page-forbidden');}})} as unknown as Browser;
   const extras=new Proxy({},{get(){authority++;throw new Error('synthetic-authority-forbidden');}}) as SandboxAcceptanceExtras;
   try {
-    await assert.rejects(runOwnedSandboxDonations(browser,extras,binding,{deadline,signal:controller.signal}),{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});
+    await assert.rejects(runOwnedSandboxDonations(browser,extras,binding,{deadline,signal:controller.signal}),trustedFailure);
     assert.equal(closes,1);assert.equal(pages,0);assert.equal(authority,0);
   }finally{listen.mock.restore();clock.mock.restore();}
 });

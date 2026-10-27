@@ -1,7 +1,7 @@
 import type {Browser,BrowserContext,Request,Response,Route,Page} from '@playwright/test';
 import type {SandboxAcceptanceExtras,SandboxDonationKind,SandboxDonationIdentity} from '../../../../infrastructure/stripe-sandbox-extras.mjs';
 import type {OwnedSandboxLimits,OwnedSandboxPublicBinding} from '../../../../infrastructure/stripe-sandbox-acceptance.mjs';
-import {rethrowSandboxBrowserFailure} from '../../../../infrastructure/stripe-sandbox-acceptance.mjs';
+import {rethrowSandboxBrowserFailure,runSandboxBrowserStep} from '../../../../infrastructure/stripe-sandbox-acceptance.mjs';
 // @ts-expect-error Native Node 25 test execution uses the existing source directly.
 import {enterPrivateText} from './private-entry.ts';
 
@@ -49,7 +49,7 @@ async function bounded<T>(body:()=>Promise<T>,limits:OwnedSandboxLimits,maximum=
       limits.signal?.addEventListener('abort',abort,{once:true});timer=setTimeout(abort,duration);
       if(limits.signal?.aborted)abort();
     })]);timeout(limits);return value;
-  }catch{return fail();}finally{clearTimeout(timer);limits.signal?.removeEventListener('abort',abort);}
+  }catch(error){return rethrowSandboxBrowserFailure(error,'DONATION_PENDING');}finally{clearTimeout(timer);limits.signal?.removeEventListener('abort',abort);}
 }
 async function jsonResponse(response:Pick<Response,'body'>,limits:OwnedSandboxLimits):Promise<Record<string,unknown>> {
   const bytes=await bounded(()=>response.body(),limits);
@@ -74,7 +74,7 @@ export async function forwardDonationCreate(route:Pick<Route,'request'|'continue
     timeout(limits);
     // Playwright preserves the original method/body and every unmodified original header.
     await bounded(()=>route.continue({headers:{...headers,'idempotency-key':key}}),limits);
-  }catch{try{await bounded(()=>route.abort('failed'),{deadline:Date.now()+15000});}catch{}fail();}
+  }catch(error){try{await bounded(()=>route.abort('failed'),{deadline:Date.now()+15000});}catch{}rethrowSandboxBrowserFailure(error,'DONATION_PENDING');}
 }
 
 export async function acknowledgeDonationResponse(response:Pick<Response,'request'|'url'|'status'|'body'>,request:Request,extras:Pick<SandboxAcceptanceExtras,'ackDonationCreate'>,
@@ -90,8 +90,8 @@ export async function acknowledgeDonationResponse(response:Pick<Response,'reques
       ||donation.campaign_key!==binding.campaign.key||donation.campaign_version!==binding.campaign.version)fail();
     const identity:SandboxDonationIdentity={checkoutId:value.checkout_id as string,paymentId:value.payment_id as string,
       donationId:donation.donation_id as string,campaignKey:binding.campaign.key,campaignVersion:binding.campaign.version,amountMinor:500,currency:'EUR'};
-    if(await extras.ackDonationCreate(kind,identity,limits)!==true)fail();
-  }catch{fail();}
+    await runSandboxBrowserStep(kind,'DONATION_ACK',async()=>{if(await extras.ackDonationCreate(kind,identity,limits)!==true)fail();});
+  }catch(error){rethrowSandboxBrowserFailure(error,'DONATION_PENDING');}
 }
 
 export async function runDonationOtp(page:Page,extras:Pick<SandboxAcceptanceExtras,'beginOtp'|'ackOtpChallenge'|'withOtpCode'|'beforeOtpVerify'|'ackOtpVerification'>,binding:OwnedSandboxPublicBinding,limits:OwnedSandboxLimits):Promise<void> {
@@ -145,7 +145,7 @@ export async function runDonationOtp(page:Page,extras:Pick<SandboxAcceptanceExtr
       }catch{return false;}
     },{backend:binding.endpoints.backend,site:binding.site.key,demo:binding.endpoints.demo,customerId:customer.id as string},{timeout:timeout(limits)});
     if(challengePosts!==1||verifyPosts!==1||await extras.ackOtpVerification({challengeId,customerId:customer.id as string},limits)!==true)fail();
-  }catch{fail();}finally{email=undefined;code=undefined;page.off('request',observe);}
+  }catch(error){rethrowSandboxBrowserFailure(error,'DONATION_PENDING');}finally{email=undefined;code=undefined;page.off('request',observe);}
 }
 
 async function donationContext(browser:Browser,limits:OwnedSandboxLimits):Promise<{context:BrowserContext;close:()=>Promise<void>}> {
@@ -159,68 +159,92 @@ async function donationContext(browser:Browser,limits:OwnedSandboxLimits):Promis
   try {
     const context=await bounded(()=>opening,limits);
     return {context,close:()=>closeOwned(context)};
-  }catch{
+  }catch(error){
     abandoned=true;
     // Creation and actual close share one independent cleanup budget. Neither can wait indefinitely.
     try{await bounded(async()=>{await closeOwned(await opening);},{deadline:Date.now()+15000});}catch{}
-    return fail();
+    rethrowSandboxBrowserFailure(error,'DONATION_PENDING');
   }
 }
 
 export async function runOwnedSandboxDonations(browser:Browser,extras:SandboxAcceptanceExtras,binding:OwnedSandboxPublicBinding,limits:OwnedSandboxLimits):Promise<true> {
   for(const kind of ['anonymous','emailOtp'] as const) {
-    const owner=await donationContext(browser,limits),context=owner.context;
+    const owner=await runSandboxBrowserStep(kind,'DONATION_SETUP',()=>donationContext(browser,limits)),context=owner.context;
     const abort=()=>{void owner.close().catch(()=>{});};
-    let timer:ReturnType<typeof setTimeout>|undefined;
+    let timer:ReturnType<typeof setTimeout>|undefined,failed=false,primary:unknown;
     try {
-      limits.signal?.addEventListener('abort',abort,{once:true});
-      if(limits.signal?.aborted){abort();fail();}
-      timer=setTimeout(abort,timeout(limits,2700000));
-      const page=await bounded(()=>context.newPage(),limits),url=new URL('/',binding.endpoints.demo);
-      for(const [key,value] of Object.entries({api_base_url:binding.endpoints.backend,site_key:binding.site.key,price_key:binding.price.key,campaign_key:binding.campaign.key,locale:'en'}))url.searchParams.set(key,value);
-      await page.goto(url.href,{timeout:timeout(limits)});
-      if(kind==='emailOtp')await runDonationOtp(page,extras,binding,limits);
-      else if(!await page.evaluate(()=>!Object.keys(sessionStorage).some(key=>key.startsWith('generic-payments:customer:'))))fail();
+      const page=await runSandboxBrowserStep(kind,'DONATION_SETUP',async()=>{
+        limits.signal?.addEventListener('abort',abort,{once:true});
+        if(limits.signal?.aborted){abort();fail();}
+        timer=setTimeout(abort,timeout(limits,2700000));
+        const page=await bounded(()=>context.newPage(),limits),url=new URL('/',binding.endpoints.demo);
+        for(const [key,value] of Object.entries({api_base_url:binding.endpoints.backend,site_key:binding.site.key,price_key:binding.price.key,campaign_key:binding.campaign.key,locale:'en'}))url.searchParams.set(key,value);
+        await page.goto(url.href,{timeout:timeout(limits)});
+        if(kind==='emailOtp')await runDonationOtp(page,extras,binding,limits);
+        else if(!await page.evaluate(()=>!Object.keys(sessionStorage).some(key=>key.startsWith('generic-payments:customer:'))))fail();
+        return page;
+      });
       await donationPayment(page,context,extras,kind,binding,limits);
-    }catch{fail();}
-    finally{clearTimeout(timer);limits.signal?.removeEventListener('abort',abort);try{await bounded(()=>owner.close(),{deadline:Date.now()+15000});}catch{fail();}}
+    }catch(error){failed=true;primary=error;}
+    finally{
+      clearTimeout(timer);limits.signal?.removeEventListener('abort',abort);
+      try{await runSandboxBrowserStep(kind,'DONATION_CLOSE_CONTEXT',()=>bounded(()=>owner.close(),{deadline:Date.now()+15000}));}
+      catch(error){if(!failed){failed=true;primary=error;}}
+    }
+    if(failed)rethrowSandboxBrowserFailure(primary,'DONATION_PENDING');
   }
   return true;
 }
 
 async function donationPayment(page:Page,context:BrowserContext,extras:SandboxAcceptanceExtras,kind:SandboxDonationKind,binding:OwnedSandboxPublicBinding,limits:OwnedSandboxLimits):Promise<void> {
-  let posts=0,responses=0,original:Request|undefined,routeFailure=false;
-  let resolveForward!:()=>void,rejectForward!:()=>void;
-  const forwarded=new Promise<void>((resolve,reject)=>{resolveForward=resolve;rejectForward=()=>reject(new Error('stripe_sandbox_BROWSER_DONATION_PENDING'));});
+  let posts=0,responses=0,original:Request|undefined,routeFailure=false,firstRouteFailure:unknown;
+  let resolveForward!:()=>void,rejectForward!:(error:unknown)=>void;
+  const forwarded=new Promise<void>((resolve,reject)=>{resolveForward=resolve;rejectForward=reject;});
   forwarded.catch(()=>{});
-  await context.route(endpoint(binding),async route=>{
+  await runSandboxBrowserStep(kind,'DONATION_SETUP',()=>context.route(endpoint(binding),async route=>{
     if(route.request().method()==='OPTIONS'){
-      try{await forwardDonationCreate(route,extras,kind,binding,limits);}catch{routeFailure=true;rejectForward();}return;
+      try{await runSandboxBrowserStep(kind,'DONATION_DISPATCH',()=>forwardDonationCreate(route,extras,kind,binding,limits));}
+      catch(error){if(!routeFailure)firstRouteFailure=error;routeFailure=true;rejectForward(firstRouteFailure);}return;
     }
     try {
-      if(++posts!==1||route.request().method()!=='POST')fail();original=route.request();
-      await forwardDonationCreate(route,extras,kind,binding,limits);resolveForward();
-    }catch{routeFailure=true;try{await route.abort('failed');}catch{}rejectForward();}
-  });
+      await runSandboxBrowserStep(kind,'DONATION_DISPATCH',async()=>{
+        if(++posts!==1||route.request().method()!=='POST')fail();original=route.request();
+        await forwardDonationCreate(route,extras,kind,binding,limits);
+      });resolveForward();
+    }catch(error){if(!routeFailure)firstRouteFailure=error;routeFailure=true;rejectForward(firstRouteFailure);try{await bounded(()=>route.abort('failed'),{deadline:Date.now()+15000});}catch{}}
+  }));
   const observe=(response:Response)=>{if(response.url()===endpoint(binding)&&response.request().method()==='POST')responses++;};
   page.on('response',observe);
   try {
-    const widget=page.locator('generic-donation').first();
-    await widget.locator('button[data-amount="500"]').click({timeout:timeout(limits)});
-    if(!await widget.locator('textarea').evaluate(element=>(element as HTMLTextAreaElement).value===''))fail();
-    const genuine=page.waitForResponse(response=>response.url()===endpoint(binding)&&response.request().method()==='POST',{timeout:timeout(limits)});
-    genuine.catch(()=>{});
-    await widget.getByRole('button',{name:'Create donation',exact:true}).click({timeout:timeout(limits)});
-    await bounded(()=>forwarded,limits);const response=await bounded(()=>genuine,limits);
-    if(!original||posts!==1||responses!==1||routeFailure)fail();
-    await acknowledgeDonationResponse(response,original,extras,kind,binding,limits);
-    const frame=widget.frameLocator('iframe[title="Secure payment input frame"]');
-    await frame.locator('input[name="number"]').fill('4242424242424242',{timeout:timeout(limits)});
-    await frame.locator('input[name="expiry"]').fill('1230',{timeout:timeout(limits)});
-    await frame.locator('input[name="cvc"]').fill('123',{timeout:timeout(limits)});
-    const postal=frame.locator('input[name="postalCode"]');if(await postal.isVisible())await postal.fill('10001',{timeout:timeout(limits)});
-    if(await extras.beforeDonationPay(kind,limits)!==true||posts!==1||responses!==1||routeFailure)fail();
-    await widget.getByRole('button',{name:'Pay',exact:true}).click({timeout:timeout(limits)});
-    if(await extras.confirmDonation(kind,{deadline:Math.min(limits.deadline,Date.now()+45000),signal:limits.signal})!==true||posts!==1||responses!==1||routeFailure)fail();
+    const widget=await runSandboxBrowserStep(kind,'DONATION_SETUP',async()=>{
+      const widget=page.locator('generic-donation').first();
+      await widget.locator('button[data-amount="500"]').click({timeout:timeout(limits)});
+      if(!await widget.locator('textarea').evaluate(element=>(element as HTMLTextAreaElement).value===''))fail();
+      return widget;
+    });
+    const {genuine}=await runSandboxBrowserStep(kind,'DONATION_DISPATCH',async()=>{
+      const genuine=page.waitForResponse(response=>response.url()===endpoint(binding)&&response.request().method()==='POST',{timeout:timeout(limits)});
+      genuine.catch(()=>{});
+      try{
+        await widget.getByRole('button',{name:'Create donation',exact:true}).click({timeout:timeout(limits)});
+        await bounded(()=>forwarded,limits);
+      }catch(error){rethrowSandboxBrowserFailure(routeFailure?firstRouteFailure:error,'DONATION_PENDING');}
+      return {genuine};
+    });
+    await runSandboxBrowserStep(kind,'DONATION_RESPONSE',async()=>{
+      const response=await bounded(()=>genuine,limits);
+      if(!original||posts!==1||responses!==1||routeFailure)fail();
+      await acknowledgeDonationResponse(response,original,extras,kind,binding,limits);
+    });
+    await runSandboxBrowserStep(kind,'DONATION_PAYMENT',async()=>{
+      const frame=widget.frameLocator('iframe[title="Secure payment input frame"]');
+      await frame.locator('input[name="number"]').fill('4242424242424242',{timeout:timeout(limits)});
+      await frame.locator('input[name="expiry"]').fill('1230',{timeout:timeout(limits)});
+      await frame.locator('input[name="cvc"]').fill('123',{timeout:timeout(limits)});
+      const postal=frame.locator('input[name="postalCode"]');if(await postal.isVisible())await postal.fill('10001',{timeout:timeout(limits)});
+      if(await extras.beforeDonationPay(kind,limits)!==true||posts!==1||responses!==1||routeFailure)fail();
+      await widget.getByRole('button',{name:'Pay',exact:true}).click({timeout:timeout(limits)});
+      if(await extras.confirmDonation(kind,{deadline:Math.min(limits.deadline,Date.now()+45000),signal:limits.signal})!==true||posts!==1||responses!==1||routeFailure)fail();
+    });
   }finally{page.off('response',observe);}
 }

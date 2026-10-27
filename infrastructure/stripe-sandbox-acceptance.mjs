@@ -25,6 +25,10 @@ const BROWSER_CASES=['success','decline','sca'];
 const SCA_FRAME_STEPS=['SCA_WRAPPER_FRAME','SCA_CHALLENGE_FRAME','SCA_ISSUER_FRAME'];
 const BROWSER_STEPS=['BEGIN_BROWSER','NEW_CONTEXT','CHECKOUT_SESSION','INSTALL_SESSION','NEW_PAGE','NAVIGATE','RESUME','PAYMENT_FORM_READY','CARD_FRAME','CARD_NUMBER_READY','CARD_NUMBER','CARD_EXPIRY','CARD_CVC','POSTAL_CHECK','POSTAL_FILL','MARK_PAY','PAY','MARK_RETRY','RETRY_PAYMENT_FORM_READY','RETRY_CARD_FRAME','RETRY_CARD_NUMBER_READY','RETRY_CARD_NUMBER','RETRY_CARD_EXPIRY','RETRY_CARD_CVC','RETRY_POSTAL_CHECK','RETRY_POSTAL_FILL','RETRY_PAY',...SCA_FRAME_STEPS,'SCA_COMPLETE','SERVER_CONFIRM','CLOSE_CONTEXT'];
 const FORM_STEPS=['PAYMENT_FORM_READY','RETRY_PAYMENT_FORM_READY'];
+const DONATION_CASES=['anonymous','emailOtp'];
+const DONATION_STEPS=['DONATION_SETUP','DONATION_DISPATCH','DONATION_RESPONSE','DONATION_ACK','DONATION_PAYMENT','DONATION_CLOSE_CONTEXT'];
+const validBrowserStep=(browserCase,browserStep)=>DONATION_CASES.includes(browserCase)?DONATION_STEPS.includes(browserStep)
+  :BROWSER_CASES.includes(browserCase)&&BROWSER_STEPS.includes(browserStep)&&(!SCA_FRAME_STEPS.includes(browserStep)||browserCase==='sca');
 function formObservation(value) {
   try{
     const keys=['widgetState','elementState','payState'];
@@ -39,12 +43,12 @@ function formObservation(value) {
 }
 const browserFailures=new WeakMap();
 const browserPair=(phase,code,exitCode,browserCase,browserStep)=>code==='OPERATION_FAILED'&&exitCode===null
-  &&(phase==='CARDS'||phase==='MISSED'&&browserCase==='success')&&BROWSER_CASES.includes(browserCase)&&BROWSER_STEPS.includes(browserStep)
-  &&(!SCA_FRAME_STEPS.includes(browserStep)||browserCase==='sca');
+  &&validBrowserStep(browserCase,browserStep)&&(DONATION_CASES.includes(browserCase)?phase==='DONATIONS'
+    :phase==='CARDS'||phase==='MISSED'&&browserCase==='success');
 
 /** Only private identity carries browser provenance; foreign rejections are never inspected. */
 export async function runSandboxBrowserStep(browserCase,browserStep,body,observeFailure) {
-  if(!BROWSER_CASES.includes(browserCase)||!BROWSER_STEPS.includes(browserStep)||SCA_FRAME_STEPS.includes(browserStep)&&browserCase!=='sca')rethrowSandboxBrowserFailure(null);
+  if(!validBrowserStep(browserCase,browserStep))rethrowSandboxBrowserFailure(null);
   try{return await body();}catch(error){
     if(browserFailures.has(error))throw error;
     let observation=null,timer;
@@ -56,8 +60,9 @@ export async function runSandboxBrowserStep(browserCase,browserStep,body,observe
     const token=Object.freeze(Object.create(null));browserFailures.set(token,{browserCase,browserStep,...(observation??{})});throw token;
   }
 }
-export function rethrowSandboxBrowserFailure(error) {
+export function rethrowSandboxBrowserFailure(error,fallback) {
   if(browserFailures.has(error))throw error;
+  if(fallback==='DONATION_PENDING')throw new Error('stripe_sandbox_BROWSER_DONATION_PENDING');
   throw new Error('stripe_sandbox_MANUAL_CHECK_BROWSER');
 }
 

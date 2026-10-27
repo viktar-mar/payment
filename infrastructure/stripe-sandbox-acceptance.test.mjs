@@ -434,6 +434,59 @@ async function reportFrames(frames,owned=true,exercisePrivateChannels=false){
   }finally{write.mock.restore();if(old===undefined)delete process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN;else process.env.PAYMENT_STRIPE_SANDBOX_OWNED_RUN=old;}
 }
 
+// Break: collapsing the create/response/ACK boundary or rejecting cleanup loses the first safe failure.
+test('donation failures survive the real helper owner and split reporter without later writes',async()=>{
+  const {runOwnedSandboxDonations}=await import('../examples/demo-site/tests/support/stripe-sandbox-acceptance.ts');
+  for(const [fault,step] of [['forward','DONATION_DISPATCH'],['missing','DONATION_RESPONSE'],['non201','DONATION_RESPONSE'],['malformed','DONATION_RESPONSE'],['partial','DONATION_RESPONSE'],['bodyReject','DONATION_RESPONSE'],['oversized','DONATION_RESPONSE'],['identity','DONATION_RESPONSE'],['ack','DONATION_ACK'],['ackFalse','DONATION_ACK'],['setup','DONATION_SETUP'],['payment','DONATION_PAYMENT'],['close','DONATION_CLOSE_CONTEXT']]){
+    const f=fixture(),events=[];let reads=0,routeHandler,responseObserver=()=>{},keyCalls=0,ackCalls=0,posts=0,contexts=0;
+    const hostile=new Proxy({},{get(){reads++;throw new Error('private-secret');},ownKeys(){reads++;throw null;}});
+    const url='http://127.0.0.1:18080/api/v1/public/sites/s5a-site/donation-campaigns/s5a-donate/checkouts';
+    const request={url:()=>url,method:()=> 'POST',redirectedFrom:()=>null,postData:()=>'{"amount_minor":500}',allHeaders:async()=>({origin:'http://127.0.0.1:14173','content-type':'application/json'})};
+    const value={checkout_id:'00000000-0000-4000-8000-000000000010',payment_id:'00000000-0000-4000-8000-000000000020',checkout_token:'private-secret',amount_minor:500,currency:'EUR',price:null,provider_type:'STRIPE',confirmation_mode:'CLIENT_PROVIDER',provider_client_payload:{},status:'CREATED',expires_at:new Date(Date.now()+120000).toISOString(),donation:{donation_id:'00000000-0000-4000-8000-000000000030',campaign_key:'s5a-donate',campaign_version:1}};
+    const response={url:()=>url,request:()=>fault==='identity'?{...request}:request,status:()=>fault==='non201'?500:201,body:async()=>{
+      if(fault==='bodyReject')throw hostile;
+      return Buffer.from(fault==='malformed'?'{private-secret':fault==='partial'?'{}':fault==='oversized'?'x'.repeat(65537):JSON.stringify(value));
+    }};
+    const route={request:()=>request,continue:async()=>{events.push('forward');if(fault==='forward')throw hostile;responseObserver(response);},abort:async()=>{events.push('abort');throw hostile;}};
+    const widget={first(){return this;},locator:selector=>({click:async()=>events.push('amount'),evaluate:async()=>true}),
+      getByRole:(_role,{name})=>({click:async()=>{events.push(name);if(name==='Create donation'){posts++;await routeHandler(route);}}}),
+      frameLocator:()=>({locator:()=>({fill:async()=>{events.push('fill');if(fault==='payment')throw hostile;},isVisible:async()=>false})})};
+    const page={goto:async()=>{if(fault==='setup')throw hostile;},evaluate:async()=>true,locator:()=>widget,
+      waitForResponse:()=>fault==='missing'?Promise.reject(hostile):Promise.resolve(response),on:(_event,fn)=>{responseObserver=fn;},off:()=>{}};
+    const browser={newContext:async()=>{contexts++;return {newPage:async()=>page,route:async(_url,fn)=>{routeHandler=fn;},close:async()=>{events.push('close');throw hostile;}};}};
+    const binding={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:14173',receiver:'http://127.0.0.1:18090'},site:{key:'s5a-site'},price:{key:'s5a-price'},campaign:{key:'s5a-donate',version:1}};
+    // This models the real ambiguity: persisted OPEN/DISPATCHING can coexist with in-memory PENDING.
+    const durable={status:'OPEN',donations:{anonymous:{phase:'NEW'}}},memory={status:'OPEN'};
+    const extras={beforeDonationCreate:async()=>{keyCalls++;durable.donations.anonymous.phase='DISPATCHING';return 'synthetic-key';},
+      ackDonationCreate:async()=>{ackCalls++;if(fault==='ack')throw hostile;return fault!=='ackFalse';},beforeDonationPay:async()=>true,confirmDonation:async()=>true};
+    f.journeys.donations=async()=>{try{return await runOwnedSandboxDonations(browser,extras,binding,limits());}catch(error){memory.status='PENDING';throw error;}};
+    const owned=await quietOpen(f);await assert.rejects(owned.run(f.journeys,limits()));
+    assert.deepEqual(diagnostics(f.output),[{...expectedDiagnostic('DONATIONS','OPERATION_FAILED',null,false),browserCase:'anonymous',browserStep:step}],fault);
+    assert.equal(contexts,1);assert.equal(posts,fault==='setup'?0:1);assert.equal(keyCalls,fault==='setup'?0:1);
+    assert.equal(ackCalls,['ack','ackFalse','payment','close'].includes(fault)?1:0);assert.equal(events.includes('Pay'),fault==='close');
+    assert.equal(events.filter(x=>x==='close').length,1);assert.equal(f.events.includes('missed'),false);assert.equal(reads,0);
+    assert.equal(memory.status,'PENDING');assert.equal(durable.status,'OPEN');assert.equal(durable.donations.anonymous.phase,fault==='setup'?'NEW':'DISPATCHING');
+    assert.equal(owned.resources().accepted,false);assert.ok(Object.isFrozen(owned.resources()));
+    const reported=await reportFrames(f.output.flatMap(line=>[line.slice(0,17),Buffer.from(line.slice(17))]));
+    assert.deepEqual(reported.result,{status:'failed'});assert.ok(reported.lines.includes(`sandbox_diagnostic phase=DONATIONS code=OPERATION_FAILED exit=none cleanup=unconfirmed browser_case=anonymous browser_step=${step}\n`));
+    assert.equal(reported.lines.join('').includes('private-'),false);
+  }
+});
+
+test('donation diagnostic pairs are finite disjoint and getter safe',async()=>{
+  const base={...expectedDiagnostic('DONATIONS','OPERATION_FAILED',null,false),browserCase:'emailOtp',browserStep:'DONATION_ACK'};
+  for(const name of ['anonymous','emailOtp'])for(const step of ['DONATION_SETUP','DONATION_DISPATCH','DONATION_RESPONSE','DONATION_ACK','DONATION_PAYMENT','DONATION_CLOSE_CONTEXT'])
+    assert.equal(formatSandboxDiagnostic({...base,browserCase:name,browserStep:step}),`sandbox_diagnostic phase=DONATIONS code=OPERATION_FAILED exit=none cleanup=unconfirmed browser_case=${name} browser_step=${step}\n`);
+  let reads=0;
+  const invalid=[{...base,browserCase:'success'},{...base,browserStep:'PAY'},{...base,browserStep:'private-secret'},{...base,phase:'CARDS'},{...base,phase:'MISSED'},{...base,private:'private-secret'},
+    {...base,widgetState:'loading',elementState:'FRAME',payState:'ENABLED'},Object.defineProperty({...base},'browserStep',{get(){reads++;throw null;}})];
+  for(const value of invalid)assert.equal(formatSandboxDiagnostic(value),null);
+  assert.equal(reads,0);
+  for(const value of invalid.slice(0,-1)){
+    const result=await reportFrames([JSON.stringify(value)+'\n']);assert.deepEqual(result.result,{status:'failed'});assert.ok(result.lines.includes('sandbox_diagnostic_failed_manual_check\n'));
+  }
+});
+
 const browserSteps=['BEGIN_BROWSER','NEW_CONTEXT','CHECKOUT_SESSION','INSTALL_SESSION','NEW_PAGE','NAVIGATE','RESUME','PAYMENT_FORM_READY','CARD_FRAME','CARD_NUMBER_READY','CARD_NUMBER','CARD_EXPIRY','CARD_CVC','POSTAL_CHECK','POSTAL_FILL','MARK_PAY','PAY','MARK_RETRY','RETRY_PAYMENT_FORM_READY','RETRY_CARD_FRAME','RETRY_CARD_NUMBER_READY','RETRY_CARD_NUMBER','RETRY_CARD_EXPIRY','RETRY_CARD_CVC','RETRY_POSTAL_CHECK','RETRY_POSTAL_FILL','RETRY_PAY','SCA_COMPLETE','SERVER_CONFIRM','CLOSE_CONTEXT'];
 const scaFrameSteps=['SCA_WRAPPER_FRAME','SCA_CHALLENGE_FRAME','SCA_ISSUER_FRAME'];
 function syntheticCard(failAt,closeFails=false,formObservation){

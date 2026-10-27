@@ -613,6 +613,17 @@ elapsed-clock guesses cannot establish timeout provenance; existing proven nonze
 close diagnostics retain their established behavior outside the local-timeout path.
 Raw errors, process output, arguments, paths, browser URLs and private fields are excluded
 from diagnostics. The separate public authorization handoff still appears immediately.
+Donation browser failures use `browser_case=anonymous|emailOtp` only in `DONATIONS`.
+The finite steps distinguish `DONATION_DISPATCH` (original create/forwarding),
+`DONATION_RESPONSE` (response receipt and complete validation), and `DONATION_ACK`
+(the safe acknowledgement). `DONATION_SETUP`, `DONATION_PAYMENT` and
+`DONATION_CLOSE_CONTEXT` identify failures outside creation. The first trusted failure
+survives bounded waits, forwarding rejection and rejecting cleanup. These labels do not
+identify an HTTP/backend cause or establish whether a dispatched write took effect.
+Historical cause remains unknown: persisted `OPEN`/`DISPATCHING` and an in-memory
+`PENDING` result cannot resolve it. Retain that uncertainty; do not clear `DISPATCHING`,
+replay the write, substitute a partial response or ACK it. Offline synthetic verification
+does not certify a live correction or authorize a new Sandbox run.
 Before each original/retry card fill, the driver waits separately for an enabled visible
 Pay action (`PAYMENT_FORM_READY`), the existing exact iframe (`CARD_FRAME`) and its visible
 number field (`CARD_NUMBER_READY`); retry labels use `RETRY_`. Each condition is bounded
