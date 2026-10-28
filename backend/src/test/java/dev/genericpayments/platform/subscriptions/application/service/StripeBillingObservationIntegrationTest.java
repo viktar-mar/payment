@@ -18,6 +18,7 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.InvalidDataAccessApiUsageException;
 
 /** Hosted PostgreSQL proof: no Stripe API or credentials; all rows are fresh test fixture data. */
 class StripeBillingObservationIntegrationTest extends SubscriptionFactFixture {
@@ -58,7 +59,15 @@ class StripeBillingObservationIntegrationTest extends SubscriptionFactFixture {
     }
     @Test void casIsSingleUseAcrossTransactions() throws Exception {
         var barrier=new CyclicBarrier(2);try(var threads=Executors.newVirtualThreadPerTaskExecutor()){
-            Callable<Boolean> task=()->{barrier.await();try{tx.requiresNew(()->{observations.consumeFence(original,0);return null;});return true;}catch(IllegalStateException stale){return false;}};
+            Callable<Boolean> task=()->{
+                barrier.await();
+                try{tx.requiresNew(()->{observations.consumeFence(original,0);return null;});return true;}
+                catch(InvalidDataAccessApiUsageException stale){
+                    assertThat(stale).isExactlyInstanceOf(InvalidDataAccessApiUsageException.class).hasMessage("OBSERVATION_STALE");
+                    assertThat(stale.getCause()).isExactlyInstanceOf(IllegalStateException.class).hasMessage("OBSERVATION_STALE").hasNoCause();
+                    return false;
+                }
+            };
             var first=threads.submit(task);var second=threads.submit(task);assertThat(List.of(first.get(10,TimeUnit.SECONDS),second.get(10,TimeUnit.SECONDS))).containsExactlyInAnyOrder(true,false);
         }assertThat(sequence()).isEqualTo(1);assertThat(sub(original.id())).isEqualTo(original);
     }
