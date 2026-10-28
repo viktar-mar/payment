@@ -28,6 +28,8 @@ public class SubscriptionCommandTransaction {
     private final CustomerStore customers;
     private final LockPaymentAccountPort accounts;
     private final Clock clock;
+    @org.springframework.beans.factory.annotation.Autowired private SubscriptionBillingProofStore billingProofs;
+    @org.springframework.beans.factory.annotation.Autowired private SubscriptionObjectPort providerObjects;
     public SubscriptionCommandTransaction(SubscriptionTransactionPort tx,SubscriptionOperationStore operations,SubscriptionStore subscriptions,
         TrialEligibilityStore trials,SubscriptionPolicyPort policies,SubscriptionAuthorityPort authority,SubscriptionCatalogPort catalog,
         LoadSitePort sites,LockSitePort siteLocks,CustomerStore customers,LockPaymentAccountPort accounts,Clock clock) {
@@ -137,6 +139,32 @@ public class SubscriptionCommandTransaction {
             };
             operation=saveOperation(operation,operation.subscriptionId(),status,reply.reference()==null?operation.providerReference():reply.reference(),reply.outcome()==SubscriptionProviderModels.Outcome.DECLINED?"CREATE_REJECTED":null);
             return result(operation,reply.action());
+        });
+    }
+    public SubscriptionOperationResult recordSetupReceipt(UUID operationId,SubscriptionProviderModels.PendingSetup pending){
+        return tx.requiresNew(()->{
+            var o=operations.lock(operationId);
+            if(o.kind()!=SubscriptionOperation.Kind.CREATE||!operationId.equals(pending.receipt().operationId())||!CreateSubscriptionFingerprint.startsTrial(o.fingerprint()))throw conflict();
+            siteLocks.findByIdForUpdate(o.siteId()).orElseThrow(SubscriptionCommandTransaction::conflict);
+            customers.findByIdForUpdate(o.siteId(),o.customerId()).orElseThrow(SubscriptionCommandTransaction::conflict);
+            var candidate=subscriptions.find(o.siteId(),o.subscriptionId()).orElseThrow(SubscriptionCommandTransaction::conflict);
+            accounts.findByIdForUpdate(candidate.paymentAccountId()).orElseThrow(SubscriptionCommandTransaction::conflict);
+            var s=subscriptions.lock(o.siteId(),o.subscriptionId());
+            var proof=billingProofs.setup(s.paymentAccountId(),o.id()).orElseThrow(SubscriptionCommandTransaction::conflict);
+            if(!proof.subscription().equals(s.id())||!proof.step().equals(pending.receipt().stepId())||!proof.reference().equals(pending.receipt().setupReference()))throw conflict();
+            if(s.providerReference()!=null||o.providerReference()!=null||o.status()==SubscriptionOperation.Status.SUCCEEDED||o.status()==SubscriptionOperation.Status.FAILED)throw conflict();
+            providerObjects.bind(dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE,s,SubscriptionObjectPort.Kind.SETUP,proof.reference(),null,clock.instant());
+            var saved=saveOperation(o,s.id(),pending.action()==null?SubscriptionOperation.Status.PROCESSING:SubscriptionOperation.Status.REQUIRES_ACTION,null,null);
+            return result(saved,pending.action());
+        });
+    }
+    public SubscriptionOperationResult recordSetupUpdateReply(UUID operationId,Reply reply){
+        return tx.requiresNew(()->{
+            var o=operations.lock(operationId);if(o.kind()!=SubscriptionOperation.Kind.SETUP)throw conflict();
+            siteLocks.findByIdForUpdate(o.siteId()).orElseThrow(SubscriptionCommandTransaction::conflict);customers.findByIdForUpdate(o.siteId(),o.customerId()).orElseThrow(SubscriptionCommandTransaction::conflict);
+            var candidate=subscriptions.find(o.siteId(),o.subscriptionId()).orElseThrow(SubscriptionCommandTransaction::conflict);accounts.findByIdForUpdate(candidate.paymentAccountId()).orElseThrow(SubscriptionCommandTransaction::conflict);var s=subscriptions.lock(o.siteId(),o.subscriptionId());
+            if(reply.reference()!=null&&!reply.reference().equals(s.providerReference()))throw conflict();if(o.status()==SubscriptionOperation.Status.SUCCEEDED||o.status()==SubscriptionOperation.Status.FAILED)return result(o,null);
+            return result(saveOperation(o,s.id(),reply.outcome()==SubscriptionProviderModels.Outcome.UNKNOWN?SubscriptionOperation.Status.UNKNOWN:SubscriptionOperation.Status.PROCESSING,s.providerReference(),null),null);
         });
     }
     /** Internal continuation after authorized reservation; never a public unauthenticated lookup endpoint. */

@@ -14,7 +14,9 @@ public class CreateSubscriptionService implements CreateSubscriptionUseCase {
         var request=new SubscriptionProviderModels.Command(reserved.account(),reserved.operation(),reserved.subscription().billingPrice(),null,null,null,null,
             command.recurringConsent(),CreateSubscriptionFingerprint.startsTrial(reserved.operation().fingerprint()));
         Reply reply;
-        try {reply=providers.forAccount(reserved.account()).create(request);}
+        try {var provider=providers.forAccount(reserved.account());var preparation=provider.prepareCreate(request);
+            if(preparation instanceof PendingSetup pending)return transactions.recordSetupReceipt(reserved.operation().id(),pending);
+            reply=provider.create(request);}
         catch(RuntimeException failure){reply=new Reply(Outcome.UNKNOWN,null,null);}
         return transactions.recordReply(reserved.operation().id(),reply);
     }

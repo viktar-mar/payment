@@ -113,14 +113,14 @@ public class SubscriptionInteractionTransaction {
     public SubscriptionClientSession clientIssued(SubscriptionCommandContext c,State r,SubscriptionClientGrant expected,String token,SubscriptionClientSession result){
         return tx.requiresNew(()->{
             var fresh=authorized(c,r.subscription().id(),operations.lock(r.operation().id()),true);requireSame(r,fresh);var session=customer(c);var grant=availableClientGrant(c,fresh,token);
-            if(!grant.id().equals(expected.id())||!grant.binding().equals(expected.binding())||!"stripe".equals(result.provider())||result.flow()!=SubscriptionClientSession.Flow.PAYMENT||!token.equals(result.actionToken())||!result.expiresAt().equals(grant.expiresAt()))throw SubscriptionRuleErrors.conflict();
+            if(!grant.id().equals(expected.id())||!grant.binding().equals(expected.binding())||!"stripe".equals(result.provider())||result.flow()!=grant.binding().flow()||!token.equals(result.actionToken())||!result.expiresAt().equals(grant.expiresAt()))throw SubscriptionRuleErrors.conflict();
             var expiry=grant.expiresAt().isBefore(session.expiresAt())?grant.expiresAt():session.expiresAt();
             actions.bindSession(grant.tokenDigest(),session.sessionId().value(),session.origin(),expiry,securityClock.instant());
             return new SubscriptionClientSession(result.provider(),result.flow(),result.publishableKey(),result.clientSecret(),token,expiry);
         });
     }
     private SubscriptionClientGrant availableClientGrant(SubscriptionCommandContext c,State r,String token){
-        var session=customer(c);if(r.account().provider()!=PaymentProviderType.STRIPE||r.account().status()!=PaymentAccountStatus.ACTIVE||!r.policy().enabled()||!r.subscription().nonTerminal()||r.operation().kind()!=SubscriptionOperation.Kind.CREATE||r.operation().status()==SubscriptionOperation.Status.SUCCEEDED||r.operation().status()==SubscriptionOperation.Status.FAILED)throw SubscriptionRuleErrors.conflict();
+        var session=customer(c);if(r.account().provider()!=PaymentProviderType.STRIPE||r.account().status()!=PaymentAccountStatus.ACTIVE||!r.policy().enabled()||!r.subscription().nonTerminal()||!Set.of(SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Kind.RESUME).contains(r.operation().kind())||r.operation().status()==SubscriptionOperation.Status.SUCCEEDED||r.operation().status()==SubscriptionOperation.Status.FAILED)throw SubscriptionRuleErrors.conflict();
         var grant=billingGrant(r,token);if(!grant.available(securityClock.instant())||grant.sessionId()!=null&&(!session.sessionId().value().equals(grant.sessionId())||!session.origin().equals(grant.origin())))throw SubscriptionRuleErrors.conflict();return grant;
     }
     private SubscriptionClientGrant billingGrant(State r,String token){
@@ -157,6 +157,15 @@ public class SubscriptionInteractionTransaction {
             var status=switch(reply.outcome()){case ACCEPTED,DECLINED->SubscriptionOperation.Status.PROCESSING;case REQUIRES_ACTION->SubscriptionOperation.Status.REQUIRES_ACTION;case UNKNOWN->SubscriptionOperation.Status.UNKNOWN;};
             var saved=save(o,status);var action=reply.action()==null?null:issue(new State(fresh.subscription(),fresh.account(),fresh.policy(),saved,false),reply.action(),clock.instant());
             return result(saved,action);
+        });
+    }
+    public SubscriptionOperationResult replyPreparedSetup(SubscriptionCommandContext c,State r,String token,OwnedSetupReceipt receipt){
+        return tx.requiresNew(()->{
+            var o=operations.lock(r.operation().id());var fresh=authorized(c,r.subscription().id(),o,true);customer(c);var grant=billingGrant(fresh,token);
+            if(o.kind()!=SubscriptionOperation.Kind.CREATE||fresh.subscription().providerReference()!=null||grant.binding().flow()!=SubscriptionClientSession.Flow.SETUP||grant.binding().subscriptionReference()!=null||grant.consumedAt()==null
+                ||receipt!=null&&(!receipt.operationId().equals(o.id())||!receipt.stepId().equals(grant.binding().stepId())||!receipt.setupReference().equals(grant.binding().setupReference())))throw SubscriptionRuleErrors.conflict();
+            if(o.status()==SubscriptionOperation.Status.SUCCEEDED||o.status()==SubscriptionOperation.Status.FAILED)return result(o,null);
+            return result(save(o,SubscriptionOperation.Status.PROCESSING),null);
         });
     }
     public PortalNavigation portal(SubscriptionCommandContext c,State r,PortalNavigation navigation,String url){

@@ -9,6 +9,28 @@ import com.stripe.param.billingportal.SessionCreateParams;
 import org.junit.jupiter.api.Test;
 
 class StripeBillingSdkContractTest {
+    // The pinned resume API uses an object anchor and success-only resume, not the old scalar shape.
+    @Test void resumesOnlyOnPaymentSuccessWithNewAnchorAndNoProration()throws Exception{
+        try(var http=new StripeBillingHttpFixture()){
+            http.respond("POST","/v1/subscriptions/sub_resume/resume","{\"id\":\"sub_resume\",\"object\":\"subscription\",\"status\":\"paused\",\"latest_invoice\":\"in_resume\"}");
+            var result=http.client().v1().subscriptions().resume("sub_resume",SubscriptionResumeParams.builder()
+                .setBillingCycleAnchor(SubscriptionResumeParams.BillingCycleAnchor.builder().setType(SubscriptionResumeParams.BillingCycleAnchor.Type.NOW).build())
+                .setPaymentBehavior(SubscriptionResumeParams.PaymentBehavior.RESUME_ON_PAYMENT_SUCCESS)
+                .setProrationBehavior(SubscriptionResumeParams.ProrationBehavior.NONE).build(),RequestOptions.builder().setIdempotencyKey("original-resume").build());
+            assertThat(result.getLatestInvoice()).isEqualTo("in_resume");assertThat(result.getStatus()).isEqualTo("paused");
+            assertThat(http.calls()).singleElement().satisfies(c->{assertThat(c.form()).containsEntry("billing_cycle_anchor[type]","now").containsEntry("payment_behavior","resume_on_payment_success").containsEntry("proration_behavior","none");assertThat(c.header("Idempotency-Key")).isEqualTo("original-resume");assertThat(c.header("Stripe-Version")).isEqualTo("2026-09-30.endive");});
+        }
+    }
+
+    @Test void updatesOnlyExplicitSubscriptionDefaultAndDecodesSucceededSetupMethod()throws Exception{
+        try(var http=new StripeBillingHttpFixture()){
+            http.respond("GET","/v1/setup_intents/seti_owned","{\"id\":\"seti_owned\",\"object\":\"setup_intent\",\"livemode\":false,\"customer\":\"cus_owned\",\"usage\":\"off_session\",\"status\":\"succeeded\",\"payment_method\":\"pm_owned\",\"payment_method_types\":[\"card\"]}");
+            var setup=http.client().v1().setupIntents().retrieve("seti_owned");assertThat(setup.getPaymentMethod()).isEqualTo("pm_owned");assertThat(setup.getUsage()).isEqualTo("off_session");
+            http.respond("POST","/v1/subscriptions/sub_owned","{\"id\":\"sub_owned\",\"object\":\"subscription\",\"default_payment_method\":\"pm_owned\"}");
+            var result=http.client().v1().subscriptions().update("sub_owned",SubscriptionUpdateParams.builder().setDefaultPaymentMethod("pm_owned").build(),RequestOptions.builder().setIdempotencyKey("original-method").build());
+            assertThat(result.getDefaultPaymentMethod()).isEqualTo("pm_owned");assertThat(http.calls().getLast().form()).containsExactlyEntriesOf(java.util.Map.of("default_payment_method","pm_owned"));
+        }
+    }
     // Catches a fixture that drops requests or counts unrelated method/path pairs.
     @Test void countsOnlyMatchingBillingRequests() throws Exception {
         try (var http = new StripeBillingHttpFixture()) {

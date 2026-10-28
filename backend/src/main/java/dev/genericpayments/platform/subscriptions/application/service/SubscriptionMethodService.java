@@ -8,6 +8,7 @@ import dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation;
 @org.springframework.stereotype.Service
 public class SubscriptionMethodService implements SetupSubscriptionMethodUseCase {
     private final SubscriptionInteractionTransaction phases;private final SubscriptionProviderRegistry providers;private final GetSubscriptionActionUseCase actions;
+    @org.springframework.beans.factory.annotation.Autowired(required=false) private dev.genericpayments.platform.subscriptions.application.port.in.ContinueOriginalSubscriptionSetupUseCase continuation;
     public SubscriptionMethodService(SubscriptionInteractionTransaction phases,SubscriptionProviderRegistry providers,GetSubscriptionActionUseCase actions){this.phases=phases;this.providers=providers;this.actions=actions;}
     public SubscriptionOperationResult setup(Command command){
         SubscriptionInteractionTransaction.validateKey(command.context());
@@ -16,6 +17,9 @@ public class SubscriptionMethodService implements SetupSubscriptionMethodUseCase
         if(original!=null){
             var action=actions.get(new GetSubscriptionActionUseCase.Query(command.context(),command.subscriptionId(),original.operation().id()));
             if(action!=null)return SubscriptionInteractionTransaction.result(original.operation(),action);
+            if(continuation!=null&&original.account().provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE&&original.subscription().providerReference()==null
+                &&CreateSubscriptionFingerprint.startsTrial(original.operation().fingerprint())&&original.subscription().billingPrice().trialPolicy()==dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.REQUIRED_BEFORE_TRIAL)
+                return continuation.api(command.context(),command.subscriptionId(),original.operation().id());
             if(original.operation().status()!=SubscriptionOperation.Status.FAILED)return SubscriptionInteractionTransaction.result(original.operation(),null);
             return dispatch(command,original);
         }

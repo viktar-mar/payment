@@ -39,7 +39,44 @@ class StripeBillingObservationTest {
         when(dep(SubscriptionEventStore.class).append(any())).thenAnswer(i->{events++;return true;});
     }
     <T>T dep(Class<T> type){return type.cast(dependencies.get(type));}
+    @Test void delayedFirstTrialObservationKeepsHistoryAndFinalPaidEvent(){delayedTrial(false);}
+    @Test void delayedTrialHistoryCannotReplaceTerminalProjectionOrCallback(){delayedTrial(true);}
+    void delayedTrial(boolean terminal){
+        var s=current;current=new Subscription(s.id(),s.siteId(),s.customerId(),s.productId(),s.paymentAccountId(),s.billingPrice(),null,terminal?Subscription.Status.CANCELLED:Subscription.Status.INCOMPLETE,s.providerReference(),null,null,null,null,null,null,terminal?"PROVIDER_CANCELLED":null,0,s.createdAt(),s.updatedAt(),null);
+        var id=UUID.randomUUID();var step=UUID.randomUUID();var trial=new Subscription.Period(NOW.minusSeconds(1209600),NOW.minusSeconds(100));var paid=new Subscription.Period(trial.end(),NOW.plusSeconds(86400));
+        var operation=new SubscriptionOperation(id,s.siteId(),s.customerId(),s.id(),SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Status.PROCESSING,"test","key","v1.trial."+"a".repeat(64),"subscription:"+account.id().value()+":"+id+":CREATE",0,1,s.providerReference(),null,NOW.minusSeconds(1209600),NOW.minusSeconds(1209600),0);
+        var eligibility=new TrialEligibility(s.siteId(),s.customerId(),s.productId(),id,null,0);
+        when(dep(TrialEligibilityStore.class).find(any(),any(),any())).thenReturn(Optional.of(eligibility));when(dep(SubscriptionOperationStore.class).unresolved(any(),any())).thenReturn(List.of(operation));when(dep(SubscriptionOperationStore.class).find(any(),any(),eq(id))).thenReturn(Optional.of(operation));when(dep(SubscriptionOperationStore.class).lock(id)).thenReturn(operation);when(dep(SubscriptionReadPreparation.class).financial(any())).thenReturn(operation);
+        when(dep(BillingRecordStore.class).upsert(any())).thenAnswer(i->i.getArgument(0));
+        var proofs=mock(SubscriptionBillingProofStore.class);org.springframework.test.util.ReflectionTestUtils.setField(service,"billingProofs",proofs);
+        var request=new SubscriptionBillingProofStore.Trial(id,s.id(),account.id(),trial.end().getEpochSecond(),null,null,null,null,null);
+        when(proofs.trial(account.id(),s.id())).thenReturn(Optional.of(request));when(proofs.bindTrialInTransaction(any(),eq(step),anyString(),eq("si_owned"),eq("in_trial"),eq(trial.start().getEpochSecond()))).thenReturn(new SubscriptionBillingProofStore.Trial(id,s.id(),account.id(),trial.end().getEpochSecond(),step,s.providerReference(),"si_owned","in_trial",trial.start().getEpochSecond()));
+        var zero=new Invoice("in_trial",BillingRecord.Kind.INITIAL,s.billingPrice(),null,trial,0,"EUR",SettlementKind.ZERO,List.of());
+        var cash=new Invoice("in_renewal",BillingRecord.Kind.RENEWAL,s.billingPrice(),null,paid,1000,"EUR",SettlementKind.CASH,List.of(new CashObject("pi_renewal",1000,"EUR",dev.genericpayments.platform.payments.domain.PaymentStatus.SUCCEEDED,NOW)));
+        var evidence=new TrialEvidence(id,step,"in_trial","si_owned",trial,s.billingPrice(),null);
+        var snapshot=new Snapshot(s.providerReference(),Subscription.Status.ACTIVE,s.billingPrice(),paid,trial,null,List.of(zero,cash),operation.providerOperationKey(),false,0,NOW,new OperationObservation(operation.providerOperationKey(),OperationState.APPLIED),List.of(),evidence);
+        apply(snapshot,new Fence(current.revision(),id,operation.version(),null,null,observations.captureFence(current)));
+        assertThat(current.billingStatus()).isEqualTo(terminal?Subscription.Status.CANCELLED:Subscription.Status.ACTIVE);assertThat(current.trial()).isEqualTo(trial);assertThat(current.paidThrough()).isEqualTo(terminal?null:paid.end());
+        if(terminal){assertThat(events).isZero();verifyNoInteractions(dep(SubscriptionCallbackPort.class));}
+        else{var event=org.mockito.ArgumentCaptor.forClass(SubscriptionEvent.class);verify(dep(SubscriptionEventStore.class),atLeastOnce()).append(event.capture());assertThat(event.getAllValues().getLast().type()).isEqualTo(SubscriptionEvent.Type.PERIOD_PAID);}
+        verify(dep(TrialEligibilityStore.class)).consume(id,NOW);
+        verify(proofs).bindTrialInTransaction(request,step,s.providerReference(),"si_owned","in_trial",trial.start().getEpochSecond());
+    }
     Snapshot snapshot(Subscription.Status status,long revision){return new Snapshot(current.providerReference(),status,current.billingPrice(),current.currentPeriod(),null,null,List.of(),null,false,revision,NOW);}
+    @Test void exactOriginalResumeCashActivatesPausedSubscription(){resumeFact("in_resume",1000,true);assertThat(current.billingStatus()).isEqualTo(Subscription.Status.ACTIVE);assertThat(current.paidThrough()).isEqualTo(NOW.plusSeconds(86400));}
+    @Test void unrelatedCashCannotActivatePausedSubscription(){resumeFact("in_other",1000,true);assertThat(current.billingStatus()).isEqualTo(Subscription.Status.PAUSED);assertThat(current.paidThrough()).isNull();}
+    @Test void acknowledgedResumeWithoutCashCannotActivatePausedSubscription(){resumeFact("in_resume",0,false);assertThat(current.billingStatus()).isEqualTo(Subscription.Status.PAUSED);assertThat(current.paidThrough()).isNull();}
+    @Test void partialCashCannotActivatePausedSubscription(){assertThatThrownBy(()->resumeFact("in_resume",500,true)).isInstanceOf(IllegalArgumentException.class).hasMessage("Cash settlement needs matching successful objects");assertThat(current.billingStatus()).isEqualTo(Subscription.Status.PAUSED);assertThat(current.paidThrough()).isNull();}
+    void resumeFact(String invoice,long captured,boolean cash){
+        var s=current;current=new Subscription(s.id(),s.siteId(),s.customerId(),s.productId(),s.paymentAccountId(),s.billingPrice(),null,Subscription.Status.PAUSED,s.providerReference(),null,null,null,null,null,null,null,0,s.createdAt(),s.updatedAt(),null);
+        UUID id=UUID.randomUUID();var o=new SubscriptionOperation(id,s.siteId(),s.customerId(),s.id(),SubscriptionOperation.Kind.RESUME,SubscriptionOperation.Status.PROCESSING,"test","key","v1.resume.none."+"a".repeat(64),"subscription:"+account.id().value()+":"+id+":RESUME",0,1,s.providerReference(),null,NOW,NOW,0);
+        when(dep(SubscriptionOperationStore.class).unresolved(any(),any())).thenReturn(List.of(o));when(dep(SubscriptionOperationStore.class).lock(id)).thenReturn(o);when(dep(SubscriptionReadPreparation.class).financial(any())).thenReturn(o);when(dep(BillingRecordStore.class).upsert(any())).thenAnswer(x->x.getArgument(0));
+        var proofs=mock(SubscriptionBillingProofStore.class);org.springframework.test.util.ReflectionTestUtils.setField(service,"billingProofs",proofs);var period=new Subscription.Period(NOW,NOW.plusSeconds(86400));
+        when(proofs.resume(account.id(),id)).thenReturn(Optional.of(new SubscriptionBillingProofStore.Resume(id,s.id(),account.id(),UUID.randomUUID(),s.providerReference(),"in_resume",period)));
+        var bill=new Invoice(invoice,BillingRecord.Kind.RENEWAL,s.billingPrice(),null,period,1000,"EUR",cash?SettlementKind.CASH:SettlementKind.OPEN,cash?List.of(new CashObject("pi_resume",captured,"EUR",dev.genericpayments.platform.payments.domain.PaymentStatus.SUCCEEDED,NOW)):List.of());
+        var snapshot=new Snapshot(s.providerReference(),Subscription.Status.ACTIVE,s.billingPrice(),period,null,null,List.of(bill),o.providerOperationKey(),false,0,NOW,new OperationObservation(o.providerOperationKey(),OperationState.APPLIED),List.of());
+        apply(snapshot,new Fence(current.revision(),id,o.version(),null,null,observations.captureFence(current)));
+    }
     Fence fence(){return new Fence(current.revision(),null,null,null,null,observations.captureFence(current));}
     void apply(Snapshot snapshot,Fence fence){service.apply(new ApplySubscriptionSnapshotUseCase.Command(account,current.id(),snapshot,SubscriptionEvent.Source.RECONCILIATION,"test","test",fence));}
     // Removing the mandatory Stripe fence enables the compatibility constructor to bypass all read ownership.

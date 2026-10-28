@@ -25,6 +25,9 @@ public interface ProviderOperationStore {
     /** Use real UTC, a fresh owner token per acquisition, and a 60-second lease. Returns its fencing version. */
     Optional<ProviderOperation> claim(UUID id, String owner, Instant now, Duration lease);
     ProviderOperation acknowledge(UUID id, String owner, long expectedVersion, String reference);
+    /** Exact RESUME receipt only: row lock without Account/lifecycle locks, inside the caller transaction. */
+    default ProviderOperation lockResumeReceipt(ProviderOperation expected){throw new UnsupportedOperationException();}
+    default ProviderOperation acknowledgeInTransaction(UUID id,String owner,long version,String reference){throw new UnsupportedOperationException();}
     ProviderOperation unknown(UUID id, String owner, long expectedVersion);
 
     /**

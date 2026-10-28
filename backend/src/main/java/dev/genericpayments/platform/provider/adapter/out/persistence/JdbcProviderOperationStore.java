@@ -95,6 +95,14 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         text(reference, 255);
         return finishClaim(id, owner, expectedVersion, "ACKNOWLEDGED", reference);
     }
+    @Transactional(propagation=Propagation.MANDATORY)
+    public ProviderOperation lockResumeReceipt(ProviderOperation expected){
+        var current=lock(expected.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+        if(!current.equals(expected)||current.kind()!=Kind.SUBSCRIPTION_UPDATE||!current.operationKey().equals("subscription:"+current.accountId().value()+":"+current.resourceId()+":RESUME"))throw conflict();
+        return current;
+    }
+    @Transactional(propagation=Propagation.MANDATORY)
+    public ProviderOperation acknowledgeInTransaction(UUID id,String owner,long version,String reference){text(reference,255);return finishClaim(id,owner,version,"ACKNOWLEDGED",reference);}
 
     @Override
     public ProviderOperation unknown(UUID id, String owner, long expectedVersion) {
@@ -108,7 +116,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         // before waiting for a lock and finish after the lease has expired.
         var current = lock(id).orElseThrow(JdbcProviderOperationStore::conflict);
         if ("ACKNOWLEDGED".equals(status) && !supportedResource(current.kind())) throw conflict();
-        if ((current.kind() == Kind.CUSTOMER_CREATE||current.kind()==Kind.SUBSCRIPTION_CREATE) && "ACKNOWLEDGED".equals(status)) {
+        if ((current.kind() == Kind.CUSTOMER_CREATE||current.kind()==Kind.SUBSCRIPTION_CREATE||current.kind()==Kind.SETUP_INTENT_CREATE||current.kind()==Kind.SUBSCRIPTION_UPDATE) && "ACKNOWLEDGED".equals(status)) {
             requirePinnedAccount(current);
             requireResource(current.accountId(), current.kind(), current.resourceId(),current.operationKey());
             requireSubscriptionReference(current,reference);
@@ -159,7 +167,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         if (!current.equals(expected) || !current.fingerprint().equals(fingerprint)
             || current.firstDispatchedAt() == null) throw conflict();
         if (!supportedResource(current.kind())) throw conflict();
-        if (current.kind() == Kind.CUSTOMER_CREATE||current.kind()==Kind.SUBSCRIPTION_CREATE) {
+        if (current.kind() == Kind.CUSTOMER_CREATE||current.kind()==Kind.SUBSCRIPTION_CREATE||current.kind()==Kind.SETUP_INTENT_CREATE||current.kind()==Kind.SUBSCRIPTION_UPDATE) {
             requirePinnedAccount(current);
             requireResource(current.accountId(), current.kind(), current.resourceId(),current.operationKey());
             requireSubscriptionReference(current,reference);
@@ -201,6 +209,17 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     }
 
     private void requireResource(PaymentAccountId account, Kind kind, UUID resourceId,String key) {
+        if(kind==Kind.SETUP_INTENT_CREATE||kind==Kind.SUBSCRIPTION_UPDATE){
+            String suffix=kind==Kind.SETUP_INTENT_CREATE?":SETUP":":METHOD";
+            if(jdbc.queryForList("""
+                select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id
+                join sites site on site.id=s.site_id join customers c on c.site_id=s.site_id and c.id=s.customer_id
+                where o.id=? and s.payment_account_id=? and site.status='ACTIVE' and c.status='ACTIVE'
+                and ((?='SETUP_INTENT_CREATE' and o.kind in ('CREATE','SETUP') and ?=o.provider_operation_key||':SETUP')
+                  or (?='SUBSCRIPTION_UPDATE' and ((o.kind='SETUP' and ?=o.provider_operation_key||':METHOD') or (o.kind='RESUME' and ?=o.provider_operation_key))))
+                """,UUID.class,resourceId,account.value(),kind.name(),key,kind.name(),key,key).size()!=1)throw conflict();
+            return;
+        }
         if(kind==Kind.SUBSCRIPTION_CREATE){
             // Plain immutable identity proof: never wait on lifecycle Operation/Subscription locks
             // while holding provider-step/Account locks (the lifecycle acquires them in the reverse order).
@@ -241,6 +260,8 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     }
 
     private void requireSubscriptionReference(ProviderOperation operation,String reference){
+        if(operation.kind()==Kind.SETUP_INTENT_CREATE){if(reference==null||!reference.matches("seti_[A-Za-z0-9]{1,250}"))throw conflict();return;}
+        if(operation.kind()==Kind.SUBSCRIPTION_UPDATE){if(reference==null||!reference.matches("sub_[A-Za-z0-9]{1,251}")||jdbc.queryForList("select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id where o.id=? and s.payment_account_id=? and s.provider_reference=?",UUID.class,operation.resourceId(),operation.accountId().value(),reference).size()!=1)throw conflict();return;}
         if(operation.kind()!=Kind.SUBSCRIPTION_CREATE)return;
         if(reference==null||!reference.matches("sub_[A-Za-z0-9]{1,251}")||jdbc.queryForList("""
             select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id
@@ -251,7 +272,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
 
     private static boolean supportedResource(Kind kind) {
         return switch (kind) {
-            case PRODUCT_CREATE, PRICE_CREATE, PAYMENT_PREPARE, REFUND_CREATE, CUSTOMER_CREATE, SUBSCRIPTION_CREATE -> true;
+            case PRODUCT_CREATE, PRICE_CREATE, PAYMENT_PREPARE, REFUND_CREATE, CUSTOMER_CREATE, SUBSCRIPTION_CREATE, SETUP_INTENT_CREATE, SUBSCRIPTION_UPDATE -> true;
             default -> false;
         };
     }

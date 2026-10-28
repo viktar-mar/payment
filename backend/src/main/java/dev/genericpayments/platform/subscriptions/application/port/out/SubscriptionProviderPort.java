@@ -3,6 +3,9 @@ import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
 public interface SubscriptionProviderPort {
     Capabilities capabilities(PaymentAccount account);
+    default CreatePreparation prepareCreate(Command command){return new ReadyForCreate();}
+    default SetupContinuationResult continueOriginalSetup(Command command,SetupContinuationFence fence){return new SetupContinuationResult(null);}
+    default OwnedSetupReceipt confirmPreparedSetup(Command command,String token){throw new UnsupportedOperationException();}
     Reply create(Command command);
     ProviderQuote preview(QuoteRequest request);
     Reply change(Command command);

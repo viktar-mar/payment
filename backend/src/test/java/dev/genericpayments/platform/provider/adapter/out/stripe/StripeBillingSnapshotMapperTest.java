@@ -133,8 +133,16 @@ class StripeBillingSnapshotMapperTest {
     zeroTrial();var trial=new Subscription.Period(START,END);
     var ownedTrial=new Subscription(local.id(),local.siteId(),local.customerId(),local.productId(),account.id(),local.billingPrice(),local.entitledPrice(),Subscription.Status.TRIALING,"sub_owned",trial,null,trial,null,null,null,null,1,START,START,null);
     head();lines();http.respond("GET","/v1/invoice_payments",page(false));
-    var result=StripeBillingSnapshotMapper.retrieve(http.client(),new Ownership(account,ownedTrial,owner.customer(),owner.prices()),START.plusSeconds(2));
+    UUID operation=UUID.randomUUID(),stepId=UUID.randomUUID();
+    var proof=new dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore.Trial(operation,local.id(),account.id(),END.getEpochSecond(),stepId,"sub_owned","si_owned","in_owned",START.getEpochSecond());
+    var step=new dev.genericpayments.platform.provider.application.model.ProviderOperation(stepId,account.id(),account.externalAccountId(),account.credentialsRef(),dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SUBSCRIPTION_CREATE,operation,"subscription:"+account.id().value()+":"+operation+":CREATE","original-proof",dev.genericpayments.platform.provider.application.model.ProviderOperation.Status.ACKNOWLEDGED,"sub_owned",START,START.plusSeconds(82800),null,null,1);
+    var context=new TrialContext(proof,step,owner.prices().getFirst(),null);
+    var result=StripeBillingSnapshotMapper.retrieve(http.client(),new Ownership(account,ownedTrial,owner.customer(),owner.prices(),context,null),START.plusSeconds(2));
     assertThat(result.invoices().getFirst().settlement()).isEqualTo(SettlementKind.ZERO);assertThat(result.invoices().getFirst().cashObjects()).isEmpty();
+}
+@Test void storedTrialFieldsAloneAreNotOriginalZeroInvoiceProof(){
+    zeroTrial();var trial=new Subscription.Period(START,END);var s=new Subscription(local.id(),local.siteId(),local.customerId(),local.productId(),account.id(),local.billingPrice(),local.entitledPrice(),Subscription.Status.TRIALING,"sub_owned",trial,null,trial,null,null,null,null,1,START,START,null);
+    head();lines();http.respond("GET","/v1/invoice_payments",page(false));assertUnsupported(StripeBillingSnapshotMapper.retrieve(http.client(),new Ownership(account,s,owner.customer(),owner.prices()),START.plusSeconds(2)));
 }
 @Test void firstTrialWithoutOriginalCreateEvidenceRemainsUnsupported(){zeroTrial();head();lines();http.respond("GET","/v1/invoice_payments",page(false));var result=read();assertUnsupported(result);assertThat(result.trial()).isNull();}
 void zeroTrial(){subscription.addProperty("status","trialing");subscription.addProperty("trial_start",1800000000);subscription.addProperty("trial_end",1802678400);invoice.addProperty("billing_reason","subscription_create");for(String f:List.of("amount_due","amount_paid","total","subtotal"))invoice.addProperty(f,0);line.addProperty("amount",0);}

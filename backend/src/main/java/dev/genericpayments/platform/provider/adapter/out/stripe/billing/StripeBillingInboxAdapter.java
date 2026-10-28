@@ -18,6 +18,8 @@ import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.S
 /** Bounded fresh identity reads. No financial operation/attempt/grant is created by a hint. */
 @org.springframework.transaction.annotation.Transactional(propagation=org.springframework.transaction.annotation.Propagation.NEVER)
 public class StripeBillingInboxAdapter implements SubscriptionInboxResolutionPort {
+    private dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore proofs;
+    private dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore steps;
     private final LoadPaymentAccountPort accounts;
     private final SubscriptionObjectPort objects;
     private final StripeBillingOwnership ownership;
@@ -35,6 +37,13 @@ public class StripeBillingInboxAdapter implements SubscriptionInboxResolutionPor
         this.accounts=accounts;this.objects=objects;this.ownership=ownership;this.bindings=bindings;this.operations=operations;
         this.credentials=credentials;this.clients=clients;this.verification=verification;this.provider=provider;this.commands=commands;
     }
+    public StripeBillingInboxAdapter(LoadPaymentAccountPort accounts,SubscriptionObjectPort objects,StripeBillingOwnership ownership,
+            StripeBillingBindingPort bindings,SubscriptionOperationStore operations,StripeCredentialResolver credentials,
+            StripeClientFactory clients,PaymentAccountVerificationPort verification,StripeSubscriptionProviderAdapter provider,
+            SubscriptionCommandTransaction commands,dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore proofs,
+            dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore steps){
+        this(accounts,objects,ownership,bindings,operations,credentials,clients,verification,provider,commands);this.proofs=proofs;this.steps=steps;
+    }
     public Optional<UUID> resolve(SubscriptionProviderEnvelope envelope){
         Objects.requireNonNull(envelope);
         if(envelope.provider()!=PaymentProviderType.STRIPE)return Optional.empty();
@@ -45,10 +54,26 @@ public class StripeBillingInboxAdapter implements SubscriptionInboxResolutionPor
                 case "SUBSCRIPTION_CHANGED" -> subscription(account,envelope);
                 case "SUBSCRIPTION_INVOICE_CHANGED" -> invoice(account,envelope.objectReference());
                 // Admission is not Task7/8's original dispatch/method/schedule ownership proof.
-                case "SUBSCRIPTION_SETUP_CHANGED","SUBSCRIPTION_SCHEDULE_CHANGED" -> Optional.empty();
+                case "SUBSCRIPTION_SETUP_CHANGED" -> setup(account,envelope.objectReference());
+                case "SUBSCRIPTION_SCHEDULE_CHANGED" -> Optional.empty();
                 default -> throw mismatch();
             };
         }catch(StripeException malformed){throw mismatch();}
+    }
+    private Optional<UUID> setup(PaymentAccount a,String reference)throws StripeException{
+        if(proofs==null||steps==null)return Optional.empty();if(!reference.matches("seti_[A-Za-z0-9]{1,250}"))throw mismatch();
+        verification.verify(a);var remote=clients.create(credentials.resolve(a)).v1().setupIntents().retrieve(reference);
+        if(remote==null||!reference.equals(remote.getId())||remote.getMetadata()==null)throw mismatch();
+        UUID id,operation;try{id=UUID.fromString(remote.getMetadata().get("subscription_id"));operation=UUID.fromString(remote.getMetadata().get("operation_id"));}catch(RuntimeException malformed){throw mismatch();}
+        var s=ownership.owned(a,id);var o=operations.find(s.siteId(),id,operation).orElseThrow(StripeBillingOwnership::mismatch);
+        if(!java.util.Set.of(SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Kind.SETUP).contains(o.kind()))throw mismatch();
+        var b=bindings.findCustomer(a.id(),s.siteId(),s.customerId()).orElseThrow(StripeBillingOwnership::mismatch);requireBinding(a,s,b);
+        var step=steps.find(a.id(),o.providerOperationKey()+":SETUP").orElse(null);
+        if(step==null||step.status()!=dev.genericpayments.platform.provider.application.model.ProviderOperation.Status.ACKNOWLEDGED)return Optional.empty();
+        if(step.kind()!=dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SETUP_INTENT_CREATE||!step.resourceId().equals(o.id())||!reference.equals(step.providerReference())||!step.fingerprint().equals(ownership.setupFingerprint(a,s,o,b))||!step.externalAccountId().equals(a.externalAccountId())||!step.credentialsRef().equals(a.credentialsRef()))throw mismatch();
+        StripeSubscriptionProviderAdapter.requireSetupRemote(remote,s,o,b,step);
+        // Local immutable ACK repair only; never recovers UNKNOWN creation from a browser-confirm hint.
+        proofs.recordSetup(s,o,step.id(),reference);return Optional.of(s.id());
     }
 
     private Optional<UUID> subscription(PaymentAccount account,SubscriptionProviderEnvelope envelope)throws StripeException{

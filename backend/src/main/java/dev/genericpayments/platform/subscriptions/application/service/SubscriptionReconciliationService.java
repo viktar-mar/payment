@@ -16,6 +16,7 @@ public class SubscriptionReconciliationService implements ReconcileSubscriptionU
     private final ApplySubscriptionSnapshotUseCase facts;private final SubscriptionReadPreparation reads;
     private final SubscriptionSweepPort sweep;private final SubscriptionTelemetryPort telemetry;private final Clock clock;
     private final SubscriptionWorkerConfigurationPort properties;private final SubscriptionObservationPort observations;
+    @org.springframework.beans.factory.annotation.Autowired(required=false) private ContinueOriginalSubscriptionSetupUseCase continuation;
     public SubscriptionReconciliationService(SubscriptionStore subscriptions,SubscriptionOperationStore operations,SubscriptionTransactionPort tx,
         SubscriptionAuthorityPort authority,LoadPaymentAccountPort accounts,SubscriptionProviderRegistry providers,ApplySubscriptionSnapshotUseCase facts,
         SubscriptionReadPreparation reads,SubscriptionSweepPort sweep,SubscriptionTelemetryPort telemetry,Clock clock,
@@ -41,18 +42,21 @@ public class SubscriptionReconciliationService implements ReconcileSubscriptionU
         catch(RuntimeException failure){sweep.finish(claim,clock.instant().plus(properties.backoff(sweep.attempts(claim))),false);telemetry.record(SubscriptionTelemetryPort.Operation.RECONCILE,SubscriptionTelemetryPort.Outcome.UNKNOWN);}
     }
     private void observe(Subscription s,SubscriptionSweepPort.Claim claim,SubscriptionCommandContext context){
+        if(claim!=null&&continuation!=null){var account=accounts.findById(s.paymentAccountId()).orElseThrow();if(account.provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE){claim=continuation.sweep(account,s.id(),claim);s=subscriptions.find(s.siteId(),s.id()).orElseThrow();}}
+        if(s.providerReference()==null)throw new IllegalStateException("SETUP_PENDING");
+        final var observed=s;final var lease=claim;
         var original=reads.financial(s);
         if(original!=null&&original.status()==SubscriptionOperation.Status.UNKNOWN)telemetry.observeUnknownAge(Duration.between(original.createdAt(),clock.instant()));
         var account=accounts.findById(s.paymentAccountId()).orElseThrow();
         Long sequence=account.provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE?observations.captureFence(s):null;
         var snapshot=providers.forAccount(account).retrieve(new Lookup(account,s.id(),s.providerReference(),original==null?null:original.providerOperationKey()));
         tx.required(()->{
-            facts.apply(new ApplySubscriptionSnapshotUseCase.Command(account,s.id(),snapshot,SubscriptionEvent.Source.RECONCILIATION,"reconcile:"+UUID.randomUUID(),"subscription-reconcile",
-                new ApplySubscriptionSnapshotUseCase.Fence(s.revision(),original==null?null:original.id(),original==null?null:original.version(),claim,context,sequence)));
-            var after=subscriptions.find(s.siteId(),s.id()).orElseThrow();
-            boolean unresolved=operations.hasUnresolved(s.siteId(),s.id());
-            if(claim!=null){var advanced=sweep.advanceRevision(claim,after.revision(),clock.instant());sweep.finish(advanced,clock.instant().plus(unresolved?properties.backoff(sweep.attempts(claim)):properties.delay()),!unresolved);}
-            telemetry.record(SubscriptionTelemetryPort.Operation.RECONCILE,unresolved?SubscriptionTelemetryPort.Outcome.UNKNOWN:after.revision()==s.revision()?SubscriptionTelemetryPort.Outcome.NO_CHANGE:SubscriptionTelemetryPort.Outcome.SUCCESS);
+            facts.apply(new ApplySubscriptionSnapshotUseCase.Command(account,observed.id(),snapshot,SubscriptionEvent.Source.RECONCILIATION,"reconcile:"+UUID.randomUUID(),"subscription-reconcile",
+                new ApplySubscriptionSnapshotUseCase.Fence(observed.revision(),original==null?null:original.id(),original==null?null:original.version(),lease,context,sequence)));
+            var after=subscriptions.find(observed.siteId(),observed.id()).orElseThrow();
+            boolean unresolved=operations.hasUnresolved(observed.siteId(),observed.id());
+            if(lease!=null){var advanced=sweep.advanceRevision(lease,after.revision(),clock.instant());sweep.finish(advanced,clock.instant().plus(unresolved?properties.backoff(sweep.attempts(lease)):properties.delay()),!unresolved);}
+            telemetry.record(SubscriptionTelemetryPort.Operation.RECONCILE,unresolved?SubscriptionTelemetryPort.Outcome.UNKNOWN:after.revision()==observed.revision()?SubscriptionTelemetryPort.Outcome.NO_CHANGE:SubscriptionTelemetryPort.Outcome.SUCCESS);
             return null;
         });
     }

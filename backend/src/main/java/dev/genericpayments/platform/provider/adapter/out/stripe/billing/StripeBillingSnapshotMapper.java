@@ -10,6 +10,7 @@ import dev.genericpayments.platform.provider.application.port.out.StripeBillingB
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
+import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore;
 import dev.genericpayments.platform.subscriptions.domain.BillingRecord;
 import dev.genericpayments.platform.subscriptions.domain.Subscription;
 import dev.genericpayments.platform.subscriptions.domain.SubscriptionPriceTerms;
@@ -22,7 +23,9 @@ import java.util.*;
 public final class StripeBillingSnapshotMapper {
     private StripeBillingSnapshotMapper() {}
     public record PublishedPrice(SubscriptionPriceTerms terms,String providerPriceReference,String providerProductReference) {}
-    public record Ownership(PaymentAccount account,Subscription subscription,CustomerBinding customer,List<PublishedPrice> prices) {
+    public record TrialContext(SubscriptionBillingProofStore.Trial request,dev.genericpayments.platform.provider.application.model.ProviderOperation step,PublishedPrice original,SubscriptionBillingProofStore.Setup requiredSetup){}
+    public record Ownership(PaymentAccount account,Subscription subscription,CustomerBinding customer,List<PublishedPrice> prices,TrialContext trial,SubscriptionBillingProofStore proofs) {
+        public Ownership(PaymentAccount a,Subscription s,CustomerBinding b,List<PublishedPrice> prices){this(a,s,b,prices,null,null);}
         public Ownership { prices=List.copyOf(prices); }
     }
     private static final int PAGE_SIZE=10, MAX_PAGES=10, MAX_READS=100;
@@ -35,15 +38,26 @@ public final class StripeBillingSnapshotMapper {
     public record PaymentAction(dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding binding,String clientSecret){
         @Override public String toString(){return "PaymentAction[redacted]";}
     }
-    public static PaymentAction retrievePaymentAction(StripeClient client,StripeBillingOwnership.OriginalCreate proof,Instant at){
+    public static PaymentAction retrievePaymentAction(StripeClient client,StripeBillingOwnership.PaymentProof proof,Instant at){
         try{
             var r=new Read(client,new Ownership(proof.account(),proof.subscription(),proof.customer(),List.of(proof.price())),at);
-            var snapshot=r.snapshot();StripeBillingOwnership.requireRemote(r.remote,proof.account(),proof.subscription(),proof.operation(),proof.customer(),proof.price(),proof.step());
-            require("incomplete".equals(r.remote.getStatus()));
-            var initial=snapshot.invoices().stream().filter(i->i.kind()==BillingRecord.Kind.INITIAL).toList();require(initial.size()==1);
-            var i=initial.getFirst();require(i.settlement()==SettlementKind.OPEN&&i.price().equals(proof.price().terms())&&i.period().equals(snapshot.period()));
+            var snapshot=r.snapshot();
+            List<SubscriptionProviderModels.Invoice> selected;
+            if(proof instanceof StripeBillingOwnership.OriginalResume resume){
+                StripeBillingOwnership.requireCurrentRemote(r.remote,proof.subscription(),proof.customer(),proof.price());
+                require(Set.of("active","paused","incomplete","past_due").contains(r.remote.getStatus()));
+                selected=snapshot.invoices().stream().filter(i->i.reference().equals(resume.result().invoice())&&i.kind()==BillingRecord.Kind.RENEWAL&&i.period().equals(resume.result().period())).toList();
+            }else{
+                StripeBillingOwnership.requireRemote(r.remote,proof.account(),proof.subscription(),proof.operation(),proof.customer(),proof.price(),proof.step());
+                require("incomplete".equals(r.remote.getStatus()));
+                selected=snapshot.invoices().stream().filter(i->i.kind()==BillingRecord.Kind.INITIAL).toList();
+            }
+            require(selected.size()==1);
+            var i=selected.getFirst();require(i.settlement()==SettlementKind.OPEN&&i.price().equals(proof.price().terms())&&i.period().equals(snapshot.period()));
             var invoice=r.sourceInvoices.stream().filter(v->v.getId().equals(i.reference())).findFirst().orElseThrow(StripeBillingSnapshotMapper::mismatch);
-            require("open".equals(invoice.getStatus()));var allocations=r.sourceAllocations.get(i.reference());require(allocations!=null&&allocations.size()==1);
+            require("open".equals(invoice.getStatus()));
+            if(proof instanceof StripeBillingOwnership.OriginalResume)require(StripeBillingOwnership.inWindow(invoice.getCreated(),proof.step()));
+            var allocations=r.sourceAllocations.get(i.reference());require(allocations!=null&&allocations.size()==1);
             var a=allocations.getFirst();long due=i.amountDueMinor();require("open".equals(a.getStatus())&&Boolean.TRUE.equals(a.getIsDefault())&&Objects.equals(due,a.getAmountRequested())&&zeros(a.getAmountPaid())&&a.getPayment()!=null&&"payment_intent".equals(a.getPayment().getType()));
             ref(a.getPayment().getPaymentIntent(),"pi_");var pi=r.get(()->client.v1().paymentIntents().retrieve(a.getPayment().getPaymentIntent()));
             require(a.getPayment().getPaymentIntent().equals(pi.getId())&&"payment_intent".equals(pi.getObject())&&Boolean.FALSE.equals(pi.getLivemode())&&proof.customer().providerReference().equals(pi.getCustomer())
@@ -58,7 +72,7 @@ public final class StripeBillingSnapshotMapper {
             require(reverse.size()==1&&a.equals(reverse.getFirst()));
             String secret=pi.getClientSecret();require(secret!=null&&secret.startsWith(pi.getId()+"_secret_")&&secret.length()<=1024&&secret.matches("[A-Za-z0-9_-]+"));
             if(invoice.getConfirmationSecret()!=null)require("payment_intent".equals(invoice.getConfirmationSecret().getType())&&secret.equals(invoice.getConfirmationSecret().getClientSecret()));
-            var binding=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding(proof.step().id(),proof.operation().providerOperationKey(),StripeBillingGrantTokens.hash(dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.canonical(proof.step().fingerprint(),proof.operation().fingerprint(),i.period().start(),i.period().end())),proof.subscription().providerReference(),proof.customer().providerReference(),i.reference(),a.getId(),pi.getId());
+            var binding=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding(proof.step().id(),proof.operation().providerOperationKey(),StripeBillingGrantTokens.hash(dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.canonical(proof.step().fingerprint(),proof.operation().fingerprint(),i.period().start(),i.period().end())),proof.subscription().providerReference(),proof.customer().providerReference(),i.reference(),a.getId(),pi.getId(),proof instanceof StripeBillingOwnership.OriginalResume?"resume-v1":"payment-v1",null);
             return new PaymentAction(binding,secret);
         }catch(PaymentApplicationException safe){throw safe;}catch(StripeException|RuntimeException unsafe){throw mismatch();}
     }
@@ -70,6 +84,7 @@ public final class StripeBillingSnapshotMapper {
         com.stripe.model.Subscription remote;List<com.stripe.model.Invoice> sourceInvoices;
         final Map<String,List<InvoicePayment>> sourceAllocations=new HashMap<>();
         int requests;
+        TrialEvidence trialEvidence;
         Read(StripeClient client,Ownership owner,Instant at){this.client=Objects.requireNonNull(client);this.owner=Objects.requireNonNull(owner);this.at=Objects.requireNonNull(at);}
         <T> T get(Call<T> call) throws StripeException {require(++requests<=MAX_READS);return Objects.requireNonNull(call.run());}
         <T extends HasId> List<T> pages(Page<T> call) throws StripeException {
@@ -106,15 +121,36 @@ public final class StripeBillingSnapshotMapper {
                 case "incomplete_expired","canceled"->Subscription.Status.CANCELLED;case "past_due"->Subscription.Status.PAST_DUE;case "unpaid"->Subscription.Status.UNPAID;case "paused"->Subscription.Status.PAUSED;
                 default->throw mismatch();};
             Subscription.Period trial=null;
-            // First trial requires original durable CREATE proof supplied by the trial task.
-            if(s.trial()!=null){require(s.trial().equals(period(remote.getTrialStart(),remote.getTrialEnd())));trial=s.trial();}
+            if(owner.trial()!=null){
+                var context=owner.trial();var request=context.request();var step=context.step();
+                require(request.account().equals(a.id())&&request.subscription().equals(s.id())&&step.resourceId().equals(request.operation())&&step.accountId().equals(a.id())
+                    &&step.kind()==dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SUBSCRIPTION_CREATE&&step.status()==dev.genericpayments.platform.provider.application.model.ProviderOperation.Status.ACKNOWLEDGED&&remote.getId().equals(step.providerReference()));
+                if(context.original().terms().trialPolicy()==dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.REQUIRED_BEFORE_TRIAL){var setup=context.requiredSetup();require(setup!=null&&setup.operation().equals(request.operation())&&setup.account().equals(a.id())&&setup.subscription().equals(s.id())&&setup.method()!=null);}
+                if(request.verified()){
+                    require(step.id().equals(request.step())&&remote.getId().equals(request.subscriptionReference()));trial=request.period();
+                    if(remote.getTrialStart()!=null||remote.getTrialEnd()!=null)require(trial.equals(period(remote.getTrialStart(),remote.getTrialEnd())));
+                }else{
+                    trial=period(remote.getTrialStart(),remote.getTrialEnd());
+                    require(trial.end().getEpochSecond()==request.requestedEnd()&&StripeBillingOwnership.inWindow(remote.getTrialStart(),step)
+                        &&remote.getTrialSettings()!=null&&remote.getTrialSettings().getEndBehavior()!=null&&"pause".equals(remote.getTrialSettings().getEndBehavior().getMissingPaymentMethod())
+                        &&mapped.equals(context.original()));
+                }
+            }
             var invoices=pages(after->client.v1().invoices().list(InvoiceListParams.builder().setSubscription(remote.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build()));
             sourceInvoices=invoices;
             var normalized=new ArrayList<SubscriptionProviderModels.Invoice>();
             for(var invoice:invoices)normalized.add(invoice(invoice,remote,item,trial));
+            if(owner.trial()!=null)require(trialEvidence!=null);
             Instant cancel=remote.getCancelAt()==null?null:Instant.ofEpochSecond(remote.getCancelAt());
             if(Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())){if(cancel==null)cancel=period.end();else require(cancel.equals(period.end()));}
-            return new Snapshot(remote.getId(),status,mapped.terms(),period,trial,cancel,normalized,null,false,0,at,null,List.of());
+            boolean methodReady=false;
+            if(remote.getDefaultPaymentMethod()!=null){
+                String method=remote.getDefaultPaymentMethod();
+                    require(method.matches("pm_[A-Za-z0-9]{1,252}"));
+                    var pm=get(()->client.v1().paymentMethods().retrieve(method));
+                    require(method.equals(pm.getId())&&"payment_method".equals(pm.getObject())&&Boolean.FALSE.equals(pm.getLivemode())&&b.providerReference().equals(pm.getCustomer())&&"card".equals(pm.getType())&&pm.getCard()!=null);methodReady=true;
+            }
+            return new Snapshot(remote.getId(),status,mapped.terms(),period,trial,cancel,normalized,null,methodReady,0,at,null,List.of(),trialEvidence);
         }
         void validatePrice(Price p,PublishedPrice mapped){
             var t=mapped.terms();var recurring=p.getRecurring();
@@ -132,7 +168,9 @@ public final class StripeBillingSnapshotMapper {
             require(lines.size()==1);var line=lines.getFirst();ref(line.getId(),"il_");
             require("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&remote.getId().equals(line.getSubscription())&&Objects.equals(line.getQuantity(),1L)
                 &&line.getParent()!=null&&"subscription_item_details".equals(line.getParent().getType())&&line.getParent().getSubscriptionItemDetails()!=null);
-            var detail=line.getParent().getSubscriptionItemDetails();require(remote.getId().equals(detail.getSubscription())&&item.getId().equals(detail.getSubscriptionItem())&&detail.getProration()!=null);
+            var detail=line.getParent().getSubscriptionItemDetails();
+            var trialContext=owner.trial();boolean historicalTrial=trialContext!=null&&trialContext.request().verified()&&invoice.getId().equals(trialContext.request().invoice());
+            require(remote.getId().equals(detail.getSubscription())&&(historicalTrial?trialContext.request().item():item.getId()).equals(detail.getSubscriptionItem())&&detail.getProration()!=null);
             require(line.getPricing()!=null&&"price_details".equals(line.getPricing().getType())&&line.getPricing().getPriceDetails()!=null);
             var pricing=line.getPricing().getPriceDetails();var mapped=prices.get(pricing.getPrice());require(mapped!=null&&mapped.providerProductReference().equals(pricing.getProduct()));
             currency(invoice.getCurrency(),mapped.terms());currency(line.getCurrency(),mapped.terms());
@@ -149,7 +187,12 @@ public final class StripeBillingSnapshotMapper {
             switch(invoice.getStatus()){
                 case "paid"->{
                     if(plain&&invoice.getAmountDue()==0&&zeros(invoice.getAmountPaid(),invoice.getAmountRemaining())&&allocations.isEmpty()
-                        &&kind==BillingRecord.Kind.INITIAL&&trial!=null&&trial.equals(period)&&"trialing".equals(remote.getStatus())&&mapped.terms().equals(owner.subscription().billingPrice()))settlement=SettlementKind.ZERO;
+                        &&kind==BillingRecord.Kind.INITIAL&&trial!=null&&trial.equals(period)&&trialContext!=null&&mapped.equals(trialContext.original())
+                        &&(!trialContext.request().verified()||historicalTrial)){
+                        require(trialEvidence==null);
+                        trialEvidence=new TrialEvidence(trialContext.request().operation(),trialContext.step().id(),invoice.getId(),detail.getSubscriptionItem(),period,mapped.terms(),trialContext.requiredSetup()==null?null:trialContext.requiredSetup().method());
+                        settlement=SettlementKind.ZERO;
+                    }
                     else if(plain&&invoice.getAmountDue()>0&&invoice.getAmountDue()==mapped.terms().regularAmount().minorUnits()&&Objects.equals(invoice.getAmountPaid(),invoice.getAmountDue())&&zeros(invoice.getAmountRemaining())&&allocations.size()==1){
                         var confirmed=capture(invoice,allocations.getFirst());if(confirmed!=null){require(cashIds.add(confirmed.reference()));cash=List.of(confirmed);settlement=SettlementKind.CASH;}
                     }

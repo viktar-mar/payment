@@ -5,6 +5,17 @@ import dev.genericpayments.platform.paymentaccounts.domain.*;import dev.genericp
 import java.time.Instant;import java.util.*;import org.junit.jupiter.api.Test;
 class StripeBillingOwnershipCompatibilityTest {
  static UUID id(int n){return UUID.fromString("00000000-0000-0000-0000-"+String.format("%012d",n));}
+ @Test void legacyPaymentDescriptorAndMacRemainByteCompatibleAfterPurposeExtension(){
+  var now=Instant.parse("2026-10-28T00:00:00Z");
+  var binding=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding(id(7),"original-create-key","a".repeat(64),"sub_owned","cus_owned","in_owned","inpay_owned","pi_owned");
+  var grant=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant(id(1),new SiteId(id(2)),new CustomerId(id(3)),new PaymentAccountId(id(4)),id(5),id(6),"v1",binding,null,now,now.plusSeconds(600),now.plusSeconds(2),null,null,null,null);
+  // Persisted v27 field order and independent Ruby OpenSSL HMAC, zero synthetic 32-byte key.
+  String saved="36:00000000-0000-0000-0000-00000000000136:00000000-0000-0000-0000-00000000000236:00000000-0000-0000-0000-00000000000336:00000000-0000-0000-0000-00000000000436:00000000-0000-0000-0000-00000000000536:00000000-0000-0000-0000-0000000000062:v136:00000000-0000-0000-0000-00000000000719:original-create-key64:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa9:sub_owned9:cus_owned8:in_owned11:inpay_owned8:pi_owned20:2026-10-28T00:00:00Z20:2026-10-28T00:10:00Z";
+  assertThat(grant.descriptor()).isEqualTo(saved);
+  var tokens=new StripeBillingGrantTokens(true,"v1",Map.of("v1",Base64.getEncoder().encodeToString(new byte[32])));
+  assertThat(tokens.token("v1",grant.descriptor())).isEqualTo("bga1__4VI-dyS3_-Brsa3S0U6-OWb9RI7R5vfJ2RXk8xg6Gs");
+  assertThat(grant.available(now.plusSeconds(3))).isFalse();
+ }
  @Test void readsThePreTaskFiveStoredCreateFingerprintWithoutRekeying(){
   // Literal derived from committed 28ad7d4's persisted field order, not from the new helper.
   String saved="d1d35bcb857db4cd4201782bb5b4a520716027ea422253427845380ae3970f7f";

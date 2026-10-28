@@ -30,6 +30,20 @@ public final class SubscriptionProviderModels {
         public Reply {Objects.requireNonNull(outcome);if(outcome==Outcome.ACCEPTED||outcome==Outcome.REQUIRES_ACTION)Objects.requireNonNull(reference);if((outcome==Outcome.REQUIRES_ACTION)!=(action!=null))throw new IllegalArgumentException("Invalid action receipt");}
     }
     public enum Outcome { ACCEPTED, REQUIRES_ACTION, DECLINED, UNKNOWN }
+    public sealed interface CreatePreparation permits ReadyForCreate,PendingSetup {}
+    public record ReadyForCreate() implements CreatePreparation {}
+    public record OwnedSetupReceipt(UUID operationId,UUID stepId,String setupReference) {
+        public OwnedSetupReceipt {Objects.requireNonNull(operationId);Objects.requireNonNull(stepId);if(setupReference==null||!setupReference.matches("seti_[A-Za-z0-9]{1,250}"))throw new IllegalArgumentException("Invalid setup receipt");}
+    }
+    public record PendingSetup(OwnedSetupReceipt receipt,NextAction action) implements CreatePreparation {
+        public PendingSetup {Objects.requireNonNull(receipt);}
+    }
+    public sealed interface SetupContinuationFence permits InboxSetupFence,SweepSetupFence,ApiSetupFence {}
+    public record InboxSetupFence(dev.genericpayments.platform.webhooks.application.port.out.SubscriptionInboxPort.Claim claim) implements SetupContinuationFence {}
+    public record SweepSetupFence(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionSweepPort.Claim claim) implements SetupContinuationFence {}
+    public record ApiSetupFence(SubscriptionCommandContext context) implements SetupContinuationFence {}
+    public record SetupContinuationResult(Reply reply) {public boolean progressed(){return reply!=null;}}
+    public record TrialEvidence(UUID operation,UUID step,String invoice,String item,Subscription.Period period,SubscriptionPriceTerms price,String originalMethod){}
     public record NextAction(ActionKind kind,String secret,Instant expiresAt) {
         public NextAction {Objects.requireNonNull(kind);Objects.requireNonNull(secret);Objects.requireNonNull(expiresAt);}
         @Override public String toString(){return "NextAction[kind="+kind+", secret=[REDACTED], expiresAt="+expiresAt+"]";}
@@ -43,7 +57,11 @@ public final class SubscriptionProviderModels {
     public record Snapshot(String subscriptionReference,Subscription.Status status,SubscriptionPriceTerms billingPrice,
                            Subscription.Period period,Subscription.Period trial,Instant cancellationAt,List<Invoice> invoices,
                            String operationKey,boolean paymentMethodReady,long providerRevision,Instant observedAt,
-                           OperationObservation operationObservation,List<RecoveryObservation> recoveryObservations) {
+                           OperationObservation operationObservation,List<RecoveryObservation> recoveryObservations,TrialEvidence trialEvidence) {
+        public Snapshot(String reference,Subscription.Status status,SubscriptionPriceTerms price,Subscription.Period period,Subscription.Period trial,
+                        Instant cancellation,List<Invoice> invoices,String key,boolean ready,long revision,Instant at,OperationObservation observation,List<RecoveryObservation> recovery){
+            this(reference,status,price,period,trial,cancellation,invoices,key,ready,revision,at,observation,recovery,null);
+        }
         public Snapshot(String subscriptionReference,Subscription.Status status,SubscriptionPriceTerms billingPrice,
                         Subscription.Period period,Subscription.Period trial,Instant cancellationAt,List<Invoice> invoices,
                         String operationKey,boolean paymentMethodReady,long providerRevision,Instant observedAt,

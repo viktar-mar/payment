@@ -74,9 +74,11 @@ public class StripeSandboxConfiguration {
             dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionOperationStore operations,
             dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionCatalogPort catalog,
             dev.genericpayments.platform.catalog.application.port.out.ProviderCatalogMappingPort mappings,java.time.Clock clock,
-            org.springframework.beans.factory.ObjectProvider<dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingActionAdapter> actions) {
+            org.springframework.beans.factory.ObjectProvider<dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingActionAdapter> actions,
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore proofs,
+            @org.springframework.beans.factory.annotation.Qualifier("providerReferenceClock") java.time.Clock providerClock) {
         return new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeSubscriptionProviderAdapter(credentials,clients,verification,steps,bindings,customers,
-            digest,accounts,sites,customerStore,subscriptions,operations,catalog,mappings,clock,actions::getObject);
+            digest,accounts,sites,customerStore,subscriptions,operations,catalog,mappings,clock,actions::getObject,proofs,providerClock);
     }
 
     @Bean dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens stripeBillingGrantTokens(Environment environment,StripeSandboxProperties settings){
@@ -86,8 +88,9 @@ public class StripeSandboxConfiguration {
             StripeCredentialResolver credentials,ProviderOperationStore steps,dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort bindings,
             DigestPort digest,LoadPaymentAccountPort accounts,LoadSitePort sites,dev.genericpayments.platform.customers.application.port.out.CustomerStore customers,
             dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionStore subscriptions,dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionOperationStore operations,
-            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionCatalogPort catalog,dev.genericpayments.platform.catalog.application.port.out.ProviderCatalogMappingPort mappings){
-        return new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnership(credentials,steps,bindings,digest,accounts,sites,customers,subscriptions,operations,catalog,mappings);
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionCatalogPort catalog,dev.genericpayments.platform.catalog.application.port.out.ProviderCatalogMappingPort mappings,
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore proofs){
+        return new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnership(credentials,steps,bindings,digest,accounts,sites,customers,subscriptions,operations,catalog,mappings,proofs);
     }
     @Bean @Lazy dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingActionAdapter stripeBillingActionAdapter(
             dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnership ownership,dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens tokens,
@@ -104,8 +107,9 @@ public class StripeSandboxConfiguration {
             dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionOperationStore operations,
             StripeCredentialResolver credentials,StripeClientFactory clients,PaymentAccountVerificationPort verification,
             dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeSubscriptionProviderAdapter provider,
-            dev.genericpayments.platform.subscriptions.application.service.SubscriptionCommandTransaction commands){
+            dev.genericpayments.platform.subscriptions.application.service.SubscriptionCommandTransaction commands,
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore proofs,ProviderOperationStore steps){
         return new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingInboxAdapter(accounts,objects,ownership,bindings,
-            operations,credentials,clients,verification,provider,commands);
+            operations,credentials,clients,verification,provider,commands,proofs,steps);
     }
 }

@@ -17,6 +17,7 @@ public class SubscriptionInboxWorker {
     private final dev.genericpayments.platform.subscriptions.application.port.in.PrepareSubscriptionReadUseCase reads;
     private final SubscriptionTelemetryPort telemetry;private final SubscriptionObservationPort observations;
     private final dev.genericpayments.platform.webhooks.application.port.out.SubscriptionInboxResolutionPort resolution;
+    @org.springframework.beans.factory.annotation.Autowired(required=false) private dev.genericpayments.platform.subscriptions.application.port.in.ContinueOriginalSubscriptionSetupUseCase continuation;
     private final String owner="subscription-inbox-"+UUID.randomUUID();private final int batch;private final Duration lease;
     public SubscriptionInboxWorker(SubscriptionInboxPort inbox,SubscriptionTransactionPort tx,SubscriptionObjectPort objects,SubscriptionStore subscriptions,
         SubscriptionOperationStore operations,LoadPaymentAccountPort accounts,SubscriptionProviderRegistry providers,ApplySubscriptionSnapshotUseCase facts,
@@ -37,9 +38,11 @@ public class SubscriptionInboxWorker {
             if(envelope.provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE)
                 identity=resolution.resolve(envelope);
             if(identity.isEmpty()){inbox.fail(claim,"UNRESOLVED_OBJECT",clock.instant());continue;}
-            var subscription=subscriptions.findOwned(envelope.accountId(),identity.get()).orElseThrow();
             var account=accounts.findById(envelope.accountId()).orElseThrow();
             if(account.provider()!=envelope.provider())throw new IllegalArgumentException("Provider mismatch");
+            if(account.provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE&&envelope.eventType().equals("SUBSCRIPTION_SETUP_CHANGED")
+                &&(continuation==null||!continuation.inbox(account,identity.get(),claim))){inbox.fail(claim,"SETUP_PENDING",clock.instant());continue;}
+            var subscription=subscriptions.findOwned(envelope.accountId(),identity.get()).orElseThrow();
             var original=reads.financial(subscription);
             String key=original==null?null:original.providerOperationKey();
             Long sequence=account.provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE?observations.captureFence(subscription):null;

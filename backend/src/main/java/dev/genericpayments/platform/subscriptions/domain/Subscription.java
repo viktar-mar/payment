@@ -90,6 +90,12 @@ public record Subscription(UUID id, SiteId siteId, CustomerId customerId,
         return project(billingPrice, billingPrice, Status.TRIALING, period, paidThrough, period,
             cancellation, pendingChange, debt, null, at);
     }
+    /** Record authoritative original usage after a delayed paid or terminal observation. */
+    public Subscription recordTrialHistory(Period period,Instant at){
+        Objects.requireNonNull(period);Objects.requireNonNull(at);
+        if(trial!=null){if(!trial.equals(period))throw conflict("Trial history conflicts");return this;}
+        return project(billingPrice,entitledPrice,billingStatus,currentPeriod,paidThrough,period,cancellation,pendingChange,debt,terminalReason,at);
+    }
 
     public Subscription confirmPaid(SubscriptionPriceTerms terms, Period period, Instant at) {
         Objects.requireNonNull(terms, "terms");
