@@ -18,10 +18,6 @@ class FakeProviderConfiguration {
         return new FakeSubscriptionProviderAdapter(state);
     }
     @Bean
-    dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionProviderRegistry subscriptionProviderRegistry(FakeSubscriptionProviderAdapter fake) {
-        return account -> {FakeSubscriptionStateAdapter.requireFake(account);return fake;};
-    }
-    @Bean
     FakeCatalogProviderAdapter catalogProviderPort() {
         return new FakeCatalogProviderAdapter();
     }

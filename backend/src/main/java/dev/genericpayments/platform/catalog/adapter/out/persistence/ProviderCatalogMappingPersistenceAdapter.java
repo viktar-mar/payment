@@ -15,6 +15,7 @@ import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import java.util.Optional;
+import java.util.List;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -81,6 +82,28 @@ public class ProviderCatalogMappingPersistenceAdapter implements ProviderCatalog
             .findFirst()
             .map(ProviderPriceMappingJpaEntity::toReference);
     }
+
+    @Override
+    @Transactional(readOnly=true)
+    public List<ProviderCatalogMapping> findPricesForProduct(PaymentAccountId accountId,SiteId siteId,ProductId productId) {
+        if(accountId==null||siteId==null||productId==null)throw mappingUnavailable();
+        // Include immutable archived versions. Today's Site Account must not relocate old subscriptions.
+        var rows=jdbc.query("""
+            select p.id,pm.provider_price_id,product.provider_product_id,pm.created_at
+            from provider_price_mappings pm join prices p on p.id=pm.price_id
+            join products owned on owned.id=p.product_id and owned.site_id=p.site_id
+            join provider_product_mappings product on product.payment_account_id=pm.payment_account_id and product.product_id=owned.id
+            where pm.payment_account_id=? and p.site_id=? and p.product_id=?
+              and p.price_type='SUBSCRIPTION' and p.published_at is not null and p.status in ('PUBLISHED','ARCHIVED')
+            order by p.price_version,p.id limit 101
+            """,(r,n)->new ProviderCatalogMapping(accountId,productId,new ProviderProductRef(r.getString("provider_product_id")),
+                new PriceId(r.getObject("id",java.util.UUID.class)),new ProviderPriceRef(r.getString("provider_price_id")),r.getTimestamp("created_at").toInstant()),
+            accountId.value(),siteId.value(),productId.value());
+        if(rows.size()>100)throw mappingUnavailable();
+        return List.copyOf(rows);
+    }
+
+    private static PaymentApplicationException mappingUnavailable(){return new PaymentApplicationException("PROVIDER_EVIDENCE_MISMATCH",409,"Provider catalog evidence unavailable");}
 
     @Override
     @Transactional

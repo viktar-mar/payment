@@ -64,4 +64,17 @@ public class StripeSandboxConfiguration {
             LoadSitePort sites, LoadPaymentPort payments, LoadPaymentAccountPort accounts,dev.genericpayments.platform.payments.application.port.out.LoadRefundPort refunds) {
         return new StripePaymentProviderAdapter(credentials, clients, verification, operations, digest, sites, payments, accounts,refunds);
     }
+
+    @Bean @Lazy dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeSubscriptionProviderAdapter stripeSubscriptionProvider(
+            StripeCredentialResolver credentials,StripeClientFactory clients,PaymentAccountVerificationPort verification,
+            ProviderOperationStore steps,dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort bindings,
+            dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingCustomerAdapter customers,DigestPort digest,
+            LoadPaymentAccountPort accounts,LoadSitePort sites,dev.genericpayments.platform.customers.application.port.out.CustomerStore customerStore,
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionStore subscriptions,
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionOperationStore operations,
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionCatalogPort catalog,
+            dev.genericpayments.platform.catalog.application.port.out.ProviderCatalogMappingPort mappings,java.time.Clock clock) {
+        return new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeSubscriptionProviderAdapter(credentials,clients,verification,steps,bindings,customers,
+            digest,accounts,sites,customerStore,subscriptions,operations,catalog,mappings,clock);
+    }
 }
