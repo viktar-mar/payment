@@ -67,6 +67,18 @@ class StripeSubscriptionCreateTest {
         graph.subscription.add("payment_settings",JsonParser.parseString("{\"payment_method_types\":[\"card\"],\"save_default_payment_method\":\"on_subscription\"}"));
     }
     @AfterEach void close(){graph.close();}
+    @Test void positiveFixtureCreateSharesOneInstantAfterTheSetupSecondHasPassed(){
+        var later=Clock.fixed(Instant.ofEpochSecond(graph.subscription.get("created").getAsLong()+1),ZoneOffset.UTC);
+        org.springframework.test.util.ReflectionTestUtils.setField(adapter,"providerClock",later);
+        assertThatCode(this::create).doesNotThrowAnyException();
+        assertThat(steps.only().firstDispatchedAt().getEpochSecond()).isEqualTo(graph.subscription.get("created").getAsLong());
+        assertThat(org.springframework.test.util.ReflectionTestUtils.getField(adapter,"providerClock")).isSameAs(later);
+    }
+    @Test void intentionallyEarlierCreatedResponseStillRefusesTheOriginalDispatchWindow(){
+        var at=Instant.now();org.springframework.test.util.ReflectionTestUtils.setField(adapter,"providerClock",Clock.fixed(at,ZoneOffset.UTC));graph.subscription.addProperty("created",at.minusSeconds(1).getEpochSecond());
+        identity();graph.http.respond("POST","/v1/subscriptions",graph.subscription.toString());
+        assertThat(adapter.create(command()).outcome()).isEqualTo(Outcome.UNKNOWN);assertThat(steps.only().status()).isEqualTo(ProviderOperation.Status.UNKNOWN);assertThat(steps.only().firstDispatchedAt()).isEqualTo(at);assertThat(steps.only().retryBefore()).isEqualTo(at.plus(Duration.ofHours(23)));
+    }
     @Test void capabilitiesRemainReadableInsideTheQueryTransactionWhileWritesAreRejected(){
         var manager=new StripeAccountVerificationAdapterTest.TestTransactionManager();var proxy=new org.springframework.aop.framework.ProxyFactory(adapter);
         proxy.setProxyTargetClass(true);proxy.addAdvice(new org.springframework.transaction.interceptor.TransactionInterceptor(manager,new org.springframework.transaction.annotation.AnnotationTransactionAttributeSource()));
@@ -158,7 +170,15 @@ class StripeSubscriptionCreateTest {
     Command command(){return new Command(account,operation,local.billingPrice(),null,null,null,null,true,false);}
     Lookup lookup(){return new Lookup(account,local.id(),local.providerReference(),operation.providerOperationKey());}
     void identity(){graph.http.respond("GET","/v1/account","{\"id\":\"acct_expected\",\"object\":\"account\"}");}
-    void create(){identity();graph.http.respond("POST","/v1/subscriptions",graph.subscription.toString());assertThat(adapter.create(command()).outcome()).isEqualTo(Outcome.ACCEPTED);}
+    // Known-positive responses share the dispatch instant; malformed-response tests call the adapter directly.
+    void create(){
+        var original=(Clock)org.springframework.test.util.ReflectionTestUtils.getField(adapter,"providerClock");
+        var at=steps.find(account.id(),operation.providerOperationKey()).map(ProviderOperation::firstDispatchedAt).orElseGet(Instant::now);
+        graph.subscription.addProperty("created",at.getEpochSecond());
+        org.springframework.test.util.ReflectionTestUtils.setField(adapter,"providerClock",Clock.fixed(at,ZoneOffset.UTC));
+        try{identity();graph.http.respond("POST","/v1/subscriptions",graph.subscription.toString());assertThat(adapter.create(command()).outcome()).isEqualTo(Outcome.ACCEPTED);}
+        finally{org.springframework.test.util.ReflectionTestUtils.setField(adapter,"providerClock",original);}
+    }
     void unknown(){identity();graph.http.disconnectNext("POST","/v1/subscriptions");assertThat(adapter.create(command()).outcome()).isEqualTo(Outcome.UNKNOWN);}
     JsonObject metadata(){var m=new JsonObject();m.addProperty("account_id",account.id().value().toString());m.addProperty("site_id",local.siteId().value().toString());m.addProperty("customer_id",local.customerId().value().toString());m.addProperty("subscription_id",local.id().toString());m.addProperty("operation_id",operation.id().toString());return m;}
     void event(String id,String key,long created){graph.http.respond("GET","/v1/events/"+id,eventJson(id,key,created));}
