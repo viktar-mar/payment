@@ -455,9 +455,15 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
     }
 
     @Test void crossQuoteScheduleCannotBeConfiguredOrReleasedAndOtherKindsRetainReferenceUniqueness() {
-        var change = plan(original.subscription(), ChangeTiming.NEXT_PERIOD, "schedule-exact-owner");
+        var otherOriginal = paidOriginal();
+        // Transition edits invalidate every Site quote; finish both edits before either reservation.
+        var target = target(original.subscription(), ChangeTiming.NEXT_PERIOD);
+        var otherTarget = target(otherOriginal.subscription(), ChangeTiming.NEXT_PERIOD);
+        var change = reserve(preview(original.subscription(), ChangeTiming.NEXT_PERIOD, "schedule-exact-owner", target));
         var created = createSchedule(change, "sub_sched_Unique");
-        var other = plan(paidOriginal().subscription(), ChangeTiming.NEXT_PERIOD, "schedule-foreign-owner");
+        var other = reserve(preview(otherOriginal.subscription(), ChangeTiming.NEXT_PERIOD, "schedule-foreign-owner", otherTarget));
+        assertThat(change.quote().policy()).isEqualTo(change.operation().policyVersion()).isEqualTo(policies.load(site).version());
+        assertThat(other.quote().policy()).isEqualTo(other.operation().policyVersion()).isEqualTo(change.quote().policy());
         var colliding = claimed(other.operation(), ProviderOperation.Kind.SCHEDULE_CREATE);
         providerConflict(() -> steps.acknowledge(colliding.id(), OWNER, colliding.version(), created.reference()));
         assertThat(steps.findById(colliding.id())).contains(colliding);
@@ -518,21 +524,26 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
         var change = plan(original.subscription(), ChangeTiming.IMMEDIATE, "grant-no-result");
         var step = acknowledge(changeStep(change), change.subscription().providerReference());
         var noResult = grant(change.subscription(), change.operation(), paymentBinding(change, step.id(), "in_MissingResult", "change-v1"));
-        subscriptionConflict(() -> reserveGrant(noResult.grant()));
+        subscriptionStoreConflict(() -> reserveGrant(noResult.grant()));
         var createDescriptor = grant(change.subscription(), change.operation(), paymentBinding(change, step.id(), "in_MissingResult", "payment-v1"));
-        subscriptionConflict(() -> reserveGrant(createDescriptor.grant()));
+        subscriptionStoreConflict(() -> reserveGrant(createDescriptor.grant()));
         var other = changeGrantCase(paidOriginal().subscription(), "grant-foreign-result");
         var foreign = grant(change.subscription(), change.operation(), new SubscriptionClientGrant.Binding(other.grant().binding().stepId(), change.operation().providerOperationKey(), other.grant().binding().proof(),
             change.subscription().providerReference(), customerReference, other.grant().binding().invoiceReference(), nativeReference("inpay_"), nativeReference("pi_"), "change-v1", null));
-        subscriptionConflict(() -> reserveGrant(foreign.grant()));
+        subscriptionStoreConflict(() -> reserveGrant(foreign.grant()));
         assertThat(count("subscription_action_capabilities")).isZero();
         assertThat(proofs.result(account.id(), change.operation().id())).isEmpty();
         assertUnchangedEntitlement(change);
     }
 
     @Test void changeGrantSqlRejectsForeignResultInvoiceStepOwnersAndMissingDiscriminant() {
-        var owned = changeGrantCase("grant-sql-owner");
-        var other = changeGrantCase(paidOriginal().subscription(), "grant-sql-foreign");
+        var otherOriginal = paidOriginal();
+        var target = target(original.subscription(), ChangeTiming.IMMEDIATE);
+        var otherTarget = target(otherOriginal.subscription(), ChangeTiming.IMMEDIATE);
+        var owned = changeGrantCase(reserve(preview(original.subscription(), ChangeTiming.IMMEDIATE, "grant-sql-owner", target)));
+        var other = changeGrantCase(reserve(preview(otherOriginal.subscription(), ChangeTiming.IMMEDIATE, "grant-sql-foreign", otherTarget)));
+        assertThat(owned.change().quote().policy()).isEqualTo(owned.change().operation().policyVersion()).isEqualTo(policies.load(site).version());
+        assertThat(other.change().quote().policy()).isEqualTo(other.change().operation().policyVersion()).isEqualTo(owned.change().quote().policy());
         reserveGrant(owned.grant());
         var valid = jdbc.queryForMap("select * from subscription_action_capabilities where id=?", owned.grant().id());
         rejectGrant(valid, "billing_change_operation", null, "23514");
@@ -572,9 +583,9 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
         assertThat(first.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
         assertThat(storedGrant(workflow.owned().grant()).consumedAt()).isNotNull();
         assertThat(storedGrant(workflow.owned().grant()).descriptor()).isEqualTo(workflow.owned().grant().descriptor());
-        subscriptionConflict(() -> clientSessionUseCase.issue(clientCommand(workflow, workflow.context())));
+        subscriptionStateConflict(() -> clientSessionUseCase.issue(clientCommand(workflow, workflow.context())));
         var changedKey = new SubscriptionCommandContext(workflow.context().actor(), site, customer.id(), workflow.context().origin(), "another-confirmation", "task8-change-grant");
-        subscriptionConflict(() -> confirmations.confirm(confirmationCommand(workflow, changedKey)));
+        subscriptionStateConflict(() -> confirmations.confirm(confirmationCommand(workflow, changedKey)));
         verify(workflow.provider(), times(1)).confirmAction(any(), eq(workflow.owned().raw()));
         assertThat(jdbc.queryForObject("select row_to_json(a)::text from subscription_action_capabilities a where id=?", String.class, workflow.owned().grant().id())).doesNotContain(workflow.owned().raw(), workflow.secret());
         assertUnchangedEntitlement(workflow.owned().change());
@@ -614,11 +625,11 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
         clientSessionUseCase.issue(clientCommand(workflow, workflow.context()));
         var anotherSession = new SubscriptionActor.Customer(sessions.resolveRequired(sessions.issue(site, customer.id(), "https://facts.test").rawToken(), "https://facts.test"));
         var anotherContext = new SubscriptionCommandContext(anotherSession, site, customer.id(), "https://facts.test", "other-session", "task8-change-grant");
-        subscriptionConflict(() -> clientSessionUseCase.issue(clientCommand(workflow, anotherContext)));
+        subscriptionStateConflict(() -> clientSessionUseCase.issue(clientCommand(workflow, anotherContext)));
         jdbc.update("insert into site_allowed_origins values (?,'https://plan-other.test')", site.value());
         var otherOrigin = new SubscriptionActor.Customer(sessions.resolveRequired(sessions.issue(site, customer.id(), "https://plan-other.test").rawToken(), "https://plan-other.test"));
         var otherOriginContext = new SubscriptionCommandContext(otherOrigin, site, customer.id(), "https://plan-other.test", "other-origin", "task8-change-grant");
-        subscriptionConflict(() -> clientSessionUseCase.issue(clientCommand(workflow, otherOriginContext)));
+        subscriptionStateConflict(() -> clientSessionUseCase.issue(clientCommand(workflow, otherOriginContext)));
         var otherCustomer = customers.save(Customer.create(new CustomerId(UUID.randomUUID()), site, null, null, grantNow()));
         var foreignActor = new SubscriptionActor.Customer(sessions.resolveRequired(sessions.issue(site, otherCustomer.id(), "https://facts.test").rawToken(), "https://facts.test"));
         var foreign = new SubscriptionCommandContext(foreignActor, site, otherCustomer.id(), "https://facts.test", "foreign-customer", "task8-change-grant");
@@ -672,9 +683,15 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
     }
 
     @Test void originalReplayRejectsStaleOperationVersionAndForeignRetainedQuoteAccountOrSubscription() {
-        var prepared = preview(original.subscription(), ChangeTiming.IMMEDIATE, "original-replay-binding");
-        var alternate = preview(original.subscription(), ChangeTiming.IMMEDIATE, "original-replay-alternate");
+        var target = target(original.subscription(), ChangeTiming.IMMEDIATE);
+        var prepared = preview(original.subscription(), ChangeTiming.IMMEDIATE, "original-replay-binding", target);
+        var alternate = preview(original.subscription(), ChangeTiming.IMMEDIATE, "original-replay-alternate", target);
+        assertThat(alternate.common().id()).isNotEqualTo(prepared.common().id());
+        assertThat(alternate.quote().id()).isNotEqualTo(prepared.quote().id());
+        assertThat(alternate.quote().target()).isEqualTo(prepared.quote().target());
+        assertThat(prepared.quote().policy()).isEqualTo(alternate.quote().policy()).isEqualTo(policies.load(site).version());
         var owner = reserveOnly(prepared);
+        assertThat(owner.operation().policyVersion()).isEqualTo(prepared.quote().policy());
         plans.beforeMutation(prepared.context(), owner, true);
         var processing = reserveOnly(prepared);
         plans.reply(processing, new Reply(Outcome.UNKNOWN, null, null));
@@ -705,6 +722,8 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
         replayStale(() -> plans.beforeOriginalReplay(otherContext, r));
         var foreign = foreignOwners(paidOriginal().subscription());
         var foreignSite = new dev.genericpayments.platform.sites.domain.SiteId((UUID) foreign.get("site_id"));
+        assertThat(siteLoader.findById(foreignSite)).isPresent();
+        assertThat(customers.findById(foreignSite, customer.id())).isEmpty();
         var foreignSiteContext = new SubscriptionCommandContext(c.actor(), foreignSite, customer.id(), c.origin(), c.idempotencyKey(), "task8-replay-site");
         customerUnavailable(() -> plans.beforeOriginalReplay(foreignSiteContext, r));
         var key = new dev.genericpayments.platform.partners.domain.SiteApiKey(new dev.genericpayments.platform.partners.domain.SiteApiKeyId(UUID.randomUUID()), site,
@@ -1331,8 +1350,8 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
     private record ChangeGrant(Plan change, SubscriptionPlanProofStore.Result result, SubscriptionClientGrant grant, String raw) {}
     private record GrantWorkflow(ChangeGrant owned, SubscriptionCommandContext context, SubscriptionProviderPort provider, String secret) {}
     private ChangeGrant changeGrantCase(String key) { return changeGrantCase(original.subscription(), key); }
-    private ChangeGrant changeGrantCase(Subscription source, String key) {
-        var change = plan(source, ChangeTiming.IMMEDIATE, key);
+    private ChangeGrant changeGrantCase(Subscription source, String key) { return changeGrantCase(plan(source, ChangeTiming.IMMEDIATE, key)); }
+    private ChangeGrant changeGrantCase(Plan change) {
         var step = claim(changeStep(change));
         var result = proofs.recordResult(change.subscription(), change.operation(), change.quote(), step, OWNER, nativeReference("in_"), grantNow().plusSeconds(1800).getEpochSecond(), creditLine(change), debitLine(change));
         var grant = grant(change.subscription(), change.operation(), paymentBinding(change, result.step(), result.invoice(), "change-v1"));
@@ -1420,8 +1439,11 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
         assertThat(storedGrant(g).consumedAt()).isNotNull();
         sqlState("23514", () -> jdbc.update("update subscription_action_capabilities set consumed_at=null where id=?", g.id()));
     }
-    private static void subscriptionConflict(ThrowingCallable action) {
+    private static void subscriptionStoreConflict(ThrowingCallable action) {
         assertThatThrownBy(action).isInstanceOfSatisfying(PaymentApplicationException.class, failure -> assertThat(failure.code()).isEqualTo("SUBSCRIPTION_CONFLICT"));
+    }
+    private static void subscriptionStateConflict(ThrowingCallable action) {
+        assertThatThrownBy(action).isInstanceOfSatisfying(PaymentApplicationException.class, failure -> assertThat(failure.code()).isEqualTo("SUBSCRIPTION_STATE_CONFLICT"));
     }
 
     private record Original(Subscription subscription, SubscriptionOperation operation, ProviderOperation creationStep) {}
@@ -1447,8 +1469,10 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
         return bindings.bindCustomer(account.id(), site, owner.id(), acknowledged.providerReference(), acknowledged.id()).providerReference();
     }
     private Prepared preview(Subscription subscription, ChangeTiming timing, String key) {
+        return preview(subscription, timing, key, target(subscription, timing));
+    }
+    private Prepared preview(Subscription subscription, ChangeTiming timing, String key, PriceId target) {
         var context = context(key);
-        var target = target(subscription, timing);
         var query = new PreviewSubscriptionChangeUseCase.Query(context, subscription.id(), target, timing);
         var candidate = plans.candidate(context, subscription.id());
         var preview = plans.preview(query, candidate, true);
@@ -1571,6 +1595,8 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
         UUID otherAccount = UUID.randomUUID(), otherSite = UUID.randomUUID();
         jdbc.update("insert into payment_accounts values (?,?,'STRIPE','SANDBOX','ACTIVE','acct_otherPlan','stripe-sandbox-default',now(),0)", otherAccount, "plan-account-" + otherAccount);
         jdbc.update("insert into sites(id,site_key,display_name,status,payment_account_id,payment_method_policy,created_at,updated_at,version) values (?,?,'Other','ACTIVE',?,'AUTOMATIC',now(),now(),0)", otherSite, "plan-site-" + otherSite, otherAccount);
+        jdbc.update("insert into site_allowed_origins values (?,'https://facts.test')", otherSite);
+        jdbc.update("insert into site_authentication_modes values (?,'SITE_TOKEN')", otherSite);
         return Map.of("site_id", otherSite, "customer_id", otherCustomer.id().value(), "subscription_id", other.id(), "payment_account_id", otherAccount);
     }
     private void insert(String table, Map<String, Object> row) {
