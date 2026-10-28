@@ -15,6 +15,7 @@ import dev.genericpayments.platform.subscriptions.application.port.in.*;
 import dev.genericpayments.platform.subscriptions.application.port.out.*;
 import dev.genericpayments.platform.subscriptions.domain.*;
 import dev.genericpayments.platform.support.PostgresIntegrationTest;
+import dev.genericpayments.platform.support.CurrentSchemaVersions;
 import dev.genericpayments.platform.webhooks.application.service.SubscriptionInboxWorker;
 import io.cucumber.spring.ScenarioScope;
 import java.sql.Timestamp;
@@ -220,7 +221,7 @@ public class SubscriptionAcceptanceWorld {
     void validateMigration() {
         var before=subscription();var cash=jdbc.queryForList("select * from payments where site_id=?",site.value());
         var flyway=bean(org.flywaydb.core.Flyway.class);flyway.validate();assertThat(flyway.migrate().migrationsExecuted).isZero();
-        assertThat(Arrays.stream(flyway.info().applied()).map(i->i.getVersion().toString()).toList()).containsExactlyElementsOf(java.util.stream.IntStream.rangeClosed(1,25).mapToObj(Integer::toString).toList());
+        assertThat(Arrays.stream(flyway.info().applied()).map(i->i.getVersion().toString()).toList()).containsExactlyElementsOf(CurrentSchemaVersions.EXPECTED);
         assertThat(subscription()).isEqualTo(before);assertThat(jdbc.queryForList("select * from payments where site_id=?",site.value())).isEqualTo(cash);
     }
     void callbacks() {bean(dev.genericpayments.platform.webhooks.application.port.out.CallbackConfigurationPort.class).configure(site.value(),"https://example.test/callback",true);}
