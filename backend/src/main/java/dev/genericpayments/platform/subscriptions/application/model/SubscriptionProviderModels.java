@@ -38,6 +38,8 @@ public final class SubscriptionProviderModels {
     public record Lookup(PaymentAccount account,UUID subscriptionId,String reference,String providerOperationKey) {
         public Lookup {Objects.requireNonNull(account);Objects.requireNonNull(subscriptionId);}
     }
+    /** providerRevision 0 explicitly denotes an unversioned provider (Stripe). Fresh reads require
+     * a captured, single-use local observation fence; observedAt is never a provider sequence. */
     public record Snapshot(String subscriptionReference,Subscription.Status status,SubscriptionPriceTerms billingPrice,
                            Subscription.Period period,Subscription.Period trial,Instant cancellationAt,List<Invoice> invoices,
                            String operationKey,boolean paymentMethodReady,long providerRevision,Instant observedAt,

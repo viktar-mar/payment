@@ -67,7 +67,7 @@ public final class StripeHttpFixture implements AutoCloseable {
                 }
             }
             var call = new Call(exchange.getRequestMethod(), exchange.getRequestURI().getPath(),
-                Map.copyOf(headers), Map.copyOf(form));
+                Map.copyOf(headers), Map.copyOf(form), query(exchange.getRequestURI().getRawQuery()));
             calls.add(call);
             Response response = responses.poll();
             if (response == null || !response.method.equals(exchange.getRequestMethod())
@@ -95,12 +95,23 @@ public final class StripeHttpFixture implements AutoCloseable {
         }
     }
 
+    private static Map<String,String> query(String raw) {
+        var result = new LinkedHashMap<String,String>();
+        if (raw != null && !raw.isEmpty()) for (String pair : raw.split("&")) {
+            var parts = pair.split("=", 2);
+            result.put(decode(parts[0]), parts.length == 2 ? decode(parts[1]) : "");
+        }
+        return Map.copyOf(result);
+    }
     private static String decode(String value) { return URLDecoder.decode(value, StandardCharsets.UTF_8); }
 
     @Override public void close() { server.stop(0); executor.shutdownNow(); }
 
     public record Call(String method, String path, Map<String, List<String>> headers,
-                       Map<String, String> form) {
+                       Map<String, String> form, Map<String,String> query) {
+        public Call(String method, String path, Map<String,List<String>> headers, Map<String,String> form) {
+            this(method,path,headers,form,Map.of());
+        }
         public String header(String name) {
             return headers.entrySet().stream().filter(entry -> entry.getKey().equalsIgnoreCase(name))
                 .flatMap(entry -> entry.getValue().stream()).findFirst().orElse(null);

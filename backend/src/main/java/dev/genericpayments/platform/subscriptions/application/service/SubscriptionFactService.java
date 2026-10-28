@@ -72,7 +72,14 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
             if(fence.lease()!=null)sweep.requireCurrent(fence.lease(),clock.instant());
         }
         var snapshot=command.snapshot();var now=clock.instant();
-        boolean current=observations.acceptRevision(original,snapshot.providerRevision());
+        boolean unversioned=account.provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE;
+        if(unversioned){
+            var fence=command.fence();
+            if(snapshot.providerRevision()!=0||fence==null||fence.observationSequence()==null||fence.observationSequence()<0
+                ||(fence.operationId()==null)!=(fence.operationVersion()==null))throw new IllegalStateException("OBSERVATION_STALE");
+            observations.consumeFence(original,fence.observationSequence());
+        }
+        boolean current=unversioned||observations.acceptRevision(original,snapshot.providerRevision());
         if(original.providerReference()!=null&&!original.providerReference().equals(snapshot.subscriptionReference()))throw new IllegalArgumentException("Subscription identity mismatch");
         validateTerms(original,snapshot.billingPrice());
         objects.bind(account.provider(),original,SubscriptionObjectPort.Kind.SUBSCRIPTION,snapshot.subscriptionReference(),null,now);

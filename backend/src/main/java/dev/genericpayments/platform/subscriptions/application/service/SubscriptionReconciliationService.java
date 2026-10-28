@@ -15,12 +15,12 @@ public class SubscriptionReconciliationService implements ReconcileSubscriptionU
     private final LoadPaymentAccountPort accounts;private final SubscriptionProviderRegistry providers;
     private final ApplySubscriptionSnapshotUseCase facts;private final SubscriptionReadPreparation reads;
     private final SubscriptionSweepPort sweep;private final SubscriptionTelemetryPort telemetry;private final Clock clock;
-    private final SubscriptionWorkerConfigurationPort properties;
+    private final SubscriptionWorkerConfigurationPort properties;private final SubscriptionObservationPort observations;
     public SubscriptionReconciliationService(SubscriptionStore subscriptions,SubscriptionOperationStore operations,SubscriptionTransactionPort tx,
         SubscriptionAuthorityPort authority,LoadPaymentAccountPort accounts,SubscriptionProviderRegistry providers,ApplySubscriptionSnapshotUseCase facts,
         SubscriptionReadPreparation reads,SubscriptionSweepPort sweep,SubscriptionTelemetryPort telemetry,Clock clock,
-        SubscriptionWorkerConfigurationPort properties){
-        this.subscriptions=subscriptions;this.operations=operations;this.tx=tx;this.authority=authority;this.accounts=accounts;this.providers=providers;this.facts=facts;this.reads=reads;this.sweep=sweep;this.telemetry=telemetry;this.clock=clock;this.properties=properties;
+        SubscriptionWorkerConfigurationPort properties,SubscriptionObservationPort observations){
+        this.subscriptions=subscriptions;this.operations=operations;this.tx=tx;this.authority=authority;this.accounts=accounts;this.providers=providers;this.facts=facts;this.reads=reads;this.sweep=sweep;this.telemetry=telemetry;this.clock=clock;this.properties=properties;this.observations=observations;
     }
     public SubscriptionOperationResult reconcile(Command c){
         outside();var context=Objects.requireNonNull(c.context());
@@ -44,10 +44,11 @@ public class SubscriptionReconciliationService implements ReconcileSubscriptionU
         var original=reads.financial(s);
         if(original!=null&&original.status()==SubscriptionOperation.Status.UNKNOWN)telemetry.observeUnknownAge(Duration.between(original.createdAt(),clock.instant()));
         var account=accounts.findById(s.paymentAccountId()).orElseThrow();
+        Long sequence=account.provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE?observations.captureFence(s):null;
         var snapshot=providers.forAccount(account).retrieve(new Lookup(account,s.id(),s.providerReference(),original==null?null:original.providerOperationKey()));
         tx.required(()->{
             facts.apply(new ApplySubscriptionSnapshotUseCase.Command(account,s.id(),snapshot,SubscriptionEvent.Source.RECONCILIATION,"reconcile:"+UUID.randomUUID(),"subscription-reconcile",
-                new ApplySubscriptionSnapshotUseCase.Fence(s.revision(),original==null?null:original.id(),original==null?null:original.version(),claim,context)));
+                new ApplySubscriptionSnapshotUseCase.Fence(s.revision(),original==null?null:original.id(),original==null?null:original.version(),claim,context,sequence)));
             var after=subscriptions.find(s.siteId(),s.id()).orElseThrow();
             boolean unresolved=operations.hasUnresolved(s.siteId(),s.id());
             if(claim!=null){var advanced=sweep.advanceRevision(claim,after.revision(),clock.instant());sweep.finish(advanced,clock.instant().plus(unresolved?properties.backoff(sweep.attempts(claim)):properties.delay()),!unresolved);}
