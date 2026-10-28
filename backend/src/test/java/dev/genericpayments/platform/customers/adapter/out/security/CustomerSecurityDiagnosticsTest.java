@@ -11,6 +11,8 @@ import dev.genericpayments.platform.customers.application.port.out.IdentityProvi
 import dev.genericpayments.platform.customers.domain.JwksSource;
 import java.time.*;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.*;
@@ -28,7 +30,7 @@ class CustomerSecurityDiagnosticsTest {
     }
     @Test void errorsAndTraceLoggingNeverContainCredentialsPiiKeysOrPayloads() throws Exception {
         var logger=(Logger)LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME); Level before=logger.getLevel();
-        var appender=new ListAppender<ILoggingEvent>(); appender.start(); logger.addAppender(appender); logger.setLevel(Level.TRACE);
+        var appender=captureAppender(); appender.start(); logger.addAppender(appender); logger.setLevel(Level.TRACE);
         var payload=jwks(RSA.toPublicJWK()); var c=claims(); c.put("email","profile@example.test"); c.put("email_verified",true);
         var raw=token(RSA,c); var bad=token(rsa("rsa-key"),c);
         try {
@@ -39,10 +41,38 @@ class CustomerSecurityDiagnosticsTest {
             assertThat(verifier.verifyOidc(cfg,raw,"fixture-nonce",NOW).toString()).isEqualTo("VerifiedIdentityEvidence[redacted]");
             NimbusIdentityTokenVerifierAdapterTest.assertSafeFailure(()->verifier.verifyOidc(cfg,bad,"fixture-nonce",NOW));
             NimbusIdentityTokenVerifierAdapterTest.assertSafeFailure(()->SafeJwksClient.validateStatic(new PublicJwkSet(jwks(RSA))));
-            String logs=appender.list.stream().map(event->event.getFormattedMessage()+render(event.getThrowableProxy())).reduce("",String::concat);
+            String logs=capturedMessages(appender).reduce("",String::concat);
             for(var sensitive:List.of(raw,bad,"fixture-subject","profile@example.test",payload,RSA.getPrivateExponent().toString(),HmacSha256KeyedDigestAdapterTest.KEY))
                 assertThat(logs.contains(sensitive)).isFalse();
         } finally { logger.setLevel(before); logger.detachAppender(appender); appender.stop(); }
+    }
+    @Test void logCaptureRetainsItsSnapshotWhenAnotherThreadAppends() throws Exception {
+        var context=new LoggerContext();
+        var logger=context.getLogger("diagnostics-capture-regression");
+        var appender=captureAppender(); appender.setContext(context); appender.start(); logger.addAppender(appender);
+        logger.setLevel(Level.TRACE);
+        try(var pool=Executors.newSingleThreadExecutor()) {
+            logger.info("before-capture-one"); logger.info("before-capture-two");
+            try(var capture=capturedMessages(appender)) {
+                var messages=capture.iterator();
+                assertThat(messages.next()).isEqualTo("before-capture-one");
+                // Complete the append after traversal starts and before it resumes: no timing race.
+                pool.submit(()->logger.info("during-capture")).get(5,TimeUnit.SECONDS);
+                var remaining=new ArrayList<String>(); messages.forEachRemaining(remaining::add);
+                assertThat(remaining).containsExactly("before-capture-two");
+            }
+            try(var nextCapture=capturedMessages(appender)) {
+                assertThat(nextCapture.toList()).containsExactly("before-capture-one","before-capture-two","during-capture");
+            }
+        } finally { logger.detachAppender(appender); appender.stop(); context.stop(); }
+    }
+    private static ListAppender<ILoggingEvent> captureAppender() {
+        var appender=new ListAppender<ILoggingEvent>();
+        appender.list=new CopyOnWriteArrayList<>();
+        return appender;
+    }
+    private static Stream<String> capturedMessages(ListAppender<ILoggingEvent> appender) {
+        return appender.list.stream().map(event->event.getFormattedMessage()+render(event.getThrowableProxy()));
     }
     private static String render(IThrowableProxy failure) { return failure==null?"":ThrowableProxyUtil.asString(failure); }
 }

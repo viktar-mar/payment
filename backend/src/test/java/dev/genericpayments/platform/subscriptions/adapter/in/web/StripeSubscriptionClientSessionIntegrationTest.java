@@ -87,7 +87,8 @@ class StripeSubscriptionClientSessionIntegrationTest extends SubscriptionApiFixt
  @Test void openApiDocumentsOnlyCustomerSessionRouteAndActualStatus()throws Exception{
   var json=admin.mvc.perform(get("/v3/api-docs")).andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
   var paths=JsonPath.<Map<String,Object>>read(json,"$.paths");var route="/api/v1/customer/subscriptions/{id}/operations/{operationId}/client-session";
-  assertThat(paths).containsKey(route);assertThat(paths.keySet()).noneMatch(p->p.endsWith("/client-session")&&!p.contains("/customer/"));
+  assertThat(paths).containsKey(route);
+  assertThat(paths.keySet()).filteredOn(p->p.contains("/subscriptions/")&&p.endsWith("/client-session")).containsExactly(route);
   var response=JsonPath.<Map<String,Object>>read(json,"$.paths['"+route+"'].post.responses");assertThat(response).containsKey("200").doesNotContainKey("202");
  }
 }
