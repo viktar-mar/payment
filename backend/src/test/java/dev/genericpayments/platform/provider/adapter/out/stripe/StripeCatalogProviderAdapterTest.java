@@ -159,7 +159,7 @@ class StripeCatalogProviderAdapterTest extends CheckoutTestFixture {
         assertThat(count("provider_price_mappings")).isZero();
     }
 
-    @Test void publishesRecurringTermsWithoutEnablingStripeSubscriptionCommands() {
+    @Test void publishesRecurringTermsWithStripeRoutingWithoutCreatingSubscription() {
         var draft = Price.draft(new PriceId(UUID.randomUUID()), site, product, PriceKey.of("annual"), 1,
             PriceType.SUBSCRIPTION, Money.of(12345, "EUR"), BillingInterval.YEAR, 14,
             TrialPaymentMethodPolicy.REQUIRED_BEFORE_TRIAL, TaxMode.INCLUSIVE, null, INITIAL_TIME);
@@ -173,7 +173,11 @@ class StripeCatalogProviderAdapterTest extends CheckoutTestFixture {
                 .containsEntry("recurring[trial_period_days]", "14"));
         var stripeAccount = PaymentAccount.create(account.id(), "test-account", PaymentProviderType.STRIPE,
             PaymentAccountMode.SANDBOX, "acct_expected", "stripe-sandbox-default");
-        assertThatThrownBy(() -> subscriptions.forAccount(stripeAccount)).isInstanceOf(IllegalArgumentException.class);
+        assertThat(subscriptions.forAccount(stripeAccount))
+            .isInstanceOf(dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeSubscriptionProviderAdapter.class);
+        assertThat(http.calls()).noneMatch(c -> c.method().equals("POST") && c.path().startsWith("/v1/subscriptions"));
+        assertThat(count("subscriptions")).isZero();
+        assertThat(jdbc.queryForObject("select count(*) from provider_operations where kind='SUBSCRIPTION_CREATE'", Integer.class)).isZero();
     }
 
     @Test void accountSpecificMappingCannotBeTakenFromAnotherAccount() {
