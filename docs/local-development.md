@@ -17,8 +17,14 @@ Final offline checks are backend `./mvnw verify`; SDK `pnpm test --run`, `pnpm t
 Default browser acceptance needs its own Fake backend/PostgreSQL/Mailpit/Admin/demo and explicit
 Stage 4 test clock inputs described below. A listening localhost port is not evidence of ownership.
 
-Real Sandbox acceptance is **PENDING until actually executed**. Key readiness alone does not authorize
-financial operations. Both commands require explicit local process flags
+The [dated 2026-10-28 acceptance matrix](stage-5a-acceptance.md) records Stage 5A as
+**technically ACCEPTED** on executable source `9143e01937b9d0e06d2e2809eec88cf0c965ea3a`,
+combining separate bound Sandbox runs and offline/Fake regression. Independent documentation and
+risk-based branch reviews are complete with no actionable/material findings and the limits stated
+in the matrix. Final staged audit, commit/push and external exact-documentation-commit CI
+verification remain the publication gate at this write-time. The matrix preserves older
+unknown outcomes and narrow report limits. Key readiness and this guide authorize no new financial
+operation. Any future real run requires fresh explicit scope and local process flags
 `PAYMENT_STRIPE_SANDBOX_ENABLED=true` and `PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS=true`.
 The tooling never reads a Stripe env file, calls Stripe directly, installs/logs into the CLI, starts a
 listener, creates catalog/Account/Site fixtures, or changes an account's API version. Server keys stay
@@ -163,12 +169,15 @@ recorded services/listener. No Sandbox result establishes live-payment readiness
 ### Remaining-only 5A Sandbox mode
 
 `playwright.stripe-sandbox-remaining.config.ts` selects one serial owned run for the
-remaining lifecycle proofs. This implementation was prepared and tested locally with
-synthetic boundaries and discovery only; no Sandbox run was performed. Publication,
-green hosted CI for the exact reviewed committed source, fresh credential-free
-source/daemon/port admission, and fresh explicit runtime authorization are still
-required before the future command below. Admission is not a port reservation or
-financial authorization. Use a fresh run UUID, empty new owned run state and newly
+remaining lifecycle proofs. Its separately authorized run on 2026-10-28 passed on
+source `9143e01937b9d0e06d2e2809eec88cf0c965ea3a`: new payment and EUR7+EUR13
+refunds, anonymous and EMAIL_OTP donations, missed-webhook reconciliation and confirmed
+owned cleanup. The [canonical matrix](stage-5a-acceptance.md#bound-sandbox-evidence-and-current-source-ci--2026-10-28)
+records the exact run and report limits. No new run is required for the current closeout.
+For any future use of the command below, green hosted CI for its exact reviewed source,
+fresh credential-free source/daemon/port admission and fresh explicit runtime
+authorization remain required. Admission is not a port reservation or financial
+authorization. Use a fresh run UUID, empty new owned run state and newly
 provisioned Site/catalog/campaign; this mode accepts no old-payment target or imported
 historical evidence. Both branches of the older Sandbox entry reject this selector.
 
@@ -220,8 +229,11 @@ rotate keys, recreate fixtures, delete evidence or apply this workflow to the re
 payment. A successful narrow resource report is `mode: 'REMAINING_5A'` with
 `remainingAccepted: true` only after every proof and confirmed cleanup; `accepted: false`
 and `proof.cards: false` always remain. `proof.payment` records only the new success
-payment. This supplies no new decline/3DS proof and cannot claim full 5A acceptance;
-Stage 5A remains **NOT_ACCEPTED** until its separate acceptance gates are satisfied.
+payment. This supplies no new decline/3DS proof and cannot alone claim full 5A acceptance.
+The [2026-10-28 matrix](stage-5a-acceptance.md) combines this narrow result with earlier
+bound card/3DS and offline regression evidence; independent reviews are complete, and
+its publication gate remains separate. The old EUR13/local-state issue and prior anonymous DISPATCHING donation remain
+unresolved and excluded from replay, import, rekey or state reset.
 
 ## Stripe Sandbox credential binding (Stage 5A)
 
@@ -549,8 +561,9 @@ rotate a conflicting webhook secret or retry financial work. Stop the exact CLI 
 first, then call bootstrap `stop({signal, deadline})`. Cleanup stops only recorded,
 freshly verified containers and preserves containers, volumes, network and private audit
 files. It never uses Compose down, prune, default Docker configuration or global stops.
-Synthetic tests establish local behavior only; real Stage 5A acceptance remains pending
-until the root operator completes the separately approved runtime checks.
+Synthetic tests establish local behavior only. The [dated acceptance matrix](stage-5a-acceptance.md)
+records the completed separately authorized runtime evidence and current technical acceptance;
+that decision grants no new runtime or financial authority.
 
 An operation failure keeps bootstrap resources and the durable ledger `PENDING` even
 when `stop` subsequently returns `true`. That status retains the failure latch and
@@ -1164,7 +1177,10 @@ comes from the same captured charge's 3DS result `authenticated`, flow `challeng
 and a valid `2.x.x` version, read through the existing exact Intent/Event inspection.
 Missing, malformed, frictionless or failed 3DS evidence is unverified and cannot be
 promoted to success. Browser success alone never supplies any of these proofs.
-Stage 5A remains **NOT_ACCEPTED**; this mode does not complete its wider lifecycle.
+This mode alone does not complete the wider 5A lifecycle. The separately successful
+manual 3DS run and the current aggregated technical acceptance, including completed
+independent reviews, the separate publication gate and `browser_closure=NOT_OWNED`, are recorded in the
+[dated acceptance matrix](stage-5a-acceptance.md).
 
 The controller closes/drains its gateway and provisioner, stops its listener/children,
 then stops only freshly verified owned runtime containers. Containers, networks,
@@ -1408,8 +1424,8 @@ For a future separately authorized manual-payment invocation, construction or pr
 
 Historical PROVISION/UNKNOWN does not establish successful credentials or any precise failure boundary: the earlier provisioner reset its marker to UNKNOWN after credentials, and UNKNOWN is also the unbranded/controller fallback. The offline marker correction neither reclassifies historical evidence nor proves that it explains a historical runtime failure.
 
-The later separately authorized attempt `75456a71-342e-4549-a5b2-b7dfd605ade3` on source `398ee98fbb70c86727d3301da8e38cc4690518ea` exited 1/PENDING at PROVISION with only FIXTURE_SETUP classified. No gateway was emitted; confirmation and every financial/3DS proof were false, while the three controller closure flags were true. A bounded ledger projection found admin-session, account, site-and-email-provider and return-url ACKNOWLEDGED, with no persisted product DISPATCHING intent. This narrows the unclassified range to the post-PUT policy GET, existing policy validation or next product durable dispatch; it does not identify the cause. Independent inspection of actual backend record serialization with cached Jackson 3.1.5 and SNAKE_CASE matched the expected origin/return_url/version ordering, so ordering is not supported as that attempt's cause. The three new markers close this reporting gap only; no equality predicate, request, timeout or retry changed. The historical report stays unchanged and Stage 5A remains NOT_ACCEPTED.
+The later separately authorized attempt `75456a71-342e-4549-a5b2-b7dfd605ade3` on source `398ee98fbb70c86727d3301da8e38cc4690518ea` exited 1/PENDING at PROVISION with only FIXTURE_SETUP classified. No gateway was emitted; confirmation and every financial/3DS proof were false, while the three controller closure flags were true. A bounded ledger projection found admin-session, account, site-and-email-provider and return-url ACKNOWLEDGED, with no persisted product DISPATCHING intent. This narrows the unclassified range to the post-PUT policy GET, existing policy validation or next product durable dispatch; it does not identify the cause. Independent inspection of actual backend record serialization with cached Jackson 3.1.5 and SNAKE_CASE matched the expected origin/return_url/version ordering, so ordering is not supported as that attempt's cause. The three new markers close this reporting gap only; no equality predicate, request, timeout or retry changed. The historical report stays unchanged. At that checkpoint Stage 5A was NOT_ACCEPTED; the [dated acceptance matrix](stage-5a-acceptance.md) records the later evidence and current gates.
 
 The controller also retains the existing once-only bootstrap stop's directly observed literal-true settlement time. If its 30-second close slice expires but that same stop fulfills true strictly before the original cleanup ceiling while the existing final work drain runs, the final immutable report can record `runtime_closed=true`. False, rejection, unsettled work and true observed at or after the ceiling cannot supply that proof; fulfillment after the report never changes it. The failure remains latched as PENDING/exit 1, with no new stop, wait, retry or authority extension. Gateway and listener closure rules are unchanged. Persisted `STOPPED` or exited-container metadata alone is insufficient: bootstrap lock closure and its final deadline check follow the manifest write. This source correction does not rewrite historical reports or prove their runtime cause.
 
-Diagnostic output gets at most one second clipped to the original cleanup ceiling; failure or stall leaves exit 1/PENDING and cannot postpone independent cleanup or authorize another attempt. Report version/shape, source/account/API/ownership/signed-journal/callback/capture gates, one Pay/permit, ten-second child/HTTP, 45-minute authority, 45-second/30-probe proof, five-minute page and original plus two-minute cleanup limits remain unchanged. This offline correction ran no runtime/provider operation and authorizes none; historical reports remain intact and Stage 5A remains NOT_ACCEPTED.
+Diagnostic output gets at most one second clipped to the original cleanup ceiling; failure or stall leaves exit 1/PENDING and cannot postpone independent cleanup or authorize another attempt. Report version/shape, source/account/API/ownership/signed-journal/callback/capture gates, one Pay/permit, ten-second child/HTTP, 45-minute authority, 45-second/30-probe proof, five-minute page and original plus two-minute cleanup limits remain unchanged. This offline correction ran no runtime/provider operation and authorizes none; historical reports remain intact. Stage 5A was NOT_ACCEPTED at that checkpoint; see the [dated acceptance matrix](stage-5a-acceptance.md) for the current evidence decision and gates.
