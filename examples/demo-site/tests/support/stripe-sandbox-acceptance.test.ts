@@ -145,7 +145,8 @@ test('expired donation response consumes no body or ACK',async()=>{
 function admissionClock() {
   const native=globalThis.setTimeout,alarms:{fire:()=>void;handle:ReturnType<typeof setTimeout>}[]=[];
   const timer=mock.method(globalThis,'setTimeout',(fn:(...args:unknown[])=>void,delay?:number,...args:unknown[])=>{
-    if(delay!==15000)return native(fn,delay,...args);
+    // Deadline conversion may consume time before the timer is registered.
+    if(typeof delay!=='number'||!Number.isFinite(delay)||delay<=0||delay>15000)return native(fn,delay,...args);
     const handle=native(()=>{},1000000);alarms.push({fire:()=>fn(...args),handle});return handle;
   });
   return {count:()=>alarms.length,fire(index:number){const alarm=alarms[index];assert.ok(alarm);clearTimeout(alarm.handle);alarm.fire();},
@@ -290,15 +291,18 @@ test('late donation context with rejecting close remains a fixed failed owner',a
   }finally{clock.close();}
 });
 test('late donation context with pending close ends at the independent cleanup bound',async()=>{
-  const clock=admissionClock();let create!:(context:unknown)=>void,closes=0;
+  // Let time pass between creating the cleanup deadline and scheduling its timer.
+  let now=Date.now();const wallClock=mock.method(Date,'now',()=>now++);
+  const clock=admissionClock();let create!:(context:unknown)=>void,finishClose!:()=>void,closes=0,settled=false;
+  const closing=new Promise<void>(resolve=>{finishClose=resolve;});
   const browser={newContext:()=>new Promise(resolve=>{create=resolve;})} as unknown as Browser;
-  const running=runOwnedSandboxDonations(browser,{} as SandboxAcceptanceExtras,binding,limits());running.catch(()=>{});
+  const running=runOwnedSandboxDonations(browser,{} as SandboxAcceptanceExtras,binding,limits()).finally(()=>{settled=true;});running.catch(()=>{});
   try {
     await new Promise(resolve=>setImmediate(resolve));clock.fire(0);await new Promise(resolve=>setImmediate(resolve));
-    create({close:async()=>{closes++;await new Promise(()=>{});}});await new Promise(resolve=>setImmediate(resolve));
-    const cleanupAlarms=clock.count();if(cleanupAlarms>1)clock.fire(1);
-    await assert.rejects(running,trustedFailure);assert.equal(cleanupAlarms,2);assert.equal(closes,1);
-  }finally{clock.close();}
+    create({close:async()=>{closes++;await closing;}});await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(settled,false);assert.equal(closes,1);assert.equal(clock.count(),2);
+    clock.fire(1);await assert.rejects(running,trustedFailure);assert.equal(closes,1);
+  }finally{finishClose();await running.catch(()=>{});clock.close();wallClock.mock.restore();}
 });
 test('creation beyond cleanup bound stays abandoned and its eventual context still closes once',async()=>{
   const clock=admissionClock();let create!:(context:unknown)=>void,closes=0;
