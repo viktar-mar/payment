@@ -29,6 +29,8 @@ public interface ProviderOperationStore {
     default ProviderOperation lockResumeReceipt(ProviderOperation expected){throw new UnsupportedOperationException();}
     /** Exact CHANGE/Schedule receipt row lock, before Account/lifecycle locks. */
     default ProviderOperation lockPlanReceipt(ProviderOperation expected){throw new UnsupportedOperationException();}
+    /** Exact CANCEL/WITHDRAW/RECOVER receipt row lock, before Account/lifecycle locks. */
+    default ProviderOperation lockSubscriptionMutationReceipt(ProviderOperation expected){throw new UnsupportedOperationException();}
     default ProviderOperation acknowledgeInTransaction(UUID id,String owner,long version,String reference){throw new UnsupportedOperationException();}
     ProviderOperation unknown(UUID id, String owner, long expectedVersion);
 

@@ -38,6 +38,15 @@ class StripeSubscriptionClientAuthorityTest {
  @Test void expiredConsumedGrantCannotAuthorizeBrowserAfterReceipt(){var r=state();consume();securityNow=f.now.plusSeconds(601);assertThat(phases.browserConfirmationAllowed(f.command,r)).isFalse();}
  @Test void unconsumedGrantNeverAuthorizesBrowser(){assertThat(phases.browserConfirmationAllowed(f.command,state())).isFalse();}
  @Test void currentConsumedReceiptCanAuthorizeWinningInvocation(){var r=state();consume();assertThat(phases.browserConfirmationAllowed(f.command,r)).isTrue();}
+ @Test void failedStripeOperationCannotBeReopenedByALateConsumedReceipt(){
+  var r=state();consume();fail();when(operations.save(any(),anyLong())).thenAnswer(i->i.getArgument(0));
+  assertThat(phases.reply(f.context,r,new Reply(Outcome.ACCEPTED,f.s.providerReference(),null)).status()).isEqualTo(SubscriptionOperation.Status.FAILED);verify(operations,never()).save(any(),anyLong());
+ }
+ @Test void fakeFailedCreateKeepsItsExistingContinuationBehavior(){
+  var r=state();fail();var fake=PaymentAccount.create(f.account.id(),"fake",PaymentProviderType.FAKE,PaymentAccountMode.SANDBOX,"fake-owned","fake-ref");when(accounts.findByIdForUpdate(fake.id())).thenReturn(Optional.of(fake));when(operations.save(any(),anyLong())).thenAnswer(i->i.getArgument(0));
+  assertThat(phases.reply(f.context,r,new Reply(Outcome.ACCEPTED,f.s.providerReference(),null)).status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+ }
+ void fail(){var o=operation;operation=new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),o.subscriptionId(),o.kind(),SubscriptionOperation.Status.FAILED,o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),o.providerReference(),"PROVIDER_DECLINED",o.createdAt(),o.updatedAt(),o.version()+1);}
  void consume(){var g=grant;grant=new SubscriptionClientGrant(g.id(),g.site(),g.customer(),g.account(),g.subscription(),g.operation(),g.keyVersion(),g.binding(),g.tokenDigest(),g.issuedAt(),g.expiresAt(),f.now,null,g.sessionId(),g.origin(),g.clientExpiresAt());}
  SubscriptionClientSession session(){return new SubscriptionClientSession("stripe",SubscriptionClientSession.Flow.PAYMENT,"pk_test_fixture","pi_owned_secret_canary",f.action.secret(),grant.expiresAt());}
 }

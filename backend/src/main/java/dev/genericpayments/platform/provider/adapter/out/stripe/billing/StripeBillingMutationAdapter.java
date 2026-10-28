@@ -18,6 +18,8 @@ import dev.genericpayments.platform.provider.adapter.out.stripe.*;
 import dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore;
+import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionCancellationProofStore;
+import dev.genericpayments.platform.subscriptions.application.service.SubscriptionCancellationTransaction;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.*;
 import dev.genericpayments.platform.subscriptions.domain.*;
 import java.time.*;
@@ -179,6 +181,128 @@ public final class StripeBillingMutationAdapter {
             var response=client.v1().subscriptionSchedules().release(binding.reference(),RequestOptions.builder().setIdempotencyKey(key).build());
             requireReleased(response,q,binding,step,securityClock.instant());proofs.recordRelease(s,o,binding,step,owner);return new Reply(Outcome.ACCEPTED,s.providerReference(),null);
         }catch(StripeException|RuntimeException unknown){steps.unknown(step.id(),owner,step.version());return new Reply(Outcome.UNKNOWN,null,null);}
+    }
+    /** Only explicit original CANCEL/WITHDRAW commands enter here; reads never call this method. */
+    public Reply cancel(Command c,boolean withdraw,ProviderOperationStore steps,
+                        SubscriptionCancellationProofStore cancellations,Clock securityClock){
+        var s=ownership.owned(c.account(),c.operation().subscriptionId());
+        var o=ownership.lookupOperation(new Lookup(c.account(),s.id(),s.providerReference(),c.operation().providerOperationKey()));
+        boolean immediate=!withdraw&&SubscriptionCancellationTransaction.immediate(o);
+        var mode=withdraw?SubscriptionCancellationProofStore.Mode.WITHDRAW:immediate?SubscriptionCancellationProofStore.Mode.IMMEDIATE:SubscriptionCancellationProofStore.Mode.PERIOD_END;
+        String expected=withdraw?"v1.cancel.withdraw.":immediate?"v1.cancel.immediate.none.":"v1.cancel.period_end.";
+        if(!o.equals(c.operation())||o.kind()!=(withdraw?SubscriptionOperation.Kind.WITHDRAW_CANCEL:SubscriptionOperation.Kind.CANCEL)
+            ||!o.fingerprint().startsWith(expected)||!s.billingPrice().equals(c.current())
+            ||!Objects.equals(s.providerReference(),c.providerSubscriptionReference())||c.target()!=null
+            ||c.providerInvoiceReference()!=null||c.providerQuoteReference()!=null||c.startTrial()||c.recurringConsent())throw mismatch();
+        var boundary=SubscriptionCancellationTransaction.boundary(o).orElse(null);
+        if(!immediate&&(boundary==null||boundary.getNano()!=0))throw mismatch();
+        var customer=bindings.findCustomer(c.account().id(),s.siteId(),s.customerId()).orElseThrow(StripeBillingOwnership::mismatch);
+        requireBinding(c.account(),s,customer);
+        var saved=cancellations.receipt(c.account().id(),o.id()).orElse(null);
+        if(saved!=null){requireCancellationReceipt(c.account(),s,o,saved,steps,customer);return new Reply(Outcome.ACCEPTED,s.providerReference(),null);}
+        var prior=withdraw?cancellations.activeSchedule(c.account().id(),s.id(),boundary).orElseThrow(StripeBillingOwnership::mismatch):null;
+        if(prior!=null&&(prior.mode()!=SubscriptionCancellationProofStore.Mode.PERIOD_END||!prior.account().equals(c.account().id())
+            ||!prior.subscription().equals(s.id())||!prior.reference().equals(s.providerReference())||!boundary.equals(prior.boundary())))throw mismatch();
+        String fp=cancellationFingerprint(c.account(),s,o,customer,mode,boundary,prior==null?null:prior.operation());
+        if(!Set.of(SubscriptionOperation.Status.PROCESSING,SubscriptionOperation.Status.UNKNOWN).contains(o.status())
+            ||s.revision()!=o.expectedRevision()||!s.nonTerminal()||s.pendingChange()!=null||!immediate&&!clock.instant().isBefore(boundary))throw mismatch();
+        if(withdraw){SubscriptionCancellationRules.requireWithdrawable(s,clock.instant());if(!boundary.equals(s.cancellation().effectiveAt()))throw mismatch();}
+        else if(!immediate&&(s.cancellation()!=null||!boundary.equals(SubscriptionCancellationRules.liveBoundary(s,clock.instant()))))throw mismatch();
+        var reserved=steps.reserve(c.account(),immediate?ProviderOperation.Kind.SUBSCRIPTION_CANCEL:ProviderOperation.Kind.SUBSCRIPTION_UPDATE,o.id(),o.providerOperationKey(),fp);
+        if(reserved.status()==ProviderOperation.Status.ACKNOWLEDGED)throw mismatch();
+        String owner=UUID.randomUUID().toString();var claim=steps.claim(reserved.id(),owner,securityClock.instant(),Duration.ofSeconds(60));
+        if(claim.isEmpty())return new Reply(Outcome.UNKNOWN,null,null);var step=claim.get();
+        try{
+            verification.verify(c.account());var client=clients.create(credentials.resolve(c.account()));
+            var remoteCustomer=client.v1().customers().retrieve(customer.providerReference());
+            if(!customer.providerReference().equals(remoteCustomer.getId())||!"customer".equals(remoteCustomer.getObject())
+                ||!Boolean.FALSE.equals(remoteCustomer.getLivemode())||Boolean.TRUE.equals(remoteCustomer.getDeleted()))throw mismatch();
+            var remote=client.v1().subscriptions().retrieve(s.providerReference());
+            requireCancellationRemote(remote,s,customer,ownership.price(c.account(),s,s.billingPrice()),boundary);
+            boolean replay=reserved.firstDispatchedAt()!=null;
+            if(immediate){
+                requireSafeImmediateInventory(client,s,customer);
+            }else if(withdraw){
+                if(!Objects.equals(remote.getCancelAt(),boundary.getEpochSecond())&&!(replay&&remote.getCancelAt()==null&&!Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())))throw mismatch();
+            }else if(remote.getCancelAt()!=null&&!(replay&&remote.getCancelAt()==boundary.getEpochSecond())||Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())&&remote.getCancelAt()==null)throw mismatch();
+            cancellations.authorize(s,o);
+            if(!immediate&&!clock.instant().isBefore(boundary))throw mismatch();
+            String key=new ProviderOperationGuard().requireDispatch(step,c.account(),fp,securityClock.instant());
+            if(immediate){
+                var response=client.v1().subscriptions().cancel(s.providerReference(),com.stripe.param.SubscriptionCancelParams.builder().setInvoiceNow(false).setProrate(false).build(),RequestOptions.builder().setIdempotencyKey(key).build());
+                requireCurrentRemote(response,s,customer,ownership.price(c.account(),s,s.billingPrice()));
+                var received=securityClock.instant().truncatedTo(ChronoUnit.MICROS);
+                if(!s.providerReference().equals(response.getId())||!"canceled".equals(response.getStatus())||response.getTrialStart()!=null||response.getTrialEnd()!=null
+                    ||response.getSchedule()!=null||response.getPendingUpdate()!=null||!StripeBillingOwnership.inWindow(response.getCanceledAt(),step)
+                    ||response.getEndedAt()==null||response.getEndedAt()<step.firstDispatchedAt().getEpochSecond()||response.getEndedAt()>received.getEpochSecond())throw mismatch();
+                cancellations.record(s,o,step,owner,mode,null,null,received);
+                return new Reply(Outcome.ACCEPTED,s.providerReference(),null);
+            }
+            var params=SubscriptionUpdateParams.builder().setProrationBehavior(SubscriptionUpdateParams.ProrationBehavior.NONE);
+            if(withdraw)params.setCancelAt(com.stripe.param.common.EmptyParam.EMPTY).setCancelAtPeriodEnd(false);
+            else params.setCancelAt(boundary.getEpochSecond());
+            var response=client.v1().subscriptions().update(s.providerReference(),params.build(),RequestOptions.builder().setIdempotencyKey(key).build());
+            requireCancellationRemote(response,s,customer,ownership.price(c.account(),s,s.billingPrice()),boundary);
+            if(withdraw?(response.getCancelAt()!=null||!Boolean.FALSE.equals(response.getCancelAtPeriodEnd())):!Objects.equals(response.getCancelAt(),boundary.getEpochSecond()))throw mismatch();
+            // Receiving the complete original response before the deadline proves the write finished
+            // before it. Dispatch time or a later status-null read cannot replace this evidence.
+            var received=securityClock.instant().truncatedTo(ChronoUnit.MICROS);if(!received.isBefore(boundary))throw mismatch();
+            var fresh=ownership.lookupOperation(new Lookup(c.account(),s.id(),s.providerReference(),o.providerOperationKey()));if(!fresh.equals(o))throw mismatch();
+            cancellations.record(s,o,step,owner,mode,boundary,prior==null?null:prior.operation(),received);
+            return new Reply(Outcome.ACCEPTED,s.providerReference(),null);
+        }catch(StripeException|RuntimeException uncertain){steps.unknown(step.id(),owner,step.version());return new Reply(Outcome.UNKNOWN,null,null);}
+    }
+    private static void requireCancellationRemote(com.stripe.model.Subscription r,dev.genericpayments.platform.subscriptions.domain.Subscription s,
+        StripeBillingBindingPort.CustomerBinding customer,StripeBillingSnapshotMapper.PublishedPrice price,Instant boundary){
+        requireCurrentRemote(r,s,customer,price);
+        if(!s.providerReference().equals(r.getId())||Set.of("canceled","incomplete_expired").contains(r.getStatus())
+            ||r.getSchedule()!=null||r.getPendingUpdate()!=null||!itemPeriod(r).equals(s.currentPeriod()))throw mismatch();
+        if(boundary==null){if(s.trial()!=null||r.getTrialStart()!=null||r.getTrialEnd()!=null)throw mismatch();}
+        else if(s.trial()!=null){
+            if((r.getTrialStart()!=null||r.getTrialEnd()!=null)&&(!Objects.equals(r.getTrialStart(),s.trial().start().getEpochSecond())||!Objects.equals(r.getTrialEnd(),s.trial().end().getEpochSecond())))throw mismatch();
+            if(!boundary.equals(s.trial().end())&&s.billingStatus()==dev.genericpayments.platform.subscriptions.domain.Subscription.Status.TRIALING)throw mismatch();
+        }else if(r.getTrialStart()!=null||r.getTrialEnd()!=null)throw mismatch();
+    }
+    /** DELETE can disable collection on other customer invoices; a Sub-only inventory is insufficient. */
+    private static void requireSafeImmediateInventory(StripeClient client,dev.genericpayments.platform.subscriptions.domain.Subscription s,
+        StripeBillingBindingPort.CustomerBinding customer)throws StripeException{
+        var pending=client.v1().invoiceItems().list(com.stripe.param.InvoiceItemListParams.builder().setCustomer(customer.providerReference()).setPending(true).setLimit(10L).build());
+        if(pending==null||!"list".equals(pending.getObject())||!Boolean.FALSE.equals(pending.getHasMore())||pending.getData()==null||!pending.getData().isEmpty())throw mismatch();
+        String after=null;var seen=new HashSet<String>();
+        for(int page=0;page<10;page++){
+            var values=client.v1().invoices().list(com.stripe.param.InvoiceListParams.builder().setCustomer(customer.providerReference()).setLimit(10L).setStartingAfter(after).build());
+            if(values==null||!"list".equals(values.getObject())||values.getHasMore()==null||values.getData()==null)throw mismatch();
+            for(var invoice:values.getData()){
+                if(invoice.getId()==null||!invoice.getId().matches("in_[A-Za-z0-9]{1,252}")||!seen.add(invoice.getId())||!"invoice".equals(invoice.getObject())
+                    ||!Boolean.FALSE.equals(invoice.getLivemode())||!customer.providerReference().equals(invoice.getCustomer())||invoice.getStatus()==null)throw mismatch();
+                if(Set.of("paid","void").contains(invoice.getStatus()))continue;
+                if(!Set.of("open","draft","uncollectible").contains(invoice.getStatus())||invoice.getParent()==null||invoice.getParent().getSubscriptionDetails()==null
+                    ||!s.providerReference().equals(invoice.getParent().getSubscriptionDetails().getSubscription())||!noAdjustments(invoice)
+                    ||!Objects.equals(invoice.getAmountDue(),s.billingPrice().regularAmount().minorUnits())||!s.billingPrice().regularAmount().currency().equalsIgnoreCase(invoice.getCurrency()))throw mismatch();
+            }
+            if(!values.getHasMore())return;
+            if(values.getData().isEmpty())throw mismatch();after=values.getData().getLast().getId();
+        }
+        throw mismatch();
+    }
+    public static String cancellationFingerprint(dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount a,
+        dev.genericpayments.platform.subscriptions.domain.Subscription s,SubscriptionOperation o,StripeBillingBindingPort.CustomerBinding customer,
+        SubscriptionCancellationProofStore.Mode mode,Instant boundary,UUID prior){
+        return StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,a,"CANCELLATION_V1",o.id().toString(),o.providerOperationKey(),o.fingerprint(),
+            Long.toString(o.expectedRevision()),Long.toString(o.policyVersion()),s.id().toString(),s.providerReference(),customer.providerReference(),
+            mode.name(),Objects.toString(boundary,null),Objects.toString(prior,null),"proration:none");
+    }
+    static void requireCancellationReceipt(dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount a,
+        dev.genericpayments.platform.subscriptions.domain.Subscription s,SubscriptionOperation o,SubscriptionCancellationProofStore.Receipt receipt,
+        ProviderOperationStore steps,StripeBillingBindingPort.CustomerBinding customer){
+        var step=steps.findById(receipt.step()).orElseThrow(StripeBillingOwnership::mismatch);
+        if(!receipt.operation().equals(o.id())||!receipt.subscription().equals(s.id())||!receipt.account().equals(a.id())||!receipt.reference().equals(s.providerReference())
+            ||step.kind()!=(receipt.mode()==SubscriptionCancellationProofStore.Mode.IMMEDIATE?ProviderOperation.Kind.SUBSCRIPTION_CANCEL:ProviderOperation.Kind.SUBSCRIPTION_UPDATE)||step.status()!=ProviderOperation.Status.ACKNOWLEDGED||!step.resourceId().equals(o.id())
+            ||!step.accountId().equals(a.id())||!step.externalAccountId().equals(a.externalAccountId())||!step.credentialsRef().equals(a.credentialsRef())
+            ||!step.operationKey().equals(o.providerOperationKey())||!step.providerReference().equals(s.providerReference())
+            ||receipt.acknowledgedAt()==null||step.firstDispatchedAt()==null||step.retryBefore()==null||receipt.acknowledgedAt().isBefore(step.firstDispatchedAt())||!receipt.acknowledgedAt().isBefore(step.retryBefore())
+            ||!Objects.equals(receipt.boundary(),SubscriptionCancellationTransaction.boundary(o).orElse(null))||receipt.mode()!=SubscriptionCancellationProofStore.Mode.IMMEDIATE&&!receipt.acknowledgedAt().isBefore(receipt.boundary())
+            ||!step.fingerprint().equals(cancellationFingerprint(a,s,o,customer,receipt.mode(),receipt.boundary(),receipt.priorOperation())))throw mismatch();
     }
     private void readScheduleSubscription(Command c,dev.genericpayments.platform.subscriptions.domain.Subscription s,Quote q,StripeClient client,String allowedSchedule)throws StripeException{
         readScheduleSubscription(c,s,q,client,allowedSchedule,false);

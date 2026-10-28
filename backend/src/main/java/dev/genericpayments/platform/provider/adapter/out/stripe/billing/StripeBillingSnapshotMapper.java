@@ -23,6 +23,7 @@ import java.util.*;
  * Creation/Setup/CHANGE proof is deliberately not inferred from status or metadata. */
 public final class StripeBillingSnapshotMapper {
     private StripeBillingSnapshotMapper() {}
+    private static final com.fasterxml.jackson.databind.ObjectMapper NATIVE_JSON=new com.fasterxml.jackson.databind.ObjectMapper().enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
     public record PublishedPrice(SubscriptionPriceTerms terms,String providerPriceReference,String providerProductReference) {}
     public record TrialContext(SubscriptionBillingProofStore.Trial request,dev.genericpayments.platform.provider.application.model.ProviderOperation step,PublishedPrice original,SubscriptionBillingProofStore.Setup requiredSetup){}
     public record Ownership(PaymentAccount account,Subscription subscription,CustomerBinding customer,List<PublishedPrice> prices,TrialContext trial,SubscriptionBillingProofStore proofs,List<dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.Proration> prorations,List<dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.ScheduleProof> schedules) {
@@ -78,13 +79,21 @@ public final class StripeBillingSnapshotMapper {
                 StripeBillingOwnership.requireCurrentRemote(r.remote,proof.subscription(),proof.customer(),proof.price());
                 require(Set.of("active","paused","incomplete","past_due").contains(r.remote.getStatus()));
                 selected=snapshot.invoices().stream().filter(i->i.reference().equals(resume.result().invoice())&&i.kind()==BillingRecord.Kind.RENEWAL&&i.period().equals(resume.result().period())).toList();
+            }else if(proof instanceof StripeBillingOwnership.OriginalRecovery recovery){
+                StripeBillingOwnership.requireCurrentRemote(r.remote,proof.subscription(),proof.customer(),proof.price());
+                selected=snapshot.invoices().stream().filter(i->exactRecoveryInvoice(i,recovery.bill())).toList();
             }else{
                 StripeBillingOwnership.requireRemote(r.remote,proof.account(),proof.subscription(),proof.operation(),proof.customer(),proof.price(),proof.step());
                 require("incomplete".equals(r.remote.getStatus()));
                 selected=snapshot.invoices().stream().filter(i->i.kind()==BillingRecord.Kind.INITIAL).toList();
             }
             require(selected.size()==1);
-            var i=selected.getFirst();require(i.settlement()==SettlementKind.OPEN&&i.price().equals(proof.price().terms())&&(proof instanceof StripeBillingOwnership.OriginalChange||i.period().equals(snapshot.period())));
+            var i=selected.getFirst();require(i.settlement()==SettlementKind.OPEN&&i.price().equals(proof.price().terms())&&(proof instanceof StripeBillingOwnership.OriginalChange||proof instanceof StripeBillingOwnership.OriginalRecovery||i.period().equals(snapshot.period())));
+            return paymentAction(r,proof,i);
+        }catch(PaymentApplicationException safe){throw safe;}catch(StripeException|RuntimeException unsafe){throw mismatch();}
+    }
+    private static PaymentAction paymentAction(Read r,StripeBillingOwnership.PaymentProof proof,SubscriptionProviderModels.Invoice i) throws StripeException {
+            var client=r.client;
             var invoice=r.sourceInvoices.stream().filter(v->v.getId().equals(i.reference())).findFirst().orElseThrow(StripeBillingSnapshotMapper::mismatch);
             require("open".equals(invoice.getStatus()));
             if(proof instanceof StripeBillingOwnership.OriginalResume||proof instanceof StripeBillingOwnership.OriginalChange)require(StripeBillingOwnership.inWindow(invoice.getCreated(),proof.step()));
@@ -105,10 +114,32 @@ public final class StripeBillingSnapshotMapper {
             if(invoice.getConfirmationSecret()!=null)require("payment_intent".equals(invoice.getConfirmationSecret().getType())&&secret.equals(invoice.getConfirmationSecret().getClientSecret()));
             String canonical=dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.canonical(proof.step().fingerprint(),proof.operation().fingerprint(),i.period().start(),i.period().end());
             if(proof instanceof StripeBillingOwnership.OriginalChange change)canonical=dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.canonical("CHANGE_V1",canonical,change.result().quote().toString(),change.result().result().creditLine(),change.result().result().debitLine());
-            var binding=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding(proof.step().id(),proof.operation().providerOperationKey(),StripeBillingGrantTokens.hash(canonical),proof.subscription().providerReference(),proof.customer().providerReference(),i.reference(),a.getId(),pi.getId(),proof instanceof StripeBillingOwnership.OriginalChange?"change-v1":proof instanceof StripeBillingOwnership.OriginalResume?"resume-v1":"payment-v1",null);
+            if(proof instanceof StripeBillingOwnership.OriginalRecovery recovery){
+                canonical=dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.canonical("RECOVERY_V1",canonical,recovery.bill().id(),recovery.origin().operation(),recovery.origin().step());
+                var saved=recovery.result();if(saved!=null)require(Objects.equals(saved.allocation(),a.getId())&&Objects.equals(saved.intent(),pi.getId()));
+            }
+            var binding=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding(proof.step().id(),proof.operation().providerOperationKey(),StripeBillingGrantTokens.hash(canonical),proof.subscription().providerReference(),proof.customer().providerReference(),i.reference(),a.getId(),pi.getId(),proof instanceof StripeBillingOwnership.OriginalRecovery?"recovery-v1":proof instanceof StripeBillingOwnership.OriginalChange?"change-v1":proof instanceof StripeBillingOwnership.OriginalResume?"resume-v1":"payment-v1",null);
             return new PaymentAction(binding,secret);
+    }
+    public record RecoveryRead(Snapshot snapshot,String allocation,String intent,String method,boolean firstPay) {}
+    public static RecoveryRead retrieveRecovery(StripeClient client,StripeBillingOwnership.OriginalRecovery proof,Instant at){
+        try{
+            var r=new Read(client,new Ownership(proof.account(),proof.subscription(),proof.customer(),proof.prices(),null,null,proof.history()),at);var snapshot=r.snapshot();
+            StripeBillingOwnership.requireCurrentRemote(r.remote,proof.subscription(),proof.customer(),proof.price());
+            require(r.remote.getSchedule()==null&&r.remote.getPendingUpdate()==null&&Set.of("active","past_due","unpaid","incomplete").contains(r.remote.getStatus()));
+            var selected=snapshot.invoices().stream().filter(i->exactRecoveryInvoice(i,proof.bill())).toList();require(selected.size()==1);var i=selected.getFirst();
+            if(i.settlement()==SettlementKind.CASH)return new RecoveryRead(snapshot,null,null,null,false);
+            require(i.settlement()==SettlementKind.OPEN);var allocations=r.sourceAllocations.get(i.reference());require(allocations!=null);
+            if(allocations.size()==1){var action=paymentAction(r,proof,i);return new RecoveryRead(snapshot,action.binding().allocationReference(),action.binding().intentReference(),null,false);}
+            require(allocations.isEmpty());var invoice=r.sourceInvoices.stream().filter(v->v.getId().equals(i.reference())).findFirst().orElseThrow(StripeBillingSnapshotMapper::mismatch);
+            boolean first=Boolean.FALSE.equals(invoice.getAttempted())&&Objects.equals(0L,invoice.getAttemptCount())&&Boolean.FALSE.equals(invoice.getAutoAdvance())&&invoice.getNextPaymentAttempt()==null
+                &&r.explicitNoNextAttempt.contains(invoice.getId())
+                &&invoice.getConfirmationSecret()==null&&StripeBillingMutationAdapter.noAdjustments(invoice)&&snapshot.paymentMethodReady()
+                &&Objects.equals(invoice.getAmountPaid(),0L)&&Objects.equals(invoice.getAmountRemaining(),proof.bill().amountDueMinor());
+            return new RecoveryRead(snapshot,null,null,first?r.remote.getDefaultPaymentMethod():null,first);
         }catch(PaymentApplicationException safe){throw safe;}catch(StripeException|RuntimeException unsafe){throw mismatch();}
     }
+    private static boolean exactRecoveryInvoice(SubscriptionProviderModels.Invoice invoice,BillingRecord bill){return invoice.reference().equals(bill.providerInvoiceReference())&&invoice.kind()==bill.kind()&&invoice.price().equals(bill.billedPrice())&&Objects.equals(invoice.previousPrice(),bill.previousPrice())&&invoice.period().equals(bill.period())&&invoice.amountDueMinor()==bill.amountDueMinor();}
     @FunctionalInterface private interface Call<T>{T run() throws StripeException;}
     @FunctionalInterface private interface Page<T extends HasId>{StripeCollection<T> read(String after) throws StripeException;}
     private static final class Read {
@@ -117,6 +148,7 @@ public final class StripeBillingSnapshotMapper {
         com.stripe.model.Subscription remote;List<com.stripe.model.Invoice> sourceInvoices;
         final Map<String,List<InvoicePayment>> sourceAllocations=new HashMap<>();
         final Map<String,List<InvoiceLineItem>> sourceLines=new HashMap<>();
+        final Set<String> explicitNoNextAttempt=new HashSet<>();
         int requests;
         TrialEvidence trialEvidence;
         Read(StripeClient client,Ownership owner,Instant at){this.client=Objects.requireNonNull(client);this.owner=Objects.requireNonNull(owner);this.at=Objects.requireNonNull(at);}
@@ -170,7 +202,7 @@ public final class StripeBillingSnapshotMapper {
                     }
                 }
             }
-            var invoices=pages(after->client.v1().invoices().list(InvoiceListParams.builder().setSubscription(remote.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build()));
+            var invoices=pages(after->{var page=client.v1().invoices().list(InvoiceListParams.builder().setSubscription(remote.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build());rememberExplicitNullAttempt(page);return page;});
             sourceInvoices=invoices;
             var normalized=new ArrayList<SubscriptionProviderModels.Invoice>();
             for(var invoice:invoices)normalized.add(invoice(invoice,remote,item,trial));
@@ -185,6 +217,15 @@ public final class StripeBillingSnapshotMapper {
                     require(method.equals(pm.getId())&&"payment_method".equals(pm.getObject())&&Boolean.FALSE.equals(pm.getLivemode())&&b.providerReference().equals(pm.getCustomer())&&"card".equals(pm.getType())&&pm.getCard()!=null);methodReady=true;
             }
             return new Snapshot(remote.getId(),status,mapped.terms(),period,trialEvidence==null?trial:trialEvidence.period(),cancel,normalized,null,methodReady,0,at,null,List.of(),trialEvidence);
+        }
+        void rememberExplicitNullAttempt(StripeCollection<com.stripe.model.Invoice> page){
+            // A nullable SDK getter loses the distinction between absent and explicit null.
+            // Retain that one native field from this exact already-read collection response.
+            if(page.getLastResponse()==null)return;
+            try{
+                var root=NATIVE_JSON.readTree(page.getLastResponse().body());var data=root.get("data");if(data==null||!data.isArray()||page.getData()==null||data.size()!=page.getData().size())return;
+                for(int i=0;i<data.size();i++){var raw=data.get(i);var id=raw.get("id");if(id!=null&&id.isTextual()&&id.textValue().equals(page.getData().get(i).getId())&&raw.has("next_payment_attempt")&&raw.get("next_payment_attempt").isNull())explicitNoNextAttempt.add(id.textValue());}
+            }catch(java.io.IOException|RuntimeException malformed){throw mismatch();}
         }
         void validatePrice(Price p,PublishedPrice mapped){
             var t=mapped.terms();var recurring=p.getRecurring();

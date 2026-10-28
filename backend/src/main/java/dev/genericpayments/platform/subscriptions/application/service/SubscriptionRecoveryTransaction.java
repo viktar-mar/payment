@@ -62,7 +62,11 @@ public class SubscriptionRecoveryTransaction {
             var s=subscriptions.lock(context.siteId(),id);
             if(!operation.subscriptionId().equals(id)||!operation.customerId().equals(context.customerId())
                 ||!operation.fingerprint().equals(fingerprint(context,id,billId,consent,kind,principal,operation.expectedRevision(),operation.policyVersion())))throw SubscriptionRuleErrors.conflict();
-            if(!claim.owner())return new Reserved(operation,s,account,null,false);
+            if(!claim.owner()){
+                String invoice=null;
+                if(kind==SubscriptionOperation.Kind.RECOVER){var bill=bills.lock(context.siteId(),billId);if(!bill.subscriptionId().equals(s.id())||!bill.accountId().equals(account.id()))throw SubscriptionRuleErrors.conflict();invoice=bill.providerInvoiceReference();}
+                return new Reserved(operation,s,account,invoice,false);
+            }
             var policy=policies.load(context.siteId());
             if(s.revision()!=candidate.subscription().revision()||!s.paymentAccountId().equals(candidate.account().id())||!Objects.equals(s.providerReference(),snapshot.subscriptionReference())
                 ||account.status()!=PaymentAccountStatus.ACTIVE||!policy.enabled()||policy.version()!=candidate.policy()
@@ -74,7 +78,9 @@ public class SubscriptionRecoveryTransaction {
                 if(observed.size()!=1||observed.getFirst().settlement()!=SettlementKind.OPEN||!observed.getFirst().period().equals(bill.period())
                     ||!observed.getFirst().price().equals(bill.billedPrice()))throw SubscriptionRuleErrors.conflict();
                 var disposition=snapshot.recoveryDisposition(invoice);
-                if(disposition==RecoveryDisposition.ASSOCIATE_EXISTING_ACTION)RecoveryRules.requireActionAssociation(s,bill);
+                // Stripe reservation is local only. Its adapter proves action/pay permission from
+                // the complete exact graph after reservation; BLOCKED is never retry authority.
+                if(account.provider()==PaymentProviderType.STRIPE||disposition==RecoveryDisposition.ASSOCIATE_EXISTING_ACTION)RecoveryRules.requireActionAssociation(s,bill);
                 else RecoveryRules.requireRecoverable(s,bill,disposition!=RecoveryDisposition.RETRY_ALLOWED);
             }else {
                 RecoveryRules.requireResumable(s,snapshot.paymentMethodReady());
@@ -85,6 +91,18 @@ public class SubscriptionRecoveryTransaction {
         catch(DataIntegrityViolationException conflict){throw SubscriptionRuleErrors.conflict();}
     }
     public SubscriptionOperationResult readResult(UUID id){return tx.required(()->result(operations.lock(id),null));}
+    public void beforeOriginalReplay(SubscriptionCommandContext c,Reserved r){tx.requiresNew(()->{
+        var o=operations.lock(r.operation().id());authority.revalidate(c,true);
+        var current=owned(c,o.subscriptionId());var a=accounts.findByIdForUpdate(current.paymentAccountId()).orElseThrow(SubscriptionRuleErrors::conflict);
+        var s=subscriptions.lock(c.siteId(),o.subscriptionId());var policy=policies.load(c.siteId());
+        if(!o.equals(r.operation())||o.kind()!=SubscriptionOperation.Kind.RECOVER||!o.authorityScope().equals(principal(c))||!a.equals(r.account())
+            ||a.provider()!=PaymentProviderType.STRIPE||a.mode()!=PaymentAccountMode.SANDBOX||a.status()!=PaymentAccountStatus.ACTIVE
+            ||!Set.of(SubscriptionOperation.Status.PROCESSING,SubscriptionOperation.Status.UNKNOWN).contains(o.status())
+            ||!policy.enabled()||policy.version()!=o.policyVersion()||s.revision()!=o.expectedRevision()||!s.nonTerminal()||s.pendingChange()!=null
+            ||!s.billingPrice().equals(r.subscription().billingPrice())||s.debt()==null||!recoveryBill(o).filter(s.debt().billingRecordId()::equals).isPresent()
+            ||operations.unresolved(c.siteId(),s.id()).stream().anyMatch(other->!other.id().equals(o.id())&&other.kind()!=SubscriptionOperation.Kind.PORTAL&&other.kind()!=SubscriptionOperation.Kind.RECONCILE))throw SubscriptionRuleErrors.conflict();
+        return null;
+    });}
     public SubscriptionOperationResult recordReply(UUID id,Reply reply){
         return tx.requiresNew(()->{
             var o=operations.lock(id);
@@ -108,7 +126,7 @@ public class SubscriptionRecoveryTransaction {
         var canonical=new StringBuilder();for(var field:fields){var value=String.valueOf(field);canonical.append(value.length()).append(':').append(value);}
         return "v1."+kind.name().toLowerCase(Locale.ROOT)+"."+(bill==null?"none":bill)+"."+CreateSubscriptionFingerprint.digest(canonical.toString());
     }
-    static Optional<UUID> recoveryBill(SubscriptionOperation o){
+    public static Optional<UUID> recoveryBill(SubscriptionOperation o){
         if(o.kind()!=SubscriptionOperation.Kind.RECOVER||!o.fingerprint().matches("v1\\.recover\\.[0-9a-f-]{36}\\.[0-9a-f]{64}"))return Optional.empty();
         try{return Optional.of(UUID.fromString(o.fingerprint().split("\\.")[2]));}catch(IllegalArgumentException invalid){return Optional.empty();}
     }

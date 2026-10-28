@@ -42,6 +42,7 @@ public final class StripeBillingOwnership {
     private final ProviderCatalogMappingPort mappings;
     private SubscriptionBillingProofStore proofs;
     @org.springframework.beans.factory.annotation.Autowired private SubscriptionPlanProofStore plans;
+    @org.springframework.beans.factory.annotation.Autowired private SubscriptionRecoveryProofStore recoveryProofs;
     public StripeBillingOwnership(StripeCredentialResolver credentials,dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore steps,
         StripeBillingBindingPort bindings,DigestPort digest,LoadPaymentAccountPort accounts,LoadSitePort sites,CustomerStore customerStore,
         SubscriptionStore subscriptions,SubscriptionOperationStore operations,SubscriptionCatalogPort catalog,ProviderCatalogMappingPort mappings){
@@ -53,7 +54,7 @@ public final class StripeBillingOwnership {
         SubscriptionStore subscriptions,SubscriptionOperationStore operations,SubscriptionCatalogPort catalog,ProviderCatalogMappingPort mappings,SubscriptionBillingProofStore proofs){
         this(credentials,steps,bindings,digest,accounts,sites,customerStore,subscriptions,operations,catalog,mappings);this.proofs=proofs;
     }
-    public sealed interface PaymentProof permits OriginalCreate,OriginalResume,OriginalChange {
+    public sealed interface PaymentProof permits OriginalCreate,OriginalResume,OriginalChange,OriginalRecovery {
         PaymentAccount account();Subscription subscription();SubscriptionOperation operation();CustomerBinding customer();ProviderOperation step();StripeBillingSnapshotMapper.PublishedPrice price();
         default List<StripeBillingSnapshotMapper.PublishedPrice> prices(){return List.of(price());}
         default List<SubscriptionPlanProofStore.Proration> history(){return List.of();}
@@ -64,6 +65,29 @@ public final class StripeBillingOwnership {
         ProviderOperation step,StripeBillingSnapshotMapper.PublishedPrice price,SubscriptionBillingProofStore.Resume result) implements PaymentProof{}
     public record OriginalSetup(PaymentAccount account,Subscription subscription,SubscriptionOperation operation,CustomerBinding customer,ProviderOperation step,SubscriptionBillingProofStore.Setup proof){}
     public record OriginalChange(PaymentAccount account,Subscription subscription,SubscriptionOperation operation,CustomerBinding customer,ProviderOperation step,StripeBillingSnapshotMapper.PublishedPrice price,SubscriptionPlanProofStore.Proration result,List<StripeBillingSnapshotMapper.PublishedPrice> prices,List<SubscriptionPlanProofStore.Proration> history) implements PaymentProof{}
+    public record OriginalRecovery(PaymentAccount account,Subscription subscription,SubscriptionOperation operation,CustomerBinding customer,ProviderOperation step,StripeBillingSnapshotMapper.PublishedPrice price,BillingRecord bill,SubscriptionRecoveryProofStore.Origin origin,SubscriptionRecoveryProofStore.Receipt result,List<StripeBillingSnapshotMapper.PublishedPrice> prices,List<SubscriptionPlanProofStore.Proration> history) implements PaymentProof{}
+    /** Consent comes from the immutable acknowledged CREATE request, never today's native status. */
+    public OriginalRecovery recovery(dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Command command,SubscriptionRecoveryProofStore store,SubscriptionBillingProofStore billing){
+        var a=command.account();var s=owned(a,command.operation().subscriptionId());var o=lookupOperation(new Lookup(a,s.id(),s.providerReference(),command.operation().providerOperationKey()));
+        if(!o.equals(command.operation())||o.kind()!=SubscriptionOperation.Kind.RECOVER||!s.nonTerminal()||s.pendingChange()!=null||s.debt()==null||s.revision()!=o.expectedRevision()
+            ||!s.billingPrice().equals(command.current())||!Objects.equals(s.providerReference(),command.providerSubscriptionReference())||command.startTrial()||command.target()!=null||command.providerQuoteReference()!=null)throw mismatch();
+        UUID billId=dev.genericpayments.platform.subscriptions.application.service.SubscriptionRecoveryTransaction.recoveryBill(o).orElseThrow(StripeBillingOwnership::mismatch);
+        var bill=store.bill(a.id(),s.id(),billId).orElseThrow(StripeBillingOwnership::mismatch);
+        if(!bill.id().equals(s.debt().billingRecordId())||!bill.subscriptionId().equals(s.id())||!bill.accountId().equals(a.id())||!bill.siteId().equals(s.siteId())||!Objects.equals(bill.providerInvoiceReference(),command.providerInvoiceReference())||!bill.billedPrice().equals(s.billingPrice())||!bill.period().equals(s.debt().unpaidPeriod())||bill.settlement()!=BillingRecord.Settlement.OPEN||bill.amountDueMinor()<=0)throw mismatch();
+        var origin=store.origin(a.id(),s.id()).orElseThrow(StripeBillingOwnership::mismatch);var source=original(s,origin.operation());if(source.status()!=SubscriptionOperation.Status.SUCCEEDED)throw mismatch();
+        var step=steps.findById(origin.step()).orElseThrow(StripeBillingOwnership::mismatch);var b=bindings.findCustomer(a.id(),s.siteId(),s.customerId()).orElseThrow(StripeBillingOwnership::mismatch);requireBinding(a,s,b);
+        var prices=prices(a,s);String fp;
+        if(CreateSubscriptionFingerprint.startsTrial(source.fingerprint())){
+            if(billing==null)throw mismatch();var trial=billing.trial(a.id(),s.id()).filter(t->t.operation().equals(source.id())&&t.verified()&&s.providerReference().equals(t.subscriptionReference())).orElseThrow(StripeBillingOwnership::mismatch);
+            var setup=billing.setup(a.id(),source.id()).filter(t->t.method()!=null).orElse(null);
+            var selected=prices.stream().filter(p->trialFingerprint(a,s,source,b,p,trial,p.terms().trialPolicy()==dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.REQUIRED_BEFORE_TRIAL?setup:null).equals(step.fingerprint())).toList();if(selected.size()!=1)throw mismatch();
+            var p=selected.getFirst();if(p.terms().trialPolicy()==dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.REQUIRED_BEFORE_TRIAL&&setup==null)throw mismatch();fp=trialFingerprint(a,s,source,b,p,trial,p.terms().trialPolicy()==dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.REQUIRED_BEFORE_TRIAL?setup:null);
+        }else{var p=originalPrice(a,s,source,b,prices,step);fp=fingerprint(a,s,source,b,p);}
+        requireStep(a,s,source,step,fp);if(step.status()!=ProviderOperation.Status.ACKNOWLEDGED||!s.providerReference().equals(step.providerReference())||!s.providerReference().equals(source.providerReference()))throw mismatch();
+        var receipt=store.receipt(a.id(),o.id()).orElse(null);
+        if(receipt!=null&&(!receipt.operation().equals(o.id())||!receipt.subscription().equals(s.id())||!receipt.account().equals(a.id())||!receipt.billingRecord().equals(bill.id())||!receipt.reference().equals(s.providerReference())||!receipt.invoice().equals(bill.providerInvoiceReference())||!receipt.originOperation().equals(source.id())||!receipt.originStep().equals(step.id())))throw mismatch();
+        return new OriginalRecovery(a,s,o,b,step,price(a,s,bill.billedPrice()),bill,origin,receipt,prices,plans==null?List.of():planHistory(a,s,plans));
+    }
     public boolean setupPurpose(Lookup lookup){var o=lookupOperation(lookup);return proofs!=null&&(o.kind()==SubscriptionOperation.Kind.SETUP||o.kind()==SubscriptionOperation.Kind.CREATE&&CreateSubscriptionFingerprint.startsTrial(o.fingerprint())&&owned(lookup.account(),lookup.subscriptionId()).billingPrice().trialPolicy()==dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.REQUIRED_BEFORE_TRIAL);}
     public SubscriptionOperation lookupOperation(Lookup lookup){
         var s=owned(lookup.account(),lookup.subscriptionId());if(lookup.providerOperationKey()==null||!Objects.equals(s.providerReference(),lookup.reference()))throw mismatch();
@@ -91,7 +115,12 @@ public final class StripeBillingOwnership {
         if(step.status()!=ProviderOperation.Status.ACKNOWLEDGED||!s.providerReference().equals(step.providerReference()))throw mismatch();
         return new OriginalCreate(lookup.account(),s,o,b,step,p);
     }
-    public PaymentProof acknowledgedPayment(Lookup lookup){return switch(lookupOperation(lookup).kind()){case RESUME->acknowledgedResume(lookup);case CHANGE->acknowledgedChange(lookup);default->acknowledgedCreate(lookup);};}
+    public PaymentProof acknowledgedPayment(Lookup lookup){return switch(lookupOperation(lookup).kind()){case RECOVER->acknowledgedRecovery(lookup);case RESUME->acknowledgedResume(lookup);case CHANGE->acknowledgedChange(lookup);default->acknowledgedCreate(lookup);};}
+    public OriginalRecovery acknowledgedRecovery(Lookup lookup){
+        if(recoveryProofs==null)throw unsupported();var s=owned(lookup.account(),lookup.subscriptionId());var o=lookupOperation(lookup);var saved=recoveryProofs.receipt(lookup.account().id(),o.id()).orElseThrow(StripeBillingOwnership::mismatch);
+        var p=recovery(new Command(lookup.account(),o,s.billingPrice(),null,s.providerReference(),saved.invoice(),null,false,false),recoveryProofs,proofs);
+        if(p.result()==null||p.result().allocation()==null||p.result().intent()==null||!recoveryProofs.available(lookup.account().id(),s.id(),saved.invoice(),o.id()))throw mismatch();return p;
+    }
     public OriginalChange acknowledgedChange(Lookup lookup){
         if(plans==null)throw unsupported();var a=lookup.account();var s=owned(a,lookup.subscriptionId());var o=lookupOperation(lookup);
         var selected=planHistory(a,s,plans).stream().filter(p->p.result().operation().equals(o.id())).toList();if(o.kind()!=SubscriptionOperation.Kind.CHANGE||selected.size()!=1)throw mismatch();

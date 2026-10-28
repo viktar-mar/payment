@@ -12,6 +12,10 @@ public interface SubscriptionProviderPort {
     Reply clearChange(Command command);
     /** Explicit same-key retry only; providers opt in after proving an original dispatch. */
     default Reply continueOriginalPlan(Command command){return null;}
+    /** Explicit original cancellation retry only; read workflows never invoke this hook. */
+    default Reply continueOriginalCancellation(Command command){return null;}
+    /** Explicit same-owner server pay replay only; observing an invoice never invokes this hook. */
+    default Reply continueOriginalRecovery(Command command){return null;}
     Reply cancel(Command command,boolean immediate);
     Reply withdrawCancel(Command command);
     Reply setup(Command command);

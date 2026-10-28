@@ -120,7 +120,7 @@ public class SubscriptionInteractionTransaction {
         });
     }
     private SubscriptionClientGrant availableClientGrant(SubscriptionCommandContext c,State r,String token){
-        var session=customer(c);if(r.account().provider()!=PaymentProviderType.STRIPE||r.account().status()!=PaymentAccountStatus.ACTIVE||!r.policy().enabled()||!r.subscription().nonTerminal()||!Set.of(SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Kind.RESUME,SubscriptionOperation.Kind.CHANGE).contains(r.operation().kind())||r.operation().status()==SubscriptionOperation.Status.SUCCEEDED||r.operation().status()==SubscriptionOperation.Status.FAILED)throw SubscriptionRuleErrors.conflict();
+        var session=customer(c);if(r.account().provider()!=PaymentProviderType.STRIPE||r.account().status()!=PaymentAccountStatus.ACTIVE||!r.policy().enabled()||!r.subscription().nonTerminal()||!Set.of(SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Kind.RESUME,SubscriptionOperation.Kind.CHANGE,SubscriptionOperation.Kind.RECOVER).contains(r.operation().kind())||r.operation().status()==SubscriptionOperation.Status.SUCCEEDED||r.operation().status()==SubscriptionOperation.Status.FAILED)throw SubscriptionRuleErrors.conflict();
         var grant=billingGrant(r,token);if(!grant.available(securityClock.instant())||grant.sessionId()!=null&&(!session.sessionId().value().equals(grant.sessionId())||!session.origin().equals(grant.origin())))throw SubscriptionRuleErrors.conflict();return grant;
     }
     private SubscriptionClientGrant billingGrant(State r,String token){
@@ -129,6 +129,7 @@ public class SubscriptionInteractionTransaction {
         if(!g.account().equals(r.account().id())||!g.site().equals(r.subscription().siteId())||!g.customer().equals(r.subscription().customerId())||!g.subscription().equals(r.subscription().id())||!g.operation().equals(r.operation().id())
             ||!java.security.MessageDigest.isEqual(g.tokenDigest().getBytes(java.nio.charset.StandardCharsets.US_ASCII),digest(token).getBytes(java.nio.charset.StandardCharsets.US_ASCII)))throw SubscriptionRuleErrors.conflict();
         if(r.operation().kind()==SubscriptionOperation.Kind.CHANGE&&(!g.binding().schema().equals("change-v1")||r.subscription().pendingChange()==null||!r.subscription().pendingChange().operationId().equals(r.operation().id())))throw SubscriptionRuleErrors.conflict();
+        if(r.operation().kind()==SubscriptionOperation.Kind.RECOVER&&(!g.binding().schema().equals("recovery-v1")||r.subscription().debt()==null||!SubscriptionRecoveryTransaction.recoveryBill(r.operation()).filter(r.subscription().debt().billingRecordId()::equals).isPresent()))throw SubscriptionRuleErrors.conflict();
         return g;
     }
     private dev.genericpayments.platform.customers.application.model.CustomerSessionContext customer(SubscriptionCommandContext c){
@@ -154,8 +155,8 @@ public class SubscriptionInteractionTransaction {
             var o=operations.lock(r.operation().id());var fresh=authorized(c,r.subscription().id(),o,true);
             if(fresh.account().provider()==PaymentProviderType.STRIPE)customer(c);
             if(reply.reference()!=null&&!reply.reference().equals(fresh.subscription().providerReference()))throw SubscriptionRuleErrors.conflict();
-            if(o.status()==SubscriptionOperation.Status.SUCCEEDED)return result(o,null);
-            // Receipts never grant success or entitlement. A continuing failed CREATE may become pending again.
+            if(o.status()==SubscriptionOperation.Status.SUCCEEDED||fresh.account().provider()==PaymentProviderType.STRIPE&&o.status()==SubscriptionOperation.Status.FAILED)return result(o,null);
+            // Receipts never grant success or entitlement. Preserve existing Fake CREATE continuation.
             var status=switch(reply.outcome()){case ACCEPTED,DECLINED->SubscriptionOperation.Status.PROCESSING;case REQUIRES_ACTION->SubscriptionOperation.Status.REQUIRES_ACTION;case UNKNOWN->SubscriptionOperation.Status.UNKNOWN;};
             var saved=save(o,status);var action=reply.action()==null?null:issue(new State(fresh.subscription(),fresh.account(),fresh.policy(),saved,false),reply.action(),clock.instant());
             return result(saved,action);
