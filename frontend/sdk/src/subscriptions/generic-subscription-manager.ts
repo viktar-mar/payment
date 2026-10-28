@@ -36,7 +36,8 @@ export class GenericSubscriptionManager extends ElementBase {
   #stripeHandle?: StripeSubscriptionHandle;
   #formController?: AbortController;
   #formReady = false;
-  #preparedOperations = new Set<string>();
+  #formOperation?: string;
+  #spentOperations = new Set<string>();
   #polling = false;
   #offers: SubscriptionOffer[] = [];
   #billing: SubscriptionBillingPage = { items: [], nextCursor: null };
@@ -131,7 +132,7 @@ export class GenericSubscriptionManager extends ElementBase {
   disconnectedCallback(): void { this.#reset(); this.#render(); }
   attributeChangedCallback(name: string, old: string | null, value: string | null): void { if (name === 'locale' && old !== value) this.locale = value === 'pt' ? 'pt' : 'en'; }
   #reset(): void {
-    this.#retireForm(); this.#preparedOperations.clear(); this.#polling = false;
+    this.#retireForm(); this.#spentOperations.clear(); this.#polling = false;
     this.#controller?.abort(); this.#controller = undefined; if (this.#expiry !== undefined) clearTimeout(this.#expiry); this.#expiry = undefined;
     this.#state = { authorityRevision: this.#state.authorityRevision + 1, phase: 'idle', subscription: null, operation: null };
     this.#fingerprint = identity(this.#session); this.#busy = this.#loaded = this.#uncertain = false; this.#action = undefined; this.#offers = []; this.#quote = undefined; this.#cancelMode = undefined; this.#error = undefined;
@@ -157,12 +158,12 @@ export class GenericSubscriptionManager extends ElementBase {
     this.dispatchEvent(new CustomEvent('generic-subscription-state', { detail, bubbles: true, composed: true }));
   }
   #accept(revision: number, next: Partial<ManagerState>): void { if (!this.#current(revision)) return; this.#state = acceptManagerResult(this.#state, revision, { ...this.#state, ...next }); this.#render(); this.#emit(); }
-  #failure(error: unknown, revision: number, mutation = false): void {
+  #failure(error: unknown, revision: number, mutation = false, preparation = false): void {
     if (!this.#current(revision) || isAbort(error)) return;
     this.#retireForm(); this.#action = undefined; this.#quote = undefined; this.#cancelMode = undefined;
     const code = problemError(error instanceof PaymentSdkError ? { code: error.code } : {}).code;
     if (['SESSION_EXPIRED', 'INVALID_SESSION', 'AUTHENTICATION_FAILED'].includes(code)) { this.#reset(); this.#state.phase = 'expired'; this.#error = 'login'; }
-    else { if (mutation) this.#uncertain = true; this.#state.phase = mutation || unresolved(this.#state.operation) ? 'unknown' : 'error'; this.#error = mutation ? 'unknown' : 'error'; }
+    else { if (mutation) this.#uncertain = true; this.#state.phase = preparation ? 'error' : mutation || unresolved(this.#state.operation) ? 'unknown' : 'error'; this.#error = mutation ? 'unknown' : 'error'; }
     this.#render(); this.#alert.focus(); this.#emit(); this.dispatchEvent(new CustomEvent('generic-subscription-error', { detail: Object.freeze({ code }), bubbles: true, composed: true }));
   }
   async #load(revision: number): Promise<void> {
@@ -191,43 +192,44 @@ export class GenericSubscriptionManager extends ElementBase {
     const op = await client.operation(input); if (!this.#current(revision)) return;
     if (['SUCCEEDED','FAILED','UNKNOWN'].includes(op.status)) this.#retireForm();
     this.#action = undefined;
-    if (['PROCESSING','REQUIRES_ACTION'].includes(op.status) && !this.#preparedOperations.has(operationId) && this.#session!.scopes.includes('SUBSCRIPTION_MANAGE')) {
+    if (['PROCESSING','REQUIRES_ACTION'].includes(op.status) && this.#formOperation!==operationId && !this.#spentOperations.has(operationId) && this.#session!.scopes.includes('SUBSCRIPTION_MANAGE')) {
+      let action: SubscriptionAction | undefined;
       try {
-        const action = await client.action(input); if (!this.#current(revision)) return;
-        if (action.kind === 'PROVIDER_CLIENT') { this.#accept(revision, { operation:safeOperation(op),phase:this.#phase(op) }); await this.#prepareStripe(revision,op,action); }
-        else if (op.status === 'REQUIRES_ACTION' && op.actionAvailable) this.#action = action;
+        action = await client.action(input); if (!this.#current(revision)) return;
       } catch (error) {
         if (isAbort(error) || error instanceof PaymentSdkError && ['INVALID_SESSION','SESSION_EXPIRED','AUTHENTICATION_FAILED'].includes(error.code)) throw error;
         // An unavailable original action is still pending; a read never retries a write.
         this.#error = 'processing';
       }
+      if (action?.kind === 'PROVIDER_CLIENT') { this.#accept(revision, { operation:safeOperation(op),phase:this.#phase(op) }); if (!await this.#prepareStripe(revision,op,action)) return; }
+      else if (action && op.status === 'REQUIRES_ACTION' && op.actionAvailable) this.#action = action;
     }
     this.#uncertain = op.status === 'UNKNOWN'; this.#accept(revision, { operation: safeOperation(op), phase: this.#phase(op) });
   }
   #retireForm(): void {
     const controller=this.#formController, handle=this.#stripeHandle, mount=this.#providerMount;
-    this.#formReady=false; this.#formController=undefined; this.#stripeHandle=undefined; this.#providerMount=undefined;
+    this.#formReady=false; this.#formOperation=undefined; this.#formController=undefined; this.#stripeHandle=undefined; this.#providerMount=undefined;
     controller?.abort(); handle?.destroy(); mount?.destroy();
   }
-  async #prepareStripe(revision:number, op:SubscriptionOperation, action:SubscriptionAction):Promise<void> {
-    if (this.#preparedOperations.has(op.operationId)) return;
-    this.#preparedOperations.add(op.operationId); this.#retireForm();
+  async #prepareStripe(revision:number, op:SubscriptionOperation, action:SubscriptionAction):Promise<boolean> {
+    if (this.#spentOperations.has(op.operationId) || this.#formOperation===op.operationId) return false;
+    this.#retireForm(); this.#formOperation=op.operationId;
     const form = new AbortController(); this.#formController=form;
-    const mount = createProviderMount(this,this.#buttons.get('pay')!,'STRIPE');
-    // Reserve actual light-DOM geometry before the provider creates its iframe.
-    mount.host.style.minHeight='3rem'; this.#providerMount=mount; this.#render();
     try {
+      const mount = createProviderMount(this,this.#buttons.get('pay')!,'STRIPE');
+      // Reserve actual light-DOM geometry before the provider creates its iframe.
+      mount.host.style.minHeight='3rem'; this.#providerMount=mount; this.#render();
       const handle = await mountStripeSubscription({ client:this.#client!.subscriptions, input:{session:this.#session!,subscriptionId:op.subscriptionId,operationId:op.operationId,signal:AbortSignal.any([this.#controller!.signal,form.signal])},action,container:mount.host,locale:this.#locale,
         isCurrent:()=>this.#current(revision) && this.#providerMount===mount && ownedProviderHost(this)===mount.host,
         onRetire:()=>{ if (this.#providerMount===mount) { this.#retireForm(); if(this.#current(revision)) this.#render(); } } });
-      if (!this.#current(revision) || this.#providerMount!==mount) { handle.destroy(); return; }
-      this.#stripeHandle=handle; this.#formReady=true; this.#render();
-    } catch(error) { if (this.#providerMount===mount) this.#retireForm(); throw error; }
+      if (!this.#current(revision) || this.#providerMount!==mount) { handle.destroy(); return false; }
+      this.#stripeHandle=handle; this.#formReady=true; this.#render(); return true;
+    } catch(error) { if (this.#formController===form) this.#retireForm(); this.#failure(error,revision,false,true); return false; }
   }
   async #pay():Promise<void> {
     const revision=this.#state.authorityRevision, handle=this.#stripeHandle, op=this.#state.operation;
     if (this.#busy || !this.#formReady || !handle || !op || !this.#current(revision)) return;
-    this.#formReady=false; this.#busy=true; this.#error=undefined; this.#render();
+    this.#spentOperations.add(op.operationId); this.#formReady=false; this.#busy=true; this.#error=undefined; this.#render();
     try { await handle.confirm(); }
     catch(error) { if (this.#current(revision) && !isAbort(error)) this.#error='unknown'; }
     finally { if (this.#current(revision)) { this.#retireForm(); this.#busy=false; this.#render(); void this.#observe(revision,op); } }
@@ -276,7 +278,7 @@ export class GenericSubscriptionManager extends ElementBase {
       outcomeKnown = true;
       this.#action = op.nextAction; this.#uncertain = op.status === 'UNKNOWN';
       this.#accept(revision, { operation: safeOperation(op), phase: this.#phase(op) });
-      if (this.#action?.kind==='PROVIDER_CLIENT') { const action=this.#action; this.#action=undefined; await this.#prepareStripe(revision,op,action); }
+      if (this.#action?.kind==='PROVIDER_CLIENT') { const action=this.#action; this.#action=undefined; if (!await this.#prepareStripe(revision,op,action)) return; }
       else if (['PROCESSING','REQUIRES_ACTION'].includes(op.status) && !this.#action) await this.#readOperation(revision, op.operationId, op.subscriptionId);
       if (['SUCCEEDED', 'FAILED'].includes(op.status)) { this.#consent.checked = false; await this.#load(revision); }
       if (this.#current(revision)) this.#status.focus();
