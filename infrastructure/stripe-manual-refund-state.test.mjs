@@ -1,0 +1,123 @@
+import {fixture,envText} from './fixtures/stripe-manual-refund-state-fixture.mjs';
+import test,{after,mock} from 'node:test';
+import assert from 'node:assert/strict';
+import * as fs from 'node:fs/promises';
+import filesystem from 'node:fs/promises';
+import childProcess from 'node:child_process';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import {syncBuiltinESMExports} from 'node:module';
+import {constants} from 'node:fs';
+import {openManualRefundState} from './stripe-manual-refund-state.mjs';
+const forbidden=()=>{throw Error('test_forbids_external_IO');};
+mock.method(childProcess,'execFile',forbidden);mock.method(childProcess,'spawn',forbidden);mock.method(globalThis,'fetch',forbidden);syncBuiltinESMExports();
+after(()=>{mock.restoreAll();syncBuiltinESMExports();});
+const RUN='031b5ae7-6603-4339-b1b3-77231291ff34',SOURCE='f0620e40004162d2b3eededa60512f50a492f4cc',NEW='11111111-2222-4333-8444-555555555555';
+const RESTORE=['postgres','mailpit','callback-receiver','demo-site','backend'];
+const uuid=n=>`aaaaaaaa-bbbb-4ccc-8ddd-${String(n).padStart(12,'0')}`;
+const durable=async f=>JSON.parse(await fs.readFile(f.statePath,'utf8'));
+const proof=(index=0)=>({refundId:uuid(20+index),providerReference:'re_SYNTHETIC'+index,providerEventId:'evt_SYNTHETIC'+index,amountMinor:index?1300:700,totalMinor:index?2000:700,providerVerified:true,webhookVerified:true,journalVerified:true,callbackVerified:true});
+async function configured(f,s){for(const service of RESTORE){await s.beginRestore(service,f.limits);await s.ackRestore(service,f.limits);}await s.beginRotation(f.limits);await s.ackRotation(2,f.limits);await s.beginConfigure(2,f.limits);await s.ackConfigure(2,f.limits);}
+// Break caught: hardcoded platform temp paths ignore the OS-selected owned parent.
+test('fixture creates fresh canonical roots and real sockets under the OS temp directory',async t=>{
+  const parent=await fs.mkdtemp(path.join(await fs.realpath('/tmp'),'rf-'));
+  t.after(()=>fs.rm(parent,{recursive:true,force:true}));
+  t.mock.method(os,'tmpdir',()=>parent);
+  const first=await fixture(t),second=await fixture(t);
+  assert.equal(path.dirname(first.root),parent);
+  assert.equal(path.dirname(second.root),parent);
+  assert.notEqual(first.root,second.root);
+  for(const f of [first,second]){
+    assert.equal(await fs.realpath(f.root),f.root);
+    assert.equal((await fs.lstat(f.root+'/docker.sock')).isSocket(),true);
+    const stat=await fs.stat(f.root);
+    assert.equal(stat.uid,process.getuid());
+    assert.equal(stat.mode&0o777,0o700);
+  }
+});
+// Break caught: loading credentials before admission or accepting mutable source/socket authority.
+test('admission fails before retained reads for bad flags, source, socket or renewed authority',async t=>{
+  for(const variant of ['flags','source','dirty','socket','deadline'])await t.test(variant,async t=>{const f=await fixture(t);let reads=0;f.deps.open=()=>{reads++;throw Error('PRIVATE_CANARY');};if(variant==='flags')f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND='false';if(variant==='source')f.deps.execute=async()=>({stdout:'a'.repeat(40)+'\n',stderr:''});if(variant==='dirty')f.deps.execute=async(_file,args)=>({stdout:args.includes('status')?' M tracked.mjs\n':'e'.repeat(40)+'\n',stderr:''});if(variant==='socket')f.options.daemon='unix://'+f.root+'/missing.sock';if(variant==='deadline')f.limits.deadline=Date.now()+1801000;await assert.rejects(f.open(),/^Error: stripe_manual_refund_state_/);assert.equal(reads,0);});
+});
+// Break caught: adopting another historical target or leaking private maps through projections.
+test('complete retained STOPPED and ACKNOWLEDGED files yield one frozen safe target',async t=>{
+  const f=await fixture(t),s=await f.open(),target=s.target;assert.equal(target.originalRunId,RUN);assert.equal(target.originalSource,SOURCE);assert.equal(target.paymentId,uuid(7));assert.equal(target.operationId,uuid(8));assert.equal(target.intentId,'pi_SYNTHETIC');assert.equal(target.callbackVersion,1);assert.equal(target.amountMinor,2000);assert.equal(target.currency,'EUR');assert.equal(target.source,'CATALOG');assert.equal(Object.keys(target.containers).length,7);assert.equal(Object.keys(target.images).length,5);assert.ok(Object.isFrozen(target.containers.backend));
+  const serialized=JSON.stringify(s);for(const secret of Object.values(f.data.final).filter(v=>v.includes('SYNTHETIC')||v.endsWith('=')))assert.equal(serialized.includes(secret),false);assert.equal(s.resources,undefined);assert.equal(s.admin,undefined);
+  let seen;assert.equal(await s.withRetainedAdmin(value=>{seen=value;assert.deepEqual(Object.keys(value),['username','password']);return true;},f.limits),true);assert.equal(seen.username,f.data.app.PAYMENT_ADMIN_BOOTSTRAP_USERNAME);
+  assert.equal(await s.verifyRetainedWebhookSecret(f.data.final.PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET,f.limits),true);assert.equal(await s.close({retain:false},{deadline:f.limits.deadline+120000}),true);await assert.rejects(s.withRetainedAdmin(()=>true,f.limits));await assert.rejects(fs.lstat(f.lockPath),{code:'ENOENT'});assert.equal((await fs.stat(f.statePath)).mode&0o777,0o600);
+});
+test('two controllers and a fresh UUID cannot bypass the same original lock',async t=>{
+  const f=await fixture(t),s=await f.open();await assert.rejects(f.open());f.options.runId='99999999-2222-4333-8444-555555555555';await assert.rejects(f.open());assert.equal(await s.close({retain:true},{deadline:f.limits.deadline+120000}),true);await assert.rejects(f.open());assert.ok(await fs.stat(f.lockPath));
+});
+test('fixed legs are durable before dispatch and remainder requires the complete first proof',async t=>{
+  const f=await fixture(t),s=await f.open();let state=await durable(f);assert.deepEqual(state.legs.map(v=>[v.amountMinor,v.phase]),[[700,'READY'],[1300,'READY']]);assert.notEqual(state.legs[0].key,state.legs[1].key);await configured(f,s);const dispatched=await s.beginRefund(0,f.limits);state=await durable(f);assert.equal(state.legs[0].phase,'DISPATCHING');assert.deepEqual(dispatched,state.legs[0]);assert.equal(dispatched.key,'s5a-refund:11111111-2222-4333-8444-555555555555:partial');assert.ok(Object.isFrozen(dispatched));assert.throws(()=>{dispatched.amountMinor=1300;});await s.ackRefund(0,{refundId:uuid(20)},f.limits);assert.equal(dispatched.phase,'DISPATCHING');assert.equal((await durable(f)).legs[0].phase,'ACKNOWLEDGED');await s.confirmRefund(0,proof(),f.limits);await s.beginRefund(1,f.limits);await s.ackRefund(1,{refundId:uuid(21)},f.limits);await s.confirmRefund(1,proof(1),f.limits);state=await durable(f);assert.deepEqual(state.legs.map(v=>[v.phase,v.providerReference]),[['CONFIRMED','re_SYNTHETIC0'],['CONFIRMED','re_SYNTHETIC1']]);assert.equal(await s.close({retain:false},{deadline:f.limits.deadline+120000}),true);
+});
+for(const key of Object.keys(proof()))test(`every omitted or false proof prevents CONFIRMED and permanently fences the remainder: ${key}`,async t=>{const f=await fixture(t),s=await f.open();await configured(f,s);await s.beginRefund(0,f.limits);await s.ackRefund(0,{refundId:uuid(20)},f.limits);const p=proof();delete p[key];await assert.rejects(s.confirmRefund(0,p,f.limits));assert.equal((await durable(f)).legs[0].phase,'ACKNOWLEDGED');await assert.rejects(s.beginRefund(1,f.limits));await assert.rejects(s.confirmRefund(0,proof(),f.limits));await s.close({retain:false},{deadline:f.limits.deadline+120000});assert.ok(await fs.stat(f.lockPath));});
+test('state transitions forbid skip, repeat, wrong restore order and changed deadline',async t=>{
+  for(const action of [(s,l)=>s.beginRefund(1,l),(s,l)=>s.ackRefund(0,{refundId:uuid(20)},l),(s,l)=>s.beginRotation(l),(s,l)=>s.beginRestore('backend',l),(s,l)=>s.ackRestore('postgres',l),(s,l)=>s.beginConfigure(2,l)])await t.test('phase violation',async t=>{const f=await fixture(t),s=await f.open();await assert.rejects(action(s,f.limits));await assert.rejects(s.beginRestore('postgres',f.limits));await s.close({retain:false},{deadline:f.limits.deadline+120000});assert.ok(await fs.stat(f.lockPath));});
+  const f=await fixture(t),s=await f.open();await assert.rejects(s.beginRestore('postgres',{deadline:f.limits.deadline+1}));await s.close({retain:true},{deadline:f.limits.deadline+120000});
+});
+test('private callbacks and verifier require exact true/equality and clear after close',async t=>{
+  for(const variant of ['false','secret','version'])await t.test(variant,async t=>{const f=await fixture(t),s=await f.open();if(variant==='false')await assert.rejects(s.withRetainedAdmin(()=>false,f.limits));if(variant==='secret')await assert.rejects(s.verifyRetainedWebhookSecret('whsec_WRONG_00112233445566778899',f.limits));if(variant==='version'){for(const v of RESTORE){await s.beginRestore(v,f.limits);await s.ackRestore(v,f.limits);}await s.beginRotation(f.limits);await assert.rejects(s.ackRotation(3,f.limits));}await s.close({retain:true},{deadline:f.limits.deadline+120000});await assert.rejects(s.verifyRetainedWebhookSecret(f.data.final.PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET,f.limits));});
+});
+test('strict retained decoders reject duplicate members, unknown shape and mixed private inputs',async t=>{
+  const changes=[['duplicate JSON',f=>f.write('runtime.json',JSON.stringify(f.data.runtime).replace('"status":"STOPPED"','"status":"STOPPED","status":"STOPPED"'))],['wrong run',f=>{f.data.runtime.runId=NEW;return f.write('runtime.json',f.data.runtime);}],['wrong source',f=>{f.data.runtime.expectedSource='a'.repeat(40);return f.write('runtime.json',f.data.runtime);}],['unknown key',f=>{f.data.runtime.secret='CREDENTIAL_CANARY';return f.write('runtime.json',f.data.runtime);}],['unacknowledged',f=>{f.data.runtime.intents[0].status='DISPATCHING';return f.write('runtime.json',f.data.runtime);}],['extra payment',f=>{f.data.provision.cases.other={paymentId:uuid(99)};return f.write('form-provisioning.json',f.data.provision);}],['wrong prepare',f=>{f.data.provision.operationProof.reference='pi_OTHER';f.data.provision.operationProof.kind='REFUND';return f.write('form-provisioning.json',f.data.provision);}],['duplicate env',f=>f.write('app.env',envText(f.data.app)+'PAYMENT_FAKE_AUTO_SUCCESS=false\n')],['shell env',f=>f.write('app.env',envText(f.data.app)+'UNKNOWN=$(secret)\n')],['mixed env',f=>{f.data.final.PAYMENT_DB_PASSWORD=Buffer.alloc(32,22).toString('base64');return f.write('final.env',envText(f.data.final));}],...['missing','empty','live'].map(kind=>[kind+' verifier',f=>{if(kind==='missing')delete f.data.final.PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET;else f.data.final.PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET=kind==='empty'?'':'whsec_live';if(kind==='live')f.data.final.PAYMENT_STRIPE_SANDBOX_SECRET_KEY='sk_live_CANARY';return f.write('final.env',envText(f.data.final));}])];
+  for(const [name,change] of changes)await t.test(name,async t=>{const f=await fixture(t);await change(f);await assert.rejects(f.open(),error=>{assert.match(error.message,/^stripe_manual_refund_state_/);assert.equal(error.message.includes('CANARY'),false);return true;});await assert.rejects(fs.lstat(f.statePath),{code:'ENOENT'});});
+});
+test('retained reader rejects symlink, hardlink, owner/mode/size, inode change and partial reads',async t=>{
+  for(const variant of ['symlink','hardlink','owner','mode','size','inode','partial'])await t.test(variant,async t=>{const f=await fixture(t),path=f.original+'/app.env';
+    if(variant==='symlink'){await fs.rename(path,path+'.other');await fs.symlink(path+'.other',path);}if(variant==='hardlink')await fs.link(path,path+'.link');if(variant==='mode')await fs.chmod(path,0o644);if(variant==='size')await f.write('app.env','A'.repeat(65537));
+    if(variant==='owner')f.deps.lstat=async p=>{const stat=await fs.lstat(p);if(p===path)return new Proxy(stat,{get(target,key){return key==='uid'?process.getuid()+1:typeof target[key]==='function'?target[key].bind(target):target[key];}});return stat;};
+    if(['inode','partial'].includes(variant))f.deps.open=async(p,...args)=>{const handle=await fs.open(p,...args);if(p===path&&args[0]===(constants.O_RDONLY|constants.O_NOFOLLOW)){if(variant==='inode'){await fs.rename(path,path+'.old');await f.write('app.env',envText(f.data.app));}else return new Proxy(handle,{get(target,key){if(key==='read')return async(buffer,offset,length,position)=>target.read(buffer,offset,Math.min(length,3),position);return typeof target[key]==='function'?target[key].bind(target):target[key];}});}return handle;};
+    await assert.rejects(f.open());
+  });
+});
+test('fsync and rename failure fence state with no second dispatch and retain original lock',async t=>{
+  for(const variant of ['sync','rename'])await t.test(variant,async t=>{const f=await fixture(t);let armed=false;f.deps.rename=async(...args)=>{if(armed&&variant==='rename')throw Error('CREDENTIAL_CANARY');return fs.rename(...args);};f.deps.open=async(...args)=>{const handle=await fs.open(...args);return new Proxy(handle,{get(target,key){if(key==='sync')return async()=>{if(armed&&variant==='sync')throw Error('CREDENTIAL_CANARY');return target.sync();};return typeof target[key]==='function'?target[key].bind(target):target[key];}});};const s=await f.open();await configured(f,s);armed=true;await assert.rejects(s.beginRefund(0,f.limits),{message:'stripe_manual_refund_state_PENDING'});armed=false;await assert.rejects(s.beginRefund(0,f.limits));await s.close({retain:false},{deadline:f.limits.deadline+120000});assert.ok(await fs.stat(f.lockPath));assert.notEqual((await durable(f)).legs[0].phase,'CONFIRMED');});
+});
+// Break caught: a known rotation or partial confirmation must not permit a fresh controller.
+test('closing after acknowledged rotation or confirmed partial retains the original target fence',async t=>{
+  for(const partial of [false,true])await t.test(partial?'confirmed partial':'rotation acknowledged',async t=>{const f=await fixture(t),s=await f.open();await configured(f,s);if(partial){await s.beginRefund(0,f.limits);await s.ackRefund(0,{refundId:uuid(20)},f.limits);await s.confirmRefund(0,proof(),f.limits);}await s.close({retain:false},{deadline:f.limits.deadline+120000});assert.ok(await fs.stat(f.lockPath));f.options.runId='99999999-2222-4333-8444-555555555555';await assert.rejects(f.open());});
+});
+for(const patch of [{providerVerified:false},{webhookVerified:false},{journalVerified:false},{callbackVerified:false},{refundId:uuid(99)},{amountMinor:1300},{totalMinor:2000}])test(`false financial proofs and mismatched totals or identities cannot advance the remainder: ${JSON.stringify(patch)}`,async t=>{const f=await fixture(t),s=await f.open();await configured(f,s);await s.beginRefund(0,f.limits);await s.ackRefund(0,{refundId:uuid(20)},f.limits);await assert.rejects(s.confirmRefund(0,{...proof(),...patch},f.limits));await assert.rejects(s.beginRefund(1,f.limits));await s.close({retain:true},{deadline:f.limits.deadline+120000});});
+// Break caught: using a mutable caller deadline to renew financial authority.
+test('caller mutation cannot alter a committed financial proof',async t=>{
+  const f=await fixture(t),s=await f.open();await configured(f,s);await s.beginRefund(0,f.limits);await s.ackRefund(0,{refundId:uuid(20)},f.limits);const p=proof();await s.confirmRefund(0,p,f.limits);p.providerReference='re_ALTERED';await s.beginRefund(1,f.limits);assert.equal((await durable(f)).legs[0].proof.providerReference,'re_SYNTHETIC0');await s.close({retain:true},{deadline:f.limits.deadline+120000});
+});
+test('admission snapshots the initial deadline before awaiting source checks',async t=>{
+  const f=await fixture(t),originalDeadline=f.limits.deadline,execute=f.deps.execute;let unblock,entered;const waiting=new Promise(resolve=>{unblock=resolve;}),ready=new Promise(resolve=>{entered=resolve;});f.deps.execute=async(...args)=>{entered();await waiting;return execute(...args);};const opening=f.open();await ready;f.limits.deadline+=60000;unblock();const s=await opening;assert.equal((await durable(f)).deadline,originalDeadline);await assert.rejects(s.beginRestore('postgres',f.limits));await s.close({retain:true},{deadline:originalDeadline+120000});
+});
+test('importing all refund contracts performs no filesystem, process or network IO',async()=>{
+  const guards=[mock.method(filesystem,'open',forbidden),mock.method(filesystem,'lstat',forbidden),mock.method(filesystem,'realpath',forbidden),mock.method(filesystem,'mkdir',forbidden),mock.method(net,'createServer',forbidden)];syncBuiltinESMExports();try{for(const name of ['options','schema','state'])await import('./stripe-manual-refund-'+name+'.mjs?inert-contract-check');}finally{for(const guard of guards)guard.mock.restore();syncBuiltinESMExports();}
+});
+test('failed cleanup ownership still closes held descriptors while retaining the lock and clearing private inputs',async t=>{
+  const f=await fixture(t),handles=new Set();f.deps.open=async(...args)=>{const handle=await fs.open(...args);handles.add(handle);return new Proxy(handle,{get(target,key){if(key==='close')return async()=>{await target.close();handles.delete(target);};return typeof target[key]==='function'?target[key].bind(target):target[key];}});};const s=await f.open();assert.equal(handles.size,1);await fs.chmod(f.statePath,0o644);await assert.rejects(s.close({retain:false},{deadline:f.limits.deadline+120000}));assert.equal(handles.size,0);assert.ok(await fs.stat(f.lockPath));await assert.rejects(s.withRetainedAdmin(()=>true,f.limits));
+});
+function trackOpenHandles(f,t,{delayPath=()=>false,delayClosePath=()=>false}={}){
+  const handles=new Set(),disposals=[];let entered,unblock;const ready=new Promise(resolve=>{entered=resolve;}),blocked=new Promise(resolve=>{unblock=resolve;});
+  f.deps.open=async(...args)=>{const handle=await fs.open(...args);handles.add(handle);const wrapped=new Proxy(handle,{get(target,key){if(key==='close')return async()=>{if(delayClosePath(args[0])){entered();await blocked;}disposals.push(f.deps.now?.()??Date.now());await target.close();handles.delete(target);};return typeof target[key]==='function'?target[key].bind(target):target[key];}});if(delayPath(args[0])){entered();await blocked;}return wrapped;};
+  t.after(async()=>{unblock();for(const handle of handles)await handle.close();});return {handles,disposals,ready,unblock};
+}
+// Break caught: pre-body validation must not leave a terminal close holding private authority.
+test('terminal close clears private authority and disposes descriptors after rejected cleanup Limits',async t=>{
+  for(const variant of ['malformed','expired','aborted','renewed'])await t.test(variant,async t=>{const f=await fixture(t),tracked=trackOpenHandles(f,t),s=await f.open();const abort=new AbortController();abort.abort();const limits={malformed:{deadline:'CREDENTIAL_CANARY'},expired:{deadline:Date.now()-1},aborted:{deadline:f.limits.deadline+120000,signal:abort.signal},renewed:{deadline:f.limits.deadline+120001}}[variant];const closing=s.close({retain:false},limits);let callbacks=0;await assert.rejects(s.withRetainedAdmin(()=>{callbacks++;return true;},f.limits));await assert.rejects(closing,{message:'stripe_manual_refund_state_PENDING'});assert.equal(tracked.handles.size,0);assert.equal(callbacks,0);assert.ok(await fs.stat(f.lockPath));await assert.rejects(s.verifyRetainedWebhookSecret(f.data.final.PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET,f.limits));await assert.rejects(s.close({retain:false},{deadline:f.limits.deadline+120000}));});
+});
+test('overlapping terminal close denies a pending private callback and disposes late acquired descriptors',async t=>{
+  const f=await fixture(t);let armed=false;const tracked=trackOpenHandles(f,t,{delayPath:path=>armed&&path===f.statePath}),s=await f.open();armed=true;let callbacks=0;const reading=s.withRetainedAdmin(()=>{callbacks++;return true;},f.limits);await tracked.ready;await assert.rejects(s.close({retain:false},{deadline:f.limits.deadline+120000}));tracked.unblock();await assert.rejects(reading);await new Promise(resolve=>setImmediate(resolve));assert.equal(callbacks,0);assert.equal(tracked.handles.size,0);assert.ok(await fs.stat(f.lockPath));await assert.rejects(s.beginRestore('postgres',f.limits));await assert.rejects(s.close({retain:false},{deadline:f.limits.deadline+120000}));
+});
+test('terminal close never renews descriptor disposal beyond the original cleanup ceiling',async t=>{
+  const f=await fixture(t);let now=Date.now();f.deps.now=()=>now;const tracked=trackOpenHandles(f,t),s=await f.open(),before=tracked.disposals.length;now=f.limits.deadline+120001;await assert.rejects(s.close({retain:false},{deadline:now+60000}));assert.equal(tracked.disposals.length,before);assert.equal(tracked.handles.size,1);assert.ok(await fs.stat(f.lockPath));await assert.rejects(s.withRetainedAdmin(()=>true,{deadline:now+10000}));await assert.rejects(s.close({retain:false},{deadline:now+60000}));assert.equal(tracked.disposals.length,before);
+});
+test('terminal close keeps late descriptor disposal inside the original cleanup ceiling',async t=>{
+  const f=await fixture(t);let now=Date.now(),armed=false;f.deps.now=()=>now;const tracked=trackOpenHandles(f,t,{delayPath:path=>armed&&path===f.statePath}),s=await f.open();armed=true;let callbacks=0;const reading=s.withRetainedAdmin(()=>{callbacks++;return true;},f.limits);await tracked.ready;await assert.rejects(s.close({retain:false},{deadline:f.limits.deadline+120000}));const disposals=tracked.disposals.length;now=f.limits.deadline+120001;tracked.unblock();await assert.rejects(reading);await new Promise(resolve=>setImmediate(resolve));assert.equal(callbacks,0);assert.equal(tracked.disposals.length,disposals);assert.equal(tracked.handles.size,1);assert.ok(await fs.stat(f.lockPath));
+});
+test('overlapping terminal close calls cannot release an uncertain original-target lock',async t=>{
+  const f=await fixture(t);let armed=false;const tracked=trackOpenHandles(f,t,{delayPath:path=>armed&&path===f.statePath}),s=await f.open();armed=true;const closing=s.close({retain:false},{deadline:f.limits.deadline+120000});await tracked.ready;await assert.rejects(s.close({retain:false},{deadline:f.limits.deadline+120000}));tracked.unblock();await assert.rejects(closing);await new Promise(resolve=>setImmediate(resolve));assert.equal(tracked.handles.size,0);assert.ok(await fs.stat(f.lockPath));
+});
+test('terminal close retains the target lock if overlapping work makes cleanup uncertain',async t=>{
+  const f=await fixture(t);let armed=false;const tracked=trackOpenHandles(f,t,{delayClosePath:path=>armed&&path===f.lockPath}),s=await f.open();armed=true;const closing=s.close({retain:false},{deadline:f.limits.deadline+120000});await tracked.ready;await assert.rejects(s.withRetainedAdmin(()=>true,f.limits));tracked.unblock();await closing;assert.equal(tracked.handles.size,0);assert.ok(await fs.stat(f.lockPath));
+});
+test('retained JSON accepts only space tab CR LF and rejects NBSP or BOM',async t=>{
+  for(const [name,prefix,suffix] of [['JSON whitespace',' \t\r\n','\n \r\t'],['NBSP prefix','\u00a0','\n'],['NBSP suffix','','\u00a0'],['BOM prefix','\ufeff','\n'],['BOM suffix','','\ufeff']])await t.test(name,async t=>{const f=await fixture(t);await f.write('runtime.json',prefix+JSON.stringify(f.data.runtime)+suffix);if(name==='JSON whitespace'){const s=await f.open();await s.close({retain:false},{deadline:f.limits.deadline+120000});}else await assert.rejects(f.open(),{message:'stripe_manual_refund_state_PENDING'});});
+});

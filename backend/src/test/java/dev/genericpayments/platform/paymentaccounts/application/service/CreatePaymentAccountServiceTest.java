@@ -19,6 +19,19 @@ import org.junit.jupiter.api.Test;
 
 class CreatePaymentAccountServiceTest {
     @Test
+    void legacyConstructorsCannotCreateStripeAccountsWithoutVerification() {
+        InMemoryPaymentAccountPort accounts = new InMemoryPaymentAccountPort();
+        var stripe = new CreatePaymentAccountCommand("stripe-account", PaymentProviderType.STRIPE,
+            PaymentAccountMode.SANDBOX, "acct_expected", "stripe-sandbox-default");
+
+        assertThatThrownBy(() -> new CreatePaymentAccountService(accounts).create(stripe))
+            .isInstanceOf(DomainValidationException.class);
+        assertThatThrownBy(() -> new CreatePaymentAccountService(accounts, accounts).create(stripe))
+            .isInstanceOf(DomainValidationException.class);
+        assertThat(accounts.accounts).isEmpty();
+    }
+
+    @Test
     void refusesDuplicateNormalizedAccountKey() {
         InMemoryPaymentAccountPort accounts = new InMemoryPaymentAccountPort();
         accounts.save(account("demo-account", "env:EXISTING_KEY"));

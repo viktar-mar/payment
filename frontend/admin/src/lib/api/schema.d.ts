@@ -36,6 +36,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/sites/{siteId}/checkout-return-urls": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listAdminCheckoutReturnUrls"];
+        put: operations["updateAdminCheckoutReturnUrl"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/sites/{siteId}/callback": {
         parameters: {
             query?: never;
@@ -206,6 +222,39 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["confirmCheckout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/public/checkouts/{checkoutId}/client-session": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Prepare an ephemeral client capability using this checkout's confirm-scoped bearer, exact allowed Origin and idempotency key. The request body must be empty. */
+        post: operations["prepareClientPaymentSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/provider-webhooks/stripe/{accountKey}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["receive"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1044,6 +1093,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/provider-operations/{operationId}/recover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["recoverAdminProviderOperation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/payments/{paymentId}/refunds": {
         parameters: {
             query?: never;
@@ -1700,6 +1765,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/provider-operations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["inspectAdminProviderOperations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/provider-operations/unresolved": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listAdminUnresolvedProviderOperations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/provider-operations/dead-references": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listAdminDeadProviderReferences"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/payments": {
         parameters: {
             query?: never;
@@ -1925,6 +2038,12 @@ export interface components {
             /** Format: date-time */
             updated_at?: string;
         };
+        UpdateReturnUrl: {
+            origin: string;
+            return_url: string;
+            /** Format: int64 */
+            expected_version: number;
+        };
         ConfigureRequest: {
             endpointUrl: string;
             enabled: boolean;
@@ -2095,6 +2214,24 @@ export interface components {
             status?: string;
             /** Format: date-time */
             expiresAt?: string;
+        };
+        ClientPaymentSessionResponse: {
+            /** Format: uuid */
+            checkout_id: string;
+            /** Format: uuid */
+            payment_id: string;
+            /** Format: uuid */
+            attempt_id: string;
+            /** @enum {string} */
+            provider_type: "STRIPE";
+            /** @enum {string} */
+            confirmation_mode: "CLIENT_PROVIDER";
+            publishable_key: string;
+            client_secret: string;
+            /** Format: date-time */
+            expires_at: string;
+            /** Format: uri */
+            return_url: string;
         };
         SubscriptionCreateRequest: {
             /** Format: uuid */
@@ -2364,6 +2501,13 @@ export interface components {
             expiresAt?: string;
             apiKey?: string;
         };
+        RecoveryRequest: {
+            provider_reference: string;
+            creation_event_id: string;
+        };
+        RecoveryAccepted: {
+            status?: string;
+        };
         RefundRequest: {
             /** Format: int64 */
             amount_minor: number;
@@ -2609,6 +2753,12 @@ export interface components {
             allowed_origins: string[];
             authentication_modes: ("SITE_TOKEN" | "OIDC_TOKEN" | "EMAIL_OTP")[];
             payment_method_policy: components["schemas"]["Policy"];
+            email_otp_provider?: components["schemas"]["EmailOtpProvider"];
+        };
+        EmailOtpProvider: {
+            provider_key: string;
+            sender_ref: string;
+            template_key: string;
         };
         Policy: {
             /** @enum {string} */
@@ -3019,6 +3169,56 @@ export interface components {
         CustomerAdminPage: {
             items?: components["schemas"]["CustomerResponse"][];
         };
+        CheckoutReturnUrlPolicy: {
+            /** Format: uri */
+            origin?: string;
+            /** Format: uri */
+            return_url?: string;
+            /** Format: int64 */
+            version?: number;
+        };
+        ProviderOperationView: {
+            /** Format: uuid */
+            operation_id?: string;
+            /** Format: uuid */
+            payment_id?: string;
+            /** Format: uuid */
+            account_id?: string;
+            account_mode?: string;
+            kind?: string;
+            status?: string;
+            reference?: string;
+            /** Format: date-time */
+            first_dispatched_at?: string;
+            /** Format: date-time */
+            retry_before?: string;
+            /** Format: date-time */
+            next_attempt_at?: string;
+            safe_error_code?: string;
+            /** Format: uuid */
+            resource_id?: string;
+            /** Format: uuid */
+            site_id?: string;
+            manual_review_required?: boolean;
+        };
+        DeadProviderReferenceView: {
+            /** Format: uuid */
+            receipt_id?: string;
+            /** Format: uuid */
+            account_id?: string;
+            account_mode?: string;
+            event_id?: string;
+            object_id?: string;
+            object_type?: string;
+            /** Format: date-time */
+            occurred_at?: string;
+            /** Format: date-time */
+            received_at?: string;
+            /** Format: int32 */
+            attempt_count?: number;
+            safe_error_code?: string;
+            status?: string;
+        };
         Page: {
             items?: components["schemas"]["Projection"][];
             /** Format: int64 */
@@ -3209,6 +3409,52 @@ export interface operations {
                 content: {
                     "*/*": components["schemas"]["CampaignResponse"];
                 };
+            };
+        };
+    };
+    listAdminCheckoutReturnUrls: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                siteId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": components["schemas"]["CheckoutReturnUrlPolicy"][];
+                };
+            };
+        };
+    };
+    updateAdminCheckoutReturnUrl: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                siteId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateReturnUrl"];
+            };
+        };
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -3489,6 +3735,55 @@ export interface operations {
                 };
                 content: {
                     "*/*": components["schemas"]["CheckoutResponse"];
+                };
+            };
+        };
+    };
+    prepareClientPaymentSession: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exactly one Origin matching this checkout's allowed Site origin. */
+                Origin: string;
+                /** @description Exactly one nonblank key, without ISO control characters; reuse for the same operation. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                checkoutId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientPaymentSessionResponse"];
+                };
+            };
+        };
+    };
+    receive: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                accountKey: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": Record<string, never>;
                 };
             };
         };
@@ -5108,6 +5403,34 @@ export interface operations {
             };
         };
     };
+    recoverAdminProviderOperation: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                operationId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryRequest"];
+            };
+        };
+        responses: {
+            /** @description Accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": components["schemas"]["RecoveryAccepted"];
+                };
+            };
+        };
+    };
     createAdminRefund: {
         parameters: {
             query?: never;
@@ -6305,6 +6628,74 @@ export interface operations {
                 };
                 content: {
                     "*/*": components["schemas"]["SubscriptionOffers"];
+                };
+            };
+        };
+    };
+    inspectAdminProviderOperations: {
+        parameters: {
+            query: {
+                payment_id: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": components["schemas"]["ProviderOperationView"][];
+                };
+            };
+        };
+    };
+    listAdminUnresolvedProviderOperations: {
+        parameters: {
+            query?: {
+                after?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": components["schemas"]["ProviderOperationView"][];
+                };
+            };
+        };
+    };
+    listAdminDeadProviderReferences: {
+        parameters: {
+            query?: {
+                after?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": components["schemas"]["DeadProviderReferenceView"][];
                 };
             };
         };

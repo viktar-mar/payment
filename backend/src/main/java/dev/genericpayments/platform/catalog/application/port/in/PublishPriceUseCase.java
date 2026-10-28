@@ -5,4 +5,5 @@ import dev.genericpayments.platform.catalog.domain.PriceId;
 
 public interface PublishPriceUseCase {
     Price publish(PriceId id);
+    Price publish(PriceId id, PricePublicationAudit audit);
 }

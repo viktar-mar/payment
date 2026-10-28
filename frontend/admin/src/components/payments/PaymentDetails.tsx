@@ -6,6 +6,7 @@ import { api, errorTitle } from "../../lib/api/client";
 import { PaymentTimeline } from "./PaymentTimeline";
 import { PaymentActions } from "./PaymentActions";
 import { StatusBadge } from "./StatusBadge";
+import { ProviderOperationPanel } from './ProviderOperationPanel';
 import { copy, Language, utc, type Locale } from "../subscriptions/SubscriptionFilters";
 type Schemas = components["schemas"];
 function Fields({ fields }: { fields: readonly (readonly [string, ReactNode])[] }) { return <dl className="details">{fields.map(([name, value]) => <Fragment key={name}><dt>{name}</dt><dd>{value ?? "—"}</dd></Fragment>)}</dl>; }
@@ -36,6 +37,7 @@ export function PaymentDetails({ paymentId }: { paymentId: string }) {
         ["Campaign key", p.campaign_key], ["Campaign version", p.campaign_version],
       ]} /></section>}
       <PaymentActions details={details} onRefresh={refresh} />
+      {p.provider === 'STRIPE' && <ProviderOperationPanel key={paymentId} paymentId={paymentId} />}
       {p.subscription_id && <section className="surface" aria-label={copy(locale,"Subscription billing context","Contexto de faturação da assinatura")}><h2>{copy(locale,"Subscription billing context","Contexto de faturação da assinatura")}</h2><Language locale={locale} onChange={setLocale} /><Fields fields={[
         [copy(locale,"Subscription","Assinatura"),<Link key="subscription" href={`/subscriptions/${p.subscription_id}?site_id=${p.site_id}`}>{p.subscription_id}</Link>], [copy(locale,"Billing record","Registo de faturação"),p.billing_record_id], [copy(locale,"Billing kind","Tipo de faturação"),p.subscription_billing_kind], [copy(locale,"Period start","Início do período"),utc(p.subscription_period_start)], [copy(locale,"Period end","Fim do período"),utc(p.subscription_period_end)],
       ]} /><p>{copy(locale,"Refunds do not cancel this subscription.","Os reembolsos não cancelam esta assinatura.")}</p></section>}

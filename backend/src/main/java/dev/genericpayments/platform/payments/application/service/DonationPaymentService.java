@@ -30,10 +30,11 @@ public class DonationPaymentService implements CreateDonationPaymentUseCase {
     private final DigestPort digest;
     private final Clock clock;
     private final Stage2TelemetryPort telemetry;
+    private final PaymentProviderRegistry providers;
     public DonationPaymentService(PaymentCreationTransaction creation,LoadPaymentPort payments,LoadPaymentAccountPort accounts,
-        CheckoutSessionPort sessions,RandomTokenPort tokens,DigestPort digest,Clock clock,Stage2TelemetryPort telemetry) {
+        CheckoutSessionPort sessions,RandomTokenPort tokens,DigestPort digest,Clock clock,Stage2TelemetryPort telemetry,PaymentProviderRegistry providers) {
         this.creation=creation;this.payments=payments;this.accounts=accounts;this.sessions=sessions;this.tokens=tokens;this.digest=digest;this.clock=clock;
-        this.telemetry=telemetry;
+        this.telemetry=telemetry;this.providers=providers;
     }
     @Override public void preflight(Site site) { requireTelemetry(site,account(site.paymentAccountId())); }
     @Override public Result create(CreateDonationPaymentCommand c) {
@@ -60,9 +61,16 @@ public class DonationPaymentService implements CreateDonationPaymentUseCase {
         return result(session,payment,account(payment.paymentAccountId()),token);
     }
     private PaymentAccount account(PaymentAccountId id) {
-        // Stage 3 has only the local fake server-confirmation capability. No provider adapter is invoked here.
-        return accounts.findById(id).filter(a->a.status()==PaymentAccountStatus.ACTIVE && a.provider()==PaymentProviderType.FAKE)
+        var account=accounts.findById(id).filter(a->a.status()==PaymentAccountStatus.ACTIVE)
             .orElseThrow(CatalogCheckoutTransaction::capability);
+        capabilities(account).require(TaxMode.NONE);
+        return account;
+    }
+    private PaymentProviderCapabilities capabilities(PaymentAccount account) {
+        // Fake retains its local descriptor. Stripe's descriptor resolves config only, never SDK I/O.
+        if(account.provider()==PaymentProviderType.FAKE)return PaymentProviderCapabilities.fake();
+        try { return providers.select(account).capabilities(account); }
+        catch(RuntimeException unavailable) { throw CatalogCheckoutTransaction.capability(); }
     }
     private Stage2TelemetryPort.Context requireTelemetry(Site site,PaymentAccount account) {
         try {
@@ -75,7 +83,7 @@ public class DonationPaymentService implements CreateDonationPaymentUseCase {
     }
     private Result result(CheckoutSession session,Payment p,PaymentAccount account,String token) {
         var view=new CheckoutView(session.id(),p.id().value(),p.money().minorUnits(),p.money().currency(),null,
-            account.provider().name(),PaymentProviderCapabilities.fake().confirmationMode().name(),Map.of(),p.status().name(),session.expiresAt());
+            account.provider().name(),capabilities(account).confirmationMode().name(),Map.of(),p.status().name(),session.expiresAt());
         return new Result(new CheckoutCreation(view,token),p);
     }
 }

@@ -4,6 +4,52 @@ import { PaymentSdkError } from "./errors.js";
 import { recoverCheckout } from "./storage.js";
 import { input, wire, readWire, json, token } from "./test/fixtures.js";
 describe("client transport security", () => {
+  it('authorizes a headless recovered Fake candidate with GET before confirm POST', async () => {
+    vi.stubGlobal('fetch', async () => json(wire())); const client = createGenericPaymentClient({ apiBaseUrl: 'https://api.test' }); await client.createCatalogCheckout(input);
+    const recovered = recoverCheckout({ ...input, apiBaseUrl: 'https://api.test' })!; const requests: Request[] = [];
+    vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { requests.push(new Request(url, init)); return json(readWire(init.method === 'GET' ? 'REQUIRES_PAYMENT_METHOD' : 'PROCESSING')); });
+    expect((await client.confirm(recovered)).status).toBe('PROCESSING'); expect(requests.map(request => request.method)).toEqual(['GET', 'POST']);
+    expect(requests.every(request => request.headers.get('authorization') === `Bearer ${token}`)).toBe(true);
+  });
+  it('keeps a recovered candidate unverified after provider substitution and does not POST', async () => {
+    vi.stubGlobal('fetch', async () => json(wire())); const client = createGenericPaymentClient({ apiBaseUrl: 'https://api.test' }); await client.createCatalogCheckout(input);
+    const recovered = recoverCheckout({ ...input, apiBaseUrl: 'https://api.test' })!; const methods: string[] = [];
+    vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => { methods.push(init.method!); return json({ ...readWire('REQUIRES_PAYMENT_METHOD'), provider_type: 'STRIPE', confirmation_mode: 'CLIENT_PROVIDER' }); });
+    await expect(client.confirm(recovered)).rejects.toMatchObject({ code: 'UNSUPPORTED_PROVIDER' });
+    await expect(client.confirm(recovered)).rejects.toMatchObject({ code: 'UNSUPPORTED_PROVIDER' });
+    expect(methods).toEqual(['GET', 'GET']); expect(recovered.state.status).toBe('REQUIRES_PAYMENT_METHOD');
+  });
+  it('does not authorize a recovered candidate whose local context changed during GET', async () => {
+    vi.stubGlobal('fetch', async () => json(wire())); const client = createGenericPaymentClient({ apiBaseUrl: 'https://api.test' }); await client.createCatalogCheckout(input);
+    const recovered = recoverCheckout({ ...input, apiBaseUrl: 'https://api.test' })!; const methods: string[] = [];
+    vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => { methods.push(init.method!); recovered.siteKey = 'other-site'; return json(readWire('REQUIRES_PAYMENT_METHOD')); });
+    await expect(client.confirm(recovered)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' }); expect(methods).toEqual(['GET']);
+  });
+  it.each([
+    { checkout_id: '55555555-5555-4555-8555-555555555555' }, { payment_id: '55555555-5555-4555-8555-555555555555' },
+    { expires_at: '2099-01-01T00:00:00Z' }, { amount_minor: 5000 }, { currency: 'USD' },
+    { price: { ...wire().price, version: 2 } },
+  ])('refuses changed recovery immutable facts before action %#', async patch => {
+    vi.stubGlobal('fetch', async () => json(wire())); const client = createGenericPaymentClient({ apiBaseUrl: 'https://api.test' }); await client.createCatalogCheckout(input);
+    const recovered = recoverCheckout({ ...input, apiBaseUrl: 'https://api.test' })!; const methods: string[] = [];
+    vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => { methods.push(init.method!); return json({ ...readWire('REQUIRES_PAYMENT_METHOD'), ...patch }); });
+    await expect(client.confirm(recovered)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' }); expect(methods).toEqual(['GET']);
+  });
+  it('retains recovery gating after an aborted authorized read', async () => {
+    vi.stubGlobal('fetch', async () => json(wire())); const client = createGenericPaymentClient({ apiBaseUrl: 'https://api.test' }); await client.createCatalogCheckout(input);
+    const recovered = recoverCheckout({ ...input, apiBaseUrl: 'https://api.test' })!; const controller = new AbortController(); const methods: string[] = [];
+    vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => { methods.push(init.method!); if (methods.length === 1) controller.abort(); return json(readWire('REQUIRES_PAYMENT_METHOD')); });
+    await expect(client.get(recovered, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    await client.confirm(recovered); expect(methods).toEqual(['GET', 'GET', 'POST']);
+  });
+  it('does not clear recovery gating with an earlier read superseded by a failing read', async () => {
+    vi.stubGlobal('fetch', async () => json(wire())); const client = createGenericPaymentClient({ apiBaseUrl: 'https://api.test' }); await client.createCatalogCheckout(input);
+    const recovered = recoverCheckout({ ...input, apiBaseUrl: 'https://api.test' })!; const methods: string[] = []; let deliver!: (response: Response) => void;
+    vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => { methods.push(init.method!); if (methods.length === 1) return new Promise(resolve => { deliver = resolve; }); return methods.length === 2 ? json({ code: 'REQUEST_FAILED' }, 500) : json(readWire('REQUIRES_PAYMENT_METHOD')); });
+    const stale = expect(client.get(recovered)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+    await expect(client.get(recovered)).rejects.toMatchObject({ code: 'REQUEST_FAILED' }); deliver(json(readWire('REQUIRES_PAYMENT_METHOD'))); await stale;
+    await client.confirm(recovered); expect(methods).toEqual(['GET', 'GET', 'GET', 'POST']);
+  });
   it("uses exact catalog, handoff, confirm and read contracts with isolated bearer headers", async () => {
     const requests: Request[] = [];
     vi.stubGlobal("fetch", async (url: string, init: RequestInit) => { requests.push(new Request(url, init)); return json(requests.length < 3 ? wire() : readWire()); });

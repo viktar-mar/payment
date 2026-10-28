@@ -19,7 +19,7 @@ public final class ReconcilePaymentService implements ReconcilePaymentUseCase {
         if(state==null||!acquired.payment().providerPaymentReference().equals(state.reference()))throw PartnerPaymentRules.state();
         var outcome=switch(state.status()){case SUCCEEDED -> Stage2TelemetryPort.ProviderResult.SUCCEEDED;case FAILED -> Stage2TelemetryPort.ProviderResult.FAILED;case CANCELLED -> Stage2TelemetryPort.ProviderResult.CANCELLED;case REQUIRES_ACTION -> Stage2TelemetryPort.ProviderResult.REQUIRES_ACTION;case PROCESSING,PENDING -> Stage2TelemetryPort.ProviderResult.PROCESSING;case UNKNOWN -> Stage2TelemetryPort.ProviderResult.UNKNOWN;default -> Stage2TelemetryPort.ProviderResult.ACCEPTED;};
         telemetry.providerCall(acquired.context(),Stage2TelemetryPort.ProviderOperation.RETRIEVE_PAYMENT,outcome,Duration.ofNanos(Math.max(0,System.nanoTime()-start)));
-        if(refunds!=null)for(var stored:refunds.findByPayment(site,id)){
+        if(acquired.account().provider()!=dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE&&refunds!=null)for(var stored:refunds.findByPayment(site,id)){
             var r=stored.value();if(RefundTransitionService.terminal(r.status()))continue;
             if(r.providerRefundReference()==null)r=refundCoordinator.resume(acquired.payment(),r,acquired.account(),acquired.context(),requestId);
             if(r.providerRefundReference()==null||RefundTransitionService.terminal(r.status()))continue;
@@ -31,5 +31,21 @@ public final class ReconcilePaymentService implements ReconcilePaymentUseCase {
             var result=refundTransitions.reconcile(acquired,r.id(),truth,requestId);refundTransitions.emit(result);
         }
         var result=transitions.reconcile(acquired,state,requestId);transitions.emit(result);return result.payment();
+    }
+    /** Internal Task11 entry: one already-bound Stripe Refund, four logical reads, one 120s lease. */
+    public Refund reconcileRefund(SiteId site,PaymentId paymentId,RefundId refundId,String requestId) {
+        transitions.requireNoAmbientTransaction();
+        var acquired=transitions.acquire(site,paymentId,requestId,lease);
+        if(acquired.account().provider()!=dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE)throw PartnerPaymentRules.state();
+        var refund=refunds.findById(site,refundId).orElseThrow(PartnerPaymentRules::notFound).value();
+        if(!refund.paymentId().equals(paymentId)||refund.providerRefundReference()==null)throw PartnerPaymentRules.state();
+        long start=System.nanoTime();ProviderState state;
+        try{state=providers.select(acquired.account()).retrieveRefund(ProviderRefundLookup.forRefund(acquired.account(),paymentId,refundId,refund.providerRefundReference()));}
+        catch(RuntimeException failure){telemetry.providerCall(acquired.context(),Stage2TelemetryPort.ProviderOperation.RETRIEVE_REFUND,Stage2TelemetryPort.ProviderResult.TEMPORARILY_UNAVAILABLE,Duration.ofNanos(Math.max(0,System.nanoTime()-start)));throw failure;}
+        var outcome=switch(state.status()){case SUCCEEDED->Stage2TelemetryPort.ProviderResult.SUCCEEDED;case FAILED->Stage2TelemetryPort.ProviderResult.FAILED;case CANCELLED->Stage2TelemetryPort.ProviderResult.CANCELLED;case PROCESSING,PENDING->Stage2TelemetryPort.ProviderResult.PROCESSING;default->Stage2TelemetryPort.ProviderResult.UNKNOWN;};
+        telemetry.providerCall(acquired.context(),Stage2TelemetryPort.ProviderOperation.RETRIEVE_REFUND,outcome,Duration.ofNanos(Math.max(0,System.nanoTime()-start)));
+        // Unsupported provider status is unresolved, not successful pending recovery.
+        if(state.status()==ProviderState.Status.UNKNOWN)throw new IllegalStateException("UNRESOLVED_OBJECT");
+        var result=refundTransitions.reconcile(acquired,refundId,state,requestId);refundTransitions.emit(result);return result.refund();
     }
 }

@@ -61,6 +61,7 @@ public class SecurityConfiguration {
         var csrfRepository = CookieCsrfTokenRepository.withHttpOnlyFalse();
         csrfRepository.setCookieCustomizer(cookie -> cookie.secure(properties.secureCookie()).sameSite("Strict").path("/"));
         http.authorizeHttpRequests(auth -> auth
+                .requestMatchers(PathPatternRequestMatcher.withDefaults().matcher(HttpMethod.POST,"/api/v1/provider-webhooks/stripe/{accountKey}")).permitAll()
                 .requestMatchers("/actuator/health/**", "/v3/api-docs/**", "/api/admin/v1/auth/sessions", "/api/v1/public/**").permitAll()
                 .requestMatchers("/api/admin/**", "/api/v1/admin/**").hasRole("ADMIN")
                 .requestMatchers("/api/v1/partner/**").hasRole("PARTNER")
@@ -76,6 +77,7 @@ public class SecurityConfiguration {
                 .sessionAuthenticationStrategy(new NullAuthenticatedSessionStrategy())
                 .csrfTokenRequestHandler(new CsrfTokenRequestAttributeHandler())
                 .ignoringRequestMatchers(PathPatternRequestMatcher.withDefaults()
+                    .matcher(HttpMethod.POST,"/api/v1/provider-webhooks/stripe/{accountKey}"), PathPatternRequestMatcher.withDefaults()
                     .matcher(HttpMethod.POST, "/api/admin/v1/auth/sessions"), PathPatternRequestMatcher.withDefaults().matcher("/api/v1/public/**"),
                     PathPatternRequestMatcher.withDefaults().matcher("/api/v1/partner/**"),
                     PathPatternRequestMatcher.withDefaults().matcher("/api/v1/customer/**")))
@@ -93,6 +95,7 @@ public class SecurityConfiguration {
                         exception instanceof CsrfException ? "csrf_invalid" : "forbidden",
                         exception instanceof CsrfException ? "Invalid CSRF token" : "Forbidden");
                 }))
+            .addFilterBefore(new dev.genericpayments.platform.provider.adapter.in.web.StripeWebhookAdmissionFilter(mapper), CsrfFilter.class)
             .addFilterBefore(new dev.genericpayments.platform.subscriptions.adapter.in.web.SubscriptionRequestPolicyFilter(mapper,true), CsrfFilter.class)
             .addFilterBefore(new dev.genericpayments.platform.customers.adapter.in.web.CustomerAuthenticationRequestPolicyFilter(
                 sites,customerAuthenticationLimits,mapper),

@@ -51,4 +51,12 @@ public class PaymentAttemptPersistenceAdapter implements LoadPaymentAttemptPort,
             .setParameter("site",siteId.value()).setParameter("id",id.value()).getResultList().stream().map(this::stored).toList();
     }
     private StoredAttempt stored(PaymentAttemptJpaEntity e) { return new StoredAttempt(mapper.attempt(e),e.version); }
+    @Override @Transactional(readOnly=true)
+    public List<StoredAttempt> findClientAttemptsByPayment(SiteId siteId,PaymentId id) {
+        var members=new HashSet<>(jdbc.query("""
+            select c.attempt_id from payment_client_attempts c join payments p on p.id=c.payment_id
+            where p.site_id=? and p.id=?
+            """,(rs,n) -> rs.getObject(1,UUID.class),siteId.value(),id.value()));
+        return findByPayment(siteId,id).stream().filter(a -> members.contains(a.value().id().value())).toList();
+    }
 }

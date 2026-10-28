@@ -3,7 +3,12 @@ target
 .idea
 .vscode
 *.iml
+**/test-results
+**/.superpowers
 **/.env
 **/.env.*
-!.env.example
+**/*.env.local
+**/fixtures/customer-issuer-*.jwks.json
+!**/.env.example
+!**/*.env.example
 .DS_Store

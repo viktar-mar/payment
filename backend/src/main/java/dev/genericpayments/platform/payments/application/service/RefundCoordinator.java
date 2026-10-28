@@ -38,13 +38,24 @@ public final class RefundCoordinator implements CreateRefundUseCase {
         catch(RuntimeException failure){result=new ProviderResult.Unknown(null);}
         telemetry.providerCall(context,Stage2TelemetryPort.ProviderOperation.REFUND,Stage2TelemetryPort.ProviderResult.valueOf(result.kind().name()),Duration.ofNanos(Math.max(0,System.nanoTime()-start)));
         var acknowledged=result;
-        var committed=tx.transaction(()->{var locked=payments.findByIdForUpdate(p.siteId(),p.id()).orElseThrow(PartnerPaymentRules::notFound);var stored=refunds.findByIdForUpdate(p.siteId(),r.id()).orElseThrow(PartnerPaymentRules::notFound);if(!locked.paymentAccountId().equals(account.id())||!stored.value().paymentId().equals(locked.id()))throw PartnerPaymentRules.state();return transitions.acknowledge(locked,stored,acknowledged,context,requestId);});
+        var committed=tx.transaction(()->{
+            var locked=payments.findByIdForUpdate(p.siteId(),p.id()).orElseThrow(PartnerPaymentRules::notFound);
+            var stored=refunds.findByIdForUpdate(p.siteId(),r.id()).orElseThrow(PartnerPaymentRules::notFound);
+            if(!locked.paymentAccountId().equals(account.id())||!stored.value().paymentId().equals(locked.id()))throw PartnerPaymentRules.state();
+            if(account.provider()==PaymentProviderType.STRIPE&&(!accounts.findById(account.id()).filter(account::equals).isPresent()
+                    ||!ProviderEvidenceValidator.samePayment(locked,p)||!ProviderEvidenceValidator.sameRefund(stored.value(),r)
+                    ||stored.value().providerRefundReference()!=null&&acknowledged.reference()!=null
+                        &&!stored.value().providerRefundReference().equals(acknowledged.reference())))throw PartnerPaymentRules.state();
+            return transitions.acknowledge(locked,stored,acknowledged,context,requestId);
+        });
         transitions.emit(committed);return committed.refund();
     }
     private Reservation reserve(CreateRefundCommand c){
         var site=sites.findById(c.siteId()).filter(s->s.status()==SiteStatus.ACTIVE).orElseThrow(PartnerPaymentRules::state);
         var p=payments.findByIdForUpdate(c.siteId(),c.paymentId()).orElseThrow(PartnerPaymentRules::notFound);
-        var account=accounts.findById(p.source()==PaymentSource.SUBSCRIPTION?p.paymentAccountId():site.paymentAccountId()).filter(a->a.status()==PaymentAccountStatus.ACTIVE).orElseThrow(PartnerPaymentRules::state);
+        var original=accounts.findById(p.paymentAccountId()).filter(a->a.status()==PaymentAccountStatus.ACTIVE).orElseThrow(PartnerPaymentRules::state);
+        var account=p.source()==PaymentSource.SUBSCRIPTION||original.provider()==PaymentProviderType.STRIPE?original:
+            accounts.findById(site.paymentAccountId()).filter(a->a.status()==PaymentAccountStatus.ACTIVE).orElseThrow(PartnerPaymentRules::state);
         try{providers.select(account);}catch(IllegalStateException unavailable){throw PartnerPaymentRules.state();}
         PartnerPaymentRules.preflight(telemetry,site,account);var context=new Stage2TelemetryPort.Context(site.key().value(),Stage2TelemetryPort.Provider.valueOf(account.provider().name()));
         String hash=idem.fingerprint(Map.of("payment_id",c.paymentId().value(),"amount",c.amountMinor(),"currency",c.currency(),"reason",c.reasonCode(),"note",Objects.toString(c.technicalNote(),"")));

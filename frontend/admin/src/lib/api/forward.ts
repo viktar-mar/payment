@@ -50,6 +50,9 @@ function problem(
 
 // This browser-facing proxy cannot be used to reach customer/partner credential surfaces.
 const routes: readonly [RegExp, readonly string[], boolean, number][] = [
+  [/^v1\/admin\/provider-operations(?:\/(?:unresolved|dead-references))?$/, ["GET"], false, 131072],
+  [/^v1\/admin\/provider-operations\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\/recover$/i, ["POST"], false, 32768],
+  [/^v1\/admin\/sites\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\/checkout-return-urls$/i, ["GET", "PUT"], false, 131072],
   [/^admin\/v1\/auth\/sessions$/, ["POST"], false, 32768], [/^admin\/v1\/auth\/session$/, ["GET", "DELETE"], false, 32768],
   [/^admin\/v1\/(sites|payment-accounts)$/, ["GET", "POST"], false, 131072],
   [/^admin\/v1\/sites\/[^/]+\/catalog$/, ["GET"], false, 131072],
@@ -101,6 +104,18 @@ export async function forward(request: NextRequest, segments: string[]) {
   if (!route) return problem(request, 404, "api_route_not_found", "API route not found");
   if (!route[1].includes(request.method)) return problem(request, 405, "api_method_not_allowed", "API method not allowed");
   const subscription = route[2];
+  const stripeAdmin = path.startsWith('v1/admin/provider-operations') || path.endsWith('/checkout-return-urls');
+  if (stripeAdmin) {
+    const query=request.nextUrl.searchParams;
+    const allowed=path==='v1/admin/provider-operations'?['payment_id']:
+      /\/(unresolved|dead-references)$/.test(path)?['after','limit']:[];
+    const uuid=/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+    if(path==='v1/admin/provider-operations' && !uuid.test(query.get('payment_id')??''))
+      return problem(request,400,'invalid_api_query','Invalid API query');
+    for(const [key,value] of query) if(!allowed.includes(key) || query.getAll(key).length!==1 ||
+      (key==='limit' ? !/^[1-9]\d?$|^100$/.test(value) : !uuid.test(value)))
+      return problem(request,400,'invalid_api_query','Invalid API query');
+  }
   if (subscription) {
     const query = request.nextUrl.searchParams; const allowed = path === "v1/admin/subscriptions" && request.method === "GET" ? ["site_id", "customer_id", "product_id", "state", "limit", "cursor"] : /\/(events|billing-records)$/.test(path) ? ["site_id", "limit", "cursor"] : path.startsWith("v1/admin/subscriptions/") ? ["site_id"] : [];
     for (const [key, value] of query) if (!allowed.includes(key) || query.getAll(key).length !== 1 || value.length > (key === "cursor" ? 4096 : 64)) return problem(request, 400, "invalid_api_query", "Invalid API query");
@@ -108,7 +123,7 @@ export async function forward(request: NextRequest, segments: string[]) {
     if (request.method === "POST" && (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json") || !/^[A-Za-z0-9_.:/-]{1,255}$/.test(request.headers.get("idempotency-key") ?? "") && !path.endsWith("/change-preview"))) return problem(request, 400, "invalid_api_request", "Invalid API request");
   }
   let body: ArrayBuffer | undefined;
-  try { if (!["GET", "HEAD"].includes(request.method)) { const bytes = await bounded(request.body, subscription ? 8192 : 1048576); body = bytes.buffer as ArrayBuffer; } }
+  try { if (!["GET", "HEAD"].includes(request.method)) { const bytes = await bounded(request.body, subscription || stripeAdmin ? 8192 : 1048576); body = bytes.buffer as ArrayBuffer; } }
   catch { return problem(request, 413, "api_body_too_large", "API body too large"); }
   try {
     const target = new URL(

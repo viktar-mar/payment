@@ -30,6 +30,54 @@ class ReconcilePaymentServiceIntegrationTest extends ProviderTestFixture {
         return new ReconcilePaymentService(transitions,new PaymentProviderRegistry(Map.of(account.provider(),provider)),telemetry,clock,Duration.ofSeconds(30));
     }
     Payment persisted(){return save.save(payment().withProviderPaymentReference("object-1",INITIAL_TIME));}
+    @Test void stripeSuccessWithoutEvidenceCannotSettleOrEmitFinancialFacts() {
+        jdbc.update("update payment_accounts set provider='STRIPE',external_account_id='acct_expected',credentials_ref='stripe-sandbox-default' where id=?",account.id().value());
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        var lease=transitions.acquire(site,p.id(),"missing-evidence",Duration.ofSeconds(30));
+        var before=jdbc.queryForMap("select * from payments where id=?",p.id().value());
+        assertThatThrownBy(() -> transitions.reconcile(lease,new ProviderState("pi_fixture",ProviderState.Status.SUCCEEDED),"missing-evidence"))
+            .isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
+        assertThat(jdbc.queryForMap("select * from payments where id=?",p.id().value())).isEqualTo(before);
+        assertThat(count("payment_events")).isZero();assertThat(count("outbox_events")).isZero();
+    }
+    @Test void matchingStripeEvidenceSettlesThroughExistingKernel() {
+        jdbc.update("update payment_accounts set provider='STRIPE',external_account_id='acct_expected',credentials_ref='stripe-sandbox-default' where id=?",account.id().value());
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        var lease=transitions.acquire(site,p.id(),"verified",Duration.ofSeconds(30));
+        var evidence=new ProviderEvidence(dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE,account.id(),account.mode(),"acct_expected",p.money(),"pi_fixture","ch_verified",null,true);
+        assertThat(transitions.reconcile(lease,new ProviderState("pi_fixture",ProviderState.Status.SUCCEEDED,evidence),"verified").payment().status()).isEqualTo(PaymentStatus.SUCCEEDED);
+        assertThat(count("payment_events")).isEqualTo(1);
+    }
+    @Test void staleAccountBindingCannotSettlePreviouslyRetrievedEvidence() {
+        jdbc.update("update payment_accounts set provider='STRIPE',external_account_id='acct_expected',credentials_ref='stripe-sandbox-default' where id=?",account.id().value());
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        var lease=transitions.acquire(site,p.id(),"stale",Duration.ofSeconds(30));
+        var evidence=new ProviderEvidence(dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE,account.id(),account.mode(),"acct_expected",p.money(),"pi_fixture","ch_verified",null,true);
+        jdbc.update("update payment_accounts set credentials_ref='rotated-alias' where id=?",account.id().value());
+        assertThatThrownBy(() -> transitions.reconcile(lease,new ProviderState("pi_fixture",ProviderState.Status.SUCCEEDED,evidence),"stale"))
+            .isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
+        assertThat(load.findById(site,p.id()).orElseThrow().status()).isEqualTo(PaymentStatus.CREATED);assertThat(count("payment_events")).isZero();
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"provider","account","mode","external","money","currency","payment","charge","captured","failed"})
+    void stripeSettlementRejectsEveryForeignOrUncapturedEvidenceField(String field) {
+        jdbc.update("update payment_accounts set provider='STRIPE',external_account_id='acct_expected',credentials_ref='stripe-sandbox-default' where id=?",account.id().value());
+        var p=save.save(payment().withProviderPaymentReference("pi_fixture",INITIAL_TIME));
+        var lease=transitions.acquire(site,p.id(),"mismatch",Duration.ofSeconds(30));
+        var e=new ProviderEvidence(
+            field.equals("provider")?account.provider():dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE,
+            field.equals("account")?new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId(UUID.randomUUID()):account.id(),
+            field.equals("mode")?dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountMode.LIVE:account.mode(),
+            field.equals("external")?"acct_foreign":"acct_expected",
+            field.equals("money")?dev.genericpayments.platform.catalog.domain.Money.of(1999,"EUR"):
+                field.equals("currency")?dev.genericpayments.platform.catalog.domain.Money.of(2000,"USD"):p.money(),
+            field.equals("payment")?"pi_foreign":"pi_fixture",field.equals("charge")?null:"ch_verified",
+            field.equals("failed")?"raw private response":null,!field.equals("captured"));
+        assertThatThrownBy(() -> transitions.reconcile(lease,new ProviderState("pi_fixture",ProviderState.Status.SUCCEEDED,e),"mismatch"))
+            .isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
+        assertThat(load.findById(site,p.id()).orElseThrow().status()).isEqualTo(PaymentStatus.CREATED);
+        assertThat(count("payment_events")).isZero();assertThat(count("outbox_events")).isZero();
+    }
     @Test void ambientTransactionRejectsBeforeLeaseOrProviderLookup() {
         var p=persisted();var before=jdbc.queryForMap("select * from payments where id=?",p.id().value());
         var calls=new java.util.concurrent.atomic.AtomicInteger();var rejection=new java.util.concurrent.atomic.AtomicReference<RuntimeException>();

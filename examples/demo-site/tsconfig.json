@@ -13,5 +13,5 @@
     "noUncheckedIndexedAccess": true,
     "types": ["node", "@playwright/test"]
   },
-  "include": ["src", "tests", "vite.config.ts", "playwright.config.ts"]
+  "include": ["src", "tests", "vite.config.ts", "playwright*.config.ts"]
 }

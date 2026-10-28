@@ -18,10 +18,17 @@ COPY examples/demo-site/package.json examples/demo-site/pnpm-lock.yaml ./example
 RUN cd examples/demo-site \
     && pnpm install --frozen-lockfile
 
-COPY examples/demo-site/index.html examples/demo-site/tsconfig.json examples/demo-site/vite.config.ts ./examples/demo-site/
+COPY examples/demo-site/index.html examples/demo-site/payment-return.html examples/demo-site/form-load-diagnostic.html examples/demo-site/form-load-manual.html examples/demo-site/manual-payment.html examples/demo-site/tsconfig.json examples/demo-site/vite.config.ts ./examples/demo-site/
 COPY examples/demo-site/src ./examples/demo-site/src
+# Pure browser diagnostic schema and its transitive runtime/type dependencies.
+# Never copy the infrastructure directory (it also holds private local inputs).
+COPY infrastructure/stripe-manual-form-evidence.mjs infrastructure/stripe-manual-form-evidence.d.mts \
+    infrastructure/stripe-form-diagnostic-schema.mjs infrastructure/stripe-form-diagnostic-schema.d.mts \
+    infrastructure/stripe-form-diagnostic-environment.mjs infrastructure/stripe-form-diagnostic-environment.d.mts \
+    infrastructure/stripe-form-diagnostic-network.d.mts ./infrastructure/
+ARG PAYMENT_DEMO_BUILD_MODE=production
 RUN cd examples/demo-site \
-    && pnpm build
+    && pnpm build --mode "$PAYMENT_DEMO_BUILD_MODE"
 
 FROM nginxinc/nginx-unprivileged:1.29.5-alpine3.23
 

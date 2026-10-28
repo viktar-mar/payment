@@ -18,4 +18,4 @@ export { PaymentSdkError } from "./errors.js";
 export type { PaymentErrorCode } from "./errors.js";
 export { defineGenericPaymentWidget, GenericPaymentWidget } from "./widget/generic-payment-widget.js";
 export type { WidgetState } from "./widget/generic-payment-widget.js";
-export type { GenericPaymentClient, ClientOptions, CatalogCheckoutInput, HandoffInput, CheckoutSession, CheckoutState, PaymentStatus, WatchOptions, RecoveryIdentity } from "./contracts.js";
+export type { GenericPaymentClient, ClientOptions, CatalogCheckoutInput, HandoffInput, CheckoutSession, FakeCheckoutSession, StripeCheckoutSession, ClientPaymentSession, PrepareClientPaymentOptions, CheckoutState, PaymentStatus, WatchOptions, RecoveryIdentity } from "./contracts.js";

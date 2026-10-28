@@ -69,12 +69,12 @@ class Stage2ObservabilityIntegrationTest extends PostgresIntegrationTest {
         assertThat(meters.find("payment.provider.call").meters()).hasSize(100);
         assertThat(meters.find("payment.provider.unknown").meters()).hasSize(10);
         assertThat(meters.find("payment.refund.result").meters()).hasSize(12);
-        assertThat(meters.find("payment.idempotency.replay").meters()).hasSize(42);
-        assertThat(meters.find("payment.idempotency.conflict").meters()).hasSize(14);
+        assertThat(meters.find("payment.idempotency.replay").meters()).hasSize(48);
+        assertThat(meters.find("payment.idempotency.conflict").meters()).hasSize(16);
         assertThatThrownBy(()->telemetry.paymentCreated(new Context("unconfigured",Provider.FAKE))).isInstanceOf(IllegalArgumentException.class);
     }
     private static Set<String> paymentStates() {return Set.of("created","requires_payment_method","requires_action","processing","succeeded","failed","cancelled","partially_refunded","refunded");}
-    private static Set<String> operations() {return Set.of("checkout_create","checkout_confirm","payment_create","handoff_issue","handoff_exchange","refund_create","reconcile","callback_retry","fake_event","campaign_create","campaign_update","campaign_status","donation_checkout_create","donation_message_redact");}
+    private static Set<String> operations() {return Set.of("checkout_create","checkout_confirm","checkout_client_session","payment_create","handoff_issue","handoff_exchange","refund_create","reconcile","callback_retry","fake_event","campaign_create","campaign_update","campaign_status","donation_checkout_create","donation_message_redact","provider_recovery");}
     @Test void propagatesValidRequestIdThroughAttributeResponseAndMdcThenClears() throws Exception {
         MDC.clear();var req=new MockHttpServletRequest("GET","/api/v1/public/test");req.addHeader("X-Request-Id","safe-correlation:1");
         var response=new MockHttpServletResponse();

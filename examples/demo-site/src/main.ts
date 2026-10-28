@@ -1,6 +1,7 @@
-import { createGenericPaymentClient, defineGenericDonation, defineGenericEmailOtp, defineGenericPaymentWidget, PaymentSdkError, recoverCustomerSession } from "@generic-payments/sdk";
+import { createGenericPaymentClient, defineGenericDonation, defineGenericEmailOtp, defineGenericPaymentWidget, PaymentSdkError, recoverCheckout, recoverCustomerSession } from "@generic-payments/sdk";
 import type { CustomerSession } from "@generic-payments/sdk";
 import { mountSubscriptions } from './subscriptions';
+import {rememberReturnConfiguration} from './payment-return';
 
 import "./styles.css";
 
@@ -98,6 +99,7 @@ function mountCheckout(): void {
 
   try {
     const configuration = configurationFromPage();
+    rememberReturnConfiguration(configuration);
     widget.setAttribute("api-base-url", configuration.apiBaseUrl);
     widget.setAttribute("site-key", configuration.siteKey);
     widget.setAttribute("price-key", configuration.priceKey);
@@ -147,6 +149,7 @@ function mountCustomer(configuration: DemoConfiguration): void {
   const logout = document.querySelector<HTMLButtonElement>("#customer-logout");
   const donationHistory = document.querySelector<HTMLButtonElement>('#customer-donation-history');
   const donations = document.querySelector<HTMLUListElement>('#customer-donations');
+  const checkoutHost=document.querySelector<HTMLElement>('#customer-checkout-host');
   if (!login || !summary || !status || !payments || !pay || !guest || !history || !logout) return;
   const client = createGenericPaymentClient({ apiBaseUrl: configuration.apiBaseUrl });
   const subscriptionDemo = mountSubscriptions(configuration, client, locale => {
@@ -156,8 +159,11 @@ function mountCustomer(configuration: DemoConfiguration): void {
   let session: CustomerSession | null = null;
   let busy = false;
   let generation = 0;
+  let stripeCreated = false;
   let loginElement = login;
   const authorityChanged = (): void => {
+    checkoutHost?.replaceChildren();
+    stripeCreated=false;
     subscriptionDemo.setSession(session ?? undefined);
     document.dispatchEvent(new Event('demo-customer-authority-changed'));
   };
@@ -170,10 +176,10 @@ function mountCustomer(configuration: DemoConfiguration): void {
     loginElement = replacement;
   };
   const controls = (): void => {
-    pay.disabled = busy || session === null;
+    pay.disabled = busy || session === null || stripeCreated;
     history.disabled = busy || session === null;
     logout.disabled = busy || session === null;
-    guest.disabled = busy;
+    guest.disabled = busy || stripeCreated;
     if (donationHistory) donationHistory.disabled = busy || session === null;
   };
   const unavailable = (): void => {
@@ -240,6 +246,23 @@ function mountCustomer(configuration: DemoConfiguration): void {
     const checkout = await client.createCatalogCheckout({ siteKey: configuration.siteKey, priceKey: configuration.priceKey,
       ...(asGuest ? { customerSession: "omit" as const } : {}) });
     if (!ownsCurrent()) return;
+    if(checkout.providerType==='STRIPE') {
+      stripeCreated=true;
+      document.querySelector('#checkout-widget')?.remove();
+      // Recover only the exact already-created checkout. Storage is optional, so a
+      // failed write cannot silently create another payment or mount stale authority.
+      const recovered=recoverCheckout(configuration);
+      if(!checkoutHost||!recovered||recovered.checkoutId!==checkout.checkoutId||recovered.checkoutToken!==checkout.checkoutToken
+        ||recovered.state.paymentId!==checkout.state.paymentId||recovered.providerType!=='STRIPE') {
+        status.textContent='Existing payment session is unavailable. Sign in to inspect history or use the original checkout recovery flow.';
+        return;
+      }
+      const widget=document.createElement('generic-payment-widget');
+      for(const [attribute,value] of Object.entries({'api-base-url':configuration.apiBaseUrl,'site-key':configuration.siteKey,'price-key':configuration.priceKey,locale:configuration.locale}))widget.setAttribute(attribute,value);
+      checkoutHost.replaceChildren(widget);
+      status.textContent='Existing Stripe payment loaded for recovery. Check status, then explicitly resume and pay when the form is ready.';
+      return;
+    }
     const result = await client.confirm(checkout);
     if (!ownsCurrent()) return;
     status.textContent = `Payment ${result.paymentId} · ${result.status}. Fulfillment requires trusted server-side status.`;

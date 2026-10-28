@@ -25,6 +25,11 @@ public class PaymentPersistenceAdapter implements LoadPaymentPort, SavePaymentPo
         return mapper.payment(saveEntity(p, null, false));
     }
     @Override @Transactional(readOnly=true)
+    public Optional<Payment> findByAccountAndId(dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId accountId,PaymentId id) {
+        return entities.createQuery("select p from PaymentJpaEntity p where p.id=:id and p.paymentAccountId=:account",PaymentJpaEntity.class)
+            .setParameter("id",id.value()).setParameter("account",accountId.value()).getResultStream().findFirst().map(mapper::payment);
+    }
+    @Override @Transactional(readOnly=true)
     public Optional<LoadSubscriptionCashOwnershipPort.Ownership> findCashOwnership(dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId accountId,PaymentId paymentId,String reference) {
         return jdbc.query("select subscription_id,subscription_invoice_reference,amount_minor,currency from payments where id=? and payment_account_id=? and provider_payment_reference=? and source='SUBSCRIPTION'",
             (rs,n)->new LoadSubscriptionCashOwnershipPort.Ownership(rs.getObject("subscription_id",UUID.class),rs.getString("subscription_invoice_reference"),dev.genericpayments.platform.catalog.domain.Money.of(rs.getLong("amount_minor"),rs.getString("currency"))),

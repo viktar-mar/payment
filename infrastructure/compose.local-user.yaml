@@ -1,0 +1,3 @@
+services:
+  backend:
+    user: "${PAYMENT_LOCAL_UID:?local launcher must set PAYMENT_LOCAL_UID}:${PAYMENT_LOCAL_GID:?local launcher must set PAYMENT_LOCAL_GID}"

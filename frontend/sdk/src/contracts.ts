@@ -6,7 +6,13 @@ export type PaymentStatus = "CREATED" | "REQUIRES_PAYMENT_METHOD" | "REQUIRES_AC
 export interface PriceSnapshot { priceId: string; priceKey: string; version: number; amountMinor: number; currency: string; taxMode: "NONE" | "INCLUSIVE"; }
 export interface CheckoutState { checkoutId: string; paymentId: string; amountMinor: number; currency: string; price: PriceSnapshot | null; status: PaymentStatus; expiresAt: string; }
 /** Secret-bearing capability. Keep out of events, logs, URLs and DOM. */
-export interface CheckoutSession { checkoutId: string; checkoutToken: string; expiresAt: string; apiBaseUrl: string; siteKey: string; priceKey: string; state: CheckoutState; providerType: "FAKE"; confirmationMode: "SERVER"; providerClientPayload: Record<string, never>; donation?: DonationContext; }
+interface CheckoutSessionBase { checkoutId: string; checkoutToken: string; expiresAt: string; apiBaseUrl: string; siteKey: string; priceKey: string; state: CheckoutState; providerClientPayload: Record<string, never>; donation?: DonationContext; }
+export interface FakeCheckoutSession extends CheckoutSessionBase { providerType: 'FAKE'; confirmationMode: 'SERVER'; }
+export interface StripeCheckoutSession extends CheckoutSessionBase { providerType: 'STRIPE'; confirmationMode: 'CLIENT_PROVIDER'; }
+export type CheckoutSession = FakeCheckoutSession | StripeCheckoutSession;
+/** Ephemeral capability. Keep out of storage, events, logs, URLs and DOM. */
+export interface ClientPaymentSession { checkoutId: string; paymentId: string; attemptId: string; publishableKey: string; clientSecret: string; expiresAt: string; returnUrl: string; }
+export interface PrepareClientPaymentOptions { idempotencyKey?: string; signal?: AbortSignal; }
 export interface CatalogCheckoutInput { siteKey: string; priceKey: string; signal?: AbortSignal; customerSession?: "omit"; }
 export interface HandoffInput extends Pick<CatalogCheckoutInput, "siteKey" | "priceKey" | "signal"> { handoffToken: string; }
 export interface WatchOptions { signal?: AbortSignal; }
@@ -19,6 +25,7 @@ export interface GenericPaymentClient extends CustomerClient {
   createCatalogCheckout(input: CatalogCheckoutInput): Promise<CheckoutSession>;
   exchangeHandoff(input: HandoffInput): Promise<CheckoutSession>;
   confirm(session: CheckoutSession): Promise<CheckoutState>;
+  prepareClientPayment(session: StripeCheckoutSession, options?: PrepareClientPaymentOptions): Promise<ClientPaymentSession>;
   get(session: CheckoutSession, signal?: AbortSignal): Promise<CheckoutState>;
   watch(session: CheckoutSession, options?: WatchOptions): AsyncIterable<CheckoutState>;
   clear(session: CheckoutSession): void;
@@ -52,12 +59,24 @@ export function validateSession(value: CheckoutSession, base?: string): void {
   if (!object(value) || !uuid(value.checkoutId) || !token(value.checkoutToken) || !instant(value.expiresAt) || !key(value.siteKey) || !key(value.priceKey) || normalizeApiBase(value.apiBaseUrl) !== value.apiBaseUrl || (base && base !== value.apiBaseUrl)) throw new PaymentSdkError("INVALID_CONFIGURATION");
   const state = safeState(value.state);
   if (state.checkoutId !== value.checkoutId || state.expiresAt !== value.expiresAt || (state.price && state.price.priceKey !== value.priceKey)) throw new PaymentSdkError("INVALID_RESPONSE");
+  providerBinding(value.providerType, value.confirmationMode, value.providerClientPayload);
 }
-export function parseWire(value: unknown, creation: boolean): { state: CheckoutState; checkoutToken?: string } {
+type ProviderBinding = Pick<FakeCheckoutSession, 'providerType' | 'confirmationMode'> | Pick<StripeCheckoutSession, 'providerType' | 'confirmationMode'>;
+function providerBinding(provider: unknown, mode: unknown, payload: unknown): ProviderBinding {
+  if (!object(payload) || Object.keys(payload).length) throw new PaymentSdkError('UNSUPPORTED_PROVIDER');
+  if (provider === 'FAKE' && mode === 'SERVER') return { providerType: provider, confirmationMode: mode };
+  if (provider === 'STRIPE' && mode === 'CLIENT_PROVIDER') return { providerType: provider, confirmationMode: mode };
+  throw new PaymentSdkError('UNSUPPORTED_PROVIDER');
+}
+export function assertProviderBinding(expectedProvider: string, expectedMode: string, actualProvider: string, actualMode: string): void {
+  providerBinding(expectedProvider, expectedMode, {}); providerBinding(actualProvider, actualMode, {});
+  if (expectedProvider !== actualProvider || expectedMode !== actualMode) throw new PaymentSdkError('UNSUPPORTED_PROVIDER');
+}
+export function parseWire(value: unknown, creation: boolean): { state: CheckoutState; checkoutToken?: string } & ProviderBinding {
   const keys = ["checkout_id", "payment_id", "amount_minor", "currency", "price", "provider_type", "confirmation_mode", "provider_client_payload", "status", "expires_at"];
   if (creation) keys.push("checkout_token");
   if (!object(value) || !exact(value, keys) || (creation && !token(value.checkout_token))) throw new PaymentSdkError("INVALID_RESPONSE");
-  if (value.provider_type !== "FAKE" || value.confirmation_mode !== "SERVER" || !object(value.provider_client_payload) || Object.keys(value.provider_client_payload).length) throw new PaymentSdkError("UNSUPPORTED_PROVIDER");
+  const binding = providerBinding(value.provider_type, value.confirmation_mode, value.provider_client_payload);
   let price: unknown = null;
   if (value.price !== null) {
     const p = value.price;
@@ -65,5 +84,5 @@ export function parseWire(value: unknown, creation: boolean): { state: CheckoutS
     price = { priceId: p.price_id, priceKey: p.price_key, version: p.version, amountMinor: p.amount_minor, currency: p.currency, taxMode: p.tax_mode };
   }
   const state = safeState({ checkoutId: value.checkout_id, paymentId: value.payment_id, amountMinor: value.amount_minor, currency: value.currency, price, status: value.status, expiresAt: value.expires_at });
-  return { state, checkoutToken: creation ? value.checkout_token as string : undefined };
+  return { state, checkoutToken: creation ? value.checkout_token as string : undefined, ...binding };
 }

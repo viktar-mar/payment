@@ -1,5 +1,13 @@
 # Payment admin
 
+Stage5A exposes safe original Account/mode operation inspection, DEAD reference receipts, audited
+proof recovery and versioned checkout return-URL policies. A recovery acknowledgement or refund202
+does not establish settlement. Keep the original operation key after a timeout and inspect its server
+facts before an explicit retry. The default UI tests/Fake browser suite require no Stripe keys; real
+Sandbox acceptance uses the separate opt-in runner and browser config described in
+[local development](../docs/local-development.md#stage-5a-offline-regression-and-explicit-sandbox-acceptance).
+Server Stripe keys belong only in the backend, never Admin/demo environment or browser diagnostics.
+
 ## Stage 4 subscriptions (local Fake provider)
 
 Enable the Site subscription policy, publish a subscription Price, and configure explicit same-Product/currency transitions. Published Price versions and invoice policy snapshots are immutable. Policy changes affect future operations, not an existing invoice's fixed grace deadline. Enablement cannot be switched off while a non-terminal subscription or unresolved create/cancel still exists.

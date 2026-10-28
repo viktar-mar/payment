@@ -13,6 +13,18 @@ import dev.genericpayments.platform.payments.adapter.in.web.*;
 @Configuration(proxyBeanMethods = false)
 @EnableConfigurationProperties(PublicRateLimitProperties.class)
 class CheckoutConfiguration {
+    @Bean ClientPaymentAttemptTransaction clientPaymentAttemptTransaction(LoadPaymentPort payments,LoadPaymentAttemptPort attempts,
+        SavePaymentAttemptPort saveAttempts,ClientPaymentAttemptPort baselines,CheckoutSessionPort sessions,LoadSitePort sites,
+        LoadPaymentAccountPort accounts,dev.genericpayments.platform.customers.application.port.out.CustomerStore customers,
+        IdempotencyService idempotency,PaymentPhaseSupport journal,Clock clock) {
+        return new ClientPaymentAttemptTransaction(payments,attempts,saveAttempts,baselines,sessions,sites,accounts,customers,idempotency,journal,clock);
+    }
+    @Bean PrepareClientPaymentService prepareClientPaymentService(CheckoutAuthorizationService authorization,LoadPaymentAccountPort accounts,
+        PaymentProviderRegistry providers,PaymentPreparationCoordinator preparation,ClientPaymentAttemptTransaction transaction,
+        ClientPaymentCapabilityPort capabilities,CheckoutReturnUrlPort returnUrls,LoadPaymentAttemptPort attempts,
+        dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore operations) {
+        return new PrepareClientPaymentService(authorization,accounts,providers,preparation,transaction,capabilities,returnUrls,attempts,operations);
+    }
     @Bean @Primary RateLimitPort publicRateLimitPort(Clock clock, PublicRateLimitProperties properties) {
         return new InMemoryTokenBucketRateLimitAdapter(clock, properties.createPerMinute(), properties.confirmPerMinute(), properties.readPerMinute(), properties.maxKeys());
     }

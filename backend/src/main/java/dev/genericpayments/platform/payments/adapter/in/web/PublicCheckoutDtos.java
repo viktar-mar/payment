@@ -16,7 +16,17 @@ public final class PublicCheckoutDtos {
         @Override public String toString() { return "CheckoutCreationResponse[checkoutId=" + checkoutId + ", token=redacted]"; }
     }
     public record CheckoutResponse(UUID checkoutId, UUID paymentId, long amountMinor, String currency, PriceSnapshotResponse price,
-        String providerType, String confirmationMode, Map<String, Object> providerClientPayload, String status, Instant expiresAt) {}
+        String providerType, String confirmationMode, Map<String, Object> providerClientPayload, String status, Instant expiresAt) {
+        @Override public String toString() { return "CheckoutResponse[redacted]"; }
+    }
+    public record ClientPaymentSessionResponse(UUID checkoutId,UUID paymentId,UUID attemptId,String providerType,String confirmationMode,
+        String publishableKey,String clientSecret,Instant expiresAt,java.net.URI returnUrl) {
+        @Override public String toString() { return "ClientPaymentSessionResponse[redacted]"; }
+    }
+    static ClientPaymentSessionResponse clientSession(ClientPaymentSession session) {
+        return new ClientPaymentSessionResponse(session.checkoutId(),session.paymentId(),session.attemptId(),"STRIPE","CLIENT_PROVIDER",
+            session.capability().publishableKey(),session.capability().clientSecret(),session.expiresAt(),session.returnUrl());
+    }
     static PriceSnapshotResponse price(CheckoutView v) {
         var p = v.priceSnapshot();
         return p == null ? null : new PriceSnapshotResponse(p.priceId().value(), p.priceKey(), p.version(), p.money().minorUnits(), p.money().currency(), p.taxMode().name());

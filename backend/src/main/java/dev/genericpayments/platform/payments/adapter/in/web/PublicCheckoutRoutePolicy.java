@@ -40,7 +40,7 @@ final class PublicCheckoutRoutePolicy {
         if (segments.length == 6) return "checkouts".equals(segments[4]);
         if (segments.length != 7) return false;
         return "sites".equals(segments[4]) && "checkouts".equals(segments[6])
-            || "checkouts".equals(segments[4]) && "confirm".equals(segments[6]);
+            || "checkouts".equals(segments[4]) && ("confirm".equals(segments[6]) || "client-session".equals(segments[6]));
     }
 
     static boolean routeFamily(String rawApplicationPath) {

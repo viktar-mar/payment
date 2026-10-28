@@ -17,8 +17,13 @@ public final class AdminApiClient {
     public Cookie session;
     public Cookie xsrf;
     public AdminApiClient(WebApplicationContext context) {
-        mvc = MockMvcBuilders.webAppContextSetup(context).addFilters(context.getBean(RequestIdFilter.class))
-            .apply(springSecurity()).build();
+        this(context, null);
+    }
+    public AdminApiClient(WebApplicationContext context, String remoteAddress) {
+        var builder = MockMvcBuilders.webAppContextSetup(context).addFilters(context.getBean(RequestIdFilter.class))
+            .apply(springSecurity());
+        if (remoteAddress != null) builder.defaultRequest(get("/").remoteAddress(remoteAddress));
+        mvc = builder.build();
     }
     public void login() throws Exception {
         var response = mvc.perform(post("/api/admin/v1/auth/sessions").contentType("application/json")

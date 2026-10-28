@@ -3,16 +3,23 @@ package dev.genericpayments.platform.payments.adapter.in.configuration;
 import dev.genericpayments.platform.payments.domain.*;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType;
 import io.swagger.v3.oas.models.media.Schema;
+import io.swagger.v3.oas.models.media.Content;
+import io.swagger.v3.oas.models.media.MediaType;
+import io.swagger.v3.oas.models.media.StringSchema;
+import io.swagger.v3.oas.models.parameters.Parameter;
+import io.swagger.v3.oas.models.security.SecurityRequirement;
+import io.swagger.v3.oas.models.security.SecurityScheme;
 import java.util.*;
 import org.springdoc.core.customizers.OpenApiCustomizer;
 import org.springframework.context.annotation.*;
 
-/** Align only Task 9 schemas with the existing snake-case HTTP serialization. */
+/** Align explicitly listed payment schemas with the existing snake-case HTTP serialization. */
 @Configuration(proxyBeanMethods=false)
 public class PaymentAdminOpenApiConfiguration {
     @Bean OpenApiCustomizer paymentAdminSchemas(){return api->{
         var schemas=api.getComponents().getSchemas();
-        for(String name:List.of("RefundRequest","RefundResponse","FakeRequest","ApiValidationProblem","Projection","Page","Attempt","Event","RefundView","Outbox","Delivery","Details","Accepted")){
+        for(String name:List.of("RefundRequest","RefundResponse","FakeRequest","ApiValidationProblem","Projection","Page","Attempt","Event","RefundView","Outbox","Delivery","Details","Accepted",
+                "ProviderOperationView","DeadProviderReferenceView","RecoveryRequest","RecoveryAccepted","UpdateReturnUrl","CheckoutReturnUrlPolicy","ClientPaymentSessionResponse")){
             Schema<?> schema=schemas.get(name);if(schema==null||schema.getProperties()==null)continue;
             var properties=new LinkedHashMap<String,Schema>();
             schema.getProperties().forEach((key,value)->properties.put(snake(key),value));schema.setProperties(properties);
@@ -33,6 +40,30 @@ public class PaymentAdminOpenApiConfiguration {
         values(schemas,"Outbox","callback_type",List.of("payment.requires_payment_method","payment.requires_action","payment.processing","payment.succeeded","payment.failed","payment.cancelled","refund.processing","refund.succeeded","refund.failed"));
         values(schemas,"Delivery","status",List.of("SUCCEEDED","FAILED"));values(schemas,"Accepted","status",List.of("ACCEPTED"));
         values(schemas,"RefundView","reason_code",List.of("REQUESTED_BY_CUSTOMER","DUPLICATE","FRAUDULENT","OTHER"));values(schemas,"FieldError","code",List.of("INVALID_VALUE"));
+        var clientSession=schemas.get("ClientPaymentSessionResponse");
+        if(clientSession!=null)clientSession.setRequired(List.of("checkout_id","payment_id","attempt_id","provider_type",
+            "confirmation_mode","publishable_key","client_secret","expires_at","return_url"));
+        values(schemas,"ClientPaymentSessionResponse","provider_type",List.of("STRIPE"));
+        values(schemas,"ClientPaymentSessionResponse","confirmation_mode",List.of("CLIENT_PROVIDER"));
+        var path=api.getPaths().get("/api/v1/public/checkouts/{checkoutId}/client-session");
+        if(path!=null&&path.getPost()!=null){
+            var operation=path.getPost();
+            operation.setDescription("Prepare an ephemeral client capability using this checkout's confirm-scoped bearer, exact allowed Origin and idempotency key. The request body must be empty.");
+            operation.setRequestBody(null);
+            operation.addParametersItem(new Parameter().name("Origin").in("header").required(true)
+                .description("Exactly one Origin matching this checkout's allowed Site origin.")
+                .schema(new StringSchema().minLength(1)));
+            operation.addParametersItem(new Parameter().name("Idempotency-Key").in("header").required(true)
+                .description("Exactly one nonblank key, without ISO control characters; reuse for the same operation.")
+                .schema(new StringSchema().minLength(1).maxLength(255)));
+            api.getComponents().addSecuritySchemes("checkoutBearer",new SecurityScheme().type(SecurityScheme.Type.HTTP)
+                .scheme("bearer").bearerFormat("checkout token")
+                .description("Exactly one Authorization: Bearer header with the 43-character opaque checkout token ([A-Za-z0-9_-]), scoped to confirm this checkout. This is not an Admin or Customer session."));
+            operation.setSecurity(List.of(new SecurityRequirement().addList("checkoutBearer")));
+            var response=operation.getResponses().get("200");
+            if(response!=null)response.setContent(new Content().addMediaType("application/json",new MediaType()
+                .schema(new Schema<>().$ref("#/components/schemas/ClientPaymentSessionResponse"))));
+        }
     };}
     private static String snake(String name){return name.replaceAll("([a-z])([A-Z])","$1_$2").toLowerCase(Locale.ROOT);}
     @SuppressWarnings({"rawtypes","unchecked"})

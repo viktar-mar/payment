@@ -2,6 +2,7 @@ import { exact, key, normalizeApiBase, object } from "../contracts.js";
 import { PaymentSdkError } from "../errors.js";
 import { browserOrigin, validateCustomerSession } from "./contracts.js";
 import type { CustomerRecoveryIdentity, CustomerSession } from "./contracts.js";
+import { clearCheckoutCustomer, replaceCheckoutCustomer } from './session-lifecycle.js';
 // Safe failure markers retain fail-closed intent after public recovery removes a bad record.
 // They contain only a namespace and fixed code, never a credential or response body.
 const invalidRecords = new Map<string, "INVALID_SESSION" | "SESSION_EXPIRED">();
@@ -54,9 +55,11 @@ export function resolveCustomerSession(identity: CustomerRecoveryIdentity): Cust
 export function recoverCustomerSession(identity: CustomerRecoveryIdentity): CustomerSession | null { const result = resolveCustomerSession(identity); return result.kind === "valid" ? result.session : null; }
 export function saveCustomerSession(session: CustomerSession): boolean {
   validateCustomerSession(session); const storageKey = customerStorageKey(session); invalidRecords.delete(storageKey);
+  replaceCheckoutCustomer(session);
   try { const target = globalThis.sessionStorage; if (!target) return false; const raw = JSON.stringify({ version: 1, ...session }); target.setItem(storageKey, raw); noteRecordObservation(storageKey, raw, false); return true; } catch { return false; }
 }
 export function clearCustomerSession(session: CustomerSession): void {
+  clearCheckoutCustomer(session);
   const storageKey = customerStorageKey(session); const raw = readCustomerRecord(session);
   // Even a nonmatching exact-token clear has observed a replacement record.
   if (typeof raw === "string") noteRecordObservation(storageKey, raw, false);

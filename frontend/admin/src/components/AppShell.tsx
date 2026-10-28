@@ -34,6 +34,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <span className="font-semibold">Payment admin</span>
           <Link href="/sites" prefetch={pathname === "/login" ? false : undefined}>Sites</Link>
           <Link href="/payments" prefetch={pathname === "/login" ? false : undefined}>Payments</Link>
+          <Link href="/provider-operations" prefetch={pathname === "/login" ? false : undefined}>Provider operations</Link>
           <Link href="/customers" prefetch={pathname === "/login" ? false : undefined}>Customers</Link>
           <Link href="/donations" prefetch={pathname === "/login" ? false : undefined}>Donations</Link>
           <Link href="/subscriptions" prefetch={pathname === "/login" ? false : undefined}>Subscriptions / Assinaturas</Link>

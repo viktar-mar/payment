@@ -1,6 +1,5 @@
 package dev.genericpayments.platform.provider.adapter.out.fake;
 
-import dev.genericpayments.platform.catalog.application.port.out.CatalogProviderPort;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -23,7 +22,7 @@ class FakeProviderConfiguration {
         return account -> {FakeSubscriptionStateAdapter.requireFake(account);return fake;};
     }
     @Bean
-    CatalogProviderPort catalogProviderPort() {
+    FakeCatalogProviderAdapter catalogProviderPort() {
         return new FakeCatalogProviderAdapter();
     }
 }
