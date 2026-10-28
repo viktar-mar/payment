@@ -47,6 +47,7 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
     private final Clock clock;
     private final StripeBillingOwnership ownership;
     private SubscriptionBillingProofStore proofs;
+    @org.springframework.beans.factory.annotation.Autowired private SubscriptionPlanProofStore planProofs;
     private Clock providerClock=Clock.systemUTC();
     @org.springframework.beans.factory.annotation.Autowired private SubscriptionSetupContinuationGuard continuationGuard;
     @org.springframework.beans.factory.annotation.Autowired private dev.genericpayments.platform.subscriptions.application.service.SubscriptionResumeReceiptTransaction resumeReceipts;
@@ -79,7 +80,7 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
         this.proofs=Objects.requireNonNull(proofs);this.providerClock=Objects.requireNonNull(providerClock);
     }
     @Transactional(propagation=Propagation.SUPPORTS,readOnly=true)
-    public Capabilities capabilities(PaymentAccount account){ownership.requireAccount(account,false);return new Capabilities(false,false,proofs!=null&&billingActions!=null&&billingActions.get().enabled()&&continuationGuard!=null,false);}
+    public Capabilities capabilities(PaymentAccount account){ownership.requireAccount(account,false);return new Capabilities(planProofs!=null,false,proofs!=null&&billingActions!=null&&billingActions.get().enabled()&&continuationGuard!=null,false);}
     public CreatePreparation prepareCreate(Command command){
         if(!command.startTrial()||command.current().trialPolicy()!=dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.REQUIRED_BEFORE_TRIAL)return new ReadyForCreate();
         if(proofs==null)throw unsupported();
@@ -281,7 +282,7 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
         }
         if(s.providerReference()==null)throw mismatch();
         verification.verify(lookup.account());
-        var result=StripeBillingSnapshotMapper.retrieve(client(lookup.account()),new StripeBillingSnapshotMapper.Ownership(lookup.account(),s,b,prices,trialContext,proofs),clock.instant());
+        var result=StripeBillingSnapshotMapper.retrieve(client(lookup.account()),new StripeBillingSnapshotMapper.Ownership(lookup.account(),s,b,prices,trialContext,proofs,planProofs==null?List.of():ownership.planHistory(lookup.account(),s,planProofs),planProofs==null?List.of():ownership.scheduleHistory(lookup.account(),s,planProofs)),clock.instant());
         ownership.owned(lookup.account(),s.id());
         if(o==null)return operationResult(lookup,s,b,result);
         var originalTerms=initial.terms();
@@ -294,20 +295,50 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
             new OperationObservation(o.providerOperationKey(),paid?OperationState.APPLIED:OperationState.PENDING),result.recoveryObservations(),result.trialEvidence());
     }
     private Snapshot operationResult(Lookup lookup,Subscription s,CustomerBinding b,Snapshot result){
-        if(lookup.providerOperationKey()==null||proofs==null)return result;
+        if(lookup.providerOperationKey()==null||proofs==null&&planProofs==null)return result;
         var matching=operations.unresolved(s.siteId(),s.id()).stream().filter(o->lookup.providerOperationKey().equals(o.providerOperationKey())).toList();
-        if(matching.size()!=1)return result;var o=matching.getFirst();boolean applied=false;
-        if(o.kind()==SubscriptionOperation.Kind.SETUP){
+        if(matching.size()!=1)return result;var o=matching.getFirst();boolean applied=false,declined=false;
+        if(o.kind()==SubscriptionOperation.Kind.SETUP&&proofs!=null){
             var setup=proofs.setup(lookup.account().id(),o.id()).orElse(null);var update=steps.find(lookup.account().id(),o.providerOperationKey()+":METHOD").orElse(null);
             if(setup!=null&&setup.method()!=null&&update!=null&&update.status()==ProviderOperation.Status.ACKNOWLEDGED&&update.providerReference().equals(s.providerReference())&&update.fingerprint().equals(methodFingerprint(lookup.account(),s,o,b,setup))&&result.paymentMethodReady()){
                 try{var remote=client(lookup.account()).v1().subscriptions().retrieve(s.providerReference());applied=remote!=null&&s.providerReference().equals(remote.getId())&&b.providerReference().equals(remote.getCustomer())&&setup.method().equals(remote.getDefaultPaymentMethod());}catch(StripeException invalid){throw mismatch();}
             }
-        }else if(o.kind()==SubscriptionOperation.Kind.RESUME){
+        }else if(o.kind()==SubscriptionOperation.Kind.RESUME&&proofs!=null){
             var resume=proofs.resume(lookup.account().id(),o.id()).orElse(null);var update=steps.find(lookup.account().id(),o.providerOperationKey()).orElse(null);
             if(resume!=null&&update!=null&&update.id().equals(resume.step())&&update.status()==ProviderOperation.Status.ACKNOWLEDGED&&update.fingerprint().equals(resumeFingerprint(lookup.account(),s,o,b))&&s.providerReference().equals(resume.reference()))
                 applied=result.status()==Subscription.Status.ACTIVE&&result.invoices().stream().anyMatch(i->i.reference().equals(resume.invoice())&&i.period().equals(resume.period())&&i.price().equals(s.billingPrice())&&i.settlement()==SettlementKind.CASH);
+        }else if(o.kind()==SubscriptionOperation.Kind.CHANGE&&planProofs!=null){
+            var original=planProofs.result(lookup.account().id(),o.id()).orElse(null);
+            if(original!=null){
+                var q=planProofs.quote(lookup.account().id(),original.quote()).orElseThrow(StripeSubscriptionProviderAdapter::mismatch);
+                var invoice=result.invoices().stream().filter(i->i.reference().equals(original.invoice())).findFirst().orElseThrow(StripeSubscriptionProviderAdapter::mismatch);
+                applied=result.status()==Subscription.Status.ACTIVE&&result.billingPrice().equals(q.target())&&result.period().equals(q.period())&&(invoice.settlement()==SettlementKind.CASH||invoice.settlement()==SettlementKind.ZERO);
+                if(!applied&&invoice.settlement()==SettlementKind.VOID&&original.pendingExpiry()!=null&&providerClock.instant().getEpochSecond()>=original.pendingExpiry()&&result.billingPrice().equals(q.source())&&result.period().equals(q.period())){
+                    try{var remote=client(lookup.account()).v1().subscriptions().retrieve(s.providerReference());StripeBillingOwnership.requireCurrentRemote(remote,s,b,ownership.price(lookup.account(),s,q.source()));declined=remote.getPendingUpdate()==null&&"active".equals(remote.getStatus())&&StripeBillingMutationAdapter.itemPeriod(remote).equals(result.period());}catch(StripeException invalid){throw mismatch();}
+                }
+            }else{
+                var schedule=planProofs.schedule(lookup.account().id(),o.id()).orElse(null);
+                if(schedule!=null&&schedule.updateStep()!=null&&schedule.releaseStep()==null){
+                    var q=planProofs.quote(lookup.account().id(),schedule.quote()).orElseThrow(StripeSubscriptionProviderAdapter::mismatch);
+                    StripeBillingMutationAdapter.requireScheduleSteps(new Command(lookup.account(),o,s.billingPrice(),q.target(),s.providerReference(),null,q.reference(),false,false),s,o,q,schedule,steps);
+                    applied=result.invoices().stream().anyMatch(i->i.kind()==BillingRecord.Kind.RENEWAL&&i.settlement()==SettlementKind.CASH&&i.price().equals(q.target())&&i.period().start().equals(q.period().end())&&i.period().end().getEpochSecond()==schedule.targetEnd());
+                    if(!applied&&providerClock.instant().isBefore(q.period().end()))try{var remote=client(lookup.account()).v1().subscriptionSchedules().retrieve(schedule.reference());StripeBillingMutationAdapter.requireSchedule(remote,q,schedule,true);applied=true;}catch(StripeException invalid){throw mismatch();}
+                }
+            }
+        }else if(o.kind()==SubscriptionOperation.Kind.CLEAR_CHANGE&&planProofs!=null&&s.pendingChange()!=null){
+            var schedule=planProofs.schedule(lookup.account().id(),s.pendingChange().operationId()).orElse(null);
+            if(schedule!=null&&o.id().equals(schedule.clearOperation())&&schedule.releaseStep()!=null){
+                var q=planProofs.quote(lookup.account().id(),schedule.quote()).orElseThrow(StripeSubscriptionProviderAdapter::mismatch);
+                var original=operations.find(s.siteId(),s.id(),schedule.operation()).orElseThrow(StripeSubscriptionProviderAdapter::mismatch);
+                StripeBillingMutationAdapter.requireScheduleSteps(new Command(lookup.account(),o,s.billingPrice(),null,s.providerReference(),null,null,false,false),s,original,q,schedule,steps);
+                var release=steps.findById(schedule.releaseStep()).orElseThrow(StripeSubscriptionProviderAdapter::mismatch);
+                if(release.kind()!=ProviderOperation.Kind.SCHEDULE_RELEASE||release.status()!=ProviderOperation.Status.ACKNOWLEDGED||!release.accountId().equals(lookup.account().id())||!release.resourceId().equals(o.id())||!release.operationKey().equals(o.providerOperationKey()+":SCHEDULE_RELEASE")||!release.providerReference().equals(schedule.reference())||!release.externalAccountId().equals(lookup.account().externalAccountId())||!release.credentialsRef().equals(lookup.account().credentialsRef())||!release.fingerprint().equals(StripeBillingMutationAdapter.scheduleFingerprint(lookup.account(),o,q,schedule,ProviderOperation.Kind.SCHEDULE_RELEASE)))throw mismatch();
+                try{
+                    StripeBillingMutationAdapter.requireReleased(client(lookup.account()).v1().subscriptionSchedules().retrieve(schedule.reference()),q,schedule,release,providerClock.instant());applied=true;
+                }catch(StripeException invalid){throw mismatch();}
+            }
         }
-        return new Snapshot(result.subscriptionReference(),result.status(),result.billingPrice(),result.period(),result.trial(),result.cancellationAt(),result.invoices(),o.providerOperationKey(),result.paymentMethodReady(),result.providerRevision(),result.observedAt(),new OperationObservation(o.providerOperationKey(),applied?OperationState.APPLIED:OperationState.PENDING),result.recoveryObservations(),result.trialEvidence());
+        return new Snapshot(result.subscriptionReference(),result.status(),result.billingPrice(),result.period(),result.trial(),result.cancellationAt(),result.invoices(),o.providerOperationKey(),result.paymentMethodReady(),result.providerRevision(),result.observedAt(),new OperationObservation(o.providerOperationKey(),applied?OperationState.APPLIED:declined?OperationState.DECLINED:OperationState.PENDING),result.recoveryObservations(),result.trialEvidence());
     }
     private String methodFingerprint(PaymentAccount a,Subscription s,SubscriptionOperation o,CustomerBinding b,SubscriptionBillingProofStore.Setup setup){return StripeRequestFingerprint.of(digest,a,"SUBSCRIPTION_METHOD_V1",o.id().toString(),o.providerOperationKey()+":METHOD",o.fingerprint(),s.providerReference(),b.providerReference(),setup.step().toString(),setup.reference(),setup.method(),"consent:true");}
     private String resumeFingerprint(PaymentAccount a,Subscription s,SubscriptionOperation o,CustomerBinding b){return ownership.resumeFingerprint(a,s,o,b,ownership.price(a,s,s.billingPrice()));}
@@ -351,9 +382,23 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
         return accepted(steps.bindRecovered(step,reference,step.fingerprint()).providerReference());
     }
     public NextAction nextAction(Lookup lookup){ownership.owned(lookup.account(),lookup.subscriptionId());return billingActions==null?null:billingActions.get().nextAction(lookup);}
-    public ProviderQuote preview(QuoteRequest request){throw unsupported();}
-    public Reply change(Command command){throw unsupported();}
-    public Reply clearChange(Command command){throw unsupported();}
+    public ProviderQuote preview(QuoteRequest request){if(planProofs==null)throw unsupported();return new StripeBillingMutationAdapter(ownership,bindings,planProofs,credentials,clients,verification,providerClock).preview(request);}
+    public Reply change(Command command){if(planProofs==null)throw unsupported();return new StripeBillingMutationAdapter(ownership,bindings,planProofs,credentials,clients,verification,providerClock).change(command,steps,providerClock);}
+    public Reply clearChange(Command command){if(planProofs==null)throw unsupported();return new StripeBillingMutationAdapter(ownership,bindings,planProofs,credentials,clients,verification,providerClock).clear(command,steps,providerClock);}
+    public Reply continueOriginalPlan(Command command){
+        var o=command.operation();
+        String key=o.providerOperationKey();
+        if(o.kind()==SubscriptionOperation.Kind.CLEAR_CHANGE)key+=":SCHEDULE_RELEASE";
+        else if(o.kind()==SubscriptionOperation.Kind.CHANGE){
+            var q=planProofs.quote(command.account().id(),StripeBillingMutationAdapter.quoteId(command.providerQuoteReference())).orElseThrow(StripeSubscriptionProviderAdapter::mismatch);
+            if(q.timing()==ChangeTiming.NEXT_PERIOD)key+=":SCHEDULE_CREATE";
+        }else throw mismatch();
+        var original=steps.find(command.account().id(),key).orElse(null);
+        if(original==null||original.firstDispatchedAt()==null)return null;
+        if(original.status()!=ProviderOperation.Status.ACKNOWLEDGED&&(!ProviderOperationGuard.withinWriteWindow(original.firstDispatchedAt(),providerClock.instant())
+            ||original.retryBefore()==null||!providerClock.instant().isBefore(original.retryBefore())))return unknown();
+        return o.kind()==SubscriptionOperation.Kind.CLEAR_CHANGE?clearChange(command):change(command);
+    }
     public Reply cancel(Command command,boolean immediate){throw unsupported();}
     public Reply withdrawCancel(Command command){throw unsupported();}
     public Reply setup(Command command){var proof=prepareSetup(command);if(command.providerSubscriptionReference()==null)throw conflict();return accepted(command.providerSubscriptionReference());}

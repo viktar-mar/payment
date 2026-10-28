@@ -9,6 +9,56 @@ import com.stripe.param.billingportal.SessionCreateParams;
 import org.junit.jupiter.api.Test;
 
 class StripeBillingSdkContractTest {
+    // Pins the preview anchor, signed debit/credit linkage, and original update-result identity.
+    @Test void previewsExactProrationAndRetainsOriginalPendingUpdateInvoice() throws Exception {
+        try(var http=new StripeBillingHttpFixture()) {
+            http.respond("POST","/v1/invoices/create_preview","""
+                {"id":"upcoming_in_preview","object":"invoice","customer":"cus_billing","currency":"eur","amount_due":500,
+                 "lines":{"object":"list","has_more":false,"data":[
+                  {"id":"il_credit","object":"line_item","amount":-500,"period":{"start":1800000100,"end":1802678400},
+                   "parent":{"type":"subscription_item_details","subscription_item_details":{"subscription":"sub_billing","subscription_item":"si_billing","proration":true,
+                    "proration_details":{"credited_items":{"invoice":"in_original","invoice_line_items":["il_original"]}}}}},
+                  {"id":"il_debit","object":"line_item","amount":1000,"period":{"start":1800000100,"end":1802678400},
+                   "parent":{"type":"subscription_item_details","subscription_item_details":{"subscription":"sub_billing","subscription_item":"si_billing","proration":true}}}]}}
+                """);
+            var preview=http.client().v1().invoices().createPreview(InvoiceCreatePreviewParams.builder()
+                .setCustomer("cus_billing").setSubscription("sub_billing")
+                .setSubscriptionDetails(InvoiceCreatePreviewParams.SubscriptionDetails.builder().setProrationDate(1800000100L)
+                    .setProrationBehavior(InvoiceCreatePreviewParams.SubscriptionDetails.ProrationBehavior.ALWAYS_INVOICE)
+                    .addItem(InvoiceCreatePreviewParams.SubscriptionDetails.Item.builder().setId("si_billing").setPrice("price_next").setQuantity(1L).build()).build()).build());
+            assertThat(http.calls().getLast().form()).containsEntry("subscription","sub_billing").containsEntry("customer","cus_billing")
+                .containsEntry("subscription_details[proration_date]","1800000100").containsEntry("subscription_details[proration_behavior]","always_invoice")
+                .containsEntry("subscription_details[items][0][id]","si_billing").containsEntry("subscription_details[items][0][price]","price_next")
+                .containsEntry("subscription_details[items][0][quantity]","1");
+            assertThat(preview.getLines().getHasMore()).isFalse();assertThat(preview.getLines().getData()).hasSize(2);
+            var credit=preview.getLines().getData().getFirst();assertThat(credit.getAmount()).isEqualTo(-500L);
+            assertThat(credit.getParent().getSubscriptionItemDetails().getProrationDetails().getCreditedItems().getInvoice()).isEqualTo("in_original");
+            assertThat(credit.getParent().getSubscriptionItemDetails().getProrationDetails().getCreditedItems().getInvoiceLineItems()).containsExactly("il_original");
+            http.respond("POST","/v1/subscriptions/sub_billing",subscriptionJson().replace("\"status\":\"active\"","\"status\":\"active\",\"latest_invoice\":\"in_originalChange\""));
+            var result=http.client().v1().subscriptions().update("sub_billing",SubscriptionUpdateParams.builder()
+                .setPaymentBehavior(SubscriptionUpdateParams.PaymentBehavior.PENDING_IF_INCOMPLETE).setProrationBehavior(SubscriptionUpdateParams.ProrationBehavior.ALWAYS_INVOICE)
+                .setProrationDate(1800000100L).addItem(SubscriptionUpdateParams.Item.builder().setId("si_billing").setPrice("price_next").setQuantity(1L).build()).build(),RequestOptions.builder().setIdempotencyKey("original-change").build());
+            assertThat(result.getLatestInvoice()).isEqualTo("in_originalChange");assertThat(result.getPendingUpdate().getExpiresAt()).isEqualTo(1800082800L);
+            assertThat(result.getItems().getData().getFirst().getPrice().getId()).isEqualTo("price_billing");
+            assertThat(http.calls().getLast().header("Idempotency-Key")).isEqualTo("original-change");
+            assertThat(http.calls()).allSatisfy(c->assertThat(c.header("Stripe-Version")).isEqualTo("2026-09-30.endive"));
+        }
+    }
+    // A month/year phase must use provider calendar duration and suppress transition proration too.
+    @Test void schedulesTargetCalendarDurationAndNoTransitionProration() throws Exception {
+        try(var http=new StripeBillingHttpFixture()) {
+            http.respond("POST","/v1/subscription_schedules/sub_sched_owned","{\"id\":\"sub_sched_owned\",\"object\":\"subscription_schedule\",\"current_phase\":{\"start_date\":1800000000,\"end_date\":1802678400}}");
+            var schedule=http.client().v1().subscriptionSchedules().update("sub_sched_owned",SubscriptionScheduleUpdateParams.builder()
+                .setEndBehavior(SubscriptionScheduleUpdateParams.EndBehavior.RELEASE).setProrationBehavior(SubscriptionScheduleUpdateParams.ProrationBehavior.NONE)
+                .addPhase(SubscriptionScheduleUpdateParams.Phase.builder().setStartDate(1802678400L)
+                    .setDuration(SubscriptionScheduleUpdateParams.Phase.Duration.builder().setInterval(SubscriptionScheduleUpdateParams.Phase.Duration.Interval.YEAR).setIntervalCount(1L).build())
+                    .setProrationBehavior(SubscriptionScheduleUpdateParams.Phase.ProrationBehavior.NONE)
+                    .addItem(SubscriptionScheduleUpdateParams.Phase.Item.builder().setPrice("price_year").setQuantity(1L).build()).build()).build());
+            assertThat(schedule.getCurrentPhase().getEndDate()).isEqualTo(1802678400L);
+            assertThat(http.calls().getLast().form()).containsEntry("phases[0][duration][interval]","year").containsEntry("phases[0][duration][interval_count]","1")
+                .containsEntry("phases[0][proration_behavior]","none").containsEntry("proration_behavior","none").containsEntry("end_behavior","release");
+        }
+    }
     // The pinned resume API uses an object anchor and success-only resume, not the old scalar shape.
     @Test void resumesOnlyOnPaymentSuccessWithNewAnchorAndNoProration()throws Exception{
         try(var http=new StripeBillingHttpFixture()){

@@ -10,7 +10,7 @@ public record SubscriptionClientGrant(UUID id,SiteId site,CustomerId customer,Pa
  UUID sessionId,String origin,Instant clientExpiresAt) {
  public record Binding(UUID stepId,String operationKey,String proof,String subscriptionReference,String customerReference,String invoiceReference,String allocationReference,String intentReference,String schema,String setupReference){
   public Binding(UUID step,String key,String proof,String sub,String customer,String invoice,String allocation,String intent){this(step,key,proof,sub,customer,invoice,allocation,intent,"payment-v1",null);}
-  public String stepKind(){return switch(schema){case "setup-v1"->"SETUP_INTENT_CREATE";case "resume-v1"->"SUBSCRIPTION_UPDATE";case "payment-v1"->"SUBSCRIPTION_CREATE";default->throw new IllegalArgumentException("Invalid billing descriptor");};}
+  public String stepKind(){return switch(schema){case "setup-v1"->"SETUP_INTENT_CREATE";case "resume-v1","change-v1"->"SUBSCRIPTION_UPDATE";case "payment-v1"->"SUBSCRIPTION_CREATE";default->throw new IllegalArgumentException("Invalid billing descriptor");};}
   public String stepReference(){return schema.equals("setup-v1")?setupReference:subscriptionReference;}
   public SubscriptionClientSession.Flow flow(){return schema.equals("setup-v1")?SubscriptionClientSession.Flow.SETUP:SubscriptionClientSession.Flow.PAYMENT;}
  }

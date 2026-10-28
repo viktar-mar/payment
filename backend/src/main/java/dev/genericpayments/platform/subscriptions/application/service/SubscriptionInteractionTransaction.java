@@ -85,7 +85,7 @@ public class SubscriptionInteractionTransaction {
         var expires=action.expiresAt().isBefore(now.plusSeconds(600))?action.expiresAt():now.plusSeconds(600);
         var o=r.operation();var s=r.subscription();var digest=digest(action.secret());
         actions.issue(s.siteId(),s.customerId(),s.paymentAccountId(),s.id(),o.id(),action.kind().name(),digest,expires);
-        if(o.kind()==SubscriptionOperation.Kind.SETUP||o.kind()==SubscriptionOperation.Kind.CREATE||o.kind()==SubscriptionOperation.Kind.RESUME)
+        if(o.kind()==SubscriptionOperation.Kind.SETUP||o.kind()==SubscriptionOperation.Kind.CREATE||o.kind()==SubscriptionOperation.Kind.RESUME||o.kind()==SubscriptionOperation.Kind.CHANGE)
             actions.consent(digest,o.kind().name(),true,o.policyVersion(),o.createdAt());
         return new NextAction(action.kind(),action.secret(),expires);
     }
@@ -120,14 +120,16 @@ public class SubscriptionInteractionTransaction {
         });
     }
     private SubscriptionClientGrant availableClientGrant(SubscriptionCommandContext c,State r,String token){
-        var session=customer(c);if(r.account().provider()!=PaymentProviderType.STRIPE||r.account().status()!=PaymentAccountStatus.ACTIVE||!r.policy().enabled()||!r.subscription().nonTerminal()||!Set.of(SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Kind.RESUME).contains(r.operation().kind())||r.operation().status()==SubscriptionOperation.Status.SUCCEEDED||r.operation().status()==SubscriptionOperation.Status.FAILED)throw SubscriptionRuleErrors.conflict();
+        var session=customer(c);if(r.account().provider()!=PaymentProviderType.STRIPE||r.account().status()!=PaymentAccountStatus.ACTIVE||!r.policy().enabled()||!r.subscription().nonTerminal()||!Set.of(SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Kind.RESUME,SubscriptionOperation.Kind.CHANGE).contains(r.operation().kind())||r.operation().status()==SubscriptionOperation.Status.SUCCEEDED||r.operation().status()==SubscriptionOperation.Status.FAILED)throw SubscriptionRuleErrors.conflict();
         var grant=billingGrant(r,token);if(!grant.available(securityClock.instant())||grant.sessionId()!=null&&(!session.sessionId().value().equals(grant.sessionId())||!session.origin().equals(grant.origin())))throw SubscriptionRuleErrors.conflict();return grant;
     }
     private SubscriptionClientGrant billingGrant(State r,String token){
         if(token==null||!token.matches("bga1_[A-Za-z0-9_-]{43}"))throw SubscriptionRuleErrors.conflict();
         var g=actions.billing(digest(token)).orElseThrow(SubscriptionRuleErrors::conflict);
         if(!g.account().equals(r.account().id())||!g.site().equals(r.subscription().siteId())||!g.customer().equals(r.subscription().customerId())||!g.subscription().equals(r.subscription().id())||!g.operation().equals(r.operation().id())
-            ||!java.security.MessageDigest.isEqual(g.tokenDigest().getBytes(java.nio.charset.StandardCharsets.US_ASCII),digest(token).getBytes(java.nio.charset.StandardCharsets.US_ASCII)))throw SubscriptionRuleErrors.conflict();return g;
+            ||!java.security.MessageDigest.isEqual(g.tokenDigest().getBytes(java.nio.charset.StandardCharsets.US_ASCII),digest(token).getBytes(java.nio.charset.StandardCharsets.US_ASCII)))throw SubscriptionRuleErrors.conflict();
+        if(r.operation().kind()==SubscriptionOperation.Kind.CHANGE&&(!g.binding().schema().equals("change-v1")||r.subscription().pendingChange()==null||!r.subscription().pendingChange().operationId().equals(r.operation().id())))throw SubscriptionRuleErrors.conflict();
+        return g;
     }
     private dev.genericpayments.platform.customers.application.model.CustomerSessionContext customer(SubscriptionCommandContext c){
         if(!(c.actor() instanceof SubscriptionActor.Customer actor)||!securityClock.instant().isBefore(actor.session().expiresAt()))throw SubscriptionRuleErrors.conflict();

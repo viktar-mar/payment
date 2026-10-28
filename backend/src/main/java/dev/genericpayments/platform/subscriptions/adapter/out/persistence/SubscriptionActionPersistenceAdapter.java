@@ -48,13 +48,21 @@ public class SubscriptionActionPersistenceAdapter implements SubscriptionActionS
         var b=g.binding();
         int inserted=jdbc.update("""
             insert into subscription_action_capabilities(id,site_id,customer_id,payment_account_id,subscription_id,operation_id,purpose,token_digest,issued_at,expires_at,
-              consent_purpose,recurring_consent,consent_policy_version,consent_at,billing_key_version,billing_step_id,billing_step_kind,billing_operation_key,billing_proof,billing_subscription_reference,billing_customer_reference,billing_invoice_reference,billing_allocation_reference,billing_intent_reference,billing_schema,billing_setup_reference,billing_step_reference)
-            select ?,?,?,?, ?,o.id,'PROVIDER_CLIENT',?,?,?,o.kind,true,o.policy_version,o.created_at,?,?,?,?,?,?,?,?,?,?,?,?,?
+              consent_purpose,recurring_consent,consent_policy_version,consent_at,billing_key_version,billing_step_id,billing_step_kind,billing_operation_key,billing_proof,billing_subscription_reference,billing_customer_reference,billing_invoice_reference,billing_allocation_reference,billing_intent_reference,billing_schema,billing_setup_reference,billing_step_reference,billing_change_operation)
+            select ?,?,?,?, ?,o.id,'PROVIDER_CLIENT',?,?,?,o.kind,true,o.policy_version,o.created_at,?,?,?,?,?,?,?,?,?,?,?,?,?,case when ?='change-v1' then o.id end
               from subscription_operations o where o.id=? and o.site_id=? and o.customer_id=? and o.subscription_id=? and o.provider_operation_key=?
               and ((?='payment-v1' and o.kind='CREATE' and o.fingerprint like 'v1.paid.%')
                 or (?='setup-v1' and ((o.kind='CREATE' and o.fingerprint like 'v1.trial.%') or o.kind='SETUP'))
-                or (?='resume-v1' and o.kind='RESUME' and o.fingerprint like 'v1.resume.none.%'))
-            """,g.id(),g.site().value(),g.customer().value(),g.account().value(),g.subscription(),g.tokenDigest(),Timestamp.from(g.issuedAt()),Timestamp.from(g.expiresAt()),g.keyVersion(),b.stepId(),b.stepKind(),b.operationKey(),b.proof(),b.subscriptionReference(),b.customerReference(),b.invoiceReference(),b.allocationReference(),b.intentReference(),b.schema(),b.setupReference(),b.stepReference(),g.operation(),g.site().value(),g.customer().value(),g.subscription(),b.operationKey(),b.schema(),b.schema(),b.schema());
+                or (?='resume-v1' and o.kind='RESUME' and o.fingerprint like 'v1.resume.none.%')
+                or (?='change-v1' and o.kind='CHANGE' and o.fingerprint like 'v1.plan.%' and o.status in ('PROCESSING','REQUIRES_ACTION','UNKNOWN')
+                  and exists(select 1 from stripe_plan_results r join stripe_plan_quotes p on p.id=r.quote_id
+                    join subscriptions s on s.id=r.subscription_id and s.payment_account_id=r.payment_account_id
+                    join site_subscription_policies policy on policy.site_id=s.site_id join payment_accounts a on a.id=s.payment_account_id
+                    where r.operation_id=o.id and r.payment_account_id=? and r.step_id=? and r.invoice_reference=? and r.subscription_reference=?
+                    and s.pending_operation_id=o.id and s.pending_price_id=p.target_price_id and s.pending_price_version=(p.descriptor->'target'->>'version')::integer
+                    and s.billing_status='ACTIVE' and s.debt_billing_record_id is null and s.cancellation_effective_at is null
+                    and policy.enabled and policy.version=o.policy_version and a.account_status='ACTIVE' and a.provider='STRIPE' and a.account_mode='SANDBOX')))
+            """,g.id(),g.site().value(),g.customer().value(),g.account().value(),g.subscription(),g.tokenDigest(),Timestamp.from(g.issuedAt()),Timestamp.from(g.expiresAt()),g.keyVersion(),b.stepId(),b.stepKind(),b.operationKey(),b.proof(),b.subscriptionReference(),b.customerReference(),b.invoiceReference(),b.allocationReference(),b.intentReference(),b.schema(),b.setupReference(),b.stepReference(),b.schema(),g.operation(),g.site().value(),g.customer().value(),g.subscription(),b.operationKey(),b.schema(),b.schema(),b.schema(),b.schema(),g.account().value(),b.stepId(),b.invoiceReference(),b.subscriptionReference());
         if(inserted!=1)throw conflict();
     }
     public void bindSession(String digest,UUID session,String origin,Instant expires,Instant now){
@@ -67,7 +75,7 @@ public class SubscriptionActionPersistenceAdapter implements SubscriptionActionS
         int updated=jdbc.update("""
             update subscription_action_capabilities set consumed_at=?,confirmation_authority_scope=?,confirmation_key_digest=?,confirmation_fingerprint=?
             where site_id=? and customer_id=? and payment_account_id=? and subscription_id=? and operation_id=? and purpose='PROVIDER_CLIENT' and token_digest=?
-             and billing_key_version is not null and recurring_consent is true and consent_purpose in ('CREATE','SETUP','RESUME') and consumed_at is null and superseded_at is null and issued_at<=? and expires_at>?
+             and billing_key_version is not null and recurring_consent is true and consent_purpose in ('CREATE','SETUP','RESUME','CHANGE') and consumed_at is null and superseded_at is null and issued_at<=? and expires_at>?
              and client_session_id=? and client_origin=? and client_expires_at>?
             """,Timestamp.from(now),authority,key,fingerprint,site.value(),customer.value(),account.value(),subscription,operation,digest,Timestamp.from(now),Timestamp.from(now),session,origin,Timestamp.from(now));
         if(updated!=1)throw conflict();return ClaimDisposition.NEW;

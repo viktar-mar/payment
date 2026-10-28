@@ -10,6 +10,8 @@ public interface SubscriptionProviderPort {
     ProviderQuote preview(QuoteRequest request);
     Reply change(Command command);
     Reply clearChange(Command command);
+    /** Explicit same-key retry only; providers opt in after proving an original dispatch. */
+    default Reply continueOriginalPlan(Command command){return null;}
     Reply cancel(Command command,boolean immediate);
     Reply withdrawCancel(Command command);
     Reply setup(Command command);

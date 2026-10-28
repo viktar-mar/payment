@@ -34,7 +34,10 @@ public class StripeBillingActionAdapter implements SubscriptionClientSessionPort
    var now=securityClock.instant().truncatedTo(ChronoUnit.MICROS);var current=actions.current(lookup.account().id(),proof.operation().id()).orElse(null);
    if(current!=null){if(current.consumedAt()!=null)return null;if(!current.binding().equals(graph.binding()))throw StripeBillingOwnership.mismatch();
     if(current.available(now))return action(current);if(now.isBefore(current.issuedAt()))throw StripeBillingOwnership.mismatch();}
-   var s=fresh.subscription();var grant=new SubscriptionClientGrant(UUID.randomUUID(),s.siteId(),s.customerId(),s.paymentAccountId(),s.id(),fresh.operation().id(),tokens.activeVersion(),graph.binding(),null,now,now.plusSeconds(600),null,null,null,null,null);
+   var expires=now.plusSeconds(600);
+   if(fresh instanceof StripeBillingOwnership.OriginalChange change){var pending=change.result().result().pendingExpiry();if(pending==null)throw StripeBillingOwnership.mismatch();var deadline=Instant.ofEpochSecond(pending);if(deadline.isBefore(expires))expires=deadline;}
+   if(!expires.isAfter(now))throw StripeBillingOwnership.mismatch();
+   var s=fresh.subscription();var grant=new SubscriptionClientGrant(UUID.randomUUID(),s.siteId(),s.customerId(),s.paymentAccountId(),s.id(),fresh.operation().id(),tokens.activeVersion(),graph.binding(),null,now,expires,null,null,null,null,null);
    String token=tokens.token(grant.keyVersion(),grant.descriptor());grant=grant.digest(StripeBillingGrantTokens.hash(token));actions.reserveBilling(grant);
    return new NextAction(ActionKind.PROVIDER_CLIENT,token,grant.expiresAt());
   });

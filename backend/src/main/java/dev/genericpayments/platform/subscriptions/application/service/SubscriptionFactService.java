@@ -36,6 +36,7 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
     private final SubscriptionReadPreparation reads;
     private final SubscriptionAuthorityPort authority;
     @org.springframework.beans.factory.annotation.Autowired private SubscriptionBillingProofStore billingProofs;
+    @org.springframework.beans.factory.annotation.Autowired private SubscriptionPlanProofStore planProofs;
     public SubscriptionFactService(SubscriptionStore subscriptions,SubscriptionOperationStore operations,TrialEligibilityStore trials,
         LockSitePort sites,CustomerStore customers,LockPaymentAccountPort accounts,BillingRecordStore bills,
         SubscriptionCashPort cash,SubscriptionEventStore events,SubscriptionCatalogPort catalog,Clock clock,SubscriptionCallbackPort callbacks,SubscriptionObjectPort objects,BillingMetadataPort metadata,SubscriptionPolicyPort policies,SubscriptionObservationPort observations,dev.genericpayments.platform.shared.application.port.out.DigestPort digest,SubscriptionQuoteStore quotes,SubscriptionSweepPort sweep,SubscriptionReadPreparation reads,SubscriptionAuthorityPort authority){
@@ -92,7 +93,7 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
         if(trialOwner!=null&&(trialOwner.kind()!=SubscriptionOperation.Kind.CREATE||!CreateSubscriptionFingerprint.startsTrial(trialOwner.fingerprint())))throw new IllegalArgumentException("Invalid trial owner");
         var projected=original;
         if(current&&original.providerReference()==null)projected=copy(original,snapshot.subscriptionReference(),original.revision()+1,now);
-        SubscriptionEvent.Type change=null;UUID changedBill=null;
+        SubscriptionEvent.Type change=null;UUID changedBill=null;var appliedChangeBills=new ArrayList<UUID>();
         var trialEvidence=snapshot.trialEvidence();
         if(current&&unversioned&&snapshot.trial()!=null){
             if(billingProofs==null||trialEvidence==null||!trialEvidence.period().equals(snapshot.trial()))throw new IllegalArgumentException("Trial lacks original proof");
@@ -147,15 +148,21 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
             boolean freeTrial=invoice.settlement()==SettlementKind.ZERO&&invoice.kind()==BillingRecord.Kind.INITIAL&&(unversioned
                 ?trialEvidence!=null&&invoice.reference().equals(trialEvidence.invoice())&&invoice.period().equals(trialEvidence.period())&&invoice.price().equals(trialEvidence.price())
                 :snapshot.trial()!=null&&invoice.period().equals(snapshot.trial())&&invoice.price().equals(snapshot.billingPrice())&&(trialOwner!=null||original.trial()!=null));
-            boolean zeroChange=invoice.settlement()==SettlementKind.ZERO&&(confirmedProration(original,invoice,snapshot,locked,now)
+            boolean exactProration=unversioned&&stripeProration(original,invoice,snapshot,locked,now);
+            boolean scheduledCash=unversioned&&stripeScheduledCash(original,invoice,snapshot);
+            boolean zeroChange=invoice.settlement()==SettlementKind.ZERO&&((unversioned?originalProration(original,invoice).isPresent():confirmedProration(original,invoice,snapshot,locked,now))
                 ||events.hasBillingFact(original.siteId(),original.id(),bill.id(),SubscriptionEvent.Type.CHANGE_APPLIED));
             if(invoice.settlement()==SettlementKind.ZERO&&!freeTrial&&!zeroChange||invoice.settlement()==SettlementKind.UNSUPPORTED) {
                 append(projected,command,SubscriptionEvent.Type.RECONCILIATION_REQUIRED,bill.id(),"billing:"+bill.id()+":unsupported",now);
+            } else if(exactProration&&(invoice.settlement()==SettlementKind.CASH||zeroChange)){
+                var paid=projected.confirmPaid(invoice.price(),snapshot.period(),now);
+                if(paid!=projected){projected=paid;appliedChangeBills.add(bill.id());confirmedPlanOperations.add(original.pendingChange().operationId());}
             } else if((invoice.settlement()==SettlementKind.CASH||zeroChange)&&snapshot.status()==Subscription.Status.ACTIVE&&invoice.price().equals(snapshot.billingPrice())&&invoice.period().equals(snapshot.period())
+                &&(!unversioned||original.pendingChange()==null||!original.pendingChange().target().equals(invoice.price())||scheduledCash)
                 &&(!unversioned||original.billingStatus()!=Subscription.Status.PAUSED||stripeResumeCash(original,locked,snapshot,invoice))
-                &&(invoice.kind()!=BillingRecord.Kind.PRORATION||confirmedProration(original,invoice,snapshot,locked,now)||invoice.price().equals(original.entitledPrice())&&invoice.price().equals(original.billingPrice()))) {
+                &&(invoice.kind()!=BillingRecord.Kind.PRORATION||!unversioned&&(confirmedProration(original,invoice,snapshot,locked,now)||invoice.price().equals(original.entitledPrice())&&invoice.price().equals(original.billingPrice())))) {
                 var paid=projected.confirmPaid(invoice.price(),invoice.period(),now);
-                if(paid!=projected){projected=paid;change=zeroChange?SubscriptionEvent.Type.CHANGE_APPLIED:SubscriptionEvent.Type.PERIOD_PAID;changedBill=bill.id();}
+                if(paid!=projected){projected=paid;change=zeroChange?SubscriptionEvent.Type.CHANGE_APPLIED:SubscriptionEvent.Type.PERIOD_PAID;changedBill=bill.id();if(scheduledCash){appliedChangeBills.add(bill.id());confirmedPlanOperations.add(original.pendingChange().operationId());}}
             } else if(invoice.settlement()==SettlementKind.OPEN&&projected.nonTerminal()
                 &&(snapshot.status()==Subscription.Status.PAST_DUE||snapshot.status()==Subscription.Status.UNPAID||snapshot.status()==Subscription.Status.INCOMPLETE)
                 &&invoice.period().equals(snapshot.period())&&invoice.price().equals(snapshot.billingPrice())) {
@@ -212,6 +219,7 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
         }
         if(projected!=original) {
             projected=subscriptions.save(copy(projected,projected.providerReference(),original.revision()+1,now),original.revision());
+            for(var bill:appliedChangeBills)append(projected,command,SubscriptionEvent.Type.CHANGE_APPLIED,bill,"change:"+bill,now);
             if(change!=null)append(projected,command,change,changedBill,"projection:"+projected.revision(),now);
         }
         for(var operation:locked) {
@@ -257,6 +265,31 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
                 &&q.fromPriceId().equals(invoice.previousPrice().priceId())&&q.fromPriceVersion()==invoice.previousPrice().version()
                 &&q.dueNowMinor()==invoice.amountDueMinor()&&q.currency().equals(invoice.currency())&&q.effectiveAt().equals(invoice.period().start()))
                 .orElse(false));
+    }
+    private Optional<SubscriptionPlanProofStore.Proration> originalProration(Subscription s,Invoice invoice){
+        if(planProofs==null||invoice.kind()!=BillingRecord.Kind.PRORATION)return Optional.empty();
+        return planProofs.proration(s.paymentAccountId(),invoice.reference()).filter(p->{var q=p.quote();var r=p.result();return r.account().equals(s.paymentAccountId())&&r.subscription().equals(s.id())&&r.quote().equals(q.id())&&r.invoice().equals(invoice.reference())&&r.reference().equals(s.providerReference())&&q.account().equals(s.paymentAccountId())&&q.site().equals(s.siteId())&&q.customer().equals(s.customerId())&&q.subscription().equals(s.id())&&q.subscriptionReference().equals(s.providerReference())&&q.timing()==ChangeTiming.IMMEDIATE&&q.source().equals(invoice.previousPrice())&&q.target().equals(invoice.price())&&q.dueNow()==invoice.amountDueMinor()&&q.target().regularAmount().currency().equals(invoice.currency())&&new Subscription.Period(q.anchor(),q.paidThrough()).equals(invoice.period());});
+    }
+    private boolean stripeProration(Subscription s,Invoice invoice,Snapshot snapshot,List<SubscriptionOperation> locked,Instant now){
+        var pending=s.pendingChange();var observation=snapshot.operationObservation();
+        if(pending==null||s.billingStatus()!=Subscription.Status.ACTIVE||s.debt()!=null||s.cancellation()!=null||!s.nonTerminal()||observation==null||observation.state()!=OperationState.APPLIED||snapshot.status()!=Subscription.Status.ACTIVE||!invoice.price().equals(snapshot.billingPrice())||!pending.target().equals(invoice.price())||!pending.effectiveAt().equals(invoice.period().start())||now.isBefore(pending.effectiveAt()))return false;
+        return originalProration(s,invoice).filter(p->{var q=p.quote();var r=p.result();return r.operation().equals(pending.operationId())&&q.source().equals(s.billingPrice())&&q.entitled().equals(s.entitledPrice())&&q.period().equals(s.currentPeriod())&&q.period().equals(snapshot.period())&&q.paidThrough().equals(s.paidThrough())&&q.period().end().equals(s.paidThrough())&&(s.revision()==q.revision()+1||pending.state()==Subscription.ChangeState.PAYMENT_PENDING&&s.revision()==q.revision()+2)&&locked.stream().anyMatch(o->o.id().equals(r.operation())&&o.kind()==SubscriptionOperation.Kind.CHANGE&&o.expectedRevision()==q.revision()&&o.policyVersion()==q.policy()&&o.providerOperationKey().equals(observation.operationKey())&&o.providerOperationKey().equals(snapshot.operationKey())&&quotes.forOperation(s.siteId(),s.id(),o.id()).filter(v->v.providerQuoteReference().equals(q.reference())&&v.target().equals(q.target())&&v.timing()==ChangeTiming.IMMEDIATE&&v.dueNowMinor()==q.dueNow()&&v.effectiveAt().equals(q.anchor())).isPresent());}).isPresent();
+    }
+    private boolean stripeScheduledCash(Subscription s,Invoice invoice,Snapshot snapshot){
+        var pending=s.pendingChange();
+        if(planProofs==null||pending==null||!Set.of(Subscription.ChangeState.SCHEDULED,Subscription.ChangeState.UNKNOWN).contains(pending.state())||!s.nonTerminal()||s.cancellation()!=null
+            ||invoice.kind()!=BillingRecord.Kind.RENEWAL||invoice.settlement()!=SettlementKind.CASH||snapshot.status()!=Subscription.Status.ACTIVE
+            ||!invoice.price().equals(pending.target())||!invoice.price().equals(snapshot.billingPrice())||!invoice.period().equals(snapshot.period())
+            ||!invoice.period().start().equals(pending.effectiveAt()))return false;
+        return planProofs.schedule(s.paymentAccountId(),pending.operationId()).filter(binding->binding.account().equals(s.paymentAccountId())
+            &&binding.subscription().equals(s.id())&&binding.operation().equals(pending.operationId())&&binding.updateStep()!=null&&binding.releaseStep()==null&&binding.targetEnd()!=null
+            &&binding.targetEnd()==invoice.period().end().getEpochSecond()).flatMap(binding->planProofs.quote(s.paymentAccountId(),binding.quote()))
+            .filter(q->q.account().equals(s.paymentAccountId())&&q.site().equals(s.siteId())&&q.customer().equals(s.customerId())&&q.subscription().equals(s.id())
+                &&q.subscriptionReference().equals(s.providerReference())&&q.timing()==ChangeTiming.NEXT_PERIOD&&q.target().equals(invoice.price())
+                &&q.entitled().equals(s.entitledPrice())&&q.paidThrough().equals(s.paidThrough())&&q.period().end().equals(invoice.period().start())
+                &&(s.debt()==null?q.source().equals(s.billingPrice())&&q.period().equals(s.currentPeriod()):s.debt().unpaidPeriod().equals(invoice.period()))
+                &&quotes.forOperation(s.siteId(),s.id(),pending.operationId()).filter(v->v.providerQuoteReference().equals(q.reference())&&v.target().equals(q.target())
+                    &&v.timing()==ChangeTiming.NEXT_PERIOD&&v.effectiveAt().equals(q.period().end())).isPresent()).isPresent();
     }
     private void validateTerms(Subscription s,SubscriptionPriceTerms terms){if(!s.productId().equals(terms.productId())||!catalog.terms(s.siteId(),terms.priceId()).equals(terms))throw new IllegalArgumentException("Invoice terms mismatch");}
     private void append(Subscription s,Command c,SubscriptionEvent.Type type,UUID bill,String key,Instant now){

@@ -102,6 +102,12 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         return current;
     }
     @Transactional(propagation=Propagation.MANDATORY)
+    public ProviderOperation lockPlanReceipt(ProviderOperation expected){
+        var current=lock(expected.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+        if(!current.equals(expected)||!java.util.Set.of(Kind.SUBSCRIPTION_UPDATE,Kind.SCHEDULE_CREATE,Kind.SCHEDULE_UPDATE,Kind.SCHEDULE_RELEASE).contains(current.kind()))throw conflict();
+        return current;
+    }
+    @Transactional(propagation=Propagation.MANDATORY)
     public ProviderOperation acknowledgeInTransaction(UUID id,String owner,long version,String reference){text(reference,255);return finishClaim(id,owner,version,"ACKNOWLEDGED",reference);}
 
     @Override
@@ -216,9 +222,24 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
                 join sites site on site.id=s.site_id join customers c on c.site_id=s.site_id and c.id=s.customer_id
                 where o.id=? and s.payment_account_id=? and site.status='ACTIVE' and c.status='ACTIVE'
                 and ((?='SETUP_INTENT_CREATE' and o.kind in ('CREATE','SETUP') and ?=o.provider_operation_key||':SETUP')
-                  or (?='SUBSCRIPTION_UPDATE' and ((o.kind='SETUP' and ?=o.provider_operation_key||':METHOD') or (o.kind='RESUME' and ?=o.provider_operation_key))))
-                """,UUID.class,resourceId,account.value(),kind.name(),key,kind.name(),key,key).size()!=1)throw conflict();
+                  or (?='SUBSCRIPTION_UPDATE' and ((o.kind='SETUP' and ?=o.provider_operation_key||':METHOD') or (o.kind='RESUME' and ?=o.provider_operation_key)
+                    or (o.kind='CHANGE' and ?=o.provider_operation_key and exists(select 1 from subscription_change_intents i join subscription_quotes q on q.id=i.quote_id join stripe_plan_quotes p on p.reference=q.provider_quote_reference and p.subscription_id=s.id and p.payment_account_id=s.payment_account_id where i.operation_id=o.id and p.timing='IMMEDIATE')))))
+                """,UUID.class,resourceId,account.value(),kind.name(),key,kind.name(),key,key,key).size()!=1)throw conflict();
             return;
+        }
+        if(java.util.Set.of(Kind.SCHEDULE_CREATE,Kind.SCHEDULE_UPDATE,Kind.SCHEDULE_RELEASE).contains(kind)){
+            if(jdbc.queryForList("""
+                select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id
+                join subscription_change_intents i on i.operation_id=o.id and i.site_id=o.site_id and i.subscription_id=o.subscription_id
+                join subscription_quotes q on q.id=i.quote_id and q.site_id=i.site_id and q.subscription_id=i.subscription_id
+                join stripe_plan_quotes p on p.reference=q.provider_quote_reference and p.subscription_id=s.id and p.payment_account_id=s.payment_account_id
+                join sites site on site.id=s.site_id join customers c on c.id=s.customer_id and c.site_id=s.site_id
+                where o.id=? and s.payment_account_id=? and site.status='ACTIVE' and c.status='ACTIVE' and p.timing='NEXT_PERIOD'
+                and ((o.kind='CHANGE' and ((?='SCHEDULE_CREATE' and ?=o.provider_operation_key||':SCHEDULE_CREATE')
+                    or (?='SCHEDULE_UPDATE' and ?=o.provider_operation_key||':SCHEDULE_UPDATE' and exists(select 1 from stripe_plan_schedules x where x.operation_id=o.id and x.quote_id=p.id))))
+                  or (o.kind='CLEAR_CHANGE' and ?='SCHEDULE_RELEASE' and ?=o.provider_operation_key||':SCHEDULE_RELEASE'
+                    and exists(select 1 from stripe_plan_schedules x where x.operation_id=s.pending_operation_id and x.quote_id=p.id and x.update_step is not null)))
+                """,UUID.class,resourceId,account.value(),kind.name(),key,kind.name(),key,kind.name(),key).size()!=1)throw conflict();return;
         }
         if(kind==Kind.SUBSCRIPTION_CREATE){
             // Plain immutable identity proof: never wait on lifecycle Operation/Subscription locks
@@ -260,6 +281,16 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     }
 
     private void requireSubscriptionReference(ProviderOperation operation,String reference){
+        if(java.util.Set.of(Kind.SCHEDULE_CREATE,Kind.SCHEDULE_UPDATE,Kind.SCHEDULE_RELEASE).contains(operation.kind())){
+            if(reference==null||!reference.matches("sub_sched_[A-Za-z0-9]{1,245}"))throw conflict();
+            if(operation.kind()!=Kind.SCHEDULE_CREATE&&jdbc.queryForList("""
+                select x.operation_id from stripe_plan_schedules x join subscription_operations o on o.id=?
+                join subscription_change_intents i on i.operation_id=o.id join subscription_quotes q on q.id=i.quote_id
+                join stripe_plan_quotes p on p.reference=q.provider_quote_reference and p.id=x.quote_id
+                where x.payment_account_id=? and x.schedule_reference=? and ((o.kind='CHANGE' and x.operation_id=o.id)
+                  or (o.kind='CLEAR_CHANGE' and x.subscription_id=o.subscription_id))
+                """,UUID.class,operation.resourceId(),operation.accountId().value(),reference).size()!=1)throw conflict();return;
+        }
         if(operation.kind()==Kind.SETUP_INTENT_CREATE){if(reference==null||!reference.matches("seti_[A-Za-z0-9]{1,250}"))throw conflict();return;}
         if(operation.kind()==Kind.SUBSCRIPTION_UPDATE){if(reference==null||!reference.matches("sub_[A-Za-z0-9]{1,251}")||jdbc.queryForList("select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id where o.id=? and s.payment_account_id=? and s.provider_reference=?",UUID.class,operation.resourceId(),operation.accountId().value(),reference).size()!=1)throw conflict();return;}
         if(operation.kind()!=Kind.SUBSCRIPTION_CREATE)return;
@@ -272,7 +303,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
 
     private static boolean supportedResource(Kind kind) {
         return switch (kind) {
-            case PRODUCT_CREATE, PRICE_CREATE, PAYMENT_PREPARE, REFUND_CREATE, CUSTOMER_CREATE, SUBSCRIPTION_CREATE, SETUP_INTENT_CREATE, SUBSCRIPTION_UPDATE -> true;
+            case PRODUCT_CREATE, PRICE_CREATE, PAYMENT_PREPARE, REFUND_CREATE, CUSTOMER_CREATE, SUBSCRIPTION_CREATE, SETUP_INTENT_CREATE, SUBSCRIPTION_UPDATE, SCHEDULE_CREATE, SCHEDULE_UPDATE, SCHEDULE_RELEASE -> true;
             default -> false;
         };
     }
