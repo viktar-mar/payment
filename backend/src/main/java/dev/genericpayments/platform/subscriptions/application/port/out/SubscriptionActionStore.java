@@ -10,6 +10,12 @@ public interface SubscriptionActionStore {
     void consent(String digest,String purpose,boolean accepted,long policy,Instant at);
     /** Exact authority-scoped retry; a changed request conflicts. Requires an enclosing transaction. */
     boolean replay(SiteId site,String authority,String keyDigest,String fingerprint);
-    void claim(SiteId site,CustomerId customer,PaymentAccountId account,UUID subscription,UUID operation,String purpose,String digest,
+    enum ClaimDisposition { NEW, REPLAY }
+    ClaimDisposition claim(SiteId site,CustomerId customer,PaymentAccountId account,UUID subscription,UUID operation,String purpose,String digest,
         String authority,String keyDigest,String fingerprint,Instant now);
+    default java.util.Optional<dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant> current(PaymentAccountId account,UUID operation){throw new UnsupportedOperationException();}
+    default java.util.Optional<dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant> billing(String digest){throw new UnsupportedOperationException();}
+    default void reserveBilling(dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant grant){throw new UnsupportedOperationException();}
+    default void bindSession(String digest,UUID session,String origin,Instant expires,Instant now){throw new UnsupportedOperationException();}
+    default ClaimDisposition claimBilling(SiteId site,CustomerId customer,PaymentAccountId account,UUID subscription,UUID operation,String digest,UUID session,String origin,String authority,String key,String fingerprint,Instant now){throw new UnsupportedOperationException();}
 }

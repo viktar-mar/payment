@@ -73,8 +73,27 @@ public class StripeSandboxConfiguration {
             dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionStore subscriptions,
             dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionOperationStore operations,
             dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionCatalogPort catalog,
-            dev.genericpayments.platform.catalog.application.port.out.ProviderCatalogMappingPort mappings,java.time.Clock clock) {
+            dev.genericpayments.platform.catalog.application.port.out.ProviderCatalogMappingPort mappings,java.time.Clock clock,
+            org.springframework.beans.factory.ObjectProvider<dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingActionAdapter> actions) {
         return new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeSubscriptionProviderAdapter(credentials,clients,verification,steps,bindings,customers,
-            digest,accounts,sites,customerStore,subscriptions,operations,catalog,mappings,clock);
+            digest,accounts,sites,customerStore,subscriptions,operations,catalog,mappings,clock,actions::getObject);
+    }
+
+    @Bean dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens stripeBillingGrantTokens(Environment environment,StripeSandboxProperties settings){
+        return dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens.from(environment,settings.enabled());
+    }
+    @Bean @Lazy dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnership stripeBillingOwnership(
+            StripeCredentialResolver credentials,ProviderOperationStore steps,dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort bindings,
+            DigestPort digest,LoadPaymentAccountPort accounts,LoadSitePort sites,dev.genericpayments.platform.customers.application.port.out.CustomerStore customers,
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionStore subscriptions,dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionOperationStore operations,
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionCatalogPort catalog,dev.genericpayments.platform.catalog.application.port.out.ProviderCatalogMappingPort mappings){
+        return new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnership(credentials,steps,bindings,digest,accounts,sites,customers,subscriptions,operations,catalog,mappings);
+    }
+    @Bean @Lazy dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingActionAdapter stripeBillingActionAdapter(
+            dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnership ownership,dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens tokens,
+            StripeCredentialResolver credentials,StripeClientFactory clients,PaymentAccountVerificationPort verification,
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionActionStore actions,dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionOperationStore operations,
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionTransactionPort tx,@org.springframework.beans.factory.annotation.Qualifier("providerReferenceClock") java.time.Clock clock){
+        return new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingActionAdapter(ownership,tokens,credentials,clients,verification,actions,operations,tx,clock);
     }
 }

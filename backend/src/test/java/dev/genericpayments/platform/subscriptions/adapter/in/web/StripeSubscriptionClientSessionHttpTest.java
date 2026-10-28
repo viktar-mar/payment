@@ -1,0 +1,32 @@
+package dev.genericpayments.platform.subscriptions.adapter.in.web;
+import static org.assertj.core.api.Assertions.*;import static org.mockito.Mockito.*;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+import dev.genericpayments.platform.customers.adapter.in.web.CustomerSessionAuthenticationFilter;import dev.genericpayments.platform.customers.application.model.CustomerSessionContext;import dev.genericpayments.platform.customers.application.port.out.CustomerSessionResolver;import dev.genericpayments.platform.customers.domain.*;
+import dev.genericpayments.platform.sites.application.port.out.LoadSitePort;import dev.genericpayments.platform.sites.domain.*;import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
+import dev.genericpayments.platform.subscriptions.application.model.*;import dev.genericpayments.platform.subscriptions.application.port.in.CreateSubscriptionClientSessionUseCase;
+import dev.genericpayments.platform.shared.application.PaymentApplicationException;
+import java.time.Instant;import java.net.URI;import java.util.*;import org.junit.jupiter.api.*;import org.junit.jupiter.params.ParameterizedTest;import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.test.web.servlet.MockMvc;import org.springframework.test.web.servlet.setup.MockMvcBuilders;import org.springframework.security.core.context.SecurityContextHolder;
+class StripeSubscriptionClientSessionHttpTest {
+ final SiteId site=new SiteId(UUID.randomUUID());final CustomerId customer=new CustomerId(UUID.randomUUID());final String token="a".repeat(43),grant="bga1_"+"b".repeat(43),secret="pi_owned_secret_canary";
+ final CustomerSessionContext session=new CustomerSessionContext(new CustomerSessionId(UUID.randomUUID()),site,customer,"https://shop.test",Set.of(CustomerSessionScope.SUBSCRIPTION_MANAGE),Instant.now().plusSeconds(1800));
+ final String path="/api/v1/customer/subscriptions/"+UUID.randomUUID()+"/operations/"+UUID.randomUUID()+"/client-session";
+ final CustomerSessionResolver sessions=mock(CustomerSessionResolver.class);final CreateSubscriptionClientSessionUseCase use=mock(CreateSubscriptionClientSessionUseCase.class);MockMvc mvc;
+ @BeforeEach void setup(){
+  var sites=mock(LoadSitePort.class);when(sites.findAll()).thenReturn(List.of(Site.create(site,new SiteKey("shop"),"Shop",new PaymentAccountId(UUID.randomUUID()),Set.of(URI.create("https://shop.test"),URI.create("https://other.test")),Set.of(AuthenticationMode.SITE_TOKEN),PaymentMethodPolicy.automatic())));
+  when(sessions.resolveRequired(anyString(),anyString())).thenAnswer(x->{if(!token.equals(x.getArgument(0))||!session.origin().equals(x.getArgument(1)))throw new PaymentApplicationException("AUTHENTICATION_FAILED",401,"Authentication failed");return session;});
+  when(use.issue(any())).thenAnswer(x->{CreateSubscriptionClientSessionUseCase.Command c=x.getArgument(0);assertThat(c.context().actor()).isEqualTo(new SubscriptionActor.Customer(session));assertThat(c.context().siteId()).isEqualTo(site);assertThat(c.context().origin()).isEqualTo("https://shop.test");assertThat(c.context().idempotencyKey()).isEqualTo("issue");return new SubscriptionClientSession("stripe",SubscriptionClientSession.Flow.PAYMENT,"pk_test_fixture",secret,c.actionToken(),Instant.now().plusSeconds(500));});
+  var mapper=new tools.jackson.databind.ObjectMapper();mvc=MockMvcBuilders.standaloneSetup(new SubscriptionClientSessionController(use)).addFilters(new SubscriptionRequestPolicyFilter(mapper,true),new CustomerSessionAuthenticationFilter(sessions,sites,mapper),new SubscriptionRequestPolicyFilter(mapper,false)).build();
+ }
+ @AfterEach void clear(){SecurityContextHolder.clearContext();}
+ org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder request(){return post(path).header("Origin","https://shop.test").header("Authorization","Bearer "+token).header("Idempotency-Key","issue").contentType("application/json").content("{\"action_token\":\""+grant+"\"}");}
+ @Test void onlySuccessfulCustomerResponseContainsSecretAndNoStore(){mvcResult();}
+ void mvcResult(){try{mvc.perform(request()).andExpect(status().isOk()).andExpect(header().string("Cache-Control","no-store")).andExpect(header().string("Access-Control-Allow-Origin","https://shop.test")).andExpect(jsonPath("$.client_secret").value(secret)).andExpect(jsonPath("$.action_token").value(grant)).andExpect(jsonPath("$.flow").value("PAYMENT"));}catch(Exception e){throw new AssertionError(e);}}
+ @ParameterizedTest @ValueSource(strings={"absent","duplicate","foreign","malformed","allowedOther"}) void actualOriginAdmissionCannotBeBypassed(String kind)throws Exception{
+  var r=request();r.with(req->{req.removeHeader("Origin");switch(kind){case "duplicate"->{req.addHeader("Origin","https://shop.test");req.addHeader("Origin","https://other.test");}case "foreign"->req.addHeader("Origin","https://foreign.test");case "malformed"->req.addHeader("Origin","https://shop.test/path");case "allowedOther"->req.addHeader("Origin","https://other.test");}return req;});
+  var result=mvc.perform(r).andExpect(status().isUnauthorized()).andExpect(header().string("Cache-Control","no-store")).andReturn();assertThat(result.getResponse().getContentAsString()).doesNotContain(secret,grant);verifyNoInteractions(use);
+ }
+ @ParameterizedTest @ValueSource(strings={"site_id","customer_id","provider","client_secret","return_url","flow"}) void bodyCannotSelectForeignAuthority(String field)throws Exception{mvc.perform(request().content("{\"action_token\":\""+grant+"\",\""+field+"\":\"foreign\"}")).andExpect(status().isBadRequest()).andExpect(header().string("Cache-Control","no-store"));verifyNoInteractions(use);}
+ @Test void missingKeyAndCookieRefuseBeforeUse()throws Exception{mvc.perform(request().with(r->{r.removeHeader("Idempotency-Key");return r;})).andExpect(status().isBadRequest());SecurityContextHolder.clearContext();mvc.perform(request().header("Cookie","admin=forged")).andExpect(status().isBadRequest());verifyNoInteractions(use);}
+ @Test void partnerAndAdminHaveNoClientSessionMapping()throws Exception{for(String role:List.of("partner","admin")){SecurityContextHolder.clearContext();var r=post(path.replace("/customer/","/"+role+"/")).header("Idempotency-Key","issue").contentType("application/json").content("{}");mvc.perform(r).andExpect(status().isNotFound()).andExpect(header().string("Cache-Control","no-store"));}verifyNoInteractions(use);}
+}

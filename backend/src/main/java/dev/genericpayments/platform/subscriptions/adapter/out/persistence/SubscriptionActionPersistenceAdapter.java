@@ -1,5 +1,6 @@
 package dev.genericpayments.platform.subscriptions.adapter.out.persistence;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionActionStore;
+import dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant;
 import dev.genericpayments.platform.sites.domain.SiteId;
 import dev.genericpayments.platform.customers.domain.CustomerId;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
@@ -30,10 +31,48 @@ public class SubscriptionActionPersistenceAdapter implements SubscriptionActionS
         var rows=jdbc.queryForList("select confirmation_fingerprint from subscription_action_capabilities where site_id=? and confirmation_authority_scope=? and confirmation_key_digest=? for update",String.class,site.value(),authority,key);
         if(rows.isEmpty())return false;if(!rows.getFirst().equals(fingerprint))throw conflict();return true;
     }
-    public void claim(SiteId site,CustomerId customer,PaymentAccountId account,UUID subscription,UUID operation,String purpose,String digest,String authority,String key,String fingerprint,Instant now){
-        if(replay(site,authority,key,fingerprint))return;
+    public ClaimDisposition claim(SiteId site,CustomerId customer,PaymentAccountId account,UUID subscription,UUID operation,String purpose,String digest,String authority,String key,String fingerprint,Instant now){
+        if(replay(site,authority,key,fingerprint))return ClaimDisposition.REPLAY;
         if(!consume(site,customer,account,subscription,operation,purpose,digest,now))throw conflict();
         jdbc.update("update subscription_action_capabilities set confirmation_authority_scope=?,confirmation_key_digest=?,confirmation_fingerprint=? where token_digest=?",authority,key,fingerprint,digest);
+        return ClaimDisposition.NEW;
     }
+    public Optional<SubscriptionClientGrant> current(PaymentAccountId account,UUID operation){
+        return jdbc.query("select * from subscription_action_capabilities where payment_account_id=? and operation_id=? and billing_key_version is not null and superseded_at is null for update",(r,n)->billing(r),account.value(),operation).stream().findFirst();
+    }
+    public Optional<SubscriptionClientGrant> billing(String digest){return jdbc.query("select * from subscription_action_capabilities where token_digest=? and billing_key_version is not null for update",(r,n)->billing(r),digest).stream().findFirst();}
+    public void reserveBilling(SubscriptionClientGrant g){
+        var current=current(g.account(),g.operation()).orElse(null);
+        if(current!=null){if(current.consumedAt()!=null||current.expiresAt().isAfter(g.issuedAt())||!current.binding().equals(g.binding()))throw conflict();
+            if(jdbc.update("update subscription_action_capabilities set superseded_at=? where id=? and consumed_at is null and superseded_at is null",Timestamp.from(g.issuedAt()),current.id())!=1)throw conflict();}
+        var b=g.binding();
+        int inserted=jdbc.update("""
+            insert into subscription_action_capabilities(id,site_id,customer_id,payment_account_id,subscription_id,operation_id,purpose,token_digest,issued_at,expires_at,
+              consent_purpose,recurring_consent,consent_policy_version,consent_at,billing_key_version,billing_step_id,billing_step_kind,billing_operation_key,billing_proof,billing_subscription_reference,billing_customer_reference,billing_invoice_reference,billing_allocation_reference,billing_intent_reference)
+            select ?,?,?,?, ?,o.id,'PROVIDER_CLIENT',?,?,?,'CREATE',true,o.policy_version,o.created_at,?,?,'SUBSCRIPTION_CREATE',?,?,?,?,?,?,?
+              from subscription_operations o where o.id=? and o.site_id=? and o.customer_id=? and o.subscription_id=? and o.kind='CREATE' and o.fingerprint like 'v1.paid.%' and o.provider_operation_key=?
+            """,g.id(),g.site().value(),g.customer().value(),g.account().value(),g.subscription(),g.tokenDigest(),Timestamp.from(g.issuedAt()),Timestamp.from(g.expiresAt()),g.keyVersion(),b.stepId(),b.operationKey(),b.proof(),b.subscriptionReference(),b.customerReference(),b.invoiceReference(),b.allocationReference(),b.intentReference(),g.operation(),g.site().value(),g.customer().value(),g.subscription(),b.operationKey());
+        if(inserted!=1)throw conflict();
+    }
+    public void bindSession(String digest,UUID session,String origin,Instant expires,Instant now){
+        var g=billing(digest).orElseThrow(SubscriptionActionPersistenceAdapter::conflict);if(!g.available(now)||!expires.isAfter(now)||expires.isAfter(g.expiresAt()))throw conflict();
+        if(g.sessionId()!=null){if(!g.sessionId().equals(session)||!g.origin().equals(origin)||!g.clientExpiresAt().equals(expires))throw conflict();return;}
+        if(jdbc.update("update subscription_action_capabilities set client_session_id=?,client_origin=?,client_expires_at=? where token_digest=? and client_session_id is null and consumed_at is null and superseded_at is null",session,origin,Timestamp.from(expires),digest)!=1)throw conflict();
+    }
+    public ClaimDisposition claimBilling(SiteId site,CustomerId customer,PaymentAccountId account,UUID subscription,UUID operation,String digest,UUID session,String origin,String authority,String key,String fingerprint,Instant now){
+        if(replay(site,authority,key,fingerprint))return ClaimDisposition.REPLAY;
+        int updated=jdbc.update("""
+            update subscription_action_capabilities set consumed_at=?,confirmation_authority_scope=?,confirmation_key_digest=?,confirmation_fingerprint=?
+            where site_id=? and customer_id=? and payment_account_id=? and subscription_id=? and operation_id=? and purpose='PROVIDER_CLIENT' and token_digest=?
+             and billing_key_version is not null and recurring_consent is true and consent_purpose='CREATE' and consumed_at is null and superseded_at is null and issued_at<=? and expires_at>?
+             and client_session_id=? and client_origin=? and client_expires_at>?
+            """,Timestamp.from(now),authority,key,fingerprint,site.value(),customer.value(),account.value(),subscription,operation,digest,Timestamp.from(now),Timestamp.from(now),session,origin,Timestamp.from(now));
+        if(updated!=1)throw conflict();return ClaimDisposition.NEW;
+    }
+    private static SubscriptionClientGrant billing(java.sql.ResultSet r)throws java.sql.SQLException{
+        return new SubscriptionClientGrant(r.getObject("id",UUID.class),new SiteId(r.getObject("site_id",UUID.class)),new CustomerId(r.getObject("customer_id",UUID.class)),new PaymentAccountId(r.getObject("payment_account_id",UUID.class)),r.getObject("subscription_id",UUID.class),r.getObject("operation_id",UUID.class),r.getString("billing_key_version"),
+            new SubscriptionClientGrant.Binding(r.getObject("billing_step_id",UUID.class),r.getString("billing_operation_key"),r.getString("billing_proof"),r.getString("billing_subscription_reference"),r.getString("billing_customer_reference"),r.getString("billing_invoice_reference"),r.getString("billing_allocation_reference"),r.getString("billing_intent_reference")),r.getString("token_digest"),at(r,"issued_at"),at(r,"expires_at"),at(r,"consumed_at"),at(r,"superseded_at"),r.getObject("client_session_id",UUID.class),r.getString("client_origin"),at(r,"client_expires_at"));
+    }
+    private static Instant at(java.sql.ResultSet r,String column)throws java.sql.SQLException{var t=r.getTimestamp(column);return t==null?null:t.toInstant();}
     private static PaymentApplicationException conflict(){return new PaymentApplicationException("SUBSCRIPTION_CONFLICT",409,"Subscription conflict");}
 }
