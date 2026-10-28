@@ -4,10 +4,10 @@ import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
 import dev.genericpayments.platform.shared.application.port.out.DigestPort;
 
 /** Persisted identity encoding: UTF-16 lengths, exact values, strict UTF-8 SHA-256. */
-final class StripeRequestFingerprint {
+public final class StripeRequestFingerprint {
     private StripeRequestFingerprint() {}
 
-    static String of(DigestPort digest, PaymentAccount account, String... facts) {
+    public static String of(DigestPort digest, PaymentAccount account, String... facts) {
         var canonical = new StringBuilder();
         for (String fact : new String[]{account.id().value().toString(), account.externalAccountId(), account.credentialsRef(),
                 account.provider().name(), account.mode().name()}) append(canonical, fact);

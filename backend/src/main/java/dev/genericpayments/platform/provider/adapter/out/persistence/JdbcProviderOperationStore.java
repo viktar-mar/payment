@@ -106,7 +106,12 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         if (id == null || version < 0) throw conflict();
         // Acquire the row first: a blocked UPDATE could otherwise evaluate its clock predicate
         // before waiting for a lock and finish after the lease has expired.
-        lock(id).orElseThrow(JdbcProviderOperationStore::conflict);
+        var current = lock(id).orElseThrow(JdbcProviderOperationStore::conflict);
+        if ("ACKNOWLEDGED".equals(status) && !supportedResource(current.kind())) throw conflict();
+        if (current.kind() == Kind.CUSTOMER_CREATE && "ACKNOWLEDGED".equals(status)) {
+            requirePinnedAccount(current);
+            requireResource(current.accountId(), current.kind(), current.resourceId());
+        }
         try {
             return one(jdbc.query("""
                 update provider_operations set status=?, provider_reference=?, lease_owner=null,
@@ -152,6 +157,11 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         // Includes immutable request facts, dispatch bounds, owner and fencing version.
         if (!current.equals(expected) || !current.fingerprint().equals(fingerprint)
             || current.firstDispatchedAt() == null) throw conflict();
+        if (!supportedResource(current.kind())) throw conflict();
+        if (current.kind() == Kind.CUSTOMER_CREATE) {
+            requirePinnedAccount(current);
+            requireResource(current.accountId(), current.kind(), current.resourceId());
+        }
         if (current.status() == Status.ACKNOWLEDGED) {
             if (!Objects.equals(current.providerReference(), reference)) throw conflict();
             return current;
@@ -189,13 +199,36 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     }
 
     private void requireResource(PaymentAccountId account, Kind kind, UUID resourceId) {
+        if (kind == Kind.CUSTOMER_CREATE) {
+            // Consistent Billing lock order: operation (if present), Account, Site, Customer.
+            // CustomerId is globally keyed; a fresh subscription UUID cannot be a create identity.
+            var sites = jdbc.queryForList("select site_id from customers where id=?", UUID.class, resourceId);
+            if (sites.size() != 1) throw conflict();
+            var site = sites.getFirst();
+            if (jdbc.queryForList("select id from sites where id=? and payment_account_id=? and status='ACTIVE' for share",
+                    UUID.class, site, account.value()).size() != 1) throw conflict();
+            if (jdbc.queryForList("select id from customers where id=? and site_id=? and status='ACTIVE' for share",
+                    UUID.class, resourceId, site).size() != 1) throw conflict();
+            if (jdbc.queryForList("select id from payment_accounts where id=? and provider='STRIPE' and account_mode='SANDBOX'",
+                    UUID.class, account.value()).size() != 1) throw conflict();
+            return;
+        }
         String query = switch (kind) {
             case PRODUCT_CREATE -> "select p.id from products p join sites s on s.id=p.site_id where p.id=? and s.payment_account_id=? for share of p,s";
             case PRICE_CREATE -> "select p.id from prices p join products product on product.id=p.product_id and product.site_id=p.site_id join sites s on s.id=p.site_id where p.id=? and s.payment_account_id=? for share of p,product,s";
             case PAYMENT_PREPARE -> "select p.id from payments p where p.id=? and p.payment_account_id=? for share of p";
             case REFUND_CREATE -> "select r.id from refunds r join payments p on p.id=r.payment_id where r.id=? and p.payment_account_id=? for share of r,p";
+            // Each later command needs its own durable resource proof. Never reuse payment recovery.
+            default -> throw conflict();
         };
         if (jdbc.queryForList(query, UUID.class, resourceId, account.value()).size() != 1) throw conflict();
+    }
+
+    private static boolean supportedResource(Kind kind) {
+        return switch (kind) {
+            case PRODUCT_CREATE, PRICE_CREATE, PAYMENT_PREPARE, REFUND_CREATE, CUSTOMER_CREATE -> true;
+            default -> false;
+        };
     }
 
     private ProviderOperation operation(ResultSet row, int index) throws SQLException {
