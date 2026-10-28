@@ -72,6 +72,14 @@ class StripeSubscriptionCreateTest {
         org.springframework.test.util.ReflectionTestUtils.setField(adapter,"providerClock",later);
         assertThatCode(this::create).doesNotThrowAnyException();
         assertThat(steps.only().firstDispatchedAt().getEpochSecond()).isEqualTo(graph.subscription.get("created").getAsLong());
+        assertThat(steps.only().firstDispatchedAt()).isEqualTo(later.instant());
+        assertThat(org.springframework.test.util.ReflectionTestUtils.getField(adapter,"providerClock")).isSameAs(later);
+    }
+    @Test void positiveFixtureCannotMoveTheCurrentClockBackToReplayAnExpiredOriginal(){
+        unknown();steps.expire();var expired=steps.only();var later=Clock.fixed(expired.retryBefore().plusSeconds(1),ZoneOffset.UTC);
+        org.springframework.test.util.ReflectionTestUtils.setField(adapter,"providerClock",later);
+        assertThatThrownBy(this::create).isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
+        assertThat(steps.only()).isEqualTo(expired);assertThat(graph.http.requestCount("POST","/v1/subscriptions")).isEqualTo(1);
         assertThat(org.springframework.test.util.ReflectionTestUtils.getField(adapter,"providerClock")).isSameAs(later);
     }
     @Test void intentionallyEarlierCreatedResponseStillRefusesTheOriginalDispatchWindow(){
@@ -173,9 +181,10 @@ class StripeSubscriptionCreateTest {
     // Known-positive responses share the dispatch instant; malformed-response tests call the adapter directly.
     void create(){
         var original=(Clock)org.springframework.test.util.ReflectionTestUtils.getField(adapter,"providerClock");
-        var at=steps.find(account.id(),operation.providerOperationKey()).map(ProviderOperation::firstDispatchedAt).orElseGet(Instant::now);
-        graph.subscription.addProperty("created",at.getEpochSecond());
-        org.springframework.test.util.ReflectionTestUtils.setField(adapter,"providerClock",Clock.fixed(at,ZoneOffset.UTC));
+        var requestNow=original.instant();
+        var responseCreatedAt=steps.find(account.id(),operation.providerOperationKey()).map(ProviderOperation::firstDispatchedAt).orElse(requestNow);
+        graph.subscription.addProperty("created",responseCreatedAt.getEpochSecond());
+        org.springframework.test.util.ReflectionTestUtils.setField(adapter,"providerClock",Clock.fixed(requestNow,ZoneOffset.UTC));
         try{identity();graph.http.respond("POST","/v1/subscriptions",graph.subscription.toString());assertThat(adapter.create(command()).outcome()).isEqualTo(Outcome.ACCEPTED);}
         finally{org.springframework.test.util.ReflectionTestUtils.setField(adapter,"providerClock",original);}
     }
