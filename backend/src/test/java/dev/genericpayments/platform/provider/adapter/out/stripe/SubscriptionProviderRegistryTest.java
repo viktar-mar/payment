@@ -17,6 +17,8 @@ class SubscriptionProviderRegistryTest {
     final StripeSubscriptionProviderAdapter stripe=mock(StripeSubscriptionProviderAdapter.class);
     ApplicationContextRunner runner(boolean enabled){return new ApplicationContextRunner().withUserConfiguration(SubscriptionProviderRegistryConfiguration.class)
         .withBean(FakeSubscriptionProviderAdapter.class,()->fake)
+        .withBean(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionSetupContinuationGuard.class,()->mock(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionSetupContinuationGuard.class))
+        .withBean(dev.genericpayments.platform.subscriptions.application.service.SubscriptionResumeReceiptTransaction.class,()->mock(dev.genericpayments.platform.subscriptions.application.service.SubscriptionResumeReceiptTransaction.class))
         .withBean(StripeSandboxProperties.class,()->enabled?new StripeSandboxProperties(true,"sk_test_"+"A".repeat(32),"pk_test_"+"B".repeat(32),"whsec_"+"C".repeat(32)):new StripeSandboxProperties(false,"","",""))
         .withBean(StripeSubscriptionProviderAdapter.class,()->{constructed.incrementAndGet();return stripe;},definition->definition.setLazyInit(true));}
     // Catches eager Stripe construction/key lookup on the default Fake path.
