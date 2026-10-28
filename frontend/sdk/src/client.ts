@@ -111,7 +111,7 @@ export function createGenericPaymentClient(options: ClientOptions): GenericPayme
   }
   const client: GenericPaymentClient = {
     ...customer.methods,
-    subscriptions: createSubscriptionClient(customer.subscriptionAuthorized),
+    subscriptions: createSubscriptionClient(customer.subscriptionAuthorized, customer.subscriptionAuthority),
     getDonationCampaign: async input => { donationInput(input); const raw = await request(`/api/v1/public/sites/${encodeURIComponent(input.siteKey)}/donation-campaigns/${encodeURIComponent(input.campaignKey)}`, 'GET', undefined, { kind: 'none' }, undefined, input.signal, [200]); return parseCampaign(raw, input.campaignKey); },
     createDonationCheckout: createDonation,
     createCatalogCheckout: input => created(input, false), exchangeHandoff: input => created(input, true),

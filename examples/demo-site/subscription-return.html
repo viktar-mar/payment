@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta name="referrer" content="no-referrer" />
+    <script>history.replaceState(null,'',location.pathname)</script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Subscription return</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module">import {mountSubscriptionReturn} from '/src/subscriptions.ts';mountSubscriptionReturn();</script>
+  </head>
+  <body>
+    <main class="demo-shell">
+      <h1>Subscription return</h1>
+      <p>A return does not identify a subscription, confirm payment or grant access.</p>
+      <p id="subscription-return-status" role="status" aria-live="polite">Sign in to inspect subscriptions.</p>
+      <button id="read-subscriptions" type="button" hidden>Read my subscriptions from the server</button>
+      <p><a href="/#customer-access">Sign in and manage subscriptions</a></p>
+    </main>
+  </body>
+</html>

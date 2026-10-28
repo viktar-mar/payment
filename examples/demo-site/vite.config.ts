@@ -7,7 +7,7 @@ function isPrivateReturnTarget(target: string | undefined): boolean {
   try {
     // Decode the path only for matching; never decode or retain a return query.
     const decoded = decodeURIComponent(pathname);
-    return decoded === '/payment-return' || decoded === '/payment-return.html';
+    return ['/payment-return','/payment-return.html','/subscription-return','/subscription-return.html'].includes(decoded);
   } catch {
     // Malformed paths may themselves trigger Vite warnings. Drop their query too.
     return true;
@@ -37,7 +37,7 @@ export default defineConfig(({mode}):UserConfig=>({
     configureServer: protectReturnRequests,
     configurePreviewServer: protectReturnRequests,
   }],
-  build: { manifest:mode==='manual-payment',rollupOptions: { input: mode==='manual-payment'?{manualPayment:'manual-payment.html'}:mode==='form-diagnostic'?{formDiagnostic:'form-load-diagnostic.html',formManual:'form-load-manual.html'}:{main:'index.html',paymentReturn:'payment-return.html'} } },
+  build: { manifest:mode==='manual-payment',rollupOptions: { input: mode==='manual-payment'?{manualPayment:'manual-payment.html'}:mode==='form-diagnostic'?{formDiagnostic:'form-load-diagnostic.html',formManual:'form-load-manual.html'}:{main:'index.html',paymentReturn:'payment-return.html',subscriptionReturn:'subscription-return.html'} } },
   server: {
     host: "127.0.0.1",
     port: 4173,

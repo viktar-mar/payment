@@ -93,7 +93,7 @@ jobs:
         run: pnpm --dir examples/demo-site install --frozen-lockfile
       - name: Verify demo return handling and build
         run: |
-          pnpm --dir examples/demo-site exec vitest run src/payment-return.test.ts src/vite-return-privacy.test.ts
+          pnpm --dir examples/demo-site exec vitest run src/payment-return.test.ts src/subscription-return.test.ts src/vite-return-privacy.test.ts
           pnpm --dir examples/demo-site build
       - name: Install offline browser
         run: pnpm --dir examples/demo-site exec playwright install --with-deps chromium

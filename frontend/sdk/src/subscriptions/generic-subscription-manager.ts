@@ -2,7 +2,9 @@ import type { GenericPaymentClient } from '../contracts.js';
 import type { CustomerSession } from '../customer/contracts.js';
 import { validateCustomerSession } from '../customer/contracts.js';
 import { isAbort, PaymentSdkError, problemError } from '../errors.js';
-import { SubscriptionFakeActionDriver } from './action-driver.js';
+import { SubscriptionFakeActionDriver, watchSubscriptionOperation } from './action-driver.js';
+import { mountStripeSubscription, type StripeSubscriptionHandle } from './stripe-subscription-driver.js';
+import { createProviderMount, ownedProviderHost, type OwnedProviderMount } from '../widget/provider-mount.js';
 import type { SubscriptionAction, SubscriptionBillingPage, SubscriptionBillingView, SubscriptionEvent, SubscriptionHistory, SubscriptionMutation, SubscriptionOffer, SubscriptionOperation, SubscriptionQuote, SubscriptionTiming, SubscriptionView } from './contracts.js';
 import { acceptManagerResult, type ManagerState } from './manager-state.js';
 import { subscriptionCopy, type SubscriptionCopyKey } from './copy.js';
@@ -30,6 +32,12 @@ export class GenericSubscriptionManager extends ElementBase {
   #loaded = false;
   #uncertain = false;
   #action?: SubscriptionAction;
+  #providerMount?: OwnedProviderMount;
+  #stripeHandle?: StripeSubscriptionHandle;
+  #formController?: AbortController;
+  #formReady = false;
+  #preparedOperations = new Set<string>();
+  #polling = false;
   #offers: SubscriptionOffer[] = [];
   #billing: SubscriptionBillingPage = { items: [], nextCursor: null };
   #history: SubscriptionHistory = { items: [], nextCursor: null };
@@ -109,6 +117,7 @@ export class GenericSubscriptionManager extends ElementBase {
     button('recover', () => { const debt = this.#state.subscription?.debt; if (debt) void this.#mutate(i => this.#client!.subscriptions.recover({ ...i, billingRecordId: debt.billingRecordId }), 'RECOVER_INVOICE'); });
     button('resume', () => { if (this.#requireConsent()) void this.#mutate(i => this.#client!.subscriptions.resume({ ...i, recurringConsent: true }), 'RESUME'); });
     button('complete', () => { const action = this.#action, op = this.#state.operation; if (!action || !op) return; this.#action = undefined; void this.#mutate(i => new SubscriptionFakeActionDriver(this.#client!.subscriptions).complete(action, { ...i, operationId: op.operationId }), undefined, true); });
+    button('pay', () => { void this.#pay(); });
     button('portal', () => { void this.#portal(); });
     this.#section.append(this.#billingTitle, this.#billingList); button('moreBilling', () => { void this.#more('billing'); });
     this.#section.append(this.#historyTitle, this.#historyList); button('moreHistory', () => { void this.#more('history'); }); this.#section.append(this.#protected);
@@ -122,6 +131,7 @@ export class GenericSubscriptionManager extends ElementBase {
   disconnectedCallback(): void { this.#reset(); this.#render(); }
   attributeChangedCallback(name: string, old: string | null, value: string | null): void { if (name === 'locale' && old !== value) this.locale = value === 'pt' ? 'pt' : 'en'; }
   #reset(): void {
+    this.#retireForm(); this.#preparedOperations.clear(); this.#polling = false;
     this.#controller?.abort(); this.#controller = undefined; if (this.#expiry !== undefined) clearTimeout(this.#expiry); this.#expiry = undefined;
     this.#state = { authorityRevision: this.#state.authorityRevision + 1, phase: 'idle', subscription: null, operation: null };
     this.#fingerprint = identity(this.#session); this.#busy = this.#loaded = this.#uncertain = false; this.#action = undefined; this.#offers = []; this.#quote = undefined; this.#cancelMode = undefined; this.#error = undefined;
@@ -149,7 +159,7 @@ export class GenericSubscriptionManager extends ElementBase {
   #accept(revision: number, next: Partial<ManagerState>): void { if (!this.#current(revision)) return; this.#state = acceptManagerResult(this.#state, revision, { ...this.#state, ...next }); this.#render(); this.#emit(); }
   #failure(error: unknown, revision: number, mutation = false): void {
     if (!this.#current(revision) || isAbort(error)) return;
-    this.#action = undefined; this.#quote = undefined; this.#cancelMode = undefined;
+    this.#retireForm(); this.#action = undefined; this.#quote = undefined; this.#cancelMode = undefined;
     const code = problemError(error instanceof PaymentSdkError ? { code: error.code } : {}).code;
     if (['SESSION_EXPIRED', 'INVALID_SESSION', 'AUTHENTICATION_FAILED'].includes(code)) { this.#reset(); this.#state.phase = 'expired'; this.#error = 'login'; }
     else { if (mutation) this.#uncertain = true; this.#state.phase = mutation || unresolved(this.#state.operation) ? 'unknown' : 'error'; this.#error = mutation ? 'unknown' : 'error'; }
@@ -179,13 +189,63 @@ export class GenericSubscriptionManager extends ElementBase {
   async #readOperation(revision: number, operationId: string, subscriptionId: string): Promise<void> {
     const input = { session: this.#session!, signal: this.#controller!.signal, subscriptionId, operationId }, client = this.#client!.subscriptions;
     const op = await client.operation(input); if (!this.#current(revision)) return;
+    if (['SUCCEEDED','FAILED','UNKNOWN'].includes(op.status)) this.#retireForm();
     this.#action = undefined;
-    if (op.status === 'REQUIRES_ACTION' && op.actionAvailable && this.#session!.scopes.includes('SUBSCRIPTION_MANAGE')) { const action = await client.action(input); if (!this.#current(revision)) return; this.#action = action; }
+    if (['PROCESSING','REQUIRES_ACTION'].includes(op.status) && !this.#preparedOperations.has(operationId) && this.#session!.scopes.includes('SUBSCRIPTION_MANAGE')) {
+      try {
+        const action = await client.action(input); if (!this.#current(revision)) return;
+        if (action.kind === 'PROVIDER_CLIENT') { this.#accept(revision, { operation:safeOperation(op),phase:this.#phase(op) }); await this.#prepareStripe(revision,op,action); }
+        else if (op.status === 'REQUIRES_ACTION' && op.actionAvailable) this.#action = action;
+      } catch (error) {
+        if (isAbort(error) || error instanceof PaymentSdkError && ['INVALID_SESSION','SESSION_EXPIRED','AUTHENTICATION_FAILED'].includes(error.code)) throw error;
+        // An unavailable original action is still pending; a read never retries a write.
+        this.#error = 'processing';
+      }
+    }
     this.#uncertain = op.status === 'UNKNOWN'; this.#accept(revision, { operation: safeOperation(op), phase: this.#phase(op) });
+  }
+  #retireForm(): void {
+    const controller=this.#formController, handle=this.#stripeHandle, mount=this.#providerMount;
+    this.#formReady=false; this.#formController=undefined; this.#stripeHandle=undefined; this.#providerMount=undefined;
+    controller?.abort(); handle?.destroy(); mount?.destroy();
+  }
+  async #prepareStripe(revision:number, op:SubscriptionOperation, action:SubscriptionAction):Promise<void> {
+    if (this.#preparedOperations.has(op.operationId)) return;
+    this.#preparedOperations.add(op.operationId); this.#retireForm();
+    const form = new AbortController(); this.#formController=form;
+    const mount = createProviderMount(this,this.#buttons.get('pay')!,'STRIPE');
+    // Reserve actual light-DOM geometry before the provider creates its iframe.
+    mount.host.style.minHeight='3rem'; this.#providerMount=mount; this.#render();
+    try {
+      const handle = await mountStripeSubscription({ client:this.#client!.subscriptions, input:{session:this.#session!,subscriptionId:op.subscriptionId,operationId:op.operationId,signal:AbortSignal.any([this.#controller!.signal,form.signal])},action,container:mount.host,locale:this.#locale,
+        isCurrent:()=>this.#current(revision) && this.#providerMount===mount && ownedProviderHost(this)===mount.host,
+        onRetire:()=>{ if (this.#providerMount===mount) { this.#retireForm(); if(this.#current(revision)) this.#render(); } } });
+      if (!this.#current(revision) || this.#providerMount!==mount) { handle.destroy(); return; }
+      this.#stripeHandle=handle; this.#formReady=true; this.#render();
+    } catch(error) { if (this.#providerMount===mount) this.#retireForm(); throw error; }
+  }
+  async #pay():Promise<void> {
+    const revision=this.#state.authorityRevision, handle=this.#stripeHandle, op=this.#state.operation;
+    if (this.#busy || !this.#formReady || !handle || !op || !this.#current(revision)) return;
+    this.#formReady=false; this.#busy=true; this.#error=undefined; this.#render();
+    try { await handle.confirm(); }
+    catch(error) { if (this.#current(revision) && !isAbort(error)) this.#error='unknown'; }
+    finally { if (this.#current(revision)) { this.#retireForm(); this.#busy=false; this.#render(); void this.#observe(revision,op); } }
+  }
+  async #observe(revision:number, original:SubscriptionOperation):Promise<void> {
+    if (!this.#current(revision) || this.#polling) return; this.#polling=true; this.#render();
+    try {
+      for await (const op of watchSubscriptionOperation(this.#client!.subscriptions,{session:this.#session!,signal:this.#controller!.signal,subscriptionId:original.subscriptionId,operationId:original.operationId})) {
+        if (!this.#current(revision)) return;
+        this.#uncertain=op.status==='UNKNOWN'; this.#accept(revision,{operation:safeOperation(op),phase:this.#phase(op)});
+        if (['SUCCEEDED','FAILED'].includes(op.status)) { this.#consent.checked=false; await this.#load(revision); }
+      }
+    } catch(error) { this.#failure(error,revision); }
+    finally { if (this.#current(revision)) { this.#polling=false; this.#render(); } }
   }
   #phase(op: SubscriptionOperation): ManagerState['phase'] { return op.status === 'UNKNOWN' ? 'unknown' : op.status === 'REQUIRES_ACTION' ? 'requires_action' : ['RESERVED', 'PROCESSING'].includes(op.status) ? 'processing' : op.status === 'FAILED' ? 'error' : 'ready'; }
   async #refresh(revision = this.#state.authorityRevision): Promise<void> {
-    if (this.#busy || !this.#current(revision) || !this.#controller) return;
+    if (this.#busy || this.#polling || !this.#current(revision) || !this.#controller) return;
     this.#busy = true; this.#error = undefined; this.#quote = undefined; this.#cancelMode = undefined;
     this.#changeConfirmed.checked = this.#cancelConfirmed.checked = false; this.#render();
     try {
@@ -216,7 +276,8 @@ export class GenericSubscriptionManager extends ElementBase {
       outcomeKnown = true;
       this.#action = op.nextAction; this.#uncertain = op.status === 'UNKNOWN';
       this.#accept(revision, { operation: safeOperation(op), phase: this.#phase(op) });
-      if (op.status === 'REQUIRES_ACTION' && op.actionAvailable && !this.#action) await this.#readOperation(revision, op.operationId, op.subscriptionId);
+      if (this.#action?.kind==='PROVIDER_CLIENT') { const action=this.#action; this.#action=undefined; await this.#prepareStripe(revision,op,action); }
+      else if (['PROCESSING','REQUIRES_ACTION'].includes(op.status) && !this.#action) await this.#readOperation(revision, op.operationId, op.subscriptionId);
       if (['SUCCEEDED', 'FAILED'].includes(op.status)) { this.#consent.checked = false; await this.#load(revision); }
       if (this.#current(revision)) this.#status.focus();
     } catch (e) { this.#failure(e, revision, !outcomeKnown); }
@@ -248,7 +309,7 @@ export class GenericSubscriptionManager extends ElementBase {
   #renderTimings(): void { const old = this.#timing.value; const timings = this.#offers.find(o => o.price.priceId === this.#plan.value)?.allowedTimings ?? []; this.#timing.replaceChildren(...timings.map(value => { const option = document.createElement('option'); option.value = value; return option; })); this.#timing.value = timings.includes(old as SubscriptionTiming) ? old : timings[0] ?? ''; }
   #render(): void {
     const t = subscriptionCopy[this.#locale], s = this.#state.subscription, op = this.#state.operation, authenticated = !!this.#session && !!this.#client && !!this.#controller, canCreate = authenticated && this.#canCreate();
-    this.#section.lang = this.#locale; this.#section.setAttribute('aria-label', t.title); this.#section.setAttribute('aria-busy', String(this.#busy)); this.#title.textContent = t.title; this.#simulation.textContent = t.simulated;
+    this.#section.lang = this.#locale; this.#section.setAttribute('aria-label', t.title); this.#section.setAttribute('aria-busy', String(this.#busy)); this.#title.textContent = t.title; this.#simulation.textContent = t.simulated; this.#simulation.hidden=!this.#action?.kind.startsWith('FAKE_');
     this.#status.textContent = this.#state.phase === 'expired' ? t.expired : !authenticated ? t.login : this.#busy ? t.loading : this.#state.phase === 'unknown' ? t.unknown : this.#state.phase === 'processing' ? t.processing : this.#state.phase === 'requires_action' ? t.requiresAction : this.#state.phase === 'error' ? t.error : s ? t.ready : t.idle;
     this.#alert.hidden = !this.#error; this.#alert.textContent = this.#error ? t[this.#error] : '';
     const rows: [string, string][] = [];
@@ -269,7 +330,8 @@ export class GenericSubscriptionManager extends ElementBase {
     this.#cancelText.hidden = this.#cancelLabel.hidden = !this.#cancelMode; this.#cancelConfirmed.disabled = this.#busy;
     this.#cancelText.textContent = this.#cancelMode ? `${t.effective}: ${this.#cancelMode === 'PERIOD_END' ? s?.period?.end ?? t.none : t.immediate}. ${t.cancelNote}` : '';
     const visible: Partial<Record<SubscriptionCopyKey, boolean>> = { refresh: authenticated, create: canCreate, preview: this.#can('CHANGE_PLAN'), apply: !!q && this.#can('CHANGE_PLAN'), cancelEnd: this.#can('CANCEL_PERIOD_END'), cancelNow: this.#can('CANCEL_IMMEDIATE'), submitCancel: !!this.#cancelMode, dismiss: !!q || !!this.#cancelMode, clear: this.#can('CLEAR_CHANGE'), withdraw: this.#can('WITHDRAW_CANCELLATION'), setup: this.#can('SETUP_METHOD'), recover: this.#can('RECOVER_INVOICE') && !!s?.debt, resume: this.#can('RESUME'), complete: authenticated && !!this.#action && op?.status === 'REQUIRES_ACTION', portal: this.#can('OPEN_PORTAL'), moreBilling: authenticated && !!this.#billing.nextCursor, moreHistory: authenticated && !!this.#history.nextCursor };
-    for (const [key, button] of this.#buttons) { button.textContent = t[key]; button.hidden = !visible[key]; button.disabled = this.#busy; }
+    visible.pay=authenticated && !!this.#providerMount;
+    for (const [key, button] of this.#buttons) { button.textContent = t[key]; button.hidden = !visible[key]; button.disabled = this.#busy || (key==='pay' && !this.#formReady) || (key==='refresh' && this.#polling); }
     const list = (element: HTMLUListElement, items: string[]) => element.replaceChildren(...(items.length ? items : [t.noRecords]).map(text => { const li = document.createElement('li'); li.textContent = text; return li; }));
     this.#billingTitle.textContent = t.billing; this.#historyTitle.textContent = t.history;
     list(this.#billingList, this.#billing.items.map((b: SubscriptionBillingView) => `${b.kind} · ${this.#money(b.amountDueMinor, b.currency)} · ${b.settlement} · ${b.period.start} – ${b.period.end}`));

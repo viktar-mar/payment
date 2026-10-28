@@ -1,4 +1,4 @@
-import { registerGenericSubscriptionManager } from '@generic-payments/sdk';
+import { createGenericPaymentClient, recoverCustomerSession, registerGenericSubscriptionManager } from '@generic-payments/sdk';
 import type { CustomerSession, GenericPaymentClient, GenericSubscriptionManager } from '@generic-payments/sdk';
 
 const en = {
@@ -19,10 +19,39 @@ const copy = {
   },
 } satisfies Record<'en' | 'pt', { [K in keyof typeof en]: string }>;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const returnConfigurationKey='demo:subscription-return:v1';
+function returnIdentity(raw:unknown):{apiBaseUrl:string;siteKey:string}|undefined {
+  if(!raw||typeof raw!=='object')return;const value=raw as Record<string,unknown>;
+  if(Object.keys(value).length!==2||typeof value.apiBaseUrl!=='string'||typeof value.siteKey!=='string'||!(/^[A-Za-z0-9][A-Za-z0-9-]{2,62}$/).test(value.siteKey))return;
+  try { const url=new URL(value.apiBaseUrl);if(url.origin!==value.apiBaseUrl||!(url.protocol==='https:'||url.protocol==='http:'&&['127.0.0.1','localhost','[::1]'].includes(url.hostname)))return;return {apiBaseUrl:value.apiBaseUrl,siteKey:value.siteKey}; }catch{return;}
+}
+/** Return parameters carry no authority. Only an explicit recovered Customer read is offered. */
+export function mountSubscriptionReturn():void {
+  const status=document.querySelector<HTMLElement>('#subscription-return-status'),button=document.querySelector<HTMLButtonElement>('#read-subscriptions');if(!status||!button)return;
+  let identity:{apiBaseUrl:string;siteKey:string}|undefined;
+  try { const raw=sessionStorage.getItem(returnConfigurationKey);if(raw&&raw.length<=2048)identity=returnIdentity(JSON.parse(raw)); }catch{/* Public hints are optional. */}
+  identity??=returnIdentity({apiBaseUrl:document.documentElement.dataset.apiBaseUrl,siteKey:document.documentElement.dataset.siteKey});
+  const session=identity?recoverCustomerSession(identity):null;
+  status.textContent='Sign in to inspect subscriptions. A return does not confirm billing or access.';
+  if(!identity||!session)return;
+  const controller=new AbortController();window.addEventListener('pagehide',()=>controller.abort(),{once:true});
+  button.hidden=false;status.textContent='A saved Customer session is available. Read the server status to inspect billing and access.';
+  button.addEventListener('click',async()=>{
+    if(button.disabled||controller.signal.aborted)return;button.disabled=true;
+    try {
+      const current=recoverCustomerSession(identity!);if(!current||current.sessionToken!==session.sessionToken)throw new Error('Customer authority changed');
+      const page=await createGenericPaymentClient({apiBaseUrl:identity!.apiBaseUrl,signal:controller.signal}).subscriptions.list({session:current,signal:controller.signal,limit:20});
+      if(!controller.signal.aborted)status.textContent=page.items.length?page.items.map(value=>`Billing ${value.billingStatus} · Access ${value.access.allowed?'allowed':'not allowed'} · ${value.access.reason}`).join('; '):'No subscriptions are available for this Customer.';
+    }catch{if(!controller.signal.aborted)status.textContent='Unable to read subscriptions. Sign in again to inspect server status.';}
+    finally{if(!controller.signal.aborted)button.disabled=false;}
+  });
+}
 
 /** Public configuration only. Customer authority is passed explicitly by the OTP host. */
-export function mountSubscriptions(configuration: { locale: string }, client: GenericPaymentClient, onLocale: (locale: 'en' | 'pt') => void): { setSession(session: CustomerSession | undefined): void } {
+export function mountSubscriptions(configuration: { locale: string; apiBaseUrl?: string; siteKey?: string }, client: GenericPaymentClient, onLocale: (locale: 'en' | 'pt') => void): { setSession(session: CustomerSession | undefined): void } {
   registerGenericSubscriptionManager();
+  const identity=returnIdentity({apiBaseUrl:configuration.apiBaseUrl,siteKey:configuration.siteKey});
+  if(identity)try{sessionStorage.setItem(returnConfigurationKey,JSON.stringify(identity));}catch{/* Public hints are optional. */}
   let locale: 'en' | 'pt' = configuration.locale.toLowerCase().startsWith('pt') ? 'pt' : 'en';
   const parameters = new URLSearchParams(location.search), page = document.documentElement.dataset;
   const section = document.createElement('section'); section.className = 'product-card subscription-demo'; section.id = 'subscription-demo';

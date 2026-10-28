@@ -68,13 +68,13 @@ export function createCustomerClient(base: string, request: CustomerRequest, sig
     if (result.kind === "unavailable") { const s = memory.get(siteKey); return s ? checked(s) : undefined; }
     memory.delete(siteKey); failedWrites.delete(siteKey); return undefined;
   }
-  async function authorized(session: CustomerSession, path: string, method: "GET" | "POST" | "DELETE", body?: object, signal?: AbortSignal, expected: readonly number[] = [200], idempotency?: string, scope?: CustomerScope, rule?: ResponseRule, cap = 131072): Promise<unknown> {
+  async function authorized(session: CustomerSession, path: string, method: "GET" | "POST" | "DELETE", body?: object, signal?: AbortSignal, expected: readonly number[] = [200], idempotency?: string, scope?: CustomerScope, rule?: ResponseRule, cap = 131072, parseSuccess?: (raw: string) => unknown): Promise<unknown> {
     const owned = checked(session);
     if (scope && !owned.scopes.includes(scope)) throw new PaymentSdkError("INVALID_SESSION");
-    try { return await request(path, method, body, { kind: "customer", token: owned.sessionToken }, idempotency, signal, expected, cap, rule); }
+    try { return await request(path, method, body, { kind: "customer", token: owned.sessionToken }, idempotency, signal, expected, cap, rule, parseSuccess); }
     catch (e) { if (e instanceof PaymentSdkError && (e.code === "INVALID_SESSION" || e.code === "SESSION_EXPIRED")) clear(owned, e.code); throw e; }
   }
-  const subscriptionAuthorized: SubscriptionAuthorizedRequest = async (session, path, method, body, signal, expected, idempotency, scope, rule, cap = 32768) => {
+  function captureSubscriptionAuthority(session: CustomerSession, signal: AbortSignal | undefined, scope: 'SUBSCRIPTION_READ' | 'SUBSCRIPTION_MANAGE') {
     const owned = checked(session); const identity = fingerprint(owned);
     if (!uuid(owned.siteId) || !owned.scopes.includes(scope) || revokedSubscriptionIdentities.has(identity)) throw new PaymentSdkError('INVALID_SESSION');
     const current = catalog(owned.siteKey);
@@ -95,8 +95,11 @@ export function createCustomerClient(base: string, request: CustomerRequest, sig
       const replacement = catalog(owned.siteKey);
       if ((replacement && fingerprint(replacement) !== identity) || readCustomerRecord(owned) !== record) throw new PaymentSdkError('INVALID_SESSION');
     }
-    stillAuthorized();
-    try { const raw = await authorized(owned, path, method, body, signal, expected, idempotency, scope, rule, cap); stillAuthorized(); return raw; }
+    stillAuthorized(); return { owned, stillAuthorized };
+  }
+  const subscriptionAuthorized: SubscriptionAuthorizedRequest = async (session, path, method, body, signal, expected, idempotency, scope, rule, cap = 32768, parseSuccess) => {
+    const { owned, stillAuthorized } = captureSubscriptionAuthority(session, signal, scope);
+    try { const raw = await authorized(owned, path, method, body, signal, expected, idempotency, scope, rule, cap, parseSuccess); stillAuthorized(); return raw; }
     catch (error) { stillAuthorized(); throw error; }
   };
   async function authenticate(siteKey: string, intent: AuthenticationIntent, path: string, body: object, signal?: AbortSignal) {
@@ -177,5 +180,5 @@ export function createCustomerClient(base: string, request: CustomerRequest, sig
       clear(owned); await authorized(owned, "/api/v1/customer/session", "DELETE", undefined, signal, [204]);
     },
   };
-  return { methods, catalog, authorized, subscriptionAuthorized };
+  return { methods, catalog, authorized, subscriptionAuthorized, subscriptionAuthority: (session: CustomerSession, signal?: AbortSignal) => captureSubscriptionAuthority(session, signal, 'SUBSCRIPTION_MANAGE').stillAuthorized };
 }

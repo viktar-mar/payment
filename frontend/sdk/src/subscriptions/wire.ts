@@ -1,6 +1,8 @@
 import { exact, instant, key, object, uuid } from '../contracts.js';
 import { validCursor } from '../customer/contracts.js';
 import { PaymentSdkError } from '../errors.js';
+import type { CustomerSession } from '../customer/contracts.js';
+import type { SubscriptionClientSession, SubscriptionMutationReceipt } from './contracts.js';
 import { accessReasons, billingStatuses, eventTypes, operationKinds, operationStatuses, permittedActions, subscriptionStates } from './contracts.js';
 import type { SubscriptionAccess, SubscriptionAction, SubscriptionBillingPage, SubscriptionBillingView, SubscriptionEvent, SubscriptionHistory, SubscriptionOffer, SubscriptionOperation, SubscriptionPage, SubscriptionPeriod, SubscriptionPortal, SubscriptionPrice, SubscriptionQuote, SubscriptionView } from './contracts.js';
 function invalid(): never { throw new PaymentSdkError('INVALID_RESPONSE'); }
@@ -68,14 +70,38 @@ export function parseSubscriptionAction(raw: unknown): SubscriptionAction {
 }
 export function validSubscriptionActionToken(raw: unknown): raw is string { return typeof raw === 'string' && raw.length > 0 && raw.length <= 2048 && /^[A-Za-z0-9_.:/-]+$/.test(raw); }
 function operation(raw: unknown, mutation: boolean): SubscriptionOperation {
-  const o = fields(raw, 'operation_id subscription_id status action_available' + (mutation ? ' next_action' : ''));
+  const permission = mutation && object(raw) && Object.hasOwn(raw, 'browser_confirm_allowed');
+  const o = fields(raw, 'operation_id subscription_id status action_available' + (mutation ? ' next_action' : '') + (permission ? ' browser_confirm_allowed' : ''));
   const result: SubscriptionOperation = { operationId: id(o.operation_id), subscriptionId: id(o.subscription_id), status: enumeration(o.status, operationStatuses), actionAvailable: bool(o.action_available) };
   if (result.actionAvailable !== (result.status === 'REQUIRES_ACTION')) invalid();
   if (mutation && o.next_action !== null) { if (!result.actionAvailable) invalid(); result.nextAction = parseSubscriptionAction(o.next_action); }
+  if (mutation) Object.defineProperty(result, 'browserConfirmAllowed', { value: permission ? bool(o.browser_confirm_allowed) : false, enumerable: false });
   return result;
 }
 export function parseSubscriptionOperation(raw: unknown): SubscriptionOperation { return operation(raw, false); }
-export function parseSubscriptionMutation(raw: unknown): SubscriptionOperation { return operation(raw, true); }
+export function parseSubscriptionMutation(raw: unknown): SubscriptionMutationReceipt { return operation(raw, true) as SubscriptionMutationReceipt; }
+/** Flat six-string transport grammar also rejects duplicate/escaped duplicate keys. */
+export function parseSubscriptionClientSessionJson(raw: string): unknown {
+  const string = '"(?:[^"\\\\\\u0000-\\u001f]|\\\\(?:["\\\\/bfnrt]|u[0-9a-fA-F]{4}))*"';
+  const pair = `${string}\\s*:\\s*${string}`;
+  if (!new RegExp(`^\\s*\\{\\s*${pair}(?:\\s*,\\s*${pair})*\\s*\\}\\s*$`).test(raw) || [...raw.matchAll(new RegExp(pair, 'g'))].length !== 6) invalid();
+  return JSON.parse(raw);
+}
+export function parseSubscriptionClientSession(raw: unknown, action: SubscriptionAction, session: CustomerSession): SubscriptionClientSession {
+  const s = fields(raw, 'provider flow publishable_key client_secret action_token expires_at');
+  if (s.provider !== 'stripe' || action.kind !== 'PROVIDER_CLIENT' || s.action_token !== action.secret || !validSubscriptionActionToken(s.action_token)
+    || typeof s.publishable_key !== 'string' || s.publishable_key.length > 255 || !/^pk_(?:test|live)_[A-Za-z0-9_]+$/.test(s.publishable_key)) invalid();
+  const flow = enumeration(s.flow, ['PAYMENT', 'SETUP'] as const);
+  if (typeof s.client_secret !== 'string' || s.client_secret.length > 512 || !(flow === 'PAYMENT' ? /^pi_[A-Za-z0-9_]+_secret_[A-Za-z0-9_]+$/ : /^seti_[A-Za-z0-9_]+_secret_[A-Za-z0-9_]+$/).test(s.client_secret)) invalid();
+  const expiresAt = fresh(s.expires_at);
+  if (!instant(action.expiresAt) || !instant(session.expiresAt) || Date.parse(expiresAt) > Math.min(Date.parse(action.expiresAt), Date.parse(session.expiresAt))) invalid();
+  const result = {} as SubscriptionClientSession;
+  Object.defineProperties(result, {
+    flow: { value: flow }, publishableKey: { value: s.publishable_key }, clientSecret: { value: s.client_secret }, actionToken: { value: s.action_token }, expiresAt: { value: expiresAt },
+    toJSON: { value: () => '[SubscriptionClientSession redacted]' }, toString: { value: () => '[SubscriptionClientSession redacted]' },
+  });
+  return Object.freeze(result);
+}
 export function parseSubscriptionQuote(raw: unknown): SubscriptionQuote {
   const q = fields(raw, 'quote_id subscription_id from_price_id from_price_version target_price timing due_now_minor next_amount_minor currency effective_at expires_at tax_final subscription_revision policy_version');
   const result: SubscriptionQuote = { quoteId: id(q.quote_id), subscriptionId: id(q.subscription_id), fromPriceId: id(q.from_price_id), fromPriceVersion: integer(q.from_price_version, 1), targetPrice: price(q.target_price), timing: enumeration(q.timing, ['IMMEDIATE', 'NEXT_PERIOD']), dueNowMinor: integer(q.due_now_minor, Number.MIN_SAFE_INTEGER), nextAmountMinor: integer(q.next_amount_minor, 1), currency: currency(q.currency), effectiveAt: time(q.effective_at), expiresAt: fresh(q.expires_at), taxFinal: bool(q.tax_final), subscriptionRevision: integer(q.subscription_revision), policyVersion: integer(q.policy_version) };
