@@ -22,7 +22,7 @@ class StripeBillingObservationTest {
     static final Instant NOW=Instant.parse("2026-10-01T00:00:00Z");
     final Map<Class<?>,Object> dependencies=new HashMap<>();
     final MemoryObservations observations=new MemoryObservations();
-    Subscription current;PaymentAccount account;SubscriptionFactService service;int saves,events;boolean actionReplyRecorded;boolean scheduleObserved=true;
+    Subscription current;PaymentAccount account;SubscriptionFactService service;int saves,events;boolean actionReplyRecorded;boolean scheduleObserved=true;boolean originalFirst;boolean scheduleCompleted;
     @BeforeEach void setup() throws Exception {
         current=SubscriptionFixtures.active(NOW.minusSeconds(86400),NOW.plusSeconds(86400));
         account=PaymentAccount.create(current.paymentAccountId(),"billing",PaymentProviderType.STRIPE,PaymentAccountMode.SANDBOX,"acct_test","stripe-sandbox-default");
@@ -46,13 +46,60 @@ class StripeBillingObservationTest {
     @Test void configuredOriginalScheduleCashAppliesOnlyAtItsExactPaidBoundary(){scheduledFact(true);}
     @Test void unownedTargetRenewalCannotReplacePendingPlanEntitlement(){scheduledFact(false);}
     @Test void firstTargetCashDoesNotNeedAnEarlierSchedulingObservation(){scheduleObserved=false;scheduledFact(true);}
+    @Test void delayedImmediateCashTransitionProjectsLatestPaidTargetPeriod(){delayedPlan(ChangeTiming.IMMEDIATE,false,null);}
+    @Test void delayedImmediateZeroTransitionProjectsLatestPaidTargetPeriod(){delayedPlan(ChangeTiming.IMMEDIATE,true,null);}
+    @Test void delayedConfiguredTransitionProjectsLatestPaidTargetPeriod(){delayedPlan(ChangeTiming.NEXT_PERIOD,false,null);}
+    @Test void delayedImmediateCashIsIndependentOfInvoiceOrdering(){originalFirst=true;delayedPlan(ChangeTiming.IMMEDIATE,false,null);}
+    @Test void delayedConfiguredCashIsIndependentOfInvoiceOrdering(){originalFirst=true;delayedPlan(ChangeTiming.NEXT_PERIOD,false,null);}
+    @Test void delayedConfiguredCashStillAppliesAfterSchedulingOperationCompleted(){scheduleCompleted=true;delayedPlan(ChangeTiming.NEXT_PERIOD,false,null);}
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"missing","unpaid","currentUnpaid","foreign","newerIntent","revision","debt","cancel","terminal"})
+    void delayedImmediateRenewalCannotSubstituteForOriginalTransition(String fault){delayedPlan(ChangeTiming.IMMEDIATE,false,fault);}
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"missing","unpaid","currentUnpaid","foreign","newerIntent","revision","debt","cancel","terminal"})
+    void delayedConfiguredRenewalCannotSubstituteForOriginalTransition(String fault){delayedPlan(ChangeTiming.NEXT_PERIOD,false,fault);}
+    void delayedPlan(ChangeTiming timing,boolean zero,String fault){
+        var s=current;var old=s.billingPrice();var id=UUID.randomUUID();
+        var target=new SubscriptionPriceTerms(new dev.genericpayments.platform.catalog.domain.PriceId(UUID.randomUUID()),"delayed",1,s.productId(),dev.genericpayments.platform.catalog.domain.Money.of(2000,"EUR"),old.interval(),0,old.trialPolicy(),old.taxMode());
+        var effective=timing==ChangeTiming.IMMEDIATE?NOW:s.paidThrough();
+        var operation=new SubscriptionOperation(id,s.siteId(),s.customerId(),s.id(),SubscriptionOperation.Kind.CHANGE,scheduleCompleted?SubscriptionOperation.Status.SUCCEEDED:SubscriptionOperation.Status.PROCESSING,"test","key","v1.plan."+"a".repeat(64),"subscription:"+account.id().value()+":"+id+":CHANGE",s.revision(),1,s.providerReference(),null,NOW,NOW,0);
+        current=SubscriptionPlanTransaction.withChange(s,new Subscription.Change("newerIntent".equals(fault)?UUID.randomUUID():id,target,effective,scheduleCompleted?Subscription.ChangeState.SCHEDULED:Subscription.ChangeState.UNKNOWN),NOW);
+        if("revision".equals(fault))current=SubscriptionPlanTransaction.withChange(current,current.pendingChange(),NOW);
+        if("terminal".equals(fault))current=current.cancel("PROVIDER_CANCELLED",NOW);
+        if("cancel".equals(fault))current=new Subscription(current.id(),current.siteId(),current.customerId(),current.productId(),current.paymentAccountId(),current.billingPrice(),current.entitledPrice(),current.billingStatus(),current.providerReference(),current.currentPeriod(),current.paidThrough(),current.trial(),new Subscription.Cancellation(s.paidThrough()),current.pendingChange(),current.debt(),current.terminalReason(),current.revision(),current.createdAt(),current.updatedAt(),current.lastReconciledAt());
+        if("debt".equals(fault))current=current.renewalFailed(UUID.randomUUID(),new Subscription.Period(s.paidThrough(),s.paidThrough().plusSeconds(2678400)),0,NOW);
+        when(dep(SubscriptionOperationStore.class).unresolved(any(),any())).thenReturn(scheduleCompleted?List.of():List.of(operation));when(dep(SubscriptionOperationStore.class).lock(id)).thenReturn(operation);when(dep(SubscriptionOperationStore.class).find(s.siteId(),s.id(),id)).thenReturn(Optional.of(operation));when(dep(SubscriptionReadPreparation.class).financial(any())).thenReturn(scheduleCompleted?null:operation);
+        when(dep(BillingRecordStore.class).upsert(any())).thenAnswer(i->i.getArgument(0));when(dep(SubscriptionCatalogPort.class).terms(any(),eq(target.priceId()))).thenReturn(target);when(dep(SubscriptionCatalogPort.class).terms(any(),eq(old.priceId()))).thenReturn(old);
+        long due=timing==ChangeTiming.IMMEDIATE?(zero?0:500):0;
+        var q=new SubscriptionPlanProofStore.Quote(UUID.randomUUID(),account.id(),s.siteId(),s.customerId(),s.id(),s.providerReference(),"cus_owned",old,old,target,"price_old","price_target","prod_owned","si_owned",s.currentPeriod(),s.paidThrough(),s.revision(),1,timing,NOW,NOW.plusSeconds(300),due,List.of());
+        var proofs=mock(SubscriptionPlanProofStore.class);org.springframework.test.util.ReflectionTestUtils.setField(service,"planProofs",proofs);
+        var firstPeriod=timing==ChangeTiming.IMMEDIATE?new Subscription.Period(NOW,s.paidThrough()):new Subscription.Period(s.paidThrough(),s.paidThrough().plusSeconds(2678400));
+        var latest=new Subscription.Period(firstPeriod.end(),firstPeriod.end().plusSeconds(2678400));
+        var historical=new Invoice("in_original",timing==ChangeTiming.IMMEDIATE?BillingRecord.Kind.PRORATION:BillingRecord.Kind.RENEWAL,target,timing==ChangeTiming.IMMEDIATE?old:null,firstPeriod,timing==ChangeTiming.IMMEDIATE?due:2000,"EUR","unpaid".equals(fault)?SettlementKind.OPEN:zero?SettlementKind.ZERO:SettlementKind.CASH,zero||"unpaid".equals(fault)?List.of():List.of(new CashObject("pi_original",timing==ChangeTiming.IMMEDIATE?due:2000,"EUR",dev.genericpayments.platform.payments.domain.PaymentStatus.SUCCEEDED,NOW)));
+        var result=new SubscriptionPlanProofStore.Result("foreign".equals(fault)?UUID.randomUUID():id,s.id(),account.id(),q.id(),UUID.randomUUID(),s.providerReference(),historical.reference(),null,"il_credit","il_debit");
+        when(proofs.proration(account.id(),historical.reference())).thenReturn(Optional.of(new SubscriptionPlanProofStore.Proration(q,result)));
+        var schedule=new SubscriptionPlanProofStore.Schedule("foreign".equals(fault)?UUID.randomUUID():id,s.id(),account.id(),q.id(),UUID.randomUUID(),"sub_sched_owned",s.currentPeriod().start().getEpochSecond(),UUID.randomUUID(),firstPeriod.end().getEpochSecond(),null,null,new SubscriptionPlanProofStore.SourcePhase("none",null,"charge_automatically"));
+        when(proofs.schedule(account.id(),id)).thenReturn(Optional.of(schedule));when(proofs.quote(account.id(),q.id())).thenReturn(Optional.of(q));
+        var generic=new SubscriptionQuote(UUID.randomUUID(),s.siteId(),s.id(),"test",old.priceId(),old.version(),target,timing,due,2000,"EUR",effective,NOW.plusSeconds(300),true,s.revision(),1,q.reference());when(dep(SubscriptionQuoteStore.class).forOperation(s.siteId(),s.id(),id)).thenReturn(Optional.of(generic));
+        var renewal=new Invoice("in_current",BillingRecord.Kind.RENEWAL,target,null,latest,2000,"EUR","currentUnpaid".equals(fault)?SettlementKind.OPEN:SettlementKind.CASH,"currentUnpaid".equals(fault)?List.of():List.of(new CashObject("pi_current",2000,"EUR",dev.genericpayments.platform.payments.domain.PaymentStatus.SUCCEEDED,latest.start())));
+        var invoices="missing".equals(fault)?List.of(renewal):originalFirst?List.of(historical,renewal):List.of(renewal,historical);
+        var at=latest.start().plusSeconds(100);org.springframework.test.util.ReflectionTestUtils.setField(service,"clock",Clock.fixed(at,ZoneOffset.UTC));
+        var snapshot=new Snapshot(s.providerReference(),Subscription.Status.ACTIVE,target,latest,null,null,invoices,scheduleCompleted?null:operation.providerOperationKey(),false,0,at,scheduleCompleted?null:new OperationObservation(operation.providerOperationKey(),OperationState.APPLIED));
+        apply(snapshot,new Fence(current.revision(),scheduleCompleted?null:id,scheduleCompleted?null:operation.version(),null,null,observations.captureFence(current)));
+        if(fault==null){
+            assertThat(current.entitledPrice()).isEqualTo(target);assertThat(current.currentPeriod()).isEqualTo(latest);assertThat(current.paidThrough()).isEqualTo(latest.end());assertThat(current.pendingChange()).isNull();
+            if(!scheduleCompleted){var completed=org.mockito.ArgumentCaptor.forClass(SubscriptionOperation.class);verify(dep(SubscriptionOperationStore.class)).save(completed.capture(),eq(operation.version()));assertThat(completed.getValue().status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);}
+            var recorded=org.mockito.ArgumentCaptor.forClass(SubscriptionEvent.class);verify(dep(SubscriptionEventStore.class),atLeastOnce()).append(recorded.capture());var bill=org.mockito.ArgumentCaptor.forClass(BillingRecord.class);verify(dep(BillingRecordStore.class),atLeastOnce()).upsert(bill.capture());var originalBill=bill.getAllValues().stream().filter(b->b.providerInvoiceReference().equals(historical.reference())).findFirst().orElseThrow();assertThat(recorded.getAllValues()).anyMatch(e->e.type()==SubscriptionEvent.Type.CHANGE_APPLIED&&originalBill.id().equals(e.billingRecordId()));
+            int eventCount=events,saveCount=saves;when(dep(SubscriptionOperationStore.class).unresolved(any(),any())).thenReturn(List.of());when(dep(SubscriptionReadPreparation.class).financial(any())).thenReturn(null);apply(snapshot,fence());assertThat(events).isEqualTo(eventCount);assertThat(saves).isEqualTo(saveCount);
+        }else{assertThat(current.entitledPrice()).isEqualTo(old);assertThat(current.paidThrough()).isEqualTo(s.paidThrough());if(timing==ChangeTiming.IMMEDIATE)verify(dep(SubscriptionOperationStore.class),never()).save(any(),anyLong());var recorded=org.mockito.ArgumentCaptor.forClass(SubscriptionEvent.class);verify(dep(SubscriptionEventStore.class),atLeast(0)).append(recorded.capture());assertThat(recorded.getAllValues()).noneMatch(e->e.type()==SubscriptionEvent.Type.CHANGE_APPLIED);}
+    }
     void scheduledFact(boolean owned){
         var s=current;var old=s.billingPrice();var boundary=s.paidThrough();
         var target=new SubscriptionPriceTerms(new dev.genericpayments.platform.catalog.domain.PriceId(UUID.randomUUID()),"deferred",1,s.productId(),dev.genericpayments.platform.catalog.domain.Money.of(2000,"EUR"),old.interval(),0,old.trialPolicy(),old.taxMode());
         var id=UUID.randomUUID();current=SubscriptionPlanTransaction.withChange(s,new Subscription.Change(id,target,boundary,scheduleObserved?Subscription.ChangeState.SCHEDULED:Subscription.ChangeState.UNKNOWN),NOW);
         var paidPeriod=new Subscription.Period(boundary,boundary.plusSeconds(2678400));
         var q=new SubscriptionPlanProofStore.Quote(UUID.randomUUID(),account.id(),s.siteId(),s.customerId(),s.id(),s.providerReference(),"cus_owned",old,old,target,"price_old","price_target","prod_owned","si_owned",s.currentPeriod(),boundary,s.revision(),1,ChangeTiming.NEXT_PERIOD,NOW,NOW.plusSeconds(300),0,List.of());
-        var schedule=new SubscriptionPlanProofStore.Schedule(id,s.id(),account.id(),q.id(),UUID.randomUUID(),"sub_sched_owned",s.currentPeriod().start().getEpochSecond(),UUID.randomUUID(),paidPeriod.end().getEpochSecond(),null,null);
+        var schedule=new SubscriptionPlanProofStore.Schedule(id,s.id(),account.id(),q.id(),UUID.randomUUID(),"sub_sched_owned",s.currentPeriod().start().getEpochSecond(),UUID.randomUUID(),paidPeriod.end().getEpochSecond(),null,null,new SubscriptionPlanProofStore.SourcePhase("none",null,"charge_automatically"));
         var proofs=mock(SubscriptionPlanProofStore.class);org.springframework.test.util.ReflectionTestUtils.setField(service,"planProofs",proofs);when(proofs.schedule(account.id(),id)).thenReturn(owned?Optional.of(schedule):Optional.empty());when(proofs.quote(account.id(),q.id())).thenReturn(Optional.of(q));
         var generic=new SubscriptionQuote(UUID.randomUUID(),s.siteId(),s.id(),"test",old.priceId(),old.version(),target,ChangeTiming.NEXT_PERIOD,0,2000,"EUR",boundary,NOW.plusSeconds(300),true,s.revision(),1,q.reference());when(dep(SubscriptionQuoteStore.class).forOperation(s.siteId(),s.id(),id)).thenReturn(Optional.of(generic));
         when(dep(BillingRecordStore.class).upsert(any())).thenAnswer(i->i.getArgument(0));when(dep(SubscriptionCatalogPort.class).terms(any(),eq(target.priceId()))).thenReturn(target);when(dep(SubscriptionCatalogPort.class).terms(any(),eq(old.priceId()))).thenReturn(old);

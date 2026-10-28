@@ -312,7 +312,9 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
             if(original!=null){
                 var q=planProofs.quote(lookup.account().id(),original.quote()).orElseThrow(StripeSubscriptionProviderAdapter::mismatch);
                 var invoice=result.invoices().stream().filter(i->i.reference().equals(original.invoice())).findFirst().orElseThrow(StripeSubscriptionProviderAdapter::mismatch);
-                applied=result.status()==Subscription.Status.ACTIVE&&result.billingPrice().equals(q.target())&&result.period().equals(q.period())&&(invoice.settlement()==SettlementKind.CASH||invoice.settlement()==SettlementKind.ZERO);
+                boolean originalOrLaterPeriod=result.period().equals(q.period())||!result.period().start().isBefore(q.period().end());
+                applied=result.status()==Subscription.Status.ACTIVE&&result.billingPrice().equals(q.target())&&originalOrLaterPeriod
+                    &&(invoice.settlement()==SettlementKind.CASH||invoice.settlement()==SettlementKind.ZERO);
                 if(!applied&&invoice.settlement()==SettlementKind.VOID&&original.pendingExpiry()!=null&&providerClock.instant().getEpochSecond()>=original.pendingExpiry()&&result.billingPrice().equals(q.source())&&result.period().equals(q.period())){
                     try{var remote=client(lookup.account()).v1().subscriptions().retrieve(s.providerReference());StripeBillingOwnership.requireCurrentRemote(remote,s,b,ownership.price(lookup.account(),s,q.source()));declined=remote.getPendingUpdate()==null&&"active".equals(remote.getStatus())&&StripeBillingMutationAdapter.itemPeriod(remote).equals(result.period());}catch(StripeException invalid){throw mismatch();}
                 }

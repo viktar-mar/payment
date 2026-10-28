@@ -39,6 +39,7 @@ import dev.genericpayments.platform.subscriptions.application.port.out.Subscript
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.Line;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.Quote;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.Schedule;
+import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.SourcePhase;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionQuoteStore;
 import dev.genericpayments.platform.subscriptions.application.service.SubscriptionFactFixture;
 import dev.genericpayments.platform.subscriptions.application.service.SubscriptionPlanTransaction;
@@ -434,10 +435,10 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
     @Test void failedScheduleCreateConfigureAndReleaseEachRollBackTheirExactAcknowledgement() {
         var change = plan(original.subscription(), ChangeTiming.NEXT_PERIOD, "schedule-atomic");
         var create = claimed(change.operation(), ProviderOperation.Kind.SCHEDULE_CREATE);
-        rejectProofWrite("stripe_plan_schedules", () -> proofs.recordSchedule(change.subscription(), change.operation(), change.quote(), create, OWNER, "sub_sched_Atomic", SOURCE_PERIOD.start().getEpochSecond()));
+        rejectProofWrite("stripe_plan_schedules", () -> proofs.recordSchedule(change.subscription(), change.operation(), change.quote(), create, OWNER, "sub_sched_Atomic", SOURCE_PERIOD.start().getEpochSecond(), new SourcePhase("none", null, "charge_automatically")));
         assertThat(steps.findById(create.id())).contains(create);
         assertThat(proofs.schedule(account.id(), change.operation().id())).isEmpty();
-        var created = proofs.recordSchedule(change.subscription(), change.operation(), change.quote(), create, OWNER, "sub_sched_Atomic", SOURCE_PERIOD.start().getEpochSecond());
+        var created = proofs.recordSchedule(change.subscription(), change.operation(), change.quote(), create, OWNER, "sub_sched_Atomic", SOURCE_PERIOD.start().getEpochSecond(), new SourcePhase("none", null, "charge_automatically"));
         var update = claimed(change.operation(), ProviderOperation.Kind.SCHEDULE_UPDATE);
         rejectProofWrite("stripe_plan_schedules", () -> proofs.recordScheduleUpdate(change.subscription(), change.operation(), created, update, OWNER, targetEnd(change)));
         assertThat(steps.findById(update.id())).contains(update);
@@ -460,7 +461,7 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
         var colliding = claimed(other.operation(), ProviderOperation.Kind.SCHEDULE_CREATE);
         providerConflict(() -> steps.acknowledge(colliding.id(), OWNER, colliding.version(), created.reference()));
         assertThat(steps.findById(colliding.id())).contains(colliding);
-        var otherCreated = proofs.recordSchedule(other.subscription(), other.operation(), other.quote(), colliding, OWNER, "sub_sched_Other", SOURCE_PERIOD.start().getEpochSecond());
+        var otherCreated = proofs.recordSchedule(other.subscription(), other.operation(), other.quote(), colliding, OWNER, "sub_sched_Other", SOURCE_PERIOD.start().getEpochSecond(), new SourcePhase("none", null, "charge_automatically"));
         var update = claimed(change.operation(), ProviderOperation.Kind.SCHEDULE_UPDATE);
         providerConflict(() -> proofs.recordScheduleUpdate(change.subscription(), change.operation(), otherCreated, update, OWNER, targetEnd(change)));
         assertThat(steps.findById(update.id())).contains(update);
@@ -812,84 +813,88 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
         assertUnchangedEntitlement(change);
     }
 
+    @Test void configuredScheduleSourcePhaseReloadsFiniteModesAndOptionalPaymentMethod() {
+        var phases = List.of(new SourcePhase("none", null, "charge_automatically"),
+            new SourcePhase("create_prorations", "pm_SourceCreate", "charge_automatically"),
+            new SourcePhase("always_invoice", "pm_SourceInvoice", "charge_automatically"));
+        for (int i = 0; i < phases.size(); i++) {
+            var phase = phases.get(i);
+            var change = plan(i == 0 ? original.subscription() : paidOriginal().subscription(), ChangeTiming.NEXT_PERIOD, "source-phase-codec-" + i);
+            var step = claimed(change.operation(), ProviderOperation.Kind.SCHEDULE_CREATE);
+            var saved = proofs.recordSchedule(change.subscription(), change.operation(), change.quote(), step, OWNER, "sub_sched_Source" + i, SOURCE_PERIOD.start().getEpochSecond(), phase);
+            assertThat(saved.sourcePhase()).isEqualTo(phase);
+            assertThat(proofs.schedule(account.id(), change.operation().id())).contains(saved);
+            assertThat(proofs.scheduleReference(account.id(), saved.reference())).contains(saved);
+            assertThat(jdbc.queryForObject("select source_proration_behavior from stripe_plan_schedules where operation_id=?", String.class, change.operation().id())).isEqualTo(phase.prorationBehavior());
+            assertThat(jdbc.queryForObject("select source_default_payment_method from stripe_plan_schedules where operation_id=?", String.class, change.operation().id())).isEqualTo(phase.defaultPaymentMethod());
+            assertThat(jdbc.queryForObject("select source_collection_method from stripe_plan_schedules where operation_id=?", String.class, change.operation().id())).isEqualTo("charge_automatically");
+            var update = claimed(change.operation(), ProviderOperation.Kind.SCHEDULE_UPDATE);
+            var configured = proofs.recordScheduleUpdate(change.subscription(), change.operation(), saved, update, OWNER, targetEnd(change));
+            assertThat(configured.sourcePhase()).isEqualTo(phase);
+            assertThat(proofs.schedules(account.id(), change.subscription().id())).containsExactly(new SubscriptionPlanProofStore.ScheduleProof(change.quote(), configured));
+        }
+        assertThat(count("stripe_plan_schedules")).isEqualTo(3);
+        assertThat(count("payments")).isZero();
+    }
+
+    @Test void scheduleSourcePhaseSqlRejectsUnknownModesMethodsAndNonAutomaticCollection() {
+        var change = plan(original.subscription(), ChangeTiming.NEXT_PERIOD, "source-phase-sql");
+        var step = acknowledge(reserveStep(change.operation(), ProviderOperation.Kind.SCHEDULE_CREATE), "sub_sched_SourceSql");
+        var row = scheduleRow(change, step, "sub_sched_SourceSql");
+        reject("stripe_plan_schedules", row, "source_proration_behavior", null, "23502");
+        reject("stripe_plan_schedules", row, "source_proration_behavior", "invented", "23514");
+        reject("stripe_plan_schedules", row, "source_default_payment_method", "pm_not_native", "23514");
+        reject("stripe_plan_schedules", row, "source_default_payment_method", "cus_Source", "23514");
+        reject("stripe_plan_schedules", row, "source_collection_method", null, "23502");
+        reject("stripe_plan_schedules", row, "source_collection_method", "send_invoice", "23514");
+        row.put("source_proration_behavior", "create_prorations"); row.put("source_default_payment_method", "pm_SqlSource");
+        insert("stripe_plan_schedules", row);
+        assertThat(proofs.schedule(account.id(), change.operation().id())).hasValueSatisfying(s ->
+            assertThat(s.sourcePhase()).isEqualTo(new SourcePhase("create_prorations", "pm_SqlSource", "charge_automatically")));
+        assertUnchangedEntitlement(change);
+    }
+
+    @Test void sourcePhaseReceiptRollbackAndDriftCannotChangeExistingConfiguration() {
+        var change = plan(original.subscription(), ChangeTiming.NEXT_PERIOD, "source-phase-rollback");
+        var phase = new SourcePhase("always_invoice", "pm_RetainedSource", "charge_automatically");
+        var create = claimed(change.operation(), ProviderOperation.Kind.SCHEDULE_CREATE);
+        rejectProofWrite("stripe_plan_schedules", () -> proofs.recordSchedule(change.subscription(), change.operation(), change.quote(), create, OWNER,
+            "sub_sched_SourceAtomic", SOURCE_PERIOD.start().getEpochSecond(), phase));
+        assertThat(steps.findById(create.id())).contains(create);
+        assertThat(proofs.schedule(account.id(), change.operation().id())).isEmpty();
+        var saved = proofs.recordSchedule(change.subscription(), change.operation(), change.quote(), create, OWNER,
+            "sub_sched_SourceAtomic", SOURCE_PERIOD.start().getEpochSecond(), phase);
+        for (String assignment : List.of("source_proration_behavior='none'", "source_default_payment_method='pm_Replacement'", "source_default_payment_method=null", "source_collection_method='send_invoice'")) {
+            sqlState("23514", () -> jdbc.update("update stripe_plan_schedules set " + assignment + " where operation_id=?", change.operation().id()));
+        }
+        var changedSource = new Schedule(saved.operation(), saved.subscription(), saved.account(), saved.quote(), saved.creationStep(), saved.reference(),
+            saved.phaseStart(), saved.updateStep(), saved.targetEnd(), saved.clearOperation(), saved.releaseStep(), new SourcePhase("none", "pm_Replacement", "charge_automatically"));
+        var update = claimed(change.operation(), ProviderOperation.Kind.SCHEDULE_UPDATE);
+        providerConflict(() -> proofs.recordScheduleUpdate(change.subscription(), change.operation(), changedSource, update, OWNER, targetEnd(change)));
+        assertThat(steps.findById(update.id())).contains(update);
+        assertThat(proofs.schedule(account.id(), change.operation().id())).contains(saved);
+        var configured = proofs.recordScheduleUpdate(change.subscription(), change.operation(), saved, update, OWNER, targetEnd(change));
+        // Receipt API requires the exact live step; replay reads retain the committed descriptor.
+        // Neither an old DISPATCHING snapshot nor changed source fields can grant a new write.
+        providerConflict(() -> proofs.recordSchedule(change.subscription(), change.operation(), change.quote(), create, OWNER,
+            saved.reference(), saved.phaseStart(), phase));
+        providerConflict(() -> proofs.recordSchedule(change.subscription(), change.operation(), change.quote(), create, OWNER,
+            saved.reference(), saved.phaseStart(), changedSource.sourcePhase()));
+        assertThat(proofs.scheduleReference(account.id(), saved.reference())).contains(configured);
+        assertThat(proofs.schedules(account.id(), change.subscription().id())).containsExactly(new SubscriptionPlanProofStore.ScheduleProof(change.quote(), configured));
+        assertThat(configured.sourcePhase()).isEqualTo(phase);
+        assertThat(count("stripe_plan_schedules")).isEqualTo(1);
+        assertUnchangedEntitlement(change);
+    }
+
     @Test void realPublicPlanChangeSdkReceiptThenVerifiedCashDeliversSignedCallbackAndReplaysWithoutMoney() throws Exception {
         var live = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS);
-        TestClock.set(live);
-        actor = new SubscriptionActor.Customer(sessions.resolveRequired(sessions.issue(site, customer.id(), "https://facts.test").rawToken(), "https://facts.test"));
         var fullPeriod = new Subscription.Period(live.minusSeconds(86400), live.plusSeconds(29 * 86400));
-        var seeded = sub(original.subscription().id());
-        // Honest source fixture seed: initial cash settlement is outside this scenario's evidence.
-        subscriptions.save(seeded.confirmPaid(seeded.billingPrice(), fullPeriod, live), seeded.revision());
-        var source = sub(seeded.id());
-        var targetId = target(source, ChangeTiming.IMMEDIATE);
-        var targetTerms = catalog.published(site, targetId);
-        for (var mapping : List.of(Map.entry(source.billingPrice().priceId(), "price_ConnectedSource"), Map.entry(targetId, "price_ConnectedTarget"))) {
-            catalogMappings.save(new dev.genericpayments.platform.catalog.application.model.ProviderCatalogMapping(account.id(), source.productId(),
-                new dev.genericpayments.platform.catalog.application.model.ProviderProductRef("prod_Connected"), mapping.getKey(),
-                new dev.genericpayments.platform.catalog.application.model.ProviderPriceRef(mapping.getValue()), live));
-        }
-        var graph = connectedPlanGraph(source, targetTerms, fullPeriod, live);
         try (var http = new dev.genericpayments.platform.support.StripeHttpFixture()) {
-            var credentials = new dev.genericpayments.platform.provider.adapter.out.stripe.StripeCredentialResolver(
-                new dev.genericpayments.platform.provider.adapter.out.stripe.StripeSandboxProperties(true, "sk_test_" + "A".repeat(32), "pk_test_" + "B".repeat(32), "whsec_" + "C".repeat(32)));
-            var factory = new dev.genericpayments.platform.provider.adapter.out.stripe.StripeClientFactory() {
-                @Override protected com.stripe.StripeClient.StripeClientBuilder builder(dev.genericpayments.platform.provider.adapter.out.stripe.StripeCredentials c) {
-                    assertThat(tx.active()).isFalse();
-                    return super.builder(c).setApiBase(http.baseUri().toString()).setHttpClient(closedPlanTransport(http.baseUri()));
-                }
-            };
-            var verification = new dev.genericpayments.platform.provider.adapter.out.stripe.StripeAccountVerificationAdapter(credentials, factory);
-            var customerAdapter = new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingCustomerAdapter(
-                credentials, factory, steps, bindings, digest, verification, accounts, siteLoader, customers);
-            var realProvider = new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeSubscriptionProviderAdapter(
-                credentials, factory, verification, steps, bindings, customerAdapter, digest, accounts, siteLoader, customers, subscriptions, operations, catalog, catalogMappings, businessClock);
-            org.springframework.test.util.ReflectionTestUtils.setField(realProvider, "planProofs", proofs);
-            org.springframework.test.util.ReflectionTestUtils.setField(realProvider, "providerClock", java.time.Clock.fixed(live, java.time.ZoneOffset.UTC));
-            reset(providers);
-            when(providers.forAccount(any())).thenAnswer(call -> { assertThat(call.getArgument(0, dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount.class)).isEqualTo(account); return realProvider; });
-            callbackConfiguration.configure(site.value(), "https://example.invalid/plan-callback", true);
-
-            enqueuePlanRead(http, graph, source.providerReference(), "source");
-            http.enqueue("POST", "/v1/invoices/create_preview", 200, graph.get("preview").toString());
-            var quote = planPreview.preview(new PreviewSubscriptionChangeUseCase.Query(context("connected-preview"), source.id(), targetId, ChangeTiming.IMMEDIATE));
-            var proofId = UUID.fromString(quote.providerQuoteReference().substring("bq1:".length()));
-            var savedQuote = proofs.quote(account.id(), proofId).orElseThrow();
-            assertThat(savedQuote.anchor()).isEqualTo(live);
-            assertThat(savedQuote.source()).isEqualTo(source.billingPrice());
-            assertThat(savedQuote.target()).isEqualTo(targetTerms);
-            assertThat(savedQuote.dueNow()).isEqualTo(1000);
-            assertThat(savedQuote.lines()).extracting(Line::amount).containsExactly(-1000L, 2000L);
-            assertThat(sub(source.id()).entitledPrice()).isEqualTo(source.entitledPrice());
-
-            // Public change performs its own fresh preview before the actual guarded SDK update.
-            enqueuePlanRead(http, graph, source.providerReference(), "source");
-            http.enqueue("POST", "/v1/invoices/create_preview", 200, graph.get("preview").toString());
-            enqueuePlanRead(http, graph, source.providerReference(), "source");
-            http.enqueue("POST", "/v1/subscriptions/" + source.providerReference(), 200, graph.get("target").toString());
-            http.enqueue("GET", "/v1/invoices/in_ConnectedChange", 200, graph.get("invoice").toString());
-            http.enqueue("GET", "/v1/invoices/in_ConnectedChange/lines", 200, connectedPlanPage(graph.get("credit"), graph.get("debit")));
-            var command = new dev.genericpayments.platform.subscriptions.application.port.in.ChangeSubscriptionPlanUseCase.Command(context("connected-change"), source.id(), quote.id());
-            var changed = planChange.change(command);
-            assertThat(changed.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
-            var receipt = proofs.result(account.id(), changed.operationId()).orElseThrow();
-            assertThat(receipt.quote()).isEqualTo(proofId);
-            assertThat(receipt.reference()).isEqualTo(source.providerReference());
-            assertThat(receipt.invoice()).isEqualTo("in_ConnectedChange");
-            assertThat(receipt.creditLine()).isEqualTo("il_ConnectedCredit");
-            assertThat(receipt.debitLine()).isEqualTo("il_ConnectedDebit");
-            var ownedStep = steps.find(account.id(), op(changed.operationId()).providerOperationKey()).orElseThrow();
-            assertThat(receipt.step()).isEqualTo(ownedStep.id());
-            assertThat(ownedStep.kind()).isEqualTo(ProviderOperation.Kind.SUBSCRIPTION_UPDATE);
-            assertThat(ownedStep.resourceId()).isEqualTo(changed.operationId());
-            assertThat(ownedStep.status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
-            var afterAck = sub(source.id());
-            assertThat(afterAck.billingPrice()).isEqualTo(source.billingPrice());
-            assertThat(afterAck.entitledPrice()).isEqualTo(source.entitledPrice());
-            assertThat(afterAck.currentPeriod()).isEqualTo(fullPeriod);
-            assertThat(afterAck.paidThrough()).isEqualTo(fullPeriod.end());
-            assertThat(count("payments")).isZero();
-            assertThat(jdbc.queryForObject("select count(*) from subscription_events where event_type='CHANGE_APPLIED'", Integer.class)).isZero();
-
+            var flow = connectedPlanReceipt(http, live, fullPeriod);
+            var source = flow.source(); var graph = flow.graph(); var command = flow.command();
+            var changed = flow.changed(); var savedQuote = flow.quote(); var receipt = flow.receipt();
+            var proofId = savedQuote.id(); var targetTerms = savedQuote.target(); var targetId = targetTerms.priceId();
             enqueuePlanCashRead(http, graph, source.providerReference());
             reconciliation.reconcile(new dev.genericpayments.platform.subscriptions.application.port.in.ReconcileSubscriptionUseCase.Command(context("connected-cash-one"), source.id()));
             var settled = sub(source.id());
@@ -931,48 +936,260 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
             assertThat(http.calls().stream().filter(c -> c.method().equals("POST") && c.path().equals("/v1/invoices/create_preview"))).hasSize(2);
             assertThat(jdbc.queryForObject("select count(*) from provider_operations where kind='PAYMENT_PREPARE'", Integer.class)).isZero();
 
-            var cashCallbacks = new java.util.concurrent.atomic.AtomicInteger();
-            var appliedCallbacks = new java.util.concurrent.atomic.AtomicInteger();
-            var claims = outbox.claimAutomatic("connected-plan-delivery", 20, live, Duration.ofSeconds(30));
-            assertThat(claims).isNotEmpty();
-            for (var claim : claims) {
-                byte[] secret = Base64.getUrlDecoder().decode(encryption.decrypt(claim.secret()));
-                try {
-                    new dev.genericpayments.platform.webhooks.application.service.CallbackDeliveryService(outbox, encryption, callbackPayload, (endpoint, headers, body) -> {
-                        assertThat(tx.active()).isFalse();
-                        assertThat(endpoint.toString()).isEqualTo("https://example.invalid/plan-callback");
-                        long at = Long.parseLong(headers.get("Payment-Timestamp"));
-                        assertThat(headers.get("Payment-Signature")).isEqualTo("v1=" + new dev.genericpayments.platform.webhooks.application.service.CallbackSigner().sign(secret, at, body));
-                        var payload = connectedPlanJson(new String(body, java.nio.charset.StandardCharsets.UTF_8));
-                        assertThat(headers.get("Payment-Event-Id")).isEqualTo(payload.get("event_id").getAsString());
-                        assertThat(payload.get("site_id").getAsString()).isEqualTo(site.value().toString());
-                        assertThat(payload.get("subscription_id").getAsString()).isEqualTo(source.id().toString());
-                        assertThat(new String(body, java.nio.charset.StandardCharsets.UTF_8)).doesNotContain("client_secret", "sk_test_");
-                        if (payload.get("event_type").getAsString().equals("payment.succeeded")) {
-                            assertThat(payload.get("amount_minor").getAsLong()).isEqualTo(1000);
-                            assertThat(payload.get("billing_kind").getAsString()).isEqualTo("PRORATION");
-                            assertThat(payload.get("currency").getAsString()).isEqualTo("EUR");
-                            assertThat(payload.get("period_start").getAsString()).isEqualTo(live.toString());
-                            assertThat(payload.get("price_id").getAsString()).isEqualTo(targetId.value().toString());
-                            assertThat(payload.get("billing_record_id").getAsString()).isEqualTo(bill.toString());
-                            assertThat(payload.get("period_end").getAsString()).isEqualTo(fullPeriod.end().toString());
-                            cashCallbacks.incrementAndGet();
-                        }
-                        if (payload.get("event_id").getAsString().equals(changeEvent.toString())) {
-                            assertThat(payload.get("billing_record_id").getAsString()).isEqualTo(bill.toString());
-                            assertThat(payload.get("access_allowed").getAsBoolean()).isTrue();
-                            assertThat(payload.get("access_valid_until").getAsString()).isEqualTo(live.plusSeconds(300).toString());
-                            appliedCallbacks.incrementAndGet();
-                        }
-                        return dev.genericpayments.platform.webhooks.application.port.out.CallbackHttpPort.Result.success(204);
-                    }, java.time.Clock.fixed(live, java.time.ZoneOffset.UTC)).deliver(claim);
-                } finally { Arrays.fill(secret, (byte) 0); }
-            }
-            assertThat(cashCallbacks.get()).isEqualTo(1);
-            assertThat(appliedCallbacks.get()).isEqualTo(1);
-            assertThat(jdbc.queryForList("select status from outbox_events", String.class)).containsOnly("DELIVERED");
+            deliverConnectedCallbacks(source, targetId,
+                Map.of(bill, new ConnectedCashCallback("PRORATION", 1000, new Subscription.Period(live, fullPeriod.end()))),
+                Map.of(changeEvent, bill), live.plusSeconds(300), java.time.Clock.fixed(live, java.time.ZoneOffset.UTC), live, "connected-plan-delivery");
             assertThat(count("payments")).isEqualTo(1);
             assertThat(jdbc.queryForObject("select count(*) from payment_events where event_type='PAYMENT_SUCCEEDED'", Integer.class)).isEqualTo(1);
+        }
+    }
+
+    @Test void delayedConnectedPlanCashWithProrationFirstProjectsLatestRenewalAndSignsBothBills() throws Exception {
+        delayedConnectedPlanCash(false);
+    }
+    @Test void delayedConnectedPlanCashWithRenewalFirstProjectsLatestRenewalAndSignsBothBills() throws Exception {
+        delayedConnectedPlanCash(true);
+    }
+    private void delayedConnectedPlanCash(boolean renewalFirst) throws Exception {
+        var live = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS);
+        // Honest artificial source period, not INITIAL cash or provider calendar evidence.
+        var fullPeriod = new Subscription.Period(live.minusSeconds(86400), live.plusSeconds(2));
+        try (var http = new dev.genericpayments.platform.support.StripeHttpFixture()) {
+            var flow = connectedPlanReceipt(http, live, fullPeriod);
+            var source = flow.source(); var graph = flow.graph(); var command = flow.command();
+            var changed = flow.changed(); var savedQuote = flow.quote(); var receipt = flow.receipt();
+            var proofId = savedQuote.id(); var targetTerms = savedQuote.target(); var targetId = targetTerms.priceId();
+            var currentPeriod = new Subscription.Period(fullPeriod.end(), fullPeriod.end().plusSeconds(30 * 86400));
+            var observedAt = currentPeriod.start().plusSeconds(1);
+            // Only application/native observation time advances. Original native dispatch clock stays live.
+            TestClock.set(observedAt);
+            actor = new SubscriptionActor.Customer(sessions.resolveRequired(sessions.issue(site, customer.id(), "https://facts.test").rawToken(), "https://facts.test"));
+            advanceConnectedPlanGraph(graph, currentPeriod, observedAt);
+            enqueueDelayedPlanCashRead(http, graph, source.providerReference(), renewalFirst);
+            reconciliation.reconcile(new dev.genericpayments.platform.subscriptions.application.port.in.ReconcileSubscriptionUseCase.Command(context("delayed-cash-one"), source.id()));
+            var settled = sub(source.id());
+            assertThat(settled.billingPrice()).isEqualTo(targetTerms);
+            assertThat(settled.entitledPrice()).isEqualTo(targetTerms);
+            assertThat(settled.currentPeriod()).isEqualTo(currentPeriod);
+            assertThat(settled.paidThrough()).isEqualTo(currentPeriod.end());
+            assertThat(settled.pendingChange()).isNull();
+            assertThat(op(changed.operationId()).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+            var originalBill = jdbc.queryForObject("select id from subscription_billing_records where provider_invoice_reference='in_ConnectedChange' and kind='PRORATION' and settlement='CONFIRMED_CASH'", UUID.class);
+            var currentBill = jdbc.queryForObject("select id from subscription_billing_records where provider_invoice_reference='in_ConnectedRenewal' and kind='RENEWAL' and settlement='CONFIRMED_CASH'", UUID.class);
+            assertThat(currentBill).isNotEqualTo(originalBill);
+            assertThat(jdbc.queryForObject("select period_start from subscription_billing_records where id=?", Timestamp.class, originalBill).toInstant()).isEqualTo(live);
+            assertThat(jdbc.queryForObject("select period_end from subscription_billing_records where id=?", Timestamp.class, originalBill).toInstant()).isEqualTo(fullPeriod.end());
+            assertThat(jdbc.queryForObject("select period_start from subscription_billing_records where id=?", Timestamp.class, currentBill).toInstant()).isEqualTo(currentPeriod.start());
+            assertThat(jdbc.queryForObject("select period_end from subscription_billing_records where id=?", Timestamp.class, currentBill).toInstant()).isEqualTo(currentPeriod.end());
+            assertThat(jdbc.queryForList("select billed_price_id from subscription_billing_records", UUID.class)).containsOnly(targetId.value());
+            var changeEvent = jdbc.queryForObject("select id from subscription_events where subscription_id=? and event_type='CHANGE_APPLIED'", UUID.class, source.id());
+            var periodEvent = jdbc.queryForObject("select id from subscription_events where subscription_id=? and event_type='PERIOD_PAID'", UUID.class, source.id());
+            assertThat(periodEvent).isNotEqualTo(changeEvent);
+            assertThat(jdbc.queryForObject("select billing_record_id from subscription_events where id=?", UUID.class, changeEvent)).isEqualTo(originalBill);
+            assertThat(jdbc.queryForObject("select billing_record_id from subscription_events where id=?", UUID.class, periodEvent)).isEqualTo(currentBill);
+            assertThat(jdbc.queryForObject("select count(*) from payments where source='SUBSCRIPTION' and status='SUCCEEDED' and currency='EUR'", Integer.class)).isEqualTo(2);
+            assertThat(jdbc.queryForObject("select amount_minor from payments where provider_payment_reference='pi_Connected'", Long.class)).isEqualTo(1000);
+            assertThat(jdbc.queryForObject("select amount_minor from payments where provider_payment_reference='pi_ConnectedRenewal'", Long.class)).isEqualTo(4000);
+            assertThat(jdbc.queryForObject("select billing_record_id from payments where provider_payment_reference='pi_Connected'", UUID.class)).isEqualTo(originalBill);
+            assertThat(jdbc.queryForObject("select billing_record_id from payments where provider_payment_reference='pi_ConnectedRenewal'", UUID.class)).isEqualTo(currentBill);
+            assertThat(jdbc.queryForObject("select count(*) from payment_events where event_type='PAYMENT_SUCCEEDED'", Integer.class)).isEqualTo(2);
+            var stableRows = connectedFinancialRows();
+            int callsBeforeReplay = http.calls().size();
+            var replay = new dev.genericpayments.platform.subscriptions.application.port.in.ChangeSubscriptionPlanUseCase.Command(context("connected-change"), source.id(), command.quoteId());
+            assertThat(planChange.change(replay).operationId()).isEqualTo(changed.operationId());
+            assertThat(http.calls()).hasSize(callsBeforeReplay);
+            enqueueDelayedPlanCashRead(http, graph, source.providerReference(), !renewalFirst);
+            reconciliation.reconcile(new dev.genericpayments.platform.subscriptions.application.port.in.ReconcileSubscriptionUseCase.Command(context("delayed-cash-repeat"), source.id()));
+            assertThat(connectedFinancialRows()).isEqualTo(stableRows);
+            assertThat(proofs.result(account.id(), changed.operationId())).contains(receipt);
+            assertThat(proofs.quote(account.id(), proofId)).contains(savedQuote);
+            assertThat(http.calls()).hasSize(42);
+            assertThat(http.calls().stream().filter(c -> c.method().equals("POST") && c.path().equals("/v1/subscriptions/" + source.providerReference())))
+                .singleElement().satisfies(c -> assertThat(c.header("Idempotency-Key")).isEqualTo(op(changed.operationId()).providerOperationKey()));
+            assertThat(http.calls().stream().filter(c -> c.method().equals("POST") && c.path().equals("/v1/invoices/create_preview"))).hasSize(2);
+            assertThat(jdbc.queryForObject("select count(*) from provider_operations where kind='PAYMENT_PREPARE'", Integer.class)).isZero();
+
+            // Real-time callback boundary: no synthetic future signing or security-clock margin.
+            awaitConnectedRealTime(observedAt);
+            var deliveryClock = java.time.Clock.systemUTC();
+            var dueAt = deliveryClock.instant();
+            deliverConnectedCallbacks(source, targetId,
+                Map.of(originalBill, new ConnectedCashCallback("PRORATION", 1000, new Subscription.Period(live, fullPeriod.end())),
+                    currentBill, new ConnectedCashCallback("RENEWAL", 4000, currentPeriod)),
+                Map.of(changeEvent, originalBill, periodEvent, currentBill), observedAt.plusSeconds(300), deliveryClock, dueAt, "delayed-plan-delivery");
+            assertThat(outbox.claimAutomatic("delayed-plan-empty", 20, deliveryClock.instant(), Duration.ofSeconds(30))).isEmpty();
+            assertThat(connectedFinancialRows()).isEqualTo(stableRows);
+            assertThat(count("payments")).isEqualTo(2);
+        }
+    }
+
+    private ConnectedPlanReceipt connectedPlanReceipt(dev.genericpayments.platform.support.StripeHttpFixture http, Instant live, Subscription.Period fullPeriod) {
+        TestClock.set(live);
+        actor = new SubscriptionActor.Customer(sessions.resolveRequired(sessions.issue(site, customer.id(), "https://facts.test").rawToken(), "https://facts.test"));
+        var seeded = sub(original.subscription().id());
+        // Honest source fixture seed: initial cash settlement is outside this scenario's evidence.
+        subscriptions.save(seeded.confirmPaid(seeded.billingPrice(), fullPeriod, live), seeded.revision());
+        var source = sub(seeded.id());
+        var targetId = target(source, ChangeTiming.IMMEDIATE);
+        var targetTerms = catalog.published(site, targetId);
+        for (var mapping : List.of(Map.entry(source.billingPrice().priceId(), "price_ConnectedSource"), Map.entry(targetId, "price_ConnectedTarget"))) {
+            catalogMappings.save(new dev.genericpayments.platform.catalog.application.model.ProviderCatalogMapping(account.id(), source.productId(),
+                new dev.genericpayments.platform.catalog.application.model.ProviderProductRef("prod_Connected"), mapping.getKey(),
+                new dev.genericpayments.platform.catalog.application.model.ProviderPriceRef(mapping.getValue()), live));
+        }
+        var graph = connectedPlanGraph(source, targetTerms, fullPeriod, live);
+        var credentials = new dev.genericpayments.platform.provider.adapter.out.stripe.StripeCredentialResolver(
+            new dev.genericpayments.platform.provider.adapter.out.stripe.StripeSandboxProperties(true, "sk_test_" + "A".repeat(32), "pk_test_" + "B".repeat(32), "whsec_" + "C".repeat(32)));
+        var factory = new dev.genericpayments.platform.provider.adapter.out.stripe.StripeClientFactory() {
+            @Override protected com.stripe.StripeClient.StripeClientBuilder builder(dev.genericpayments.platform.provider.adapter.out.stripe.StripeCredentials c) {
+                assertThat(tx.active()).isFalse();
+                return super.builder(c).setApiBase(http.baseUri().toString()).setHttpClient(closedPlanTransport(http.baseUri()));
+            }
+        };
+        var verification = new dev.genericpayments.platform.provider.adapter.out.stripe.StripeAccountVerificationAdapter(credentials, factory);
+        var customerAdapter = new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingCustomerAdapter(
+            credentials, factory, steps, bindings, digest, verification, accounts, siteLoader, customers);
+        var realProvider = new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeSubscriptionProviderAdapter(
+            credentials, factory, verification, steps, bindings, customerAdapter, digest, accounts, siteLoader, customers, subscriptions, operations, catalog, catalogMappings, businessClock);
+        org.springframework.test.util.ReflectionTestUtils.setField(realProvider, "planProofs", proofs);
+        org.springframework.test.util.ReflectionTestUtils.setField(realProvider, "providerClock", java.time.Clock.fixed(live, java.time.ZoneOffset.UTC));
+        reset(providers);
+        when(providers.forAccount(any())).thenAnswer(call -> { assertThat(call.getArgument(0, dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount.class)).isEqualTo(account); return realProvider; });
+        callbackConfiguration.configure(site.value(), "https://example.invalid/plan-callback", true);
+
+        enqueuePlanRead(http, graph, source.providerReference(), "source");
+        http.enqueue("POST", "/v1/invoices/create_preview", 200, graph.get("preview").toString());
+        var quote = planPreview.preview(new PreviewSubscriptionChangeUseCase.Query(context("connected-preview"), source.id(), targetId, ChangeTiming.IMMEDIATE));
+        var proofId = UUID.fromString(quote.providerQuoteReference().substring("bq1:".length()));
+        var savedQuote = proofs.quote(account.id(), proofId).orElseThrow();
+        assertThat(savedQuote.anchor()).isEqualTo(live);
+        assertThat(savedQuote.source()).isEqualTo(source.billingPrice());
+        assertThat(savedQuote.target()).isEqualTo(targetTerms);
+        assertThat(savedQuote.dueNow()).isEqualTo(1000);
+        assertThat(savedQuote.lines()).extracting(Line::amount).containsExactly(-1000L, 2000L);
+        assertThat(sub(source.id()).entitledPrice()).isEqualTo(source.entitledPrice());
+
+        // Public change performs its own fresh preview before the actual guarded SDK update.
+        enqueuePlanRead(http, graph, source.providerReference(), "source");
+        http.enqueue("POST", "/v1/invoices/create_preview", 200, graph.get("preview").toString());
+        enqueuePlanRead(http, graph, source.providerReference(), "source");
+        http.enqueue("POST", "/v1/subscriptions/" + source.providerReference(), 200, graph.get("target").toString());
+        http.enqueue("GET", "/v1/invoices/in_ConnectedChange", 200, graph.get("invoice").toString());
+        http.enqueue("GET", "/v1/invoices/in_ConnectedChange/lines", 200, connectedPlanPage(graph.get("credit"), graph.get("debit")));
+        var command = new dev.genericpayments.platform.subscriptions.application.port.in.ChangeSubscriptionPlanUseCase.Command(context("connected-change"), source.id(), quote.id());
+        var changed = planChange.change(command);
+        assertThat(changed.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        var receipt = proofs.result(account.id(), changed.operationId()).orElseThrow();
+        assertThat(receipt.quote()).isEqualTo(proofId);
+        assertThat(receipt.reference()).isEqualTo(source.providerReference());
+        assertThat(receipt.invoice()).isEqualTo("in_ConnectedChange");
+        assertThat(receipt.creditLine()).isEqualTo("il_ConnectedCredit");
+        assertThat(receipt.debitLine()).isEqualTo("il_ConnectedDebit");
+        var ownedStep = steps.find(account.id(), op(changed.operationId()).providerOperationKey()).orElseThrow();
+        assertThat(receipt.step()).isEqualTo(ownedStep.id());
+        assertThat(ownedStep.kind()).isEqualTo(ProviderOperation.Kind.SUBSCRIPTION_UPDATE);
+        assertThat(ownedStep.resourceId()).isEqualTo(changed.operationId());
+        assertThat(ownedStep.status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
+        var afterAck = sub(source.id());
+        assertThat(afterAck.billingPrice()).isEqualTo(source.billingPrice());
+        assertThat(afterAck.entitledPrice()).isEqualTo(source.entitledPrice());
+        assertThat(afterAck.currentPeriod()).isEqualTo(fullPeriod);
+        assertThat(afterAck.paidThrough()).isEqualTo(fullPeriod.end());
+        assertThat(count("payments")).isZero();
+        assertThat(jdbc.queryForObject("select count(*) from subscription_events where event_type='CHANGE_APPLIED'", Integer.class)).isZero();
+
+        return new ConnectedPlanReceipt(source, graph, command, changed, savedQuote, receipt);
+    }
+
+    private record ConnectedPlanReceipt(Subscription source, Map<String,com.google.gson.JsonObject> graph,
+        dev.genericpayments.platform.subscriptions.application.port.in.ChangeSubscriptionPlanUseCase.Command command,
+        dev.genericpayments.platform.subscriptions.application.model.SubscriptionOperationResult changed, Quote quote, SubscriptionPlanProofStore.Result receipt) {}
+    private record ConnectedCashCallback(String kind, long amount, Subscription.Period period) {}
+
+    private void deliverConnectedCallbacks(Subscription source, PriceId target, Map<UUID,ConnectedCashCallback> expectedCash,
+            Map<UUID,UUID> lifecycleBills, Instant accessUntil, java.time.Clock deliveryClock, Instant dueAt, String owner) {
+        var cashCallbacks = new HashSet<UUID>();
+        var lifecycleCallbacks = new HashSet<UUID>();
+        var claims = outbox.claimAutomatic(owner, 20, dueAt, Duration.ofSeconds(30));
+        // Both paths also have exactly one original CHANGE_REQUESTED callback.
+        assertThat(claims).hasSize(expectedCash.size() + lifecycleBills.size() + 1);
+        for (var claim : claims) {
+            byte[] secret = Base64.getUrlDecoder().decode(encryption.decrypt(claim.secret()));
+            try {
+                new dev.genericpayments.platform.webhooks.application.service.CallbackDeliveryService(outbox, encryption, callbackPayload, (endpoint, headers, body) -> {
+                    assertThat(tx.active()).isFalse();
+                    assertThat(endpoint.toString()).isEqualTo("https://example.invalid/plan-callback");
+                    long at = Long.parseLong(headers.get("Payment-Timestamp"));
+                    assertThat(at).isBetween(dueAt.getEpochSecond(), deliveryClock.instant().getEpochSecond());
+                    assertThat(headers.get("Payment-Signature")).isEqualTo("v1=" + new dev.genericpayments.platform.webhooks.application.service.CallbackSigner().sign(secret, at, body));
+                    var payload = connectedPlanJson(new String(body, java.nio.charset.StandardCharsets.UTF_8));
+                    assertThat(headers.get("Payment-Event-Id")).isEqualTo(payload.get("event_id").getAsString());
+                    assertThat(payload.get("site_id").getAsString()).isEqualTo(site.value().toString());
+                    assertThat(payload.get("subscription_id").getAsString()).isEqualTo(source.id().toString());
+                    assertThat(new String(body, java.nio.charset.StandardCharsets.UTF_8)).doesNotContain("client_secret", "sk_test_");
+                    var eventId = UUID.fromString(payload.get("event_id").getAsString());
+                    if (payload.get("event_type").getAsString().equals("payment.succeeded")) {
+                        var billId = UUID.fromString(payload.get("billing_record_id").getAsString());
+                        var expected = expectedCash.get(billId);
+                        assertThat(expected).isNotNull();
+                        assertThat(cashCallbacks.add(billId)).isTrue();
+                        assertThat(payload.get("amount_minor").getAsLong()).isEqualTo(expected.amount());
+                        assertThat(payload.get("billing_kind").getAsString()).isEqualTo(expected.kind());
+                        assertThat(payload.get("currency").getAsString()).isEqualTo("EUR");
+                        assertThat(payload.get("price_id").getAsString()).isEqualTo(target.value().toString());
+                        assertThat(payload.get("billing_record_id").getAsString()).isEqualTo(billId.toString());
+                        assertThat(payload.get("period_start").getAsString()).isEqualTo(expected.period().start().toString());
+                        assertThat(payload.get("period_end").getAsString()).isEqualTo(expected.period().end().toString());
+                    }
+                    if (lifecycleBills.containsKey(eventId)) {
+                        assertThat(lifecycleCallbacks.add(eventId)).isTrue();
+                        assertThat(payload.get("billing_record_id").getAsString()).isEqualTo(lifecycleBills.get(eventId).toString());
+                        assertThat(payload.get("access_allowed").getAsBoolean()).isTrue();
+                        assertThat(payload.get("access_valid_until").getAsString()).isEqualTo(accessUntil.toString());
+                    }
+                    return dev.genericpayments.platform.webhooks.application.port.out.CallbackHttpPort.Result.success(204);
+                }, deliveryClock).deliver(claim);
+            } finally { Arrays.fill(secret, (byte) 0); }
+        }
+        assertThat(cashCallbacks).containsExactlyInAnyOrderElementsOf(expectedCash.keySet());
+        assertThat(lifecycleCallbacks).containsExactlyInAnyOrderElementsOf(lifecycleBills.keySet());
+        assertThat(jdbc.queryForList("select status from outbox_events", String.class)).containsOnly("DELIVERED");
+    }
+
+    private static void awaitConnectedRealTime(Instant observedAt) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (Instant.now().isBefore(observedAt) && System.nanoTime() < deadline) Thread.sleep(20);
+        assertThat(Instant.now()).isAfterOrEqualTo(observedAt);
+    }
+    private void advanceConnectedPlanGraph(Map<String,com.google.gson.JsonObject> graph, Subscription.Period period, Instant observedAt) {
+        var item = graph.get("target").getAsJsonObject("items").getAsJsonArray("data").get(0).getAsJsonObject();
+        item.addProperty("current_period_start", period.start().getEpochSecond()); item.addProperty("current_period_end", period.end().getEpochSecond());
+        graph.get("target").addProperty("latest_invoice", "in_ConnectedRenewal");
+        var invoice = graph.get("invoice").deepCopy(); invoice.addProperty("id", "in_ConnectedRenewal");
+        invoice.addProperty("billing_reason", "subscription_cycle"); invoice.addProperty("created", observedAt.getEpochSecond());
+        for (String field : List.of("amount_due", "amount_paid", "total", "subtotal")) invoice.addProperty(field, 4000);
+        graph.put("renewalInvoice", invoice);
+        var line = graph.get("debit").deepCopy(); line.addProperty("id", "il_ConnectedRenewal"); line.addProperty("invoice", "in_ConnectedRenewal"); line.addProperty("amount", 4000);
+        line.getAsJsonObject("period").addProperty("start", period.start().getEpochSecond()); line.getAsJsonObject("period").addProperty("end", period.end().getEpochSecond());
+        line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("proration", false); graph.put("renewalLine", line);
+        var allocation = graph.get("allocation").deepCopy(); allocation.addProperty("id", "inpay_ConnectedRenewal"); allocation.addProperty("invoice", "in_ConnectedRenewal");
+        allocation.addProperty("amount_paid", 4000); allocation.addProperty("amount_requested", 4000);
+        allocation.getAsJsonObject("payment").addProperty("payment_intent", "pi_ConnectedRenewal");
+        allocation.getAsJsonObject("status_transitions").addProperty("paid_at", observedAt.getEpochSecond()); graph.put("renewalAllocation", allocation);
+        var intent = graph.get("intent").deepCopy(); intent.addProperty("id", "pi_ConnectedRenewal"); intent.addProperty("amount", 4000); intent.addProperty("amount_received", 4000); intent.addProperty("latest_charge", "ch_ConnectedRenewal"); graph.put("renewalIntent", intent);
+        var charge = graph.get("charge").deepCopy(); charge.addProperty("id", "ch_ConnectedRenewal"); charge.addProperty("payment_intent", "pi_ConnectedRenewal");
+        charge.addProperty("amount", 4000); charge.addProperty("amount_captured", 4000); charge.addProperty("created", observedAt.getEpochSecond()); graph.put("renewalCharge", charge);
+    }
+    private void enqueueDelayedPlanCashRead(dev.genericpayments.platform.support.StripeHttpFixture http, Map<String,com.google.gson.JsonObject> graph, String subscription, boolean renewalFirst) {
+        enqueuePlanRead(http, graph, subscription, "target");
+        http.enqueue("GET", "/v1/invoices", 200, renewalFirst ? connectedPlanPage(graph.get("renewalInvoice"), graph.get("invoice")) : connectedPlanPage(graph.get("invoice"), graph.get("renewalInvoice")));
+        for (boolean renewal : renewalFirst ? List.of(true, false) : List.of(false, true)) {
+            String invoice = renewal ? "in_ConnectedRenewal" : "in_ConnectedChange";
+            http.enqueue("GET", "/v1/invoices/" + invoice + "/lines", 200, renewal ? connectedPlanPage(graph.get("renewalLine")) : connectedPlanPage(graph.get("credit"), graph.get("debit")));
+            http.enqueue("GET", "/v1/invoice_payments", 200, connectedPlanPage(graph.get(renewal ? "renewalAllocation" : "allocation")));
+            http.enqueue("GET", "/v1/payment_intents/" + (renewal ? "pi_ConnectedRenewal" : "pi_Connected"), 200, graph.get(renewal ? "renewalIntent" : "intent").toString());
+            http.enqueue("GET", "/v1/charges/" + (renewal ? "ch_ConnectedRenewal" : "ch_Connected"), 200, graph.get(renewal ? "renewalCharge" : "charge").toString());
+            http.enqueue("GET", "/v1/invoice_payments", 200, connectedPlanPage(graph.get(renewal ? "renewalAllocation" : "allocation")));
         }
     }
 
@@ -1286,7 +1503,7 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
     private static String creditLine(Plan p) { return "il_Credit" + p.operation().id().toString().replace("-", ""); }
     private static String debitLine(Plan p) { return "il_Debit" + p.operation().id().toString().replace("-", ""); }
     private Schedule createSchedule(Plan change, String reference) {
-        return proofs.recordSchedule(change.subscription(), change.operation(), change.quote(), claimed(change.operation(), ProviderOperation.Kind.SCHEDULE_CREATE), OWNER, reference, SOURCE_PERIOD.start().getEpochSecond());
+        return proofs.recordSchedule(change.subscription(), change.operation(), change.quote(), claimed(change.operation(), ProviderOperation.Kind.SCHEDULE_CREATE), OWNER, reference, SOURCE_PERIOD.start().getEpochSecond(), new SourcePhase("none", null, "charge_automatically"));
     }
     private long targetEnd(Plan change) { return TARGET_PHASE_END.getEpochSecond(); }
     private Clear clear(Plan change) {
@@ -1333,6 +1550,7 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
     private Map<String, Object> scheduleRow(Plan p, ProviderOperation step, String reference) {
         var row = ownerRow(p);
         row.put("schedule_reference", reference); row.put("creation_step", step.id()); row.put("phase_start", SOURCE_PERIOD.start().getEpochSecond());
+        row.put("source_proration_behavior", "none"); row.put("source_default_payment_method", null); row.put("source_collection_method", "charge_automatically");
         return row;
     }
     private Map<String, Object> copiedQuote(Quote q) {

@@ -130,7 +130,7 @@ public final class StripeBillingMutationAdapter {
                 String key=new ProviderOperationGuard().requireDispatch(step,c.account(),step.fingerprint(),securityClock.instant());
                 var created=client.v1().subscriptionSchedules().create(SubscriptionScheduleCreateParams.builder().setFromSubscription(q.subscriptionReference()).build(),RequestOptions.builder().setIdempotencyKey(key).build());
                 requireSchedule(created,q,null,false);
-                binding=proofs.recordSchedule(s,o,q,step,owner,created.getId(),created.getCurrentPhase().getStartDate());
+                binding=proofs.recordSchedule(s,o,q,step,owner,created.getId(),created.getCurrentPhase().getStartDate(),sourcePhase(created.getPhases().getFirst()));
             }catch(StripeException|RuntimeException unknown){steps.unknown(step.id(),owner,step.version());return new Reply(Outcome.UNKNOWN,null,null);}
         }
         String fp=scheduleFingerprint(c.account(),o,q,binding,ProviderOperation.Kind.SCHEDULE_UPDATE);
@@ -145,16 +145,16 @@ public final class StripeBillingMutationAdapter {
             requireSchedule(current,q,binding,current.getPhases()!=null&&current.getPhases().size()==2);
             if(reserved.firstDispatchedAt()==null&&current.getPhases().size()!=1)throw mismatch();
             proofs.authorize(s,o,q);String key=new ProviderOperationGuard().requireDispatch(step,c.account(),fp,securityClock.instant());
-            var phase=current.getPhases().getFirst();var preserve=SubscriptionScheduleUpdateParams.Phase.builder().setStartDate(binding.phaseStart()).setEndDate(q.period().end().getEpochSecond())
-                .setProrationBehavior(phase.getProrationBehavior()==null?SubscriptionScheduleUpdateParams.Phase.ProrationBehavior.NONE:SubscriptionScheduleUpdateParams.Phase.ProrationBehavior.valueOf(phase.getProrationBehavior().toUpperCase(Locale.ROOT)))
+            var phase=binding.sourcePhase();var preserve=SubscriptionScheduleUpdateParams.Phase.builder().setStartDate(binding.phaseStart()).setEndDate(q.period().end().getEpochSecond())
+                .setProrationBehavior(SubscriptionScheduleUpdateParams.Phase.ProrationBehavior.valueOf(phase.prorationBehavior().toUpperCase(Locale.ROOT)))
+                .setCollectionMethod(SubscriptionScheduleUpdateParams.Phase.CollectionMethod.valueOf(phase.collectionMethod().toUpperCase(Locale.ROOT)))
                 .addItem(SubscriptionScheduleUpdateParams.Phase.Item.builder().setPrice(q.sourcePrice()).setQuantity(1L).build());
-            if(phase.getDefaultPaymentMethod()!=null)preserve.setDefaultPaymentMethod(phase.getDefaultPaymentMethod());
-            if(phase.getCollectionMethod()!=null)preserve.setCollectionMethod(SubscriptionScheduleUpdateParams.Phase.CollectionMethod.CHARGE_AUTOMATICALLY);
+            if(phase.defaultPaymentMethod()!=null)preserve.setDefaultPaymentMethod(phase.defaultPaymentMethod());
             var target=SubscriptionScheduleUpdateParams.Phase.builder().setStartDate(q.period().end().getEpochSecond())
                 .setProrationBehavior(SubscriptionScheduleUpdateParams.Phase.ProrationBehavior.NONE)
                 .setDuration(SubscriptionScheduleUpdateParams.Phase.Duration.builder().setInterval(SubscriptionScheduleUpdateParams.Phase.Duration.Interval.valueOf(q.target().interval().name())).setIntervalCount(1L).build())
                 .addItem(SubscriptionScheduleUpdateParams.Phase.Item.builder().setPrice(q.targetPrice()).setQuantity(1L).build());
-            if(phase.getDefaultPaymentMethod()!=null)target.setDefaultPaymentMethod(phase.getDefaultPaymentMethod());
+            if(phase.defaultPaymentMethod()!=null)target.setDefaultPaymentMethod(phase.defaultPaymentMethod());
             var response=client.v1().subscriptionSchedules().update(binding.reference(),SubscriptionScheduleUpdateParams.builder().setEndBehavior(SubscriptionScheduleUpdateParams.EndBehavior.RELEASE)
                 .setProrationBehavior(SubscriptionScheduleUpdateParams.ProrationBehavior.NONE).addPhase(preserve.build()).addPhase(target.build()).build(),RequestOptions.builder().setIdempotencyKey(key).build());
             requireSchedule(response,q,binding,true);var fresh=client.v1().subscriptionSchedules().retrieve(binding.reference());requireSchedule(fresh,q,binding,true);
@@ -189,7 +189,7 @@ public final class StripeBillingMutationAdapter {
         var remote=client.v1().subscriptions().retrieve(q.subscriptionReference());requireCurrentRemote(remote,s,customer,ownership.price(c.account(),s,q.source()));
         if(!"active".equals(remote.getStatus())||!q.period().equals(itemPeriod(remote))||!q.item().equals(remote.getItems().getData().getFirst().getId())||remote.getPendingUpdate()!=null||remote.getCancelAt()!=null||Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())||!"original-key-replay".equals(allowedSchedule)&&!Objects.equals(remote.getSchedule(),allowedSchedule)&&!(allowReleased&&remote.getSchedule()==null))throw mismatch();
     }
-    public static String scheduleFingerprint(dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount a,SubscriptionOperation o,Quote q,SubscriptionPlanProofStore.Schedule binding,ProviderOperation.Kind kind){return StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,a,"SCHEDULE_V1",kind.name(),o.id().toString(),o.providerOperationKey(),o.fingerprint(),q.toString(),binding==null?null:binding.reference(),binding==null?null:Long.toString(binding.phaseStart()),binding==null?null:binding.creationStep().toString());}
+    public static String scheduleFingerprint(dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount a,SubscriptionOperation o,Quote q,SubscriptionPlanProofStore.Schedule binding,ProviderOperation.Kind kind){return StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,a,"SCHEDULE_V1",kind.name(),o.id().toString(),o.providerOperationKey(),o.fingerprint(),q.toString(),binding==null?null:binding.reference(),binding==null?null:Long.toString(binding.phaseStart()),binding==null?null:binding.creationStep().toString(),binding==null?null:binding.sourcePhase().toString(),"end:release","top_proration:none","target_proration:none","target_collection:inherit_auto","quantity:1","duration_count:1");}
     static void requireScheduleSteps(Command c,dev.genericpayments.platform.subscriptions.domain.Subscription s,SubscriptionOperation original,Quote q,SubscriptionPlanProofStore.Schedule binding,ProviderOperationStore steps){
         for(var kind:List.of(ProviderOperation.Kind.SCHEDULE_CREATE,ProviderOperation.Kind.SCHEDULE_UPDATE)){
             var id=kind==ProviderOperation.Kind.SCHEDULE_CREATE?binding.creationStep():binding.updateStep();var step=steps.findById(id).orElseThrow(StripeBillingOwnership::mismatch);
@@ -202,14 +202,40 @@ public final class StripeBillingMutationAdapter {
             ||!StripeBillingOwnership.inWindow(value.getReleasedAt(),original)||value.getReleasedAt()>=q.period().end().getEpochSecond()||value.getReleasedAt()>at.getEpochSecond())throw mismatch();
     }
     static void requireSchedule(com.stripe.model.SubscriptionSchedule value,Quote q,SubscriptionPlanProofStore.Schedule binding,boolean configured){
-        if(value==null||value.getId()==null||!value.getId().matches("sub_sched_[A-Za-z0-9]{1,245}")||binding!=null&&!binding.reference().equals(value.getId())||!"subscription_schedule".equals(value.getObject())||!Boolean.FALSE.equals(value.getLivemode())||!q.customerReference().equals(value.getCustomer())||!q.subscriptionReference().equals(value.getSubscription())||!"active".equals(value.getStatus())||!"release".equals(value.getEndBehavior())||value.getCurrentPhase()==null||value.getCurrentPhase().getStartDate()==null||value.getCurrentPhase().getStartDate()<=0||value.getCurrentPhase().getEndDate()==null||value.getCurrentPhase().getEndDate()!=q.period().end().getEpochSecond()||value.getPhases()==null||value.getPhases().size()!=(configured?2:1))throw mismatch();
-        var defaults=value.getDefaultSettings();if(defaults==null||!"charge_automatically".equals(defaults.getCollectionMethod())||defaults.getApplicationFeePercent()!=null||defaults.getTransferData()!=null||defaults.getOnBehalfOf()!=null||defaults.getBillingThresholds()!=null||defaults.getAutomaticTax()!=null&&Boolean.TRUE.equals(defaults.getAutomaticTax().getEnabled()))throw mismatch();
+        if(value==null||value.getId()==null||!value.getId().matches("sub_sched_[A-Za-z0-9]{1,245}")
+            ||binding!=null&&!binding.reference().equals(value.getId())||!"subscription_schedule".equals(value.getObject())||!Boolean.FALSE.equals(value.getLivemode())
+            ||!q.customerReference().equals(value.getCustomer())||!q.subscriptionReference().equals(value.getSubscription())
+            ||!"active".equals(value.getStatus())||!"release".equals(value.getEndBehavior())
+            ||value.getCurrentPhase()==null||value.getCurrentPhase().getStartDate()==null||value.getCurrentPhase().getStartDate()<=0
+            ||value.getCurrentPhase().getEndDate()==null||value.getCurrentPhase().getEndDate()!=q.period().end().getEpochSecond()
+            ||value.getPhases()==null||value.getPhases().size()!=(configured?2:1))throw mismatch();
+        var defaults=value.getDefaultSettings();
+        if(defaults==null||!"charge_automatically".equals(defaults.getCollectionMethod())||defaults.getApplicationFeePercent()!=null
+            ||defaults.getTransferData()!=null||defaults.getOnBehalfOf()!=null||defaults.getBillingThresholds()!=null
+            ||defaults.getAutomaticTax()!=null&&Boolean.TRUE.equals(defaults.getAutomaticTax().getEnabled()))throw mismatch();
         long start=value.getCurrentPhase().getStartDate();if(binding!=null&&binding.phaseStart()!=start)throw mismatch();
         for(int n=0;n<value.getPhases().size();n++){
             var p=value.getPhases().get(n);var expected=n==0?q.sourcePrice():q.targetPrice();
-            if(p.getStartDate()==null||p.getStartDate()!=(n==0?start:q.period().end().getEpochSecond())||p.getEndDate()==null||p.getEndDate()<=(n==0?start:q.period().end().getEpochSecond())||n==0&&p.getEndDate()!=q.period().end().getEpochSecond()||n==1&&!"none".equals(p.getProrationBehavior())||p.getItems()==null||p.getItems().size()!=1||!expected.equals(p.getItems().getFirst().getPrice())||!Objects.equals(1L,p.getItems().getFirst().getQuantity())||p.getCollectionMethod()!=null&&!"charge_automatically".equals(p.getCollectionMethod())||p.getCurrency()!=null&&!q.target().regularAmount().currency().equalsIgnoreCase(p.getCurrency())||p.getApplicationFeePercent()!=null||p.getBillingThresholds()!=null||p.getTransferData()!=null||p.getOnBehalfOf()!=null||p.getTrialEnd()!=null||Boolean.TRUE.equals(p.getTrial())||p.getAutomaticTax()!=null&&Boolean.TRUE.equals(p.getAutomaticTax().getEnabled())||nonempty(p.getDiscounts())||nonempty(p.getDefaultTaxRates())||nonempty(p.getAddInvoiceItems())||p.getMetadata()!=null&&!p.getMetadata().isEmpty()||p.getInvoiceSettings()!=null||p.getBillingCycleAnchor()!=null)throw mismatch();
-            var item=p.getItems().getFirst();if(item.getBillingThresholds()!=null||nonempty(item.getDiscounts())||nonempty(item.getTaxRates())||item.getMetadata()!=null&&!item.getMetadata().isEmpty())throw mismatch();
+            if(p.getStartDate()==null||p.getStartDate()!=(n==0?start:q.period().end().getEpochSecond())||p.getEndDate()==null
+                ||p.getEndDate()<=(n==0?start:q.period().end().getEpochSecond())||n==0&&p.getEndDate()!=q.period().end().getEpochSecond()
+                ||n==1&&!"none".equals(p.getProrationBehavior())||p.getItems()==null||p.getItems().size()!=1
+                ||!expected.equals(p.getItems().getFirst().getPrice())||!Objects.equals(1L,p.getItems().getFirst().getQuantity())
+                ||p.getCollectionMethod()!=null&&!"charge_automatically".equals(p.getCollectionMethod())
+                ||p.getCurrency()!=null&&!q.target().regularAmount().currency().equalsIgnoreCase(p.getCurrency())
+                ||p.getApplicationFeePercent()!=null||p.getBillingThresholds()!=null||p.getTransferData()!=null||p.getOnBehalfOf()!=null
+                ||p.getTrialEnd()!=null||Boolean.TRUE.equals(p.getTrial())||p.getAutomaticTax()!=null&&Boolean.TRUE.equals(p.getAutomaticTax().getEnabled())
+                ||nonempty(p.getDiscounts())||nonempty(p.getDefaultTaxRates())||nonempty(p.getAddInvoiceItems())
+                ||p.getMetadata()!=null&&!p.getMetadata().isEmpty()||p.getInvoiceSettings()!=null||p.getBillingCycleAnchor()!=null)throw mismatch();
+            var item=p.getItems().getFirst();
+            if(item.getBillingThresholds()!=null||nonempty(item.getDiscounts())||nonempty(item.getTaxRates())||item.getMetadata()!=null&&!item.getMetadata().isEmpty())throw mismatch();
+            if(n==0){var effective=sourcePhase(p);if(binding!=null&&!binding.sourcePhase().equals(effective))throw mismatch();}
+            else if(binding==null||!Objects.equals(binding.sourcePhase().defaultPaymentMethod(),p.getDefaultPaymentMethod()))throw mismatch();
         }
+    }
+    private static SubscriptionPlanProofStore.SourcePhase sourcePhase(com.stripe.model.SubscriptionSchedule.Phase phase){
+        // Missing collection inherits the already verified automatic default. Send the canonical
+        // explicit source setting; target collection stays omitted under that verified default.
+        return new SubscriptionPlanProofStore.SourcePhase(phase.getProrationBehavior()==null?"none":phase.getProrationBehavior(),phase.getDefaultPaymentMethod(),"charge_automatically");
     }
     private static boolean nonempty(List<?> list){return list!=null&&!list.isEmpty();}
     public static String changeFingerprint(dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount a,SubscriptionOperation o,Quote q){return StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,a,"SUBSCRIPTION_CHANGE_V1",o.id().toString(),o.providerOperationKey(),o.fingerprint(),q.id().toString(),q.toString(),"pending_if_incomplete","always_invoice");}

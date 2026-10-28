@@ -88,11 +88,20 @@ public class StripeBillingBindingAdapter implements StripeBillingBindingPort,Sub
     public Optional<Schedule> schedule(PaymentAccountId a,UUID operation){return jdbc.query("select * from stripe_plan_schedules where payment_account_id=? and operation_id=?",this::planSchedule,a.value(),operation).stream().findFirst();}
     public List<ScheduleProof> schedules(PaymentAccountId a,UUID subscription){var rows=jdbc.query("select * from stripe_plan_schedules where payment_account_id=? and subscription_id=? and update_step is not null order by operation_id limit 101",this::planSchedule,a.value(),subscription);if(rows.size()>100)throw conflict();return rows.stream().map(s->new ScheduleProof(quote(a,s.quote()).orElseThrow(StripeBillingBindingAdapter::conflict),s)).toList();}
     public Optional<Schedule> scheduleReference(PaymentAccountId a,String reference){return jdbc.query("select * from stripe_plan_schedules where payment_account_id=? and schedule_reference=?",this::planSchedule,a.value(),reference).stream().findFirst();}
-    public Schedule recordSchedule(Subscription s,SubscriptionOperation o,Quote q,ProviderOperation step,String owner,String reference,long start){
-        lockPlan(s,o,step);var common=requirePlan(s,o,q);if(o.kind()!=SubscriptionOperation.Kind.CHANGE||q.timing()!=ChangeTiming.NEXT_PERIOD||step.kind()!=ProviderOperation.Kind.SCHEDULE_CREATE)throw conflict();
+    public Schedule recordSchedule(Subscription s,SubscriptionOperation o,Quote q,ProviderOperation step,String owner,String reference,long start,SourcePhase sourcePhase){
+        Objects.requireNonNull(sourcePhase);
+        lockPlan(s,o,step);var common=requirePlan(s,o,q);
+        if(o.kind()!=SubscriptionOperation.Kind.CHANGE||q.timing()!=ChangeTiming.NEXT_PERIOD||step.kind()!=ProviderOperation.Kind.SCHEDULE_CREATE)throw conflict();
         operations.acknowledgeInTransaction(step.id(),owner,step.version(),reference);
-        jdbc.update("insert into stripe_plan_schedules(operation_id,site_id,customer_id,subscription_id,payment_account_id,quote_id,common_quote_id,quote_reference,schedule_reference,creation_step,phase_start) values (?,?,?,?,?,?,?,?,?,?,?) on conflict(operation_id) do nothing",o.id(),s.siteId().value(),s.customerId().value(),s.id(),s.paymentAccountId().value(),q.id(),common,q.reference(),reference,step.id(),start);
-        return schedule(q.account(),o.id()).filter(v->v.quote().equals(q.id())&&v.creationStep().equals(step.id())&&v.reference().equals(reference)&&v.phaseStart()==start).orElseThrow(StripeBillingBindingAdapter::conflict);
+        jdbc.update("""
+            insert into stripe_plan_schedules(operation_id,site_id,customer_id,subscription_id,payment_account_id,quote_id,
+                common_quote_id,quote_reference,schedule_reference,creation_step,phase_start,source_proration_behavior,
+                source_default_payment_method,source_collection_method) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            on conflict(operation_id) do nothing
+            """,o.id(),s.siteId().value(),s.customerId().value(),s.id(),s.paymentAccountId().value(),q.id(),common,q.reference(),reference,
+            step.id(),start,sourcePhase.prorationBehavior(),sourcePhase.defaultPaymentMethod(),sourcePhase.collectionMethod());
+        return schedule(q.account(),o.id()).filter(v->v.quote().equals(q.id())&&v.creationStep().equals(step.id())
+            &&v.reference().equals(reference)&&v.phaseStart()==start&&v.sourcePhase().equals(sourcePhase)).orElseThrow(StripeBillingBindingAdapter::conflict);
     }
     public Schedule recordScheduleUpdate(Subscription s,SubscriptionOperation o,Schedule expected,ProviderOperation step,String owner,long end){
         var q=quote(expected.account(),expected.quote()).orElseThrow(StripeBillingBindingAdapter::conflict);lockPlan(s,o,step);requirePlan(s,o,q);
@@ -105,7 +114,7 @@ public class StripeBillingBindingAdapter implements StripeBillingBindingPort,Sub
         if(o.kind()!=SubscriptionOperation.Kind.CLEAR_CHANGE||step.kind()!=ProviderOperation.Kind.SCHEDULE_RELEASE||!expected.operation().equals(s.pendingChange().operationId())||!schedule(q.account(),expected.operation()).filter(expected::equals).isPresent())throw conflict();
         operations.acknowledgeInTransaction(step.id(),owner,step.version(),expected.reference());jdbc.update("update stripe_plan_schedules set clear_operation=?,release_step=? where operation_id=? and release_step is null",o.id(),step.id(),expected.operation());return schedule(q.account(),expected.operation()).filter(v->v.clearOperation().equals(o.id())&&v.releaseStep().equals(step.id())).orElseThrow(StripeBillingBindingAdapter::conflict);
     }
-    private Schedule planSchedule(ResultSet r,int n)throws SQLException{return new Schedule(r.getObject("operation_id",UUID.class),r.getObject("subscription_id",UUID.class),new PaymentAccountId(r.getObject("payment_account_id",UUID.class)),r.getObject("quote_id",UUID.class),r.getObject("creation_step",UUID.class),r.getString("schedule_reference"),r.getLong("phase_start"),r.getObject("update_step",UUID.class),r.getObject("target_end",Long.class),r.getObject("clear_operation",UUID.class),r.getObject("release_step",UUID.class));}
+    private Schedule planSchedule(ResultSet r,int n)throws SQLException{return new Schedule(r.getObject("operation_id",UUID.class),r.getObject("subscription_id",UUID.class),new PaymentAccountId(r.getObject("payment_account_id",UUID.class)),r.getObject("quote_id",UUID.class),r.getObject("creation_step",UUID.class),r.getString("schedule_reference"),r.getLong("phase_start"),r.getObject("update_step",UUID.class),r.getObject("target_end",Long.class),r.getObject("clear_operation",UUID.class),r.getObject("release_step",UUID.class),new SourcePhase(r.getString("source_proration_behavior"),r.getString("source_default_payment_method"),r.getString("source_collection_method")));}
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
     public Optional<CustomerBinding> findCustomer(PaymentAccountId accountId, SiteId siteId, CustomerId customerId) {
