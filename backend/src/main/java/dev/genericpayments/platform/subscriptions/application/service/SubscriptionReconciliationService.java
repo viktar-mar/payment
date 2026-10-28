@@ -43,11 +43,11 @@ public class SubscriptionReconciliationService implements ReconcileSubscriptionU
     }
     private void observe(Subscription s,SubscriptionSweepPort.Claim claim,SubscriptionCommandContext context){
         if(claim!=null&&continuation!=null){var account=accounts.findById(s.paymentAccountId()).orElseThrow();if(account.provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE){claim=continuation.sweep(account,s.id(),claim);s=subscriptions.find(s.siteId(),s.id()).orElseThrow();}}
-        if(s.providerReference()==null)throw new IllegalStateException("SETUP_PENDING");
+        var account=accounts.findById(s.paymentAccountId()).orElseThrow();
+        if(account.provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE&&s.providerReference()==null)throw new IllegalStateException("SETUP_PENDING");
         final var observed=s;final var lease=claim;
         var original=reads.financial(s);
         if(original!=null&&original.status()==SubscriptionOperation.Status.UNKNOWN)telemetry.observeUnknownAge(Duration.between(original.createdAt(),clock.instant()));
-        var account=accounts.findById(s.paymentAccountId()).orElseThrow();
         Long sequence=account.provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE?observations.captureFence(s):null;
         var snapshot=providers.forAccount(account).retrieve(new Lookup(account,s.id(),s.providerReference(),original==null?null:original.providerOperationKey()));
         tx.required(()->{

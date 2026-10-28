@@ -130,10 +130,10 @@ public final class StripeBillingSnapshotMapper {
                     require(step.id().equals(request.step())&&remote.getId().equals(request.subscriptionReference()));trial=request.period();
                     if(remote.getTrialStart()!=null||remote.getTrialEnd()!=null)require(trial.equals(period(remote.getTrialStart(),remote.getTrialEnd())));
                 }else{
-                    trial=period(remote.getTrialStart(),remote.getTrialEnd());
-                    require(trial.end().getEpochSecond()==request.requestedEnd()&&StripeBillingOwnership.inWindow(remote.getTrialStart(),step)
-                        &&remote.getTrialSettings()!=null&&remote.getTrialSettings().getEndBehavior()!=null&&"pause".equals(remote.getTrialSettings().getEndBehavior().getMissingPaymentMethod())
-                        &&mapped.equals(context.original()));
+                    if(remote.getTrialStart()!=null||remote.getTrialEnd()!=null){
+                        trial=period(remote.getTrialStart(),remote.getTrialEnd());
+                        require(trial.end().getEpochSecond()==request.requestedEnd()&&StripeBillingOwnership.inWindow(remote.getTrialStart(),step));
+                    }
                 }
             }
             var invoices=pages(after->client.v1().invoices().list(InvoiceListParams.builder().setSubscription(remote.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build()));
@@ -150,7 +150,7 @@ public final class StripeBillingSnapshotMapper {
                     var pm=get(()->client.v1().paymentMethods().retrieve(method));
                     require(method.equals(pm.getId())&&"payment_method".equals(pm.getObject())&&Boolean.FALSE.equals(pm.getLivemode())&&b.providerReference().equals(pm.getCustomer())&&"card".equals(pm.getType())&&pm.getCard()!=null);methodReady=true;
             }
-            return new Snapshot(remote.getId(),status,mapped.terms(),period,trial,cancel,normalized,null,methodReady,0,at,null,List.of(),trialEvidence);
+            return new Snapshot(remote.getId(),status,mapped.terms(),period,trialEvidence==null?trial:trialEvidence.period(),cancel,normalized,null,methodReady,0,at,null,List.of(),trialEvidence);
         }
         void validatePrice(Price p,PublishedPrice mapped){
             var t=mapped.terms();var recurring=p.getRecurring();
@@ -170,12 +170,18 @@ public final class StripeBillingSnapshotMapper {
                 &&line.getParent()!=null&&"subscription_item_details".equals(line.getParent().getType())&&line.getParent().getSubscriptionItemDetails()!=null);
             var detail=line.getParent().getSubscriptionItemDetails();
             var trialContext=owner.trial();boolean historicalTrial=trialContext!=null&&trialContext.request().verified()&&invoice.getId().equals(trialContext.request().invoice());
-            require(remote.getId().equals(detail.getSubscription())&&(historicalTrial?trialContext.request().item():item.getId()).equals(detail.getSubscriptionItem())&&detail.getProration()!=null);
+            require(remote.getId().equals(detail.getSubscription())&&detail.getProration()!=null);
             require(line.getPricing()!=null&&"price_details".equals(line.getPricing().getType())&&line.getPricing().getPriceDetails()!=null);
             var pricing=line.getPricing().getPriceDetails();var mapped=prices.get(pricing.getPrice());require(mapped!=null&&mapped.providerProductReference().equals(pricing.getProduct()));
             currency(invoice.getCurrency(),mapped.terms());currency(line.getCurrency(),mapped.terms());
             require(line.getPeriod()!=null);var period=period(line.getPeriod().getStart(),line.getPeriod().getEnd());require(invoice.getAmountDue()!=null&&invoice.getAmountDue()>=0&&line.getAmount()!=null);
             var kind=switch(invoice.getBillingReason()){case "subscription_create"->BillingRecord.Kind.INITIAL;case "subscription_cycle"->BillingRecord.Kind.RENEWAL;case "subscription_update"->BillingRecord.Kind.PRORATION;default->throw mismatch();};
+            boolean originalTrial=trialContext!=null&&!trialContext.request().verified()&&kind==BillingRecord.Kind.INITIAL&&invoice.getAmountDue()==0
+                &&mapped.equals(trialContext.original())&&period.end().getEpochSecond()==trialContext.request().requestedEnd()
+                &&StripeBillingOwnership.inWindow(period.start().getEpochSecond(),trialContext.step())&&StripeBillingOwnership.inWindow(invoice.getCreated(),trialContext.step())
+                &&(trial==null||trial.equals(period));
+            if(originalTrial)require(detail.getSubscriptionItem()!=null&&detail.getSubscriptionItem().matches("si_[A-Za-z0-9]{1,252}"));
+            else require((historicalTrial?trialContext.request().item():item.getId()).equals(detail.getSubscriptionItem()));
             var allocations=pages(after->client.v1().invoicePayments().list(InvoicePaymentListParams.builder().setInvoice(invoice.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build()));
             sourceAllocations.put(invoice.getId(),allocations);
             for(var allocation:allocations){ref(allocation.getId(),"inpay_");require("invoice_payment".equals(allocation.getObject())&&Boolean.FALSE.equals(allocation.getLivemode())&&invoice.getId().equals(allocation.getInvoice()));currency(allocation.getCurrency(),mapped.terms());}
@@ -187,8 +193,8 @@ public final class StripeBillingSnapshotMapper {
             switch(invoice.getStatus()){
                 case "paid"->{
                     if(plain&&invoice.getAmountDue()==0&&zeros(invoice.getAmountPaid(),invoice.getAmountRemaining())&&allocations.isEmpty()
-                        &&kind==BillingRecord.Kind.INITIAL&&trial!=null&&trial.equals(period)&&trialContext!=null&&mapped.equals(trialContext.original())
-                        &&(!trialContext.request().verified()||historicalTrial)){
+                        &&kind==BillingRecord.Kind.INITIAL&&trialContext!=null&&mapped.equals(trialContext.original())
+                        &&(originalTrial||historicalTrial&&trial!=null&&trial.equals(period))){
                         require(trialEvidence==null);
                         trialEvidence=new TrialEvidence(trialContext.request().operation(),trialContext.step().id(),invoice.getId(),detail.getSubscriptionItem(),period,mapped.terms(),trialContext.requiredSetup()==null?null:trialContext.requiredSetup().method());
                         settlement=SettlementKind.ZERO;

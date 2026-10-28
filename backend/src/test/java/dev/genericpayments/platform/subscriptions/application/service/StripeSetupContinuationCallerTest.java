@@ -212,6 +212,12 @@ class StripeSetupContinuationCallerTest {
         verify(facts).apply(argThat(command -> command.fence().observationSequence() == null && command.fence().lease().equals(claim)));
         verify(sweep).finish(claim, now.plusSeconds(30), true);
     }
+    @Test void fakeLostCreateReceiptRetrievesByOriginalKeyWithANullLocalReference(){
+        account=account(PaymentProviderType.FAKE);when(accounts.findById(account.id())).thenReturn(Optional.of(account));when(providers.forAccount(account)).thenReturn(provider);
+        when(subscriptions.find(pending.siteId(),pending.id())).thenReturn(Optional.of(pending),Optional.of(prepared));var original=operation(null,7);when(reads.financial(pending)).thenReturn(original);when(provider.retrieve(any())).thenReturn(snapshot(prepared,1));when(sweep.advanceRevision(initialSweep,prepared.revision(),now)).thenReturn(continuedSweep);
+        reconciliation().reconcileClaim(initialSweep);
+        verify(provider).retrieve(argThat(l->l.reference()==null&&l.providerOperationKey().equals(original.providerOperationKey())));verifyNoInteractions(continuation,observations);verify(facts).apply(argThat(c->c.snapshot().subscriptionReference().equals(prepared.providerReference())&&c.fence().observationSequence()==null));verify(sweep).finish(continuedSweep,now.plusSeconds(30),true);
+    }
 
     private SubscriptionInboxWorker inboxWorker() {
         var worker = new SubscriptionInboxWorker(inbox, tx, objects, subscriptions, operations, accounts, providers, facts, clock, 20, 30, reads, telemetry, observations, resolution);

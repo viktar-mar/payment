@@ -25,10 +25,19 @@ class StripeSubscriptionMethodIsolationTest {
         var old=f.op;var original=new SubscriptionOperation(old.id(),old.siteId(),old.customerId(),old.subscriptionId(),old.kind(),old.status(),old.authorityScope(),old.keyDigest(),"v1.trial."+"a".repeat(64),old.providerOperationKey(),old.expectedRevision(),old.policyVersion(),null,null,old.createdAt(),old.updatedAt(),old.version());
         var state=new SubscriptionInteractionTransaction.State(pending,f.account,null,original,false);when(phases.originalCreate(f.context,f.s.id())).thenReturn(state);
         var expected=new SubscriptionOperationResult(f.op.id(),f.s.id(),SubscriptionOperation.Status.UNKNOWN,null);
-        when(continuation.api(f.context,f.s.id(),f.op.id())).thenReturn(expected);
+        var repaired=new java.util.concurrent.atomic.AtomicBoolean();when(continuation.api(f.context,f.s.id(),f.op.id())).thenAnswer(x->{repaired.set(true);return expected;});
+        when(actions.get(any())).thenAnswer(x->{if(!repaired.get())throw new IllegalStateException("Exact ACK receipt is still missing");return null;});
         var service=new SubscriptionMethodService(phases,a->provider,actions);org.springframework.test.util.ReflectionTestUtils.setField(service,"continuation",continuation);
-        assertThat(service.setup(new SetupSubscriptionMethodUseCase.Command(f.context,f.s.id(),true))).isEqualTo(expected);
+        assertThatCode(()->assertThat(service.setup(new SetupSubscriptionMethodUseCase.Command(f.context,f.s.id(),true))).isEqualTo(expected)).doesNotThrowAnyException();
         verify(phases,never()).reserve(any(),any(),any(),any(),any());verifyNoInteractions(provider);
+    }
+    @Test void explicitSetupReplayRepairsItsAcknowledgedReceiptBeforeReadingAnAction(){
+        var phases=mock(SubscriptionInteractionTransaction.class);var actions=mock(GetSubscriptionActionUseCase.class);var continuation=mock(ContinueOriginalSubscriptionSetupUseCase.class);var provider=mock(SubscriptionProviderPort.class);
+        var old=f.op;var operation=new SubscriptionOperation(old.id(),old.siteId(),old.customerId(),old.subscriptionId(),SubscriptionOperation.Kind.SETUP,old.status(),old.authorityScope(),old.keyDigest(),"b".repeat(64),"subscription:"+f.account.id().value()+":"+old.id()+":SETUP",old.expectedRevision(),old.policyVersion(),"sub_owned",null,old.createdAt(),old.updatedAt(),old.version());
+        var state=new SubscriptionInteractionTransaction.State(f.s,f.account,null,operation,false);when(phases.candidate(f.context,f.s.id())).thenReturn(state);when(phases.reserve(any(),any(),eq(SubscriptionOperation.Kind.SETUP),any(),eq(state))).thenReturn(state);when(provider.capabilities(f.account)).thenReturn(new Capabilities(false,false,true,false));
+        var repaired=new java.util.concurrent.atomic.AtomicBoolean();var action=new NextAction(ActionKind.PROVIDER_CLIENT,"owned-action",f.now.plusSeconds(100));when(continuation.api(f.context,f.s.id(),operation.id())).thenAnswer(x->{repaired.set(true);return new SubscriptionOperationResult(operation.id(),f.s.id(),SubscriptionOperation.Status.PROCESSING,null);});when(actions.get(any())).thenAnswer(x->{if(!repaired.get())throw new IllegalStateException("Exact ACK receipt is still missing");return action;});
+        var service=new SubscriptionMethodService(phases,a->provider,actions);org.springframework.test.util.ReflectionTestUtils.setField(service,"continuation",continuation);
+        assertThatCode(()->assertThat(service.setup(new SetupSubscriptionMethodUseCase.Command(f.context,f.s.id(),true)).nextAction()).isEqualTo(action)).doesNotThrowAnyException();verify(provider,never()).setup(any());verify(continuation).api(f.context,f.s.id(),operation.id());
     }
     @Test void ordinaryPaidOriginalDoesNotEnterRequiredSetupContinuation(){
         var phases=mock(SubscriptionInteractionTransaction.class);var actions=mock(GetSubscriptionActionUseCase.class);var continuation=mock(ContinueOriginalSubscriptionSetupUseCase.class);
