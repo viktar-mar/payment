@@ -52,7 +52,7 @@ class SubscriptionObservationCallerTest {
             when(inbox.claim(anyString(),eq(20),any(),any())).thenReturn(List.of(claim));
             when(inbox.lock(eq(claim),any())).thenReturn(new SubscriptionProviderEnvelope(providerType,account.id(),"evt_owned",s.providerReference(),"SUBSCRIPTION_CHANGED",now,now));
             when(objects.resolve(providerType,account.id(),SubscriptionObjectPort.Kind.SUBSCRIPTION,s.providerReference())).thenReturn(Optional.of(s.id()));
-            run=new SubscriptionInboxWorker(inbox,tx,objects,subscriptions,operations,accounts,a->provider,facts,Clock.fixed(now,ZoneOffset.UTC),20,30,reads,telemetry,observations)::runOnce;
+            run=new SubscriptionInboxWorker(inbox,tx,objects,subscriptions,operations,accounts,a->provider,facts,Clock.fixed(now,ZoneOffset.UTC),20,30,reads,telemetry,observations,e->Optional.of(s.id()))::runOnce;
         }
         try(var executor=Executors.newVirtualThreadPerTaskExecutor()){
             var task=executor.submit(run);try{assertThat(entered.await(5,TimeUnit.SECONDS)).isTrue();assertThat(applied).isEmpty();assertThat(sequence).hasValue(17);assertThat(captures).hasValue(providerType==PaymentProviderType.STRIPE?1:0);}finally{release.countDown();}

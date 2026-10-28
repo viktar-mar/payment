@@ -27,6 +27,9 @@ public final class ProviderReferenceInboxWorker {
         try {
             var receipt=inbox.reference(claim);
             if(receipt.isEmpty())return;
+            if(receipt.get().provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE
+                &&receipt.get().objectType()==dev.genericpayments.platform.payments.application.model.ProviderReferenceReceipt.ObjectType.PAYMENT
+                &&inbox.promoteBillingPaymentReference(claim,receipt.get()))return;
             result=transitions.processVerified(claim,resolution.resolve(receipt.get()));
         } catch(RuntimeException failure) {
             String category="PROCESSING_FAILED";

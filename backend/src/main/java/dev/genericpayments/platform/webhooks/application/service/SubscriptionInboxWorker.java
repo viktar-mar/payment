@@ -16,20 +16,26 @@ public class SubscriptionInboxWorker {
     private final SubscriptionProviderRegistry providers;private final ApplySubscriptionSnapshotUseCase facts;private final Clock clock;
     private final dev.genericpayments.platform.subscriptions.application.port.in.PrepareSubscriptionReadUseCase reads;
     private final SubscriptionTelemetryPort telemetry;private final SubscriptionObservationPort observations;
+    private final dev.genericpayments.platform.webhooks.application.port.out.SubscriptionInboxResolutionPort resolution;
     private final String owner="subscription-inbox-"+UUID.randomUUID();private final int batch;private final Duration lease;
     public SubscriptionInboxWorker(SubscriptionInboxPort inbox,SubscriptionTransactionPort tx,SubscriptionObjectPort objects,SubscriptionStore subscriptions,
         SubscriptionOperationStore operations,LoadPaymentAccountPort accounts,SubscriptionProviderRegistry providers,ApplySubscriptionSnapshotUseCase facts,
-        Clock clock,@Value("${payment.inbox.batch-size:20}")int batch,@Value("${payment.inbox.lease-seconds:30}")long seconds,dev.genericpayments.platform.subscriptions.application.port.in.PrepareSubscriptionReadUseCase reads,SubscriptionTelemetryPort telemetry,SubscriptionObservationPort observations){
+        Clock clock,@Value("${payment.inbox.batch-size:20}")int batch,@Value("${payment.inbox.lease-seconds:30}")long seconds,dev.genericpayments.platform.subscriptions.application.port.in.PrepareSubscriptionReadUseCase reads,SubscriptionTelemetryPort telemetry,SubscriptionObservationPort observations,
+        @org.springframework.context.annotation.Lazy dev.genericpayments.platform.webhooks.application.port.out.SubscriptionInboxResolutionPort resolution){
         if(batch<1||batch>100||seconds<1||seconds>600)throw new IllegalArgumentException("Invalid inbox configuration");
         this.inbox=inbox;this.tx=tx;this.objects=objects;this.subscriptions=subscriptions;this.operations=operations;this.accounts=accounts;this.providers=providers;this.facts=facts;this.clock=clock;this.batch=batch;this.lease=Duration.ofSeconds(seconds);
-        this.reads=reads;this.telemetry=telemetry;this.observations=observations;
+        this.reads=reads;this.telemetry=telemetry;this.observations=observations;this.resolution=resolution;
     }
     public void runOnce(){
         if(tx.active())throw new IllegalStateException("Provider retrieval requires no transaction");
         for(var claim:inbox.claim(owner,batch,clock.instant(),lease))try{
             var envelope=tx.required(()->inbox.lock(claim,clock.instant()));
-            var kind=switch(envelope.eventType()){case "SUBSCRIPTION_CHANGED"->SubscriptionObjectPort.Kind.SUBSCRIPTION;case "SUBSCRIPTION_INVOICE_CHANGED"->SubscriptionObjectPort.Kind.INVOICE;case "SUBSCRIPTION_SETUP_CHANGED"->SubscriptionObjectPort.Kind.SETUP;default->throw new IllegalArgumentException("Invalid event type");};
+            var kind=switch(envelope.eventType()){case "SUBSCRIPTION_CHANGED"->SubscriptionObjectPort.Kind.SUBSCRIPTION;case "SUBSCRIPTION_INVOICE_CHANGED"->SubscriptionObjectPort.Kind.INVOICE;case "SUBSCRIPTION_SETUP_CHANGED"->SubscriptionObjectPort.Kind.SETUP;case "SUBSCRIPTION_SCHEDULE_CHANGED"->SubscriptionObjectPort.Kind.SCHEDULE;default->throw new IllegalArgumentException("Invalid event type");};
             var identity=objects.resolve(envelope.provider(),envelope.accountId(),kind,envelope.objectReference());
+            // Stripe preparation also validates mapped auxiliary parents; recovery/recordReply must
+            // finish before reloading lifecycle state, choosing an operation and capturing its fence.
+            if(envelope.provider()==dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE)
+                identity=resolution.resolve(envelope);
             if(identity.isEmpty()){inbox.fail(claim,"UNRESOLVED_OBJECT",clock.instant());continue;}
             var subscription=subscriptions.findOwned(envelope.accountId(),identity.get()).orElseThrow();
             var account=accounts.findById(envelope.accountId()).orElseThrow();

@@ -96,4 +96,16 @@ public class StripeSandboxConfiguration {
             dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionTransactionPort tx,@org.springframework.beans.factory.annotation.Qualifier("providerReferenceClock") java.time.Clock clock){
         return new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingActionAdapter(ownership,tokens,credentials,clients,verification,actions,operations,tx,clock);
     }
+
+    @Bean @Lazy dev.genericpayments.platform.webhooks.application.port.out.SubscriptionInboxResolutionPort stripeBillingInboxAdapter(
+            LoadPaymentAccountPort accounts,dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionObjectPort objects,
+            dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnership ownership,
+            dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort bindings,
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionOperationStore operations,
+            StripeCredentialResolver credentials,StripeClientFactory clients,PaymentAccountVerificationPort verification,
+            dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeSubscriptionProviderAdapter provider,
+            dev.genericpayments.platform.subscriptions.application.service.SubscriptionCommandTransaction commands){
+        return new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingInboxAdapter(accounts,objects,ownership,bindings,
+            operations,credentials,clients,verification,provider,commands);
+    }
 }

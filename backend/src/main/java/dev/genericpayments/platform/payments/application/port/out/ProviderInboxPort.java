@@ -18,6 +18,8 @@ public interface ProviderInboxPort {
     Optional<Claim> claimReference(Duration lease);
     /** Short independent transaction; returns no receipt for a lost lease, releases its lock before IO. */
     Optional<ProviderReferenceReceipt> reference(Claim claim);
+    /** Independent local transaction: reroute only this exact live claim with immutable Billing proof. */
+    default boolean promoteBillingPaymentReference(Claim claim,ProviderReferenceReceipt expected) { return false; }
     /** Requires the financial apply transaction; checks the live claim after locking its row. */
     ProviderReferenceReceipt lockReference(Claim claim);
     /** Same apply transaction, revalidating the live claim so an expired apply rolls back. */
