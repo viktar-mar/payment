@@ -103,25 +103,11 @@ public final class StripeBillingSnapshotMapper {
         }catch(PaymentApplicationException safe){throw safe;}catch(StripeException|RuntimeException unsafe){throw mismatch();}
     }
     private static PaymentAction paymentAction(Read r,StripeBillingOwnership.PaymentProof proof,SubscriptionProviderModels.Invoice i) throws StripeException {
-            var client=r.client;
-            var invoice=r.sourceInvoices.stream().filter(v->v.getId().equals(i.reference())).findFirst().orElseThrow(StripeBillingSnapshotMapper::mismatch);
-            require("open".equals(invoice.getStatus()));
-            if(proof instanceof StripeBillingOwnership.OriginalResume||proof instanceof StripeBillingOwnership.OriginalChange)require(StripeBillingOwnership.inWindow(invoice.getCreated(),proof.step()));
-            var allocations=r.sourceAllocations.get(i.reference());require(allocations!=null&&allocations.size()==1);
-            var a=allocations.getFirst();long due=i.amountDueMinor();require("open".equals(a.getStatus())&&Boolean.TRUE.equals(a.getIsDefault())&&Objects.equals(due,a.getAmountRequested())&&zeros(a.getAmountPaid())&&a.getPayment()!=null&&"payment_intent".equals(a.getPayment().getType()));
-            ref(a.getPayment().getPaymentIntent(),"pi_");var pi=r.get(()->client.v1().paymentIntents().retrieve(a.getPayment().getPaymentIntent()));
-            require(a.getPayment().getPaymentIntent().equals(pi.getId())&&"payment_intent".equals(pi.getObject())&&Boolean.FALSE.equals(pi.getLivemode())&&proof.customer().providerReference().equals(pi.getCustomer())
-                &&invoice.getCurrency().equals(pi.getCurrency())&&Objects.equals(due,pi.getAmount())&&zeros(pi.getAmountReceived())&&"automatic".equals(pi.getCaptureMethod())&&List.of("card").equals(pi.getPaymentMethodTypes())
-                &&Set.of("requires_payment_method","requires_action").contains(pi.getStatus()));
-            if(pi.getLatestCharge()!=null){
-                ref(pi.getLatestCharge(),"ch_");var ch=r.get(()->client.v1().charges().retrieve(pi.getLatestCharge()));
-                require(pi.getLatestCharge().equals(ch.getId())&&"charge".equals(ch.getObject())&&Boolean.FALSE.equals(ch.getLivemode())&&pi.getId().equals(ch.getPaymentIntent())&&proof.customer().providerReference().equals(ch.getCustomer())&&pi.getCurrency().equals(ch.getCurrency())
-                    &&Objects.equals(due,ch.getAmount())&&zeros(ch.getAmountCaptured())&&Boolean.FALSE.equals(ch.getPaid())&&Boolean.FALSE.equals(ch.getCaptured())&&"failed".equals(ch.getStatus())&&ch.getPaymentMethodDetails()!=null&&"card".equals(ch.getPaymentMethodDetails().getType()));
+            if(proof instanceof StripeBillingOwnership.OriginalResume||proof instanceof StripeBillingOwnership.OriginalChange){
+                var invoice=r.sourceInvoices.stream().filter(v->v.getId().equals(i.reference())).findFirst().orElseThrow(StripeBillingSnapshotMapper::mismatch);
+                require(StripeBillingOwnership.inWindow(invoice.getCreated(),proof.step()));
             }
-            var reverse=r.pages(after->client.v1().invoicePayments().list(InvoicePaymentListParams.builder().setPayment(InvoicePaymentListParams.Payment.builder().setType(InvoicePaymentListParams.Payment.Type.PAYMENT_INTENT).setPaymentIntent(pi.getId()).build()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build()));
-            require(reverse.size()==1&&a.equals(reverse.getFirst()));
-            String secret=pi.getClientSecret();require(secret!=null&&secret.startsWith(pi.getId()+"_secret_")&&secret.length()<=1024&&secret.matches("[A-Za-z0-9_-]+"));
-            if(invoice.getConfirmationSecret()!=null)require("payment_intent".equals(invoice.getConfirmationSecret().getType())&&secret.equals(invoice.getConfirmationSecret().getClientSecret()));
+            var graph=paymentGraph(r,i,proof.customer().providerReference());var a=graph.allocation();var pi=graph.intent();var secret=graph.secret();
             String canonical=dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.canonical(proof.step().fingerprint(),proof.operation().fingerprint(),i.period().start(),i.period().end());
             if(proof instanceof StripeBillingOwnership.OriginalChange change)canonical=dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.canonical("CHANGE_V1",canonical,change.result().quote().toString(),change.result().result().creditLine(),change.result().result().debitLine());
             if(proof instanceof StripeBillingOwnership.OriginalRecovery recovery){
@@ -130,6 +116,50 @@ public final class StripeBillingSnapshotMapper {
             }
             var binding=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding(proof.step().id(),proof.operation().providerOperationKey(),StripeBillingGrantTokens.hash(canonical),proof.subscription().providerReference(),proof.customer().providerReference(),i.reference(),a.getId(),pi.getId(),proof instanceof StripeBillingOwnership.OriginalRecovery?"recovery-v1":proof instanceof StripeBillingOwnership.OriginalChange?"change-v1":proof instanceof StripeBillingOwnership.OriginalResume?"resume-v1":"payment-v1",null);
             return new PaymentAction(binding,secret,pi.getAmount(),pi.getCurrency());
+    }
+    /** Typed original-only entry. This descriptive receipt must be independently authorized by the caller. */
+    public static PaymentAction retrieveOwnedPaymentAction(StripeClient client,Ownership owner,OwnedInitial original,Instant at){
+        try{
+            var r=new Read(client,owner,at,Objects.requireNonNull(original));var snapshot=r.snapshot();
+            var receipt=original.receipt();var intent=receipt.intent();
+            require(snapshot.status()==Subscription.Status.INCOMPLETE&&snapshot.invoices().size()==1);
+            var invoice=snapshot.invoices().getFirst();
+            require(invoice.kind()==BillingRecord.Kind.INITIAL&&invoice.settlement()==SettlementKind.OPEN&&invoice.price().equals(intent.terms())
+                &&invoice.period().equals(snapshot.period())&&invoice.period().start().getEpochSecond()==receipt.periodStart()&&invoice.period().end().getEpochSecond()==receipt.periodEnd());
+            var graph=paymentGraph(r,invoice,intent.customerReference());var pi=graph.intent();
+            require("requires_payment_method".equals(pi.getStatus())&&"automatic".equals(pi.getConfirmationMethod())&&pi.getLatestCharge()==null&&graph.secret().length()<=512);
+            var binding=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding(receipt.providerOperation(),intent.operationKey(),
+                dev.genericpayments.platform.provider.application.model.OwnedInitialConfirmationProof.hash(receipt,invoice.reference(),graph.allocation().getId(),pi.getId()),
+                receipt.reference(),intent.customerReference(),invoice.reference(),graph.allocation().getId(),pi.getId(),"owned-initial-v1",null,intent.id());
+            return new PaymentAction(binding,graph.secret(),pi.getAmount(),pi.getCurrency());
+        }catch(PaymentApplicationException safe){throw safe;}catch(StripeException|RuntimeException unsafe){throw mismatch();}
+    }
+    private record PaymentGraph(InvoicePayment allocation,PaymentIntent intent,String secret){
+        @Override public String toString(){return "PaymentGraph[redacted]";}
+    }
+    private static PaymentGraph paymentGraph(Read r,SubscriptionProviderModels.Invoice i,String customer)throws StripeException{
+            var client=r.client;
+            var invoice=r.sourceInvoices.stream().filter(v->v.getId().equals(i.reference())).findFirst().orElseThrow(StripeBillingSnapshotMapper::mismatch);
+            require("open".equals(invoice.getStatus()));
+
+            var allocations=r.sourceAllocations.get(i.reference());require(allocations!=null&&allocations.size()==1);
+            var a=allocations.getFirst();long due=i.amountDueMinor();require("open".equals(a.getStatus())&&Boolean.TRUE.equals(a.getIsDefault())&&Objects.equals(due,a.getAmountRequested())&&zeros(a.getAmountPaid())&&a.getPayment()!=null&&"payment_intent".equals(a.getPayment().getType()));
+            ref(a.getPayment().getPaymentIntent(),"pi_");var pi=r.get(()->client.v1().paymentIntents().retrieve(a.getPayment().getPaymentIntent()));
+            require(a.getPayment().getPaymentIntent().equals(pi.getId())&&"payment_intent".equals(pi.getObject())&&Boolean.FALSE.equals(pi.getLivemode())&&customer.equals(pi.getCustomer())
+                &&invoice.getCurrency().equals(pi.getCurrency())&&Objects.equals(due,pi.getAmount())&&zeros(pi.getAmountReceived())&&"automatic".equals(pi.getCaptureMethod())&&List.of("card").equals(pi.getPaymentMethodTypes())
+                &&Set.of("requires_payment_method","requires_action").contains(pi.getStatus()));
+            // Owned initial proof never enters the ordinary causal-decline Charge branch.
+            if(r.original!=null)require("requires_payment_method".equals(pi.getStatus())&&"automatic".equals(pi.getConfirmationMethod())&&pi.getLatestCharge()==null);
+            if(pi.getLatestCharge()!=null){
+                ref(pi.getLatestCharge(),"ch_");var ch=r.get(()->client.v1().charges().retrieve(pi.getLatestCharge()));
+                require(pi.getLatestCharge().equals(ch.getId())&&"charge".equals(ch.getObject())&&Boolean.FALSE.equals(ch.getLivemode())&&pi.getId().equals(ch.getPaymentIntent())&&customer.equals(ch.getCustomer())&&pi.getCurrency().equals(ch.getCurrency())
+                    &&Objects.equals(due,ch.getAmount())&&zeros(ch.getAmountCaptured())&&Boolean.FALSE.equals(ch.getPaid())&&Boolean.FALSE.equals(ch.getCaptured())&&"failed".equals(ch.getStatus())&&ch.getPaymentMethodDetails()!=null&&"card".equals(ch.getPaymentMethodDetails().getType()));
+            }
+            var reverse=r.pages(after->client.v1().invoicePayments().list(InvoicePaymentListParams.builder().setPayment(InvoicePaymentListParams.Payment.builder().setType(InvoicePaymentListParams.Payment.Type.PAYMENT_INTENT).setPaymentIntent(pi.getId()).build()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build()));
+            require(reverse.size()==1&&a.equals(reverse.getFirst()));
+            String secret=pi.getClientSecret();require(secret!=null&&secret.startsWith(pi.getId()+"_secret_")&&secret.length()<=1024&&secret.matches("[A-Za-z0-9_-]+"));
+            if(invoice.getConfirmationSecret()!=null)require("payment_intent".equals(invoice.getConfirmationSecret().getType())&&secret.equals(invoice.getConfirmationSecret().getClientSecret()));
+            return new PaymentGraph(a,pi,secret);
     }
     public record RecoveryRead(Snapshot snapshot,String allocation,String intent,String method,boolean firstPay) {}
     public static RecoveryRead retrieveRecovery(StripeClient client,StripeBillingOwnership.OriginalRecovery proof,Instant at){
