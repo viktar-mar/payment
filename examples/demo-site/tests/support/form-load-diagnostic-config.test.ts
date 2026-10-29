@@ -14,7 +14,7 @@ const root=fileURLToPath(new URL('../..',import.meta.url));
 test('actual Vite config isolates diagnostic entry and preserves ordinary entries',async()=>{
   const normal=await loadConfigFromFile({command:'build',mode:'production'},root+'/vite.config.ts',root);
   const diagnostic=await loadConfigFromFile({command:'build',mode:'form-diagnostic'},root+'/vite.config.ts',root);
-  assert.deepEqual(normal?.config.build?.rollupOptions?.input,{main:'index.html',paymentReturn:'payment-return.html'});
+  assert.deepEqual(normal?.config.build?.rollupOptions?.input,{main:'index.html',paymentReturn:'payment-return.html',subscriptionReturn:'subscription-return.html'});
   assert.deepEqual(diagnostic?.config.build?.rollupOptions?.input,{formDiagnostic:'form-load-diagnostic.html',formManual:'form-load-manual.html'});
   const aliases=diagnostic?.config.resolve?.alias as Record<string,string>;
   assert.ok(aliases['@generic-payments/sdk']?.endsWith('/frontend/sdk/src/index.ts'));

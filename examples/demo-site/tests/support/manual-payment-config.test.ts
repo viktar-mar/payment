@@ -12,7 +12,7 @@ test('manual payment has one isolated source SDK graph and manifest; old modes k
   assert.equal(manual?.config.build?.manifest,true);
   assert.ok((manual?.config.resolve?.alias as Record<string,string>)['@generic-payments/sdk']?.endsWith('/frontend/sdk/src/index.ts'));
   const ordinary=await loadConfigFromFile({command:'build',mode:'production'},root+'/vite.config.ts',root);
-  assert.deepEqual(ordinary?.config.build?.rollupOptions?.input,{main:'index.html',paymentReturn:'payment-return.html'});
+  assert.deepEqual(ordinary?.config.build?.rollupOptions?.input,{main:'index.html',paymentReturn:'payment-return.html',subscriptionReturn:'subscription-return.html'});
   const diagnostic=await loadConfigFromFile({command:'build',mode:'form-diagnostic'},root+'/vite.config.ts',root);
   assert.deepEqual(diagnostic?.config.build?.rollupOptions?.input,{formDiagnostic:'form-load-diagnostic.html',formManual:'form-load-manual.html'});
 });

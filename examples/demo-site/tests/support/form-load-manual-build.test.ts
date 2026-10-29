@@ -15,12 +15,13 @@ test('actual Vite graph shares SDK across manual/automatic entries and excludes 
     await build({root,configFile:root+'/vite.config.ts',mode:'form-diagnostic',logLevel:'silent',build:{outDir:directory}});
     const assets=await readdir(join(directory,'assets')),manual=assets.find(name=>/^formManual-.*\.js$/.test(name)),automatic=assets.find(name=>/^formDiagnostic-.*\.js$/.test(name));
     assert.ok(manual);assert.ok(automatic);
+    assert.equal((await readdir(directory)).includes('subscription-return.html'),false);
     const manualCode=await readFile(join(directory,'assets',manual),'utf8'),automaticCode=await readFile(join(directory,'assets',automatic),'utf8');
     const shared=assets.filter(name=>name.endsWith('.js')&&manualCode.includes(name)&&automaticCode.includes(name));assert.ok(shared.length>0);
     for(const name of assets)assert.doesNotMatch(await readFile(join(directory,'assets',name),'utf8'),/node:http|node:crypto|createManualFormGateway/);
     for(const scenario of ['no-click','synchronous-ready','delayed-ready','frame-only','late-session'])await t.test(scenario,()=>exercise(pathToFileURL(join(directory,'assets',manual)).href,scenario,true));
     await build({root,configFile:root+'/vite.config.ts',mode:'production',logLevel:'silent',build:{outDir:directory,emptyOutDir:true}});
-    const documents=await readdir(directory);assert.ok(documents.includes('index.html'));assert.ok(documents.includes('payment-return.html'));
+    const documents=await readdir(directory);assert.ok(documents.includes('index.html'));assert.ok(documents.includes('payment-return.html'));assert.ok(documents.includes('subscription-return.html'));
     assert.equal(documents.includes('form-load-manual.html'),false);assert.equal(documents.includes('form-load-diagnostic.html'),false);
     for(const name of await readdir(join(directory,'assets')))assert.doesNotMatch(await readFile(join(directory,'assets',name),'utf8'),/manual-session|manual-observation|Ручная проверка|__formLoadDiagnostic|__formDiagnosticSession/);
   }finally{await rm(directory,{recursive:true,force:true});}
@@ -41,7 +42,7 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
     'frontend/package.json','frontend/pnpm-lock.yaml','frontend/pnpm-workspace.yaml',
     'frontend/sdk/package.json','frontend/sdk',
     'examples/demo-site/package.json','examples/demo-site/pnpm-lock.yaml',
-    'examples/demo-site/index.html','examples/demo-site/payment-return.html',
+    'examples/demo-site/index.html','examples/demo-site/payment-return.html','examples/demo-site/subscription-return.html',
     'examples/demo-site/form-load-diagnostic.html','examples/demo-site/form-load-manual.html','examples/demo-site/manual-payment.html',
     'examples/demo-site/tsconfig.json','examples/demo-site/vite.config.ts','examples/demo-site/src',
     ...publicInfrastructure.map(name=>'infrastructure/'+name),
@@ -123,9 +124,9 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
         assert.equal(manifest['manual-payment.html'].isEntry,true);
       }else if(mode==='form-diagnostic'){
         assert.ok(documents.includes('form-load-manual.html'));assert.ok(documents.includes('form-load-diagnostic.html'));
-        assert.equal(documents.includes('index.html'),false);
+        assert.equal(documents.includes('index.html'),false);assert.equal(documents.includes('subscription-return.html'),false);
       }else{
-        assert.ok(documents.includes('index.html'));assert.ok(documents.includes('payment-return.html'));
+        assert.ok(documents.includes('index.html'));assert.ok(documents.includes('payment-return.html'));assert.ok(documents.includes('subscription-return.html'));
         assert.equal(documents.includes('form-load-manual.html'),false);assert.equal(documents.includes('form-load-diagnostic.html'),false);
       }
       for(const name of await readdir(join(demo,'dist/assets'))){
