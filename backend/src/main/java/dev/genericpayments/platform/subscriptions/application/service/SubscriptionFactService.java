@@ -185,7 +185,8 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
                 if(paid!=projected){projected=paid;change=zeroChange?SubscriptionEvent.Type.CHANGE_APPLIED:SubscriptionEvent.Type.PERIOD_PAID;changedBill=bill.id();if(scheduledCash){appliedChangeBills.add(bill.id());confirmedPlanOperations.add(original.pendingChange().operationId());}else if(delayedTransition.isPresent()){delayedTransitionApplied=true;confirmedPlanOperations.add(original.pendingChange().operationId());}}
             } else if(invoice.settlement()==SettlementKind.OPEN&&projected.nonTerminal()
                 &&(snapshot.status()==Subscription.Status.PAST_DUE||snapshot.status()==Subscription.Status.UNPAID||snapshot.status()==Subscription.Status.INCOMPLETE)
-                &&invoice.period().equals(snapshot.period())&&invoice.price().equals(snapshot.billingPrice())) {
+                &&invoice.period().equals(snapshot.period())&&invoice.price().equals(snapshot.billingPrice())
+                &&!(sample.isolated()&&initialPending(projected,snapshot,invoice,locked))) {
                 var policy=policies.load(original.siteId());
                 var deadline=projected.paidThrough()!=null&&projected.entitledPrice()!=null?projected.paidThrough().plus(Duration.ofDays(policy.graceDays())):null;
                 var captured=metadata.captureOnce(bill,policy.version(),deadline);
@@ -285,6 +286,17 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
                 observation.state()==OperationState.APPLIED&&proof?SubscriptionOperation.Status.SUCCEEDED:null;
             if(status!=null)operations.save(new SubscriptionOperation(operation.id(),operation.siteId(),operation.customerId(),operation.subscriptionId(),operation.kind(),status,operation.authorityScope(),operation.keyDigest(),operation.fingerprint(),operation.providerOperationKey(),operation.expectedRevision(),operation.policyVersion(),snapshot.subscriptionReference(),status==SubscriptionOperation.Status.FAILED?"PROVIDER_DECLINED":null,operation.createdAt(),now,operation.version()+1),operation.version());
         }
+    }
+    /** Original isolated unpaid CREATE remains incomplete; an OPEN invoice alone is not renewal failure. */
+    private static boolean initialPending(Subscription s,Snapshot snapshot,Invoice invoice,List<SubscriptionOperation> locked){
+        if(s.billingStatus()!=Subscription.Status.INCOMPLETE||snapshot.status()!=Subscription.Status.INCOMPLETE
+            ||invoice.kind()!=BillingRecord.Kind.INITIAL||!invoice.cashObjects().isEmpty()
+            ||s.paidThrough()!=null||s.entitledPrice()!=null||s.currentPeriod()!=null||s.trial()!=null||s.debt()!=null)return false;
+        var observation=snapshot.operationObservation();
+        return observation!=null&&observation.state()==OperationState.PENDING
+            &&Objects.equals(snapshot.operationKey(),observation.operationKey())
+            &&locked.stream().anyMatch(o->o.kind()==SubscriptionOperation.Kind.CREATE
+                &&o.providerOperationKey().equals(observation.operationKey())&&!CreateSubscriptionFingerprint.startsTrial(o.fingerprint()));
     }
     /** This seam supports facts and reads only; command/time proof expansion requires separate work. */
     private void requireIsolatedShape(Subscription s,Snapshot snapshot,List<SubscriptionOperation> locked){
