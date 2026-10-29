@@ -17,12 +17,12 @@ function fixture(options:{lostConfirm?:boolean;lostRetry?:boolean;state?:string;
   const r=new Request(url,init);calls.push(r);
   if(url.includes('/offers'))return json({items:offersWire().items.map(o=>({...o,direction:null,allowed_timings:[]}))});
   if(url.includes('/subscriptions?'))return json({items:[],next_cursor:null});
-  if(url.endsWith('/confirmation-session')){active=first;return json(options.setup?{protocol:'BROWSER_CONFIRM_V1',provider:'stripe',flow:'SETUP',publishable_key:'pk_test_fixture',client_secret:'seti_fixture_secret_fixture',action_token:actionWire().secret,expires_at:expiry}:context());}
+  if(url.endsWith('/confirmation-session')){active=options.setup?null:first;return json(options.setup?{protocol:'BROWSER_CONFIRM_V1',provider:'stripe',flow:'SETUP',publishable_key:'pk_test_fixture',client_secret:'seti_fixture_secret_fixture',action_token:actionWire().secret,expires_at:expiry}:context());}
   if(url.endsWith('/action-confirmations'))return json({...mutationWire(),browser_confirm_allowed:true},202);
   if(url.endsWith('/confirmation-attempts/current'))return json(active?status(active):null);
   if(url.endsWith('/confirm')){state=options.state??'DECLINED';if(options.lostConfirm)throw Error('lost acknowledgement');return json({...status(url.includes(second)?second:first),state:url.includes(second)?'OBSERVE':state,retry_allowed:!url.includes(second)&&state==='DECLINED',next_action_allowed:options.nextAction??false});}
   if(url.endsWith('/retry')){successor=second;active=second;if(options.lostRetry)throw Error('lost retry acknowledgement');return json(status());}
-  if(url.endsWith('/client-session'))return json(options.invalidSuccessor==='expired'?{...context(second),expires_at:'2000-01-01T00:00:00Z'}:context(options.invalidSuccessor==='foreign'?first:second));
+  if(url.endsWith('/client-session'))return json(options.invalidSuccessor==='expired'?{...context(second),expires_at:'2000-01-01T00:00:00Z'}:context(options.invalidSuccessor==='foreign'?first:url.includes(second)?second:first));
   if(url.includes('/confirmation-attempts/'))return json(status(url.includes(second)?second:first));
   if(url.endsWith('/action'))return json({...actionWire(),kind:'PROVIDER_CLIENT'});
   if(url.includes('/operations/'))return json({...operationWire(),status:'REQUIRES_ACTION',action_available:true});
@@ -61,3 +61,40 @@ it('ignores a late Retry receipt after identity replacement without preparing a 
 it('does not infer next-action permission from a REQUIRES_ACTION status or replay receipt',async()=>{const f=fixture({state:'REQUIRES_ACTION',nextAction:false});await f.start();await f.click('Pay');await waitFor(()=>expect(f.destroy).toHaveBeenCalledTimes(1));await f.click('Refresh status');await waitFor(()=>expect(getByRole(f.root,'button',{name:'Refresh status'})).toBeEnabled());expect(f.next).not.toHaveBeenCalled();});
 
 it('keeps selected SETUP on the legacy one-shot path without a second session request',async()=>{const f=fixture({setup:true});await f.start();await f.click('Pay');await waitFor(()=>expect(f.browserConfirm).toHaveBeenCalledTimes(1));await waitFor(()=>expect(f.destroy).toHaveBeenCalledTimes(1));expect(f.calls.filter(r=>r.url.endsWith('/confirmation-session'))).toHaveLength(1);expect(f.calls.filter(r=>r.url.endsWith('/client-session'))).toHaveLength(0);expect(f.calls.filter(r=>r.url.endsWith('/action-confirmations'))).toHaveLength(1);expect(f.calls.filter(r=>r.url.endsWith('/confirm'))).toHaveLength(0);expect(queryByRole(f.root,'button',{name:'Retry payment'})).toBeNull();});
+
+// Deferred handoff regressions use call/mount assertions, avoiding ShadowRoot
+// pretty-print failures that can mask a missing-element assertion.
+async function handoffLoss(f:ReturnType<typeof fixture>,loss:'pagehide'|'document-hidden'|'host-hidden') {
+ if(loss==='pagehide')window.dispatchEvent(new Event('pagehide'));
+ if(loss==='document-hidden'){
+  const visibility=vi.spyOn(document,'visibilityState','get');visibility.mockReturnValue('hidden');document.dispatchEvent(new Event('visibilitychange'));
+  visibility.mockReturnValue('visible');document.dispatchEvent(new Event('visibilitychange'));
+ }
+ if(loss==='host-hidden'){
+  const host=(f.manager.firstElementChild??f.manager) as HTMLElement;host.hidden=true;
+  await new Promise(r=>setTimeout(r,0));host.hidden=false;
+ }
+}
+it.each([false,true].flatMap(setup=>(['pagehide','document-hidden','host-hidden'] as const).map(loss=>({setup,loss}))))('latches $loss during initial selected session (SETUP=$setup)',async({setup,loss})=>{
+  let release!:()=>void;const gate=new Promise<void>(r=>{release=r;});const f=fixture({setup}),original=globalThis.fetch;
+  vi.stubGlobal('fetch',async(url:string,init:RequestInit)=>{const response=await original(url,init);if(url.endsWith('/confirmation-session'))await gate;return response;});
+  await waitFor(()=>expect(getByRole(f.root,'button',{name:'Create subscription'})).toBeEnabled());fireEvent.click(getByLabelText(f.root,'I consent to recurring payments'));await f.click('Create subscription');
+  await waitFor(()=>expect(f.calls.filter(r=>r.url.endsWith('/confirmation-session'))).toHaveLength(1));await handoffLoss(f,loss);release();
+  await waitFor(()=>expect(f.root.querySelector('section')!.getAttribute('aria-busy')).toBe('false'));
+  expect(f.mount,loss).not.toHaveBeenCalled();expect(provider.load,loss).not.toHaveBeenCalled();expect(f.manager.children,loss).toHaveLength(0);
+  const before=f.calls.length;await f.click('Refresh status');await waitFor(()=>expect(f.root.querySelector('section')!.getAttribute('aria-busy')).toBe('false'));
+  expect(f.calls.slice(before).every(r=>r.method==='GET'),loss).toBe(true);expect(f.mount,loss).not.toHaveBeenCalled();
+  if(!setup){await f.click('Continue payment');await waitFor(()=>expect(f.mount).toHaveBeenCalledTimes(1));}
+  expect(f.calls.filter(r=>r.url.endsWith('/confirmation-session')),loss).toHaveLength(1);f.manager.remove();
+});
+it.each((['retry','successor-status','successor-session'] as const).flatMap(boundary=>(['pagehide','document-hidden','host-hidden'] as const).map(loss=>({boundary,loss}))))('latches $loss at $boundary and recovers through reads without Retry replay',async({boundary,loss})=>{
+  let release!:()=>void;const gate=new Promise<void>(r=>{release=r;});const f=fixture(),original=globalThis.fetch;let held=false;
+  const match=(url:string)=>boundary==='retry'?url.endsWith('/retry'):boundary==='successor-status'?url.endsWith(`/confirmation-attempts/${second}`):url.endsWith('/client-session');
+  vi.stubGlobal('fetch',async(url:string,init:RequestInit)=>{const response=await original(url,init);if(match(url)&&!held){held=true;await gate;}return response;});
+  await f.start();await f.click('Pay');await f.click('Retry payment');await waitFor(()=>expect(held).toBe(true));await handoffLoss(f,loss);release();
+  await waitFor(()=>expect(f.root.querySelector('section')!.getAttribute('aria-busy')).toBe('false'));
+  expect(f.mount,loss).toHaveBeenCalledTimes(1);expect(f.calls.filter(r=>r.url.endsWith('/client-session')),loss).toHaveLength(boundary==='successor-session'?1:0);
+  const before=f.calls.length;await f.click('Refresh status');await waitFor(()=>expect(f.root.querySelector('section')!.getAttribute('aria-busy')).toBe('false'));
+  expect(f.calls.slice(before).every(r=>r.method==='GET'),loss).toBe(true);expect(f.calls.filter(r=>r.url.endsWith('/retry')),loss).toHaveLength(1);
+  await f.click('Continue payment');await waitFor(()=>expect(f.mount).toHaveBeenCalledTimes(2));expect(f.calls.filter(r=>r.url.endsWith('/retry')),loss).toHaveLength(1);f.manager.remove();
+});

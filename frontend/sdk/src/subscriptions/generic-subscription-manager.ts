@@ -1,3 +1,4 @@
+import { guardSubscriptionHandoff, type SubscriptionHandoff } from './subscription-handoff.js';
 import { supportsPaymentV2 } from './confirmation-v2.js';
 import { mountStripePaymentAttempt, type StripePaymentAttemptHandle } from './stripe-payment-attempt-driver.js';
 import type { SubscriptionAttemptStatus } from './contracts.js';
@@ -222,16 +223,22 @@ export class GenericSubscriptionManager extends ElementBase {
     this.#formReady=false; this.#formOperation=undefined; this.#formController=undefined; this.#stripeHandle=undefined; this.#providerMount=undefined;
     controller?.abort(); handle?.destroy(); mount?.destroy();
   }
-  async #prepareStripe(revision:number, op:SubscriptionOperation, action?:SubscriptionAction, successor?:SubscriptionAttemptStatus):Promise<boolean> {
+  async #prepareStripe(revision:number, op:SubscriptionOperation, action?:SubscriptionAction, successor?:SubscriptionAttemptStatus, handoffSignal?:AbortSignal):Promise<boolean> {
     if ((!successor && this.#spentOperations.has(op.operationId)) || this.#formOperation===op.operationId) return false;
     this.#retireForm(); this.#formOperation=op.operationId;
     const form = new AbortController(); this.#formController=form;
+    let handoff:SubscriptionHandoff|undefined;
     try {
       const mount = createProviderMount(this,this.#buttons.get('pay')!,'STRIPE');
       // Reserve actual light-DOM geometry before the provider creates its iframe.
       mount.host.style.minHeight='3rem'; this.#providerMount=mount; this.#render();
       const client=this.#client!.subscriptions;
-      const input={session:this.#session!,subscriptionId:op.subscriptionId,operationId:op.operationId,signal:AbortSignal.any([this.#controller!.signal,form.signal])};
+      handoff=guardSubscriptionHandoff({container:mount.host,
+        signal:AbortSignal.any([this.#controller!.signal,form.signal,...(handoffSignal?[handoffSignal]:[])]),
+        expiresAt:successor?.expiresAt??action?.expiresAt??this.#session!.expiresAt,
+        isCurrent:()=>this.#current(revision)&&this.#providerMount===mount&&ownedProviderHost(this)===mount.host,
+        onRetire:()=>{if(this.#providerMount===mount){this.#retireForm();if(this.#current(revision))this.#render();}}});
+      const input={session:this.#session!,subscriptionId:op.subscriptionId,operationId:op.operationId,signal:handoff.signal};
       const options={client,input,container:mount.host,locale:this.#locale,
         isCurrent:()=>this.#current(revision) && this.#providerMount===mount && ownedProviderHost(this)===mount.host,
         onRetire:()=>{ if (this.#providerMount===mount) { this.#retireForm(); if(this.#current(revision)) this.#render(); } } };
@@ -239,8 +246,8 @@ export class GenericSubscriptionManager extends ElementBase {
       if(supportsPaymentV2(client)){
         this.#v2 ??= {subscriptionId:op.subscriptionId,operationId:op.operationId,retrySent:false};
         const context=successor
-          ? await client.paymentAttemptSession!({...input,attemptId:successor.attemptId,expiresAt:successor.expiresAt,idempotencyKey:crypto.randomUUID()})
-          : await client.confirmationSession!({...input,action:action!,idempotencyKey:crypto.randomUUID()});
+          ? await handoff.wait(client.paymentAttemptSession!({...input,attemptId:successor.attemptId,expiresAt:successor.expiresAt,idempotencyKey:crypto.randomUUID()}))
+          : await handoff.wait(client.confirmationSession!({...input,action:action!,idempotencyKey:crypto.randomUUID()}));
         if(!options.isCurrent()||input.signal.aborted)return false;
         if(context.protocol==='SERVER_CONFIRM_V2'){
           this.#v2={subscriptionId:op.subscriptionId,operationId:op.operationId,attemptId:context.attemptId,retrySent:false,status:{protocol:'SERVER_CONFIRM_V2',attemptId:context.attemptId,state:'READY',retryAllowed:false,successorAttemptId:null,expiresAt:context.expiresAt}};
@@ -250,6 +257,7 @@ export class GenericSubscriptionManager extends ElementBase {
       if (!this.#current(revision) || this.#providerMount!==mount) { handle.destroy(); return false; }
       this.#stripeHandle=handle; this.#formReady=true; this.#render(); return true;
     } catch(error) { if (this.#formController===form) this.#retireForm(); this.#failure(error,revision,false,true); return false; }
+    finally { handoff?.release(); }
   }
   async #pay():Promise<void> {
     const revision=this.#state.authorityRevision, handle=this.#stripeHandle, op=this.#state.operation;
@@ -280,24 +288,27 @@ export class GenericSubscriptionManager extends ElementBase {
     if(status.state==='READY'&&locator.attempted)return;
     if(!status.successorAttemptId&&status.state!=='READY'&&(!status.retryAllowed||locator.retrySent))return;
     this.#busy=true;this.#error=undefined;this.#retireForm();this.#render();
+    let handoff:SubscriptionHandoff|undefined;
     try{
-      const client=this.#client!.subscriptions,input={session:this.#session!,signal:this.#controller!.signal,subscriptionId:locator.subscriptionId,operationId:locator.operationId};
+      handoff=guardSubscriptionHandoff({container:this,signal:this.#controller!.signal,expiresAt:status.expiresAt,
+        isCurrent:()=>this.#current(revision),onRetire:()=>{if(this.#v2===locator)locator.status=undefined;}});
+      const client=this.#client!.subscriptions,input={session:this.#session!,signal:handoff.signal,subscriptionId:locator.subscriptionId,operationId:locator.operationId};
       let prepared=status;
       if(!status.successorAttemptId&&status.state!=='READY'){
         locator.retrySent=true;
-        prepared=await client.retryPaymentAttempt!({...input,attemptId:status.attemptId,idempotencyKey:crypto.randomUUID()});
+        prepared=await handoff.wait(client.retryPaymentAttempt!({...input,attemptId:status.attemptId,idempotencyKey:crypto.randomUUID()}));
         if(!this.#current(revision)||this.#v2!==locator)return;
         locator.status=prepared;
         if(prepared.state!=='DECLINED'||!prepared.successorAttemptId)throw new PaymentSdkError('INVALID_RESPONSE');
       }
       const attemptId=prepared.successorAttemptId??prepared.attemptId;
-      const successor=await client.confirmationAttempt!({...input,attemptId});
+      const successor=await handoff.wait(client.confirmationAttempt!({...input,attemptId}));
       if(!this.#current(revision)||this.#v2!==locator)return;
       if(successor.state!=='READY'||Date.parse(successor.expiresAt)<=Date.now())throw new PaymentSdkError('INVALID_RESPONSE');
       const op=this.#state.operation??{subscriptionId:locator.subscriptionId,operationId:locator.operationId,status:'REQUIRES_ACTION' as const,actionAvailable:true};
-      this.#accept(revision,{operation:op});await this.#prepareStripe(revision,op,undefined,successor);
+      this.#accept(revision,{operation:op});await this.#prepareStripe(revision,op,undefined,successor,handoff.signal);
     }catch(error){this.#failure(error,revision,true);}
-    finally{if(this.#current(revision)){this.#busy=false;this.#render();}}
+    finally{handoff?.release();if(this.#current(revision)){this.#busy=false;this.#render();}}
   }
   async #observe(revision:number, original:SubscriptionOperation):Promise<void> {
     if (!this.#current(revision) || this.#polling) return; this.#polling=true; this.#render();
