@@ -24,6 +24,7 @@ public class SubscriptionOperationPersistenceAdapter implements SubscriptionOper
     }
     @Transactional(propagation=Propagation.MANDATORY)
     public SubscriptionOperation lock(UUID id){return jdbc.query("select * from subscription_operations where id=? for update",this::map,id).stream().findFirst().orElseThrow();}
+    public Optional<SubscriptionOperation> findByRequest(SiteId site,String authorityScope,SubscriptionOperation.Kind kind,String keyDigest){return jdbc.query("select * from subscription_operations where site_id=? and authority_scope=? and kind=? and key_digest=?",this::map,site.value(),authorityScope,kind.name(),keyDigest).stream().findFirst();}
     public SubscriptionOperation save(SubscriptionOperation op,long expected){
         if(expected<0||op.version()!=Math.incrementExact(expected))throw new OptimisticLockingFailureException("Invalid operation version");
         var v=values(op);

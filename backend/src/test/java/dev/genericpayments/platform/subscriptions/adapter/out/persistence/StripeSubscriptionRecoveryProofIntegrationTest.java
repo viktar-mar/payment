@@ -159,7 +159,8 @@ class StripeSubscriptionRecoveryProofIntegrationTest extends SubscriptionFactFix
         var claimed = claim(reserved);
         providerConflict(() -> recordPay(p, claimed, "foreign-owner"));
         providerConflict(() -> recordPay(p, reserved, OWNER));
-        jdbc.update("update provider_operations set lease_expires_at=clock_timestamp()-interval '1 second' where id=?", claimed.id());
+        jdbc.update("update provider_operations set lease_expires_at=first_dispatched_at+interval '1 microsecond' where id=?", claimed.id());
+        assertThat(jdbc.queryForObject("select lease_expires_at>first_dispatched_at and lease_expires_at<=clock_timestamp() from provider_operations where id=?", Boolean.class, claimed.id())).isTrue();
         var expired = steps.findById(claimed.id()).orElseThrow();
         providerConflict(() -> recordPay(p, expired, OWNER));
         assertThat(steps.findById(claimed.id()).orElseThrow().status()).isEqualTo(ProviderOperation.Status.DISPATCHING);
@@ -232,11 +233,11 @@ class StripeSubscriptionRecoveryProofIntegrationTest extends SubscriptionFactFix
 
     @Test void freshAuthorityIsRecheckedAfterExternalRecoveryRead() {
         var s = original.subscription();
-        when(provider.retrieve(any())).thenAnswer(call -> {
+        doAnswer(call -> {
             assertThat(tx.active()).isFalse();
             jdbc.update("update customer_sessions set revoked_at=?,revoked_reason='ADMIN' where revoked_at is null", Timestamp.from(INITIAL_TIME.plusSeconds(60)));
             return snapshot(s);
-        });
+        }).when(provider).retrieve(any());
         assertThatThrownBy(() -> pending(original, "revoked-after-read")).isInstanceOf(PaymentApplicationException.class);
         assertThat(jdbc.queryForObject("select count(*) from subscription_operations where kind='RECOVER'", Integer.class)).isZero();
         assertThat(count(TABLE)).isZero();

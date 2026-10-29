@@ -561,6 +561,7 @@ class StripeSubscriptionPlanProofIntegrationTest extends SubscriptionFactFixture
         foreignQuote.put("id", UUID.randomUUID()); foreignQuote.put("token_digest", StripeBillingGrantTokens.hash(nativeReference("grant_")));
         foreignQuote.put("superseded_at", valid.get("expires_at"));
         foreignQuote.put("operation_id", other.change().operation().id()); foreignQuote.put("billing_change_operation", other.change().operation().id());
+        foreignQuote.put("billing_step_resource_id", other.change().operation().id());
         foreignQuote.put("subscription_id", other.change().subscription().id()); foreignQuote.put("billing_operation_key", other.change().operation().providerOperationKey());
         sqlState("23503", () -> insert("subscription_action_capabilities", foreignQuote));
         assertThat(count("subscription_action_capabilities")).isEqualTo(1);

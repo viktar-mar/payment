@@ -46,13 +46,22 @@ public class SubscriptionCancellationTransaction {
             // Find the original owner before acquiring Account. No provider Step row lock is taken.
             var eligibility=trials.find(c.siteId(),c.customerId(),candidate.subscription().productId()).orElse(null);
             var original=eligibility==null||eligibility.reservedByOperation()==null?null:operations.lock(eligibility.reservedByOperation());
+            // Original-owner serialization precedes replay lookup: a concurrent winner may have
+            // closed CREATE and committed this exact CANCEL while we waited for that owner.
+            authority.revalidate(c,true);
+            var prior=operations.findByRequest(c.siteId(),principal(c),SubscriptionOperation.Kind.CANCEL,CreateSubscriptionFingerprint.digest(c.idempotencyKey()));
+            if(prior.isPresent()){
+                var replay=operations.lock(prior.orElseThrow().id());
+                if(!replay.siteId().equals(c.siteId())||!replay.subscriptionId().equals(id)||!replay.customerId().equals(c.customerId())
+                    ||replay.kind()!=SubscriptionOperation.Kind.CANCEL||!replay.authorityScope().equals(principal(c))
+                    ||!replay.keyDigest().equals(CreateSubscriptionFingerprint.digest(c.idempotencyKey()))
+                    ||!replay.fingerprint().startsWith("v1.cancel.abandon.")||!replay.fingerprint().endsWith("."+request))throw SubscriptionRuleErrors.conflict();
+                return result(replay);
+            }
             var oid=UUID.randomUUID();
             var proposed=new SubscriptionOperation(oid,c.siteId(),c.customerId(),id,SubscriptionOperation.Kind.CANCEL,SubscriptionOperation.Status.RESERVED,principal(c),
                 CreateSubscriptionFingerprint.digest(c.idempotencyKey()),"v1.cancel.abandon."+(original==null?new UUID(0,0):original.id())+"."+request,
                 "subscription:"+candidate.account().id().value()+":"+oid+":CANCEL",candidate.subscription().revision(),candidate.policy().version(),null,null,now,now,0);
-            var claim=operations.claim(proposed);var o=claim.operation();authority.revalidate(c,true);
-            if(!o.subscriptionId().equals(id)||!o.customerId().equals(c.customerId())||!o.fingerprint().endsWith("."+request))throw SubscriptionRuleErrors.conflict();
-            if(!claim.owner())return result(o);
             var site=sites.findByIdForUpdate(c.siteId()).orElseThrow(SubscriptionRuleErrors::conflict);
             var customer=customers.findByIdForUpdate(c.siteId(),c.customerId()).orElseThrow(SubscriptionRuleErrors::conflict);
             var account=accounts.findByIdForUpdate(candidate.account().id()).orElseThrow(SubscriptionRuleErrors::conflict);
@@ -67,7 +76,7 @@ public class SubscriptionCancellationTransaction {
                 ||original.kind()!=SubscriptionOperation.Kind.CREATE||!CreateSubscriptionFingerprint.startsTrial(original.fingerprint())
                 ||!original.siteId().equals(s.siteId())||!original.customerId().equals(s.customerId())||!original.subscriptionId().equals(s.id())
                 ||original.providerReference()!=null||Set.of(SubscriptionOperation.Status.SUCCEEDED,SubscriptionOperation.Status.FAILED).contains(original.status())
-                ||operations.unresolved(c.siteId(),id).stream().anyMatch(other->!other.id().equals(original.id())&&!other.id().equals(o.id())&&other.kind()!=SubscriptionOperation.Kind.RECONCILE&&other.kind()!=SubscriptionOperation.Kind.PORTAL))throw SubscriptionRuleErrors.conflict();
+                ||operations.unresolved(c.siteId(),id).stream().anyMatch(other->!other.id().equals(original.id())&&other.kind()!=SubscriptionOperation.Kind.RECONCILE&&other.kind()!=SubscriptionOperation.Kind.PORTAL))throw SubscriptionRuleErrors.conflict();
             if(!trials.find(s.siteId(),s.customerId(),s.productId()).filter(e->e.consumedAt()==null&&original.id().equals(e.reservedByOperation())).isPresent())throw SubscriptionRuleErrors.conflict();
             var setup=billingProofs.setup(account.id(),original.id()).orElseThrow(SubscriptionRuleErrors::conflict);
             var setupStep=providerSteps.findById(setup.step()).orElseThrow(SubscriptionRuleErrors::conflict);
@@ -81,6 +90,10 @@ public class SubscriptionCancellationTransaction {
                 ||!step.resourceId().equals(original.id())||step.status()!=dev.genericpayments.platform.provider.application.model.ProviderOperation.Status.RESERVED
                 ||step.firstDispatchedAt()!=null||step.retryBefore()!=null||step.providerReference()!=null||step.leaseOwner()!=null||step.leaseExpiresAt()!=null))throw SubscriptionRuleErrors.conflict();
             operations.save(status(original,SubscriptionOperation.Status.FAILED,"ABANDONED_BEFORE_DISPATCH"),original.version());
+            // Keep the single unresolved-owner index intact. Closure and the new local CANCEL
+            // claim commit together; any claim/journal/callback failure rolls both back.
+            var claim=operations.claim(proposed);var o=claim.operation();
+            if(!claim.owner())throw SubscriptionRuleErrors.conflict();
             var closed=subscriptions.save(s.cancel("CUSTOMER_ABANDONED",now),s.revision());
             trials.releaseConfirmedFailure(original.id());
             var done=operations.save(status(o,SubscriptionOperation.Status.SUCCEEDED,null),o.version());
