@@ -216,7 +216,18 @@ public final class StripeBillingSnapshotMapper {
                     var pm=get(()->client.v1().paymentMethods().retrieve(method));
                     require(method.equals(pm.getId())&&"payment_method".equals(pm.getObject())&&Boolean.FALSE.equals(pm.getLivemode())&&b.providerReference().equals(pm.getCustomer())&&"card".equals(pm.getType())&&pm.getCard()!=null);methodReady=true;
             }
-            return new Snapshot(remote.getId(),status,mapped.terms(),period,trialEvidence==null?trial:trialEvidence.period(),cancel,normalized,null,methodReady,0,at,null,List.of(),trialEvidence);
+            var withdrawal=externalWithdrawal(status,mapped.terms(),period);
+            return new Snapshot(remote.getId(),status,mapped.terms(),period,trialEvidence==null?trial:trialEvidence.period(),cancel,normalized,null,methodReady,0,at,null,List.of(),trialEvidence,withdrawal);
+        }
+        ExternalWithdrawalEvidence externalWithdrawal(Subscription.Status status,SubscriptionPriceTerms price,Subscription.Period period){
+            if(status!=Subscription.Status.ACTIVE||owner.trial()!=null||!price.equals(owner.subscription().billingPrice())
+                ||!period.equals(owner.subscription().currentPeriod())||remote.getLastResponse()==null)return null;
+            try{
+                var raw=NATIVE_JSON.readTree(remote.getLastResponse().body());
+                if(!remote.getId().equals(raw.path("id").asText())||!raw.path("cancel_at_period_end").isBoolean()||raw.path("cancel_at_period_end").booleanValue())return null;
+                for(var field:List.of("cancel_at","schedule","pending_update","trial_start","trial_end"))if(!raw.has(field)||!raw.get(field).isNull())return null;
+                return new ExternalWithdrawalEvidence(remote.getId(),price,period,at);
+            }catch(java.io.IOException|RuntimeException malformed){throw mismatch();}
         }
         void rememberExplicitNullAttempt(StripeCollection<com.stripe.model.Invoice> page){
             // A nullable SDK getter loses the distinction between absent and explicit null.

@@ -295,7 +295,7 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
             &&i.settlement()==SettlementKind.CASH&&i.price().equals(originalTerms));
         return new Snapshot(result.subscriptionReference(),result.status(),result.billingPrice(),result.period(),result.trial(),result.cancellationAt(),result.invoices(),
             o.providerOperationKey(),result.paymentMethodReady(),result.providerRevision(),result.observedAt(),
-            new OperationObservation(o.providerOperationKey(),paid?OperationState.APPLIED:OperationState.PENDING),result.recoveryObservations(),result.trialEvidence());
+            new OperationObservation(o.providerOperationKey(),paid?OperationState.APPLIED:OperationState.PENDING),result.recoveryObservations(),result.trialEvidence(),result.externalWithdrawalEvidence());
     }
     private Snapshot operationResult(Lookup lookup,Subscription s,CustomerBinding b,Snapshot result){
         if(lookup.providerOperationKey()==null||proofs==null&&planProofs==null&&cancellationProofs==null&&recoveryProofs==null)return result;
@@ -362,7 +362,7 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
                 }catch(StripeException invalid){throw mismatch();}
             }
         }
-        return new Snapshot(result.subscriptionReference(),result.status(),result.billingPrice(),result.period(),result.trial(),result.cancellationAt(),result.invoices(),o.providerOperationKey(),result.paymentMethodReady(),result.providerRevision(),result.observedAt(),new OperationObservation(o.providerOperationKey(),applied?OperationState.APPLIED:declined?OperationState.DECLINED:OperationState.PENDING),result.recoveryObservations(),result.trialEvidence());
+        return new Snapshot(result.subscriptionReference(),result.status(),result.billingPrice(),result.period(),result.trial(),result.cancellationAt(),result.invoices(),o.providerOperationKey(),result.paymentMethodReady(),result.providerRevision(),result.observedAt(),new OperationObservation(o.providerOperationKey(),applied?OperationState.APPLIED:declined?OperationState.DECLINED:OperationState.PENDING),result.recoveryObservations(),result.trialEvidence(),result.externalWithdrawalEvidence());
     }
     private String methodFingerprint(PaymentAccount a,Subscription s,SubscriptionOperation o,CustomerBinding b,SubscriptionBillingProofStore.Setup setup){return StripeRequestFingerprint.of(digest,a,"SUBSCRIPTION_METHOD_V1",o.id().toString(),o.providerOperationKey()+":METHOD",o.fingerprint(),s.providerReference(),b.providerReference(),setup.step().toString(),setup.reference(),setup.method(),"consent:true");}
     private String resumeFingerprint(PaymentAccount a,Subscription s,SubscriptionOperation o,CustomerBinding b){return ownership.resumeFingerprint(a,s,o,b,ownership.price(a,s,s.billingPrice()));}

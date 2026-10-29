@@ -44,6 +44,8 @@ public final class SubscriptionProviderModels {
     public record ApiSetupFence(SubscriptionCommandContext context) implements SetupContinuationFence {}
     public record SetupContinuationResult(Reply reply) {public boolean progressed(){return reply!=null;}}
     public record TrialEvidence(UUID operation,UUID step,String invoice,String item,Subscription.Period period,SubscriptionPriceTerms price,String originalMethod){}
+    /** Server-only positive native shape; a normalized nullable cancellation field is insufficient. */
+    public record ExternalWithdrawalEvidence(String reference,SubscriptionPriceTerms price,Subscription.Period period,Instant observedAt){}
     public record NextAction(ActionKind kind,String secret,Instant expiresAt) {
         public NextAction {Objects.requireNonNull(kind);Objects.requireNonNull(secret);Objects.requireNonNull(expiresAt);}
         @Override public String toString(){return "NextAction[kind="+kind+", secret=[REDACTED], expiresAt="+expiresAt+"]";}
@@ -57,7 +59,11 @@ public final class SubscriptionProviderModels {
     public record Snapshot(String subscriptionReference,Subscription.Status status,SubscriptionPriceTerms billingPrice,
                            Subscription.Period period,Subscription.Period trial,Instant cancellationAt,List<Invoice> invoices,
                            String operationKey,boolean paymentMethodReady,long providerRevision,Instant observedAt,
-                           OperationObservation operationObservation,List<RecoveryObservation> recoveryObservations,TrialEvidence trialEvidence) {
+                           OperationObservation operationObservation,List<RecoveryObservation> recoveryObservations,TrialEvidence trialEvidence,ExternalWithdrawalEvidence externalWithdrawalEvidence) {
+        public Snapshot(String reference,Subscription.Status status,SubscriptionPriceTerms price,Subscription.Period period,Subscription.Period trial,
+                        Instant cancellation,List<Invoice> invoices,String key,boolean ready,long revision,Instant at,OperationObservation observation,List<RecoveryObservation> recovery,TrialEvidence evidence){
+            this(reference,status,price,period,trial,cancellation,invoices,key,ready,revision,at,observation,recovery,evidence,null);
+        }
         public Snapshot(String reference,Subscription.Status status,SubscriptionPriceTerms price,Subscription.Period period,Subscription.Period trial,
                         Instant cancellation,List<Invoice> invoices,String key,boolean ready,long revision,Instant at,OperationObservation observation,List<RecoveryObservation> recovery){
             this(reference,status,price,period,trial,cancellation,invoices,key,ready,revision,at,observation,recovery,null);

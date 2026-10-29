@@ -230,6 +230,8 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
         if(unversioned&&original.cancellation()!=null&&projected.cancellation()!=null
             &&original.billingStatus()==Subscription.Status.ACTIVE&&projected.billingStatus()==Subscription.Status.ACTIVE
             &&snapshot.status()==Subscription.Status.ACTIVE&&snapshot.cancellationAt()==null
+            &&snapshot.externalWithdrawalEvidence()!=null
+            &&snapshot.externalWithdrawalEvidence().equals(new ExternalWithdrawalEvidence(snapshot.subscriptionReference(),snapshot.billingPrice(),snapshot.period(),snapshot.observedAt()))
             &&original.pendingChange()==null&&original.debt()==null&&original.trial()==null&&snapshot.trial()==null
             &&Objects.equals(original.currentPeriod(),snapshot.period())&&original.billingPrice().equals(snapshot.billingPrice())
             &&original.cancellation().effectiveAt().equals(SubscriptionCancellationTransaction.liveBoundary(original,now))

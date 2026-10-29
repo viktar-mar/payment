@@ -166,10 +166,15 @@ public class StripeBillingPortalAdapter {
         keys(f.get("invoice_history"),"enabled");flag(f.get("invoice_history"),"enabled",true);
         keys(f.get("customer_update"),"enabled","allowed_updates");flag(f.get("customer_update"),"enabled",false);empty(f.get("customer_update"),"allowed_updates");
         keys(f.get("payment_method_update"),"enabled");flag(f.get("payment_method_update"),"enabled",false);
-        keys(f.get("subscription_update"),"enabled","default_allowed_updates","products");flag(f.get("subscription_update"),"enabled",false);empty(f.get("subscription_update"),"default_allowed_updates");empty(f.get("subscription_update"),"products");
+        var update=f.get("subscription_update");keys(update,"enabled","default_allowed_updates","products","proration_behavior");flag(update,"enabled",false);empty(update,"default_allowed_updates");empty(update,"products");
+        if(update.has("proration_behavior")&&!"none".equals(update.path("proration_behavior").textValue()))throw unavailable();
         var cancel=f.get("subscription_cancel");keys(cancel,"enabled","mode","proration_behavior","cancellation_reason");flag(cancel,"enabled",true);
         if(!"at_period_end".equals(cancel.path("mode").asText())||!"none".equals(cancel.path("proration_behavior").asText()))throw unavailable();
-        keys(cancel.get("cancellation_reason"),"enabled","options");flag(cancel.get("cancellation_reason"),"enabled",false);empty(cancel.get("cancellation_reason"),"options");
+        var reason=cancel.get("cancellation_reason");keys(reason,"enabled","options");flag(reason,"enabled",false);
+        var options=reason.get("options");if(options!=null&&!options.isNull()){
+            if(!options.isArray())throw unavailable();var seen=new HashSet<String>();
+            for(var option:options)if(!option.isTextual()||!Set.of("too_expensive","missing_features","switched_service","unused","other").contains(option.textValue())||!seen.add(option.textValue()))throw unavailable();
+        }
         keys(n.get("login_page"),"enabled","url");flag(n.get("login_page"),"enabled",false);if(!n.path("login_page").path("url").isMissingNode()&&!n.path("login_page").path("url").isNull())throw unavailable();
     }
     private void recognize(com.stripe.model.billingportal.Session r,Scope s,Configuration c,ProviderOperation step){

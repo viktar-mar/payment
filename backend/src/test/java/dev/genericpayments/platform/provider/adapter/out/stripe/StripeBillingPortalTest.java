@@ -29,6 +29,21 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 /** Pinned Portal wire contract and actual local admission/publication boundaries. */
 class StripeBillingPortalTest {
+    @Test void documentedDisabledFeatureDefaultsRemainCompatibleWithoutEnablingAnAction()throws Exception{
+        try(var f=new PortalCase()){
+            var response=com.google.gson.JsonParser.parseString(f.config()).getAsJsonObject();var features=response.getAsJsonObject("features");features.getAsJsonObject("subscription_update").addProperty("proration_behavior","none");features.getAsJsonObject("subscription_cancel").getAsJsonObject("cancellation_reason").add("options",com.google.gson.JsonParser.parseString("[\"too_expensive\",\"missing_features\",\"switched_service\",\"unused\",\"other\"]"));
+            f.remote();f.fixture.graph.http.respond("POST",CONFIGURATIONS,response.toString());f.fixture.graph.http.respond("GET",CONFIGURATION,response.toString());f.fixture.graph.http.respond("POST",SESSIONS,f.sessionJson());assertThatCode(()->f.adapter.create(f.command(),RETURN)).doesNotThrowAnyException();
+            assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isEqualTo(1);assertThat(f.fixture.graph.http.calls().stream().filter(c->c.path().equals(CONFIGURATIONS)&&c.method().equals("POST")).toList().getFirst().form()).containsEntry("features[subscription_update][enabled]","false").containsEntry("features[subscription_cancel][cancellation_reason][enabled]","false");
+        }
+    }
+    @ParameterizedTest @ValueSource(strings={"proration","nullProration","enabledUpdate","enabledReason","unknownOption","nonStringOption","duplicateOption","unknownField"})
+    void documentedDisabledDefaultsDoNotAdmitChangedActionsOrUnrecognizedValues(String fault)throws Exception{
+        try(var f=new PortalCase()){
+            var json=com.google.gson.JsonParser.parseString(f.config()).getAsJsonObject();var features=json.getAsJsonObject("features");var update=features.getAsJsonObject("subscription_update");var reason=features.getAsJsonObject("subscription_cancel").getAsJsonObject("cancellation_reason");update.addProperty("proration_behavior","none");reason.add("options",com.google.gson.JsonParser.parseString("[\"other\"]"));
+            switch(fault){case "proration"->update.addProperty("proration_behavior","create_prorations");case "nullProration"->update.add("proration_behavior",com.google.gson.JsonNull.INSTANCE);case "enabledUpdate"->update.addProperty("enabled",true);case "enabledReason"->reason.addProperty("enabled",true);case "unknownOption"->reason.add("options",com.google.gson.JsonParser.parseString("[\"unknown\"]"));case "nonStringOption"->reason.add("options",com.google.gson.JsonParser.parseString("[1]"));case "duplicateOption"->reason.add("options",com.google.gson.JsonParser.parseString("[\"other\",\"other\"]"));case "unknownField"->reason.addProperty("future_behavior",true);}
+            f.remote();f.fixture.graph.http.respond("POST",CONFIGURATIONS,json.toString());assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isZero();assertThat(f.saved).isNull();
+        }
+    }
     @Test void provedOwnedCustomerCreatesConfiguredRealNavigationOnlyOnce() throws Exception {
         try(var f=new PortalCase()){
             f.remote();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.respond("POST",SESSIONS,f.sessionJson());

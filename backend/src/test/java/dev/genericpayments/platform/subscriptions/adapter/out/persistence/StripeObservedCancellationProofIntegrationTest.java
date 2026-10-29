@@ -24,6 +24,48 @@ class StripeObservedCancellationProofIntegrationTest extends Task10StripeProofFi
     @Autowired SubscriptionCancellationTransaction cancellations;
     @Autowired SubscriptionEventStore events;
 
+    @Test void genuineLocalScheduleRemainsAvailableBeforeAndImmediatelyAfterProjection() {
+        var local=localSchedule();
+        assertThat(proofs.activeSchedule(account.id(),local.subscription().id(),boundary)).contains(local.receipt());
+        var event=proofs.observedSchedule(account.id(),local.subscription().id(),boundary).orElseThrow();
+        assertThat(events.list(site,local.subscription().id(),100,0).stream().filter(e->e.id().equals(event.event())).findFirst()).hasValueSatisfying(e->assertThat(e.operationId()).isEqualTo(local.receipt().operation()));
+        var pending=withdraw(local.subscription());
+        var receipt=proofs.record(pending.subscription(),pending.operation(),pending.step(),OWNER,Mode.WITHDRAW,boundary,local.receipt().operation(),received(pending.step()));
+        assertThat(receipt.priorOperation()).isEqualTo(local.receipt().operation());assertThat(receipt.observed()).isNull();
+    }
+
+    @Test void externalWithdrawalAndRescheduleCannotReuseHistoricalLocalReceiptAtSameBoundary() {
+        var old=localSchedule();var cleared=externalClear(old.subscription());
+        assertThat(proofs.activeSchedule(account.id(),cleared.id(),boundary)).isEmpty();
+        var current=subscriptions.save(cleared.scheduleCancellation(boundary,INITIAL_TIME),cleared.revision());var event=append(current,SubscriptionEvent.Type.CANCEL_SCHEDULED);
+        assertThat(proofs.activeSchedule(account.id(),current.id(),boundary)).isEmpty();
+        var observed=proofs.observedSchedule(account.id(),current.id(),boundary).orElseThrow();assertThat(observed.event()).isEqualTo(event.id());
+        var pending=withdraw(current);var own=record(pending,observed,received(pending.step()));
+        assertThat(own.observed()).isEqualTo(observed);assertThat(own.priorOperation()).isNull();assertThat(proofs.receipt(account.id(),old.receipt().operation())).contains(old.receipt());
+    }
+
+    @Test void newLocalScheduleAmongHistoricalUnconsumedReceiptsSelectsOnlyCurrentGeneration() {
+        var old=localSchedule();externalClear(old.subscription());var current=localSchedule();
+        assertThat(proofs.activeSchedule(account.id(),current.subscription().id(),boundary)).contains(current.receipt());
+        assertThat(proofs.receipt(account.id(),old.receipt().operation())).contains(old.receipt());
+        assertThat(jdbc.queryForObject("select count(*) from stripe_subscription_cancellation_proofs where subscription_id=? and mode='PERIOD_END'",Integer.class,current.subscription().id())).isEqualTo(2);
+        var pending=withdraw(current.subscription());var saved=proofs.record(pending.subscription(),pending.operation(),pending.step(),OWNER,Mode.WITHDRAW,boundary,current.receipt().operation(),received(pending.step()));
+        assertThat(saved.priorOperation()).isEqualTo(current.receipt().operation());assertThat(saved.priorOperation()).isNotEqualTo(old.receipt().operation());
+    }
+
+    @Test void localReceiptCannotBridgeUnprovedRevisionOrLaterCancellationGeneration() {
+        var local=localSchedule();jdbc.update("update subscriptions set revision=revision+1 where id=?",local.subscription().id());
+        assertThat(proofs.activeSchedule(account.id(),local.subscription().id(),boundary)).isEmpty();
+        assertThat(proofs.observedSchedule(account.id(),local.subscription().id(),boundary)).isEmpty();
+        assertThat(proofs.receipt(account.id(),local.receipt().operation())).contains(local.receipt());
+    }
+
+    @Test void laterWithdrawalEventInvalidatesLocalReceiptEvenWithoutTrustingAnUnchangedRow() {
+        var local=localSchedule();append(local.subscription(),SubscriptionEvent.Type.CANCEL_WITHDRAWN);
+        assertThat(proofs.activeSchedule(account.id(),local.subscription().id(),boundary)).isEmpty();
+        assertThat(proofs.observedSchedule(account.id(),local.subscription().id(),boundary)).isEmpty();
+    }
+
     @Test void currentTypedScheduleCanPrecedeOwnWithdrawalWithoutInventingLocalCancellation() {
         var scheduled = scheduled(SubscriptionEvent.Type.CANCEL_SCHEDULED);
         var observed = proofs.observedSchedule(account.id(), scheduled.subscription().id(), boundary).orElseThrow();
@@ -161,7 +203,21 @@ class StripeObservedCancellationProofIntegrationTest extends Task10StripeProofFi
     }
 
     private record Scheduled(Subscription subscription, SubscriptionEvent event) {}
+    private record LocalSchedule(Subscription subscription,Receipt receipt) {}
     private record Pending(Subscription subscription, SubscriptionOperation operation, ProviderOperation step) {}
+    private LocalSchedule localSchedule() {
+        var s=sub(original.subscription().id());var c=context(local,"cancel-"+UUID.randomUUID());
+        var r=cancellations.reserve(c,s.id(),dev.genericpayments.platform.subscriptions.application.port.in.CancelSubscriptionUseCase.Mode.PERIOD_END,null,cancellations.candidate(c,s.id()),admissionSnapshot(s),true,false);
+        assertThat(r.owner()).isTrue();var step=claim(steps.reserve(account,ProviderOperation.Kind.SUBSCRIPTION_UPDATE,r.operation().id(),r.operation().providerOperationKey(),"task10-local-cancel-"+r.operation().id()));
+        var receipt=proofs.record(r.subscription(),r.operation(),step,OWNER,Mode.PERIOD_END,boundary,null,received(step));
+        assertThat(proofs.activeSchedule(account.id(),s.id(),boundary)).contains(receipt);finish(r.operation());
+        var scheduled=subscriptions.save(s.scheduleCancellation(boundary,INITIAL_TIME),s.revision());
+        var event=new SubscriptionEvent(UUID.randomUUID(),site,scheduled.id(),account.id(),0,scheduled.revision(),SubscriptionEvent.Type.CANCEL_SCHEDULED,SubscriptionEvent.Source.API,INITIAL_TIME,INITIAL_TIME,r.operation().id(),null,null,scheduled.providerReference(),"task10:local-journal:"+UUID.randomUUID(),"task10-sql");
+        assertThat(events.append(event)).isTrue();return new LocalSchedule(scheduled,receipt);
+    }
+    private Subscription externalClear(Subscription s) {
+        var cleared=subscriptions.save(s.withdrawCancellation(INITIAL_TIME),s.revision());append(cleared,SubscriptionEvent.Type.CANCEL_WITHDRAWN);return cleared;
+    }
     private Subscription scheduleOnly() {
         var s = sub(original.subscription().id());
         subscriptions.save(s.scheduleCancellation(boundary, INITIAL_TIME), s.revision());

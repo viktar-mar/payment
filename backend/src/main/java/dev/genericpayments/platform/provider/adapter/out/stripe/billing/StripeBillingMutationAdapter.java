@@ -201,10 +201,20 @@ public final class StripeBillingMutationAdapter {
         var saved=cancellations.receipt(c.account().id(),o.id()).orElse(null);
         if(saved!=null){requireCancellationReceipt(c.account(),s,o,saved,steps,customer);return new Reply(Outcome.ACCEPTED,s.providerReference(),null);}
         var prior=withdraw?cancellations.activeSchedule(c.account().id(),s.id(),boundary).orElse(null):null;
-        var observed=withdraw&&prior==null?cancellations.observedSchedule(c.account().id(),s.id(),boundary).orElseThrow(StripeBillingOwnership::mismatch):null;
+        var observed=withdraw?cancellations.observedSchedule(c.account().id(),s.id(),boundary).orElse(null):null;
         if(observed!=null&&(observed.event()==null||observed.revision()!=o.expectedRevision()||!boundary.equals(observed.boundary())))throw mismatch();
         if(prior!=null&&(prior.mode()!=SubscriptionCancellationProofStore.Mode.PERIOD_END||!prior.account().equals(c.account().id())
             ||!prior.subscription().equals(s.id())||!prior.reference().equals(s.providerReference())||!boundary.equals(prior.boundary())))throw mismatch();
+        if(withdraw){
+            var original=steps.find(c.account().id(),o.providerOperationKey()).orElse(null);
+            if(original!=null){
+                // A lost response retains exactly its original predecessor, fingerprint and key.
+                if(prior!=null&&original.fingerprint().equals(cancellationFingerprint(c.account(),s,o,customer,mode,boundary,prior.operation(),null)))observed=null;
+                else if(observed!=null&&original.fingerprint().equals(cancellationFingerprint(c.account(),s,o,customer,mode,boundary,null,observed)))prior=null;
+                else throw mismatch();
+            }else if(observed!=null)prior=null;
+            if(prior==null&&observed==null)throw mismatch();
+        }
         String fp=cancellationFingerprint(c.account(),s,o,customer,mode,boundary,prior==null?null:prior.operation(),observed);
         if(!Set.of(SubscriptionOperation.Status.PROCESSING,SubscriptionOperation.Status.UNKNOWN).contains(o.status())
             ||s.revision()!=o.expectedRevision()||!s.nonTerminal()||s.pendingChange()!=null||!immediate&&!clock.instant().isBefore(boundary))throw mismatch();

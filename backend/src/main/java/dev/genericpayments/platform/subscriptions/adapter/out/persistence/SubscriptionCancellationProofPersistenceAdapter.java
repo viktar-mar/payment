@@ -25,9 +25,21 @@ public class SubscriptionCancellationProofPersistenceAdapter implements Subscrip
         return jdbc.query("select * from stripe_subscription_cancellation_proofs where payment_account_id=? and operation_id=?",this::receipt,account.value(),operation).stream().findFirst();
     }
     public Optional<Receipt> activeSchedule(PaymentAccountId account,UUID subscription,Instant boundary){
+        // Keep the original preprojection lookup and its immediate schedule revision only.
+        // Later generations never inherit an immutable receipt merely because B is unchanged.
         var rows=jdbc.query("""
             select p.* from stripe_subscription_cancellation_proofs p
+            join subscription_operations o on o.id=p.operation_id and o.site_id=p.site_id
+              and o.subscription_id=p.subscription_id and o.customer_id=p.customer_id
+            join subscriptions s on s.id=p.subscription_id and s.site_id=p.site_id
+              and s.customer_id=p.customer_id and s.payment_account_id=p.payment_account_id
+              and s.provider_reference=p.subscription_reference
             where p.payment_account_id=? and p.subscription_id=? and p.mode='PERIOD_END' and p.boundary=?
+              and o.kind='CANCEL' and ((s.revision=o.expected_revision and s.cancellation_effective_at is null)
+                or (s.revision=o.expected_revision+1 and s.cancellation_effective_at=p.boundary))
+              and not exists(select 1 from subscription_events e where e.subscription_id=s.id
+                and ((e.event_type in ('CANCEL_WITHDRAWN','CANCELLED') and e.revision>o.expected_revision)
+                  or (e.event_type='CANCEL_SCHEDULED' and e.revision>o.expected_revision+1)))
               and not exists(select 1 from stripe_subscription_cancellation_proofs w where w.prior_operation=p.operation_id)
             order by p.acknowledged_at,p.operation_id limit 2
             """,this::receipt,account.value(),subscription,Timestamp.from(boundary));
