@@ -4,6 +4,8 @@ import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.provider.application.model.ReadyClock;
+import dev.genericpayments.platform.provider.application.model.OwnedClockSubscription;
+import dev.genericpayments.platform.provider.application.model.OwnedClockSubscriptionReceipt;
 import dev.genericpayments.platform.customers.domain.CustomerId;
 import dev.genericpayments.platform.sites.domain.SiteId;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind;
@@ -54,6 +56,45 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         return reserveRow(account,Kind.CUSTOMER_CREATE,ready.owner().customer().value(),ready.owner().customerKey(),ready.customerFingerprint());
     }
 
+    @Override
+    public ProviderOperation reserveOwnedBillingSubscription(PaymentAccount account,OwnedClockSubscription intent) {
+        if(account==null || intent==null || !account.id().equals(intent.clock().owner().account())
+            || !account.externalAccountId().equals(intent.clock().owner().externalAccount())
+            || !account.credentialsRef().equals(intent.clock().owner().credentialsRef()))throw conflict();
+        requireAccount(account);
+        JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,intent);
+        return reserveRow(account,Kind.SUBSCRIPTION_CREATE,intent.createOperation(),intent.operationKey(),intent.fingerprint());
+    }
+    @Override
+    public OwnedClockSubscriptionReceipt acknowledgeOwnedBillingSubscription(OwnedClockSubscription intent,ProviderOperation claim,
+            String reference,long created,String item,long start,long end,Instant acknowledgedAt) {
+        if(intent==null || claim==null || acknowledgedAt==null || claim.status()!=Status.DISPATCHING || claim.leaseOwner()==null)throw conflict();
+        var current=lock(claim.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+        if(!current.equals(claim) || current.kind()!=Kind.SUBSCRIPTION_CREATE || !current.accountId().equals(intent.clock().owner().account())
+            || !current.resourceId().equals(intent.createOperation()) || !current.operationKey().equals(intent.operationKey())
+            || !current.fingerprint().equals(intent.fingerprint()) || current.firstDispatchedAt()==null
+            || acknowledgedAt.isBefore(current.firstDispatchedAt()))throw conflict();
+        requirePinnedAccount(current);
+        JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,intent);
+        requireFirstSubscriptionDispatch(current);
+        JdbcStripeBillingClockSubscriptionStore.requirePristine(jdbc,intent);
+        requireSubscriptionReference(current,reference);
+        var receipt=new OwnedClockSubscriptionReceipt(intent,current.id(),reference,created,item,start,end,acknowledgedAt.truncatedTo(ChronoUnit.MICROS));
+        try {
+            // Provider row was acquired before the real DB clock predicate; no second transaction or proxy call.
+            one(jdbc.query("""
+                update provider_operations set status='ACKNOWLEDGED',provider_reference=?,lease_owner=null,lease_expires_at=null,version=version+1
+                where id=? and status='DISPATCHING' and lease_owner=? and version=? and lease_expires_at>clock_timestamp() returning *
+                """,this::operation,reference,current.id(),current.leaseOwner(),current.version()));
+            jdbc.update("""
+                insert into stripe_billing_owned_subscription_receipts(intent_id,payment_account_id,create_operation,provider_operation,
+                 reference,provider_created,item_reference,period_start,period_end,acknowledged_at)
+                values (?,?,?,?,?,?,?,?,?,?)
+                """,intent.id(),current.accountId().value(),intent.createOperation(),current.id(),reference,created,item,start,end,Timestamp.from(receipt.acknowledgedAt()));
+            return JdbcStripeBillingClockSubscriptionStore.receiptRow(jdbc,intent).filter(receipt::equals).orElseThrow(JdbcProviderOperationStore::conflict);
+        } catch(DataIntegrityViolationException invalid) { throw conflict(); }
+    }
+
     private ProviderOperation reserveRow(PaymentAccount account,Kind kind,UUID resourceId,String key,String fingerprint) {
         jdbc.update("""
             insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,
@@ -96,10 +137,14 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
             || (current.leaseExpiresAt() != null && now.isBefore(current.leaseExpiresAt()))
             || (current.firstDispatchedAt() != null && (now.isBefore(current.firstDispatchedAt())
                 || !now.isBefore(current.retryBefore())))) return Optional.empty();
+        if(firstDispatchOnly(current) && current.firstDispatchedAt()!=null) return Optional.empty();
         requirePinnedAccount(current);
         requireResource(current.accountId(), current.kind(), current.resourceId(),current.operationKey(),current.fingerprint());
-        if(firstDispatchOnly(current) && current.firstDispatchedAt()!=null) return Optional.empty();
-        if(current.kind()==Kind.SUBSCRIPTION_CREATE&&current.firstDispatchedAt()==null)requireFirstSubscriptionDispatch(current);
+        if(current.kind()==Kind.SUBSCRIPTION_CREATE&&current.firstDispatchedAt()==null) {
+            requireFirstSubscriptionDispatch(current);
+            JdbcStripeBillingClockSubscriptionStore.operationIntent(jdbc,current.accountId(),current.resourceId())
+                .ifPresent(i->JdbcStripeBillingClockSubscriptionStore.requirePristine(jdbc,i));
+        }
         return jdbc.query("""
             update provider_operations set status='DISPATCHING', lease_owner=?, lease_expires_at=?,
                 first_dispatched_at=coalesce(first_dispatched_at,?), retry_before=coalesce(retry_before,?),
@@ -149,7 +194,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         // Acquire the row first: a blocked UPDATE could otherwise evaluate its clock predicate
         // before waiting for a lock and finish after the lease has expired.
         var current = lock(id).orElseThrow(JdbcProviderOperationStore::conflict);
-        if ("ACKNOWLEDGED".equals(status) && !supportedResource(current.kind())) throw conflict();
+        if ("ACKNOWLEDGED".equals(status) && (!supportedResource(current.kind()) || ownedSubscription(current))) throw conflict();
         if ((current.kind() == Kind.TEST_CLOCK_CREATE||current.kind() == Kind.CUSTOMER_CREATE||current.kind()==Kind.SUBSCRIPTION_CREATE||current.kind()==Kind.SETUP_INTENT_CREATE||current.kind()==Kind.SUBSCRIPTION_UPDATE||current.kind()==Kind.SUBSCRIPTION_CANCEL||current.kind()==Kind.INVOICE_PAY||current.kind()==Kind.PORTAL_CONFIGURATION_CREATE||current.kind()==Kind.PORTAL_SESSION_CREATE) && "ACKNOWLEDGED".equals(status)) {
             requirePinnedAccount(current);
             requireResource(current.accountId(), current.kind(), current.resourceId(),current.operationKey(),current.fingerprint());
@@ -261,6 +306,14 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
             JdbcStripeBillingClockStore.lockOwner(jdbc,intent);
             JdbcStripeBillingClockStore.requireActiveRow(jdbc,intent);
             return;
+        }
+        if(kind==Kind.SUBSCRIPTION_CREATE && ownedCustomer) {
+            var owned=JdbcStripeBillingClockSubscriptionStore.operationIntent(jdbc,account,resourceId);
+            if(owned.isPresent()) {
+                var i=owned.get();
+                if(!i.operationKey().equals(key)||!i.fingerprint().equals(fingerprint))throw conflict();
+                JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,i);return;
+            }
         }
         if(kind==Kind.SUBSCRIPTION_CREATE || kind==Kind.SETUP_INTENT_CREATE) {
             if(!jdbc.queryForList("""
@@ -407,9 +460,14 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     }
 
     private boolean firstDispatchOnly(ProviderOperation operation) {
-        return operation.kind()==Kind.TEST_CLOCK_CREATE || (operation.kind()==Kind.CUSTOMER_CREATE
+        return ownedSubscription(operation) || operation.kind()==Kind.TEST_CLOCK_CREATE || (operation.kind()==Kind.CUSTOMER_CREATE
             && !jdbc.queryForList("select id from stripe_billing_clock_intents where payment_account_id=? and customer_id=?",
                 UUID.class,operation.accountId().value(),operation.resourceId()).isEmpty());
+    }
+    private boolean ownedSubscription(ProviderOperation operation) {
+        return operation.kind()==Kind.SUBSCRIPTION_CREATE && !jdbc.queryForList(
+            "select id from stripe_billing_owned_subscriptions where payment_account_id=? and create_operation=?",
+            UUID.class,operation.accountId().value(),operation.resourceId()).isEmpty();
     }
     private void requireSubscriptionReference(ProviderOperation operation,String reference){
         if(operation.kind()==Kind.TEST_CLOCK_CREATE){if(reference==null||!reference.matches("clock_[A-Za-z0-9]{1,249}"))throw conflict();return;}

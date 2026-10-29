@@ -20,6 +20,16 @@ public interface ProviderOperationStore {
     default ProviderOperation reserveOwnedBillingCustomer(PaymentAccount account, dev.genericpayments.platform.provider.application.model.ReadyClock ready) {
         throw new UnsupportedOperationException("Owned Billing Customer reservation is unavailable");
     }
+    default ProviderOperation reserveOwnedBillingSubscription(PaymentAccount account,
+            dev.genericpayments.platform.provider.application.model.OwnedClockSubscription intent) {
+        throw new UnsupportedOperationException("Owned Billing Subscription reservation is unavailable");
+    }
+    /** Original live claim and complete response evidence commit together, or neither commits. */
+    default dev.genericpayments.platform.provider.application.model.OwnedClockSubscriptionReceipt acknowledgeOwnedBillingSubscription(
+            dev.genericpayments.platform.provider.application.model.OwnedClockSubscription intent, ProviderOperation claim,
+            String reference, long providerCreated, String itemReference, long periodStart, long periodEnd, Instant acknowledgedAt) {
+        throw new UnsupportedOperationException("Owned Billing Subscription acknowledgment is unavailable");
+    }
     Optional<ProviderOperation> find(PaymentAccountId account, String key);
     Optional<ProviderOperation> findById(UUID id);
     /** Join manual recovery transaction; lock operation, original Account, resource in that order. */

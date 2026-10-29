@@ -1,0 +1,56 @@
+# Owned TestClock initial Subscription
+
+## Intent
+
+Continue Stage5B from reviewed/published `b7776a72c28eedd499630d5c3a9bebd95db5b2d1` and successful [CI40916243540](https://github.com/viktar-mar/payment/actions/runs/40916243540). Deliver a working internal owned-clock initial Subscription create → original receipt → exact initial observation → existing lifecycle projection. No diagnostic framework, new dependency, public route, runtime flag or provider activation is needed.
+
+The user requested continuous implementation with subagents, tests, independent review and hosted CI, without local Docker/Sandbox. The implementation choices below are the controller's decisions under that authority; they are not a new native-run authorization.
+
+## Scope and boundaries
+
+- One existing backend-owned READY clock, one freshly bound Customer, one original paid (non-trial) local CREATE/Subscription, unchanged fixed terms, classic billing, card, quantity one, automatic collection and default_incomplete.
+- New adapter is not auto-registered and does not implement an exposed control route. Only inert test-source orchestration instantiates it. Existing production provider registry and INITIAL_NON_CLOCK entry remain unchanged.
+- Existing public/ordinary create, action, confirmation, setup, mutation, recovery, Portal and inbox paths continue refusing clock owners. No automatic lane selection by discovering a clock ID.
+- No confirmation token, payment confirmation, clock advance/polling/delete, trial, cancellation, retry/recovery, schedule or price change is introduced. Initial OPEN/INCOMPLETE projection is the positive end-to-end acceptance for this block; it is not paid or renewal proof. Later paid/renewal/trial work remains explicit.
+- No local Docker, DB/SQL execution, application/Spring context, Testcontainers, browser, provider/Sandbox/financial request, Python, installation, private environment/key/archive/recovery read. Cached offline compilation and audited exact standalone pure tests only. Existing hosted CI may execute its synthetic SQL/application/Fake/browser gates.
+- Preserve historical EUR13/DISPATCHING records, migration history, ordinary keys/fingerprints/replay and UTC behavior. Preserve original three untracked paths and worktree/review evidence. Root owns Git; ordinary commits/push/hosted CI are authorized, no merge/force push/PR/deletion.
+
+## Authority and persisted proof
+
+Introduce a narrow owned Subscription intent from persisted READY/original clock ACK, immutable Customer binding/original Customer ACK, original local Subscription/CREATE and current published terms/mappings. Exactly one Subscription/CREATE can belong to a clock intent. A Java record supplied by a caller is descriptive evidence, never authority: reservation, claim, acknowledgement and read reload/compare persisted relations.
+
+Keep existing SUBSCRIPTION_CREATE kind, local resource and operation key. Use a new versioned owned fingerprint containing original paid request and all clock/Customer provenance and immutable price terms. Ordinary fingerprint bytes remain unchanged. Ordinary reserve and generic/manual recovery refuse owned operations. Additive V31 relations and exact inventory update protect owner/operation/reference relations, one-owner uniqueness and immutable intent/receipt contents.
+
+Only the original claim can dispatch once. Include owned Subscription in the first-dispatch-only policy: UNKNOWN, expired or abandoned DISPATCHING and missing response cannot become another POST. A losing duplicate caller must not stop the live winner. Persist subscription failure with finite safe stop reasons, never raw SDK data. Original successful ACK replay is local-only and may complete existing deterministic lifecycle publication; it grants no HTTP/recovery permission.
+
+The original provider ACK and the owned response receipt commit atomically in the same independent short transaction. Receipt retains exact returned Subscription reference, positive opaque provider-created epoch, exact item reference, initial item period, original provider step and real acknowledged/observed time. A failed receipt insert rolls back the ACK. Late ACK must fail against the actual DB clock after provider row acquisition. No second receipt or timestamp can replace original evidence.
+
+Preserve current lock discipline: provider row → Account → Site → Customer; no waiting for lifecycle locks under provider/account locks, no nested REQUIRES_NEW under outer owner/lifecycle locks. Claim/ACK revalidate original current account identity, active owner, READY and Customer lineage, operation and pristine first-dispatch state. Receipt FK/trigger protection supplements Java validation, it does not replace it.
+
+## Provider and time contracts
+
+Keep stripe-java34.0.0/API2026-09-30.endive, explicit zero SDK retries, original idempotency key and no SDK traffic within an active database transaction. At most one exact owned clock GET before original Subscription POST, validating original name/created/deletes_after/F and READY; no GET polling. No new GET on ACK replay. A stopped/changed clock aborts before POST. Response association and initial-period checks also constrain an out-of-band clock change after preflight.
+
+The Subscription POST uses the original owned Customer; TestClock association is inherited through that Customer, not an invented Subscription create parameter. Share ordinary request construction and structural shape validation where appropriate; do not duplicate large request/validation blocks and do not relax ordinary guards.
+
+Original response must match sandbox identity, exact Customer and clock, metadata as consistency only, one exact item/price/product/quantity/currency/terms, classic/automatic/card/on_subscription settings, supported incomplete non-trial shape, no schedule/pending update/cancellation/pause collection. Its valid initial service period must contain F (`start <= F < end`). Do not assume period.start==F, Subscription.created==F or provider-created within UTC dispatch. Store original created/item/period and compare them on subsequent initial reads.
+
+Operational admission, audit, provider leases/retry windows, observations/fences, session/token/security and callback signing retain real UTC. Lifecycle evaluation samples the exact persisted READY F. Existing ordinary `inWindow` stays unchanged; owned creation uses the original dispatch/ACK/response lineage rather than an alternative timestamp-window guess. No provider timestamp is used as event ordering or observation revision.
+
+Official evidence: [TestClock object](https://docs.stripe.com/api/test_clocks/object) distinguishes frozen_time from created/deletes_after; [simulation guide](https://docs.stripe.com/billing/testing/test-clocks/api-advanced-usage) creates Customer before Subscription and advances lifecycle time; [pinned SubscriptionItem](https://raw.githubusercontent.com/stripe/stripe-java/v34.0.0/src/main/java/com/stripe/model/SubscriptionItem.java) supplies current_period_start/end. No consulted source establishes one universal frozen/UTC interpretation for all associated created fields. Capturing original opaque created and checking equality is our application consistency contract, not a claim of additional Stripe semantics.
+
+## Exact owned observation
+
+Use only the persisted original Subscription/Customer references. Reload current active owner/receipt before and after provider reads; check exact clock READY/F before reading the graph, and reject drift. Reuse the existing bounded snapshot mapper with an explicit typed owned receipt, not a boolean that disables validation. It must require Customer, Subscription and every relevant Invoice.test_clock equal the original clock, Subscription.created/item/initial-period equal the original receipt, and full existing invoice-parent/line/price/allocation/PI/Charge proof. Reject unsupported trial, cancellation, pending update, schedule, proration and changed-period/terms shapes. This no-advance slice cannot accept a later renewal period merely because it is on the same clock.
+
+Ordinary mapper entry requires no owned context and retains its ordinary behavior; new unexpected-clock rejection should make ordinary direct mapper use fail closed. Paid data must never bypass existing CASH joins. No action/client secret, mutation permission or confirmation capability is returned by the new observation entry.
+
+Capture/revalidate the existing observation fence, revision and operation version; feed normalized facts into existing FactService rather than writing lifecycle status directly. Use real command reservation and recordReply/object binding in the positive hosted flow. SQL fixture inserts are acceptable for negative corruption/race cases, not a substitute for the positive application path.
+
+Production OrdinarySubscriptionBillingTimeAdapter remains unchanged. Hosted-only @Primary exact-owner sampler uses one transaction-participating read (no new transaction/owner lock) of intent→READY→Subscription receipt. FactService already holds Account ownership; stop needs exclusive Account. Missing/stopped lineage rejects, never falls back to UTC for an admitted clock owner. Unscoped queries that can include admitted owners refuse. No sampler endpoint or general mutable clock is added.
+
+## Verification and completion
+
+Pure identity/policy and official SDK inert-transport tests establish exact request/receipt/negative behavior without sockets. Meaningful RED precedes implementation where locally executable. Hosted tests prove V31 constraints, transaction/lease/race contracts and actual application reservation→create→binding→observation→OPEN projection with simulated F far from UTC, repeated/stale observations, no cash/access and real UTC audit/security.
+
+Every task gets independent spec/quality review; final combined review, ordinary root commits/push and exact-head hosted CI are required. Record actual evidence without rewriting earlier failures. Native Billing remains NOT_RUN and full Stage5B NOT_ACCEPTED until separately authorized actual-provider matrix succeeds.

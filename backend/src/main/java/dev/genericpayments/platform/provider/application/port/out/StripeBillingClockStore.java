@@ -11,7 +11,7 @@ import java.util.UUID;
 
 /** Short independent transactions only. Admission and READY never call another receipt transaction. */
 public interface StripeBillingClockStore {
-    enum StopReason { CLOCK_CREATE_FAILED, CLOCK_READY_FAILED, CUSTOMER_CREATE_FAILED, BINDING_FAILED, AUTHORITY_REVOKED }
+    enum StopReason { CLOCK_CREATE_FAILED, CLOCK_READY_FAILED, CUSTOMER_CREATE_FAILED, BINDING_FAILED, SUBSCRIPTION_CREATE_FAILED, SUBSCRIPTION_RECEIPT_FAILED, AUTHORITY_REVOKED }
     enum ReadyState { READY }
     record ReadyObservation(ReadyState state, String reference, long frozenTime,
                             long providerCreated, long providerDeletesAfter, Instant observedAt) {}
