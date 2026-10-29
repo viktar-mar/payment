@@ -231,9 +231,10 @@ test.describe("one-time checkout demo", () => {
 
     expect(await inspectStorage(page, { apiBaseUrl: admin.backendUrl, siteKey: fixture.siteKey,
       priceKey: fixture.priceKey, locale: "en", paymentId: payment.payment_id })).toEqual({
-      entryCount: 2,
+      entryCount: 3,
       recoveryEntryCount: 1,
       publicConfigurationIsExact: true,
+      subscriptionReturnConfigurationIsExact: true,
       keyIsNamespaced: true,
       hasExpectedFields: true,
       tokenLooksOpaque: true,
@@ -323,12 +324,15 @@ async function inspectStorage(page: Page, expected: { apiBaseUrl: string; siteKe
     }
     const record = object(raw);
     const publicConfiguration = object(sessionStorage.getItem("demo:public-return-configuration:v1") ?? "");
+    const subscriptionReturnConfiguration = object(sessionStorage.getItem("demo:subscription-return:v1") ?? "");
     return {
       entryCount: entries.length,
       recoveryEntryCount: recovery.length,
       publicConfigurationIsExact: Object.keys(publicConfiguration).sort().join(",") === "apiBaseUrl,locale,priceKey,siteKey" &&
         publicConfiguration.apiBaseUrl === expected.apiBaseUrl && publicConfiguration.siteKey === expected.siteKey &&
         publicConfiguration.priceKey === expected.priceKey && publicConfiguration.locale === expected.locale,
+      subscriptionReturnConfigurationIsExact: Object.keys(subscriptionReturnConfiguration).sort().join(",") === "apiBaseUrl,siteKey" &&
+        subscriptionReturnConfiguration.apiBaseUrl === expected.apiBaseUrl && subscriptionReturnConfiguration.siteKey === expected.siteKey,
       keyIsNamespaced: key === `generic-payments:v1:${encodeURIComponent(expected.apiBaseUrl)}:${expected.siteKey}:${expected.priceKey}`,
       hasExpectedFields:
         Object.keys(record).sort().join(",") === "apiBaseUrl,checkoutId,checkoutToken,confirmationMode,expiresAt,priceKey,providerType,siteKey,state,version" &&
