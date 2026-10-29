@@ -16,7 +16,7 @@ const gates = {
     'pnpm --dir frontend/sdk test --run', 'pnpm --dir frontend/sdk typecheck', 'pnpm --dir frontend/sdk build',
     'pnpm --dir frontend/admin test --run', 'pnpm --dir frontend/admin typecheck', 'pnpm --dir frontend/admin lint', 'pnpm --dir frontend/admin build',
     'pnpm --dir examples/demo-site install --frozen-lockfile',
-    'pnpm --dir examples/demo-site exec vitest run src/payment-return.test.ts src/vite-return-privacy.test.ts',
+    'pnpm --dir examples/demo-site exec vitest run src/payment-return.test.ts src/subscription-return.test.ts src/vite-return-privacy.test.ts',
     'pnpm --dir examples/demo-site build',
     'pnpm --dir examples/demo-site exec playwright install --with-deps chromium',
     'node --test --test-timeout=60000 --test-concurrency=1 examples/demo-site/tests/support/*.test.ts',
