@@ -16,6 +16,10 @@ public interface ProviderOperationStore {
      */
     ProviderOperation reserve(PaymentAccount account, ProviderOperation.Kind kind,
         UUID resourceId, String key, String fingerprint);
+    /** Explicit owned lane: defaults fail closed for older pure doubles. */
+    default ProviderOperation reserveOwnedBillingCustomer(PaymentAccount account, dev.genericpayments.platform.provider.application.model.ReadyClock ready) {
+        throw new UnsupportedOperationException("Owned Billing Customer reservation is unavailable");
+    }
     Optional<ProviderOperation> find(PaymentAccountId account, String key);
     Optional<ProviderOperation> findById(UUID id);
     /** Join manual recovery transaction; lock operation, original Account, resource in that order. */
