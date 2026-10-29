@@ -218,7 +218,7 @@ public class StripeBillingSteps {
         assertThat(response.getStatus()).as("Billing signed receipt HTTP status; payload withheld").isEqualTo(204);
     }
     private void processReceipt(String event) throws Exception {
-        signed(event);TestClock.set(Instant.now());identity();respond("GET","/v1/invoices/in_initial",invoices.getFirst().invoice());readGraph();
+        signed(event);TestClock.set(Instant.now().truncatedTo(ChronoUnit.MICROS));identity();respond("GET","/v1/invoices/in_initial",invoices.getFirst().invoice());readGraph();
         bean(SubscriptionInboxWorker.class).runOnce();
         assertThat(count("provider_inbox","payment_account_id=? and provider_event_id=? and status='PROCESSED'",account.id().value(),event)).isEqualTo(1);
     }
@@ -263,7 +263,7 @@ public class StripeBillingSteps {
         assertThat(http.calls()).allSatisfy(c->{assertThat(c.header("Stripe-Version")).isEqualTo("2026-09-30.endive");assertThat(c.header("Stripe-Account")).isNull();});
     }
     @When("its original zero Stripe trial invoice is reconciled") public void trialZero() {
-        TestClock.set(Instant.now());invoices.add(invoice("trial","subscription_create",start,end,"ZERO"));reconcile();
+        TestClock.set(Instant.now().truncatedTo(ChronoUnit.MICROS));invoices.add(invoice("trial","subscription_create",start,end,"ZERO"));reconcile();
     }
     @Then("trial access exists without a cash payment or payment succeeded fact") public void trialAccess() {
         assertThat(access().allowed()).isTrue();assertThat(access().reason()).isEqualTo(AccessDecision.Reason.TRIAL);assertThat(subscription().trial()).isEqualTo(new Subscription.Period(start,end));
@@ -367,7 +367,7 @@ public class StripeBillingSteps {
             preview.add("lines",JsonParser.parseString(page(List.of(credit,debit))));
             // Real provider quote anchors use UTC; align only the existing synthetic business fixture
             // before its common quote publication validates effectiveAt/TTL against business time.
-            TestClock.set(Instant.now());return preview.toString();
+            TestClock.set(Instant.now().truncatedTo(ChronoUnit.MICROS));return preview.toString();
         });
     }
     @When("the customer previews and confirms an allowed immediate Stripe upgrade") public void upgrade() {
