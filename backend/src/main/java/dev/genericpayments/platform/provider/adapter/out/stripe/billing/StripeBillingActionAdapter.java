@@ -46,6 +46,7 @@ public class StripeBillingActionAdapter implements SubscriptionClientSessionPort
   });
  }
  public Reply confirmAction(Command command,String token){
+  ownership.owned(command.account(),command.operation().subscriptionId());
   outside();return tx.requiresNew(()->{
    var grant=actions.billing(StripeBillingGrantTokens.hash(token)).orElseThrow(StripeBillingOwnership::mismatch);
    if(grant.consumedAt()==null||!StripeBillingGrantTokens.matches(token,grant.tokenDigest())||!grant.account().equals(command.account().id())||!grant.operation().equals(command.operation().id())
@@ -62,6 +63,7 @@ public class StripeBillingActionAdapter implements SubscriptionClientSessionPort
   return new SubscriptionClientSession("stripe",SubscriptionClientSession.Flow.PAYMENT,credentials.resolve(lookup.account()).publishableKey(),graph.clientSecret(),token,grant.expiresAt());
  }
  public OwnedSetupReceipt confirmPreparedSetup(Command command,String token){
+  ownership.owned(command.account(),command.operation().subscriptionId());
   outside();return tx.requiresNew(()->{
    var g=actions.billing(StripeBillingGrantTokens.hash(token)).orElseThrow(StripeBillingOwnership::mismatch);
    if(g.consumedAt()==null||g.binding().flow()!=SubscriptionClientSession.Flow.SETUP||!StripeBillingGrantTokens.matches(token,g.tokenDigest())||!g.account().equals(command.account().id())||!g.operation().equals(command.operation().id())||!g.subscription().equals(command.operation().subscriptionId())||!g.site().equals(command.operation().siteId())||!g.customer().equals(command.operation().customerId())||g.binding().subscriptionReference()!=null||command.providerSubscriptionReference()!=null||!g.binding().operationKey().equals(command.operation().providerOperationKey()))throw StripeBillingOwnership.mismatch();

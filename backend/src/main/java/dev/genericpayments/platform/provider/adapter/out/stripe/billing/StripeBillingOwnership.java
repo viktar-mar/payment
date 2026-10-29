@@ -41,6 +41,8 @@ public final class StripeBillingOwnership {
     private final SubscriptionCatalogPort catalog;
     private final ProviderCatalogMappingPort mappings;
     private SubscriptionBillingProofStore proofs;
+    @org.springframework.beans.factory.annotation.Autowired private dev.genericpayments.platform.provider.application.port.out.StripeBillingClockStore clocks;
+    void clockOwnership(dev.genericpayments.platform.provider.application.port.out.StripeBillingClockStore clocks){this.clocks=Objects.requireNonNull(clocks);}
     @org.springframework.beans.factory.annotation.Autowired private SubscriptionPlanProofStore plans;
     @org.springframework.beans.factory.annotation.Autowired private SubscriptionRecoveryProofStore recoveryProofs;
     public StripeBillingOwnership(StripeCredentialResolver credentials,dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore steps,
@@ -179,6 +181,7 @@ public final class StripeBillingOwnership {
         var customer=customerStore.findById(s.siteId(),s.customerId()).orElseThrow(StripeBillingOwnership::conflict);
         if(!id.equals(s.id())||!a.id().equals(s.paymentAccountId())||!s.siteId().equals(site.id())||site.status()!=SiteStatus.ACTIVE
             ||!s.customerId().equals(customer.id())||!s.siteId().equals(customer.siteId())||customer.status()!=CustomerStatus.ACTIVE)throw conflict();
+        if(clocks!=null&&clocks.owner(a.id(),s.siteId(),s.customerId()).isPresent())throw unsupported();
         return s;
     }
     public SubscriptionOperation original(Subscription s,UUID id){
@@ -245,7 +248,7 @@ public final class StripeBillingOwnership {
     }
     public static void requireCurrentRemote(com.stripe.model.Subscription r,Subscription s,CustomerBinding b,StripeBillingSnapshotMapper.PublishedPrice p){requireRemoteShape(r,null,s,null,b,p,null,false);}
     private static void requireRemoteShape(com.stripe.model.Subscription r,PaymentAccount a,Subscription s,SubscriptionOperation o,CustomerBinding b,StripeBillingSnapshotMapper.PublishedPrice p,ProviderOperation step,boolean original){
-        if(r==null||r.getId()==null||!r.getId().matches("sub_[A-Za-z0-9]{1,251}")||!"subscription".equals(r.getObject())||!Boolean.FALSE.equals(r.getLivemode())
+        if(r==null||r.getTestClock()!=null||r.getId()==null||!r.getId().matches("sub_[A-Za-z0-9]{1,251}")||!"subscription".equals(r.getObject())||!Boolean.FALSE.equals(r.getLivemode())
             ||!b.providerReference().equals(r.getCustomer())||!p.terms().regularAmount().currency().equalsIgnoreCase(r.getCurrency())
             ||original&&(r.getMetadata()==null||!r.getMetadata().entrySet().containsAll(metadata(a,s,o).entrySet())||!inWindow(r.getCreated(),step))
             ||!"charge_automatically".equals(r.getCollectionMethod())||r.getBillingMode()==null||!"classic".equals(r.getBillingMode().getType())

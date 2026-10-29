@@ -46,6 +46,8 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
     private final ProviderCatalogMappingPort mappings;
     private final Clock clock;
     private final StripeBillingOwnership ownership;
+    @org.springframework.beans.factory.annotation.Autowired
+    void clockOwnership(dev.genericpayments.platform.provider.application.port.out.StripeBillingClockStore clocks){ownership.clockOwnership(clocks);}
     private SubscriptionBillingProofStore proofs;
     @org.springframework.beans.factory.annotation.Autowired private SubscriptionPlanProofStore planProofs;
     @org.springframework.beans.factory.annotation.Autowired private SubscriptionCancellationProofStore cancellationProofs;
@@ -85,6 +87,7 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
     @Transactional(propagation=Propagation.SUPPORTS,readOnly=true)
     public Capabilities capabilities(PaymentAccount account){ownership.requireAccount(account,false);return new Capabilities(planProofs!=null,cancellationProofs!=null,proofs!=null&&billingActions!=null&&billingActions.get().enabled()&&continuationGuard!=null,portalAdapter!=null);}
     public CreatePreparation prepareCreate(Command command){
+        ownership.owned(command.account(),command.operation().subscriptionId());
         if(!command.startTrial()||command.current().trialPolicy()!=dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.REQUIRED_BEFORE_TRIAL)return new ReadyForCreate();
         if(proofs==null)throw unsupported();
         var existing=proofs.setup(command.account().id(),command.operation().id());
