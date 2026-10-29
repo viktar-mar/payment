@@ -8,6 +8,7 @@ import dev.genericpayments.platform.provider.application.model.ProviderOperation
 import dev.genericpayments.platform.provider.application.port.out.*;
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
 import dev.genericpayments.platform.sites.domain.SiteId;
+import java.sql.SQLException;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -141,6 +142,107 @@ class StripeBillingBindingIntegrationTest extends ProviderTestFixture {
             UUID.randomUUID(), billingAccount.id().value(), site.value(), customer.value(), "cus_unproved", op.id())).isInstanceOf(DataIntegrityViolationException.class);
         var binding = bindings.bindCustomer(billingAccount.id(), site, customer, "cus_owned", op.id());
         assertThatThrownBy(() -> jdbc.update("update stripe_billing_customers set provider_reference='cus_changed' where id=?", binding.id())).isInstanceOf(DataIntegrityViolationException.class);
+    }
+    // Each attempted row has no competing binding: only the named original-receipt dimension differs.
+    @Test void databaseRequiresEveryOriginalCustomerReceiptComponent() {
+        var acknowledged = ack(reserve(customer), "cus_owned");
+        var otherAccount = addBillingAccount();
+        var otherCustomer = new CustomerId(UUID.randomUUID());
+        addCustomer(site, otherCustomer);
+        var receiptColumns = "creation_operation_id, payment_account_id, customer_id, creation_operation_kind, provider_reference";
+
+        databaseRejects("23503", receiptColumns, () -> insertBinding(UUID.randomUUID(), billingAccount.id().value(),
+            site.value(), customer.value(), "cus_owned", UUID.randomUUID()));
+        databaseRejects("23503", receiptColumns, () -> insertBinding(UUID.randomUUID(), otherAccount,
+            site.value(), customer.value(), "cus_owned", acknowledged.id()));
+        databaseRejects("23503", receiptColumns, () -> insertBinding(UUID.randomUUID(), billingAccount.id().value(),
+            site.value(), otherCustomer.value(), "cus_owned", acknowledged.id()));
+        databaseRejects("23503", receiptColumns, () -> insertBinding(UUID.randomUUID(), billingAccount.id().value(),
+            site.value(), customer.value(), "cus_unproved", acknowledged.id()));
+
+        // A schema-valid receipt of another kind must not serve as CUSTOMER_CREATE proof.
+        // Raw SQL intentionally bypasses the store resource guard to isolate the composite FK's kind.
+        var wrongKind = insertAcknowledgedReceipt(customer.value(), "PRODUCT_CREATE", "cus_wrongkind");
+        databaseRejects("23503", receiptColumns, () -> insertBinding(UUID.randomUUID(), billingAccount.id().value(),
+            site.value(), customer.value(), "cus_wrongkind", wrongKind));
+        assertThat(count("stripe_billing_customers")).isZero();
+        assertThat(bindings.bindCustomer(billingAccount.id(), site, customer, "cus_owned", acknowledged.id())
+            .creationOperationId()).isEqualTo(acknowledged.id());
+    }
+    // Receipt/account proof is valid; each row violates only one component of (site_id,customer_id).
+    @Test void databaseRequiresTheCustomerToBelongToTheExactSite() {
+        var acknowledged = ack(reserve(customer), "cus_owned");
+        var otherSite = UUID.randomUUID();
+        jdbc.update("""
+            insert into sites(id,site_key,display_name,status,payment_account_id,payment_method_policy,created_at,updated_at,version)
+            values (?,'other-customer-scope','Other','ACTIVE',?,'AUTOMATIC',now(),now(),0)
+            """, otherSite, billingAccount.id().value());
+        databaseRejects("23503", "site_id, customer_id", () -> insertBinding(UUID.randomUUID(), billingAccount.id().value(),
+            otherSite, customer.value(), "cus_owned", acknowledged.id()));
+
+        // No customers row exists for this resource, but every receipt FK field matches.
+        var missingCustomer = UUID.randomUUID();
+        var receipt = insertAcknowledgedReceipt(missingCustomer, "CUSTOMER_CREATE", "cus_missingcustomer");
+        databaseRejects("23503", "site_id, customer_id", () -> insertBinding(UUID.randomUUID(), billingAccount.id().value(),
+            site.value(), missingCustomer, "cus_missingcustomer", receipt));
+        assertThat(count("stripe_billing_customers")).isZero();
+    }
+    // SQLSTATE and failed key columns prevent a later FK rejection from masking a removed unique key.
+    @Test void databaseRejectsDuplicateCustomerScope() {
+        var acknowledged = ack(reserve(customer), "cus_owned");
+        bindings.bindCustomer(billingAccount.id(), site, customer, "cus_owned", acknowledged.id());
+        databaseRejects("23505", "payment_account_id, site_id, customer_id", () -> insertBinding(UUID.randomUUID(),
+            billingAccount.id().value(), site.value(), customer.value(), "cus_another", UUID.randomUUID()));
+        assertThat(count("stripe_billing_customers")).isEqualTo(1);
+    }
+    @Test void databaseRejectsDuplicateAccountProviderReference() {
+        var acknowledged = ack(reserve(customer), "cus_owned");
+        bindings.bindCustomer(billingAccount.id(), site, customer, "cus_owned", acknowledged.id());
+        var otherCustomer = new CustomerId(UUID.randomUUID());
+        addCustomer(site, otherCustomer);
+        databaseRejects("23505", "payment_account_id, provider_reference", () -> insertBinding(UUID.randomUUID(),
+            billingAccount.id().value(), site.value(), otherCustomer.value(), "cus_owned", UUID.randomUUID()));
+        assertThat(count("stripe_billing_customers")).isEqualTo(1);
+    }
+    @Test void databaseRejectsReusingTheOriginalCreationOperation() {
+        var acknowledged = ack(reserve(customer), "cus_owned");
+        bindings.bindCustomer(billingAccount.id(), site, customer, "cus_owned", acknowledged.id());
+        var otherCustomer = new CustomerId(UUID.randomUUID());
+        addCustomer(site, otherCustomer);
+        var otherAccount = addBillingAccount();
+        databaseRejects("23505", "creation_operation_id", () -> insertBinding(UUID.randomUUID(), otherAccount,
+            site.value(), otherCustomer.value(), "cus_other", acknowledged.id()));
+        assertThat(count("stripe_billing_customers")).isEqualTo(1);
+    }
+    UUID addBillingAccount() {
+        var id = UUID.randomUUID();
+        jdbc.update("""
+            insert into payment_accounts values (?,?,'STRIPE','SANDBOX','ACTIVE','acct_other','stripe-sandbox-default',now(),0)
+            """, id, "other-billing-" + id);
+        return id;
+    }
+    UUID insertAcknowledgedReceipt(UUID resource, String kind, String reference) {
+        var id = UUID.randomUUID();
+        jdbc.update("""
+            insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,
+                resource_id,operation_key,fingerprint,status,provider_reference,first_dispatched_at,retry_before)
+            values (?,?,'acct_billing','stripe-sandbox-default',?,?,?,'raw-constraint-facts',
+                'ACKNOWLEDGED',?,now(),now()+interval '23 hours')
+            """, id, billingAccount.id().value(), kind, resource, "raw-constraint-" + id, reference);
+        return id;
+    }
+    void insertBinding(UUID id, UUID accountId, UUID siteId, UUID customerId, String reference, UUID receipt) {
+        jdbc.update("""
+            insert into stripe_billing_customers(id,payment_account_id,site_id,customer_id,provider_reference,creation_operation_id)
+            values (?,?,?,?,?,?)
+            """, id, accountId, siteId, customerId, reference, receipt);
+    }
+    static void databaseRejects(String sqlState, String keyColumns, org.assertj.core.api.ThrowableAssert.ThrowingCallable action) {
+        assertThatThrownBy(action).isInstanceOfSatisfying(DataIntegrityViolationException.class, failure ->
+            assertThat(failure.getMostSpecificCause()).isInstanceOfSatisfying(SQLException.class, cause -> {
+                assertThat(cause.getSQLState()).isEqualTo(sqlState);
+                assertThat(cause.getMessage()).contains("Key (" + keyColumns + ")=");
+            }));
     }
     ProviderOperation reserve(CustomerId id) { return operations.reserve(billingAccount, ProviderOperation.Kind.valueOf("CUSTOMER_CREATE"), id.value(), "customer-" + id.value(), "facts-" + id.value()); }
     ProviderOperation ack(ProviderOperation op, String ref) { var c = operations.claim(op.id(), "owner", Instant.now(), LEASE).orElseThrow(); return operations.acknowledge(op.id(), "owner", c.version(), ref); }

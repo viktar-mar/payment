@@ -8,6 +8,7 @@ import dev.genericpayments.platform.provider.application.model.ProviderOperation
 import dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore;
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
 import dev.genericpayments.platform.subscriptions.domain.*;
+import java.sql.SQLException;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -67,10 +68,52 @@ class StripeSubscriptionOperationIntegrationTest extends SubscriptionFactFixture
         assertThatThrownBy(()->steps.reserve(account,ProviderOperation.Kind.INVOICE_PAY,operation.id(),"future-kind","facts")).isInstanceOf(PaymentApplicationException.class);
     }
     @Test void lifecycleOperationLockDoesNotInvertProviderAccountOwnershipLocks() throws Exception {
-        try(var executor=Executors.newVirtualThreadPerTaskExecutor()){
-            tx.required(()->{operations.lock(operation.id());var future=executor.submit(()->claim(reserve()));
-                try{assertThat(future.get(3,TimeUnit.SECONDS).status()).isEqualTo(ProviderOperation.Status.DISPATCHING);}
-                catch(Exception failure){throw new AssertionError("Provider step blocked behind lifecycle lock",failure);}return null;});
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            tx.required(() -> {
+                assertThat(operations.lock(operation.id())).isEqualTo(operation);
+                assertLifecycleRowIsLocked(executor);
+                var future = executor.submit(() -> {
+                    var claimed = claim(reserve());
+                    assertThat(claimed.status()).isEqualTo(ProviderOperation.Status.DISPATCHING);
+                    return steps.acknowledge(claimed.id(), "owner", claimed.version(), "sub_owned");
+                });
+                try {
+                    var acknowledged = future.get(3, TimeUnit.SECONDS);
+                    assertThat(acknowledged.status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
+                    assertThat(acknowledged.resourceId()).isEqualTo(operation.id());
+                    assertThat(acknowledged.accountId()).isEqualTo(account.id());
+                    assertThat(acknowledged.kind()).isEqualTo(ProviderOperation.Kind.SUBSCRIPTION_CREATE);
+                    assertThat(acknowledged.operationKey()).isEqualTo(operation.providerOperationKey());
+                    assertThat(acknowledged.providerReference()).isEqualTo("sub_owned");
+                    assertThat(steps.findById(acknowledged.id())).contains(acknowledged);
+                    assertLifecycleRowIsLocked(executor);
+                    assertThat(operations.lock(operation.id())).isEqualTo(operation);
+                } catch (Exception failure) {
+                    throw new AssertionError("Provider claim/ACK blocked behind lifecycle lock", failure);
+                }
+                return null;
+            });
+        }
+        assertThat(sub(original.id()).billingStatus()).isEqualTo(Subscription.Status.INCOMPLETE);
+        assertThat(sub(original.id()).providerReference()).isNull();
+        assertThat(sub(original.id()).entitledPrice()).isNull();
+        assertThat(sub(original.id()).paidThrough()).isNull();
+        assertThat(count("payments")).isZero();
+        assertThat(count("subscription_billing_records")).isZero();
+    }
+    void assertLifecycleRowIsLocked(ExecutorService executor) {
+        // A separate SQL transaction must observe the original row lock before and after ACK.
+        // NOWAIT avoids sleeps and proves a real held lock rather than a merely scheduled worker.
+        var probe = executor.submit(() -> catchThrowable(() -> tx.required(() ->
+            jdbc.queryForObject("select id from subscription_operations where id=? for update nowait", UUID.class, operation.id()))));
+        try {
+            assertThat(probe.get(3, TimeUnit.SECONDS)).isNotNull().hasRootCauseInstanceOf(SQLException.class)
+                .satisfies(failure -> {
+                    while (failure.getCause() != null) failure = failure.getCause();
+                    assertThat(((SQLException) failure).getSQLState()).isEqualTo("55P03");
+                });
+        } catch (Exception failure) {
+            throw new AssertionError("Could not prove the lifecycle row lock is held", failure);
         }
     }
     @Test void siteAccountSwitchDoesNotRelocateTheOriginalSubscriptionStep(){
