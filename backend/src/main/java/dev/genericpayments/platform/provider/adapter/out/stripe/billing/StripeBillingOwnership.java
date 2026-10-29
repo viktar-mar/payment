@@ -248,9 +248,14 @@ public final class StripeBillingOwnership {
     }
     public static void requireCurrentRemote(com.stripe.model.Subscription r,Subscription s,CustomerBinding b,StripeBillingSnapshotMapper.PublishedPrice p){requireRemoteShape(r,null,s,null,b,p,null,false);}
     private static void requireRemoteShape(com.stripe.model.Subscription r,PaymentAccount a,Subscription s,SubscriptionOperation o,CustomerBinding b,StripeBillingSnapshotMapper.PublishedPrice p,ProviderOperation step,boolean original){
-        if(r==null||r.getTestClock()!=null||r.getId()==null||!r.getId().matches("sub_[A-Za-z0-9]{1,251}")||!"subscription".equals(r.getObject())||!Boolean.FALSE.equals(r.getLivemode())
-            ||!b.providerReference().equals(r.getCustomer())||!p.terms().regularAmount().currency().equalsIgnoreCase(r.getCurrency())
-            ||original&&(r.getMetadata()==null||!r.getMetadata().entrySet().containsAll(metadata(a,s,o).entrySet())||!inWindow(r.getCreated(),step))
+        if(r==null||r.getTestClock()!=null)throw mismatch();
+        requireRemoteStructure(r,b.providerReference(),p);
+        if(original&&(r.getMetadata()==null||!r.getMetadata().entrySet().containsAll(metadata(a,s,o).entrySet())||!inWindow(r.getCreated(),step)))throw mismatch();
+    }
+    /** Common native shape; each caller separately establishes its own time and clock lineage. */
+    private static void requireRemoteStructure(com.stripe.model.Subscription r,String customer,StripeBillingSnapshotMapper.PublishedPrice p){
+        if(r==null||r.getId()==null||!r.getId().matches("sub_[A-Za-z0-9]{1,251}")||!"subscription".equals(r.getObject())||!Boolean.FALSE.equals(r.getLivemode())
+            ||!customer.equals(r.getCustomer())||!p.terms().regularAmount().currency().equalsIgnoreCase(r.getCurrency())
             ||!"charge_automatically".equals(r.getCollectionMethod())||r.getBillingMode()==null||!"classic".equals(r.getBillingMode().getType())
             ||r.getPauseCollection()!=null||r.getPaymentSettings()==null
             ||!List.of("card").equals(r.getPaymentSettings().getPaymentMethodTypes())||!"on_subscription".equals(r.getPaymentSettings().getSaveDefaultPaymentMethod())
@@ -262,6 +267,30 @@ public final class StripeBillingOwnership {
             ||price.getRecurring()==null||!t.interval().name().equalsIgnoreCase(price.getRecurring().getInterval())||!Objects.equals(1L,price.getRecurring().getIntervalCount())
             ||!"licensed".equals(price.getRecurring().getUsageType())||price.getMetadata()==null||!t.priceId().value().toString().equals(price.getMetadata().get("local_price_id"))
             ||!Integer.toString(t.version()).equals(price.getMetadata().get("local_price_version")))throw mismatch();
+    }
+    static void requireOwnedInitialRemote(com.stripe.model.Subscription r,dev.genericpayments.platform.provider.application.model.OwnedClockSubscription intent){
+        requireRemoteStructure(r,intent.customerReference(),new StripeBillingSnapshotMapper.PublishedPrice(intent.terms(),intent.priceReference(),intent.productReference()));
+        if(!intent.clock().reference().equals(r.getTestClock())||r.getCreated()==null||r.getCreated()<=0
+            ||r.getMetadata()==null||!r.getMetadata().entrySet().containsAll(metadata(intent).entrySet())
+            ||!Set.of("incomplete","active").contains(r.getStatus())||r.getTrialStart()!=null||r.getTrialEnd()!=null
+            ||r.getSchedule()!=null||r.getPendingUpdate()!=null||r.getCancelAt()!=null||Boolean.TRUE.equals(r.getCancelAtPeriodEnd())||r.getCanceledAt()!=null||r.getEndedAt()!=null)throw mismatch();
+        var item=r.getItems().getData().getFirst();long frozen=intent.clock().frozenTime();
+        if(item.getCurrentPeriodStart()==null||item.getCurrentPeriodEnd()==null||item.getCurrentPeriodStart()<=0
+            ||item.getCurrentPeriodStart()>frozen||item.getCurrentPeriodEnd()<=frozen)throw mismatch();
+    }
+    static Map<String,String> metadata(dev.genericpayments.platform.provider.application.model.OwnedClockSubscription intent){
+        var owner=intent.clock().owner();return Map.of("account_id",owner.account().value().toString(),"site_id",owner.site().value().toString(),
+            "customer_id",owner.customer().value().toString(),"subscription_id",intent.subscription().toString(),"operation_id",intent.createOperation().toString());
+    }
+    static SubscriptionCreateParams.Builder paidCreate(String customer,String price,Map<String,String> metadata){
+        return SubscriptionCreateParams.builder().setCustomer(customer)
+            .setBillingMode(SubscriptionCreateParams.BillingMode.builder().setType(SubscriptionCreateParams.BillingMode.Type.CLASSIC).build())
+            .setCollectionMethod(SubscriptionCreateParams.CollectionMethod.CHARGE_AUTOMATICALLY)
+            .setPaymentBehavior(SubscriptionCreateParams.PaymentBehavior.DEFAULT_INCOMPLETE)
+            .setPaymentSettings(SubscriptionCreateParams.PaymentSettings.builder()
+                .addPaymentMethodType(SubscriptionCreateParams.PaymentSettings.PaymentMethodType.CARD)
+                .setSaveDefaultPaymentMethod(SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION).build())
+            .addItem(SubscriptionCreateParams.Item.builder().setPrice(price).setQuantity(1L).build()).putAllMetadata(metadata);
     }
     public static boolean inWindow(Long timestamp,ProviderOperation step){return timestamp!=null&&step.firstDispatchedAt()!=null&&step.retryBefore()!=null
         &&timestamp>=step.firstDispatchedAt().getEpochSecond()&&timestamp<step.retryBefore().getEpochSecond();}

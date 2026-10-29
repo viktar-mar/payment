@@ -180,16 +180,7 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
         String key=guard.requireDispatch(step,command.account(),fingerprint,providerClock.instant());
         com.stripe.model.Subscription remote;
         try{
-            var params=SubscriptionCreateParams.builder()
-                .setCustomer(b.providerReference())
-                .setBillingMode(SubscriptionCreateParams.BillingMode.builder().setType(SubscriptionCreateParams.BillingMode.Type.CLASSIC).build())
-                .setCollectionMethod(SubscriptionCreateParams.CollectionMethod.CHARGE_AUTOMATICALLY)
-                .setPaymentBehavior(SubscriptionCreateParams.PaymentBehavior.DEFAULT_INCOMPLETE)
-                .setPaymentSettings(SubscriptionCreateParams.PaymentSettings.builder()
-                    .addPaymentMethodType(SubscriptionCreateParams.PaymentSettings.PaymentMethodType.CARD)
-                    .setSaveDefaultPaymentMethod(SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION).build())
-                .addItem(SubscriptionCreateParams.Item.builder().setPrice(p.providerPriceReference()).setQuantity(1L).build())
-                .putAllMetadata(ownership.metadata(command.account(),s,o));
+            var params=StripeBillingOwnership.paidCreate(b.providerReference(),p.providerPriceReference(),ownership.metadata(command.account(),s,o));
             if(trial!=null){params.setTrialEnd(trial.requestedEnd()).setTrialSettings(SubscriptionCreateParams.TrialSettings.builder().setEndBehavior(SubscriptionCreateParams.TrialSettings.EndBehavior.builder().setMissingPaymentMethod(SubscriptionCreateParams.TrialSettings.EndBehavior.MissingPaymentMethod.PAUSE).build()).build());if(setup!=null)params.setDefaultPaymentMethod(setup.method());}
             remote=client(command.account()).v1().subscriptions().create(params.build(),RequestOptions.builder().setIdempotencyKey(key).build());
             if(trial==null)ownership.requireRemote(remote,command.account(),s,o,b,p,step);
