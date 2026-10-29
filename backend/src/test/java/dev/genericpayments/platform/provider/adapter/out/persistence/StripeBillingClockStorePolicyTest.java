@@ -28,6 +28,33 @@ class StripeBillingClockStorePolicyTest {
         assertThat(store.claim(db.operation.id(),"next",now,Duration.ofSeconds(60))).isEmpty();
         assertThat(db.dispatchUpdates).isZero();
     }
+    @Test void consumedClockStillRejectsStoppedAuthority() { consumedAuthorityRefused(ProviderOperation.Kind.TEST_CLOCK_CREATE,"stopped"); }
+    @Test void consumedCustomerStillRejectsStoppedAuthority() { consumedAuthorityRefused(ProviderOperation.Kind.CUSTOMER_CREATE,"stopped"); }
+    @Test void consumedClockStillRejectsChangedPinnedAccount() { consumedAuthorityRefused(ProviderOperation.Kind.TEST_CLOCK_CREATE,"account"); }
+    @Test void consumedCustomerStillRejectsChangedPinnedAccount() { consumedAuthorityRefused(ProviderOperation.Kind.CUSTOMER_CREATE,"account"); }
+    @Test void consumedClockStillRejectsForeignOriginalIdentity() { consumedAuthorityRefused(ProviderOperation.Kind.TEST_CLOCK_CREATE,"identity"); }
+    @Test void consumedCustomerStillRejectsForeignOriginalIdentity() { consumedAuthorityRefused(ProviderOperation.Kind.CUSTOMER_CREATE,"identity"); }
+    private void consumedAuthorityRefused(ProviderOperation.Kind kind,String change) {
+        for(var status:List.of(ProviderOperation.Status.UNKNOWN,ProviderOperation.Status.DISPATCHING)) {
+            var step=operation(kind,status);
+            if(change.equals("identity"))step=new ProviderOperation(step.id(),step.accountId(),step.externalAccountId(),step.credentialsRef(),step.kind(),step.resourceId(),
+                step.operationKey(),"foreign-fingerprint",step.status(),step.providerReference(),step.firstDispatchedAt(),step.retryBefore(),step.leaseOwner(),step.leaseExpiresAt(),step.version());
+            var db=new InertJdbc(step,true);db.stopped=change.equals("stopped");db.pinnedAccountChanged=change.equals("account");
+            assertThatThrownBy(()->new JdbcProviderOperationStore(db).claim(db.operation.id(),"next",now,Duration.ofSeconds(60)))
+                .isInstanceOfSatisfying(PaymentApplicationException.class,e->assertThat(e.code()).isEqualTo("PROVIDER_OPERATION_CONFLICT"));
+            assertThat(db.dispatchUpdates).isZero();assertThat(db.inserts).isZero();
+        }
+    }
+    @Test void liveClockAndCustomerClaimLoserDoesNotWriteOrInvalidateWinner() {
+        for(var kind:List.of(ProviderOperation.Kind.TEST_CLOCK_CREATE,ProviderOperation.Kind.CUSTOMER_CREATE)) {
+            var old=operation(kind,ProviderOperation.Status.DISPATCHING);
+            var live=new ProviderOperation(old.id(),old.accountId(),old.externalAccountId(),old.credentialsRef(),old.kind(),old.resourceId(),old.operationKey(),old.fingerprint(),
+                old.status(),null,now.minusSeconds(10),now.plusSeconds(82790),"winner",now.plusSeconds(50),old.version());
+            var db=new InertJdbc(live,true);
+            assertThat(new JdbcProviderOperationStore(db).claim(live.id(),"loser",now,Duration.ofSeconds(60))).isEmpty();
+            assertThat(db.operation).isEqualTo(live);assertThat(db.dispatchUpdates).isZero();assertThat(db.inserts).isZero();
+        }
+    }
     @Test void ordinaryCustomerStillReclaimsItsOriginalKey() {
         var db=new InertJdbc(operation(ProviderOperation.Kind.CUSTOMER_CREATE,ProviderOperation.Status.UNKNOWN),false);
         assertThat(new JdbcProviderOperationStore(db).claim(db.operation.id(),"next",now,Duration.ofSeconds(60))).isPresent();
@@ -100,7 +127,7 @@ class StripeBillingClockStorePolicyTest {
             status==ProviderOperation.Status.DISPATCHING?"first":null,status==ProviderOperation.Status.DISPATCHING?now.minusSeconds(60):null,0);
     }
     final class InertJdbc extends JdbcTemplate {
-        final ProviderOperation operation; final boolean owned; boolean stopped,bindingFailure; int dispatchUpdates,inserts;
+        final ProviderOperation operation; final boolean owned; boolean stopped,bindingFailure,pinnedAccountChanged; int dispatchUpdates,inserts;
         InertJdbc(ProviderOperation operation,boolean owned){this.operation=operation;this.owned=owned;}
         @Override @SuppressWarnings("unchecked") public <T> List<T> query(String sql,RowMapper<T> mapper,Object... args) {
             if(sql.contains("update provider_operations")){dispatchUpdates++; return (List<T>)List.of(operation);}
@@ -110,6 +137,7 @@ class StripeBillingClockStorePolicyTest {
             throw new AssertionError("Unexpected SQL template: "+sql);
         }
         @Override @SuppressWarnings("unchecked") public <T> List<T> queryForList(String sql,Class<T> type,Object... args) {
+            if(sql.contains("from payment_accounts") && pinnedAccountChanged)return List.of();
             if(sql.contains("select site_id from customers"))return (List<T>)List.of(owner.site().value());
             if(sql.contains("from stripe_billing_clock_intents")) {
                 if(!owned || (sql.contains("stopped_at is null") && stopped && !(sql.contains("BINDING_FAILED")&&bindingFailure)))return List.of();

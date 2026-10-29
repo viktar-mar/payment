@@ -18,6 +18,26 @@ import static org.assertj.core.api.Assertions.*;
 class StripeBillingOwnedSubscriptionPolicyTest {
     @Test void unknownOriginalOwnedSubscriptionCannotPostAgain() { refuses(ProviderOperation.Status.UNKNOWN); }
     @Test void abandonedOriginalOwnedSubscriptionCannotPostAgain() { refuses(ProviderOperation.Status.DISPATCHING); }
+    @Test void consumedSubscriptionStillRejectsStoppedAuthority() { consumedAuthorityRefused("stopped"); }
+    @Test void consumedSubscriptionStillRejectsChangedPinnedAccount() { consumedAuthorityRefused("account"); }
+    @Test void consumedSubscriptionStillRejectsForeignOriginalIdentity() { consumedAuthorityRefused("identity"); }
+    private void consumedAuthorityRefused(String change) {
+        for(var status:List.of(ProviderOperation.Status.UNKNOWN,ProviderOperation.Status.DISPATCHING)) {
+            var db=consumed(status);db.stopped=change.equals("stopped");db.pinnedAccountChanged=change.equals("account");
+            if(change.equals("identity")) {
+                var s=db.step;db.step=new ProviderOperation(s.id(),s.accountId(),s.externalAccountId(),s.credentialsRef(),s.kind(),s.resourceId(),s.operationKey(),
+                    "foreign-fingerprint",s.status(),s.providerReference(),s.firstDispatchedAt(),s.retryBefore(),s.leaseOwner(),s.leaseExpiresAt(),s.version());
+            }
+            assertThatThrownBy(()->new JdbcProviderOperationStore(db).claim(db.step.id(),"next",db.now,Duration.ofSeconds(60)))
+                .isInstanceOfSatisfying(PaymentApplicationException.class,e->assertThat(e.code()).isEqualTo("PROVIDER_OPERATION_CONFLICT"));
+            assertThat(db.updates).isZero();assertThat(db.receipt).isNull();
+        }
+    }
+    @Test void liveSubscriptionClaimLoserDoesNotWriteOrInvalidateWinner() {
+        var db=new AckJdbc();var winner=db.step;
+        assertThat(new JdbcProviderOperationStore(db).claim(winner.id(),"loser",db.now,Duration.ofSeconds(60))).isEmpty();
+        assertThat(db.step).isEqualTo(winner);assertThat(db.updates).isZero();assertThat(db.receipt).isNull();
+    }
     @Test void genericAckRefusesOwnedSubscriptionBeforeAnyUpdate() { genericAckRefused(false); }
     @Test void participatingGenericAckRefusesOwnedSubscriptionBeforeAnyUpdate() { genericAckRefused(true); }
     private void genericAckRefused(boolean participating) {
@@ -53,7 +73,7 @@ class StripeBillingOwnedSubscriptionPolicyTest {
             "price_owned","prod_owned","d".repeat(64),now.minusSeconds(80));
         ProviderOperation step=new ProviderOperation(UUID.randomUUID(),account,"acct_test","alias",ProviderOperation.Kind.SUBSCRIPTION_CREATE,operation,intent.operationKey(),intent.fingerprint(),
             ProviderOperation.Status.DISPATCHING,null,now.minusSeconds(10),now.plusSeconds(82790),"winner",now.plusSeconds(50),1);
-        OwnedClockSubscriptionReceipt receipt;int updates;
+        OwnedClockSubscriptionReceipt receipt;int updates;boolean stopped,pinnedAccountChanged;
         @Override @SuppressWarnings("unchecked") public <T> List<T> query(String sql,RowMapper<T> mapper,Object... args) {
             Object result;
             if(sql.contains("update provider_operations")) {
@@ -70,6 +90,8 @@ class StripeBillingOwnedSubscriptionPolicyTest {
             return (List<T>)List.of(result);
         }
         @Override @SuppressWarnings("unchecked") public <T> List<T> queryForList(String sql,Class<T> type,Object... args) {
+            if(sql.contains("from payment_accounts") && pinnedAccountChanged)return List.of();
+            if(sql.contains("from stripe_billing_clock_intents") && sql.contains("stopped_at is null") && stopped)return List.of();
             return (List<T>)List.of(sql.startsWith("select subscription_id")?subscription:step.id());
         }
         @Override public int update(String sql,Object... args) {
@@ -78,20 +100,16 @@ class StripeBillingOwnedSubscriptionPolicyTest {
         }
     }
     private void refuses(ProviderOperation.Status status) {
-        Instant now=Instant.parse("2026-10-29T10:00:00Z");
-        var step=new ProviderOperation(UUID.randomUUID(),new PaymentAccountId(UUID.randomUUID()),"acct_test","alias",
-            ProviderOperation.Kind.SUBSCRIPTION_CREATE,UUID.randomUUID(),"original-key","fingerprint",status,null,
-            now.minusSeconds(120),now.plusSeconds(3600),null,null,1);
-        var db=new JdbcTemplate() {
-            @Override @SuppressWarnings("unchecked") public <T> List<T> query(String sql,RowMapper<T> mapper,Object... args) {
-                return (List<T>)List.of(step);
-            }
-            @Override @SuppressWarnings("unchecked") public <T> List<T> queryForList(String sql,Class<T> type,Object... args) {
-                // Existing ordinary lifecycle fixture; the new persisted intent marks its one-use authority.
-                if(sql.contains("join stripe_billing_clock_intents"))return List.of();
-                return (List<T>)List.of(step.id());
-            }
-        };
-        assertThat(new JdbcProviderOperationStore(db).claim(step.id(),"second",now,Duration.ofSeconds(60))).isEmpty();
+        var db=consumed(status);var original=db.step;
+        assertThat(new JdbcProviderOperationStore(db).claim(original.id(),"second",db.now,Duration.ofSeconds(60))).isEmpty();
+        assertThat(db.step).isEqualTo(original);assertThat(db.updates).isZero();assertThat(db.receipt).isNull();
+    }
+    private AckJdbc consumed(ProviderOperation.Status status) {
+        var db=new AckJdbc();var s=db.step;
+        // This original attempt starts after admission, has expired, and remains inside its 23-hour bound.
+        db.step=new ProviderOperation(s.id(),s.accountId(),s.externalAccountId(),s.credentialsRef(),s.kind(),s.resourceId(),s.operationKey(),s.fingerprint(),status,null,
+            db.now.minusSeconds(70),db.now.plusSeconds(82730),status==ProviderOperation.Status.DISPATCHING?"winner":null,
+            status==ProviderOperation.Status.DISPATCHING?db.now.minusSeconds(10):null,s.version());
+        return db;
     }
 }

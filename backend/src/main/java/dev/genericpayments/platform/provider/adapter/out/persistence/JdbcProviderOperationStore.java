@@ -137,9 +137,9 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
             || (current.leaseExpiresAt() != null && now.isBefore(current.leaseExpiresAt()))
             || (current.firstDispatchedAt() != null && (now.isBefore(current.firstDispatchedAt())
                 || !now.isBefore(current.retryBefore())))) return Optional.empty();
-        if(firstDispatchOnly(current) && current.firstDispatchedAt()!=null) return Optional.empty();
         requirePinnedAccount(current);
         requireResource(current.accountId(), current.kind(), current.resourceId(),current.operationKey(),current.fingerprint());
+        if(firstDispatchOnly(current) && current.firstDispatchedAt()!=null) return Optional.empty();
         if(current.kind()==Kind.SUBSCRIPTION_CREATE&&current.firstDispatchedAt()==null) {
             requireFirstSubscriptionDispatch(current);
             JdbcStripeBillingClockSubscriptionStore.operationIntent(jdbc,current.accountId(),current.resourceId())
