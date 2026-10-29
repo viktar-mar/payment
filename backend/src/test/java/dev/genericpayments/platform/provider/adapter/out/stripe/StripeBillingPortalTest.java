@@ -29,6 +29,31 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 /** Pinned Portal wire contract and actual local admission/publication boundaries. */
 class StripeBillingPortalTest {
+    @Test void actualInteractionCommandCanCreateNavigationThroughTheStrictPortalAdapter()throws Exception{
+        try(var f=new PortalCase()){
+            var state=new SubscriptionInteractionTransaction.State(f.fixture.local,f.fixture.account,f.policy,f.fixture.operation,true);
+            var command=SubscriptionInteractionTransaction.command(state);f.successResponses();
+            var navigation=new java.util.concurrent.atomic.AtomicReference<PortalNavigation>();
+            assertThatCode(()->navigation.set(f.adapter.create(command,RETURN))).doesNotThrowAnyException();
+            assertThat(command.recurringConsent()).isFalse();assertThat(command.startTrial()).isFalse();
+            assertThat(navigation.get().simulated()).isFalse();assertThat(navigation.get().navigationUrl()).isEqualTo(PortalCase.REAL_URL);
+            assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isEqualTo(1);
+        }
+    }
+    @Test void strictPortalAdapterStillRefusesPaymentConsent()throws Exception{
+        try(var f=new PortalCase()){
+            var ordinary=f.command();var consent=new Command(ordinary.account(),ordinary.operation(),ordinary.current(),null,ordinary.providerSubscriptionReference(),null,null,true,false);
+            assertThatThrownBy(()->f.adapter.create(consent,RETURN)).isInstanceOf(PaymentApplicationException.class);assertThat(f.fixture.graph.http.calls()).isEmpty();assertThat(f.saved).isNull();
+        }
+    }
+    @ParameterizedTest @ValueSource(strings={"CREATE_PAID","CREATE_TRIAL","SETUP","CHANGE","RECOVER","RESUME","CLEAR_CHANGE","CANCEL","WITHDRAW_CANCEL","RECONCILE"})
+    void otherInteractionCommandsRetainConsentAndOriginalCreateTrialDecision(String shape){
+        var f=new LocalCase();var s=f.local;var id=UUID.randomUUID();boolean trial=shape.equals("CREATE_TRIAL");
+        var kind=shape.startsWith("CREATE_")?SubscriptionOperation.Kind.CREATE:SubscriptionOperation.Kind.valueOf(shape);
+        var operation=new SubscriptionOperation(id,s.siteId(),s.customerId(),s.id(),kind,SubscriptionOperation.Status.RESERVED,"customer:owned","key","v1."+(trial?"trial":"paid")+"."+"a".repeat(64),"subscription:"+f.account.id().value()+":"+id+":"+kind,s.revision(),7,s.providerReference(),null,NOW,NOW,0);
+        var command=SubscriptionInteractionTransaction.command(new SubscriptionInteractionTransaction.State(s,f.account,f.policy,operation,true));
+        assertThat(command.recurringConsent()).isTrue();assertThat(command.startTrial()).isEqualTo(trial);assertThat(command.operation()).isSameAs(operation);
+    }
     @Test void documentedDisabledFeatureDefaultsRemainCompatibleWithoutEnablingAnAction()throws Exception{
         try(var f=new PortalCase()){
             var response=com.google.gson.JsonParser.parseString(f.config()).getAsJsonObject();var features=response.getAsJsonObject("features");features.getAsJsonObject("subscription_update").addProperty("proration_behavior","none");features.getAsJsonObject("subscription_cancel").getAsJsonObject("cancellation_reason").add("options",com.google.gson.JsonParser.parseString("[\"too_expensive\",\"missing_features\",\"switched_service\",\"unused\",\"other\"]"));
@@ -386,6 +411,8 @@ class StripeBillingPortalTest {
                 assertThat(command.providerSubscriptionReference()).isEqualTo("sub_owned");
                 assertThat(command.operation().policyVersion()).isEqualTo(7);
                 assertThat(command.operation().expectedRevision()).isEqualTo(f.local.revision());
+                assertThat(command.recurringConsent()).isFalse();
+                assertThat(command.startTrial()).isFalse();
             });
         }
 
