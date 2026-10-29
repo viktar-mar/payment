@@ -224,6 +224,20 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
             &&locked.stream().noneMatch(o->o.kind()==SubscriptionOperation.Kind.CANCEL||o.kind()==SubscriptionOperation.Kind.WITHDRAW_CANCEL)){
             projected=projected.scheduleCancellation(snapshot.cancellationAt(),now);change=SubscriptionEvent.Type.CANCEL_SCHEDULED;
         }
+        // Independently retrieved native state can withdraw an external schedule. The consumed
+        // revision/selected-operation/read-sequence fence above prevents an old null-state read
+        // from clearing a newer generation. It never supplies an owned command's missing proof.
+        if(unversioned&&original.cancellation()!=null&&projected.cancellation()!=null
+            &&original.billingStatus()==Subscription.Status.ACTIVE&&projected.billingStatus()==Subscription.Status.ACTIVE
+            &&snapshot.status()==Subscription.Status.ACTIVE&&snapshot.cancellationAt()==null
+            &&original.pendingChange()==null&&original.debt()==null&&original.trial()==null&&snapshot.trial()==null
+            &&Objects.equals(original.currentPeriod(),snapshot.period())&&original.billingPrice().equals(snapshot.billingPrice())
+            &&original.cancellation().effectiveAt().equals(SubscriptionCancellationTransaction.liveBoundary(original,now))
+            &&now.isBefore(original.cancellation().effectiveAt())&&snapshot.observedAt().isBefore(original.cancellation().effectiveAt())
+            &&!snapshot.observedAt().isBefore(original.updatedAt())
+            &&locked.stream().noneMatch(o->o.kind()!=SubscriptionOperation.Kind.PORTAL&&o.kind()!=SubscriptionOperation.Kind.RECONCILE)){
+            projected=projected.withdrawCancellation(now);change=SubscriptionEvent.Type.CANCEL_WITHDRAWN;
+        }
         if(projected!=original) {
             projected=subscriptions.save(copy(projected,projected.providerReference(),original.revision()+1,now),original.revision());
             for(var bill:appliedChangeBills)append(projected,command,SubscriptionEvent.Type.CHANGE_APPLIED,bill,"change:"+bill,now);

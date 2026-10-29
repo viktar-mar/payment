@@ -200,10 +200,12 @@ public final class StripeBillingMutationAdapter {
         requireBinding(c.account(),s,customer);
         var saved=cancellations.receipt(c.account().id(),o.id()).orElse(null);
         if(saved!=null){requireCancellationReceipt(c.account(),s,o,saved,steps,customer);return new Reply(Outcome.ACCEPTED,s.providerReference(),null);}
-        var prior=withdraw?cancellations.activeSchedule(c.account().id(),s.id(),boundary).orElseThrow(StripeBillingOwnership::mismatch):null;
+        var prior=withdraw?cancellations.activeSchedule(c.account().id(),s.id(),boundary).orElse(null):null;
+        var observed=withdraw&&prior==null?cancellations.observedSchedule(c.account().id(),s.id(),boundary).orElseThrow(StripeBillingOwnership::mismatch):null;
+        if(observed!=null&&(observed.event()==null||observed.revision()!=o.expectedRevision()||!boundary.equals(observed.boundary())))throw mismatch();
         if(prior!=null&&(prior.mode()!=SubscriptionCancellationProofStore.Mode.PERIOD_END||!prior.account().equals(c.account().id())
             ||!prior.subscription().equals(s.id())||!prior.reference().equals(s.providerReference())||!boundary.equals(prior.boundary())))throw mismatch();
-        String fp=cancellationFingerprint(c.account(),s,o,customer,mode,boundary,prior==null?null:prior.operation());
+        String fp=cancellationFingerprint(c.account(),s,o,customer,mode,boundary,prior==null?null:prior.operation(),observed);
         if(!Set.of(SubscriptionOperation.Status.PROCESSING,SubscriptionOperation.Status.UNKNOWN).contains(o.status())
             ||s.revision()!=o.expectedRevision()||!s.nonTerminal()||s.pendingChange()!=null||!immediate&&!clock.instant().isBefore(boundary))throw mismatch();
         if(withdraw){SubscriptionCancellationRules.requireWithdrawable(s,clock.instant());if(!boundary.equals(s.cancellation().effectiveAt()))throw mismatch();}
@@ -223,9 +225,11 @@ public final class StripeBillingMutationAdapter {
             if(immediate){
                 requireSafeImmediateInventory(client,s,customer);
             }else if(withdraw){
-                if(!Objects.equals(remote.getCancelAt(),boundary.getEpochSecond())&&!(replay&&remote.getCancelAt()==null&&!Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())))throw mismatch();
+                boolean nativeEnd=observed!=null&&remote.getCancelAt()==null&&Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())&&boundary.equals(itemPeriod(remote).end());
+                if(!Objects.equals(remote.getCancelAt(),boundary.getEpochSecond())&&!nativeEnd&&!(replay&&remote.getCancelAt()==null&&!Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())))throw mismatch();
             }else if(remote.getCancelAt()!=null&&!(replay&&remote.getCancelAt()==boundary.getEpochSecond())||Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())&&remote.getCancelAt()==null)throw mismatch();
             cancellations.authorize(s,o);
+            if(observed!=null)cancellations.requireObserved(s,observed);
             if(!immediate&&!clock.instant().isBefore(boundary))throw mismatch();
             String key=new ProviderOperationGuard().requireDispatch(step,c.account(),fp,securityClock.instant());
             if(immediate){
@@ -248,7 +252,8 @@ public final class StripeBillingMutationAdapter {
             // before it. Dispatch time or a later status-null read cannot replace this evidence.
             var received=securityClock.instant().truncatedTo(ChronoUnit.MICROS);if(!received.isBefore(boundary))throw mismatch();
             var fresh=ownership.lookupOperation(new Lookup(c.account(),s.id(),s.providerReference(),o.providerOperationKey()));if(!fresh.equals(o))throw mismatch();
-            cancellations.record(s,o,step,owner,mode,boundary,prior==null?null:prior.operation(),received);
+            if(observed==null)cancellations.record(s,o,step,owner,mode,boundary,prior==null?null:prior.operation(),received);
+            else cancellations.recordObserved(s,o,step,owner,observed,received);
             return new Reply(Outcome.ACCEPTED,s.providerReference(),null);
         }catch(StripeException|RuntimeException uncertain){steps.unknown(step.id(),owner,step.version());return new Reply(Outcome.UNKNOWN,null,null);}
     }
@@ -288,6 +293,14 @@ public final class StripeBillingMutationAdapter {
     public static String cancellationFingerprint(dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount a,
         dev.genericpayments.platform.subscriptions.domain.Subscription s,SubscriptionOperation o,StripeBillingBindingPort.CustomerBinding customer,
         SubscriptionCancellationProofStore.Mode mode,Instant boundary,UUID prior){
+        return cancellationFingerprint(a,s,o,customer,mode,boundary,prior,null);
+    }
+    public static String cancellationFingerprint(dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount a,
+        dev.genericpayments.platform.subscriptions.domain.Subscription s,SubscriptionOperation o,StripeBillingBindingPort.CustomerBinding customer,
+        SubscriptionCancellationProofStore.Mode mode,Instant boundary,UUID prior,SubscriptionCancellationProofStore.ObservedSchedule observed){
+        if(observed!=null)return StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,a,"CANCELLATION_OBSERVED_V1",o.id().toString(),o.providerOperationKey(),o.fingerprint(),
+            Long.toString(o.expectedRevision()),Long.toString(o.policyVersion()),s.id().toString(),s.providerReference(),customer.providerReference(),mode.name(),Objects.toString(boundary,null),
+            observed.event().toString(),Long.toString(observed.revision()),observed.boundary().toString(),"proration:none");
         return StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,a,"CANCELLATION_V1",o.id().toString(),o.providerOperationKey(),o.fingerprint(),
             Long.toString(o.expectedRevision()),Long.toString(o.policyVersion()),s.id().toString(),s.providerReference(),customer.providerReference(),
             mode.name(),Objects.toString(boundary,null),Objects.toString(prior,null),"proration:none");
@@ -302,7 +315,9 @@ public final class StripeBillingMutationAdapter {
             ||!step.operationKey().equals(o.providerOperationKey())||!step.providerReference().equals(s.providerReference())
             ||receipt.acknowledgedAt()==null||step.firstDispatchedAt()==null||step.retryBefore()==null||receipt.acknowledgedAt().isBefore(step.firstDispatchedAt())||!receipt.acknowledgedAt().isBefore(step.retryBefore())
             ||!Objects.equals(receipt.boundary(),SubscriptionCancellationTransaction.boundary(o).orElse(null))||receipt.mode()!=SubscriptionCancellationProofStore.Mode.IMMEDIATE&&!receipt.acknowledgedAt().isBefore(receipt.boundary())
-            ||!step.fingerprint().equals(cancellationFingerprint(a,s,o,customer,receipt.mode(),receipt.boundary(),receipt.priorOperation())))throw mismatch();
+            ||receipt.observed()!=null&&(receipt.mode()!=SubscriptionCancellationProofStore.Mode.WITHDRAW||receipt.priorOperation()!=null
+                ||receipt.observed().revision()!=o.expectedRevision()||!receipt.boundary().equals(receipt.observed().boundary()))
+            ||!step.fingerprint().equals(cancellationFingerprint(a,s,o,customer,receipt.mode(),receipt.boundary(),receipt.priorOperation(),receipt.observed())))throw mismatch();
     }
     private void readScheduleSubscription(Command c,dev.genericpayments.platform.subscriptions.domain.Subscription s,Quote q,StripeClient client,String allowedSchedule)throws StripeException{
         readScheduleSubscription(c,s,q,client,allowedSchedule,false);

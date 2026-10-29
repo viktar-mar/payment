@@ -149,6 +149,33 @@ class StripeBillingObservationTest {
         verify(proofs).bindTrialInTransaction(request,step,s.providerReference(),"si_owned","in_trial",trial.start().getEpochSecond());
     }
     Snapshot snapshot(Subscription.Status status,long revision){return new Snapshot(current.providerReference(),status,current.billingPrice(),current.currentPeriod(),null,null,List.of(),null,false,revision,NOW);}
+    @Test void externalCancellationThenWithdrawalProjectsWithoutInventingLocalCommands(){
+        var s=current;var boundary=s.paidThrough();
+        var scheduled=new Snapshot(s.providerReference(),s.billingStatus(),s.billingPrice(),s.currentPeriod(),null,boundary,List.of(),null,false,0,NOW);
+        apply(scheduled,fence());assertThat(current.cancellation().effectiveAt()).isEqualTo(boundary);
+        apply(snapshot(Subscription.Status.ACTIVE,0),fence());
+        assertThat(current.cancellation()).isNull();assertThat(current.paidThrough()).isEqualTo(s.paidThrough());
+        verify(dep(SubscriptionOperationStore.class),never()).save(any(),anyLong());
+        var recorded=org.mockito.ArgumentCaptor.forClass(SubscriptionEvent.class);verify(dep(SubscriptionEventStore.class),times(2)).append(recorded.capture());
+        assertThat(recorded.getAllValues()).extracting(SubscriptionEvent::type).containsExactly(SubscriptionEvent.Type.CANCEL_SCHEDULED,SubscriptionEvent.Type.CANCEL_WITHDRAWN);
+    }
+    @Test void nullStateReadCapturedBeforeExternalSchedulingCannotClearIt(){
+        var stale=fence();var old=snapshot(Subscription.Status.ACTIVE,0);var s=current;
+        apply(new Snapshot(s.providerReference(),s.billingStatus(),s.billingPrice(),s.currentPeriod(),null,s.paidThrough(),List.of(),null,false,0,NOW),fence());
+        assertThatThrownBy(()->apply(old,stale)).hasMessage("OBSERVATION_STALE");assertThat(current.cancellation()).isNotNull();
+    }
+    @Test void externalWithdrawalAtCapturedBoundaryDoesNotClearCancellation(){
+        current=current.scheduleCancellation(current.paidThrough(),NOW);
+        org.springframework.test.util.ReflectionTestUtils.setField(service,"clock",Clock.fixed(current.paidThrough(),ZoneOffset.UTC));
+        apply(snapshot(Subscription.Status.ACTIVE,0),fence());assertThat(current.cancellation()).isNotNull();
+    }
+    @Test void externalWithdrawalCannotResolveAnUnknownLocalMutation(){
+        current=current.scheduleCancellation(current.paidThrough(),NOW);var s=current;var id=UUID.randomUUID();
+        var o=new SubscriptionOperation(id,s.siteId(),s.customerId(),s.id(),SubscriptionOperation.Kind.WITHDRAW_CANCEL,SubscriptionOperation.Status.UNKNOWN,"test","key","v1.cancel.withdraw."+s.paidThrough().getEpochSecond()+"/0."+"a".repeat(64),"subscription:"+account.id().value()+":"+id+":WITHDRAW_CANCEL",s.revision(),1,s.providerReference(),null,NOW,NOW,0);
+        when(dep(SubscriptionOperationStore.class).unresolved(any(),any())).thenReturn(List.of(o));when(dep(SubscriptionOperationStore.class).lock(id)).thenReturn(o);when(dep(SubscriptionReadPreparation.class).financial(any())).thenReturn(o);
+        apply(snapshot(Subscription.Status.ACTIVE,0),new Fence(s.revision(),id,o.version(),null,null,observations.captureFence(s)));
+        assertThat(current.cancellation()).isNotNull();verify(dep(SubscriptionOperationStore.class),never()).save(any(),anyLong());
+    }
     @Test void exactOriginalResumeCashActivatesPausedSubscription(){resumeFact("in_resume",1000,true);assertThat(current.billingStatus()).isEqualTo(Subscription.Status.ACTIVE);assertThat(current.paidThrough()).isEqualTo(NOW.plusSeconds(86400));}
     @Test void unrelatedCashCannotActivatePausedSubscription(){resumeFact("in_other",1000,true);assertThat(current.billingStatus()).isEqualTo(Subscription.Status.PAUSED);assertThat(current.paidThrough()).isNull();}
     @Test void acknowledgedResumeWithoutCashCannotActivatePausedSubscription(){resumeFact("in_resume",0,false);assertThat(current.billingStatus()).isEqualTo(Subscription.Status.PAUSED);assertThat(current.paidThrough()).isNull();}

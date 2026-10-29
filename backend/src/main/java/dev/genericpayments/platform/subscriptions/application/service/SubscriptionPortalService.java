@@ -19,12 +19,13 @@ public class SubscriptionPortalService implements CreateSubscriptionPortalUseCas
         if(!provider.capabilities(candidate.account()).portal())throw SubscriptionRuleErrors.conflict();
         var r=phases.reserve(command.context(),command.subscriptionId(),SubscriptionOperation.Kind.PORTAL,
             SubscriptionInteractionTransaction.request(command.context(),"PORTAL",command.subscriptionId(),url),candidate);
+        phases.beforePortal(command.context(),r,url);
         var navigation=provider.portal(SubscriptionInteractionTransaction.command(r),url);
         return phases.portal(command.context(),r,navigation,url);
     }
     public Subscription returned(SubscriptionCommandContext context,UUID subscriptionId,UUID publicOperationId){return phases.portalReturn(context,subscriptionId,publicOperationId);}
     public static String requireAllowedReturn(SubscriptionPolicy policy,String url){
-        if(!policy.portalEnabled()||url==null||!policy.portalReturnUrls().contains(url))throw new PaymentApplicationException("SUBSCRIPTION_PORTAL_UNAVAILABLE",409,"Portal unavailable");
+        if(!policy.enabled()||!policy.portalEnabled()||url==null||!policy.portalReturnUrls().contains(url))throw new PaymentApplicationException("SUBSCRIPTION_PORTAL_UNAVAILABLE",409,"Portal unavailable");
         return url;
     }
 }

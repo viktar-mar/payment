@@ -92,6 +92,14 @@ public class StripeSandboxConfiguration {
             dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore proofs){
         return new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnership(credentials,steps,bindings,digest,accounts,sites,customers,subscriptions,operations,catalog,mappings,proofs);
     }
+    @Bean @Lazy dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingPortalAdapter stripeBillingPortalAdapter(
+            dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnership ownership,
+            dev.genericpayments.platform.provider.application.port.out.StripePortalConfigurationPort proofs,ProviderOperationStore steps,
+            StripeCredentialResolver credentials,StripeClientFactory clients,PaymentAccountVerificationPort verification,
+            @org.springframework.beans.factory.annotation.Qualifier("providerReferenceClock") java.time.Clock clock,
+            dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionObjectPort objects){
+        return new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingPortalAdapter(ownership,proofs,steps,credentials,clients,verification,clock,objects);
+    }
     @Bean @Lazy dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingActionAdapter stripeBillingActionAdapter(
             dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnership ownership,dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens tokens,
             StripeCredentialResolver credentials,StripeClientFactory clients,PaymentAccountVerificationPort verification,

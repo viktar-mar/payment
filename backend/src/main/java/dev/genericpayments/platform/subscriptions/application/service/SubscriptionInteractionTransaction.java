@@ -21,6 +21,8 @@ public class SubscriptionInteractionTransaction {
     private final Clock clock;
     @org.springframework.beans.factory.annotation.Autowired(required=false) @org.springframework.beans.factory.annotation.Qualifier("providerReferenceClock")
     private Clock securityClock=Clock.systemUTC();
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private dev.genericpayments.platform.provider.application.port.out.StripePortalConfigurationPort portalProofs;
     public SubscriptionInteractionTransaction(SubscriptionTransactionPort tx,SubscriptionOperationStore operations,SubscriptionStore subscriptions,
         SubscriptionAuthorityPort authority,SubscriptionPolicyPort policies,LockPaymentAccountPort accounts,SubscriptionActionStore actions,
         SubscriptionPortalStore portals,TrialEligibilityStore trials,Clock clock){
@@ -173,11 +175,28 @@ public class SubscriptionInteractionTransaction {
             return result(save(o,SubscriptionOperation.Status.PROCESSING),null);
         });
     }
+    public void beforePortal(SubscriptionCommandContext c,State r,String url){
+        tx.requiresNew(()->{requirePortal(r,authorized(c,r.subscription().id(),operations.lock(r.operation().id()),true),url);return null;});
+    }
+    private static void requirePortal(State expected,State fresh,String url){
+        SubscriptionPortalService.requireAllowedReturn(fresh.policy(),url);
+        if(!fresh.account().equals(expected.account())||fresh.account().status()!=PaymentAccountStatus.ACTIVE
+            ||!fresh.subscription().nonTerminal()||fresh.subscription().revision()!=expected.subscription().revision()
+            ||fresh.subscription().revision()!=fresh.operation().expectedRevision()||fresh.policy().version()!=fresh.operation().policyVersion()
+            ||fresh.operation().kind()!=SubscriptionOperation.Kind.PORTAL||!fresh.operation().equals(expected.operation()))throw SubscriptionRuleErrors.conflict();
+    }
     public PortalNavigation portal(SubscriptionCommandContext c,State r,PortalNavigation navigation,String url){
         return tx.requiresNew(()->{
-            var o=operations.lock(r.operation().id());var fresh=authorized(c,r.subscription().id(),o,true);
-            SubscriptionPortalService.requireAllowedReturn(fresh.policy(),url);
-            if(!navigation.simulated()||!navigation.expiresAt().isAfter(clock.instant()))throw SubscriptionRuleErrors.conflict();
+            var o=operations.lock(r.operation().id());
+            if(navigation==null)throw SubscriptionRuleErrors.conflict();
+            if(r.account().provider()==PaymentProviderType.STRIPE){
+                if(navigation.simulated()||portalProofs==null||!dev.genericpayments.platform.provider.application.model.StripePortalNavigationUrl.valid(navigation.navigationUrl()))throw SubscriptionRuleErrors.conflict();
+                // Proof locks Site/Customer before Account/lifecycle, in the same publication transaction.
+                portalProofs.requirePublication(r.account(),r.subscription(),o,url,navigation.expiresAt());
+            }else if(!navigation.simulated())throw SubscriptionRuleErrors.conflict();
+            var fresh=authorized(c,r.subscription().id(),o,true);
+            requirePortal(r,fresh,url);
+            if(!navigation.expiresAt().isAfter(r.account().provider()==PaymentProviderType.STRIPE?securityClock.instant():clock.instant()))throw SubscriptionRuleErrors.conflict();
             portals.save(c.siteId(),c.customerId(),r.subscription().id(),o.id(),navigation.expiresAt());
             if(o.status()!=SubscriptionOperation.Status.SUCCEEDED)save(o,SubscriptionOperation.Status.SUCCEEDED);
             return navigation;

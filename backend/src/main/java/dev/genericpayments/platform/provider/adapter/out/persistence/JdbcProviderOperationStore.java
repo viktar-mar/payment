@@ -131,7 +131,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         // before waiting for a lock and finish after the lease has expired.
         var current = lock(id).orElseThrow(JdbcProviderOperationStore::conflict);
         if ("ACKNOWLEDGED".equals(status) && !supportedResource(current.kind())) throw conflict();
-        if ((current.kind() == Kind.CUSTOMER_CREATE||current.kind()==Kind.SUBSCRIPTION_CREATE||current.kind()==Kind.SETUP_INTENT_CREATE||current.kind()==Kind.SUBSCRIPTION_UPDATE||current.kind()==Kind.SUBSCRIPTION_CANCEL||current.kind()==Kind.INVOICE_PAY) && "ACKNOWLEDGED".equals(status)) {
+        if ((current.kind() == Kind.CUSTOMER_CREATE||current.kind()==Kind.SUBSCRIPTION_CREATE||current.kind()==Kind.SETUP_INTENT_CREATE||current.kind()==Kind.SUBSCRIPTION_UPDATE||current.kind()==Kind.SUBSCRIPTION_CANCEL||current.kind()==Kind.INVOICE_PAY||current.kind()==Kind.PORTAL_CONFIGURATION_CREATE||current.kind()==Kind.PORTAL_SESSION_CREATE) && "ACKNOWLEDGED".equals(status)) {
             requirePinnedAccount(current);
             requireResource(current.accountId(), current.kind(), current.resourceId(),current.operationKey());
             requireSubscriptionReference(current,reference);
@@ -179,6 +179,8 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         if (expected == null || expected.id() == null) throw conflict();
         var current = lock(expected.id()).orElseThrow(JdbcProviderOperationStore::conflict);
         // Includes immutable request facts, dispatch bounds, owner and fencing version.
+        // Portal has no accepted post-window original-request recovery evidence contract.
+        if(current.kind()==Kind.PORTAL_CONFIGURATION_CREATE||current.kind()==Kind.PORTAL_SESSION_CREATE)throw conflict();
         if (!current.equals(expected) || !current.fingerprint().equals(fingerprint)
             || current.firstDispatchedAt() == null) throw conflict();
         if (!supportedResource(current.kind())) throw conflict();
@@ -224,6 +226,23 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     }
 
     private void requireResource(PaymentAccountId account, Kind kind, UUID resourceId,String key) {
+        if(kind==Kind.PORTAL_CONFIGURATION_CREATE){
+            if(jdbc.queryForList("""
+                select i.id from stripe_portal_configuration_intents i
+                join subscription_operations o on o.id=i.owner_operation and o.site_id=i.site_id and o.subscription_id=i.owner_subscription and o.kind='PORTAL'
+                join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id and s.payment_account_id=i.payment_account_id
+                where i.id=? and i.payment_account_id=? and i.operation_key=?
+                """,UUID.class,resourceId,account.value(),key).size()!=1)throw conflict();return;
+        }
+        if(kind==Kind.PORTAL_SESSION_CREATE){
+            if(jdbc.queryForList("""
+                select i.operation_id from stripe_portal_session_intents i
+                join subscription_operations o on o.id=i.operation_id and o.site_id=i.site_id and o.customer_id=i.customer_id and o.subscription_id=i.subscription_id and o.kind='PORTAL'
+                join subscriptions s on s.id=i.subscription_id and s.payment_account_id=i.payment_account_id and s.site_id=i.site_id and s.customer_id=i.customer_id
+                join stripe_portal_configurations c on c.intent_id=i.configuration_id and c.payment_account_id=i.payment_account_id and c.configuration_reference=i.configuration_reference
+                where i.operation_id=? and i.payment_account_id=? and ?=o.provider_operation_key||':SESSION'
+                """,UUID.class,resourceId,account.value(),key).size()!=1)throw conflict();return;
+        }
         if(kind==Kind.INVOICE_PAY){
             if(jdbc.queryForList("""
                 select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id
@@ -327,6 +346,8 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     }
 
     private void requireSubscriptionReference(ProviderOperation operation,String reference){
+        if(operation.kind()==Kind.PORTAL_CONFIGURATION_CREATE){if(reference==null||!reference.matches("bpc_[A-Za-z0-9]{1,251}"))throw conflict();return;}
+        if(operation.kind()==Kind.PORTAL_SESSION_CREATE){if(reference==null||!reference.matches("bps_[A-Za-z0-9]{1,251}"))throw conflict();return;}
         if(java.util.Set.of(Kind.SCHEDULE_CREATE,Kind.SCHEDULE_UPDATE,Kind.SCHEDULE_RELEASE).contains(operation.kind())){
             if(reference==null||!reference.matches("sub_sched_[A-Za-z0-9]{1,245}"))throw conflict();
             if(operation.kind()!=Kind.SCHEDULE_CREATE&&jdbc.queryForList("""
@@ -352,7 +373,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
 
     private static boolean supportedResource(Kind kind) {
         return switch (kind) {
-            case PRODUCT_CREATE, PRICE_CREATE, PAYMENT_PREPARE, REFUND_CREATE, CUSTOMER_CREATE, SUBSCRIPTION_CREATE, SETUP_INTENT_CREATE, SUBSCRIPTION_UPDATE, SUBSCRIPTION_CANCEL, INVOICE_PAY, SCHEDULE_CREATE, SCHEDULE_UPDATE, SCHEDULE_RELEASE -> true;
+            case PRODUCT_CREATE, PRICE_CREATE, PAYMENT_PREPARE, REFUND_CREATE, CUSTOMER_CREATE, SUBSCRIPTION_CREATE, SETUP_INTENT_CREATE, SUBSCRIPTION_UPDATE, SUBSCRIPTION_CANCEL, INVOICE_PAY, SCHEDULE_CREATE, SCHEDULE_UPDATE, SCHEDULE_RELEASE, PORTAL_CONFIGURATION_CREATE, PORTAL_SESSION_CREATE -> true;
             default -> false;
         };
     }

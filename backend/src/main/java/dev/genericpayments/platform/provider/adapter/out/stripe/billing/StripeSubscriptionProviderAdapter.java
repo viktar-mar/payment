@@ -81,8 +81,9 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
         this(credentials,clients,verification,steps,bindings,customers,digest,accounts,sites,customerStore,subscriptions,operations,catalog,mappings,clock,actions);
         this.proofs=Objects.requireNonNull(proofs);this.providerClock=Objects.requireNonNull(providerClock);
     }
+    @org.springframework.beans.factory.annotation.Autowired(required=false) private StripeBillingPortalAdapter portalAdapter;
     @Transactional(propagation=Propagation.SUPPORTS,readOnly=true)
-    public Capabilities capabilities(PaymentAccount account){ownership.requireAccount(account,false);return new Capabilities(planProofs!=null,cancellationProofs!=null,proofs!=null&&billingActions!=null&&billingActions.get().enabled()&&continuationGuard!=null,false);}
+    public Capabilities capabilities(PaymentAccount account){ownership.requireAccount(account,false);return new Capabilities(planProofs!=null,cancellationProofs!=null,proofs!=null&&billingActions!=null&&billingActions.get().enabled()&&continuationGuard!=null,portalAdapter!=null);}
     public CreatePreparation prepareCreate(Command command){
         if(!command.startTrial()||command.current().trialPolicy()!=dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.REQUIRED_BEFORE_TRIAL)return new ReadyForCreate();
         if(proofs==null)throw unsupported();
@@ -305,9 +306,11 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
             if(receipt!=null){
                 StripeBillingMutationAdapter.requireCancellationReceipt(lookup.account(),s,o,receipt,steps,b);
                 if(receipt.mode()==SubscriptionCancellationProofStore.Mode.WITHDRAW){
-                    var prior=cancellationProofs.receipt(lookup.account().id(),receipt.priorOperation()).orElseThrow(StripeSubscriptionProviderAdapter::mismatch);
-                    if(prior.mode()!=SubscriptionCancellationProofStore.Mode.PERIOD_END||!prior.subscription().equals(s.id())||!prior.reference().equals(s.providerReference())
-                        ||!receipt.boundary().equals(prior.boundary())||!prior.acknowledgedAt().isBefore(prior.boundary()))throw mismatch();
+                    if(receipt.observed()==null){
+                        var prior=cancellationProofs.receipt(lookup.account().id(),receipt.priorOperation()).orElseThrow(StripeSubscriptionProviderAdapter::mismatch);
+                        if(prior.mode()!=SubscriptionCancellationProofStore.Mode.PERIOD_END||!prior.subscription().equals(s.id())||!prior.reference().equals(s.providerReference())
+                            ||!receipt.boundary().equals(prior.boundary())||!prior.acknowledgedAt().isBefore(prior.boundary()))throw mismatch();
+                    }
                     applied=result.cancellationAt()==null&&result.status()!=Subscription.Status.CANCELLED;
                 }else if(receipt.mode()==SubscriptionCancellationProofStore.Mode.IMMEDIATE)applied=result.status()==Subscription.Status.CANCELLED;
                 else applied=receipt.boundary().equals(result.cancellationAt())&&result.status()!=Subscription.Status.CANCELLED
@@ -515,7 +518,7 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
     }
     public Reply confirmAction(Command command,String actionToken){if(billingActions==null)throw unsupported();return billingActions.get().confirmAction(command,actionToken);}
     public OwnedSetupReceipt confirmPreparedSetup(Command command,String token){if(billingActions==null)throw unsupported();return billingActions.get().confirmPreparedSetup(command,token);}
-    public PortalNavigation portal(Command command,String allowedReturnUrl){throw unsupported();}
+    public PortalNavigation portal(Command command,String allowedReturnUrl){if(portalAdapter==null)throw unsupported();return portalAdapter.create(command,allowedReturnUrl);}
     private StripeClient client(PaymentAccount account){return clients.create(credentials.resolve(account));}
     private static Reply accepted(String reference){if(reference==null||!reference.matches("sub_[A-Za-z0-9]{1,251}"))throw mismatch();return new Reply(Outcome.ACCEPTED,reference,null);}
     private static Reply unknown(){return new Reply(Outcome.UNKNOWN,null,null);}

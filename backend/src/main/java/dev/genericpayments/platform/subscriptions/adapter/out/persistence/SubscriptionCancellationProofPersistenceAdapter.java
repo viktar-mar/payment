@@ -34,7 +34,31 @@ public class SubscriptionCancellationProofPersistenceAdapter implements Subscrip
         if(rows.size()>1)throw conflict();return rows.stream().findFirst();
     }
     public void authorize(Subscription s,SubscriptionOperation o){lockAndRequire(s,o,null);}
+    public Optional<ObservedSchedule> observedSchedule(PaymentAccountId account,UUID subscription,Instant boundary){
+        var rows=jdbc.query("""
+            select e.id,e.revision from subscriptions s join subscription_events e on e.subscription_id=s.id
+              and e.site_id=s.site_id and e.payment_account_id=s.payment_account_id and e.provider_reference=s.provider_reference
+            where s.id=? and s.payment_account_id=? and s.cancellation_effective_at=? and e.revision=s.revision
+              and e.event_type='CANCEL_SCHEDULED' and s.billing_status='ACTIVE' and s.pending_operation_id is null
+              and s.debt_billing_record_id is null and s.trial_end is null and s.paid_through=?
+              and s.current_period_end=? and s.current_period_start<=clock_timestamp() and ? > clock_timestamp()
+              and not exists(select 1 from subscription_events later where later.subscription_id=s.id
+                and later.sequence_number>e.sequence_number and later.event_type in ('CANCEL_SCHEDULED','CANCEL_WITHDRAWN','CANCELLED'))
+              and not exists(select 1 from stripe_subscription_cancellation_proofs used where used.prior_event=e.id)
+            """,(r,n)->new ObservedSchedule(r.getObject(1,UUID.class),r.getLong(2),boundary),subscription,account.value(),Timestamp.from(boundary),Timestamp.from(boundary),Timestamp.from(boundary),Timestamp.from(boundary));
+        if(rows.size()>1)throw conflict();return rows.stream().findFirst();
+    }
+    public void requireObserved(Subscription s,ObservedSchedule observed){
+        if(observed==null||observed.revision()!=s.revision()||s.cancellation()==null||!observed.boundary().equals(s.cancellation().effectiveAt())
+            ||!observedSchedule(s.paymentAccountId(),s.id(),observed.boundary()).filter(observed::equals).isPresent())throw conflict();
+    }
     public Receipt record(Subscription s,SubscriptionOperation o,ProviderOperation step,String owner,Mode mode,Instant boundary,UUID prior,Instant received){
+        return record(s,o,step,owner,mode,boundary,prior,received,null);
+    }
+    public Receipt recordObserved(Subscription s,SubscriptionOperation o,ProviderOperation step,String owner,ObservedSchedule observed,Instant received){
+        return record(s,o,step,owner,Mode.WITHDRAW,observed.boundary(),null,received,observed);
+    }
+    private Receipt record(Subscription s,SubscriptionOperation o,ProviderOperation step,String owner,Mode mode,Instant boundary,UUID prior,Instant received,ObservedSchedule observed){
         lockAndRequire(s,o,step);
         var expected=SubscriptionCancellationTransaction.boundary(o).orElse(null);
         if(!Objects.equals(boundary,expected)||received==null||received.getNano()%1000!=0||step.firstDispatchedAt()==null||step.retryBefore()==null
@@ -42,19 +66,20 @@ public class SubscriptionCancellationProofPersistenceAdapter implements Subscrip
             ||mode!=Mode.IMMEDIATE&&(boundary==null||boundary.getNano()!=0||!received.isBefore(boundary)))throw conflict();
         if(!Boolean.TRUE.equals(jdbc.queryForObject("select ?::timestamptz<=clock_timestamp()",Boolean.class,Timestamp.from(received))))throw conflict();
         if(mode==Mode.WITHDRAW){
-            if(o.kind()!=SubscriptionOperation.Kind.WITHDRAW_CANCEL||prior==null
-                ||!activeSchedule(s.paymentAccountId(),s.id(),boundary).filter(p->p.operation().equals(prior)).isPresent())throw conflict();
+            if(o.kind()!=SubscriptionOperation.Kind.WITHDRAW_CANCEL||(prior==null)==(observed==null))throw conflict();
+            if(observed!=null)requireObserved(s,observed);
+            else if(!activeSchedule(s.paymentAccountId(),s.id(),boundary).filter(p->p.operation().equals(prior)).isPresent())throw conflict();
         }else if(o.kind()!=SubscriptionOperation.Kind.CANCEL||prior!=null||(mode==Mode.IMMEDIATE)!=SubscriptionCancellationTransaction.immediate(o))throw conflict();
         var kind=mode==Mode.IMMEDIATE?ProviderOperation.Kind.SUBSCRIPTION_CANCEL:ProviderOperation.Kind.SUBSCRIPTION_UPDATE;
         if(step.kind()!=kind||!step.resourceId().equals(o.id())||!step.accountId().equals(s.paymentAccountId())||!step.operationKey().equals(o.providerOperationKey()))throw conflict();
         steps.acknowledgeInTransaction(step.id(),owner,step.version(),s.providerReference());
         jdbc.update("""
             insert into stripe_subscription_cancellation_proofs(operation_id,site_id,customer_id,subscription_id,payment_account_id,
-                operation_kind,step_id,step_kind,subscription_reference,mode,boundary,prior_operation,acknowledged_at)
-            values (?,?,?,?,?,?,?,?,?,?,?,?,?) on conflict(operation_id) do nothing
-            """,o.id(),s.siteId().value(),s.customerId().value(),s.id(),s.paymentAccountId().value(),o.kind().name(),step.id(),kind.name(),s.providerReference(),mode.name(),boundary==null?null:Timestamp.from(boundary),prior,Timestamp.from(received));
+                operation_kind,step_id,step_kind,subscription_reference,mode,boundary,prior_operation,acknowledged_at,prior_event,prior_event_revision)
+            values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) on conflict(operation_id) do nothing
+            """,o.id(),s.siteId().value(),s.customerId().value(),s.id(),s.paymentAccountId().value(),o.kind().name(),step.id(),kind.name(),s.providerReference(),mode.name(),boundary==null?null:Timestamp.from(boundary),prior,Timestamp.from(received),observed==null?null:observed.event(),observed==null?null:observed.revision());
         return receipt(s.paymentAccountId(),o.id()).filter(r->r.subscription().equals(s.id())&&r.step().equals(step.id())&&r.reference().equals(s.providerReference())
-            &&r.mode()==mode&&Objects.equals(r.boundary(),boundary)&&Objects.equals(r.priorOperation(),prior)&&r.acknowledgedAt().equals(received)).orElseThrow(SubscriptionCancellationProofPersistenceAdapter::conflict);
+            &&r.mode()==mode&&Objects.equals(r.boundary(),boundary)&&Objects.equals(r.priorOperation(),prior)&&Objects.equals(r.observed(),observed)&&r.acknowledgedAt().equals(received)).orElseThrow(SubscriptionCancellationProofPersistenceAdapter::conflict);
     }
     private void lockAndRequire(Subscription s,SubscriptionOperation o,ProviderOperation step){
         if(!Set.of(SubscriptionOperation.Kind.CANCEL,SubscriptionOperation.Kind.WITHDRAW_CANCEL).contains(o.kind())
@@ -88,7 +113,8 @@ public class SubscriptionCancellationProofPersistenceAdapter implements Subscrip
     }
     private Receipt receipt(ResultSet r,int row)throws SQLException{
         var boundary=r.getTimestamp("boundary");
-        return new Receipt(r.getObject("operation_id",UUID.class),r.getObject("subscription_id",UUID.class),new PaymentAccountId(r.getObject("payment_account_id",UUID.class)),r.getObject("step_id",UUID.class),r.getString("subscription_reference"),Mode.valueOf(r.getString("mode")),boundary==null?null:boundary.toInstant(),r.getObject("prior_operation",UUID.class),r.getTimestamp("acknowledged_at").toInstant());
+        var event=r.getObject("prior_event",UUID.class);
+        return new Receipt(r.getObject("operation_id",UUID.class),r.getObject("subscription_id",UUID.class),new PaymentAccountId(r.getObject("payment_account_id",UUID.class)),r.getObject("step_id",UUID.class),r.getString("subscription_reference"),Mode.valueOf(r.getString("mode")),boundary==null?null:boundary.toInstant(),r.getObject("prior_operation",UUID.class),r.getTimestamp("acknowledged_at").toInstant(),event==null?null:new ObservedSchedule(event,r.getLong("prior_event_revision"),boundary.toInstant()));
     }
     private static PaymentApplicationException conflict(){return new PaymentApplicationException("PROVIDER_EVIDENCE_MISMATCH",409,"Provider evidence does not match");}
 }
