@@ -66,6 +66,8 @@ class SubscriptionBillingTimeDomainIntegrationTest extends SubscriptionRecoveryF
         assertUtcRows("subscription_billing_records","created_at","updated_at");
         assertUtcRows("subscription_provider_objects","created_at");
         assertUtcRows("payments","created_at","updated_at");
+        assertUtcRows("payment_events","received_at");
+        assertThat(jdbc.queryForList("select occurred_at from payment_events",Timestamp.class)).containsOnly(Timestamp.from(billingAt));
         assertUtcRows("subscription_events","received_at");
         assertUtcRows("outbox_events","next_attempt_at","created_at","updated_at");
         assertThat(events.list(site,active.id(),100,0)).allSatisfy(e->assertThat(e.occurredAt()).isEqualTo(billingAt));
@@ -122,12 +124,15 @@ class SubscriptionBillingTimeDomainIntegrationTest extends SubscriptionRecoveryF
     @Test void foreignCustomerUsesOrdinaryTimeAndEqualTimeIsolatedModeStillRefusesUnsupportedFacts() {
         var owned=start();var source=retrieve(owned);var ownedCustomer=customer;var ownedActor=actor;
         billing.own(sub(owned.subscriptionId()),utc);
-        var trial=new Snapshot(source.subscriptionReference(),Subscription.Status.TRIALING,source.billingPrice(),source.period(),source.period(),null,source.invoices(),source.operationKey(),true,source.providerRevision(),utc,source.operationObservation());
         var before=sub(owned.subscriptionId());int bills=count("subscription_billing_records"),objects=count("subscription_provider_objects");
+        // Fake retrieval also describes recovery authority; that unsupported shape must stay rejected.
+        assertThat(source.recoveryObservations()).isNotEmpty();
+        assertThatThrownBy(()->apply(owned.subscriptionId(),source,"unsupported-recovery")).hasMessage("ISOLATED_BILLING_UNSUPPORTED");
+        var trial=new Snapshot(source.subscriptionReference(),Subscription.Status.TRIALING,source.billingPrice(),source.period(),source.period(),null,source.invoices(),source.operationKey(),true,source.providerRevision(),utc,source.operationObservation());
         assertThatThrownBy(()->apply(owned.subscriptionId(),trial,"unsupported")).hasMessage("ISOLATED_BILLING_UNSUPPORTED");
         assertThat(sub(owned.subscriptionId())).isEqualTo(before);assertThat(count("subscription_billing_records")).isEqualTo(bills);assertThat(count("subscription_provider_objects")).isEqualTo(objects);
         assertThat(count("payments")).isZero();assertThat(count("subscription_events")).isZero();
-        apply(owned.subscriptionId(),source,"supported-equal-time");
+        apply(owned.subscriptionId(),paidSnapshot(source,utc),"supported-equal-time");
         assertThat(queries.get(actor,site,owned.subscriptionId()).permittedActions()).isEmpty();
         billing.at(utc.plus(Duration.ofDays(35)));
         customer=customers.save(Customer.create(new CustomerId(UUID.randomUUID()),site,null,null,utc));freshActor();

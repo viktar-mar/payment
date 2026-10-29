@@ -31,6 +31,14 @@ class SubscriptionBillingTimeFactTest {
         assertThat(h.s.updatedAt()).isEqualTo(UTC);assertThat(h.journal.getLast().occurredAt()).isEqualTo(h.billing);
         assertThat(h.callbacks).containsExactly(UTC,UTC);
     }
+    @Test void equalTimeRecoveryAnnotationsAreRefusedWhilePlainPaidFactsAreAdmitted() {
+        var h=new Harness(UTC);var paid=h.snapshot(Subscription.Status.ACTIVE,SettlementKind.CASH,UTC,null);
+        var annotated=new Snapshot(paid.subscriptionReference(),paid.status(),paid.billingPrice(),paid.period(),null,null,paid.invoices(),null,true,paid.providerRevision(),UTC,null,
+            List.of(new RecoveryObservation(paid.invoices().getFirst().reference(),RecoveryDisposition.BLOCKED)));
+        assertRejected(h,annotated);
+        h.apply(paid);
+        assertThat(h.observations).isEqualTo(1);assertThat(h.cash).hasSize(1);assertThat(h.records).hasSize(1);
+    }
     @Test void isolatedEqualTimeRejectsUnsupportedShapesBeforeObservationAndAnyWrite() {
         for(var status:List.of(Subscription.Status.TRIALING,Subscription.Status.PAUSED,Subscription.Status.CANCELLED)){
             var h=new Harness(UTC);assertRejected(h,h.snapshot(status,SettlementKind.OPEN,UTC,null));
