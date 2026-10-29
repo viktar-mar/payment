@@ -18,6 +18,7 @@ public class SubscriptionInteractionTransaction {
     private final SubscriptionStore subscriptions;private final SubscriptionAuthorityPort authority;
     private final SubscriptionPolicyPort policies;private final LockPaymentAccountPort accounts;
     private final SubscriptionActionStore actions;private final SubscriptionPortalStore portals;private final TrialEligibilityStore trials;
+    private final dev.genericpayments.platform.provider.application.port.out.StripeBillingClockSubscriptionStore confirmationAuthority;
     private final Clock clock;
     @org.springframework.beans.factory.annotation.Autowired(required=false) @org.springframework.beans.factory.annotation.Qualifier("providerReferenceClock")
     private Clock securityClock=Clock.systemUTC();
@@ -26,7 +27,13 @@ public class SubscriptionInteractionTransaction {
     public SubscriptionInteractionTransaction(SubscriptionTransactionPort tx,SubscriptionOperationStore operations,SubscriptionStore subscriptions,
         SubscriptionAuthorityPort authority,SubscriptionPolicyPort policies,LockPaymentAccountPort accounts,SubscriptionActionStore actions,
         SubscriptionPortalStore portals,TrialEligibilityStore trials,Clock clock){
-        this.tx=tx;this.operations=operations;this.subscriptions=subscriptions;this.authority=authority;this.policies=policies;this.accounts=accounts;this.actions=actions;this.portals=portals;this.trials=trials;this.clock=clock;
+        this(tx,operations,subscriptions,authority,policies,accounts,actions,portals,trials,clock,null);
+    }
+    @org.springframework.beans.factory.annotation.Autowired
+    public SubscriptionInteractionTransaction(SubscriptionTransactionPort tx,SubscriptionOperationStore operations,SubscriptionStore subscriptions,
+        SubscriptionAuthorityPort authority,SubscriptionPolicyPort policies,LockPaymentAccountPort accounts,SubscriptionActionStore actions,
+        SubscriptionPortalStore portals,TrialEligibilityStore trials,Clock clock,dev.genericpayments.platform.provider.application.port.out.StripeBillingClockSubscriptionStore confirmationAuthority){
+        this.confirmationAuthority=confirmationAuthority;this.tx=tx;this.operations=operations;this.subscriptions=subscriptions;this.authority=authority;this.policies=policies;this.accounts=accounts;this.actions=actions;this.portals=portals;this.trials=trials;this.clock=clock;
     }
     public record State(Subscription subscription,PaymentAccount account,SubscriptionPolicy policy,SubscriptionOperation operation,boolean owner) {}
     public void outside(){if(tx.active())throw new IllegalStateException("Provider workflow requires no ambient transaction");}
@@ -77,7 +84,7 @@ public class SubscriptionInteractionTransaction {
             var now=clock.instant();var fresh=authorized(c,r.subscription().id(),operations.lock(r.operation().id()),true);
             if(!fresh.subscription().nonTerminal()||!fresh.policy().enabled()||fresh.account().status()!=PaymentAccountStatus.ACTIVE)throw SubscriptionRuleErrors.conflict();
             if(fresh.account().provider()==PaymentProviderType.STRIPE){
-                requireSame(r,fresh);var g=billingGrant(fresh,action.secret());if(!g.available(securityClock.instant())||!g.expiresAt().equals(action.expiresAt()))throw SubscriptionRuleErrors.conflict();return action;
+                requireSame(r,fresh);var g=ordinaryBillingGrant(fresh,action.secret());if(!g.available(securityClock.instant())||!g.expiresAt().equals(action.expiresAt()))throw SubscriptionRuleErrors.conflict();return action;
             }
             return issue(fresh,action,now);
         });
@@ -93,15 +100,16 @@ public class SubscriptionInteractionTransaction {
     }
     public boolean replay(ConfirmSubscriptionActionUseCase.Command c){
         validateKey(c.context());validateToken(c.actionToken());
-        return tx.requiresNew(()->{authorized(c.context(),c.subscriptionId(),operations.lock(c.operationId()),true);return actions.replay(c.context().siteId(),principal(c.context()),digest(c.context().idempotencyKey()),confirmationFingerprint(c));});
+        return tx.requiresNew(()->{ordinaryConfirmation(authorized(c.context(),c.subscriptionId(),operations.lock(c.operationId()),true));return actions.replay(c.context().siteId(),principal(c.context()),digest(c.context().idempotencyKey()),confirmationFingerprint(c));});
     }
     public SubscriptionActionStore.ClaimDisposition claim(ConfirmSubscriptionActionUseCase.Command c,State r,NextAction action){
         return translated(()->tx.requiresNew(()->{
             var fresh=authorized(c.context(),c.subscriptionId(),operations.lock(c.operationId()),true);
+            ordinaryConfirmation(fresh);
             if(fresh.account().provider()==PaymentProviderType.STRIPE&&actions.replay(c.context().siteId(),principal(c.context()),digest(c.context().idempotencyKey()),confirmationFingerprint(c)))return SubscriptionActionStore.ClaimDisposition.REPLAY;
             if(!fresh.subscription().nonTerminal()||!fresh.policy().enabled()||fresh.account().status()!=PaymentAccountStatus.ACTIVE)throw SubscriptionRuleErrors.conflict();
             if(fresh.account().provider()==PaymentProviderType.STRIPE){
-                requireSame(r,fresh);var session=customer(c.context());var g=billingGrant(fresh,c.actionToken());
+                requireSame(r,fresh);var session=customer(c.context());var g=ordinaryBillingGrant(fresh,c.actionToken());
                 if(actions.serverConfirmationReserved(g.id())||!g.available(securityClock.instant())||!session.sessionId().value().equals(g.sessionId())||!session.origin().equals(g.origin())||g.clientExpiresAt()==null||!securityClock.instant().isBefore(g.clientExpiresAt()))throw SubscriptionRuleErrors.conflict();
                 return actions.claimBilling(c.context().siteId(),c.context().customerId(),fresh.account().id(),c.subscriptionId(),c.operationId(),digest(c.actionToken()),session.sessionId().value(),session.origin(),principal(c.context()),digest(c.context().idempotencyKey()),confirmationFingerprint(c),securityClock.instant());
             }
@@ -123,17 +131,34 @@ public class SubscriptionInteractionTransaction {
     }
     private SubscriptionClientGrant availableClientGrant(SubscriptionCommandContext c,State r,String token){
         var session=customer(c);if(r.account().provider()!=PaymentProviderType.STRIPE||r.account().status()!=PaymentAccountStatus.ACTIVE||!r.policy().enabled()||!r.subscription().nonTerminal()||!Set.of(SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Kind.RESUME,SubscriptionOperation.Kind.CHANGE,SubscriptionOperation.Kind.RECOVER).contains(r.operation().kind())||r.operation().status()==SubscriptionOperation.Status.SUCCEEDED||r.operation().status()==SubscriptionOperation.Status.FAILED)throw SubscriptionRuleErrors.conflict();
-        var grant=billingGrant(r,token);if(actions.serverConfirmationReserved(grant.id())||!grant.available(securityClock.instant())||grant.sessionId()!=null&&(!session.sessionId().value().equals(grant.sessionId())||!session.origin().equals(grant.origin())))throw SubscriptionRuleErrors.conflict();return grant;
+        var grant=ordinaryBillingGrant(r,token);if(actions.serverConfirmationReserved(grant.id())||!grant.available(securityClock.instant())||grant.sessionId()!=null&&(!session.sessionId().value().equals(grant.sessionId())||!session.origin().equals(grant.origin())))throw SubscriptionRuleErrors.conflict();return grant;
     }
     /** Shared operation/account/subscription lock order for v2 phases; never calls a provider. */
-    <T>T confirmationLocked(SubscriptionCommandContext c,UUID id,UUID operation,java.util.function.Function<State,T> work){
+    public <T>T confirmationLocked(SubscriptionCommandContext c,UUID id,UUID operation,java.util.function.Function<State,T> work){
+        return confirmationPhase(c,id,operation,null,work);
+    }
+    public <T>T confirmationLocked(SubscriptionCommandContext c,UUID id,UUID operation,dev.genericpayments.platform.provider.application.model.OwnedClockSubscriptionReceipt expected,java.util.function.Function<State,T> work){
+        return confirmationPhase(c,id,operation,Objects.requireNonNull(expected),work);
+    }
+    private <T>T confirmationPhase(SubscriptionCommandContext c,UUID id,UUID operation,dev.genericpayments.platform.provider.application.model.OwnedClockSubscriptionReceipt expected,java.util.function.Function<State,T> work){
         outside();return translated(()->tx.requiresNew(()->{
             var fresh=authorized(c,id,operations.lock(operation),true);customer(c);
             if(!Set.of(SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Kind.RESUME,SubscriptionOperation.Kind.CHANGE,SubscriptionOperation.Kind.RECOVER,SubscriptionOperation.Kind.SETUP).contains(fresh.operation().kind()))throw SubscriptionRuleErrors.conflict();
             if(fresh.account().provider()!=PaymentProviderType.STRIPE||fresh.account().status()!=PaymentAccountStatus.ACTIVE||!fresh.policy().enabled()||!fresh.subscription().nonTerminal()
               ||fresh.policy().version()!=fresh.operation().policyVersion()||fresh.operation().status()==SubscriptionOperation.Status.SUCCEEDED||fresh.operation().status()==SubscriptionOperation.Status.FAILED||!recoveryPolicyCurrent(fresh))throw SubscriptionRuleErrors.conflict();
+            if(confirmationAuthority==null)throw SubscriptionRuleErrors.conflict();
+            if(expected==null)ordinaryConfirmation(fresh);else confirmationAuthority.requireConfirmationReceipt(expected,fresh.account(),fresh.subscription(),fresh.operation());
             return work.apply(fresh);
         }));
+    }
+    private void ordinaryConfirmation(State state){
+        if(state.account().provider()!=PaymentProviderType.STRIPE)return;
+        if(confirmationAuthority==null)throw SubscriptionRuleErrors.conflict();
+        confirmationAuthority.requireOrdinaryConfirmation(state.account().id(),state.subscription().siteId(),state.subscription().customerId());
+    }
+    private SubscriptionClientGrant ordinaryBillingGrant(State state,String token){
+        ordinaryConfirmation(state);var grant=billingGrant(state,token);
+        if(grant.binding().ownedIntent()!=null||"owned-initial-v1".equals(grant.binding().schema()))throw SubscriptionRuleErrors.conflict();return grant;
     }
     SubscriptionClientGrant confirmationRoot(State state,String token){return billingGrant(state,token);}
     private SubscriptionClientGrant billingGrant(State r,String token){
@@ -155,7 +180,7 @@ public class SubscriptionInteractionTransaction {
         return tx.requiresNew(()->{
             var fresh=authorized(c.context(),r.subscription().id(),operations.lock(r.operation().id()),true);
             if(!recoveryPolicyCurrent(fresh))return false;
-            var session=customer(c.context());var now=securityClock.instant();var grant=billingGrant(fresh,c.actionToken());
+            var session=customer(c.context());var now=securityClock.instant();var grant=ordinaryBillingGrant(fresh,c.actionToken());
             // Reply persistence changes the operation version. The immutable consumed receipt remains the authority.
             return fresh.account().provider()==PaymentProviderType.STRIPE&&fresh.account().status()==PaymentAccountStatus.ACTIVE
                 &&fresh.policy().enabled()&&fresh.subscription().nonTerminal()&&fresh.operation().status()==SubscriptionOperation.Status.PROCESSING
@@ -179,7 +204,7 @@ public class SubscriptionInteractionTransaction {
     }
     public SubscriptionOperationResult replyPreparedSetup(SubscriptionCommandContext c,State r,String token,OwnedSetupReceipt receipt){
         return tx.requiresNew(()->{
-            var o=operations.lock(r.operation().id());var fresh=authorized(c,r.subscription().id(),o,true);customer(c);var grant=billingGrant(fresh,token);
+            var o=operations.lock(r.operation().id());var fresh=authorized(c,r.subscription().id(),o,true);customer(c);var grant=ordinaryBillingGrant(fresh,token);
             if(o.kind()!=SubscriptionOperation.Kind.CREATE||fresh.subscription().providerReference()!=null||grant.binding().flow()!=SubscriptionClientSession.Flow.SETUP||grant.binding().subscriptionReference()!=null||grant.consumedAt()==null
                 ||receipt!=null&&(!receipt.operationId().equals(o.id())||!receipt.stepId().equals(grant.binding().stepId())||!receipt.setupReference().equals(grant.binding().setupReference())))throw SubscriptionRuleErrors.conflict();
             if(o.status()==SubscriptionOperation.Status.SUCCEEDED||o.status()==SubscriptionOperation.Status.FAILED)return result(o,null);

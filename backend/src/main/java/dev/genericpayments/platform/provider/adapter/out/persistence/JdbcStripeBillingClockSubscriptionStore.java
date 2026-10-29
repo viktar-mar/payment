@@ -23,6 +23,51 @@ public class JdbcStripeBillingClockSubscriptionStore implements StripeBillingClo
     private final DigestPort digest;
     public JdbcStripeBillingClockSubscriptionStore(JdbcTemplate jdbc,DigestPort digest){this.jdbc=jdbc;this.digest=digest;}
 
+    @Transactional(propagation=Propagation.MANDATORY)
+    public void requireOrdinaryConfirmation(PaymentAccountId account,dev.genericpayments.platform.sites.domain.SiteId site,dev.genericpayments.platform.customers.domain.CustomerId customer){
+        requireTransaction();
+        if(Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from stripe_billing_clock_intents where payment_account_id=? and site_id=? and customer_id=?)",Boolean.class,account.value(),site.value(),customer.value())))throw conflict();
+    }
+    @Transactional(propagation=Propagation.MANDATORY)
+    public OwnedClockSubscriptionReceipt requireConfirmationReceipt(OwnedClockSubscriptionReceipt expected,PaymentAccount account,
+            dev.genericpayments.platform.subscriptions.domain.Subscription s,
+            dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation operation){
+        requireTransaction();
+        if(expected==null||account==null||s==null||operation==null)throw conflict();
+        var i=intentRow(jdbc,account.id(),s.id()).orElseThrow(JdbcStripeBillingClockStore::conflict);
+        requireCurrentRow(jdbc,i);
+        var r=receiptRow(jdbc,i).filter(expected::equals).orElseThrow(JdbcStripeBillingClockStore::conflict);
+        var owner=i.clock().owner();
+        if(!account.id().equals(owner.account())||account.provider()!=PaymentProviderType.STRIPE||account.mode()!=PaymentAccountMode.SANDBOX||account.status()!=PaymentAccountStatus.ACTIVE
+            ||!account.externalAccountId().equals(owner.externalAccount())||!account.credentialsRef().equals(owner.credentialsRef())
+            ||!s.siteId().equals(owner.site())||!s.customerId().equals(owner.customer())||!s.paymentAccountId().equals(owner.account())
+            ||!s.billingPrice().equals(i.terms())||s.billingStatus()!=dev.genericpayments.platform.subscriptions.domain.Subscription.Status.INCOMPLETE
+            ||!r.reference().equals(s.providerReference())||s.entitledPrice()!=null||s.paidThrough()!=null||s.trial()!=null||s.debt()!=null||s.pendingChange()!=null||s.cancellation()!=null
+            ||s.currentPeriod()!=null&&(!s.currentPeriod().start().equals(Instant.ofEpochSecond(r.periodStart()))||!s.currentPeriod().end().equals(Instant.ofEpochSecond(r.periodEnd())))
+            ||!operation.id().equals(i.createOperation())||!operation.subscriptionId().equals(i.subscription())||!operation.siteId().equals(owner.site())||!operation.customerId().equals(owner.customer())
+            ||operation.kind()!=dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation.Kind.CREATE
+            ||!Set.of(dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation.Status.PROCESSING,dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation.Status.REQUIRES_ACTION,dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation.Status.UNKNOWN).contains(operation.status())
+            ||!r.reference().equals(operation.providerReference())||!operation.providerOperationKey().equals(i.operationKey())||!operation.fingerprint().equals(i.requestFingerprint())
+            ||operation.expectedRevision()!=i.expectedRevision()||operation.policyVersion()!=i.policyVersion())throw conflict();
+        if(!Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from site_subscription_policies where site_id=? and enabled and version=?)",Boolean.class,owner.site().value(),i.policyVersion())))throw conflict();
+        if(!Boolean.TRUE.equals(jdbc.queryForObject("select owned_initial_confirmation_available(?) and exists(select 1 from subscriptions s join subscription_operations o on o.id=? where s.id=? and s.revision=? and o.version=?)",Boolean.class,i.id(),operation.id(),s.id(),s.revision(),operation.version())))throw conflict();
+        return r;
+    }
+    /** Narrow root writer proof in the caller transaction. Reuses owner Site/Customer/Account locks;
+     * never acquires a provider step or lifecycle lock beneath those rows. */
+    public static void requireConfirmationGrant(JdbcTemplate jdbc,dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant g,OwnedClockSubscriptionReceipt expected){
+        requireTransaction();if(g==null||expected==null)throw conflict();
+        var i=intentRow(jdbc,g.account(),g.subscription()).orElseThrow(JdbcStripeBillingClockStore::conflict);
+        requireCurrentRow(jdbc,i);var r=receiptRow(jdbc,i).filter(expected::equals).orElseThrow(JdbcStripeBillingClockStore::conflict);
+        var b=g.binding();var o=i.clock().owner();
+        if(!"owned-initial-v1".equals(b.schema())||!i.id().equals(b.ownedIntent())||!i.createOperation().equals(g.operation())||!o.site().equals(g.site())||!o.customer().equals(g.customer())
+            ||!r.providerOperation().equals(b.stepId())||!i.operationKey().equals(b.operationKey())||!r.reference().equals(b.subscriptionReference())||!i.customerReference().equals(b.customerReference())
+            ||!OwnedInitialConfirmationProof.hash(r,b.invoiceReference(),b.allocationReference(),b.intentReference()).equals(b.proof())
+            ||g.issuedAt().isBefore(r.acknowledgedAt())||g.consumedAt()!=null||g.supersededAt()!=null||g.sessionId()!=null||g.origin()!=null||g.clientExpiresAt()!=null)throw conflict();
+        if(!Boolean.TRUE.equals(jdbc.queryForObject("select owned_initial_confirmation_available(?)",Boolean.class,i.id())))throw conflict();
+    }
+    private static void requireTransaction(){if(!org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive())throw new IllegalStateException("Confirmation authority requires caller transaction");}
+
     public OwnedClockSubscription admitFresh(PaymentAccount account,ClockOwner owner,UUID subscription,UUID operation,Instant at) {
         if(account==null || owner==null || subscription==null || operation==null || at==null
             || !account.id().equals(owner.account()) || !account.externalAccountId().equals(owner.externalAccount())
