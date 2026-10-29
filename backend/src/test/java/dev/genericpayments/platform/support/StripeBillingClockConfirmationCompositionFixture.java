@@ -5,6 +5,8 @@ import com.google.gson.JsonObject;
 import com.stripe.net.StripeRequest;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.*;
 import dev.genericpayments.platform.provider.application.model.OwnedClockSubscriptionReceipt;
+import dev.genericpayments.platform.shared.application.port.out.Stage2TelemetryPort;
+import dev.genericpayments.platform.sites.application.port.out.LoadSitePort;
 import dev.genericpayments.platform.subscriptions.application.model.*;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
 import dev.genericpayments.platform.subscriptions.application.port.in.*;
@@ -18,10 +20,12 @@ import java.util.*;
 import java.util.function.Consumer;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.test.context.TestPropertySource;
 import static org.assertj.core.api.Assertions.*;
 
 /** Hosted only: real create/action/claim/facts/cash/journal/outbox, inert official SDK transport.
  * No successful lifecycle, action, attempt or payment fixture row is inserted. */
+@TestPropertySource(properties="payment.telemetry.site-keys[0]=test-site")
 public abstract class StripeBillingClockConfirmationCompositionFixture extends StripeBillingClockSubscriptionCompositionFixture {
     @Autowired protected SubscriptionInteractionTransaction phases;
     @Autowired protected SubscriptionReadPreparation readPreparation;
@@ -32,6 +36,8 @@ public abstract class StripeBillingClockConfirmationCompositionFixture extends S
     @Autowired protected SubscriptionConfirmationUseCase ordinary;
     @Autowired protected QuerySubscriptionsUseCase queries;
     @Autowired protected CallbackConfigurationPort callbacks;
+    @Autowired protected Stage2TelemetryPort telemetry;
+    @Autowired protected LoadSitePort sites;
     protected OwnedClockSubscriptionReceipt receipt;
     protected SubscriptionConfirmationUseCase.Scope scope;
     protected StripeBillingClockActionAdapter action;
@@ -44,6 +50,10 @@ public abstract class StripeBillingClockConfirmationCompositionFixture extends S
         Map.of("v1",Base64.getEncoder().encodeToString(new byte[32])));
 
     protected void beginConfirmation() {
+        var actualSite=sites.findById(site).orElseThrow();
+        assertThatCode(()->telemetry.requireContext(new Stage2TelemetryPort.Context(actualSite.key().value(),Stage2TelemetryPort.Provider.STRIPE)))
+            .as("The real cash publisher requires this fixture Site's configured telemetry identity")
+            .doesNotThrowAnyException();
         createOwned();
         receipt=owned.requireReceipt(billing.id(),current().id());
         scope=scope("owned-pay");
