@@ -88,6 +88,44 @@ class StripeSubscriptionRecoveryTest {
         }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void consumedRecoveryOwnerReachesPublicFalsePermissionReplayAtEitherReadBoundary(boolean finalPhase) throws Exception {
+        try(var c=new RecoveryCase()){
+            c.actionGraph();assertThat(c.fixture.adapter.recover(c.command()).outcome()).isEqualTo(Outcome.ACCEPTED);
+            var actual=c.actions();c.actionGraph();var first=actual.nextAction(c.fixture.lookup());assertThat(first).isNotNull();
+            var service=c.confirmations();c.bindGrant();var original=c.grant;
+            if(finalPhase){c.consumeInFinalActionPhase=true;c.actionTransactions=0;c.actionGraph();}else c.consumeAfterStaleReplayCheck=true;
+            var result=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionOperationResult[1];
+            assertThatCode(()->result[0]=service.confirm(c.confirmCommand(first.secret()))).doesNotThrowAnyException();
+            assertThat(result[0].browserConfirmAllowed()).isFalse();assertThat(c.grant.id()).isEqualTo(original.id());assertThat(c.grant.tokenDigest()).isEqualTo(original.tokenDigest());assertThat(c.grant.consumedAt()).isNotNull();
+            verify(c.actionStore,never()).claimBilling(any(),any(),any(),any(),any(),anyString(),any(),anyString(),anyString(),anyString(),anyString(),any());
+            int reads=c.fixture.graph.http.calls().size();assertThatCode(()->assertThat(actual.nextAction(c.fixture.lookup())).isNull()).doesNotThrowAnyException();assertThat(c.fixture.graph.http.calls()).hasSize(reads);
+            assertThat(c.fixture.graph.http.requestCount("POST",PAY)).isZero();
+        }
+    }
+
+    @Test
+    void actualRecoveryActionStillRefusesAnIncompatibleAvailableOwner() throws Exception {
+        try(var c=new RecoveryCase()){
+            c.actionGraph();assertThat(c.fixture.adapter.recover(c.command()).outcome()).isEqualTo(Outcome.ACCEPTED);
+            var actual=c.actions();c.actionGraph();actual.nextAction(c.fixture.lookup());var original=c.grant;
+            when(c.proofs.available(any(),any(),anyString(),any())).thenReturn(false);c.actionGraph();
+            assertThatThrownBy(()->actual.nextAction(c.fixture.lookup())).isInstanceOf(PaymentApplicationException.class);assertThat(c.grant).isEqualTo(original);
+        }
+    }
+
+    @Test
+    void publicRecoveryRetainsAcceptedImmediateProrationHistoryWhenAssociatingTheLaterDebt() throws Exception {
+        try(var c=new RecoveryCase()){
+            c.retainAcceptedProration();var service=c.publicService();c.openReadGraph();c.actionGraph();
+            assertThat(publicRecover(service,c).status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+            assertThat(c.receipts.get(c.fixture.operation.id()).billingRecord()).isEqualTo(c.bill.id());assertThat(c.receipts.get(c.fixture.operation.id()).payStep()).isNull();
+            assertThat(c.fixture.graph.http.requestCount("POST",PAY)).isZero();assertThat(c.fixture.local.debt().graceDeadline()).isEqualTo(c.grace);
+            verify(c.planHistory,atLeast(2)).prorations(c.fixture.account.id(),c.fixture.local.id());
+        }
+    }
+
     @Test
     void ownedUnfinishedFirstActionAssociatesWithoutPayOrAnotherIntent() throws Exception {
         try(var c=new RecoveryCase()){
@@ -196,9 +234,15 @@ class StripeSubscriptionRecoveryTest {
         final SubscriptionRecoveryProofStore proofs=mock(SubscriptionRecoveryProofStore.class);
         final Map<UUID,SubscriptionRecoveryProofStore.Receipt> receipts=new HashMap<>();
         final SubscriptionRecoveryProofStore.Origin origin;
-        final BillingRecord bill;
-        final Instant grace=StripeBillingSnapshotMapperTest.START.plusSeconds(259200);
+        BillingRecord bill;
+        Instant grace=StripeBillingSnapshotMapperTest.START.plusSeconds(259200);
+        dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore planHistory;
+        com.google.gson.JsonObject retainedInvoice,retainedLines,retainedAllocation,retainedIntent,retainedCharge;
         dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext publicContext;
+        dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant grant;
+        final dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionActionStore actionStore=mock(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionActionStore.class);
+        dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext confirmationContext;
+        boolean durableConfirmation,consumeAfterStaleReplayCheck,consumeInFinalActionPhase;int actionTransactions;
         RecoveryCase() throws Exception {
             fixture.setup();fixture.create();
             var source=fixture.operation;var sourceStep=fixture.steps.only();
@@ -227,6 +271,29 @@ class StripeSubscriptionRecoveryTest {
         }
         SubscriptionRecoveryProofStore.Receipt receipt(UUID pay,String allocation,String intent){return new SubscriptionRecoveryProofStore.Receipt(fixture.operation.id(),fixture.local.id(),fixture.account.id(),bill.id(),"sub_owned","in_owned",origin.operation(),origin.step(),pay,allocation,intent);}
         Command command(){return new Command(fixture.account,fixture.operation,fixture.local.billingPrice(),null,"sub_owned","in_owned",null,false,false);}
+        dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingActionAdapter actions(){
+            var ownership=(dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnership)org.springframework.test.util.ReflectionTestUtils.getField(fixture.adapter,"ownership");org.springframework.test.util.ReflectionTestUtils.setField(ownership,"recoveryProofs",proofs);
+            when(proofs.available(any(),any(),anyString(),any())).thenAnswer(i->grant==null||grant.consumedAt()==null);
+            when(actionStore.current(any(),any())).thenAnswer(i->Optional.ofNullable(grant));when(actionStore.billing(anyString())).thenAnswer(i->Optional.ofNullable(grant).filter(g->g.tokenDigest().equals(i.getArgument(0))));
+            doAnswer(i->{grant=i.getArgument(0);return null;}).when(actionStore).reserveBilling(any());when(fixture.operations.lock(any())).thenAnswer(i->fixture.operation);
+            var credentials=new StripeCredentialResolver(new StripeSandboxProperties(true,"sk_test_"+"A".repeat(32),"pk_test_"+"B".repeat(32),"whsec_"+"C".repeat(32)));
+            var factory=new StripeClientFactory(){@Override public com.stripe.StripeClient create(StripeCredentials ignored){return fixture.graph.http.client();}};
+            var tx=new dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionTransactionPort(){public <T>T required(java.util.function.Supplier<T> action){return action.get();}public <T>T requiresNew(java.util.function.Supplier<T> action){if(++actionTransactions==2&&consumeInFinalActionPhase){consumeInFinalActionPhase=false;consumeGrant();}return action.get();}public boolean active(){return false;}};
+            var actual=new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingActionAdapter(ownership,new dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens(true,"v1",Map.of("v1",Base64.getEncoder().encodeToString(new byte[32]))),credentials,factory,new StripeAccountVerificationAdapter(credentials,factory),actionStore,fixture.operations,tx,Clock.systemUTC());
+            org.springframework.test.util.ReflectionTestUtils.setField(fixture.adapter,"billingActions",(java.util.function.Supplier<dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingActionAdapter>)()->actual);return actual;
+        }
+        dev.genericpayments.platform.subscriptions.application.service.SubscriptionActionService confirmations(){
+            var s=fixture.local;var locks=mock(dev.genericpayments.platform.paymentaccounts.application.port.out.LockPaymentAccountPort.class);var policies=mock(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPolicyPort.class);var authority=mock(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionAuthorityPort.class);
+            when(locks.findByIdForUpdate(s.paymentAccountId())).thenReturn(Optional.of(fixture.account));when(policies.load(s.siteId())).thenReturn(new SubscriptionPolicy(s.siteId(),1,true,3,false,false,false,Set.of()));when(fixture.subscriptions.find(s.siteId(),s.id())).thenAnswer(i->Optional.of(fixture.local));when(fixture.subscriptions.lock(s.siteId(),s.id())).thenAnswer(i->fixture.local);when(fixture.operations.save(any(),anyLong())).thenAnswer(i->{fixture.operation=i.getArgument(0);return fixture.operation;});
+            var session=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(new dev.genericpayments.platform.customers.domain.CustomerSessionId(UUID.randomUUID()),s.siteId(),s.customerId(),"https://shop.test",Set.of(dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_MANAGE),Instant.now().plusSeconds(600));confirmationContext=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(new dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer(session),s.siteId(),s.customerId(),session.origin(),"same-confirm-key","same-confirm-request");
+            when(actionStore.replay(any(),anyString(),anyString(),anyString())).thenAnswer(i->{if(consumeAfterStaleReplayCheck&&!durableConfirmation){consumeAfterStaleReplayCheck=false;consumeGrant();return false;}return durableConfirmation;});
+            var tx=new dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionTransactionPort(){public <T>T required(java.util.function.Supplier<T> action){return action.get();}public <T>T requiresNew(java.util.function.Supplier<T> action){return action.get();}public boolean active(){return false;}};
+            var phases=new dev.genericpayments.platform.subscriptions.application.service.SubscriptionInteractionTransaction(tx,fixture.operations,fixture.subscriptions,authority,policies,locks,actionStore,mock(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPortalStore.class),mock(dev.genericpayments.platform.subscriptions.application.port.out.TrialEligibilityStore.class),Clock.systemUTC());
+            return new dev.genericpayments.platform.subscriptions.application.service.SubscriptionActionService(phases,a->fixture.adapter);
+        }
+        dev.genericpayments.platform.subscriptions.application.port.in.ConfirmSubscriptionActionUseCase.Command confirmCommand(String token){return new dev.genericpayments.platform.subscriptions.application.port.in.ConfirmSubscriptionActionUseCase.Command(confirmationContext,fixture.local.id(),fixture.operation.id(),token);}
+        void bindGrant(){var g=grant;var session=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)confirmationContext.actor()).session();grant=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant(g.id(),g.site(),g.customer(),g.account(),g.subscription(),g.operation(),g.keyVersion(),g.binding(),g.tokenDigest(),g.issuedAt(),g.expiresAt(),g.consumedAt(),g.supersededAt(),session.sessionId().value(),session.origin(),g.expiresAt());}
+        void consumeGrant(){var g=grant;grant=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant(g.id(),g.site(),g.customer(),g.account(),g.subscription(),g.operation(),g.keyVersion(),g.binding(),g.tokenDigest(),g.issuedAt(),g.expiresAt(),Instant.now(),g.supersededAt(),g.sessionId(),g.origin(),g.clientExpiresAt());durableConfirmation=true;var o=fixture.operation;fixture.operation=new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),o.subscriptionId(),o.kind(),SubscriptionOperation.Status.PROCESSING,o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),o.providerReference(),o.safeFailureCode(),o.createdAt(),Instant.now(),o.version()+1);}
         dev.genericpayments.platform.subscriptions.application.service.SubscriptionRecoveryService publicService(){
             var s=fixture.local;var locks=mock(dev.genericpayments.platform.paymentaccounts.application.port.out.LockPaymentAccountPort.class);
             var sites=mock(dev.genericpayments.platform.sites.application.port.out.LockSitePort.class);
@@ -250,13 +317,37 @@ class StripeSubscriptionRecoveryTest {
             return new dev.genericpayments.platform.subscriptions.application.service.SubscriptionRecoveryService(transaction,registry);
         }
         dev.genericpayments.platform.subscriptions.application.port.in.RecoverSubscriptionUseCase.Command publicCommand(){return new dev.genericpayments.platform.subscriptions.application.port.in.RecoverSubscriptionUseCase.Command(publicContext,fixture.local.id(),bill.id());}
-        void openReadGraph(){head();fixture.graph.payments();method();}
+        void openReadGraph(){if(retainedInvoice!=null){retainedGraph(false);return;}head();fixture.graph.payments();method();}
         void cashGraph(){var g=fixture.graph;g.invoice.addProperty("status","paid");g.invoice.addProperty("amount_paid",1000);g.invoice.addProperty("amount_remaining",0);g.allocation.addProperty("status","paid");g.allocation.addProperty("amount_paid",1000);g.intent.addProperty("status","succeeded");g.intent.addProperty("amount_received",1000);g.intent.addProperty("latest_charge","ch_owned");fixture.identity();g.graph();method();}
         void head(){fixture.identity();fixture.graph.head();fixture.graph.lines();}
-        void actionGraph(){head();fixture.graph.payments();method();fixture.graph.http.respond("GET","/v1/payment_intents/pi_owned",fixture.graph.intent.toString());fixture.graph.http.respond("GET","/v1/invoice_payments",StripeBillingSnapshotMapperTest.page(false,fixture.graph.allocation));}
+        void actionGraph(){if(retainedInvoice!=null){retainedGraph(true);return;}head();fixture.graph.payments();method();fixture.graph.http.respond("GET","/v1/payment_intents/pi_owned",fixture.graph.intent.toString());fixture.graph.http.respond("GET","/v1/invoice_payments",StripeBillingSnapshotMapperTest.page(false,fixture.graph.allocation));}
         void afterPayActionGraph(){fixture.graph.head();fixture.graph.lines();fixture.graph.payments();method();fixture.graph.http.respond("GET","/v1/payment_intents/pi_owned",fixture.graph.intent.toString());fixture.graph.http.respond("GET","/v1/invoice_payments",StripeBillingSnapshotMapperTest.page(false,fixture.graph.allocation));}
         void noAttemptGraph(){head();fixture.graph.http.respond("GET","/v1/invoice_payments",StripeBillingSnapshotMapperTest.page(false));fixture.graph.http.respond("GET","/v1/payment_methods/pm_owned","{\"id\":\"pm_owned\",\"object\":\"payment_method\",\"livemode\":false,\"customer\":\"cus_owned\",\"type\":\"card\",\"card\":{\"brand\":\"visa\"}}");}
         void method(){fixture.graph.http.respond("GET","/v1/payment_methods/pm_owned","{\"id\":\"pm_owned\",\"object\":\"payment_method\",\"livemode\":false,\"customer\":\"cus_owned\",\"type\":\"card\",\"card\":{\"brand\":\"visa\"}}");}
+        void retainAcceptedProration(){
+            var plan=new StripeSubscriptionPlanChangeTest();plan.borrowFixture(fixture);fixture.graph.subscription.addProperty("status","active");
+            var change=plan.changeCommand();plan.identityAndCurrent();plan.updateResult();assertThat(fixture.adapter.change(change).outcome()).isEqualTo(Outcome.ACCEPTED);
+            var result=plan.results.get(change.operation().id());var quote=plan.quotes.get(result.quote());planHistory=plan.proofs;
+            when(planHistory.prorations(any(),any())).thenReturn(List.of(new dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.Proration(quote,result)));
+            when(fixture.operations.find(fixture.local.siteId(),fixture.local.id(),change.operation().id())).thenReturn(Optional.of(change.operation()));
+            retainedInvoice=com.google.gson.JsonParser.parseString(plan.preview()).getAsJsonObject();retainedLines=retainedInvoice.remove("lines").getAsJsonObject();
+            retainedInvoice.addProperty("id","in_change");retainedInvoice.addProperty("billing_reason","subscription_update");retainedInvoice.addProperty("status","paid");retainedInvoice.addProperty("amount_paid",500);retainedInvoice.addProperty("amount_remaining",0);
+            for(var line:retainedLines.getAsJsonArray("data")){var l=line.getAsJsonObject();l.addProperty("invoice","in_change");l.addProperty("id",l.getAsJsonObject("pricing").getAsJsonObject("price_details").get("price").getAsString().equals("price_next")?result.debitLine():result.creditLine());}
+            var g=fixture.graph;retainedAllocation=g.allocation.deepCopy();retainedAllocation.addProperty("id","inpay_change");retainedAllocation.addProperty("invoice","in_change");retainedAllocation.addProperty("status","paid");retainedAllocation.addProperty("amount_requested",500);retainedAllocation.addProperty("amount_paid",500);retainedAllocation.addProperty("is_default",true);retainedAllocation.getAsJsonObject("payment").addProperty("payment_intent","pi_change");
+            retainedIntent=g.intent.deepCopy();retainedIntent.addProperty("id","pi_change");retainedIntent.addProperty("status","succeeded");retainedIntent.addProperty("amount",500);retainedIntent.addProperty("amount_received",500);retainedIntent.addProperty("latest_charge","ch_change");retainedIntent.remove("client_secret");
+            retainedCharge=g.charge.deepCopy();retainedCharge.addProperty("id","ch_change");retainedCharge.addProperty("payment_intent","pi_change");retainedCharge.addProperty("amount",500);retainedCharge.addProperty("amount_captured",500);
+            var old=fixture.local;var period=new Subscription.Period(old.currentPeriod().end(),old.currentPeriod().end().plusSeconds(2678400));grace=period.start().plusSeconds(259200);
+            bill=new BillingRecord(bill.id(),old.siteId(),old.id(),old.paymentAccountId(),"in_owned",BillingRecord.Kind.RENEWAL,plan.target,null,period,2000,"EUR",BillingRecord.Settlement.OPEN,0,period.start(),period.start());
+            fixture.local=new Subscription(old.id(),old.siteId(),old.customerId(),old.productId(),old.paymentAccountId(),plan.target,plan.target,Subscription.Status.PAST_DUE,old.providerReference(),period,old.paidThrough(),null,null,null,new Subscription.Debt(bill.id(),period,grace),null,old.revision()+1,old.createdAt(),period.start(),null);
+            when(proofs.bill(fixture.account.id(),fixture.local.id(),bill.id())).thenReturn(Optional.of(bill));
+            g.subscription.addProperty("status","past_due");g.item().addProperty("current_period_start",period.start().getEpochSecond());g.item().addProperty("current_period_end",period.end().getEpochSecond());var price=g.item().getAsJsonObject("price");price.addProperty("id","price_next");price.addProperty("unit_amount",2000);price.getAsJsonObject("metadata").addProperty("local_price_id",plan.target.priceId().value().toString());
+            for(String field:List.of("amount_due","amount_remaining","total","subtotal"))g.invoice.addProperty(field,2000);g.line.addProperty("amount",2000);g.line.getAsJsonObject("pricing").getAsJsonObject("price_details").addProperty("price","price_next");g.line.getAsJsonObject("period").addProperty("start",period.start().getEpochSecond());g.line.getAsJsonObject("period").addProperty("end",period.end().getEpochSecond());g.allocation.addProperty("amount_requested",2000);g.intent.addProperty("amount",2000);
+            org.springframework.test.util.ReflectionTestUtils.setField(fixture.adapter,"clock",Clock.systemUTC());org.springframework.test.util.ReflectionTestUtils.setField(fixture.adapter,"providerClock",Clock.systemUTC());
+        }
+        void retainedGraph(boolean action){
+            fixture.identity();var g=fixture.graph;g.base();g.http.respond("GET","/v1/invoices",StripeBillingSnapshotMapperTest.page(false,retainedInvoice,g.invoice));g.http.respond("GET","/v1/invoices/in_change/lines",retainedLines.toString());g.http.respond("GET","/v1/invoice_payments",StripeBillingSnapshotMapperTest.page(false,retainedAllocation));g.http.respond("GET","/v1/payment_intents/pi_change",retainedIntent.toString());g.http.respond("GET","/v1/charges/ch_change",retainedCharge.toString());g.http.respond("GET","/v1/invoice_payments",StripeBillingSnapshotMapperTest.page(false,retainedAllocation));g.lines();g.payments();method();
+            if(action){g.http.respond("GET","/v1/payment_intents/pi_owned",g.intent.toString());g.http.respond("GET","/v1/invoice_payments",StripeBillingSnapshotMapperTest.page(false,g.allocation));}
+        }
         ProviderOperation payStep(){return fixture.steps.rows.values().stream().filter(s->s.kind()==ProviderOperation.Kind.INVOICE_PAY).findFirst().orElseThrow();}
         public void close(){fixture.close();}
     }

@@ -17,7 +17,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 /** Owned loopback only. Persistence durability/concurrency is separately hosted. */
 class StripeSubscriptionPlanChangeTest {
     static final Instant NOW=StripeBillingSnapshotMapperTest.START.plusSeconds(100);
-    final StripeSubscriptionCreateTest fixture=new StripeSubscriptionCreateTest();
+    StripeSubscriptionCreateTest fixture;
     SubscriptionPriceTerms target;
     StripeBillingOwnership ownership;
     boolean replacedActualLine;
@@ -27,7 +27,11 @@ class StripeSubscriptionPlanChangeTest {
     final Map<UUID,dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.Result> results=new HashMap<>();
     final Map<UUID,dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.Schedule> schedules=new HashMap<>();
     @BeforeEach void setup() throws Exception {
-        fixture.setup();fixture.local=fixture.graph.local;
+        fixture=new StripeSubscriptionCreateTest();fixture.setup();configureExisting();
+    }
+    void borrowFixture(StripeSubscriptionCreateTest existing){fixture=existing;configureExisting();}
+    void configureExisting(){
+        fixture.local=fixture.graph.local;
         org.springframework.test.util.ReflectionTestUtils.setField(fixture.adapter,"clock",Clock.fixed(NOW,ZoneOffset.UTC));
         org.springframework.test.util.ReflectionTestUtils.setField(fixture.adapter,"providerClock",Clock.fixed(NOW,ZoneOffset.UTC));
         org.springframework.test.util.ReflectionTestUtils.setField(fixture.adapter,"planProofs",proofs);

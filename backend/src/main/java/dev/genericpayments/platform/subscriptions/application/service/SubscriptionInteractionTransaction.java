@@ -129,7 +129,7 @@ public class SubscriptionInteractionTransaction {
         if(!g.account().equals(r.account().id())||!g.site().equals(r.subscription().siteId())||!g.customer().equals(r.subscription().customerId())||!g.subscription().equals(r.subscription().id())||!g.operation().equals(r.operation().id())
             ||!java.security.MessageDigest.isEqual(g.tokenDigest().getBytes(java.nio.charset.StandardCharsets.US_ASCII),digest(token).getBytes(java.nio.charset.StandardCharsets.US_ASCII)))throw SubscriptionRuleErrors.conflict();
         if(r.operation().kind()==SubscriptionOperation.Kind.CHANGE&&(!g.binding().schema().equals("change-v1")||r.subscription().pendingChange()==null||!r.subscription().pendingChange().operationId().equals(r.operation().id())))throw SubscriptionRuleErrors.conflict();
-        if(r.operation().kind()==SubscriptionOperation.Kind.RECOVER&&(!g.binding().schema().equals("recovery-v1")||r.subscription().debt()==null||!SubscriptionRecoveryTransaction.recoveryBill(r.operation()).filter(r.subscription().debt().billingRecordId()::equals).isPresent()))throw SubscriptionRuleErrors.conflict();
+        if(r.operation().kind()==SubscriptionOperation.Kind.RECOVER&&(!recoveryPolicyCurrent(r)||!g.binding().schema().equals("recovery-v1")||r.subscription().debt()==null||!SubscriptionRecoveryTransaction.recoveryBill(r.operation()).filter(r.subscription().debt().billingRecordId()::equals).isPresent()))throw SubscriptionRuleErrors.conflict();
         return g;
     }
     private dev.genericpayments.platform.customers.application.model.CustomerSessionContext customer(SubscriptionCommandContext c){
@@ -137,9 +137,11 @@ public class SubscriptionInteractionTransaction {
         actor.session().requireScope(dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_MANAGE);return actor.session();
     }
     private static void requireSame(State before,State after){if(!before.account().equals(after.account())||before.subscription().revision()!=after.subscription().revision()||before.operation().version()!=after.operation().version())throw SubscriptionRuleErrors.conflict();}
+    private static boolean recoveryPolicyCurrent(State r){return r.operation().kind()!=SubscriptionOperation.Kind.RECOVER||r.policy().enabled()&&r.policy().version()==r.operation().policyVersion();}
     public boolean browserConfirmationAllowed(ConfirmSubscriptionActionUseCase.Command c,State r){
         return tx.requiresNew(()->{
             var fresh=authorized(c.context(),r.subscription().id(),operations.lock(r.operation().id()),true);
+            if(!recoveryPolicyCurrent(fresh))return false;
             var session=customer(c.context());var now=securityClock.instant();var grant=billingGrant(fresh,c.actionToken());
             // Reply persistence changes the operation version. The immutable consumed receipt remains the authority.
             return fresh.account().provider()==PaymentProviderType.STRIPE&&fresh.account().status()==PaymentAccountStatus.ACTIVE

@@ -24,14 +24,17 @@ public class StripeBillingActionAdapter implements SubscriptionClientSessionPort
   var operation=ownership.lookupOperation(lookup);
   if(operation.kind()==SubscriptionOperation.Kind.CREATE&&dev.genericpayments.platform.subscriptions.application.service.CreateSubscriptionFingerprint.startsTrial(operation.fingerprint())
       &&(lookup.reference()!=null||!ownership.setupPurpose(lookup)))return null;
+  if(terminal(operation))return null;
   if(ownership.setupPurpose(lookup))return setupAction(lookup);
-  var proof=ownership.acknowledgedPayment(lookup);if(terminal(proof.operation()))return null;
-  var old=tx.requiresNew(()->actions.current(lookup.account().id(),proof.operation().id()).orElse(null));
+  var old=tx.requiresNew(()->actions.current(lookup.account().id(),operation.id()).orElse(null));
   if(old!=null&&old.consumedAt()!=null)return null;
+  var proof=ownership.acknowledgedPayment(lookup);
   var graph=read(proof);
   return tx.requiresNew(()->{
-   operations.lock(proof.operation().id());var fresh=ownership.acknowledgedPayment(lookup);same(proof,fresh);
-   var now=securityClock.instant().truncatedTo(ChronoUnit.MICROS);var current=actions.current(lookup.account().id(),proof.operation().id()).orElse(null);
+   operations.lock(proof.operation().id());var current=actions.current(lookup.account().id(),proof.operation().id()).orElse(null);
+   if(current!=null&&current.consumedAt()!=null)return null;
+   var fresh=ownership.acknowledgedPayment(lookup);same(proof,fresh);if(!ownership.recoveryActionAvailable(fresh))throw StripeBillingOwnership.mismatch();
+   var now=securityClock.instant().truncatedTo(ChronoUnit.MICROS);
    if(current!=null){if(current.consumedAt()!=null)return null;if(!current.binding().equals(graph.binding()))throw StripeBillingOwnership.mismatch();
     if(current.available(now))return action(current);if(now.isBefore(current.issuedAt()))throw StripeBillingOwnership.mismatch();}
    var expires=now.plusSeconds(600);
@@ -53,9 +56,9 @@ public class StripeBillingActionAdapter implements SubscriptionClientSessionPort
  public SubscriptionClientSession retrieve(Lookup lookup,SubscriptionClientGrant grant,String token){
   outside();if(!tokens.enabled()||!grant.available(securityClock.instant())||!StripeBillingGrantTokens.matches(token,grant.tokenDigest()))throw StripeBillingOwnership.unsupported();
   if(grant.binding().flow()==SubscriptionClientSession.Flow.SETUP)return setupSession(lookup,grant,token);
-  var proof=ownership.acknowledgedPayment(lookup);if(terminal(proof.operation())||!grant.operation().equals(proof.operation().id())||!grant.account().equals(lookup.account().id())||!grant.subscription().equals(lookup.subscriptionId()))throw StripeBillingOwnership.mismatch();
+  var proof=ownership.acknowledgedPayment(lookup);if(terminal(proof.operation())||!ownership.recoveryActionAvailable(proof)||!grant.operation().equals(proof.operation().id())||!grant.account().equals(lookup.account().id())||!grant.subscription().equals(lookup.subscriptionId()))throw StripeBillingOwnership.mismatch();
   if(!java.security.MessageDigest.isEqual(token.getBytes(java.nio.charset.StandardCharsets.UTF_8),tokens.token(grant.keyVersion(),grant.descriptor()).getBytes(java.nio.charset.StandardCharsets.UTF_8)))throw StripeBillingOwnership.mismatch();
-  var graph=read(proof);same(proof,ownership.acknowledgedPayment(lookup));if(!graph.binding().equals(grant.binding())||!grant.available(securityClock.instant()))throw StripeBillingOwnership.mismatch();
+  var graph=read(proof);var fresh=ownership.acknowledgedPayment(lookup);same(proof,fresh);if(!ownership.recoveryActionAvailable(fresh)||!graph.binding().equals(grant.binding())||!grant.available(securityClock.instant()))throw StripeBillingOwnership.mismatch();
   return new SubscriptionClientSession("stripe",SubscriptionClientSession.Flow.PAYMENT,credentials.resolve(lookup.account()).publishableKey(),graph.clientSecret(),token,grant.expiresAt());
  }
  public OwnedSetupReceipt confirmPreparedSetup(Command command,String token){

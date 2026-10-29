@@ -445,7 +445,7 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
         if(recoveryProofs==null)throw unsupported();
         ProviderOperation claimed=null;String owner=null;
         try{
-            var proof=ownership.recovery(command,recoveryProofs,proofs);var a=proof.account();var s=proof.subscription();var o=proof.operation();
+            var proof=ownership.recovery(command,recoveryProofs,proofs,planProofs);var a=proof.account();var s=proof.subscription();var o=proof.operation();
             if(!Set.of(SubscriptionOperation.Status.RESERVED,SubscriptionOperation.Status.PROCESSING,SubscriptionOperation.Status.UNKNOWN,SubscriptionOperation.Status.REQUIRES_ACTION).contains(o.status()))return unknown();
             if(!recoveryProofs.available(a.id(),s.id(),proof.bill().providerInvoiceReference(),o.id()))return unknown();
             verification.verify(a);var read=StripeBillingSnapshotMapper.retrieveRecovery(client(a),proof,providerClock.instant());
@@ -462,13 +462,13 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
             var reserved=steps.reserve(a,ProviderOperation.Kind.INVOICE_PAY,o.id(),key,fp);requirePayStep(a,o,reserved,fp,proof.bill().providerInvoiceReference());
             if(reserved.status()==ProviderOperation.Status.ACKNOWLEDGED)return unknown();
             owner=UUID.randomUUID().toString();var claim=steps.claim(reserved.id(),owner,providerClock.instant(),Duration.ofSeconds(60));if(claim.isEmpty())return unknown();claimed=claim.get();
-            ownership.recovery(command,recoveryProofs,proofs);recoveryProofs.authorize(s,o,proof.bill(),proof.origin());
+            ownership.recovery(command,recoveryProofs,proofs,planProofs);recoveryProofs.authorize(s,o,proof.bill(),proof.origin());
             String dispatch=guard.requireDispatch(claimed,a,fp,providerClock.instant());
             var response=client(a).v1().invoices().pay(proof.bill().providerInvoiceReference(),com.stripe.param.InvoicePayParams.builder().setPaymentMethod(read.method()).build(),RequestOptions.builder().setIdempotencyKey(dispatch).build());
             if(response==null||!proof.bill().providerInvoiceReference().equals(response.getId())||!"invoice".equals(response.getObject())||!Boolean.FALSE.equals(response.getLivemode())||!proof.customer().providerReference().equals(response.getCustomer())||!proof.bill().currency().equalsIgnoreCase(response.getCurrency())||!Objects.equals(proof.bill().amountDueMinor(),response.getAmountDue())||!StripeBillingMutationAdapter.noAdjustments(response)||response.getParent()==null||response.getParent().getSubscriptionDetails()==null||!s.providerReference().equals(response.getParent().getSubscriptionDetails().getSubscription()))throw mismatch();
             // The POST response alone neither proves cash nor creates a client capability.
             var after=StripeBillingSnapshotMapper.retrieveRecovery(client(a),proof,providerClock.instant());
-            ownership.recovery(command,recoveryProofs,proofs);
+            ownership.recovery(command,recoveryProofs,proofs,planProofs);
             recoveryProofs.recordPay(s,o,proof.bill(),proof.origin(),claimed,owner,after.allocation(),after.intent());return accepted(s.providerReference());
         }catch(StripeException|RuntimeException uncertain){if(claimed!=null)steps.unknown(claimed.id(),owner,claimed.version());return unknown();}
     }

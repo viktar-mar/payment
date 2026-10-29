@@ -307,6 +307,73 @@ class StripeSubscriptionRecoveryProofIntegrationTest extends SubscriptionFactFix
         assertUnchanged(w.pending().subscription());
     }
 
+    @Test void retainedRecoveryGrantCannotReleaseClientMaterialAfterEnabledPolicyVersionChanges() {
+        var w = workflow("retained-client-policy");
+        var before = storedGrant(w.grant().grant());
+        var receipt = proofs.receipt(account.id(), w.pending().operation().id()).orElseThrow();
+        changeEnabledPolicy(w);
+        ruleConflict(() -> clientUseCase.issue(clientCommand(w)));
+        assertThat(storedGrant(w.grant().grant())).isEqualTo(before);
+        assertThat(proofs.receipt(account.id(), w.pending().operation().id())).contains(receipt);
+        verify(clientSessions, never()).retrieve(any(), any(), anyString());
+        assertUnchanged(w.pending().subscription());
+    }
+
+    @Test void retainedBoundRecoveryGrantCannotBeNewlyConsumedAfterEnabledPolicyVersionChanges() {
+        var w = workflow("retained-confirm-policy");
+        clientUseCase.issue(clientCommand(w));
+        var before = storedGrant(w.grant().grant());
+        assertThat(before.sessionId()).isNotNull();
+        assertThat(before.consumedAt()).isNull();
+        changeEnabledPolicy(w);
+        ruleConflict(() -> confirmations.confirm(confirmCommand(w)));
+        assertThat(storedGrant(w.grant().grant())).isEqualTo(before);
+        verify(provider, never()).confirmAction(any(), anyString());
+        assertUnchanged(w.pending().subscription());
+    }
+
+    @Test void policyVersionChangingDuringExternalClientReadPreventsFinalRecoverySessionBinding() {
+        var w = workflow("during-client-policy");
+        var before = storedGrant(w.grant().grant());
+        var externalRead = new java.util.concurrent.atomic.AtomicBoolean();
+        when(clientSessions.retrieve(any(), any(), eq(w.grant().raw()))).thenAnswer(call -> {
+            assertThat(tx.active()).isFalse();
+            externalRead.set(true);
+            changeEnabledPolicy(w);
+            return new SubscriptionClientSession("stripe", SubscriptionClientSession.Flow.PAYMENT, "pk_test_fixture", "pi_recovery_secret_memory_fixture", w.grant().raw(), w.grant().grant().expiresAt());
+        });
+        ruleConflict(() -> clientUseCase.issue(clientCommand(w)));
+        assertThat(externalRead).isTrue();
+        assertThat(storedGrant(w.grant().grant())).isEqualTo(before);
+        assertUnchanged(w.pending().subscription());
+    }
+
+    @Test void policyVersionChangingAfterNewClaimNeverReturnsRecoveryBrowserPermissionOrReopensGrant() {
+        var w = workflow("after-new-policy");
+        clientUseCase.issue(clientCommand(w));
+        var before = storedGrant(w.grant().grant());
+        var receipt = proofs.receipt(account.id(), w.pending().operation().id()).orElseThrow();
+        var acknowledged = new java.util.concurrent.atomic.AtomicBoolean();
+        when(provider.confirmAction(any(), eq(w.grant().raw()))).thenAnswer(call -> {
+            assertThat(tx.active()).isFalse();
+            assertThat(storedGrant(w.grant().grant()).consumedAt()).isNotNull();
+            acknowledged.set(true);
+            changeEnabledPolicy(w);
+            return new Reply(Outcome.ACCEPTED, w.pending().subscription().providerReference(), null);
+        });
+        var result = confirmations.confirm(confirmCommand(w));
+        assertThat(acknowledged).isTrue();
+        assertThat(result.browserConfirmAllowed()).isFalse();
+        var spent = storedGrant(w.grant().grant());
+        assertThat(spent.consumedAt()).isNotNull();
+        assertThat(spent.descriptor()).isEqualTo(before.descriptor());
+        assertThat(spent.sessionId()).isEqualTo(before.sessionId());
+        assertThat(proofs.receipt(account.id(), w.pending().operation().id())).contains(receipt);
+        assertThat(confirmations.confirm(confirmCommand(w)).browserConfirmAllowed()).isFalse();
+        assertThat(storedGrant(w.grant().grant()).consumedAt()).isEqualTo(spent.consumedAt());
+        assertUnchanged(w.pending().subscription());
+    }
+
     @Test void lostRecoveryConfirmationAckNeverReopensConsumedBrowserPermission() {
         var w = workflow("lost-ack"); clientUseCase.issue(clientCommand(w));
         doThrow(new IllegalStateException("lost original acknowledgement")).when(provider).confirmAction(any(), eq(w.grant().raw()));
@@ -436,6 +503,16 @@ class StripeSubscriptionRecoveryProofIntegrationTest extends SubscriptionFactFix
     }
     private CreateSubscriptionClientSessionUseCase.Command clientCommand(Workflow w) { return new CreateSubscriptionClientSessionUseCase.Command(w.context(), w.pending().subscription().id(), w.pending().operation().id(), w.grant().raw()); }
     private ConfirmSubscriptionActionUseCase.Command confirmCommand(Workflow w) { return new ConfirmSubscriptionActionUseCase.Command(w.context(), w.pending().subscription().id(), w.pending().operation().id(), w.grant().raw()); }
+    private void changeEnabledPolicy(Workflow w) {
+        var current = policies.load(site);
+        assertThat(current.enabled()).isTrue();
+        assertThat(current.version()).isEqualTo(w.pending().operation().policyVersion());
+        var saved = policies.save(new SubscriptionPolicy(site, current.version(), true, current.graceDays() + 1,
+            current.allowImmediateCancellation(), current.portalEnabled(), current.deferUpgrades(), current.portalReturnUrls()), current.version());
+        assertThat(saved.enabled()).isTrue();
+        assertThat(saved.version()).isEqualTo(w.pending().operation().policyVersion() + 1);
+        assertThat(op(w.pending().operation().id()).policyVersion()).isEqualTo(w.pending().operation().policyVersion());
+    }
     private void assertUnchanged(Subscription before) {
         assertThat(sub(before.id())).isEqualTo(before);
         assertThat(sub(before.id()).paidThrough()).isEqualTo(PAID_THROUGH);

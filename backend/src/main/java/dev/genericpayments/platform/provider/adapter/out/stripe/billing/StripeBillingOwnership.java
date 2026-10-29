@@ -68,6 +68,9 @@ public final class StripeBillingOwnership {
     public record OriginalRecovery(PaymentAccount account,Subscription subscription,SubscriptionOperation operation,CustomerBinding customer,ProviderOperation step,StripeBillingSnapshotMapper.PublishedPrice price,BillingRecord bill,SubscriptionRecoveryProofStore.Origin origin,SubscriptionRecoveryProofStore.Receipt result,List<StripeBillingSnapshotMapper.PublishedPrice> prices,List<SubscriptionPlanProofStore.Proration> history) implements PaymentProof{}
     /** Consent comes from the immutable acknowledged CREATE request, never today's native status. */
     public OriginalRecovery recovery(dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Command command,SubscriptionRecoveryProofStore store,SubscriptionBillingProofStore billing){
+        return recovery(command,store,billing,plans);
+    }
+    public OriginalRecovery recovery(dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Command command,SubscriptionRecoveryProofStore store,SubscriptionBillingProofStore billing,SubscriptionPlanProofStore history){
         var a=command.account();var s=owned(a,command.operation().subscriptionId());var o=lookupOperation(new Lookup(a,s.id(),s.providerReference(),command.operation().providerOperationKey()));
         if(!o.equals(command.operation())||o.kind()!=SubscriptionOperation.Kind.RECOVER||!s.nonTerminal()||s.pendingChange()!=null||s.debt()==null||s.revision()!=o.expectedRevision()
             ||!s.billingPrice().equals(command.current())||!Objects.equals(s.providerReference(),command.providerSubscriptionReference())||command.startTrial()||command.target()!=null||command.providerQuoteReference()!=null)throw mismatch();
@@ -86,7 +89,7 @@ public final class StripeBillingOwnership {
         requireStep(a,s,source,step,fp);if(step.status()!=ProviderOperation.Status.ACKNOWLEDGED||!s.providerReference().equals(step.providerReference())||!s.providerReference().equals(source.providerReference()))throw mismatch();
         var receipt=store.receipt(a.id(),o.id()).orElse(null);
         if(receipt!=null&&(!receipt.operation().equals(o.id())||!receipt.subscription().equals(s.id())||!receipt.account().equals(a.id())||!receipt.billingRecord().equals(bill.id())||!receipt.reference().equals(s.providerReference())||!receipt.invoice().equals(bill.providerInvoiceReference())||!receipt.originOperation().equals(source.id())||!receipt.originStep().equals(step.id())))throw mismatch();
-        return new OriginalRecovery(a,s,o,b,step,price(a,s,bill.billedPrice()),bill,origin,receipt,prices,plans==null?List.of():planHistory(a,s,plans));
+        return new OriginalRecovery(a,s,o,b,step,price(a,s,bill.billedPrice()),bill,origin,receipt,prices,history==null?List.of():planHistory(a,s,history));
     }
     public boolean setupPurpose(Lookup lookup){var o=lookupOperation(lookup);return proofs!=null&&(o.kind()==SubscriptionOperation.Kind.SETUP||o.kind()==SubscriptionOperation.Kind.CREATE&&CreateSubscriptionFingerprint.startsTrial(o.fingerprint())&&owned(lookup.account(),lookup.subscriptionId()).billingPrice().trialPolicy()==dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.REQUIRED_BEFORE_TRIAL);}
     public SubscriptionOperation lookupOperation(Lookup lookup){
@@ -119,8 +122,10 @@ public final class StripeBillingOwnership {
     public OriginalRecovery acknowledgedRecovery(Lookup lookup){
         if(recoveryProofs==null)throw unsupported();var s=owned(lookup.account(),lookup.subscriptionId());var o=lookupOperation(lookup);var saved=recoveryProofs.receipt(lookup.account().id(),o.id()).orElseThrow(StripeBillingOwnership::mismatch);
         var p=recovery(new Command(lookup.account(),o,s.billingPrice(),null,s.providerReference(),saved.invoice(),null,false,false),recoveryProofs,proofs);
-        if(p.result()==null||p.result().allocation()==null||p.result().intent()==null||!recoveryProofs.available(lookup.account().id(),s.id(),saved.invoice(),o.id()))throw mismatch();return p;
+        if(p.result()==null||p.result().allocation()==null||p.result().intent()==null)throw mismatch();return p;
     }
+    /** Mutable issuance exclusions are separate from reconstructing an immutable original receipt. */
+    public boolean recoveryActionAvailable(PaymentProof proof){return !(proof instanceof OriginalRecovery recovery)||recoveryProofs!=null&&recoveryProofs.available(proof.account().id(),proof.subscription().id(),recovery.bill().providerInvoiceReference(),proof.operation().id());}
     public OriginalChange acknowledgedChange(Lookup lookup){
         if(plans==null)throw unsupported();var a=lookup.account();var s=owned(a,lookup.subscriptionId());var o=lookupOperation(lookup);
         var selected=planHistory(a,s,plans).stream().filter(p->p.result().operation().equals(o.id())).toList();if(o.kind()!=SubscriptionOperation.Kind.CHANGE||selected.size()!=1)throw mismatch();
