@@ -4,6 +4,7 @@ import type { Page } from "@playwright/test";
 import { adminLogin, adminUrl, challenge, customerFixture, demoPath, localEmail, signIn } from "./support/customer-api";
 import { enterPrivateText } from './support/private-entry';
 import { alternateLoopbackOrigin } from './support/loopback-origin.mjs';
+import { submitOtpChallenge } from './support/otp-challenge-response';
 
 test.use({ trace: "off", screenshot: "off", video: "off" });
 
@@ -354,12 +355,13 @@ for(const unavailable of ["configuration","delivery"] as const)test(`real OTP ${
     if(unavailable==="delivery"){await ownedContainerCommand(process.env,'stop');stopped=true;}
     for(const email of [knownEmail,localEmail()]) {
       await page.reload();const component=page.locator("generic-email-otp");
-      const received=page.waitForResponse(r=>r.url().endsWith("/customer-auth/email-otp/challenges")&&r.request().method()==="POST");
-      await enterPrivateText(component.getByRole("textbox",{name:"Email",exact:true}),email);
-      await component.getByRole("textbox",{name:"Email",exact:true}).press("Enter");
-      const response=await received;expect(response.status()).toBe(unavailable==="delivery"?202:503);
+      const response=await submitOtpChallenge(page,`${api.backendUrl}/api/v1/public/customer-auth/email-otp/challenges`,unavailable==="delivery",async()=>{
+        await enterPrivateText(component.getByRole("textbox",{name:"Email",exact:true}),email);
+        await component.getByRole("textbox",{name:"Email",exact:true}).press("Enter");
+      });
+      expect(response.status).toBe(unavailable==="delivery"?202:503);
       if(unavailable==="delivery") {
-        expect(Object.keys(await response.json()).sort()).toEqual(["challenge_id","expires_at"]);
+        expect(response.fields).toEqual(["challenge_id","expires_at"]);
         await expect(component.getByRole("status")).toHaveText("If available, use the code sent to your email.");
         await expect(component.getByRole("textbox",{name:"Six-digit code"})).toBeFocused();
       } else await expect(component.getByRole("alert")).toHaveText("Unable to complete sign in. Please try again.");

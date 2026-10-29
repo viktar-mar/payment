@@ -42,6 +42,8 @@ test('normal Playwright excludes Node-only support regressions without hiding or
     ['tests/support/provider-mount-browser.test.ts',true],
     ['tests/support/stripe-sandbox-fixtures.test.ts',true],
     ['tests/support/stripe-sandbox-fixtures.ts',false],
+    ['tests/support/otp-challenge-response.test.ts',true],
+    ['tests/support/otp-challenge-response.ts',false],
     ['tests/checkout.spec.ts',false],
     ['tests/donations.spec.ts',false],
     ['tests/subscriptions.spec.ts',false],
