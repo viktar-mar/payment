@@ -152,7 +152,8 @@ class StripeSubscriptionNoSubCancellationIntegrationTest extends SubscriptionFac
             try {
                 int dispatchPid = awaitAccountWait(blockerPid, "%for share%");
                 abandon = pool.submit(() -> failureCode(() -> cancellations.abandon(request.context(), original.id(), request.mode(), candidate)));
-                int abandonPid = awaitAccountWait(blockerPid, "%for%update%");
+                // pg_blocking_pids reports direct edges: the second row-lock waiter queues behind the first.
+                int abandonPid = awaitAccountWait(dispatchPid, "%for%update%");
                 assertThat(abandonPid).isNotEqualTo(dispatchPid);
             } finally { blocker.rollback(); }
             var claimed = dispatch.get(15, TimeUnit.SECONDS);
@@ -182,7 +183,7 @@ class StripeSubscriptionNoSubCancellationIntegrationTest extends SubscriptionFac
             try {
                 int abandonPid = awaitAccountWait(blockerPid, "%for%update%");
                 dispatch = pool.submit(() -> failureCode(() -> claim(reserved)));
-                int dispatchPid = awaitAccountWait(blockerPid, "%for share%");
+                int dispatchPid = awaitAccountWait(abandonPid, "%for share%");
                 assertThat(dispatchPid).isNotEqualTo(abandonPid);
             } finally { blocker.rollback(); }
             assertAbandoned(abandon.get(15, TimeUnit.SECONDS));
