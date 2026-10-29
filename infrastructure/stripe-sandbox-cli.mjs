@@ -577,10 +577,10 @@ async function createCliAdapter(options,dependencies,purpose) {
   }
   function bindOwnedBillingGraph(value,context){
     billingListener(context);if(billingGraph)fail();
-    const keys=['runId','expectedSource','accountId','siteId','customerId','subscriptionId','operationId','priceId','priceVersion','customerReference','subscriptionReference','productReference','priceReference','invoiceReference','allocationReference','intentReference','chargeReference','periodStart','periodEnd'];
+    const keys=['runId','expectedSource','accountId','siteId','customerId','subscriptionId','operationId','priceId','priceVersion','customerReference','subscriptionReference','productReference','priceReference','invoiceReference','allocationReference','intentReference','periodStart','periodEnd'];
     const v=exactData(value,keys);
     if(v.runId!==runId||v.expectedSource!==options.expectedSource||!['accountId','siteId','customerId','subscriptionId','operationId','priceId'].every(k=>typeof v[k]==='string'&&UUID.test(v[k]))||v.priceVersion!==1)fail();
-    for(const [name,prefix] of Object.entries({customer:'cus',subscription:'sub',product:'prod',price:'price',invoice:'in',allocation:'inpay',intent:'pi',charge:'ch'}))if(typeof v[name+'Reference']!=='string'||!new RegExp('^'+prefix+'_[A-Za-z0-9_]{1,200}$').test(v[name+'Reference']))fail();
+    for(const [name,prefix] of Object.entries({customer:'cus',subscription:'sub',product:'prod',price:'price',invoice:'in',allocation:'inpay',intent:'pi'}))if(typeof v[name+'Reference']!=='string'||!new RegExp('^'+prefix+'_[A-Za-z0-9_]{1,200}$').test(v[name+'Reference']))fail();
     if(!Number.isSafeInteger(v.periodStart)||v.periodStart<=0||!Number.isSafeInteger(v.periodEnd)||v.periodEnd<=v.periodStart)fail();
     billingGraph=Object.freeze(v);return true;
   }
@@ -620,13 +620,16 @@ async function createCliAdapter(options,dependencies,purpose) {
     function allocationProof(v){exact(v,t.allocationReference,'invoice_payment');require(v.invoice===t.invoiceReference&&v.currency==='eur'&&v.is_default===true&&v.status==='paid'&&v.amount_paid===2000&&v.amount_requested===2000&&v.payment?.type==='payment_intent'&&v.payment.payment_intent===t.intentReference&&Number.isSafeInteger(v.status_transitions?.paid_at)&&v.status_transitions.paid_at>0);}
     const allocations=await pages('/v1/invoice_payments',[['invoice',t.invoiceReference]]);require(allocations.length===1);allocationProof(allocations[0]);
     const intent=await read('/v1/payment_intents/'+t.intentReference);exact(intent,t.intentReference,'payment_intent');
-    require(intent.customer===t.customerReference&&intent.status==='succeeded'&&intent.amount===2000&&intent.amount_received===2000&&intent.currency==='eur'&&intent.capture_method==='automatic'&&Array.isArray(intent.payment_method_types)&&intent.payment_method_types.length===1&&intent.payment_method_types[0]==='card'&&intent.latest_charge===t.chargeReference);
-    const charge=await read('/v1/charges/'+t.chargeReference);exact(charge,t.chargeReference,'charge');
+    require(intent.customer===t.customerReference&&intent.status==='succeeded'&&intent.amount===2000&&intent.amount_received===2000&&intent.currency==='eur'&&intent.capture_method==='automatic'&&Array.isArray(intent.payment_method_types)&&intent.payment_method_types.length===1&&intent.payment_method_types[0]==='card'&&typeof intent.latest_charge==='string'&&/^ch_[A-Za-z0-9_]{1,200}$/.test(intent.latest_charge));
+    const chargeReference=intent.latest_charge;
+    const charge=await read('/v1/charges/'+chargeReference);exact(charge,chargeReference,'charge');
     require(charge.customer===t.customerReference&&charge.payment_intent===t.intentReference&&charge.status==='succeeded'&&charge.paid===true&&charge.captured===true&&charge.amount===2000&&charge.amount_captured===2000&&charge.currency==='eur'&&charge.payment_method_details?.type==='card'&&charge.amount_refunded===0&&charge.refunded===false);
     const noRefunds=value=>value?.object==='list'&&empty(value.data)&&value.has_more===false;
     if(Object.hasOwn(charge,'refunds'))require(noRefunds(charge.refunds));
-    require(noRefunds(await read('/v1/refunds',[['charge',t.chargeReference],['limit',100]])));
+    require(noRefunds(await read('/v1/refunds',[['charge',chargeReference],['limit',100]])));
     const reverse=await pages('/v1/invoice_payments',[['payment[type]','payment_intent'],['payment[payment_intent]',t.intentReference]]);require(reverse.length===1);allocationProof(reverse[0]);require(reverse[0].status_transitions.paid_at===allocations[0].status_transitions.paid_at);
+    const latest=await read('/v1/payment_intents/'+t.intentReference);exact(latest,t.intentReference,'payment_intent');
+    require(latest.latest_charge===chargeReference&&latest.customer===t.customerReference&&latest.status==='succeeded'&&latest.amount_received===2000&&latest.currency==='eur');
     billingListener(context);return Object.freeze({providerVerified:true,initialCashVerified:true,lineCount:1,allocationCount:1,chargeCount:1});
   }
 

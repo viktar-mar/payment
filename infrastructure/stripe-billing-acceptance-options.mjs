@@ -28,3 +28,20 @@ export function validateBillingAcceptanceOptions(value){
     return Object.freeze({...base,env:Object.freeze({PAYMENT_STRIPE_SANDBOX_ENABLED:'true',[FLAG]:'true'}),approvedBinding:Object.freeze({externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'}),selectedCase:'initial_success',protocol:'SERVER_CONFIRM_V2',budget:Object.freeze({create:1,confirm:1})});
   }catch{return null;}
 }
+
+/** Explicit native environment boundary. Check every security flag before making a plain snapshot.
+ * process.env has an exotic prototype; no unrelated environment value is enumerated or read.
+ */
+export function snapshotBillingAcceptanceEnvironment(raw){
+  try{
+    if(!raw||typeof raw!=='object'||Array.isArray(raw))return null;
+    const snapshot={};
+    for(const key of [FLAG,'PAYMENT_STRIPE_SANDBOX_ENABLED',...EXCLUDED,'DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE']){
+      const own=Object.getOwnPropertyDescriptor(raw,key);
+      if(own){if(!own.enumerable||!Object.hasOwn(own,'value'))return null;snapshot[key]=own.value;}
+      let parent=Object.getPrototypeOf(raw),depth=0;
+      while(parent){if(++depth>32||Object.getOwnPropertyDescriptor(parent,key))return null;parent=Object.getPrototypeOf(parent);}
+    }
+    return billingAcceptanceOptIn(snapshot)?Object.freeze(snapshot):null;
+  }catch{return null;}
+}

@@ -282,3 +282,10 @@ test('Billing preflight reuses exact source daemon and six-port proof without le
   safe(await owned.preflightOwnedBilling(input,f.dependencies),{status:'READY'});assert.equal(f.calls.filter(c=>c.type==='port').length,6);
   const wrong=fixture({head:'b'.repeat(40)});safe(await owned.preflightOwnedBilling(input,wrong.dependencies),pending('SOURCE','SOURCE_MISMATCH'));assert.equal(wrong.calls.filter(c=>c.type==='port').length,0);
 });
+test('Billing runtime preflight cancellation reaches command and prevents late source-to-daemon continuation',async()=>{
+ const controller=new AbortController(),f=fixture();let release,signal;
+ f.dependencies.execute=async(_file,_args,settings)=>{signal=settings.signal;return new Promise(r=>release=r);};
+ const input=options({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_success'});
+ const pending=owned.preflightOwnedBilling(input,f.dependencies,{deadline:Date.now()+1000,signal:controller.signal});await new Promise(r=>setTimeout(r,5));controller.abort();
+ assert.equal((await pending).status,'PENDING');assert.equal(signal.aborted,true);release({stdout:source+'\n',stderr:''});await new Promise(r=>setTimeout(r,5));assert.deepEqual(f.calls,[]);
+});

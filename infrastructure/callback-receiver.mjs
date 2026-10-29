@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -92,15 +92,16 @@ export function createOwnedAccessRuntime({backendUrl,clockUrl,capability}) {
 }
 
 /** Internal local-development receiver: never retains bodies, secrets in diagnostics, or provider data. */
-export function createReceiver({accessCache,accessRuntime}={}) {
+export function createReceiver({accessCache,accessRuntime}={}, {createServer=http.createServer}={}) {
   let key, version;
-  const events=new Map(); let duplicates=0;
-  const server=http.createServer(async (req,res) => {
+  const events=new Map(),digests=new Map(); let duplicates=0;
+  const server=createServer(async (req,res) => {
     const route=req.url;
-    if(!['/configure','/callback','/inspection','/health',...(accessRuntime?['/access','/access/configure']:[])].includes(route)) return json(res,404,{error:'not_found'});
+    if(!['/configure','/callback','/inspection','/inspection/digests','/health',...(accessRuntime?['/access','/access/configure']:[])].includes(route)) return json(res,404,{error:'not_found'});
     const expected=route==='/configure'||route==='/callback'||route==='/access/configure'?'POST':'GET';
     if(req.method!==expected) return json(res,405,{error:'method_not_allowed'});
     if(route==='/health') return json(res,200,{status:'UP'});
+    if(route==='/inspection/digests') return json(res,200,{count:events.size,duplicates,events:[...events.values()].map(event=>({...event,sha256:digests.get(event.event_id)}))});
     if(route==='/inspection') return json(res,200,{count:events.size,duplicates,events:[...events.values()]});
     if(route==='/access') {
       try {const result=await accessRuntime.read();return json(res,result?200:409,result??{error:'access_not_configured'});}
@@ -148,6 +149,7 @@ export function createReceiver({accessCache,accessRuntime}={}) {
         accessCache?.observe(p);
         accessRuntime?.observe(p);
         events.set(p.event_id,{event_id:p.event_id,event_type:p.event_type,count:1});
+        digests.set(p.event_id,createHash('sha256').update(body).digest('hex'));
       }
       return json(res,204);
     } catch {if(!res.headersSent)json(res,400,{error:'invalid_request'});}

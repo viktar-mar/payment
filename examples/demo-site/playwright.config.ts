@@ -6,7 +6,7 @@ const externalOrigin = process.env.PAYMENT_E2E_DEMO_ORIGIN;
 
 export default defineConfig({
   testDir: "./tests",
-  testIgnore: ["stripe-sandbox.spec.ts", "stripe-sandbox-remaining.spec.ts", "**/support/stripe-sandbox-acceptance.test.ts", "form-load-diagnostic.spec.ts", "**/support/form-load-diagnostic*.test.ts", "**/support/form-load-manual*.test.ts", "**/support/manual-payment*.test.ts", "**/support/provider-mount-browser.test.ts", "**/support/subscription-elements-browser.test.ts", "**/support/stripe-sandbox-fixtures.test.ts", "**/support/otp-challenge-response.test.ts"],
+  testIgnore: ["stripe-billing.spec.ts", "**/support/stripe-billing-acceptance.test.ts", "stripe-sandbox.spec.ts", "stripe-sandbox-remaining.spec.ts", "**/support/stripe-sandbox-acceptance.test.ts", "form-load-diagnostic.spec.ts", "**/support/form-load-diagnostic*.test.ts", "**/support/form-load-manual*.test.ts", "**/support/manual-payment*.test.ts", "**/support/provider-mount-browser.test.ts", "**/support/subscription-elements-browser.test.ts", "**/support/stripe-sandbox-fixtures.test.ts", "**/support/otp-challenge-response.test.ts"],
   fullyParallel: false,
   workers: 1,
   retries: 1,

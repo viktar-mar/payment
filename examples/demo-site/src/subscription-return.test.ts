@@ -39,3 +39,9 @@ it('scrubs subscription return capabilities at the actual Vite middleware entry 
   expect(seen.some(r=>r.url?.includes('synthetic-sentinel')||r.originalUrl?.includes('synthetic-sentinel'))).toBe(false);
   expect(configuration.build.rollupOptions.input.subscriptionReturn==='subscription-return.html').toBe(true);
 });
+it('accepts one configured Product, supports distinct second Product and refuses a duplicate manager',()=>{
+  expect(subscriptions).toHaveProperty('validSubscriptionProducts',expect.any(Function));
+  const one='11111111-2222-4333-8444-555555555555',two='22222222-3333-4444-8555-666666666666';
+  const valid=(subscriptions as unknown as {validSubscriptionProducts:(v:string[])=>boolean}).validSubscriptionProducts;
+  expect(valid([one,''])).toBe(true);expect(valid([one,two])).toBe(true);expect(valid([one,one])).toBe(false);expect(valid(['',two])).toBe(false);expect(valid([one,'broken'])).toBe(false);
+});

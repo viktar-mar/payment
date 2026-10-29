@@ -475,7 +475,7 @@ test('changed or nonpositive child PID never grants kill authority',async()=>{
   const g=fixture(),spawnFake=g.dependencies.spawn;g.dependencies.spawn=(...args)=>{const child=spawnFake(...args);child.pid=0;return child;};g.adapter=await createSandboxCliAdapter(g.options,g.dependencies);await rejects(g.adapter.startListener(LIMIT()),'LISTENER');assert.deepEqual(g.children[0].signals,[]);
 });
 
-const billingTarget=()=>({runId:RUN,expectedSource:'e'.repeat(40),accountId:'44444444-5555-4666-8777-888888888888',siteId:'22222222-3333-4444-8555-666666666666',customerId:'55555555-6666-4777-8888-999999999999',subscriptionId:'66666666-7777-4888-8999-000000000000',operationId:'33333333-4444-4555-8666-777777777777',priceId:'77777777-8888-4999-8000-111111111111',priceVersion:1,customerReference:'cus_original',subscriptionReference:'sub_original',productReference:'prod_original',priceReference:'price_original',invoiceReference:'in_original',allocationReference:'inpay_original',intentReference:'pi_original',chargeReference:'ch_original',periodStart:1800000000,periodEnd:1802678400});
+const billingTarget=()=>({runId:RUN,expectedSource:'e'.repeat(40),accountId:'44444444-5555-4666-8777-888888888888',siteId:'22222222-3333-4444-8555-666666666666',customerId:'55555555-6666-4777-8888-999999999999',subscriptionId:'66666666-7777-4888-8999-000000000000',operationId:'33333333-4444-4555-8666-777777777777',priceId:'77777777-8888-4999-8000-111111111111',priceVersion:1,customerReference:'cus_original',subscriptionReference:'sub_original',productReference:'prod_original',priceReference:'price_original',invoiceReference:'in_original',allocationReference:'inpay_original',intentReference:'pi_original',periodStart:1800000000,periodEnd:1802678400});
 function billingObjects(){
   const t=billingTarget(),base=(id,object)=>({id,object,livemode:false}),metadata={account_id:t.accountId,site_id:t.siteId,customer_id:t.customerId};
   const price={...base(t.priceReference,'price'),product:t.productReference,active:true,unit_amount:2000,currency:'eur',tax_behavior:'inclusive',type:'recurring',recurring:{interval:'month',interval_count:1,usage_type:'licensed'},metadata:{local_price_id:t.priceId,local_price_version:'1'}};
@@ -488,8 +488,8 @@ function billingObjects(){
     ['/v1/prices/'+t.priceReference]:price,
     ['/v1/invoices/'+t.invoiceReference]:{...base(t.invoiceReference,'invoice'),customer:t.customerReference,parent:{type:'subscription_details',subscription_details:{subscription:t.subscriptionReference}},billing_reason:'subscription_create',status:'paid',collection_method:'charge_automatically',currency:'eur',amount_due:2000,amount_paid:2000,total:2000,subtotal:2000,amount_remaining:0,amount_paid_off_stripe:0,amount_overpaid:0,starting_balance:0,ending_balance:0,pre_payment_credit_notes_amount:0,post_payment_credit_notes_amount:0,discounts:[],total_discount_amounts:[],total_pretax_credit_amounts:[]},
     ['/v1/invoices/'+t.invoiceReference+'/lines']:list([line]),'/v1/invoice_payments':list([allocation]),'/v1/refunds':list([]),
-    ['/v1/payment_intents/'+t.intentReference]:{...base(t.intentReference,'payment_intent'),customer:t.customerReference,status:'succeeded',currency:'eur',amount:2000,amount_received:2000,capture_method:'automatic',payment_method_types:['card'],latest_charge:t.chargeReference,client_secret:'never-return'},
-    ['/v1/charges/'+t.chargeReference]:{...base(t.chargeReference,'charge'),customer:t.customerReference,payment_intent:t.intentReference,status:'succeeded',paid:true,captured:true,currency:'eur',amount:2000,amount_captured:2000,amount_refunded:0,refunded:false,payment_method_details:{type:'card'},refunds:list([])},
+    ['/v1/payment_intents/'+t.intentReference]:{...base(t.intentReference,'payment_intent'),customer:t.customerReference,status:'succeeded',currency:'eur',amount:2000,amount_received:2000,capture_method:'automatic',payment_method_types:['card'],latest_charge:'ch_original',client_secret:'never-return'},
+    ['/v1/charges/'+'ch_original']:{...base('ch_original','charge'),customer:t.customerReference,payment_intent:t.intentReference,status:'succeeded',paid:true,captured:true,currency:'eur',amount:2000,amount_captured:2000,amount_refunded:0,refunded:false,payment_method_details:{type:'card'},refunds:list([])},
   };
 }
 async function billingSetup(mutate=()=>{}){
@@ -583,4 +583,17 @@ test('Billing omitted embedded refunds require a fixed exact-charge complete emp
   const f=await billingSetup(o=>{delete o['/v1/charges/ch_original'].refunds;});await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
   assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).initialCashVerified,true);
   const calls=f.calls.filter(c=>c.args.includes('/v1/refunds'));assert.equal(calls.length,1);assert.ok(calls[0].args.includes('charge=ch_original'));assert.ok(calls[0].args.includes('limit=100'));await stop(f);
+});
+test('Billing graph derives successful Charge only from exact bound original PI, with no caller override',async()=>{
+ const f=await billingSetup();await f.adapter.validateBinding(f.limits);await start(f);const target=billingTarget();
+ await f.adapter.bindOwnedBillingGraph(target,f.limits);assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).chargeCount,1);
+ assert.ok(f.calls.some(c=>c.args.includes('/v1/charges/ch_original')));await stop(f);
+ const g=await billingSetup();await g.adapter.validateBinding(g.limits);await start(g);await assert.rejects(g.adapter.bindOwnedBillingGraph({...target,chargeReference:'ch_override'},g.limits),/BILLING_BINDING/);await stop(g);
+});
+for(const charge of [null,{},'pi_foreign','ch_foreign'])test('Billing derived latest Charge rejects '+JSON.stringify(charge),async()=>{
+ const f=await billingSetup(o=>o['/v1/payment_intents/pi_original'].latest_charge=charge);await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);await stop(f);
+});
+test('Billing latest Charge drift after reverse allocation read cannot accept',async()=>{
+ const f=await billingSetup(),execute=f.dependencies.execute;let reads=0;f.dependencies.execute=async(...args)=>{if(args[1].includes('/v1/payment_intents/pi_original')&&++reads===2)f.objects['/v1/payment_intents/pi_original'].latest_charge='ch_changed';return execute(...args);};
+ const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');f.adapter=await createBillingCliAdapter(f.options,f.dependencies);await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);await stop(f);
 });

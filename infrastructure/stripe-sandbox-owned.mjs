@@ -1,3 +1,4 @@
+import {billingBounded} from './stripe-billing-limits.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
 import {billingAcceptanceExcluded,billingAcceptanceOptIn,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
 import {execFile} from 'node:child_process';
@@ -54,9 +55,19 @@ function portAvailable(port,host,dependencies) {
 export async function preflightOwnedSandbox(options,dependencies={}) {
   return preflight(options,dependencies,false);
 }
-export async function preflightOwnedBilling(options,dependencies={}) {
+export async function preflightOwnedBilling(options,dependencies={},limits) {
   const selected=validateBillingAcceptanceOptions(options);
   if(!selected)return pending('OPT_IN','OPT_IN_REQUIRED');
+  if(limits!==undefined){
+    const raw=dependencies;
+    // Runtime-only authority is explicit; each boundary rechecks it before dispatch and after completion.
+    dependencies={
+      execute:(file,args,settings)=>billingBounded(limits,l=>(raw.execute??executeFile)(file,args,{...settings,signal:l.signal,timeout:Math.min(settings.timeout,l.deadline-Date.now())}),10000),
+      lstat:path=>billingBounded(limits,()=>(raw.lstat??lstat)(path)),
+      realpath:path=>billingBounded(limits,()=>(raw.realpath??realpath)(path)),
+      portAvailable:(port,host)=>billingBounded(limits,()=>raw.portAvailable?raw.portAvailable(port,host):portAvailable(port,host,raw),4000),
+    };
+  }
   return preflight(selected,dependencies,'billing');
 }
 

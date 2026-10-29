@@ -46,3 +46,12 @@ test('all legacy mode parsers reject Billing before normalization can erase the 
   const {manualRefundRemainderExcluded}=await import('./stripe-manual-refund-remainder-options.mjs');assert.equal(manualRefundRemainderExcluded(options().env),false);
   const bad=options();bad.env.PAYMENT_STRIPE_SANDBOX_REMAINING_ONLY='true';assert.equal(module.validateBillingAcceptanceOptions(bad),null);
 });
+test('explicit native environment snapshot admits process.env prototype without erasing mixed/accessor/inherited flags',()=>{
+ assert.equal(typeof module.snapshotBillingAcceptanceEnvironment,'function');
+ // Only process.env prototype metadata is inspected; no real environment values are read or logged.
+ const nativeShape=Object.create(Object.getPrototypeOf(process.env));Object.assign(nativeShape,options().env);
+ assert.equal(module.validateBillingAcceptanceOptions({...options(),env:nativeShape}),null);
+ const snapshot=module.snapshotBillingAcceptanceEnvironment(nativeShape);assert.equal(Object.isFrozen(snapshot),true);assert.ok(module.validateBillingAcceptanceOptions({...options(),env:snapshot}));
+ let reads=0;for(const mutate of [v=>v.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS='true',v=>v.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT='true',v=>Object.defineProperty(v,'DEBUG',{enumerable:true,get(){reads++;return '';}}),v=>Object.setPrototypeOf(v,{PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND:'false'}),v=>delete v.PAYMENT_STRIPE_BILLING_ACCEPTANCE]){const value=Object.create({});Object.assign(value,options().env);mutate(value);assert.equal(module.snapshotBillingAcceptanceEnvironment(value),null);}
+ const withUnrelated=Object.assign(Object.create({}),options().env);Object.defineProperty(withUnrelated,'UNRELATED_PRIVATE_VALUE',{get(){reads++;throw null;}});assert.ok(module.snapshotBillingAcceptanceEnvironment(withUnrelated));assert.equal(reads,0);
+});

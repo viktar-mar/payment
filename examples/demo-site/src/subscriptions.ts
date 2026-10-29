@@ -3,7 +3,7 @@ import type { CustomerSession, GenericPaymentClient, GenericSubscriptionManager 
 
 const en = {
   title: 'Subscription demo', product: 'Product', productId: 'Product ID', priceId: 'Initial price ID (optional)',
-  load: 'Load products', configuration: 'Enter the two published Product UUIDs from your local Site. Prices and permissions come from the server.',
+  load: 'Load products', configuration: 'Enter one or two distinct published Product UUIDs from your local Site. Prices and permissions come from the server.',
   invalid: 'Enter valid Product UUIDs and optional price UUIDs.',
   protected: 'Protected content requires backend or serverless verification of subscription access. This browser does not authorize protected content.',
   portal: 'Returned from the local Fake portal simulation. Subscription state is reloaded from the server after sign-in recovery.',
@@ -12,13 +12,14 @@ const copy = {
   en,
   pt: {
     title: 'Demonstração de subscrições', product: 'Produto', productId: 'ID do produto', priceId: 'ID do preço inicial (opcional)',
-    load: 'Carregar produtos', configuration: 'Introduza os UUIDs dos dois produtos publicados do Site local. Os preços e as permissões vêm do servidor.',
+    load: 'Carregar produtos', configuration: 'Introduza um ou dois UUIDs de produtos publicados distintos do Site local. Os preços e as permissões vêm do servidor.',
     invalid: 'Introduza UUIDs de produto válidos e UUIDs de preço opcionais.',
     protected: 'O conteúdo protegido exige verificação do acesso à subscrição no backend ou numa função serverless. Este browser não autoriza conteúdo protegido.',
     portal: 'Regresso da simulação local do portal Fake. O estado da subscrição é recarregado do servidor após recuperar a sessão.',
   },
 } satisfies Record<'en' | 'pt', { [K in keyof typeof en]: string }>;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function validSubscriptionProducts(values:string[]):boolean {return values.length===2&&uuid.test(values[0]??'')&&(values[1]===''||uuid.test(values[1]??'')&&values[1]!.toLowerCase()!==values[0]!.toLowerCase());}
 const returnConfigurationKey='demo:subscription-return:v1';
 function returnIdentity(raw:unknown):{apiBaseUrl:string;siteKey:string}|undefined {
   if(!raw||typeof raw!=='object')return;const value=raw as Record<string,unknown>;
@@ -71,7 +72,7 @@ export function mountSubscriptions(configuration: { locale: string; apiBaseUrl?:
     const productLabel = document.createElement('label'), priceLabel = document.createElement('label');
     const product = document.createElement('input'), price = document.createElement('input');
     product.id = `subscription-product-${index}`; price.id = `subscription-price-${index}`; productLabel.htmlFor = product.id; priceLabel.htmlFor = price.id;
-    product.required = true; for (const input of [product, price]) { input.type = 'text'; input.maxLength = 36; input.pattern = uuid.source.slice(1, -1).replaceAll('a-f', 'a-fA-F'); input.setAttribute('aria-describedby', error.id); }
+    product.required = index === 1; for (const input of [product, price]) { input.type = 'text'; input.maxLength = 36; input.pattern = uuid.source.slice(1, -1).replaceAll('a-f', 'a-fA-F'); input.setAttribute('aria-describedby', error.id); }
     product.value = parameters.get(`subscription_product_${index}_id`) ?? page[`subscriptionProduct${index}Id`] ?? '';
     price.value = parameters.get(`subscription_price_${index}_id`) ?? page[`subscriptionPrice${index}Id`] ?? '';
     form.append(productLabel, product, priceLabel, price);
@@ -90,12 +91,13 @@ export function mountSubscriptions(configuration: { locale: string; apiBaseUrl?:
   };
   const configure = (): void => {
     const invalid = products.flatMap(p => [p.product, p.price]).find(input => (input.required || input.value.trim()) && !uuid.test(input.value.trim()));
+    if (!validSubscriptionProducts(products.map(p=>p.product.value.trim()))) { error.hidden=false; return; }
     if (invalid) { error.hidden = false; invalid.setAttribute('aria-invalid', 'true'); invalid.focus(); return; }
     error.hidden = true;
     const url = new URL(location.href);
     for (const [i, p] of products.entries()) {
       p.product.removeAttribute('aria-invalid'); p.price.removeAttribute('aria-invalid');
-      p.manager.priceId = p.price.value.trim() || undefined; p.manager.productId = p.product.value.trim();
+      p.container.hidden = !p.product.value.trim(); p.manager.priceId = p.price.value.trim() || undefined; p.manager.productId = p.product.value.trim() || undefined;
       // UUIDs are public configuration, never Customer/action capabilities. Keep
       // them through the server-controlled Fake portal return/reload.
       url.searchParams.set(`subscription_product_${i + 1}_id`, p.product.value.trim());
@@ -107,6 +109,6 @@ export function mountSubscriptions(configuration: { locale: string; apiBaseUrl?:
   form.addEventListener('submit', event => { event.preventDefault(); configure(); });
   for (const [button, value] of [[english, 'en'], [portuguese, 'pt']] as const) button.addEventListener('click', () => { locale = value; render(); onLocale(value); });
   theme.addEventListener('click', () => { const active = section.classList.toggle('subscription-theme-alternate'); theme.setAttribute('aria-pressed', String(active)); });
-  render(); if (products.every(p => uuid.test(p.product.value) && (!p.price.value || uuid.test(p.price.value)))) configure();
+  render(); if (validSubscriptionProducts(products.map(p=>p.product.value.trim())) && products.every(p => !p.price.value || uuid.test(p.price.value))) configure();
   return { setSession(session) { for (const p of products) p.manager.customerSession = session; } };
 }
