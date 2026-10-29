@@ -98,12 +98,17 @@ public record Subscription(UUID id, SiteId siteId, CustomerId customerId,
     }
 
     public Subscription confirmPaid(SubscriptionPriceTerms terms, Period period, Instant at) {
+        return confirmPaid(terms, period, at, at);
+    }
+
+    public Subscription confirmPaid(SubscriptionPriceTerms terms, Period period, Instant billingAt, Instant recordedAt) {
         Objects.requireNonNull(terms, "terms");
         Objects.requireNonNull(period, "period");
-        Objects.requireNonNull(at, "at");
+        Objects.requireNonNull(billingAt, "billingAt");
+        Objects.requireNonNull(recordedAt, "recordedAt");
         if (!nonTerminal()) return this;
         validateTerms(productId, billingPrice, terms);
-        if (at.isBefore(period.start())) return this;
+        if (billingAt.isBefore(period.start())) return this;
         if (paidThrough != null && period.end().isBefore(paidThrough)) return this;
         boolean matchingChange = pendingChange != null && pendingChange.target().equals(terms);
         if (period.end().equals(paidThrough) && (!terms.equals(billingPrice) || !terms.equals(entitledPrice))
@@ -115,18 +120,23 @@ public record Subscription(UUID id, SiteId siteId, CustomerId customerId,
                 && period.equals(currentPeriod) && period.end().equals(paidThrough) && debt == null
                 && Objects.equals(remaining, pendingChange)) return this;
         return project(terms, terms, Status.ACTIVE, period, period.end(), trial, cancellation,
-            remaining, null, null, at);
+            remaining, null, null, recordedAt);
     }
 
     public Subscription renewalFailed(UUID billingRecordId, Period period, int graceDays, Instant at) {
+        return renewalFailed(billingRecordId, period, graceDays, at, at);
+    }
+
+    public Subscription renewalFailed(UUID billingRecordId, Period period, int graceDays, Instant billingAt, Instant recordedAt) {
         Objects.requireNonNull(billingRecordId, "billingRecordId");
         Objects.requireNonNull(period, "period");
-        Objects.requireNonNull(at, "at");
+        Objects.requireNonNull(billingAt, "billingAt");
+        Objects.requireNonNull(recordedAt, "recordedAt");
         if (graceDays < 0) throw new DomainValidationException("Grace days must not be negative");
         if (!nonTerminal()) return this;
         if (paidThrough != null && !period.end().isAfter(paidThrough)) return this;
         if (paidThrough != null && currentPeriod != null && currentPeriod.start().isBefore(paidThrough)
-                && at.isBefore(currentPeriod.start())) return this;
+                && billingAt.isBefore(currentPeriod.start())) return this;
         if (debt != null) {
             if (debt.billingRecordId().equals(billingRecordId)) return this;
             throw conflict("An unpaid billing record already exists");
@@ -134,7 +144,7 @@ public record Subscription(UUID id, SiteId siteId, CustomerId customerId,
         Instant deadline = paidThrough != null && entitledPrice != null
             ? paidThrough.plus(Duration.ofDays(graceDays)) : null;
         return project(billingPrice, entitledPrice, Status.PAST_DUE, period, paidThrough, trial,
-            cancellation, pendingChange, new Debt(billingRecordId, period, deadline), null, at);
+            cancellation, pendingChange, new Debt(billingRecordId, period, deadline), null, recordedAt);
     }
 
     public Subscription pause(Instant at) {
