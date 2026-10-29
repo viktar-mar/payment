@@ -47,7 +47,16 @@ export function createSubscriptionClient(request: SubscriptionAuthorizedRequest,
     action: async i => { input(i, ['session', 'subscriptionId', 'operationId']); return bindSubscriptionAction(client, i.session, i.operationId, i.subscriptionId, parseSubscriptionAction(await read(i, path(i, `/operations/${i.operationId}/action`), 32768, true))); },
     clientSession: async i => { input(i, ['session', 'subscriptionId', 'operationId', 'idempotencyKey', 'action']); assertSubscriptionAction(client, i, i.action); const raw = await post(i, path(i, `/operations/${i.operationId}/client-session`), { action_token: i.action.secret }, 200, parseSubscriptionClientSessionJson); assertSubscriptionAction(client, i, i.action); return parseSubscriptionClientSession(raw, i.action, i.session); },
     confirmAction: async i => { input(i, ['session', 'subscriptionId', 'operationId', 'idempotencyKey', 'actionToken']); if (!validSubscriptionActionToken(i.actionToken)) invalid(); return mutate(i, `/operations/${i.operationId}/action-confirmations`, { action_token: i.actionToken }); },
-    portal: async i => { input(i, ['session', 'subscriptionId', 'idempotencyKey', 'returnUrl']); if (!validSubscriptionReturnUrl(i.returnUrl)) invalid(); const result = parseSubscriptionPortal(await post(i, path(i, '/portal-sessions'), { return_url: i.returnUrl }, 201)); const actual = new URL(result.navigationUrl); const expected = new URL(i.returnUrl); const query = new URLSearchParams(actual.search); query.delete('subscriptionPortal'); query.delete('operationId'); if (actual.origin !== expected.origin || actual.pathname !== expected.pathname || query.toString() !== expected.searchParams.toString()) throw new PaymentSdkError('INVALID_RESPONSE'); return result; },
+    portal: async i => {
+      input(i, ['session', 'subscriptionId', 'idempotencyKey', 'returnUrl']); if (!validSubscriptionReturnUrl(i.returnUrl)) invalid();
+      const result = parseSubscriptionPortal(await post(i, path(i, '/portal-sessions'), { return_url: i.returnUrl }, 201));
+      if (result.simulated) {
+        const actual = new URL(result.navigationUrl); const expected = new URL(i.returnUrl); const query = new URLSearchParams(actual.search);
+        query.delete('subscriptionPortal'); query.delete('operationId');
+        if (actual.origin !== expected.origin || actual.pathname !== expected.pathname || query.toString() !== expected.searchParams.toString()) throw new PaymentSdkError('INVALID_RESPONSE');
+      }
+      return result;
+    },
   };
   if (captureAuthority) registerSubscriptionAuthority(client, captureAuthority);
   return client;

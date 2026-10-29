@@ -128,10 +128,17 @@ function validPortalUrl(raw: unknown): raw is string {
 }
 export function parseSubscriptionPortal(raw: unknown): SubscriptionPortal {
   const p = fields(raw, 'navigation_url expires_at simulated');
-  if (!validPortalUrl(p.navigation_url) || p.simulated !== true) invalid();
-  const url = new URL(p.navigation_url);
-  if (url.searchParams.getAll('subscriptionPortal').length !== 1 || url.searchParams.get('subscriptionPortal') !== 'simulated' || url.searchParams.getAll('operationId').length !== 1 || !uuid(url.searchParams.get('operationId'))) invalid();
-  return { navigationUrl: p.navigation_url, expiresAt: fresh(p.expires_at), simulated: true };
+  const simulated = bool(p.simulated);
+  if (simulated) {
+    if (!validPortalUrl(p.navigation_url)) invalid();
+    const url = new URL(p.navigation_url);
+    if (url.searchParams.getAll('subscriptionPortal').length !== 1 || url.searchParams.get('subscriptionPortal') !== 'simulated' || url.searchParams.getAll('operationId').length !== 1 || !uuid(url.searchParams.get('operationId'))) invalid();
+  } else {
+    // Deliberately accept only this documented Sandbox response subset. Match
+    // raw bytes so URL normalization cannot admit ports, escapes or extra data.
+    if (typeof p.navigation_url !== 'string' || p.navigation_url.length > 2048 || /\s/.test(p.navigation_url) || !/^https:\/\/billing\.stripe\.com\/p\/session\?secret=test_[A-Za-z0-9_-]+$/.test(p.navigation_url)) invalid();
+  }
+  return { navigationUrl: p.navigation_url as string, expiresAt: fresh(p.expires_at), simulated };
 }
 function billing(raw: unknown): SubscriptionBillingView {
   const b = fields(raw, 'billing_record_id subscription_id kind price previous_price period amount_due_minor currency settlement payment_ids created_at updated_at');

@@ -3,6 +3,81 @@ import { createGenericPaymentClient } from '../client.js';
 import { base, customerToken, json } from '../test/customer-fixtures.js';
 import { actionWire, billingWire, eventWire, mutationWire, offersWire, operationId, operationWire, portalWire, productId, quoteWire, returnUrl, subscriptionId, subscriptionPriceId, subscriptionSession, subscriptionWire, billingId } from '../test/subscription-fixtures.js';
 import * as sdk from '../index.js';
+const stripePortalUrl = 'https://billing.stripe.com/p/session?secret=test_sdkOpaque-123_ABC';
+it('returns the supported real Sandbox Portal capability without persisting it or changing the caller return URL', async () => {
+  const session = subscriptionSession(); const c = createGenericPaymentClient({ apiBaseUrl: base }).subscriptions;
+  const storage = vi.spyOn(Storage.prototype, 'setItem'); const seen: Request[] = []; const wire = { ...portalWire(), navigation_url: stripePortalUrl, simulated: false };
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { seen.push(new Request(url, init)); return json(wire, 201); });
+  const result = await c.portal({ session, subscriptionId, idempotencyKey: operationId, returnUrl });
+  expect(result.navigationUrl === stripePortalUrl).toBe(true); expect(result.simulated).toBe(false); expect(result.expiresAt).toBe(wire.expires_at);
+  expect(Object.keys(result).sort()).toEqual(['expiresAt', 'navigationUrl', 'simulated']); expect(storage).not.toHaveBeenCalled();
+  expect(seen).toHaveLength(1); const request = seen[0]!;
+  expect(request.url).toBe(`${base}/api/v1/customer/subscriptions/${subscriptionId}/portal-sessions`);
+  expect(request.method).toBe('POST'); expect(await request.json()).toEqual({ return_url: returnUrl });
+  expect(request.headers.get('authorization') === `Bearer ${session.sessionToken}`).toBe(true);
+  expect(request.headers.get('idempotency-key')).toBe(operationId);
+  expect([request.credentials, request.cache, request.redirect]).toEqual(['omit', 'no-store', 'error']);
+});
+it.each([
+  ['non-Stripe host', 'https://shop.test/p/session?secret=test_opaque'],
+  ['HTTP', stripePortalUrl.replace('https:', 'http:')],
+  ['userinfo', stripePortalUrl.replace('billing.stripe.com', 'user@billing.stripe.com')],
+  ['password', stripePortalUrl.replace('billing.stripe.com', 'user:pass@billing.stripe.com')],
+  ['explicit default port', stripePortalUrl.replace('billing.stripe.com', 'billing.stripe.com:443')],
+  ['alternate port', stripePortalUrl.replace('billing.stripe.com', 'billing.stripe.com:8443')],
+  ['suffix host', stripePortalUrl.replace('billing.stripe.com', 'billing.stripe.com.evil.test')],
+  ['fragment', stripePortalUrl + '#section'], ['empty fragment', stripePortalUrl + '#'],
+  ['extra query', stripePortalUrl + '&other=value'], ['duplicate secret', stripePortalUrl + '&secret=test_other'],
+  ['encoded delimiter', stripePortalUrl + '%26other%3Dvalue'],
+  ['encoded host', stripePortalUrl.replace('billing.stripe.com', '%62illing.stripe.com')],
+  ['encoded path', stripePortalUrl.replace('/p/session', '/p/%73ession')],
+  ['encoded key', stripePortalUrl.replace('?secret=', '?%73ecret=')],
+  ['empty secret', 'https://billing.stripe.com/p/session?secret='],
+  ['empty test opaque', 'https://billing.stripe.com/p/session?secret=test_'],
+  ['live secret', stripePortalUrl.replace('test_', 'live_')],
+  ['wrong path', stripePortalUrl.replace('/p/session', '/session')],
+  ['trailing slash', stripePortalUrl.replace('/p/session?', '/p/session/?')],
+  ['normalized path', stripePortalUrl.replace('/p/session', '/other/../p/session')],
+  ['oversized', 'https://billing.stripe.com/p/session?secret=test_' + 'a'.repeat(2048)],
+  ['leading whitespace', ' ' + stripePortalUrl], ['trailing newline', stripePortalUrl + '\n'],
+  ['control', stripePortalUrl.replace('test_', 'test_\u0000')],
+  ['backslash', stripePortalUrl.replace('/p/', '\\p/')],
+  ['noncanonical host', stripePortalUrl.replace('billing.stripe.com', 'BILLING.STRIPE.COM')],
+] as const)('rejects unsupported real Portal navigation (%s) with a redacted error', async (_kind, navigation_url) => {
+  const fetchMock = vi.fn(async () => json({ ...portalWire(), navigation_url, simulated: false }, 201)); vi.stubGlobal('fetch', fetchMock);
+  const outcome = await createGenericPaymentClient({ apiBaseUrl: base }).subscriptions.portal({ session: subscriptionSession(), subscriptionId, idempotencyKey: operationId, returnUrl }).catch(error => error);
+  expect(outcome).toMatchObject({ code: 'INVALID_RESPONSE', message: 'Invalid payment response' });
+  expect(String(outcome).includes('test_')).toBe(false); expect(JSON.stringify(outcome).includes(navigation_url)).toBe(false); expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+it.each(['missing simulated', 'string simulated', 'null simulated', 'number simulated', 'extra field', 'expired', 'invalid expiry'])(
+  'rejects malformed Portal receipt %s through the authenticated consumer', async kind => {
+    const wire: Record<string, unknown> = { ...portalWire(), navigation_url: stripePortalUrl, simulated: false };
+    if (kind === 'missing simulated') delete wire.simulated;
+    if (kind === 'string simulated') wire.simulated = 'false';
+    if (kind === 'null simulated') wire.simulated = null;
+    if (kind === 'number simulated') wire.simulated = 0;
+    if (kind === 'extra field') wire.proof = 'unrecognized';
+    if (kind === 'expired') wire.expires_at = '2000-01-01T00:00:00Z';
+    if (kind === 'invalid expiry') wire.expires_at = 'tomorrow';
+    vi.stubGlobal('fetch', async () => json(wire, 201));
+    await expect(createGenericPaymentClient({ apiBaseUrl: base }).subscriptions.portal({ session: subscriptionSession(), subscriptionId, idempotencyKey: operationId, returnUrl })).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+  });
+it.each(['origin', 'path', 'query'] as const)('preserves exact Fake Portal return %s binding', async mismatch => {
+  const url = new URL(portalWire().navigation_url);
+  if (mismatch === 'origin') url.hostname = 'other.test';
+  if (mismatch === 'path') url.pathname = '/other';
+  if (mismatch === 'query') url.searchParams.append('extra', 'value');
+  vi.stubGlobal('fetch', async () => json({ ...portalWire(), navigation_url: url.href }, 201));
+  await expect(createGenericPaymentClient({ apiBaseUrl: base }).subscriptions.portal({ session: subscriptionSession(), subscriptionId, idempotencyKey: operationId, returnUrl })).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+});
+it.each(['before', 'during'] as const)('requires Customer manage authority %s Portal dispatch', async timing => {
+  const session = subscriptionSession(); const c = createGenericPaymentClient({ apiBaseUrl: base }).subscriptions;
+  let release!: (response: Response) => void; const fetchMock = vi.fn(() => new Promise<Response>(resolve => { release = resolve; })); vi.stubGlobal('fetch', fetchMock);
+  if (timing === 'before') session.scopes = [];
+  const pending = c.portal({ session, subscriptionId, idempotencyKey: operationId, returnUrl });
+  if (timing === 'during') { expect(fetchMock).toHaveBeenCalledTimes(1); session.scopes = []; release(json({ ...portalWire(), navigation_url: stripePortalUrl, simulated: false }, 201)); }
+  await expect(pending).rejects.toMatchObject({ code: 'INVALID_SESSION' }); expect(fetchMock).toHaveBeenCalledTimes(timing === 'before' ? 0 : 1);
+});
 it.each(['http://localhost:4173/manage?screen=subscriptions', 'http://127.0.0.1:4173/manage', 'http://[::1]:4173/manage', 'https://shop.test/manage'])(
   'round trips the canonical unmarked Portal return %s', async returnUrl => {
     const c = createGenericPaymentClient({ apiBaseUrl: base }).subscriptions;
