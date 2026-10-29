@@ -17,6 +17,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.*;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.InvalidDataAccessApiUsageException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -60,7 +61,14 @@ class StripeBillingClockStoreIntegrationTest extends ProviderTestFixture {
         conflict(()->clocks.recordReady(owner,reserved,observation("clock_owned",1000)));
         var ack=ack(reserved,"clock_owned");
         conflict(()->clocks.recordReady(owner,ack,observation("clock_foreign",1000)));
-        assertThatThrownBy(()->clocks.recordReady(owner,ack,observation("clock_owned",1001))).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(()->clocks.recordReady(owner,ack,observation("clock_owned",1001)))
+            .isInstanceOf(InvalidDataAccessApiUsageException.class)
+            .hasMessage("Invalid READY clock evidence")
+            .hasRootCauseInstanceOf(IllegalArgumentException.class)
+            .hasRootCauseMessage("Invalid READY clock evidence");
+        assertThat(clocks.ready(owner.intent())).isEmpty();
+        assertThat(count("stripe_billing_clock_ready")).isZero();
+        assertThat(operations.findById(ack.id())).contains(ack);
         var observation=observation("clock_owned",1000); var ready=clocks.recordReady(owner,ack,observation);
         assertThat(clocks.recordReady(owner,ack,observation)).isEqualTo(ready);
         assertThat(clocks.ready(owner.intent())).contains(ready);

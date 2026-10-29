@@ -6,6 +6,7 @@ import dev.genericpayments.platform.paymentaccounts.domain.*;
 import dev.genericpayments.platform.provider.adapter.in.configuration.SubscriptionProviderRegistryConfiguration;
 import dev.genericpayments.platform.provider.adapter.out.fake.*;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeSubscriptionProviderAdapter;
+import dev.genericpayments.platform.provider.application.port.out.StripeBillingClockStore;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionProviderRegistry;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -17,6 +18,7 @@ class SubscriptionProviderRegistryTest {
     final StripeSubscriptionProviderAdapter stripe=mock(StripeSubscriptionProviderAdapter.class);
     ApplicationContextRunner runner(boolean enabled){return new ApplicationContextRunner().withUserConfiguration(SubscriptionProviderRegistryConfiguration.class)
         .withBean(FakeSubscriptionProviderAdapter.class,()->fake)
+        .withBean(StripeBillingClockStore.class,()->mock(StripeBillingClockStore.class))
         .withBean(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionSetupContinuationGuard.class,()->mock(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionSetupContinuationGuard.class))
         .withBean(dev.genericpayments.platform.subscriptions.application.service.SubscriptionResumeReceiptTransaction.class,()->mock(dev.genericpayments.platform.subscriptions.application.service.SubscriptionResumeReceiptTransaction.class))
         .withBean(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.class,()->mock(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.class))
