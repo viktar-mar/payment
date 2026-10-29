@@ -17,6 +17,7 @@ import dev.genericpayments.platform.subscriptions.domain.*;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionRecoveryProofStore;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
+import dev.genericpayments.platform.provider.application.port.out.StripeBillingClockSubscriptionStore;
 import org.junit.jupiter.api.Test;
 
 class StripeSubscriptionRecoveryTest {
@@ -98,6 +99,7 @@ class StripeSubscriptionRecoveryTest {
             if(finalPhase){c.consumeInFinalActionPhase=true;c.actionTransactions=0;c.actionGraph();}else c.consumeAfterStaleReplayCheck=true;
             var result=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionOperationResult[1];
             assertThatCode(()->result[0]=service.confirm(c.confirmCommand(first.secret()))).doesNotThrowAnyException();
+            verify(c.confirmationAuthority,atLeastOnce()).requireOrdinaryConfirmation(c.fixture.account.id(),c.fixture.local.siteId(),c.fixture.local.customerId());
             assertThat(result[0].browserConfirmAllowed()).isFalse();assertThat(c.grant.id()).isEqualTo(original.id());assertThat(c.grant.tokenDigest()).isEqualTo(original.tokenDigest());assertThat(c.grant.consumedAt()).isNotNull();
             verify(c.actionStore,never()).claimBilling(any(),any(),any(),any(),any(),anyString(),any(),anyString(),anyString(),anyString(),anyString(),any());
             int reads=c.fixture.graph.http.calls().size();assertThatCode(()->assertThat(actual.nextAction(c.fixture.lookup())).isNull()).doesNotThrowAnyException();assertThat(c.fixture.graph.http.calls()).hasSize(reads);
@@ -232,6 +234,7 @@ class StripeSubscriptionRecoveryTest {
     static final class RecoveryCase implements AutoCloseable {
         final StripeSubscriptionCreateTest fixture=new StripeSubscriptionCreateTest();
         final SubscriptionRecoveryProofStore proofs=mock(SubscriptionRecoveryProofStore.class);
+        final StripeBillingClockSubscriptionStore confirmationAuthority=mock(StripeBillingClockSubscriptionStore.class);
         final Map<UUID,SubscriptionRecoveryProofStore.Receipt> receipts=new HashMap<>();
         final SubscriptionRecoveryProofStore.Origin origin;
         BillingRecord bill;
@@ -288,7 +291,7 @@ class StripeSubscriptionRecoveryTest {
             var session=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(new dev.genericpayments.platform.customers.domain.CustomerSessionId(UUID.randomUUID()),s.siteId(),s.customerId(),"https://shop.test",Set.of(dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_MANAGE),Instant.now().plusSeconds(600));confirmationContext=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(new dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer(session),s.siteId(),s.customerId(),session.origin(),"same-confirm-key","same-confirm-request");
             when(actionStore.replay(any(),anyString(),anyString(),anyString())).thenAnswer(i->{if(consumeAfterStaleReplayCheck&&!durableConfirmation){consumeAfterStaleReplayCheck=false;consumeGrant();return false;}return durableConfirmation;});
             var tx=new dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionTransactionPort(){public <T>T required(java.util.function.Supplier<T> action){return action.get();}public <T>T requiresNew(java.util.function.Supplier<T> action){return action.get();}public boolean active(){return false;}};
-            var phases=new dev.genericpayments.platform.subscriptions.application.service.SubscriptionInteractionTransaction(tx,fixture.operations,fixture.subscriptions,authority,policies,locks,actionStore,mock(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPortalStore.class),mock(dev.genericpayments.platform.subscriptions.application.port.out.TrialEligibilityStore.class),Clock.systemUTC());
+            var phases=new dev.genericpayments.platform.subscriptions.application.service.SubscriptionInteractionTransaction(tx,fixture.operations,fixture.subscriptions,authority,policies,locks,actionStore,mock(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPortalStore.class),mock(dev.genericpayments.platform.subscriptions.application.port.out.TrialEligibilityStore.class),Clock.systemUTC(),confirmationAuthority);
             return new dev.genericpayments.platform.subscriptions.application.service.SubscriptionActionService(phases,a->fixture.adapter);
         }
         dev.genericpayments.platform.subscriptions.application.port.in.ConfirmSubscriptionActionUseCase.Command confirmCommand(String token){return new dev.genericpayments.platform.subscriptions.application.port.in.ConfirmSubscriptionActionUseCase.Command(confirmationContext,fixture.local.id(),fixture.operation.id(),token);}
