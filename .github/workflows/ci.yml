@@ -50,7 +50,7 @@ jobs:
 
   frontend:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: .
@@ -69,6 +69,12 @@ jobs:
           cache-dependency-path: |
             frontend/pnpm-lock.yaml
             examples/demo-site/pnpm-lock.yaml
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: backend/pom.xml
       - name: Check owned-test container tooling
         run: |
           docker version
@@ -101,6 +107,144 @@ jobs:
         run: node --test --test-timeout=60000 --test-concurrency=1 examples/demo-site/tests/support/*.test.ts
       - name: Verify built offline return privacy with Chromium
         run: pnpm --dir examples/demo-site exec playwright test --config playwright.offline.config.ts --workers=1 --retries=0
+      - name: Verify default Fake browser journeys in a fresh owned environment
+        run: |
+          set +x
+          node --input-type=module <<'NODE'
+          import {randomBytes, randomUUID} from 'node:crypto';
+          import {chmodSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync} from 'node:fs';
+          import {join} from 'node:path';
+          import {createServer} from 'node:net';
+          import {spawnSync} from 'node:child_process';
+          import {initializeLocalCustomerIssuer} from './infrastructure/init-local-customer-issuer.mjs';
+
+          // Pass only tool locations and fresh inputs; never inherit local/provider keys.
+          const env = Object.fromEntries(['PATH', 'HOME', 'JAVA_HOME', 'PNPM_HOME', 'RUNNER_TEMP', 'TMPDIR', 'CI'].filter(key => process.env[key]).map(key => [key, process.env[key]]));
+          env.CI = 'true';
+          const run = (command, args, options = {}) => {
+            const result = spawnSync(command, args, {env, timeout: 30000, maxBuffer: 1048576, encoding: 'utf8', stdio: 'pipe', ...options});
+            if (result.error || result.status !== 0) throw new Error(`Hosted Fake CI command failed: ${command}`);
+            return result.stdout?.trim() ?? '';
+          };
+          const root = mkdtempSync(join(process.env.RUNNER_TEMP, 'payment-fake-'));
+          chmodSync(root, 0o700);
+          Object.assign(env, {
+            PAYMENT_FAKE_CI_RUNTIME: join(root, 'runtime'), PAYMENT_FAKE_CI_TIME: join(root, 'task17-time-fake'),
+            PAYMENT_FAKE_CI_ISSUER: join(root, 'customer-issuer-private.jwks.json'), PAYMENT_FAKE_CI_EMPTY_ENV: join(root, 'empty.env'),
+            PAYMENT_E2E_COMPOSE_PROJECT: 'task17-ci-' + randomUUID(), PAYMENT_E2E_SITE_RUN: randomBytes(6).toString('hex'),
+            PAYMENT_POSTGRES_HOST_PORT: '25432', PAYMENT_BACKEND_HOST_PORT: '28080', PAYMENT_MAILPIT_HOST_PORT: '28025',
+            PAYMENT_MAILPIT_SMTP_HOST_PORT: '21025', PAYMENT_ADMIN_HOST_PORT: '23000', PAYMENT_FAKE_AUTO_SUCCESS: 'false',
+            PAYMENT_E2E_BACKEND_URL: 'http://127.0.0.1:28080', PAYMENT_E2E_ADMIN_URL: 'http://127.0.0.1:23000',
+            PAYMENT_E2E_MAILPIT_URL: 'http://127.0.0.1:28025', PAYMENT_STAGE4_CONTROL_URL: 'http://127.0.0.1:28081/time',
+          });
+          for (const key of ['PAYMENT_DATA_ENCRYPTION_KEY', 'PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY', 'PAYMENT_CUSTOMER_DIGEST_KEY_V1', 'PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1']) env[key] = randomBytes(32).toString('base64');
+          for (const key of ['PAYMENT_DB_PASSWORD', 'PAYMENT_ADMIN_BOOTSTRAP_PASSWORD', 'PAYMENT_STAGE4_CONTROL_KEY']) env[key] = randomBytes(32).toString('base64url');
+          env.PAYMENT_ADMIN_BOOTSTRAP_USERNAME = 'ci-' + randomBytes(8).toString('hex');
+          env.PAYMENT_E2E_ADMIN_USERNAME = env.PAYMENT_ADMIN_BOOTSTRAP_USERNAME;
+          env.PAYMENT_E2E_ADMIN_PASSWORD = env.PAYMENT_ADMIN_BOOTSTRAP_PASSWORD;
+          env.PAYMENT_E2E_DATABASE_URL = `postgres://payment:${encodeURIComponent(env.PAYMENT_DB_PASSWORD)}@127.0.0.1:25432/payment`;
+          env.PAYMENT_LOCAL_UID = run('id', ['-u']); env.PAYMENT_LOCAL_GID = run('id', ['-g']);
+          if (!/^[1-9][0-9]*$/.test(env.PAYMENT_LOCAL_UID) || !/^[1-9][0-9]*$/.test(env.PAYMENT_LOCAL_GID)) throw new Error('Non-root runner required');
+          const journeys = `success decline processing unknown failure reload
+          recoverlogout recoverexpiry navigation customer expiry storage
+          racecheckout raceconfirm racehistory racelogout racehistoryerror racelogouterror racebusy
+          scope second pending admin unavailable config delivery
+          donateanon donatecustomer donateinvalid donatemixed donaterevoked donatepolicy donaterace
+          donateoutdraft donateoutintent donateoutok donateouterr adminrefund admincampaign adminredact
+          sub-admin sub-admin-read sub-admin-dialog sub-portal sub-journey sub-locale
+          sub-logout sub-customer-switch sub-disconnect`;
+          env.PAYMENT_TELEMETRY_SITEKEYS = journeys.trim().split(/\s+/).map(journey => `t12-${env.PAYMENT_E2E_SITE_RUN}-${journey}-r0-site`).join(',');
+          writeFileSync(env.PAYMENT_FAKE_CI_EMPTY_ENV, '', {flag: 'wx', mode: 0o600});
+          mkdirSync(env.PAYMENT_FAKE_CI_TIME, {mode: 0o700});
+          initializeLocalCustomerIssuer(env.PAYMENT_FAKE_CI_ISSUER);
+
+          for (const port of [25432, 28080, 28025, 21025, 23000, 28081, 4173]) {
+            await new Promise((resolve, reject) => {
+              const server = createServer();
+              server.once('error', () => reject(new Error('Hosted Fake CI port already occupied')));
+              server.listen({host: '127.0.0.1', port, exclusive: true}, () => server.close(resolve));
+            });
+          }
+          const project = env.PAYMENT_E2E_COMPOSE_PROJECT;
+          for (const args of [
+            ['ps', '-aq', '--filter', `label=com.docker.compose.project=${project}`],
+            ['volume', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`],
+            ['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`],
+          ]) if (run('docker', args)) throw new Error('Fresh Compose project required');
+          run('./mvnw', ['-B', '-ntp', '-DskipTests', 'package'], {cwd: 'backend', timeout: 600000, stdio: 'inherit'});
+          const jar = run('jar', ['tf', 'backend/target/payment-platform-backend-0.1.0-SNAPSHOT.jar']);
+          if (!jar.split('\n').includes('org/springframework/boot/loader/launch/PropertiesLauncher.class')) throw new Error('Boot PropertiesLauncher missing');
+          const packagePath = 'dev/genericpayments/acceptance/runtime';
+          const classes = ['OwnedSubscriptionRuntime.class', 'OwnedSubscriptionRuntime$1.class', 'OwnedSubscriptionRuntime$BusinessClock.class'];
+          const compiled = readdirSync(join('backend/target/test-classes', packagePath)).filter(name => /^OwnedSubscriptionRuntime(?:\$.*)?\.class$/.test(name)).sort();
+          if (JSON.stringify(compiled) !== JSON.stringify([...classes].sort())) throw new Error('Owned launcher class tree changed');
+          const destination = join(env.PAYMENT_FAKE_CI_RUNTIME, packagePath);
+          mkdirSync(destination, {recursive: true, mode: 0o700});
+          for (const name of classes) { copyFileSync(join('backend/target/test-classes', packagePath, name), join(destination, name)); chmodSync(join(destination, name), 0o600); }
+
+          const compose = ['compose', '--env-file', env.PAYMENT_FAKE_CI_EMPTY_ENV,
+            '-p', project, '-f', 'infrastructure/compose.yaml', '-f', 'infrastructure/compose.local-user.yaml', '-f', 'infrastructure/compose.fake-e2e.yaml'];
+          const services = ['postgres', 'mailpit', 'backend', 'admin'];
+          const owned = new Map();
+          const verify = (service, id) => {
+            if (!/^[0-9a-f]{64}$/.test(id)) throw new Error('Full owned container ID required');
+            const actual = run('docker', ['inspect', '--format', '{{.Id}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}', id]);
+            if (actual !== `${id}|${project}|${service}`) throw new Error('Owned container identity mismatch');
+          };
+          const capture = () => {
+            let invalid = false;
+            for (const service of services) {
+              if (owned.has(service)) continue;
+              try {
+                const id = run('docker', [...compose, 'ps', '--all', '--quiet', '--no-trunc', service]);
+                if (id) { verify(service, id); owned.set(service, id); }
+              } catch { invalid = true; }
+            }
+            if (invalid) throw new Error('Unable to capture exact owned service identities');
+          };
+          let failure = false, cleanupFailed = false;
+          // finally is installed before the first container can be created.
+          try {
+            run('docker', [...compose, 'up', '--build', '-d', '--wait', '--wait-timeout', '180', ...services], {timeout: 900000, stdio: 'inherit'});
+            capture();
+            if (owned.size !== services.length) throw new Error('Missing owned service');
+            env.PAYMENT_E2E_MAILPIT_OWNER = owned.get('mailpit');
+            const deadline = Date.now() + 30000;
+            let ready = false;
+            while (Date.now() < deadline && !ready) {
+              try {
+                const response = await fetch(env.PAYMENT_STAGE4_CONTROL_URL, {headers: {Authorization: 'Bearer ' + env.PAYMENT_STAGE4_CONTROL_KEY}, redirect: 'error', signal: AbortSignal.timeout(2000)});
+                if (response.status !== 200) { await response.body?.cancel(); throw new Error('Control not ready'); }
+                const reader = response.body.getReader();
+                let body = '', bytes = 0;
+                try {
+                  for (;;) {
+                    const chunk = await reader.read(); if (chunk.done) break;
+                    bytes += chunk.value.byteLength;
+                    body += Buffer.from(chunk.value).toString('utf8');
+                    if (bytes > 64 || body.length > 64) { await reader.cancel(); throw new Error('Control response too large'); }
+                  }
+                } finally { reader.releaseLock(); }
+                ready = body.length > 0 && Number.isFinite(Date.parse(body));
+              } catch { /* Bounded readiness; capability/body/errors stay private. */ }
+              if (!ready) await new Promise(resolve => setTimeout(resolve, 250));
+            }
+            if (!ready) throw new Error('Authenticated owned business clock not ready');
+            run('pnpm', ['--dir', 'examples/demo-site', 'exec', 'playwright', 'test', '--config', 'playwright.config.ts', '--workers=1', '--retries=0'], {timeout: 1500000, stdio: 'inherit'});
+          } catch {
+            failure = true;
+            console.error('Hosted default Fake browser startup or acceptance failed; sensitive diagnostics suppressed.');
+          } finally {
+            // Capture partial startup too. Never replace an original ID or remove state.
+            try { capture(); } catch { cleanupFailed = true; }
+            for (const [service, id] of owned) {
+              try { verify(service, id); run('docker', ['stop', '--time', '10', id], {timeout: 20000}); }
+              catch { cleanupFailed = true; }
+            }
+            if (cleanupFailed) console.error('Hosted Fake CI exact-owner stop failed; retained state was not removed.');
+          }
+          process.exitCode = failure ? 1 : cleanupFailed ? 1 : 0;
+          NODE
 
   infrastructure:
     runs-on: ubuntu-24.04
