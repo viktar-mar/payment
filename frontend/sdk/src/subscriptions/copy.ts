@@ -1,4 +1,5 @@
 const en = {
+  retryPayment: 'Retry payment', continuePayment: 'Continue payment', paymentDeclined: 'Your payment was declined. You can try again.', paymentDetails: 'Check your payment details and try Pay again.',
   title: 'Subscriptions', simulated: 'Local Fake simulation — not a real payment',
   setup: 'Update payment method', recover: 'Pay the existing invoice',
   unknown: 'The result is not confirmed. Refresh the operation status.',
@@ -27,6 +28,7 @@ type Copy = { [K in keyof typeof en]: string };
 export const subscriptionCopy = {
   en,
   pt: {
+    retryPayment: 'Tentar pagar novamente', continuePayment: 'Continuar pagamento', paymentDeclined: 'O pagamento foi recusado. Pode tentar novamente.', paymentDetails: 'Verifique os dados de pagamento e tente pagar novamente.',
     title: 'Subscrições', simulated: 'Simulação Fake local — não é um pagamento real',
     setup: 'Atualizar método de pagamento', recover: 'Pagar a fatura existente',
     unknown: 'O resultado não está confirmado. Atualize o estado da operação.',

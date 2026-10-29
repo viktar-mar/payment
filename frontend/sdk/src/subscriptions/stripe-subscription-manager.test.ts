@@ -27,7 +27,9 @@ function fixture(permission=true,expiresIn=60000,options:{prepareFailure?:'clien
     throw new Error('Unexpected synthetic manager request');
   });
   sdk.registerGenericSubscriptionManager(); const manager=document.createElement('generic-subscription-manager') as sdk.GenericSubscriptionManager;
-  manager.client=sdk.createGenericPaymentClient({apiBaseUrl:base});manager.customerSession=subscriptionSession();manager.priceId=subscriptionPriceId;manager.productId=productId;document.body.append(manager);
+  manager.client=sdk.createGenericPaymentClient({apiBaseUrl:base});
+  // Explicit legacy custom-client compatibility fixture: no v2 method family.
+  for(const key of ['confirmationSession','confirmationAttempt','currentConfirmationAttempt','confirmPaymentAttempt','retryPaymentAttempt','paymentAttemptSession'] as const)delete manager.client.subscriptions[key];manager.customerSession=subscriptionSession();manager.priceId=subscriptionPriceId;manager.productId=productId;document.body.append(manager);
   const root=manager.shadowRoot as unknown as HTMLElement;
   const stateEvents:unknown[]=[];manager.addEventListener('generic-subscription-state',e=>stateEvents.push((e as CustomEvent).detail));
   async function create(){await waitFor(()=>expect(getByRole(root,'button',{name:'Create subscription'})).toBeEnabled());fireEvent.click(getByLabelText(root,'I consent to recurring payments'));fireEvent.click(getByRole(root,'button',{name:'Create subscription'}));}

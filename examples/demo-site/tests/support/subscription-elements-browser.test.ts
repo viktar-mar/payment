@@ -29,6 +29,8 @@ test('native subscription PAYMENT and SETUP mount visibly, wait for ready and re
       const token='C'.repeat(43),grant='G'.repeat(43),secret=flow==='PAYMENT'?'pi_fixture_secret_synthetic':'seti_fixture_secret_synthetic';
       const expires=new Date(Date.now()+120000).toISOString(),actionExpires=new Date(Date.now()+90000).toISOString(),clientExpires=new Date(Date.now()+60000).toISOString();
       const price={price_id:priceId,price_key:'native-monthly',version:1,product_id:product,amount_minor:1000,currency:'EUR',interval:'MONTH',trial_days:0,trial_payment_method_policy:'REQUIRED_BEFORE_TRIAL',tax_mode:'NONE'};
+      const attempt='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',capability='bca2_'+'A'.repeat(43);
+      const attemptStatus=()=>({protocol:'SERVER_CONFIRM_V2',attempt_id:attempt,state:preflight?'REQUIRES_ACTION':'READY',retry_allowed:false,successor_attempt_id:null,expires_at:clientExpires});
       const op={operation_id:operation,subscription_id:subscription,status:'PROCESSING',action_available:false};
       const now=new Date().toISOString(),end=new Date(Date.now()+86400000).toISOString(),valid=new Date(Date.now()+240000).toISOString();
       const view={subscription_id:subscription,site_id:site,customer_id:customer,product_id:product,payment_account_id:'b773932b-2075-4ead-8e9b-5cd7aab43d4c',billing_price:price,entitled_price:price,state:'ACTIVE',billing_status:'ACTIVE',revision:1,period:{start:now,end},paid_through:end,trial:null,cancellation:null,pending_change:null,pending_operation:null,debt:null,access:{allowed:true,reason:'PAID',site_id:site,customer_id:customer,product_id:product,subscription_id:subscription,entitled_price_id:priceId,entitled_price_version:1,revision:1,evaluated_at:now,valid_until:valid},permitted_actions:[],next_amount:{amount_minor:1000,currency:'EUR',tax_final:true},created_at:now,updated_at:now};
@@ -51,7 +53,10 @@ test('native subscription PAYMENT and SETUP mount visibly, wait for ready and re
             if(path===base&&method==='POST'){create++;assert.equal(!!request.headers()['idempotency-key'],true);return route.fulfill({status:202,json:{...op,next_action:null,browser_confirm_allowed:false}});}
             if(path===original&&method==='GET'){reads++;return route.fulfill({json:{...op,status:settled?'SUCCEEDED':'PROCESSING'}});}
             if(path===original+'/action'&&method==='GET')return route.fulfill({json:{kind:'PROVIDER_CLIENT',secret:grant,expires_at:actionExpires}});
-            if(path===original+'/client-session'&&method==='POST'){issue++;const body=request.postDataJSON();assert.equal(Object.keys(body).join(',')==='action_token'&&body.action_token===grant,true,'exact synthetic session body');return route.fulfill({headers:{'Cache-Control':'no-store'},json:{provider:'stripe',flow,publishable_key:'pk_test_fixture',client_secret:secret,action_token:grant,expires_at:clientExpires}});}
+            if(path===original+'/confirmation-attempts/current'&&method==='GET')return route.fulfill({json:issue&&flow==='PAYMENT'?attemptStatus():null});
+            if(path===original+'/confirmation-attempts/'+attempt&&method==='GET')return route.fulfill({json:attemptStatus()});
+            if(path===original+'/confirmation-attempts/'+attempt+'/confirm'&&method==='POST'){preflight++;assert.deepEqual(request.postDataJSON(),{capability,confirmation_token:'ctoken_fixture'});return route.fulfill({json:{...attemptStatus(),next_action_allowed:preflight===1}});}
+            if(path===original+'/confirmation-session'&&method==='POST'){issue++;const body=request.postDataJSON();assert.equal(Object.keys(body).join(',')==='action_token'&&body.action_token===grant,true,'exact synthetic session body');return route.fulfill({headers:{'Cache-Control':'no-store'},json:{protocol:flow==='PAYMENT'?'SERVER_CONFIRM_V2':'BROWSER_CONFIRM_V1',provider:'stripe',flow,publishable_key:'pk_test_fixture',client_secret:secret,...(flow==='PAYMENT'?{attempt_id:attempt,capability}:{action_token:grant}),expires_at:clientExpires}});}
             if(path===original+'/action-confirmations'&&method==='POST'){preflight++;return route.fulfill({status:202,json:{...op,next_action:null,browser_confirm_allowed:preflight===1}});}
             if([`${base}/${subscription}/billing-records`,`${base}/${subscription}/events`].includes(path)&&method==='GET')return route.fulfill({json:{items:[],next_cursor:null}});
           }
@@ -74,17 +79,17 @@ test('native subscription PAYMENT and SETUP mount visibly, wait for ready and re
               const frame=document.createElement('iframe');frame.title='Synthetic subscription challenge';frame.src='/challenge';document.body.append(frame);
               const complete=(event:MessageEvent)=>{if(event.origin===origin&&event.data==='synthetic-subscription-sca'){window.removeEventListener('message',complete);frame.remove();resolve({});}};window.addEventListener('message',complete);
             });};
-            return {elements:(options:{clientSecret:string})=>{check(options.clientSecret===secret,'synthetic flow context');return {create:()=>{
+            return {elements:(options:{clientSecret:string})=>{check(options.clientSecret===secret,'synthetic flow context');return {submit:async()=>({}),create:()=>{
               const listeners=new Map<string,()=>void>();let record:typeof records[number];const frame=document.createElement('iframe');frame.title='Synthetic subscription field';frame.style.height='80px';
               const element={on:(name:string,listener:()=>void)=>{listeners.set(name,listener);return element;},off:(name:string)=>{listeners.delete(name);return element;},mount:(host:HTMLElement)=>{
                 check(host.isConnected&&host.getRootNode()===document&&host.assignedSlot,'connected projected owned host');check([...host.getClientRects()].some(r=>r.width>0&&r.height>0),'visible host before provider mount');
                 record={host,listeners,destroyed:false};records.push(record);host.append(frame);
               },destroy:()=>{if(record)record.destroyed=true;frame.remove();}};return element;
-            }};},confirmPayment:()=>confirm('PAYMENT'),confirmSetup:()=>confirm('SETUP')};
+            }};},createConfirmationToken:async()=>({confirmationToken:{id:'ctoken_fixture'}}),handleNextAction:()=>confirm('PAYMENT'),confirmPayment:()=>{throw Error('v2 browser confirmation is forbidden');},confirmSetup:()=>confirm('SETUP')};
           };
           const sdk=await import(origin+'/sdk.js');sdk.registerGenericSubscriptionManager();
           const manager=document.createElement('generic-subscription-manager') as any;state.manager=manager;manager.client=sdk.createGenericPaymentClient({apiBaseUrl:origin});manager.customerSession={apiBaseUrl:origin,siteKey:'test-site',siteId:site,origin,customer:{id:customer,status:'ACTIVE',maskedEmail:null},sessionToken:token,expiresAt:expires,scopes:['SUBSCRIPTION_READ','SUBSCRIPTION_MANAGE']};manager.productId=product;manager.priceId=priceId;document.querySelector('main')!.append(manager);
-          const issue=manager.client.subscriptions.clientSession;manager.client.subscriptions.clientSession=async(input:unknown)=>{try{const result=await issue(input);state.sessionsResolved++;return result;}catch(error){state.errors.push((error as {code?:string}).code??'FIXTURE_UNCLASSIFIED');throw error;}};
+          const issue=manager.client.subscriptions.confirmationSession;manager.client.subscriptions.clientSession=async(input:unknown)=>{try{const result=await issue(input);state.sessionsResolved++;return result;}catch(error){state.errors.push((error as {code?:string}).code??'FIXTURE_UNCLASSIFIED');throw error;}};
           manager.addEventListener('generic-subscription-error',(event:CustomEvent)=>state.errors.push(event.detail.code));
           const until=async(predicate:()=>boolean,phase:string)=>{const end=Date.now()+4000;while(!predicate()){check(Date.now()<end,'native subscription '+phase+' did not settle');await new Promise(resolve=>setTimeout(resolve,5));}};
           const buttons=()=>[...manager.shadowRoot.querySelectorAll('button')] as HTMLButtonElement[];const button=(name:string)=>buttons().find(b=>b.textContent===name&&!b.hidden)!;

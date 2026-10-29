@@ -1,3 +1,4 @@
+import { assertSelectedSetup } from './confirmation-v2.js';
 import type { Stripe, StripeElements, StripePaymentElement } from '@stripe/stripe-js';
 import { browserOrigin, validateCustomerSession } from '../customer/contracts.js';
 import { PaymentSdkError, isAbort } from '../errors.js';
@@ -11,11 +12,13 @@ export interface StripeSubscriptionOptions {
   client: SubscriptionClient; input: SubscriptionIdRequest & { operationId: string }; action: SubscriptionAction;
   container: HTMLElement; isCurrent: () => boolean; locale?: 'en' | 'pt';
   onRetire?: () => void;
+  /** Already selected SETUP context; internal manager handoff. */
+  selectedSession?: SubscriptionClientSession;
 }
 export interface StripeSubscriptionHandle { confirm(): Promise<SubscriptionOperation>; destroy(): void; }
 const fingerprint = (s: StripeSubscriptionOptions['input']['session']) => JSON.stringify([s.apiBaseUrl,s.siteKey,s.siteId,s.origin,s.customer.id,s.customer.status,s.customer.maskedEmail,s.sessionToken,s.expiresAt,[...s.scopes].sort()]);
 const aborted = () => new DOMException('Aborted', 'AbortError');
-function visible(host: HTMLElement): boolean {
+export function visibleSubscriptionHost(host: HTMLElement): boolean {
   if (!host.isConnected || ![...host.getClientRects()].some(r => r.width > 0 && r.height > 0)) return false;
   let node: HTMLElement | null = host;
   while (node) {
@@ -53,7 +56,7 @@ export async function mountStripeSubscription(options: StripeSubscriptionOptions
     if (wasActive) { cancel(aborted()); try { onRetire?.(); } catch { /* owner cleanup cannot revive this form */ } }
   }
   function current(): void {
-    if (!active || input.signal?.aborted || !isCurrent() || !visible(container)) throw aborted();
+    if (!active || input.signal?.aborted || !isCurrent() || !visibleSubscriptionHost(container)) throw aborted();
     assertAuthority!();
     validateCustomerSession(input.session);
     if (fingerprint(input.session) !== authority || input.session.origin !== browserOrigin() || Date.now() >= expires || !input.session.scopes.includes('SUBSCRIPTION_MANAGE') || (action && JSON.stringify(action) !== actionIdentity)) throw new PaymentSdkError('INVALID_SESSION');
@@ -62,13 +65,14 @@ export async function mountStripeSubscription(options: StripeSubscriptionOptions
   function armExpiry(): void { if (expiry !== undefined) clearTimeout(expiry); expiry = setTimeout(destroy,Math.max(0,Math.min(expires-Date.now(),2147483647))); }
   try {
     current(); assertSubscriptionAction(client,input,action);
+    if(options.selectedSession)assertSelectedSetup(client,input,action,options.selectedSession);
     input.signal?.addEventListener('abort',destroy,{ once:true }); window.addEventListener('pagehide',destroy,{ once:true });
     releaseCustomer=subscribeSubscriptionCustomer(input.session,destroy);
     const observation={ childList:true,subtree:true,attributes:true,attributeFilter:['hidden','style','class','name','slot'] };
     observer.observe(container.ownerDocument,observation);
     const projection=container.assignedSlot?.getRootNode();if(projection instanceof ShadowRoot)observer.observe(projection,observation);
     armExpiry();
-    capability = await guarded(client.clientSession({ ...input, action, idempotencyKey:crypto.randomUUID() }));
+    capability = options.selectedSession ?? await guarded(client.clientSession({ ...input, action, idempotencyKey:crypto.randomUUID() }));
     expires = Math.min(expires,Date.parse(capability.expiresAt)); armExpiry();
     const loaded = await guarded(loadStripeClient(capability.publishableKey)); if (!loaded) throw new PaymentSdkError('PROVIDER_TEMPORARILY_UNAVAILABLE');
     stripe = loaded; elements = stripe.elements({ clientSecret:capability.clientSecret, locale:locale ?? 'en' });

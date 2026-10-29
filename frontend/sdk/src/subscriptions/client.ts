@@ -1,3 +1,5 @@
+import { bindSelectedSetup, bindPaymentSession, consumePaymentSession, parseAttempt, parseConfirmationJson, parseConfirmationSession } from './confirmation-v2.js';
+import type { SubscriptionConfirmReceipt, SubscriptionPaymentSession } from './contracts.js';
 import { object, uuid } from '../contracts.js';
 import { validCursor } from '../customer/contracts.js';
 import { PaymentSdkError } from '../errors.js';
@@ -12,7 +14,7 @@ function invalid(): never { throw new PaymentSdkError('INVALID_CONFIGURATION'); 
 function input(raw: unknown, required: string[], optional: string[] = []): asserts raw is SubscriptionRequest {
   if (!object(raw) || !required.every(k => Object.hasOwn(raw, k)) || Object.keys(raw).some(k => !['session', 'signal', ...required, ...optional].includes(k)) || (raw.signal !== undefined && !(raw.signal instanceof AbortSignal))) invalid();
   if (!object(raw.session)) throw new PaymentSdkError('INVALID_SESSION');
-  for (const name of ['subscriptionId', 'productId', 'priceId', 'targetPriceId', 'quoteId', 'operationId', 'billingRecordId']) if (name in raw && !uuid(raw[name])) invalid();
+  for (const name of ['subscriptionId', 'productId', 'priceId', 'targetPriceId', 'quoteId', 'operationId', 'billingRecordId', 'attemptId']) if (name in raw && !uuid(raw[name])) invalid();
   if ('idempotencyKey' in raw && (typeof raw.idempotencyKey !== 'string' || !/^[A-Za-z0-9_.:/-]{1,255}$/.test(raw.idempotencyKey))) invalid();
   if ('recurringConsent' in raw && typeof raw.recurringConsent !== 'boolean') invalid();
 }
@@ -47,6 +49,18 @@ export function createSubscriptionClient(request: SubscriptionAuthorizedRequest,
     action: async i => { input(i, ['session', 'subscriptionId', 'operationId']); return bindSubscriptionAction(client, i.session, i.operationId, i.subscriptionId, parseSubscriptionAction(await read(i, path(i, `/operations/${i.operationId}/action`), 32768, true))); },
     clientSession: async i => { input(i, ['session', 'subscriptionId', 'operationId', 'idempotencyKey', 'action']); assertSubscriptionAction(client, i, i.action); const raw = await post(i, path(i, `/operations/${i.operationId}/client-session`), { action_token: i.action.secret }, 200, parseSubscriptionClientSessionJson); assertSubscriptionAction(client, i, i.action); return parseSubscriptionClientSession(raw, i.action, i.session); },
     confirmAction: async i => { input(i, ['session', 'subscriptionId', 'operationId', 'idempotencyKey', 'actionToken']); if (!validSubscriptionActionToken(i.actionToken)) invalid(); return mutate(i, `/operations/${i.operationId}/action-confirmations`, { action_token: i.actionToken }); },
+    confirmationSession: async i => {
+      input(i,['session','subscriptionId','operationId','idempotencyKey','action']); assertSubscriptionAction(client,i,i.action);
+      const raw=await post(i,path(i,`/operations/${i.operationId}/confirmation-session`),{action_token:i.action.secret},200,parseConfirmationJson);
+      assertSubscriptionAction(client,i,i.action);
+      const context=parseConfirmationSession(raw,i.session,i.action.expiresAt,i.action);
+      return context.protocol==='SERVER_CONFIRM_V2'?bindPaymentSession(client,i,context):bindSelectedSetup(client,i,i.action,context);
+    },
+    confirmationAttempt: async i => { input(i,['session','subscriptionId','operationId','attemptId']); return parseAttempt(await request(i.session,path(i,`/operations/${i.operationId}/confirmation-attempts/${i.attemptId}`),'GET',undefined,i.signal,[200],undefined,'SUBSCRIPTION_MANAGE',undefined,32768,parseConfirmationJson),i.attemptId); },
+    currentConfirmationAttempt: async i => { input(i,['session','subscriptionId','operationId']); const raw=await request(i.session,path(i,`/operations/${i.operationId}/confirmation-attempts/current`),'GET',undefined,i.signal,[200],undefined,'SUBSCRIPTION_MANAGE',undefined,32768,parseConfirmationJson); return raw===null?null:parseAttempt(raw); },
+    confirmPaymentAttempt: async i => { input(i,['session','subscriptionId','operationId','context','confirmationToken','idempotencyKey']); if(typeof i.confirmationToken!=='string'||!/^ctoken_[A-Za-z0-9]{1,200}$/.test(i.confirmationToken))invalid(); consumePaymentSession(client,i,i.context); return parseAttempt(await post(i,path(i,`/operations/${i.operationId}/confirmation-attempts/${i.context.attemptId}/confirm`),{capability:i.context.capability,confirmation_token:i.confirmationToken},200,parseConfirmationJson),i.context.attemptId,true) as SubscriptionConfirmReceipt; },
+    retryPaymentAttempt: async i => { input(i,['session','subscriptionId','operationId','attemptId','idempotencyKey']); return parseAttempt(await post(i,path(i,`/operations/${i.operationId}/confirmation-attempts/${i.attemptId}/retry`),{},200,parseConfirmationJson),i.attemptId); },
+    paymentAttemptSession: async i => { input(i,['session','subscriptionId','operationId','attemptId','idempotencyKey','expiresAt']); return bindPaymentSession(client,i,parseConfirmationSession(await post(i,path(i,`/operations/${i.operationId}/confirmation-attempts/${i.attemptId}/client-session`),{},200,parseConfirmationJson),i.session,i.expiresAt,undefined,i.attemptId) as SubscriptionPaymentSession); },
     portal: async i => {
       input(i, ['session', 'subscriptionId', 'idempotencyKey', 'returnUrl']); if (!validSubscriptionReturnUrl(i.returnUrl)) invalid();
       const result = parseSubscriptionPortal(await post(i, path(i, '/portal-sessions'), { return_url: i.returnUrl }, 201));
