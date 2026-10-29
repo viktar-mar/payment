@@ -16,6 +16,17 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Standalone pure official SDK tests. All ports handwritten; transport is the audited inert HttpClient. */
 class StripeBillingClockSubscriptionSdkTest {
+    @Test void ownedCreateAndReadUseOwnedAuthorityWithoutLegacyAccountFirstReentry(){
+        var h=new Harness();
+        var clocks=StripeBillingInertSdkFixture.port(StripeBillingClockStore.class,c->{throw new AssertionError("Legacy clock entry: "+c.name());});
+        var adapter=new StripeBillingClockSubscriptionAdapter(h.f.f.credentials,h.f.f.clients,h.f.f.verification,h.steps,clocks,h.owned,h.bindings,h.subscriptions,h.operations,Clock.fixed(h.f.utc.plusSeconds(2),ZoneOffset.UTC));
+        h.createReplies();
+        assertThat(adapter.createOwned(h.f.command(),h.f.f.owner).outcome()).isEqualTo(Outcome.ACCEPTED);
+        h.f.local=StripeBillingOwnership.bound(h.f.local,"sub_owned");
+        h.f.f.http.reply(h.f.f.clockJson());h.f.graph();
+        assertThat(adapter.retrieveOwned(h.f.lookup(),h.f.f.owner).status()).isEqualTo(Subscription.Status.INCOMPLETE);
+        assertThat(h.currentChecks).isGreaterThan(2);
+    }
     // Explicit construction bypasses Spring interceptors; neither entry may touch a port under an outer transaction.
     @ParameterizedTest @ValueSource(strings={"create","retrieve"})
     void explicitlyConstructedAdapterRefusesActualTransactionBeforeAnyDependency(String entry){

@@ -61,8 +61,8 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         if(account==null || intent==null || !account.id().equals(intent.clock().owner().account())
             || !account.externalAccountId().equals(intent.clock().owner().externalAccount())
             || !account.credentialsRef().equals(intent.clock().owner().credentialsRef()))throw conflict();
-        requireAccount(account);
         JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,intent);
+        requireAccount(account);
         return reserveRow(account,Kind.SUBSCRIPTION_CREATE,intent.createOperation(),intent.operationKey(),intent.fingerprint());
     }
     @Override
@@ -74,8 +74,8 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
             || !current.resourceId().equals(intent.createOperation()) || !current.operationKey().equals(intent.operationKey())
             || !current.fingerprint().equals(intent.fingerprint()) || current.firstDispatchedAt()==null
             || acknowledgedAt.isBefore(current.firstDispatchedAt()))throw conflict();
-        requirePinnedAccount(current);
         JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,intent);
+        requirePinnedAccount(current);
         requireFirstSubscriptionDispatch(current);
         JdbcStripeBillingClockSubscriptionStore.requirePristine(jdbc,intent);
         requireSubscriptionReference(current,reference);
@@ -137,6 +137,11 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
             || (current.leaseExpiresAt() != null && now.isBefore(current.leaseExpiresAt()))
             || (current.firstDispatchedAt() != null && (now.isBefore(current.firstDispatchedAt())
                 || !now.isBefore(current.retryBefore())))) return Optional.empty();
+        // Owned initial publication uses Site -> Customer -> Account. Detect from persisted
+        // intent before the generic Account fence, never after Account has already been held.
+        if(current.kind()==Kind.SUBSCRIPTION_CREATE)
+            JdbcStripeBillingClockSubscriptionStore.operationIntent(jdbc,current.accountId(),current.resourceId())
+                .ifPresent(i->JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,i));
         requirePinnedAccount(current);
         requireResource(current.accountId(), current.kind(), current.resourceId(),current.operationKey(),current.fingerprint());
         if(firstDispatchOnly(current) && current.firstDispatchedAt()!=null) return Optional.empty();

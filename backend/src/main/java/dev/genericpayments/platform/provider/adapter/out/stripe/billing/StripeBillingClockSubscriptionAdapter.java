@@ -129,7 +129,8 @@ public class StripeBillingClockSubscriptionAdapter {
     private void requireOwner(PaymentAccount account,ClockOwner owner){
         if(account==null||owner==null||!account.id().equals(owner.account())||!account.externalAccountId().equals(owner.externalAccount())||!account.credentialsRef().equals(owner.credentialsRef())
             ||account.provider()!=PaymentProviderType.STRIPE||account.mode()!=PaymentAccountMode.SANDBOX||account.status()!=PaymentAccountStatus.ACTIVE||!StripeBillingTestClockAdapter.API_VERSION.equals(owner.apiVersion()))throw StripeBillingOwnership.conflict();
-        clocks.requireActive(owner);
+        // Persisted owned find/admit/current/receipt validate active authority in lifecycle
+        // owner order. Reentering the older Account-first clock helper would invert it.
     }
     private void requireStep(ProviderOperation step,OwnedClockSubscription intent){
         var owner=intent.clock().owner();

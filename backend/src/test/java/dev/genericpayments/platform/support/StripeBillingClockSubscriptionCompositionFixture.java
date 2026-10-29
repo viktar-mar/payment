@@ -88,8 +88,8 @@ public abstract class StripeBillingClockSubscriptionCompositionFixture extends S
         return new Command(billing,reserved.operation(),reserved.subscription().billingPrice(),null,null,null,null,true,false);
     }
     protected Reply createOwned() {
-        var command=reserve();
         owner=admit(); createReady(owner); createCustomer(owner);
+        var command=reserve();
         http.reply(clockJson(owner)); http.reply(graph.remote.toString());
         var reply=ownedAdapter.createOwned(command,owner);
         assertThat(reply.outcome()).isEqualTo(Outcome.ACCEPTED);

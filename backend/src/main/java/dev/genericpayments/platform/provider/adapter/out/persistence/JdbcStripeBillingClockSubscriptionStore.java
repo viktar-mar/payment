@@ -28,7 +28,7 @@ public class JdbcStripeBillingClockSubscriptionStore implements StripeBillingClo
             || !account.id().equals(owner.account()) || !account.externalAccountId().equals(owner.externalAccount())
             || !account.credentialsRef().equals(owner.credentialsRef()) || account.provider()!=PaymentProviderType.STRIPE
             || account.mode()!=PaymentAccountMode.SANDBOX)throw conflict();
-        JdbcStripeBillingClockStore.lockOwner(jdbc,owner);
+        lockOwner(jdbc,owner);
         JdbcStripeBillingClockStore.requireActiveRow(jdbc,owner);
         var existing=intentRow(jdbc,account.id(),subscription);
         if(existing.isPresent()) {
@@ -37,7 +37,7 @@ public class JdbcStripeBillingClockSubscriptionStore implements StripeBillingClo
             return requireCurrentRow(jdbc,i);
         }
         var clock=JdbcStripeBillingClockStore.readyRow(jdbc,owner.intent()).orElseThrow(JdbcStripeBillingClockStore::conflict);
-        // No lifecycle locks under Account/Site/Customer. Immutable source relations are compared at every boundary.
+        // No lifecycle locks under Site/Customer/Account. Immutable source relations are compared at every boundary.
         var candidates=jdbc.query("""
             select b.id customer_binding,b.creation_operation_id customer_creation_operation,b.provider_reference customer_reference,
              o.fingerprint request_fingerprint,o.provider_operation_key operation_key,o.expected_revision,o.policy_version,
@@ -94,10 +94,23 @@ public class JdbcStripeBillingClockSubscriptionStore implements StripeBillingClo
     }
     static OwnedClockSubscription requireCurrentRow(JdbcTemplate jdbc,OwnedClockSubscription i){
         if(i==null)throw conflict();
-        JdbcStripeBillingClockStore.lockOwner(jdbc,i.clock().owner());
+        lockOwner(jdbc,i.clock().owner());
         JdbcStripeBillingClockStore.requireActiveRow(jdbc,i.clock().owner());
         if(!intentRow(jdbc,i.clock().owner().account(),i.subscription()).filter(i::equals).isPresent())throw conflict();
         requireLineage(jdbc,i);return i;
+    }
+    /** Initial Subscription publication locks Site, Customer, then Account. Acquire this order
+     * before any Account lock; the inherited clock/Customer setup helper is Account-first.
+     * Provider steps may already hold their own row, but never acquire lifecycle row locks. */
+    private static void lockOwner(JdbcTemplate jdbc,ClockOwner owner){
+        if(jdbc.queryForList("select id from sites where id=? and payment_account_id=? and status='ACTIVE' for share",
+            UUID.class,owner.site().value(),owner.account().value()).size()!=1)throw conflict();
+        if(jdbc.queryForList("select id from customers where id=? and site_id=? and status='ACTIVE' for share",
+            UUID.class,owner.customer().value(),owner.site().value()).size()!=1)throw conflict();
+        if(jdbc.queryForList("""
+            select id from payment_accounts where id=? and provider='STRIPE' and account_mode='SANDBOX'
+             and account_status='ACTIVE' and external_account_id=? and credentials_ref=? for share
+            """,UUID.class,owner.account().value(),owner.externalAccount(),owner.credentialsRef()).size()!=1)throw conflict();
     }
     static void requirePristine(JdbcTemplate jdbc,OwnedClockSubscription i){
         if(jdbc.queryForList("""

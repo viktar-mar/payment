@@ -103,9 +103,10 @@ class StripeBillingClockSubscriptionCompositionIntegrationTest extends StripeBil
 
     @ParameterizedTest @ValueSource(strings={"intentOnly","readyOnly","customerOnly","receiptBeforePublication"})
     void admittedMissingLineageNeverFallsBackToOperationalTime(String gap) {
-        var command=reserve();owner=admit();
+        owner=admit();
         if(!gap.equals("intentOnly"))createReady(owner);
         if(gap.equals("customerOnly")||gap.equals("receiptBeforePublication"))createCustomer(owner);
+        var command=reserve();
         if(gap.equals("receiptBeforePublication")){
             http.reply(clockJson(owner));http.reply(graph.remote.toString());
             assertThat(ownedAdapter.createOwned(command,owner).outcome()).isEqualTo(Outcome.ACCEPTED);
