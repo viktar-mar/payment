@@ -17,6 +17,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.InvalidDataAccessApiUsageException;
 import static org.assertj.core.api.Assertions.*;
 
 /** Authored/compiled offline ONLY. Runtime proof requires the complete hosted PostgreSQL/Spring gate. */
@@ -71,7 +72,17 @@ class StripeBillingClockSubscriptionCompositionIntegrationTest extends StripeBil
         assertThat(count("subscription_billing_records")).isEqualTo(1);
         assertThat(count("subscription_provider_objects")).isEqualTo(2);
         assertNoSuccess();
-        assertThatThrownBy(()->apply(snapshot,repeatedFence)).isInstanceOf(IllegalStateException.class).hasMessage("OBSERVATION_STALE");
+        var beforeRejected=current();var operationBeforeRejected=currentOperation();
+        long sequenceBeforeRejected=observations.captureFence(beforeRejected);
+        assertThatThrownBy(()->apply(snapshot,repeatedFence))
+            .isExactlyInstanceOf(InvalidDataAccessApiUsageException.class).hasMessage("OBSERVATION_STALE")
+            .satisfies(failure->assertThat(failure.getCause()).isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("OBSERVATION_STALE").hasNoCause());
+        assertThat(current()).isEqualTo(beforeRejected);assertThat(currentOperation()).isEqualTo(operationBeforeRejected);
+        assertThat(observations.captureFence(current())).isEqualTo(sequenceBeforeRejected);
+        assertThat(count("subscription_billing_records")).isEqualTo(1);
+        assertThat(count("subscription_provider_objects")).isEqualTo(2);
+        assertNoSuccess();
         assertThat(sdkCallbacks).isEqualTo(http.calls.size());
         assertThat(http.calls.stream().filter(r->r.method().name().equals("POST")).map(r->r.url().getPath()).toList())
             .containsExactly("/v1/test_helpers/test_clocks","/v1/customers","/v1/subscriptions");
@@ -88,7 +99,17 @@ class StripeBillingClockSubscriptionCompositionIntegrationTest extends StripeBil
             case "providerRevision"->snapshot=new Snapshot(snapshot.subscriptionReference(),snapshot.status(),snapshot.billingPrice(),snapshot.period(),null,null,snapshot.invoices(),snapshot.operationKey(),false,1,snapshot.observedAt(),snapshot.operationObservation());
         }
         var stale=snapshot;
-        assertThatThrownBy(()->apply(stale,fence)).isInstanceOf(IllegalStateException.class).hasMessage("OBSERVATION_STALE");
+        long sequenceBeforeRejected=observations.captureFence(current());
+        if(changed.equals("consumedFence")) {
+            assertThatThrownBy(()->apply(stale,fence))
+                .isExactlyInstanceOf(InvalidDataAccessApiUsageException.class).hasMessage("OBSERVATION_STALE")
+                .satisfies(failure->assertThat(failure.getCause()).isExactlyInstanceOf(IllegalStateException.class)
+                    .hasMessage("OBSERVATION_STALE").hasNoCause());
+        } else {
+            assertThatThrownBy(()->apply(stale,fence)).isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("OBSERVATION_STALE").hasNoCause();
+        }
+        assertThat(observations.captureFence(current())).isEqualTo(sequenceBeforeRejected);
         assertThat(count("subscription_billing_records")).isZero();assertNoSuccess();
     }
 
