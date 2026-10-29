@@ -46,6 +46,8 @@ public abstract class StripeBillingClockConfirmationCompositionFixture extends S
     protected SubscriptionConfirmationUseCase.Session selected;
     protected String actionToken;
     protected static final String TOKEN="ctoken_INERT";
+    // AccessDecision and callback contracts cap cached access at five billing minutes.
+    private static final Duration ACCESS_CACHE_LEASE=Duration.ofSeconds(300);
     protected final StripeBillingGrantTokens tokens=new StripeBillingGrantTokens(true,"v1",
         Map.of("v1",Base64.getEncoder().encodeToString(new byte[32])));
 
@@ -195,7 +197,9 @@ public abstract class StripeBillingClockConfirmationCompositionFixture extends S
         assertThat(count("subscription_events")).isEqualTo(1);
         var access=queries.get(scope.context().actor(),site,s.id()).access();
         assertThat(access.allowed()).isTrue();assertThat(access.evaluatedAt()).isEqualTo(Instant.ofEpochSecond(FROZEN));
-        assertThat(access.validUntil()).isEqualTo(period.end());
+        var expectedAccessExpiry=Instant.ofEpochSecond(FROZEN).plus(ACCESS_CACHE_LEASE);
+        assertThat(access.reason()).isEqualTo(AccessDecision.Reason.PAID);
+        assertThat(access.validUntil()).isEqualTo(expectedAccessExpiry);
         assertThat(owned.requireReceipt(billing.id(),s.id())).isEqualTo(receipt);
         assertThat(receipt.providerCreated()).isEqualTo(42).isNotEqualTo(FROZEN);
         assertThat(count("outbox_events")).isEqualTo(2);
@@ -208,7 +212,7 @@ public abstract class StripeBillingClockConfirmationCompositionFixture extends S
         var subscription=jdbc.queryForMap("select payload->>'event_id' as event,payload->>'subscription_id' as subscription,payload->>'state' as state,payload->>'access_allowed' as access,payload->>'access_valid_until' as until,payload->>'occurred_at' as occurred from outbox_events where source_kind='SUBSCRIPTION'");
         assertThat(subscription).containsEntry("event",jdbc.queryForObject("select id::text from subscription_events",String.class))
             .containsEntry("subscription",s.id().toString()).containsEntry("state","ACTIVE").containsEntry("access","true")
-            .containsEntry("until",period.end().toString()).containsEntry("occurred",Instant.ofEpochSecond(FROZEN).toString());
+            .containsEntry("until",expectedAccessExpiry.toString()).containsEntry("occurred",Instant.ofEpochSecond(FROZEN).toString());
         assertThat(jdbc.queryForList("select occurred_at from payment_events",Timestamp.class)).containsExactly(Timestamp.from(Instant.ofEpochSecond(1700000011)));
         for(var table:List.of("payments","subscription_billing_records","outbox_events"))
             assertThat(jdbc.queryForList("select created_at from "+table,Timestamp.class)).allSatisfy(t->assertThat(t.toInstant()).isBetween(began,Instant.now()));
