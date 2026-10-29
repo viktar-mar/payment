@@ -178,7 +178,7 @@ function fixture(overrides={}) {
         if(a.includes('build')) {images.set('backend',image(1));images.set('demo-site',image(2));}
         if(a.includes('config'))stdout=JSON.stringify({services:Object.fromEntries(SERVICES.map(service=>[service,{
           image:service==='backend'?PROJECT+'-backend:latest':service==='demo-site'?PROJECT+'-demo-site:latest':service==='postgres'?'postgres:18-alpine':service==='mailpit'?'axllent/mailpit:v1.27':'node:24-alpine',
-          container_name:PROJECT+'-'+service,labels:labels('container'),networks:{default:null},environment:service==='backend'?{PAYMENT_STRIPE_SANDBOX_ENABLED:'false'}:{},
+          container_name:PROJECT+'-'+service,labels:labels('container'),networks:{default:null},environment:service==='backend'?{PAYMENT_STRIPE_SANDBOX_ENABLED:'false',...(options.env.PAYMENT_STRIPE_BILLING_ACCEPTANCE==='true'?{PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:'buildOnly'}:{})}:{},
           ports:Object.entries(mapping(service)).map(([port,binding])=>({target:Number(port.split('/')[0]),published:binding[0].HostPort,host_ip:binding[0].HostIp,protocol:'tcp',mode:'ingress'})),
           volumes:mounts(service).map(m=>({type:m.Type,source:m.Type==='bind'?m.Source:service==='backend'?'owned-issuer':'payment-postgres',target:m.Destination,read_only:!m.RW})),
         }])),networks:{default:{external:true,name:PROJECT+'-network'}},volumes:{'payment-postgres':{external:true,name:PROJECT+'-postgres'},'owned-issuer':{external:true,name:PROJECT+'-issuer'}}});
@@ -1442,4 +1442,53 @@ test('both opt-ins precede every configuration and dependency getter',async()=>{
     await assert.rejects(createOwnedSandboxBootstrap(options,dependencies),{message:'stripe_sandbox_bootstrap_OPT_IN_REQUIRED'});
     assert.equal(touched,0);
   }
+});
+
+test('Billing bootstrap is inert and keeps a seventh distinct grant key in owned backend only',async()=>{
+  assert.equal(typeof bootstrapModule.createOwnedBillingBootstrap,'function');const f=fixture();
+  f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';
+  const b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies),limits=LIMIT();assert.equal(f.events.length,0);
+  await b.prepare(limits);await b.persistWebhookSecret(SECRET);await b.start(limits);
+  const data=Object.fromEntries(f.files.get(DIR+'/app.env').contents.toString().trim().split('\n').map(l=>l.split(/=(.*)/s).slice(0,2)));
+  assert.match(data.PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1,/^[A-Za-z0-9+/]{43}=$/);
+  assert.equal(Object.values(data).filter(v=>v===data.PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1).length,1);
+  assert.equal(JSON.stringify(b.resources()).includes(data.PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1),false);
+  const yaml=f.files.get(DIR+'/owned.yaml').contents.toString();
+  assert.equal((yaml.match(/PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED/g)||[]).length,1);
+  assert.ok(yaml.indexOf('PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED')>yaml.indexOf('  backend:'));
+  assert.ok(yaml.indexOf('PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1')<yaml.indexOf('  demo-site:'));
+  let credentials;assert.equal(await b.withDatabaseCredentials(async value=>{credentials=value;return true;},limits),true);
+  assert.deepEqual(credentials,{host:'127.0.0.1',port:PORTS.postgres,database:'payment',user:'payment',password:data.PAYMENT_DB_PASSWORD});
+  await b.stop(LIMIT());
+});
+
+test('Billing grant entropy collision fails before owned service creation',async()=>{
+  const f=fixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';
+  let n=0;f.dependencies.randomBytes=size=>Buffer.alloc(size,++n===7?1:n);
+  const b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);await assert.rejects(b.prepare(LIMIT()));assert.equal(f.containers.size,0);
+});
+test('Billing bootstrap denies renewal of original deadline and restricts DB callback to live proof',async()=>{
+  const f=fixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';
+  const b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies),limits=LIMIT();await b.prepare(limits);
+  await assert.rejects(b.persistWebhookSecret(SECRET).then(()=>b.start({deadline:limits.deadline+1})));assert.equal(b.resources().status,'PENDING');
+});
+test('Billing generated Compose proof rejects grant configuration escaping the backend',async()=>{
+  const f=fixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';
+  const execute=f.dependencies.execute;f.dependencies.execute=async(file,args,settings)=>{const r=await execute(file,args,settings);if(args.includes('config')&&args.includes('--format')){const c=JSON.parse(r.stdout);c.services['demo-site'].environment.PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1='buildOnly';return {...r,stdout:JSON.stringify(c)};}return r;};
+  const b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);await assert.rejects(b.prepare(LIMIT()),/PREPARE_PENDING/);
+});
+
+for(const interruption of ['before-callback','root-abort','child-deadline'])test('Billing DB credential callback rejects '+interruption+' and cannot accept a late result',async()=>{
+  const f=fixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';
+  const root=new AbortController(),limits={...LIMIT(),signal:root.signal},b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);
+  await b.prepare(limits);await b.persistWebhookSecret(SECRET);await b.start(limits);
+  let entered,release,calls=0;const waiting=new Promise(resolveEntered=>{entered=resolveEntered;});
+  if(interruption==='before-callback')root.abort();
+  const result=b.withDatabaseCredentials(()=>{calls++;entered();return new Promise(resolveRelease=>{release=resolveRelease;});},{deadline:limits.deadline-1000});
+  const rejected=assert.rejects(result,/ADMIN_PENDING/);
+  if(interruption!=='before-callback'){await waiting;if(interruption==='root-abort')root.abort();else{assert.equal(f.timers.size,1);[...f.timers.values()][0].callback();}}
+  await rejected;assert.equal(calls,interruption==='before-callback'?0:1);assert.equal(b.resources().status,'PENDING');
+  if(release){release(true);await turn();assert.equal(b.resources().status,'PENDING');}
+  const prior=calls;await assert.rejects(b.withDatabaseCredentials(()=>{calls++;return true;},{deadline:limits.deadline-1000}),/ADMIN_PENDING/);assert.equal(calls,prior);
+  assert.equal(await b.stop({deadline:limits.deadline+1000}),true);
 });

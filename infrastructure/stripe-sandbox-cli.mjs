@@ -1,4 +1,5 @@
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
+import {billingAcceptanceExcluded,billingAcceptanceOptIn,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
 import {execFile,spawn} from 'node:child_process';
 import {lstat,realpath,readdir,open} from 'node:fs/promises';
 import {constants} from 'node:fs';
@@ -14,6 +15,7 @@ const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const EXHAUSTED=new Set(['2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-429f-a34c-e4f69ba2ce18']);
 const PREFIX=Object.freeze(['-p','(version 1)(allow default)(deny process-exec (literal "/usr/bin/security"))','/opt/homebrew/bin/stripe']);
 const EVENTS='payment_intent.processing,payment_intent.requires_action,payment_intent.succeeded,payment_intent.payment_failed,payment_intent.canceled,refund.created,refund.updated,refund.failed';
+const BILLING_EVENTS='payment_intent.processing,payment_intent.requires_action,payment_intent.succeeded,payment_intent.payment_failed,payment_intent.canceled,customer.subscription.created,customer.subscription.updated,customer.subscription.deleted,customer.subscription.paused,customer.subscription.resumed,customer.subscription.trial_will_end,invoice.created,invoice.updated,invoice.finalized,invoice.finalization_failed,invoice.paid,invoice.payment_failed,invoice.payment_action_required,invoice.voided,invoice.marked_uncollectible';
 function executeAwaited(execute,file,args,options) {
   return new Promise((resolveExecution,rejectExecution)=>{
     let callbackDone=false,closed=false,failed=false,result;
@@ -29,7 +31,7 @@ const fail=()=>{throw null;};
 const fixed=code=>new Error('stripe_sandbox_cli_'+code);
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 // Closed purposes are private capabilities, never caller-supplied modes or flags.
-const SANDBOX=Symbol('sandbox'),REFUND=Symbol('refund'),REMAINDER=Symbol('remainder');
+const SANDBOX=Symbol('sandbox'),REFUND=Symbol('refund'),REMAINDER=Symbol('remainder'),BILLING=Symbol('billing');
 const ORIGINAL='031b5ae7-6603-4339-b1b3-77231291ff34',PRIOR='34941d87-12d3-4c74-8c5a-b62b7c914390';
 function exactData(value,keys){
   if(!object(value)||![Object.prototype,null].includes(Object.getPrototypeOf(value)))fail();
@@ -65,11 +67,19 @@ export async function createManualRefundCliAdapter(options,dependencies={}) {
 export async function createSandboxCliAdapter(options,dependencies={}) {
   return createCliAdapter(options,dependencies,SANDBOX);
 }
+/** The caller supplies an owned configuration and two bootstrap capabilities, never commands. */
+export async function createBillingCliAdapter(options,dependencies={}) {
+  let selected,configuration;
+  try{selected=exactData(options,['configuration','cliDirectory','verifyForwardTarget','persistWebhookSecret']);configuration=validateBillingAcceptanceOptions(selected.configuration);if(!configuration)fail();}
+  catch{throw fixed('OPT_IN_REQUIRED');}
+  return createCliAdapter({...configuration,cliDirectory:selected.cliDirectory,backendPort:configuration.ports.backend,accountKey:'stripe-sandbox-default',verifyForwardTarget:selected.verifyForwardTarget,persistWebhookSecret:selected.persistWebhookSecret},dependencies,BILLING);
+}
 async function createCliAdapter(options,dependencies,purpose) {
-  const remainderMode=purpose===REMAINDER,refundMode=purpose===REFUND||remainderMode;
+  const billingMode=purpose===BILLING,remainderMode=purpose===REMAINDER,refundMode=purpose===REFUND||remainderMode;
   const descriptor=Object.getOwnPropertyDescriptor(options??{},'env');
   const rawEnv=descriptor?.enumerable&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined;
-  if(!remainderMode&&!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
+  if(!billingMode&&!billingAcceptanceExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
+  if(!billingMode&&!remainderMode&&!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
   let enabled=false,manualPaymentMode=false,threeDSecure=false;
   try{
     const key='PAYMENT_STRIPE_SANDBOX_MANUAL_3DS',selected=Object.getOwnPropertyDescriptor(rawEnv??{},key);
@@ -78,6 +88,7 @@ async function createCliAdapter(options,dependencies,purpose) {
     threeDSecure=selected?.value==='true';if(threeDSecure&&(refundMode||!manualPaymentOptIn(rawEnv)))fail();
   }catch{throw fixed('OPT_IN_REQUIRED');}
   try {const optIn=rawEnv;manualPaymentMode=!refundMode&&optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=remainderMode?manualRefundRemainderOptIn(optIn):refundMode?manualRefundOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
+  if(billingMode)enabled=billingAcceptanceOptIn(rawEnv);
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {
@@ -102,15 +113,19 @@ async function createCliAdapter(options,dependencies,purpose) {
   let refundDeadline=null,refundOwner=null,refundBinding=null,refundBindUsed=false,refundFailed=false,refundStarted=false,refundCharge=null,partialReference=null,partialRefundId=null;
   let remainderTarget=null,priorIdentity=null,priorEventType=null,remainderIdentity=null,remainderEventType=null;
   const remainderSignals=new Set();
+  let billingGraph=null,billingFailed=false,billingBound=false,billingStarted=false,billingDeadline=null,billingSignal;
 
-  function check(context) {if(context.signal.aborted||Date.now()>=(context.proofDeadline??context.deadline)||remainderMode&&!context.cleanup&&[...remainderSignals].some(s=>s.aborted))fail();}
+  function check(context) {if(context.signal.aborted||Date.now()>=(context.proofDeadline??context.deadline)||remainderMode&&!context.cleanup&&[...remainderSignals].some(s=>s.aborted)||billingMode&&!context.cleanup&&billingSignal?.aborted)fail();}
   async function operation(code,limits,body) {
+    if(billingMode&&billingFailed&&code!=='STOP')throw fixed(code);
     if(busy)throw fixed('BUSY');
     busy=true;let timer,external,onAbort;
     const controller=new AbortController();
     try {
       const deadline=limits?.deadline;external=limits?.signal;
       if(!Number.isFinite(deadline)||deadline<=Date.now()||(external!==undefined&&!(external instanceof AbortSignal)))fail();
+      if(billingMode){if(billingDeadline===null){if(deadline>Date.now()+45*60000)fail();billingDeadline=deadline;billingSignal=external;}if(deadline>billingDeadline+(code==='STOP'?120000:0))fail();
+        if(code!=='STOP'&&billingSignal)external=external?AbortSignal.any([billingSignal,external]):billingSignal;}
       if(refundMode){if(refundDeadline===null){if(deadline>Date.now()+1800000)fail();refundDeadline=deadline;}if(code==='STOP'?deadline>refundDeadline+120000:deadline!==refundDeadline)fail();}
       if(remainderMode&&code!=='STOP'&&external)remainderSignals.add(external);
       if(remainderMode&&code!=='STOP'&&remainderSignals.size)external=AbortSignal.any([...remainderSignals]);
@@ -120,8 +135,8 @@ async function createCliAdapter(options,dependencies,purpose) {
       const proofDeadline=boundedProof?Math.min(deadline,Date.now()+45000):deadline;
       timer=io.setTimeout(onAbort,Math.min(proofDeadline-Date.now(),2147483647));
       const context={deadline,signal:controller.signal,...(boundedProof?{proofDeadline}:{}),...(code==='STOP'?{cleanup:true}:{})};check(context);
-      return await body(context);
-    } catch {throw fixed(code);}
+      const result=await body(context);if(billingMode)check(context);return result;
+    } catch {if(billingMode)billingFailed=true;throw fixed(code);}
     finally {try {io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);} catch {} busy=false;}
   }
   async function privateFile(path) {
@@ -144,7 +159,7 @@ async function createCliAdapter(options,dependencies,purpose) {
   async function command(commandArgs,context) {
     await privateTree(context);check(context);
     if(remainderMode&&refundBinding)refundListener(context);
-    const result=await io.execute('/usr/bin/sandbox-exec',[...args,...commandArgs],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe'],
+    const result=await io.execute('/usr/bin/sandbox-exec',[...args,...commandArgs,...(billingMode&&commandArgs[0]==='get'?['--stripe-version',VERSION]:[])],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe'],
       timeout:Math.min(context.manual||refundMode?10000:20000,Math.max(1,(context.proofDeadline??context.deadline)-Date.now())),maxBuffer:65536,signal:context.signal});
     check(context);
     if(remainderMode&&refundBinding)refundListener(context);
@@ -181,13 +196,13 @@ async function createCliAdapter(options,dependencies,purpose) {
     });
   }
   async function waitExit(record,ms) {
-    if(refundMode?record.closed:record.exited)return true;
+    if(refundMode||billingMode?record.closed:record.exited)return true;
     let timer;
     try {return await Promise.race([record.termination.then(()=>true),new Promise(resolveWait=>{timer=io.setTimeout(()=>resolveWait(false),ms);})]);}
     finally {io.clearTimeout(timer);}
   }
   async function terminate(record,budget=10000) {
-    if(refundMode?record.closed:record.exited)return true;
+    if(refundMode||billingMode?record.closed:record.exited)return true;
     // The process object and positive PID are captured once; no PID-based/global kill.
     if(owner!==record||record.child.pid!==record.pid) {uncertain=true;return false;}
     try {record.child.kill('SIGINT');} catch {}
@@ -199,7 +214,7 @@ async function createCliAdapter(options,dependencies,purpose) {
     uncertain=true;return false;
   }
   function listen(context) {
-    const child=io.spawn('/usr/bin/sandbox-exec',[...args,'listen','--events',EVENTS,'--events-from','@self','--forward-to',
+    const child=io.spawn('/usr/bin/sandbox-exec',[...args,'listen','--events',billingMode?BILLING_EVENTS:EVENTS,'--events-from','@self','--forward-to',
       'http://127.0.0.1:'+backendPort+'/api/v1/provider-webhooks/stripe/stripe-sandbox-default'],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe']});
     const pid=child.pid;
     if(!Number.isInteger(pid)||pid<=0) {uncertain=true;child.on('error',()=>{});fail();}
@@ -210,8 +225,8 @@ async function createCliAdapter(options,dependencies,purpose) {
     record.termination=new Promise(resolveWait=>{resolveExit=resolveWait;});
     owner=record;
     const invalidate=()=>{record.valid=false;record.invalidated=true;rejectReady(null);};
-    child.on('exit',()=>{record.exited=true;record.valid=false;if(!record.stopping)record.invalidated=true;rejectReady(null);if(!refundMode)resolveExit();});
-    if(refundMode)child.on('close',()=>{record.closed=true;record.exited=true;record.valid=false;rejectReady(null);resolveExit();});
+    child.on('exit',()=>{record.exited=true;record.valid=false;if(!record.stopping)record.invalidated=true;rejectReady(null);if(!refundMode&&!billingMode)resolveExit();});
+    if(refundMode||billingMode)child.on('close',()=>{record.closed=true;record.exited=true;record.valid=false;rejectReady(null);resolveExit();});
     child.on('error',invalidate);
     function line(raw) {
       const text=raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'').replace(/\r$/,'');
@@ -269,7 +284,7 @@ async function createCliAdapter(options,dependencies,purpose) {
   async function stopListener(context) {
     if(uncertain)fail();
     if(owner===null)return true;
-    if(owner.explicitStop&&owner.exited)return true;
+    if(owner.explicitStop&&(billingMode?owner.closed:owner.exited))return true;
     check(context);
     const record=owner;
     record.stopping=true;
@@ -550,6 +565,71 @@ async function createCliAdapter(options,dependencies,purpose) {
       return Object.freeze({providerVerified:true,webhookVerified:true});
     });
   }
+  function billingListener(context){
+    check(context);
+    if(!billingBound||!owner||!owner.valid||!owner.ready||!owner.persisted||owner.exited||owner.closed||owner.invalidated||owner.child.pid!==owner.pid||uncertain)fail();
+  }
+  function assertBillingListener(limits){
+    try{const d=Object.getOwnPropertyDescriptors(limits??{}),deadline=d.deadline?.value,signal=d.signal?.value;
+      if(billingFailed||!Number.isSafeInteger(deadline)||deadline>Date.now()+45*60000||deadline>billingDeadline||deadline<=Date.now()||!Object.hasOwn(d.deadline??{},'value')||d.signal&&!Object.hasOwn(d.signal,'value')||signal!==undefined&&!(signal instanceof AbortSignal))fail();
+      billingListener({deadline,signal:signal??{aborted:false}});return true;
+    }catch{billingFailed=true;throw fixed('BILLING_LISTENER');}
+  }
+  function bindOwnedBillingGraph(value,context){
+    billingListener(context);if(billingGraph)fail();
+    const keys=['runId','expectedSource','accountId','siteId','customerId','subscriptionId','operationId','priceId','priceVersion','customerReference','subscriptionReference','productReference','priceReference','invoiceReference','allocationReference','intentReference','chargeReference','periodStart','periodEnd'];
+    const v=exactData(value,keys);
+    if(v.runId!==runId||v.expectedSource!==options.expectedSource||!['accountId','siteId','customerId','subscriptionId','operationId','priceId'].every(k=>typeof v[k]==='string'&&UUID.test(v[k]))||v.priceVersion!==1)fail();
+    for(const [name,prefix] of Object.entries({customer:'cus',subscription:'sub',product:'prod',price:'price',invoice:'in',allocation:'inpay',intent:'pi',charge:'ch'}))if(typeof v[name+'Reference']!=='string'||!new RegExp('^'+prefix+'_[A-Za-z0-9_]{1,200}$').test(v[name+'Reference']))fail();
+    if(!Number.isSafeInteger(v.periodStart)||v.periodStart<=0||!Number.isSafeInteger(v.periodEnd)||v.periodEnd<=v.periodStart)fail();
+    billingGraph=Object.freeze(v);return true;
+  }
+  async function observeOwnedBillingGraph(context){
+    billingListener(context);if(!billingGraph)fail();const t=billingGraph;
+    await binding(context);billingListener(context);
+    const require=value=>{if(!value)fail();};
+    const exact=(v,id,type)=>require(v?.id===id&&v.object===type&&v.livemode===false&&(v.account===undefined||v.account===ACCOUNT));
+    const empty=v=>Array.isArray(v)&&v.length===0;
+    const metadata=(v,expected)=>require(object(v)&&Object.entries(expected).every(([k,x])=>v[k]===x));
+    async function read(path,filters=[]){billingListener(context);const value=parseBody(await command(['get',path,...filters.flatMap(([k,v])=>['-d',k+'='+v])],context));billingListener(context);return value;}
+    async function pages(path,filters=[]){
+      const data=[],seen=new Set();let after=null;
+      for(let page=0;page<4;page++){
+        const v=await read(path,[...filters,['limit',100],...(after?[['starting_after',after]]:[])]);
+        require(v.object==='list'&&Array.isArray(v.data)&&v.data.length<=100&&typeof v.has_more==='boolean');
+        for(const row of v.data){require(object(row)&&typeof row.id==='string'&&/^[a-z]+_[A-Za-z0-9_]{1,200}$/.test(row.id)&&!seen.has(row.id));seen.add(row.id);data.push(row);}
+        if(!v.has_more)return data;require(v.data.length>0);after=v.data.at(-1).id;
+      }fail();
+    }
+    const customer=await read('/v1/customers/'+t.customerReference);exact(customer,t.customerReference,'customer');require(customer.deleted!==true&&customer.test_clock===null);
+    const local={account_id:t.accountId,site_id:t.siteId,customer_id:t.customerId};metadata(customer.metadata,local);
+    const subscription=await read('/v1/subscriptions/'+t.subscriptionReference);exact(subscription,t.subscriptionReference,'subscription');
+    metadata(subscription.metadata,{...local,subscription_id:t.subscriptionId,operation_id:t.operationId});
+    require(subscription.customer===t.customerReference&&subscription.status==='active'&&subscription.currency==='eur'&&subscription.latest_invoice===t.invoiceReference&&subscription.trial_start===null&&subscription.trial_end===null&&subscription.test_clock===null);
+    require(subscription.items?.object==='list'&&subscription.items.has_more===false&&Array.isArray(subscription.items.data)&&subscription.items.data.length===1);
+    const item=subscription.items.data[0];require(/^si_[A-Za-z0-9_]{1,200}$/.test(item.id)&&item.object==='subscription_item'&&item.subscription===t.subscriptionReference&&item.quantity===1&&item.price?.id===t.priceReference&&item.current_period_start===t.periodStart&&item.current_period_end===t.periodEnd);
+    const price=await read('/v1/prices/'+t.priceReference);exact(price,t.priceReference,'price');metadata(price.metadata,{local_price_id:t.priceId,local_price_version:String(t.priceVersion)});
+    require(price.product===t.productReference&&price.active===true&&price.unit_amount===2000&&price.currency==='eur'&&price.type==='recurring'&&price.tax_behavior==='inclusive'&&price.recurring?.interval==='month'&&price.recurring.interval_count===1&&price.recurring.usage_type==='licensed');
+    const invoice=await read('/v1/invoices/'+t.invoiceReference);exact(invoice,t.invoiceReference,'invoice');
+    require(invoice.customer===t.customerReference&&invoice.parent?.type==='subscription_details'&&invoice.parent.subscription_details?.subscription===t.subscriptionReference&&invoice.billing_reason==='subscription_create'&&invoice.status==='paid'&&invoice.collection_method==='charge_automatically'&&invoice.currency==='eur');
+    require(['amount_due','amount_paid','total','subtotal'].every(k=>invoice[k]===2000)&&['amount_remaining','amount_paid_off_stripe','amount_overpaid','starting_balance','ending_balance','pre_payment_credit_notes_amount','post_payment_credit_notes_amount'].every(k=>invoice[k]===0)&&['discounts','total_discount_amounts','total_pretax_credit_amounts'].every(k=>empty(invoice[k])));
+    const invoices=await pages('/v1/invoices',[['subscription',t.subscriptionReference]]);require(invoices.length===1&&invoices[0].id===t.invoiceReference);
+    const lines=await pages('/v1/invoices/'+t.invoiceReference+'/lines');require(lines.length===1);const line=lines[0];exact(line,line.id,'line_item');require(/^il_/.test(line.id));
+    const detail=line.parent?.subscription_item_details;
+    require(line.invoice===t.invoiceReference&&line.subscription===t.subscriptionReference&&line.quantity===1&&line.currency==='eur'&&line.amount===2000&&line.parent?.type==='subscription_item_details'&&detail?.subscription===t.subscriptionReference&&detail.subscription_item===item.id&&detail.proration===false&&line.pricing?.type==='price_details'&&line.pricing.price_details?.price===t.priceReference&&line.pricing.price_details.product===t.productReference&&line.period?.start===t.periodStart&&line.period.end===t.periodEnd&&empty(line.discount_amounts)&&empty(line.pretax_credit_amounts));
+    function allocationProof(v){exact(v,t.allocationReference,'invoice_payment');require(v.invoice===t.invoiceReference&&v.currency==='eur'&&v.is_default===true&&v.status==='paid'&&v.amount_paid===2000&&v.amount_requested===2000&&v.payment?.type==='payment_intent'&&v.payment.payment_intent===t.intentReference&&Number.isSafeInteger(v.status_transitions?.paid_at)&&v.status_transitions.paid_at>0);}
+    const allocations=await pages('/v1/invoice_payments',[['invoice',t.invoiceReference]]);require(allocations.length===1);allocationProof(allocations[0]);
+    const intent=await read('/v1/payment_intents/'+t.intentReference);exact(intent,t.intentReference,'payment_intent');
+    require(intent.customer===t.customerReference&&intent.status==='succeeded'&&intent.amount===2000&&intent.amount_received===2000&&intent.currency==='eur'&&intent.capture_method==='automatic'&&Array.isArray(intent.payment_method_types)&&intent.payment_method_types.length===1&&intent.payment_method_types[0]==='card'&&intent.latest_charge===t.chargeReference);
+    const charge=await read('/v1/charges/'+t.chargeReference);exact(charge,t.chargeReference,'charge');
+    require(charge.customer===t.customerReference&&charge.payment_intent===t.intentReference&&charge.status==='succeeded'&&charge.paid===true&&charge.captured===true&&charge.amount===2000&&charge.amount_captured===2000&&charge.currency==='eur'&&charge.payment_method_details?.type==='card'&&charge.amount_refunded===0&&charge.refunded===false);
+    const noRefunds=value=>value?.object==='list'&&empty(value.data)&&value.has_more===false;
+    if(Object.hasOwn(charge,'refunds'))require(noRefunds(charge.refunds));
+    require(noRefunds(await read('/v1/refunds',[['charge',t.chargeReference],['limit',100]])));
+    const reverse=await pages('/v1/invoice_payments',[['payment[type]','payment_intent'],['payment[payment_intent]',t.intentReference]]);require(reverse.length===1);allocationProof(reverse[0]);require(reverse[0].status_transitions.paid_at===allocations[0].status_transitions.paid_at);
+    billingListener(context);return Object.freeze({providerVerified:true,initialCashVerified:true,lineCount:1,allocationCount:1,chargeCount:1});
+  }
+
   const refundOperation=(code,limits,body)=>{
     if(refundFailed)return Promise.reject(fixed(code));
     return operation(code,limits,body).catch(()=>{refundFailed=true;throw fixed(code);});
@@ -578,9 +658,14 @@ async function createCliAdapter(options,dependencies,purpose) {
     inspectRefund:(value,limits)=>refundOperation('REFUND',limits,context=>inspectRefund(value,context)),}),
   });
   return Object.freeze({
-    validateBinding:limits=>operation('BINDING',limits,binding),
-    startListener:limits=>operation('LISTENER',limits,startListener),
-    stopListener:limits=>operation('STOP',limits,stopListener),
+    validateBinding:limits=>operation('BINDING',limits,async context=>{const result=await binding(context);if(billingMode)billingBound=true;return result;}),
+    startListener:limits=>operation('LISTENER',limits,async context=>{if(billingMode){if(!billingBound||billingStarted)fail();billingStarted=true;}return startListener(context);}),
+    stopListener:limits=>operation('STOP',limits,async context=>{if(billingMode)billingFailed=true;return stopListener(context);}),
+    ...(billingMode?{
+      assertBillingListener,
+      bindOwnedBillingGraph:(value,limits)=>operation('BILLING_BINDING',limits,context=>bindOwnedBillingGraph(value,context)),
+      observeOwnedBillingGraph:limits=>operation('BILLING_GRAPH',limits,observeOwnedBillingGraph),
+    }:{
     bindMissedIntent,
     inspectIntent:limits=>operation('INTENT',limits,inspectIntent),
     bindManualPayment:(value,limits)=>manualOperation('PAYMENT_BINDING',limits,context=>bindManualPayment(value,context)),
@@ -588,6 +673,7 @@ async function createCliAdapter(options,dependencies,purpose) {
     assertManualPaymentListener,
     inspectManualPayment:(eventId,limits)=>manualOperation('PAYMENT',limits,context=>inspectManualPayment(eventId,context)),
     inspectUnusedManualPayment:limits=>manualOperation('UNUSED',limits,inspectUnusedManualPayment),
+    }),
     loginInvocation:limits=>operation('LOGIN',limits,async context=>{
       await privateTree(context);
       return Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze([...args,'login']),options:Object.freeze({cwd:ROOT,env,shell:false,

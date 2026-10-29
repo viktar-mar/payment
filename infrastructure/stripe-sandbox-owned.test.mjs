@@ -276,3 +276,9 @@ test('manual seventh port cannot admit before verified close and unconfirmed clo
   for(let n=0;n<40&&expired.servers.length<7;n++)await new Promise(resolve=>setImmediate(resolve));
   expired.expire();safe(await pendingResult,pending('PORTS','PORT_UNAVAILABLE'));expired.servers[6].closed();assert.equal(expired.servers.length,7);
 });
+
+test('Billing preflight reuses exact source daemon and six-port proof without legacy financial flags',async()=>{
+  const input=options({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_success'}),f=fixture();
+  safe(await owned.preflightOwnedBilling(input,f.dependencies),{status:'READY'});assert.equal(f.calls.filter(c=>c.type==='port').length,6);
+  const wrong=fixture({head:'b'.repeat(40)});safe(await owned.preflightOwnedBilling(input,wrong.dependencies),pending('SOURCE','SOURCE_MISMATCH'));assert.equal(wrong.calls.filter(c=>c.type==='port').length,0);
+});

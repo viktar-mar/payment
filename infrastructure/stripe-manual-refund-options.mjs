@@ -1,6 +1,6 @@
 import {resolve} from 'node:path';
 const REQUIRED=['ENABLED','ALLOW_TEST_OPERATIONS','MANUAL_REFUND'].map(v=>'PAYMENT_STRIPE_SANDBOX_'+v);
-const EXCLUDED=['MANUAL_REFUND_REMAINDER','FULL_RUN','OWNED_RUN','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT'].map(v=>'PAYMENT_STRIPE_SANDBOX_'+v);
+const EXCLUDED=['MANUAL_REFUND_REMAINDER','FULL_RUN','OWNED_RUN','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT'].map(v=>'PAYMENT_STRIPE_SANDBOX_'+v).concat('PAYMENT_STRIPE_BILLING_ACCEPTANCE');
 const OLD_RUNS=new Set(['031b5ae7-6603-4339-b1b3-77231291ff34','2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-429f-a34c-e4f69ba2ce18']);
 function descriptors(value){if(!value||typeof value!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(value)))throw null;return Object.getOwnPropertyDescriptors(value);}
 function data(d,key){const p=d[key];if(!p||!p.enumerable||!Object.hasOwn(p,'value'))throw null;return p.value;}

@@ -474,3 +474,113 @@ test('changed or nonpositive child PID never grants kill authority',async()=>{
   const f=await setup();await start(f);f.children[0].pid=9999;await rejects(stop(f),'STOP');assert.deepEqual(f.children[0].signals,[]);await rejects(f.adapter.startListener(LIMIT()),'LISTENER');
   const g=fixture(),spawnFake=g.dependencies.spawn;g.dependencies.spawn=(...args)=>{const child=spawnFake(...args);child.pid=0;return child;};g.adapter=await createSandboxCliAdapter(g.options,g.dependencies);await rejects(g.adapter.startListener(LIMIT()),'LISTENER');assert.deepEqual(g.children[0].signals,[]);
 });
+
+const billingTarget=()=>({runId:RUN,expectedSource:'e'.repeat(40),accountId:'44444444-5555-4666-8777-888888888888',siteId:'22222222-3333-4444-8555-666666666666',customerId:'55555555-6666-4777-8888-999999999999',subscriptionId:'66666666-7777-4888-8999-000000000000',operationId:'33333333-4444-4555-8666-777777777777',priceId:'77777777-8888-4999-8000-111111111111',priceVersion:1,customerReference:'cus_original',subscriptionReference:'sub_original',productReference:'prod_original',priceReference:'price_original',invoiceReference:'in_original',allocationReference:'inpay_original',intentReference:'pi_original',chargeReference:'ch_original',periodStart:1800000000,periodEnd:1802678400});
+function billingObjects(){
+  const t=billingTarget(),base=(id,object)=>({id,object,livemode:false}),metadata={account_id:t.accountId,site_id:t.siteId,customer_id:t.customerId};
+  const price={...base(t.priceReference,'price'),product:t.productReference,active:true,unit_amount:2000,currency:'eur',tax_behavior:'inclusive',type:'recurring',recurring:{interval:'month',interval_count:1,usage_type:'licensed'},metadata:{local_price_id:t.priceId,local_price_version:'1'}};
+  const allocation={...base(t.allocationReference,'invoice_payment'),invoice:t.invoiceReference,currency:'eur',is_default:true,status:'paid',amount_paid:2000,amount_requested:2000,payment:{type:'payment_intent',payment_intent:t.intentReference},status_transitions:{paid_at:1800000001}};
+  const line={...base('il_original','line_item'),invoice:t.invoiceReference,subscription:t.subscriptionReference,quantity:1,amount:2000,currency:'eur',parent:{type:'subscription_item_details',subscription_item_details:{subscription:t.subscriptionReference,subscription_item:'si_original',proration:false}},pricing:{type:'price_details',price_details:{price:t.priceReference,product:t.productReference}},period:{start:t.periodStart,end:t.periodEnd},discount_amounts:[],pretax_credit_amounts:[]};
+  const list=data=>({object:'list',data,has_more:false});
+  return {
+    ['/v1/customers/'+t.customerReference]:{...base(t.customerReference,'customer'),metadata,test_clock:null},
+    ['/v1/subscriptions/'+t.subscriptionReference]:{...base(t.subscriptionReference,'subscription'),test_clock:null,metadata:{...metadata,subscription_id:t.subscriptionId,operation_id:t.operationId},customer:t.customerReference,status:'active',currency:'eur',latest_invoice:t.invoiceReference,trial_start:null,trial_end:null,items:list([{...base('si_original','subscription_item'),subscription:t.subscriptionReference,quantity:1,price,current_period_start:t.periodStart,current_period_end:t.periodEnd}])},
+    ['/v1/prices/'+t.priceReference]:price,
+    ['/v1/invoices/'+t.invoiceReference]:{...base(t.invoiceReference,'invoice'),customer:t.customerReference,parent:{type:'subscription_details',subscription_details:{subscription:t.subscriptionReference}},billing_reason:'subscription_create',status:'paid',collection_method:'charge_automatically',currency:'eur',amount_due:2000,amount_paid:2000,total:2000,subtotal:2000,amount_remaining:0,amount_paid_off_stripe:0,amount_overpaid:0,starting_balance:0,ending_balance:0,pre_payment_credit_notes_amount:0,post_payment_credit_notes_amount:0,discounts:[],total_discount_amounts:[],total_pretax_credit_amounts:[]},
+    ['/v1/invoices/'+t.invoiceReference+'/lines']:list([line]),'/v1/invoice_payments':list([allocation]),'/v1/refunds':list([]),
+    ['/v1/payment_intents/'+t.intentReference]:{...base(t.intentReference,'payment_intent'),customer:t.customerReference,status:'succeeded',currency:'eur',amount:2000,amount_received:2000,capture_method:'automatic',payment_method_types:['card'],latest_charge:t.chargeReference,client_secret:'never-return'},
+    ['/v1/charges/'+t.chargeReference]:{...base(t.chargeReference,'charge'),customer:t.customerReference,payment_intent:t.intentReference,status:'succeeded',paid:true,captured:true,currency:'eur',amount:2000,amount_captured:2000,amount_refunded:0,refunded:false,payment_method_details:{type:'card'},refunds:list([])},
+  };
+}
+async function billingSetup(mutate=()=>{}){
+  const module=await import('./stripe-sandbox-cli.mjs');assert.equal(typeof module.createBillingCliAdapter,'function');
+  const f=fixture(),base=f.dependencies.execute;f.objects=billingObjects();f.objects['/v1/invoices']={object:'list',data:[f.objects['/v1/invoices/in_original']],has_more:false};mutate(f.objects);
+  const spawn=f.dependencies.spawn;f.dependencies.spawn=(...args)=>{const child=spawn(...args);child.on('exit',()=>queueMicrotask(()=>child.emit('close',0)));return child;};
+  f.dependencies.execute=async(file,args,settings)=>{const path=args.find(a=>a.startsWith('/v1/'));if(path&&path!=='/v1/balance'){f.calls.push({file,args,settings});return {stdout:JSON.stringify(f.objects[path]),stderr:''};}return base(file,args,settings);};
+  f.options={configuration:{env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'},runId:RUN,expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports:{backend:18080,demo:18081,receiver:18082,postgres:15432,mailpitHttp:18025,mailpitSmtp:11025},approvedBinding:{externalAccountId:ACCOUNT,apiVersion:VERSION},selectedCase:'initial_success'},cliDirectory:DIR,verifyForwardTarget:async()=>true,persistWebhookSecret:async()=>true};
+  f.adapter=await module.createBillingCliAdapter(f.options,f.dependencies);assert.equal(f.calls.length,0);f.limits=LIMIT();return f;
+}
+test('Billing CLI exposes only lifecycle and exact graph reads with fixed supported listener events',async()=>{
+  const f=await billingSetup();assert.equal(f.adapter.bindMissedIntent,undefined);assert.equal(f.adapter.bindManualPayment,undefined);
+  await f.adapter.validateBinding(f.limits);await start(f);const args=f.calls.find(c=>c.child).args,events=args[args.indexOf('--events')+1].split(',');
+  assert.ok(events.includes('invoice.paid'));assert.ok(events.includes('customer.subscription.created'));assert.ok(events.includes('payment_intent.succeeded'));assert.equal(events.some(e=>e.startsWith('refund.')),false);
+  assert.equal(await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits),true);
+  const result=await f.adapter.observeOwnedBillingGraph(f.limits);assert.deepEqual(result,{providerVerified:true,initialCashVerified:true,lineCount:1,allocationCount:1,chargeCount:1});
+  assert.ok(f.calls.filter(c=>c.args.includes('get')&&!c.args.includes('/v1/balance')).every(c=>c.args.includes('--stripe-version')&&c.args.includes(VERSION)));
+  assert.equal(JSON.stringify(result).includes('never-return'),false);await stop(f);
+});
+for(const [name,mutate] of [
+ ['foreign customer',o=>o['/v1/customers/cus_original'].metadata.account_id=RUN],['foreign subscription',o=>o['/v1/subscriptions/sub_original'].customer='cus_other'],['wrong price',o=>o['/v1/prices/price_original'].metadata.local_price_id=RUN],['out of band',o=>o['/v1/invoices/in_original'].amount_paid_off_stripe=2000],['extra line',o=>o['/v1/invoices/in_original/lines'].data.push({...o['/v1/invoices/in_original/lines'].data[0],id:'il_other'})],['split allocation',o=>o['/v1/invoice_payments'].data.push({...o['/v1/invoice_payments'].data[0],id:'inpay_other'})],['non-default',o=>o['/v1/invoice_payments'].data[0].is_default=false],['wrong intent',o=>o['/v1/invoice_payments'].data[0].payment.payment_intent='pi_other'],['uncaptured',o=>o['/v1/charges/ch_original'].captured=false],['refunded',o=>o['/v1/charges/ch_original'].amount_refunded=1],['live',o=>o['/v1/payment_intents/pi_original'].livemode=true],['endless pagination',o=>o['/v1/invoices/in_original/lines'].has_more=true],
+])test('Billing graph rejects '+name+' and latches failure',async()=>{const f=await billingSetup(mutate);await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);const count=f.calls.length;await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits));assert.equal(f.calls.length,count);await stop(f);});
+test('Billing original graph rejects rebinding and stale source before provider reads',async()=>{
+  for(const kind of ['source','accessor','rebind']){const f=await billingSetup();await f.adapter.validateBinding(f.limits);await start(f);const target=billingTarget();let touched=0;
+    if(kind==='source')target.expectedSource='a'.repeat(40);if(kind==='accessor')Object.defineProperty(target,'intentReference',{enumerable:true,get(){touched++;throw null;}});
+    if(kind==='rebind')await f.adapter.bindOwnedBillingGraph(target,f.limits);const count=f.calls.length;
+    await assert.rejects(f.adapter.bindOwnedBillingGraph(target,f.limits),/BILLING_BINDING/);assert.equal(touched,0);assert.equal(f.calls.length,count);await stop(f);
+  }
+});
+test('Billing synchronous listener guard loses authority on exit and cannot restart after stop',async()=>{
+  const f=await billingSetup();await f.adapter.validateBinding(f.limits);await start(f);const n=f.calls.length;
+  assert.equal(typeof f.adapter.assertBillingListener,'function');assert.equal(f.adapter.assertBillingListener(f.limits),true);assert.equal(f.calls.length,n);
+  f.children[0].emit('exit',1);assert.throws(()=>f.adapter.assertBillingListener(f.limits),/BILLING_LISTENER/);await assert.rejects(f.adapter.loginInvocation(f.limits));await stop(f);
+});
+test('Billing read guard rechecks approved account rather than trusting a prior login forever',async()=>{
+  const f=await billingSetup(),execute=f.dependencies.execute;let foreign=false;
+  f.dependencies.execute=async(file,args,settings)=>args.includes('whoami')&&foreign?{stdout:JSON.stringify({...oauth(),account_id:'acct_other'}),stderr:''}:execute(file,args,settings);
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');f.adapter=await createBillingCliAdapter(f.options,f.dependencies);
+  await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);foreign=true;
+  await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);await stop(f);
+});
+test('Billing follows bounded invoice cursors and checks the reverse PI allocation join',async()=>{
+  for(const reverseWrong of [false,true]){const f=await billingSetup(),execute=f.dependencies.execute;let invoices=0;
+    f.dependencies.execute=async(file,args,settings)=>{if(args.includes('/v1/invoices')){f.calls.push({file,args,settings});invoices++;return {stdout:JSON.stringify({object:'list',data:invoices===1?[f.objects['/v1/invoices/in_original']]:[],has_more:invoices===1}),stderr:''};}
+      if(reverseWrong&&args.includes('payment[type]=payment_intent'))return {stdout:JSON.stringify({object:'list',data:[{...f.objects['/v1/invoice_payments'].data[0],invoice:'in_other'}],has_more:false}),stderr:''};return execute(file,args,settings);};
+    const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');f.adapter=await createBillingCliAdapter(f.options,f.dependencies);await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+    if(reverseWrong)await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);else assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).initialCashVerified,true);
+    assert.equal(invoices,2);const calls=f.calls.filter(c=>c.args.includes('/v1/invoices'));assert.ok(calls[0].args.includes('subscription=sub_original'));assert.ok(calls[1].args.includes('starting_after=in_original'));await stop(f);
+  }
+});
+
+for(const signalMode of ['omitted','replaced'])for(const entry of ['guard','observe'])test(`Billing original abort survives ${signalMode} signal at ${entry}`,async()=>{
+  const f=await billingSetup(),root=new AbortController(),limits={...f.limits,signal:root.signal};
+  await f.adapter.validateBinding(limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  root.abort();const later={deadline:f.limits.deadline,...(signalMode==='replaced'?{signal:new AbortController().signal}:{})},count=f.calls.length;
+  if(entry==='guard')assert.throws(()=>f.adapter.assertBillingListener(later),/BILLING_LISTENER/);else await assert.rejects(f.adapter.observeOwnedBillingGraph(later),/BILLING_GRAPH/);
+  await assert.rejects(f.adapter.validateBinding(later),/BINDING/);assert.equal(f.calls.length,count);
+  assert.equal(await f.adapter.stopListener({deadline:f.limits.deadline+1000}),true);assert.ok(f.children[0].signals.includes('SIGINT'));
+});
+test('Billing original abort reaches an in-flight read with substituted signal and rejects late response',async()=>{
+  const f=await billingSetup(),root=new AbortController(),execute=f.dependencies.execute;let release,capturedSignal,entered;
+  const waiting=new Promise(resolveEntered=>{entered=resolveEntered;});
+  f.dependencies.execute=async(file,args,settings)=>{if(args.includes('/v1/customers/cus_original')){capturedSignal=settings.signal;entered();await new Promise(resolveRelease=>{release=resolveRelease;});}return execute(file,args,settings);};
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');f.adapter=await createBillingCliAdapter(f.options,f.dependencies);
+  await f.adapter.validateBinding({...f.limits,signal:root.signal});await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  const observation=f.adapter.observeOwnedBillingGraph({...f.limits,signal:new AbortController().signal});await waiting;root.abort();
+  const aborted=capturedSignal.aborted;release();await assert.rejects(observation,/BILLING_GRAPH/);assert.equal(aborted,true);
+  const count=f.calls.length;await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits));assert.equal(f.calls.length,count);await stop(f);
+});
+for(const path of ['/v1/customers/cus_original','/v1/subscriptions/sub_original'])for(const clock of ['clock_excluded',undefined])test(`Billing no-clock proof rejects ${clock===undefined?'missing':'present'} test_clock on ${path}`,async()=>{
+  const f=await billingSetup(o=>{if(clock===undefined)delete o[path].test_clock;else o[path].test_clock=clock;});await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);const count=f.calls.length;await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits));assert.equal(f.calls.length,count);await stop(f);
+});
+const excludedRefundCollections=[
+ ['pending',{object:'list',data:[{id:'re_excluded',status:'pending'}],has_more:false}],
+ ['failed',{object:'list',data:[{id:'re_excluded',status:'failed'}],has_more:false}],
+ ['canceled',{object:'list',data:[{id:'re_excluded',status:'canceled'}],has_more:false}],
+ ['truncated',{object:'list',data:[],has_more:true}],['null',null],['missing',undefined],
+ ['wrong object',{object:'refund',data:[],has_more:false}],['missing data',{object:'list',has_more:false}],
+ ['missing completeness',{object:'list',data:[]}],
+];
+for(const [name,value] of excludedRefundCollections)test('Billing exact-charge refund read rejects '+name+' and latches',async()=>{
+  const f=await billingSetup(o=>{o['/v1/refunds']=value;});await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);const count=f.calls.length;await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits));assert.equal(f.calls.length,count);await stop(f);
+});
+for(const [name,value] of excludedRefundCollections.filter(([name])=>name!=='missing'))test('Billing embedded refund collection rejects '+name+' even when exact-charge query would be empty',async()=>{
+  const f=await billingSetup(o=>{o['/v1/charges/ch_original'].refunds=value;});await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);await stop(f);
+});
+test('Billing omitted embedded refunds require a fixed exact-charge complete empty query',async()=>{
+  const f=await billingSetup(o=>{delete o['/v1/charges/ch_original'].refunds;});await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).initialCashVerified,true);
+  const calls=f.calls.filter(c=>c.args.includes('/v1/refunds'));assert.equal(calls.length,1);assert.ok(calls[0].args.includes('charge=ch_original'));assert.ok(calls[0].args.includes('limit=100'));await stop(f);
+});

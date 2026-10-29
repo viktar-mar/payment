@@ -1,4 +1,5 @@
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
+import {billingAcceptanceExcluded,billingAcceptanceOptIn,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {lstat,realpath} from 'node:fs/promises';
@@ -53,6 +54,11 @@ function portAvailable(port,host,dependencies) {
 export async function preflightOwnedSandbox(options,dependencies={}) {
   return preflight(options,dependencies,false);
 }
+export async function preflightOwnedBilling(options,dependencies={}) {
+  const selected=validateBillingAcceptanceOptions(options);
+  if(!selected)return pending('OPT_IN','OPT_IN_REQUIRED');
+  return preflight(selected,dependencies,'billing');
+}
 
 // This gate runs before consulting dependencies or any private configuration.
 export function formDiagnosticOptIn(env) {
@@ -92,8 +98,9 @@ async function preflight(options,dependencies,diagnostic) {
   let phase='OPT_IN',code='OPT_IN_REQUIRED';
   try {
     const env=Object.getOwnPropertyDescriptor(options??{},'env')?.value;
-    if(!remainderExcluded(env))return pending(phase,code);
-    if(env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'||(diagnostic==='payment'?!manualPaymentOptIn(env):diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'
+    if(diagnostic==='billing'?!billingAcceptanceOptIn(env):!billingAcceptanceExcluded(env))return pending(phase,code);
+    if(diagnostic!=='billing'&&!remainderExcluded(env))return pending(phase,code);
+    if(env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'||(diagnostic==='billing'?false:diagnostic==='payment'?!manualPaymentOptIn(env):diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'
       ||env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'||env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC==='true')))return pending(phase,code);
     phase='INPUTS';code='CONFIGURATION';
     if(![undefined,''].includes(env.DEBUG)||![undefined,''].includes(env.NODE_DEBUG)||![undefined,'','0'].includes(env.PWDEBUG))return pending(phase,code);

@@ -1,4 +1,6 @@
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
+import {billingAcceptanceExcluded,billingAcceptanceOptIn,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
+import {preflightOwnedBilling} from './stripe-sandbox-owned.mjs';
 import {proveOwnedContainer,proveOwnedPorts as portProof,CONTAINER_FORMAT,NETWORK_FORMAT,VOLUME_FORMAT} from './stripe-sandbox-ownership.mjs';
 import {execFile} from 'node:child_process';
 import {constants} from 'node:fs';
@@ -16,6 +18,7 @@ const USERFILE=ROOT+'/infrastructure/stripe-sandbox.env.local';
 const SERVICES=['postgres','mailpit','backend','demo-site','callback-receiver'];
 const PORT_NAMES=['backend','demo','receiver','postgres','mailpitHttp','mailpitSmtp'];
 const STRIPE_NAMES=['PAYMENT_STRIPE_SANDBOX_SECRET_KEY','PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY','PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET'];
+const BILLING_CONFIG=Object.freeze({PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:'buildOnly'});
 const EXHAUSTED=new Set(['2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-429f-a34c-e4f69ba2ce18']);
 const CHILD_ENV=Object.freeze({PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C'});
 const ERRORS=new Set(['OPT_IN_REQUIRED','INPUTS_CONFIGURATION','OPERATION_BUSY',
@@ -115,13 +118,19 @@ export async function createOwnedManualPaymentBootstrap(options,dependencies={})
   const selected=validateManualPaymentOptions(options);if(!selected)throw fixed('INPUTS_CONFIGURATION');
   return createBootstrap(selected,dependencies,false,true);
 }
-async function createBootstrap(options,dependencies,diagnostic,manualPayment=false) {
+export async function createOwnedBillingBootstrap(options,dependencies={}) {
+  const selected=validateBillingAcceptanceOptions(options);if(!selected)throw fixed('OPT_IN_REQUIRED');
+  return createBootstrap(selected,dependencies,false,false,true);
+}
+async function createBootstrap(options,dependencies,diagnostic,manualPayment=false,billing=false) {
   const descriptor=Object.getOwnPropertyDescriptor(options??{},'env');
   const rawEnv=descriptor?.enumerable&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined;
-  if(!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
+  if(!billing&&!billingAcceptanceExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
+  if(!billing&&!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
   let enabled=false;
   try {const env=rawEnv;enabled=env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPayment?manualPaymentOptIn(env):diagnostic?formDiagnosticOptIn(env):env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true'
     &&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
+  if(billing)enabled=billingAcceptanceOptIn(rawEnv);
   if(!enabled)throw fixed('OPT_IN_REQUIRED');
   let runId,expectedSource,daemon,ports,env,io;
   try {
@@ -139,10 +148,10 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     const binding=diagnostic||manualPayment?{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'}:options.approvedBinding;
     if(!object(binding)||Object.keys(binding).sort().join(',')!=='apiVersion,externalAccountId'
       ||binding.externalAccountId!=='acct_1UPiMpELswAd8tpR'||binding.apiVersion!=='2026-09-30.endive')fail();
-    env=Object.freeze(manualPayment?rawEnv:diagnostic?{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}:
+    env=Object.freeze(billing||manualPayment?rawEnv:diagnostic?{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}:
       {PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',DEBUG:flags.DEBUG,NODE_DEBUG:flags.NODE_DEBUG,PWDEBUG:flags.PWDEBUG});
     const raw=dependencies.execFile??execFile;
-    io=Object.freeze({execute:dependencies.execute??((...args)=>executeAwaited(raw,...args)),preflight:dependencies.preflight??(manualPayment?preflightOwnedManualPayment:diagnostic?preflightOwnedFormDiagnostic:preflightOwnedSandbox),
+    io=Object.freeze({execute:dependencies.execute??((...args)=>executeAwaited(raw,...args)),preflight:dependencies.preflight??(billing?preflightOwnedBilling:manualPayment?preflightOwnedManualPayment:diagnostic?preflightOwnedFormDiagnostic:preflightOwnedSandbox),
       lstat:dependencies.lstat??lstat,realpath:dependencies.realpath??realpath,readFile:dependencies.readFile??readFile,readdir:dependencies.readdir??readdir,
       mkdir:dependencies.mkdir??mkdir,open:dependencies.open??open,rename:dependencies.rename??rename,unlink:dependencies.unlink??unlink,
       randomBytes:dependencies.randomBytes??randomBytes,generateKeyPairSync:dependencies.generateKeyPairSync??generateKeyPairSync,
@@ -184,7 +193,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
         limits={deadline:fields.deadline.value,signal:fields.signal?.value};
       }
       if(!Number.isSafeInteger(limits?.deadline)||limits.deadline<=io.now()||(limits.signal!==undefined&&!(limits.signal instanceof AbortSignal)))fail();
-      if(manualPayment){
+      if(manualPayment||billing){
         if(manualDeadline===null){if(limits.deadline>io.now()+45*60000)fail();manualDeadline=limits.deadline;}
         if(cleanup?limits.deadline>manualDeadline+120000:phase==='VERIFY'||adminChild?limits.deadline>manualDeadline:limits.deadline!==manualDeadline)fail();
       }
@@ -273,7 +282,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   async function intent(action,name,context) {intents.push({action,name,status:'DISPATCHING'});await ledger(context);}
   async function acknowledgement(context) {intents.at(-1).status='ACKNOWLEDGED';await ledger(context);}
   async function sourceGate(context,portsCheck=true) {
-    const result=await io.preflight({runId,expectedSource,daemon,ports,env,...(manualPayment?{manualPort:options.manualPort}:{})},{lstat:io.lstat,realpath:io.realpath,
+    const result=await io.preflight({runId,expectedSource,daemon,ports,env,...(billing?{approvedBinding:options.approvedBinding,selectedCase:options.selectedCase}:{}),...(manualPayment?{manualPort:options.manualPort}:{})},{lstat:io.lstat,realpath:io.realpath,
       execute:(file,args,settings)=>execute(file,args,settings,context),portAvailable:(port,host)=>io.portAvailable(port,host,context)});
     check(context);if(!object(result)||Object.keys(result).length!==1||result.status!=='READY')fail();
     if(portsCheck)for(const port of [...Object.values(ports),...(manualPayment?[options.manualPort]:[])]) {check(context);if(await io.portAvailable(port,'127.0.0.1',context)!==true)fail();}
@@ -313,6 +322,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   async function build(context) {
     const synthetic={PAYMENT_DB_PASSWORD:'buildOnly',PAYMENT_ADMIN_BOOTSTRAP_USERNAME:'buildOnly',PAYMENT_ADMIN_BOOTSTRAP_PASSWORD:'buildOnly',
       PAYMENT_DATA_ENCRYPTION_KEY:'buildOnly',PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY:'buildOnly',PAYMENT_CUSTOMER_DIGEST_KEY_V1:'buildOnly',PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1:'buildOnly',...portInputs()};
+    if(billing)synthetic.PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1='buildOnly';
     await exclusiveFile(directory+'/build.env',envText(synthetic),context);await intent('BUILD','backend+demo-site',context);
     if(buildDiagnostic) {buildDiagnostic.stage='BUILD_COMMAND';await ledger(context);}
     await docker(composeArgs(directory+'/build.env',['build','--quiet',...(manualPayment?['--build-arg','PAYMENT_DEMO_BUILD_MODE=manual-payment']:diagnostic?['--build-arg','PAYMENT_DEMO_BUILD_MODE=form-diagnostic']:[]),'backend','demo-site'],{override:false}),context,1200000);
@@ -328,12 +338,13 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     }
   }
   async function generate(context) {
-    const values=Array.from({length:6},()=>io.randomBytes(32).toString('base64'));
-    if(values.some(value=>!/^([A-Za-z0-9+/]{43})=$/.test(value))||new Set(values).size!==6)fail();
+    const values=Array.from({length:billing?7:6},()=>io.randomBytes(32).toString('base64'));
+    if(values.some(value=>!/^([A-Za-z0-9+/]{43})=$/.test(value))||new Set(values).size!==values.length)fail();
     admin={username:'s5a-'+io.randomBytes(16).toString('hex'),password:values[1]};
     inputs={PAYMENT_DB_PASSWORD:values[0],PAYMENT_ADMIN_BOOTSTRAP_USERNAME:admin.username,PAYMENT_ADMIN_BOOTSTRAP_PASSWORD:admin.password,
       PAYMENT_DATA_ENCRYPTION_KEY:values[2],PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY:values[3],PAYMENT_CUSTOMER_DIGEST_KEY_V1:values[4],
       PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1:values[5],PAYMENT_FAKE_AUTO_SUCCESS:'false',PAYMENT_TELEMETRY_SITEKEYS:siteKey,...portInputs()};
+    if(billing)inputs.PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1=values[6];
     const rsa=io.generateKeyPairSync('rsa',{modulusLength:2048}),ec=io.generateKeyPairSync('ec',{namedCurve:'prime256v1'});
     const keys=[{...rsa.privateKey.export({format:'jwk'}),kid:'local-fixture-rs',alg:'RS256',use:'sig'},
       {...ec.privateKey.export({format:'jwk'}),kid:'local-fixture-es',alg:'ES256',use:'sig'}];
@@ -443,6 +454,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       for(const [key,value] of Object.entries(ownLabels('container')))lines.push('      '+key+': '+value);
       lines.push('    ports: !override');for(const [port,bindings] of Object.entries(expectedPorts(service)))for(const binding of bindings)lines.push('      - "127.0.0.1:'+binding.HostPort+':'+port.split('/')[0]+'"');
       if(service==='backend')lines.push('    environment:','      PAYMENT_STRIPE_SANDBOX_ENABLED: "false"','    volumes: !override','      - type: volume','        source: owned-issuer','        target: /app/local-fixtures','        read_only: true');
+      if(service==='backend'&&billing){const at=lines.indexOf('    volumes: !override');lines.splice(at,0,'      PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED: "true"','      PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS: "v1"','      PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION: "v1"','      PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1: "${PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:?owned Billing key required}"');}
     }
     lines.push('networks:','  default:','    external: true','    name: '+networkName,'volumes:','  payment-postgres:','    external: true','    name: '+volumeNames.postgres,
       '  owned-issuer:','    external: true','    name: '+volumeNames.issuer);
@@ -473,6 +485,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
         if(!actual||actual.type!==mount.Type||actual.source!==source||Boolean(actual.read_only)!==!mount.RW)fail();
       }
       if(STRIPE_NAMES.some(name=>Object.hasOwn(value.environment??{},name))||(service==='backend'&&value.environment?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='false'))fail();
+      if(billing&&Object.entries(BILLING_CONFIG).some(([name,expected])=>service==='backend'?value.environment?.[name]!==expected:Object.hasOwn(value.environment??{},name)))fail();
     }
   }
   async function prepare(context) {
@@ -678,10 +691,10 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       if(!live) {await sourceGate(context);if(await io.portAvailable(ports.backend,'127.0.0.1',context)!==true)fail();}return true;}),
     persistWebhookSecret:secret=>operation('PERSIST',startup,context=>persist(secret,context)),
     start:limits=>operation('START',limits,start),verify:limits=>operation('VERIFY',limits,verify),resources,
-    withAdminCredentials:(callback,childLimits=undefined)=>operation('ADMIN',manualPayment&&childLimits!==undefined?childLimits:startup,async context=>{
+    withAdminCredentials:(callback,childLimits=undefined)=>operation('ADMIN',(manualPayment||billing)&&childLimits!==undefined?childLimits:startup,async context=>{
       if(typeof callback!=='function'||!live||status!=='LIVE')fail();await verify(context);
       if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({username:admin.username,password:admin.password}));}),context)!==true)fail();return true;
-    },{adminChild:manualPayment&&childLimits!==undefined}),
+    },{adminChild:(manualPayment||billing)&&childLimits!==undefined}),
     stop:limits=>operation('STOP',limits,stop,{cleanup:true}),
   };
   if(diagnostic) return Object.freeze({prepare:capabilities.prepare,start:capabilities.start,verify:capabilities.verify,resources,
@@ -691,5 +704,9 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       await sourceIdentity(context);await topology(context,live,!live);
       if(await controlled(Promise.resolve().then(()=>{check(context);return callback(providerKeys);}),context)!==true)fail();return true;
     })});
+  if(billing)capabilities.withDatabaseCredentials=(callback,limits)=>operation('ADMIN',limits,async context=>{
+    if(typeof callback!=='function')fail();await verify(context);
+    if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({host:'127.0.0.1',port:ports.postgres,database:'payment',user:'payment',password:inputs.PAYMENT_DB_PASSWORD}));}),context)!==true)fail();return true;
+  },{adminChild:true});
   return Object.freeze(capabilities);
 }
