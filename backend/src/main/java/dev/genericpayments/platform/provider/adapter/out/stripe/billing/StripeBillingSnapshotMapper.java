@@ -60,7 +60,8 @@ public final class StripeBillingSnapshotMapper {
         }catch(PaymentApplicationException safe){throw safe;}catch(StripeException|RuntimeException malformed){throw mismatch();}
     }
     /** Ephemeral, verified original Billing action; never serialize as a normal snapshot. */
-    public record PaymentAction(dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding binding,String clientSecret){
+    public record PaymentAction(dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding binding,String clientSecret,Long amount,String currency){
+        public PaymentAction(dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding binding,String clientSecret){this(binding,clientSecret,null,null);}
         @Override public String toString(){return "PaymentAction[redacted]";}
     }
     public static PaymentAction retrievePaymentAction(StripeClient client,StripeBillingOwnership.PaymentProof proof,Instant at){
@@ -119,7 +120,7 @@ public final class StripeBillingSnapshotMapper {
                 var saved=recovery.result();if(saved!=null)require(Objects.equals(saved.allocation(),a.getId())&&Objects.equals(saved.intent(),pi.getId()));
             }
             var binding=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding(proof.step().id(),proof.operation().providerOperationKey(),StripeBillingGrantTokens.hash(canonical),proof.subscription().providerReference(),proof.customer().providerReference(),i.reference(),a.getId(),pi.getId(),proof instanceof StripeBillingOwnership.OriginalRecovery?"recovery-v1":proof instanceof StripeBillingOwnership.OriginalChange?"change-v1":proof instanceof StripeBillingOwnership.OriginalResume?"resume-v1":"payment-v1",null);
-            return new PaymentAction(binding,secret);
+            return new PaymentAction(binding,secret,pi.getAmount(),pi.getCurrency());
     }
     public record RecoveryRead(Snapshot snapshot,String allocation,String intent,String method,boolean firstPay) {}
     public static RecoveryRead retrieveRecovery(StripeClient client,StripeBillingOwnership.OriginalRecovery proof,Instant at){

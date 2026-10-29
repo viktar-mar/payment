@@ -88,7 +88,10 @@ class StripeSubscriptionClientSessionIntegrationTest extends SubscriptionApiFixt
   var json=admin.mvc.perform(get("/v3/api-docs")).andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
   var paths=JsonPath.<Map<String,Object>>read(json,"$.paths");var route="/api/v1/customer/subscriptions/{id}/operations/{operationId}/client-session";
   assertThat(paths).containsKey(route);
-  assertThat(paths.keySet()).filteredOn(p->p.contains("/subscriptions/")&&p.endsWith("/client-session")).containsExactly(route);
+  var v2="/api/v1/customer/subscriptions/{id}/operations/{operationId}/confirmation-attempts/{attemptId}/client-session";
+  assertThat(paths.keySet()).filteredOn(p->p.contains("/subscriptions/")&&p.endsWith("/client-session")).containsExactlyInAnyOrder(route,v2);
+  var v2Response=JsonPath.<Map<String,Object>>read(json,"$.paths['"+v2+"'].post.responses");assertThat(v2Response).containsKey("200").doesNotContainKey("202");
+  assertThat(JsonPath.<String>read(json,"$.paths[\u0027"+v2+"\u0027].post.responses[\u0027200\u0027].content[\u0027application/json\u0027].schema[\u0027$ref\u0027]")).isEqualTo("#/components/schemas/BillingConfirmationSessionResponse");
   var response=JsonPath.<Map<String,Object>>read(json,"$.paths['"+route+"'].post.responses");assertThat(response).containsKey("200").doesNotContainKey("202");
  }
 }

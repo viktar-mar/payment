@@ -14,6 +14,7 @@ public interface SubscriptionRecoveryProofStore {
     Optional<BillingRecord> bill(PaymentAccountId account,UUID subscription,UUID billingRecord);
     Optional<Receipt> receipt(PaymentAccountId account,UUID operation);
     boolean available(PaymentAccountId account,UUID subscription,String invoice,UUID owner);
+    default boolean availableForConfirmation(PaymentAccountId account,UUID subscription,String invoice,UUID owner,UUID root){return available(account,subscription,invoice,owner);}
     void authorize(Subscription subscription,SubscriptionOperation operation,BillingRecord bill,Origin origin);
     Receipt associate(Subscription subscription,SubscriptionOperation operation,BillingRecord bill,Origin origin,String allocation,String intent);
     Receipt recordPay(Subscription subscription,SubscriptionOperation operation,BillingRecord bill,Origin origin,ProviderOperation step,

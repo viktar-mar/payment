@@ -33,16 +33,18 @@ public class SubscriptionRecoveryProofPersistenceAdapter implements Subscription
     }
     public Optional<BillingRecord> bill(PaymentAccountId account,UUID subscription,UUID id){return jdbc.query("select * from subscription_billing_records where id=? and subscription_id=? and payment_account_id=?",this::bill,id,subscription,account.value()).stream().findFirst();}
     public Optional<Receipt> receipt(PaymentAccountId account,UUID operation){return jdbc.query("select * from stripe_subscription_recovery_proofs where payment_account_id=? and operation_id=?",this::receipt,account.value(),operation).stream().findFirst();}
-    public boolean available(PaymentAccountId account,UUID subscription,String invoice,UUID owner){
+    public boolean available(PaymentAccountId account,UUID subscription,String invoice,UUID owner){return availableForConfirmation(account,subscription,invoice,owner,null);}
+    public boolean availableForConfirmation(PaymentAccountId account,UUID subscription,String invoice,UUID owner,UUID root){
+
         return Boolean.TRUE.equals(jdbc.queryForObject("""
             select not exists(select 1 from subscription_action_capabilities g where g.payment_account_id=? and g.subscription_id=? and g.billing_invoice_reference=?
-              and (g.operation_id<>? or g.consumed_at is not null))
+              and (g.operation_id<>? or g.consumed_at is not null and not exists(select 1 from subscription_confirmation_chains c where c.id=g.id and c.id=? and c.operation_id=g.operation_id)))
             and not exists(select 1 from stripe_subscription_recovery_proofs p where p.payment_account_id=? and p.subscription_id=? and p.invoice_reference=? and p.operation_id<>?)
             and not exists(select 1 from provider_operations step join subscription_operations o on o.id=step.resource_id
               join subscription_billing_records b on b.id::text=split_part(o.fingerprint,'.',3)
               where step.payment_account_id=? and o.subscription_id=? and b.provider_invoice_reference=? and step.kind='INVOICE_PAY'
                 and step.resource_id<>? and (step.first_dispatched_at is not null or step.status in ('DISPATCHING','UNKNOWN','ACKNOWLEDGED')))
-            """,Boolean.class,account.value(),subscription,invoice,owner,account.value(),subscription,invoice,owner,account.value(),subscription,invoice,owner));
+            """,Boolean.class,account.value(),subscription,invoice,owner,root,account.value(),subscription,invoice,owner,account.value(),subscription,invoice,owner));
     }
     public void authorize(Subscription s,SubscriptionOperation o,BillingRecord b,Origin origin){requireCurrent(s,o,b,origin,null);}
     public Receipt associate(Subscription s,SubscriptionOperation o,BillingRecord b,Origin origin,String allocation,String intent){

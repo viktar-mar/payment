@@ -66,6 +66,8 @@ public final class SubscriptionRequestPolicyFilter extends OncePerRequestFilter 
   if(path.endsWith("/changes"))return Set.of("quote_id");
   if(path.endsWith("/cancellation"))return Set.of("mode","confirmation");
   if(path.endsWith("/method-setups")||path.endsWith("/resumptions"))return Set.of("recurring_consent");
+  if(path.startsWith("/api/v1/customer/subscriptions/")&&path.contains("/confirmation-attempts/"))return path.endsWith("/confirm")?Set.of("capability","confirmation_token"):Set.of();
+  if(path.startsWith("/api/v1/customer/subscriptions/")&&path.endsWith("/confirmation-session"))return Set.of("action_token");
   if(path.startsWith("/api/v1/customer/subscriptions/")&&path.endsWith("/client-session"))return Set.of("action_token");
   if(path.endsWith("/action-confirmations"))return Set.of("action_token");
   if(path.endsWith("/recoveries"))return Set.of("billing_record_id");

@@ -21,6 +21,9 @@ final class StripeBillingHttpFixture implements AutoCloseable {
         http.enqueue(method, path, 200, json);
     }
 
+    void respondError(String method,String path,int status,String json,java.util.Map<String,String> headers) {
+        http.enqueue(method,path,status,json,headers,0);
+    }
     void disconnectNext(String method, String path) { http.disconnectNext(method, path); }
 
     List<StripeHttpFixture.Call> calls() { return http.calls(); }

@@ -126,6 +126,8 @@ public final class StripeBillingOwnership {
     }
     /** Mutable issuance exclusions are separate from reconstructing an immutable original receipt. */
     public boolean recoveryActionAvailable(PaymentProof proof){return !(proof instanceof OriginalRecovery recovery)||recoveryProofs!=null&&recoveryProofs.available(proof.account().id(),proof.subscription().id(),recovery.bill().providerInvoiceReference(),proof.operation().id());}
+    /** The exact v2 reservation may reuse its own consumed root; all other invoice-lane exclusions stay intact. */
+    public boolean confirmationActionAvailable(PaymentProof proof,UUID root){return !(proof instanceof OriginalRecovery recovery)||recoveryProofs!=null&&recoveryProofs.availableForConfirmation(proof.account().id(),proof.subscription().id(),recovery.bill().providerInvoiceReference(),proof.operation().id(),root);}
     public OriginalChange acknowledgedChange(Lookup lookup){
         if(plans==null)throw unsupported();var a=lookup.account();var s=owned(a,lookup.subscriptionId());var o=lookupOperation(lookup);
         var selected=planHistory(a,s,plans).stream().filter(p->p.result().operation().equals(o.id())).toList();if(o.kind()!=SubscriptionOperation.Kind.CHANGE||selected.size()!=1)throw mismatch();

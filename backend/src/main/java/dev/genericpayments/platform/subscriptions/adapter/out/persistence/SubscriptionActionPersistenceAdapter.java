@@ -41,9 +41,10 @@ public class SubscriptionActionPersistenceAdapter implements SubscriptionActionS
         return jdbc.query("select * from subscription_action_capabilities where payment_account_id=? and operation_id=? and billing_key_version is not null and superseded_at is null for update",(r,n)->billing(r),account.value(),operation).stream().findFirst();
     }
     public Optional<SubscriptionClientGrant> billing(String digest){return jdbc.query("select * from subscription_action_capabilities where token_digest=? and billing_key_version is not null for update",(r,n)->billing(r),digest).stream().findFirst();}
+    public boolean serverConfirmationReserved(UUID grant){return Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from subscription_confirmation_chains where id=?)",Boolean.class,grant));}
     public void reserveBilling(SubscriptionClientGrant g){
         var current=current(g.account(),g.operation()).orElse(null);
-        if(current!=null){if(current.consumedAt()!=null||current.expiresAt().isAfter(g.issuedAt())||!current.binding().equals(g.binding()))throw conflict();
+        if(current!=null){if(serverConfirmationReserved(current.id())||current.consumedAt()!=null||current.expiresAt().isAfter(g.issuedAt())||!current.binding().equals(g.binding()))throw conflict();
             if(jdbc.update("update subscription_action_capabilities set superseded_at=? where id=? and consumed_at is null and superseded_at is null",Timestamp.from(g.issuedAt()),current.id())!=1)throw conflict();}
         var b=g.binding();
         int inserted=jdbc.update("""
@@ -81,7 +82,7 @@ public class SubscriptionActionPersistenceAdapter implements SubscriptionActionS
         if(inserted!=1)throw conflict();
     }
     public void bindSession(String digest,UUID session,String origin,Instant expires,Instant now){
-        var g=billing(digest).orElseThrow(SubscriptionActionPersistenceAdapter::conflict);if(!g.available(now)||!expires.isAfter(now)||expires.isAfter(g.expiresAt()))throw conflict();
+        var g=billing(digest).orElseThrow(SubscriptionActionPersistenceAdapter::conflict);if(serverConfirmationReserved(g.id())||!g.available(now)||!expires.isAfter(now)||expires.isAfter(g.expiresAt()))throw conflict();
         if(g.sessionId()!=null){if(!g.sessionId().equals(session)||!g.origin().equals(origin)||!g.clientExpiresAt().equals(expires))throw conflict();return;}
         if(jdbc.update("update subscription_action_capabilities set client_session_id=?,client_origin=?,client_expires_at=? where token_digest=? and client_session_id is null and consumed_at is null and superseded_at is null",session,origin,Timestamp.from(expires),digest)!=1)throw conflict();
     }
@@ -91,6 +92,7 @@ public class SubscriptionActionPersistenceAdapter implements SubscriptionActionS
             update subscription_action_capabilities set consumed_at=?,confirmation_authority_scope=?,confirmation_key_digest=?,confirmation_fingerprint=?
             where site_id=? and customer_id=? and payment_account_id=? and subscription_id=? and operation_id=? and purpose='PROVIDER_CLIENT' and token_digest=?
              and billing_key_version is not null and recurring_consent is true and consent_purpose in ('CREATE','SETUP','RESUME','CHANGE','RECOVER') and consumed_at is null and superseded_at is null and issued_at<=? and expires_at>?
+             and not exists(select 1 from subscription_confirmation_chains v2 where v2.id=subscription_action_capabilities.id)
              and client_session_id=? and client_origin=? and client_expires_at>?
             """,Timestamp.from(now),authority,key,fingerprint,site.value(),customer.value(),account.value(),subscription,operation,digest,Timestamp.from(now),Timestamp.from(now),session,origin,Timestamp.from(now));
         if(updated!=1)throw conflict();return ClaimDisposition.NEW;

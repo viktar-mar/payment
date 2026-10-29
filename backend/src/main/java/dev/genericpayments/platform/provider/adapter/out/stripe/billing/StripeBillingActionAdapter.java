@@ -27,12 +27,12 @@ public class StripeBillingActionAdapter implements SubscriptionClientSessionPort
   if(terminal(operation))return null;
   if(ownership.setupPurpose(lookup))return setupAction(lookup);
   var old=tx.requiresNew(()->actions.current(lookup.account().id(),operation.id()).orElse(null));
-  if(old!=null&&old.consumedAt()!=null)return null;
+  if(old!=null&&(old.consumedAt()!=null||tx.requiresNew(()->actions.serverConfirmationReserved(old.id()))))return null;
   var proof=ownership.acknowledgedPayment(lookup);
   var graph=read(proof);
   return tx.requiresNew(()->{
    operations.lock(proof.operation().id());var current=actions.current(lookup.account().id(),proof.operation().id()).orElse(null);
-   if(current!=null&&current.consumedAt()!=null)return null;
+   if(current!=null&&(current.consumedAt()!=null||actions.serverConfirmationReserved(current.id())))return null;
    var fresh=ownership.acknowledgedPayment(lookup);same(proof,fresh);if(!ownership.recoveryActionAvailable(fresh))throw StripeBillingOwnership.mismatch();
    var now=securityClock.instant().truncatedTo(ChronoUnit.MICROS);
    if(current!=null){if(current.consumedAt()!=null)return null;if(!current.binding().equals(graph.binding()))throw StripeBillingOwnership.mismatch();
@@ -70,7 +70,7 @@ public class StripeBillingActionAdapter implements SubscriptionClientSessionPort
  }
  private NextAction setupAction(Lookup lookup){
   var proof=ownership.acknowledgedSetup(lookup);if(terminal(proof.operation()))return null;
-  var old=tx.requiresNew(()->actions.current(lookup.account().id(),proof.operation().id()).orElse(null));if(old!=null&&old.consumedAt()!=null)return null;
+  var old=tx.requiresNew(()->actions.current(lookup.account().id(),proof.operation().id()).orElse(null));if(old!=null&&(old.consumedAt()!=null||tx.requiresNew(()->actions.serverConfirmationReserved(old.id()))))return null;
   var graph=readSetup(proof);if(graph==null)return null;
   return tx.requiresNew(()->{
    operations.lock(proof.operation().id());var fresh=ownership.acknowledgedSetup(lookup);if(!proof.equals(fresh))throw StripeBillingOwnership.mismatch();
