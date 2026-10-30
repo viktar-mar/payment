@@ -336,7 +336,8 @@ public final class StripeBillingSnapshotMapper {
             if(!matching.isEmpty()){require(matching.size()==1);return proration(invoice,lines,matching.getFirst());}
             // Multi-line proration needs the original quote's exact debit/credit proof.
             require(lines.size()==1);var line=lines.getFirst();ref(line.getId(),"il_");
-            requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&remote.getId().equals(line.getSubscription())&&Objects.equals(line.getQuantity(),1L)
+            // Only a typed original receipt permits an absent duplicate flat reference; nested ownership remains mandatory.
+            requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&(remote.getId().equals(line.getSubscription())||original!=null&&line.getSubscription()==null)&&Objects.equals(line.getQuantity(),1L)
                 &&line.getParent()!=null&&"subscription_item_details".equals(line.getParent().getType())&&line.getParent().getSubscriptionItemDetails()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             var detail=line.getParent().getSubscriptionItemDetails();
             var trialContext=owner.trial();boolean historicalTrial=trialContext!=null&&trialContext.request().verified()&&invoice.getId().equals(trialContext.request().invoice());

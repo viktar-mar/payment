@@ -1552,8 +1552,11 @@ Action selection retains the fixed adapter boundaries `ACTION_AUTHORITY`,
 owned action graph can refine `ACTION_GRAPH` to one of three closed labels:
 
 - `ACTION_GRAPH_LINE_ASSOCIATION`: the existing invoice-line association guard
-  failed, including its top-level subscription, nested parent subscription/type,
-  or explicit proration-flag presence.
+  failed, including a supplied conflicting flat subscription, the mandatory nested
+  parent subscription/type, or explicit proration-flag presence. A typed original
+  receipt permits an omitted/JSON-null duplicate flat subscription only while the
+  complete nested and original-receipt proof still matches. Ordinary null-clock
+  reads continue requiring the exact flat subscription.
 - `ACTION_GRAPH_INVOICE_SETTLEMENT`: the existing normalized invoice
   OPEN-or-CASH settlement guard or the later action-only OPEN requirement failed.
 - `ACTION_GRAPH_PAYMENT_ALLOCATION`: the existing open, default, requested
@@ -1564,8 +1567,8 @@ These labels identify the actual failed compound guard, not a particular field
 or value. Other graph failures retain generic `ACTION_GRAPH`. Provenance is
 closed and local to one action call; exception messages, properties, causes,
 stacks and response bodies cannot supply it. Ordinary mapping and observation
-retain their existing behavior and every financial and ownership check remains
-strict.
+retain the same diagnostic transport; every financial and authoritative nested
+ownership check remains strict.
 
 The private prepare scenario also distinguishes `ACTION_SCOPE` before scope
 resolution, `ACTION_RESULT` after the adapter returns (including a denied null
@@ -1579,22 +1582,26 @@ survives abort, cleanup, and duplicate refusal, and the reporter suppresses
 unrecognized output and repeated final diagnostics.
 
 Source-only reproductions use official SDK JSON parsing with an in-memory
-transport: absent/null/foreign line associations, null/omitted/nonzero invoice
-`ending_balance`, null/omitted/nonzero allocation `amount_paid`, and existing
-amount/default/status/ownership attacks still refuse without producing an action
-or performing a provider mutation. A wrong allocation payment type can fail the
-earlier normalized settlement guard and therefore carry the settlement label.
-Explicit-zero, correctly associated successful graphs remain covered. Audited
-pure Java and injected Node/reporter tests establish guard provenance and bounded
-transport only.
+transport. Exact, omitted and JSON-null duplicate flat subscriptions preserve the
+same owned action binding/proof, successful root, confirmation material/preconfirm
+and OPEN/CASH observations. Every supplied foreign, empty or malformed flat
+reference rejects, as do missing/null/conflicting authoritative nested associations
+under both allowed absence forms. Null/omitted/nonzero invoice ending balances,
+null/omitted/nonzero allocation paid amounts and the existing amount/currency,
+default/status, receipt/clock/period/catalog, PI/reverse/capture/Charge and durable
+authority attacks still refuse without issuing a root or an unauthorized POST.
+A wrong allocation payment type can fail the earlier normalized settlement guard
+and therefore carry the settlement label. Nullable money is never converted to
+zero. First-failure and concurrent guard provenance remain covered with a supplied
+foreign flat reference. Audited pure Java and injected Node/reporter tests establish
+source behavior and bounded transport only; no new native operation is included.
 
-The native root cause remains unknown. These fixtures establish neither valid
-native semantics for nullable fields nor validity of an absent legacy line
-`subscription`; no null-to-zero policy or ownership relaxation was introduced.
-Every label establishes no provider POST, subscription outcome, or movement of
-money. No old or current DISPATCHING invocation may be retried, adopted, or reset.
-Native initial-payment acceptance and full 5B remain `NOT_ACCEPTED`; these
-offline changes include no new native attempt.
+This is an intentional owned application representation rule. The cached SDK's
+independent fields establish neither provider-valid omission nor SDK deprecation,
+and the native failed predicate remains unknown. No label proves a provider POST,
+subscription outcome or movement of money. No old or current DISPATCHING invocation
+may be retried, adopted, reset or reconciled. Native initial-payment acceptance and
+full 5B remain NOT_ACCEPTED; these offline changes include no new native attempt.
 
 
 The first-payment owner now lets the owned bootstrap stop use the remaining shared

@@ -148,8 +148,9 @@ class StripeBillingClockSubscriptionSdkTest {
         assertThat(h.adapter.createOwned(h.f.command(),h.f.f.owner).outcome()).isEqualTo(Outcome.UNKNOWN);
         assertThat(h.f.f.http.calls).hasSize(when.equals("afterPreflight")?1:2);assertThat(h.receipt).isNull();assertThat(h.f.f.stopped).isNotNull();
     }
-    @Test void exactInitialObservationRevalidatesReceiptAndReturnsPendingWithoutAuthority(){
-        var h=new Harness();h.seedReceipt();h.f.f.http.reply(h.f.f.clockJson());h.f.graph();int checks=h.currentChecks;
+    @ParameterizedTest @ValueSource(strings={"exact","omitted","null"})
+    void exactInitialObservationRevalidatesReceiptAndReturnsPendingWithoutAuthority(String representation){
+        var h=new Harness();h.seedReceipt();h.f.flatSubscription(representation);h.f.f.http.reply(h.f.f.clockJson());h.f.graph();int checks=h.currentChecks;
         var s=h.adapter.retrieveOwned(h.f.lookup(),h.f.f.owner);
         assertThat(s.status()).isEqualTo(Subscription.Status.INCOMPLETE);assertThat(s.operationObservation().state()).isEqualTo(OperationState.PENDING);
         assertThat(s.observedAt()).isEqualTo(h.f.utc.plusSeconds(2));assertThat(s.trialEvidence()).isNull();assertThat(s.externalWithdrawalEvidence()).isNull();assertThat(s.recoveryObservations()).isEmpty();
@@ -157,25 +158,44 @@ class StripeBillingClockSubscriptionSdkTest {
         assertThat(h.f.f.http.calls.stream().map(r->r.url().getPath())).containsExactly("/v1/test_helpers/test_clocks/clock_owned","/v1/customers/cus_owned","/v1/subscriptions/sub_owned","/v1/invoices","/v1/invoices/in_owned/lines","/v1/invoice_payments");
         assertThat(h.f.f.http.calls).allSatisfy(r->{assertThat(r.options().getMaxNetworkRetries()).isZero();assertThat(r.headers().map().get("Stripe-Version")).containsExactly("2026-09-30.endive");});
     }
+    @ParameterizedTest @ValueSource(strings={"exact","omitted","null"})
+    void paidOwnedObservationRetainsCapturedCashAndExactReceipt(String representation){
+        var h=new Harness();h.seedReceipt();h.f.flatSubscription(representation);h.f.f.http.reply(h.f.f.clockJson());h.f.paidGraph();
+        var snapshot=h.adapter.retrieveOwned(h.f.lookup(),h.f.f.owner);
+        assertThat(snapshot.invoices()).singleElement().satisfies(invoice->{
+            assertThat(invoice.settlement()).isEqualTo(SettlementKind.CASH);
+            assertThat(invoice.cashObjects()).singleElement().satisfies(cash->{assertThat(cash.reference()).isEqualTo("pi_owned");assertThat(cash.amountMinor()).isEqualTo(1000);});
+        });
+        assertThat(snapshot.status()).isEqualTo(Subscription.Status.ACTIVE);assertThat(snapshot.observedAt()).isEqualTo(h.f.utc.plusSeconds(2));
+        assertThat(h.f.f.http.calls).hasSize(9).allMatch(c->c.method().name().equals("GET"));
+    }
     @ParameterizedTest @ValueSource(strings={"stopped","account","wrongKey","wrongReference","missingReceipt"})
     void invalidObservationAuthorityRejectsBeforeHttp(String bad){
-        var h=new Harness();h.seedReceipt();var lookup=h.f.lookup();
-        switch(bad){case "stopped"->h.f.f.active=false;case "account"->h.accountDrift=true;
-            case "wrongKey"->lookup=new Lookup(h.f.f.account,h.f.subscriptionId,"sub_owned","subscription:other:CANCEL");
-            case "wrongReference"->lookup=new Lookup(h.f.f.account,h.f.subscriptionId,"sub_other",h.f.intent.operationKey());case "missingReceipt"->h.receipt=null;}
-        var selected=lookup;assertThatThrownBy(()->h.adapter.retrieveOwned(selected,h.f.f.owner)).isInstanceOf(RuntimeException.class);assertThat(h.f.f.http.calls).isEmpty();
+        for(var representation:List.of("exact","omitted","null")){
+            var h=new Harness();h.f.flatSubscription(representation);h.seedReceipt();var lookup=h.f.lookup();
+            switch(bad){case "stopped"->h.f.f.active=false;case "account"->h.accountDrift=true;
+                case "wrongKey"->lookup=new Lookup(h.f.f.account,h.f.subscriptionId,"sub_owned","subscription:other:CANCEL");
+                case "wrongReference"->lookup=new Lookup(h.f.f.account,h.f.subscriptionId,"sub_other",h.f.intent.operationKey());case "missingReceipt"->h.receipt=null;}
+            var selected=lookup;assertThatThrownBy(()->h.adapter.retrieveOwned(selected,h.f.f.owner)).isInstanceOf(RuntimeException.class);assertThat(h.f.f.http.calls).isEmpty();
+        }
     }
     @Test void ownerRevokedAfterGraphCannotPublishObservation(){
-        var h=new Harness();h.seedReceipt();h.f.f.http.reply(h.f.f.clockJson());h.f.graph();after(h,6,()->h.f.f.active=false);
-        assertThatThrownBy(()->h.adapter.retrieveOwned(h.f.lookup(),h.f.f.owner)).isInstanceOf(RuntimeException.class);assertThat(h.f.f.http.calls).hasSize(6);
+        for(var representation:List.of("exact","omitted","null")){
+            var h=new Harness();h.f.flatSubscription(representation);h.seedReceipt();h.f.f.http.reply(h.f.f.clockJson());h.f.graph();after(h,6,()->h.f.f.active=false);
+            assertThatThrownBy(()->h.adapter.retrieveOwned(h.f.lookup(),h.f.f.owner)).isInstanceOf(RuntimeException.class);assertThat(h.f.f.http.calls).hasSize(6);
+        }
     }
     @Test void changedReceiptAfterGraphCannotPublishObservation(){
-        var h=new Harness();h.seedReceipt();h.f.f.http.reply(h.f.f.clockJson());h.f.graph();after(h,6,()->h.receipt=new OwnedClockSubscriptionReceipt(h.f.intent,h.receipt.providerOperation(),"sub_owned",43,"si_owned",1699999900,1702678400,h.receipt.acknowledgedAt()));
-        assertThatThrownBy(()->h.adapter.retrieveOwned(h.f.lookup(),h.f.f.owner)).isInstanceOf(RuntimeException.class);
+        for(var representation:List.of("exact","omitted","null")){
+            var h=new Harness();h.f.flatSubscription(representation);h.seedReceipt();h.f.f.http.reply(h.f.f.clockJson());h.f.graph();after(h,6,()->h.receipt=new OwnedClockSubscriptionReceipt(h.f.intent,h.receipt.providerOperation(),"sub_owned",43,"si_owned",1699999900,1702678400,h.receipt.acknowledgedAt()));
+            assertThatThrownBy(()->h.adapter.retrieveOwned(h.f.lookup(),h.f.f.owner)).isInstanceOf(RuntimeException.class);
+        }
     }
     @Test void changedOperationVersionAfterGraphCannotPublishObservation(){
-        var h=new Harness();h.seedReceipt();h.f.f.http.reply(h.f.f.clockJson());h.f.graph();after(h,6,()->{var o=h.f.operation;h.f.operation=new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),o.subscriptionId(),o.kind(),o.status(),o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),o.providerReference(),o.safeFailureCode(),o.createdAt(),o.updatedAt(),o.version()+1);});
-        assertThatThrownBy(()->h.adapter.retrieveOwned(h.f.lookup(),h.f.f.owner)).isInstanceOf(RuntimeException.class);
+        for(var representation:List.of("exact","omitted","null")){
+            var h=new Harness();h.f.flatSubscription(representation);h.seedReceipt();h.f.f.http.reply(h.f.f.clockJson());h.f.graph();after(h,6,()->{var o=h.f.operation;h.f.operation=new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),o.subscriptionId(),o.kind(),o.status(),o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),o.providerReference(),o.safeFailureCode(),o.createdAt(),o.updatedAt(),o.version()+1);});
+            assertThatThrownBy(()->h.adapter.retrieveOwned(h.f.lookup(),h.f.f.owner)).isInstanceOf(RuntimeException.class);
+        }
     }
     @ParameterizedTest @ValueSource(strings={"trial","consent","cancel","setup","target","invoice","quote"})
     void unsupportedCommandsHaveNoProviderCapability(String bad){

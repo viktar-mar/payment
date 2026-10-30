@@ -23,6 +23,69 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Audited standalone tests: only value objects and an inert official SDK HttpClient. */
 class StripeBillingOwnedConfirmationSdkTest {
+    // Requiring the duplicate flat field in any owned phase breaks this complete receipt-bound flow.
+    @ParameterizedTest @ValueSource(strings={"exact","omitted","null"})
+    void ownedFlatRepresentationPreservesBindingRootMaterialAndPreconfirm(String representation){
+        var exact=new Harness();openGraph(exact.f);
+        var expected=StripeBillingSnapshotMapper.retrieveOwnedPaymentAction(exact.f.f.clients.create(null),exact.f.ordinary(),new StripeBillingSnapshotMapper.OwnedInitial(exact.receipt),exact.now);
+        var h=new Harness();h.f.flatSubscription(representation);h.graph();
+        assertThatCode(()->assertThat(h.action().nextAction(h.scope)).isNotNull()).doesNotThrowAnyException();
+        assertThat(h.root.binding()).isEqualTo(expected.binding());
+        assertThat(h.root.binding().schema()).isEqualTo("owned-initial-v1");
+        assertThat(h.root.binding().ownedIntent()).isEqualTo(h.f.intent.id());
+        assertThat(h.inserts).isEqualTo(1);assertThat(h.root.expiresAt()).isEqualTo(h.now.plusSeconds(600));
+        assertThat(h.f.f.http.calls).hasSize(9).allMatch(c->c.method().name().equals("GET"));
+        h.reserve(false);h.graph();
+        var material=h.provider().read(h.f.lookup(),h.root,null);
+        assertThat(material.clientSecret()).isEqualTo("pi_owned_secret_INERT");
+        assertThat(material.publishableKey()).isEqualTo("pk_test_INERT");
+        assertThat(h.f.f.http.calls).hasSize(18).allMatch(c->c.method().name().equals("GET"));
+        h.reserve(true);h.graph();h.f.f.http.reply(h.success());h.f.f.http.reply(h.f.f.clockJson());
+        assertThat(h.provider().confirm(h.f.lookup(),h.root,h.attempt,"ctoken_INERT").state()).isEqualTo(SubscriptionConfirmationAttempt.State.OBSERVE);
+        assertThat(h.f.f.http.calls).hasSize(29);
+        assertThat(h.f.f.http.calls.stream().filter(c->c.method().name().equals("POST")).map(c->c.url().getPath())).containsExactly("/v1/payment_intents/pi_owned/confirm");
+        assertThat(h.action().nextAction(h.scope)).isNull();assertThat(h.inserts).isEqualTo(1);assertThat(h.f.f.http.calls).hasSize(29);
+    }
+    // Omitting a duplicate never substitutes for the complete nested ownership and line envelope.
+    @ParameterizedTest @ValueSource(strings={"missingSubscription","nullSubscription","foreignSubscription","missingItem","nullItem","foreignItem","missingParent","nullParent","wrongParentType","missingParentType","nullParentType","missingDetails","nullDetails","missingProration","nullProration","trueProration","lineInvoice","quantity","nullQuantity","live","object","price","product","period","invoiceParentMissing","invoiceParentNull","invoiceParentType","invoiceDetailsMissing","invoiceDetailsNull"})
+    void missingFlatStillRequiresEveryNestedAssociationAndLineValue(String bad){
+        for(var representation:List.of("omitted","null")){
+            var h=new Harness();prepareOpen(h.f);h.f.flatSubscription(representation);
+            var line=h.f.line;var parent=line.getAsJsonObject("parent");var details=parent.getAsJsonObject("subscription_item_details");
+            switch(bad){
+                case "invoiceParentMissing"->h.f.invoice.remove("parent");case "invoiceParentNull"->h.f.invoice.add("parent",com.google.gson.JsonNull.INSTANCE);case "invoiceParentType"->h.f.invoice.getAsJsonObject("parent").addProperty("type","invoice_item_details");case "invoiceDetailsMissing"->h.f.invoice.getAsJsonObject("parent").remove("subscription_details");case "invoiceDetailsNull"->h.f.invoice.getAsJsonObject("parent").add("subscription_details",com.google.gson.JsonNull.INSTANCE);
+                case "missingSubscription"->details.remove("subscription");case "nullSubscription"->details.add("subscription",com.google.gson.JsonNull.INSTANCE);case "foreignSubscription"->details.addProperty("subscription","sub_foreign");
+                case "missingItem"->details.remove("subscription_item");case "nullItem"->details.add("subscription_item",com.google.gson.JsonNull.INSTANCE);case "foreignItem"->details.addProperty("subscription_item","si_foreign");
+                case "missingParent"->line.remove("parent");case "nullParent"->line.add("parent",com.google.gson.JsonNull.INSTANCE);case "wrongParentType"->parent.addProperty("type","invoice_item_details");case "missingParentType"->parent.remove("type");case "nullParentType"->parent.add("type",com.google.gson.JsonNull.INSTANCE);
+                case "missingDetails"->parent.remove("subscription_item_details");case "nullDetails"->parent.add("subscription_item_details",com.google.gson.JsonNull.INSTANCE);
+                case "missingProration"->details.remove("proration");case "nullProration"->details.add("proration",com.google.gson.JsonNull.INSTANCE);case "trueProration"->details.addProperty("proration",true);
+                case "lineInvoice"->line.addProperty("invoice","in_foreign");case "quantity"->line.addProperty("quantity",2);case "nullQuantity"->line.add("quantity",com.google.gson.JsonNull.INSTANCE);case "live"->line.addProperty("livemode",true);case "object"->line.addProperty("object","invoice_item");
+                case "price"->line.getAsJsonObject("pricing").getAsJsonObject("price_details").addProperty("price","price_foreign");case "product"->line.getAsJsonObject("pricing").getAsJsonObject("price_details").addProperty("product","prod_foreign");case "period"->line.getAsJsonObject("period").addProperty("end",1702678401);
+            }
+            queueActionGraph(h);var adapter=h.action();
+            assertThat(catchThrowable(()->adapter.nextAction(h.scope))).as("%s with %s flat reference",bad,representation).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
+            assertThat(h.root).isNull();assertThat(h.inserts).isZero();
+            assertThat(h.f.f.http.calls.size()).isBetween(4,6);assertThat(h.f.f.http.calls).allMatch(c->c.method().name().equals("GET"));
+        }
+    }
+    @ParameterizedTest @ValueSource(strings={"nested","allocation","capture"})
+    void allowedFlatAbsenceCannotDeferBrokenGraphToConfirmationPost(String broken){
+        for(var representation:List.of("omitted","null")){
+            var h=new Harness();h.f.flatSubscription(representation);h.root();h.reserve(false);prepareOpen(h.f);
+            switch(broken){case "nested"->h.f.line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").remove("subscription");case "allocation"->h.f.allocation.remove("amount_paid");case "capture"->h.f.pi.addProperty("capture_method","manual");}
+            queueActionGraph(h);assertThatThrownBy(()->h.provider().read(h.f.lookup(),h.root,null)).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
+            h.f.f.http.replies.clear();h.reserve(true);queueActionGraph(h);
+            assertThat(h.provider().confirm(h.f.lookup(),h.root,h.attempt,"ctoken_INERT").state()).isEqualTo(SubscriptionConfirmationAttempt.State.UNKNOWN);
+            assertThat(h.f.f.http.calls.size()).isBetween(10,14);assertThat(h.f.f.http.calls).allMatch(c->c.method().name().equals("GET"));
+        }
+    }
+    // Actual pinned SDK parsing must never turn malformed-present flat data into allowed absence.
+    @ParameterizedTest @ValueSource(strings={"\"sub_foreign\"","\"\"","{\"id\":\"sub_foreign\",\"object\":\"subscription\"}","{}","{\"id\":null}","42","true","[]"})
+    void suppliedForeignOrMalformedFlatSubscriptionCannotIssueRoot(String json){
+        var h=new Harness();prepareOpen(h.f);h.f.line.add("subscription",com.google.gson.JsonParser.parseString(json));queueActionGraph(h);
+        var adapter=h.action();assertThat(catchThrowable(()->adapter.nextAction(h.scope))).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
+        assertThat(h.root).isNull();assertThat(h.inserts).isZero();assertThat(h.f.f.http.calls).hasSize(5).allMatch(c->c.method().name().equals("GET"));
+    }
     @Test void explicitOwnedActionAcceptsOpaqueCreatedAndSeparatedClockWhileOrdinaryRefuses() throws Exception {
         var f=new StripeBillingOwnedSubscriptionFixture();
         f.graph();
@@ -95,11 +158,11 @@ class StripeBillingOwnedConfirmationSdkTest {
         assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH");
         assertThat(h.f.f.verifications).isEqualTo(1);assertThat(h.f.f.http.calls).isEmpty();assertThat(h.inserts).isZero();
     }
-    @ParameterizedTest @ValueSource(strings={"missingLegacy","nullLegacy","foreignLegacy","missingNested","nullNested","foreignNested","nullParent","wrongParentType","missingProration"})
+    @ParameterizedTest @ValueSource(strings={"foreignFlat","missingNested","nullNested","foreignNested","nullParent","wrongParentType","missingProration"})
     void ownedActionLineGuardReportsAssociationWithoutIssuingRoot(String variant){
         var h=new Harness();prepareOpen(h.f);var line=h.f.line;var detail=line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details");
         switch(variant){
-            case "missingLegacy"->line.remove("subscription");case "nullLegacy"->line.add("subscription",com.google.gson.JsonNull.INSTANCE);case "foreignLegacy"->line.addProperty("subscription","sub_foreign");
+            case "foreignFlat"->line.addProperty("subscription","sub_foreign");
             case "missingNested"->detail.remove("subscription");case "nullNested"->detail.add("subscription",com.google.gson.JsonNull.INSTANCE);case "foreignNested"->detail.addProperty("subscription","sub_foreign");
             case "nullParent"->line.add("parent",com.google.gson.JsonNull.INSTANCE);case "wrongParentType"->line.getAsJsonObject("parent").addProperty("type","invoice_item_details");case "missingProration"->detail.remove("proration");
         }
@@ -107,37 +170,43 @@ class StripeBillingOwnedConfirmationSdkTest {
     }
     @ParameterizedTest @ValueSource(strings={"nullEndingBalance","missingEndingBalance","nonzeroEndingBalance","foreignLineAmount","offStripePaid","paymentType"})
     void ownedActionUnsupportedInvoiceReportsSettlementWithoutIssuingRoot(String variant){
-        var h=new Harness();prepareOpen(h.f);
-        switch(variant){
-            case "nullEndingBalance"->h.f.invoice.add("ending_balance",com.google.gson.JsonNull.INSTANCE);case "missingEndingBalance"->h.f.invoice.remove("ending_balance");case "nonzeroEndingBalance"->h.f.invoice.addProperty("ending_balance",1);
-            case "foreignLineAmount"->h.f.line.addProperty("amount",999);case "offStripePaid"->h.f.invoice.addProperty("amount_paid_off_stripe",1);case "paymentType"->h.f.allocation.getAsJsonObject("payment").addProperty("type","payment_record");
+        for(var representation:List.of("exact","omitted","null")){
+            var h=new Harness();prepareOpen(h.f);h.f.flatSubscription(representation);
+            switch(variant){
+                case "nullEndingBalance"->h.f.invoice.add("ending_balance",com.google.gson.JsonNull.INSTANCE);case "missingEndingBalance"->h.f.invoice.remove("ending_balance");case "nonzeroEndingBalance"->h.f.invoice.addProperty("ending_balance",1);
+                case "foreignLineAmount"->h.f.line.addProperty("amount",999);case "offStripePaid"->h.f.invoice.addProperty("amount_paid_off_stripe",1);case "paymentType"->h.f.allocation.getAsJsonObject("payment").addProperty("type","payment_record");
+            }
+            queueActionGraph(h);assertActionGraphRefusal(h,"ACTION_GRAPH_INVOICE_SETTLEMENT",6);
         }
-        queueActionGraph(h);assertActionGraphRefusal(h,"ACTION_GRAPH_INVOICE_SETTLEMENT",6);
     }
     @ParameterizedTest @ValueSource(strings={"nullPaid","missingPaid","positivePaid","negativePaid","notDefault","nullDefault","wrongRequested","canceled"})
     void ownedActionAllocationGuardReportsAllocationBeforeIntentRead(String variant){
-        var h=new Harness();prepareOpen(h.f);
-        switch(variant){
-            case "nullPaid"->h.f.allocation.add("amount_paid",com.google.gson.JsonNull.INSTANCE);case "missingPaid"->h.f.allocation.remove("amount_paid");case "positivePaid"->h.f.allocation.addProperty("amount_paid",1);case "negativePaid"->h.f.allocation.addProperty("amount_paid",-1);
-            case "notDefault"->h.f.allocation.addProperty("is_default",false);case "nullDefault"->h.f.allocation.add("is_default",com.google.gson.JsonNull.INSTANCE);case "wrongRequested"->h.f.allocation.addProperty("amount_requested",999);case "canceled"->h.f.allocation.addProperty("status","canceled");
+        for(var representation:List.of("exact","omitted","null")){
+            var h=new Harness();prepareOpen(h.f);h.f.flatSubscription(representation);
+            switch(variant){
+                case "nullPaid"->h.f.allocation.add("amount_paid",com.google.gson.JsonNull.INSTANCE);case "missingPaid"->h.f.allocation.remove("amount_paid");case "positivePaid"->h.f.allocation.addProperty("amount_paid",1);case "negativePaid"->h.f.allocation.addProperty("amount_paid",-1);
+                case "notDefault"->h.f.allocation.addProperty("is_default",false);case "nullDefault"->h.f.allocation.add("is_default",com.google.gson.JsonNull.INSTANCE);case "wrongRequested"->h.f.allocation.addProperty("amount_requested",999);case "canceled"->h.f.allocation.addProperty("status","canceled");
+            }
+            queueActionGraph(h);assertActionGraphRefusal(h,"ACTION_GRAPH_PAYMENT_ALLOCATION",6);
         }
-        queueActionGraph(h);assertActionGraphRefusal(h,"ACTION_GRAPH_PAYMENT_ALLOCATION",6);
     }
     @ParameterizedTest @ValueSource(strings={"customer","invoiceOwner","allocationOwner","lineItem","period","piAmount","piCustomer","reverse"})
     void otherOwnedGraphGuardsRetainGenericFailure(String variant){
-        var h=new Harness();prepareOpen(h.f);int reads=6;
-        switch(variant){
-            case "customer"->{h.f.customer.addProperty("id","cus_foreign");reads=2;}
-            case "invoiceOwner"->{h.f.invoice.getAsJsonObject("parent").getAsJsonObject("subscription_details").addProperty("subscription","sub_foreign");reads=4;}
-            case "allocationOwner"->h.f.allocation.addProperty("invoice","in_foreign");case "lineItem"->{h.f.line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription_item","si_foreign");reads=5;}
-            case "period"->h.f.line.getAsJsonObject("period").addProperty("end",1702678401);
-            case "piAmount"->{h.f.pi.addProperty("amount",999);reads=7;}case "piCustomer"->{h.f.pi.addProperty("customer","cus_foreign");reads=7;}
-            case "reverse"->reads=8;
+        for(var representation:List.of("exact","omitted","null")){
+            var h=new Harness();prepareOpen(h.f);h.f.flatSubscription(representation);int reads=6;
+            switch(variant){
+                case "customer"->{h.f.customer.addProperty("id","cus_foreign");reads=2;}
+                case "invoiceOwner"->{h.f.invoice.getAsJsonObject("parent").getAsJsonObject("subscription_details").addProperty("subscription","sub_foreign");reads=4;}
+                case "allocationOwner"->h.f.allocation.addProperty("invoice","in_foreign");case "lineItem"->{h.f.line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription_item","si_foreign");reads=5;}
+                case "period"->h.f.line.getAsJsonObject("period").addProperty("end",1702678401);
+                case "piAmount"->{h.f.pi.addProperty("amount",999);reads=7;}case "piCustomer"->{h.f.pi.addProperty("customer","cus_foreign");reads=7;}
+                case "reverse"->reads=8;
+            }
+            h.f.f.http.reply(h.f.f.clockJson());
+            h.f.f.http.reply(h.f.customer.toString());h.f.f.http.reply(h.f.remote.toString());h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.invoice));h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.line));h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.allocation));h.f.f.http.reply(h.f.pi.toString());
+            var reverse=h.f.allocation.deepCopy();if(variant.equals("reverse"))reverse.addProperty("id","inpay_foreign");h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(reverse));h.f.f.http.reply(h.f.f.clockJson());
+            assertActionGraphRefusal(h,"ACTION_GRAPH",reads);
         }
-        h.f.f.http.reply(h.f.f.clockJson());
-        h.f.f.http.reply(h.f.customer.toString());h.f.f.http.reply(h.f.remote.toString());h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.invoice));h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.line));h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.allocation));h.f.f.http.reply(h.f.pi.toString());
-        var reverse=h.f.allocation.deepCopy();if(variant.equals("reverse"))reverse.addProperty("id","inpay_foreign");h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(reverse));h.f.f.http.reply(h.f.f.clockJson());
-        assertActionGraphRefusal(h,"ACTION_GRAPH",reads);
     }
     @Test void detailedGraphFailureRemainsFirstThroughGenericFailureSuccessAndDuplicateRefusal(){
         var h=new Harness();var adapter=h.action();prepareOpen(h.f);h.f.allocation.remove("amount_paid");queueActionGraph(h);
@@ -152,7 +221,7 @@ class StripeBillingOwnedConfirmationSdkTest {
         assertThat(h.f.f.http.calls).allMatch(c->c.method().name().equals("GET"));
     }
     @Test void concurrentDetailedAndGenericFailuresKeepCallLocalGuardProvenance()throws Exception{
-        var detailed=new Harness();var generic=new Harness();prepareOpen(detailed.f);detailed.f.line.remove("subscription");queueActionGraph(detailed);generic.graph();
+        var detailed=new Harness();var generic=new Harness();prepareOpen(detailed.f);detailed.f.line.addProperty("subscription","sub_foreign");queueActionGraph(detailed);generic.graph();
         var detailedEntered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
         after(detailed,5,()->{detailedEntered.countDown();awaitRelease(release);});after(generic,2,()->{throw new UnreadableFailure();});
         var detailedAdapter=detailed.action();var genericAdapter=generic.action();
@@ -288,41 +357,50 @@ class StripeBillingOwnedConfirmationSdkTest {
         r.add("next_action",StripeBillingOwnedSubscriptionFixture.json("{\"type\":\"use_stripe_sdk\",\"use_stripe_sdk\":{\"future_sdk_field\":{\"anything\":[null,42,true]}}}"));h.f.f.http.reply(r.toString());h.f.f.http.reply(h.f.f.clockJson());
         var result=h.provider().confirm(h.f.lookup(),h.root,h.attempt,"ctoken_INERT");assertThat(result.state()).isEqualTo(SubscriptionConfirmationAttempt.State.REQUIRES_ACTION);assertThat(result.receipt()).isNull();
     }
-    @ParameterizedTest @ValueSource(strings={"customerClock","subscriptionClock","invoiceClock","created","item","periodStart","periodEnd","customer","allocationInvoice","allocationDefault","allocationPaid","allocationRequested","allocationMissingPaid","allocationCanceled","allocationSecond","reverse","piId","piCustomer","piAmount","piCurrency","piLive","piObject","piReceived","piConfirmation","piCapture","piStatus","piCards","piLatest","secretMissing","secretForeign","secretOversize","invoiceSecret","invoicePaid","invoiceSecond"})
+    @ParameterizedTest @ValueSource(strings={"customerClock","subscriptionClock","invoiceClock","created","item","periodStart","periodEnd","customer","allocationInvoice","allocationDefault","allocationPaid","allocationRequested","allocationMissingPaid","allocationCanceled","allocationSecond","reverse","piId","piCustomer","piAmount","piCurrency","piLive","piObject","piReceived","piConfirmation","piCapture","piStatus","piCards","piLatest","secretMissing","secretForeign","secretOversize","invoiceSecret","invoicePaid","invoiceSecond","invoiceAmount","invoiceCurrency","lineCurrency","lineAmountMissing","lineAmountNull","invoicePaidNull","invoiceRemainingNull","invoiceTotalNull","invoiceSubtotalNull","startingBalanceNull","allocationRequestedNull","allocationCurrency","piAmountNull","piReceivedNull","piCurrencyNull"})
     void originalGraphSubstitutionNeverReleasesOwnedSecret(String bad){
-        var f=new StripeBillingOwnedSubscriptionFixture();prepareOpen(f);
-        switch(bad){
-            case "customerClock"->f.customer.addProperty("test_clock","clock_other");case "subscriptionClock"->f.remote.addProperty("test_clock","clock_other");case "invoiceClock"->f.invoice.addProperty("test_clock","clock_other");
-            case "created"->f.remote.addProperty("created",43);case "item"->f.item().addProperty("id","si_other");case "periodStart"->f.item().addProperty("current_period_start",1699999901);case "periodEnd"->f.item().addProperty("current_period_end",1702678401);case "customer"->f.remote.addProperty("customer","cus_other");
-            case "allocationInvoice"->f.allocation.addProperty("invoice","in_other");case "allocationDefault"->f.allocation.addProperty("is_default",false);case "allocationPaid"->f.allocation.addProperty("amount_paid",1);case "allocationRequested"->f.allocation.addProperty("amount_requested",999);case "allocationMissingPaid"->f.allocation.remove("amount_paid");case "allocationCanceled"->f.allocation.addProperty("status","canceled");
-            case "piId"->f.pi.addProperty("id","pi_other");case "piCustomer"->f.pi.addProperty("customer","cus_other");case "piAmount"->f.pi.addProperty("amount",999);case "piCurrency"->f.pi.addProperty("currency","usd");case "piLive"->f.pi.addProperty("livemode",true);case "piObject"->f.pi.addProperty("object","charge");case "piReceived"->f.pi.addProperty("amount_received",1);case "piConfirmation"->f.pi.addProperty("confirmation_method","manual");case "piCapture"->f.pi.addProperty("capture_method","manual");case "piStatus"->f.pi.addProperty("status","requires_action");case "piCards"->f.pi.add("payment_method_types",com.google.gson.JsonParser.parseString("[\"card\",\"link\"]"));
-            case "piLatest"->f.pi.addProperty("latest_charge","ch_owned");case "secretMissing"->f.pi.remove("client_secret");case "secretForeign"->f.pi.addProperty("client_secret","pi_other_secret_CANARY");case "secretOversize"->f.pi.addProperty("client_secret","pi_owned_secret_"+"x".repeat(497));case "invoiceSecret"->f.invoice.add("confirmation_secret",StripeBillingOwnedSubscriptionFixture.json("{\"type\":\"payment_intent\",\"client_secret\":\"pi_owned_secret_OTHER\"}"));case "invoicePaid"->f.invoice.addProperty("status","paid");default->{}
+        for(var representation:List.of("exact","omitted","null")){
+            var f=new StripeBillingOwnedSubscriptionFixture();prepareOpen(f);f.flatSubscription(representation);
+            switch(bad){
+                case "invoiceAmount"->f.invoice.add("amount_due",com.google.gson.JsonNull.INSTANCE);case "invoiceCurrency"->f.invoice.addProperty("currency","usd");case "lineCurrency"->f.line.addProperty("currency","usd");case "lineAmountMissing"->f.line.remove("amount");case "lineAmountNull"->f.line.add("amount",com.google.gson.JsonNull.INSTANCE);
+                case "invoicePaidNull"->f.invoice.add("amount_paid",com.google.gson.JsonNull.INSTANCE);case "invoiceRemainingNull"->f.invoice.add("amount_remaining",com.google.gson.JsonNull.INSTANCE);case "invoiceTotalNull"->f.invoice.add("total",com.google.gson.JsonNull.INSTANCE);case "invoiceSubtotalNull"->f.invoice.add("subtotal",com.google.gson.JsonNull.INSTANCE);case "startingBalanceNull"->f.invoice.add("starting_balance",com.google.gson.JsonNull.INSTANCE);
+                case "allocationRequestedNull"->f.allocation.add("amount_requested",com.google.gson.JsonNull.INSTANCE);case "allocationCurrency"->f.allocation.addProperty("currency","usd");case "piAmountNull"->f.pi.add("amount",com.google.gson.JsonNull.INSTANCE);case "piReceivedNull"->f.pi.add("amount_received",com.google.gson.JsonNull.INSTANCE);case "piCurrencyNull"->f.pi.add("currency",com.google.gson.JsonNull.INSTANCE);
+                case "customerClock"->f.customer.addProperty("test_clock","clock_other");case "subscriptionClock"->f.remote.addProperty("test_clock","clock_other");case "invoiceClock"->f.invoice.addProperty("test_clock","clock_other");
+                case "created"->f.remote.addProperty("created",43);case "item"->f.item().addProperty("id","si_other");case "periodStart"->f.item().addProperty("current_period_start",1699999901);case "periodEnd"->f.item().addProperty("current_period_end",1702678401);case "customer"->f.remote.addProperty("customer","cus_other");
+                case "allocationInvoice"->f.allocation.addProperty("invoice","in_other");case "allocationDefault"->f.allocation.addProperty("is_default",false);case "allocationPaid"->f.allocation.addProperty("amount_paid",1);case "allocationRequested"->f.allocation.addProperty("amount_requested",999);case "allocationMissingPaid"->f.allocation.remove("amount_paid");case "allocationCanceled"->f.allocation.addProperty("status","canceled");
+                case "piId"->f.pi.addProperty("id","pi_other");case "piCustomer"->f.pi.addProperty("customer","cus_other");case "piAmount"->f.pi.addProperty("amount",999);case "piCurrency"->f.pi.addProperty("currency","usd");case "piLive"->f.pi.addProperty("livemode",true);case "piObject"->f.pi.addProperty("object","charge");case "piReceived"->f.pi.addProperty("amount_received",1);case "piConfirmation"->f.pi.addProperty("confirmation_method","manual");case "piCapture"->f.pi.addProperty("capture_method","manual");case "piStatus"->f.pi.addProperty("status","requires_action");case "piCards"->f.pi.add("payment_method_types",com.google.gson.JsonParser.parseString("[\"card\",\"link\"]"));
+                case "piLatest"->f.pi.addProperty("latest_charge","ch_owned");case "secretMissing"->f.pi.remove("client_secret");case "secretForeign"->f.pi.addProperty("client_secret","pi_other_secret_CANARY");case "secretOversize"->f.pi.addProperty("client_secret","pi_owned_secret_"+"x".repeat(497));case "invoiceSecret"->f.invoice.add("confirmation_secret",StripeBillingOwnedSubscriptionFixture.json("{\"type\":\"payment_intent\",\"client_secret\":\"pi_owned_secret_OTHER\"}"));case "invoicePaid"->f.invoice.addProperty("status","paid");default->{}
+            }
+            var second=f.allocation.deepCopy();second.addProperty("id","inpay_second");var invoice2=f.invoice.deepCopy();invoice2.addProperty("id","in_second");
+            f.f.http.reply(f.customer.toString());f.f.http.reply(f.remote.toString());f.f.http.reply(bad.equals("invoiceSecond")?StripeBillingOwnedSubscriptionFixture.page(f.invoice,invoice2):StripeBillingOwnedSubscriptionFixture.page(f.invoice));
+            f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(f.line));f.f.http.reply(bad.equals("allocationSecond")?StripeBillingOwnedSubscriptionFixture.page(f.allocation,second):StripeBillingOwnedSubscriptionFixture.page(f.allocation));f.f.http.reply(f.pi.toString());f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(bad.equals("reverse")?second:f.allocation));
+            assertThatThrownBy(()->StripeBillingSnapshotMapper.retrieveOwnedPaymentAction(f.f.clients.create(null),f.ordinary(),new StripeBillingSnapshotMapper.OwnedInitial(f.receipt()),f.utc)).isInstanceOf(RuntimeException.class).hasMessageNotContaining("secret_CANARY");
+            if(bad.equals("piLatest"))assertThat(f.f.http.calls.stream().map(c->c.url().getPath())).noneMatch(path->path.startsWith("/v1/charges"));
         }
-        var second=f.allocation.deepCopy();second.addProperty("id","inpay_second");var invoice2=f.invoice.deepCopy();invoice2.addProperty("id","in_second");
-        f.f.http.reply(f.customer.toString());f.f.http.reply(f.remote.toString());f.f.http.reply(bad.equals("invoiceSecond")?StripeBillingOwnedSubscriptionFixture.page(f.invoice,invoice2):StripeBillingOwnedSubscriptionFixture.page(f.invoice));
-        f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(f.line));f.f.http.reply(bad.equals("allocationSecond")?StripeBillingOwnedSubscriptionFixture.page(f.allocation,second):StripeBillingOwnedSubscriptionFixture.page(f.allocation));f.f.http.reply(f.pi.toString());f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(bad.equals("reverse")?second:f.allocation));
-        assertThatThrownBy(()->StripeBillingSnapshotMapper.retrieveOwnedPaymentAction(f.f.clients.create(null),f.ordinary(),new StripeBillingSnapshotMapper.OwnedInitial(f.receipt()),f.utc)).isInstanceOf(RuntimeException.class).hasMessageNotContaining("secret_CANARY");
-        if(bad.equals("piLatest"))assertThat(f.f.http.calls.stream().map(c->c.url().getPath())).noneMatch(path->path.startsWith("/v1/charges"));
     }
     @ParameterizedTest @ValueSource(strings={"before","afterClock","afterGraph","afterPost","afterPostClock"})
     void revokedSessionOrPostIoPolicyDriftNeverPublishesOutcome(String when){
-        var h=new Harness();h.root();h.reserve(true);h.graph();h.f.f.http.reply(h.success());h.f.f.http.reply(h.f.f.clockJson());
-        if(when.equals("before"))h.revoked=true;else after(h,when.equals("afterClock")?1:when.equals("afterGraph")?9:when.equals("afterPost")?10:11,()->h.revoked=true);
-        var result=h.provider().confirm(h.f.lookup(),h.root,h.attempt,"ctoken_INERT");assertThat(result.state()).isEqualTo(SubscriptionConfirmationAttempt.State.UNKNOWN);assertThat(result.receipt()).isNull();
-        assertThat(h.f.f.http.calls.stream().filter(c->c.method().name().equals("POST"))).hasSize(when.startsWith("afterPost")?1:0);
+        for(var representation:List.of("exact","omitted","null")){
+            var h=new Harness();h.f.flatSubscription(representation);h.root();h.reserve(true);h.graph();h.f.f.http.reply(h.success());h.f.f.http.reply(h.f.f.clockJson());
+            if(when.equals("before"))h.revoked=true;else after(h,when.equals("afterClock")?1:when.equals("afterGraph")?9:when.equals("afterPost")?10:11,()->h.revoked=true);
+            var result=h.provider().confirm(h.f.lookup(),h.root,h.attempt,"ctoken_INERT");assertThat(result.state()).isEqualTo(SubscriptionConfirmationAttempt.State.UNKNOWN);assertThat(result.receipt()).isNull();
+            assertThat(h.f.f.http.calls.stream().filter(c->c.method().name().equals("POST"))).hasSize(when.startsWith("afterPost")?1:0);
+        }
     }
     @ParameterizedTest @ValueSource(strings={"unconsumed","wrongToken","wrongDigest","wrongChain","wrongSession","wrongOrigin","wrongPolicy","wrongRevision","predecessor","successor","receipt","ready","finished","forgedVersion","forgedAttempt","wrongFingerprint","expired","wrongLookup","foreignScope"})
     void missingOrSubstitutedDurableAuthorityCannotPost(String bad){
-        var h=new Harness();h.root();h.reserve(!bad.equals("unconsumed"));String token="ctoken_INERT";var lookup=h.f.lookup();var a=h.attempt;var c=h.chain;
-        switch(bad){
-            case "wrongToken"->token="ctoken_OTHER";case "wrongDigest"->h.chain=new SubscriptionConfirmationChain(c.id(),"f".repeat(64),c.sessionId(),c.origin(),c.expiresAt(),c.policyVersion(),c.subscriptionRevision());
-            case "wrongChain"->h.chain=new SubscriptionConfirmationChain(UUID.randomUUID(),c.rootDigest(),c.sessionId(),c.origin(),c.expiresAt(),c.policyVersion(),c.subscriptionRevision());
-            case "wrongSession","wrongOrigin","wrongPolicy","wrongRevision","expired"->h.chain=new SubscriptionConfirmationChain(c.id(),c.rootDigest(),bad.equals("wrongSession")?UUID.randomUUID():c.sessionId(),bad.equals("wrongOrigin")?"https://other.test":c.origin(),bad.equals("expired")?h.now:c.expiresAt(),bad.equals("wrongPolicy")?2:c.policyVersion(),bad.equals("wrongRevision")?99:c.subscriptionRevision());
-            case "predecessor","successor","receipt","ready","finished","forgedVersion","wrongFingerprint"->h.attempt=new SubscriptionConfirmationAttempt(a.id(),a.chain(),bad.equals("predecessor")?UUID.randomUUID():null,a.keyVersion(),a.issuedAt(),a.expiresAt(),bad.equals("ready")?SubscriptionConfirmationAttempt.State.READY:bad.equals("finished")?SubscriptionConfirmationAttempt.State.UNKNOWN:a.state(),a.confirmKey(),a.tokenDigest(),bad.equals("wrongFingerprint")?"e".repeat(64):a.fingerprint(),bad.equals("receipt")?new SubscriptionConfirmationAttempt.Receipt("req_fake","ch_fake","generic_decline"):null,bad.equals("successor")?UUID.randomUUID():null,null,bad.equals("forgedVersion")?2:a.version());
-            case "wrongLookup"->lookup=new SubscriptionProviderModels.Lookup(lookup.account(),lookup.subscriptionId(),"sub_other",lookup.providerOperationKey());case "foreignScope"->h.revoked=true;default->{}
+        for(var representation:List.of("exact","omitted","null")){
+            var h=new Harness();h.f.flatSubscription(representation);h.root();h.reserve(!bad.equals("unconsumed"));String token="ctoken_INERT";var lookup=h.f.lookup();var a=h.attempt;var c=h.chain;
+            switch(bad){
+                case "wrongToken"->token="ctoken_OTHER";case "wrongDigest"->h.chain=new SubscriptionConfirmationChain(c.id(),"f".repeat(64),c.sessionId(),c.origin(),c.expiresAt(),c.policyVersion(),c.subscriptionRevision());
+                case "wrongChain"->h.chain=new SubscriptionConfirmationChain(UUID.randomUUID(),c.rootDigest(),c.sessionId(),c.origin(),c.expiresAt(),c.policyVersion(),c.subscriptionRevision());
+                case "wrongSession","wrongOrigin","wrongPolicy","wrongRevision","expired"->h.chain=new SubscriptionConfirmationChain(c.id(),c.rootDigest(),bad.equals("wrongSession")?UUID.randomUUID():c.sessionId(),bad.equals("wrongOrigin")?"https://other.test":c.origin(),bad.equals("expired")?h.now:c.expiresAt(),bad.equals("wrongPolicy")?2:c.policyVersion(),bad.equals("wrongRevision")?99:c.subscriptionRevision());
+                case "predecessor","successor","receipt","ready","finished","forgedVersion","wrongFingerprint"->h.attempt=new SubscriptionConfirmationAttempt(a.id(),a.chain(),bad.equals("predecessor")?UUID.randomUUID():null,a.keyVersion(),a.issuedAt(),a.expiresAt(),bad.equals("ready")?SubscriptionConfirmationAttempt.State.READY:bad.equals("finished")?SubscriptionConfirmationAttempt.State.UNKNOWN:a.state(),a.confirmKey(),a.tokenDigest(),bad.equals("wrongFingerprint")?"e".repeat(64):a.fingerprint(),bad.equals("receipt")?new SubscriptionConfirmationAttempt.Receipt("req_fake","ch_fake","generic_decline"):null,bad.equals("successor")?UUID.randomUUID():null,null,bad.equals("forgedVersion")?2:a.version());
+                case "wrongLookup"->lookup=new SubscriptionProviderModels.Lookup(lookup.account(),lookup.subscriptionId(),"sub_other",lookup.providerOperationKey());case "foreignScope"->h.revoked=true;default->{}
+            }
+            var supplied=bad.equals("forgedAttempt")?new SubscriptionConfirmationAttempt(UUID.randomUUID(),a.chain(),null,a.keyVersion(),a.issuedAt(),a.expiresAt(),a.state(),a.confirmKey(),a.tokenDigest(),a.fingerprint(),null,null,null,a.version()):h.attempt;
+            assertThat(h.provider().confirm(lookup,h.root,supplied,token).state()).isEqualTo(SubscriptionConfirmationAttempt.State.UNKNOWN);assertThat(h.f.f.http.calls).isEmpty();
         }
-        var supplied=bad.equals("forgedAttempt")?new SubscriptionConfirmationAttempt(UUID.randomUUID(),a.chain(),null,a.keyVersion(),a.issuedAt(),a.expiresAt(),a.state(),a.confirmKey(),a.tokenDigest(),a.fingerprint(),null,null,null,a.version()):h.attempt;
-        assertThat(h.provider().confirm(lookup,h.root,supplied,token).state()).isEqualTo(SubscriptionConfirmationAttempt.State.UNKNOWN);assertThat(h.f.f.http.calls).isEmpty();
     }
     @Test void directAmbientTransactionRefusesBothIoEntriesAndActionBeforeCollaborators(){
         var h=new Harness();h.root();h.reserve(true);var provider=h.provider();int guards=h.guards;
@@ -358,21 +436,27 @@ class StripeBillingOwnedConfirmationSdkTest {
     }
     @ParameterizedTest @ValueSource(strings={"receipt","created","item","period","owner","clock"})
     void differentExpectedReceiptNeverGainsAuthority(String bad){
-        var h=new Harness();h.root();h.reserve(true);var r=h.receipt;var i=r.intent();
-        if(bad.equals("owner")||bad.equals("clock")){var c=i.clock();var o=c.owner();o=new ClockOwner(bad.equals("owner")?UUID.randomUUID():o.intent(),o.run(),o.account(),o.site(),o.customer(),o.externalAccount(),o.credentialsRef(),o.apiVersion(),bad.equals("clock")?o.initialFrozenTime()+1:o.initialFrozenTime(),o.name(),o.createKey(),o.createFingerprint(),o.admittedAt());c=new ReadyClock(o,c.creationOperation(),c.reference(),bad.equals("clock")?c.frozenTime()+1:c.frozenTime(),c.providerCreated(),c.providerDeletesAfter(),c.observedAt(),c.customerFingerprint());i=new OwnedClockSubscription(i.id(),c,i.customerBinding(),i.customerCreationOperation(),i.customerReference(),i.subscription(),i.createOperation(),i.operationKey(),i.requestFingerprint(),i.expectedRevision(),i.policyVersion(),i.terms(),i.priceReference(),i.productReference(),i.fingerprint(),i.admittedAt());}
-        var changed=new OwnedClockSubscriptionReceipt(i,bad.equals("receipt")?UUID.randomUUID():r.providerOperation(),r.reference(),bad.equals("created")?r.providerCreated()+1:r.providerCreated(),bad.equals("item")?"si_other":r.itemReference(),r.periodStart(),bad.equals("period")?r.periodEnd()+1:r.periodEnd(),r.acknowledgedAt());
-        var provider=new StripeBillingClockConfirmationAdapter(changed,h.scope,h.phases,h.roots,h.confirmations,h.tokens,h.f.f.credentials,h.f.f.clients,h.f.f.verification,h.clock);
-        assertThat(provider.confirm(h.f.lookup(),h.root,h.attempt,"ctoken_INERT").state()).isEqualTo(SubscriptionConfirmationAttempt.State.UNKNOWN);assertThat(h.f.f.http.calls).isEmpty();
+        for(var representation:List.of("exact","omitted","null")){
+            var h=new Harness();h.f.flatSubscription(representation);h.root();h.reserve(true);var r=h.receipt;var i=r.intent();
+            if(bad.equals("owner")||bad.equals("clock")){var c=i.clock();var o=c.owner();o=new ClockOwner(bad.equals("owner")?UUID.randomUUID():o.intent(),o.run(),o.account(),o.site(),o.customer(),o.externalAccount(),o.credentialsRef(),o.apiVersion(),bad.equals("clock")?o.initialFrozenTime()+1:o.initialFrozenTime(),o.name(),o.createKey(),o.createFingerprint(),o.admittedAt());c=new ReadyClock(o,c.creationOperation(),c.reference(),bad.equals("clock")?c.frozenTime()+1:c.frozenTime(),c.providerCreated(),c.providerDeletesAfter(),c.observedAt(),c.customerFingerprint());i=new OwnedClockSubscription(i.id(),c,i.customerBinding(),i.customerCreationOperation(),i.customerReference(),i.subscription(),i.createOperation(),i.operationKey(),i.requestFingerprint(),i.expectedRevision(),i.policyVersion(),i.terms(),i.priceReference(),i.productReference(),i.fingerprint(),i.admittedAt());}
+            var changed=new OwnedClockSubscriptionReceipt(i,bad.equals("receipt")?UUID.randomUUID():r.providerOperation(),r.reference(),bad.equals("created")?r.providerCreated()+1:r.providerCreated(),bad.equals("item")?"si_other":r.itemReference(),r.periodStart(),bad.equals("period")?r.periodEnd()+1:r.periodEnd(),r.acknowledgedAt());
+            var provider=new StripeBillingClockConfirmationAdapter(changed,h.scope,h.phases,h.roots,h.confirmations,h.tokens,h.f.f.credentials,h.f.f.clients,h.f.f.verification,h.clock);
+            assertThat(provider.confirm(h.f.lookup(),h.root,h.attempt,"ctoken_INERT").state()).isEqualTo(SubscriptionConfirmationAttempt.State.UNKNOWN);assertThat(h.f.f.http.calls).isEmpty();
+        }
     }
     @ParameterizedTest @ValueSource(strings={"reserved","consumed","expired","unknown"})
     void anyLifetimeOwnedRootPreventsNewPermission(String kind){
-        var h=new Harness();h.root();if(!kind.equals("expired"))h.reserve(!kind.equals("reserved"));if(kind.equals("unknown"))h.attempt=h.attempt.finish(SubscriptionConfirmationAttempt.State.UNKNOWN,null);
-        assertThat(h.action().nextAction(h.scope)).isNull();assertThat(h.inserts).isZero();assertThat(h.f.f.http.calls).isEmpty();
+        for(var representation:List.of("exact","omitted","null")){
+            var h=new Harness();h.f.flatSubscription(representation);h.root();if(!kind.equals("expired"))h.reserve(!kind.equals("reserved"));if(kind.equals("unknown"))h.attempt=h.attempt.finish(SubscriptionConfirmationAttempt.State.UNKNOWN,null);
+            assertThat(h.action().nextAction(h.scope)).isNull();assertThat(h.inserts).isZero();assertThat(h.f.f.http.calls).isEmpty();
+        }
     }
     @ParameterizedTest @ValueSource(strings={"revoke","policy","operation","subscription"})
     void issuanceRechecksActualLockedStateAfterGraphBeforeInsert(String bad){
-        var h=new Harness();h.graph();after(h,9,()->{switch(bad){case "revoke"->h.revoked=true;case "policy"->h.drift=true;case "operation"->{var o=h.f.operation;h.f.operation=new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),o.subscriptionId(),o.kind(),o.status(),o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),o.providerReference(),null,o.createdAt(),o.updatedAt(),o.version()+1);}case "subscription"->{var s=h.f.local;h.f.local=new Subscription(s.id(),s.siteId(),s.customerId(),s.productId(),s.paymentAccountId(),s.billingPrice(),s.entitledPrice(),s.billingStatus(),s.providerReference(),s.currentPeriod(),s.paidThrough(),s.trial(),s.cancellation(),s.pendingChange(),s.debt(),s.terminalReason(),s.revision()+1,s.createdAt(),s.updatedAt(),s.lastReconciledAt());}}});
-        assertThatThrownBy(()->h.action().nextAction(h.scope)).isInstanceOf(RuntimeException.class);assertThat(h.inserts).isZero();assertThat(h.root).isNull();
+        for(var representation:List.of("exact","omitted","null")){
+            var h=new Harness();h.f.flatSubscription(representation);h.graph();after(h,9,()->{switch(bad){case "revoke"->h.revoked=true;case "policy"->h.drift=true;case "operation"->{var o=h.f.operation;h.f.operation=new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),o.subscriptionId(),o.kind(),o.status(),o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),o.providerReference(),null,o.createdAt(),o.updatedAt(),o.version()+1);}case "subscription"->{var s=h.f.local;h.f.local=new Subscription(s.id(),s.siteId(),s.customerId(),s.productId(),s.paymentAccountId(),s.billingPrice(),s.entitledPrice(),s.billingStatus(),s.providerReference(),s.currentPeriod(),s.paidThrough(),s.trial(),s.cancellation(),s.pendingChange(),s.debt(),s.terminalReason(),s.revision()+1,s.createdAt(),s.updatedAt(),s.lastReconciledAt());}}});
+            assertThatThrownBy(()->h.action().nextAction(h.scope)).isInstanceOf(RuntimeException.class);assertThat(h.inserts).isZero();assertThat(h.root).isNull();
+        }
     }
     @Test void ordinaryMapperRetainsFixedProofAndLargerSecretWithOpaqueConfirmationMethod(){
         var f=new StripeBillingOwnedSubscriptionFixture();prepareOpen(f);f.customer.remove("test_clock");f.remote.remove("test_clock");f.invoice.remove("test_clock");f.remote.addProperty("created",f.utc.getEpochSecond());f.pi.remove("confirmation_method");f.pi.addProperty("client_secret","pi_owned_secret_"+"x".repeat(600));queueGraph(f);

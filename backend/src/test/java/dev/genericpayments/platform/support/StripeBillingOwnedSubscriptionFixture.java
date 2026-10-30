@@ -63,6 +63,15 @@ public final class StripeBillingOwnedSubscriptionFixture {
            "paid":true,"captured":true,"status":"succeeded","payment_method_details":{"type":"card"},"amount_refunded":0,"refunded":false}
           """);
     }
+    /** Mutate only the duplicate flat representation; the authoritative nested graph is unchanged. */
+    public void flatSubscription(String representation){
+        switch(representation){
+            case "exact"->line.addProperty("subscription","sub_owned");
+            case "omitted"->line.remove("subscription");
+            case "null"->line.add("subscription",JsonNull.INSTANCE);
+            default->throw new IllegalArgumentException("unknown flat representation");
+        }
+    }
     public CustomerBinding binding(){return new CustomerBinding(bindingId,f.account.id(),f.site,f.customer,"cus_owned",customerStep,0);}
     public Command command(){return new Command(f.account,operation,terms,null,null,null,null,true,false);}
     public Lookup lookup(){return new Lookup(f.account,subscriptionId,"sub_owned",intent.operationKey());}
