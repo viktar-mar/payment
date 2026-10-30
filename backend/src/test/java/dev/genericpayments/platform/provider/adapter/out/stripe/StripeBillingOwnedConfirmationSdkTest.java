@@ -95,6 +95,99 @@ class StripeBillingOwnedConfirmationSdkTest {
         assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH");
         assertThat(h.f.f.verifications).isEqualTo(1);assertThat(h.f.f.http.calls).isEmpty();assertThat(h.inserts).isZero();
     }
+    @ParameterizedTest @ValueSource(strings={"missingLegacy","nullLegacy","foreignLegacy","missingNested","nullNested","foreignNested","nullParent","wrongParentType","missingProration"})
+    void ownedActionLineGuardReportsAssociationWithoutIssuingRoot(String variant){
+        var h=new Harness();prepareOpen(h.f);var line=h.f.line;var detail=line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details");
+        switch(variant){
+            case "missingLegacy"->line.remove("subscription");case "nullLegacy"->line.add("subscription",com.google.gson.JsonNull.INSTANCE);case "foreignLegacy"->line.addProperty("subscription","sub_foreign");
+            case "missingNested"->detail.remove("subscription");case "nullNested"->detail.add("subscription",com.google.gson.JsonNull.INSTANCE);case "foreignNested"->detail.addProperty("subscription","sub_foreign");
+            case "nullParent"->line.add("parent",com.google.gson.JsonNull.INSTANCE);case "wrongParentType"->line.getAsJsonObject("parent").addProperty("type","invoice_item_details");case "missingProration"->detail.remove("proration");
+        }
+        queueActionGraph(h);assertActionGraphRefusal(h,"ACTION_GRAPH_LINE_ASSOCIATION",5);
+    }
+    @ParameterizedTest @ValueSource(strings={"nullEndingBalance","missingEndingBalance","nonzeroEndingBalance","foreignLineAmount","offStripePaid","paymentType"})
+    void ownedActionUnsupportedInvoiceReportsSettlementWithoutIssuingRoot(String variant){
+        var h=new Harness();prepareOpen(h.f);
+        switch(variant){
+            case "nullEndingBalance"->h.f.invoice.add("ending_balance",com.google.gson.JsonNull.INSTANCE);case "missingEndingBalance"->h.f.invoice.remove("ending_balance");case "nonzeroEndingBalance"->h.f.invoice.addProperty("ending_balance",1);
+            case "foreignLineAmount"->h.f.line.addProperty("amount",999);case "offStripePaid"->h.f.invoice.addProperty("amount_paid_off_stripe",1);case "paymentType"->h.f.allocation.getAsJsonObject("payment").addProperty("type","payment_record");
+        }
+        queueActionGraph(h);assertActionGraphRefusal(h,"ACTION_GRAPH_INVOICE_SETTLEMENT",6);
+    }
+    @ParameterizedTest @ValueSource(strings={"nullPaid","missingPaid","positivePaid","negativePaid","notDefault","nullDefault","wrongRequested","canceled"})
+    void ownedActionAllocationGuardReportsAllocationBeforeIntentRead(String variant){
+        var h=new Harness();prepareOpen(h.f);
+        switch(variant){
+            case "nullPaid"->h.f.allocation.add("amount_paid",com.google.gson.JsonNull.INSTANCE);case "missingPaid"->h.f.allocation.remove("amount_paid");case "positivePaid"->h.f.allocation.addProperty("amount_paid",1);case "negativePaid"->h.f.allocation.addProperty("amount_paid",-1);
+            case "notDefault"->h.f.allocation.addProperty("is_default",false);case "nullDefault"->h.f.allocation.add("is_default",com.google.gson.JsonNull.INSTANCE);case "wrongRequested"->h.f.allocation.addProperty("amount_requested",999);case "canceled"->h.f.allocation.addProperty("status","canceled");
+        }
+        queueActionGraph(h);assertActionGraphRefusal(h,"ACTION_GRAPH_PAYMENT_ALLOCATION",6);
+    }
+    @ParameterizedTest @ValueSource(strings={"customer","invoiceOwner","allocationOwner","lineItem","period","piAmount","piCustomer","reverse"})
+    void otherOwnedGraphGuardsRetainGenericFailure(String variant){
+        var h=new Harness();prepareOpen(h.f);int reads=6;
+        switch(variant){
+            case "customer"->{h.f.customer.addProperty("id","cus_foreign");reads=2;}
+            case "invoiceOwner"->{h.f.invoice.getAsJsonObject("parent").getAsJsonObject("subscription_details").addProperty("subscription","sub_foreign");reads=4;}
+            case "allocationOwner"->h.f.allocation.addProperty("invoice","in_foreign");case "lineItem"->{h.f.line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription_item","si_foreign");reads=5;}
+            case "period"->h.f.line.getAsJsonObject("period").addProperty("end",1702678401);
+            case "piAmount"->{h.f.pi.addProperty("amount",999);reads=7;}case "piCustomer"->{h.f.pi.addProperty("customer","cus_foreign");reads=7;}
+            case "reverse"->reads=8;
+        }
+        h.f.f.http.reply(h.f.f.clockJson());
+        h.f.f.http.reply(h.f.customer.toString());h.f.f.http.reply(h.f.remote.toString());h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.invoice));h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.line));h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.allocation));h.f.f.http.reply(h.f.pi.toString());
+        var reverse=h.f.allocation.deepCopy();if(variant.equals("reverse"))reverse.addProperty("id","inpay_foreign");h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(reverse));h.f.f.http.reply(h.f.f.clockJson());
+        assertActionGraphRefusal(h,"ACTION_GRAPH",reads);
+    }
+    @Test void detailedGraphFailureRemainsFirstThroughGenericFailureSuccessAndDuplicateRefusal(){
+        var h=new Harness();var adapter=h.action();prepareOpen(h.f);h.f.allocation.remove("amount_paid");queueActionGraph(h);
+        assertThat(catchThrowable(()->adapter.nextAction(h.scope))).isInstanceOf(RuntimeException.class);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH_PAYMENT_ALLOCATION");
+        h.f.f.http.replies.clear();h.graph();after(h,2,()->{throw new UnreadableFailure();});
+        assertThat(catchThrowable(()->adapter.nextAction(h.scope))).isInstanceOf(RuntimeException.class);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH_PAYMENT_ALLOCATION");
+        h.f.f.http.replies.clear();h.graph();assertThat(adapter.nextAction(h.scope)).isNotNull();h.reserve(false);int reads=h.f.f.http.calls.size();
+        assertThat(adapter.nextAction(h.scope)).isNull();assertThat(h.inserts).isEqualTo(1);assertThat(h.f.f.http.calls).hasSize(reads);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH_PAYMENT_ALLOCATION");
+        assertThat(h.f.f.http.calls).allMatch(c->c.method().name().equals("GET"));
+    }
+    @Test void concurrentDetailedAndGenericFailuresKeepCallLocalGuardProvenance()throws Exception{
+        var detailed=new Harness();var generic=new Harness();prepareOpen(detailed.f);detailed.f.line.remove("subscription");queueActionGraph(detailed);generic.graph();
+        var detailedEntered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        after(detailed,5,()->{detailedEntered.countDown();awaitRelease(release);});after(generic,2,()->{throw new UnreadableFailure();});
+        var detailedAdapter=detailed.action();var genericAdapter=generic.action();
+        try(var executor=java.util.concurrent.Executors.newFixedThreadPool(2)){
+            var pending=executor.submit(()->catchThrowable(()->detailedAdapter.nextAction(detailed.scope)));
+            assertThat(detailedEntered.await(5,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            try{assertThat(executor.submit(()->catchThrowable(()->genericAdapter.nextAction(generic.scope))).get(5,java.util.concurrent.TimeUnit.SECONDS)).isInstanceOf(RuntimeException.class);}
+            finally{release.countDown();}
+            assertThat(pending.get(5,java.util.concurrent.TimeUnit.SECONDS)).isInstanceOf(RuntimeException.class);
+        }
+        assertThat(selectionFailureStage(detailedAdapter)).isEqualTo("ACTION_GRAPH_LINE_ASSOCIATION");assertThat(selectionFailureStage(genericAdapter)).isEqualTo("ACTION_GRAPH");
+        assertThat(detailed.root).isNull();assertThat(generic.root).isNull();assertThat(detailed.inserts+generic.inserts).isZero();
+        assertThat(detailed.f.f.http.calls).allMatch(c->c.method().name().equals("GET"));assertThat(generic.f.f.http.calls).allMatch(c->c.method().name().equals("GET"));
+    }
+    @Test void reentrantFailureCannotLendItsTrustedGuardToTheCallingAction(){
+        var outer=new Harness();var inner=new Harness();var outerAdapter=outer.action();var innerAdapter=inner.action();
+        outer.graph();prepareOpen(inner.f);inner.f.allocation.remove("amount_paid");queueActionGraph(inner);
+        after(outer,2,()->{
+            assertThat(catchThrowable(()->innerAdapter.nextAction(inner.scope))).isInstanceOf(RuntimeException.class);
+            throw new UnreadableFailure();
+        });
+        assertThat(catchThrowable(()->outerAdapter.nextAction(outer.scope))).isInstanceOf(RuntimeException.class);
+        assertThat(selectionFailureStage(innerAdapter)).isEqualTo("ACTION_GRAPH_PAYMENT_ALLOCATION");
+        assertThat(selectionFailureStage(outerAdapter)).isEqualTo("ACTION_GRAPH");
+        assertThat(outer.root).isNull();assertThat(inner.root).isNull();assertThat(outer.inserts+inner.inserts).isZero();
+        assertThat(outer.f.f.http.calls).hasSize(2).allMatch(c->c.method().name().equals("GET"));
+        assertThat(inner.f.f.http.calls).hasSize(6).allMatch(c->c.method().name().equals("GET"));
+    }
+    static void queueActionGraph(Harness h){h.f.f.http.reply(h.f.f.clockJson());queueGraph(h.f);h.f.f.http.reply(h.f.f.clockJson());}
+    static void assertActionGraphRefusal(Harness h,String expected,int reads){
+        var adapter=h.action();var failure=catchThrowable(()->adapter.nextAction(h.scope));
+        assertThat(failure).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
+        assertThat(selectionFailureStage(adapter)).isEqualTo(expected);assertThat(h.root).isNull();assertThat(h.inserts).isZero();
+        assertThat(h.f.f.http.calls).hasSize(reads).allMatch(c->c.method().name().equals("GET"));
+    }
     @ParameterizedTest @ValueSource(strings={"locked","reserve"})
     void actionReservationFailuresKeepIdentityAfterFullGraphWithoutIssuingRoot(String boundary){
         var h=new Harness();var adapter=h.action();var failure=new UnreadableFailure();h.graph();

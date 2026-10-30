@@ -123,7 +123,7 @@ public final class OwnedBillingFirstPaymentScenario implements OwnedBillingFirst
     }
     /** Adapter metadata refines only the selection boundary; no external detail becomes a stage. */
     static String actionFailureStage(String checkpoint,String adapterStage) {
-        if("ACTION_SELECT".equals(checkpoint)&&adapterStage!=null&&Set.of("ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_RESERVATION").contains(adapterStage))return adapterStage;
+        if("ACTION_SELECT".equals(checkpoint)&&adapterStage!=null&&Set.of("ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_GRAPH_LINE_ASSOCIATION","ACTION_GRAPH_INVOICE_SETTLEMENT","ACTION_GRAPH_PAYMENT_ALLOCATION","ACTION_RESERVATION").contains(adapterStage))return adapterStage;
         return checkpoint;
     }
     @Override public synchronized JsonObject confirm(JsonObject request) {

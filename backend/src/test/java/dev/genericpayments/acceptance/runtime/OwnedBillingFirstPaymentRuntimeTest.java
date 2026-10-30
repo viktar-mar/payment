@@ -295,7 +295,7 @@ class OwnedBillingFirstPaymentRuntimeTest {
     }
     // A dropped mapping or widened metadata allowlist changes the actual Handler wire output.
     @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(strings={"ACTION_SCOPE","ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_RESERVATION","ACTION_RESULT","ACTION_BINDING"})
+    @org.junit.jupiter.params.provider.ValueSource(strings={"ACTION_SCOPE","ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_GRAPH_LINE_ASSOCIATION","ACTION_GRAPH_INVOICE_SETTLEMENT","ACTION_GRAPH_PAYMENT_ALLOCATION","ACTION_RESERVATION","ACTION_RESULT","ACTION_BINDING"})
     void actionFailureStagesReachHandlerBeforeAbort(String stage) throws Exception {
         var operations=new InertOperations(){public String prepareFailureStage(){return aborted?"REQUEST":stage;}};
         operations.failure=true;
@@ -307,13 +307,13 @@ class OwnedBillingFirstPaymentRuntimeTest {
     }
     @Test void scenarioMapsOnlyAdapterSelectionMetadataAndKeepsFallback() throws Exception {
         var mapping=OwnedBillingFirstPaymentScenario.class.getDeclaredMethod("actionFailureStage",String.class,String.class);
-        for(String stage:List.of("ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_RESERVATION")) {
+        for(String stage:List.of("ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_GRAPH_LINE_ASSOCIATION","ACTION_GRAPH_INVOICE_SETTLEMENT","ACTION_GRAPH_PAYMENT_ALLOCATION","ACTION_RESERVATION")) {
             assertThat(mapping.invoke(null,"ACTION_SELECT",stage)).isEqualTo(stage);
             // Even recognized stale adapter metadata cannot relabel the surrounding scenario boundary.
             for(String checkpoint:List.of("ACTION_SCOPE","ACTION_RESULT","ACTION_BINDING","RECEIPT","REQUEST"))
                 assertThat(mapping.invoke(null,checkpoint,stage)).isEqualTo(checkpoint);
         }
-        for(String stage:Arrays.asList(null,"","ACTION_SCOPE","ACTION_RESULT","ACTION_BINDING","ACTION_SELECT","sk_test_SECRET","ACTION_GRAPH\n"))
+        for(String stage:Arrays.asList(null,"","ACTION_SCOPE","ACTION_RESULT","ACTION_BINDING","ACTION_SELECT","sk_test_SECRET","ACTION_GRAPH\n","ACTION_GRAPH_LINE_ASSOCIATION_FOREIGN","ACTION_GRAPH_INVOICE_SETTLEMENT\n","PREPARE_SERVER_ACTION_GRAPH_PAYMENT_ALLOCATION"))
             assertThat(mapping.invoke(null,"ACTION_SELECT",stage)).isEqualTo("ACTION_SELECT");
     }
     @Test void unknownDefaultAndThrowingStageProvidersCannotLeakOrInspectExceptions() throws Exception {
@@ -327,6 +327,16 @@ class OwnedBillingFirstPaymentRuntimeTest {
             assertThat(exchange.code).isEqualTo(400);
             assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\",\"stage\":\"UNCLASSIFIED\"}");
         }
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"ACTION_GRAPH_LINE_ASSOCIATION_FOREIGN","ACTION_GRAPH_INVOICE_SETTLEMENT\n","PREPARE_SERVER_ACTION_GRAPH_PAYMENT_ALLOCATION"})
+    void forgedActionGraphStageCannotEnterHandlerEnvelope(String stage) throws Exception {
+        var operations=new InertOperations(){public String prepareFailureStage(){return stage;}};operations.failure=true;
+        var exchange=new MemoryExchange("POST","/initial-payment/prepare",prepareRequest().toString(),true);
+        new OwnedBillingFirstPaymentRuntime.Handler(operations,"q".repeat(43)).handle(exchange);
+        assertThat(exchange.code).isEqualTo(400);
+        assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\",\"stage\":\"UNCLASSIFIED\"}");
+        assertThat(operations.calls).isEqualTo(1);assertThat(operations.aborted).isTrue();
     }
     @Test void authenticatedPrepareParsingFailureIsRequestBeforeOperationsOrStageProvider() throws Exception {
         for(String body:List.of("{}","{\"run_id\":\"a\",\"run_id\":\"b\"}","{", " ".repeat(16385))) {

@@ -117,14 +117,28 @@ public final class StripeBillingSnapshotMapper {
             var binding=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding(proof.step().id(),proof.operation().providerOperationKey(),StripeBillingGrantTokens.hash(canonical),proof.subscription().providerReference(),proof.customer().providerReference(),i.reference(),a.getId(),pi.getId(),proof instanceof StripeBillingOwnership.OriginalRecovery?"recovery-v1":proof instanceof StripeBillingOwnership.OriginalChange?"change-v1":proof instanceof StripeBillingOwnership.OriginalResume?"resume-v1":"payment-v1",null);
             return new PaymentAction(binding,secret,pi.getAmount(),pi.getCurrency());
     }
+    /** Closed guard provenance for one owned action read; never inferred from exceptions. */
+    enum OwnedActionGuard { LINE_ASSOCIATION, INVOICE_SETTLEMENT, PAYMENT_ALLOCATION }
+    static final class OwnedActionFailure {
+        private OwnedActionGuard guard;
+        OwnedActionGuard guard(){return guard;}
+        private void require(boolean valid,OwnedActionGuard boundary){
+            if(!valid){if(guard==null)guard=boundary;throw mismatch();}
+        }
+    }
     /** Typed original-only entry. This descriptive receipt must be independently authorized by the caller. */
     public static PaymentAction retrieveOwnedPaymentAction(StripeClient client,Ownership owner,OwnedInitial original,Instant at){
+        return retrieveOwnedPaymentAction(client,owner,original,at,null);
+    }
+    static PaymentAction retrieveOwnedPaymentAction(StripeClient client,Ownership owner,OwnedInitial original,Instant at,OwnedActionFailure failure){
         try{
-            var r=new Read(client,owner,at,Objects.requireNonNull(original));var snapshot=r.snapshot();
+            var r=new Read(client,owner,at,Objects.requireNonNull(original),failure);var snapshot=r.snapshot();
             var receipt=original.receipt();var intent=receipt.intent();
             require(snapshot.status()==Subscription.Status.INCOMPLETE&&snapshot.invoices().size()==1);
             var invoice=snapshot.invoices().getFirst();
-            require(invoice.kind()==BillingRecord.Kind.INITIAL&&invoice.settlement()==SettlementKind.OPEN&&invoice.price().equals(intent.terms())
+            require(invoice.kind()==BillingRecord.Kind.INITIAL);
+            r.requireOwned(invoice.settlement()==SettlementKind.OPEN,OwnedActionGuard.INVOICE_SETTLEMENT);
+            require(invoice.price().equals(intent.terms())
                 &&invoice.period().equals(snapshot.period())&&invoice.period().start().getEpochSecond()==receipt.periodStart()&&invoice.period().end().getEpochSecond()==receipt.periodEnd());
             var graph=paymentGraph(r,invoice,intent.customerReference());var pi=graph.intent();
             require("requires_payment_method".equals(pi.getStatus())&&"automatic".equals(pi.getConfirmationMethod())&&pi.getLatestCharge()==null&&graph.secret().length()<=512);
@@ -143,7 +157,7 @@ public final class StripeBillingSnapshotMapper {
             require("open".equals(invoice.getStatus()));
 
             var allocations=r.sourceAllocations.get(i.reference());require(allocations!=null&&allocations.size()==1);
-            var a=allocations.getFirst();long due=i.amountDueMinor();require("open".equals(a.getStatus())&&Boolean.TRUE.equals(a.getIsDefault())&&Objects.equals(due,a.getAmountRequested())&&zeros(a.getAmountPaid())&&a.getPayment()!=null&&"payment_intent".equals(a.getPayment().getType()));
+            var a=allocations.getFirst();long due=i.amountDueMinor();r.requireOwned("open".equals(a.getStatus())&&Boolean.TRUE.equals(a.getIsDefault())&&Objects.equals(due,a.getAmountRequested())&&zeros(a.getAmountPaid())&&a.getPayment()!=null&&"payment_intent".equals(a.getPayment().getType()),OwnedActionGuard.PAYMENT_ALLOCATION);
             ref(a.getPayment().getPaymentIntent(),"pi_");var pi=r.get(()->client.v1().paymentIntents().retrieve(a.getPayment().getPaymentIntent()));
             require(a.getPayment().getPaymentIntent().equals(pi.getId())&&"payment_intent".equals(pi.getObject())&&Boolean.FALSE.equals(pi.getLivemode())&&customer.equals(pi.getCustomer())
                 &&invoice.getCurrency().equals(pi.getCurrency())&&Objects.equals(due,pi.getAmount())&&zeros(pi.getAmountReceived())&&"automatic".equals(pi.getCaptureMethod())&&List.of("card").equals(pi.getPaymentMethodTypes())
@@ -183,7 +197,7 @@ public final class StripeBillingSnapshotMapper {
     @FunctionalInterface private interface Call<T>{T run() throws StripeException;}
     @FunctionalInterface private interface Page<T extends HasId>{StripeCollection<T> read(String after) throws StripeException;}
     private static final class Read {
-        final StripeClient client;final Ownership owner;final Instant at;final OwnedInitial original;
+        final StripeClient client;final Ownership owner;final Instant at;final OwnedInitial original;final OwnedActionFailure actionFailure;
         final Map<String,PublishedPrice> prices=new HashMap<>();final Set<String> cashIds=new HashSet<>();
         com.stripe.model.Subscription remote;List<com.stripe.model.Invoice> sourceInvoices;
         final Map<String,List<InvoicePayment>> sourceAllocations=new HashMap<>();
@@ -192,7 +206,9 @@ public final class StripeBillingSnapshotMapper {
         int requests;
         TrialEvidence trialEvidence;
         Read(StripeClient client,Ownership owner,Instant at){this(client,owner,at,null);}
-        Read(StripeClient client,Ownership owner,Instant at,OwnedInitial original){this.client=Objects.requireNonNull(client);this.owner=Objects.requireNonNull(owner);this.at=Objects.requireNonNull(at);this.original=original;}
+        Read(StripeClient client,Ownership owner,Instant at,OwnedInitial original){this(client,owner,at,original,null);}
+        Read(StripeClient client,Ownership owner,Instant at,OwnedInitial original,OwnedActionFailure actionFailure){this.client=Objects.requireNonNull(client);this.owner=Objects.requireNonNull(owner);this.at=Objects.requireNonNull(at);this.original=original;this.actionFailure=actionFailure;}
+        void requireOwned(boolean valid,OwnedActionGuard boundary){if(actionFailure==null)require(valid);else actionFailure.require(valid,boundary);}
         boolean clockMatches(String clock){return Objects.equals(clock,original==null?null:original.receipt().intent().clock().reference());}
 
         <T> T get(Call<T> call) throws StripeException {require(++requests<=MAX_READS);return Objects.requireNonNull(call.run());}
@@ -268,8 +284,8 @@ public final class StripeBillingSnapshotMapper {
             if(owner.trial()!=null)require(trialEvidence!=null);
             if(original!=null){
                 require(normalized.size()==1);var initial=normalized.getFirst();
-                require(initial.kind()==BillingRecord.Kind.INITIAL&&initial.price().equals(original.receipt().intent().terms())&&initial.period().equals(period)
-                    &&(initial.settlement()==SettlementKind.OPEN||initial.settlement()==SettlementKind.CASH));
+                require(initial.kind()==BillingRecord.Kind.INITIAL&&initial.price().equals(original.receipt().intent().terms())&&initial.period().equals(period));
+                requireOwned(initial.settlement()==SettlementKind.OPEN||initial.settlement()==SettlementKind.CASH,OwnedActionGuard.INVOICE_SETTLEMENT);
             }
 
             Instant cancel=remote.getCancelAt()==null?null:Instant.ofEpochSecond(remote.getCancelAt());
@@ -320,11 +336,11 @@ public final class StripeBillingSnapshotMapper {
             if(!matching.isEmpty()){require(matching.size()==1);return proration(invoice,lines,matching.getFirst());}
             // Multi-line proration needs the original quote's exact debit/credit proof.
             require(lines.size()==1);var line=lines.getFirst();ref(line.getId(),"il_");
-            require("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&remote.getId().equals(line.getSubscription())&&Objects.equals(line.getQuantity(),1L)
-                &&line.getParent()!=null&&"subscription_item_details".equals(line.getParent().getType())&&line.getParent().getSubscriptionItemDetails()!=null);
+            requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&remote.getId().equals(line.getSubscription())&&Objects.equals(line.getQuantity(),1L)
+                &&line.getParent()!=null&&"subscription_item_details".equals(line.getParent().getType())&&line.getParent().getSubscriptionItemDetails()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             var detail=line.getParent().getSubscriptionItemDetails();
             var trialContext=owner.trial();boolean historicalTrial=trialContext!=null&&trialContext.request().verified()&&invoice.getId().equals(trialContext.request().invoice());
-            require(remote.getId().equals(detail.getSubscription())&&detail.getProration()!=null);
+            requireOwned(remote.getId().equals(detail.getSubscription())&&detail.getProration()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             require(line.getPricing()!=null&&"price_details".equals(line.getPricing().getType())&&line.getPricing().getPriceDetails()!=null);
             var pricing=line.getPricing().getPriceDetails();var mapped=prices.get(pricing.getPrice());require(mapped!=null&&mapped.providerProductReference().equals(pricing.getProduct()));
             currency(invoice.getCurrency(),mapped.terms());currency(line.getCurrency(),mapped.terms());

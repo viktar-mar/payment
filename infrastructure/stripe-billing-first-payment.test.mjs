@@ -43,7 +43,7 @@ test('cleanup follows shared bootstrap listener-stop prerequisite and remains bo
 test('real owner and private client compose exact Task1 prepare confirm observe DTOs',async()=>{const h=harness(),requests=[];h.bootstrap.withFirstPaymentRuntime=async cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});h.dependencies.createRuntime=args=>runtimeApi.createBillingFirstPaymentRuntime(args,{fetch:async(url,init)=>{requests.push({url,body:init.body&&JSON.parse(init.body)});let v;if(url.endsWith('/status'))v={phase:'NEW',code:'OK',run_id:id(1)};else if(url.endsWith('/prepare'))v=prepared();else if(url.endsWith('/confirm'))v=confirmed();else {const settled=await h.runtime.observe();v=Object.fromEntries(Object.entries(settled).filter(([k])=>!['protocol','attempt_id','state','retry_allowed','successor_attempt_id','next_action_allowed','expires_at'].includes(k)));}return new Response(JSON.stringify(v));}});const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);assert.equal((await owner.run(journey,limits())).initialAccepted,true);assert.deepEqual(requests.map(r=>r.url.split('/').at(-1)),['status','prepare','confirm','observe']);assert.equal(requests[1].body.customer_token,'customer-token');assert.equal(requests[2].body.idempotency_key,'sdk-original-key');assert.deepEqual(requests[3].body,{});});
 
 // Inert diagnostic contracts: Response is synthetic and every dependency is injected.
-const serverStages=['REQUEST','PREFLIGHT','CLOCK_ADMISSION','CLOCK_CREATE','CUSTOMER_CREATE','LOCAL_RESERVE','SUBSCRIPTION_CREATE','LOCAL_RECORD','RECEIPT','ACTION_SELECT','ACTION_SCOPE','ACTION_AUTHORITY','ACTION_VERIFICATION','ACTION_GRAPH','ACTION_RESERVATION','ACTION_RESULT','ACTION_BINDING','SESSION_SELECT','RESPONSE_BUILD','UNCLASSIFIED'];
+const serverStages=['REQUEST','PREFLIGHT','CLOCK_ADMISSION','CLOCK_CREATE','CUSTOMER_CREATE','LOCAL_RESERVE','SUBSCRIPTION_CREATE','LOCAL_RECORD','RECEIPT','ACTION_SELECT','ACTION_SCOPE','ACTION_AUTHORITY','ACTION_VERIFICATION','ACTION_GRAPH','ACTION_GRAPH_LINE_ASSOCIATION','ACTION_GRAPH_INVOICE_SETTLEMENT','ACTION_GRAPH_PAYMENT_ALLOCATION','ACTION_RESERVATION','ACTION_RESULT','ACTION_BINDING','SESSION_SELECT','RESPONSE_BUILD','UNCLASSIFIED'];
 async function diagnosticRuntime(reply,bootstrapChange){
  let calls=0;const bootstrap={withFirstPaymentRuntime:cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)})};
  const runtime=runtimeApi.createBillingFirstPaymentRuntime({configuration:options(),bootstrap},{fetch:async()=>{calls++;return calls===1?new Response(JSON.stringify({phase:'NEW',code:'OK',run_id:id(1)})):reply();}}),l=limits();
@@ -65,6 +65,22 @@ for(const [name,reply,expected]of [
  ['success-extra',()=>new Response(JSON.stringify({...prepared(),secret:'private-sentinel'})),'PREPARE_RESPONSE'],
  ...['{}','{','{"code":"INITIAL_PAYMENT_STOPPED","stage":"UNKNOWN"}','{"code":"INITIAL_PAYMENT_STOPPED","stage":"REQUEST","secret":"private-sentinel"}','{"code":"INITIAL_PAYMENT_STOPPED","stage":"REQUEST","stage":"PREFLIGHT"}','{"code":"INITIAL_PAYMENT_STOPPED","stage":"sk_test_secret"}','x'.repeat(16385)].map((body,i)=>['invalid-server-'+i,()=>new Response(body,{status:400}),'PREPARE_HTTP']),
 ])test('bounded fixed diagnostic '+name,async()=>{const f=await diagnosticRuntime(reply);let failure;try{await f.runtime.prepare(scope(),f.l);}catch(e){failure=e;}assert.equal(runtimeApi.billingFirstPaymentDiagnostic(failure),expected);assert.equal(f.calls(),2);});
+// The three graph stages use the existing strict error envelope only.
+for(const stage of ["ACTION_GRAPH_LINE_ASSOCIATION","ACTION_GRAPH_INVOICE_SETTLEMENT","ACTION_GRAPH_PAYMENT_ALLOCATION"])for(const [kind,body,status,expected]of [
+ ['extra',JSON.stringify({code:'INITIAL_PAYMENT_STOPPED',stage,secret:'private-sentinel'}),400,'PREPARE_HTTP'],
+ ['wrong-code',JSON.stringify({code:'OK',stage}),400,'PREPARE_HTTP'],
+ ['wrong-status',JSON.stringify({code:'INITIAL_PAYMENT_STOPPED',stage}),200,'PREPARE_RESPONSE'],
+ ['duplicate-stage','{"code":"INITIAL_PAYMENT_STOPPED","stage":"'+stage+'","stage":"ACTION_GRAPH"}',400,'PREPARE_HTTP'],
+ ['escaped-stage','{"code":"INITIAL_PAYMENT_STOPPED","stage":"\\u0041'+stage.slice(1)+'"}',400,'PREPARE_HTTP'],
+ ['forged-stage',JSON.stringify({code:'INITIAL_PAYMENT_STOPPED',stage:stage+'_FOREIGN'}),400,'PREPARE_HTTP'],
+ ['object-stage',JSON.stringify({code:'INITIAL_PAYMENT_STOPPED',stage:{stage}}),400,'PREPARE_HTTP'],
+])test('graph diagnostic rejects '+stage+' '+kind+' and preserves first failure',async()=>{
+ const f=await diagnosticRuntime(()=>new Response(body,{status}));
+ let first;try{await f.runtime.prepare(scope(),f.l);}catch(e){first=e;}
+ assert.equal(runtimeApi.billingFirstPaymentDiagnostic(first),expected);
+ let duplicate;try{await f.runtime.prepare(scope(),f.l);}catch(e){duplicate=e;}
+ assert.equal(runtimeApi.billingFirstPaymentDiagnostic(duplicate),expected);assert.equal(f.calls(),2);
+});
 test('prepare callback admission denial has authority diagnostic and no transport',async()=>{const f=await diagnosticRuntime(()=>{throw null;},async()=>false);let failure;try{await f.runtime.prepare(scope(),f.l);}catch(e){failure=e;}assert.equal(runtimeApi.billingFirstPaymentDiagnostic(failure),'PREPARE_AUTHORITY');assert.equal(f.calls(),1);});
 test('diagnostic lookup never inspects foreign rejection or forged fields',()=>{let reads=0;const foreign=new Proxy({diagnostic:'PREPARE_SERVER_REQUEST'},{get(){reads++;throw null;},getOwnPropertyDescriptor(){reads++;throw null;}});assert.equal(runtimeApi.billingFirstPaymentDiagnostic(foreign),null);assert.equal(runtimeApi.billingFirstPaymentDiagnostic(null),null);assert.equal(reads,0);});
 test('owner keeps first runtime diagnostic when browser catches and duplicate/cleanup fail',async()=>{
@@ -126,7 +142,7 @@ test('owner preserves request diagnostic when only prepare caller signal aborts'
  const pending=owner.run(async p=>{await p.prepare({token:'customer-token',origin:scope().endpoints.demo},'original-key',{...limits(),signal:controller.signal});},limits());pending.catch(()=>{});await entry;controller.abort();await assert.rejects(pending);assert.equal(owner.resources().diagnostic,'PREPARE_REQUEST');assert.equal(h.calls.filter(x=>x.startsWith('create-dispatch:')).length,1);
 });
 
-for(const stage of ["ACTION_SCOPE","ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_RESERVATION","ACTION_RESULT","ACTION_BINDING"])test('action boundary '+stage+' reaches closed formatter and parser once',async()=>{
+for(const stage of ["ACTION_SCOPE","ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_GRAPH_LINE_ASSOCIATION","ACTION_GRAPH_INVOICE_SETTLEMENT","ACTION_GRAPH_PAYMENT_ALLOCATION","ACTION_RESERVATION","ACTION_RESULT","ACTION_BINDING"])test('action boundary '+stage+' reaches closed formatter and parser once',async()=>{
  const h=harness();let requests=0;h.bootstrap.withFirstPaymentRuntime=cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});
  h.dependencies.createRuntime=args=>runtimeApi.createBillingFirstPaymentRuntime(args,{fetch:async url=>{requests++;return url.endsWith('/status')?new Response(JSON.stringify({phase:'NEW',code:'OK',run_id:id(1)})):new Response(JSON.stringify({code:'INITIAL_PAYMENT_STOPPED',stage}),{status:400});}});
  h.bootstrap.stop=async()=>{h.calls.push('stop');return false;};

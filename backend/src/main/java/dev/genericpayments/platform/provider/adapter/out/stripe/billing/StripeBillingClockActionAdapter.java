@@ -47,8 +47,16 @@ public final class StripeBillingClockActionAdapter {
             verification.verify(before.state().account());
             checkpoint="ACTION_GRAPH";
             final StripeBillingSnapshotMapper.PaymentAction graph;
-            try{graph=graph(clients.create(credentials.resolve(before.state().account())),before.state(),receipt,utc.instant());}
-            catch(com.stripe.exception.StripeException|RuntimeException unsafe){throw StripeBillingOwnership.mismatch();}
+            var graphFailure=new StripeBillingSnapshotMapper.OwnedActionFailure();
+            try{graph=graph(clients.create(credentials.resolve(before.state().account())),before.state(),receipt,utc.instant(),graphFailure);}
+            catch(com.stripe.exception.StripeException|RuntimeException unsafe){
+                if(graphFailure.guard()!=null)checkpoint=switch(graphFailure.guard()){
+                    case LINE_ASSOCIATION->"ACTION_GRAPH_LINE_ASSOCIATION";
+                    case INVOICE_SETTLEMENT->"ACTION_GRAPH_INVOICE_SETTLEMENT";
+                    case PAYMENT_ALLOCATION->"ACTION_GRAPH_PAYMENT_ALLOCATION";
+                };
+                throw StripeBillingOwnership.mismatch();
+            }
             checkpoint="ACTION_RESERVATION";
             return phases.confirmationLocked(scope.context(),scope.subscription(),scope.operation(),receipt,state->{
                 same(before.state(),state);if(roots.current(state.account().id(),state.operation().id()).isPresent())return null;

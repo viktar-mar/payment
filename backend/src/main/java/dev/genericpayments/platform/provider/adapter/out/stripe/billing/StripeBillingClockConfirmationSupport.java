@@ -17,12 +17,15 @@ final class StripeBillingClockConfirmationSupport {
     static void outside(){if(TransactionSynchronizationManager.isActualTransactionActive())throw StripeBillingOwnership.conflict();}
     static void require(boolean valid){if(!valid)throw StripeBillingOwnership.mismatch();}
     static StripeBillingSnapshotMapper.PaymentAction graph(StripeClient client,State state,OwnedClockSubscriptionReceipt receipt,Instant now)throws StripeException{
+        return graph(client,state,receipt,now,null);
+    }
+    static StripeBillingSnapshotMapper.PaymentAction graph(StripeClient client,State state,OwnedClockSubscriptionReceipt receipt,Instant now,StripeBillingSnapshotMapper.OwnedActionFailure failure)throws StripeException{
         ready(client,receipt.intent().clock());
         var i=receipt.intent();var o=i.clock().owner();
         var customer=new CustomerBinding(i.customerBinding(),o.account(),o.site(),o.customer(),i.customerReference(),i.customerCreationOperation(),0);
         var ownership=new StripeBillingSnapshotMapper.Ownership(state.account(),state.subscription(),customer,
             List.of(new StripeBillingSnapshotMapper.PublishedPrice(i.terms(),i.priceReference(),i.productReference())));
-        var graph=StripeBillingSnapshotMapper.retrieveOwnedPaymentAction(client,ownership,new StripeBillingSnapshotMapper.OwnedInitial(receipt),now);
+        var graph=StripeBillingSnapshotMapper.retrieveOwnedPaymentAction(client,ownership,new StripeBillingSnapshotMapper.OwnedInitial(receipt),now,failure);
         ready(client,i.clock());return graph;
     }
     static void ready(StripeClient client,ReadyClock expected)throws StripeException{

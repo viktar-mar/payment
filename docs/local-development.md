@@ -1547,23 +1547,54 @@ remains uncertain, consumed and permanently non-retryable; these source changes
 provide no recovery authority. Offline inert tests establish diagnostic handling
 only, with no native acceptance claim.
 
-Action selection now retains only four fixed adapter boundaries:
-`ACTION_AUTHORITY`, `ACTION_VERIFICATION`, `ACTION_GRAPH`, and
-`ACTION_RESERVATION`. The private prepare scenario also distinguishes
-`ACTION_SCOPE` before scope resolution, `ACTION_RESULT` after the adapter
-returns (including a denied null result), and `ACTION_BINDING` before binding
-lookup. Unknown or unavailable adapter metadata keeps the `ACTION_SELECT`
-fallback. These labels travel through the same exact code-plus-stage status-400
-envelope and one final `PREPARE_SERVER_<stage>` diagnostic; they add no fields,
-provider reads, financial authority, or retries. The first failure survives
-abort, cleanup, and duplicate refusal.
+Action selection retains the fixed adapter boundaries `ACTION_AUTHORITY`,
+`ACTION_VERIFICATION`, `ACTION_GRAPH`, and `ACTION_RESERVATION`. A failed
+owned action graph can refine `ACTION_GRAPH` to one of three closed labels:
 
-The native root cause remains unproved. Nullable `amount_paid` and an absent
-legacy line `subscription` are hypotheses only; financial validation is
-preserved. Every new label identifies a boundary only and establishes no provider
-POST, subscription outcome, or movement of money. No old or current
-DISPATCHING invocation may be retried, adopted, or reset. Native/full5B acceptance
-remains `NOT_ACCEPTED`; these offline changes include no new native attempt.
+- `ACTION_GRAPH_LINE_ASSOCIATION`: the existing invoice-line association guard
+  failed, including its top-level subscription, nested parent subscription/type,
+  or explicit proration-flag presence.
+- `ACTION_GRAPH_INVOICE_SETTLEMENT`: the existing normalized invoice
+  OPEN-or-CASH settlement guard or the later action-only OPEN requirement failed.
+- `ACTION_GRAPH_PAYMENT_ALLOCATION`: the existing open, default, requested
+  amount, explicit zero-paid and payment-type allocation guard failed before the
+  PaymentIntent read.
+
+These labels identify the actual failed compound guard, not a particular field
+or value. Other graph failures retain generic `ACTION_GRAPH`. Provenance is
+closed and local to one action call; exception messages, properties, causes,
+stacks and response bodies cannot supply it. Ordinary mapping and observation
+retain their existing behavior and every financial and ownership check remains
+strict.
+
+The private prepare scenario also distinguishes `ACTION_SCOPE` before scope
+resolution, `ACTION_RESULT` after the adapter returns (including a denied null
+result), and `ACTION_BINDING` before binding lookup. Unknown or unavailable
+adapter metadata keeps the `ACTION_SELECT` fallback. These labels travel through
+the same exact code-plus-stage status-400 envelope and one final
+`PREPARE_SERVER_<stage>` diagnostic; they add no DTO fields, provider reads,
+financial authority, or retries. Unknown stages, forged suffixes, extra fields,
+duplicate keys and escaped wire aliases remain rejected. The first failure
+survives abort, cleanup, and duplicate refusal, and the reporter suppresses
+unrecognized output and repeated final diagnostics.
+
+Source-only reproductions use official SDK JSON parsing with an in-memory
+transport: absent/null/foreign line associations, null/omitted/nonzero invoice
+`ending_balance`, null/omitted/nonzero allocation `amount_paid`, and existing
+amount/default/status/ownership attacks still refuse without producing an action
+or performing a provider mutation. A wrong allocation payment type can fail the
+earlier normalized settlement guard and therefore carry the settlement label.
+Explicit-zero, correctly associated successful graphs remain covered. Audited
+pure Java and injected Node/reporter tests establish guard provenance and bounded
+transport only.
+
+The native root cause remains unknown. These fixtures establish neither valid
+native semantics for nullable fields nor validity of an absent legacy line
+`subscription`; no null-to-zero policy or ownership relaxation was introduced.
+Every label establishes no provider POST, subscription outcome, or movement of
+money. No old or current DISPATCHING invocation may be retried, adopted, or reset.
+Native initial-payment acceptance and full 5B remain `NOT_ACCEPTED`; these
+offline changes include no new native attempt.
 
 
 The first-payment owner now lets the owned bootstrap stop use the remaining shared
