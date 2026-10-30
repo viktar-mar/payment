@@ -43,7 +43,7 @@ class OwnedBillingFirstPaymentScenarioIntegrationTest extends StripeBillingClock
 
     @BeforeEach void newScenario() {
         run=UUID.randomUUID();
-        jdbc.update("update payment_accounts set external_account_id='acct_1UPiMpELswAd8tpR' where id=?",billing.id().value());
+        jdbc.update("update payment_accounts set account_key='stripe-sandbox-default',external_account_id='acct_1UPiMpELswAd8tpR' where id=?",billing.id().value());
         billing=accounts.findById(billing.id()).orElseThrow();
         originalPrice=createCommand.priceId().value();var firstPrice=UUID.randomUUID();
         jdbc.update("insert into prices(id,site_id,product_id,price_key,price_version,price_type,amount_minor,currency,billing_interval,trial_days,trial_payment_method_policy,tax_mode,status,published_at,created_at,updated_at) select ?,site_id,product_id,'first-monthly',1,'SUBSCRIPTION',2000,'EUR','MONTH',0,'OPTIONAL_DURING_TRIAL','INCLUSIVE','PUBLISHED',now(),now(),now() from prices where id=?",firstPrice,originalPrice);
