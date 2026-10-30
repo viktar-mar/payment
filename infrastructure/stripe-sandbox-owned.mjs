@@ -1,3 +1,4 @@
+import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {billingBounded} from './stripe-billing-limits.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
 import {billingAcceptanceExcluded,billingAcceptanceOptIn,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
@@ -55,8 +56,9 @@ function portAvailable(port,host,dependencies) {
 export async function preflightOwnedSandbox(options,dependencies={}) {
   return preflight(options,dependencies,false);
 }
-export async function preflightOwnedBilling(options,dependencies={},limits) {
-  const selected=validateBillingAcceptanceOptions(options);
+export async function preflightOwnedBillingFirstPayment(options,dependencies={},limits){return preflightOwnedBilling(options,dependencies,limits,true);}
+export async function preflightOwnedBilling(options,dependencies={},limits,firstPayment=false) {
+  const selected=(firstPayment?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(options);
   if(!selected)return pending('OPT_IN','OPT_IN_REQUIRED');
   if(limits!==undefined){
     const raw=dependencies;
@@ -68,7 +70,7 @@ export async function preflightOwnedBilling(options,dependencies={},limits) {
       portAvailable:(port,host)=>billingBounded(limits,()=>raw.portAvailable?raw.portAvailable(port,host):portAvailable(port,host,raw),4000),
     };
   }
-  return preflight(selected,dependencies,'billing');
+  return preflight(selected,dependencies,firstPayment?'first-payment':'billing');
 }
 
 // This gate runs before consulting dependencies or any private configuration.
@@ -109,15 +111,15 @@ async function preflight(options,dependencies,diagnostic) {
   let phase='OPT_IN',code='OPT_IN_REQUIRED';
   try {
     const env=Object.getOwnPropertyDescriptor(options??{},'env')?.value;
-    if(diagnostic==='billing'?!billingAcceptanceOptIn(env):!billingAcceptanceExcluded(env))return pending(phase,code);
-    if(diagnostic!=='billing'&&!remainderExcluded(env))return pending(phase,code);
-    if(env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'||(diagnostic==='billing'?false:diagnostic==='payment'?!manualPaymentOptIn(env):diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'
+    if(diagnostic==='first-payment'?!billingFirstPaymentOptIn(env):diagnostic==='billing'?!billingAcceptanceOptIn(env):!billingAcceptanceExcluded(env))return pending(phase,code);
+    if(!['billing','first-payment'].includes(diagnostic)&&!remainderExcluded(env))return pending(phase,code);
+    if(env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'||(['billing','first-payment'].includes(diagnostic)?false:diagnostic==='payment'?!manualPaymentOptIn(env):diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'
       ||env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'||env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC==='true')))return pending(phase,code);
     phase='INPUTS';code='CONFIGURATION';
     if(![undefined,''].includes(env.DEBUG)||![undefined,''].includes(env.NODE_DEBUG)||![undefined,'','0'].includes(env.PWDEBUG))return pending(phase,code);
     const topology=validateFormDiagnosticTopology(options);if(!topology)return pending(phase,code);
     const {expectedSource,daemon,ports}=topology,url=new URL(daemon);
-    const selectedPorts=PORTS.map(name=>ports[name]);if(diagnostic==='manual'||diagnostic==='payment')selectedPorts.push(options.manualPort);
+    const selectedPorts=PORTS.map(name=>ports[name]);if(diagnostic==='first-payment')selectedPorts.push(options.controlPort);if(diagnostic==='manual'||diagnostic==='payment')selectedPorts.push(options.manualPort);
 
     phase='SOURCE';code='SOURCE_MISMATCH';
     const execute=dependencies.execute??executeFile;

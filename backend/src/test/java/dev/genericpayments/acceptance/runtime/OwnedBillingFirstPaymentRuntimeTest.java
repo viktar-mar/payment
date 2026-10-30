@@ -7,7 +7,16 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Pure tests: reflection keeps the first failing contract runnable before the launcher exists. */
 class OwnedBillingFirstPaymentRuntimeTest {
+    @Test void hostedScenarioNamesExplicitApplicationRootWithoutInitialization() throws Exception {
+        // Never initialize/instantiate this hosted fixture or ask Spring to bootstrap a context.
+        var scenario=Class.forName("dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentScenarioIntegrationTest",false,getClass().getClassLoader());
+        var configuration=scenario.getAnnotation(org.springframework.boot.test.context.SpringBootTest.class);
+        assertThat(configuration).isNotNull();
+        assertThat(configuration.classes()).extracting(Class::getName)
+            .containsExactly("dev.genericpayments.platform.PaymentPlatformApplication");
+    }
     static Map<String,String> environment() {
+
         var env=new HashMap<String,String>();
         env.put("PAYMENT_STRIPE_BILLING_FIRST_PAYMENT","true");
         env.put("PAYMENT_STRIPE_SANDBOX_ENABLED","true");

@@ -1,13 +1,13 @@
 import {resolve} from 'node:path';
 import {validateFormDiagnosticTopology} from './stripe-manual-form-options.mjs';
 const FLAG='PAYMENT_STRIPE_BILLING_ACCEPTANCE';
-const EXCLUDED=['ALLOW_TEST_OPERATIONS','FULL_RUN','OWNED_RUN','REMAINING_ONLY','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT','MANUAL_3DS','MANUAL_REFUND','MANUAL_REFUND_REMAINDER'].map(name=>'PAYMENT_STRIPE_SANDBOX_'+name);
+const EXCLUDED=['ALLOW_TEST_OPERATIONS','FULL_RUN','OWNED_RUN','REMAINING_ONLY','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT','MANUAL_3DS','MANUAL_REFUND','MANUAL_REFUND_REMAINDER'].map(name=>'PAYMENT_STRIPE_SANDBOX_'+name).concat('PAYMENT_STRIPE_BILLING_FIRST_PAYMENT');
 const OLD_RUNS=new Set(['031b5ae7-6603-4339-b1b3-77231291ff34','34941d87-12d3-4c74-8c5a-b62b7c914390']);
 function descriptors(value){if(!value||typeof value!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(value)))throw null;return Object.getOwnPropertyDescriptors(value);}
 function data(d,key){const p=d[key];if(!p?.enumerable||!Object.hasOwn(p,'value'))throw null;return p.value;}
 /** Reciprocal gate for legacy factories, including exotic legacy environment records. */
 export function billingAcceptanceExcluded(env){
-  try{if(!env||typeof env!=='object')return false;const d=Object.getOwnPropertyDescriptor(env,FLAG);return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(FLAG in env);}catch{return false;}
+  try{if(!env||typeof env!=='object')return false;return [FLAG,'PAYMENT_STRIPE_BILLING_FIRST_PAYMENT'].every(key=>{const d=Object.getOwnPropertyDescriptor(env,key);return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);});}catch{return false;}
 }
 export function billingAcceptanceOptIn(env){
   try{const d=descriptors(env);for(const key of [FLAG,'PAYMENT_STRIPE_SANDBOX_ENABLED',...EXCLUDED,'DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE'])if(d[key]&&(!d[key].enumerable||!Object.hasOwn(d[key],'value')))return false;

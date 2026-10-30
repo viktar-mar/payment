@@ -8,6 +8,10 @@ const canonical=p=>JSON.stringify(Object.fromEntries(Object.keys(p).sort().map(k
 /** Only sanitized proof flags and exact owned provider binding escape the in-memory SQL/callback comparison. */
 export function validateBillingEvidence(scope,row,inspection) {
  need(row&&['cash','journal','original','webhook'].every(k=>row.proof?.[k]===true));
+ return validateBillingCallbackEvidence(scope,row,inspection);
+}
+/** Shared strict payload/digest validation; each caller separately establishes its own financial proof. */
+export function validateBillingCallbackEvidence(scope,row,inspection) {
  need(Array.isArray(row.callbacks)&&row.callbacks.length>=2&&row.callbacks.length<=100&&inspection?.duplicates===0&&inspection.count===row.callbacks.length&&inspection.events?.length===row.callbacks.length);
  const ids=new Set();let payments=0,lifecycle=0;
  for(const e of row.callbacks){const p=e.payload;need(e.delivered===true&&billingUuid(e.id)&&!ids.has(e.id));ids.add(e.id);

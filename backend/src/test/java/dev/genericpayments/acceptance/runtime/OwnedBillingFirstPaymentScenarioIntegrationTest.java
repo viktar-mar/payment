@@ -4,6 +4,7 @@ import com.google.gson.*;
 import com.stripe.StripeClient;
 import com.stripe.net.*;
 import com.stripe.exception.*;
+import dev.genericpayments.platform.PaymentPlatformApplication;
 import dev.genericpayments.platform.provider.adapter.out.stripe.*;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.*;
 import dev.genericpayments.platform.provider.application.port.out.*;
@@ -21,10 +22,12 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.ApplicationContext;
 import static org.assertj.core.api.Assertions.*;
 
 /** Hosted only. The scenario under test creates all financial rows through real durable services. */
+@SpringBootTest(classes=PaymentPlatformApplication.class)
 class OwnedBillingFirstPaymentScenarioIntegrationTest extends StripeBillingClockConfirmationCompositionFixture {
     @Autowired ApplicationContext application;
     @Autowired EncryptedSecretPort encryption;
@@ -104,7 +107,8 @@ class OwnedBillingFirstPaymentScenarioIntegrationTest extends StripeBillingClock
     private void noMoney(){assertThat(count("payments")).isZero();assertThat(count("subscription_billing_records")).isZero();assertThat(count("payment_events")).isZero();assertThat(count("subscription_events")).isZero();assertThat(count("outbox_events")).isZero();}
     private long posts(){return requests.stream().filter(r->r.method().name().equals("POST")).count();}
 
-    @Test void actualSdkKeySelectsThenConfirmsOnceAndFreshCashProducesSignedDeliveredCallbacks() {
+    @Test void actualSdkKeySelectsThenConfirmsOnceAndFreshCashProducesSignedDeliveredCallbacks() throws Exception {
+        callbacks.configure(site.value(),"http://callback-receiver:8080/callback",true);
         prepare();assertThat(prepared.getAsJsonObject("action").get("secret").getAsString()).startsWith("bga1_");noMoney();
         assertThat(scenario.confirm(confirmRequest()).get("state").getAsString()).isEqualTo("OBSERVE");noMoney();
         paidGraph();var proof=scenario.observe();assertThat(proof.get("phase").getAsString()).isEqualTo("SETTLED_LOCAL");
@@ -123,6 +127,28 @@ class OwnedBillingFirstPaymentScenarioIntegrationTest extends StripeBillingClock
         }
         assertThat(jdbc.queryForList("select status from outbox_events",String.class)).containsOnly("DELIVERED");
         assertThat(scenario.status().toString()).doesNotContain("ctoken","bca2_","bga1_","secret","customer_token");
+        verifyOwnedInitialSql();
+    }
+
+    /** Task2 proves the shipped SQL against the same real service-created settled/delivered rows. */
+    private void verifyOwnedInitialSql() throws Exception {
+        var sql=java.nio.file.Files.readString(java.nio.file.Path.of("../infrastructure/stripe-billing-first-payment-proof.sql")).replaceAll("\\$[0-9]+","?");
+        var digest=java.security.MessageDigest.getInstance("SHA-256");
+        var createHash=HexFormat.of().formatHex(digest.digest("original-create".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        var confirmHash=HexFormat.of().formatHex(digest.digest("sdk-generated-pay-key".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        Object[] args={billing.id().value(),site.value(),customer.value(),UUID.fromString(prepared.get("subscription_id").getAsString()),UUID.fromString(prepared.get("operation_id").getAsString()),UUID.fromString(prepared.getAsJsonObject("session").get("attempt_id").getAsString()),jdbc.queryForObject("select product_id from prices where id=?",UUID.class,createCommand.priceId().value()),createCommand.priceId().value(),createHash,confirmHash,"https://shop.test",run,FROZEN};
+        var rows=jdbc.queryForList(sql,args);assertThat(rows).hasSize(1);
+        var proof=JsonParser.parseString(rows.getFirst().get("proof").toString()).getAsJsonObject();
+        for(var key:List.of("owned","cash","original","journal"))assertThat(proof.get(key).getAsBoolean()).as(key).isTrue();
+        var delivered=JsonParser.parseString(rows.getFirst().get("callbacks").toString()).getAsJsonArray();assertThat(delivered.size()).isEqualTo(2);
+        for(var callback:delivered)assertThat(callback.getAsJsonObject().get("delivered").getAsBoolean()).isTrue();
+        assertThat(count("provider_inbox")).isZero();
+        for(int index:new int[]{8,9,11,12}) {
+            var bad=args.clone();bad[index]=index==11?UUID.randomUUID():index==12?FROZEN+1:"0".repeat(64);
+            var rejected=jdbc.queryForList(sql,bad);assertThat(rejected).hasSize(1);
+            var flags=JsonParser.parseString(rejected.getFirst().get("proof").toString()).getAsJsonObject();
+            assertThat(flags.get(index>=11?"owned":"original").getAsBoolean()).isFalse();
+        }
     }
     @ParameterizedTest @ValueSource(strings={"requires_action","requires_payment_method","processing","disconnect"})
     void anyNonObserveOrLostResponseIsTerminalWithoutMoneyOrRedispatch(String outcome) {
