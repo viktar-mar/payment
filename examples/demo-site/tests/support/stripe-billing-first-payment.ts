@@ -163,7 +163,7 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     await waitPhase('CODE');
     await port.withOtpCode(async code => {
       await enterPrivateText(page.getByRole('textbox', {name:'Six-digit code', exact:true}), code);
-      return true;
+      return true as const;
     }, limits);
     await page.getByRole('button', {name:'Verify code', exact:true}).click({timeout:remaining(limits)});
     await waitPhase('AUTHENTICATED');
@@ -183,7 +183,7 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     need(!failure && prepared && challenges === 1 && verifies === 1);
     return true;
   } catch {
-    fail();
+    return fail();
   } finally {
     abandoned = true;
     limits.signal?.removeEventListener('abort', abort);

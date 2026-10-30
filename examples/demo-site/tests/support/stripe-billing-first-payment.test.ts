@@ -111,3 +111,22 @@ test('dedicated discovery and reporter suppress artifacts, raw errors and arbitr
     assert.deepEqual(lines,['first_payment_setup_failed\n','owned_initial_payment_not_accepted\n','owned_initial_payment_result_not_accepted full5b=NOT_ACCEPTED\n']);
   } finally {process.stdout.write = original;}
 });
+
+
+test('browser runner sanitizes early page failure and closes the opened context', async () => {
+  const module = await import(moduleUrl);
+  let closes = 0;
+  let portReads = 0;
+  const context = {
+    newPage: async () => {throw new Error('private-provider-sentinel');},
+    close: async () => {closes++;},
+  };
+  const browser = {newContext: async () => context};
+  const port = new Proxy({}, {get() {portReads++;throw new Error('unexpected port access');}});
+  await assert.rejects(
+    module.runFirstPaymentBrowser(browser, port, {deadline:Date.now() + 1000}),
+    /^Error: first_payment_BROWSER$/,
+  );
+  assert.equal(closes, 1);
+  assert.equal(portReads, 0);
+});
