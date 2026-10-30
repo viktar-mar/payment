@@ -19,6 +19,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 /** Explicit future launcher, outside platform scanning and absent from the production jar. */
 public final class OwnedBillingFirstPaymentRuntime {
     private OwnedBillingFirstPaymentRuntime() {}
+    private static final Set<String> PREPARE_FAILURE_STAGES=Set.of("REQUEST","PREFLIGHT","CLOCK_ADMISSION","CLOCK_CREATE","CUSTOMER_CREATE",
+        "LOCAL_RESERVE","SUBSCRIPTION_CREATE","LOCAL_RECORD","RECEIPT","ACTION_SELECT","SESSION_SELECT","RESPONSE_BUILD","UNCLASSIFIED");
     static final String PREFIX="PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_";
     public record Admission(UUID run, String source, long frozen, String capability, int port, String bind) {
         @Override public String toString(){return "Admission[redacted]";}
@@ -41,6 +43,7 @@ public final class OwnedBillingFirstPaymentRuntime {
     }
     public interface Operations {
         JsonObject prepare(JsonObject request);
+        default String prepareFailureStage(){return "UNCLASSIFIED";}
         JsonObject confirm(JsonObject request);
         JsonObject observe();
         JsonObject status();
@@ -63,6 +66,7 @@ public final class OwnedBillingFirstPaymentRuntime {
         private final Operations operations;private final byte[] authorization;
         public Handler(Operations operations,String capability){this.operations=operations;this.authorization=("Bearer "+capability).getBytes(StandardCharsets.US_ASCII);}
         @Override public void handle(HttpExchange exchange) throws IOException {
+            boolean prepare=false,prepareDispatched=false;
             try {
                 var headers=exchange.getRequestHeaders().get("Authorization");
                 if(headers==null||headers.size()!=1||!MessageDigest.isEqual(authorization,headers.getFirst().getBytes(StandardCharsets.UTF_8))){reply(exchange,403,error("DENIED"));return;}
@@ -70,16 +74,26 @@ public final class OwnedBillingFirstPaymentRuntime {
                 if(!Set.of("/initial-payment/prepare","/initial-payment/confirm","/initial-payment/observe","/initial-payment/status").contains(path)){operations.abort();reply(exchange,404,error("INVALID_REQUEST"));return;}
                 boolean status=path.endsWith("/status");
                 if(!exchange.getRequestMethod().equals(status?"GET":"POST")){operations.abort();reply(exchange,405,error("INVALID_REQUEST"));return;}
+                prepare=path.equals("/initial-payment/prepare");
                 JsonObject request=read(exchange,status);
                 JsonObject response=switch(path){
-                    case "/initial-payment/prepare" -> {fields(request,Set.of("run_id","source_sha","account_id","site_id","customer_id","price_id","origin","create_key","customer_token"));yield operations.prepare(request);}
+                    case "/initial-payment/prepare" -> {fields(request,Set.of("run_id","source_sha","account_id","site_id","customer_id","price_id","origin","create_key","customer_token"));prepareDispatched=true;yield operations.prepare(request);}
                     case "/initial-payment/confirm" -> {fields(request,Set.of("attempt_id","capability","confirmation_token","idempotency_key"));yield operations.confirm(request);}
                     case "/initial-payment/observe" -> {fields(request,Set.of());yield operations.observe();}
                     default -> operations.status();
                 };
                 reply(exchange,200,response);
-            }catch(Exception failure){operations.abort();reply(exchange,400,error("INITIAL_PAYMENT_STOPPED"));}
+            }catch(Exception failure){
+                var response=prepare?prepareError(prepareDispatched):error("INITIAL_PAYMENT_STOPPED");
+                operations.abort();reply(exchange,400,response);
+            }
             finally{exchange.close();}
+        }
+        private JsonObject prepareError(boolean dispatched) {
+            String stage="REQUEST";
+            if(dispatched)try{stage=operations.prepareFailureStage();}catch(RuntimeException ignored){stage="UNCLASSIFIED";}
+            var result=error("INITIAL_PAYMENT_STOPPED");
+            result.addProperty("stage",stage!=null&&PREPARE_FAILURE_STAGES.contains(stage)?stage:"UNCLASSIFIED");return result;
         }
         private static JsonObject read(HttpExchange exchange,boolean empty) throws Exception {
             var executor=Executors.newVirtualThreadPerTaskExecutor();

@@ -1,20 +1,20 @@
 import {validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {billingBounded,billingCheck,billingError} from './stripe-billing-limits.mjs';
-import {createBillingFirstPaymentRuntime} from './stripe-billing-first-payment-runtime.mjs';
+import {createBillingFirstPaymentRuntime,billingFirstPaymentDiagnostic,isBillingFirstPaymentDiagnostic} from './stripe-billing-first-payment-runtime.mjs';
 import {billingUuid} from './stripe-billing-provision.mjs';
 /** Single owner: construction is inert, run is explicit, uncertainty consumes all authority. */
 export async function createOwnedBillingFirstPayment(options,dependencies={}){
  const c=validateBillingFirstPaymentOptions(options);if(!c)throw billingError('OPT_IN_REQUIRED');
- let state='NEW',phase='NEW',failure=null,accepted=false,cleanupConfirmed=false,bootstrap,cli,fixture,runtime,cleanupPromise,active,finish;
- const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
+ let state='NEW',phase='NEW',failure=null,diagnostic=null,accepted=false,cleanupConfirmed=false,bootstrap,cli,fixture,runtime,cleanupPromise,active,finish;
+ const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
  const checkIdentity=v=>{if(!originalIdentity||Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))fail('ACK');};
- const resources=()=>Object.freeze({runId:c.runId,expectedSource:c.expectedSource,scope:'OWNED_INITIAL_PAYMENT',status:state,phase,code:failure,initialAccepted:accepted,full5bAccepted:false,cleanupConfirmed});
- const fail=code=>{failure??=code;lifetime.abort();throw billingError(failure);};
+ const resources=()=>Object.freeze({runId:c.runId,expectedSource:c.expectedSource,scope:'OWNED_INITIAL_PAYMENT',status:state,phase,code:failure,diagnostic,initialAccepted:accepted,full5bAccepted:false,cleanupConfirmed});
+ const fail=(code,detail=null)=>{if(failure===null)diagnostic=isBillingFirstPaymentDiagnostic(detail)?detail:null;failure??=code;lifetime.abort();throw billingError(failure);};
  async function cleanup(){return cleanupPromise??=(async()=>{let ok=true;const l={deadline:Math.min(Date.now()+120000,(active?.deadline??Date.now())+120000)};for(const [o,m]of [[runtime,'close'],[cli,'stopListener'],[bootstrap,'stop'],[fixture,'close']])if(o)try{if(await billingBounded(l,x=>o[m](x),30000)!==true)ok=false;}catch{ok=false;}cleanupConfirmed=ok;if(!ok)failure??='CLEANUP';return ok;})();}
  return Object.freeze({resources,
   async run(journey,limits){if(state!=='NEW')throw billingError('SINGLE_USE');state='RUNNING';let timer,remove=()=>{};
    try{billingCheck(limits);if(typeof journey!=='function'||limits.deadline>Date.now()+2700000)fail('LIMITS');const abort=()=>lifetime.abort();limits.signal?.addEventListener('abort',abort,{once:true});remove=()=>limits.signal?.removeEventListener('abort',abort);timer=setTimeout(abort,Math.max(1,limits.deadline-Date.now()));active={deadline:limits.deadline,signal:lifetime.signal};
-    async function step(name,body,max=120000){if(failure)fail(failure);phase=name;try{return await billingBounded(active,body,max);}catch{fail(active.signal.aborted?'ABORTED':name);}}
+    async function step(name,body,max=120000){if(failure)fail(failure);phase=name;try{return await billingBounded(active,body,max);}catch{fail(active.signal.aborted?'ABORTED':name,preparePending?'PREPARE_REQUEST':null);}}
     const requireTrue=async(name,body,max)=>{if(await step(name,body,max)!==true)fail(name);};
     const pf=await step('PREFLIGHT',async l=>(dependencies.preflight??(await import('./stripe-sandbox-owned.mjs')).preflightOwnedBillingFirstPayment)(c,...(dependencies.preflight?[l]:[{},l])));if(pf!==true&&pf?.status!=='READY')fail('PREFLIGHT');
     bootstrap=await step('BOOTSTRAP',async()=>(dependencies.createBootstrap??(await import('./stripe-sandbox-bootstrap.mjs')).createOwnedBillingFirstPaymentBootstrap)(c));
@@ -25,7 +25,7 @@ export async function createOwnedBillingFirstPayment(options,dependencies={}){
     runtime=await step('RUNTIME',()=>(dependencies.createRuntime??createBillingFirstPaymentRuntime)({configuration:c,bootstrap}));await requireTrue('RUNTIME',()=>runtime.ready(active));
     fixture=await step('FIXTURE',async()=>(dependencies.createFixture??(await import('./stripe-billing-provision.mjs')).createBillingFixture)({configuration:c,bootstrap,cli}));await requireTrue('PROVISION',l=>fixture.provision(l));
     const child=l=>{billingCheck(active);billingCheck(l);return {deadline:Math.min(active.deadline,l.deadline),signal:l.signal?AbortSignal.any([active.signal,l.signal]):active.signal};};
-    async function guarded(name,l,body){try{if(failure)fail(failure);return await billingBounded(child(l),body,120000);}catch{fail(name);}}
+    async function guarded(name,l,body){try{if(failure)fail(failure);return await billingBounded(child(l),body,120000);}catch(error){fail(name,billingFirstPaymentDiagnostic(error)??(name==='DISPATCH'&&preparePending?'PREPARE_REQUEST':null));}}
     const port=Object.freeze({resources:()=>fixture.resources(),
      withOtpCode:(callback,l)=>guarded('OTP',l,x=>fixture.withOtpCode(callback,x)),
      acknowledgeCustomer:v=>guarded('CUSTOMER',active,async l=>{if(await fixture.acknowledgeCustomer(v,l)!==true)fail('CUSTOMER');return true;}),
@@ -33,12 +33,12 @@ export async function createOwnedBillingFirstPayment(options,dependencies={}){
       if(prepareUsed)fail('SINGLE_USE');prepareUsed=true;
       const scope=fixture.resources();if(!session||Object.keys(session).sort().join(',')!=='origin,token'||typeof session.token!=='string'||!session.token||session.token.length>8192||session.origin!==scope.endpoints.demo||!['accountId','siteId','customerId','priceId'].every(k=>billingUuid(scope[k])))fail('SESSION');
       if(await cli.assertBillingListener(bound)!==true||await fixture.beforeDispatch('create',key,undefined,bound)!==true)fail('DISPATCH');
-      const v=await runtime.prepare({...scope,customerToken:session.token,origin:session.origin,createKey:key},bound);billingCheck(bound);
-      for(const [k,s] of [['run_id','runId'],['account_id','accountId'],['site_id','siteId'],['customer_id','customerId'],['price_id','priceId']])if(v[k]!==scope[s])fail('ACK');
-      if(v.phase!=='PREPARED'||!billingUuid(v.subscription_id)||!billingUuid(v.operation_id)||!billingUuid(v.session?.attempt_id)||v.session.protocol!=='SERVER_CONFIRM_V2'||v.action?.kind!=='PROVIDER_CLIENT'||typeof v.action.secret!=='string'||typeof v.session.capability!=='string')fail('ACK');
+      let v;preparePending=true;try{v=await runtime.prepare({...scope,customerToken:session.token,origin:session.origin,createKey:key},bound);billingCheck(bound);preparePending=false;}catch(error){fail('DISPATCH',billingFirstPaymentDiagnostic(error)??(bound.signal.aborted?'PREPARE_REQUEST':null));}
+      for(const [k,s] of [['run_id','runId'],['account_id','accountId'],['site_id','siteId'],['customer_id','customerId'],['price_id','priceId']])if(v[k]!==scope[s])fail('ACK','PREPARE_ACK');
+      if(v.phase!=='PREPARED'||!billingUuid(v.subscription_id)||!billingUuid(v.operation_id)||!billingUuid(v.session?.attempt_id)||v.session.protocol!=='SERVER_CONFIRM_V2'||v.action?.kind!=='PROVIDER_CLIENT'||typeof v.action.secret!=='string'||typeof v.session.capability!=='string')fail('ACK','PREPARE_ACK');
       originalIdentity=Object.fromEntries(['run_id','account_id','site_id','customer_id','price_id','subscription_id','operation_id'].map(k=>[k,v[k]]));
       selected={attemptId:v.session.attempt_id,capability:v.session.capability,subscriptionId:v.subscription_id,operationId:v.operation_id,createKey:key};
-      if(await fixture.acknowledge('create',{subscriptionId:v.subscription_id,operationId:v.operation_id},bound)!==true)fail('ACK');prepareAck=true;return v;
+      if(await fixture.acknowledge('create',{subscriptionId:v.subscription_id,operationId:v.operation_id},bound)!==true)fail('ACK','PREPARE_ACK');prepareAck=true;return v;
      }),
      confirm:(original,l)=>guarded('CONFIRM',l,async bound=>{
       if(!prepareAck||confirmUsed)fail('SINGLE_USE');confirmUsed=true;
@@ -59,4 +59,15 @@ export async function createOwnedBillingFirstPayment(options,dependencies={}){
   },
   async close(){lifetime.abort();if(state==='RUNNING')await billingBounded({deadline:Date.now()+120000},()=>finished,120000);else{state='CLOSED';await cleanup();}return resources();},
  });
+}
+
+/** The only printable diagnostic: closed fields, after cleanup and rejection. */
+export function formatBillingFirstPaymentDiagnostic(result){
+ if(!result||result.status!=='CLOSED'||result.initialAccepted!==false||result.code===null||!isBillingFirstPaymentDiagnostic(result.diagnostic)||typeof result.cleanupConfirmed!=='boolean')return null;
+ return 'owned_initial_payment_diagnostic code='+result.diagnostic+' cleanup='+(result.cleanupConfirmed?'CONFIRMED':'UNCONFIRMED');
+}
+export function parseBillingFirstPaymentDiagnosticLine(line){
+ if(typeof line!=='string'||line.length>160)return null;
+ const match=/^owned_initial_payment_diagnostic code=([A-Z_]+) cleanup=(CONFIRMED|UNCONFIRMED)$/.exec(line);
+ return match&&match[0]===line&&isBillingFirstPaymentDiagnostic(match[1])?line:null;
 }

@@ -1,5 +1,5 @@
 import {test} from '@playwright/test';
-import {createOwnedBillingFirstPayment} from '../../../infrastructure/stripe-billing-first-payment.mjs';
+import {createOwnedBillingFirstPayment, formatBillingFirstPaymentDiagnostic} from '../../../infrastructure/stripe-billing-first-payment.mjs';
 import {snapshotBillingFirstPaymentEnvironment} from '../../../infrastructure/stripe-billing-first-payment-options.mjs';
 import {runFirstPaymentBrowser} from './support/stripe-billing-first-payment';
 
@@ -30,6 +30,8 @@ test('OWNED_INITIAL_PAYMENT: one READY clock EUR20 original v2 cash and signed c
     if (result.scope !== 'OWNED_INITIAL_PAYMENT' || !result.initialAccepted || !result.cleanupConfirmed || result.full5bAccepted) throw new Error('first_payment_NOT_ACCEPTED');
   } finally {
     controller.abort();
-    await owner.close();
+    const final = await owner.close();
+    const diagnostic = formatBillingFirstPaymentDiagnostic(final);
+    if (diagnostic) process.stdout.write(diagnostic + '\n');
   }
 });

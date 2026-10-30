@@ -32,6 +32,7 @@ public final class OwnedBillingFirstPaymentScenario implements OwnedBillingFirst
     private final Function<Class<?>,Object> beans;
     private final Clock utc;
     private final OwnedBillingFirstPaymentRuntime.State state;
+    private String prepareFailureStage;
     private PaymentAccount account;
     private SiteId site;private CustomerId customer;private PriceId price;
     private String token,origin,createKey,originalInvoice,originalIntent;
@@ -48,14 +49,18 @@ public final class OwnedBillingFirstPaymentScenario implements OwnedBillingFirst
         this.state=new OwnedBillingFirstPaymentRuntime.State(utc,deadline);
     }
     private <T>T bean(Class<T> type){return type.cast(beans.apply(type));}
+    @Override public synchronized String prepareFailureStage(){return prepareFailureStage==null?"UNCLASSIFIED":prepareFailureStage;}
     @Override public synchronized JsonObject prepare(JsonObject request) {
+        String checkpoint="REQUEST";
         try {
             state.begin("NEW","PREPARING");
             OwnedBillingFirstPaymentRuntime.fields(request,Set.of("run_id","source_sha","account_id","site_id","customer_id","price_id","origin","create_key","customer_token"));
             require(admission.run().toString().equals(text(request,"run_id"))&&admission.source().equals(text(request,"source_sha")));
             site=new SiteId(uuid(request,"site_id"));customer=new CustomerId(uuid(request,"customer_id"));price=new PriceId(uuid(request,"price_id"));
             origin=text(request,"origin");token=text(request,"customer_token");createKey=key(text(request,"create_key"));
-            account=bean(LoadPaymentAccountPort.class).findById(new PaymentAccountId(uuid(request,"account_id"))).orElseThrow();
+            var accountId=new PaymentAccountId(uuid(request,"account_id"));
+            checkpoint="PREFLIGHT";
+            account=bean(LoadPaymentAccountPort.class).findById(accountId).orElseThrow();
             require(account.provider()==PaymentProviderType.STRIPE&&account.mode()==PaymentAccountMode.SANDBOX&&account.status()==PaymentAccountStatus.ACTIVE
                 &&account.externalAccountId().equals("acct_1UPiMpELswAd8tpR"));
             originalSession=bean(CustomerSessionResolver.class).resolveRequired(token,origin);
@@ -74,32 +79,42 @@ public final class OwnedBillingFirstPaymentScenario implements OwnedBillingFirst
             var credentials=bean(StripeCredentialResolver.class);var clients=bean(StripeClientFactory.class);var verification=bean(PaymentAccountVerificationPort.class);
             credentials.resolve(account);
             var operations=bean(ProviderOperationStore.class);var clocks=bean(StripeBillingClockStore.class);
+            checkpoint="CLOCK_ADMISSION";
             state.check();owner=clocks.admitFresh(account,site,customer,admission.run(),StripeBillingTestClockAdapter.API_VERSION,admission.frozen(),utc.instant());
+            checkpoint="CLOCK_CREATE";
             var clockAdapter=new StripeBillingTestClockAdapter(credentials,clients,verification,operations,clocks,bean(DigestPort.class));
             state.check();clockAdapter.createFresh(account,owner);
+            checkpoint="CUSTOMER_CREATE";
             state.check();bean(StripeBillingCustomerAdapter.class).ensureOwnedCustomer(account,owner);
+            checkpoint="LOCAL_RESERVE";
             state.check();reserved=bean(SubscriptionCommandTransaction.class).reserveCreate(new CreateSubscriptionUseCase.Command(context(createKey),price,true));
             require(reserved.owner()&&reserved.account().equals(account));
+            checkpoint="SUBSCRIPTION_CREATE";
             adapter=new StripeBillingClockSubscriptionAdapter(credentials,clients,verification,operations,clocks,bean(StripeBillingClockSubscriptionStore.class),bean(StripeBillingBindingPort.class),bean(SubscriptionStore.class),bean(SubscriptionOperationStore.class),utc);
             var command=new Command(account,reserved.operation(),reserved.subscription().billingPrice(),null,null,null,null,true,false);
             state.check();var reply=adapter.createOwned(command,owner);require(reply.outcome()==Outcome.ACCEPTED&&reply.action()==null);
+            checkpoint="LOCAL_RECORD";
             bean(SubscriptionCommandTransaction.class).recordReply(reserved.operation().id(),reply);
+            checkpoint="RECEIPT";
             receipt=bean(StripeBillingClockSubscriptionStore.class).requireReceipt(account.id(),reserved.subscription().id());
             // Selection has its own request key; the SDK's later confirm key is not known yet.
+            checkpoint="ACTION_SELECT";
             var scope=scope("initial-select-"+admission.run());
             var action=new StripeBillingClockActionAdapter(receipt,bean(SubscriptionInteractionTransaction.class),bean(SubscriptionActionStore.class),grants,credentials,clients,verification,utc);
             state.check();var next=action.nextAction(scope);require(next.kind()==ActionKind.PROVIDER_CLIENT);
             var binding=bean(SubscriptionTransactionPort.class).required(()->bean(SubscriptionActionStore.class).billing(StripeBillingGrantTokens.hash(next.secret())).orElseThrow().binding());
             originalInvoice=binding.invoiceReference();originalIntent=binding.intentReference();require(originalInvoice!=null&&originalIntent!=null);
+            checkpoint="SESSION_SELECT";
             state.check();selected=service(scope).select(scope,next.secret());
             require(selected.protocol().equals("SERVER_CONFIRM_V2")&&selected.flow()==SubscriptionClientSession.Flow.PAYMENT&&selected.attemptId()!=null&&selected.actionToken()==null);
+            checkpoint="RESPONSE_BUILD";
             state.finish("PREPARING","PREPARED");
             var result=status();var actionJson=new JsonObject();actionJson.addProperty("kind",next.kind().name());actionJson.addProperty("secret",next.secret());actionJson.addProperty("expires_at",next.expiresAt().toString());result.add("action",actionJson);
             var session=new JsonObject();session.addProperty("protocol",selected.protocol());session.addProperty("provider",selected.provider());session.addProperty("flow",selected.flow().name());
             session.addProperty("publishable_key",selected.publishableKey());session.addProperty("client_secret",selected.clientSecret());session.add("action_token",JsonNull.INSTANCE);
             session.addProperty("attempt_id",selected.attemptId().toString());session.addProperty("capability",selected.capability());session.addProperty("expires_at",selected.expiresAt().toString());result.add("session",session);
             return result;
-        }catch(RuntimeException invalid){abort();throw OwnedBillingFirstPaymentRuntime.denied();}
+        }catch(RuntimeException invalid){if(prepareFailureStage==null)prepareFailureStage=checkpoint;abort();throw OwnedBillingFirstPaymentRuntime.denied();}
     }
     @Override public synchronized JsonObject confirm(JsonObject request) {
         try {

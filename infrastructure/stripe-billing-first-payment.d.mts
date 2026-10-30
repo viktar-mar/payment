@@ -16,5 +16,8 @@ export interface BillingFirstPaymentPort {
  prepare(customerSession:{token:string;origin:string},createKey:string,limits:BillingLimits):Promise<FirstPaymentPrepared>;
  confirm(originalSDKRequest:FirstPaymentConfirmRequest,limits:BillingLimits):Promise<FirstPaymentConfirmed>;
 }
-export interface BillingFirstPaymentResult {runId:string;expectedSource:string;scope:'OWNED_INITIAL_PAYMENT';initialAccepted:boolean;full5bAccepted:false;cleanupConfirmed:boolean;status:string;phase:string;code:string|null}
+export interface BillingFirstPaymentResult {runId:string;expectedSource:string;scope:'OWNED_INITIAL_PAYMENT';initialAccepted:boolean;full5bAccepted:false;cleanupConfirmed:boolean;status:string;phase:string;code:string|null;diagnostic:string|null}
 export function createOwnedBillingFirstPayment(options:unknown,dependencies?:Record<string,unknown>):Promise<{resources():BillingFirstPaymentResult;run(journey:(port:BillingFirstPaymentPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingFirstPaymentResult>;close():Promise<BillingFirstPaymentResult>}>;
+
+export function formatBillingFirstPaymentDiagnostic(result:BillingFirstPaymentResult):string|null;
+export function parseBillingFirstPaymentDiagnosticLine(line:unknown):string|null;

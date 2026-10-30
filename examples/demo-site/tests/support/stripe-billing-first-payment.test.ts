@@ -130,3 +130,31 @@ test('browser runner sanitizes early page failure and closes the opened context'
   assert.equal(closes, 1);
   assert.equal(portReads, 0);
 });
+
+test('reporter forwards one strict final diagnostic after CLI handoff and drops hostile suffixes', async () => {
+  const {default:Reporter}=await import(new URL('./stripe-billing-first-payment-reporter.ts',import.meta.url).href);
+  const original=process.stdout.write,lines:string[]=[];process.stdout.write=((v:unknown)=>{lines.push(String(v));return true;}) as typeof process.stdout.write;
+  try {
+    const reporter=new Reporter();const handoff='Authorize the isolated Sandbox CLI at https://access.stripe.com/fixture using code ABCD EFGH. Keep this terminal open.';
+    reporter.onStdOut(handoff+'\n');reporter.onStdOut(handoff+'\n');
+    for(const line of ['owned_initial_payment_diagnostic code=UNKNOWN cleanup=CONFIRMED','owned_initial_payment_diagnostic code=PREPARE_ACK cleanup=CONFIRMED run_id=private-sentinel','owned_initial_payment_diagnostic code=PREPARE_ACK cleanup=private-sentinel','x'.repeat(4097)+'owned_initial_payment_diagnostic code=PREPARE_ACK cleanup=CONFIRMED'])reporter.onStdOut(line+'\n');
+    reporter.onStdOut('owned_initial_payment_diagnostic code=PREPARE_SERVER_SUBSCRIPTION_');reporter.onStdOut('CREATE cleanup=UNCONFIRMED\nprivate-sentinel\n');
+    reporter.onStdOut('owned_initial_payment_diagnostic code=PREPARE_ACK cleanup=CONFIRMED\n');
+    assert.deepEqual(lines,[handoff+'\n','owned_initial_payment_diagnostic code=PREPARE_SERVER_SUBSCRIPTION_CREATE cleanup=UNCONFIRMED\n']);
+  } finally {process.stdout.write=original;}
+});
+
+test('bridge accepts an evolving fixture whose initial snapshot has no acknowledged customer', async () => {
+  const module=await import(moduleUrl),f=await fixture();
+  const initial={...binding,customerId:undefined};
+  const current={...initial,customerId:f.p.customer_id};
+  assert.equal(initial.customerId,undefined);
+  assert.equal(current.customerId,f.p.customer_id);
+  const bridge=module.createFirstPaymentBridge({binding:initial,prepared:f.p,token,port:{confirm:async(value:unknown)=>{f.calls.push(value);return f.confirmed;}},limits:f.limits});
+  await bridge(route(f.original+'/action'));
+  await bridge(route(f.original+'/confirmation-session','POST',{action_token:f.p.action.secret}));
+  const confirmation=route(f.original+'/confirmation-attempts/'+f.p.session.attempt_id+'/confirm','POST',{capability:f.p.session.capability,confirmation_token:'ctoken_fixture'});
+  await bridge(confirmation);
+  assert.equal(confirmation.response().state,'OBSERVE');
+  assert.equal(f.calls.length,1);
+});

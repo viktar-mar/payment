@@ -41,3 +41,87 @@ test('total bound includes bootstrap and cleanup false remains unconfirmed',asyn
 test('expiry cleanup cannot renew the bootstrap captured lifetime',async()=>{const h=harness();let originalDeadline;h.runtime.confirm=async()=>{while(Date.now()<=originalDeadline+5){}return confirmed();};h.bootstrap.stop=async l=>l.deadline<=originalDeadline+120000;const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);originalDeadline=Date.now()+30;await assert.rejects(owner.run(journey,{deadline:originalDeadline}));assert.equal(owner.resources().cleanupConfirmed,true);});
 test('cleanup follows shared bootstrap listener-stop prerequisite and remains bounded',async()=>{const h=harness(),owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);await owner.run(journey,limits());assert.deepEqual(h.calls.filter(x=>['runtime-close','listener-stop','stop','fixture-close'].includes(x)),['runtime-close','listener-stop','stop','fixture-close']);});
 test('real owner and private client compose exact Task1 prepare confirm observe DTOs',async()=>{const h=harness(),requests=[];h.bootstrap.withFirstPaymentRuntime=async cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});h.dependencies.createRuntime=args=>runtimeApi.createBillingFirstPaymentRuntime(args,{fetch:async(url,init)=>{requests.push({url,body:init.body&&JSON.parse(init.body)});let v;if(url.endsWith('/status'))v={phase:'NEW',code:'OK',run_id:id(1)};else if(url.endsWith('/prepare'))v=prepared();else if(url.endsWith('/confirm'))v=confirmed();else {const settled=await h.runtime.observe();v=Object.fromEntries(Object.entries(settled).filter(([k])=>!['protocol','attempt_id','state','retry_allowed','successor_attempt_id','next_action_allowed','expires_at'].includes(k)));}return new Response(JSON.stringify(v));}});const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);assert.equal((await owner.run(journey,limits())).initialAccepted,true);assert.deepEqual(requests.map(r=>r.url.split('/').at(-1)),['status','prepare','confirm','observe']);assert.equal(requests[1].body.customer_token,'customer-token');assert.equal(requests[2].body.idempotency_key,'sdk-original-key');assert.deepEqual(requests[3].body,{});});
+
+// Inert diagnostic contracts: Response is synthetic and every dependency is injected.
+const serverStages=['REQUEST','PREFLIGHT','CLOCK_ADMISSION','CLOCK_CREATE','CUSTOMER_CREATE','LOCAL_RESERVE','SUBSCRIPTION_CREATE','LOCAL_RECORD','RECEIPT','ACTION_SELECT','SESSION_SELECT','RESPONSE_BUILD','UNCLASSIFIED'];
+async function diagnosticRuntime(reply,bootstrapChange){
+ let calls=0;const bootstrap={withFirstPaymentRuntime:cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)})};
+ const runtime=runtimeApi.createBillingFirstPaymentRuntime({configuration:options(),bootstrap},{fetch:async()=>{calls++;return calls===1?new Response(JSON.stringify({phase:'NEW',code:'OK',run_id:id(1)})):reply();}}),l=limits();
+ await runtime.ready(l);if(bootstrapChange)bootstrap.withFirstPaymentRuntime=bootstrapChange;
+ return {runtime,l,calls:()=>calls};
+}
+for(const stage of serverStages)test('fixed prepare server diagnostic '+stage+' survives terminal reuse',async()=>{
+ const f=await diagnosticRuntime(()=>new Response(JSON.stringify({code:'INITIAL_PAYMENT_STOPPED',stage}),{status:400}));
+ let first;try{await f.runtime.prepare(scope(),f.l);}catch(e){first=e;}
+ assert.equal(runtimeApi.billingFirstPaymentDiagnostic(first),'PREPARE_SERVER_'+stage);
+ let duplicate;try{await f.runtime.prepare(scope(),f.l);}catch(e){duplicate=e;}
+ assert.equal(runtimeApi.billingFirstPaymentDiagnostic(duplicate),'PREPARE_SERVER_'+stage);assert.equal(f.calls(),2);
+});
+for(const [name,reply,expected]of [
+ ['transport',()=>{throw new Proxy({},{get(){throw null;}});},'PREPARE_REQUEST'],
+ ['status',()=>new Response('private-sentinel',{status:503}),'PREPARE_HTTP'],
+ ['malformed',()=>new Response('{secret-sentinel'),'PREPARE_RESPONSE'],
+ ['oversized',()=>new Response('x'.repeat(16385)),'PREPARE_RESPONSE'],
+ ['success-extra',()=>new Response(JSON.stringify({...prepared(),secret:'private-sentinel'})),'PREPARE_RESPONSE'],
+ ...['{}','{','{"code":"INITIAL_PAYMENT_STOPPED","stage":"UNKNOWN"}','{"code":"INITIAL_PAYMENT_STOPPED","stage":"REQUEST","secret":"private-sentinel"}','{"code":"INITIAL_PAYMENT_STOPPED","stage":"REQUEST","stage":"PREFLIGHT"}','{"code":"INITIAL_PAYMENT_STOPPED","stage":"sk_test_secret"}','x'.repeat(16385)].map((body,i)=>['invalid-server-'+i,()=>new Response(body,{status:400}),'PREPARE_HTTP']),
+])test('bounded fixed diagnostic '+name,async()=>{const f=await diagnosticRuntime(reply);let failure;try{await f.runtime.prepare(scope(),f.l);}catch(e){failure=e;}assert.equal(runtimeApi.billingFirstPaymentDiagnostic(failure),expected);assert.equal(f.calls(),2);});
+test('prepare callback admission denial has authority diagnostic and no transport',async()=>{const f=await diagnosticRuntime(()=>{throw null;},async()=>false);let failure;try{await f.runtime.prepare(scope(),f.l);}catch(e){failure=e;}assert.equal(runtimeApi.billingFirstPaymentDiagnostic(failure),'PREPARE_AUTHORITY');assert.equal(f.calls(),1);});
+test('diagnostic lookup never inspects foreign rejection or forged fields',()=>{let reads=0;const foreign=new Proxy({diagnostic:'PREPARE_SERVER_REQUEST'},{get(){reads++;throw null;},getOwnPropertyDescriptor(){reads++;throw null;}});assert.equal(runtimeApi.billingFirstPaymentDiagnostic(foreign),null);assert.equal(runtimeApi.billingFirstPaymentDiagnostic(null),null);assert.equal(reads,0);});
+test('owner keeps first runtime diagnostic when browser catches and duplicate/cleanup fail',async()=>{
+ const h=harness();h.bootstrap.withFirstPaymentRuntime=cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});let dispatches=0;
+ h.dependencies.createRuntime=args=>runtimeApi.createBillingFirstPaymentRuntime(args,{fetch:async url=>{if(url.endsWith('/status'))return new Response(JSON.stringify({phase:'NEW',code:'OK',run_id:id(1)}));dispatches++;return new Response('{"code":"INITIAL_PAYMENT_STOPPED","stage":"SUBSCRIPTION_CREATE"}',{status:400});}});
+ h.bootstrap.stop=async()=>{throw new Proxy({},{get(){throw null;}});};
+ const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);
+ await assert.rejects(owner.run(async p=>{for(let i=0;i<2;i++)try{await journey(p);}catch{}},limits()));
+ const r=await owner.close();assert.equal(r.diagnostic,'PREPARE_SERVER_SUBSCRIPTION_CREATE');assert.equal(r.cleanupConfirmed,false);assert.equal(r.initialAccepted,false);assert.equal(dispatches,1);assert.deepEqual(h.calls.filter(x=>x.startsWith('create-dispatch:')),['create-dispatch:create-original']);assert.ok(!h.calls.some(x=>x.startsWith('confirm-dispatch:')));
+ assert.equal(api.formatBillingFirstPaymentDiagnostic(r),'owned_initial_payment_diagnostic code=PREPARE_SERVER_SUBSCRIPTION_CREATE cleanup=UNCONFIRMED');
+});
+test('evolving customer resource acknowledgement precedes prepare and fixed ACK rejection',async()=>{
+ const h=harness();let customer=null;h.fixture.resources=()=>({...scope(),customerId:customer});h.fixture.acknowledgeCustomer=async v=>{customer=v.customerId;return true;};h.runtime.prepare=async s=>{assert.equal(s.customerId,id(4));return {...prepared(),customer_id:id(99)};};
+ const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);await assert.rejects(owner.run(async p=>{assert.equal(p.resources().customerId,null);await p.acknowledgeCustomer({customerId:id(4),siteId:id(3)});return journey(p);},limits()));assert.equal(owner.resources().diagnostic,'PREPARE_ACK');assert.ok(!h.calls.includes('create-ack'));
+});
+test('foreign runtime rejection stays generic without property reads',async()=>{const h=harness();let reads=0;h.runtime.prepare=async()=>{throw new Proxy({diagnostic:'PREPARE_SERVER_REQUEST'},{get(){reads++;throw null;}});};const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);await assert.rejects(owner.run(journey,limits()));assert.equal(owner.resources().diagnostic,null);assert.equal(reads,0);});
+test('cancelled prepare remains consumed and late acknowledgement cannot replace diagnostic',async()=>{
+ const h=harness();let release;h.runtime.prepare=()=>new Promise(r=>release=r);const controller=new AbortController(),owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);
+ const pending=owner.run(journey,{...limits(),signal:controller.signal});pending.catch(()=>{});while(!release)await new Promise(r=>setTimeout(r,1));controller.abort();await assert.rejects(pending);assert.equal(owner.resources().diagnostic,'PREPARE_REQUEST');release(prepared());await new Promise(r=>setTimeout(r,1));assert.equal(owner.resources().diagnostic,'PREPARE_REQUEST');assert.ok(!h.calls.includes('create-ack'));assert.equal(owner.resources().initialAccepted,false);
+});
+
+test('pending prepare duplicate latches first failure and rejects late successful response',async()=>{
+ let release;const f=await diagnosticRuntime(()=>new Promise(r=>release=r));const pending=f.runtime.prepare(scope(),f.l);pending.catch(()=>{});while(!release)await new Promise(r=>setTimeout(r,1));await assert.rejects(f.runtime.prepare(scope(),f.l));release(new Response(JSON.stringify(prepared())));await assert.rejects(pending);assert.equal(f.calls(),2);
+});
+test('pending prepare duplicate cannot acquire a later server failure diagnostic',async()=>{
+ let release;const f=await diagnosticRuntime(()=>new Promise(r=>release=r));const pending=f.runtime.prepare(scope(),f.l);pending.catch(()=>{});while(!release)await new Promise(r=>setTimeout(r,1));await assert.rejects(f.runtime.prepare(scope(),f.l));release(new Response('{"code":"INITIAL_PAYMENT_STOPPED","stage":"REQUEST"}',{status:400}));let failure;try{await pending;}catch(e){failure=e;}assert.equal(runtimeApi.billingFirstPaymentDiagnostic(failure),null);
+});
+test('diagnostic formatter requires rejected closed result and parser rejects terminal newline',async()=>{
+ const h=harness(),owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies),initial=owner.resources();assert.equal(api.formatBillingFirstPaymentDiagnostic(initial),null);
+ assert.equal(api.formatBillingFirstPaymentDiagnostic({...initial,status:'CLOSED',code:'ACK',diagnostic:'PREPARE_ACK'}),'owned_initial_payment_diagnostic code=PREPARE_ACK cleanup=UNCONFIRMED');
+ for(const patch of [{status:'RUNNING'},{initialAccepted:true},{diagnostic:'private-sentinel'},{cleanupConfirmed:'CONFIRMED'}])assert.equal(api.formatBillingFirstPaymentDiagnostic({...initial,status:'CLOSED',code:'ACK',diagnostic:'PREPARE_ACK',...patch}),null);
+ assert.equal(api.parseBillingFirstPaymentDiagnosticLine('owned_initial_payment_diagnostic code=PREPARE_ACK cleanup=CONFIRMED\n'),null);
+});
+test('runtime cancellation while reading prepare body carries request uncertainty',async()=>{
+ const controller=new AbortController();let entered;const entry=new Promise(r=>entered=r);const f=await diagnosticRuntime(()=>({status:200,body:{async *[Symbol.asyncIterator](){entered();await new Promise(()=>{});},cancel:async()=>{}}}));
+ const pending=f.runtime.prepare(scope(),{...f.l,signal:controller.signal});pending.catch(()=>{});await entry;controller.abort();let failure;try{await pending;}catch(e){failure=e;}assert.equal(runtimeApi.billingFirstPaymentDiagnostic(failure),'PREPARE_REQUEST');
+});
+
+for(const [name,reply,code]of [
+ ['success-wrong-phase',()=>new Response(JSON.stringify({...prepared(),phase:'STOPPED'})),'PREPARE_RESPONSE'],
+ ['invalid-utf8',()=>new Response(new Uint8Array([255])),'PREPARE_RESPONSE'],
+ ['unauthorized-error-dto',()=>new Response('{"code":"INITIAL_PAYMENT_STOPPED","stage":"REQUEST"}',{status:401}),'PREPARE_HTTP'],
+ ['wrong-success-status',()=>new Response('{"code":"INITIAL_PAYMENT_STOPPED","stage":"REQUEST"}',{status:200}),'PREPARE_RESPONSE'],
+ ['hostile-stream',()=>({status:200,body:{async *[Symbol.asyncIterator](){throw new Proxy({},{get(){throw null;}});},cancel:async()=>{}}}),'PREPARE_RESPONSE'],
+])test('prepare diagnostic rejects '+name,async()=>{const f=await diagnosticRuntime(reply);let failure;try{await f.runtime.prepare(scope(),f.l);}catch(e){failure=e;}assert.equal(runtimeApi.billingFirstPaymentDiagnostic(failure),code);assert.equal(f.calls(),2);});
+test('fixed server error on confirm remains generic',async()=>{
+ let calls=0;const runtime=runtimeApi.createBillingFirstPaymentRuntime({configuration:options(),bootstrap:{withFirstPaymentRuntime:cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)})}},{fetch:async()=>{calls++;return calls===1?new Response(JSON.stringify({phase:'NEW',code:'OK',run_id:id(1)})):calls===2?new Response(JSON.stringify(prepared())):new Response('{"code":"INITIAL_PAYMENT_STOPPED","stage":"REQUEST"}',{status:400});}}),l=limits();await runtime.ready(l);await runtime.prepare(scope(),l);let failure;try{await runtime.confirm(confirmation(),l);}catch(e){failure=e;}assert.equal(runtimeApi.billingFirstPaymentDiagnostic(failure),null);assert.equal(calls,3);
+});
+
+for(const [kind,admit,calls]of [
+ ['no-callback',async()=>true,1],
+ ['false-after-callback',async cb=>{await cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});return false;},2],
+ ['duplicate-callback',async cb=>{await cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});return cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});},2],
+])test('prepare callback authority refuses '+kind,async()=>{const f=await diagnosticRuntime(()=>new Response(JSON.stringify(prepared())),admit);let failure;try{await f.runtime.prepare(scope(),f.l);}catch(e){failure=e;}assert.equal(runtimeApi.billingFirstPaymentDiagnostic(failure),'PREPARE_AUTHORITY');assert.equal(f.calls(),calls);});
+
+test('prepare rejects missing bounds with fixed request metadata',async()=>{const f=await diagnosticRuntime(()=>new Response(JSON.stringify(prepared())));let failure;try{await f.runtime.prepare(scope());}catch(e){failure=e;}assert.equal(runtimeApi.billingFirstPaymentDiagnostic(failure),'PREPARE_REQUEST');assert.equal(f.calls(),1);});
+test('owner preserves request diagnostic when only prepare caller signal aborts',async()=>{
+ const h=harness();let entered;const entry=new Promise(r=>entered=r);h.runtime.prepare=async()=>{entered();return new Promise(()=>{});};const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies),controller=new AbortController();
+ const pending=owner.run(async p=>{await p.prepare({token:'customer-token',origin:scope().endpoints.demo},'original-key',{...limits(),signal:controller.signal});},limits());pending.catch(()=>{});await entry;controller.abort();await assert.rejects(pending);assert.equal(owner.resources().diagnostic,'PREPARE_REQUEST');assert.equal(h.calls.filter(x=>x.startsWith('create-dispatch:')).length,1);
+});

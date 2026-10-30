@@ -1,22 +1,30 @@
 import type {Reporter, TestCase, TestResult, FullResult} from '@playwright/test/reporter';
-/** Fixed labels only; CLI authorization handoff is the sole permitted transient text. */
+import {parseBillingFirstPaymentDiagnosticLine} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
+/** Fixed labels, one CLI authorization handoff and one validated final diagnostic. */
 export default class FirstPaymentReporter implements Reporter {
   private buffer = '';
   private handoff = false;
+  private diagnostic = false;
+  private overflow = false;
   printsToStdio(): boolean {return true;}
   onStdOut(chunk: string | Buffer): void {
-    if (this.handoff) return;
     for (const character of chunk.toString('utf8')) {
       if (character === '\n') {
-        const line = this.buffer;
+        const line = this.overflow ? '' : this.buffer;
         this.buffer = '';
+        this.overflow = false;
+        if (!this.diagnostic && parseBillingFirstPaymentDiagnosticLine(line)) {
+          this.diagnostic = true;
+          process.stdout.write(line + '\n');
+          continue;
+        }
         const match = /^Authorize the isolated Sandbox CLI at (https:\/\/(?:access|dashboard)\.stripe\.com\/[^\s]*) using code ([A-Za-z0-9 -]{4,128})\. Keep this terminal open\.$/.exec(line);
-        if (match && !/(?:[spr]k_(?:test|live)_|whsec_|client_secret)/i.test(line)) {
+        if (!this.handoff && match && !/(?:[spr]k_(?:test|live)_|whsec_|client_secret)/i.test(line)) {
           this.handoff = true;
           process.stdout.write(line + '\n');
         }
-      } else if (this.buffer.length < 4096) this.buffer += character;
-      else this.buffer = '';
+      } else if (!this.overflow && this.buffer.length < 4096) this.buffer += character;
+      else {this.buffer = '';this.overflow = true;}
     }
   }
   onStdErr(): void {}

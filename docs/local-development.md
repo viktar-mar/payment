@@ -1525,3 +1525,24 @@ The dedicated page blocks its own sessionStorage/localStorage before constructin
 Verification is deliberately layered: hosted Chromium uses the actual built page and deployment CSP with inert Stripe transport, genuine SDK OTP authority and the real Node owner/private client; all its external requests are fulfilled or denied. Hosted PostgreSQL uses the actual private HTTP Handler in memory, the real owned scenario/services and inert official Stripe SDK transport, then the existing SQL and signed callback proof. A hosted packaging step checks the exact export, production-jar absence and production-only dependency closure without launching the runtime. These synthetic checks establish source contracts, not native payment acceptance or an executed container deployment. No native scenario is launched by ordinary CI.
 
 The first-payment Compose proof treats only absent or `null` backend `command` and `entrypoint` fields as inherited image defaults; explicit values, including empty strings and arrays, remain forbidden. The exact source/build, image launcher, private runtime environment and seven loopback-port proofs still apply. The prior native attempt reached preparation after issuer setup and stopped before stopped-service creation and Stripe operations. Offline regression tests reproduce and correct the null-default rejection; they do not establish the exact native failure cause or successful native execution. Native payment acceptance remains **NOT_ACCEPTED**.
+
+
+Prepare failures now retain a fixed diagnostic in the Node owner's final result. The
+private client accepts a server checkpoint only from the exact bounded status-400
+`INITIAL_PAYMENT_STOPPED` envelope with one allowlisted stage and no extra fields
+or duplicate keys. Other failures identify only the authority, request, HTTP,
+response or owner-acknowledgement boundary. External rejection properties, response
+bodies, HTTP statuses, credentials and identifiers never enter that diagnostic.
+The dedicated test emits one validated `owned_initial_payment_diagnostic` line
+after `owner.close()`, containing only the fixed code and
+`cleanup=CONFIRMED|UNCONFIRMED`. The dedicated reporter permits that one line
+after the existing CLI authorization handoff while suppressing arbitrary output
+and repeated handoffs.
+
+These codes identify a stopped boundary. In particular,
+`PREPARE_SERVER_SUBSCRIPTION_CREATE` does not prove that a provider POST happened,
+that a subscription was created, or that money moved. The original native root
+cause and creation outcome remain unknown. The original DISPATCHING operation
+remains uncertain, consumed and permanently non-retryable; these source changes
+provide no recovery authority. Offline inert tests establish diagnostic handling
+only, with no native acceptance claim.

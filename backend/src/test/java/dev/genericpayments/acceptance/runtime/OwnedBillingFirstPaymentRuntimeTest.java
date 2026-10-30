@@ -150,10 +150,126 @@ class OwnedBillingFirstPaymentRuntimeTest {
             assertThat(request.code).isGreaterThanOrEqualTo(400);assertThat(operations.calls).isZero();assertThat(operations.aborted).isTrue();
         }
     }
-    static final class InertOperations implements OwnedBillingFirstPaymentRuntime.Operations {
+    // Losing the prepare checkpoint, exposing exception details, or dispatching after failure breaks these contracts.
+    @Test void authenticatedPrepareFailuresExposeOnlyClosedCheckpointDto() throws Exception {
+        for(String stage:List.of("REQUEST","PREFLIGHT","CLOCK_ADMISSION","CLOCK_CREATE","CUSTOMER_CREATE","LOCAL_RESERVE","SUBSCRIPTION_CREATE","LOCAL_RECORD","RECEIPT","ACTION_SELECT","SESSION_SELECT","RESPONSE_BUILD","UNCLASSIFIED")) {
+            var operations=new InertOperations(){public String prepareFailureStage(){return stage;}};operations.failure=true;
+            var exchange=new MemoryExchange("POST","/initial-payment/prepare",prepareRequest().toString(),true);
+            new OwnedBillingFirstPaymentRuntime.Handler(operations,"q".repeat(43)).handle(exchange);
+            assertThat(exchange.code).isEqualTo(400);
+            assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\",\"stage\":\""+stage+"\"}");
+            assertThat(operations.calls).isEqualTo(1);assertThat(operations.aborted).isTrue();
+        }
+    }
+    @Test void unknownDefaultAndThrowingStageProvidersCannotLeakOrInspectExceptions() throws Exception {
+        for(var operations:List.of(new InertOperations(),
+            new InertOperations(){public String prepareFailureStage(){return "sk_test_SECRET";}},
+            new InertOperations(){public String prepareFailureStage(){return null;}},
+            new InertOperations(){public String prepareFailureStage(){throw hostileFailure();}})) {
+            operations.failure=true;
+            var exchange=new MemoryExchange("POST","/initial-payment/prepare",prepareRequest().toString(),true);
+            new OwnedBillingFirstPaymentRuntime.Handler(operations,"q".repeat(43)).handle(exchange);
+            assertThat(exchange.code).isEqualTo(400);
+            assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\",\"stage\":\"UNCLASSIFIED\"}");
+        }
+    }
+    @Test void authenticatedPrepareParsingFailureIsRequestBeforeOperationsOrStageProvider() throws Exception {
+        for(String body:List.of("{}","{\"run_id\":\"a\",\"run_id\":\"b\"}","{", " ".repeat(16385))) {
+            var operations=new InertOperations(){public String prepareFailureStage(){throw new AssertionError("No dispatch checkpoint available");}};
+            var exchange=new MemoryExchange("POST","/initial-payment/prepare",body,true);
+            new OwnedBillingFirstPaymentRuntime.Handler(operations,"q".repeat(43)).handle(exchange);
+            assertThat(exchange.code).isEqualTo(400);
+            assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\",\"stage\":\"REQUEST\"}");
+            assertThat(operations.calls).isZero();assertThat(operations.aborted).isTrue();
+        }
+    }
+    @Test void stageIsCapturedBeforeAbortAndOtherErrorsKeepTheirProtocol() throws Exception {
+        var operations=new InertOperations(){public String prepareFailureStage(){return aborted?"REQUEST":"SUBSCRIPTION_CREATE";}};operations.failure=true;
+        var handler=new OwnedBillingFirstPaymentRuntime.Handler(operations,"q".repeat(43));
+        var prepare=new MemoryExchange("POST","/initial-payment/prepare",prepareRequest().toString(),true);handler.handle(prepare);
+        assertThat(prepare.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\",\"stage\":\"SUBSCRIPTION_CREATE\"}");
+        var confirm=new MemoryExchange("POST","/initial-payment/confirm","{\"attempt_id\":\"a\",\"capability\":\"b\",\"confirmation_token\":\"c\",\"idempotency_key\":\"d\"}",true);handler.handle(confirm);
+        assertThat(confirm.code).isEqualTo(400);assertThat(confirm.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\"}");
+        var unauthorized=new MemoryExchange("POST","/initial-payment/prepare",prepareRequest().toString(),false);handler.handle(unauthorized);
+        assertThat(unauthorized.output.toString()).isEqualTo("{\"code\":\"DENIED\"}");
+        var wrongMethod=new MemoryExchange("GET","/initial-payment/prepare","{}",true);handler.handle(wrongMethod);
+        assertThat(wrongMethod.code).isEqualTo(405);assertThat(wrongMethod.output.toString()).isEqualTo("{\"code\":\"INVALID_REQUEST\"}");
+        var wrongPath=new MemoryExchange("POST","/initial-payment/prepare?x=y","{}",true);handler.handle(wrongPath);
+        assertThat(wrongPath.code).isEqualTo(404);assertThat(wrongPath.output.toString()).isEqualTo("{\"code\":\"INVALID_REQUEST\"}");
+    }
+    @Test void actualScenarioRequestFailureBurnsRunBeforeAnyDependency() throws Exception {
+        var dependencies=new ArrayList<Class<?>>();
+        var scenario=scenario(type->{dependencies.add(type);throw new AssertionError("Request must reject before dependency access");});
+        assertThatThrownBy(()->scenario.prepare(new com.google.gson.JsonObject())).isInstanceOf(IllegalStateException.class).hasMessage("INITIAL_PAYMENT_STOPPED");
+        assertThat(scenario.prepareFailureStage()).isEqualTo("REQUEST");assertThat(scenario.status().get("phase").getAsString()).isEqualTo("STOPPED");
+        scenario.abort();assertThatThrownBy(()->scenario.prepare(prepareRequest())).isInstanceOf(IllegalStateException.class);
+        assertThat(scenario.prepareFailureStage()).isEqualTo("REQUEST");assertThat(dependencies).isEmpty();
+    }
+    @Test void actualScenarioMalformedAccountIdentifierIsRequestBeforePreflight() throws Exception {
+        var dependencies=new ArrayList<Class<?>>();var scenario=scenario(type->{dependencies.add(type);throw hostileFailure();});
+        var request=prepareRequest();request.addProperty("account_id","invalid-account-id");
+        assertThatThrownBy(()->scenario.prepare(request)).isInstanceOf(IllegalStateException.class).hasMessage("INITIAL_PAYMENT_STOPPED");
+        assertThat(scenario.prepareFailureStage()).isEqualTo("REQUEST");assertThat(dependencies).isEmpty();
+    }
+    @Test void successfulPrepareKeepsItsOriginalDtoAndDoesNotQueryFailureStage() throws Exception {
+        var operations=new InertOperations(){public String prepareFailureStage(){throw new AssertionError("No failed prepare");}};
+        var exchange=new MemoryExchange("POST","/initial-payment/prepare",prepareRequest().toString(),true);
+        new OwnedBillingFirstPaymentRuntime.Handler(operations,"q".repeat(43)).handle(exchange);
+        assertThat(exchange.code).isEqualTo(200);assertThat(exchange.output.toString()).isEqualTo(prepareRequest().toString());
+        assertThat(operations.calls).isEqualTo(1);assertThat(operations.aborted).isFalse();
+    }
+    @Test void actualScenarioPreflightFailureSurvivesDuplicateAndAbortWithoutDownstreamEffects() throws Exception {
+        var dependencies=new ArrayList<Class<?>>();
+        var scenario=scenario(type->{dependencies.add(type);throw hostileFailure();});
+        var handler=new OwnedBillingFirstPaymentRuntime.Handler(scenario,"q".repeat(43));
+        var first=new MemoryExchange("POST","/initial-payment/prepare",prepareRequest().toString(),true);handler.handle(first);
+        assertThat(first.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\",\"stage\":\"PREFLIGHT\"}");
+        assertThat(dependencies).containsExactly(dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort.class);
+        scenario.abort();
+        var duplicate=new MemoryExchange("POST","/initial-payment/prepare",prepareRequest().toString(),true);handler.handle(duplicate);
+        assertThat(duplicate.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\",\"stage\":\"PREFLIGHT\"}");
+        assertThat(scenario.prepareFailureStage()).isEqualTo("PREFLIGHT");assertThat(scenario.status().get("phase").getAsString()).isEqualTo("STOPPED");
+        assertThat(dependencies).hasSize(1);
+    }
+    @Test void actualScenarioAccountLookupIsInertAndCustomerAuthorityFailureStopsPreflight() throws Exception {
+        var dependencies=new ArrayList<Class<?>>();
+        var account=dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount.create(
+            new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId(new UUID(0,1)),"inert-account",
+            dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE,dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountMode.SANDBOX,
+            "acct_1UPiMpELswAd8tpR","stripe-sandbox-default");
+        var accountPort=(dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort)Proxy.newProxyInstance(getClass().getClassLoader(),
+            new Class<?>[]{dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort.class},(proxy,method,args)->{
+                assertThat(method.getName()).isEqualTo("findById");assertThat(args).containsExactly(account.id());return Optional.of(account);});
+        var sessionPort=(dev.genericpayments.platform.customers.application.port.out.CustomerSessionResolver)Proxy.newProxyInstance(getClass().getClassLoader(),
+            new Class<?>[]{dev.genericpayments.platform.customers.application.port.out.CustomerSessionResolver.class},(proxy,method,args)->{
+                assertThat(method.getName()).isEqualTo("resolveRequired");assertThat(args).containsExactly("inert-customer-token","https://fixture.invalid");throw hostileFailure();});
+        var scenario=scenario(type->{dependencies.add(type);if(type==dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort.class)return accountPort;
+            if(type==dev.genericpayments.platform.customers.application.port.out.CustomerSessionResolver.class)return sessionPort;throw new AssertionError("No downstream effect");});
+        assertThatThrownBy(()->scenario.prepare(prepareRequest())).isInstanceOf(IllegalStateException.class).hasMessage("INITIAL_PAYMENT_STOPPED");
+        assertThat(scenario.prepareFailureStage()).isEqualTo("PREFLIGHT");assertThat(dependencies).containsExactly(
+            dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort.class,dev.genericpayments.platform.customers.application.port.out.CustomerSessionResolver.class);
+        assertThatThrownBy(()->scenario.prepare(prepareRequest())).isInstanceOf(IllegalStateException.class);assertThat(dependencies).hasSize(2);
+    }
+    private static RuntimeException hostileFailure() {
+        return new IllegalStateException("ctoken_SECRET sk_test_SECRET") {
+            @Override public String getMessage(){throw new AssertionError("Do not inspect dependency message");}
+            @Override public String toString(){throw new AssertionError("Do not inspect dependency exception");}
+        };
+    }
+    private static OwnedBillingFirstPaymentScenario scenario(java.util.function.Function<Class<?>,Object> beans) {
+        var now=java.time.Instant.parse("2026-10-30T12:00:00Z");
+        return new OwnedBillingFirstPaymentScenario(OwnedBillingFirstPaymentRuntime.admit(environment(),"a".repeat(40)),beans,
+            java.time.Clock.fixed(now,java.time.ZoneOffset.UTC),now.plusSeconds(30));
+    }
+    private static com.google.gson.JsonObject prepareRequest() {
+        var request=new com.google.gson.JsonObject();request.addProperty("run_id","cd2116f9-f847-4dc8-85fa-7df63ca51451");request.addProperty("source_sha","a".repeat(40));
+        for(String name:List.of("account_id","site_id","customer_id","price_id"))request.addProperty(name,new UUID(0,1).toString());
+        request.addProperty("origin","https://fixture.invalid");request.addProperty("create_key","first-create");request.addProperty("customer_token","inert-customer-token");return request;
+    }
+    static class InertOperations implements OwnedBillingFirstPaymentRuntime.Operations {
         int calls;boolean aborted,failure;
-        public com.google.gson.JsonObject prepare(com.google.gson.JsonObject r){calls++;return r;}
-        public com.google.gson.JsonObject confirm(com.google.gson.JsonObject r){calls++;return r;}
+        public com.google.gson.JsonObject prepare(com.google.gson.JsonObject r){calls++;if(failure)throw hostileFailure();return r;}
+        public com.google.gson.JsonObject confirm(com.google.gson.JsonObject r){calls++;if(failure)throw hostileFailure();return r;}
         public com.google.gson.JsonObject observe(){calls++;if(failure)throw new IllegalStateException("ctoken_SECRET sk_test_SECRET");return new com.google.gson.JsonObject();}
         public com.google.gson.JsonObject status(){calls++;return new com.google.gson.JsonObject();}
         public void abort(){aborted=true;}
