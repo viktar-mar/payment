@@ -493,7 +493,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
         if(!actual||actual.type!==mount.Type||actual.source!==source||Boolean(actual.read_only)!==!mount.RW)fail();
       }
       if(STRIPE_NAMES.some(name=>Object.hasOwn(value.environment??{},name))||(service==='backend'&&value.environment?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='false'))fail();
-      if(firstPayment){const expected=runtimeEnv('buildOnly');if(Object.entries(expected).some(([name,want])=>service==='backend'?value.environment?.[name]!==want:Object.hasOwn(value.environment??{},name)))fail();if(service==='backend'&&(value.build?.context!==ROOT+'/backend'||value.build?.dockerfile!=='Dockerfile.billing-first-payment'||!same(value.build?.args,{PAYMENT_RUNTIME_SOURCE_SHA:expectedSource})||value.entrypoint!==undefined||value.command!==undefined))fail();}
+      if(firstPayment){const expected=runtimeEnv('buildOnly');if(Object.entries(expected).some(([name,want])=>service==='backend'?value.environment?.[name]!==want:Object.hasOwn(value.environment??{},name)))fail();if(service==='backend'&&(value.build?.context!==ROOT+'/backend'||value.build?.dockerfile!=='Dockerfile.billing-first-payment'||!same(value.build?.args,{PAYMENT_RUNTIME_SOURCE_SHA:expectedSource})||(value.entrypoint!==undefined&&value.entrypoint!==null)||(value.command!==undefined&&value.command!==null)))fail();}
       if(billing&&Object.entries(BILLING_CONFIG).some(([name,expected])=>service==='backend'?value.environment?.[name]!==expected:Object.hasOwn(value.environment??{},name)))fail();
     }
   }
