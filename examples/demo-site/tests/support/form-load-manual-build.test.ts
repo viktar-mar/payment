@@ -29,7 +29,7 @@ test('actual Vite graph shares SDK across manual/automatic entries and excludes 
 
 // Catch omitted Docker COPY inputs (including transitive runtime/declaration
 // imports), not just successful builds with the entire checkout available.
-test('Docker COPY filesystem typechecks and builds diagnostic and production entries offline',async t=>{
+test('Docker COPY filesystem typechecks and builds dedicated and production entries offline',async t=>{
   const root=fileURLToPath(new URL('../..',import.meta.url)),repository=resolve(root,'../..');
   const directory=await mkdtemp(join(tmpdir(),'payment-manual-docker-'));
   const publicInfrastructure=[
@@ -44,6 +44,7 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
     'examples/demo-site/package.json','examples/demo-site/pnpm-lock.yaml',
     'examples/demo-site/index.html','examples/demo-site/payment-return.html','examples/demo-site/subscription-return.html',
     'examples/demo-site/form-load-diagnostic.html','examples/demo-site/form-load-manual.html','examples/demo-site/manual-payment.html',
+    'examples/demo-site/billing-first-payment.html',
     'examples/demo-site/tsconfig.json','examples/demo-site/vite.config.ts','examples/demo-site/src',
     ...publicInfrastructure.map(name=>'infrastructure/'+name),
   ]);
@@ -113,7 +114,7 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
     // stale SDK installation or source files outside the staged COPY tree.
     typecheck('frontend/sdk',['-p','tsconfig.json']);
     typecheck('examples/demo-site',['--noEmit']);
-    for(const mode of ['manual-payment','form-diagnostic','production'])await t.test(mode,async()=>{
+    for(const mode of ['manual-payment','form-diagnostic','billing-first-payment','production'])await t.test(mode,async()=>{
       assert.deepEqual((await readdir(join(directory,'infrastructure'))).sort(),[...publicInfrastructure].sort());
       const demo=join(directory,'examples/demo-site');
       await build({root:demo,configFile:join(demo,'vite.config.ts'),mode,logLevel:'silent'});
@@ -122,6 +123,9 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
         assert.deepEqual(documents.sort(),['.vite','assets','manual-payment.html']);
         const manifest=JSON.parse(await readFile(join(demo,'dist/.vite/manifest.json'),'utf8'));
         assert.equal(manifest['manual-payment.html'].isEntry,true);
+      }else if(mode==='billing-first-payment'){
+        assert.deepEqual(documents.sort(),['assets','billing-first-payment.html','health']);
+        assert.equal(await readFile(join(demo,'dist/health'),'utf8'),'ok\n');
       }else if(mode==='form-diagnostic'){
         assert.ok(documents.includes('form-load-manual.html'));assert.ok(documents.includes('form-load-diagnostic.html'));
         assert.equal(documents.includes('index.html'),false);assert.equal(documents.includes('subscription-return.html'),false);
@@ -129,9 +133,14 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
         assert.ok(documents.includes('index.html'));assert.ok(documents.includes('payment-return.html'));assert.ok(documents.includes('subscription-return.html'));
         assert.equal(documents.includes('form-load-manual.html'),false);assert.equal(documents.includes('form-load-diagnostic.html'),false);
       }
+      if(mode!=='billing-first-payment'){
+        assert.equal(documents.includes('billing-first-payment.html'),false);
+        assert.equal(documents.includes('health'),false);
+      }
       for(const name of await readdir(join(demo,'dist/assets'))){
         const code=await readFile(join(demo,'dist/assets',name),'utf8');
         assert.doesNotMatch(code,/node:http|node:crypto|createManualFormGateway|PAYMENT_STRIPE_SANDBOX_SECRET_KEY/);
+        if(mode!=='billing-first-payment')assert.doesNotMatch(code,/__firstPaymentConfigure|__firstPaymentPrepare/);
         if(mode==='production')assert.doesNotMatch(code,/manual-session|manual-observation|Ручная проверка|__formLoadDiagnostic|__formDiagnosticSession/);
       }
     });

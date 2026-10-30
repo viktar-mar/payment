@@ -44,6 +44,44 @@ class OwnedBillingFirstPaymentRuntimeTest {
             new dev.genericpayments.platform.subscriptions.domain.Subscription.Period(java.time.Instant.parse("2023-11-14T22:13:20Z"),java.time.Instant.parse("2023-12-14T22:13:20Z")),
             2000,"EUR",dev.genericpayments.platform.subscriptions.domain.BillingRecord.Settlement.CONFIRMED_CASH,0,created,updated);
     }
+    /** Shared hosted-fixture claim time; no synthetic advance of operational UTC. */
+    static java.time.Instant callbackClaimUtc(java.time.Instant utc) { return utc; }
+    @Test void callbackClaimCanCompleteAtTheCurrentUtcDeliveryBoundary() {
+        var claimedAt=java.time.Instant.parse("2026-10-30T11:00:00.123456789Z");
+        var completedAt=java.time.Instant.parse("2026-10-30T11:00:00.124456789Z");
+        var claim=new dev.genericpayments.platform.webhooks.application.port.out.OutboxPort.Claim(
+            new UUID(0,1),null,new UUID(0,2),"https://callback.invalid",1,
+            new dev.genericpayments.platform.shared.application.port.out.EncryptedSecretPort.EncryptedValue(new byte[16],new byte[12],"inert"),
+            "{}",1,"first-payment",callbackClaimUtc(claimedAt),claimedAt.minusSeconds(1),
+            dev.genericpayments.platform.webhooks.application.port.out.OutboxPort.Mode.AUTOMATIC,
+            new dev.genericpayments.platform.shared.application.port.out.Stage2TelemetryPort.Context("fixture",dev.genericpayments.platform.shared.application.port.out.Stage2TelemetryPort.Provider.STRIPE));
+        var completions=new ArrayList<Object[]>();
+        var sent=new ArrayList<Map<String,String>>();
+        // Capture the actual service's completion arguments at the store boundary, without a database.
+        var outbox=(dev.genericpayments.platform.webhooks.application.port.out.OutboxPort)Proxy.newProxyInstance(
+            getClass().getClassLoader(),new Class<?>[]{dev.genericpayments.platform.webhooks.application.port.out.OutboxPort.class},
+            (proxy,method,args)->switch(method.getName()) {
+                case "ambientTransaction" -> false;
+                case "complete" -> {completions.add(args);yield true;}
+                default -> throw new AssertionError("Unexpected outbox access: "+method.getName());
+            });
+        var encryption=new dev.genericpayments.platform.shared.application.port.out.EncryptedSecretPort() {
+            public EncryptedValue encrypt(String plaintext){throw new AssertionError("No encryption write");}
+            public String decrypt(EncryptedValue value){return Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32]);}
+        };
+        new dev.genericpayments.platform.webhooks.application.service.CallbackDeliveryService(outbox,encryption,
+            c->c.payload().getBytes(java.nio.charset.StandardCharsets.UTF_8),
+            (endpoint,headers,bytes)->{sent.add(headers);return dev.genericpayments.platform.webhooks.application.port.out.CallbackHttpPort.Result.success(204);},
+            java.time.Clock.fixed(completedAt,java.time.ZoneOffset.UTC)).deliver(claim);
+        assertThat(sent).hasSize(1);
+        assertThat(java.time.Instant.ofEpochSecond(Long.parseLong(sent.getFirst().get("Payment-Timestamp"))))
+            .isEqualTo(java.time.Instant.parse("2026-10-30T11:00:00Z"));
+        assertThat(sent.getFirst().get("Payment-Signature")).startsWith("v1=");
+        assertThat(completions).hasSize(1);
+        assertThat(completions.getFirst()[0]).isSameAs(claim);
+        assertThat(completions.getFirst()[1]).isEqualTo(dev.genericpayments.platform.webhooks.application.port.out.CallbackHttpPort.Result.success(204));
+        assertThat((java.time.Instant)completions.getFirst()[2]).isEqualTo(completedAt).isAfterOrEqualTo(claim.startedAt());
+    }
     static Map<String,String> environment() {
 
 

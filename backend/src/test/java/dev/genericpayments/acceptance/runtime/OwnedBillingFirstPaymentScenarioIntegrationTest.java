@@ -121,7 +121,7 @@ class OwnedBillingFirstPaymentScenarioIntegrationTest extends StripeBillingClock
         assertThat(jdbc.queryForObject("select settlement from subscription_billing_records",String.class)).isEqualTo("CONFIRMED_CASH");assertThat(jdbc.queryForObject("select provider_payment_reference from payments",String.class)).isEqualTo("pi_owned");assertThat(jdbc.queryForObject("select event_type from payment_events",String.class)).isEqualTo("PAYMENT_SUCCEEDED");assertThat(jdbc.queryForObject("select event_type from subscription_events",String.class)).isEqualTo("PERIOD_PAID");
         var snapshots=jdbc.queryForList("select id,payload::text from outbox_events order by id");assertThat(snapshots).hasSize(2);
         observe();assertThat(jdbc.queryForList("select id,payload::text from outbox_events order by id")).isEqualTo(snapshots);assertThat(posts()).isEqualTo(4);
-        var claims=outbox.claimAutomatic("first-payment",10,Instant.now().plusSeconds(1),Duration.ofSeconds(30));assertThat(claims).hasSize(2);
+        var claims=outbox.claimAutomatic("first-payment",10,OwnedBillingFirstPaymentRuntimeTest.callbackClaimUtc(Instant.now()),Duration.ofSeconds(30));assertThat(claims).hasSize(2);
         for(var claim:claims) {
             new CallbackDeliveryService(outbox,encryption,payload,(endpoint,headers,bytes)->{
                 long timestamp=Long.parseLong(headers.get("Payment-Timestamp"));assertThat(Instant.ofEpochSecond(timestamp)).isBetween(began,Instant.now());
