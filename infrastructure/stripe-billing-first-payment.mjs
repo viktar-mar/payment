@@ -2,6 +2,19 @@ import {validateBillingFirstPaymentOptions} from './stripe-billing-first-payment
 import {billingBounded,billingCheck,billingError} from './stripe-billing-limits.mjs';
 import {createBillingFirstPaymentRuntime,billingFirstPaymentDiagnostic,isBillingFirstPaymentDiagnostic} from './stripe-billing-first-payment-runtime.mjs';
 import {billingUuid} from './stripe-billing-provision.mjs';
+// Terminal reporting only; the private PREPARE validator keeps its original set.
+const startupCodes=new Set([
+ ...['ADMISSION','PROOF','PORTS','REPLACEMENT','FINAL_PROOF','LEDGER'].flatMap(stage=>['REJECTED','ABORT','TIMEOUT'].map(category=>'START_BOOTSTRAP_'+stage+'_'+category)),
+ ...['POSTGRES','MAILPIT','BACKEND','DEMO_SITE','CALLBACK_RECEIVER'].flatMap(service=>[
+  ...['PROOF','INTENT','COMMAND','HEALTH_PROOF','HEALTH','HEALTH_WAIT','ACK','PUBLIC_HEALTH'].flatMap(stage=>['REJECTED','ABORT','TIMEOUT'].map(category=>'START_'+service+'_'+stage+'_'+category)),
+  ...['NONZERO_EXIT','OUTPUT_LIMIT','SPAWN_FAILURE'].map(category=>'START_'+service+'_COMMAND_'+category),
+  ...['NOT_RUNNING','UNHEALTHY'].map(category=>'START_'+service+'_HEALTH_'+category),
+ ]),
+]);
+const isTerminalDiagnostic=code=>isBillingFirstPaymentDiagnostic(code)||typeof code==='string'&&startupCodes.has(code);
+function startupDiagnostic(bootstrap){
+ try{const read=Object.getOwnPropertyDescriptor(bootstrap,'startupDiagnostic')?.value;if(typeof read!=='function')return null;const code=read.call(bootstrap);return typeof code==='string'&&startupCodes.has(code)?code:null;}catch{return null;}
+}
 /** Single owner: construction is inert, run is explicit, uncertainty consumes all authority. */
 export async function createOwnedBillingFirstPayment(options,dependencies={}){
  const c=validateBillingFirstPaymentOptions(options);if(!c)throw billingError('OPT_IN_REQUIRED');
@@ -9,13 +22,13 @@ export async function createOwnedBillingFirstPayment(options,dependencies={}){
  const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
  const checkIdentity=v=>{if(!originalIdentity||Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))fail('ACK');};
  const resources=()=>Object.freeze({runId:c.runId,expectedSource:c.expectedSource,scope:'OWNED_INITIAL_PAYMENT',status:state,phase,code:failure,diagnostic,initialAccepted:accepted,full5bAccepted:false,cleanupConfirmed});
- const fail=(code,detail=null)=>{if(failure===null)diagnostic=isBillingFirstPaymentDiagnostic(detail)?detail:null;failure??=code;lifetime.abort();throw billingError(failure);};
- async function cleanup(){return cleanupPromise??=(async()=>{let ok=true;const l={deadline:Math.min(Date.now()+120000,(active?.deadline??Date.now())+120000)};for(const [o,m]of [[runtime,'close'],[cli,'stopListener'],[bootstrap,'stop'],[fixture,'close']])if(o)try{if(await billingBounded(l,x=>o[m](x),30000)!==true)ok=false;}catch{ok=false;}cleanupConfirmed=ok;if(!ok)failure??='CLEANUP';return ok;})();}
+ const fail=(code,detail=null)=>{if(failure===null)diagnostic=isTerminalDiagnostic(detail)?detail:null;failure??=code;lifetime.abort();throw billingError(failure);};
+ async function cleanup(){return cleanupPromise??=(async()=>{let ok=true;const l={deadline:Math.min(Date.now()+120000,(active?.deadline??Date.now())+120000)};for(const [o,m]of [[runtime,'close'],[cli,'stopListener'],[bootstrap,'stop'],[fixture,'close']])if(o)try{if(await billingBounded(l,x=>o[m](x),o===bootstrap?120000:30000)!==true)ok=false;}catch{ok=false;}cleanupConfirmed=ok;if(!ok)failure??='CLEANUP';return ok;})();}
  return Object.freeze({resources,
   async run(journey,limits){if(state!=='NEW')throw billingError('SINGLE_USE');state='RUNNING';let timer,remove=()=>{};
    try{billingCheck(limits);if(typeof journey!=='function'||limits.deadline>Date.now()+2700000)fail('LIMITS');const abort=()=>lifetime.abort();limits.signal?.addEventListener('abort',abort,{once:true});remove=()=>limits.signal?.removeEventListener('abort',abort);timer=setTimeout(abort,Math.max(1,limits.deadline-Date.now()));active={deadline:limits.deadline,signal:lifetime.signal};
-    async function step(name,body,max=120000){if(failure)fail(failure);phase=name;try{return await billingBounded(active,body,max);}catch{fail(active.signal.aborted?'ABORTED':name,preparePending?'PREPARE_REQUEST':null);}}
-    const requireTrue=async(name,body,max)=>{if(await step(name,body,max)!==true)fail(name);};
+    async function step(name,body,max=120000){if(failure)fail(failure);phase=name;try{return await billingBounded(active,body,max);}catch{fail(active.signal.aborted?'ABORTED':name,name==='START'?startupDiagnostic(bootstrap):preparePending?'PREPARE_REQUEST':null);}}
+    const requireTrue=async(name,body,max)=>{if(await step(name,body,max)!==true)fail(name,name==='START'?startupDiagnostic(bootstrap):null);};
     const pf=await step('PREFLIGHT',async l=>(dependencies.preflight??(await import('./stripe-sandbox-owned.mjs')).preflightOwnedBillingFirstPayment)(c,...(dependencies.preflight?[l]:[{},l])));if(pf!==true&&pf?.status!=='READY')fail('PREFLIGHT');
     bootstrap=await step('BOOTSTRAP',async()=>(dependencies.createBootstrap??(await import('./stripe-sandbox-bootstrap.mjs')).createOwnedBillingFirstPaymentBootstrap)(c));
     await requireTrue('PREPARE',()=>bootstrap.prepare(active),2700000);
@@ -63,11 +76,11 @@ export async function createOwnedBillingFirstPayment(options,dependencies={}){
 
 /** The only printable diagnostic: closed fields, after cleanup and rejection. */
 export function formatBillingFirstPaymentDiagnostic(result){
- if(!result||result.status!=='CLOSED'||result.initialAccepted!==false||result.code===null||!isBillingFirstPaymentDiagnostic(result.diagnostic)||typeof result.cleanupConfirmed!=='boolean')return null;
+ if(!result||result.status!=='CLOSED'||result.initialAccepted!==false||result.code===null||!isTerminalDiagnostic(result.diagnostic)||typeof result.cleanupConfirmed!=='boolean')return null;
  return 'owned_initial_payment_diagnostic code='+result.diagnostic+' cleanup='+(result.cleanupConfirmed?'CONFIRMED':'UNCONFIRMED');
 }
 export function parseBillingFirstPaymentDiagnosticLine(line){
  if(typeof line!=='string'||line.length>160)return null;
  const match=/^owned_initial_payment_diagnostic code=([A-Z_]+) cleanup=(CONFIRMED|UNCONFIRMED)$/.exec(line);
- return match&&match[0]===line&&isBillingFirstPaymentDiagnostic(match[1])?line:null;
+ return match&&match[0]===line&&isTerminalDiagnostic(match[1])?line:null;
 }

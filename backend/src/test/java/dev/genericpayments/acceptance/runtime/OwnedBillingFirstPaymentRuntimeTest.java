@@ -7,6 +7,138 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Pure tests: reflection keeps the first failing contract runnable before the launcher exists. */
 class OwnedBillingFirstPaymentRuntimeTest {
+    // Missing unwind, reordered effects, or duplicate disposal breaks the actual guard contracts below.
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"context","listener","scenario","server","executor","set-executor","handler","start"})
+    void startupFailureDisposesOnlyAlreadyAcquiredResourcesAndStopsSetup(String boundary) throws Exception {
+        var calls=new ArrayList<String>();var guard=new StartupFixture(calls);var failure=new java.io.IOException("inert");
+        assertThatThrownBy(()->guard.start(boundary,failure)).isSameAs(failure);
+        var acquired=switch(boundary) {
+            case "context" -> List.<String>of();
+            case "listener","scenario" -> List.of("context");
+            case "server" -> List.of("scenario","context");
+            case "executor" -> List.of("scenario","server","context");
+            default -> List.of("scenario","server","executor","context");
+        };
+        assertThat(guard.closed).containsExactlyElementsOf(acquired);
+        assertThat(calls.getLast()).isEqualTo(boundary);
+        guard.close();guard.contextClosed();assertThat(guard.closed).containsExactlyElementsOf(acquired);
+        assertThatThrownBy(()->guard.run(()->calls.add("provider"))).isInstanceOf(IllegalStateException.class);
+        assertThat(calls).doesNotContain("provider");
+    }
+    @Test void successfulStartupLivesUntilContextCloseWithoutRecursiveContextDisposal() throws Exception {
+        var guard=new StartupFixture(new ArrayList<>());guard.start(null,new java.io.IOException("unused"));
+        assertThat(guard.closed).isEmpty();
+        // The context already owns its normal close. Its event must close children only.
+        guard.contextClosed();guard.contextClosed();guard.close();
+        assertThat(guard.closed).containsExactly("scenario","server","executor");
+        assertThatThrownBy(()->guard.acquire("late",false,()->"late")).isInstanceOf(IllegalStateException.class);
+        assertThat(guard.closed).containsExactly("scenario","server","executor");
+    }
+    @Test void everyCleanupIsAttemptedEvenWhenAllThrowAndOriginalStartupFailureSurvives() throws Exception {
+        var guard=new StartupFixture(new ArrayList<>());guard.throwOnClose=true;
+        var failure=hostileFailure();assertThatThrownBy(()->guard.start("start",failure)).isSameAs(failure);
+        assertThat(guard.closed).containsExactly("scenario","server","executor","context");
+        guard.close();assertThat(guard.closed).hasSize(4);
+    }
+    @Test void normalContextCloseContinuesAfterThrowingChildCleanup() throws Exception {
+        var guard=new StartupFixture(new ArrayList<>());guard.start(null,new java.io.IOException("unused"));guard.throwOnClose=true;
+        guard.contextClosed();guard.close();assertThat(guard.closed).containsExactly("scenario","server","executor");
+    }
+    // A close event may already have selected its listeners while Spring still reports active.
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"true,true,true","true,false,true","false,false,true","false,true,false"})
+    void postRegistrationContextStateStopsMissedCloseBeforeLaterEffects(boolean closing,boolean active,boolean stopped) throws Exception {
+        var guard=new StartupFixture(new ArrayList<>());guard.acquire("context",true,()->"context");
+        org.assertj.core.api.ThrowableAssert.ThrowingCallable registered=()->guard.run(()->{
+            guard.calls.add("listener-registered");
+            // No context-close event is delivered to the guard in this regression.
+            guard.checkContextAfterListenerRegistration(closing,active);
+        });
+        if(stopped) {
+            assertThatThrownBy(registered).isInstanceOf(IllegalStateException.class);
+            for(String name:List.of("scenario","server","executor"))
+                assertThatThrownBy(()->guard.acquire(name,false,()->{guard.calls.add(name);return name;})).isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(()->guard.run(()->guard.calls.add("start-or-provider"))).isInstanceOf(IllegalStateException.class);
+            guard.close();guard.contextClosed();
+            assertThat(guard.calls).containsExactly("listener-registered");
+            assertThat(guard.closed).as("context shutdown is already owned externally").isEmpty();
+        } else {
+            assertThatCode(registered).doesNotThrowAnyException();
+            guard.acquire("scenario",false,()->{guard.calls.add("scenario");return "scenario";});
+            assertThat(guard.closed).isEmpty();assertThat(guard.calls).containsExactly("listener-registered","scenario");
+            guard.contextClosed();assertThat(guard.closed).containsExactly("scenario");
+        }
+    }
+    @Test void contextCloseDuringListenerRegistrationPreventsAllLaterAcquisition() throws Exception {
+        var guard=new StartupFixture(new ArrayList<>());guard.acquire("context",true,()->"context");
+        assertThatThrownBy(()->guard.run(()->{guard.contextClosedUnchecked();})).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(()->guard.acquire("scenario",false,()->{guard.calls.add("provider");return "scenario";})).isInstanceOf(IllegalStateException.class);
+        assertThat(guard.calls).doesNotContain("provider");assertThat(guard.closed).isEmpty();
+    }
+    @Test void contextCloseDuringAcquisitionDisposesReturnedResourceWithoutInstallingIt() throws Exception {
+        var guard=new StartupFixture(new ArrayList<>());guard.acquire("context",true,()->"context");
+        assertThatThrownBy(()->guard.acquire("server",false,()->{guard.contextClosed();return "server";})).isInstanceOf(IllegalStateException.class);
+        guard.close();assertThat(guard.closed).containsExactly("server");
+    }
+    @Test void contextCloseInterleavedWithFailureUnwindDoesNotCloseContextAgain() throws Exception {
+        var guard=new StartupFixture(new ArrayList<>());guard.onChildClose=guard::contextClosedUnchecked;
+        var failure=hostileFailure();assertThatThrownBy(()->guard.start("start",failure)).isSameAs(failure);
+        assertThat(guard.closed).containsExactly("scenario","server","executor");guard.close();assertThat(guard.closed).hasSize(3);
+    }
+    @Test void startupErrorsAlsoUnwindAndDoNotDispatchLaterSetup() throws Exception {
+        var guard=new StartupFixture(new ArrayList<>());var failure=new AssertionError("inert");
+        assertThatThrownBy(()->guard.start("handler",failure)).isSameAs(failure);
+        assertThat(guard.closed).containsExactly("scenario","server","executor","context");assertThat(guard.calls).doesNotContain("start");
+    }
+    @Test void argumentAndEnvironmentAdmissionRejectBeforeLifecycleFactory() throws Exception {
+        var methods=Arrays.stream(OwnedBillingFirstPaymentRuntime.class.getDeclaredMethods()).map(Method::getName).toList();
+        assertThat(methods).as("main must use an admission-gated lifecycle factory").contains("admitted");
+        var method=OwnedBillingFirstPaymentRuntime.class.getDeclaredMethod("admitted",String[].class,Map.class,java.util.function.Function.class);
+        var calls=new ArrayList<Object>();java.util.function.Function<OwnedBillingFirstPaymentRuntime.Admission,Object> factory=a->{calls.add(a);return a;};
+        var env=environment();env.put("PAYMENT_RUNTIME_SOURCE_SHA","a".repeat(40));
+        assertThatThrownBy(()->invoke(method,null,new String[]{"--unsafe"},env,factory)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(()->invoke(method,null,new String[0],Map.of(),factory)).isInstanceOf(IllegalArgumentException.class);assertThat(calls).isEmpty();
+        assertThat(invoke(method,null,new String[0],env,factory)).isSameAs(calls.getFirst());assertThat(calls).hasSize(1);
+    }
+    private static Object invoke(Method method,Object receiver,Object... args) throws Exception {
+        try{return method.invoke(receiver,args);}catch(InvocationTargetException failure){
+            if(failure.getCause() instanceof Error error)throw error;throw (Exception)failure.getCause();
+        }
+    }
+    private static final class StartupFixture {
+        final Object guard;final Class<?> type;final List<String> calls,closed=new ArrayList<>();boolean throwOnClose;Runnable onChildClose=()->{};
+        StartupFixture(List<String> calls) throws Exception {
+            this.calls=calls;
+            var types=Arrays.stream(OwnedBillingFirstPaymentRuntime.class.getDeclaredClasses()).filter(c->c.getSimpleName().equals("StartupResources")).toList();
+            assertThat(types).as("actual startup must own and unwind acquired resources").hasSize(1);
+            type=types.getFirst();var constructor=type.getDeclaredConstructor(OwnedBillingFirstPaymentRuntime.Admission.class);constructor.setAccessible(true);
+            guard=constructor.newInstance(OwnedBillingFirstPaymentRuntime.admit(environment(),"a".repeat(40)));
+        }
+        Object acquire(String name,boolean context,java.util.concurrent.Callable<String> factory) throws Exception {
+            java.util.function.Consumer<String> dispose=value->{closed.add(value);if(context)contextClosedUnchecked();else onChildClose.run();if(throwOnClose)throw hostileFailure();};
+            return invoke(type.getDeclaredMethod(context?"acquireContext":"acquire",java.util.concurrent.Callable.class,java.util.function.Consumer.class),guard,factory,dispose);
+        }
+        void run(Runnable action) throws Exception {invoke(type.getDeclaredMethod("run",Runnable.class),guard,action);}
+        void checkContextAfterListenerRegistration(boolean closing,boolean active) {
+            try{invoke(type.getDeclaredMethod("checkContextAfterListenerRegistration",boolean.class,boolean.class),guard,closing,active);}
+            catch(Exception failure){throw new AssertionError(failure);}
+        }
+        void close() throws Exception {invoke(type.getDeclaredMethod("close"),guard);}
+        void contextClosed() throws Exception {invoke(type.getDeclaredMethod("contextClosed"),guard);}
+        void contextClosedUnchecked(){try{contextClosed();}catch(Exception failure){throw new AssertionError(failure);}}
+        void start(String failAt,Throwable failure) throws Exception {
+            for(String boundary:List.of("context","listener","scenario","server","executor","set-executor","handler","start")) {
+                if(Set.of("context","scenario","server","executor").contains(boundary))acquire(boundary,boundary.equals("context"),()->{
+                    calls.add(boundary);if(boundary.equals(failAt)){if(failure instanceof Error error)throw error;throw (Exception)failure;}return boundary;});
+                else run(()->{calls.add(boundary);if(boundary.equals(failAt)){if(failure instanceof Error error)throw error;if(failure instanceof RuntimeException runtime)throw runtime;
+                    // Checked acquisition failures are covered above; wiring throws runtime failures in production.
+                    sneaky(failure);}});
+            }
+        }
+        @SuppressWarnings("unchecked") private static <E extends Throwable> void sneaky(Throwable failure) throws E {throw (E)failure;}
+    }
+
     @Test void hostedScenarioNamesExplicitApplicationRootWithoutInitialization() throws Exception {
         // Never initialize/instantiate this hosted fixture or ask Spring to bootstrap a context.
         var scenario=Class.forName("dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentScenarioIntegrationTest",false,getClass().getClassLoader());

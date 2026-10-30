@@ -120,19 +120,76 @@ public final class OwnedBillingFirstPaymentRuntime {
     public static class BillingTimeConfiguration {
         @Bean @Primary OwnedSubscriptionBillingTime ownedInitialBillingTime(JdbcTemplate jdbc){return new OwnedSubscriptionBillingTime(jdbc);}
     }
-    public static void main(String[] args) throws Exception {
-        // No application construction before the complete environment gate. No launch arguments override isolation.
+    static <T> T admitted(String[] args,Map<String,String> env,java.util.function.Function<Admission,T> factory) {
         if(args.length!=0)throw new IllegalArgumentException("INITIAL_PAYMENT_ADMISSION_DENIED");
-        var env=System.getenv();var admission=admit(env,env.get("PAYMENT_RUNTIME_SOURCE_SHA"));
+        return factory.apply(admit(env,env.get("PAYMENT_RUNTIME_SOURCE_SHA")));
+    }
+    /** Owns only startup resources; closes children before the context, without reentering its close event. */
+    static final class StartupResources {
+        final Admission admission;
+        private final List<Runnable> cleanup=new ArrayList<>();
+        private Runnable closeContext;private boolean closed,contextClosing;
+        StartupResources(Admission admission){this.admission=admission;}
+        <T> T acquireContext(Callable<T> factory,java.util.function.Consumer<T> dispose) throws Exception {
+            return acquire(factory,dispose,true);
+        }
+        <T> T acquire(Callable<T> factory,java.util.function.Consumer<T> dispose) throws Exception {
+            return acquire(factory,dispose,false);
+        }
+        private <T> T acquire(Callable<T> factory,java.util.function.Consumer<T> dispose,boolean context) throws Exception {
+            try {
+                synchronized(this) {
+                    checkOpen();
+                    T resource=factory.call();Runnable close=()->dispose.accept(resource);
+                    // A synchronous close event can arrive from inside an acquisition callback.
+                    if(closed){quietly(close);throw denied();}
+                    if(context)closeContext=close;else cleanup.add(close);
+                    return resource;
+                }
+            }catch(Exception|Error failure){close();throw failure;}
+        }
+        void run(Runnable action) throws Exception {
+            try {synchronized(this){checkOpen();action.run();checkOpen();}}
+            catch(Exception|Error failure){close();throw failure;}
+        }
+        void checkContextAfterListenerRegistration(boolean closing,boolean active) {
+            if(closing||!active)contextClosed();
+        }
+        private void checkOpen(){if(closed)throw denied();}
+        void contextClosed(){synchronized(this){contextClosing=true;}close();}
+        void close() {
+            List<Runnable> children;
+            synchronized(this){if(closed)return;closed=true;children=new ArrayList<>(cleanup);cleanup.clear();}
+            // Failure unwind releases the setup monitor before disposal; close events never request context close.
+            for(var child:children)quietly(child);
+            Runnable context;
+            synchronized(this){context=contextClosing?null:closeContext;contextClosing=true;closeContext=null;}
+            if(context!=null)quietly(context);
+        }
+        private static void quietly(Runnable close){try{close.run();}catch(Throwable ignored){/* Preserve the setup failure; continue unwind without raw diagnostics. */}}
+    }
+    public static void main(String[] args) throws Exception {
+        // No lifecycle/application construction before the complete environment and arguments gate.
+        var resources=admitted(args,System.getenv(),StartupResources::new);
+        var admission=resources.admission;
         var deadline=Instant.now().plus(Duration.ofMinutes(45));
-        System.setProperty("payment.subscriptions.scheduling-enabled","false");
-        var app=new SpringApplication(PaymentPlatformApplication.class,BillingTimeConfiguration.class);app.setAdditionalProfiles("local");
-        var context=app.run();
-        var scenario=new OwnedBillingFirstPaymentScenario(admission,context::getBean,Clock.systemUTC(),deadline);
-        var server=HttpServer.create(new InetSocketAddress(admission.bind(),admission.port()),4);
-        var executor=Executors.newVirtualThreadPerTaskExecutor();server.setExecutor(executor);
-        server.createContext("/",new Handler(scenario,admission.capability()));
-        context.addApplicationListener(event->{if(event instanceof org.springframework.context.event.ContextClosedEvent){scenario.abort();server.stop(0);executor.shutdownNow();}});
-        server.start();
+        var context=resources.acquireContext(()->{
+            System.setProperty("payment.subscriptions.scheduling-enabled","false");
+            var app=new SpringApplication(PaymentPlatformApplication.class,BillingTimeConfiguration.class);app.setAdditionalProfiles("local");
+            return app.run();
+        },org.springframework.context.ConfigurableApplicationContext::close);
+        resources.run(()->{
+            context.addApplicationListener(event->{
+                if(event instanceof org.springframework.context.event.ContextClosedEvent closing&&closing.getApplicationContext()==context)resources.contextClosed();
+            });
+            // A close before listener registration must not leave newly acquired children alive.
+            resources.checkContextAfterListenerRegistration(context.isClosed(),context.isActive());
+        });
+        var scenario=resources.acquire(()->new OwnedBillingFirstPaymentScenario(admission,context::getBean,Clock.systemUTC(),deadline),OwnedBillingFirstPaymentScenario::abort);
+        var server=resources.acquire(()->HttpServer.create(new InetSocketAddress(admission.bind(),admission.port()),4),s->s.stop(0));
+        var executor=resources.acquire(Executors::newVirtualThreadPerTaskExecutor,ExecutorService::shutdownNow);
+        resources.run(()->server.setExecutor(executor));
+        resources.run(()->server.createContext("/",new Handler(scenario,admission.capability())));
+        resources.run(server::start);
     }
 }

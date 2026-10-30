@@ -171,6 +171,15 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   let inputs=null,admin=null,providerKeys=null,diagnosticConfigured=false,controlCapability;
   const runtimeEnv=key=>({PAYMENT_STRIPE_BILLING_FIRST_PAYMENT:'true',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_RUN_ID:runId,PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_SOURCE_SHA:expectedSource,PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_FROZEN_TIME:String(options.frozenTime),PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_CONTROL_PORT:String(options.controlPort),PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_CONTROL_BIND:'0.0.0.0',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_CONTROL_KEY:key});
   let terminalBuild=false,buildDiagnostic=null,buildxIdentity=null;
+  // First-payment START only: local checkpoints and trusted internal failure categories.
+  let startupCode=null,startupStage='ADMISSION',startupService='BOOTSTRAP';
+  const startupStep=(stage,service='BOOTSTRAP')=>{if(firstPayment&&startupCode===null){startupStage=stage;startupService=service==='BOOTSTRAP'?service:service.toUpperCase().replaceAll('-','_');}};
+  function retainStartup(error,controller,external) {
+    if(!firstPayment||startupCode!==null)return;
+    const category=failures.get(error)?.category??(controller.signal.aborted?(external?.aborted?'ABORT':'TIMEOUT'):null);
+    const allowed=category==='ABORT'||category==='TIMEOUT'||startupStage==='COMMAND'&&['NONZERO_EXIT','OUTPUT_LIMIT','SPAWN_FAILURE'].includes(category)||startupStage==='HEALTH'&&['NOT_RUNNING','UNHEALTHY'].includes(category);
+    startupCode='START_'+startupService+'_'+startupStage+'_'+(allowed?category:'REJECTED');
+  }
   const buildxDirectory=directory+'/buildx',dockerEnvironment=Object.freeze({...CHILD_ENV,DOCKER_CONFIG:'/private/var/empty',BUILDX_CONFIG:buildxDirectory});
   const recorded={images:{},network:null,volumes:{},containers:{},retiredBackend:null},intents=[],privateIdentities=new Map();
   const ownLabels=kind=>({'payment.sandbox.project':project,'payment.sandbox.run':runId,'payment.sandbox.kind':kind});
@@ -187,6 +196,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     if(terminalBuild&&!diagnostic)throw fixed(phase+'_PENDING');
     if(busy)throw fixed('OPERATION_BUSY');busy=true;
     const controller=new AbortController();let timer,external,original,onAbort;
+    const captureStartup=firstPayment&&phase==='START'&&!pending;if(captureStartup)startupStep('ADMISSION');
     try {
       if(pending&&!cleanup)fail();
       if(adminChild){
@@ -200,14 +210,14 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
         if(manualDeadline===null){if(limits.deadline>io.now()+45*60000)fail();manualDeadline=limits.deadline;}
         if(cleanup?limits.deadline>manualDeadline+120000:phase==='VERIFY'||adminChild?limits.deadline>manualDeadline:limits.deadline!==manualDeadline)fail();
       }
-      external=limits.signal;onAbort=()=>controller.abort();external?.addEventListener('abort',onAbort,{once:true});if(external?.aborted)controller.abort();
+      external=limits.signal;onAbort=()=>{if(captureStartup)retainStartup(diagnosticFailure(external?.aborted?'ABORT':'TIMEOUT'),controller,external);controller.abort();};external?.addEventListener('abort',onAbort,{once:true});if(external?.aborted)controller.abort();
       // A clipped manual child supplements the captured startup authority.
       original=adminChild?startup?.signal:undefined;original?.addEventListener('abort',onAbort,{once:true});if(original?.aborted)controller.abort();
       timer=io.setTimeout(onAbort,Math.min(limits.deadline-io.now(),2147483647));
       const context={deadline:limits.deadline,signal:controller.signal,externalSignal:external};check(context);
       const result=await body(context);
       if(!diagnostic||context.buildCompleted!==true)check(context);return result;
-    } catch {pending=true;throw fixed(phase+'_PENDING');}
+    } catch(error) {if(captureStartup)retainStartup(error,controller,external);pending=true;throw fixed(phase+'_PENDING');}
     finally {io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);original?.removeEventListener('abort',onAbort);busy=false;}
   }
   async function execute(file,args,settings,context) {
@@ -629,24 +639,26 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   }
   async function healthy(service,context) {
     for(;;) {
-      await infrastructureProof(context);const proof=await containerProof(service,recorded.containers[service].id,context);
-      if(!proof.state.Running||proof.state.Status!=='running'||!['starting','healthy'].includes(proof.state.Health))fail();
-      if(proof.state.Health==='healthy') {await containerProof(service,proof.safe.id,context,{liveRequired:true});return;}
-      await sleepForHealth(context);
+      startupStep('HEALTH_PROOF',service);await infrastructureProof(context);const proof=await containerProof(service,recorded.containers[service].id,context);
+      startupStep('HEALTH',service);
+      if(!proof.state.Running||proof.state.Status!=='running'){if(firstPayment)throw diagnosticFailure('NOT_RUNNING');fail();}
+      if(!['starting','healthy'].includes(proof.state.Health)){if(firstPayment&&proof.state.Health==='unhealthy')throw diagnosticFailure('UNHEALTHY');fail();}
+      if(proof.state.Health==='healthy') {startupStep('HEALTH_PROOF',service);await containerProof(service,proof.safe.id,context,{liveRequired:true});return;}
+      startupStep('HEALTH_WAIT',service);await sleepForHealth(context);
     }
   }
   async function healthRequests(context) {
     for(const [service,path] of [['backend','/actuator/health/readiness'],['demo-site','/health'],['callback-receiver','/health']]) {
-      await infrastructureProof(context);await containerProof(service,recorded.containers[service].id,context,{liveRequired:true});
+      startupStep('HEALTH_PROOF',service);await infrastructureProof(context);await containerProof(service,recorded.containers[service].id,context,{liveRequired:true});
       const endpoint=service==='demo-site'?endpoints.demo:service==='callback-receiver'?endpoints.receiver:endpoints.backend;
-      if(await io.health(endpoint+path,{signal:context.signal,deadline:Math.min(context.deadline,io.now()+10000)})!==true)fail();check(context);
+      startupStep('PUBLIC_HEALTH',service);if(await io.health(endpoint+path,{signal:context.signal,deadline:Math.min(context.deadline,io.now()+10000)})!==true)fail();check(context);
     }
   }
   async function start(context) {
     if(status!=='PREPARED'||!(diagnostic?diagnosticConfigured:webhookReady)||!issuerProved||retired||live)fail();
-    await sourceIdentity(context);await topology(context,false,true);
-    for(const port of [...Object.values(ports),...(firstPayment?[options.controlPort]:[])])if(await io.portAvailable(port,'127.0.0.1',context)!==true)fail();
-    if(!diagnostic){if(!manualPayment){const old=recorded.containers.backend;await containerProof('backend',old.id,context,{neverStarted:true});
+    startupStep('PROOF');await sourceIdentity(context);await topology(context,false,true);
+    startupStep('PORTS');for(const port of [...Object.values(ports),...(firstPayment?[options.controlPort]:[])])if(await io.portAvailable(port,'127.0.0.1',context)!==true)fail();
+    startupStep('REPLACEMENT');if(!diagnostic){if(!manualPayment){const old=recorded.containers.backend;await containerProof('backend',old.id,context,{neverStarted:true});
     await intent('RETIRE_PLACEHOLDER',old.id,context);
     const removed=await docker(['container','rm',old.id],context);if(removed.stdout.trim()!==old.id)fail();
     recorded.retiredBackend=old;delete recorded.containers.backend;retired=true;await projectProof(context);await acknowledgement(context);
@@ -656,11 +668,11 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     const proof=await containerProof('backend',project+'-backend',context,{neverStarted:true});recorded.containers.backend=proof.safe;
     await topology(context,false,true);await acknowledgement(context);}
     for(const service of SERVICES) {
-      await topology(context);await containerProof(service,recorded.containers[service].id,context,{neverStarted:true});
-      await intent('START_SERVICE',recorded.containers[service].id,context);await docker(['container','start',recorded.containers[service].id],context);
-      await healthy(service,context);await acknowledgement(context);
+      startupStep('PROOF',service);await topology(context);await containerProof(service,recorded.containers[service].id,context,{neverStarted:true});
+      startupStep('INTENT',service);await intent('START_SERVICE',recorded.containers[service].id,context);startupStep('COMMAND',service);await docker(['container','start',recorded.containers[service].id],context);
+      await healthy(service,context);startupStep('ACK',service);await acknowledgement(context);
     }
-    await topology(context,true);await healthRequests(context);live=true;status='LIVE';await ledger(context);return true;
+    startupStep('FINAL_PROOF');await topology(context,true);await healthRequests(context);live=true;status='LIVE';startupStep('LEDGER');await ledger(context);return true;
   }
   async function verify(context) {
     if(!live||status!=='LIVE')fail();await sourceIdentity(context);await topology(context,true);await healthRequests(context);return true;
@@ -675,6 +687,11 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   }
   async function stop(context) {
     // Root must stop its R2 listener before calling this capability.
+    // First-payment cleanup can prove stopped state without acknowledging an uncertain start.
+    const ownedStartsOnly=firstPayment&&[...SERVICES,'issuer-installer','issuer-probe'].every(service=>recorded.containers[service])
+      &&intents.every(value=>value.status==='ACKNOWLEDGED'||value.status==='DISPATCHING'&&value.action==='START_SERVICE'
+        &&fullId(value.name)&&SERVICES.some(service=>recorded.containers[service].id===value.name));
+    if(firstPayment&&!ownedStartsOnly)fail();
     await infrastructureProof(context);await projectProof(context);
     for(const [service,container] of Object.entries(recorded.containers))await containerProof(service,container.id,context,{cleanupOnly:true});
     for(const [service,container] of Object.entries(recorded.containers).reverse()) {
@@ -684,7 +701,11 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
         const stopped=await containerProof(service,container.id,context,{cleanupOnly:true});if(stopped.state.Running||!['exited','created'].includes(stopped.state.Status))fail();
       }
     }
-    await projectProof(context);if(intents.some(value=>value.status!=='ACKNOWLEDGED'))fail();
+    if(firstPayment)for(const [service,container] of Object.entries(recorded.containers)) {
+      const proof=await containerProof(service,container.id,context,{cleanupOnly:true});
+      if(proof.state.Running||!['exited','created'].includes(proof.state.Status))fail();
+    }
+    await projectProof(context);if(!ownedStartsOnly&&intents.some(value=>value.status!=='ACKNOWLEDGED'))fail();
     live=false;status='STOPPED';await ledger(context);if(lock) {await lock.close();lock=null;}return true;
   }
 
@@ -717,6 +738,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     if(typeof callback!=='function')fail();await verify(context);
     if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({host:'127.0.0.1',port:ports.postgres,database:'payment',user:'payment',password:inputs.PAYMENT_DB_PASSWORD}));}),context)!==true)fail();return true;
   },{adminChild:true});
+  if(firstPayment)capabilities.startupDiagnostic=()=>startupCode;
   if(firstPayment)capabilities.withFirstPaymentRuntime=(callback,limits)=>operation('ADMIN',limits,async context=>{if(typeof callback!=='function'||!controlCapability)fail();await verify(context);if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({endpoint:'http://127.0.0.1:'+options.controlPort,capability:controlCapability}));}),context)!==true)fail();return true;},{adminChild:true});
   return Object.freeze(capabilities);
 }

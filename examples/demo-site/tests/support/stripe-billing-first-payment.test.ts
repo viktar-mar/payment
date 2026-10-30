@@ -175,3 +175,21 @@ for(const stage of ["ACTION_SCOPE","ACTION_AUTHORITY","ACTION_VERIFICATION","ACT
   assert.deepEqual(lines,[handoff+'\n',line+'\n']);
  }finally{process.stdout.write=original;}
 });
+
+// Task3: terminal acceptance is finite; private protocol acceptance stays separate.
+for(const code of ['START_BACKEND_COMMAND_REJECTED','START_BACKEND_COMMAND_NONZERO_EXIT','START_BACKEND_COMMAND_OUTPUT_LIMIT','START_BACKEND_COMMAND_SPAWN_FAILURE','START_BACKEND_HEALTH_NOT_RUNNING','START_BACKEND_HEALTH_UNHEALTHY','START_BACKEND_HEALTH_PROOF_REJECTED','START_BACKEND_PUBLIC_HEALTH_REJECTED','START_BACKEND_COMMAND_ABORT','START_BACKEND_COMMAND_TIMEOUT','START_BACKEND_HEALTH_WAIT_ABORT','START_BACKEND_HEALTH_WAIT_TIMEOUT','START_BACKEND_HEALTH_REJECTED'])test('startup diagnostic reporter validates '+code+' only once',async()=>{
+ const {default:Reporter}=await import(new URL('./stripe-billing-first-payment-reporter.ts',import.meta.url).href);
+ const {formatBillingFirstPaymentDiagnostic,parseBillingFirstPaymentDiagnosticLine}=await import(new URL('../../../../infrastructure/stripe-billing-first-payment.mjs',import.meta.url).href);
+ const {createOwnedBillingFirstPayment}=await import(new URL('../../../../infrastructure/stripe-billing-first-payment.mjs',import.meta.url).href);
+ const owner=await createOwnedBillingFirstPayment({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT:'true'},runId:id('1'),expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports:{backend:18080,demo:18081,receiver:18082,postgres:15432,mailpitHttp:18025,mailpitSmtp:11025},controlPort:18083,frozenTime:1790000000,approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_success'},{preflight:async()=>true,createBootstrap:async()=>({prepare:async()=>true,resources:()=>({cliDirectory:'/synthetic'}),start:async()=>{throw null;},startupDiagnostic:()=>code,stop:async()=>{throw null;}}),createCli:async()=>({validateBinding:async()=>true,startListener:async()=>true,stopListener:async()=>true}),login:async()=>true});
+ await assert.rejects(owner.run(async()=>{throw Error('unexpected journey');},{deadline:Date.now()+10000}));const result=await owner.close();assert.equal(result.initialAccepted,false);assert.equal(result.code,'START');assert.equal(result.diagnostic,code);
+ const line=formatBillingFirstPaymentDiagnostic(result);assert.equal(line,'owned_initial_payment_diagnostic code='+code+' cleanup=UNCONFIRMED');assert.equal(parseBillingFirstPaymentDiagnosticLine(line),line);
+ const original=process.stdout.write,lines:string[]=[];process.stdout.write=((v:unknown)=>{lines.push(String(v));return true;}) as typeof process.stdout.write;
+ try{
+  const reporter=new Reporter(),handoff='Authorize the isolated Sandbox CLI at https://access.stripe.com/fixture using code ABCD EFGH. Keep this terminal open.';
+  reporter.onStdOut(handoff+'\n');reporter.onStdOut(handoff+'\n');
+  for(const bad of ['START_PRIVATE_COMMAND_REJECTED','START_BACKEND_COMMAND_SECRET','START_BACKEND_HEALTH_PRIVATE'])reporter.onStdOut('owned_initial_payment_diagnostic code='+bad+' cleanup=CONFIRMED\n');
+  reporter.onStdOut(line+' private-sentinel\n');reporter.onStdOut(line.slice(0,31));reporter.onStdOut(line.slice(31)+'\n');reporter.onStdOut(line+'\n');reporter.onStdErr();
+  assert.deepEqual(lines,[handoff+'\n',line+'\n']);
+ }finally{process.stdout.write=original;}
+});

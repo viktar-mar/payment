@@ -11,6 +11,7 @@ dev/genericpayments/acceptance/runtime/OwnedBillingFirstPaymentRuntime$Operation
 dev/genericpayments/acceptance/runtime/OwnedBillingFirstPaymentRuntime$State.class
 dev/genericpayments/acceptance/runtime/OwnedBillingFirstPaymentRuntime$Handler.class
 dev/genericpayments/acceptance/runtime/OwnedBillingFirstPaymentRuntime$BillingTimeConfiguration.class
+dev/genericpayments/acceptance/runtime/OwnedBillingFirstPaymentRuntime$StartupResources.class
 dev/genericpayments/acceptance/runtime/OwnedBillingFirstPaymentScenario.class
 dev/genericpayments/platform/support/OwnedSubscriptionBillingTime.class'
 # Validate the whole inventory before creating any export. Reject symlink ancestors too.
@@ -20,7 +21,7 @@ printf '%s\n' "$inventory" | while IFS= read -r class; do
   while [ "$parent" != . ]; do [ ! -L "$source_dir/$parent" ] || exit 66; parent=$(dirname "$parent"); done
 done
 actual=$(find "$source_dir/dev/genericpayments/acceptance/runtime" -maxdepth 1 \( -name 'OwnedBillingFirstPaymentRuntime.class' -o -name 'OwnedBillingFirstPaymentRuntime$*.class' -o -name 'OwnedBillingFirstPaymentScenario.class' -o -name 'OwnedBillingFirstPaymentScenario$*.class' \) | wc -l | tr -d ' ')
-[ "$actual" = 7 ] || exit 67
+[ "$actual" = 8 ] || exit 67
 mkdir "$destination"
 printf '%s\n' "$inventory" | while IFS= read -r class; do
   mkdir -p "$destination/$(dirname "$class")"

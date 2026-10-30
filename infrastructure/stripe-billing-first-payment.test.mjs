@@ -140,3 +140,54 @@ for(const stage of ["ACTION_SCOPE","ACTION_AUTHORITY","ACTION_VERIFICATION","ACT
  assert.ok(!h.calls.some(c=>c.startsWith('confirm-dispatch:')||c==='observe'||c==='create-ack'));
  assert.deepEqual(h.calls.filter(c=>['listener-stop','stop','fixture-close'].includes(c)),['listener-stop','stop','fixture-close']);
 });
+
+// Break: clipping bootstrap.stop to 30s loses valid cleanup inside its shared 120s.
+for(const listenerMs of [0,25000])test('startup failure permits 45s owned stop after '+listenerMs+'ms listener cleanup',async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const h=harness();let enteredListener,enteredStop;const listening=new Promise(r=>enteredListener=r),stopping=new Promise(r=>enteredStop=r);let stopLimits;
+ h.bootstrap.start=async()=>{h.calls.push('start');throw null;};
+ h.cli.stopListener=async()=>{h.calls.push('listener-stop');enteredListener();await new Promise(r=>setTimeout(r,listenerMs));return true;};
+ h.bootstrap.stop=async l=>{h.calls.push('stop');stopLimits=l;enteredStop();await new Promise(r=>setTimeout(r,45000));return true;};
+ const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies),running=owner.run(journey,{deadline:101000}),rejected=assert.rejects(running,/billing_START/);
+ await listening;t.mock.timers.tick(listenerMs);await stopping;t.mock.timers.tick(45000);await rejected;
+ assert.equal(stopLimits.deadline,121000);assert.equal(owner.resources().cleanupConfirmed,true);assert.equal(owner.resources().code,'START');assert.equal(owner.resources().initialAccepted,false);
+ const closed=await owner.close();assert.equal(closed.cleanupConfirmed,true);assert.equal(h.calls.filter(c=>c==='stop').length,1);assert.deepEqual(h.calls.filter(c=>['listener-stop','stop'].includes(c)),['listener-stop','stop']);
+});
+for(const lateMs of [95000,95001])test('startup cleanup keeps original shared ceiling when stop resolves at '+(25000+lateMs)+'ms',async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const h=harness();let enteredListener,enteredStop,release;const listening=new Promise(r=>enteredListener=r),stopping=new Promise(r=>enteredStop=r);let stopLimits;
+ h.bootstrap.start=async()=>{throw null;};h.cli.stopListener=async()=>{enteredListener();await new Promise(r=>setTimeout(r,25000));return true;};
+ h.bootstrap.stop=async l=>{h.calls.push('stop');stopLimits=l;enteredStop();return new Promise(r=>release=r);};
+ const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies),running=owner.run(journey,{deadline:101000}),rejected=assert.rejects(running,/billing_START/);
+ await listening;t.mock.timers.tick(25000);await stopping;assert.equal(stopLimits.deadline,121000);t.mock.timers.tick(lateMs);await rejected;
+ assert.equal(stopLimits.signal.aborted,true);assert.equal(owner.resources().cleanupConfirmed,false);release(true);await Promise.resolve();await Promise.resolve();
+ assert.equal((await owner.close()).cleanupConfirmed,false);assert.equal(owner.resources().code,'START');assert.equal(h.calls.filter(c=>c==='stop').length,1);
+});
+
+for(const diagnostic of ['START_BACKEND_COMMAND_REJECTED','START_BACKEND_COMMAND_NONZERO_EXIT','START_BACKEND_COMMAND_OUTPUT_LIMIT','START_BACKEND_COMMAND_SPAWN_FAILURE','START_BACKEND_HEALTH_NOT_RUNNING','START_BACKEND_HEALTH_UNHEALTHY','START_BACKEND_HEALTH_PROOF_REJECTED','START_BACKEND_PUBLIC_HEALTH_REJECTED','START_BACKEND_COMMAND_ABORT','START_BACKEND_COMMAND_TIMEOUT','START_BACKEND_HEALTH_WAIT_ABORT','START_BACKEND_HEALTH_WAIT_TIMEOUT','START_BACKEND_HEALTH_REJECTED'])test('startup diagnostic owner retains '+diagnostic+' before cleanup',async()=>{
+ const h=harness();let first=diagnostic,reads=0,errorReads=0;h.bootstrap.startupDiagnostic=()=>{reads++;return first;};
+ h.bootstrap.start=async()=>{h.calls.push('start');throw new Proxy({diagnostic},{get(){errorReads++;throw null;}});};
+ h.cli.stopListener=async()=>{h.calls.push('listener-stop');first='START_BACKEND_COMMAND_ABORT';throw null;};h.bootstrap.stop=async()=>{h.calls.push('stop');first=null;throw null;};
+ const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);await assert.rejects(owner.run(journey,limits()));const r=await owner.close();
+ assert.equal(r.diagnostic,diagnostic);assert.equal(r.phase,'START');assert.equal(r.code,'START');assert.equal(r.cleanupConfirmed,false);assert.equal(r.initialAccepted,false);assert.equal(reads,1);assert.equal(errorReads,0);
+ assert.ok(!h.calls.some(c=>['runtime-ready','provision','runtime-prepare','create-ack','confirm-ack','observe'].includes(c)));assert.equal(h.calls.filter(c=>c==='start').length,1);
+ const line=api.formatBillingFirstPaymentDiagnostic(r);assert.equal(line,'owned_initial_payment_diagnostic code='+diagnostic+' cleanup=UNCONFIRMED');assert.equal(api.parseBillingFirstPaymentDiagnosticLine(line),line);assert.ok(line.length<=160);
+ assert.equal(runtimeApi.isBillingFirstPaymentDiagnostic(diagnostic),false);
+});
+for(const kind of ['unknown','malformed','object','throwing','getter'])test('startup diagnostic owner ignores '+kind+' accessor result',async()=>{
+ const h=harness();let reads=0;
+ h.bootstrap.start=async()=>{throw new Proxy({},{get(){reads++;throw null;}});};
+ if(kind==='getter')Object.defineProperty(h.bootstrap,'startupDiagnostic',{get(){reads++;throw null;}});
+ else h.bootstrap.startupDiagnostic=()=>{if(kind==='throwing')throw new Proxy({},{get(){reads++;throw null;}});return kind==='unknown'?'START_PRIVATE_COMMAND_REJECTED':kind==='malformed'?'START_BACKEND_COMMAND_REJECTED\nprivate-sentinel':new Proxy({},{get(){reads++;throw null;}});};
+ const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);await assert.rejects(owner.run(journey,limits()));assert.equal(owner.resources().diagnostic,null);assert.equal(api.formatBillingFirstPaymentDiagnostic(owner.resources()),null);assert.equal(reads,0);
+});
+test('startup labels never enter authenticated private PREPARE wire diagnostics',async()=>{
+ for(const stage of ['START_BACKEND_COMMAND_NONZERO_EXIT','BACKEND_HEALTH_UNHEALTHY']){
+  const f=await diagnosticRuntime(()=>new Response(JSON.stringify({code:'INITIAL_PAYMENT_STOPPED',stage}),{status:400}));let error;try{await f.runtime.prepare(scope(),f.l);}catch(e){error=e;}assert.equal(runtimeApi.billingFirstPaymentDiagnostic(error),'PREPARE_HTTP');assert.equal(f.calls(),2);
+ }
+});
+
+test('startup diagnostic owner retains false START result before cleanup',async()=>{
+ const h=harness();h.bootstrap.start=async()=>false;h.bootstrap.startupDiagnostic=()=> 'START_BOOTSTRAP_PROOF_REJECTED';h.bootstrap.stop=async()=>{h.bootstrap.startupDiagnostic=()=>null;return true;};
+ const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);await assert.rejects(owner.run(journey,limits()));assert.equal(owner.resources().diagnostic,'START_BOOTSTRAP_PROOF_REJECTED');assert.equal(owner.resources().code,'START');
+});

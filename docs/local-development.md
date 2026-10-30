@@ -1514,7 +1514,7 @@ pnpm --dir examples/demo-site exec playwright test \
 
 The illustrative seven ports must be the ports approved for that fresh run. The source SHA must equal the approved clean checkout; preflight refuses drift, unknown daemon identity or occupied ports. No separate adapter implementation or manual backend startup is missing from this invocation. The dedicated config selects only `stripe-billing-first-payment.spec.ts`, one worker, zero retries, no web-server auto-discovery, trace/video/screenshots off and a fixed sanitized reporter. Its 48-minute test and 50-minute global budgets leave headroom around the owner's one total at-most-45-minute deadline and separate at-most-120-second cleanup budget. The page receives at most five minutes within the owner's existing deadline. A failed/uncertain run cannot be restarted or retried under its original authority.
 
-Bootstrap builds the backend with `backend/Dockerfile.billing-first-payment` and the exact `PAYMENT_RUNTIME_SOURCE_SHA` build argument. The eight explicitly exported runtime classes live beside the unchanged production jar and launch through Boot PropertiesLauncher. Only this runtime installs the persisted READY billing-time sampler; ordinary scheduling is disabled, callback delivery remains active and operational/security clocks remain UTC. Seven loopback mappings, exact container ID, source, launcher and private runtime environment are proved before use. The public application has no new production route or registry entry.
+Bootstrap builds the backend with `backend/Dockerfile.billing-first-payment` and the exact `PAYMENT_RUNTIME_SOURCE_SHA` build argument. The nine explicitly exported classes (eight dedicated runtime/scenario classes and the existing billing-time support class) live beside the unchanged production jar and launch through Boot PropertiesLauncher. Only this runtime installs the persisted READY billing-time sampler; ordinary scheduling is disabled, callback delivery remains active and operational/security clocks remain UTC. Seven loopback mappings, exact container ID, source, launcher and private runtime environment are proved before use. The public application has no new production route or registry entry.
 
 Bootstrap also passes `PAYMENT_DEMO_BUILD_MODE=billing-first-payment` to the existing demo Dockerfile. Vite selects only `billing-first-payment.html`, its source SDK bundle/CSS and a fixed public `health` asset for the existing `/health` probe. The page route is `/billing-first-payment.html`. Normal production build inputs are unchanged. The Dockerfile copies that HTML and ordinary `src`; private DTO types and Node adapters live solely in `tests/support`, so no infrastructure directory, DTO runtime, private file or key is copied into the browser image.
 
@@ -1564,3 +1564,48 @@ preserved. Every new label identifies a boundary only and establishes no provide
 POST, subscription outcome, or movement of money. No old or current
 DISPATCHING invocation may be retried, adopted, or reset. Native/full5B acceptance
 remains `NOT_ACCEPTED`; these offline changes include no new native attempt.
+
+
+The first-payment owner now lets the owned bootstrap stop use the remaining shared
+120-second cleanup budget. Previously its per-method bound clipped that stop to
+30 seconds. Listener stop still precedes container stop, and listener, runtime and
+fixture cleanup retain their existing bounds. Time spent on earlier cleanup is
+subtracted from the same deadline. A confirmed stop requires fresh, complete
+ownership checks and actual nonrunning state for every recorded container; command
+stdout alone cannot confirm it. Only first-payment START_SERVICE uncertainty for
+exact, previously recorded owned container IDs can coexist with that stopped-state
+proof. The durable ledger remains PENDING with its original DISPATCHING intent;
+start and verify remain denied, and no intent is acknowledged, replayed or reset.
+Unknown creates, replacements, extra resources and ownership drift still refuse
+cleanup before any container stop.
+
+The dedicated Java runtime also owns startup acquisition and unwind. A failure
+while acquiring the scenario, control server or executor closes every resource
+already acquired, even if another close fails. The exact application-context
+listener and the subsequent closing/inactive check prevent shutdown races from
+allowing further startup. Successful startup keeps those resources alive until
+normal context closure; repeated closure does not dispose them twice.
+
+First-payment startup failures retain one fixed terminal code before cleanup, for
+example `START_BACKEND_COMMAND_NONZERO_EXIT`,
+`START_BACKEND_HEALTH_NOT_RUNNING`, `START_BACKEND_HEALTH_UNHEALTHY`,
+`START_BACKEND_HEALTH_PROOF_REJECTED`, or
+`START_BACKEND_PUBLIC_HEALTH_REJECTED`. The closed service/checkpoint/category set
+also distinguishes owned abort/deadline signals and internally normalized command
+failures such as output limits or spawn failures. NOT_RUNNING and UNHEALTHY are
+used only after the unchanged complete ownership and runtime identity projection
+succeeds. A rejected proof reports its fixed checkpoint instead. Foreign thrown
+values supply no diagnostic authority: their properties, messages, causes, stacks
+and raw output are never read for this code. The first code survives later
+start/verify/cleanup failures and reaches the same bounded final
+`owned_initial_payment_diagnostic code=... cleanup=CONFIRMED|UNCONFIRMED`
+line after owner closure. These startup codes extend only terminal reporting;
+the authenticated private PREPARE envelope and its allowlist remain unchanged.
+
+These repairs establish source behavior with injected offline tests. The historical
+backend exit 137 was observed after cleanup, and OOMKilled=false does not establish
+the original startup failure or exclude other causes. Its historical cause remains
+unknown. Existing admission, runtime/image/source/ownership proofs, financial
+validation and original dispatch authority remain in force. No old DISPATCHING
+operation gains retry or recovery authority. Native initial-payment and full5B
+acceptance remain **NOT_ACCEPTED**.
