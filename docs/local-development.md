@@ -1546,3 +1546,21 @@ cause and creation outcome remain unknown. The original DISPATCHING operation
 remains uncertain, consumed and permanently non-retryable; these source changes
 provide no recovery authority. Offline inert tests establish diagnostic handling
 only, with no native acceptance claim.
+
+Action selection now retains only four fixed adapter boundaries:
+`ACTION_AUTHORITY`, `ACTION_VERIFICATION`, `ACTION_GRAPH`, and
+`ACTION_RESERVATION`. The private prepare scenario also distinguishes
+`ACTION_SCOPE` before scope resolution, `ACTION_RESULT` after the adapter
+returns (including a denied null result), and `ACTION_BINDING` before binding
+lookup. Unknown or unavailable adapter metadata keeps the `ACTION_SELECT`
+fallback. These labels travel through the same exact code-plus-stage status-400
+envelope and one final `PREPARE_SERVER_<stage>` diagnostic; they add no fields,
+provider reads, financial authority, or retries. The first failure survives
+abort, cleanup, and duplicate refusal.
+
+The native root cause remains unproved. Nullable `amount_paid` and an absent
+legacy line `subscription` are hypotheses only; financial validation is
+preserved. Every new label identifies a boundary only and establishes no provider
+POST, subscription outcome, or movement of money. No old or current
+DISPATCHING invocation may be retried, adopted, or reset. Native/full5B acceptance
+remains `NOT_ACCEPTED`; these offline changes include no new native attempt.

@@ -1,6 +1,6 @@
 import {billingBounded,billingCheck,billingError} from './stripe-billing-limits.mjs';
 import {validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
-const prepareStages=new Set(['REQUEST','PREFLIGHT','CLOCK_ADMISSION','CLOCK_CREATE','CUSTOMER_CREATE','LOCAL_RESERVE','SUBSCRIPTION_CREATE','LOCAL_RECORD','RECEIPT','ACTION_SELECT','SESSION_SELECT','RESPONSE_BUILD','UNCLASSIFIED']);
+const prepareStages=new Set(['REQUEST','PREFLIGHT','CLOCK_ADMISSION','CLOCK_CREATE','CUSTOMER_CREATE','LOCAL_RESERVE','SUBSCRIPTION_CREATE','LOCAL_RECORD','RECEIPT','ACTION_SELECT','ACTION_SCOPE','ACTION_AUTHORITY','ACTION_VERIFICATION','ACTION_GRAPH','ACTION_RESERVATION','ACTION_RESULT','ACTION_BINDING','SESSION_SELECT','RESPONSE_BUILD','UNCLASSIFIED']);
 const prepareCodes=new Set(['PREPARE_AUTHORITY','PREPARE_REQUEST','PREPARE_HTTP','PREPARE_RESPONSE','PREPARE_ACK',...[...prepareStages].map(s=>'PREPARE_SERVER_'+s)]);
 const ownDiagnostics=new WeakMap();
 /** Only errors created here carry metadata; foreign rejections are never inspected. */

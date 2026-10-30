@@ -52,6 +52,7 @@ public final class OwnedBillingFirstPaymentScenario implements OwnedBillingFirst
     @Override public synchronized String prepareFailureStage(){return prepareFailureStage==null?"UNCLASSIFIED":prepareFailureStage;}
     @Override public synchronized JsonObject prepare(JsonObject request) {
         String checkpoint="REQUEST";
+        StripeBillingClockActionAdapter actionAdapter=null;
         try {
             state.begin("NEW","PREPARING");
             OwnedBillingFirstPaymentRuntime.fields(request,Set.of("run_id","source_sha","account_id","site_id","customer_id","price_id","origin","create_key","customer_token"));
@@ -98,10 +99,14 @@ public final class OwnedBillingFirstPaymentScenario implements OwnedBillingFirst
             checkpoint="RECEIPT";
             receipt=bean(StripeBillingClockSubscriptionStore.class).requireReceipt(account.id(),reserved.subscription().id());
             // Selection has its own request key; the SDK's later confirm key is not known yet.
-            checkpoint="ACTION_SELECT";
+            checkpoint="ACTION_SCOPE";
             var scope=scope("initial-select-"+admission.run());
-            var action=new StripeBillingClockActionAdapter(receipt,bean(SubscriptionInteractionTransaction.class),bean(SubscriptionActionStore.class),grants,credentials,clients,verification,utc);
-            state.check();var next=action.nextAction(scope);require(next.kind()==ActionKind.PROVIDER_CLIENT);
+            checkpoint="ACTION_SELECT";
+            actionAdapter=new StripeBillingClockActionAdapter(receipt,bean(SubscriptionInteractionTransaction.class),bean(SubscriptionActionStore.class),grants,credentials,clients,verification,utc);
+            state.check();var next=actionAdapter.nextAction(scope);
+            checkpoint="ACTION_RESULT";
+            require(next!=null&&next.kind()==ActionKind.PROVIDER_CLIENT);
+            checkpoint="ACTION_BINDING";
             var binding=bean(SubscriptionTransactionPort.class).required(()->bean(SubscriptionActionStore.class).billing(StripeBillingGrantTokens.hash(next.secret())).orElseThrow().binding());
             originalInvoice=binding.invoiceReference();originalIntent=binding.intentReference();require(originalInvoice!=null&&originalIntent!=null);
             checkpoint="SESSION_SELECT";
@@ -114,7 +119,12 @@ public final class OwnedBillingFirstPaymentScenario implements OwnedBillingFirst
             session.addProperty("publishable_key",selected.publishableKey());session.addProperty("client_secret",selected.clientSecret());session.add("action_token",JsonNull.INSTANCE);
             session.addProperty("attempt_id",selected.attemptId().toString());session.addProperty("capability",selected.capability());session.addProperty("expires_at",selected.expiresAt().toString());result.add("session",session);
             return result;
-        }catch(RuntimeException invalid){if(prepareFailureStage==null)prepareFailureStage=checkpoint;abort();throw OwnedBillingFirstPaymentRuntime.denied();}
+        }catch(RuntimeException invalid){if(prepareFailureStage==null)prepareFailureStage=actionFailureStage(checkpoint,checkpoint.equals("ACTION_SELECT")&&actionAdapter!=null?actionAdapter.selectionFailureStage():null);abort();throw OwnedBillingFirstPaymentRuntime.denied();}
+    }
+    /** Adapter metadata refines only the selection boundary; no external detail becomes a stage. */
+    static String actionFailureStage(String checkpoint,String adapterStage) {
+        if("ACTION_SELECT".equals(checkpoint)&&adapterStage!=null&&Set.of("ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_RESERVATION").contains(adapterStage))return adapterStage;
+        return checkpoint;
     }
     @Override public synchronized JsonObject confirm(JsonObject request) {
         try {

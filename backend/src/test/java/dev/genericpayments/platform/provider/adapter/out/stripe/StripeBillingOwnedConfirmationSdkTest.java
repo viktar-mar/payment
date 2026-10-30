@@ -42,10 +42,111 @@ class StripeBillingOwnedConfirmationSdkTest {
         var type=type("StripeBillingClockActionAdapter");
         var adapter=type.getConstructors()[0].newInstance(h.receipt,h.phases,h.roots,h.tokens,h.f.f.credentials,h.f.f.clients,h.f.f.verification,h.clock);
         var next=type.getMethod("nextAction",SubscriptionConfirmationUseCase.Scope.class);
+        assertThat(selectionFailureStage((StripeBillingClockActionAdapter)adapter)).isNull();
         var action=(SubscriptionProviderModels.NextAction)next.invoke(adapter,h.scope);
         assertThat(action.secret()).startsWith("bga1_");assertThat(action.expiresAt()).isEqualTo(h.now.plusSeconds(600));assertThat(h.inserts).isEqualTo(1);
+        assertThat(selectionFailureStage((StripeBillingClockActionAdapter)adapter)).isNull();
         h.reserve(false);int reads=h.f.f.http.calls.size();
-        assertThat(next.invoke(adapter,h.scope)).isNull();assertThat(h.inserts).isEqualTo(1);assertThat(h.f.f.http.calls).hasSize(reads);
+        assertThat(next.invoke(adapter,h.scope)).isNull();assertThat(h.inserts).isEqualTo(1);assertThat(h.f.f.http.calls).hasSize(reads);assertThat(h.f.f.verifications).isEqualTo(1);
+        assertThat(selectionFailureStage((StripeBillingClockActionAdapter)adapter)).isNull();
+    }
+    @ParameterizedTest @ValueSource(strings={"ambient","scope","snapshot"})
+    void actionAuthorityFailuresStopBeforeVerificationOrIo(String boundary){
+        var h=new Harness();var adapter=h.action();var failure=new UnreadableFailure();
+        var scope=boundary.equals("scope")?new SubscriptionConfirmationUseCase.Scope(h.scope.context(),UUID.randomUUID(),h.scope.operation()):h.scope;
+        if(boundary.equals("snapshot"))h.currentFailure=failure;
+        if(boundary.equals("ambient"))org.springframework.transaction.support.TransactionSynchronizationManager.setActualTransactionActive(true);
+        Throwable thrown;
+        try{thrown=catchThrowable(()->adapter.nextAction(scope));}
+        finally{org.springframework.transaction.support.TransactionSynchronizationManager.setActualTransactionActive(false);}
+        assertThat(thrown).isInstanceOf(RuntimeException.class);
+        if(boundary.equals("snapshot"))assertThat(thrown).isSameAs(failure);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_AUTHORITY");
+        assertThat(h.f.f.verifications).isZero();assertThat(h.f.f.http.calls).isEmpty();assertThat(h.inserts).isZero();
+    }
+    @Test void actionVerificationFailureRetainsIdentityAndFirstStageThroughSuccessAndDuplicateRefusal(){
+        var h=new Harness();var failure=new UnreadableFailure();var calls=new java.util.concurrent.atomic.AtomicInteger();
+        var adapter=new StripeBillingClockActionAdapter(h.receipt,h.phases,h.roots,h.tokens,h.f.f.credentials,h.f.f.clients,a->{
+            h.f.f.verification.verify(a);if(calls.incrementAndGet()==1)throw failure;
+        },h.clock);
+        assertThat(catchThrowable(()->adapter.nextAction(h.scope))).isSameAs(failure);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_VERIFICATION");
+        assertThat(h.f.f.http.calls).isEmpty();assertThat(h.inserts).isZero();
+        h.graph();assertThat(adapter.nextAction(h.scope)).isNotNull();assertThat(h.inserts).isEqualTo(1);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_VERIFICATION");
+        h.reserve(false);int reads=h.f.f.http.calls.size();
+        assertThat(adapter.nextAction(h.scope)).isNull();assertThat(h.inserts).isEqualTo(1);assertThat(h.f.f.http.calls).hasSize(reads);assertThat(calls.get()).isEqualTo(2);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_VERIFICATION");
+        assertThat(catchThrowable(()->adapter.nextAction(new SubscriptionConfirmationUseCase.Scope(h.scope.context(),UUID.randomUUID(),h.scope.operation())))).isInstanceOf(RuntimeException.class);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_VERIFICATION");
+    }
+    @ParameterizedTest @ValueSource(ints={1,2,9})
+    void actionGraphFailuresKeepExistingNormalizationAcrossReadyGraphReady(int response){
+        var h=new Harness();var adapter=h.action();var failure=new UnreadableFailure();h.graph();after(h,response,()->{throw failure;});
+        assertThat(catchThrowable(()->adapter.nextAction(h.scope))).isInstanceOf(RuntimeException.class).isNotSameAs(failure);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH");
+        assertThat(h.f.f.verifications).isEqualTo(1);assertThat(h.f.f.http.calls).hasSize(response);assertThat(h.root).isNull();assertThat(h.inserts).isZero();
+    }
+    @Test void actionClientConstructionFailureBelongsToGraphWithoutReadingTheException(){
+        var h=new Harness();var failure=new UnreadableFailure();
+        var clients=new StripeClientFactory(){@Override public com.stripe.StripeClient create(StripeCredentials ignored){throw failure;}};
+        var adapter=new StripeBillingClockActionAdapter(h.receipt,h.phases,h.roots,h.tokens,h.f.f.credentials,clients,h.f.f.verification,h.clock);
+        assertThat(catchThrowable(()->adapter.nextAction(h.scope))).isInstanceOf(RuntimeException.class).isNotSameAs(failure);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH");
+        assertThat(h.f.f.verifications).isEqualTo(1);assertThat(h.f.f.http.calls).isEmpty();assertThat(h.inserts).isZero();
+    }
+    @ParameterizedTest @ValueSource(strings={"locked","reserve"})
+    void actionReservationFailuresKeepIdentityAfterFullGraphWithoutIssuingRoot(String boundary){
+        var h=new Harness();var adapter=h.action();var failure=new UnreadableFailure();h.graph();
+        after(h,9,()->{if(boundary.equals("locked"))h.authorityFailure=failure;else h.reserveFailure=failure;});
+        assertThat(catchThrowable(()->adapter.nextAction(h.scope))).isSameAs(failure);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_RESERVATION");
+        assertThat(h.f.f.http.calls).hasSize(9);assertThat(h.f.f.verifications).isEqualTo(1);assertThat(h.root).isNull();assertThat(h.inserts).isZero();
+    }
+    @Test void concurrentCallsKeepTheirOwnCheckpointAndTheFirstCaughtFailure()throws Exception{
+        var h=new Harness();var verificationFailure=new UnreadableFailure();var authorityFailure=new UnreadableFailure();
+        var verificationEntered=new java.util.concurrent.CountDownLatch(1);var authorityEntered=new java.util.concurrent.CountDownLatch(1);
+        var releaseVerification=new java.util.concurrent.CountDownLatch(1);var releaseAuthority=new java.util.concurrent.CountDownLatch(1);
+        var adapter=new StripeBillingClockActionAdapter(h.receipt,h.phases,h.roots,h.tokens,h.f.f.credentials,h.f.f.clients,a->{
+            verificationEntered.countDown();awaitRelease(releaseVerification);throw verificationFailure;
+        },h.clock);
+        try(var executor=java.util.concurrent.Executors.newFixedThreadPool(2)){
+            var verification=executor.submit(()->catchThrowable(()->adapter.nextAction(h.scope)));
+            assertThat(verificationEntered.await(5,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            h.authorityFailure=authorityFailure;h.authorityEffect=()->{authorityEntered.countDown();awaitRelease(releaseAuthority);};
+            var authority=executor.submit(()->catchThrowable(()->adapter.nextAction(h.scope)));
+            try{
+                assertThat(authorityEntered.await(5,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                // The later call is still inside authority when the first call fails verification.
+                releaseVerification.countDown();assertThat(verification.get(5,java.util.concurrent.TimeUnit.SECONDS)).isSameAs(verificationFailure);
+                assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_VERIFICATION");
+            }finally{releaseVerification.countDown();releaseAuthority.countDown();}
+            assertThat(authority.get(5,java.util.concurrent.TimeUnit.SECONDS)).isSameAs(authorityFailure);
+        }
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_VERIFICATION");
+        assertThat(h.f.f.http.calls).isEmpty();assertThat(h.inserts).isZero();
+    }
+    static void awaitRelease(java.util.concurrent.CountDownLatch release){
+        try{if(!release.await(5,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("test release timed out");}
+        catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+    }
+    @Test void disabledActionReturnsNullWithoutInventingFailureOrCallingCollaborators(){
+        var h=new Harness();var disabled=new StripeBillingGrantTokens(false,null,null);
+        var adapter=new StripeBillingClockActionAdapter(h.receipt,h.phases,h.roots,disabled,h.f.f.credentials,h.f.f.clients,h.f.f.verification,h.clock);
+        assertThat(adapter.nextAction(null)).isNull();assertThat(selectionFailureStage(adapter)).isNull();
+        assertThat(h.guards).isZero();assertThat(h.f.f.verifications).isZero();assertThat(h.f.f.http.calls).isEmpty();assertThat(h.inserts).isZero();
+    }
+    static String selectionFailureStage(StripeBillingClockActionAdapter adapter){
+        var accessor=Arrays.stream(StripeBillingClockActionAdapter.class.getMethods()).filter(m->m.getName().equals("selectionFailureStage")&&m.getParameterCount()==0).findFirst();
+        assertThat(accessor).as("finite first action-selection failure accessor").isPresent();
+        try{return (String)accessor.orElseThrow().invoke(adapter);}catch(ReflectiveOperationException failure){throw new AssertionError("selection failure accessor failed");}
+    }
+    static final class UnreadableFailure extends RuntimeException {
+        @Override public String getMessage(){throw new AssertionError("exception message read");}
+        @Override public String getLocalizedMessage(){throw new AssertionError("exception localized message read");}
+        @Override public synchronized Throwable getCause(){throw new AssertionError("exception cause read");}
+        @Override public StackTraceElement[] getStackTrace(){throw new AssertionError("exception stack read");}
+        @Override public String toString(){throw new AssertionError("exception string read");}
     }
     @Test void persistedOriginalConsumedAttemptConfirmsOnceWithStrictSdkRequest()throws Exception{
         var h=new Harness();h.root();h.reserve(true);h.graph();h.f.f.http.reply(h.success());h.f.f.http.reply(h.f.f.clockJson());
@@ -223,10 +324,10 @@ class StripeBillingOwnedConfirmationSdkTest {
         final StripeBillingGrantTokens tokens=new StripeBillingGrantTokens(true,"v1",Map.of("v1",Base64.getEncoder().encodeToString(new byte[32])));
         final CustomerSessionContext session=new CustomerSessionContext(new CustomerSessionId(new UUID(0,90)),f.f.site,f.f.customer,"https://shop.test",Set.of(CustomerSessionScope.SUBSCRIPTION_MANAGE),now.plusSeconds(1200));
         final SubscriptionConfirmationUseCase.Scope scope=new SubscriptionConfirmationUseCase.Scope(new SubscriptionCommandContext(new SubscriptionActor.Customer(session),f.f.site,f.f.customer,session.origin(),"key","test"),f.subscriptionId,f.operationId);
-        SubscriptionClientGrant root;SubscriptionConfirmationChain chain;SubscriptionConfirmationAttempt attempt;boolean revoked,drift,active;int inserts,guards;
+        SubscriptionClientGrant root;SubscriptionConfirmationChain chain;SubscriptionConfirmationAttempt attempt;boolean revoked,drift,active;int inserts,guards;RuntimeException currentFailure,reserveFailure,authorityFailure;Runnable authorityEffect;
         final SubscriptionActionStore roots=StripeBillingInertSdkFixture.port(SubscriptionActionStore.class,c->switch(c.name()){
-            case "current","billing"->Optional.ofNullable(root);case "serverConfirmationReserved"->chain!=null;
-            case "reserveOwnedInitialBilling"->{if(!active||!receipt.equals(c.args()[1])||root!=null)throw new AssertionError("invalid owned insert");root=(SubscriptionClientGrant)c.args()[0];inserts++;yield null;}
+            case "current","billing"->{if(currentFailure!=null)throw currentFailure;yield Optional.ofNullable(root);}case "serverConfirmationReserved"->chain!=null;
+            case "reserveOwnedInitialBilling"->{if(reserveFailure!=null)throw reserveFailure;if(!active||!receipt.equals(c.args()[1])||root!=null)throw new AssertionError("invalid owned insert");root=(SubscriptionClientGrant)c.args()[0];inserts++;yield null;}
             default->throw new AssertionError(c.name());});
         final SubscriptionConfirmationStore confirmations=StripeBillingInertSdkFixture.port(SubscriptionConfirmationStore.class,c->switch(c.name()){
             case "chain","current"->Optional.ofNullable(chain);case "attempt","latest"->attempt;
@@ -240,7 +341,7 @@ class StripeBillingOwnedConfirmationSdkTest {
             f.local=StripeBillingOwnership.bound(f.local,"sub_owned");var o=f.operation;f.operation=new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),o.subscriptionId(),o.kind(),o.status(),o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),"sub_owned",null,o.createdAt(),o.updatedAt(),o.version());
             var ops=StripeBillingInertSdkFixture.port(SubscriptionOperationStore.class,c->f.operation);
             var subs=StripeBillingInertSdkFixture.port(SubscriptionStore.class,c->c.name().equals("lock")?f.local:Optional.of(f.local));
-            var auth=StripeBillingInertSdkFixture.port(SubscriptionAuthorityPort.class,c->{if(revoked||!scope.context().equals(c.args()[0]))throw new IllegalStateException("revoked session");return null;});
+            var auth=StripeBillingInertSdkFixture.port(SubscriptionAuthorityPort.class,c->{if(authorityEffect!=null)authorityEffect.run();if(authorityFailure!=null)throw authorityFailure;if(revoked||!scope.context().equals(c.args()[0]))throw new IllegalStateException("revoked session");return null;});
             var policy=StripeBillingInertSdkFixture.port(SubscriptionPolicyPort.class,c->new SubscriptionPolicy(f.f.site,drift?2:1,true,0,false,false,false,Set.of()));
             var accounts=StripeBillingInertSdkFixture.port(LockPaymentAccountPort.class,c->Optional.of(f.f.account));
             var owned=StripeBillingInertSdkFixture.port(StripeBillingClockSubscriptionStore.class,c->{guards++;if(!active||!c.name().equals("requireConfirmationReceipt")||!receipt.equals(c.args()[0]))throw new IllegalStateException("foreign receipt");return receipt;});

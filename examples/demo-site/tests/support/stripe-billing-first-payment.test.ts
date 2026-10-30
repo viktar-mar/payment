@@ -158,3 +158,20 @@ test('bridge accepts an evolving fixture whose initial snapshot has no acknowled
   assert.equal(confirmation.response().state,'OBSERVE');
   assert.equal(f.calls.length,1);
 });
+
+for(const stage of ["ACTION_SCOPE","ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_RESERVATION","ACTION_RESULT","ACTION_BINDING"])test('reporter validates '+stage+' once after handoff',async()=>{
+ const {default:Reporter}=await import(new URL('./stripe-billing-first-payment-reporter.ts',import.meta.url).href);
+ const {formatBillingFirstPaymentDiagnostic,parseBillingFirstPaymentDiagnosticLine}=await import(new URL('../../../../infrastructure/stripe-billing-first-payment.mjs',import.meta.url).href);
+ const line=formatBillingFirstPaymentDiagnostic({status:'CLOSED',initialAccepted:false,code:'RUNTIME',diagnostic:'PREPARE_SERVER_'+stage,cleanupConfirmed:true});
+ assert.equal(line,'owned_initial_payment_diagnostic code=PREPARE_SERVER_'+stage+' cleanup=CONFIRMED');
+ assert.equal(parseBillingFirstPaymentDiagnosticLine(line),line);
+ const original=process.stdout.write,lines:string[]=[];process.stdout.write=((v:unknown)=>{lines.push(String(v));return true;}) as typeof process.stdout.write;
+ try {
+  const reporter=new Reporter(),handoff='Authorize the isolated Sandbox CLI at https://access.stripe.com/fixture using code ABCD EFGH. Keep this terminal open.';
+  reporter.onStdOut(handoff+'\n');reporter.onStdOut(handoff+'\n');
+  reporter.onStdOut('owned_initial_payment_diagnostic code=PREPARE_SERVER_ACTION_FOREIGN cleanup=CONFIRMED\n');
+  reporter.onStdOut(line+' private-sentinel\n');reporter.onStdOut(line+'\n');reporter.onStdOut(line+'\n');
+  reporter.onStdErr();
+  assert.deepEqual(lines,[handoff+'\n',line+'\n']);
+ }finally{process.stdout.write=original;}
+});

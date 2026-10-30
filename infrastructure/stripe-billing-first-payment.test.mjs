@@ -43,7 +43,7 @@ test('cleanup follows shared bootstrap listener-stop prerequisite and remains bo
 test('real owner and private client compose exact Task1 prepare confirm observe DTOs',async()=>{const h=harness(),requests=[];h.bootstrap.withFirstPaymentRuntime=async cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});h.dependencies.createRuntime=args=>runtimeApi.createBillingFirstPaymentRuntime(args,{fetch:async(url,init)=>{requests.push({url,body:init.body&&JSON.parse(init.body)});let v;if(url.endsWith('/status'))v={phase:'NEW',code:'OK',run_id:id(1)};else if(url.endsWith('/prepare'))v=prepared();else if(url.endsWith('/confirm'))v=confirmed();else {const settled=await h.runtime.observe();v=Object.fromEntries(Object.entries(settled).filter(([k])=>!['protocol','attempt_id','state','retry_allowed','successor_attempt_id','next_action_allowed','expires_at'].includes(k)));}return new Response(JSON.stringify(v));}});const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);assert.equal((await owner.run(journey,limits())).initialAccepted,true);assert.deepEqual(requests.map(r=>r.url.split('/').at(-1)),['status','prepare','confirm','observe']);assert.equal(requests[1].body.customer_token,'customer-token');assert.equal(requests[2].body.idempotency_key,'sdk-original-key');assert.deepEqual(requests[3].body,{});});
 
 // Inert diagnostic contracts: Response is synthetic and every dependency is injected.
-const serverStages=['REQUEST','PREFLIGHT','CLOCK_ADMISSION','CLOCK_CREATE','CUSTOMER_CREATE','LOCAL_RESERVE','SUBSCRIPTION_CREATE','LOCAL_RECORD','RECEIPT','ACTION_SELECT','SESSION_SELECT','RESPONSE_BUILD','UNCLASSIFIED'];
+const serverStages=['REQUEST','PREFLIGHT','CLOCK_ADMISSION','CLOCK_CREATE','CUSTOMER_CREATE','LOCAL_RESERVE','SUBSCRIPTION_CREATE','LOCAL_RECORD','RECEIPT','ACTION_SELECT','ACTION_SCOPE','ACTION_AUTHORITY','ACTION_VERIFICATION','ACTION_GRAPH','ACTION_RESERVATION','ACTION_RESULT','ACTION_BINDING','SESSION_SELECT','RESPONSE_BUILD','UNCLASSIFIED'];
 async function diagnosticRuntime(reply,bootstrapChange){
  let calls=0;const bootstrap={withFirstPaymentRuntime:cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)})};
  const runtime=runtimeApi.createBillingFirstPaymentRuntime({configuration:options(),bootstrap},{fetch:async()=>{calls++;return calls===1?new Response(JSON.stringify({phase:'NEW',code:'OK',run_id:id(1)})):reply();}}),l=limits();
@@ -124,4 +124,19 @@ test('prepare rejects missing bounds with fixed request metadata',async()=>{cons
 test('owner preserves request diagnostic when only prepare caller signal aborts',async()=>{
  const h=harness();let entered;const entry=new Promise(r=>entered=r);h.runtime.prepare=async()=>{entered();return new Promise(()=>{});};const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies),controller=new AbortController();
  const pending=owner.run(async p=>{await p.prepare({token:'customer-token',origin:scope().endpoints.demo},'original-key',{...limits(),signal:controller.signal});},limits());pending.catch(()=>{});await entry;controller.abort();await assert.rejects(pending);assert.equal(owner.resources().diagnostic,'PREPARE_REQUEST');assert.equal(h.calls.filter(x=>x.startsWith('create-dispatch:')).length,1);
+});
+
+for(const stage of ["ACTION_SCOPE","ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_RESERVATION","ACTION_RESULT","ACTION_BINDING"])test('action boundary '+stage+' reaches closed formatter and parser once',async()=>{
+ const h=harness();let requests=0;h.bootstrap.withFirstPaymentRuntime=cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});
+ h.dependencies.createRuntime=args=>runtimeApi.createBillingFirstPaymentRuntime(args,{fetch:async url=>{requests++;return url.endsWith('/status')?new Response(JSON.stringify({phase:'NEW',code:'OK',run_id:id(1)})):new Response(JSON.stringify({code:'INITIAL_PAYMENT_STOPPED',stage}),{status:400});}});
+ h.bootstrap.stop=async()=>{h.calls.push('stop');return false;};
+ const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);
+ await assert.rejects(owner.run(async p=>{try{await journey(p);}catch{}try{await journey(p);}catch{}return true;},limits()));
+ const result=await owner.close(),line=api.formatBillingFirstPaymentDiagnostic(result);
+ assert.equal(line,'owned_initial_payment_diagnostic code=PREPARE_SERVER_'+stage+' cleanup=UNCONFIRMED');
+ assert.equal(api.parseBillingFirstPaymentDiagnosticLine(line),line);
+ assert.equal(result.initialAccepted,false);assert.equal(requests,2);
+ assert.equal(h.calls.filter(c=>c.startsWith('create-dispatch:')).length,1);
+ assert.ok(!h.calls.some(c=>c.startsWith('confirm-dispatch:')||c==='observe'||c==='create-ack'));
+ assert.deepEqual(h.calls.filter(c=>['listener-stop','stop','fixture-close'].includes(c)),['listener-stop','stop','fixture-close']);
 });
