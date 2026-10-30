@@ -109,14 +109,18 @@ class OwnedBillingFirstPaymentScenarioIntegrationTest extends StripeBillingClock
 
     @Test void actualSdkKeySelectsThenConfirmsOnceAndFreshCashProducesSignedDeliveredCallbacks() throws Exception {
         callbacks.configure(site.value(),"http://callback-receiver:8080/callback",true);
-        prepare();assertThat(prepared.getAsJsonObject("action").get("secret").getAsString()).startsWith("bga1_");noMoney();
-        assertThat(scenario.confirm(confirmRequest()).get("state").getAsString()).isEqualTo("OBSERVE");noMoney();
-        paidGraph();var proof=scenario.observe();assertThat(proof.get("phase").getAsString()).isEqualTo("SETTLED_LOCAL");
+        prepared=privateRequest("POST", "/initial-payment/prepare", prepareRequest);
+        assertThat(prepared.getAsJsonObject("action").get("secret").getAsString()).startsWith("bga1_");
+        noMoney();
+        assertThat(privateRequest("POST", "/initial-payment/confirm", confirmRequest()).get("state").getAsString()).isEqualTo("OBSERVE");
+        noMoney();
+        paidGraph();
+        var proof=privateRequest("POST", "/initial-payment/observe", new JsonObject());assertThat(proof.get("phase").getAsString()).isEqualTo("SETTLED_LOCAL");
         assertThat(proof.get("paid_through").getAsString()).isEqualTo("2023-12-15T22:13:20Z");assertThat(proof.get("access_valid_until").getAsString()).isEqualTo("2023-11-14T22:18:20Z");
         assertThat(count("payments")).isEqualTo(1);assertThat(count("payment_events")).isEqualTo(1);assertThat(count("subscription_billing_records")).isEqualTo(1);assertThat(count("subscription_events")).isEqualTo(1);
         assertThat(jdbc.queryForObject("select settlement from subscription_billing_records",String.class)).isEqualTo("CONFIRMED_CASH");assertThat(jdbc.queryForObject("select provider_payment_reference from payments",String.class)).isEqualTo("pi_owned");assertThat(jdbc.queryForObject("select event_type from payment_events",String.class)).isEqualTo("PAYMENT_SUCCEEDED");assertThat(jdbc.queryForObject("select event_type from subscription_events",String.class)).isEqualTo("PERIOD_PAID");
         var snapshots=jdbc.queryForList("select id,payload::text from outbox_events order by id");assertThat(snapshots).hasSize(2);
-        scenario.observe();assertThat(jdbc.queryForList("select id,payload::text from outbox_events order by id")).isEqualTo(snapshots);assertThat(posts()).isEqualTo(4);
+        observe();assertThat(jdbc.queryForList("select id,payload::text from outbox_events order by id")).isEqualTo(snapshots);assertThat(posts()).isEqualTo(4);
         var claims=outbox.claimAutomatic("first-payment",10,Instant.now().plusSeconds(1),Duration.ofSeconds(30));assertThat(claims).hasSize(2);
         for(var claim:claims) {
             new CallbackDeliveryService(outbox,encryption,payload,(endpoint,headers,bytes)->{
@@ -128,6 +132,23 @@ class OwnedBillingFirstPaymentScenarioIntegrationTest extends StripeBillingClock
         assertThat(jdbc.queryForList("select status from outbox_events",String.class)).containsOnly("DELIVERED");
         assertThat(scenario.status().toString()).doesNotContain("ctoken","bca2_","bga1_","secret","customer_token");
         verifyOwnedInitialSql();
+    }
+
+    private void refreshObservationClock() {
+        // Match the existing composition fixture's apply boundary; only persisted billing F stays frozen.
+        TestClock.set(OwnedBillingFirstPaymentRuntimeTest.observationUtc(Instant.now()));
+    }
+    private JsonObject observe() { refreshObservationClock();return scenario.observe(); }
+
+    /** Actual private HTTP handler with the real scenario and stores; no listener/socket. */
+
+    private JsonObject privateRequest(String method, String path, JsonObject body) throws Exception {
+        if(path.equals("/initial-payment/observe"))refreshObservationClock();
+        var exchange=new OwnedBillingFirstPaymentRuntimeTest.MemoryExchange(method,path,body.toString(),true);
+        new OwnedBillingFirstPaymentRuntime.Handler(scenario,"q".repeat(43)).handle(exchange);
+        assertThat(exchange.code).isEqualTo(200);
+        assertThat(exchange.responses.getFirst("Cache-Control")).isEqualTo("no-store");
+        return JsonParser.parseString(exchange.output.toString(java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();
     }
 
     /** Task2 proves the shipped SQL against the same real service-created settled/delivered rows. */
@@ -153,7 +174,7 @@ class OwnedBillingFirstPaymentScenarioIntegrationTest extends StripeBillingClock
     @ParameterizedTest @ValueSource(strings={"requires_action","requires_payment_method","processing","disconnect"})
     void anyNonObserveOrLostResponseIsTerminalWithoutMoneyOrRedispatch(String outcome) {
         this.outcome=outcome;prepare();assertThatThrownBy(()->scenario.confirm(confirmRequest())).hasMessage("INITIAL_PAYMENT_STOPPED");
-        long posts=posts();assertThat(posts).isEqualTo(4);assertThatThrownBy(()->scenario.confirm(confirmRequest())).isInstanceOf(RuntimeException.class);assertThatThrownBy(scenario::observe).isInstanceOf(RuntimeException.class);assertThat(posts()).isEqualTo(posts);noMoney();
+        long posts=posts();assertThat(posts).isEqualTo(4);assertThatThrownBy(()->scenario.confirm(confirmRequest())).isInstanceOf(RuntimeException.class);assertThatThrownBy(this::observe).isInstanceOf(RuntimeException.class);assertThat(posts()).isEqualTo(posts);noMoney();
     }
     @Test void duplicatePrepareAndRestartCannotAdoptExistingOwner() {
         prepare();long posts=posts();assertThatThrownBy(()->scenario.prepare(prepareRequest)).isInstanceOf(RuntimeException.class);assertThat(posts()).isEqualTo(posts);
@@ -167,7 +188,7 @@ class OwnedBillingFirstPaymentScenarioIntegrationTest extends StripeBillingClock
     }
     @Test void revokedSessionBeforeConfirmAndExplicitAbortNeverDispatch() {
         prepare();var context=sessions.resolveRequired(prepareRequest.get("customer_token").getAsString(),"https://shop.test");sessions.logout(context);
-        assertThatThrownBy(()->scenario.confirm(confirmRequest())).isInstanceOf(RuntimeException.class);assertThat(posts()).isEqualTo(3);scenario.abort();assertThatThrownBy(scenario::observe).isInstanceOf(RuntimeException.class);noMoney();
+        assertThatThrownBy(()->scenario.confirm(confirmRequest())).isInstanceOf(RuntimeException.class);assertThat(posts()).isEqualTo(3);scenario.abort();assertThatThrownBy(this::observe).isInstanceOf(RuntimeException.class);noMoney();
     }
     @Test void driftAfterProviderPostRetainsConsumedAttemptWithoutAnotherPost() {
         prepare();driftAfterConfirm=true;assertThatThrownBy(()->scenario.confirm(confirmRequest())).isInstanceOf(RuntimeException.class);
@@ -175,7 +196,7 @@ class OwnedBillingFirstPaymentScenarioIntegrationTest extends StripeBillingClock
     }
     @ParameterizedTest @ValueSource(strings={"revision","fence"}) void staleObservationCannotBeRebasedOntoFreshFence(String drift) {
         prepare();scenario.confirm(confirmRequest());paidGraph();staleDuringRead=drift.equals("revision");consumeDuringRead=drift.equals("fence");
-        assertThatThrownBy(scenario::observe).hasMessage("INITIAL_PAYMENT_STOPPED");noMoney();assertThatThrownBy(scenario::observe).isInstanceOf(RuntimeException.class);assertThat(posts()).isEqualTo(4);
+        assertThatThrownBy(this::observe).hasMessage("INITIAL_PAYMENT_STOPPED");noMoney();assertThatThrownBy(this::observe).isInstanceOf(RuntimeException.class);assertThat(posts()).isEqualTo(4);
     }
     @Test void lostLocalConfirmationAcknowledgementStaysDispatchingAndCannotRepeat() {
         prepare();jdbc.execute("create function first_payment_reject_ack() returns trigger language plpgsql as $$ begin if new.state='OBSERVE' then raise exception 'synthetic'; end if; return new; end; $$");jdbc.execute("create trigger first_payment_reject_ack before update on subscription_confirmation_attempts for each row execute function first_payment_reject_ack()");

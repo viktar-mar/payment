@@ -15,7 +15,37 @@ class OwnedBillingFirstPaymentRuntimeTest {
         assertThat(configuration.classes()).extracting(Class::getName)
             .containsExactly("dev.genericpayments.platform.PaymentPlatformApplication");
     }
+    /** Shared hosted-fixture precision boundary; never used by the exported runtime. */
+    static java.time.Instant observationUtc(java.time.Instant utc) { return utc.truncatedTo(java.time.temporal.ChronoUnit.MICROS); }
+    @Test void operationalObservationClockDoesNotPrecedeItsPersistedBillingRecord() throws Exception {
+        var raw=java.time.Instant.parse("2026-10-30T11:00:00.123456789Z");
+        var formatter=new org.postgresql.jdbc.TimestampUtils(false,()->java.util.TimeZone.getTimeZone("UTC"));
+        var calendar=java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+        var rounded=formatter.toTimestamp(calendar,formatter.toString(calendar,java.sql.Timestamp.from(raw))).toInstant();
+        assertThat(rounded).isEqualTo(java.time.Instant.parse("2026-10-30T11:00:00.123457Z"));
+        assertThatThrownBy(()->billingRecordAt(rounded,raw))
+            .isInstanceOf(dev.genericpayments.platform.shared.domain.DomainValidationException.class).hasMessage("Invalid billing record");
+        var aligned=observationUtc(raw);
+        var persisted=formatter.toTimestamp(calendar,formatter.toString(calendar,java.sql.Timestamp.from(aligned))).toInstant();
+        var repeated=billingRecordAt(persisted,aligned);
+        assertThat(repeated.createdAt()).isEqualTo(java.time.Instant.parse("2026-10-30T11:00:00.123456Z"));
+        assertThat(repeated.updatedAt()).isEqualTo(repeated.createdAt());
+    }
+    private static dev.genericpayments.platform.subscriptions.domain.BillingRecord billingRecordAt(java.time.Instant created,java.time.Instant updated) {
+        var terms=new dev.genericpayments.platform.subscriptions.domain.SubscriptionPriceTerms(
+            new dev.genericpayments.platform.catalog.domain.PriceId(new UUID(0,1)),"first-monthly",1,
+            new dev.genericpayments.platform.catalog.domain.ProductId(new UUID(0,2)),dev.genericpayments.platform.catalog.domain.Money.of(2000,"EUR"),
+            dev.genericpayments.platform.catalog.domain.BillingInterval.MONTH,0,
+            dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.OPTIONAL_DURING_TRIAL,dev.genericpayments.platform.catalog.domain.TaxMode.INCLUSIVE);
+        return new dev.genericpayments.platform.subscriptions.domain.BillingRecord(new UUID(0,3),
+            new dev.genericpayments.platform.sites.domain.SiteId(new UUID(0,4)),new UUID(0,5),
+            new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId(new UUID(0,6)),"in_original",
+            dev.genericpayments.platform.subscriptions.domain.BillingRecord.Kind.INITIAL,terms,null,
+            new dev.genericpayments.platform.subscriptions.domain.Subscription.Period(java.time.Instant.parse("2023-11-14T22:13:20Z"),java.time.Instant.parse("2023-12-14T22:13:20Z")),
+            2000,"EUR",dev.genericpayments.platform.subscriptions.domain.BillingRecord.Settlement.CONFIRMED_CASH,0,created,updated);
+    }
     static Map<String,String> environment() {
+
 
         var env=new HashMap<String,String>();
         env.put("PAYMENT_STRIPE_BILLING_FIRST_PAYMENT","true");

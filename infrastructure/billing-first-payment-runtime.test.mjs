@@ -23,3 +23,16 @@ test('class symlinks, symlink ancestors, and preexisting exports are rejected',(
   fixture(({root,source,dest,run})=>{const support=join(source,'dev/genericpayments/platform/support');rmSync(support,{recursive:true});mkdirSync(join(root,'foreign'));writeFileSync(join(root,'foreign/OwnedSubscriptionBillingTime.class'),'foreign');symlinkSync(join(root,'foreign'),support);assert.notEqual(run().status,0);assert.equal(existsSync(dest),false);});
   fixture(({dest,run})=>{mkdirSync(dest);writeFileSync(join(dest,'keep'),'keep');assert.notEqual(run().status,0);assert.equal(readFileSync(join(dest,'keep'),'utf8'),'keep');});
 });
+
+test('dedicated Docker launch compiles and exports the named runtime beside the production jar', () => {
+  // Static deployment contract: no Docker build or application invocation here.
+  const source = readFileSync(resolve(import.meta.dirname, '../backend/Dockerfile.billing-first-payment'), 'utf8');
+  const instruction = source.replace(/\\\n\s*/g, ' ').split('\n');
+  const entrypoint = JSON.parse(instruction.find(line => line.startsWith('ENTRYPOINT ')).slice('ENTRYPOINT '.length));
+  assert.deepEqual(entrypoint, ['java','-Dloader.path=/app/initial-runtime','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentRuntime','-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher']);
+  assert.ok(instruction.some(line => line.startsWith('RUN mvn ') && line.includes('-DskipTests package') && line.includes('sh export-billing-first-payment-runtime.sh /workspace/target/test-classes /workspace/initial-runtime')));
+  assert.ok(instruction.some(line => /^COPY --from=build .*\/workspace\/initial-runtime \/app\/initial-runtime$/.test(line)));
+  assert.ok(instruction.some(line => /^COPY --from=build .*\/workspace\/target\/payment-platform-backend-\*\.jar app.jar$/.test(line)));
+  const normal = readFileSync(resolve(import.meta.dirname, '../backend/Dockerfile'), 'utf8');
+  assert.doesNotMatch(normal, /initial-runtime|OwnedBillingFirstPaymentRuntime/);
+});

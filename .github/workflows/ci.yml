@@ -47,6 +47,28 @@ jobs:
       - name: Verify backend
         working-directory: backend
         run: ./mvnw -B -ntp verify
+      - name: Verify dedicated first-payment runtime packaging without launching it
+        run: |
+          set -euo pipefail
+          packaging_root=$(mktemp -d)
+          trap 'rm -rf "$packaging_root"' EXIT
+          sh backend/export-billing-first-payment-runtime.sh backend/target/test-classes "$packaging_root/runtime"
+          backend_jar=$(realpath backend/target/payment-platform-backend-*.jar)
+          jar tf "$backend_jar" > "$packaging_root/entries.txt"
+          if grep -Eq 'OwnedBillingFirstPayment|OwnedSubscriptionBillingTime|org/junit/|org/mockito/|org/testcontainers/' "$packaging_root/entries.txt"; then
+            echo 'first_payment_production_jar_isolation_failed'
+            exit 1
+          fi
+          (cd "$packaging_root" && jar xf "$backend_jar" BOOT-INF/lib)
+          jdeps --multi-release 25 --ignore-missing-deps -verbose:class -filter:none \
+            --class-path "backend/target/classes:$packaging_root/BOOT-INF/lib/*" \
+            "$packaging_root/runtime" > "$packaging_root/dependencies.txt"
+          if grep -Eq 'not found|org\.junit|org\.mockito|org\.testcontainers|org\.springframework\.test|org\.springframework\.boot\.test' "$packaging_root/dependencies.txt"; then
+            echo 'first_payment_runtime_dependency_closure_failed'
+            cat "$packaging_root/dependencies.txt"
+            exit 1
+          fi
+          echo 'first_payment_runtime_packaging_verified_without_launch'
 
   frontend:
     runs-on: ubuntu-24.04

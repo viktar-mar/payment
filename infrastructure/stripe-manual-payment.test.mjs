@@ -164,6 +164,7 @@ test('inert imports neither read private credentials nor launch any subprocess o
       'stripe-sandbox-ownership.mjs','stripe-manual-refund-options.mjs','stripe-manual-refund-remainder-options.mjs',
       'stripe-sandbox-extras.mjs','smoke-stage-5a.mjs',
       'stripe-billing-acceptance-options.mjs','stripe-billing-limits.mjs',
+      'stripe-billing-first-payment-options.mjs',
     ].map(name=>new URL('infrastructure/'+name,root).href));
     const readSource=fs.readFileSync;
     registerHooks({load(url,context,nextLoad){
@@ -175,16 +176,18 @@ test('inert imports neither read private credentials nor launch any subprocess o
     http.createServer=net.createServer=trap;globalThis.fetch=trap;syncBuiltinESMExports();
     await import('./infrastructure/stripe-manual-payment.mjs');
     await import('./infrastructure/stripe-manual-payment-auth.mjs');
+    await import('./infrastructure/stripe-billing-first-payment-options.mjs');
     // Negative probes never read the filesystem, including an otherwise allowed
     // source path. No private path is exempted by suffix or repository prefix.
     for(const file of ['infrastructure/.env','infrastructure/fixtures/customer-issuer-private.jwks.json',
       'test-results/stripe-sandbox/synthetic/state.json','docs/local-development.md',
       'infrastructure/stripe-manual-payment.mjs','infrastructure/stripe-billing-acceptance-options.mjs',
-      'infrastructure/stripe-billing-limits.mjs']){
+      'infrastructure/stripe-billing-limits.mjs','infrastructure/stripe-billing-first-payment-options.mjs']){
       assert.throws(()=>fs.readFileSync(new URL(file,root)),/private boundary touched/);
       await assert.rejects(async()=>fsp.readFile(new URL(file,root)),/private boundary touched/);
     }
     await assert.rejects(import('./infrastructure/stripe-billing-acceptance-options.test.mjs'),/private boundary touched/);
+    await assert.rejects(import('./infrastructure/stripe-billing-first-payment.test.mjs'),/private boundary touched/);
   `;
   const result=spawnSync(process.execPath,['--input-type=module','-e',script],{cwd:new URL('..',import.meta.url),env:{PATH:'/usr/bin:/bin',LANG:'C',LC_ALL:'C',NO_COLOR:'1'},encoding:'utf8'});assert.equal(result.status,0,result.stderr);assert.equal(result.stdout,'');
 });

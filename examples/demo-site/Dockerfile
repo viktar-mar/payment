@@ -18,7 +18,7 @@ COPY examples/demo-site/package.json examples/demo-site/pnpm-lock.yaml ./example
 RUN cd examples/demo-site \
     && pnpm install --frozen-lockfile
 
-COPY examples/demo-site/index.html examples/demo-site/payment-return.html examples/demo-site/subscription-return.html examples/demo-site/form-load-diagnostic.html examples/demo-site/form-load-manual.html examples/demo-site/manual-payment.html examples/demo-site/tsconfig.json examples/demo-site/vite.config.ts ./examples/demo-site/
+COPY examples/demo-site/index.html examples/demo-site/payment-return.html examples/demo-site/subscription-return.html examples/demo-site/form-load-diagnostic.html examples/demo-site/form-load-manual.html examples/demo-site/manual-payment.html examples/demo-site/billing-first-payment.html examples/demo-site/tsconfig.json examples/demo-site/vite.config.ts ./examples/demo-site/
 COPY examples/demo-site/src ./examples/demo-site/src
 # Pure browser diagnostic schema and its transitive runtime/type dependencies.
 # Never copy the infrastructure directory (it also holds private local inputs).

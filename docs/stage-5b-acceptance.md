@@ -121,3 +121,20 @@ Remaining acceptance work is:
 - Under separate explicit runtime authority, execute fresh owned Billing cases from the accepted design: initial success/decline/manual 3DS; trial/method isolation; renewal/failure/grace/recovery; changes/cancel/withdraw/resume; Portal policy/return; webhook reorder/missed recovery. Preserve exact provider-to-local cash and signed callback evidence, first-failure/UNKNOWN stop rules and the explicit financial budget for test-clock advances.
 
 All actual Stripe Billing provider scenarios in this matrix remain **NOT_RUN**. Stage 5A's historical accepted evidence and unresolved operational records are preserved separately.
+
+## Prepared owned first-payment browser lane
+
+The dedicated future scenario now has a concrete page, SDK transport bridge, Node owner, private handler and separate launcher: see [invocation and scope](local-development.md#prepared-owned-initial-payment-scenario-separate-future-execution). Its only financial case is initial_success: one fresh READY clock/Customer, EUR20 MONTH inclusive/no trial, original CREATE, 4242 and one original server confirmation. No advance, renewal, retry/successor, decline, 3DS acceptance, refund, donation or old-target adoption is included. Unexpected 3DS stops before browser permission.
+
+| Evidence scope | Status and limit |
+| --- | --- |
+| Prior confirmation component | `69e61e7` / [CI40971762290](https://github.com/viktar-mar/payment/actions/runs/40971762290) passed; historical evidence, not this lane |
+| New source preparation | Authored; injected local bridge/privacy/import/bootstrap tests and cached Java compilation recorded in the Task 3 report |
+| New complete published-source gate | Pending independent review and exact-head hosted CI; intermediate `05f897b` inert-import allowlist failure retained and source-corrected |
+| Hosted browser composition | Authored: actual page/CSP/SDK OTP→action→session→driver and Node owner/private client, inert external transports only |
+| Hosted private-handler composition | Authored/compiled: in-memory HTTP Handler→real scenario/store, original SDK key, no money from confirm, fresh CASH and existing signed delivery/SQL assertions |
+| Runtime packaging | Hosted-only named export, actual production-jar absence and production dependency closure; no startup or provider execution |
+| Native owned first payment | **NOT_RUN**; separate approval of fresh runtime scope still required |
+| Full Stage 5B | **NOT_ACCEPTED** |
+
+Native entry is excluded from default discovery, uses one worker/zero retries and disables trace/video/screenshots with fixed output labels. A single immutable owner deadline and finite independent cleanup cover startup through proof. Browser OBSERVE does not prove settlement; actual owned reconciliation with a new fence before each graph read, exact original INITIAL full CASH/payment/journal/CREATE/PERIOD_PAID, original paidThrough and independently delivered signed v3/v4 callbacks are required. Access snapshot expiry remains F+300 independently of the full paid period. This lane does not claim ordinary inbound webhook acceptance. The existing INITIAL_NON_CLOCK path, public production routes, normal jar, default Fake flow and all historical financial/evidence records remain preserved.

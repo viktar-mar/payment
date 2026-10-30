@@ -330,7 +330,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     if(firstPayment){Object.assign(synthetic,runtimeEnv('buildOnly'));await exclusiveFile(directory+'/runtime-build.yaml','services:\n  backend:\n    build:\n      context: '+ROOT+'/backend\n      dockerfile: Dockerfile.billing-first-payment\n      args:\n        PAYMENT_RUNTIME_SOURCE_SHA: '+expectedSource+'\n',context);}
     await exclusiveFile(directory+'/build.env',envText(synthetic),context);await intent('BUILD','backend+demo-site',context);
     if(buildDiagnostic) {buildDiagnostic.stage='BUILD_COMMAND';await ledger(context);}
-    await docker(composeArgs(directory+'/build.env',['build','--quiet',...(manualPayment?['--build-arg','PAYMENT_DEMO_BUILD_MODE=manual-payment']:diagnostic?['--build-arg','PAYMENT_DEMO_BUILD_MODE=form-diagnostic']:[]),'backend','demo-site'],{override:false}),context,1200000);
+    await docker(composeArgs(directory+'/build.env',['build','--quiet',...(firstPayment?['--build-arg','PAYMENT_DEMO_BUILD_MODE=billing-first-payment']:manualPayment?['--build-arg','PAYMENT_DEMO_BUILD_MODE=manual-payment']:diagnostic?['--build-arg','PAYMENT_DEMO_BUILD_MODE=form-diagnostic']:[]),'backend','demo-site'],{override:false}),context,1200000);
     for(const service of ['backend','demo-site']) {
       if(buildDiagnostic) {buildDiagnostic.stage=service==='backend'?'BACKEND_IMAGE_PROOF':'DEMO_IMAGE_PROOF';await ledger(context);}
       await imageProof(service,context);

@@ -1,0 +1,5 @@
+body { font: 16px system-ui, sans-serif; color: #18202a; background: #f5f7f9; }
+main { max-width: 40rem; margin: 2rem auto; padding: 2rem; background: white; }
+label { display: block; margin: 1rem 0; }
+button { padding: .7rem 1rem; margin: .5rem 0; }
+#provider { min-height: 12rem; width: 100%; margin: 1rem 0; }
