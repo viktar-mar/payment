@@ -1,0 +1,95 @@
+package dev.genericpayments.acceptance.runtime;
+
+import java.lang.reflect.*;
+import java.util.*;
+import org.junit.jupiter.api.Test;
+import static org.assertj.core.api.Assertions.*;
+
+/** Pure tests: reflection keeps the first failing contract runnable before the launcher exists. */
+class OwnedBillingFirstPaymentRuntimeTest {
+    static Map<String,String> environment() {
+        var env=new HashMap<String,String>();
+        env.put("PAYMENT_STRIPE_BILLING_FIRST_PAYMENT","true");
+        env.put("PAYMENT_STRIPE_SANDBOX_ENABLED","true");
+        env.put("PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_RUN_ID","cd2116f9-f847-4dc8-85fa-7df63ca51451");
+        env.put("PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_SOURCE_SHA","a".repeat(40));
+        env.put("PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_FROZEN_TIME","1700000000");
+        env.put("PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_CONTROL_KEY","q".repeat(43));
+        env.put("PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_CONTROL_PORT","8099");
+        return env;
+    }
+    static Object admit(Map<String,String> env) throws Throwable {
+        try { return Class.forName("dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentRuntime")
+            .getDeclaredMethod("admit",Map.class,String.class).invoke(null,env,"a".repeat(40)); }
+        catch(InvocationTargetException e){throw e.getCause();}
+    }
+    @Test void missingOrConflictingOptInCannotReachRuntimeConstruction() throws Throwable {
+        assertThatThrownBy(()->admit(Map.of())).isInstanceOf(IllegalArgumentException.class);
+        for(String key:List.of("PAYMENT_STRIPE_BILLING_ACCEPTANCE","PAYMENT_STAGE4_TEST_RUNTIME","PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS","PAYMENT_STRIPE_SANDBOX_OWNED_RUN","PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT")) {
+            var env=environment();env.put(key,"true");
+            assertThatThrownBy(()->admit(env)).isInstanceOf(IllegalArgumentException.class);
+        }
+        assertThat(admit(environment())).isNotNull();
+    }
+    @Test void runSourceFrozenAndCapabilityMustBeAdmittedBeforeContext() {
+        for(var bad:Map.of("RUN_ID","not-a-uuid","SOURCE_SHA","b".repeat(40),"FROZEN_TIME","9007199254740992","CONTROL_KEY","secret","CONTROL_PORT","80").entrySet()) {
+            var env=environment();env.put("PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_"+bad.getKey(),bad.getValue());
+            assertThatThrownBy(()->admit(env)).isInstanceOf(IllegalArgumentException.class).hasMessage("INITIAL_PAYMENT_ADMISSION_DENIED");
+        }
+    }
+    @Test void duplicateOrExpiredTransitionBurnsTheRun() {
+        var now=java.time.Instant.parse("2026-10-30T12:00:00Z");
+        var state=new OwnedBillingFirstPaymentRuntime.State(java.time.Clock.fixed(now,java.time.ZoneOffset.UTC),now.plusSeconds(1));
+        state.begin("NEW","PREPARING");state.finish("PREPARING","PREPARED");
+        assertThatThrownBy(()->state.begin("NEW","PREPARING")).isInstanceOf(IllegalStateException.class);
+        assertThat(state.phase()).isEqualTo("STOPPED");
+        assertThatThrownBy(()->state.begin("STOPPED","NEW")).isInstanceOf(IllegalStateException.class);
+        var expired=new OwnedBillingFirstPaymentRuntime.State(java.time.Clock.fixed(now,java.time.ZoneOffset.UTC),now);
+        assertThatThrownBy(()->expired.begin("NEW","PREPARING")).isInstanceOf(IllegalStateException.class);
+        assertThat(expired.phase()).isEqualTo("STOPPED");
+    }
+    @Test void observationsAreBoundedAndCannotConfirmAgain() {
+        var now=java.time.Instant.parse("2026-10-30T12:00:00Z");
+        var state=new OwnedBillingFirstPaymentRuntime.State(java.time.Clock.fixed(now,java.time.ZoneOffset.UTC),now.plusSeconds(1));
+        state.begin("NEW","OBSERVE");for(int i=0;i<30;i++)state.observe();
+        assertThatThrownBy(state::observe).isInstanceOf(IllegalStateException.class);
+        assertThat(state.phase()).isEqualTo("STOPPED");
+    }
+    @Test void authenticationPrecedesReadingAndCannotExposeFailureSecrets() throws Exception {
+        var operations=new InertOperations();var handler=new OwnedBillingFirstPaymentRuntime.Handler(operations,"q".repeat(43));
+        var denied=new MemoryExchange("POST","/initial-payment/prepare","secret-body",false);
+        denied.body=new java.io.InputStream(){public int read(){throw new AssertionError("Unauthorized body was read");}};
+        handler.handle(denied);assertThat(denied.code).isEqualTo(403);assertThat(operations.calls).isZero();assertThat(operations.aborted).isFalse();
+        var failure=new MemoryExchange("POST","/initial-payment/observe","{}",true);operations.failure=true;
+        handler.handle(failure);assertThat(failure.code).isEqualTo(400);assertThat(failure.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\"}");assertThat(operations.aborted).isTrue();
+        assertThat(failure.responses.getFirst("Cache-Control")).isEqualTo("no-store");
+    }
+    @Test void unexpectedPathMethodFieldsDuplicateKeysAndOversizeNeverDispatch() throws Exception {
+        for(var entry:List.of(new String[]{"GET","/initial-payment/observe","{}"},new String[]{"POST","/initial-payment/observe?x=y","{}"},
+            new String[]{"POST","/initial-payment/observe","{\"sql\":\"secret\"}"},new String[]{"POST","/initial-payment/confirm","{\"attempt_id\":\"a\",\"attempt_id\":\"b\"}"},
+            new String[]{"POST","/initial-payment/observe"," ".repeat(16385)},new String[]{"POST","/initial-payment/observe","{} {}"},new String[]{"GET","/initial-payment/status","{}"})) {
+            var operations=new InertOperations();var handler=new OwnedBillingFirstPaymentRuntime.Handler(operations,"q".repeat(43));
+            var request=new MemoryExchange(entry[0],entry[1],entry[2],true);handler.handle(request);
+            assertThat(request.code).isGreaterThanOrEqualTo(400);assertThat(operations.calls).isZero();assertThat(operations.aborted).isTrue();
+        }
+    }
+    static final class InertOperations implements OwnedBillingFirstPaymentRuntime.Operations {
+        int calls;boolean aborted,failure;
+        public com.google.gson.JsonObject prepare(com.google.gson.JsonObject r){calls++;return r;}
+        public com.google.gson.JsonObject confirm(com.google.gson.JsonObject r){calls++;return r;}
+        public com.google.gson.JsonObject observe(){calls++;if(failure)throw new IllegalStateException("ctoken_SECRET sk_test_SECRET");return new com.google.gson.JsonObject();}
+        public com.google.gson.JsonObject status(){calls++;return new com.google.gson.JsonObject();}
+        public void abort(){aborted=true;}
+    }
+    static final class MemoryExchange extends com.sun.net.httpserver.HttpExchange {
+        final String method,path;final com.sun.net.httpserver.Headers requests=new com.sun.net.httpserver.Headers(),responses=new com.sun.net.httpserver.Headers();
+        java.io.InputStream body;final java.io.ByteArrayOutputStream output=new java.io.ByteArrayOutputStream();int code;
+        MemoryExchange(String method,String path,String body,boolean authorized){this.method=method;this.path=path;this.body=new java.io.ByteArrayInputStream(body.getBytes(java.nio.charset.StandardCharsets.UTF_8));if(authorized)requests.add("Authorization","Bearer "+"q".repeat(43));}
+        public com.sun.net.httpserver.Headers getRequestHeaders(){return requests;}public com.sun.net.httpserver.Headers getResponseHeaders(){return responses;}
+        public java.net.URI getRequestURI(){return java.net.URI.create(path);}public String getRequestMethod(){return method;}
+        public com.sun.net.httpserver.HttpContext getHttpContext(){return null;}public void close(){}public java.io.InputStream getRequestBody(){return body;}public java.io.OutputStream getResponseBody(){return output;}
+        public void sendResponseHeaders(int code,long length){this.code=code;}public java.net.InetSocketAddress getRemoteAddress(){return null;}public int getResponseCode(){return code;}public java.net.InetSocketAddress getLocalAddress(){return null;}public String getProtocol(){return "HTTP/1.1";}
+        public Object getAttribute(String name){return null;}public void setAttribute(String name,Object value){}public void setStreams(java.io.InputStream i,java.io.OutputStream o){}public com.sun.net.httpserver.HttpPrincipal getPrincipal(){return null;}
+    }
+
+}

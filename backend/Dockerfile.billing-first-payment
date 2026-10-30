@@ -1,0 +1,24 @@
+# Future explicit owned initial-payment lane. Never selected by the default image/configuration.
+FROM maven:3.9.11-eclipse-temurin-25 AS build
+WORKDIR /workspace
+COPY pom.xml ./
+RUN mvn -B -ntp dependency:go-offline
+COPY src ./src
+COPY export-billing-first-payment-runtime.sh ./
+RUN mvn -B -ntp -DskipTests package \
+    && sh export-billing-first-payment-runtime.sh /workspace/target/test-classes /workspace/initial-runtime
+
+FROM eclipse-temurin:25-jre
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 payment && useradd --uid 10001 --gid payment --no-create-home payment
+ARG PAYMENT_RUNTIME_SOURCE_SHA
+ENV PAYMENT_RUNTIME_SOURCE_SHA=${PAYMENT_RUNTIME_SOURCE_SHA}
+WORKDIR /app
+COPY --from=build --chown=payment:payment /workspace/target/payment-platform-backend-*.jar app.jar
+COPY --from=build --chown=payment:payment /workspace/initial-runtime /app/initial-runtime
+USER payment
+EXPOSE 8080
+HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=12 \
+  CMD curl --fail --silent http://127.0.0.1:8080/actuator/health/readiness || exit 1
+ENTRYPOINT ["java", "-Dloader.path=/app/initial-runtime", "-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentRuntime", "-cp", "/app/app.jar", "org.springframework.boot.loader.launch.PropertiesLauncher"]
