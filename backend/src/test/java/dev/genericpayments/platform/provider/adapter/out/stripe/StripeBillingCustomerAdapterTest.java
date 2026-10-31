@@ -85,24 +85,66 @@ class StripeBillingCustomerAdapterTest {
     }
     // Catches random resource identities and duplicate writes across concurrent subscriptions.
     @Test void concurrentSubscriptionsShareOneOriginalCustomerKey() throws Exception {
-        identity(); identity();
+        var accountResponses = new CyclicBarrier(2);
+        for (int i = 0; i < 2; i++) http.enqueue("GET", "/v1/account", 200, ignored -> {
+            // Both FIFO GET entries must be selected before either verification can return.
+            awaitCustomerRendezvous(accountResponses);
+            return "{\"id\":\"acct_expected\",\"object\":\"account\"}";
+        });
         http.enqueueDelayedBody("POST", "/v1/customers", 200, remote("cus_owned"), 150);
         var barrier = new CyclicBarrier(2);
-        try (var pool = Executors.newFixedThreadPool(2)) {
-            Callable<String> call = () -> { barrier.await(5, TimeUnit.SECONDS); try {
+        var pool = Executors.newFixedThreadPool(2);
+        var attempts = new ArrayList<Future<String>>();
+        try {
+            Callable<String> call = () -> { awaitCustomerRendezvous(barrier); try {
                 return adapter.ensureCustomer(account, site, customer).providerReference();
             } catch (PaymentApplicationException safe) { return safe.code(); } };
-            var first = pool.submit(call); var second = pool.submit(call);
+            var first = pool.submit(call); attempts.add(first);
+            var second = pool.submit(call); attempts.add(second);
             assertThat(List.of(first.get(5, TimeUnit.SECONDS), second.get(5, TimeUnit.SECONDS)))
                 .contains("cus_owned").allMatch(v -> v.equals("cus_owned") || v.equals("PROVIDER_RESULT_UNKNOWN"));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("Customer worker wait interrupted");
+        } finally {
+            barrier.reset(); accountResponses.reset();
+            attempts.forEach(attempt -> attempt.cancel(true));
+            pool.shutdownNow();
+            try {
+                if (!pool.awaitTermination(5, TimeUnit.SECONDS)) throw new AssertionError("Customer workers did not stop");
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("Customer worker teardown interrupted");
+            }
         }
+        assertThat(http.calls()).hasSize(3);
+        assertThat(http.calls().stream().filter(c -> c.method().equals("GET") && c.path().equals("/v1/account")).toList()).hasSize(2);
         assertThat(posts()).hasSize(1);
         assertThat(posts().getFirst().header("Idempotency-Key"))
             .isEqualTo("billing_customer_" + account.id().value() + "_" + site.value() + "_" + customer.value());
         assertThat(posts().getFirst().form()).containsEntry("metadata[customer_id]", customer.value().toString())
-            .containsEntry("metadata[site_id]", site.value().toString()).doesNotContainKeys("email", "name");
+            .containsEntry("metadata[site_id]", site.value().toString())
+            .containsEntry("metadata[account_id]", account.id().value().toString())
+            .doesNotContainKeys("email", "name").hasSize(3);
         assertThat(operations.rows).hasSize(1);
         assertThat(operations.only().resourceId()).isEqualTo(customer.value());
+        assertThat(operations.only().kind()).isEqualTo(ProviderOperation.Kind.CUSTOMER_CREATE);
+        assertThat(operations.only().accountId()).isEqualTo(account.id());
+        assertThat(operations.only().status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
+        assertThat(operations.only().providerReference()).isEqualTo("cus_owned");
+        assertThat(bindings.rows).hasSize(1);
+        var binding = bindings.findCustomer(account.id(), site, customer).orElseThrow();
+        assertThat(binding.providerReference()).isEqualTo("cus_owned");
+        assertThat(binding.creationOperationId()).isEqualTo(operations.only().id());
+    }
+    private static void awaitCustomerRendezvous(CyclicBarrier barrier) {
+        try { barrier.await(5, TimeUnit.SECONDS); }
+        catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("Customer concurrency rendezvous interrupted");
+        } catch (BrokenBarrierException | TimeoutException failed) {
+            throw new AssertionError("Customer concurrency rendezvous failed");
+        }
     }
     // Catches recreation after durable ACK but failed local mapping transaction.
     @Test void lostBindingCommitUsesAcknowledgedOriginalWithoutAnotherCreate() {
