@@ -1581,9 +1581,38 @@ owned action graph can refine `ACTION_GRAPH` using closed labels:
   and unknown/null statuses remain generic graph failures. Earlier INITIAL,
   price/period and allocation-cardinality guards keep their existing precedence;
   in particular, a PRORATION invoice still fails INITIAL generically.
-- `ACTION_GRAPH_PAYMENT_ALLOCATION`: the existing open, default, requested
-  amount, explicit zero-paid and payment-type allocation guard failed before the
-  PaymentIntent read.
+- `ACTION_GRAPH_PAYMENT_ALLOCATION`: compatible coarse fallback for the shared
+  six-assertion allocation contract before the PaymentIntent read. The contract
+  requires status exactly `open`, default exactly `Boolean.TRUE`, requested amount
+  exactly invoice due, paid amount explicitly zero, payment present and type exactly
+  `payment_intent`, in that order. Owned action diagnostics refine it with exactly
+  eleven suffixes under `ACTION_GRAPH_PAYMENT_ALLOCATION_`:
+  `STATUS_UNAVAILABLE`, `STATUS_NOT_OPEN`, `DEFAULT_UNAVAILABLE`, `DEFAULT_NOT_TRUE`,
+  `AMOUNT_REQUESTED_UNAVAILABLE`, `AMOUNT_REQUESTED_MISMATCH`,
+  `AMOUNT_PAID_UNAVAILABLE`, `AMOUNT_PAID_NONZERO`, `PAYMENT_UNAVAILABLE`,
+  `TYPE_UNAVAILABLE`, `TYPE_UNEXPECTED`.
+
+Allocation `UNAVAILABLE` means only that the reached typed getter returned Java
+null. Omitted and explicit JSON null share that category. Mismatch labels disclose
+no actual value, sign or delta. Sequential evaluation preserves the original second
+payment getter before type; a throwing getter, null second-payment dereference or
+parser failure stays generic. Earlier settlement refusals keep their earlier stage.
+No predicate, ordinary create/change/resume/recovery admission, owned
+action/material/preconfirm acceptance, request budget, root or dispatch authority
+changes. OPEN observation remains descriptive; independent full CASH proof remains
+strict and does not gain an action-default requirement.
+
+The selected cached stripe-java 34.0.0 binary has direct nullable boxed/reference
+getters with no defaults. No selected cached official schema/source establishes
+open-payment wire requiredness, optionality or financial meaning. Eleven closed
+enum reasons and their finite mappings/tests remove diagnostic ambiguity while
+continuing to reject incomplete action graphs; they cannot reconstruct the prior
+native field/value/cause or provider outcome, which remain UNKNOWN. No provider
+values or exception details enter the existing exact two-field status-400 envelope
+or final one-line 160-character diagnostic. Initial-payment/full 5B remain
+NOT_ACCEPTED; current CREATE/DISPATCHING is consumed, uncertain and nonretryable.
+This work grants no new Sandbox attempt, replay/reset/adoption/reconciliation or
+publication.
 
 These labels identify the predicate at the existing rejecting boundary, without
 native values or a historical cause. Other graph failures retain generic

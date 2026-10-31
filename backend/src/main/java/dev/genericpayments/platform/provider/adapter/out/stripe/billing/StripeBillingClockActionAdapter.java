@@ -64,6 +64,22 @@ public final class StripeBillingClockActionAdapter {
         };
     }
     private record Snapshot(SubscriptionInteractionTransaction.State state,SubscriptionClientGrant root){}
+    private static String allocationStage(StripeBillingSnapshotMapper.AllocationReason reason){
+        if(reason==null)return "ACTION_GRAPH_PAYMENT_ALLOCATION";
+        return switch(reason){
+            case STATUS_UNAVAILABLE->"ACTION_GRAPH_PAYMENT_ALLOCATION_STATUS_UNAVAILABLE";
+            case STATUS_NOT_OPEN->"ACTION_GRAPH_PAYMENT_ALLOCATION_STATUS_NOT_OPEN";
+            case DEFAULT_UNAVAILABLE->"ACTION_GRAPH_PAYMENT_ALLOCATION_DEFAULT_UNAVAILABLE";
+            case DEFAULT_NOT_TRUE->"ACTION_GRAPH_PAYMENT_ALLOCATION_DEFAULT_NOT_TRUE";
+            case AMOUNT_REQUESTED_UNAVAILABLE->"ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_REQUESTED_UNAVAILABLE";
+            case AMOUNT_REQUESTED_MISMATCH->"ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_REQUESTED_MISMATCH";
+            case AMOUNT_PAID_UNAVAILABLE->"ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_UNAVAILABLE";
+            case AMOUNT_PAID_NONZERO->"ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_NONZERO";
+            case PAYMENT_UNAVAILABLE->"ACTION_GRAPH_PAYMENT_ALLOCATION_PAYMENT_UNAVAILABLE";
+            case TYPE_UNAVAILABLE->"ACTION_GRAPH_PAYMENT_ALLOCATION_TYPE_UNAVAILABLE";
+            case TYPE_UNEXPECTED->"ACTION_GRAPH_PAYMENT_ALLOCATION_TYPE_UNEXPECTED";
+        };
+    }
     public String selectionFailureStage(){return selectionFailureStage.get();}
     public NextAction nextAction(Scope scope){
         String checkpoint="ACTION_AUTHORITY";
@@ -86,7 +102,7 @@ public final class StripeBillingClockActionAdapter {
                 if(graphFailure.guard()!=null)checkpoint=switch(graphFailure.guard()){
                     case LINE_ASSOCIATION->"ACTION_GRAPH_LINE_ASSOCIATION";
                     case INVOICE_SETTLEMENT->settlementStage(graphFailure.settlement());
-                    case PAYMENT_ALLOCATION->"ACTION_GRAPH_PAYMENT_ALLOCATION";
+                    case PAYMENT_ALLOCATION->allocationStage(graphFailure.allocation());
                 };
                 throw StripeBillingOwnership.mismatch();
             }

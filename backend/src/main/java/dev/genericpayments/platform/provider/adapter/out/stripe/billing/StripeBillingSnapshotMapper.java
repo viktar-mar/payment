@@ -119,6 +119,13 @@ public final class StripeBillingSnapshotMapper {
     }
     /** Closed guard provenance for one owned action read; never inferred from exceptions. */
     enum OwnedActionGuard { LINE_ASSOCIATION, INVOICE_SETTLEMENT, PAYMENT_ALLOCATION }
+    /** A reached typed null is unavailable; this says nothing about provider wire optionality. */
+    enum AllocationReason {
+        STATUS_UNAVAILABLE, STATUS_NOT_OPEN, DEFAULT_UNAVAILABLE, DEFAULT_NOT_TRUE,
+        AMOUNT_REQUESTED_UNAVAILABLE, AMOUNT_REQUESTED_MISMATCH,
+        AMOUNT_PAID_UNAVAILABLE, AMOUNT_PAID_NONZERO, PAYMENT_UNAVAILABLE,
+        TYPE_UNAVAILABLE, TYPE_UNEXPECTED
+    }
     enum SettlementReason {
         PRORATION_FLAG, PRORATION_KIND, COLLECTION_METHOD, PAID_OFF_STRIPE,
         OVERPAID, STARTING_BALANCE, ENDING_BALANCE, PRE_CREDIT_NOTES,
@@ -148,7 +155,9 @@ public final class StripeBillingSnapshotMapper {
     static final class OwnedActionFailure {
         private OwnedActionGuard guard;
         private SettlementReason settlement;
+        private AllocationReason allocation;
         SettlementReason settlement(){return settlement;}
+        AllocationReason allocation(){return allocation;}
         OwnedActionGuard guard(){return guard;}
         private void require(boolean valid,OwnedActionGuard boundary){
             require(valid,boundary,null);
@@ -188,7 +197,14 @@ public final class StripeBillingSnapshotMapper {
             require("open".equals(invoice.getStatus()));
 
             var allocations=r.sourceAllocations.get(i.reference());require(allocations!=null&&allocations.size()==1);
-            var a=allocations.getFirst();long due=i.amountDueMinor();r.requireOwned("open".equals(a.getStatus())&&Boolean.TRUE.equals(a.getIsDefault())&&Objects.equals(due,a.getAmountRequested())&&zeros(a.getAmountPaid())&&a.getPayment()!=null&&"payment_intent".equals(a.getPayment().getType()),OwnedActionGuard.PAYMENT_ALLOCATION);
+            var a=allocations.getFirst();long due=i.amountDueMinor();
+            // Preserve the original short circuit order, including the second payment getter.
+            var status=a.getStatus();r.requireAllocation("open".equals(status),status==null?AllocationReason.STATUS_UNAVAILABLE:AllocationReason.STATUS_NOT_OPEN);
+            var isDefault=a.getIsDefault();r.requireAllocation(Boolean.TRUE.equals(isDefault),isDefault==null?AllocationReason.DEFAULT_UNAVAILABLE:AllocationReason.DEFAULT_NOT_TRUE);
+            var requested=a.getAmountRequested();r.requireAllocation(Objects.equals(due,requested),requested==null?AllocationReason.AMOUNT_REQUESTED_UNAVAILABLE:AllocationReason.AMOUNT_REQUESTED_MISMATCH);
+            var paid=a.getAmountPaid();r.requireAllocation(zeros(paid),paid==null?AllocationReason.AMOUNT_PAID_UNAVAILABLE:AllocationReason.AMOUNT_PAID_NONZERO);
+            var payment=a.getPayment();r.requireAllocation(payment!=null,AllocationReason.PAYMENT_UNAVAILABLE);
+            var type=a.getPayment().getType();r.requireAllocation("payment_intent".equals(type),type==null?AllocationReason.TYPE_UNAVAILABLE:AllocationReason.TYPE_UNEXPECTED);
             ref(a.getPayment().getPaymentIntent(),"pi_");var pi=r.get(()->client.v1().paymentIntents().retrieve(a.getPayment().getPaymentIntent()));
             require(a.getPayment().getPaymentIntent().equals(pi.getId())&&"payment_intent".equals(pi.getObject())&&Boolean.FALSE.equals(pi.getLivemode())&&customer.equals(pi.getCustomer())
                 &&invoice.getCurrency().equals(pi.getCurrency())&&Objects.equals(due,pi.getAmount())&&zeros(pi.getAmountReceived())&&"automatic".equals(pi.getCaptureMethod())&&List.of("card").equals(pi.getPaymentMethodTypes())
@@ -241,6 +257,12 @@ public final class StripeBillingSnapshotMapper {
         Read(StripeClient client,Ownership owner,Instant at,OwnedInitial original){this(client,owner,at,original,null);}
         Read(StripeClient client,Ownership owner,Instant at,OwnedInitial original,OwnedActionFailure actionFailure){this.client=Objects.requireNonNull(client);this.owner=Objects.requireNonNull(owner);this.at=Objects.requireNonNull(at);this.original=original;this.actionFailure=actionFailure;}
         void requireOwned(boolean valid,OwnedActionGuard boundary){if(actionFailure==null)require(valid);else actionFailure.require(valid,boundary);}
+        private void requireAllocation(boolean valid,AllocationReason reason){
+            if(!valid){
+                if(actionFailure!=null&&actionFailure.guard==null)actionFailure.allocation=reason;
+                requireOwned(false,OwnedActionGuard.PAYMENT_ALLOCATION);
+            }
+        }
         void requireSettlement(boolean valid,SettlementReason reason){if(actionFailure==null)require(valid);else actionFailure.require(valid,OwnedActionGuard.INVOICE_SETTLEMENT,reason);}
         boolean clockMatches(String clock){return Objects.equals(clock,original==null?null:original.receipt().intent().clock().reference());}
 
