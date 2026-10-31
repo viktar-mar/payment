@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { CampaignList } from "./CampaignList";
 import { CampaignDetails } from "./CampaignDetails";
@@ -60,4 +60,114 @@ it("refreshes a create conflict, releases the blocked intent and restores the cr
   fireEvent.click(screen.getByRole("button",{name:"Create campaign"}));
   expect(screen.getByRole("button",{name:"Save campaign"})).toBeEnabled();
   expect(screen.getByLabelText("Campaign key")).toHaveValue("");
+});
+
+it("restores the exact trigger when Refresh is clicked before passive conflict focus", async () => {
+  let reads = 0; let submissions = 0;
+  vi.stubGlobal("fetch", async (_: string, init: RequestInit) => {
+    if (init.method === "GET") { reads++; return Response.json({ items: [], offset: 0, limit: 20 }); }
+    submissions++;
+    return Response.json({ title: "Resource conflict" }, { status: 409 });
+  });
+  render(<CampaignList siteId={siteId} />);
+  await screen.findByText("No campaigns found.");
+  const trigger = screen.getByRole("button", { name: "Create campaign" });
+  fireEvent.click(trigger);
+  fireEvent.change(screen.getByLabelText("Campaign key"), { target: { value: "help-now" } });
+  fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Help" } });
+  let refreshed = false; let alertWasFocused: boolean | undefined;
+  // Act as soon as the real conflict DOM exists, before its passive alert-focus effect.
+  const observer = new MutationObserver(() => {
+    const refresh = screen.queryByRole("button", { name: "Refresh campaign" });
+    if (!refresh) return;
+    observer.disconnect();
+    alertWasFocused = screen.getByRole("alert") === document.activeElement;
+    refreshed = true;
+    fireEvent.click(refresh);
+  });
+  try {
+    observer.observe(document.body, { childList: true, subtree: true });
+    fireEvent.click(screen.getByRole("button", { name: "Save campaign" }));
+    await waitFor(() => expect(screen.queryByRole("form", { name: "Create campaign" })).not.toBeInTheDocument());
+    expect(refreshed).toBe(true);
+    expect(alertWasFocused).toBe(false);
+    expect(trigger).toHaveFocus();
+    await waitFor(() => expect(reads).toBe(2));
+    expect(submissions).toBe(1);
+    fireEvent.click(trigger);
+    expect(screen.getByRole("button", { name: "Save campaign" })).toBeEnabled();
+    expect(screen.getByLabelText("Campaign key")).toHaveValue("");
+    expect(screen.getByLabelText("Display name")).toHaveValue("");
+    expect(submissions).toBe(1);
+  } finally {
+    observer.disconnect();
+  }
+});
+
+it("does not steal focus on initial mount, list completion or opening creation", async () => {
+  const initialRead = Promise.withResolvers<Response>();
+  vi.stubGlobal("fetch", () => initialRead.promise);
+  const outside = document.createElement("button");
+  outside.textContent = "Another control";
+  document.body.append(outside);
+  outside.focus();
+  try {
+    render(<CampaignList siteId={siteId} />);
+    expect(outside).toHaveFocus();
+    await act(async () => initialRead.resolve(Response.json({ items: [], offset: 0, limit: 20 })));
+    expect(screen.getByText("No campaigns found.")).toBeInTheDocument();
+    expect(outside).toHaveFocus();
+    fireEvent.click(screen.getByRole("button", { name: "Create campaign" }));
+    expect(screen.getByRole("form", { name: "Create campaign" })).toBeInTheDocument();
+    expect(outside).toHaveFocus();
+  } finally {
+    outside.remove();
+  }
+});
+
+it.each(["save", "refresh"] as const)("consumes %s focus restoration before later list completion and parent renders", async close => {
+  const refreshedList = Promise.withResolvers<Response>();
+  const reads: string[] = [];
+  let submissions = 0;
+  vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
+    if (init.method !== "GET") {
+      submissions++;
+      return close === "save" ? Response.json(campaign) : Response.json({ title: "Resource conflict" }, { status: 409 });
+    }
+    reads.push(url);
+    if (reads.length === 3) return refreshedList.promise;
+    return Response.json({ items: reads.length === 1 ? Array.from({ length: 20 }, (_, index) => ({ ...campaign, id: index === 0 ? campaign.id : `row-${index}` })) : [campaign], offset: reads.length === 1 ? 0 : 20, limit: 20 });
+  });
+  const view = render(<div><button>Another control</button><CampaignList siteId={siteId} /></div>);
+  await screen.findByRole("button", { name: "Next page" });
+  fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+  await screen.findByText("Offset 20 · up to 20 campaigns per page");
+  const trigger = screen.getByRole("button", { name: "Create campaign" });
+  fireEvent.click(trigger);
+  fireEvent.change(screen.getByLabelText("Campaign key"), { target: { value: "help-now" } });
+  fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Help" } });
+  const submit = screen.getByRole("button", { name: "Save campaign" });
+  submit.focus();
+  fireEvent.click(submit);
+  if (close === "refresh") fireEvent.click(await screen.findByRole("button", { name: "Refresh campaign" }));
+  await waitFor(() => expect(screen.queryByRole("form", { name: "Create campaign" })).not.toBeInTheDocument());
+  expect(trigger).toHaveFocus();
+  expect(reads).toHaveLength(3);
+  expect(reads[2]).toContain(close === "save" ? "offset=0" : "offset=20");
+  const outside = screen.getByRole("button", { name: "Another control" });
+  outside.focus();
+  await act(async () => refreshedList.resolve(Response.json({ items: [], offset: close === "save" ? 0 : 20, limit: 20 })));
+  expect(screen.getByText("No campaigns found.")).toBeInTheDocument();
+  expect(outside).toHaveFocus();
+  view.rerender(<div><button>Another control</button><CampaignList siteId={siteId} /></div>);
+  expect(outside).toHaveFocus();
+  fireEvent.click(trigger);
+  expect(screen.getByRole("button", { name: "Save campaign" })).toBeEnabled();
+  expect(screen.getByLabelText("Campaign key")).toHaveValue("");
+  expect(screen.getByLabelText("Display name")).toHaveValue("");
+  expect(outside).toHaveFocus();
+  fireEvent.click(trigger);
+  expect(screen.queryByRole("form", { name: "Create campaign" })).not.toBeInTheDocument();
+  expect(outside).toHaveFocus();
+  expect(submissions).toBe(1);
 });
