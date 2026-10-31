@@ -7,13 +7,18 @@ import dev.genericpayments.platform.support.StripeBillingOwnedSubscriptionFixtur
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import static org.assertj.core.api.Assertions.*;
 
 /** Exact mapper expression with official SDK values and two inert GET responses only. */
 class StripeBillingSettlementEvaluationTest {
     // Splitting zeros into short-circuited getter calls would skip five original argument reads.
-    @Test void allSixZeroArgumentsAreReadBeforeFirstNonzeroRefusal() throws Exception {
-        var f=new StripeBillingOwnedSubscriptionFixture();f.invoice.addProperty("amount_paid_off_stripe",1);
+    @ParameterizedTest @ValueSource(strings={"nonzero","omitted","null"})
+    void allSixZeroArgumentsAreReadBeforeFirstRefusal(String indicator) throws Exception {
+        var f=new StripeBillingOwnedSubscriptionFixture();
+        switch(indicator){case "nonzero"->f.invoice.addProperty("amount_paid_off_stripe",1);case "omitted"->f.invoice.remove("amount_paid_off_stripe");case "null"->f.invoice.add("amount_paid_off_stripe",com.google.gson.JsonNull.INSTANCE);}
+        f.invoice.addProperty("ending_balance",1);
         var parsed=ApiResource.GSON.fromJson(f.invoice.toString(),Invoice.class);
         var invoice=new CountingInvoice();
         for(var field:Invoice.class.getDeclaredFields())if(!java.lang.reflect.Modifier.isStatic(field.getModifiers())){field.setAccessible(true);field.set(invoice,field.get(parsed));}
@@ -32,11 +37,22 @@ class StripeBillingSettlementEvaluationTest {
         var result=(dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Invoice)normalize.invoke(read,invoice,remote,remote.getItems().getData().getFirst(),null);
         assertThat(result.settlement()).isEqualTo(dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind.UNSUPPORTED);
         assertThat(invoice.reads).containsExactly("paidOffStripe","overpaid","starting","ending","preCredit","postCredit");
+        assertThat(invoice.statusReads).as("the typed status is cached once before the eager amount getters").isEqualTo(1);
         assertThat(failure.guard()).as("tentative normalization cannot commit a boundary failure").isNull();
         assertThat(f.f.http.calls).hasSize(2).allMatch(c->c.method().name().equals("GET"));
     }
+    @ParameterizedTest @ValueSource(strings={"zero","omitted","null","positive","negative"})
+    void actualNoAdjustmentsRetainsExplicitZeroRequirement(String indicator){
+        var f=new StripeBillingOwnedSubscriptionFixture();
+        assertThat(StripeBillingMutationAdapter.noAdjustments(ApiResource.GSON.fromJson(f.invoice.toString(),Invoice.class))).isTrue();
+        switch(indicator){case "omitted"->f.invoice.remove("amount_paid_off_stripe");case "null"->f.invoice.add("amount_paid_off_stripe",com.google.gson.JsonNull.INSTANCE);case "positive"->f.invoice.addProperty("amount_paid_off_stripe",1);case "negative"->f.invoice.addProperty("amount_paid_off_stripe",-1);}
+        assertThat(StripeBillingMutationAdapter.noAdjustments(ApiResource.GSON.fromJson(f.invoice.toString(),Invoice.class))).isEqualTo(indicator.equals("zero"));
+        assertThat(f.f.http.calls).isEmpty();
+    }
     static final class CountingInvoice extends Invoice {
         final List<String> reads=new ArrayList<>();
+        int statusReads;
+        @Override public String getStatus(){statusReads++;return super.getStatus();}
         @Override public Long getAmountPaidOffStripe(){reads.add("paidOffStripe");return super.getAmountPaidOffStripe();}
         @Override public Long getAmountOverpaid(){reads.add("overpaid");return super.getAmountOverpaid();}
         @Override public Long getStartingBalance(){reads.add("starting");return super.getStartingBalance();}

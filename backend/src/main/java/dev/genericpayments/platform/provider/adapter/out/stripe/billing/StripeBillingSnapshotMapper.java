@@ -135,8 +135,9 @@ public final class StripeBillingSnapshotMapper {
         SettlementTrace(boolean enabled){this.enabled=enabled;}
         boolean check(boolean valid,SettlementReason reason){if(enabled&&!valid&&first==null)first=reason;return valid;}
         // All six getter arguments are evaluated before this helper, as with the original zeros call.
-        boolean plainZeros(Long paidOffStripe,Long overpaid,Long starting,Long ending,Long preCredit,Long postCredit){
-            return check(Objects.equals(paidOffStripe,0L),SettlementReason.PAID_OFF_STRIPE)
+        boolean plainAmounts(Long paidOffStripe,Long overpaid,Long starting,Long ending,Long preCredit,Long postCredit,boolean acceptsUnavailableOffStripe){
+            // Application evidence policy: unavailable is unknown, not zero or proof of no outside funding.
+            return check(Objects.equals(paidOffStripe,0L)||acceptsUnavailableOffStripe&&paidOffStripe==null,SettlementReason.PAID_OFF_STRIPE)
                 &&check(Objects.equals(overpaid,0L),SettlementReason.OVERPAID)
                 &&check(Objects.equals(starting,0L),SettlementReason.STARTING_BALANCE)
                 &&check(Objects.equals(ending,0L),SettlementReason.ENDING_BALANCE)
@@ -397,12 +398,16 @@ public final class StripeBillingSnapshotMapper {
             SettlementKind settlement=SettlementKind.UNSUPPORTED;List<CashObject> cash=List.of();
             var trace=new SettlementTrace(actionFailure!=null);
             SettlementReason unsupportedReason=SettlementReason.SNAPSHOT_UNSUPPORTED;
+            // Cache the pure typed status before the six eager amount getters; reuse it below.
+            var status=invoice.getStatus();
+            boolean acceptsUnavailableOffStripe=original!=null&&kind==BillingRecord.Kind.INITIAL&&invoice.getAmountDue()>0
+                &&("open".equals(status)||"paid".equals(status));
             boolean plain=trace.check(!detail.getProration(),SettlementReason.PRORATION_FLAG)&&trace.check(kind!=BillingRecord.Kind.PRORATION,SettlementReason.PRORATION_KIND)&&trace.check("charge_automatically".equals(invoice.getCollectionMethod()),SettlementReason.COLLECTION_METHOD)
-                &&trace.plainZeros(invoice.getAmountPaidOffStripe(),invoice.getAmountOverpaid(),invoice.getStartingBalance(),invoice.getEndingBalance(),invoice.getPrePaymentCreditNotesAmount(),invoice.getPostPaymentCreditNotesAmount())
+                &&trace.plainAmounts(invoice.getAmountPaidOffStripe(),invoice.getAmountOverpaid(),invoice.getStartingBalance(),invoice.getEndingBalance(),invoice.getPrePaymentCreditNotesAmount(),invoice.getPostPaymentCreditNotesAmount(),acceptsUnavailableOffStripe)
                 &&trace.check(empty(invoice.getDiscounts()),SettlementReason.INVOICE_DISCOUNTS)&&trace.check(empty(invoice.getTotalDiscountAmounts()),SettlementReason.INVOICE_DISCOUNT_AMOUNTS)&&trace.check(empty(invoice.getTotalPretaxCreditAmounts()),SettlementReason.INVOICE_PRETAX_CREDITS)&&trace.check(empty(line.getDiscountAmounts()),SettlementReason.LINE_DISCOUNT_AMOUNTS)&&trace.check(empty(line.getPretaxCreditAmounts()),SettlementReason.LINE_PRETAX_CREDITS)
                 &&trace.check(Objects.equals(invoice.getTotal(),invoice.getAmountDue()),SettlementReason.TOTAL)&&trace.check(Objects.equals(invoice.getSubtotal(),invoice.getAmountDue()),SettlementReason.SUBTOTAL)&&trace.check(Objects.equals(line.getAmount(),invoice.getAmountDue()),SettlementReason.LINE_AMOUNT);
             if(trace.first!=null)unsupportedReason=trace.first;
-            switch(invoice.getStatus()){
+            switch(status){
                 case "paid"->{
                     if(plain&&invoice.getAmountDue()==0&&zeros(invoice.getAmountPaid(),invoice.getAmountRemaining())&&allocations.isEmpty()
                         &&kind==BillingRecord.Kind.INITIAL&&trialContext!=null&&mapped.equals(trialContext.original())

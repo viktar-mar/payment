@@ -10,6 +10,26 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Standalone official SDK/inert transport; no parent, extension, context, server or DB. */
 class StripeBillingClockSnapshotTest {
+    @ParameterizedTest @ValueSource(strings={"omitted","null","zero","positive","negative"})
+    void indicatorPolicyIsLimitedToOwnedPositiveInitialOpenAndCash(String indicator){
+        for(boolean paid:java.util.List.of(false,true))for(boolean owned:java.util.List.of(false,true)){
+            var f=new StripeBillingOwnedSubscriptionFixture();indicator(f,indicator);
+            if(!owned)for(var resource:java.util.List.of(f.customer,f.remote,f.invoice))resource.remove("test_clock");
+            if(paid)f.paidGraph();else f.graph();
+            if(owned&&(indicator.equals("omitted")||indicator.equals("null")||indicator.equals("zero"))){
+                var invoice=owned(f).invoices().getFirst();
+                assertThat(invoice.settlement()).isEqualTo(paid?dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind.CASH:dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind.OPEN);
+                assertThat(invoice.amountDueMinor()).isEqualTo(1000);assertThat(invoice.currency()).isEqualTo("EUR");
+            }else if(!owned&&indicator.equals("zero")){
+                assertThat(StripeBillingSnapshotMapper.retrieve(f.f.clients.create(null),f.ordinary(),f.utc).invoices().getFirst().settlement()).isEqualTo(paid?dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind.CASH:dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind.OPEN);
+            }else if(owned)assertThatThrownBy(()->owned(f)).isInstanceOf(PaymentApplicationException.class);
+            else assertThat(StripeBillingSnapshotMapper.retrieve(f.f.clients.create(null),f.ordinary(),f.utc).invoices().getFirst().settlement()).isEqualTo(dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind.UNSUPPORTED);
+            assertThat(f.f.http.calls).hasSize(paid&&(owned||indicator.equals("zero"))&&!java.util.List.of("positive","negative").contains(indicator)?8:5).allMatch(c->c.method().name().equals("GET"));
+        }
+    }
+    static void indicator(StripeBillingOwnedSubscriptionFixture f,String state){
+        switch(state){case "omitted"->f.invoice.remove("amount_paid_off_stripe");case "null"->f.invoice.add("amount_paid_off_stripe",com.google.gson.JsonNull.INSTANCE);case "zero"->f.invoice.addProperty("amount_paid_off_stripe",0);case "positive"->f.invoice.addProperty("amount_paid_off_stripe",1);case "negative"->f.invoice.addProperty("amount_paid_off_stripe",-1);default->throw new AssertionError(state);}
+    }
     // Removing an ordinary resource's clock fence would admit a clock graph through a direct mapper call.
     @ParameterizedTest @ValueSource(strings={"customer","subscription","invoice"})
     void ordinaryDirectMapperRejectsEachUnexpectedClock(String resource){
@@ -25,8 +45,8 @@ class StripeBillingClockSnapshotTest {
     }
     @ParameterizedTest @ValueSource(strings={"customerMissing","customerForeign","subscriptionMissing","subscriptionForeign","invoiceMissing","invoiceForeign","createdMissing","createdChanged","item","price","periodStart","periodEnd","laterPeriod","trial","schedule","pending","cancel","pause","renewal","linePeriod","lineItem","lineProduct","proration","invoiceCustomer","invoiceParent","live","deletedCustomer","unknownStatus"})
     void rejectsBrokenOriginalClockAndInitialGraph(String mutation){
-        for(var representation:java.util.List.of("exact","omitted","null")){
-            var f=new StripeBillingOwnedSubscriptionFixture();f.flatSubscription(representation);
+        for(var indicator:java.util.List.of("omitted","null","zero"))for(var representation:java.util.List.of("exact","omitted","null")){
+            var f=new StripeBillingOwnedSubscriptionFixture();f.flatSubscription(representation);indicator(f,indicator);
             switch(mutation){
                 case "customerMissing"->f.customer.remove("test_clock");case "customerForeign"->f.customer.addProperty("test_clock","clock_foreign");
                 case "subscriptionMissing"->f.remote.remove("test_clock");case "subscriptionForeign"->f.remote.addProperty("test_clock","clock_foreign");
@@ -63,11 +83,15 @@ class StripeBillingClockSnapshotTest {
         assertThat(f.f.http.calls).hasSize(8).allMatch(c->c.method().name().equals("GET"));
         assertThat(s.externalWithdrawalEvidence()).isNull();assertThat(s.recoveryObservations()).isEmpty();
     }
-    @ParameterizedTest @ValueSource(strings={"uncaptured","chargeAmount","chargeCustomer","chargeIntent","intentState","intentCustomer","allocationAmount","allocationType","offStripe","reverseForeign","reverseDuplicate","nullCaptured","nullChargeAmount","nullIntentReceived","nullPaidAt","chargeCurrency","chargeLive","chargeObject","chargeId","chargeStatus","chargePaid","chargeMethod","chargeGross","intentAmount","intentCurrency","intentCapture","allocationRequested"})
+    @ParameterizedTest @ValueSource(strings={"missingCharge","missingAllocation","splitAllocation","foreignAllocation","allocationCurrency","allocationLive","missingPaidAt","intentLive","intentCards","invoiceAmount","invoicePaid","invoiceRemaining","invoiceCurrency","invoiceCustomer","uncaptured","chargeAmount","chargeCustomer","chargeIntent","intentState","intentCustomer","allocationAmount","allocationType","offStripe","reverseMissing","reverseForeign","reverseDuplicate","nullCaptured","nullChargeAmount","nullIntentReceived","nullPaidAt","chargeCurrency","chargeLive","chargeObject","chargeId","chargeStatus","chargePaid","chargeMethod","chargeGross","intentAmount","intentCurrency","intentCapture","allocationRequested"})
     void ownedPaidStatusCannotReplaceFullCashGraph(String broken){
-        for(var representation:java.util.List.of("exact","omitted","null")){
-            var f=new StripeBillingOwnedSubscriptionFixture();f.flatSubscription(representation);
+        for(var indicator:java.util.List.of("omitted","null","zero"))for(var representation:java.util.List.of("exact","omitted","null")){
+            var f=new StripeBillingOwnedSubscriptionFixture();f.flatSubscription(representation);indicator(f,indicator);
             switch(broken){
+                case "missingCharge"->f.pi.remove("latest_charge");case "missingPaidAt"->f.allocation.getAsJsonObject("status_transitions").remove("paid_at");case "foreignAllocation"->f.allocation.addProperty("invoice","in_foreign");
+                case "allocationCurrency"->f.allocation.addProperty("currency","usd");case "allocationLive"->f.allocation.addProperty("livemode",true);
+                case "intentLive"->f.pi.addProperty("livemode",true);case "intentCards"->f.pi.add("payment_method_types",com.google.gson.JsonParser.parseString("[\"link\"]"));case "invoiceCurrency"->f.invoice.addProperty("currency","usd");case "invoiceCustomer"->f.invoice.addProperty("customer","cus_foreign");
+                case "invoiceAmount"->f.invoice.addProperty("amount_due",999);
                 case "nullCaptured"->f.charge.add("captured",com.google.gson.JsonNull.INSTANCE);case "nullChargeAmount"->f.charge.add("amount_captured",com.google.gson.JsonNull.INSTANCE);case "nullIntentReceived"->f.pi.add("amount_received",com.google.gson.JsonNull.INSTANCE);case "nullPaidAt"->f.allocation.getAsJsonObject("status_transitions").add("paid_at",com.google.gson.JsonNull.INSTANCE);
                 case "chargeCurrency"->f.charge.addProperty("currency","usd");case "chargeLive"->f.charge.addProperty("livemode",true);case "chargeObject"->f.charge.addProperty("object","payment_intent");case "chargeId"->f.charge.addProperty("id","ch_foreign");case "chargeStatus"->f.charge.addProperty("status","failed");case "chargePaid"->f.charge.addProperty("paid",false);case "chargeMethod"->f.charge.getAsJsonObject("payment_method_details").addProperty("type","link");case "chargeGross"->f.charge.addProperty("amount",999);
                 case "intentAmount"->f.pi.addProperty("amount",999);case "intentCurrency"->f.pi.addProperty("currency","usd");case "intentCapture"->f.pi.addProperty("capture_method","manual");case "allocationRequested"->f.allocation.addProperty("amount_requested",999);
@@ -77,9 +101,19 @@ class StripeBillingClockSnapshotTest {
                 case "allocationAmount"->f.allocation.addProperty("amount_paid",999);case "allocationType"->f.allocation.getAsJsonObject("payment").addProperty("type","future_payment");
                 case "offStripe"->f.invoice.addProperty("amount_paid_off_stripe",1000);}
             f.paidGraph();
+            if(broken.equals("invoicePaid")||broken.equals("invoiceRemaining")){
+                // paidGraph supplies the baseline; replace only the queued invoice response.
+                var replies=new java.util.ArrayList<>(f.f.http.replies);f.f.http.replies.clear();f.invoice.addProperty(broken.equals("invoicePaid")?"amount_paid":"amount_remaining",1);
+                f.f.http.reply(f.customer.toString());f.f.http.reply(f.remote.toString());f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(f.invoice));for(int n=3;n<replies.size();n++)f.f.http.replies.add(replies.get(n));
+            }
+            if(broken.equals("missingAllocation")||broken.equals("splitAllocation")){
+                var replies=new java.util.ArrayList<>(f.f.http.replies);f.f.http.replies.clear();
+                var first=f.allocation.deepCopy();first.addProperty("amount_paid",500);first.addProperty("amount_requested",500);var second=first.deepCopy();second.addProperty("id","inpay_second");
+                for(int n=0;n<replies.size();n++)if(n==4)f.f.http.reply(broken.equals("missingAllocation")?StripeBillingOwnedSubscriptionFixture.page():StripeBillingOwnedSubscriptionFixture.page(first,second));else f.f.http.replies.add(replies.get(n));
+            }
             if(broken.startsWith("reverse")){
                 f.f.http.replies.removeLast();var other=f.allocation.deepCopy();other.addProperty("id","inpay_other");other.addProperty("invoice","in_other");
-                f.f.http.reply(broken.equals("reverseForeign")?StripeBillingOwnedSubscriptionFixture.page(other):StripeBillingOwnedSubscriptionFixture.page(f.allocation,other));
+                f.f.http.reply(broken.equals("reverseMissing")?StripeBillingOwnedSubscriptionFixture.page():broken.equals("reverseForeign")?StripeBillingOwnedSubscriptionFixture.page(other):StripeBillingOwnedSubscriptionFixture.page(f.allocation,other));
             }
             assertThatThrownBy(()->owned(f)).isInstanceOf(PaymentApplicationException.class);
         }
