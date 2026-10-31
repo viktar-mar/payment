@@ -202,7 +202,9 @@ public final class StripeBillingSnapshotMapper {
             var status=a.getStatus();r.requireAllocation("open".equals(status),status==null?AllocationReason.STATUS_UNAVAILABLE:AllocationReason.STATUS_NOT_OPEN);
             var isDefault=a.getIsDefault();r.requireAllocation(Boolean.TRUE.equals(isDefault),isDefault==null?AllocationReason.DEFAULT_UNAVAILABLE:AllocationReason.DEFAULT_NOT_TRUE);
             var requested=a.getAmountRequested();r.requireAllocation(Objects.equals(due,requested),requested==null?AllocationReason.AMOUNT_REQUESTED_UNAVAILABLE:AllocationReason.AMOUNT_REQUESTED_MISMATCH);
-            var paid=a.getAmountPaid();r.requireAllocation(zeros(paid),paid==null?AllocationReason.AMOUNT_PAID_UNAVAILABLE:AllocationReason.AMOUNT_PAID_NONZERO);
+            // Stripe leaves allocation paid unfinalized until paid; only the proved owned initial graph admits null.
+            // Null remains unknown, never numeric zero or the full paid amount required by CASH.
+            var paid=a.getAmountPaid();r.requireAllocation(zeros(paid)||paid==null&&r.original!=null&&i.kind()==BillingRecord.Kind.INITIAL&&due>0,paid==null?AllocationReason.AMOUNT_PAID_UNAVAILABLE:AllocationReason.AMOUNT_PAID_NONZERO);
             var payment=a.getPayment();r.requireAllocation(payment!=null,AllocationReason.PAYMENT_UNAVAILABLE);
             var type=a.getPayment().getType();r.requireAllocation("payment_intent".equals(type),type==null?AllocationReason.TYPE_UNAVAILABLE:AllocationReason.TYPE_UNEXPECTED);
             ref(a.getPayment().getPaymentIntent(),"pi_");var pi=r.get(()->client.v1().paymentIntents().retrieve(a.getPayment().getPaymentIntent()));

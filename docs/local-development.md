@@ -1490,6 +1490,8 @@ No local Docker, database/SQL, application/context, browser, provider/financial 
 
 The bounded owned off-Stripe policy changes the application evidence requirement for a typed original receipt, positive INITIAL invoice and actual `open`/`paid` status only. The shared action/material/preconfirm/OPEN/CASH mapper accepts an unavailable (omitted or JSON-null typed getter) `amount_paid_off_stripe`; zero remains accepted and any supplied numeric nonzero refuses. Unavailable stays unknown. The other five zero-money fields and required empty adjustment lists remain strict, and ordinary/nonoriginal, draft/uncollectible/VOID, zero/trial/proration and mutation `noAdjustments` retain explicit zero. Exact unpaid graph proof is still required before action, and exact full allocation/PI/captured card Charge/reverse/paid-at proof before CASH. Full gross card cash does not prove absence of additional outside funding. This is a deliberate evidence-policy choice, not proof of Stripe wire optionality, null=zero, the historical native value/cause, or actual-provider acceptance. It grants no new native permission: current CREATE/DISPATCHING remains nonretryable; initial-payment and full 5B remain **NOT_ACCEPTED**. Offline verification selects only the three audited pure Java classes with inert SDK transport; it cannot substitute for native or hosted acceptance.
 
+For a typed original receipt, positive INITIAL invoice and actual invoice status exactly `open`, action/material/preconfirm accept allocation `amount_paid` as typed null or explicit numeric zero; supplied positive or negative amounts refuse. The [pinned stripe-java 34.0.0 model](https://raw.githubusercontent.com/stripe/stripe-java/v34.0.0/src/main/java/com/stripe/model/InvoicePayment.java) documents null until the payment is paid, corroborated by the [official object reference](https://docs.stripe.com/api/invoice-payment/object); the [pinned SDK API version](https://raw.githubusercontent.com/stripe/stripe-java/v34.0.0/src/main/java/com/stripe/ApiVersion.java) is `2026-09-30.endive`. Omitted and JSON-null source representations both deserialize to typed null; this boundary cannot distinguish them or establish conforming wire omission. Null remains unfinalized/unknown, never numeric zero or cash. Complete independent unpaid proof remains mandatory: invoice paid explicitly zero and remaining exactly positive catalog due; sole default open allocation requesting that due with exact owner/currency/mode/payment reference; matching card-only automatic PI with received explicitly zero, automatic confirmation, `requires_payment_method` and no latest Charge; exact sole reverse allocation; original receipt/clock/period/line and secret bounds. Ordinary/nonoriginal action still requires explicit allocation zero. CASH still requires explicit full paid allocation, succeeded full PI, full paid/captured card Charge, exact reverse ownership and paid timestamp. This is a bounded admission correction, with no new financial route, read, root authority or dispatch budget. Historical run `aabe30d7-d499-46bf-bb56-4f592ed50aa8` reached a getter returning null; its precise wire representation and provider outcome remain unknown. Its uncertain CREATE is consumed and nonretryable; initial-payment/full 5B remain NOT_ACCEPTED and no native attempt is authorized.
+
 The source preparation adds a dedicated `OWNED_INITIAL_PAYMENT` lane for one fresh READY Stripe TestClock, its owned Customer, a fresh published EUR20 MONTH inclusive Price with no trial, one original CREATE and one 4242 `SERVER_CONFIRM_V2` confirmation. Native Billing is **NOT_RUN**; full 5B is **NOT_ACCEPTED**. The previous component checkpoint `69e61e7` / [CI40971762290](https://github.com/viktar-mar/payment/actions/runs/40971762290) passed. It does not prove this new scenario. The intermediate `05f897b` hosted run exposed a finite inert-import test allowlist omission, now repaired in source; the combined scenario still requires independent review and successful hosted CI at its final published SHA.
 
 This paragraph and command document a future invocation, not permission to execute it. Obtain separate runtime approval for the exact reviewed source SHA, new UUID, canonical owned Docker daemon, seven free loopback ports, explicit frozen epoch, pinned account `acct_1UPiMpELswAd8tpR` / API `2026-09-30.endive`, and fixed financial budget `{clock:1,customer:1,create:1,confirm:1}`. Fresh fixed catalog provisioning is separate. Do not adopt any old provider/local IDs, private recovery state, retained run or prior volume. All old Billing/full/remaining/manual/refund/diagnostic/Stage4 flags must be absent or false; DEBUG/NODE_DEBUG/PWDEBUG/PW_TRACE must be off. The reviewed bootstrap alone reads its existing private Sandbox credential file and creates fresh keys, issuer, ledger and runtime capability. No runtime control key is an operator/browser input.
@@ -1584,8 +1586,10 @@ owned action graph can refine `ACTION_GRAPH` using closed labels:
 - `ACTION_GRAPH_PAYMENT_ALLOCATION`: compatible coarse fallback for the shared
   six-assertion allocation contract before the PaymentIntent read. The contract
   requires status exactly `open`, default exactly `Boolean.TRUE`, requested amount
-  exactly invoice due, paid amount explicitly zero, payment present and type exactly
-  `payment_intent`, in that order. Owned action diagnostics refine it with exactly
+  exactly invoice due, paid amount typed-null or explicitly zero only for the bounded
+  owned original positive INITIAL graph (explicitly zero otherwise), payment present
+  and type exactly `payment_intent`, in that order. Owned action diagnostics refine
+  it with exactly
   eleven suffixes under `ACTION_GRAPH_PAYMENT_ALLOCATION_`:
   `STATUS_UNAVAILABLE`, `STATUS_NOT_OPEN`, `DEFAULT_UNAVAILABLE`, `DEFAULT_NOT_TRUE`,
   `AMOUNT_REQUESTED_UNAVAILABLE`, `AMOUNT_REQUESTED_MISMATCH`,
@@ -1593,21 +1597,26 @@ owned action graph can refine `ACTION_GRAPH` using closed labels:
   `TYPE_UNAVAILABLE`, `TYPE_UNEXPECTED`.
 
 Allocation `UNAVAILABLE` means only that the reached typed getter returned Java
-null. Omitted and explicit JSON null share that category. Mismatch labels disclose
+null. Omitted and explicit JSON null share that category. The compatible closed
+`AMOUNT_PAID_UNAVAILABLE` label remains, but the bounded owned graph now accepts
+documented allocation null; ordinary allocation null still refuses. Mismatch
+labels disclose
 no actual value, sign or delta. Sequential evaluation preserves the original second
 payment getter before type; a throwing getter, null second-payment dereference or
 parser failure stays generic. Earlier settlement refusals keep their earlier stage.
-No predicate, ordinary create/change/resume/recovery admission, owned
-action/material/preconfirm acceptance, request budget, root or dispatch authority
-changes. OPEN observation remains descriptive; independent full CASH proof remains
+The bounded owned allocation paid predicate is the admission correction described
+above. Ordinary create/change/resume/recovery admission, request budgets, root
+authority and dispatch authority remain unchanged. OPEN observation remains
+descriptive; independent full CASH proof remains
 strict and does not gain an action-default requirement.
 
 The selected cached stripe-java 34.0.0 binary has direct nullable boxed/reference
-getters with no defaults. No selected cached official schema/source establishes
-open-payment wire requiredness, optionality or financial meaning. Eleven closed
-enum reasons and their finite mappings/tests remove diagnostic ambiguity while
-continuing to reject incomplete action graphs; they cannot reconstruct the prior
-native field/value/cause or provider outcome, which remain UNKNOWN. No provider
+getters with no defaults. The pinned official model and current reference linked
+above establish allocation
+null until paid, while wire omission validity remains unproved. Eleven closed enum
+reasons and their finite mappings/tests retain diagnostic compatibility while
+independent graph failures still refuse. The historical getter-null is known; its
+precise wire representation and provider outcome remain UNKNOWN. No provider
 values or exception details enter the existing exact two-field status-400 envelope
 or final one-line 160-character diagnostic. Initial-payment/full 5B remain
 NOT_ACCEPTED; current CREATE/DISPATCHING is consumed, uncertain and nonretryable.
@@ -1619,12 +1628,13 @@ native values or a historical cause. Other graph failures retain generic
 `ACTION_GRAPH`. Tentative reasons belong to one invoice and action call and
 cannot annotate a success or unrelated failure. Exception messages, properties,
 causes, stacks and response bodies cannot supply provenance. Ordinary mapping
-and observation behavior, provider read order, and every financial and
-nested ownership check remain strict.
+and observation behavior, provider read order, and all other financial and
+nested ownership checks remain strict.
 
-This is a diagnostic-only source correction. Offline artificial fixtures do not
-identify the predicate in the prior native failure or establish successful native
-payment semantics. Initial-payment and full5B remain `NOT_ACCEPTED`; the
+The allocation policy is a bounded admission correction. Offline artificial
+fixtures establish source behavior, while the historical paid-amount getter-null
+does not establish its wire representation or successful native payment semantics.
+Initial-payment and full5B remain `NOT_ACCEPTED`; the
 original CREATE/DISPATCHING remains consumed and non-retryable. This patch
 provides no authority to replay, reset, adopt or reconcile it.
 
@@ -1645,18 +1655,20 @@ same owned action binding/proof, successful root, confirmation material/preconfi
 and OPEN/CASH observations. Every supplied foreign, empty or malformed flat
 reference rejects, as do missing/null/conflicting authoritative nested associations
 under both allowed absence forms. Null/omitted/nonzero invoice ending balances,
-null/omitted/nonzero allocation paid amounts and the existing amount/currency,
+supplied nonzero allocation paid amounts and the existing amount/currency,
 default/status, receipt/clock/period/catalog, PI/reverse/capture/Charge and durable
 authority attacks still refuse without issuing a root or an unauthorized POST.
 A wrong allocation payment type can fail the earlier normalized settlement guard
 and therefore carry the settlement label. Nullable money is never converted to
-zero. First-failure and concurrent guard provenance remain covered with a supplied
-foreign flat reference. Audited pure Java and injected Node/reporter tests establish
+zero. Omitted/JSON-null allocation paid is accepted only in the complete bounded
+owned unpaid action graph and cannot establish CASH. First-failure and concurrent
+guard provenance remain covered with a supplied foreign flat reference. Audited pure Java and injected Node/reporter tests establish
 source behavior and bounded transport only; no new native operation is included.
 
 This is an intentional owned application representation rule. The cached SDK's
 independent fields establish neither provider-valid omission nor SDK deprecation,
-and the native failed predicate remains unknown. No label proves a provider POST,
+and cannot establish the historical wire representation. The historical reached
+allocation paid getter-null is known; no label proves a provider POST,
 subscription outcome or movement of money. No old or current DISPATCHING invocation
 may be retried, adopted, reset or reconciled. Native initial-payment acceptance and
 full 5B remain NOT_ACCEPTED; these offline changes include no new native attempt.

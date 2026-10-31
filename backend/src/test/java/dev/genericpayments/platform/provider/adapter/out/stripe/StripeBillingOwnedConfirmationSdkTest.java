@@ -23,26 +23,27 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Audited standalone tests: only value objects and an inert official SDK HttpClient. */
 class StripeBillingOwnedConfirmationSdkTest {
-    // Requiring the duplicate flat field in any owned phase breaks this complete receipt-bound flow.
-    @ParameterizedTest @ValueSource(strings={"exact","omitted","null"})
-    void ownedFlatRepresentationPreservesBindingRootMaterialAndPreconfirm(String representation){
+    // The documented unfinalized allocation must preserve the complete receipt-bound flow.
+    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"exact,omitted","exact,null","exact,zero","omitted,omitted","omitted,null","omitted,zero","null,omitted","null,null","null,zero"})
+    void ownedFlatRepresentationPreservesBindingRootMaterialAndPreconfirm(String representation,String allocationPaid){
         for(var indicator:List.of("omitted","null","zero")){
         var exact=new Harness();openGraph(exact.f);
         var expected=StripeBillingSnapshotMapper.retrieveOwnedPaymentAction(exact.f.f.clients.create(null),exact.f.ordinary(),new StripeBillingSnapshotMapper.OwnedInitial(exact.receipt),exact.now);
         assertThat(expected.amount()).isEqualTo(1000);assertThat(expected.currency()).isEqualTo("eur");
-        var h=new Harness();h.f.flatSubscription(representation);StripeBillingClockSnapshotTest.indicator(h.f,indicator);h.graph();
-        assertThatCode(()->assertThat(h.action().nextAction(h.scope)).isNotNull()).doesNotThrowAnyException();
+        var h=new Harness();h.f.flatSubscription(representation);StripeBillingClockSnapshotTest.indicator(h.f,indicator);prepareOpen(h.f);allocationPaid(h.f,allocationPaid);queueActionGraph(h);
+        var adapter=h.action();var actionFailure=catchThrowable(()->assertThat(adapter.nextAction(h.scope)).isNotNull());
+        assertThat(actionFailure).as("allocation paid %s; stage %s",allocationPaid,selectionFailureStage(adapter)).isNull();
         assertThat(h.root.binding()).isEqualTo(expected.binding());
         assertThat(h.root.binding().schema()).isEqualTo("owned-initial-v1");
         assertThat(h.root.binding().ownedIntent()).isEqualTo(h.f.intent.id());
         assertThat(h.inserts).isEqualTo(1);assertThat(h.root.expiresAt()).isEqualTo(h.now.plusSeconds(600));
         assertThat(h.f.f.http.calls).hasSize(9).allMatch(c->c.method().name().equals("GET"));
-        h.reserve(false);h.graph();
+        h.reserve(false);queueActionGraph(h);
         var material=h.provider().read(h.f.lookup(),h.root,null);
         assertThat(material.clientSecret()).isEqualTo("pi_owned_secret_INERT");
         assertThat(material.publishableKey()).isEqualTo("pk_test_INERT");
         assertThat(h.f.f.http.calls).hasSize(18).allMatch(c->c.method().name().equals("GET"));
-        h.reserve(true);h.graph();h.f.f.http.reply(h.success());h.f.f.http.reply(h.f.f.clockJson());
+        h.reserve(true);queueActionGraph(h);h.f.f.http.reply(h.success());h.f.f.http.reply(h.f.f.clockJson());
         assertThat(h.provider().confirm(h.f.lookup(),h.root,h.attempt,"ctoken_INERT").state()).isEqualTo(SubscriptionConfirmationAttempt.State.OBSERVE);
         assertThat(h.f.f.http.calls).hasSize(29);
         assertThat(h.f.f.http.calls.stream().filter(c->c.method().name().equals("POST")).map(c->c.url().getPath())).containsExactly("/v1/payment_intents/pi_owned/confirm");
@@ -88,7 +89,7 @@ class StripeBillingOwnedConfirmationSdkTest {
     void allowedFlatAbsenceCannotDeferBrokenGraphToConfirmationPost(String broken){
         for(var indicator:List.of("omitted","null","zero"))for(var representation:List.of("omitted","null")){
             var h=new Harness();h.f.flatSubscription(representation);StripeBillingClockSnapshotTest.indicator(h.f,indicator);h.root();h.reserve(false);prepareOpen(h.f);
-            switch(broken){case "nested"->h.f.line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").remove("subscription");case "allocation"->h.f.allocation.remove("amount_paid");case "capture"->h.f.pi.addProperty("capture_method","manual");}
+            switch(broken){case "nested"->h.f.line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").remove("subscription");case "allocation"->h.f.allocation.addProperty("amount_paid",1);case "capture"->h.f.pi.addProperty("capture_method","manual");}
             queueActionGraph(h);assertThatThrownBy(()->h.provider().read(h.f.lookup(),h.root,null)).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
             h.f.f.http.replies.clear();h.reserve(true);queueActionGraph(h);
             assertThat(h.provider().confirm(h.f.lookup(),h.root,h.attempt,"ctoken_INERT").state()).isEqualTo(SubscriptionConfirmationAttempt.State.UNKNOWN);
@@ -195,13 +196,14 @@ class StripeBillingOwnedConfirmationSdkTest {
             queueActionGraph(h);assertActionGraphRefusal(h,"ACTION_GRAPH_INVOICE_SETTLEMENT_"+switch(variant){case "nullEndingBalance","missingEndingBalance","nonzeroEndingBalance"->"ENDING_BALANCE";case "foreignLineAmount"->"LINE_AMOUNT";case "offStripePaid"->"PAID_OFF_STRIPE";default->"OPEN_ALLOCATION_TYPE";},6);
         }
     }
-    @ParameterizedTest @ValueSource(strings={"nullPaid","missingPaid","positivePaid","negativePaid","notDefault","nullDefault","missingDefault","nullRequested","missingRequested","zeroRequested","negativeRequested","wrongRequested","overRequested","canceled"})
+    @ParameterizedTest @ValueSource(strings={"nullPaidMissingRequested","missingPaidWrongRequested","positivePaid","negativePaid","notDefault","nullDefault","missingDefault","nullRequested","missingRequested","zeroRequested","negativeRequested","wrongRequested","overRequested","canceled"})
     void ownedActionAllocationGuardReportsAllocationBeforeIntentRead(String variant){
         for(var indicator:List.of("omitted","null","zero"))for(var representation:List.of("exact","omitted","null")){
             var h=new Harness();prepareOpen(h.f);h.f.flatSubscription(representation);StripeBillingClockSnapshotTest.indicator(h.f,indicator);
             mutateAllocation(h.f,variant);
             queueActionGraph(h);assertActionGraphRefusal(h,switch(variant){
-                case "nullPaid","missingPaid"->"ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_UNAVAILABLE";
+                case "nullPaidMissingRequested"->"ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_REQUESTED_UNAVAILABLE";
+                case "missingPaidWrongRequested"->"ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_REQUESTED_MISMATCH";
                 case "positivePaid","negativePaid"->"ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_NONZERO";
                 case "notDefault"->"ACTION_GRAPH_PAYMENT_ALLOCATION_DEFAULT_NOT_TRUE";
                 case "nullDefault","missingDefault"->"ACTION_GRAPH_PAYMENT_ALLOCATION_DEFAULT_UNAVAILABLE";
@@ -228,6 +230,8 @@ class StripeBillingOwnedConfirmationSdkTest {
     }
     private static void mutateAllocation(StripeBillingOwnedSubscriptionFixture f,String variant){
             switch(variant){
+                case "nullPaidMissingRequested"->{allocationPaid(f,"null");f.allocation.remove("amount_requested");}
+                case "missingPaidWrongRequested"->{allocationPaid(f,"omitted");f.allocation.addProperty("amount_requested",999);}
                 case "nullPaid"->f.allocation.add("amount_paid",com.google.gson.JsonNull.INSTANCE);case "missingPaid"->f.allocation.remove("amount_paid");case "positivePaid"->f.allocation.addProperty("amount_paid",1);case "negativePaid"->f.allocation.addProperty("amount_paid",-1);
                 case "notDefault"->f.allocation.addProperty("is_default",false);case "nullDefault"->f.allocation.add("is_default",com.google.gson.JsonNull.INSTANCE);case "missingDefault"->f.allocation.remove("is_default");
                 case "nullRequested"->f.allocation.add("amount_requested",com.google.gson.JsonNull.INSTANCE);case "missingRequested"->f.allocation.remove("amount_requested");
@@ -253,15 +257,15 @@ class StripeBillingOwnedConfirmationSdkTest {
         }
     }
     @Test void detailedGraphFailureRemainsFirstThroughGenericFailureSuccessAndDuplicateRefusal(){
-        var h=new Harness();var adapter=h.action();prepareOpen(h.f);h.f.allocation.remove("amount_paid");queueActionGraph(h);
+        var h=new Harness();var adapter=h.action();prepareOpen(h.f);h.f.allocation.addProperty("amount_paid",1);queueActionGraph(h);
         assertThat(catchThrowable(()->adapter.nextAction(h.scope))).isInstanceOf(RuntimeException.class);
-        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_UNAVAILABLE");
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_NONZERO");
         h.f.f.http.replies.clear();h.graph();after(h,2,()->{throw new UnreadableFailure();});
         assertThat(catchThrowable(()->adapter.nextAction(h.scope))).isInstanceOf(RuntimeException.class);
-        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_UNAVAILABLE");
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_NONZERO");
         h.f.f.http.replies.clear();h.graph();assertThat(adapter.nextAction(h.scope)).isNotNull();h.reserve(false);int reads=h.f.f.http.calls.size();
         assertThat(adapter.nextAction(h.scope)).isNull();assertThat(h.inserts).isEqualTo(1);assertThat(h.f.f.http.calls).hasSize(reads);
-        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_UNAVAILABLE");
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_NONZERO");
         assertThat(h.f.f.http.calls).allMatch(c->c.method().name().equals("GET"));
     }
     @Test void concurrentDetailedAndGenericFailuresKeepCallLocalGuardProvenance()throws Exception{
@@ -585,7 +589,7 @@ class StripeBillingOwnedConfirmationSdkTest {
         r.add("next_action",StripeBillingOwnedSubscriptionFixture.json("{\"type\":\"use_stripe_sdk\",\"use_stripe_sdk\":{\"future_sdk_field\":{\"anything\":[null,42,true]}}}"));h.f.f.http.reply(r.toString());h.f.f.http.reply(h.f.f.clockJson());
         var result=h.provider().confirm(h.f.lookup(),h.root,h.attempt,"ctoken_INERT");assertThat(result.state()).isEqualTo(SubscriptionConfirmationAttempt.State.REQUIRES_ACTION);assertThat(result.receipt()).isNull();
     }
-    @ParameterizedTest @ValueSource(strings={"customerClock","subscriptionClock","invoiceClock","created","item","periodStart","periodEnd","customer","allocationInvoice","allocationDefault","allocationPaid","allocationRequested","allocationMissingPaid","allocationCanceled","allocationSecond","reverse","piId","piCustomer","piAmount","piCurrency","piLive","piObject","piReceived","piConfirmation","piCapture","piStatus","piCards","piLatest","secretMissing","secretForeign","secretOversize","invoiceSecret","invoicePaid","invoiceSecond","invoiceAmount","invoiceCurrency","lineCurrency","lineAmountMissing","lineAmountNull","invoicePaidNull","invoiceRemainingNull","invoiceTotalNull","invoiceSubtotalNull","startingBalanceNull","allocationRequestedNull","allocationCurrency","piAmountNull","piReceivedNull","piCurrencyNull"})
+    @ParameterizedTest @ValueSource(strings={"customerClock","subscriptionClock","invoiceClock","created","item","periodStart","periodEnd","customer","allocationInvoice","allocationDefault","allocationPaid","allocationRequested","allocationMissingRequested","allocationCanceled","allocationSecond","reverse","piId","piCustomer","piAmount","piCurrency","piLive","piObject","piReceived","piConfirmation","piCapture","piStatus","piCards","piLatest","secretMissing","secretForeign","secretOversize","invoiceSecret","invoicePaid","invoiceSecond","invoiceAmount","invoiceCurrency","lineCurrency","lineAmountMissing","lineAmountNull","invoicePaidNull","invoiceRemainingNull","invoiceTotalNull","invoiceSubtotalNull","startingBalanceNull","allocationRequestedNull","allocationCurrency","piAmountNull","piReceivedNull","piCurrencyNull"})
     void originalGraphSubstitutionNeverReleasesOwnedSecret(String bad){
         for(var indicator:List.of("omitted","null","zero"))for(var representation:List.of("exact","omitted","null")){
             var f=new StripeBillingOwnedSubscriptionFixture();prepareOpen(f);f.flatSubscription(representation);StripeBillingClockSnapshotTest.indicator(f,indicator);
@@ -595,7 +599,7 @@ class StripeBillingOwnedConfirmationSdkTest {
                 case "allocationRequestedNull"->f.allocation.add("amount_requested",com.google.gson.JsonNull.INSTANCE);case "allocationCurrency"->f.allocation.addProperty("currency","usd");case "piAmountNull"->f.pi.add("amount",com.google.gson.JsonNull.INSTANCE);case "piReceivedNull"->f.pi.add("amount_received",com.google.gson.JsonNull.INSTANCE);case "piCurrencyNull"->f.pi.add("currency",com.google.gson.JsonNull.INSTANCE);
                 case "customerClock"->f.customer.addProperty("test_clock","clock_other");case "subscriptionClock"->f.remote.addProperty("test_clock","clock_other");case "invoiceClock"->f.invoice.addProperty("test_clock","clock_other");
                 case "created"->f.remote.addProperty("created",43);case "item"->f.item().addProperty("id","si_other");case "periodStart"->f.item().addProperty("current_period_start",1699999901);case "periodEnd"->f.item().addProperty("current_period_end",1702678401);case "customer"->f.remote.addProperty("customer","cus_other");
-                case "allocationInvoice"->f.allocation.addProperty("invoice","in_other");case "allocationDefault"->f.allocation.addProperty("is_default",false);case "allocationPaid"->f.allocation.addProperty("amount_paid",1);case "allocationRequested"->f.allocation.addProperty("amount_requested",999);case "allocationMissingPaid"->f.allocation.remove("amount_paid");case "allocationCanceled"->f.allocation.addProperty("status","canceled");
+                case "allocationInvoice"->f.allocation.addProperty("invoice","in_other");case "allocationDefault"->f.allocation.addProperty("is_default",false);case "allocationPaid"->f.allocation.addProperty("amount_paid",1);case "allocationRequested"->f.allocation.addProperty("amount_requested",999);case "allocationMissingRequested"->f.allocation.remove("amount_requested");case "allocationCanceled"->f.allocation.addProperty("status","canceled");
                 case "piId"->f.pi.addProperty("id","pi_other");case "piCustomer"->f.pi.addProperty("customer","cus_other");case "piAmount"->f.pi.addProperty("amount",999);case "piCurrency"->f.pi.addProperty("currency","usd");case "piLive"->f.pi.addProperty("livemode",true);case "piObject"->f.pi.addProperty("object","charge");case "piReceived"->f.pi.addProperty("amount_received",1);case "piConfirmation"->f.pi.addProperty("confirmation_method","manual");case "piCapture"->f.pi.addProperty("capture_method","manual");case "piStatus"->f.pi.addProperty("status","requires_action");case "piCards"->f.pi.add("payment_method_types",com.google.gson.JsonParser.parseString("[\"card\",\"link\"]"));
                 case "piLatest"->f.pi.addProperty("latest_charge","ch_owned");case "secretMissing"->f.pi.remove("client_secret");case "secretForeign"->f.pi.addProperty("client_secret","pi_other_secret_CANARY");case "secretOversize"->f.pi.addProperty("client_secret","pi_owned_secret_"+"x".repeat(497));case "invoiceSecret"->f.invoice.add("confirmation_secret",StripeBillingOwnedSubscriptionFixture.json("{\"type\":\"payment_intent\",\"client_secret\":\"pi_owned_secret_OTHER\"}"));case "invoicePaid"->f.invoice.addProperty("status","paid");default->{}
             }
@@ -759,6 +763,49 @@ class StripeBillingOwnedConfirmationSdkTest {
         void root(){var b=new SubscriptionClientGrant.Binding(receipt.providerOperation(),f.intent.operationKey(),OwnedInitialConfirmationProof.hash(receipt,"in_owned","inpay_owned","pi_owned"),"sub_owned","cus_owned","in_owned","inpay_owned","pi_owned","owned-initial-v1",null,f.intent.id());root=new SubscriptionClientGrant(new UUID(0,80),f.f.site,f.f.customer,f.f.account.id(),f.subscriptionId,f.operationId,"v1",b,null,now,now.plusSeconds(600),null,null,null,null,null);root=root.digest(StripeBillingGrantTokens.hash(tokens.token("v1",root.descriptor())));}
         void reserve(boolean consume){chain=new SubscriptionConfirmationChain(root.id(),root.tokenDigest(),session.sessionId().value(),session.origin(),root.expiresAt(),1,f.local.revision());attempt=SubscriptionConfirmationAttempt.ready(new UUID(0,81),root.id(),null,"v1",now,chain.expiresAt());if(consume){attempt=attempt.claim(StripeBillingGrantTokens.hash("key"),StripeBillingGrantTokens.hash("ctoken_INERT"),StripeBillingGrantTokens.hash(SubscriptionClientGrant.canonical("SERVER_CONFIRM_V2",attempt.id(),root.descriptor(),StripeBillingGrantTokens.hash("ctoken_INERT"),"use_stripe_sdk=true")));root=new SubscriptionClientGrant(root.id(),root.site(),root.customer(),root.account(),root.subscription(),root.operation(),root.keyVersion(),root.binding(),root.tokenDigest(),root.issuedAt(),root.expiresAt(),now,null,null,null,null);}}
         String success(){return "{\"id\":\"pi_owned\",\"object\":\"payment_intent\",\"livemode\":false,\"customer\":\"cus_owned\",\"amount\":1000,\"currency\":\"eur\",\"amount_received\":1000,\"status\":\"succeeded\",\"capture_method\":\"automatic\",\"confirmation_method\":\"automatic\",\"payment_method_types\":[\"card\"],\"next_action\":null}";}
+    }
+    static void allocationPaid(StripeBillingOwnedSubscriptionFixture f,String representation){
+        switch(representation){case "omitted"->f.allocation.remove("amount_paid");case "null"->f.allocation.add("amount_paid",com.google.gson.JsonNull.INSTANCE);case "zero"->f.allocation.addProperty("amount_paid",0);default->throw new AssertionError(representation);}
+    }
+    // Relaxing allocation paid alone must never bypass the remaining independent unpaid proof.
+    @ParameterizedTest @ValueSource(strings={"invoicePaidMissing","invoicePaidNull","remainingMissing","remainingNull","requestedMissing","requestedMismatch","canceled","notDefault","piReceivedMissing","piReceivedNull","piReceivedPositive","piAmount","piCustomer","piCurrency","piStatus","piCapture","piConfirmation","piLatest","reverseMissing"})
+    void unfinalizedAllocationStillRefusesIndependentBrokenGraphInEveryActionPhase(String broken){
+        for(var representation:List.of("omitted","null","zero")){
+            var h=new Harness();prepareOpen(h.f);allocationPaid(h.f,representation);int reads=7;String stage="ACTION_GRAPH";
+            switch(broken){
+                case "invoicePaidMissing"->{h.f.invoice.remove("amount_paid");reads=6;stage+="_INVOICE_SETTLEMENT_OPEN_PAID";}
+                case "invoicePaidNull"->{h.f.invoice.add("amount_paid",com.google.gson.JsonNull.INSTANCE);reads=6;stage+="_INVOICE_SETTLEMENT_OPEN_PAID";}
+                case "remainingMissing"->{h.f.invoice.remove("amount_remaining");reads=6;stage+="_INVOICE_SETTLEMENT_OPEN_REMAINING";}
+                case "remainingNull"->{h.f.invoice.add("amount_remaining",com.google.gson.JsonNull.INSTANCE);reads=6;stage+="_INVOICE_SETTLEMENT_OPEN_REMAINING";}
+                case "requestedMissing"->{h.f.allocation.remove("amount_requested");reads=6;stage+="_PAYMENT_ALLOCATION_AMOUNT_REQUESTED_UNAVAILABLE";}
+                case "requestedMismatch"->{h.f.allocation.addProperty("amount_requested",999);reads=6;stage+="_PAYMENT_ALLOCATION_AMOUNT_REQUESTED_MISMATCH";}
+                case "canceled"->{h.f.allocation.addProperty("status","canceled");reads=6;stage+="_PAYMENT_ALLOCATION_STATUS_NOT_OPEN";}
+                case "notDefault"->{h.f.allocation.addProperty("is_default",false);reads=6;stage+="_PAYMENT_ALLOCATION_DEFAULT_NOT_TRUE";}
+                case "piReceivedMissing"->h.f.pi.remove("amount_received");case "piReceivedNull"->h.f.pi.add("amount_received",com.google.gson.JsonNull.INSTANCE);case "piReceivedPositive"->h.f.pi.addProperty("amount_received",1);
+                case "piAmount"->h.f.pi.addProperty("amount",999);case "piCustomer"->h.f.pi.addProperty("customer","cus_foreign");case "piCurrency"->h.f.pi.addProperty("currency","usd");case "piStatus"->h.f.pi.addProperty("status","requires_action");case "piCapture"->h.f.pi.addProperty("capture_method","manual");case "piConfirmation"->h.f.pi.addProperty("confirmation_method","manual");case "piLatest"->h.f.pi.addProperty("latest_charge","ch_owned");case "reverseMissing"->reads=8;default->throw new AssertionError(broken);
+            }
+            queueBrokenUnpaidGraph(h,broken);assertActionGraphRefusal(h,stage,reads);
+            h.f.f.http.replies.clear();h.root();h.reserve(false);queueBrokenUnpaidGraph(h,broken);
+            assertThatThrownBy(()->h.provider().read(h.f.lookup(),h.root,null)).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
+            h.f.f.http.replies.clear();h.reserve(true);queueBrokenUnpaidGraph(h,broken);
+            assertThat(h.provider().confirm(h.f.lookup(),h.root,h.attempt,"ctoken_INERT").state()).isEqualTo(SubscriptionConfirmationAttempt.State.UNKNOWN);
+            assertThat(h.inserts).isZero();assertThat(h.f.f.http.calls).hasSize(3*reads).allMatch(c->c.method().name().equals("GET"));
+        }
+    }
+    static void queueBrokenUnpaidGraph(Harness h,String broken){
+        queueActionGraph(h);
+        if(broken.equals("reverseMissing")){
+            var queued=new ArrayList<>(h.f.f.http.replies);h.f.f.http.replies.clear();
+            for(int n=0;n<queued.size();n++)if(n==7)h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page());else h.f.f.http.replies.add(queued.get(n));
+        }
+    }
+    @ParameterizedTest @ValueSource(strings={"omitted","null","zero"})
+    void unfinalizedOrZeroAllocationPaidCannotBecomeCash(String representation){
+        for(var indicator:List.of("omitted","null","zero")){
+            var f=new StripeBillingOwnedSubscriptionFixture();allocationPaid(f,representation);StripeBillingClockSnapshotTest.indicator(f,indicator);f.paidGraph();
+            assertThatThrownBy(()->StripeBillingSnapshotMapper.retrieveOwned(f.f.clients.create(null),f.ordinary(),new StripeBillingSnapshotMapper.OwnedInitial(f.receipt()),f.utc)).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
+            assertThat(f.f.http.calls).hasSize(5).allMatch(c->c.method().name().equals("GET"));
+        }
     }
     static void openGraph(StripeBillingOwnedSubscriptionFixture f){prepareOpen(f);queueGraph(f);}
     static void prepareOpen(StripeBillingOwnedSubscriptionFixture f){
