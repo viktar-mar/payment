@@ -119,11 +119,41 @@ public final class StripeBillingSnapshotMapper {
     }
     /** Closed guard provenance for one owned action read; never inferred from exceptions. */
     enum OwnedActionGuard { LINE_ASSOCIATION, INVOICE_SETTLEMENT, PAYMENT_ALLOCATION }
+    enum SettlementReason {
+        PRORATION_FLAG, PRORATION_KIND, COLLECTION_METHOD, PAID_OFF_STRIPE,
+        OVERPAID, STARTING_BALANCE, ENDING_BALANCE, PRE_CREDIT_NOTES,
+        POST_CREDIT_NOTES, INVOICE_DISCOUNTS, INVOICE_DISCOUNT_AMOUNTS, INVOICE_PRETAX_CREDITS,
+        LINE_DISCOUNT_AMOUNTS, LINE_PRETAX_CREDITS, TOTAL, SUBTOTAL,
+        LINE_AMOUNT, OPEN_DUE_POSITIVE, OPEN_DUE_CATALOG, OPEN_PAID,
+        OPEN_REMAINING, OPEN_ALLOCATION_STATUS, OPEN_ALLOCATION_PAYMENT, OPEN_ALLOCATION_TYPE,
+        OPEN_ALLOCATION_INTENT, SNAPSHOT_UNSUPPORTED, ACTION_OPEN_CASH, ACTION_OPEN
+    }
+    /** Records only the first false expression, without throwing or retaining provider values. */
+    private static final class SettlementTrace {
+        private final boolean enabled;
+        private SettlementReason first;
+        SettlementTrace(boolean enabled){this.enabled=enabled;}
+        boolean check(boolean valid,SettlementReason reason){if(enabled&&!valid&&first==null)first=reason;return valid;}
+        // All six getter arguments are evaluated before this helper, as with the original zeros call.
+        boolean plainZeros(Long paidOffStripe,Long overpaid,Long starting,Long ending,Long preCredit,Long postCredit){
+            return check(Objects.equals(paidOffStripe,0L),SettlementReason.PAID_OFF_STRIPE)
+                &&check(Objects.equals(overpaid,0L),SettlementReason.OVERPAID)
+                &&check(Objects.equals(starting,0L),SettlementReason.STARTING_BALANCE)
+                &&check(Objects.equals(ending,0L),SettlementReason.ENDING_BALANCE)
+                &&check(Objects.equals(preCredit,0L),SettlementReason.PRE_CREDIT_NOTES)
+                &&check(Objects.equals(postCredit,0L),SettlementReason.POST_CREDIT_NOTES);
+        }
+    }
     static final class OwnedActionFailure {
         private OwnedActionGuard guard;
+        private SettlementReason settlement;
+        SettlementReason settlement(){return settlement;}
         OwnedActionGuard guard(){return guard;}
         private void require(boolean valid,OwnedActionGuard boundary){
-            if(!valid){if(guard==null)guard=boundary;throw mismatch();}
+            require(valid,boundary,null);
+        }
+        private void require(boolean valid,OwnedActionGuard boundary,SettlementReason reason){
+            if(!valid){if(guard==null){guard=boundary;settlement=reason;}throw mismatch();}
         }
     }
     /** Typed original-only entry. This descriptive receipt must be independently authorized by the caller. */
@@ -137,7 +167,7 @@ public final class StripeBillingSnapshotMapper {
             require(snapshot.status()==Subscription.Status.INCOMPLETE&&snapshot.invoices().size()==1);
             var invoice=snapshot.invoices().getFirst();
             require(invoice.kind()==BillingRecord.Kind.INITIAL);
-            r.requireOwned(invoice.settlement()==SettlementKind.OPEN,OwnedActionGuard.INVOICE_SETTLEMENT);
+            r.requireSettlement(invoice.settlement()==SettlementKind.OPEN,invoice.settlement()==SettlementKind.CASH?SettlementReason.ACTION_OPEN_CASH:SettlementReason.ACTION_OPEN);
             require(invoice.price().equals(intent.terms())
                 &&invoice.period().equals(snapshot.period())&&invoice.period().start().getEpochSecond()==receipt.periodStart()&&invoice.period().end().getEpochSecond()==receipt.periodEnd());
             var graph=paymentGraph(r,invoice,intent.customerReference());var pi=graph.intent();
@@ -202,6 +232,7 @@ public final class StripeBillingSnapshotMapper {
         com.stripe.model.Subscription remote;List<com.stripe.model.Invoice> sourceInvoices;
         final Map<String,List<InvoicePayment>> sourceAllocations=new HashMap<>();
         final Map<String,List<InvoiceLineItem>> sourceLines=new HashMap<>();
+        final Map<SubscriptionProviderModels.Invoice,SettlementReason> settlementReasons=new IdentityHashMap<>();
         final Set<String> explicitNoNextAttempt=new HashSet<>();
         int requests;
         TrialEvidence trialEvidence;
@@ -209,6 +240,7 @@ public final class StripeBillingSnapshotMapper {
         Read(StripeClient client,Ownership owner,Instant at,OwnedInitial original){this(client,owner,at,original,null);}
         Read(StripeClient client,Ownership owner,Instant at,OwnedInitial original,OwnedActionFailure actionFailure){this.client=Objects.requireNonNull(client);this.owner=Objects.requireNonNull(owner);this.at=Objects.requireNonNull(at);this.original=original;this.actionFailure=actionFailure;}
         void requireOwned(boolean valid,OwnedActionGuard boundary){if(actionFailure==null)require(valid);else actionFailure.require(valid,boundary);}
+        void requireSettlement(boolean valid,SettlementReason reason){if(actionFailure==null)require(valid);else actionFailure.require(valid,OwnedActionGuard.INVOICE_SETTLEMENT,reason);}
         boolean clockMatches(String clock){return Objects.equals(clock,original==null?null:original.receipt().intent().clock().reference());}
 
         <T> T get(Call<T> call) throws StripeException {require(++requests<=MAX_READS);return Objects.requireNonNull(call.run());}
@@ -285,7 +317,7 @@ public final class StripeBillingSnapshotMapper {
             if(original!=null){
                 require(normalized.size()==1);var initial=normalized.getFirst();
                 require(initial.kind()==BillingRecord.Kind.INITIAL&&initial.price().equals(original.receipt().intent().terms())&&initial.period().equals(period));
-                requireOwned(initial.settlement()==SettlementKind.OPEN||initial.settlement()==SettlementKind.CASH,OwnedActionGuard.INVOICE_SETTLEMENT);
+                requireSettlement(initial.settlement()==SettlementKind.OPEN||initial.settlement()==SettlementKind.CASH,settlementReasons.getOrDefault(initial,SettlementReason.SNAPSHOT_UNSUPPORTED));
             }
 
             Instant cancel=remote.getCancelAt()==null?null:Instant.ofEpochSecond(remote.getCancelAt());
@@ -363,10 +395,13 @@ public final class StripeBillingSnapshotMapper {
             sourceAllocations.put(invoice.getId(),allocations);
             for(var allocation:allocations){ref(allocation.getId(),"inpay_");require("invoice_payment".equals(allocation.getObject())&&Boolean.FALSE.equals(allocation.getLivemode())&&invoice.getId().equals(allocation.getInvoice()));currency(allocation.getCurrency(),mapped.terms());}
             SettlementKind settlement=SettlementKind.UNSUPPORTED;List<CashObject> cash=List.of();
-            boolean plain=!detail.getProration()&&kind!=BillingRecord.Kind.PRORATION&&"charge_automatically".equals(invoice.getCollectionMethod())
-                &&zeros(invoice.getAmountPaidOffStripe(),invoice.getAmountOverpaid(),invoice.getStartingBalance(),invoice.getEndingBalance(),invoice.getPrePaymentCreditNotesAmount(),invoice.getPostPaymentCreditNotesAmount())
-                &&empty(invoice.getDiscounts())&&empty(invoice.getTotalDiscountAmounts())&&empty(invoice.getTotalPretaxCreditAmounts())&&empty(line.getDiscountAmounts())&&empty(line.getPretaxCreditAmounts())
-                &&Objects.equals(invoice.getTotal(),invoice.getAmountDue())&&Objects.equals(invoice.getSubtotal(),invoice.getAmountDue())&&Objects.equals(line.getAmount(),invoice.getAmountDue());
+            var trace=new SettlementTrace(actionFailure!=null);
+            SettlementReason unsupportedReason=SettlementReason.SNAPSHOT_UNSUPPORTED;
+            boolean plain=trace.check(!detail.getProration(),SettlementReason.PRORATION_FLAG)&&trace.check(kind!=BillingRecord.Kind.PRORATION,SettlementReason.PRORATION_KIND)&&trace.check("charge_automatically".equals(invoice.getCollectionMethod()),SettlementReason.COLLECTION_METHOD)
+                &&trace.plainZeros(invoice.getAmountPaidOffStripe(),invoice.getAmountOverpaid(),invoice.getStartingBalance(),invoice.getEndingBalance(),invoice.getPrePaymentCreditNotesAmount(),invoice.getPostPaymentCreditNotesAmount())
+                &&trace.check(empty(invoice.getDiscounts()),SettlementReason.INVOICE_DISCOUNTS)&&trace.check(empty(invoice.getTotalDiscountAmounts()),SettlementReason.INVOICE_DISCOUNT_AMOUNTS)&&trace.check(empty(invoice.getTotalPretaxCreditAmounts()),SettlementReason.INVOICE_PRETAX_CREDITS)&&trace.check(empty(line.getDiscountAmounts()),SettlementReason.LINE_DISCOUNT_AMOUNTS)&&trace.check(empty(line.getPretaxCreditAmounts()),SettlementReason.LINE_PRETAX_CREDITS)
+                &&trace.check(Objects.equals(invoice.getTotal(),invoice.getAmountDue()),SettlementReason.TOTAL)&&trace.check(Objects.equals(invoice.getSubtotal(),invoice.getAmountDue()),SettlementReason.SUBTOTAL)&&trace.check(Objects.equals(line.getAmount(),invoice.getAmountDue()),SettlementReason.LINE_AMOUNT);
+            if(trace.first!=null)unsupportedReason=trace.first;
             switch(invoice.getStatus()){
                 case "paid"->{
                     if(plain&&invoice.getAmountDue()==0&&zeros(invoice.getAmountPaid(),invoice.getAmountRemaining())&&allocations.isEmpty()
@@ -380,12 +415,18 @@ public final class StripeBillingSnapshotMapper {
                         var confirmed=capture(invoice,allocations.getFirst());if(confirmed!=null){require(cashIds.add(confirmed.reference()));cash=List.of(confirmed);settlement=SettlementKind.CASH;}
                     }
                 }
-                case "open","draft","uncollectible"->{if(plain&&invoice.getAmountDue()>0&&invoice.getAmountDue()==mapped.terms().regularAmount().minorUnits()&&zeros(invoice.getAmountPaid())&&Objects.equals(invoice.getAmountRemaining(),invoice.getAmountDue())&&allocations.stream().allMatch(p->("open".equals(p.getStatus())||"canceled".equals(p.getStatus()))&&p.getPayment()!=null&&"payment_intent".equals(p.getPayment().getType())&&p.getPayment().getPaymentIntent()!=null))settlement=SettlementKind.OPEN;}
+                case "open","draft","uncollectible"->{
+                    if(plain&&trace.check(invoice.getAmountDue()>0,SettlementReason.OPEN_DUE_POSITIVE)&&trace.check(invoice.getAmountDue()==mapped.terms().regularAmount().minorUnits(),SettlementReason.OPEN_DUE_CATALOG)&&trace.check(zeros(invoice.getAmountPaid()),SettlementReason.OPEN_PAID)&&trace.check(Objects.equals(invoice.getAmountRemaining(),invoice.getAmountDue()),SettlementReason.OPEN_REMAINING)
+                        &&allocations.stream().allMatch(p->trace.check("open".equals(p.getStatus())||"canceled".equals(p.getStatus()),SettlementReason.OPEN_ALLOCATION_STATUS)&&trace.check(p.getPayment()!=null,SettlementReason.OPEN_ALLOCATION_PAYMENT)&&trace.check("payment_intent".equals(p.getPayment().getType()),SettlementReason.OPEN_ALLOCATION_TYPE)&&trace.check(p.getPayment().getPaymentIntent()!=null,SettlementReason.OPEN_ALLOCATION_INTENT)))settlement=SettlementKind.OPEN;
+                    if(trace.first!=null)unsupportedReason=trace.first;
+                }
                 case "void"->{if(plain&&allocations.isEmpty())settlement=SettlementKind.VOID;}
                 default->throw mismatch();
             }
             if(!scheduleHistory.isEmpty())require(settlement==SettlementKind.CASH||item.getId().equals(detail.getSubscriptionItem())&&settlement==SettlementKind.OPEN);
-            return new SubscriptionProviderModels.Invoice(invoice.getId(),kind,mapped.terms(),null,period,invoice.getAmountDue(),mapped.terms().regularAmount().currency(),settlement,cash);
+            var result=new SubscriptionProviderModels.Invoice(invoice.getId(),kind,mapped.terms(),null,period,invoice.getAmountDue(),mapped.terms().regularAmount().currency(),settlement,cash);
+            if(actionFailure!=null&&settlement==SettlementKind.UNSUPPORTED)settlementReasons.put(result,unsupportedReason);
+            return result;
         }
         SubscriptionProviderModels.Invoice proration(com.stripe.model.Invoice invoice,List<InvoiceLineItem> lines,dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.Proration proof)throws StripeException {
             var q=proof.quote();var result=proof.result();var s=owner.subscription();

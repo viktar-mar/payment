@@ -30,6 +30,39 @@ public final class StripeBillingClockActionAdapter {
         this.receipt=Objects.requireNonNull(receipt);this.phases=Objects.requireNonNull(phases);this.roots=Objects.requireNonNull(roots);this.tokens=Objects.requireNonNull(tokens);
         this.credentials=Objects.requireNonNull(credentials);this.clients=Objects.requireNonNull(clients);this.verification=Objects.requireNonNull(verification);this.utc=Objects.requireNonNull(utc);
     }
+    private static String settlementStage(StripeBillingSnapshotMapper.SettlementReason reason){
+        if(reason==null)return "ACTION_GRAPH_INVOICE_SETTLEMENT";
+        return switch(reason){
+            case PRORATION_FLAG->"ACTION_GRAPH_INVOICE_SETTLEMENT_PRORATION_FLAG";
+            case PRORATION_KIND->"ACTION_GRAPH_INVOICE_SETTLEMENT_PRORATION_KIND";
+            case COLLECTION_METHOD->"ACTION_GRAPH_INVOICE_SETTLEMENT_COLLECTION_METHOD";
+            case PAID_OFF_STRIPE->"ACTION_GRAPH_INVOICE_SETTLEMENT_PAID_OFF_STRIPE";
+            case OVERPAID->"ACTION_GRAPH_INVOICE_SETTLEMENT_OVERPAID";
+            case STARTING_BALANCE->"ACTION_GRAPH_INVOICE_SETTLEMENT_STARTING_BALANCE";
+            case ENDING_BALANCE->"ACTION_GRAPH_INVOICE_SETTLEMENT_ENDING_BALANCE";
+            case PRE_CREDIT_NOTES->"ACTION_GRAPH_INVOICE_SETTLEMENT_PRE_CREDIT_NOTES";
+            case POST_CREDIT_NOTES->"ACTION_GRAPH_INVOICE_SETTLEMENT_POST_CREDIT_NOTES";
+            case INVOICE_DISCOUNTS->"ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_DISCOUNTS";
+            case INVOICE_DISCOUNT_AMOUNTS->"ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_DISCOUNT_AMOUNTS";
+            case INVOICE_PRETAX_CREDITS->"ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_PRETAX_CREDITS";
+            case LINE_DISCOUNT_AMOUNTS->"ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_DISCOUNT_AMOUNTS";
+            case LINE_PRETAX_CREDITS->"ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_PRETAX_CREDITS";
+            case TOTAL->"ACTION_GRAPH_INVOICE_SETTLEMENT_TOTAL";
+            case SUBTOTAL->"ACTION_GRAPH_INVOICE_SETTLEMENT_SUBTOTAL";
+            case LINE_AMOUNT->"ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_AMOUNT";
+            case OPEN_DUE_POSITIVE->"ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_DUE_POSITIVE";
+            case OPEN_DUE_CATALOG->"ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_DUE_CATALOG";
+            case OPEN_PAID->"ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_PAID";
+            case OPEN_REMAINING->"ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_REMAINING";
+            case OPEN_ALLOCATION_STATUS->"ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_STATUS";
+            case OPEN_ALLOCATION_PAYMENT->"ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_PAYMENT";
+            case OPEN_ALLOCATION_TYPE->"ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_TYPE";
+            case OPEN_ALLOCATION_INTENT->"ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_INTENT";
+            case SNAPSHOT_UNSUPPORTED->"ACTION_GRAPH_INVOICE_SETTLEMENT_SNAPSHOT_UNSUPPORTED";
+            case ACTION_OPEN_CASH->"ACTION_GRAPH_INVOICE_SETTLEMENT_ACTION_OPEN_CASH";
+            case ACTION_OPEN->"ACTION_GRAPH_INVOICE_SETTLEMENT_ACTION_OPEN";
+        };
+    }
     private record Snapshot(SubscriptionInteractionTransaction.State state,SubscriptionClientGrant root){}
     public String selectionFailureStage(){return selectionFailureStage.get();}
     public NextAction nextAction(Scope scope){
@@ -52,7 +85,7 @@ public final class StripeBillingClockActionAdapter {
             catch(com.stripe.exception.StripeException|RuntimeException unsafe){
                 if(graphFailure.guard()!=null)checkpoint=switch(graphFailure.guard()){
                     case LINE_ASSOCIATION->"ACTION_GRAPH_LINE_ASSOCIATION";
-                    case INVOICE_SETTLEMENT->"ACTION_GRAPH_INVOICE_SETTLEMENT";
+                    case INVOICE_SETTLEMENT->settlementStage(graphFailure.settlement());
                     case PAYMENT_ALLOCATION->"ACTION_GRAPH_PAYMENT_ALLOCATION";
                 };
                 throw StripeBillingOwnership.mismatch();

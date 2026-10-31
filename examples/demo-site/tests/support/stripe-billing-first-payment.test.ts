@@ -159,18 +159,19 @@ test('bridge accepts an evolving fixture whose initial snapshot has no acknowled
   assert.equal(f.calls.length,1);
 });
 
-for(const stage of ["ACTION_SCOPE","ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_GRAPH_LINE_ASSOCIATION","ACTION_GRAPH_INVOICE_SETTLEMENT","ACTION_GRAPH_PAYMENT_ALLOCATION","ACTION_RESERVATION","ACTION_RESULT","ACTION_BINDING"])test('reporter validates '+stage+' once after handoff',async()=>{
+for(const stage of ["ACTION_SCOPE","ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_GRAPH_LINE_ASSOCIATION","ACTION_GRAPH_INVOICE_SETTLEMENT","ACTION_GRAPH_INVOICE_SETTLEMENT_PRORATION_FLAG","ACTION_GRAPH_INVOICE_SETTLEMENT_PRORATION_KIND","ACTION_GRAPH_INVOICE_SETTLEMENT_COLLECTION_METHOD","ACTION_GRAPH_INVOICE_SETTLEMENT_PAID_OFF_STRIPE","ACTION_GRAPH_INVOICE_SETTLEMENT_OVERPAID","ACTION_GRAPH_INVOICE_SETTLEMENT_STARTING_BALANCE","ACTION_GRAPH_INVOICE_SETTLEMENT_ENDING_BALANCE","ACTION_GRAPH_INVOICE_SETTLEMENT_PRE_CREDIT_NOTES","ACTION_GRAPH_INVOICE_SETTLEMENT_POST_CREDIT_NOTES","ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_DISCOUNTS","ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_DISCOUNT_AMOUNTS","ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_PRETAX_CREDITS","ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_DISCOUNT_AMOUNTS","ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_PRETAX_CREDITS","ACTION_GRAPH_INVOICE_SETTLEMENT_TOTAL","ACTION_GRAPH_INVOICE_SETTLEMENT_SUBTOTAL","ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_AMOUNT","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_DUE_POSITIVE","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_DUE_CATALOG","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_PAID","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_REMAINING","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_STATUS","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_PAYMENT","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_TYPE","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_INTENT","ACTION_GRAPH_INVOICE_SETTLEMENT_SNAPSHOT_UNSUPPORTED","ACTION_GRAPH_INVOICE_SETTLEMENT_ACTION_OPEN_CASH","ACTION_GRAPH_INVOICE_SETTLEMENT_ACTION_OPEN","ACTION_GRAPH_PAYMENT_ALLOCATION","ACTION_RESERVATION","ACTION_RESULT","ACTION_BINDING"])test('reporter validates '+stage+' once after handoff',async()=>{
  const {default:Reporter}=await import(new URL('./stripe-billing-first-payment-reporter.ts',import.meta.url).href);
  const {formatBillingFirstPaymentDiagnostic,parseBillingFirstPaymentDiagnosticLine}=await import(new URL('../../../../infrastructure/stripe-billing-first-payment.mjs',import.meta.url).href);
  const line=formatBillingFirstPaymentDiagnostic({status:'CLOSED',initialAccepted:false,code:'RUNTIME',diagnostic:'PREPARE_SERVER_'+stage,cleanupConfirmed:true});
  assert.equal(line,'owned_initial_payment_diagnostic code=PREPARE_SERVER_'+stage+' cleanup=CONFIRMED');
- assert.equal(parseBillingFirstPaymentDiagnosticLine(line),line);
+ assert.equal(parseBillingFirstPaymentDiagnosticLine(line),line);assert.ok(line!.length<=160);
  const original=process.stdout.write,lines:string[]=[];process.stdout.write=((v:unknown)=>{lines.push(String(v));return true;}) as typeof process.stdout.write;
  try {
   const reporter=new Reporter(),handoff='Authorize the isolated Sandbox CLI at https://access.stripe.com/fixture using code ABCD EFGH. Keep this terminal open.';
   reporter.onStdOut(handoff+'\n');reporter.onStdOut(handoff+'\n');
   reporter.onStdOut('owned_initial_payment_diagnostic code=PREPARE_SERVER_ACTION_FOREIGN cleanup=CONFIRMED\n');
   reporter.onStdOut(line.replace(stage,stage+'_FOREIGN')+'\n');
+  reporter.onStdOut(line!.replace(stage,stage+'_sk_test_SECRET')+'\n');
   reporter.onStdOut(line+' private-sentinel\n');reporter.onStdOut(line.slice(0,31));reporter.onStdOut(line.slice(31)+'\n');reporter.onStdOut(line+'\n');
   reporter.onStdErr();
   assert.deepEqual(lines,[handoff+'\n',line+'\n']);

@@ -176,7 +176,7 @@ class StripeBillingOwnedConfirmationSdkTest {
                 case "nullEndingBalance"->h.f.invoice.add("ending_balance",com.google.gson.JsonNull.INSTANCE);case "missingEndingBalance"->h.f.invoice.remove("ending_balance");case "nonzeroEndingBalance"->h.f.invoice.addProperty("ending_balance",1);
                 case "foreignLineAmount"->h.f.line.addProperty("amount",999);case "offStripePaid"->h.f.invoice.addProperty("amount_paid_off_stripe",1);case "paymentType"->h.f.allocation.getAsJsonObject("payment").addProperty("type","payment_record");
             }
-            queueActionGraph(h);assertActionGraphRefusal(h,"ACTION_GRAPH_INVOICE_SETTLEMENT",6);
+            queueActionGraph(h);assertActionGraphRefusal(h,"ACTION_GRAPH_INVOICE_SETTLEMENT_"+switch(variant){case "nullEndingBalance","missingEndingBalance","nonzeroEndingBalance"->"ENDING_BALANCE";case "foreignLineAmount"->"LINE_AMOUNT";case "offStripePaid"->"PAID_OFF_STRIPE";default->"OPEN_ALLOCATION_TYPE";},6);
         }
     }
     @ParameterizedTest @ValueSource(strings={"nullPaid","missingPaid","positivePaid","negativePaid","notDefault","nullDefault","wrongRequested","canceled"})
@@ -221,9 +221,9 @@ class StripeBillingOwnedConfirmationSdkTest {
         assertThat(h.f.f.http.calls).allMatch(c->c.method().name().equals("GET"));
     }
     @Test void concurrentDetailedAndGenericFailuresKeepCallLocalGuardProvenance()throws Exception{
-        var detailed=new Harness();var generic=new Harness();prepareOpen(detailed.f);detailed.f.line.addProperty("subscription","sub_foreign");queueActionGraph(detailed);generic.graph();
+        var detailed=new Harness();var generic=new Harness();prepareOpen(detailed.f);detailed.f.invoice.addProperty("ending_balance",1);queueActionGraph(detailed);generic.graph();
         var detailedEntered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
-        after(detailed,5,()->{detailedEntered.countDown();awaitRelease(release);});after(generic,2,()->{throw new UnreadableFailure();});
+        after(detailed,6,()->{detailedEntered.countDown();awaitRelease(release);});after(generic,2,()->{throw new UnreadableFailure();});
         var detailedAdapter=detailed.action();var genericAdapter=generic.action();
         try(var executor=java.util.concurrent.Executors.newFixedThreadPool(2)){
             var pending=executor.submit(()->catchThrowable(()->detailedAdapter.nextAction(detailed.scope)));
@@ -232,23 +232,168 @@ class StripeBillingOwnedConfirmationSdkTest {
             finally{release.countDown();}
             assertThat(pending.get(5,java.util.concurrent.TimeUnit.SECONDS)).isInstanceOf(RuntimeException.class);
         }
-        assertThat(selectionFailureStage(detailedAdapter)).isEqualTo("ACTION_GRAPH_LINE_ASSOCIATION");assertThat(selectionFailureStage(genericAdapter)).isEqualTo("ACTION_GRAPH");
+        assertThat(selectionFailureStage(detailedAdapter)).isEqualTo("ACTION_GRAPH_INVOICE_SETTLEMENT_ENDING_BALANCE");assertThat(selectionFailureStage(genericAdapter)).isEqualTo("ACTION_GRAPH");
         assertThat(detailed.root).isNull();assertThat(generic.root).isNull();assertThat(detailed.inserts+generic.inserts).isZero();
         assertThat(detailed.f.f.http.calls).allMatch(c->c.method().name().equals("GET"));assertThat(generic.f.f.http.calls).allMatch(c->c.method().name().equals("GET"));
     }
     @Test void reentrantFailureCannotLendItsTrustedGuardToTheCallingAction(){
         var outer=new Harness();var inner=new Harness();var outerAdapter=outer.action();var innerAdapter=inner.action();
-        outer.graph();prepareOpen(inner.f);inner.f.allocation.remove("amount_paid");queueActionGraph(inner);
+        outer.graph();prepareOpen(inner.f);inner.f.invoice.addProperty("ending_balance",1);queueActionGraph(inner);
         after(outer,2,()->{
             assertThat(catchThrowable(()->innerAdapter.nextAction(inner.scope))).isInstanceOf(RuntimeException.class);
             throw new UnreadableFailure();
         });
         assertThat(catchThrowable(()->outerAdapter.nextAction(outer.scope))).isInstanceOf(RuntimeException.class);
-        assertThat(selectionFailureStage(innerAdapter)).isEqualTo("ACTION_GRAPH_PAYMENT_ALLOCATION");
+        assertThat(selectionFailureStage(innerAdapter)).isEqualTo("ACTION_GRAPH_INVOICE_SETTLEMENT_ENDING_BALANCE");
         assertThat(selectionFailureStage(outerAdapter)).isEqualTo("ACTION_GRAPH");
         assertThat(outer.root).isNull();assertThat(inner.root).isNull();assertThat(outer.inserts+inner.inserts).isZero();
         assertThat(outer.f.f.http.calls).hasSize(2).allMatch(c->c.method().name().equals("GET"));
         assertThat(inner.f.f.http.calls).hasSize(6).allMatch(c->c.method().name().equals("GET"));
+    }
+
+    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"invoice,amount_paid_off_stripe,missing,PAID_OFF_STRIPE",
+        "invoice,amount_paid_off_stripe,null,PAID_OFF_STRIPE",
+        "invoice,amount_paid_off_stripe,positive,PAID_OFF_STRIPE",
+        "invoice,amount_paid_off_stripe,negative,PAID_OFF_STRIPE",
+        "invoice,amount_overpaid,missing,OVERPAID",
+        "invoice,amount_overpaid,null,OVERPAID",
+        "invoice,amount_overpaid,positive,OVERPAID",
+        "invoice,amount_overpaid,negative,OVERPAID",
+        "invoice,starting_balance,missing,STARTING_BALANCE",
+        "invoice,starting_balance,null,STARTING_BALANCE",
+        "invoice,starting_balance,positive,STARTING_BALANCE",
+        "invoice,starting_balance,negative,STARTING_BALANCE",
+        "invoice,ending_balance,missing,ENDING_BALANCE",
+        "invoice,ending_balance,null,ENDING_BALANCE",
+        "invoice,ending_balance,positive,ENDING_BALANCE",
+        "invoice,ending_balance,negative,ENDING_BALANCE",
+        "invoice,pre_payment_credit_notes_amount,missing,PRE_CREDIT_NOTES",
+        "invoice,pre_payment_credit_notes_amount,null,PRE_CREDIT_NOTES",
+        "invoice,pre_payment_credit_notes_amount,positive,PRE_CREDIT_NOTES",
+        "invoice,pre_payment_credit_notes_amount,negative,PRE_CREDIT_NOTES",
+        "invoice,post_payment_credit_notes_amount,missing,POST_CREDIT_NOTES",
+        "invoice,post_payment_credit_notes_amount,null,POST_CREDIT_NOTES",
+        "invoice,post_payment_credit_notes_amount,positive,POST_CREDIT_NOTES",
+        "invoice,post_payment_credit_notes_amount,negative,POST_CREDIT_NOTES",
+        "invoice,discounts,missing,INVOICE_DISCOUNTS",
+        "invoice,discounts,null,INVOICE_DISCOUNTS",
+        "invoice,discounts,list,INVOICE_DISCOUNTS",
+        "invoice,total_discount_amounts,missing,INVOICE_DISCOUNT_AMOUNTS",
+        "invoice,total_discount_amounts,null,INVOICE_DISCOUNT_AMOUNTS",
+        "invoice,total_discount_amounts,list,INVOICE_DISCOUNT_AMOUNTS",
+        "invoice,total_pretax_credit_amounts,missing,INVOICE_PRETAX_CREDITS",
+        "invoice,total_pretax_credit_amounts,null,INVOICE_PRETAX_CREDITS",
+        "invoice,total_pretax_credit_amounts,list,INVOICE_PRETAX_CREDITS",
+        "line,discount_amounts,missing,LINE_DISCOUNT_AMOUNTS",
+        "line,discount_amounts,null,LINE_DISCOUNT_AMOUNTS",
+        "line,discount_amounts,list,LINE_DISCOUNT_AMOUNTS",
+        "line,pretax_credit_amounts,missing,LINE_PRETAX_CREDITS",
+        "line,pretax_credit_amounts,null,LINE_PRETAX_CREDITS",
+        "line,pretax_credit_amounts,list,LINE_PRETAX_CREDITS",
+        "invoice,total,positive,TOTAL",
+        "invoice,total,negative,TOTAL",
+        "invoice,total,null,TOTAL",
+        "invoice,total,missing,TOTAL",
+        "invoice,subtotal,positive,SUBTOTAL",
+        "invoice,subtotal,negative,SUBTOTAL",
+        "invoice,subtotal,null,SUBTOTAL",
+        "invoice,subtotal,missing,SUBTOTAL",
+        "line,amount,positive,LINE_AMOUNT",
+        "line,amount,negative,LINE_AMOUNT",
+        "invoice,amount_paid,positive,OPEN_PAID",
+        "invoice,amount_paid,negative,OPEN_PAID",
+        "invoice,amount_paid,null,OPEN_PAID",
+        "invoice,amount_paid,missing,OPEN_PAID",
+        "invoice,amount_remaining,positive,OPEN_REMAINING",
+        "invoice,amount_remaining,negative,OPEN_REMAINING",
+        "invoice,amount_remaining,null,OPEN_REMAINING",
+        "invoice,amount_remaining,missing,OPEN_REMAINING",
+        "invoice,collection_method,missing,COLLECTION_METHOD",
+        "invoice,collection_method,null,COLLECTION_METHOD",
+        "allocation,status,missing,OPEN_ALLOCATION_STATUS",
+        "allocation,status,null,OPEN_ALLOCATION_STATUS",
+        "allocation,payment,missing,OPEN_ALLOCATION_PAYMENT",
+        "allocation,payment,null,OPEN_ALLOCATION_PAYMENT",
+        "payment,type,missing,OPEN_ALLOCATION_TYPE",
+        "payment,type,null,OPEN_ALLOCATION_TYPE",
+        "payment,payment_intent,missing,OPEN_ALLOCATION_INTENT",
+        "payment,payment_intent,null,OPEN_ALLOCATION_INTENT",
+        "detail,proration,true,PRORATION_FLAG",
+        "invoice,billing_reason,update,PRORATION_KIND",
+        "invoice,collection_method,manual,COLLECTION_METHOD",
+        "invoice,amount_due,zero,OPEN_DUE_POSITIVE",
+        "invoice,amount_due,catalog,OPEN_DUE_CATALOG",
+        "allocation,status,paid,OPEN_ALLOCATION_STATUS",
+        "allocation,payment,null,OPEN_ALLOCATION_PAYMENT",
+        "payment,type,record,OPEN_ALLOCATION_TYPE",
+        "payment,payment_intent,null,OPEN_ALLOCATION_INTENT"})
+    void settlementPredicateRefusalKeepsExactOrderAndNoRoot(String target,String field,String variant,String reason){
+        var h=new Harness();prepareOpen(h.f);
+        var value=switch(target){case "invoice"->h.f.invoice;case "line"->h.f.line;case "detail"->h.f.line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details");case "allocation"->h.f.allocation;case "payment"->h.f.allocation.getAsJsonObject("payment");default->throw new AssertionError();};
+        switch(variant){
+            case "missing"->value.remove(field);case "null"->value.add(field,com.google.gson.JsonNull.INSTANCE);
+            case "positive"->value.addProperty(field,1);case "negative"->value.addProperty(field,-1);case "zero"->value.addProperty(field,0);case "catalog"->value.addProperty(field,999);
+            case "list"->value.add(field,com.google.gson.JsonParser.parseString(field.equals("discounts")?"[\"di_INERT\"]":"[{}]"));
+            case "true"->value.addProperty(field,true);case "update"->value.addProperty(field,"subscription_update");case "manual"->value.addProperty(field,"send_invoice");case "paid"->value.addProperty(field,"paid");case "record"->value.addProperty(field,"payment_record");default->throw new AssertionError();
+        }
+        // These earlier equalities must pass before the OPEN due predicate is reached.
+        if(field.equals("amount_due")){h.f.invoice.add(field,value.get(field));h.f.invoice.add("total",value.get(field));h.f.invoice.add("subtotal",value.get(field));h.f.line.add("amount",value.get(field));}
+        queueActionGraph(h);assertActionGraphRefusal(h,field.equals("billing_reason")?"ACTION_GRAPH":"ACTION_GRAPH_INVOICE_SETTLEMENT_"+reason,6);
+        assertThat(h.f.f.http.calls.stream().map(c->c.url().getPath()).toList()).containsExactly("/v1/test_helpers/test_clocks/clock_owned","/v1/customers/cus_owned","/v1/subscriptions/sub_owned","/v1/invoices","/v1/invoices/in_owned/lines","/v1/invoice_payments");
+    }
+    @Test void settlementFirstPredicateWinsWithoutLeakingIntoLaterFailure(){
+        var h=new Harness();prepareOpen(h.f);h.f.invoice.addProperty("ending_balance",1);h.f.invoice.addProperty("total",999);queueActionGraph(h);
+        var adapter=h.action();assertThat(catchThrowable(()->adapter.nextAction(h.scope))).isInstanceOf(RuntimeException.class);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH_INVOICE_SETTLEMENT_ENDING_BALANCE");
+        h.f.f.http.replies.clear();h.f.invoice.addProperty("ending_balance",0);h.f.invoice.addProperty("total",1000);h.graph();after(h,2,()->{throw new UnreadableFailure();});
+        assertThat(catchThrowable(()->adapter.nextAction(h.scope))).isInstanceOf(RuntimeException.class);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH_INVOICE_SETTLEMENT_ENDING_BALANCE");
+        h.f.f.http.replies.clear();h.graph();assertThat(adapter.nextAction(h.scope)).isNotNull();h.reserve(false);int reads=h.f.f.http.calls.size();assertThat(adapter.nextAction(h.scope)).isNull();assertThat(h.f.f.http.calls).hasSize(reads);
+        assertThat(selectionFailureStage(adapter)).isEqualTo("ACTION_GRAPH_INVOICE_SETTLEMENT_ENDING_BALANCE");
+    }
+
+    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"cash,ACTION_OPEN_CASH,9","paidPlain,ENDING_BALANCE,6","paidEligibility,SNAPSHOT_UNSUPPORTED,6","captureNull,SNAPSHOT_UNSUPPORTED,6","captureException,GENERIC,7","unknown,GENERIC,6","nullStatus,GENERIC,6","void,SNAPSHOT_UNSUPPORTED,6","empty,GENERIC,6","draft,GENERIC,6","uncollectible,GENERIC,6","lateOwnership,GENERIC,6"})
+    void settlementAlternativesCommitOnlyAtRejectingBoundary(String variant,String reason,int reads){
+        var h=new Harness();prepareOpen(h.f);
+        if(List.of("cash","paidPlain","paidEligibility","captureNull","captureException").contains(variant)){
+            h.f.invoice.addProperty("status","paid");h.f.invoice.addProperty("amount_paid",1000);h.f.invoice.addProperty("amount_remaining",0);
+            h.f.allocation.addProperty("status","paid");h.f.allocation.addProperty("amount_paid",1000);h.f.allocation.add("status_transitions",StripeBillingOwnedSubscriptionFixture.json("{\"paid_at\":1700000011}"));h.f.pi.addProperty("status","succeeded");h.f.pi.addProperty("amount_received",1000);h.f.pi.addProperty("latest_charge","ch_owned");
+        }
+        switch(variant){
+            case "paidPlain"->h.f.invoice.addProperty("ending_balance",1);case "paidEligibility"->h.f.invoice.addProperty("amount_remaining",1);case "captureNull"->h.f.allocation.addProperty("amount_paid",999);
+            case "captureException"->h.f.pi.addProperty("customer","cus_foreign");case "unknown"->h.f.invoice.addProperty("status","future");case "nullStatus"->h.f.invoice.add("status",com.google.gson.JsonNull.INSTANCE);case "void"->h.f.invoice.addProperty("status","void");
+            case "draft","uncollectible"->h.f.invoice.addProperty("status",variant);case "lateOwnership"->{h.f.line.getAsJsonObject("period").addProperty("end",1702678401);h.f.invoice.addProperty("ending_balance",1);}default->{}
+        }
+        h.f.f.http.reply(h.f.f.clockJson());h.f.f.http.reply(h.f.customer.toString());h.f.f.http.reply(h.f.remote.toString());h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.invoice));h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.line));h.f.f.http.reply(variant.equals("empty")||variant.equals("void")?StripeBillingOwnedSubscriptionFixture.page():StripeBillingOwnedSubscriptionFixture.page(h.f.allocation));
+        h.f.f.http.reply(h.f.pi.toString());h.f.f.http.reply(h.f.charge.toString());h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.allocation));
+        assertActionGraphRefusal(h,reason.equals("GENERIC")?"ACTION_GRAPH":reason.equals("ALLOCATION")?"ACTION_GRAPH_PAYMENT_ALLOCATION":"ACTION_GRAPH_INVOICE_SETTLEMENT_"+reason,reads);
+    }
+    @Test void earlierNullAndNegativeAmountAndLineGuardsStayGeneric(){
+        for(String field:List.of("amount_due","amount"))for(String variant:List.of("missing","null","negative")){
+            if(field.equals("amount")&&variant.equals("negative"))continue;
+            var h=new Harness();prepareOpen(h.f);var value=field.equals("amount")?h.f.line:h.f.invoice;
+            switch(variant){case "missing"->value.remove(field);case "null"->value.add(field,com.google.gson.JsonNull.INSTANCE);case "negative"->value.addProperty(field,-1);}
+            queueActionGraph(h);assertActionGraphRefusal(h,"ACTION_GRAPH",5);
+        }
+    }
+
+    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"balance-list,PAID_OFF_STRIPE","list-total,INVOICE_DISCOUNTS","total-subtotal,TOTAL","paid-remaining,OPEN_PAID","allocation-status-payment,OPEN_ALLOCATION_STATUS","allocation-payment-type,OPEN_ALLOCATION_PAYMENT"})
+    void firstSettlementFailureRetainsExpressionPrecedence(String variant,String reason){
+        var h=new Harness();prepareOpen(h.f);
+        switch(variant){
+            case "balance-list"->{h.f.invoice.addProperty("amount_paid_off_stripe",1);h.f.invoice.remove("discounts");}
+            case "list-total"->{h.f.invoice.remove("discounts");h.f.invoice.addProperty("total",999);}
+            case "total-subtotal"->{h.f.invoice.addProperty("total",999);h.f.invoice.addProperty("subtotal",999);}
+            case "paid-remaining"->{h.f.invoice.addProperty("amount_paid",1);h.f.invoice.addProperty("amount_remaining",999);}
+            case "allocation-status-payment"->{h.f.allocation.addProperty("status","paid");h.f.allocation.remove("payment");}
+            case "allocation-payment-type"->h.f.allocation.remove("payment");
+        }
+        queueActionGraph(h);assertActionGraphRefusal(h,"ACTION_GRAPH_INVOICE_SETTLEMENT_"+reason,6);
+    }
+    @Test void allocationEncounterOrderRetainsFirstActualFailure(){
+        var h=new Harness();prepareOpen(h.f);var second=h.f.allocation.deepCopy();second.addProperty("id","inpay_second");second.remove("payment");h.f.allocation.getAsJsonObject("payment").addProperty("type","payment_record");
+        h.f.f.http.reply(h.f.f.clockJson());h.f.f.http.reply(h.f.customer.toString());h.f.f.http.reply(h.f.remote.toString());h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.invoice));h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.line));h.f.f.http.reply(StripeBillingOwnedSubscriptionFixture.page(h.f.allocation,second));
+        assertActionGraphRefusal(h,"ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_TYPE",6);
     }
     static void queueActionGraph(Harness h){h.f.f.http.reply(h.f.f.clockJson());queueGraph(h.f);h.f.f.http.reply(h.f.f.clockJson());}
     static void assertActionGraphRefusal(Harness h,String expected,int reads){

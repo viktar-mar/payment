@@ -98,5 +98,12 @@ class StripeBillingClockSnapshotTest {
         assertThatThrownBy(()->StripeBillingSnapshotMapper.retrieveOwned(f.f.clients.create(null),foreign,new StripeBillingSnapshotMapper.OwnedInitial(f.receipt()),f.utc)).isInstanceOf(PaymentApplicationException.class);
         assertThat(f.f.http.calls).isEmpty();
     }
+    @Test void ordinaryCashKeepsFullCapturedProof(){
+        var f=new StripeBillingOwnedSubscriptionFixture();for(var resource:java.util.List.of(f.customer,f.remote,f.invoice))resource.remove("test_clock");
+        f.paidGraph();var s=StripeBillingSnapshotMapper.retrieve(f.f.clients.create(null),f.ordinary(),f.utc);
+        assertThat(s.invoices().getFirst().settlement()).isEqualTo(dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind.CASH);
+        assertThat(s.invoices().getFirst().cashObjects().getFirst().reference()).isEqualTo("pi_owned");assertThat(s.invoices().getFirst().cashObjects().getFirst().amountMinor()).isEqualTo(1000);
+        assertThat(f.f.http.calls).hasSize(8).allMatch(c->c.method().name().equals("GET"));
+    }
     static dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Snapshot owned(StripeBillingOwnedSubscriptionFixture f){return StripeBillingSnapshotMapper.retrieveOwned(f.f.clients.create(null),f.ordinary(),new StripeBillingSnapshotMapper.OwnedInitial(f.receipt()),f.utc);}
 }

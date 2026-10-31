@@ -1549,7 +1549,7 @@ only, with no native acceptance claim.
 
 Action selection retains the fixed adapter boundaries `ACTION_AUTHORITY`,
 `ACTION_VERIFICATION`, `ACTION_GRAPH`, and `ACTION_RESERVATION`. A failed
-owned action graph can refine `ACTION_GRAPH` to one of three closed labels:
+owned action graph can refine `ACTION_GRAPH` using closed labels:
 
 - `ACTION_GRAPH_LINE_ASSOCIATION`: the existing invoice-line association guard
   failed, including a supplied conflicting flat subscription, the mandatory nested
@@ -1557,18 +1557,45 @@ owned action graph can refine `ACTION_GRAPH` to one of three closed labels:
   receipt permits an omitted/JSON-null duplicate flat subscription only while the
   complete nested and original-receipt proof still matches. Ordinary null-clock
   reads continue requiring the exact flat subscription.
-- `ACTION_GRAPH_INVOICE_SETTLEMENT`: the existing normalized invoice
-  OPEN-or-CASH settlement guard or the later action-only OPEN requirement failed.
+- `ACTION_GRAPH_INVOICE_SETTLEMENT` remains the coarse compatibility label for
+  the normalized invoice OPEN-or-CASH guard or later action-only OPEN requirement.
+  New failures can use the exact `ACTION_GRAPH_INVOICE_SETTLEMENT_<reason>`
+  stages below; only these fixed suffixes are accepted:
+  `PRORATION_FLAG`, `PRORATION_KIND`, `COLLECTION_METHOD`,
+  `PAID_OFF_STRIPE`, `OVERPAID`, `STARTING_BALANCE`, `ENDING_BALANCE`,
+  `PRE_CREDIT_NOTES`, `POST_CREDIT_NOTES`, `INVOICE_DISCOUNTS`,
+  `INVOICE_DISCOUNT_AMOUNTS`, `INVOICE_PRETAX_CREDITS`,
+  `LINE_DISCOUNT_AMOUNTS`, `LINE_PRETAX_CREDITS`, `TOTAL`, `SUBTOTAL`,
+  `LINE_AMOUNT`, `OPEN_DUE_POSITIVE`, `OPEN_DUE_CATALOG`, `OPEN_PAID`,
+  `OPEN_REMAINING`, `OPEN_ALLOCATION_STATUS`, `OPEN_ALLOCATION_PAYMENT`,
+  `OPEN_ALLOCATION_TYPE`, `OPEN_ALLOCATION_INTENT`, `SNAPSHOT_UNSUPPORTED`,
+  `ACTION_OPEN_CASH`, and `ACTION_OPEN`.
+  A common/plain or OPEN suffix identifies the first failed existing predicate
+  only when the existing settlement boundary actually rejects. Missing, null and
+  nonzero/nonempty field variants share one category; no presence or value is
+  reported. Paid CASH eligibility and a returned-null capture proof retain the
+  coarse `SNAPSHOT_UNSUPPORTED` fallback. A successfully normalized CASH reaching
+  the later action OPEN requirement uses `ACTION_OPEN_CASH`. Capture exceptions
+  and unknown/null statuses remain generic graph failures. Earlier INITIAL,
+  price/period and allocation-cardinality guards keep their existing precedence;
+  in particular, a PRORATION invoice still fails INITIAL generically.
 - `ACTION_GRAPH_PAYMENT_ALLOCATION`: the existing open, default, requested
   amount, explicit zero-paid and payment-type allocation guard failed before the
   PaymentIntent read.
 
-These labels identify the actual failed compound guard, not a particular field
-or value. Other graph failures retain generic `ACTION_GRAPH`. Provenance is
-closed and local to one action call; exception messages, properties, causes,
-stacks and response bodies cannot supply it. Ordinary mapping and observation
-retain the same diagnostic transport; every financial and authoritative nested
-ownership check remains strict.
+These labels identify the predicate at the existing rejecting boundary, without
+native values or a historical cause. Other graph failures retain generic
+`ACTION_GRAPH`. Tentative reasons belong to one invoice and action call and
+cannot annotate a success or unrelated failure. Exception messages, properties,
+causes, stacks and response bodies cannot supply provenance. Ordinary mapping
+and observation behavior, provider read order, and every financial and
+nested ownership check remain strict.
+
+This is a diagnostic-only source correction. Offline artificial fixtures do not
+identify the predicate in the prior native failure or establish successful native
+payment semantics. Initial-payment and full5B remain `NOT_ACCEPTED`; the
+original CREATE/DISPATCHING remains consumed and non-retryable. This patch
+provides no authority to replay, reset, adopt or reconcile it.
 
 The private prepare scenario also distinguishes `ACTION_SCOPE` before scope
 resolution, `ACTION_RESULT` after the adapter returns (including a denied null
