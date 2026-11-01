@@ -15,6 +15,62 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Pure/inert mapper consumer: no parent, extension, application, database, sockets or mock framework. */
 class StripeBillingFirstRenewalMappingTest {
+    // Catches silently projecting provider tax as the original local NONE terms with unchanged gross cash.
+    @ParameterizedTest @ValueSource(strings={"inclusive-tax","invoice-tax","line-tax","invoice-automatic","invoice-default",
+        "subscription-automatic","subscription-default","item-tax","total-excluding","subtotal-excluding","missing-tax-total","null-tax-total"})
+    void unchangedGrossDoesNotPermitRenewalTaxDrift(String drift){
+        for(boolean paid:new boolean[]{true,false}){
+            var control=paidLocal();var controlAdmission=admission(control);queueGraph(control,paid);
+            assertThat(mapFinal(control,controlAdmission)).as("Otherwise-valid %s graph",paid?"cash":"pending")
+                .isInstanceOf(paid?MappedPaid.class:MappedPending.class);
+            var f=paidLocal();var admission=admission(f);queueGraph(f,paid);
+            if(drift.equals("inclusive-tax")||drift.equals("line-tax"))replaceReply(f,8,body->{
+                var json=StripeBillingOwnedSubscriptionFixture.json(body);
+                json.getAsJsonArray("data").get(0).getAsJsonObject().add("taxes",com.google.gson.JsonParser.parseString("[{\"amount\":5,\"tax_behavior\":\"inclusive\",\"taxable_amount\":995,\"type\":\"tax_rate_details\",\"tax_rate_details\":{\"tax_rate\":\"txr_renewal\"}}]"));
+                return json.toString();});
+            if(drift.startsWith("subscription-")||drift.equals("item-tax"))replaceReply(f,1,body->{
+                var json=StripeBillingOwnedSubscriptionFixture.json(body);
+                if(drift.equals("subscription-automatic"))json.add("automatic_tax",com.google.gson.JsonParser.parseString("{\"enabled\":true}"));
+                else if(drift.equals("subscription-default"))json.add("default_tax_rates",com.google.gson.JsonParser.parseString("[{\"id\":\"txr_renewal\",\"object\":\"tax_rate\",\"inclusive\":true,\"percentage\":0.5}]"));
+                else json.getAsJsonObject("items").getAsJsonArray("data").get(0).getAsJsonObject().add("tax_rates",com.google.gson.JsonParser.parseString("[{\"id\":\"txr_renewal\",\"object\":\"tax_rate\",\"inclusive\":true,\"percentage\":0.5}]"));
+                return json.toString();});
+            else if(!drift.equals("line-tax"))replaceReply(f,2,body->{
+                var json=StripeBillingOwnedSubscriptionFixture.json(body);var invoice=json.getAsJsonArray("data").get(1).getAsJsonObject();
+                switch(drift){
+                    case "inclusive-tax"->{invoice.add("total_taxes",com.google.gson.JsonParser.parseString("[{\"amount\":5,\"tax_behavior\":\"inclusive\",\"taxable_amount\":995,\"type\":\"tax_rate_details\",\"tax_rate_details\":{\"tax_rate\":\"txr_renewal\"}}]"));invoice.addProperty("total_excluding_tax",995);invoice.addProperty("subtotal_excluding_tax",995);}
+                    case "invoice-tax"->invoice.add("total_taxes",com.google.gson.JsonParser.parseString("[{\"amount\":5}]"));
+                    case "invoice-automatic"->invoice.add("automatic_tax",com.google.gson.JsonParser.parseString("{\"enabled\":true}"));
+                    case "invoice-default"->invoice.add("default_tax_rates",com.google.gson.JsonParser.parseString("[{\"id\":\"txr_renewal\",\"object\":\"tax_rate\",\"inclusive\":true,\"percentage\":0.5}]"));
+                    case "total-excluding"->invoice.addProperty("total_excluding_tax",995);
+                    case "subtotal-excluding"->invoice.addProperty("subtotal_excluding_tax",995);
+                    case "missing-tax-total"->invoice.remove("total_taxes");
+                    case "null-tax-total"->invoice.add("total_taxes",com.google.gson.JsonNull.INSTANCE);
+                    default->throw new AssertionError(drift);
+                }return json.toString();});
+            assertThatThrownBy(()->mapFinal(f,admission)).as("Refuse %s on %s with gross still EUR1000 minor",drift,paid?"cash":"pending")
+                .isInstanceOf(RuntimeException.class);
+        }
+    }
+    @Test void disabledTaxSettingsAndEqualExcludingTotalsRemainSupported(){
+        for(boolean paid:new boolean[]{true,false}){
+            var f=paidLocal();var admission=admission(f);queueGraph(f,paid);
+            replaceReply(f,1,body->{var json=StripeBillingOwnedSubscriptionFixture.json(body);
+                json.add("automatic_tax",com.google.gson.JsonParser.parseString("{\"enabled\":false}"));json.add("default_tax_rates",new com.google.gson.JsonArray());
+                json.getAsJsonObject("items").getAsJsonArray("data").get(0).getAsJsonObject().add("tax_rates",new com.google.gson.JsonArray());return json.toString();});
+            replaceReply(f,2,body->{var json=StripeBillingOwnedSubscriptionFixture.json(body);var invoice=json.getAsJsonArray("data").get(1).getAsJsonObject();
+                invoice.add("automatic_tax",com.google.gson.JsonParser.parseString("{\"enabled\":false}"));invoice.add("default_tax_rates",new com.google.gson.JsonArray());
+                invoice.addProperty("total_excluding_tax",1000);invoice.addProperty("subtotal_excluding_tax",1000);return json.toString();});
+            replaceReply(f,8,body->{var json=StripeBillingOwnedSubscriptionFixture.json(body);json.getAsJsonArray("data").get(0).getAsJsonObject().add("taxes",new com.google.gson.JsonArray());return json.toString();});
+            assertThat(mapFinal(f,admission)).isInstanceOf(paid?MappedPaid.class:MappedPending.class);
+        }
+    }
+    private static MappedObservation mapFinal(StripeBillingOwnedSubscriptionFixture f,Admission admission){
+        var first=boundaryReady(admission,f.utc.plusSeconds(4));
+        var boundary=new Boundary(id(24),admission.id(),first,"si_owned","in_renewal",
+            new Subscription.Period(Instant.ofEpochSecond(1702678400),Instant.ofEpochSecond(1705356800)),"b".repeat(64),f.utc.plusSeconds(5));
+        return StripeBillingSnapshotMapper.retrieveOwnedFirstRenewal(f.f.clients.create(f.f.credentials.resolve(f.f.account)),f.ordinary(),admission,
+            finalReady(admission,boundary),f.utc.plusSeconds(10),boundary);
+    }
     @Test void earlyBoundaryCashIsStillPrivatePending(){
         var f=paidLocal();var admission=admission(f);queueGraph(f,true);
         assertThat(StripeBillingSnapshotMapper.retrieveOwnedFirstRenewal(f.f.clients.create(f.f.credentials.resolve(f.f.account)),f.ordinary(),admission,

@@ -93,6 +93,38 @@ class StripeBillingFirstRenewalCompositionIntegrationTest extends StripeBillingF
         assertBoundedRequests(admission,firstRenewalCall);
     }
 
+    // Catches publishing unchanged local NONE terms when the fresh provider renewal contains inclusive tax.
+    @Test void inclusiveTaxWithUnchangedGrossCannotPublishRenewal(){
+        var admission=paidAdmission();var before=financialState();var original=originalEvidence();
+        var first=advance(admission,Step.BOUNDARY);boundary(admission,first);
+        var second=advance(admission,Step.FINALIZATION);assertDeniedAt(receipt.periodEnd()+3600);
+        graph(second,true);
+        // Change only the fresh renewal's tax evidence; the complete 1000 EUR minor cash graph stays intact.
+        var replies=new ArrayList<>(http.replies);
+        for(int index:new int[]{3,9}){
+            var response=(com.stripe.net.StripeResponse)replies.get(index);
+            var json=com.google.gson.JsonParser.parseString(response.body()).getAsJsonObject();
+            var value=json.getAsJsonArray("data").get(index==3?1:0).getAsJsonObject();
+            value.add(index==3?"total_taxes":"taxes",com.google.gson.JsonParser.parseString("[{\"amount\":5,\"tax_behavior\":\"inclusive\",\"taxable_amount\":995,\"type\":\"tax_rate_details\",\"tax_rate_details\":{\"tax_rate\":\"txr_renewal\"}}]"));
+            if(index==3){value.addProperty("total_excluding_tax",995);value.addProperty("subtotal_excluding_tax",995);}
+            replies.set(index,new com.stripe.net.StripeResponse(200,com.stripe.net.HttpHeaders.of(Map.of()),json.toString()));
+        }
+        http.replies.clear();http.replies.addAll(replies);
+        int beforeRead=http.calls.size();
+        assertThatThrownBy(()->observer().observe(admission,second)).isInstanceOf(RuntimeException.class);
+        assertThat(jdbc.queryForObject("select stop_reason from stripe_billing_first_renewals",String.class)).isEqualTo("GRAPH_UNSUPPORTED");
+        assertThat(http.calls.subList(beforeRead,http.calls.size())).allSatisfy(request->assertThat(request.method().name()).isEqualTo("GET"));
+        assertThat(financialState()).isEqualTo(before);assertOriginal(original);
+        assertThat(current().paidThrough()).isEqualTo(Instant.ofEpochSecond(receipt.periodEnd()));assertThat(current().debt()).isNull();
+        assertThat(count("stripe_billing_first_renewal_publications")).isZero();
+        assertThat(count("stripe_billing_first_renewal_read_claims")).isEqualTo(2);
+        int stopped=http.calls.size();
+        assertThatThrownBy(()->observer().observe(admission,second)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->publisher().replayPublished(admission)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->queries.get(scope.context().actor(),site,current().id())).isInstanceOf(RuntimeException.class);
+        assertThat(http.calls).hasSize(stopped);assertThat(financialState()).isEqualTo(before);assertOriginal(original);
+    }
+
     // Catches accepting caller source identity or stale live authority/fence after an otherwise genuine Paid.
     @ParameterizedTest @ValueSource(strings={"source","owner","policy","revision","sequence"})
     void currentSourceOwnerPolicyAndFenceDriftCannotPublish(String drift) {

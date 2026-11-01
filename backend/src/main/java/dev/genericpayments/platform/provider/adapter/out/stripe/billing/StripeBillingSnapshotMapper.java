@@ -345,12 +345,15 @@ public final class StripeBillingSnapshotMapper {
                 &&remote.getBillingMode()!=null&&"classic".equals(remote.getBillingMode().getType())
                 &&remote.getPaymentSettings()!=null&&List.of("card").equals(remote.getPaymentSettings().getPaymentMethodTypes())
                 &&"on_subscription".equals(remote.getPaymentSettings().getSaveDefaultPaymentMethod())
+                &&(remote.getAutomaticTax()==null||!Boolean.TRUE.equals(remote.getAutomaticTax().getEnabled()))
+                &&(remote.getDefaultTaxRates()==null||remote.getDefaultTaxRates().isEmpty())
                 &&remote.getMetadata()!=null&&remote.getMetadata().entrySet().containsAll(StripeBillingOwnership.metadata(intent).entrySet())
                 &&remote.getTrialStart()==null&&remote.getTrialEnd()==null&&remote.getSchedule()==null&&remote.getPendingUpdate()==null
                 &&remote.getCancelAt()==null&&Boolean.FALSE.equals(remote.getCancelAtPeriodEnd())&&remote.getCanceledAt()==null&&remote.getEndedAt()==null);
             var items=remote.getItems();require(items!=null&&Boolean.FALSE.equals(items.getHasMore())&&items.getData()!=null&&items.getData().size()==1);
             var item=items.getData().getFirst();require(receipt.itemReference().equals(item.getId())&&"subscription_item".equals(item.getObject())
-                &&receipt.reference().equals(item.getSubscription())&&Objects.equals(1L,item.getQuantity())&&!Boolean.TRUE.equals(item.getDeleted()));
+                &&receipt.reference().equals(item.getSubscription())&&Objects.equals(1L,item.getQuantity())&&!Boolean.TRUE.equals(item.getDeleted())
+                &&(item.getTaxRates()==null||item.getTaxRates().isEmpty()));
             require(item.getPrice()!=null&&intent.priceReference().equals(item.getPrice().getId()));validatePrice(item.getPrice(),mapped);currency(remote.getCurrency(),intent.terms());
             var period=period(item.getCurrentPeriodStart(),item.getCurrentPeriodEnd());
             require(period.start().equals(Instant.ofEpochSecond(receipt.periodEnd()))&&!Instant.ofEpochSecond(target).isBefore(period.start())
@@ -539,7 +542,8 @@ public final class StripeBillingSnapshotMapper {
             requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&(remote.getId().equals(line.getSubscription())||originalHistory&&line.getSubscription()==null)&&Objects.equals(line.getQuantity(),1L)
                 &&line.getParent()!=null&&"subscription_item_details".equals(line.getParent().getType())&&line.getParent().getSubscriptionItemDetails()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             var detail=line.getParent().getSubscriptionItemDetails();
-            if(renewalAdmission!=null&&!originalHistory)require(item.getId().equals(renewalFlatItems.get(line.getId())));
+            if(renewalAdmission!=null&&!originalHistory)require(item.getId().equals(renewalFlatItems.get(line.getId()))
+                &&StripeBillingMutationAdapter.noAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
             var trialContext=owner.trial();boolean historicalTrial=trialContext!=null&&trialContext.request().verified()&&invoice.getId().equals(trialContext.request().invoice());
             requireOwned(remote.getId().equals(detail.getSubscription())&&detail.getProration()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             require(line.getPricing()!=null&&"price_details".equals(line.getPricing().getType())&&line.getPricing().getPriceDetails()!=null);
