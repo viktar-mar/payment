@@ -24,12 +24,21 @@ export async function createOwnedBillingFirstRenewal(options,dependencies={}){re
 async function createOwner(options,dependencies,firstRenewal){
  const c=(firstRenewal?validateBillingFirstRenewalOptions:validateBillingFirstPaymentOptions)(options);if(!c)throw billingError('OPT_IN_REQUIRED');
  let state='NEW',phase='NEW',failure=null,diagnostic=null,accepted=false,cleanupConfirmed=false,bootstrap,cli,fixture,runtime,cleanupPromise,active,finish;
- let journeyStarted=false,journeySettled=false,journeyClean=false;
+ let journeyStarted=false,journeySettled=false,journeyClean=false,startSettlement;
  const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
  const checkIdentity=v=>{if(!originalIdentity||Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))fail('ACK');};
  const resources=()=>Object.freeze({runId:c.runId,expectedSource:c.expectedSource,scope:firstRenewal?'OWNED_INITIAL_AND_FIRST_RENEWAL':'OWNED_INITIAL_PAYMENT',status:state,phase,code:failure,diagnostic,initialAccepted:accepted,...(firstRenewal?{renewalAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
  const fail=(code,detail=null)=>{if(failure===null)diagnostic=isTerminalDiagnostic(detail)?detail:null;failure??=code;lifetime.abort();throw billingError(failure);};
- async function cleanup(){return cleanupPromise??=(async()=>{let ok=!journeyStarted||(journeySettled&&journeyClean);const l={deadline:Math.min(Date.now()+120000,(active?.deadline??Date.now())+120000)};for(const [o,m]of [[runtime,'close'],[cli,'stopListener'],[bootstrap,'stop'],[fixture,'close']])if(o)try{if(await billingBounded(l,x=>o[m](x),o===bootstrap?120000:30000)!==true)ok=false;}catch{ok=false;}cleanupConfirmed=ok;if(!ok)failure??='CLEANUP';return ok;})();}
+ async function cleanup(){return cleanupPromise??=(async()=>{
+  let ok=!journeyStarted||(journeySettled&&journeyClean);const l={deadline:Math.min(Date.now()+120000,(active?.deadline??Date.now())+120000)};
+  for(const [o,m]of [[runtime,'close'],[cli,'stopListener'],[bootstrap,'stop'],[fixture,'close']])if(o){
+   // The canceled outer race can finish before START releases bootstrap's busy guard.
+   // Settlement grants no success or ownership proof; stop retains its own checks.
+   if(o===bootstrap&&startSettlement)try{await billingBounded(l,()=>startSettlement,120000);}catch{ok=false;continue;}
+   try{if(await billingBounded(l,x=>o[m](x),o===bootstrap?120000:30000)!==true)ok=false;}catch{ok=false;}
+  }
+  cleanupConfirmed=ok;if(!ok)failure??='CLEANUP';return ok;
+ })();}
  return Object.freeze({resources,
   async run(journey,limits){if(state!=='NEW')throw billingError('SINGLE_USE');state='RUNNING';let timer,remove=()=>{};
    try{billingCheck(limits);if(typeof journey!=='function'||limits.deadline>Date.now()+2700000)fail('LIMITS');const abort=()=>lifetime.abort();limits.signal?.addEventListener('abort',abort,{once:true});remove=()=>limits.signal?.removeEventListener('abort',abort);timer=setTimeout(abort,Math.max(1,limits.deadline-Date.now()));active={deadline:limits.deadline,signal:lifetime.signal};
@@ -40,7 +49,10 @@ async function createOwner(options,dependencies,firstRenewal){
     await requireTrue('PREPARE',()=>bootstrap.prepare(active),2700000);
     cli=await step('CLI',async()=>(dependencies.createCli??(await import('./stripe-sandbox-cli.mjs'))[firstRenewal?'createBillingFirstRenewalCliAdapter':'createBillingFirstPaymentCliAdapter'])({configuration:c,cliDirectory:bootstrap.resources().cliDirectory,verifyForwardTarget:bootstrap.verifyForwardTarget,persistWebhookSecret:bootstrap.persistWebhookSecret}));
     await requireTrue('LOGIN',async()=>(dependencies.login??(await import('./stripe-billing-login.mjs')).completeBillingLogin)(cli,c,active),780000);
-    await requireTrue('BINDING',()=>cli.validateBinding(active));await requireTrue('LISTENER',()=>cli.startListener(active));await requireTrue('START',()=>bootstrap.start(active),2700000);
+    await requireTrue('BINDING',()=>cli.validateBinding(active));await requireTrue('LISTENER',()=>cli.startListener(active));await requireTrue('START',()=>{
+     const started=Promise.resolve().then(()=>bootstrap.start(active));
+     startSettlement=started.then(()=>undefined,()=>undefined);return started;
+    },2700000);
     runtime=await step('RUNTIME',()=>(dependencies.createRuntime??(firstRenewal?createBillingFirstRenewalRuntime:createBillingFirstPaymentRuntime))({configuration:c,bootstrap}));await requireTrue('RUNTIME',()=>runtime.ready(active));
     fixture=await step('FIXTURE',async()=>(dependencies.createFixture??(await import('./stripe-billing-provision.mjs')).createBillingFixture)({configuration:c,bootstrap,cli}));await requireTrue('PROVISION',l=>fixture.provision(l));
     const child=l=>{billingCheck(active);billingCheck(l);return {deadline:Math.min(active.deadline,l.deadline),signal:l.signal?AbortSignal.any([active.signal,l.signal]):active.signal};};

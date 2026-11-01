@@ -23,6 +23,50 @@ function harness(change={}){
 }
 const journey=async p=>{await p.prepare({token:'customer-token',origin:scope().endpoints.demo},'create-original',limits());await p.confirm(confirmation(),limits());return true;};
 
+const settlementTurn=()=>new Promise(resolve=>setImmediate(resolve));
+const settlementOptions=renewal=>renewal?{...options(),env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_RENEWAL:'true'},selectedCase:'initial_and_first_renewal'}:options();
+for(const renewal of [false,true])for(const outcome of ['resolve','hostile-reject','listener-failure'])test((renewal?'first-renewal':'first-payment')+' cleanup drains actual START before one stop: '+outcome,async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const h=harness(),controller=new AbortController();let enter,release,settled=false,errorReads=0,completed=false,stopLimits;
+ const entered=new Promise(r=>enter=r),held=new Promise((resolve,reject)=>release=()=>outcome==='hostile-reject'?reject(new Proxy({},{get(){errorReads++;throw null;},getPrototypeOf(){errorReads++;throw null;},ownKeys(){errorReads++;throw null;}})):resolve(true));
+ h.bootstrap.start=async()=>{h.calls.push('start');enter();try{return await held;}finally{settled=true;}};
+ h.bootstrap.startupDiagnostic=()=> 'START_DEMO_SITE_HEALTH_PROOF_ABORT';
+ h.cli.stopListener=async()=>{h.calls.push('listener-stop');await new Promise(r=>setTimeout(r,25000));if(outcome==='listener-failure')throw null;return true;};
+ h.bootstrap.stop=async l=>{h.calls.push('stop');stopLimits=l;assert.equal(l.signal.aborted,false);assert.equal(settled,true);return true;};
+ h.dependencies.createRuntime=()=>{assert.fail('runtime must not start');};h.dependencies.createFixture=()=>{assert.fail('fixture must not start');};
+ const create=renewal?api.createOwnedBillingFirstRenewal:api.createOwnedBillingFirstPayment;
+ const owner=await create(settlementOptions(renewal),h.dependencies),running=owner.run(()=>assert.fail('journey must not start'),{deadline:101000,signal:controller.signal});
+ running.then(()=>{completed=true;},()=>{completed=true;});const rejected=assert.rejects(running,/billing_ABORTED/);
+ await entered;controller.abort();await settlementTurn();
+ assert.deepEqual(h.calls.filter(c=>['listener-stop','stop'].includes(c)),['listener-stop']);
+ t.mock.timers.tick(25000);await settlementTurn();
+ const beforeRelease={completed,stops:h.calls.filter(c=>c==='stop').length,status:owner.resources().status};
+ t.mock.timers.tick(20000);release();await rejected;
+ assert.deepEqual(beforeRelease,{completed:false,stops:0,status:'RUNNING'});
+ assert.equal(stopLimits.deadline,121000);assert.equal(errorReads,0);
+ const result=await owner.close();assert.equal(result.code,'ABORTED');assert.equal(result.diagnostic,'START_DEMO_SITE_HEALTH_PROOF_ABORT');assert.equal(result.phase,'START');assert.equal(result.cleanupConfirmed,outcome!=='listener-failure');assert.equal(result.initialAccepted,false);assert.equal(result.full5bAccepted,false);if(renewal)assert.equal(result.renewalAccepted,false);
+ assert.deepEqual(h.calls.filter(c=>['start','listener-stop','stop'].includes(c)),['start','listener-stop','stop']);
+ await assert.rejects(owner.run(journey,{deadline:221000}),/SINGLE_USE/);assert.deepEqual(await owner.close(),result);
+});
+for(const renewal of [false,true])test((renewal?'first-renewal':'first-payment')+' cleanup expires at original ceiling without late START stop',async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const h=harness();let enter,release,completed=false,errorReads=0;
+ const entered=new Promise(r=>enter=r),held=new Promise((_resolve,reject)=>release=()=>reject(new Proxy({},{get(){errorReads++;throw null;}})));
+ h.bootstrap.start=()=>{h.calls.push('start');enter();return held;};h.bootstrap.startupDiagnostic=()=> 'START_DEMO_SITE_HEALTH_PROOF_ABORT';
+ h.cli.stopListener=async()=>{h.calls.push('listener-stop');await new Promise(r=>setTimeout(r,25000));return true;};
+ h.dependencies.createRuntime=()=>assert.fail('runtime must not start');h.dependencies.createFixture=()=>assert.fail('fixture must not start');
+ const create=renewal?api.createOwnedBillingFirstRenewal:api.createOwnedBillingFirstPayment;
+ const owner=await create(settlementOptions(renewal),h.dependencies),running=owner.run(()=>assert.fail('journey must not start'),{deadline:101000});
+ running.then(()=>{completed=true;},()=>{completed=true;});const rejected=assert.rejects(running,/billing_ABORTED/);
+ await entered;t.mock.timers.tick(110000);await settlementTurn(); // Cleanup starts late: original deadline + 120s still wins.
+ t.mock.timers.tick(25000);await settlementTurn();t.mock.timers.tick(84999);await settlementTurn();
+ const beforeExpiry={completed,stops:h.calls.filter(c=>c==='stop').length};
+ t.mock.timers.tick(1);await rejected;const result=await owner.close();
+ release();await settlementTurn();t.mock.timers.tick(120000);await settlementTurn();
+ assert.deepEqual(beforeExpiry,{completed:false,stops:0});assert.equal(result.cleanupConfirmed,false);assert.equal(result.code,'ABORTED');assert.equal(result.diagnostic,'START_DEMO_SITE_HEALTH_PROOF_ABORT');assert.equal(result.initialAccepted,false);assert.equal(result.full5bAccepted,false);if(renewal)assert.equal(result.renewalAccepted,false);
+ assert.equal(errorReads,0);assert.equal(h.calls.filter(c=>c==='stop').length,0);assert.deepEqual(await owner.close(),result);await assert.rejects(owner.run(journey,{deadline:Date.now()+10000}),/SINGLE_USE/);
+});
+
 const browserMeta=await import('./stripe-billing-first-payment-browser-diagnostic.mjs');
 const browserCodes=['BROWSER_CONTEXT','BROWSER_PAGE','BROWSER_SETUP','BROWSER_NAVIGATION','BROWSER_CONFIGURE','BROWSER_OTP_REQUEST','BROWSER_OTP_VERIFY','BROWSER_PREPARE','BROWSER_ACTION_BRIDGE','BROWSER_SESSION_BRIDGE','BROWSER_CONFIRM_BRIDGE','BROWSER_WAIT_READY','BROWSER_CARD_NUMBER','BROWSER_CARD_EXPIRY','BROWSER_CARD_CVC','BROWSER_POSTAL_CHECK','BROWSER_POSTAL_FILL','BROWSER_PAY_CLICK','BROWSER_WAIT_OBSERVE','BROWSER_CLOSE','BROWSER_CONFIRM_GUARD','BROWSER_CONFIRM_STATE','BROWSER_CONFIRM_SUBMIT_VALIDATION','BROWSER_CONFIRM_SUBMIT','BROWSER_CONFIRM_TOKEN_VALIDATION','BROWSER_CONFIRM_TOKEN','BROWSER_CONFIRM_CLIENT','BROWSER_CONFIRM_NEXT_ACTION','BROWSER_CONFIRM_RETIRED','BROWSER_CONFIRM_RECEIPT'];
 for(const code of browserCodes)test('owner captures trusted '+code+' only at BROWSER after acknowledged CREATE',async()=>{
