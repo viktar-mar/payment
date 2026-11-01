@@ -1,5 +1,6 @@
 import {createGenericPaymentClient, mountStripePaymentAttempt, type CustomerSession} from '@generic-payments/sdk';
 import './billing-first-payment.css';
+import {readStripePaymentAttemptFailure, type StripePaymentAttemptFailure} from '../../../frontend/sdk/src/subscriptions/stripe-payment-attempt-diagnostic.js';
 
 // The dedicated build is inert until its single controller configures this page.
 // Capabilities stay in closures. There is no recovery, storage or secret DOM state.
@@ -11,6 +12,10 @@ let configured = false;
 let stopped = false;
 let spent = false;
 let confirming = false;
+let terminalStopped = false;
+let terminalFailure: StripePaymentAttemptFailure | 'RECEIPT' | null = null;
+Object.defineProperty(window, '__firstPaymentFailure', {value:() => terminalStopped ? terminalFailure : null, configurable:false, writable:false});
+const captureFailure = (): void => {terminalFailure ??= readStripePaymentAttemptFailure(handle);};
 let session: CustomerSession | undefined;
 let handle: Awaited<ReturnType<typeof mountStripePaymentAttempt>> | undefined;
 let timer: ReturnType<typeof setTimeout> | undefined;
@@ -23,13 +28,15 @@ function stop(): void {
   if (stopped) return;
   stopped = true;
   clearTimeout(timer);
+  captureFailure();
   controller.abort();
   handle?.destroy();
+  captureFailure();
   handle = undefined;
   session = undefined;
   code.value = '';
   for (const element of document.querySelectorAll('button,input')) (element as HTMLInputElement).disabled = true;
-  if (document.body.dataset.phase !== 'OBSERVE') phase('STOPPED');
+  if (document.body.dataset.phase !== 'OBSERVE') {phase('STOPPED');terminalStopped = true;}
 }
 window.addEventListener('pagehide', stop, {once:true});
 document.addEventListener('visibilitychange', () => {if (document.visibilityState === 'hidden') stop();});
@@ -102,7 +109,10 @@ document.addEventListener('visibilitychange', () => {if (document.visibilityStat
     phase('CONFIRMING');
     try {
       const result = await handle.confirm();
-      if (stopped || 'validationFailed' in result || result.state !== 'OBSERVE' || result.retryAllowed || result.successorAttemptId !== null) throw Error('confirmation');
+      if (stopped) return;
+      captureFailure();
+      if ('validationFailed' in result) {stop();return;}
+      if (result.state !== 'OBSERVE' || result.retryAllowed || result.successorAttemptId !== null) {terminalFailure ??= 'RECEIPT';stop();return;}
       phase('OBSERVE');
       stop();
     } catch {stop();}

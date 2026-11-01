@@ -1,5 +1,9 @@
-import test from 'node:test';
+import test, {before, after} from 'node:test';
+const originalFetch=globalThis.fetch;let transportCalls=0;
+before(()=>{globalThis.fetch=()=>{transportCalls++;throw new Error('offline test transport blocked');};});
+after(()=>{globalThis.fetch=originalFetch;assert.equal(transportCalls,0);});
 import assert from 'node:assert/strict';
+import {runInNewContext} from 'node:vm';
 
 // Local audit: Node builtins, inert source imports and an injected Route/BrowserPort only.
 // No listener, browser, build, process launch, private input or network dependency.
@@ -141,14 +145,14 @@ test('browser page checkpoint survives sanitization and terminal formatting', as
   assert.match(String(error), /^Error: first_payment_BROWSER$/);
 });
 
-// Inert original-flow fixture: no callback evaluates browser source or starts a browser.
-async function journeyFixture(fault = '', options: {closeReject?:boolean;stopReady?:boolean;stopObserve?:boolean;postalVisible?:boolean;lateOpen?:boolean;payRace?:'bridge-first'|'pay-first'} = {}) {
+// Inert original-flow fixture: terminal evaluation runs only in a VM; no browser or transport.
+async function journeyFixture(fault = '', options: {closeReject?:boolean;stopReady?:boolean;stopObserve?:boolean;postalVisible?:boolean;lateOpen?:boolean;payRace?:'bridge-first'|'pay-first';snapshot?:unknown;reader?:'missing'|'throwing'|'accessor'|'writable'|'configurable'|'enumerable'|'nonfunction';snapshotOrigin?:string;wrongTop?:boolean;skipPrepare?:boolean;lateOrigin?:boolean;lateEvaluation?:boolean;bridgeDuringEvaluation?:boolean} = {}) {
   const module=await import(moduleUrl);
   const provenance=await import('../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs');
   const p=prepared(),calls:string[]=[],b={...binding,siteKey:'fixture-site',email:'fixture@example.test'};
   let phase='',bindingCallback:any,routeCallback:any,navigation:any,closed=false,releaseOpen:any,releaseHeaders:undefined|(()=>void);
   const hit=(name:string)=>{calls.push(name);if(fault===name)throw new Proxy({}, {get(){throw Error('foreign value read');}});};
-  const frame={url:()=>b.endpoints.demo+'/billing-first-payment.html'};
+  const frame={url:()=>options.lateOrigin&&phase==='OBSERVE'?'https://foreign.test/':b.endpoints.demo+'/billing-first-payment.html'};
   const requestRoute=(url:string,method='GET',body?:unknown,wrong=false)=>{
     const r=route(url,method,body);
     if(wrong){const request=r.request;r.request=()=>({...request(),allHeaders:async()=>{
@@ -162,12 +166,22 @@ async function journeyFixture(fault = '', options: {closeReject?:boolean;stopRea
   const selectBridge=async()=>{await routeCallback(requestRoute(original+'/action'));await routeCallback(requestRoute(original+'/confirmation-session','POST',{action_token:p.action.secret}));};
   const page:any={mainFrame:()=>frame,on:(_event:string,cb:any)=>{navigation=cb;},
     goto:async()=>{hit('NAVIGATION');navigation(frame);},
-    waitForFunction:async(_fn:any,expected:string)=>{if(expected==='READY'&&fault==='SECOND_NAVIGATION')navigation(frame);if(closed)throw null;if(expected)hit('WAIT_'+expected);else hit('CONFIGURE_WAIT');},
-    evaluate:async()=>{hit('CONFIGURE');},
+    waitForFunction:async(_fn:any,expected:string)=>{if(expected==='READY'&&fault==='SECOND_NAVIGATION')navigation(frame);if(closed)throw null;if(expected)hit('WAIT_'+expected);else hit(phase==='OBSERVE'?'WAIT_OBSERVE':'CONFIGURE_WAIT');},
+    evaluate:async(fn:any,value:any)=>{
+      if(typeof value!=='string'){hit('CONFIGURE');return;}
+      calls.push('terminal-evaluate');
+      if(options.lateEvaluation)await new Promise<void>(resolve=>{releaseHeaders=resolve;});
+      if(options.bridgeDuringEvaluation)await routeCallback(requestRoute(original+'/action'));
+      const window:any={};window.top=options.wrongTop?{}:window;
+      const reader=()=>{calls.push('reader');if(options.reader==='throwing')throw null;return options.snapshot;};
+      if(options.reader!=='missing')Object.defineProperty(window,'__firstPaymentFailure',options.reader==='accessor'?{get(){calls.push('accessor');return reader;}}:{value:options.reader==='nonfunction'?'SUBMIT':reader,writable:options.reader==='writable',configurable:options.reader==='configurable',enumerable:options.reader==='enumerable'});
+      return runInNewContext('('+fn.toString()+')(origin)',{window,location:{origin:options.snapshotOrigin??b.endpoints.demo},document:{body:{dataset:{phase:options.stopObserve?'STOPPED':phase}}},origin:value});
+    },
     locator:(selector:string)=>selector==='body'?{getAttribute:async()=>(options.stopReady&&phase==='READY'||options.stopObserve&&phase==='OBSERVE')?'STOPPED':phase}:{frameLocator:()=>({locator:(s:string)=>({fill:async()=>hit(s.includes('number')?'CARD_NUMBER':s.includes('expiry')?'CARD_EXPIRY':s.includes('cvc')?'CARD_CVC':'POSTAL_FILL'),isVisible:async()=>{hit('POSTAL_CHECK');return options.postalVisible!==false;}})})},
     getByRole:(_role:string,{name}:any)=>({evaluate:async()=>true,check:async()=>{},isEnabled:async()=>true,click:async()=>{
       if(name==='Request code'){hit('OTP_REQUEST');await routeCallback(requestRoute(otp,'POST',{site_key:b.siteKey,email:b.email,intent:'AUTHENTICATE'}));phase='CODE';}
       if(name==='Verify code'){hit('OTP_VERIFY');await routeCallback(requestRoute(otp+'/'+id('9')+'/verify','POST',{}));phase='AUTHENTICATED';}
+      if(name==='Start payment'&&options.skipPrepare){phase='READY';return;}
       if(name==='Start payment'){await bindingCallback({frame},{token,origin:b.endpoints.demo,customerId:b.customerId,siteId:b.siteId});await selectBridge();phase='READY';}
       if(name==='Pay'){
         hit('PAY_CLICK');
@@ -211,7 +225,7 @@ test('invisible optional postal field leaves original successful route sequence 
 for(const fault of ['CARD_NUMBER',''])test('rejecting close preserves '+(fault||'successful body')+' primary and cleanup uncertainty',async()=>{
  const f=await journeyFixture(fault,{closeReject:true});let e;try{await f.run();}catch(error){e=error;}assert.equal(String(e),'Error: first_payment_BROWSER');assert.equal(f.provenance.browserDiagnostic(e),fault?'BROWSER_CARD_NUMBER':'BROWSER_CLOSE');assert.equal(f.provenance.browserCleanupConfirmed(e),false);assert.equal(f.calls.filter(x=>x==='close').length,1);
 });
-for(const code of ['BROWSER_CONTEXT','BROWSER_PAGE','BROWSER_SETUP','BROWSER_NAVIGATION','BROWSER_CONFIGURE','BROWSER_OTP_REQUEST','BROWSER_OTP_VERIFY','BROWSER_PREPARE','BROWSER_ACTION_BRIDGE','BROWSER_SESSION_BRIDGE','BROWSER_CONFIRM_BRIDGE','BROWSER_WAIT_READY','BROWSER_CARD_NUMBER','BROWSER_CARD_EXPIRY','BROWSER_CARD_CVC','BROWSER_POSTAL_CHECK','BROWSER_POSTAL_FILL','BROWSER_PAY_CLICK','BROWSER_WAIT_OBSERVE','BROWSER_CLOSE'])test('reporter transports literal '+code+' exactly once',async()=>{
+for(const code of ['BROWSER_CONTEXT','BROWSER_PAGE','BROWSER_SETUP','BROWSER_NAVIGATION','BROWSER_CONFIGURE','BROWSER_OTP_REQUEST','BROWSER_OTP_VERIFY','BROWSER_PREPARE','BROWSER_ACTION_BRIDGE','BROWSER_SESSION_BRIDGE','BROWSER_CONFIRM_BRIDGE','BROWSER_WAIT_READY','BROWSER_CARD_NUMBER','BROWSER_CARD_EXPIRY','BROWSER_CARD_CVC','BROWSER_POSTAL_CHECK','BROWSER_POSTAL_FILL','BROWSER_PAY_CLICK','BROWSER_WAIT_OBSERVE','BROWSER_CLOSE','BROWSER_CONFIRM_GUARD','BROWSER_CONFIRM_STATE','BROWSER_CONFIRM_SUBMIT_VALIDATION','BROWSER_CONFIRM_SUBMIT','BROWSER_CONFIRM_TOKEN_VALIDATION','BROWSER_CONFIRM_TOKEN','BROWSER_CONFIRM_CLIENT','BROWSER_CONFIRM_NEXT_ACTION','BROWSER_CONFIRM_RETIRED','BROWSER_CONFIRM_RECEIPT'])test('reporter transports literal '+code+' exactly once',async()=>{
  const {default:Reporter}=await import(new URL('./stripe-billing-first-payment-reporter.ts',import.meta.url).href);
  const {formatBillingFirstPaymentDiagnostic,parseBillingFirstPaymentDiagnosticLine}=await import(new URL('../../../../infrastructure/stripe-billing-first-payment.mjs',import.meta.url).href);
  const line=formatBillingFirstPaymentDiagnostic({status:'CLOSED',initialAccepted:false,code:'BROWSER',diagnostic:code,cleanupConfirmed:true});assert.equal(line,'owned_initial_payment_diagnostic code='+code+' cleanup=CONFIRMED');assert.equal(parseBillingFirstPaymentDiagnosticLine(line),line);assert.ok(line.length<160);
@@ -292,4 +306,25 @@ for(const code of ['START_BACKEND_COMMAND_REJECTED','START_BACKEND_COMMAND_NONZE
   reporter.onStdOut(line+' private-sentinel\n');reporter.onStdOut(line.slice(0,31));reporter.onStdOut(line.slice(31)+'\n');reporter.onStdOut(line+'\n');reporter.onStdErr();
   assert.deepEqual(lines,[handoff+'\n',line+'\n']);
  }finally{process.stdout.write=original;}
+});
+
+for(const category of ['GUARD','STATE','SUBMIT_VALIDATION','SUBMIT','TOKEN_VALIDATION','TOKEN','CLIENT','NEXT_ACTION','RETIRED','RECEIPT'])test('atomic terminal VM snapshot maps '+category+' only after original prepare and Pay',async()=>{
+ const f=await journeyFixture('',{stopObserve:true,snapshot:category});let error;try{await f.run();}catch(e){error=e;}
+ assert.equal(f.provenance.browserDiagnostic(error),'BROWSER_CONFIRM_'+category);assert.equal(f.provenance.browserCleanupConfirmed(error),true);assert.equal(f.calls.filter(c=>c==='terminal-evaluate').length,1);assert.equal(f.calls.filter(c=>c==='reader').length,1);assert.equal(f.calls.filter(c=>c==='PREPARE').length,1);assert.equal(f.calls.filter(c=>c==='PAY_CLICK').length,1);assert.equal(f.calls.filter(c=>c==='confirm').length,0);
+});
+for(const reader of ['missing','throwing','accessor','writable','configurable','enumerable','nonfunction'] as const)test('malformed terminal '+reader+' reader preserves generic WAIT_OBSERVE',async()=>{
+ const f=await journeyFixture('',{stopObserve:true,snapshot:'SUBMIT',reader});let error;try{await f.run();}catch(e){error=e;}assert.equal(f.provenance.browserDiagnostic(error),'BROWSER_WAIT_OBSERVE');assert.equal(f.calls.filter(c=>c==='confirm').length,0);assert.equal(f.calls.includes('accessor'),false);
+});
+for(const snapshot of [undefined,null,1,true,{},['SUBMIT'],'BROWSER_CONFIRM_SUBMIT','SUBMIT_EXTRA','PREFIX_SUBMIT','SUBMIT\n'])test('untrusted terminal label '+JSON.stringify(snapshot)+' stays generic',async()=>{
+ const f=await journeyFixture('',{stopObserve:true,snapshot});let error;try{await f.run();}catch(e){error=e;}assert.equal(f.provenance.browserDiagnostic(error),'BROWSER_WAIT_OBSERVE');assert.equal(f.calls.filter(c=>c==='confirm').length,0);
+});
+test('unreadable terminal value is never inspected',async()=>{let reads=0;const snapshot=new Proxy({},{get(){reads++;throw null;},getPrototypeOf(){reads++;throw null;},ownKeys(){reads++;throw null;}});const f=await journeyFixture('',{stopObserve:true,snapshot});let error;try{await f.run();}catch(e){error=e;}assert.equal(f.provenance.browserDiagnostic(error),'BROWSER_WAIT_OBSERVE');assert.equal(reads,0);});
+for(const options of [{snapshotOrigin:'https://foreign.test'},{wrongTop:true},{skipPrepare:true},{lateOrigin:true}])test('wrong terminal flow or origin '+JSON.stringify(options)+' supplies no category',async()=>{
+ const f=await journeyFixture('',{stopObserve:true,snapshot:'SUBMIT',...options});let error;try{await f.run();}catch(e){error=e;}assert.equal(f.provenance.browserDiagnostic(error),'BROWSER_WAIT_OBSERVE');assert.equal(f.calls.includes('reader'),false);assert.equal(f.calls.includes('confirm'),false);
+});
+test('successful OBSERVE never consults failure reader',async()=>{const f=await journeyFixture('',{snapshot:'SUBMIT',reader:'throwing'});assert.equal(await f.run(),true);assert.equal(f.calls.includes('reader'),false);assert.equal(f.calls.filter(c=>c==='confirm').length,1);});
+test('no terminal timeout does not sample or manufacture a confirmation category',async()=>{const f=await journeyFixture('WAIT_OBSERVE',{snapshot:'SUBMIT'});let error;try{await f.run();}catch(e){error=e;}assert.equal(f.provenance.browserDiagnostic(error),'BROWSER_WAIT_OBSERVE');assert.equal(f.calls.includes('terminal-evaluate'),false);assert.equal(f.calls.includes('reader'),false);});
+test('already latched Node bridge failure wins over later renderer category',async()=>{const f=await journeyFixture('',{stopObserve:true,snapshot:'SUBMIT',bridgeDuringEvaluation:true});let error;try{await f.run();}catch(e){error=e;}assert.equal(f.provenance.browserDiagnostic(error),'BROWSER_CONFIRM_BRIDGE');assert.equal(f.calls.includes('confirm'),false);});
+test('bounded late terminal evaluation cannot restore success or replace first generic failure',async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});const f=await journeyFixture('',{stopObserve:true,snapshot:'SUBMIT',lateEvaluation:true});let error;const running=f.run({deadline:2000}).catch((e:unknown)=>{error=e;});for(let i=0;i<120&&!f.calls.includes('terminal-evaluate');i++)await Promise.resolve();assert.equal(f.calls.includes('terminal-evaluate'),true);t.mock.timers.tick(1000);await running;assert.equal(f.provenance.browserDiagnostic(error),'BROWSER_WAIT_OBSERVE');assert.equal(f.provenance.browserCleanupConfirmed(error),true);assert.equal(f.calls.filter(c=>c==='close').length,1);assert.equal(f.calls.includes('confirm'),false);await Promise.resolve();assert.equal(f.provenance.browserDiagnostic(error),'BROWSER_WAIT_OBSERVE');
 });

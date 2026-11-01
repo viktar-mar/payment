@@ -206,7 +206,30 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     const postal = frame.locator('input[name="postalCode"]');
     if (await at('BROWSER_POSTAL_CHECK', () => postal.isVisible())) await at('BROWSER_POSTAL_FILL', () => postal.fill('10001', {timeout:remaining(limits)}));
     await at('BROWSER_PAY_CLICK', () => page.getByRole('button', {name:'Pay', exact:true}).click({timeout:remaining(limits)}));
-    await at('BROWSER_WAIT_OBSERVE', () => waitPhase('OBSERVE'));
+    await at('BROWSER_WAIT_OBSERVE', async () => {
+      // This path is reachable only after this runner's original prepare and Pay.
+      need(!failure && prepared && bridge && challenges === 1 && verifies === 1);
+      need(new URL(page.mainFrame().url()).origin === binding.endpoints.demo);
+      await page.waitForFunction(() => ['OBSERVE','STOPPED'].includes(document.body.dataset.phase ?? ''), undefined, {timeout:remaining(limits)});
+      const observation = await billingBounded(limits, () => page.evaluate(origin => {
+        if (window !== window.top || location.origin !== origin) return 'STOPPED';
+        const phase = document.body.dataset.phase;
+        if (phase === 'OBSERVE') return 'OBSERVE';
+        if (phase !== 'STOPPED') return 'STOPPED';
+        try {
+          const reader = Object.getOwnPropertyDescriptor(window, '__firstPaymentFailure');
+          if (!reader || reader.configurable !== false || reader.writable !== false || reader.enumerable !== false || typeof reader.value !== 'function') return 'STOPPED';
+          const value: unknown = reader.value();
+          return typeof value === 'string' && ['GUARD','STATE','SUBMIT_VALIDATION','SUBMIT','TOKEN_VALIDATION','TOKEN','CLIENT','NEXT_ACTION','RETIRED','RECEIPT'].includes(value) ? value : 'STOPPED';
+        } catch {return 'STOPPED';}
+      }, binding.endpoints.demo));
+      billingCheck(limits);
+      need(!failure && new URL(page.mainFrame().url()).origin === binding.endpoints.demo);
+      const codes: Record<string, string> = {
+        GUARD:'BROWSER_CONFIRM_GUARD', STATE:'BROWSER_CONFIRM_STATE', SUBMIT_VALIDATION:'BROWSER_CONFIRM_SUBMIT_VALIDATION', SUBMIT:'BROWSER_CONFIRM_SUBMIT', TOKEN_VALIDATION:'BROWSER_CONFIRM_TOKEN_VALIDATION', TOKEN:'BROWSER_CONFIRM_TOKEN', CLIENT:'BROWSER_CONFIRM_CLIENT', NEXT_ACTION:'BROWSER_CONFIRM_NEXT_ACTION', RETIRED:'BROWSER_CONFIRM_RETIRED', RECEIPT:'BROWSER_CONFIRM_RECEIPT',
+      };
+      if (observation !== 'OBSERVE') throw latch(typeof observation === 'string' && Object.hasOwn(codes, observation) ? codes[observation]! : 'BROWSER_WAIT_OBSERVE');
+    });
     billingCheck(limits);
     need(!failure && prepared && challenges === 1 && verifies === 1);
     return true;

@@ -1,3 +1,4 @@
+import {retainStripePaymentAttemptFailure, type StripePaymentAttemptFailure} from './stripe-payment-attempt-diagnostic.js';
 import type { Stripe, StripeElements, StripePaymentElement } from '@stripe/stripe-js';
 import { browserOrigin, validateCustomerSession } from '../customer/contracts.js';
 import { PaymentSdkError, isAbort } from '../errors.js';
@@ -15,12 +16,15 @@ export async function mountStripePaymentAttempt(options:{client:SubscriptionClie
  const expires=Math.min(Date.parse(input.session.expiresAt),Date.parse(context.expiresAt));
  let stripe:Stripe|undefined,elements:StripeElements|undefined,element:StripePaymentElement|undefined;
  let active=true,ready=false,busy=false,dispatched=false;
+ let handle:StripePaymentAttemptHandle|undefined;
+ const retain=(code:StripePaymentAttemptFailure):void=>retainStripePaymentAttemptFailure(handle,code);
  let expiry:ReturnType<typeof setTimeout>|undefined,readinessTimer:ReturnType<typeof setTimeout>|undefined,releaseCustomer:(()=>void)|undefined;
  let readyListener:(()=>void)|undefined,loadErrorListener:(()=>void)|undefined;
  const aborted=()=>new DOMException('Aborted','AbortError');let cancel!:(error:DOMException)=>void;
  const cancelled=new Promise<never>((_,reject)=>{cancel=reject;});void cancelled.catch(()=>{});
  const observer=new MutationObserver(()=>{if(active){try{current();}catch{destroy();}}});
  function destroy():void{
+  if(busy)retain('RETIRED');
   const wasActive=active;active=false;ready=false;if(expiry!==undefined)clearTimeout(expiry);if(readinessTimer!==undefined)clearTimeout(readinessTimer);
   input.signal?.removeEventListener('abort',destroy);window.removeEventListener('pagehide',destroy);document.removeEventListener('visibilitychange',visibility);observer.disconnect();releaseCustomer?.();releaseCustomer=undefined;assertAuthority=undefined;
   try{if(readyListener)element?.off('ready',readyListener);if(loadErrorListener)element?.off('loaderror',loadErrorListener);}catch{/* sanitized cleanup */}
@@ -28,7 +32,8 @@ export async function mountStripePaymentAttempt(options:{client:SubscriptionClie
   try{retired?.destroy();}catch{/* sanitized cleanup */}
   if(wasActive){cancel(aborted());try{onRetire?.();}catch{/* cannot revive */}}
  }
- function current():void{if(!active||input.signal?.aborted||!isCurrent()||!visibleSubscriptionHost(container)||document.visibilityState==='hidden')throw aborted();assertAuthority!();validateCustomerSession(input.session);if(input.session.origin!==browserOrigin()||Date.now()>=expires||!input.session.scopes.includes('SUBSCRIPTION_MANAGE'))throw new PaymentSdkError('INVALID_SESSION');}
+ function current():void{try{if(!active||input.signal?.aborted||!isCurrent()||!visibleSubscriptionHost(container)||document.visibilityState==='hidden')throw aborted();assertAuthority!();validateCustomerSession(input.session);if(input.session.origin!==browserOrigin()||Date.now()>=expires||!input.session.scopes.includes('SUBSCRIPTION_MANAGE'))throw new PaymentSdkError('INVALID_SESSION');}catch(error){retain('GUARD');throw error;}}
+ function paymentCurrent():void{try{assertPaymentSession(client,input,context!);}catch(error){retain('GUARD');throw error;}}
  function visibility():void{if(document.visibilityState==='hidden')destroy();}
  async function guarded<T>(pending:Promise<T>):Promise<T>{const result=await Promise.race([pending,cancelled]);current();return result;}
  try{
@@ -40,20 +45,22 @@ export async function mountStripePaymentAttempt(options:{client:SubscriptionClie
   elements=stripe.elements({clientSecret:context.clientSecret,locale:options.locale??'en'});current();element=elements.create('payment',{wallets:{applePay:'never',googlePay:'never',link:'never'}});
   const readiness=new Promise<void>((resolve,reject)=>{readyListener=()=>{try{current();ready=true;resolve();}catch{reject(aborted());}};loadErrorListener=()=>reject(new PaymentSdkError('PROVIDER_TEMPORARILY_UNAVAILABLE'));readinessTimer=setTimeout(()=>reject(new PaymentSdkError('PROVIDER_TEMPORARILY_UNAVAILABLE')),30000);});void readiness.catch(()=>{});
   element.on('ready',readyListener!);element.on('loaderror',loadErrorListener!);current();element.mount(container);await guarded(readiness);clearTimeout(readinessTimer);
-  return {protocol:'SERVER_CONFIRM_V2',destroy,async confirm(){
-   if(busy||dispatched)throw new PaymentSdkError('PAYMENT_STATE_CONFLICT');busy=true;
+  handle={protocol:'SERVER_CONFIRM_V2',destroy,async confirm(){
+   if(busy||dispatched){retain('STATE');throw new PaymentSdkError('PAYMENT_STATE_CONFLICT');}busy=true;
+   let branch:StripePaymentAttemptFailure='STATE';
    let validationFailed=false;
    try{
-    current();if(!ready||!context)throw new PaymentSdkError('PAYMENT_STATE_CONFLICT');assertPaymentSession(client,input,context);
-    const submitted=await guarded(elements!.submit());if(submitted.error){validationFailed=true;return {validationFailed:true};}
-    const token=await guarded(stripe!.createConfirmationToken({elements:elements!}));if(token.error||!token.confirmationToken){validationFailed=true;return {validationFailed:true};}
-    current();assertPaymentSession(client,input,context);dispatched=true;
-    const receipt=await guarded(client.confirmPaymentAttempt!({...input,context,confirmationToken:token.confirmationToken.id,idempotencyKey:crypto.randomUUID()}));
-    if(receipt.nextActionAllowed===true){current();await guarded(stripe!.handleNextAction({clientSecret:context!.clientSecret}));}
+    current();if(!ready||!context){retain('STATE');throw new PaymentSdkError('PAYMENT_STATE_CONFLICT');}paymentCurrent();
+    branch='SUBMIT';const submitted=await guarded(elements!.submit());if(submitted.error){retain('SUBMIT_VALIDATION');validationFailed=true;return {validationFailed:true};}
+    branch='TOKEN';const token=await guarded(stripe!.createConfirmationToken({elements:elements!}));if(token.error||!token.confirmationToken){retain('TOKEN_VALIDATION');validationFailed=true;return {validationFailed:true};}
+    current();paymentCurrent();dispatched=true;
+    branch='CLIENT';const receipt=await guarded(client.confirmPaymentAttempt!({...input,context,confirmationToken:token.confirmationToken.id,idempotencyKey:crypto.randomUUID()}));
+    if(receipt.nextActionAllowed===true){current();branch='NEXT_ACTION';await guarded(stripe!.handleNextAction({clientSecret:context!.clientSecret}));}
     // Neither a successful challenge nor an OBSERVE receipt establishes settlement.
     return receipt;
-   }catch(error){if(isAbort(error)||error instanceof PaymentSdkError)throw error;throw new PaymentSdkError('PROVIDER_RESULT_UNKNOWN');}
+   }catch(error){retain(branch);if(isAbort(error)||error instanceof PaymentSdkError)throw error;throw new PaymentSdkError('PROVIDER_RESULT_UNKNOWN');}
    finally{busy=false;if(!validationFailed)destroy();}
   }};
+  return handle;
  }catch(error){destroy();if(isAbort(error)||error instanceof PaymentSdkError)throw error;throw new PaymentSdkError('PROVIDER_TEMPORARILY_UNAVAILABLE');}
 }

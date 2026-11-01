@@ -1,4 +1,7 @@
-import test from 'node:test';
+import test, {before, after} from 'node:test';
+const originalFetch=globalThis.fetch;let transportCalls=0;
+before(()=>{globalThis.fetch=()=>{transportCalls++;throw new Error('offline test transport blocked');};});
+after(()=>{globalThis.fetch=originalFetch;assert.equal(transportCalls,0);});
 import assert from 'node:assert/strict';
 const api=await import('./stripe-billing-first-payment.mjs').catch(()=>({}));
 const opt=await import('./stripe-billing-first-payment-options.mjs').catch(()=>({}));
@@ -21,7 +24,7 @@ function harness(change={}){
 const journey=async p=>{await p.prepare({token:'customer-token',origin:scope().endpoints.demo},'create-original',limits());await p.confirm(confirmation(),limits());return true;};
 
 const browserMeta=await import('./stripe-billing-first-payment-browser-diagnostic.mjs');
-const browserCodes=['BROWSER_CONTEXT','BROWSER_PAGE','BROWSER_SETUP','BROWSER_NAVIGATION','BROWSER_CONFIGURE','BROWSER_OTP_REQUEST','BROWSER_OTP_VERIFY','BROWSER_PREPARE','BROWSER_ACTION_BRIDGE','BROWSER_SESSION_BRIDGE','BROWSER_CONFIRM_BRIDGE','BROWSER_WAIT_READY','BROWSER_CARD_NUMBER','BROWSER_CARD_EXPIRY','BROWSER_CARD_CVC','BROWSER_POSTAL_CHECK','BROWSER_POSTAL_FILL','BROWSER_PAY_CLICK','BROWSER_WAIT_OBSERVE','BROWSER_CLOSE'];
+const browserCodes=['BROWSER_CONTEXT','BROWSER_PAGE','BROWSER_SETUP','BROWSER_NAVIGATION','BROWSER_CONFIGURE','BROWSER_OTP_REQUEST','BROWSER_OTP_VERIFY','BROWSER_PREPARE','BROWSER_ACTION_BRIDGE','BROWSER_SESSION_BRIDGE','BROWSER_CONFIRM_BRIDGE','BROWSER_WAIT_READY','BROWSER_CARD_NUMBER','BROWSER_CARD_EXPIRY','BROWSER_CARD_CVC','BROWSER_POSTAL_CHECK','BROWSER_POSTAL_FILL','BROWSER_PAY_CLICK','BROWSER_WAIT_OBSERVE','BROWSER_CLOSE','BROWSER_CONFIRM_GUARD','BROWSER_CONFIRM_STATE','BROWSER_CONFIRM_SUBMIT_VALIDATION','BROWSER_CONFIRM_SUBMIT','BROWSER_CONFIRM_TOKEN_VALIDATION','BROWSER_CONFIRM_TOKEN','BROWSER_CONFIRM_CLIENT','BROWSER_CONFIRM_NEXT_ACTION','BROWSER_CONFIRM_RETIRED','BROWSER_CONFIRM_RECEIPT'];
 for(const code of browserCodes)test('owner captures trusted '+code+' only at BROWSER after acknowledged CREATE',async()=>{
  const h=harness(),owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies),error=browserMeta.browserFailure(code);browserMeta.finishBrowserCleanup(error,true);
  await assert.rejects(owner.run(async p=>{await p.prepare({token:'customer-token',origin:scope().endpoints.demo},'original-create',limits());throw error;},limits()));

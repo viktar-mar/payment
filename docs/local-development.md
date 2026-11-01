@@ -1761,3 +1761,43 @@ and nonretryable, cash remains unverified, and native initial-payment/full 5B
 remain **NOT_ACCEPTED**. Offline injected tests establish the diagnostic repair
 only. This source change grants no Sandbox execution, replay, recovery, new
 attempt, selector change, or financial authority.
+
+The private first-payment page now preserves confirmation branch provenance from
+one actual SDK handle through a closure-owned terminal snapshot. The SDK's nine
+internal categories are exactly `GUARD`, `STATE`, `SUBMIT_VALIDATION`, `SUBMIT`,
+`TOKEN_VALIDATION`, `TOKEN`, `CLIENT`, `NEXT_ACTION`, and `RETIRED`. The page adds
+`RECEIPT` when its existing returned-receipt checks refuse. The ten corresponding
+terminal labels are `BROWSER_CONFIRM_GUARD`, `BROWSER_CONFIRM_STATE`,
+`BROWSER_CONFIRM_SUBMIT_VALIDATION`, `BROWSER_CONFIRM_SUBMIT`,
+`BROWSER_CONFIRM_TOKEN_VALIDATION`, `BROWSER_CONFIRM_TOKEN`,
+`BROWSER_CONFIRM_CLIENT`, `BROWSER_CONFIRM_NEXT_ACTION`,
+`BROWSER_CONFIRM_RETIRED`, and `BROWSER_CONFIRM_RECEIPT`.
+
+These categories identify observed control-flow branches. `CLIENT` does not
+prove CONFIRM dispatch or provider acceptance; `TOKEN_VALIDATION` covers both a
+token validation result and a missing token. The internal handle WeakMap retains
+only its first finite category, without changing public SDK handles, results or
+errors. Ordinary SDK field-validation correction remains available. The dedicated
+page still permits one Pay only, reads provenance before clearing its handle,
+and exposes `__firstPaymentFailure()` as a nonconfigurable, nonwritable reader.
+It returns a primitive category only after STOPPED; success returns null. Normal
+successful final retirement remains compatible with OBSERVE.
+
+After its original prepare and Pay, the Node runner atomically samples terminal
+phase and category in its owned main frame and origin. It admits only the exact
+primitive labels from a valid own reader descriptor, then mints local terminal
+provenance. Unknown, absent, malformed, throwing or unavailable snapshots and
+nonterminal timeouts remain `BROWSER_WAIT_OBSERVE`. Earlier Node bridge or owner
+failures win, including an earlier null diagnostic; renderer and Node events do
+not establish a shared chronological ordering. The snapshot grants no payment,
+cash, retry or cleanup authority. Existing financial guards, deadlines, one final
+line under 160 characters, cleanup proof and private PREPARE allowlist remain.
+
+The safe consumed report for run `0d750060-5cf9-4009-b89e-c2dca1e4815c` records
+CREATE dispatch/acknowledgement, no CONFIRM dispatch/acknowledgement,
+`BROWSER_WAIT_OBSERVE` with confirmed cleanup, STOPPED runtime and all seven
+containers independently stopped. Its acknowledged CREATE is consumed and
+nonretryable. Cash is unverified, the historical root cause is unknown, and
+native initial-payment/full 5B remain **NOT_ACCEPTED**. Offline tests establish
+this diagnostic correction only; they grant no new runtime, replay, attempt,
+push or CI authority.
