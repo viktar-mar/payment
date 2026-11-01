@@ -1,6 +1,8 @@
+import {validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
+import {validateRenewalBoundary,validateRenewalFinalization} from './stripe-billing-first-renewal-response.mjs';
 import {validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {billingBounded,billingCheck,billingError} from './stripe-billing-limits.mjs';
-import {createBillingFirstPaymentRuntime,billingFirstPaymentDiagnostic,isBillingFirstPaymentDiagnostic} from './stripe-billing-first-payment-runtime.mjs';
+import {createBillingFirstPaymentRuntime,createBillingFirstRenewalRuntime,billingFirstPaymentDiagnostic,isBillingFirstPaymentDiagnostic} from './stripe-billing-first-payment-runtime.mjs';
 import {billingUuid} from './stripe-billing-provision.mjs';
 import {isBrowserDiagnostic,browserDiagnostic,browserCleanupConfirmed} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 // Terminal reporting only; the private PREPARE validator keeps its original set.
@@ -17,13 +19,15 @@ function startupDiagnostic(bootstrap){
  try{const read=Object.getOwnPropertyDescriptor(bootstrap,'startupDiagnostic')?.value;if(typeof read!=='function')return null;const code=read.call(bootstrap);return typeof code==='string'&&startupCodes.has(code)?code:null;}catch{return null;}
 }
 /** Single owner: construction is inert, run is explicit, uncertainty consumes all authority. */
-export async function createOwnedBillingFirstPayment(options,dependencies={}){
- const c=validateBillingFirstPaymentOptions(options);if(!c)throw billingError('OPT_IN_REQUIRED');
+export async function createOwnedBillingFirstPayment(options,dependencies={}){return createOwner(options,dependencies,false);}
+export async function createOwnedBillingFirstRenewal(options,dependencies={}){return createOwner(options,dependencies,true);}
+async function createOwner(options,dependencies,firstRenewal){
+ const c=(firstRenewal?validateBillingFirstRenewalOptions:validateBillingFirstPaymentOptions)(options);if(!c)throw billingError('OPT_IN_REQUIRED');
  let state='NEW',phase='NEW',failure=null,diagnostic=null,accepted=false,cleanupConfirmed=false,bootstrap,cli,fixture,runtime,cleanupPromise,active,finish;
  let journeyStarted=false,journeySettled=false,journeyClean=false;
  const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
  const checkIdentity=v=>{if(!originalIdentity||Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))fail('ACK');};
- const resources=()=>Object.freeze({runId:c.runId,expectedSource:c.expectedSource,scope:'OWNED_INITIAL_PAYMENT',status:state,phase,code:failure,diagnostic,initialAccepted:accepted,full5bAccepted:false,cleanupConfirmed});
+ const resources=()=>Object.freeze({runId:c.runId,expectedSource:c.expectedSource,scope:firstRenewal?'OWNED_INITIAL_AND_FIRST_RENEWAL':'OWNED_INITIAL_PAYMENT',status:state,phase,code:failure,diagnostic,initialAccepted:accepted,...(firstRenewal?{renewalAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
  const fail=(code,detail=null)=>{if(failure===null)diagnostic=isTerminalDiagnostic(detail)?detail:null;failure??=code;lifetime.abort();throw billingError(failure);};
  async function cleanup(){return cleanupPromise??=(async()=>{let ok=!journeyStarted||(journeySettled&&journeyClean);const l={deadline:Math.min(Date.now()+120000,(active?.deadline??Date.now())+120000)};for(const [o,m]of [[runtime,'close'],[cli,'stopListener'],[bootstrap,'stop'],[fixture,'close']])if(o)try{if(await billingBounded(l,x=>o[m](x),o===bootstrap?120000:30000)!==true)ok=false;}catch{ok=false;}cleanupConfirmed=ok;if(!ok)failure??='CLEANUP';return ok;})();}
  return Object.freeze({resources,
@@ -31,13 +35,13 @@ export async function createOwnedBillingFirstPayment(options,dependencies={}){
    try{billingCheck(limits);if(typeof journey!=='function'||limits.deadline>Date.now()+2700000)fail('LIMITS');const abort=()=>lifetime.abort();limits.signal?.addEventListener('abort',abort,{once:true});remove=()=>limits.signal?.removeEventListener('abort',abort);timer=setTimeout(abort,Math.max(1,limits.deadline-Date.now()));active={deadline:limits.deadline,signal:lifetime.signal};
     async function step(name,body,max=120000){if(failure)fail(failure);phase=name;try{return await billingBounded(active,body,max);}catch(error){fail(active.signal.aborted?'ABORTED':name,name==='START'?startupDiagnostic(bootstrap):preparePending?'PREPARE_REQUEST':name==='BROWSER'?browserDiagnostic(error):null);}}
     const requireTrue=async(name,body,max)=>{if(await step(name,body,max)!==true)fail(name,name==='START'?startupDiagnostic(bootstrap):null);};
-    const pf=await step('PREFLIGHT',async l=>(dependencies.preflight??(await import('./stripe-sandbox-owned.mjs')).preflightOwnedBillingFirstPayment)(c,...(dependencies.preflight?[l]:[{},l])));if(pf!==true&&pf?.status!=='READY')fail('PREFLIGHT');
-    bootstrap=await step('BOOTSTRAP',async()=>(dependencies.createBootstrap??(await import('./stripe-sandbox-bootstrap.mjs')).createOwnedBillingFirstPaymentBootstrap)(c));
+    const pf=await step('PREFLIGHT',async l=>(dependencies.preflight??(await import('./stripe-sandbox-owned.mjs'))[firstRenewal?'preflightOwnedBillingFirstRenewal':'preflightOwnedBillingFirstPayment'])(c,...(dependencies.preflight?[l]:[{},l])));if(pf!==true&&pf?.status!=='READY')fail('PREFLIGHT');
+    bootstrap=await step('BOOTSTRAP',async()=>(dependencies.createBootstrap??(await import('./stripe-sandbox-bootstrap.mjs'))[firstRenewal?'createOwnedBillingFirstRenewalBootstrap':'createOwnedBillingFirstPaymentBootstrap'])(c));
     await requireTrue('PREPARE',()=>bootstrap.prepare(active),2700000);
-    cli=await step('CLI',async()=>(dependencies.createCli??(await import('./stripe-sandbox-cli.mjs')).createBillingFirstPaymentCliAdapter)({configuration:c,cliDirectory:bootstrap.resources().cliDirectory,verifyForwardTarget:bootstrap.verifyForwardTarget,persistWebhookSecret:bootstrap.persistWebhookSecret}));
+    cli=await step('CLI',async()=>(dependencies.createCli??(await import('./stripe-sandbox-cli.mjs'))[firstRenewal?'createBillingFirstRenewalCliAdapter':'createBillingFirstPaymentCliAdapter'])({configuration:c,cliDirectory:bootstrap.resources().cliDirectory,verifyForwardTarget:bootstrap.verifyForwardTarget,persistWebhookSecret:bootstrap.persistWebhookSecret}));
     await requireTrue('LOGIN',async()=>(dependencies.login??(await import('./stripe-billing-login.mjs')).completeBillingLogin)(cli,c,active),780000);
     await requireTrue('BINDING',()=>cli.validateBinding(active));await requireTrue('LISTENER',()=>cli.startListener(active));await requireTrue('START',()=>bootstrap.start(active),2700000);
-    runtime=await step('RUNTIME',()=>(dependencies.createRuntime??createBillingFirstPaymentRuntime)({configuration:c,bootstrap}));await requireTrue('RUNTIME',()=>runtime.ready(active));
+    runtime=await step('RUNTIME',()=>(dependencies.createRuntime??(firstRenewal?createBillingFirstRenewalRuntime:createBillingFirstPaymentRuntime))({configuration:c,bootstrap}));await requireTrue('RUNTIME',()=>runtime.ready(active));
     fixture=await step('FIXTURE',async()=>(dependencies.createFixture??(await import('./stripe-billing-provision.mjs')).createBillingFixture)({configuration:c,bootstrap,cli}));await requireTrue('PROVISION',l=>fixture.provision(l));
     const child=l=>{billingCheck(active);billingCheck(l);return {deadline:Math.min(active.deadline,l.deadline),signal:l.signal?AbortSignal.any([active.signal,l.signal]):active.signal};};
     async function guarded(name,l,body){try{if(failure)fail(failure);return await billingBounded(child(l),body,120000);}catch(error){fail(name,billingFirstPaymentDiagnostic(error)??(name==='DISPATCH'&&preparePending?'PREPARE_REQUEST':null));}}
@@ -68,6 +72,12 @@ export async function createOwnedBillingFirstPayment(options,dependencies={}){
     let settlement;for(let i=0;i<30;i++){const v=await step('OBSERVE',l=>runtime.observe(l));checkIdentity(v);if(v.phase==='SETTLED_LOCAL'){settlement=v;break;}if(v.phase!=='OBSERVE')fail('OBSERVE');if(i<29)await step('OBSERVE',l=>(dependencies.pause??(()=>new Promise(r=>setTimeout(r,1000))))(l));}if(!settlement)fail('OBSERVE');
     if(Date.parse(settlement.access_evaluated_at)/1000!==c.frozenTime||Date.parse(settlement.access_valid_until)/1000!==c.frozenTime+300||!(Date.parse(settlement.period_start)/1000<=c.frozenTime)||!(Date.parse(settlement.paid_through)/1000>c.frozenTime))fail('EVIDENCE');
     const proof=await step('EVIDENCE',async l=>(dependencies.prove??(await import('./stripe-billing-first-payment-evidence.mjs')).proveBillingFirstPaymentEvidence)({configuration:c,bootstrap,fixture,settlement},l));if(!proof||!['ownedVerified','cashVerified','journalVerified','signedCallbacksVerified'].every(k=>proof[k]===true))fail('EVIDENCE');billingCheck(active);
+    if(firstRenewal){
+     const boundary=await step('RENEWAL_BOUNDARY',async l=>validateRenewalBoundary(await runtime.boundary(l),originalIdentity,settlement));
+     const renewalSettlement=await step('RENEWAL_FINALIZATION',async l=>validateRenewalFinalization(await runtime.finalization(l),originalIdentity,boundary));
+     const renewalProof=await step('RENEWAL_EVIDENCE',async l=>(dependencies.proveRenewal??(await import('./stripe-billing-first-renewal-evidence.mjs')).proveBillingFirstRenewalEvidence)({configuration:c,bootstrap,fixture,boundary,settlement:renewalSettlement},l));
+     if(!renewalProof||!['ownedVerified','cashVerified','journalVerified','signedCallbacksVerified'].every(k=>renewalProof[k]===true))fail('RENEWAL_EVIDENCE');billingCheck(active);
+    }
    }catch{failure??=lifetime.signal.aborted?'ABORTED':'FAILED';}
    finally{clearTimeout(timer);remove();lifetime.abort();selected=null;await cleanup();state='CLOSED';finish();}
    if(failure)throw billingError(failure);accepted=true;phase='COMPLETE';return resources();

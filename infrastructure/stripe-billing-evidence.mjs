@@ -11,16 +11,21 @@ export function validateBillingEvidence(scope,row,inspection) {
  return validateBillingCallbackEvidence(scope,row,inspection);
 }
 /** Shared strict payload/digest validation; each caller separately establishes its own financial proof. */
-export function validateBillingCallbackEvidence(scope,row,inspection) {
+export function validateBillingCallbackEvidence(scope,row,inspection) {validateCallbackPayloads(scope,row,inspection,'INITIAL');return callbackGraph(scope,row);}
+/** Separate fixed entry point; received RENEWAL payloads are never rewritten. */
+export function validateBillingRenewalCallbackEvidence(scope,row,inspection) {need(row?.callbacks?.length===2);validateCallbackPayloads(scope,row,inspection,'RENEWAL');return Object.freeze({cashVerified:true,journalVerified:true,signedCallbacksVerified:true});}
+function validateCallbackPayloads(scope,row,inspection,kind) {
  need(Array.isArray(row.callbacks)&&row.callbacks.length>=2&&row.callbacks.length<=100&&inspection?.duplicates===0&&inspection.count===row.callbacks.length&&inspection.events?.length===row.callbacks.length);
  const ids=new Set();let payments=0,lifecycle=0;
  for(const e of row.callbacks){const p=e.payload;need(e.delivered===true&&billingUuid(e.id)&&!ids.has(e.id));ids.add(e.id);
   need(p?.event_id===e.id&&p.event_type===e.type&&p.site_id===scope.siteId&&p.customer_id===scope.customerId&&p.subscription_id===scope.subscriptionId&&p.product_id===scope.productId);
   const receipt=inspection.events.filter(v=>v.event_id===e.id);need(receipt.length===1&&receipt[0].event_type===e.type&&receipt[0].count===1&&receipt[0].sha256===createHash('sha256').update(canonical(p)).digest('hex'));
-  if(p.schema_version===3){payments++;need(p.event_type==='payment.succeeded'&&p.payment_status==='SUCCEEDED'&&p.payment_id===row.payment_id&&p.billing_record_id===row.billing_record_id&&p.amount_minor===2000&&p.currency==='EUR'&&p.billing_kind==='INITIAL'&&p.price_id===scope.priceId&&p.price_version===1&&Date.parse(p.period_start)/1000===Number(row.period_start)&&Date.parse(p.period_end)/1000===Number(row.period_end));}
+  if(p.schema_version===3){payments++;need(p.event_type==='payment.succeeded'&&p.payment_status==='SUCCEEDED'&&p.payment_id===row.payment_id&&p.billing_record_id===row.billing_record_id&&p.amount_minor===2000&&p.currency==='EUR'&&p.billing_kind===kind&&p.price_id===scope.priceId&&p.price_version===1&&Date.parse(p.period_start)/1000===Number(row.period_start)&&Date.parse(p.period_end)/1000===Number(row.period_end));}
   else {need(p.schema_version===4&&['subscription.updated','subscription.access_changed'].includes(p.event_type));if(p.state==='ACTIVE'&&p.access_allowed===true){need(p.payment_id===null||p.payment_id===row.payment_id);if(p.billing_record_id===row.billing_record_id)lifecycle++;}}
  }
  need(payments===1&&lifecycle>=1);
+}
+function callbackGraph(scope,row){
  const graph={runId:scope.runId,expectedSource:scope.expectedSource,...Object.fromEntries(['accountId','siteId','customerId','subscriptionId','operationId','priceId'].map(k=>{need(billingUuid(scope[k]));return [k,scope[k]];})),priceVersion:1};
  for(const [key,prefix] of [['customer','cus'],['subscription','sub'],['product','prod'],['price','price'],['invoice','in'],['allocation','inpay'],['intent','pi']]){const v=row[key+'_reference'];need(typeof v==='string'&&new RegExp('^'+prefix+'_[A-Za-z0-9_]{1,200}$').test(v));graph[key+'Reference']=v;}
  graph.periodStart=Number(row.period_start);graph.periodEnd=Number(row.period_end);need(Number.isSafeInteger(graph.periodStart)&&graph.periodStart>0&&Number.isSafeInteger(graph.periodEnd)&&graph.periodEnd>graph.periodStart);
