@@ -158,6 +158,9 @@ class OwnedFirstRenewalAdmissionIntegrationTest extends StripeBillingClockConfir
             +",\"jit\":"+measured.get("JIT")+",\"nodes\":"+new com.google.gson.Gson().toJson(nodes)
             +",\"rows\":"+measured.getAsJsonObject("Plan").get("Actual Rows")+"}"));
         assertThat(measured.getAsJsonObject("Plan").get("Actual Rows").getAsInt()).isEqualTo(1);
+        assertThat(measured.get("Planning Time").getAsDouble()+measured.get("Execution Time").getAsDouble())
+            .as("The exact owned proof must leave headroom for repeated checks under the five-second lifecycle lock bound")
+            .isLessThan(1000.0);
     }
     private static void collectPlanNodes(com.google.gson.JsonObject plan,java.util.Map<String,Integer> counts) {
         counts.merge(plan.get("Node Type").getAsString(),1,Integer::sum);

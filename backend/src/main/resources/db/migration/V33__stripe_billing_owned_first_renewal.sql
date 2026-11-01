@@ -20,11 +20,13 @@ create table stripe_billing_first_renewals (
 
 -- Read only. Caller owns lifecycle locks, or provider-step -> Site -> Customer -> Account.
 -- A consumed association/OBSERVE is only one relation in this complete paid proof.
+-- This exact-ID proof follows a selective FK chain. Bound join-order search to its declared
+-- order inside this function only; unconstrained planning held lifecycle locks for seconds.
 create function owned_first_renewal_paid(owned_id uuid) returns table(
  root_id uuid,attempt_id uuid,attempt_version bigint,bill_id uuid,bill_version bigint,payment_id uuid,payment_version bigint,
  invoice_reference varchar,allocation_reference varchar,payment_intent_reference varchar,
  subscription_revision bigint,policy_version bigint,root_proof varchar)
- language sql stable as $$
+ language sql stable set join_collapse_limit=1 as $$
  select g.id,t.id,t.version,b.id,b.version,p.id,p.version,g.billing_invoice_reference,g.billing_allocation_reference,
   g.billing_intent_reference,s.revision,i.policy_version,g.billing_proof
  from stripe_billing_owned_subscriptions i

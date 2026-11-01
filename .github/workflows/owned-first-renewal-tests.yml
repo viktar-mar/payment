@@ -1,4 +1,4 @@
-name: Owned first renewal paid-proof diagnostic
+name: Owned first renewal tests
 
 on:
   push:
@@ -46,6 +46,6 @@ jobs:
           docker buildx version
       - name: Prepare local test issuer
         run: node infrastructure/init-local-customer-issuer.mjs
-      - name: Diagnose paid-proof execution plan (not full GREEN)
+      - name: Verify owned first renewal contracts
         working-directory: backend
-        run: ./mvnw -B -ntp '-Dtest=OwnedFirstRenewalAdmissionIntegrationTest#paidProofExecutionPlan' test
+        run: ./mvnw -B -ntp '-Dtest=*FirstRenewal*Test,StripeBillingClockStorePolicyTest,StripeBillingSnapshotMapperTest,StripeBillingClockConfirmationCompositionIntegrationTest' test
