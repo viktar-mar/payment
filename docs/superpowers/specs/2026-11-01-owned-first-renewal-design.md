@@ -1,0 +1,110 @@
+# Owned first unchanged-terms renewal — design
+
+Дата: 2026-11-01. **Предложение для последующей реализации; capability не включена.**
+Основание: [5B §§4,5,7](2026-10-28-stripe-billing-5b-design.md), [план подготовки](../plans/2026-11-01-billing-5b-evidence-refresh.md).
+Прочитанный HEAD: `3b9114c9599a59efe0e5290d2992c5f57b8c564c`. Stage 5B **NOT_ACCEPTED**; native initial acceptance остаётся незавершённой. Последняя попытка `150000ac` остановилась до CREATE/CONFIRM; её authority потреблена. Этот документ не разрешает новый запуск.
+
+## 1. Цель и границы
+
+Добавить внутренний typed путь для **одного первого успешного renewal без изменения terms**, от реально оплаченного owned initial до второго локального CASH-факта. Его потребители: новый advance adapter, typed snapshot mapper, scoped billing-time selector и публикация через существующий `SubscriptionFactService`. SDK-проверки появляются вместе с этими потребителями.
+
+- Сохранить `stripe-java 34.0.0` и API `2026-09-30.endive`. Default Fake и отключённый Stripe не требуют ключей.
+- Только исходный sandbox Account/Site/Customer/Subscription, один item, quantity1, неизменный MONTH/YEAR Price, card/automatic/classic, trial_days=0; без tax expansion, credits/discounts, schedule, pending update, cancel, debt, recovery и grace-сценариев.
+- Только additive migration V33. V30–V32, исходный F/`ReadyClock`, receipts, fingerprints, original initial-only guards и старые consumed/UNKNOWN/DISPATCHING неизменны.
+- Нет public/scheduled advance, обычной Spring-регистрации, нового launcher/framework, ordinary fallback, автоматического confirm/pay/finalize, третьего advance или принятия старых fixtures.
+- Operational UTC для JWT/OTP/signature/leases/retry/callback delivery не сдвигается. Документ не даёт runtime/финансового бюджета.
+
+## 2. Проверенные исходники и документальные пределы
+
+Проверено чтением исходников, без запуска:
+
+- [ReadyClock](../../../backend/src/main/java/dev/genericpayments/platform/provider/application/model/ReadyClock.java) требует `frozenTime==owner.initialFrozenTime()`. [V30](../../../backend/src/main/resources/db/migration/V30__stripe_billing_owned_test_clocks.sql), [V31](../../../backend/src/main/resources/db/migration/V31__stripe_billing_owned_subscriptions.sql), [V32](../../../backend/src/main/resources/db/migration/V32__stripe_billing_owned_initial_confirmation.sql) защищают original evidence/одноразовое подтверждение.
+- [OwnedInitialConfirmationProof](../../../backend/src/main/java/dev/genericpayments/platform/provider/application/model/OwnedInitialConfirmationProof.java) кодирует preconfirmation association, а не оплату. `requireConfirmationReceipt` и `owned_initial_confirmation_available` требуют INCOMPLETE/unpaid и nonterminal CREATE; paid-renewal admission через них невозможен.
+- [SnapshotMapper](../../../backend/src/main/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/StripeBillingSnapshotMapper.java) в `OwnedInitial` требует ровно один INITIAL и исходные created/item/period. CASH проверяет InvoicePayment→PI→captured Charge и обратный invoice-payment join; статус/время отдельно оплаты не доказывают.
+- [FactService](../../../backend/src/main/java/dev/genericpayments/platform/subscriptions/application/service/SubscriptionFactService.java) принимает unchanged isolated INITIAL/RENEWAL CASH/OPEN, но `initialPending` исключает лишь INITIAL+INCOMPLETE. Renewal OPEN при past_due/unpaid/incomplete может создать debt/grace; промежуточный renewal нельзя ему передавать.
+- [OwnedSubscriptionBillingTime](../../../backend/src/test/java/dev/genericpayments/platform/support/OwnedSubscriptionBillingTime.java) — test-support, caller-transaction/nonlocking seam, требует original F внутри original period. Новый later-time путь нужен отдельно.
+- [Confirmation fixture](../../../backend/src/test/java/dev/genericpayments/platform/support/StripeBillingClockConfirmationCompositionFixture.java) и [composition test](../../../backend/src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/StripeBillingClockConfirmationCompositionIntegrationTest.java) проходят настоящий local create→confirmation→fresh CASH→FactService; `assertPaid()` проверяет INITIAL, CREATE SUCCEEDED, Payment/events/outbox/access. Это нужный predecessor, а не вставка успешного Payment.
+
+Официальные тексты прочитаны root 2026-11-01; повторного online/pinned-wire наблюдения здесь нет:
+
+- [advance](https://docs.stripe.com/api/test_clocks/advance): target строго вперёд, максимум два shortest intervals; POST ACK может иметь старый frozen_time и не иметь status_details. Пример публичной версии `2026-10-28.endive` новее pin, поэтому не доказывает wire-контракт `2026-09-30.endive`.
+- [clock object](https://docs.stripe.com/api/test_clocks/object): advancing/ready/internal_failure, optional advancing details. Готовность устанавливает отдельный bounded GET.
+- [advanced usage](https://docs.stripe.com/billing/testing/test-clocks/api-advanced-usage): пример renewal сначала идёт к boundary, затем ещё на час для finalization/autopay; draft около часа. Это основание двух шагов, а не гарантия оплаты/точного срока. Один скачок на boundary+hour не принимается как эквивалент.
+
+Все интерфейсы/лимиты ниже — **проектные решения**, не реализованные возможности и не пользовательская приёмка.
+
+## 3. Paid admission и транзакционные границы
+
+`OwnedFirstRenewal.Admission` создаёт новый `OwnedFirstRenewalStore.admitPaid(receipt, sourceSha, utcAt)` в caller lifecycle transaction. Он заново читает всю lineage, не доверяет переданному record/hash/status:
+
+1. Original owner/run/API/account credentials/external account, original clock ACK+READY, customer binding+ACK, owned intent/subscription receipt+CREATE-provider ACK точны, owner не stopped, Account/Site/Customer active, policy enabled с исходной version, catalog mappings/terms прежние.
+2. Local CREATE той же subscription/site/customer имеет kind CREATE, **SUCCEEDED**, исходные key/fingerprint/expectedRevision/policyVersion/provider ref. Subscription ACTIVE, billingPrice==entitledPrice==original terms, currentPeriod==original receipt period `[S,E)`, paidThrough==E; trial/debt/pendingChange/cancellation отсутствуют; нет unresolved financial operation.
+3. Ровно один INITIAL BillingRecord, `CONFIRMED_CASH`, exact account/site/subscription/invoice/terms/amount/currency/`[S,E)`, без previous price. Ровно один связанный Payment: `source=SUBSCRIPTION`, `status=SUCCEEDED`, refundedAmount=0; exact account/site/customer/PI/amount/currency/tax и `SubscriptionBillingContext` (bill ID, subscription, INITIAL, product/price/version, invoice, period, no previous price).
+4. Исходный consumed owned-initial root связывает invoice/allocation/PI с receipt через оригинальный descriptor; соответствующий original attempt был durably dispatched без successor/retry. Его OBSERVE/REQUIRES_ACTION или сама association не заменяют пункты 2–3. Persist original root/bill/payment IDs и версии, invoice/allocation/PI, current subscription revision, policy и полную immutable lineage в новом admission; ни токенов, ни secrets.
+5. Нет прежнего renewal admission для этой owned subscription; sourceSha — exact 40-hex source для будущего source-bound gate. Дальнейшие шаги обязаны сохранить paid predecessor и локальные revision/terms; повторный вызов только возвращает точную сохранённую admission без IO, drift отказывает.
+
+Существующие порядки различаются: `JdbcStripeBillingClockStore.lockScope` фактически Account→Site→Customer; `JdbcStripeBillingClockSubscriptionStore.lockOwner` — Site→Customer→Account; lifecycle `FactService` — sorted operation(s)→Site→Customer→Account→Subscription. Это наблюдение кода, не основание менять старые helpers.
+Новая admission/publication использует lifecycle порядок (включая original CREATE как candidate), без вызова REQUIRES_NEW clock/provider store из уже удерживаемых locks. Advance claim/ACK/READY — отдельные короткие transactions: provider-step row→Site→Customer→Account, затем только plain lifecycle reads; никогда не ждут operation/Subscription row под provider-step/Account locks и не вызывают legacy Account-first helper. Новый claim hook обязан взять owned Site/Customer перед generic requirePinnedAccount, иначе возникнет Account→Site инверсия. Stop берёт только Account exclusive. Account сериализует revoke/publication; CAS revision проверяется повторно. HTTP всегда вне transaction; phase revalidation после IO обязательна. Hosted race tests обязаны подтвердить порядок.
+
+## 4. Две конечные single-dispatch стадии
+
+Обозначения: F — исходный immutable READY, `[S,E)` — original period, B=E, T=E+3600 секунд. Один admission допускает **BOUNDARY(B)** и затем **FINALIZATION(T)**; третьего шага нет. Перед B валидировать strictly-forward и provider interval limit для выбранного единственного MONTH/YEAR item. После READY1 provider-derived следующий период `[E,N)` обязан содержать T (`E<T<N`); N не вычисляется через plusMonths/plusYears (Jan31/Feb28 anchor).
+
+Новые типы в `provider/application/model/OwnedFirstRenewal.java`: `Admission`, `Step {BOUNDARY, FINALIZATION}`, `Advance`, `Ack`, `LaterReady`, `Boundary`, sealed `Observation` (`Pending|Paid`). Каждый содержит admission ID; step identity — `(admission, ordinal 1|2)`, source/predecessor/target и версионированный canonical SHA-256 fingerprint. Key: `billing-renewal-advance-v1:<admission UUID>:<ordinal>`. Step2 ссылается на READY1 и сохранённое boundary observation.
+
+Новая V33 создаёт:
+
+- `stripe_billing_first_renewals`: immutable admission, unique owned subscription, exact original lineage/paid proof/source/revision.
+- `stripe_billing_first_renewal_steps`: immutable intents, unique `(admission_id, ordinal)`, target/key/fingerprint/predecessor; resource ID нового `ProviderOperation.Kind.TEST_CLOCK_ADVANCE`. Dispatch state/claim/version/lease/UNKNOWN переиспользуют `provider_operations`, отдельной CAS-машины нет.
+- `stripe_billing_first_renewal_acks`: append-only exact POST evidence и исходные claimant/deadline, атомарно с owned-only ACK; POST fields не объявляются READY.
+- `stripe_billing_first_renewal_ready`: append-only exact GET evidence, unique step; FK admission+step+ACK identity, clock reference/name/created/deletes_after/frozen time/status, observedAt UTC.
+- `stripe_billing_first_renewal_boundary`: append-only provider-derived invoice/item/period observation, FK READY1; допускает только один INITIAL и один первый RENEWAL.
+- `stripe_billing_first_renewal_publications`: append-only admission→renewal bill/payment/projected revision, в одной транзакции с FactService; позволяет exact replay без требования старой current revision.
+
+Triggers/FKs запрещают UPDATE/DELETE immutable evidence, изменение OLD provider identity, очистку consumed history, возврат в RESERVED, второй ordinal/target/key, READY без exact original ACK; ACK+receipt и READY inserts атомарны. Отдельный terminal stop marker на admission допускает только null→UTC reason, original owner stop/revoke всегда сильнее. Нельзя переписать original ReadyClock или создать fake initial receipt.
+
+V33 добавляет kind, сохраняя все старые CHECK members; reference index исключает **только дополнительно TEST_CLOCK_ADVANCE** (оба шага ACK одного clock), сохраняя старое исключение SUBSCRIPTION_UPDATE. Вместо глобальной uniqueness новый composite FK/unique step закрепляет clock+ordinal+owner. `firstDispatchOnly`, resource/account/reference guards и generic ACK refusal расширяются именно этим owned kind; special ACK пишет receipt атомарно. `StripeRecoveryProofAdapter`, `StripeInboxResolutionAdapter` и store bindRecovered/lockRecovery не получают advance recovery. Generic reserve для этого kind всегда отказывает до Account lock; special reservation требует exact persisted intent и owned lock order.
+
+| Стадия | Admission и действия | Разрешённый результат |
+|---|---|---|
+| BOUNDARY | Полный paid predecessor из §3; original READY F; claim и один exact predispatch GET проверяют predecessor до единственного POST advance(B), retries0 | ACK — только ответ POST; затем ≤12 exact clock GET, минимум 250ms между reads, общий monotonic deadline 30s, каждый request timeout ≤2s, claim lease 60s UTC |
+| READY1 | GET exact reference/object/test-mode/name/created/deletes_after, `status=ready`, frozen=B, нет contradictory advancing details | Immutable LaterReady1; затем один private boundary graph read, ≤100 запросов включая clock brackets, ≤10 pages×10 rows per list, 30s monotonic/2s request; не FactService |
+| FINALIZATION | Original paid proof+unchanged local revision/terms **и** READY1+boundary record `[E,N)`, T внутри него; не требовать B внутри `[S,E)` | Один predispatch GET проверяет READY1, единственный POST advance(T), свой key/claim, тот же bounded clock GET budget; сохранить LaterReady2 |
+| Paid read | После READY2 до 3 полных authoritative graph attempts, ≤100 requests каждый, ≥250ms между попытками, monotonic deadline 30s, request timeout ≤2s | Лишь typed Paid допускает publication; Pending после лимита → STOPPED, без debt/access/следующего advance |
+
+Сроки — ceilings, не обещание готовности. Ни HTTP retries, ни перенос read budget между вызовами, ни background polling. Live claimant один: повторный вызов с DISPATCHING/ACK без READY, истёкший lease, crash/потерянный ответ/ошибка записи/timeout/internal_failure/mismatch прекращают сценарий. Consume-before-POST сохраняется даже при неизвестном результате; takeover/recovery/replay POST и новые keys запрещены. GET после ACK доступен только исходному live invocation; завершённый точный READY можно вернуть локально без сети. Optional ACK advancing target проверяется, если присутствует; его отсутствие не отказ, старый frozen_time допустим. ACK никогда не означает READY или paid.
+
+При любом drift credentials/account/site/customer/policy/terms/revision/lineage: stop, никакой публикации и следующего POST. Сбой не доказывает отсутствия provider charge; сохранить evidence, не компенсировать автоматически.
+
+## 5. Typed renewal mapping и промежуточные invoices
+
+Новый `StripeBillingSnapshotMapper.retrieveOwnedFirstRenewal(client, ownership, admission, laterReady, observedAt)` возвращает внутренний `MappedObservation` (`MappedPending|MappedPaid`) без publication authority; adapter создаёт `Pending` либо `Paid` с обязательным captured fence. Обычные/OwnedInitial entrypoints сохраняют прежние условия. Новый `StripeBillingFirstRenewalAdapter.observe(admission, laterReady)` до/после graph читает exact current clock и revalidates persisted admission/revision, без обычного registry; publication заново сверяет DB fence.
+
+- Remote account/customer/subscription/test_clock, original subscription created/item, automatic/classic, exact catalog mappings/quantity/terms/absence of trial/cancel/pending/schedule/debt drift обязательны. Remote item period и renewal line period совпадают с `[E,N)`. Original INITIAL остаётся exact `[S,E)`, original invoice/PI/CASH identity сохранены; ровно один distinct RENEWAL `subscription_cycle`, не proration. Missing/extra invoices/items/lines, gap/overlap, чужая lineage, третья cycle — refusal.
+- Boundary допускает verified draft/OPEN и ещё не созданные allocation/PI как `Pending`; это отсутствие paid proof, а не unsupported→CASH coercion. Не нормализовать draft как failed renewal, не создавать BillingRecord/Payment/events/outbox, не менять revision/paidThrough/grace. Даже ранний paid на boundary остаётся private; FINALIZATION и новое paid read обязательны.
+- После READY2 draft/OPEN/ещё не paid PI остаются `Pending` и используют только остаток bounded read budget. Void/uncollectible, failure/action-required, неподдержанная форма/credits/нулевая сумма — stop, отдельные будущие сценарии.
+- `Paid` содержит Snapshot ACTIVE, original INITIAL CASH + ровно один RENEWAL CASH, period `[E,N)`, null operationKey/operationObservation, providerRevision=0. Ни event.created/event ID, ни invoice.status, ни clock READY не являются payment proof.
+- Renewal CASH требует существующий полный cash graph: exact positive catalog amount/currency, invoice paid/full remaining0/no outside funding/balance/credits/discounts, single paid allocation с amount_requested==amount_paid==due, succeeded automatic card PI с amount_received==due, exact captured+paid succeeded Charge, единственный обратный allocation join. Все обязательные нули остаются typed zero, не null.
+- Существующие узкие OwnedInitial allowances для исторического INITIAL сохраняются только в original-history branch. Для новой renewal line требуются exact flat и nested subscription/item associations; nullable off-stripe amount не объявляется нулём. Pinned wire может это не дать: safe refusal и отдельное обоснованное изменение дизайна, не ослабление original guards.
+
+## 6. Время, fence и публикация
+
+Реальный consumer later evidence — отдельный hosted-only `OwnedFirstRenewalBillingTime` (`src/test/.../support`), реализующий существующий [SubscriptionBillingTimePort](../../../backend/src/main/java/dev/genericpayments/platform/subscriptions/application/port/out/SubscriptionBillingTimePort.java). Ordinary adapter/UTC и original `OwnedSubscriptionBillingTime` неизменны.
+
+Selector начинает с owner admission, не successful inner join: без renewal admission делегирует original sampler; после admission выбирает **наивысший подготовленный ordinal**. Отсутствующий/неполный/сломанный/terminal шаг, stopped owner или mismatch ⇒ refusal, никогда old F/UTC fallback. READY1 даёт B, READY2 — T; при DISPATCHING2 READY1 уже не current. Выбор и повторная проверка — одним nonlocking SQL в caller transaction, без store proxy/new locks. requireUnscopedAllowed продолжает блокировать любой scope с admitted owner, включая stopped.
+
+Later time само не продлевает paidThrough: на B/T original paidThrough==E уже истёк, доступ не выдать. Не вызывать expiry/sweep, не материализовать grace на private Pending. Source clocks для recordedAt/receivedAt/createdAt/leases остаются UTC; cash occurredAt — provider allocation paid_at как opaque occurrence, callback lifecycle occurredAt — billingAt; подпись webhook t проверяется UTC.
+
+`OwnedFirstRenewalPublicationService.publish(admission, ready2, paid)` — отдельный internal consumer, не raw Snapshot entry. Capture existing revision/financial selection/observation fence до graph; в caller lifecycle transaction revalidate paid admission и READY2/current ordinal, fresh fence, immutable boundary period/invoice и Paid shape. Затем **тот же transaction** вызывает существующий FactService; атомарность cash/journal/events/outbox и stale rejection сохраняются. Publication не вызывает confirmation guards и не изобретает новую CREATE. На success currentPeriod=`[E,N)`, paidThrough=N; original CREATE остаётся SUCCEEDED.
+
+Admission фиксирует original revision как provenance; service после FactService вставляет publication receipt с exact RENEWAL bill/payment/projected revision **до того же commit**. Exact повторное paid observation допускается только с новым fence и проверенным publication receipt+опубликованными bill/payment той же lineage; повторная publication не создаёт новые Payment/events/outbox. Между original paid admission и первым publish никакой revision drift не разрешён. Failed/stale transaction ничего финансового не пишет. Selector после publish проверяет terminal paid lineage/current projected revision вместо старой revision. Publication completion — существующий CASH-факт, не необратимый флаг до commit.
+
+## 7. Проверка и future authority
+
+[План реализации](../plans/2026-11-01-owned-first-renewal-implementation.md) закрепляет реальные consumer tests: genuine initial confirmation predecessor; SQL tamper/claim race; mocked pinned SDK transport advance→READY→mapping; caller-time/fence→FactService→cash/outbox/access. Direct SDK-only suite до consumer не нужен.
+
+Подготовка проверяет лишь source paths, связность текста/ссылок и whitespace. Ни compile/test/Docker/Stripe, ни provider timing/wire не проверены. Hosted full checkpoint — все три jobs существующего [CI](../../../.github/workflows/ci.yml) на одном exact future SHA после реализации; старый успешный CI `41302204254` относится только к `3b9114c`, renewal не покрывает. Изменение source обнуляет gate.
+
+Native acceptance — отдельно разрешённый новый fresh run после exact-source hosted success и первоначальной paid acceptance: explicitly budget **initial EUR20 + один renewal EUR20**, два advance B/T, fresh clock/customer/subscription/create/confirm и bounded reads. Старые EUR13, UNKNOWN/DISPATCHING и run150000ac не принимаются как predecessor. Новый native execution/publication launcher не входит в этот план; текущая authority отсутствует. Stage 5B остаётся NOT_ACCEPTED до всей предусмотренной приёмки.
+
+Оставшиеся существенные внешние проверки: pinned optional/flat invoice fields, automatic payment-method persistence и фактическое invoice/finalization timing. При отказе двух шагов сценарий останавливается; расширение budget, weakening evidence или третий шаг потребуют нового scoped решения. Открытых локальных продуктовых решений для написания consumer-кода здесь не оставлено; это не human acceptance дизайна.
