@@ -57,7 +57,7 @@ class OwnedFirstRenewalAdmissionIntegrationTest extends StripeBillingClockConfir
         assertThat(count("stripe_billing_first_renewal_steps")).isZero();
         assertThat(http.calls).hasSize(calls);assertThat(financialState()).isEqualTo(before);
     }
-    @ParameterizedTest @ValueSource(strings={"create","revision","policy","credentials","refunded","period","trial","price"})
+    @ParameterizedTest @ValueSource(strings={"create","revision","policy","credentials","refunded","period","trial","price","account","billVersion","paymentVersion","entitled","cancel","debt","pending"})
     void refusesPaidPredecessorDriftWithoutDispatch(String drift) {
         genuinePaid();
         // Persist genuine admission first: subsequent calls must revalidate, never trust the record.
@@ -71,14 +71,84 @@ class OwnedFirstRenewalAdmissionIntegrationTest extends StripeBillingClockConfir
             case "period"->jdbc.update("update subscriptions set current_period_end=current_period_end+interval '1 second' where id=?",current().id());
             case "trial"->jdbc.update("update subscriptions set trial_start=current_period_start,trial_end=current_period_end where id=?",current().id());
             case "price"->jdbc.update("update subscriptions set entitled_amount_minor=entitled_amount_minor+1 where id=?",current().id());
+            case "account"->jdbc.update("update payment_accounts set account_status='DISABLED' where id=?",billing.id().value());
+            case "billVersion"->jdbc.update("update subscription_billing_records set version=version+1 where id=?",admitted.bill());
+            case "paymentVersion"->jdbc.update("update payments set version=version+1 where id=?",admitted.payment());
+            case "entitled"->jdbc.update("update subscriptions set entitled_interval='YEAR' where id=?",current().id());
+            case "cancel"->jdbc.update("update subscriptions set cancellation_effective_at=current_period_end where id=?",current().id());
+            case "debt"->jdbc.update("update subscriptions set debt_billing_record_id=?,debt_period_start=current_period_start,debt_period_end=current_period_end where id=?",admitted.bill(),current().id());
+            case "pending"->jdbc.update("update subscriptions set pending_operation_id=?,pending_effective_at=current_period_end,pending_state='SCHEDULED',pending_price_id=billing_price_id,pending_price_key=billing_price_key,pending_price_version=billing_price_version,pending_amount_minor=billing_amount_minor,pending_interval=billing_interval,pending_trial_days=billing_trial_days,pending_trial_policy=billing_trial_policy,pending_tax_mode=billing_tax_mode where id=?",receipt.intent().createOperation(),current().id());
         }
         int calls=http.calls.size();var before=financialState();
         assertThatThrownBy(()->service().admit(receipt,SOURCE)).isInstanceOf(RuntimeException.class);
         assertThat(count("stripe_billing_first_renewal_steps")).isZero();
         assertThat(http.calls).hasSize(calls);assertThat(financialState()).isEqualTo(before);
     }
+    @Test void rejectsUnconsumedRootEvenWhenFreshCashAlreadyExists() {
+        beginConfirmation();issueAndSelect();
+        var captured=fence();apply(paidObservation(),captured);assertPaid();
+        assertThat(jdbc.queryForObject("select consumed_at from subscription_action_capabilities",java.sql.Timestamp.class)).isNull();
+        var before=financialState();int calls=http.calls.size();
+        assertThatThrownBy(()->service().admit(receipt,SOURCE)).isInstanceOf(RuntimeException.class);
+        assertThat(count("stripe_billing_first_renewals")).isZero();
+        assertThat(http.calls).hasSize(calls);assertThat(financialState()).isEqualTo(before);
+    }
+    @Test void databaseRefusesForeignInitialPaymentContext() {
+        genuinePaid();
+        for(var assignment:java.util.List.of("billing_record_id=gen_random_uuid()","subscription_invoice_reference='in_foreign'",
+                "provider_payment_reference='pi_foreign'","subscription_period_end=subscription_period_end+interval '1 second'",
+                "amount_minor=amount_minor+1","payment_account_id=gen_random_uuid()","customer_id=gen_random_uuid()"))
+            assertThatThrownBy(()->jdbc.update("update payments set "+assignment))
+                .as("Original immutable payment context rejects "+assignment)
+                .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+        assertThat(admitGenuinePaid()).isNotNull();
+    }
+    @Test void concurrentAdmissionProducesOneImmutableIdentity() throws Exception {
+        genuinePaid();var before=financialState();int calls=http.calls.size();
+        try(var workers=java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var start=new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.Callable<dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.Admission> call=()->{
+                assertThat(start.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                return transaction.required(()->{jdbc.execute("set local lock_timeout='5s'");return service().admit(receipt,SOURCE);});
+            };
+            var first=workers.submit(call);var second=workers.submit(call);start.countDown();
+            assertThat(first.get(15,java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(second.get(15,java.util.concurrent.TimeUnit.SECONDS));
+        }
+        assertThat(count("stripe_billing_first_renewals")).isEqualTo(1);
+        assertThat(count("stripe_billing_first_renewal_steps")).isZero();
+        assertThat(http.calls).hasSize(calls);assertThat(financialState()).isEqualTo(before);
+    }
+    @Test void admissionDoesNotHoldAccountWhileWaitingForLifecycleSite() throws Exception {
+        genuinePaid();
+        var siteHeld=new java.util.concurrent.CountDownLatch(1);
+        var admissionReachedSite=new java.util.concurrent.CountDownLatch(1);
+        var observingLocks=(SubscriptionLifecycleLockPort)(s,c)->{
+            admissionReachedSite.countDown();lifecycleLocks.lockActive(s,c);
+        };
+        var observedService=new OwnedFirstRenewalAdmissionService(renewals,transaction,lifecycleOperations,observingLocks,accountLocks,subscriptions,Clock.systemUTC());
+        try(var workers=java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var lifecycle=workers.submit(()->transaction.required(()->{
+                jdbc.execute("set local lock_timeout='5s'");
+                jdbc.queryForList("select id from sites where id=? for update",site.value());siteHeld.countDown();
+                try {assertThat(admissionReachedSite.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();}
+                catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IllegalStateException(interrupted);}
+                accountLocks.findByIdForUpdate(billing.id()).orElseThrow();return null;
+            }));
+            assertThat(siteHeld.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            var admission=workers.submit(()->transaction.required(()->{
+                jdbc.execute("set local lock_timeout='5s'");return observedService.admit(receipt,SOURCE);
+            }));
+            lifecycle.get(15,java.util.concurrent.TimeUnit.SECONDS);
+            assertThat(admission.get(15,java.util.concurrent.TimeUnit.SECONDS)).isNotNull();
+        }
+        assertThat(count("stripe_billing_first_renewals")).isEqualTo(1);
+    }
     @Test void rejectsEvidenceTamper() {
         genuinePaid();var admitted=admitGenuinePaid();
+        assertThatThrownBy(()->jdbc.update("insert into stripe_billing_first_renewal_steps(id,admission_id,ordinal,target,operation_key,fingerprint,prepared_at) values (?,?,1,?,?,?,now())",
+            java.util.UUID.randomUUID(),admitted.id(),receipt.periodEnd()+1,"billing-renewal-advance-v1:"+admitted.id()+":1","b".repeat(64)))
+            .as("A foreign target cannot become the immutable first intent")
+            .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
         var step=renewals.prepare(admitted,Step.BOUNDARY,null,java.time.Instant.now());
         for(var sql:java.util.List.of(
                 "update stripe_billing_first_renewals set source_sha='"+"b".repeat(40)+"'",
@@ -88,14 +158,32 @@ class OwnedFirstRenewalAdmissionIntegrationTest extends StripeBillingClockConfir
                 "update stripe_billing_first_renewal_steps set target=target+1",
                 "update stripe_billing_first_renewal_steps set ordinal=2",
                 "update stripe_billing_first_renewal_steps set fingerprint='"+"b".repeat(64)+"'",
-                "delete from stripe_billing_first_renewal_steps"))
+                "delete from stripe_billing_first_renewal_steps",
+                "update stripe_billing_owned_subscription_receipts set provider_created=provider_created+1",
+                "delete from stripe_billing_owned_subscription_receipts",
+                "update stripe_billing_clock_ready set frozen_time=frozen_time+1"))
             assertThatThrownBy(()->jdbc.update(sql)).as(sql).isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
-        assertThatThrownBy(()->jdbc.update("insert into stripe_billing_first_renewals select gen_random_uuid(),owned_intent,payment_account_id,site_id,customer_id,subscription_id,source_sha,original_root,original_attempt,initial_bill,bill_version,initial_payment,payment_version,invoice_reference,allocation_reference,payment_intent_reference,subscription_revision,policy_version,fingerprint,admitted_at,stopped_at,stop_reason from stripe_billing_first_renewals"))
+        assertThatThrownBy(()->jdbc.update("insert into stripe_billing_first_renewals select gen_random_uuid(),owned_intent,payment_account_id,site_id,customer_id,subscription_id,source_sha,original_root,original_attempt,attempt_version,initial_bill,bill_version,initial_payment,payment_version,invoice_reference,allocation_reference,payment_intent_reference,subscription_revision,policy_version,fingerprint,admitted_at,stopped_at,stop_reason from stripe_billing_first_renewals"))
             .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
         assertThat(renewals.prepare(admitted,Step.BOUNDARY,null,java.time.Instant.now())).isEqualTo(step);
+        assertThat(step.target()).isEqualTo(receipt.periodEnd());
+        assertThatThrownBy(()->renewals.prepare(admitted,Step.FINALIZATION,null,java.time.Instant.now())).isInstanceOf(RuntimeException.class);
         renewals.stop(admitted,"AUTHORITY_DRIFT",java.time.Instant.now());
         assertThatThrownBy(()->jdbc.update("update stripe_billing_first_renewals set stopped_at=null,stop_reason=null"))
             .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
         assertThatThrownBy(()->service().admit(receipt,SOURCE)).isInstanceOf(RuntimeException.class);
+    }
+    @Test void callerRecordCannotSubstituteOriginalReceiptIdentity() {
+        genuinePaid();var a=admitGenuinePaid();
+        var foreign=new dev.genericpayments.platform.provider.application.model.OwnedClockSubscriptionReceipt(receipt.intent(),receipt.providerOperation(),receipt.reference(),
+            receipt.providerCreated(),"si_foreign",receipt.periodStart(),receipt.periodEnd(),receipt.acknowledgedAt());
+        var forged=new dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.Admission(a.id(),foreign,a.sourceSha(),a.root(),a.attempt(),a.attemptVersion(),
+            a.bill(),a.billVersion(),a.payment(),a.paymentVersion(),a.invoice(),a.allocation(),a.paymentIntent(),a.subscriptionRevision(),a.policyVersion(),a.fingerprint(),a.admittedAt());
+        assertThatThrownBy(()->renewals.stop(forged,"AUTHORITY_DRIFT",java.time.Instant.now())).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->renewals.prepare(forged,Step.BOUNDARY,null,java.time.Instant.now())).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->transaction.required(()->renewals.requirePaidInTransaction(forged))).isInstanceOf(RuntimeException.class);
+        assertThat(count("stripe_billing_first_renewal_steps")).isZero();
+        assertThat(jdbc.queryForObject("select stopped_at from stripe_billing_first_renewals",java.sql.Timestamp.class)).isNull();
+        assertThat(service().admit(receipt,SOURCE)).isEqualTo(a);
     }
 }
