@@ -12,6 +12,13 @@ public interface OwnedFirstRenewalStore {
     Advance prepare(Admission admission,Step step,Boundary boundary,Instant utcAt);
     void stop(Admission admission,String reason,Instant utcAt);
     Admission requireCurrent(Admission admission);
+    /** Exact local completed receipt only; never transfers a bare ACK's continuation. */
+    default Optional<LaterReady> ready(Admission admission,Step step) {throw new UnsupportedOperationException();}
+    /** Insert-winner authority is implemented by the graph consumer under caller lifecycle locks. */
+    default ReadClaim beginReadInTransaction(Admission admission,LaterReady ready,
+            dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Fence fence,
+            java.util.UUID invocation,Instant startedAt) {throw new UnsupportedOperationException();}
+    default Optional<ReadClaim> readClaim(Admission admission,LaterReady ready) {throw new UnsupportedOperationException();}
     LaterReady recordReady(Ack ack,TestClockReady observation,Instant utcAt);
     Boundary recordBoundary(Admission admission,LaterReady ready,Boundary boundary);
     Boundary boundary(Admission admission);

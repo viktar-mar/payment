@@ -27,6 +27,23 @@ import static org.assertj.core.api.Assertions.*;
  * No successful lifecycle, action, attempt or payment fixture row is inserted. */
 @TestPropertySource(properties="payment.telemetry.site-keys[0]=test-site")
 public abstract class StripeBillingClockConfirmationCompositionFixture extends StripeBillingClockSubscriptionCompositionFixture {
+    /** Avoid ExecutorService.close's unbounded wait after a failed Future.get. Close failures are
+     * suppressed under the original failure by try-with-resources. Daemon workers cannot hold JVM exit. */
+    protected static final class BoundedWorkers implements AutoCloseable {
+        private final java.util.concurrent.ExecutorService executor=java.util.concurrent.Executors.newFixedThreadPool(2,
+            task->Thread.ofPlatform().daemon(true).name("owned-renewal-race").unstarted(task));
+        private final java.util.List<java.util.concurrent.Future<?>> submitted=new java.util.ArrayList<>();
+        public BoundedWorkers() {}
+        public <T> java.util.concurrent.Future<T> submit(java.util.concurrent.Callable<T> task){
+            var future=executor.submit(task);submitted.add(future);return future;
+        }
+        public void close() throws InterruptedException {
+            for(var future:submitted)future.cancel(true);
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(5,java.util.concurrent.TimeUnit.SECONDS))
+                .as("Race workers must terminate within bounded cleanup").isTrue();
+        }
+    }
     @Autowired protected SubscriptionInteractionTransaction phases;
     @Autowired protected SubscriptionReadPreparation readPreparation;
     @Autowired protected SubscriptionActionStore roots;

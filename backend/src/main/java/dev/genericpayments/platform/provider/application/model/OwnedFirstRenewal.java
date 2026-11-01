@@ -10,6 +10,10 @@ import java.util.Objects;
 /** Internal persisted evidence. Records alone confer no authority: every consumer reloads them. */
 public final class OwnedFirstRenewal {
     private OwnedFirstRenewal() {}
+    /** Emitted only after exact persisted admission authentication, never for a claimant conflict. */
+    public static final class AuthorityDrift extends IllegalStateException {
+        public AuthorityDrift(){super("Owned first renewal authority changed");}
+    }
     public record Admission(UUID id,OwnedClockSubscriptionReceipt receipt,String sourceSha,
             UUID root,UUID attempt,long attemptVersion,UUID bill,long billVersion,UUID payment,long paymentVersion,
             String invoice,String allocation,String paymentIntent,long subscriptionRevision,long policyVersion,
@@ -27,6 +31,17 @@ public final class OwnedFirstRenewal {
         private final int ordinal;
         Step(int ordinal){this.ordinal=ordinal;}
         public int number(){return ordinal;}
+    }
+    /** Conservative two-interval ceiling, not a calculation of the provider's next period N.
+     * Two shortest months are at least56 days; two shortest years at least730 days. */
+    public static void requireAdvanceWindow(Admission admission,Step step,long target) {
+        required(admission,step);
+        long predecessor=step==Step.BOUNDARY?admission.receipt().intent().clock().frozenTime():admission.receipt().periodEnd();
+        long seconds=switch(admission.receipt().intent().terms().interval()) {
+            case MONTH->56L*86400;
+            case YEAR->730L*86400;
+        };
+        if(target<=predecessor||target-predecessor>seconds)throw invalid();
     }
     public record Advance(UUID id,UUID admissionId,Step step,long target,UUID predecessorReady,
             UUID boundary,String operationKey,String fingerprint,Instant preparedAt) {
@@ -75,6 +90,18 @@ public final class OwnedFirstRenewal {
                     ||period.start().getEpochSecond()!=ready.observation().frozenTime()||!period.start().equals(Instant.ofEpochSecond(ready.observation().frozenTime()))
                     ||!matches(item,"si_[A-Za-z0-9]{1,252}")||!matches(renewalInvoice,"in_[A-Za-z0-9]{1,252}")
                     ||!hash(fingerprint)||observedAt.isBefore(ready.observedAt()))throw invalid();
+        }
+    }
+    /** Append-only graph start provenance, never a renewable or transferable lease. */
+    public record ReadClaim(LaterReady ready,UUID invocation,Instant startedAt,Instant deadlineAt,
+            ApplySubscriptionSnapshotUseCase.Fence fence) {
+        public ReadClaim {
+            required(ready,invocation,startedAt,deadlineAt,fence);
+            if(!deadlineAt.equals(startedAt.plusSeconds(30))||startedAt.isBefore(ready.observedAt())
+                    ||fence.revision()<0||fence.observationSequence()==null||fence.observationSequence()<0
+                    ||fence.lease()!=null||fence.authority()!=null
+                    ||(fence.operationId()==null)!=(fence.operationVersion()==null)
+                    ||fence.operationVersion()!=null&&fence.operationVersion()<0)throw invalid();
         }
     }
     public sealed interface Observation permits Pending,Paid {}

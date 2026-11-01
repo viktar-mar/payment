@@ -16,6 +16,15 @@ public interface ProviderOperationStore {
      */
     ProviderOperation reserve(PaymentAccount account, ProviderOperation.Kind kind,
         UUID resourceId, String key, String fingerprint);
+    default ProviderOperation reserveOwnedFirstRenewalAdvance(PaymentAccount account,
+            dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.Advance advance) {
+        throw new UnsupportedOperationException("Owned first renewal reservation is unavailable");
+    }
+    default dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.Ack acknowledgeOwnedFirstRenewalAdvance(
+            dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.Advance advance,ProviderOperation claim,
+            dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.TestClockAck observation,Instant utcAt) {
+        throw new UnsupportedOperationException("Owned first renewal acknowledgment is unavailable");
+    }
     /** Explicit owned lane: defaults fail closed for older pure doubles. */
     default ProviderOperation reserveOwnedBillingCustomer(PaymentAccount account, dev.genericpayments.platform.provider.application.model.ReadyClock ready) {
         throw new UnsupportedOperationException("Owned Billing Customer reservation is unavailable");

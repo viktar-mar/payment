@@ -1,4 +1,12 @@
 -- Additive evidence relations. The original clock and initial-only evidence stay unchanged.
+alter table provider_operations drop constraint provider_operations_kind_check;
+alter table provider_operations add constraint provider_operations_kind_check check(kind in (
+ 'PRODUCT_CREATE','PRICE_CREATE','PAYMENT_PREPARE','REFUND_CREATE','CUSTOMER_CREATE','TEST_CLOCK_CREATE','TEST_CLOCK_ADVANCE',
+ 'SUBSCRIPTION_CREATE','SUBSCRIPTION_UPDATE','SUBSCRIPTION_CANCEL','SETUP_INTENT_CREATE','INVOICE_PAY',
+ 'SCHEDULE_CREATE','SCHEDULE_UPDATE','SCHEDULE_RELEASE','PORTAL_CONFIGURATION_CREATE','PORTAL_SESSION_CREATE'));
+drop index uq_provider_operation_reference;
+create unique index uq_provider_operation_reference on provider_operations(payment_account_id,kind,provider_reference)
+ where provider_reference is not null and kind not in ('SUBSCRIPTION_UPDATE','TEST_CLOCK_ADVANCE');
 create table stripe_billing_first_renewals (
  id uuid primary key, owned_intent uuid not null unique references stripe_billing_owned_subscriptions(id),
  payment_account_id uuid not null, site_id uuid not null, customer_id uuid not null, subscription_id uuid not null unique,
@@ -11,7 +19,7 @@ create table stripe_billing_first_renewals (
  subscription_revision bigint not null check(subscription_revision>=0), policy_version bigint not null check(policy_version>=0),
  fingerprint varchar(64) not null check(fingerprint ~ '^[a-f0-9]{64}$'), admitted_at timestamptz not null,
  stopped_at timestamptz, stop_reason varchar(32),
- unique(id,payment_account_id,site_id,customer_id,subscription_id),
+ unique(id,payment_account_id,site_id,customer_id,subscription_id), unique(id,payment_account_id),
  foreign key(subscription_id,payment_account_id,site_id,customer_id) references subscriptions(id,payment_account_id,site_id,customer_id),
  check(num_nonnulls(stopped_at,stop_reason) in (0,2)),
  check((stopped_at is null and stop_reason is null) or (stopped_at>=admitted_at and stop_reason in
@@ -121,26 +129,40 @@ create table stripe_billing_first_renewal_steps (
 );
 create table stripe_billing_first_renewal_acks (
  step_id uuid primary key, admission_id uuid not null, provider_operation uuid not null unique references provider_operations(id),
+ payment_account_id uuid not null, operation_kind varchar(32) not null default 'TEST_CLOCK_ADVANCE' check(operation_kind='TEST_CLOCK_ADVANCE'),
  claimant varchar(255) not null, deadline timestamptz not null,
  reference varchar(255) not null, object_type varchar(32) not null, livemode boolean not null,
  name varchar(255) not null, frozen_time bigint not null, status varchar(32) not null,
  provider_created bigint not null, provider_deletes_after bigint not null, advancing_target bigint, acknowledged_at timestamptz not null,
  unique(step_id,admission_id),
- foreign key(step_id,admission_id) references stripe_billing_first_renewal_steps(id,admission_id)
+ foreign key(step_id,admission_id) references stripe_billing_first_renewal_steps(id,admission_id),
+ foreign key(admission_id,payment_account_id) references stripe_billing_first_renewals(id,payment_account_id),
+ foreign key(provider_operation,payment_account_id,step_id,operation_kind,reference)
+  references provider_operations(id,payment_account_id,resource_id,kind,provider_reference)
 );
 create table stripe_billing_first_renewal_ready (
  id uuid primary key, admission_id uuid not null, step_id uuid not null unique,
  reference varchar(255) not null, object_type varchar(32) not null, livemode boolean not null,
  name varchar(255) not null, frozen_time bigint not null, status varchar(32) not null,
  provider_created bigint not null, provider_deletes_after bigint not null, advancing_target bigint, observed_at timestamptz not null,
- unique(id,admission_id), foreign key(step_id,admission_id) references stripe_billing_first_renewal_acks(step_id,admission_id)
+ unique(id,admission_id), unique(id,admission_id,step_id), foreign key(step_id,admission_id) references stripe_billing_first_renewal_acks(step_id,admission_id)
+);
+-- Durable consume-before-graph receipt. No state, counter, takeover, refresh or provider operation.
+create table stripe_billing_first_renewal_read_claims (
+ ready_id uuid primary key, step_id uuid not null unique, admission_id uuid not null, invocation uuid not null unique,
+ started_at timestamptz not null, deadline_at timestamptz not null check(deadline_at=started_at+interval '30 seconds'),
+ captured_revision bigint not null check(captured_revision>=0), selected_operation uuid, selected_version bigint,
+ observation_sequence bigint not null check(observation_sequence>=0), unique(ready_id,admission_id),
+ check(num_nonnulls(selected_operation,selected_version) in (0,2)), check(selected_version is null or selected_version>=0),
+ foreign key(ready_id,admission_id,step_id) references stripe_billing_first_renewal_ready(id,admission_id,step_id)
 );
 create table stripe_billing_first_renewal_boundary (
  id uuid primary key, admission_id uuid not null unique references stripe_billing_first_renewals(id), ready_id uuid not null unique,
  item_reference varchar(255) not null, invoice_reference varchar(255) not null,
  period_start timestamptz not null, period_end timestamptz not null check(period_start<period_end),
  fingerprint varchar(64) not null check(fingerprint ~ '^[a-f0-9]{64}$'), observed_at timestamptz not null,
- unique(id,admission_id), foreign key(ready_id,admission_id) references stripe_billing_first_renewal_ready(id,admission_id)
+ unique(id,admission_id), foreign key(ready_id,admission_id) references stripe_billing_first_renewal_ready(id,admission_id),
+ foreign key(ready_id,admission_id) references stripe_billing_first_renewal_read_claims(ready_id,admission_id)
 );
 alter table stripe_billing_first_renewal_steps add foreign key(predecessor_ready,admission_id) references stripe_billing_first_renewal_ready(id,admission_id);
 alter table stripe_billing_first_renewal_steps add foreign key(boundary_id,admission_id) references stripe_billing_first_renewal_boundary(id,admission_id);
@@ -149,6 +171,7 @@ create table stripe_billing_first_renewal_publications (
  boundary_id uuid not null unique, renewal_bill uuid not null unique references subscription_billing_records(id),
  renewal_payment uuid not null unique references payments(id), projected_revision bigint not null check(projected_revision>=0), published_at timestamptz not null,
  foreign key(ready_id,admission_id) references stripe_billing_first_renewal_ready(id,admission_id),
+ foreign key(ready_id,admission_id) references stripe_billing_first_renewal_read_claims(ready_id,admission_id),
  foreign key(boundary_id,admission_id) references stripe_billing_first_renewal_boundary(id,admission_id)
 );
 
@@ -185,6 +208,7 @@ end $$;
 create trigger first_renewal_step_immutable before update or delete on stripe_billing_first_renewal_steps for each row execute function protect_first_renewal_evidence();
 create trigger first_renewal_ack_immutable before update or delete on stripe_billing_first_renewal_acks for each row execute function protect_first_renewal_evidence();
 create trigger first_renewal_ready_immutable before update or delete on stripe_billing_first_renewal_ready for each row execute function protect_first_renewal_evidence();
+create trigger first_renewal_read_claim_immutable before update or delete on stripe_billing_first_renewal_read_claims for each row execute function protect_first_renewal_evidence();
 create trigger first_renewal_boundary_immutable before update or delete on stripe_billing_first_renewal_boundary for each row execute function protect_first_renewal_evidence();
 create trigger first_renewal_publication_immutable before update or delete on stripe_billing_first_renewal_publications for each row execute function protect_first_renewal_evidence();
 
@@ -198,6 +222,9 @@ begin
   where a.id=new.admission_id and a.stopped_at is null and new.prepared_at>=a.admitted_at
    and p.root_id=a.original_root and p.attempt_id=a.original_attempt and p.attempt_version=a.attempt_version and p.bill_id=a.initial_bill and p.bill_version=a.bill_version
    and p.payment_id=a.initial_payment and p.payment_version=a.payment_version and p.subscription_revision=a.subscription_revision
+   -- Conservative two-shortest-interval cap from the exact predecessor F/B; never derive N here.
+   and new.target-case when new.ordinal=1 then original.frozen_time else r.period_end end
+    between 1 and case i.billing_interval when 'MONTH' then 56::bigint*86400 when 'YEAR' then 730::bigint*86400 else 0 end
    and ((new.ordinal=1 and new.target=r.period_end and new.target>original.frozen_time)
     or (new.ordinal=2 and new.target=r.period_end+3600 and exists(
      select 1 from stripe_billing_first_renewal_ready ready
@@ -211,8 +238,8 @@ begin
 end $$;
 create trigger first_renewal_step_proof before insert on stripe_billing_first_renewal_steps for each row execute function require_first_renewal_step();
 
--- These evidence producers remain absent until their owning consumers are implemented.
--- Existing rows nevertheless cannot be replaced or detached through direct SQL.
+-- The advance producer owns ACK/READY. Boundary/read/publication consumers are added sequentially
+-- before Task5 freezes this unreleased migration; only disposable hosted fixtures may apply it now.
 create function require_first_renewal_ack() returns trigger language plpgsql as $$
 begin
  if not exists(select 1 from stripe_billing_first_renewal_steps s
@@ -227,9 +254,10 @@ begin
    and p.external_account_id=owner.external_account_id and p.credentials_ref=owner.credentials_ref and p.first_dispatched_at is not null
    and new.reference=original.reference and new.object_type='test_helpers.test_clock' and not new.livemode and new.name=owner.name
    and new.provider_created=original.provider_created and new.provider_deletes_after=original.provider_deletes_after
-   and new.status in ('ready','advancing') and new.frozen_time>=original.frozen_time and new.frozen_time<=s.target
+   and new.status in ('ready','advancing') and new.frozen_time>=case when s.ordinal=1 then original.frozen_time else s.target-3600 end and new.frozen_time<=s.target
    and (new.advancing_target is null or new.advancing_target=s.target)
    and length(trim(new.claimant))>0 and new.acknowledged_at>=p.first_dispatched_at and new.acknowledged_at<new.deadline
+   and new.deadline=p.first_dispatched_at+interval '60 seconds' and new.deadline>clock_timestamp() and new.acknowledged_at<=clock_timestamp()
  ) then raise exception 'First renewal ACK lacks original owned dispatch' using errcode='23514'; end if;
  return new;
 end $$;
@@ -242,6 +270,10 @@ begin
    and new.object_type='test_helpers.test_clock' and not new.livemode and new.status='ready' and new.frozen_time=s.target
    and new.provider_created=a.provider_created and new.provider_deletes_after=a.provider_deletes_after
    and (new.advancing_target is null or new.advancing_target=s.target) and new.observed_at>=a.acknowledged_at
+   and new.observed_at<a.deadline and a.deadline>clock_timestamp() and new.observed_at<=clock_timestamp()
+   and exists(select 1 from stripe_billing_first_renewals owner join stripe_billing_owned_subscriptions i on i.id=owner.owned_intent
+    join stripe_billing_clock_intents c on c.id=i.clock_intent where owner.id=s.admission_id and owner.stopped_at is null and c.stopped_at is null)
+   and not exists(select 1 from stripe_billing_first_renewal_steps higher where higher.admission_id=s.admission_id and higher.ordinal>s.ordinal)
  ) then raise exception 'First renewal READY lacks exact ACK' using errcode='23514'; end if;
  return new;
 end $$;
@@ -252,10 +284,105 @@ begin
   join stripe_billing_first_renewal_steps s on s.id=ready.step_id and s.admission_id=ready.admission_id
   join stripe_billing_first_renewals a on a.id=s.admission_id
   join stripe_billing_owned_subscription_receipts r on r.intent_id=a.owned_intent
+  join stripe_billing_first_renewal_read_claims claim on claim.ready_id=ready.id and claim.admission_id=a.id
   where ready.id=new.ready_id and ready.admission_id=new.admission_id and s.ordinal=1 and ready.status='ready'
    and new.period_start=to_timestamp(r.period_end) and new.item_reference=r.item_reference
-   and new.invoice_reference<>a.invoice_reference and new.observed_at>=ready.observed_at
+   and new.invoice_reference<>a.invoice_reference and new.observed_at>=claim.started_at
+   and new.observed_at<claim.deadline_at and claim.deadline_at>clock_timestamp() and new.observed_at<=clock_timestamp()
  ) then raise exception 'First renewal boundary lacks exact READY1' using errcode='23514'; end if;
  return new;
 end $$;
 create trigger first_renewal_boundary_proof before insert on stripe_billing_first_renewal_boundary for each row execute function require_first_renewal_boundary();
+
+create function require_first_renewal_read_claim() returns trigger language plpgsql as $$
+begin
+ if new.started_at>clock_timestamp() or new.deadline_at<=clock_timestamp() or not exists(
+  select 1 from stripe_billing_first_renewal_ready r
+  join stripe_billing_first_renewal_steps step on step.id=r.step_id and step.admission_id=r.admission_id
+  join stripe_billing_first_renewals a on a.id=r.admission_id
+  join subscriptions s on s.id=a.subscription_id
+  join owned_first_renewal_paid(a.owned_intent) p on true
+  where r.id=new.ready_id and r.step_id=new.step_id and r.admission_id=new.admission_id and a.stopped_at is null
+   and new.started_at>=r.observed_at and new.captured_revision=a.subscription_revision and new.captured_revision=s.revision
+   and new.observation_sequence=s.observation_sequence
+   and p.root_id=a.original_root and p.attempt_id=a.original_attempt and p.attempt_version=a.attempt_version
+   and p.bill_id=a.initial_bill and p.bill_version=a.bill_version and p.payment_id=a.initial_payment and p.payment_version=a.payment_version
+   and p.subscription_revision=a.subscription_revision and p.policy_version=a.policy_version
+   and not exists(select 1 from stripe_billing_first_renewal_steps higher where higher.admission_id=a.id and higher.ordinal>step.ordinal)
+   and not exists(select 1 from stripe_billing_first_renewal_publications completed where completed.admission_id=a.id)
+   and (step.ordinal=2 or not exists(select 1 from stripe_billing_first_renewal_boundary b where b.admission_id=a.id))
+   and (new.selected_operation is null or exists(select 1 from subscription_operations selected
+    where selected.id=new.selected_operation and selected.subscription_id=s.id and selected.site_id=s.site_id
+     and selected.customer_id=s.customer_id and selected.version=new.selected_version))
+ ) then raise exception 'First renewal read start lacks exact current READY and fence' using errcode='23514'; end if;
+ return new;
+end $$;
+create trigger first_renewal_read_claim_proof before insert on stripe_billing_first_renewal_read_claims
+ for each row execute function require_first_renewal_read_claim();
+
+-- OLD identity is inspected first so changing kind/account/resource cannot escape owned guards.
+create function require_first_renewal_operation() returns trigger language plpgsql as $$
+declare step stripe_billing_first_renewal_steps; admission stripe_billing_first_renewals; owner stripe_billing_clock_intents;
+ old_owned boolean := false;
+begin
+ if tg_op in ('UPDATE','DELETE') and old.kind='TEST_CLOCK_ADVANCE' then
+  old_owned := true;
+  if tg_op='DELETE' then raise exception 'Owned advance cannot be deleted' using errcode='23514'; end if;
+  if row(new.id,new.payment_account_id,new.kind,new.resource_id,new.operation_key,new.fingerprint,new.external_account_id,new.credentials_ref)
+   is distinct from row(old.id,old.payment_account_id,old.kind,old.resource_id,old.operation_key,old.fingerprint,old.external_account_id,old.credentials_ref) then
+   raise exception 'Owned advance identity is immutable' using errcode='23514'; end if;
+  if old.first_dispatched_at is not null and row(new.first_dispatched_at,new.retry_before) is distinct from row(old.first_dispatched_at,old.retry_before) then
+   raise exception 'Owned advance dispatch history is immutable' using errcode='23514'; end if;
+  if old.status in ('ACKNOWLEDGED','UNKNOWN','FAILED') and new is distinct from old then
+   raise exception 'Owned advance consumed state is immutable' using errcode='23514'; end if;
+ end if;
+ if tg_op='DELETE' then return old; end if;
+ if new.kind<>'TEST_CLOCK_ADVANCE' then return new; end if;
+ if tg_op='UPDATE' and not old_owned then raise exception 'Owned advance requires original reservation' using errcode='23514'; end if;
+ select * into step from stripe_billing_first_renewal_steps where id=new.resource_id;
+ if not found then raise exception 'Owned advance lacks persisted step' using errcode='23514'; end if;
+ select * into admission from stripe_billing_first_renewals where id=step.admission_id;
+ select c.* into owner from stripe_billing_clock_intents c join stripe_billing_owned_subscriptions i on i.clock_intent=c.id where i.id=admission.owned_intent;
+ if new.payment_account_id<>admission.payment_account_id or new.operation_key<>step.operation_key or new.fingerprint<>step.fingerprint
+  or new.external_account_id<>owner.external_account_id or new.credentials_ref<>owner.credentials_ref then
+  raise exception 'Owned advance identity mismatch' using errcode='23514'; end if;
+ if tg_op='INSERT' and (new.status<>'RESERVED' or new.version<>0 or new.first_dispatched_at is not null
+  or new.lease_owner is not null or new.provider_reference is not null or admission.stopped_at is not null or owner.stopped_at is not null) then
+  raise exception 'Owned advance requires pristine reservation' using errcode='23514'; end if;
+ if tg_op='UPDATE' and new is distinct from old then
+  if new.version<>old.version+1 then raise exception 'Owned advance version must follow original claim' using errcode='23514'; end if;
+  if new.status='DISPATCHING' then
+   if old.status<>'RESERVED' or old.first_dispatched_at is not null or admission.stopped_at is not null or owner.stopped_at is not null
+    or new.lease_expires_at<>new.first_dispatched_at+interval '60 seconds' or new.first_dispatched_at>clock_timestamp()
+    or new.lease_expires_at<=clock_timestamp() then
+    raise exception 'Owned advance dispatch is once only' using errcode='23514'; end if;
+  elsif new.status='ACKNOWLEDGED' then
+   if old.status<>'DISPATCHING' or old.lease_owner is null or old.lease_expires_at<=clock_timestamp()
+    or admission.stopped_at is not null or owner.stopped_at is not null or not exists(
+     select 1 from stripe_billing_clock_ready r where r.intent_id=owner.id and r.reference=new.provider_reference) then
+    raise exception 'Owned advance ACK requires original live claim' using errcode='23514'; end if;
+  elsif new.status<>'UNKNOWN' or old.status<>'DISPATCHING' then
+   raise exception 'Owned advance cannot reset or recover' using errcode='23514';
+  end if;
+ end if;
+ return new;
+end $$;
+create trigger first_renewal_operation_proof before insert or update or delete on provider_operations
+ for each row execute function require_first_renewal_operation();
+
+-- Atomic update+receipt, including the original live owner/deadline, not a newly supplied lease.
+create function require_first_renewal_ack_receipt() returns trigger language plpgsql as $$
+begin
+ if new.kind='TEST_CLOCK_ADVANCE' and new.status='ACKNOWLEDGED' then
+  if not exists(select 1 from stripe_billing_first_renewal_acks a
+   where a.provider_operation=new.id and a.step_id=new.resource_id and a.payment_account_id=new.payment_account_id
+    and a.reference=new.provider_reference) then
+   raise exception 'Owned advance ACK requires atomic receipt' using errcode='23514'; end if;
+  if tg_op='UPDATE' and old.status='DISPATCHING' and not exists(select 1 from stripe_billing_first_renewal_acks a
+   where a.provider_operation=new.id and a.claimant=old.lease_owner and a.deadline=old.lease_expires_at) then
+   raise exception 'Owned advance ACK must preserve original claim' using errcode='23514'; end if;
+ end if;
+ return null;
+end $$;
+create constraint trigger first_renewal_ack_receipt after insert or update on provider_operations
+ deferrable initially deferred for each row execute function require_first_renewal_ack_receipt();

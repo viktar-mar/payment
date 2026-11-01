@@ -169,22 +169,6 @@ class OwnedFirstRenewalAdmissionIntegrationTest extends StripeBillingClockConfir
     private void raceStatementDeadlines(){
         jdbc.execute("set local lock_timeout='5s'");jdbc.execute("set local statement_timeout='10s'");
     }
-    /** Avoid ExecutorService.close's unbounded wait after a failed Future.get. Close failures are
-     * suppressed under the original failure by try-with-resources. Daemon workers cannot hold JVM exit. */
-    private static final class BoundedWorkers implements AutoCloseable {
-        private final java.util.concurrent.ExecutorService executor=java.util.concurrent.Executors.newFixedThreadPool(2,
-            task->Thread.ofPlatform().daemon(true).name("owned-renewal-race").unstarted(task));
-        private final java.util.List<java.util.concurrent.Future<?>> submitted=new java.util.ArrayList<>();
-        <T> java.util.concurrent.Future<T> submit(java.util.concurrent.Callable<T> task){
-            var future=executor.submit(task);submitted.add(future);return future;
-        }
-        public void close() throws InterruptedException {
-            for(var future:submitted)future.cancel(true);
-            executor.shutdownNow();
-            assertThat(executor.awaitTermination(5,java.util.concurrent.TimeUnit.SECONDS))
-                .as("Race workers must terminate within bounded cleanup").isTrue();
-        }
-    }
     @Test void rejectsEvidenceTamper() {
         genuinePaid();var admitted=admitGenuinePaid();
         assertThatThrownBy(()->jdbc.update("insert into stripe_billing_first_renewal_steps(id,admission_id,ordinal,target,operation_key,fingerprint,prepared_at) values (?,?,1,?,?,?,now())",

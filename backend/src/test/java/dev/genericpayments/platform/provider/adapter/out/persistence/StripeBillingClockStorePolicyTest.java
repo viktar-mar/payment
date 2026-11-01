@@ -20,6 +20,22 @@ class StripeBillingClockStorePolicyTest {
     final ReadyClock ready=new ReadyClock(owner,UUID.randomUUID(),"clock_owned",1000,2000,3000,now.minusSeconds(500),"b".repeat(64));
 
     @Test void unknownClockCannotBeDispatchedAgainInsideRetryWindow() { refusedRedispatch(ProviderOperation.Kind.TEST_CLOCK_CREATE,ProviderOperation.Status.UNKNOWN); }
+    @Test void genericAdvanceReservationAndAckRefuseBeforeAnyAccountRead() {
+        var db=new InertJdbc(operation(ProviderOperation.Kind.TEST_CLOCK_ADVANCE,ProviderOperation.Status.DISPATCHING),true);
+        var store=new JdbcProviderOperationStore(db);
+        assertThatThrownBy(()->store.reserve(account,ProviderOperation.Kind.TEST_CLOCK_ADVANCE,db.operation.resourceId(),db.operation.operationKey(),db.operation.fingerprint())).isInstanceOf(PaymentApplicationException.class);
+        assertThatThrownBy(()->store.acknowledge(db.operation.id(),"first",0,"clock_owned")).isInstanceOf(PaymentApplicationException.class);
+        assertThat(db.scopeReads).isZero();assertThat(db.inserts).isZero();assertThat(db.dispatchUpdates).isZero();
+    }
+    @Test void advanceRecoveryRefusesBeforeAccountIncludingExpiredClaimsAndAcks() {
+        for(var status:List.of(ProviderOperation.Status.DISPATCHING,ProviderOperation.Status.UNKNOWN,ProviderOperation.Status.ACKNOWLEDGED)) {
+            var db=new InertJdbc(operation(ProviderOperation.Kind.TEST_CLOCK_ADVANCE,status),true);var store=new JdbcProviderOperationStore(db);
+            assertThatThrownBy(()->store.lockRecovery(db.operation)).isInstanceOf(PaymentApplicationException.class);
+            assertThatThrownBy(()->store.bindRecovered(db.operation,"clock_owned",db.operation.fingerprint())).isInstanceOf(PaymentApplicationException.class);
+            assertThatThrownBy(()->store.bindRecoveredInTransaction(db.operation,"clock_owned",db.operation.fingerprint())).isInstanceOf(PaymentApplicationException.class);
+            assertThat(db.scopeReads).isZero();assertThat(db.inserts).isZero();assertThat(db.dispatchUpdates).isZero();
+        }
+    }
     @Test void expiredClockClaimCannotBeReclaimed() { refusedRedispatch(ProviderOperation.Kind.TEST_CLOCK_CREATE,ProviderOperation.Status.DISPATCHING); }
     @Test void unknownOwnedCustomerCannotBeDispatchedAgainInsideRetryWindow() { refusedRedispatch(ProviderOperation.Kind.CUSTOMER_CREATE,ProviderOperation.Status.UNKNOWN); }
     @Test void expiredOwnedCustomerClaimCannotBeReclaimed() { refusedRedispatch(ProviderOperation.Kind.CUSTOMER_CREATE,ProviderOperation.Status.DISPATCHING); }
@@ -127,7 +143,7 @@ class StripeBillingClockStorePolicyTest {
             status==ProviderOperation.Status.DISPATCHING?"first":null,status==ProviderOperation.Status.DISPATCHING?now.minusSeconds(60):null,0);
     }
     final class InertJdbc extends JdbcTemplate {
-        final ProviderOperation operation; final boolean owned; boolean stopped,bindingFailure,pinnedAccountChanged; int dispatchUpdates,inserts;
+        final ProviderOperation operation; final boolean owned; boolean stopped,bindingFailure,pinnedAccountChanged; int dispatchUpdates,inserts,scopeReads;
         InertJdbc(ProviderOperation operation,boolean owned){this.operation=operation;this.owned=owned;}
         @Override @SuppressWarnings("unchecked") public <T> List<T> query(String sql,RowMapper<T> mapper,Object... args) {
             if(sql.contains("update provider_operations")){dispatchUpdates++; return (List<T>)List.of(operation);}
@@ -137,6 +153,7 @@ class StripeBillingClockStorePolicyTest {
             throw new AssertionError("Unexpected SQL template: "+sql);
         }
         @Override @SuppressWarnings("unchecked") public <T> List<T> queryForList(String sql,Class<T> type,Object... args) {
+            scopeReads++;
             if(sql.contains("from payment_accounts") && pinnedAccountChanged)return List.of();
             if(sql.contains("select site_id from customers"))return (List<T>)List.of(owner.site().value());
             if(sql.contains("from stripe_billing_clock_intents")) {

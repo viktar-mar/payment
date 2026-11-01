@@ -9,6 +9,8 @@ import java.util.Optional;
 import java.util.UUID;
 import java.sql.Timestamp;
 import java.time.temporal.ChronoUnit;
+import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
+import dev.genericpayments.platform.subscriptions.domain.Subscription;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.*;
@@ -78,17 +80,19 @@ public class JdbcOwnedFirstRenewalStore implements OwnedFirstRenewalStore {
         lockProviderScope(admission);
         requirePaidInTransaction(admission);
         if(step==Step.BOUNDARY&&boundary!=null)throw unavailable();
-        // Boundary and later READY producers belong to the later consumer tasks. Until their exact
-        // persisted chain is implemented FINALIZATION stays fail-closed.
-        if(step==Step.FINALIZATION)throw unavailable();
-        if(!existing.isEmpty())return requireBoundaryAdvance(admission,advanceRow(existing.getFirst(),admission.id()));
-        long target=admission.receipt().periodEnd();
+        Boundary predecessor=step==Step.FINALIZATION?boundaryRow(admission).filter(b->b.equals(boundary)).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable):null;
+        if(!existing.isEmpty())return requireAdvance(admission,advanceRow(existing.getFirst(),admission.id()));
+        long target=step==Step.BOUNDARY?admission.receipt().periodEnd():Math.addExact(admission.receipt().periodEnd(),3600);
+        OwnedFirstRenewal.requireAdvanceWindow(admission,step,target);
         if(target<=admission.receipt().intent().clock().frozenTime())throw unavailable();
+        if(predecessor!=null&&(!predecessor.period().start().equals(Instant.ofEpochSecond(admission.receipt().periodEnd()))
+                ||!Instant.ofEpochSecond(target).isBefore(predecessor.period().end())))throw unavailable();
         var id=UUID.randomUUID();var key="billing-renewal-advance-v1:"+admission.id()+":"+step.number();
         var at=utcAt.truncatedTo(ChronoUnit.MICROS);
-        var fp=boundaryFingerprint(id,admission,target,key,at);
-        jdbc.update("insert into stripe_billing_first_renewal_steps(id,admission_id,ordinal,target,operation_key,fingerprint,prepared_at) values (?,?,?,?,?,?,?)",id,admission.id(),step.number(),target,key,fp,Timestamp.from(at));
-        return requireBoundaryAdvance(admission,advanceRow(id,admission.id()));
+        var fp=advanceFingerprint(id,admission,step,target,predecessor==null?null:predecessor.ready().id(),predecessor==null?null:predecessor.id(),key,at);
+        jdbc.update("insert into stripe_billing_first_renewal_steps(id,admission_id,ordinal,target,predecessor_ready,boundary_id,operation_key,fingerprint,prepared_at) values (?,?,?,?,?,?,?,?,?)",id,admission.id(),step.number(),target,
+            predecessor==null?null:predecessor.ready().id(),predecessor==null?null:predecessor.id(),key,fp,Timestamp.from(at));
+        return requireAdvance(admission,advanceRow(id,admission.id()));
     }
     @Transactional(propagation=Propagation.REQUIRES_NEW)
     public void stop(Admission admission,String reason,Instant utcAt){
@@ -102,11 +106,43 @@ public class JdbcOwnedFirstRenewalStore implements OwnedFirstRenewalStore {
     }
     @Transactional(propagation=Propagation.REQUIRES_NEW)
     public Admission requireCurrent(Admission admission){
-        requireTransaction();if(admission==null)throw unavailable();lockProviderScope(admission);return requirePaidInTransaction(admission);
+        requireTransaction();if(admission==null)throw unavailable();
+        // Authenticate immutable stored scope before classifying a predicate failure as drift.
+        // Forged records and infrastructure/lock errors must never gain authority to stop an owner.
+        requireStoredOriginal(admission.receipt());
+        if(admissionRow(admission.receipt()).filter(admission::equals).isEmpty())throw unavailable();
+        try{lockProviderScope(admission);return requirePaidInTransaction(admission);}
+        catch(IllegalStateException|IllegalArgumentException|dev.genericpayments.platform.shared.application.PaymentApplicationException changed){throw new AuthorityDrift();}
     }
-    public LaterReady recordReady(Ack ack,TestClockReady observation,Instant utcAt){throw unavailable();}
+    @Transactional(propagation=Propagation.REQUIRES_NEW)
+    public Optional<LaterReady> ready(Admission admission,Step step){
+        requireTransaction();if(admission==null||step==null)throw unavailable();lockProviderScope(admission);requirePaidInTransaction(admission);
+        requireHighest(admission,step);
+        return jdbc.queryForList("select id from stripe_billing_first_renewal_steps where admission_id=? and ordinal=?",UUID.class,admission.id(),step.number())
+            .stream().findFirst().flatMap(id->{requireAdvance(admission,advanceRow(id,admission.id()));return readyRow(admission,id);});
+    }
+    @Transactional(propagation=Propagation.REQUIRES_NEW)
+    public LaterReady recordReady(Ack ack,TestClockReady observation,Instant utcAt){
+        requireTransaction();if(ack==null||observation==null||utcAt==null)throw unavailable();
+        if(jdbc.queryForList("select id from provider_operations where id=? for update",UUID.class,ack.operation().id()).size()!=1)throw unavailable();
+        var admission=admissionForAdvance(jdbc,ack.operation().accountId(),ack.advance().id());
+        lockProviderScope(admission);requirePaidInTransaction(admission);requireAdvance(admission,ack.advance());
+        if(!ackRow(admission,ack.advance()).filter(ack::equals).isPresent()||!utcAt.isBefore(ack.deadline())
+                ||!Boolean.TRUE.equals(jdbc.queryForObject("select clock_timestamp() < ?",Boolean.class,Timestamp.from(ack.deadline()))))throw unavailable();
+        var ready=new LaterReady(UUID.randomUUID(),admission.id(),ack,observation,utcAt.truncatedTo(ChronoUnit.MICROS));
+        jdbc.update("""
+            insert into stripe_billing_first_renewal_ready(id,admission_id,step_id,reference,object_type,livemode,name,frozen_time,status,
+             provider_created,provider_deletes_after,advancing_target,observed_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,ready.id(),admission.id(),ack.advance().id(),observation.reference(),observation.object(),observation.livemode(),observation.name(),observation.frozenTime(),observation.status(),
+            observation.created(),observation.deletesAfter(),observation.advancingTarget(),Timestamp.from(ready.observedAt()));
+        return readyRow(admission,ack.advance().id()).filter(ready::equals).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+    }
     public Boundary recordBoundary(Admission admission,LaterReady ready,Boundary boundary){throw unavailable();}
-    public Boundary boundary(Admission admission){throw unavailable();}
+    @Transactional(propagation=Propagation.REQUIRES_NEW)
+    public Boundary boundary(Admission admission){
+        requireTransaction();lockProviderScope(admission);requirePaidInTransaction(admission);
+        return boundaryRow(admission).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+    }
     public Publication recordPublicationInTransaction(Admission admission,LaterReady ready,Paid paid){throw unavailable();}
     public Optional<Publication> publicationInTransaction(Admission admission){throw unavailable();}
 
@@ -135,15 +171,75 @@ public class JdbcOwnedFirstRenewalStore implements OwnedFirstRenewalStore {
         return jdbc.query("select * from stripe_billing_first_renewal_steps where id=? and admission_id=?",(r,n)->new Advance(r.getObject("id",UUID.class),admission,
             r.getInt("ordinal")==1?Step.BOUNDARY:Step.FINALIZATION,r.getLong("target"),r.getObject("predecessor_ready",UUID.class),r.getObject("boundary_id",UUID.class),r.getString("operation_key"),r.getString("fingerprint"),r.getTimestamp("prepared_at").toInstant()),id,admission).stream().findFirst().orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
     }
-    private Advance requireBoundaryAdvance(Admission admission,Advance advance){
-        if(advance.step()!=Step.BOUNDARY||advance.target()!=admission.receipt().periodEnd()
-                ||!advance.fingerprint().equals(boundaryFingerprint(advance.id(),admission,advance.target(),advance.operationKey(),advance.preparedAt())))throw unavailable();
+    private Advance requireAdvance(Admission admission,Advance advance){
+        if(!advance.equals(advanceRow(advance.id(),admission.id())))throw unavailable();
+        requireHighest(admission,advance.step());
+        long target=admission.receipt().periodEnd();
+        if(advance.step()==Step.FINALIZATION){
+            target=Math.addExact(target,3600);
+            var boundary=boundaryRow(admission).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+            if(!boundary.id().equals(advance.boundary())||!boundary.ready().id().equals(advance.predecessorReady())
+                    ||!boundary.period().start().equals(Instant.ofEpochSecond(admission.receipt().periodEnd()))
+                    ||!Instant.ofEpochSecond(target).isBefore(boundary.period().end()))throw unavailable();
+        }
+        if(advance.target()!=target||!advance.fingerprint().equals(advanceFingerprint(advance.id(),admission,advance.step(),advance.target(),
+                advance.predecessorReady(),advance.boundary(),advance.operationKey(),advance.preparedAt())))throw unavailable();
+        OwnedFirstRenewal.requireAdvanceWindow(admission,advance.step(),advance.target());
         return advance;
     }
-    private static String boundaryFingerprint(UUID id,Admission admission,long target,String key,Instant at){
+    private void requireHighest(Admission admission,Step step){
+        if(!jdbc.queryForList("select id from stripe_billing_first_renewal_steps where admission_id=? and ordinal>?",UUID.class,admission.id(),step.number()).isEmpty())throw unavailable();
+    }
+    private static String advanceFingerprint(UUID id,Admission admission,Step step,long target,UUID predecessor,UUID boundary,String key,Instant at){
         var c=admission.receipt().intent().clock();
-        return OwnedFirstRenewal.fingerprint("gp:owned-first-renewal-advance:v1",id,admission.id(),admission.fingerprint(),Step.BOUNDARY.number(),target,
-            c.creationOperation(),c.reference(),c.frozenTime(),null,null,key,at);
+        return OwnedFirstRenewal.fingerprint("gp:owned-first-renewal-advance:v1",id,admission.id(),admission.fingerprint(),step.number(),target,
+            c.creationOperation(),c.reference(),c.frozenTime(),predecessor,boundary,key,at);
+    }
+    /** No proxy/REQUIRES_NEW call: provider store owns its existing short transaction and row lock. */
+    static Admission requireAdvanceScope(JdbcTemplate jdbc,PaymentAccountId account,Advance expected){
+        var store=new JdbcOwnedFirstRenewalStore(jdbc);var a=admissionForAdvance(jdbc,account,expected.id());
+        store.lockProviderScope(a);store.requirePaidInTransaction(a);store.requireAdvance(a,expected);return a;
+    }
+    static Advance requireOperationAdvance(JdbcTemplate jdbc,ProviderOperation operation){
+        var store=new JdbcOwnedFirstRenewalStore(jdbc);var a=admissionForAdvance(jdbc,operation.accountId(),operation.resourceId());
+        var advance=store.advanceRow(operation.resourceId(),a.id());requireAdvanceScope(jdbc,operation.accountId(),advance);
+        var owner=a.receipt().intent().clock().owner();
+        if(!operation.operationKey().equals(advance.operationKey())||!operation.fingerprint().equals(advance.fingerprint())
+                ||!operation.externalAccountId().equals(owner.externalAccount())||!operation.credentialsRef().equals(owner.credentialsRef()))throw unavailable();
+        return advance;
+    }
+    static void requireAdvanceResource(JdbcTemplate jdbc,PaymentAccountId account,UUID resource,String key,String fingerprint){
+        var store=new JdbcOwnedFirstRenewalStore(jdbc);var a=admissionForAdvance(jdbc,account,resource);
+        var advance=store.advanceRow(resource,a.id());
+        if(!advance.operationKey().equals(key)||!advance.fingerprint().equals(fingerprint))throw unavailable();
+        requireAdvanceScope(jdbc,account,advance);
+    }
+    static Admission admissionForAdvance(JdbcTemplate jdbc,PaymentAccountId account,UUID step){
+        var ids=jdbc.queryForList("select a.subscription_id from stripe_billing_first_renewals a join stripe_billing_first_renewal_steps s on s.admission_id=a.id where s.id=? and a.payment_account_id=?",UUID.class,step,account.value());
+        if(ids.size()!=1)throw unavailable();
+        var intent=JdbcStripeBillingClockSubscriptionStore.intentRow(jdbc,account,ids.getFirst()).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+        var receipt=JdbcStripeBillingClockSubscriptionStore.receiptRow(jdbc,intent).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+        return new JdbcOwnedFirstRenewalStore(jdbc).admissionRow(receipt).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+    }
+    private Optional<Ack> ackRow(Admission admission,Advance advance){
+        return jdbc.query("select * from stripe_billing_first_renewal_acks where step_id=? and admission_id=?",(r,n)->new Ack(advance,
+            JdbcProviderOperationStore.row(jdbc,r.getObject("provider_operation",UUID.class)).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable),
+            r.getString("claimant"),r.getTimestamp("deadline").toInstant(),new TestClockAck(r.getString("reference"),r.getString("object_type"),r.getBoolean("livemode"),r.getString("name"),
+            r.getLong("frozen_time"),r.getString("status"),r.getLong("provider_created"),r.getLong("provider_deletes_after"),r.getObject("advancing_target",Long.class)),
+            r.getTimestamp("acknowledged_at").toInstant()),advance.id(),admission.id()).stream().findFirst();
+    }
+    private Optional<LaterReady> readyRow(Admission admission,UUID step){
+        var advance=advanceRow(step,admission.id());
+        return jdbc.query("select * from stripe_billing_first_renewal_ready where step_id=? and admission_id=?",(r,n)->new LaterReady(r.getObject("id",UUID.class),admission.id(),
+            ackRow(admission,advance).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable),new TestClockReady(r.getString("reference"),r.getString("object_type"),r.getBoolean("livemode"),r.getString("name"),
+            r.getLong("frozen_time"),r.getString("status"),r.getLong("provider_created"),r.getLong("provider_deletes_after"),r.getObject("advancing_target",Long.class)),r.getTimestamp("observed_at").toInstant()),
+            step,admission.id()).stream().findFirst();
+    }
+    private Optional<Boundary> boundaryRow(Admission admission){
+        return jdbc.query("select b.*,r.step_id from stripe_billing_first_renewal_boundary b join stripe_billing_first_renewal_ready r on r.id=b.ready_id and r.admission_id=b.admission_id where b.admission_id=?",(r,n)->
+            new Boundary(r.getObject("id",UUID.class),admission.id(),readyRow(admission,r.getObject("step_id",UUID.class)).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable),
+            r.getString("item_reference"),r.getString("invoice_reference"),new Subscription.Period(r.getTimestamp("period_start").toInstant(),r.getTimestamp("period_end").toInstant()),
+            r.getString("fingerprint"),r.getTimestamp("observed_at").toInstant()),admission.id()).stream().findFirst();
     }
     private void lockProviderScope(Admission admission){
         var o=admission.receipt().intent().clock().owner();
