@@ -2,6 +2,7 @@ import type {Browser, BrowserContext, Route} from '@playwright/test';
 import type {BillingBinding, BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {BillingFirstPaymentPort, FirstPaymentPrepared} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 import {billingBounded, billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
+import {browserFailure, browserDiagnostic, finishBrowserCleanup} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 // @ts-ignore Explicit source import for dependency-free Node tests.
 import {enterPrivateText} from './private-entry.ts';
 
@@ -20,11 +21,13 @@ export function createFirstPaymentBridge(options: {
   token: string;
   port: Pick<BillingFirstPaymentPort, 'confirm'>;
   limits: BillingLimits;
+  latchFailure?: (checkpoint: string) => Error;
 }): (route: Pick<Route, 'request' | 'fulfill'>) => Promise<void> {
-  const {binding, prepared, token, port, limits} = options;
+  const {binding, prepared, token, port, limits, latchFailure = browserFailure} = options;
   const original = `${binding.endpoints.backend}/api/v1/customer/subscriptions/${prepared.subscription_id}/operations/${prepared.operation_id}`;
   let step = 0;
   return async route => {
+    const checkpoint = ['BROWSER_ACTION_BRIDGE','BROWSER_SESSION_BRIDGE','BROWSER_CONFIRM_BRIDGE'][Math.min(step, 2)]!;
     try {
       billingCheck(limits);
       need(step < 3 && Date.now() < Date.parse(prepared.session.expires_at));
@@ -63,7 +66,7 @@ export function createFirstPaymentBridge(options: {
       billingCheck(limits);
     } catch {
       step = 3;
-      fail();
+      throw latchFailure(checkpoint);
     }
   };
 }
@@ -74,8 +77,15 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
   let abandoned = false;
   let closing: Promise<void> | undefined;
   let failure = false;
+  let firstFailure: Error | undefined;
+  let checkpoint = 'BROWSER_CONTEXT';
+  const latch = (code: string): Error => firstFailure ??= browserFailure(code);
+  const at = async <T>(code: string, body: () => Promise<T>): Promise<T> => {
+    checkpoint = code;
+    try {return await body();} catch {throw latch(code);}
+  };
   const close = (value: BrowserContext): Promise<void> => {
-    closing ??= value.close();
+    closing ??= Promise.resolve().then(() => value.close());
     void closing.catch(() => {});
     return closing;
   };
@@ -83,17 +93,18 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     abandoned = true;
     if (context) void close(context);
   };
-  const opening = browser.newContext({serviceWorkers:'block', acceptDownloads:false});
-  void opening.then(value => {if (abandoned) return close(value);}, () => {}).catch(() => {});
   limits.signal?.addEventListener('abort', abort, {once:true});
   const pending = new Set<Promise<void>>();
   try {
+    const opening = browser.newContext({serviceWorkers:'block', acceptDownloads:false});
+    void opening.then(value => {if (abandoned) return close(value);}, () => {}).catch(() => {});
     context = await billingBounded(limits, () => opening);
-    const page = await billingBounded(limits, () => context!.newPage());
+    const page = await at('BROWSER_PAGE', () => billingBounded(limits, () => context!.newPage()));
     const waitPhase = async (expected: string): Promise<void> => {
       await page.waitForFunction(value => [value,'STOPPED'].includes(document.body.dataset.phase ?? ''), expected, {timeout:remaining(limits)});
       need(await page.locator('body').getAttribute('data-phase') === expected);
     };
+    checkpoint = 'BROWSER_SETUP';
     const binding = port.resources();
     const otp = binding.endpoints.backend + '/api/v1/public/customer-auth/email-otp/challenges';
     let bridge: ReturnType<typeof createFirstPaymentBridge> | undefined;
@@ -102,7 +113,7 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     let verifies = 0;
     let documents = 0;
     page.on('framenavigated', frame => {
-      if (frame === page.mainFrame() && ++documents > 1) {failure = true; abort();}
+      if (frame === page.mainFrame() && ++documents > 1) {latch('BROWSER_NAVIGATION'); failure = true; abort();}
     });
     await context.exposeBinding('__firstPaymentPrepare', async ({frame}, input: unknown) => {
       try {
@@ -113,16 +124,18 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
         const value = input as {token:string;origin:string;customerId:string;siteId:string};
         await port.acknowledgeCustomer({customerId:value.customerId, siteId:value.siteId});
         const result = await port.prepare({token:value.token, origin:value.origin}, crypto.randomUUID(), limits);
-        bridge = createFirstPaymentBridge({binding, prepared:result, token:value.token, port, limits});
+        bridge = createFirstPaymentBridge({binding, prepared:result, token:value.token, port, limits, latchFailure:latch});
         return {subscriptionId:result.subscription_id, operationId:result.operation_id};
       } catch {
+        const primary = latch('BROWSER_PREPARE');
         failure = true;
         abort();
-        fail();
+        throw primary;
       }
     });
     await context.route(binding.endpoints.backend + '/**', route => {
       const work = (async () => {
+        let routeCheckpoint = 'BROWSER_SETUP';
         try {
           billingCheck(limits);
           need(!failure);
@@ -133,6 +146,7 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
             return;
           }
           if (request.url() === otp && request.method() === 'POST') {
+            routeCheckpoint = 'BROWSER_OTP_REQUEST';
             need(++challenges === 1);
             const value: unknown = JSON.parse(request.postData() ?? '');
             need(exact(value, ['site_key','email','intent']) && value.site_key === binding.siteKey && value.email === binding.email && value.intent === 'AUTHENTICATE');
@@ -140,13 +154,15 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
             return;
           }
           if (request.url().startsWith(otp + '/') && /^\/[0-9a-f-]{36}\/verify$/.test(request.url().slice(otp.length)) && request.method() === 'POST') {
+            routeCheckpoint = 'BROWSER_OTP_VERIFY';
             need(++verifies === 1 && challenges === 1);
             await route.fallback();
             return;
           }
           need(bridge);
           await bridge!(route);
-        } catch {
+        } catch (error) {
+          latch(browserDiagnostic(error) ?? routeCheckpoint);
           failure = true;
           await route.abort('failed').catch(() => {});
           abort();
@@ -156,40 +172,58 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
       void work.finally(() => pending.delete(work));
       return work;
     });
-    await page.goto(binding.endpoints.demo + '/billing-first-payment.html', {timeout:remaining(limits)});
-    await page.waitForFunction(() => typeof (window as any).__firstPaymentConfigure === 'function', undefined, {timeout:remaining(limits)});
-    await page.evaluate(value => (window as any).__firstPaymentConfigure(value), {backend:binding.endpoints.backend, siteKey:binding.siteKey, email:binding.email, deadline:Math.min(limits.deadline, Date.now() + 300000)});
-    await page.getByRole('button', {name:'Request code', exact:true}).click({timeout:remaining(limits)});
-    await waitPhase('CODE');
-    await port.withOtpCode(async code => {
-      await enterPrivateText(page.getByRole('textbox', {name:'Six-digit code', exact:true}), code);
-      return true as const;
-    }, limits);
-    await page.getByRole('button', {name:'Verify code', exact:true}).click({timeout:remaining(limits)});
-    await waitPhase('AUTHENTICATED');
-    await page.getByRole('checkbox', {name:'I consent to recurring payments', exact:true}).check({timeout:remaining(limits)});
-    await page.getByRole('button', {name:'Start payment', exact:true}).click({timeout:remaining(limits)});
-    await waitPhase('READY');
-    need(await page.getByRole('button', {name:'Pay', exact:true}).isEnabled());
+    await at('BROWSER_NAVIGATION', () => page.goto(binding.endpoints.demo + '/billing-first-payment.html', {timeout:remaining(limits)}));
+    await at('BROWSER_CONFIGURE', async () => {
+      await page.waitForFunction(() => typeof (window as any).__firstPaymentConfigure === 'function', undefined, {timeout:remaining(limits)});
+      await page.evaluate(value => (window as any).__firstPaymentConfigure(value), {backend:binding.endpoints.backend, siteKey:binding.siteKey, email:binding.email, deadline:Math.min(limits.deadline, Date.now() + 300000)});
+    });
+    await at('BROWSER_OTP_REQUEST', async () => {
+      await page.getByRole('button', {name:'Request code', exact:true}).click({timeout:remaining(limits)});
+      await waitPhase('CODE');
+    });
+    await at('BROWSER_OTP_VERIFY', async () => {
+      await port.withOtpCode(async code => {
+        await enterPrivateText(page.getByRole('textbox', {name:'Six-digit code', exact:true}), code);
+        return true as const;
+      }, limits);
+      await page.getByRole('button', {name:'Verify code', exact:true}).click({timeout:remaining(limits)});
+      await waitPhase('AUTHENTICATED');
+    });
+    await at('BROWSER_PREPARE', async () => {
+      await page.getByRole('checkbox', {name:'I consent to recurring payments', exact:true}).check({timeout:remaining(limits)});
+      await page.getByRole('button', {name:'Start payment', exact:true}).click({timeout:remaining(limits)});
+    });
+    await at('BROWSER_WAIT_READY', async () => {
+      await waitPhase('READY');
+      need(await page.getByRole('button', {name:'Pay', exact:true}).isEnabled());
+    });
+    checkpoint = 'BROWSER_CARD_NUMBER';
     const frame = page.locator('#provider').frameLocator('iframe[title="Secure payment input frame"]');
-    await frame.locator('input[name="number"]').fill('4242424242424242', {timeout:remaining(limits)});
-    await frame.locator('input[name="expiry"]').fill('1230', {timeout:remaining(limits)});
-    await frame.locator('input[name="cvc"]').fill('123', {timeout:remaining(limits)});
+    await at('BROWSER_CARD_NUMBER', () => frame.locator('input[name="number"]').fill('4242424242424242', {timeout:remaining(limits)}));
+    await at('BROWSER_CARD_EXPIRY', () => frame.locator('input[name="expiry"]').fill('1230', {timeout:remaining(limits)}));
+    await at('BROWSER_CARD_CVC', () => frame.locator('input[name="cvc"]').fill('123', {timeout:remaining(limits)}));
+    checkpoint = 'BROWSER_POSTAL_CHECK';
     const postal = frame.locator('input[name="postalCode"]');
-    if (await postal.isVisible()) await postal.fill('10001', {timeout:remaining(limits)});
-    await page.getByRole('button', {name:'Pay', exact:true}).click({timeout:remaining(limits)});
-    await waitPhase('OBSERVE');
+    if (await at('BROWSER_POSTAL_CHECK', () => postal.isVisible())) await at('BROWSER_POSTAL_FILL', () => postal.fill('10001', {timeout:remaining(limits)}));
+    await at('BROWSER_PAY_CLICK', () => page.getByRole('button', {name:'Pay', exact:true}).click({timeout:remaining(limits)}));
+    await at('BROWSER_WAIT_OBSERVE', () => waitPhase('OBSERVE'));
     billingCheck(limits);
     need(!failure && prepared && challenges === 1 && verifies === 1);
     return true;
   } catch {
-    return fail();
+    throw latch(checkpoint);
   } finally {
     abandoned = true;
     limits.signal?.removeEventListener('abort', abort);
-    if (context) await billingBounded({deadline:Date.now() + 15000}, async () => {
-      await close(context!);
-      await Promise.allSettled(pending);
-    });
+    let cleanup = false;
+    try {
+      if (context) await billingBounded({deadline:Date.now() + 15000}, async () => {
+        await close(context!);
+        await Promise.allSettled(pending);
+      });
+      // An unresolved context opening has no trustworthy cleanup proof.
+      cleanup = !!context;
+    } catch {throw latch('BROWSER_CLOSE');}
+    finally {if (firstFailure) {finishBrowserCleanup(firstFailure, cleanup); throw firstFailure;}}
   }
 }

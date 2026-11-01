@@ -1492,7 +1492,7 @@ The bounded owned off-Stripe policy changes the application evidence requirement
 
 For a typed original receipt, positive INITIAL invoice and actual invoice status exactly `open`, action/material/preconfirm accept allocation `amount_paid` as typed null or explicit numeric zero; supplied positive or negative amounts refuse. The [pinned stripe-java 34.0.0 model](https://raw.githubusercontent.com/stripe/stripe-java/v34.0.0/src/main/java/com/stripe/model/InvoicePayment.java) documents null until the payment is paid, corroborated by the [official object reference](https://docs.stripe.com/api/invoice-payment/object); the [pinned SDK API version](https://raw.githubusercontent.com/stripe/stripe-java/v34.0.0/src/main/java/com/stripe/ApiVersion.java) is `2026-09-30.endive`. Omitted and JSON-null source representations both deserialize to typed null; this boundary cannot distinguish them or establish conforming wire omission. Null remains unfinalized/unknown, never numeric zero or cash. Complete independent unpaid proof remains mandatory: invoice paid explicitly zero and remaining exactly positive catalog due; sole default open allocation requesting that due with exact owner/currency/mode/payment reference; matching card-only automatic PI with received explicitly zero, automatic confirmation, `requires_payment_method` and no latest Charge; exact sole reverse allocation; original receipt/clock/period/line and secret bounds. Ordinary/nonoriginal action still requires explicit allocation zero. CASH still requires explicit full paid allocation, succeeded full PI, full paid/captured card Charge, exact reverse ownership and paid timestamp. This is a bounded admission correction, with no new financial route, read, root authority or dispatch budget. Historical run `aabe30d7-d499-46bf-bb56-4f592ed50aa8` reached a getter returning null; its precise wire representation and provider outcome remain unknown. Its uncertain CREATE is consumed and nonretryable; initial-payment/full 5B remain NOT_ACCEPTED and no native attempt is authorized.
 
-The source preparation adds a dedicated `OWNED_INITIAL_PAYMENT` lane for one fresh READY Stripe TestClock, its owned Customer, a fresh published EUR20 MONTH inclusive Price with no trial, one original CREATE and one 4242 `SERVER_CONFIRM_V2` confirmation. Native Billing is **NOT_RUN**; full 5B is **NOT_ACCEPTED**. The previous component checkpoint `69e61e7` / [CI40971762290](https://github.com/viktar-mar/payment/actions/runs/40971762290) passed. It does not prove this new scenario. The intermediate `05f897b` hosted run exposed a finite inert-import test allowlist omission, now repaired in source; the combined scenario still requires independent review and successful hosted CI at its final published SHA.
+The source preparation adds a dedicated `OWNED_INITIAL_PAYMENT` lane for one fresh READY Stripe TestClock, its owned Customer, a fresh published EUR20 MONTH inclusive Price with no trial, one original CREATE and one 4242 `SERVER_CONFIRM_V2` confirmation. Native initial-payment and full 5B remain **NOT_ACCEPTED**. The previous component checkpoint `69e61e7` / [CI40971762290](https://github.com/viktar-mar/payment/actions/runs/40971762290) passed. It does not prove this new scenario. The intermediate `05f897b` hosted run exposed a finite inert-import test allowlist omission, now repaired in source; the combined scenario still requires independent review and successful hosted CI at its final published SHA.
 
 This paragraph and command document a future invocation, not permission to execute it. Obtain separate runtime approval for the exact reviewed source SHA, new UUID, canonical owned Docker daemon, seven free loopback ports, explicit frozen epoch, pinned account `acct_1UPiMpELswAd8tpR` / API `2026-09-30.endive`, and fixed financial budget `{clock:1,customer:1,create:1,confirm:1}`. Fresh fixed catalog provisioning is separate. Do not adopt any old provider/local IDs, private recovery state, retained run or prior volume. All old Billing/full/remaining/manual/refund/diagnostic/Stage4 flags must be absent or false; DEBUG/NODE_DEBUG/PWDEBUG/PW_TRACE must be off. The reviewed bootstrap alone reads its existing private Sandbox credential file and creates fresh keys, issuer, ledger and runtime capability. No runtime control key is an operator/browser input.
 
@@ -1717,3 +1717,47 @@ unknown. Existing admission, runtime/image/source/ownership proofs, financial
 validation and original dispatch authority remain in force. No old DISPATCHING
 operation gains retry or recovery authority. Native initial-payment and full5B
 acceptance remain **NOT_ACCEPTED**.
+
+Owned first-payment browser failures now preserve a finite operation checkpoint
+in the Node owner's existing terminal diagnostic. The exact closed set is
+`BROWSER_CONTEXT`, `BROWSER_PAGE`, `BROWSER_SETUP`, `BROWSER_NAVIGATION`,
+`BROWSER_CONFIGURE`, `BROWSER_OTP_REQUEST`, `BROWSER_OTP_VERIFY`,
+`BROWSER_PREPARE`, `BROWSER_ACTION_BRIDGE`, `BROWSER_SESSION_BRIDGE`,
+`BROWSER_CONFIRM_BRIDGE`, `BROWSER_WAIT_READY`, `BROWSER_CARD_NUMBER`,
+`BROWSER_CARD_EXPIRY`, `BROWSER_CARD_CVC`, `BROWSER_POSTAL_CHECK`,
+`BROWSER_POSTAL_FILL`, `BROWSER_PAY_CLICK`, `BROWSER_WAIT_OBSERVE`, and
+`BROWSER_CLOSE`. A checkpoint names the first operation where failure was
+observed; it does not identify a Stripe, DOM, validation, or historical root
+cause. Private WeakMap provenance supplies the code; rejected values, messages,
+properties, getters, causes and stacks supply no authority. The displayed browser
+error remains `Error: first_payment_BROWSER`.
+
+The runner latches asynchronous bridge, binding and navigation failures before
+abort/close. A later close rejection cannot replace the primary checkpoint or
+make a rejected run successful. The owner's first failure also wins when its
+diagnostic was null, so an earlier PREPARE/CONFIRM/abort failure cannot acquire a
+later browser label. Only the BROWSER boundary consumes browser provenance.
+The existing final line remains
+`owned_initial_payment_diagnostic code=<CLOSED_CODE> cleanup=<CONFIRMED|UNCONFIRMED>`;
+only the finite code and existing cleanup boolean leave the process. There are
+no new wire fields or private PREPARE response labels.
+
+Cleanup remains `UNCONFIRMED` when browser close is rejected, bounded out, or
+not yet known to have completed. The owner tracks journey settlement separately
+from the outer abort race and snapshots browser cleanup knowledge before starting
+its existing container cleanup. A pending journey or foreign rejection cannot
+claim confirmed browser cleanup. Late settlement cannot upgrade the first null
+diagnostic or reopen the final result. A journey that never started adds no
+browser uncertainty. Existing owner/page/locator/bridge/close limits and the
+container-stop budget are unchanged; there is no extra wait or close call.
+
+The safe report for run `6c32724b-cd17-4ab2-9b52-88f85f392701` at source
+`56ea76f74ffb48356a938d7b30ff7bbecfb198fb` records CREATE dispatch and
+acknowledgement, no CONFIRM dispatch/acknowledgement, a null diagnostic, STOPPED
+runtime state, and independent confirmation that all seven containers stopped.
+The interval after CREATE acknowledgement and before CONFIRM dispatch is inferred;
+the historical browser cause remains unknown. CREATE is consumed, acknowledged
+and nonretryable, cash remains unverified, and native initial-payment/full 5B
+remain **NOT_ACCEPTED**. Offline injected tests establish the diagnostic repair
+only. This source change grants no Sandbox execution, replay, recovery, new
+attempt, selector change, or financial authority.

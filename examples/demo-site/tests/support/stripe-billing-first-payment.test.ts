@@ -131,6 +131,103 @@ test('browser runner sanitizes early page failure and closes the opened context'
   assert.equal(portReads, 0);
 });
 
+test('browser page checkpoint survives sanitization and terminal formatting', async () => {
+  const module = await import(moduleUrl);
+  const {formatBillingFirstPaymentDiagnostic} = await import('../../../../infrastructure/stripe-billing-first-payment.mjs');
+  let error: unknown;
+  try {await module.runFirstPaymentBrowser({newContext:async()=>({newPage:async()=>{throw null;},close:async()=>{}})}, {}, {deadline:Date.now()+1000});} catch (value) {error=value;}
+  // The final formatter must recognize the literal closed checkpoint.
+  assert.equal(formatBillingFirstPaymentDiagnostic({runId:id('1'),expectedSource:'e'.repeat(40),scope:'OWNED_INITIAL_PAYMENT',full5bAccepted:false,phase:'BROWSER',status:'CLOSED',initialAccepted:false,code:'BROWSER',diagnostic:'BROWSER_PAGE',cleanupConfirmed:true}), 'owned_initial_payment_diagnostic code=BROWSER_PAGE cleanup=CONFIRMED');
+  assert.match(String(error), /^Error: first_payment_BROWSER$/);
+});
+
+// Inert original-flow fixture: no callback evaluates browser source or starts a browser.
+async function journeyFixture(fault = '', options: {closeReject?:boolean;stopReady?:boolean;stopObserve?:boolean;postalVisible?:boolean;lateOpen?:boolean;payRace?:'bridge-first'|'pay-first'} = {}) {
+  const module=await import(moduleUrl);
+  const provenance=await import('../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs');
+  const p=prepared(),calls:string[]=[],b={...binding,siteKey:'fixture-site',email:'fixture@example.test'};
+  let phase='',bindingCallback:any,routeCallback:any,navigation:any,closed=false,releaseOpen:any,releaseHeaders:undefined|(()=>void);
+  const hit=(name:string)=>{calls.push(name);if(fault===name)throw new Proxy({}, {get(){throw Error('foreign value read');}});};
+  const frame={url:()=>b.endpoints.demo+'/billing-first-payment.html'};
+  const requestRoute=(url:string,method='GET',body?:unknown,wrong=false)=>{
+    const r=route(url,method,body);
+    if(wrong){const request=r.request;r.request=()=>({...request(),allHeaders:async()=>{
+      if(options.payRace==='pay-first')await new Promise<void>(resolve=>{releaseHeaders=resolve;});
+      return {get authorization(){calls.push('bridge_validation_observed');return 'Bearer foreign';},origin:b.endpoints.demo,'content-type':'application/json','idempotency-key':'sdk-original-key'};
+    }});}
+    return {...r,fallback:async()=>{},abort:async()=>{calls.push('route-abort');}};
+  };
+  const original=`${b.endpoints.backend}/api/v1/customer/subscriptions/${p.subscription_id}/operations/${p.operation_id}`;
+  const otp=b.endpoints.backend+'/api/v1/public/customer-auth/email-otp/challenges';
+  const selectBridge=async()=>{await routeCallback(requestRoute(original+'/action'));await routeCallback(requestRoute(original+'/confirmation-session','POST',{action_token:p.action.secret}));};
+  const page:any={mainFrame:()=>frame,on:(_event:string,cb:any)=>{navigation=cb;},
+    goto:async()=>{hit('NAVIGATION');navigation(frame);},
+    waitForFunction:async(_fn:any,expected:string)=>{if(expected==='READY'&&fault==='SECOND_NAVIGATION')navigation(frame);if(closed)throw null;if(expected)hit('WAIT_'+expected);else hit('CONFIGURE_WAIT');},
+    evaluate:async()=>{hit('CONFIGURE');},
+    locator:(selector:string)=>selector==='body'?{getAttribute:async()=>(options.stopReady&&phase==='READY'||options.stopObserve&&phase==='OBSERVE')?'STOPPED':phase}:{frameLocator:()=>({locator:(s:string)=>({fill:async()=>hit(s.includes('number')?'CARD_NUMBER':s.includes('expiry')?'CARD_EXPIRY':s.includes('cvc')?'CARD_CVC':'POSTAL_FILL'),isVisible:async()=>{hit('POSTAL_CHECK');return options.postalVisible!==false;}})})},
+    getByRole:(_role:string,{name}:any)=>({evaluate:async()=>true,check:async()=>{},isEnabled:async()=>true,click:async()=>{
+      if(name==='Request code'){hit('OTP_REQUEST');await routeCallback(requestRoute(otp,'POST',{site_key:b.siteKey,email:b.email,intent:'AUTHENTICATE'}));phase='CODE';}
+      if(name==='Verify code'){hit('OTP_VERIFY');await routeCallback(requestRoute(otp+'/'+id('9')+'/verify','POST',{}));phase='AUTHENTICATED';}
+      if(name==='Start payment'){await bindingCallback({frame},{token,origin:b.endpoints.demo,customerId:b.customerId,siteId:b.siteId});await selectBridge();phase='READY';}
+      if(name==='Pay'){
+        hit('PAY_CLICK');
+        const confirmation=()=>requestRoute(original+'/confirmation-attempts/'+p.session.attempt_id+'/confirm','POST',{capability:p.session.capability,confirmation_token:'ctoken_fixture'},!!options.payRace);
+        if(options.payRace){void routeCallback(confirmation());throw null;}
+        if(fault!=='WAIT_OBSERVE'&&!options.stopObserve)await routeCallback(confirmation());phase='OBSERVE';
+      }
+    }}),
+  };
+  const context:any={newPage:async()=>{hit('PAGE');return page;},exposeBinding:async(_name:string,cb:any)=>{hit('SETUP');bindingCallback=cb;},route:async(_url:string,cb:any)=>{routeCallback=async(r:any)=>{if(fault==='ACTION_BRIDGE'&&r.request().url().endsWith('/action'))r.fulfill=async()=>{throw null;};if(fault==='SESSION_BRIDGE'&&r.request().url().endsWith('/confirmation-session'))r.fulfill=async()=>{throw null;};if(fault==='CONFIRM_BRIDGE'&&r.request().url().endsWith('/confirm'))r.fulfill=async()=>{throw null;};return cb(r);};},close:async()=>{calls.push('close');closed=true;releaseHeaders?.();if(options.closeReject)throw null;}};
+  const browser:any={newContext:()=>{hit('CONTEXT');return options.lateOpen?new Promise(r=>releaseOpen=r):Promise.resolve(context);}};
+  const port:any={resources:()=>b,acknowledgeCustomer:async()=>true,prepare:async()=>{hit('PREPARE');return p;},withOtpCode:async(cb:any)=>cb('123456'),confirm:async()=>{calls.push('confirm');return {...p,phase:'OBSERVE',protocol:'SERVER_CONFIRM_V2',attempt_id:p.session.attempt_id,state:'OBSERVE',retry_allowed:false,successor_attempt_id:null,next_action_allowed:false,expires_at:p.session.expires_at};}};
+  return {run:(limits:any={deadline:Date.now()+1000})=>module.runFirstPaymentBrowser(browser,port,limits),calls,provenance,releaseOpen:()=>releaseOpen(context)};
+}
+test('independent confirm bridge failure wins before concurrent Pay rejection propagates',async()=>{
+  const f=await journeyFixture('',{payRace:'bridge-first'});let failure;try{await f.run();}catch(error){failure=error;}
+  assert.equal(f.calls.filter(x=>x==='bridge_validation_observed').length,1);assert.equal(f.calls.filter(x=>x==='PREPARE').length,1);assert.equal(f.calls.filter(x=>x==='confirm').length,0);assert.equal(f.calls.filter(x=>x==='close').length,1);
+  assert.equal(String(failure),'Error: first_payment_BROWSER');assert.equal(f.provenance.browserDiagnostic(failure),'BROWSER_CONFIRM_BRIDGE');
+});
+test('earlier Pay rejection survives an independently pending confirm bridge failure',async()=>{
+  const f=await journeyFixture('',{payRace:'pay-first'});let failure;try{await f.run();}catch(error){failure=error;}
+  assert.equal(f.calls.filter(x=>x==='bridge_validation_observed').length,1);assert.equal(f.calls.filter(x=>x==='PREPARE').length,1);assert.equal(f.calls.filter(x=>x==='confirm').length,0);assert.equal(f.calls.filter(x=>x==='close').length,1);
+  assert.ok(f.calls.indexOf('close')<f.calls.indexOf('bridge_validation_observed'));assert.equal(String(failure),'Error: first_payment_BROWSER');assert.equal(f.provenance.browserDiagnostic(failure),'BROWSER_PAY_CLICK');
+});
+for(const [fault,code] of [['CONTEXT','BROWSER_CONTEXT'],['PAGE','BROWSER_PAGE'],['SETUP','BROWSER_SETUP'],['NAVIGATION','BROWSER_NAVIGATION'],['CONFIGURE','BROWSER_CONFIGURE'],['OTP_REQUEST','BROWSER_OTP_REQUEST'],['OTP_VERIFY','BROWSER_OTP_VERIFY'],['PREPARE','BROWSER_PREPARE'],['WAIT_READY','BROWSER_WAIT_READY'],['CARD_NUMBER','BROWSER_CARD_NUMBER'],['CARD_EXPIRY','BROWSER_CARD_EXPIRY'],['CARD_CVC','BROWSER_CARD_CVC'],['POSTAL_CHECK','BROWSER_POSTAL_CHECK'],['POSTAL_FILL','BROWSER_POSTAL_FILL'],['PAY_CLICK','BROWSER_PAY_CLICK'],['WAIT_OBSERVE','BROWSER_WAIT_OBSERVE'],['ACTION_BRIDGE','BROWSER_ACTION_BRIDGE'],['SESSION_BRIDGE','BROWSER_SESSION_BRIDGE'],['CONFIRM_BRIDGE','BROWSER_CONFIRM_BRIDGE'],['SECOND_NAVIGATION','BROWSER_NAVIGATION']])test('inert original journey retains literal '+code+' for '+fault,async()=>{
+ const f=await journeyFixture(fault!);let e;try{await f.run();}catch(error){e=error;}
+ assert.equal(String(e),'Error: first_payment_BROWSER');assert.equal(f.provenance.browserDiagnostic(e),code);
+ assert.equal(f.calls.filter(x=>x==='close').length,fault==='CONTEXT'?0:1);
+ if(['WAIT_READY','CARD_NUMBER','CARD_EXPIRY','CARD_CVC','POSTAL_CHECK','POSTAL_FILL','WAIT_OBSERVE'].includes(fault!)){assert.equal(f.calls.filter(x=>x==='PREPARE').length,1);assert.equal(f.calls.filter(x=>x==='confirm').length,0);}
+});
+test('STOPPED READY preserves checkpoint without confirm and successful original flow confirms once',async()=>{
+ const f=await journeyFixture('',{stopReady:true});let e;try{await f.run();}catch(error){e=error;}assert.equal(f.provenance.browserDiagnostic(e),'BROWSER_WAIT_READY');assert.equal(f.calls.filter(x=>x==='confirm').length,0);assert.equal(f.calls.filter(x=>x==='PREPARE').length,1);
+ const success=await journeyFixture();assert.equal(await success.run(),true);assert.equal(success.calls.filter(x=>x==='confirm').length,1);assert.equal(success.calls.filter(x=>x==='close').length,1);
+});
+test('synthetic validation STOPPED at OBSERVE cannot confirm or accept',async()=>{
+ const f=await journeyFixture('',{stopObserve:true});let error;try{await f.run();}catch(e){error=e;}assert.equal(f.provenance.browserDiagnostic(error),'BROWSER_WAIT_OBSERVE');assert.equal(f.calls.filter(x=>x==='PREPARE').length,1);assert.equal(f.calls.filter(x=>x==='confirm').length,0);assert.equal(f.calls.filter(x=>x==='close').length,1);
+});
+test('invisible optional postal field leaves original successful route sequence intact',async()=>{
+ const f=await journeyFixture('',{postalVisible:false});assert.equal(await f.run(),true);assert.equal(f.calls.includes('POSTAL_FILL'),false);assert.equal(f.calls.filter(x=>x==='confirm').length,1);assert.equal(f.calls.filter(x=>x==='close').length,1);
+});
+for(const fault of ['CARD_NUMBER',''])test('rejecting close preserves '+(fault||'successful body')+' primary and cleanup uncertainty',async()=>{
+ const f=await journeyFixture(fault,{closeReject:true});let e;try{await f.run();}catch(error){e=error;}assert.equal(String(e),'Error: first_payment_BROWSER');assert.equal(f.provenance.browserDiagnostic(e),fault?'BROWSER_CARD_NUMBER':'BROWSER_CLOSE');assert.equal(f.provenance.browserCleanupConfirmed(e),false);assert.equal(f.calls.filter(x=>x==='close').length,1);
+});
+for(const code of ['BROWSER_CONTEXT','BROWSER_PAGE','BROWSER_SETUP','BROWSER_NAVIGATION','BROWSER_CONFIGURE','BROWSER_OTP_REQUEST','BROWSER_OTP_VERIFY','BROWSER_PREPARE','BROWSER_ACTION_BRIDGE','BROWSER_SESSION_BRIDGE','BROWSER_CONFIRM_BRIDGE','BROWSER_WAIT_READY','BROWSER_CARD_NUMBER','BROWSER_CARD_EXPIRY','BROWSER_CARD_CVC','BROWSER_POSTAL_CHECK','BROWSER_POSTAL_FILL','BROWSER_PAY_CLICK','BROWSER_WAIT_OBSERVE','BROWSER_CLOSE'])test('reporter transports literal '+code+' exactly once',async()=>{
+ const {default:Reporter}=await import(new URL('./stripe-billing-first-payment-reporter.ts',import.meta.url).href);
+ const {formatBillingFirstPaymentDiagnostic,parseBillingFirstPaymentDiagnosticLine}=await import(new URL('../../../../infrastructure/stripe-billing-first-payment.mjs',import.meta.url).href);
+ const line=formatBillingFirstPaymentDiagnostic({status:'CLOSED',initialAccepted:false,code:'BROWSER',diagnostic:code,cleanupConfirmed:true});assert.equal(line,'owned_initial_payment_diagnostic code='+code+' cleanup=CONFIRMED');assert.equal(parseBillingFirstPaymentDiagnosticLine(line),line);assert.ok(line.length<160);
+ const original=process.stdout.write,lines:string[]=[];process.stdout.write=((value:unknown)=>{lines.push(String(value));return true;}) as typeof process.stdout.write;
+ try{const reporter=new Reporter();for(const bad of [code+'_ALIAS','PREFIX_'+code,code+'1','BROWSER_UNKNOWN','sk_test_SECRET'])reporter.onStdOut('owned_initial_payment_diagnostic code='+bad+' cleanup=CONFIRMED\n');reporter.onStdOut(line+' extra\n');reporter.onStdOut('x'.repeat(4097)+line+'\n');reporter.onStdOut(line.slice(0,31));reporter.onStdOut(line.slice(31)+'\n');reporter.onStdOut(line+'\n');reporter.onError(new Proxy({},{get(){throw null;}}));assert.deepEqual(lines,[line+'\n','first_payment_setup_failed\n']);}finally{process.stdout.write=original;}
+});
+test('aborted context opening closes once after late resolution without restoring success',async()=>{
+ const f=await journeyFixture('',{lateOpen:true}),controller=new AbortController();const running=f.run({deadline:Date.now()+1000,signal:controller.signal});const rejected=assert.rejects(running,/first_payment_BROWSER/);controller.abort();await rejected;f.releaseOpen();await Promise.resolve();await Promise.resolve();assert.equal(f.calls.filter(x=>x==='close').length,1);
+});
+test('runner close timeout retains the first checkpoint and cannot gain late cleanup proof',async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});const module=await import(moduleUrl),meta=await import('../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs');let enter:any,release:any,closes=0;const entered=new Promise(r=>enter=r);
+ const context={newPage:async()=>{throw null;},close:()=>{closes++;enter();return new Promise<void>(r=>release=r);}};
+ const running=module.runFirstPaymentBrowser({newContext:async()=>context},{},{deadline:100000});let failure:unknown;const settled=running.catch((error:unknown)=>{failure=error;});await entered;t.mock.timers.tick(15000);await settled;
+ assert.equal(meta.browserDiagnostic(failure),'BROWSER_PAGE');assert.equal(meta.browserCleanupConfirmed(failure),false);release();for(let i=0;i<10;i++)await Promise.resolve();assert.equal(meta.browserCleanupConfirmed(failure),false);assert.equal(closes,1);
+});
+
 test('reporter forwards one strict final diagnostic after CLI handoff and drops hostile suffixes', async () => {
   const {default:Reporter}=await import(new URL('./stripe-billing-first-payment-reporter.ts',import.meta.url).href);
   const original=process.stdout.write,lines:string[]=[];process.stdout.write=((v:unknown)=>{lines.push(String(v));return true;}) as typeof process.stdout.write;
