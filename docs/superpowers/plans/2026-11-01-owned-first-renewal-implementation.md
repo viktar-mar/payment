@@ -105,7 +105,7 @@ Inspect/update explicit refusal only: `P/adapter/out/stripe/StripeRecoveryProofA
 ## Task 4: Monotonic scoped time и atomic first-renewal publication
 
 **Files:** Create `T/support/OwnedFirstRenewalBillingTime.java`, `P/application/service/OwnedFirstRenewalPublicationService.java`; extend Task1 store publication writer/reader. Existing `S/application/service/SubscriptionFactService.java` and original time sampler remain unchanged unless a focused failing consumer test identifies a necessary seam; widening their old guards is excluded.
-**Tests:** Create `T/subscriptions/application/service/OwnedFirstRenewalPublicationIntegrationTest.java` with real FactService/query/cash/outbox ports.
+**Tests:** Create `T/subscriptions/application/service/OwnedFirstRenewalPublicationIntegrationTest.java` with real FactService/query/cash/outbox ports. Controller ruling after Phase A review I1: pull `T/support/StripeBillingFirstRenewalCompositionFixture.java` forward from Task 5 and extract the shared genuine producers from Task 3's `StripeBillingFirstRenewalObservationIntegrationTest` and Task 4's publication test. Preserve all assertions and test contexts; the shared fixture has no automatic renewal-sampler import and no pure-test dependency. Renewal sampler opt-in belongs only to the publication test configuration.
 
 **Interfaces:**
 - `OwnedFirstRenewalBillingTime implements SubscriptionBillingTimePort`: constructor `(JdbcTemplate jdbc,OwnedSubscriptionBillingTime original)`; same `sample(account,site,customer,utcAt): Sample` and `requireUnscopedAllowed(site,customer): void`.
@@ -120,7 +120,7 @@ Inspect/update explicit refusal only: `P/adapter/out/stripe/StripeRecoveryProofA
 
 ## Task 5: Complete composition и exact-source hosted gate
 
-**Files:** Create `T/support/StripeBillingFirstRenewalCompositionFixture.java`, `T/provider/adapter/out/stripe/billing/StripeBillingFirstRenewalCompositionIntegrationTest.java`. Modify `docs/stage-5b-acceptance.md` and `docs/local-development.md` only after actual implementation evidence exists; preserve historical native failure.
+**Files:** Reuse the shared `T/support/StripeBillingFirstRenewalCompositionFixture.java` pulled into Task 4 after review I1; create `T/provider/adapter/out/stripe/billing/StripeBillingFirstRenewalCompositionIntegrationTest.java`. Modify `docs/stage-5b-acceptance.md` and `docs/local-development.md` only after actual implementation evidence exists; preserve historical native failure. Task 5 retains the full composition tests, documentation and final V33 freeze.
 **Interfaces:** Fixture extends existing genuine confirmation fixture; explicitly constructs admission/advance/mapping/publication consumers and new sampler, no production bean/registry/launcher. Root process controls future Git/publication; no push implied by this plan.
 
 - [ ] **RED:** `genuineInitialThroughTwoAdvancesToRenewalCash` invokes real create/action/select/durable confirm/fresh paid graph/apply/assertPaid before admission; then READY1 draft boundary, READY2 fresh paid graph, publication, authenticated query and outbox payload checks. Expected financial totals: 2 bills/2 payments/2 PERIOD_PAID/4 outbox entries, no synthetic successful seed. Hosted inherited fixture currently uses 1000 EUR minor units (EUR10) per invoice; do not mistake that inert fixture amount for native EUR20 budget.

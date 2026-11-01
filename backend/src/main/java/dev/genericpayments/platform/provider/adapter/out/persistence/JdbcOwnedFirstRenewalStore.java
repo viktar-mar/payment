@@ -56,10 +56,7 @@ public class JdbcOwnedFirstRenewalStore implements OwnedFirstRenewalStore {
     }
     @Transactional(propagation=Propagation.MANDATORY)
     public Admission requirePaidInTransaction(Admission admission){
-        requireTransaction();if(admission==null)throw unavailable();
-        var actual=requireOriginal(admission.receipt());
-        var saved=admissionRow(actual).filter(admission::equals).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
-        if(jdbc.queryForList("select id from stripe_billing_first_renewals where id=? and stopped_at is null",UUID.class,saved.id()).size()!=1)throw unavailable();
+        var saved=requireIdentity(admission);var actual=saved.receipt();
         var valid=jdbc.queryForObject("""
             select exists(select 1 from owned_first_renewal_paid(?) p
              where p.root_id=? and p.attempt_id=? and p.attempt_version=? and p.bill_id=? and p.bill_version=? and p.payment_id=? and p.payment_version=?
@@ -67,7 +64,15 @@ public class JdbcOwnedFirstRenewalStore implements OwnedFirstRenewalStore {
              and p.root_proof=?)
             """,Boolean.class,actual.intent().id(),saved.root(),saved.attempt(),saved.attemptVersion(),saved.bill(),saved.billVersion(),saved.payment(),saved.paymentVersion(),saved.invoice(),
             saved.allocation(),saved.paymentIntent(),saved.subscriptionRevision(),saved.policyVersion(),OwnedInitialConfirmationProof.hash(actual,saved.invoice(),saved.allocation(),saved.paymentIntent()));
-        if(!Boolean.TRUE.equals(valid)||!saved.fingerprint().equals(admissionFingerprint(saved.id(),actual,saved.sourceSha(),saved.root(),saved.attempt(),saved.attemptVersion(),saved.bill(),saved.billVersion(),
+        if(!Boolean.TRUE.equals(valid)&&!Boolean.TRUE.equals(jdbc.queryForObject("select owned_first_renewal_committed(?)",Boolean.class,saved.id())))throw unavailable();
+        return saved;
+    }
+    private Admission requireIdentity(Admission admission){
+        requireTransaction();if(admission==null)throw unavailable();
+        var actual=requireOriginal(admission.receipt());
+        var saved=admissionRow(actual).filter(admission::equals).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+        if(jdbc.queryForList("select id from stripe_billing_first_renewals where id=? and stopped_at is null",UUID.class,saved.id()).size()!=1
+                ||!saved.fingerprint().equals(admissionFingerprint(saved.id(),actual,saved.sourceSha(),saved.root(),saved.attempt(),saved.attemptVersion(),saved.bill(),saved.billVersion(),
                 saved.payment(),saved.paymentVersion(),saved.invoice(),saved.allocation(),saved.paymentIntent(),saved.subscriptionRevision(),saved.policyVersion(),saved.admittedAt())))throw unavailable();
         return saved;
     }
@@ -212,8 +217,46 @@ public class JdbcOwnedFirstRenewalStore implements OwnedFirstRenewalStore {
         requireTransaction();lockProviderScope(admission);requirePaidInTransaction(admission);
         return boundaryInTransaction(admission);
     }
-    public Publication recordPublicationInTransaction(Admission admission,LaterReady ready,Paid paid){throw unavailable();}
-    public Optional<Publication> publicationInTransaction(Admission admission){throw unavailable();}
+    @Transactional(propagation=Propagation.MANDATORY)
+    public Publication recordPublicationInTransaction(Admission admission,LaterReady ready,Paid paid){
+        requireIdentity(admission);
+        if(ready==null||paid==null||!paid.admission().equals(admission)||!paid.ready().equals(ready)
+                ||ready.ack().advance().step()!=Step.FINALIZATION||!paid.fence().equals(paid.claim().fence()))throw unavailable();
+        requireAdvance(admission,ready.ack().advance());
+        if(!readyRow(admission,ready.ack().advance().id()).filter(ready::equals).isPresent()
+                ||!readClaimRow(admission,ready).filter(paid.claim()::equals).isPresent()
+                ||!boundaryRow(admission).filter(paid.boundary()::equals).isPresent())throw unavailable();
+        requireBoundary(admission,paid.boundary(),readClaimRow(admission,paid.boundary().ready()).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable));
+        // The IDs and revision come exclusively from actual projected rows, never the caller.
+        var rows=jdbc.query("select * from owned_first_renewal_projected(?)",(r,n)->new Publication(admission.id(),ready,paid.boundary(),
+            r.getObject("renewal_bill",UUID.class),r.getObject("renewal_payment",UUID.class),r.getLong("projected_revision"),Instant.now().truncatedTo(ChronoUnit.MICROS)),admission.id());
+        if(rows.size()!=1)throw unavailable();var publication=rows.getFirst();
+        var renewal=paid.snapshot().invoices().stream().filter(i->i.kind()==dev.genericpayments.platform.subscriptions.domain.BillingRecord.Kind.RENEWAL).toList();
+        if(renewal.size()!=1||renewal.getFirst().cashObjects().size()!=1
+                ||!renewal.getFirst().reference().equals(paid.boundary().renewalInvoice())||!renewal.getFirst().period().equals(paid.boundary().period())
+                ||!Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from payments where id=? and provider_payment_reference=?)",Boolean.class,
+                    publication.payment(),renewal.getFirst().cashObjects().getFirst().reference())))throw unavailable();
+        jdbc.update("""
+            insert into stripe_billing_first_renewal_publications(admission_id,ready_id,boundary_id,renewal_bill,renewal_payment,projected_revision,published_at,graph_accepted_at)
+            values(?,?,?,?,?,?,?,?)
+            """,admission.id(),ready.id(),paid.boundary().id(),publication.bill(),publication.payment(),publication.projectedRevision(),
+            Timestamp.from(publication.publishedAt()),Timestamp.from(paid.graphAcceptedAt()));
+        return publicationInTransaction(admission).filter(publication::equals).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+    }
+    @Transactional(propagation=Propagation.MANDATORY,readOnly=true)
+    public Optional<Publication> publicationInTransaction(Admission admission){
+        requireIdentity(admission);
+        var rows=jdbc.queryForList("select * from stripe_billing_first_renewal_publications where admission_id=?",admission.id());
+        if(rows.isEmpty())return Optional.empty();
+        if(rows.size()!=1||!Boolean.TRUE.equals(jdbc.queryForObject("select owned_first_renewal_committed(?)",Boolean.class,admission.id())))throw unavailable();
+        var row=rows.getFirst();var boundary=boundaryRow(admission).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+        var step=jdbc.queryForObject("select step_id from stripe_billing_first_renewal_ready where id=? and admission_id=?",UUID.class,row.get("ready_id"),admission.id());
+        var ready=readyRow(admission,step).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+        requireAdvance(admission,ready.ack().advance());
+        requireBoundary(admission,boundary,readClaimRow(admission,boundary.ready()).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable));
+        return Optional.of(new Publication(admission.id(),ready,boundary,(UUID)row.get("renewal_bill"),(UUID)row.get("renewal_payment"),
+            ((Number)row.get("projected_revision")).longValue(),((Timestamp)row.get("published_at")).toInstant()));
+    }
 
     private OwnedClockSubscriptionReceipt requireOriginal(OwnedClockSubscriptionReceipt expected){
         requireStoredOriginal(expected);

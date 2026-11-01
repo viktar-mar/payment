@@ -1,25 +1,26 @@
 package dev.genericpayments.platform.subscriptions.application.service;
 
-import dev.genericpayments.platform.paymentaccounts.application.port.out.LockPaymentAccountPort;
-import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingFirstRenewalAdapter;
-import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingFirstRenewalAdvanceAdapter;
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.*;
 import dev.genericpayments.platform.provider.application.port.out.OwnedFirstRenewalStore;
-import dev.genericpayments.platform.provider.application.service.OwnedFirstRenewalAdmissionService;
 import dev.genericpayments.platform.provider.application.service.OwnedFirstRenewalPublicationService;
 import dev.genericpayments.platform.subscriptions.application.port.in.QuerySubscriptionsUseCase;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingTimePort;
-import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionLifecycleLockPort;
 import dev.genericpayments.platform.subscriptions.domain.Subscription;
 import dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation;
 import dev.genericpayments.platform.support.OwnedFirstRenewalBillingTime;
 import dev.genericpayments.platform.support.OwnedSubscriptionBillingTime;
-import dev.genericpayments.platform.support.StripeBillingClockConfirmationCompositionFixture;
+import dev.genericpayments.platform.support.StripeBillingFirstRenewalCompositionFixture;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Supplier;
+import java.util.concurrent.*;
+import java.sql.Timestamp;
+import java.lang.reflect.*;
+import dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase;
+import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -31,11 +32,9 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Hosted only: real initial confirmation, claim/READY/graph producers, FactService, cash and outbox. */
 @Import(OwnedFirstRenewalPublicationIntegrationTest.RenewalTimeConfiguration.class)
-class OwnedFirstRenewalPublicationIntegrationTest extends StripeBillingClockConfirmationCompositionFixture {
-    @Autowired OwnedFirstRenewalStore renewals;
-    @Autowired LockPaymentAccountPort accountLocks;
-    @Autowired SubscriptionLifecycleLockPort lifecycleLocks;
+class OwnedFirstRenewalPublicationIntegrationTest extends StripeBillingFirstRenewalCompositionFixture {
     @Autowired OwnedFirstRenewalBillingTime renewalTime;
+    @Autowired dev.genericpayments.platform.subscriptions.application.port.out.TrialEligibilityStore trialEligibility;
 
     @TestConfiguration(proxyBeanMethods=false)
     static class RenewalTimeConfiguration {
@@ -47,72 +46,12 @@ class OwnedFirstRenewalPublicationIntegrationTest extends StripeBillingClockConf
         }
     }
 
-    private void genuineInitialCash() {
-        beginConfirmation();issueAndSelect();confirm("succeeded");
-        var captured=fence();apply(paidObservation(),captured);assertPaid();
-    }
-    private Admission admitRenewal() {
-        return new OwnedFirstRenewalAdmissionService(renewals,transaction,lifecycleOperations,lifecycleLocks,accountLocks,subscriptions,Clock.systemUTC())
-            .admit(receipt,"a".repeat(40));
-    }
-    private Admission paidAdmission() { genuineInitialCash();return admitRenewal(); }
-    private StripeBillingFirstRenewalAdapter observer() {
-        return new StripeBillingFirstRenewalAdapter(credentials,clients,renewals,transaction,lifecycleOperations,lifecycleLocks,accountLocks,
-            subscriptions,readPreparation,observations,bindings,Clock.systemUTC());
-    }
     private OwnedFirstRenewalPublicationService publisher() {
-        return new OwnedFirstRenewalPublicationService(renewals,transaction,lifecycleOperations,lifecycleLocks,accountLocks,
-            subscriptions,readPreparation,observations,facts,Clock.systemUTC());
+        return publisher(renewals,facts);
     }
-    private String clock(long frozen,String status) {
-        var value=json(clockJson(owner));value.addProperty("frozen_time",frozen);value.addProperty("status",status);return value.toString();
-    }
-    private LaterReady advance(Admission admission,Step step) {
-        long before=step==Step.BOUNDARY?FROZEN:receipt.periodEnd(),target=step==Step.BOUNDARY?receipt.periodEnd():receipt.periodEnd()+3600;
-        http.reply(clock(before,"ready"));http.reply(clock(before,"advancing"));http.reply(clock(target,"ready"));
-        return new StripeBillingFirstRenewalAdvanceAdapter(credentials,clients,accounts,operations,renewals,Clock.systemUTC()).advance(admission,step);
-    }
-    private void graph(LaterReady ready,boolean paid) {
-        long b=receipt.periodEnd(),n=b+31*86400;
-        var renewal=graph.invoice.deepCopy();renewal.addProperty("id","in_renewal");renewal.addProperty("billing_reason","subscription_cycle");
-        renewal.addProperty("status",paid?"paid":"draft");renewal.addProperty("amount_paid",paid?1000:0);renewal.addProperty("amount_remaining",paid?0:1000);
-        renewal.addProperty("amount_paid_off_stripe",0);
-        var line=graph.line.deepCopy();line.addProperty("id","il_renewal");line.addProperty("invoice","in_renewal");
-        line.addProperty("subscription","sub_owned");line.addProperty("subscription_item","si_owned");
-        line.getAsJsonObject("period").addProperty("start",b);line.getAsJsonObject("period").addProperty("end",n);
-        graph.item().addProperty("current_period_start",b);graph.item().addProperty("current_period_end",n);
-        http.reply(clock(ready.observation().frozenTime(),"ready"));http.reply(customerJson("clock_owned"));http.reply(graph.remote.toString());
-        http.reply(page(graph.invoice,renewal));http.reply(page(graph.line));http.reply(page(graph.allocation));http.reply(graph.pi.toString());
-        http.reply(graph.charge.toString());http.reply(page(graph.allocation));http.reply(page(line));
-        if(paid) {
-            var allocation=graph.allocation.deepCopy();allocation.addProperty("id","inpay_renewal");allocation.addProperty("invoice","in_renewal");
-            allocation.getAsJsonObject("payment").addProperty("payment_intent","pi_renewal");allocation.getAsJsonObject("status_transitions").addProperty("paid_at",b+11);
-            var pi=graph.pi.deepCopy();pi.addProperty("id","pi_renewal");pi.addProperty("latest_charge","ch_renewal");
-            var charge=graph.charge.deepCopy();charge.addProperty("id","ch_renewal");charge.addProperty("payment_intent","pi_renewal");
-            http.reply(page(allocation));http.reply(pi.toString());http.reply(charge.toString());http.reply(page(allocation));
-        } else http.reply(page());
-        http.reply(clock(ready.observation().frozenTime(),"ready"));
-    }
-    private Pending boundary(Admission admission,LaterReady ready) {
-        graph(ready,false);return (Pending)observer().observe(admission,ready);
-    }
-    private Paid paid(Admission admission) {
-        var first=advance(admission,Step.BOUNDARY);var pending=boundary(admission,first);
-        var second=advance(admission,Step.FINALIZATION);graph(second,true);
-        var paid=(Paid)observer().observe(admission,second);
-        assertThat(paid.boundary()).isEqualTo(pending.boundary());assertThat(paid.claim().ready()).isEqualTo(second);
-        assertThat(underLifecycle(admission,()->renewals.readClaim(admission,second).orElseThrow())).isEqualTo(paid.claim());
-        assertThat(underLifecycle(admission,()->renewals.boundaryInTransaction(admission))).isEqualTo(pending.boundary());
-        assertThat(paid.fence()).isEqualTo(paid.claim().fence());assertThat(paid.graphAcceptedAt()).isBefore(paid.claim().deadlineAt());
-        assertThat(count("stripe_billing_first_renewal_read_claims")).isEqualTo(2);
-        assertThat(count("stripe_billing_first_renewal_publications")).isZero();assertThat(http.replies).isEmpty();return paid;
-    }
-    private <T>T underLifecycle(Admission admission,Supplier<T> work) {
-        return transaction.required(()->{
-            var ids=new TreeSet<UUID>();ids.add(admission.receipt().intent().createOperation());
-            lifecycleOperations.unresolved(site,current().id()).forEach(operation->ids.add(operation.id()));for(var id:ids)lifecycleOperations.lock(id);
-            lifecycleLocks.lockActive(site,customer);accountLocks.findByIdForUpdate(billing.id()).orElseThrow();subscriptions.lock(site,current().id());return work.get();
-        });
+    private OwnedFirstRenewalPublicationService publisher(OwnedFirstRenewalStore store,ApplySubscriptionSnapshotUseCase apply) {
+        return new OwnedFirstRenewalPublicationService(store,transaction,lifecycleOperations,lifecycleLocks,accountLocks,
+            subscriptions,readPreparation,observations,apply,trialEligibility,Clock.systemUTC());
     }
     private SubscriptionBillingTimePort.Sample sample() {
         return transaction.required(()->{
@@ -154,6 +93,11 @@ class OwnedFirstRenewalPublicationIntegrationTest extends StripeBillingClockConf
             .containsEntry("subscription_period_end",java.sql.Timestamp.from(expected.end()));
         assertThat(published.get().bill()).isEqualTo(bill);assertThat(published.get().payment()).isEqualTo(payment.get("id"));
         assertThat(published.get().projectedRevision()).isEqualTo(current().revision());
+        assertThat(current().revision()).isEqualTo(admission.subscriptionRevision()+1);
+        assertThat(observations.captureFence(current())).isEqualTo(paid.fence().observationSequence()+1);
+        assertThat(sample().billingAt()).isEqualTo(Instant.ofEpochSecond(receipt.periodEnd()+3600));
+        assertThat(queries.get(scope.context().actor(),site,current().id()).access().allowed()).isTrue();
+        assertThat(jdbc.queryForObject("select graph_accepted_at from stripe_billing_first_renewal_publications",Timestamp.class).toInstant()).isEqualTo(paid.graphAcceptedAt());
         assertThat(jdbc.queryForList("select event_type from subscription_events",String.class)).containsExactly("PERIOD_PAID","PERIOD_PAID");
         assertThat(count("payment_events")).isEqualTo(2);assertThat(count("outbox_events")).isEqualTo(4);
         assertThat(jdbc.queryForList("select callback_type from outbox_events",String.class))
@@ -165,6 +109,232 @@ class OwnedFirstRenewalPublicationIntegrationTest extends StripeBillingClockConf
         assertThat(count("stripe_billing_first_renewal_read_claims")).isEqualTo(2);
         assertThatThrownBy(()->publisher().publish(admission,paid.ready(),paid)).isInstanceOf(RuntimeException.class);
         assertThat(financialState()).isEqualTo(committed);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings={"claim-invocation","claim-sequence","claim-revision","wrong-ready-argument","command","open","period","initial-pi","shared-pi"})
+    void rejectsOtherwiseValidPaidWithChangedProvenanceOrCashShape(String mutation) {
+        var admission=paidAdmission();var original=paid(admission);var before=financialState();
+        var claim=original.claim();var snapshot=original.snapshot();var ready=original.ready();
+        if(mutation.startsWith("claim-")) {
+            var f=claim.fence();
+            var forged=new ApplySubscriptionSnapshotUseCase.Fence(f.revision()+(mutation.equals("claim-revision")?1:0),null,null,null,null,
+                f.observationSequence()+(mutation.equals("claim-sequence")?1:0));
+            claim=new ReadClaim(claim.ready(),mutation.equals("claim-invocation")?UUID.randomUUID():claim.invocation(),claim.startedAt(),claim.deadlineAt(),forged);
+        } else if(mutation.equals("wrong-ready-argument"))ready=original.boundary().ready();
+        else {
+            var invoices=new ArrayList<>(snapshot.invoices());
+            if(mutation.endsWith("pi")) {
+                var index=mutation.equals("initial-pi")?0:1;var old=invoices.get(index);var cash=old.cashObjects().getFirst();
+                invoices.set(index,new Invoice(old.reference(),old.kind(),old.price(),null,old.period(),old.amountDueMinor(),old.currency(),old.settlement(),
+                    List.of(new CashObject(mutation.equals("initial-pi")?"pi_foreign":admission.paymentIntent(),cash.amountMinor(),cash.currency(),cash.status(),cash.occurredAt()))));
+            }
+            if(mutation.equals("open")) {
+                var i=invoices.getLast();invoices.set(invoices.size()-1,new Invoice(i.reference(),i.kind(),i.price(),null,i.period(),i.amountDueMinor(),i.currency(),SettlementKind.OPEN,List.of()));
+            }
+            snapshot=new Snapshot(snapshot.subscriptionReference(),snapshot.status(),snapshot.billingPrice(),
+                mutation.equals("period")?new Subscription.Period(snapshot.period().start(),snapshot.period().end().plusSeconds(1)):snapshot.period(),
+                null,null,invoices,mutation.equals("command")?currentOperation().providerOperationKey():null,snapshot.paymentMethodReady(),0,snapshot.observedAt());
+        }
+        var invalid=new Paid(admission,original.ready(),original.boundary(),claim.fence(),snapshot,claim,original.graphAcceptedAt());
+        var argument=ready;
+        assertThatThrownBy(()->publisher().publish(admission,argument,invalid)).isInstanceOf(RuntimeException.class);
+        assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_first_renewal_publications")).isZero();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings={"revision","sequence","policy","credentials","revoke","stop"})
+    void driftAfterGraphRefusesPublicationAndTimeWithoutFurtherFinancialWrites(String drift) {
+        var admission=paidAdmission();var paid=paid(admission);
+        switch(drift) {
+            case "revision"->jdbc.update("update subscriptions set revision=revision+1 where id=?",current().id());
+            case "sequence"->jdbc.update("update subscriptions set observation_sequence=observation_sequence+1 where id=?",current().id());
+            case "policy"->jdbc.update("update site_subscription_policies set version=version+1 where site_id=?",site.value());
+            case "credentials"->jdbc.update("update payment_accounts set credentials_ref='inert-drift' where id=?",billing.id().value());
+            case "revoke"->clocks.stop(owner,dev.genericpayments.platform.provider.application.port.out.StripeBillingClockStore.StopReason.AUTHORITY_REVOKED,Instant.now());
+            case "stop"->renewals.stop(admission,"PAYMENT_NOT_OBSERVED",Instant.now());
+        }
+        var before=financialState();
+        assertThatThrownBy(()->publisher().publish(admission,paid.ready(),paid)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(this::sample).isInstanceOf(RuntimeException.class);
+        assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_first_renewal_publications")).isZero();
+    }
+
+    @Test void nullOrForeignEvidenceCannotInvokeFactService() {
+        var admission=paidAdmission();var paid=paid(admission);var before=financialState();
+        assertThatThrownBy(()->publisher().publish(admission,paid.ready(),null)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->publisher().publish(admission,null,paid)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->publisher().publish(null,paid.ready(),paid)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->transaction.required(()->renewalTime.sample(new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId(UUID.randomUUID()),site,customer,Instant.now())))
+            .isInstanceOf(RuntimeException.class);
+        assertThat(financialState()).isEqualTo(before);
+    }
+
+    private OwnedFirstRenewalStore interceptReceipt(java.util.function.Function<Object[],Publication> action) {
+        return (OwnedFirstRenewalStore)Proxy.newProxyInstance(OwnedFirstRenewalStore.class.getClassLoader(),new Class<?>[]{OwnedFirstRenewalStore.class},(proxy,method,args)->{
+            if(method.getName().equals("recordPublicationInTransaction"))return action.apply(args);
+            try{return method.invoke(renewals,args);}catch(InvocationTargetException failure){throw failure.getCause();}
+        });
+    }
+
+    @Test void driftInsideFactApplicationRollsBackProjectionAndPolicyTogether() {
+        var admission=paidAdmission();var paid=paid(admission);var before=financialState();
+        var policy=jdbc.queryForObject("select version from site_subscription_policies where site_id=?",Long.class,site.value());
+        ApplySubscriptionSnapshotUseCase drift=command->{facts.apply(command);
+            jdbc.update("update site_subscription_policies set version=version+1 where site_id=?",site.value());};
+        assertThatThrownBy(()->publisher(renewals,drift).publish(admission,paid.ready(),paid)).isInstanceOf(RuntimeException.class);
+        assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_first_renewal_publications")).isZero();
+        assertThat(jdbc.queryForObject("select version from site_subscription_policies where site_id=?",Long.class,site.value())).isEqualTo(policy);
+    }
+
+    @Test void samplerUsesCallerTransactionWithoutWaitingForProviderStepLock() throws Exception {
+        var admission=paidAdmission();var first=advance(admission,Step.BOUNDARY);var locked=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()) {
+            var lock=workers.submit(()->transaction.required(()->{
+                jdbc.queryForList("select id from stripe_billing_first_renewal_steps where id=? for update",UUID.class,first.ack().advance().id());locked.countDown();
+                try{if(!release.await(10,TimeUnit.SECONDS))throw new AssertionError("Step release timed out");}
+                catch(InterruptedException failure){Thread.currentThread().interrupt();throw new AssertionError(failure);}return true;
+            }));
+            assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
+            try {
+                var sampling=workers.submit(this::sample);
+                assertThat(sampling.get(2,TimeUnit.SECONDS).billingAt()).isEqualTo(Instant.ofEpochSecond(receipt.periodEnd()));
+            } finally {release.countDown();}
+            assertThat(lock.get(5,TimeUnit.SECONDS)).isTrue();
+        }
+        assertThat(count("stripe_billing_first_renewal_read_claims")).isZero();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings={"bill","payment","revision","ready","boundary","before-start","at-deadline","future-publication"})
+    void sqlReceiptFailureRollsBackRealFactCashEventsAndFence(String mutation) {
+        var admission=paidAdmission();var paid=paid(admission);var before=financialState();
+        var holder=new AtomicReference<Object>();var xact=new AtomicReference<String>();
+        var writer=interceptReceipt(args->{
+            assertThat(TransactionSynchronizationManager.getResource(jdbc.getDataSource())).isSameAs(holder.get());
+            assertThat(jdbc.queryForObject("select pg_current_xact_id()::text",String.class)).isEqualTo(xact.get());
+            assertThat(count("payments")).isEqualTo(2);assertThat(count("outbox_events")).isEqualTo(4);
+            assertThat(observations.captureFence(current())).isEqualTo(paid.fence().observationSequence()+1);
+            var row=jdbc.queryForMap("select * from owned_first_renewal_projected(?)",admission.id());
+            var accepted=mutation.equals("before-start")?paid.claim().startedAt().minusNanos(1000):mutation.equals("at-deadline")?paid.claim().deadlineAt():paid.graphAcceptedAt();
+            jdbc.update("""
+                insert into stripe_billing_first_renewal_publications(admission_id,ready_id,boundary_id,renewal_bill,renewal_payment,projected_revision,published_at,graph_accepted_at)
+                values(?,?,?,?,?,?,?,?)
+                """,admission.id(),mutation.equals("ready")?paid.boundary().ready().id():paid.ready().id(),mutation.equals("boundary")?UUID.randomUUID():paid.boundary().id(),
+                mutation.equals("bill")?admission.bill():row.get("renewal_bill"),mutation.equals("payment")?admission.payment():row.get("renewal_payment"),
+                ((Number)row.get("projected_revision")).longValue()+(mutation.equals("revision")?1:0),
+                Timestamp.from(Instant.now().plusSeconds(mutation.equals("future-publication")?60:0)),Timestamp.from(accepted));
+            throw new AssertionError("Malformed receipt INSERT must fail");
+        });
+        ApplySubscriptionSnapshotUseCase instrumented=command->{
+            holder.set(TransactionSynchronizationManager.getResource(jdbc.getDataSource()));xact.set(jdbc.queryForObject("select pg_current_xact_id()::text",String.class));
+            facts.apply(command);
+            assertThat(renewalTime.sampledConnectionHolder).isSameAs(holder.get());assertThat(renewalTime.sampledTransaction).isEqualTo(xact.get());
+        };
+        assertThatThrownBy(()->publisher(writer,instrumented).publish(admission,paid.ready(),paid)).isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+        assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_first_renewal_publications")).isZero();
+        int calls=http.calls.size();assertThatThrownBy(()->observer().observe(admission,paid.ready())).isInstanceOf(RuntimeException.class);
+        assertThat(http.calls).hasSize(calls);assertThat(count("stripe_billing_first_renewal_read_claims")).isEqualTo(2);
+    }
+
+    @Test void publicationAndReceiptBecomeVisibleTogetherAndRevokeWaitsForAccount() throws Exception {
+        var admission=paidAdmission();var paid=paid(admission);var applied=new CountDownLatch(1);var release=new CountDownLatch(1);var revoking=new CountDownLatch(1);
+        ApplySubscriptionSnapshotUseCase pause=command->{facts.apply(command);applied.countDown();
+            try{if(!release.await(10,TimeUnit.SECONDS))throw new AssertionError("Publication release timed out");}
+            catch(InterruptedException failure){Thread.currentThread().interrupt();throw new AssertionError(failure);}};
+        try(var workers=new BoundedWorkers()) {
+            var publication=workers.submit(()->publisher(renewals,pause).publish(admission,paid.ready(),paid));
+            assertThat(applied.await(5,TimeUnit.SECONDS)).isTrue();
+            try {
+                assertThat(count("payments")).isEqualTo(1);assertThat(count("stripe_billing_first_renewal_publications")).isZero();
+                var revoke=workers.submit(()->{revoking.countDown();clocks.stop(owner,dev.genericpayments.platform.provider.application.port.out.StripeBillingClockStore.StopReason.AUTHORITY_REVOKED,Instant.now());return true;});
+                assertThat(revoking.await(5,TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(()->revoke.get(150,TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                release.countDown();assertThat(publication.get(10,TimeUnit.SECONDS)).isNotNull();assertThat(revoke.get(10,TimeUnit.SECONDS)).isTrue();
+            } finally {release.countDown();}
+        }
+        assertThat(count("payments")).isEqualTo(2);assertThat(count("stripe_billing_first_renewal_publications")).isEqualTo(1);
+        var committed=financialState();assertThatThrownBy(this::sample).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->publisher().replayPublished(admission)).isInstanceOf(RuntimeException.class);assertThat(financialState()).isEqualTo(committed);
+    }
+
+    @Test void concurrentPaidPublicationHasOneCommitAndOneStaleLoser() throws Exception {
+        var admission=paidAdmission();var paid=paid(admission);var start=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()) {
+            Callable<Boolean> publish=()->{if(!start.await(5,TimeUnit.SECONDS))throw new AssertionError("Start timed out");
+                try{publisher().publish(admission,paid.ready(),paid);return true;}catch(IllegalStateException expected){return false;}};
+            var first=workers.submit(publish);var second=workers.submit(publish);start.countDown();
+            assertThat(List.of(first.get(10,TimeUnit.SECONDS),second.get(10,TimeUnit.SECONDS))).containsExactlyInAnyOrder(true,false);
+        }
+        assertThat(count("payments")).isEqualTo(2);assertThat(count("outbox_events")).isEqualTo(4);assertThat(count("stripe_billing_first_renewal_publications")).isEqualTo(1);
+    }
+
+    @Test void acceptedGraphCanPublishAfterOriginalReadDeadlineWithoutNewBudget() throws InterruptedException {
+        var admission=paidAdmission();var paid=paid(admission);int calls=http.calls.size();long started=System.nanoTime();
+        while(Instant.now().isBefore(paid.claim().deadlineAt().plusMillis(25))) {
+            if(System.nanoTime()-started>Duration.ofSeconds(35).toNanos())throw new AssertionError("Original deadline wait exceeded35 seconds");
+            Thread.sleep(100);
+        }
+        var result=publisher().publish(admission,paid.ready(),paid);
+        assertThat(result.publishedAt()).isAfter(paid.claim().deadlineAt());assertThat(http.calls).hasSize(calls);
+        assertThat(jdbc.queryForObject("select graph_accepted_at from stripe_billing_first_renewal_publications",Timestamp.class).toInstant()).isEqualTo(paid.graphAcceptedAt());
+        assertThat(publisher().replayPublished(admission)).isEqualTo(result);assertThat(count("stripe_billing_first_renewal_read_claims")).isEqualTo(2);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings={"revision","sequence","policy","refund"})
+    void committedReceiptRefusesLaterDrift(String drift) {
+        var admission=paidAdmission();var paid=paid(admission);var receipt=publisher().publish(admission,paid.ready(),paid);
+        switch(drift) {
+            case "revision"->jdbc.update("update subscriptions set revision=revision+1 where id=?",current().id());
+            case "sequence"->jdbc.update("update subscriptions set observation_sequence=observation_sequence+1 where id=?",current().id());
+            case "policy"->jdbc.update("update site_subscription_policies set version=version+1 where site_id=?",site.value());
+            case "refund"->jdbc.update("update payments set refunded_amount_minor=1 where id=?",receipt.payment());
+        }
+        var before=financialState();
+        assertThatThrownBy(()->publisher().replayPublished(admission)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(this::sample).isInstanceOf(RuntimeException.class);assertThat(financialState()).isEqualTo(before);
+    }
+
+    @Test void dispatchingSecondStepBlocksOldTimeAndImmutablePredecessorCannotBeChanged() {
+        var admission=paidAdmission();var first=advance(admission,Step.BOUNDARY);var pending=boundary(admission,first);
+        for(var table:List.of("stripe_billing_first_renewal_boundary","stripe_billing_first_renewal_steps")) {
+            assertThatThrownBy(()->jdbc.update("update "+table+" set fingerprint=?","0".repeat(64))).isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+        }
+        assertThatThrownBy(()->jdbc.update("delete from stripe_billing_first_renewal_ready where id=?",first.id())).isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+        inspectSdk(request->{
+            if(request.method().name().equals("POST")) {
+                assertThat(jdbc.queryForObject("select status from provider_operations where resource_id=(select id from stripe_billing_first_renewal_steps where admission_id=? and ordinal=2)",String.class,admission.id())).isEqualTo("DISPATCHING");
+                assertThatThrownBy(this::sample).isInstanceOf(RuntimeException.class);
+            }
+        });
+        advance(admission,Step.FINALIZATION);assertThat(sample().billingAt()).isEqualTo(Instant.ofEpochSecond(receipt.periodEnd()+3600));
+        assertThat(underLifecycle(admission,()->renewals.boundaryInTransaction(admission))).isEqualTo(pending.boundary());
+    }
+
+    @Test void laterBillingTimePreservesUtcOperationalTimesLeasesAndWebhookSignatures() throws Exception {
+        var admission=paidAdmission();var attempt=jdbc.queryForObject("select row_to_json(t)::text from subscription_confirmation_attempts t",String.class);
+        var paid=paid(admission);publisher().publish(admission,paid.ready(),paid);var now=Instant.now();
+        for(var table:List.of("payments","subscription_billing_records","outbox_events"))
+            assertThat(jdbc.queryForList("select created_at from "+table,Timestamp.class)).allSatisfy(t->assertThat(t.toInstant()).isBetween(began,now));
+        for(var table:List.of("payment_events","subscription_events"))
+            assertThat(jdbc.queryForList("select received_at from "+table,Timestamp.class)).allSatisfy(t->assertThat(t.toInstant()).isBetween(began,now));
+        assertThat(jdbc.queryForList("select next_attempt_at from outbox_events",Timestamp.class)).allSatisfy(t->assertThat(t.toInstant()).isBetween(began,now));
+        assertThat(jdbc.queryForObject("select row_to_json(t)::text from subscription_confirmation_attempts t",String.class)).isEqualTo(attempt);
+        assertThat(jdbc.queryForObject("select occurred_at from subscription_events where revision=?",Timestamp.class,current().revision()).toInstant())
+            .isEqualTo(Instant.ofEpochSecond(receipt.periodEnd()+3600));
+        assertThat(jdbc.queryForObject("select occurred_at from payment_events where payment_id=(select id from payments where provider_payment_reference='pi_renewal')",Timestamp.class).toInstant())
+            .isEqualTo(Instant.ofEpochSecond(receipt.periodEnd()+11));
+        var raw="{\"id\":\"evt_renewal\",\"object\":\"event\",\"type\":\"invoice.paid\",\"livemode\":false,\"api_version\":\"2026-09-30.endive\",\"created\":42,\"data\":{\"object\":{\"id\":\"in_renewal\",\"object\":\"invoice\",\"livemode\":false}}}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        var verifier=new dev.genericpayments.platform.provider.adapter.out.stripe.StripeWebhookVerifier(credentials);
+        assertThat(verifier.verifyAny(raw,signature(raw,now.getEpochSecond()),billing,now)).isPresent();
+        assertThatThrownBy(()->verifier.verifyAny(raw,signature(raw,receipt.periodEnd()+3600),billing,now)).isInstanceOf(IllegalArgumentException.class);
+        assertThat(sample().billingAt()).isEqualTo(Instant.ofEpochSecond(receipt.periodEnd()+3600));
+    }
+
+    private static String signature(byte[] raw,long timestamp) throws Exception {
+        var mac=javax.crypto.Mac.getInstance("HmacSHA256");mac.init(new javax.crypto.spec.SecretKeySpec("whsec_INERT".getBytes(java.nio.charset.StandardCharsets.UTF_8),"HmacSHA256"));
+        mac.update((timestamp+".").getBytes(java.nio.charset.StandardCharsets.US_ASCII));return "t="+timestamp+",v1="+HexFormat.of().formatHex(mac.doFinal(raw));
     }
 
     @Test void neverFallsBackAfterRenewalAdmission() {
