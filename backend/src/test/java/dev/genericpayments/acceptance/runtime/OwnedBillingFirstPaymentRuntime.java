@@ -28,7 +28,7 @@ public final class OwnedBillingFirstPaymentRuntime {
     public static Admission admit(Map<String,String> env,String source) {
         try {
             if(!"true".equals(env.get("PAYMENT_STRIPE_BILLING_FIRST_PAYMENT"))||!"true".equals(env.get("PAYMENT_STRIPE_SANDBOX_ENABLED")))throw new IllegalArgumentException();
-            for(String flag:List.of("PAYMENT_STRIPE_BILLING_ACCEPTANCE","PAYMENT_STAGE4_TEST_RUNTIME","PAYMENT_STRIPE_ACCEPTANCE","PAYMENT_STRIPE_NATIVE_ACCEPTANCE"))
+            for(String flag:List.of("PAYMENT_STRIPE_BILLING_FIRST_RENEWAL","PAYMENT_STRIPE_BILLING_ACCEPTANCE","PAYMENT_STAGE4_TEST_RUNTIME","PAYMENT_STRIPE_ACCEPTANCE","PAYMENT_STRIPE_NATIVE_ACCEPTANCE"))
                 if(!Set.of("","false").contains(env.getOrDefault(flag,"")))throw new IllegalArgumentException();
             for(String name:List.of("ALLOW_TEST_OPERATIONS","FULL_RUN","OWNED_RUN","REMAINING_ONLY","FORM_DIAGNOSTIC","MANUAL_FORM_DIAGNOSTIC","ALLOW_PREPARE_ONLY","MANUAL_PAYMENT","MANUAL_3DS","MANUAL_REFUND","MANUAL_REFUND_REMAINDER"))
                 if(!Set.of("","false").contains(env.getOrDefault("PAYMENT_STRIPE_SANDBOX_"+name,"")))throw new IllegalArgumentException();
@@ -95,7 +95,7 @@ public final class OwnedBillingFirstPaymentRuntime {
             var result=error("INITIAL_PAYMENT_STOPPED");
             result.addProperty("stage",stage!=null&&PREPARE_FAILURE_STAGES.contains(stage)?stage:"UNCLASSIFIED");return result;
         }
-        private static JsonObject read(HttpExchange exchange,boolean empty) throws Exception {
+        static JsonObject read(HttpExchange exchange,boolean empty) throws Exception {
             var executor=Executors.newVirtualThreadPerTaskExecutor();
             Future<byte[]> task=executor.submit(()->exchange.getRequestBody().readNBytes(16385));
             byte[] bytes;
@@ -108,7 +108,7 @@ public final class OwnedBillingFirstPaymentRuntime {
             while(reader.hasNext()) {String name=reader.nextName();if(result.has(name)||reader.peek()!=com.google.gson.stream.JsonToken.STRING)throw denied();result.addProperty(name,reader.nextString());}
             reader.endObject();if(reader.peek()!=com.google.gson.stream.JsonToken.END_DOCUMENT)throw denied();return result;
         }
-        private static void reply(HttpExchange exchange,int status,JsonObject response) throws IOException {
+        static void reply(HttpExchange exchange,int status,JsonObject response) throws IOException {
             byte[] body=response.toString().getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Cache-Control","no-store");exchange.getResponseHeaders().set("Content-Type","application/json");
             exchange.sendResponseHeaders(status,body.length);exchange.getResponseBody().write(body);

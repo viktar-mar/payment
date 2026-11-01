@@ -167,6 +167,18 @@ public final class OwnedBillingFirstPaymentScenario implements OwnedBillingFirst
             state.settled();var response=status();response.addProperty("period_start",period.start().toString());response.addProperty("paid_through",period.end().toString());response.addProperty("access_valid_until",access.validUntil().toString());response.addProperty("access_evaluated_at",access.evaluatedAt().toString());return response;
         }catch(RuntimeException invalid){abort();throw OwnedBillingFirstPaymentRuntime.denied();}
     }
+    /** Package-local retained authority for the separate combined runtime; never caller-selected. */
+    synchronized OwnedClockSubscriptionReceipt settledReceipt() {
+        state.check();require(state.phase().equals("SETTLED_LOCAL"));
+        var retained=bean(StripeBillingClockSubscriptionStore.class).requireReceipt(account.id(),reserved.subscription().id());
+        require(retained.equals(receipt)&&retained.intent().clock().owner().equals(owner)
+            &&owner.run().equals(admission.run())&&retained.intent().subscription().equals(reserved.subscription().id()));
+        return retained;
+    }
+    synchronized SubscriptionView authenticatedView() {
+        state.check();var authority=context("first-renewal-access-"+admission.run());
+        return bean(QuerySubscriptionsUseCase.class).get(authority.actor(),site,reserved.subscription().id());
+    }
     private Subscription current(){return bean(SubscriptionStore.class).find(site,reserved.subscription().id()).orElseThrow();}
     private SubscriptionCommandContext context(String key) {
         var session=bean(CustomerSessionResolver.class).resolveRequired(token,origin);
