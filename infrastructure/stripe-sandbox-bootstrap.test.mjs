@@ -1720,3 +1720,24 @@ for(const kind of ['external-health','deadline-health','timer-health','external-
  assert.equal(atCleanup,code);assert.equal(firstDiagnostic,code);
  const line=formatBillingFirstPaymentDiagnostic(final);assert.equal(line,'owned_initial_payment_diagnostic code='+code+' cleanup='+(final.cleanupConfirmed?'CONFIRMED':'UNCONFIRMED'));assert.equal(parseBillingFirstPaymentDiagnosticLine(line),line);assert.ok(line.length<=160);
 });
+
+function firstRenewalFixture(){
+ const f=firstPaymentFixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_RENEWAL:'true'};f.options.selectedCase='initial_and_first_renewal';
+ const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);return {...r,stdout:r.stdout.replaceAll('FIRST_PAYMENT','FIRST_RENEWAL').replaceAll('OwnedBillingFirstPaymentRuntime','OwnedBillingFirstRenewalRuntime').replaceAll('/app/initial-runtime','/app/renewal-runtime').replaceAll('Dockerfile.billing-first-payment','Dockerfile.billing-first-renewal')};};return f;
+}
+test('first-renewal bootstrap privately binds dedicated source entrypoint env and reuses browser build mode',async()=>{
+ assert.equal(typeof bootstrapModule.createOwnedBillingFirstRenewalBootstrap,'function');const f=firstRenewalFixture(),b=await bootstrapModule.createOwnedBillingFirstRenewalBootstrap(f.options,f.dependencies),l=LIMIT();
+ assert.equal(f.events.length,0);assert.equal(b.withFirstPaymentRuntime,undefined);await b.prepare(l);await b.persistWebhookSecret(SECRET);await b.start(l);
+ let privateRuntime;await b.withFirstRenewalRuntime(v=>{privateRuntime=v;return true;},l);assert.match(privateRuntime.capability,/^[A-Za-z0-9_-]{43}$/);assert.equal(privateRuntime.endpoint,'http://127.0.0.1:18083');assert.equal(JSON.stringify(b.resources()).includes(privateRuntime.capability),false);
+ assert.match(f.files.get(DIR+'/runtime-build.yaml').contents.toString(),/Dockerfile.billing-first-renewal/);assert.ok(f.events.find(e=>e.type==='process'&&e.args.includes('build')&&e.args.includes('--quiet')).args.includes('PAYMENT_DEMO_BUILD_MODE=billing-first-payment'));
+ await b.stop(LIMIT());
+});
+for(const drift of ['source','entrypoint','environment','port'])test('first-renewal bootstrap rejects '+drift+' before backend start',async()=>{
+ assert.equal(typeof bootstrapModule.createOwnedBillingFirstRenewalBootstrap,'function');const f=firstRenewalFixture(),execute=f.dependencies.execute;
+ f.dependencies.execute=async(file,args,settings)=>{const r=await execute(file,args,settings);if(args[5]==='inspect'){const v=JSON.parse(r.stdout);if(args[4]==='image'&&args.at(-1)===PROJECT+'-backend:latest'){if(drift==='source')v.RuntimeSource=false;if(drift==='entrypoint')v.Entrypoint=['java','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentRuntime'];}if(args[4]==='container'&&v.Name==='/'+PROJECT+'-backend'){if(drift==='environment')v.RuntimeIdentity=false;if(drift==='port')v.PortBindings['18083/tcp'][0].HostIp='0.0.0.0';}r.stdout=JSON.stringify(v);}return r;};
+ const b=await bootstrapModule.createOwnedBillingFirstRenewalBootstrap(f.options,f.dependencies);await assert.rejects(b.prepare(LIMIT()));assert.equal(firstPaymentStarts(f).length,0);
+});
+test('first-renewal bootstrap mode rejection precedes all dependency access',async()=>{
+ assert.equal(typeof bootstrapModule.createOwnedBillingFirstRenewalBootstrap,'function');let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}}),f=firstRenewalFixture();
+ await assert.rejects(bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,trap),/OPT_IN_REQUIRED/);f.options.env.PAYMENT_STRIPE_BILLING_FIRST_PAYMENT='true';await assert.rejects(bootstrapModule.createOwnedBillingFirstRenewalBootstrap(f.options,trap),/OPT_IN_REQUIRED/);assert.equal(reads,0);
+});

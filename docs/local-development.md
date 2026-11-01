@@ -1821,3 +1821,35 @@ nonretryable. Cash is unverified, the historical root cause is unknown, and
 native initial-payment/full 5B remain **NOT_ACCEPTED**. Offline tests establish
 this diagnostic correction only; they grant no new runtime, replay, attempt,
 push or CI authority.
+
+## Prepared initial payment and first renewal scenario
+
+The separate combined lane is **OFFLINE_PREPARED**. Its native acceptance is **NOT_RUN** and full stage 5B remains **NOT_ACCEPTED**. It reuses the original browser payment component for a fresh EUR20 MONTH subscription, then performs exactly one unchanged-terms EUR20 renewal. The original initial-only launcher remains available with its original authority and result. This preparation grants no native financial authority and does not resolve the previously recorded storage prerequisite or authorize reuse of retained resources, operations, keys or ledgers.
+
+The dedicated entry is `examples/demo-site/tests/stripe-billing-first-renewal.spec.ts`, selected only by `playwright.stripe-billing-first-renewal.config.ts`. Ordinary and offline Playwright discovery exclude it. One worker, zero retries, disabled trace/screenshots/video, the existing browser component and a bounded scope-specific reporter preserve the initial lane's privacy and cleanup rules. Both accepted flags become true only after the initial proof, final proof and confirmed cleanup. An incomplete run consumes its authority; there is no retry, resume, arbitrary advance or graph command.
+
+A future native run requires separate approval of a clean exact source SHA, fresh UUID/resources, canonical daemon, seven free loopback ports, explicit frozen epoch, pinned account/API and budget `{clock:1,customer:1,create:1,confirm:1,advance:2}` plus one fresh product and price. Resolve and independently verify adequate native storage before requesting that run; the earlier cleanup receipt is not proof of available capacity. With those prerequisites approved, from the repository root use the explicit invocation below. These required variables must contain the approved values; this example does not select a daemon, source, run or ports automatically.
+
+```sh
+: "${PAYMENT_STRIPE_SANDBOX_RUN_ID:?Approved fresh UUID required}"
+: "${PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE:?Approved clean source SHA required}"
+: "${PAYMENT_STRIPE_SANDBOX_DAEMON:?Approved canonical unix:// socket required}"
+: "${PAYMENT_STRIPE_SANDBOX_PORT_BACKEND:?Approved backend port required}"
+: "${PAYMENT_STRIPE_SANDBOX_PORT_DEMO:?Approved demo port required}"
+: "${PAYMENT_STRIPE_SANDBOX_PORT_RECEIVER:?Approved receiver port required}"
+: "${PAYMENT_STRIPE_SANDBOX_PORT_POSTGRES:?Approved database port required}"
+: "${PAYMENT_STRIPE_SANDBOX_PORT_MAILPITHTTP:?Approved mail HTTP port required}"
+: "${PAYMENT_STRIPE_SANDBOX_PORT_MAILPITSMTP:?Approved mail SMTP port required}"
+: "${PAYMENT_STRIPE_BILLING_FIRST_RENEWAL_CONTROL_PORT:?Approved distinct control port required}"
+: "${PAYMENT_STRIPE_BILLING_FIRST_RENEWAL_FROZEN_TIME:?Approved positive epoch seconds required}"
+export PAYMENT_STRIPE_SANDBOX_ENABLED=true
+export PAYMENT_STRIPE_BILLING_FIRST_RENEWAL=true
+pnpm --dir examples/demo-site exec playwright test \
+  --config playwright.stripe-billing-first-renewal.config.ts
+```
+
+Export the required values before invocation. All other initial-only, billing acceptance, legacy/native, diagnostic, manual, refund and Stage4 opt-ins must be absent or false, and debug/trace controls off. The bootstrap generates the private control key and supplies only the `PAYMENT_STRIPE_BILLING_FIRST_RENEWAL_*` runtime identity fields. It builds `backend/Dockerfile.billing-first-renewal` with the exact source argument and verifies the `OwnedBillingFirstRenewalRuntime` PropertiesLauncher entrypoint, `/app/renewal-runtime` closure, source/environment identity and seven loopback ports before use. The private `withFirstRenewalRuntime` capability is unavailable on the initial-only bootstrap. The CLI provides only binding/login/listener capabilities. The demo image continues to use `billing-first-payment` mode and `/billing-first-payment.html`.
+
+The owner proves the original one-payment/no-advance SQL before admission, then invokes only empty-body `/first-renewal/boundary` and `/first-renewal/finalization`. Boundary is B=E and finalization T=E+3600; N comes from the provider. Final evidence requires two EUR2000 cash facts, two payment events, two PERIOD_PAID events, the committed publication, both ACK/READY steps and exactly seven acknowledged provider operations with no recovery: product, price, clock, customer, original subscription and two advances. Four signed delivered callbacks must be the exact INITIAL/RENEWAL union. No production route or ordinary clock registration changes; authentication, leases and delivery remain on UTC.
+
+The hosted combined test creates catalog operations through the actual catalog adapter with inert SDK transport, retains the original SQL before admission, executes the shipped final SQL in a real read-only database transaction and passes its actual row plus signature-verified deliveries to the production Node validator. Rollback-only SQL mutations check missing, foreign, unresolved and altered operation evidence without new SDK requests or financial writes. These tests and production-only exported closure checks belong to hosted CI; local source compilation and pure injected tests do not establish database, browser, Stripe or native acceptance. Final source-bound CI outcomes are retained in the external completion receipt, not inferred from this preparation status.

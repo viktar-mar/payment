@@ -24,3 +24,5 @@ export function parseBillingFirstPaymentDiagnosticLine(line:unknown):string|null
 
 export interface BillingFirstRenewalResult extends Omit<BillingFirstPaymentResult,'scope'> {scope:'OWNED_INITIAL_AND_FIRST_RENEWAL';renewalAccepted:boolean}
 export function createOwnedBillingFirstRenewal(options:unknown,dependencies?:Record<string,unknown>):Promise<{resources():BillingFirstRenewalResult;run(journey:(port:BillingFirstPaymentPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingFirstRenewalResult>;close():Promise<BillingFirstRenewalResult>}>;
+export function formatBillingFirstRenewalDiagnostic(result:BillingFirstRenewalResult):string|null;
+export function parseBillingFirstRenewalDiagnosticLine(line:unknown):string|null;

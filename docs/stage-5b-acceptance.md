@@ -164,3 +164,19 @@ The dedicated initial-only scenario has a concrete page, SDK transport bridge, N
 | Full Stage 5B | **NOT_ACCEPTED** |
 
 Native entry is excluded from default discovery, uses one worker/zero retries and disables trace/video/screenshots with fixed output labels. A single immutable owner deadline and finite independent cleanup cover startup through proof. Browser OBSERVE does not prove settlement; actual owned reconciliation with a new fence before each graph read, exact original INITIAL full CASH/payment/journal/CREATE/PERIOD_PAID, original paidThrough and independently delivered signed v3/v4 callbacks are required. Access snapshot expiry remains F+300 independently of the full paid period. This lane does not claim ordinary inbound webhook acceptance. The existing INITIAL_NON_CLOCK path, public production routes, normal jar, default Fake flow and all historical financial/evidence records remain preserved.
+
+## Combined initial payment and first renewal scenario
+
+The separate `OWNED_INITIAL_AND_FIRST_RENEWAL` lane is **OFFLINE_PREPARED**. It adds an explicit future entry for EUR20 original SERVER_CONFIRM_V2 payment plus exactly one unchanged-terms EUR20 renewal, using the existing initial browser component. The initial-only result and default Fake path retain their scope.
+
+| Gate | Evidence and current scope |
+| --- | --- |
+| Closed owner and transport | Separate opt-in, preflight/bootstrap/CLI factories, exact renewal runtime image/source/environment proof and private runtime capability; no generic clock or graph command |
+| Initial evidence | Original shipped SQL runs before renewal admission, preserving one-payment/no-advance and original confirm lineage requirements |
+| Final evidence | Exactly two EUR2000 cash facts, one committed publication, two fixed advances, seven exact acknowledged operations and four signed callbacks forming the exact INITIAL/RENEWAL union |
+| Hosted synthetic composition | Actual catalog reserve/dispatch/ACK, genuine payment services, shipped read-only final SQL, production callback validator and rollback operation-mutation regressions authored; execution outcomes belong to the exact-source CI completion receipt |
+| Runtime packaging | Both dedicated exported closures checked against production libraries only without launching; normal production jar excludes runtime/samplers |
+| Native combined run | **NOT_RUN / NOT_ACCEPTED**; separate one-use approval and verified storage capacity remain prerequisites |
+| Full stage 5B | **NOT_ACCEPTED** |
+
+[Future invocation and prerequisites](local-development.md#prepared-initial-payment-and-first-renewal-scenario) describe the dedicated configuration. This preparation supplies no native authority, successful provider result or storage remediation. Historical failures and consumed/UNKNOWN/DISPATCHING operations remain preserved and nonretryable. Both `initialAccepted` and `renewalAccepted` require completed proofs and confirmed cleanup; `full5bAccepted` is always false.

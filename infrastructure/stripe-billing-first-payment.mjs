@@ -96,3 +96,13 @@ export function parseBillingFirstPaymentDiagnosticLine(line){
  const match=/^owned_initial_payment_diagnostic code=([A-Z_]+) cleanup=(CONFIRMED|UNCONFIRMED)$/.exec(line);
  return match&&match[0]===line&&isTerminalDiagnostic(match[1])?line:null;
 }
+
+/** Same finite checkpoints, with a distinct combined-run scope; never an acceptance report. */
+export function formatBillingFirstRenewalDiagnostic(result){
+ if(result?.scope!=='OWNED_INITIAL_AND_FIRST_RENEWAL'||result.renewalAccepted!==false)return null;
+ return formatBillingFirstPaymentDiagnostic(result)?.replace('owned_initial_payment_diagnostic','owned_initial_and_first_renewal_diagnostic')??null;
+}
+export function parseBillingFirstRenewalDiagnosticLine(line){
+ if(typeof line!=='string'||!line.startsWith('owned_initial_and_first_renewal_diagnostic '))return null;
+ return parseBillingFirstPaymentDiagnosticLine(line.replace('owned_initial_and_first_renewal_diagnostic','owned_initial_payment_diagnostic'))?line:null;
+}

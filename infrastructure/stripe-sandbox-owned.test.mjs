@@ -290,3 +290,14 @@ test('Billing runtime preflight cancellation reaches command and prevents late s
  assert.equal((await pending).status,'PENDING');assert.equal(signal.aborted,true);release({stdout:source+'\n',stderr:''});await new Promise(r=>setTimeout(r,5));assert.deepEqual(f.calls,[]);
 });
 test('first-payment preflight owns all seven distinct ports and source before any runtime authority',async()=>{const input=options({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT:'true'},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_success',controlPort:56127,frozenTime:1790000000}),f=fixture();safe(await owned.preflightOwnedBillingFirstPayment(input,f.dependencies),{status:'READY'});assert.deepEqual(f.calls.filter(c=>c.type==='port').map(c=>c.port),[...Object.values(ports),56127]);const busy=fixture();busy.dependencies.portAvailable=async p=>p!==56127;safe(await owned.preflightOwnedBillingFirstPayment(input,busy.dependencies),pending('PORTS','PORT_UNAVAILABLE'));const drift=fixture({head:'b'.repeat(40)});safe(await owned.preflightOwnedBillingFirstPayment(input,drift.dependencies),pending('SOURCE','SOURCE_MISMATCH'));assert.equal(drift.calls.some(c=>c.type==='port'),false);});
+
+test('first-renewal preflight owns seventh port and rejects wrong modes before dependencies',async()=>{
+ const input=options({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_RENEWAL:'true'},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_and_first_renewal',controlPort:56127,frozenTime:1790000000}),f=fixture();
+ assert.equal(typeof owned.preflightOwnedBillingFirstRenewal,'function');
+ safe(await owned.preflightOwnedBillingFirstRenewal(input,f.dependencies),{status:'READY'});
+ assert.deepEqual(f.calls.filter(c=>c.type==='port').map(c=>c.port),[...Object.values(ports),56127]);
+ let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}});
+ for(const change of [{selectedCase:'initial_success'},{env:{...input.env,PAYMENT_STRIPE_BILLING_FIRST_PAYMENT:'true'}},{controlPort:ports.backend}])safe(await owned.preflightOwnedBillingFirstRenewal({...input,...change},trap),pending('OPT_IN','OPT_IN_REQUIRED'));
+ safe(await owned.preflightOwnedBillingFirstPayment(input,trap),pending('OPT_IN','OPT_IN_REQUIRED'));assert.equal(reads,0);
+ const busy=fixture();busy.dependencies.portAvailable=async p=>p!==56127;safe(await owned.preflightOwnedBillingFirstRenewal(input,busy.dependencies),pending('PORTS','PORT_UNAVAILABLE'));
+});

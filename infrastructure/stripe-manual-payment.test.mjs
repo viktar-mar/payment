@@ -164,7 +164,7 @@ test('inert imports neither read private credentials nor launch any subprocess o
       'stripe-sandbox-ownership.mjs','stripe-manual-refund-options.mjs','stripe-manual-refund-remainder-options.mjs',
       'stripe-sandbox-extras.mjs','smoke-stage-5a.mjs',
       'stripe-billing-acceptance-options.mjs','stripe-billing-limits.mjs',
-      'stripe-billing-first-payment-options.mjs',
+      'stripe-billing-first-payment-options.mjs','stripe-billing-first-renewal-options.mjs',
     ].map(name=>new URL('infrastructure/'+name,root).href));
     const readSource=fs.readFileSync;
     registerHooks({load(url,context,nextLoad){

@@ -2,18 +2,19 @@ import type {Reporter, TestCase, TestResult, FullResult} from '@playwright/test/
 import {parseBillingFirstPaymentDiagnosticLine} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 /** Fixed labels, one CLI authorization handoff and one validated final diagnostic. */
 export default class FirstPaymentReporter implements Reporter {
-  private buffer = '';
+  protected buffer = '';
   private handoff = false;
   private diagnostic = false;
   private overflow = false;
   printsToStdio(): boolean {return true;}
+  protected acceptDiagnostic(line: string): string | null {return parseBillingFirstPaymentDiagnosticLine(line);}
   onStdOut(chunk: string | Buffer): void {
     for (const character of chunk.toString('utf8')) {
       if (character === '\n') {
         const line = this.overflow ? '' : this.buffer;
         this.buffer = '';
         this.overflow = false;
-        if (!this.diagnostic && parseBillingFirstPaymentDiagnosticLine(line)) {
+        if (!this.diagnostic && this.acceptDiagnostic(line)) {
           this.diagnostic = true;
           process.stdout.write(line + '\n');
           continue;

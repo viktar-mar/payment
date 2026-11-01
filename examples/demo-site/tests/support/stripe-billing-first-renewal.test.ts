@@ -1,0 +1,14 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+// No browser/runtime invocation: inert reporter and owner/diagnostic modules only.
+test('combined reporter keeps closed scope labels and inherited filtered output',async()=>{
+ const {default:Reporter}=await import(new URL('./stripe-billing-first-renewal-reporter.ts',import.meta.url).href);
+ const original=process.stdout.write,output:string[]=[];
+ process.stdout.write=((value:unknown)=>{output.push(String(value));return true;}) as typeof process.stdout.write;
+ try {
+  const reporter=new Reporter();reporter.onStdErr('secret-sentinel');reporter.onStdOut('secret-sentinel\n');reporter.onStdOut('owned_initial_payment_diagnostic code=BROWSER_PAGE cleanup=CONFIRMED\n');
+  reporter.onStdOut('owned_initial_and_first_renewal_diagnostic code=BROWSER_PAGE cleanup=CONFIRMED\n');
+  reporter.onError({get message(){throw Error('must not read');}});reporter.onTestEnd({title:'secret-sentinel'}, {status:'failed',errors:['secret-sentinel']});reporter.onEnd({status:'failed'});
+  assert.deepEqual(output,['owned_initial_and_first_renewal_diagnostic code=BROWSER_PAGE cleanup=CONFIRMED\n','first_renewal_setup_failed\n','owned_initial_and_first_renewal_not_accepted\n','owned_initial_and_first_renewal_result_not_accepted full5b=NOT_ACCEPTED\n']);
+ }finally {process.stdout.write=original;}
+});
