@@ -329,7 +329,11 @@ class OwnedFirstRenewalPublicationIntegrationTest extends StripeBillingFirstRene
             case "revision"->jdbc.update("update subscriptions set revision=revision+1 where id=?",current().id());
             case "sequence"->jdbc.update("update subscriptions set observation_sequence=observation_sequence+1 where id=?",current().id());
             case "policy"->jdbc.update("update site_subscription_policies set version=version+1 where site_id=?",site.value());
-            case "refund"->jdbc.update("update payments set refunded_amount_minor=1 where id=?",receipt.payment());
+            case "refund"->{
+                jdbc.update("update payments set status='PARTIALLY_REFUNDED',refunded_amount_minor=1 where id=?",receipt.payment());
+                assertThat(jdbc.queryForMap("select status,refunded_amount_minor,refundable_amount_minor from payments where id=?",receipt.payment()))
+                    .containsEntry("status","PARTIALLY_REFUNDED").containsEntry("refunded_amount_minor",1L).containsEntry("refundable_amount_minor",999L);
+            }
         }
         var before=financialState();
         assertThatThrownBy(()->publisher().replayPublished(admission)).isInstanceOf(RuntimeException.class);
