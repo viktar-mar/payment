@@ -11,7 +11,7 @@ import java.util.Objects;
 public final class OwnedFirstRenewal {
     private OwnedFirstRenewal() {}
     /** Emitted only after exact persisted admission authentication, never for a claimant conflict. */
-    public static final class AuthorityDrift extends IllegalStateException {
+    public static final class AuthorityDrift extends RuntimeException {
         public AuthorityDrift(){super("Owned first renewal authority changed");}
     }
     public record Admission(UUID id,OwnedClockSubscriptionReceipt receipt,String sourceSha,

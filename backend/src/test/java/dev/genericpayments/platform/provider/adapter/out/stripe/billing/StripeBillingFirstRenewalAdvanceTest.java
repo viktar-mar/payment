@@ -77,6 +77,12 @@ class StripeBillingFirstRenewalAdvanceTest {
         assertThatThrownBy(()->adapter.advance(admission,Step.BOUNDARY)).isInstanceOf(RuntimeException.class);
         assertThat(f.http.calls).isEmpty();assertThat(claims).isZero();
     }
+    @Test void infrastructureFailureDoesNotGainAuthorityToStopAdmission() {
+        var admission=admission();var adapter=adapter(admission);
+        authorityFailure=new org.springframework.dao.InvalidDataAccessApiUsageException("inert infrastructure failure");
+        assertThatThrownBy(()->adapter.advance(admission,Step.BOUNDARY)).isSameAs(authorityFailure);
+        assertThat(stopped).isFalse();assertThat(f.http.calls).isEmpty();assertThat(claims).isZero();
+    }
     @Test void postsOnceAndPersistsOnlySeparateGetReady() {
         var admission=admission();var adapter=adapter(admission);
         f.http.reply(clock(1700000000,"ready"));f.http.reply(clock(1700000000,"advancing"));f.http.reply(clock(1700003600,"ready"));

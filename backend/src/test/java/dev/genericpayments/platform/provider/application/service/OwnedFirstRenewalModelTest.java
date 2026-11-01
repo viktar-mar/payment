@@ -12,8 +12,14 @@ import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
-/** Pure records only: no superclass, extensions, static resources, mocks, Spring or IO. */
+/** Records and pure exception translation: no superclass, extensions, mocks, Spring context or IO. */
 class OwnedFirstRenewalModelTest {
+    @Test void authorityDriftSurvivesPersistenceExceptionTranslation() {
+        var drift=new AuthorityDrift();
+        var outgoing=org.springframework.dao.support.DataAccessUtils.translateIfNecessary(drift,
+            org.springframework.orm.jpa.EntityManagerFactoryUtils::convertJpaAccessExceptionIfPossible);
+        assertThat(outgoing).as("The repository boundary must preserve the authenticated domain signal for the adapter").isSameAs(drift);
+    }
     private UUID id(int n){return new UUID(0,n);}
     private final Instant at=Instant.parse("2026-11-01T12:00:00Z");
     private OwnedClockSubscriptionReceipt receipt() {

@@ -81,7 +81,10 @@ class StripeBillingFirstRenewalAdvanceIntegrationTest extends StripeBillingClock
     @Test void authenticatedPreclaimCredentialDriftStopsEvenIfLaterRepaired() {
         var admission=paidAdmission();int calls=http.calls.size();
         jdbc.update("update payment_accounts set credentials_ref='inert-drift' where id=?",billing.id().value());
-        assertThatThrownBy(()->adapter().advance(admission,Step.BOUNDARY)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->renewals.requireCurrent(admission))
+            .as("The real repository proxy must preserve authenticated AuthorityDrift without JPA exception translation")
+            .isExactlyInstanceOf(AuthorityDrift.class);
+        assertThatThrownBy(()->adapter().advance(admission,Step.BOUNDARY)).isExactlyInstanceOf(AuthorityDrift.class);
         assertThat(jdbc.queryForObject("select stopped_at from stripe_billing_first_renewals",java.sql.Timestamp.class)).isNotNull();
         jdbc.update("update payment_accounts set credentials_ref=? where id=?",billing.credentialsRef(),billing.id().value());
         assertThatThrownBy(()->adapter().advance(admission,Step.BOUNDARY)).isInstanceOf(RuntimeException.class);
