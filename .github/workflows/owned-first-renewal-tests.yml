@@ -1,0 +1,51 @@
+name: Owned first renewal tests
+
+on:
+  push:
+    paths:
+      - 'backend/**'
+      - '.github/workflows/owned-first-renewal-tests.yml'
+  pull_request:
+    paths:
+      - 'backend/**'
+      - '.github/workflows/owned-first-renewal-tests.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  first-renewal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: backend/pom.xml
+      - name: Check owned-test container tooling
+        run: |
+          docker version
+          docker compose version
+          docker buildx version
+      - name: Prepare local test issuer
+        run: node infrastructure/init-local-customer-issuer.mjs
+      - name: Verify owned first renewal contracts
+        working-directory: backend
+        run: ./mvnw -B -ntp '-Dtest=*FirstRenewal*Test,StripeBillingClockStorePolicyTest,StripeBillingSnapshotMapperTest,StripeBillingClockConfirmationCompositionIntegrationTest' test
