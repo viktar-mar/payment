@@ -137,11 +137,80 @@ public class JdbcOwnedFirstRenewalStore implements OwnedFirstRenewalStore {
             observation.created(),observation.deletesAfter(),observation.advancingTarget(),Timestamp.from(ready.observedAt()));
         return readyRow(admission,ack.advance().id()).filter(ready::equals).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
     }
-    public Boundary recordBoundary(Admission admission,LaterReady ready,Boundary boundary){throw unavailable();}
+    @Transactional(propagation=Propagation.MANDATORY)
+    public LaterReady requireReadyInTransaction(Admission admission,LaterReady ready){
+        requireTransaction();requirePaidInTransaction(admission);
+        if(ready==null||!ready.admissionId().equals(admission.id()))throw unavailable();
+        requireAdvance(admission,ready.ack().advance());
+        return readyRow(admission,ready.ack().advance().id()).filter(ready::equals).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+    }
+    @Transactional(propagation=Propagation.MANDATORY)
+    public ReadClaim beginReadInTransaction(Admission admission,LaterReady ready,
+            dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Fence fence,UUID invocation,Instant startedAt){
+        requireTransaction();requireReadyInTransaction(admission,ready);requireReadFence(admission,fence);
+        var at=startedAt.truncatedTo(ChronoUnit.MICROS);var claim=new ReadClaim(ready,invocation,at,at.plusSeconds(30),fence);
+        int inserted=jdbc.update("""
+            insert into stripe_billing_first_renewal_read_claims(ready_id,step_id,admission_id,invocation,started_at,deadline_at,
+              captured_revision,selected_operation,selected_version,observation_sequence) values (?,?,?,?,?,?,?,?,?,?)
+            on conflict do nothing
+            """,ready.id(),ready.ack().advance().id(),admission.id(),invocation,Timestamp.from(claim.startedAt()),Timestamp.from(claim.deadlineAt()),
+            fence.revision(),fence.operationId(),fence.operationVersion(),fence.observationSequence());
+        // The returned value is authority only on an actual INSERT in this stack. Never reload on conflict.
+        if(inserted!=1)throw unavailable();return claim;
+    }
+    @Transactional(propagation=Propagation.MANDATORY,readOnly=true)
+    public Optional<ReadClaim> readClaim(Admission admission,LaterReady ready){
+        requireTransaction();requireReadyInTransaction(admission,ready);
+        var claim=readClaimRow(admission,ready);claim.ifPresent(c->requireReadFence(admission,c.fence()));return claim;
+    }
+    private Optional<ReadClaim> readClaimRow(Admission admission,LaterReady ready){
+        return jdbc.query("select * from stripe_billing_first_renewal_read_claims where ready_id=? and step_id=? and admission_id=?",(r,n)->
+            new ReadClaim(ready,r.getObject("invocation",UUID.class),r.getTimestamp("started_at").toInstant(),r.getTimestamp("deadline_at").toInstant(),
+                new dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Fence(
+                    r.getLong("captured_revision"),r.getObject("selected_operation",UUID.class),r.getObject("selected_version",Long.class),null,null,r.getLong("observation_sequence"))),
+            ready.id(),ready.ack().advance().id(),admission.id()).stream().findFirst();
+    }
+    private void requireReadFence(Admission admission,dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Fence fence){
+        // Exact paid admission excludes every unresolved financial operation. A retained trial reservation is also not this paid read.
+        if(fence==null||fence.revision()!=admission.subscriptionRevision()||fence.operationId()!=null||fence.operationVersion()!=null
+                ||fence.lease()!=null||fence.authority()!=null||fence.observationSequence()==null||!Boolean.TRUE.equals(jdbc.queryForObject("""
+            select exists(select 1 from subscriptions s where s.id=? and s.revision=? and s.observation_sequence=?
+             and not exists(select 1 from subscription_trial_eligibility t where t.site_id=s.site_id and t.customer_id=s.customer_id
+              and t.product_id=s.product_id and t.consumed_at is null and t.reserved_by_operation is not null))
+            """,Boolean.class,admission.receipt().intent().subscription(),fence.revision(),fence.observationSequence())))throw unavailable();
+    }
+    @Transactional(propagation=Propagation.MANDATORY)
+    public Boundary recordBoundary(Admission admission,LaterReady ready,Boundary boundary){
+        requireTransaction();requireReadyInTransaction(admission,ready);
+        if(ready.ack().advance().step()!=Step.BOUNDARY||boundary==null||!boundary.ready().equals(ready))throw unavailable();
+        var claim=readClaim(admission,ready).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);requireBoundary(admission,boundary,claim);
+        var saved=boundaryRow(admission);if(saved.isPresent())return saved.filter(boundary::equals).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+        jdbc.update("""
+            insert into stripe_billing_first_renewal_boundary(id,admission_id,ready_id,item_reference,invoice_reference,period_start,period_end,fingerprint,observed_at)
+             values(?,?,?,?,?,?,?,?,?)
+            """,boundary.id(),admission.id(),ready.id(),boundary.item(),boundary.renewalInvoice(),Timestamp.from(boundary.period().start()),
+            Timestamp.from(boundary.period().end()),boundary.fingerprint(),Timestamp.from(boundary.observedAt()));
+        return boundaryRow(admission).filter(boundary::equals).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+    }
+    @Transactional(propagation=Propagation.MANDATORY,readOnly=true)
+    public Boundary boundaryInTransaction(Admission admission){
+        requireTransaction();requirePaidInTransaction(admission);
+        var boundary=boundaryRow(admission).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+        var exact=readyRow(admission,boundary.ready().ack().advance().id()).filter(boundary.ready()::equals).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+        requireBoundary(admission,boundary,readClaimRow(admission,exact).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable));return boundary;
+    }
+    private static void requireBoundary(Admission admission,Boundary boundary,ReadClaim claim){
+        if(!boundary.admissionId().equals(admission.id())||!boundary.ready().equals(claim.ready())||!boundary.item().equals(admission.receipt().itemReference())
+            ||boundary.renewalInvoice().equals(admission.invoice())||!boundary.period().start().equals(Instant.ofEpochSecond(admission.receipt().periodEnd()))
+            ||!Instant.ofEpochSecond(Math.addExact(admission.receipt().periodEnd(),3600)).isBefore(boundary.period().end())
+            ||boundary.observedAt().isBefore(claim.startedAt())||!boundary.observedAt().isBefore(claim.deadlineAt())
+            ||!boundary.fingerprint().equals(OwnedFirstRenewal.fingerprint("gp:owned-first-renewal-boundary:v1",boundary.id(),admission.id(),boundary.ready().id(),
+                boundary.item(),boundary.renewalInvoice(),boundary.period().start(),boundary.period().end(),boundary.observedAt())))throw unavailable();
+    }
     @Transactional(propagation=Propagation.REQUIRES_NEW)
     public Boundary boundary(Admission admission){
         requireTransaction();lockProviderScope(admission);requirePaidInTransaction(admission);
-        return boundaryRow(admission).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+        return boundaryInTransaction(admission);
     }
     public Publication recordPublicationInTransaction(Admission admission,LaterReady ready,Paid paid){throw unavailable();}
     public Optional<Publication> publicationInTransaction(Admission admission){throw unavailable();}

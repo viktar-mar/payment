@@ -105,12 +105,15 @@ public final class OwnedFirstRenewal {
         }
     }
     public sealed interface Observation permits Pending,Paid {}
-    public record Pending(Admission admission,LaterReady ready,Boundary boundary) implements Observation {
-        public Pending {observation(admission,ready,boundary);}
+    public record Pending(Admission admission,LaterReady ready,Boundary boundary,ReadClaim claim,Instant graphAcceptedAt) implements Observation {
+        public Pending {observation(admission,ready,boundary);accepted(ready,claim,graphAcceptedAt);}
     }
     public record Paid(Admission admission,LaterReady ready,Boundary boundary,
-            ApplySubscriptionSnapshotUseCase.Fence fence,Snapshot snapshot) implements Observation {
-        public Paid {observation(admission,ready,boundary);required(fence,snapshot);if(ready.ack().advance().step()!=Step.FINALIZATION)throw invalid();}
+            ApplySubscriptionSnapshotUseCase.Fence fence,Snapshot snapshot,ReadClaim claim,Instant graphAcceptedAt) implements Observation {
+        public Paid {
+            observation(admission,ready,boundary);required(fence,snapshot);accepted(ready,claim,graphAcceptedAt);
+            if(ready.ack().advance().step()!=Step.FINALIZATION||!fence.equals(claim.fence()))throw invalid();
+        }
     }
     public sealed interface MappedObservation permits MappedPending,MappedPaid {}
     public record MappedPending(Boundary boundary) implements MappedObservation {public MappedPending {required(boundary);}}
@@ -133,6 +136,10 @@ public final class OwnedFirstRenewal {
         required(a,r,b);
         if(!a.id().equals(r.admissionId())||!a.id().equals(b.admissionId())||!a.receipt().itemReference().equals(b.item())
                 ||!b.period().start().equals(Instant.ofEpochSecond(a.receipt().periodEnd())))throw invalid();
+    }
+    private static void accepted(LaterReady ready,ReadClaim claim,Instant at){
+        required(claim,at);
+        if(!ready.equals(claim.ready())||at.isBefore(claim.startedAt())||at.isBefore(ready.observedAt())||!at.isBefore(claim.deadlineAt()))throw invalid();
     }
     private static void clock(String ref,String object,boolean live,String name,long frozen,String status,long created,long deletes,Long target){
         if(!matches(ref,"clock_[A-Za-z0-9]{1,249}")||!"test_helpers.test_clock".equals(object)||live||name==null||name.isBlank()||name.length()>255||name.codePoints().anyMatch(Character::isISOControl)

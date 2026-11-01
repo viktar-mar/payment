@@ -57,7 +57,7 @@ class OwnedFirstRenewalModelTest {
         assertThatCode(()->new TestClockAck("clock_owned","test_helpers.test_clock",false,"owned",1000,"advancing",2000,3000,null)).doesNotThrowAnyException();
     }
     @Test void paidRequiresCompleteTypedProof() {
-        assertThatThrownBy(()->new Paid(admission("a".repeat(40),0,"in_owned","pi_owned"),null,null,null,null))
+        assertThatThrownBy(()->new Paid(admission("a".repeat(40),0,"in_owned","pi_owned"),null,null,null,null,null,null))
             .isInstanceOf(IllegalArgumentException.class);
     }
 }

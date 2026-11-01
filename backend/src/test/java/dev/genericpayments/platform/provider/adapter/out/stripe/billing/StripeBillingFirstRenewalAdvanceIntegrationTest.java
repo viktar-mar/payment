@@ -140,7 +140,8 @@ class StripeBillingFirstRenewalAdvanceIntegrationTest extends StripeBillingClock
             insert into stripe_billing_first_renewal_boundary(id,admission_id,ready_id,item_reference,invoice_reference,period_start,period_end,fingerprint,observed_at)
              values (?,?,?,?,?,?,?,?,?)
             """,boundaryId,admission.id(),first.id(),receipt.itemReference(),"in_renewal",java.sql.Timestamp.from(Instant.ofEpochSecond(b)),
-            java.sql.Timestamp.from(Instant.ofEpochSecond(b+86400)),"b".repeat(64),java.sql.Timestamp.from(started));
+            java.sql.Timestamp.from(Instant.ofEpochSecond(b+86400)),dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.fingerprint(
+                "gp:owned-first-renewal-boundary:v1",boundaryId,admission.id(),first.id(),receipt.itemReference(),"in_renewal",Instant.ofEpochSecond(b),Instant.ofEpochSecond(b+86400),started),java.sql.Timestamp.from(started));
         http.reply(clock(b,"ready",null));http.reply(clock(b,"advancing",null));http.reply(clock(t,"ready",null));
         var second=new AtomicReference<LaterReady>();
         assertThatCode(()->second.set(adapter().advance(admission,Step.FINALIZATION)))

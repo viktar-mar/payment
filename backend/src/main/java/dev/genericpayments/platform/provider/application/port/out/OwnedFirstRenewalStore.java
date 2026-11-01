@@ -19,6 +19,9 @@ public interface OwnedFirstRenewalStore {
             dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Fence fence,
             java.util.UUID invocation,Instant startedAt) {throw new UnsupportedOperationException();}
     default Optional<ReadClaim> readClaim(Admission admission,LaterReady ready) {throw new UnsupportedOperationException();}
+    /** Caller lifecycle transaction; no provider locks or nested independent transaction. */
+    default LaterReady requireReadyInTransaction(Admission admission,LaterReady ready) {throw new UnsupportedOperationException();}
+    default Boundary boundaryInTransaction(Admission admission) {throw new UnsupportedOperationException();}
     LaterReady recordReady(Ack ack,TestClockReady observation,Instant utcAt);
     Boundary recordBoundary(Admission admission,LaterReady ready,Boundary boundary);
     Boundary boundary(Admission admission);

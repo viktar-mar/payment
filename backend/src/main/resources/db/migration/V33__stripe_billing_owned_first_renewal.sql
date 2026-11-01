@@ -285,8 +285,20 @@ begin
   join stripe_billing_first_renewals a on a.id=s.admission_id
   join stripe_billing_owned_subscription_receipts r on r.intent_id=a.owned_intent
   join stripe_billing_first_renewal_read_claims claim on claim.ready_id=ready.id and claim.admission_id=a.id
+  join subscriptions local on local.id=a.subscription_id
+  join owned_first_renewal_paid(a.owned_intent) paid on true
   where ready.id=new.ready_id and ready.admission_id=new.admission_id and s.ordinal=1 and ready.status='ready'
+   and a.stopped_at is null and not exists(select 1 from stripe_billing_first_renewal_steps later where later.admission_id=a.id and later.ordinal>1)
+   and claim.step_id=s.id and claim.captured_revision=local.revision and claim.captured_revision=a.subscription_revision
+   and claim.observation_sequence=local.observation_sequence and claim.selected_operation is null and claim.selected_version is null
+   and not exists(select 1 from subscription_trial_eligibility t where t.site_id=local.site_id and t.customer_id=local.customer_id
+    and t.product_id=local.product_id and t.consumed_at is null and t.reserved_by_operation is not null)
+   and paid.root_id=a.original_root and paid.attempt_id=a.original_attempt and paid.attempt_version=a.attempt_version
+   and paid.bill_id=a.initial_bill and paid.bill_version=a.bill_version and paid.payment_id=a.initial_payment and paid.payment_version=a.payment_version
+   and paid.invoice_reference=a.invoice_reference and paid.allocation_reference=a.allocation_reference and paid.payment_intent_reference=a.payment_intent_reference
+   and paid.subscription_revision=a.subscription_revision and paid.policy_version=a.policy_version
    and new.period_start=to_timestamp(r.period_end) and new.item_reference=r.item_reference
+   and new.period_end>to_timestamp(r.period_end+3600)
    and new.invoice_reference<>a.invoice_reference and new.observed_at>=claim.started_at
    and new.observed_at<claim.deadline_at and claim.deadline_at>clock_timestamp() and new.observed_at<=clock_timestamp()
  ) then raise exception 'First renewal boundary lacks exact READY1' using errcode='23514'; end if;
@@ -307,13 +319,15 @@ begin
    and new.observation_sequence=s.observation_sequence
    and p.root_id=a.original_root and p.attempt_id=a.original_attempt and p.attempt_version=a.attempt_version
    and p.bill_id=a.initial_bill and p.bill_version=a.bill_version and p.payment_id=a.initial_payment and p.payment_version=a.payment_version
+   and p.invoice_reference=a.invoice_reference and p.allocation_reference=a.allocation_reference and p.payment_intent_reference=a.payment_intent_reference
    and p.subscription_revision=a.subscription_revision and p.policy_version=a.policy_version
    and not exists(select 1 from stripe_billing_first_renewal_steps higher where higher.admission_id=a.id and higher.ordinal>step.ordinal)
    and not exists(select 1 from stripe_billing_first_renewal_publications completed where completed.admission_id=a.id)
    and (step.ordinal=2 or not exists(select 1 from stripe_billing_first_renewal_boundary b where b.admission_id=a.id))
-   and (new.selected_operation is null or exists(select 1 from subscription_operations selected
-    where selected.id=new.selected_operation and selected.subscription_id=s.id and selected.site_id=s.site_id
-     and selected.customer_id=s.customer_id and selected.version=new.selected_version))
+   -- Paid predecessor already forbids unresolved financial operations; reject a retained trial selection too.
+   and new.selected_operation is null and new.selected_version is null
+   and not exists(select 1 from subscription_trial_eligibility t where t.site_id=s.site_id and t.customer_id=s.customer_id
+    and t.product_id=s.product_id and t.consumed_at is null and t.reserved_by_operation is not null)
  ) then raise exception 'First renewal read start lacks exact current READY and fence' using errcode='23514'; end if;
  return new;
 end $$;
