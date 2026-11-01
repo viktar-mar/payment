@@ -53,6 +53,8 @@ class OwnedBillingFirstRenewalScenarioIntegrationTest extends OwnedBillingFirstP
         return new StripeResponse(200,HttpHeaders.of(Map.of()),renewalReplies.removeFirst());
     }
     private void initial() throws Exception {
+        // Outbox rows retain their configured endpoint at financial event creation.
+        callbacks.configure(site.value(),"http://callback-receiver:8080/callback",true);
         prepare();noMoney();scenario.confirm(confirmRequest());noMoney();paidGraph();
         var settled=observe();assertThat(settled.get("phase").getAsString()).isEqualTo("SETTLED_LOCAL");
         end=Instant.parse(settled.get("paid_through").getAsString()).getEpochSecond();next=end+31*86400;
@@ -80,6 +82,7 @@ class OwnedBillingFirstRenewalScenarioIntegrationTest extends OwnedBillingFirstP
     private void deliver() {
         var claims=outbox.claimAutomatic("combined",10,OwnedBillingFirstPaymentRuntimeTest.callbackClaimUtc(Instant.now()),Duration.ofSeconds(30));assertThat(claims).hasSize(2);
         for(var claim:claims)new CallbackDeliveryService(outbox,encryption,payload,(endpoint,headers,bytes)->{
+            assertThat(endpoint).as("combined signed callback receiver binding").isEqualTo("http://callback-receiver:8080/callback");
             long timestamp=Long.parseLong(headers.get("Payment-Timestamp"));assertThat(Instant.ofEpochSecond(timestamp)).isBetween(began,Instant.now());
             assertThat(headers.get("Payment-Signature")).isEqualTo("v1="+new CallbackSigner().sign(Base64.getUrlDecoder().decode(encryption.decrypt(claim.secret())),timestamp,bytes));
             var json=JsonParser.parseString(new String(bytes,java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();assertThat(json.get("subscription_id").getAsString()).isEqualTo(prepared.get("subscription_id").getAsString());delivered.add(json.toString());return CallbackHttpPort.Result.success(204);
@@ -109,7 +112,7 @@ class OwnedBillingFirstRenewalScenarioIntegrationTest extends OwnedBillingFirstP
     @org.junit.jupiter.params.provider.ValueSource(strings={"lost_ack","stale_fence","authority_drift"})
     void failedBoundaryCannotFinalizeOrAdvanceAgain(String fault) throws Exception {
         initial();failure=fault;advanceReplies(false);graphReplies(false,false);
-        if(fault.equals("authority_drift"))jdbc.update("update payment_accounts set status='DISABLED' where id=?",billing.id().value());
+        if(fault.equals("authority_drift"))jdbc.update("update payment_accounts set account_status='DISABLED' where id=?",billing.id().value());
         assertThatThrownBy(combined()::boundary).hasMessage("FIRST_RENEWAL_STOPPED");var posts=posts();
         assertThatThrownBy(combined()::boundary).hasMessage("FIRST_RENEWAL_STOPPED");assertThatThrownBy(combined()::finalization).hasMessage("FIRST_RENEWAL_STOPPED");
         assertThat(posts()).isEqualTo(posts);assertThat(posts).isLessThanOrEqualTo(5);assertThat(count("payments")).isEqualTo(1);assertThat(count("stripe_billing_first_renewal_publications")).isZero();

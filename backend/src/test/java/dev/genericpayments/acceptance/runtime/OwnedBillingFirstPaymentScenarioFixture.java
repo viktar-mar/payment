@@ -135,15 +135,17 @@ abstract class OwnedBillingFirstPaymentScenarioFixture extends StripeBillingCloc
         Object[] args={billing.id().value(),site.value(),customer.value(),UUID.fromString(prepared.get("subscription_id").getAsString()),UUID.fromString(prepared.get("operation_id").getAsString()),UUID.fromString(prepared.getAsJsonObject("session").get("attempt_id").getAsString()),jdbc.queryForObject("select product_id from prices where id=?",UUID.class,createCommand.priceId().value()),createCommand.priceId().value(),createHash,confirmHash,"https://shop.test",run,FROZEN};
         var rows=jdbc.queryForList(sql,args);assertThat(rows).hasSize(1);
         var proof=JsonParser.parseString(rows.getFirst().get("proof").toString()).getAsJsonObject();
-        for(var key:List.of("owned","cash","original","journal"))assertThat(proof.get(key).getAsBoolean()).as(key).isTrue();
+        for(var key:List.of("owned","cash","original","journal"))assertThat(proof.get(key).getAsBoolean()).as("initial SQL proof.%s",key).isTrue();
         var delivered=JsonParser.parseString(rows.getFirst().get("callbacks").toString()).getAsJsonArray();assertThat(delivered.size()).isEqualTo(2);
-        for(var callback:delivered)assertThat(callback.getAsJsonObject().get("delivered").getAsBoolean()).isTrue();
+        for(var callback:delivered)assertThat(callback.getAsJsonObject().get("delivered").getAsBoolean())
+            .as("initial SQL callbacks[%s].delivered",callback.getAsJsonObject().get("id").getAsString()).isTrue();
         assertThat(count("provider_inbox")).isZero();
         for(int index:new int[]{8,9,11,12}) {
             var bad=args.clone();bad[index]=index==11?UUID.randomUUID():index==12?FROZEN+1:"0".repeat(64);
             var rejected=jdbc.queryForList(sql,bad);assertThat(rejected).hasSize(1);
             var flags=JsonParser.parseString(rejected.getFirst().get("proof").toString()).getAsJsonObject();
-            assertThat(flags.get(index>=11?"owned":"original").getAsBoolean()).isFalse();
+            var key=index>=11?"owned":"original";
+            assertThat(flags.get(key).getAsBoolean()).as("initial SQL mismatched binding[%s] proof.%s",index,key).isFalse();
         }
     }
 }
