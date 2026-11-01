@@ -7,6 +7,7 @@ import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal
 import dev.genericpayments.platform.provider.application.port.out.OwnedFirstRenewalStore;
 import dev.genericpayments.platform.provider.application.service.OwnedFirstRenewalAdmissionService;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionLifecycleLockPort;
+import dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase;
 import java.time.*;
 import java.util.*;
 import java.util.function.Supplier;
@@ -19,6 +20,11 @@ public abstract class StripeBillingFirstRenewalCompositionFixture extends Stripe
     @Autowired protected OwnedFirstRenewalStore renewals;
     @Autowired protected LockPaymentAccountPort accountLocks;
     @Autowired protected SubscriptionLifecycleLockPort lifecycleLocks;
+    /** Like the original fixture's apply helper, each later real application uses current UTC.
+     * The test clock must not retain the initial nanosecond value after PostgreSQL rounds it. */
+    protected ApplySubscriptionSnapshotUseCase atCurrentOperationalUtc(ApplySubscriptionSnapshotUseCase delegate) {
+        return command->{TestClock.set(Instant.now());delegate.apply(command);};
+    }
     protected void genuineInitialCash() {
         beginConfirmation();issueAndSelect();confirm("succeeded");
         var captured=fence();apply(paidObservation(),captured);assertPaid();

@@ -51,7 +51,7 @@ class OwnedFirstRenewalPublicationIntegrationTest extends StripeBillingFirstRene
     }
     private OwnedFirstRenewalPublicationService publisher(OwnedFirstRenewalStore store,ApplySubscriptionSnapshotUseCase apply) {
         return new OwnedFirstRenewalPublicationService(store,transaction,lifecycleOperations,lifecycleLocks,accountLocks,
-            subscriptions,readPreparation,observations,apply,trialEligibility,Clock.systemUTC());
+            subscriptions,readPreparation,observations,atCurrentOperationalUtc(apply),trialEligibility,Clock.systemUTC());
     }
     private SubscriptionBillingTimePort.Sample sample() {
         return transaction.required(()->{
@@ -109,6 +109,46 @@ class OwnedFirstRenewalPublicationIntegrationTest extends StripeBillingFirstRene
         assertThat(count("stripe_billing_first_renewal_read_claims")).isEqualTo(2);
         assertThatThrownBy(()->publisher().publish(admission,paid.ready(),paid)).isInstanceOf(RuntimeException.class);
         assertThat(financialState()).isEqualTo(committed);
+    }
+
+    @Test void publicationRefreshesOperationalUtcAfterInitialBillRoundsUpInPostgres() {
+        var admission=paidAdmission();var paid=paid(admission);var before=financialState();
+        var initialBill=jdbc.queryForObject("select row_to_json(b)::text from subscription_billing_records b where id=?",String.class,admission.bill());
+        var initialPayment=jdbc.queryForObject("select row_to_json(p)::text from payments p where id=?",String.class,admission.payment());
+        var claims=jdbc.queryForList("select row_to_json(c)::text from stripe_billing_first_renewal_read_claims c order by ready_id",String.class);
+        int calls=http.calls.size();
+        var created=jdbc.queryForObject("select created_at from subscription_billing_records where id=?",Timestamp.class,admission.bill()).toInstant();
+        // Artificial fixture-clock input derived from the genuinely persisted UTC bill. No row is changed.
+        // PostgreSQL rounds this input up by211ns, reproducing the original frozen nanosecond clock.
+        var unrounded=created.minusNanos(211);
+        assertThat(jdbc.queryForObject("select cast(? as timestamptz)",Timestamp.class,Timestamp.from(unrounded)).toInstant()).isEqualTo(created);
+        assertThat(unrounded).isBefore(created);TestClock.set(unrounded);
+        var unrefreshed=new OwnedFirstRenewalPublicationService(renewals,transaction,lifecycleOperations,lifecycleLocks,accountLocks,
+            subscriptions,readPreparation,observations,facts,trialEligibility,Clock.systemUTC());
+        assertThatThrownBy(()->unrefreshed.publish(admission,paid.ready(),paid))
+            .as("The unchanged domain guard rejects a stale fixture clock before the rounded historical createdAt")
+            .isInstanceOf(dev.genericpayments.platform.shared.domain.DomainValidationException.class).hasMessage("Invalid billing record");
+        assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_first_renewal_publications")).isZero();
+
+        ApplySubscriptionSnapshotUseCase originalAuthority=command->{
+            assertThat(command.fence()).isEqualTo(paid.fence());assertThat(command.snapshot()).isEqualTo(paid.snapshot());
+            assertThat(observations.captureFence(current())).isEqualTo(paid.fence().observationSequence());
+            assertThat(http.calls).hasSize(calls);
+            assertThat(jdbc.queryForList("select row_to_json(c)::text from stripe_billing_first_renewal_read_claims c order by ready_id",String.class)).isEqualTo(claims);
+            facts.apply(command);
+        };
+        assertThatCode(()->publisher(renewals,originalAuthority).publish(admission,paid.ready(),paid))
+            .as("The fixture refreshes operational UTC before the same genuine FactService call")
+            .doesNotThrowAnyException();
+        assertThat(count("payments")).isEqualTo(2);assertThat(count("outbox_events")).isEqualTo(4);
+        assertThat(count("stripe_billing_first_renewal_publications")).isEqualTo(1);
+        assertThat(current().paidThrough()).isEqualTo(paid.boundary().period().end());
+        assertThat(jdbc.queryForObject("select created_at from subscription_billing_records where id=?",Timestamp.class,admission.bill()).toInstant()).isEqualTo(created);
+        assertThat(jdbc.queryForObject("select row_to_json(b)::text from subscription_billing_records b where id=?",String.class,admission.bill())).isEqualTo(initialBill);
+        assertThat(jdbc.queryForObject("select row_to_json(p)::text from payments p where id=?",String.class,admission.payment())).isEqualTo(initialPayment);
+        assertThat(currentOperation()).isEqualTo(before.get("operation"));assertThat(http.calls).hasSize(calls);
+        assertThat(jdbc.queryForList("select row_to_json(c)::text from stripe_billing_first_renewal_read_claims c order by ready_id",String.class)).isEqualTo(claims);
+        assertThat(jdbc.queryForObject("select graph_accepted_at from stripe_billing_first_renewal_publications",Timestamp.class).toInstant()).isEqualTo(paid.graphAcceptedAt());
     }
 
     @ParameterizedTest
