@@ -12,11 +12,26 @@ import java.time.*;
 import java.util.*;
 import java.util.function.Supplier;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Primary;
+import org.springframework.jdbc.core.JdbcTemplate;
 import static dev.genericpayments.platform.support.StripeBillingOwnedSubscriptionFixture.*;
 import static org.assertj.core.api.Assertions.*;
 
 /** Genuine hosted producers shared by observation and publication tests. No sampler opt-in here. */
 public abstract class StripeBillingFirstRenewalCompositionFixture extends StripeBillingClockConfirmationCompositionFixture {
+    /** Explicit opt-in only: observation tests retain the original sampler. */
+    @TestConfiguration(proxyBeanMethods=false)
+    public static class RenewalTimeConfiguration {
+        @Bean static BeanFactoryPostProcessor selectRenewalTime() {
+            return factory->factory.getBeanDefinition("ownedSubscriptionTime").setPrimary(false);
+        }
+        @Bean @Primary OwnedFirstRenewalBillingTime ownedFirstRenewalTime(JdbcTemplate jdbc,OwnedSubscriptionBillingTime original) {
+            return new OwnedFirstRenewalBillingTime(jdbc,original);
+        }
+    }
     @Autowired protected OwnedFirstRenewalStore renewals;
     @Autowired protected LockPaymentAccountPort accountLocks;
     @Autowired protected SubscriptionLifecycleLockPort lifecycleLocks;

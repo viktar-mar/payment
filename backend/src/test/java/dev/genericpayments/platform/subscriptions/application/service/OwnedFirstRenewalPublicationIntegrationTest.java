@@ -8,7 +8,6 @@ import dev.genericpayments.platform.subscriptions.application.port.out.Subscript
 import dev.genericpayments.platform.subscriptions.domain.Subscription;
 import dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation;
 import dev.genericpayments.platform.support.OwnedFirstRenewalBillingTime;
-import dev.genericpayments.platform.support.OwnedSubscriptionBillingTime;
 import dev.genericpayments.platform.support.StripeBillingFirstRenewalCompositionFixture;
 import java.time.*;
 import java.util.*;
@@ -22,29 +21,16 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
-import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.*;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import static dev.genericpayments.platform.support.StripeBillingOwnedSubscriptionFixture.*;
 import static org.assertj.core.api.Assertions.*;
 
 /** Hosted only: real initial confirmation, claim/READY/graph producers, FactService, cash and outbox. */
-@Import(OwnedFirstRenewalPublicationIntegrationTest.RenewalTimeConfiguration.class)
+@Import(StripeBillingFirstRenewalCompositionFixture.RenewalTimeConfiguration.class)
 class OwnedFirstRenewalPublicationIntegrationTest extends StripeBillingFirstRenewalCompositionFixture {
     @Autowired OwnedFirstRenewalBillingTime renewalTime;
     @Autowired dev.genericpayments.platform.subscriptions.application.port.out.TrialEligibilityStore trialEligibility;
-
-    @TestConfiguration(proxyBeanMethods=false)
-    static class RenewalTimeConfiguration {
-        @Bean static BeanFactoryPostProcessor selectRenewalTime() {
-            return factory->factory.getBeanDefinition("ownedSubscriptionTime").setPrimary(false);
-        }
-        @Bean @Primary OwnedFirstRenewalBillingTime ownedFirstRenewalTime(JdbcTemplate jdbc,OwnedSubscriptionBillingTime original) {
-            return new OwnedFirstRenewalBillingTime(jdbc,original);
-        }
-    }
 
     private OwnedFirstRenewalPublicationService publisher() {
         return publisher(renewals,facts);
