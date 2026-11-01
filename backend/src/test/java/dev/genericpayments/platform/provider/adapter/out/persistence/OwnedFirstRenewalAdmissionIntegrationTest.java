@@ -105,11 +105,11 @@ class OwnedFirstRenewalAdmissionIntegrationTest extends StripeBillingClockConfir
     }
     @Test void concurrentAdmissionProducesOneImmutableIdentity() throws Exception {
         genuinePaid();var before=financialState();int calls=http.calls.size();
-        try(var workers=java.util.concurrent.Executors.newFixedThreadPool(2)) {
+        try(var workers=new BoundedWorkers()) {
             var start=new java.util.concurrent.CountDownLatch(1);
             java.util.concurrent.Callable<dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.Admission> call=()->{
                 assertThat(start.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
-                return transaction.required(()->{jdbc.execute("set local lock_timeout='5s'");return service().admit(receipt,SOURCE);});
+                return transaction.required(()->{raceStatementDeadlines();return service().admit(receipt,SOURCE);});
             };
             var first=workers.submit(call);var second=workers.submit(call);start.countDown();
             assertThat(first.get(15,java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(second.get(15,java.util.concurrent.TimeUnit.SECONDS));
@@ -126,9 +126,9 @@ class OwnedFirstRenewalAdmissionIntegrationTest extends StripeBillingClockConfir
             admissionReachedSite.countDown();lifecycleLocks.lockActive(s,c);
         };
         var observedService=new OwnedFirstRenewalAdmissionService(renewals,transaction,lifecycleOperations,observingLocks,accountLocks,subscriptions,Clock.systemUTC());
-        try(var workers=java.util.concurrent.Executors.newFixedThreadPool(2)) {
+        try(var workers=new BoundedWorkers()) {
             var lifecycle=workers.submit(()->transaction.required(()->{
-                jdbc.execute("set local lock_timeout='5s'");
+                raceStatementDeadlines();
                 jdbc.queryForList("select id from sites where id=? for update",site.value());siteHeld.countDown();
                 try {assertThat(admissionReachedSite.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();}
                 catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IllegalStateException(interrupted);}
@@ -136,12 +136,51 @@ class OwnedFirstRenewalAdmissionIntegrationTest extends StripeBillingClockConfir
             }));
             assertThat(siteHeld.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
             var admission=workers.submit(()->transaction.required(()->{
-                jdbc.execute("set local lock_timeout='5s'");return observedService.admit(receipt,SOURCE);
+                raceStatementDeadlines();return observedService.admit(receipt,SOURCE);
             }));
             lifecycle.get(15,java.util.concurrent.TimeUnit.SECONDS);
             assertThat(admission.get(15,java.util.concurrent.TimeUnit.SECONDS)).isNotNull();
         }
         assertThat(count("stripe_billing_first_renewals")).isEqualTo(1);
+    }
+    /** One hosted measurement against the genuine predecessor; no admission predicate is changed. */
+    @Test void paidProofExecutionPlan() {
+        genuinePaid();
+        var raw=transaction.required(()->jdbc.query(connection->{
+            var statement=connection.prepareStatement("explain (analyze,format json,summary on) select * from owned_first_renewal_paid(?)");
+            statement.setQueryTimeout(60);statement.setObject(1,receipt.intent().id());return statement;
+        },result->{if(!result.next())throw new IllegalStateException("Paid proof EXPLAIN returned no result");return result.getString(1);}));
+        var measured=com.google.gson.JsonParser.parseString(raw).getAsJsonArray().get(0).getAsJsonObject();
+        var nodes=new java.util.TreeMap<String,Integer>();
+        collectPlanNodes(measured.getAsJsonObject("Plan"),nodes);
+        System.out.println("OWNED_FIRST_RENEWAL_PAID_PLAN="+com.google.gson.JsonParser.parseString(
+            "{\"planningMs\":"+measured.get("Planning Time")+",\"executionMs\":"+measured.get("Execution Time")
+            +",\"jit\":"+measured.get("JIT")+",\"nodes\":"+new com.google.gson.Gson().toJson(nodes)
+            +",\"rows\":"+measured.getAsJsonObject("Plan").get("Actual Rows")+"}"));
+        assertThat(measured.getAsJsonObject("Plan").get("Actual Rows").getAsInt()).isEqualTo(1);
+    }
+    private static void collectPlanNodes(com.google.gson.JsonObject plan,java.util.Map<String,Integer> counts) {
+        counts.merge(plan.get("Node Type").getAsString(),1,Integer::sum);
+        if(plan.has("Plans"))for(var child:plan.getAsJsonArray("Plans"))collectPlanNodes(child.getAsJsonObject(),counts);
+    }
+    private void raceStatementDeadlines(){
+        jdbc.execute("set local lock_timeout='5s'");jdbc.execute("set local statement_timeout='10s'");
+    }
+    /** Avoid ExecutorService.close's unbounded wait after a failed Future.get. Close failures are
+     * suppressed under the original failure by try-with-resources. Daemon workers cannot hold JVM exit. */
+    private static final class BoundedWorkers implements AutoCloseable {
+        private final java.util.concurrent.ExecutorService executor=java.util.concurrent.Executors.newFixedThreadPool(2,
+            task->Thread.ofPlatform().daemon(true).name("owned-renewal-race").unstarted(task));
+        private final java.util.List<java.util.concurrent.Future<?>> submitted=new java.util.ArrayList<>();
+        <T> java.util.concurrent.Future<T> submit(java.util.concurrent.Callable<T> task){
+            var future=executor.submit(task);submitted.add(future);return future;
+        }
+        public void close() throws InterruptedException {
+            for(var future:submitted)future.cancel(true);
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(5,java.util.concurrent.TimeUnit.SECONDS))
+                .as("Race workers must terminate within bounded cleanup").isTrue();
+        }
     }
     @Test void rejectsEvidenceTamper() {
         genuinePaid();var admitted=admitGenuinePaid();
