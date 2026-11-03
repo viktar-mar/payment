@@ -60,6 +60,12 @@ export function proveOwnedContainer(value,{service,project,runId,network,sourceI
 const INITIAL_ENTRYPOINT=['java','-Dloader.path=/app/initial-runtime','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentRuntime','-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher'];
 const RENEWAL_ENTRYPOINT=['java','-Dloader.path=/app/renewal-runtime','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstRenewalRuntime','-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher'];
 const EXECUTION_FORMAT='"Entrypoint":{{json .Config.Entrypoint}},"Cmd":{{json .Config.Cmd}}';
+// Select the final reference without reading earlier attempt fields. Only a closed hint leaves inspect.
+const BACKEND_HEALTH_FORMAT='"BackendHealthFailure":{{$hint := "UNAVAILABLE"}}{{$last := false}}{{if .State.Health}}{{range .State.Health.Log}}{{$last = .}}{{end}}{{end}}'+
+ '{{if $last}}{{$out := $last.Output}}{{if and (eq (printf "%T" $out) "string") (eq (printf "%T" $last.ExitCode) "int")}}{{if and (eq $last.ExitCode 22) (eq (len $out) 3) '+
+ [0,1,2].map(i=>'(ge (index $out '+i+') 48) (le (index $out '+i+') 57)').join(' ')+
+ ' (ge $out "400") (le $out "599")}}{{if eq $out "503"}}{{$hint = "HTTP_UNAVAILABLE"}}{{else if or (eq $out "401") (eq $out "403")}}{{$hint = "HTTP_REJECTED"}}{{else}}{{$hint = "HTTP_ERROR"}}{{end}}'+
+ '{{else if and (eq $last.ExitCode 7) (eq $out "000")}}{{$hint = "CONNECTION_FAILED"}}{{else if and (eq $last.ExitCode 28) (eq $out "000")}}{{$hint = "PROBE_TIMEOUT"}}{{end}}{{end}}{{end}}{{json $hint}}';
 export function firstPaymentImageFormat(source){if(!/^[a-f0-9]{40}$/.test(source))fail();return '{"Id":{{json .ID}},"User":{{json .Config.User}},'+EXECUTION_FORMAT+',"RuntimeSource":{{$ok := false}}{{range .Config.Env}}{{if eq . "PAYMENT_RUNTIME_SOURCE_SHA='+source+'"}}{{$ok = true}}{{end}}{{end}}{{$ok}}}';}
 /** Only boolean equality leaves Docker: private capability/env values never enter inspect output. */
 export const firstRenewalImageFormat=firstPaymentImageFormat;
@@ -69,7 +75,7 @@ function runtimeContainerFormat(expected,renewal){
  const checks=Object.entries(expected).map(([k,v],i)=>'{{$v'+i+' := false}}{{range .Config.Env}}{{if eq . '+JSON.stringify(k+'='+v)+'}}{{$v'+i+' = true}}{{end}}{{end}}');
  const excluded=[renewal?'PAYMENT_STRIPE_BILLING_FIRST_PAYMENT':'PAYMENT_STRIPE_BILLING_FIRST_RENEWAL','PAYMENT_STRIPE_BILLING_ACCEPTANCE','PAYMENT_STAGE4_TEST_RUNTIME','PAYMENT_STRIPE_ACCEPTANCE','PAYMENT_STRIPE_NATIVE_ACCEPTANCE',...['ALLOW_TEST_OPERATIONS','FULL_RUN','OWNED_RUN','REMAINING_ONLY','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT','MANUAL_3DS','MANUAL_REFUND','MANUAL_REFUND_REMAINDER'].map(k=>'PAYMENT_STRIPE_SANDBOX_'+k)];
  const disabled='{{$disabled := true}}{{range .Config.Env}}{{$pair := split . "="}}{{$name := index $pair 0}}{{if or '+excluded.map(k=>'(eq $name '+JSON.stringify(k)+')').join(' ')+'}}{{if and (ne . (print $name "=")) (ne . (print $name "=false"))}}{{$disabled = false}}{{end}}{{end}}{{end}}';
- return CONTAINER_FORMAT.slice(0,-1)+','+EXECUTION_FORMAT+',"RuntimeIdentity":'+checks.join('')+disabled+'{{and $disabled '+checks.map((_,i)=>'$v'+i).join(' ')+'}}}';
+ return CONTAINER_FORMAT.slice(0,-1)+','+EXECUTION_FORMAT+','+BACKEND_HEALTH_FORMAT+',"RuntimeIdentity":'+checks.join('')+disabled+'{{and $disabled '+checks.map((_,i)=>'$v'+i).join(' ')+'}}}';
 }
 export function proveFirstPaymentRuntime(v,kind){if(!same(v.Entrypoint,INITIAL_ENTRYPOINT)||v.Cmd!==null&&!same(v.Cmd,[])||v[kind==='image'?'RuntimeSource':'RuntimeIdentity']!==true)fail();}
 

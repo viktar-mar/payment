@@ -7,6 +7,7 @@ import {billingUuid} from './stripe-billing-provision.mjs';
 import {isBrowserDiagnostic,browserDiagnostic,browserCleanupConfirmed} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 // Terminal reporting only; the private PREPARE validator keeps its original set.
 const startupCodes=new Set([
+ ...['HTTP_UNAVAILABLE','HTTP_REJECTED','HTTP_ERROR','CONNECTION_FAILED','PROBE_TIMEOUT'].map(hint=>'START_BACKEND_HEALTH_UNHEALTHY_'+hint),
  ...['ADMISSION','PROOF','PORTS','REPLACEMENT','FINAL_PROOF','LEDGER'].flatMap(stage=>['REJECTED','ABORT','TIMEOUT'].map(category=>'START_BOOTSTRAP_'+stage+'_'+category)),
  ...['POSTGRES','MAILPIT','BACKEND','DEMO_SITE','CALLBACK_RECEIVER'].flatMap(service=>[
   ...['PROOF','INTENT','COMMAND','HEALTH_PROOF','HEALTH','HEALTH_WAIT','ACK','PUBLIC_HEALTH'].flatMap(stage=>['REJECTED','ABORT','TIMEOUT'].map(category=>'START_'+service+'_'+stage+'_'+category)),

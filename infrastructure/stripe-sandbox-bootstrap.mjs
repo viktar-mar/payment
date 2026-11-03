@@ -180,11 +180,13 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   let terminalBuild=false,buildDiagnostic=null,buildxIdentity=null;
   // First-payment START only: local checkpoints and trusted internal failure categories.
   let startupCode=null,startupStage='ADMISSION',startupService='BOOTSTRAP';
+  const backendHealthFailures=new Set(['HTTP_UNAVAILABLE','HTTP_REJECTED','HTTP_ERROR','CONNECTION_FAILED','PROBE_TIMEOUT']);
   const startupStep=(stage,service='BOOTSTRAP')=>{if(firstPayment&&startupCode===null){startupStage=stage;startupService=service==='BOOTSTRAP'?service:service.toUpperCase().replaceAll('-','_');}};
   function retainStartup(error,controller,external) {
     if(!firstPayment||startupCode!==null)return;
     const category=failures.get(error)?.category??(controller.signal.aborted?(external?.aborted?'ABORT':'TIMEOUT'):null);
-    const allowed=category==='ABORT'||category==='TIMEOUT'||startupStage==='COMMAND'&&['NONZERO_EXIT','OUTPUT_LIMIT','SPAWN_FAILURE'].includes(category)||startupStage==='HEALTH'&&['NOT_RUNNING','UNHEALTHY'].includes(category);
+    const backendUnhealthy=startupService==='BACKEND'&&typeof category==='string'&&category.startsWith('UNHEALTHY_')&&backendHealthFailures.has(category.slice('UNHEALTHY_'.length));
+    const allowed=category==='ABORT'||category==='TIMEOUT'||startupStage==='COMMAND'&&['NONZERO_EXIT','OUTPUT_LIMIT','SPAWN_FAILURE'].includes(category)||startupStage==='HEALTH'&&(['NOT_RUNNING','UNHEALTHY'].includes(category)||backendUnhealthy);
     startupCode='START_'+startupService+'_'+startupStage+'_'+(allowed?category:'REJECTED');
   }
   const buildxDirectory=directory+'/buildx',dockerEnvironment=Object.freeze({...CHILD_ENV,DOCKER_CONFIG:'/private/var/empty',BUILDX_CONFIG:buildxDirectory});
@@ -423,7 +425,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       recordedContainer,expectedMounts:expectedMounts(service),expectedPorts:expectedPorts(service),liveRequired,neverStarted,cleanupOnly,backendStripeEnabled:Boolean(retired||diagnosticConfigured)});
     if(proof.infrastructureRequired)await infrastructureProof(context);
     if(recordedContainer)recorded.containers[service]=proof.safe;
-    return {safe:proof.safe,state:proof.state};
+    return {safe:proof.safe,state:proof.state,backendHealthFailure:firstPayment&&service==='backend'&&backendHealthFailures.has(value.BackendHealthFailure)?value.BackendHealthFailure:null};
   }
   async function projectProof(context) {
     const output=await docker(['ps','--all','--no-trunc','--filter','label=com.docker.compose.project='+project,'--format','{{.ID}}'],context,10000);
@@ -649,7 +651,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       startupStep('HEALTH_PROOF',service);await infrastructureProof(context);const proof=await containerProof(service,recorded.containers[service].id,context);
       startupStep('HEALTH',service);
       if(!proof.state.Running||proof.state.Status!=='running'){if(firstPayment)throw diagnosticFailure('NOT_RUNNING');fail();}
-      if(!['starting','healthy'].includes(proof.state.Health)){if(firstPayment&&proof.state.Health==='unhealthy')throw diagnosticFailure('UNHEALTHY');fail();}
+      if(!['starting','healthy'].includes(proof.state.Health)){if(firstPayment&&proof.state.Health==='unhealthy')throw diagnosticFailure('UNHEALTHY'+(proof.backendHealthFailure?'_'+proof.backendHealthFailure:''));fail();}
       if(proof.state.Health==='healthy') {startupStep('HEALTH_PROOF',service);await containerProof(service,proof.safe.id,context,{liveRequired:true});return;}
       startupStep('HEALTH_WAIT',service);await sleepForHealth(context);
     }

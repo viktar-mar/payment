@@ -1589,7 +1589,7 @@ for(const mode of ['sandbox','billing','manual','diagnostic'])test(mode+' startu
  if(mode==='billing'){f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';create=bootstrapModule.createOwnedBillingBootstrap;}
  if(mode==='manual'){f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT='true';f.options.manualPort=18083;delete f.options.approvedBinding;create=bootstrapModule.createOwnedManualPaymentBootstrap;}
  if(mode==='diagnostic'){f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};delete f.options.approvedBinding;create=bootstrapModule.createOwnedFormDiagnosticBootstrap;}
- const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){const c=f.containers.get(args[1].at(-1));if(c.Name==='/'+PROJECT+'-backend')c.State.Health='unhealthy';}return r;};
+ const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){const c=f.containers.get(args[1].at(-1));if(c.Name==='/'+PROJECT+'-backend'){c.State.Health='unhealthy';c.BackendHealthFailure='HTTP_UNAVAILABLE';}}return r;};
  const b=await create(f.options,f.dependencies),l=LIMIT();assert.equal(b.startupDiagnostic,undefined);await b.prepare(l);if(mode!=='diagnostic')await b.persistWebhookSecret(SECRET);await rejects(b.start(l),'START_PENDING');
  const original=JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents;await rejects(b.stop({deadline:l.deadline+120000}),'STOP_PENDING');assert.deepEqual(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents,original);assert.equal(b.resources().status,'PENDING');
 });
@@ -1670,7 +1670,7 @@ for(const kind of ['clock','timer'])test('startup diagnostic health wait '+kind+
 });
 for(const service of ['postgres','mailpit','demo-site','callback-receiver'])test('startup diagnostic fixed service '+service+' from owned projection',async()=>{
  const f=firstPaymentFixture(),execute=f.dependencies.execute;
- f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){const c=f.containers.get(args[1].at(-1));if(c?.Name==='/'+PROJECT+'-'+service)c.State.Health='unhealthy';}return r;};
+ f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){const c=f.containers.get(args[1].at(-1));if(c?.Name==='/'+PROJECT+'-'+service){c.State.Health='unhealthy';c.BackendHealthFailure='HTTP_UNAVAILABLE';}}return r;};
  const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),l=LIMIT();await b.prepare(l);await b.persistWebhookSecret(SECRET);await rejects(b.start(l),'START_PENDING');
  const code='START_'+service.toUpperCase().replaceAll('-','_')+'_HEALTH_UNHEALTHY';assert.equal(b.startupDiagnostic(),code);
  const {formatBillingFirstPaymentDiagnostic,parseBillingFirstPaymentDiagnosticLine}=await import('./stripe-billing-first-payment.mjs');const line=formatBillingFirstPaymentDiagnostic({status:'CLOSED',initialAccepted:false,code:'START',diagnostic:code,cleanupConfirmed:false});assert.equal(parseBillingFirstPaymentDiagnosticLine(line),line);assert.ok(line.includes(code));
@@ -1727,6 +1727,47 @@ function firstRenewalFixture(){
  const f=firstPaymentFixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_RENEWAL:'true'};f.options.selectedCase='initial_and_first_renewal';
  const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);return {...r,stdout:r.stdout.replaceAll('FIRST_PAYMENT','FIRST_RENEWAL').replaceAll('OwnedBillingFirstPaymentRuntime','OwnedBillingFirstRenewalRuntime').replaceAll('/app/initial-runtime','/app/renewal-runtime').replaceAll('Dockerfile.billing-first-payment','Dockerfile.billing-first-renewal')};};return f;
 }
+// Break: proved dedicated failure hints are lost before the real owner closes.
+for(const renewal of [false,true])for(const [hint,suffix] of [
+ ['HTTP_UNAVAILABLE','_HTTP_UNAVAILABLE'],['HTTP_REJECTED','_HTTP_REJECTED'],['HTTP_ERROR','_HTTP_ERROR'],
+ ['CONNECTION_FAILED','_CONNECTION_FAILED'],['PROBE_TIMEOUT','_PROBE_TIMEOUT'],['UNAVAILABLE',''],
+ [undefined,''],['HTTP_503',''],['private-health-sentinel',''],[{Output:'private-health-sentinel'},''],
+])test('dedicated backend unhealthy owner '+(renewal?'renewal ':'payment ')+String(hint),async()=>{
+ const f=renewal?firstRenewalFixture():firstPaymentFixture(),execute=f.dependencies.execute;let startedAt,late=0;
+ f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){
+  const c=f.containers.get(args[1].at(-1));if(c?.Name==='/'+PROJECT+'-backend'){c.State.Health='unhealthy';c.BackendHealthFailure=hint;startedAt=f.events.length;}
+ }return r;};
+ const b=await (renewal?bootstrapModule.createOwnedBillingFirstRenewalBootstrap:bootstrapModule.createOwnedBillingFirstPaymentBootstrap)(f.options,f.dependencies);
+ const api=await import('./stripe-billing-first-payment.mjs'),code='START_BACKEND_HEALTH_UNHEALTHY'+suffix;
+ const owner=await (renewal?api.createOwnedBillingFirstRenewal:api.createOwnedBillingFirstPayment)(f.options,{preflight:async()=>true,createBootstrap:async()=>b,createCli:async()=>({validateBinding:async()=>true,startListener:async()=>{await b.persistWebhookSecret(SECRET);return true;},stopListener:async()=>{
+  assert.equal(b.startupDiagnostic(),code);
+  assert.equal(f.events.slice(startedAt).filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='inspect').length,1,'no new inspect request for diagnostic');return true;
+ }}),login:async()=>true,createRuntime:async()=>{late++;throw null;},createFixture:async()=>{late++;throw null;}});
+ await assert.rejects(owner.run(async()=>{late++;},LIMIT()));const r=await owner.close();
+ assert.equal(r.phase,'START');assert.equal(r.code,'START');assert.equal(r.diagnostic,code);assert.equal(r.cleanupConfirmed,true);assert.equal(r.initialAccepted,false);assert.equal(r.full5bAccepted,false);if(renewal)assert.equal(r.renewalAccepted,false);assert.equal(late,0);
+ const format=renewal?api.formatBillingFirstRenewalDiagnostic:api.formatBillingFirstPaymentDiagnostic,parse=renewal?api.parseBillingFirstRenewalDiagnosticLine:api.parseBillingFirstPaymentDiagnosticLine;
+ const line=format(r);assert.equal(line,(renewal?'owned_initial_and_first_renewal_diagnostic':'owned_initial_payment_diagnostic')+' code='+code+' cleanup=CONFIRMED');assert.equal(parse(line),line);assert.ok(line.length<=160);assert.equal(line.includes('private-health-sentinel'),false);
+});
+// Break: unproved hints override ownership/runtime rejection or healthy acceptance.
+for(const kind of ['ownership','runtime','healthy'])test('backend hint cannot override '+kind,async()=>{
+ const f=firstPaymentFixture(),execute=f.dependencies.execute;
+ f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){
+  const c=f.containers.get(args[1].at(-1));if(c?.Name==='/'+PROJECT+'-backend'){c.BackendHealthFailure='HTTP_UNAVAILABLE';if(kind!=='healthy')c.State.Health='unhealthy';if(kind==='ownership')c.Labels['payment.sandbox.run']='foreign';}
+ }if(kind==='runtime'&&args[1][4]==='container'&&args[1][5]==='inspect'){
+  const c=JSON.parse(r.stdout);if(c.Name==='/'+PROJECT+'-backend'&&c.State.Running){c.RuntimeIdentity=false;r.stdout=JSON.stringify(c);}
+ }return r;};
+ const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),l=LIMIT();await b.prepare(l);await b.persistWebhookSecret(SECRET);
+ if(kind==='healthy'){assert.equal(await b.start(l),true);assert.equal(b.startupDiagnostic(),null);await b.stop(LIMIT());}
+ else{await rejects(b.start(l),'START_PENDING');assert.equal(b.startupDiagnostic(),'START_BACKEND_HEALTH_PROOF_REJECTED');}
+});
+test('backend terminal diagnostics reject arbitrary and inconsistent suffixes',async()=>{
+ const api=await import('./stripe-billing-first-payment.mjs');
+ for(const suffix of ['HTTP_503','HTTP_UNAVAILABLE_private','UNAVAILABLE','503','HTTP_ERROR\n','CONNECTION_FAILED body'])for(const renewal of [false,true]){
+  const code='START_BACKEND_HEALTH_UNHEALTHY_'+suffix,prefix=renewal?'owned_initial_and_first_renewal_diagnostic':'owned_initial_payment_diagnostic';
+  assert.equal((renewal?api.parseBillingFirstRenewalDiagnosticLine:api.parseBillingFirstPaymentDiagnosticLine)(prefix+' code='+code+' cleanup=CONFIRMED'),null);
+  assert.equal((renewal?api.formatBillingFirstRenewalDiagnostic:api.formatBillingFirstPaymentDiagnostic)({status:'CLOSED',code:'START',initialAccepted:false,diagnostic:code,cleanupConfirmed:true}),null);
+ }
+});
 for(const drift of [false,true])test('demo-site HEALTH_PROOF native inspect timeout waits for close and '+(drift?'refuses ownership drift':'stops only exact owned IDs'),async t=>{
  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
  const f=firstRenewalFixture(),execute=f.dependencies.execute;let demoStarted=false,injected=false,releaseClose,callbackReached,listenerStops=0,late=0,completed=false;
