@@ -7,7 +7,7 @@ const seam=vi.hoisted(()=>({client:null as any,mount:null as any,load:vi.fn()}))
 vi.mock('../providers/stripe-loader.js',()=>({loadStripeClient:seam.load}));
 const categories=['GUARD','STATE','SUBMIT_VALIDATION','SUBMIT','TOKEN_VALIDATION','TOKEN','CLIENT','NEXT_ACTION','RETIRED'] as const;
 const html='<body><button id="request" disabled></button><button id="verify" disabled></button><button id="start" disabled></button><button id="pay" disabled></button><input id="code" disabled><input id="consent" type="checkbox" disabled><div id="provider"></div><span id="status"></span></body>';
-async function page(options:{category?:string;receipt?:any;pending?:boolean;realDriver?:boolean;validation?:boolean;throwConfirm?:boolean}={},body:(f:any)=>Promise<void>){
+async function page(options:{category?:string;receipt?:any;pending?:boolean;realDriver?:boolean;validation?:boolean;throwConfirm?:boolean;transport?:string;pendingSubmit?:boolean}={},body:(f:any)=>Promise<void>){
  vi.resetModules();
  const realm=new JSDOM(html,{url:'http://localhost:3000',runScripts:'outside-only'});
  const blocked=vi.fn(()=>{throw new Error('offline test transport blocked');});
@@ -19,6 +19,9 @@ async function page(options:{category?:string;receipt?:any;pending?:boolean;real
  const w=realm.window as any;let retire:any,release:any;let handle:any;const duringDestroy:unknown[]=[];
  const confirm=vi.fn(),clientConfirm=vi.fn(),destroy=vi.fn(),submit=vi.fn(async()=>options.validation?{error:{}}:{}),token=vi.fn(async()=>({confirmationToken:{id:'ctoken_fixture'}}));
  try {
+  const pendingEvents:unknown[]=[];let transportReads=0;
+  if(options.transport==='accessor')Object.defineProperty(w,'__firstPaymentPending',{get(){transportReads++;throw null;}});
+  else if(options.transport!=='missing')w.__firstPaymentPending=vi.fn((stage:unknown)=>{pendingEvents.push(stage);if(options.transport==='throw')throw Object.create(null);if(options.transport==='reject')return Promise.reject(Object.create(null));if(options.transport==='hung')return new Promise(()=>{});return Promise.resolve();});
   const diagnostic=await import('./stripe-payment-attempt-diagnostic.js');
   const session={apiBaseUrl:'https://api.test',siteKey:'test-site',siteId:'08ac693f-6f49-4a8d-bd14-e5ef47a1dc18',origin:w.location.origin,sessionToken:'T'.repeat(43),customer:{id:'3aaa2ff0-bad1-40bc-8619-d862d0932230',status:'ACTIVE',maskedEmail:null},expiresAt:new Date(Date.now()+60000).toISOString(),scopes:['SUBSCRIPTION_READ','SUBSCRIPTION_MANAGE']};
   const receipt=options.receipt??{state:'OBSERVE',retryAllowed:false,successorAttemptId:null};
@@ -31,6 +34,7 @@ async function page(options:{category?:string;receipt?:any;pending?:boolean;real
     const {registerSubscriptionAuthority}=await import('./authority.js');const {bindPaymentSession}=await import('./confirmation-v2.js');const driver=await import('./stripe-payment-attempt-driver.js');
     registerSubscriptionAuthority(seam.client.subscriptions,()=>()=>{});bindPaymentSession(seam.client.subscriptions,optionsMount.input,context as any);
     vi.spyOn(w.HTMLElement.prototype,'getClientRects').mockReturnValue([{width:300,height:100}] as any);
+    if(options.pendingSubmit)submit.mockImplementation(()=>new Promise(r=>{release=r;}));
     if(options.pending)token.mockImplementation(()=>new Promise(r=>{release=r;}));
     seam.load.mockResolvedValue({elements:()=>({submit,create:()=>{let ready=()=>{};return {on:(name:string,cb:any)=>{if(name==='ready')ready=cb;},off:vi.fn(),mount:()=>queueMicrotask(ready),destroy};}}),createConfirmationToken:token});
     clientConfirm.mockImplementation(async()=>receipt);handle=await driver.mountStripePaymentAttempt(optionsMount);return handle;
@@ -48,8 +52,8 @@ async function page(options:{category?:string;receipt?:any;pending?:boolean;real
   const source=readFileSync(resolve(process.cwd(),'../../examples/demo-site/src/billing-first-payment.ts'),'utf8');
   expect(source).toContain("from '../../../frontend/sdk/src/subscriptions/stripe-payment-attempt-diagnostic.js'");
   const script=transpileModule(source,{compilerOptions:{module:ModuleKind.ESNext,target:ScriptTarget.ES2022}}).outputText.replace(/^import .*;\s*$/gm,'').replace(/^export \{\};?\s*$/gm,'');
-  w.__boundaries={createGenericPaymentClient:()=>seam.client,mountStripePaymentAttempt:(value:any)=>seam.mount(value),readStripePaymentAttemptFailure:diagnostic.readStripePaymentAttemptFailure};
-  w.eval('const {createGenericPaymentClient,mountStripePaymentAttempt,readStripePaymentAttemptFailure}=__boundaries;\n'+script);
+  w.__boundaries={createGenericPaymentClient:()=>seam.client,mountStripePaymentAttempt:(value:any)=>seam.mount(value),observeStripePaymentAttemptPending:diagnostic.observeStripePaymentAttemptPending,readStripePaymentAttemptFailure:diagnostic.readStripePaymentAttemptFailure};
+  w.eval('const {createGenericPaymentClient,mountStripePaymentAttempt,observeStripePaymentAttemptPending,readStripePaymentAttemptFailure}=__boundaries;\n'+script);
   delete w.__boundaries;
   const click=async(id:string)=>{await w.document.getElementById(id).onclick();};
   const snapshot=()=>w.__firstPaymentFailure();
@@ -59,7 +63,7 @@ async function page(options:{category?:string;receipt?:any;pending?:boolean;real
   for(const name of ['sessionStorage','localStorage']){expect(Object.getOwnPropertyDescriptor(w,name)?.configurable).toBe(false);expect(()=>w[name]).toThrow();}
   await click('request');expect(seam.client.requestEmailOtp).toHaveBeenCalledTimes(1);expect(w.document.body.dataset.phase).toBe('CODE');w.document.getElementById('code').value='123456';await click('verify');expect(w.document.body.dataset.phase).toBe('AUTHENTICATED');w.document.getElementById('consent').checked=true;expect(typeof crypto.randomUUID).toBe('function');await click('start');
   expect(w.document.body.dataset.phase).toBe('READY');expect(snapshot()).toBeNull();
-  await body({w,click,snapshot,confirm,clientConfirm,destroy,submit,token,release:(value:any)=>release(value),handle:()=>handle,duringDestroy});
+  await body({w,click,snapshot,confirm,clientConfirm,destroy,submit,token,release:(value:any)=>release(value),handle:()=>handle,duringDestroy,pendingEvents,transportReads:()=>transportReads,diagnostic});
   expect(blocked).not.toHaveBeenCalled();
  } finally {
   try {
@@ -96,4 +100,22 @@ it('restores original global descriptors when the inert transport guard rejects 
   // Keep even the deliberately RED version safe for shared SDK teardown.
   for(const [name,descriptor] of originals){if(descriptor)Object.defineProperty(globalThis,name,descriptor);else Reflect.deleteProperty(globalThis,name);}
  }
+});
+
+it.each(['ok','missing','accessor','throw','reject','hung'])('actual page observation transport %s cannot delay or duplicate original Pay',async transport=>{
+ await page({realDriver:true,transport},async f=>{
+  expect(f.pendingEvents).toEqual([]);await f.click('pay');expect(f.w.document.body.dataset.phase).toBe('OBSERVE');expect(f.snapshot()).toBeNull();expect(f.clientConfirm).toHaveBeenCalledTimes(1);expect(f.transportReads()).toBe(0);
+  if(transport==='ok'||transport==='hung')expect(f.pendingEvents).toEqual(['SUBMIT',null,'TOKEN',null]);
+  if(transport==='throw'||transport==='reject')expect(f.pendingEvents).toEqual(['SUBMIT']);
+  if(transport==='missing'||transport==='accessor')expect(f.pendingEvents).toEqual([]);
+  await f.click('pay');expect(f.clientConfirm).toHaveBeenCalledTimes(1);
+  const before=[...f.pendingEvents];f.diagnostic.setStripePaymentAttemptPending(f.handle(),'SUBMIT');expect(f.pendingEvents).toEqual(before);
+ });
+});
+it('real pending page forwards TOKEN and synchronous cancellation clear through the same helper',async()=>{
+ await page({realDriver:true,pending:true},async f=>{const running=f.click('pay');await vi.waitFor(()=>expect(f.pendingEvents).toEqual(['SUBMIT',null,'TOKEN']));f.w.dispatchEvent(new f.w.Event('pagehide'));expect(f.pendingEvents).toEqual(['SUBMIT',null,'TOKEN',null]);f.release({confirmationToken:{id:'ctoken_late'}});await running;expect(f.clientConfirm).not.toHaveBeenCalled();const before=[...f.pendingEvents];f.diagnostic.setStripePaymentAttemptPending(f.handle(),'SUBMIT');expect(f.pendingEvents).toEqual(before);});
+});
+
+it('real page forwards deferred SUBMIT before token or client work and clears on stop',async()=>{
+ await page({realDriver:true,pendingSubmit:true},async f=>{const running=f.click('pay');expect(f.pendingEvents).toEqual(['SUBMIT']);expect(f.token).not.toHaveBeenCalled();expect(f.clientConfirm).not.toHaveBeenCalled();await f.click('pay');expect(f.submit).toHaveBeenCalledTimes(1);f.w.dispatchEvent(new f.w.Event('pagehide'));expect(f.pendingEvents).toEqual(['SUBMIT',null]);expect(f.snapshot()).toBe('RETIRED');f.release({});await running;expect(f.token).not.toHaveBeenCalled();expect(f.clientConfirm).not.toHaveBeenCalled();expect(f.pendingEvents).toEqual(['SUBMIT',null]);});
 });

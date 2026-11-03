@@ -1,4 +1,4 @@
-import {retainStripePaymentAttemptFailure, type StripePaymentAttemptFailure} from './stripe-payment-attempt-diagnostic.js';
+import {setStripePaymentAttemptPending, retainStripePaymentAttemptFailure, type StripePaymentAttemptFailure} from './stripe-payment-attempt-diagnostic.js';
 import type { Stripe, StripeElements, StripePaymentElement } from '@stripe/stripe-js';
 import { browserOrigin, validateCustomerSession } from '../customer/contracts.js';
 import { PaymentSdkError, isAbort } from '../errors.js';
@@ -25,6 +25,7 @@ export async function mountStripePaymentAttempt(options:{client:SubscriptionClie
  const observer=new MutationObserver(()=>{if(active){try{current();}catch{destroy();}}});
  function destroy():void{
   if(busy)retain('RETIRED');
+  setStripePaymentAttemptPending(handle,null);
   const wasActive=active;active=false;ready=false;if(expiry!==undefined)clearTimeout(expiry);if(readinessTimer!==undefined)clearTimeout(readinessTimer);
   input.signal?.removeEventListener('abort',destroy);window.removeEventListener('pagehide',destroy);document.removeEventListener('visibilitychange',visibility);observer.disconnect();releaseCustomer?.();releaseCustomer=undefined;assertAuthority=undefined;
   try{if(readyListener)element?.off('ready',readyListener);if(loadErrorListener)element?.off('loaderror',loadErrorListener);}catch{/* sanitized cleanup */}
@@ -51,8 +52,10 @@ export async function mountStripePaymentAttempt(options:{client:SubscriptionClie
    let validationFailed=false;
    try{
     current();if(!ready||!context){retain('STATE');throw new PaymentSdkError('PAYMENT_STATE_CONFLICT');}paymentCurrent();
-    branch='SUBMIT';const submitted=await guarded(elements!.submit());if(submitted.error){retain('SUBMIT_VALIDATION');validationFailed=true;return {validationFailed:true};}
-    branch='TOKEN';const token=await guarded(stripe!.createConfirmationToken({elements:elements!}));if(token.error||!token.confirmationToken){retain('TOKEN_VALIDATION');validationFailed=true;return {validationFailed:true};}
+    branch='SUBMIT';setStripePaymentAttemptPending(handle,'SUBMIT');
+    let submitted;try{submitted=await guarded(elements!.submit());}finally{setStripePaymentAttemptPending(handle,null);}if(submitted.error){retain('SUBMIT_VALIDATION');validationFailed=true;return {validationFailed:true};}
+    branch='TOKEN';setStripePaymentAttemptPending(handle,'TOKEN');
+    let token;try{token=await guarded(stripe!.createConfirmationToken({elements:elements!}));}finally{setStripePaymentAttemptPending(handle,null);}if(token.error||!token.confirmationToken){retain('TOKEN_VALIDATION');validationFailed=true;return {validationFailed:true};}
     current();paymentCurrent();dispatched=true;
     branch='CLIENT';const receipt=await guarded(client.confirmPaymentAttempt!({...input,context,confirmationToken:token.confirmationToken.id,idempotencyKey:crypto.randomUUID()}));
     if(receipt.nextActionAllowed===true){current();branch='NEXT_ACTION';await guarded(stripe!.handleNextAction({clientSecret:context!.clientSecret}));}

@@ -1,6 +1,6 @@
 import {createGenericPaymentClient, mountStripePaymentAttempt, type CustomerSession} from '@generic-payments/sdk';
 import './billing-first-payment.css';
-import {readStripePaymentAttemptFailure, type StripePaymentAttemptFailure} from '../../../frontend/sdk/src/subscriptions/stripe-payment-attempt-diagnostic.js';
+import {observeStripePaymentAttemptPending, readStripePaymentAttemptFailure, type StripePaymentAttemptFailure} from '../../../frontend/sdk/src/subscriptions/stripe-payment-attempt-diagnostic.js';
 
 // The dedicated build is inert until its single controller configures this page.
 // Capabilities stay in closures. There is no recovery, storage or secret DOM state.
@@ -18,6 +18,7 @@ Object.defineProperty(window, '__firstPaymentFailure', {value:() => terminalStop
 const captureFailure = (): void => {terminalFailure ??= readStripePaymentAttemptFailure(handle);};
 let session: CustomerSession | undefined;
 let handle: Awaited<ReturnType<typeof mountStripePaymentAttempt>> | undefined;
+let disposePending: (() => void) | undefined;
 let timer: ReturnType<typeof setTimeout> | undefined;
 const controller = new AbortController();
 const phase = (value: string): void => {
@@ -32,6 +33,8 @@ function stop(): void {
   controller.abort();
   handle?.destroy();
   captureFailure();
+  disposePending?.();
+  disposePending = undefined;
   handle = undefined;
   session = undefined;
   code.value = '';
@@ -98,6 +101,14 @@ document.addEventListener('visibilitychange', () => {if (document.visibilityStat
         if (!confirming) stop();
       }});
       if (stopped) {handle.destroy();return;}
+      disposePending = observeStripePaymentAttemptPending(handle, stage => {
+        const disable = (): void => {disposePending?.();disposePending = undefined;};
+        try {
+          const binding = Object.getOwnPropertyDescriptor(window, '__firstPaymentPending');
+          if (!binding || !('value' in binding) || typeof binding.value !== 'function') {disable();return;}
+          void Promise.resolve(binding.value(stage)).catch(disable);
+        } catch {disable();}
+      });
       button('pay').disabled = false;
       phase('READY');
     } catch {stop();}

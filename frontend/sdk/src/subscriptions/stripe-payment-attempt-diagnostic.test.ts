@@ -1,5 +1,5 @@
 import {afterEach, beforeEach, expect, it, vi} from 'vitest';
-import {readStripePaymentAttemptFailure as read, retainStripePaymentAttemptFailure as retain} from './stripe-payment-attempt-diagnostic.js';
+import {observeStripePaymentAttemptPending as observe, setStripePaymentAttemptPending as setPending, readStripePaymentAttemptFailure as read, retainStripePaymentAttemptFailure as retain} from './stripe-payment-attempt-diagnostic.js';
 import {mountStripePaymentAttempt} from './stripe-payment-attempt-driver.js';
 import {registerSubscriptionAuthority} from './authority.js';
 import {bindPaymentSession} from './confirmation-v2.js';
@@ -54,3 +54,37 @@ it('records STATE for concurrent confirm without issuing a duplicate call',async
 it('normal successful finally-destroy carries no failure and repeated confirmation remains fenced',async()=>{const f=await fixture({nextAction:true});expect(await f.handle.confirm()).toBe(f.receipt);expect(read(f.handle)).toBeNull();expect(f.destroy).toHaveBeenCalledTimes(1);expect(f.retire).toHaveBeenCalledTimes(1);expect(f.next).toHaveBeenCalledTimes(1);const args=f.confirm.mock.calls[0]![0];expect(args.context).toBe(f.context);expect(args.confirmationToken).toBe('ctoken_fixture');expect(args.subscriptionId).toBe(subscriptionId);expect(args.operationId).toBe(operationId);expect(args.idempotencyKey).toMatch(/^[0-9a-f-]{36}$/);await expect(f.handle.confirm()).rejects.toMatchObject({code:'PAYMENT_STATE_CONFLICT'});expect(read(f.handle)).toBe('STATE');expect(f.confirm).toHaveBeenCalledTimes(1);});
 it('keeps ordinary SDK validation correction and first category across a later success',async()=>{const f=await fixture();expect(await f.handle.confirm()).toEqual({validationFailed:true});f.submit.mockResolvedValue({});expect(await f.handle.confirm()).toBe(f.receipt);expect(f.submit).toHaveBeenCalledTimes(2);expect(f.confirm).toHaveBeenCalledTimes(1);expect(read(f.handle)).toBe('SUBMIT_VALIDATION');expect(f.destroy).toHaveBeenCalledTimes(1);});
 it('destroying an idle returned handle is not pending cancellation',async()=>{const f=await fixture({});f.handle.destroy();expect(read(f.handle)).toBeNull();await expect(f.handle.confirm()).rejects.toBeDefined();expect(read(f.handle)).toBe('GUARD');expect(f.confirm).not.toHaveBeenCalled();});
+
+it('announces SUBMIT on the actual handle before a deferred submit settles',async()=>{
+ const f=await fixture({}),gate=deferred(),events:unknown[]=[];
+ const diagnostic=await import('./stripe-payment-attempt-diagnostic.js');
+ const observe=(diagnostic as unknown as Record<string,unknown>).observeStripePaymentAttemptPending;
+ if(typeof observe==='function')observe(f.handle,(stage:unknown)=>events.push(stage));
+ f.submit.mockReturnValue(gate.promise);const running=f.handle.confirm();
+ try{expect(events).toEqual(['SUBMIT']);expect(f.token).not.toHaveBeenCalled();expect(f.confirm).not.toHaveBeenCalled();}
+ finally{f.handle.destroy();gate.resolve({});await running.catch(()=>{});}
+});
+
+it('observes primitive changes without replay, coercion, duplicate observers or stale disposal',()=>{
+ let reads=0;const hostile=new Proxy({}, {get(){reads++;throw null;},getPrototypeOf(){reads++;throw null;},ownKeys(){reads++;throw null;}});
+ const events:unknown[]=[],other:unknown[]=[];setPending(hostile,'SUBMIT');const dispose=observe(hostile,s=>events.push(s));expect(events).toEqual([]);
+ const ignored=observe(hostile,s=>other.push(s));ignored();setPending(hostile,'SUBMIT');
+ for(const value of [undefined,{},hostile,'TOKEN_EXTRA',1])setPending(hostile,value);
+ setPending(hostile,null);setPending(hostile,null);setPending(hostile,'TOKEN');expect(events).toEqual([null,'TOKEN']);expect(other).toEqual([]);
+ dispose();const replacement=observe(hostile,s=>other.push(s));dispose();setPending(hostile,null);expect(other).toEqual([null]);replacement();
+ for(const key of [null,undefined,1,'SUBMIT',true,Symbol()]){setPending(key,'TOKEN');observe(key,()=>{throw null;})();}
+ observe({},null as any)();expect(reads).toBe(0);expect(read(hostile)).toBeNull();
+});
+it('synchronous observer exceptions cannot alter original confirmation',async()=>{
+ const f=await fixture({});observe(f.handle,()=>{throw Object.create(null);});expect(await f.handle.confirm()).toBe(f.receipt);expect(f.confirm).toHaveBeenCalledTimes(1);expect(read(f.handle)).toBeNull();
+});
+it('observes both actual deferred boundaries with one original dispatch and unchanged public handle',async()=>{
+ const f=await fixture({}),submit=deferred(),token=deferred(),events:unknown[]=[];observe(f.handle,s=>events.push(s));f.submit.mockReturnValue(submit.promise);f.token.mockReturnValue(token.promise);
+ const running=f.handle.confirm();expect(events).toEqual(['SUBMIT']);expect(f.token).not.toHaveBeenCalled();expect(f.confirm).not.toHaveBeenCalled();
+ submit.resolve({});await vi.waitFor(()=>expect(events).toEqual(['SUBMIT',null,'TOKEN']));expect(f.confirm).not.toHaveBeenCalled();token.resolve({confirmationToken:{id:'ctoken_fixture'}});
+ expect(await running).toBe(f.receipt);expect(events).toEqual(['SUBMIT',null,'TOKEN',null]);expect(f.confirm).toHaveBeenCalledTimes(1);expect(read(f.handle)).toBeNull();expect(Object.keys(f.handle)).toEqual(['protocol','destroy','confirm']);
+});
+it.each(['SUBMIT','TOKEN'])('clears %s synchronously on cancellation and blocks late confirm',async stage=>{
+ const f=await fixture({}),gate=deferred(),events:unknown[]=[];observe(f.handle,s=>events.push(s));(stage==='SUBMIT'?f.submit:f.token).mockReturnValue(gate.promise);
+ const running=f.handle.confirm();const rejected=expect(running).rejects.toMatchObject({name:'AbortError'});await vi.waitFor(()=>expect(events.at(-1)).toBe(stage));f.handle.destroy();expect(events.at(-1)).toBeNull();const frozen=[...events];gate.resolve(stage==='TOKEN'?{confirmationToken:{id:'ctoken_late'}}:{});await rejected;expect(events).toEqual(frozen);expect(f.confirm).not.toHaveBeenCalled();expect(read(f.handle)).toBe('RETIRED');
+});
