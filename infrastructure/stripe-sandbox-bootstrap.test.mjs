@@ -1727,6 +1727,133 @@ function firstRenewalFixture(){
  const f=firstPaymentFixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_RENEWAL:'true'};f.options.selectedCase='initial_and_first_renewal';
  const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);return {...r,stdout:r.stdout.replaceAll('FIRST_PAYMENT','FIRST_RENEWAL').replaceAll('OwnedBillingFirstPaymentRuntime','OwnedBillingFirstRenewalRuntime').replaceAll('/app/initial-runtime','/app/renewal-runtime').replaceAll('Dockerfile.billing-first-payment','Dockerfile.billing-first-renewal')};};return f;
 }
+
+// Break: local timer cancellation loses TIMEOUT or releases START before native close.
+for(const renewal of [false,true])for(const checkpoint of ['health-wait','native-command'])test('dedicated startup local timer owner '+(renewal?'renewal ':'payment ')+checkpoint,async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const f=renewal?firstRenewalFixture():firstPaymentFixture(),execute=f.dependencies.execute,schedule=f.dependencies.setTimeout,external=new AbortController();
+ let entered,releaseClose,childSignal,childCallback,late=0,listenerStops=0,completed=false;
+ const entry=new Promise(resolve=>entered=resolve);f.dependencies.now=()=>Date.now();
+ f.dependencies.setTimeout=(callback,ms)=>{const key=schedule(callback,ms);if(ms===300000)childCallback=callback;if(ms===1000)entered();return key;};
+ delete f.dependencies.execute;
+ f.dependencies.execFile=(file,args,settings,done)=>{
+  const child=new EventEmitter();queueMicrotask(async()=>{
+   try{
+    const result=await execute(file,args,settings);
+    if(args[4]==='container'&&args[5]==='start'&&f.containers.get(args.at(-1))?.Name==='/'+PROJECT+'-backend'){
+     childSignal=settings.signal;
+     if(checkpoint==='native-command'){
+      settings.signal.addEventListener('abort',()=>{done({code:'ABORT_ERR'},'','');releaseClose=()=>child.emit('close',null,'SIGTERM');},{once:true});entered();return;
+     }
+     f.containers.get(args.at(-1)).State.Health='starting';
+    }
+    done(null,result.stdout,result.stderr);child.emit('close',0,null);
+   }catch(error){done(error,'','');child.emit('close',1,null);}
+  });return child;
+ };
+ const b=await (renewal?bootstrapModule.createOwnedBillingFirstRenewalBootstrap:bootstrapModule.createOwnedBillingFirstPaymentBootstrap)(f.options,f.dependencies),api=await import('./stripe-billing-first-payment.mjs');
+ const code='START_BACKEND_'+(checkpoint==='health-wait'?'HEALTH_WAIT':'COMMAND')+'_TIMEOUT';
+ const owner=await (renewal?api.createOwnedBillingFirstRenewal:api.createOwnedBillingFirstPayment)(f.options,{preflight:async()=>true,createBootstrap:async()=>b,createCli:async()=>({validateBinding:async()=>true,startListener:async()=>{await b.persistWebhookSecret(SECRET);return true;},stopListener:async()=>{listenerStops++;assert.equal(b.startupDiagnostic(),code);return true;}}),login:async()=>true,createRuntime:()=>{late++;throw null;},createFixture:()=>{late++;throw null;}});
+ const running=owner.run(()=>{late++;},{deadline:601000,signal:external.signal});running.then(()=>{completed=true;},()=>{completed=true;});const rejected=assert.rejects(running);
+ await entry;
+ // A broken implementation still terminates deterministically through parent abort.
+ const hadLocalTimer=typeof childCallback==='function';if(hadLocalTimer)childCallback();else external.abort();
+ if(checkpoint==='native-command'){
+  await turn();const beforeClose={completed,listenerStops,stops:stopCalls(f).length,status:owner.resources().status};
+  assert.deepEqual(beforeClose,{completed:false,listenerStops:0,stops:0,status:'RUNNING'});
+  external.abort();releaseClose();
+ }
+ await rejected;const result=await owner.close();
+ assert.equal(hadLocalTimer,true);assert.equal(childSignal.aborted,true);assert.equal(result.diagnostic,code);assert.equal(result.phase,'START');assert.equal(result.initialAccepted,false);assert.equal(result.cleanupConfirmed,true);assert.equal(listenerStops,1);assert.equal(late,0);
+ assert.ok(!firstPaymentStarts(f).some(e=>f.containers.get(e.args.at(-1))?.Name.endsWith('-demo-site')));
+ assert.equal(f.timers.size,0);const count=f.events.length;childCallback();assert.equal(f.events.length,count);assert.equal(b.startupDiagnostic(),code);assert.equal(f.timers.size,0);
+});
+
+// Break: leaked/stale child authority affects subsequent services or overwrites failure.
+for(const boundary of ['success','setup','command','health-proof','final-live-proof'])test('dedicated startup scope cleanup '+boundary,async()=>{
+ const f=firstPaymentFixture(),execute=f.dependencies.execute,schedule=f.dependencies.setTimeout,signals=new Map();let saved,backendStarted=false,backendInspects=0;
+ f.dependencies.now=()=>1000;
+ f.dependencies.setTimeout=(callback,ms)=>{if(ms===300000){saved=callback;if(boundary==='setup')throw null;}return schedule(callback,ms);};
+ f.dependencies.execute=async(...args)=>{
+  const r=await execute(...args),c=f.containers.get(args[1].at(-1));
+  if(args[1][4]==='container'&&args[1][5]==='start'){
+   const service=SERVICES.find(service=>c?.Name==='/'+PROJECT+'-'+service);if(service)signals.set(service,args[2].signal);
+   if(service==='backend'){backendStarted=true;if(boundary==='command')throw null;}
+  }
+  if(backendStarted&&args[1][4]==='container'&&args[1][5]==='inspect'){
+   const value=JSON.parse(r.stdout);
+   if(value.Name==='/'+PROJECT+'-backend'){
+    backendInspects++;
+    if(boundary==='health-proof'&&backendInspects===1||boundary==='final-live-proof'&&backendInspects===2){value.RuntimeIdentity=false;r.stdout=JSON.stringify(value);}
+   }
+  }return r;
+ };
+ const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),limits={deadline:601000};await b.prepare(limits);await b.persistWebhookSecret(SECRET);
+ if(boundary==='success'){
+  await b.start(limits);assert.notEqual(signals.get('backend'),signals.get('postgres'));assert.equal(signals.get('demo-site'),signals.get('postgres'));
+ }else await rejects(b.start(limits),'START_PENDING');
+ const diagnostic=b.startupDiagnostic(),events=f.events.length;assert.equal(f.timers.size,0);saved();
+ assert.equal(f.events.length,events);assert.equal(f.timers.size,0);assert.equal(b.startupDiagnostic(),diagnostic);assert.equal(signals.get('backend')?.aborted??false,false);
+ if(boundary==='success'){assert.equal(diagnostic,null);assert.equal(await b.verify(limits),true);}
+ await b.stop({deadline:721000});assert.equal(f.timers.size,0);
+});
+
+// Break: applying the new dedicated policy to unrelated bootstrap modes.
+for(const mode of ['generic','diagnostic','manual','billing'])test('dedicated startup budget isolation '+mode,async()=>{
+ const f=fixture(),schedule=f.dependencies.setTimeout;let childTimers=0,create=createOwnedSandboxBootstrap;
+ f.dependencies.now=()=>1000;f.dependencies.setTimeout=(callback,ms)=>{if(ms===300000)childTimers++;return schedule(callback,ms);};
+ if(mode==='diagnostic'){f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};create=bootstrapModule.createOwnedFormDiagnosticBootstrap;}
+ if(mode==='manual'){f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT='true';f.options.manualPort=18083;delete f.options.approvedBinding;create=bootstrapModule.createOwnedManualPaymentBootstrap;}
+ if(mode==='billing'){f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';create=bootstrapModule.createOwnedBillingBootstrap;}
+ const b=await create(f.options,f.dependencies),limits={deadline:601000};await b.prepare(limits);
+ if(mode!=='diagnostic')await b.persistWebhookSecret(SECRET);
+ assert.equal(await b.start(limits),true);assert.equal(childTimers,0);assert.equal(f.timers.size,0);await b.stop({deadline:721000});
+});
+
+// Break: missing, renewed, or command-exclusive dedicated startup authority.
+for(const renewal of [false,true])for(const scenario of ['slow-ready','always-starting','short-parent','command-consumes-budget','late-healthy'])test('dedicated startup budget '+(renewal?'renewal ':'payment ')+scenario,async()=>{
+ const f=renewal?firstRenewalFixture():firstPaymentFixture(),execute=f.dependencies.execute,schedule=f.dependencies.setTimeout;
+ let time=1000,backendStarted=false,startTime,backendSignal;
+ const parentDeadline=scenario==='short-parent'?121000:601000;
+ f.dependencies.now=()=>time;
+ f.dependencies.execute=async(...args)=>{
+  const result=await execute(...args),c=f.containers.get(args[1].at(-1));
+  if(args[1][4]==='container'&&args[1][5]==='start'&&c?.Name==='/'+PROJECT+'-backend'){
+   backendStarted=true;startTime=time;backendSignal=args[2].signal;c.State.Health='starting';
+   if(scenario==='command-consumes-budget')time+=240000;
+  }
+  if(backendStarted&&args[1][4]==='container'&&args[1][5]==='inspect'){
+   const value=JSON.parse(result.stdout);
+   if(value.Name==='/'+PROJECT+'-backend'&&scenario==='late-healthy'&&time>=241000){time=301000;value.State.Health='healthy';result.stdout=JSON.stringify(value);}
+  }
+  return result;
+ };
+ f.dependencies.setTimeout=(callback,ms)=>{
+  const key=schedule(callback,ms);
+  if(ms===1000)queueMicrotask(()=>{
+   f.timers.delete(key);time+=60000;
+   const c=[...f.containers.values()].find(c=>c.Name==='/'+PROJECT+'-backend');
+   if(scenario==='slow-ready'&&time>=241000)c.State.Health='healthy';
+   // Give a broken unbounded implementation a finite synthetic escape.
+   if(time>=361000)c.State.Health='healthy';
+   callback();
+  });return key;
+ };
+ const b=await (renewal?bootstrapModule.createOwnedBillingFirstRenewalBootstrap:bootstrapModule.createOwnedBillingFirstPaymentBootstrap)(f.options,f.dependencies),limits={deadline:parentDeadline};
+ await b.prepare(limits);await b.persistWebhookSecret(SECRET);
+ if(scenario==='slow-ready'){
+  assert.equal(await b.start(limits),true);assert.equal(time-startTime,240000);assert.equal(b.resources().status,'LIVE');assert.equal(b.startupDiagnostic(),null);
+  assert.equal(f.events.filter(e=>e.type==='health').length,3);
+ }else{
+  await rejects(b.start(limits),'START_PENDING');assert.match(b.startupDiagnostic(),/^START_BACKEND_.*_TIMEOUT$/);
+  assert.equal(time,scenario==='short-parent'?121000:301000);
+  assert.equal(f.events.filter(e=>e.type==='health').length,0);
+  assert.ok(!firstPaymentStarts(f).some(e=>f.containers.get(e.args.at(-1))?.Name.endsWith('-demo-site')));
+  const n=f.events.length;await rejects(b.start(limits),'START_PENDING');await rejects(b.verify(limits),'VERIFY_PENDING');assert.equal(f.events.length,n);
+ }
+ assert.equal(f.timers.size,0);await b.stop({deadline:parentDeadline+120000});assert.equal(f.timers.size,0);
+ assert.equal(backendSignal.aborted,false,'clock expiry alone does not fabricate a timer callback');
+});
 // Break: proved dedicated failure hints are lost before the real owner closes.
 for(const renewal of [false,true])for(const [hint,suffix] of [
  ['HTTP_UNAVAILABLE','_HTTP_UNAVAILABLE'],['HTTP_REJECTED','_HTTP_REJECTED'],['HTTP_ERROR','_HTTP_ERROR'],

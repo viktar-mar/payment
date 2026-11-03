@@ -17,7 +17,7 @@ after(()=>mock.restoreAll());
 for(const lane of ['payment','renewal'])test('dedicated '+lane+' actual probe discards body and retains curl failure offline',async()=>{
  const source=await readFile(new URL('../backend/Dockerfile.billing-first-'+lane,import.meta.url),'utf8');
  const health=/HEALTHCHECK ([^\n]+) \\\n\s+CMD ([^\n]+)/.exec(source);assert.ok(health);
- assert.equal(health[1],'--interval=10s --timeout=3s --start-period=60s --retries=12');
+ assert.equal(health[1],'--interval=10s --timeout=3s --start-period=300s --retries=12');
  const directory=await mkdtemp(join(tmpdir(),'synthetic-health-probe-'));
  try{
   const fake=join(directory,'curl');
@@ -48,6 +48,11 @@ exit "$FAKE_EXIT"
    assert.equal(result.error,undefined);assert.equal(result.status,exit);assert.equal(result.stdout,http);assert.equal(result.stderr,'');
   }
  }finally{await rm(directory,{recursive:true,force:true});}
+});
+
+test('default backend retains its existing health grace',async()=>{
+ const source=await readFile(new URL('../backend/Dockerfile',import.meta.url),'utf8');
+ assert.match(source,/HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=12/);
 });
 
 // Structural policy check only: no Docker or Go interpreter is launched.

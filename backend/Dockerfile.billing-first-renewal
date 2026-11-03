@@ -19,6 +19,6 @@ COPY --from=build --chown=payment:payment /workspace/target/payment-platform-bac
 COPY --from=build --chown=payment:payment /workspace/renewal-runtime /app/renewal-runtime
 USER payment
 EXPOSE 8080
-HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=12 \
+HEALTHCHECK --interval=10s --timeout=3s --start-period=300s --retries=12 \
   CMD curl --fail --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/actuator/health/readiness
 ENTRYPOINT ["java", "-Dloader.path=/app/renewal-runtime", "-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstRenewalRuntime", "-cp", "/app/app.jar", "org.springframework.boot.loader.launch.PropertiesLauncher"]

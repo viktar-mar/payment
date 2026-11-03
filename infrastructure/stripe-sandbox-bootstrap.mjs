@@ -663,6 +663,25 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       startupStep('PUBLIC_HEALTH',service);if(await io.health(endpoint+path,{signal:context.signal,deadline:Math.min(context.deadline,io.now()+10000)})!==true)fail();check(context);
     }
   }
+  async function dedicatedBackendStartup(parent,body) {
+    const controller=new AbortController(),context={deadline:Math.min(parent.deadline,io.now()+300000),signal:controller.signal,externalSignal:parent.externalSignal};
+    let timer,active=true;
+    const abort=()=>{if(active)controller.abort();};
+    const expire=()=>{
+      if(!active)return;
+      // Native abort callbacks can precede close; retain the boundary immediately.
+      retainStartup(diagnosticFailure('TIMEOUT'),controller,parent.externalSignal);controller.abort();
+    };
+    try {
+      parent.signal.addEventListener('abort',abort,{once:true});if(parent.signal.aborted)abort();
+      timer=io.setTimeout(expire,Math.max(1,context.deadline-io.now()));check(context);
+      const result=await body(context);check(context);return result;
+    } catch(error) {
+      // A health sleep rejects null. Classify only through trusted child state;
+      // an already trusted failure retains its original boundary.
+      if(!failures.has(error))check(context);throw error;
+    } finally {active=false;io.clearTimeout(timer);parent.signal.removeEventListener('abort',abort);}
+  }
   async function start(context) {
     if(status!=='PREPARED'||!(diagnostic?diagnosticConfigured:webhookReady)||!issuerProved||retired||live)fail();
     startupStep('PROOF');await sourceIdentity(context);await topology(context,false,true);
@@ -678,8 +697,10 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     await topology(context,false,true);await acknowledgement(context);}
     for(const service of SERVICES) {
       startupStep('PROOF',service);await topology(context);await containerProof(service,recorded.containers[service].id,context,{neverStarted:true});
-      startupStep('INTENT',service);await intent('START_SERVICE',recorded.containers[service].id,context);startupStep('COMMAND',service);await docker(['container','start',recorded.containers[service].id],context);
-      await healthy(service,context);startupStep('ACK',service);await acknowledgement(context);
+      startupStep('INTENT',service);await intent('START_SERVICE',recorded.containers[service].id,context);startupStep('COMMAND',service);
+      const commandAndHealthy=async budget=>{await docker(['container','start',recorded.containers[service].id],budget);await healthy(service,budget);};
+      if(firstPayment&&service==='backend')await dedicatedBackendStartup(context,commandAndHealthy);else await commandAndHealthy(context);
+      startupStep('ACK',service);await acknowledgement(context);
     }
     startupStep('FINAL_PROOF');await topology(context,true);await healthRequests(context);live=true;status='LIVE';startupStep('LEDGER');await ledger(context);return true;
   }
