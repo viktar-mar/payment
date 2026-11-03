@@ -72,14 +72,26 @@ export function createFirstPaymentBridge(options: {
 }
 
 /** Genuine OTP and one real driver; settlement remains exclusively with the Node owner. */
-export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirstPaymentPort, limits: BillingLimits): Promise<true> {
+export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirstPaymentPort, parent: BillingLimits): Promise<true> {
+  const controller = new AbortController();
+  const limits = {deadline:parent.deadline, signal:controller.signal};
   let context: BrowserContext | undefined;
   let abandoned = false;
   let closing: Promise<void> | undefined;
   let failure = false;
   let firstFailure: Error | undefined;
   let checkpoint = 'BROWSER_CONTEXT';
-  const latch = (code: string): Error => firstFailure ??= browserFailure(code);
+  let ready = false, payStarted = false;
+  let observation: 'NEW'|'SUBMIT'|'BETWEEN'|'TOKEN'|'DONE'|'UNAVAILABLE' = 'NEW';
+  const latch = (code: string): Error => {
+    if (firstFailure) return firstFailure;
+    failure = true;
+    abandoned = true;
+    firstFailure = browserFailure(code);
+    controller.abort();
+    if (context) void close(context);
+    return firstFailure;
+  };
   const at = async <T>(code: string, body: () => Promise<T>): Promise<T> => {
     checkpoint = code;
     try {return await body();} catch {throw latch(code);}
@@ -90,10 +102,10 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     return closing;
   };
   const abort = (): void => {
-    abandoned = true;
-    if (context) void close(context);
+    latch(checkpoint);
   };
-  limits.signal?.addEventListener('abort', abort, {once:true});
+  parent.signal?.addEventListener('abort', abort, {once:true});
+  if (parent.signal?.aborted) abort();
   const pending = new Set<Promise<void>>();
   try {
     const opening = browser.newContext({serviceWorkers:'block', acceptDownloads:false});
@@ -115,6 +127,18 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     page.on('framenavigated', frame => {
       if (frame === page.mainFrame() && ++documents > 1) {latch('BROWSER_NAVIGATION'); failure = true; abort();}
     });
+    await context.exposeBinding('__firstPaymentPending', ({frame}, value: unknown) => {
+      if (failure || abandoned || !prepared || !bridge || !ready || !payStarted) return;
+      if (observation === 'UNAVAILABLE') return;
+      try {
+        if (frame !== page.mainFrame() || new URL(frame.url()).origin !== binding.endpoints.demo) {observation = 'UNAVAILABLE'; return;}
+        if (observation === 'NEW' && value === 'SUBMIT') observation = 'SUBMIT';
+        else if (observation === 'SUBMIT' && value === null) observation = 'BETWEEN';
+        else if (observation === 'BETWEEN' && value === 'TOKEN') observation = 'TOKEN';
+        else if (observation === 'TOKEN' && value === null) observation = 'DONE';
+        else observation = 'UNAVAILABLE';
+      } catch {observation = 'UNAVAILABLE';}
+    });
     await context.exposeBinding('__firstPaymentPrepare', async ({frame}, input: unknown) => {
       try {
         billingCheck(limits);
@@ -123,7 +147,9 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
         need(exact(input, ['token','origin','customerId','siteId']) && input.origin === binding.endpoints.demo && input.siteId === binding.siteId && typeof input.customerId === 'string' && typeof input.token === 'string' && /^[A-Za-z0-9_-]{43}$/.test(input.token));
         const value = input as {token:string;origin:string;customerId:string;siteId:string};
         await port.acknowledgeCustomer({customerId:value.customerId, siteId:value.siteId});
+        billingCheck(limits);
         const result = await port.prepare({token:value.token, origin:value.origin}, crypto.randomUUID(), limits);
+        billingCheck(limits);
         bridge = createFirstPaymentBridge({binding, prepared:result, token:value.token, port, limits, latchFailure:latch});
         return {subscriptionId:result.subscription_id, operationId:result.operation_id};
       } catch {
@@ -196,6 +222,7 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     await at('BROWSER_WAIT_READY', async () => {
       await waitPhase('READY');
       need(await page.getByRole('button', {name:'Pay', exact:true}).isEnabled());
+      ready = true;
     });
     checkpoint = 'BROWSER_CARD_NUMBER';
     const frame = page.locator('#provider').frameLocator('iframe[title="Secure payment input frame"]');
@@ -205,13 +232,18 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     checkpoint = 'BROWSER_POSTAL_CHECK';
     const postal = frame.locator('input[name="postalCode"]');
     if (await at('BROWSER_POSTAL_CHECK', () => postal.isVisible())) await at('BROWSER_POSTAL_FILL', () => postal.fill('10001', {timeout:remaining(limits)}));
-    await at('BROWSER_PAY_CLICK', () => page.getByRole('button', {name:'Pay', exact:true}).click({timeout:remaining(limits)}));
+    await at('BROWSER_PAY_CLICK', () => {billingCheck(limits); payStarted = true; return page.getByRole('button', {name:'Pay', exact:true}).click({timeout:remaining(limits)});});
     await at('BROWSER_WAIT_OBSERVE', async () => {
       // This path is reachable only after this runner's original prepare and Pay.
       need(!failure && prepared && bridge && challenges === 1 && verifies === 1);
       need(new URL(page.mainFrame().url()).origin === binding.endpoints.demo);
-      await page.waitForFunction(() => ['OBSERVE','STOPPED'].includes(document.body.dataset.phase ?? ''), undefined, {timeout:remaining(limits)});
-      const observation = await billingBounded(limits, () => page.evaluate(origin => {
+      try {
+        await page.waitForFunction(() => ['OBSERVE','STOPPED'].includes(document.body.dataset.phase ?? ''), undefined, {timeout:remaining(limits)});
+      } catch {
+        const hint = observation as string;
+        throw latch(!parent.signal?.aborted && Date.now() < parent.deadline && (hint === 'SUBMIT' || hint === 'TOKEN') ? 'BROWSER_WAIT_OBSERVE_LAST_OBSERVED_' + hint : 'BROWSER_WAIT_OBSERVE');
+      }
+      const terminal = await billingBounded(limits, () => page.evaluate(origin => {
         if (window !== window.top || location.origin !== origin) return 'STOPPED';
         const phase = document.body.dataset.phase;
         if (phase === 'OBSERVE') return 'OBSERVE';
@@ -228,7 +260,7 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
       const codes: Record<string, string> = {
         GUARD:'BROWSER_CONFIRM_GUARD', STATE:'BROWSER_CONFIRM_STATE', SUBMIT_VALIDATION:'BROWSER_CONFIRM_SUBMIT_VALIDATION', SUBMIT:'BROWSER_CONFIRM_SUBMIT', TOKEN_VALIDATION:'BROWSER_CONFIRM_TOKEN_VALIDATION', TOKEN:'BROWSER_CONFIRM_TOKEN', CLIENT:'BROWSER_CONFIRM_CLIENT', NEXT_ACTION:'BROWSER_CONFIRM_NEXT_ACTION', RETIRED:'BROWSER_CONFIRM_RETIRED', RECEIPT:'BROWSER_CONFIRM_RECEIPT',
       };
-      if (observation !== 'OBSERVE') throw latch(typeof observation === 'string' && Object.hasOwn(codes, observation) ? codes[observation]! : 'BROWSER_WAIT_OBSERVE');
+      if (terminal !== 'OBSERVE') throw latch(typeof terminal === 'string' && Object.hasOwn(codes, terminal) ? codes[terminal]! : 'BROWSER_WAIT_OBSERVE');
     });
     billingCheck(limits);
     need(!failure && prepared && challenges === 1 && verifies === 1);
@@ -237,7 +269,8 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     throw latch(checkpoint);
   } finally {
     abandoned = true;
-    limits.signal?.removeEventListener('abort', abort);
+    parent.signal?.removeEventListener('abort', abort);
+    controller.abort();
     let cleanup = false;
     try {
       if (context) await billingBounded({deadline:Date.now() + 15000}, async () => {

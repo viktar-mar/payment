@@ -1807,11 +1807,29 @@ After its original prepare and Pay, the Node runner atomically samples terminal
 phase and category in its owned main frame and origin. It admits only the exact
 primitive labels from a valid own reader descriptor, then mints local terminal
 provenance. Unknown, absent, malformed, throwing or unavailable snapshots and
-nonterminal timeouts remain `BROWSER_WAIT_OBSERVE`. Earlier Node bridge or owner
+nonterminal timeouts without a usable pending hint remain `BROWSER_WAIT_OBSERVE`. Earlier Node bridge or owner
 failures win, including an earlier null diagnostic; renderer and Node events do
 not establish a shared chronological ordering. The snapshot grants no payment,
 cash, retry or cleanup authority. Existing financial guards, deadlines, one final
 line under 160 characters, cleanup proof and private PREPARE allowlist remain.
+
+The dedicated page optionally sends primitive pending changes to its context-local
+binding. After the original prepare, READY and Pay start, Node accepts only
+SUBMIT, null, TOKEN, null from the owned main frame and exact demo origin.
+Invalid open observations permanently disable the hint. Only rejection of the
+original OBSERVE wait, while the parent is live and before its original deadline,
+can report `BROWSER_WAIT_OBSERVE_LAST_OBSERVED_SUBMIT` or
+`BROWSER_WAIT_OBSERVE_LAST_OBSERVED_TOKEN`. Missing or cleared hints keep the
+generic code; terminal-page errors keep their existing labels.
+
+LAST_OBSERVED means the last pending stage received by Node before failure.
+Delayed renderer messages can make it stale; missing observation is inconclusive.
+The first failure freezes its local label and immediately cancels the browser
+journey before yielding. Late messages and provider completions cannot rewrite it
+or start a new CONFIRM. No diagnostic page read occurs after a rejected wait.
+Original deadlines, the 45000ms OBSERVE cap and 15000ms close/drain cap remain.
+These labels establish neither live provider state, cause, dispatch, cash nor
+acceptance, and cannot retrospectively classify any historical consumed run.
 
 The safe consumed report for run `0d750060-5cf9-4009-b89e-c2dca1e4815c` records
 CREATE dispatch/acknowledgement, no CONFIRM dispatch/acknowledgement,
