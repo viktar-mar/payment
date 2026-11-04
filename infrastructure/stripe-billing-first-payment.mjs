@@ -15,7 +15,10 @@ const startupCodes=new Set([
   ...['NOT_RUNNING','UNHEALTHY'].map(category=>'START_'+service+'_HEALTH_'+category),
  ]),
 ]);
-const isTerminalDiagnostic=code=>isBillingFirstPaymentDiagnostic(code)||isBrowserDiagnostic(code)||typeof code==='string'&&startupCodes.has(code);
+// A checkpoint is a finite owner stage, not a provider outcome or a cash proof.
+const postConfirmCheckpoints=Object.freeze({BROWSER:'POST_CONFIRM_BROWSER',OBSERVE:'POST_CONFIRM_OBSERVE',EVIDENCE:'POST_CONFIRM_EVIDENCE',RENEWAL_BOUNDARY:'POST_CONFIRM_RENEWAL_BOUNDARY',RENEWAL_FINALIZATION:'POST_CONFIRM_RENEWAL_FINALIZATION',RENEWAL_EVIDENCE:'POST_CONFIRM_RENEWAL_EVIDENCE'});
+const postConfirmCodes=new Set([...Object.values(postConfirmCheckpoints),'POST_CONFIRM_CLEANUP']);
+const isTerminalDiagnostic=code=>isBillingFirstPaymentDiagnostic(code)||isBrowserDiagnostic(code)||typeof code==='string'&&(startupCodes.has(code)||postConfirmCodes.has(code));
 function startupDiagnostic(bootstrap){
  try{const read=Object.getOwnPropertyDescriptor(bootstrap,'startupDiagnostic')?.value;if(typeof read!=='function')return null;const code=read.call(bootstrap);return typeof code==='string'&&startupCodes.has(code)?code:null;}catch{return null;}
 }
@@ -29,7 +32,7 @@ async function createOwner(options,dependencies,firstRenewal){
  const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
  const checkIdentity=v=>{if(!originalIdentity||Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))fail('ACK');};
  const resources=()=>Object.freeze({runId:c.runId,expectedSource:c.expectedSource,scope:firstRenewal?'OWNED_INITIAL_AND_FIRST_RENEWAL':'OWNED_INITIAL_PAYMENT',status:state,phase,code:failure,diagnostic,initialAccepted:accepted,...(firstRenewal?{renewalAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
- const fail=(code,detail=null)=>{if(failure===null)diagnostic=isTerminalDiagnostic(detail)?detail:null;failure??=code;lifetime.abort();throw billingError(failure);};
+ const fail=(code,detail=null)=>{if(failure===null)diagnostic=isTerminalDiagnostic(detail)?detail:confirmAck?postConfirmCheckpoints[phase]??null:null;failure??=code;lifetime.abort();throw billingError(failure);};
  async function cleanup(){return cleanupPromise??=(async()=>{
   let ok=!journeyStarted||(journeySettled&&journeyClean);const l={deadline:Math.min(Date.now()+120000,(active?.deadline??Date.now())+120000)};
   for(const [o,m]of [[runtime,'close'],[cli,'stopListener'],[bootstrap,'stop'],[fixture,'close']])if(o){
@@ -38,7 +41,7 @@ async function createOwner(options,dependencies,firstRenewal){
    if(o===bootstrap&&startSettlement)try{await billingBounded(l,()=>startSettlement,120000);}catch{ok=false;continue;}
    try{if(await billingBounded(l,x=>o[m](x),o===bootstrap?120000:30000)!==true)ok=false;}catch{ok=false;}
   }
-  cleanupConfirmed=ok;if(!ok)failure??='CLEANUP';return ok;
+  cleanupConfirmed=ok;if(!ok&&failure===null){failure='CLEANUP';if(confirmAck)diagnostic='POST_CONFIRM_CLEANUP';}return ok;
  })();}
  return Object.freeze({resources,
   async run(journey,limits){if(state!=='NEW')throw billingError('SINGLE_USE');state='RUNNING';let timer,remove=()=>{};
@@ -83,6 +86,7 @@ async function createOwner(options,dependencies,firstRenewal){
     });
     await step('BROWSER',async()=>{journeyStarted=true;try{const result=await journey(port,active);journeySettled=true;journeyClean=true;return result;}catch(error){journeySettled=true;journeyClean=browserCleanupConfirmed(error);throw error;}},2700000);if(!prepareAck||!confirmAck)fail('ACK');
     let settlement;for(let i=0;i<30;i++){const v=await step('OBSERVE',l=>runtime.observe(l));checkIdentity(v);if(v.phase==='SETTLED_LOCAL'){settlement=v;break;}if(v.phase!=='OBSERVE')fail('OBSERVE');if(i<29)await step('OBSERVE',l=>(dependencies.pause??(()=>new Promise(r=>setTimeout(r,1000))))(l));}if(!settlement)fail('OBSERVE');
+    phase='EVIDENCE';
     if(Date.parse(settlement.access_evaluated_at)/1000!==c.frozenTime||Date.parse(settlement.access_valid_until)/1000!==c.frozenTime+300||!(Date.parse(settlement.period_start)/1000<=c.frozenTime)||!(Date.parse(settlement.paid_through)/1000>c.frozenTime))fail('EVIDENCE');
     const proof=await step('EVIDENCE',async l=>(dependencies.prove??(await import('./stripe-billing-first-payment-evidence.mjs')).proveBillingFirstPaymentEvidence)({configuration:c,bootstrap,fixture,settlement},l));if(!proof||!['ownedVerified','cashVerified','journalVerified','signedCallbacksVerified'].every(k=>proof[k]===true))fail('EVIDENCE');billingCheck(active);
     if(firstRenewal){
@@ -91,7 +95,7 @@ async function createOwner(options,dependencies,firstRenewal){
      const renewalProof=await step('RENEWAL_EVIDENCE',async l=>(dependencies.proveRenewal??(await import('./stripe-billing-first-renewal-evidence.mjs')).proveBillingFirstRenewalEvidence)({configuration:c,bootstrap,fixture,boundary,settlement:renewalSettlement},l));
      if(!renewalProof||!['ownedVerified','cashVerified','journalVerified','signedCallbacksVerified'].every(k=>renewalProof[k]===true))fail('RENEWAL_EVIDENCE');billingCheck(active);
     }
-   }catch{failure??=lifetime.signal.aborted?'ABORTED':'FAILED';}
+   }catch{if(failure===null){failure=lifetime.signal.aborted?'ABORTED':'FAILED';if(confirmAck)diagnostic=postConfirmCheckpoints[phase]??null;}}
    finally{clearTimeout(timer);remove();lifetime.abort();selected=null;await cleanup();state='CLOSED';finish();}
    if(failure)throw billingError(failure);accepted=true;phase='COMPLETE';return resources();
   },

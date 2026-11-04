@@ -131,9 +131,28 @@ The [V33 migration](../backend/src/main/resources/db/migration/V33__stripe_billi
 
 The final release gate is the existing full Offline CI on the exact final source commit, including this documentation: backend verification/packaging, frontend/default Fake/privacy, and infrastructure must all succeed. **At this documentation checkpoint that final gate is PENDING**; the focused 272-test result does not establish those three outcomes. The final source/run/job receipt is recorded separately after completion, avoiding a self-referential source-SHA edit.
 
-Native first renewal is **NOT_RUN**, native initial paid acceptance remains outstanding, and Stage 5B remains **NOT_ACCEPTED**. Pinned wire fields, automatic payment-method persistence and actual invoice/finalization timing remain external acceptance gates. Any later native execution requires separate fresh explicit authority for initial EUR20 plus **one EUR20 renewal**, both B/T advances, fresh resources and bounded reads. This checkpoint grants none of that authority and adds no launcher or native command. Old EUR13, donations, consumed CREATE/UNKNOWN/DISPATCHING, keys, ledgers and every historical native failure remain excluded from new fixtures and retries.
+Native first renewal remains **UNPROVEN**, native initial paid acceptance remains outstanding, and Stage 5B remains **NOT_ACCEPTED**. Pinned wire fields, automatic payment-method persistence and actual invoice/finalization timing remain external acceptance gates. Any later native execution requires separate fresh explicit authority for initial EUR20 plus **one EUR20 renewal**, both B/T advances, fresh resources and bounded reads. This checkpoint grants none of that authority and adds no launcher or native command. Old EUR13, donations, consumed CREATE/UNKNOWN/DISPATCHING, keys, ledgers and every historical native failure remain excluded from new fixtures and retries.
 
 ## Native clock and remaining gates
+
+The isolated combined Sandbox attempt `206b7940-6495-4f4f-a09a-d43e79175990`
+on source `c18d51884b0fb162cf5b38e2bf6784eebd801194` exited 1 after
+an acknowledged original CREATE and CONFIRM. Its bounded terminal report was
+only `NOT_ACCEPTED`; no initial CASH/Payment/journal/callback proof or renewal
+proof was emitted. The final provider financial state was not queried. All seven
+run containers were independently observed exited; the retained runtime metadata
+is `PENDING`, so this is not a confirmed cleanup receipt. The one-attempt
+authority is consumed, and no old operation may be retried. The source lacked a
+terminal checkpoint for several stages after CONFIRM; the exact failure stage
+of this historical run cannot be recovered from its safe report. Full 5B
+remains **NOT_ACCEPTED**.
+
+The subsequent offline source change emits only fixed post-CONFIRM owner
+checkpoints for browser, observation, initial evidence, renewal boundary,
+finalization, renewal evidence and cleanup failures. These identify the last
+owner stage, not the provider result or cause. No financial request, timeout,
+retry or acceptance predicate changes; no native run is authorized by this
+diagnostic update.
 
 
 The existing [Stage 4 business-clock harness](local-development.md#stage-4-subscription-rollout-and-acceptance) is a Fake acceptance facility. The owned TestClock/Customer component above prepares durable provenance and assignment/readiness; the separate initial-payment launcher below has now been attempted without accepted native evidence. Provider/event timestamp contracts, native Subscription/trial/renewal/advance and remaining mutation/security time boundaries are still outstanding. Merely injecting the Stage 4 clock would mix billing time with UTC grant/quote expiry, provider leases/retry windows and callback queue scheduling; it cannot establish safe Billing acceptance. Native quote/cancellation proof and historical immutable fingerprints also require explicit treatment before those scenarios can be claimed.
@@ -167,7 +186,7 @@ Native entry is excluded from default discovery, uses one worker/zero retries an
 
 ## Combined initial payment and first renewal scenario
 
-The separate `OWNED_INITIAL_AND_FIRST_RENEWAL` lane is **OFFLINE_PREPARED**. It adds an explicit future entry for EUR20 original SERVER_CONFIRM_V2 payment plus exactly one unchanged-terms EUR20 renewal, using the existing initial browser component. The initial-only result and default Fake path retain their scope.
+The separate `OWNED_INITIAL_AND_FIRST_RENEWAL` lane is **OFFLINE_PREPARED / NATIVE ATTEMPTED, NONE ACCEPTED**. It adds an explicit entry for EUR20 original SERVER_CONFIRM_V2 payment plus exactly one unchanged-terms EUR20 renewal, using the existing initial browser component. The initial-only result and default Fake path retain their scope.
 
 | Gate | Evidence and current scope |
 | --- | --- |
@@ -176,7 +195,7 @@ The separate `OWNED_INITIAL_AND_FIRST_RENEWAL` lane is **OFFLINE_PREPARED**. It 
 | Final evidence | Exactly two EUR2000 cash facts, one committed publication, two fixed advances, seven exact acknowledged operations and four signed callbacks forming the exact INITIAL/RENEWAL union |
 | Hosted synthetic composition | Actual catalog reserve/dispatch/ACK, genuine payment services, shipped read-only final SQL, production callback validator and rollback operation-mutation regressions authored; execution outcomes belong to the exact-source CI completion receipt |
 | Runtime packaging | Both dedicated exported closures checked against production libraries only without launching; normal production jar excludes runtime/samplers |
-| Native combined run | **NOT_RUN / NOT_ACCEPTED**; separate one-use approval and verified storage capacity remain prerequisites |
+| Native combined run | **ATTEMPTED / NONE ACCEPTED**; the latest consumed attempt is recorded above; another run requires fresh one-use approval and verified storage capacity |
 | Full stage 5B | **NOT_ACCEPTED** |
 
 [Future invocation and prerequisites](local-development.md#prepared-initial-payment-and-first-renewal-scenario) describe the dedicated configuration. This preparation supplies no native authority, successful provider result or storage remediation. Historical failures and consumed/UNKNOWN/DISPATCHING operations remain preserved and nonretryable. Both `initialAccepted` and `renewalAccepted` require completed proofs and confirmed cleanup; `full5bAccepted` is always false.

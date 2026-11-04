@@ -1852,7 +1852,7 @@ push or CI authority.
 
 ## Prepared initial payment and first renewal scenario
 
-The separate combined lane is **OFFLINE_PREPARED**. Its native acceptance is **NOT_RUN** and full stage 5B remains **NOT_ACCEPTED**. It reuses the original browser payment component for a fresh EUR20 MONTH subscription, then performs exactly one unchanged-terms EUR20 renewal. The original initial-only launcher remains available with its original authority and result. This preparation grants no native financial authority and does not resolve the previously recorded storage prerequisite or authorize reuse of retained resources, operations, keys or ledgers.
+The separate combined lane is **OFFLINE_PREPARED**. Its native status is **ATTEMPTED / NONE ACCEPTED** and full stage 5B remains **NOT_ACCEPTED**. It reuses the original browser payment component for a fresh EUR20 MONTH subscription, then performs exactly one unchanged-terms EUR20 renewal. The original initial-only launcher remains available with its original authority and result. This preparation grants no native financial authority and does not resolve the previously recorded storage prerequisite or authorize reuse of retained resources, operations, keys or ledgers.
 
 The dedicated entry is `examples/demo-site/tests/stripe-billing-first-renewal.spec.ts`, selected only by `playwright.stripe-billing-first-renewal.config.ts`. Ordinary and offline Playwright discovery exclude it. One worker, zero retries, disabled trace/screenshots/video, the existing browser component and a bounded scope-specific reporter preserve the initial lane's privacy and cleanup rules. Both accepted flags become true only after the initial proof, final proof and confirmed cleanup. An incomplete run consumes its authority; there is no retry, resume, arbitrary advance or graph command.
 
@@ -1881,3 +1881,17 @@ Export the required values before invocation. All other initial-only, billing ac
 The owner proves the original one-payment/no-advance SQL before admission, then invokes only empty-body `/first-renewal/boundary` and `/first-renewal/finalization`. Boundary is B=E and finalization T=E+3600; N comes from the provider. Final evidence requires two EUR2000 cash facts, two payment events, two PERIOD_PAID events, the committed publication, both ACK/READY steps and exactly seven acknowledged provider operations with no recovery: product, price, clock, customer, original subscription and two advances. Four signed delivered callbacks must be the exact INITIAL/RENEWAL union. No production route or ordinary clock registration changes; authentication, leases and delivery remain on UTC.
 
 The hosted combined test creates catalog operations through the actual catalog adapter with inert SDK transport, retains the original SQL before admission, executes the shipped final SQL in a real read-only database transaction and passes its actual row plus signature-verified deliveries to the production Node validator. Rollback-only SQL mutations check missing, foreign, unresolved and altered operation evidence without new SDK requests or financial writes. These tests and production-only exported closure checks belong to hosted CI; local source compilation and pure injected tests do not establish database, browser, Stripe or native acceptance. Final source-bound CI outcomes are retained in the external completion receipt, not inferred from this preparation status.
+
+The later isolated combined Sandbox run `206b7940-6495-4f4f-a09a-d43e79175990`
+reached acknowledged original CREATE and CONFIRM but exited 1 with no accepted
+initial or renewal proof. Its terminal output had no stage diagnostic; retained
+metadata is PENDING, while all seven exact-run containers were independently
+observed exited. The provider's final financial state was not queried. The
+attempt is consumed and cannot be replayed. In the owner source, generic errors
+after CONFIRM kept their finite phase but did not qualify for the closed terminal
+diagnostic; the offline correction now emits only a fixed post-CONFIRM checkpoint
+for browser, observation, evidence, renewal boundary, finalization, renewal
+evidence or cleanup. This is the last owner stage, not a cause or cash proof, and
+cannot retrospectively locate the historical failure. Payment dispatch,
+budgets, retries, deadlines and acceptance checks are unchanged. Stage 5B
+remains NOT_ACCEPTED.
