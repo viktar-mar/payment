@@ -152,7 +152,8 @@ it.each(["save", "refresh"] as const)("consumes %s focus restoration before late
   if (close === "refresh") fireEvent.click(await screen.findByRole("button", { name: "Refresh campaign" }));
   await waitFor(() => expect(screen.queryByRole("form", { name: "Create campaign" })).not.toBeInTheDocument());
   expect(trigger).toHaveFocus();
-  expect(reads).toHaveLength(3);
+  // Closing the form commits first; the new rows request starts in a passive effect.
+  await waitFor(() => expect(reads).toHaveLength(3));
   expect(reads[2]).toContain(close === "save" ? "offset=0" : "offset=20");
   const outside = screen.getByRole("button", { name: "Another control" });
   outside.focus();
