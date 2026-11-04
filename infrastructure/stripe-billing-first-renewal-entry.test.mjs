@@ -4,11 +4,12 @@ import {readFile} from 'node:fs/promises';
 const read=path=>readFile(new URL('../'+path,import.meta.url),'utf8');
 test('combined browser entry is opt-in, initial browser reused, no default discovery or diagnostics artifacts',async()=>{
  const entry=await read('examples/demo-site/tests/stripe-billing-first-renewal.spec.ts');
- assert.match(entry,/snapshotBillingFirstRenewalEnvironment/);assert.match(entry,/createOwnedBillingFirstRenewal/);assert.match(entry,/selectedCase:'initial_and_first_renewal'/);assert.match(entry,/FIRST_RENEWAL_CONTROL_PORT/);assert.match(entry,/FIRST_RENEWAL_FROZEN_TIME/);assert.match(entry,/runFirstPaymentBrowser\(browser, port, scoped\)/);assert.match(entry,/renewalAccepted/);
+ assert.match(entry,/snapshotBillingFirstRenewalEnvironment/);assert.match(entry,/createOwnedBillingFirstRenewal/);assert.match(entry,/selectedCase:'initial_and_first_renewal'/);assert.match(entry,/FIRST_RENEWAL_CONTROL_PORT/);assert.match(entry,/FIRST_RENEWAL_FROZEN_TIME/);assert.match(entry,/const mode = firstRenewalBrowserMode\(testInfo\.project\.name\)/);assert.match(entry,/runFirstPaymentBrowser\(browser, port, scoped, mode\)/);assert.match(entry,/renewalAccepted/);
  assert.ok(entry.indexOf('test.beforeAll')<entry.indexOf('await createOwnedBillingFirstRenewal'));assert.doesNotMatch(entry.slice(0,entry.indexOf('test.beforeAll')),/\.run\(/);
  const ordinary=await read('examples/demo-site/playwright.config.ts'),offline=await read('examples/demo-site/playwright.offline.config.ts'),config=await read('examples/demo-site/playwright.stripe-billing-first-renewal.config.ts');
  assert.match(ordinary,/testIgnore:.*"stripe-billing-first-renewal.spec.ts"/);assert.match(offline,/testMatch:'stripe-return-offline.spec.ts'/);
  assert.match(config,/testMatch:'stripe-billing-first-renewal.spec.ts'/);assert.match(config,/workers:1/);assert.match(config,/retries:0/);assert.match(config,/preserveOutput:'never'/);assert.match(config,/trace:'off',screenshot:'off',video:'off'/);assert.doesNotMatch(config,/webServer|globalSetup/);
+ const mode=await read('examples/demo-site/tests/support/stripe-billing-first-renewal-browser-mode.ts');assert.match(mode,/projectName === 'owned-manual-chrome' \? \{manualPay:true\} : undefined/);
  const reporter=await read('examples/demo-site/tests/support/stripe-billing-first-renewal-reporter.ts');assert.match(reporter,/FirstPaymentReporter/);assert.match(reporter,/owned_initial_and_first_renewal/);assert.doesNotMatch(reporter,/\.errors|\.error|stack|attachments/);
 });
 test('combined image selects only exported renewal runtime and preserves original image',async()=>{
