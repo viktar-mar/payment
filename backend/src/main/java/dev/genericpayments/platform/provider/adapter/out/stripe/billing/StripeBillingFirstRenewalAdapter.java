@@ -31,32 +31,48 @@ public final class StripeBillingFirstRenewalAdapter {
     private final SubscriptionTransactionPort transaction;private final SubscriptionOperationStore operations;private final SubscriptionLifecycleLockPort lifecycle;
     private final LockPaymentAccountPort accounts;private final SubscriptionStore subscriptions;private final PrepareSubscriptionReadUseCase preparation;
     private final SubscriptionObservationPort observations;private final StripeBillingBindingPort bindings;private final Clock utc;
-    private final LongSupplier nanos;private final Consumer<Duration> wait;
+    private final LongSupplier nanos;private final Consumer<Duration> wait;private final Consumer<String> stage;
     public StripeBillingFirstRenewalAdapter(StripeCredentialResolver credentials,StripeClientFactory clients,
             OwnedFirstRenewalStore store,SubscriptionTransactionPort transaction,SubscriptionOperationStore operations,
             SubscriptionLifecycleLockPort lifecycle,LockPaymentAccountPort accounts,SubscriptionStore subscriptions,
             PrepareSubscriptionReadUseCase preparation,SubscriptionObservationPort observations,
             StripeBillingBindingPort bindings,Clock utc) {
         this(credentials,clients,store,transaction,operations,lifecycle,accounts,subscriptions,preparation,observations,bindings,
-            utc,System::nanoTime,duration->{try{Thread.sleep(duration);}catch(InterruptedException failure){Thread.currentThread().interrupt();throw new IllegalStateException(failure);}});
+            utc,ignored->{});
+    }
+    /** The callback receives only fixed, source-owned stage names; never provider content. */
+    public StripeBillingFirstRenewalAdapter(StripeCredentialResolver credentials,StripeClientFactory clients,
+            OwnedFirstRenewalStore store,SubscriptionTransactionPort transaction,SubscriptionOperationStore operations,
+            SubscriptionLifecycleLockPort lifecycle,LockPaymentAccountPort accounts,SubscriptionStore subscriptions,
+            PrepareSubscriptionReadUseCase preparation,SubscriptionObservationPort observations,
+            StripeBillingBindingPort bindings,Clock utc,Consumer<String> stage) {
+        this(credentials,clients,store,transaction,operations,lifecycle,accounts,subscriptions,preparation,observations,bindings,
+            utc,System::nanoTime,duration->{try{Thread.sleep(duration);}catch(InterruptedException failure){Thread.currentThread().interrupt();throw new IllegalStateException(failure);}},stage);
     }
     StripeBillingFirstRenewalAdapter(StripeCredentialResolver credentials,StripeClientFactory clients,
             OwnedFirstRenewalStore store,SubscriptionTransactionPort transaction,SubscriptionOperationStore operations,
             SubscriptionLifecycleLockPort lifecycle,LockPaymentAccountPort accounts,SubscriptionStore subscriptions,
             PrepareSubscriptionReadUseCase preparation,SubscriptionObservationPort observations,
             StripeBillingBindingPort bindings,Clock utc,LongSupplier nanos,Consumer<Duration> wait) {
+        this(credentials,clients,store,transaction,operations,lifecycle,accounts,subscriptions,preparation,observations,bindings,utc,nanos,wait,ignored->{});
+    }
+    StripeBillingFirstRenewalAdapter(StripeCredentialResolver credentials,StripeClientFactory clients,
+            OwnedFirstRenewalStore store,SubscriptionTransactionPort transaction,SubscriptionOperationStore operations,
+            SubscriptionLifecycleLockPort lifecycle,LockPaymentAccountPort accounts,SubscriptionStore subscriptions,
+            PrepareSubscriptionReadUseCase preparation,SubscriptionObservationPort observations,
+            StripeBillingBindingPort bindings,Clock utc,LongSupplier nanos,Consumer<Duration> wait,Consumer<String> stage) {
         this.credentials=Objects.requireNonNull(credentials);this.clients=Objects.requireNonNull(clients);this.store=Objects.requireNonNull(store);
         this.transaction=Objects.requireNonNull(transaction);this.operations=Objects.requireNonNull(operations);this.lifecycle=Objects.requireNonNull(lifecycle);
         this.accounts=Objects.requireNonNull(accounts);this.subscriptions=Objects.requireNonNull(subscriptions);this.preparation=Objects.requireNonNull(preparation);
         this.observations=Objects.requireNonNull(observations);this.bindings=Objects.requireNonNull(bindings);this.utc=Objects.requireNonNull(utc);
-        this.nanos=Objects.requireNonNull(nanos);this.wait=Objects.requireNonNull(wait);
+        this.nanos=Objects.requireNonNull(nanos);this.wait=Objects.requireNonNull(wait);this.stage=Objects.requireNonNull(stage);
     }
     public Observation observe(Admission admission,LaterReady ready) {
         if(TransactionSynchronizationManager.isActualTransactionActive()||admission==null||ready==null)throw unavailable();
         long began=nanos.getAsLong();Instant startedAt=utc.instant().truncatedTo(ChronoUnit.MICROS);
         var budget=new Budget(began,startedAt.plusSeconds(30));
         // Outside the winner catch: a conflict, forged scope or crash residue never stops the live owner.
-        var start=transaction.required(()->{
+        stage.accept("GRAPH_CLAIM");var start=transaction.required(()->{
             var state=locked(admission,ready);budget.remaining();
             var boundary=ready.ack().advance().step()==Step.FINALIZATION?store.boundaryInTransaction(admission):null;
             var selected=state.selected();
@@ -73,14 +89,14 @@ public final class StripeBillingFirstRenewalAdapter {
             for(int attempt=0;attempt<attempts;attempt++){
                 if(attempt>0){if(budget.remaining()<=Duration.ofMillis(250).toNanos())throw new NotObserved();wait.accept(Duration.ofMillis(250));budget.remaining();}
                 var executor=new Attempt(start,budget);
-                exactClock(executor.execute(()->client.v1().testHelpers().testClocks().retrieve(admission.receipt().intent().clock().reference(),executor.options())),ready);
+                stage.accept("GRAPH_CLOCK_BEFORE");exactClock(executor.execute(()->client.v1().testHelpers().testClocks().retrieve(admission.receipt().intent().clock().reference(),executor.options())),ready);
                 var intent=admission.receipt().intent();
                 var ownership=new StripeBillingSnapshotMapper.Ownership(start.state().account(),start.state().subscription(),start.state().binding(),
                     List.of(new StripeBillingSnapshotMapper.PublishedPrice(intent.terms(),intent.priceReference(),intent.productReference())));
-                var mapped=StripeBillingSnapshotMapper.retrieveOwnedFirstRenewal(client,ownership,admission,ready,
+                stage.accept("GRAPH_REMOTE_PRECHECK");var mapped=StripeBillingSnapshotMapper.retrieveOwnedFirstRenewal(client,ownership,admission,ready,
                     utc.instant().truncatedTo(ChronoUnit.MICROS),start.boundary(),executor);
-                exactClock(executor.execute(()->client.v1().testHelpers().testClocks().retrieve(intent.clock().reference(),executor.options())),ready);
-                revalidate(start);budget.remaining();var acceptedAt=utc.instant().truncatedTo(ChronoUnit.MICROS);
+                stage.accept("GRAPH_CLOCK_AFTER");exactClock(executor.execute(()->client.v1().testHelpers().testClocks().retrieve(intent.clock().reference(),executor.options())),ready);
+                stage.accept("GRAPH_ACCEPT");revalidate(start);budget.remaining();var acceptedAt=utc.instant().truncatedTo(ChronoUnit.MICROS);
                 if(ready.ack().advance().step()==Step.BOUNDARY){
                     if(!(mapped instanceof MappedPending pending))throw unavailable();
                     var b=pending.boundary();
@@ -139,6 +155,7 @@ public final class StripeBillingFirstRenewalAdapter {
         private final Start start;private final Budget budget;private int requests;private RequestOptions options;
         Attempt(Start start,Budget budget){this.start=start;this.budget=budget;}
         public RequestOptions options(){return options;}
+        public void checkpoint(StripeBillingSnapshotMapper.RenewalCheckpoint checkpoint){stage.accept("GRAPH_"+checkpoint.name());}
         public <T>T execute(StripeBillingSnapshotMapper.Call<T> call){
             if(++requests>100)throw unavailable();revalidate(start);
             long allowance=Math.min(Duration.ofSeconds(2).toNanos(),budget.remaining());

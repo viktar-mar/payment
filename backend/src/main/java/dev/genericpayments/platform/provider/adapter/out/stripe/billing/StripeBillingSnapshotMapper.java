@@ -267,9 +267,11 @@ public final class StripeBillingSnapshotMapper {
     }
     private static boolean exactRecoveryInvoice(SubscriptionProviderModels.Invoice invoice,BillingRecord bill){return invoice.reference().equals(bill.providerInvoiceReference())&&invoice.kind()==bill.kind()&&invoice.price().equals(bill.billedPrice())&&Objects.equals(invoice.previousPrice(),bill.previousPrice())&&invoice.period().equals(bill.period())&&invoice.amountDueMinor()==bill.amountDueMinor();}
     @FunctionalInterface interface Call<T>{T run() throws StripeException;}
+    enum RenewalCheckpoint { CUSTOMER,SUBSCRIPTION,INVOICES,INITIAL_INVOICE,RENEWAL_INVOICE }
     interface ReadExecutor {
         <T>T execute(Call<T> call);
         RequestOptions options();
+        default void checkpoint(RenewalCheckpoint checkpoint){}
     }
     @FunctionalInterface private interface Page<T extends HasId>{StripeCollection<T> read(String after) throws StripeException;}
     private static final class Read {
@@ -288,6 +290,7 @@ public final class StripeBillingSnapshotMapper {
         Read(StripeClient client,Ownership owner,Instant at){this(client,owner,at,null);}
         Read(StripeClient client,Ownership owner,Instant at,OwnedInitial original){this(client,owner,at,original,null);}
         Read(StripeClient client,Ownership owner,Instant at,OwnedInitial original,OwnedActionFailure actionFailure){this.client=Objects.requireNonNull(client);this.owner=Objects.requireNonNull(owner);this.at=Objects.requireNonNull(at);this.original=original;this.actionFailure=actionFailure;}
+        void checkpoint(RenewalCheckpoint value){if(executor!=null)executor.checkpoint(value);}
         void requireOwned(boolean valid,OwnedActionGuard boundary){if(actionFailure==null)require(valid);else actionFailure.require(valid,boundary);}
         private void requireAllocation(boolean valid,AllocationReason reason){
             if(!valid){
@@ -335,10 +338,10 @@ public final class StripeBillingSnapshotMapper {
                 &&owner.trial()==null&&owner.proofs()==null&&owner.prorations().isEmpty()&&owner.schedules().isEmpty()
                 &&owner.prices().equals(List.of(new PublishedPrice(intent.terms(),intent.priceReference(),intent.productReference()))));
             var mapped=owner.prices().getFirst();prices.put(mapped.providerPriceReference(),mapped);
-            var customer=get(()->client.v1().customers().retrieve(b.providerReference(),options()));
+            checkpoint(RenewalCheckpoint.CUSTOMER);var customer=get(()->client.v1().customers().retrieve(b.providerReference(),options()));
             require(b.providerReference().equals(customer.getId())&&"customer".equals(customer.getObject())&&Boolean.FALSE.equals(customer.getLivemode())
                 &&!Boolean.TRUE.equals(customer.getDeleted())&&clockMatches(customer.getTestClock()));
-            remote=get(()->client.v1().subscriptions().retrieve(receipt.reference(),options()));
+            checkpoint(RenewalCheckpoint.SUBSCRIPTION);remote=get(()->client.v1().subscriptions().retrieve(receipt.reference(),options()));
             require(receipt.reference().equals(remote.getId())&&"subscription".equals(remote.getObject())&&Boolean.FALSE.equals(remote.getLivemode())
                 &&Objects.equals(receipt.providerCreated(),remote.getCreated())&&b.providerReference().equals(remote.getCustomer())&&clockMatches(remote.getTestClock())
                 &&"active".equals(remote.getStatus())&&remote.getPauseCollection()==null&&"charge_automatically".equals(remote.getCollectionMethod())
@@ -362,19 +365,19 @@ public final class StripeBillingSnapshotMapper {
                 require(saved!=null&&saved.admissionId().equals(admission.id())&&saved.id().equals(ready.ack().advance().boundary())
                     &&saved.ready().id().equals(ready.ack().advance().predecessorReady())&&saved.item().equals(item.getId())&&saved.period().equals(period));
             }else require(saved==null);
-            sourceInvoices=pages(after->client.v1().invoices().list(InvoiceListParams.builder().setSubscription(remote.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build(),options()));
+            checkpoint(RenewalCheckpoint.INVOICES);sourceInvoices=pages(after->client.v1().invoices().list(InvoiceListParams.builder().setSubscription(remote.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build(),options()));
             require(sourceInvoices.size()==2);
             var historical=sourceInvoices.stream().filter(i->admission.invoice().equals(i.getId())&&"subscription_create".equals(i.getBillingReason())).toList();
             var renewals=sourceInvoices.stream().filter(i->!admission.invoice().equals(i.getId())&&"subscription_cycle".equals(i.getBillingReason())).toList();
             require(historical.size()==1&&renewals.size()==1);var renewal=renewals.getFirst();
             require(Set.of("paid","draft","open").contains(renewal.getStatus()));
-            var initial=invoice(historical.getFirst(),remote,item,null);
+            checkpoint(RenewalCheckpoint.INITIAL_INVOICE);var initial=invoice(historical.getFirst(),remote,item,null);
             require(initial.kind()==BillingRecord.Kind.INITIAL&&initial.period().equals(period(receipt.periodStart(),receipt.periodEnd()))
                 &&initial.price().equals(intent.terms())&&initial.settlement()==SettlementKind.CASH&&initial.cashObjects().size()==1
                 &&initial.cashObjects().getFirst().reference().equals(admission.paymentIntent()));
             var initialAllocations=sourceAllocations.get(initial.reference());
             require(initialAllocations.size()==1&&initialAllocations.getFirst().getId().equals(admission.allocation()));
-            var next=invoice(renewal,remote,item,null);
+            checkpoint(RenewalCheckpoint.RENEWAL_INVOICE);var next=invoice(renewal,remote,item,null);
             require(next.kind()==BillingRecord.Kind.RENEWAL&&next.period().equals(period)&&next.price().equals(intent.terms())
                 &&(next.settlement()==SettlementKind.CASH||next.settlement()==SettlementKind.OPEN));
             if(next.settlement()==SettlementKind.OPEN)requirePendingRenewal(renewal);

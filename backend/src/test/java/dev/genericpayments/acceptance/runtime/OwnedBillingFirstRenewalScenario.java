@@ -55,8 +55,9 @@ public final class OwnedBillingFirstRenewalScenario implements OwnedBillingFirst
         require(admission.receipt().equals(receipt)&&admission.sourceSha().equals(owner.source()));
         boundaryFailureStage="CLOCK_ADVANCE";
         check();var ready=advance().advance(admission,Step.BOUNDARY);
-        boundaryFailureStage="GRAPH";
+        boundaryFailureStage="GRAPH_OBSERVER_INIT";
         check();var observation=observer().observe(admission,ready);
+        boundaryFailureStage="GRAPH_ASSERT";
         require(observation instanceof Pending);var pending=(Pending)observation;boundary=pending.boundary();
         require(pending.admission().equals(admission)&&pending.ready().equals(ready)&&boundary.equals(bean(OwnedFirstRenewalStore.class).boundary(admission))
             &&boundary.period().start().equals(Instant.ofEpochSecond(receipt.periodEnd()))&&boundary.period().start().plusSeconds(3600).isBefore(boundary.period().end()));
@@ -79,7 +80,7 @@ public final class OwnedBillingFirstRenewalScenario implements OwnedBillingFirst
         response.addProperty("publication_id",publication.admissionId().toString());response.addProperty("period_start",boundary.period().start().toString());response.addProperty("paid_through",subscription.paidThrough().toString());response.addProperty("access_evaluated_at",access.evaluatedAt().toString());response.addProperty("access_valid_until",access.validUntil().toString());return response;
     });}
     private StripeBillingFirstRenewalAdvanceAdapter advance(){return new StripeBillingFirstRenewalAdvanceAdapter(bean(StripeCredentialResolver.class),bean(StripeClientFactory.class),bean(LoadPaymentAccountPort.class),bean(ProviderOperationStore.class),bean(OwnedFirstRenewalStore.class),utc);}
-    private StripeBillingFirstRenewalAdapter observer(){return new StripeBillingFirstRenewalAdapter(bean(StripeCredentialResolver.class),bean(StripeClientFactory.class),bean(OwnedFirstRenewalStore.class),bean(SubscriptionTransactionPort.class),bean(SubscriptionOperationStore.class),bean(SubscriptionLifecycleLockPort.class),bean(LockPaymentAccountPort.class),bean(SubscriptionStore.class),bean(PrepareSubscriptionReadUseCase.class),bean(SubscriptionObservationPort.class),bean(StripeBillingBindingPort.class),utc);}
+    private StripeBillingFirstRenewalAdapter observer(){return new StripeBillingFirstRenewalAdapter(bean(StripeCredentialResolver.class),bean(StripeClientFactory.class),bean(OwnedFirstRenewalStore.class),bean(SubscriptionTransactionPort.class),bean(SubscriptionOperationStore.class),bean(SubscriptionLifecycleLockPort.class),bean(LockPaymentAccountPort.class),bean(SubscriptionStore.class),bean(PrepareSubscriptionReadUseCase.class),bean(SubscriptionObservationPort.class),bean(StripeBillingBindingPort.class),utc,stage->boundaryFailureStage=stage);}
     @Override public synchronized void abort(){if(phase.equals("STOPPED"))return;phase="STOPPED";if(admission!=null)try{bean(OwnedFirstRenewalStore.class).stop(admission,"AUTHORITY_DRIFT",utc.instant());}catch(RuntimeException ignored){}initial.abort();}
     private static void require(boolean valid){if(!valid)throw stopped();}
     private static IllegalStateException stopped(){return new IllegalStateException("FIRST_RENEWAL_STOPPED");}

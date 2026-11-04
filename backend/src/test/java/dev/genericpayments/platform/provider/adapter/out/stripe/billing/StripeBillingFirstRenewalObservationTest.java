@@ -31,6 +31,7 @@ class StripeBillingFirstRenewalObservationTest {
     private boolean delayLock;
     private boolean foreignInvocation;
     private final List<Duration> waits=new ArrayList<>();
+    private final List<String> graphStages=new ArrayList<>();
     private final OwnedFirstRenewalStore store=port(OwnedFirstRenewalStore.class,call->switch(call.name()){
         case "requirePaidInTransaction"->{assertThat(inTransaction).isTrue();assertThat(call.args()[0]).isEqualTo(admission);yield admission;}
         case "requireReadyInTransaction"->{assertThat(inTransaction).isTrue();assertThat(call.args()[1]).isEqualTo(ready);yield ready;}
@@ -62,7 +63,7 @@ class StripeBillingFirstRenewalObservationTest {
         var observations=port(SubscriptionObservationPort.class,call->{assertThat(call.name()).isEqualTo("captureFence");captures++;return 7L;});
         var bindings=port(StripeBillingBindingPort.class,call->{assertThat(call.name()).isEqualTo("findCustomer");return Optional.of(f.binding());});
         return new StripeBillingFirstRenewalAdapter(f.f.credentials,f.f.clients,store,tx,operations,lifecycle,accounts,subscriptions,
-            subscription->null,observations,bindings,Clock.fixed(now,ZoneOffset.UTC),()->nanos,duration->{waits.add(duration);nanos+=duration.toNanos();});
+            subscription->null,observations,bindings,Clock.fixed(now,ZoneOffset.UTC),()->nanos,duration->{waits.add(duration);nanos+=duration.toNanos();},graphStages::add);
     }
     private void graph(){
         graph(false);
@@ -86,6 +87,8 @@ class StripeBillingFirstRenewalObservationTest {
         assertThat(inserts).isEqualTo(1);assertThat(captures).isEqualTo(1);assertThat(stops).isZero();
         assertThat(claim.fence()).isEqualTo(new Fence(2,null,null,null,null,7L));
         assertThat(f.f.http.calls).hasSize(12);assertThat(f.f.http.replies).isEmpty();
+        assertThat(graphStages).containsExactly("GRAPH_CLAIM","GRAPH_CLOCK_BEFORE","GRAPH_REMOTE_PRECHECK","GRAPH_CUSTOMER",
+            "GRAPH_SUBSCRIPTION","GRAPH_INVOICES","GRAPH_INITIAL_INVOICE","GRAPH_RENEWAL_INVOICE","GRAPH_CLOCK_AFTER","GRAPH_ACCEPT");
         for(var request:f.f.http.calls){assertThat(request.options().getReadTimeout()).isBetween(1,2000);assertThat(request.options().getConnectTimeout()).isBetween(1,2000);assertThat(request.options().getMaxNetworkRetries()).isZero();}
         assertThatThrownBy(()->adapter().observe(admission,ready)).isInstanceOf(RuntimeException.class);
         assertThat(f.f.http.calls).hasSize(12);assertThat(stops).isZero();assertThat(inserts).isEqualTo(1);
@@ -123,6 +126,7 @@ class StripeBillingFirstRenewalObservationTest {
         graph();f.f.http.afterResponse=()->claim=new ReadClaim(ready,UUID.randomUUID(),claim.startedAt(),claim.deadlineAt(),claim.fence());
         assertThatThrownBy(()->adapter().observe(admission,ready)).isInstanceOf(RuntimeException.class);
         assertThat(saved).isNull();assertThat(f.f.http.calls).hasSize(1);assertThat(reason).isEqualTo("AUTHORITY_DRIFT");
+        assertThat(graphStages.getLast()).isEqualTo("GRAPH_CLOCK_BEFORE");
     }
     @Test void foreignInvocationClaimCannotStartIo(){
         foreignInvocation=true;graph();

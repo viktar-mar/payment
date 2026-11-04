@@ -55,7 +55,9 @@ public final class OwnedBillingFirstRenewalRuntime {
             }catch(Exception failure){operations.abort();var response=OwnedBillingFirstPaymentRuntime.error("FIRST_RENEWAL_STOPPED");
                 if(path.equals("/first-renewal/boundary")){
                     String stage;try{stage=operations.boundaryFailureStage();}catch(RuntimeException ignored){stage="UNCLASSIFIED";}
-                    if(stage==null||!Set.of("INITIAL_RECEIPT","ADMISSION","CLOCK_ADVANCE","GRAPH","BOUNDARY_RESPONSE").contains(stage))stage="UNCLASSIFIED";
+                    if(stage==null||!Set.of("INITIAL_RECEIPT","ADMISSION","CLOCK_ADVANCE","GRAPH","GRAPH_OBSERVER_INIT","GRAPH_CLAIM",
+                        "GRAPH_CLOCK_BEFORE","GRAPH_REMOTE_PRECHECK","GRAPH_CUSTOMER","GRAPH_SUBSCRIPTION","GRAPH_INVOICES",
+                        "GRAPH_INITIAL_INVOICE","GRAPH_RENEWAL_INVOICE","GRAPH_CLOCK_AFTER","GRAPH_ACCEPT","GRAPH_ASSERT","BOUNDARY_RESPONSE").contains(stage))stage="UNCLASSIFIED";
                     response.addProperty("stage",stage);
                 }
                 OwnedBillingFirstPaymentRuntime.Handler.reply(exchange,400,response);}

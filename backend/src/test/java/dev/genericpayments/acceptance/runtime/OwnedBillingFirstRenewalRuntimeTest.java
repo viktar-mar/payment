@@ -78,6 +78,27 @@ class OwnedBillingFirstRenewalRuntimeTest {
         assertThat(x.code).isEqualTo(400);
         assertThat(x.output.toString()).isEqualTo("{\"code\":\"FIRST_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}");
     }
+    @Test void fixedGraphSubstageIsReturnedWithoutProviderDetails() throws Exception {
+        var ops=new Inert(){
+            @Override public JsonObject boundary(){throw new IllegalStateException("private-provider-detail");}
+            @Override public String boundaryFailureStage(){return "GRAPH_RENEWAL_INVOICE";}
+        };
+        var x=new OwnedBillingFirstPaymentRuntimeTest.MemoryExchange("POST","/first-renewal/boundary","{}",true);
+        new OwnedBillingFirstRenewalRuntime.Handler(ops,"q".repeat(43)).handle(x);
+        assertThat(x.code).isEqualTo(400);
+        assertThat(x.output.toString()).isEqualTo("{\"code\":\"FIRST_RENEWAL_STOPPED\",\"stage\":\"GRAPH_RENEWAL_INVOICE\"}");
+        assertThat(x.output.toString()).doesNotContain("private-provider-detail");
+    }
+    @Test void unlistedGraphSubstageCannotEscapeServer() throws Exception {
+        var ops=new Inert(){
+            @Override public JsonObject boundary(){throw new IllegalStateException("private-provider-detail");}
+            @Override public String boundaryFailureStage(){return "GRAPH_PRIVATE_PROVIDER_DETAIL";}
+        };
+        var x=new OwnedBillingFirstPaymentRuntimeTest.MemoryExchange("POST","/first-renewal/boundary","{}",true);
+        new OwnedBillingFirstRenewalRuntime.Handler(ops,"q".repeat(43)).handle(x);
+        assertThat(x.code).isEqualTo(400);
+        assertThat(x.output.toString()).isEqualTo("{\"code\":\"FIRST_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}");
+    }
     static class Inert extends OwnedBillingFirstPaymentRuntimeTest.InertOperations implements OwnedBillingFirstRenewalRuntime.Operations {
         int boundaries,finals;
         public JsonObject boundary(){boundaries++;return new JsonObject();}

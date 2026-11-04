@@ -85,6 +85,8 @@ for(const [kind,reply,expected] of [
  ['response',()=>new Response('{"unexpected":"private-sentinel"}'),'POST_CONFIRM_RENEWAL_BOUNDARY_RESPONSE'],
  ['transport',()=>{throw Error('private-sentinel');},'POST_CONFIRM_RENEWAL_BOUNDARY_TRANSPORT'],
  ['server',()=>new Response('{"code":"FIRST_RENEWAL_STOPPED","stage":"INITIAL_RECEIPT"}',{status:400}),'POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_INITIAL_RECEIPT'],
+ ['graph-substage',()=>new Response('{"code":"FIRST_RENEWAL_STOPPED","stage":"GRAPH_RENEWAL_INVOICE"}',{status:400}),'POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_GRAPH_RENEWAL_INVOICE'],
+ ['forged-graph-stage',()=>new Response('{"code":"FIRST_RENEWAL_STOPPED","stage":"GRAPH_PRIVATE_PROVIDER_DETAIL"}',{status:400}),'POST_CONFIRM_RENEWAL_BOUNDARY_HTTP'],
  ['forged-stage',()=>new Response('{"code":"FIRST_RENEWAL_STOPPED","stage":"private-sentinel"}',{status:400}),'POST_CONFIRM_RENEWAL_BOUNDARY_HTTP'],
 ])test('boundary '+kind+' failure exposes only a fixed safe category',async()=>{
  const h=await runtimeHarness({route:'boundary',reply}),l=await settleClient(h.runtime);
