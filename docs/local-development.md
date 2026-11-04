@@ -1826,6 +1826,13 @@ TOKEN (`BROWSER_WAIT_OBSERVE_TOKEN_CLEARED`), and an invalid/unavailable marker
 sequence (`BROWSER_WAIT_OBSERVE_MARKER_INVALID`). Parent abort or expiry retains
 the generic code; terminal-page errors keep their existing labels.
 
+The page also sends an optional fixed Pay signal when its handler begins. If Node
+receives that signal from the owned main frame before the wait fails, but receives
+no pending stage, it reports `BROWSER_WAIT_OBSERVE_PAY_SIGNAL_OBSERVED_MARKER_MISSING`.
+This proves only that Node received a page signal, not that a payment was sent or
+the handler ran. Same-origin page code can invoke the binding, and delayed signals
+can leave the older `MARKER_MISSING` label. Neither label grants a retry.
+
 LAST_OBSERVED means the last pending stage received by Node before failure.
 Delayed renderer messages can make it stale; missing observation is inconclusive.
 The first failure freezes its local label and immediately cancels the browser

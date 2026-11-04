@@ -81,7 +81,7 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
   let failure = false;
   let firstFailure: Error | undefined;
   let checkpoint = 'BROWSER_CONTEXT';
-  let ready = false, payStarted = false;
+  let ready = false, payStarted = false, paySignalObserved = false;
   let observation: 'NEW'|'SUBMIT'|'BETWEEN'|'TOKEN'|'DONE'|'UNAVAILABLE' = 'NEW';
   const latch = (code: string): Error => {
     if (firstFailure) return firstFailure;
@@ -138,6 +138,12 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
         else if (observation === 'TOKEN' && value === null) observation = 'DONE';
         else observation = 'UNAVAILABLE';
       } catch {observation = 'UNAVAILABLE';}
+    });
+    await context.exposeBinding('__firstPaymentPaySignal', ({frame}, value: unknown) => {
+      if (failure || abandoned || !prepared || !bridge || !ready || !payStarted || value !== 'ENTERED') return;
+      try {
+        if (frame === page.mainFrame() && new URL(frame.url()).origin === binding.endpoints.demo) paySignalObserved = true;
+      } catch { /* The diagnostic is optional and never changes payment authority. */ }
     });
     await context.exposeBinding('__firstPaymentPrepare', async ({frame}, input: unknown) => {
       try {
@@ -242,7 +248,7 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
       } catch {
         const hint = observation as string;
         const observed: Record<string,string> = {
-          NEW:'BROWSER_WAIT_OBSERVE_MARKER_MISSING',
+          NEW:paySignalObserved ? 'BROWSER_WAIT_OBSERVE_PAY_SIGNAL_OBSERVED_MARKER_MISSING' : 'BROWSER_WAIT_OBSERVE_MARKER_MISSING',
           SUBMIT:'BROWSER_WAIT_OBSERVE_LAST_OBSERVED_SUBMIT',
           BETWEEN:'BROWSER_WAIT_OBSERVE_SUBMIT_CLEARED',
           TOKEN:'BROWSER_WAIT_OBSERVE_LAST_OBSERVED_TOKEN',

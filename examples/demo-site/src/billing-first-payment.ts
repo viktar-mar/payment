@@ -119,6 +119,10 @@ document.addEventListener('visibilitychange', () => {if (document.visibilityStat
     button('pay').disabled = true;
     phase('CONFIRMING');
     try {
+      const binding = Object.getOwnPropertyDescriptor(window, '__firstPaymentPaySignal');
+      if (binding && 'value' in binding && typeof binding.value === 'function') void Promise.resolve(binding.value('ENTERED')).catch(() => {});
+    } catch { /* Optional diagnostic must never prevent confirmation. */ }
+    try {
       const result = await handle.confirm();
       if (stopped) return;
       captureFailure();
