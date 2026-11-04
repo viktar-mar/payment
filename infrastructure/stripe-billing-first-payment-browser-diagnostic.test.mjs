@@ -9,6 +9,13 @@ const codes=['BROWSER_CONTEXT','BROWSER_PAGE','BROWSER_SETUP','BROWSER_NAVIGATIO
 test('internal errors carry only a finite checkpoint and conservative private cleanup knowledge',()=>{
  for(const code of codes){const e=browserFailure(code);assert.equal(String(e),'Error: first_payment_BROWSER');assert.equal(browserDiagnostic(e),code);assert.equal(browserCleanupConfirmed(e),false);assert.deepEqual(Object.keys(e),[]);finishBrowserCleanup(e,true);assert.equal(browserCleanupConfirmed(e),true);assert.equal(isBrowserDiagnostic(code),true);}
 });
+test('bounded wait marker categories carry no payload and remain closed',()=>{
+ for(const suffix of ['MARKER_MISSING','SUBMIT_CLEARED','TOKEN_CLEARED','MARKER_INVALID']) {
+  const code='BROWSER_WAIT_OBSERVE_'+suffix,error=browserFailure(code);
+  assert.equal(browserDiagnostic(error),code);assert.deepEqual(Object.keys(error),[]);
+  assert.equal(isBrowserDiagnostic(code+'_PRIVATE'),false);
+ }
+});
 test('foreign values and unreadable proxies cannot supply provenance',()=>{
  let reads=0;const hostile=new Proxy({diagnostic:'BROWSER_PAGE',cleanupConfirmed:true},{get(){reads++;throw null;},getPrototypeOf(){reads++;throw null;},ownKeys(){reads++;throw null;}});
  for(const e of [hostile,null,undefined,1,'BROWSER_PAGE',{code:'BROWSER_PAGE'},new Error('BROWSER_PAGE'),Object.create(browserFailure('BROWSER_PAGE'))]){assert.equal(browserDiagnostic(e),null);assert.equal(browserCleanupConfirmed(e),false);finishBrowserCleanup(e,true);}

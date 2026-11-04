@@ -241,7 +241,15 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
         await page.waitForFunction(() => ['OBSERVE','STOPPED'].includes(document.body.dataset.phase ?? ''), undefined, {timeout:remaining(limits)});
       } catch {
         const hint = observation as string;
-        throw latch(!parent.signal?.aborted && Date.now() < parent.deadline && (hint === 'SUBMIT' || hint === 'TOKEN') ? 'BROWSER_WAIT_OBSERVE_LAST_OBSERVED_' + hint : 'BROWSER_WAIT_OBSERVE');
+        const observed: Record<string,string> = {
+          NEW:'BROWSER_WAIT_OBSERVE_MARKER_MISSING',
+          SUBMIT:'BROWSER_WAIT_OBSERVE_LAST_OBSERVED_SUBMIT',
+          BETWEEN:'BROWSER_WAIT_OBSERVE_SUBMIT_CLEARED',
+          TOKEN:'BROWSER_WAIT_OBSERVE_LAST_OBSERVED_TOKEN',
+          DONE:'BROWSER_WAIT_OBSERVE_TOKEN_CLEARED',
+          UNAVAILABLE:'BROWSER_WAIT_OBSERVE_MARKER_INVALID',
+        };
+        throw latch(!parent.signal?.aborted && Date.now() < parent.deadline ? observed[hint] ?? 'BROWSER_WAIT_OBSERVE' : 'BROWSER_WAIT_OBSERVE');
       }
       const terminal = await billingBounded(limits, () => page.evaluate(origin => {
         if (window !== window.top || location.origin !== origin) return 'STOPPED';

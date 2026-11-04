@@ -83,6 +83,7 @@ test('dedicated deployed page preserves real SDK OTP authority through one ready
       let confirmKey = '';
       const privatePaths: string[] = [];
       const dispatches: string[] = [];
+      const pendingSignals: unknown[] = [];
       const bootstrap = {resources:()=>({cliDirectory:'/synthetic'}),prepare:async()=>true,start:async()=>true,stop:async()=>true,withFirstPaymentRuntime:async(callback:any)=>callback({endpoint:'http://127.0.0.1:18083',capability:control})};
       const owner = await createOwnedBillingFirstPayment(options, {
         preflight:async()=>true,createBootstrap:async()=>bootstrap,
@@ -112,6 +113,10 @@ test('dedicated deployed page preserves real SDK OTP authority through one ready
       });
       const wrappedBrowser = {newContext:async(value:any)=>{
         const context = await browser!.newContext(value);
+        const exposeBinding = context.exposeBinding.bind(context);
+        context.exposeBinding = async (name:any, callback:any) => exposeBinding(name, name === '__firstPaymentPending'
+          ? (source:any, stage:unknown) => {pendingSignals.push(stage);return callback(source, stage);}
+          : callback);
         await context.addInitScript(() => {
           if (window.top === window && location.origin !== 'null') (window as any).__storageAudit = {session:window.sessionStorage,local:window.localStorage};
         });
@@ -166,6 +171,7 @@ test('dedicated deployed page preserves real SDK OTP authority through one ready
       if (outcome === 'OBSERVE') assert.equal((await run).initialAccepted,true);
       else await assert.rejects(run);
       assert.deepEqual(dispatches,outcome === 'PAGEHIDE' ? ['create'] : ['create','confirm']);
+      assert.deepEqual(pendingSignals,outcome === 'PAGEHIDE' ? [] : ['SUBMIT',null,'TOKEN',null]);
       assert.deepEqual(privatePaths,['/initial-payment/status','/initial-payment/prepare',...(outcome === 'PAGEHIDE' ? [] : ['/initial-payment/confirm']),...(outcome === 'OBSERVE' ? ['/initial-payment/observe'] : [])]);
       assert.equal(denied,0);
       assert.equal(leaked,false);

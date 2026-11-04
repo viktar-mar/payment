@@ -10,6 +10,16 @@ const client=await import('./stripe-billing-first-payment-runtime.mjs');
 const id=n=>'11111111-2222-4333-8444-'+String(n).padStart(12,'0');
 const F=1790000000,E=1792592000,N=1795270400,T=E+3600,iso=n=>new Date(n*1000).toISOString();
 const limits=()=>({deadline:Date.now()+10000});
+test('first-payment and first-renewal envelopes accept only closed wait marker categories',()=>{
+ for(const suffix of ['MARKER_MISSING','SUBMIT_CLEARED','TOKEN_CLEARED','MARKER_INVALID']) {
+  const code='BROWSER_WAIT_OBSERVE_'+suffix;
+  for(const [prefix,parse] of [['owned_initial_payment_diagnostic',api.parseBillingFirstPaymentDiagnosticLine],['owned_initial_and_first_renewal_diagnostic',api.parseBillingFirstRenewalDiagnosticLine]]) {
+   const line=prefix+' code='+code+' cleanup=CONFIRMED';
+   assert.equal(parse(line),line);assert.ok(line.length<=160);
+   assert.equal(parse(line.replace(code,code+'_EXTRA')),null);
+  }
+ }
+});
 const options=()=>({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_RENEWAL:'true'},runId:id(1),expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports:{backend:18080,demo:18081,receiver:18082,postgres:15432,mailpitHttp:18025,mailpitSmtp:11025},controlPort:18083,frozenTime:F,approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_and_first_renewal'});
 const scope=()=>({runId:id(1),expectedSource:'e'.repeat(40),accountId:id(2),siteId:id(3),customerId:id(4),priceId:id(5),productId:id(6),endpoints:{demo:'http://127.0.0.1:18081'}});
 const identity=()=>({code:'OK',run_id:id(1),account_id:id(2),site_id:id(3),customer_id:id(4),price_id:id(5),subscription_id:id(7),operation_id:id(8)});
