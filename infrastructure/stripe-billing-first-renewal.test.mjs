@@ -78,8 +78,33 @@ test('concurrent boundary burns both calls and forbids finalization after late a
 for(const route of ['boundary','finalization'])test('fixed '+route+' deadline rejection never gains fresh authority or diagnostics',async()=>{const h=await runtimeHarness(),l=await settleClient(h.runtime);if(route==='finalization')await h.runtime.boundary(l);await assert.rejects(h.runtime[route]({deadline:Date.now()-1}));await assert.rejects(h.runtime[route](limits()));assert.equal(h.calls.length,route==='boundary'?4:5);});
 
 test('client retains immutable stage snapshots when caller mutates returned settlement/boundary',async()=>{const h=await runtimeHarness(),l=limits();await h.runtime.ready(l);await h.runtime.prepare(scope(),l);await h.runtime.confirm(confirmation(),l);const initial=await h.runtime.observe(l);try{initial.paid_through=iso(E+1);}catch{}const b=await h.runtime.boundary(l);try{b.period_end=iso(N+1);}catch{}assert.equal((await h.runtime.finalization(l)).paid_through,iso(N));});
-for(const [route,change]of [['boundary',v=>v.subscription_id=id(90)],['boundary',v=>v.renewal_admission_id='invalid'],['boundary',v=>v.period_start=iso(E+1)],['finalization',v=>v.publication_id=id(90)],['finalization',v=>v.access_evaluated_at=iso(T+1)]])test('client independently rejects fixed '+route+' mismatch without an owner',async()=>{const h=await runtimeHarness({route,reply:v=>{change(v);return new Response(JSON.stringify(v));}}),l=await settleClient(h.runtime);if(route==='finalization')await h.runtime.boundary(l);let rejected;try{await h.runtime[route](l);}catch(e){rejected=e;}assert.ok(rejected);assert.equal(client.billingFirstPaymentDiagnostic(rejected),null);await assert.rejects(h.runtime.finalization(l));});
+for(const [route,change]of [['boundary',v=>v.subscription_id=id(90)],['boundary',v=>v.renewal_admission_id='invalid'],['boundary',v=>v.period_start=iso(E+1)],['finalization',v=>v.publication_id=id(90)],['finalization',v=>v.access_evaluated_at=iso(T+1)]])test('client independently rejects fixed '+route+' mismatch without an owner',async()=>{const h=await runtimeHarness({route,reply:v=>{change(v);return new Response(JSON.stringify(v));}}),l=await settleClient(h.runtime);if(route==='finalization')await h.runtime.boundary(l);let rejected;try{await h.runtime[route](l);}catch(e){rejected=e;}assert.ok(rejected);assert.equal(client.billingFirstPaymentDiagnostic(rejected),route==='boundary'?'POST_CONFIRM_RENEWAL_BOUNDARY_RESPONSE':null);await assert.rejects(h.runtime.finalization(l));});
 for(const route of ['boundary','finalization'])test('client rejects duplicate/escaped renewal wire keys at '+route,async()=>{for(const kind of ['duplicate','escaped']){const h=await runtimeHarness({route,reply:v=>{const s=JSON.stringify(v);return new Response(kind==='duplicate'?s.replace('{','{"code":"OK",'):s.replace('"code"','"co\\u0064e"'));}}),l=await settleClient(h.runtime);if(route==='finalization')await h.runtime.boundary(l);await assert.rejects(h.runtime[route](l));}});
+for(const [kind,reply,expected] of [
+ ['http',()=>new Response('{"code":"FIRST_RENEWAL_STOPPED"}',{status:400}),'POST_CONFIRM_RENEWAL_BOUNDARY_HTTP'],
+ ['response',()=>new Response('{"unexpected":"private-sentinel"}'),'POST_CONFIRM_RENEWAL_BOUNDARY_RESPONSE'],
+ ['transport',()=>{throw Error('private-sentinel');},'POST_CONFIRM_RENEWAL_BOUNDARY_TRANSPORT'],
+])test('boundary '+kind+' failure exposes only a fixed safe category',async()=>{
+ const h=await runtimeHarness({route:'boundary',reply}),l=await settleClient(h.runtime);
+ let rejected;try{await h.runtime.boundary(l);}catch(error){rejected=error;}
+ assert.ok(rejected);assert.equal(client.billingFirstPaymentDiagnostic(rejected),expected);
+ assert.ok(!String(rejected).includes('private-sentinel'));
+ await assert.rejects(h.runtime.finalization(l));assert.equal(h.calls.length,5);
+});
+test('owner retains the fixed boundary HTTP category after cleanup',async()=>{
+ const h=harness();h.bootstrap.withFirstRenewalRuntime=cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});
+ const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),settled()];
+ h.dependencies.createRuntime=()=>client.createBillingFirstRenewalRuntime({configuration:options(),bootstrap:h.bootstrap},{fetch:async()=>{
+  const next=replies.shift();return next?new Response(JSON.stringify(next)):new Response('{"code":"FIRST_RENEWAL_STOPPED"}',{status:400});
+ }});
+ const owner=await api.createOwnedBillingFirstRenewal(options(),h.dependencies);
+ await assert.rejects(owner.run(journey,limits()));const result=await owner.close();
+ assert.equal(result.diagnostic,'POST_CONFIRM_RENEWAL_BOUNDARY_HTTP');assert.equal(result.cleanupConfirmed,true);
+ assert.equal(result.initialAccepted,false);assert.equal(result.renewalAccepted,false);
+ const line=api.formatBillingFirstRenewalDiagnostic(result);
+ assert.equal(line,'owned_initial_and_first_renewal_diagnostic code=POST_CONFIRM_RENEWAL_BOUNDARY_HTTP cleanup=CONFIRMED');
+ assert.equal(api.parseBillingFirstRenewalDiagnosticLine(line),line);
+});
 for(const stage of ['SUBMIT','TOKEN'])test('combined owner preserves historical wait hint '+stage+' without acceptance',async()=>{
  const {browserFailure,finishBrowserCleanup}=await import('./stripe-billing-first-payment-browser-diagnostic.mjs');
  const code='BROWSER_WAIT_OBSERVE_LAST_OBSERVED_'+stage,h=harness(),owner=await api.createOwnedBillingFirstRenewal(options(),h.dependencies);
