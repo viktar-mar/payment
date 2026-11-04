@@ -9,6 +9,7 @@ const code = document.querySelector<HTMLInputElement>('#code')!;
 const consent = document.querySelector<HTMLInputElement>('#consent')!;
 const host = document.querySelector<HTMLElement>('#provider')!;
 let configured = false;
+let manualPay = false;
 let stopped = false;
 let spent = false;
 let confirming = false;
@@ -44,9 +45,10 @@ function stop(): void {
 window.addEventListener('pagehide', stop, {once:true});
 document.addEventListener('visibilitychange', () => {if (document.visibilityState === 'hidden') stop();});
 
-(window as any).__firstPaymentConfigure = (configuration: {backend:string;siteKey:string;email:string;deadline:number}): void => {
+(window as any).__firstPaymentConfigure = (configuration: {backend:string;siteKey:string;email:string;deadline:number;manualPay?:true}): void => {
   if (configured || stopped || !Number.isSafeInteger(configuration.deadline) || configuration.deadline <= Date.now() || configuration.deadline > Date.now() + 300000) {stop();return;}
   configured = true;
+  manualPay = configuration.manualPay === true;
   timer = setTimeout(stop, configuration.deadline - Date.now());
   // Exercise the SDK's existing unavailable-storage path, retaining genuine OTP
   // authority in this client only. No customer/action/session material is saved.
@@ -109,7 +111,7 @@ document.addEventListener('visibilitychange', () => {if (document.visibilityStat
           void Promise.resolve(binding.value(stage)).catch(disable);
         } catch {disable();}
       });
-      button('pay').disabled = false;
+      button('pay').disabled = manualPay;
       phase('READY');
     } catch {stop();}
   };

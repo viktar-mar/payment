@@ -2,6 +2,7 @@ import {test} from '@playwright/test';
 import {createOwnedBillingFirstRenewal, formatBillingFirstRenewalDiagnostic} from '../../../infrastructure/stripe-billing-first-payment.mjs';
 import {snapshotBillingFirstRenewalEnvironment} from '../../../infrastructure/stripe-billing-first-renewal-options.mjs';
 import {runFirstPaymentBrowser} from './support/stripe-billing-first-payment';
+import {firstRenewalBrowserMode} from './support/stripe-billing-first-renewal-browser-mode';
 
 let owner: Awaited<ReturnType<typeof createOwnedBillingFirstRenewal>>;
 test.beforeAll(async () => {
@@ -22,11 +23,12 @@ test.beforeAll(async () => {
     selectedCase:'initial_and_first_renewal',
   });
 });
-test('OWNED_INITIAL_AND_FIRST_RENEWAL: EUR20 original v2 plus one EUR20 renewal and four signed callbacks', async ({browser}) => {
+test('OWNED_INITIAL_AND_FIRST_RENEWAL: EUR20 original v2 plus one EUR20 renewal and four signed callbacks', async ({browser},testInfo) => {
   const controller = new AbortController();
   const limits = {deadline:Date.now() + 2700000, signal:controller.signal};
   try {
-    const result = await owner.run((port, scoped) => runFirstPaymentBrowser(browser, port, scoped), limits);
+    const mode = firstRenewalBrowserMode(testInfo.project.name);
+    const result = await owner.run((port, scoped) => runFirstPaymentBrowser(browser, port, scoped, mode), limits);
     if (result.scope !== 'OWNED_INITIAL_AND_FIRST_RENEWAL' || !result.initialAccepted || !result.renewalAccepted || !result.cleanupConfirmed || result.full5bAccepted) throw new Error('first_renewal_NOT_ACCEPTED');
   } finally {
     controller.abort();

@@ -1863,7 +1863,11 @@ The separate combined lane is **OFFLINE_PREPARED**. Its native status is **ATTEM
 
 The dedicated entry is `examples/demo-site/tests/stripe-billing-first-renewal.spec.ts`, selected only by `playwright.stripe-billing-first-renewal.config.ts`. Ordinary and offline Playwright discovery exclude it. One worker, zero retries, disabled trace/screenshots/video, the existing browser component and a bounded scope-specific reporter preserve the initial lane's privacy and cleanup rules. Both accepted flags become true only after the initial proof, final proof and confirmed cleanup. An incomplete run consumes its authority; there is no retry, resume, arbitrary advance or graph command.
 
-A future native run requires separate approval of a clean exact source SHA, fresh UUID/resources, canonical daemon, seven free loopback ports, explicit frozen epoch, pinned account/API and budget `{clock:1,customer:1,create:1,confirm:1,advance:2}` plus one fresh product and price. Resolve and independently verify adequate native storage before requesting that run; the earlier cleanup receipt is not proof of available capacity. With those prerequisites approved, from the repository root use the explicit invocation below. These required variables must contain the approved values; this example does not select a daemon, source, run or ports automatically.
+For an operator-attended diagnostic of the same owned scenario, use the separate `playwright.stripe-billing-first-renewal-manual.config.ts` only in a newly authorized run. It opens installed Chrome visibly, performs the original OTP/prepare/card-entry path, then waits at most three minutes for the operator to press Pay once. It never clicks Pay automatically or resumes a consumed attempt. The existing server proof and cleanup still decide acceptance; a visible form or on-screen payment message is not proof. The unattended config and default discovery remain unchanged. Do not run both configs for the same run ID.
+
+In that Chrome window, wait until the test-card fields are filled and Pay becomes enabled; then press Pay once. Do not enter a real card, refresh, open the URL in a second browser, or press Pay again. Observe the on-screen state immediately after the click; the controlled window closes when the bounded attempt finishes. Report the visible state separately from the fixed server diagnostic. The local ignored `launch-manual-next.mjs` uses the same one-shot preflight and fresh run ID as the unattended launcher but selects only this manual config; merely listing tests is never evidence of payment.
+
+A future native run requires separate approval of a clean exact source SHA, fresh UUID/resources, canonical daemon, seven free loopback ports, explicit frozen epoch, pinned account/API and budget `{clock:1,customer:1,create:1,confirm:1,advance:2}` plus one fresh product and price. Resolve and independently verify adequate native storage before requesting that run; the earlier cleanup receipt is not proof of available capacity. With those prerequisites approved, from the repository root use the **unattended invocation below, which clicks Pay automatically**. These required variables must contain the approved values; this example does not select a daemon, source, run or ports automatically. Do not use the unattended command for the manual Chrome check.
 
 ```sh
 : "${PAYMENT_STRIPE_SANDBOX_RUN_ID:?Approved fresh UUID required}"
@@ -1882,6 +1886,15 @@ export PAYMENT_STRIPE_BILLING_FIRST_RENEWAL=true
 pnpm --dir examples/demo-site exec playwright test \
   --config playwright.stripe-billing-first-renewal.config.ts
 ```
+
+For a separately authorized manual Chrome run, use the same approved environment and preflight, but invoke **only** this config instead of the unattended command:
+
+```sh
+pnpm --dir examples/demo-site exec playwright test \
+  --config playwright.stripe-billing-first-renewal-manual.config.ts
+```
+
+In this worktree the ignored `node .superpowers/sandbox-5b/launch-manual-next.mjs` performs the fresh preflight and invokes that manual config. It has not been run. Never invoke both launchers for one run ID.
 
 Export the required values before invocation. All other initial-only, billing acceptance, legacy/native, diagnostic, manual, refund and Stage4 opt-ins must be absent or false, and debug/trace controls off. The bootstrap generates the private control key and supplies only the `PAYMENT_STRIPE_BILLING_FIRST_RENEWAL_*` runtime identity fields. It builds `backend/Dockerfile.billing-first-renewal` with the exact source argument and verifies the `OwnedBillingFirstRenewalRuntime` PropertiesLauncher entrypoint, `/app/renewal-runtime` closure, source/environment identity and seven loopback ports before use. The private `withFirstRenewalRuntime` capability is unavailable on the initial-only bootstrap. The CLI provides only binding/login/listener capabilities. The demo image continues to use `billing-first-payment` mode and `/billing-first-payment.html`.
 

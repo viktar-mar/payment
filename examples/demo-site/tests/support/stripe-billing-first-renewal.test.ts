@@ -20,3 +20,11 @@ for(const stage of ['SUBMIT','TOKEN'])test('combined reporter preserves LAST_OBS
  const original=process.stdout.write,output:string[]=[];process.stdout.write=((value:unknown)=>{output.push(String(value));return true;}) as typeof process.stdout.write;
  try{new Reporter().onStdOut(line+'\n');assert.deepEqual(output,[line+'\n']);}finally{process.stdout.write=original;}
 });
+for(const code of ['BROWSER_MANUAL_PAY_ARM','BROWSER_MANUAL_PAY_WAIT'])test('combined reporter preserves bounded '+code,async()=>{
+ const {default:Reporter}=await import(new URL('./stripe-billing-first-renewal-reporter.ts',import.meta.url).href);
+ const {parseBillingFirstRenewalDiagnosticLine}=await import('../../../../infrastructure/stripe-billing-first-payment.mjs');
+ const line='owned_initial_and_first_renewal_diagnostic code='+code+' cleanup=CONFIRMED';
+ assert.ok(line.length<160);assert.equal(parseBillingFirstRenewalDiagnosticLine(line),line);
+ const original=process.stdout.write,output:string[]=[];process.stdout.write=((value:unknown)=>{output.push(String(value));return true;}) as typeof process.stdout.write;
+ try{new Reporter().onStdOut(line+'\n');assert.deepEqual(output,[line+'\n']);}finally{process.stdout.write=original;}
+});

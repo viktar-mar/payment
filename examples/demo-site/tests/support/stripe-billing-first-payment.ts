@@ -72,7 +72,7 @@ export function createFirstPaymentBridge(options: {
 }
 
 /** Genuine OTP and one real driver; settlement remains exclusively with the Node owner. */
-export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirstPaymentPort, parent: BillingLimits): Promise<true> {
+export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirstPaymentPort, parent: BillingLimits, options: {manualPay?: true} = {}): Promise<true> {
   const controller = new AbortController();
   const limits = {deadline:parent.deadline, signal:controller.signal};
   let context: BrowserContext | undefined;
@@ -207,7 +207,7 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     await at('BROWSER_NAVIGATION', () => page.goto(binding.endpoints.demo + '/billing-first-payment.html', {timeout:remaining(limits)}));
     await at('BROWSER_CONFIGURE', async () => {
       await page.waitForFunction(() => typeof (window as any).__firstPaymentConfigure === 'function', undefined, {timeout:remaining(limits)});
-      await page.evaluate(value => (window as any).__firstPaymentConfigure(value), {backend:binding.endpoints.backend, siteKey:binding.siteKey, email:binding.email, deadline:Math.min(limits.deadline, Date.now() + 300000)});
+      await page.evaluate(value => (window as any).__firstPaymentConfigure(value), {backend:binding.endpoints.backend, siteKey:binding.siteKey, email:binding.email, deadline:Math.min(limits.deadline, Date.now() + 300000), ...(options.manualPay === true ? {manualPay:true as const} : {})});
     });
     await at('BROWSER_OTP_REQUEST', async () => {
       await page.getByRole('button', {name:'Request code', exact:true}).click({timeout:remaining(limits)});
@@ -227,7 +227,7 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     });
     await at('BROWSER_WAIT_READY', async () => {
       await waitPhase('READY');
-      need(await page.getByRole('button', {name:'Pay', exact:true}).isEnabled());
+      need(await page.getByRole('button', {name:'Pay', exact:true}).isEnabled() !== (options.manualPay === true));
       ready = true;
     });
     checkpoint = 'BROWSER_CARD_NUMBER';
@@ -238,7 +238,24 @@ export async function runFirstPaymentBrowser(browser: Browser, port: BillingFirs
     checkpoint = 'BROWSER_POSTAL_CHECK';
     const postal = frame.locator('input[name="postalCode"]');
     if (await at('BROWSER_POSTAL_CHECK', () => postal.isVisible())) await at('BROWSER_POSTAL_FILL', () => postal.fill('10001', {timeout:remaining(limits)}));
-    await at('BROWSER_PAY_CLICK', () => {billingCheck(limits); payStarted = true; return page.getByRole('button', {name:'Pay', exact:true}).click({timeout:remaining(limits)});});
+    if (options.manualPay === true) {
+      await at('BROWSER_MANUAL_PAY_ARM', async () => {
+        const armed = await page.getByRole('button', {name:'Pay', exact:true}).evaluate(button => {
+          if (!(button instanceof HTMLButtonElement) || button.id !== 'pay' || !button.disabled || document.body.dataset.phase !== 'READY') return false;
+          button.disabled = false;
+          return true;
+        });
+        need(armed);
+      });
+      await at('BROWSER_MANUAL_PAY_WAIT', async () => {
+        billingCheck(limits);
+        payStarted = true;
+        await page.waitForFunction(() => ['CONFIRMING','OBSERVE','STOPPED'].includes(document.body.dataset.phase ?? ''), 'MANUAL_PAY', {timeout:Math.min(180000, limits.deadline - Date.now())});
+        need(['CONFIRMING','OBSERVE','STOPPED'].includes(await page.locator('body').getAttribute('data-phase') ?? ''));
+      });
+    } else {
+      await at('BROWSER_PAY_CLICK', () => {billingCheck(limits); payStarted = true; return page.getByRole('button', {name:'Pay', exact:true}).click({timeout:remaining(limits)});});
+    }
     await at('BROWSER_WAIT_OBSERVE', async () => {
       // This path is reachable only after this runner's original prepare and Pay.
       need(!failure && prepared && bridge && challenges === 1 && verifies === 1);

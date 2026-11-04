@@ -63,7 +63,7 @@ test('dedicated deployed page preserves real SDK OTP authority through one ready
     assert.equal(assets.get('/health'), 'ok\n');
     assert.equal(assets.has('/index.html'), false);
     browser = await chromium.launch({headless:true,args:['--disable-background-networking','--disable-component-update','--no-first-run']});
-    for (const outcome of ['OBSERVE','REQUIRES_ACTION','PAGEHIDE'] as const) {
+    for (const outcome of ['OBSERVE','REQUIRES_ACTION','PAGEHIDE','MANUAL_OBSERVE','MANUAL_NO_CLICK'] as const) {
       const id = (n: number) => '11111111-2222-4333-8444-' + String(n).padStart(12,'0');
       const origin = 'http://127.0.0.1:14173';
       const backend = 'http://127.0.0.1:18080';
@@ -85,6 +85,8 @@ test('dedicated deployed page preserves real SDK OTP authority through one ready
       const dispatches: string[] = [];
       const pendingSignals: unknown[] = [];
       const paySignals: unknown[] = [];
+      let manualWaitObserved = 0;
+      let contextCloses = 0;
       const bootstrap = {resources:()=>({cliDirectory:'/synthetic'}),prepare:async()=>true,start:async()=>true,stop:async()=>true,withFirstPaymentRuntime:async(callback:any)=>callback({endpoint:'http://127.0.0.1:18083',capability:control})};
       const owner = await createOwnedBillingFirstPayment(options, {
         preflight:async()=>true,createBootstrap:async()=>bootstrap,
@@ -104,7 +106,7 @@ test('dedicated deployed page preserves real SDK OTP authority through one ready
             const value = JSON.parse(init.body);
             assert.deepEqual(value,{attempt_id:id(9),capability:prepared.session.capability,confirmation_token:'ctoken_fixture',idempotency_key:confirmKey});
             assert.match(confirmKey,/^[0-9a-f-]{36}$/);
-            response = {...identity,phase:'OBSERVE',protocol:'SERVER_CONFIRM_V2',attempt_id:id(9),state:outcome,retry_allowed:false,successor_attempt_id:null,next_action_allowed:outcome!=='OBSERVE',expires_at:attemptExpires};
+            response = {...identity,phase:'OBSERVE',protocol:'SERVER_CONFIRM_V2',attempt_id:id(9),state:outcome.startsWith('MANUAL_') ? 'OBSERVE' : outcome,retry_allowed:false,successor_attempt_id:null,next_action_allowed:outcome==='REQUIRES_ACTION',expires_at:attemptExpires};
           } else {
             response = {...identity,phase:'SETTLED_LOCAL',period_start:new Date(1790000000000).toISOString(),paid_through:new Date(1792592000000).toISOString(),access_evaluated_at:new Date(1790000000000).toISOString(),access_valid_until:new Date(1790000300000).toISOString()};
           }
@@ -114,6 +116,26 @@ test('dedicated deployed page preserves real SDK OTP authority through one ready
       });
       const wrappedBrowser = {newContext:async(value:any)=>{
         const context = await browser!.newContext(value);
+        if (outcome === 'MANUAL_OBSERVE' || outcome === 'MANUAL_NO_CLICK') {
+          const createPage = context.newPage.bind(context);
+          context.newPage = async () => {
+            const page = await createPage();
+            const wait = page.waitForFunction.bind(page);
+            (page as any).waitForFunction = async (predicate:any, argument:any, settings:any) => {
+              if (argument === 'READY') {
+                const result = await wait(predicate,argument,settings);
+                assert.equal(await page.getByRole('button',{name:'Pay',exact:true}).isEnabled(),false);
+                return result;
+              }
+              if (argument !== 'MANUAL_PAY') return wait(predicate,argument,settings);
+              if (outcome === 'MANUAL_NO_CLICK') {manualWaitObserved++;return wait(predicate,argument,{...settings,timeout:200});}
+              const pending = wait(predicate,argument,settings);
+              await page.getByRole('button',{name:'Pay',exact:true}).click();
+              return pending;
+            };
+            return page;
+          };
+        }
         const exposeBinding = context.exposeBinding.bind(context);
         context.exposeBinding = async (name:any, callback:any) => exposeBinding(name, name === '__firstPaymentPending'
           ? (source:any, stage:unknown) => {pendingSignals.push(stage);return callback(source, stage);}
@@ -146,6 +168,7 @@ test('dedicated deployed page preserves real SDK OTP authority through one ready
         });
         const actualClose = context.close.bind(context);
         context.close = async (...args) => {
+          contextCloses++;
           for (const page of context.pages()) {
             if (page.url().startsWith(origin)) {
               // Only synthetic DOM leaves this hosted fixture; the private control
@@ -170,17 +193,23 @@ test('dedicated deployed page preserves real SDK OTP authority through one ready
         });
         return context;
       }} as any;
-      const run = owner.run((port, limits)=>runFirstPaymentBrowser(wrappedBrowser,port,limits), {deadline:Date.now()+15000});
-      if (outcome === 'OBSERVE') assert.equal((await run).initialAccepted,true);
+      const run = owner.run((port, limits)=>runFirstPaymentBrowser(wrappedBrowser,port,limits,outcome.startsWith('MANUAL_') ? {manualPay:true} : undefined), {deadline:Date.now()+15000});
+      if (outcome === 'OBSERVE' || outcome === 'MANUAL_OBSERVE') assert.equal((await run).initialAccepted,true);
       else await assert.rejects(run);
-      assert.deepEqual(dispatches,outcome === 'PAGEHIDE' ? ['create'] : ['create','confirm']);
-      assert.deepEqual(pendingSignals,outcome === 'PAGEHIDE' ? [] : ['SUBMIT',null,'TOKEN',null]);
-      assert.deepEqual(paySignals,outcome === 'PAGEHIDE' ? [] : ['ENTERED']);
-      assert.deepEqual(privatePaths,['/initial-payment/status','/initial-payment/prepare',...(outcome === 'PAGEHIDE' ? [] : ['/initial-payment/confirm']),...(outcome === 'OBSERVE' ? ['/initial-payment/observe'] : [])]);
+      assert.deepEqual(dispatches,['PAGEHIDE','MANUAL_NO_CLICK'].includes(outcome) ? ['create'] : ['create','confirm']);
+      assert.deepEqual(pendingSignals,['PAGEHIDE','MANUAL_NO_CLICK'].includes(outcome) ? [] : ['SUBMIT',null,'TOKEN',null]);
+      assert.deepEqual(paySignals,['PAGEHIDE','MANUAL_NO_CLICK'].includes(outcome) ? [] : ['ENTERED']);
+      assert.deepEqual(privatePaths,['/initial-payment/status','/initial-payment/prepare',...(['PAGEHIDE','MANUAL_NO_CLICK'].includes(outcome) ? [] : ['/initial-payment/confirm']),...(['OBSERVE','MANUAL_OBSERVE'].includes(outcome) ? ['/initial-payment/observe'] : [])]);
       assert.equal(denied,0);
       assert.equal(leaked,false);
       assert.equal(sinksClean,true);
       assert.equal(owner.resources().full5bAccepted,false);
+      if (outcome === 'MANUAL_NO_CLICK') {
+        assert.equal(manualWaitObserved,1);
+        assert.equal(contextCloses,1);
+        assert.equal(owner.resources().diagnostic,'BROWSER_MANUAL_PAY_WAIT');
+        assert.equal(owner.resources().cleanupConfirmed,true);
+      }
     }
   } finally {
     await browser?.close();
