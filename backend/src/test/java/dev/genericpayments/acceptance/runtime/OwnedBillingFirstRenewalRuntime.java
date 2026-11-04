@@ -21,6 +21,7 @@ public final class OwnedBillingFirstRenewalRuntime {
     public interface Operations extends OwnedBillingFirstPaymentRuntime.Operations {
         JsonObject boundary();
         JsonObject finalization();
+        default String boundaryFailureStage(){return "UNCLASSIFIED";}
     }
     public static OwnedBillingFirstPaymentRuntime.Admission admit(Map<String,String> env,String source) {
         try {
@@ -51,7 +52,13 @@ public final class OwnedBillingFirstRenewalRuntime {
                 if(!exchange.getRequestMethod().equals("POST")){operations.abort();OwnedBillingFirstPaymentRuntime.Handler.reply(exchange,405,OwnedBillingFirstPaymentRuntime.error("INVALID_REQUEST"));return;}
                 var body=OwnedBillingFirstPaymentRuntime.Handler.read(exchange,false);OwnedBillingFirstPaymentRuntime.fields(body,Set.of());
                 var response=path.equals("/first-renewal/boundary")?operations.boundary():operations.finalization();OwnedBillingFirstPaymentRuntime.Handler.reply(exchange,200,response);
-            }catch(Exception failure){operations.abort();OwnedBillingFirstPaymentRuntime.Handler.reply(exchange,400,OwnedBillingFirstPaymentRuntime.error("FIRST_RENEWAL_STOPPED"));}
+            }catch(Exception failure){operations.abort();var response=OwnedBillingFirstPaymentRuntime.error("FIRST_RENEWAL_STOPPED");
+                if(path.equals("/first-renewal/boundary")){
+                    String stage;try{stage=operations.boundaryFailureStage();}catch(RuntimeException ignored){stage="UNCLASSIFIED";}
+                    if(stage==null||!Set.of("INITIAL_RECEIPT","ADMISSION","CLOCK_ADVANCE","GRAPH","BOUNDARY_RESPONSE").contains(stage))stage="UNCLASSIFIED";
+                    response.addProperty("stage",stage);
+                }
+                OwnedBillingFirstPaymentRuntime.Handler.reply(exchange,400,response);}
             finally{exchange.close();}
         }
     }

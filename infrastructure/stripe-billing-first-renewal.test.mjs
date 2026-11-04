@@ -84,6 +84,8 @@ for(const [kind,reply,expected] of [
  ['http',()=>new Response('{"code":"FIRST_RENEWAL_STOPPED"}',{status:400}),'POST_CONFIRM_RENEWAL_BOUNDARY_HTTP'],
  ['response',()=>new Response('{"unexpected":"private-sentinel"}'),'POST_CONFIRM_RENEWAL_BOUNDARY_RESPONSE'],
  ['transport',()=>{throw Error('private-sentinel');},'POST_CONFIRM_RENEWAL_BOUNDARY_TRANSPORT'],
+ ['server',()=>new Response('{"code":"FIRST_RENEWAL_STOPPED","stage":"INITIAL_RECEIPT"}',{status:400}),'POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_INITIAL_RECEIPT'],
+ ['forged-stage',()=>new Response('{"code":"FIRST_RENEWAL_STOPPED","stage":"private-sentinel"}',{status:400}),'POST_CONFIRM_RENEWAL_BOUNDARY_HTTP'],
 ])test('boundary '+kind+' failure exposes only a fixed safe category',async()=>{
  const h=await runtimeHarness({route:'boundary',reply}),l=await settleClient(h.runtime);
  let rejected;try{await h.runtime.boundary(l);}catch(error){rejected=error;}
@@ -95,14 +97,14 @@ test('owner retains the fixed boundary HTTP category after cleanup',async()=>{
  const h=harness();h.bootstrap.withFirstRenewalRuntime=cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});
  const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),settled()];
  h.dependencies.createRuntime=()=>client.createBillingFirstRenewalRuntime({configuration:options(),bootstrap:h.bootstrap},{fetch:async()=>{
-  const next=replies.shift();return next?new Response(JSON.stringify(next)):new Response('{"code":"FIRST_RENEWAL_STOPPED"}',{status:400});
+  const next=replies.shift();return next?new Response(JSON.stringify(next)):new Response('{"code":"FIRST_RENEWAL_STOPPED","stage":"INITIAL_RECEIPT"}',{status:400});
  }});
  const owner=await api.createOwnedBillingFirstRenewal(options(),h.dependencies);
  await assert.rejects(owner.run(journey,limits()));const result=await owner.close();
- assert.equal(result.diagnostic,'POST_CONFIRM_RENEWAL_BOUNDARY_HTTP');assert.equal(result.cleanupConfirmed,true);
+ assert.equal(result.diagnostic,'POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_INITIAL_RECEIPT');assert.equal(result.cleanupConfirmed,true);
  assert.equal(result.initialAccepted,false);assert.equal(result.renewalAccepted,false);
  const line=api.formatBillingFirstRenewalDiagnostic(result);
- assert.equal(line,'owned_initial_and_first_renewal_diagnostic code=POST_CONFIRM_RENEWAL_BOUNDARY_HTTP cleanup=CONFIRMED');
+ assert.equal(line,'owned_initial_and_first_renewal_diagnostic code=POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_INITIAL_RECEIPT cleanup=CONFIRMED');
  assert.equal(api.parseBillingFirstRenewalDiagnosticLine(line),line);
 });
 for(const stage of ['SUBMIT','TOKEN'])test('combined owner preserves historical wait hint '+stage+' without acceptance',async()=>{

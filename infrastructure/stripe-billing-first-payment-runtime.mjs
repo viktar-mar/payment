@@ -4,7 +4,7 @@ import {validateRenewalBoundary,validateRenewalFinalization} from './stripe-bill
 import {validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 const prepareStages=new Set(['REQUEST','PREFLIGHT','CLOCK_ADMISSION','CLOCK_CREATE','CUSTOMER_CREATE','LOCAL_RESERVE','SUBSCRIPTION_CREATE','LOCAL_RECORD','RECEIPT','ACTION_SELECT','ACTION_SCOPE','ACTION_AUTHORITY','ACTION_VERIFICATION','ACTION_GRAPH','ACTION_GRAPH_LINE_ASSOCIATION','ACTION_GRAPH_INVOICE_SETTLEMENT','ACTION_GRAPH_INVOICE_SETTLEMENT_PRORATION_FLAG','ACTION_GRAPH_INVOICE_SETTLEMENT_PRORATION_KIND','ACTION_GRAPH_INVOICE_SETTLEMENT_COLLECTION_METHOD','ACTION_GRAPH_INVOICE_SETTLEMENT_PAID_OFF_STRIPE','ACTION_GRAPH_INVOICE_SETTLEMENT_OVERPAID','ACTION_GRAPH_INVOICE_SETTLEMENT_STARTING_BALANCE','ACTION_GRAPH_INVOICE_SETTLEMENT_ENDING_BALANCE','ACTION_GRAPH_INVOICE_SETTLEMENT_PRE_CREDIT_NOTES','ACTION_GRAPH_INVOICE_SETTLEMENT_POST_CREDIT_NOTES','ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_DISCOUNTS','ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_DISCOUNT_AMOUNTS','ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_PRETAX_CREDITS','ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_DISCOUNT_AMOUNTS','ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_PRETAX_CREDITS','ACTION_GRAPH_INVOICE_SETTLEMENT_TOTAL','ACTION_GRAPH_INVOICE_SETTLEMENT_SUBTOTAL','ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_AMOUNT','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_DUE_POSITIVE','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_DUE_CATALOG','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_PAID','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_REMAINING','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_STATUS','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_PAYMENT','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_TYPE','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_INTENT','ACTION_GRAPH_INVOICE_SETTLEMENT_SNAPSHOT_UNSUPPORTED','ACTION_GRAPH_INVOICE_SETTLEMENT_ACTION_OPEN_CASH','ACTION_GRAPH_INVOICE_SETTLEMENT_ACTION_OPEN','ACTION_GRAPH_PAYMENT_ALLOCATION','ACTION_GRAPH_PAYMENT_ALLOCATION_STATUS_UNAVAILABLE','ACTION_GRAPH_PAYMENT_ALLOCATION_STATUS_NOT_OPEN','ACTION_GRAPH_PAYMENT_ALLOCATION_DEFAULT_UNAVAILABLE','ACTION_GRAPH_PAYMENT_ALLOCATION_DEFAULT_NOT_TRUE','ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_REQUESTED_UNAVAILABLE','ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_REQUESTED_MISMATCH','ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_UNAVAILABLE','ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_NONZERO','ACTION_GRAPH_PAYMENT_ALLOCATION_PAYMENT_UNAVAILABLE','ACTION_GRAPH_PAYMENT_ALLOCATION_TYPE_UNAVAILABLE','ACTION_GRAPH_PAYMENT_ALLOCATION_TYPE_UNEXPECTED','ACTION_RESERVATION','ACTION_RESULT','ACTION_BINDING','SESSION_SELECT','RESPONSE_BUILD','UNCLASSIFIED']);
 const prepareCodes=new Set(['PREPARE_AUTHORITY','PREPARE_REQUEST','PREPARE_HTTP','PREPARE_RESPONSE','PREPARE_ACK',...[...prepareStages].map(s=>'PREPARE_SERVER_'+s)]);
-const renewalBoundaryCodes=new Set(['TRANSPORT','HTTP','RESPONSE'].map(stage=>'POST_CONFIRM_RENEWAL_BOUNDARY_'+stage));
+const renewalBoundaryCodes=new Set([...['TRANSPORT','HTTP','RESPONSE'].map(stage=>'POST_CONFIRM_RENEWAL_BOUNDARY_'+stage),...['INITIAL_RECEIPT','ADMISSION','CLOCK_ADVANCE','GRAPH','BOUNDARY_RESPONSE'].map(stage=>'POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_'+stage)]);
 const ownDiagnostics=new WeakMap();
 /** Only errors created here carry metadata; foreign rejections are never inspected. */
 export const billingFirstPaymentDiagnostic=error=>ownDiagnostics.get(error)??null;
@@ -36,11 +36,11 @@ function createRuntime({configuration,bootstrap},dependencies,firstRenewal){
     if(route==='prepare')checkpoint='PREPARE_REQUEST';
     result=await billingBounded(limits,async l=>{
      const response=await (dependencies.fetch??globalThis.fetch)(privateRuntime.endpoint+(['boundary','finalization'].includes(route)?'/first-renewal/':'/initial-payment/')+route,{method:body===undefined?'GET':'POST',redirect:'error',signal:l.signal,headers:{Accept:'application/json',Authorization:'Bearer '+privateRuntime.capability,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});
-     let count=0;const chunks=[];const stopped=route==='prepare'&&response.status===400;
+     let count=0;const chunks=[];const stopped=route==='prepare'&&response.status===400,boundaryStopped=route==='boundary'&&response.status===400;
      if(route==='prepare')checkpoint=response.status===200?'PREPARE_RESPONSE':'PREPARE_HTTP';
      if(route==='boundary')checkpoint=response.status===200?'POST_CONFIRM_RENEWAL_BOUNDARY_RESPONSE':'POST_CONFIRM_RENEWAL_BOUNDARY_HTTP';
      try{
-      need(response.status===200||stopped);
+      need(response.status===200||stopped||boundaryStopped);
       for await(const chunk of response.body??[]){billingCheck(l);count+=chunk.length;need(count<=16384);chunks.push(Buffer.from(chunk));}
      }finally{await response.body?.cancel().catch(()=>{});}
      billingCheck(l);need(!failed);const text=new TextDecoder('utf8',{fatal:true}).decode(Buffer.concat(chunks)),v=JSON.parse(text);
@@ -50,6 +50,12 @@ function createRuntime({configuration,bootstrap},dependencies,firstRenewal){
       need(new RegExp('^\\s*\\{\\s*'+field+'\\s*,\\s*'+field+'\\s*\\}\\s*$').test(text));
       need(exact(v,['code','stage'])&&v.code==='INITIAL_PAYMENT_STOPPED'&&prepareStages.has(v.stage));
       checkpoint='PREPARE_SERVER_'+v.stage;throw failure(checkpoint);
+     }
+     if(boundaryStopped){
+      need(/^\{"code":"FIRST_RENEWAL_STOPPED","stage":"[A-Z_]+"\}$/.test(text));
+      need(exact(v,['code','stage'])&&v.code==='FIRST_RENEWAL_STOPPED');
+      const code='POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_'+v.stage;
+      need(renewalBoundaryCodes.has(code));checkpoint=code;throw failure(code);
      }
      need(v&&v.code==='OK'&&v.run_id===c.runId);
      if(route==='boundary'||route==='finalization'){

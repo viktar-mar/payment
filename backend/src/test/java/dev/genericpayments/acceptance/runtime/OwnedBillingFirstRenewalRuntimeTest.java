@@ -58,7 +58,27 @@ class OwnedBillingFirstRenewalRuntimeTest {
             assertThatThrownBy(scenario::boundary).hasMessage("FIRST_RENEWAL_STOPPED");assertThatThrownBy(scenario::finalization).hasMessage("FIRST_RENEWAL_STOPPED");assertThat(scenario.status().get("phase").getAsString()).isEqualTo("STOPPED");assertThat(calls).isEmpty();
         }
     }
-    static final class Inert extends OwnedBillingFirstPaymentRuntimeTest.InertOperations implements OwnedBillingFirstRenewalRuntime.Operations {
+    @Test void boundaryFailureReturnsOnlyFixedStageWithoutExceptionText() throws Exception {
+        var now=Instant.now();var admitted=OwnedBillingFirstRenewalRuntime.admit(environment(),"a".repeat(40));
+        var scenario=new OwnedBillingFirstRenewalScenario(admitted,t->{throw new IllegalStateException("private-sentinel");},Clock.fixed(now,ZoneOffset.UTC),now.plusSeconds(120));
+        var x=new OwnedBillingFirstPaymentRuntimeTest.MemoryExchange("POST","/first-renewal/boundary","{}",true);
+        new OwnedBillingFirstRenewalRuntime.Handler(scenario,"q".repeat(43)).handle(x);
+        assertThat(x.code).isEqualTo(400);
+        assertThat(x.output.toString()).isEqualTo("{\"code\":\"FIRST_RENEWAL_STOPPED\",\"stage\":\"INITIAL_RECEIPT\"}");
+        assertThat(x.output.toString()).doesNotContain("private-sentinel");
+        assertThat(scenario.status().get("phase").getAsString()).isEqualTo("STOPPED");
+    }
+    @Test void malformedBoundaryStageFallsBackToUnclassified() throws Exception {
+        var ops=new Inert(){
+            @Override public JsonObject boundary(){throw new IllegalStateException("private-sentinel");}
+            @Override public String boundaryFailureStage(){return null;}
+        };
+        var x=new OwnedBillingFirstPaymentRuntimeTest.MemoryExchange("POST","/first-renewal/boundary","{}",true);
+        new OwnedBillingFirstRenewalRuntime.Handler(ops,"q".repeat(43)).handle(x);
+        assertThat(x.code).isEqualTo(400);
+        assertThat(x.output.toString()).isEqualTo("{\"code\":\"FIRST_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}");
+    }
+    static class Inert extends OwnedBillingFirstPaymentRuntimeTest.InertOperations implements OwnedBillingFirstRenewalRuntime.Operations {
         int boundaries,finals;
         public JsonObject boundary(){boundaries++;return new JsonObject();}
         public JsonObject finalization(){finals++;return new JsonObject();}

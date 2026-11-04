@@ -24,6 +24,7 @@ public final class OwnedBillingFirstRenewalScenario implements OwnedBillingFirst
     private final Clock utc;private final Instant deadline;
     private final AtomicBoolean busy=new AtomicBoolean();
     private volatile String phase="INITIAL";
+    private volatile String boundaryFailureStage="UNCLASSIFIED";
     private Admission admission;private Boundary boundary;
     public OwnedBillingFirstRenewalScenario(OwnedBillingFirstPaymentRuntime.Admission owner,Function<Class<?>,Object> beans,Clock utc,Instant deadline) {
         this.owner=Objects.requireNonNull(owner);this.beans=Objects.requireNonNull(beans);this.utc=Objects.requireNonNull(utc);this.deadline=Objects.requireNonNull(deadline);
@@ -42,18 +43,24 @@ public final class OwnedBillingFirstRenewalScenario implements OwnedBillingFirst
     @Override public JsonObject confirm(JsonObject request){return initial(()->initial.confirm(request));}
     @Override public JsonObject observe(){return initial(initial::observe);}
     @Override public JsonObject status(){if(!utc.instant().isBefore(deadline))abort();var response=initial.status();if(!phase.equals("INITIAL")){response.addProperty("phase",phase);response.addProperty("code",phase.equals("STOPPED")?"FIRST_RENEWAL_STOPPED":"OK");}return response;}
+    @Override public String boundaryFailureStage(){return boundaryFailureStage;}
     @Override public JsonObject boundary(){return invoke(()->{
         begin("INITIAL","BOUNDARY_RUNNING");
+        boundaryFailureStage="INITIAL_RECEIPT";
         var receipt=initial.settledReceipt();initial.authenticatedView();var scope=receipt.intent().clock().owner();
         require(scope.run().equals(owner.run())&&scope.initialFrozenTime()==owner.frozen());
         var terms=receipt.intent().terms();require(terms.regularAmount().minorUnits()==2000&&terms.regularAmount().currency().equals("EUR")&&terms.interval()==dev.genericpayments.platform.catalog.domain.BillingInterval.MONTH&&terms.trialDays()==0&&terms.taxMode()==dev.genericpayments.platform.catalog.domain.TaxMode.INCLUSIVE);
+        boundaryFailureStage="ADMISSION";
         check();admission=new OwnedFirstRenewalAdmissionService(bean(OwnedFirstRenewalStore.class),bean(SubscriptionTransactionPort.class),bean(SubscriptionOperationStore.class),bean(SubscriptionLifecycleLockPort.class),bean(LockPaymentAccountPort.class),bean(SubscriptionStore.class),utc).admit(receipt,owner.source());
         require(admission.receipt().equals(receipt)&&admission.sourceSha().equals(owner.source()));
+        boundaryFailureStage="CLOCK_ADVANCE";
         check();var ready=advance().advance(admission,Step.BOUNDARY);
+        boundaryFailureStage="GRAPH";
         check();var observation=observer().observe(admission,ready);
         require(observation instanceof Pending);var pending=(Pending)observation;boundary=pending.boundary();
         require(pending.admission().equals(admission)&&pending.ready().equals(ready)&&boundary.equals(bean(OwnedFirstRenewalStore.class).boundary(admission))
             &&boundary.period().start().equals(Instant.ofEpochSecond(receipt.periodEnd()))&&boundary.period().start().plusSeconds(3600).isBefore(boundary.period().end()));
+        boundaryFailureStage="BOUNDARY_RESPONSE";
         begin("BOUNDARY_RUNNING","RENEWAL_BOUNDARY");var response=status();response.addProperty("renewal_admission_id",admission.id().toString());response.addProperty("boundary_time",boundary.period().start().toString());response.addProperty("period_start",boundary.period().start().toString());response.addProperty("period_end",boundary.period().end().toString());return response;
     });}
     @Override public JsonObject finalization(){return invoke(()->{
