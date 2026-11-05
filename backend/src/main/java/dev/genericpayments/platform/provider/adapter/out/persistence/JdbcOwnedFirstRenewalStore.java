@@ -258,6 +258,52 @@ public class JdbcOwnedFirstRenewalStore implements OwnedFirstRenewalStore {
             ((Number)row.get("projected_revision")).longValue(),((Timestamp)row.get("published_at")).toInstant()));
     }
 
+    /** Immutable predecessor reload for the failed-renewal lane. This does not assert live authority. */
+    static void requireStoredFailedPredecessor(JdbcTemplate jdbc, Admission admission, LaterReady ready, Boundary boundary) {
+        requireStoredFailedIdentity(jdbc, admission, ready, boundary);
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                select exists(select 1 from owned_first_renewal_step_evidence(?) first_step
+                  join owned_first_renewal_step_evidence(?) final_step on final_step.ordinal=2
+                  where first_step.ordinal=1 and first_step.ready_id=? and final_step.ready_id=?
+                    and final_step.step_id=? and exists(select 1 from stripe_billing_first_renewal_steps s
+                      where s.id=final_step.step_id and s.boundary_id=? and s.predecessor_ready=first_step.ready_id))
+                """, Boolean.class, admission.id(), admission.id(), boundary.ready().id(), ready.id(),
+                ready.ack().advance().id(), boundary.id()))) throw unavailable();
+    }
+
+    /** Descriptive identity only, also valid after live authority is revoked. */
+    static void requireStoredFailedIdentity(JdbcTemplate jdbc, Admission admission, LaterReady ready, Boundary boundary) {
+        requireTransaction();
+        if (admission == null || ready == null || boundary == null) throw unavailable();
+        var store = new JdbcOwnedFirstRenewalStore(jdbc);
+        store.requireStoredOriginal(admission.receipt());
+        if (store.admissionRow(admission.receipt()).filter(admission::equals).isEmpty()
+                || !admission.fingerprint().equals(admissionFingerprint(admission.id(), admission.receipt(), admission.sourceSha(),
+                    admission.root(), admission.attempt(), admission.attemptVersion(), admission.bill(), admission.billVersion(),
+                    admission.payment(), admission.paymentVersion(), admission.invoice(), admission.allocation(), admission.paymentIntent(),
+                    admission.subscriptionRevision(), admission.policyVersion(), admission.admittedAt()))
+                || store.readyRow(admission, ready.ack().advance().id()).filter(ready::equals).isEmpty()
+                || store.boundaryRow(admission).filter(boundary::equals).isEmpty()) throw unavailable();
+        var boundaryClaim = store.readClaimRow(admission, boundary.ready()).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+        requireBoundary(admission, boundary, boundaryClaim);
+    }
+
+    static OwnedFailedRenewal.Admission storedFailedAdmission(JdbcTemplate jdbc, UUID id) {
+        requireTransaction();
+        var store = new JdbcOwnedFirstRenewalStore(jdbc);
+        return jdbc.query("""
+                select d.*, r.step_id from stripe_billing_failed_renewals d
+                join stripe_billing_first_renewal_ready r on r.id=d.ready_id and r.admission_id=d.first_renewal_admission
+                where d.id=?
+                """, (r, n) -> {
+            var upstream = admissionForAdvance(jdbc, new PaymentAccountId(r.getObject("payment_account_id",UUID.class)), r.getObject("step_id",UUID.class));
+            var ready = store.readyRow(upstream,r.getObject("step_id",UUID.class)).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+            var boundary = store.boundaryRow(upstream).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+            if (!boundary.id().equals(r.getObject("boundary_id",UUID.class))) throw unavailable();
+            return new OwnedFailedRenewal.Admission(id,upstream,ready,boundary,r.getString("source_sha"),r.getTimestamp("admitted_at").toInstant());
+        },id).stream().findFirst().orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
+    }
+
     private OwnedClockSubscriptionReceipt requireOriginal(OwnedClockSubscriptionReceipt expected){
         requireStoredOriginal(expected);
         var i=expected.intent();var o=i.clock().owner();

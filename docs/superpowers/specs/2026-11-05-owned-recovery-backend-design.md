@@ -1,0 +1,48 @@
+# Owned failed-renewal recovery backend integration
+
+## Goal and scope
+
+Implement a real internal backend slice: durable failed-renewal ownership, one-use observation claims, publication of OPEN debt through the existing fact service, explicit reservation/association of one RECOVER operation to the original invoice/allocation/PI, and recovered CASH publication through the same fact/cash/event/outbox services. This is not another transcript validator. The user authorizes uninterrupted offline implementation, tests and independent review, but no Docker/Sandbox or old-operation reuse.
+
+The component accepts trusted normalized provider observations. Producing those observations from actual Stripe, confirming a method/payment in a browser, native clock advances and runtime/endpoint registration are separate unsupported boundaries. Do not claim native or SQL execution from source/unit tests. Stage5B remains NOT_ACCEPTED.
+
+## Existing behavior that remains closed
+
+- Ordinary Stripe ownership still rejects owned-clock customers. Ordinary recovery/scheduler/client-session paths are unchanged.
+- V30–V33 and existing successful renewal mapper/publication/SQL contracts remain byte-identical. New additive V34 may add exclusion triggers to existing tables, never broaden successful publication semantics.
+- Query projection continues hiding financial commands under isolated time. Default Spring FactService constructors deny isolated RECOVER. Only an explicit constructor with a persisted-proof port can admit the exact new recovery publication.
+- No default bean, registry, endpoint, scheduler, native exporter, browser or infrastructure activation. No invoice.pay, provider confirm, new subscription/invoice/PI, automatic retry or old UNKNOWN/DISPATCHING continuation.
+
+## Durable lineage and phases
+
+Use the already verified genuine paid-initial `OwnedFirstRenewal.Admission`, its FINALIZATION LaterReady and Boundary as immutable upstream provenance. Claim the failed branch while `owned_first_renewal_original` still authenticates, before any finalization graph claim or success publication. Exclusivity is permanent, including stopped attempts; a V34 trigger rejects V33 success publication/read ownership after failed-branch admission. Both branch decisions must serialize on the existing lifecycle/admission locks.
+
+New `OwnedFailedRenewal` records describe Admission, Phase(FAILED/RECOVERED), ReadClaim, FailedEvidence, Failure, Recovery, RecoveredEvidence and Publication. Records alone confer no authority. Every store/consumer reloads exact persisted relations. Source is the same 40-hex upstream source, owner/account/site/customer/subscription/terms are unchanged. Bind amount/currency/recurring interval to the genuine original published price and paid receipt, never to a hardcoded EUR20 production constant; quantity1, trial0, one unchanged item; no tax/credits/proration/change/trial/cancellation. EUR20 remains the separately authorized future acceptance scenario, not a limit on the generic backend. Existing genuine hosted fixtures may keep their original EUR10 price.
+
+Read claims are append-only, unique per admission/phase, contain an invocation, exact current revision/observation sequence and optional exact operation/version, and have a fixed 30-second UTC acceptance window. No renewal, takeover or replacement. FAILED uses its own exclusive claim; it cannot coexist with a V33 FINALIZATION graph claim. Trust the normalized producer boundary but validate all local identity, time and shape fields.
+
+Failure requires PAST_DUE, unchanged initial CASH and exactly one new OPEN renewal matching Boundary invoice/period, no renewal succeeded cash, and a separately supplied existing allocation/PI different from the initial PI. Snapshot observation/acceptance times are operational UTC within the claim window; lifecycle evaluation is the separate authenticated isolated billing sample. Store the actual resulting debt bill/version, captured grace deadline, projected revision/sequence, invoice/allocation/PI and UTC receipt atomically with fact application. OPEN alone is not native decline proof.
+
+Recovery is an explicit separate internal call after failure. Create one real SubscriptionOperation RECOVER with a new UUID, internal admission authority scope, immutable request fingerprint `v1.recover.<same-bill>.<hash>` and standard provider operation key. Persist the exact existing association in `stripe_subscription_recovery_proofs` with pay_step NULL in the SAME caller transaction. Do not call its existing REQUIRES_NEW adapter inside lifecycle locks. Verify current OPEN debt and no other action root/recovery proof/dispatched INVOICE_PAY owns the invoice. A duplicate reservation returns no new authority; uncertainty consumes the admission and cannot generate a successor.
+
+Recovered evidence requires ACTIVE, same period/terms/renewal invoice and same associated PI, full one-object succeeded cash of the immutable price's positive amount/currency on that renewal, unchanged original initial CASH, exact RECOVER operation key and APPLIED marker. Accept no unrelated recovery observations. Publication applies real facts and records the resulting bill/payment/revision only after the RECOVER operation is SUCCEEDED and debt clears. Setup/association/ACK alone do not pay debt or grant access. Signed callbacks remain produced by normal outbox delivery; source/unit checks are not delivery proof.
+
+## Persistence and service
+
+Add six append-only V34 relations: failed admission, reads, failures, recoveries, publications, terminal stops. Use composite owner FKs, exact uniqueness, constrained phases/reasons, immutable metadata and guarded inserts. Admission authenticates original paid/clock/ready/boundary relations; later current authority authenticates both original evidence and the exact new local debt/recovery/post-publication state, active account/site/customer/catalog/policy/credentials and absence of stop/conflict. Do not use V33 success-only `requirePaid` after failure or treat immutable identity alone as live authority.
+
+`OwnedFailedRenewalStore` has concrete caller-transaction methods for admit/current/read claim/read reload/failure record+reload/recovery association+reload/publication record+reload/stop and the fact proof check. JDBC asserts caller transaction, normalizes UTC to microseconds, never starts provider work or nested REQUIRES_NEW under lifecycle locks. Immutable stop receipt is written in a separate outer requiresNew only AFTER failed work unwinds. It survives rollback of a failed projection.
+
+`OwnedFailedRenewalService` exposes admit, beginFailedRead, publishFailure, reserveExistingRecovery, beginRecoveredRead, publishRecovery, replayPublication (read only) and stop. Acquire sorted operation locks, Site/Customer lifecycle, Account, Subscription, then bill; use existing observation CAS/fences. For a fresh RECOVER, insert/claim that operation BEFORE lifecycle/Account/Subscription/bill locks in the same outer transaction, then revalidate all conditions after locking (the operation FK otherwise inverts the existing lock order). Facts, ordinary association row and new receipts commit atomically; any drift/failure rolls back all writes. Unknown consumes rather than resumes. All provider reads belong outside transactions and are not performed by this component.
+
+Authenticate immutable upstream READY/ACK/Boundary using their actual immutable evidence relations, such as `owned_first_renewal_step_evidence`, independently of mutable debt/recovery revision. `owned_first_renewal_chain` also binds mutable projection state and cannot be reused after failure as immutable lineage proof. Immutable identity alone remains insufficient: the new lane must additionally authenticate its exact live local phase and authority.
+
+`SubscriptionIsolatedRecoveryProofPort` defaults to deny. Explicit FactService construction may supply a concrete persisted-proof adapter that verifies Command.factKey, owner, source, active recovered ReadClaim, entire fence, exact operation/debt/association/snapshot before CAS/cash effects. Preserve all common isolated constraints; allow only one exact authorized RECOVER plus existing harmless CREATE/RECONCILE. A caller flag or bare normalized snapshot is insufficient. Existing constructors/Spring wiring keep denial.
+
+No production time selector or native time claim is added now. Hosted composition may inject an exact-owner test billing sample at E+3600/G-1/G/G+1 while operational UTC stays real. Admission must not fall into ordinary time if the new explicit component is used; service/proof requires an isolated owner sample, with fixed valid boundary and debt-period checks. Future native time requires its own persisted provider readiness proof.
+
+## Verification and completion limits
+
+Pure tests execute real service/domain behavior with storage/transaction boundaries faked only where needed, including no provider-in-transaction, same debt/PI, fixed grace, default denial, first failure, duplicate/read expiry/fence drift and no effects on invalid inputs. Author genuine hosted JDBC/FactService/cash/outbox composition and race/rollback tests; compile but do not execute them locally. No default Maven test discovery (Testcontainers); cached compile and explicitly audited pure JUnit only. Preserve historical migrations, scopes and every operational artifact.
+
+Backend implementation completion is distinct from hosted SQL pass and native acceptance. Document executed pure tests, authored/unexecuted SQL composition and remaining raw-provider/time/confirmation/runtime gaps separately.
