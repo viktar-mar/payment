@@ -18,7 +18,8 @@ import static org.assertj.core.api.Assertions.*;
 class StripeBillingFirstRenewalAdvanceTest {
     private final StripeBillingInertSdkFixture f=new StripeBillingInertSdkFixture();
     private final Instant at=Instant.parse("2026-11-01T12:00:00Z");
-    private final Clock utc=Clock.fixed(at,ZoneOffset.UTC);
+    private final InertTime time=new InertTime();
+    private final Clock utc=time;
     private ProviderOperation operation;
     private LaterReady saved;
     private boolean stopped;
@@ -28,7 +29,14 @@ class StripeBillingFirstRenewalAdvanceTest {
     private final List<Thread> stageThreads=new ArrayList<>();
     private String failAt;
     private final RuntimeException privateFailure=new IllegalStateException("private-provider-sentinel");
-    private java.util.function.LongSupplier nanos=System::nanoTime;
+    private java.util.function.LongSupplier nanos=time::nanos;
+    private java.util.function.Consumer<Duration> wait=time::waitFor;
+    private java.util.function.Consumer<String> checkpoint=ignored->{};
+    private Runnable preparing=()->{};
+    private Duration claimLease=Duration.ofSeconds(60);
+    private ProviderOperation acquiredClaim;
+    private Ack acknowledged;
+    private Long readyAtNanos;
     private Runnable afterReady=()->{};
     private void fail(String location){if(location.equals(failAt))throw privateFailure;}
     private BillingInterval interval=BillingInterval.MONTH;
@@ -48,26 +56,159 @@ class StripeBillingFirstRenewalAdvanceTest {
         var store=StripeBillingInertSdkFixture.port(OwnedFirstRenewalStore.class,call->{var a=call.args();return switch(call.name()){
             case "requireCurrent"->{fail("AUTHORITY");if(authorityFailure!=null)throw authorityFailure;if(stopped)throw new IllegalStateException("stopped");yield admission;}
             case "ready"->Optional.ofNullable(saved);
-            case "prepare"->{fail("PREPARE");yield advance;}
-            case "recordReady"->{fail("READY_STORE");writes++;saved=new LaterReady(id(22),admission.id(),(Ack)a[0],(TestClockReady)a[1],(Instant)a[2]);afterReady.run();yield saved;}
+            case "prepare"->{fail("PREPARE");preparing.run();yield advance;}
+            case "recordReady"->{fail("READY_STORE");assertThat(a[0]).isSameAs(acknowledged);writes++;saved=new LaterReady(id(22),admission.id(),(Ack)a[0],(TestClockReady)a[1],(Instant)a[2]);afterReady.run();yield saved;}
             case "stop"->{stopped=true;yield null;}
             default->throw new AssertionError("Unexpected owned call "+call.name());};});
         var steps=StripeBillingInertSdkFixture.port(ProviderOperationStore.class,call->{var a=call.args();return switch(call.name()){
             case "reserveOwnedFirstRenewalAdvance"->{fail("RESERVE");
                 if(operation==null)operation=new ProviderOperation(id(23),f.account.id(),f.account.externalAccountId(),f.account.credentialsRef(),ProviderOperation.Kind.valueOf("TEST_CLOCK_ADVANCE"),
                     advance.id(),advance.operationKey(),advance.fingerprint(),ProviderOperation.Status.RESERVED,null,null,null,null,null,0);yield operation;}
-            case "claim"->{fail("CLAIM");claims++;if(operation.firstDispatchedAt()!=null)yield Optional.empty();operation=StripeBillingInertSdkFixture.copy(operation,ProviderOperation.Status.DISPATCHING,null,at,at.plusSeconds(82800),(String)a[1],at.plusSeconds(60),1);yield Optional.of(operation);}
-            case "acknowledgeOwnedFirstRenewalAdvance"->{fail("ACK_STORE");acks++;var claim=operation;operation=StripeBillingInertSdkFixture.copy(operation,ProviderOperation.Status.ACKNOWLEDGED,"clock_owned",at,at.plusSeconds(82800),null,null,2);yield new Ack(advance,operation,claim.leaseOwner(),claim.leaseExpiresAt(),(TestClockAck)a[2],(Instant)a[3]);}
+            case "claim"->{fail("CLAIM");claims++;if(operation.firstDispatchedAt()!=null)yield Optional.empty();assertThat(a[2]).isEqualTo(utc.instant());assertThat(a[3]).isEqualTo(Duration.ofSeconds(60));
+                var now=(Instant)a[2];operation=StripeBillingInertSdkFixture.copy(operation,ProviderOperation.Status.DISPATCHING,null,now,now.plusSeconds(82800),(String)a[1],now.plus(claimLease),1);acquiredClaim=operation;yield Optional.of(operation);}
+            case "acknowledgeOwnedFirstRenewalAdvance"->{fail("ACK_STORE");acks++;assertThat(a[1]).isSameAs(acquiredClaim);var claim=operation;operation=StripeBillingInertSdkFixture.copy(operation,ProviderOperation.Status.ACKNOWLEDGED,"clock_owned",claim.firstDispatchedAt(),claim.retryBefore(),null,null,2);acknowledged=new Ack(advance,operation,claim.leaseOwner(),claim.leaseExpiresAt(),(TestClockAck)a[2],(Instant)a[3]);yield acknowledged;}
             case "findById"->Optional.ofNullable(operation);
             case "unknown"->{unknownAttempts++;
                 if(operation.status()!=ProviderOperation.Status.DISPATCHING||!Objects.equals(operation.leaseOwner(),a[1])||operation.version()!=(long)a[2])throw new IllegalStateException("inert lost claim");
-                operation=StripeBillingInertSdkFixture.copy(operation,ProviderOperation.Status.UNKNOWN,null,at,at.plusSeconds(82800),null,null,2);yield operation;}
+                operation=StripeBillingInertSdkFixture.copy(operation,ProviderOperation.Status.UNKNOWN,null,operation.firstDispatchedAt(),operation.retryBefore(),null,null,2);yield operation;}
             default->throw new AssertionError("Unexpected operation call "+call.name());};});
         var accounts=StripeBillingInertSdkFixture.port(dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort.class,call->{fail("ACCOUNT");return Optional.of(f.account);});
         var clients=new dev.genericpayments.platform.provider.adapter.out.stripe.StripeClientFactory(){
             @Override public com.stripe.StripeClient create(dev.genericpayments.platform.provider.adapter.out.stripe.StripeCredentials credentials){fail("CLIENT");return f.clients.create(credentials);}
         };
-        return new StripeBillingFirstRenewalAdvanceAdapter(f.credentials,clients,accounts,steps,store,utc,nanos,stage->{stages.add(stage);stageThreads.add(Thread.currentThread());});
+        return new StripeBillingFirstRenewalAdvanceAdapter(f.credentials,clients,accounts,steps,store,utc,nanos,wait,stage->{
+            stages.add(stage);stageThreads.add(Thread.currentThread());checkpoint.accept(stage);
+            if(stage.equals("CLOCK_ADVANCE_POLL_READ")&&readyAtNanos!=null)
+                f.http.reply(clock(time.nanos()>=readyAtNanos?1700003600:1700000000,time.nanos()>=readyAtNanos?"ready":"advancing"));
+        });
+    }
+    /** Both original time sources move together; wait runs only on the calling thread. */
+    private final class InertTime extends Clock {
+        private final java.util.concurrent.atomic.AtomicLong elapsed=new java.util.concurrent.atomic.AtomicLong();
+        private final List<Duration> waits=new ArrayList<>();
+        private final List<Thread> waitThreads=new ArrayList<>();
+        long nanos(){return elapsed.get();}
+        void advance(Duration duration){elapsed.addAndGet(duration.toNanos());}
+        void waitFor(Duration duration){waits.add(duration);waitThreads.add(Thread.currentThread());advance(duration);}
+        @Override public Instant instant(){return at.plusNanos(nanos());}
+        @Override public ZoneId getZone(){return ZoneOffset.UTC;}
+        @Override public Clock withZone(ZoneId zone){return Clock.fixed(instant(),zone);}
+    }
+    private StripeBillingFirstRenewalAdvanceAdapter timedAdapter(Admission admission,long readyAfterSeconds) {
+        readyAtNanos=Duration.ofSeconds(readyAfterSeconds).toNanos();
+        f.http.reply(clock(1700000000,"ready"));f.http.reply(clock(1700000000,"advancing"));
+        return adapter(admission);
+    }
+    private void boundedOriginalAuthority(Admission admission) {
+        assertThat(time.waits).allMatch(d->d.compareTo(Duration.ofMillis(250))>=0).hasSizeLessThanOrEqualTo(12);
+        assertThat(time.waitThreads).allMatch(t->t==Thread.currentThread());
+        assertThat(stageThreads).allMatch(t->t==Thread.currentThread());
+        assertThat(claims).isEqualTo(1);assertThat(acks).isEqualTo(1);
+        assertThat(acknowledged.claimant()).isEqualTo(acquiredClaim.leaseOwner());
+        assertThat(acknowledged.deadline()).isEqualTo(acquiredClaim.leaseExpiresAt());
+        assertThat(acknowledged.operation().operationKey()).isEqualTo(acquiredClaim.operationKey());
+        assertThat(f.http.calls.stream().filter(c->c.method().name().equals("POST"))).hasSize(1);
+        var post=f.http.calls.get(1);
+        assertThat(post.headers().map().get("Idempotency-Key")).containsExactly("billing-renewal-advance-v1:"+admission.id()+":1");
+        for(var request:f.http.calls){assertThat(request.options().getMaxNetworkRetries()).isZero();
+            assertThat(request.options().getConnectTimeout()).isBetween(1,2000);assertThat(request.options().getReadTimeout()).isBetween(1,2000);}
+    }
+    @Test void firstPollReadyKeepsQuarterSecondFastPath() {
+        var admission=admission();var result=timedAdapter(admission,0).advance(admission,Step.BOUNDARY);
+        assertThat(result).isSameAs(saved);assertThat(time.nanos()).isEqualTo(250_000_000L);
+        assertThat(time.waits).containsExactly(Duration.ofMillis(250));assertThat(f.http.calls).hasSize(3);
+        boundedOriginalAuthority(admission);
+    }
+    @Test void readyAtSixSecondsIsObservedInsideOriginalBudget() {
+        var admission=admission();var adapter=timedAdapter(admission,6);var result=new AtomicReference<LaterReady>();
+        var failure=catchThrowable(()->result.set(adapter.advance(admission,Step.BOUNDARY)));
+        assertThat(failure).as("READY at 6s must be observed; elapsed=%s, waits=%s, SDK requests=%s, last stage=%s",
+            Duration.ofNanos(time.nanos()),time.waits.size(),f.http.calls.size(),stages.getLast()).isNull();
+        assertThat(result.get()).isSameAs(saved);assertThat(time.nanos()).isBetween(6_000_000_000L,29_999_999_999L);
+        assertThat(time.waits).hasSize(4);assertThat(f.http.calls).hasSize(6);
+        assertThat(writes).isEqualTo(1);assertThat(stopped).isFalse();boundedOriginalAuthority(admission);
+    }
+    @Test void alwaysAdvancingUsesTwelvePacedReadsThenStopsWithoutReplaying() {
+        var admission=admission();var adapter=timedAdapter(admission,60);
+        assertThatThrownBy(()->adapter.advance(admission,Step.BOUNDARY)).isInstanceOf(RuntimeException.class);
+        assertThat(time.waits).hasSize(12);assertThat(time.nanos()).isEqualTo(28_000_000_000L);
+        assertThat(f.http.calls).hasSize(14);assertThat(writes).isZero();assertThat(stopped).isTrue();
+        assertThat(stages).last().isEqualTo("CLOCK_ADVANCE_POLL_EXHAUSTED");
+        assertThat(operation.status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
+        assertThat(unknownAttempts).isEqualTo(1);boundedOriginalAuthority(admission);
+        assertThatThrownBy(()->adapter.advance(admission,Step.BOUNDARY)).isInstanceOf(RuntimeException.class);
+        assertThat(f.http.calls).hasSize(14);assertThat(claims).isEqualTo(1);assertThat(acks).isEqualTo(1);
+    }
+    @Test void preparationAndPostTimeReduceScheduleWithoutRestartingInvocation() {
+        preparing=()->time.advance(Duration.ofSeconds(5));
+        checkpoint=stage->{if(stage.equals("CLOCK_ADVANCE_POST"))f.http.afterResponse=()->time.advance(Duration.ofSeconds(1));};
+        var admission=admission();var adapter=timedAdapter(admission,60);
+        assertThatThrownBy(()->adapter.advance(admission,Step.BOUNDARY)).isInstanceOf(RuntimeException.class);
+        assertThat(time.waits).hasSize(12).startsWith(Duration.ofMillis(250),Duration.ofNanos(1_977_272_727L));
+        assertThat(time.nanos()).isEqualTo(28_000_000_000L);
+        assertThat(acquiredClaim.leaseExpiresAt()).isEqualTo(at.plusSeconds(65));
+        assertThat(f.http.calls).hasSize(14);assertThat(writes).isZero();boundedOriginalAuthority(admission);
+    }
+    @Test void successfulReadyAfterPreparationKeepsOriginalDispatchAndAckLineage() {
+        preparing=()->time.advance(Duration.ofSeconds(5));
+        checkpoint=stage->{if(stage.equals("CLOCK_ADVANCE_POST"))f.http.afterResponse=()->time.advance(Duration.ofSeconds(1));};
+        var admission=admission();var result=timedAdapter(admission,6).advance(admission,Step.BOUNDARY);
+        assertThat(result).isSameAs(saved);assertThat(time.nanos()).isEqualTo(6_250_000_000L);
+        assertThat(result.ack().operation().firstDispatchedAt()).isEqualTo(at.plusSeconds(5));
+        assertThat(result.ack().operation().retryBefore()).isEqualTo(at.plusSeconds(82805));
+        assertThat(result.ack().deadline()).isEqualTo(at.plusSeconds(65));
+        assertThat(f.http.calls).hasSize(3);assertThat(writes).isEqualTo(1);boundedOriginalAuthority(admission);
+    }
+    @Test void shorterOriginalLeaseSetsPacedScheduleInsteadOfMonotonicCeiling() {
+        claimLease=Duration.ofSeconds(6);
+        var admission=admission();var adapter=timedAdapter(admission,60);
+        assertThatThrownBy(()->adapter.advance(admission,Step.BOUNDARY)).isInstanceOf(RuntimeException.class);
+        assertThat(time.waits).hasSize(12).startsWith(Duration.ofMillis(250),Duration.ofNanos(340_909_090L));
+        assertThat(time.nanos()).isEqualTo(4_000_000_000L);
+        assertThat(acknowledged.deadline()).isEqualTo(at.plusSeconds(6));
+        assertThat(f.http.calls).hasSize(14);assertThat(writes).isZero();assertThat(stopped).isTrue();
+        boundedOriginalAuthority(admission);
+    }
+    @Test void originalShortLeaseLimitsPollingAndShrinksLastSdkAllowance() {
+        claimLease=Duration.ofMillis(2800);
+        var admission=admission();var adapter=timedAdapter(admission,60);
+        assertThatThrownBy(()->adapter.advance(admission,Step.BOUNDARY)).isInstanceOf(RuntimeException.class);
+        assertThat(time.nanos()).isEqualTo(2_750_000_000L);assertThat(time.waits).hasSize(11);
+        assertThat(acknowledged.deadline()).isEqualTo(at.plusMillis(2800));
+        assertThat(f.http.calls).hasSize(13);assertThat(f.http.calls.getLast().options().getReadTimeout()).isEqualTo(50);
+        assertThat(stages).last().isEqualTo("CLOCK_ADVANCE_POLL_WAIT");
+        assertThat(writes).isZero();assertThat(stopped).isTrue();boundedOriginalAuthority(admission);
+    }
+    @Test void waitEqualToRemainingLeaseIsRefusedBeforeSleepOrPoll() {
+        claimLease=Duration.ofMillis(250);
+        var admission=admission();var adapter=timedAdapter(admission,0);
+        assertThatThrownBy(()->adapter.advance(admission,Step.BOUNDARY)).isInstanceOf(RuntimeException.class);
+        assertThat(time.waits).isEmpty();assertThat(f.http.calls).hasSize(2);assertThat(writes).isZero();
+        assertThat(stopped).isTrue();boundedOriginalAuthority(admission);
+    }
+    @Test void oversleepCannotDispatchPollOrPersistReady() {
+        wait=duration->{time.waitFor(duration);time.advance(Duration.ofSeconds(30));};
+        var admission=admission();var adapter=timedAdapter(admission,0);
+        assertThatThrownBy(()->adapter.advance(admission,Step.BOUNDARY)).isInstanceOf(RuntimeException.class);
+        assertThat(f.http.calls).hasSize(2);assertThat(writes).isZero();assertThat(stopped).isTrue();
+        assertThat(stages).last().isEqualTo("CLOCK_ADVANCE_POLL_WAIT");boundedOriginalAuthority(admission);
+    }
+    @Test void interruptedWaitPreservesInterruptAndCannotDispatchPoll() {
+        wait=duration->{time.waitFor(duration);Thread.currentThread().interrupt();};
+        var admission=admission();var adapter=timedAdapter(admission,0);
+        try {
+            assertThatThrownBy(()->adapter.advance(admission,Step.BOUNDARY)).isInstanceOf(RuntimeException.class);
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+            assertThat(f.http.calls).hasSize(2);assertThat(writes).isZero();assertThat(stopped).isTrue();
+            boundedOriginalAuthority(admission);
+        } finally {Thread.interrupted();}
+    }
+    @Test void authorityDriftDuringWaitCannotDispatchAnotherSdkCall() {
+        wait=duration->{time.waitFor(duration);authorityFailure=new AuthorityDrift();};
+        var admission=admission();var adapter=timedAdapter(admission,0);
+        assertThatThrownBy(()->adapter.advance(admission,Step.BOUNDARY)).isInstanceOf(AuthorityDrift.class);
+        assertThat(f.http.calls).hasSize(2);assertThat(writes).isZero();assertThat(stopped).isTrue();
+        boundedOriginalAuthority(admission);
     }
     @ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(strings={"AUTHORITY","PREPARE","ACCOUNT","RESERVE","CLAIM","CLIENT","ACK_STORE","READY_STORE"})
     void localFailureKeepsLastSourceCheckpointWithoutLeakingOrReopeningDispatch(String location) {

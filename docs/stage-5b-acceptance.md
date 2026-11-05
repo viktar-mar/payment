@@ -209,7 +209,7 @@ The separate `OWNED_INITIAL_AND_FIRST_RENEWAL` lane is **OFFLINE_PREPARED / NATI
 | Final evidence | Exactly two EUR2000 cash facts, one committed publication, two fixed advances, seven exact acknowledged operations and four signed callbacks forming the exact INITIAL/RENEWAL union |
 | Hosted synthetic composition | Actual catalog reserve/dispatch/ACK, genuine payment services, shipped read-only final SQL, production callback validator and rollback operation-mutation regressions authored; execution outcomes belong to the exact-source CI completion receipt |
 | Runtime packaging | Both dedicated exported closures checked against production libraries only without launching; normal production jar excludes runtime/samplers |
-| Native combined run | **ATTEMPTED / NONE ACCEPTED**; latest consumed `0bb368b2` stopped at broad `CLOCK_ADVANCE` (see the offline checkpoint below); another run requires fresh one-use approval and verified storage capacity |
+| Native combined run | **ATTEMPTED / NONE ACCEPTED**; latest consumed `ab6505e3` stopped at `CLOCK_ADVANCE_POLL_EXHAUSTED` with confirmed cleanup (see the offline pacing checkpoint below); another run requires fresh one-use approval and verified storage capacity |
 | Full stage 5B | **NOT_ACCEPTED** |
 
 [Future invocation and prerequisites](local-development.md#prepared-initial-payment-and-first-renewal-scenario) describe the dedicated configuration. This preparation supplies no native authority, successful provider result or storage remediation. Historical failures and consumed/UNKNOWN/DISPATCHING operations remain preserved and nonretryable. Both `initialAccepted` and `renewalAccepted` require completed proofs and confirmed cleanup; `full5bAccepted` is always false.
@@ -217,7 +217,7 @@ The separate `OWNED_INITIAL_AND_FIRST_RENEWAL` lane is **OFFLINE_PREPARED / NATI
 
 ### 2026-11-05 offline CLOCK_ADVANCE checkpoint
 
-The latest consumed combined run `0bb368b2-f97c-435a-9b5b-436d08d518f4` reported the broad
+The earlier consumed combined run `0bb368b2-f97c-435a-9b5b-436d08d518f4` reported the broad
 `CLOCK_ADVANCE` location. Its exact cause remains unresolved; available local
 fixture snapshots stop at CONFIRM ACK without a clock-specific trace. The new
 closed `CLOCK_ADVANCE_*` checkpoints identify only the last reached source
@@ -234,3 +234,33 @@ calls, the original 30-second invocation/60-second lease, twelve polls, 250 ms
 spacing and all exact identity/ownership/target fences remain unchanged.
 Explicit pure/inert verification only; no runtime/provider execution, old replay
 or native acceptance was performed. **Stage 5B remains NOT_ACCEPTED.**
+
+
+### 2026-11-05 offline bounded polling checkpoint
+
+The later consumed combined run `ab6505e3-f1ee-48cb-bfc7-88debe42d1a9` ended at
+`CLOCK_ADVANCE_POLL_EXHAUSTED`, and cleanup was confirmed. The bounded evidence
+establishes twelve validated advancing GET observations after one acknowledged
+POST. It does not prove their elapsed time, a provider fault or that READY would
+have followed. The original fixed 250 ms spacing was spec-compliant. Earlier
+run history and artifacts remain preserved; no consumed operation gains retry
+authority.
+
+The offline robustness change preserves the first poll's 250 ms fast path and
+spaces later reads across the smaller of the original remaining monotonic
+invocation budget and UTC claim lease. The wait is
+`max(250ms, (remaining - 2s) / (12 - poll))` for subsequent zero-based polls.
+A wait at least as large as the remaining budget is refused; the budget is
+rechecked after waiting, and each SDK call retains `min(2s, remaining)` allowance.
+Inert six-second READY was missed by the former twelve quarter-second waits and
+is observed by the paced reads. In the full-budget, instantaneous-IO inert case,
+the final read starts at 28 seconds, leaving the existing two-second allowance.
+These fixture results are not historical native timing evidence.
+
+One POST, zero SDK retries, twelve post-ACK GET maximum, minimum 250 ms spacing,
+original 30-second invocation and 60-second claim lease, original claimant/key,
+ACK/READY and all ownership/identity/target fences remain intact. Oversleep,
+interrupt, authority drift and late READY return still refuse continuation and
+retain the stop/no-replay rules. No new runtime entry, diagnostic stage or native
+execution is included. Native first-renewal acceptance is unproven; full Stage
+5B remains **NOT_ACCEPTED**.

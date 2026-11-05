@@ -1950,3 +1950,42 @@ Verification is limited to explicitly selected pure/inert Java and Node tests.
 No Docker, application/database/browser/provider execution, financial action,
 archive access, installation or old operation replay was performed. This supplies
 no native fix or acceptance evidence; Stage 5B remains **NOT_ACCEPTED**.
+
+### Offline bounded clock-poll pacing (2026-11-05)
+
+The later consumed run `ab6505e3-f1ee-48cb-bfc7-88debe42d1a9` ended at
+`CLOCK_ADVANCE_POLL_EXHAUSTED`; cleanup was confirmed. This establishes one
+acknowledged advance POST followed by twelve validated advancing observations.
+It does not establish their elapsed time, a provider fault or eventual READY.
+The former fixed 250 ms cadence complied with the specified ceilings; this
+change is bounded robustness, not a proven historical root-cause fix. All prior
+run reports, consumed operations and no-replay restrictions remain preserved.
+
+The first post-ACK poll still waits 250 ms. Each later wait uses the smaller of
+the original invocation's remaining 30-second monotonic budget and the original
+claim's remaining 60-second UTC lease. With zero-based `poll` and
+`pollsRemaining = 12 - poll`, the delay is
+`max(250ms, (remaining - 2s) / pollsRemaining)`. A delay at least as large as the
+remaining budget is refused before sleeping; the same original budget is checked
+after sleeping. The final SDK allowance remains `min(2s, remaining)`. Neither the
+deadline, lease, claim, key nor poll counter is renewed. With inert instantaneous
+IO and a full original budget, twelve advancing reads now span 28 seconds,
+reserving two seconds for the last call; this is a test fixture result, not a
+measurement of either historical native run.
+
+Deterministic inert tests demonstrate READY becoming available at six seconds:
+the old spacing exhausted twelve reads at three seconds, while paced reads
+observe READY within the original budget. The fast READY path still returns at
+250 ms. Tests also cover original preparation/POST time, short leases, oversleep,
+interrupt, authority drift, late READY store refusal and the existing
+uncooperative SDK worker cancellation deadline. The injected wait runs on the
+caller; ordinary constructors retain real monotonic time and interrupted sleep
+with the interrupt flag preserved. No callback, sleep or store continuation is
+transferred to the SDK worker.
+
+The unchanged limits are one POST, zero SDK retries, at most twelve post-ACK GET
+polls, at least 250 ms spacing, at most two seconds per SDK call, original
+30-second invocation and 60-second claim lease, all identity/target/ownership
+fences, ACK/READY persistence checks and terminal stop/no-replay behavior. Only
+explicitly selected offline pure tests were run; no runtime/provider execution
+or native acceptance was performed. Full Stage 5B remains **NOT_ACCEPTED**.

@@ -26,7 +26,7 @@ public class StripeBillingFirstRenewalAdvanceAdapter {
     private final ProviderOperationStore operations;
     private final OwnedFirstRenewalStore renewals;
     private final Clock utc;
-    private final LongSupplier nanos;private final Consumer<String> stage;
+    private final LongSupplier nanos;private final Consumer<Duration> wait;private final Consumer<String> stage;
     public StripeBillingFirstRenewalAdvanceAdapter(StripeCredentialResolver credentials,StripeClientFactory clients,
             LoadPaymentAccountPort accounts,ProviderOperationStore operations,OwnedFirstRenewalStore renewals,Clock utc) {
         this(credentials,clients,accounts,operations,renewals,utc,ignored->{});
@@ -38,10 +38,17 @@ public class StripeBillingFirstRenewalAdvanceAdapter {
     }
     StripeBillingFirstRenewalAdvanceAdapter(StripeCredentialResolver credentials,StripeClientFactory clients,
             LoadPaymentAccountPort accounts,ProviderOperationStore operations,OwnedFirstRenewalStore renewals,Clock utc,LongSupplier nanos,Consumer<String> stage) {
+        this(credentials,clients,accounts,operations,renewals,utc,nanos,duration->{
+            try{Thread.sleep(duration);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw unavailable();}
+        },stage);
+    }
+    StripeBillingFirstRenewalAdvanceAdapter(StripeCredentialResolver credentials,StripeClientFactory clients,
+            LoadPaymentAccountPort accounts,ProviderOperationStore operations,OwnedFirstRenewalStore renewals,Clock utc,
+            LongSupplier nanos,Consumer<Duration> wait,Consumer<String> stage) {
         this.credentials=Objects.requireNonNull(credentials);this.clients=Objects.requireNonNull(clients);
         this.accounts=Objects.requireNonNull(accounts);this.operations=Objects.requireNonNull(operations);
         this.renewals=Objects.requireNonNull(renewals);this.utc=Objects.requireNonNull(utc);
-        this.nanos=Objects.requireNonNull(nanos);this.stage=Objects.requireNonNull(stage);
+        this.nanos=Objects.requireNonNull(nanos);this.wait=Objects.requireNonNull(wait);this.stage=Objects.requireNonNull(stage);
     }
     public LaterReady advance(Admission admission,Step step) {
         stage.accept("CLOCK_ADVANCE_AUTHORITY");
@@ -100,7 +107,7 @@ public class StripeBillingFirstRenewalAdvanceAdapter {
             if(!acknowledged.claimant().equals(claimant)||!acknowledged.deadline().equals(claim.leaseExpiresAt()))throw unavailable();
             for(int poll=0;poll<12;poll++) {
                 stage.accept("CLOCK_ADVANCE_POLL_WAIT");
-                budget.space();
+                budget.space(poll);
                 stage.accept("CLOCK_ADVANCE_POLL_READ");
                 var remote=io(admission,budget,null,o->client.v1().testHelpers().testClocks().retrieve(admission.receipt().intent().clock().reference(),o));
                 stage.accept("CLOCK_ADVANCE_POLL_VALIDATE");
@@ -187,9 +194,14 @@ public class StripeBillingFirstRenewalAdvanceAdapter {
             long remaining=Math.min(monotonic,lease);
             if(Thread.currentThread().isInterrupted()||remaining<=0)throw unavailable();return remaining;
         }
-        void space(){
-            if(remaining()<=TimeUnit.MILLISECONDS.toNanos(250))throw unavailable();
-            try{Thread.sleep(250);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw unavailable();}
+        void space(int poll){
+            long remaining=remaining();
+            long minimum=TimeUnit.MILLISECONDS.toNanos(250);
+            // Keep the early-ready path; spread later reads within this original budget,
+            // reserving the existing SDK allowance for the last read.
+            long delay=poll==0?minimum:Math.max(minimum,(remaining-TimeUnit.SECONDS.toNanos(2))/(12-poll));
+            if(delay>=remaining)throw unavailable();
+            wait.accept(Duration.ofNanos(delay));
             remaining();
         }
     }
