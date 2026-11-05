@@ -95,6 +95,30 @@ for(const [kind,reply,expected] of [
  assert.ok(!String(rejected).includes('private-sentinel'));
  await assert.rejects(h.runtime.finalization(l));assert.equal(h.calls.length,5);
 });
+for(const stage of ['CLOCK_ADVANCE','CLOCK_ADVANCE_AUTHORITY','CLOCK_ADVANCE_PREPARE','CLOCK_ADVANCE_ACCOUNT','CLOCK_ADVANCE_RESERVE','CLOCK_ADVANCE_CLAIM','CLOCK_ADVANCE_CLIENT','CLOCK_ADVANCE_PRE_READ','CLOCK_ADVANCE_PRE_VALIDATE','CLOCK_ADVANCE_POST','CLOCK_ADVANCE_POST_VALIDATE','CLOCK_ADVANCE_ACK_STORE','CLOCK_ADVANCE_POLL_WAIT','CLOCK_ADVANCE_POLL_READ','CLOCK_ADVANCE_POLL_VALIDATE','CLOCK_ADVANCE_POLL_EXHAUSTED','CLOCK_ADVANCE_READY_STORE'])test('owner retains closed advance checkpoint after cleanup: '+stage,async()=>{
+ const h=harness();h.bootstrap.withFirstRenewalRuntime=cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});
+ const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),settled()];let requests=0;
+ h.dependencies.createRuntime=()=>client.createBillingFirstRenewalRuntime({configuration:options(),bootstrap:h.bootstrap},{fetch:async()=>{
+  requests++;const next=replies.shift();return next?new Response(JSON.stringify(next)):new Response(JSON.stringify({code:'FIRST_RENEWAL_STOPPED',stage}),{status:400});
+ }});
+ const owner=await api.createOwnedBillingFirstRenewal(options(),h.dependencies);
+ await assert.rejects(owner.run(journey,limits()));const result=await owner.close();
+ const code='POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_'+stage;
+ assert.equal(result.diagnostic,code);assert.equal(result.cleanupConfirmed,true);
+ assert.equal(result.initialAccepted,false);assert.equal(result.renewalAccepted,false);
+ const line=api.formatBillingFirstRenewalDiagnostic(result);
+ assert.equal(line,'owned_initial_and_first_renewal_diagnostic code='+code+' cleanup=CONFIRMED');
+ assert.equal(api.parseBillingFirstRenewalDiagnosticLine(line),line);
+ await assert.rejects(owner.run(journey,limits()));assert.equal(requests,5);
+});
+for(const stage of ['CLOCK_ADVANCE_PRIVATE_PROVIDER_DETAIL','CLOCK_ADVANCE_POST_IO_PROVIDER_STATUS','CLOCK_ADVANCE_POST_500','private-provider-sentinel'])test('client refuses forged advance checkpoint '+stage,async()=>{
+ const h=await runtimeHarness({route:'boundary',reply:()=>new Response(JSON.stringify({code:'FIRST_RENEWAL_STOPPED',stage}),{status:400})}),l=await settleClient(h.runtime);
+ let rejected;try{await h.runtime.boundary(l);}catch(error){rejected=error;}
+ assert.equal(client.billingFirstPaymentDiagnostic(rejected),'POST_CONFIRM_RENEWAL_BOUNDARY_HTTP');
+ assert.ok(!String(rejected).includes('private-provider-sentinel'));
+ await assert.rejects(h.runtime.finalization(l));assert.equal(h.calls.length,5);
+ assert.equal(client.isBillingFirstPaymentDiagnostic('POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_'+stage),false);
+});
 test('owner retains the fixed boundary HTTP category after cleanup',async()=>{
  const h=harness();h.bootstrap.withFirstRenewalRuntime=cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});
  const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),settled()];

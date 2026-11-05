@@ -1915,3 +1915,38 @@ evidence or cleanup. This is the last owner stage, not a cause or cash proof, an
 cannot retrospectively locate the historical failure. Payment dispatch,
 budgets, retries, deadlines and acceptance checks are unchanged. Stage 5B
 remains NOT_ACCEPTED.
+
+
+### Offline clock-advance diagnostics and late READY refusal (2026-11-05)
+
+The consumed run `0bb368b2-f97c-435a-9b5b-436d08d518f4` stopped at the
+broad `CLOCK_ADVANCE` boundary checkpoint. Its exact historical cause remains
+unknown: available local fixture snapshots end at the original CONFIRM ACK and
+contain no clock-specific failure trace. No provider state is inferred, and the
+attempt must not be replayed.
+
+The offline patch routes fixed source-owned `CLOCK_ADVANCE_*` checkpoints through
+the existing boundary failure response and terminal diagnostic allowlists. They
+cover local authority, preparation, account, reservation, claim and client;
+pre-read/validation, POST/validation, ACK store, poll wait/read/validation/exhaustion
+and READY store. The legacy broad `CLOCK_ADVANCE` remains valid. These names identify
+the last reached source location; they are neither root causes nor financial
+outcomes. No exception text, provider bodies/status codes, identifiers, timing or
+counters are exported, and unknown/forged suffixes fail closed.
+
+A separate inert regression proves an acceptance gap: `recordReady` could return
+after the original 30-second monotonic invocation budget while the original
+60-second lease remained valid. A post-return budget check now refuses that late
+successful return before graph observation and follows the existing fenced
+UNKNOWN attempt and admission stop path. It cannot roll back a READY write already
+committed; a committed ACK also remains ACKNOWLEDGED when the consumed claim can no
+longer mark it UNKNOWN. Stopping the admission blocks continuation and retries.
+The ordinary constructor still uses `System.nanoTime`. One POST per claimed step,
+zero SDK retries, two seconds per call, 30 seconds per invocation, the original
+60-second lease, twelve polls and 250 ms spacing are unchanged, as are exact
+identity/account/clock/target checks and persistence fences.
+
+Verification is limited to explicitly selected pure/inert Java and Node tests.
+No Docker, application/database/browser/provider execution, financial action,
+archive access, installation or old operation replay was performed. This supplies
+no native fix or acceptance evidence; Stage 5B remains **NOT_ACCEPTED**.

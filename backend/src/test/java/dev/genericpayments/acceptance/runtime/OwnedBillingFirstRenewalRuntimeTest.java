@@ -99,6 +99,27 @@ class OwnedBillingFirstRenewalRuntimeTest {
         assertThat(x.code).isEqualTo(400);
         assertThat(x.output.toString()).isEqualTo("{\"code\":\"FIRST_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}");
     }
+    @ParameterizedTest @ValueSource(strings={"CLOCK_ADVANCE","CLOCK_ADVANCE_AUTHORITY","CLOCK_ADVANCE_PREPARE","CLOCK_ADVANCE_ACCOUNT","CLOCK_ADVANCE_RESERVE","CLOCK_ADVANCE_CLAIM","CLOCK_ADVANCE_CLIENT","CLOCK_ADVANCE_PRE_READ","CLOCK_ADVANCE_PRE_VALIDATE","CLOCK_ADVANCE_POST","CLOCK_ADVANCE_POST_VALIDATE","CLOCK_ADVANCE_ACK_STORE","CLOCK_ADVANCE_POLL_WAIT","CLOCK_ADVANCE_POLL_READ","CLOCK_ADVANCE_POLL_VALIDATE","CLOCK_ADVANCE_POLL_EXHAUSTED","CLOCK_ADVANCE_READY_STORE"})
+    void fixedAdvanceCheckpointSurvivesServerAbort(String stage) throws Exception {
+        var ops=new Inert(){
+            @Override public JsonObject boundary(){throw new IllegalStateException("private-provider-sentinel");}
+            @Override public String boundaryFailureStage(){return stage;}
+        };
+        var x=new OwnedBillingFirstPaymentRuntimeTest.MemoryExchange("POST","/first-renewal/boundary","{}",true);
+        new OwnedBillingFirstRenewalRuntime.Handler(ops,"q".repeat(43)).handle(x);
+        assertThat(ops.aborted).isTrue();assertThat(x.code).isEqualTo(400);
+        assertThat(x.output.toString()).isEqualTo("{\"code\":\"FIRST_RENEWAL_STOPPED\",\"stage\":\""+stage+"\"}");
+    }
+    @ParameterizedTest @ValueSource(strings={"CLOCK_ADVANCE_PRIVATE_PROVIDER_DETAIL","CLOCK_ADVANCE_POST_IO_PROVIDER_STATUS","CLOCK_ADVANCE_POST_500","private-provider-sentinel"})
+    void unlistedAdvanceDetailsCannotEscapeServer(String stage) throws Exception {
+        var ops=new Inert(){
+            @Override public JsonObject boundary(){throw new IllegalStateException("private-provider-sentinel");}
+            @Override public String boundaryFailureStage(){return stage;}
+        };
+        var x=new OwnedBillingFirstPaymentRuntimeTest.MemoryExchange("POST","/first-renewal/boundary","{}",true);
+        new OwnedBillingFirstRenewalRuntime.Handler(ops,"q".repeat(43)).handle(x);
+        assertThat(x.output.toString()).isEqualTo("{\"code\":\"FIRST_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}");
+    }
     static class Inert extends OwnedBillingFirstPaymentRuntimeTest.InertOperations implements OwnedBillingFirstRenewalRuntime.Operations {
         int boundaries,finals;
         public JsonObject boundary(){boundaries++;return new JsonObject();}

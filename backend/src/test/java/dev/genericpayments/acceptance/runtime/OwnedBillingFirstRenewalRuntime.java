@@ -55,7 +55,7 @@ public final class OwnedBillingFirstRenewalRuntime {
             }catch(Exception failure){operations.abort();var response=OwnedBillingFirstPaymentRuntime.error("FIRST_RENEWAL_STOPPED");
                 if(path.equals("/first-renewal/boundary")){
                     String stage;try{stage=operations.boundaryFailureStage();}catch(RuntimeException ignored){stage="UNCLASSIFIED";}
-                    if(stage==null||!Set.of("INITIAL_RECEIPT","ADMISSION","CLOCK_ADVANCE","GRAPH","GRAPH_OBSERVER_INIT","GRAPH_CLAIM",
+                    if(stage==null||!Set.of("INITIAL_RECEIPT","ADMISSION","CLOCK_ADVANCE","CLOCK_ADVANCE_AUTHORITY","CLOCK_ADVANCE_PREPARE","CLOCK_ADVANCE_ACCOUNT","CLOCK_ADVANCE_RESERVE","CLOCK_ADVANCE_CLAIM","CLOCK_ADVANCE_CLIENT","CLOCK_ADVANCE_PRE_READ","CLOCK_ADVANCE_PRE_VALIDATE","CLOCK_ADVANCE_POST","CLOCK_ADVANCE_POST_VALIDATE","CLOCK_ADVANCE_ACK_STORE","CLOCK_ADVANCE_POLL_WAIT","CLOCK_ADVANCE_POLL_READ","CLOCK_ADVANCE_POLL_VALIDATE","CLOCK_ADVANCE_POLL_EXHAUSTED","CLOCK_ADVANCE_READY_STORE","GRAPH","GRAPH_OBSERVER_INIT","GRAPH_CLAIM",
                         "GRAPH_CLOCK_BEFORE","GRAPH_REMOTE_PRECHECK","GRAPH_CUSTOMER","GRAPH_SUBSCRIPTION","GRAPH_INVOICES",
                         "GRAPH_INITIAL_INVOICE","GRAPH_RENEWAL_INVOICE","GRAPH_CLOCK_AFTER","GRAPH_ACCEPT","GRAPH_ASSERT","BOUNDARY_RESPONSE").contains(stage))stage="UNCLASSIFIED";
                     response.addProperty("stage",stage);

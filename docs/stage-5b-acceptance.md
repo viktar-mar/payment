@@ -6,11 +6,11 @@ Status on 2026-11-04: **Stage 5B NOT_ACCEPTED**. Billing backend, SDK Elements a
 
 ## Current checkpoint — 2026-11-04
 
-Update on 2026-11-05: bounded GET-only inspection at the pinned API found one test-clock candidate in the latest attempt's creation window in the approved account. Its active subscription had exactly an initial paid invoice and a renewal draft. Both lines omitted flat subscription/item duplicates while their nested associations matched; the renewal period matched its subscription item. The optional off-stripe field was absent and the draft ending balance was null. No durable local receipt was revalidated, so this establishes a provider response shape incompatible with the old mapper, not the failed attempt's exact first predicate or acceptance. No provider writes, new payments, refunds or clock advances occurred.
+Update on 2026-11-05: bounded GET-only inspection at the pinned API found one test-clock candidate in a previously recorded attempt's creation window in the approved account. Its active subscription had exactly an initial paid invoice and a renewal draft. Both lines omitted flat subscription/item duplicates while their nested associations matched; the renewal period matched its subscription item. The optional off-stripe field was absent and the draft ending balance was null. No durable local receipt was revalidated, so this establishes a provider response shape incompatible with the old mapper, not the failed attempt's exact first predicate or acceptance. No provider writes, new payments, refunds or clock advances occurred.
 
 The scoped compatibility patch follows the amended [first-renewal contract](superpowers/specs/2026-11-01-owned-first-renewal-design.md): nested ownership remains mandatory and present invalid flat duplicates refuse. A follow-up GET with the documented `expand[]=data.amount_paid_off_stripe` returned known zero for both invoices; the lane now requests that field and still rejects unknown/nonzero renewal values. Only a draft may have an unfinalized ending balance. A cash fact still requires the full allocation/PI/Charge/reverse proof. Local targeted regression passed; the updated composition fixture is reserved for hosted CI. Full 5B remains **NOT_ACCEPTED**.
 
-The latest isolated Sandbox attempt `8495db3e-c160-466b-8629-a47a04d0cb9b` used source `572101f5202f95204ba2833e6fa0322dfd304254`. Its safe terminal report was `POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_GRAPH`, `cleanup=CONFIRMED`, `NOT_ACCEPTED`. The boundary clock advance returned, but the old `GRAPH` category covered claim, remote reads, normalization, local boundary persistence and the final boundary assertions. The report cannot identify which of those failed. The attempt and its CREATE/CONFIRM authority are consumed; no payment, renewal or DISPATCHING operation may be repeated from it.
+The earlier isolated Sandbox attempt `8495db3e-c160-466b-8629-a47a04d0cb9b` used source `572101f5202f95204ba2833e6fa0322dfd304254`. Its safe terminal report was `POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_GRAPH`, `cleanup=CONFIRMED`, `NOT_ACCEPTED`. The boundary clock advance returned, but the old `GRAPH` category covered claim, remote reads, normalization, local boundary persistence and the final boundary assertions. The report cannot identify which of those failed. The attempt and its CREATE/CONFIRM authority are consumed; no payment, renewal or DISPATCHING operation may be repeated from it.
 
 A subsequent source-only diagnostic change splits that category into fixed graph checkpoints, including the remote subscription and invoice checks and the local acceptance assertions. It emits no Stripe field values, raw errors, credentials or payment details, and changes no graph predicate or financial action. Pure Java and Node regression tests pass locally; an exact-source hosted CI result and a new provider observation are still pending. The change cannot retrospectively diagnose the consumed attempt or establish renewal acceptance.
 
@@ -209,7 +209,28 @@ The separate `OWNED_INITIAL_AND_FIRST_RENEWAL` lane is **OFFLINE_PREPARED / NATI
 | Final evidence | Exactly two EUR2000 cash facts, one committed publication, two fixed advances, seven exact acknowledged operations and four signed callbacks forming the exact INITIAL/RENEWAL union |
 | Hosted synthetic composition | Actual catalog reserve/dispatch/ACK, genuine payment services, shipped read-only final SQL, production callback validator and rollback operation-mutation regressions authored; execution outcomes belong to the exact-source CI completion receipt |
 | Runtime packaging | Both dedicated exported closures checked against production libraries only without launching; normal production jar excludes runtime/samplers |
-| Native combined run | **ATTEMPTED / NONE ACCEPTED**; the latest consumed attempt is recorded above; another run requires fresh one-use approval and verified storage capacity |
+| Native combined run | **ATTEMPTED / NONE ACCEPTED**; latest consumed `0bb368b2` stopped at broad `CLOCK_ADVANCE` (see the offline checkpoint below); another run requires fresh one-use approval and verified storage capacity |
 | Full stage 5B | **NOT_ACCEPTED** |
 
 [Future invocation and prerequisites](local-development.md#prepared-initial-payment-and-first-renewal-scenario) describe the dedicated configuration. This preparation supplies no native authority, successful provider result or storage remediation. Historical failures and consumed/UNKNOWN/DISPATCHING operations remain preserved and nonretryable. Both `initialAccepted` and `renewalAccepted` require completed proofs and confirmed cleanup; `full5bAccepted` is always false.
+
+
+### 2026-11-05 offline CLOCK_ADVANCE checkpoint
+
+The latest consumed combined run `0bb368b2-f97c-435a-9b5b-436d08d518f4` reported the broad
+`CLOCK_ADVANCE` location. Its exact cause remains unresolved; available local
+fixture snapshots stop at CONFIRM ACK without a clock-specific trace. The new
+closed `CLOCK_ADVANCE_*` checkpoints identify only the last reached source
+location and retain legacy `CLOCK_ADVANCE`; they expose no provider/exception
+content and do not retrospectively diagnose this run.
+
+Separately, an inert monotonic-time test proves that a READY store return after
+30 seconds, before the original 60-second lease expires, previously escaped the
+invocation budget. A post-return check now refuses continuation to graph
+observation, attempts the existing fenced UNKNOWN cleanup and stops the
+admission. It does not undo already committed ACK/READY writes or force an
+ACKNOWLEDGED operation back to UNKNOWN. One POST, zero SDK retries, two-second
+calls, the original 30-second invocation/60-second lease, twelve polls, 250 ms
+spacing and all exact identity/ownership/target fences remain unchanged.
+Explicit pure/inert verification only; no runtime/provider execution, old replay
+or native acceptance was performed. **Stage 5B remains NOT_ACCEPTED.**
