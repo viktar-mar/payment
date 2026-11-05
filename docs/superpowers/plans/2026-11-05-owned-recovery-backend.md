@@ -57,8 +57,12 @@ Modify `JdbcOwnedFirstRenewalStore.java` only if needed for a narrow package-pri
 
 - [x] Step1: Author genuine JDBC+real FactService failed OPEN debt→grace-1/G checks→explicit same-PI RECOVER association→CASH publication; assert original cash, actual bill/debt/operation/event/outbox and no INVOICE_PAY. Include concurrent branch exclusion, expired/stale/foreign claims, association rollback, post-fact rollback, stopped/no-resume and idempotent read-only replay cases.
 - [x] Step2: Compile hosted tests but do not execute; run all audited related pure regression. No default Maven test discovery; use cached test-compile or explicit javac closure. Report exact executed vs unexecuted checks and missing runtime/raw-provider/confirmation/time evidence.
-- [ ] Step3: Update guide/matrix precisely; independent task review and final whole-change review, root local commits. No push/CI/native run required by this offline request.
+- [x] Step3: Update guide/matrix precisely; independent task review and final whole-change review, root local commits. No push/CI/native run required by this offline request.
 
 ## Self-review
 
 Task1 produces immutable model/store APIs consumed by Task2 and genuine DB tests in Task3. Task2 owns the only shared production seam, backward compatible/denied by default; Task3 changes only tests/docs. Model/SQL current predicates must agree on before/after failure/publication state. Review the SQL exclusion and lock order together before accepting either branch. No task grants runtime permission.
+
+## Offline completion checkpoint
+
+Implementation commits: `284d43a`, `e50158a`, `2b4d7a3`. Independent per-task and whole-change reviews passed. Fresh cached compilation and 113 explicitly selected pure tests passed, with zero failures/skips; hosted composition source compiled but was not executed. V30–V33 are unchanged. SQL/runtime/native recovery remain **NOT_RUN**, full Stage 5B **NOT_ACCEPTED**. No runtime registration, remote publication, Docker or Stripe run belongs to this offline slice. Worktree and evidence are preserved.
