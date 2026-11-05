@@ -44,9 +44,9 @@
 
 **Interfaces:** Consume Task1 exact implemented stage API/test evidence. The operator guide names fixed future business-time boundaries and required native adapters/evidence, but supplies no runnable unsupported command or financial authorization.
 
-- [ ] Step1: Record successful native predecessor e7080356 at a59dad7 with exact receipt/run/source and confirmed cleanup. Explicitly supersede stale current-status claims without erasing historical failures.
-- [ ] Step2: Document the new offline component, pure tests actually run, and precise native blockers (durable admission/publication, isolated time/recovery permission, method transition, runtime/SQL/callback proof). State no Docker/Stripe execution and no native recovery acceptance.
-- [ ] Step3: Check local links, exact source bindings and no misleading runnable/accepted claim. Root independent spec/quality review; commit, then final combined independent review. No push/CI or native run is required by this offline request.
+- [x] Step1: Record successful native predecessor e7080356 at a59dad7 with exact receipt/run/source and confirmed cleanup. Explicitly supersede stale current-status claims without erasing historical failures.
+- [x] Step2: Document the new offline component, pure tests actually run, and precise native blockers (durable admission/publication, isolated time/recovery permission, method transition, runtime/SQL/callback proof). State no Docker/Stripe execution and no native recovery acceptance.
+- [x] Step3: Check local links, exact source bindings and no misleading runnable/accepted claim. Root independent spec/quality review; commit, then final combined independent review. No push/CI or native run is required by this offline request.
 
 ## Self-review
 

@@ -1,0 +1,72 @@
+# Failed renewal, fixed grace and recovery — offline guide
+
+Status on 2026-11-05: **OFFLINE_CONTRACT_VERIFIED / NATIVE NOT_RUN**. Full Stage 5B remains **NOT_ACCEPTED**. This guide describes the test-only component at source `28acc7c0438d61f36962c37a3a3d3a0f18cbd943`, its synthetic fixture and the work required before a separately authorized native recovery scenario. It provides no Sandbox invocation or financial authority.
+
+The [design](../superpowers/specs/2026-11-05-failed-renewal-recovery-offline-design.md), [acceptance matrix](../stage-5b-acceptance.md#current-checkpoint--2026-11-05) and [operator checkpoint](../local-development.md#current-operator-checkpoint--2026-11-05) define the scope. The earlier successful combined initial/first-renewal run is separate: [safe receipt](../../.superpowers/sdd/2026-11-05-prepare-cleanup-publication/native-after-storage-107/e7080356-9c8c-4dd8-9ed4-b9ee94e57039/result.json), run `e7080356-9c8c-4dd8-9ed4-b9ee94e57039`, source `a59dad7fd979cea774537210e76ed98f95f334a8`, exit 0, 2000 EUR minor units (EUR20) for each invoice, cash/journal/signed-callback gates verified, cleanup confirmed and all seven containers stopped. Its `full5bAccepted` is false. That receipt covers neither failed renewal nor grace, setup or recovery. Historical failed runs and consumed operations remain preserved and nonretryable.
+
+## Implemented API and proof boundary
+
+[OwnedBillingFailedRenewalScenario](../../backend/src/test/java/dev/genericpayments/acceptance/runtime/OwnedBillingFailedRenewalScenario.java) is a package-private, test-source Java class in `dev.genericpayments.acceptance.runtime`. Its API is:
+
+```java
+enum Stage {
+    INITIAL_PAID, FAILED_RENEWAL, REPEATED_FAILURE, GRACE_LAST_SECOND,
+    GRACE_EXPIRED, METHOD_READY, RECOVERY_REQUESTED, RECOVERED
+}
+enum Authority { NONE, FRESH, LIVE, UNKNOWN, DISPATCHING }
+record Payment(UUID id, UUID billId, String invoice, String paymentIntent,
+               long amountMinor, String currency) {}
+record Observation(Stage stage, UUID owner, String source, Subscription subscription,
+                   BillingRecord initialBill, BillingRecord renewalBill,
+                   List<Payment> payments, UUID allocation, String paymentIntent,
+                   int quantity, Instant businessAt, SubscriptionOperation operation,
+                   Authority authority) {}
+synchronized void observe(Observation observation);
+synchronized boolean complete();
+```
+
+Construct a fresh instance and supply the eight observations once, in order. The payment list is defensively copied. Accepted business time cannot decrease; equal-time expiry/setup/request observations are permitted. Invalid or out-of-order input consumes the instance; a later valid observation cannot resume it. Calls are synchronized and replay after completion refuses. `complete()` reports only that the supplied offline transcript passed. It returns no cash, journal, signed-callback, provider, native or full-5B verification flags.
+
+The validator uses the real `Subscription.renewalFailed`, `Subscription.confirmPaid`, `SubscriptionAccessPolicy` and `RecoveryRules`. It pins the supplied owner, 40-character lowercase hexadecimal source identity, original bill/payment, subscription lineage and terms, renewal bill/invoice/period, allocation and recovery PaymentIntent. Terms are EUR20 (2000 minor units) MONTH, quantity 1, trial 0; terms and original positive payment remain unchanged. These are consistency checks over synthetic inputs, not authenticated external facts. In particular, the fixture's source string is a synthetic identity, not the executable commit above.
+
+METHOD_READY is only a labelled observation of unchanged debt, paidThrough and denied access. There is no setup receipt or method object in this API, so it does **not** verify method setup, readiness or ownership. Likewise, supplied `Authority.FRESH` is synthetic; it is neither authenticated permission nor a financial budget. LIVE, UNKNOWN and DISPATCHING authority cannot authorize this offline recovery transition. Recovery fingerprint checking binds its local shape to the same bill; it does not authenticate the digest.
+
+The class has no runtime adapter, endpoint, Spring registration, provider SDK call, launcher or production export. Existing native runtime packaging does not export it. There was no Docker, Stripe, application, database/SQL, browser or network execution for this preparation, and no native recovery acceptance is claimed.
+
+## Exact fixture business times
+
+The [executable test fixture](../../backend/src/test/java/dev/genericpayments/acceptance/runtime/OwnedBillingFailedRenewalScenarioTest.java) uses these constants. They are synthetic test times, not approved epochs for a future native run. Original paid period is `[F,E)` and debt period is `[E,N)`; `N > G+1 second`. Operational audit UTC `U` stays `2025-01-01T00:00:00Z` independently of every business observation. Security, authentication, leases and delivery clocks must not be advanced to simulate grace.
+
+| Symbol or observation | Exact UTC fixture time | Required state |
+| --- | --- | --- |
+| F / INITIAL_PAID | `2025-02-01T00:00:00Z` | ACTIVE, paidThrough E; initial bill CONFIRMED_CASH; one supplied EUR20 (2000 minor units) payment; renewal bill OPEN |
+| E | `2025-03-01T00:00:00Z` | Original paid-through and renewal-period start |
+| FAILED_RENEWAL / E+3600 | `2025-03-01T01:00:00Z` | PAST_DUE; unchanged paidThrough E and entitlement; same OPEN debt bill; no new cash; GRACE access |
+| REPEATED_FAILURE / E+7200 | `2025-03-01T02:00:00Z` | Same debt/bill/invoice/period, paidThrough and captured grace, even with later policy 99 days; no new cash |
+| GRACE_LAST_SECOND / G−1 second | `2025-03-03T23:59:59Z` | GRACE with validUntil exactly G |
+| G / GRACE_EXPIRED | `2025-03-04T00:00:00Z` | Access denied at the exact boundary; no cash or paid-through extension |
+| METHOD_READY / G | `2025-03-04T00:00:00Z` | Same open debt and denied access; label only, no verified setup |
+| RECOVERY_REQUESTED / G | `2025-03-04T00:00:00Z` | One supplied fresh RESERVED RECOVER operation; same debt, cash and denied access |
+| RECOVERED / G+1 second | `2025-03-04T00:00:01Z` | Same renewal bill CONFIRMED_CASH; one new supplied EUR20 (2000 minor units) payment on its original invoice/PI; debt cleared, ACTIVE, paidThrough N and PAID access |
+| N | `2025-04-01T00:00:00Z` | Recovered paid-through; separate late-capture test at N+1 second (`2025-04-01T00:00:01Z`) yields EXPIRED access |
+
+Grace is fixed at `G = E + 259200 seconds`, captured by the first three-day failure reducer. Repeated failure must not move it when the later policy is 99 days. The successful fixture selects E+7200 for the repeat; the validator permits an ordered repeat while access is GRACE, rather than requiring that exact repeat timestamp. INITIAL_PAID uses F in the fixture; the validator requires PAID access there. Other boundary observations in the table are pinned by the stage checks.
+
+RECOVERY_REQUESTED requires a RESERVED RECOVER operation for the pinned Site/Customer/Subscription and expected revision, with unchanged UTC audit fields and fingerprint `v1.recover.<same renewal bill UUID>.<64 lowercase hex>`. Recovery retains that operation, the same renewal allocation and PI, and exactly the original payment plus one new distinct payment. This narrow transcript supplies no new invoice, subscription, third positive payment or generic `invoice.pay` fallback. The separate late-capture domain test demonstrates that recording the debt-period payment after N cannot restore current access; it does not change the fixed G+1 successful stage.
+
+## Recorded offline verification
+
+The [Task 1 report](../../.superpowers/sdd/2026-11-05-failed-renewal-recovery-offline/task-1-report.md) records an initial failing transcript test before implementation, then GREEN. Independent review requested two regressions: wrong-bill recovery fingerprint and rollback of accepted business time. Both were observed RED on the prior implementation (7 passed / 2 failed), then the corrected selected scenario/access-policy/recovery-rule run passed **34/34**. The [scoped independent re-review](../../.superpowers/sdd/2026-11-05-failed-renewal-recovery-offline/task-1-fix1-review.md) approved both fixes; it was source review, not a separate test execution.
+
+Root's later fresh pure compilation and selected run passed **72/72**, with zero failures, skips or aborted tests. The [verification record](../../.superpowers/sdd/2026-11-05-failed-renewal-recovery-offline/final-pure-v2-verification.json) pins source hashes, compile/test exits 0 and these eight explicit selectors: the new scenario plus existing `PlanChangeRulesTest`, `RecoveryRulesTest`, `SubscriptionAccessPolicyTest`, `SubscriptionBillingTimeTest`, `SubscriptionCancellationRulesTest`, `SubscriptionPolicyTest` and `SubscriptionTest`. The [test log](../../.superpowers/sdd/2026-11-05-failed-renewal-recovery-offline/final-pure-v2-tests.log) records 72 started and successful. Those checks compiled the pure domain source closure and tests against cached dependencies, without default Maven discovery or Testcontainers. No tests were rerun for this prose update. These results are neither a full hosted suite nor native acceptance.
+
+## Native blockers
+
+A future native failure/grace/recovery scenario needs a separately implemented and reviewed lane before any invocation:
+
+1. **Durable owned admission and publication.** Persist failure/debt/grace provenance and one-use recovery ownership, with atomic publication and stop/fence rules. The successful first-renewal lane requires draft then Paid, two advances and exactly two paid invoices; its existing success contract must stay closed to debt/recovery. Do not adopt retained historical resources, payments, refunds, CREATE or DISPATCHING operations.
+2. **Scoped business time and explicit recovery permission.** Implement a later-time selector for this owned debt lifecycle and authenticated one-use recovery authority, retaining UTC operational/security clocks, exact source/owner binding, bounded reads/advances/payment budget and refusal of uncertain/live operations. Ordinary Stripe ownership rejects owned TestClock customers; the isolated projection hides financial commands and isolated facts reject recovery observations. Calling an ordinary recovery path is not a supported workaround. Fresh explicit authorization must bind any future native source, run, resources, epochs and financial budget.
+3. **Verified failure and method transitions.** Establish an actual owned decline/no-new-cash observation, fixed grace through repeated failure and policy change, and verified method setup/ownership without paying debt or regaining access. Then require a separate explicit recovery action for the original bill/invoice/allocation/PI; synthetic METHOD_READY and FRESH inputs supply none of this proof.
+4. **Source-bound runtime and end-to-end evidence.** Add and verify packaging/export/preflight and appropriate adapters before launch. Produce actual provider and SQL evidence for both original and recovered payments, unchanged original cash, no extra cash during failure/setup/request, debt/grace/access boundaries and recovery publication. Require the actual operation journal and signature-verified delivered callbacks, plus bounded cleanup and stopped-runtime proof. No fake-driver booleans may stand in for these gates.
+
+Until these blockers are resolved, there is no runnable Sandbox command for this component. The previously accepted first-payment/first-renewal receipt remains its own narrow evidence; full Stage 5B and native failed-renewal recovery remain unaccepted.
