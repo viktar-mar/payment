@@ -10,7 +10,7 @@ The completed [safe native receipt](../.superpowers/sdd/2026-11-05-prepare-clean
 
 This completed run supersedes earlier current-status claims of “NONE ACCEPTED” for the combined scenario and of no accepted initial payment. It neither upgrades the separate initial-only lane's historical attempts nor diagnoses earlier failures or permits replay. Older dated preparation, failed-run and offline-diagnostic checkpoints below are historical at their named sources; their failed results, consumed authority and artifacts remain unchanged. The receipt is recorded evidence, not a new live-state or storage-capacity check.
 
-The next [failed-renewal, grace and recovery component](testing/billing-failed-renewal-recovery.md) is **OFFLINE_CONTRACT_VERIFIED / NATIVE NOT_RUN**, implemented in test sources at `28acc7c0438d61f36962c37a3a3d3a0f18cbd943`. Explicit pure-domain compilation and selected tests passed **72/72, zero failures, aborted or skipped**, including the new scenario. No Docker, Stripe, application, SQL or browser was run for this preparation. Synthetic observations prove no financial, journal, signed-callback or method-ownership fact and grant no recovery authority.
+The earlier [failed-renewal, grace and recovery transcript](testing/billing-failed-renewal-recovery.md) was **OFFLINE_CONTRACT_VERIFIED / NATIVE NOT_RUN**, implemented in test sources at `28acc7c0438d61f36962c37a3a3d3a0f18cbd943`. Explicit pure-domain compilation and selected tests passed **72/72, zero failures, aborted or skipped**, including the new scenario. No Docker, Stripe, application, SQL or browser was run for this preparation. Synthetic observations prove no financial, journal, signed-callback or method-ownership fact and grant no recovery authority. The later [owned failed-renewal backend checkpoint](#owned-failed-renewal-backend-checkpoint-offline) supersedes the test-only implementation status: the internal store, orchestration and isolated proof are implemented and 113/113 selected pure tests passed; the hosted composition is compiled only, SQL/runtime and native provider recovery are **NOT_RUN**, and raw-provider, native-time/readiness, confirmation and runtime evidence remains outstanding.
 
 ## Historical checkpoint — 2026-11-04
 
@@ -303,3 +303,11 @@ budgets, owner lifetime and separate cleanup allowance remain unchanged. Only
 audited inert Node tests and cached TypeScript checking were performed; no
 Docker, application/database/browser/provider execution or native acceptance.
 Full Stage 5B remains **NOT_ACCEPTED**.
+
+## Owned failed-renewal backend checkpoint (offline)
+
+The internal owned-recovery backend now includes a JDBC store, an explicit failure/recovery orchestrator, and an exact-owner isolated billing-time proof. The ordinary FactService constructor denies this recovery seam by default; no runtime registration, provider adapter, browser flow, exporter or native launcher is enabled by this work. The generic backend binds the original published terms; the hosted source fixture retains its genuine EUR 1000-minor initial payment and renewal terms. The future native EUR20 case is a separate acceptance scenario.
+
+The fresh, explicit offline pure-backend checkpoint passed **113/113**, with zero failures or skips. The hosted composition source is authored and compiled only: its real JDBC/FactService/cash/event/outbox, branch exclusion, rollback and stop assertions have **not been executed**. Compilation does not establish PostgreSQL migration or trigger validity, transaction behavior, persisted money or callback delivery. No application context, database, SQL, Docker or provider was run for this checkpoint.
+
+Raw provider failure/recovery observations, a native exact-owner time/readiness producer, customer confirmation, hosted execution and native acceptance evidence remain missing. Native provider recovery is **NOT_RUN**, SQL/runtime is **NOT_RUN**, and full Stage 5B remains **NOT_ACCEPTED**. The earlier pure transcript and accepted initial/first-successful-renewal receipt retain their historical scope.

@@ -1,10 +1,10 @@
 # Failed renewal, fixed grace and recovery — offline guide
 
-Status on 2026-11-05: **OFFLINE_CONTRACT_VERIFIED / NATIVE NOT_RUN**. Full Stage 5B remains **NOT_ACCEPTED**. This guide describes the test-only component at source `28acc7c0438d61f36962c37a3a3d3a0f18cbd943`, its synthetic fixture and the work required before a separately authorized native recovery scenario. It provides no Sandbox invocation or financial authority.
+Status on 2026-11-05: the internal owned-recovery backend is implemented with an explicit JDBC store, orchestration and isolated proof, and has passed 113/113 selected pure tests. Its hosted composition is authored and compiled but **SQL/runtime NOT_RUN**; native recovery is **NOT_RUN** and full Stage 5B remains **NOT_ACCEPTED**. See the [current backend checkpoint](#owned-failed-renewal-backend-checkpoint-offline). The earlier test-only component at source `28acc7c0438d61f36962c37a3a3d3a0f18cbd943` and its synthetic fixture are retained below as historical evidence. This guide grants no Sandbox invocation or financial authority.
 
 The [design](../superpowers/specs/2026-11-05-failed-renewal-recovery-offline-design.md), [acceptance matrix](../stage-5b-acceptance.md#current-checkpoint--2026-11-05) and [operator checkpoint](../local-development.md#current-operator-checkpoint--2026-11-05) define the scope. The earlier successful combined initial/first-renewal run is separate: [safe receipt](../../.superpowers/sdd/2026-11-05-prepare-cleanup-publication/native-after-storage-107/e7080356-9c8c-4dd8-9ed4-b9ee94e57039/result.json), run `e7080356-9c8c-4dd8-9ed4-b9ee94e57039`, source `a59dad7fd979cea774537210e76ed98f95f334a8`, exit 0, 2000 EUR minor units (EUR20) for each invoice, cash/journal/signed-callback gates verified, cleanup confirmed and all seven containers stopped. Its `full5bAccepted` is false. That receipt covers neither failed renewal nor grace, setup or recovery. Historical failed runs and consumed operations remain preserved and nonretryable.
 
-## Implemented API and proof boundary
+## Historical test-only API and proof boundary
 
 [OwnedBillingFailedRenewalScenario](../../backend/src/test/java/dev/genericpayments/acceptance/runtime/OwnedBillingFailedRenewalScenario.java) is a package-private, test-source Java class in `dev.genericpayments.acceptance.runtime`. Its API is:
 
@@ -33,7 +33,7 @@ METHOD_READY is only a labelled observation of unchanged debt, paidThrough and d
 
 The class has no runtime adapter, endpoint, Spring registration, provider SDK call, launcher or production export. Existing native runtime packaging does not export it. There was no Docker, Stripe, application, database/SQL, browser or network execution for this preparation, and no native recovery acceptance is claimed.
 
-## Exact fixture business times
+## Historical synthetic fixture business times
 
 The [executable test fixture](../../backend/src/test/java/dev/genericpayments/acceptance/runtime/OwnedBillingFailedRenewalScenarioTest.java) uses these constants. They are synthetic test times, not approved epochs for a future native run. Original paid period is `[F,E)` and debt period is `[E,N)`; `N > G+1 second`. Operational audit UTC `U` stays `2025-01-01T00:00:00Z` independently of every business observation. Security, authentication, leases and delivery clocks must not be advanced to simulate grace.
 
@@ -54,19 +54,29 @@ Grace is fixed at `G = E + 259200 seconds`, captured by the first three-day fail
 
 RECOVERY_REQUESTED requires a RESERVED RECOVER operation for the pinned Site/Customer/Subscription and expected revision, with unchanged UTC audit fields and fingerprint `v1.recover.<same renewal bill UUID>.<64 lowercase hex>`. Recovery retains that operation, the same renewal allocation and PI, and exactly the original payment plus one new distinct payment. This narrow transcript supplies no new invoice, subscription, third positive payment or generic `invoice.pay` fallback. The separate late-capture domain test demonstrates that recording the debt-period payment after N cannot restore current access; it does not change the fixed G+1 successful stage.
 
-## Recorded offline verification
+## Historical offline transcript verification
 
 The [Task 1 report](../../.superpowers/sdd/2026-11-05-failed-renewal-recovery-offline/task-1-report.md) records an initial failing transcript test before implementation, then GREEN. Independent review requested two regressions: wrong-bill recovery fingerprint and rollback of accepted business time. Both were observed RED on the prior implementation (7 passed / 2 failed), then the corrected selected scenario/access-policy/recovery-rule run passed **34/34**. The [scoped independent re-review](../../.superpowers/sdd/2026-11-05-failed-renewal-recovery-offline/task-1-fix1-review.md) approved both fixes; it was source review, not a separate test execution.
 
 Root's later fresh pure compilation and selected run passed **72/72**, with zero failures, skips or aborted tests. The [verification record](../../.superpowers/sdd/2026-11-05-failed-renewal-recovery-offline/final-pure-v2-verification.json) pins source hashes, compile/test exits 0 and these eight explicit selectors: the new scenario plus existing `PlanChangeRulesTest`, `RecoveryRulesTest`, `SubscriptionAccessPolicyTest`, `SubscriptionBillingTimeTest`, `SubscriptionCancellationRulesTest`, `SubscriptionPolicyTest` and `SubscriptionTest`. The [test log](../../.superpowers/sdd/2026-11-05-failed-renewal-recovery-offline/final-pure-v2-tests.log) records 72 started and successful. Those checks compiled the pure domain source closure and tests against cached dependencies, without default Maven discovery or Testcontainers. No tests were rerun for this prose update. These results are neither a full hosted suite nor native acceptance.
 
-## Native blockers
+## Historical native blockers at the test-only source
 
-A future native failure/grace/recovery scenario needs a separately implemented and reviewed lane before any invocation:
+At source `28acc7c0438d61f36962c37a3a3d3a0f18cbd943`, the following work was identified as necessary before a native scenario. The later backend checkpoint below supersedes the implementation-status claims in items 1 and 2; these items remain historical, not a current instruction to reimplement that backend:
 
 1. **Durable owned admission and publication.** Persist failure/debt/grace provenance and one-use recovery ownership, with atomic publication and stop/fence rules. The successful first-renewal lane requires draft then Paid, two advances and exactly two paid invoices; its existing success contract must stay closed to debt/recovery. Do not adopt retained historical resources, payments, refunds, CREATE or DISPATCHING operations.
 2. **Scoped business time and explicit recovery permission.** Implement a later-time selector for this owned debt lifecycle and authenticated one-use recovery authority, retaining UTC operational/security clocks, exact source/owner binding, bounded reads/advances/payment budget and refusal of uncertain/live operations. Ordinary Stripe ownership rejects owned TestClock customers; the isolated projection hides financial commands and isolated facts reject recovery observations. Calling an ordinary recovery path is not a supported workaround. Fresh explicit authorization must bind any future native source, run, resources, epochs and financial budget.
 3. **Verified failure and method transitions.** Establish an actual owned decline/no-new-cash observation, fixed grace through repeated failure and policy change, and verified method setup/ownership without paying debt or regaining access. Then require a separate explicit recovery action for the original bill/invoice/allocation/PI; synthetic METHOD_READY and FRESH inputs supply none of this proof.
 4. **Source-bound runtime and end-to-end evidence.** Add and verify packaging/export/preflight and appropriate adapters before launch. Produce actual provider and SQL evidence for both original and recovered payments, unchanged original cash, no extra cash during failure/setup/request, debt/grace/access boundaries and recovery publication. Require the actual operation journal and signature-verified delivered callbacks, plus bounded cleanup and stopped-runtime proof. No fake-driver booleans may stand in for these gates.
 
-Until these blockers are resolved, there is no runnable Sandbox command for this component. The previously accepted first-payment/first-renewal receipt remains its own narrow evidence; full Stage 5B and native failed-renewal recovery remain unaccepted.
+## Native blockers
+
+A future native scenario still needs raw provider failure and recovery producers, a native exact-owner time/readiness producer, verified method and customer confirmation, runtime integration and end-to-end evidence. The implemented backend, its migration and hosted composition require actual hosted verification; their compilation and pure tests do not establish SQL or callback delivery. There is no runnable Sandbox command for this component. The previously accepted first-payment/first-renewal receipt remains its own narrow evidence; full Stage 5B and native failed-renewal recovery remain unaccepted.
+
+## Owned failed-renewal backend checkpoint (offline)
+
+The internal owned-recovery backend now includes a JDBC store, an explicit failure/recovery orchestrator, and an exact-owner isolated billing-time proof. The ordinary FactService constructor denies this recovery seam by default; no runtime registration, provider adapter, browser flow, exporter or native launcher is enabled by this work. The generic backend binds the original published terms; the hosted source fixture retains its genuine EUR 1000-minor initial payment and renewal terms. The future native EUR20 case is a separate acceptance scenario.
+
+The fresh, explicit offline pure-backend checkpoint passed **113/113**, with zero failures or skips. The hosted composition source is authored and compiled only: its real JDBC/FactService/cash/event/outbox, branch exclusion, rollback and stop assertions have **not been executed**. Compilation does not establish PostgreSQL migration or trigger validity, transaction behavior, persisted money or callback delivery. No application context, database, SQL, Docker or provider was run for this checkpoint.
+
+Raw provider failure/recovery observations, a native exact-owner time/readiness producer, customer confirmation, hosted execution and native acceptance evidence remain missing. Native provider recovery is **NOT_RUN**, SQL/runtime is **NOT_RUN**, and full Stage 5B remains **NOT_ACCEPTED**. The earlier pure transcript and accepted initial/first-successful-renewal receipt retain their historical scope.

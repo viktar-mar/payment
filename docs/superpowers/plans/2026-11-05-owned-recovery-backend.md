@@ -55,8 +55,8 @@ Modify `JdbcOwnedFirstRenewalStore.java` only if needed for a narrow package-pri
 
 **Interfaces:** Actual Task1–2 constructors/methods; test-only exact-owner isolated time sample. Runtime/provider/browser factories remain unchanged.
 
-- [ ] Step1: Author genuine JDBC+real FactService failed OPEN debt→grace-1/G checks→explicit same-PI RECOVER association→CASH publication; assert original cash, actual bill/debt/operation/event/outbox and no INVOICE_PAY. Include concurrent branch exclusion, expired/stale/foreign claims, association rollback, post-fact rollback, stopped/no-resume and idempotent read-only replay cases.
-- [ ] Step2: Compile hosted tests but do not execute; run all audited related pure regression. No default Maven test discovery; use cached test-compile or explicit javac closure. Report exact executed vs unexecuted checks and missing runtime/raw-provider/confirmation/time evidence.
+- [x] Step1: Author genuine JDBC+real FactService failed OPEN debt→grace-1/G checks→explicit same-PI RECOVER association→CASH publication; assert original cash, actual bill/debt/operation/event/outbox and no INVOICE_PAY. Include concurrent branch exclusion, expired/stale/foreign claims, association rollback, post-fact rollback, stopped/no-resume and idempotent read-only replay cases.
+- [x] Step2: Compile hosted tests but do not execute; run all audited related pure regression. No default Maven test discovery; use cached test-compile or explicit javac closure. Report exact executed vs unexecuted checks and missing runtime/raw-provider/confirmation/time evidence.
 - [ ] Step3: Update guide/matrix precisely; independent task review and final whole-change review, root local commits. No push/CI/native run required by this offline request.
 
 ## Self-review
