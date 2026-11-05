@@ -45,9 +45,9 @@ Modify `JdbcOwnedFirstRenewalStore.java` only if needed for a narrow package-pri
 
 **Interfaces:** Consume Task1 records/store. Service methods admit/beginFailedRead/publishFailure/reserveExistingRecovery/beginRecoveredRead/publishRecovery/replayPublication/stop. Port void requireAuthorized(Command,Subscription,List<SubscriptionOperation>,Instant billingAt,Instant utcAt), static denied() default; adapter delegates to store's current proof under caller transaction. Existing constructors preserve denied(). Keep all common isolated guards and reject every unrelated operation/marker even with a proof port.
 
-- [ ] Step1: Write meaningful failing pure tests for real service calls and default denial, read expiry/stale/foreign/fence/PI/unknown/duplicates, same-debt recovery and rollback/stop orchestration. Audit closure before execution, no application contexts.
-- [ ] Step2: Implement lock ordering, concrete claim/reservation/association/publication through existing operations and FactService. No provider traffic or custom cash insertion. Require exact isolated billing sample; never set global Clock.
-- [ ] Step3: Implement narrow proof gate before effects; common shape checks stay binding. Test existing constructors and forged proof/foreign marker/unsupported shapes. Run focused/related pure regression and cached compilation. Independent review then root commit.
+- [x] Step1: Write meaningful failing pure tests for real service calls and default denial, read expiry/stale/foreign/fence/PI/unknown/duplicates, same-debt recovery and rollback/stop orchestration. Audit closure before execution, no application contexts.
+- [x] Step2: Implement lock ordering, concrete claim/reservation/association/publication through existing operations and FactService. No provider traffic or custom cash insertion. Require exact isolated billing sample; never set global Clock.
+- [x] Step3: Implement narrow proof gate before effects; common shape checks stay binding. Test existing constructors and forged proof/foreign marker/unsupported shapes. Run focused/related pure regression and cached compilation. Independent review then root commit.
 
 ### Task 3: Hosted composition source and honest operator documentation
 

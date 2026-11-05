@@ -38,6 +38,7 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
     @org.springframework.beans.factory.annotation.Autowired private SubscriptionBillingProofStore billingProofs;
     @org.springframework.beans.factory.annotation.Autowired private SubscriptionPlanProofStore planProofs;
     private final SubscriptionBillingTimePort billingTime;
+    private final SubscriptionIsolatedRecoveryProofPort recoveryProof;
     public SubscriptionFactService(SubscriptionStore subscriptions,SubscriptionOperationStore operations,TrialEligibilityStore trials,
         LockSitePort sites,CustomerStore customers,LockPaymentAccountPort accounts,BillingRecordStore bills,
         SubscriptionCashPort cash,SubscriptionEventStore events,SubscriptionCatalogPort catalog,Clock clock,SubscriptionCallbackPort callbacks,SubscriptionObjectPort objects,BillingMetadataPort metadata,SubscriptionPolicyPort policies,SubscriptionObservationPort observations,dev.genericpayments.platform.shared.application.port.out.DigestPort digest,SubscriptionQuoteStore quotes,SubscriptionSweepPort sweep,SubscriptionReadPreparation reads,SubscriptionAuthorityPort authority){
@@ -47,6 +48,12 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
     public SubscriptionFactService(SubscriptionStore subscriptions,SubscriptionOperationStore operations,TrialEligibilityStore trials,
         LockSitePort sites,CustomerStore customers,LockPaymentAccountPort accounts,BillingRecordStore bills,
         SubscriptionCashPort cash,SubscriptionEventStore events,SubscriptionCatalogPort catalog,Clock clock,SubscriptionCallbackPort callbacks,SubscriptionObjectPort objects,BillingMetadataPort metadata,SubscriptionPolicyPort policies,SubscriptionObservationPort observations,dev.genericpayments.platform.shared.application.port.out.DigestPort digest,SubscriptionQuoteStore quotes,SubscriptionSweepPort sweep,SubscriptionReadPreparation reads,SubscriptionAuthorityPort authority,SubscriptionBillingTimePort billingTime){
+        this(subscriptions,operations,trials,sites,customers,accounts,bills,cash,events,catalog,clock,callbacks,objects,metadata,policies,observations,digest,quotes,sweep,reads,authority,billingTime,SubscriptionIsolatedRecoveryProofPort.denied());
+    }
+    public SubscriptionFactService(SubscriptionStore subscriptions,SubscriptionOperationStore operations,TrialEligibilityStore trials,
+        LockSitePort sites,CustomerStore customers,LockPaymentAccountPort accounts,BillingRecordStore bills,
+        SubscriptionCashPort cash,SubscriptionEventStore events,SubscriptionCatalogPort catalog,Clock clock,SubscriptionCallbackPort callbacks,SubscriptionObjectPort objects,BillingMetadataPort metadata,SubscriptionPolicyPort policies,SubscriptionObservationPort observations,dev.genericpayments.platform.shared.application.port.out.DigestPort digest,SubscriptionQuoteStore quotes,SubscriptionSweepPort sweep,SubscriptionReadPreparation reads,SubscriptionAuthorityPort authority,SubscriptionBillingTimePort billingTime,SubscriptionIsolatedRecoveryProofPort recoveryProof){
+        this.recoveryProof=Objects.requireNonNull(recoveryProof);
         this.billingTime=Objects.requireNonNull(billingTime);
 
         this.subscriptions=subscriptions;this.operations=operations;this.trials=trials;this.sites=sites;this.customers=customers;
@@ -80,7 +87,7 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
         var sample=billingTime.sample(original.paymentAccountId(),original.siteId(),original.customerId(),now);
         var billingAt=sample.billingAt();
         var snapshot=command.snapshot();
-        if(sample.isolated())requireIsolatedShape(original,snapshot,locked);
+        if(sample.isolated())requireIsolatedShape(command,original,snapshot,locked,billingAt,now);
         if(command.fence()!=null){
             var fence=command.fence();
             if(original.revision()!=fence.revision()||!Objects.equals(fence.operationId(),selected==null?null:selected.id())
@@ -299,18 +306,24 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
                 &&o.providerOperationKey().equals(observation.operationKey())&&!CreateSubscriptionFingerprint.startsTrial(o.fingerprint()));
     }
     /** This seam supports facts and reads only; command/time proof expansion requires separate work. */
-    private void requireIsolatedShape(Subscription s,Snapshot snapshot,List<SubscriptionOperation> locked){
+    private void requireIsolatedShape(Command command,Subscription s,Snapshot snapshot,List<SubscriptionOperation> locked,Instant billingAt,Instant utcAt){
         var statuses=Set.of(Subscription.Status.INCOMPLETE,Subscription.Status.ACTIVE,Subscription.Status.PAST_DUE,Subscription.Status.UNPAID);
         if(!statuses.contains(s.billingStatus())||!statuses.contains(snapshot.status())||s.trial()!=null||snapshot.trial()!=null
             ||s.cancellation()!=null||snapshot.cancellationAt()!=null||s.pendingChange()!=null||snapshot.trialEvidence()!=null
             ||snapshot.externalWithdrawalEvidence()!=null||!snapshot.recoveryObservations().isEmpty()
             ||!s.billingPrice().equals(snapshot.billingPrice())||s.entitledPrice()!=null&&!s.entitledPrice().equals(s.billingPrice())
             ||snapshot.period()==null||snapshot.invoices().isEmpty())throw isolatedUnsupported();
-        for(var operation:locked)if(operation.kind()!=SubscriptionOperation.Kind.RECONCILE
+        boolean recovery=locked.stream().anyMatch(o->o.kind()==SubscriptionOperation.Kind.RECOVER);
+        if(recovery)requireIsolatedRecoveryShape(command,s,snapshot,locked);
+        for(var operation:locked)if(!(recovery&&operation.kind()==SubscriptionOperation.Kind.RECOVER)&&operation.kind()!=SubscriptionOperation.Kind.RECONCILE
             &&(operation.kind()!=SubscriptionOperation.Kind.CREATE||CreateSubscriptionFingerprint.startsTrial(operation.fingerprint())))throw isolatedUnsupported();
         for(var invoice:snapshot.invoices())if(!Set.of(BillingRecord.Kind.INITIAL,BillingRecord.Kind.RENEWAL).contains(invoice.kind())
             ||!invoice.price().equals(s.billingPrice())||invoice.previousPrice()!=null
             ||!Set.of(SettlementKind.CASH,SettlementKind.OPEN).contains(invoice.settlement()))throw isolatedUnsupported();
+        if(recovery){
+            recoveryProof.requireAuthorized(command,s,locked,billingAt,utcAt);
+            return;
+        }
         // Only the original non-trial CREATE acknowledgement is supported. Terminal CREATE replay
         // still resolves the exact immutable operation; an unrelated command marker is not a proof.
         if(snapshot.operationKey()!=null||snapshot.operationObservation()!=null){
@@ -323,6 +336,26 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
                 ||operation.kind()!=SubscriptionOperation.Kind.CREATE||!operation.providerOperationKey().equals(key)
                 ||CreateSubscriptionFingerprint.startsTrial(operation.fingerprint()))throw isolatedUnsupported();
         }
+    }
+    private static void requireIsolatedRecoveryShape(Command command,Subscription s,Snapshot snapshot,List<SubscriptionOperation> locked){
+        var recoveries=locked.stream().filter(o->o.kind()==SubscriptionOperation.Kind.RECOVER).toList();
+        if(recoveries.size()!=1||command.source()!=SubscriptionEvent.Source.RECONCILIATION||s.debt()==null
+            ||s.billingStatus()!=Subscription.Status.PAST_DUE||snapshot.status()!=Subscription.Status.ACTIVE
+            ||snapshot.providerRevision()!=0||command.fence()==null)throw isolatedUnsupported();
+        for(var lockedOperation:locked)if(!lockedOperation.siteId().equals(s.siteId())||!lockedOperation.customerId().equals(s.customerId())
+            ||!s.id().equals(lockedOperation.subscriptionId()))throw isolatedUnsupported();
+        var operation=recoveries.getFirst();var fence=command.fence();var marker=snapshot.operationObservation();
+        if(operation.status()!=SubscriptionOperation.Status.RESERVED||!operation.siteId().equals(s.siteId())
+            ||!operation.customerId().equals(s.customerId())||!operation.subscriptionId().equals(s.id())
+            ||operation.expectedRevision()!=s.revision()||fence.revision()!=s.revision()
+            ||!operation.id().equals(fence.operationId())||!Objects.equals(operation.version(),fence.operationVersion())
+            ||fence.lease()!=null||fence.authority()!=null||fence.observationSequence()==null||fence.observationSequence()<0
+            ||!operation.providerOperationKey().equals("subscription:"+s.paymentAccountId().value()+":"+operation.id()+":RECOVER")
+            ||!operation.providerOperationKey().equals(snapshot.operationKey())||marker==null
+            ||marker.state()!=OperationState.APPLIED||!operation.providerOperationKey().equals(marker.operationKey())
+            ||!SubscriptionRecoveryTransaction.recoveryBill(operation).filter(s.debt().billingRecordId()::equals).isPresent()
+            ||locked.stream().anyMatch(o->!o.id().equals(operation.id())&&o.kind()!=SubscriptionOperation.Kind.RECONCILE
+                &&!(o.kind()==SubscriptionOperation.Kind.CREATE&&o.status()==SubscriptionOperation.Status.SUCCEEDED)))throw isolatedUnsupported();
     }
     private static IllegalStateException isolatedUnsupported(){return new IllegalStateException("ISOLATED_BILLING_UNSUPPORTED");}
     private boolean stripeResumeCash(Subscription s,List<SubscriptionOperation> locked,Snapshot snapshot,Invoice invoice){
