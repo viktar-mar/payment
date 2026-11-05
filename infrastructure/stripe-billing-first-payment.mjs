@@ -2,7 +2,7 @@ import {validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal
 import {validateRenewalBoundary,validateRenewalFinalization} from './stripe-billing-first-renewal-response.mjs';
 import {validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {billingBounded,billingCheck,billingError} from './stripe-billing-limits.mjs';
-import {createBillingFirstPaymentRuntime,createBillingFirstRenewalRuntime,billingFirstPaymentDiagnostic,isBillingFirstPaymentDiagnostic} from './stripe-billing-first-payment-runtime.mjs';
+import {createBillingFirstPaymentRuntime,createBillingFirstRenewalRuntime,billingFirstPaymentDiagnostic,billingFirstPaymentPrepareCheckpoint,isBillingFirstPaymentDiagnostic} from './stripe-billing-first-payment-runtime.mjs';
 import {billingUuid} from './stripe-billing-provision.mjs';
 import {isBrowserDiagnostic,browserDiagnostic,browserCleanupConfirmed} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 // Terminal reporting only; the private PREPARE validator keeps its original set.
@@ -32,7 +32,13 @@ async function createOwner(options,dependencies,firstRenewal){
  const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
  const checkIdentity=v=>{if(!originalIdentity||Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))fail('ACK');};
  const resources=()=>Object.freeze({runId:c.runId,expectedSource:c.expectedSource,scope:firstRenewal?'OWNED_INITIAL_AND_FIRST_RENEWAL':'OWNED_INITIAL_PAYMENT',status:state,phase,code:failure,diagnostic,initialAccepted:accepted,...(firstRenewal?{renewalAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
- const fail=(code,detail=null)=>{if(failure===null)diagnostic=isTerminalDiagnostic(detail)?detail:confirmAck?postConfirmCheckpoints[phase]??null:null;failure??=code;lifetime.abort();throw billingError(failure);};
+ const fail=(code,detail=null)=>{
+  if(failure===null){
+   if(detail==='PREPARE_REQUEST')detail=billingFirstPaymentPrepareCheckpoint(runtime)??detail;
+   diagnostic=isTerminalDiagnostic(detail)?detail:confirmAck?postConfirmCheckpoints[phase]??null:null;
+  }
+  failure??=code;lifetime.abort();throw billingError(failure);
+ };
  async function cleanup(){return cleanupPromise??=(async()=>{
   let ok=!journeyStarted||(journeySettled&&journeyClean);const l={deadline:Math.min(Date.now()+120000,(active?.deadline??Date.now())+120000)};
   for(const [o,m]of [[runtime,'close'],[cli,'stopListener'],[bootstrap,'stop'],[fixture,'close']])if(o){

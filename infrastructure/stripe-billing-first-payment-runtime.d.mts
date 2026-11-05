@@ -13,4 +13,5 @@ export interface FirstRenewalRuntime extends FirstPaymentRuntime {boundary(limit
 export function createBillingFirstPaymentRuntime(options:{configuration:unknown;bootstrap:unknown},dependencies?:Record<string,unknown>):Readonly<FirstPaymentRuntime>;
 export function createBillingFirstRenewalRuntime(options:{configuration:unknown;bootstrap:unknown},dependencies?:Record<string,unknown>):Readonly<FirstRenewalRuntime>;
 export function billingFirstPaymentDiagnostic(error:unknown):string|null;
+export function billingFirstPaymentPrepareCheckpoint(runtime:unknown):'PREPARE_REQUEST_AUTHORITY'|'PREPARE_REQUEST_TRANSPORT'|'PREPARE_REQUEST_RESPONSE'|null;
 export function isBillingFirstPaymentDiagnostic(code:unknown):boolean;

@@ -140,3 +140,18 @@ for(const stage of ['SUBMIT','TOKEN'])test('combined owner preserves historical 
  const result=await owner.close();assert.equal(result.diagnostic,code);assert.equal(result.initialAccepted,false);assert.equal(result.renewalAccepted,false);assert.equal(h.calls.includes('observe'),false);assert.equal(h.calls.includes('boundary'),false);
  const line=api.formatBillingFirstRenewalDiagnostic(result);assert.equal(line,'owned_initial_and_first_renewal_diagnostic code='+code+' cleanup=CONFIRMED');assert.equal(api.parseBillingFirstRenewalDiagnosticLine(line),line);assert.ok(line.length<160);
 });
+
+for(const code of ['PREPARE_REQUEST_AUTHORITY','PREPARE_REQUEST_TRANSPORT','PREPARE_REQUEST_RESPONSE'])test('finite prepare location '+code+' formats in either scope without entering the server stage grammar',async()=>{
+ const closed={status:'CLOSED',initialAccepted:false,renewalAccepted:false,code:'DISPATCH',diagnostic:code,cleanupConfirmed:false,scope:'OWNED_INITIAL_AND_FIRST_RENEWAL'};
+ assert.equal(client.isBillingFirstPaymentDiagnostic(code),true);
+ for(const [prefix,format,parse,other]of [
+  ['owned_initial_payment_diagnostic',api.formatBillingFirstPaymentDiagnostic,api.parseBillingFirstPaymentDiagnosticLine,api.parseBillingFirstRenewalDiagnosticLine],
+  ['owned_initial_and_first_renewal_diagnostic',api.formatBillingFirstRenewalDiagnostic,api.parseBillingFirstRenewalDiagnosticLine,api.parseBillingFirstPaymentDiagnosticLine],
+ ]){
+  const line=prefix+' code='+code+' cleanup=UNCONFIRMED';assert.equal(format(closed),line);assert.equal(parse(line),line);assert.ok(line.length<=160);assert.equal(other(line),null);
+  for(const bad of [line+'\n',line+' extra',line.replace(code,code+'_FOREIGN'),line.replace(code,'PREFIX_'+code),line.replace(code,code+'1'),line.replace(code,'private-sentinel'),line+' '.repeat(161),line+'\n'+line])assert.equal(parse(bad),null);
+  assert.equal(format({...closed,diagnostic:code+'_FOREIGN'}),null);
+ }
+ const h=await runtimeHarness({route:'prepare',reply:()=>new Response(JSON.stringify({code:'INITIAL_PAYMENT_STOPPED',stage:code}),{status:400})});
+ const l=limits();await h.runtime.ready(l);let error;try{await h.runtime.prepare(scope(),l);}catch(e){error=e;}assert.equal(client.billingFirstPaymentDiagnostic(error),'PREPARE_HTTP');
+});

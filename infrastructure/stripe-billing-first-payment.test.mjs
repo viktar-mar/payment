@@ -315,3 +315,63 @@ test('startup diagnostic owner retains false START result before cleanup',async(
  const h=harness();h.bootstrap.start=async()=>false;h.bootstrap.startupDiagnostic=()=> 'START_BOOTSTRAP_PROOF_REJECTED';h.bootstrap.stop=async()=>{h.bootstrap.startupDiagnostic=()=>null;return true;};
  const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);await assert.rejects(owner.run(journey,limits()));assert.equal(owner.resources().diagnostic,'START_BOOTSTRAP_PROOF_REJECTED');assert.equal(owner.resources().code,'START');
 });
+
+// Breaks caught: owner-side cancellation must snapshot the real client's source
+// boundary before aborting it; late runtime settlement must never regain authority.
+for(const renewal of [false,true])for(const boundary of ['AUTHORITY','TRANSPORT','RESPONSE'])for(const lateReject of [false,true])test((renewal?'combined':'payment')+' first rejection snapshots prepare '+boundary+' before late '+(lateReject?'error':'success'),async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const h=harness(),controller=new AbortController(),requests=[];let enter,resolve,reject,admissions=0,reads=0,realRuntime;
+ const entered=new Promise(r=>enter=r),held=new Promise((yes,no)=>{resolve=yes;reject=no;});
+ const hostile=new Proxy({progress:'PREPARE_REQUEST_RESPONSE'},{get(){reads++;throw null;},getPrototypeOf(){reads++;throw null;},ownKeys(){reads++;throw null;}});
+ h.bootstrap[renewal?'withFirstRenewalRuntime':'withFirstPaymentRuntime']=cb=>{
+  admissions++;
+  if(admissions===2&&boundary==='AUTHORITY'){enter();return held;}
+  return cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});
+ };
+ h.dependencies.createRuntime=args=>realRuntime=(renewal?runtimeApi.createBillingFirstRenewalRuntime:runtimeApi.createBillingFirstPaymentRuntime)(args,{fetch:async url=>{
+  requests.push(url.split('/').at(-1));
+  if(url.endsWith('/status'))return new Response(JSON.stringify({phase:'NEW',code:'OK',run_id:id(1)}));
+  if(boundary==='TRANSPORT'){enter();return held;}
+  return {status:200,body:{async *[Symbol.asyncIterator](){enter();await held;yield Buffer.from(JSON.stringify(prepared()));},cancel:async()=>{}}};
+ }});
+ const owner=await (renewal?api.createOwnedBillingFirstRenewal:api.createOwnedBillingFirstPayment)(settlementOptions(renewal),h.dependencies);
+ const running=owner.run(async p=>{await p.prepare({token:'customer-token',origin:scope().endpoints.demo},'original-create',{deadline:901000});await p.confirm(confirmation(),{deadline:901000});},{deadline:1001000,signal:controller.signal});
+ const rejected=assert.rejects(running);await entered;
+ if(boundary==='TRANSPORT')t.mock.timers.tick(120000);else controller.abort();
+ await rejected;const first=await owner.close();
+ // Assert the consumer-visible result first: red must exercise real owner/runtime.
+ assert.equal(first.diagnostic,'PREPARE_REQUEST_'+boundary);
+ assert.equal(runtimeApi.billingFirstPaymentPrepareCheckpoint(realRuntime),'PREPARE_REQUEST_'+boundary);
+ assert.equal(first.initialAccepted,false);assert.equal(first.full5bAccepted,false);if(renewal)assert.equal(first.renewalAccepted,false);
+ assert.deepEqual(requests,boundary==='AUTHORITY'?['status']:['status','prepare']);
+ if(lateReject)reject(hostile);else resolve(boundary==='TRANSPORT'?new Response(JSON.stringify(prepared())):true);
+ await settlementTurn();t.mock.timers.tick(120000);await settlementTurn();
+ assert.deepEqual(await owner.close(),first);assert.equal(reads,0);
+ assert.deepEqual(requests,boundary==='AUTHORITY'?['status']:['status','prepare']);
+ assert.equal(h.calls.filter(c=>c.startsWith('create-dispatch:')).length,1);
+ assert.ok(!h.calls.some(c=>['create-ack','confirm-ack','observe'].includes(c)||c.startsWith('confirm-dispatch:')));
+ await assert.rejects(owner.run(journey,{deadline:Date.now()+10000}),/SINGLE_USE/);
+});
+
+test('prepare progress lookup accepts only genuine runtimes without reading hostile fields',async()=>{
+ let reads=0;const foreign=new Proxy({prepareCheckpoint:'PREPARE_REQUEST_RESPONSE',progress:'PREPARE_REQUEST_RESPONSE'},{get(){reads++;throw null;},getOwnPropertyDescriptor(){reads++;throw null;},getPrototypeOf(){reads++;throw null;},ownKeys(){reads++;throw null;}});
+ for(const value of [foreign,{},null,undefined,1,'PREPARE_REQUEST_RESPONSE'])assert.equal(runtimeApi.billingFirstPaymentPrepareCheckpoint(value),null);
+ const f=await diagnosticRuntime(()=>new Response(JSON.stringify(prepared())));
+ assert.equal(runtimeApi.billingFirstPaymentPrepareCheckpoint(f.runtime),null);assert.ok(Object.isFrozen(f.runtime));
+ assert.equal(runtimeApi.billingFirstPaymentPrepareCheckpoint(new Proxy(f.runtime,{})),null);assert.equal(reads,0);
+});
+
+test('real pending prepare progress cannot enrich an earlier null owner failure',async()=>{
+ const h=harness();let enter,release,realRuntime;const entered=new Promise(r=>enter=r),held=new Promise(r=>release=r);let requests=0;
+ h.bootstrap.withFirstPaymentRuntime=cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});
+ h.dependencies.createRuntime=args=>realRuntime=runtimeApi.createBillingFirstPaymentRuntime(args,{fetch:async url=>{requests++;if(url.endsWith('/status'))return new Response(JSON.stringify({phase:'NEW',code:'OK',run_id:id(1)}));enter();return held;}});
+ const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);
+ await assert.rejects(owner.run(async(p,l)=>{
+  const first=p.prepare({token:'customer-token',origin:scope().endpoints.demo},'original-create',l);first.catch(()=>{});await entered;
+  await assert.rejects(p.prepare({token:'customer-token',origin:scope().endpoints.demo},'duplicate-create',l));await first;
+ },limits()));
+ const first=await owner.close();assert.equal(first.code,'SINGLE_USE');assert.equal(first.diagnostic,null);
+ assert.equal(runtimeApi.billingFirstPaymentPrepareCheckpoint(realRuntime),'PREPARE_REQUEST_TRANSPORT');
+ release(new Response('{"code":"INITIAL_PAYMENT_STOPPED","stage":"REQUEST"}',{status:400}));await settlementTurn();
+ assert.deepEqual(await owner.close(),first);assert.equal(requests,2);assert.ok(!h.calls.includes('create-ack'));
+});

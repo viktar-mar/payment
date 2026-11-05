@@ -3,11 +3,14 @@ import {validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal
 import {validateRenewalBoundary,validateRenewalFinalization} from './stripe-billing-first-renewal-response.mjs';
 import {validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 const prepareStages=new Set(['REQUEST','PREFLIGHT','CLOCK_ADMISSION','CLOCK_CREATE','CUSTOMER_CREATE','LOCAL_RESERVE','SUBSCRIPTION_CREATE','LOCAL_RECORD','RECEIPT','ACTION_SELECT','ACTION_SCOPE','ACTION_AUTHORITY','ACTION_VERIFICATION','ACTION_GRAPH','ACTION_GRAPH_LINE_ASSOCIATION','ACTION_GRAPH_INVOICE_SETTLEMENT','ACTION_GRAPH_INVOICE_SETTLEMENT_PRORATION_FLAG','ACTION_GRAPH_INVOICE_SETTLEMENT_PRORATION_KIND','ACTION_GRAPH_INVOICE_SETTLEMENT_COLLECTION_METHOD','ACTION_GRAPH_INVOICE_SETTLEMENT_PAID_OFF_STRIPE','ACTION_GRAPH_INVOICE_SETTLEMENT_OVERPAID','ACTION_GRAPH_INVOICE_SETTLEMENT_STARTING_BALANCE','ACTION_GRAPH_INVOICE_SETTLEMENT_ENDING_BALANCE','ACTION_GRAPH_INVOICE_SETTLEMENT_PRE_CREDIT_NOTES','ACTION_GRAPH_INVOICE_SETTLEMENT_POST_CREDIT_NOTES','ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_DISCOUNTS','ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_DISCOUNT_AMOUNTS','ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_PRETAX_CREDITS','ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_DISCOUNT_AMOUNTS','ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_PRETAX_CREDITS','ACTION_GRAPH_INVOICE_SETTLEMENT_TOTAL','ACTION_GRAPH_INVOICE_SETTLEMENT_SUBTOTAL','ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_AMOUNT','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_DUE_POSITIVE','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_DUE_CATALOG','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_PAID','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_REMAINING','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_STATUS','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_PAYMENT','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_TYPE','ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_INTENT','ACTION_GRAPH_INVOICE_SETTLEMENT_SNAPSHOT_UNSUPPORTED','ACTION_GRAPH_INVOICE_SETTLEMENT_ACTION_OPEN_CASH','ACTION_GRAPH_INVOICE_SETTLEMENT_ACTION_OPEN','ACTION_GRAPH_PAYMENT_ALLOCATION','ACTION_GRAPH_PAYMENT_ALLOCATION_STATUS_UNAVAILABLE','ACTION_GRAPH_PAYMENT_ALLOCATION_STATUS_NOT_OPEN','ACTION_GRAPH_PAYMENT_ALLOCATION_DEFAULT_UNAVAILABLE','ACTION_GRAPH_PAYMENT_ALLOCATION_DEFAULT_NOT_TRUE','ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_REQUESTED_UNAVAILABLE','ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_REQUESTED_MISMATCH','ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_UNAVAILABLE','ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_NONZERO','ACTION_GRAPH_PAYMENT_ALLOCATION_PAYMENT_UNAVAILABLE','ACTION_GRAPH_PAYMENT_ALLOCATION_TYPE_UNAVAILABLE','ACTION_GRAPH_PAYMENT_ALLOCATION_TYPE_UNEXPECTED','ACTION_RESERVATION','ACTION_RESULT','ACTION_BINDING','SESSION_SELECT','RESPONSE_BUILD','UNCLASSIFIED']);
-const prepareCodes=new Set(['PREPARE_AUTHORITY','PREPARE_REQUEST','PREPARE_HTTP','PREPARE_RESPONSE','PREPARE_ACK',...[...prepareStages].map(s=>'PREPARE_SERVER_'+s)]);
+const prepareCodes=new Set(['PREPARE_AUTHORITY','PREPARE_REQUEST','PREPARE_REQUEST_AUTHORITY','PREPARE_REQUEST_TRANSPORT','PREPARE_REQUEST_RESPONSE','PREPARE_HTTP','PREPARE_RESPONSE','PREPARE_ACK',...[...prepareStages].map(s=>'PREPARE_SERVER_'+s)]);
 const renewalBoundaryCodes=new Set([...['TRANSPORT','HTTP','RESPONSE'].map(stage=>'POST_CONFIRM_RENEWAL_BOUNDARY_'+stage),...['INITIAL_RECEIPT','ADMISSION','CLOCK_ADVANCE','CLOCK_ADVANCE_AUTHORITY','CLOCK_ADVANCE_PREPARE','CLOCK_ADVANCE_ACCOUNT','CLOCK_ADVANCE_RESERVE','CLOCK_ADVANCE_CLAIM','CLOCK_ADVANCE_CLIENT','CLOCK_ADVANCE_PRE_READ','CLOCK_ADVANCE_PRE_VALIDATE','CLOCK_ADVANCE_POST','CLOCK_ADVANCE_POST_VALIDATE','CLOCK_ADVANCE_ACK_STORE','CLOCK_ADVANCE_POLL_WAIT','CLOCK_ADVANCE_POLL_READ','CLOCK_ADVANCE_POLL_VALIDATE','CLOCK_ADVANCE_POLL_EXHAUSTED','CLOCK_ADVANCE_READY_STORE','GRAPH','GRAPH_OBSERVER_INIT','GRAPH_CLAIM','GRAPH_CLOCK_BEFORE','GRAPH_REMOTE_PRECHECK','GRAPH_CUSTOMER','GRAPH_SUBSCRIPTION','GRAPH_INVOICES','GRAPH_INITIAL_INVOICE','GRAPH_RENEWAL_INVOICE','GRAPH_CLOCK_AFTER','GRAPH_ACCEPT','GRAPH_ASSERT','BOUNDARY_RESPONSE'].map(stage=>'POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_'+stage)]);
 const ownDiagnostics=new WeakMap();
+const ownPrepareCheckpoints=new WeakMap();
 /** Only errors created here carry metadata; foreign rejections are never inspected. */
 export const billingFirstPaymentDiagnostic=error=>ownDiagnostics.get(error)??null;
+/** Last local prepare boundary only; neither completion nor provider proof. */
+export const billingFirstPaymentPrepareCheckpoint=runtime=>ownPrepareCheckpoints.get(runtime)??null;
 export const isBillingFirstPaymentDiagnostic=code=>typeof code==='string'&&(prepareCodes.has(code)||renewalBoundaryCodes.has(code));
 const need=v=>{if(!v)throw billingError('RUNTIME');};
 const exact=(v,keys)=>v&&typeof v==='object'&&!Array.isArray(v)&&Object.keys(v).sort().join(',')===[...keys].sort().join(',');
@@ -29,13 +32,16 @@ function createRuntime({configuration,bootstrap},dependencies,firstRenewal){
   try{
    billingCheck(limits);if(deadline===undefined){need(limits.deadline<=Date.now()+2700000);deadline=limits.deadline;}need(limits.deadline<=deadline);
    let result,entered=false;if(route==='prepare')checkpoint='PREPARE_AUTHORITY';
+   if(route==='prepare')ownPrepareCheckpoints.set(runtime,'PREPARE_REQUEST_AUTHORITY');
    const admitted=await bootstrap[firstRenewal?'withFirstRenewalRuntime':'withFirstPaymentRuntime'](async privateRuntime=>{
     if(route==='prepare')checkpoint='PREPARE_AUTHORITY';if(firstRenewal||route==='prepare'){need(!entered);entered=true;}
     need(!failed);
     need(privateRuntime.endpoint==='http://127.0.0.1:'+c.controlPort&&/^[A-Za-z0-9_-]{43}$/.test(privateRuntime.capability));
     if(route==='prepare')checkpoint='PREPARE_REQUEST';
     result=await billingBounded(limits,async l=>{
+     if(route==='prepare')ownPrepareCheckpoints.set(runtime,'PREPARE_REQUEST_TRANSPORT');
      const response=await (dependencies.fetch??globalThis.fetch)(privateRuntime.endpoint+(['boundary','finalization'].includes(route)?'/first-renewal/':'/initial-payment/')+route,{method:body===undefined?'GET':'POST',redirect:'error',signal:l.signal,headers:{Accept:'application/json',Authorization:'Bearer '+privateRuntime.capability,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});
+     if(route==='prepare')ownPrepareCheckpoints.set(runtime,'PREPARE_REQUEST_RESPONSE');
      let count=0;const chunks=[];const stopped=route==='prepare'&&response.status===400,boundaryStopped=route==='boundary'&&response.status===400;
      if(route==='prepare')checkpoint=response.status===200?'PREPARE_RESPONSE':'PREPARE_HTTP';
      if(route==='boundary')checkpoint=response.status===200?'POST_CONFIRM_RENEWAL_BOUNDARY_RESPONSE':'POST_CONFIRM_RENEWAL_BOUNDARY_HTTP';
@@ -73,7 +79,7 @@ function createRuntime({configuration,bootstrap},dependencies,firstRenewal){
   }catch{failed=true;throw failure(route==='prepare'&&(limits?.signal?.aborted||Date.now()>=limits?.deadline)?'PREPARE_REQUEST':checkpoint);}finally{busy=false;}
  }
  const stop=code=>{failed=true;throw failure(code);};
- return Object.freeze({
+ const runtime=Object.freeze({
   async ready(l){if(phase!=='NEW')stop();const v=await request('status',undefined,l);if(v.phase!=='NEW')stop();phase='READY';return true;},
   async prepare(s,l){if(phase!=='READY')stop();phase='PREPARING';const v=await request('prepare',{run_id:c.runId,source_sha:c.expectedSource,account_id:s.accountId,site_id:s.siteId,customer_id:s.customerId,price_id:s.priceId,origin:s.origin,create_key:s.createKey,customer_token:s.customerToken},l);if(v.phase!=='PREPARED')stop('PREPARE_RESPONSE');if(firstRenewal){for(const [k,n]of [['run_id','runId'],['account_id','accountId'],['site_id','siteId'],['customer_id','customerId'],['price_id','priceId']])if(v[k]!==s[n])stop('PREPARE_ACK');originalIdentity=Object.fromEntries(identity.slice(2).map(k=>[k,v[k]]));}phase='PREPARED';return v;},
   async confirm(original,l){if(phase!=='PREPARED')stop();phase='CONFIRMING';const v=await request('confirm',original,l);if(v.phase!=='OBSERVE'||v.state!=='OBSERVE'||v.next_action_allowed!==false||v.retry_allowed!==false||v.successor_attempt_id!==null)stop();if(firstRenewal&&Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))stop();phase='OBSERVE';return v;},
@@ -84,4 +90,5 @@ function createRuntime({configuration,bootstrap},dependencies,firstRenewal){
   }:{}),
   async close(){failed=true;failureLatched=true;phase='CLOSED';return true;},
  });
+ ownPrepareCheckpoints.set(runtime,null);return runtime;
 }
