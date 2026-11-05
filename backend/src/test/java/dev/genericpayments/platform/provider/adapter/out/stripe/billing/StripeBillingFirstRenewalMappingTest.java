@@ -76,8 +76,16 @@ class StripeBillingFirstRenewalMappingTest {
         assertThat(StripeBillingSnapshotMapper.retrieveOwnedFirstRenewal(f.f.clients.create(f.f.credentials.resolve(f.f.account)),f.ordinary(),admission,
             boundaryReady(admission,f.utc.plusSeconds(4)),f.utc.plusSeconds(5))).isInstanceOf(MappedPending.class);
     }
-    @ParameterizedTest @ValueSource(strings={"missing","null","number","wrong","duplicate"})
-    void renewalFlatItemMustBeLiteralExactEvidence(String representation){
+    @Test void ownedRenewalUsesExactNestedAssociationWhenFlatDuplicatesAreUnavailable(){
+        for(boolean paid:new boolean[]{false,true}){
+            var f=paidLocal();var admission=admission(f);queueGraph(f,paid);
+            replaceReply(f,8,body->{var page=StripeBillingOwnedSubscriptionFixture.json(body);var line=page.getAsJsonArray("data").get(0).getAsJsonObject();
+                for(String field:new String[]{"subscription","subscription_item"})line.remove(field);return page.toString();});
+            assertThat(mapFinal(f,admission)).isInstanceOf(paid?MappedPaid.class:MappedPending.class);
+        }
+    }
+    @ParameterizedTest @ValueSource(strings={"null","number","wrong","duplicate"})
+    void presentRenewalFlatItemMustRemainLiteralExactEvidence(String representation){
         var f=paidLocal();var admission=admission(f);queueGraph(f,false);
         replaceReply(f,8,body->{var page=StripeBillingOwnedSubscriptionFixture.json(body);var line=page.getAsJsonArray("data").get(0).getAsJsonObject();
             switch(representation){case "missing"->line.remove("subscription_item");case "null"->line.add("subscription_item",com.google.gson.JsonNull.INSTANCE);
@@ -86,6 +94,51 @@ class StripeBillingFirstRenewalMappingTest {
                 default->throw new AssertionError(representation);}return page.toString();});
         assertThatThrownBy(()->StripeBillingSnapshotMapper.retrieveOwnedFirstRenewal(f.f.clients.create(f.f.credentials.resolve(f.f.account)),f.ordinary(),admission,
             boundaryReady(admission,f.utc.plusSeconds(4)),f.utc.plusSeconds(5))).isInstanceOf(RuntimeException.class);
+    }
+    @ParameterizedTest @ValueSource(strings={"null","number","wrong","duplicate","nested-subscription","nested-item"})
+    void optionalFlatReferencesCannotReplaceOrContradictNestedOwnership(String mutation){
+        var f=paidLocal();var admission=admission(f);queueGraph(f,false);
+        replaceReply(f,8,body->{var page=StripeBillingOwnedSubscriptionFixture.json(body);var line=page.getAsJsonArray("data").get(0).getAsJsonObject();line.remove("subscription_item");
+            switch(mutation){case "null"->line.add("subscription",com.google.gson.JsonNull.INSTANCE);case "number"->line.addProperty("subscription",42);case "wrong"->line.addProperty("subscription","sub_foreign");
+                case "duplicate"->{return page.toString().replace("\"subscription\":\"sub_owned\"","\"subscription\":\"sub_owned\",\"subscription\":\"sub_owned\"");}
+                default->{line.remove("subscription");line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").remove(mutation.equals("nested-item")?"subscription_item":"subscription");}}
+            return page.toString();});
+        assertThatThrownBy(()->mapFinal(f,admission)).isInstanceOf(RuntimeException.class);
+    }
+    @Test void ordinaryAdjustmentGuardStillRequiresKnownZeroAmounts(){
+        var f=paidLocal();assertThat(StripeBillingMutationAdapter.noAdjustments(com.stripe.net.ApiResource.GSON.fromJson(f.invoice,com.stripe.model.Invoice.class))).isTrue();
+        f.invoice.remove("amount_paid_off_stripe");assertThat(StripeBillingMutationAdapter.noAdjustments(com.stripe.net.ApiResource.GSON.fromJson(f.invoice,com.stripe.model.Invoice.class))).isFalse();
+    }
+    @Test void ownedRenewalSupportsObservedExpandedDraftAndCashShapes(){
+        for(boolean paid:new boolean[]{false,true}){
+            var f=paidLocal();var admission=admission(f);queueGraph(f,paid);
+            replaceReply(f,2,body->{var page=StripeBillingOwnedSubscriptionFixture.json(body);
+                if(!paid)page.getAsJsonArray("data").get(1).getAsJsonObject().add("ending_balance",com.google.gson.JsonNull.INSTANCE);return page.toString();});
+            replaceReply(f,8,body->{var page=StripeBillingOwnedSubscriptionFixture.json(body);var line=page.getAsJsonArray("data").get(0).getAsJsonObject();line.remove("subscription");line.remove("subscription_item");return page.toString();});
+            assertThat(mapFinal(f,admission)).isInstanceOf(paid?MappedPaid.class:MappedPending.class);
+            assertThat(f.f.http.calls.stream().filter(r->r.url().getPath().equals("/v1/invoices")).toList()).singleElement()
+                .satisfies(r->assertThat(r.params().get("expand")).isEqualTo(java.util.List.of("data.amount_paid_off_stripe")));
+        }
+    }
+    @ParameterizedTest @ValueSource(strings={"amount_overpaid","starting_balance","pre_payment_credit_notes_amount","post_payment_credit_notes_amount","ending_balance"})
+    void unavailableOtherFinalizedAmountsRemainUnsupported(String field){
+        var f=paidLocal();var admission=admission(f);queueGraph(f,true);
+        replaceReply(f,2,body->{var page=StripeBillingOwnedSubscriptionFixture.json(body);var invoice=page.getAsJsonArray("data").get(1).getAsJsonObject();invoice.add(field,com.google.gson.JsonNull.INSTANCE);return page.toString();});
+        assertThatThrownBy(()->mapFinal(f,admission)).isInstanceOf(RuntimeException.class);
+    }
+    @ParameterizedTest @ValueSource(strings={"missing","null","negative"})
+    void expandedRenewalOffStripeMustRemainKnownZero(String shape){
+        for(boolean paid:new boolean[]{false,true}){
+            var f=paidLocal();var admission=admission(f);queueGraph(f,paid);
+            replaceReply(f,2,body->{var page=StripeBillingOwnedSubscriptionFixture.json(body);var invoice=page.getAsJsonArray("data").get(1).getAsJsonObject();
+                if(shape.equals("missing"))invoice.remove("amount_paid_off_stripe");else if(shape.equals("null"))invoice.add("amount_paid_off_stripe",com.google.gson.JsonNull.INSTANCE);else invoice.addProperty("amount_paid_off_stripe",-1);return page.toString();});
+            assertThatThrownBy(()->mapFinal(f,admission)).isInstanceOf(RuntimeException.class);
+        }
+    }
+    @Test void finalizedOpenRenewalCannotUseDraftBalanceAllowance(){
+        var f=paidLocal();var admission=admission(f);queueGraph(f,false);
+        replaceReply(f,2,body->{var page=StripeBillingOwnedSubscriptionFixture.json(body);var invoice=page.getAsJsonArray("data").get(1).getAsJsonObject();invoice.addProperty("status","open");invoice.add("ending_balance",com.google.gson.JsonNull.INSTANCE);return page.toString();});
+        assertThatThrownBy(()->mapFinal(f,admission)).isInstanceOf(RuntimeException.class);
     }
     @ParameterizedTest @ValueSource(strings={"third","duplicate-initial","duplicate-renewal","initial-allocation","initial-pi","renewal-reverse","split","created","item","terms","clock","gap","overlap","end","void","uncollectible","action","failed","zero","credit","flat-subscription","nested-item","off-stripe"})
     void malformedOrUnsupportedRenewalNeverProducesCash(String mutation){
@@ -107,8 +160,8 @@ class StripeBillingFirstRenewalMappingTest {
                 case "overlap"->first.getAsJsonObject("period").addProperty("start",1702678399);case "end"->first.getAsJsonObject("period").addProperty("end",1702682000);
                 case "void","uncollectible"->renewal.addProperty("status",mutation);case "action"->first.addProperty("status","requires_action");case "failed"->first.addProperty("status","requires_payment_method");
                 case "zero"->renewal.addProperty("amount_due",0);case "credit"->renewal.addProperty("pre_payment_credit_notes_amount",1);
-                case "flat-subscription"->first.remove("subscription");case "nested-item"->first.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription_item","si_foreign");
-                case "off-stripe"->renewal.remove("amount_paid_off_stripe");default->throw new AssertionError(mutation);
+                case "flat-subscription"->first.addProperty("subscription","sub_foreign");case "nested-item"->first.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription_item","si_foreign");
+                case "off-stripe"->renewal.addProperty("amount_paid_off_stripe",1);default->throw new AssertionError(mutation);
             }return json.toString();});
         assertThatThrownBy(()->StripeBillingSnapshotMapper.retrieveOwnedFirstRenewal(f.f.clients.create(f.f.credentials.resolve(f.f.account)),f.ordinary(),admission,
             boundaryReady(admission,f.utc.plusSeconds(4)),f.utc.plusSeconds(5))).as(mutation).isInstanceOf(RuntimeException.class);

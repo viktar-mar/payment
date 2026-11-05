@@ -66,6 +66,9 @@ class OwnedBillingFirstRenewalScenarioIntegrationTest extends OwnedBillingFirstP
         long at=finalization?end+3600:end;
         var renewal=graph.invoice.deepCopy();renewal.addProperty("id","in_renewal");renewal.addProperty("billing_reason","subscription_cycle");renewal.addProperty("status",paid?"paid":"draft");renewal.addProperty("amount_paid",paid?2000:0);renewal.addProperty("amount_remaining",paid?0:2000);renewal.addProperty("amount_paid_off_stripe",0);
         var line=graph.line.deepCopy();line.addProperty("id","il_renewal");line.addProperty("invoice","in_renewal");line.addProperty("subscription","sub_owned");line.addProperty("subscription_item","si_owned");line.getAsJsonObject("period").addProperty("start",end);line.getAsJsonObject("period").addProperty("end",next);
+        // Observed pinned expanded shape: nested associations, known off-stripe zero, unfinalized draft balance.
+        line.remove("subscription");line.remove("subscription_item");
+        if(!paid)renewal.add("ending_balance",JsonNull.INSTANCE);
         graph.item().addProperty("current_period_start",end);graph.item().addProperty("current_period_end",next);
         Collections.addAll(renewalReplies,clock(at,"ready"),customerJson("clock_owned"),graph.remote.toString(),StripeBillingOwnedSubscriptionFixture.page(graph.invoice,renewal),StripeBillingOwnedSubscriptionFixture.page(graph.line),StripeBillingOwnedSubscriptionFixture.page(graph.allocation),graph.pi.toString(),graph.charge.toString(),StripeBillingOwnedSubscriptionFixture.page(graph.allocation),StripeBillingOwnedSubscriptionFixture.page(line));
         if(paid){

@@ -165,12 +165,12 @@ public final class StripeBillingSnapshotMapper {
         SettlementTrace(boolean enabled){this.enabled=enabled;}
         boolean check(boolean valid,SettlementReason reason){if(enabled&&!valid&&first==null)first=reason;return valid;}
         // All six getter arguments are evaluated before this helper, as with the original zeros call.
-        boolean plainAmounts(Long paidOffStripe,Long overpaid,Long starting,Long ending,Long preCredit,Long postCredit,boolean acceptsUnavailableOffStripe){
+        boolean plainAmounts(Long paidOffStripe,Long overpaid,Long starting,Long ending,Long preCredit,Long postCredit,boolean acceptsUnavailableOffStripe,boolean acceptsUnfinalizedEnding){
             // Application evidence policy: unavailable is unknown, not zero or proof of no outside funding.
             return check(Objects.equals(paidOffStripe,0L)||acceptsUnavailableOffStripe&&paidOffStripe==null,SettlementReason.PAID_OFF_STRIPE)
                 &&check(Objects.equals(overpaid,0L),SettlementReason.OVERPAID)
                 &&check(Objects.equals(starting,0L),SettlementReason.STARTING_BALANCE)
-                &&check(Objects.equals(ending,0L),SettlementReason.ENDING_BALANCE)
+                &&check(Objects.equals(ending,0L)||acceptsUnfinalizedEnding&&ending==null,SettlementReason.ENDING_BALANCE)
                 &&check(Objects.equals(preCredit,0L),SettlementReason.PRE_CREDIT_NOTES)
                 &&check(Objects.equals(postCredit,0L),SettlementReason.POST_CREDIT_NOTES);
         }
@@ -365,7 +365,7 @@ public final class StripeBillingSnapshotMapper {
                 require(saved!=null&&saved.admissionId().equals(admission.id())&&saved.id().equals(ready.ack().advance().boundary())
                     &&saved.ready().id().equals(ready.ack().advance().predecessorReady())&&saved.item().equals(item.getId())&&saved.period().equals(period));
             }else require(saved==null);
-            checkpoint(RenewalCheckpoint.INVOICES);sourceInvoices=pages(after->client.v1().invoices().list(InvoiceListParams.builder().setSubscription(remote.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build(),options()));
+            checkpoint(RenewalCheckpoint.INVOICES);sourceInvoices=pages(after->client.v1().invoices().list(InvoiceListParams.builder().setSubscription(remote.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after).addExpand("data.amount_paid_off_stripe").build(),options()));
             require(sourceInvoices.size()==2);
             var historical=sourceInvoices.stream().filter(i->admission.invoice().equals(i.getId())&&"subscription_create".equals(i.getBillingReason())).toList();
             var renewals=sourceInvoices.stream().filter(i->!admission.invoice().equals(i.getId())&&"subscription_cycle".equals(i.getBillingReason())).toList();
@@ -510,15 +510,15 @@ public final class StripeBillingSnapshotMapper {
             }catch(java.io.IOException|RuntimeException malformed){throw mismatch();}
         }
         void rememberRenewalFlatItems(StripeCollection<InvoiceLineItem> page){
-            // The pinned SDK has no flat subscription_item getter. Require its literal value in this same response.
+            // Pinned wire uses the mandatory nested association. Validate any optional flat duplicate in this same response.
             require(page.getLastResponse()!=null&&page.getData()!=null);
             try{
                 var raw=NATIVE_JSON.readTree(page.getLastResponse().body());var data=raw.get("data");
                 require(data!=null&&data.isArray()&&data.size()==page.getData().size());
                 for(int i=0;i<data.size();i++){
-                    var line=data.get(i);var id=line.get("id");var item=line.get("subscription_item");
-                    require(id!=null&&id.isTextual()&&id.textValue().equals(page.getData().get(i).getId())&&item!=null&&item.isTextual());
-                    require(renewalFlatItems.put(id.textValue(),item.textValue())==null);
+                    var line=data.get(i);var id=line.get("id");var item=line.get("subscription_item");var subscription=line.get("subscription");
+                    require(id!=null&&id.isTextual()&&id.textValue().equals(page.getData().get(i).getId())&&(item==null||item.isTextual())&&(subscription==null||subscription.isTextual()));
+                    if(item!=null)require(renewalFlatItems.put(id.textValue(),item.textValue())==null);
                 }
             }catch(java.io.IOException malformed){throw mismatch();}
         }
@@ -542,11 +542,12 @@ public final class StripeBillingSnapshotMapper {
             require(lines.size()==1);var line=lines.getFirst();ref(line.getId(),"il_");
             // Only a typed original receipt permits an absent duplicate flat reference; nested ownership remains mandatory.
             boolean originalHistory=original!=null&&(renewalAdmission==null||renewalAdmission.invoice().equals(invoice.getId())&&"subscription_create".equals(invoice.getBillingReason()));
-            requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&(remote.getId().equals(line.getSubscription())||originalHistory&&line.getSubscription()==null)&&Objects.equals(line.getQuantity(),1L)
+            boolean ownedRenewal=renewalAdmission!=null&&!originalHistory;
+            requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&(remote.getId().equals(line.getSubscription())||(originalHistory||ownedRenewal)&&line.getSubscription()==null)&&Objects.equals(line.getQuantity(),1L)
                 &&line.getParent()!=null&&"subscription_item_details".equals(line.getParent().getType())&&line.getParent().getSubscriptionItemDetails()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             var detail=line.getParent().getSubscriptionItemDetails();
-            if(renewalAdmission!=null&&!originalHistory)require(item.getId().equals(renewalFlatItems.get(line.getId()))
-                &&StripeBillingMutationAdapter.noAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
+            if(ownedRenewal)require((!renewalFlatItems.containsKey(line.getId())||item.getId().equals(renewalFlatItems.get(line.getId())))
+                &&ownedRenewalNoAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
             var trialContext=owner.trial();boolean historicalTrial=trialContext!=null&&trialContext.request().verified()&&invoice.getId().equals(trialContext.request().invoice());
             requireOwned(remote.getId().equals(detail.getSubscription())&&detail.getProration()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             require(line.getPricing()!=null&&"price_details".equals(line.getPricing().getType())&&line.getPricing().getPriceDetails()!=null);
@@ -576,8 +577,9 @@ public final class StripeBillingSnapshotMapper {
             var status=invoice.getStatus();
             boolean acceptsUnavailableOffStripe=originalHistory&&kind==BillingRecord.Kind.INITIAL&&invoice.getAmountDue()>0
                 &&("open".equals(status)||"paid".equals(status));
+            boolean acceptsUnfinalizedEnding=ownedRenewal&&kind==BillingRecord.Kind.RENEWAL&&"draft".equals(status);
             boolean plain=trace.check(!detail.getProration(),SettlementReason.PRORATION_FLAG)&&trace.check(kind!=BillingRecord.Kind.PRORATION,SettlementReason.PRORATION_KIND)&&trace.check("charge_automatically".equals(invoice.getCollectionMethod()),SettlementReason.COLLECTION_METHOD)
-                &&trace.plainAmounts(invoice.getAmountPaidOffStripe(),invoice.getAmountOverpaid(),invoice.getStartingBalance(),invoice.getEndingBalance(),invoice.getPrePaymentCreditNotesAmount(),invoice.getPostPaymentCreditNotesAmount(),acceptsUnavailableOffStripe)
+                &&trace.plainAmounts(invoice.getAmountPaidOffStripe(),invoice.getAmountOverpaid(),invoice.getStartingBalance(),invoice.getEndingBalance(),invoice.getPrePaymentCreditNotesAmount(),invoice.getPostPaymentCreditNotesAmount(),acceptsUnavailableOffStripe,acceptsUnfinalizedEnding)
                 &&trace.check(empty(invoice.getDiscounts()),SettlementReason.INVOICE_DISCOUNTS)&&trace.check(empty(invoice.getTotalDiscountAmounts()),SettlementReason.INVOICE_DISCOUNT_AMOUNTS)&&trace.check(empty(invoice.getTotalPretaxCreditAmounts()),SettlementReason.INVOICE_PRETAX_CREDITS)&&trace.check(empty(line.getDiscountAmounts()),SettlementReason.LINE_DISCOUNT_AMOUNTS)&&trace.check(empty(line.getPretaxCreditAmounts()),SettlementReason.LINE_PRETAX_CREDITS)
                 &&trace.check(Objects.equals(invoice.getTotal(),invoice.getAmountDue()),SettlementReason.TOTAL)&&trace.check(Objects.equals(invoice.getSubtotal(),invoice.getAmountDue()),SettlementReason.SUBTOTAL)&&trace.check(Objects.equals(line.getAmount(),invoice.getAmountDue()),SettlementReason.LINE_AMOUNT);
             if(trace.first!=null)unsupportedReason=trace.first;
@@ -606,6 +608,13 @@ public final class StripeBillingSnapshotMapper {
             var result=new SubscriptionProviderModels.Invoice(invoice.getId(),kind,mapped.terms(),null,period,invoice.getAmountDue(),mapped.terms().regularAmount().currency(),settlement,cash);
             if(actionFailure!=null&&settlement==SettlementKind.UNSUPPORTED)settlementReasons.put(result,unsupportedReason);
             return result;
+        }
+        private boolean ownedRenewalNoAdjustments(com.stripe.model.Invoice invoice){
+            // Request off-stripe explicitly; only the unfinalized draft ending balance may remain unknown.
+            return "subscription_cycle".equals(invoice.getBillingReason())&&invoice.getAmountDue()!=null&&invoice.getAmountDue()>0
+                &&zeros(invoice.getAmountPaidOffStripe(),invoice.getAmountOverpaid(),invoice.getStartingBalance(),invoice.getPrePaymentCreditNotesAmount(),invoice.getPostPaymentCreditNotesAmount())
+                &&(zeros(invoice.getEndingBalance())||"draft".equals(invoice.getStatus())&&invoice.getEndingBalance()==null)
+                &&StripeBillingMutationAdapter.noNonAmountAdjustments(invoice);
         }
         SubscriptionProviderModels.Invoice proration(com.stripe.model.Invoice invoice,List<InvoiceLineItem> lines,dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.Proration proof)throws StripeException {
             var q=proof.quote();var result=proof.result();var s=owner.subscription();

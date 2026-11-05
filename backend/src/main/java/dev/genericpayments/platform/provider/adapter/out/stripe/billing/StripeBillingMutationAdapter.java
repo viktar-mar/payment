@@ -409,7 +409,8 @@ public final class StripeBillingMutationAdapter {
         var credit=credits.getFirst();if((credit.creditedInvoice()==null)!=credit.creditedLines().isEmpty()||credit.creditedLines().size()>1)throw mismatch();
         return List.copyOf(result);
     }
-    static boolean noAdjustments(Invoice i){return zeros(i.getAmountPaidOffStripe(),i.getAmountOverpaid(),i.getStartingBalance(),i.getEndingBalance(),i.getPrePaymentCreditNotesAmount(),i.getPostPaymentCreditNotesAmount())&&empty(i.getDiscounts())&&empty(i.getTotalDiscountAmounts())&&empty(i.getTotalPretaxCreditAmounts())&&empty(i.getTotalTaxes())
+    static boolean noAdjustments(Invoice i){return zeros(i.getAmountPaidOffStripe(),i.getAmountOverpaid(),i.getStartingBalance(),i.getEndingBalance(),i.getPrePaymentCreditNotesAmount(),i.getPostPaymentCreditNotesAmount())&&noNonAmountAdjustments(i);}
+    static boolean noNonAmountAdjustments(Invoice i){return empty(i.getDiscounts())&&empty(i.getTotalDiscountAmounts())&&empty(i.getTotalPretaxCreditAmounts())&&empty(i.getTotalTaxes())
         &&(i.getAmountShipping()==null||i.getAmountShipping()==0)&&i.getShippingCost()==null&&i.getShippingDetails()==null
         &&!nonempty(i.getDefaultTaxRates())&&(i.getAutomaticTax()==null||!Boolean.TRUE.equals(i.getAutomaticTax().getEnabled()))
         &&(i.getTotalExcludingTax()==null||Objects.equals(i.getTotalExcludingTax(),i.getTotal()))&&(i.getSubtotalExcludingTax()==null||Objects.equals(i.getSubtotalExcludingTax(),i.getSubtotal()));}
