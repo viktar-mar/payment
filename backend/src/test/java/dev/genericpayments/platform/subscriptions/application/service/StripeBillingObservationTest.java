@@ -26,7 +26,7 @@ class StripeBillingObservationTest {
     @BeforeEach void setup() throws Exception {
         current=SubscriptionFixtures.active(NOW.minusSeconds(86400),NOW.plusSeconds(86400));
         account=PaymentAccount.create(current.paymentAccountId(),"billing",PaymentProviderType.STRIPE,PaymentAccountMode.SANDBOX,"acct_test","stripe-sandbox-default");
-        var constructor=SubscriptionFactService.class.getConstructors()[0];
+        var constructor=dev.genericpayments.platform.support.SubscriptionFactConstructors.ordinary();
         for(var type:constructor.getParameterTypes())dependencies.put(type,type==Clock.class?Clock.fixed(NOW,ZoneOffset.UTC):type==SubscriptionObservationPort.class?observations:mock(type));
         service=(SubscriptionFactService)constructor.newInstance(Arrays.stream(constructor.getParameterTypes()).map(dependencies::get).toArray());
         when(dep(SubscriptionStore.class).findOwned(any(),any())).thenAnswer(i->Optional.of(current));
