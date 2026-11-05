@@ -1,5 +1,5 @@
 import {test} from '@playwright/test';
-import {createOwnedBillingFirstPayment, formatBillingFirstPaymentDiagnostic} from '../../../infrastructure/stripe-billing-first-payment.mjs';
+import {createOwnedBillingFirstPayment, formatBillingFirstPaymentDiagnostic, formatBillingFirstPaymentCleanupDiagnostic} from '../../../infrastructure/stripe-billing-first-payment.mjs';
 import {snapshotBillingFirstPaymentEnvironment} from '../../../infrastructure/stripe-billing-first-payment-options.mjs';
 import {runFirstPaymentBrowser} from './support/stripe-billing-first-payment';
 
@@ -33,5 +33,7 @@ test('OWNED_INITIAL_PAYMENT: one READY clock EUR20 original v2 cash and signed c
     const final = await owner.close();
     const diagnostic = formatBillingFirstPaymentDiagnostic(final);
     if (diagnostic) process.stdout.write(diagnostic + '\n');
+    const cleanupDiagnostic = formatBillingFirstPaymentCleanupDiagnostic(final);
+    if (cleanupDiagnostic) process.stdout.write(cleanupDiagnostic + '\n');
   }
 });

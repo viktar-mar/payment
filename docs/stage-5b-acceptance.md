@@ -209,7 +209,7 @@ The separate `OWNED_INITIAL_AND_FIRST_RENEWAL` lane is **OFFLINE_PREPARED / NATI
 | Final evidence | Exactly two EUR2000 cash facts, one committed publication, two fixed advances, seven exact acknowledged operations and four signed callbacks forming the exact INITIAL/RENEWAL union |
 | Hosted synthetic composition | Actual catalog reserve/dispatch/ACK, genuine payment services, shipped read-only final SQL, production callback validator and rollback operation-mutation regressions authored; execution outcomes belong to the exact-source CI completion receipt |
 | Runtime packaging | Both dedicated exported closures checked against production libraries only without launching; normal production jar excludes runtime/samplers |
-| Native combined run | **ATTEMPTED / NONE ACCEPTED**; latest consumed `ab6505e3` stopped at `CLOCK_ADVANCE_POLL_EXHAUSTED` with confirmed cleanup (see the offline pacing checkpoint below); another run requires fresh one-use approval and verified storage capacity |
+| Native combined run | **ATTEMPTED / NONE ACCEPTED**; latest consumed `483a0469` stopped at generic `PREPARE_REQUEST` with unconfirmed cleanup; exact cause and provider outcome unknown (see the offline PREPARE/cleanup checkpoint below); another run requires fresh one-use approval and verified storage capacity |
 | Full stage 5B | **NOT_ACCEPTED** |
 
 [Future invocation and prerequisites](local-development.md#prepared-initial-payment-and-first-renewal-scenario) describe the dedicated configuration. This preparation supplies no native authority, successful provider result or storage remediation. Historical failures and consumed/UNKNOWN/DISPATCHING operations remain preserved and nonretryable. Both `initialAccepted` and `renewalAccepted` require completed proofs and confirmed cleanup; `full5bAccepted` is always false.
@@ -264,3 +264,35 @@ interrupt, authority drift and late READY return still refuse continuation and
 retain the stop/no-replay rules. No new runtime entry, diagnostic stage or native
 execution is included. Native first-renewal acceptance is unproven; full Stage
 5B remains **NOT_ACCEPTED**.
+
+### 2026-11-05 offline PREPARE/cleanup checkpoint
+
+The later consumed combined run `483a0469` ended at generic `PREPARE_REQUEST`
+with UNCONFIRMED cleanup. The exact historical cause remains unknown. Its local
+CREATE dispatch record is not provider receipt, completion or financial-state
+evidence. The original saved PENDING state remains unchanged and may survive
+stop. Later all-seven-Exited observation does not establish browser, listener,
+START settlement and every owned cleanup proof, so it does not contradict that
+UNCONFIRMED report. The attempt is consumed; no CREATE or old operation replay
+is authorized. Earlier runs and reports remain preserved.
+
+The offline diagnostic change adds only source-owned PREPARE request locations
+AUTHORITY, TRANSPORT and RESPONSE to the existing finite terminal code grammar,
+retaining generic PREPARE_REQUEST and all prior detailed codes. It also records
+the first missing cleanup proof from the existing browser snapshot and cleanup
+order: BROWSER_UNSETTLED, BROWSER_CLOSE, RUNTIME_CLOSE, LISTENER_STOP,
+START_SETTLEMENT, BOOTSTRAP_STOP or FIXTURE_CLOSE. Rejected CLOSED results alone
+may emit one separate scope-specific `*_cleanup_diagnostic code=<LITERAL>` line;
+confirmed cleanup or a missing/invalid witness emits none. Each reporter accepts
+one primary and one cleanup line independently for its own scope, with the
+existing single CLI handoff, exact <=160-character lines, 4096-character buffer
+and raw-error suppression.
+
+These locations do not retrospectively identify the cause of `483a0469`, prove
+financial or stop state, grant ACK/CONFIRM, or upgrade late cleanup. No extra
+wait, request, probe, retry, stop or timeout is introduced. First failure/null
+diagnostic, conservative snapshot, cleanup order/counts, original financial
+budgets, owner lifetime and separate cleanup allowance remain unchanged. Only
+audited inert Node tests and cached TypeScript checking were performed; no
+Docker, application/database/browser/provider execution or native acceptance.
+Full Stage 5B remains **NOT_ACCEPTED**.

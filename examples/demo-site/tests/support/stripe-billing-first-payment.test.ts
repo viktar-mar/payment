@@ -5,6 +5,32 @@ after(()=>{globalThis.fetch=originalFetch;assert.equal(transportCalls,0);});
 import assert from 'node:assert/strict';
 import {runInNewContext} from 'node:vm';
 
+test('initial reporter independently filters finite cleanup and primary lines with bounded chunks and floods',async()=>{
+ const {default:Reporter}=await import(new URL('./stripe-billing-first-payment-reporter.ts',import.meta.url).href);
+ const primary='owned_initial_payment_diagnostic code=PREPARE_REQUEST_TRANSPORT cleanup=UNCONFIRMED';
+ const cleanup='owned_initial_payment_cleanup_diagnostic code=BROWSER_UNSETTLED';
+ const handoff='Authorize the isolated Sandbox CLI at https://access.stripe.com/fixture using code ABCD EFGH. Keep this terminal open.';
+ const original=process.stdout.write,output:string[]=[];process.stdout.write=((v:unknown)=>{output.push(String(v));return true;}) as typeof process.stdout.write;
+ try {
+  for(const cleanupFirst of [false,true]){
+   const reporter=new Reporter(),start=output.length;
+   for(const bad of ['secret-sentinel',cleanup+' extra=secret-sentinel',cleanup.replace('BROWSER_UNSETTLED','UNKNOWN'),cleanup.replace('BROWSER_UNSETTLED','BROWSER_UNSETTLED_ALIAS'),cleanup.replace('BROWSER_UNSETTLED','BROWSER_UNSETTLED1'),cleanup.replace('BROWSER_UNSETTLED','sk_test_SENTINEL'),cleanup.replace('owned_initial_payment','owned_initial_and_first_renewal'),primary.replace('owned_initial_payment','owned_initial_and_first_renewal')])reporter.onStdOut(bad+'\n');
+   reporter.onStdOut('x'.repeat(4096));reporter.onStdOut(cleanup+'\n');
+   reporter.onStdErr(cleanup+'\nprivate-sentinel\n');
+   const ordered=cleanupFirst?[cleanup,primary]:[primary,cleanup];
+   for(const line of ordered)for(const character of line+'\n')reporter.onStdOut(Buffer.from(character));
+   for(let i=0;i<100;i++)reporter.onStdOut(primary+'\n'+cleanup+'\n'+handoff+'\n');
+   reporter.onStdOut(cleanup+'\r\n');reporter.onStdOut('private-sentinel');reporter.onEnd({status:'failed'});
+   reporter.onError(new Proxy({},{get(){assert.fail('raw error must stay opaque');}}));
+   assert.deepEqual(output.slice(start),[...ordered.map(line=>line+'\n'),handoff+'\n','owned_initial_payment_result_not_accepted full5b=NOT_ACCEPTED\n','first_payment_setup_failed\n']);
+  }
+  for(const code of ['BROWSER_UNSETTLED','BROWSER_CLOSE','RUNTIME_CLOSE','LISTENER_STOP','START_SETTLEMENT','BOOTSTRAP_STOP','FIXTURE_CLOSE']){
+   const reporter=new Reporter(),start=output.length,line='owned_initial_payment_cleanup_diagnostic code='+code;
+   reporter.onStdOut(line+'\n'+line+'\n');assert.deepEqual(output.slice(start),[line+'\n']);
+  }
+ }finally{process.stdout.write=original;}
+});
+
 // Local audit: Node builtins, inert source imports and an injected Route/BrowserPort only.
 // No listener, browser, build, process launch, private input or network dependency.
 const moduleUrl = new URL('./stripe-billing-first-payment.ts', import.meta.url).href;
@@ -141,7 +167,7 @@ test('browser page checkpoint survives sanitization and terminal formatting', as
   let error: unknown;
   try {await module.runFirstPaymentBrowser({newContext:async()=>({newPage:async()=>{throw null;},close:async()=>{}})}, {}, {deadline:Date.now()+1000});} catch (value) {error=value;}
   // The final formatter must recognize the literal closed checkpoint.
-  assert.equal(formatBillingFirstPaymentDiagnostic({runId:id('1'),expectedSource:'e'.repeat(40),scope:'OWNED_INITIAL_PAYMENT',full5bAccepted:false,phase:'BROWSER',status:'CLOSED',initialAccepted:false,code:'BROWSER',diagnostic:'BROWSER_PAGE',cleanupConfirmed:true}), 'owned_initial_payment_diagnostic code=BROWSER_PAGE cleanup=CONFIRMED');
+  assert.equal(formatBillingFirstPaymentDiagnostic({runId:id('1'),expectedSource:'e'.repeat(40),scope:'OWNED_INITIAL_PAYMENT',full5bAccepted:false,phase:'BROWSER',status:'CLOSED',initialAccepted:false,code:'BROWSER',diagnostic:'BROWSER_PAGE',cleanupConfirmed:true,cleanupFailure:null}), 'owned_initial_payment_diagnostic code=BROWSER_PAGE cleanup=CONFIRMED');
   assert.match(String(error), /^Error: first_payment_BROWSER$/);
 });
 

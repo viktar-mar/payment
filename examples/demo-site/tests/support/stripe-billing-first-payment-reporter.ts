@@ -1,13 +1,15 @@
 import type {Reporter, TestCase, TestResult, FullResult} from '@playwright/test/reporter';
-import {parseBillingFirstPaymentDiagnosticLine} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
-/** Fixed labels, one CLI authorization handoff and one validated final diagnostic. */
+import {parseBillingFirstPaymentDiagnosticLine, parseBillingFirstPaymentCleanupDiagnosticLine} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
+/** Fixed labels, one CLI handoff, one primary and one independent cleanup diagnostic. */
 export default class FirstPaymentReporter implements Reporter {
   protected buffer = '';
   private handoff = false;
   private diagnostic = false;
+  private cleanupDiagnostic = false;
   private overflow = false;
   printsToStdio(): boolean {return true;}
   protected acceptDiagnostic(line: string): string | null {return parseBillingFirstPaymentDiagnosticLine(line);}
+  protected acceptCleanupDiagnostic(line: string): string | null {return parseBillingFirstPaymentCleanupDiagnosticLine(line);}
   onStdOut(chunk: string | Buffer): void {
     for (const character of chunk.toString('utf8')) {
       if (character === '\n') {
@@ -16,6 +18,11 @@ export default class FirstPaymentReporter implements Reporter {
         this.overflow = false;
         if (!this.diagnostic && this.acceptDiagnostic(line)) {
           this.diagnostic = true;
+          process.stdout.write(line + '\n');
+          continue;
+        }
+        if (!this.cleanupDiagnostic && this.acceptCleanupDiagnostic(line)) {
+          this.cleanupDiagnostic = true;
           process.stdout.write(line + '\n');
           continue;
         }

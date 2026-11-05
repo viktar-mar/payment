@@ -1989,3 +1989,47 @@ polls, at least 250 ms spacing, at most two seconds per SDK call, original
 fences, ACK/READY persistence checks and terminal stop/no-replay behavior. Only
 explicitly selected offline pure tests were run; no runtime/provider execution
 or native acceptance was performed. Full Stage 5B remains **NOT_ACCEPTED**.
+
+### Offline PREPARE location and missing-cleanup diagnostics (2026-11-05)
+
+The later consumed combined run `483a0469` ended at generic `PREPARE_REQUEST`
+with `cleanup=UNCONFIRMED`. Its exact historical cause remains unknown. A local
+CREATE dispatch record proves only the local dispatch boundary, not that the
+provider received or completed CREATE, nor its financial outcome. The original
+saved PENDING state is retained and may survive stop. Later observation of all
+seven containers as Exited does not contradict UNCONFIRMED: it does not establish
+the browser, listener, START settlement or every owned cleanup callback's proof.
+No old CREATE or consumed operation may be replayed.
+
+For future separately authorized runs, the owner can report the last local
+PREPARE location through the existing primary diagnostic: `PREPARE_REQUEST_AUTHORITY`
+before bootstrap admission, `PREPARE_REQUEST_TRANSPORT` immediately before fetch,
+or `PREPARE_REQUEST_RESPONSE` after fetch resolves and before response processing.
+Only genuine process-local runtime provenance supplies those labels. Legacy
+generic PREPARE_REQUEST and detailed source-owned failures remain valid; the first
+failure, including a null diagnostic, stays latched. A location is not a cause,
+request completion, authenticated ACK or provider outcome.
+
+Rejected CLOSED results with unconfirmed cleanup may additionally print one
+independent line: `owned_initial_payment_cleanup_diagnostic code=<LITERAL>` or
+`owned_initial_and_first_renewal_cleanup_diagnostic code=<LITERAL>`. The closed
+literals, in existing cleanup order, are BROWSER_UNSETTLED, BROWSER_CLOSE,
+RUNTIME_CLOSE, LISTENER_STOP, START_SETTLEMENT, BOOTSTRAP_STOP and FIXTURE_CLOSE.
+Only the first missing proof is retained. BROWSER_UNSETTLED means the journey was
+still pending at the original cleanup snapshot; BROWSER_CLOSE means it had
+settled without trusted completed-close proof. START_SETTLEMENT means the existing
+bounded START drain did not supply settlement proof before bootstrap stop; it
+does not diagnose bootstrap internals. No late wait, new probe, retry or stop is
+added, and late completion cannot upgrade the frozen UNCONFIRMED result.
+
+Each dedicated spec prints the cleanup line after the unchanged primary line,
+when either qualifies independently. Each reporter forwards at most one primary
+line and one cleanup line for its own scope, plus the existing one CLI handoff.
+Lines remain at most 160 characters with exact finite grammar; the reporter keeps
+its 4096-character buffer and suppresses raw errors, stderr and arbitrary fields.
+No exception/provider text, IDs, timing or counters cross these boundaries.
+These added locations are neither historical root-cause evidence nor financial
+or stop evidence. Original single-use budgets, 45-minute owner lifetime, request
+bounds, separate 120-second cleanup allowance, ownership and acceptance rules
+are unchanged. Explicit inert Node tests and cached TypeScript checking only:
+no native execution or new authority. Full Stage 5B remains **NOT_ACCEPTED**.

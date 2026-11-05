@@ -27,11 +27,11 @@ export async function createOwnedBillingFirstPayment(options,dependencies={}){re
 export async function createOwnedBillingFirstRenewal(options,dependencies={}){return createOwner(options,dependencies,true);}
 async function createOwner(options,dependencies,firstRenewal){
  const c=(firstRenewal?validateBillingFirstRenewalOptions:validateBillingFirstPaymentOptions)(options);if(!c)throw billingError('OPT_IN_REQUIRED');
- let state='NEW',phase='NEW',failure=null,diagnostic=null,accepted=false,cleanupConfirmed=false,bootstrap,cli,fixture,runtime,cleanupPromise,active,finish;
+ let state='NEW',phase='NEW',failure=null,diagnostic=null,accepted=false,cleanupConfirmed=false,cleanupFailure=null,bootstrap,cli,fixture,runtime,cleanupPromise,active,finish;
  let journeyStarted=false,journeySettled=false,journeyClean=false,startSettlement;
  const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
  const checkIdentity=v=>{if(!originalIdentity||Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))fail('ACK');};
- const resources=()=>Object.freeze({runId:c.runId,expectedSource:c.expectedSource,scope:firstRenewal?'OWNED_INITIAL_AND_FIRST_RENEWAL':'OWNED_INITIAL_PAYMENT',status:state,phase,code:failure,diagnostic,initialAccepted:accepted,...(firstRenewal?{renewalAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
+ const resources=()=>Object.freeze({runId:c.runId,expectedSource:c.expectedSource,scope:firstRenewal?'OWNED_INITIAL_AND_FIRST_RENEWAL':'OWNED_INITIAL_PAYMENT',status:state,phase,code:failure,diagnostic,initialAccepted:accepted,...(firstRenewal?{renewalAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed,cleanupFailure});
  const fail=(code,detail=null)=>{
   if(failure===null){
    if(detail==='PREPARE_REQUEST')detail=billingFirstPaymentPrepareCheckpoint(runtime)??detail;
@@ -41,11 +41,14 @@ async function createOwner(options,dependencies,firstRenewal){
  };
  async function cleanup(){return cleanupPromise??=(async()=>{
   let ok=!journeyStarted||(journeySettled&&journeyClean);const l={deadline:Math.min(Date.now()+120000,(active?.deadline??Date.now())+120000)};
-  for(const [o,m]of [[runtime,'close'],[cli,'stopListener'],[bootstrap,'stop'],[fixture,'close']])if(o){
+  // Capture the same conservative browser knowledge once; late settlement is not proof.
+  if(!ok)cleanupFailure=journeySettled?'BROWSER_CLOSE':'BROWSER_UNSETTLED';
+  const missing=code=>{ok=false;cleanupFailure??=code;};
+  for(const [o,m,code]of [[runtime,'close','RUNTIME_CLOSE'],[cli,'stopListener','LISTENER_STOP'],[bootstrap,'stop','BOOTSTRAP_STOP'],[fixture,'close','FIXTURE_CLOSE']])if(o){
    // The canceled outer race can finish before START releases bootstrap's busy guard.
    // Settlement grants no success or ownership proof; stop retains its own checks.
-   if(o===bootstrap&&startSettlement)try{await billingBounded(l,()=>startSettlement,120000);}catch{ok=false;continue;}
-   try{if(await billingBounded(l,x=>o[m](x),o===bootstrap?120000:30000)!==true)ok=false;}catch{ok=false;}
+   if(o===bootstrap&&startSettlement)try{await billingBounded(l,()=>startSettlement,120000);}catch{missing('START_SETTLEMENT');continue;}
+   try{if(await billingBounded(l,x=>o[m](x),o===bootstrap?120000:30000)!==true)missing(code);}catch{missing(code);}
   }
   cleanupConfirmed=ok;if(!ok&&failure===null){failure='CLEANUP';if(confirmAck)diagnostic='POST_CONFIRM_CLEANUP';}return ok;
  })();}
@@ -128,4 +131,30 @@ export function formatBillingFirstRenewalDiagnostic(result){
 export function parseBillingFirstRenewalDiagnosticLine(line){
  if(typeof line!=='string'||!line.startsWith('owned_initial_and_first_renewal_diagnostic '))return null;
  return parseBillingFirstPaymentDiagnosticLine(line.replace('owned_initial_and_first_renewal_diagnostic','owned_initial_payment_diagnostic'))?line:null;
+}
+
+// Independent terminal-only missing proof; never provider state or extra cleanup authority.
+const cleanupCodes=new Set(['BROWSER_UNSETTLED','BROWSER_CLOSE','RUNTIME_CLOSE','LISTENER_STOP','START_SETTLEMENT','BOOTSTRAP_STOP','FIXTURE_CLOSE']);
+const isCleanupDiagnostic=code=>typeof code==='string'&&cleanupCodes.has(code);
+function formatCleanupDiagnostic(result,prefix){
+ if(!result||result.status!=='CLOSED'||result.initialAccepted!==false||typeof result.code!=='string'||!result.code||result.cleanupConfirmed!==false||!isCleanupDiagnostic(result.cleanupFailure))return null;
+ return prefix+' code='+result.cleanupFailure;
+}
+export function formatBillingFirstPaymentCleanupDiagnostic(result){
+ if(result?.scope!=='OWNED_INITIAL_PAYMENT')return null;
+ return formatCleanupDiagnostic(result,'owned_initial_payment_cleanup_diagnostic');
+}
+export function parseBillingFirstPaymentCleanupDiagnosticLine(line){
+ if(typeof line!=='string'||line.length>160)return null;
+ const match=/^owned_initial_payment_cleanup_diagnostic code=([A-Z_]+)$/.exec(line);
+ return match&&match[0]===line&&isCleanupDiagnostic(match[1])?line:null;
+}
+export function formatBillingFirstRenewalCleanupDiagnostic(result){
+ if(result?.scope!=='OWNED_INITIAL_AND_FIRST_RENEWAL'||result.renewalAccepted!==false)return null;
+ return formatCleanupDiagnostic(result,'owned_initial_and_first_renewal_cleanup_diagnostic');
+}
+export function parseBillingFirstRenewalCleanupDiagnosticLine(line){
+ if(typeof line!=='string'||line.length>160)return null;
+ const match=/^owned_initial_and_first_renewal_cleanup_diagnostic code=([A-Z_]+)$/.exec(line);
+ return match&&match[0]===line&&isCleanupDiagnostic(match[1])?line:null;
 }

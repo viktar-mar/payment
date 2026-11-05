@@ -1,5 +1,5 @@
 import {test} from '@playwright/test';
-import {createOwnedBillingFirstRenewal, formatBillingFirstRenewalDiagnostic} from '../../../infrastructure/stripe-billing-first-payment.mjs';
+import {createOwnedBillingFirstRenewal, formatBillingFirstRenewalDiagnostic, formatBillingFirstRenewalCleanupDiagnostic} from '../../../infrastructure/stripe-billing-first-payment.mjs';
 import {snapshotBillingFirstRenewalEnvironment} from '../../../infrastructure/stripe-billing-first-renewal-options.mjs';
 import {runFirstPaymentBrowser} from './support/stripe-billing-first-payment';
 import {firstRenewalBrowserMode} from './support/stripe-billing-first-renewal-browser-mode';
@@ -35,5 +35,7 @@ test('OWNED_INITIAL_AND_FIRST_RENEWAL: EUR20 original v2 plus one EUR20 renewal 
     const final = await owner.close();
     const diagnostic = formatBillingFirstRenewalDiagnostic(final);
     if (diagnostic) process.stdout.write(diagnostic + '\n');
+    const cleanupDiagnostic = formatBillingFirstRenewalCleanupDiagnostic(final);
+    if (cleanupDiagnostic) process.stdout.write(cleanupDiagnostic + '\n');
   }
 });

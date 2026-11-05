@@ -16,7 +16,8 @@ export interface BillingFirstPaymentPort {
  prepare(customerSession:{token:string;origin:string},createKey:string,limits:BillingLimits):Promise<FirstPaymentPrepared>;
  confirm(originalSDKRequest:FirstPaymentConfirmRequest,limits:BillingLimits):Promise<FirstPaymentConfirmed>;
 }
-export interface BillingFirstPaymentResult {runId:string;expectedSource:string;scope:'OWNED_INITIAL_PAYMENT';initialAccepted:boolean;full5bAccepted:false;cleanupConfirmed:boolean;status:string;phase:string;code:string|null;diagnostic:string|null}
+export type BillingFirstPaymentCleanupFailure='BROWSER_UNSETTLED'|'BROWSER_CLOSE'|'RUNTIME_CLOSE'|'LISTENER_STOP'|'START_SETTLEMENT'|'BOOTSTRAP_STOP'|'FIXTURE_CLOSE';
+export interface BillingFirstPaymentResult {runId:string;expectedSource:string;scope:'OWNED_INITIAL_PAYMENT';initialAccepted:boolean;full5bAccepted:false;cleanupConfirmed:boolean;cleanupFailure:BillingFirstPaymentCleanupFailure|null;status:string;phase:string;code:string|null;diagnostic:string|null}
 export function createOwnedBillingFirstPayment(options:unknown,dependencies?:Record<string,unknown>):Promise<{resources():BillingFirstPaymentResult;run(journey:(port:BillingFirstPaymentPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingFirstPaymentResult>;close():Promise<BillingFirstPaymentResult>}>;
 
 export function formatBillingFirstPaymentDiagnostic(result:BillingFirstPaymentResult):string|null;
@@ -26,3 +27,7 @@ export interface BillingFirstRenewalResult extends Omit<BillingFirstPaymentResul
 export function createOwnedBillingFirstRenewal(options:unknown,dependencies?:Record<string,unknown>):Promise<{resources():BillingFirstRenewalResult;run(journey:(port:BillingFirstPaymentPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingFirstRenewalResult>;close():Promise<BillingFirstRenewalResult>}>;
 export function formatBillingFirstRenewalDiagnostic(result:BillingFirstRenewalResult):string|null;
 export function parseBillingFirstRenewalDiagnosticLine(line:unknown):string|null;
+export function formatBillingFirstPaymentCleanupDiagnostic(result:BillingFirstPaymentResult):string|null;
+export function parseBillingFirstPaymentCleanupDiagnosticLine(line:unknown):string|null;
+export function formatBillingFirstRenewalCleanupDiagnostic(result:BillingFirstRenewalResult):string|null;
+export function parseBillingFirstRenewalCleanupDiagnosticLine(line:unknown):string|null;
