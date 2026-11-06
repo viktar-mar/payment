@@ -6,16 +6,21 @@ import com.stripe.model.*;
 import com.stripe.param.*;
 import com.stripe.net.RequestOptions;
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal;
+import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.*;
+import dev.genericpayments.platform.provider.adapter.out.stripe.StripeRequestFingerprint;
 import dev.genericpayments.platform.paymentaccounts.domain.*;
 import dev.genericpayments.platform.payments.domain.PaymentStatus;
 import dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding;
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
+import dev.genericpayments.platform.shared.application.port.out.DigestPort;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore;
 import dev.genericpayments.platform.subscriptions.domain.BillingRecord;
 import dev.genericpayments.platform.subscriptions.domain.Subscription;
+import dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation;
 import dev.genericpayments.platform.subscriptions.domain.SubscriptionPriceTerms;
 import dev.genericpayments.platform.subscriptions.domain.ChangeTiming;
 import java.time.Instant;
@@ -71,6 +76,62 @@ public final class StripeBillingSnapshotMapper {
         catch(StripeException malformed){throw mismatch();}
     }
     record FailedRenewalRead(Snapshot snapshot,String allocation,String paymentIntent) {}
+    /** Supplied descriptive records only: persistence, readiness and completion authority are external. */
+    record OwnedMethodCandidate(SubscriptionOperation operation,SubscriptionBillingProofStore.Setup setup,
+            ProviderOperation setupStep,ProviderOperation methodStep) {}
+    record OwnedMethodRead(Snapshot snapshot,String setupIntent,String method) {}
+    static OwnedMethodRead retrieveOwnedMethodReady(StripeClient client,Ownership owner,
+            OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.Failure failure,OwnedMethodCandidate candidate,
+            DigestPort digest,Instant observedAt,ReadExecutor executor){
+        try{
+            require(admission!=null&&executor!=null);
+            var read=new Read(client,owner,observedAt,new OwnedInitial(admission.firstRenewalAdmission().receipt()));
+            read.renewalAdmission=admission.firstRenewalAdmission();read.executor=executor;
+            read.requireDebtContext(admission,failure);
+            requireOwnedMethodCandidate(owner,failure,candidate,digest,observedAt,admission.firstRenewalAdmission().policyVersion());
+            var failed=read.ownedDebtGraph(admission,failure,RenewalLane.FAILED).failed();
+            require(failure.allocation().equals(failed.allocation())&&failure.paymentIntent().equals(failed.paymentIntent()));
+            var setup=candidate.setup();var operation=candidate.operation();
+            require(setup.method().equals(read.remote.getDefaultPaymentMethod()));
+            var remote=read.get(()->client.v1().setupIntents().retrieve(setup.reference(),read.options()));
+            StripeSubscriptionProviderAdapter.requireSetupRemote(remote,owner.subscription(),operation,owner.customer(),candidate.setupStep());
+            require("succeeded".equals(remote.getStatus())&&setup.method().equals(remote.getPaymentMethod())
+                &&remote.getCreated()<=observedAt.getEpochSecond()&&remote.getCreated()<=candidate.methodStep().firstDispatchedAt().getEpochSecond());
+            var method=read.get(()->client.v1().paymentMethods().retrieve(setup.method(),read.options()));
+            require(setup.method().equals(method.getId())&&"payment_method".equals(method.getObject())&&Boolean.FALSE.equals(method.getLivemode())
+                &&owner.customer().providerReference().equals(method.getCustomer())&&"card".equals(method.getType())&&method.getCard()!=null);
+            var s=failed.snapshot();
+            return new OwnedMethodRead(new Snapshot(s.subscriptionReference(),s.status(),s.billingPrice(),s.period(),s.trial(),s.cancellationAt(),
+                s.invoices(),null,true,0,observedAt,null,List.of(),null,null),setup.reference(),setup.method());
+        }catch(StripeException|RuntimeException malformed){throw mismatch();}
+    }
+    private static void requireOwnedMethodCandidate(Ownership owner,OwnedFailedRenewal.Failure failure,
+            OwnedMethodCandidate candidate,DigestPort digest,Instant at,long policyVersion){
+        require(candidate!=null&&digest!=null);var o=candidate.operation();var setup=candidate.setup();var a=owner.account();var s=owner.subscription();var b=owner.customer();
+        require(o!=null&&setup!=null&&o.kind()==SubscriptionOperation.Kind.SETUP&&o.status()==SubscriptionOperation.Status.PROCESSING
+            &&o.siteId().equals(s.siteId())&&o.customerId().equals(s.customerId())&&o.subscriptionId().equals(s.id())
+            &&o.expectedRevision()==failure.revision()&&o.policyVersion()==policyVersion&&s.providerReference().equals(o.providerReference())
+            &&o.safeFailureCode()==null&&!o.createdAt().isBefore(failure.recordedAt())&&!o.updatedAt().isAfter(at)
+            &&o.providerOperationKey().equals("subscription:"+a.id().value()+":"+o.id()+":SETUP")
+            &&setup.operation().equals(o.id())&&setup.subscription().equals(s.id())&&setup.account().equals(a.id()));
+        ref(setup.reference(),"seti_");ref(setup.method(),"pm_");
+        String setupFingerprint=StripeRequestFingerprint.of(digest,a,"SETUP_INTENT_CREATE_V1",o.id().toString(),o.providerOperationKey()+":SETUP",
+            o.fingerprint(),Long.toString(o.policyVersion()),s.id().toString(),s.siteId().value().toString(),s.customerId().value().toString(),b.providerReference(),"off_session","card","consent:true");
+        String methodFingerprint=StripeRequestFingerprint.of(digest,a,"SUBSCRIPTION_METHOD_V1",o.id().toString(),o.providerOperationKey()+":METHOD",o.fingerprint(),
+            s.providerReference(),b.providerReference(),setup.step().toString(),setup.reference(),setup.method(),"consent:true");
+        requireMethodStep(a,o,candidate.setupStep(),ProviderOperation.Kind.SETUP_INTENT_CREATE,":SETUP",setupFingerprint,setup.reference(),at);
+        requireMethodStep(a,o,candidate.methodStep(),ProviderOperation.Kind.SUBSCRIPTION_UPDATE,":METHOD",methodFingerprint,s.providerReference(),at);
+        require(setup.step().equals(candidate.setupStep().id())&&!candidate.setupStep().id().equals(candidate.methodStep().id())
+            &&!candidate.methodStep().firstDispatchedAt().isBefore(candidate.setupStep().firstDispatchedAt()));
+    }
+    private static void requireMethodStep(PaymentAccount a,SubscriptionOperation operation,ProviderOperation step,ProviderOperation.Kind kind,
+            String suffix,String fingerprint,String reference,Instant at){
+        require(step!=null&&step.accountId().equals(a.id())&&step.externalAccountId().equals(a.externalAccountId())&&step.credentialsRef().equals(a.credentialsRef())
+            &&step.kind()==kind&&step.resourceId().equals(operation.id())&&step.operationKey().equals(operation.providerOperationKey()+suffix)
+            &&step.fingerprint().equals(fingerprint)&&step.status()==ProviderOperation.Status.ACKNOWLEDGED&&reference.equals(step.providerReference())
+            &&step.firstDispatchedAt()!=null&&!step.firstDispatchedAt().isBefore(operation.createdAt())&&!step.firstDispatchedAt().isAfter(at)
+            &&step.retryBefore()!=null&&step.retryBefore().isAfter(step.firstDispatchedAt())&&step.leaseOwner()==null&&step.leaseExpiresAt()==null);
+    }
     private enum RenewalLane { SUCCESS, FAILED }
     private record RenewalResult(MappedObservation success,FailedRenewalRead failed) {}
     static FailedRenewalRead retrieveOwnedFailedRenewal(StripeClient client,Ownership owner,
@@ -298,6 +359,7 @@ public final class StripeBillingSnapshotMapper {
         final Set<String> explicitNoNextAttempt=new HashSet<>();
         int requests;
         Admission renewalAdmission;
+        OwnedFailedRenewal.Failure debtFailure;
         ReadExecutor executor;
         TrialEvidence trialEvidence;
         Read(StripeClient client,Ownership owner,Instant at){this(client,owner,at,null);}
@@ -331,6 +393,21 @@ public final class StripeBillingSnapshotMapper {
             }
             throw mismatch();
         }
+        /** Validates only supplied joins against the actual debt projection; this authenticates no durable row or fence. */
+        void requireDebtContext(OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.Failure failure){
+            require(admission!=null&&failure!=null&&executor!=null&&failure.admissionId().equals(admission.id())
+                &&failure.invoice().equals(admission.boundary().renewalInvoice())&&failure.period().equals(admission.boundary().period())
+                &&!failure.recordedAt().isBefore(admission.admittedAt())&&!at.isBefore(failure.recordedAt()));
+            var s=owner.subscription();var debt=s.debt();var receipt=admission.firstRenewalAdmission().receipt();
+            require(s.billingStatus()==Subscription.Status.PAST_DUE&&s.revision()==failure.revision()&&debt!=null
+                &&debt.billingRecordId().equals(failure.billId())&&debt.unpaidPeriod().equals(failure.period())&&Objects.equals(debt.graceDeadline(),failure.graceDeadline())
+                &&s.currentPeriod().equals(failure.period())&&s.paidThrough().equals(Instant.ofEpochSecond(receipt.periodEnd()))&&s.terminalReason()==null);
+        }
+        /** Shared complete invoice/cash normalization, without fabricating an ACTIVE local owner. */
+        RenewalResult ownedDebtGraph(OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.Failure failure,RenewalLane lane)throws StripeException{
+            requireDebtContext(admission,failure);debtFailure=failure;
+            return firstRenewal(admission.ready(),admission.boundary(),lane);
+        }
         RenewalResult firstRenewal(LaterReady ready,Boundary saved,RenewalLane lane) throws StripeException {
             var admission=renewalAdmission;var receipt=admission.receipt();var intent=receipt.intent();var clock=intent.clock();var scope=clock.owner();
             var a=owner.account();var s=owner.subscription();var b=owner.customer();
@@ -342,10 +419,11 @@ public final class StripeBillingSnapshotMapper {
             require(a!=null&&s!=null&&b!=null&&a.provider()==PaymentProviderType.STRIPE&&a.mode()==PaymentAccountMode.SANDBOX&&a.status()==PaymentAccountStatus.ACTIVE
                 &&a.id().equals(scope.account())&&a.externalAccountId().equals(scope.externalAccount())&&a.credentialsRef().equals(scope.credentialsRef())
                 &&s.paymentAccountId().equals(a.id())&&s.id().equals(intent.subscription())&&s.siteId().equals(scope.site())&&s.customerId().equals(scope.customer())
-                &&s.billingPrice().equals(intent.terms())&&intent.terms().equals(s.entitledPrice())&&s.billingStatus()==Subscription.Status.ACTIVE
-                &&s.providerReference().equals(receipt.reference())&&s.revision()==admission.subscriptionRevision()
-                &&s.currentPeriod().equals(period(receipt.periodStart(),receipt.periodEnd()))&&s.paidThrough().equals(Instant.ofEpochSecond(receipt.periodEnd()))
-                &&s.trial()==null&&s.cancellation()==null&&s.pendingChange()==null&&s.debt()==null
+                &&s.billingPrice().equals(intent.terms())&&intent.terms().equals(s.entitledPrice())
+                &&s.providerReference().equals(receipt.reference())
+                &&(debtFailure!=null||s.billingStatus()==Subscription.Status.ACTIVE&&s.revision()==admission.subscriptionRevision()
+                    &&s.currentPeriod().equals(period(receipt.periodStart(),receipt.periodEnd()))&&s.paidThrough().equals(Instant.ofEpochSecond(receipt.periodEnd()))&&s.debt()==null)
+                &&s.trial()==null&&s.cancellation()==null&&s.pendingChange()==null
                 &&b.accountId().equals(a.id())&&b.siteId().equals(scope.site())&&b.customerId().equals(scope.customer())&&b.id().equals(intent.customerBinding())
                 &&b.creationOperationId().equals(intent.customerCreationOperation())&&b.providerReference().equals(intent.customerReference())
                 &&owner.trial()==null&&owner.proofs()==null&&owner.prorations().isEmpty()&&owner.schedules().isEmpty()
