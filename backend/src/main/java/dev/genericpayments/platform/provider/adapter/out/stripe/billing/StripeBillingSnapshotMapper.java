@@ -76,6 +76,40 @@ public final class StripeBillingSnapshotMapper {
         catch(StripeException malformed){throw mismatch();}
     }
     record FailedRenewalRead(Snapshot snapshot,String allocation,String paymentIntent) {}
+    /** Descriptive cash graph only; supplied Recovery consistency authenticates no durable authority. */
+    record OwnedRecoveredRead(Snapshot snapshot,String allocation,String paymentIntent) {}
+    static OwnedRecoveredRead retrieveOwnedRecoveredRenewal(StripeClient client,Ownership owner,
+            OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.Failure failure,OwnedFailedRenewal.Recovery recovery,
+            SubscriptionOperation operation,Instant observedAt,ReadExecutor executor){
+        try{
+            require(admission!=null&&executor!=null);
+            var read=new Read(client,owner,observedAt,new OwnedInitial(admission.firstRenewalAdmission().receipt()));
+            read.renewalAdmission=admission.firstRenewalAdmission();read.executor=executor;
+            read.requireDebtContext(admission,failure);
+            requireOwnedRecovery(owner,admission,failure,recovery,operation,observedAt);
+            var mapped=read.ownedDebtGraph(admission,failure,RenewalLane.RECOVERED).success();
+            require(mapped instanceof MappedPaid);
+            return new OwnedRecoveredRead(((MappedPaid)mapped).snapshot(),recovery.allocation(),recovery.paymentIntent());
+        }catch(StripeException|RuntimeException malformed){throw mismatch();}
+    }
+    private static void requireOwnedRecovery(Ownership owner,OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.Failure failure,
+            OwnedFailedRenewal.Recovery recovery,SubscriptionOperation operation,Instant at){
+        require(recovery!=null&&operation!=null);var s=owner.subscription();var a=owner.account();
+        require(recovery.admissionId().equals(admission.id())&&recovery.billId().equals(failure.billId())
+            &&recovery.allocation().equals(failure.allocation())&&recovery.paymentIntent().equals(failure.paymentIntent())
+            &&recovery.expectedRevision()==failure.revision()&&recovery.operationId().equals(operation.id())&&recovery.operationVersion()==operation.version()
+            &&!recovery.associatedAt().isBefore(failure.recordedAt())&&!at.isBefore(recovery.associatedAt())
+            &&operation.kind()==SubscriptionOperation.Kind.RECOVER&&operation.status()==SubscriptionOperation.Status.RESERVED
+            &&operation.siteId().equals(s.siteId())&&operation.customerId().equals(s.customerId())&&operation.subscriptionId().equals(s.id())
+            &&operation.expectedRevision()==failure.revision()&&operation.policyVersion()==admission.firstRenewalAdmission().policyVersion()
+            &&s.providerReference().equals(operation.providerReference())&&operation.safeFailureCode()==null
+            &&!operation.createdAt().isBefore(failure.recordedAt())&&!operation.updatedAt().isAfter(recovery.associatedAt())
+            &&operation.providerOperationKey().equals("subscription:"+a.id().value()+":"+operation.id()+":RECOVER")
+            &&operation.authorityScope().equals(OwnedFailedRenewal.recoveryAuthority(admission))
+            &&operation.keyDigest().equals(OwnedFirstRenewal.fingerprint("owned-failed-renewal-recover-key-v1",admission.id()))
+            &&operation.fingerprint().equals("v1.recover."+failure.billId()+"."+OwnedFirstRenewal.fingerprint(
+                "owned-failed-renewal-recover-v1",admission.id(),failure.billId(),failure.billVersion(),failure.invoice(),failure.allocation(),failure.paymentIntent(),failure.revision())));
+    }
     /** Supplied descriptive records only: persistence, readiness and completion authority are external. */
     record OwnedMethodCandidate(SubscriptionOperation operation,SubscriptionBillingProofStore.Setup setup,
             ProviderOperation setupStep,ProviderOperation methodStep) {}
@@ -132,7 +166,7 @@ public final class StripeBillingSnapshotMapper {
             &&step.firstDispatchedAt()!=null&&!step.firstDispatchedAt().isBefore(operation.createdAt())&&!step.firstDispatchedAt().isAfter(at)
             &&step.retryBefore()!=null&&step.retryBefore().isAfter(step.firstDispatchedAt())&&step.leaseOwner()==null&&step.leaseExpiresAt()==null);
     }
-    private enum RenewalLane { SUCCESS, FAILED }
+    private enum RenewalLane { SUCCESS, FAILED, RECOVERED }
     private record RenewalResult(MappedObservation success,FailedRenewalRead failed) {}
     static FailedRenewalRead retrieveOwnedFailedRenewal(StripeClient client,Ownership owner,
             dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal.Admission failed,Instant observedAt,ReadExecutor executor){
@@ -360,6 +394,7 @@ public final class StripeBillingSnapshotMapper {
         int requests;
         Admission renewalAdmission;
         OwnedFailedRenewal.Failure debtFailure;
+        boolean recoveredDebt;
         ReadExecutor executor;
         TrialEvidence trialEvidence;
         Read(StripeClient client,Ownership owner,Instant at){this(client,owner,at,null);}
@@ -405,7 +440,7 @@ public final class StripeBillingSnapshotMapper {
         }
         /** Shared complete invoice/cash normalization, without fabricating an ACTIVE local owner. */
         RenewalResult ownedDebtGraph(OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.Failure failure,RenewalLane lane)throws StripeException{
-            requireDebtContext(admission,failure);debtFailure=failure;
+            requireDebtContext(admission,failure);debtFailure=failure;recoveredDebt=lane==RenewalLane.RECOVERED;
             return firstRenewal(admission.ready(),admission.boundary(),lane);
         }
         RenewalResult firstRenewal(LaterReady ready,Boundary saved,RenewalLane lane) throws StripeException {
@@ -435,7 +470,7 @@ public final class StripeBillingSnapshotMapper {
             checkpoint(RenewalCheckpoint.SUBSCRIPTION);remote=get(()->client.v1().subscriptions().retrieve(receipt.reference(),options()));
             require(receipt.reference().equals(remote.getId())&&"subscription".equals(remote.getObject())&&Boolean.FALSE.equals(remote.getLivemode())
                 &&Objects.equals(receipt.providerCreated(),remote.getCreated())&&b.providerReference().equals(remote.getCustomer())&&clockMatches(remote.getTestClock())
-                &&(lane==RenewalLane.SUCCESS?"active":"past_due").equals(remote.getStatus())&&remote.getPauseCollection()==null&&"charge_automatically".equals(remote.getCollectionMethod())
+                &&(lane==RenewalLane.FAILED?"past_due":"active").equals(remote.getStatus())&&remote.getPauseCollection()==null&&"charge_automatically".equals(remote.getCollectionMethod())
                 &&remote.getBillingMode()!=null&&"classic".equals(remote.getBillingMode().getType())
                 &&remote.getPaymentSettings()!=null&&List.of("card").equals(remote.getPaymentSettings().getPaymentMethodTypes())
                 &&"on_subscription".equals(remote.getPaymentSettings().getSaveDefaultPaymentMethod())
@@ -461,6 +496,7 @@ public final class StripeBillingSnapshotMapper {
             var historical=sourceInvoices.stream().filter(i->admission.invoice().equals(i.getId())&&"subscription_create".equals(i.getBillingReason())).toList();
             var renewals=sourceInvoices.stream().filter(i->!admission.invoice().equals(i.getId())&&"subscription_cycle".equals(i.getBillingReason())).toList();
             require(historical.size()==1&&renewals.size()==1);var renewal=renewals.getFirst();
+            if(lane==RenewalLane.RECOVERED)require(saved!=null&&saved.renewalInvoice().equals(renewal.getId()));
             require(Set.of("paid","draft","open").contains(renewal.getStatus()));
             checkpoint(RenewalCheckpoint.INITIAL_INVOICE);var initial=invoice(historical.getFirst(),remote,item,null);
             require(initial.kind()==BillingRecord.Kind.INITIAL&&initial.period().equals(period(receipt.periodStart(),receipt.periodEnd()))
@@ -477,6 +513,14 @@ public final class StripeBillingSnapshotMapper {
                 var failed=failedRenewal(renewal,admission);
                 return new RenewalResult(null,new FailedRenewalRead(new Snapshot(remote.getId(),Subscription.Status.PAST_DUE,intent.terms(),period,null,null,
                     List.of(initial,next),null,false,0,at,null,List.of(),null,null),failed.getFirst(),failed.getLast()));
+            }
+            if(lane==RenewalLane.RECOVERED){
+                require(saved!=null&&saved.renewalInvoice().equals(next.reference())&&next.settlement()==SettlementKind.CASH&&next.cashObjects().size()==1
+                    &&debtFailure.paymentIntent().equals(next.cashObjects().getFirst().reference()));
+                var allocations=sourceAllocations.get(next.reference());
+                require(allocations.size()==1&&debtFailure.allocation().equals(allocations.getFirst().getId())&&Boolean.TRUE.equals(allocations.getFirst().getIsDefault()));
+                return new RenewalResult(new MappedPaid(saved,new Snapshot(remote.getId(),Subscription.Status.ACTIVE,intent.terms(),period,null,null,
+                    List.of(initial,next),null,false,0,at,null,List.of(),null,null)),null);
             }
             if(next.settlement()==SettlementKind.OPEN)requirePendingRenewal(renewal);
             if(saved!=null)require(saved.renewalInvoice().equals(next.reference()));
@@ -669,6 +713,7 @@ public final class StripeBillingSnapshotMapper {
             // Only a typed original receipt permits an absent duplicate flat reference; nested ownership remains mandatory.
             boolean originalHistory=original!=null&&(renewalAdmission==null||renewalAdmission.invoice().equals(invoice.getId())&&"subscription_create".equals(invoice.getBillingReason()));
             boolean ownedRenewal=renewalAdmission!=null&&!originalHistory;
+            if(recoveredDebt)require(StripeBillingMutationAdapter.noNonAmountAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
             requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&(remote.getId().equals(line.getSubscription())||(originalHistory||ownedRenewal)&&line.getSubscription()==null)&&Objects.equals(line.getQuantity(),1L)
                 &&line.getParent()!=null&&"subscription_item_details".equals(line.getParent().getType())&&line.getParent().getSubscriptionItemDetails()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             var detail=line.getParent().getSubscriptionItemDetails();
@@ -701,7 +746,7 @@ public final class StripeBillingSnapshotMapper {
             SettlementReason unsupportedReason=SettlementReason.SNAPSHOT_UNSUPPORTED;
             // Cache the pure typed status before the six eager amount getters; reuse it below.
             var status=invoice.getStatus();
-            boolean acceptsUnavailableOffStripe=originalHistory&&kind==BillingRecord.Kind.INITIAL&&invoice.getAmountDue()>0
+            boolean acceptsUnavailableOffStripe=!recoveredDebt&&originalHistory&&kind==BillingRecord.Kind.INITIAL&&invoice.getAmountDue()>0
                 &&("open".equals(status)||"paid".equals(status));
             boolean acceptsUnfinalizedEnding=ownedRenewal&&kind==BillingRecord.Kind.RENEWAL&&"draft".equals(status);
             boolean plain=trace.check(!detail.getProration(),SettlementReason.PRORATION_FLAG)&&trace.check(kind!=BillingRecord.Kind.PRORATION,SettlementReason.PRORATION_KIND)&&trace.check("charge_automatically".equals(invoice.getCollectionMethod()),SettlementReason.COLLECTION_METHOD)
@@ -771,6 +816,8 @@ public final class StripeBillingSnapshotMapper {
             if(!"succeeded".equals(intent.getStatus())||!"automatic".equals(intent.getCaptureMethod())||!List.of("card").equals(intent.getPaymentMethodTypes())||!Objects.equals(intent.getAmount(),due)||!Objects.equals(intent.getAmountReceived(),due))return null;
             ref(intent.getLatestCharge(),"ch_");var charge=get(()->client.v1().charges().retrieve(intent.getLatestCharge(),options()));
             require(intent.getLatestCharge().equals(charge.getId())&&"charge".equals(charge.getObject())&&Boolean.FALSE.equals(charge.getLivemode())&&owner.customer().providerReference().equals(charge.getCustomer())&&intent.getId().equals(charge.getPaymentIntent())&&invoice.getCurrency().equals(charge.getCurrency()));
+            // This descriptive recovered-debt lane rejects refunded/unknown cash; legacy facts retain gross capture semantics below.
+            if(recoveredDebt)require(zeros(charge.getAmountRefunded())&&Boolean.FALSE.equals(charge.getRefunded()));
             if(!Boolean.TRUE.equals(charge.getCaptured())||!Boolean.TRUE.equals(charge.getPaid())||!"succeeded".equals(charge.getStatus())||!Objects.equals(charge.getAmount(),due)||!Objects.equals(charge.getAmountCaptured(),due)||charge.getPaymentMethodDetails()==null||!"card".equals(charge.getPaymentMethodDetails().getType()))return null;
             var reverse=pages(after->client.v1().invoicePayments().list(InvoicePaymentListParams.builder().setPayment(InvoicePaymentListParams.Payment.builder().setType(InvoicePaymentListParams.Payment.Type.PAYMENT_INTENT).setPaymentIntent(intent.getId()).build()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build(),options()));
             if(reverse.size()!=1)return null;var sole=reverse.getFirst();require(sole.equals(allocation));
