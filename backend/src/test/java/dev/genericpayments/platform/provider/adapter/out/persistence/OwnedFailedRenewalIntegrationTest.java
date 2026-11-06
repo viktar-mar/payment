@@ -5,6 +5,7 @@ import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewa
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal;
 import dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalStore;
 import dev.genericpayments.platform.provider.application.service.OwnedFailedRenewalService;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalObserver;
 import dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase;
 import dev.genericpayments.platform.subscriptions.application.port.out.*;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
@@ -55,11 +56,14 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         }
     }
     private OwnedFailedRenewalService service(OwnedFailedRenewalStore store, ApplySubscriptionSnapshotUseCase wrapper) {
+        return service(store,wrapper,()->{});
+    }
+    private OwnedFailedRenewalService service(OwnedFailedRenewalStore store,ApplySubscriptionSnapshotUseCase wrapper,Runnable beforeFacts) {
         var real=new SubscriptionFactService(subscriptions,lifecycleOperations,trials,siteLock,customerStore,accountLocks,bills,cash,events,catalog,
             Clock.systemUTC(),callback,objects,metadata,policies,observations,digest,quotes,sweep,readPreparation,authority,time,
             new OwnedFailedRenewalFactProof(store,transaction,time));
         return new OwnedFailedRenewalService(store,transaction,lifecycleOperations,lifecycleLocks,accountLocks,subscriptions,bills,
-            readPreparation,observations,wrapper==null?real:command->{real.apply(command);wrapper.apply(command);},trials,time,Clock.systemUTC(),bindings);
+            readPreparation,observations,command->{beforeFacts.run();real.apply(command);if(wrapper!=null)wrapper.apply(command);},trials,time,Clock.systemUTC(),bindings);
     }
     private record Setup(OwnedFirstRenewal.Admission upstream,OwnedFirstRenewal.LaterReady ready,OwnedFirstRenewal.Boundary boundary,Admission admission) {}
     private Setup setup() {
@@ -92,6 +96,68 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThatThrownBy(()->svc.publishFailure(s.admission(),read,new FailedEvidence(snapshot(s,false,null,now),"inpay_renewal","pi_renewal",now),context)).hasMessage("BILLING_TIME_CHANGED");
         assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_failed_renewal_failures")).isZero();
         assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);assertThat(count("payments")).isEqualTo(1);
+    }
+    @Test void observerPublishesFreshDeclineThroughJdbcAndRealFactService() {
+        var s=setup();var original=jdbc.queryForMap("select * from payments where id=?",s.upstream().payment());
+        long beforeOutbox=count("outbox_events"),beforeEvents=count("subscription_events");int beforeReads=http.calls.size();
+        failedGraph(s);
+        var result=new StripeBillingOwnedFailedRenewalObserver(service(store(),null),credentials,clients,Clock.systemUTC()).observe(s.admission());
+        assertThat(current().billingStatus()).isEqualTo(Subscription.Status.PAST_DUE);
+        assertThat(current().debt().billingRecordId()).isEqualTo(result.billId());
+        assertThat(result.invoice()).isEqualTo(s.boundary().renewalInvoice());assertThat(result.paymentIntent()).isEqualTo("pi_renewal");
+        assertThat(jdbc.queryForObject("select claim_id from stripe_billing_failed_renewal_failures where admission_id=?",UUID.class,s.admission().id())).isEqualTo(result.claimId());
+        assertThat(jdbc.queryForObject("select settlement from subscription_billing_records where id=?",String.class,result.billId())).isEqualTo("OPEN");
+        assertThat(jdbc.queryForMap("select * from payments where id=?",s.upstream().payment())).isEqualTo(original);
+        assertThat(count("payments")).isEqualTo(1);assertThat(count("subscription_events")).isEqualTo(beforeEvents+1);
+        assertThat(count("outbox_events")).isEqualTo(beforeOutbox+1);assertThat(count("stripe_billing_failed_renewal_failures")).isEqualTo(1);
+        assertThat(count("stripe_billing_failed_renewal_reads")).isEqualTo(1);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+        assertThat(jdbc.queryForObject("select count(*) from subscription_operations where kind='RECOVER'",Long.class)).isZero();
+        assertThat(jdbc.queryForObject("select count(*) from provider_operations where kind='INVOICE_PAY'",Long.class)).isZero();
+        assertThat(http.calls.subList(beforeReads,http.calls.size())).hasSize(15).allSatisfy(r->assertThat(r.method().name()).isEqualTo("GET"));
+        assertThat(http.replies).isEmpty();
+    }
+    @Test void observerPostFactFailureRollsBackDebtJournalAndOutboxBeforeOneStop() {
+        var s=setup();var before=financialState();int beforeReads=http.calls.size();failedGraph(s);
+        var broken=service(store(),command->{throw new IllegalStateException("synthetic after fact");});
+        assertThatThrownBy(()->new StripeBillingOwnedFailedRenewalObserver(broken,credentials,clients,Clock.systemUTC()).observe(s.admission()))
+            .isInstanceOfSatisfying(dev.genericpayments.platform.shared.application.PaymentApplicationException.class,e->{
+                assertThat(e.code()).isEqualTo("FAILED_RENEWAL_UNAVAILABLE");assertThat(e.status()).isEqualTo(409);
+                assertThat(e).hasMessage("Failed renewal observation unavailable").hasNoCause();});
+        assertThat(financialState()).isEqualTo(before);assertThat(current().debt()).isNull();assertThat(count("payments")).isEqualTo(1);
+        assertThat(count("stripe_billing_failed_renewal_failures")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);
+        assertThat(http.calls.subList(beforeReads,http.calls.size())).hasSize(15);assertThat(http.replies).isEmpty();
+    }
+    @Test void observerFactResamplingDriftAfterMatchedPublicationContextCannotWrite() {
+        var s=setup();var before=financialState();int beforeReads=http.calls.size();failedGraph(s);
+        var drifting=service(store(),null,()->time.selected=time.selected.plusSeconds(1));
+        assertThatThrownBy(()->new StripeBillingOwnedFailedRenewalObserver(drifting,credentials,clients,Clock.systemUTC()).observe(s.admission()))
+            .isInstanceOfSatisfying(dev.genericpayments.platform.shared.application.PaymentApplicationException.class,e->{
+                assertThat(e.code()).isEqualTo("FAILED_RENEWAL_UNAVAILABLE");assertThat(e).hasMessage("Failed renewal observation unavailable").hasNoCause();});
+        assertThat(financialState()).isEqualTo(before);assertThat(current().debt()).isNull();assertThat(count("payments")).isEqualTo(1);
+        assertThat(count("stripe_billing_failed_renewal_failures")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);
+        assertThat(http.calls.subList(beforeReads,http.calls.size())).hasSize(15);assertThat(http.replies).isEmpty();
+    }
+    /** Fresh synthetic failed SDK graph, queued after genuine initial payment and both owned advances. */
+    private void failedGraph(Setup s) {
+        assertThat(http.replies).isEmpty();graph(s.ready(),true);
+        replaceFailedReply(2,j->j.addProperty("status","past_due"));
+        replaceFailedReply(3,j->{var renewal=j.getAsJsonArray("data").get(1).getAsJsonObject();renewal.addProperty("status","open");renewal.addProperty("amount_paid",0);renewal.addProperty("amount_remaining",1000);});
+        for(int i:new int[]{10,13})replaceFailedReply(i,j->{var allocation=j.getAsJsonArray("data").get(0).getAsJsonObject();
+            allocation.addProperty("status","open");allocation.addProperty("is_default",true);allocation.addProperty("amount_paid",0);
+            allocation.getAsJsonObject("status_transitions").add("paid_at",com.google.gson.JsonNull.INSTANCE);
+            allocation.getAsJsonObject("status_transitions").add("canceled_at",com.google.gson.JsonNull.INSTANCE);});
+        replaceFailedReply(11,j->{j.addProperty("status","requires_payment_method");j.addProperty("amount_received",0);
+            j.add("last_payment_error",com.google.gson.JsonParser.parseString("{\"type\":\"card_error\",\"code\":\"card_declined\",\"decline_code\":\"generic_decline\",\"charge\":\"ch_renewal\"}"));});
+        replaceFailedReply(12,j->{j.addProperty("status","failed");j.addProperty("paid",false);j.addProperty("captured",false);
+            j.addProperty("amount_captured",0);j.addProperty("amount_refunded",0);j.addProperty("refunded",false);j.addProperty("failure_code","card_declined");
+            j.getAsJsonObject("payment_method_details").add("card",com.google.gson.JsonParser.parseString("{}"));
+            j.add("outcome",com.google.gson.JsonParser.parseString("{\"type\":\"issuer_declined\",\"reason\":\"generic_decline\"}"));});
+    }
+    private void replaceFailedReply(int index,java.util.function.Consumer<com.google.gson.JsonObject> mutation) {
+        var replies=new ArrayList<>(http.replies);var old=(com.stripe.net.StripeResponse)replies.get(index);
+        var value=com.google.gson.JsonParser.parseString(old.body()).getAsJsonObject();mutation.accept(value);
+        replies.set(index,new com.stripe.net.StripeResponse(200,com.stripe.net.HttpHeaders.of(Map.of()),value.toString()));
+        http.replies.clear();http.replies.addAll(replies);
     }
     @Test void genuineDebtGraceRecoveryAndReadOnlyReplay() {
         var s=setup();var service=service(store(),null);var original=jdbc.queryForMap("select * from payments where id=?",s.upstream().payment());

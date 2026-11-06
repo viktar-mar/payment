@@ -39,7 +39,7 @@ class StripeBillingFailedRenewalMappingTest {
         queueGraph(f,true);
         replace(f,1,j->j.addProperty("status","past_due"));
         replace(f,2,j->{var x=j.getAsJsonArray("data").get(1).getAsJsonObject();x.addProperty("status","open");x.addProperty("amount_paid",0);x.addProperty("amount_remaining",1000);});
-        for(int i:new int[]{9,12})replace(f,i,j->{var x=first(j);x.addProperty("status","open");x.addProperty("is_default",true);x.addProperty("amount_paid",0);});
+        for(int i:new int[]{9,12})replace(f,i,j->{var x=first(j);x.addProperty("status","open");x.addProperty("is_default",true);x.addProperty("amount_paid",0);x.getAsJsonObject("status_transitions").add("paid_at",JsonNull.INSTANCE);x.getAsJsonObject("status_transitions").add("canceled_at",JsonNull.INSTANCE);});
         replace(f,10,j->{j.addProperty("status","requires_payment_method");j.addProperty("amount_received",0);j.add("last_payment_error",JsonParser.parseString("{\"type\":\"card_error\",\"code\":\"card_declined\",\"decline_code\":\"generic_decline\",\"charge\":\"ch_renewal\"}"));});
         replace(f,11,j->{j.addProperty("status","failed");j.addProperty("paid",false);j.addProperty("captured",false);j.addProperty("amount_captured",0);j.addProperty("amount_refunded",0);j.addProperty("refunded",false);j.addProperty("failure_code","card_declined");j.getAsJsonObject("payment_method_details").add("card",JsonParser.parseString("{}"));j.add("outcome",JsonParser.parseString("{\"type\":\"issuer_declined\",\"reason\":\"generic_decline\"}"));});
     }
