@@ -66,9 +66,22 @@ public final class StripeBillingSnapshotMapper {
         try{
             var read=new Read(client,owner,observedAt,new OwnedInitial(admission.receipt()));
             read.renewalAdmission=admission;read.executor=executor;
-            return read.firstRenewal(laterReady,boundary);
+            return read.firstRenewal(laterReady,boundary,RenewalLane.SUCCESS).success();
         }catch(PaymentApplicationException safe){throw safe;}
         catch(StripeException malformed){throw mismatch();}
+    }
+    record FailedRenewalRead(Snapshot snapshot,String allocation,String paymentIntent) {}
+    private enum RenewalLane { SUCCESS, FAILED }
+    private record RenewalResult(MappedObservation success,FailedRenewalRead failed) {}
+    static FailedRenewalRead retrieveOwnedFailedRenewal(StripeClient client,Ownership owner,
+            dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal.Admission failed,Instant observedAt,ReadExecutor executor){
+        try {
+            require(failed!=null&&executor!=null&&failed.ready().ack().advance().step()==Step.FINALIZATION);
+            var read=new Read(client,owner,observedAt,new OwnedInitial(failed.firstRenewalAdmission().receipt()));
+            read.renewalAdmission=failed.firstRenewalAdmission();read.executor=executor;
+            return read.firstRenewal(failed.ready(),failed.boundary(),RenewalLane.FAILED).failed();
+        }catch(PaymentApplicationException safe){throw safe;}
+        catch(StripeException | RuntimeException malformed){throw mismatch();}
     }
     /** Exact credited native line, funded using the same complete normalization as ordinary reads. */
     static void requireCreditedFunding(StripeClient client,Ownership owner,com.stripe.model.Subscription remote,
@@ -318,7 +331,7 @@ public final class StripeBillingSnapshotMapper {
             }
             throw mismatch();
         }
-        MappedObservation firstRenewal(LaterReady ready,Boundary saved) throws StripeException {
+        RenewalResult firstRenewal(LaterReady ready,Boundary saved,RenewalLane lane) throws StripeException {
             var admission=renewalAdmission;var receipt=admission.receipt();var intent=receipt.intent();var clock=intent.clock();var scope=clock.owner();
             var a=owner.account();var s=owner.subscription();var b=owner.customer();
             require(ready!=null&&ready.admissionId().equals(admission.id())&&at!=null&&!at.isBefore(ready.observedAt()));
@@ -344,7 +357,7 @@ public final class StripeBillingSnapshotMapper {
             checkpoint(RenewalCheckpoint.SUBSCRIPTION);remote=get(()->client.v1().subscriptions().retrieve(receipt.reference(),options()));
             require(receipt.reference().equals(remote.getId())&&"subscription".equals(remote.getObject())&&Boolean.FALSE.equals(remote.getLivemode())
                 &&Objects.equals(receipt.providerCreated(),remote.getCreated())&&b.providerReference().equals(remote.getCustomer())&&clockMatches(remote.getTestClock())
-                &&"active".equals(remote.getStatus())&&remote.getPauseCollection()==null&&"charge_automatically".equals(remote.getCollectionMethod())
+                &&(lane==RenewalLane.SUCCESS?"active":"past_due").equals(remote.getStatus())&&remote.getPauseCollection()==null&&"charge_automatically".equals(remote.getCollectionMethod())
                 &&remote.getBillingMode()!=null&&"classic".equals(remote.getBillingMode().getType())
                 &&remote.getPaymentSettings()!=null&&List.of("card").equals(remote.getPaymentSettings().getPaymentMethodTypes())
                 &&"on_subscription".equals(remote.getPaymentSettings().getSaveDefaultPaymentMethod())
@@ -380,6 +393,13 @@ public final class StripeBillingSnapshotMapper {
             checkpoint(RenewalCheckpoint.RENEWAL_INVOICE);var next=invoice(renewal,remote,item,null);
             require(next.kind()==BillingRecord.Kind.RENEWAL&&next.period().equals(period)&&next.price().equals(intent.terms())
                 &&(next.settlement()==SettlementKind.CASH||next.settlement()==SettlementKind.OPEN));
+            if(lane==RenewalLane.FAILED){
+                require(saved!=null&&saved.renewalInvoice().equals(next.reference())&&"open".equals(renewal.getStatus())
+                    &&next.settlement()==SettlementKind.OPEN&&next.cashObjects().isEmpty());
+                var failed=failedRenewal(renewal,admission);
+                return new RenewalResult(null,new FailedRenewalRead(new Snapshot(remote.getId(),Subscription.Status.PAST_DUE,intent.terms(),period,null,null,
+                    List.of(initial,next),null,false,0,at,null,List.of(),null,null),failed.getFirst(),failed.getLast()));
+            }
             if(next.settlement()==SettlementKind.OPEN)requirePendingRenewal(renewal);
             if(saved!=null)require(saved.renewalInvoice().equals(next.reference()));
             var boundary=saved;
@@ -388,15 +408,43 @@ public final class StripeBillingSnapshotMapper {
                 boundary=new Boundary(id,admission.id(),ready,item.getId(),next.reference(),period,
                     OwnedFirstRenewal.fingerprint("gp:owned-first-renewal-boundary:v1",id,admission.id(),ready.id(),item.getId(),next.reference(),period.start(),period.end(),at),at);
             }
-            if(ready.ack().advance().step()==Step.BOUNDARY||next.settlement()==SettlementKind.OPEN)return new MappedPending(boundary);
+            if(ready.ack().advance().step()==Step.BOUNDARY||next.settlement()==SettlementKind.OPEN)return new RenewalResult(new MappedPending(boundary),null);
             boolean methodReady=false;
             if(remote.getDefaultPaymentMethod()!=null){
                 String method=remote.getDefaultPaymentMethod();ref(method,"pm_");var pm=get(()->client.v1().paymentMethods().retrieve(method,options()));
                 require(method.equals(pm.getId())&&"payment_method".equals(pm.getObject())&&Boolean.FALSE.equals(pm.getLivemode())
                     &&b.providerReference().equals(pm.getCustomer())&&"card".equals(pm.getType())&&pm.getCard()!=null);methodReady=true;
             }
-            return new MappedPaid(boundary,new Snapshot(remote.getId(),Subscription.Status.ACTIVE,intent.terms(),period,null,null,
-                List.of(initial,next),null,methodReady,0,at,null,List.of(),null,null));
+            return new RenewalResult(new MappedPaid(boundary,new Snapshot(remote.getId(),Subscription.Status.ACTIVE,intent.terms(),period,null,null,
+                List.of(initial,next),null,methodReady,0,at,null,List.of(),null,null)),null);
+        }
+        private List<String> failedRenewal(com.stripe.model.Invoice invoice,Admission admission)throws StripeException {
+            var allocations=sourceAllocations.get(invoice.getId());require(allocations.size()==1);
+            var allocation=allocations.getFirst();long due=invoice.getAmountDue();
+            require(!admission.allocation().equals(allocation.getId())&&Boolean.TRUE.equals(allocation.getIsDefault())
+                &&"open".equals(allocation.getStatus())&&Objects.equals(due,allocation.getAmountRequested())&&zeros(allocation.getAmountPaid())
+                &&allocation.getPayment()!=null&&"payment_intent".equals(allocation.getPayment().getType()));
+            var id=allocation.getPayment().getPaymentIntent();ref(id,"pi_");require(!id.equals(admission.paymentIntent()));
+            var pi=get(()->client.v1().paymentIntents().retrieve(id,options()));
+            require(id.equals(pi.getId())&&"payment_intent".equals(pi.getObject())&&Boolean.FALSE.equals(pi.getLivemode())
+                &&owner.customer().providerReference().equals(pi.getCustomer())&&invoice.getCurrency().equals(pi.getCurrency())
+                &&Objects.equals(due,pi.getAmount())&&zeros(pi.getAmountReceived())&&"automatic".equals(pi.getCaptureMethod())
+                &&List.of("card").equals(pi.getPaymentMethodTypes())&&"requires_payment_method".equals(pi.getStatus()));
+            var error=pi.getLastPaymentError();require(error!=null&&"card_error".equals(error.getType())&&"card_declined".equals(error.getCode())
+                &&Set.of("generic_decline","insufficient_funds","do_not_honor").contains(error.getDeclineCode()));
+            var chargeId=pi.getLatestCharge();ref(chargeId,"ch_");require(chargeId.equals(error.getCharge()));
+            var charge=get(()->client.v1().charges().retrieve(chargeId,options()));
+            require(chargeId.equals(charge.getId())&&"charge".equals(charge.getObject())&&Boolean.FALSE.equals(charge.getLivemode())
+                &&owner.customer().providerReference().equals(charge.getCustomer())&&id.equals(charge.getPaymentIntent())&&invoice.getCurrency().equals(charge.getCurrency())
+                &&Objects.equals(due,charge.getAmount())&&"failed".equals(charge.getStatus())&&Boolean.FALSE.equals(charge.getPaid())
+                &&Boolean.FALSE.equals(charge.getCaptured())&&zeros(charge.getAmountCaptured(),charge.getAmountRefunded())&&Boolean.FALSE.equals(charge.getRefunded())
+                &&charge.getPaymentMethodDetails()!=null&&"card".equals(charge.getPaymentMethodDetails().getType())&&charge.getPaymentMethodDetails().getCard()!=null
+                &&"card_declined".equals(charge.getFailureCode())&&charge.getOutcome()!=null&&"issuer_declined".equals(charge.getOutcome().getType())
+                &&error.getDeclineCode().equals(charge.getOutcome().getReason()));
+            var reverse=pages(after->client.v1().invoicePayments().list(InvoicePaymentListParams.builder().setPayment(InvoicePaymentListParams.Payment.builder()
+                .setType(InvoicePaymentListParams.Payment.Type.PAYMENT_INTENT).setPaymentIntent(id).build()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build(),options()));
+            require(reverse.size()==1&&allocation.equals(reverse.getFirst()));
+            return List.of(allocation.getId(),id);
         }
         private void requirePendingRenewal(com.stripe.model.Invoice invoice)throws StripeException {
             var allocations=sourceAllocations.get(invoice.getId());require(allocations.size()<=1);
