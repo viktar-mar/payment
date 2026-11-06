@@ -85,6 +85,7 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
         var selected=reads.financial(original);
         var now=clock.instant();
         var sample=billingTime.sample(original.paymentAccountId(),original.siteId(),original.customerId(),now);
+        if(command.expectedBillingSample()!=null&&!command.expectedBillingSample().equals(sample))throw new IllegalStateException("BILLING_TIME_CHANGED");
         var billingAt=sample.billingAt();
         var snapshot=command.snapshot();
         if(sample.isolated())requireIsolatedShape(command,original,snapshot,locked,billingAt,now);

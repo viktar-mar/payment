@@ -44,10 +44,11 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     private OwnedFailedRenewalStore store() { return new JdbcOwnedFailedRenewalStore(jdbc); }
     private final ExactTime time=new ExactTime();
     private class ExactTime implements SubscriptionBillingTimePort {
-        Instant selected;
+        Instant selected; boolean driftSecondSample; int samples;
         public Sample sample(PaymentAccountId account,SiteId suppliedSite,CustomerId suppliedCustomer,Instant utc) {
             if(!transaction.active() || selected==null || !billing.id().equals(account) || !site.equals(suppliedSite) || !customer.equals(suppliedCustomer)) throw new IllegalStateException("foreign or unarmed isolated owner");
-            return new Sample(selected,Mode.ISOLATED);
+            samples++;
+            return new Sample(driftSecondSample&&samples==2?selected.plusSeconds(1):selected,Mode.ISOLATED);
         }
         public void requireUnscopedAllowed(SiteId s,CustomerId c) {
             if((s==null||s.equals(site))&&(c==null||c.equals(customer))) throw new IllegalStateException("isolated owner included");
@@ -58,7 +59,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             Clock.systemUTC(),callback,objects,metadata,policies,observations,digest,quotes,sweep,readPreparation,authority,time,
             new OwnedFailedRenewalFactProof(store,transaction,time));
         return new OwnedFailedRenewalService(store,transaction,lifecycleOperations,lifecycleLocks,accountLocks,subscriptions,bills,
-            readPreparation,observations,wrapper==null?real:command->{real.apply(command);wrapper.apply(command);},trials,time,Clock.systemUTC());
+            readPreparation,observations,wrapper==null?real:command->{real.apply(command);wrapper.apply(command);},trials,time,Clock.systemUTC(),bindings);
     }
     private record Setup(OwnedFirstRenewal.Admission upstream,OwnedFirstRenewal.LaterReady ready,OwnedFirstRenewal.Boundary boundary,Admission admission) {}
     private Setup setup() {
@@ -80,6 +81,17 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     private Failure fail(Setup s,OwnedFailedRenewalService service) {
         var read=service.beginFailedRead(s.admission(),UUID.randomUUID());var now=Instant.now();
         return service.publishFailure(s.admission(),read,new FailedEvidence(snapshot(s,false,null,now),"inpay_renewal","pi_renewal",now));
+    }
+    @Test void genuineInspectionAndFactResamplingMismatchRollsBack() {
+        var s=setup();var svc=service(store(),null);var read=svc.beginFailedRead(s.admission(),UUID.randomUUID());
+        var before=financialState();var context=svc.inspectFailedRead(s.admission(),read);
+        assertThat(context.binding()).isEqualTo(bindings.findCustomer(billing.id(),site,customer).orElseThrow());
+        assertThat(context.billingAt()).isEqualTo(Instant.ofEpochSecond(s.ready().ack().advance().target()));
+        assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+        time.samples=0;time.driftSecondSample=true;var now=Instant.now();
+        assertThatThrownBy(()->svc.publishFailure(s.admission(),read,new FailedEvidence(snapshot(s,false,null,now),"inpay_renewal","pi_renewal",now),context)).hasMessage("BILLING_TIME_CHANGED");
+        assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_failed_renewal_failures")).isZero();
+        assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);assertThat(count("payments")).isEqualTo(1);
     }
     @Test void genuineDebtGraceRecoveryAndReadOnlyReplay() {
         var s=setup();var service=service(store(),null);var original=jdbc.queryForMap("select * from payments where id=?",s.upstream().payment());

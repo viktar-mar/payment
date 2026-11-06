@@ -28,6 +28,63 @@ class OwnedFailedRenewalServiceTest {
         assertThat(read.fence()).isEqualTo(new Fence(2,null,null,null,null,0L));assertThat(h.cash).isEmpty();
         assertThat(h.trace).containsSubsequence("operations","lifecycle","account","subscription","bill");
     }
+    @Test void inspectedContextIsAuthenticatedAndPublicationPinsFactSample() {
+        var h=new Harness(true);var read=h.service.beginFailedRead(h.admission,UUID.randomUUID());
+        var context=h.service.inspectFailedRead(h.admission,read);
+        assertThat(context.account()).isEqualTo(h.account);assertThat(context.subscription()).isEqualTo(h.s);
+        assertThat(context.binding()).isEqualTo(h.binding);assertThat(context.billingAt()).isEqualTo(Instant.ofEpochSecond(4700));
+        assertThat(h.effects).isZero();assertThat(h.stopped).isFalse();
+        assertThat(h.trace).containsSubsequence("begin","operations","lifecycle","account","subscription","bill","commit");
+        h.factTimeDrift=true;
+        assertThatThrownBy(()->h.service.publishFailure(h.admission,read,new FailedEvidence(h.snapshot(false),"inpay_renewal","pi_renewal",h.utc),context)).hasMessage("BILLING_TIME_CHANGED");
+        assertThat(h.effects).isZero();assertThat(h.s.debt()).isNull();assertThat(h.failure).isNull();assertThat(h.stopped).isTrue();
+    }
+    @Test void inspectionRejectsDefaultConstructorAndChangedBindingWithoutStopping() {
+        var legacy=new Harness();var read=legacy.service.beginFailedRead(legacy.admission,UUID.randomUUID());
+        assertThatThrownBy(()->legacy.service.inspectFailedRead(legacy.admission,read)).isInstanceOf(IllegalStateException.class);
+        assertThat(legacy.stopped).isFalse();
+        var h=new Harness(true);var r=h.service.beginFailedRead(h.admission,UUID.randomUUID());var context=h.service.inspectFailedRead(h.admission,r);
+        h.binding=new dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding(h.binding.id(),h.binding.accountId(),h.binding.siteId(),h.binding.customerId(),h.binding.providerReference(),h.binding.creationOperationId(),1);
+        assertThatThrownBy(()->h.service.publishFailure(h.admission,r,new FailedEvidence(h.snapshot(false),"inpay_renewal","pi_renewal",h.utc),context)).isInstanceOf(IllegalStateException.class);
+        assertThat(h.effects).isZero();assertThat(h.stopped).isTrue();
+    }
+    @Test void inspectionRejectsInvalidClaimsAndTimeWithoutEffectsOrStop() {
+        for(var bad:List.of("expired","future","foreign","stale","time","ambient")) {
+            var h=new Harness(true);var original=h.service.beginFailedRead(h.admission,UUID.randomUUID());var read=original;
+            if(bad.equals("expired"))h.utc=original.deadlineAt();
+            if(bad.equals("future"))h.utc=original.startedAt().minusSeconds(1);
+            if(bad.equals("foreign"))read=new ReadClaim(original.id(),UUID.randomUUID(),original.phase(),original.invocation(),original.startedAt(),original.deadlineAt(),original.fence());
+            if(bad.equals("stale"))h.sequence++;
+            if(bad.equals("time"))h.billingSecond=4701;
+            if(bad.equals("ambient"))h.active=true;
+            var supplied=read;assertThatThrownBy(()->h.service.inspectFailedRead(h.admission,supplied)).isInstanceOf(RuntimeException.class);
+            assertThat(h.effects).isZero();assertThat(h.stopped).isFalse();
+        }
+    }
+    @Test void contextPublicationSucceedsAndReceiptFailureRollsBackBeforeOneStop() {
+        var h=new Harness(true);var read=h.service.beginFailedRead(h.admission,UUID.randomUUID());var context=h.service.inspectFailedRead(h.admission,read);
+        var result=h.service.publishFailure(h.admission,read,new FailedEvidence(h.snapshot(false),"inpay_renewal","pi_renewal",h.utc),context);
+        assertThat(result).isEqualTo(h.failure);assertThat(h.s.debt()).isNotNull();assertThat(h.cash).containsOnly("pi_initial");
+        var broken=new Harness(true);var r=broken.service.beginFailedRead(broken.admission,UUID.randomUUID());var c=broken.service.inspectFailedRead(broken.admission,r);broken.failReceipt=true;
+        assertThatThrownBy(()->broken.service.publishFailure(broken.admission,r,new FailedEvidence(broken.snapshot(false),"inpay_renewal","pi_renewal",broken.utc),c)).hasMessage("receipt failed");
+        assertThat(broken.effects).isZero();assertThat(broken.failure).isNull();assertThat(broken.s.debt()).isNull();assertThat(broken.trace).containsSubsequence("rollback","begin","stop","commit");assertThat(broken.trace.stream().filter("stop"::equals)).hasSize(1);
+    }
+    @Test void factSampleModeChangeRejectsBeforeEffects() {
+        var h=new Harness(true);var read=h.service.beginFailedRead(h.admission,UUID.randomUUID());var context=h.service.inspectFailedRead(h.admission,read);h.factModeDrift=true;
+        assertThatThrownBy(()->h.service.publishFailure(h.admission,read,new FailedEvidence(h.snapshot(false),"inpay_renewal","pi_renewal",h.utc),context)).hasMessage("BILLING_TIME_CHANGED");
+        assertThat(h.effects).isZero();assertThat(h.sequence).isZero();assertThat(h.stopped).isTrue();
+    }
+    @Test void inspectionRejectsInvalidBindingIdentityAndPublicationRejectsForgedContext() {
+        for(var bad:List.of("id","owner","creation","reference")) {
+            var h=new Harness(true);var r=h.service.beginFailedRead(h.admission,UUID.randomUUID());var b=h.binding;
+            h.binding=new dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding(bad.equals("id")?UUID.randomUUID():b.id(),bad.equals("owner")?new PaymentAccountId(UUID.randomUUID()):b.accountId(),b.siteId(),b.customerId(),bad.equals("reference")?"cus_foreign":b.providerReference(),bad.equals("creation")?UUID.randomUUID():b.creationOperationId(),b.version());
+            assertThatThrownBy(()->h.service.inspectFailedRead(h.admission,r)).isInstanceOf(IllegalStateException.class);assertThat(h.stopped).isFalse();assertThat(h.effects).isZero();
+        }
+        var h=new Harness(true);var r=h.service.beginFailedRead(h.admission,UUID.randomUUID());var c=h.service.inspectFailedRead(h.admission,r);
+        var forged=new OwnedFailedRenewalService.FailedReadContext(c.account(),c.subscription(),c.binding(),c.billingAt().plusSeconds(1));
+        assertThatThrownBy(()->h.service.publishFailure(h.admission,r,new FailedEvidence(h.snapshot(false),"inpay_renewal","pi_renewal",h.utc),forged)).isInstanceOf(IllegalStateException.class);
+        assertThat(h.effects).isZero();assertThat(h.stopped).isTrue();
+    }
     @Test void failureUsesRealFactsAndFixedGraceWithReceiptAfterProjection() {
         var h=new Harness();h.fail();
         assertThat(h.s.billingStatus()).isEqualTo(Subscription.Status.PAST_DUE);assertThat(h.failure.billId()).isEqualTo(h.s.debt().billingRecordId());
@@ -117,9 +174,11 @@ class OwnedFailedRenewalServiceTest {
         final PaymentAccount account=PaymentAccount.create(owner.account(),"owned",PaymentProviderType.STRIPE,PaymentAccountMode.SANDBOX,"acct_owned","alias");
         Map<UUID,SubscriptionOperation> ops=new LinkedHashMap<>();Map<String,BillingRecord> records=new LinkedHashMap<>();Map<Phase,ReadClaim> reads=new HashMap<>();
         Set<String> cash=new LinkedHashSet<>();List<SubscriptionEvent.Type> events=new ArrayList<>();List<String> trace=new ArrayList<>();
-        long sequence;int effects,callbacks;boolean active,isolated=true,foreign,claimOwner=true,stopped,failReceipt,normalizeClaim;Instant utc=UTC;
+        long sequence,billingSecond=4700;int effects,callbacks,timeCalls;boolean active,isolated=true,foreign,claimOwner=true,stopped,failReceipt,normalizeClaim,factTimeDrift,factModeDrift;Instant utc=UTC;
+        dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding binding=new dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding(upstream.receipt().intent().customerBinding(),owner.account(),owner.site(),owner.customer(),upstream.receipt().intent().customerReference(),upstream.receipt().intent().customerCreationOperation(),0);
         Failure failure;Recovery recovery;Publication publication;final OwnedFailedRenewalService service;
-        Harness(){
+        Harness(){this(false);}
+        Harness(boolean withBinding){
             var initialOperation=new SubscriptionOperation(upstream.receipt().intent().createOperation(),owner.site(),owner.customer(),s.id(),SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Status.SUCCEEDED,"create","digest",upstream.receipt().intent().requestFingerprint(),upstream.receipt().intent().operationKey(),0,1,"sub_owned",null,UTC,UTC,1);ops.put(initialOperation.id(),initialOperation);
             records.put("in_initial",new BillingRecord(upstream.bill(),s.siteId(),s.id(),s.paymentAccountId(),"in_initial",BillingRecord.Kind.INITIAL,s.billingPrice(),null,s.currentPeriod(),1000,"EUR",BillingRecord.Settlement.CONFIRMED_CASH,0,UTC,UTC));
             var operations=port(SubscriptionOperationStore.class,(m,a)->switch(m){
@@ -134,14 +193,14 @@ class OwnedFailedRenewalServiceTest {
             var subscriptions=port(SubscriptionStore.class,(m,a)->switch(m){case "findOwned"->Optional.of(s);case "lock"->{trace.add("subscription");yield s;}case "save"->{effects++;s=(Subscription)a[0];yield s;}default->throw new AssertionError(m);});
             var bills=port(BillingRecordStore.class,(m,a)->switch(m){case "find"->Optional.ofNullable(records.get(a[3]));case "lock"->{trace.add("bill");yield records.values().stream().filter(b->b.id().equals(a[1])).findFirst().orElseThrow();}case "upsert"->{effects++;var b=(BillingRecord)a[0];var old=records.get(b.providerInvoiceReference());if(old!=null)b=new BillingRecord(b.id(),b.siteId(),b.subscriptionId(),b.accountId(),b.providerInvoiceReference(),b.kind(),b.billedPrice(),b.previousPrice(),b.period(),b.amountDueMinor(),b.currency(),b.settlement(),old.version()+(old.settlement()!=b.settlement()?1:0),b.createdAt(),b.updatedAt());records.put(b.providerInvoiceReference(),b);yield b;}default->throw new AssertionError(m);});
             var observations=port(SubscriptionObservationPort.class,(m,a)->switch(m){case "captureFence"->sequence;case "consumeFence"->{if(!Objects.equals(a[1],sequence))throw new IllegalStateException("stale");sequence++;yield null;}default->throw new AssertionError(m);});
-            var time=new SubscriptionBillingTimePort(){public Sample sample(PaymentAccountId account,SiteId site,CustomerId customer,Instant at){assertThat(account).isEqualTo(owner.account());assertThat(site).isEqualTo(owner.site());assertThat(customer).isEqualTo(owner.customer());assertThat(at).isEqualTo(utc);return new Sample(Instant.ofEpochSecond(4700),isolated&&!foreign?Mode.ISOLATED:Mode.ORDINARY);}public void requireUnscopedAllowed(SiteId site,CustomerId customer){throw new AssertionError();}};
+            var time=new SubscriptionBillingTimePort(){public Sample sample(PaymentAccountId account,SiteId site,CustomerId customer,Instant at){assertThat(account).isEqualTo(owner.account());assertThat(site).isEqualTo(owner.site());assertThat(customer).isEqualTo(owner.customer());assertThat(at).isEqualTo(utc);timeCalls++;return new Sample(Instant.ofEpochSecond(factTimeDrift&&timeCalls%2==0?4701:billingSecond),isolated&&!foreign&&!(factModeDrift&&timeCalls%2==0)?Mode.ISOLATED:Mode.ORDINARY);}public void requireUnscopedAllowed(SiteId site,CustomerId customer){throw new AssertionError();}};
             var clock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId z){return this;}public Instant instant(){return utc;}};
             var store=port(OwnedFailedRenewalStore.class,(m,a)->{if(!active)throw new AssertionError("outside tx");return switch(m){
                 case "admitInTransaction"->admission;
                 case "requireCurrentInTransaction"->{current((Admission)a[0]);if(recovery==null&&ops.size()>1)throw new IllegalStateException("transient unassociated");yield admission;}
                 case "claimReadInTransaction"->{current((Admission)a[0]);var phase=(Phase)a[1];if(reads.containsKey(phase))throw new IllegalStateException("duplicate read");var r=new ReadClaim(UUID.randomUUID(),admission.id(),phase,(UUID)a[2],(Instant)a[4],((Instant)a[4]).plusSeconds(30),(Fence)a[3]);reads.put(phase,r);yield r;}
                 case "requireReadInTransaction"->{current((Admission)a[0]);var r=(ReadClaim)a[1];if(!r.equals(reads.get(r.phase()))||!utc.isBefore(r.deadlineAt()))throw new IllegalStateException("read unavailable");yield r;}
-                case "recordFailureInTransaction"->{trace.add("failureReceipt");assertThat(s.debt()).isNotNull();var b=records.get("in_renewal");failure=new Failure(admission.id(),((ReadClaim)a[1]).id(),b.id(),b.version(),b.providerInvoiceReference(),"inpay_renewal","pi_renewal",b.period(),s.debt().graceDeadline(),s.revision(),sequence,utc);yield failure;}
+                case "recordFailureInTransaction"->{trace.add("failureReceipt");if(failReceipt)throw new IllegalStateException("receipt failed");assertThat(s.debt()).isNotNull();var b=records.get("in_renewal");failure=new Failure(admission.id(),((ReadClaim)a[1]).id(),b.id(),b.version(),b.providerInvoiceReference(),"inpay_renewal","pi_renewal",b.period(),s.debt().graceDeadline(),s.revision(),sequence,utc);yield failure;}
                 case "requireFailureInTransaction"->{current((Admission)a[0]);if(recovery!=null)throw new IllegalStateException("already reserved");yield Objects.requireNonNull(failure);}
                 case "associateInTransaction"->{trace.add("associate");current((Admission)a[0]);if(recovery!=null)throw new IllegalStateException("duplicate");var o=(SubscriptionOperation)a[1];recovery=new Recovery(admission.id(),o.id(),failure.billId(),(String)a[2],(String)a[3],o.expectedRevision(),o.version(),utc);yield recovery;}
                 case "requireRecoveryInTransaction"->{current((Admission)a[0]);yield Objects.requireNonNull(recovery);}
@@ -159,7 +218,8 @@ class OwnedFailedRenewalServiceTest {
                 (b,v,deadline)->new BillingMetadataPort.Captured(v,deadline),port(SubscriptionPolicyPort.class,(m,a)->new SubscriptionPolicy(s.siteId(),1,true,3,false,false,false,Set.of())),observations,value->"digest",inert(SubscriptionQuoteStore.class),inert(SubscriptionSweepPort.class),new SubscriptionReadPreparation(operations,trials),inert(SubscriptionAuthorityPort.class),time,
                 new dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedRenewalFactProof(store,tx,time));
 
-            service=new OwnedFailedRenewalService(store,tx,operations,(siteId,customer)->trace.add("lifecycle"),id->{trace.add("account");return Optional.of(account);},subscriptions,bills,new SubscriptionReadPreparation(operations,trials),observations,c->{trace.add("facts");facts.apply(c);},trials,time,clock);
+            var bindings=port(dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.class,(m,a)->Optional.of(binding));
+            service=withBinding?new OwnedFailedRenewalService(store,tx,operations,(siteId,customer)->trace.add("lifecycle"),id->{trace.add("account");return Optional.of(account);},subscriptions,bills,new SubscriptionReadPreparation(operations,trials),observations,c->{trace.add("facts");facts.apply(c);},trials,time,clock,bindings):new OwnedFailedRenewalService(store,tx,operations,(siteId,customer)->trace.add("lifecycle"),id->{trace.add("account");return Optional.of(account);},subscriptions,bills,new SubscriptionReadPreparation(operations,trials),observations,c->{trace.add("facts");facts.apply(c);},trials,time,clock);
         }
         void current(Admission supplied){if(!admission.equals(supplied)||stopped)throw new IllegalStateException("authority unavailable");}
         void fail(){var read=service.beginFailedRead(admission,UUID.randomUUID());service.publishFailure(admission,read,new FailedEvidence(snapshot(false),"inpay_renewal","pi_renewal",utc));}

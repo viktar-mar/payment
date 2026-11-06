@@ -4,6 +4,7 @@ import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewa
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal.*;
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal;
 import dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalStore;
+import dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.LockPaymentAccountPort;
 import dev.genericpayments.platform.paymentaccounts.domain.*;
 import dev.genericpayments.platform.payments.domain.PaymentStatus;
@@ -32,15 +33,24 @@ public final class OwnedFailedRenewalService {
     private final TrialEligibilityStore trials;
     private final SubscriptionBillingTimePort billingTime;
     private final Clock clock;
+    private final StripeBillingBindingPort bindings;
+    public record FailedReadContext(PaymentAccount account,Subscription subscription,StripeBillingBindingPort.CustomerBinding binding,Instant billingAt) {}
 
     public OwnedFailedRenewalService(OwnedFailedRenewalStore store,SubscriptionTransactionPort transaction,SubscriptionOperationStore operations,
             SubscriptionLifecycleLockPort lifecycle,LockPaymentAccountPort accounts,SubscriptionStore subscriptions,BillingRecordStore bills,
             PrepareSubscriptionReadUseCase reads,SubscriptionObservationPort observations,ApplySubscriptionSnapshotUseCase facts,
             TrialEligibilityStore trials,SubscriptionBillingTimePort billingTime,Clock clock) {
+        this(store,transaction,operations,lifecycle,accounts,subscriptions,bills,reads,observations,facts,trials,billingTime,clock,null);
+    }
+    public OwnedFailedRenewalService(OwnedFailedRenewalStore store,SubscriptionTransactionPort transaction,SubscriptionOperationStore operations,
+            SubscriptionLifecycleLockPort lifecycle,LockPaymentAccountPort accounts,SubscriptionStore subscriptions,BillingRecordStore bills,
+            PrepareSubscriptionReadUseCase reads,SubscriptionObservationPort observations,ApplySubscriptionSnapshotUseCase facts,
+            TrialEligibilityStore trials,SubscriptionBillingTimePort billingTime,Clock clock,StripeBillingBindingPort bindings) {
         this.store=Objects.requireNonNull(store);this.transaction=Objects.requireNonNull(transaction);this.operations=Objects.requireNonNull(operations);
         this.lifecycle=Objects.requireNonNull(lifecycle);this.accounts=Objects.requireNonNull(accounts);this.subscriptions=Objects.requireNonNull(subscriptions);
         this.bills=Objects.requireNonNull(bills);this.reads=Objects.requireNonNull(reads);this.observations=Objects.requireNonNull(observations);
         this.facts=Objects.requireNonNull(facts);this.trials=Objects.requireNonNull(trials);this.billingTime=Objects.requireNonNull(billingTime);this.clock=Objects.requireNonNull(clock);
+        this.bindings=bindings;
     }
     public Admission admit(OwnedFirstRenewal.Admission upstream,OwnedFirstRenewal.LaterReady ready,OwnedFirstRenewal.Boundary boundary) {
         fresh();Objects.requireNonNull(upstream);Objects.requireNonNull(ready);Objects.requireNonNull(boundary);
@@ -58,13 +68,24 @@ public final class OwnedFailedRenewalService {
         }));
     }
     public Failure publishFailure(Admission admission,ReadClaim claim,FailedEvidence evidence) {
+        return publishFailureCore(admission,claim,evidence,null,false);
+    }
+    public FailedReadContext inspectFailedRead(Admission admission,ReadClaim claim) {
+        fresh();Objects.requireNonNull(admission);
+        return transaction.requiresNew(()->{var state=current(admission);requireNoFinancial(state);return failedContext(admission,claim,state);});
+    }
+    public Failure publishFailure(Admission admission,ReadClaim claim,FailedEvidence evidence,FailedReadContext expected) {
+        return publishFailureCore(admission,claim,evidence,expected,true);
+    }
+    private Failure publishFailureCore(Admission admission,ReadClaim claim,FailedEvidence evidence,FailedReadContext expected,boolean contextual) {
         return guarded(admission,()->transaction.requiresNew(()->{
             var state=current(admission);requireNoFinancial(state);
             requireRead(admission,claim,Phase.FAILED,state,evidence.snapshot(),evidence.acceptedAt());
+            if(contextual&&(expected==null||!failedContext(admission,claim,state).equals(expected)))throw unavailable();
             if(evidence.paymentIntent().equals(admission.firstRenewalAdmission().paymentIntent())
                     ||evidence.allocation().equals(admission.firstRenewalAdmission().allocation()))throw unavailable();
             requireSnapshot(admission,evidence.snapshot(),false,evidence.paymentIntent(),null);
-            apply(state,claim,evidence.snapshot());
+            apply(state,claim,evidence.snapshot(),contextual?state.sample():null);
             // Recorder authenticates the transient post-fact debt; current/read predicates are prestate only.
             return store.recordFailureInTransaction(admission,claim,evidence);
         }));
@@ -134,7 +155,20 @@ public final class OwnedFailedRenewalService {
     }
     private void fresh(){if(transaction.active())throw new IllegalStateException("Owned failed renewal requires an outer transaction boundary");}
     private record Locked(PaymentAccount account,Subscription subscription,List<SubscriptionOperation> operations,
-            List<BillingRecord> bills,SubscriptionOperation selected,Fence fence,Instant utcAt) {}
+            List<BillingRecord> bills,SubscriptionOperation selected,Fence fence,Instant utcAt,SubscriptionBillingTimePort.Sample sample) {}
+    private FailedReadContext failedContext(Admission admission,ReadClaim claim,Locked state) {
+        var s=state.subscription();var intent=admission.firstRenewalAdmission().receipt().intent();var owner=intent.clock().owner();
+        if(bindings==null||claim==null||claim.phase()!=Phase.FAILED||!claim.admissionId().equals(admission.id())
+                ||!claim.fence().equals(state.fence())||!claim.equals(store.requireReadInTransaction(admission,claim))
+                ||state.utcAt().isBefore(claim.startedAt())||!state.utcAt().isBefore(claim.deadlineAt())
+                ||s.revision()!=admission.firstRenewalAdmission().subscriptionRevision()||s.billingStatus()!=Subscription.Status.ACTIVE||s.debt()!=null
+                ||!state.sample().isolated()||!state.sample().billingAt().equals(Instant.ofEpochSecond(admission.ready().ack().advance().target())))throw unavailable();
+        var binding=bindings.findCustomer(owner.account(),owner.site(),owner.customer()).orElseThrow(OwnedFailedRenewalService::unavailable);
+        if(!binding.id().equals(intent.customerBinding())||!binding.accountId().equals(owner.account())||!binding.siteId().equals(owner.site())
+                ||!binding.customerId().equals(owner.customer())||!binding.creationOperationId().equals(intent.customerCreationOperation())
+                ||!binding.providerReference().equals(intent.customerReference()))throw unavailable();
+        return new FailedReadContext(state.account(),s,binding,state.sample().billingAt());
+    }
     private Locked current(Admission admission) {
         var state=lock(admission.firstRenewalAdmission(),admission.boundary(),null);
         if(!admission.equals(store.requireCurrentInTransaction(admission)))throw unavailable();
@@ -166,7 +200,7 @@ public final class OwnedFailedRenewalService {
         if(sample==null||!sample.isolated()||sample.billingAt().isBefore(boundary.period().start())||!sample.billingAt().isBefore(boundary.period().end()))throw unavailable();
         var selected=reads.financial(subscription);
         var fence=new Fence(subscription.revision(),selected==null?null:selected.id(),selected==null?null:selected.version(),null,null,observations.captureFence(subscription));
-        return new Locked(account,subscription,List.copyOf(locked),List.copyOf(lockedBills),selected,fence,at);
+        return new Locked(account,subscription,List.copyOf(locked),List.copyOf(lockedBills),selected,fence,at,sample);
     }
     private static void requireNoFinancial(Locked state) {
         if(state.selected()!=null)throw unavailable();
@@ -197,8 +231,11 @@ public final class OwnedFailedRenewalService {
         claim.requireAccepted(snapshot.observedAt(),acceptedAt);
     }
     private void apply(Locked state,ReadClaim claim,Snapshot snapshot) {
+        apply(state,claim,snapshot,null);
+    }
+    private void apply(Locked state,ReadClaim claim,Snapshot snapshot,SubscriptionBillingTimePort.Sample expected) {
         var key=OwnedFailedRenewal.factKey(claim);
-        facts.apply(new ApplySubscriptionSnapshotUseCase.Command(state.account(),state.subscription().id(),snapshot,SubscriptionEvent.Source.RECONCILIATION,key,key,claim.fence()));
+        facts.apply(new ApplySubscriptionSnapshotUseCase.Command(state.account(),state.subscription().id(),snapshot,SubscriptionEvent.Source.RECONCILIATION,key,key,claim.fence(),expected));
     }
     private static void requireSnapshot(Admission admission,Snapshot snapshot,boolean recovered,String paymentIntent,String operationKey) {
         var original=admission.firstRenewalAdmission();var receipt=original.receipt();var terms=receipt.intent().terms();
