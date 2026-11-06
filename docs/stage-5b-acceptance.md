@@ -318,6 +318,8 @@ This mapper preparation passed a fresh **213/213** explicitly selected in-memory
 
 ## Persisted failed-renewal observer preparation — 2026-11-06
 
+This is the offline pre-publication checkpoint: the table records what had been executed before branch publication. Subsequent hosted results belong to the exact published source and are recorded separately in the plan ledger and its publication receipt; PENDING here does not supersede a later completed CI run.
+
 The explicit observer and authenticated context/publication seam are implemented under the [observer design](superpowers/specs/2026-11-06-owned-failed-renewal-observer-design.md). One fresh persisted FAILED claim covers before/after caller-thread inspections, both exact READY2 clocks and one declined mapper read, followed by atomic debt publication and its persisted receipt. The actual FactService sample is constrained independently before effects. One executor counts clocks within its 100-GET cap and enforces two seconds per call, 30 seconds of actual/injected monotonic time, the persisted UTC deadline, explicit API/timeouts, zero retries and cancellation. No runtime registration or financial request is enabled.
 
 | Evidence boundary | Current observer preparation |

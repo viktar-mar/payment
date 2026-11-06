@@ -44,8 +44,12 @@
 - [x] Write behavioral tests first for valid persisted FAILED receipt and no provider IO until the fresh claim/context exists. Use in-memory SDK transport and real service with handwritten ports; verify all15GET paths, original payment/no newcash and actual debt projection/receipt rather than descriptive success. Observe RED before implementation.
 - [x] Implement one-shot context/clock/graph/publication flow and complete-SDK-call executor per spec. Test clock/context/fence/sample drift before/after reads and publication; missing/malformed/foreignreturnedclaims; expired/futureUTC, elapsed injected/actualmonotonic limits, locks consuming budget, count/page limits, zero retries/timeouts/API, interruption/cancel, SDK errors, one stop after unwind, stop failure safety, service-owned publication/begin failure stop and committed success after delayed commit.
 - [x] Author/compile hosted full observer→realFactService→debt/journal/outbox composition on genuine fresh initial/READY/boundary data; include rejected drift rollback/no cash. Execute no hosted tests locally. Run all related explicit pure service/mapper/observer/first-renewal/clock regressions with current-source cached compile and record limitations.
-- [ ] Update evidence docs without native claims; independent Task2 review/fixes and whole-change review, root commits. Push the reviewed branch and verify both GitHub workflows on exact final source. No local Docker or Sandbox attempt follows automatically.
+- [x] Update evidence docs without native claims; independent Task2 review/fixes and whole-change review, root commits.
+
+**Required publication gate (recorded separately):** Push the reviewed branch and verify both GitHub workflows on the exact final source. No local Docker or Sandbox attempt follows automatically. Publication completion and exact source/run results belong to the ignored ledger and publication receipt, so this pre-publication plan does not require a self-referential source-SHA edit.
 
 ## Completion
 
 Record task commits, executed local/hosted checks, reviews, decisions and remaining native boundaries in this plan's ignored ledger. Keep old operational evidence intact. Stage5B remains NOT_ACCEPTED; no fresh financial authority is created by this plan.
+
+The offline implementation checkpoint passed independent review of both tasks and a separate whole-branch review. Root freshly compiled current sources and passed **343/343** explicit in-memory tests with zero failures, skips or aborts. Hosted composition source compiled locally only. This is the pre-publication checkpoint; later hosted results are a separate exact-source gate.
