@@ -158,6 +158,10 @@ class OwnedFailedRenewalMethodServiceTest {
         // Binding-only controls are opt-in; older bound/METHOD fixtures keep their original behavior.
         boolean bindingEnabled,browserConsumptionUncommitted,unboundSetupDenied,competingBind;
         BoundSetup returnedUnboundSetup;Runnable afterUnboundSetup=()->{},beforeBindingWrite=()->{},afterBindingWrite=()->{},afterBindingCommit=()->{};
+        // Recovery-only controls do not relax older SETUP/METHOD fixtures.
+        boolean recoveryPreparationEnabled,recoveryEnrollmentDenied;
+        OwnedMethodBrowser.Enrollment returnedRecoveryEnrollment;
+        Runnable afterRecoveryEnrollment=()->{},afterAuthority=()->{};
         final Map<String,ProviderOperation> providerSteps=new LinkedHashMap<>();
         Harness(){this(false);}
         Harness(boolean customerActor){this(customerActor,"alias");}
@@ -186,6 +190,18 @@ class OwnedFailedRenewalMethodServiceTest {
                     var s=(CustomerSessionContext)a[1];var original=((SubscriptionActor.Customer)context.actor()).session();var now=(Instant)a[2];
                     if(!liveSession||enrollment==null||!original.equals(s)||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())||!enrollment.sessionExpiresAt().equals(s.expiresAt())||!now.isBefore(s.expiresAt())||!b.utc.isBefore(s.expiresAt())||now.isAfter(b.utc))throw new IllegalStateException("browser unavailable");
                     if(reply)afterReplyEnrollment.run();yield reply?Optional.of(enrollment):enrollment;
+                }
+                case "requireBrowserRecoveryEnrollmentInTransaction"->{
+                    same((Reservation)a[0]);b.trace.add("recovery-enrollment");
+                    var s=(CustomerSessionContext)a[1];var now=(Instant)a[2];
+                    var original=((SubscriptionActor.Customer)context.actor()).session();
+                    if(!recoveryPreparationEnabled||recoveryEnrollmentDenied||!browserConsumed||browserConsumptionUncommitted
+                            ||completion==null||recovery==null||enrollment==null||!liveSession||!original.equals(s)
+                            ||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())
+                            ||!enrollment.sessionExpiresAt().equals(s.expiresAt())||!now.isBefore(s.expiresAt())
+                            ||!b.utc.isBefore(s.expiresAt())||now.isAfter(b.utc))throw new IllegalStateException("recovery browser unavailable");
+                    var result=returnedRecoveryEnrollment==null?enrollment:returnedRecoveryEnrollment;
+                    afterRecoveryEnrollment.run();yield result;
                 }
                 case "requireBrowserBoundSetupInTransaction"->{
                     same((Reservation)a[0]);b.trace.add("bound-setup");
@@ -235,6 +251,7 @@ class OwnedFailedRenewalMethodServiceTest {
                 assertThat(b.active).isTrue();b.trace.add("authority");
                 var supplied=((SubscriptionCommandContext)a[0]).actor();
                 boolean second=supplied instanceof SubscriptionActor.Customer actorCustomer&&actorCustomer.session().equals(secondLiveSession);
+                afterAuthority.run();
                 if(!authorized||!liveSession&&!second)throw new IllegalStateException("authority revoked");
                 // New bound SDK fixtures model production lockedSession.activeAt(current UTC).
                 // Older fixtures retain their existing explicitly selected authority behavior.

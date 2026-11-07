@@ -245,6 +245,52 @@ public final class OwnedFailedRenewalMethodService {
             return store.associateRecoveryInTransaction(reservation,completion,candidate,state.utcAt());
         }));
     }
+    /** Fresh original management authority and unchanged open debt; no claim, provider call or stop. */
+    public RecoveryPreparationContext inspectBrowserRecoveryPreparation(Reservation reservation,Completion completion,Recovery recovery,SubscriptionCommandContext originalContext){
+        fresh();Objects.requireNonNull(reservation);Objects.requireNonNull(completion);Objects.requireNonNull(recovery);
+        validateContext(originalContext);customer(originalContext,clock.instant());
+        return transaction.requiresNew(()->{
+            var state=current(reservation,originalContext,recovery.association().operationId());
+            var failure=reservation.failure();var admission=reservation.admission();var upstream=admission.firstRenewalAdmission();
+            requireDebt(state,failure,1);
+            if(!completion.equals(store.requireCompletionInTransaction(reservation,completion))
+                    ||!recovery.equals(store.requireRecoveryInTransaction(reservation,recovery)))throw unavailable();
+            var association=recovery.association();var sequence=Math.addExact(failure.observationSequence(),1);
+            if(!completion.reservationId().equals(reservation.id())||!completion.setupOperationId().equals(reservation.setupOperationId())
+                    ||completion.setupFinalVersion()!=Math.addExact(reservation.initialOperationVersion(),2)
+                    ||completion.revision()!=failure.revision()||completion.observationSequence()!=sequence
+                    ||!recovery.reservationId().equals(reservation.id())||recovery.observationSequence()!=sequence
+                    ||!association.admissionId().equals(admission.id())||!association.billId().equals(failure.billId())
+                    ||!association.allocation().equals(failure.allocation())||!association.paymentIntent().equals(failure.paymentIntent())
+                    ||association.expectedRevision()!=failure.revision()||association.operationVersion()!=0
+                    ||completion.completedAt().isBefore(reservation.reservedAt())||association.associatedAt().isBefore(completion.completedAt())
+                    ||association.associatedAt().isAfter(clock.instant()))throw unavailable();
+            var recover=selected(state,association.operationId(),SubscriptionOperation.Kind.RECOVER,
+                SubscriptionOperation.Status.RESERVED,association.operationVersion(),reservation.setupOperationId());
+            var setup=state.operations().stream().filter(o->o.id().equals(reservation.setupOperationId())).findFirst().orElseThrow(OwnedFailedRenewalMethodService::unavailable);
+            var reference=upstream.receipt().reference();var prefix="subscription:"+state.account().id().value()+":";
+            if(setup.kind()!=SubscriptionOperation.Kind.SETUP||setup.status()!=SubscriptionOperation.Status.SUCCEEDED
+                    ||setup.version()!=completion.setupFinalVersion()||setup.expectedRevision()!=failure.revision()
+                    ||!setup.authorityScope().equals(methodAuthority(admission))
+                    ||!setup.fingerprint().equals(reservation.requestFingerprint())||!setup.fingerprint().equals(request(admission,failure,originalContext))
+                    ||!setup.keyDigest().equals(digest.sha256Hex(originalContext.idempotencyKey()))
+                    ||setup.policyVersion()!=upstream.policyVersion()||!setup.providerOperationKey().equals(prefix+setup.id()+":SETUP")
+                    ||!Objects.equals(setup.providerReference(),reference)||setup.safeFailureCode()!=null
+                    ||!recover.authorityScope().equals(OwnedFailedRenewalMethod.recoveryAuthority(reservation))
+                    ||!recover.keyDigest().equals(OwnedFirstRenewal.fingerprint("owned-failed-renewal-recover-key-v1",admission.id()))
+                    ||!recover.fingerprint().equals("v1.recover."+failure.billId()+"."+OwnedFirstRenewal.fingerprint("owned-failed-renewal-recover-v1",admission.id(),failure.billId(),failure.billVersion(),failure.invoice(),failure.allocation(),failure.paymentIntent(),failure.revision()))
+                    ||recover.policyVersion()!=upstream.policyVersion()||!recover.providerOperationKey().equals(prefix+recover.id()+":RECOVER")
+                    ||!Objects.equals(recover.providerReference(),reference)||recover.safeFailureCode()!=null)throw unavailable();
+            // This distinct port authenticates the original completed lineage and committed browser permit.
+            var enrollment=store.requireBrowserRecoveryEnrollmentInTransaction(reservation,customer(originalContext,clock.instant()),utc());
+            authority.revalidate(originalContext,true);
+            // Neither database locks nor authority waits extend the exact original management session.
+            var session=customer(originalContext,clock.instant());
+            if(enrollment==null||!enrollment.sessionId().equals(session.sessionId().value())||!enrollment.origin().equals(session.origin())
+                    ||!enrollment.sessionExpiresAt().equals(session.expiresAt()))throw unavailable();
+            return new RecoveryPreparationContext(reservation,enrollment,state.account(),state.subscription(),setup,recover,state.binding(),completion,recovery,state.sample());
+        });
+    }
     public ReadClaim beginRecoveredRead(Reservation reservation,Recovery recovery,UUID invocation){
         return guarded(reservation.admission(),()->transaction.requiresNew(()->{
             var state=current(reservation,null,recovery.association().operationId());requireDebt(state,reservation.failure(),1);

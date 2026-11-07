@@ -17,6 +17,8 @@ import java.util.*;
 public interface OwnedFailedRenewalMethodStore {
     default Reservation reserveBrowserInTransaction(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,SubscriptionOperation o,CustomerBinding b,Sample sample,Instant now,Enrollment enrollment){throw browserDenied();}
     default Enrollment requireBrowserSetupEnrollmentInTransaction(Reservation r,CustomerSessionContext originalSession,Instant now){throw browserDenied();}
+    /** Completed original browser lineage and committed permit; never SETUP's RESERVED predicate. */
+    default Enrollment requireBrowserRecoveryEnrollmentInTransaction(Reservation reservation,CustomerSessionContext originalSession,Instant now){throw browserDenied();}
     default BoundSetup requireBrowserBoundSetupInTransaction(Reservation r,CustomerSessionContext originalSession,Instant now){throw browserDenied();}
     /** Distinct unbound receipt: original SETUP ACK plus committed browser consumption, no METHOD. */
     default BoundSetup requireBrowserUnboundSetupInTransaction(Reservation r,CustomerSessionContext originalSession,Instant now){throw browserDenied();}
