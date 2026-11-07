@@ -2,6 +2,19 @@ import { expect, test } from '@playwright/test';
 import { enterPrivateText } from './support/private-entry';
 import { entryCanary } from './support/entry-canary';
 
+test('private entry waits for a remounted disabled control to become editable', async ({ page }) => {
+  await page.setContent('<label>Private input<textarea disabled></textarea></label>');
+  await page.getByLabel('Private input').evaluate(node => {
+    setTimeout(() => {
+      const replacement = node.cloneNode(false) as HTMLTextAreaElement;
+      node.replaceWith(replacement);
+      setTimeout(() => { replacement.disabled = false; }, 50);
+    }, 50);
+  });
+  await enterPrivateText(page.getByLabel('Private input'), entryCanary);
+  expect(await page.getByLabel('Private input').evaluate((node, value) => (node as HTMLTextAreaElement).value === value, entryCanary), 'ready replacement receives private entry').toBe(true);
+});
+
 for (const state of ['disabled', 'readonly'] as const) {
   test(`private entry ${state} failure excludes payload from error and call log`, async ({ page }) => {
     await page.setContent(`<label>Private input<textarea ${state}></textarea></label>`);
