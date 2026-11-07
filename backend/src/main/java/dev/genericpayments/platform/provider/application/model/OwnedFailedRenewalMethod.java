@@ -70,6 +70,14 @@ public final class OwnedFailedRenewalMethod {
         public SetupPreparationContext { required(reservation,enrollment,account,subscription,operation,binding,billingSample); }
         @Override public String toString(){return "SetupPreparationContext[redacted]";}
     }
+    public record BoundSetup(OwnedMethodBrowser.Enrollment enrollment,Setup setupProof,ProviderOperation setupStep) {
+        public BoundSetup { required(enrollment,setupProof,setupStep); }
+        @Override public String toString(){return "BoundSetup[redacted]";}
+    }
+    public record MethodPreparationContext(SetupPreparationContext original,Setup setupProof,ProviderOperation setupStep) {
+        public MethodPreparationContext { required(original,setupProof,setupStep); }
+        @Override public String toString(){return "MethodPreparationContext[redacted]";}
+    }
     public record MethodReadContext(PaymentAccount account,Subscription subscription,CustomerBinding binding,
             SubscriptionOperation operation,Setup setupProof,ProviderOperation setupStep,ProviderOperation methodStep,Sample billingSample) {
         public MethodReadContext { required(account,subscription,binding,operation,setupProof,setupStep,methodStep);isolated(billingSample); }

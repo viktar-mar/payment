@@ -4,6 +4,7 @@ import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewa
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.*;
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal;
+import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.provider.application.model.OwnedMethodBrowser.*;
 import dev.genericpayments.platform.customers.application.model.CustomerSessionContext;
 import dev.genericpayments.platform.customers.domain.CustomerSessionScope;
@@ -87,17 +88,42 @@ public final class OwnedFailedRenewalMethodService {
     /** Fresh original management authentication before SETUP exists; no writes and no reusable dispatch authority. */
     public SetupPreparationContext inspectBrowserSetupPreparation(Reservation reservation,SubscriptionCommandContext originalContext){
         fresh();Objects.requireNonNull(reservation);validateContext(originalContext);customer(originalContext,utc());
+        return transaction.requiresNew(()->inspectBrowserSetupInTransaction(reservation,originalContext));
+    }
+    /** Fresh original authority plus independently bound SETUP evidence, without requiring any METHOD row. */
+    public MethodPreparationContext inspectBrowserMethodPreparation(Reservation reservation,SubscriptionCommandContext originalContext){
+        fresh();Objects.requireNonNull(reservation);validateContext(originalContext);customer(originalContext,utc());
         return transaction.requiresNew(()->{
-            var state=current(reservation,originalContext,null);requireDebt(state,reservation.failure(),0);
-            var selected=selected(state,reservation.setupOperationId(),SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Status.RESERVED,0,null);
-            if(!selected.authorityScope().equals(methodAuthority(reservation.admission()))
-                ||!selected.fingerprint().equals(request(reservation.admission(),reservation.failure(),originalContext))
-                ||!selected.keyDigest().equals(digest.sha256Hex(originalContext.idempotencyKey())))throw unavailable();
-            // Existing operation/lifecycle/account/subscription/bill waits cannot extend original session authority.
-            authority.revalidate(originalContext,true);
-            var enrollment=store.requireBrowserSetupEnrollmentInTransaction(reservation,customer(originalContext,utc()),utc());
-            return new SetupPreparationContext(reservation,enrollment,state.account(),state.subscription(),selected,state.binding(),state.sample());
+            var original=inspectBrowserSetupInTransaction(reservation,originalContext);
+            var bound=store.requireBrowserBoundSetupInTransaction(reservation,customer(originalContext,utc()),utc());
+            requireBoundSetup(original,bound);
+            // Binding/proof/provider-row locks cannot extend the original management session.
+            authority.revalidate(originalContext,true);customer(originalContext,utc());
+            return new MethodPreparationContext(original,bound.setupProof(),bound.setupStep());
         });
+    }
+    private SetupPreparationContext inspectBrowserSetupInTransaction(Reservation reservation,SubscriptionCommandContext originalContext){
+        var state=current(reservation,originalContext,null);requireDebt(state,reservation.failure(),0);
+        var selected=selected(state,reservation.setupOperationId(),SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Status.RESERVED,0,null);
+        if(!selected.authorityScope().equals(methodAuthority(reservation.admission()))
+            ||!selected.fingerprint().equals(request(reservation.admission(),reservation.failure(),originalContext))
+            ||!selected.keyDigest().equals(digest.sha256Hex(originalContext.idempotencyKey())))throw unavailable();
+        // Existing operation/lifecycle/account/subscription/bill waits cannot extend original session authority.
+        authority.revalidate(originalContext,true);
+        var enrollment=store.requireBrowserSetupEnrollmentInTransaction(reservation,customer(originalContext,utc()),utc());
+        return new SetupPreparationContext(reservation,enrollment,state.account(),state.subscription(),selected,state.binding(),state.sample());
+    }
+    private void requireBoundSetup(SetupPreparationContext original,BoundSetup bound){
+        if(bound==null||!original.enrollment().equals(bound.enrollment()))throw unavailable();
+        var proof=bound.setupProof();var step=bound.setupStep();var o=original.operation();var account=original.account();
+        if(!o.id().equals(proof.operation())||!original.subscription().id().equals(proof.subscription())||!account.id().equals(proof.account())
+            ||!step.id().equals(proof.step())||proof.reference()==null||!proof.reference().matches("seti_[A-Za-z0-9]{1,250}")
+            ||proof.method()==null||!proof.method().matches("pm_[A-Za-z0-9]{1,252}")
+            ||step.kind()!=ProviderOperation.Kind.SETUP_INTENT_CREATE||step.status()!=ProviderOperation.Status.ACKNOWLEDGED||step.version()!=2
+            ||!account.id().equals(step.accountId())||!account.externalAccountId().equals(step.externalAccountId())||!account.credentialsRef().equals(step.credentialsRef())
+            ||!o.id().equals(step.resourceId())||!Objects.equals(o.providerOperationKey()+":SETUP",step.operationKey())||!proof.reference().equals(step.providerReference())
+            ||step.firstDispatchedAt()==null||step.firstDispatchedAt().isBefore(original.reservation().reservedAt())||step.firstDispatchedAt().isAfter(utc())
+            ||!step.firstDispatchedAt().plusSeconds(23*3600).equals(step.retryBefore())||step.leaseOwner()!=null||step.leaseExpiresAt()!=null)throw unavailable();
     }
     /** Browser requests have their own keys (GET has none) and must never stop another customer's admission. */
     <T>T browserPhase(Reservation reservation,SubscriptionCommandContext context,Function<Pending,T> work){

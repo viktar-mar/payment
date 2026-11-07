@@ -103,6 +103,25 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
     }
     private JdbcOwnedMethodBrowserStore browser(){return new JdbcOwnedMethodBrowserStore(jdbc,this);}
     @Override public Enrollment requireBrowserSetupEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().setupEnrollment(r,s,now);}
+    @Override public BoundSetup requireBrowserBoundSetupInTransaction(Reservation r,CustomerSessionContext s,Instant now){
+        transaction();if(r==null||s==null||now==null)throw unavailable();
+        var owner=r.admission().firstRenewalAdmission().receipt().intent().clock().owner();
+        var o=operation(r,r.setupOperationId());
+        var fingerprint=jdbc.queryForObject("select owned_method_step_fingerprint(?,true)",String.class,r.id());
+        requireStepResource(jdbc,owner.account(),ProviderOperation.Kind.SUBSCRIPTION_UPDATE,o.id(),o.providerOperationKey()+":METHOD",fingerprint);
+        var proof=setup(r);var step=JdbcProviderOperationStore.row(jdbc,proof.step()).orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable);
+        var setupFingerprint=jdbc.queryForObject("select owned_method_step_fingerprint(?,false)",String.class,r.id());
+        if(!r.setupOperationId().equals(proof.operation())||!o.subscriptionId().equals(proof.subscription())||!owner.account().equals(proof.account())
+            ||proof.reference()==null||!proof.reference().matches("seti_[A-Za-z0-9]{1,250}")||proof.method()==null||!proof.method().matches("pm_[A-Za-z0-9]{1,252}")
+            ||step.kind()!=ProviderOperation.Kind.SETUP_INTENT_CREATE||step.status()!=ProviderOperation.Status.ACKNOWLEDGED||step.version()!=2
+            ||!owner.account().equals(step.accountId())||!owner.externalAccount().equals(step.externalAccountId())||!owner.credentialsRef().equals(step.credentialsRef())
+            ||!o.id().equals(step.resourceId())||!Objects.equals(o.providerOperationKey()+":SETUP",step.operationKey())||!Objects.equals(setupFingerprint,step.fingerprint())
+            ||!proof.reference().equals(step.providerReference())||step.firstDispatchedAt()==null||step.firstDispatchedAt().isBefore(r.reservedAt())||step.firstDispatchedAt().isAfter(utc(now))
+            ||!step.firstDispatchedAt().plusSeconds(23*3600).equals(step.retryBefore())||step.leaseOwner()!=null||step.leaseExpiresAt()!=null)throw unavailable();
+        // Rechecks exact original session/scopes and fresh DB UTC after every potentially blocking read.
+        var enrollment=browser().setupEnrollment(r,s,now);
+        return new BoundSetup(enrollment,proof,step);
+    }
     @Override public Pending requireBrowserPendingInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().pending(r,s,now);}
     @Override public Optional<Root> browserRootInTransaction(UUID r){return browser().root(r);}
     @Override public Root insertBrowserRootInTransaction(Pending p,Root r){return browser().insert(p,r);}
