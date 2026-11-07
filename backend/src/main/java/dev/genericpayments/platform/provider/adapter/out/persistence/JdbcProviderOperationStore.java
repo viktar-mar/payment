@@ -47,6 +47,34 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         return reserveRow(account,kind,resourceId,key,fingerprint);
     }
     @Override
+    public ProviderOperation reserveOwnedFailedRenewalMethodStep(PaymentAccount account,
+            dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reservation,Kind kind) {
+        if(account==null||reservation==null||(kind!=Kind.SETUP_INTENT_CREATE&&kind!=Kind.SUBSCRIPTION_UPDATE))throw conflict();
+        var store=new JdbcOwnedFailedRenewalMethodStore(jdbc);store.requireReservationInTransaction(reservation);
+        var owner=reservation.admission().firstRenewalAdmission().receipt().intent().clock().owner();
+        if(!account.id().equals(owner.account())||!account.externalAccountId().equals(owner.externalAccount())||!account.credentialsRef().equals(owner.credentialsRef())
+                ||!account.provider().name().equals("STRIPE")||!account.mode().name().equals("SANDBOX"))throw conflict();
+        requireAccount(account);
+        String key=jdbc.queryForObject("select provider_operation_key from subscription_operations where id=?",String.class,reservation.setupOperationId())
+            +(kind==Kind.SETUP_INTENT_CREATE?":SETUP":":METHOD");
+        String fingerprint=jdbc.queryForObject("select owned_method_step_fingerprint(?,?)",String.class,reservation.id(),kind==Kind.SUBSCRIPTION_UPDATE);
+        JdbcOwnedFailedRenewalMethodStore.requireStepResource(jdbc,account.id(),kind,reservation.setupOperationId(),key,fingerprint);
+        return reserveRow(account,kind,reservation.setupOperationId(),key,fingerprint);
+    }
+    @Override
+    public ProviderOperation requireOwnedFailedRenewalMethodDispatch(PaymentAccount account,
+            dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reservation,ProviderOperation claim,Instant now) {
+        if(account==null||reservation==null||claim==null||now==null||!claim.resourceId().equals(reservation.setupOperationId()))throw conflict();
+        var current=lock(claim.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+        if(!current.equals(claim))throw conflict();
+        new JdbcOwnedFailedRenewalMethodStore(jdbc).requireReservationInTransaction(reservation);
+        requirePinnedAccount(current);
+        JdbcOwnedFailedRenewalMethodStore.requireStepResource(jdbc,current.accountId(),current.kind(),current.resourceId(),current.operationKey(),current.fingerprint());
+        new dev.genericpayments.platform.provider.application.service.ProviderOperationGuard().requireDispatch(current,account,current.fingerprint(),now);
+        if(current.version()!=1||current.firstDispatchedAt()==null)throw conflict();
+        return current;
+    }
+    @Override
     public ProviderOperation reserveOwnedFirstRenewalAdvance(PaymentAccount account,Advance advance){
         if(account==null||advance==null)throw conflict();
         var admission=JdbcOwnedFirstRenewalStore.requireAdvanceScope(jdbc,account.id(),advance);
@@ -353,6 +381,11 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         requireResource(account,kind,resourceId,key,fingerprint,ownedCustomer,false);
     }
     private void requireResource(PaymentAccountId account, Kind kind, UUID resourceId,String key,String fingerprint,boolean ownedCustomer,boolean bindingRepair) {
+        if((kind==Kind.SETUP_INTENT_CREATE||kind==Kind.SUBSCRIPTION_UPDATE)
+                &&JdbcOwnedFailedRenewalMethodStore.ownedStepResource(jdbc,account,resourceId)) {
+            if(!ownedCustomer||bindingRepair)throw conflict();
+            JdbcOwnedFailedRenewalMethodStore.requireStepResource(jdbc,account,kind,resourceId,key,fingerprint);return;
+        }
         if(kind==Kind.TEST_CLOCK_ADVANCE){
             if(!ownedCustomer||bindingRepair)throw conflict();
             JdbcOwnedFirstRenewalStore.requireAdvanceResource(jdbc,account,resourceId,key,fingerprint);return;
@@ -372,7 +405,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
                 JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,i);return;
             }
         }
-        if(kind==Kind.SUBSCRIPTION_CREATE || kind==Kind.SETUP_INTENT_CREATE) {
+        if(kind==Kind.SUBSCRIPTION_CREATE || kind==Kind.SETUP_INTENT_CREATE || kind==Kind.SUBSCRIPTION_UPDATE) {
             if(!jdbc.queryForList("""
                 select i.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id
                 join stripe_billing_clock_intents i on i.payment_account_id=s.payment_account_id and i.site_id=s.site_id and i.customer_id=s.customer_id
@@ -517,7 +550,9 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     }
 
     private boolean firstDispatchOnly(ProviderOperation operation) {
-        return operation.kind()==Kind.TEST_CLOCK_ADVANCE || ownedSubscription(operation) || operation.kind()==Kind.TEST_CLOCK_CREATE || (operation.kind()==Kind.CUSTOMER_CREATE
+        return ((operation.kind()==Kind.SETUP_INTENT_CREATE||operation.kind()==Kind.SUBSCRIPTION_UPDATE)
+            &&JdbcOwnedFailedRenewalMethodStore.ownedStepResource(jdbc,operation.accountId(),operation.resourceId()))
+            || operation.kind()==Kind.TEST_CLOCK_ADVANCE || ownedSubscription(operation) || operation.kind()==Kind.TEST_CLOCK_CREATE || (operation.kind()==Kind.CUSTOMER_CREATE
             && !jdbc.queryForList("select id from stripe_billing_clock_intents where payment_account_id=? and customer_id=?",
                 UUID.class,operation.accountId().value(),operation.resourceId()).isEmpty());
     }

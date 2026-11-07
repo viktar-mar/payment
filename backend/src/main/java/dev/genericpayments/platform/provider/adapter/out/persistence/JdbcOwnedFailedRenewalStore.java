@@ -269,7 +269,7 @@ public final class JdbcOwnedFailedRenewalStore implements OwnedFailedRenewalStor
         return new ReadClaim(uuid(r,"id"),uuid(r,"admission_id"),Phase.valueOf(r.getString("phase")),uuid(r,"invocation"),instant(r,"started_at"),instant(r,"deadline_at"),
             new Fence(r.getLong("captured_revision"),uuid(r,"selected_operation"),r.getObject("selected_version",Long.class),null,null,r.getLong("observation_sequence")));
     }
-    private Failure failureRow(UUID admission) {
+    Failure failureRow(UUID admission) {
         return jdbc.query("select * from stripe_billing_failed_renewal_failures where admission_id=?",(r,n)->new Failure(admission,uuid(r,"claim_id"),uuid(r,"renewal_bill"),r.getLong("bill_version"),
             r.getString("invoice_reference"),r.getString("allocation_reference"),r.getString("payment_intent_reference"),new Subscription.Period(instant(r,"period_start"),instant(r,"period_end")),
             instant(r,"grace_deadline"),r.getLong("projected_revision"),r.getLong("observation_sequence"),instant(r,"recorded_at")),admission).stream().findFirst().orElseThrow(JdbcOwnedFailedRenewalStore::unavailable);
@@ -279,7 +279,7 @@ public final class JdbcOwnedFailedRenewalStore implements OwnedFailedRenewalStor
             r.getString("allocation_reference"),r.getString("payment_intent_reference"),r.getLong("expected_revision"),r.getLong("operation_version"),instant(r,"associated_at")),admission)
             .stream().findFirst().orElseThrow(JdbcOwnedFailedRenewalStore::unavailable);
     }
-    private static void requireSnapshot(Admission admission,Snapshot snapshot,boolean recovered,String paymentIntent,String operationKey) {
+    static void requireSnapshot(Admission admission,Snapshot snapshot,boolean recovered,String paymentIntent,String operationKey) {
         var original=admission.firstRenewalAdmission();var receipt=original.receipt();var terms=receipt.intent().terms();
         if(!snapshot.subscriptionReference().equals(receipt.reference())||!snapshot.billingPrice().equals(terms)||!Objects.equals(snapshot.period(),admission.boundary().period())
                 ||snapshot.status()!=(recovered?Subscription.Status.ACTIVE:Subscription.Status.PAST_DUE)||snapshot.trial()!=null||snapshot.cancellationAt()!=null

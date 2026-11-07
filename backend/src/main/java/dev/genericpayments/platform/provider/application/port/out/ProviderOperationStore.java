@@ -16,6 +16,17 @@ public interface ProviderOperationStore {
      */
     ProviderOperation reserve(PaymentAccount account, ProviderOperation.Kind kind,
         UUID resourceId, String key, String fingerprint);
+    /** Explicit persisted branch authority; ordinary reserve never admits either owned step. */
+    default ProviderOperation reserveOwnedFailedRenewalMethodStep(PaymentAccount account,
+            dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reservation,
+            ProviderOperation.Kind kind) {
+        throw new UnsupportedOperationException("Owned failed renewal method reservation is unavailable");
+    }
+    default ProviderOperation requireOwnedFailedRenewalMethodDispatch(PaymentAccount account,
+            dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reservation,
+            ProviderOperation claim,Instant now) {
+        throw new UnsupportedOperationException("Owned failed renewal method dispatch is unavailable");
+    }
     default ProviderOperation reserveOwnedFirstRenewalAdvance(PaymentAccount account,
             dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.Advance advance) {
         throw new UnsupportedOperationException("Owned first renewal reservation is unavailable");

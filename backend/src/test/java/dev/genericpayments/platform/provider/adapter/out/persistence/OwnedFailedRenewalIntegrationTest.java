@@ -304,4 +304,118 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         catch(InterruptedException e){Thread.currentThread().interrupt();throw new AssertionError(e);}
     }
 
+    /** V35 persistence negatives only; no successful lifecycle or ACK row is fabricated. */
+    private dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reserveMethod(Setup s,Failure failure) {
+        return underLifecycle(s.upstream(),()->{
+            var id=UUID.randomUUID();var at=Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+            var candidate=new SubscriptionOperation(id,site,customer,current().id(),SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Status.RESERVED,
+                "synthetic-management", "a".repeat(64),"v1.setup."+"b".repeat(64),"subscription:"+billing.id().value()+":"+id+":SETUP",
+                failure.revision(),s.upstream().policyVersion(),null,null,at,at,0);
+            assertThat(lifecycleOperations.claim(candidate).owner()).isTrue();
+            return new JdbcOwnedFailedRenewalMethodStore(jdbc).reserveInTransaction(s.admission(),failure,candidate,
+                bindings.findCustomer(billing.id(),site,customer).orElseThrow(),new SubscriptionBillingTimePort.Sample(time.selected,SubscriptionBillingTimePort.Mode.ISOLATED),at);
+        });
+    }
+    @Test void methodReservationPinsExactIdentityAndRejectsAppendOnlyMutationAndReadBeforeProviderProofs() {
+        var s=setup();var failure=fail(s,service(store(),null));var r=reserveMethod(s,failure);
+        var method=new JdbcOwnedFailedRenewalMethodStore(jdbc);
+        assertThat(transaction.required(()->method.requireReservationInTransaction(r))).isEqualTo(r);
+        var financial=financialState();
+        assertThatThrownBy(()->jdbc.update("update stripe_billing_failed_method_reservations set request_fingerprint='changed' where id=?",r.id())).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->jdbc.update("delete from stripe_billing_failed_method_reservations where id=?",r.id())).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->transaction.required(()->method.requirePreparedMethodInTransaction(r))).isInstanceOf(RuntimeException.class);
+        var fence=new ApplySubscriptionSnapshotUseCase.Fence(failure.revision(),r.setupOperationId(),0L,null,null,failure.observationSequence());
+        assertThatThrownBy(()->transaction.required(()->method.claimReadInTransaction(r,
+            dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Phase.METHOD,UUID.randomUUID(),fence,r.billingSample(),Instant.now()))).isInstanceOf(RuntimeException.class);
+        assertThat(financialState()).isEqualTo(financial);assertThat(count("stripe_billing_failed_method_reads")).isZero();
+        assertThat(count("stripe_billing_failed_method_completions")).isZero();
+        var forged=new dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation(UUID.randomUUID(),r.admission(),r.failure(),r.setupOperationId(),
+            r.requestFingerprint(),r.initialOperationVersion(),r.binding(),r.billingSample(),r.reservedAt());
+        assertThatThrownBy(()->transaction.required(()->method.requireReservationInTransaction(forged))).isInstanceOf(RuntimeException.class);
+    }
+    @Test void ordinarySetupAndMethodReservationsRemainClosedForOwnedResources() {
+        var s=setup();var failure=fail(s,service(store(),null));var r=reserveMethod(s,failure);
+        for(var kind:List.of(dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SETUP_INTENT_CREATE,
+                dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SUBSCRIPTION_UPDATE)) {
+            String key=jdbc.queryForObject("select provider_operation_key from subscription_operations where id=?",String.class,r.setupOperationId())
+                +(kind==dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SETUP_INTENT_CREATE?":SETUP":":METHOD");
+            String fingerprint=jdbc.queryForObject("select owned_method_step_fingerprint(?,?)",String.class,r.id(),kind==dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SUBSCRIPTION_UPDATE);
+            assertThatThrownBy(()->operations.reserve(billing,kind,r.setupOperationId(),key,fingerprint)).isInstanceOf(RuntimeException.class);
+        }
+        assertThat(jdbc.queryForObject("select count(*) from provider_operations where resource_id=?",Long.class,r.setupOperationId())).isZero();
+        // METHOD cannot be admitted before its already acknowledged/bound setup proof exists.
+        assertThatThrownBy(()->operations.reserveOwnedFailedRenewalMethodStep(billing,r,
+            dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SUBSCRIPTION_UPDATE)).isInstanceOf(RuntimeException.class);
+    }
+    @Test void terminalFailedSetupNeverReopensTheLegacyRecoveryBranch() {
+        var s=setup();var svc=service(store(),null);var failure=fail(s,svc);var r=reserveMethod(s,failure);
+        // Negative branch test only. This terminal failure is not positive method completion evidence.
+        jdbc.update("update subscription_operations set status='FAILED',safe_failure_code='SYNTHETIC_FAILURE',version=version+1,updated_at=clock_timestamp() where id=?",r.setupOperationId());
+        assertThat(transaction.required(()->new JdbcOwnedFailedRenewalMethodStore(jdbc).requireReservationInTransaction(r))).isEqualTo(r);
+        assertThatThrownBy(()->svc.reserveExistingRecovery(s.admission())).isInstanceOf(RuntimeException.class);
+        assertThat(count("stripe_billing_failed_method_reservations")).isEqualTo(1);
+        assertThat(count("stripe_billing_failed_renewal_recoveries")).isZero();
+        assertThat(count("stripe_subscription_recovery_proofs")).isZero();
+    }
+    @Test void legacyRecoveryPermanentlyRefusesALaterMethodReservation() {
+        var s=setup();var svc=service(store(),null);var failure=fail(s,svc);var recovery=svc.reserveExistingRecovery(s.admission());
+        assertThatThrownBy(()->reserveMethod(s,failure)).isInstanceOf(RuntimeException.class);
+        assertThat(count("stripe_billing_failed_method_reservations")).isZero();
+        assertThat(count("stripe_billing_failed_renewal_recoveries")).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select operation_id from stripe_billing_failed_renewal_recoveries where admission_id=?",UUID.class,s.admission().id())).isEqualTo(recovery.operationId());
+    }
+    @Test void methodReservationReloadDetectsCorruptedInitialOperationSnapshot() {
+        var s=setup();var failure=fail(s,service(store(),null));var r=reserveMethod(s,failure);
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            // Deliberate negative corruption, rolled back with the failed authentication below.
+            jdbc.execute("alter table stripe_billing_failed_method_reservations disable trigger failed_method_reservation_immutable");
+            jdbc.update("update stripe_billing_failed_method_reservations set operation_snapshot=jsonb_set(operation_snapshot,'{fingerprint}','\"corrupted\"'::jsonb) where id=?",r.id());
+            return new JdbcOwnedFailedRenewalMethodStore(jdbc).requireReservationInTransaction(r);
+        })).hasMessage("Owned method transition authority unavailable");
+        assertThat(transaction.required(()->new JdbcOwnedFailedRenewalMethodStore(jdbc).requireReservationInTransaction(r))).isEqualTo(r);
+    }
+    @Test void methodReadForeignKeySurvivesDisabledPhaseGuard() {
+        var s=setup();var failure=fail(s,service(store(),null));var r=reserveMethod(s,failure);
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            // Isolate the FK negative from the stronger prestate trigger. Transaction rollback restores it.
+            jdbc.execute("alter table stripe_billing_failed_method_reads disable trigger failed_method_read_proof");
+            jdbc.update("""
+                insert into stripe_billing_failed_method_reads(id,reservation_id,phase,invocation,started_at,deadline_at,captured_revision,
+                 observation_sequence,selected_operation,selected_version,operation_snapshot,setup_step_snapshot,method_step_snapshot,billing_at,billing_mode)
+                values(?,?,'METHOD',?,transaction_timestamp(),transaction_timestamp()+interval '30 seconds',?,?,?,0,'{}','{}','{}',?,'ISOLATED')
+                """,UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),failure.revision(),failure.observationSequence(),r.setupOperationId(),java.sql.Timestamp.from(time.selected));
+            return true;
+        })).hasStackTraceContaining("stripe_billing_failed_method_reads_reservation_id_fkey");
+        assertThat(count("stripe_billing_failed_method_reads")).isZero();
+    }
+    @Test void methodExclusionRechecksCommittedReservationAfterWaitingForCommonAdmissionLock() throws Exception {
+        var s=setup();var failure=fail(s,service(store(),null));
+        var chosen=new CountDownLatch(1);var release=new CountDownLatch(1);var competing=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()) {
+            var winner=workers.submit(()->transaction.requiresNew(()->{
+                reserveMethod(s,failure);chosen.countDown();awaitRelease(release);return true;
+            }));
+            try {
+                assertThat(chosen.await(5,TimeUnit.SECONDS)).isTrue();
+                var loser=workers.submit(()->{
+                    competing.countDown();
+                    // Deliberately invalid downstream identity: the branch trigger must reject BEFORE V34/FK checks.
+                    assertThatThrownBy(()->transaction.requiresNew(()->{
+                        jdbc.update("""
+                            insert into stripe_billing_failed_renewal_recoveries(admission_id,operation_id,renewal_bill,payment_account_id,site_id,customer_id,subscription_id,
+                             allocation_reference,payment_intent_reference,expected_revision,operation_version,associated_at)
+                            values(?,?,?,?,?,?,?,?,?,?,0,clock_timestamp())
+                            """,s.admission().id(),UUID.randomUUID(),failure.billId(),billing.id().value(),site.value(),customer.value(),current().id(),
+                            failure.allocation(),failure.paymentIntent(),failure.revision());return true;
+                    })).hasStackTraceContaining("Method reservation permanently owns this branch");return true;
+                });
+                assertThat(competing.await(5,TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(()->loser.get(150,TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                release.countDown();assertThat(winner.get(10,TimeUnit.SECONDS)).isTrue();assertThat(loser.get(10,TimeUnit.SECONDS)).isTrue();
+            } finally {release.countDown();}
+        }
+        assertThat(count("stripe_billing_failed_method_reservations")).isEqualTo(1);
+        assertThat(count("stripe_billing_failed_renewal_recoveries")).isZero();assertThat(count("payments")).isEqualTo(1);
+    }
+
 }
