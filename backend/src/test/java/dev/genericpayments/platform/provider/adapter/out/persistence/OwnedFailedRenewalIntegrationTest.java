@@ -678,6 +678,16 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThatThrownBy(()->OwnedMethodBrowserTestAccess.phase(p.service(),r,p.context(),value->value)).isInstanceOf(RuntimeException.class);
         assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
     }
+    @Test void browserSetupEnrollmentRejectsOneNanosecondOriginalExpiryDriftDirectlyThroughJdbc(){
+        var p=reservedMethod(true,0);var s=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
+        var before=financialState();int calls=http.calls.size();var store=browserStore();
+        var original=transaction.requiresNew(()->store.requireBrowserSetupEnrollmentInTransaction(p.reservation(),s,browserNow()));
+        assertThat(original.sessionExpiresAt()).isEqualTo(s.expiresAt());
+        var changed=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(s.sessionId(),s.siteId(),s.customerId(),s.origin(),s.scopes(),s.expiresAt().plusNanos(1));
+        assertThatThrownBy(()->transaction.requiresNew(()->store.requireBrowserSetupEnrollmentInTransaction(p.reservation(),changed,browserNow()))).isInstanceOf(IllegalStateException.class);
+        assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+        assertThat(count("stripe_billing_method_browser_roots")).isZero();assertThat(methodBillingProofs.setup(billing.id(),p.reservation().setupOperationId())).isEmpty();
+    }
     @ParameterizedTest @ValueSource(strings={"session","non-browser","revoked","expired","scopes","future","key","origin"})
     void browserSetupPreparationRefusesReplacedOrDeadOriginalAuthorityWithoutStop(String mutation){
         var p=reservedMethod(!mutation.equals("non-browser"),0);var s=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();

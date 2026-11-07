@@ -36,9 +36,12 @@ final class JdbcOwnedMethodBrowserStore {
             and ?<=clock_timestamp() and ?<r.browser_session_expires_at and clock_timestamp()<r.browser_session_expires_at)
             """,r.id(),session.sessionId().value(),session.siteId().value(),session.customerId().value(),session.origin(),time(session.expiresAt()),
             scopes,scopes,time(now),time(now));
-        return jdbc.query("select browser_session_id,browser_origin,browser_session_expires_at from stripe_billing_failed_method_reservations where id=?",
+        var enrollment=jdbc.query("select browser_session_id,browser_origin,browser_session_expires_at from stripe_billing_failed_method_reservations where id=?",
             (row,n)->new Enrollment(uuid(row,"browser_session_id"),row.getString("browser_origin"),instant(row,"browser_session_expires_at")),r.id())
             .stream().findFirst().orElseThrow(JdbcOwnedMethodBrowserStore::unavailable);
+        // JDBC timestamp normalization must not turn an inexact caller expiry into the original Instant.
+        if(!enrollment.sessionExpiresAt().equals(session.expiresAt()))throw unavailable();
+        return enrollment;
     }
     Pending pending(Reservation r,CustomerSessionContext session,Instant now){
         transaction();if(r==null||session==null)throw unavailable();
