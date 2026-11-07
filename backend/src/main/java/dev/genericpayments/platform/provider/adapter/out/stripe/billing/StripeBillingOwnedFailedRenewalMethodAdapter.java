@@ -46,12 +46,13 @@ public final class StripeBillingOwnedFailedRenewalMethodAdapter {
             budget.remaining(null);
             if(steps.find(account.id(),key).isPresent())throw unavailable();
             inspect(original,originalContext,budget,null);
+            dispatchTime(original.setupStep());
             var reserved=steps.reserveOwnedFailedRenewalMethodStep(account,reservation,ProviderOperation.Kind.SUBSCRIPTION_UPDATE);
             requireIdentity(reserved,original,fingerprint);
             if(reserved.status()!=ProviderOperation.Status.RESERVED||reserved.version()!=0||reserved.providerReference()!=null
                     ||reserved.firstDispatchedAt()!=null||reserved.retryBefore()!=null||reserved.leaseOwner()!=null||reserved.leaseExpiresAt()!=null)throw unavailable();
             inspect(original,originalContext,budget,null);
-            String claimant=UUID.randomUUID().toString();Instant claimedAt=utc.instant().truncatedTo(ChronoUnit.MICROS);
+            String claimant=UUID.randomUUID().toString();Instant claimedAt=dispatchTime(original.setupStep());
             var claim=steps.claim(reserved.id(),claimant,claimedAt,LEASE).orElseThrow(StripeBillingOwnedFailedRenewalMethodAdapter::unavailable);
             requireIdentity(claim,original,fingerprint);
             if(!reserved.id().equals(claim.id())||claim.status()!=ProviderOperation.Status.DISPATCHING||claim.version()!=1
@@ -92,6 +93,11 @@ public final class StripeBillingOwnedFailedRenewalMethodAdapter {
         budget.remaining(claim);
         if(!expected.equals(methods.inspectBrowserMethodPreparation(expected.original().reservation(),context)))throw unavailable();
         budget.remaining(claim);
+    }
+    private Instant dispatchTime(ProviderOperation setup){
+        var at=utc.instant().truncatedTo(ChronoUnit.MICROS);
+        if(at.isBefore(setup.firstDispatchedAt()))throw unavailable();
+        return at;
     }
     private String fingerprint(MethodPreparationContext context){var p=context.original();var o=p.operation();var proof=context.setupProof();return StripeRequestFingerprint.of(digest,p.account(),"SUBSCRIPTION_METHOD_V1",o.id().toString(),o.providerOperationKey()+":METHOD",o.fingerprint(),p.subscription().providerReference(),p.binding().providerReference(),proof.step().toString(),proof.reference(),proof.method(),"consent:true");}
     private static void requireIdentity(ProviderOperation step,MethodPreparationContext context,String fingerprint){

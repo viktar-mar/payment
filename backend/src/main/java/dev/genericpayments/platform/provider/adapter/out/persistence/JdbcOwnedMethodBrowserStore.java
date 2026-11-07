@@ -14,6 +14,19 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 final class JdbcOwnedMethodBrowserStore {
     private final JdbcTemplate jdbc;private final JdbcOwnedFailedRenewalMethodStore methods;
     JdbcOwnedMethodBrowserStore(JdbcTemplate jdbc,JdbcOwnedFailedRenewalMethodStore methods){this.jdbc=Objects.requireNonNull(jdbc);this.methods=Objects.requireNonNull(methods);}
+    Optional<Enrollment> replyEnrollment(Reservation r,CustomerSessionContext supplied,Instant now){
+        transaction();if(r==null||now==null)throw unavailable();
+        var fields=jdbc.queryForList("""
+            select num_nonnulls(browser_session_id,browser_origin,browser_session_expires_at)
+            from stripe_billing_failed_method_reservations where id=? and setup_operation=?
+            """,Integer.class,r.id(),r.setupOperationId());
+        if(fields.equals(List.of(0))){
+            methods.requireReservationInTransaction(r);
+            return Optional.empty();
+        }
+        if(!fields.equals(List.of(3)))throw unavailable();
+        return Optional.of(setupEnrollment(r,supplied,now));
+    }
     /** Original live enrollment independently of the ACK/proof-dependent browser pending phase. */
     Enrollment setupEnrollment(Reservation r,CustomerSessionContext session,Instant now){
         transaction();if(r==null||session==null||now==null)throw unavailable();methods.requireReservationInTransaction(r);

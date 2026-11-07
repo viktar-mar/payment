@@ -7,6 +7,9 @@ import dev.genericpayments.platform.provider.adapter.out.stripe.StripeRequestFin
 import dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding;
 import dev.genericpayments.platform.shared.application.port.out.DigestPort;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext;
+import dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor;
+import dev.genericpayments.platform.customers.application.model.CustomerSessionContext;
+import dev.genericpayments.platform.customers.domain.CustomerSessionId;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore.Setup;
 import dev.genericpayments.platform.subscriptions.domain.*;
 import java.time.*;
@@ -62,6 +65,12 @@ public final class OwnedMethodSetupInertFixture {
         default->throw new AssertionError(kind);
     }}
     public void afterAccountLock(Runnable action){h.afterAccountLock=action;}
+    public void afterReplyEnrollment(Runnable action){h.afterReplyEnrollment=action;}
+    public SubscriptionCommandContext secondSession(){
+        var s=((SubscriptionActor.Customer)context.actor()).session();
+        h.secondLiveSession=new CustomerSessionContext(new CustomerSessionId(UUID.randomUUID()),s.siteId(),s.customerId(),s.origin(),s.scopes(),s.expiresAt());
+        return new SubscriptionCommandContext(new SubscriptionActor.Customer(h.secondLiveSession),s.siteId(),s.customerId(),s.origin(),context.idempotencyKey(),"replacement");
+    }
     public void noBusinessChanges(){
         assertThat(h.b.s).isEqualTo(subscription);assertThat(h.b.records).isEqualTo(bills);assertThat(h.b.cash).isEqualTo(cash);assertThat(h.b.events).isEqualTo(events);
         assertThat(h.b.sequence).isEqualTo(sequence);assertThat(h.b.effects).isEqualTo(effects);assertThat(h.b.callbacks).isEqualTo(callbacks);

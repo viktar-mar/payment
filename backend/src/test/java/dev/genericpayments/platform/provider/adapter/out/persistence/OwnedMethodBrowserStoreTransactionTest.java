@@ -79,12 +79,35 @@ class OwnedMethodBrowserStoreTransactionTest {
     @Test void unextendedStorePortsDenyEveryBrowserEntry() {
         var store=Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{OwnedFailedRenewalMethodStore.class},
             (proxy,method,args)->{if(!method.isDefault())throw new AssertionError("Unexpected ordinary store call");return InvocationHandler.invokeDefault(proxy,method,args);});
-        var browser=List.of("reserveBrowserInTransaction","requireBrowserSetupEnrollmentInTransaction","requireBrowserBoundSetupInTransaction","requireBrowserPendingInTransaction","browserRootInTransaction","insertBrowserRootInTransaction",
+        var browser=List.of("reserveBrowserInTransaction","requireBrowserSetupEnrollmentInTransaction","requireBrowserBoundSetupInTransaction","requireReplyEnrollmentInTransaction","requireBrowserPendingInTransaction","browserRootInTransaction","insertBrowserRootInTransaction",
             "requireBrowserActionInTransaction","startBrowserSelectionInTransaction","finishBrowserSelectionInTransaction","consumeBrowserFirstInTransaction");
         var methods=java.util.Arrays.stream(OwnedFailedRenewalMethodStore.class.getMethods()).filter(m->browser.contains(m.getName())).toList();
-        assertThat(methods).hasSize(10);
+        assertThat(methods).hasSize(11);
         for(var method:methods)assertThatThrownBy(()->{try{method.invoke(store,new Object[method.getParameterCount()]);}catch(InvocationTargetException e){throw e.getCause();}})
             .isInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
+    }
+    @Test void onlyAStoredAllNullEnrollmentPermitsReplyWithoutAnOriginalCustomerSession(){
+        var r=mock(dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation.class);
+        var reservationId=java.util.UUID.randomUUID();var operationId=java.util.UUID.randomUUID();
+        when(r.id()).thenReturn(reservationId);when(r.setupOperationId()).thenReturn(operationId);
+        var jdbc=mock(JdbcTemplate.class);var identity=mock(JdbcOwnedFailedRenewalMethodStore.class);
+        when(identity.requireReservationInTransaction(r)).thenReturn(r);
+        var store=new JdbcOwnedMethodBrowserStore(jdbc,identity);var at=java.time.Instant.EPOCH;
+        boolean previous=TransactionSynchronizationManager.isActualTransactionActive();TransactionSynchronizationManager.setActualTransactionActive(true);
+        try{
+            for(var fields:List.of(List.<Integer>of(),List.of(1),List.of(2),List.of(3),List.of(0,0),List.of(0))){
+                when(jdbc.queryForList(anyString(),eq(Integer.class),eq(reservationId),eq(operationId))).thenReturn(fields);
+                if(fields.equals(List.of(0)))assertThat(store.replyEnrollment(r,null,at)).isEmpty();
+                else assertThatThrownBy(()->store.replyEnrollment(r,null,at))
+                    .isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
+            }
+            verify(identity).requireReservationInTransaction(r);
+        }finally{TransactionSynchronizationManager.setActualTransactionActive(previous);}
+    }
+    @Test void replyEnrollmentRequiresCallerTransactionBeforeSql(){
+        var store=new JdbcOwnedFailedRenewalMethodStore(new JdbcTemplate());
+        assertThatThrownBy(()->store.requireReplyEnrollmentInTransaction(null,null,null))
+            .isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method transition requires caller transaction");
     }
     @Test void everyBrowserEntryRequiresCallerTransactionBeforeSql() {
         var s=new JdbcOwnedFailedRenewalMethodStore(new JdbcTemplate());

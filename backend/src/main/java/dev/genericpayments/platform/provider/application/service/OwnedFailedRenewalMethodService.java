@@ -148,10 +148,20 @@ public final class OwnedFailedRenewalMethodService {
                 ||!selected.keyDigest().equals(digest.sha256Hex(context.idempotencyKey())))throw unavailable();
             var prepared=store.requirePreparedMethodInTransaction(reservation);requireMethodContext(state,prepared);
             if(!prepared.operation().equals(selected))throw unavailable();
+            requireReplyAuthority(reservation,context);
             return operations.save(new SubscriptionOperation(selected.id(),selected.siteId(),selected.customerId(),selected.subscriptionId(),selected.kind(),
                 SubscriptionOperation.Status.PROCESSING,selected.authorityScope(),selected.keyDigest(),selected.fingerprint(),selected.providerOperationKey(),
                 selected.expectedRevision(),selected.policyVersion(),state.subscription().providerReference(),null,selected.createdAt(),state.utcAt(),selected.version()+1),selected.version());
         }));
+    }
+    private void requireReplyAuthority(Reservation reservation,SubscriptionCommandContext context){
+        var supplied=context.actor() instanceof SubscriptionActor.Customer actor?actor.session():null;
+        var enrollment=store.requireReplyEnrollmentInTransaction(reservation,supplied,utc());
+        if(enrollment.isEmpty())return;
+        authority.revalidate(context,true);
+        var session=customer(context,clock.instant());var original=enrollment.orElseThrow();
+        if(!original.sessionId().equals(session.sessionId().value())||!original.origin().equals(session.origin())
+            ||!original.sessionExpiresAt().equals(session.expiresAt()))throw unavailable();
     }
     public ReadClaim beginMethodRead(Reservation reservation,UUID invocation){
         return guarded(reservation.admission(),()->transaction.requiresNew(()->{

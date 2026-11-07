@@ -35,6 +35,9 @@ import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
 import dev.genericpayments.platform.payments.domain.PaymentStatus;
 import dev.genericpayments.platform.sites.domain.SiteId;
 import dev.genericpayments.platform.customers.domain.CustomerId;
+import dev.genericpayments.platform.customers.domain.CustomerSessionScope;
+import dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor;
+import dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext;
 import dev.genericpayments.platform.sites.application.port.out.LockSitePort;
 import dev.genericpayments.platform.customers.application.port.out.CustomerStore;
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
@@ -605,6 +608,72 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             .satisfies(failure->{var e=(PaymentApplicationException)failure;assertThat(e.code()).isEqualTo("AUTHENTICATION_FAILED");assertThat(e.status()).isEqualTo(401);});
         assertThat(lifecycleOperations.find(site,current().id(),bound.operation().id())).contains(bound.operation());assertThat(operations.findById(ack.id())).contains(ack);
         methodUnavailable(()->producer.apply(p.reservation(),p.context()));assertThat(http.calls).hasSize(start+1);assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_failed_method_completions")).isZero();
+    }
+    @ParameterizedTest @ValueSource(strings={"bill","enrollment"})
+    void lifecycleWaitAcrossOriginalExpiryCannotSaveProcessingWithCommittedAck(String lockedRow) throws Exception {
+        var bound=boundBrowserMethod(20);var p=bound.pending();int start=http.calls.size();var before=financialState();
+        var session=((SubscriptionActor.Customer)p.context().actor()).session();
+        http.reply(methodUpdateBody(bound));var ack=methodProducer(p,operations).apply(p.reservation(),p.context());assertOriginalMethodRequest(bound,ack,start);
+        var locked=new CountDownLatch(1);var release=new CountDownLatch(1);var holder=new java.util.concurrent.atomic.AtomicInteger();
+        try(var workers=new BoundedWorkers()){
+            var blocker=workers.submit(()->transaction.requiresNew(()->{
+                if(lockedRow.equals("bill"))bills.lock(site,p.failure().billId());
+                else assertThat(jdbc.queryForList("select id from stripe_billing_method_browser_roots where reservation_id=? for update",
+                    UUID.class,p.reservation().id())).hasSize(1);
+                holder.set(jdbc.queryForObject("select pg_backend_pid()",Integer.class));locked.countDown();
+                try{if(!release.await(30,TimeUnit.SECONDS))throw new AssertionError("lifecycle wait timed out");}
+                catch(InterruptedException e){Thread.currentThread().interrupt();throw new AssertionError(e);}
+                return true;
+            }));
+            try{
+                assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
+                var attempt=workers.submit(()->{
+                    assertThatThrownBy(()->p.service().recordMethodUpdateReply(p.reservation(),p.context()))
+                        .isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
+                    return true;
+                });
+                String query=lockedRow.equals("bill")?"%from subscription_billing_records%for update%":"%lock_owned_method_browser%";
+                boolean waiting=false;long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);
+                while(System.nanoTime()<deadline){
+                    waiting=Boolean.TRUE.equals(jdbc.queryForObject("""
+                        select exists(select 1 from pg_stat_activity where datname=current_database() and state='active'
+                        and query like ? and ?=any(pg_blocking_pids(pid)))
+                        """,Boolean.class,query,holder.get()));
+                    if(waiting)break;
+                    Thread.sleep(20);
+                }
+                assertThat(waiting).as("lifecycle worker waiting on the held %s row",lockedRow).isTrue();
+                var dbNow=jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant();
+                assertThat(dbNow).isBefore(session.expiresAt());Thread.sleep(Duration.between(dbNow,session.expiresAt()).plusMillis(100));
+                var expiredAt=jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant();
+                assertThat(expiredAt).isAfterOrEqualTo(session.expiresAt());TestClock.set(expiredAt);
+                release.countDown();assertThat(blocker.get(10,TimeUnit.SECONDS)).isTrue();assertThat(attempt.get(10,TimeUnit.SECONDS)).isTrue();
+            }finally{release.countDown();}
+        }
+        assertLifecycleRefusalRetainsAck(bound,ack,start,before);
+    }
+    @Test void secondLiveSessionWithOriginalKeyCannotSaveProcessingAfterOriginalRevocation(){
+        var bound=boundBrowserMethod(0);var p=bound.pending();int start=http.calls.size();var before=financialState();
+        http.reply(methodUpdateBody(bound));var ack=methodProducer(p,operations).apply(p.reservation(),p.context());assertOriginalMethodRequest(bound,ack,start);
+        var original=((SubscriptionActor.Customer)p.context().actor()).session();
+        TestClock.set(jdbc.queryForObject("select issued_at from customer_sessions where id=?",java.sql.Timestamp.class,original.sessionId().value()).toInstant());
+        var issued=sessions.issue(site,customer,original.origin());var second=sessions.resolveRequired(issued.rawToken(),original.origin());
+        TestClock.set(Instant.now());assertThat(second.sessionId()).isNotEqualTo(original.sessionId());assertThat(second.expiresAt()).isEqualTo(original.expiresAt());
+        assertThat(second.scopes()).isEqualTo(original.scopes());assertThat(second.origin()).isEqualTo(original.origin());
+        assertThat(jdbc.update("update customer_sessions set revoked_at=clock_timestamp(),revoked_reason='LOGOUT' where id=?",original.sessionId().value())).isEqualTo(1);
+        assertThat(transaction.requiresNew(()->sessions.revalidate(second,site,second.origin(),CustomerSessionScope.SUBSCRIPTION_MANAGE))).isEqualTo(second);
+        var context=new SubscriptionCommandContext(new SubscriptionActor.Customer(second),site,customer,second.origin(),p.context().idempotencyKey(),"second");
+        assertThatThrownBy(()->p.service().recordMethodUpdateReply(p.reservation(),context))
+            .isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
+        assertLifecycleRefusalRetainsAck(bound,ack,start,before);
+    }
+    private void assertLifecycleRefusalRetainsAck(BoundMethod bound,ProviderOperation ack,int start,Map<String,Object> before) {
+        var p=bound.pending();assertThat(operations.findById(ack.id())).contains(ack);
+        assertThat(ack.status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);assertThat(ack.version()).isEqualTo(2);
+        assertThat(lifecycleOperations.find(site,current().id(),bound.operation().id())).contains(bound.operation());
+        assertThat(bound.operation().status()).isEqualTo(SubscriptionOperation.Status.RESERVED);assertThat(bound.operation().version()).isZero();
+        methodUnavailable(()->methodProducer(p,operations).apply(p.reservation(),p.context()));assertThat(http.calls).hasSize(start+1);
+        assertThat(count("stripe_billing_failed_method_completions")).isZero();assertThat(financialState()).isEqualTo(before);
     }
     /** Reuses the genuine original first dispatch and SDK ACK producer, stopping before any method binding. */
     private PendingMethod pendingMethod(boolean browser) {

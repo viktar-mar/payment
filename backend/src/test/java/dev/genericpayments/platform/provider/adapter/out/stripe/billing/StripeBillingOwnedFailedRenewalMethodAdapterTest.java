@@ -68,6 +68,35 @@ class StripeBillingOwnedFailedRenewalMethodAdapterTest {
         var f=new Fixture();f.reply();var ack=f.apply();refused(f::apply);
         assertThat(f.step).isSameAs(ack);assertThat(f.sdk.http.calls).hasSize(1);assertThat(f.g.stops()).isZero();f.unchanged();
     }
+    @Test void writerBehindAuthenticatedSetupDispatchCannotReserveOrPost() {
+        var f=new Fixture();var floor=f.originalSetup.firstDispatchedAt();
+        f.invocationClock=Clock.fixed(floor.minusSeconds(1),ZoneOffset.UTC);f.reply();
+        refused(f::apply);assertThat(f.step).isNull();
+        assertThat(f.events).doesNotContain("reserve","claim-attempt","dispatch","sdk","unknown","ack");
+        assertThat(f.sdk.http.calls).isEmpty();assertThat(f.g.stops()).isZero();f.unchanged();
+    }
+    @Test void writerMayClaimAtTheExactOriginalSetupDispatch() {
+        var f=new Fixture();var floor=f.originalSetup.firstDispatchedAt();
+        f.invocationClock=Clock.fixed(floor,ZoneOffset.UTC);f.reply();var ack=f.apply();
+        assertThat(ack.firstDispatchedAt()).isEqualTo(floor);assertThat(ack.status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
+        assertThat(f.sdk.http.calls).hasSize(1);assertThat(f.g.stops()).isZero();f.unchanged();
+    }
+    @Test void actualClaimTimeBelowSetupFloorAfterReservationCannotConsumeFirstDispatch() {
+        var f=new Fixture();var floor=f.originalSetup.firstDispatchedAt();
+        // Both later samples stay inside the invocation budget, including its lower bound.
+        var now=new AtomicReference<>(floor.minusSeconds(1));
+        f.invocationClock=new Clock(){
+            public ZoneId getZone(){return ZoneOffset.UTC;}
+            public Clock withZone(ZoneId zone){return this;}
+            public Instant instant(){return now.get();}
+        };
+        f.on("find",()->now.set(floor.plusNanos(999)));
+        f.on("reserve",()->now.set(floor.minusNanos(1)));
+        f.reply();refused(f::apply);
+        assertThat(f.step.status()).isEqualTo(ProviderOperation.Status.RESERVED);assertThat(f.step.version()).isZero();
+        assertThat(f.events).doesNotContain("claim-attempt","dispatch","sdk","unknown","ack");
+        assertThat(f.sdk.http.calls).isEmpty();assertThat(f.g.stops()).isZero();f.unchanged();
+    }
     @Test void foreignOriginalKeyAndClientAuthorityRefuseBeforeProviderEffects() {
         var f=new Fixture();var c=f.g.context;
         var changed=new SubscriptionCommandContext(c.actor(),c.siteId(),c.customerId(),c.origin(),"browser-confirm-key",c.requestId());
@@ -185,6 +214,29 @@ class StripeBillingOwnedFailedRenewalMethodAdapterTest {
             if(clock.equals("nanos"))assertThat(f.g.now()).isEqualTo(entry);
         }
     }
+    @Test void originalSessionExpiryDuringAccountLockCannotSaveProcessingAfterActualAck() {
+        var f=new Fixture();f.reply();var ack=f.apply();
+        f.g.afterAccountLock(()->f.g.at(f.expiry()));
+        assertThatThrownBy(()->f.g.methods.recordMethodUpdateReply(f.g.reservation,f.g.context))
+            .isExactlyInstanceOf(IllegalStateException.class).hasMessage("browser unavailable");
+        f.retainedAck(ack);
+    }
+    @Test void managementRevalidationAfterLastEnrollmentReadRefusesLostAuthorityOrExpiry() {
+        for(var boundary:List.of("revoked","expired")){
+            var f=new Fixture();f.reply();var ack=f.apply();
+            f.g.afterReplyEnrollment(()->{if(boundary.equals("expired"))f.g.at(f.expiry());else f.g.drift("authority");});
+            assertThatThrownBy(()->f.g.methods.recordMethodUpdateReply(f.g.reservation,f.g.context))
+                .isExactlyInstanceOf(IllegalStateException.class).hasMessage("authority "+boundary);
+            f.retainedAck(ack);
+        }
+    }
+    @Test void secondLiveCustomerSessionCannotSaveAnEnrolledReplyAfterOriginalRevocation() {
+        var f=new Fixture();f.reply();var ack=f.apply();
+        var second=f.g.secondSession();f.g.revoke();
+        assertThatThrownBy(()->f.g.methods.recordMethodUpdateReply(f.g.reservation,second))
+            .isExactlyInstanceOf(IllegalStateException.class).hasMessage("browser unavailable");
+        f.retainedAck(ack);
+    }
     @Test void backwardsUtcOrMonotonicAndOriginalLeaseExpiryRefuseBeforePost() {
         for(var mutation:List.of("backwards-utc","backwards-nanos","lease")){
             var f=new Fixture();f.on("dispatch",()->{switch(mutation){case "backwards-utc"->f.g.at(f.g.now().minusNanos(1));case "backwards-nanos"->f.nanos.set(-1);case "lease"->f.g.at(f.g.now().plusSeconds(60));}});
@@ -288,6 +340,11 @@ class StripeBillingOwnedFailedRenewalMethodAdapterTest {
         void event(String boundary){events.add(boundary);var action=hooks.remove(boundary);if(action!=null)action.run();}
         void drift(String bad){switch(bad){case "proof"->{var p=g.setupProof();g.setupProof(new Setup(p.operation(),p.subscription(),p.account(),p.step(),p.reference(),"pm_changed"));}case "setup"->g.setupStep(copy(g.setupStep(),ProviderOperation.Status.ACKNOWLEDGED,"seti_foreign",g.setupStep().firstDispatchedAt(),g.setupStep().retryBefore(),null,null,2));case "consumption"->g.browserConsumed(false);default->g.drift(bad);}}
         void unchanged(){g.noBusinessChanges();assertThat(g.setupProof()).isEqualTo(originalProof);assertThat(g.setupStep()).isEqualTo(originalSetup);}
+        void retainedAck(ProviderOperation ack){
+            assertThat(step).isSameAs(ack);assertThat(step.status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
+            assertThat(step.version()).isEqualTo(2);unchanged();
+            refused(this::apply);assertThat(step).isSameAs(ack);assertThat(sdk.http.calls).hasSize(1);
+        }
         String key(){return g.operation().providerOperationKey()+":METHOD";}
         String fingerprint(){var o=g.operation();return StripeRequestFingerprint.of(sdk.digest,g.account(),"SUBSCRIPTION_METHOD_V1",o.id().toString(),key(),o.fingerprint(),g.subscription().providerReference(),g.binding().providerReference(),g.setupProof().step().toString(),g.setupProof().reference(),g.setupProof().method(),"consent:true");}
         ProviderOperation fresh(){return new ProviderOperation(UUID.randomUUID(),g.account().id(),g.account().externalAccountId(),g.account().credentialsRef(),ProviderOperation.Kind.SUBSCRIPTION_UPDATE,g.operation().id(),key(),fingerprint(),ProviderOperation.Status.RESERVED,null,null,null,null,null,0);}

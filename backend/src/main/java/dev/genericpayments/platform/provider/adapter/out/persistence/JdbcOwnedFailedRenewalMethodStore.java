@@ -103,6 +103,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
     }
     private JdbcOwnedMethodBrowserStore browser(){return new JdbcOwnedMethodBrowserStore(jdbc,this);}
     @Override public Enrollment requireBrowserSetupEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().setupEnrollment(r,s,now);}
+    @Override public Optional<Enrollment> requireReplyEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().replyEnrollment(r,s,now);}
     @Override public BoundSetup requireBrowserBoundSetupInTransaction(Reservation r,CustomerSessionContext s,Instant now){
         transaction();if(r==null||s==null||now==null)throw unavailable();
         var owner=r.admission().firstRenewalAdmission().receipt().intent().clock().owner();

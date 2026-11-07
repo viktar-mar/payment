@@ -18,6 +18,8 @@ public interface OwnedFailedRenewalMethodStore {
     default Reservation reserveBrowserInTransaction(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,SubscriptionOperation o,CustomerBinding b,Sample sample,Instant now,Enrollment enrollment){throw browserDenied();}
     default Enrollment requireBrowserSetupEnrollmentInTransaction(Reservation r,CustomerSessionContext originalSession,Instant now){throw browserDenied();}
     default BoundSetup requireBrowserBoundSetupInTransaction(Reservation r,CustomerSessionContext originalSession,Instant now){throw browserDenied();}
+    /** Empty only for a durable non-browser reservation. Otherwise require the exact live enrolled session after locks. */
+    default Optional<Enrollment> requireReplyEnrollmentInTransaction(Reservation r,CustomerSessionContext suppliedSession,Instant now){throw browserDenied();}
     default Pending requireBrowserPendingInTransaction(Reservation r,CustomerSessionContext session,Instant now){throw browserDenied();}
     default Optional<Root> browserRootInTransaction(UUID reservationId){throw browserDenied();}
     default Root insertBrowserRootInTransaction(Pending p,Root proposed){throw browserDenied();}

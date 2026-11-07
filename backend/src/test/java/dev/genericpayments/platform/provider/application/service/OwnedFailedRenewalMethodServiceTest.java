@@ -3,6 +3,7 @@ package dev.genericpayments.platform.provider.application.service;
 import dev.genericpayments.platform.provider.application.model.*;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.*;
 import dev.genericpayments.platform.provider.application.port.out.*;
+import dev.genericpayments.platform.customers.application.model.CustomerSessionContext;
 import dev.genericpayments.platform.provider.adapter.out.persistence.*;
 import dev.genericpayments.platform.subscriptions.application.model.*;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
@@ -151,7 +152,8 @@ class OwnedFailedRenewalMethodServiceTest {
         final OwnedFailedRenewalServiceTest.Harness b;
         final SubscriptionCommandContext context;final OwnedFailedRenewalMethodService service;
         Reservation reservation;OwnedMethodBrowser.Enrollment enrollment;Completion completion;Recovery recovery;Publication publication;Map<Phase,ReadClaim> claims=new HashMap<>();boolean acks,authorized=true,failReceipt,liveSession=true,failStop;
-        Runnable afterAccountLock=()->{};
+        CustomerSessionContext secondLiveSession;
+        Runnable afterAccountLock=()->{},afterReplyEnrollment=()->{};
         boolean providerEvidence,browserConsumed,boundSetupDenied,enforceSessionExpiry;BoundSetup returnedBoundSetup;Runnable afterBoundSetup=()->{},requireBoundEvidence=()->{};
         final Map<String,ProviderOperation> providerSteps=new LinkedHashMap<>();
         Harness(){this(false);}
@@ -165,7 +167,14 @@ class OwnedFailedRenewalMethodServiceTest {
             var store=port(OwnedFailedRenewalMethodStore.class,(m,a)->{assertThat(b.active).isTrue();return switch(m){
                 case "reserveInTransaction","reserveBrowserInTransaction"->{b.trace.add("reservation");if(reservation!=null)throw new IllegalStateException("duplicate");var o=(SubscriptionOperation)a[2];reservation=new Reservation(UUID.randomUUID(),b.admission,b.failure,o.id(),o.fingerprint(),0,b.binding,(SubscriptionBillingTimePort.Sample)a[4],(Instant)a[5]);if(m.equals("reserveBrowserInTransaction")){enrollment=(OwnedMethodBrowser.Enrollment)a[6];if(failReceipt)throw new IllegalStateException("enrollment failed");}yield reservation;}
                 case "requireBrowserPendingInTransaction"->{same((Reservation)a[0]);var s=(dev.genericpayments.platform.customers.application.model.CustomerSessionContext)a[1];if(!acks||enrollment==null||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())||!enrollment.sessionExpiresAt().equals(s.expiresAt()))throw new IllegalStateException("browser unavailable");var o=b.ops.get(reservation.setupOperationId());yield new OwnedMethodBrowser.Pending(reservation,enrollment,b.account,b.s,o,b.binding,new SubscriptionBillingProofStore.Setup(o.id(),b.s.id(),b.account.id(),id(91),"seti_owned",null),step(o,false));}
-                case "requireBrowserSetupEnrollmentInTransaction"->{same((Reservation)a[0]);b.trace.add("setup-enrollment");var s=(dev.genericpayments.platform.customers.application.model.CustomerSessionContext)a[1];var original=((SubscriptionActor.Customer)context.actor()).session();var now=(Instant)a[2];if(!liveSession||enrollment==null||!s.equals(original)||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())||!enrollment.sessionExpiresAt().equals(s.expiresAt())||!now.isBefore(s.expiresAt())||!b.utc.isBefore(s.expiresAt())||now.isAfter(b.utc))throw new IllegalStateException("browser unavailable");yield enrollment;}
+                case "requireBrowserSetupEnrollmentInTransaction","requireReplyEnrollmentInTransaction"->{
+                    same((Reservation)a[0]);boolean reply=m.equals("requireReplyEnrollmentInTransaction");
+                    if(reply&&enrollment==null)yield Optional.empty();
+                    b.trace.add(reply?"reply-enrollment":"setup-enrollment");
+                    var s=(CustomerSessionContext)a[1];var original=((SubscriptionActor.Customer)context.actor()).session();var now=(Instant)a[2];
+                    if(!liveSession||enrollment==null||!original.equals(s)||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())||!enrollment.sessionExpiresAt().equals(s.expiresAt())||!now.isBefore(s.expiresAt())||!b.utc.isBefore(s.expiresAt())||now.isAfter(b.utc))throw new IllegalStateException("browser unavailable");
+                    if(reply)afterReplyEnrollment.run();yield reply?Optional.of(enrollment):enrollment;
+                }
                 case "requireBrowserBoundSetupInTransaction"->{
                     same((Reservation)a[0]);b.trace.add("bound-setup");
                     var s=(dev.genericpayments.platform.customers.application.model.CustomerSessionContext)a[1];var original=((SubscriptionActor.Customer)context.actor()).session();
@@ -195,7 +204,10 @@ class OwnedFailedRenewalMethodServiceTest {
             b.methodProof=new OwnedFailedRenewalMethodFactProof(store,tx,b.timePort);b.successorProof=new OwnedFailedRenewalMethodRecoveryFactProof(store,tx,b.timePort);
             var failed=port(OwnedFailedRenewalStore.class,(m,a)->{assertThat(b.active).isTrue();return switch(m){case "requireFailureInTransaction"->b.failure;case "stopInTransaction"->{b.trace.add("stop");if(failStop)throw new IllegalStateException("private stop failure");b.stopped=true;yield null;}default->throw new AssertionError(m);};});
             service=new OwnedFailedRenewalMethodService(store,failed,tx,b.operationsPort,(site,customer)->b.trace.add("lifecycle"),id->{b.trace.add("account");afterAccountLock.run();return Optional.of(b.account);},b.subscriptionsPort,b.billsPort,new SubscriptionReadPreparation(b.operationsPort,port(TrialEligibilityStore.class,(m,a)->Optional.empty())),b.observationsPort,b.factsPort,port(TrialEligibilityStore.class,(m,a)->Optional.empty()),b.timePort,b.clockPort,port(StripeBillingBindingPort.class,(m,a)->Optional.of(b.binding)),port(SubscriptionAuthorityPort.class,(m,a)->{
-                assertThat(b.active).isTrue();b.trace.add("authority");if(!authorized||!liveSession)throw new IllegalStateException("authority revoked");
+                assertThat(b.active).isTrue();b.trace.add("authority");
+                var supplied=((SubscriptionCommandContext)a[0]).actor();
+                boolean second=supplied instanceof SubscriptionActor.Customer actorCustomer&&actorCustomer.session().equals(secondLiveSession);
+                if(!authorized||!liveSession&&!second)throw new IllegalStateException("authority revoked");
                 // New bound SDK fixtures model production lockedSession.activeAt(current UTC).
                 // Older fixtures retain their existing explicitly selected authority behavior.
                 if(enforceSessionExpiry&&((SubscriptionCommandContext)a[0]).actor() instanceof SubscriptionActor.Customer customer
