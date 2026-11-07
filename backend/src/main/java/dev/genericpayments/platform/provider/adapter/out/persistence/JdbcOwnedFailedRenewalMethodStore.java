@@ -105,15 +105,30 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
     @Override public Enrollment requireBrowserSetupEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().setupEnrollment(r,s,now);}
     @Override public Optional<Enrollment> requireReplyEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().replyEnrollment(r,s,now);}
     @Override public BoundSetup requireBrowserBoundSetupInTransaction(Reservation r,CustomerSessionContext s,Instant now){
+        return requireBrowserSetup(r,s,now,true);
+    }
+    @Override public BoundSetup requireBrowserUnboundSetupInTransaction(Reservation r,CustomerSessionContext s,Instant now){
+        return requireBrowserSetup(r,s,now,false);
+    }
+    private BoundSetup requireBrowserSetup(Reservation r,CustomerSessionContext s,Instant now,boolean methodRequired){
         transaction();if(r==null||s==null||now==null)throw unavailable();
         var owner=r.admission().firstRenewalAdmission().receipt().intent().clock().owner();
         var o=operation(r,r.setupOperationId());
-        var fingerprint=jdbc.queryForObject("select owned_method_step_fingerprint(?,true)",String.class,r.id());
-        requireStepResource(jdbc,owner.account(),ProviderOperation.Kind.SUBSCRIPTION_UPDATE,o.id(),o.providerOperationKey()+":METHOD",fingerprint);
+        if(methodRequired){
+            var fingerprint=jdbc.queryForObject("select owned_method_step_fingerprint(?,true)",String.class,r.id());
+            requireStepResource(jdbc,owner.account(),ProviderOperation.Kind.SUBSCRIPTION_UPDATE,o.id(),o.providerOperationKey()+":METHOD",fingerprint);
+        }else{
+            // V36 pending is specifically unbound and refuses any existing METHOD row. It joins caller locks.
+            browser().pending(r,s,now);
+            if(jdbc.queryForList("select operation_id from stripe_subscription_setup_proofs where operation_id=? and payment_account_id=? for update",
+                    UUID.class,o.id(),owner.account().value()).size()!=1)throw unavailable();
+            require("select owned_method_browser_permit(?)",o.id());
+        }
         var proof=setup(r);var step=JdbcProviderOperationStore.row(jdbc,proof.step()).orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable);
         var setupFingerprint=jdbc.queryForObject("select owned_method_step_fingerprint(?,false)",String.class,r.id());
         if(!r.setupOperationId().equals(proof.operation())||!o.subscriptionId().equals(proof.subscription())||!owner.account().equals(proof.account())
-            ||proof.reference()==null||!proof.reference().matches("seti_[A-Za-z0-9]{1,250}")||proof.method()==null||!proof.method().matches("pm_[A-Za-z0-9]{1,252}")
+            ||proof.reference()==null||!proof.reference().matches("seti_[A-Za-z0-9]{1,250}")
+            ||(methodRequired?(proof.method()==null||!proof.method().matches("pm_[A-Za-z0-9]{1,252}")):proof.method()!=null)
             ||step.kind()!=ProviderOperation.Kind.SETUP_INTENT_CREATE||step.status()!=ProviderOperation.Status.ACKNOWLEDGED||step.version()!=2
             ||!owner.account().equals(step.accountId())||!owner.externalAccount().equals(step.externalAccountId())||!owner.credentialsRef().equals(step.credentialsRef())
             ||!o.id().equals(step.resourceId())||!Objects.equals(o.providerOperationKey()+":SETUP",step.operationKey())||!Objects.equals(setupFingerprint,step.fingerprint())
@@ -123,6 +138,27 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         // Rechecks exact original session/scopes and fresh DB UTC after every potentially blocking read.
         var enrollment=browser().setupEnrollment(r,s,now);
         return new BoundSetup(enrollment,proof,step);
+    }
+    @Override public BoundSetup bindBrowserSetupInTransaction(BindingPreparationContext expected,CustomerSessionContext s,String method,Instant now){
+        transaction();if(expected==null||s==null||now==null||method==null||!method.matches("pm_[A-Za-z0-9]{1,252}"))throw unavailable();
+        var original=expected.original();var r=original.reservation();
+        var unbound=requireBrowserUnboundSetupInTransaction(r,s,now);
+        if(!original.enrollment().equals(unbound.enrollment())||!expected.setupProof().equals(unbound.setupProof())
+            ||!expected.setupStep().equals(unbound.setupStep()))throw unavailable();
+        var proof=unbound.setupProof();var owner=r.admission().firstRenewalAdmission().receipt().intent().clock().owner();
+        // Match every immutable proof identity column; an already-bound proof is never adopted or replaced.
+        int changed=jdbc.update("""
+            update stripe_subscription_setup_proofs set method_reference=?
+            where operation_id=? and site_id=? and customer_id=? and subscription_id=? and payment_account_id=?
+            and operation_kind='SETUP' and step_id=? and setup_reference=? and method_reference is null
+            """,method,proof.operation(),owner.site().value(),owner.customer().value(),proof.subscription(),proof.account().value(),proof.step(),proof.reference());
+        if(changed!=1)throw unavailable();
+        var actual=setup(r);
+        if(!actual.equals(new Setup(proof.operation(),proof.subscription(),proof.account(),proof.step(),proof.reference(),method)))throw unavailable();
+        // No independently committed ordinary proof-store call. Fresh DBUTC after the update's locks.
+        var enrollment=browser().setupEnrollment(r,s,now);
+        if(!original.enrollment().equals(enrollment))throw unavailable();
+        return new BoundSetup(enrollment,actual,unbound.setupStep());
     }
     static void requireBoundSetupRootChronology(Root root,ProviderOperation setupStep){
         if(root==null||setupStep==null||setupStep.firstDispatchedAt()==null||root.issuedAt().isBefore(setupStep.firstDispatchedAt()))throw unavailable();

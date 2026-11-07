@@ -90,6 +90,43 @@ public final class OwnedFailedRenewalMethodService {
         fresh();Objects.requireNonNull(reservation);validateContext(originalContext);customer(originalContext,utc());
         return transaction.requiresNew(()->inspectBrowserSetupInTransaction(reservation,originalContext));
     }
+    /** Fresh authenticated unbound original SETUP evidence; never grants reusable browser authority. */
+    public BindingPreparationContext inspectBrowserBindingPreparation(Reservation reservation,SubscriptionCommandContext originalContext){
+        fresh();Objects.requireNonNull(reservation);validateContext(originalContext);customer(originalContext,clock.instant());
+        return transaction.requiresNew(()->inspectBrowserBindingInTransaction(reservation,originalContext));
+    }
+    /** Reauthenticates and conditionally binds the exact unbound proof in a separate fresh caller transaction. */
+    public SubscriptionBillingProofStore.Setup bindBrowserMethod(BindingPreparationContext expected,SubscriptionCommandContext originalContext,String method){
+        fresh();Objects.requireNonNull(expected);validateContext(originalContext);customer(originalContext,clock.instant());
+        if(method==null||!method.matches("pm_[A-Za-z0-9]{1,252}"))throw unavailable();
+        return transaction.requiresNew(()->{
+            var current=inspectBrowserBindingInTransaction(expected.original().reservation(),originalContext);
+            if(!expected.equals(current))throw unavailable();
+            var bound=store.bindBrowserSetupInTransaction(expected,customer(originalContext,clock.instant()),method,utc());
+            requireBoundSetup(current.original(),bound);
+            var proof=current.setupProof();
+            var actual=new SubscriptionBillingProofStore.Setup(proof.operation(),proof.subscription(),proof.account(),proof.step(),proof.reference(),method);
+            if(!actual.equals(bound.setupProof())||!current.setupStep().equals(bound.setupStep()))throw unavailable();
+            requireBindingAuthority(current.original(),originalContext);
+            return bound.setupProof();
+        });
+    }
+    private BindingPreparationContext inspectBrowserBindingInTransaction(Reservation reservation,SubscriptionCommandContext originalContext){
+        var original=inspectBrowserSetupInTransaction(reservation,originalContext);
+        var unbound=store.requireBrowserUnboundSetupInTransaction(reservation,customer(originalContext,clock.instant()),utc());
+        requireSetup(original,unbound,false);
+        requireBindingAuthority(original,originalContext);
+        return new BindingPreparationContext(original,unbound.setupProof(),unbound.setupStep());
+    }
+    private void requireBindingAuthority(SetupPreparationContext original,SubscriptionCommandContext context){
+        var enrollment=store.requireBrowserSetupEnrollmentInTransaction(original.reservation(),customer(context,clock.instant()),utc());
+        if(!original.enrollment().equals(enrollment))throw unavailable();
+        authority.revalidate(context,true);
+        // Exact expiry and original enrollment are checked after every potentially blocking store/authority call.
+        var session=customer(context,clock.instant());
+        if(!enrollment.sessionId().equals(session.sessionId().value())||!enrollment.origin().equals(session.origin())
+            ||!enrollment.sessionExpiresAt().equals(session.expiresAt()))throw unavailable();
+    }
     /** Fresh original authority plus independently bound SETUP evidence, without requiring any METHOD row. */
     public MethodPreparationContext inspectBrowserMethodPreparation(Reservation reservation,SubscriptionCommandContext originalContext){
         fresh();Objects.requireNonNull(reservation);validateContext(originalContext);customer(originalContext,utc());
@@ -114,11 +151,14 @@ public final class OwnedFailedRenewalMethodService {
         return new SetupPreparationContext(reservation,enrollment,state.account(),state.subscription(),selected,state.binding(),state.sample());
     }
     private void requireBoundSetup(SetupPreparationContext original,BoundSetup bound){
+        requireSetup(original,bound,true);
+    }
+    private void requireSetup(SetupPreparationContext original,BoundSetup bound,boolean methodRequired){
         if(bound==null||!original.enrollment().equals(bound.enrollment()))throw unavailable();
         var proof=bound.setupProof();var step=bound.setupStep();var o=original.operation();var account=original.account();
         if(!o.id().equals(proof.operation())||!original.subscription().id().equals(proof.subscription())||!account.id().equals(proof.account())
             ||!step.id().equals(proof.step())||proof.reference()==null||!proof.reference().matches("seti_[A-Za-z0-9]{1,250}")
-            ||proof.method()==null||!proof.method().matches("pm_[A-Za-z0-9]{1,252}")
+            ||(methodRequired?(proof.method()==null||!proof.method().matches("pm_[A-Za-z0-9]{1,252}")):proof.method()!=null)
             ||step.kind()!=ProviderOperation.Kind.SETUP_INTENT_CREATE||step.status()!=ProviderOperation.Status.ACKNOWLEDGED||step.version()!=2
             ||!account.id().equals(step.accountId())||!account.externalAccountId().equals(step.externalAccountId())||!account.credentialsRef().equals(step.credentialsRef())
             ||!o.id().equals(step.resourceId())||!Objects.equals(o.providerOperationKey()+":SETUP",step.operationKey())||!proof.reference().equals(step.providerReference())

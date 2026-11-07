@@ -18,6 +18,10 @@ public interface OwnedFailedRenewalMethodStore {
     default Reservation reserveBrowserInTransaction(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,SubscriptionOperation o,CustomerBinding b,Sample sample,Instant now,Enrollment enrollment){throw browserDenied();}
     default Enrollment requireBrowserSetupEnrollmentInTransaction(Reservation r,CustomerSessionContext originalSession,Instant now){throw browserDenied();}
     default BoundSetup requireBrowserBoundSetupInTransaction(Reservation r,CustomerSessionContext originalSession,Instant now){throw browserDenied();}
+    /** Distinct unbound receipt: original SETUP ACK plus committed browser consumption, no METHOD. */
+    default BoundSetup requireBrowserUnboundSetupInTransaction(Reservation r,CustomerSessionContext originalSession,Instant now){throw browserDenied();}
+    /** Conditional write in this caller transaction; no suspension or independently committed proof binding. */
+    default BoundSetup bindBrowserSetupInTransaction(BindingPreparationContext expected,CustomerSessionContext originalSession,String method,Instant now){throw browserDenied();}
     /** Empty only for a durable non-browser reservation. Otherwise require the exact live enrolled session after locks. */
     default Optional<Enrollment> requireReplyEnrollmentInTransaction(Reservation r,CustomerSessionContext suppliedSession,Instant now){throw browserDenied();}
     default Pending requireBrowserPendingInTransaction(Reservation r,CustomerSessionContext session,Instant now){throw browserDenied();}

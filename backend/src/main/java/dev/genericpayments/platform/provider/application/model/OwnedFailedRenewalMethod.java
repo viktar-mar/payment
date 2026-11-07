@@ -74,6 +74,11 @@ public final class OwnedFailedRenewalMethod {
         public BoundSetup { required(enrollment,setupProof,setupStep); }
         @Override public String toString(){return "BoundSetup[redacted]";}
     }
+    /** Descriptive original unbound proof only; every binding must authenticate it again. */
+    public record BindingPreparationContext(SetupPreparationContext original,Setup setupProof,ProviderOperation setupStep) {
+        public BindingPreparationContext { required(original,setupProof,setupStep); }
+        @Override public String toString(){return "BindingPreparationContext[redacted]";}
+    }
     public record MethodPreparationContext(SetupPreparationContext original,Setup setupProof,ProviderOperation setupStep) {
         public MethodPreparationContext { required(original,setupProof,setupStep); }
         @Override public String toString(){return "MethodPreparationContext[redacted]";}

@@ -75,14 +75,18 @@ class OwnedMethodBrowserStoreTransactionTest {
             .isInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
         assertThatThrownBy(()->store.requireBrowserBoundSetupInTransaction(null,null,null))
             .isInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
+        assertThatThrownBy(()->store.requireBrowserUnboundSetupInTransaction(null,null,null))
+            .isInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
+        assertThatThrownBy(()->store.bindBrowserSetupInTransaction(null,null,null,null))
+            .isInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
     }
     @Test void unextendedStorePortsDenyEveryBrowserEntry() {
         var store=Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{OwnedFailedRenewalMethodStore.class},
             (proxy,method,args)->{if(!method.isDefault())throw new AssertionError("Unexpected ordinary store call");return InvocationHandler.invokeDefault(proxy,method,args);});
-        var browser=List.of("reserveBrowserInTransaction","requireBrowserSetupEnrollmentInTransaction","requireBrowserBoundSetupInTransaction","requireReplyEnrollmentInTransaction","requireBrowserPendingInTransaction","browserRootInTransaction","insertBrowserRootInTransaction",
+        var browser=List.of("reserveBrowserInTransaction","requireBrowserSetupEnrollmentInTransaction","requireBrowserBoundSetupInTransaction","requireBrowserUnboundSetupInTransaction","bindBrowserSetupInTransaction","requireReplyEnrollmentInTransaction","requireBrowserPendingInTransaction","browserRootInTransaction","insertBrowserRootInTransaction",
             "requireBrowserActionInTransaction","startBrowserSelectionInTransaction","finishBrowserSelectionInTransaction","consumeBrowserFirstInTransaction");
         var methods=java.util.Arrays.stream(OwnedFailedRenewalMethodStore.class.getMethods()).filter(m->browser.contains(m.getName())).toList();
-        assertThat(methods).hasSize(11);
+        assertThat(methods).hasSize(13);
         for(var method:methods)assertThatThrownBy(()->{try{method.invoke(store,new Object[method.getParameterCount()]);}catch(InvocationTargetException e){throw e.getCause();}})
             .isInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
     }
@@ -117,5 +121,12 @@ class OwnedMethodBrowserStoreTransactionTest {
             ()->s.startBrowserSelectionInTransaction(null,null,null,null),()->s.finishBrowserSelectionInTransaction(null,null,null,null),
             ()->s.consumeBrowserFirstInTransaction(null,null,null,null,null));
         for(var call:calls)assertThatThrownBy(call::run).isInstanceOf(IllegalStateException.class).hasMessage("Owned method transition requires caller transaction");
+    }
+    @Test void bindingPortsRequireExistingCallerTransactionBeforeSql(){
+        var store=new JdbcOwnedFailedRenewalMethodStore(new JdbcTemplate());
+        assertThatThrownBy(()->store.requireBrowserUnboundSetupInTransaction(null,null,null))
+            .isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method transition requires caller transaction");
+        assertThatThrownBy(()->store.bindBrowserSetupInTransaction(null,null,null,null))
+            .isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method transition requires caller transaction");
     }
 }

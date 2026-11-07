@@ -43,8 +43,15 @@ public final class OwnedMethodSetupInertFixture {
     public void failStop(){h.failStop=true;}
     /** Independent earlier durable evidence; deliberately no METHOD row or legacy both-ACK flag. */
     public void bindOriginalSetup(DigestPort digest){
+        originalSetup(digest,"pm_original");
+    }
+    /** Explicit unbound original SETUP ACK plus independently committed browser consumption; no METHOD. */
+    public void unboundOriginalSetup(DigestPort digest){
+        h.bindingEnabled=true;originalSetup(digest,null);
+    }
+    private void originalSetup(DigestPort digest,String method){
         h.providerEvidence=true;h.browserConsumed=true;h.enforceSessionExpiry=true;var o=operation();var id=UUID.randomUUID();
-        h.b.methodSetup=new Setup(o.id(),subscription().id(),account().id(),id,"seti_original","pm_original");
+        h.b.methodSetup=new Setup(o.id(),subscription().id(),account().id(),id,"seti_original",method);
         var step=new ProviderOperation(id,account().id(),account().externalAccountId(),account().credentialsRef(),ProviderOperation.Kind.SETUP_INTENT_CREATE,o.id(),o.providerOperationKey()+":SETUP",
             setupFingerprint(digest),ProviderOperation.Status.ACKNOWLEDGED,"seti_original",now(),now().plusSeconds(23*3600),null,null,2);
         h.providerSteps.put(step.operationKey(),step);
@@ -57,6 +64,9 @@ public final class OwnedMethodSetupInertFixture {
     public void setupStep(ProviderOperation step){h.providerSteps.put(operation().providerOperationKey()+":SETUP",step);}
     public void providerStep(ProviderOperation step){h.providerSteps.put(operation().providerOperationKey()+":METHOD",step);}
     public void browserConsumed(boolean value){h.browserConsumed=value;}
+    public void browserConsumptionUncommitted(boolean value){h.browserConsumptionUncommitted=value;}
+    public void afterBindingWrite(Runnable action){h.afterBindingWrite=action;}
+    public void afterUnboundSetup(Runnable action){h.afterUnboundSetup=action;}
     public void drift(String kind){switch(kind){
         case "session"->revoke();case "authority"->h.authorized=false;case "sequence"->h.b.sequence++;
         case "sample"->h.b.billingSecond++;case "mode"->h.b.isolated=false;
