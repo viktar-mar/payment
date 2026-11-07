@@ -248,9 +248,18 @@ public final class OwnedFailedRenewalMethodService {
     /** Fresh original management authority and unchanged open debt; no claim, provider call or stop. */
     public RecoveryPreparationContext inspectBrowserRecoveryPreparation(Reservation reservation,Completion completion,Recovery recovery,SubscriptionCommandContext originalContext){
         fresh();Objects.requireNonNull(reservation);Objects.requireNonNull(completion);Objects.requireNonNull(recovery);
-        validateContext(originalContext);customer(originalContext,clock.instant());
+        validateContext(originalContext);var originalSession=customer(originalContext,clock.instant());
+        var owner=reservation.admission().firstRenewalAdmission().receipt().intent().clock().owner();
+        if(!owner.site().equals(originalContext.siteId())||!owner.customer().equals(originalContext.customerId()))throw unavailable();
         return transaction.requiresNew(()->{
-            var state=current(reservation,originalContext,recovery.association().operationId());
+            // Bind immutable stored locators read-only before they can enter global operation/session locks.
+            if(!reservation.equals(store.requireReservationInTransaction(reservation)))throw unavailable();
+            var originalEnrollment=store.requireBrowserRecoveryIdentityInTransaction(reservation,originalSession);
+            if(originalEnrollment==null||!originalEnrollment.sessionId().equals(originalSession.sessionId().value())
+                    ||!originalEnrollment.origin().equals(originalSession.origin())
+                    ||!originalEnrollment.sessionExpiresAt().equals(originalSession.expiresAt()))throw unavailable();
+            // The legitimate RESERVED RECOVER is discovered by the scoped unresolved query, in canonical order.
+            var state=current(reservation,originalContext,null);
             var failure=reservation.failure();var admission=reservation.admission();var upstream=admission.firstRenewalAdmission();
             requireDebt(state,failure,1);
             if(!completion.equals(store.requireCompletionInTransaction(reservation,completion))
@@ -286,7 +295,7 @@ public final class OwnedFailedRenewalMethodService {
             authority.revalidate(originalContext,true);
             // Neither database locks nor authority waits extend the exact original management session.
             var session=customer(originalContext,clock.instant());
-            if(enrollment==null||!enrollment.sessionId().equals(session.sessionId().value())||!enrollment.origin().equals(session.origin())
+            if(!originalEnrollment.equals(enrollment)||!enrollment.sessionId().equals(session.sessionId().value())||!enrollment.origin().equals(session.origin())
                     ||!enrollment.sessionExpiresAt().equals(session.expiresAt()))throw unavailable();
             return new RecoveryPreparationContext(reservation,enrollment,state.account(),state.subscription(),setup,recover,state.binding(),completion,recovery,state.sample());
         });

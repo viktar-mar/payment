@@ -153,6 +153,7 @@ class OwnedFailedRenewalMethodServiceTest {
         final SubscriptionCommandContext context;final OwnedFailedRenewalMethodService service;
         Reservation reservation;OwnedMethodBrowser.Enrollment enrollment;Completion completion;Recovery recovery;Publication publication;Map<Phase,ReadClaim> claims=new HashMap<>();boolean acks,authorized=true,failReceipt,liveSession=true,failStop;
         CustomerSessionContext secondLiveSession;
+        final List<SubscriptionCommandContext> authorityTargets=new ArrayList<>();
         Runnable afterAccountLock=()->{},afterReplyEnrollment=()->{};
         boolean providerEvidence,browserConsumed,boundSetupDenied,enforceSessionExpiry;BoundSetup returnedBoundSetup;Runnable afterBoundSetup=()->{},requireBoundEvidence=()->{};
         // Binding-only controls are opt-in; older bound/METHOD fixtures keep their original behavior.
@@ -161,7 +162,7 @@ class OwnedFailedRenewalMethodServiceTest {
         // Recovery-only controls do not relax older SETUP/METHOD fixtures.
         boolean recoveryPreparationEnabled,recoveryEnrollmentDenied;
         OwnedMethodBrowser.Enrollment returnedRecoveryEnrollment;
-        Runnable afterRecoveryEnrollment=()->{},afterAuthority=()->{};
+        Runnable afterRecoveryIdentity=()->{},afterRecoveryEnrollment=()->{},afterAuthority=()->{};
         final Map<String,ProviderOperation> providerSteps=new LinkedHashMap<>();
         Harness(){this(false);}
         Harness(boolean customerActor){this(customerActor,"alias");}
@@ -190,6 +191,13 @@ class OwnedFailedRenewalMethodServiceTest {
                     var s=(CustomerSessionContext)a[1];var original=((SubscriptionActor.Customer)context.actor()).session();var now=(Instant)a[2];
                     if(!liveSession||enrollment==null||!original.equals(s)||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())||!enrollment.sessionExpiresAt().equals(s.expiresAt())||!now.isBefore(s.expiresAt())||!b.utc.isBefore(s.expiresAt())||now.isAfter(b.utc))throw new IllegalStateException("browser unavailable");
                     if(reply)afterReplyEnrollment.run();yield reply?Optional.of(enrollment):enrollment;
+                }
+                case "requireBrowserRecoveryIdentityInTransaction"->{
+                    same((Reservation)a[0]);b.trace.add("recovery-identity");var s=(CustomerSessionContext)a[1];
+                    if(enrollment==null||!b.owner.site().equals(s.siteId())||!b.owner.customer().equals(s.customerId())
+                            ||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())
+                            ||!enrollment.sessionExpiresAt().equals(s.expiresAt()))throw new IllegalStateException("browser identity unavailable");
+                    var original=enrollment;afterRecoveryIdentity.run();yield original;
                 }
                 case "requireBrowserRecoveryEnrollmentInTransaction"->{
                     same((Reservation)a[0]);b.trace.add("recovery-enrollment");
@@ -248,7 +256,7 @@ class OwnedFailedRenewalMethodServiceTest {
             b.methodProof=new OwnedFailedRenewalMethodFactProof(store,tx,b.timePort);b.successorProof=new OwnedFailedRenewalMethodRecoveryFactProof(store,tx,b.timePort);
             var failed=port(OwnedFailedRenewalStore.class,(m,a)->{assertThat(b.active).isTrue();return switch(m){case "requireFailureInTransaction"->b.failure;case "stopInTransaction"->{b.trace.add("stop");if(failStop)throw new IllegalStateException("private stop failure");b.stopped=true;yield null;}default->throw new AssertionError(m);};});
             service=new OwnedFailedRenewalMethodService(store,failed,tx,b.operationsPort,(site,customer)->b.trace.add("lifecycle"),id->{b.trace.add("account");afterAccountLock.run();return Optional.of(b.account);},b.subscriptionsPort,b.billsPort,new SubscriptionReadPreparation(b.operationsPort,port(TrialEligibilityStore.class,(m,a)->Optional.empty())),b.observationsPort,b.factsPort,port(TrialEligibilityStore.class,(m,a)->Optional.empty()),b.timePort,b.clockPort,port(StripeBillingBindingPort.class,(m,a)->Optional.of(b.binding)),port(SubscriptionAuthorityPort.class,(m,a)->{
-                assertThat(b.active).isTrue();b.trace.add("authority");
+                assertThat(b.active).isTrue();b.trace.add("authority");authorityTargets.add((SubscriptionCommandContext)a[0]);
                 var supplied=((SubscriptionCommandContext)a[0]).actor();
                 boolean second=supplied instanceof SubscriptionActor.Customer actorCustomer&&actorCustomer.session().equals(secondLiveSession);
                 afterAuthority.run();

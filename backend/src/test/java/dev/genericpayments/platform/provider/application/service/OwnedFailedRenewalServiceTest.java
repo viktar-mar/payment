@@ -174,6 +174,7 @@ class OwnedFailedRenewalServiceTest {
         final PaymentAccount account;
         Map<UUID,SubscriptionOperation> ops=new LinkedHashMap<>();Map<String,BillingRecord> records=new LinkedHashMap<>();Map<Phase,ReadClaim> reads=new HashMap<>();
         Set<String> cash=new LinkedHashSet<>();List<SubscriptionEvent.Type> events=new ArrayList<>();List<String> trace=new ArrayList<>();
+        final List<UUID> operationLockTargets=new ArrayList<>();
         long sequence,billingSecond=4700;int effects,callbacks,timeCalls;boolean active,isolated=true,foreign,claimOwner=true,stopped,failReceipt,normalizeClaim,factTimeDrift,factModeDrift;Instant utc=UTC;
         dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding binding;
         Failure failure;Recovery recovery;Publication publication;final OwnedFailedRenewalService service;
@@ -194,8 +195,8 @@ class OwnedFailedRenewalServiceTest {
             var initialOperation=new SubscriptionOperation(upstream.receipt().intent().createOperation(),owner.site(),owner.customer(),s.id(),SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Status.SUCCEEDED,"create","digest",upstream.receipt().intent().requestFingerprint(),upstream.receipt().intent().operationKey(),0,1,"sub_owned",null,UTC,UTC,1);ops.put(initialOperation.id(),initialOperation);
             records.put("in_initial",new BillingRecord(upstream.bill(),s.siteId(),s.id(),s.paymentAccountId(),"in_initial",BillingRecord.Kind.INITIAL,s.billingPrice(),null,s.currentPeriod(),1000,"EUR",BillingRecord.Settlement.CONFIRMED_CASH,0,UTC,UTC));
             var operations=port(SubscriptionOperationStore.class,(m,a)->switch(m){
-                case "unresolved"->ops.values().stream().filter(o->o.status()!=SubscriptionOperation.Status.SUCCEEDED).toList();
-                case "lock"->{trace.add("operations");yield ops.get(a[0]);}
+                case "unresolved"->ops.values().stream().filter(o->o.siteId().equals(a[0])&&o.subscriptionId().equals(a[1])&&o.status()!=SubscriptionOperation.Status.SUCCEEDED).toList();
+                case "lock"->{trace.add("operations");operationLockTargets.add((UUID)a[0]);yield ops.get(a[0]);}
                 case "find"->Optional.ofNullable(ops.get(a[2]));
                 case "claim"->{trace.add("claim");var o=(SubscriptionOperation)a[0];if(normalizeClaim)o=new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),o.subscriptionId(),o.kind(),o.status(),o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),o.providerReference(),null,o.createdAt().truncatedTo(java.time.temporal.ChronoUnit.MICROS),o.updatedAt().truncatedTo(java.time.temporal.ChronoUnit.MICROS),o.version());ops.put(o.id(),o);yield new SubscriptionOperationStore.Claim(o,claimOwner);}
                 case "save"->{effects++;var o=(SubscriptionOperation)a[0];ops.put(o.id(),o);yield o;}

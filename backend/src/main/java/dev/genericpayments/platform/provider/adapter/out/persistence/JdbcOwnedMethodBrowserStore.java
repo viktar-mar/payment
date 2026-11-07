@@ -33,6 +33,23 @@ final class JdbcOwnedMethodBrowserStore {
         jdbc.queryForList("select lock_owned_method_browser(?)",r.id());
         return authenticatedEnrollment(r,session,now,"owned_method_debt(r.id,0,o.id) and owned_method_initial_operation(r.id)");
     }
+    /** Immutable locators only: ordinary SELECTs, no locks, phase dispatch or live authority. */
+    Enrollment recoveryIdentity(Reservation r,CustomerSessionContext session){
+        transaction();if(r==null||session==null)throw unavailable();methods.requireReservationInTransaction(r);
+        var enrollments=jdbc.query("""
+            select r.browser_session_id,r.browser_origin,r.browser_session_expires_at
+            from stripe_billing_failed_method_reservations r
+            join stripe_billing_failed_renewals d on d.id=r.admission_id
+            where r.id=? and d.site_id=? and d.customer_id=?
+            and num_nonnulls(r.browser_session_id,r.browser_origin,r.browser_session_expires_at)=3
+            """,(row,n)->new Enrollment(uuid(row,"browser_session_id"),row.getString("browser_origin"),instant(row,"browser_session_expires_at")),
+            r.id(),session.siteId().value(),session.customerId().value());
+        if(enrollments.size()!=1)throw unavailable();var enrollment=enrollments.getFirst();
+        // Compare the raw caller Instant to the JDBC-normalized stored value, never truncate the caller.
+        if(!enrollment.sessionId().equals(session.sessionId().value())||!enrollment.origin().equals(session.origin())
+                ||!enrollment.sessionExpiresAt().equals(session.expiresAt()))throw unavailable();
+        return enrollment;
+    }
     /** Completed original browser lineage only. Historical permission survives the root's former action window. */
     Enrollment recoveryEnrollment(Reservation r,CustomerSessionContext session,Instant now){
         transaction();if(r==null||session==null||now==null)throw unavailable();methods.requireReservationInTransaction(r);

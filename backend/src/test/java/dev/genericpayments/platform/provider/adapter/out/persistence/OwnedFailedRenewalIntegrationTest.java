@@ -95,8 +95,11 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         return methodService(methods,operationStore,transaction);
     }
     private OwnedFailedRenewalMethodService methodService(OwnedFailedRenewalMethodStore methods,SubscriptionOperationStore operationStore,SubscriptionTransactionPort serviceTransaction){
+        return methodService(methods,operationStore,serviceTransaction,authority);
+    }
+    private OwnedFailedRenewalMethodService methodService(OwnedFailedRenewalMethodStore methods,SubscriptionOperationStore operationStore,SubscriptionTransactionPort serviceTransaction,SubscriptionAuthorityPort serviceAuthority){
         return new OwnedFailedRenewalMethodService(methods,store(),serviceTransaction,operationStore,lifecycleLocks,
-            accountLocks,subscriptions,bills,readPreparation,observations,methodFacts(methods),trials,time,Clock.systemUTC(),bindings,authority,digest);
+            accountLocks,subscriptions,bills,readPreparation,observations,methodFacts(methods),trials,time,Clock.systemUTC(),bindings,serviceAuthority,digest);
     }
     private final ExactTime time=new ExactTime();
     private class ExactTime implements SubscriptionBillingTimePort {
@@ -1199,7 +1202,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             OwnedFailedRenewalMethod.Recovery recovery) {
         @Override public String toString(){return "RecoveryPrepared[redacted]";}
     }
-    /** Real original browser HTTP issuance/selection/consumption precedes all independent downstream writers. */
+    /** Genuine SETUP/unbound proof/ACK, browser HTTP permission, binding, METHOD, lifecycle and observer. */
     private RecoveryPrepared recoveryPrepared(boolean legacy,int sessionSeconds) throws Exception {
         var pending=pendingMethod(true,sessionSeconds);controllerBrowserPermission(pending,legacy);
         var prepared=preparedMethod(pending);int start=http.calls.size();methodGraph(prepared);
@@ -1218,6 +1221,65 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                 "stripe_billing_method_browser_selections","stripe_billing_method_browser_releases","stripe_billing_method_browser_consumptions",
                 "subscription_events","outbox_events"))state.put(table,rows(table));
         return state;
+    }
+    @ParameterizedTest @ValueSource(strings={"recovery","setup","session"})
+    void recoveryInspectionNeverLocksAnExistingForeignCallerLocator(String locator) throws Exception {
+        var p=recoveryPrepared(false,0);var pending=p.pending();var r=pending.reservation();
+        var original=((SubscriptionActor.Customer)pending.context().actor()).session();
+        var suppliedReservation=r;var suppliedRecovery=p.recovery();var suppliedContext=pending.context();UUID foreignOperation=null;
+        if(locator.equals("session")){
+            var foreignCustomer=new CustomerId(UUID.randomUUID());
+            customerStore.save(dev.genericpayments.platform.customers.domain.Customer.create(foreignCustomer,site,null,null,Instant.now()));
+            TestClock.set(Instant.now());var issued=sessions.issue(site,foreignCustomer,original.origin());
+            var realForeign=sessions.resolveRequired(issued.rawToken(),original.origin());
+            assertThat(realForeign.customerId()).isEqualTo(foreignCustomer);
+            var forged=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(realForeign.sessionId(),original.siteId(),original.customerId(),original.origin(),original.scopes(),original.expiresAt());
+            suppliedContext=new SubscriptionCommandContext(new SubscriptionActor.Customer(forged),site,customer,original.origin(),pending.context().idempotencyKey(),"foreign-existing-session");
+        }else{
+            // Inert unrelated subscription and RESERVED operation only; no successful proof/ACK/completion is seeded.
+            var foreignCustomer=new CustomerId(UUID.randomUUID());
+            customerStore.save(dev.genericpayments.platform.customers.domain.Customer.create(foreignCustomer,site,null,null,Instant.now()));
+            var foreignSubscription=UUID.randomUUID();foreignOperation=UUID.randomUUID();
+            jdbc.update("""
+                insert into subscriptions(id,site_id,customer_id,product_id,payment_account_id,currency,billing_price_id,
+                  billing_price_key,billing_price_version,billing_amount_minor,billing_interval,billing_trial_days,
+                  billing_trial_policy,billing_tax_mode,billing_status,created_at,updated_at)
+                select ?,site_id,?,product_id,payment_account_id,currency,billing_price_id,
+                  billing_price_key,billing_price_version,billing_amount_minor,billing_interval,billing_trial_days,
+                  billing_trial_policy,billing_tax_mode,'INCOMPLETE',clock_timestamp(),clock_timestamp()
+                from subscriptions where id=?
+                """,foreignSubscription,foreignCustomer.value(),current().id());
+            var at=Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+            var candidate=new SubscriptionOperation(foreignOperation,site,foreignCustomer,foreignSubscription,SubscriptionOperation.Kind.RECOVER,SubscriptionOperation.Status.RESERVED,
+                "inert-foreign","inert-foreign","inert-foreign","inert-foreign:"+foreignOperation,0,1,null,null,at,at,0);
+            assertThat(transaction.requiresNew(()->lifecycleOperations.claim(candidate)).operation()).isEqualTo(candidate);
+            assertThat(lifecycleOperations.find(site,foreignSubscription,candidate.id())).contains(candidate);
+            if(locator.equals("setup"))suppliedReservation=new OwnedFailedRenewalMethod.Reservation(r.id(),r.admission(),r.failure(),candidate.id(),r.requestFingerprint(),r.initialOperationVersion(),r.binding(),r.billingSample(),r.reservedAt());
+            else{
+                var a=p.recovery().association();
+                suppliedRecovery=new OwnedFailedRenewalMethod.Recovery(r.id(),new Recovery(a.admissionId(),candidate.id(),a.billId(),a.allocation(),a.paymentIntent(),a.expectedRevision(),a.operationVersion(),a.associatedAt()),p.recovery().observationSequence());
+            }
+        }
+        var locks=new ArrayList<UUID>();var authorityTargets=new ArrayList<SubscriptionCommandContext>();
+        var trackedOperations=(SubscriptionOperationStore)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{SubscriptionOperationStore.class},(proxy,method,args)->{
+            if(method.getName().equals("lock"))locks.add((UUID)args[0]);
+            try{return method.invoke(lifecycleOperations,args);}catch(InvocationTargetException failure){throw failure.getCause();}
+        });
+        var trackedAuthority=(SubscriptionAuthorityPort)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{SubscriptionAuthorityPort.class},(proxy,method,args)->{
+            if(method.getName().equals("revalidate"))authorityTargets.add((SubscriptionCommandContext)args[0]);
+            try{return method.invoke(authority,args);}catch(InvocationTargetException failure){throw failure.getCause();}
+        });
+        var service=methodService(browserStore(),trackedOperations,transaction,trackedAuthority);
+        var reservation=suppliedReservation;var recovery=suppliedRecovery;var context=suppliedContext;
+        var before=financialState();var receipts=recoveryPreparationRows();int calls=http.calls.size();
+        assertThatThrownBy(()->service.inspectBrowserRecoveryPreparation(reservation,p.completion(),recovery,context)).isInstanceOf(IllegalStateException.class);
+        if(foreignOperation!=null)assertThat(locks).doesNotContain(foreignOperation);
+        if(!locator.equals("recovery")){assertThat(locks).isEmpty();assertThat(authorityTargets).isEmpty();}
+        for(int i=0;i<2;i++){
+            locks.clear();var actual=service.inspectBrowserRecoveryPreparation(r,p.completion(),p.recovery(),pending.context());
+            assertThat(actual.recovery()).isEqualTo(p.recovery());assertThat(locks).isSorted().contains(p.recovery().association().operationId());
+        }
+        assertThat(financialState()).isEqualTo(before);assertThat(recoveryPreparationRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
     }
     @ParameterizedTest @ValueSource(booleans={false,true})
     void originalBrowserRecoveryPreparationDescribesTheSameReservedDebtWithoutAnyWriteOrSdkCall(boolean legacy) throws Exception {

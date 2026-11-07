@@ -17,6 +17,7 @@ class OwnedFailedRenewalMethodStoreTransactionTest {
             ()->s.requireCompletionInTransaction(null,null),()->s.associateRecoveryInTransaction(null,null,null,null),
             ()->s.requireRecoveryInTransaction(null,null),()->s.requireRecoveredContextInTransaction(null,null),
             ()->s.requireBrowserRecoveryEnrollmentInTransaction(null,null,null),
+            ()->s.requireBrowserRecoveryIdentityInTransaction(null,null),
             ()->s.recordPublicationInTransaction(null,null,null),()->s.publicationInTransaction(null),
             ()->s.requireMethodFactInTransaction(null,null,null,null,null),()->s.requireRecoveryFactInTransaction(null,null,null,null,null));
         for(var call:calls)assertThatThrownBy(call::run).isInstanceOf(IllegalStateException.class)

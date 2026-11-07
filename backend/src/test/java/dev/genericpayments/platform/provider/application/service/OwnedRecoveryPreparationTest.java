@@ -17,11 +17,49 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Actual lifecycle/fact publication, handwritten caller transactions and inert external ports only. */
 class OwnedRecoveryPreparationTest {
+    // Foreign rows exist, but neither caller receipt nor forged reservation may choose a lock target.
+    @Test void existingForeignRecoveryCannotReachAnOperationLock(){
+        var h=completed(true);var foreign=foreignOperation(h);var r=h.recovery;var a=r.association();
+        var forged=new Recovery(r.reservationId(),new OwnedFailedRenewal.Recovery(a.admissionId(),foreign.id(),a.billId(),a.allocation(),a.paymentIntent(),a.expectedRevision(),a.operationVersion(),a.associatedAt()),r.observationSequence());
+        h.b.operationLockTargets.clear();h.authorityTargets.clear();denied(h,h.context,h.completion,forged,"existing foreign RECOVER");
+        assertThat(h.b.operationLockTargets).doesNotContain(foreign.id());
+        assertThat(inspect(h,h.context).recovery()).isEqualTo(h.recovery);
+    }
+    @Test void forgedReservationCannotReachItsExistingForeignSetupLocator(){
+        var h=completed(true);var foreign=foreignOperation(h);var r=h.reservation;
+        var forged=new Reservation(r.id(),r.admission(),r.failure(),foreign.id(),r.requestFingerprint(),r.initialOperationVersion(),r.binding(),r.billingSample(),r.reservedAt());
+        var before=state(h);h.b.trace.clear();h.b.operationLockTargets.clear();h.authorityTargets.clear();
+        assertThatThrownBy(()->h.service.inspectBrowserRecoveryPreparation(forged,h.completion,h.recovery,h.context)).isInstanceOf(RuntimeException.class);
+        assertThat(h.b.operationLockTargets).isEmpty();assertThat(h.authorityTargets).isEmpty();assertThat(state(h)).isEqualTo(before);noEffects(h);
+        assertThat(inspect(h,h.context).reservation()).isEqualTo(r);
+    }
+    @Test void foreignOwnerContextRefusesBeforeAnyTransactionOrOperationOrAuthorityLock(){
+        var h=completed(true);var s=session(h);
+        var foreign=new CustomerSessionContext(s.sessionId(),new dev.genericpayments.platform.sites.domain.SiteId(UUID.randomUUID()),new CustomerId(UUID.randomUUID()),s.origin(),s.scopes(),s.expiresAt());
+        var context=new SubscriptionCommandContext(new SubscriptionActor.Customer(foreign),foreign.siteId(),foreign.customerId(),foreign.origin(),h.context.idempotencyKey(),"foreign-owner");
+        h.b.operationLockTargets.clear();h.authorityTargets.clear();denied(h,context,h.completion,h.recovery,"foreign owner");
+        assertThat(h.b.trace).doesNotContain("begin");assertThat(h.b.operationLockTargets).isEmpty();assertThat(h.authorityTargets).isEmpty();
+        assertThat(inspect(h,h.context).reservation()).isEqualTo(h.reservation);
+    }
+    @Test void originalOwnerCarryingAnotherExistingSessionIdRefusesBeforeAnyAuthorityTarget(){
+        var h=completed(true);var foreign=new OwnedFailedRenewalMethodServiceTest.Harness(true);var s=session(h);
+        h.secondLiveSession=session(foreign); // A real fixture session, with no authority from this reservation.
+        var forged=new CustomerSessionContext(h.secondLiveSession.sessionId(),s.siteId(),s.customerId(),s.origin(),s.scopes(),s.expiresAt());
+        var context=new SubscriptionCommandContext(new SubscriptionActor.Customer(forged),s.siteId(),s.customerId(),s.origin(),h.context.idempotencyKey(),"foreign-session");
+        h.b.operationLockTargets.clear();h.authorityTargets.clear();denied(h,context,h.completion,h.recovery,"foreign session ID");
+        assertThat(h.authorityTargets).isEmpty();assertThat(h.b.operationLockTargets).isEmpty();
+        assertThat(inspect(h,h.context).enrollment()).isEqualTo(h.enrollment);
+    }
+    private static SubscriptionOperation foreignOperation(OwnedFailedRenewalMethodServiceTest.Harness h){
+        var o=h.b.ops.get(h.recovery.association().operationId());
+        var foreign=new SubscriptionOperation(UUID.randomUUID(),new dev.genericpayments.platform.sites.domain.SiteId(UUID.randomUUID()),new CustomerId(UUID.randomUUID()),UUID.randomUUID(),o.kind(),o.status(),o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),o.providerReference(),o.safeFailureCode(),o.createdAt(),o.updatedAt(),o.version());
+        h.b.ops.put(foreign.id(),foreign);return foreign;
+    }
     // Catches using the old SETUP/debt-delta-0 guard, mutation, claims, stops or cached authority.
     @Test void completedOriginalBrowserFlowReturnsExactDescriptionTwiceWithoutAnyWrites(){
         var h=completed(true);var before=state(h);
         for(int i=0;i<2;i++){
-            h.b.trace.clear();var c=inspect(h,h.context);
+            h.b.trace.clear();h.b.operationLockTargets.clear();var c=inspect(h,h.context);
             assertThat(c.reservation()).isEqualTo(h.reservation);assertThat(c.enrollment()).isEqualTo(h.enrollment);
             assertThat(c.account()).isEqualTo(h.b.account);assertThat(c.subscription()).isEqualTo(h.b.s);
             assertThat(c.setupOperation()).isEqualTo(h.b.ops.get(h.reservation.setupOperationId()));
@@ -32,6 +70,8 @@ class OwnedRecoveryPreparationTest {
             assertThat(c.recovery()).isEqualTo(h.recovery);assertThat(c.billingSample()).isEqualTo(h.reservation.billingSample());
             assertThat(state(h)).isEqualTo(before);assertThat(h.b.trace.stream().filter("begin"::equals)).hasSize(1);
             assertThat(h.b.trace).containsSubsequence("begin","operations","authority","lifecycle","account","subscription","bill","recovery-enrollment","authority","commit");
+            assertThat(h.b.trace).containsSubsequence("begin","recovery-identity","operations","authority");
+            assertThat(h.b.operationLockTargets).isSorted().contains(h.recovery.association().operationId());
             noEffects(h);
         }
         assertThat(h.b.sequence).isEqualTo(h.reservation.failure().observationSequence()+1);
@@ -122,6 +162,21 @@ class OwnedRecoveryPreparationTest {
         var h=completed(true);
         var store=(OwnedFailedRenewalMethodStore)Proxy.newProxyInstance(OwnedFailedRenewalMethodStore.class.getClassLoader(),new Class<?>[]{OwnedFailedRenewalMethodStore.class},(proxy,method,args)->{if(!method.isDefault())throw new AssertionError("Unexpected abstract method");return InvocationHandler.invokeDefault(proxy,method,args);});
         assertThatThrownBy(()->store.requireBrowserRecoveryEnrollmentInTransaction(h.reservation,session(h),h.b.utc)).isInstanceOf(IllegalStateException.class);
+    }
+    @Test void storeRecoveryIdentityIndependentlyDefaultsToDenied(){
+        var h=completed(true);
+        var store=(OwnedFailedRenewalMethodStore)Proxy.newProxyInstance(OwnedFailedRenewalMethodStore.class.getClassLoader(),new Class<?>[]{OwnedFailedRenewalMethodStore.class},(proxy,method,args)->{if(!method.isDefault())throw new AssertionError("Unexpected abstract method");return InvocationHandler.invokeDefault(proxy,method,args);});
+        assertThatThrownBy(()->store.requireBrowserRecoveryIdentityInTransaction(h.reservation,session(h))).isInstanceOf(IllegalStateException.class);
+    }
+    @Test void immutableIdentityPreflightCannotReplaceFinalLiveEnrollmentOrExpiryChecks(){
+        for(var drift:List.of("session","origin","expiry","revoked","expired")){
+            var h=completed(true);var e=h.enrollment;
+            h.afterRecoveryIdentity=()->{
+                if(Set.of("session","origin","expiry").contains(drift))h.enrollment=new OwnedMethodBrowser.Enrollment(drift.equals("session")?UUID.randomUUID():e.sessionId(),drift.equals("origin")?"https://foreign.test":e.origin(),drift.equals("expiry")?e.sessionExpiresAt().plusNanos(1):e.sessionExpiresAt());
+                if(drift.equals("revoked"))h.liveSession=false;if(drift.equals("expired"))h.b.utc=e.sessionExpiresAt();
+            };
+            denied(h,h.context,h.completion,h.recovery,"after immutable preflight: "+drift);
+        }
     }
     private static OwnedFailedRenewalMethodServiceTest.Harness completed(boolean browser){
         var h=new OwnedFailedRenewalMethodServiceTest.Harness(true,"alias",OwnedFailedRenewalServiceTest.UTC.plusSeconds(600).plusNanos(123456789));
