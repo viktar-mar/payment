@@ -99,6 +99,22 @@ class StripeBillingOwnedFailedRenewalMethodAdapterTest {
         var f=new Fixture();f.on("reserve",()->f.g.drift("sequence"));refused(f::apply);
         assertThat(f.events).doesNotContain("claim","sdk","unknown");assertThat(f.g.stops()).isZero();
     }
+    @Test void originalExpiryDuringInitialStepLookupRefusesBeforeAnyMethodReservation() {
+        var f=new Fixture();f.g.at(f.expiry().minusMillis(500));var entry=f.g.now();
+        f.on("find",()->f.g.at(f.expiry()));refused(f::apply);
+        // The 500ms wait remains inside the immutable 30s invocation; session authentication
+        // must refuse before reserve rather than relying on the unrelated invocation timeout.
+        assertThat(Duration.between(entry,f.g.now())).isEqualTo(Duration.ofMillis(500));
+        assertThat(f.step).isNull();assertThat(f.events).doesNotContain("reserve","claim","sdk","unknown");
+        assertThat(f.sdk.http.calls).isEmpty();assertThat(f.g.stops()).isZero();f.unchanged();
+    }
+    @Test void originalAuthorityOrFullContextDriftDuringInitialLookupRefusesBeforeAnyMethodReservation() {
+        for(var bad:List.of("session","authority","proof","setup","consumption","sequence","sample","binding","operation")){
+            var f=new Fixture();f.on("find",()->f.drift(bad));refused(f::apply);
+            assertThat(f.step).as(bad).isNull();assertThat(f.events).doesNotContain("reserve","claim","sdk","unknown");
+            assertThat(f.sdk.http.calls).isEmpty();assertThat(f.g.stops()).isZero();
+        }
+    }
     @Test void fullFreshContextDetectsAuthorityAndIndependentProofDriftAfterClaim() {
         for(var boundary:List.of("claim","dispatch","client","response"))for(var bad:List.of("authority","session","sequence","sample","binding","operation","proof","setup","consumption")){
             var f=new Fixture();f.reply();f.on(boundary,()->f.drift(bad));refused(f::apply);
@@ -211,10 +227,34 @@ class StripeBillingOwnedFailedRenewalMethodAdapterTest {
 
     static void refused(Runnable action){assertThatThrownBy(action::run).isExactlyInstanceOf(PaymentApplicationException.class).hasMessage("Owned method application unavailable").hasNoCause().satisfies(failure->{var e=(PaymentApplicationException)failure;assertThat(e.code()).isEqualTo("OWNED_METHOD_APPLY_UNAVAILABLE");assertThat(e.status()).isEqualTo(409);assertThat(e.getSuppressed()).isEmpty();});}
     static ProviderOperation copy(ProviderOperation s,ProviderOperation.Status status,String reference,Instant first,Instant window,String owner,Instant lease,long version){return StripeBillingInertSdkFixture.copy(s,status,reference,first,window,owner,lease,version);}
-    static ProviderOperation identity(ProviderOperation s,String bad){return new ProviderOperation(bad.equals("id")?null:s.id(),bad.equals("account")?new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId(UUID.randomUUID()):s.accountId(),bad.equals("external")?"acct_foreign":s.externalAccountId(),bad.equals("credentials")?"foreign":s.credentialsRef(),bad.equals("kind")?ProviderOperation.Kind.SETUP_INTENT_CREATE:s.kind(),bad.equals("resource")?UUID.randomUUID():s.resourceId(),bad.equals("key")?"foreign:METHOD":s.operationKey(),bad.equals("fingerprint")?"foreign":s.fingerprint(),s.status(),s.providerReference(),s.firstDispatchedAt(),s.retryBefore(),s.leaseOwner(),s.leaseExpiresAt(),s.version());}
+    static ProviderOperation identity(ProviderOperation s,String bad){
+        return new ProviderOperation(
+            bad.equals("id")?null:s.id(),
+            bad.equals("account")?new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId(UUID.randomUUID()):s.accountId(),
+            bad.equals("external")?"acct_foreign":s.externalAccountId(),
+            bad.equals("credentials")?"foreign":s.credentialsRef(),
+            bad.equals("kind")?ProviderOperation.Kind.SETUP_INTENT_CREATE:s.kind(),
+            bad.equals("resource")?UUID.randomUUID():s.resourceId(),
+            bad.equals("key")?"foreign:METHOD":s.operationKey(),
+            bad.equals("fingerprint")?"foreign":s.fingerprint(),
+            s.status(),
+            s.providerReference(),
+            s.firstDispatchedAt(),
+            s.retryBefore(),
+            s.leaseOwner(),
+            s.leaseExpiresAt(),
+            s.version());
+    }
     static ProviderOperation malformed(ProviderOperation s,String bad){
         if(List.of("id","kind","account","external","credentials","resource","key","fingerprint").contains(bad))return identity(s,bad);
-        return copy(s,bad.equals("status")?ProviderOperation.Status.UNKNOWN:s.status(),bad.equals("reference")?"foreign":s.providerReference(),bad.equals("first")?(s.firstDispatchedAt()==null?Instant.EPOCH:s.firstDispatchedAt().plusNanos(1)):s.firstDispatchedAt(),bad.equals("window")?(s.retryBefore()==null?Instant.EPOCH:s.retryBefore().plusNanos(1)):s.retryBefore(),bad.equals("lease-owner")?"foreign":s.leaseOwner(),bad.equals("lease-expiry")?(s.leaseExpiresAt()==null?Instant.EPOCH:s.leaseExpiresAt().plusNanos(1)):s.leaseExpiresAt(),bad.equals("version")?s.version()+1:s.version());
+        return copy(s,
+            bad.equals("status")?ProviderOperation.Status.UNKNOWN:s.status(),
+            bad.equals("reference")?"foreign":s.providerReference(),
+            bad.equals("first")?(s.firstDispatchedAt()==null?Instant.EPOCH:s.firstDispatchedAt().plusNanos(1)):s.firstDispatchedAt(),
+            bad.equals("window")?(s.retryBefore()==null?Instant.EPOCH:s.retryBefore().plusNanos(1)):s.retryBefore(),
+            bad.equals("lease-owner")?"foreign":s.leaseOwner(),
+            bad.equals("lease-expiry")?(s.leaseExpiresAt()==null?Instant.EPOCH:s.leaseExpiresAt().plusNanos(1)):s.leaseExpiresAt(),
+            bad.equals("version")?s.version()+1:s.version());
     }
     @FunctionalInterface interface MemoryResponse {StripeResponse request(StripeRequest request)throws StripeException;}
     static final class Fixture {

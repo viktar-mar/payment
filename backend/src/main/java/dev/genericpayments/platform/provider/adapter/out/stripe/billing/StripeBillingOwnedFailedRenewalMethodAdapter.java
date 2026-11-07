@@ -45,7 +45,7 @@ public final class StripeBillingOwnedFailedRenewalMethodAdapter {
             String key=operation.providerOperationKey()+":METHOD",fingerprint=fingerprint(original);
             budget.remaining(null);
             if(steps.find(account.id(),key).isPresent())throw unavailable();
-            budget.remaining(null);
+            inspect(original,originalContext,budget,null);
             var reserved=steps.reserveOwnedFailedRenewalMethodStep(account,reservation,ProviderOperation.Kind.SUBSCRIPTION_UPDATE);
             requireIdentity(reserved,original,fingerprint);
             if(reserved.status()!=ProviderOperation.Status.RESERVED||reserved.version()!=0||reserved.providerReference()!=null

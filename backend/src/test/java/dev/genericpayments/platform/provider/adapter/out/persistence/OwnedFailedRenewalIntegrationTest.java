@@ -590,14 +590,19 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             else{
                 var wait=Duration.between(dbNow,session.expiresAt()).plusMillis(100);assertThat(wait).isPositive().isLessThan(Duration.ofSeconds(21));
                 try{Thread.sleep(wait);}catch(InterruptedException e){Thread.currentThread().interrupt();throw new AssertionError(e);}
-                assertThat(jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant()).isAfterOrEqualTo(session.expiresAt());
+                var afterExpiry=jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant();assertThat(afterExpiry).isAfterOrEqualTo(session.expiresAt());
                 assertThat(jdbc.queryForObject("select expires_at from customer_sessions where id=?",java.sql.Timestamp.class,session.sessionId().value()).toInstant()).isEqualTo(session.expiresAt());
+                // CustomerSessionService uses the injected authentication clock, independently
+                // of the real DBUTC used above. Advance it to that same proven expired instant.
+                TestClock.set(afterExpiry);
             }
             atAck.set(true);
         }},name->{});
         var producer=methodProducer(p,steps);var ack=producer.apply(p.reservation(),p.context());assertThat(atAck).isTrue();assertOriginalMethodRequest(bound,ack,start);
         assertThat(count("stripe_billing_failed_renewal_stops")).isZero();assertThat(lifecycleOperations.find(site,current().id(),bound.operation().id())).contains(bound.operation());assertThat(financialState()).isEqualTo(before);
-        assertThatThrownBy(()->p.service().recordMethodUpdateReply(p.reservation(),p.context())).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->p.service().recordMethodUpdateReply(p.reservation(),p.context()))
+            .isExactlyInstanceOf(PaymentApplicationException.class).hasMessage("Authentication failed").hasNoCause()
+            .satisfies(failure->{var e=(PaymentApplicationException)failure;assertThat(e.code()).isEqualTo("AUTHENTICATION_FAILED");assertThat(e.status()).isEqualTo(401);});
         assertThat(lifecycleOperations.find(site,current().id(),bound.operation().id())).contains(bound.operation());assertThat(operations.findById(ack.id())).contains(ack);
         methodUnavailable(()->producer.apply(p.reservation(),p.context()));assertThat(http.calls).hasSize(start+1);assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_failed_method_completions")).isZero();
     }
