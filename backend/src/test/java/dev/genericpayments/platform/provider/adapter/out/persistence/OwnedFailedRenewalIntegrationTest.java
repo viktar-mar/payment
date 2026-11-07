@@ -92,7 +92,10 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         return methodService(methods,lifecycleOperations);
     }
     private OwnedFailedRenewalMethodService methodService(OwnedFailedRenewalMethodStore methods,SubscriptionOperationStore operationStore){
-        return new OwnedFailedRenewalMethodService(methods,store(),transaction,operationStore,lifecycleLocks,
+        return methodService(methods,operationStore,transaction);
+    }
+    private OwnedFailedRenewalMethodService methodService(OwnedFailedRenewalMethodStore methods,SubscriptionOperationStore operationStore,SubscriptionTransactionPort serviceTransaction){
+        return new OwnedFailedRenewalMethodService(methods,store(),serviceTransaction,operationStore,lifecycleLocks,
             accountLocks,subscriptions,bills,readPreparation,observations,methodFacts(methods),trials,time,Clock.systemUTC(),bindings,authority,digest);
     }
     private final ExactTime time=new ExactTime();
@@ -601,7 +604,10 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         try(var workers=new BoundedWorkers()){
             var blocker=workers.submit(()->transaction.requiresNew(()->{
                 assertThat(jdbc.queryForList("select id from stripe_billing_method_browser_roots where reservation_id=? for update",UUID.class,p.reservation().id())).hasSize(1);
-                holder.set(jdbc.queryForObject("select pg_backend_pid()",Integer.class));locked.countDown();awaitRelease(release);return true;
+                holder.set(jdbc.queryForObject("select pg_backend_pid()",Integer.class));locked.countDown();
+                try{if(!release.await(30,TimeUnit.SECONDS))throw new AssertionError("binding expiry wait timed out");}
+                catch(InterruptedException e){Thread.currentThread().interrupt();throw new AssertionError(e);}
+                return true;
             }));
             try{
                 assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
@@ -686,18 +692,54 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     }
     @Test void bindingAdapterConcurrentFinalBindingCannotAdoptEvenAnIdenticalCommittedMethod() throws Exception {
         var p=committedBindingPending(0);var before=financialState();int start=http.calls.size();var expected=p.service().inspectBrowserBindingPreparation(p.reservation(),p.context());
-        var atCard=new CountDownLatch(1);var release=new CountDownLatch(1);var previous=http.afterResponse;
+        var afterCardInspection=new CountDownLatch(1);var release=new CountDownLatch(1);
+        var postCardInspected=new java.util.concurrent.atomic.AtomicBoolean();var winnerCommitted=new java.util.concurrent.atomic.AtomicBoolean();
+        var finalTransactionEntered=new java.util.concurrent.atomic.AtomicBoolean();var finalTransactionRefused=new java.util.concurrent.atomic.AtomicBoolean();
+        var committedWinner=new java.util.concurrent.atomic.AtomicReference<SubscriptionBillingProofStore.Setup>();
+        var losingTransaction=new SubscriptionTransactionPort(){
+            @Override public <T>T required(java.util.function.Supplier<T> work){return transaction.required(work);}
+            @Override public boolean active(){return transaction.active();}
+            @Override public <T>T requiresNew(java.util.function.Supplier<T> work){
+                if(postCardInspected.get())return transaction.requiresNew(()->{
+                    assertThat(transaction.active()).isTrue();assertThat(winnerCommitted).isTrue();
+                    assertThat(jdbc.queryForObject("select method_reference from stripe_subscription_setup_proofs where operation_id=? and payment_account_id=?",
+                        String.class,p.reservation().setupOperationId(),billing.id().value())).isEqualTo(committedWinner.get().method());
+                    assertThat(transaction.active()).isTrue();
+                    finalTransactionEntered.set(true);
+                    try{
+                        work.get();throw new AssertionError("losing final binding transaction unexpectedly succeeded");
+                    }catch(RuntimeException failure){
+                        assertThat(failure).isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable").hasNoCause();
+                        finalTransactionRefused.set(true);throw failure;
+                    }
+                });
+                var result=transaction.requiresNew(work);
+                // Both SDK GETs have returned before this real successful post-card inspection.
+                // Wait only after its transaction commits, with no caller transaction or locks held.
+                if(result instanceof OwnedFailedRenewalMethod.BindingPreparationContext && http.calls.size()==start+2){
+                    assertThat(result).isEqualTo(expected);assertOriginalBindingReads(start);assertThat(http.replies).isEmpty();
+                    assertThat(transaction.active()).isFalse();postCardInspected.set(true);afterCardInspection.countDown();
+                    awaitRelease(release);assertThat(transaction.active()).isFalse();assertThat(winnerCommitted).isTrue();
+                }
+                return result;
+            }
+        };
+        var loser=methodService(browserStore(),lifecycleOperations,losingTransaction);
         http.reply(setupBody(expected.original().operation(),p.setupStep(),"succeeded"));http.reply(methodBody());
-        http.afterResponse=new Runnable(){public void run(){if(previous!=null)previous.run();http.afterResponse=this;
-            if(http.calls.getLast().url().getPath().equals("/v1/payment_methods/pm_saved")){atCard.countDown();awaitRelease(release);}}};
         try(var workers=new BoundedWorkers()){
-            var attempt=workers.submit(()->{bindingUnavailable(()->bindingProducer(p.service()).bind(p.reservation(),p.context()));return true;});
+            var attempt=workers.submit(()->{bindingUnavailable(()->bindingProducer(loser).bind(p.reservation(),p.context()));return true;});
             try{
-                assertThat(atCard.await(5,TimeUnit.SECONDS)).isTrue();var winner=p.service().bindBrowserMethod(expected,p.context(),"pm_saved");release.countDown();
-                assertThat(attempt.get(10,TimeUnit.SECONDS)).isTrue();assertThat(methodBillingProofs.setup(billing.id(),winner.operation())).contains(winner);
+                assertThat(afterCardInspection.await(5,TimeUnit.SECONDS)).isTrue();assertThat(postCardInspected).isTrue();
+                var winner=p.service().bindBrowserMethod(expected,p.context(),"pm_saved");
+                assertThat(transaction.active()).isFalse();assertThat(winner.method()).isEqualTo("pm_saved");
+                assertThat(methodBillingProofs.setup(billing.id(),winner.operation())).contains(winner);
+                committedWinner.set(winner);winnerCommitted.set(true);release.countDown();
+                assertThat(attempt.get(10,TimeUnit.SECONDS)).isTrue();
+                assertThat(finalTransactionEntered).isTrue();assertThat(finalTransactionRefused).isTrue();
                 bindingUnavailable(()->bindingProducer(p.service()).bind(p.reservation(),p.context()));
+                assertThat(methodBillingProofs.setup(billing.id(),winner.operation())).contains(winner);
             }finally{release.countDown();}
-        }finally{http.afterResponse=previous;}
+        }
         assertOriginalBindingReads(start);assertBindingOnlyState(p,before,start+2);assertThat(http.replies).isEmpty();
     }
     @Test void genuineMethodWriterRequiresCommittedBrowserConsumptionAndIndependentBindingBeforeAnyPost(){
