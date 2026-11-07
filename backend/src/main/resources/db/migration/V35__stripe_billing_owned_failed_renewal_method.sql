@@ -72,6 +72,7 @@ create trigger aaa_method_branch before insert on stripe_billing_failed_method_r
 create trigger aaa_method_branch before insert on stripe_billing_failed_renewal_recoveries for each row execute function exclude_failed_method_branch();
 
 -- Current immutable lineage, deliberately independent of SETUP status/version.
+-- Bind SQL inputs positionally: joined advance.target is bigint and must never shadow the UUID input.
 create function owned_method_identity(target uuid) returns boolean language sql stable as $$
  select exists(select 1 from stripe_billing_failed_method_reservations r
  join stripe_billing_failed_renewals d on d.id=r.admission_id
@@ -81,7 +82,7 @@ create function owned_method_identity(target uuid) returns boolean language sql 
  join stripe_billing_first_renewal_steps advance on advance.id=ready.step_id
  join stripe_billing_customers b on b.id=r.binding_id
  join subscription_operations o on o.id=r.setup_operation
- where r.id=target
+ where r.id=$1
  and (to_jsonb(o)-array['status','provider_reference','safe_failure_code','updated_at','version'])
   =(r.operation_snapshot-array['status','provider_reference','safe_failure_code','updated_at','version'])
  and row(b.payment_account_id,b.site_id,b.customer_id,b.version,b.provider_reference,b.creation_operation_id)
@@ -96,13 +97,13 @@ create function owned_method_identity(target uuid) returns boolean language sql 
  and r.operation_snapshot->>'provider_reference' is null and r.operation_snapshot->>'safe_failure_code' is null)
 $$;
 create function owned_method_lineage(target uuid) returns boolean language sql stable as $$
- select exists(select 1 from stripe_billing_failed_method_reservations r where r.id=target
+ select exists(select 1 from stripe_billing_failed_method_reservations r where r.id=$1
  and owned_method_identity(r.id) and owned_failed_renewal_authority(r.admission_id)
  and not exists(select 1 from stripe_billing_failed_renewal_recoveries where admission_id=r.admission_id))
 $$;
 create function owned_method_initial_operation(target uuid) returns boolean language sql stable as $$
  select exists(select 1 from stripe_billing_failed_method_reservations r join subscription_operations o on o.id=r.setup_operation
- where r.id=target and to_jsonb(o)=r.operation_snapshot)
+ where r.id=$1 and to_jsonb(o)=r.operation_snapshot)
 $$;
 
 -- Exact unchanged debt, at either the original failure or the one method successor sequence.
@@ -115,8 +116,8 @@ create function owned_method_debt(target uuid, successor integer, allowed uuid) 
  join subscriptions s on s.id=d.subscription_id
  join subscription_billing_records b on b.id=f.renewal_bill
  join subscription_billing_records initial on initial.id=a.initial_bill
- where r.id=target and successor in (0,1) and owned_method_lineage(r.id)
- and s.revision=f.projected_revision and s.observation_sequence=f.observation_sequence+successor
+ where r.id=$1 and $2 in (0,1) and owned_method_lineage(r.id)
+ and s.revision=f.projected_revision and s.observation_sequence=f.observation_sequence+$2
  and s.billing_status='PAST_DUE' and s.debt_billing_record_id=f.renewal_bill
  and row(s.current_period_start,s.current_period_end,s.debt_period_start,s.debt_period_end,s.paid_through,s.grace_deadline)
   =row(f.period_start,f.period_end,f.period_start,f.period_end,f.period_start,f.grace_deadline)
@@ -129,7 +130,7 @@ create function owned_method_debt(target uuid, successor integer, allowed uuid) 
  and (select count(*) from subscription_billing_records where subscription_id=s.id)=2
  and (select count(*) from payments where subscription_id=s.id)=1
  and not exists(select 1 from payments where billing_record_id=b.id)
- and not exists(select 1 from subscription_operations other where other.subscription_id=s.id and other.id is distinct from allowed
+ and not exists(select 1 from subscription_operations other where other.subscription_id=s.id and other.id is distinct from $3
   and other.kind not in ('PORTAL','RECONCILE') and other.status in ('RESERVED','PROCESSING','REQUIRES_ACTION','UNKNOWN'))
  and exists(select 1 from subscription_events e where e.subscription_id=s.id and e.billing_record_id=b.id and e.event_type='RENEWAL_FAILED' and e.revision=f.projected_revision))
 $$;
@@ -138,10 +139,10 @@ $$;
 create function owned_method_stripe_hash(variadic fields text[]) returns text language sql immutable as $$
  select encode(sha256(convert_to(string_agg(case when value is null then '-1:' else
   (length(value)+(select count(*) from regexp_split_to_table(value,'') ch where ascii(ch)>65535))::text||':'||value end,'' order by position),'UTF8')),'hex')
- from unnest(fields) with ordinality as f(value,position)
+ from unnest($1) with ordinality as f(value,position)
 $$;
 create function owned_method_step_fingerprint(target uuid, method_step boolean) returns text language sql stable as $$
- select case when method_step then owned_method_stripe_hash(d.payment_account_id::text,c.external_account_id,c.credentials_ref,'STRIPE','SANDBOX',
+ select case when $2 then owned_method_stripe_hash(d.payment_account_id::text,c.external_account_id,c.credentials_ref,'STRIPE','SANDBOX',
  'SUBSCRIPTION_METHOD_V1',o.id::text,o.provider_operation_key||':METHOD',o.fingerprint,initial.reference,r.binding_reference,p.step_id::text,p.setup_reference,p.method_reference,'consent:true')
  else owned_method_stripe_hash(d.payment_account_id::text,c.external_account_id,c.credentials_ref,'STRIPE','SANDBOX',
  'SETUP_INTENT_CREATE_V1',o.id::text,o.provider_operation_key||':SETUP',o.fingerprint,o.policy_version::text,d.subscription_id::text,d.site_id::text,d.customer_id::text,r.binding_reference,'off_session','card','consent:true') end
@@ -151,7 +152,7 @@ create function owned_method_step_fingerprint(target uuid, method_step boolean) 
  join stripe_billing_clock_intents c on c.id=i.clock_intent
  join stripe_billing_owned_subscription_receipts initial on initial.intent_id=i.id
  join subscription_operations o on o.id=r.setup_operation
- left join stripe_subscription_setup_proofs p on p.operation_id=o.id where r.id=target
+ left join stripe_subscription_setup_proofs p on p.operation_id=o.id where r.id=$1
 $$;
 create function owned_method_steps(target uuid) returns boolean language sql stable as $$
  select exists(select 1 from stripe_billing_failed_method_reservations r
@@ -162,7 +163,7 @@ create function owned_method_steps(target uuid) returns boolean language sql sta
  join subscriptions s on s.id=d.subscription_id
  join provider_operations setup on setup.id=p.step_id
  join provider_operations method on method.payment_account_id=a.id and method.resource_id=o.id and method.kind='SUBSCRIPTION_UPDATE'
- where r.id=target and row(p.site_id,p.customer_id,p.subscription_id,p.payment_account_id,p.operation_kind)=row(d.site_id,d.customer_id,d.subscription_id,d.payment_account_id,'SETUP'::varchar)
+ where r.id=$1 and row(p.site_id,p.customer_id,p.subscription_id,p.payment_account_id,p.operation_kind)=row(d.site_id,d.customer_id,d.subscription_id,d.payment_account_id,'SETUP'::varchar)
  and p.method_reference ~ '^pm_[A-Za-z0-9]{1,252}$'
  and row(setup.payment_account_id,setup.resource_id,setup.kind,setup.status,setup.provider_reference,setup.operation_key,setup.fingerprint)
   =row(a.id,o.id,'SETUP_INTENT_CREATE'::varchar,'ACKNOWLEDGED'::varchar,p.setup_reference,o.provider_operation_key||':SETUP',owned_method_step_fingerprint(r.id,false))
@@ -176,7 +177,7 @@ $$;
 create function owned_method_pre(target uuid) returns boolean language sql stable as $$
  select exists(select 1 from stripe_billing_failed_method_reservations r join subscription_operations o on o.id=r.setup_operation
  join stripe_billing_failed_renewals d on d.id=r.admission_id join subscriptions s on s.id=d.subscription_id
- where r.id=target and owned_method_debt(r.id,0,o.id) and owned_method_steps(r.id)
+ where r.id=$1 and owned_method_debt(r.id,0,o.id) and owned_method_steps(r.id)
  and o.status='PROCESSING' and o.version=r.initial_operation_version+1 and o.provider_reference=s.provider_reference and o.safe_failure_code is null
  and not exists(select 1 from stripe_billing_failed_method_completions where reservation_id=r.id))
 $$;
@@ -188,7 +189,7 @@ create function owned_method_completed(target uuid) returns boolean language sql
  join subscription_operations o on o.id=r.setup_operation
  join stripe_subscription_setup_proofs p on p.operation_id=o.id
  join provider_operations setup on setup.id=c.setup_step join provider_operations method on method.id=c.method_step
- where r.id=target and owned_method_steps(r.id) and o.status='SUCCEEDED' and o.safe_failure_code is null
+ where r.id=$1 and owned_method_steps(r.id) and o.status='SUCCEEDED' and o.safe_failure_code is null
  and o.version=q.selected_version+1 and c.setup_final_version=o.version and c.setup_operation=o.id
  and (to_jsonb(o)-array['status','updated_at','version'])=(q.operation_snapshot-array['status','updated_at','version'])
  and to_jsonb(setup)=q.setup_step_snapshot and to_jsonb(method)=q.method_step_snapshot
@@ -203,7 +204,7 @@ create function owned_method_recovery_pre(target uuid) returns boolean language 
  join stripe_billing_failed_method_reservations r on r.id=x.reservation_id
  join stripe_billing_failed_renewal_failures f on f.admission_id=r.admission_id
  join subscription_operations o on o.id=x.operation_id
- where r.id=target and owned_method_completed(r.id) and owned_method_debt(r.id,1,o.id)
+ where r.id=$1 and owned_method_completed(r.id) and owned_method_debt(r.id,1,o.id)
  and owned_failed_renewal_association(r.admission_id,o.id)
  and o.status='RESERVED' and o.version=x.operation_version and x.observation_sequence=f.observation_sequence+1)
 $$;
@@ -295,7 +296,7 @@ create function owned_method_projected(target uuid)
  join subscription_operations o on o.id=x.operation_id join subscriptions s on s.id=d.subscription_id
  join subscription_billing_records b on b.id=f.renewal_bill join subscription_billing_records initial on initial.id=a.initial_bill
  join payments p on p.billing_record_id=b.id
- where r.id=target and owned_method_lineage(r.id) and owned_method_completed(r.id) and owned_failed_renewal_association(d.id,o.id)
+ where r.id=$1 and owned_method_lineage(r.id) and owned_method_completed(r.id) and owned_failed_renewal_association(d.id,o.id)
  and o.status='SUCCEEDED' and o.version=x.operation_version+1 and o.provider_reference=s.provider_reference and o.safe_failure_code is null
  and (to_jsonb(o)-array['status','provider_reference','updated_at','version'])=(q.operation_snapshot-array['status','provider_reference','updated_at','version'])
  and s.billing_status='ACTIVE' and s.debt_billing_record_id is null and s.debt_period_start is null and s.debt_period_end is null and s.grace_deadline is null

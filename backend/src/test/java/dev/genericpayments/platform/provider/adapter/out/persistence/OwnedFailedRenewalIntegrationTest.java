@@ -591,6 +591,28 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             r.requestFingerprint(),r.initialOperationVersion(),r.binding(),r.billingSample(),r.reservedAt());
         assertThatThrownBy(()->transaction.required(()->method.requireReservationInTransaction(forged))).isInstanceOf(RuntimeException.class);
     }
+    @Test void methodSqlArgumentsAuthenticateTheRequestedReservationAndExactDebtPhase() {
+        var s=setup();fail(s,service(store(),null));
+        var r=methodService(new JdbcOwnedFailedRenewalMethodStore(jdbc)).reserveMethod(s.admission(),managementContext("sql-method-binding"),true);
+        var before=financialState();var receipts=authorityRows();
+        // The genuine reservation joins READY2's bigint advance.target; its UUID argument must remain independent.
+        assertThat(jdbc.queryForObject("select owned_method_identity(?)",Boolean.class,r.id())).isTrue();
+        assertThat(jdbc.queryForObject("select owned_method_lineage(?)",Boolean.class,r.id())).isTrue();
+        assertThat(jdbc.queryForObject("select owned_method_initial_operation(?)",Boolean.class,r.id())).isTrue();
+        assertThat(jdbc.queryForObject("select owned_method_debt(?,0,?)",Boolean.class,r.id(),r.setupOperationId())).isTrue();
+        for(var wrongId:List.of(UUID.randomUUID(),r.admission().id(),r.setupOperationId())) {
+            assertThat(jdbc.queryForObject("select owned_method_identity(?)",Boolean.class,wrongId)).isFalse();
+            assertThat(jdbc.queryForObject("select owned_method_lineage(?)",Boolean.class,wrongId)).isFalse();
+            assertThat(jdbc.queryForObject("select owned_method_initial_operation(?)",Boolean.class,wrongId)).isFalse();
+            assertThat(jdbc.queryForObject("select owned_method_debt(?,0,?)",Boolean.class,wrongId,r.setupOperationId())).isFalse();
+            assertThat(jdbc.queryForObject("select owned_method_step_fingerprint(?,false)",String.class,wrongId)).isNull();
+        }
+        assertThat(jdbc.queryForObject("select owned_method_debt(?,0,null)",Boolean.class,r.id())).isFalse();
+        for(int successor:new int[]{-1,1,2})assertThat(jdbc.queryForObject("select owned_method_debt(?,?,?)",Boolean.class,r.id(),successor,r.setupOperationId())).isFalse();
+        assertThat(jdbc.queryForObject("select owned_method_step_fingerprint(?,false)",String.class,r.id())).matches("[a-f0-9]{64}");
+        assertThat(transaction.required(()->new JdbcOwnedFailedRenewalMethodStore(jdbc).requireReservationInTransaction(r))).isEqualTo(r);
+        assertThat(financialState()).isEqualTo(before);assertThat(authorityRows()).isEqualTo(receipts);
+    }
     @Test void ordinarySetupAndMethodReservationsRemainClosedForOwnedResources() {
         var s=setup();var failure=fail(s,service(store(),null));var r=reserveMethod(s,failure);
         for(var kind:List.of(dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SETUP_INTENT_CREATE,
