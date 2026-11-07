@@ -157,7 +157,7 @@ class OwnedFailedRenewalMethodServiceTest {
         boolean providerEvidence,browserConsumed,boundSetupDenied,enforceSessionExpiry;BoundSetup returnedBoundSetup;Runnable afterBoundSetup=()->{},requireBoundEvidence=()->{};
         // Binding-only controls are opt-in; older bound/METHOD fixtures keep their original behavior.
         boolean bindingEnabled,browserConsumptionUncommitted,unboundSetupDenied,competingBind;
-        BoundSetup returnedUnboundSetup;Runnable afterUnboundSetup=()->{},beforeBindingWrite=()->{},afterBindingWrite=()->{};
+        BoundSetup returnedUnboundSetup;Runnable afterUnboundSetup=()->{},beforeBindingWrite=()->{},afterBindingWrite=()->{},afterBindingCommit=()->{};
         final Map<String,ProviderOperation> providerSteps=new LinkedHashMap<>();
         Harness(){this(false);}
         Harness(boolean customerActor){this(customerActor,"alias");}
@@ -169,7 +169,13 @@ class OwnedFailedRenewalMethodServiceTest {
             b.fail();b.trace.clear();
             SubscriptionActor actor=customerActor?new SubscriptionActor.Customer(new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(new dev.genericpayments.platform.customers.domain.CustomerSessionId(UUID.randomUUID()),b.owner.site(),b.owner.customer(),"https://test.example",Set.of(dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_MANAGE),sessionExpiry)):new SubscriptionActor.Admin(new dev.genericpayments.platform.admin.application.port.in.AuthenticatedAdmin(new dev.genericpayments.platform.admin.domain.AdminUserId(UUID.randomUUID()),"admin",new dev.genericpayments.platform.admin.domain.AdminSessionId(UUID.randomUUID()),UTC.plusSeconds(600)));
             context=new SubscriptionCommandContext(actor,b.owner.site(),b.owner.customer(),"https://test.example","setup-key","test");
-            var tx=new SubscriptionTransactionPort(){public boolean active(){return b.active;}public <T>T required(Supplier<T> work){return requiresNew(work);}public <T>T requiresNew(Supplier<T> work){var oldR=reservation;var oldE=enrollment;var oldC=completion;var oldX=recovery;var oldP=publication;var oldClaims=new HashMap<>(claims);var oldSetup=b.methodSetup;try{return b.transactionPort.requiresNew(work);}catch(RuntimeException e){reservation=oldR;enrollment=oldE;completion=oldC;recovery=oldX;publication=oldP;claims=oldClaims;if(bindingEnabled)b.methodSetup=oldSetup;throw e;}}};
+            var tx=new SubscriptionTransactionPort(){public boolean active(){return b.active;}public <T>T required(Supplier<T> work){return requiresNew(work);}public <T>T requiresNew(Supplier<T> work){
+                var oldR=reservation;var oldE=enrollment;var oldC=completion;var oldX=recovery;var oldP=publication;var oldClaims=new HashMap<>(claims);var oldSetup=b.methodSetup;T result;
+                try{result=b.transactionPort.requiresNew(work);}catch(RuntimeException e){reservation=oldR;enrollment=oldE;completion=oldC;recovery=oldX;publication=oldP;claims=oldClaims;if(bindingEnabled)b.methodSetup=oldSetup;throw e;}
+                // Opt-in adapter boundary: real inert transaction has completed and cannot roll back.
+                if(bindingEnabled&&oldSetup!=null&&oldSetup.method()==null&&b.methodSetup!=null&&b.methodSetup.method()!=null)afterBindingCommit.run();
+                return result;
+            }};
             var store=port(OwnedFailedRenewalMethodStore.class,(m,a)->{assertThat(b.active).isTrue();return switch(m){
                 case "reserveInTransaction","reserveBrowserInTransaction"->{b.trace.add("reservation");if(reservation!=null)throw new IllegalStateException("duplicate");var o=(SubscriptionOperation)a[2];reservation=new Reservation(UUID.randomUUID(),b.admission,b.failure,o.id(),o.fingerprint(),0,b.binding,(SubscriptionBillingTimePort.Sample)a[4],(Instant)a[5]);if(m.equals("reserveBrowserInTransaction")){enrollment=(OwnedMethodBrowser.Enrollment)a[6];if(failReceipt)throw new IllegalStateException("enrollment failed");}yield reservation;}
                 case "requireBrowserPendingInTransaction"->{same((Reservation)a[0]);var s=(dev.genericpayments.platform.customers.application.model.CustomerSessionContext)a[1];if(!acks||enrollment==null||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())||!enrollment.sessionExpiresAt().equals(s.expiresAt()))throw new IllegalStateException("browser unavailable");var o=b.ops.get(reservation.setupOperationId());yield new OwnedMethodBrowser.Pending(reservation,enrollment,b.account,b.s,o,b.binding,new SubscriptionBillingProofStore.Setup(o.id(),b.s.id(),b.account.id(),id(91),"seti_owned",null),step(o,false));}

@@ -66,7 +66,14 @@ public final class OwnedMethodSetupInertFixture {
     public void browserConsumed(boolean value){h.browserConsumed=value;}
     public void browserConsumptionUncommitted(boolean value){h.browserConsumptionUncommitted=value;}
     public void afterBindingWrite(Runnable action){h.afterBindingWrite=action;}
+    public void beforeBindingWrite(Runnable action){h.beforeBindingWrite=action;}
+    public void afterBindingCommit(Runnable action){h.afterBindingCommit=action;}
     public void afterUnboundSetup(Runnable action){h.afterUnboundSetup=action;}
+    public Map<String,ProviderOperation> providerSteps(){return new LinkedHashMap<>(h.providerSteps);}
+    public List<String> trace(){return List.copyOf(h.b.trace);}
+    public List<Object> bindingState(){return Arrays.asList(h.b.s,new LinkedHashMap<>(h.b.ops),new LinkedHashMap<>(h.b.records),
+        new LinkedHashSet<>(h.b.cash),new ArrayList<>(h.b.events),h.b.callbacks,h.b.sequence,h.b.effects,h.b.stopped,
+        h.reservation,h.enrollment,h.completion,h.recovery,h.publication,new HashMap<>(h.claims),new LinkedHashMap<>(h.providerSteps),h.b.methodSetup);}
     public void drift(String kind){switch(kind){
         case "session"->revoke();case "authority"->h.authorized=false;case "sequence"->h.b.sequence++;
         case "sample"->h.b.billingSecond++;case "mode"->h.b.isolated=false;
