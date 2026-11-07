@@ -4,10 +4,12 @@ on:
   push:
     paths:
       - 'backend/**'
+      - '.github/workflows/ci.yml'
       - '.github/workflows/owned-first-renewal-tests.yml'
   pull_request:
     paths:
       - 'backend/**'
+      - '.github/workflows/ci.yml'
       - '.github/workflows/owned-first-renewal-tests.yml'
 
 permissions:

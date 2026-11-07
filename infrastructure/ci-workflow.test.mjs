@@ -46,7 +46,7 @@ test('CI admits untrusted PRs with read-only credentials and bounded cancellable
   assert.deepEqual(Object.keys(blocks).sort(), ['backend', 'frontend', 'infrastructure']);
   for (const [job, block] of Object.entries(blocks)) {
     assert.match(block, /runs-on: ubuntu-24\.04/);
-    assert.match(block, new RegExp(`timeout-minutes: ${job === 'infrastructure' ? 30 : 45}\\b`));
+    assert.match(block, new RegExp(`timeout-minutes: ${{backend: 60, frontend: 45, infrastructure: 30}[job]}\\b`));
     assert.match(block, /persist-credentials: false/);
     assert.match(block, /node-version: ['"]24['"]/);
     assert.match(block, /working-directory: \./);
