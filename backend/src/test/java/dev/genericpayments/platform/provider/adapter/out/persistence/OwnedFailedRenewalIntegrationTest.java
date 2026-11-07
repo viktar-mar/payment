@@ -1222,6 +1222,77 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                 "subscription_events","outbox_events"))state.put(table,rows(table));
         return state;
     }
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void ordinaryInvoicePayReservationRefusesGenuinePreparedOwnedRecoveryWithoutChangingAnyReceipt(boolean legacy) throws Exception {
+        var p=recoveryPrepared(legacy,0);var context=inspectRecovery(p);var recover=context.recoveryOperation();
+        var before=financialState();var receipts=recoveryPreparationRows();int calls=http.calls.size();
+        assertThatThrownBy(()->operations.reserve(billing,ProviderOperation.Kind.INVOICE_PAY,recover.id(),
+            recover.providerOperationKey()+":INVOICE_PAY","negative-owned-pay-admission"))
+            .isInstanceOfSatisfying(PaymentApplicationException.class,e->assertThat(e.code()).isEqualTo("PROVIDER_OPERATION_CONFLICT"));
+        assertThat(inspectRecovery(p)).isEqualTo(context);
+        assertThat(financialState()).isEqualTo(before);assertThat(recoveryPreparationRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+        assertThat(jdbc.queryForObject("select count(*) from provider_operations where kind='INVOICE_PAY' and resource_id=?",Long.class,recover.id())).isZero();
+    }
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void ordinaryLikeRecoveryAuthorityCannotBypassDurableClockOwnership(boolean legacy) throws Exception {
+        var p=recoveryPrepared(legacy,0);var context=inspectRecovery(p);var recover=context.recoveryOperation();
+        var before=financialState();var receipts=recoveryPreparationRows();int calls=http.calls.size();
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            // Deliberate negative authority drift only, fully rolled back. The customer-style
+            // scope matches ordinary recovery but cannot remove durable clock ownership.
+            String ordinaryScope="customer:"+customer.value();
+            assertThat(jdbc.update("update subscription_operations set authority_scope=?,version=version+1,updated_at=clock_timestamp() where id=?",
+                ordinaryScope,recover.id())).isEqualTo(1);
+            assertThat(jdbc.queryForObject("select authority_scope from subscription_operations where id=?",String.class,recover.id())).isEqualTo(ordinaryScope);
+            var drifted=recoveryPreparationRows();var state=financialState();
+            var direct=new JdbcProviderOperationStore(jdbc);
+            assertThatThrownBy(()->direct.reserve(billing,ProviderOperation.Kind.INVOICE_PAY,recover.id(),
+                recover.providerOperationKey()+":INVOICE_PAY","negative-authority-drift-pay"))
+                .isInstanceOfSatisfying(PaymentApplicationException.class,e->assertThat(e.code()).isEqualTo("PROVIDER_OPERATION_CONFLICT"));
+            assertThat(financialState()).isEqualTo(state);assertThat(recoveryPreparationRows()).isEqualTo(drifted);assertThat(http.calls).hasSize(calls);
+            assertThat(jdbc.queryForObject("select count(*) from provider_operations where kind='INVOICE_PAY' and resource_id=?",Long.class,recover.id())).isZero();
+            throw new NegativeOwnedPayReceiptRollback();
+        })).isExactlyInstanceOf(NegativeOwnedPayReceiptRollback.class);
+        assertThat(inspectRecovery(p)).isEqualTo(context);
+        assertThat(financialState()).isEqualTo(before);assertThat(recoveryPreparationRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+    }
+    @ParameterizedTest @ValueSource(strings={"claim","acknowledge","bind"})
+    void ordinaryInvoicePayLegacyReceiptCannotMutateGenuinePreparedOwnedRecovery(String boundary) throws Exception {
+        var p=recoveryPrepared(false,0);var context=inspectRecovery(p);var recover=context.recoveryOperation();
+        var before=financialState();var receipts=recoveryPreparationRows();int calls=http.calls.size();
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            // Negative legacy input only. Seed just the provider receipt inside this rollback-only
+            // transaction; it is neither a dispatch nor positive provider/financial evidence.
+            var id=UUID.randomUUID();var first=Instant.now().minusSeconds(30).truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+            boolean reserved=boundary.equals("claim"),leased=boundary.equals("acknowledge");
+            jdbc.update("""
+                insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,
+                 operation_key,fingerprint,status,first_dispatched_at,retry_before,lease_owner,lease_expires_at,version)
+                values(?,?,?,?,'INVOICE_PAY',?,?,?,?,?,?,?,?,?)
+                """,id,billing.id().value(),billing.externalAccountId(),billing.credentialsRef(),recover.id(),
+                recover.providerOperationKey()+":INVOICE_PAY","negative-legacy-owned-pay",
+                reserved?"RESERVED":leased?"DISPATCHING":"UNKNOWN",
+                reserved?null:java.sql.Timestamp.from(first),reserved?null:java.sql.Timestamp.from(first.plus(Duration.ofHours(23))),
+                leased?"negative-legacy-owner":null,leased?java.sql.Timestamp.from(first.plusSeconds(60)):null,reserved?0L:1L);
+            // Direct store shares this transaction, so the seed cannot escape rollback or require
+            // a committed synthetic receipt just to exercise the genuine public boundary.
+            var direct=new JdbcProviderOperationStore(jdbc);var original=direct.findById(id).orElseThrow();
+            var seeded=recoveryPreparationRows();var state=financialState();
+            assertThatThrownBy(()->{
+                switch(boundary){
+                    case "claim"->direct.claim(id,"negative-first-claim",Instant.now(),Duration.ofSeconds(60));
+                    case "acknowledge"->direct.acknowledge(id,"negative-legacy-owner",original.version(),p.pending().failure().invoice());
+                    default->direct.bindRecovered(original,p.pending().failure().invoice(),original.fingerprint());
+                }
+            }).isInstanceOfSatisfying(PaymentApplicationException.class,e->assertThat(e.code()).isEqualTo("PROVIDER_OPERATION_CONFLICT"));
+            assertThat(direct.findById(id)).contains(original);
+            assertThat(financialState()).isEqualTo(state);assertThat(recoveryPreparationRows()).isEqualTo(seeded);assertThat(http.calls).hasSize(calls);
+            throw new NegativeOwnedPayReceiptRollback();
+        })).isExactlyInstanceOf(NegativeOwnedPayReceiptRollback.class);
+        assertThat(inspectRecovery(p)).isEqualTo(context);
+        assertThat(financialState()).isEqualTo(before);assertThat(recoveryPreparationRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+    }
+    private static final class NegativeOwnedPayReceiptRollback extends RuntimeException {}
     @ParameterizedTest @ValueSource(strings={"recovery","setup","session"})
     void recoveryInspectionNeverLocksAnExistingForeignCallerLocator(String locator) throws Exception {
         var p=recoveryPrepared(false,0);var pending=p.pending();var r=pending.reservation();

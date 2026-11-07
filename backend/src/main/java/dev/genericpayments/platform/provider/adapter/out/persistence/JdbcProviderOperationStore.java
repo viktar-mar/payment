@@ -427,7 +427,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
                 JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,i);return;
             }
         }
-        if(kind==Kind.SUBSCRIPTION_CREATE || kind==Kind.SETUP_INTENT_CREATE || kind==Kind.SUBSCRIPTION_UPDATE) {
+        if(kind==Kind.SUBSCRIPTION_CREATE || kind==Kind.SETUP_INTENT_CREATE || kind==Kind.SUBSCRIPTION_UPDATE || kind==Kind.INVOICE_PAY) {
             if(!jdbc.queryForList("""
                 select i.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id
                 join stripe_billing_clock_intents i on i.payment_account_id=s.payment_account_id and i.site_id=s.site_id and i.customer_id=s.customer_id

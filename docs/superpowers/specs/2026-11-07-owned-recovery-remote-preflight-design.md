@@ -4,7 +4,7 @@
 
 Continue Stage 5B after original management-authorized recovery preparation (8d01100). Before implementing a new financial producer, close the ordinary INVOICE_PAY admission gap and add the independent remote evidence check that producer will need. This delivers executable internal components, not a native acceptance claim or a financial dispatch permit. Full 5B remains NOT_ACCEPTED.
 
-The controller chooses this boundary: ordinary recovery only pays a never-attempted invoice without an allocation; the owned lane already has the original failed allocation/PaymentIntent and an immutable null-pay recovery proof. V34 excludes dispatched INVOICE_PAY and V27_4 forbids modifying the proof. Neither guard may be silently bypassed. Public official API references describe invoice.pay and PaymentIntent.confirm, but do not establish our pinned same-allocation runtime contract. No mutation is selected or implemented here.
+The controller chooses this boundary: ordinary recovery only pays a never-attempted invoice without an allocation; the owned lane already has the original failed allocation/PaymentIntent and an immutable null-pay recovery proof. V34 excludes dispatched INVOICE_PAY and V27_4 forbids modifying the proof. Neither guard may be silently bypassed. Public official API references describe [invoice.pay](https://docs.stripe.com/api/invoices/pay) and [PaymentIntent.confirm](https://docs.stripe.com/api/payment_intents/confirm), but do not establish our pinned same-allocation runtime contract. This is a limitation inferred from the documented contracts, not a claim that Stripe cannot preserve that identity. No mutation is selected or implemented here.
 
 ## Fixed constraints
 
