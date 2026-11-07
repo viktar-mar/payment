@@ -159,12 +159,31 @@ class StripeBillingOwnedFailedRenewalSetupAdapterTest {
             assertThat(f.g.stops()).isEqualTo(boundary.equals("reserve")?0:1);
         }
     }
-    @Test void monotonicBudgetCannotBeExtendedByUtcRollback() {
-        var f=new Fixture();f.on("claim",()->{f.nanos.set(TimeUnit.SECONDS.toNanos(30));f.g.at(f.g.now().minusSeconds(5));});refused(f::prepare);
-        assertThat(f.events).doesNotContain("sdk");assertThat(f.g.stops()).isEqualTo(1);
+    @Test void injectedMonotonicBudgetExpiresIndependentlyWhileUtcIsUnchanged() {
+        var f=new Fixture();var entry=f.g.now();f.on("claim",()->f.nanos.set(TimeUnit.SECONDS.toNanos(30)));refused(f::prepare);
+        assertThat(f.g.now()).isEqualTo(entry);assertThat(f.events).doesNotContain("sdk");assertThat(f.g.stops()).isEqualTo(1);
     }
-    @Test void leaseExpiryAfterCallerLocksRefusesEvenWhenOtherBudgetsAreUnchanged() {
+    @Test void utcJumpPastOriginalLeaseAndEarlierInvocationDeadlineRefusesAfterCallerLocks() {
         var f=new Fixture();f.on("dispatch",()->f.g.at(f.g.now().plusSeconds(60)));refused(f::prepare);assertThat(f.sdk.http.calls).isEmpty();assertThat(f.g.stops()).isEqualTo(1);
+    }
+    @Test void workerEntryAfterCallOrInvocationOrLeaseDeadlineCannotStartHttp() {
+        for(long lateSeconds:new long[]{2,30,60}){
+            var f=new Fixture();f.reply();var entry=f.g.now();
+            // Caller still has its pre-scheduling UTC sample; only the newly scheduled worker
+            // sees the expired real-time boundary. No sleep or service/store runs in this clock.
+            f.invocationClock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId zone){return this;}
+                public Instant instant(){return Thread.currentThread()==f.caller?entry:entry.plusSeconds(lateSeconds);}};
+            refused(f::prepare);
+            assertThat(f.sdkEntries).hasValue(0);assertThat(f.sdk.http.calls).isEmpty();assertThat(f.events).doesNotContain("sdk","ack","record");
+            assertThat(f.step.status()).isEqualTo(ProviderOperation.Status.UNKNOWN);assertThat(f.g.stops()).isEqualTo(1);assertThat(f.proof).isNull();f.g.noBusinessChanges();
+        }
+    }
+    @Test void injectedMonotonicExpiryAtWorkerEntryCannotStartHttpWhileUtcStaysFixed() {
+        var f=new Fixture();f.reply();var entry=f.g.now();
+        f.invocationNanos=()->Thread.currentThread()==f.caller?0:TimeUnit.SECONDS.toNanos(30);
+        refused(f::prepare);
+        assertThat(f.g.now()).isEqualTo(entry);assertThat(f.sdkEntries).hasValue(0);assertThat(f.sdk.http.calls).isEmpty();
+        assertThat(f.events).doesNotContain("sdk","ack","record");assertThat(f.step.status()).isEqualTo(ProviderOperation.Status.UNKNOWN);assertThat(f.g.stops()).isEqualTo(1);assertThat(f.proof).isNull();f.g.noBusinessChanges();
     }
     @Test void finalSuccessfulUnboundProofMayCommitAfterExpiryOrRevocation() {
         for(var mutation:List.of("expired","revoked")){
@@ -202,6 +221,7 @@ class StripeBillingOwnedFailedRenewalSetupAdapterTest {
         final StripeBillingInertSdkFixture sdk=new StripeBillingInertSdkFixture();
         final Thread caller=Thread.currentThread();final List<String> events=new ArrayList<>();final Map<String,Runnable> hooks=new HashMap<>();
         final AtomicLong nanos=new AtomicLong();final AtomicInteger sdkEntries=new AtomicInteger();
+        Clock invocationClock=g.clock;LongSupplier invocationNanos=nanos::get;
         ProviderOperation step;SubscriptionBillingProofStore.Setup proof;boolean loseClaim;int hideFinds;
         UnaryOperator<ProviderOperation> reserveMutation=UnaryOperator.identity(),claimMutation=UnaryOperator.identity();
         UnaryOperator<SubscriptionBillingProofStore.Setup> proofMutation=UnaryOperator.identity();
@@ -230,7 +250,7 @@ class StripeBillingOwnedFailedRenewalSetupAdapterTest {
         final StripeClientFactory clients=new StripeClientFactory(){@Override public StripeClient create(StripeCredentials ignored){caller();return StripeClient.builder().setApiKey("sk_test_INERT").setHttpClient(new HttpClient(){@Override public StripeResponse request(StripeRequest request)throws StripeException{
             assertThat(Thread.currentThread()).isNotSameAs(caller);assertThat(g.active()).isFalse();sdkEntries.incrementAndGet();events.add("sdk");var response=transport.request(request);event("response");return response;
         }}).build();}};
-        StripeBillingOwnedFailedRenewalSetupAdapter adapter(){return new StripeBillingOwnedFailedRenewalSetupAdapter(g.methods,steps,proofs,sdk.credentials,clients,sdk.digest,g.clock,nanos::get);}
+        StripeBillingOwnedFailedRenewalSetupAdapter adapter(){return new StripeBillingOwnedFailedRenewalSetupAdapter(g.methods,steps,proofs,sdk.credentials,clients,sdk.digest,invocationClock,invocationNanos);}
         SubscriptionBillingProofStore.Setup prepare(){return adapter().prepare(g.reservation,g.context);}
         void caller(){assertThat(Thread.currentThread()).isSameAs(caller);assertThat(g.active()).isFalse();}
         void on(String boundary,Runnable effect){hooks.put(boundary,effect);}

@@ -86,9 +86,13 @@ public final class StripeBillingOwnedFailedRenewalSetupAdapter {
             var optionsBuilder=RequestOptions.builder().setIdempotencyKey(dispatchKey).setConnectTimeout(millis).setReadTimeout(millis).setMaxNetworkRetries(0);
             RequestOptions.RequestOptionsBuilder.unsafeSetStripeVersionOverride(optionsBuilder,StripeBillingTestClockAdapter.API_VERSION);
             var options=optionsBuilder.build();
-            var pending=new FutureTask<SetupIntent>(()->client.v1().setupIntents().create(params,options));
+            var pending=new FutureTask<SetupIntent>(()->{
+                // Scheduling cannot extend the immutable call/invocation/lease allowance.
+                callRemaining(budget,claim,callStarted,callDeadline);
+                return client.v1().setupIntents().create(params,options);
+            });
             SetupIntent remote;
-            // No transaction, service or store is reachable from the SDK task.
+            // The worker checks time/interruption only, then performs the one SDK create.
             callRemaining(budget,claim,callStarted,callDeadline);
             Thread.ofVirtual().name("owned-method-setup-create").start(pending);
             try{
@@ -143,7 +147,7 @@ public final class StripeBillingOwnedFailedRenewalSetupAdapter {
     private long callRemaining(Budget budget,ProviderOperation claim,long started,Instant deadline){
         long elapsed=System.nanoTime()-started;
         long remaining=Math.min(budget.remaining(claim),Math.min(CALL-elapsed,Duration.between(utc.instant(),deadline).toNanos()));
-        if(elapsed<0||remaining<=0)throw unavailable();return remaining;
+        if(Thread.currentThread().isInterrupted()||elapsed<0||remaining<=0)throw unavailable();return remaining;
     }
     private final class Budget {
         private final long actualStart=System.nanoTime(),injectedStart=nanos.getAsLong();
