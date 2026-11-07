@@ -148,12 +148,14 @@ class OwnedFailedRenewalMethodServiceTest {
         assertThat(h.b.ops).hasSize(count);assertThat(h.recovery).isNull();assertThat(h.completion).isEqualTo(c);assertThat(h.b.trace).containsSubsequence("rollback","begin","stop","commit");
     }
     static class Harness {
-        final OwnedFailedRenewalServiceTest.Harness b=new OwnedFailedRenewalServiceTest.Harness(true);
+        final OwnedFailedRenewalServiceTest.Harness b;
         final SubscriptionCommandContext context;final OwnedFailedRenewalMethodService service;
-        Reservation reservation;OwnedMethodBrowser.Enrollment enrollment;Completion completion;Recovery recovery;Publication publication;Map<Phase,ReadClaim> claims=new HashMap<>();boolean acks,authorized=true,failReceipt,liveSession=true;
+        Reservation reservation;OwnedMethodBrowser.Enrollment enrollment;Completion completion;Recovery recovery;Publication publication;Map<Phase,ReadClaim> claims=new HashMap<>();boolean acks,authorized=true,failReceipt,liveSession=true,failStop;
         Runnable afterAccountLock=()->{};
         Harness(){this(false);}
-        Harness(boolean customerActor){
+        Harness(boolean customerActor){this(customerActor,"alias");}
+        Harness(boolean customerActor,String credentialsRef){
+            b=new OwnedFailedRenewalServiceTest.Harness(true,credentialsRef);
             b.fail();b.trace.clear();
             SubscriptionActor actor=customerActor?new SubscriptionActor.Customer(new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(new dev.genericpayments.platform.customers.domain.CustomerSessionId(UUID.randomUUID()),b.owner.site(),b.owner.customer(),"https://test.example",Set.of(dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_MANAGE),UTC.plusSeconds(600))):new SubscriptionActor.Admin(new dev.genericpayments.platform.admin.application.port.in.AuthenticatedAdmin(new dev.genericpayments.platform.admin.domain.AdminUserId(UUID.randomUUID()),"admin",new dev.genericpayments.platform.admin.domain.AdminSessionId(UUID.randomUUID()),UTC.plusSeconds(600)));
             context=new SubscriptionCommandContext(actor,b.owner.site(),b.owner.customer(),"https://test.example","setup-key","test");
@@ -178,7 +180,7 @@ class OwnedFailedRenewalMethodServiceTest {
                 default->throw new AssertionError(m);
             };});
             b.methodProof=new OwnedFailedRenewalMethodFactProof(store,tx,b.timePort);b.successorProof=new OwnedFailedRenewalMethodRecoveryFactProof(store,tx,b.timePort);
-            var failed=port(OwnedFailedRenewalStore.class,(m,a)->{assertThat(b.active).isTrue();return switch(m){case "requireFailureInTransaction"->b.failure;case "stopInTransaction"->{b.trace.add("stop");b.stopped=true;yield null;}default->throw new AssertionError(m);};});
+            var failed=port(OwnedFailedRenewalStore.class,(m,a)->{assertThat(b.active).isTrue();return switch(m){case "requireFailureInTransaction"->b.failure;case "stopInTransaction"->{b.trace.add("stop");if(failStop)throw new IllegalStateException("private stop failure");b.stopped=true;yield null;}default->throw new AssertionError(m);};});
             service=new OwnedFailedRenewalMethodService(store,failed,tx,b.operationsPort,(site,customer)->b.trace.add("lifecycle"),id->{b.trace.add("account");afterAccountLock.run();return Optional.of(b.account);},b.subscriptionsPort,b.billsPort,new SubscriptionReadPreparation(b.operationsPort,port(TrialEligibilityStore.class,(m,a)->Optional.empty())),b.observationsPort,b.factsPort,port(TrialEligibilityStore.class,(m,a)->Optional.empty()),b.timePort,b.clockPort,port(StripeBillingBindingPort.class,(m,a)->Optional.of(b.binding)),port(SubscriptionAuthorityPort.class,(m,a)->{assertThat(b.active).isTrue();b.trace.add("authority");if(!authorized)throw new IllegalStateException("authority revoked");return null;}),value->"digest:"+value);
         }
         Reservation reserve(){return service.reserveMethod(b.admission,context,true);}

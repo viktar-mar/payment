@@ -146,8 +146,9 @@ class OwnedFailedRenewalServiceTest {
         var nested=new Harness();nested.active=true;assertThatThrownBy(()->nested.service.beginFailedRead(nested.admission,UUID.randomUUID())).isInstanceOf(IllegalStateException.class);assertThat(nested.reads).isEmpty();
     }
     static UUID id(long n) {return new UUID(0,n);}
-    static OwnedFirstRenewal.Admission upstream() {
-        var owner=new ClockOwner(id(1),id(2),new PaymentAccountId(id(3)),new SiteId(id(4)),new CustomerId(id(5)),"acct_owned","alias","2026-09-30.endive",1000,"billing_clock_"+id(1),"clock-key","a".repeat(64),UTC.minusSeconds(100));
+    static OwnedFirstRenewal.Admission upstream() {return upstream("alias");}
+    static OwnedFirstRenewal.Admission upstream(String credentialsRef) {
+        var owner=new ClockOwner(id(1),id(2),new PaymentAccountId(id(3)),new SiteId(id(4)),new CustomerId(id(5)),"acct_owned",credentialsRef,"2026-09-30.endive",1000,"billing_clock_"+id(1),"clock-key","a".repeat(64),UTC.minusSeconds(100));
         var clock=new ReadyClock(owner,id(6),"clock_owned",1000,2000,3000,UTC.minusSeconds(50),"b".repeat(64));
         var terms=new SubscriptionPriceTerms(new PriceId(id(7)),"monthly",1,new ProductId(id(8)),Money.of(1000,"EUR"),BillingInterval.MONTH,0,TrialPaymentMethodPolicy.OPTIONAL_DURING_TRIAL,TaxMode.NONE);
         var intent=new OwnedClockSubscription(id(9),clock,id(10),id(11),"cus_owned",id(12),id(13),"subscription:"+id(3)+":"+id(13)+":CREATE","v1.paid."+"d".repeat(64),0,1,terms,"price_owned","prod_owned","c".repeat(64),UTC.minusSeconds(10));
@@ -156,7 +157,7 @@ class OwnedFailedRenewalServiceTest {
     }
     static OwnedFirstRenewal.LaterReady ready(OwnedFirstRenewal.Admission upstream,OwnedFirstRenewal.Step step,UUID previous,UUID boundary,long target) {
         var advance=new OwnedFirstRenewal.Advance(id(20+step.number()),upstream.id(),step,target,previous,boundary,"billing-renewal-advance-v1:"+upstream.id()+":"+step.number(),"e".repeat(64),UTC);
-        var operation=new ProviderOperation(id(50+step.number()),upstream.receipt().intent().clock().owner().account(),"acct_owned","alias",ProviderOperation.Kind.TEST_CLOCK_ADVANCE,advance.id(),advance.operationKey(),advance.fingerprint(),ProviderOperation.Status.ACKNOWLEDGED,"clock_owned",UTC,null,null,null,1);
+        var operation=new ProviderOperation(id(50+step.number()),upstream.receipt().intent().clock().owner().account(),"acct_owned",upstream.receipt().intent().clock().owner().credentialsRef(),ProviderOperation.Kind.TEST_CLOCK_ADVANCE,advance.id(),advance.operationKey(),advance.fingerprint(),ProviderOperation.Status.ACKNOWLEDGED,"clock_owned",UTC,null,null,null,1);
         var ack=new OwnedFirstRenewal.Ack(advance,operation,"owner",UTC.plusSeconds(60),new OwnedFirstRenewal.TestClockAck("clock_owned","test_helpers.test_clock",false,"owned",target,"ready",2000,3000,null),UTC);
         return new OwnedFirstRenewal.LaterReady(id(60+step.number()),upstream.id(),ack,new OwnedFirstRenewal.TestClockReady("clock_owned","test_helpers.test_clock",false,"owned",target,"ready",2000,3000,null),UTC);
     }
@@ -164,25 +165,32 @@ class OwnedFailedRenewalServiceTest {
     static <T>T port(Class<T> type,BiFunction<String,Object[],Object> f){return type.cast(Proxy.newProxyInstance(type.getClassLoader(),new Class<?>[]{type},(p,m,a)->f.apply(m.getName(),a)));}
     static <T>T inert(Class<T> type){return port(type,(m,a)->{throw new AssertionError(type.getSimpleName()+"."+m);});}
     static class Harness {
-        final OwnedFirstRenewal.Admission upstream=upstream();
-        final OwnedFirstRenewal.LaterReady first=ready(upstream,OwnedFirstRenewal.Step.BOUNDARY,null,null,1100);
-        final OwnedFirstRenewal.Boundary boundary=new OwnedFirstRenewal.Boundary(id(70),upstream.id(),first,"si_owned","in_renewal",new Subscription.Period(Instant.ofEpochSecond(1100),Instant.ofEpochSecond(10000)),"a".repeat(64),UTC);
-        final OwnedFirstRenewal.LaterReady ready=ready(upstream,OwnedFirstRenewal.Step.FINALIZATION,first.id(),boundary.id(),4700);
-        final Admission admission=new Admission(id(71),upstream,ready,boundary,upstream.sourceSha(),UTC);
-        final ClockOwner owner=upstream.receipt().intent().clock().owner();
-        Subscription s=new Subscription(upstream.receipt().intent().subscription(),owner.site(),owner.customer(),upstream.receipt().intent().terms().productId(),owner.account(),upstream.receipt().intent().terms(),upstream.receipt().intent().terms(),Subscription.Status.ACTIVE,"sub_owned",new Subscription.Period(Instant.ofEpochSecond(900),Instant.ofEpochSecond(1100)),Instant.ofEpochSecond(1100),null,null,null,null,null,2,UTC,UTC,null);
-        final PaymentAccount account=PaymentAccount.create(owner.account(),"owned",PaymentProviderType.STRIPE,PaymentAccountMode.SANDBOX,"acct_owned","alias");
+        final OwnedFirstRenewal.Admission upstream;
+        final OwnedFirstRenewal.LaterReady first,ready;
+        final OwnedFirstRenewal.Boundary boundary;
+        final Admission admission;
+        final ClockOwner owner;
+        Subscription s;
+        final PaymentAccount account;
         Map<UUID,SubscriptionOperation> ops=new LinkedHashMap<>();Map<String,BillingRecord> records=new LinkedHashMap<>();Map<Phase,ReadClaim> reads=new HashMap<>();
         Set<String> cash=new LinkedHashSet<>();List<SubscriptionEvent.Type> events=new ArrayList<>();List<String> trace=new ArrayList<>();
         long sequence,billingSecond=4700;int effects,callbacks,timeCalls;boolean active,isolated=true,foreign,claimOwner=true,stopped,failReceipt,normalizeClaim,factTimeDrift,factModeDrift;Instant utc=UTC;
-        dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding binding=new dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding(upstream.receipt().intent().customerBinding(),owner.account(),owner.site(),owner.customer(),upstream.receipt().intent().customerReference(),upstream.receipt().intent().customerCreationOperation(),0);
+        dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding binding;
         Failure failure;Recovery recovery;Publication publication;final OwnedFailedRenewalService service;
         SubscriptionOperationStore operationsPort;SubscriptionStore subscriptionsPort;BillingRecordStore billsPort;
         SubscriptionObservationPort observationsPort;SubscriptionBillingTimePort timePort;SubscriptionTransactionPort transactionPort;Clock clockPort;SubscriptionFactService factsPort;
         SubscriptionIsolatedMethodProofPort methodProof=SubscriptionIsolatedMethodProofPort.denied();
         SubscriptionIsolatedRecoveryProofPort successorProof;SubscriptionBillingProofStore.Setup methodSetup;
         Harness(){this(false);}
-        Harness(boolean withBinding){
+        Harness(boolean withBinding){this(withBinding,"alias");}
+        Harness(boolean withBinding,String credentialsRef){
+            upstream=upstream(credentialsRef);first=ready(upstream,OwnedFirstRenewal.Step.BOUNDARY,null,null,1100);
+            boundary=new OwnedFirstRenewal.Boundary(id(70),upstream.id(),first,"si_owned","in_renewal",new Subscription.Period(Instant.ofEpochSecond(1100),Instant.ofEpochSecond(10000)),"a".repeat(64),UTC);
+            ready=ready(upstream,OwnedFirstRenewal.Step.FINALIZATION,first.id(),boundary.id(),4700);
+            admission=new Admission(id(71),upstream,ready,boundary,upstream.sourceSha(),UTC);owner=upstream.receipt().intent().clock().owner();
+            s=new Subscription(upstream.receipt().intent().subscription(),owner.site(),owner.customer(),upstream.receipt().intent().terms().productId(),owner.account(),upstream.receipt().intent().terms(),upstream.receipt().intent().terms(),Subscription.Status.ACTIVE,"sub_owned",new Subscription.Period(Instant.ofEpochSecond(900),Instant.ofEpochSecond(1100)),Instant.ofEpochSecond(1100),null,null,null,null,null,2,UTC,UTC,null);
+            account=PaymentAccount.create(owner.account(),"owned",PaymentProviderType.STRIPE,PaymentAccountMode.SANDBOX,"acct_owned",credentialsRef);
+            binding=new dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding(upstream.receipt().intent().customerBinding(),owner.account(),owner.site(),owner.customer(),upstream.receipt().intent().customerReference(),upstream.receipt().intent().customerCreationOperation(),0);
             var initialOperation=new SubscriptionOperation(upstream.receipt().intent().createOperation(),owner.site(),owner.customer(),s.id(),SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Status.SUCCEEDED,"create","digest",upstream.receipt().intent().requestFingerprint(),upstream.receipt().intent().operationKey(),0,1,"sub_owned",null,UTC,UTC,1);ops.put(initialOperation.id(),initialOperation);
             records.put("in_initial",new BillingRecord(upstream.bill(),s.siteId(),s.id(),s.paymentAccountId(),"in_initial",BillingRecord.Kind.INITIAL,s.billingPrice(),null,s.currentPeriod(),1000,"EUR",BillingRecord.Settlement.CONFIRMED_CASH,0,UTC,UTC));
             var operations=port(SubscriptionOperationStore.class,(m,a)->switch(m){
