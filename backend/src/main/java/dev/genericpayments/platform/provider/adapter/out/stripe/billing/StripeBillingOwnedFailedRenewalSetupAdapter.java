@@ -86,9 +86,11 @@ public final class StripeBillingOwnedFailedRenewalSetupAdapter {
             var optionsBuilder=RequestOptions.builder().setIdempotencyKey(dispatchKey).setConnectTimeout(millis).setReadTimeout(millis).setMaxNetworkRetries(0);
             RequestOptions.RequestOptionsBuilder.unsafeSetStripeVersionOverride(optionsBuilder,StripeBillingTestClockAdapter.API_VERSION);
             var options=optionsBuilder.build();
+            Instant sessionExpiresAt=original.enrollment().sessionExpiresAt();
             var pending=new FutureTask<SetupIntent>(()->{
-                // Scheduling cannot extend the immutable call/invocation/lease allowance.
+                // Scheduling cannot extend the immutable call/invocation/lease or original session.
                 callRemaining(budget,claim,callStarted,callDeadline);
+                if(!utc.instant().isBefore(sessionExpiresAt))throw unavailable();
                 return client.v1().setupIntents().create(params,options);
             });
             SetupIntent remote;

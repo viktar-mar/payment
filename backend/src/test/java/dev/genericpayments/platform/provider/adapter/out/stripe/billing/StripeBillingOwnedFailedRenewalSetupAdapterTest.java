@@ -185,6 +185,16 @@ class StripeBillingOwnedFailedRenewalSetupAdapterTest {
         assertThat(f.g.now()).isEqualTo(entry);assertThat(f.sdkEntries).hasValue(0);assertThat(f.sdk.http.calls).isEmpty();
         assertThat(f.events).doesNotContain("sdk","ack","record");assertThat(f.step.status()).isEqualTo(ProviderOperation.Status.UNKNOWN);assertThat(f.g.stops()).isEqualTo(1);assertThat(f.proof).isNull();f.g.noBusinessChanges();
     }
+    @Test void originalEnrollmentExpiryAtWorkerEntryCannotStartHttpWithinOtherBudgets() {
+        var f=new Fixture();
+        var expiry=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)f.g.context.actor()).session().expiresAt();
+        var entry=expiry.minusMillis(500);f.g.at(entry);f.reply();
+        f.invocationClock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId zone){return this;}
+            public Instant instant(){return Thread.currentThread()==f.caller?entry:expiry;}};
+        refused(f::prepare);
+        assertThat(f.sdkEntries).hasValue(0);assertThat(f.sdk.http.calls).isEmpty();assertThat(f.events).doesNotContain("sdk","ack","record");
+        assertThat(f.step.status()).isEqualTo(ProviderOperation.Status.UNKNOWN);assertThat(f.g.stops()).isEqualTo(1);assertThat(f.proof).isNull();f.g.noBusinessChanges();
+    }
     @Test void finalSuccessfulUnboundProofMayCommitAfterExpiryOrRevocation() {
         for(var mutation:List.of("expired","revoked")){
             var f=new Fixture();f.reply();f.on("record",()->{if(mutation.equals("expired"))f.g.at(f.g.now().plusSeconds(700));else f.g.revoke();});
