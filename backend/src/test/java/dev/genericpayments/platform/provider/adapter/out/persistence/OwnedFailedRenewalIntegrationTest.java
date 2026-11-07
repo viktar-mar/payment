@@ -62,11 +62,8 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             new OwnedFailedRenewalMethodRecoveryFactProof(methods,transaction,time),new OwnedFailedRenewalMethodFactProof(methods,transaction,time),methodBillingProofs);
     }
     private dev.genericpayments.platform.provider.application.service.OwnedFailedRenewalMethodService methodService(dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore methods){
-        return methodService(methods,Clock.systemUTC());
-    }
-    private OwnedFailedRenewalMethodService methodService(dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore methods,Clock operationalClock){
         return new dev.genericpayments.platform.provider.application.service.OwnedFailedRenewalMethodService(methods,store(),transaction,lifecycleOperations,lifecycleLocks,
-            accountLocks,subscriptions,bills,readPreparation,observations,methodFacts(methods),trials,time,operationalClock,bindings,authority,digest);
+            accountLocks,subscriptions,bills,readPreparation,observations,methodFacts(methods),trials,time,Clock.systemUTC(),bindings,authority,digest);
     }
     private final ExactTime time=new ExactTime();
     private class ExactTime implements SubscriptionBillingTimePort {
@@ -530,17 +527,28 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);assertThat(count("payments")).isEqualTo(1);
     }
     @ParameterizedTest @ValueSource(strings={"version","sequence","expired","forged-fence"})
-    void preparedMethodPublicationRejectsActualVersionSequenceDeadlineAndCapturedFenceDrift(String mutation) {
+    void preparedMethodPublicationRejectsActualVersionSequenceDeadlineAndCapturedFenceDrift(String mutation) throws InterruptedException {
         var p=preparedMethod();var r=p.reservation();var read=p.service().beginMethodRead(r,UUID.randomUUID());var context=p.service().inspectMethodRead(r,read);
         if(mutation.equals("version"))jdbc.update("update subscription_operations set version=version+1,updated_at=clock_timestamp() where id=?",r.setupOperationId());
         if(mutation.equals("sequence"))jdbc.update("update subscriptions set observation_sequence=observation_sequence+1 where id=?",current().id());
         var q=read;
         if(mutation.equals("forged-fence"))q=new OwnedFailedRenewalMethod.ReadClaim(read.id(),read.reservationId(),read.phase(),read.invocation(),read.startedAt(),read.deadlineAt(),
             new ApplySubscriptionSnapshotUseCase.Fence(read.fence().revision(),read.fence().operationId(),read.fence().operationVersion()+1,null,null,read.fence().observationSequence()),read.billingSample());
-        var expected=q;var svc=mutation.equals("expired")?methodService(new JdbcOwnedFailedRenewalMethodStore(jdbc),Clock.fixed(read.deadlineAt(),ZoneOffset.UTC)):p.service();
+        var expected=q;
         var before=financialState();var operation=lifecycleOperations.find(site,current().id(),r.setupOperationId()).orElseThrow();var now=Instant.now();
         var evidence=new OwnedFailedRenewalMethod.MethodEvidence(snapshot(p.setup(),false,null,now),"seti_saved","pm_saved",now);
-        assertThatThrownBy(()->svc.publishMethod(r,expected,evidence,context)).isInstanceOf(RuntimeException.class);
+        read.requireAccepted(evidence.snapshot().observedAt(),evidence.acceptedAt());
+        if(mutation.equals("expired")) {
+            assertThat(read.deadlineAt()).isEqualTo(read.startedAt().plusSeconds(30));
+            long remaining=Math.max(0,Duration.between(Instant.now(),read.deadlineAt()).toNanos());
+            assertThat(remaining).isBetween(0L,TimeUnit.SECONDS.toNanos(30));
+            // Wait only for this genuine claim. A future Java clock would also send an invalid future stop to PostgreSQL.
+            // Interrupting this bounded hosted-only wait fails the test; no deadline or persisted authority is changed.
+            TimeUnit.NANOSECONDS.sleep(remaining+TimeUnit.MILLISECONDS.toNanos(50));
+            assertThat(Instant.now()).isAfterOrEqualTo(read.deadlineAt());
+            assertThat(jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant()).isAfterOrEqualTo(read.deadlineAt());
+        }
+        assertThatThrownBy(()->p.service().publishMethod(r,expected,evidence,context)).isInstanceOf(RuntimeException.class).hasNoSuppressedExceptions();
         assertThat(financialState()).isEqualTo(before);assertThat(lifecycleOperations.find(site,current().id(),operation.id())).contains(operation);
         assertThat(count("stripe_billing_failed_method_completions")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);
     }
