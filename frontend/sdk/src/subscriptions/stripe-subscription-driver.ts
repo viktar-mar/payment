@@ -4,7 +4,7 @@ import { browserOrigin, validateCustomerSession } from '../customer/contracts.js
 import { PaymentSdkError, isAbort } from '../errors.js';
 import { loadStripeClient } from '../providers/stripe-loader.js';
 import { subscribeSubscriptionCustomer } from '../customer/session-lifecycle.js';
-import { captureSubscriptionAuthority } from './authority.js';
+import { captureOriginalSubscriptionConfirmation, captureSubscriptionAuthority } from './authority.js';
 import { assertSubscriptionAction, consumeSubscriptionAction } from './action-driver.js';
 import type { SubscriptionAction, SubscriptionClient, SubscriptionClientSession, SubscriptionIdRequest, SubscriptionMutationReceipt, SubscriptionOperation } from './contracts.js';
 
@@ -36,6 +36,7 @@ export async function mountStripeSubscription(options: StripeSubscriptionOptions
   let action: SubscriptionAction | undefined = options.action;
   const authority = fingerprint(input.session);
   let assertAuthority: (() => void) | undefined = captureSubscriptionAuthority(client,input.session,input.signal);
+  let originalConfirmation = receiptConstraint === 'OWNED_METHOD_RESERVED' ? captureOriginalSubscriptionConfirmation(client) : undefined;
   let actionIdentity: string | undefined = JSON.stringify(action), token: string | undefined = action.secret;
   let expires = Math.min(Date.parse(input.session.expiresAt), Date.parse(action.expiresAt));
   let capability: SubscriptionClientSession | undefined;
@@ -51,7 +52,7 @@ export async function mountStripeSubscription(options: StripeSubscriptionOptions
     const wasActive = active; active = false; ready = false;
     if (expiry !== undefined) clearTimeout(expiry); if (readinessTimer !== undefined) clearTimeout(readinessTimer);
     input.signal?.removeEventListener('abort', destroy); window.removeEventListener('pagehide', destroy); observer.disconnect();
-    releaseCustomer?.(); releaseCustomer=undefined; assertAuthority=undefined;
+    releaseCustomer?.(); releaseCustomer=undefined; assertAuthority=undefined; originalConfirmation=undefined;
     try { if (readyListener) element?.off('ready',readyListener); if (loadErrorListener) element?.off('loaderror',loadErrorListener); } catch { /* fixed cleanup only */ }
     const retired = element; element = undefined; elements = undefined; stripe = undefined; capability = undefined; action = undefined; actionIdentity = undefined; token = undefined;
     try { retired?.destroy(); } catch { /* never expose provider details */ }
@@ -95,7 +96,8 @@ export async function mountStripeSubscription(options: StripeSubscriptionOptions
           current(); if (!ready || !action) throw new PaymentSdkError('PAYMENT_STATE_CONFLICT');
           // Permanent local latch precedes the very first asynchronous preflight.
           spent=true; consumeSubscriptionAction(client,input,action); action=undefined;
-          const receipt = await guarded(client.confirmAction({ ...input, actionToken:token!, idempotencyKey:crypto.randomUUID() }));
+          const command = { ...input, actionToken:token!, idempotencyKey:crypto.randomUUID() };
+          const receipt = await guarded(originalConfirmation ? originalConfirmation(command) : client.confirmAction(command));
           if ((receipt as SubscriptionMutationReceipt).browserConfirmAllowed !== true || receipt.status === 'UNKNOWN') throw new PaymentSdkError('PROVIDER_RESULT_UNKNOWN');
           if (receiptConstraint === 'OWNED_METHOD_RESERVED' && (flow !== 'SETUP' || receipt.status !== 'RESERVED' || receipt.actionAvailable || receipt.nextAction !== undefined)) throw new PaymentSdkError('PROVIDER_RESULT_UNKNOWN');
           current();

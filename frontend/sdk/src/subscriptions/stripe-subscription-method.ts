@@ -55,7 +55,7 @@ export async function mountStripeSubscriptionMethod(options: StripeSubscriptionM
     if (action.kind !== 'PROVIDER_CLIENT') throw new PaymentSdkError('INVALID_RESPONSE');
     const selected = await handoff.wait(client.confirmationSession({ ...input, action, idempotencyKey: crypto.randomUUID() }));
     handoff.assertCurrent(); assertSelectedSetup(client, input, action, selected);
-    if (selected.protocol !== 'BROWSER_CONFIRM_V1' || selected.flow !== 'SETUP') throw new PaymentSdkError('INVALID_RESPONSE');
+    if (selected.protocol !== 'BROWSER_CONFIRM_V1' || selected.flow !== 'SETUP' || !selected.publishableKey.startsWith('pk_test_')) throw new PaymentSdkError('INVALID_RESPONSE');
     // Keep the outer visibility/host guard alive during the driver's preflight and
     // confirmation. Only driver retirement releases it; release never aborts a result.
     return await handoff.wait(mountStripeSubscription({ client, input, action, selectedSession: selected,

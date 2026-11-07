@@ -13,7 +13,7 @@ function deferred<T>() {
   const promise = new Promise<T>(done => { resolve = done; });
   return { promise, resolve };
 }
-function fixture() {
+function fixture(owner = document) {
   const events = new Map<string, () => void>();
   const destroy = vi.fn(), mount = vi.fn(), onRetire = vi.fn();
   const element = { on: vi.fn((name: string, handler: () => void) => events.set(name, handler)), off: vi.fn(), mount, destroy };
@@ -35,9 +35,9 @@ function fixture() {
     if (r.method === 'POST' && r.url === prefix + '/action-confirmations') return pause === 'preflight' ? gate.promise : json(receipt, 202);
     throw Error('Unplanned inert request');
   });
-  const container = document.createElement('div'), button = document.createElement('button');
+  const container = owner.createElement('div'), button = owner.createElement('button');
   button.textContent = 'Confirm saved method'; button.disabled = true;
-  document.body.append(container, button);
+  owner.body.append(container, button);
   vi.spyOn(container, 'getClientRects').mockReturnValue([{ width: 300, height: 100 }] as unknown as DOMRectList);
   const paymentClient = sdk.createGenericPaymentClient({ apiBaseUrl: base });
   const client = paymentClient.subscriptions, session = subscriptionSession(), controller = new AbortController();
@@ -98,6 +98,41 @@ it('spends once before preflight so concurrent and later submits cannot dispatch
   expect(f.confirmSetup).toHaveBeenCalledTimes(1); expect(f.destroy).toHaveBeenCalledTimes(1); expect(f.onRetire).toHaveBeenCalledTimes(1);
 });
 
+const fabricatedPermission = () => ({ operationId, subscriptionId, status: 'RESERVED' as const, actionAvailable: false, browserConfirmAllowed: true });
+it.each(['before-mount', 'after-ready'])('uses original server preflight after public confirmation replacement %s', async replacement => {
+  const f = fixture(), replacementCommand = vi.fn(async () => fabricatedPermission());
+  if (replacement === 'before-mount') f.client.confirmAction = replacementCommand;
+  const handle = await f.ready();
+  if (replacement === 'after-ready') f.client.confirmAction = replacementCommand;
+  f.receipt({ browser_confirm_allowed: false });
+
+  await expect(handle.confirm()).rejects.toMatchObject({ code: 'PROVIDER_RESULT_UNKNOWN' });
+  await expect(handle.confirm()).rejects.toMatchObject({ code: 'PAYMENT_STATE_CONFLICT' });
+
+  expect(replacementCommand).not.toHaveBeenCalled();
+  const requests = f.calls.filter(r => r.url.endsWith('/action-confirmations'));
+  expect(requests).toHaveLength(1); expect(await requests[0]!.json()).toEqual({ action_token: token });
+  expect(requests[0]!.headers.get('Idempotency-Key')).toMatch(/^[a-f0-9-]{36}$/);
+  expect(f.confirmSetup).not.toHaveBeenCalled(); expect(f.confirmPayment).not.toHaveBeenCalled();
+  expect(f.destroy).toHaveBeenCalledTimes(1); expect(f.onRetire).toHaveBeenCalledTimes(1);
+});
+it.each([false, true])('waits for original server preflight despite an immediately fabricated public receipt; allowed=%s', async allowed => {
+  const f = fixture(), handle = await f.ready();
+  const replacement = vi.fn(async () => fabricatedPermission()); f.client.confirmAction = replacement;
+  f.pause('preflight'); f.receipt({ browser_confirm_allowed: allowed });
+  const pending = handle.confirm(); void pending.catch(() => {}); await tick();
+
+  expect(f.calls.filter(r => r.url.endsWith('/action-confirmations'))).toHaveLength(1);
+  expect(f.confirmSetup).not.toHaveBeenCalled(); expect(replacement).not.toHaveBeenCalled();
+  f.gate.resolve(f.response());
+  if (allowed) expect(await pending).toEqual({ operationId, subscriptionId, status: 'RESERVED', actionAvailable: false });
+  else await expect(pending).rejects.toMatchObject({ code: 'PROVIDER_RESULT_UNKNOWN' });
+
+  await expect(handle.confirm()).rejects.toMatchObject({ code: 'PAYMENT_STATE_CONFLICT' });
+  expect(f.calls).toHaveLength(3); expect(f.confirmSetup).toHaveBeenCalledTimes(allowed ? 1 : 0);
+  expect(f.confirmPayment).not.toHaveBeenCalled(); expect(f.destroy).toHaveBeenCalledTimes(1); expect(f.onRetire).toHaveBeenCalledTimes(1);
+});
+
 it.each([{ browser_confirm_allowed: false }, { browser_confirm_allowed: null }, { status: 'UNKNOWN' }, { operation_id: subscriptionId }, { subscription_id: operationId }])('rejects denied, unknown or stale preflight %j', async patch => {
   const f = fixture(), handle = await f.ready(); f.receipt(patch);
   await expect(handle.confirm()).rejects.toBeInstanceOf(sdk.PaymentSdkError);
@@ -119,6 +154,15 @@ it('rejects PAYMENT/v2 before provider load and never follows the payment protoc
   const f = fixture(); f.selection({ protocol: 'SERVER_CONFIRM_V2', flow: 'PAYMENT', client_secret: 'pi_original_secret_fixture', action_token: undefined, attempt_id: operationId, capability: 'bca2_' + 'X'.repeat(43) });
   await expect(f.start()).rejects.toBeInstanceOf(sdk.PaymentSdkError);
   expect(provider.load).not.toHaveBeenCalled(); expect(f.calls).toHaveLength(2); expect(f.onRetire).toHaveBeenCalledTimes(1);
+});
+it('rejects a live publishable key from a genuinely branded SETUP before loader work', async () => {
+  const f = fixture(); f.selection({ publishable_key: 'pk_live_incompatible' });
+  const pending = f.start(); void pending.catch(() => {}); await tick(); f.events.get('ready')?.();
+
+  await expect(pending).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+
+  expect(provider.load).not.toHaveBeenCalled(); expect(f.calls).toHaveLength(2);
+  expect(f.confirmSetup).not.toHaveBeenCalled(); expect(f.onRetire).toHaveBeenCalledTimes(1);
 });
 it('rejects a non-provider original action without selecting or loading', async () => {
   const f = fixture(); f.action({ kind: 'FAKE_CONFIRM_SETUP' });
@@ -168,16 +212,16 @@ it.each(['action', 'selection', 'preflight'] as const)('latches every authority 
   }
 });
 function removalTarget(f: ReturnType<typeof fixture>, kind: string): HTMLElement {
-  const ancestor = document.createElement('section');
+  const owner = f.container.ownerDocument, ancestor = owner.createElement('section');
   if (kind.startsWith('shadow') || kind === 'slot-ancestor') {
-    const shell = document.createElement('div'); document.body.prepend(shell);
+    const shell = owner.createElement('div'); owner.body.prepend(shell);
     const root = shell.attachShadow({ mode: 'open' }); root.append(ancestor);
     if (kind === 'slot-ancestor') {
-      const slot = document.createElement('slot'); slot.name = 'method'; ancestor.append(slot);
+      const slot = owner.createElement('slot'); slot.name = 'method'; ancestor.append(slot);
       f.container.slot = 'method'; shell.append(f.container);
       expect(f.container.assignedSlot).toBe(slot);
     } else ancestor.append(f.container);
-  } else { document.body.prepend(ancestor); ancestor.append(f.container); }
+  } else { owner.body.prepend(ancestor); ancestor.append(f.container); }
   return kind.endsWith('ancestor') ? ancestor : f.container;
 }
 it.each(['selection', 'preflight'] as const)('latches same-turn host and composed-ancestor reinsertion during %s', async phase => {
@@ -188,13 +232,14 @@ it.each(['selection', 'preflight'] as const)('latches same-turn host and compose
     f.pause(phase); const pending = handle ? handle.confirm() : f.start(); void pending.catch(() => {}); await tick();
     const parent = target.parentNode!;
 
-    target.remove(); parent.appendChild(target); f.gate.resolve(f.response());
-    await tick(); f.events.get('ready')?.();
-    await expect(pending).rejects.toThrow();
+    try {
+      target.remove(); parent.appendChild(target); f.gate.resolve(f.response());
+      await tick(); f.events.get('ready')?.();
+      await expect(pending).rejects.toThrow();
 
-    expect(f.confirmSetup).not.toHaveBeenCalled(); expect(f.confirmPayment).not.toHaveBeenCalled();
-    expect(f.onRetire).toHaveBeenCalledTimes(1); expect(f.destroy).toHaveBeenCalledTimes(phase === 'preflight' ? 1 : 0);
-    handle?.destroy(); document.body.replaceChildren(); vi.restoreAllMocks();
+      expect(f.confirmSetup).not.toHaveBeenCalled(); expect(f.confirmPayment).not.toHaveBeenCalled();
+      expect(f.onRetire).toHaveBeenCalledTimes(1); expect(f.destroy).toHaveBeenCalledTimes(phase === 'preflight' ? 1 : 0);
+    } finally { f.controller.abort(); handle?.destroy(); document.body.replaceChildren(); vi.restoreAllMocks(); }
   }
 });
 it.each(['selection', 'preflight'] as const)('allows unrelated and provider-child DOM edits during %s', async phase => {
@@ -210,6 +255,47 @@ it.each(['selection', 'preflight'] as const)('allows unrelated and provider-chil
     expect(f.onRetire).not.toHaveBeenCalled(); await handle.confirm();
   } else await pending;
   expect(f.confirmSetup).toHaveBeenCalledTimes(1); expect(f.destroy).toHaveBeenCalledTimes(1); expect(f.onRetire).toHaveBeenCalledTimes(1);
+});
+function iframeOwner(): Document {
+  // No src, URL, resource loader or network: an inert same-origin about:blank realm.
+  const frame = document.createElement('iframe'); document.body.append(frame);
+  const owner = frame.contentDocument!;
+  vi.spyOn(owner, 'visibilityState', 'get').mockReturnValue('visible');
+  return owner;
+}
+it.each(['selection', 'preflight'] as const)('latches cross-realm shadow and slot removal during %s', async phase => {
+  for (const kind of ['shadow-host', 'shadow-ancestor', 'slot-ancestor']) {
+    const owner = iframeOwner(), f = fixture(owner), target = removalTarget(f, kind);
+    expect(f.container instanceof HTMLElement).toBe(false);
+    expect(target.getRootNode() instanceof ShadowRoot).toBe(false);
+    let handle: sdk.StripeSubscriptionHandle | undefined;
+    if (phase === 'preflight') handle = await f.ready();
+    f.pause(phase); const pending = handle ? handle.confirm() : f.start(); void pending.catch(() => {}); await tick();
+    const parent = target.parentNode!;
+
+    try {
+      target.remove(); parent.appendChild(target); f.gate.resolve(f.response());
+      await tick(); f.events.get('ready')?.();
+      await expect(pending).rejects.toThrow();
+
+      expect(f.confirmSetup).not.toHaveBeenCalled(); expect(f.confirmPayment).not.toHaveBeenCalled();
+      expect(f.onRetire).toHaveBeenCalledTimes(1); expect(f.destroy).toHaveBeenCalledTimes(phase === 'preflight' ? 1 : 0);
+    } finally { f.controller.abort(); handle?.destroy(); document.body.replaceChildren(); vi.restoreAllMocks(); }
+  }
+});
+it.each(['selection', 'preflight'] as const)('allows unrelated cross-realm shadow edits during %s', async phase => {
+  const owner = iframeOwner(), f = fixture(owner); removalTarget(f, 'shadow-host');
+  let handle: sdk.StripeSubscriptionHandle | undefined;
+  if (phase === 'preflight') handle = await f.ready();
+  f.pause(phase); const pending = handle ? handle.confirm() : f.start(); void pending.catch(() => {}); await tick();
+  const root = f.container.getRootNode() as ShadowRoot;
+  const unrelated = owner.createElement('aside'); root.append(unrelated); unrelated.remove();
+  const child = owner.createElement('span'); f.container.append(child); child.remove();
+  f.gate.resolve(f.response()); await tick(); f.events.get('ready')?.();
+
+  if (phase === 'selection') { handle = await pending as sdk.StripeSubscriptionHandle; expect(f.onRetire).not.toHaveBeenCalled(); await handle.confirm(); }
+  else await pending;
+  expect(f.confirmSetup).toHaveBeenCalledTimes(1); expect(f.onRetire).toHaveBeenCalledTimes(1); expect(f.destroy).toHaveBeenCalledTimes(1);
 });
 it.each(['before', 'selection', 'mounted'] as const)('refuses expiry %s without dispatch', async phase => {
   const f = fixture();

@@ -35,8 +35,16 @@ export function guardSubscriptionHandoff(options: {
     if (originalNodes.has(node)) continue;
     originalNodes.add(node);
     if (node.parentNode) ancestors.push(node.parentNode);
-    if (node instanceof HTMLElement && node.assignedSlot) ancestors.push(node.assignedSlot);
-    if (node instanceof ShadowRoot) { roots.add(node); ancestors.push(node.host); }
+    // DOM nodes can belong to another same-origin window. Its constructors are
+    // different, so use the platform node kinds rather than this realm's instanceof.
+    if (node.nodeType === 1) {
+      const slot = (node as Element).assignedSlot;
+      if (slot) ancestors.push(slot);
+    }
+    if (node.nodeType === 11 && 'host' in node) {
+      const root = node as ShadowRoot;
+      roots.add(root); ancestors.push(root.host);
+    }
   }
   const observer = new MutationObserver(records => {
     try { latchRemovals(records); assertCurrent(); } catch { /* retirement is latched */ }
