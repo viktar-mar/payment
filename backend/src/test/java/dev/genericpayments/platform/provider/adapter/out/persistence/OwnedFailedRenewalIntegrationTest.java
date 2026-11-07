@@ -398,6 +398,11 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
 
     private record PreparedMethod(Setup setup,Failure failure,OwnedFailedRenewalMethod.Reservation reservation,
             OwnedFailedRenewalMethodService service,ProviderOperation setupStep,ProviderOperation methodStep) {}
+    private record ReservedMethod(Setup setup,Failure failure,OwnedFailedRenewalMethod.Reservation reservation,
+            OwnedFailedRenewalMethodService service,dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext context,
+            String customerToken) {
+        @Override public String toString(){return "ReservedMethod[redacted]";}
+    }
     private record PendingMethod(Setup setup,Failure failure,OwnedFailedRenewalMethod.Reservation reservation,
             OwnedFailedRenewalMethodService service,dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext context,
             ProviderOperation setupStep,int callStart,String customerToken) {
@@ -452,20 +457,9 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         return pendingMethod(browser,0);
     }
     private PendingMethod pendingMethod(boolean browser,int sessionSeconds) {
-        var s=setup();failedGraph(s);
-        var failure=new StripeBillingOwnedFailedRenewalObserver(service(store(),null),credentials,clients,Clock.systemUTC()).observe(s.admission());
-        var before=financialState();var methods=new JdbcOwnedFailedRenewalMethodStore(jdbc);var svc=methodService(methods);
-        var authentication=managementAuthentication("genuine-owned-method");var context=authentication.context();
-        if(sessionSeconds>0){
-            var original=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)context.actor()).session();
-            var expiry=Instant.now().plusSeconds(sessionSeconds).truncatedTo(java.time.temporal.ChronoUnit.MICROS);
-            jdbc.update("update customer_sessions set expires_at=? where id=?",java.sql.Timestamp.from(expiry),original.sessionId().value());
-            var changed=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(original.sessionId(),original.siteId(),original.customerId(),original.origin(),original.scopes(),expiry);
-            context=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(new dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer(changed),site,customer,changed.origin(),context.idempotencyKey(),context.requestId());
-        }
-        var r=browser?svc.reserveBrowserMethod(s.admission(),context,true):svc.reserveMethod(s.admission(),context,true);
-        var subscription=current();var o=lifecycleOperations.find(site,subscription.id(),r.setupOperationId()).orElseThrow();
-        assertThat(o.status()).isEqualTo(SubscriptionOperation.Status.RESERVED);assertThat(o.version()).isZero();
+        var reservedMethod=reservedMethod(browser,sessionSeconds);
+        var s=reservedMethod.setup();var failure=reservedMethod.failure();var r=reservedMethod.reservation();var svc=reservedMethod.service();var context=reservedMethod.context();
+        var before=financialState();var subscription=current();var o=lifecycleOperations.find(site,subscription.id(),r.setupOperationId()).orElseThrow();
         var binding=bindings.findCustomer(billing.id(),site,customer).orElseThrow();var client=clients.create(credentials.resolve(billing));
         int callStart=http.calls.size();var reserved=operations.reserveOwnedFailedRenewalMethodStep(billing,r,ProviderOperation.Kind.SETUP_INTENT_CREATE);
         String setupOwner=UUID.randomUUID().toString();var claimed=operations.claim(reserved.id(),setupOwner,Instant.now(),Duration.ofSeconds(60)).orElseThrow();
@@ -482,7 +476,28 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var setupStep=operations.acknowledge(dispatch.id(),setupOwner,dispatch.version(),remote.getId());
         var proof=methodBillingProofs.recordSetup(subscription,o,setupStep.id(),setupStep.providerReference());
         assertThat(proof.method()).isNull();assertThat(financialState()).isEqualTo(before);
-        return new PendingMethod(s,failure,r,svc,context,setupStep,callStart,authentication.rawToken());
+        return new PendingMethod(s,failure,r,svc,context,setupStep,callStart,reservedMethod.customerToken());
+    }
+    /** Genuine observer and original management reservation; stops before any provider SETUP step or proof. */
+    private ReservedMethod reservedMethod(boolean browser,int sessionSeconds) {
+        var s=setup();failedGraph(s);
+        var failure=new StripeBillingOwnedFailedRenewalObserver(service(store(),null),credentials,clients,Clock.systemUTC()).observe(s.admission());
+        var before=financialState();var methods=new JdbcOwnedFailedRenewalMethodStore(jdbc);var svc=methodService(methods);
+        var authentication=managementAuthentication("genuine-owned-method");var context=authentication.context();
+        if(sessionSeconds>0){
+            var original=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)context.actor()).session();
+            var expiry=Instant.now().plusSeconds(sessionSeconds).truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+            jdbc.update("update customer_sessions set expires_at=? where id=?",java.sql.Timestamp.from(expiry),original.sessionId().value());
+            var changed=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(original.sessionId(),original.siteId(),original.customerId(),original.origin(),original.scopes(),expiry);
+            context=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(new dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer(changed),site,customer,changed.origin(),context.idempotencyKey(),context.requestId());
+        }
+        var r=browser?svc.reserveBrowserMethod(s.admission(),context,true):svc.reserveMethod(s.admission(),context,true);
+        var subscription=current();var o=lifecycleOperations.find(site,subscription.id(),r.setupOperationId()).orElseThrow();
+        assertThat(o.status()).isEqualTo(SubscriptionOperation.Status.RESERVED);assertThat(o.version()).isZero();
+        assertThat(financialState()).isEqualTo(before);
+        assertThat(methodBillingProofs.setup(billing.id(),o.id())).isEmpty();
+        assertThat(jdbc.queryForObject("select count(*) from provider_operations where resource_id=?",Long.class,o.id())).isZero();
+        return new ReservedMethod(s,failure,r,svc,context,authentication.rawToken());
     }
     private dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore browserStore(){return new JdbcOwnedFailedRenewalMethodStore(jdbc);}
     private <T>T browserPhase(PendingMethod p,java.util.function.Function<OwnedMethodBrowser.Pending,T> work){
@@ -647,6 +662,63 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(lifecycleOperations.find(site,operation.subscriptionId(),operation.id())).contains(operation);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
     }
 
+    @Test void browserSetupPreparationAuthenticatesRealJdbcEnrollmentBeforeAnySetupAckOrProof(){
+        var p=reservedMethod(true,0);var r=p.reservation();var before=financialState();var original=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
+        var operation=lifecycleOperations.find(site,current().id(),r.setupOperationId()).orElseThrow();int calls=http.calls.size();
+        var reservations=rows("stripe_billing_failed_method_reservations");var events=rows("subscription_events");
+        var prepared=p.service().inspectBrowserSetupPreparation(r,p.context());
+        assertThat(prepared.reservation()).isEqualTo(r);assertThat(prepared.enrollment()).isEqualTo(new OwnedMethodBrowser.Enrollment(original.sessionId().value(),original.origin(),original.expiresAt()));
+        assertThat(prepared.account()).isEqualTo(billing);assertThat(prepared.subscription()).isEqualTo(current());assertThat(prepared.operation()).isEqualTo(operation);
+        assertThat(prepared.binding()).isEqualTo(r.binding());assertThat(prepared.billingSample()).isEqualTo(r.billingSample());
+        assertThat(prepared.toString()).isEqualTo("SetupPreparationContext[redacted]");assertThat(p.toString()).isEqualTo("ReservedMethod[redacted]");
+        assertThat(methodBillingProofs.setup(billing.id(),operation.id())).isEmpty();assertThat(jdbc.queryForObject("select count(*) from provider_operations where resource_id=?",Long.class,operation.id())).isZero();
+        assertThat(operation.status()).isEqualTo(SubscriptionOperation.Status.RESERVED);assertThat(operation.version()).isZero();
+        assertThat(financialState()).isEqualTo(before);assertThat(rows("stripe_billing_failed_method_reservations")).isEqualTo(reservations);assertThat(rows("subscription_events")).isEqualTo(events);
+        assertThat(count("stripe_billing_method_browser_roots")).isZero();assertThat(count("stripe_billing_failed_method_completions")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();assertThat(http.calls).hasSize(calls);
+        assertThatThrownBy(()->OwnedMethodBrowserTestAccess.phase(p.service(),r,p.context(),value->value)).isInstanceOf(RuntimeException.class);
+        assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @ParameterizedTest @ValueSource(strings={"session","non-browser","revoked","expired","scopes","future","key","origin"})
+    void browserSetupPreparationRefusesReplacedOrDeadOriginalAuthorityWithoutStop(String mutation){
+        var p=reservedMethod(!mutation.equals("non-browser"),0);var s=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
+        var context=p.context();var supplied=s;
+        if(mutation.equals("session")){
+            TestClock.set(jdbc.queryForObject("select issued_at from customer_sessions where id=?",java.sql.Timestamp.class,s.sessionId().value()).toInstant());
+            var second=sessions.issue(site,customer,s.origin());supplied=sessions.resolveRequired(second.rawToken(),s.origin());TestClock.set(Instant.now());
+            assertThat(supplied.sessionId()).isNotEqualTo(s.sessionId());assertThat(supplied.expiresAt()).isEqualTo(s.expiresAt());
+            var replacement=supplied;assertThat(transaction.requiresNew(()->sessions.revalidate(replacement,site,replacement.origin(),dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_MANAGE))).isEqualTo(replacement);
+            context=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(new dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer(supplied),site,customer,s.origin(),context.idempotencyKey(),"replacement");
+        }
+        if(mutation.equals("revoked"))jdbc.update("update customer_sessions set revoked_at=clock_timestamp(),revoked_reason='LOGOUT' where id=?",s.sessionId().value());
+        if(mutation.equals("expired"))jdbc.update("update customer_sessions set expires_at=clock_timestamp() where id=?",s.sessionId().value());
+        if(mutation.equals("scopes"))jdbc.update("update customer_sessions set scopes='[\"SUBSCRIPTION_MANAGE\",\"SUBSCRIPTION_READ\"]'::jsonb where id=?",s.sessionId().value());
+        if(mutation.equals("key")||mutation.equals("origin"))context=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(context.actor(),site,customer,mutation.equals("origin")?"https://foreign.test":context.origin(),mutation.equals("key")?"changed":context.idempotencyKey(),"changed");
+        var before=financialState();int calls=http.calls.size();var originalContext=context;var session=supplied;
+        if(mutation.equals("future"))assertThatThrownBy(()->transaction.requiresNew(()->browserStore().requireBrowserSetupEnrollmentInTransaction(p.reservation(),session,browserNow().plusSeconds(60)))).isInstanceOf(RuntimeException.class);
+        else {
+            assertThatThrownBy(()->p.service().inspectBrowserSetupPreparation(p.reservation(),originalContext)).isInstanceOf(RuntimeException.class);
+            // The JDBC check itself also refuses valid second sessions, revoked/expired rows and exact-scope drift.
+            if(Set.of("session","non-browser","revoked","expired","scopes").contains(mutation))assertThatThrownBy(()->transaction.requiresNew(()->browserStore().requireBrowserSetupEnrollmentInTransaction(p.reservation(),session,browserNow()))).isInstanceOf(RuntimeException.class);
+        }
+        assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();assertThat(count("stripe_billing_method_browser_roots")).isZero();
+        assertThat(methodBillingProofs.setup(billing.id(),p.reservation().setupOperationId())).isEmpty();
+    }
+    @Test void browserSetupPreparationRechecksDatabaseExpiryAfterBlockingOperationLock() throws Exception {
+        var p=reservedMethod(true,5);var session=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();var stale=browserNow();var before=financialState();
+        var locked=new CountDownLatch(1);var release=new CountDownLatch(1);var attempting=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()){
+            var blocker=workers.submit(()->transaction.requiresNew(()->{lifecycleOperations.lock(p.reservation().setupOperationId());locked.countDown();awaitRelease(release);return true;}));
+            try{
+                assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
+                var refused=workers.submit(()->{attempting.countDown();assertThatThrownBy(()->transaction.requiresNew(()->browserStore().requireBrowserSetupEnrollmentInTransaction(p.reservation(),session,stale))).isInstanceOf(RuntimeException.class);return true;});
+                assertThat(attempting.await(5,TimeUnit.SECONDS)).isTrue();assertThatThrownBy(()->refused.get(100,TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                var wait=Duration.between(Instant.now(),session.expiresAt()).plusMillis(100);if(!wait.isNegative())Thread.sleep(wait);
+                release.countDown();assertThat(blocker.get(10,TimeUnit.SECONDS)).isTrue();assertThat(refused.get(10,TimeUnit.SECONDS)).isTrue();
+            }finally{release.countDown();}
+        }
+        assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();assertThat(count("stripe_billing_method_browser_roots")).isZero();
+        assertThat(methodBillingProofs.setup(billing.id(),p.reservation().setupOperationId())).isEmpty();
+    }
     @Test void browserEnrollmentPinsExactOriginalSessionAndReservedSetupWithoutFinancialEffects(){
         var p=pendingMethod(true);var r=p.reservation();var original=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
         var before=financialState();var operation=lifecycleOperations.find(site,current().id(),r.setupOperationId()).orElseThrow();int calls=http.calls.size();

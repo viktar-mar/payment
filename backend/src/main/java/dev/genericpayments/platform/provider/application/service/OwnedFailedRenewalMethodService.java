@@ -84,6 +84,21 @@ public final class OwnedFailedRenewalMethodService {
         };
         return browser?work.get():guarded(admission,work);
     }
+    /** Fresh original management authentication before SETUP exists; no writes and no reusable dispatch authority. */
+    public SetupPreparationContext inspectBrowserSetupPreparation(Reservation reservation,SubscriptionCommandContext originalContext){
+        fresh();Objects.requireNonNull(reservation);validateContext(originalContext);customer(originalContext,utc());
+        return transaction.requiresNew(()->{
+            var state=current(reservation,originalContext,null);requireDebt(state,reservation.failure(),0);
+            var selected=selected(state,reservation.setupOperationId(),SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Status.RESERVED,0,null);
+            if(!selected.authorityScope().equals(methodAuthority(reservation.admission()))
+                ||!selected.fingerprint().equals(request(reservation.admission(),reservation.failure(),originalContext))
+                ||!selected.keyDigest().equals(digest.sha256Hex(originalContext.idempotencyKey())))throw unavailable();
+            // Existing operation/lifecycle/account/subscription/bill waits cannot extend original session authority.
+            authority.revalidate(originalContext,true);
+            var enrollment=store.requireBrowserSetupEnrollmentInTransaction(reservation,customer(originalContext,utc()),utc());
+            return new SetupPreparationContext(reservation,enrollment,state.account(),state.subscription(),selected,state.binding(),state.sample());
+        });
+    }
     /** Browser requests have their own keys (GET has none) and must never stop another customer's admission. */
     <T>T browserPhase(Reservation reservation,SubscriptionCommandContext context,Function<Pending,T> work){
         fresh();Objects.requireNonNull(reservation);Objects.requireNonNull(work);customer(context,utc());

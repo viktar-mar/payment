@@ -64,6 +64,12 @@ public final class OwnedFailedRenewalMethod {
     public record Publication(UUID reservationId,OwnedFailedRenewal.Publication publication,long observationSequence) {
         public Publication { required(reservationId,publication);if(observationSequence<0)throw invalid(); }
     }
+    /** Current descriptive state only; never a cached dispatch permit or browser secret. */
+    public record SetupPreparationContext(Reservation reservation,OwnedMethodBrowser.Enrollment enrollment,
+            PaymentAccount account,Subscription subscription,SubscriptionOperation operation,CustomerBinding binding,Sample billingSample) {
+        public SetupPreparationContext { required(reservation,enrollment,account,subscription,operation,binding,billingSample); }
+        @Override public String toString(){return "SetupPreparationContext[redacted]";}
+    }
     public record MethodReadContext(PaymentAccount account,Subscription subscription,CustomerBinding binding,
             SubscriptionOperation operation,Setup setupProof,ProviderOperation setupStep,ProviderOperation methodStep,Sample billingSample) {
         public MethodReadContext { required(account,subscription,binding,operation,setupProof,setupStep,methodStep);isolated(billingSample); }

@@ -102,6 +102,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         return requireReservationInTransaction(r);
     }
     private JdbcOwnedMethodBrowserStore browser(){return new JdbcOwnedMethodBrowserStore(jdbc,this);}
+    @Override public Enrollment requireBrowserSetupEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().setupEnrollment(r,s,now);}
     @Override public Pending requireBrowserPendingInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().pending(r,s,now);}
     @Override public Optional<Root> browserRootInTransaction(UUID r){return browser().root(r);}
     @Override public Root insertBrowserRootInTransaction(Pending p,Root r){return browser().insert(p,r);}

@@ -16,6 +16,7 @@ import java.util.*;
 /** All operations join an existing caller transaction. No provider calls or transaction suspension. */
 public interface OwnedFailedRenewalMethodStore {
     default Reservation reserveBrowserInTransaction(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,SubscriptionOperation o,CustomerBinding b,Sample sample,Instant now,Enrollment enrollment){throw browserDenied();}
+    default Enrollment requireBrowserSetupEnrollmentInTransaction(Reservation r,CustomerSessionContext originalSession,Instant now){throw browserDenied();}
     default Pending requireBrowserPendingInTransaction(Reservation r,CustomerSessionContext session,Instant now){throw browserDenied();}
     default Optional<Root> browserRootInTransaction(UUID reservationId){throw browserDenied();}
     default Root insertBrowserRootInTransaction(Pending p,Root proposed){throw browserDenied();}
