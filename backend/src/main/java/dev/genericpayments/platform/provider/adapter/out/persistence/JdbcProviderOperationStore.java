@@ -65,13 +65,25 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     public ProviderOperation requireOwnedFailedRenewalMethodDispatch(PaymentAccount account,
             dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reservation,ProviderOperation claim,Instant now) {
         if(account==null||reservation==null||claim==null||now==null||!claim.resourceId().equals(reservation.setupOperationId()))throw conflict();
-        var current=lock(claim.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+        return requireOwnedMethodDispatchAfterAuthentication(account,claim,now,()->{
+            var current=lock(claim.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+            if(!current.equals(claim))throw conflict();
+            new JdbcOwnedFailedRenewalMethodStore(jdbc).requireReservationInTransaction(reservation);
+            requirePinnedAccount(current);
+            JdbcOwnedFailedRenewalMethodStore.requireStepResource(jdbc,current.accountId(),current.kind(),current.resourceId(),current.operationKey(),current.fingerprint());
+            return current;
+        },()->jdbc.queryForObject("select clock_timestamp()",Timestamp.class).toInstant());
+    }
+    /** Authentication may wait for row/account locks; time authority must be sampled after it returns. */
+    static ProviderOperation requireOwnedMethodDispatchAfterAuthentication(PaymentAccount account,ProviderOperation claim,Instant now,
+            java.util.function.Supplier<ProviderOperation> authenticate,java.util.function.Supplier<Instant> databaseUtc) {
+        var current=authenticate.get();
         if(!current.equals(claim))throw conflict();
-        new JdbcOwnedFailedRenewalMethodStore(jdbc).requireReservationInTransaction(reservation);
-        requirePinnedAccount(current);
-        JdbcOwnedFailedRenewalMethodStore.requireStepResource(jdbc,current.accountId(),current.kind(),current.resourceId(),current.operationKey(),current.fingerprint());
-        new dev.genericpayments.platform.provider.application.service.ProviderOperationGuard().requireDispatch(current,account,current.fingerprint(),now);
         if(current.version()!=1||current.firstDispatchedAt()==null)throw conflict();
+        var guard=new dev.genericpayments.platform.provider.application.service.ProviderOperationGuard();
+        guard.requireDispatch(current,account,current.fingerprint(),now);
+        // No caller timestamp may extend the lease/retry window after authentication waited for a lock.
+        guard.requireDispatch(current,account,current.fingerprint(),databaseUtc.get());
         return current;
     }
     @Override

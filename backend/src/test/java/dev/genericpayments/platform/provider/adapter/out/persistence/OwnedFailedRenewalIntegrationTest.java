@@ -357,6 +357,47 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(count("stripe_billing_failed_renewal_recoveries")).isZero();
         assertThat(count("stripe_subscription_recovery_proofs")).isZero();
     }
+    @Test void ownedMethodDispatchDeniesLeaseThatExpiresWhileWaitingForItsReceiptLock() throws Exception {
+        var s=setup();var failure=fail(s,service(store(),null));var r=reserveMethod(s,failure);
+        int sdkCalls=http.calls.size();
+        var reservedStep=operations.reserveOwnedFailedRenewalMethodStep(billing,r,
+            dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SETUP_INTENT_CREATE);
+        var claimed=operations.claim(reservedStep.id(),"negative-lock-delay",Instant.now(),Duration.ofSeconds(60)).orElseThrow();
+        // Negative fixture only: keep the genuine RESERVED -> DISPATCHING version-one receipt but shorten its lease.
+        // No successful provider call, ACK, lifecycle completion or old operation is manufactured.
+        jdbc.update("update provider_operations set lease_expires_at=first_dispatched_at+interval '1 second' where id=? and version=1",claimed.id());
+        var shortened=operations.findById(claimed.id()).orElseThrow();
+        var suppliedAt=shortened.firstDispatchedAt().plusMillis(1);
+        assertThat(suppliedAt).isBefore(shortened.leaseExpiresAt());
+        var locked=new CountDownLatch(1);var release=new CountDownLatch(1);var checking=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()) {
+            var holder=workers.submit(()->transaction.requiresNew(()->{
+                assertThat(jdbc.queryForList("select id from provider_operations where id=? for update",UUID.class,shortened.id())).containsExactly(shortened.id());
+                locked.countDown();awaitRelease(release);return true;
+            }));
+            try {
+                assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
+                var dispatch=workers.submit(()->{
+                    checking.countDown();
+                    assertThatThrownBy(()->operations.requireOwnedFailedRenewalMethodDispatch(billing,r,shortened,suppliedAt))
+                        .isInstanceOfSatisfying(dev.genericpayments.platform.shared.application.PaymentApplicationException.class,
+                            e->assertThat(e.code()).isEqualTo("PROVIDER_RESULT_UNKNOWN"));
+                    return true;
+                });
+                assertThat(checking.await(5,TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(()->dispatch.get(150,TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                Thread.sleep(1100);
+                assertThat(jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant()).isAfterOrEqualTo(shortened.leaseExpiresAt());
+                release.countDown();assertThat(holder.get(5,TimeUnit.SECONDS)).isTrue();assertThat(dispatch.get(10,TimeUnit.SECONDS)).isTrue();
+            } finally {release.countDown();}
+        }
+        assertThat(operations.findById(shortened.id())).contains(shortened);
+        assertThat(shortened.status()).isEqualTo(dev.genericpayments.platform.provider.application.model.ProviderOperation.Status.DISPATCHING);
+        assertThat(shortened.providerReference()).isNull();assertThat(shortened.version()).isEqualTo(1);
+        assertThat(http.calls).hasSize(sdkCalls);
+        assertThat(jdbc.queryForObject("select count(*) from stripe_subscription_setup_proofs where operation_id=?",Long.class,r.setupOperationId())).isZero();
+        assertThat(count("stripe_billing_failed_method_completions")).isZero();
+    }
     @Test void legacyRecoveryPermanentlyRefusesALaterMethodReservation() {
         var s=setup();var svc=service(store(),null);var failure=fail(s,svc);var recovery=svc.reserveExistingRecovery(s.admission());
         assertThatThrownBy(()->reserveMethod(s,failure)).isInstanceOf(RuntimeException.class);
