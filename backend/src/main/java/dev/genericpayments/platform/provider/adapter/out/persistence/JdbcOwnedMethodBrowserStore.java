@@ -31,23 +31,36 @@ final class JdbcOwnedMethodBrowserStore {
     Enrollment setupEnrollment(Reservation r,CustomerSessionContext session,Instant now){
         transaction();if(r==null||session==null||now==null)throw unavailable();methods.requireReservationInTransaction(r);
         jdbc.queryForList("select lock_owned_method_browser(?)",r.id());
+        return authenticatedEnrollment(r,session,now,"owned_method_debt(r.id,0,o.id) and owned_method_initial_operation(r.id)");
+    }
+    /** Completed original browser lineage only. Historical permission survives the root's former action window. */
+    Enrollment recoveryEnrollment(Reservation r,CustomerSessionContext session,Instant now){
+        transaction();if(r==null||session==null||now==null)throw unavailable();methods.requireReservationInTransaction(r);
+        if(!jdbc.queryForList("""
+            select num_nonnulls(browser_session_id,browser_origin,browser_session_expires_at)
+            from stripe_billing_failed_method_reservations where id=? and setup_operation=?
+            """,Integer.class,r.id(),r.setupOperationId()).equals(List.of(3)))throw unavailable();
+        jdbc.queryForList("select lock_owned_method_browser(?)",r.id());
+        return authenticatedEnrollment(r,session,now,"owned_method_recovery_pre(r.id) and owned_method_browser_permit(r.setup_operation)");
+    }
+    /** Phase predicates are fixed by the two callers; exact session identity and post-lock DBUTC stay shared. */
+    private Enrollment authenticatedEnrollment(Reservation r,CustomerSessionContext session,Instant now,String phase){
         String scopes=session.scopes().stream().map(s->"\""+s.name()+"\"").sorted().collect(java.util.stream.Collectors.joining(",","[","]"));
-        // Match V36 enrollment/pending identity and lifecycle semantics, without requiring the not-yet-created SETUP.
-        // clock_timestamp is evaluated only after the operation/session/root locks above have completed.
+        // No SDK I/O: clock_timestamp is evaluated only after the operation/session/root locks have completed.
         require("""
             select exists(select 1 from stripe_billing_failed_method_reservations r
             join stripe_billing_failed_renewals d on d.id=r.admission_id join subscription_operations o on o.id=r.setup_operation
             join customer_sessions c on c.id=r.browser_session_id
             join customers customer on customer.id=d.customer_id and customer.site_id=d.site_id
             join sites site on site.id=d.site_id join site_allowed_origins origin on origin.site_id=site.id and origin.origin=c.origin
-            where r.id=? and owned_method_debt(r.id,0,o.id) and owned_method_initial_operation(r.id)
+            where r.id=? and %s
             and r.request_fingerprint=owned_method_browser_request(d.id,r.browser_origin)
             and row(c.site_id,c.customer_id,c.origin,c.expires_at)=row(d.site_id,d.customer_id,r.browser_origin,r.browser_session_expires_at)
             and row(c.id,c.site_id,c.customer_id,c.origin,c.expires_at)=row(?::uuid,?::uuid,?::uuid,?::text,?::timestamptz)
             and c.scopes @> ?::jsonb and c.scopes <@ ?::jsonb and c.scopes @> '["SUBSCRIPTION_MANAGE"]'::jsonb
             and c.revoked_at is null and c.issued_at<=r.reserved_at and customer.status='ACTIVE' and site.status='ACTIVE'
             and ?<=clock_timestamp() and ?<r.browser_session_expires_at and clock_timestamp()<r.browser_session_expires_at)
-            """,r.id(),session.sessionId().value(),session.siteId().value(),session.customerId().value(),session.origin(),time(session.expiresAt()),
+            """.formatted(phase),r.id(),session.sessionId().value(),session.siteId().value(),session.customerId().value(),session.origin(),time(session.expiresAt()),
             scopes,scopes,time(now),time(now));
         var enrollment=jdbc.query("select browser_session_id,browser_origin,browser_session_expires_at from stripe_billing_failed_method_reservations where id=?",
             (row,n)->new Enrollment(uuid(row,"browser_session_id"),row.getString("browser_origin"),instant(row,"browser_session_expires_at")),r.id())

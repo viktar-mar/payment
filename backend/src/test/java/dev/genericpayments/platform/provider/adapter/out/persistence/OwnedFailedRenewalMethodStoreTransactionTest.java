@@ -16,9 +16,11 @@ class OwnedFailedRenewalMethodStoreTransactionTest {
             ()->s.requireMethodContextInTransaction(null,null),()->s.recordCompletionInTransaction(null,null,null,null),
             ()->s.requireCompletionInTransaction(null,null),()->s.associateRecoveryInTransaction(null,null,null,null),
             ()->s.requireRecoveryInTransaction(null,null),()->s.requireRecoveredContextInTransaction(null,null),
+            ()->s.requireBrowserRecoveryEnrollmentInTransaction(null,null,null),
             ()->s.recordPublicationInTransaction(null,null,null),()->s.publicationInTransaction(null),
             ()->s.requireMethodFactInTransaction(null,null,null,null,null),()->s.requireRecoveryFactInTransaction(null,null,null,null,null));
         for(var call:calls)assertThatThrownBy(call::run).isInstanceOf(IllegalStateException.class)
             .hasMessage("Owned method transition requires caller transaction");
     }
+
 }

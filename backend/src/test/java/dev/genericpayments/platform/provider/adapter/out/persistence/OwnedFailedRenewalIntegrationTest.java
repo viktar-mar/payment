@@ -1195,6 +1195,195 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(methodBillingProofs.setup(billing.id(),operation.id()).orElseThrow().method()).isNull();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();assertThat(http.replies).isEmpty();
         assertThat(rows("stripe_billing_method_browser_roots").toString()).doesNotContain(action.secret(),"_secret_INERT","pk_test_");
     }
+    private record RecoveryPrepared(PendingMethod pending,PreparedMethod prepared,OwnedFailedRenewalMethod.Completion completion,
+            OwnedFailedRenewalMethod.Recovery recovery) {
+        @Override public String toString(){return "RecoveryPrepared[redacted]";}
+    }
+    /** Real original browser HTTP issuance/selection/consumption precedes all independent downstream writers. */
+    private RecoveryPrepared recoveryPrepared(boolean legacy,int sessionSeconds) throws Exception {
+        var pending=pendingMethod(true,sessionSeconds);controllerBrowserPermission(pending,legacy);
+        var prepared=preparedMethod(pending);int start=http.calls.size();methodGraph(prepared);
+        var completion=methodObserver(prepared.service()).observeMethod(prepared.reservation());assertObservationSlice(prepared,start,17);
+        var recovery=prepared.service().reserveRecovery(prepared.reservation(),completion);
+        return new RecoveryPrepared(pending,prepared,completion,recovery);
+    }
+    private OwnedFailedRenewalMethod.RecoveryPreparationContext inspectRecovery(RecoveryPrepared p){
+        return p.pending().service().inspectBrowserRecoveryPreparation(p.pending().reservation(),p.completion(),p.recovery(),p.pending().context());
+    }
+    private Map<String,List<String>> recoveryPreparationRows(){
+        var state=new TreeMap<>(authorityRows());
+        for(var table:List.of("provider_operations","stripe_subscription_setup_proofs","stripe_billing_failed_method_reservations",
+                "stripe_billing_failed_method_reads","stripe_billing_failed_method_completions","stripe_billing_failed_method_recoveries",
+                "stripe_billing_failed_method_publications","stripe_billing_failed_renewal_stops","stripe_billing_method_browser_roots",
+                "stripe_billing_method_browser_selections","stripe_billing_method_browser_releases","stripe_billing_method_browser_consumptions",
+                "subscription_events","outbox_events"))state.put(table,rows(table));
+        return state;
+    }
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void originalBrowserRecoveryPreparationDescribesTheSameReservedDebtWithoutAnyWriteOrSdkCall(boolean legacy) throws Exception {
+        var p=recoveryPrepared(legacy,0);var pending=p.pending();var r=pending.reservation();
+        var original=((SubscriptionActor.Customer)pending.context().actor()).session();
+        assertThat(sessions.resolveRequired(pending.customerToken(),original.origin())).isEqualTo(original);
+        var before=financialState();var receipts=recoveryPreparationRows();int calls=http.calls.size();
+        var c=inspectRecovery(p);assertThat(inspectRecovery(p)).isEqualTo(c);
+        assertThat(c.reservation()).isEqualTo(r);assertThat(c.completion()).isEqualTo(p.completion());assertThat(c.recovery()).isEqualTo(p.recovery());
+        assertThat(c.enrollment()).isEqualTo(new OwnedMethodBrowser.Enrollment(original.sessionId().value(),original.origin(),original.expiresAt()));
+        assertThat(c.account()).isEqualTo(billing);assertThat(c.subscription()).isEqualTo(current());assertThat(c.binding()).isEqualTo(r.binding());
+        assertThat(c.billingSample()).isEqualTo(r.billingSample());assertThat(c.setupOperation().id()).isEqualTo(r.setupOperationId());
+        assertThat(c.setupOperation().status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);assertThat(c.setupOperation().version()).isEqualTo(p.completion().setupFinalVersion());
+        assertThat(c.recoveryOperation().id()).isEqualTo(p.recovery().association().operationId());assertThat(c.recoveryOperation().status()).isEqualTo(SubscriptionOperation.Status.RESERVED);
+        assertThat(c.recoveryOperation().version()).isEqualTo(p.recovery().association().operationVersion());assertThat(c.toString()).isEqualTo("RecoveryPreparationContext[redacted]");
+        assertThat(transaction.requiresNew(()->browserStore().requireBrowserRecoveryEnrollmentInTransaction(r,original,browserNow()))).isEqualTo(c.enrollment());
+        // Earlier phases remain closed after completion; no fresh root/action can be minted.
+        assertThatThrownBy(()->browserService(pending,browserStore()).get(new GetSubscriptionActionUseCase.Query(browserCommand(pending,null),current().id(),r.setupOperationId()))).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->pending.service().inspectBrowserSetupPreparation(r,pending.context())).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->pending.service().inspectBrowserMethodPreparation(r,pending.context())).isInstanceOf(RuntimeException.class);
+        assertThat(financialState()).isEqualTo(before);assertThat(recoveryPreparationRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+        assertThat(count("stripe_billing_method_browser_roots")).isEqualTo(1);assertThat(count("stripe_billing_method_browser_consumptions")).isEqualTo(1);
+        assertThat(count("stripe_billing_failed_method_completions")).isEqualTo(1);assertThat(count("stripe_billing_failed_method_recoveries")).isEqualTo(1);
+        assertThat(count("payments")).isEqualTo(1);assertThat(count("stripe_billing_failed_method_publications")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @ParameterizedTest @ValueSource(strings={"session","revoked","expired","scopes","missing-scope","site","customer","expiry-nanosecond","origin","key","ambient","future"})
+    void recoveryPreparationRequiresTheExactLiveOriginalManagementAuthority(String mutation) throws Exception {
+        var p=recoveryPrepared(false,0);var pending=p.pending();var context=pending.context();var original=((SubscriptionActor.Customer)context.actor()).session();var supplied=original;
+        if(mutation.equals("session")){
+            TestClock.set(jdbc.queryForObject("select issued_at from customer_sessions where id=?",java.sql.Timestamp.class,original.sessionId().value()).toInstant());
+            var replacement=sessions.issue(site,customer,original.origin());supplied=sessions.resolveRequired(replacement.rawToken(),original.origin());TestClock.set(Instant.now());
+            assertThat(supplied.sessionId()).isNotEqualTo(original.sessionId());assertThat(supplied.expiresAt()).isEqualTo(original.expiresAt());
+            var live=supplied;assertThat(transaction.requiresNew(()->sessions.revalidate(live,site,live.origin(),CustomerSessionScope.SUBSCRIPTION_MANAGE))).isEqualTo(live);
+        }
+        if(mutation.equals("expiry-nanosecond"))supplied=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(original.sessionId(),original.siteId(),original.customerId(),original.origin(),original.scopes(),original.expiresAt().plusNanos(1));
+        if(Set.of("missing-scope","site","customer").contains(mutation))supplied=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(original.sessionId(),mutation.equals("site")?new SiteId(UUID.randomUUID()):original.siteId(),mutation.equals("customer")?new CustomerId(UUID.randomUUID()):original.customerId(),original.origin(),mutation.equals("missing-scope")?Set.of(CustomerSessionScope.SUBSCRIPTION_READ):original.scopes(),original.expiresAt());
+        if(mutation.equals("revoked"))jdbc.update("update customer_sessions set revoked_at=clock_timestamp(),revoked_reason='LOGOUT' where id=?",original.sessionId().value());
+        if(mutation.equals("expired"))jdbc.update("update customer_sessions set expires_at=clock_timestamp() where id=?",original.sessionId().value());
+        if(mutation.equals("scopes"))jdbc.update("update customer_sessions set scopes='[\"SUBSCRIPTION_MANAGE\",\"SUBSCRIPTION_READ\"]'::jsonb where id=?",original.sessionId().value());
+        var changed=new SubscriptionCommandContext(new SubscriptionActor.Customer(supplied),site,customer,mutation.equals("origin")?"https://foreign.test":original.origin(),mutation.equals("key")?"foreign":context.idempotencyKey(),"recovery-inspect");
+        var session=supplied;var before=financialState();var receipts=recoveryPreparationRows();int calls=http.calls.size();
+        if(mutation.equals("ambient"))assertThatThrownBy(()->transaction.requiresNew(()->inspectRecovery(p))).isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method transition requires an outer transaction boundary");
+        else if(mutation.equals("future"))assertThatThrownBy(()->transaction.requiresNew(()->browserStore().requireBrowserRecoveryEnrollmentInTransaction(pending.reservation(),session,browserNow().plusSeconds(60)))).isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
+        else {
+            assertThatThrownBy(()->pending.service().inspectBrowserRecoveryPreparation(pending.reservation(),p.completion(),p.recovery(),changed)).isInstanceOf(RuntimeException.class);
+            if(!Set.of("key","origin").contains(mutation))assertThatThrownBy(()->transaction.requiresNew(()->browserStore().requireBrowserRecoveryEnrollmentInTransaction(pending.reservation(),session,browserNow()))).isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
+        }
+        assertThat(financialState()).isEqualTo(before);assertThat(recoveryPreparationRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+    }
+    @ParameterizedTest @ValueSource(strings={"stop","sequence","setup-version","setup-authority","recover-version","recover-status","bill-version","debt"})
+    void recoveryPreparationRefusesInterveningDurableLineageOrDebtDriftWithoutAnotherMutation(String mutation) throws Exception {
+        var p=recoveryPrepared(false,0);var pending=p.pending();var r=pending.reservation();
+        assertThat(inspectRecovery(p).recovery()).isEqualTo(p.recovery());
+        switch(mutation){
+            case "stop"->service(store(),null).stop(r.admission(),Reason.AUTHORITY_DRIFT);
+            case "sequence"->jdbc.update("update subscriptions set observation_sequence=observation_sequence+1 where id=?",current().id());
+            case "setup-version"->jdbc.update("update subscription_operations set version=version+1,updated_at=clock_timestamp() where id=?",r.setupOperationId());
+            case "setup-authority"->jdbc.update("update subscription_operations set authority_scope='foreign',version=version+1,updated_at=clock_timestamp() where id=?",r.setupOperationId());
+            case "recover-version"->jdbc.update("update subscription_operations set version=version+1,updated_at=clock_timestamp() where id=?",p.recovery().association().operationId());
+            case "recover-status"->jdbc.update("update subscription_operations set status='PROCESSING',version=version+1,updated_at=clock_timestamp() where id=?",p.recovery().association().operationId());
+            case "bill-version"->jdbc.update("update subscription_billing_records set version=version+1 where id=?",r.failure().billId());
+            default->jdbc.update("update subscriptions set grace_deadline=grace_deadline+interval '1 second' where id=?",current().id());
+        }
+        var before=financialState();var receipts=recoveryPreparationRows();int calls=http.calls.size();
+        assertThatThrownBy(()->inspectRecovery(p)).isInstanceOf(RuntimeException.class);
+        var session=((SubscriptionActor.Customer)pending.context().actor()).session();
+        assertThatThrownBy(()->transaction.requiresNew(()->browserStore().requireBrowserRecoveryEnrollmentInTransaction(r,session,browserNow()))).isInstanceOf(IllegalStateException.class);
+        assertThat(financialState()).isEqualTo(before);assertThat(recoveryPreparationRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+    }
+    @Test void originalRecoveryAssociationPreventsReplacingItsInvoiceBeforeInspection() throws Exception {
+        var p=recoveryPrepared(false,0);var before=financialState();var receipts=recoveryPreparationRows();int calls=http.calls.size();
+        assertThatThrownBy(()->jdbc.update("update subscription_billing_records set provider_invoice_reference='in_foreign',version=version+1 where id=?",p.pending().failure().billId()))
+            .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class).hasStackTraceContaining("foreign key constraint");
+        assertThat(inspectRecovery(p).recovery()).isEqualTo(p.recovery());assertThat(financialState()).isEqualTo(before);
+        assertThat(recoveryPreparationRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+    }
+    @ParameterizedTest @ValueSource(strings={"completion","completion-sequence","recovery","association","recovery-sequence","missing-completion","missing-recovery"})
+    void recoveryPreparationAuthenticatesBothOriginalDurableReceipts(String mutation) throws Exception {
+        var p=recoveryPrepared(false,0);var c=p.completion();var x=p.recovery();
+        var completion=mutation.equals("missing-completion")?null:new OwnedFailedRenewalMethod.Completion(c.reservationId(),mutation.equals("completion")?UUID.randomUUID():c.claimId(),c.setupOperationId(),c.setupFinalVersion(),c.setupStepId(),c.setupStepVersion(),c.methodStepId(),c.methodStepVersion(),c.setupIntent(),c.method(),c.revision(),mutation.equals("completion-sequence")?c.observationSequence()+1:c.observationSequence(),c.completedAt());
+        var a=x.association();var association=new Recovery(a.admissionId(),mutation.equals("association")?UUID.randomUUID():a.operationId(),a.billId(),a.allocation(),a.paymentIntent(),a.expectedRevision(),a.operationVersion(),a.associatedAt());
+        var recovery=mutation.equals("missing-recovery")?null:new OwnedFailedRenewalMethod.Recovery(mutation.equals("recovery")?UUID.randomUUID():x.reservationId(),association,mutation.equals("recovery-sequence")?x.observationSequence()+1:x.observationSequence());
+        var before=financialState();var receipts=recoveryPreparationRows();int calls=http.calls.size();
+        assertThatThrownBy(()->p.pending().service().inspectBrowserRecoveryPreparation(p.pending().reservation(),completion,recovery,p.pending().context())).isInstanceOf(RuntimeException.class);
+        assertThat(financialState()).isEqualTo(before);assertThat(recoveryPreparationRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);assertThat(inspectRecovery(p).completion()).isEqualTo(c);
+    }
+    @ParameterizedTest @ValueSource(strings={"root","selection","release","consumption","uncommitted-consumption","missing-enrollment","partial-enrollment"})
+    void recoveryEnrollmentRefusesMissingPartialOrUncommittedOriginalBrowserEvidence(String mutation) throws Exception {
+        var p=recoveryPrepared(false,0);var pending=p.pending();var r=pending.reservation();var session=((SubscriptionActor.Customer)pending.context().actor()).session();
+        var before=financialState();var receipts=recoveryPreparationRows();int calls=http.calls.size();
+        // Corruption controls are rollback-only. No successful completion, proof, ACK or permission is seeded.
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            if(mutation.endsWith("enrollment")){
+                jdbc.execute("alter table stripe_billing_failed_method_reservations disable trigger failed_method_reservation_immutable");
+                if(mutation.equals("partial-enrollment")){
+                    jdbc.execute("alter table stripe_billing_failed_method_reservations drop constraint owned_method_browser_enrollment");
+                    jdbc.update("update stripe_billing_failed_method_reservations set browser_origin=null where id=?",r.id());
+                }else jdbc.update("update stripe_billing_failed_method_reservations set browser_session_id=null,browser_origin=null,browser_session_expires_at=null where id=?",r.id());
+            }else{
+                jdbc.execute("alter table stripe_billing_method_browser_consumptions disable trigger method_browser_consumption_immutable");
+                if(mutation.equals("uncommitted-consumption"))jdbc.update("update stripe_billing_method_browser_consumptions set recorded_transaction=pg_current_xact_id() where root_id=(select id from stripe_billing_method_browser_roots where reservation_id=?)",r.id());
+                else{
+                    jdbc.update("delete from stripe_billing_method_browser_consumptions where root_id=(select id from stripe_billing_method_browser_roots where reservation_id=?)",r.id());
+                    if(!mutation.equals("consumption")){
+                        jdbc.execute("alter table stripe_billing_method_browser_releases disable trigger method_browser_release_immutable");
+                        jdbc.update("delete from stripe_billing_method_browser_releases where root_id=(select id from stripe_billing_method_browser_roots where reservation_id=?)",r.id());
+                    }
+                    if(Set.of("root","selection").contains(mutation)){
+                        jdbc.execute("alter table stripe_billing_method_browser_selections disable trigger method_browser_selection_immutable");
+                        jdbc.update("delete from stripe_billing_method_browser_selections where root_id=(select id from stripe_billing_method_browser_roots where reservation_id=?)",r.id());
+                    }
+                    if(mutation.equals("root")){
+                        jdbc.execute("alter table stripe_billing_method_browser_roots disable trigger method_browser_root_immutable");
+                        jdbc.update("delete from stripe_billing_method_browser_roots where reservation_id=?",r.id());
+                    }
+                }
+            }
+            return browserStore().requireBrowserRecoveryEnrollmentInTransaction(r,session,browserNow());
+        })).isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
+        assertThat(financialState()).isEqualTo(before);assertThat(recoveryPreparationRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);assertThat(inspectRecovery(p).recovery()).isEqualTo(p.recovery());
+    }
+    @Test void nonBrowserCompletionAndRecoveryNeverGainBrowserRecoveryEnrollment(){
+        var prepared=preparedMethod();methodGraph(prepared);var completion=methodObserver(prepared.service()).observeMethod(prepared.reservation());var recovery=prepared.service().reserveRecovery(prepared.reservation(),completion);
+        var context=managementContext("genuine-owned-method");var session=((SubscriptionActor.Customer)context.actor()).session();var before=financialState();var receipts=recoveryPreparationRows();int calls=http.calls.size();
+        assertThatThrownBy(()->transaction.requiresNew(()->browserStore().requireBrowserRecoveryEnrollmentInTransaction(prepared.reservation(),session,browserNow()))).isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");
+        assertThatThrownBy(()->prepared.service().inspectBrowserRecoveryPreparation(prepared.reservation(),completion,recovery,context)).isInstanceOf(RuntimeException.class);
+        assertThat(financialState()).isEqualTo(before);assertThat(recoveryPreparationRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+    }
+    @ParameterizedTest @ValueSource(strings={"expiry","revocation"})
+    void recoveryEnrollmentRechecksFreshAuthorityAfterAnObservedBlockingOriginalOperationLock(String mutation) throws Exception {
+        var p=recoveryPrepared(false,mutation.equals("expiry")?20:0);var pending=p.pending();var r=pending.reservation();var session=((SubscriptionActor.Customer)pending.context().actor()).session();
+        var stale=browserNow();assertThat(stale).isBefore(session.expiresAt());
+        assertThat(transaction.requiresNew(()->browserStore().requireBrowserRecoveryEnrollmentInTransaction(r,session,stale)).sessionId()).isEqualTo(session.sessionId().value());
+        var before=financialState();var receipts=recoveryPreparationRows();int calls=http.calls.size();var locked=new CountDownLatch(1);var release=new CountDownLatch(1);var attempting=new CountDownLatch(1);
+        var blockerPid=new java.util.concurrent.atomic.AtomicInteger();var workerPid=new java.util.concurrent.atomic.AtomicInteger();
+        try(var workers=new BoundedWorkers()){
+            var blocker=workers.submit(()->transaction.requiresNew(()->{
+                lifecycleOperations.lock(r.setupOperationId());blockerPid.set(jdbc.queryForObject("select pg_backend_pid()",Integer.class));locked.countDown();
+                try{if(!release.await(30,TimeUnit.SECONDS))throw new AssertionError("recovery enrollment wait timed out");}
+                catch(InterruptedException e){Thread.currentThread().interrupt();throw new AssertionError(e);}return true;
+            }));
+            try{
+                assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
+                var refused=workers.submit(()->{assertThatThrownBy(()->transaction.requiresNew(()->{
+                    workerPid.set(jdbc.queryForObject("select pg_backend_pid()",Integer.class));attempting.countDown();
+                    return browserStore().requireBrowserRecoveryEnrollmentInTransaction(r,session,stale);
+                })).isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");return true;});
+                assertThat(attempting.await(5,TimeUnit.SECONDS)).isTrue();boolean blocked=false;long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);
+                while(System.nanoTime()<deadline){
+                    blocked=Boolean.TRUE.equals(jdbc.queryForObject("select ?=any(pg_blocking_pids(?))",Boolean.class,blockerPid.get(),workerPid.get()));
+                    if(blocked)break;Thread.sleep(20);
+                }
+                assertThat(blocked).as("recovery validator actually waits for this operation-lock holder").isTrue();assertThat(refused.isDone()).isFalse();
+                if(mutation.equals("revocation"))jdbc.update("update customer_sessions set revoked_at=clock_timestamp(),revoked_reason='LOGOUT' where id=?",session.sessionId().value());
+                else{
+                    var dbNow=jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant();assertThat(dbNow).isBefore(session.expiresAt());
+                    var wait=Duration.between(dbNow,session.expiresAt()).plusMillis(100);assertThat(wait).isPositive().isLessThan(Duration.ofSeconds(21));Thread.sleep(wait);
+                    assertThat(jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant()).isAfterOrEqualTo(session.expiresAt());
+                    assertThat(jdbc.queryForObject("select expires_at from customer_sessions where id=?",java.sql.Timestamp.class,session.sessionId().value()).toInstant()).isEqualTo(session.expiresAt());
+                }
+                release.countDown();assertThat(blocker.get(10,TimeUnit.SECONDS)).isTrue();assertThat(refused.get(10,TimeUnit.SECONDS)).isTrue();
+            }finally{release.countDown();}
+        }
+        assertThat(financialState()).isEqualTo(before);assertThat(recoveryPreparationRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+    }
+
     @Test void explicitBrowserIssuerLostReleaseRollsBackSecretReceiptAndCannotReadAgain(){
         var p=pendingMethod(true);var real=browserStore();
         var broken=(OwnedFailedRenewalMethodStore)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{OwnedFailedRenewalMethodStore.class},(proxy,method,args)->{
