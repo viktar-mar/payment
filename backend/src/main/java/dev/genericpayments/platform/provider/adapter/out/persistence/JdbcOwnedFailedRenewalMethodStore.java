@@ -3,6 +3,8 @@ package dev.genericpayments.platform.provider.adapter.out.persistence;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.*;
+import dev.genericpayments.platform.provider.application.model.OwnedMethodBrowser.*;
+import dev.genericpayments.platform.customers.application.model.CustomerSessionContext;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore;
 import dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding;
@@ -46,6 +48,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
     /** Provider reserve/claim/dispatch/ACK phase. No own ACK or not-yet-created setup proof is required. */
     static void requireStepResource(JdbcTemplate jdbc,PaymentAccountId account,ProviderOperation.Kind kind,UUID resource,String key,String fingerprint) {
         if(kind!=ProviderOperation.Kind.SETUP_INTENT_CREATE&&kind!=ProviderOperation.Kind.SUBSCRIPTION_UPDATE)throw unavailable();
+        jdbc.queryForList("select id from subscription_operations where id=? for update",UUID.class,resource);
         var store=new JdbcOwnedFailedRenewalMethodStore(jdbc);var r=stepReservation(jdbc,account,resource);
         store.requireReservationInTransaction(r);
         store.require("select owned_method_debt(?,0,?) and owned_method_initial_operation(?)",r.id(),resource,r.id());
@@ -55,6 +58,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         String expected=jdbc.queryForObject("select owned_method_step_fingerprint(?,?)",String.class,r.id(),method);
         if(!Objects.equals(fingerprint,expected)||!key.equals(o.providerOperationKey()+(method?":METHOD":":SETUP")))throw unavailable();
         if(method) {
+            store.require("select owned_method_browser_permit(?)",resource);
             var p=store.setup(r);var setup=JdbcProviderOperationStore.row(jdbc,p.step()).orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable);
             var owner=r.admission().firstRenewalAdmission().receipt().intent().clock().owner();
             String setupFingerprint=jdbc.queryForObject("select owned_method_step_fingerprint(?,false)",String.class,r.id());
@@ -70,6 +74,14 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
 
     @Override public Reservation reserveInTransaction(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,
             SubscriptionOperation setup,CustomerBinding binding,Sample sample,Instant now) {
+        return reserve(a,f,setup,binding,sample,now,null);
+    }
+    @Override public Reservation reserveBrowserInTransaction(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,
+            SubscriptionOperation setup,CustomerBinding binding,Sample sample,Instant now,Enrollment enrollment) {
+        transaction();if(enrollment==null)throw unavailable();return reserve(a,f,setup,binding,sample,now,enrollment);
+    }
+    private Reservation reserve(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,
+            SubscriptionOperation setup,CustomerBinding binding,Sample sample,Instant now,Enrollment enrollment) {
         transaction();if(a==null||f==null||setup==null)throw unavailable();
         JdbcOwnedFirstRenewalStore.requireStoredFailedPredecessor(jdbc,a.firstRenewalAdmission(),a.ready(),a.boundary());
         if(!JdbcOwnedFirstRenewalStore.storedFailedAdmission(jdbc,a.id()).equals(a)
@@ -80,13 +92,23 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         if(!operation(r,setup.id()).equals(setup))throw unavailable();
         int count=jdbc.update("""
             insert into stripe_billing_failed_method_reservations(id,admission_id,setup_operation,request_fingerprint,initial_operation_version,
-             operation_snapshot,binding_id,binding_version,binding_reference,binding_creation_operation,billing_at,billing_mode,reserved_at)
-            select ?,?,?,?, ?,to_jsonb(o),?,?,?,?,?,'ISOLATED',? from subscription_operations o where o.id=?
+             operation_snapshot,binding_id,binding_version,binding_reference,binding_creation_operation,billing_at,billing_mode,reserved_at,
+             browser_session_id,browser_origin,browser_session_expires_at)
+            select ?,?,?,?, ?,to_jsonb(o),?,?,?,?,?,'ISOLATED',?,?,?,? from subscription_operations o where o.id=?
             """,r.id(),a.id(),setup.id(),r.requestFingerprint(),r.initialOperationVersion(),binding.id(),binding.version(),binding.providerReference(),
-            binding.creationOperationId(),time(sample.billingAt()),time(r.reservedAt()),setup.id());
+            binding.creationOperationId(),time(sample.billingAt()),time(r.reservedAt()),enrollment==null?null:enrollment.sessionId(),
+            enrollment==null?null:enrollment.origin(),enrollment==null?null:time(enrollment.sessionExpiresAt()),setup.id());
         if(count!=1)throw unavailable();
         return requireReservationInTransaction(r);
     }
+    private JdbcOwnedMethodBrowserStore browser(){return new JdbcOwnedMethodBrowserStore(jdbc,this);}
+    @Override public Pending requireBrowserPendingInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().pending(r,s,now);}
+    @Override public Optional<Root> browserRootInTransaction(UUID r){return browser().root(r);}
+    @Override public Root insertBrowserRootInTransaction(Pending p,Root r){return browser().insert(p,r);}
+    @Override public void requireBrowserActionInTransaction(Pending p,Root r,Instant now){browser().action(p,r,now);}
+    @Override public Selection startBrowserSelectionInTransaction(Pending p,Root r,String key,Instant now){return browser().start(p,r,key,now);}
+    @Override public void finishBrowserSelectionInTransaction(Pending p,Root r,Selection s,Instant now){browser().finish(p,r,s,now);}
+    @Override public boolean consumeBrowserFirstInTransaction(Pending p,Root r,String key,String fingerprint,Instant now){return browser().consume(p,r,key,fingerprint,now);}
     @Override public Reservation requireReservationInTransaction(Reservation expected) {
         transaction();if(expected==null)throw unavailable();
         var a=expected.admission();
@@ -289,17 +311,17 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         if(ids.size()!=1)throw unavailable();
         return new MethodReadContext(account(r),subscription(r),r.binding(),o,p,setup,JdbcProviderOperationStore.row(jdbc,ids.getFirst()).orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable),r.billingSample());
     }
-    private Setup setup(Reservation r) {
+    Setup setup(Reservation r) {
         return jdbc.query("select * from stripe_subscription_setup_proofs where operation_id=? and payment_account_id=?",(row,n)->new Setup(uuid(row,"operation_id"),uuid(row,"subscription_id"),r.binding().accountId(),uuid(row,"step_id"),row.getString("setup_reference"),row.getString("method_reference")),r.setupOperationId(),r.binding().accountId().value())
             .stream().findFirst().orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable);
     }
-    private SubscriptionOperation operation(Reservation r,UUID id) {
+    SubscriptionOperation operation(Reservation r,UUID id) {
         return new SubscriptionOperationPersistenceAdapter(jdbc).find(r.binding().siteId(),r.admission().firstRenewalAdmission().receipt().intent().subscription(),id).orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable);
     }
-    private Subscription subscription(Reservation r) {
+    Subscription subscription(Reservation r) {
         return new SubscriptionPersistenceAdapter(jdbc).find(r.binding().siteId(),r.admission().firstRenewalAdmission().receipt().intent().subscription()).orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable);
     }
-    private PaymentAccount account(Reservation r) {
+    PaymentAccount account(Reservation r) {
         return jdbc.query("select * from payment_accounts where id=?",(row,n)->new PaymentAccount(r.binding().accountId(),row.getString("account_key"),PaymentProviderType.valueOf(row.getString("provider")),
             PaymentAccountMode.valueOf(row.getString("account_mode")),PaymentAccountStatus.valueOf(row.getString("account_status")),row.getString("external_account_id"),row.getString("credentials_ref")),r.binding().accountId().value()).stream().findFirst().orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable);
     }

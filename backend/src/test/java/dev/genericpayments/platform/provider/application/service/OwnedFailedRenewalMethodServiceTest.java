@@ -19,6 +19,36 @@ import static dev.genericpayments.platform.provider.application.service.OwnedFai
 
 /** Stateful caller transactions and actual FactService; all provider/persistence ports are inert. */
 class OwnedFailedRenewalMethodServiceTest {
+    @Test void browserEnrollmentIsAtomicWithTheActualOriginalSetupAndGetNeedsNoReservationKey() {
+        var h=new Harness(true);var r=h.service.reserveBrowserMethod(h.b.admission,h.context,true);
+        var session=((SubscriptionActor.Customer)h.context.actor()).session();
+        assertThat(h.enrollment).isEqualTo(new OwnedMethodBrowser.Enrollment(session.sessionId().value(),session.origin(),session.expiresAt()));
+        assertThat(h.b.ops.get(r.setupOperationId()).status()).isEqualTo(SubscriptionOperation.Status.RESERVED);
+        h.acks=true;
+        var get=new SubscriptionCommandContext(h.context.actor(),h.context.siteId(),h.context.customerId(),h.context.origin(),null,"get");
+        var pending=h.service.browserPhase(r,get,p->p);
+        assertThat(pending.enrollment()).isEqualTo(h.enrollment);assertThat(pending.setup().method()).isNull();
+        assertThat(pending.operation()).isEqualTo(h.b.ops.get(r.setupOperationId()));assertThat(h.b.stopped).isFalse();
+    }
+    @Test void browserClientFailuresNeverStopTheAdmissionAndEnrollmentFailureRollsBackOriginalClaim() {
+        for(var bad:List.of("consent","admin","ambient","insert")) {
+            var h=new Harness(!bad.equals("admin"));h.failReceipt=bad.equals("insert");h.b.active=bad.equals("ambient");
+            assertThatThrownBy(()->h.service.reserveBrowserMethod(h.b.admission,h.context,!bad.equals("consent"))).isInstanceOf(RuntimeException.class);
+            assertThat(h.reservation).isNull();assertThat(h.enrollment).isNull();assertThat(h.b.ops).hasSize(1);assertThat(h.b.stopped).isFalse();
+        }
+    }
+    @Test void browserPhasePinsOriginalSessionAndOriginAndCannotEnrollAnOlderReservation() {
+        for(var bad:List.of("session","origin","late","acks","expired")) {
+            var h=new Harness(true);var r=bad.equals("late")?h.reserve():h.service.reserveBrowserMethod(h.b.admission,h.context,true);h.acks=!bad.equals("acks");
+            var s=((SubscriptionActor.Customer)h.context.actor()).session();
+            if(bad.equals("expired"))h.b.utc=s.expiresAt();
+            var changed=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(
+                bad.equals("session")?new dev.genericpayments.platform.customers.domain.CustomerSessionId(UUID.randomUUID()):s.sessionId(),s.siteId(),s.customerId(),
+                bad.equals("origin")?"https://other.example":s.origin(),s.scopes(),s.expiresAt());
+            var c=new SubscriptionCommandContext(new SubscriptionActor.Customer(changed),s.siteId(),s.customerId(),changed.origin(),null,"get");
+            assertThatThrownBy(()->h.service.browserPhase(r,c,p->p)).isInstanceOf(RuntimeException.class);assertThat(h.b.stopped).isFalse();
+        }
+    }
     @Test void trueConsentReservationPinsPrincipalDebtSequenceAndClaimBeforeAuthorityLocks() {
         var h=new Harness();var r=h.reserve();var f=h.b.failure;var o=h.b.ops.get(r.setupOperationId());
         assertThat(o.authorityScope()).isEqualTo("owned-failed-renewal-method:"+h.b.admission.id());
@@ -120,13 +150,16 @@ class OwnedFailedRenewalMethodServiceTest {
     static class Harness {
         final OwnedFailedRenewalServiceTest.Harness b=new OwnedFailedRenewalServiceTest.Harness(true);
         final SubscriptionCommandContext context;final OwnedFailedRenewalMethodService service;
-        Reservation reservation;Completion completion;Recovery recovery;Publication publication;Map<Phase,ReadClaim> claims=new HashMap<>();boolean acks,authorized=true,failReceipt;
-        Harness(){
+        Reservation reservation;OwnedMethodBrowser.Enrollment enrollment;Completion completion;Recovery recovery;Publication publication;Map<Phase,ReadClaim> claims=new HashMap<>();boolean acks,authorized=true,failReceipt;
+        Harness(){this(false);}
+        Harness(boolean customerActor){
             b.fail();b.trace.clear();
-            context=new SubscriptionCommandContext(new SubscriptionActor.Admin(new dev.genericpayments.platform.admin.application.port.in.AuthenticatedAdmin(new dev.genericpayments.platform.admin.domain.AdminUserId(UUID.randomUUID()),"admin",new dev.genericpayments.platform.admin.domain.AdminSessionId(UUID.randomUUID()),UTC.plusSeconds(600))),b.owner.site(),b.owner.customer(),"https://test.example","setup-key","test");
-            var tx=new SubscriptionTransactionPort(){public boolean active(){return b.active;}public <T>T required(Supplier<T> work){return requiresNew(work);}public <T>T requiresNew(Supplier<T> work){var oldR=reservation;var oldC=completion;var oldX=recovery;var oldP=publication;var oldClaims=new HashMap<>(claims);try{return b.transactionPort.requiresNew(work);}catch(RuntimeException e){reservation=oldR;completion=oldC;recovery=oldX;publication=oldP;claims=oldClaims;throw e;}}};
+            SubscriptionActor actor=customerActor?new SubscriptionActor.Customer(new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(new dev.genericpayments.platform.customers.domain.CustomerSessionId(UUID.randomUUID()),b.owner.site(),b.owner.customer(),"https://test.example",Set.of(dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_MANAGE),UTC.plusSeconds(600))):new SubscriptionActor.Admin(new dev.genericpayments.platform.admin.application.port.in.AuthenticatedAdmin(new dev.genericpayments.platform.admin.domain.AdminUserId(UUID.randomUUID()),"admin",new dev.genericpayments.platform.admin.domain.AdminSessionId(UUID.randomUUID()),UTC.plusSeconds(600)));
+            context=new SubscriptionCommandContext(actor,b.owner.site(),b.owner.customer(),"https://test.example","setup-key","test");
+            var tx=new SubscriptionTransactionPort(){public boolean active(){return b.active;}public <T>T required(Supplier<T> work){return requiresNew(work);}public <T>T requiresNew(Supplier<T> work){var oldR=reservation;var oldE=enrollment;var oldC=completion;var oldX=recovery;var oldP=publication;var oldClaims=new HashMap<>(claims);try{return b.transactionPort.requiresNew(work);}catch(RuntimeException e){reservation=oldR;enrollment=oldE;completion=oldC;recovery=oldX;publication=oldP;claims=oldClaims;throw e;}}};
             var store=port(OwnedFailedRenewalMethodStore.class,(m,a)->{assertThat(b.active).isTrue();return switch(m){
-                case "reserveInTransaction"->{b.trace.add("reservation");if(reservation!=null)throw new IllegalStateException("duplicate");var o=(SubscriptionOperation)a[2];reservation=new Reservation(UUID.randomUUID(),b.admission,b.failure,o.id(),o.fingerprint(),0,b.binding,(SubscriptionBillingTimePort.Sample)a[4],(Instant)a[5]);yield reservation;}
+                case "reserveInTransaction","reserveBrowserInTransaction"->{b.trace.add("reservation");if(reservation!=null)throw new IllegalStateException("duplicate");var o=(SubscriptionOperation)a[2];reservation=new Reservation(UUID.randomUUID(),b.admission,b.failure,o.id(),o.fingerprint(),0,b.binding,(SubscriptionBillingTimePort.Sample)a[4],(Instant)a[5]);if(m.equals("reserveBrowserInTransaction")){enrollment=(OwnedMethodBrowser.Enrollment)a[6];if(failReceipt)throw new IllegalStateException("enrollment failed");}yield reservation;}
+                case "requireBrowserPendingInTransaction"->{same((Reservation)a[0]);var s=(dev.genericpayments.platform.customers.application.model.CustomerSessionContext)a[1];if(!acks||enrollment==null||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())||!enrollment.sessionExpiresAt().equals(s.expiresAt()))throw new IllegalStateException("browser unavailable");var o=b.ops.get(reservation.setupOperationId());yield new OwnedMethodBrowser.Pending(reservation,enrollment,b.account,b.s,o,b.binding,new SubscriptionBillingProofStore.Setup(o.id(),b.s.id(),b.account.id(),id(91),"seti_owned",null),step(o,false));}
                 case "requireReservationInTransaction"->{same((Reservation)a[0]);yield reservation;}
                 case "requirePreparedMethodInTransaction"->{same((Reservation)a[0]);b.trace.add("prepared");if(!acks||b.ops.get(reservation.setupOperationId()).status()!=SubscriptionOperation.Status.RESERVED)throw new IllegalStateException("not prepared");yield methodContext();}
                 case "claimReadInTransaction"->{same((Reservation)a[0]);var phase=(Phase)a[1];if(claims.containsKey(phase))throw new IllegalStateException("duplicate claim");var q=new ReadClaim(UUID.randomUUID(),reservation.id(),phase,(UUID)a[2],(Instant)a[5],((Instant)a[5]).plusSeconds(30),(Fence)a[3],(SubscriptionBillingTimePort.Sample)a[4]);claims.put(phase,q);yield q;}

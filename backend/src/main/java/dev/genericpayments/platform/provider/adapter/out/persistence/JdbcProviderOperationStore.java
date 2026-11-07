@@ -50,6 +50,8 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     public ProviderOperation reserveOwnedFailedRenewalMethodStep(PaymentAccount account,
             dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reservation,Kind kind) {
         if(account==null||reservation==null||(kind!=Kind.SETUP_INTENT_CREATE&&kind!=Kind.SUBSCRIPTION_UPDATE))throw conflict();
+        // Browser phases already hold this row before authority/account/root locks.
+        lockOwnedMethodOperation(reservation.setupOperationId());
         var store=new JdbcOwnedFailedRenewalMethodStore(jdbc);store.requireReservationInTransaction(reservation);
         var owner=reservation.admission().firstRenewalAdmission().receipt().intent().clock().owner();
         if(!account.id().equals(owner.account())||!account.externalAccountId().equals(owner.externalAccount())||!account.credentialsRef().equals(owner.credentialsRef())
@@ -363,8 +365,16 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     }
 
     private Optional<ProviderOperation> lock(UUID id) {
+        // Locate immutable ownership without locking the provider receipt. Replays must use the
+        // same operation -> provider order as browser root/proof FKs, even for terminal ACKs.
+        row(jdbc,id).filter(o->o.kind()==Kind.SETUP_INTENT_CREATE||o.kind()==Kind.SUBSCRIPTION_UPDATE)
+            .filter(o->JdbcOwnedFailedRenewalMethodStore.ownedStepResource(jdbc,o.accountId(),o.resourceId()))
+            .ifPresent(o->lockOwnedMethodOperation(o.resourceId()));
         return jdbc.query("select * from provider_operations where id=? for update", this::operation, id)
             .stream().findFirst();
+    }
+    private void lockOwnedMethodOperation(UUID resource){
+        if(jdbc.queryForList("select id from subscription_operations where id=? for update",UUID.class,resource).size()!=1)throw conflict();
     }
     static Optional<ProviderOperation> row(JdbcTemplate jdbc,UUID id){
         var store=new JdbcProviderOperationStore(jdbc);

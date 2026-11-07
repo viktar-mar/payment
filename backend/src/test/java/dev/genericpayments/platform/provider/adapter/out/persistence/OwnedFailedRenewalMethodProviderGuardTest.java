@@ -13,6 +13,23 @@ import static org.assertj.core.api.Assertions.*;
 
 /** No DataSource/context: verifies closed defaults and early typed admission, not SQL behavior. */
 class OwnedFailedRenewalMethodProviderGuardTest {
+    @Test void ownedMethodOperationLocksBeforeProviderReceiptEvenForTerminalReplays() {
+        var account=dispatchAccount();var claim=dispatchClaim(account,dispatchAt.plusSeconds(82800),dispatchAt.plusSeconds(60),1);
+        var acknowledged=new ProviderOperation(claim.id(),claim.accountId(),claim.externalAccountId(),claim.credentialsRef(),claim.kind(),claim.resourceId(),claim.operationKey(),claim.fingerprint(),
+            ProviderOperation.Status.ACKNOWLEDGED,"seti_saved",claim.firstDispatchedAt(),claim.retryBefore(),null,null,2);
+        var trace=new java.util.ArrayList<String>();
+        var jdbc=new JdbcTemplate(){
+            @Override @SuppressWarnings("unchecked") public <T>java.util.List<T> query(String sql,org.springframework.jdbc.core.RowMapper<T> mapper,Object... args){
+                assertThat(sql).contains("provider_operations");trace.add(sql.contains("for update")?"receipt lock":"receipt locator");return (java.util.List<T>)java.util.List.of(acknowledged);
+            }
+            @Override @SuppressWarnings("unchecked") public <T>java.util.List<T> queryForList(String sql,Class<T> type,Object... args){
+                if(sql.contains("stripe_billing_failed_method_reservations")){trace.add("owned method locator");return (java.util.List<T>)java.util.List.of(java.util.UUID.randomUUID());}
+                assertThat(sql).contains("subscription_operations").contains("for update");trace.add("operation lock");return (java.util.List<T>)java.util.List.of(acknowledged.resourceId());
+            }
+        };
+        assertThat(new JdbcProviderOperationStore(jdbc).claim(claim.id(),"replay",dispatchAt.plusSeconds(2),java.time.Duration.ofSeconds(60))).isEmpty();
+        assertThat(trace).containsExactly("receipt locator","owned method locator","operation lock","receipt lock");
+    }
     private final java.time.Instant dispatchAt=java.time.Instant.parse("2026-11-01T12:00:00Z");
     private PaymentAccount dispatchAccount() {
         return PaymentAccount.create(new PaymentAccountId(UUID.randomUUID()),"owned-account",PaymentProviderType.STRIPE,PaymentAccountMode.SANDBOX,"acct_owned","alias");

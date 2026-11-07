@@ -4,6 +4,8 @@ import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewa
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal.*;
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod;
+import dev.genericpayments.platform.provider.application.model.OwnedMethodBrowser;
+import dev.genericpayments.platform.provider.application.service.OwnedMethodBrowserTestAccess;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.provider.application.service.OwnedFailedRenewalMethodService;
 import dev.genericpayments.platform.provider.application.service.ProviderOperationGuard;
@@ -377,31 +379,18 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
 
     private record PreparedMethod(Setup setup,Failure failure,OwnedFailedRenewalMethod.Reservation reservation,
             OwnedFailedRenewalMethodService service,ProviderOperation setupStep,ProviderOperation methodStep) {}
+    private record PendingMethod(Setup setup,Failure failure,OwnedFailedRenewalMethod.Reservation reservation,
+            OwnedFailedRenewalMethodService service,dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext context,
+            ProviderOperation setupStep,int callStart) {}
 
     /** Genuine failed observer, service reservation, typed first dispatches, SDK replies and ordinary proof stores.
      * Provider-side confirmation is synthetic observation only; no browser capability is issued or claimed. */
     private PreparedMethod preparedMethod() {
-        var s=setup();failedGraph(s);
-        var failure=new StripeBillingOwnedFailedRenewalObserver(service(store(),null),credentials,clients,Clock.systemUTC()).observe(s.admission());
-        var before=financialState();var methods=new JdbcOwnedFailedRenewalMethodStore(jdbc);var svc=methodService(methods);
-        var context=managementContext("genuine-owned-method");var r=svc.reserveMethod(s.admission(),context,true);
+        var pending=pendingMethod(false);var s=pending.setup();var failure=pending.failure();var r=pending.reservation();var svc=pending.service();
+        var context=pending.context();var setupStep=pending.setupStep();var callStart=pending.callStart();var before=financialState();
         var subscription=current();var o=lifecycleOperations.find(site,subscription.id(),r.setupOperationId()).orElseThrow();
-        assertThat(o.status()).isEqualTo(SubscriptionOperation.Status.RESERVED);assertThat(o.version()).isZero();
         var binding=bindings.findCustomer(billing.id(),site,customer).orElseThrow();var client=clients.create(credentials.resolve(billing));
-        int callStart=http.calls.size();var reserved=operations.reserveOwnedFailedRenewalMethodStep(billing,r,ProviderOperation.Kind.SETUP_INTENT_CREATE);
-        String setupOwner=UUID.randomUUID().toString();var claimed=operations.claim(reserved.id(),setupOwner,Instant.now(),Duration.ofSeconds(60)).orElseThrow();
-        methodBillingProofs.authorizeSetup(subscription,o);
-        http.reply(setupBody(o,claimed,"requires_payment_method"));
-        var dispatch=operations.requireOwnedFailedRenewalMethodDispatch(billing,r,claimed,Instant.now());
-        String key=new ProviderOperationGuard().requireDispatch(dispatch,billing,reserved.fingerprint(),Instant.now());
-        com.stripe.model.SetupIntent remote;
-        try {remote=client.v1().setupIntents().create(com.stripe.param.SetupIntentCreateParams.builder().setCustomer(binding.providerReference())
-            .setUsage(com.stripe.param.SetupIntentCreateParams.Usage.OFF_SESSION).addAllowedPaymentMethodType(com.stripe.param.SetupIntentCreateParams.AllowedPaymentMethodType.CARD)
-            .putMetadata("operation_id",o.id().toString()).putMetadata("subscription_id",subscription.id().toString()).build(),writeOptions(key));}
-        catch(com.stripe.exception.StripeException failureSdk){throw new AssertionError(failureSdk);}
-        OwnedMethodRemoteChecks.requireSetup(remote,subscription,o,binding,dispatch);
-        var setupStep=operations.acknowledge(dispatch.id(),setupOwner,dispatch.version(),remote.getId());
-        var proof=methodBillingProofs.recordSetup(subscription,o,setupStep.id(),setupStep.providerReference());
+        var proof=methodBillingProofs.setup(billing.id(),o.id()).orElseThrow();
         http.reply(setupBody(o,setupStep,"succeeded"));http.reply(methodBody());
         try {
             var succeeded=client.v1().setupIntents().retrieve(proof.reference());OwnedMethodRemoteChecks.requireSetup(succeeded,subscription,o,binding,setupStep);
@@ -428,9 +417,265 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             .containsExactly("POST /v1/setup_intents","GET /v1/setup_intents/seti_saved","GET /v1/payment_methods/pm_saved","POST /v1/subscriptions/"+subscription.providerReference());
         assertThat(http.calls.get(callStart).options().getIdempotencyKey()).isEqualTo(setupStep.operationKey());
         assertThat(http.calls.get(callStart+3).options().getIdempotencyKey()).isEqualTo(methodStep.operationKey());assertThat(http.replies).isEmpty();
-        var pending=svc.recordMethodUpdateReply(r,context);assertThat(pending.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);assertThat(pending.version()).isEqualTo(1);
-        assertThat(pending.providerReference()).isEqualTo(subscription.providerReference());assertThat(financialState()).isEqualTo(before);
+        var processing=svc.recordMethodUpdateReply(r,context);assertThat(processing.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);assertThat(processing.version()).isEqualTo(1);
+        assertThat(processing.providerReference()).isEqualTo(subscription.providerReference());assertThat(financialState()).isEqualTo(before);
         return new PreparedMethod(s,failure,r,svc,setupStep,methodStep);
+    }
+    /** Reuses the genuine original first dispatch and SDK ACK producer, stopping before any method binding. */
+    private PendingMethod pendingMethod(boolean browser) {
+        return pendingMethod(browser,0);
+    }
+    private PendingMethod pendingMethod(boolean browser,int sessionSeconds) {
+        var s=setup();failedGraph(s);
+        var failure=new StripeBillingOwnedFailedRenewalObserver(service(store(),null),credentials,clients,Clock.systemUTC()).observe(s.admission());
+        var before=financialState();var methods=new JdbcOwnedFailedRenewalMethodStore(jdbc);var svc=methodService(methods);
+        var context=managementContext("genuine-owned-method");
+        if(sessionSeconds>0){
+            var original=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)context.actor()).session();
+            var expiry=Instant.now().plusSeconds(sessionSeconds).truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+            jdbc.update("update customer_sessions set expires_at=? where id=?",java.sql.Timestamp.from(expiry),original.sessionId().value());
+            var changed=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(original.sessionId(),original.siteId(),original.customerId(),original.origin(),original.scopes(),expiry);
+            context=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(new dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer(changed),site,customer,changed.origin(),context.idempotencyKey(),context.requestId());
+        }
+        var r=browser?svc.reserveBrowserMethod(s.admission(),context,true):svc.reserveMethod(s.admission(),context,true);
+        var subscription=current();var o=lifecycleOperations.find(site,subscription.id(),r.setupOperationId()).orElseThrow();
+        assertThat(o.status()).isEqualTo(SubscriptionOperation.Status.RESERVED);assertThat(o.version()).isZero();
+        var binding=bindings.findCustomer(billing.id(),site,customer).orElseThrow();var client=clients.create(credentials.resolve(billing));
+        int callStart=http.calls.size();var reserved=operations.reserveOwnedFailedRenewalMethodStep(billing,r,ProviderOperation.Kind.SETUP_INTENT_CREATE);
+        String setupOwner=UUID.randomUUID().toString();var claimed=operations.claim(reserved.id(),setupOwner,Instant.now(),Duration.ofSeconds(60)).orElseThrow();
+        methodBillingProofs.authorizeSetup(subscription,o);
+        http.reply(setupBody(o,claimed,"requires_payment_method"));
+        var dispatch=operations.requireOwnedFailedRenewalMethodDispatch(billing,r,claimed,Instant.now());
+        String key=new ProviderOperationGuard().requireDispatch(dispatch,billing,reserved.fingerprint(),Instant.now());
+        com.stripe.model.SetupIntent remote;
+        try {remote=client.v1().setupIntents().create(com.stripe.param.SetupIntentCreateParams.builder().setCustomer(binding.providerReference())
+            .setUsage(com.stripe.param.SetupIntentCreateParams.Usage.OFF_SESSION).addAllowedPaymentMethodType(com.stripe.param.SetupIntentCreateParams.AllowedPaymentMethodType.CARD)
+            .putMetadata("operation_id",o.id().toString()).putMetadata("subscription_id",subscription.id().toString()).build(),writeOptions(key));}
+        catch(com.stripe.exception.StripeException failureSdk){throw new AssertionError(failureSdk);}
+        OwnedMethodRemoteChecks.requireSetup(remote,subscription,o,binding,dispatch);
+        var setupStep=operations.acknowledge(dispatch.id(),setupOwner,dispatch.version(),remote.getId());
+        var proof=methodBillingProofs.recordSetup(subscription,o,setupStep.id(),setupStep.providerReference());
+        assertThat(proof.method()).isNull();assertThat(financialState()).isEqualTo(before);
+        return new PendingMethod(s,failure,r,svc,context,setupStep,callStart);
+    }
+    private dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore browserStore(){return new JdbcOwnedFailedRenewalMethodStore(jdbc);}
+    private <T>T browserPhase(PendingMethod p,java.util.function.Function<OwnedMethodBrowser.Pending,T> work){
+        return OwnedMethodBrowserTestAccess.phase(p.service(),p.reservation(),p.context(),work);
+    }
+    private static Instant browserNow(){return Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MICROS);}
+    private OwnedMethodBrowser.Root browserRoot(PendingMethod p){
+        return browserPhase(p,pending->{var at=browserNow();var expiry=at.plusSeconds(600);
+            if(pending.enrollment().sessionExpiresAt().isBefore(expiry))expiry=pending.enrollment().sessionExpiresAt();
+            return browserStore().insertBrowserRootInTransaction(pending,new OwnedMethodBrowser.Root(UUID.randomUUID(),p.reservation().id(),pending.operation().id(),pending.setupStep().id(),
+                pending.setupStep().version(),pending.setup().reference(),"v1","a".repeat(64),at,expiry));});
+    }
+    private OwnedMethodBrowser.Selection selectBrowser(PendingMethod p,OwnedMethodBrowser.Root root){
+        return browserPhase(p,pending->browserStore().startBrowserSelectionInTransaction(pending,root,"b".repeat(64),browserNow()));
+    }
+    private void releaseBrowser(PendingMethod p,OwnedMethodBrowser.Root root,OwnedMethodBrowser.Selection selected){
+        browserPhase(p,pending->{browserStore().finishBrowserSelectionInTransaction(pending,root,selected,browserNow());return null;});
+    }
+    private boolean consumeBrowser(PendingMethod p,OwnedMethodBrowser.Root root){
+        return browserPhase(p,pending->browserStore().consumeBrowserFirstInTransaction(pending,root,"c".repeat(64),"d".repeat(64),browserNow()));
+    }
+
+    @Test void browserEnrollmentPinsExactOriginalSessionAndReservedSetupWithoutFinancialEffects(){
+        var p=pendingMethod(true);var r=p.reservation();var original=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
+        var before=financialState();var operation=lifecycleOperations.find(site,current().id(),r.setupOperationId()).orElseThrow();int calls=http.calls.size();
+        var pending=browserPhase(p,value->value);
+        assertThat(pending.enrollment()).isEqualTo(new OwnedMethodBrowser.Enrollment(original.sessionId().value(),original.origin(),original.expiresAt()));
+        assertThat(pending.setupStep()).isEqualTo(p.setupStep());assertThat(pending.setup().method()).isNull();assertThat(pending.operation()).isEqualTo(operation);
+        assertThat(operation.status()).isEqualTo(SubscriptionOperation.Status.RESERVED);assertThat(operation.version()).isZero();
+        assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @ParameterizedTest @ValueSource(booleans={true,false}) void browserEnrollmentCannotBeChangedRemovedOrAddedLater(boolean enrolled){
+        var p=pendingMethod(enrolled);var before=rows("stripe_billing_failed_method_reservations");
+        for(var mutation:List.of("browser_session_id=null,browser_origin=null,browser_session_expires_at=null","browser_origin='https://foreign.test'",
+            "browser_session_id='11111111-1111-1111-1111-111111111111',browser_origin='https://shop.test',browser_session_expires_at=clock_timestamp()+interval '10 minutes'")){
+            assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update("update stripe_billing_failed_method_reservations set "+mutation+" where id=?",p.reservation().id()))).isInstanceOf(RuntimeException.class);
+        }
+        assertThat(rows("stripe_billing_failed_method_reservations")).isEqualTo(before);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @Test void failedBrowserEnrollmentRollsBackClaimAndSnapshotWithoutStoppingAdmission(){
+        var s=setup();fail(s,service(store(),null));var before=financialState();long operationsBefore=count("subscription_operations");var real=browserStore();
+        var broken=(dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore.class},(proxy,method,args)->{
+            try{var result=method.invoke(real,args);if(method.getName().equals("reserveBrowserInTransaction"))throw new IllegalStateException("after browser enrollment");return result;}
+            catch(InvocationTargetException e){throw e.getCause();}
+        });
+        var context=managementContext("browser-rollback");assertThatThrownBy(()->methodService(broken).reserveBrowserMethod(s.admission(),context,true)).hasMessage("after browser enrollment");
+        assertThat(count("stripe_billing_failed_method_reservations")).isZero();assertThat(count("subscription_operations")).isEqualTo(operationsBefore);
+        assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @ParameterizedTest @ValueSource(strings={"session","origin","missing-scope","non-browser"}) void browserPendingRefusesWrongOriginalAuthorityWithoutStop(String mutation){
+        var p=pendingMethod(!mutation.equals("non-browser"));var s=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
+        var other=mutation.equals("session")?((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)managementContext("second-session").actor()).session():s;
+        var changed=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(other.sessionId(),s.siteId(),s.customerId(),
+            mutation.equals("origin")?"https://foreign.test":s.origin(),mutation.equals("missing-scope")?Set.of(dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_READ):s.scopes(),s.expiresAt());
+        var context=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(new dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer(changed),site,customer,changed.origin(),null,"browser-get");
+        var before=financialState();assertThatThrownBy(()->OwnedMethodBrowserTestAccess.phase(p.service(),p.reservation(),context,value->value)).isInstanceOf(RuntimeException.class);
+        assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();assertThat(count("stripe_billing_method_browser_roots")).isZero();
+    }
+    @ParameterizedTest @ValueSource(strings={"operation","step","version","reference","future","interval"}) void browserRootRejectsNonOriginalProofOrTime(String mutation){
+        var p=pendingMethod(true);var at=browserNow();var expires=at.plusSeconds(600);var session=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
+        if(session.expiresAt().isBefore(expires))expires=session.expiresAt();var expiry=expires;
+        assertThatThrownBy(()->browserPhase(p,pending->jdbc.update("""
+            insert into stripe_billing_method_browser_roots(id,reservation_id,setup_operation,setup_step,step_version,payment_account_id,
+             setup_reference,key_version,digest,issued_at,expires_at) values(?,?,?,?,?,?,?,?,?,?,?)
+            """,UUID.randomUUID(),p.reservation().id(),mutation.equals("operation")?UUID.randomUUID():pending.operation().id(),
+            mutation.equals("step")?UUID.randomUUID():pending.setupStep().id(),mutation.equals("version")?1:2,billing.id().value(),
+            mutation.equals("reference")?"seti_foreign":pending.setup().reference(),"v1","a".repeat(64),java.sql.Timestamp.from(mutation.equals("future")?at.plusSeconds(60):at),
+            java.sql.Timestamp.from(mutation.equals("interval")?expiry.plusSeconds(1):expiry)))).isInstanceOf(RuntimeException.class);
+        assertThat(count("stripe_billing_method_browser_roots")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @Test void browserOneShotSelectionReleaseConsumptionHaveDistinctPrestatesAndExactReplay(){
+        var p=pendingMethod(true);var before=financialState();var root=browserRoot(p);int calls=http.calls.size();
+        browserPhase(p,pending->{browserStore().requireBrowserActionInTransaction(pending,root,browserNow());return null;});
+        assertThatThrownBy(()->consumeBrowser(p,root)).isInstanceOf(RuntimeException.class);
+        var selected=selectBrowser(p,root);
+        assertThatThrownBy(()->browserPhase(p,pending->{browserStore().requireBrowserActionInTransaction(pending,root,browserNow());return null;})).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->selectBrowser(p,root)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->consumeBrowser(p,root)).isInstanceOf(RuntimeException.class);
+        releaseBrowser(p,root,selected);assertThatThrownBy(()->releaseBrowser(p,root,selected)).isInstanceOf(RuntimeException.class);
+        assertThat(consumeBrowser(p,root)).isTrue();assertThat(consumeBrowser(p,root)).isFalse();
+        for(var bad:List.of("key","body"))assertThatThrownBy(()->browserPhase(p,pending->browserStore().consumeBrowserFirstInTransaction(pending,root,
+            bad.equals("key")?"e".repeat(64):"c".repeat(64),bad.equals("body")?"e".repeat(64):"d".repeat(64),browserNow()))).isInstanceOf(RuntimeException.class);
+        assertThat(count("stripe_billing_method_browser_selections")).isEqualTo(1);assertThat(count("stripe_billing_method_browser_releases")).isEqualTo(1);assertThat(count("stripe_billing_method_browser_consumptions")).isEqualTo(1);
+        assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @Test void browserReceiptsAreAppendOnlyUniqueAndConsumptionRollbackKeepsTheReleasedRoot(){
+        var p=pendingMethod(true);var root=browserRoot(p);
+        assertThatThrownBy(()->browserPhase(p,pending->browserStore().insertBrowserRootInTransaction(pending,root))).isInstanceOf(RuntimeException.class);
+        var selected=selectBrowser(p,root);releaseBrowser(p,root,selected);
+        assertThatThrownBy(()->browserPhase(p,pending->{assertThat(browserStore().consumeBrowserFirstInTransaction(pending,root,"c".repeat(64),"d".repeat(64),browserNow())).isTrue();throw new IllegalStateException("after consume");})).hasMessage("after consume");
+        assertThat(count("stripe_billing_method_browser_consumptions")).isZero();assertThat(consumeBrowser(p,root)).isTrue();
+        for(var table:List.of("stripe_billing_method_browser_roots","stripe_billing_method_browser_selections","stripe_billing_method_browser_releases","stripe_billing_method_browser_consumptions")){
+            var before=rows(table);assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update("delete from "+table))).isInstanceOf(RuntimeException.class);
+            String field=table.endsWith("roots")?"issued_at=issued_at":table.endsWith("selections")?"started_at=started_at":table.endsWith("releases")?"released_at=released_at":"consumed_at=consumed_at";
+            assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update("update "+table+" set "+field))).isInstanceOf(RuntimeException.class);assertThat(rows(table)).isEqualTo(before);
+        }
+    }
+    @Test void browserEnrollmentDeniesDirectBindingPreboundInsertAndMethodAdmissionUntilHistoricalConsumption(){
+        var p=pendingMethod(true,5);var proof=methodBillingProofs.setup(billing.id(),p.reservation().setupOperationId()).orElseThrow();var before=financialState();
+        assertThatThrownBy(()->methodBillingProofs.bindMethod(proof,"pm_saved")).isInstanceOf(RuntimeException.class).hasStackTraceContaining("Owned method browser consumption required");
+        assertThatThrownBy(()->operations.reserveOwnedFailedRenewalMethodStep(billing,p.reservation(),ProviderOperation.Kind.SUBSCRIPTION_UPDATE)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            jdbc.update("delete from stripe_subscription_setup_proofs where operation_id=?",proof.operation());
+            return jdbc.update("""
+                insert into stripe_subscription_setup_proofs(operation_id,site_id,customer_id,subscription_id,payment_account_id,operation_kind,step_id,setup_reference,method_reference)
+                values(?,?,?,?,?,'SETUP',?,?,'pm_saved')
+                """,proof.operation(),site.value(),customer.value(),proof.subscription(),billing.id().value(),proof.step(),proof.reference());
+        })).isInstanceOf(RuntimeException.class).hasStackTraceContaining("Owned method browser consumption required");
+        assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update("""
+            insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint,status,version)
+            select ?,payment_account_id,external_account_id,credentials_ref,'SUBSCRIPTION_UPDATE',resource_id,operation_key||':BYPASS',fingerprint,'RESERVED',0 from provider_operations where id=?
+            """,UUID.randomUUID(),p.setupStep().id()))).isInstanceOf(RuntimeException.class).hasStackTraceContaining("Owned method browser consumption required");
+        var root=browserRoot(p);var selected=selectBrowser(p,root);releaseBrowser(p,root,selected);assertThat(consumeBrowser(p,root)).isTrue();
+        var untilExpiry=Duration.between(Instant.now(),root.expiresAt()).plusMillis(50);
+        try{if(!untilExpiry.isNegative())Thread.sleep(untilExpiry);}catch(InterruptedException e){Thread.currentThread().interrupt();throw new AssertionError(e);}
+        var session=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
+        jdbc.update("update customer_sessions set revoked_at=clock_timestamp(),revoked_reason='LOGOUT' where id=?",session.sessionId().value());
+        jdbc.update("delete from customer_sessions where id=?",session.sessionId().value());
+        assertThat(jdbc.queryForObject("select browser_session_id from stripe_billing_failed_method_reservations where id=?",UUID.class,p.reservation().id())).isEqualTo(session.sessionId().value());
+        assertThat(methodBillingProofs.bindMethod(proof,"pm_saved").method()).isEqualTo("pm_saved");
+        assertThat(operations.reserveOwnedFailedRenewalMethodStep(billing,p.reservation(),ProviderOperation.Kind.SUBSCRIPTION_UPDATE).status()).isEqualTo(ProviderOperation.Status.RESERVED);
+        assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @ParameterizedTest @ValueSource(strings={"selection","release","consume"}) void browserReceiptsRefuseFutureCallerTime(String phase){
+        var p=pendingMethod(true);var root=browserRoot(p);var future=browserNow().plusSeconds(60);
+        if(phase.equals("selection")){
+            assertThatThrownBy(()->browserPhase(p,pending->browserStore().startBrowserSelectionInTransaction(pending,root,"b".repeat(64),future))).isInstanceOf(RuntimeException.class);
+            assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update("insert into stripe_billing_method_browser_selections(root_id,key_digest,started_at,deadline_at) values(?,?,?,?)",
+                root.id(),"b".repeat(64),java.sql.Timestamp.from(future),java.sql.Timestamp.from(future.plusSeconds(30))))).isInstanceOf(RuntimeException.class);
+        }
+        else {var selected=selectBrowser(p,root);
+            if(phase.equals("release")){
+                assertThatThrownBy(()->browserPhase(p,pending->{browserStore().finishBrowserSelectionInTransaction(pending,root,selected,future);return null;})).isInstanceOf(RuntimeException.class);
+                assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update("insert into stripe_billing_method_browser_releases(root_id,released_at) values(?,?)",root.id(),java.sql.Timestamp.from(future)))).isInstanceOf(RuntimeException.class);
+            }
+            else {releaseBrowser(p,root,selected);
+                assertThatThrownBy(()->browserPhase(p,pending->browserStore().consumeBrowserFirstInTransaction(pending,root,"c".repeat(64),"d".repeat(64),future))).isInstanceOf(RuntimeException.class);
+                assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update("insert into stripe_billing_method_browser_consumptions(root_id,key_digest,request_fingerprint,consumed_at) values(?,?,?,?)",root.id(),"c".repeat(64),"d".repeat(64),java.sql.Timestamp.from(future)))).isInstanceOf(RuntimeException.class);
+            }
+        }
+        assertThat(count("stripe_billing_method_browser_consumptions")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @ParameterizedTest @ValueSource(booleans={true,false}) void browserSelectionDeadlineControlsReleaseAndNotReleasedCustomerInput(boolean released) throws Exception {
+        var p=pendingMethod(true);var root=browserRoot(p);var selected=selectBrowser(p,root);if(released)releaseBrowser(p,root,selected);
+        var wait=Duration.between(Instant.now(),selected.deadlineAt()).plusMillis(50);if(!wait.isNegative())Thread.sleep(wait);
+        if(released)assertThat(consumeBrowser(p,root)).isTrue();
+        else {assertThatThrownBy(()->releaseBrowser(p,root,selected)).isInstanceOf(RuntimeException.class);assertThatThrownBy(()->consumeBrowser(p,root)).isInstanceOf(RuntimeException.class);}
+        assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @Test void browserReleaseMustCommitBeforeConsumptionEvenAcrossSavepoints(){
+        var p=pendingMethod(true);var root=browserRoot(p);var selected=selectBrowser(p,root);
+        assertThatThrownBy(()->browserPhase(p,pending->{
+            jdbc.execute((org.springframework.jdbc.core.ConnectionCallback<Void>)connection->{var savepoint=connection.setSavepoint();
+                browserStore().finishBrowserSelectionInTransaction(pending,root,selected,browserNow());connection.releaseSavepoint(savepoint);return null;});
+            return browserStore().consumeBrowserFirstInTransaction(pending,root,"c".repeat(64),"d".repeat(64),browserNow());
+        })).isInstanceOf(RuntimeException.class).hasStackTraceContaining("Missing owned method browser release");
+        assertThat(count("stripe_billing_method_browser_releases")).isZero();assertThat(count("stripe_billing_method_browser_consumptions")).isZero();
+        assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update("insert into stripe_billing_method_browser_releases(root_id,released_at,recorded_transaction) values(?,?, '1'::xid8)",root.id(),java.sql.Timestamp.from(browserNow())))).isInstanceOf(RuntimeException.class);
+        releaseBrowser(p,root,selected);assertThat(consumeBrowser(p,root)).isTrue();
+    }
+    @ParameterizedTest @ValueSource(strings={"binding","method"}) void browserConsumptionMustCommitBeforeDownstreamEvenAcrossSavepoints(String next){
+        var p=pendingMethod(true);var root=browserRoot(p);releaseBrowser(p,root,selectBrowser(p,root));
+        var proof=methodBillingProofs.setup(billing.id(),p.reservation().setupOperationId()).orElseThrow();
+        assertThatThrownBy(()->browserPhase(p,pending->{
+            jdbc.execute((org.springframework.jdbc.core.ConnectionCallback<Void>)connection->{var savepoint=connection.setSavepoint();
+                assertThat(browserStore().consumeBrowserFirstInTransaction(pending,root,"c".repeat(64),"d".repeat(64),browserNow())).isTrue();connection.releaseSavepoint(savepoint);return null;});
+            if(next.equals("binding"))return jdbc.update("update stripe_subscription_setup_proofs set method_reference='pm_saved' where operation_id=?",proof.operation());
+            return jdbc.update("""
+                insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint,status,version)
+                select ?,payment_account_id,external_account_id,credentials_ref,'SUBSCRIPTION_UPDATE',resource_id,operation_key||':BYPASS',fingerprint,'RESERVED',0 from provider_operations where id=?
+                """,UUID.randomUUID(),p.setupStep().id());
+        })).isInstanceOf(RuntimeException.class).hasStackTraceContaining("Owned method browser consumption required");
+        assertThat(count("stripe_billing_method_browser_consumptions")).isZero();assertThat(methodBillingProofs.setup(billing.id(),proof.operation()).orElseThrow().method()).isNull();
+        assertThat(consumeBrowser(p,root)).isTrue();
+    }
+    @Test void browserConsumptionSerializesConcurrentIdenticalRequestsAndChangedReplayRefuses() throws Exception {
+        var p=pendingMethod(true);var root=browserRoot(p);releaseBrowser(p,root,selectBrowser(p,root));var started=new CountDownLatch(2);var begin=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()){
+            var first=workers.submit(()->{started.countDown();awaitRelease(begin);return consumeBrowser(p,root);});
+            var second=workers.submit(()->{started.countDown();awaitRelease(begin);return consumeBrowser(p,root);});
+            try{assertThat(started.await(5,TimeUnit.SECONDS)).isTrue();begin.countDown();assertThat(List.of(first.get(10,TimeUnit.SECONDS),second.get(10,TimeUnit.SECONDS))).containsExactlyInAnyOrder(true,false);}
+            finally{begin.countDown();}
+        }
+        assertThat(count("stripe_billing_method_browser_consumptions")).isEqualTo(1);
+        assertThatThrownBy(()->browserPhase(p,pending->browserStore().consumeBrowserFirstInTransaction(pending,root,"e".repeat(64),"d".repeat(64),browserNow()))).isInstanceOf(RuntimeException.class);
+        assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @Test void browserConsumptionRechecksDatabaseExpiryAfterWaitingForTheOriginalOperationLock() throws Exception {
+        var p=pendingMethod(true,5);var root=browserRoot(p);releaseBrowser(p,root,selectBrowser(p,root));var stale=browserNow();
+        var locked=new CountDownLatch(1);var release=new CountDownLatch(1);var attempting=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()){
+            var blocker=workers.submit(()->transaction.requiresNew(()->{lifecycleOperations.lock(p.reservation().setupOperationId());locked.countDown();awaitRelease(release);return true;}));
+            try{
+                assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
+                var loser=workers.submit(()->{attempting.countDown();assertThatThrownBy(()->transaction.requiresNew(()->{
+                    // A stale pre-wait trusted timestamp must not bypass the post-lock database clock.
+                    jdbc.update("insert into stripe_billing_method_browser_consumptions(root_id,key_digest,request_fingerprint,consumed_at) values(?,?,?,?)",root.id(),"c".repeat(64),"d".repeat(64),java.sql.Timestamp.from(stale));return true;
+                })).isInstanceOf(RuntimeException.class);return true;});
+                assertThat(attempting.await(5,TimeUnit.SECONDS)).isTrue();assertThatThrownBy(()->loser.get(100,TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                var wait=Duration.between(Instant.now(),root.expiresAt()).plusMillis(100);if(!wait.isNegative())Thread.sleep(wait);
+                release.countDown();assertThat(blocker.get(10,TimeUnit.SECONDS)).isTrue();assertThat(loser.get(10,TimeUnit.SECONDS)).isTrue();
+            }finally{release.countDown();}
+        }
+        assertThat(count("stripe_billing_method_browser_consumptions")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @Test void browserRootAndTypedProviderReplayShareOperationBeforeProviderReceiptLockOrder() throws Exception {
+        var p=pendingMethod(true);var locked=new CountDownLatch(1);var insert=new CountDownLatch(1);var attempting=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()){
+            var root=workers.submit(()->browserPhase(p,pending->{locked.countDown();awaitRelease(insert);
+                var now=browserNow();var expiry=now.plusSeconds(600);if(pending.enrollment().sessionExpiresAt().isBefore(expiry))expiry=pending.enrollment().sessionExpiresAt();
+                return browserStore().insertBrowserRootInTransaction(pending,new OwnedMethodBrowser.Root(UUID.randomUUID(),p.reservation().id(),pending.operation().id(),pending.setupStep().id(),2,pending.setup().reference(),"v1","a".repeat(64),now,expiry));}));
+            try{
+                assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
+                var replay=workers.submit(()->{attempting.countDown();assertThatThrownBy(()->operations.acknowledge(p.setupStep().id(),"terminal-replay",1,p.setupStep().providerReference())).isInstanceOf(RuntimeException.class);return true;});
+                assertThat(attempting.await(5,TimeUnit.SECONDS)).isTrue();assertThatThrownBy(()->replay.get(100,TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                insert.countDown();assertThat(root.get(10,TimeUnit.SECONDS).setupStep()).isEqualTo(p.setupStep().id());assertThat(replay.get(10,TimeUnit.SECONDS)).isTrue();
+            }finally{insert.countDown();}
+        }
+        assertThat(count("stripe_billing_method_browser_roots")).isEqualTo(1);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
     }
     private com.stripe.net.RequestOptions writeOptions(String key) {
         var builder=com.stripe.net.RequestOptions.builder().setIdempotencyKey(key).setConnectTimeout(2000).setReadTimeout(2000).setMaxNetworkRetries(0);

@@ -4,11 +4,15 @@ import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewa
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.*;
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal;
+import dev.genericpayments.platform.provider.application.model.OwnedMethodBrowser.*;
+import dev.genericpayments.platform.customers.application.model.CustomerSessionContext;
+import dev.genericpayments.platform.customers.domain.CustomerSessionScope;
 import dev.genericpayments.platform.provider.application.port.out.*;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.LockPaymentAccountPort;
 import dev.genericpayments.platform.paymentaccounts.domain.*;
 import dev.genericpayments.platform.shared.application.port.out.DigestPort;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext;
+import dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
 import dev.genericpayments.platform.subscriptions.application.port.in.*;
 import dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Fence;
@@ -19,6 +23,7 @@ import java.time.*;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.function.Supplier;
+import java.util.function.Function;
 
 /** Explicit internal composition. No provider calls, runtime registration or nested authority transactions. */
 public final class OwnedFailedRenewalMethodService {
@@ -52,9 +57,16 @@ public final class OwnedFailedRenewalMethodService {
         this.authority=Objects.requireNonNull(authority);this.digest=Objects.requireNonNull(digest);
     }
     public Reservation reserveMethod(OwnedFailedRenewal.Admission admission,SubscriptionCommandContext context,boolean recurringConsent){
+        return reserve(admission,context,recurringConsent,false);
+    }
+    public Reservation reserveBrowserMethod(OwnedFailedRenewal.Admission admission,SubscriptionCommandContext context,boolean recurringConsent){
+        return reserve(admission,context,recurringConsent,true);
+    }
+    private Reservation reserve(OwnedFailedRenewal.Admission admission,SubscriptionCommandContext context,boolean recurringConsent,boolean browser){
         fresh();Objects.requireNonNull(admission);validateContext(context);
         if(!recurringConsent)throw new IllegalArgumentException("Recurring consent required");
-        return guarded(admission,()->{
+        if(browser)customer(context,utc());
+        Supplier<Reservation> work=()->{
             var failure=transaction.requiresNew(()->failed.requireFailureInTransaction(admission));
             return transaction.requiresNew(()->{
                 var intent=admission.firstRenewalAdmission().receipt().intent();var owner=intent.clock().owner();var id=UUID.randomUUID();var at=utc();
@@ -65,8 +77,24 @@ public final class OwnedFailedRenewalMethodService {
                 if(!claim.owner()||!candidate.equals(claim.operation()))throw unavailable();
                 var state=lock(admission,failure,Set.of(id),context);requireDebt(state,failure,0);
                 selected(state,id,SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Status.RESERVED,0,null);
+                if(browser){var session=customer(context,utc());return store.reserveBrowserInTransaction(admission,failure,candidate,state.binding(),state.sample(),state.utcAt(),
+                    new Enrollment(session.sessionId().value(),session.origin(),session.expiresAt()));}
                 return store.reserveInTransaction(admission,failure,candidate,state.binding(),state.sample(),state.utcAt());
             });
+        };
+        return browser?work.get():guarded(admission,work);
+    }
+    /** Browser requests have their own keys (GET has none) and must never stop another customer's admission. */
+    <T>T browserPhase(Reservation reservation,SubscriptionCommandContext context,Function<Pending,T> work){
+        fresh();Objects.requireNonNull(reservation);Objects.requireNonNull(work);customer(context,utc());
+        return transaction.requiresNew(()->{
+            var state=current(reservation,context,null);requireDebt(state,reservation.failure(),0);
+            var selected=selected(state,reservation.setupOperationId(),SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Status.RESERVED,0,null);
+            if(!selected.authorityScope().equals(methodAuthority(reservation.admission()))||!selected.fingerprint().equals(request(reservation.admission(),reservation.failure(),context)))throw unavailable();
+            var pending=store.requireBrowserPendingInTransaction(reservation,customer(context,utc()),utc());
+            if(!pending.reservation().equals(reservation)||!pending.account().equals(state.account())||!pending.subscription().equals(state.subscription())
+                ||!pending.operation().equals(selected)||!pending.binding().equals(state.binding()))throw unavailable();
+            return work.apply(pending);
         });
     }
     /** Both provider ACKs and management authority are authenticated in this exact save transaction. */
@@ -245,6 +273,12 @@ public final class OwnedFailedRenewalMethodService {
     private static String request(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,SubscriptionCommandContext c){return SubscriptionInteractionTransaction.request(c,"owned-failed-renewal-method-v1",a.id(),f.billId(),f.billVersion(),f.invoice(),f.allocation(),f.paymentIntent(),f.revision(),f.observationSequence(),"SETUP",true);}
     private static void validateContext(SubscriptionCommandContext c){
         if(c==null||c.actor()==null||c.siteId()==null||c.customerId()==null||c.idempotencyKey()==null||c.idempotencyKey().isBlank()||c.idempotencyKey().length()>255||c.idempotencyKey().codePoints().anyMatch(Character::isISOControl))throw unavailable();
+    }
+    private static CustomerSessionContext customer(SubscriptionCommandContext c,Instant now){
+        if(c==null||!(c.actor() instanceof SubscriptionActor.Customer actor)||actor.session()==null)throw unavailable();
+        var s=actor.session();
+        if(!s.siteId().equals(c.siteId())||!s.customerId().equals(c.customerId())||!s.origin().equals(c.origin())||!now.isBefore(s.expiresAt()))throw unavailable();
+        s.requireScope(CustomerSessionScope.SUBSCRIPTION_MANAGE);return s;
     }
     private static IllegalStateException unavailable(){return new IllegalStateException("OWNED_FAILED_RENEWAL_METHOD_UNAVAILABLE");}
 }
