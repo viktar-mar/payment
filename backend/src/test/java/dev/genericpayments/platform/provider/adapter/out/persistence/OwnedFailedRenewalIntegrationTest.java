@@ -45,6 +45,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import static org.assertj.core.api.Assertions.*;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 /** Hosted composition only. Never selected by the offline pure-test launcher. */
 class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalCompositionFixture {
@@ -61,11 +63,18 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     @Autowired LockSitePort siteLock;
     @Autowired CustomerStore customerStore;
     @Autowired SubscriptionBillingProofStore methodBillingProofs;
+    @Autowired dev.genericpayments.platform.subscriptions.adapter.in.web.SubscriptionHttpUseCases ordinaryHttp;
     private OwnedFailedRenewalStore store() { return new JdbcOwnedFailedRenewalStore(jdbc); }
+    private record ManagementAuthentication(dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext context,String rawToken){
+        @Override public String toString(){return "ManagementAuthentication[redacted]";}
+    }
     private dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext managementContext(String key){
+        return managementAuthentication(key).context();
+    }
+    private ManagementAuthentication managementAuthentication(String key){
         TestClock.set(Instant.now());var session=sessions.issue(site,customer,"https://shop.test");
         var actor=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer(sessions.resolveRequired(session.rawToken(),"https://shop.test"));
-        return new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(actor,site,customer,"https://shop.test",key,"owned-method-request");
+        return new ManagementAuthentication(new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(actor,site,customer,"https://shop.test",key,"owned-method-request"),session.rawToken());
     }
     private SubscriptionFactService methodFacts(dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore methods){
         return new SubscriptionFactService(subscriptions,lifecycleOperations,trials,siteLock,customerStore,accountLocks,bills,cash,events,catalog,
@@ -390,13 +399,19 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             OwnedFailedRenewalMethodService service,ProviderOperation setupStep,ProviderOperation methodStep) {}
     private record PendingMethod(Setup setup,Failure failure,OwnedFailedRenewalMethod.Reservation reservation,
             OwnedFailedRenewalMethodService service,dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext context,
-            ProviderOperation setupStep,int callStart) {}
+            ProviderOperation setupStep,int callStart,String customerToken) {
+        @Override public String toString(){return "PendingMethod[redacted]";}
+    }
 
     /** Genuine failed observer, service reservation, typed first dispatches, SDK replies and ordinary proof stores.
      * Provider-side confirmation is synthetic observation only; no browser capability is issued or claimed. */
     private PreparedMethod preparedMethod() {
-        var pending=pendingMethod(false);var s=pending.setup();var failure=pending.failure();var r=pending.reservation();var svc=pending.service();
+        return preparedMethod(pendingMethod(false));
+    }
+    private PreparedMethod preparedMethod(PendingMethod pending) {
+        var s=pending.setup();var failure=pending.failure();var r=pending.reservation();var svc=pending.service();
         var context=pending.context();var setupStep=pending.setupStep();var callStart=pending.callStart();var before=financialState();
+        int continuationStart=http.calls.size();
         var subscription=current();var o=lifecycleOperations.find(site,subscription.id(),r.setupOperationId()).orElseThrow();
         var binding=bindings.findCustomer(billing.id(),site,customer).orElseThrow();var client=clients.create(credentials.resolve(billing));
         var proof=methodBillingProofs.setup(billing.id(),o.id()).orElseThrow();
@@ -422,10 +437,11 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var methodStep=operations.acknowledge(updateDispatch.id(),methodOwner,updateDispatch.version(),subscription.providerReference());
         assertThat(setupStep.version()).isEqualTo(2);assertThat(methodStep.version()).isEqualTo(2);
         assertThat(financialState()).isEqualTo(before);assertThat(lifecycleOperations.find(site,subscription.id(),o.id())).contains(o);
-        assertThat(http.calls.subList(callStart,http.calls.size()).stream().map(request->request.method().name()+" "+request.url().getPath()).toList())
-            .containsExactly("POST /v1/setup_intents","GET /v1/setup_intents/seti_saved","GET /v1/payment_methods/pm_saved","POST /v1/subscriptions/"+subscription.providerReference());
+        assertThat(http.calls.get(callStart).method().name()+" "+http.calls.get(callStart).url().getPath()).isEqualTo("POST /v1/setup_intents");
+        assertThat(http.calls.subList(continuationStart,http.calls.size()).stream().map(request->request.method().name()+" "+request.url().getPath()).toList())
+            .containsExactly("GET /v1/setup_intents/seti_saved","GET /v1/payment_methods/pm_saved","POST /v1/subscriptions/"+subscription.providerReference());
         assertThat(http.calls.get(callStart).options().getIdempotencyKey()).isEqualTo(setupStep.operationKey());
-        assertThat(http.calls.get(callStart+3).options().getIdempotencyKey()).isEqualTo(methodStep.operationKey());assertThat(http.replies).isEmpty();
+        assertThat(http.calls.get(continuationStart+2).options().getIdempotencyKey()).isEqualTo(methodStep.operationKey());assertThat(http.replies).isEmpty();
         var processing=svc.recordMethodUpdateReply(r,context);assertThat(processing.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);assertThat(processing.version()).isEqualTo(1);
         assertThat(processing.providerReference()).isEqualTo(subscription.providerReference());assertThat(financialState()).isEqualTo(before);
         return new PreparedMethod(s,failure,r,svc,setupStep,methodStep);
@@ -438,7 +454,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var s=setup();failedGraph(s);
         var failure=new StripeBillingOwnedFailedRenewalObserver(service(store(),null),credentials,clients,Clock.systemUTC()).observe(s.admission());
         var before=financialState();var methods=new JdbcOwnedFailedRenewalMethodStore(jdbc);var svc=methodService(methods);
-        var context=managementContext("genuine-owned-method");
+        var authentication=managementAuthentication("genuine-owned-method");var context=authentication.context();
         if(sessionSeconds>0){
             var original=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)context.actor()).session();
             var expiry=Instant.now().plusSeconds(sessionSeconds).truncatedTo(java.time.temporal.ChronoUnit.MICROS);
@@ -465,7 +481,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var setupStep=operations.acknowledge(dispatch.id(),setupOwner,dispatch.version(),remote.getId());
         var proof=methodBillingProofs.recordSetup(subscription,o,setupStep.id(),setupStep.providerReference());
         assertThat(proof.method()).isNull();assertThat(financialState()).isEqualTo(before);
-        return new PendingMethod(s,failure,r,svc,context,setupStep,callStart);
+        return new PendingMethod(s,failure,r,svc,context,setupStep,callStart,authentication.rawToken());
     }
     private dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore browserStore(){return new JdbcOwnedFailedRenewalMethodStore(jdbc);}
     private <T>T browserPhase(PendingMethod p,java.util.function.Function<OwnedMethodBrowser.Pending,T> work){
@@ -499,6 +515,97 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var o=lifecycleOperations.find(site,current().id(),p.reservation().setupOperationId()).orElseThrow();
         var body=dev.genericpayments.platform.support.StripeBillingOwnedSubscriptionFixture.json(setupBody(o,p.setupStep(),"requires_payment_method"));
         body.addProperty("client_secret",p.setupStep().providerReference()+"_secret_INERT");http.reply(body.toString());
+    }
+    private org.springframework.test.web.servlet.MockMvc browserMvc(OwnedMethodBrowserService service){
+        var u=ordinaryHttp;
+        var explicit=new dev.genericpayments.platform.subscriptions.adapter.in.web.SubscriptionHttpUseCases(u.query(),u.create(),u.preview(),u.change(),u.clear(),u.cancel(),u.withdraw(),u.setup(),u.recover(),u.resume(),service,service,u.portal(),u.reconcile());
+        var mapper=new tools.jackson.databind.ObjectMapper();
+        return org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(
+            new dev.genericpayments.platform.subscriptions.adapter.in.web.CustomerSubscriptionController(explicit),
+            new dev.genericpayments.platform.subscriptions.adapter.in.web.SubscriptionConfirmationController(service),
+            new dev.genericpayments.platform.subscriptions.adapter.in.web.SubscriptionClientSessionController(service))
+            .setControllerAdvice(new dev.genericpayments.platform.shared.adapter.in.web.ApiExceptionHandler())
+            .addFilters(new dev.genericpayments.platform.subscriptions.adapter.in.web.SubscriptionRequestPolicyFilter(mapper,true),
+                new dev.genericpayments.platform.customers.adapter.in.web.CustomerSessionAuthenticationFilter(sessions,sites,mapper),
+                new dev.genericpayments.platform.subscriptions.adapter.in.web.SubscriptionRequestPolicyFilter(mapper,false)).build();
+    }
+    private String browserPath(PendingMethod p){return "/api/v1/customer/subscriptions/"+current().id()+"/operations/"+p.reservation().setupOperationId();}
+    private org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder browserGet(PendingMethod p,String suffix){
+        return get(browserPath(p)+suffix).header("Origin",p.context().origin()).header("Authorization","Bearer "+p.customerToken());
+    }
+    private org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder browserPost(PendingMethod p,String suffix,String key,String grant){
+        return post(browserPath(p)+suffix).header("Origin",p.context().origin()).header("Authorization","Bearer "+p.customerToken()).header("Idempotency-Key",key).contentType("application/json").content("{\"action_token\":\""+grant+"\"}");
+    }
+    /** All four real HTTP boundaries, actual original session resolution and exact no-store wire.
+     * Hosted only: standalone MVC creates a context and must never enter the offline pure selector. */
+    private void controllerBrowserPermission(PendingMethod p,boolean legacy) throws Exception {
+        var service=browserService(p,browserStore());var operation=lifecycleOperations.find(site,current().id(),p.reservation().setupOperationId()).orElseThrow();
+        var original=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
+        assertThat(sessions.resolveRequired(p.customerToken(),original.origin())).isEqualTo(original);
+        var before=financialState();int calls=http.calls.size();var mvc=browserMvc(service);var mapper=new tools.jackson.databind.ObjectMapper();
+        try{
+            var actionResult=mvc.perform(browserGet(p,"/action")).andExpect(status().isOk()).andExpect(header().string("Cache-Control","no-store"))
+                .andExpect(jsonPath("$.kind").value("PROVIDER_CLIENT")).andReturn();
+            var action=mapper.readTree(actionResult.getResponse().getContentAsString());String grant=action.get("secret").asString();
+            // Another valid session for this same customer cannot inherit the original browser.
+            TestClock.set(Instant.now());var replacement=sessions.issue(site,customer,original.origin());
+            mvc.perform(browserGet(p,"/action").with(r->{r.removeHeader("Authorization");r.addHeader("Authorization","Bearer "+replacement.rawToken());return r;}))
+                .andExpect(status().isConflict()).andExpect(header().string("Cache-Control","no-store"));
+            for(String locator:List.of("/api/v1/customer/subscriptions/"+UUID.randomUUID()+"/operations/"+operation.id(),
+                    "/api/v1/customer/subscriptions/"+operation.subscriptionId()+"/operations/"+UUID.randomUUID())){
+                mvc.perform(get(locator+"/action").header("Origin",original.origin()).header("Authorization","Bearer "+p.customerToken()))
+                    .andExpect(status().isConflict()).andExpect(header().string("Cache-Control","no-store"));
+            }
+            mvc.perform(browserGet(p,"/action").with(r->{r.removeHeader("Origin");return r;})).andExpect(status().isUnauthorized()).andExpect(header().string("Cache-Control","no-store"));
+            mvc.perform(browserGet(p,"/action").with(r->{r.removeHeader("Origin");r.addHeader("Origin","https://foreign.test");return r;})).andExpect(status().isUnauthorized()).andExpect(header().string("Cache-Control","no-store"));
+            assertThat(http.calls).hasSize(calls);queuePendingBrowser(p);
+            String selectedPath=legacy?"/client-session":"/confirmation-session";
+            var selected=mvc.perform(browserPost(p,selectedPath,"select",grant)).andExpect(status().isOk()).andExpect(header().string("Cache-Control","no-store"))
+                .andExpect(jsonPath("$.provider").value("stripe")).andExpect(jsonPath("$.flow").value("SETUP"))
+                .andExpect(jsonPath("$.client_secret").value(p.setupStep().providerReference()+"_secret_INERT")).andExpect(jsonPath("$.action_token").value(grant))
+                .andExpect(jsonPath("$.attempt_id").doesNotExist()).andExpect(jsonPath("$.capability").doesNotExist()).andReturn();
+            var selection=mapper.readTree(selected.getResponse().getContentAsString());assertThat(selection.get("expires_at").asString()).isEqualTo(action.get("expires_at").asString());
+            if(!legacy)assertThat(selection.get("protocol").asString()).isEqualTo("BROWSER_CONFIRM_V1");
+            mvc.perform(browserPost(p,legacy?"/confirmation-session":"/client-session","select-again",grant)).andExpect(status().isConflict()).andExpect(header().string("Cache-Control","no-store"));
+            var confirmation=browserPost(p,"/action-confirmations","confirm",grant);
+            mvc.perform(confirmation).andExpect(status().isAccepted()).andExpect(header().string("Cache-Control","no-store"))
+                .andExpect(jsonPath("$.operation_id").value(operation.id().toString())).andExpect(jsonPath("$.subscription_id").value(operation.subscriptionId().toString()))
+                .andExpect(jsonPath("$.status").value("RESERVED")).andExpect(jsonPath("$.action_available").value(false)).andExpect(jsonPath("$.next_action").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.browser_confirm_allowed").value(true)).andExpect(jsonPath("$.client_secret").doesNotExist());
+            mvc.perform(browserPost(p,"/action-confirmations","confirm",grant)).andExpect(status().isAccepted()).andExpect(header().string("Cache-Control","no-store")).andExpect(jsonPath("$.browser_confirm_allowed").value(false));
+            mvc.perform(browserPost(p,"/action-confirmations","changed",grant)).andExpect(status().isConflict()).andExpect(header().string("Cache-Control","no-store"));
+        }finally{org.springframework.security.core.context.SecurityContextHolder.clearContext();}
+        assertThat(http.calls).hasSize(calls+1);assertThat(http.calls.getLast().url().getPath()).isEqualTo("/v1/setup_intents/"+p.setupStep().providerReference());
+        assertThat(lifecycleOperations.find(site,operation.subscriptionId(),operation.id())).contains(operation);assertThat(operation.version()).isZero();assertThat(financialState()).isEqualTo(before);
+        assertThat(methodBillingProofs.setup(billing.id(),operation.id()).orElseThrow().method()).isNull();
+        assertThat(count("stripe_billing_method_browser_roots")).isEqualTo(1);assertThat(count("stripe_billing_method_browser_selections")).isEqualTo(1);assertThat(count("stripe_billing_method_browser_releases")).isEqualTo(1);assertThat(count("stripe_billing_method_browser_consumptions")).isEqualTo(1);
+        assertThat(count("stripe_billing_failed_method_completions")).isZero();assertThat(count("payments")).isEqualTo(1);
+    }
+    @Test void ordinaryCustomerControllerAndQueriesStillRefuseTheEnrolledClockOwnerWithoutSdkCalls(){
+        var p=pendingMethod(true);var original=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
+        var before=financialState();int calls=http.calls.size();var controller=new dev.genericpayments.platform.subscriptions.adapter.in.web.CustomerSubscriptionController(ordinaryHttp);
+        var request=new org.springframework.mock.web.MockHttpServletRequest();request.addHeader("Idempotency-Key","ordinary-denied");
+        org.springframework.security.core.context.SecurityContextHolder.getContext().setAuthentication(org.springframework.security.authentication.UsernamePasswordAuthenticationToken.authenticated(original,null,List.of()));
+        try{
+            assertThatThrownBy(()->controller.get(request,current().id())).isInstanceOf(RuntimeException.class);
+            assertThatThrownBy(()->controller.action(request,current().id(),p.reservation().setupOperationId())).isInstanceOf(RuntimeException.class);
+            assertThatThrownBy(()->controller.confirm(request,current().id(),p.reservation().setupOperationId(),new dev.genericpayments.platform.subscriptions.adapter.in.web.SubscriptionTransport.SubscriptionActionRequest("bga1_"+"D".repeat(43)))).isInstanceOf(RuntimeException.class);
+        }finally{org.springframework.security.core.context.SecurityContextHolder.clearContext();}
+        assertThat(http.calls).hasSize(calls);assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_method_browser_roots")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @ParameterizedTest @ValueSource(booleans={false,true}) void browserPermissionThenIndependentMethodProofAndActualObserverCompleteOnlyTheMethod(boolean legacy) throws Exception {
+        var pending=pendingMethod(true);var before=financialState();var debt=current().debt();var subscription=current();long sequence=observations.captureFence(subscription);
+        controllerBrowserPermission(pending,legacy);
+        // The browser receipt is permission only. The unchanged genuine continuation separately
+        // reads succeeded SETUP + card, binds, dispatches METHOD and records its real ACK.
+        var prepared=preparedMethod(pending);
+        assertThat(financialState()).isEqualTo(before);assertThat(current().debt()).isEqualTo(debt);
+        assertThat(lifecycleOperations.find(site,current().id(),pending.reservation().setupOperationId()).orElseThrow().status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        int start=http.calls.size();methodGraph(prepared);var completed=methodObserver(prepared.service()).observeMethod(prepared.reservation());assertObservationSlice(prepared,start,17);
+        assertThat(completed.reservationId()).isEqualTo(pending.reservation().id());assertThat(current()).isEqualTo(subscription);assertThat(current().debt()).isEqualTo(debt);
+        assertThat(observations.captureFence(current())).isEqualTo(sequence+1);var after=new TreeMap<>(financialState());after.put("sequence",before.get("sequence"));assertThat(after).isEqualTo(before);
+        assertThat(lifecycleOperations.find(site,current().id(),pending.reservation().setupOperationId()).orElseThrow().status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+        assertThat(count("stripe_billing_failed_method_completions")).isEqualTo(1);assertThat(count("stripe_billing_failed_method_publications")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();assertThat(count("payments")).isEqualTo(1);
     }
     @ParameterizedTest @ValueSource(booleans={false,true}) void explicitBrowserIssuerCommitsOneReleaseAndOneActualReservedPermission(boolean legacy){
         var p=pendingMethod(true);var service=browserService(p,browserStore());var before=financialState();

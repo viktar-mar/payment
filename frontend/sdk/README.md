@@ -197,6 +197,37 @@ V2 session fields are frozen, non-enumerable and redacted; preserve the returned
 
 The legacy headless `mountStripeSubscription` and `clientSession` remain available. Legacy PAYMENT, SETUP and Fake behavior retains the original one-shot rules. A legacy Stripe Pay permanently consumes the original operation grant before its first asynchronous preflight; only an original response's `browserConfirmAllowed: true` permits browser confirmation. Spent legacy grants never reopen through Retry or Refresh. Selected SETUP uses the already-returned context without requesting a second session.
 
+For an explicitly composed owned method reservation, `mountStripeSubscriptionMethod` prepares its original SETUP form using the real `client.subscriptions`, original authenticated Customer session and subscription/operation locator. The custom site supplies a connected visible container and current-owner predicate; the entry retrieves and brands the original action, selects BROWSER_CONFIRM_V1/SETUP and mounts the existing driver. PAYMENT/v2, copied capabilities and unavailable selection fail closed. There is no legacy session, current-attempt or retry fallback. This entry does not change the general manager's reserved-operation behavior or subscription query permissions. Its matching server service is explicitly constructed per reservation and remains unregistered in the ordinary application.
+
+```js
+import { mountStripeSubscriptionMethod } from '@generic-payments/sdk';
+confirmButton.disabled = true;
+const handle = await mountStripeSubscriptionMethod({
+  client: client.subscriptions,
+  session: authenticatedCustomerSession,
+  subscriptionId: reservedSubscriptionId,
+  operationId: reservedSetupOperationId,
+  container: visibleMethodHost,
+  isCurrent: () => originalOwnerStillCurrent,
+  signal: pageController.signal,
+  locale: 'en',
+  onRetire: () => { confirmButton.disabled = true; },
+});
+// Resolves only after the Payment Element's ready event.
+confirmButton.disabled = false;
+confirmButton.addEventListener('click', async () => {
+  confirmButton.disabled = true;
+  try {
+    const pendingOperation = await handle.confirm();
+    showPendingMethodObservation(pendingOperation);
+  } catch (error) {
+    showSafeMethodError(error.name === 'AbortError' ? 'CANCELLED' : error.code);
+  }
+}, { once: true });
+```
+
+The exported `StripeSubscriptionMethodOptions` and `StripeSubscriptionHandle` describe this contract. `confirm()` spends once before its server preflight and invokes `confirmSetup` at most once; `destroy()` retires it. Keep the same real client and original session object, and destroy or abort when replacing the page owner. Document hidden→visible, host removal/visibility loss, pagehide, cancellation, logout, session replacement and expiry remain latched through selection, readiness, preflight and driver retirement. The browser returns the actual pending RESERVED operation with no method/payment success fact. Only subsequent independent provider observation and the server FactService can complete the method transition; existing invoice debt remains open.
+
 The manager reserves a connected visible host, waits for the Payment Element's actual ready event and preserves it across presentation changes. Logout, bearer replacement, expiry, disconnect, pagehide and lost host visibility retire the Element and provider references. V2 also retires on document visibility loss. Server Billing observation alone establishes payment/access; browser success and Portal navigation never grant entitlement.
 
 `portal` returns exactly `{navigationUrl,expiresAt,simulated}`. Fake navigation retains the exact caller return origin/path/query, a single `subscriptionPortal` marker and operation UUID; HTTP is accepted only for literal loopback (`localhost`, `127.0.0.1`, `[::1]`) under the backend's local profile. For `simulated: false`, the SDK accepts only the conservative raw Sandbox shape `https://billing.stripe.com/p/session?secret=test_<opaque>`, with `[A-Za-z0-9_-]+` opaque content and at most 2048 characters. Other paths, extra/duplicate query fields, encoding, fragments, userinfo, ports and live secrets fail closed. This supported subset does not claim compatibility with every Stripe Portal URL shape.

@@ -356,3 +356,19 @@ The new [observer](../backend/src/main/java/dev/genericpayments/platform/provide
 | Full Stage 5B | **NOT_ACCEPTED**. |
 
 No local Docker, SQL/application context, provider account, native browser or financial operation was executed. This checkpoint introduces no native launcher or permission to reuse retained operations.
+
+## Original-session method browser permission preparation — 2026-11-07
+
+The [browser design](superpowers/specs/2026-11-07-owned-method-browser-design.md) adds atomic original-session enrollment and durable one-shot browser permission between the genuine SETUP ACK/unbound proof and independent saved-method binding. The explicitly constructed server service shares one selection opportunity between legacy client-session and BROWSER_CONFIRM_V1; it commits release before returning ephemeral material and consumption before granting first-only browser confirmation. The reader permits one logical SDK retrieve with zero application/Stripe SDK retries and one immutable two-second UTC/monotonic budget; existing JDK transparent GET recovery can occur within that budget. No single-wire-attempt guarantee or transport change is claimed.
+
+The SDK exports `mountStripeSubscriptionMethod` for the real authenticated client and original subscription/operation locator. It keeps the outer visibility/authority guard through driver retirement, requires actual readiness before a site's explicit confirmation click, and spends before preflight. The actual returned operation remains RESERVED/pending. Customer action/confirm controller context derives only from the authenticated session and delegates locator authorization to the action ports; ordinary query, partner/admin scope and provider clock-owner guards retain their prior denial. No ordinary query permission or manager reserved-state behavior is widened.
+
+| Evidence boundary | Current preparation |
+| --- | --- |
+| Local inert verification | Actual SDK client/action/selection/SETUP driver over JSDOM, inert fetch and provider-loader substitute; direct controllers around actual method/browser services and handwritten state. Exact commands, counts, TDD results and hashes are in the [Task 3 report](../.superpowers/sdd/2026-11-07-owned-method-browser/task-3-report.md). |
+| Local SDK dependency gap | Pinned Stripe JS 10.1.0 is absent from the existing local cache. The related confirmation-v2 suite fails import while the other three selected suites pass. Full tests/typecheck/build require exact-source hosted CI; no installation or substitute types were used. |
+| Genuine hosted composition | Reuses original consenting session, real guarded SETUP dispatch/ACK/unbound proof, actual controllers/service/JDBC permission, independent succeeded SetupIntent/card binding and real METHOD ACK, then existing observer/FactService completion. No browser-as-fact shortcut or synthetic successful lifecycle row. Hosted execution remains **PENDING**; prior CI counts do not establish these additions. |
+| Native browser/provider and later time | Actual owned method confirmation, Sandbox field/timing interoperability, runtime and delivered callbacks, exact-owner later time/grace/G+1 lineage remain **NOT_RUN**. |
+| Full Stage 5B | **NOT_ACCEPTED**. |
+
+This source preparation supplies no native launcher, registration, financial execution or authority to replay retained resources. Browser permission and hosted synthetic responses do not establish native acceptance.

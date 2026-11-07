@@ -1,6 +1,9 @@
 export type { SubscriptionPaymentSession, SubscriptionConfirmationSession, SubscriptionAttemptStatus, SubscriptionConfirmReceipt, SubscriptionAttemptInput } from './subscriptions/contracts.js';
 export { mountStripePaymentAttempt } from './subscriptions/stripe-payment-attempt-driver.js';
 export type { StripePaymentAttemptHandle } from './subscriptions/stripe-payment-attempt-driver.js';
+export { mountStripeSubscriptionMethod } from './subscriptions/stripe-subscription-method.js';
+export type { StripeSubscriptionMethodOptions } from './subscriptions/stripe-subscription-method.js';
+export type { StripeSubscriptionHandle } from './subscriptions/stripe-subscription-driver.js';
 export { createGenericPaymentClient } from "./client.js";
 export type { SubscriptionClient, SubscriptionRequest, SubscriptionIdRequest, SubscriptionMutation, SubscriptionMutationReceipt, SubscriptionClientSession, SubscriptionPrice, SubscriptionPeriod, SubscriptionAccess, SubscriptionView, SubscriptionOffer, SubscriptionBillingView, SubscriptionBillingPage, SubscriptionPage, SubscriptionEvent, SubscriptionHistory, SubscriptionQuote, SubscriptionOperation, SubscriptionAction, SubscriptionPortal, SubscriptionTiming } from './subscriptions/contracts.js';
 export { parseSubscription, parseSubscriptionQuote, parseSubscriptionOperation, parseSubscriptionAction, parseSubscriptionPortal, parseSubscriptionOffers, parseSubscriptionBillingPage } from './subscriptions/wire.js';
