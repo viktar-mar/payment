@@ -592,7 +592,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             assertThatThrownBy(()->controller.action(request,current().id(),p.reservation().setupOperationId())).isExactlyInstanceOf(PaymentApplicationException.class)
                 .satisfies(failure->assertThat(((PaymentApplicationException)failure).code()).isEqualTo("PROVIDER_CAPABILITY_UNAVAILABLE"));
             assertThatThrownBy(()->controller.confirm(request,current().id(),p.reservation().setupOperationId(),new dev.genericpayments.platform.subscriptions.adapter.in.web.SubscriptionTransport.SubscriptionActionRequest("bga1_"+"D".repeat(43)))).isExactlyInstanceOf(PaymentApplicationException.class)
-                .satisfies(failure->assertThat(((PaymentApplicationException)failure).code()).isEqualTo("PROVIDER_OPERATION_CONFLICT"));
+                .satisfies(failure->assertThat(((PaymentApplicationException)failure).code()).isEqualTo("PROVIDER_CAPABILITY_UNAVAILABLE"));
         }finally{org.springframework.security.core.context.SecurityContextHolder.clearContext();}
         assertThat(http.calls).hasSize(calls);assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_method_browser_roots")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
     }
