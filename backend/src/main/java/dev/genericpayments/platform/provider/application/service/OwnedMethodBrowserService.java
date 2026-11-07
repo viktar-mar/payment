@@ -49,7 +49,7 @@ public final class OwnedMethodBrowserService implements GetSubscriptionActionUse
     });}
     private Released release(SubscriptionCommandContext context,UUID subscription,UUID operation,String token){
         scope(context,subscription,operation);requireToken(token);var key=key(context);
-        // The start receipt commits before the sole provider GET. Any later failure burns this opportunity.
+        // The start receipt commits before the sole SDK retrieve. Any later failure burns this opportunity.
         var selected=methods.browserPhase(expected,context,p->{
             var root=store.browserRootInTransaction(expected.id()).orElseThrow(OwnedMethodBrowserService::unavailable);verify(p,root,token);
             var at=now();var selection=store.startBrowserSelectionInTransaction(p,root,key,at);

@@ -14,7 +14,9 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.regex.Pattern;
 
-/** One bounded original GET. The SDK worker has no service/store/transaction capability. */
+/** One original SDK retrieve with no application/SDK retries and one wall/monotonic budget.
+ * Existing JDK transparent GET recovery shares that budget; no single-wire-attempt claim.
+ * The SDK worker has no service/store/transaction capability. */
 public final class StripeOwnedMethodBrowserReader implements OwnedMethodBrowserReader {
     private static final long LIMIT=TimeUnit.SECONDS.toNanos(2);
     private final StripeCredentialResolver credentials;private final StripeClientFactory clients;private final Clock clock;
@@ -22,18 +24,21 @@ public final class StripeOwnedMethodBrowserReader implements OwnedMethodBrowserR
     public EphemeralSetup read(Pending p,Instant deadline){
         long started=System.nanoTime();
         try{
-            remaining(started,deadline);requireOriginal(p);
+            if(deadline==null)throw unavailable();
+            var maximum=clock.instant().plusSeconds(2);
+            var wallDeadline=deadline.isBefore(maximum)?deadline:maximum;
+            remaining(started,wallDeadline);requireOriginal(p);
             var credential=credentials.resolve(p.account());var pk=credential.publishableKey();
             if(pk==null||!pk.matches("pk_test_[A-Za-z0-9]+"))throw unavailable();
             var client=clients.create(credential);var reference=p.setup().reference();
-            int millis=(int)TimeUnit.NANOSECONDS.toMillis(remaining(started,deadline));if(millis<=0)throw unavailable();
+            int millis=(int)TimeUnit.NANOSECONDS.toMillis(remaining(started,wallDeadline));if(millis<=0)throw unavailable();
             var builder=RequestOptions.builder().setConnectTimeout(millis).setReadTimeout(millis).setMaxNetworkRetries(0);
             RequestOptions.RequestOptionsBuilder.unsafeSetStripeVersionOverride(builder,StripeBillingTestClockAdapter.API_VERSION);
             var options=builder.build();
-            var pending=new FutureTask<SetupIntent>(()->{remaining(started,deadline);return client.v1().setupIntents().retrieve(reference,options);});
+            var pending=new FutureTask<SetupIntent>(()->{remaining(started,wallDeadline);return client.v1().setupIntents().retrieve(reference,options);});
             Thread.ofVirtual().name("owned-method-browser-read").start(pending);
             SetupIntent remote;
-            try{remote=pending.get(remaining(started,deadline),TimeUnit.NANOSECONDS);remaining(started,deadline);}
+            try{remote=pending.get(remaining(started,wallDeadline),TimeUnit.NANOSECONDS);remaining(started,wallDeadline);}
             catch(InterruptedException failure){Thread.currentThread().interrupt();throw unavailable();}
             catch(ExecutionException|TimeoutException failure){throw unavailable();}
             finally{pending.cancel(true);}
@@ -41,7 +46,7 @@ public final class StripeOwnedMethodBrowserReader implements OwnedMethodBrowserR
             if(!reference.equals(remote.getId())||!"requires_payment_method".equals(remote.getStatus())||remote.getPaymentMethod()!=null)throw unavailable();
             var secret=remote.getClientSecret();
             if(secret==null||secret.length()>512||!secret.matches(Pattern.quote(reference)+"_secret_[A-Za-z0-9_]+"))throw unavailable();
-            remaining(started,deadline);
+            remaining(started,wallDeadline);
             return new EphemeralSetup(reference,pk,secret);
         }catch(RuntimeException failure){throw unavailable();}
     }

@@ -14,12 +14,13 @@ import java.util.concurrent.atomic.*;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
+/** Counts SDK entries into explicit inert transport, not production HTTP wire attempts. */
 class StripeOwnedMethodBrowserReaderTest {
     final ReaderContext f=new ReaderContext();
     final StripeBillingInertSdkFixture sdk=f.g.f.f;
     StripeOwnedMethodBrowserReader reader(){return new StripeOwnedMethodBrowserReader(sdk.credentials,sdk.clients,f.clock);}
     String body(){var p=f.pending();return "{\"id\":\"seti_owned\",\"object\":\"setup_intent\",\"livemode\":false,\"customer\":\""+p.binding().providerReference()+"\",\"usage\":\"off_session\",\"payment_method_types\":[\"card\"],\"status\":\"requires_payment_method\",\"payment_method\":null,\"created\":"+p.setupStep().firstDispatchedAt().getEpochSecond()+",\"metadata\":{\"operation_id\":\""+p.operation().id()+"\",\"subscription_id\":\""+p.subscription().id()+"\"},\"client_secret\":\"seti_owned_secret_INERT\"}";}
-    @Test void oneExactOriginalGetPinsApiVersionTimeoutsAndNoRetries(){
+    @Test void oneOriginalSdkRetrievePinsApiVersionTimeoutsAndZeroSdkRetries(){
         sdk.http.reply(body());var result=reader().read(f.pending(),f.now().plusSeconds(30));
         assertThat(result.setupReference()).isEqualTo("seti_owned");assertThat(result.publishableKey()).isEqualTo("pk_test_INERT");assertThat(result.clientSecret()).isEqualTo("seti_owned_secret_INERT");assertThat(sdk.http.calls).hasSize(1);
         var request=sdk.http.calls.getFirst();assertThat(request.method().name()).isEqualTo("GET");assertThat(request.url().toString()).isEqualTo("https://api.stripe.com/v1/setup_intents/seti_owned");
@@ -45,8 +46,17 @@ class StripeOwnedMethodBrowserReaderTest {
         var proof=p.setup();var changed=new dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore.Setup(proof.operation(),proof.subscription(),proof.account(),proof.step(),"seti_foreign",null);
         refused(()->reader().read(new Pending(p.reservation(),p.enrollment(),p.account(),p.subscription(),p.operation(),p.binding(),changed,p.setupStep()),f.now().plusSeconds(30)));assertThat(sdk.http.calls).isEmpty();
     }
-    @Test void providerErrorsAreFixedCauseFreeAndDoNotRetry(){sdk.http.disconnect();refused(()->reader().read(f.pending(),f.now().plusSeconds(30)));assertThat(sdk.http.calls).hasSize(1);}
+    @Test void providerErrorsAreFixedCauseFreeAndDoNotReenterSdk(){sdk.http.disconnect();refused(()->reader().read(f.pending(),f.now().plusSeconds(30)));assertThat(sdk.http.calls).hasSize(1);}
     @Test void utcDeadlineCapsRequestAndLateCompletionCannotReturnSecret(){sdk.http.reply(body());var deadline=f.now().plusMillis(70);sdk.http.afterResponse=()->f.at(deadline);refused(()->reader().read(f.pending(),deadline));assertThat(sdk.http.calls).hasSize(1);assertThat(sdk.http.calls.getFirst().options().getReadTimeout()).isBetween(1,70);refused(()->reader().read(f.pending(),deadline));assertThat(sdk.http.calls).hasSize(1);}
+    @Test void fastSdkCompletionAfterThreeWallSecondsCannotReturnSecretWithinLongSelection(){
+        var start=f.now();var selectionDeadline=start.plusSeconds(30);
+        sdk.http.reply(body());sdk.http.afterResponse=()->f.at(start.plusSeconds(3));
+
+        refused(()->reader().read(f.pending(),selectionDeadline));
+
+        assertThat(sdk.http.calls).hasSize(1);assertThat(f.now()).isBefore(selectionDeadline);
+        assertThat(sdk.http.calls.getFirst().options().getReadTimeout()).isBetween(1,2000);
+    }
     @Test void interruptedCallerIsPreservedAndNoGetStarts(){Thread.currentThread().interrupt();try{refused(()->reader().read(f.pending(),f.now().plusSeconds(30)));assertThat(Thread.currentThread().isInterrupted()).isTrue();assertThat(sdk.http.calls).isEmpty();}finally{Thread.interrupted();}}
     @Test void interruptionDuringGetCancelsWorkerAndPreservesCallerFlag()throws Exception{
         var entered=new CountDownLatch(1);var stopped=new CountDownLatch(1);var preserved=new AtomicBoolean();var count=new AtomicInteger();
@@ -55,7 +65,23 @@ class StripeOwnedMethodBrowserReaderTest {
         var reader=new StripeOwnedMethodBrowserReader(sdk.credentials,factory,f.clock);var task=new FutureTask<Void>(()->{try{refused(()->reader.read(f.pending(),f.now().plusSeconds(30)));preserved.set(Thread.currentThread().isInterrupted());return null;}finally{Thread.interrupted();}});var caller=Thread.ofVirtual().start(task);
         try{assertThat(entered.await(1,TimeUnit.SECONDS)).isTrue();caller.interrupt();task.get(1,TimeUnit.SECONDS);assertThat(preserved).isTrue();assertThat(stopped.await(1,TimeUnit.SECONDS)).isTrue();assertThat(count).hasValue(1);}finally{caller.interrupt();task.cancel(true);}
     }
-    @Test void blockedGetIsCancelledAtBoundWithoutSocketOrSecondRead()throws Exception{var entered=new CountDownLatch(1);var cancelled=new CountDownLatch(1);var count=new AtomicInteger();var transport=new HttpClient(){public StripeResponse request(StripeRequest request){count.incrementAndGet();entered.countDown();try{new CountDownLatch(1).await();throw new AssertionError("unreachable");}catch(InterruptedException e){cancelled.countDown();throw new IllegalStateException("private provider detail");}}};var factory=new StripeClientFactory(){public StripeClient create(StripeCredentials ignored){return StripeClient.builder().setApiKey("sk_test_INERT").setHttpClient(transport).build();}};var reader=new StripeOwnedMethodBrowserReader(sdk.credentials,factory,f.clock);long start=System.nanoTime();refused(()->reader.read(f.pending(),f.now().plusSeconds(30)));assertThat(Duration.ofNanos(System.nanoTime()-start)).isLessThan(Duration.ofSeconds(4));assertThat(entered.await(1,TimeUnit.SECONDS)).isTrue();assertThat(cancelled.await(1,TimeUnit.SECONDS)).isTrue();assertThat(count).hasValue(1);}
+    @Test void blockedSdkEntryIsCancelledAtBoundWithoutSocketOrSecondSdkEntry()throws Exception{
+        var entered=new CountDownLatch(1);var cancelled=new CountDownLatch(1);var sdkEntries=new AtomicInteger();
+        var transport=new HttpClient(){public StripeResponse request(StripeRequest request){
+            sdkEntries.incrementAndGet();entered.countDown();
+            try{new CountDownLatch(1).await();throw new AssertionError("unreachable");}
+            catch(InterruptedException e){cancelled.countDown();throw new IllegalStateException("private provider detail");}
+        }};
+        var factory=new StripeClientFactory(){public StripeClient create(StripeCredentials ignored){
+            return StripeClient.builder().setApiKey("sk_test_INERT").setHttpClient(transport).build();
+        }};
+        var reader=new StripeOwnedMethodBrowserReader(sdk.credentials,factory,f.clock);long start=System.nanoTime();
+
+        refused(()->reader.read(f.pending(),f.now().plusSeconds(30)));
+
+        assertThat(Duration.ofNanos(System.nanoTime()-start)).isLessThan(Duration.ofSeconds(4));
+        assertThat(entered.await(1,TimeUnit.SECONDS)).isTrue();assertThat(cancelled.await(1,TimeUnit.SECONDS)).isTrue();assertThat(sdkEntries).hasValue(1);
+    }
     @Test void tokenAdapterUsesExistingVersionHashAndMacWithoutExposingConfiguration(){var utility=new StripeBillingGrantTokens(true,"v1",Map.of("v1",Base64.getEncoder().encodeToString(new byte[32])));var adapter=new StripeOwnedMethodBrowserTokens(utility);var token=adapter.token("v1","inert descriptor");assertThat(adapter.activeVersion()).isEqualTo("v1");assertThat(token).isEqualTo(utility.token("v1","inert descriptor"));assertThat(adapter.hash(token)).isEqualTo(StripeBillingGrantTokens.hash(token));assertThat(adapter.matches(token,adapter.hash(token))).isTrue();assertThat(adapter.matches(token,"0".repeat(64))).isFalse();assertThat(adapter.toString()).doesNotContain(token);assertThat(new OwnedMethodBrowserReader.EphemeralSetup("seti_owned","pk_test_INERT","seti_owned_secret_INERT").toString()).doesNotContain("INERT");}
     static void refused(Runnable work){assertThatThrownBy(work::run).isExactlyInstanceOf(PaymentApplicationException.class).hasMessage("Owned method browser unavailable").hasNoCause();}
     /** Existing pure owned graph has a real supported default credential reference. */
