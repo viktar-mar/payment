@@ -508,8 +508,16 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     }
     @ParameterizedTest @ValueSource(strings={"session","origin","missing-scope","non-browser"}) void browserPendingRefusesWrongOriginalAuthorityWithoutStop(String mutation){
         var p=pendingMethod(!mutation.equals("non-browser"));var s=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
-        var other=mutation.equals("session")?((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)managementContext("second-session").actor()).session():s;
-        var changed=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(other.sessionId(),s.siteId(),s.customerId(),
+        dev.genericpayments.platform.customers.application.model.CustomerSessionContext changed;
+        if(mutation.equals("session")){
+            // Issue a real second session at the original issuance time so UUID is the only changed identity.
+            TestClock.set(jdbc.queryForObject("select issued_at from customer_sessions where id=?",java.sql.Timestamp.class,s.sessionId().value()).toInstant());
+            var second=sessions.issue(site,customer,s.origin());changed=sessions.resolveRequired(second.rawToken(),s.origin());TestClock.set(Instant.now());
+            assertThat(changed.sessionId()).isNotEqualTo(s.sessionId());assertThat(changed.expiresAt()).isEqualTo(s.expiresAt());
+            assertThat(changed.siteId()).isEqualTo(s.siteId());assertThat(changed.customerId()).isEqualTo(s.customerId());
+            assertThat(changed.origin()).isEqualTo(s.origin());assertThat(changed.scopes()).isEqualTo(s.scopes());
+            assertThat(transaction.requiresNew(()->sessions.revalidate(changed,site,changed.origin(),dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_MANAGE))).isEqualTo(changed);
+        }else changed=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(s.sessionId(),s.siteId(),s.customerId(),
             mutation.equals("origin")?"https://foreign.test":s.origin(),mutation.equals("missing-scope")?Set.of(dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_READ):s.scopes(),s.expiresAt());
         var context=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(new dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer(changed),site,customer,changed.origin(),null,"browser-get");
         var before=financialState();assertThatThrownBy(()->OwnedMethodBrowserTestAccess.phase(p.service(),p.reservation(),context,value->value)).isInstanceOf(RuntimeException.class);
@@ -606,6 +614,17 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         else {assertThatThrownBy(()->releaseBrowser(p,root,selected)).isInstanceOf(RuntimeException.class);assertThatThrownBy(()->consumeBrowser(p,root)).isInstanceOf(RuntimeException.class);}
         assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
     }
+    @Test void browserSelectionRefusesExpiredOpportunityWhileRootLiveWithoutBurningFreshSelection() throws Exception {
+        var p=pendingMethod(true);var root=browserRoot(p);var stale=browserNow();
+        var wait=Duration.between(Instant.now(),stale.plusSeconds(30)).plusMillis(50);if(!wait.isNegative())Thread.sleep(wait);
+        assertThat(Instant.now()).isBefore(root.expiresAt());
+        assertThatThrownBy(()->browserPhase(p,pending->browserStore().startBrowserSelectionInTransaction(pending,root,"b".repeat(64),stale)))
+            .isInstanceOf(RuntimeException.class).hasStackTraceContaining("Invalid owned method browser selection");
+        assertThat(count("stripe_billing_method_browser_selections")).isZero();
+        var fresh=selectBrowser(p,root);assertThat(fresh.startedAt()).isAfterOrEqualTo(stale.plusSeconds(30));
+        assertThat(fresh.deadlineAt()).isEqualTo(fresh.startedAt().plusSeconds(30));assertThat(count("stripe_billing_method_browser_selections")).isEqualTo(1);
+        assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
     @Test void browserReleaseMustCommitBeforeConsumptionEvenAcrossSavepoints(){
         var p=pendingMethod(true);var root=browserRoot(p);var selected=selectBrowser(p,root);
         assertThatThrownBy(()->browserPhase(p,pending->{
@@ -670,7 +689,11 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                 return browserStore().insertBrowserRootInTransaction(pending,new OwnedMethodBrowser.Root(UUID.randomUUID(),p.reservation().id(),pending.operation().id(),pending.setupStep().id(),2,pending.setup().reference(),"v1","a".repeat(64),now,expiry));}));
             try{
                 assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
-                var replay=workers.submit(()->{attempting.countDown();assertThatThrownBy(()->operations.acknowledge(p.setupStep().id(),"terminal-replay",1,p.setupStep().providerReference())).isInstanceOf(RuntimeException.class);return true;});
+                var replay=workers.submit(()->{attempting.countDown();assertThatThrownBy(()->operations.acknowledge(p.setupStep().id(),"terminal-replay",1,p.setupStep().providerReference()))
+                    .isInstanceOfSatisfying(dev.genericpayments.platform.shared.application.PaymentApplicationException.class,e->{
+                        assertThat(e.code()).isEqualTo("PROVIDER_OPERATION_CONFLICT");assertThat(e.status()).isEqualTo(409);
+                        assertThat(e).hasMessage("Provider operation conflicts with the request").hasNoCause();
+                    });return true;});
                 assertThat(attempting.await(5,TimeUnit.SECONDS)).isTrue();assertThatThrownBy(()->replay.get(100,TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
                 insert.countDown();assertThat(root.get(10,TimeUnit.SECONDS).setupStep()).isEqualTo(p.setupStep().id());assertThat(replay.get(10,TimeUnit.SECONDS)).isTrue();
             }finally{insert.countDown();}

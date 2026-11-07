@@ -129,7 +129,7 @@ begin
   select * into root from stripe_billing_method_browser_roots where id=new.root_id;
   if tg_table_name='stripe_billing_method_browser_selections' then
    at:=new.started_at;
-   if new.deadline_at<>least(new.started_at+interval '30 seconds',root.expires_at)
+   if db_at>=new.deadline_at or new.deadline_at<>least(new.started_at+interval '30 seconds',root.expires_at)
     or exists(select 1 from stripe_billing_method_browser_releases where root_id=root.id)
     or exists(select 1 from stripe_billing_method_browser_consumptions where root_id=root.id)
    then raise exception 'Invalid owned method browser selection' using errcode='23514'; end if;
