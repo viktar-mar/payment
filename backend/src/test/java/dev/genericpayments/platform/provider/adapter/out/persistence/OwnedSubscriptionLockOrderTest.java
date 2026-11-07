@@ -20,6 +20,10 @@ class OwnedSubscriptionLockOrderTest {
         var jdbc=new RecordingJdbc(false);
         assertThatThrownBy(()->invoke(entry,jdbc)).isSameAs(jdbc.complete);
         assertThat(jdbc.locks).containsExactly("sites","customers","payment_accounts");
+        assertThat(jdbc.calls).containsExactlyElementsOf(switch(entry){
+            case "claim","ack"->List.of("provider locator","provider lock","sites","customers","payment_accounts");
+            default->List.of("sites","customers","payment_accounts");
+        });
     }
 
     @ParameterizedTest @ValueSource(strings={"admit","current","receipt","reserve","claim","ack"})
@@ -27,6 +31,10 @@ class OwnedSubscriptionLockOrderTest {
         var jdbc=new RecordingJdbc(true);
         assertThatThrownBy(()->invoke(entry,jdbc)).isInstanceOf(PaymentApplicationException.class);
         assertThat(jdbc.locks).containsExactly("sites");
+        assertThat(jdbc.calls).containsExactlyElementsOf(switch(entry){
+            case "claim","ack"->List.of("provider locator","provider lock","sites");
+            default->List.of("sites");
+        });
     }
 
     private void invoke(String entry,RecordingJdbc jdbc) {
@@ -46,6 +54,7 @@ class OwnedSubscriptionLockOrderTest {
     static final class RecordingJdbc extends JdbcTemplate {
         final StripeBillingOwnedSubscriptionFixture f=new StripeBillingOwnedSubscriptionFixture();
         final List<String> locks=new ArrayList<>();
+        final List<String> calls=new ArrayList<>();
         final RuntimeException complete=new IllegalStateException("owner locks observed");
         final boolean rejectSite;
         final ProviderOperation claim=new ProviderOperation(new UUID(0,15),f.f.account.id(),f.f.account.externalAccountId(),f.f.account.credentialsRef(),
@@ -56,6 +65,7 @@ class OwnedSubscriptionLockOrderTest {
         public <T> List<T> queryForList(String sql,Class<T> type,Object... args) {
             for(String table:List.of("sites","customers","payment_accounts"))if(sql.contains("from "+table)&&sql.contains("for share")) {
                 locks.add(table);
+                calls.add(table);
                 if(table.equals("sites")&&rejectSite)return List.of();
                 if(locks.size()==3)throw complete;
                 return (List<T>)List.of(new UUID(0,1));
@@ -65,7 +75,12 @@ class OwnedSubscriptionLockOrderTest {
         }
         @Override @SuppressWarnings("unchecked")
         public <T> List<T> query(String sql,RowMapper<T> mapper,Object... args) {
-            if(sql.equals("select * from provider_operations where id=? for update"))return (List<T>)List.of(claim);
+            if(sql.equals("select * from provider_operations where id=?")){
+                assertThat(args).containsExactly(claim.id());calls.add("provider locator");return (List<T>)List.of(claim);
+            }
+            if(sql.equals("select * from provider_operations where id=? for update")){
+                assertThat(args).containsExactly(claim.id());calls.add("provider lock");return (List<T>)List.of(claim);
+            }
             if(sql.equals("select * from stripe_billing_owned_subscriptions where payment_account_id=? and subscription_id=?"))return (List<T>)List.of(f.intent);
             throw new AssertionError("Unexpected JDBC call: "+sql);
         }
