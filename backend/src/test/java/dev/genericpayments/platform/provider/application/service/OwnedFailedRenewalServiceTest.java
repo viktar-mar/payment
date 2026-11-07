@@ -177,6 +177,10 @@ class OwnedFailedRenewalServiceTest {
         long sequence,billingSecond=4700;int effects,callbacks,timeCalls;boolean active,isolated=true,foreign,claimOwner=true,stopped,failReceipt,normalizeClaim,factTimeDrift,factModeDrift;Instant utc=UTC;
         dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding binding=new dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding(upstream.receipt().intent().customerBinding(),owner.account(),owner.site(),owner.customer(),upstream.receipt().intent().customerReference(),upstream.receipt().intent().customerCreationOperation(),0);
         Failure failure;Recovery recovery;Publication publication;final OwnedFailedRenewalService service;
+        SubscriptionOperationStore operationsPort;SubscriptionStore subscriptionsPort;BillingRecordStore billsPort;
+        SubscriptionObservationPort observationsPort;SubscriptionBillingTimePort timePort;SubscriptionTransactionPort transactionPort;Clock clockPort;SubscriptionFactService factsPort;
+        SubscriptionIsolatedMethodProofPort methodProof=SubscriptionIsolatedMethodProofPort.denied();
+        SubscriptionIsolatedRecoveryProofPort successorProof;SubscriptionBillingProofStore.Setup methodSetup;
         Harness(){this(false);}
         Harness(boolean withBinding){
             var initialOperation=new SubscriptionOperation(upstream.receipt().intent().createOperation(),owner.site(),owner.customer(),s.id(),SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Status.SUCCEEDED,"create","digest",upstream.receipt().intent().requestFingerprint(),upstream.receipt().intent().operationKey(),0,1,"sub_owned",null,UTC,UTC,1);ops.put(initialOperation.id(),initialOperation);
@@ -216,7 +220,10 @@ class OwnedFailedRenewalServiceTest {
                 c->{effects++;cash.add(c.providerPaymentReference());return null;},port(SubscriptionEventStore.class,(m,a)->{effects++;events.add(((SubscriptionEvent)a[0]).type());return true;}),port(SubscriptionCatalogPort.class,(m,a)->s.billingPrice()),clock,
                 (sub,event,access,enqueued)->{effects++;callbacks++;assertThat(event.receivedAt()).isEqualTo(utc);},port(SubscriptionObjectPort.class,(m,a)->{effects++;return null;}),
                 (b,v,deadline)->new BillingMetadataPort.Captured(v,deadline),port(SubscriptionPolicyPort.class,(m,a)->new SubscriptionPolicy(s.siteId(),1,true,3,false,false,false,Set.of())),observations,value->"digest",inert(SubscriptionQuoteStore.class),inert(SubscriptionSweepPort.class),new SubscriptionReadPreparation(operations,trials),inert(SubscriptionAuthorityPort.class),time,
-                new dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedRenewalFactProof(store,tx,time));
+                (c,s,o,b,u)->{if(successorProof!=null)successorProof.requireAuthorized(c,s,o,b,u);else new dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedRenewalFactProof(store,tx,time).requireAuthorized(c,s,o,b,u);},
+                (c,s,o,b,u)->methodProof.requireAuthorized(c,s,o,b,u),
+                port(SubscriptionBillingProofStore.class,(m,a)->{if(!m.equals("setup"))throw new AssertionError(m);return Optional.ofNullable(methodSetup);}));
+            operationsPort=operations;subscriptionsPort=subscriptions;billsPort=bills;observationsPort=observations;timePort=time;transactionPort=tx;clockPort=clock;factsPort=facts;
 
             var bindings=port(dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.class,(m,a)->Optional.of(binding));
             service=withBinding?new OwnedFailedRenewalService(store,tx,operations,(siteId,customer)->trace.add("lifecycle"),id->{trace.add("account");return Optional.of(account);},subscriptions,bills,new SubscriptionReadPreparation(operations,trials),observations,c->{trace.add("facts");facts.apply(c);},trials,time,clock,bindings):new OwnedFailedRenewalService(store,tx,operations,(siteId,customer)->trace.add("lifecycle"),id->{trace.add("account");return Optional.of(account);},subscriptions,bills,new SubscriptionReadPreparation(operations,trials),observations,c->{trace.add("facts");facts.apply(c);},trials,time,clock);

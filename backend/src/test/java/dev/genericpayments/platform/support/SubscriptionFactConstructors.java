@@ -14,6 +14,14 @@ import java.time.Clock;
 public final class SubscriptionFactConstructors {
     private SubscriptionFactConstructors() {}
 
+    public static Constructor<SubscriptionFactService> methodEnabled() {
+        var parameters=new java.util.ArrayList<Class<?>>(java.util.List.of(ordinary().getParameterTypes()));
+        parameters.addAll(java.util.List.of(SubscriptionBillingTimePort.class,SubscriptionIsolatedRecoveryProofPort.class,
+            SubscriptionIsolatedMethodProofPort.class,SubscriptionBillingProofStore.class));
+        try{return SubscriptionFactService.class.getConstructor(parameters.toArray(Class<?>[]::new));}
+        catch(NoSuchMethodException exception){throw new AssertionError("Explicit method subscription fact constructor is missing",exception);}
+    }
+
     public static Constructor<SubscriptionFactService> ordinary() {
         try {
             return SubscriptionFactService.class.getConstructor(
