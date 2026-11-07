@@ -12,6 +12,30 @@ import static org.mockito.Mockito.*;
 
 /** No DataSource, context, network or provider calls. */
 class OwnedMethodBrowserStoreTransactionTest {
+    @Test void committedRootCannotWitnessAnAckBeforeItsFirstDispatch() {
+        var issued=java.time.Instant.parse("2026-11-07T12:00:00.123456Z");
+        var root=new dev.genericpayments.platform.provider.application.model.OwnedMethodBrowser.Root(
+            java.util.UUID.randomUUID(),java.util.UUID.randomUUID(),java.util.UUID.randomUUID(),java.util.UUID.randomUUID(),2,
+            "seti_saved","v1","a".repeat(64),issued,issued.plusSeconds(600));
+        for(var first:List.of(issued.minusNanos(1_000),issued)){
+            var step=acknowledgedSetup(root,first);
+            assertThatCode(()->JdbcOwnedFailedRenewalMethodStore.requireBoundSetupRootChronology(root,step)).doesNotThrowAnyException();
+        }
+        // Both original dispatch bounds move together, so the existing exact 23h check still passes.
+        var contradicted=acknowledgedSetup(root,issued.plusNanos(1_000));
+        assertThat(contradicted.retryBefore()).isEqualTo(contradicted.firstDispatchedAt().plusSeconds(23*3600));
+        assertThatThrownBy(()->JdbcOwnedFailedRenewalMethodStore.requireBoundSetupRootChronology(root,contradicted))
+            .isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method transition authority unavailable");
+        assertThatThrownBy(()->JdbcOwnedFailedRenewalMethodStore.requireBoundSetupRootChronology(null,acknowledgedSetup(root,issued)))
+            .isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method transition authority unavailable");
+    }
+    private static dev.genericpayments.platform.provider.application.model.ProviderOperation acknowledgedSetup(
+            dev.genericpayments.platform.provider.application.model.OwnedMethodBrowser.Root root,java.time.Instant first){
+        return new dev.genericpayments.platform.provider.application.model.ProviderOperation(root.setupStep(),
+            new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId(java.util.UUID.randomUUID()),"acct_owned","alias",
+            dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SETUP_INTENT_CREATE,root.setupOperation(),"original:SETUP","fingerprint",
+            dev.genericpayments.platform.provider.application.model.ProviderOperation.Status.ACKNOWLEDGED,root.setupReference(),first,first.plusSeconds(23*3600),null,null,2);
+    }
     @Test void preSetupEnrollmentRequiresTheExactOriginalExpiryDespiteJdbcMicrosecondNormalization() {
         var expiry=java.time.Instant.parse("2026-11-07T12:10:00.123456Z");
         var r=mock(dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation.class);

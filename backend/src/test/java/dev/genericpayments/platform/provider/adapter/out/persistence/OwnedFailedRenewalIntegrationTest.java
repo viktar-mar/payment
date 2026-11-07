@@ -833,7 +833,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(methodBillingProofs.setup(billing.id(),proof.operation())).contains(proof);assertThat(proof.method()).isNull();
         assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
     }
-    @ParameterizedTest @ValueSource(strings={"fingerprint","key","credentials","external","version","future-first","old-first"})
+    @ParameterizedTest @ValueSource(strings={"fingerprint","key","credentials","external","version","future-first","old-first","after-root"})
     void browserMethodPreparationRefusesCorruptedOriginalSetupAckAndRollsBackOnlyTheCorruption(String mutation){
         var bound=boundBrowserMethod(0);var p=bound.pending();var before=financialState();var providerRows=rows("provider_operations");int calls=http.calls.size();
         var session=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
@@ -841,6 +841,12 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             // clock_timestamp is volatile; use one captured timestamp for the exact immutable 23h window.
             if(mutation.equals("future-first"))jdbc.update("update provider_operations set first_dispatched_at=?,retry_before=? where id=?",
                 java.sql.Timestamp.from(session.expiresAt().plusSeconds(3600)),java.sql.Timestamp.from(session.expiresAt().plusSeconds(24*3600)),p.setupStep().id());
+            else if(mutation.equals("after-root")){
+                var root=browserStore().browserRootInTransaction(p.reservation().id()).orElseThrow();var shifted=root.issuedAt().plusNanos(1_000);
+                assertThat(browserNow()).isAfter(shifted);
+                jdbc.update("update provider_operations set first_dispatched_at=?,retry_before=? where id=?",
+                    java.sql.Timestamp.from(shifted),java.sql.Timestamp.from(shifted.plusSeconds(23*3600)),p.setupStep().id());
+            }
             else {
                 String change=switch(mutation){
                     case "fingerprint"->"fingerprint='foreign'";case "key"->"operation_key=operation_key||':FOREIGN'";
@@ -892,15 +898,36 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
     }
     @Test void browserMethodPreparationRechecksFreshDatabaseExpiryAfterItsOperationLock() throws Exception {
-        var bound=boundBrowserMethod(5);var p=bound.pending();var session=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
+        var bound=boundBrowserMethod(20);var p=bound.pending();var session=((dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer)p.context().actor()).session();
         var stale=browserNow();var before=financialState();int calls=http.calls.size();var locked=new CountDownLatch(1);var release=new CountDownLatch(1);var attempting=new CountDownLatch(1);
+        var blockerPid=new java.util.concurrent.atomic.AtomicInteger();var workerPid=new java.util.concurrent.atomic.AtomicInteger();
+        assertThat(stale).isBefore(session.expiresAt());
+        assertThat(transaction.requiresNew(()->browserStore().requireBrowserBoundSetupInTransaction(p.reservation(),session,stale)).setupProof()).isEqualTo(bound.proof());
         try(var workers=new BoundedWorkers()){
-            var blocker=workers.submit(()->transaction.requiresNew(()->{lifecycleOperations.lock(p.reservation().setupOperationId());locked.countDown();awaitRelease(release);return true;}));
+            var blocker=workers.submit(()->transaction.requiresNew(()->{
+                lifecycleOperations.lock(p.reservation().setupOperationId());blockerPid.set(jdbc.queryForObject("select pg_backend_pid()",Integer.class));locked.countDown();
+                try{if(!release.await(30,TimeUnit.SECONDS))throw new AssertionError("expiry lock wait timed out");}
+                catch(InterruptedException e){Thread.currentThread().interrupt();throw new AssertionError(e);}
+                return true;
+            }));
             try {
                 assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
-                var refused=workers.submit(()->{attempting.countDown();assertThatThrownBy(()->transaction.requiresNew(()->browserStore().requireBrowserBoundSetupInTransaction(p.reservation(),session,stale))).isInstanceOf(RuntimeException.class);return true;});
-                assertThat(attempting.await(5,TimeUnit.SECONDS)).isTrue();assertThatThrownBy(()->refused.get(100,TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
-                var wait=Duration.between(Instant.now(),session.expiresAt()).plusMillis(100);if(!wait.isNegative())Thread.sleep(wait);
+                var refused=workers.submit(()->{assertThatThrownBy(()->transaction.requiresNew(()->{
+                    workerPid.set(jdbc.queryForObject("select pg_backend_pid()",Integer.class));attempting.countDown();
+                    return browserStore().requireBrowserBoundSetupInTransaction(p.reservation(),session,stale);
+                }))
+                    .isExactlyInstanceOf(IllegalStateException.class).hasMessage("Owned method browser authority unavailable");return true;});
+                assertThat(attempting.await(5,TimeUnit.SECONDS)).isTrue();assertThat(blockerPid.get()).isPositive();assertThat(workerPid.get()).isPositive();
+                boolean databaseBlocked=false;long lockDeadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);
+                while(System.nanoTime()<lockDeadline){
+                    databaseBlocked=Boolean.TRUE.equals(jdbc.queryForObject("select ? = any(pg_blocking_pids(?))",Boolean.class,blockerPid.get(),workerPid.get()));
+                    if(databaseBlocked)break;Thread.sleep(20);
+                }
+                assertThat(databaseBlocked).as("worker waits for this fixture's operation-lock holder").isTrue();
+                assertThatThrownBy(()->refused.get(100,TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                var databaseNow=jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant();
+                var wait=Duration.between(databaseNow,session.expiresAt()).plusMillis(100);if(!wait.isNegative())Thread.sleep(wait);
+                assertThat(jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant()).isAfterOrEqualTo(session.expiresAt());
                 release.countDown();assertThat(blocker.get(10,TimeUnit.SECONDS)).isTrue();assertThat(refused.get(10,TimeUnit.SECONDS)).isTrue();
             }finally{release.countDown();}
         }

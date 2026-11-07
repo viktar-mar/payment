@@ -118,9 +118,13 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
             ||!o.id().equals(step.resourceId())||!Objects.equals(o.providerOperationKey()+":SETUP",step.operationKey())||!Objects.equals(setupFingerprint,step.fingerprint())
             ||!proof.reference().equals(step.providerReference())||step.firstDispatchedAt()==null||step.firstDispatchedAt().isBefore(r.reservedAt())||step.firstDispatchedAt().isAfter(utc(now))
             ||!step.firstDispatchedAt().plusSeconds(23*3600).equals(step.retryBefore())||step.leaseOwner()!=null||step.leaseExpiresAt()!=null)throw unavailable();
+        requireBoundSetupRootChronology(browser().root(r.id()).orElse(null),step);
         // Rechecks exact original session/scopes and fresh DB UTC after every potentially blocking read.
         var enrollment=browser().setupEnrollment(r,s,now);
         return new BoundSetup(enrollment,proof,step);
+    }
+    static void requireBoundSetupRootChronology(Root root,ProviderOperation setupStep){
+        if(root==null||setupStep==null||setupStep.firstDispatchedAt()==null||root.issuedAt().isBefore(setupStep.firstDispatchedAt()))throw unavailable();
     }
     @Override public Pending requireBrowserPendingInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().pending(r,s,now);}
     @Override public Optional<Root> browserRootInTransaction(UUID r){return browser().root(r);}
