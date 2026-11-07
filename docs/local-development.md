@@ -2041,3 +2041,9 @@ or stop evidence. Original single-use budgets, 45-minute owner lifetime, request
 bounds, separate 120-second cleanup allowance, ownership and acceptance rules
 are unchanged. Explicit inert Node tests and cached TypeScript checking only:
 no native execution or new authority. Full Stage 5B remains **NOT_ACCEPTED**.
+
+### Authenticated owned method component preparation (2026-11-07)
+
+The [testing guide](testing/billing-failed-renewal-recovery.md#authenticated-method-completion-and-successor-recovery--2026-11-07) records the explicit backend method-completion and same-debt successor-recovery consumer. It remains unregistered, at the existing READY2 E+3600 sample, with no runnable native command. Local evidence is selected socket-free JUnit and compilation; the new genuine JDBC/provider-ACK/FactService composition is authored and compiled only, awaiting exact-source hosted execution. The [acceptance checkpoint](stage-5b-acceptance.md#authenticated-method-and-same-debt-recovery-preparation--2026-11-07) separates these boundaries.
+
+Synthetic SetupIntent confirmation and saved-card SDK responses in the hosted fixture do not exercise owned browser capability issuance or actual customer confirmation. Native Sandbox interoperability, exact-owner later time/grace/G+1 lineage, runtime integration and delivered callbacks remain outstanding. Native failed-renewal recovery is **NOT_RUN** and full Stage 5B **NOT_ACCEPTED**. Existing native authority and consumed-resource restrictions are unchanged.

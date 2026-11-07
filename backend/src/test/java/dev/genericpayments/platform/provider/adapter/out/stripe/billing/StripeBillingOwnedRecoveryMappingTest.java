@@ -23,7 +23,7 @@ class StripeBillingOwnedRecoveryMappingTest {
     private static final List<String> PATHS=List.of("/v1/customers/cus_owned","/v1/subscriptions/sub_owned","/v1/invoices",
         "/v1/invoices/in_owned/lines","/v1/invoice_payments","/v1/payment_intents/pi_owned","/v1/charges/ch_owned","/v1/invoice_payments",
         "/v1/invoices/in_renewal/lines","/v1/invoice_payments","/v1/payment_intents/pi_renewal","/v1/charges/ch_renewal","/v1/invoice_payments");
-    private static final class Graph {
+    static final class Graph {
         final StripeBillingOwnedMethodMappingTest.Graph debt=new StripeBillingOwnedMethodMappingTest.Graph();
         final StripeBillingOwnedSubscriptionFixture f=debt.f;
         OwnedFailedRenewal.Recovery recovery;
