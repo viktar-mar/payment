@@ -113,19 +113,36 @@ test('only the original successful genuine response yields the safe donation ACK
 // Break: an OTP retry, early ACK or session injection bypasses the actual original challenge.
 test('OTP sends and verifies once with original genuine responses before the safe customer ACK',async()=>{
   const events:string[]=[],challenge='00000000-0000-4000-8000-000000000040',customer='00000000-0000-4000-8000-000000000050',expires=new Date(Date.now()+120000).toISOString();
+  const evaluationTrace:{field:string;value:unknown}[]=[];
   const challengeUrl=binding.endpoints.backend+'/api/v1/public/customer-auth/email-otp/challenges',verifyUrl=challengeUrl+'/'+challenge+'/verify';
   const genuine=(url:string,status:number,body:object,requestBody:object)=>({url:()=>url,status:()=>status,body:async()=>Buffer.from(JSON.stringify(body)),request:()=>({method:()=>url.endsWith('/me')?'GET':'POST',url:()=>url,postData:()=>JSON.stringify(requestBody),redirectedFrom:()=>null})}) as unknown as Response;
   const responses=[genuine(challengeUrl,202,{challenge_id:challenge,expires_at:expires},{site_key:'s5a-site',email:'synthetic@example.test',intent:'AUTHENTICATE'}),
     genuine(verifyUrl,200,{session_token:'s'.repeat(43),expires_at:expires,scopes:['CUSTOMER_READ','CHECKOUT_CREATE'],customer:{id:customer,status:'ACTIVE',masked_email:'***@***'}},{site_key:'s5a-site',code:'123456'}),
     genuine(binding.endpoints.backend+'/api/v1/customer/me',200,{id:customer,status:'ACTIVE',masked_email:'***@***',authentication_modes:['EMAIL_OTP'],session_expires_at:expires},{})];
   let observe:(request:Request)=>void=()=>{};
-  const page={locator:()=>({first(){return this;},getByRole:(_role:string,settings:{name:string})=>({evaluate:async(_fn:unknown,value:unknown)=>{events.push(settings.name==='Email'?'email-entry':'code-entry');assert.ok(value==='synthetic@example.test'||value==='123456');return true;},click:async()=>{events.push(settings.name==='Request code'?'send-click':'verify-click');observe(responses[settings.name==='Request code'?0:1]!.request());}})}),
+  const page={locator:()=>({first(){return this;},getByRole:(_role:string,settings:{name:string})=>{
+    let readinessObserved=false;
+    return {evaluate:async(_fn:unknown,value:unknown)=>{
+      assert.ok(settings.name==='Email'||settings.name==='Six-digit code');
+      evaluationTrace.push({field:settings.name,value});
+      if(!readinessObserved){
+        assert.equal(value,undefined,'readiness probes carry no private value');readinessObserved=true;
+        events.push(settings.name==='Email'?'email-ready':'code-ready');
+      }else{
+        assert.equal(value,settings.name==='Email'?'synthetic@example.test':'123456','private value belongs to its exact OTP field');
+        events.push(settings.name==='Email'?'email-entry':'code-entry');
+      }
+      return true;
+    },click:async()=>{events.push(settings.name==='Request code'?'send-click':'verify-click');observe(responses[settings.name==='Request code'?0:1]!.request());}};
+  }}),
     waitForResponse:async(predicate:(response:Response)=>boolean)=>{const response=responses.find(predicate);assert.ok(response);return response;},waitForFunction:async()=>{events.push('active-session');},on:(_event:string,fn:(request:Request)=>void)=>{observe=fn;},off:()=>{}} as unknown as Page;
   const extras:Pick<SandboxAcceptanceExtras,'beginOtp'|'ackOtpChallenge'|'withOtpCode'|'beforeOtpVerify'|'ackOtpVerification'>={beginOtp:async cb=>{events.push('challenge-intent');assert.equal(cb(Object.freeze({email:'synthetic@example.test',siteKey:'s5a-site'})),true);return true;},
     ackOtpChallenge:async value=>{events.push('challenge-ack');assert.equal(value.challengeId,challenge);return true;},withOtpCode:async cb=>{events.push('mail-code');assert.equal(cb('123456'),true);return true;},
     beforeOtpVerify:async()=>{events.push('verify-intent');return true;},ackOtpVerification:async value=>{events.push('verify-ack');assert.deepEqual(value,{challengeId:challenge,customerId:customer});return true;}};
   await runDonationOtp(page,extras,binding,limits());
-  assert.deepEqual(events,['challenge-intent','email-entry','send-click','challenge-ack','mail-code','code-entry','verify-intent','verify-click','active-session','verify-ack']);
+  assert.deepEqual(evaluationTrace,[{field:'Email',value:undefined},{field:'Email',value:'synthetic@example.test'},
+    {field:'Six-digit code',value:undefined},{field:'Six-digit code',value:'123456'}]);
+  assert.deepEqual(events,['challenge-intent','email-ready','email-entry','send-click','challenge-ack','mail-code','code-ready','code-entry','verify-intent','verify-click','active-session','verify-ack']);
 });
 test('expired OTP browser phase dispatches no challenge',async()=>{
   await assert.rejects(runDonationOtp({locator:forbidden,off:()=>{}} as unknown as Page,{beginOtp:forbidden} as unknown as SandboxAcceptanceExtras,binding,{deadline:Date.now()-1}),{message:'stripe_sandbox_BROWSER_DONATION_PENDING'});
