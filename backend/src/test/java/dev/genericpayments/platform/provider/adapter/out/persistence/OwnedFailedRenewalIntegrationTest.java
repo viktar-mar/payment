@@ -6,6 +6,15 @@ import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod;
 import dev.genericpayments.platform.provider.application.model.OwnedMethodBrowser;
 import dev.genericpayments.platform.provider.application.service.OwnedMethodBrowserTestAccess;
+import dev.genericpayments.platform.provider.application.service.OwnedMethodBrowserService;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeOwnedMethodBrowserReader;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeOwnedMethodBrowserTokens;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens;
+import dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore;
+import dev.genericpayments.platform.subscriptions.application.port.in.GetSubscriptionActionUseCase;
+import dev.genericpayments.platform.subscriptions.application.port.in.CreateSubscriptionClientSessionUseCase;
+import dev.genericpayments.platform.subscriptions.application.port.in.ConfirmSubscriptionActionUseCase;
+import dev.genericpayments.platform.subscriptions.application.port.in.SubscriptionConfirmationUseCase;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.provider.application.service.OwnedFailedRenewalMethodService;
 import dev.genericpayments.platform.provider.application.service.ProviderOperationGuard;
@@ -477,6 +486,55 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     }
     private boolean consumeBrowser(PendingMethod p,OwnedMethodBrowser.Root root){
         return browserPhase(p,pending->browserStore().consumeBrowserFirstInTransaction(pending,root,"c".repeat(64),"d".repeat(64),browserNow()));
+    }
+
+    private OwnedMethodBrowserService browserService(PendingMethod p,OwnedFailedRenewalMethodStore methods){
+        return new OwnedMethodBrowserService(p.reservation(),p.service(),methods,new StripeOwnedMethodBrowserReader(credentials,clients,Clock.systemUTC()),
+            new StripeOwnedMethodBrowserTokens(new StripeBillingGrantTokens(true,"v1",Map.of("v1",Base64.getEncoder().encodeToString(new byte[32])))),Clock.systemUTC());
+    }
+    private dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext browserCommand(PendingMethod p,String key){
+        var c=p.context();return new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(c.actor(),c.siteId(),c.customerId(),c.origin(),key,"browser-issuer");
+    }
+    private void queuePendingBrowser(PendingMethod p){
+        var o=lifecycleOperations.find(site,current().id(),p.reservation().setupOperationId()).orElseThrow();
+        var body=dev.genericpayments.platform.support.StripeBillingOwnedSubscriptionFixture.json(setupBody(o,p.setupStep(),"requires_payment_method"));
+        body.addProperty("client_secret",p.setupStep().providerReference()+"_secret_INERT");http.reply(body.toString());
+    }
+    @ParameterizedTest @ValueSource(booleans={false,true}) void explicitBrowserIssuerCommitsOneReleaseAndOneActualReservedPermission(boolean legacy){
+        var p=pendingMethod(true);var service=browserService(p,browserStore());var before=financialState();
+        var operation=lifecycleOperations.find(site,current().id(),p.reservation().setupOperationId()).orElseThrow();int calls=http.calls.size();
+        var action=service.get(new GetSubscriptionActionUseCase.Query(browserCommand(p,null),operation.subscriptionId(),operation.id()));
+        assertThat(service.get(new GetSubscriptionActionUseCase.Query(browserCommand(p,null),operation.subscriptionId(),operation.id()))).isEqualTo(action);
+        assertThat(http.calls).hasSize(calls);queuePendingBrowser(p);
+        if(legacy){var session=service.issue(new CreateSubscriptionClientSessionUseCase.Command(browserCommand(p,"issue"),operation.subscriptionId(),operation.id(),action.secret()));
+            assertThat(session.flow()).isEqualTo(dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientSession.Flow.SETUP);assertThat(session.actionToken()).isEqualTo(action.secret());}
+        else{var session=service.select(new SubscriptionConfirmationUseCase.Scope(browserCommand(p,"select"),operation.subscriptionId(),operation.id()),action.secret());
+            assertThat(session.protocol()).isEqualTo("BROWSER_CONFIRM_V1");assertThat(session.flow()).isEqualTo(dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientSession.Flow.SETUP);assertThat(session.attemptId()).isNull();assertThat(session.capability()).isNull();}
+        assertThat(http.calls).hasSize(calls+1);assertThat(http.calls.getLast().method().name()).isEqualTo("GET");assertThat(http.calls.getLast().url().getPath()).isEqualTo("/v1/setup_intents/"+p.setupStep().providerReference());
+        var confirmation=new ConfirmSubscriptionActionUseCase.Command(browserCommand(p,"confirm"),operation.subscriptionId(),operation.id(),action.secret());
+        var first=service.confirm(confirmation);assertThat(first.status()).isEqualTo(SubscriptionOperation.Status.RESERVED);assertThat(first.operationId()).isEqualTo(operation.id());assertThat(first.nextAction()).isNull();assertThat(first.browserConfirmAllowed()).isTrue();
+        assertThat(service.confirm(confirmation).browserConfirmAllowed()).isFalse();
+        assertThatThrownBy(()->service.confirm(new ConfirmSubscriptionActionUseCase.Command(browserCommand(p,"changed"),operation.subscriptionId(),operation.id(),action.secret()))).hasMessage("Owned method browser unavailable").hasNoCause();
+        assertThat(count("stripe_billing_method_browser_roots")).isEqualTo(1);assertThat(count("stripe_billing_method_browser_selections")).isEqualTo(1);assertThat(count("stripe_billing_method_browser_releases")).isEqualTo(1);assertThat(count("stripe_billing_method_browser_consumptions")).isEqualTo(1);
+        assertThat(lifecycleOperations.find(site,operation.subscriptionId(),operation.id())).contains(operation);assertThat(financialState()).isEqualTo(before);
+        assertThat(methodBillingProofs.setup(billing.id(),operation.id()).orElseThrow().method()).isNull();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();assertThat(http.replies).isEmpty();
+        assertThat(rows("stripe_billing_method_browser_roots").toString()).doesNotContain(action.secret(),"_secret_INERT","pk_test_");
+    }
+    @Test void explicitBrowserIssuerLostReleaseRollsBackSecretReceiptAndCannotReadAgain(){
+        var p=pendingMethod(true);var real=browserStore();
+        var broken=(OwnedFailedRenewalMethodStore)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{OwnedFailedRenewalMethodStore.class},(proxy,method,args)->{
+            try{var result=method.invoke(real,args);if(method.getName().equals("finishBrowserSelectionInTransaction"))throw new IllegalStateException("after release write");return result;}
+            catch(InvocationTargetException failure){throw failure.getCause();}
+        });
+        var service=browserService(p,broken);var before=financialState();var operation=lifecycleOperations.find(site,current().id(),p.reservation().setupOperationId()).orElseThrow();
+        var action=service.get(new GetSubscriptionActionUseCase.Query(browserCommand(p,null),operation.subscriptionId(),operation.id()));queuePendingBrowser(p);int calls=http.calls.size();
+        var scope=new SubscriptionConfirmationUseCase.Scope(browserCommand(p,"select"),operation.subscriptionId(),operation.id());
+        assertThatThrownBy(()->service.select(scope,action.secret())).hasMessage("Owned method browser unavailable").hasNoCause();
+        assertThat(count("stripe_billing_method_browser_selections")).isEqualTo(1);assertThat(count("stripe_billing_method_browser_releases")).isZero();
+        assertThatThrownBy(()->service.select(scope,action.secret())).hasMessage("Owned method browser unavailable").hasNoCause();
+        assertThatThrownBy(()->service.confirm(new ConfirmSubscriptionActionUseCase.Command(browserCommand(p,"confirm"),operation.subscriptionId(),operation.id(),action.secret()))).hasMessage("Owned method browser unavailable").hasNoCause();
+        assertThat(count("stripe_billing_method_browser_consumptions")).isZero();assertThat(http.calls).hasSize(calls+1);assertThat(http.replies).isEmpty();assertThat(financialState()).isEqualTo(before);
+        assertThat(lifecycleOperations.find(site,operation.subscriptionId(),operation.id())).contains(operation);assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
     }
 
     @Test void browserEnrollmentPinsExactOriginalSessionAndReservedSetupWithoutFinancialEffects(){
