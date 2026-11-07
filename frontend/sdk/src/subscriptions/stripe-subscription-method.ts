@@ -59,7 +59,8 @@ export async function mountStripeSubscriptionMethod(options: StripeSubscriptionM
     // Keep the outer visibility/host guard alive during the driver's preflight and
     // confirmation. Only driver retirement releases it; release never aborts a result.
     return await handoff.wait(mountStripeSubscription({ client, input, action, selectedSession: selected,
-      container, isCurrent: currentOwner, locale: options.locale, onRetire: retire }));
+      container, isCurrent: () => { handoff!.assertCurrent(); return true; }, locale: options.locale, onRetire: retire,
+      receiptConstraint: 'OWNED_METHOD_RESERVED' }));
   } catch (error) {
     controller.abort(); retire();
     if (isAbort(error) || error instanceof PaymentSdkError) throw error;

@@ -1,8 +1,8 @@
 import { visibleSubscriptionHost } from './stripe-subscription-driver.js';
 
-/** One preparation action owns this guard until the mounted driver takes over.
- * Retirement latches across hidden→visible transitions; releasing a successful
- * handoff removes observers without aborting the driver's inherited signal. */
+/** One preparation action owns this guard, optionally through driver retirement.
+ * Visibility and original composed-host removal latch even after synchronous
+ * restoration; release detaches observers without aborting an inherited signal. */
 export interface SubscriptionHandoff {
   readonly signal: AbortSignal;
   assertCurrent(): void;
@@ -25,7 +25,25 @@ export function guardSubscriptionHandoff(options: {
   void cancelled.catch(() => {});
   const document = options.container.ownerDocument;
   const window = document.defaultView!;
-  const observer = new MutationObserver(() => { try { assertCurrent(); } catch { /* retirement is latched */ } });
+  // Preserve identities from both physical and composed ancestry. Document
+  // subtree observation cannot see removals inside a shadow root or slot tree.
+  const originalNodes = new Set<Node>();
+  const roots = new Set<Document | ShadowRoot>([document]);
+  const ancestors: Node[] = [options.container];
+  while (ancestors.length) {
+    const node = ancestors.pop()!;
+    if (originalNodes.has(node)) continue;
+    originalNodes.add(node);
+    if (node.parentNode) ancestors.push(node.parentNode);
+    if (node instanceof HTMLElement && node.assignedSlot) ancestors.push(node.assignedSlot);
+    if (node instanceof ShadowRoot) { roots.add(node); ancestors.push(node.host); }
+  }
+  const observer = new MutationObserver(records => {
+    try { latchRemovals(records); assertCurrent(); } catch { /* retirement is latched */ }
+  });
+  function latchRemovals(records: MutationRecord[]): void {
+    if (records.some(record => record.type === 'childList' && [...record.removedNodes].some(node => originalNodes.has(node)))) retire();
+  }
   function release(): void {
     signal.removeEventListener('abort', retire);
     window.removeEventListener('pagehide', retire);
@@ -43,6 +61,9 @@ export function guardSubscriptionHandoff(options: {
   }
   function visibility(): void { if (document.visibilityState === 'hidden') retire(); }
   function assertCurrent(): void {
+    // Also drain queued records at synchronous dispatch checks, before observer
+    // delivery can race an already-resolved preflight continuation.
+    latchRemovals(observer.takeRecords());
     if (!active || signal.aborted || !options.isCurrent() || document.visibilityState === 'hidden'
       || !visibleSubscriptionHost(options.container) || Date.parse(options.expiresAt) <= Date.now()) {
       retire();
@@ -53,9 +74,7 @@ export function guardSubscriptionHandoff(options: {
   window.addEventListener('pagehide', retire, { once: true });
   document.addEventListener('visibilitychange', visibility);
   const observation = { childList: true, subtree: true, attributes: true, attributeFilter: ['hidden', 'style', 'class', 'name', 'slot'] };
-  observer.observe(document, observation);
-  const projection = options.container.assignedSlot?.getRootNode();
-  if (projection instanceof ShadowRoot) observer.observe(projection, observation);
+  for (const root of roots) observer.observe(root, observation);
   timer = setTimeout(retire, Math.max(0, Math.min(Date.parse(options.expiresAt) - Date.now(), 2147483647)));
   assertCurrent();
   return {

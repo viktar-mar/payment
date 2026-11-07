@@ -35,6 +35,7 @@ import dev.genericpayments.platform.sites.domain.SiteId;
 import dev.genericpayments.platform.customers.domain.CustomerId;
 import dev.genericpayments.platform.sites.application.port.out.LockSitePort;
 import dev.genericpayments.platform.customers.application.port.out.CustomerStore;
+import dev.genericpayments.platform.shared.application.PaymentApplicationException;
 import dev.genericpayments.platform.support.StripeBillingFirstRenewalCompositionFixture;
 import java.lang.reflect.*;
 import java.time.*;
@@ -587,9 +588,11 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var request=new org.springframework.mock.web.MockHttpServletRequest();request.addHeader("Idempotency-Key","ordinary-denied");
         org.springframework.security.core.context.SecurityContextHolder.getContext().setAuthentication(org.springframework.security.authentication.UsernamePasswordAuthenticationToken.authenticated(original,null,List.of()));
         try{
-            assertThatThrownBy(()->controller.get(request,current().id())).isInstanceOf(RuntimeException.class);
-            assertThatThrownBy(()->controller.action(request,current().id(),p.reservation().setupOperationId())).isInstanceOf(RuntimeException.class);
-            assertThatThrownBy(()->controller.confirm(request,current().id(),p.reservation().setupOperationId(),new dev.genericpayments.platform.subscriptions.adapter.in.web.SubscriptionTransport.SubscriptionActionRequest("bga1_"+"D".repeat(43)))).isInstanceOf(RuntimeException.class);
+            assertThatThrownBy(()->controller.list(request,20,null,null,null)).isExactlyInstanceOf(IllegalStateException.class).hasMessage("OWNED_TIME_UNSCOPED");
+            assertThatThrownBy(()->controller.action(request,current().id(),p.reservation().setupOperationId())).isExactlyInstanceOf(PaymentApplicationException.class)
+                .satisfies(failure->assertThat(((PaymentApplicationException)failure).code()).isEqualTo("PROVIDER_CAPABILITY_UNAVAILABLE"));
+            assertThatThrownBy(()->controller.confirm(request,current().id(),p.reservation().setupOperationId(),new dev.genericpayments.platform.subscriptions.adapter.in.web.SubscriptionTransport.SubscriptionActionRequest("bga1_"+"D".repeat(43)))).isExactlyInstanceOf(PaymentApplicationException.class)
+                .satisfies(failure->assertThat(((PaymentApplicationException)failure).code()).isEqualTo("PROVIDER_OPERATION_CONFLICT"));
         }finally{org.springframework.security.core.context.SecurityContextHolder.clearContext();}
         assertThat(http.calls).hasSize(calls);assertThat(financialState()).isEqualTo(before);assertThat(count("stripe_billing_method_browser_roots")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
     }

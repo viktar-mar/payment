@@ -104,6 +104,16 @@ it.each([{ browser_confirm_allowed: false }, { browser_confirm_allowed: null }, 
   expect(f.confirmSetup).not.toHaveBeenCalled(); expect(f.confirmPayment).not.toHaveBeenCalled();
   expect(f.destroy).toHaveBeenCalledTimes(1); expect(f.onRetire).toHaveBeenCalledTimes(1);
 });
+it.each(['SUCCEEDED', 'FAILED', 'PROCESSING'])('rejects owned %s permission before Stripe and permanently spends the handle', async status => {
+  const f = fixture(), handle = await f.ready(); f.receipt({ status });
+
+  await expect(handle.confirm()).rejects.toMatchObject({ code: 'PROVIDER_RESULT_UNKNOWN' });
+  await expect(handle.confirm()).rejects.toMatchObject({ code: 'PAYMENT_STATE_CONFLICT' });
+
+  expect(f.confirmSetup).not.toHaveBeenCalled(); expect(f.confirmPayment).not.toHaveBeenCalled();
+  expect(f.calls.filter(r => r.url.endsWith('/action-confirmations'))).toHaveLength(1);
+  expect(f.destroy).toHaveBeenCalledTimes(1); expect(f.onRetire).toHaveBeenCalledTimes(1);
+});
 
 it('rejects PAYMENT/v2 before provider load and never follows the payment protocol', async () => {
   const f = fixture(); f.selection({ protocol: 'SERVER_CONFIRM_V2', flow: 'PAYMENT', client_secret: 'pi_original_secret_fixture', action_token: undefined, attempt_id: operationId, capability: 'bca2_' + 'X'.repeat(43) });
@@ -156,6 +166,50 @@ it.each(['action', 'selection', 'preflight'] as const)('latches every authority 
     expect(f.onRetire).toHaveBeenCalledTimes(1); expect(f.destroy).toHaveBeenCalledTimes(phase === 'preflight' ? 1 : 0);
     document.body.replaceChildren(); sessionStorage.clear(); vi.restoreAllMocks();
   }
+});
+function removalTarget(f: ReturnType<typeof fixture>, kind: string): HTMLElement {
+  const ancestor = document.createElement('section');
+  if (kind.startsWith('shadow') || kind === 'slot-ancestor') {
+    const shell = document.createElement('div'); document.body.prepend(shell);
+    const root = shell.attachShadow({ mode: 'open' }); root.append(ancestor);
+    if (kind === 'slot-ancestor') {
+      const slot = document.createElement('slot'); slot.name = 'method'; ancestor.append(slot);
+      f.container.slot = 'method'; shell.append(f.container);
+      expect(f.container.assignedSlot).toBe(slot);
+    } else ancestor.append(f.container);
+  } else { document.body.prepend(ancestor); ancestor.append(f.container); }
+  return kind.endsWith('ancestor') ? ancestor : f.container;
+}
+it.each(['selection', 'preflight'] as const)('latches same-turn host and composed-ancestor reinsertion during %s', async phase => {
+  for (const kind of ['host', 'ancestor', 'shadow-host', 'shadow-ancestor', 'slot-ancestor']) {
+    const f = fixture(), target = removalTarget(f, kind);
+    let handle: sdk.StripeSubscriptionHandle | undefined;
+    if (phase === 'preflight') handle = await f.ready();
+    f.pause(phase); const pending = handle ? handle.confirm() : f.start(); void pending.catch(() => {}); await tick();
+    const parent = target.parentNode!;
+
+    target.remove(); parent.appendChild(target); f.gate.resolve(f.response());
+    await tick(); f.events.get('ready')?.();
+    await expect(pending).rejects.toThrow();
+
+    expect(f.confirmSetup).not.toHaveBeenCalled(); expect(f.confirmPayment).not.toHaveBeenCalled();
+    expect(f.onRetire).toHaveBeenCalledTimes(1); expect(f.destroy).toHaveBeenCalledTimes(phase === 'preflight' ? 1 : 0);
+    handle?.destroy(); document.body.replaceChildren(); vi.restoreAllMocks();
+  }
+});
+it.each(['selection', 'preflight'] as const)('allows unrelated and provider-child DOM edits during %s', async phase => {
+  const f = fixture(); let handle: sdk.StripeSubscriptionHandle | undefined;
+  if (phase === 'preflight') handle = await f.ready();
+  f.pause(phase); const pending = handle ? handle.confirm() : f.start(); void pending.catch(() => {}); await tick();
+  const unrelated = document.createElement('aside'); document.body.append(unrelated); unrelated.remove();
+  const child = document.createElement('span'); f.container.append(child); child.remove();
+  f.gate.resolve(f.response()); await tick(); f.events.get('ready')?.();
+
+  if (phase === 'selection') {
+    handle = await pending as sdk.StripeSubscriptionHandle;
+    expect(f.onRetire).not.toHaveBeenCalled(); await handle.confirm();
+  } else await pending;
+  expect(f.confirmSetup).toHaveBeenCalledTimes(1); expect(f.destroy).toHaveBeenCalledTimes(1); expect(f.onRetire).toHaveBeenCalledTimes(1);
 });
 it.each(['before', 'selection', 'mounted'] as const)('refuses expiry %s without dispatch', async phase => {
   const f = fixture();

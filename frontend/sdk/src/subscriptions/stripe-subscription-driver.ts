@@ -14,6 +14,8 @@ export interface StripeSubscriptionOptions {
   onRetire?: () => void;
   /** Already selected SETUP context; internal manager handoff. */
   selectedSession?: SubscriptionClientSession;
+  /** Additional owned-method restriction; ordinary mounts retain their existing receipt contract. */
+  receiptConstraint?: 'OWNED_METHOD_RESERVED';
 }
 export interface StripeSubscriptionHandle { confirm(): Promise<SubscriptionOperation>; destroy(): void; }
 const fingerprint = (s: StripeSubscriptionOptions['input']['session']) => JSON.stringify([s.apiBaseUrl,s.siteKey,s.siteId,s.origin,s.customer.id,s.customer.status,s.customer.maskedEmail,s.sessionToken,s.expiresAt,[...s.scopes].sort()]);
@@ -30,7 +32,7 @@ export function visibleSubscriptionHost(host: HTMLElement): boolean {
 }
 /** One memory-only original grant, one explicit preflight, at most one browser dispatch. */
 export async function mountStripeSubscription(options: StripeSubscriptionOptions): Promise<StripeSubscriptionHandle> {
-  const { client, input, container, isCurrent, locale, onRetire } = options;
+  const { client, input, container, isCurrent, locale, onRetire, receiptConstraint } = options;
   let action: SubscriptionAction | undefined = options.action;
   const authority = fingerprint(input.session);
   let assertAuthority: (() => void) | undefined = captureSubscriptionAuthority(client,input.session,input.signal);
@@ -95,6 +97,7 @@ export async function mountStripeSubscription(options: StripeSubscriptionOptions
           spent=true; consumeSubscriptionAction(client,input,action); action=undefined;
           const receipt = await guarded(client.confirmAction({ ...input, actionToken:token!, idempotencyKey:crypto.randomUUID() }));
           if ((receipt as SubscriptionMutationReceipt).browserConfirmAllowed !== true || receipt.status === 'UNKNOWN') throw new PaymentSdkError('PROVIDER_RESULT_UNKNOWN');
+          if (receiptConstraint === 'OWNED_METHOD_RESERVED' && (flow !== 'SETUP' || receipt.status !== 'RESERVED' || receipt.actionAvailable || receipt.nextAction !== undefined)) throw new PaymentSdkError('PROVIDER_RESULT_UNKNOWN');
           current();
           // There is no await between the final authority/mount check and dispatch.
           const confirmation = flow === 'PAYMENT'
