@@ -116,6 +116,27 @@ test('atomic entry still rejects a control disabled after readiness and emits no
   assert.equal(h.node.events.length, 0);
 });
 
+test('controlled evaluator failure reaches the private dispatch and leaves the control empty without events', async () => {
+  const h = harness();
+  h.node.focus = () => { throw new Error('Controlled non-sensitive evaluator failure'); };
+  let controlledFailureObserved = false;
+  let errorContainsPayload = false;
+  let callLogContainsPayload = false;
+  try {
+    await enterPrivateText(h.locator, canary);
+  } catch (error) {
+    controlledFailureObserved = (error as Error).message === 'Controlled non-sensitive evaluator failure';
+    errorContainsPayload = String(error).includes(canary);
+    callLogContainsPayload = JSON.stringify((error as { log?: unknown }).log ?? []).includes(canary);
+  }
+  assert.equal(controlledFailureObserved, true, 'the expected evaluator error reaches the caller');
+  assert.equal(h.calls.filter(arg => arg !== undefined).length, 1, 'failure occurs after exactly one private dispatch');
+  assert.equal(errorContainsPayload, false);
+  assert.equal(callLogContainsPayload, false);
+  assert.equal(h.node.value, '');
+  assert.equal(h.node.events.length, 0);
+});
+
 test('attachment/readiness cannot consume the deadline and then dispatch a private write', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
   const h = harness('input', () => { t.mock.timers.tick(12_000); });
