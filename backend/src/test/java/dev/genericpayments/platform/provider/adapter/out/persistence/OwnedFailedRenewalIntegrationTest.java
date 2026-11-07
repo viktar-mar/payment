@@ -926,6 +926,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                 assertThat(databaseBlocked).as("worker waits for this fixture's operation-lock holder").isTrue();
                 assertThatThrownBy(()->refused.get(100,TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
                 var databaseNow=jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant();
+                assertThat(databaseNow).isBefore(session.expiresAt());
                 var wait=Duration.between(databaseNow,session.expiresAt()).plusMillis(100);if(!wait.isNegative())Thread.sleep(wait);
                 assertThat(jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant()).isAfterOrEqualTo(session.expiresAt());
                 release.countDown();assertThat(blocker.get(10,TimeUnit.SECONDS)).isTrue();assertThat(refused.get(10,TimeUnit.SECONDS)).isTrue();
