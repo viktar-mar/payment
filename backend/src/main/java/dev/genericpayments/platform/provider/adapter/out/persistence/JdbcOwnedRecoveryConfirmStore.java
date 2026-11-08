@@ -68,10 +68,16 @@ public final class JdbcOwnedRecoveryConfirmStore implements OwnedRecoveryConfirm
         // Return original normalized nanosecond evidence; SQL persists its exact microsecond projection.
         return new ConfirmationAck(acknowledged,reply,now);
     }
-    @Override public boolean unknownInTransaction(RecoveryPreparationContext c,ProviderOperation claim){
+    @Override public boolean unknownInTransaction(RecoveryPreparationContext c,ProviderOperation claim,InvocationBudget budget){
+        if(budget==null)throw denied();
         transaction();identity(c);requireOwned(c,claim);var current=lockInTransaction(c);
         if(current.isEmpty()||!current.get().equals(claim)||claim.status()!=Status.DISPATCHING||claim.version()!=1)return false;
-        require("select exists(select 1 from stripe_billing_failed_recovery_confirm_claims where provider_operation=? and reservation_id=? and claimant=? and claimed_at=? and deadline=? and recorded_transaction<>pg_current_xact_id())",claim.id(),c.reservation().id(),claim.leaseOwner(),stamp(claim.firstDispatchedAt()),stamp(claim.leaseExpiresAt()));
+        // Identity survives invocation/session/lease expiry; the first claim must still be independently committed.
+        require("""
+            select exists(select 1 from stripe_billing_failed_recovery_confirm_claims
+            where provider_operation=? and reservation_id=? and claimant=? and claimed_at=? and deadline=?
+              and invocation=? and entered_at=? and deadline_at=? and recorded_transaction<>pg_current_xact_id())
+            """,claim.id(),c.reservation().id(),claim.leaseOwner(),stamp(claim.firstDispatchedAt()),stamp(claim.leaseExpiresAt()),budget.invocation(),stamp(budget.enteredAt()),stamp(budget.deadlineAt()));
         return jdbc.update("update provider_operations set status='UNKNOWN',lease_owner=null,lease_expires_at=null,version=2 where id=? and status='DISPATCHING' and version=1 and lease_owner=? and lease_expires_at=?",claim.id(),claim.leaseOwner(),stamp(claim.leaseExpiresAt()))==1;
     }
     private void identity(RecoveryPreparationContext c){

@@ -44,11 +44,13 @@ public final class OwnedRecoveryConfirmService {
                     ||!ack.reply().equals(reply)||ack.acknowledgedAt().isAfter(clock.instant()))throw denied();return ack;
         });
     }
-    public void uncertain(RecoveryPreparationContext expected,ProviderOperation claim){
+    public void uncertain(RecoveryPreparationContext expected,ProviderOperation claim,InvocationBudget budget){
         fresh();try{
+            // Cleanup uses only the original immutable invocation identity, even after expiry.
+            if(budget==null)throw denied();
             requireExactClaim(expected,claim);
             transactions.requiresNew(()->{methods.consumeRecoveryConfirmationInTransaction(expected,()->{
-                if(!store.lockInTransaction(expected).filter(claim::equals).isPresent())return false;return store.unknownInTransaction(expected,claim);
+                if(!store.lockInTransaction(expected).filter(claim::equals).isPresent())return false;return store.unknownInTransaction(expected,claim,budget);
             });return null;});
         }catch(RuntimeException ignored){/* Preserve consumed evidence. Cleanup never reacquires authority. */}
     }

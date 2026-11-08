@@ -12,7 +12,8 @@ public interface OwnedRecoveryConfirmStore {
     default ProviderOperation insertAndClaimInTransaction(RecoveryPreparationContext context,String claimant,Instant now,InvocationBudget budget){throw denied();}
     default ProviderOperation requireClaimInTransaction(RecoveryPreparationContext context,ProviderOperation claim,InvocationBudget budget,Instant now){throw denied();}
     default ConfirmationAck acknowledgeInTransaction(RecoveryPreparationContext context,ProviderOperation claim,ConfirmReply reply,Instant now,InvocationBudget budget){throw denied();}
-    /** True only if this exact immutable original relation consumed its own committed first claim. */
-    default boolean unknownInTransaction(RecoveryPreparationContext context,ProviderOperation claim){throw denied();}
+    /** True only if the original invocation identity consumed its exact independently committed claim.
+     * The proof is immutable identity only; cleanup does not require remaining budget or live authority. */
+    default boolean unknownInTransaction(RecoveryPreparationContext context,ProviderOperation claim,InvocationBudget budget){throw denied();}
     private static IllegalStateException denied(){return new IllegalStateException("OWNED_RECOVERY_CONFIRM_UNAVAILABLE");}
 }

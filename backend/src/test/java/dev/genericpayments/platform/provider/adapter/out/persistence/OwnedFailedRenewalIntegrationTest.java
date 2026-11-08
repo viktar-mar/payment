@@ -1423,15 +1423,46 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(confirmationRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(financial);
     }
 
+    @Test void dedicatedConfirmationExactReadableClaimCannotTransferCleanupToAnotherInvocation() throws Exception {
+        var p=recoveryPrepared(false,0);var original=inspectRecovery(p);var ownerBudget=confirmationBudget();var svc=recoveryConfirmer(p);
+        var owner=svc.claim(original,p.pending().context(),"original-owner",ownerBudget);
+        var independentlyInspected=inspectRecovery(p);var otherBudget=confirmationBudget();
+        var readback=operations.find(billing.id(),original.recoveryOperation().providerOperationKey()+":CONFIRM").orElseThrow();
+        assertThat(operations.findById(owner.id())).contains(readback);assertThat(readback).isEqualTo(owner);
+        assertThat(independentlyInspected).isEqualTo(original);assertThat(otherBudget.invocation()).isNotEqualTo(ownerBudget.invocation());
+        var receipts=confirmationRows();var before=financialState();int calls=http.calls.size();
+        svc.uncertain(independentlyInspected,readback,otherBudget);
+        assertThat(confirmationRows()).isEqualTo(receipts);assertThat(operations.findById(owner.id())).contains(owner);
+        assertThat(count("stripe_billing_failed_renewal_stops")).isZero();assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+        // Exercise the actual JDBC boundary as well as the public service, with no positive authority substitute.
+        assertThatThrownBy(()->transaction.requiresNew(()->new JdbcOwnedRecoveryConfirmStore(jdbc).unknownInTransaction(independentlyInspected,readback,otherBudget)))
+            .isInstanceOf(RuntimeException.class);
+        svc.uncertain(independentlyInspected,readback,null);
+        assertThatThrownBy(()->transaction.requiresNew(()->new JdbcOwnedRecoveryConfirmStore(jdbc).unknownInTransaction(independentlyInspected,readback,null)))
+            .isInstanceOf(RuntimeException.class);
+        assertThat(confirmationRows()).isEqualTo(receipts);assertThat(financialState()).isEqualTo(before);
+        var session=((SubscriptionActor.Customer)p.pending().context().actor()).session();
+        assertThat(jdbc.update("update customer_sessions set revoked_at=clock_timestamp(),revoked_reason='LOGOUT' where id=?",session.sessionId().value())).isEqualTo(1);
+        var revoked=confirmationRows();
+        assertThatThrownBy(()->svc.inspectClaim(original,owner,p.pending().context(),ownerBudget)).isInstanceOf(RuntimeException.class);
+        svc.uncertain(independentlyInspected,readback,otherBudget);assertThat(confirmationRows()).isEqualTo(revoked);
+        assertThat(count("stripe_billing_failed_renewal_stops")).isZero();assertThat(financialState()).isEqualTo(before);
+        svc.uncertain(independentlyInspected,readback,ownerBudget);
+        assertThat(operations.findById(owner.id()).orElseThrow().status()).isEqualTo(ProviderOperation.Status.UNKNOWN);
+        assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);assertThat(count("stripe_billing_failed_recovery_confirm_acks")).isZero();
+        assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+        var stopped=confirmationRows();svc.uncertain(independentlyInspected,readback,ownerBudget);assertThat(confirmationRows()).isEqualTo(stopped);
+    }
+
     @Test void dedicatedConfirmationAckRejectsDifferentInvocationAndUnknownConsumesOnlyOriginalOwner() throws Exception {
         var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var budget=confirmationBudget();var svc=recoveryConfirmer(p);var claim=svc.claim(c,p.pending().context(),"owner",budget);var before=financialState();
         var receipt=confirmationRows();assertThatThrownBy(()->svc.acknowledge(c,claim,confirmationReply(c),p.pending().context(),confirmationBudget())).isInstanceOf(RuntimeException.class);
         assertThat(confirmationRows()).isEqualTo(receipt);
         var foreign=new ProviderOperation(claim.id(),claim.accountId(),claim.externalAccountId(),claim.credentialsRef(),claim.kind(),claim.resourceId(),claim.operationKey(),claim.fingerprint(),claim.status(),claim.providerReference(),claim.firstDispatchedAt(),claim.retryBefore(),"foreign",claim.leaseExpiresAt(),claim.version());
-        svc.uncertain(c,foreign);assertThat(confirmationRows()).isEqualTo(receipt);
-        svc.uncertain(c,claim);assertThat(operations.findById(claim.id()).orElseThrow().status()).isEqualTo(ProviderOperation.Status.UNKNOWN);
+        svc.uncertain(c,foreign,budget);assertThat(confirmationRows()).isEqualTo(receipt);
+        svc.uncertain(c,claim,budget);assertThat(operations.findById(claim.id()).orElseThrow().status()).isEqualTo(ProviderOperation.Status.UNKNOWN);
         assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);assertThat(count("stripe_billing_failed_recovery_confirm_acks")).isZero();assertThat(financialState()).isEqualTo(before);
-        var stopped=confirmationRows();svc.uncertain(c,claim);assertThat(confirmationRows()).isEqualTo(stopped);
+        var stopped=confirmationRows();svc.uncertain(c,claim,budget);assertThat(confirmationRows()).isEqualTo(stopped);
         assertThatThrownBy(()->svc.claim(c,p.pending().context(),"retry",confirmationBudget())).isInstanceOf(RuntimeException.class);
     }
 

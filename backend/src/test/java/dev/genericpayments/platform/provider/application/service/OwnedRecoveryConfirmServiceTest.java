@@ -219,22 +219,74 @@ class OwnedRecoveryConfirmServiceTest {
         assertThat(h.store.acks).containsExactly(ack);assertThat(ack.operation().status()).isEqualTo(Status.ACKNOWLEDGED);
     }
 
-    @Test void uncertainConsumesOnlyOwnCommittedClaimEvenAfterExpiryWithoutFinancialAuthority(){
-        var h=new Harness();var claim=h.claim();h.f.at(claim.leaseExpiresAt().plusSeconds(1));h.f.h.liveSession=false;
-        var before=h.f.state();h.service.uncertain(h.expected,claim);
+    @Test void anotherInvocationWithExactReadbackCannotConsumeOrStopTheOriginalClaim(){
+        var h=new Harness();var owner=h.claim();var independentlyInspected=h.f.inspect();var secondInvocation=h.newBudget();
+        assertThat(independentlyInspected).isEqualTo(h.expected);
+        assertThat(secondInvocation.invocation()).isNotEqualTo(h.budget.invocation());
+        assertThat(secondInvocation.enteredAt()).isEqualTo(h.budget.enteredAt());assertThat(secondInvocation.deadlineAt()).isEqualTo(h.budget.deadlineAt());
+        // Every claim field is readable; possession of an equal copy must not confer cleanup ownership.
+        var readback=h.store.row;
+        var borrowed=new ProviderOperation(readback.id(),readback.accountId(),readback.externalAccountId(),readback.credentialsRef(),readback.kind(),readback.resourceId(),readback.operationKey(),readback.fingerprint(),readback.status(),readback.providerReference(),readback.firstDispatchedAt(),readback.retryBefore(),readback.leaseOwner(),readback.leaseExpiresAt(),readback.version());
+        assertThat(borrowed).isEqualTo(owner).isNotSameAs(owner);
+        var receipts=h.receiptState();var before=h.f.state();int writes=h.store.writes;
+        h.service.uncertain(independentlyInspected,borrowed,secondInvocation);
+        assertThat(h.receiptState()).isEqualTo(receipts);assertThat(h.store.writes).isEqualTo(writes);
+        assertThat(h.f.state()).isEqualTo(before);assertThat(h.f.h.b.stopped).isFalse();
+        h.f.at(((SubscriptionActor.Customer)h.f.command().actor()).session().expiresAt().plusSeconds(1));h.nanos=31_000_000_000L;h.f.h.liveSession=false;
+        h.service.uncertain(independentlyInspected,borrowed,h.budget);
         assertThat(h.store.row.status()).isEqualTo(Status.UNKNOWN);assertThat(h.store.row.version()).isEqualTo(2);
         assertThat(h.store.acks).isEmpty();assertThat(h.f.h.b.stopped).isTrue();
         assertThat(h.f.h.b.s).isEqualTo(((List<?>)before).getFirst());
-        var stopped=h.f.state();h.service.uncertain(h.expected,claim);assertThat(h.f.state()).isEqualTo(stopped);
+    }
+
+    @Test void cleanupRefusesNullProofOrMissingMismatchedOrUncommittedInvocationReceipt(){
+        for(var bad:List.of("null-proof","missing-receipt","uncommitted","same-transaction","entry","deadline")){
+            var h=new Harness();var claim=h.claim();
+            switch(bad){
+                case "missing-receipt"->{h.store.invocation=null;h.store.entered=null;h.store.deadline=null;}
+                case "uncommitted"->h.store.committed=false;
+                case "same-transaction"->h.store.creatingTransaction=h.transaction+1;
+                case "entry"->h.store.entered=h.store.entered.plusNanos(1);
+                case "deadline"->h.store.deadline=h.store.deadline.plusNanos(1);
+                default->{}
+            }
+            var receipts=h.receiptState();var before=h.f.state();int writes=h.store.writes;
+            h.service.uncertain(h.expected,claim,bad.equals("null-proof")?null:h.budget);
+            assertThat(h.receiptState()).as(bad).isEqualTo(receipts);assertThat(h.store.writes).as(bad).isEqualTo(writes);
+            assertThat(h.f.state()).as(bad).isEqualTo(before);assertThat(h.f.h.b.stopped).as(bad).isFalse();
+        }
+    }
+
+    @Test void cleanupUsesIdentityWithoutSamplingBudgetOrCheckingInterruption(){
+        var h=new Harness();var claim=h.claim();
+        // A rollback would invalidate a positive budget checkpoint, but cannot revoke cleanup identity.
+        h.f.at(h.budget.enteredAt().minusSeconds(1));h.nanos=-1;
+        boolean previous=Thread.interrupted();
+        try{
+            Thread.currentThread().interrupt();h.service.uncertain(h.expected,claim,h.budget);
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();assertThat(h.store.row.status()).isEqualTo(Status.UNKNOWN);
+            assertThat(h.f.h.b.stopped).isTrue();assertThat(h.store.acks).isEmpty();
+        }finally{Thread.interrupted();if(previous)Thread.currentThread().interrupt();}
+    }
+
+    @Test void uncertainConsumesOnlyOwnCommittedClaimEvenAfterExpiryWithoutFinancialAuthority(){
+        var h=new Harness();var claim=h.claim();h.f.at(((SubscriptionActor.Customer)h.f.command().actor()).session().expiresAt().plusSeconds(1));h.nanos=31_000_000_000L;h.f.h.liveSession=false;
+        var before=h.f.state();h.service.uncertain(h.expected,claim,h.budget);
+        assertThat(h.store.row.status()).isEqualTo(Status.UNKNOWN);assertThat(h.store.row.version()).isEqualTo(2);
+        assertThat(h.store.acks).isEmpty();assertThat(h.f.h.b.stopped).isTrue();
+        assertThat(h.f.h.b.s).isEqualTo(((List<?>)before).getFirst());
+        var stopped=h.f.state();var receipts=h.receiptState();int writes=h.store.writes;
+        h.service.uncertain(h.expected,claim,h.budget);assertThat(h.f.state()).isEqualTo(stopped);assertThat(h.receiptState()).isEqualTo(receipts);assertThat(h.store.writes).isEqualTo(writes);
         assertThatThrownBy(h::claim).isInstanceOf(RuntimeException.class);
     }
 
     @Test void foreignOrAcknowledgedClaimCannotConsumeOrStopTheOriginalAdmission(){
         for(boolean acknowledged:List.of(false,true)){
             var h=new Harness();var claim=h.claim();if(acknowledged)h.service.acknowledge(h.expected,claim,h.reply(),h.f.command(),h.budget);
-            var row=h.store.row;var before=h.f.state();var foreign=new ProviderOperation(UUID.randomUUID(),claim.accountId(),claim.externalAccountId(),claim.credentialsRef(),claim.kind(),claim.resourceId(),claim.operationKey(),claim.fingerprint(),claim.status(),null,claim.firstDispatchedAt(),claim.retryBefore(),"foreign",claim.leaseExpiresAt(),claim.version());
-            h.service.uncertain(h.expected,acknowledged?claim:foreign);
-            assertThat(h.store.row).isEqualTo(row);assertThat(h.f.state()).isEqualTo(before);assertThat(h.f.h.b.stopped).isFalse();
+            var row=h.store.row;var receipts=h.receiptState();int writes=h.store.writes;var before=h.f.state();var foreign=new ProviderOperation(UUID.randomUUID(),claim.accountId(),claim.externalAccountId(),claim.credentialsRef(),claim.kind(),claim.resourceId(),claim.operationKey(),claim.fingerprint(),claim.status(),null,claim.firstDispatchedAt(),claim.retryBefore(),"foreign",claim.leaseExpiresAt(),claim.version());
+            h.service.uncertain(h.expected,acknowledged?claim:foreign,h.budget);
+            assertThat(h.store.row).isEqualTo(row);assertThat(h.receiptState()).isEqualTo(receipts);assertThat(h.store.writes).isEqualTo(writes);
+            assertThat(h.f.state()).isEqualTo(before);assertThat(h.f.h.b.stopped).isFalse();
         }
     }
 
@@ -243,7 +295,8 @@ class OwnedRecoveryConfirmServiceTest {
         var s=h.f.h.b.s;h.f.h.b.s=new dev.genericpayments.platform.subscriptions.domain.Subscription(s.id(),s.siteId(),s.customerId(),s.productId(),s.paymentAccountId(),s.billingPrice(),s.entitledPrice(),s.billingStatus(),s.providerReference(),s.currentPeriod(),s.paidThrough(),s.trial(),s.cancellation(),s.pendingChange(),null,s.terminalReason(),s.revision()+1,s.createdAt(),s.updatedAt(),s.lastReconciledAt());
         var before=h.f.state();assertThatThrownBy(()->h.service.inspectClaim(h.expected,claim,h.f.command(),h.budget)).isInstanceOf(RuntimeException.class);
         assertThatThrownBy(()->h.service.acknowledge(h.expected,claim,h.reply(),h.f.command(),h.budget)).isInstanceOf(RuntimeException.class);
-        h.service.uncertain(h.expected,claim);assertThat(h.store.row.status()).isEqualTo(Status.UNKNOWN);assertThat(h.store.acks).isEmpty();
+        h.f.at(((SubscriptionActor.Customer)h.f.command().actor()).session().expiresAt().plusSeconds(1));h.nanos=31_000_000_000L;h.f.h.liveSession=false;
+        h.service.uncertain(h.expected,claim,h.budget);assertThat(h.store.row.status()).isEqualTo(Status.UNKNOWN);assertThat(h.store.acks).isEmpty();
         assertThat(h.f.h.b.s).isEqualTo(((List<?>)before).getFirst());assertThat(h.f.h.b.stopped).isTrue();
         assertThat(h.f.trace()).containsSubsequence("recovery-confirm-identity","confirm-lock");
     }
@@ -256,7 +309,7 @@ class OwnedRecoveryConfirmServiceTest {
         List<org.assertj.core.api.ThrowableAssert.ThrowingCallable> calls=List.of(
             ()->defaults.lockInTransaction(h.expected),()->defaults.insertAndClaimInTransaction(h.expected,"first",h.f.now(),h.budget),
             ()->defaults.requireClaimInTransaction(h.expected,claim,h.budget,h.f.now()),
-            ()->defaults.acknowledgeInTransaction(h.expected,claim,h.reply(),h.f.now(),h.budget),()->defaults.unknownInTransaction(h.expected,claim));
+            ()->defaults.acknowledgeInTransaction(h.expected,claim,h.reply(),h.f.now(),h.budget),()->defaults.unknownInTransaction(h.expected,claim,h.budget));
         calls.forEach(call->assertThatThrownBy(call).isInstanceOf(RuntimeException.class));
     }
 

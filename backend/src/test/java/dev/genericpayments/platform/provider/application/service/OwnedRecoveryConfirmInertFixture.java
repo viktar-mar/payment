@@ -67,8 +67,10 @@ public class OwnedRecoveryConfirmInertFixture {
             requireClaimInTransaction(c,claim,budget,now);h.f.trace().add("confirm-ack");row=new ProviderOperation(row.id(),row.accountId(),row.externalAccountId(),row.credentialsRef(),row.kind(),row.resourceId(),row.operationKey(),row.fingerprint(),Status.ACKNOWLEDGED,reply.paymentIntent(),row.firstDispatchedAt(),row.retryBefore(),null,null,2);
             var ack=new ConfirmationAck(row,reply,now);acks.add(ack);writes++;effectReached=true;afterEffect.run();if(failAck)throw new IllegalStateException("receipt write failed");return ack;
         }
-        public boolean unknownInTransaction(RecoveryPreparationContext c,ProviderOperation claim){
-            active();context(c);calls.add("unknown");if(!committed||creatingTransaction==h.transaction||!Objects.equals(row,claim)||row.status()!=Status.DISPATCHING)return false;
+        public boolean unknownInTransaction(RecoveryPreparationContext c,ProviderOperation claim,InvocationBudget budget){
+            active();context(c);calls.add("unknown");
+            if(budget==null||!committed||creatingTransaction==h.transaction||!Objects.equals(row,claim)||row.status()!=Status.DISPATCHING||row.version()!=1
+                    ||!Objects.equals(invocation,budget.invocation())||!Objects.equals(entered,budget.enteredAt())||!Objects.equals(deadline,budget.deadlineAt()))return false;
             row=copy(row,Status.UNKNOWN,2);writes++;return true;
         }
         ProviderOperation copy(ProviderOperation o,Status status,long version){boolean dispatch=status==Status.DISPATCHING;return new ProviderOperation(o.id(),o.accountId(),o.externalAccountId(),o.credentialsRef(),o.kind(),o.resourceId(),o.operationKey(),o.fingerprint(),status,status==Status.ACKNOWLEDGED?h.expected.reservation().failure().paymentIntent():null,status==Status.RESERVED?null:o.firstDispatchedAt(),status==Status.RESERVED?null:o.retryBefore(),dispatch?o.leaseOwner():null,dispatch?o.leaseExpiresAt():null,version);}

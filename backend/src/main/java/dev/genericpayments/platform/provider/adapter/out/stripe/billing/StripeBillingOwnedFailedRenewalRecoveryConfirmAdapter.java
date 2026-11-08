@@ -48,8 +48,10 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
     }
     public ConfirmationAck confirm(Reservation reservation,Completion completion,Recovery recovery,SubscriptionCommandContext originalContext){
         RecoveryPreparationContext original=null;ProviderOperation owned=null;
+        final InvocationBudget budget;
+        try{budget=new InvocationBudget(utc,nanos);}catch(RuntimeException failure){throw unavailable();}
         try{
-            var budget=new InvocationBudget(utc,nanos);budget.remainingNanos(null);
+            budget.remainingNanos(null);
             var prepared=remotePreflight.inspect(reservation,completion,recovery,originalContext,budget);
             original=prepared.original();checkpoint(budget,null,original);
             if(!reservation.equals(original.reservation())||!completion.equals(original.completion())||!recovery.equals(original.recovery())
@@ -78,7 +80,7 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
             // claim/reply are checked by this atomic ACK; the independent observer owns settlement.
             return confirmations.acknowledge(original,claim,reply,originalContext,budget);
         }catch(RuntimeException failure){
-            if(owned!=null&&original!=null)try{confirmations.uncertain(original,owned);}catch(RuntimeException ignored){/* Keep consumed evidence. */}
+            if(owned!=null&&original!=null)try{confirmations.uncertain(original,owned,budget);}catch(RuntimeException ignored){/* Keep consumed evidence. */}
             throw unavailable();
         }
     }
