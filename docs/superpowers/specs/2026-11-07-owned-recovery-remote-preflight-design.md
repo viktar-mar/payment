@@ -30,6 +30,8 @@ New package-private mapper retrieveOwnedRecoveryPreparation consumes Ownership, 
 
 Read the same admitted ready TestClock before and after the graph, verifying identity/frozen time/readiness and all existing owned-clock fields. All actual calls are GET only, with pinned API, zero retries, no idempotency key, max 100 total logical GETs (including clock GETs), existing graph page limits, 2 seconds per GET including scheduling, and immutable 30-second invocation budget covering caller authentication/store/credential work. Enforce real and injected monotonic time and UTC rollback/deadline, exact original session expiry, interruption and cancellation. Fail closed with cause-free OWNED_RECOVERY_PREFLIGHT_UNAVAILABLE / 409 / "Owned recovery preflight unavailable"; expose no SDK payload, client secret, credential, card detail or arbitrary exception in result/toString/error.
 
+The invocation budget refuses further work or a successful result after synchronous authentication/store/credential work returns past its deadline. It does not interrupt indefinitely blocked synchronous storage calls or guarantee an end-to-end response within 30 seconds. The SDK GET worker has a separate bounded wait and cancellation. The exact 100/101 GET boundary and wrong-admitted-owner API are source-verified; the inert cases reach an earlier strict graph/page bound and use the authentic pinned owner, respectively.
+
 No new generic transport framework or shared write-helper changes. A small read-only helper local to this reader is acceptable. Repeated preflight is permitted only while original authority/debt remains unchanged; it never authorizes repeat financial operations.
 
 ## Evidence and completion

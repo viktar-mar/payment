@@ -63,8 +63,10 @@ class StripeBillingOwnedFailedRenewalRecoveryReaderTest {
     }
     @ParameterizedTest @ValueSource(strings={"authority","proof","step","sequence"})
     void eachCompletedGetMustRecheckOriginalAuthorityAndImmutableEvidence(String drift){
-        var g=new Graph();g.queueClocks();var before=g.local.state();g.sdk.http.afterResponse=()->{switch(drift){case "authority"->g.local.revoke();case "proof"->{var p=g.local.proof;g.local.proof=new Setup(p.operation(),p.subscription(),p.account(),p.step(),p.reference(),"pm_other");}case "step"->g.local.steps.remove(g.original.completion().methodStepId());case "sequence"->g.local.driftSequence();default->throw new AssertionError(drift);}};
-        refused(()->inspect(g,reader(g)));assertThat(g.sdk.http.calls).hasSize(1);if(!drift.equals("sequence"))noEffects(g,before);else assertThat(g.local.trace()).doesNotContain("stop","claim","publication");
+        var g=new Graph();g.queueClocks();var before=g.local.state();var afterSequenceDrift=new AtomicReference<Object>();
+        g.sdk.http.afterResponse=()->{switch(drift){case "authority"->g.local.revoke();case "proof"->{var p=g.local.proof;g.local.proof=new Setup(p.operation(),p.subscription(),p.account(),p.step(),p.reference(),"pm_other");}case "step"->g.local.steps.remove(g.original.completion().methodStepId());case "sequence"->{assertThat(g.local.state()).isEqualTo(before);g.local.driftSequence();afterSequenceDrift.set(g.local.state());}default->throw new AssertionError(drift);}};
+        refused(()->inspect(g,reader(g)));assertThat(g.sdk.http.calls).hasSize(1);
+        if(drift.equals("sequence")){assertThat(afterSequenceDrift.get()).isNotNull();noEffects(g,afterSequenceDrift.get());}else noEffects(g,before);
     }
     @Test void originalSessionExclusiveNanosecondExpiryIsCheckedAfterAuthenticationAndInsideWorker(){
         for(boolean worker:new boolean[]{false,true}){

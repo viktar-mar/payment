@@ -1,6 +1,6 @@
 # Original recovery remote preflight Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Isolate ordinary invoice payment from owned debt and independently validate the unchanged original debt/card graph.
 
@@ -35,10 +35,10 @@
 
 **Interfaces:** consumes existing ProviderOperationStore reserve/claim/acknowledge/bindRecovered and common requireResource; produces same signatures with durable clock-owned INVOICE_PAY refusal. No new public seam.
 
-- [ ] Write pure tests exercising actual JdbcProviderOperationStore public methods with a bare scripted JdbcTemplate, no DataSource/context. Assert owned reservation/first claim/ACK/manual binding refuse before any provider receipt mutation; ordinary nonclock control proceeds to the existing mutation boundary. Name the specific production branch removal each catches. Add hosted tests using actual recoveryPrepared composition and unchanged snapshots, both browser variants; negative legacy seeded receipt remains test-only and no financial positive evidence.
-- [ ] Root audit closure, compile all main+explicit tests, run only new pure class. Observe behavioral RED caused by missing owned INVOICE_PAY exclusion, not artificial exception matching.
-- [ ] Extend only the existing ownership exclusion to INVOICE_PAY. Keep join scoping/lock modes and ordinary behavior unchanged.
-- [ ] Root run new pure and related provider-store/method tests; compile hosted test only. Independent task spec/quality review, resolve findings, commit.
+- [x] Write pure tests exercising actual JdbcProviderOperationStore public methods with a bare scripted JdbcTemplate, no DataSource/context. Assert owned reservation/first claim/ACK/manual binding refuse before any provider receipt mutation; ordinary nonclock control proceeds to the existing mutation boundary. Name the specific production branch removal each catches. Add hosted tests using actual recoveryPrepared composition and unchanged snapshots, both browser variants; negative legacy seeded receipt remains test-only and no financial positive evidence.
+- [x] Root audit closure, compile all main+explicit tests, run only new pure class. Observe behavioral RED caused by missing owned INVOICE_PAY exclusion, not artificial exception matching.
+- [x] Extend only the existing ownership exclusion to INVOICE_PAY. Keep join scoping/lock modes and ordinary behavior unchanged.
+- [x] Root run new pure and related provider-store/method tests; compile hosted test only. Independent task spec/quality review, resolve findings, commit.
 
 ### Task 2: Add original recovery remote graph reader
 
@@ -56,11 +56,11 @@
 - Produces public final unregistered StripeBillingOwnedFailedRenewalRecoveryReader with public constructor(methods,proofs,steps,credentials,clients,digest,Clock), package-private equivalent with LongSupplier, public PreparedRecovery inspect(Reservation,Completion,Recovery,SubscriptionCommandContext). Nested PreparedRecovery(RecoveryPreparationContext original,Snapshot snapshot) redacts toString.
 - Produces mapper package-private static Snapshot retrieveOwnedRecoveryPreparation(StripeClient,Ownership,RecoveryPreparationContext,OwnedMethodCandidate,DigestPort,Instant,ReadExecutor). Existing METHOD entry remains PROCESSING-only and recovery cash reader unchanged.
 
-- [ ] Write tests first for completed-original SETUP SUCCEEDED2 + RECOVER RESERVED0 + same OPEN debt/failed PI + independently confirmed original card; only prior initial invoice has cash, no authority/grants/result secrets. Hand-derived expected GET sequence is clock, complete debt graph, original SetupIntent, exact card, clock. Reuse existing inert graph fixtures, not synthetic operation-status substitution in production.
-- [ ] Add ownership/operation/step/version/fingerprint/reference/chronology/association mismatch tests, remote graph/card drift and existing reader PROCESSING-only negative control; no SDK calls for invalid supplied records. Reader tests cover pre-auth refusal before credentials/store IDs, missing/foreign proof and steps, mid-read original authority/proof/step drift, session equality/exactexpiry, clock/readiness/API mismatch, 2-second/per-invocation UTC+monotonic+actual wallclock, interrupt/cancellation, maxread/page bounds and safe exceptions without stop/mutation. Prefer actual service with existing inert fixture; mocks only external boundary where unavoidable.
-- [ ] Root audits closure and observes expected RED (new API absent), then authorizes minimal implementation.
-- [ ] Implement mapper shared mechanics without broadening existing lane; implement reader with spec budgets and repeated actual original-service/immutable evidence comparisons. No new dispatch port or migration.
-- [ ] Root run explicit pure tests plus related owned method/recovery mapper/adapter/service regressions, compile affected hosted tests, independent task review, fix findings and commit.
+- [x] Write tests first for completed-original SETUP SUCCEEDED2 + RECOVER RESERVED0 + same OPEN debt/failed PI + independently confirmed original card; only prior initial invoice has cash, no authority/grants/result secrets. Hand-derived expected GET sequence is clock, complete debt graph, original SetupIntent, exact card, clock. Reuse existing inert graph fixtures, not synthetic operation-status substitution in production.
+- [x] Add ownership/operation/step/version/fingerprint/reference/chronology/association mismatch tests, remote graph/card drift and existing reader PROCESSING-only negative control; no SDK calls for invalid supplied records. Reader tests cover pre-auth refusal before credentials/store IDs, missing/foreign proof and steps, mid-read original authority/proof/step drift, session equality/exactexpiry, clock/readiness/API mismatch, 2-second/per-invocation UTC+monotonic+actual wallclock, interrupt/cancellation, maxread/page bounds and safe exceptions without stop/mutation. Prefer actual service with existing inert fixture; mocks only external boundary where unavoidable.
+- [x] Root audits closure and observes expected RED (new API absent), then authorizes minimal implementation.
+- [x] Implement mapper shared mechanics without broadening existing lane; implement reader with spec budgets and repeated actual original-service/immutable evidence comparisons. No new dispatch port or migration.
+- [x] Root run explicit pure tests plus related owned method/recovery mapper/adapter/service regressions, compile affected hosted tests, independent task review, fix findings and commit.
 
 ### Publication
 
