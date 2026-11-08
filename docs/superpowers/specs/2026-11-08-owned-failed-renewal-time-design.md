@@ -1,0 +1,47 @@
+# Persisted failed-renewal billing time — offline integration
+
+## Intent and baseline
+
+Advance Stage5B toward an isolated failed-renewal/method/recovery scenario by replacing its manually selected READY2 business time with the already persisted original readiness. Published baseline `4dbf53b3db880c99cf3d9bc0a47c596ce25bcf5d` passed full CI42495801804 (5,897 backend cases, zero failures/errors, one existing opt-in skip, both runtime packaging gates) and dedicated42495801809 (379/379). Its one-use original confirmation → independent recovered observation is verified hosted test support, not native acceptance.
+
+The current genuine JDBC failed-renewal fixture uses nested `ExactTime.selected`. Existing `OwnedFirstRenewalBillingTime` authenticates a mutable successful-renewal chain and cannot serve the later debt/method transitions. A future scenario must derive its business time from the exact persisted original READY2 evidence; directly assigning a time is not native readiness proof. This slice supplies and genuinely exercises that selector without opening a launcher or authorizing execution.
+
+The user asked to continue uninterrupted with subagents, tests and independent review. Questions/approval menus were opted out; prior prohibitions on local Docker, database/application/browser/provider/Stripe/Sandbox and old operations remain. Existing linked worktree/branch and stack are retained, no install.
+
+## Scope and interfaces
+
+Create test-support `public final dev.genericpayments.platform.support.OwnedFailedRenewalBillingTime implements SubscriptionBillingTimePort` with constructor `(JdbcTemplate jdbc, OwnedFirstRenewalBillingTime original)`; both required nonnull. Like the two existing support selectors, this is explicitly constructed and unregistered. No production source/service/schema/dependency/route/runtime packaging change.
+
+`Sample sample(PaymentAccountId account, SiteId site, CustomerId customer, Instant operationalAt)`:
+
+- Require a caller-owned actual Spring transaction before any SQL or fallback, as the existing support selectors do. Do not start a transaction, acquire a lock, call independent stores, read credentials/provider or mutate anything.
+- Execute one nonlocking SELECT starting from **all** `stripe_billing_failed_renewals` rows matching supplied Site/Customer. Do not start at a successful inner join or filter invalid candidates out in WHERE. A foreign account for an existing Site/Customer is refusal, never ordinary fallback.
+- LEFT JOIN the exact predecessor first-renewal admission by its ID and full stored Account/Site/Customer/Subscription tuple; require matching source SHA and failed admitted_at >= READY2 observed_at. LEFT JOIN exact original READY2: `ready.id=d.ready_id AND ready.admission_id=d.first_renewal_admission`. Only the supplied account matching `d.payment_account_id`, present original READY row and **`owned_failed_renewal_authority(d.id)`** authorize an isolated result. Read `ready.frozen_time`; never operationalAt, a parameter target, latest arbitrary READY, mutable subscription period, or reconstructed G/grace time.
+- Existing V34 authority is reused unchanged. It authenticates the original immutable owner/credentials/initial cash/first-renewal identity, both ACK/READY steps, boundary and stop predicates. It deliberately avoids the mutable original-paid chain and accepts the legal SETUP/METHOD/debt phases; it is already consumed by their V35 predicates. Do not replace it with a partial identity or latest successful join, and do not add current debt/status/operation predicates that reject transient fact-before-receipt or pending-method phases.
+- An invalid/missing proof, stopped lane or foreign account throws fixed `IllegalStateException("OWNED_TIME_AUTHORITY_MISSING")`; multiple candidate rows refuse `OWNED_TIME_AUTHORITY_AMBIGUOUS`. Never swallow SQL/authority errors into fallback. No raw payload, identity or cause is deliberately added by this selector.
+- Exactly one valid candidate returns `new Sample(Instant.ofEpochSecond(ready.frozen_time), Mode.ISOLATED)`. This reports billing time only, not mutation permission, a fact/publication/ACK or native acceptance. Existing service/delegate reauthentication and financial authority remain mandatory.
+- Only zero failed-admission candidates permits fallback to the concrete `OwnedFirstRenewalBillingTime`, preserving its initial/renewal/ordinary authority and refusal behavior. No ordinary fallback after a candidate exists.
+- Retain existing test-support transaction observability (`sampledConnectionHolder`, `sampledTransaction`) so genuine tests can pin caller connection/xact. Record current result/fallback transaction correctly; these diagnostics grant no authority.
+
+`void requireUnscopedAllowed(SiteId site, CustomerId customer)` must reject any scope containing a failed admission, including stopped/malformed rows. Null site means global and null customer all customers. Only an empty failed-admission scope delegates to the concrete original selector, which independently guards earlier admissions. No lifecycle/account locks or time mutation.
+
+## Genuine integration and tests
+
+Keep existing exact-time drift/grace controls intact; they prove their old limited contracts. Add an opt-in persisted delegate in the **existing fixture's** ExactTime seam for new genuine cases; its historical selected/ordinary/drift controls remain default and must not affect the persisted lane. New positives enable the persisted selector before `setup()` so admission itself uses fallback before its own row exists, then all failure/SETUP/browser/binding/METHOD/recovery service and FactService samples use it.
+
+Reuse existing real fixture `setup`, declined SDK graph, original setup/browser/method chain and `singleUseRecoveryCompositionConfirmsThenIndependentlyObservesOnlyOriginalBill` for both original browser variants. Factor its assertion body narrowly if needed, then run it in both existing exact-time and new persisted-time modes. Preserve all exact SDK/options/receipts, unchanged initial cash, no cash from ACK, original recovered bill/PI settlement, exact journal and two callback enqueue deltas, and duplicate/refusal checks. Do not insert positive proof/ACK/lifecycle rows or create a fake time authority. New independent expectations are original READY2 epoch E+3600 and preserved operational UTC; no fixture-selected time may satisfy a persisted-positive assertion.
+
+Add genuine hosted controls for same-caller transaction/connection identity, no-ambient-transaction rejection before SQL/fallback; exact-account/site/customer isolation and fallback for unrelated ordinary owner; fail-closed stopped/authority-drift/READY-proof failure; and unscoped refusal across matching global/site/customer scopes with disjoint scopes still delegated. Corruption negatives must use established rollback-only trigger-safe patterns and prove restoration before valid resampling; prefer normal stop APIs and real credential/site/price changes over corrupting immutable rows. If ambiguity cannot arise under genuine constraints, test the selector's row-cardinality boundary with a narrow memory JDBC double without claiming database authority; do not weaken constraints to create a positive admission.
+
+Root may run explicitly audited memory-only tests and cached javac compilation with processors disabled, never hosted JDBC/Spring tests locally. Workers source read/edit/report only, no execution/compiler/tests/Git/network/children. New source tests first: root verifies intended missing-class RED before implementation, then meaningful local pure guards where socket-free and all-main/hosted compilation. The authority SQL and lifecycle positives require actual hosted CI, not mock/JDBC-returned-valid assertions. Whole-source full CI(all4jobs) and dedicated renewal CI at exact published head, original205+new9 regression and old SDK observer25, both packaging gates are required. No default Maven/local discovery.
+
+## Limits / subsequent work
+
+This removes the manually selected READY2 seam for the existing failed-renewal → recovery composition. It does **not** produce new provider readiness or clock advances, and does not change READY2 E+3600. Later grace/G-1/G/G+1 requires its own immutable readiness/time lineage and explicit financial budget; no inference from local UTC or debt timestamps. Native failure strategy/tax compatibility, browser method confirmation, isolated launcher/admission and actual provider/cash/journal/delivered callbacks remain NOT_RUN. Full5B remains NOT_ACCEPTED.
+
+No installation, Python, local Docker/DB/SQL/Spring/app/browser/socket/provider/Stripe/Sandbox/native/financial action, key/archive/old-payment/old-operation/DISPATCHING access/replay. No cleanup/PR/merge. Preserve all reports/worktree. Push existing work branch and verify exact-head hosted CI under the user's standing authority.
+
+## Controller choices
+
+1. Reuse unchanged V34 authority and exact stored READY2 in test support rather than duplicate SQL proofs or add a migration. If future phases change authority requirements, the selector must be deliberately extended before use; it grants no such extension now.
+2. Limit this slice to persisted READY2 selection, not new grace clock advances: existing guards explicitly bind E+3600. Later grace requires separate persisted lineage/admission work, and full5B remains open rather than claiming a complete launcher from this selector.
