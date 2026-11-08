@@ -118,7 +118,7 @@ public final class StripeBillingOwnedFailedRenewalMethodObserver {
         return result;
     }
     private Instant now(){return utc.instant().truncatedTo(ChronoUnit.MICROS);}
-    private static void exactClock(TestClock remote,Reservation r) {
+    static void exactClock(TestClock remote,Reservation r) {
         var expected=r.admission().ready().observation();
         if(remote==null||!expected.reference().equals(remote.getId())||!"test_helpers.test_clock".equals(remote.getObject())
                 ||!Boolean.FALSE.equals(remote.getLivemode())||Boolean.TRUE.equals(remote.getDeleted())

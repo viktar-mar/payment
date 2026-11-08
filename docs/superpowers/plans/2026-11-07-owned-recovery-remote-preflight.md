@@ -45,9 +45,11 @@
 **Files:**
 - Create backend/src/main/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/StripeBillingOwnedFailedRenewalRecoveryReader.java
 - Modify backend/src/main/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/StripeBillingSnapshotMapper.java
+- Modify backend/src/main/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/StripeBillingOwnedFailedRenewalMethodObserver.java only if needed to share the unchanged package-private exact-clock validator instead of duplicating it.
 - Create backend/src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/StripeBillingOwnedRecoveryPreparationMappingTest.java
 - Create backend/src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/StripeBillingOwnedFailedRenewalRecoveryReaderTest.java
 - Optional test-only fixture beside those tests, if needed for genuine service+inert ports composition.
+- Narrow existing test fixture correction allowed in OwnedFailedRenewalServiceTest.ready: its ready/ACK clock name must equal its admitted ClockOwner.name, rather than an unrelated hardcoded name. Preserve all production checks and include related pure regressions.
 
 **Interfaces:**
 - Consumes OwnedFailedRenewalMethodService.inspectBrowserRecoveryPreparation(Reservation,Completion,Recovery,SubscriptionCommandContext) and read-only SubscriptionBillingProofStore.setup(account,setupOperationId), ProviderOperationStore.findById(originalStepId).

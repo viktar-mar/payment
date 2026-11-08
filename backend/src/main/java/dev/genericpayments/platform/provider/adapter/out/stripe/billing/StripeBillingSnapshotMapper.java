@@ -114,6 +114,45 @@ public final class StripeBillingSnapshotMapper {
     record OwnedMethodCandidate(SubscriptionOperation operation,SubscriptionBillingProofStore.Setup setup,
             ProviderOperation setupStep,ProviderOperation methodStep) {}
     record OwnedMethodRead(Snapshot snapshot,String setupIntent,String method) {}
+    /** Completed original card plus unchanged OPEN debt. This description grants no dispatch authority. */
+    static Snapshot retrieveOwnedRecoveryPreparation(StripeClient client,Ownership owner,
+            dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.RecoveryPreparationContext original,
+            OwnedMethodCandidate candidate,DigestPort digest,Instant observedAt,ReadExecutor executor){
+        try{
+            require(executor!=null);
+            requireOwnedRecoveryPreparation(owner,original,candidate,digest,observedAt);
+            var r=original.reservation();var admission=r.admission();
+            var read=new Read(client,owner,observedAt,new OwnedInitial(admission.firstRenewalAdmission().receipt()));
+            read.renewalAdmission=admission.firstRenewalAdmission();read.executor=executor;
+            var failed=read.ownedDebtGraph(admission,r.failure(),RenewalLane.FAILED).failed();
+            require(r.failure().allocation().equals(failed.allocation())&&r.failure().paymentIntent().equals(failed.paymentIntent()));
+            return readOwnedMethodCard(client,owner,candidate,observedAt,read,failed.snapshot()).snapshot();
+        }catch(StripeException|RuntimeException malformed){throw mismatch();}
+    }
+    /** Supplied-record joins only; caller must independently authenticate/reload every original. */
+    static void requireOwnedRecoveryPreparation(Ownership owner,
+            dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.RecoveryPreparationContext original,
+            OwnedMethodCandidate candidate,DigestPort digest,Instant observedAt){
+        require(owner!=null&&original!=null&&candidate!=null&&observedAt!=null);
+        var r=original.reservation();var c=original.completion();var recovery=original.recovery();var o=original.setupOperation();
+        require(owner.account().equals(original.account())&&owner.subscription().equals(original.subscription())&&owner.customer().equals(original.binding())
+            &&r.binding().equals(original.binding())&&r.billingSample().equals(original.billingSample())
+            &&candidate.operation().equals(o)&&r.setupOperationId().equals(o.id())&&r.requestFingerprint().equals(o.fingerprint())
+            &&o.authorityScope().equals("owned-failed-renewal-method:"+r.admission().id())
+            &&r.initialOperationVersion()==0&&c.setupFinalVersion()==2&&o.version()==2
+            &&r.id().equals(c.reservationId())&&o.id().equals(c.setupOperationId())&&r.id().equals(recovery.reservationId())
+            &&c.revision()==r.failure().revision()&&c.observationSequence()==r.failure().observationSequence()+1
+            &&recovery.observationSequence()==c.observationSequence()&&recovery.association().operationVersion()==0&&original.recoveryOperation().version()==0
+            &&!c.completedAt().isBefore(r.reservedAt())&&!c.completedAt().isAfter(recovery.association().associatedAt())
+            &&!o.updatedAt().isBefore(o.createdAt())&&!o.updatedAt().isAfter(c.completedAt())&&!c.completedAt().isAfter(observedAt)
+            &&c.setupStepVersion()==2&&c.methodStepVersion()==2&&candidate.setupStep().version()==2&&candidate.methodStep().version()==2
+            &&c.setupStepId().equals(candidate.setupStep().id())&&c.methodStepId().equals(candidate.methodStep().id())
+            &&c.setupIntent().equals(candidate.setup().reference())&&c.method().equals(candidate.setup().method())
+            &&candidate.setupStep().firstDispatchedAt()!=null&&candidate.methodStep().firstDispatchedAt()!=null
+            &&!candidate.setupStep().firstDispatchedAt().isAfter(c.completedAt())&&!candidate.methodStep().firstDispatchedAt().isAfter(c.completedAt()));
+        requireOwnedRecovery(owner,r.admission(),r.failure(),recovery.association(),original.recoveryOperation(),observedAt);
+        requireOwnedMethodCandidate(owner,r.failure(),candidate,digest,observedAt,r.admission().firstRenewalAdmission().policyVersion(),SubscriptionOperation.Status.SUCCEEDED);
+    }
     static OwnedMethodRead retrieveOwnedMethodReady(StripeClient client,Ownership owner,
             OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.Failure failure,OwnedMethodCandidate candidate,
             DigestPort digest,Instant observedAt,ReadExecutor executor){
@@ -122,9 +161,14 @@ public final class StripeBillingSnapshotMapper {
             var read=new Read(client,owner,observedAt,new OwnedInitial(admission.firstRenewalAdmission().receipt()));
             read.renewalAdmission=admission.firstRenewalAdmission();read.executor=executor;
             read.requireDebtContext(admission,failure);
-            requireOwnedMethodCandidate(owner,failure,candidate,digest,observedAt,admission.firstRenewalAdmission().policyVersion());
+            requireOwnedMethodCandidate(owner,failure,candidate,digest,observedAt,admission.firstRenewalAdmission().policyVersion(),SubscriptionOperation.Status.PROCESSING);
             var failed=read.ownedDebtGraph(admission,failure,RenewalLane.FAILED).failed();
             require(failure.allocation().equals(failed.allocation())&&failure.paymentIntent().equals(failed.paymentIntent()));
+            return readOwnedMethodCard(client,owner,candidate,observedAt,read,failed.snapshot());
+        }catch(StripeException|RuntimeException malformed){throw mismatch();}
+    }
+    private static OwnedMethodRead readOwnedMethodCard(StripeClient client,Ownership owner,OwnedMethodCandidate candidate,
+            Instant observedAt,Read read,Snapshot s)throws StripeException{
             var setup=candidate.setup();var operation=candidate.operation();
             require(setup.method().equals(read.remote.getDefaultPaymentMethod()));
             var remote=read.get(()->client.v1().setupIntents().retrieve(setup.reference(),read.options()));
@@ -134,15 +178,13 @@ public final class StripeBillingSnapshotMapper {
             var method=read.get(()->client.v1().paymentMethods().retrieve(setup.method(),read.options()));
             require(setup.method().equals(method.getId())&&"payment_method".equals(method.getObject())&&Boolean.FALSE.equals(method.getLivemode())
                 &&owner.customer().providerReference().equals(method.getCustomer())&&"card".equals(method.getType())&&method.getCard()!=null);
-            var s=failed.snapshot();
             return new OwnedMethodRead(new Snapshot(s.subscriptionReference(),s.status(),s.billingPrice(),s.period(),s.trial(),s.cancellationAt(),
                 s.invoices(),null,true,0,observedAt,null,List.of(),null,null),setup.reference(),setup.method());
-        }catch(StripeException|RuntimeException malformed){throw mismatch();}
     }
     private static void requireOwnedMethodCandidate(Ownership owner,OwnedFailedRenewal.Failure failure,
-            OwnedMethodCandidate candidate,DigestPort digest,Instant at,long policyVersion){
+            OwnedMethodCandidate candidate,DigestPort digest,Instant at,long policyVersion,SubscriptionOperation.Status status){
         require(candidate!=null&&digest!=null);var o=candidate.operation();var setup=candidate.setup();var a=owner.account();var s=owner.subscription();var b=owner.customer();
-        require(o!=null&&setup!=null&&o.kind()==SubscriptionOperation.Kind.SETUP&&o.status()==SubscriptionOperation.Status.PROCESSING
+        require(o!=null&&setup!=null&&o.kind()==SubscriptionOperation.Kind.SETUP&&o.status()==status
             &&o.siteId().equals(s.siteId())&&o.customerId().equals(s.customerId())&&o.subscriptionId().equals(s.id())
             &&o.expectedRevision()==failure.revision()&&o.policyVersion()==policyVersion&&s.providerReference().equals(o.providerReference())
             &&o.safeFailureCode()==null&&!o.createdAt().isBefore(failure.recordedAt())&&!o.updatedAt().isAfter(at)

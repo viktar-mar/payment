@@ -158,8 +158,9 @@ class OwnedFailedRenewalServiceTest {
     static OwnedFirstRenewal.LaterReady ready(OwnedFirstRenewal.Admission upstream,OwnedFirstRenewal.Step step,UUID previous,UUID boundary,long target) {
         var advance=new OwnedFirstRenewal.Advance(id(20+step.number()),upstream.id(),step,target,previous,boundary,"billing-renewal-advance-v1:"+upstream.id()+":"+step.number(),"e".repeat(64),UTC);
         var operation=new ProviderOperation(id(50+step.number()),upstream.receipt().intent().clock().owner().account(),"acct_owned",upstream.receipt().intent().clock().owner().credentialsRef(),ProviderOperation.Kind.TEST_CLOCK_ADVANCE,advance.id(),advance.operationKey(),advance.fingerprint(),ProviderOperation.Status.ACKNOWLEDGED,"clock_owned",UTC,null,null,null,1);
-        var ack=new OwnedFirstRenewal.Ack(advance,operation,"owner",UTC.plusSeconds(60),new OwnedFirstRenewal.TestClockAck("clock_owned","test_helpers.test_clock",false,"owned",target,"ready",2000,3000,null),UTC);
-        return new OwnedFirstRenewal.LaterReady(id(60+step.number()),upstream.id(),ack,new OwnedFirstRenewal.TestClockReady("clock_owned","test_helpers.test_clock",false,"owned",target,"ready",2000,3000,null),UTC);
+        var name=upstream.receipt().intent().clock().owner().name();
+        var ack=new OwnedFirstRenewal.Ack(advance,operation,"owner",UTC.plusSeconds(60),new OwnedFirstRenewal.TestClockAck("clock_owned","test_helpers.test_clock",false,name,target,"ready",2000,3000,null),UTC);
+        return new OwnedFirstRenewal.LaterReady(id(60+step.number()),upstream.id(),ack,new OwnedFirstRenewal.TestClockReady("clock_owned","test_helpers.test_clock",false,name,target,"ready",2000,3000,null),UTC);
     }
 
     static <T>T port(Class<T> type,BiFunction<String,Object[],Object> f){return type.cast(Proxy.newProxyInstance(type.getClassLoader(),new Class<?>[]{type},(p,m,a)->f.apply(m.getName(),a)));}
