@@ -123,6 +123,14 @@ begin
  perform id from stripe_billing_first_renewals where id=a.id for update nowait;
  perform id from stripe_billing_failed_renewals where id=d.id for update nowait;
  perform admission_id from stripe_billing_failed_renewal_failures where admission_id=d.id for update nowait;
+ -- Pre-acquire the two remaining immediate FK modes before proof returns. A
+ -- FOR UPDATE reader of either immutable reference must not make INSERT wait
+ -- while grace holds canonical lifecycle locks.
+ perform q.id from stripe_billing_failed_renewal_reads q
+  join stripe_billing_failed_renewal_failures f on f.claim_id=q.id and f.admission_id=q.admission_id
+  where f.admission_id=d.id and q.phase='FAILED' for key share of q nowait;
+ perform r.id from stripe_billing_first_renewal_ready r
+  where r.id=d.ready_id and r.admission_id=d.first_renewal_admission for key share of r nowait;
 end $$;
 
 create function require_owned_failed_grace_preparation() returns trigger language plpgsql volatile as $$

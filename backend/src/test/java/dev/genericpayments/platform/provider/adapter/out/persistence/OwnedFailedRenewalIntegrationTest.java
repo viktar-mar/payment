@@ -360,16 +360,38 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         })).isInstanceOf(RuntimeException.class).hasStackTraceContaining("READ COMMITTED");
         assertThat(count("stripe_billing_failed_grace_preparations")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
     }
-    @ParameterizedTest @ValueSource(strings={"stripe_billing_first_renewals","stripe_billing_failed_renewals","stripe_billing_failed_renewal_failures","customers","subscriptions"})
-    void graceRawInsertRefusesCanonicalRowContentionWithoutBlocking(String table) throws Exception {
+    @ParameterizedTest @ValueSource(strings={"stripe_billing_first_renewals","stripe_billing_failed_renewals","stripe_billing_failed_renewal_failures","customers","subscriptions","stripe_billing_failed_renewal_reads","stripe_billing_first_renewal_ready"})
+    void graceRawInsertAndPublicPrepareRefuseExactReferenceContentionBeforeHolderRelease(String table) throws Exception {
         time.usePersisted();var s=setup();var f=fail(s,service(store(),null));var locked=new CountDownLatch(1);var release=new CountDownLatch(1);
-        UUID row=switch(table){case "stripe_billing_first_renewals"->s.upstream().id();case "stripe_billing_failed_renewals","stripe_billing_failed_renewal_failures"->s.admission().id();case "customers"->customer.value();default->current().id();};
+        UUID row=switch(table){case "stripe_billing_first_renewals"->s.upstream().id();case "stripe_billing_failed_renewals","stripe_billing_failed_renewal_failures"->s.admission().id();case "customers"->customer.value();case "stripe_billing_failed_renewal_reads"->f.claimId();case "stripe_billing_first_renewal_ready"->s.admission().ready().id();default->current().id();};
+        if(table.equals("stripe_billing_failed_renewal_reads"))assertThat(jdbc.queryForObject("select phase from stripe_billing_failed_renewal_reads where id=?",String.class,row)).isEqualTo("FAILED");
+        if(table.equals("stripe_billing_first_renewal_ready"))assertThat(row).isEqualTo(s.ready().id());
+        var financial=financialState();var receipts=selectorRows();
         try(var workers=new BoundedWorkers()) {
-            var holder=workers.submit(()->transaction.requiresNew(()->{jdbc.queryForList("select * from "+table+" where "+(table.equals("stripe_billing_failed_renewal_failures")?"admission_id":"id")+"=? for update",row);locked.countDown();awaitRelease(release);return true;}));
-            try{assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();var contender=workers.submit(()->{assertThatThrownBy(()->insertGraceRaw(s,f)).isInstanceOf(RuntimeException.class);return true;});assertThat(contender.get(5,TimeUnit.SECONDS)).isTrue();}
+            var holder=workers.submit(()->transaction.requiresNew(()->{assertThat(jdbc.queryForList("select * from "+table+" where "+(table.equals("stripe_billing_failed_renewal_failures")?"admission_id":"id")+"=? for update",row)).hasSize(1);locked.countDown();awaitRelease(release);return true;}));
+            try {
+                assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
+                for(boolean raw:List.of(true,false)) {
+                    var contender=workers.submit(()->{
+                        assertThatThrownBy(()->{if(raw)insertGraceRaw(s,f);else service(store(),null).prepareGraceLastSecond(s.admission());})
+                            .satisfies(OwnedFailedRenewalIntegrationTest::assertGraceLockUnavailable);
+                        return true;
+                    });
+                    assertThat(contender.get(5,TimeUnit.SECONDS)).isTrue();
+                    assertThat(holder.isDone()).isFalse();assertThat(release.getCount()).isEqualTo(1);
+                    assertThat(count("stripe_billing_failed_grace_preparations")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+                    assertThat(financialState()).isEqualTo(financial);assertThat(selectorRows()).isEqualTo(receipts);
+                }
+            }
             finally{release.countDown();}assertThat(holder.get(10,TimeUnit.SECONDS)).isTrue();
         }
         assertThat(count("stripe_billing_failed_grace_preparations")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+        assertThat(financialState()).isEqualTo(financial);assertThat(selectorRows()).isEqualTo(receipts);
+    }
+    private static void assertGraceLockUnavailable(Throwable error) {
+        Throwable cause=error;while(cause!=null&&!(cause instanceof java.sql.SQLException))cause=cause.getCause();
+        assertThat(cause).as("Expected immediate PostgreSQL NOWAIT refusal while the exact referenced row remains locked").isInstanceOf(java.sql.SQLException.class);
+        assertThat(((java.sql.SQLException)cause).getSQLState()).isEqualTo("55P03");
     }
     private void insertGraceRaw(Setup s,Failure f) {
         insertGraceRaw(s,f,false);
