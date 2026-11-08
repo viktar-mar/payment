@@ -60,6 +60,26 @@
 - [x] Implement exact fixed request with one bounded logical call, budget starts before preflight. No postwrite failed graph reread; only fresh local exact claim/context then atomic ACK. Decline/action/processing/uncertainty never causes fallback or retry. Return committed ACK without a new postcommit rejection. Credential/client work remains caller-side under budget.
 - [x] Root executes selected pure/related regression and compile-only hosted sources; independent task review, fix and commit. Update acceptance doc with actual source evidence/limitations.
 
+### Task 3: Preserve complete backend coverage within the existing CI budget
+
+**Files:** .github/workflows/ci.yml and infrastructure/ci-workflow.test.mjs only; controller owns this plan and report updates.
+
+**Evidence:** Exact-head full CI42482030417 timed out at60min, no completed test failures: 4766 completed cases. OwnedFailedRenewalIntegrationTest alone took1734s,235 cases. Dedicated379 and frontend/infrastructure passed. Both runtime packaging gates were skipped by timeout and remain mandatory.
+
+**Contract:**
+- Keep backend job id, normal Maven verify lifecycle, default Surefire includes, nested-class default exclusion, all existing runtime packaging gates, and60min timeout.
+- Split exactly dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java into new required job backend-owned-failed-renewal, timeout60min; same pinned checkout/node24/java25/Maven cache, Docker tooling checks and fresh local issuer preparation as backend. No job dependencies, conditions, skip/ignore/no-tests flags or secret/provider inputs.
+- Backend invocation exactly: `./mvnw -B -ntp '-Dsurefire.excludes=**/*$*,dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java' verify`.
+- Split invocation exactly: `./mvnw -B -ntp '-Dtest=dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedRenewalIntegrationTest' test` in backend directory. Whole class, no method or tag selection.
+- Official pinned Surefire3.5.6 source confirms surefire.excludes overrides its list and default nested pattern is **/*$*; retain that explicitly. No -Dtest in broad backend so future default-discovered tests remain covered. New job fails if explicit class absent using untouched default failIfNoSpecifiedTests.
+- Extend existing bounded config policy tests to require both complementary exact invocation boundaries and existing job security/cache/tooling/order/bounds for all four jobs. Preserve existing Fake browser checks verbatim. Assert the selected source exists and both runtime packaging gates remain after backend verify. These are configuration boundary checks; actual plugin execution/coverage is hosted-only.
+- No test source, POM, dependency, application, financial, browser or local operational changes. No coverage or timeout weakening.
+
+- [x] Worker writes policy tests only; root executes explicit pure Node test and observes expected missing-partition RED before workflow change.
+- [x] Worker implements minimal workflow partition; root verifies explicit policy tests, diff and source preservation. No local Maven/DB/Docker execution.
+- [x] Independent task spec/quality review and scoped fixes if needed; final focused publication review covers CI delta only, existing financial reviews retained.
+- [ ] Commit/push; wait for both exact-head workflows, including all four Offline CI jobs. Inspect both backend aggregates,235 owned hosted cases, both packaging markers and dedicated379 gate; never infer full success from earlier cancelled receipts.
+
 ### Publication
 
 - [x] Fresh independent whole-change review on most capable model, one consolidated fix wave and scoped rereview as needed; no open important finding.

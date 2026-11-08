@@ -46,7 +46,7 @@ jobs:
         run: node infrastructure/init-local-customer-issuer.mjs
       - name: Verify backend
         working-directory: backend
-        run: ./mvnw -B -ntp verify
+        run: ./mvnw -B -ntp '-Dsurefire.excludes=**/*$*,dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java' verify
       - name: Verify dedicated first-payment runtime packaging without launching it
         run: |
           set -euo pipefail
@@ -91,6 +91,37 @@ jobs:
             exit 1
           fi
           echo 'first_renewal_runtime_packaging_verified_without_launch'
+
+  backend-owned-failed-renewal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: backend/pom.xml
+      - name: Check owned-test container tooling
+        run: |
+          docker version
+          docker compose version
+          docker buildx version
+      - name: Prepare local test issuer
+        run: node infrastructure/init-local-customer-issuer.mjs
+      - name: Verify owned failed-renewal backend
+        working-directory: backend
+        run: ./mvnw -B -ntp '-Dtest=dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedRenewalIntegrationTest' test
 
   frontend:
     runs-on: ubuntu-24.04

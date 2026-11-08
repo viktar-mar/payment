@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFile} from 'node:fs/promises';
+import {readFile, stat} from 'node:fs/promises';
 
 // These are bounded policy/coverage checks. actionlint validates actual YAML and
 // GitHub Actions semantics; these checks do not attempt to implement a YAML parser.
@@ -10,7 +10,18 @@ function jobs(text) {
   return Object.fromEntries([...section.matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:|$(?![\s\S]))/gm)].map(m => [m[1], m[2]]));
 }
 const gates = {
-  backend: ['node infrastructure/init-local-customer-issuer.mjs', './mvnw -B -ntp verify'],
+  backend: [
+    'node infrastructure/init-local-customer-issuer.mjs',
+    "./mvnw -B -ntp '-Dsurefire.excludes=**/*$*,dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java' verify",
+    'sh backend/export-billing-first-payment-runtime.sh backend/target/test-classes',
+    "echo 'first_payment_runtime_packaging_verified_without_launch'",
+    'sh backend/export-billing-first-renewal-runtime.sh backend/target/test-classes',
+    "echo 'first_renewal_runtime_packaging_verified_without_launch'",
+  ],
+  'backend-owned-failed-renewal': [
+    'node infrastructure/init-local-customer-issuer.mjs',
+    "./mvnw -B -ntp '-Dtest=dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedRenewalIntegrationTest' test",
+  ],
   frontend: [
     'pnpm --dir frontend install --frozen-lockfile',
     'pnpm --dir frontend/sdk test --run', 'pnpm --dir frontend/sdk typecheck', 'pnpm --dir frontend/sdk build',
@@ -39,19 +50,49 @@ test('CI admits untrusted PRs with read-only credentials and bounded cancellable
   assert.equal([...text.matchAll(/^\s*permissions:/gm)].length, 1, 'jobs cannot escalate workflow permissions');
   assert.match(text, /group:.*github.workflow.*github.ref/);
   assert.match(text, /cancel-in-progress: true/);
-  assert.doesNotMatch(text, /pull_request_target|paths(?:-ignore)?:|secrets\.|\bif:|continue-on-error|\b(?:deploy|publish|upload-artifact)\b|PAYMENT_STRIPE_SANDBOX_|printenv|\benv\s*$/im);
+  assert.doesNotMatch(text, /pull_request_target|paths(?:-ignore)?:|secrets\.|\bif:|\bneeds:|continue-on-error|\b(?:deploy|publish|upload-artifact)\b|PAYMENT_STRIPE_SANDBOX_|printenv|\benv\s*$/im);
   // The only env file admitted is an explicitly empty, privately owned file.
   assert.deepEqual([...text.matchAll(/--env-file[^\n]*/g)].map(m => m[0]), ["--env-file', env.PAYMENT_FAKE_CI_EMPTY_ENV,"]);
   const blocks = jobs(text);
-  assert.deepEqual(Object.keys(blocks).sort(), ['backend', 'frontend', 'infrastructure']);
+  assert.deepEqual(Object.keys(blocks).sort(), ['backend', 'backend-owned-failed-renewal', 'frontend', 'infrastructure']);
   for (const [job, block] of Object.entries(blocks)) {
     assert.match(block, /runs-on: ubuntu-24\.04/);
-    assert.match(block, new RegExp(`timeout-minutes: ${{backend: 60, frontend: 45, infrastructure: 30}[job]}\\b`));
+    assert.match(block, new RegExp(`timeout-minutes: ${{backend: 60, 'backend-owned-failed-renewal': 60, frontend: 45, infrastructure: 30}[job]}\\b`));
     assert.match(block, /persist-credentials: false/);
     assert.match(block, /node-version: ['"]24['"]/);
     assert.match(block, /working-directory: \./);
+    assert.match(block, /uses: actions\/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd\b/);
+    assert.match(block, /uses: actions\/setup-node@a0853c24544627f65ddf259abe73b1d18a591444\b/);
     for (const action of block.matchAll(/uses: (\S+)/g)) assert.match(action[1], /^(?:actions\/(?:checkout|setup-node|setup-java)|pnpm\/action-setup)@[a-f0-9]{40}$/);
   }
+});
+
+// The emitted Maven invocations are our coverage boundary. Removing either
+// partition, widening its selection, losing the default nested-class exclusion,
+// or bypassing an absent explicit class must fail this configuration policy.
+// Actual Surefire discovery and execution remain hosted-only verification.
+test('backend partitions preserve default discovery and require the whole owned failed-renewal class', async () => {
+  const blocks = jobs(await readWorkflow());
+  const expected = {
+    backend: "./mvnw -B -ntp '-Dsurefire.excludes=**/*$*,dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java' verify",
+    'backend-owned-failed-renewal': "./mvnw -B -ntp '-Dtest=dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedRenewalIntegrationTest' test",
+  };
+  for (const [job, command] of Object.entries(expected)) {
+    const block = blocks[job];
+    assert.ok(block, `missing ${job} job`);
+    assert.deepEqual([...block.matchAll(/^\s+run: (\.\/mvnw[^\n]*)$/gm)].map(match => match[1]), [command], `${job}: exact complementary Maven invocation required`);
+    assert.equal([...block.matchAll(/\.\/mvnw\b/g)].length, 1, `${job}: no additional Maven invocation`);
+    assert.ok(block.includes(`working-directory: backend\n        run: ${command}`), `${job}: run Maven in backend`);
+    assert.doesNotMatch(block, /^\s+(?:env|needs):|-D[^\s'"]*(?:skip|ignore|failIfNo(?:Specified)?Tests)|PAYMENT_STRIPE|secrets\./im);
+    assert.match(block, /uses: actions\/setup-java@dded0888837ed1f317902acf8a20df0ad188d165\b/);
+    assert.match(block, /distribution: temurin/);
+    assert.match(block, /java-version: ['"]25['"]/);
+    assert.match(block, /cache: maven\n\s+cache-dependency-path: backend\/pom.xml/);
+    assert.match(block, /package-manager-cache: false/);
+    assert.equal([...block.matchAll(/run: node infrastructure\/init-local-customer-issuer\.mjs$/gm)].length, 1, `${job}: fresh local issuer preparation required`);
+  }
+  assert.doesNotMatch(blocks.backend, /-Dtest=|-(?:P|D)(?:groups|excludedGroups|surefire\.includes)/);
+  assert.ok((await stat(new URL('../backend/src/test/java/dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java', import.meta.url))).isFile(), 'explicitly selected owned failed-renewal source must exist');
 });
 
 // Dropping the owned launcher, using production java -jar, widening the test
@@ -129,15 +170,17 @@ test('each CI job runs its required gates in dependency order with frozen caches
     assert.match(block, /docker version/);
     assert.match(block, /docker compose version/);
     assert.match(block, /docker buildx version/);
-    if (job !== 'backend') {
+    if (job === 'frontend' || job === 'infrastructure') {
       assert.ok(block.indexOf('pnpm/action-setup@') < block.indexOf('cache: pnpm'));
       assert.match(block, /version: ['"]11\.1\.3['"]/);
       assert.match(block, /cache-dependency-path: \|\n\s+frontend\/pnpm-lock.yaml\n\s+examples\/demo-site\/pnpm-lock.yaml/);
     }
   }
-  assert.match(blocks.backend, /java-version: ['"]25['"]/);
-  assert.match(blocks.backend, /cache: maven\n\s+cache-dependency-path: backend\/pom.xml/);
-  assert.match(blocks.backend, /working-directory: backend/);
+  for (const job of ['backend', 'backend-owned-failed-renewal']) {
+    assert.match(blocks[job], /java-version: ['"]25['"]/);
+    assert.match(blocks[job], /cache: maven\n\s+cache-dependency-path: backend\/pom.xml/);
+    assert.match(blocks[job], /working-directory: backend/);
+  }
   assert.match(blocks.frontend, /NEXT_TELEMETRY_DISABLED: ['"]1['"]/);
   for (const command of [...(await readWorkflow()).matchAll(/^\s+(?:run: )?(pnpm .*install[^\n]*)/gm)]) {
     if (!command[1].includes('playwright install')) assert.match(command[1], /--frozen-lockfile/);
