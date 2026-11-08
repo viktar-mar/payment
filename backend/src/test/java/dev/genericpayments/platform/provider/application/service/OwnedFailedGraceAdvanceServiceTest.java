@@ -117,10 +117,25 @@ class OwnedFailedGraceAdvanceServiceTest {
             var f=new OwnedFailedGraceAdvanceInertFixture();var claim=f.claim();var originalAck=phase.equals("ready")?f.acknowledge(claim):null;
             f.afterCommit=()->{throw new IllegalStateException("synthetic ambiguous committed return");};
             assertThatThrownBy(()->{if(originalAck==null)f.acknowledge(claim);else f.service.recordReady(f.context,originalAck,f.ready(),f.now(),f.budget);}).hasMessage("synthetic ambiguous committed return");
-            f.afterCommit=()->{};var committed=f.store.snapshot();assertThat(f.ack()).isNotNull();assertThat(f.row().status()).isEqualTo(Status.ACKNOWLEDGED);
-            // With no returned ACK, cleanup conservatively preserves consumed evidence; it never creates READY.
-            f.service.uncertain(f.context,claim,null,f.budget);assertThat(f.store.snapshot()).isEqualTo(committed);
-            assertThatThrownBy(f::claim).isInstanceOf(RuntimeException.class);if(phase.equals("ready"))assertThat(f.savedReady()).isNotNull();else assertThat(f.savedReady()).isNull();
+            f.afterCommit=()->{};var committed=f.store.snapshot();var committedAck=f.ack();var financial=f.financialState();assertThat(committedAck).isNotNull();assertThat(f.row().status()).isEqualTo(Status.ACKNOWLEDGED);
+            // Exact readable claim without the original invocation remains insufficient, even after ambiguous return.
+            f.service.uncertain(f.context,claim,null,f.newBudget());assertThat(f.store.snapshot()).isEqualTo(committed);
+            f.trace().clear();f.store.calls.clear();f.nanos=31_000_000_000L;f.h.foreign=true;
+            // A missing return envelope cannot strand the original owner. Cleanup authenticates saved ACK identity only.
+            f.service.uncertain(f.context,claim,null,f.budget);
+            assertThat(f.ack()).isEqualTo(committedAck);assertThat(f.row()).isEqualTo(committedAck.operation());assertThat(f.financialState()).isEqualTo(financial);
+            assertThat(f.trace()).containsExactly("begin","grace-cleanup","commit");assertThat(f.store.calls).containsExactly("cleanup");
+            assertThat(f.stops()).isEqualTo(phase.equals("ack")?1:0);
+            assertThatThrownBy(f::claim).isInstanceOf(RuntimeException.class);if(phase.equals("ready")){assertThat(f.savedReady()).isNotNull();assertThat(f.store.snapshot()).isEqualTo(committed);}else assertThat(f.savedReady()).isNull();
+        }
+    }
+    @Test void originalCleanupSurvivesApplicationUtcRollbackBeforeClaimOrCommittedAck(){
+        for(boolean acknowledged:List.of(false,true)){
+            var f=new OwnedFailedGraceAdvanceInertFixture();var claim=f.claim();var ack=acknowledged?f.acknowledge(claim):null;var financial=f.financialState();
+            f.at(claim.firstDispatchedAt().minusSeconds(1));f.nanos=31_000_000_000L;f.h.foreign=true;f.trace().clear();f.store.calls.clear();
+            f.service.uncertain(f.context,claim,ack,f.budget);
+            assertThat(f.row().status()).isEqualTo(acknowledged?Status.ACKNOWLEDGED:Status.UNKNOWN);assertThat(f.ack()).isEqualTo(ack);assertThat(f.stops()).isEqualTo(1);
+            assertThat(f.trace()).containsExactly("begin","grace-cleanup","commit");assertThat(f.store.calls).containsExactly("cleanup");assertThat(f.financialState()).isEqualTo(financial);
         }
     }
     @Test void rawNanosecondsAreNotRoundedIntoRenewedInvocationIdentity(){

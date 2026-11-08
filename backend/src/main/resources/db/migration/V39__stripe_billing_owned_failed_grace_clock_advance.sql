@@ -338,15 +338,19 @@ begin
  then raise exception 'Invalid terminal failed renewal receipt' using errcode='23514';end if;return new;
 end $$;
 
--- Atomicity/provenance checks never resample the positive clock after a valid precommit write.
+-- Deferred atomicity/provenance is also the final database positive deadline/current-proof gate.
+-- Only receipts actually written by this xid are positive work; later original cleanup stays valid
+-- after deadline/authority drift. A committed READY's delayed return does not run this gate again.
 create function check_owned_failed_grace_committed() returns trigger language plpgsql volatile as $$
-declare selected uuid; step provider_operations%rowtype; q stripe_billing_failed_grace_claims%rowtype; ack stripe_billing_failed_grace_acks%rowtype;
+declare selected uuid; step provider_operations%rowtype; q stripe_billing_failed_grace_claims%rowtype;
+ ack stripe_billing_failed_grace_acks%rowtype; ready stripe_billing_failed_grace_ready%rowtype; positive boolean; db_at timestamptz;
 begin
  if tg_table_name='provider_operations' then if new.kind<>'OWNED_GRACE_CLOCK_ADVANCE' then return null;end if;selected:=new.id;
  else selected:=new.operation_id;end if;
  select * into step from provider_operations where id=selected;
  select * into q from stripe_billing_failed_grace_claims where operation_id=selected;
  select * into ack from stripe_billing_failed_grace_acks where operation_id=selected;
+ select * into ready from stripe_billing_failed_grace_ready where operation_id=selected;
  if step.id is null or q.preparation_id is null or not owned_failed_grace_owns(q.preparation_id,step)
  then raise exception 'Missing committed original grace claim' using errcode='23514';end if;
  if q.recorded_transaction=pg_current_xact_id() then
@@ -365,6 +369,18 @@ begin
  if tg_table_name='stripe_billing_failed_grace_ready' then
   if not exists(select 1 from stripe_billing_failed_grace_acks a where a.preparation_id=q.preparation_id and a.recorded_transaction<>new.recorded_transaction) then
    raise exception 'Independent grace ACK commit required before READY' using errcode='23514';end if;
+ end if;
+ positive:=q.recorded_transaction=pg_current_xact_id()
+  or coalesce(ack.recorded_transaction=pg_current_xact_id(),false)
+  or coalesce(ready.recorded_transaction=pg_current_xact_id(),false);
+ if positive then
+  -- Separate fresh volatile proof sees mutations made by the writing transaction after its
+  -- initial INSERT/callback. Read the deadline clock after that proof, not before its work.
+  if not owned_failed_grace_current((select admission_id from stripe_billing_failed_grace_preparations where id=q.preparation_id)) then
+   raise exception 'Owned grace positive authority changed before commit' using errcode='23514';end if;
+  db_at:=clock_timestamp();
+  if db_at>=q.deadline_at or db_at>=q.deadline then
+   raise exception 'Original owned grace positive deadline expired before commit' using errcode='23514';end if;
  end if;
  return null;
 end $$;

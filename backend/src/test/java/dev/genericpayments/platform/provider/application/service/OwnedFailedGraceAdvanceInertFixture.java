@@ -91,7 +91,8 @@ public final class OwnedFailedGraceAdvanceInertFixture {
         public void uncertainInTransaction(PreparationContext c,ProviderOperation supplied,AdvanceAck suppliedAck,InvocationBudget b,Instant now){
             boundary("cleanup");if(row==null||original!=b||claimTransaction==transactionId||committedTransaction<claimTransaction||ready!=null||!row.id().equals(supplied.id())||!c.equals(context))return;
             if(ack==null){if(!row.equals(supplied)||row.status()!=ProviderOperation.Status.DISPATCHING||suppliedAck!=null)return;row=copy(row,ProviderOperation.Status.UNKNOWN,2,null,null,null);}
-            else if(!ack.equals(suppliedAck)||!ack.operation().equals(row))return;
+            else if(suppliedAck!=null&&!ack.equals(suppliedAck)||!ack.operation().equals(row)||ackTransaction==transactionId||committedTransaction<ackTransaction
+                    ||!ack.invocation().equals(b.invocation())||!ack.claimant().equals(supplied.leaseOwner())||!ack.deadline().equals(supplied.leaseExpiresAt())||!ack.operation().firstDispatchedAt().equals(supplied.firstDispatchedAt()))return;
             if(stops==0){stops++;writes++;}afterEffect.run();
         }
     }

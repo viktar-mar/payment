@@ -82,10 +82,16 @@ public final class JdbcOwnedFailedGraceAdvanceStore implements OwnedFailedGraceA
             if(!current.equals(originalClaim)||suppliedAck!=null)return;
             var rows=jdbc.query("update provider_operations set status='UNKNOWN',lease_owner=null,lease_expires_at=null,version=2 where id=? and status='DISPATCHING' and version=1 returning *",this::row,current.id());if(rows.size()!=1)throw denied();
         }else if(current.status()==Status.ACKNOWLEDGED){
-            // An ambiguous return with no caller ACK preserves consumed evidence conservatively.
-            if(suppliedAck==null||!ack(c,current).equals(suppliedAck))return;
+            // Only the exact original committed invocation may consume saved ACK identity after
+            // an ambiguous return. This never grants positive inspection or polling authority.
+            var saved=ack(c,current);
+            if(!saved.invocation().equals(b.invocation())||!saved.claimant().equals(originalClaim.leaseOwner())||!saved.deadline().equals(originalClaim.leaseExpiresAt())
+                    ||suppliedAck!=null&&!saved.equals(suppliedAck))return;
+            if(!Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from stripe_billing_failed_grace_acks where preparation_id=? and operation_id=? and invocation=? and recorded_transaction<>pg_current_xact_id())",Boolean.class,c.preparation().id(),current.id(),b.invocation())))return;
         }else return;
-        var at=micro(now);
+        // Application UTC may have rolled backwards. Choose one actual database instant only
+        // after locking and authenticating the original identity, and reuse it for both inserts.
+        var at=micro(jdbc.queryForObject("select clock_timestamp()",Timestamp.class).toInstant());
         jdbc.update("insert into stripe_billing_failed_grace_cleanup(preparation_id,operation_id,invocation,stopped_at) values(?,?,?,?)",c.preparation().id(),originalClaim.id(),b.invocation(),stamp(at));
         jdbc.update("insert into stripe_billing_failed_renewal_stops(admission_id,reason,stopped_at) values(?,'UNCERTAIN',?)",c.admission().id(),stamp(at));
     }
