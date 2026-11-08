@@ -47,6 +47,10 @@ public interface OwnedFailedRenewalMethodStore {
     Completion requireCompletionInTransaction(Reservation r,Completion expected);
     Recovery associateRecoveryInTransaction(Reservation r,Completion c,SubscriptionOperation recover,Instant now);
     Recovery requireRecoveryInTransaction(Reservation r,Recovery expected);
+    /** Negative financial gate only; public descriptive reads retain their existing semantics. */
+    default void requireUnobservedRecoveryInTransaction(Reservation r,Recovery expected){throw browserDenied();}
+    /** Immutable cleanup identity only, independent of current session/account/debt authority. */
+    default void requireRecoveryConfirmationIdentityInTransaction(RecoveryPreparationContext expected){throw browserDenied();}
     RecoveredReadContext requireRecoveredContextInTransaction(Reservation r,ReadClaim q);
     Publication recordPublicationInTransaction(Reservation r,ReadClaim q,Instant now);
     Optional<Publication> publicationInTransaction(Reservation r);

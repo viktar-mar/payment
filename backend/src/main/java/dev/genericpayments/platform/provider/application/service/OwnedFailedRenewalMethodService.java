@@ -248,10 +248,44 @@ public final class OwnedFailedRenewalMethodService {
     /** Fresh original management authority and unchanged open debt; no claim, provider call or stop. */
     public RecoveryPreparationContext inspectBrowserRecoveryPreparation(Reservation reservation,Completion completion,Recovery recovery,SubscriptionCommandContext originalContext){
         fresh();Objects.requireNonNull(reservation);Objects.requireNonNull(completion);Objects.requireNonNull(recovery);
+        validateRecoveryOwner(reservation,originalContext);
+        return transaction.requiresNew(()->inspectRecoveryInTransaction(reservation,completion,recovery,originalContext,null,null));
+    }
+    private void validateRecoveryOwner(Reservation reservation,SubscriptionCommandContext originalContext){
+        validateContext(originalContext);customer(originalContext,clock.instant());
+        var owner=reservation.admission().firstRenewalAdmission().receipt().intent().clock().owner();
+        if(!owner.site().equals(originalContext.siteId())||!owner.customer().equals(originalContext.customerId()))throw unavailable();
+    }
+    /** Joins the confirmation caller's transaction. Only authenticated canonical operations select its receipt lock. */
+    <T>T withRecoveryConfirmationInTransaction(RecoveryPreparationContext expected,SubscriptionCommandContext originalContext,
+            java.util.function.Consumer<RecoveryPreparationContext> receiptLock,Function<RecoveryPreparationContext,T> effect){
+        if(!transaction.active()||expected==null)throw unavailable();validateRecoveryOwner(expected.reservation(),originalContext);
+        var current=inspectRecoveryInTransaction(expected.reservation(),expected.completion(),expected.recovery(),originalContext,expected,receiptLock);
+        if(!expected.equals(current))throw unavailable();
+        store.requireUnobservedRecoveryInTransaction(current.reservation(),current.recovery());
+        var result=effect.apply(current);
+        // The final database gate may wait. Original authority and raw exclusive expiry follow it.
+        store.requireUnobservedRecoveryInTransaction(current.reservation(),current.recovery());
+        var finalCurrent=inspectRecoveryInTransaction(expected.reservation(),expected.completion(),expected.recovery(),originalContext,null,null);
+        if(!expected.equals(finalCurrent))throw unavailable();return result;
+    }
+    String recoveryConfirmFingerprint(RecoveryPreparationContext context){return OwnedRecoveryConfirmService.fingerprint(context,digest);}
+    /** Cleanup authenticates immutable stored lineage and canonical operations; it grants no browser/financial authority. */
+    void consumeRecoveryConfirmationInTransaction(RecoveryPreparationContext expected,Supplier<Boolean> consume){
+        if(!transaction.active()||expected==null)throw unavailable();var r=expected.reservation();
+        store.requireRecoveryConfirmationIdentityInTransaction(expected);
+        var owner=r.admission().firstRenewalAdmission().receipt().intent().clock().owner();
+        var ids=new TreeSet<UUID>();ids.add(r.setupOperationId());ids.add(expected.recovery().association().operationId());
+        ids.add(r.admission().firstRenewalAdmission().receipt().intent().createOperation());
+        for(var id:ids){var op=operations.lock(id);if(op==null||!op.siteId().equals(owner.site())||!op.customerId().equals(owner.customer())
+                ||!op.subscriptionId().equals(expected.subscription().id()))throw unavailable();}
+        if(consume.get())failed.stopInTransaction(r.admission(),OwnedFailedRenewal.Reason.UNCERTAIN,clock.instant());
+    }
+    private RecoveryPreparationContext inspectRecoveryInTransaction(Reservation reservation,Completion completion,Recovery recovery,
+            SubscriptionCommandContext originalContext,RecoveryPreparationContext expected,java.util.function.Consumer<RecoveryPreparationContext> receiptLock){
         validateContext(originalContext);var originalSession=customer(originalContext,clock.instant());
         var owner=reservation.admission().firstRenewalAdmission().receipt().intent().clock().owner();
         if(!owner.site().equals(originalContext.siteId())||!owner.customer().equals(originalContext.customerId()))throw unavailable();
-        return transaction.requiresNew(()->{
             // Bind immutable stored locators read-only before they can enter global operation/session locks.
             if(!reservation.equals(store.requireReservationInTransaction(reservation)))throw unavailable();
             var originalEnrollment=store.requireBrowserRecoveryIdentityInTransaction(reservation,originalSession);
@@ -259,7 +293,19 @@ public final class OwnedFailedRenewalMethodService {
                     ||!originalEnrollment.origin().equals(originalSession.origin())
                     ||!originalEnrollment.sessionExpiresAt().equals(originalSession.expiresAt()))throw unavailable();
             // The legitimate RESERVED RECOVER is discovered by the scoped unresolved query, in canonical order.
-            var state=current(reservation,originalContext,null);
+            if(expected!=null&&(!expected.reservation().equals(reservation)||!expected.enrollment().equals(originalEnrollment)
+                    ||!expected.completion().equals(completion)||!expected.recovery().equals(recovery)||!expected.binding().equals(reservation.binding())
+                    ||!expected.billingSample().equals(reservation.billingSample())||!expected.account().id().equals(owner.account())
+                    ||!expected.account().externalAccountId().equals(owner.externalAccount())||!expected.account().credentialsRef().equals(owner.credentialsRef())
+                    ||!expected.subscription().id().equals(reservation.admission().firstRenewalAdmission().receipt().intent().subscription())))throw unavailable();
+            if(!completion.equals(store.requireCompletionInTransaction(reservation,completion))||!recovery.equals(store.requireRecoveryInTransaction(reservation,recovery)))throw unavailable();
+            var state=current(reservation,originalContext,null,expected==null?null:locked->{
+                if(!locked.contains(expected.setupOperation())||!locked.contains(expected.recoveryOperation())
+                        ||!expected.recoveryOperation().id().equals(recovery.association().operationId())
+                        ||!expected.setupOperation().id().equals(reservation.setupOperationId()))throw unavailable();
+                store.requireUnobservedRecoveryInTransaction(reservation,recovery);
+                receiptLock.accept(expected);
+            });
             var failure=reservation.failure();var admission=reservation.admission();var upstream=admission.firstRenewalAdmission();
             requireDebt(state,failure,1);
             if(!completion.equals(store.requireCompletionInTransaction(reservation,completion))
@@ -298,7 +344,6 @@ public final class OwnedFailedRenewalMethodService {
             if(!originalEnrollment.equals(enrollment)||!enrollment.sessionId().equals(session.sessionId().value())||!enrollment.origin().equals(session.origin())
                     ||!enrollment.sessionExpiresAt().equals(session.expiresAt()))throw unavailable();
             return new RecoveryPreparationContext(reservation,enrollment,state.account(),state.subscription(),setup,recover,state.binding(),completion,recovery,state.sample());
-        });
     }
     public ReadClaim beginRecoveredRead(Reservation reservation,Recovery recovery,UUID invocation){
         return guarded(reservation.admission(),()->transaction.requiresNew(()->{
@@ -340,17 +385,26 @@ public final class OwnedFailedRenewalMethodService {
     private record Locked(PaymentAccount account,Subscription subscription,List<SubscriptionOperation> operations,List<BillingRecord> bills,
         StripeBillingBindingPort.CustomerBinding binding,Fence fence,SubscriptionBillingTimePort.Sample sample,Instant utcAt){}
     private Locked current(Reservation reservation,SubscriptionCommandContext context,UUID recovery){
+        return current(reservation,context,recovery,null);
+    }
+    private Locked current(Reservation reservation,SubscriptionCommandContext context,UUID recovery,java.util.function.Consumer<List<SubscriptionOperation>> afterOperations){
         var ids=new HashSet<UUID>();ids.add(reservation.setupOperationId());if(recovery!=null)ids.add(recovery);
-        var state=lock(reservation.admission(),reservation.failure(),ids,context);
+        var state=lock(reservation.admission(),reservation.failure(),ids,context,afterOperations);
         if(!reservation.equals(store.requireReservationInTransaction(reservation))||!reservation.binding().equals(state.binding())||!reservation.billingSample().equals(state.sample()))throw unavailable();return state;
     }
     private Locked lock(OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.Failure failure,Set<UUID> selected,SubscriptionCommandContext context){
+        return lock(admission,failure,selected,context,null);
+    }
+    private Locked lock(OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.Failure failure,Set<UUID> selected,SubscriptionCommandContext context,
+            java.util.function.Consumer<List<SubscriptionOperation>> afterOperations){
         var upstream=admission.firstRenewalAdmission();var intent=upstream.receipt().intent();var owner=intent.clock().owner();
         var candidate=subscriptions.findOwned(owner.account(),intent.subscription()).orElseThrow(OwnedFailedRenewalMethodService::unavailable);
         if(!candidate.siteId().equals(owner.site())||!candidate.customerId().equals(owner.customer())||!candidate.id().equals(intent.subscription())||!candidate.paymentAccountId().equals(owner.account()))throw unavailable();
         var ids=new TreeSet<UUID>(selected);ids.add(intent.createOperation());operations.unresolved(owner.site(),candidate.id()).forEach(o->ids.add(o.id()));
         trials.find(owner.site(),owner.customer(),candidate.productId()).filter(t->t.consumedAt()==null&&t.reservedByOperation()!=null).ifPresent(t->ids.add(t.reservedByOperation()));
         var locked=new ArrayList<SubscriptionOperation>();for(var id:ids)locked.add(operations.lock(id));
+        for(var o:locked)if(o==null||!o.siteId().equals(owner.site())||!o.customerId().equals(owner.customer())||!intent.subscription().equals(o.subscriptionId()))throw unavailable();
+        if(afterOperations!=null)afterOperations.accept(List.copyOf(locked));
         if(context!=null){if(!owner.site().equals(context.siteId())||!owner.customer().equals(context.customerId()))throw unavailable();authority.revalidate(context,true);}
         lifecycle.lockActive(owner.site(),owner.customer());
         var account=accounts.findByIdForUpdate(owner.account()).orElseThrow(OwnedFailedRenewalMethodService::unavailable);var s=subscriptions.lock(owner.site(),intent.subscription());

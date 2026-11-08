@@ -284,6 +284,25 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         requireReadInTransaction(r,q);if(q.phase()!=Phase.RECOVERED)throw unavailable();
         return new RecoveredReadContext(account(r),subscription(r),r.binding(),operation(r,q.fence().operationId()),completion(r),recovery(r),q.billingSample());
     }
+    @Override public void requireUnobservedRecoveryInTransaction(Reservation r,Recovery expected){
+        requireRecoveryInTransaction(r,expected);
+        require("select not exists(select 1 from stripe_billing_failed_method_reads where reservation_id=? and phase='RECOVERED') and not exists(select 1 from stripe_billing_failed_method_publications where reservation_id=?)",r.id(),r.id());
+    }
+    @Override public void requireRecoveryConfirmationIdentityInTransaction(RecoveryPreparationContext expected){
+        if(expected==null)throw unavailable();var r=expected.reservation();requireReservationInTransaction(r);
+        if(!completion(r).equals(expected.completion())||!recovery(r).equals(expected.recovery())||!r.binding().equals(expected.binding()))throw unavailable();
+        require("""
+            select exists(select 1 from stripe_billing_failed_method_reservations r
+            join stripe_billing_failed_renewals d on d.id=r.admission_id
+            where r.id=? and d.payment_account_id=? and d.site_id=? and d.customer_id=? and d.subscription_id=?
+              and r.browser_session_id=? and r.browser_origin=? and r.browser_session_expires_at=?
+              and owned_recovery_confirm_identity(r.id))
+            """,r.id(),expected.account().id().value(),expected.subscription().siteId().value(),expected.subscription().customerId().value(),expected.subscription().id(),
+            expected.enrollment().sessionId(),expected.enrollment().origin(),time(expected.enrollment().sessionExpiresAt()));
+        var owner=r.admission().firstRenewalAdmission().receipt().intent().clock().owner();
+        if(!expected.account().id().equals(owner.account())||!expected.account().externalAccountId().equals(owner.externalAccount())
+                ||!expected.account().credentialsRef().equals(owner.credentialsRef()))throw unavailable();
+    }
     @Override public Publication recordPublicationInTransaction(Reservation r,ReadClaim q,Instant now) {
         requireReservationInTransaction(r);storedRead(r,q);liveWindow(q);
         if(q.phase()!=Phase.RECOVERED)throw unavailable();q.requireAccepted(now,now);

@@ -162,7 +162,7 @@ class OwnedFailedRenewalMethodServiceTest {
         // Recovery-only controls do not relax older SETUP/METHOD fixtures.
         boolean recoveryPreparationEnabled,recoveryEnrollmentDenied;
         OwnedMethodBrowser.Enrollment returnedRecoveryEnrollment;
-        Runnable afterRecoveryIdentity=()->{},afterRecoveryEnrollment=()->{},afterAuthority=()->{};
+        Runnable afterRecoveryIdentity=()->{},afterRecoveryEnrollment=()->{},afterAuthority=()->{},afterUnobservedRecovery=()->{};
         final Map<String,ProviderOperation> providerSteps=new LinkedHashMap<>();
         Harness(){this(false);}
         Harness(boolean customerActor){this(customerActor,"alias");}
@@ -170,6 +170,9 @@ class OwnedFailedRenewalMethodServiceTest {
             this(customerActor,credentialsRef,UTC.plusSeconds(600));
         }
         Harness(boolean customerActor,String credentialsRef,Instant sessionExpiry){
+            this(customerActor,credentialsRef,sessionExpiry,value->"digest:"+value);
+        }
+        Harness(boolean customerActor,String credentialsRef,Instant sessionExpiry,dev.genericpayments.platform.shared.application.port.out.DigestPort authenticationDigest){
             b=new OwnedFailedRenewalServiceTest.Harness(true,credentialsRef);
             b.fail();b.trace.clear();
             SubscriptionActor actor=customerActor?new SubscriptionActor.Customer(new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(new dev.genericpayments.platform.customers.domain.CustomerSessionId(UUID.randomUUID()),b.owner.site(),b.owner.customer(),"https://test.example",Set.of(dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_MANAGE),sessionExpiry)):new SubscriptionActor.Admin(new dev.genericpayments.platform.admin.application.port.in.AuthenticatedAdmin(new dev.genericpayments.platform.admin.domain.AdminUserId(UUID.randomUUID()),"admin",new dev.genericpayments.platform.admin.domain.AdminSessionId(UUID.randomUUID()),UTC.plusSeconds(600)));
@@ -248,6 +251,18 @@ class OwnedFailedRenewalMethodServiceTest {
                 case "requireCompletionInTransaction"->{same((Reservation)a[0]);if(completion==null||!completion.equals(a[1]))throw new IllegalStateException("completion unavailable");yield completion;}
                 case "associateRecoveryInTransaction"->{if(!Objects.equals(completion,a[1]))throw new IllegalStateException("completion unavailable");var o=(SubscriptionOperation)a[2];recovery=new Recovery(reservation.id(),new OwnedFailedRenewal.Recovery(b.admission.id(),o.id(),b.failure.billId(),b.failure.allocation(),b.failure.paymentIntent(),b.failure.revision(),0,b.utc),b.sequence);yield recovery;}
                 case "requireRecoveryInTransaction"->{if(recovery==null||!recovery.equals(a[1]))throw new IllegalStateException("recovery unavailable");yield recovery;}
+                case "requireUnobservedRecoveryInTransaction"->{
+                    same((Reservation)a[0]);b.trace.add("recovery-unobserved");
+                    if(recovery==null||!recovery.equals(a[1])||claims.containsKey(Phase.RECOVERED)||publication!=null)throw new IllegalStateException("recovery already observed");
+                    afterUnobservedRecovery.run();
+                    yield null;
+                }
+                case "requireRecoveryConfirmationIdentityInTransaction"->{
+                    var expected=(RecoveryPreparationContext)a[0];same(expected.reservation());b.trace.add("recovery-confirm-identity");
+                    if(!Objects.equals(expected.completion(),completion)||!Objects.equals(expected.recovery(),recovery)
+                            ||!Objects.equals(expected.enrollment(),enrollment)||!expected.binding().equals(reservation.binding()))throw new IllegalStateException("recovery identity unavailable");
+                    yield null;
+                }
                 case "requireMethodFactInTransaction","requireRecoveryFactInTransaction"->{var c=(dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Command)a[0];var phase=m.equals("requireMethodFactInTransaction")?Phase.METHOD:Phase.RECOVERED;var q=claims.get(phase);read(q);assertThat(c.factKey()).isEqualTo(OwnedFailedRenewalMethod.factKey(q));assertThat(c.fence()).isEqualTo(q.fence());
                     if(phase==Phase.RECOVERED){assertThat(c.snapshot().paymentMethodReady()).isFalse();assertThat(c.snapshot().operationKey()).isEqualTo(b.ops.get(recovery.association().operationId()).providerOperationKey());assertThat(c.snapshot().operationObservation()).isEqualTo(new OperationObservation(c.snapshot().operationKey(),OperationState.APPLIED));}yield null;}
                 case "recordPublicationInTransaction"->{b.trace.add("publication");if(failReceipt)throw new IllegalStateException("receipt failed");assertThat(b.s.debt()).isNull();publication=new Publication(reservation.id(),new OwnedFailedRenewal.Publication(b.admission.id(),((ReadClaim)a[1]).id(),recovery.association().operationId(),b.failure.billId(),UUID.randomUUID(),b.s.revision(),b.utc),b.sequence);yield publication;}
@@ -266,7 +281,7 @@ class OwnedFailedRenewalMethodServiceTest {
                 if(enforceSessionExpiry&&((SubscriptionCommandContext)a[0]).actor() instanceof SubscriptionActor.Customer customer
                         &&!b.utc.isBefore(customer.session().expiresAt()))throw new IllegalStateException("authority expired");
                 return null;
-            }),value->"digest:"+value);
+            }),authenticationDigest);
         }
         Reservation reserve(){return service.reserveMethod(b.admission,context,true);}
         void requireUnbound(CustomerSessionContext supplied,Instant now){

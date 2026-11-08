@@ -24,6 +24,7 @@ class OwnedSubscriptionLockOrderTest {
             case "claim","ack"->List.of("provider locator","provider lock","sites","customers","payment_accounts");
             default->List.of("sites","customers","payment_accounts");
         });
+        assertThat(jdbc.guardedProviderLocks).isEqualTo(entry.equals("claim")||entry.equals("ack")?1:0);
     }
 
     @ParameterizedTest @ValueSource(strings={"admit","current","receipt","reserve","claim","ack"})
@@ -35,6 +36,7 @@ class OwnedSubscriptionLockOrderTest {
             case "claim","ack"->List.of("provider locator","provider lock","sites");
             default->List.of("sites");
         });
+        assertThat(jdbc.guardedProviderLocks).isEqualTo(entry.equals("claim")||entry.equals("ack")?1:0);
     }
 
     private void invoke(String entry,RecordingJdbc jdbc) {
@@ -55,6 +57,7 @@ class OwnedSubscriptionLockOrderTest {
         final StripeBillingOwnedSubscriptionFixture f=new StripeBillingOwnedSubscriptionFixture();
         final List<String> locks=new ArrayList<>();
         final List<String> calls=new ArrayList<>();
+        int guardedProviderLocks;
         final RuntimeException complete=new IllegalStateException("owner locks observed");
         final boolean rejectSite;
         final ProviderOperation claim=new ProviderOperation(new UUID(0,15),f.f.account.id(),f.f.account.externalAccountId(),f.f.account.credentialsRef(),
@@ -78,8 +81,9 @@ class OwnedSubscriptionLockOrderTest {
             if(sql.equals("select * from provider_operations where id=?")){
                 assertThat(args).containsExactly(claim.id());calls.add("provider locator");return (List<T>)List.of(claim);
             }
-            if(sql.equals("select * from provider_operations where id=? for update")){
-                assertThat(args).containsExactly(claim.id());calls.add("provider lock");return (List<T>)List.of(claim);
+            if(sql.equals("select * from provider_operations where id=? and kind<>'OWNED_RECOVERY_INTENT_CONFIRM' for update")){
+                assertThat(sql).contains("kind<>'OWNED_RECOVERY_INTENT_CONFIRM'");
+                assertThat(args).containsExactly(claim.id());guardedProviderLocks++;calls.add("provider lock");return (List<T>)List.of(claim);
             }
             if(sql.equals("select * from stripe_billing_owned_subscriptions where payment_account_id=? and subscription_id=?"))return (List<T>)List.of(f.intent);
             throw new AssertionError("Unexpected JDBC call: "+sql);

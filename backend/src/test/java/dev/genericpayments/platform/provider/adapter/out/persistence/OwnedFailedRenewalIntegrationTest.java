@@ -20,6 +20,9 @@ import dev.genericpayments.platform.subscriptions.application.port.in.ConfirmSub
 import dev.genericpayments.platform.subscriptions.application.port.in.SubscriptionConfirmationUseCase;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.provider.application.service.OwnedFailedRenewalMethodService;
+import dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.*;
+import dev.genericpayments.platform.provider.application.port.out.OwnedRecoveryConfirmStore;
+import dev.genericpayments.platform.provider.application.service.OwnedRecoveryConfirmService;
 import dev.genericpayments.platform.provider.application.service.ProviderOperationGuard;
 import dev.genericpayments.platform.provider.adapter.out.stripe.StripeRequestFingerprint;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalMethodObserver;
@@ -1212,6 +1215,267 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     }
     private OwnedFailedRenewalMethod.RecoveryPreparationContext inspectRecovery(RecoveryPrepared p){
         return p.pending().service().inspectBrowserRecoveryPreparation(p.pending().reservation(),p.completion(),p.recovery(),p.pending().context());
+    }
+    private OwnedRecoveryConfirmService recoveryConfirmer(RecoveryPrepared p){
+        return recoveryConfirmer(p,new JdbcOwnedRecoveryConfirmStore(jdbc));
+    }
+    private OwnedRecoveryConfirmService recoveryConfirmer(RecoveryPrepared p,OwnedRecoveryConfirmStore receipts){
+        return new OwnedRecoveryConfirmService(p.pending().service(),receipts,transaction,Clock.systemUTC());
+    }
+    private InvocationBudget confirmationBudget(){return new InvocationBudget(Clock.systemUTC(),System::nanoTime);}
+    private ConfirmReply confirmationReply(OwnedFailedRenewalMethod.RecoveryPreparationContext c){
+        return new ConfirmReply(c.reservation().failure().paymentIntent(),c.binding().providerReference(),c.completion().method(),"EUR",1000,1000,0,"ch_confirmed",browserNow());
+    }
+    private Map<String,List<String>> confirmationRows(){
+        var result=new TreeMap<>(recoveryPreparationRows());
+        result.put("stripe_billing_failed_recovery_confirm_claims",rows("stripe_billing_failed_recovery_confirm_claims"));
+        result.put("stripe_billing_failed_recovery_confirm_acks",rows("stripe_billing_failed_recovery_confirm_acks"));return result;
+    }
+    private OwnedRecoveryConfirmStore observingConfirmationStore(java.util.function.BiConsumer<java.lang.reflect.Method,Object[]> before,
+            java.util.function.BiConsumer<java.lang.reflect.Method,Object> after){
+        var actual=new JdbcOwnedRecoveryConfirmStore(jdbc);
+        return (OwnedRecoveryConfirmStore)Proxy.newProxyInstance(OwnedRecoveryConfirmStore.class.getClassLoader(),new Class<?>[]{OwnedRecoveryConfirmStore.class},(proxy,m,args)->{
+            before.accept(m,args);try{var result=m.invoke(actual,args);after.accept(m,result);return result;}
+            catch(InvocationTargetException error){throw error.getCause();}
+        });
+    }
+
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void dedicatedConfirmationCommitsOneOriginalClaimAndAckThenIndependentObserverSettlesOnlyOriginalDebt(boolean legacy) throws Exception {
+        var p=recoveryPrepared(legacy,0);var c=inspectRecovery(p);var confirmer=recoveryConfirmer(p);var budget=confirmationBudget();
+        var before=financialState();var original=jdbc.queryForMap("select * from payments where id=?",p.prepared().setup().upstream().payment());
+        var setupBefore=jdbc.queryForMap("select * from subscription_operations where id=?",c.setupOperation().id());
+        var recoverBefore=jdbc.queryForMap("select * from subscription_operations where id=?",c.recoveryOperation().id());int calls=http.calls.size();
+        var claim=confirmer.claim(c,p.pending().context(),UUID.randomUUID().toString(),budget);
+        assertThat(claim.kind()).isEqualTo(ProviderOperation.Kind.OWNED_RECOVERY_INTENT_CONFIRM);assertThat(claim.status()).isEqualTo(ProviderOperation.Status.DISPATCHING);assertThat(claim.version()).isEqualTo(1);
+        assertThat(claim.resourceId()).isEqualTo(c.recoveryOperation().id());assertThat(claim.operationKey()).isEqualTo(c.recoveryOperation().providerOperationKey()+":CONFIRM");
+        assertThat(claim.fingerprint()).isEqualTo(OwnedRecoveryConfirmService.fingerprint(c,digest));
+        var receipt=jdbc.queryForMap("select * from stripe_billing_failed_recovery_confirm_claims where provider_operation=?",claim.id());
+        assertThat(receipt).containsEntry("invocation",budget.invocation());
+        assertThat(((java.sql.Timestamp)receipt.get("entered_at")).toInstant()).isEqualTo(budget.enteredAt().truncatedTo(java.time.temporal.ChronoUnit.MICROS));
+        assertThat(((java.sql.Timestamp)receipt.get("deadline_at")).toInstant()).isEqualTo(((java.sql.Timestamp)receipt.get("entered_at")).toInstant().plusSeconds(30));
+        Boolean independentlyCommitted=jdbc.queryForObject("select recorded_transaction<>pg_current_xact_id() from stripe_billing_failed_recovery_confirm_claims where provider_operation=?",Boolean.class,claim.id());assertThat(independentlyCommitted).isTrue();
+        assertThat(confirmer.inspectClaim(c,claim,p.pending().context(),budget)).isEqualTo(claim);
+        var reply=confirmationReply(c);var ack=confirmer.acknowledge(c,claim,reply,p.pending().context(),budget);
+        assertThat(ack.reply()).isEqualTo(reply);assertThat(ack.operation().status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);assertThat(ack.operation().version()).isEqualTo(2);
+        assertThat(ack.operation().providerReference()).isEqualTo(p.pending().failure().paymentIntent());
+        assertThat(count("stripe_billing_failed_recovery_confirm_claims")).isEqualTo(1);assertThat(count("stripe_billing_failed_recovery_confirm_acks")).isEqualTo(1);
+        assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+        assertThat(jdbc.queryForMap("select * from subscription_operations where id=?",c.setupOperation().id())).isEqualTo(setupBefore);
+        assertThat(jdbc.queryForMap("select * from subscription_operations where id=?",c.recoveryOperation().id())).isEqualTo(recoverBefore);
+        assertThat(jdbc.queryForObject("select count(*) from stripe_subscription_recovery_proofs where operation_id=? and pay_step is null and pay_kind is null",Long.class,c.recoveryOperation().id())).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select count(*) from provider_operations where kind='INVOICE_PAY'",Long.class)).isZero();
+        int observerStart=http.calls.size();recoveredGraph(p.prepared());var publication=methodObserver(p.pending().service()).observeRecovery(p.pending().reservation(),p.recovery());assertObservationSlice(p.prepared(),observerStart,15);
+        assertThat(publication.publication().billId()).isEqualTo(c.reservation().failure().billId());assertThat(current().debt()).isNull();assertThat(count("payments")).isEqualTo(2);
+        assertThat(jdbc.queryForMap("select * from payments where id=?",p.prepared().setup().upstream().payment())).isEqualTo(original);
+        assertThat(jdbc.queryForObject("select provider_payment_reference from payments where id=?",String.class,publication.publication().paymentId())).isEqualTo(c.reservation().failure().paymentIntent());
+        assertThat(operations.findById(claim.id())).contains(ack.operation());
+    }
+
+    @Test void dedicatedConfirmationFingerprintMatchesHandEnumeratedJavaAndSqlGolden() throws Exception {
+        var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var f=c.reservation().failure();var r=c.recoveryOperation();var completion=c.completion();var a=c.account();
+        // Independent golden field ordering; do not call the production fingerprint encoder here.
+        var facts=List.of(a.id().value().toString(),a.externalAccountId(),a.credentialsRef(),a.provider().name(),a.mode().name(),
+            "OWNED_RECOVERY_CONFIRM_V1",r.id().toString(),r.providerOperationKey(),r.fingerprint(),c.reservation().id().toString(),
+            f.billId().toString(),Long.toString(f.billVersion()),f.invoice(),f.allocation(),f.paymentIntent(),Long.toString(f.revision()),Long.toString(f.observationSequence()),
+            c.binding().id().toString(),c.binding().providerReference(),completion.setupStepId().toString(),Long.toString(completion.setupStepVersion()),
+            completion.methodStepId().toString(),Long.toString(completion.methodStepVersion()),completion.method(),"off_session:true","error_on_requires_action:true");
+        StringBuilder canonical=new StringBuilder();facts.forEach(value->canonical.append(value.length()).append(':').append(value));String golden=digest.sha256Hex(canonical.toString());
+        assertThat(OwnedRecoveryConfirmService.fingerprint(c,digest)).isEqualTo(golden);
+        assertThat(jdbc.queryForObject("select owned_recovery_confirm_fingerprint(?)",String.class,c.reservation().id())).isEqualTo(golden);
+        var budget=confirmationBudget();var claim=recoveryConfirmer(p).claim(c,p.pending().context(),"golden-claim",budget);assertThat(claim.fingerprint()).isEqualTo(golden);
+    }
+
+    @Test void dedicatedConfirmationDuplicateAndConcurrentFirstClaimantsNeverAdopt() throws Exception {
+        var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var before=financialState();int calls=http.calls.size();
+        var ready=new CountDownLatch(2);var start=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()){
+            java.util.concurrent.Callable<Object> attempt=()->{ready.countDown();awaitRelease(start);try{return recoveryConfirmer(p).claim(c,p.pending().context(),UUID.randomUUID().toString(),confirmationBudget());}catch(IllegalStateException refused){return refused;}};
+            var first=workers.submit(attempt);var second=workers.submit(attempt);assertThat(ready.await(5,TimeUnit.SECONDS)).isTrue();start.countDown();
+            var results=List.of(first.get(10,TimeUnit.SECONDS),second.get(10,TimeUnit.SECONDS));
+            assertThat(results.stream().filter(ProviderOperation.class::isInstance)).hasSize(1);assertThat(results.stream().filter(IllegalStateException.class::isInstance)).hasSize(1);
+        }
+        var original=confirmationRows();assertThatThrownBy(()->recoveryConfirmer(p).claim(c,p.pending().context(),"adopter",confirmationBudget())).isInstanceOf(RuntimeException.class);
+        assertThat(confirmationRows()).isEqualTo(original);assertThat(count("stripe_billing_failed_recovery_confirm_claims")).isEqualTo(1);
+        assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+    }
+
+    @ParameterizedTest @ValueSource(strings={"claim","ack"})
+    void dedicatedConfirmationFinalMutationFailureRollsBackProviderAndReceiptTogether(String phase) throws Exception {
+        var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var budget=confirmationBudget();var normal=recoveryConfirmer(p);
+        var claim=phase.equals("ack")?normal.claim(c,p.pending().context(),"owner",budget):null;
+        var before=financialState();var receipts=confirmationRows();int calls=http.calls.size();var reached=new java.util.concurrent.atomic.AtomicBoolean();
+        var broken=observingConfirmationStore((m,args)->{},(m,result)->{if(m.getName().equals(phase.equals("ack")?"acknowledgeInTransaction":"insertAndClaimInTransaction")){reached.set(true);throw new IllegalStateException("after real dedicated mutation");}});
+        assertThatThrownBy(()->{if(claim==null)recoveryConfirmer(p,broken).claim(c,p.pending().context(),"owner",budget);else recoveryConfirmer(p,broken).acknowledge(c,claim,confirmationReply(c),p.pending().context(),budget);}).hasMessage("after real dedicated mutation");
+        assertThat(reached).isTrue();assertThat(confirmationRows()).isEqualTo(receipts);assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+    }
+
+    @ParameterizedTest @ValueSource(strings={"ACKNOWLEDGED","UNKNOWN"})
+    void dedicatedConfirmationBothTerminalsRequireIndependentlyCommittedFirstClaimEvenAfterImmediateConstraints(String terminal) throws Exception {
+        var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var before=financialState();var rows=confirmationRows();var reached=new java.util.concurrent.atomic.AtomicBoolean();
+        var broken=observingConfirmationStore((m,args)->{},(m,result)->{if(m.getName().equals("insertAndClaimInTransaction")){
+            var claim=(ProviderOperation)result;jdbc.execute("set constraints all immediate");reached.set(true);
+            jdbc.update("update provider_operations set status=?,provider_reference=?,lease_owner=null,lease_expires_at=null,version=2 where id=?",terminal,terminal.equals("ACKNOWLEDGED")?c.reservation().failure().paymentIntent():null,claim.id());
+        }});
+        assertThatThrownBy(()->recoveryConfirmer(p,broken).claim(c,p.pending().context(),"owner",confirmationBudget())).isInstanceOf(RuntimeException.class);
+        assertThat(reached).isTrue();assertThat(confirmationRows()).isEqualTo(rows);assertThat(financialState()).isEqualTo(before);
+    }
+
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void dedicatedConfirmationCannotCommitAnOrphanReservedRowWithOrWithoutEarlyConstraints(boolean immediate) throws Exception {
+        var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var before=confirmationRows();var financial=financialState();
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            jdbc.update("insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint) values(?,?,?,?,'OWNED_RECOVERY_INTENT_CONFIRM',?,?,?)",
+                UUID.randomUUID(),billing.id().value(),billing.externalAccountId(),billing.credentialsRef(),c.recoveryOperation().id(),c.recoveryOperation().providerOperationKey()+":CONFIRM",OwnedRecoveryConfirmService.fingerprint(c,digest));
+            if(immediate)jdbc.execute("set constraints all immediate");return true;
+        })).isInstanceOf(RuntimeException.class);
+        assertThat(confirmationRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(financial);
+    }
+
+    @ParameterizedTest @ValueSource(strings={"delete","kind","resource","key","fingerprint","account","owner","lease","version-skip","reset","scheduler"})
+    void dedicatedConfirmationSqlCannotDeleteConvertRetargetResetOrScheduleItsCommittedClaim(String mutation) throws Exception {
+        var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var budget=confirmationBudget();var claim=recoveryConfirmer(p).claim(c,p.pending().context(),"owner",budget);
+        var before=confirmationRows();var financial=financialState();
+        String sql=switch(mutation){
+            case "delete"->"delete from provider_operations where id=?";
+            case "kind"->"update provider_operations set kind='INVOICE_PAY' where id=?";
+            case "resource"->"update provider_operations set resource_id=gen_random_uuid() where id=?";
+            case "key"->"update provider_operations set operation_key=operation_key||':changed' where id=?";
+            case "fingerprint"->"update provider_operations set fingerprint='changed' where id=?";
+            case "account"->"update provider_operations set credentials_ref='changed' where id=?";
+            case "owner"->"update provider_operations set lease_owner='changed' where id=?";
+            case "lease"->"update provider_operations set lease_expires_at=lease_expires_at+interval '1 second' where id=?";
+            case "version-skip"->"update provider_operations set status='UNKNOWN',version=3,lease_owner=null,lease_expires_at=null where id=?";
+            case "reset"->"update provider_operations set status='RESERVED',version=0,lease_owner=null,lease_expires_at=null,first_dispatched_at=null,retry_before=null where id=?";
+            default->"update provider_operations set recovery_attempts=recovery_attempts+1,next_attempt_at=clock_timestamp(),manual_review_required=true where id=?";
+        };
+        assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update(sql,claim.id()))).as(mutation).isInstanceOf(RuntimeException.class);
+        assertThat(confirmationRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(financial);
+    }
+
+    @ParameterizedTest @ValueSource(strings={"claim-update","claim-delete","claim-xid","ack-update","ack-delete","missing-ack"})
+    void dedicatedConfirmationSqlReceiptsAreImmutableAndAckCannotCommitWithoutExactAppendOnlyEvidence(String mutation) throws Exception {
+        var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var budget=confirmationBudget();var svc=recoveryConfirmer(p);var claim=svc.claim(c,p.pending().context(),"owner",budget);
+        if(mutation.startsWith("ack-"))svc.acknowledge(c,claim,confirmationReply(c),p.pending().context(),budget);
+        var before=confirmationRows();var financial=financialState();
+        String sql=switch(mutation){
+            case "claim-update"->"update stripe_billing_failed_recovery_confirm_claims set claimant='forged' where provider_operation=?";
+            case "claim-delete"->"delete from stripe_billing_failed_recovery_confirm_claims where provider_operation=?";
+            case "claim-xid"->"update stripe_billing_failed_recovery_confirm_claims set recorded_transaction=pg_current_xact_id() where provider_operation=?";
+            case "ack-update"->"update stripe_billing_failed_recovery_confirm_acks set charge='ch_forged' where provider_operation=?";
+            case "ack-delete"->"delete from stripe_billing_failed_recovery_confirm_acks where provider_operation=?";
+            default->"update provider_operations set status='ACKNOWLEDGED',version=2,provider_reference='pi_renewal',lease_owner=null,lease_expires_at=null where id=?";
+        };
+        assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update(sql,claim.id()))).isInstanceOf(RuntimeException.class);
+        assertThat(confirmationRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(financial);
+    }
+
+    @Test void dedicatedConfirmationAckRejectsDifferentInvocationAndUnknownConsumesOnlyOriginalOwner() throws Exception {
+        var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var budget=confirmationBudget();var svc=recoveryConfirmer(p);var claim=svc.claim(c,p.pending().context(),"owner",budget);var before=financialState();
+        var receipt=confirmationRows();assertThatThrownBy(()->svc.acknowledge(c,claim,confirmationReply(c),p.pending().context(),confirmationBudget())).isInstanceOf(RuntimeException.class);
+        assertThat(confirmationRows()).isEqualTo(receipt);
+        var foreign=new ProviderOperation(claim.id(),claim.accountId(),claim.externalAccountId(),claim.credentialsRef(),claim.kind(),claim.resourceId(),claim.operationKey(),claim.fingerprint(),claim.status(),claim.providerReference(),claim.firstDispatchedAt(),claim.retryBefore(),"foreign",claim.leaseExpiresAt(),claim.version());
+        svc.uncertain(c,foreign);assertThat(confirmationRows()).isEqualTo(receipt);
+        svc.uncertain(c,claim);assertThat(operations.findById(claim.id()).orElseThrow().status()).isEqualTo(ProviderOperation.Status.UNKNOWN);
+        assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);assertThat(count("stripe_billing_failed_recovery_confirm_acks")).isZero();assertThat(financialState()).isEqualTo(before);
+        var stopped=confirmationRows();svc.uncertain(c,claim);assertThat(confirmationRows()).isEqualTo(stopped);
+        assertThatThrownBy(()->svc.claim(c,p.pending().context(),"retry",confirmationBudget())).isInstanceOf(RuntimeException.class);
+    }
+
+    @Test void dedicatedConfirmationGenericAndSchedulerPathsCannotMutateGenuineClaimOrTrustForgedCallerKind() throws Exception {
+        var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var budget=confirmationBudget();var claim=recoveryConfirmer(p).claim(c,p.pending().context(),"owner",budget);
+        var before=confirmationRows();var financial=financialState();var scheduler=new dev.genericpayments.platform.payments.adapter.out.persistence.PendingProviderRecoveryPersistenceAdapter(jdbc,operations,Clock.systemUTC());
+        List<org.assertj.core.api.ThrowableAssert.ThrowingCallable> forbidden=List.of(
+            ()->operations.reserve(billing,claim.kind(),claim.resourceId(),claim.operationKey(),claim.fingerprint()),
+            ()->operations.claim(claim.id(),"ordinary",Instant.now().plusSeconds(60),Duration.ofSeconds(60)),
+            ()->operations.acknowledge(claim.id(),claim.leaseOwner(),claim.version(),"pi_renewal"),
+            ()->operations.unknown(claim.id(),claim.leaseOwner(),claim.version()),()->operations.bindRecovered(claim,"pi_renewal",claim.fingerprint()),()->operations.lockRecovery(claim));
+        forbidden.forEach(work->assertThatThrownBy(work).isInstanceOf(RuntimeException.class));assertThat(scheduler.claim(claim.id())).isEmpty();assertThat(scheduler.claimNext()).isEmpty();
+        var forged=new ProviderOperation(claim.id(),claim.accountId(),claim.externalAccountId(),claim.credentialsRef(),ProviderOperation.Kind.PAYMENT_PREPARE,claim.resourceId(),claim.operationKey(),claim.fingerprint(),claim.status(),null,claim.firstDispatchedAt(),claim.retryBefore(),claim.leaseOwner(),claim.leaseExpiresAt(),claim.version());
+        assertThatThrownBy(()->scheduler.finish(new dev.genericpayments.platform.payments.application.port.out.PendingProviderRecoveryPort.Claim(forged,1,browserNow().plusSeconds(120)),dev.genericpayments.platform.payments.application.port.out.PendingProviderRecoveryPort.Outcome.COMPLETE)).isInstanceOf(RuntimeException.class);
+        assertThat(confirmationRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(financial);
+    }
+
+    @ParameterizedTest @ValueSource(strings={"expiry","revocation"})
+    void dedicatedConfirmationObservedReceiptLockWaitCannotExtendOriginalBrowserAuthority(String mutation) throws Exception {
+        var p=recoveryPrepared(false,mutation.equals("expiry")?20:0);var c=inspectRecovery(p);var budget=confirmationBudget();var svc=recoveryConfirmer(p);var claim=svc.claim(c,p.pending().context(),"owner",budget);
+        var session=((SubscriptionActor.Customer)p.pending().context().actor()).session();var before=confirmationRows();var financial=financialState();
+        var locked=new CountDownLatch(1);var release=new CountDownLatch(1);var entering=new CountDownLatch(1);var holderPid=new java.util.concurrent.atomic.AtomicInteger();var waiterPid=new java.util.concurrent.atomic.AtomicInteger();
+        var observed=observingConfirmationStore((m,args)->{if(m.getName().equals("lockInTransaction")){waiterPid.set(jdbc.queryForObject("select pg_backend_pid()",Integer.class));entering.countDown();}},(m,result)->{});
+        try(var workers=new BoundedWorkers()){
+            var holder=workers.submit(()->transaction.requiresNew(()->{
+                jdbc.queryForList("select id from provider_operations where id=? for update",UUID.class,claim.id());holderPid.set(jdbc.queryForObject("select pg_backend_pid()",Integer.class));locked.countDown();
+                try{if(!release.await(30,TimeUnit.SECONDS))throw new AssertionError("confirmation receipt hold timed out");}
+                catch(InterruptedException error){Thread.currentThread().interrupt();throw new AssertionError(error);}return true;
+            }));
+            try{
+                assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();var refused=workers.submit(()->{assertThatThrownBy(()->recoveryConfirmer(p,observed).acknowledge(c,claim,confirmationReply(c),p.pending().context(),budget)).isInstanceOf(RuntimeException.class);return true;});
+                assertThat(entering.await(5,TimeUnit.SECONDS)).isTrue();boolean blocked=false;long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);
+                while(System.nanoTime()<until){blocked=Boolean.TRUE.equals(jdbc.queryForObject("select ?=any(pg_blocking_pids(?))",Boolean.class,holderPid.get(),waiterPid.get()));if(blocked)break;Thread.sleep(20);}
+                assertThat(blocked).as("actual receipt lock wait observed").isTrue();assertThat(refused.isDone()).isFalse();
+                if(mutation.equals("revocation"))jdbc.update("update customer_sessions set revoked_at=clock_timestamp(),revoked_reason='LOGOUT' where id=?",session.sessionId().value());
+                else{var now=jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant();assertThat(now).isBefore(session.expiresAt());Thread.sleep(Duration.between(now,session.expiresAt()).plusMillis(50));assertThat(jdbc.queryForObject("select clock_timestamp()",java.sql.Timestamp.class).toInstant()).isAfterOrEqualTo(session.expiresAt());}
+                assertThat(holder.isDone()).as("holder still owns its transaction at authority expiry/revocation").isFalse();
+                Boolean stillBlocked=jdbc.queryForObject("select ?=any(pg_blocking_pids(?))",Boolean.class,holderPid.get(),waiterPid.get());
+                assertThat(stillBlocked).as("the same provider-row holder still blocks the financial transaction after expiry/revocation").isTrue();assertThat(refused.isDone()).isFalse();
+                release.countDown();assertThat(holder.get(10,TimeUnit.SECONDS)).isTrue();assertThat(refused.get(10,TimeUnit.SECONDS)).isTrue();
+            }finally{release.countDown();}
+        }
+        // Revocation is an intentional external authority mutation, so compare all confirmation and financial receipts.
+        assertThat(rows("stripe_billing_failed_recovery_confirm_acks")).isEqualTo(before.get("stripe_billing_failed_recovery_confirm_acks"));assertThat(rows("provider_operations")).isEqualTo(before.get("provider_operations"));assertThat(financialState()).isEqualTo(financial);
+    }
+
+    @Test void dedicatedConfirmationDirectSqlRefusesContendedCanonicalOperationWithoutLockInversion() throws Exception {
+        var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var budget=confirmationBudget();var claim=recoveryConfirmer(p).claim(c,p.pending().context(),"owner",budget);
+        var before=confirmationRows();var financial=financialState();var locked=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()){
+            var holder=workers.submit(()->transaction.requiresNew(()->{lifecycleOperations.lock(c.setupOperation().id());locked.countDown();awaitRelease(release);return true;}));
+            try{
+                assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update("update provider_operations set status='UNKNOWN',lease_owner=null,lease_expires_at=null,version=2 where id=?",claim.id())))
+                    .isInstanceOf(RuntimeException.class).hasStackTraceContaining("Owned recovery confirmation authority contended");
+            }finally{release.countDown();}
+            assertThat(holder.get(10,TimeUnit.SECONDS)).isTrue();
+        }
+        assertThat(confirmationRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(financial);
+    }
+
+    @Test void dedicatedConfirmationDirectSqlAckRefusesOriginalRecoveryReferenceDrift() throws Exception {
+        var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var budget=confirmationBudget();var claim=recoveryConfirmer(p).claim(c,p.pending().context(),"owner",budget);
+        var before=confirmationRows();var financial=financialState();int calls=http.calls.size();
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            assertThat(jdbc.update("update subscription_operations set provider_reference='sub_drifted' where id=?",c.recoveryOperation().id())).isEqualTo(1);
+            assertThat(jdbc.queryForObject("select version from subscription_operations where id=?",Long.class,c.recoveryOperation().id())).isEqualTo(c.recoveryOperation().version());
+            // Invoke actual caller-transaction JDBC directly: SQL must refuse even without the Java method validator.
+            return new JdbcOwnedRecoveryConfirmStore(jdbc).acknowledgeInTransaction(c,claim,confirmationReply(c),browserNow(),budget);
+        })).isInstanceOf(RuntimeException.class);
+        assertThat(confirmationRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(financial);assertThat(http.calls).hasSize(calls);
+    }
+
+    @ParameterizedTest @ValueSource(strings={"lock","delete"})
+    void dedicatedConfirmationDirectSqlAckRefusesContendedExactAllowedOrigin(String contention) throws Exception {
+        var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var budget=confirmationBudget();var claim=recoveryConfirmer(p).claim(c,p.pending().context(),"owner",budget);
+        var before=confirmationRows();var financial=financialState();var locked=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()){
+            var holder=workers.submit(()->{
+                assertThatThrownBy(()->transaction.requiresNew(()->{
+                    if(contention.equals("lock"))assertThat(jdbc.queryForList("select site_id from site_allowed_origins where site_id=? and origin=? for update",UUID.class,c.subscription().siteId().value(),c.enrollment().origin())).containsExactly(c.subscription().siteId().value());
+                    else assertThat(jdbc.update("delete from site_allowed_origins where site_id=? and origin=?",c.subscription().siteId().value(),c.enrollment().origin())).isEqualTo(1);
+                    locked.countDown();try{if(!release.await(30,TimeUnit.SECONDS))throw new AssertionError("allowed origin hold timed out");}
+                    catch(InterruptedException error){Thread.currentThread().interrupt();throw new AssertionError(error);}
+                    throw new NegativeOwnedPayReceiptRollback();
+                })).isExactlyInstanceOf(NegativeOwnedPayReceiptRollback.class);return true;
+            });
+            try{
+                assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();assertThat(holder.isDone()).isFalse();
+                // Exact normalized ACK is generated by the actual JDBC store; only the origin's row is contended.
+                assertThatThrownBy(()->transaction.requiresNew(()->new JdbcOwnedRecoveryConfirmStore(jdbc).acknowledgeInTransaction(c,claim,confirmationReply(c),browserNow(),budget)))
+                    .isInstanceOf(RuntimeException.class).hasStackTraceContaining("Owned recovery confirmation authority contended");
+                assertThat(holder.isDone()).isFalse();
+            }finally{release.countDown();}
+            assertThat(holder.get(10,TimeUnit.SECONDS)).isTrue();
+        }
+        assertThat(confirmationRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(financial);
     }
     private Map<String,List<String>> recoveryPreparationRows(){
         var state=new TreeMap<>(authorityRows());

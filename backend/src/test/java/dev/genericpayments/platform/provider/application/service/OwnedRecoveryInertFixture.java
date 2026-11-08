@@ -7,6 +7,7 @@ import dev.genericpayments.platform.provider.application.port.out.ProviderOperat
 import dev.genericpayments.platform.shared.application.port.out.DigestPort;
 import dev.genericpayments.platform.subscriptions.application.model.*;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore;
+import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionTransactionPort;
 import java.time.*;
 import java.util.*;
 import static dev.genericpayments.platform.provider.application.service.OwnedFailedRenewalServiceTest.*;
@@ -15,6 +16,7 @@ import static dev.genericpayments.platform.provider.application.service.OwnedFai
  * Only the external acknowledged provider records are handwritten; no provider or database is reachable. */
 public final class OwnedRecoveryInertFixture {
     final OwnedFailedRenewalMethodServiceTest.Harness h;
+    final DigestPort digest;
     public final List<Object> proofLocators=new ArrayList<>();
     public final List<UUID> stepLocators=new ArrayList<>();
     public SubscriptionBillingProofStore.Setup proof;
@@ -29,7 +31,8 @@ public final class OwnedRecoveryInertFixture {
         var id=(UUID)args[0];stepLocators.add(id);return Optional.ofNullable(steps.get(id));
     });
     public OwnedRecoveryInertFixture(DigestPort digest){
-        h=new OwnedFailedRenewalMethodServiceTest.Harness(true,"stripe-sandbox-default",UTC.plusSeconds(600).plusNanos(123456789));
+        this.digest=digest;
+        h=new OwnedFailedRenewalMethodServiceTest.Harness(true,"stripe-sandbox-default",UTC.plusSeconds(600).plusNanos(123456789),digest);
         var r=h.service.reserveBrowserMethod(h.b.admission,h.context,true);
         h.acks=true;h.browserConsumed=true;h.recoveryPreparationEnabled=true;h.enforceSessionExpiry=true;
         proof=new SubscriptionBillingProofStore.Setup(r.setupOperationId(),h.b.s.id(),h.b.account.id(),id(91),"seti_owned","pm_owned");
@@ -54,6 +57,8 @@ public final class OwnedRecoveryInertFixture {
     public SubscriptionCommandContext command(){return h.context;}
     public RecoveryPreparationContext inspect(){return h.service.inspectBrowserRecoveryPreparation(reservation(),completion(),recovery(),command());}
     public Clock clock(){return h.b.clockPort;}
+    /** Actual inert caller boundary; a confirmation fixture may enlist its own rollback state. */
+    public SubscriptionTransactionPort transactions(){return h.b.transactionPort;}
     public Instant now(){return h.b.utc;}
     public void at(Instant at){h.b.utc=at;}
     public void revoke(){h.authorized=false;}
