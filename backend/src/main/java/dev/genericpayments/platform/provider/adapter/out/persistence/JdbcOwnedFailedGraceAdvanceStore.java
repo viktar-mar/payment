@@ -2,6 +2,7 @@ package dev.genericpayments.platform.provider.adapter.out.persistence;
 
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedGraceAdvance.*;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal.Admission;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal.GraceLastSecondPreparation;
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.*;
 import dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.InvocationBudget;
@@ -14,6 +15,8 @@ import java.time.*;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /** Explicit, non-registered store on the authenticated JPA caller's actual connection only. */
 public final class JdbcOwnedFailedGraceAdvanceStore implements OwnedFailedGraceAdvanceStore {
@@ -22,7 +25,22 @@ public final class JdbcOwnedFailedGraceAdvanceStore implements OwnedFailedGraceA
     @Override public void beforeAuthorityInTransaction(InvocationBudget b){
         caller();if(b==null)throw denied();long left=b.remainingNanos(null);if(left<1_000_000)throw denied();limits(left/1_000_000,false);b.remainingNanos(null);
     }
+    @Override public void beforeFreshEntryInTransaction(Admission admission,GraceLastSecondPreparation preparation,InvocationBudget b){
+        beforeAuthorityInTransaction(b);
+        if(admission==null||preparation==null)throw denied();
+        immutablePreparation(admission,preparation);
+        beforeAuthorityInTransaction(b);
+        // READ COMMITTED gives the following existence query its own snapshot. This mutex
+        // serializes fresh entrants while remaining compatible with continuation's KEY SHARE.
+        require(Boolean.TRUE.equals(jdbc.queryForObject("select owned_failed_grace_fresh_entry(?)",Boolean.class,preparation.id())));
+        b.remainingNanos(null);
+    }
     @Override public ProviderOperation firstClaimInTransaction(PreparationContext c,String claimant,Instant now,InvocationBudget b){
+        var writer=writingCaller();
+        if(c==null)throw denied();
+        // Direct JDBC writers share the same entry mutex through commit. Reacquisition by
+        // the service's transaction is reentrant and keeps the plain INSERT mandatory.
+        beforeFreshEntryInTransaction(c.admission(),c.preparation(),b);
         positive(c,b,now,null);if(!dev.genericpayments.platform.provider.application.model.OwnedFailedGraceAdvance.validClaimant(claimant))throw denied();
         var p=c.preparation();var a=c.account();var id=UUID.randomUUID();var at=micro(now);
         // Plain INSERT: every existing state, including RESERVED, is a permanent refusal.
@@ -38,13 +56,14 @@ public final class JdbcOwnedFailedGraceAdvanceStore implements OwnedFailedGraceA
             update provider_operations set status='DISPATCHING',first_dispatched_at=?,retry_before=?,lease_owner=?,lease_expires_at=?,version=1
             where id=? and status='RESERVED' and version=0 returning *
             """,this::row,stamp(at),stamp(at.plusSeconds(23*3600)),claimant,stamp(at.plusSeconds(60)),id));
-        b.remainingNanos(claim);return claim;
+        b.remainingNanos(claim);completePositive(writer,c,claim.id(),b,claim,"claim");return claim;
     }
     @Override public ProviderOperation requireClaimInTransaction(PreparationContext c,ProviderOperation claim,Instant now,InvocationBudget b){
         positive(c,b,now,claim);owned(c,claim);var current=lock(c);if(!current.equals(claim)||claim.status()!=Status.DISPATCHING||claim.version()!=1)throw denied();
         require(original(c,claim,b,true));b.remainingNanos(claim);return current;
     }
     @Override public AdvanceAck acknowledgeInTransaction(PreparationContext c,ProviderOperation claim,TestClockAck observation,Instant observedAt,Instant now,InvocationBudget b){
+        var writer=writingCaller();
         requireClaimInTransaction(c,claim,now,b);var at=micro(now);
         var operation=one(jdbc.query("""
             update provider_operations set status='ACKNOWLEDGED',provider_reference=?,lease_owner=null,lease_expires_at=null,version=2
@@ -54,7 +73,7 @@ public final class JdbcOwnedFailedGraceAdvanceStore implements OwnedFailedGraceA
             insert into stripe_billing_failed_grace_acks(preparation_id,operation_id,invocation,claimant,deadline,reference,object_type,livemode,name,frozen_time,status,provider_created,provider_deletes_after,advancing_target,observed_at,acknowledged_at)
             values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,c.preparation().id(),claim.id(),b.invocation(),claim.leaseOwner(),stamp(claim.leaseExpiresAt()),observation.reference(),observation.object(),observation.livemode(),observation.name(),observation.frozenTime(),observation.status(),observation.created(),observation.deletesAfter(),observation.advancingTarget(),stamp(observedAt),stamp(at));
-        b.remainingNanos(claim);return ack(c,operation);
+        b.remainingNanos(claim);var saved=ack(c,operation);completePositive(writer,c,claim.id(),b,claim,"ack");return saved;
     }
     @Override public AdvanceAck requireAcknowledgedInTransaction(PreparationContext c,AdvanceAck supplied,Instant now,InvocationBudget b){
         positive(c,b,now,null);if(supplied==null)throw denied();owned(c,supplied.operation());var operation=lock(c);
@@ -64,12 +83,14 @@ public final class JdbcOwnedFailedGraceAdvanceStore implements OwnedFailedGraceA
         b.remainingNanos(null);return saved;
     }
     @Override public GraceAdvanceReady recordReadyInTransaction(PreparationContext c,AdvanceAck supplied,TestClockReady observation,Instant observedAt,Instant now,InvocationBudget b){
+        var writer=writingCaller();
         requireAcknowledgedInTransaction(c,supplied,now,b);var id=UUID.randomUUID();
         jdbc.update("""
             insert into stripe_billing_failed_grace_ready(id,preparation_id,admission_id,operation_id,invocation,reference,object_type,livemode,name,frozen_time,status,provider_created,provider_deletes_after,advancing_target,observed_at)
             values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,id,c.preparation().id(),c.admission().id(),supplied.operation().id(),b.invocation(),observation.reference(),observation.object(),observation.livemode(),observation.name(),observation.frozenTime(),observation.status(),observation.created(),observation.deletesAfter(),observation.advancingTarget(),stamp(observedAt));
-        b.remainingNanos(null);return new GraceAdvanceReady(id,c.admission().id(),supplied,observation,micro(observedAt));
+        b.remainingNanos(null);var ready=new GraceAdvanceReady(id,c.admission().id(),supplied,observation,micro(observedAt));
+        completePositive(writer,c,supplied.operation().id(),b,null,"ready");return ready;
     }
     @Override public void uncertainInTransaction(PreparationContext c,ProviderOperation originalClaim,AdvanceAck suppliedAck,InvocationBudget b,Instant now){
         caller();limits(2000,true);if(c==null||b==null||now==null)throw denied();immutable(c);owned(c,originalClaim);
@@ -95,7 +116,50 @@ public final class JdbcOwnedFailedGraceAdvanceStore implements OwnedFailedGraceA
         jdbc.update("insert into stripe_billing_failed_grace_cleanup(preparation_id,operation_id,invocation,stopped_at) values(?,?,?,?)",c.preparation().id(),originalClaim.id(),b.invocation(),stamp(at));
         jdbc.update("insert into stripe_billing_failed_renewal_stops(admission_id,reason,stopped_at) values(?,'UNCERTAIN',?)",c.admission().id(),stamp(at));
     }
-    private void caller(){OwnedGraceCallerConnection.require(jdbc,factory,"Owned failed grace advance requires caller DataSource transaction");}
+    private static final String CALLER_REQUIRED="Owned failed grace advance requires caller DataSource transaction";
+    private void caller(){OwnedGraceCallerConnection.require(jdbc,factory,CALLER_REQUIRED);}
+    private OwnedGraceCallerConnection writingCaller(){
+        var writer=OwnedGraceCallerConnection.capture(jdbc,factory,CALLER_REQUIRED);
+        if(!TransactionSynchronizationManager.isSynchronizationActive())throw denied();
+        return writer;
+    }
+    private void completePositive(OwnedGraceCallerConnection writer,PreparationContext c,UUID operation,
+            InvocationBudget b,ProviderOperation lease,String phase){
+        writer.requireSame();
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization(){
+            @Override public void beforeCommit(boolean readOnly){
+                var manager=writer.requireSame();
+                if(readOnly)throw denied();
+                limits(completionMillis(b,lease),false);
+                manager.flush();
+                writer.requireSame();
+                limits(completionMillis(b,lease),false);
+                var proof=jdbc.queryForList("""
+                    select require_owned_failed_grace_positive(q) from stripe_billing_failed_grace_claims q
+                    join provider_operations o on o.id=q.operation_id
+                    left join stripe_billing_failed_grace_acks a on a.preparation_id=q.preparation_id
+                    left join stripe_billing_failed_grace_ready r on r.preparation_id=q.preparation_id
+                    where q.preparation_id=? and q.operation_id=? and q.invocation=? and q.entered_at=? and q.deadline_at=?
+                      and owned_failed_grace_owns(q.preparation_id,o)
+                      and case cast(? as text)
+                        when 'claim' then q.recorded_transaction=pg_current_xact_id() and o.status='DISPATCHING' and o.version=1
+                        when 'ack' then a.recorded_transaction=pg_current_xact_id() and o.status='ACKNOWLEDGED' and o.version=2
+                        when 'ready' then r.recorded_transaction=pg_current_xact_id() and o.status='ACKNOWLEDGED' and o.version=2
+                        else false end
+                    """,c.preparation().id(),operation,b.invocation(),stamp(b.enteredAt()),stamp(b.deadlineAt()),phase);
+                require(proof.size()==1);
+                // Check again after the final SQL round trip, without starting another
+                // positive statement between this original-budget check and completion.
+                if(completionMillis(b,lease)==0)limits(0,false);
+            }
+        });
+    }
+    private static long completionMillis(InvocationBudget b,ProviderOperation lease){
+        try{return b.remainingNanos(lease)/1_000_000;}
+        // Zero invokes only the existing 23514 refusal under the previously installed
+        // transaction limits. No new window or positive work follows an invalid budget.
+        catch(IllegalStateException expired){return 0;}
+    }
     private void limits(long millis,boolean cleanup){jdbc.queryForList("select owned_failed_grace_limits(?,?)",millis,cleanup);}
     private void positive(PreparationContext c,InvocationBudget b,Instant now,ProviderOperation claim){
         caller();if(c==null||b==null||now==null)throw denied();long left=b.remainingNanos(claim);if(left<1_000_000)throw denied();limits(left/1_000_000,false);
@@ -105,10 +169,15 @@ public final class JdbcOwnedFailedGraceAdvanceStore implements OwnedFailedGraceA
         require(Boolean.TRUE.equals(jdbc.queryForObject("select owned_failed_grace_current(?) and ?<=clock_timestamp() and clock_timestamp()<?",Boolean.class,c.admission().id(),stamp(now),stamp(b.deadlineAt()))));b.remainingNanos(claim);
     }
     private void immutable(PreparationContext c){
-        var a=c.admission();JdbcOwnedFirstRenewalStore.requireStoredFailedIdentity(jdbc,a.firstRenewalAdmission(),a.ready(),a.boundary());
-        if(!failures.storedIdentityForStop(a).equals(a)||!failures.failureRow(a.id()).equals(c.failure()))throw denied();
-        var p=jdbc.query("select * from stripe_billing_failed_grace_preparations where id=? and admission_id=?",(r,n)->new GraceLastSecondPreparation(r.getObject("id",UUID.class),r.getObject("admission_id",UUID.class),r.getObject("failure_claim_id",UUID.class),r.getObject("renewal_bill",UUID.class),r.getObject("predecessor_ready",UUID.class),instant(r,"grace_deadline"),r.getLong("target"),r.getString("operation_key"),r.getString("fingerprint"),instant(r,"prepared_at")),c.preparation().id(),a.id());
-        if(p.size()!=1||!p.getFirst().equals(c.preparation()))throw denied();require(Boolean.TRUE.equals(jdbc.queryForObject("select owned_failed_grace_identity(?)",Boolean.class,c.preparation().id())));
+        immutablePreparation(c.admission(),c.preparation());
+        if(!failures.failureRow(c.admission().id()).equals(c.failure()))throw denied();
+    }
+    private void immutablePreparation(Admission a,GraceLastSecondPreparation preparation){
+        JdbcOwnedFirstRenewalStore.requireStoredFailedIdentity(jdbc,a.firstRenewalAdmission(),a.ready(),a.boundary());
+        if(!failures.storedIdentityForStop(a).equals(a))throw denied();
+        var p=jdbc.query("select * from stripe_billing_failed_grace_preparations where id=? and admission_id=?",(r,n)->new GraceLastSecondPreparation(r.getObject("id",UUID.class),r.getObject("admission_id",UUID.class),r.getObject("failure_claim_id",UUID.class),r.getObject("renewal_bill",UUID.class),r.getObject("predecessor_ready",UUID.class),instant(r,"grace_deadline"),r.getLong("target"),r.getString("operation_key"),r.getString("fingerprint"),instant(r,"prepared_at")),preparation.id(),a.id());
+        if(p.size()!=1||!p.getFirst().equals(preparation))throw denied();
+        require(Boolean.TRUE.equals(jdbc.queryForObject("select owned_failed_grace_identity(?)",Boolean.class,preparation.id())));
     }
     private void owned(PreparationContext c,ProviderOperation o){if(o==null||o.kind()!=Kind.OWNED_GRACE_CLOCK_ADVANCE||!o.accountId().equals(c.account().id())||!o.externalAccountId().equals(c.account().externalAccountId())||!o.credentialsRef().equals(c.account().credentialsRef())||!o.resourceId().equals(c.preparation().id())||!o.operationKey().equals(c.preparation().operationKey())||!o.fingerprint().equals(c.preparation().fingerprint()))throw denied();}
     private ProviderOperation lock(PreparationContext c){return one(jdbc.query("select * from provider_operations where payment_account_id=? and kind='OWNED_GRACE_CLOCK_ADVANCE' and resource_id=? for update nowait",this::row,c.account().id().value(),c.preparation().id()));}

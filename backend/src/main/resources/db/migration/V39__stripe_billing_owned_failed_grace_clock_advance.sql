@@ -146,6 +146,18 @@ create or replace function owned_failed_renewal_association(target_admission uui
  and not exists(select 1 from stripe_billing_failed_grace_claims q join stripe_billing_failed_grace_preparations grace on grace.id=q.preparation_id where grace.admission_id=d.id))
 $$;
 
+-- Call only after immutable identity has been authenticated. The second statement sees
+-- the fresh READ COMMITTED state after acquiring the entry mutex. Continuations need only
+-- KEY SHARE on preparation and never enter this gate.
+create function owned_failed_grace_fresh_entry(preparation uuid) returns boolean language plpgsql volatile as $$
+begin
+ if current_setting('transaction_isolation')<>'read committed' then
+  raise exception 'Owned grace fresh entry requires READ COMMITTED' using errcode='23514';end if;
+ perform id from stripe_billing_failed_grace_preparations where id=$1 for no key update nowait;
+ if not found then return false;end if;
+ return not exists(select 1 from stripe_billing_failed_grace_claims where preparation_id=$1);
+end $$;
+
 -- Canonical V38 lifecycle closure first; remaining immediate references are pre-acquired NOWAIT.
 -- A direct provider UPDATE owns its row already: every reverse edge here is nonblocking.
 create function lock_owned_failed_grace_advance(preparation uuid) returns void language plpgsql volatile as $$
@@ -208,7 +220,9 @@ begin
  select * into p from stripe_billing_failed_grace_preparations where id=new.resource_id;
  if p.id is null or not owned_failed_grace_owns(p.id,new) then raise exception 'Invalid owned grace operation identity' using errcode='23514';end if;
  if tg_op='INSERT' then
-  perform owned_failed_grace_limits(30000,false);perform lock_owned_failed_grace_advance(p.id);
+  perform owned_failed_grace_limits(30000,false);
+  if not owned_failed_grace_fresh_entry(p.id) then raise exception 'Owned grace firstclaim already consumed' using errcode='23514';end if;
+  perform lock_owned_failed_grace_advance(p.id);
   if not owned_failed_grace_current(p.admission_id) or new.status<>'RESERVED' or new.version<>0
    or num_nonnulls(new.provider_reference,new.first_dispatched_at,new.retry_before,new.lease_owner,new.lease_expires_at,new.safe_error_code)<>0
    or new.recovery_attempts<>0 or new.manual_review_required or new.next_attempt_at<>transaction_timestamp()
@@ -338,12 +352,25 @@ begin
  then raise exception 'Invalid terminal failed renewal receipt' using errcode='23514';end if;return new;
 end $$;
 
--- Deferred atomicity/provenance is also the final database positive deadline/current-proof gate.
+-- Shared by the ordinary deferred proof and the supported JPA caller's independent
+-- beforeCommit proof after flush. An unrestricted SQL caller can drain deferred events early.
+create function require_owned_failed_grace_positive(q stripe_billing_failed_grace_claims)
+ returns void language plpgsql volatile as $$
+declare db_at timestamptz;
+begin
+ if not owned_failed_grace_current((select admission_id from stripe_billing_failed_grace_preparations where id=q.preparation_id)) then
+  raise exception 'Owned grace positive authority changed before commit' using errcode='23514';end if;
+ db_at:=clock_timestamp();
+ if db_at>=q.deadline_at or db_at>=q.deadline then
+  raise exception 'Original owned grace positive deadline expired before commit' using errcode='23514';end if;
+end $$;
+
+-- Deferred atomicity/provenance validates at constraint execution under the caller's mode.
 -- Only receipts actually written by this xid are positive work; later original cleanup stays valid
 -- after deadline/authority drift. A committed READY's delayed return does not run this gate again.
 create function check_owned_failed_grace_committed() returns trigger language plpgsql volatile as $$
 declare selected uuid; step provider_operations%rowtype; q stripe_billing_failed_grace_claims%rowtype;
- ack stripe_billing_failed_grace_acks%rowtype; ready stripe_billing_failed_grace_ready%rowtype; positive boolean; db_at timestamptz;
+ ack stripe_billing_failed_grace_acks%rowtype; ready stripe_billing_failed_grace_ready%rowtype; positive boolean;
 begin
  if tg_table_name='provider_operations' then if new.kind<>'OWNED_GRACE_CLOCK_ADVANCE' then return null;end if;selected:=new.id;
  else selected:=new.operation_id;end if;
@@ -376,11 +403,7 @@ begin
  if positive then
   -- Separate fresh volatile proof sees mutations made by the writing transaction after its
   -- initial INSERT/callback. Read the deadline clock after that proof, not before its work.
-  if not owned_failed_grace_current((select admission_id from stripe_billing_failed_grace_preparations where id=q.preparation_id)) then
-   raise exception 'Owned grace positive authority changed before commit' using errcode='23514';end if;
-  db_at:=clock_timestamp();
-  if db_at>=q.deadline_at or db_at>=q.deadline then
-   raise exception 'Original owned grace positive deadline expired before commit' using errcode='23514';end if;
+  perform require_owned_failed_grace_positive(q);
  end if;
  return null;
 end $$;

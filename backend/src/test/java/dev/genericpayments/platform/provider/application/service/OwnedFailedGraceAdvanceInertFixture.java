@@ -82,6 +82,10 @@ public final class OwnedFailedGraceAdvanceInertFixture {
         void restore(State s){row=s.row;ack=s.ack;ready=s.ready;original=s.budget;claimant=s.claimant;claimTransaction=s.claimTx;ackTransaction=s.ackTx;committedTransaction=s.committed;stops=s.stops;writes=s.writes;}
         void boundary(String effect){assertThat(h.active).isTrue();calls.add(effect);h.trace.add("grace-"+effect);afterLock.run();}
         public void beforeAuthorityInTransaction(InvocationBudget b){boundary("limit");if(failLimiter)throw new IllegalStateException("caller limiter unavailable");b.remainingNanos(null);}
+        public void beforeFreshEntryInTransaction(OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.GraceLastSecondPreparation preparation,InvocationBudget b){
+            assertThat(h.active).isTrue();h.trace.add("grace-fresh-entry");b.remainingNanos(null);
+            if(!admission.equals(h.admission)||!preparation.equals(h.preparation)||row!=null)throw new IllegalStateException("fresh grace entry refused");
+        }
         void exact(PreparationContext c,ProviderOperation supplied,InvocationBudget b){
             assertThat(c).isEqualTo(context);if(original!=b||row==null||!row.equals(supplied)||claimTransaction==transactionId||committedTransaction<claimTransaction)throw new IllegalStateException("original committed claim required");
         }

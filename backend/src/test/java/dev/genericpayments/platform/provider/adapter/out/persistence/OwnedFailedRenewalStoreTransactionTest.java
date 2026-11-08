@@ -40,6 +40,7 @@ class OwnedFailedRenewalStoreTransactionTest {
     }
     static final class JpaBoundary {
         final java.util.concurrent.atomic.AtomicInteger queries=new java.util.concurrent.atomic.AtomicInteger();
+        boolean closedAfterCapture;
         final String mode;final DataSource dataSource;final Connection physical,sessionConnection;final EntityManagerFactory factory;final EntityManager em;final JdbcTemplate jdbc;
         JpaBoundary(String mode) {
             this.mode=mode;
@@ -49,7 +50,7 @@ class OwnedFailedRenewalStoreTransactionTest {
             factory=proxy(EntityManagerFactory.class,(method,args)->identity(method,args,"inert-known-factory"));
             var tx=proxy(EntityTransaction.class,(method,args)->method.equals("isActive")?!mode.equals("inactive"):identity(method,args,"inert-entity-transaction"));
             var session=proxy(Session.class,(method,args)->{if(method.equals("doReturningWork"))return ((ReturningWork<?>)args[0]).execute(sessionConnection);return identity(method,args,"inert-session");});
-            em=proxy(EntityManager.class,(method,args)->switch(method){case "isOpen"->!mode.equals("closedEm");case "getTransaction"->tx;case "unwrap"->{assertThat(args[0]).isEqualTo(Session.class);yield session;}default->identity(method,args,"inert-entity-manager");});
+            em=proxy(EntityManager.class,(method,args)->switch(method){case "isOpen"->!closedAfterCapture&&!mode.equals("closedEm");case "getTransaction"->tx;case "unwrap"->{assertThat(args[0]).isEqualTo(Session.class);yield session;}default->identity(method,args,"inert-entity-manager");});
             jdbc=new JdbcTemplate(dataSource){@Override public <T> List<T> query(String sql,RowMapper<T> mapper,Object... args){queries.incrementAndGet();throw new AssertionError("INERT_PROOF_BOUNDARY");}@Override public List<Map<String,Object>> queryForList(String sql,Object... args){queries.incrementAndGet();throw new AssertionError("INERT_PROOF_BOUNDARY");}};
         }
         void bind(){TransactionSynchronizationManager.setActualTransactionActive(true);TransactionSynchronizationManager.bindResource(dataSource,new ConnectionHolder(physical));if(!mode.equals("missingEm"))TransactionSynchronizationManager.bindResource(factory,new EntityManagerHolder(em));}

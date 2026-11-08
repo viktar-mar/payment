@@ -47,3 +47,15 @@ Official public semantics: [advance](https://docs.stripe.com/api/test_clocks/adv
 ## Execution constraints
 
 No local Docker, DB/SQL, Spring/application/browser/socket/provider/Stripe/Sandbox/native/financial execution; no old operations/DISPATCHING, archives or keys; no Python, installation, default Maven or broad local discovery. Workers read/edit/report source only: no execution/compiler/tests/Git/network/runtime/children. Root owns audited cached verification and Git/GitHub publication. Preserve worktree and reports; no cleanup, PR or merge.
+
+## Whole-review completion protocol clarification
+
+Fresh inspection and firstclaim authenticate the full immutable stored admission/preparation before acquiring the preparation row FOR NO KEY UPDATE NOWAIT, then refuse any committed claim in a separate fresh READ COMMITTED query before lifecycle locks. The lock remains through firstclaim commit. Existing owned continuation takes compatible preparation KEY SHARE and never this fresh-entry gate. Plain INSERT and all canonical current checks remain.
+
+Supported positive writers use the configured, known physical JPA/JDBC fresh-transaction protocol. Each positive firstclaim/ACK/READY registers an independent beforeCommit guard: flush only the already bound known EntityManager, verify the same physical caller, and recheck original invocation/current authority/deadlines under remaining limits. Cleanup has no positive completion guard and remains possible after expiry/drift. There is no postcommit expiry check on terminal READY.
+
+Statement and deferred SQL triggers remain mandatory defense, but unrestricted raw DML that controls SET CONSTRAINTS can force pending checks before COMMIT. PostgreSQL offers no unconditional user COMMIT callback. Therefore references above to final positive checks mean the controlled completion protocol plus default deferred database checks, not an unconditional wall-clock COMMIT guarantee for arbitrary raw transaction control. Such raw control is unsupported writer authority. No protection against arbitrary database-owner or server-code changes after that trusted boundary is claimed. Reverse-order early-drain then expiry/drift tests must exercise the supported protocol and refuse; existing raw statement/deferred regressions remain strict.
+
+New grace-specific snapshot assertions project only the exact allowed original operation and explicitly expected own stop, compare every old row, and assert those permitted deltas and selected sample separately. Existing snapshot helpers/callers remain unchanged.
+
+The V39 provider INSERT authenticates its immutable stored lineage before using the same READ COMMITTED fresh-entry mutex. Its update and receipt paths preserve continuation-compatible preparation locks. The completion callback verifies the original DataSource holder, EMF holder, open active EntityManager and underlying physical connection before flushing. If its original budget is already invalid, the existing zero-budget database refusal raises SQLSTATE 23514 under the bounds already installed in that transaction.

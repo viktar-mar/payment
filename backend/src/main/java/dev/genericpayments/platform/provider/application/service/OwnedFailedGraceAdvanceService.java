@@ -21,7 +21,11 @@ public final class OwnedFailedGraceAdvanceService {
     public OwnedFailedGraceAdvanceService(OwnedFailedRenewalService failures,OwnedFailedGraceAdvanceStore store,SubscriptionTransactionPort transactions,Clock utc){this.failures=Objects.requireNonNull(failures);this.store=Objects.requireNonNull(store);this.transactions=Objects.requireNonNull(transactions);this.utc=Objects.requireNonNull(utc);}
     public PreparationContext inspect(dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal.Admission admission,GraceLastSecondPreparation p,InvocationBudget budget){
         fresh();checkpoint(budget,null,null);
-        return transactions.requiresNew(()->{store.beforeAuthorityInTransaction(budget);checkpoint(budget,null,null);var c=failures.withGraceLastSecondInTransaction(admission,p,Function.identity());checkpoint(budget,null,null);return c;});
+        return transactions.requiresNew(()->{
+            store.beforeAuthorityInTransaction(budget);checkpoint(budget,null,null);
+            store.beforeFreshEntryInTransaction(admission,p,budget);checkpoint(budget,null,null);
+            var c=failures.withGraceLastSecondInTransaction(admission,p,Function.identity());checkpoint(budget,null,null);return c;
+        });
     }
     public ProviderOperation claim(PreparationContext c,String claimant,InvocationBudget b){
         fresh();if(!OwnedFailedGraceAdvance.validClaimant(claimant))throw denied();
@@ -59,6 +63,9 @@ public final class OwnedFailedGraceAdvanceService {
         fresh();Objects.requireNonNull(expected);checkpoint(b,claim,ack);
         return transactions.requiresNew(()->{
             store.beforeAuthorityInTransaction(b);checkpoint(b,claim,ack);
+            if(claim==null&&ack==null){
+                store.beforeFreshEntryInTransaction(expected.admission(),expected.preparation(),b);checkpoint(b,null,null);
+            }
             var result=failures.withGraceLastSecondInTransaction(expected.admission(),expected.preparation(),actual->{
                 if(!actual.equals(expected))throw denied();checkpoint(b,claim,ack);var value=effect.apply(actual);checkpoint(b,claim,ack);store.beforeAuthorityInTransaction(b);checkpoint(b,claim,ack);return value;
             });

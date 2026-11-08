@@ -11,6 +11,20 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Explicit inert selection only: real failed-renewal authority, transactional memory receipts. */
 class OwnedFailedGraceAdvanceServiceTest {
+    @Test void bothConsumedEntriesRefuseBeforeLifecycleWhileOriginalContinuationSkipsFreshEntry(){
+        var f=new OwnedFailedGraceAdvanceInertFixture();var c=f.context;
+        f.service.inspect(c.admission(),c.preparation(),f.budget);
+        assertThat(f.trace()).containsSubsequence("begin","grace-limit","grace-fresh-entry","graceLocks","commit");
+        f.trace().clear();var claim=f.claim();
+        assertThat(f.trace()).containsSubsequence("begin","grace-limit","grace-fresh-entry","graceLocks","grace-firstclaim","commit");
+        for(Runnable duplicate:List.<Runnable>of(()->f.service.inspect(c.admission(),c.preparation(),f.newBudget()),()->f.service.claim(c,"delayed-original",f.newBudget()))){
+            f.trace().clear();assertThatThrownBy(duplicate::run).hasMessage("fresh grace entry refused");
+            assertThat(f.trace()).containsExactly("begin","grace-limit","grace-fresh-entry","rollback");
+        }
+        f.trace().clear();f.service.inspectClaim(c,claim,f.budget);var ack=f.acknowledge(claim);
+        f.service.inspectAck(c,ack,f.budget);f.service.recordReady(c,ack,f.ready(),f.now(),f.budget);
+        assertThat(f.trace()).doesNotContain("grace-fresh-entry");assertThat(f.stops()).isZero();
+    }
     @Test void firstClaimAckAndIndependentReadyUseOriginalSavedIdentityAndNeverFinancialAuthority(){
         var f=new OwnedFailedGraceAdvanceInertFixture();var before=f.financialState();var claim=f.claim();
         assertThat(claim.kind()).isEqualTo(Kind.OWNED_GRACE_CLOCK_ADVANCE);assertThat(claim.resourceId()).isEqualTo(f.context.preparation().id());

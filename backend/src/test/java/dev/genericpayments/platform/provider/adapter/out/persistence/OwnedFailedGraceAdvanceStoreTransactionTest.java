@@ -56,8 +56,31 @@ class OwnedFailedGraceAdvanceStoreTransactionTest {
             }finally{h.unbind();}
         }
     }
+    @Test void completionRevalidatesCapturedCallerAndRejectsReboundHoldersOrClosedManagerBeforeFlushOrSql(){
+        for(var change:List.of("connection-holder","entity-manager-holder","foreign-pair","closed")){
+            var h=new OwnedFailedRenewalStoreTransactionTest.JpaBoundary("valid");h.bind();
+            try{
+                var caller=OwnedGraceCallerConnection.capture(h.jdbc,h.factory,"lost original caller");
+                assertThat(caller.requireSame()).isSameAs(h.em);
+                if(change.equals("closed"))h.closedAfterCapture=true;
+                else{
+                    var replacement=change.equals("foreign-pair")?new OwnedFailedRenewalStoreTransactionTest.JpaBoundary("valid"):h;
+                    if(!change.equals("entity-manager-holder")){
+                        TransactionSynchronizationManager.unbindResource(h.dataSource);
+                        TransactionSynchronizationManager.bindResource(h.dataSource,new org.springframework.jdbc.datasource.ConnectionHolder(replacement.physical));
+                    }
+                    if(!change.equals("connection-holder")){
+                        TransactionSynchronizationManager.unbindResource(h.factory);
+                        TransactionSynchronizationManager.bindResource(h.factory,new org.springframework.orm.jpa.EntityManagerHolder(replacement.em));
+                    }
+                }
+                assertThatThrownBy(()->caller.requireSame().flush()).as(change).isInstanceOf(IllegalStateException.class).hasMessage("lost original caller");
+                assertThat(h.queries).hasValue(0);
+            }finally{h.unbind();}
+        }
+    }
     private List<Runnable> entries(OwnedFailedGraceAdvanceStore s,dev.genericpayments.platform.provider.application.model.OwnedFailedGraceAdvance.PreparationContext c){
         var at=Instant.parse("2026-11-08T12:00:00Z");var budget=new InvocationBudget(Clock.fixed(at,ZoneOffset.UTC),()->0);
-        return List.of(()->s.beforeAuthorityInTransaction(budget),()->s.firstClaimInTransaction(c,"original",at,budget),()->s.requireClaimInTransaction(c,null,at,budget),()->s.acknowledgeInTransaction(c,null,null,at,at,budget),()->s.requireAcknowledgedInTransaction(c,null,at,budget),()->s.recordReadyInTransaction(c,null,null,at,at,budget),()->s.uncertainInTransaction(c,null,null,budget,at));
+        return List.of(()->s.beforeAuthorityInTransaction(budget),()->s.beforeFreshEntryInTransaction(c==null?null:c.admission(),c==null?null:c.preparation(),budget),()->s.firstClaimInTransaction(c,"original",at,budget),()->s.requireClaimInTransaction(c,null,at,budget),()->s.acknowledgeInTransaction(c,null,null,at,at,budget),()->s.requireAcknowledgedInTransaction(c,null,at,budget),()->s.recordReadyInTransaction(c,null,null,at,at,budget),()->s.uncertainInTransaction(c,null,null,budget,at));
     }
 }

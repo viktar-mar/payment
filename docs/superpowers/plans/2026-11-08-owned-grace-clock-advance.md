@@ -71,3 +71,9 @@
 - [ ] Fresh whole-change review of complete7014941..finalhead package, alltasks/source constraints and deferredfindings; one consolidated fixwave and one scoped rereview if needed. No open importantfindings.
 - [ ] Root finalsourcehash/whitespace/cleantrackedtree checks, commit/push currentbranch understandingpermission. Wait all4 exacthead fullCIjobs, dedicatedrenewal and bothpackaging markers. Verify disjointbackend counts and actualnewgenuine cases, no oldskip/testweakening. No localruntime or native action.
 - [ ] Normalize hosted receipts without rawlogsave, record completedtask/publication and exhaustive Rulings/costs. Preserve workspace/reports underuseroverride, noPR/merge/cleanup. Full5B remainsNOT_ACCEPTED/nativeNOT_RUN; nextseparate step is later-time selector/access/phase integration.
+
+### Consolidated whole-review fix wave
+
+Resolve all three whole-review findings before publication: exact grace-only snapshot deltas; authenticated fresh-entry NO KEY UPDATE gate before lifecycle locks (compatible with continuation KEY SHARE); independent known-caller JPA beforeCommit proof even if constraints were forced early, with explicit unrestricted raw-DML boundary. Apply the spec's whole-review clarification. Tests first, Root RED/GREEN, one consolidated implementation and one scoped rereview. All historical guards, tests and native restrictions remain.
+
+Root observed the ordering regression RED against the old service and the expected missing-API RED at the frozen whole-review tests. The source fix shares the fresh-entry mutex with the authenticated provider INSERT and preserves the plain INSERT. Eleven added hosted invocations cover exact snapshot rollback, the held original SDK request with three duplicate entry paths, immutable proof before the held mutex, and six early-drain completion cases. The earlier 230 inert passes and 333 compiled genuine invocations belong to the preceding source revision.
