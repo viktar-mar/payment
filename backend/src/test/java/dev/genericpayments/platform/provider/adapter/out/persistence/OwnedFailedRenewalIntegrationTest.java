@@ -1323,6 +1323,9 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var acknowledged=confirmationRows();int confirmedCalls=http.calls.size();
         recoveryCompositionRefused(recovery::confirm);assertThat(recovery.state()).isEqualTo(State.CONFIRMED);
         assertThat(confirmationRows()).isEqualTo(acknowledged);assertThat(http.calls).hasSize(confirmedCalls);assertThat(financialState()).isEqualTo(before);
+        var paymentEventsBeforeObserve=jdbc.queryForList("select * from payment_events");
+        var subscriptionEventsBeforeObserve=jdbc.queryForList("select * from subscription_events");
+        var callbacksBeforeObserve=jdbc.queryForList("select * from outbox_events");
         int observed=http.calls.size();recoveredGraph(p.prepared());
         var publication=recovery.observe();assertObservationSlice(p.prepared(),observed,15);
         assertThat(recovery.state()).isEqualTo(State.COMPLETE);assertThat(recovery.confirmation()).containsSame(ack);assertThat(recovery.publication()).containsSame(publication);
@@ -1333,6 +1336,58 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(jdbc.queryForObject("select settlement from subscription_billing_records where id=?",String.class,c.reservation().failure().billId())).isEqualTo("CONFIRMED_CASH");
         assertThat(http.calls.subList(start,http.calls.size()).stream().filter(r->r.method().name().equals("POST"))).hasSize(1);
         assertThat(operations.findById(ack.operation().id())).contains(ack.operation());
+        var recoveredPayment=publication.publication().paymentId();var originalSubscription=c.subscription().id();var originalDebt=c.reservation().failure().billId();
+        assertThat(jdbc.queryForMap("select * from payments where id=?",recoveredPayment))
+            .containsEntry("site_id",site.value()).containsEntry("customer_id",customer.value()).containsEntry("payment_account_id",billing.id().value())
+            .containsEntry("subscription_id",originalSubscription).containsEntry("billing_record_id",originalDebt).containsEntry("source","SUBSCRIPTION");
+        var paymentEventsAfterObserve=jdbc.queryForList("select * from payment_events");
+        assertThat(paymentEventsAfterObserve).containsAll(paymentEventsBeforeObserve).hasSize(paymentEventsBeforeObserve.size()+1);
+        var recoveryPaymentEvents=paymentEventsAfterObserve.stream().filter(event->!paymentEventsBeforeObserve.contains(event)).toList();
+        assertThat(recoveryPaymentEvents).singleElement().satisfies(event->assertThat(event)
+            .containsEntry("payment_id",recoveredPayment).containsEntry("site_id",site.value()).containsEntry("payment_account_id",billing.id().value())
+            .containsEntry("event_type","PAYMENT_SUCCEEDED").containsEntry("source","PROVIDER_EVENT").containsEntry("sequence_number",1L)
+            .containsEntry("provider_object_id",c.reservation().failure().paymentIntent()).containsEntry("amount_minor",1000L).containsEntry("currency","EUR"));
+        var recoveryPaymentEvent=recoveryPaymentEvents.getFirst();
+        var subscriptionEventsAfterObserve=jdbc.queryForList("select * from subscription_events");
+        assertThat(subscriptionEventsAfterObserve).containsAll(subscriptionEventsBeforeObserve).hasSize(subscriptionEventsBeforeObserve.size()+1);
+        var recoverySubscriptionEvents=subscriptionEventsAfterObserve.stream().filter(event->!subscriptionEventsBeforeObserve.contains(event)).toList();
+        assertThat(recoverySubscriptionEvents).singleElement().satisfies(event->assertThat(event)
+            .containsEntry("subscription_id",originalSubscription).containsEntry("site_id",site.value()).containsEntry("payment_account_id",billing.id().value())
+            .containsEntry("event_type","PERIOD_PAID").containsEntry("source","RECONCILIATION").containsEntry("billing_record_id",originalDebt)
+            .containsEntry("revision",c.subscription().revision()+1).containsEntry("provider_reference",receipt.reference())
+            .containsEntry("payment_id",null).containsEntry("operation_id",null));
+        var recoverySubscriptionEvent=recoverySubscriptionEvents.getFirst();
+        var callbacksAfterObserve=jdbc.queryForList("select * from outbox_events");
+        assertThat(callbacksAfterObserve).containsAll(callbacksBeforeObserve).hasSize(callbacksBeforeObserve.size()+2);
+        var recoveryCallbacks=callbacksAfterObserve.stream().filter(event->!callbacksBeforeObserve.contains(event)).toList();
+        assertThat(recoveryCallbacks).extracting(event->event.get("callback_type")).containsExactlyInAnyOrder("payment.succeeded","subscription.updated");
+        assertThat(recoveryCallbacks.stream().filter(event->event.get("source_kind").equals("PAYMENT")).toList()).singleElement()
+            .satisfies(event->assertThat(event).containsEntry("id",recoveryPaymentEvent.get("id")).containsEntry("payment_id",recoveredPayment)
+                .containsEntry("site_id",site.value()).containsEntry("payment_account_id",billing.id().value()).containsEntry("callback_type","payment.succeeded")
+                .containsEntry("subscription_id",null).containsEntry("subscription_event_id",null).containsEntry("status","PENDING").containsEntry("attempt_count",0));
+        assertThat(recoveryCallbacks.stream().filter(event->event.get("source_kind").equals("SUBSCRIPTION")).toList()).singleElement()
+            .satisfies(event->assertThat(event).containsEntry("id",recoverySubscriptionEvent.get("id")).containsEntry("subscription_event_id",recoverySubscriptionEvent.get("id"))
+                .containsEntry("subscription_id",originalSubscription).containsEntry("site_id",site.value()).containsEntry("payment_account_id",billing.id().value())
+                .containsEntry("callback_type","subscription.updated").containsEntry("payment_id",null).containsEntry("status","PENDING").containsEntry("attempt_count",0));
+        var paymentCallbackPayload=jdbc.queryForMap("""
+            select payload->>'event_id' as event_id,payload->>'event_type' as event_type,payload->>'site_id' as site_id,
+             payload->>'payment_id' as payment_id,payload->>'subscription_id' as subscription_id,payload->>'billing_record_id' as billing_record_id,
+             payload->>'customer_id' as customer_id,payload->>'billing_kind' as billing_kind,payload->>'payment_status' as payment_status,
+             payload->>'amount_minor' as amount_minor,payload->>'currency' as currency from outbox_events where id=?
+            """,recoveryPaymentEvent.get("id"));
+        assertThat(paymentCallbackPayload).containsEntry("event_id",recoveryPaymentEvent.get("id").toString()).containsEntry("event_type","payment.succeeded")
+            .containsEntry("site_id",site.value().toString()).containsEntry("payment_id",recoveredPayment.toString()).containsEntry("subscription_id",originalSubscription.toString())
+            .containsEntry("billing_record_id",originalDebt.toString()).containsEntry("customer_id",customer.value().toString()).containsEntry("billing_kind","RENEWAL")
+            .containsEntry("payment_status","SUCCEEDED").containsEntry("amount_minor","1000").containsEntry("currency","EUR");
+        var subscriptionCallbackPayload=jdbc.queryForMap("""
+            select payload->>'event_id' as event_id,payload->>'event_type' as event_type,payload->>'site_id' as site_id,
+             payload->>'subscription_id' as subscription_id,payload->>'billing_record_id' as billing_record_id,payload->>'customer_id' as customer_id,
+             payload->>'revision' as revision,payload->>'state' as state,payload->>'payment_id' as payment_id from outbox_events where id=?
+            """,recoverySubscriptionEvent.get("id"));
+        assertThat(subscriptionCallbackPayload).containsEntry("event_id",recoverySubscriptionEvent.get("id").toString()).containsEntry("event_type","subscription.updated")
+            .containsEntry("site_id",site.value().toString()).containsEntry("subscription_id",originalSubscription.toString()).containsEntry("billing_record_id",originalDebt.toString())
+            .containsEntry("customer_id",customer.value().toString()).containsEntry("revision",Long.toString(c.subscription().revision()+1))
+            .containsEntry("state","ACTIVE").containsEntry("payment_id",null);
         var settled=financialState();var settledReceipts=confirmationRows();int settledCalls=http.calls.size();
         recoveryCompositionRefused(recovery::confirm);recoveryCompositionRefused(recovery::observe);
         assertThat(recovery.state()).isEqualTo(State.COMPLETE);assertThat(recovery.confirmation()).containsSame(ack);assertThat(recovery.publication()).containsSame(publication);

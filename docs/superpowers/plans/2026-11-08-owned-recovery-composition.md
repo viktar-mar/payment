@@ -45,6 +45,6 @@
 
 ### Publication
 
-- [ ] Fresh independent whole-change review, one consolidated fix wave/scoped rereview if needed. No unresolved important finding.
+- [x] Fresh independent whole-change review, one consolidated fix wave/scoped rereview if needed. No unresolved important finding.
 - [ ] Verify source hashes/diff, commit/push and await full Offline CI(all4jobs) plus dedicated renewal CI on exact head. Inspect both backend totals, genuine new composition cases,205 prior targeted cases where relevant and both runtime packaging markers, no raw log publication.
 - [ ] Record final receipt and every Ruling/cost, preserve all reports/worktree. No native/local operational run, cleanup, PR or merge. Full5B remains NOT_ACCEPTED.
