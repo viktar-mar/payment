@@ -15,14 +15,16 @@ import static org.assertj.core.api.Assertions.*;
 /** Test-only bridge: the existing real failed-renewal service and FactService remain the authority.
  * Only the new append-only receipts are in memory. No SDK, datasource, runtime or IO exists here. */
 public final class OwnedFailedGraceAdvanceInertFixture {
-    final OwnedFailedRenewalServiceTest.Harness h=new OwnedFailedRenewalServiceTest.Harness(false,"alias",900000);
+    final OwnedFailedRenewalServiceTest.Harness h;
     final MemoryStore store=new MemoryStore();
     public final OwnedFailedGraceAdvanceService service;
     public final PreparationContext context;
     public final InvocationBudget budget;
-    long nanos;long transactionId;Runnable beforeCommit=()->{},afterCommit=()->{};
+    long nanos;long transactionId;Runnable beforeCommit=()->{},afterCommit=()->{};boolean adapterBudget;
     public OwnedFailedGraceAdvanceInertFixture(){this(0);}
-    public OwnedFailedGraceAdvanceInertFixture(long enteredNanos){
+    public OwnedFailedGraceAdvanceInertFixture(long enteredNanos){this(enteredNanos,"alias");}
+    public OwnedFailedGraceAdvanceInertFixture(long enteredNanos,String credentialAlias){
+        h=new OwnedFailedRenewalServiceTest.Harness(false,credentialAlias,900000);
         h.fail();var p=h.service.prepareGraceLastSecond(h.admission);
         h.utc=h.utc.plusNanos(enteredNanos);
         var tx=new SubscriptionTransactionPort(){
@@ -56,6 +58,18 @@ public final class OwnedFailedGraceAdvanceInertFixture {
     public GraceAdvanceReady savedReady(){return store.ready;}
     public int stops(){return store.stops;}
     public void afterEffect(Runnable effect){store.afterEffect=effect;}
+    /** Opt-in only for the actual SDK adapter, which must create its own single original budget. */
+    public void acceptAdapterBudget(){adapterBudget=true;}
+    public long nanos(){return nanos;}
+    public InvocationBudget originalBudget(){return store.original;}
+    public List<String> receiptCalls(){return List.copyOf(store.calls);}
+    public void beforeCommit(Runnable effect){beforeCommit=effect;}
+    public void afterCommit(Runnable effect){afterCommit=effect;}
+    public void afterLock(Runnable effect){store.afterLock=effect;}
+    public void failAck(){store.failAck=true;}
+    public void failReady(){store.failReady=true;}
+    public void drift(String kind){switch(kind){case "sample"->h.billingSecond++;case "mode"->h.isolated=false;case "owner","account","source"->h.foreign=true;case "debt"->h.sequence++;case "preparation"->h.preparation=null;case "stop"->h.stopped=true;default->throw new IllegalArgumentException("Unknown inert drift");}}
+    public void existingStatus(ProviderOperation.Status status){var claim=claim();store.row=copy(claim,status,status==ProviderOperation.Status.RESERVED?0:2,null,null,null);}
     public boolean active(){return h.active;}
     static ProviderOperation copy(ProviderOperation o,ProviderOperation.Status status,long version,String reference,String owner,Instant lease){return new ProviderOperation(o.id(),o.accountId(),o.externalAccountId(),o.credentialsRef(),o.kind(),o.resourceId(),o.operationKey(),o.fingerprint(),status,reference,o.firstDispatchedAt(),o.retryBefore(),owner,lease,version);}
 
@@ -72,7 +86,7 @@ public final class OwnedFailedGraceAdvanceInertFixture {
             assertThat(c).isEqualTo(context);if(original!=b||row==null||!row.equals(supplied)||claimTransaction==transactionId||committedTransaction<claimTransaction)throw new IllegalStateException("original committed claim required");
         }
         public ProviderOperation firstClaimInTransaction(PreparationContext c,String owner,Instant now,InvocationBudget b){
-            boundary("firstclaim");assertThat(c).isEqualTo(context);assertThat(b).isSameAs(budget);
+            boundary("firstclaim");assertThat(c).isEqualTo(context);if(!adapterBudget)assertThat(b).isSameAs(budget);else assertThat(b).isNotNull();
             if(row!=null)throw new IllegalStateException("consumed firstclaim");var p=c.preparation();var a=c.account();var at=now.truncatedTo(ChronoUnit.MICROS);
             row=new ProviderOperation(UUID.randomUUID(),a.id(),a.externalAccountId(),a.credentialsRef(),ProviderOperation.Kind.OWNED_GRACE_CLOCK_ADVANCE,p.id(),p.operationKey(),p.fingerprint(),ProviderOperation.Status.DISPATCHING,null,at,at.plusSeconds(23*3600),owner,at.plusSeconds(60),1);
             original=b;claimant=owner;claimTransaction=transactionId;writes++;afterEffect.run();return row;
