@@ -64,7 +64,14 @@ class StripeBillingOwnedFailedGraceAdvanceAdapterTest {
     }
     @Test void supportedAdvancingDetailsMustHaveOnlyTheExactIntegralTargetShape(){
         for(String phase:List.of("get","post","poll"))for(String details:List.of("{\"advancing\":{\"extra\":1}}","{\"advancing\":{\"target_frozen_time\":null}}","{\"advancing\":{},\"internal_failure\":{}}")){var f=new Fixture();f.queueBad(phase,replace(f.phaseClock(phase),"status_details",details));refused(f::advance);f.consumed(phase);}
-        var f=new Fixture();for(String phase:List.of("get","post","poll"))f.sdk.http.reply(replace(f.phaseClock(phase),"status_details","{\"advancing\":{\"target_frozen_time\":"+f.target()+"}}"));assertThat(f.advance()).isNotNull();
+        var f=new Fixture();for(String phase:List.of("get","post","poll"))f.sdk.http.reply(replace(f.phaseClock(phase),"status_details","{\"advancing\":{\"target_frozen_time\":"+(phase.equals("get")?f.previous():f.target())+"}}"));assertThat(f.advance()).isNotNull();assertThat(f.local.stops()).isZero();assertThat(f.posts()).hasSize(1);
+    }
+    @Test void preflightReadyWithFutureAdvancingDetailsCannotAuthorizePost(){
+        var f=new Fixture();var financial=f.local.financialState();
+        f.sdk.http.reply(replace(f.phaseClock("get"),"status_details","{\"advancing\":{\"target_frozen_time\":"+f.target()+"}}"));
+        f.sdk.http.reply(f.phaseClock("post"));f.sdk.http.reply(f.phaseClock("poll"));
+        refused(f::advance);f.onlyUnknown();assertThat(f.gets()).hasSize(1);assertThat(f.posts()).isEmpty();
+        assertThat(f.local.receiptCalls().stream().filter("cleanup"::equals).count()).isEqualTo(1);assertThat(f.local.financialState()).isEqualTo(financial);
     }
     @ParameterizedTest @ValueSource(strings={"id-null","object-number","name-boolean","status-array","live-string","created-string","created-fraction","created-overflow","deleted-null","deleted-true","deleted-string","details-array","details-string","details-unknown","details-internal","advancing-null","advancing-array","target-string","target-fraction","target-overflow","target-duplicate","null","invalid-json"})
     void literalMalformedWireCannotBecomePositiveEvidenceAtAnyPhase(String bad){

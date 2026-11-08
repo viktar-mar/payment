@@ -58,7 +58,8 @@ public final class StripeBillingOwnedFailedGraceAdvanceAdapter {
             var before=call(budget,claim,null,options->client.v1().testHelpers().testClocks().retrieve(reference,options));
             service.inspectClaim(context,claim,budget);
             var predecessor=observation(before,context);
-            if(!"ready".equals(predecessor.status())||predecessor.frozenTime()!=context.admission().ready().observation().frozenTime())throw unavailable();
+            if(!"ready".equals(predecessor.status())||predecessor.frozenTime()!=context.admission().ready().observation().frozenTime()
+                    ||predecessor.advancingTarget()!=null&&predecessor.advancingTarget()!=predecessor.frozenTime())throw unavailable();
             service.inspectClaim(context,claim,budget);
             var params=TestClockAdvanceParams.builder().setFrozenTime(context.preparation().target()).build();
             var post=call(budget,claim,context.preparation().operationKey(),options->client.v1().testHelpers().testClocks().advance(reference,params,options));
@@ -86,6 +87,7 @@ public final class StripeBillingOwnedFailedGraceAdvanceAdapter {
     }
     private static void requireProgress(TestClockAck observed,PreparationContext c){
         long previous=c.admission().ready().observation().frozenTime(),target=c.preparation().target();
+        if(observed.advancingTarget()!=null&&observed.advancingTarget()!=target)throw unavailable();
         if("ready".equals(observed.status())?observed.frozenTime()!=target:
                 !"advancing".equals(observed.status())||observed.frozenTime()<previous||observed.frozenTime()>target)throw unavailable();
     }
@@ -109,7 +111,7 @@ public final class StripeBillingOwnedFailedGraceAdvanceAdapter {
             }
             var result=new TestClockAck(raw.get("id").textValue(),raw.get("object").textValue(),false,raw.get("name").textValue(),
                 raw.get("frozen_time").longValue(),raw.get("status").textValue(),raw.get("created").longValue(),raw.get("deletes_after").longValue(),target);
-            if(!OwnedFailedGraceAdvance.sameClock(result,context.admission().ready().observation())||target!=null&&target!=context.preparation().target())throw unavailable();
+            if(!OwnedFailedGraceAdvance.sameClock(result,context.admission().ready().observation()))throw unavailable();
             return result;
         }catch(java.io.IOException malformed){throw unavailable();}
     }
