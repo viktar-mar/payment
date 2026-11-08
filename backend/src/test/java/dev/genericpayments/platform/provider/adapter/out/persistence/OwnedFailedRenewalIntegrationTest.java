@@ -50,6 +50,9 @@ import dev.genericpayments.platform.sites.application.port.out.LockSitePort;
 import dev.genericpayments.platform.customers.application.port.out.CustomerStore;
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
 import dev.genericpayments.platform.support.StripeBillingFirstRenewalCompositionFixture;
+import dev.genericpayments.platform.support.OwnedFailedRenewalBillingTime;
+import dev.genericpayments.platform.support.OwnedFirstRenewalBillingTime;
+import dev.genericpayments.platform.support.OwnedSubscriptionBillingTime;
 import java.lang.reflect.*;
 import java.time.*;
 import java.util.*;
@@ -111,12 +114,31 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     private final ExactTime time=new ExactTime();
     private class ExactTime implements SubscriptionBillingTimePort {
         Instant selected; boolean driftSecondSample,ordinary; int samples;
+        OwnedFailedRenewalBillingTime persisted;
+        final List<Sample> persistedSamples=new ArrayList<>();
+        final List<Instant> persistedOperationalTimes=new ArrayList<>();
+        int beforeFailedAdmissionSamples;
+        void usePersisted() {
+            persisted=new OwnedFailedRenewalBillingTime(jdbc,new OwnedFirstRenewalBillingTime(jdbc,new OwnedSubscriptionBillingTime(jdbc)));
+        }
         public Sample sample(PaymentAccountId account,SiteId suppliedSite,CustomerId suppliedCustomer,Instant utc) {
+            if(persisted!=null) {
+                var holder=org.springframework.transaction.support.TransactionSynchronizationManager.getResource(jdbc.getDataSource());
+                var sample=persisted.sample(account,suppliedSite,suppliedCustomer,utc);
+                assertThat(persisted.sampledConnectionHolder).isSameAs(holder);
+                assertThat(persisted.sampledTransaction).isEqualTo(jdbc.queryForObject("select pg_current_xact_id()::text",String.class));
+                // The fixed initial period ends at 1702678400; original READY2 is E + 3600.
+                assertThat(sample).isEqualTo(persistedExpected());
+                persistedSamples.add(sample);persistedOperationalTimes.add(utc);
+                if(count("stripe_billing_failed_renewals")==0)beforeFailedAdmissionSamples++;
+                return sample;
+            }
             if(!transaction.active() || selected==null || !billing.id().equals(account) || !site.equals(suppliedSite) || !customer.equals(suppliedCustomer)) throw new IllegalStateException("foreign or unarmed isolated owner");
             samples++;
             return new Sample(driftSecondSample&&samples==2?selected.plusSeconds(1):selected,ordinary?Mode.ORDINARY:Mode.ISOLATED);
         }
         public void requireUnscopedAllowed(SiteId s,CustomerId c) {
+            if(persisted!=null){persisted.requireUnscopedAllowed(s,c);return;}
             if((s==null||s.equals(site))&&(c==null||c.equals(customer))) throw new IllegalStateException("isolated owner included");
         }
     }
@@ -133,9 +155,120 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     private record Setup(OwnedFirstRenewal.Admission upstream,OwnedFirstRenewal.LaterReady ready,OwnedFirstRenewal.Boundary boundary,Admission admission) {}
     private Setup setup() {
         var upstream=paidAdmission();var first=advance(upstream,OwnedFirstRenewal.Step.BOUNDARY);var pending=boundary(upstream,first);
-        var ready=advance(upstream,OwnedFirstRenewal.Step.FINALIZATION);time.selected=Instant.ofEpochSecond(receipt.periodEnd()+3600);
+        var ready=advance(upstream,OwnedFirstRenewal.Step.FINALIZATION);
+        if(time.persisted==null)time.selected=Instant.ofEpochSecond(receipt.periodEnd()+3600);
+        else assertPersistedSampleUnchanged(); // Authenticate real READY2 through the concrete upstream selector before admission exists.
         var admission=service(store(),null).admit(upstream,ready,pending.boundary());
+        if(time.persisted!=null)assertPersistedSampleUnchanged();
         return new Setup(upstream,ready,pending.boundary(),admission);
+    }
+    private static SubscriptionBillingTimePort.Sample persistedExpected() {
+        return new SubscriptionBillingTimePort.Sample(Instant.ofEpochSecond(1702682000L),SubscriptionBillingTimePort.Mode.ISOLATED);
+    }
+    private Map<String,List<String>> selectorRows() {
+        var state=new TreeMap<>(confirmationRows());
+        for(var table:List.of("stripe_billing_first_renewals","stripe_billing_first_renewal_steps","stripe_billing_first_renewal_acks",
+                "stripe_billing_first_renewal_ready","stripe_billing_first_renewal_boundary","stripe_billing_first_renewal_read_claims",
+                "stripe_billing_first_renewal_publications","stripe_billing_clock_intents","stripe_billing_clock_ready",
+                "payment_accounts","sites","customers"))state.put(table,rows(table));
+        return state;
+    }
+    private void assertPersistedSampleUnchanged() {
+        var before=financialState();var receipts=selectorRows();int calls=http.calls.size();
+        var operational=Instant.parse("2026-11-08T12:34:56Z");
+        assertThat(transaction.required(()->time.sample(billing.id(),site,customer,operational))).isEqualTo(persistedExpected());
+        assertThat(time.persistedOperationalTimes.getLast()).isEqualTo(operational);
+        assertThat(financialState()).isEqualTo(before);assertThat(selectorRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+    }
+    @Test void persistedTimeRequiresAmbientTransactionAndDoesNotTouchTheFailedOwner() {
+        time.usePersisted();setup();var before=financialState();var receipts=selectorRows();int calls=http.calls.size();
+        assertThat(transaction.active()).isFalse();
+        assertThatThrownBy(()->time.persisted.sample(billing.id(),site,customer,Instant.now())).hasMessage("OWNED_TIME_REQUIRES_CALLER_TRANSACTION");
+        assertThat(financialState()).isEqualTo(before);assertThat(selectorRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+        assertPersistedSampleUnchanged();
+    }
+    @Test void persistedTimeRejectsForeignAccountForEnrolledSiteCustomerWithoutFallbackOrMutation() {
+        time.usePersisted();setup();var before=financialState();var receipts=selectorRows();int calls=http.calls.size();
+        var foreign=new PaymentAccountId(UUID.randomUUID());
+        assertThatThrownBy(()->transaction.required(()->time.persisted.sample(foreign,site,customer,Instant.now())))
+            .hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+        assertThat(financialState()).isEqualTo(before);assertThat(selectorRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+        assertPersistedSampleUnchanged();
+    }
+    @ParameterizedTest @ValueSource(strings={"credentials_ref='changed-inert-ref'","account_status='DISABLED'"})
+    void persistedTimeRejectsAccountAuthorityDriftWithoutWritingAndRestoresAfterRollback(String mutation) {
+        time.usePersisted();setup();var before=financialState();var receipts=selectorRows();int calls=http.calls.size();
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            assertThat(jdbc.update("update payment_accounts set "+mutation+" where id=?",billing.id().value())).isEqualTo(1);
+            var drifted=selectorRows();
+            assertThatThrownBy(()->time.persisted.sample(billing.id(),site,customer,Instant.now())).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+            assertThat(selectorRows()).isEqualTo(drifted);assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+            throw new IllegalStateException("rollback account drift control");
+        })).hasMessage("rollback account drift control");
+        assertThat(financialState()).isEqualTo(before);assertThat(selectorRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+        assertPersistedSampleUnchanged();
+    }
+    @Test void persistedTimeRejectsDamagedExactReadyAndAuthenticatesAgainAfterRollback() {
+        time.usePersisted();var s=setup();var before=financialState();var receipts=selectorRows();int calls=http.calls.size();
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            // Negative-only corruption: disable only this immutable-evidence trigger in a transaction
+            // that must roll back. No successful proof, admission, ACK or lifecycle row is inserted.
+            jdbc.execute("alter table stripe_billing_first_renewal_ready disable trigger first_renewal_ready_immutable");
+            assertThat(jdbc.update("update stripe_billing_first_renewal_ready set frozen_time=frozen_time+1 where id=?",s.ready().id())).isEqualTo(1);
+            var damaged=selectorRows();
+            assertThatThrownBy(()->time.persisted.sample(billing.id(),site,customer,Instant.now())).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+            assertThat(selectorRows()).isEqualTo(damaged);assertThat(financialState()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+            throw new IllegalStateException("rollback READY corruption control");
+        })).hasMessage("rollback READY corruption control");
+        assertThat(financialState()).isEqualTo(before);assertThat(selectorRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+        assertPersistedSampleUnchanged();
+        assertThatThrownBy(()->jdbc.update("update stripe_billing_first_renewal_ready set frozen_time=frozen_time+1 where id=?",s.ready().id()))
+            .isInstanceOf(RuntimeException.class); // The rolled-back trigger disablement did not escape.
+        assertThat(selectorRows()).isEqualTo(receipts);
+    }
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void persistedTimeUnscopedQueriesRejectAllMatchingScopesEvenAfterDurableStop(boolean stopped) {
+        time.usePersisted();var s=setup();if(stopped)service(store(),null).stop(s.admission(),Reason.AUTHORITY_DRIFT);
+        var before=financialState();var receipts=selectorRows();int calls=http.calls.size();
+        assertThatThrownBy(()->time.requireUnscopedAllowed(null,null)).hasMessage("OWNED_TIME_UNSCOPED");
+        assertThatThrownBy(()->time.requireUnscopedAllowed(site,null)).hasMessage("OWNED_TIME_UNSCOPED");
+        assertThatThrownBy(()->time.requireUnscopedAllowed(null,customer)).hasMessage("OWNED_TIME_UNSCOPED");
+        assertThatThrownBy(()->time.requireUnscopedAllowed(site,customer)).hasMessage("OWNED_TIME_UNSCOPED");
+        var foreignSite=new SiteId(UUID.randomUUID());var foreignCustomer=new CustomerId(UUID.randomUUID());
+        assertThatCode(()->time.requireUnscopedAllowed(foreignSite,null)).doesNotThrowAnyException();
+        assertThatCode(()->time.requireUnscopedAllowed(null,foreignCustomer)).doesNotThrowAnyException();
+        assertThatCode(()->time.requireUnscopedAllowed(site,foreignCustomer)).doesNotThrowAnyException();
+        assertThatCode(()->time.requireUnscopedAllowed(foreignSite,customer)).doesNotThrowAnyException();
+        if(stopped)assertThatThrownBy(()->transaction.required(()->time.persisted.sample(billing.id(),site,customer,Instant.now())))
+            .hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+        else assertPersistedSampleUnchanged();
+        assertThat(financialState()).isEqualTo(before);assertThat(selectorRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+        assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(stopped?1:0);
+    }
+    @Test void persistedTimeAbsentFailedLanePreservesPreparedHighestStepRefusalFromConcreteUpstream() {
+        time.usePersisted();var upstream=paidAdmission();var first=advance(upstream,OwnedFirstRenewal.Step.BOUNDARY);
+        var pending=boundary(upstream,first);renewals.prepare(upstream,OwnedFirstRenewal.Step.FINALIZATION,pending.boundary(),Instant.now());
+        var before=financialState();var receipts=selectorRows();int calls=http.calls.size();
+        assertThat(count("stripe_billing_failed_renewals")).isZero();
+        assertThatThrownBy(()->transaction.required(()->time.persisted.sample(billing.id(),site,customer,Instant.now())))
+            .hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+        assertThat(financialState()).isEqualTo(before);assertThat(selectorRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+    }
+    @Test void persistedTimeUsesConcreteOrdinaryFallbackForUnenrolledOwnerAndDisjointSiteCustomer() {
+        time.usePersisted();setup();var ordinaryCustomer=new CustomerId(UUID.randomUUID());
+        // Owner prerequisite only: no clock, readiness, subscription, lifecycle or financial proof is seeded.
+        jdbc.update("insert into customers(id,site_id,status,email_ciphertext,email_nonce,email_key_version,email_digest,email_digest_key_version,created_at,updated_at) values (?,?,'ACTIVE',decode(repeat('00',16),'hex'),decode(repeat('00',12),'hex'),'test-only',?,'v1',now(),now())",
+            ordinaryCustomer.value(),site.value(),"digest-"+ordinaryCustomer.value());
+        var before=financialState();var receipts=selectorRows();int calls=http.calls.size();var utc=Instant.parse("2026-11-08T12:34:56Z");
+        var expected=new SubscriptionBillingTimePort.Sample(utc,SubscriptionBillingTimePort.Mode.ORDINARY);
+        SubscriptionBillingTimePort.Sample ordinarySample=transaction.required(()->time.persisted.sample(billing.id(),site,ordinaryCustomer,utc));
+        assertThat(ordinarySample).isEqualTo(expected);
+        var foreignSite=new SiteId(UUID.randomUUID());
+        SubscriptionBillingTimePort.Sample disjointSiteSample=transaction.required(()->time.persisted.sample(billing.id(),foreignSite,customer,utc));
+        assertThat(disjointSiteSample).isEqualTo(expected);
+        assertThatCode(()->time.requireUnscopedAllowed(site,ordinaryCustomer)).doesNotThrowAnyException();
+        assertThat(financialState()).isEqualTo(before);assertThat(selectorRows()).isEqualTo(receipts);assertThat(http.calls).hasSize(calls);
+        assertPersistedSampleUnchanged();
     }
     private Snapshot snapshot(Setup s,boolean recovered,String key,Instant observed) {
         var original=s.upstream();var terms=original.receipt().intent().terms();
@@ -324,7 +457,8 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     private record Predecessor(OwnedFirstRenewal.Admission upstream,OwnedFirstRenewal.LaterReady ready,OwnedFirstRenewal.Boundary boundary) {}
     private Predecessor predecessor() {
         var u=paidAdmission();var first=advance(u,OwnedFirstRenewal.Step.BOUNDARY);var pending=boundary(u,first);
-        var ready=advance(u,OwnedFirstRenewal.Step.FINALIZATION);time.selected=Instant.ofEpochSecond(receipt.periodEnd()+3600);
+        var ready=advance(u,OwnedFirstRenewal.Step.FINALIZATION);
+        if(time.persisted==null)time.selected=Instant.ofEpochSecond(receipt.periodEnd()+3600);
         return new Predecessor(u,ready,pending.boundary());
     }
     @ParameterizedTest @ValueSource(booleans={true,false}) void opposingBranchesSerializeAndExcludeEachOther(boolean failedWins) throws Exception {
@@ -952,7 +1086,13 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     /** Genuine observer and original management reservation; stops before any provider SETUP step or proof. */
     private ReservedMethod reservedMethod(boolean browser,int sessionSeconds) {
         var s=setup();failedGraph(s);
+        int samplesBeforeFailure=time.persistedSamples.size();
         var failure=new StripeBillingOwnedFailedRenewalObserver(service(store(),null),credentials,clients,Clock.systemUTC()).observe(s.admission());
+        if(time.persisted!=null) {
+            assertThat(time.persistedSamples.size()).isGreaterThan(samplesBeforeFailure);
+            assertThat(current().debt().billingRecordId()).isEqualTo(failure.billId());
+            assertPersistedSampleUnchanged();
+        }
         var before=financialState();var methods=new JdbcOwnedFailedRenewalMethodStore(jdbc);var svc=methodService(methods);
         var authentication=managementAuthentication("genuine-owned-method");var context=authentication.context();
         if(sessionSeconds>0){
@@ -963,6 +1103,10 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             context=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext(new dev.genericpayments.platform.subscriptions.application.model.SubscriptionActor.Customer(changed),site,customer,changed.origin(),context.idempotencyKey(),context.requestId());
         }
         var r=browser?svc.reserveBrowserMethod(s.admission(),context,true):svc.reserveMethod(s.admission(),context,true);
+        if(time.persisted!=null) {
+            assertThat(r.billingSample()).isEqualTo(persistedExpected());
+            assertPersistedSampleUnchanged(); // Includes the genuine pending SETUP reservation.
+        }
         var subscription=current();var o=lifecycleOperations.find(site,subscription.id(),r.setupOperationId()).orElseThrow();
         assertThat(o.status()).isEqualTo(SubscriptionOperation.Status.RESERVED);assertThat(o.version()).isZero();
         assertThat(financialState()).isEqualTo(before);
@@ -1278,9 +1422,29 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
 
     @ParameterizedTest @ValueSource(booleans={false,true})
     void singleUseRecoveryCompositionConfirmsThenIndependentlyObservesOnlyOriginalBill(boolean legacy) throws Exception {
+        assertSingleUseRecoveryComposition(legacy,false);
+    }
+
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void persistedReadyTimeSingleUseRecoveryCompositionConfirmsThenIndependentlyObservesOnlyOriginalBill(boolean legacy) throws Exception {
+        time.usePersisted();
+        assertSingleUseRecoveryComposition(legacy,true);
+    }
+
+    private void assertSingleUseRecoveryComposition(boolean legacy,boolean persistedTime) throws Exception {
         // Both browser paths traverse the genuine original SETUP, controller permission, independent
         // binding/METHOD completion and original recovery. No positive financial evidence is DML seeded.
         var p=recoveryPrepared(legacy,0);var c=inspectRecovery(p);var before=financialState();
+        if(persistedTime) {
+            assertThat(time.selected).isNull();assertThat(time.samples).isZero();
+            assertThat(time.beforeFailedAdmissionSamples).isGreaterThanOrEqualTo(2);
+            assertThat(p.pending().reservation().billingSample()).isEqualTo(persistedExpected());
+            assertPersistedSampleUnchanged();
+            assertThat(jdbc.queryForObject("select frozen_time from stripe_billing_first_renewal_ready where id=?",Long.class,p.prepared().setup().ready().id()))
+                .isEqualTo(1702682000L);
+            assertThat(jdbc.queryForList("select billing_at from stripe_billing_failed_method_reads",java.sql.Timestamp.class))
+                .isNotEmpty().allSatisfy(at->assertThat(at.toInstant()).isEqualTo(Instant.ofEpochSecond(1702682000L)));
+        }
         var originalCash=jdbc.queryForMap("select * from payments where id=?",p.prepared().setup().upstream().payment());
         var originalBill=jdbc.queryForMap("select * from subscription_billing_records where id=?",c.reservation().failure().billId());
         var originalSetup=jdbc.queryForMap("select * from subscription_operations where id=?",c.setupOperation().id());
@@ -1298,6 +1462,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(recovery.state()).isEqualTo(State.NEW);assertThat(recovery.confirmation()).isEmpty();assertThat(recovery.publication()).isEmpty();
         recoveryCompositionRefused(recovery::observe);assertThat(recovery.state()).isEqualTo(State.NEW);assertThat(http.calls).hasSize(start);
         var ack=recovery.confirm();assertThat(recovery.state()).isEqualTo(State.CONFIRMED);assertThat(recovery.confirmation()).containsSame(ack);assertThat(recovery.publication()).isEmpty();
+        if(persistedTime)assertPersistedSampleUnchanged();
         var calls=http.calls.subList(start,http.calls.size());assertThat(calls).hasSize(18);
         var paths=new ArrayList<>(List.of("/v1/test_helpers/test_clocks/clock_owned","/v1/customers/"+receipt.intent().customerReference(),"/v1/subscriptions/"+receipt.reference(),"/v1/invoices",
             "/v1/invoices/"+p.prepared().setup().upstream().invoice()+"/lines","/v1/invoice_payments","/v1/payment_intents/"+p.prepared().setup().upstream().paymentIntent(),"/v1/charges/"+graph.charge.get("id").getAsString(),
@@ -1328,6 +1493,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var callbacksBeforeObserve=jdbc.queryForList("select * from outbox_events");
         int observed=http.calls.size();recoveredGraph(p.prepared());
         var publication=recovery.observe();assertObservationSlice(p.prepared(),observed,15);
+        if(persistedTime)assertPersistedSampleUnchanged();
         assertThat(recovery.state()).isEqualTo(State.COMPLETE);assertThat(recovery.confirmation()).containsSame(ack);assertThat(recovery.publication()).containsSame(publication);
         assertThat(publication.publication().billId()).isEqualTo(c.reservation().failure().billId());assertThat(current().debt()).isNull();
         assertThat(jdbc.queryForMap("select * from payments where id=?",p.prepared().setup().upstream().payment())).isEqualTo(originalCash);assertThat(count("payments")).isEqualTo(2);
@@ -1393,6 +1559,13 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(recovery.state()).isEqualTo(State.COMPLETE);assertThat(recovery.confirmation()).containsSame(ack);assertThat(recovery.publication()).containsSame(publication);
         assertThat(http.calls).hasSize(settledCalls);assertThat(financialState()).isEqualTo(settled);assertThat(confirmationRows()).isEqualTo(settledReceipts);
         assertThat(count("stripe_billing_failed_method_publications")).isEqualTo(1);assertThat(count("stripe_billing_failed_recovery_confirm_acks")).isEqualTo(1);
+        if(persistedTime) {
+            assertThat(time.persistedSamples).isNotEmpty().allSatisfy(sample->assertThat(sample).isEqualTo(persistedExpected()));
+            assertThat(time.persistedOperationalTimes).allSatisfy(utc->assertThat(utc).isNotEqualTo(Instant.ofEpochSecond(1702682000L)));
+            assertThat(time.samples).isZero();assertThat(time.selected).isNull();
+            assertThat(jdbc.queryForList("select billing_at from stripe_billing_failed_method_reads",java.sql.Timestamp.class))
+                .hasSize(2).allSatisfy(at->assertThat(at.toInstant()).isEqualTo(Instant.ofEpochSecond(1702682000L)));
+        }
     }
 
     private OwnedBillingFailedRenewalRecovery recoveryComposition(RecoveryPrepared p) {
