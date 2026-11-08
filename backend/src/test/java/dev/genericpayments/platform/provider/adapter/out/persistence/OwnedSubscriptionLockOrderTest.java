@@ -81,8 +81,9 @@ class OwnedSubscriptionLockOrderTest {
             if(sql.equals("select * from provider_operations where id=?")){
                 assertThat(args).containsExactly(claim.id());calls.add("provider locator");return (List<T>)List.of(claim);
             }
-            if(sql.equals("select * from provider_operations where id=? and kind<>'OWNED_RECOVERY_INTENT_CONFIRM' for update")){
+            if(sql.equals("select * from provider_operations where id=? and kind<>'OWNED_RECOVERY_INTENT_CONFIRM' and kind<>'OWNED_GRACE_CLOCK_ADVANCE' for update")){
                 assertThat(sql).contains("kind<>'OWNED_RECOVERY_INTENT_CONFIRM'");
+                assertThat(sql).contains("kind<>'OWNED_GRACE_CLOCK_ADVANCE'");
                 assertThat(args).containsExactly(claim.id());guardedProviderLocks++;calls.add("provider lock");return (List<T>)List.of(claim);
             }
             if(sql.equals("select * from stripe_billing_owned_subscriptions where payment_account_id=? and subscription_id=?"))return (List<T>)List.of(f.intent);
