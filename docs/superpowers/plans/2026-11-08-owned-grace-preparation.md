@@ -16,7 +16,7 @@
 - Workers read/edit/report source only: no execution/compiler/tests/Git/network/runtime/children. Root owns audited cached verification and Git/GitHub publication. Preserve worktree and reports; no cleanup, PR or merge.
 - Existing explicit component only: no bean, route, scheduler, launcher, export, new/later sampled business time, provider operation or claim, cash, journal, callback, lifecycle mutation or stop. V30–V37, existing READY2 selector, existing service entry-point behavior and provider policy remain unchanged.
 - One immutable G−1 preparation per failed admission, insert winner only; duplicate and competing calls refuse. Exact reload reauthenticates only and grants no dispatch continuation. Current failure, fixed captured G and full original lineage are required; no current-policy-derived time or manufactured positive proofs.
-- Whole-second G/N; READY2 < G−1 < G < G+1 < N; target minus READY2 within 56 days MONTH or 730 days YEAR. Audit UTC is independent, microsecond normalized and not future in DB. Exact versioned Java/SQL fingerprint parity.
+- Whole-second G/N; READY2 < G−1 < G < G+1 < N; G+1 minus READY2 at most 56 days MONTH or 730 days YEAR (whole planned triplet fits). Audit UTC is independent, microsecond normalized and not future in DB. Exact versioned Java/SQL fingerprint parity.
 - Source-only hosted tests compile locally; actual JDBC/Flyway/transaction/concurrency evidence requires exact-head CI. Native NOT_RUN; full5B NOT_ACCEPTED. All4 full CI jobs, dedicated renewal and both packaging markers required before final completion claim.
 
 ## Review Focus

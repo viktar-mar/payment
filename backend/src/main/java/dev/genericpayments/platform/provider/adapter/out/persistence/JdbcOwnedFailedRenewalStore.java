@@ -16,6 +16,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.ConnectionHolder;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
@@ -53,6 +54,42 @@ public final class JdbcOwnedFailedRenewalStore implements OwnedFailedRenewalStor
         identity(admission);
         require("select owned_failed_renewal_current(?)",admission.id());
         return admission;
+    }
+    @Override public void lockGraceLastSecondInTransaction(Admission admission) {
+        graceTransaction();
+        // Authenticate descriptive persisted identity before deriving any lock target from it.
+        identity(admission);
+        jdbc.queryForList("select lock_owned_failed_grace(?)",admission.id());
+        // Separate statement at READ COMMITTED: eligibility must be fresh after every lock.
+        require("select owned_failed_grace_current(?)",admission.id());
+    }
+    @Override public GraceLastSecondPreparation prepareGraceLastSecondInTransaction(Admission admission,Failure failure,Instant utcAt) {
+        lockGraceLastSecondInTransaction(admission);
+        if(failure==null||!failure.equals(failureRow(admission.id())))throw unavailable();
+        var at=utc(utcAt);var id=UUID.randomUUID();var target=OwnedFailedRenewal.graceLastSecondTarget(admission,failure);
+        var key="billing-failed-grace-v1:"+admission.id()+":1";
+        var p=new GraceLastSecondPreparation(id,admission.id(),failure.claimId(),failure.billId(),admission.ready().id(),failure.graceDeadline(),target,key,
+            OwnedFailedRenewal.graceLastSecondFingerprint(id,admission,failure,target,key,at),at);
+        int inserted=jdbc.update("""
+            insert into stripe_billing_failed_grace_preparations(id,admission_id,failure_claim_id,renewal_bill,predecessor_ready,grace_deadline,target,operation_key,fingerprint,prepared_at)
+            values(?,?,?,?,?,?,?,?,?,?)
+            """,p.id(),p.admissionId(),p.failureClaimId(),p.billId(),p.predecessorReadyId(),time(p.graceDeadline()),p.target(),p.operationKey(),p.fingerprint(),time(p.preparedAt()));
+        if(inserted!=1)throw unavailable();
+        return requireGraceLastSecondInTransaction(admission,p);
+    }
+    @Override public GraceLastSecondPreparation requireGraceLastSecondInTransaction(Admission admission,GraceLastSecondPreparation preparation) {
+        lockGraceLastSecondInTransaction(admission);
+        if(preparation==null||!admission.id().equals(preparation.admissionId()))throw unavailable();
+        var saved=jdbc.query("select * from stripe_billing_failed_grace_preparations where id=? and admission_id=?",(r,n)->new GraceLastSecondPreparation(
+            uuid(r,"id"),uuid(r,"admission_id"),uuid(r,"failure_claim_id"),uuid(r,"renewal_bill"),uuid(r,"predecessor_ready"),instant(r,"grace_deadline"),
+            r.getLong("target"),r.getString("operation_key"),r.getString("fingerprint"),instant(r,"prepared_at")),preparation.id(),admission.id())
+            .stream().filter(preparation::equals).findFirst().orElseThrow(JdbcOwnedFailedRenewalStore::unavailable);
+        var f=failureRow(admission.id());
+        if(!saved.failureClaimId().equals(f.claimId())||!saved.billId().equals(f.billId())||!saved.predecessorReadyId().equals(admission.ready().id())
+                ||!saved.graceDeadline().equals(f.graceDeadline())||saved.target()!=OwnedFailedRenewal.graceLastSecondTarget(admission,f)
+                ||!saved.fingerprint().equals(OwnedFailedRenewal.graceLastSecondFingerprint(saved.id(),admission,f,saved.target(),saved.operationKey(),saved.preparedAt())))throw unavailable();
+        require("select ?<=clock_timestamp()",time(saved.preparedAt()));
+        return saved;
     }
 
     @Override public ReadClaim claimReadInTransaction(Admission admission, Phase phase, UUID invocation, Fence fence, Instant utcAt) {
@@ -316,5 +353,10 @@ public final class JdbcOwnedFailedRenewalStore implements OwnedFailedRenewalStor
     private static Instant utc(Instant at) { if(at==null)throw unavailable();return at.truncatedTo(ChronoUnit.MICROS); }
     private static Timestamp time(Instant at) { return Timestamp.from(utc(at)); }
     private static void transaction() { if(!TransactionSynchronizationManager.isActualTransactionActive())throw new IllegalStateException("Owned failed renewal requires caller transaction"); }
+    private void graceTransaction() {
+        transaction();var dataSource=jdbc.getDataSource();
+        if(dataSource==null||!(TransactionSynchronizationManager.getResource(dataSource) instanceof ConnectionHolder holder)
+                ||!holder.isSynchronizedWithTransaction())throw new IllegalStateException("Owned failed renewal requires caller DataSource transaction");
+    }
     private static IllegalStateException unavailable() { return new IllegalStateException("Owned failed renewal authority unavailable"); }
 }

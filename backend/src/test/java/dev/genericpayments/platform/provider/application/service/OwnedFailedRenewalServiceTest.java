@@ -145,6 +145,32 @@ class OwnedFailedRenewalServiceTest {
         var h=new Harness();h.foreign=true;h.service.stop(h.admission,Reason.AUTHORITY_DRIFT);assertThat(h.stopped).isTrue();assertThat(h.trace).doesNotContain("lifecycle");
         var nested=new Harness();nested.active=true;assertThatThrownBy(()->nested.service.beginFailedRead(nested.admission,UUID.randomUUID())).isInstanceOf(IllegalStateException.class);assertThat(nested.reads).isEmpty();
     }
+    @Test void gracePreparationAndExactReloadUseOneCallerTransactionAndOriginalReadySample() {
+        var h=new Harness(false,"alias",900000);h.fail();var effects=h.effects;var sequence=h.sequence;var callbacks=h.callbacks;var cash=Set.copyOf(h.cash);
+        h.trace.clear();h.utc=UTC.plusNanos(123456789);
+        var p=h.service.prepareGraceLastSecond(h.admission);
+        assertThat(p.target()).isEqualTo(h.failure.graceDeadline().getEpochSecond()-1);
+        assertThat(p.preparedAt()).isEqualTo(h.utc.truncatedTo(java.time.temporal.ChronoUnit.MICROS));
+        assertThat(h.trace).containsExactly("begin","graceLocks","operations","lifecycle","account","subscription","bill","bill","gracePrepare","commit");
+        assertThat(h.service.requireGraceLastSecond(h.admission,p)).isEqualTo(p);
+        assertThat(h.effects).isEqualTo(effects);assertThat(h.sequence).isEqualTo(sequence);assertThat(h.callbacks).isEqualTo(callbacks);assertThat(h.cash).isEqualTo(cash);assertThat(h.billingSecond).isEqualTo(4700);assertThat(h.stopped).isFalse();
+        assertThatThrownBy(()->h.service.prepareGraceLastSecond(h.admission)).isInstanceOf(IllegalStateException.class);assertThat(h.preparation).isEqualTo(p);assertThat(h.stopped).isFalse();
+        var forged=new GraceLastSecondPreparation(UUID.randomUUID(),p.admissionId(),p.failureClaimId(),p.billId(),p.predecessorReadyId(),p.graceDeadline(),p.target(),p.operationKey(),p.fingerprint(),p.preparedAt());
+        assertThatThrownBy(()->h.service.requireGraceLastSecond(h.admission,forged)).isInstanceOf(IllegalStateException.class);assertThat(h.preparation).isEqualTo(p);assertThat(h.stopped).isFalse();
+    }
+    @Test void graceRefusalsHaveNoStopNoEffectsAndRollbackStoreExceptions() {
+        for(var bad:List.of("ambient","failure","time","ordinary","foreign","debt","stop","recovery","store","lock")) {
+            var h=new Harness(false,"alias",900000);if(!bad.equals("failure"))h.fail();var effects=h.effects;var callbacks=h.callbacks;
+            if(bad.equals("ambient"))h.active=true;if(bad.equals("time"))h.billingSecond++;if(bad.equals("ordinary"))h.isolated=false;if(bad.equals("foreign"))h.foreign=true;
+            if(bad.equals("debt"))h.failure=new Failure(h.failure.admissionId(),h.failure.claimId(),h.failure.billId(),h.failure.billVersion()+1,h.failure.invoice(),h.failure.allocation(),h.failure.paymentIntent(),h.failure.period(),h.failure.graceDeadline(),h.failure.revision(),h.failure.observationSequence(),h.failure.recordedAt());
+            if(bad.equals("stop"))h.stopped=true;if(bad.equals("recovery"))h.service.reserveExistingRecovery(h.admission);
+            h.failGrace=bad.equals("store");h.failGraceLocks=bad.equals("lock");h.trace.clear();var alreadyStopped=h.stopped;
+            assertThatThrownBy(()->h.service.prepareGraceLastSecond(h.admission)).isInstanceOf(RuntimeException.class);
+            assertThat(h.preparation).isNull();assertThat(h.effects).isEqualTo(effects);assertThat(h.callbacks).isEqualTo(callbacks);assertThat(h.stopped).isEqualTo(alreadyStopped);assertThat(h.trace).doesNotContain("stop");
+            if(bad.equals("ambient"))assertThat(h.trace).isEmpty();else assertThat(h.trace).startsWith("begin","graceLocks").endsWith("rollback");
+            if(bad.equals("lock"))assertThat(h.trace).doesNotContain("operations","lifecycle");
+        }
+    }
     static UUID id(long n) {return new UUID(0,n);}
     static OwnedFirstRenewal.Admission upstream() {return upstream("alias");}
     static OwnedFirstRenewal.Admission upstream(String credentialsRef) {
@@ -178,7 +204,7 @@ class OwnedFailedRenewalServiceTest {
         final List<UUID> operationLockTargets=new ArrayList<>();
         long sequence,billingSecond=4700;int effects,callbacks,timeCalls;boolean active,isolated=true,foreign,claimOwner=true,stopped,failReceipt,normalizeClaim,factTimeDrift,factModeDrift;Instant utc=UTC;
         dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding binding;
-        Failure failure;Recovery recovery;Publication publication;final OwnedFailedRenewalService service;
+        Failure failure;Recovery recovery;Publication publication;GraceLastSecondPreparation preparation;boolean failGrace,failGraceLocks;final OwnedFailedRenewalService service;
         SubscriptionOperationStore operationsPort;SubscriptionStore subscriptionsPort;BillingRecordStore billsPort;
         SubscriptionObservationPort observationsPort;SubscriptionBillingTimePort timePort;SubscriptionTransactionPort transactionPort;Clock clockPort;SubscriptionFactService factsPort;
         SubscriptionIsolatedMethodProofPort methodProof=SubscriptionIsolatedMethodProofPort.denied();
@@ -186,8 +212,11 @@ class OwnedFailedRenewalServiceTest {
         Harness(){this(false);}
         Harness(boolean withBinding){this(withBinding,"alias");}
         Harness(boolean withBinding,String credentialsRef){
+            this(withBinding,credentialsRef,10000);
+        }
+        Harness(boolean withBinding,String credentialsRef,long periodEnd){
             upstream=upstream(credentialsRef);first=ready(upstream,OwnedFirstRenewal.Step.BOUNDARY,null,null,1100);
-            boundary=new OwnedFirstRenewal.Boundary(id(70),upstream.id(),first,"si_owned","in_renewal",new Subscription.Period(Instant.ofEpochSecond(1100),Instant.ofEpochSecond(10000)),"a".repeat(64),UTC);
+            boundary=new OwnedFirstRenewal.Boundary(id(70),upstream.id(),first,"si_owned","in_renewal",new Subscription.Period(Instant.ofEpochSecond(1100),Instant.ofEpochSecond(periodEnd)),"a".repeat(64),UTC);
             ready=ready(upstream,OwnedFirstRenewal.Step.FINALIZATION,first.id(),boundary.id(),4700);
             admission=new Admission(id(71),upstream,ready,boundary,upstream.sourceSha(),UTC);owner=upstream.receipt().intent().clock().owner();
             s=new Subscription(upstream.receipt().intent().subscription(),owner.site(),owner.customer(),upstream.receipt().intent().terms().productId(),owner.account(),upstream.receipt().intent().terms(),upstream.receipt().intent().terms(),Subscription.Status.ACTIVE,"sub_owned",new Subscription.Period(Instant.ofEpochSecond(900),Instant.ofEpochSecond(1100)),Instant.ofEpochSecond(1100),null,null,null,null,null,2,UTC,UTC,null);
@@ -211,6 +240,9 @@ class OwnedFailedRenewalServiceTest {
             var clock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId z){return this;}public Instant instant(){return utc;}};
             var store=port(OwnedFailedRenewalStore.class,(m,a)->{if(!active)throw new AssertionError("outside tx");return switch(m){
                 case "admitInTransaction"->admission;
+                case "lockGraceLastSecondInTransaction"->{trace.add("graceLocks");current((Admission)a[0]);if(failGraceLocks)throw new IllegalStateException("lock unavailable");yield null;}
+                case "prepareGraceLastSecondInTransaction"->{trace.add("gracePrepare");current((Admission)a[0]);if(preparation!=null)throw new IllegalStateException("duplicate preparation");var f=(Failure)a[1];var at=(Instant)a[2];var id=UUID.randomUUID();var target=OwnedFailedRenewal.graceLastSecondTarget(admission,f);var key="billing-failed-grace-v1:"+admission.id()+":1";preparation=new GraceLastSecondPreparation(id,admission.id(),f.claimId(),f.billId(),admission.ready().id(),f.graceDeadline(),target,key,OwnedFailedRenewal.graceLastSecondFingerprint(id,admission,f,target,key,at),at);if(failGrace)throw new IllegalStateException("grace receipt failed");yield preparation;}
+                case "requireGraceLastSecondInTransaction"->{current((Admission)a[0]);if(preparation==null||!preparation.equals(a[1]))throw new IllegalStateException("preparation unavailable");yield preparation;}
                 case "requireCurrentInTransaction"->{current((Admission)a[0]);if(recovery==null&&ops.size()>1)throw new IllegalStateException("transient unassociated");yield admission;}
                 case "claimReadInTransaction"->{current((Admission)a[0]);var phase=(Phase)a[1];if(reads.containsKey(phase))throw new IllegalStateException("duplicate read");var r=new ReadClaim(UUID.randomUUID(),admission.id(),phase,(UUID)a[2],(Instant)a[4],((Instant)a[4]).plusSeconds(30),(Fence)a[3]);reads.put(phase,r);yield r;}
                 case "requireReadInTransaction"->{current((Admission)a[0]);var r=(ReadClaim)a[1];if(!r.equals(reads.get(r.phase()))||!utc.isBefore(r.deadlineAt()))throw new IllegalStateException("read unavailable");yield r;}
@@ -225,7 +257,7 @@ class OwnedFailedRenewalServiceTest {
                 default->throw new AssertionError(m);
             };});
             var site=Site.create(s.siteId(),SiteKey.of("site"),"Site",s.paymentAccountId(),Set.of(java.net.URI.create("https://test.example")),Set.of(AuthenticationMode.SITE_TOKEN),PaymentMethodPolicy.automatic());
-            var tx=new SubscriptionTransactionPort(){public <T>T required(Supplier<T> work){return requiresNew(work);}public boolean active(){return active;}public <T>T requiresNew(Supplier<T> work){if(active)throw new AssertionError("nested transaction");trace.add("begin");active=true;var oldS=s;var oldOps=new LinkedHashMap<>(ops);var oldBills=new LinkedHashMap<>(records);var oldReads=new HashMap<>(reads);var oldCash=new LinkedHashSet<>(cash);var oldEvents=new ArrayList<>(events);var oldFailure=failure;var oldRecovery=recovery;var oldPublication=publication;var oldSeq=sequence;var oldEffects=effects;var oldCallbacks=callbacks;try{var result=work.get();trace.add("commit");return result;}catch(RuntimeException e){s=oldS;ops=oldOps;records=oldBills;reads=oldReads;cash=oldCash;events=oldEvents;failure=oldFailure;recovery=oldRecovery;publication=oldPublication;sequence=oldSeq;effects=oldEffects;callbacks=oldCallbacks;trace.add("rollback");throw e;}finally{active=false;}}};
+            var tx=new SubscriptionTransactionPort(){public <T>T required(Supplier<T> work){return requiresNew(work);}public boolean active(){return active;}public <T>T requiresNew(Supplier<T> work){if(active)throw new AssertionError("nested transaction");trace.add("begin");active=true;var oldS=s;var oldOps=new LinkedHashMap<>(ops);var oldBills=new LinkedHashMap<>(records);var oldReads=new HashMap<>(reads);var oldCash=new LinkedHashSet<>(cash);var oldEvents=new ArrayList<>(events);var oldFailure=failure;var oldRecovery=recovery;var oldPublication=publication;var oldPreparation=preparation;var oldSeq=sequence;var oldEffects=effects;var oldCallbacks=callbacks;try{var result=work.get();trace.add("commit");return result;}catch(RuntimeException e){s=oldS;ops=oldOps;records=oldBills;reads=oldReads;cash=oldCash;events=oldEvents;failure=oldFailure;recovery=oldRecovery;publication=oldPublication;preparation=oldPreparation;sequence=oldSeq;effects=oldEffects;callbacks=oldCallbacks;trace.add("rollback");throw e;}finally{active=false;}}};
             var facts=new SubscriptionFactService(subscriptions,operations,trials,port(dev.genericpayments.platform.sites.application.port.out.LockSitePort.class,(m,a)->Optional.of(site)),port(dev.genericpayments.platform.customers.application.port.out.CustomerStore.class,(m,a)->Optional.of(Customer.create(s.customerId(),s.siteId(),null,null,UTC))),id->Optional.of(account),bills,
                 c->{effects++;cash.add(c.providerPaymentReference());return null;},port(SubscriptionEventStore.class,(m,a)->{effects++;events.add(((SubscriptionEvent)a[0]).type());return true;}),port(SubscriptionCatalogPort.class,(m,a)->s.billingPrice()),clock,
                 (sub,event,access,enqueued)->{effects++;callbacks++;assertThat(event.receivedAt()).isEqualTo(utc);},port(SubscriptionObjectPort.class,(m,a)->{effects++;return null;}),

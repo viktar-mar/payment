@@ -15,6 +15,13 @@ public interface OwnedFailedRenewalStore {
     Admission admitInTransaction(OwnedFirstRenewal.Admission upstream, OwnedFirstRenewal.LaterReady ready,
             OwnedFirstRenewal.Boundary boundary, Instant utcAt);
     Admission requireCurrentInTransaction(Admission admission);
+    default void lockGraceLastSecondInTransaction(Admission admission) { throw new IllegalStateException("Owned grace preparation unsupported"); }
+    default GraceLastSecondPreparation prepareGraceLastSecondInTransaction(Admission admission,Failure failure,Instant utcAt) {
+        throw new IllegalStateException("Owned grace preparation unsupported");
+    }
+    default GraceLastSecondPreparation requireGraceLastSecondInTransaction(Admission admission,GraceLastSecondPreparation preparation) {
+        throw new IllegalStateException("Owned grace preparation unsupported");
+    }
     ReadClaim claimReadInTransaction(Admission admission, Phase phase, UUID invocation,
             ApplySubscriptionSnapshotUseCase.Fence fence, Instant utcAt);
     ReadClaim requireReadInTransaction(Admission admission, ReadClaim claim);

@@ -69,11 +69,72 @@ class OwnedFailedRenewalModelTest {
         assertThatThrownBy(()->claim(Phase.RECOVERED,new Fence(3,UUID.randomUUID(),null,null,null,5L),now.plusSeconds(30))).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(()->claim(Phase.RECOVERED,new Fence(3,UUID.randomUUID(),-1L,null,null,5L),now.plusSeconds(30))).isInstanceOf(IllegalArgumentException.class);
     }
+    @Test void gracePreparationUsesCapturedDeadlineAndExactLastSecond() {
+        var a=graceAdmission(900000);var f=graceFailure(a,260300);
+        assertThat(OwnedFailedRenewal.graceLastSecondTarget(a,f)).isEqualTo(260299);
+        var at=now.plusNanos(123456000);var key="billing-failed-grace-v1:"+a.id()+":1";
+        var hash=OwnedFailedRenewal.graceLastSecondFingerprint(id(90),a,f,260299,key,at);
+        assertThat(hash).matches("[a-f0-9]{64}");
+        assertThat(new GraceLastSecondPreparation(id(90),a.id(),f.claimId(),f.billId(),a.ready().id(),f.graceDeadline(),260299,key,hash,at).target()).isEqualTo(260299);
+        assertThat(OwnedFailedRenewal.graceLastSecondTarget(a,graceFailure(a,300000))).isEqualTo(299999);
+        assertThat(OwnedFailedRenewal.graceLastSecondFingerprint(id(90),a,f,260299,key,at))
+            .isNotEqualTo(OwnedFailedRenewal.graceLastSecondFingerprint(id(91),a,f,260299,key,at));
+    }
+    @Test void graceTargetRefusesForeignFailureAndOriginalCashReuse() {
+        var a=graceAdmission(900000);var f=graceFailure(a,260300);
+        for(var bad:java.util.List.of(
+            new Failure(id(99),f.claimId(),f.billId(),0,f.invoice(),f.allocation(),f.paymentIntent(),f.period(),f.graceDeadline(),3,1,now),
+            new Failure(a.id(),f.claimId(),a.firstRenewalAdmission().bill(),0,f.invoice(),f.allocation(),f.paymentIntent(),f.period(),f.graceDeadline(),3,1,now),
+            new Failure(a.id(),f.claimId(),f.billId(),0,"in_foreign",f.allocation(),f.paymentIntent(),f.period(),f.graceDeadline(),3,1,now),
+            new Failure(a.id(),f.claimId(),f.billId(),0,f.invoice(),a.firstRenewalAdmission().allocation(),f.paymentIntent(),f.period(),f.graceDeadline(),3,1,now),
+            new Failure(a.id(),f.claimId(),f.billId(),0,f.invoice(),f.allocation(),a.firstRenewalAdmission().paymentIntent(),f.period(),f.graceDeadline(),3,1,now),
+            new Failure(a.id(),f.claimId(),f.billId(),0,f.invoice(),f.allocation(),f.paymentIntent(),new Subscription.Period(f.period().start(),f.period().end().plusSeconds(1)),f.graceDeadline(),3,1,now),
+            new Failure(a.id(),f.claimId(),f.billId(),0,f.invoice(),f.allocation(),f.paymentIntent(),f.period(),f.graceDeadline(),2,1,now),
+            new Failure(a.id(),f.claimId(),f.billId(),0,f.invoice(),f.allocation(),f.paymentIntent(),f.period(),f.graceDeadline(),3,1,now.minusSeconds(1))))
+            assertThatThrownBy(()->OwnedFailedRenewal.graceLastSecondTarget(a,bad)).isInstanceOf(IllegalArgumentException.class);
+    }
+    @Test void graceTargetRequiresWholeSecondsStrictChronologyAndConservativeWindow() {
+        var a=graceAdmission(10000000);
+        for(long g:new long[]{4700,4701,10000000,10000001,4700+56L*86400})
+            assertThatThrownBy(()->OwnedFailedRenewal.graceLastSecondTarget(a,graceFailure(a,g))).isInstanceOf(IllegalArgumentException.class);
+        assertThat(OwnedFailedRenewal.graceLastSecondTarget(a,graceFailure(a,4700+56L*86400-1))).isEqualTo(4700+56L*86400-2);
+        var f=graceFailure(a,260300);
+        var fractional=new Failure(a.id(),f.claimId(),f.billId(),0,f.invoice(),f.allocation(),f.paymentIntent(),f.period(),f.graceDeadline().plusNanos(1),3,1,now);
+        assertThatThrownBy(()->OwnedFailedRenewal.graceLastSecondTarget(a,fractional)).isInstanceOf(IllegalArgumentException.class);
+        var fractionalEnd=new Subscription.Period(a.boundary().period().start(),a.boundary().period().end().plusNanos(1));
+        var b=new OwnedFirstRenewal.Boundary(a.boundary().id(),a.firstRenewalAdmission().id(),a.boundary().ready(),"si_owned","in_renewal",fractionalEnd,"e".repeat(64),now);
+        var altered=new Admission(a.id(),a.firstRenewalAdmission(),a.ready(),b,a.sourceSha(),now);
+        assertThatThrownBy(()->OwnedFailedRenewal.graceLastSecondTarget(altered,graceFailure(altered,260300))).isInstanceOf(IllegalArgumentException.class);
+    }
+    @Test void gracePreparationRejectsMalformedKeyHashTargetAndUtcPrecision() {
+        var a=graceAdmission(900000);var f=graceFailure(a,260300);var key="billing-failed-grace-v1:"+a.id()+":1";
+        assertThatThrownBy(()->new GraceLastSecondPreparation(id(90),a.id(),f.claimId(),f.billId(),a.ready().id(),f.graceDeadline(),260300,key,"a".repeat(64),now)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(()->new GraceLastSecondPreparation(id(90),a.id(),f.claimId(),f.billId(),a.ready().id(),f.graceDeadline(),260299,key+":retry","a".repeat(64),now)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(()->new GraceLastSecondPreparation(id(90),a.id(),f.claimId(),f.billId(),a.ready().id(),f.graceDeadline(),260299,key,"A".repeat(64),now)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(()->new GraceLastSecondPreparation(id(90),a.id(),f.claimId(),f.billId(),a.ready().id(),f.graceDeadline(),260299,key,"a".repeat(64),now.plusNanos(1))).isInstanceOf(IllegalArgumentException.class);
+    }
+    private Admission graceAdmission(long end) {
+        return graceAdmission(end,BillingInterval.MONTH);
+    }
+    @Test void graceYearCeilingUsesTwoShortestYearsFromReadyTwo() {
+        var a=graceAdmission(100000000,BillingInterval.YEAR);long ceiling=4700+730L*86400;
+        assertThat(OwnedFailedRenewal.graceLastSecondTarget(a,graceFailure(a,ceiling-1))).isEqualTo(ceiling-2);
+        assertThatThrownBy(()->OwnedFailedRenewal.graceLastSecondTarget(a,graceFailure(a,ceiling))).isInstanceOf(IllegalArgumentException.class);
+    }
+    private Admission graceAdmission(long end,BillingInterval interval) {
+        var u=upstream(interval);var first=ready(u,OwnedFirstRenewal.Step.BOUNDARY,null,null,1100);
+        var b=new OwnedFirstRenewal.Boundary(id(30),u.id(),first,"si_owned","in_renewal",new Subscription.Period(Instant.ofEpochSecond(1100),Instant.ofEpochSecond(end)),"e".repeat(64),now);
+        return new Admission(id(40),u,ready(u,OwnedFirstRenewal.Step.FINALIZATION,first.id(),b.id(),4700),b,u.sourceSha(),now);
+    }
+    private Failure graceFailure(Admission a,long grace) {return new Failure(a.id(),id(80),id(81),0,"in_renewal","inpay_renewal","pi_renewal",a.boundary().period(),Instant.ofEpochSecond(grace),3,1,now);}
     private UUID id(long n) {return new UUID(0,n);}
     private OwnedFirstRenewal.Admission upstream() {
+        return upstream(BillingInterval.MONTH);
+    }
+    private OwnedFirstRenewal.Admission upstream(BillingInterval interval) {
         var owner=new ClockOwner(id(1),id(2),new PaymentAccountId(id(3)),new SiteId(id(4)),new CustomerId(id(5)),"acct_owned","alias","2026-09-30.endive",1000,"billing_clock_"+id(1),"clock-key","a".repeat(64),now.minusSeconds(100));
         var clock=new ReadyClock(owner,id(6),"clock_owned",1000,2000,3000,now.minusSeconds(50),"b".repeat(64));
-        var terms=new SubscriptionPriceTerms(new PriceId(id(7)),"monthly",1,new ProductId(id(8)),Money.of(1000,"EUR"),BillingInterval.MONTH,0,TrialPaymentMethodPolicy.OPTIONAL_DURING_TRIAL,TaxMode.NONE);
+        var terms=new SubscriptionPriceTerms(new PriceId(id(7)),"monthly",1,new ProductId(id(8)),Money.of(1000,"EUR"),interval,0,TrialPaymentMethodPolicy.OPTIONAL_DURING_TRIAL,TaxMode.NONE);
         var intent=new OwnedClockSubscription(id(9),clock,id(10),id(11),"cus_owned",id(12),id(13),"subscription:"+id(3)+":"+id(13)+":CREATE","v1.paid."+"d".repeat(64),0,1,terms,"price_owned","prod_owned","c".repeat(64),now.minusSeconds(10));
         var receipt=new OwnedClockSubscriptionReceipt(intent,id(15),"sub_owned",42,"si_owned",900,1100,now.minusSeconds(5));
         return new OwnedFirstRenewal.Admission(id(16),receipt,"a".repeat(40),id(17),id(18),1,id(19),0,id(20),0,"in_initial","inpay_initial","pi_initial",2,1,"e".repeat(64),now);

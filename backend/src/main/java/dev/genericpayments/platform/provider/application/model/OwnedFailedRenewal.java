@@ -78,6 +78,43 @@ public final class OwnedFailedRenewal {
                     || expectedRevision < 0 || operationVersion < 0) throw invalid();
         }
     }
+    /** A descriptive saved preparation only; every consumer must reload persisted current authority. */
+    public record GraceLastSecondPreparation(UUID id,UUID admissionId,UUID failureClaimId,UUID billId,
+            UUID predecessorReadyId,Instant graceDeadline,long target,String operationKey,String fingerprint,Instant preparedAt) {
+        public GraceLastSecondPreparation {
+            required(id,admissionId,failureClaimId,billId,predecessorReadyId,graceDeadline,preparedAt);
+            if(graceDeadline.getNano()!=0||target<=0||target!=Math.subtractExact(graceDeadline.getEpochSecond(),1)
+                    ||!Objects.equals(operationKey,"billing-failed-grace-v1:"+admissionId+":1")
+                    ||!matches(fingerprint,"[a-f0-9]{64}")||preparedAt.getNano()%1000!=0)throw invalid();
+        }
+    }
+    /** G comes only from the immutable failure, never from today's policy or caller-selected time. */
+    public static long graceLastSecondTarget(Admission admission,Failure failure) {
+        required(admission,failure);var original=admission.firstRenewalAdmission();var period=admission.boundary().period();
+        if(!failure.admissionId().equals(admission.id())||failure.billId().equals(original.bill())
+                ||!failure.invoice().equals(admission.boundary().renewalInvoice())||failure.invoice().equals(original.invoice())
+                ||failure.allocation().equals(original.allocation())||failure.paymentIntent().equals(original.paymentIntent())
+                ||!failure.period().equals(period)||failure.revision()!=Math.addExact(original.subscriptionRevision(),1)
+                ||failure.observationSequence()<1||failure.recordedAt().isBefore(admission.admittedAt())
+                ||failure.recordedAt().isBefore(admission.ready().observedAt())
+                ||failure.graceDeadline().getNano()!=0||period.end().getNano()!=0)throw invalid();
+        long g=failure.graceDeadline().getEpochSecond(),target=Math.subtractExact(g,1),after=Math.addExact(g,1);
+        long ready=admission.ready().ack().advance().target();
+        long ceiling=switch(original.receipt().intent().terms().interval()){case MONTH->56L*86400;case YEAR->730L*86400;};
+        if(target<=ready||after>=period.end().getEpochSecond()||Math.subtractExact(after,ready)>ceiling)throw invalid();
+        return target;
+    }
+    /** Frozen explicit scalar vector, shared with V38 first_renewal_hash/first_renewal_instant. */
+    public static String graceLastSecondFingerprint(UUID id,Admission a,Failure f,long target,String key,Instant at) {
+        required(id,at);if(target!=graceLastSecondTarget(a,f)||!Objects.equals(key,"billing-failed-grace-v1:"+a.id()+":1")
+                ||at.getNano()%1000!=0||at.isBefore(f.recordedAt())||at.isBefore(a.ready().observedAt()))throw invalid();
+        var u=a.firstRenewalAdmission();var i=u.receipt().intent();var c=i.clock();var o=c.owner();
+        return OwnedFirstRenewal.fingerprint("gp:owned-failed-grace-preparation:v1",id,a.id(),u.id(),u.fingerprint(),a.sourceSha(),a.admittedAt(),
+            u.root(),u.attempt(),u.attemptVersion(),u.bill(),u.billVersion(),u.payment(),u.paymentVersion(),u.invoice(),u.allocation(),u.paymentIntent(),u.subscriptionRevision(),u.policyVersion(),
+            o.intent(),o.run(),o.account().value(),o.site().value(),o.customer().value(),o.externalAccount(),o.credentialsRef(),o.apiVersion(),c.reference(),c.creationOperation(),c.frozenTime(),
+            i.id(),i.subscription(),i.createOperation(),i.customerBinding(),i.customerReference(),u.receipt().reference(),u.receipt().itemReference(),a.boundary().id(),a.ready().id(),a.ready().ack().advance().id(),a.ready().ack().advance().target(),
+            f.claimId(),f.billId(),f.billVersion(),f.invoice(),f.allocation(),f.paymentIntent(),f.period().start(),f.period().end(),f.graceDeadline(),f.revision(),f.observationSequence(),f.recordedAt(),target,key,at);
+    }
     public record Publication(UUID admissionId, UUID claimId, UUID operationId, UUID billId,
             UUID paymentId, long revision, Instant publishedAt) {
         public Publication {

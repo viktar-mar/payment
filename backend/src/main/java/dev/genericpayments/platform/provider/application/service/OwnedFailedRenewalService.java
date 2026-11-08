@@ -112,6 +112,29 @@ public final class OwnedFailedRenewalService {
             });
         });
     }
+    /** Durable G−1 description, with no provider work, time mutation, dispatch or stop on refusal. */
+    public GraceLastSecondPreparation prepareGraceLastSecond(Admission admission) {
+        fresh();Objects.requireNonNull(admission);
+        return transaction.requiresNew(()->{
+            store.lockGraceLastSecondInTransaction(admission);
+            var state=current(admission);requireNoFinancial(state);
+            var failure=store.requireFailureInTransaction(admission);requireDebt(state,failure);requireOriginalReadySample(admission,state);
+            return store.prepareGraceLastSecondInTransaction(admission,failure,state.utcAt().truncatedTo(java.time.temporal.ChronoUnit.MICROS));
+        });
+    }
+    /** Exact saved-row authentication only; never a renewable permission to dispatch. */
+    public GraceLastSecondPreparation requireGraceLastSecond(Admission admission,GraceLastSecondPreparation preparation) {
+        fresh();Objects.requireNonNull(admission);Objects.requireNonNull(preparation);
+        return transaction.requiresNew(()->{
+            store.lockGraceLastSecondInTransaction(admission);
+            var state=current(admission);requireNoFinancial(state);
+            var failure=store.requireFailureInTransaction(admission);requireDebt(state,failure);requireOriginalReadySample(admission,state);
+            return store.requireGraceLastSecondInTransaction(admission,preparation);
+        });
+    }
+    private static void requireOriginalReadySample(Admission admission,Locked state) {
+        if(!state.sample().isolated()||!state.sample().billingAt().equals(Instant.ofEpochSecond(admission.ready().ack().advance().target())))throw unavailable();
+    }
     public ReadClaim beginRecoveredRead(Admission admission,UUID invocation) {
         return guarded(admission,()->transaction.requiresNew(()->{
             var state=current(admission);var recovery=store.requireRecoveryInTransaction(admission);
