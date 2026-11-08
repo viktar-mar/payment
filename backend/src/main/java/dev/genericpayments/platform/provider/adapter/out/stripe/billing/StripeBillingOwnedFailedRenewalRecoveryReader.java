@@ -3,6 +3,7 @@ package dev.genericpayments.platform.provider.adapter.out.stripe.billing;
 import com.stripe.net.RequestOptions;
 import dev.genericpayments.platform.provider.adapter.out.stripe.*;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.*;
+import dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.InvocationBudget;
 import dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore;
 import dev.genericpayments.platform.provider.application.service.OwnedFailedRenewalMethodService;
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
@@ -18,7 +19,7 @@ import java.util.function.LongSupplier;
 /** Explicit read-only original-debt preflight. No registration, claim, stop, write or reusable permit.
  * Original authority and immutable evidence stay on the caller; workers can only make bounded GETs. */
 public final class StripeBillingOwnedFailedRenewalRecoveryReader {
-    private static final long TOTAL_NANOS=TimeUnit.SECONDS.toNanos(30),CALL_NANOS=TimeUnit.SECONDS.toNanos(2);
+    private static final long CALL_NANOS=TimeUnit.SECONDS.toNanos(2);
     private final OwnedFailedRenewalMethodService methods;
     private final SubscriptionBillingProofStore proofs;
     private final ProviderOperationStore steps;
@@ -46,7 +47,13 @@ public final class StripeBillingOwnedFailedRenewalRecoveryReader {
     }
     public PreparedRecovery inspect(Reservation reservation,Completion completion,Recovery recovery,SubscriptionCommandContext command){
         try{
-            var budget=new Budget();budget.remaining(null);
+            return inspect(reservation,completion,recovery,command,new InvocationBudget(utc,nanos));
+        }catch(RuntimeException failure){throw unavailable();}
+    }
+    /** The financial producer owns this invocation; the read cannot restart its deadline. */
+    PreparedRecovery inspect(Reservation reservation,Completion completion,Recovery recovery,SubscriptionCommandContext command,InvocationBudget invocation){
+        try{
+            var budget=new Budget(invocation);budget.remaining(null);
             // No caller-derived proof/step/credential locator is used before actual original authentication.
             var original=methods.inspectBrowserRecoveryPreparation(reservation,completion,recovery,command);
             var expiry=original.enrollment().sessionExpiresAt();budget.remaining(expiry);
@@ -84,18 +91,15 @@ public final class StripeBillingOwnedFailedRenewalRecoveryReader {
     /** One immutable invocation budget, including authentication, stores and credential/client work.
      * Synchronization serializes caller/worker sampling so raw UTC and injected rollback cannot hide. */
     private final class Budget {
-        final long actualStart=System.nanoTime(),injectedStart=nanos.getAsLong();
-        final Instant entry=utc.instant(),deadline=entry.plusSeconds(30);
-        private long lastActual=actualStart,lastInjected=injectedStart;
-        private Instant lastUtc=entry;
+        final InvocationBudget invocation;
+        private Instant lastUtc;
+        Budget(InvocationBudget invocation){this.invocation=Objects.requireNonNull(invocation);lastUtc=invocation.enteredAt();}
         synchronized long remaining(Instant expiry){
-            long actual=System.nanoTime(),injected=nanos.getAsLong();var now=utc.instant();
-            if(Thread.currentThread().isInterrupted()||actual-lastActual<0||injected-lastInjected<0||now.isBefore(lastUtc))throw unavailable();
-            long actualElapsed=actual-actualStart,injectedElapsed=injected-injectedStart;
-            if(actualElapsed<0||injectedElapsed<0||actualElapsed>=TOTAL_NANOS||injectedElapsed>=TOTAL_NANOS)throw unavailable();
-            long left=Math.min(TOTAL_NANOS-actualElapsed,Math.min(TOTAL_NANOS-injectedElapsed,Duration.between(now,deadline).toNanos()));
+            long left=invocation.remainingNanos(null);var now=utc.instant();
+            if(Thread.currentThread().isInterrupted()||now.isBefore(lastUtc)||now.isBefore(invocation.enteredAt()))throw unavailable();
+            left=Math.min(left,Duration.between(now,invocation.deadlineAt()).toNanos());
             if(expiry!=null)left=Math.min(left,Duration.between(now,expiry).toNanos());
-            if(left<=0)throw unavailable();lastActual=actual;lastInjected=injected;lastUtc=now;return left;
+            if(left<=0)throw unavailable();lastUtc=now;return left;
         }
         synchronized Instant at(Instant expiry){remaining(expiry);return lastUtc;}
     }

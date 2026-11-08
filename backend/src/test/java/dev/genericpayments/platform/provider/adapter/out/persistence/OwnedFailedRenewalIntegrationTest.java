@@ -12,6 +12,8 @@ import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeOw
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalSetupAdapter;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalMethodAdapter;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryReader;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalBindingAdapter;
 import dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore;
 import dev.genericpayments.platform.subscriptions.application.port.in.GetSubscriptionActionUseCase;
@@ -1270,6 +1272,57 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(jdbc.queryForMap("select * from payments where id=?",p.prepared().setup().upstream().payment())).isEqualTo(original);
         assertThat(jdbc.queryForObject("select provider_payment_reference from payments where id=?",String.class,publication.publication().paymentId())).isEqualTo(c.reservation().failure().paymentIntent());
         assertThat(operations.findById(claim.id())).contains(ack.operation());
+    }
+
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void dedicatedConfirmationActualBoundedAdapterThenIndependentRecoveredObserverSettlesOnlyOriginalBill(boolean legacy) throws Exception {
+        // Both browser paths traverse the genuine original SETUP, controller permission, independent
+        // binding/METHOD completion and original recovery. No positive financial evidence is DML seeded.
+        var p=recoveryPrepared(legacy,0);var c=inspectRecovery(p);var before=financialState();
+        var originalCash=jdbc.queryForMap("select * from payments where id=?",p.prepared().setup().upstream().payment());
+        var originalBill=jdbc.queryForMap("select * from subscription_billing_records where id=?",c.reservation().failure().billId());
+        var originalSetup=jdbc.queryForMap("select * from subscription_operations where id=?",c.setupOperation().id());
+        var originalRecover=jdbc.queryForMap("select * from subscription_operations where id=?",c.recoveryOperation().id());
+        int start=http.calls.size();methodGraph(p.prepared());
+        var response=new com.google.gson.JsonObject();response.addProperty("id","pi_renewal");response.addProperty("object","payment_intent");
+        response.addProperty("livemode",false);response.addProperty("status","succeeded");response.addProperty("customer",receipt.intent().customerReference());
+        response.addProperty("payment_method","pm_saved");response.addProperty("currency","eur");response.addProperty("amount",1000);
+        response.addProperty("amount_received",1000);response.addProperty("amount_capturable",0);response.addProperty("capture_method","automatic");
+        response.add("payment_method_types",com.google.gson.JsonParser.parseString("[\"card\"]"));response.addProperty("latest_charge","ch_renewal");
+        response.add("last_payment_error",com.google.gson.JsonNull.INSTANCE);response.add("next_action",com.google.gson.JsonNull.INSTANCE);http.reply(response.toString());
+        var reader=new StripeBillingOwnedFailedRenewalRecoveryReader(p.pending().service(),methodBillingProofs,operations,credentials,clients,digest,Clock.systemUTC());
+        var adapter=new StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter(p.pending().service(),reader,recoveryConfirmer(p),credentials,clients,digest,Clock.systemUTC());
+        var ack=adapter.confirm(p.pending().reservation(),p.completion(),p.recovery(),p.pending().context());
+        var calls=http.calls.subList(start,http.calls.size());assertThat(calls).hasSize(18);
+        var paths=new ArrayList<>(List.of("/v1/test_helpers/test_clocks/clock_owned","/v1/customers/"+receipt.intent().customerReference(),"/v1/subscriptions/"+receipt.reference(),"/v1/invoices",
+            "/v1/invoices/"+p.prepared().setup().upstream().invoice()+"/lines","/v1/invoice_payments","/v1/payment_intents/"+p.prepared().setup().upstream().paymentIntent(),"/v1/charges/"+graph.charge.get("id").getAsString(),
+            "/v1/invoice_payments","/v1/invoices/in_renewal/lines","/v1/invoice_payments","/v1/payment_intents/pi_renewal","/v1/charges/ch_renewal","/v1/invoice_payments",
+            "/v1/setup_intents/seti_saved","/v1/payment_methods/pm_saved","/v1/test_helpers/test_clocks/clock_owned","/v1/payment_intents/pi_renewal/confirm"));
+        assertThat(calls.stream().map(r->r.url().getPath()).toList()).isEqualTo(paths);
+        assertThat(calls.subList(0,17)).allSatisfy(r->{assertThat(r.method().name()).isEqualTo("GET");assertThat(r.options().getIdempotencyKey()).isNull();});
+        var post=calls.getLast();assertThat(post.method().name()).isEqualTo("POST");
+        assertThat(post.params()).containsExactlyInAnyOrderEntriesOf(Map.of("payment_method","pm_saved","off_session",true,"error_on_requires_action",true));
+        assertThat(post.options().getIdempotencyKey()).isEqualTo(c.recoveryOperation().providerOperationKey()+":CONFIRM");
+        assertThat(calls).allSatisfy(r->{assertThat(r.options().getMaxNetworkRetries()).isZero();assertThat(r.options().getReadTimeout()).isBetween(1,2000);assertThat(r.options().getConnectTimeout()).isBetween(1,2000);assertThat(r.headers().firstValue("Stripe-Version")).contains("2026-09-30.endive");});
+        assertThat(http.replies).isEmpty();assertThat(ack.operation().kind()).isEqualTo(ProviderOperation.Kind.OWNED_RECOVERY_INTENT_CONFIRM);
+        assertThat(ack.operation().status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);assertThat(ack.operation().version()).isEqualTo(2);
+        assertThat(ack.operation().resourceId()).isEqualTo(c.recoveryOperation().id());assertThat(ack.operation().providerReference()).isEqualTo(c.reservation().failure().paymentIntent());
+        assertThat(ack.reply().charge()).isEqualTo("ch_renewal"); // Receipt does not invent a distinct-charge assertion.
+        assertThat(operations.findById(ack.operation().id())).contains(ack.operation());
+        assertThat(count("stripe_billing_failed_recovery_confirm_claims")).isEqualTo(1);assertThat(count("stripe_billing_failed_recovery_confirm_acks")).isEqualTo(1);
+        assertThat(financialState()).isEqualTo(before);assertThat(jdbc.queryForMap("select * from subscription_billing_records where id=?",c.reservation().failure().billId())).isEqualTo(originalBill);
+        assertThat(jdbc.queryForMap("select * from subscription_operations where id=?",c.setupOperation().id())).isEqualTo(originalSetup);
+        assertThat(jdbc.queryForMap("select * from subscription_operations where id=?",c.recoveryOperation().id())).isEqualTo(originalRecover);
+        assertThat(jdbc.queryForObject("select count(*) from stripe_subscription_recovery_proofs where operation_id=? and pay_step is null and pay_kind is null",Long.class,c.recoveryOperation().id())).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select count(*) from provider_operations where kind='INVOICE_PAY'",Long.class)).isZero();
+        int observed=http.calls.size();recoveredGraph(p.prepared());
+        var publication=methodObserver(p.pending().service()).observeRecovery(p.pending().reservation(),p.recovery());assertObservationSlice(p.prepared(),observed,15);
+        assertThat(publication.publication().billId()).isEqualTo(c.reservation().failure().billId());assertThat(current().debt()).isNull();
+        assertThat(jdbc.queryForMap("select * from payments where id=?",p.prepared().setup().upstream().payment())).isEqualTo(originalCash);assertThat(count("payments")).isEqualTo(2);
+        assertThat(jdbc.queryForObject("select provider_payment_reference from payments where id=?",String.class,publication.publication().paymentId())).isEqualTo(c.reservation().failure().paymentIntent());
+        assertThat(jdbc.queryForObject("select settlement from subscription_billing_records where id=?",String.class,c.reservation().failure().billId())).isEqualTo("CONFIRMED_CASH");
+        assertThat(http.calls.subList(start,http.calls.size()).stream().filter(r->r.method().name().equals("POST"))).hasSize(1);
+        assertThat(operations.findById(ack.operation().id())).contains(ack.operation());
     }
 
     @Test void dedicatedConfirmationFingerprintMatchesHandEnumeratedJavaAndSqlGolden() throws Exception {
