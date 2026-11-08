@@ -15,7 +15,7 @@
 - No local Docker/DB/SQL/Spring/app/browser/socket/provider/Stripe/Sandbox/native/financial execution, Python/install/default Maven/broad local test discovery, keys/archives or oldops/DISPATCHING.
 - Workers source read/edit/report only, no execution/compiler/tests/Git/network/runtime/children. Root audited cached javac with -proc:none, explicit inert pure JUnit and hosted compile-only; Git/GitHub under standing publication authority.
 - Test-support only: no production service/schema/dependency/route/bean/launcher/packaging export or historical runtime change. No fake financial or readiness authority, no direct positive proof/ACK/lifecycle inserts.
-- One nonlocking SELECT in caller actual transaction; exact Site/Customer candidates, foreign Account refuses. Reuse unchanged owned_failed_renewal_authority plus full predecessor tuple/source and exact original READY2; never current mutable chain/phase predicates or filtered-invalid fallback.
+- One nonlocking SELECT in caller actual transaction with an already bound holder for the selector’s own JDBC DataSource; exact Site/Customer candidates, foreign Account refuses. Reuse unchanged owned_failed_renewal_authority plus full predecessor tuple/source and exact original READY2; never current mutable chain/phase predicates or filtered-invalid fallback.
 - No new time advance or grace inference: original persisted READY2 E+3600 only; security/audit UTC stays real. No extra locks/transactions/store/provider calls. Existing services/FactService retain phase/financial authority.
 - Preserve all old exact-time drift/grace/refusal/financial tests. New genuine persisted positives must traverse original failure/SETUP/browser/binding/METHOD/confirm/independent recovered observation and keep exact journal/callback assertions.
 - Preserve worktree/reports; no cleanup/PR/merge. All4 full Offline CI jobs plus dedicated renewal CI at exact published head and both runtime packaging markers required. Native NOT_RUN; full5B NOT_ACCEPTED.
@@ -47,6 +47,6 @@
 
 ### Publication
 
-- [ ] Fresh independent whole-change review of this complete plan range, one consolidated fix wave and scoped rereview if needed. No unresolved important finding.
+- [x] Fresh independent whole-change review of this complete plan range, one consolidated fix wave and scoped rereview if needed. No unresolved important finding.
 - [ ] Verify source hashes/diff, commit/push and await all4 full CI plus dedicated renewal on exact head. Inspect actual totals/new selector cases, genuine two persisted variants, prior214 and old SDK observer25, disjoint backend partition and both packaging markers.
 - [ ] Record final receipt and every Ruling/cost, preserve all reports/worktree. Native NOT_RUN/full5B NOT_ACCEPTED; no cleanup/PR/merge or operational launch.

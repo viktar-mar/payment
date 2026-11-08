@@ -16,6 +16,7 @@ import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -33,15 +34,23 @@ class OwnedFailedRenewalBillingTimeTest {
     private final CustomerId customer=new CustomerId(new UUID(0,3));
     private final Instant utc=Instant.parse("2026-11-08T12:00:00Z");
     private boolean previousActive;
+    private final List<DataSource> boundSources=new ArrayList<>();
 
     @BeforeEach void inertTransactionPrecondition() {
         previousActive=TransactionSynchronizationManager.isActualTransactionActive();
         TransactionSynchronizationManager.setActualTransactionActive(true);
     }
     @AfterEach void restoreTransactionPrecondition() {
-        TransactionSynchronizationManager.setActualTransactionActive(previousActive);
+        try {
+            for(var source:boundSources)TransactionSynchronizationManager.unbindResource(source);
+        } finally {TransactionSynchronizationManager.setActualTransactionActive(previousActive);}
     }
+    /** Inert caller-holder precondition only; never establishes database transaction authority. */
     private OwnedFailedRenewalBillingTime selector(MemoryJdbc jdbc) {
+        if(!TransactionSynchronizationManager.hasResource(jdbc.getDataSource())) {
+            TransactionSynchronizationManager.bindResource(jdbc.getDataSource(),new Object());
+            boundSources.add(jdbc.getDataSource());
+        }
         return new OwnedFailedRenewalBillingTime(jdbc,new OwnedFirstRenewalBillingTime(jdbc,new OwnedSubscriptionBillingTime(jdbc)));
     }
 
@@ -55,6 +64,19 @@ class OwnedFailedRenewalBillingTimeTest {
         TransactionSynchronizationManager.setActualTransactionActive(false);
         assertThatThrownBy(()->time.sample(account,site,customer,utc)).hasMessage("OWNED_TIME_REQUIRES_CALLER_TRANSACTION");
         assertThat(jdbc.calls).isEmpty();
+    }
+    @Test void foreignDataSourceTransactionRefusesBeforeJdbcOrFallback() {
+        var jdbc=new MemoryJdbc();var foreign=new MemoryJdbc();
+        // Bypass the positive helper so this selector's own source remains unbound.
+        var time=new OwnedFailedRenewalBillingTime(jdbc,new OwnedFirstRenewalBillingTime(jdbc,new OwnedSubscriptionBillingTime(jdbc)));
+        jdbc.results.add(List.of(row(true,1702682000L)));
+        TransactionSynchronizationManager.bindResource(foreign.getDataSource(),new Object());
+        try {
+            assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isTrue();
+            assertThat(TransactionSynchronizationManager.getResource(jdbc.getDataSource())).isNull();
+            assertThatThrownBy(()->time.sample(account,site,customer,utc)).hasMessage("OWNED_TIME_REQUIRES_CALLER_TRANSACTION");
+            assertThat(jdbc.calls).isEmpty();
+        } finally {TransactionSynchronizationManager.unbindResource(foreign.getDataSource());}
     }
     @Test void oneReturnedValidCandidateMapsStoredEpochAndCallerHolder() {
         var jdbc=new MemoryJdbc();jdbc.results.add(List.of(row(true,1702682000L)));

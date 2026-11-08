@@ -27,7 +27,9 @@ public final class OwnedFailedRenewalBillingTime implements SubscriptionBillingT
     @Override public Sample sample(PaymentAccountId account,SiteId site,CustomerId customer,Instant operationalAt) {
         if(!TransactionSynchronizationManager.isActualTransactionActive())
             throw new IllegalStateException("OWNED_TIME_REQUIRES_CALLER_TRANSACTION");
-        sampledConnectionHolder=TransactionSynchronizationManager.getResource(jdbc.getDataSource());
+        var callerHolder=TransactionSynchronizationManager.getResource(jdbc.getDataSource());
+        if(callerHolder==null)throw new IllegalStateException("OWNED_TIME_REQUIRES_CALLER_TRANSACTION");
+        sampledConnectionHolder=callerHolder;
         sampledTransaction=null;
         // Keep every failed candidate visible, including stopped or damaged evidence. The full
         // predecessor identity and exact original READY2 must authenticate before time is returned.
