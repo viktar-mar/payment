@@ -71,27 +71,51 @@ create function owned_failed_grace_current(admission uuid) returns boolean
    and x.status in ('RESERVED','PROCESSING','REQUIRES_ACTION','UNKNOWN') and x.kind<>'RECONCILE'))
 $$;
 
+-- One canonical operation closure, including an unconsumed trial reservation. This
+-- fresh selector is reused before locks and after parent FKs stabilize operation INSERTs.
+create function owned_failed_grace_operation_ids(admission uuid) returns uuid[] language sql volatile as $$
+ select coalesce(array_agg(ids.id order by
+  ('x'||substr(replace(ids.id::text,'-',''),1,16))::bit(64)::bigint,
+  ('x'||substr(replace(ids.id::text,'-',''),17,16))::bit(64)::bigint),'{}'::uuid[])
+ from (
+  select i.create_operation as id from stripe_billing_failed_renewals d
+   join stripe_billing_first_renewals a on a.id=d.first_renewal_admission
+   join stripe_billing_owned_subscriptions i on i.id=a.owned_intent where d.id=$1
+  union select o.id from subscription_operations o join stripe_billing_failed_renewals d on d.subscription_id=o.subscription_id
+   where d.id=$1 and o.status in ('RESERVED','PROCESSING','REQUIRES_ACTION','UNKNOWN')
+  union select t.reserved_by_operation from stripe_billing_failed_renewals d join subscriptions s on s.id=d.subscription_id
+   join subscription_trial_eligibility t on t.site_id=d.site_id and t.customer_id=d.customer_id and t.product_id=s.product_id
+   where d.id=$1 and t.consumed_at is null and t.reserved_by_operation is not null
+ ) ids
+$$;
+create function require_owned_failed_grace_operation_membership(admission uuid, locked_ids uuid[]) returns void language plpgsql volatile as $$
+begin
+ if locked_ids is null or locked_ids is distinct from owned_failed_grace_operation_ids(admission) then
+  raise exception 'Owned grace operation membership changed' using errcode='23514'; end if;
+end $$;
+
 -- Shared by service preflight and INSERT trigger. Do not enter existing blocking locks
 -- first: speculative V35 SETUP holds immediate customer/subscription FK KEY SHARE locks.
 create function lock_owned_failed_grace(admission uuid) returns void language plpgsql volatile as $$
-declare d stripe_billing_failed_renewals%rowtype; a stripe_billing_first_renewals%rowtype;
+declare d stripe_billing_failed_renewals%rowtype; a stripe_billing_first_renewals%rowtype; locked_ids uuid[];
 begin
  if current_setting('transaction_isolation')<>'read committed' then
   raise exception 'Owned grace preparation requires READ COMMITTED' using errcode='23514'; end if;
  select * into strict d from stripe_billing_failed_renewals where id=admission;
  select * into strict a from stripe_billing_first_renewals where id=d.first_renewal_admission;
+ locked_ids:=owned_failed_grace_operation_ids(admission);
  -- Match Java UUID.compareTo: signed most-significant then signed least-significant long.
- perform o.id from subscription_operations o where o.id in (
-  select i.create_operation from stripe_billing_owned_subscriptions i where i.id=a.owned_intent
-  union select x.id from subscription_operations x where x.subscription_id=d.subscription_id and x.status in ('RESERVED','PROCESSING','REQUIRES_ACTION','UNKNOWN')
-  union select t.reserved_by_operation from subscription_trial_eligibility t join subscriptions s on s.id=d.subscription_id
-   where t.site_id=d.site_id and t.customer_id=d.customer_id and t.product_id=s.product_id and t.consumed_at is null and t.reserved_by_operation is not null)
+ perform o.id from subscription_operations o where o.id=any(locked_ids)
  order by ('x'||substr(replace(o.id::text,'-',''),1,16))::bit(64)::bigint,('x'||substr(replace(o.id::text,'-',''),17,16))::bit(64)::bigint
  for update of o nowait;
  perform id from sites where id=d.site_id for update nowait;
  perform id from customers where id=d.customer_id and site_id=d.site_id for update nowait;
  perform id from payment_accounts where id=d.payment_account_id for update nowait;
  perform id from subscriptions where id=d.subscription_id for update nowait;
+ -- Parent FOR UPDATE locks now conflict with operation INSERT FK KEY SHARE. A
+ -- RECONCILE committed between the initial scan and these locks must never enter
+ -- current()'s blocking rediscovery. Refuse any changed closure in a fresh statement.
+ perform require_owned_failed_grace_operation_membership(admission,locked_ids);
  perform b.id from subscription_billing_records b where b.id=a.initial_bill
   or b.id=(select f.renewal_bill from stripe_billing_failed_renewal_failures f where f.admission_id=d.id)
  order by ('x'||substr(replace(b.id::text,'-',''),1,16))::bit(64)::bigint,('x'||substr(replace(b.id::text,'-',''),17,16))::bit(64)::bigint

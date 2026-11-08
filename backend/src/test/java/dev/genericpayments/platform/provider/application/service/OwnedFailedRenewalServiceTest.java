@@ -19,7 +19,9 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
 /** Real orchestration + real FactService with inert memory ports and explicit rollback boundary; no runtime IO. */
-class OwnedFailedRenewalServiceTest {
+public class OwnedFailedRenewalServiceTest {
+    /** Shared descriptive fixture only: constructing this harness performs no IO or fact application. */
+    public static Admission admissionForStoreBoundaryTest() {return new Harness(false,"alias",900000).admission;}
     static final Instant UTC=Instant.parse("2026-11-01T12:00:00Z");
     @Test void admissionAndReadUseExactIsolatedOwnerAndUtcWindow() {
         var h=new Harness();assertThat(h.service.admit(h.upstream,h.ready,h.boundary)).isEqualTo(h.admission);

@@ -17,6 +17,10 @@ import java.time.temporal.ChronoUnit;
 import java.util.*;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.ConnectionHolder;
+import org.springframework.jdbc.datasource.DataSourceUtils;
+import org.springframework.orm.jpa.EntityManagerHolder;
+import jakarta.persistence.EntityManagerFactory;
+import org.hibernate.Session;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
@@ -26,7 +30,12 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  */
 public final class JdbcOwnedFailedRenewalStore implements OwnedFailedRenewalStore {
     private final JdbcTemplate jdbc;
-    public JdbcOwnedFailedRenewalStore(JdbcTemplate jdbc) { this.jdbc=Objects.requireNonNull(jdbc); }
+    private final EntityManagerFactory graceEntityManagerFactory;
+    /** Existing entry points retain their constructor; grace requires explicit manager provenance. */
+    public JdbcOwnedFailedRenewalStore(JdbcTemplate jdbc) { this.jdbc=Objects.requireNonNull(jdbc);this.graceEntityManagerFactory=null; }
+    public JdbcOwnedFailedRenewalStore(JdbcTemplate jdbc,EntityManagerFactory entityManagerFactory) {
+        this.jdbc=Objects.requireNonNull(jdbc);this.graceEntityManagerFactory=Objects.requireNonNull(entityManagerFactory);
+    }
 
     @Override public Admission admitInTransaction(OwnedFirstRenewal.Admission upstream,
             OwnedFirstRenewal.LaterReady ready, OwnedFirstRenewal.Boundary boundary, Instant utcAt) {
@@ -355,8 +364,20 @@ public final class JdbcOwnedFailedRenewalStore implements OwnedFailedRenewalStor
     private static void transaction() { if(!TransactionSynchronizationManager.isActualTransactionActive())throw new IllegalStateException("Owned failed renewal requires caller transaction"); }
     private void graceTransaction() {
         transaction();var dataSource=jdbc.getDataSource();
-        if(dataSource==null||!(TransactionSynchronizationManager.getResource(dataSource) instanceof ConnectionHolder holder)
-                ||!holder.isSynchronizedWithTransaction())throw new IllegalStateException("Owned failed renewal requires caller DataSource transaction");
+        if(graceEntityManagerFactory==null||dataSource==null
+                ||!(TransactionSynchronizationManager.getResource(dataSource) instanceof ConnectionHolder holder)
+                ||!(TransactionSynchronizationManager.getResource(graceEntityManagerFactory) instanceof EntityManagerHolder owner))throw graceTransactionUnavailable();
+        try {
+            var em=owner.getEntityManager();
+            if(!em.isOpen()||!em.getTransaction().isActive())throw graceTransactionUnavailable();
+            // A synchronized JDBC holder may belong to a secondary pool. Even !autoCommit
+            // alone does not prove ownership: match the known active JPA transaction's
+            // already-exposed physical connection, without opening a connection or transaction.
+            var bound=DataSourceUtils.getTargetConnection(holder.getConnection());
+            if(bound.getAutoCommit()||!Boolean.TRUE.equals(em.unwrap(Session.class).doReturningWork(connection->
+                    DataSourceUtils.getTargetConnection(connection)==bound&&!connection.getAutoCommit())))throw graceTransactionUnavailable();
+        }catch(java.sql.SQLException|RuntimeException failure){throw graceTransactionUnavailable();}
     }
+    private static IllegalStateException graceTransactionUnavailable(){return new IllegalStateException("Owned failed renewal requires caller DataSource transaction");}
     private static IllegalStateException unavailable() { return new IllegalStateException("Owned failed renewal authority unavailable"); }
 }
