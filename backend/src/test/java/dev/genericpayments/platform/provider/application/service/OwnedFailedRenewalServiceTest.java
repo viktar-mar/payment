@@ -160,6 +160,19 @@ public class OwnedFailedRenewalServiceTest {
         var forged=new GraceLastSecondPreparation(UUID.randomUUID(),p.admissionId(),p.failureClaimId(),p.billId(),p.predecessorReadyId(),p.graceDeadline(),p.target(),p.operationKey(),p.fingerprint(),p.preparedAt());
         assertThatThrownBy(()->h.service.requireGraceLastSecond(h.admission,forged)).isInstanceOf(IllegalStateException.class);assertThat(h.preparation).isEqualTo(p);assertThat(h.stopped).isFalse();
     }
+    @Test void scopedGraceCallbackRequiresExistingCallerAndAuthenticatesBeforeEffectWithoutNewTransaction() {
+        var h=new Harness(false,"alias",900000);h.fail();var p=h.service.prepareGraceLastSecond(h.admission);h.trace.clear();
+        assertThatThrownBy(()->h.service.withGraceLastSecondInTransaction(h.admission,p,c->{throw new AssertionError("outside caller effect");})).isInstanceOf(IllegalStateException.class);
+        assertThat(h.trace).isEmpty();var before=h.effects;
+        var result=h.transactionPort.requiresNew(()->h.service.withGraceLastSecondInTransaction(h.admission,p,c->{
+            assertThat(h.active).isTrue();assertThat(c.admission()).isEqualTo(h.admission);assertThat(c.preparation()).isEqualTo(p);assertThat(c.failure()).isEqualTo(h.failure);assertThat(c.account()).isSameAs(h.account);
+            assertThat(h.trace).containsSubsequence("begin","graceLocks","operations","lifecycle","account","subscription","bill","bill");h.trace.add("scoped-effect");return "authenticated";
+        }));
+        assertThat(result).isEqualTo("authenticated");assertThat(h.trace.stream().filter("begin"::equals)).hasSize(1);assertThat(h.effects).isEqualTo(before);assertThat(h.stopped).isFalse();
+        h.billingSecond++;h.trace.clear();
+        assertThatThrownBy(()->h.transactionPort.requiresNew(()->h.service.withGraceLastSecondInTransaction(h.admission,p,c->{throw new AssertionError("drift reached effect");}))).isInstanceOf(IllegalStateException.class);
+        assertThat(h.trace).contains("rollback");assertThat(h.stopped).isFalse();
+    }
     @Test void graceRefusalsHaveNoStopNoEffectsAndRollbackStoreExceptions() {
         for(var bad:List.of("ambient","failure","time","ordinary","foreign","debt","stop","recovery","store","lock")) {
             var h=new Harness(false,"alias",900000);if(!bad.equals("failure"))h.fail();var effects=h.effects;var callbacks=h.callbacks;

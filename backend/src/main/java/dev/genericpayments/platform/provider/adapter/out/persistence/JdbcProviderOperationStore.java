@@ -39,7 +39,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     @Override
     public ProviderOperation reserve(PaymentAccount account, Kind kind, UUID resourceId, String key, String fingerprint) {
         if (account == null || kind == null || resourceId == null) throw conflict();
-        if(kind==Kind.TEST_CLOCK_ADVANCE||kind==Kind.OWNED_RECOVERY_INTENT_CONFIRM)throw conflict();
+        if(kind==Kind.TEST_CLOCK_ADVANCE||dedicated(kind))throw conflict();
         text(key, 255);
         text(fingerprint, 255);
         requireAccount(account);
@@ -369,14 +369,15 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         // same operation -> provider order as browser root/proof FKs, even for terminal ACKs.
         var persisted=row(jdbc,id);
         if(persisted.isEmpty())return Optional.empty();
-        if(persisted.filter(o->o.kind()==Kind.OWNED_RECOVERY_INTENT_CONFIRM).isPresent())throw conflict();
+        if(persisted.filter(o->dedicated(o.kind())).isPresent())throw conflict();
         persisted.filter(o->o.kind()==Kind.SETUP_INTENT_CREATE||o.kind()==Kind.SUBSCRIPTION_UPDATE)
             .filter(o->JdbcOwnedFailedRenewalMethodStore.ownedStepResource(jdbc,o.accountId(),o.resourceId()))
             .ifPresent(o->lockOwnedMethodOperation(o.resourceId()));
-        var locked=jdbc.query("select * from provider_operations where id=? and kind<>'OWNED_RECOVERY_INTENT_CONFIRM' for update",this::operation,id).stream().findFirst();
-        if(locked.filter(o->o.kind()==Kind.OWNED_RECOVERY_INTENT_CONFIRM).isPresent())throw conflict();
+        var locked=jdbc.query("select * from provider_operations where id=? and kind<>'OWNED_RECOVERY_INTENT_CONFIRM' and kind<>'OWNED_GRACE_CLOCK_ADVANCE' for update",this::operation,id).stream().findFirst();
+        if(locked.filter(o->dedicated(o.kind())).isPresent())throw conflict();
         return locked;
     }
+    private static boolean dedicated(Kind kind){return kind==Kind.OWNED_RECOVERY_INTENT_CONFIRM||kind==Kind.OWNED_GRACE_CLOCK_ADVANCE;}
     private void lockOwnedMethodOperation(UUID resource){
         if(jdbc.queryForList("select id from subscription_operations where id=? for update",UUID.class,resource).size()!=1)throw conflict();
     }

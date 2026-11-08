@@ -2,6 +2,7 @@ package dev.genericpayments.platform.provider.adapter.out.persistence;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
 import dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalStore;
@@ -37,7 +38,7 @@ class OwnedFailedRenewalStoreTransactionTest {
             } finally {h.unbind();}
         }
     }
-    private static final class JpaBoundary {
+    static final class JpaBoundary {
         final java.util.concurrent.atomic.AtomicInteger queries=new java.util.concurrent.atomic.AtomicInteger();
         final String mode;final DataSource dataSource;final Connection physical,sessionConnection;final EntityManagerFactory factory;final EntityManager em;final JdbcTemplate jdbc;
         JpaBoundary(String mode) {
@@ -49,7 +50,7 @@ class OwnedFailedRenewalStoreTransactionTest {
             var tx=proxy(EntityTransaction.class,(method,args)->method.equals("isActive")?!mode.equals("inactive"):identity(method,args,"inert-entity-transaction"));
             var session=proxy(Session.class,(method,args)->{if(method.equals("doReturningWork"))return ((ReturningWork<?>)args[0]).execute(sessionConnection);return identity(method,args,"inert-session");});
             em=proxy(EntityManager.class,(method,args)->switch(method){case "isOpen"->!mode.equals("closedEm");case "getTransaction"->tx;case "unwrap"->{assertThat(args[0]).isEqualTo(Session.class);yield session;}default->identity(method,args,"inert-entity-manager");});
-            jdbc=new JdbcTemplate(dataSource){@Override public <T> List<T> query(String sql,RowMapper<T> mapper,Object... args){queries.incrementAndGet();throw new AssertionError("INERT_PROOF_BOUNDARY");}};
+            jdbc=new JdbcTemplate(dataSource){@Override public <T> List<T> query(String sql,RowMapper<T> mapper,Object... args){queries.incrementAndGet();throw new AssertionError("INERT_PROOF_BOUNDARY");}@Override public List<Map<String,Object>> queryForList(String sql,Object... args){queries.incrementAndGet();throw new AssertionError("INERT_PROOF_BOUNDARY");}};
         }
         void bind(){TransactionSynchronizationManager.setActualTransactionActive(true);TransactionSynchronizationManager.bindResource(dataSource,new ConnectionHolder(physical));if(!mode.equals("missingEm"))TransactionSynchronizationManager.bindResource(factory,new EntityManagerHolder(em));}
         void unbind(){TransactionSynchronizationManager.unbindResource(dataSource);if(!mode.equals("missingEm"))TransactionSynchronizationManager.unbindResource(factory);TransactionSynchronizationManager.setActualTransactionActive(false);}

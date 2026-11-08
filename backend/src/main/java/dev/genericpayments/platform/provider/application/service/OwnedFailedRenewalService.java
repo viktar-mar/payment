@@ -3,6 +3,7 @@ package dev.genericpayments.platform.provider.application.service;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal.*;
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedGraceAdvance.PreparationContext;
 import dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalStore;
 import dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.LockPaymentAccountPort;
@@ -16,6 +17,7 @@ import dev.genericpayments.platform.subscriptions.domain.*;
 import java.time.*;
 import java.util.*;
 import java.util.function.Supplier;
+import java.util.function.Function;
 
 /** Explicit internal consumer. No registration, provider IO, command dispatch, or time mutation.
  * Entry points require no ambient transaction so terminal stop can follow an actual rollback. */
@@ -116,21 +118,33 @@ public final class OwnedFailedRenewalService {
     public GraceLastSecondPreparation prepareGraceLastSecond(Admission admission) {
         fresh();Objects.requireNonNull(admission);
         return transaction.requiresNew(()->{
-            store.lockGraceLastSecondInTransaction(admission);
-            var state=current(admission);requireNoFinancial(state);
-            var failure=store.requireFailureInTransaction(admission);requireDebt(state,failure);requireOriginalReadySample(admission,state);
-            return store.prepareGraceLastSecondInTransaction(admission,failure,state.utcAt().truncatedTo(java.time.temporal.ChronoUnit.MICROS));
+            var grace=graceCurrent(admission);
+            return store.prepareGraceLastSecondInTransaction(admission,grace.failure(),grace.state().utcAt().truncatedTo(java.time.temporal.ChronoUnit.MICROS));
         });
     }
     /** Exact saved-row authentication only; never a renewable permission to dispatch. */
     public GraceLastSecondPreparation requireGraceLastSecond(Admission admission,GraceLastSecondPreparation preparation) {
         fresh();Objects.requireNonNull(admission);Objects.requireNonNull(preparation);
         return transaction.requiresNew(()->{
-            store.lockGraceLastSecondInTransaction(admission);
-            var state=current(admission);requireNoFinancial(state);
-            var failure=store.requireFailureInTransaction(admission);requireDebt(state,failure);requireOriginalReadySample(admission,state);
+            graceCurrent(admission);
             return store.requireGraceLastSecondInTransaction(admission,preparation);
         });
+    }
+    /** Authenticate and consume the saved description on the already-active writer transaction. */
+    public <T>T withGraceLastSecondInTransaction(Admission admission,GraceLastSecondPreparation preparation,Function<PreparationContext,T> effect){
+        if(!transaction.active())throw unavailable();Objects.requireNonNull(admission);Objects.requireNonNull(preparation);Objects.requireNonNull(effect);
+        var before=graceContext(admission,preparation);var result=effect.apply(before);
+        // Locks and current eligibility bracket every effect; a wait cannot conceal authority/sample drift.
+        if(!before.equals(graceContext(admission,preparation)))throw unavailable();return result;
+    }
+    private record GraceCurrent(Locked state,Failure failure){}
+    private GraceCurrent graceCurrent(Admission admission){
+        store.lockGraceLastSecondInTransaction(admission);var state=current(admission);requireNoFinancial(state);
+        var failure=store.requireFailureInTransaction(admission);requireDebt(state,failure);requireOriginalReadySample(admission,state);return new GraceCurrent(state,failure);
+    }
+    private PreparationContext graceContext(Admission admission,GraceLastSecondPreparation preparation){
+        var current=graceCurrent(admission);var saved=store.requireGraceLastSecondInTransaction(admission,preparation);
+        if(!preparation.equals(saved))throw unavailable();return new PreparationContext(admission,saved,current.failure(),current.state().account());
     }
     private static void requireOriginalReadySample(Admission admission,Locked state) {
         if(!state.sample().isolated()||!state.sample().billingAt().equals(Instant.ofEpochSecond(admission.ready().ack().advance().target())))throw unavailable();

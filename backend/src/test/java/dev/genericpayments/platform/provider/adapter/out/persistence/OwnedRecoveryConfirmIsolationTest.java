@@ -98,7 +98,7 @@ class OwnedRecoveryConfirmIsolationTest {
         assertThat(j.reads).isEmpty();assertThat(j.writes).isEmpty();
     }
 
-    private static ProviderOperationStore findOnly(BoundaryJdbc jdbc){
+    static ProviderOperationStore findOnly(BoundaryJdbc jdbc){
         return (ProviderOperationStore)Proxy.newProxyInstance(ProviderOperationStore.class.getClassLoader(),new Class<?>[]{ProviderOperationStore.class},(p,m,a)->{
             assertThat(m.getName()).isEqualTo("findById");assertThat(a[0]).isEqualTo(jdbc.row.id());return Optional.of(jdbc.row);
         });
@@ -123,15 +123,17 @@ class OwnedRecoveryConfirmIsolationTest {
 
     /** Dedicated row is negative input only. Missing exclusions reach observable modeled mutation,
      * rather than an artificial exception that would accidentally satisfy a refusal assertion. */
-    private static final class BoundaryJdbc extends JdbcTemplate {
+    static final class BoundaryJdbc extends JdbcTemplate {
         final PaymentAccount account=PaymentAccount.create(new PaymentAccountId(UUID.randomUUID()),"inert",PaymentProviderType.STRIPE,PaymentAccountMode.SANDBOX,"acct_inert","no-key-alias");
-        final ProviderOperation row=new ProviderOperation(UUID.randomUUID(),account.id(),account.externalAccountId(),account.credentialsRef(),DEDICATED,UUID.randomUUID(),"original:RECOVER:CONFIRM","original-fingerprint",Status.DISPATCHING,null,NOW.minusSeconds(5),NOW.plus(Duration.ofHours(22)),"original-owner",NOW.plusSeconds(55),1);
+        final ProviderOperation row;
+        BoundaryJdbc(){this(DEDICATED);}
+        BoundaryJdbc(Kind kind){row=new ProviderOperation(UUID.randomUUID(),account.id(),account.externalAccountId(),account.credentialsRef(),kind,UUID.randomUUID(),"original:RECOVER:CONFIRM","original-fingerprint",Status.DISPATCHING,null,NOW.minusSeconds(5),NOW.plus(Duration.ofHours(22)),"original-owner",NOW.plusSeconds(55),1);}
         final List<String> reads=new ArrayList<>(),writes=new ArrayList<>();int schedulerSelections,schedulerRowReads;
         @Override @SuppressWarnings("unchecked") public <T> List<T> queryForList(String sql,Class<T> type,Object... args){
             reads.add(sql);assertThat(type).isEqualTo(UUID.class);
             if(sql.contains("for update of o skip locked")){
                 schedulerSelections++;
-                boolean excluded=sql.contains("OWNED_RECOVERY_INTENT_CONFIRM") && (sql.contains("o.kind<>")||sql.contains("o.kind <>")||sql.contains("o.kind not in")||sql.contains("o.kind NOT IN"));
+                boolean excluded=sql.contains(row.kind().name()) && (sql.contains("o.kind<>")||sql.contains("o.kind <>")||sql.contains("o.kind not in")||sql.contains("o.kind NOT IN"));
                 return (List<T>)(excluded?List.<UUID>of():List.of(row.id()));
             }
             if(sql.contains("join stripe_billing_clock_intents"))return List.of();
@@ -144,7 +146,7 @@ class OwnedRecoveryConfirmIsolationTest {
         @Override public int update(String sql,Object... args){writes.add(sql);return 1;}
         @Override public Map<String,Object> queryForMap(String sql,Object... args){
             reads.add(sql);schedulerRowReads++;
-            return Map.of("kind",DEDICATED.name(),"recovery_attempts",1,"next_attempt_at",Timestamp.from(NOW.plusSeconds(120)),"lease_expires_at",Timestamp.from(NOW.minusSeconds(1)),"manual_review_required",false);
+            return Map.of("kind",row.kind().name(),"recovery_attempts",1,"next_attempt_at",Timestamp.from(NOW.plusSeconds(120)),"lease_expires_at",Timestamp.from(NOW.minusSeconds(1)),"manual_review_required",false);
         }
     }
 }

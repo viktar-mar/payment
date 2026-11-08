@@ -65,7 +65,7 @@ public class StripeRecoveryProofAdapter implements ProviderRecoveryProofPort {
     @Override
     @Transactional(propagation = Propagation.SUPPORTS, readOnly = true)
     public RecoveryRequestSnapshot request(ProviderOperation operation) {
-        if(operation.kind()==ProviderOperation.Kind.TEST_CLOCK_ADVANCE||operation.kind()==ProviderOperation.Kind.OWNED_RECOVERY_INTENT_CONFIRM)throw mismatch();
+        if(operation.kind()==ProviderOperation.Kind.TEST_CLOCK_ADVANCE||operation.kind()==ProviderOperation.Kind.OWNED_RECOVERY_INTENT_CONFIRM||operation.kind()==ProviderOperation.Kind.OWNED_GRACE_CLOCK_ADVANCE)throw mismatch();
         var account = accounts.findById(operation.accountId())
                 .orElseThrow(StripeRecoveryProofAdapter::mismatch);
         credentials.resolve(account);
