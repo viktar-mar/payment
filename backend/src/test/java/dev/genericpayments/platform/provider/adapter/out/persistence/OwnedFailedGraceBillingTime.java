@@ -105,7 +105,37 @@ public final class OwnedFailedGraceBillingTime implements SubscriptionBillingTim
            then p.id is null or owned_failed_grace_identity(p.id)
            else p.id is not null and o.id is not null and q.preparation_id is not null
             and ack.preparation_id is not null and ready.id is not null and cleanup.preparation_id is null
-            and owned_failed_grace_owns(p.id,o) and owned_failed_grace_current(d.id)
+            and owned_failed_grace_owns(p.id,o)
+            -- Reader-only projection of V38 current eligibility: the writer's VOLATILE
+            -- function deliberately takes a fresh snapshot and cannot be called here.
+            -- Keep these joins/predicates aligned with V38; only its DBUTC reference differs.
+            and exists(select 1 from stripe_billing_failed_renewals current_d
+             join stripe_billing_first_renewals current_a on current_a.id=current_d.first_renewal_admission
+             join stripe_billing_owned_subscriptions current_i on current_i.id=current_a.owned_intent
+             join stripe_billing_first_renewal_ready current_r on current_r.id=current_d.ready_id and current_r.admission_id=current_a.id
+             join stripe_billing_first_renewal_steps current_step on current_step.id=current_r.step_id and current_step.admission_id=current_a.id
+             join stripe_billing_first_renewal_boundary current_b on current_b.id=current_d.boundary_id and current_b.admission_id=current_a.id
+             join stripe_billing_failed_renewal_failures current_f on current_f.admission_id=current_d.id
+             join stripe_billing_failed_renewal_reads current_q on current_q.id=current_f.claim_id and current_q.admission_id=current_d.id and current_q.phase='FAILED'
+             where current_d.id=d.id and current_d.source_sha=current_a.source_sha
+              and owned_failed_renewal_authority(current_d.id) and owned_failed_renewal_failure_current(current_d.id,null)
+              and current_step.ordinal=2 and current_step.boundary_id=current_b.id and current_step.predecessor_ready=current_b.ready_id
+              and current_step.target=current_r.frozen_time and current_d.admitted_at>=current_r.observed_at
+              and current_f.recorded_at>=current_d.admitted_at and current_f.recorded_at>=current_r.observed_at and current_f.recorded_at<=caller.utc
+              and current_f.projected_revision=current_a.subscription_revision+1 and current_f.observation_sequence=current_q.observation_sequence+1
+              and current_f.renewal_bill<>current_a.initial_bill and current_f.invoice_reference=current_b.invoice_reference and current_f.invoice_reference<>current_a.invoice_reference
+              and current_f.allocation_reference<>current_a.allocation_reference and current_f.payment_intent_reference<>current_a.payment_intent_reference
+              and row(current_f.period_start,current_f.period_end)=row(current_b.period_start,current_b.period_end)
+              and current_f.grace_deadline=date_trunc('second',current_f.grace_deadline) and current_f.period_end=date_trunc('second',current_f.period_end)
+              and extract(epoch from current_f.grace_deadline)-1>current_step.target::numeric
+              and current_f.grace_deadline+interval '1 second'<current_f.period_end
+              and extract(epoch from current_f.grace_deadline)+1-current_step.target::numeric<=case current_i.billing_interval when 'MONTH' then 56::numeric*86400 when 'YEAR' then 730::numeric*86400 else -1 end
+              and not exists(select 1 from stripe_billing_failed_method_reservations x where x.admission_id=current_d.id)
+              and not exists(select 1 from stripe_billing_failed_renewal_recoveries x where x.admission_id=current_d.id)
+              and not exists(select 1 from stripe_billing_failed_renewal_publications x where x.admission_id=current_d.id)
+              and not exists(select 1 from stripe_billing_failed_renewal_stops x where x.admission_id=current_d.id)
+              and not exists(select 1 from subscription_operations x where x.subscription_id=current_d.subscription_id
+               and x.status in ('RESERVED','PROCESSING','REQUIRES_ACTION','UNKNOWN') and x.kind<>'RECONCILE'))
             and p.admission_id=d.id and p.predecessor_ready=predecessor.id
             and p.prepared_at>=f.recorded_at and p.prepared_at>=predecessor.observed_at
             and p.prepared_at<=q.claimed_at and p.prepared_at<=caller.utc

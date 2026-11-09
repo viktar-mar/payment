@@ -228,9 +228,11 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         return state;
     }
     private void assertGraceReadDenied(OwnedFailedGraceBillingTime selector,Subscription supplied){
-        var before=graceReadRows();int calls=http.calls.size();
-        assertThatThrownBy(()->transaction.required(()->selector.sampleForRead(supplied,Instant.now()))).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
-        assertThat(graceReadRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+        transaction.required(()->{
+            var before=graceReadRows();int calls=http.calls.size();
+            assertThatThrownBy(()->selector.sampleForRead(supplied,Instant.now())).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+            assertThat(graceReadRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);return true;
+        });
     }
     private void assertGraceQueryRead(dev.genericpayments.platform.subscriptions.application.service.SubscriptionQueryService query,
             SubscriptionActor actor,Subscription exact,Instant selected){
@@ -294,8 +296,8 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     }
     @Test void graceRealReadyInWritingTransactionAndIndependentReaderRefuseEvenAfterDeferredChecksDrain()throws Exception{
         var p=gracePrepared();var f=new GraceSdk(p);var same=graceReadTime();var independent=graceReadTime();var exact=current();
-        var checked=new java.util.concurrent.atomic.AtomicBoolean();final List<String>[] originalAck=new List[]{null};
-        f.afterCommit=phase->{if(phase.equals("ack"))originalAck[0]=rows("stripe_billing_failed_grace_acks");};
+        var checked=new java.util.concurrent.atomic.AtomicBoolean();var originalAck=new java.util.concurrent.atomic.AtomicReference<List<String>>();
+        f.afterCommit=phase->{if(phase.equals("ack"))originalAck.set(rows("stripe_billing_failed_grace_acks"));};
         f.beforeCommit=phase->{if(phase.equals("ready")){
             assertThat(count("stripe_billing_failed_grace_ready")).isEqualTo(1);assertGraceReadDenied(same,exact);
             jdbc.execute("set constraints failed_grace_provider_committed,failed_grace_claim_committed,failed_grace_ack_committed,failed_grace_ready_committed immediate");
@@ -305,7 +307,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             }catch(Exception failure){throw new IllegalStateException("Independent uncommitted grace read failed",failure);}
             checked.set(true);throw new IllegalStateException("rollback uncommitted READY control");
         }};f.queue();assertThatThrownBy(f::advance).isInstanceOf(PaymentApplicationException.class);assertThat(checked).isTrue();
-        assertThat(count("stripe_billing_failed_grace_ready")).isZero();assertThat(rows("stripe_billing_failed_grace_acks")).isEqualTo(originalAck[0]);
+        assertThat(count("stripe_billing_failed_grace_ready")).isZero();assertThat(rows("stripe_billing_failed_grace_acks")).isEqualTo(originalAck.get());
         assertThat(count("stripe_billing_failed_grace_cleanup")).isEqualTo(1);assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);assertGraceReadDenied(graceReadTime(),exact);
     }
     private Subscription graceSuppliedCopy(Subscription s,String mutation){
