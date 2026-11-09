@@ -53,7 +53,7 @@ public class SubscriptionQueryService implements QuerySubscriptionsUseCase {
             if(!timings.isEmpty())result.add(new SubscriptionOffer(price,transition.direction(),timings,false));
         }return List.copyOf(result);
     }
-    public AccessDecision access(SubscriptionActor a,SiteId site,CustomerId customer,ProductId product){return tx.required(()->{authorize(a,site,customer);var now=clock.instant();return reads.current(site,customer,product).map(s->new SubscriptionAccessPolicy().evaluate(s,billingTime.sample(s.paymentAccountId(),s.siteId(),s.customerId(),now).billingAt())).orElseGet(()->new AccessDecision(false,AccessDecision.Reason.NO_SUBSCRIPTION,site,customer,product,null,null,null,0,now,null));});}
+    public AccessDecision access(SubscriptionActor a,SiteId site,CustomerId customer,ProductId product){return tx.required(()->{authorize(a,site,customer);var now=clock.instant();return reads.current(site,customer,product).map(s->new SubscriptionAccessPolicy().evaluate(s,billingTime.sampleForRead(s,now).billingAt())).orElseGet(()->new AccessDecision(false,AccessDecision.Reason.NO_SUBSCRIPTION,site,customer,product,null,null,null,0,now,null));});}
     public SubscriptionOperationResult operation(SubscriptionActor a,SiteId site,UUID id){return tx.required(()->{
         if(a instanceof SubscriptionActor.Customer c)authorize(a,site,c.session().customerId());else authority.revalidateSite(a,site,false);
         var o=reads.operation(site,id).orElseThrow(SubscriptionQueryService::missing);owned(a,site,o.subscriptionId());
@@ -62,7 +62,7 @@ public class SubscriptionQueryService implements QuerySubscriptionsUseCase {
     private SubscriptionProviderModels.Capabilities capabilities(Subscription s){var account=accounts.findById(s.paymentAccountId()).orElseThrow(SubscriptionQueryService::missing);return providers.forAccount(account).capabilities(account);}
     private SubscriptionView view(Subscription s){
         var now=clock.instant();
-        return view(s,billingTime.sample(s.paymentAccountId(),s.siteId(),s.customerId(),now));
+        return view(s,billingTime.sampleForRead(s,now));
     }
     private SubscriptionView view(Subscription s,java.time.Instant now){
         return view(s,new SubscriptionBillingTimePort.Sample(now,SubscriptionBillingTimePort.Mode.ORDINARY));

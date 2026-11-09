@@ -3,6 +3,7 @@ package dev.genericpayments.platform.subscriptions.application.port.out;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
 import dev.genericpayments.platform.sites.domain.SiteId;
 import dev.genericpayments.platform.customers.domain.CustomerId;
+import dev.genericpayments.platform.subscriptions.domain.Subscription;
 import java.time.Instant;
 import java.util.Objects;
 
@@ -17,6 +18,9 @@ public interface SubscriptionBillingTimePort {
     }
     /** Ownership must come from an authenticated/locked Subscription, never request time/clock IDs. */
     Sample sample(PaymentAccountId account, SiteId site, CustomerId customer, Instant operationalAt);
+    default Sample sampleForRead(Subscription subscription, Instant operationalAt) {
+        return sample(subscription.paymentAccountId(), subscription.siteId(), subscription.customerId(), operationalAt);
+    }
     /** Mandatory before SQL selecting a list or deadline candidates. Null site means global;
      * null customer means all Customers. Implementations must refuse any scope that can include
      * isolated time. Ordinary adapters permit every scope. */

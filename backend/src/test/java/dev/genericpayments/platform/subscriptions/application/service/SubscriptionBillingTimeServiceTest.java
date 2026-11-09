@@ -46,6 +46,57 @@ class SubscriptionBillingTimeServiceTest {
         assertThat(ordinary.permittedActions()).contains(dev.genericpayments.platform.subscriptions.application.model.SubscriptionView.PermittedAction.SETUP_METHOD);
         assertThat(ordinary.access().evaluatedAt()).isEqualTo(UTC);
     }
+    @Test void exactGetAndAccessSelectReadTimeFromTheStoredSubscriptionAtTheGraceBoundary() {
+        var base=SubscriptionFixtures.active(Instant.parse("2026-08-01T00:00:00Z"),Instant.parse("2026-09-01T00:00:00Z"));
+        var period=new Subscription.Period(Instant.parse("2026-09-01T00:00:00Z"),UTC);
+        var s=base.renewalFailed(UUID.randomUUID(),period,3,Instant.parse("2026-09-01T00:00:00Z"),UTC);
+        var bill=new BillingRecord(s.debt().billingRecordId(),s.siteId(),s.id(),s.paymentAccountId(),"invoice",BillingRecord.Kind.RENEWAL,s.billingPrice(),null,period,1000,"EUR",BillingRecord.Settlement.OPEN,0,UTC,UTC);
+        var selected=new ArrayList<Subscription>();
+        var time=new SubscriptionBillingTimePort(){
+            public Sample sample(dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId account,dev.genericpayments.platform.sites.domain.SiteId site,dev.genericpayments.platform.customers.domain.CustomerId customer,Instant now){throw new AssertionError("Exact reads must use the subscription read hook");}
+            @Override public Sample sampleForRead(Subscription subscription,Instant operationalAt){
+                assertThat(subscription).isSameAs(s);
+                assertThat(operationalAt).isEqualTo(Instant.parse("2026-10-01T00:00:00Z"));
+                selected.add(subscription);
+                return new Sample(Instant.parse("2026-09-03T23:59:59Z"),Mode.ISOLATED);
+            }
+            public void requireUnscopedAllowed(dev.genericpayments.platform.sites.domain.SiteId site,dev.genericpayments.platform.customers.domain.CustomerId customer){throw new AssertionError("Exact reads must not select an unscoped clock");}
+        };
+        var reads=port(SubscriptionReadPort.class,(m,a)->switch(m){case "current"->Optional.of(s);case "unresolvedOperation"->Optional.empty();case "bill"->Optional.of(bill);default->throw new AssertionError(m);});
+        var query=query(s,time,reads);
+        var view=query.get(null,s.siteId(),s.id());
+        var access=query.access(null,s.siteId(),s.customerId(),s.productId());
+        assertThat(selected).containsExactly(s,s);
+        assertThat(view.subscription()).isSameAs(s);
+        assertThat(UTC).isAfter(Instant.parse("2026-09-04T00:00:00Z"));
+        assertThat(view.access().allowed()).isTrue();
+        assertThat(view.access().reason()).isEqualTo(AccessDecision.Reason.GRACE);
+        assertThat(view.access().evaluatedAt()).isEqualTo(Instant.parse("2026-09-03T23:59:59Z"));
+        assertThat(view.access().validUntil()).isEqualTo(Instant.parse("2026-09-04T00:00:00Z"));
+        assertThat(access).isEqualTo(view.access());
+        assertThat(view.permittedActions()).isEmpty();
+        assertThat(view.debt()).isEqualTo(new dev.genericpayments.platform.subscriptions.application.model.SubscriptionView.DebtView(bill.id(),new Subscription.Period(Instant.parse("2026-09-01T00:00:00Z"),Instant.parse("2026-10-01T00:00:00Z")),Instant.parse("2026-09-04T00:00:00Z"),1000,"EUR"));
+        assertThat(view.subscription().debt()).isSameAs(s.debt());
+        assertThat(view.subscription().createdAt()).isEqualTo(Instant.parse("2026-08-01T00:00:00Z"));
+        assertThat(view.subscription().updatedAt()).isEqualTo(Instant.parse("2026-10-01T00:00:00Z"));
+    }
+    @Test void refusedAuthorityPreventsExactLookupAndReadTimeSelection() {
+        var s=SubscriptionFixtures.active(UTC,UTC.plus(Duration.ofDays(30)));
+        var denied=port(SubscriptionAuthorityPort.class,(m,a)->{throw new IllegalStateException("AUTHORITY_REFUSED");});
+        var query=new SubscriptionQueryService(transaction(),denied,inert(SubscriptionStore.class),inert(SubscriptionReadPort.class),inert(SubscriptionPolicyPort.class),inert(SubscriptionCatalogPort.class),inert(TrialEligibilityStore.class),inert(dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort.class),a->{throw new AssertionError("Unexpected provider selection");},Clock.fixed(UTC,ZoneOffset.UTC),inert(SubscriptionBillingTimePort.class));
+        assertThatThrownBy(()->query.get(null,s.siteId(),s.id())).isInstanceOf(IllegalStateException.class).hasMessage("AUTHORITY_REFUSED");
+        assertThatThrownBy(()->query.access(null,s.siteId(),s.customerId(),s.productId())).isInstanceOf(IllegalStateException.class).hasMessage("AUTHORITY_REFUSED");
+    }
+    @Test void accessWithoutSubscriptionUsesOperationalUtcWithoutReadTimeSelection() {
+        var s=SubscriptionFixtures.active(UTC,UTC.plus(Duration.ofDays(30)));
+        var reads=port(SubscriptionReadPort.class,(m,a)->{assertThat(m).isEqualTo("current");return Optional.empty();});
+        var access=query(s,inert(SubscriptionBillingTimePort.class),reads).access(null,s.siteId(),s.customerId(),s.productId());
+        assertThat(access.allowed()).isFalse();
+        assertThat(access.reason()).isEqualTo(AccessDecision.Reason.NO_SUBSCRIPTION);
+        assertThat(access.evaluatedAt()).isEqualTo(Instant.parse("2026-10-01T00:00:00Z"));
+        assertThat(access.subscriptionId()).isNull();
+        assertThat(access.validUntil()).isNull();
+    }
     @Test void exactScopeRequiresAccountSiteAndCustomerAndIdentityAdapterPreservesFallback() {
         var s=SubscriptionFixtures.active(UTC,UTC.plus(Duration.ofDays(30)));var time=isolated(s,BILLING);
         assertThat(time.sample(s.paymentAccountId(),s.siteId(),s.customerId(),UTC).billingAt()).isEqualTo(BILLING);
