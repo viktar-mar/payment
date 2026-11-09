@@ -119,6 +119,43 @@ class OwnedFailedGraceBillingTimeTest {
             jdbc.counts.add(1L);assertThatThrownBy(()->selector.requireUnscopedAllowed(s.siteId(),s.customerId())).hasMessage("OWNED_TIME_UNSCOPED");assertThat(jdbc.calls).isEqualTo(2);
         });
     }
+    @Test void zeroCandidateReadIgnoresForeignJdbcAtEveryInjectedLegacyTier(){
+        for(var tier:List.of("failed","renewal","subscription"))for(var result:List.of("ordinary","isolated","refused"))withRows((h,primary)->{
+            var other=new OwnedFailedRenewalStoreTransactionTest.JpaBoundary("valid");var foreign=new Rows(other);
+            var foreignHolder=new ConnectionHolder(other.physical);foreignHolder.setSynchronizedWithTransaction(true);
+            TransactionSynchronizationManager.bindResource(other.dataSource,foreignHolder);
+            try{
+                for(int n=0;n<3;n++)primary.results.add(List.of());
+                primary.results.add(result.equals("ordinary")?List.of():List.of(oldCandidate(!result.equals("refused"))));
+                // A different otherwise valid foreign result must never be consulted, even for ordinary fallback.
+                var foreignRow=new HashMap<String,Object>(oldCandidate(true));foreignRow.put("frozen_time",READY2+99);foreignRow.put("target",READY2+99);foreignRow.put("transaction_id","inert-foreign-xact");foreign.results.add(List.of(foreignRow));
+                var selector=new OwnedFailedGraceBillingTime(primary,h.factory,mixedLegacy(primary,foreign,tier));
+                if(result.equals("refused"))assertThatThrownBy(()->selector.sampleForRead(subscription(),UTC)).as(tier).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+                else assertThat(selector.sampleForRead(subscription(),UTC)).as(tier+" "+result).isEqualTo(result.equals("ordinary")?new Sample(UTC,Mode.ORDINARY):new Sample(Instant.ofEpochSecond(READY2),Mode.ISOLATED));
+                assertThat(foreign.calls).as("No foreign proof SQL at "+tier).isZero();assertThat(primary.calls).isEqualTo(4);
+                if(result.equals("ordinary"))assertThat(selector.sampledTransaction).isNull();
+            }finally{TransactionSynchronizationManager.unbindResource(other.dataSource);}
+        });
+    }
+    @Test void historicalWriterAndUnscopedStillUseTheIndependentlyInjectedLegacyChain(){
+        for(var tier:List.of("failed","renewal","subscription"))withRows((h,primary)->{
+            var other=new OwnedFailedRenewalStoreTransactionTest.JpaBoundary("valid");var foreign=new Rows(other);
+            var holder=new ConnectionHolder(other.physical);holder.setSynchronizedWithTransaction(true);TransactionSynchronizationManager.bindResource(other.dataSource,holder);
+            try{
+                int preceding=tier.equals("failed")?0:tier.equals("renewal")?1:2;
+                for(int n=0;n<preceding;n++){primary.results.add(List.of());primary.counts.add(0L);}
+                foreign.results.add(List.of(oldCandidate(true)));foreign.counts.add(1L);
+                var selector=new OwnedFailedGraceBillingTime(primary,h.factory,mixedLegacy(primary,foreign,tier));var s=subscription();
+                assertThat(selector.sample(s.paymentAccountId(),s.siteId(),s.customerId(),UTC)).isEqualTo(new Sample(Instant.ofEpochSecond(READY2),Mode.ISOLATED));
+                assertThatThrownBy(()->selector.requireUnscopedAllowed(s.siteId(),s.customerId())).hasMessage("OWNED_TIME_UNSCOPED");
+                assertThat(foreign.calls).as(tier).isEqualTo(2);assertThat(primary.calls).isEqualTo(2*preceding);
+            }finally{TransactionSynchronizationManager.unbindResource(other.dataSource);}
+        });
+    }
+    private static OwnedFailedRenewalBillingTime mixedLegacy(Rows primary,Rows foreign,String tier){
+        return new OwnedFailedRenewalBillingTime(tier.equals("failed")?foreign:primary,
+            new OwnedFirstRenewalBillingTime(tier.equals("renewal")?foreign:primary,new OwnedSubscriptionBillingTime(tier.equals("subscription")?foreign:primary)));
+    }
     private static OwnedFailedGraceBillingTime selector(OwnedFailedRenewalStoreTransactionTest.JpaBoundary h,Rows jdbc){
         return new OwnedFailedGraceBillingTime(jdbc,h.factory,new OwnedFailedRenewalBillingTime(jdbc,new OwnedFirstRenewalBillingTime(jdbc,new OwnedSubscriptionBillingTime(jdbc))));
     }

@@ -896,6 +896,30 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(count("stripe_billing_failed_grace_preparations")).isZero();assertThat(selectorRows()).isEqualTo(receipts);assertThat(financialState()).isEqualTo(financial);
     }
     @ParameterizedTest @ValueSource(booleans={true,false})
+    void graceReadFallbackUsesPrimaryCallerWhenAnyInjectedLegacyTierUsesSecondaryPool(boolean autoCommit)throws Exception{
+        genuineInitialCash();var exact=current();assertThat(count("stripe_billing_failed_renewals")).isZero();assertThat(count("stripe_billing_first_renewals")).isZero();
+        var before=graceReadRows();var finance=financialState();int calls=http.calls.size();
+        var primaryPool=jdbc.getDataSource().unwrap(com.zaxxer.hikari.HikariDataSource.class);var configuration=new com.zaxxer.hikari.HikariConfig();primaryPool.copyStateTo(configuration);
+        configuration.setPoolName("grace-mixed-fallback-"+UUID.randomUUID());configuration.setMaximumPoolSize(1);configuration.setMinimumIdle(0);configuration.setAutoCommit(autoCommit);
+        try(var secondaryPool=new com.zaxxer.hikari.HikariDataSource(configuration)){
+            var foreignQueries=new java.util.concurrent.atomic.AtomicInteger();
+            var secondary=new org.springframework.jdbc.core.JdbcTemplate(secondaryPool){@Override public <T>List<T> query(String sql,org.springframework.jdbc.core.RowMapper<T> mapper,Object... args){foreignQueries.incrementAndGet();throw new AssertionError("FOREIGN_LEGACY_FALLBACK_REACHED_PROOF_SQL");}};
+            transaction.requiresNew(()->{
+                assertThat(new org.springframework.jdbc.core.JdbcTemplate(secondaryPool).queryForObject("select 1",Integer.class)).isEqualTo(1);
+                var holder=(org.springframework.jdbc.datasource.ConnectionHolder)org.springframework.transaction.support.TransactionSynchronizationManager.getResource(secondaryPool);
+                assertThat(holder).isNotNull();assertThat(holder.isSynchronizedWithTransaction()).isTrue();
+                try{assertThat(holder.getConnection().getAutoCommit()).isEqualTo(autoCommit);}catch(java.sql.SQLException failure){throw new IllegalStateException(failure);}
+                for(var tier:List.of("failed","renewal","subscription")){
+                    var injected=new OwnedFailedRenewalBillingTime(tier.equals("failed")?secondary:jdbc,new OwnedFirstRenewalBillingTime(tier.equals("renewal")?secondary:jdbc,new OwnedSubscriptionBillingTime(tier.equals("subscription")?secondary:jdbc)));
+                    var selector=new OwnedFailedGraceBillingTime(jdbc,entityManagerFactory,injected);var snapshot=graceReadRows();
+                    assertThat(selector.sampleForRead(exact,Instant.now())).as(tier).isEqualTo(new SubscriptionBillingTimePort.Sample(Instant.ofEpochSecond(FROZEN),SubscriptionBillingTimePort.Mode.ISOLATED));
+                    assertThat(foreignQueries).as("No foreign proof query at "+tier).hasValue(0);assertThat(graceReadRows()).isEqualTo(snapshot);
+                }return true;
+            });
+        }
+        assertThat(graceReadRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(finance);assertThat(http.calls).hasSize(calls);
+    }
+    @ParameterizedTest @ValueSource(booleans={true,false})
     void graceRejectsPretouchedSecondaryPoolRegardlessOfAutoCommitWithoutProofSqlOrLocks(boolean autoCommit)throws Exception {
         time.usePersisted();var s=setup();var f=fail(s,service(store(),null));var receipts=selectorRows();var financial=financialState();
         var originalPool=jdbc.getDataSource().unwrap(com.zaxxer.hikari.HikariDataSource.class);var configuration=new com.zaxxer.hikari.HikariConfig();originalPool.copyStateTo(configuration);

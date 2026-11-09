@@ -7,6 +7,8 @@ import dev.genericpayments.platform.subscriptions.adapter.out.persistence.OwnedG
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingTimePort;
 import dev.genericpayments.platform.subscriptions.domain.Subscription;
 import dev.genericpayments.platform.support.OwnedFailedRenewalBillingTime;
+import dev.genericpayments.platform.support.OwnedFirstRenewalBillingTime;
+import dev.genericpayments.platform.support.OwnedSubscriptionBillingTime;
 import jakarta.persistence.EntityManagerFactory;
 import java.sql.Connection;
 import java.sql.ResultSet;
@@ -29,6 +31,7 @@ public final class OwnedFailedGraceBillingTime implements SubscriptionBillingTim
     private final JdbcTemplate jdbc;
     private final EntityManagerFactory factory;
     private final OwnedFailedRenewalBillingTime original;
+    private final OwnedFailedRenewalBillingTime readFallback;
     private final OwnedGraceSubscriptionRows subscriptions;
     public Object sampledConnectionHolder;
     public String sampledTransaction;
@@ -36,6 +39,9 @@ public final class OwnedFailedGraceBillingTime implements SubscriptionBillingTim
     public OwnedFailedGraceBillingTime(JdbcTemplate jdbc,EntityManagerFactory factory,OwnedFailedRenewalBillingTime original){
         this.jdbc=Objects.requireNonNull(jdbc);this.factory=Objects.requireNonNull(factory);this.original=Objects.requireNonNull(original);
         subscriptions=new OwnedGraceSubscriptionRows(jdbc);
+        // Every read-fallback tier must use the authenticated template. The independently
+        // injected chain remains solely the historical writer/unscoped implementation.
+        readFallback=new OwnedFailedRenewalBillingTime(jdbc,new OwnedFirstRenewalBillingTime(jdbc,new OwnedSubscriptionBillingTime(jdbc)));
     }
     @Override public Sample sample(PaymentAccountId account,SiteId site,CustomerId customer,Instant operationalAt){
         sampledConnectionHolder=null;sampledTransaction=null;
@@ -59,12 +65,12 @@ public final class OwnedFailedGraceBillingTime implements SubscriptionBillingTim
         if(candidates.isEmpty()){
             // Only absence under BOTH owner and actual-ID discovery arms permits the concrete old chain.
             Sample value;
-            try{value=original.sample(supplied.paymentAccountId(),supplied.siteId(),supplied.customerId(),operationalAt);}
+            try{value=readFallback.sample(supplied.paymentAccountId(),supplied.siteId(),supplied.customerId(),operationalAt);}
             catch(RuntimeException failure){
                 requireSameReadCommitted(caller);var diagnostic=failure.getMessage();
                 throw new IllegalStateException(CALLER.equals(diagnostic)?CALLER:AMBIGUOUS.equals(diagnostic)?AMBIGUOUS:MISSING);
             }
-            requireSameReadCommitted(caller);sampledTransaction=value.isolated()?original.sampledTransaction:null;return value;
+            requireSameReadCommitted(caller);sampledTransaction=value.isolated()?readFallback.sampledTransaction:null;return value;
         }
         var candidate=candidates.getFirst();
         if(!candidate.valid()||candidate.frozenTime()==null||candidate.transaction()==null||!supplied.equals(candidate.current()))throw new IllegalStateException(MISSING);
