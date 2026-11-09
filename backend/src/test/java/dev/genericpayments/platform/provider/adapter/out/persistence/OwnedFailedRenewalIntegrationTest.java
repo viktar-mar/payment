@@ -87,6 +87,8 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     @Autowired dev.genericpayments.platform.subscriptions.adapter.in.web.SubscriptionHttpUseCases ordinaryHttp;
     @Autowired jakarta.persistence.EntityManagerFactory entityManagerFactory;
     @Autowired dev.genericpayments.platform.paymentaccounts.application.port.out.SavePaymentAccountPort graceTestAccounts;
+    @Autowired SubscriptionReadPort graceQueryReads;
+    @Autowired SubscriptionProviderRegistry graceQueryProviders;
     private OwnedFailedRenewalStore store() { return new JdbcOwnedFailedRenewalStore(jdbc,entityManagerFactory); }
     private record ManagementAuthentication(dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext context,String rawToken){
         @Override public String toString(){return "ManagementAuthentication[redacted]";}
@@ -207,6 +209,176 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         void queue(){http.reply(clock(prepared.setup().ready().observation().frozenTime(),"ready"));http.reply(clock(prepared.context().preparation().target(),"advancing"));http.reply(clock(prepared.context().preparation().target(),"ready"));}
     }
     private List<String> graceSdkHistory(){return List.of("stripe_billing_failed_grace_claims","stripe_billing_failed_grace_acks","stripe_billing_failed_grace_ready","stripe_billing_failed_grace_cleanup").stream().map(table->table+rows(table)).toList();}
+    /** Exact-query composition deliberately uses the new selector and actual injected ports. */
+    private OwnedFailedGraceBillingTime graceReadTime(){return new OwnedFailedGraceBillingTime(jdbc,entityManagerFactory,time.persisted);}
+    private dev.genericpayments.platform.subscriptions.application.service.SubscriptionQueryService graceQueries(){
+        return new dev.genericpayments.platform.subscriptions.application.service.SubscriptionQueryService(transaction,authority,subscriptions,
+            graceQueryReads,policies,catalog,trials,accounts,graceQueryProviders,Clock.systemUTC(),graceReadTime());
+    }
+    /** No exclusions: all V39 receipts, full provider/stop rows, business state and audit timestamps. */
+    private Map<String,List<String>> graceReadRows(){
+        var state=new TreeMap<>(selectorRows());
+        for(var table:List.of("stripe_billing_failed_grace_preparations","stripe_billing_failed_grace_claims","stripe_billing_failed_grace_acks",
+                "stripe_billing_failed_grace_ready","stripe_billing_failed_grace_cleanup","stripe_billing_failed_renewal_stops","provider_operations",
+                "subscriptions","subscription_operations","subscription_billing_records","subscription_provider_objects","subscription_trial_eligibility",
+                "subscription_event_sequences","subscription_events","subscription_quotes","subscription_action_capabilities","subscription_portal_sessions",
+                "subscription_admin_receipts","subscription_change_intents","subscription_confirmation_chains","subscription_confirmation_attempts",
+                "payments","payment_events","provider_charge_receipts","outbox_events","site_subscription_policies","subscription_plan_transitions",
+                "products","prices","provider_product_mappings","provider_price_mappings","customer_sessions"))state.put(table,rows(table));
+        return state;
+    }
+    private void assertGraceReadDenied(OwnedFailedGraceBillingTime selector,Subscription supplied){
+        var before=graceReadRows();int calls=http.calls.size();
+        assertThatThrownBy(()->transaction.required(()->selector.sampleForRead(supplied,Instant.now()))).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+        assertThat(graceReadRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+    }
+    private void assertGraceQueryRead(dev.genericpayments.platform.subscriptions.application.service.SubscriptionQueryService query,
+            SubscriptionActor actor,Subscription exact,Instant selected){
+        var before=graceReadRows();var finance=financialState();int calls=http.calls.size();
+        for(int repeat=0;repeat<2;repeat++){
+            var view=query.get(actor,site,exact.id());var access=query.access(actor,site,customer,exact.productId());
+            assertThat(view.subscription()).isEqualTo(exact);assertThat(view.permittedActions()).isEmpty();assertThat(view.access()).isEqualTo(access);
+            assertThat(access.allowed()).isTrue();assertThat(access.reason()).isEqualTo(AccessDecision.Reason.GRACE);
+            assertThat(access.evaluatedAt()).isEqualTo(selected);assertThat(access.validUntil()).isEqualTo(exact.debt().graceDeadline());
+            assertThat(view.debt().billingRecordId()).isEqualTo(exact.debt().billingRecordId());assertThat(view.debt().graceDeadline()).isEqualTo(exact.debt().graceDeadline());
+        }
+        assertThat(current()).isEqualTo(exact);assertThat(graceReadRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(finance);assertThat(http.calls).hasSize(calls);
+    }
+    @Test void graceCommittedOriginalReadySuppliesGMinusOneToRealGetAndAccessAfterBothProducerDeadlines()throws Exception{
+        var p=gracePrepared();var producer=new GraceSdk(p);producer.queue();int producerStart=http.calls.size();producer.advance();
+        assertThat(http.calls.subList(producerStart,http.calls.size()).stream().map(r->r.method().name()).toList()).containsExactly("GET","POST","GET");
+        var actor=managementContext("grace-exact-read").actor();var query=graceQueries();var exact=current();var selected=Instant.ofEpochSecond(p.context().preparation().target());
+        assertThat(selected).isEqualTo(exact.debt().graceDeadline().minusSeconds(1));assertGraceQueryRead(query,actor,exact,selected);assertPersistedSampleUnchanged();
+        // Actual recorded invocation and first-claim lease deadlines pass; neither stored evidence nor security time is rewritten.
+        var beforeWait=graceReadRows();int calls=http.calls.size();var waitLimit=Instant.now().plusSeconds(70);boolean expired=false;
+        while(Instant.now().isBefore(waitLimit)){
+            expired=Boolean.TRUE.equals(jdbc.queryForObject("select clock_timestamp()>deadline_at and clock_timestamp()>deadline from stripe_billing_failed_grace_claims where preparation_id=?",Boolean.class,p.context().preparation().id()));
+            if(expired)break;Thread.sleep(100);
+        }
+        assertThat(expired).as("Both real original producer deadlines must elapse").isTrue();assertThat(graceReadRows()).isEqualTo(beforeWait);assertThat(http.calls).hasSize(calls);
+        TestClock.set(Instant.now());assertGraceQueryRead(query,actor,exact,selected);assertPersistedSampleUnchanged();
+    }
+    @Test void graceReadWithoutPreparationKeepsGenuineFailedRenewalHistoricalReady2(){
+        time.usePersisted();var s=setup();var failures=service(store(),null);failedGraph(s);
+        var failure=new StripeBillingOwnedFailedRenewalObserver(failures,credentials,clients,Clock.systemUTC()).observe(s.admission());
+        assertThat(failure.billId()).isEqualTo(current().debt().billingRecordId());assertThat(http.replies).isEmpty();
+        assertThat(count("stripe_billing_failed_grace_preparations")).isZero();var selector=graceReadTime();var exact=current();
+        var before=graceReadRows();int calls=http.calls.size();
+        assertThat(transaction.required(()->selector.sampleForRead(exact,Instant.now()))).isEqualTo(persistedExpected());
+        assertThat(graceReadRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);assertPersistedSampleUnchanged();
+    }
+    @Test void gracePreparationAloneKeepsHistoricalReady2AndLeavesLegacyMethodBranchAvailable(){
+        var p=gracePrepared();var selector=graceReadTime();var before=graceReadRows();int calls=http.calls.size();
+        assertThat(transaction.required(()->selector.sampleForRead(current(),Instant.now()))).isEqualTo(persistedExpected());
+        assertThat(graceReadRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);assertPersistedSampleUnchanged();
+        methodService(new JdbcOwnedFailedRenewalMethodStore(jdbc)).reserveMethod(p.setup().admission(),managementContext("read-before-legacy-method"),true);
+        var legacy=graceReadRows();assertThat(transaction.required(()->selector.sampleForRead(current(),Instant.now()))).isEqualTo(persistedExpected());assertThat(graceReadRows()).isEqualTo(legacy);
+    }
+    @Test void graceDedicatedReservationBeforeClaimAlreadyRefusesHistoricalFallback(){
+        var p=gracePrepared();var selector=graceReadTime();var before=graceReadRows();var exact=current();
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            // Negative partial state only: a dedicated RESERVED operation has no successful receipt.
+            jdbc.update("insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint) values(?,?,?,?,'OWNED_GRACE_CLOCK_ADVANCE',?,?,?)",
+                UUID.randomUUID(),billing.id().value(),billing.externalAccountId(),billing.credentialsRef(),p.context().preparation().id(),p.context().preparation().operationKey(),p.context().preparation().fingerprint());
+            assertThat(count("stripe_billing_failed_grace_claims")).isZero();assertGraceReadDenied(selector,exact);throw new IllegalStateException("rollback partial grace reservation");
+        })).hasMessage("rollback partial grace reservation");assertThat(graceReadRows()).isEqualTo(before);assertPersistedSampleUnchanged();
+    }
+    @Test void graceDispatchAndCommittedAckNeverSupplyReadTimeWhileWriterKeepsReady2(){
+        var p=gracePrepared();var f=new GraceSdk(p);var selector=graceReadTime();var actor=managementContext("grace-incomplete-read").actor();var query=graceQueries();
+        f.afterCommit=phase->{if(phase.equals("claim")||phase.equals("ack")){
+            var before=graceReadRows();int calls=http.calls.size();assertGraceReadDenied(selector,current());
+            assertThatThrownBy(()->query.get(actor,site,current().id())).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+            assertThatThrownBy(()->query.access(actor,site,customer,current().productId())).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+            assertThat(graceReadRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);assertPersistedSampleUnchanged();
+        }};f.queue();f.advance();assertGraceQueryRead(query,actor,current(),Instant.ofEpochSecond(p.context().preparation().target()));
+    }
+    @Test void graceRealReadyInWritingTransactionAndIndependentReaderRefuseEvenAfterDeferredChecksDrain()throws Exception{
+        var p=gracePrepared();var f=new GraceSdk(p);var same=graceReadTime();var independent=graceReadTime();var exact=current();
+        var checked=new java.util.concurrent.atomic.AtomicBoolean();final List<String>[] originalAck=new List[]{null};
+        f.afterCommit=phase->{if(phase.equals("ack"))originalAck[0]=rows("stripe_billing_failed_grace_acks");};
+        f.beforeCommit=phase->{if(phase.equals("ready")){
+            assertThat(count("stripe_billing_failed_grace_ready")).isEqualTo(1);assertGraceReadDenied(same,exact);
+            jdbc.execute("set constraints failed_grace_provider_committed,failed_grace_claim_committed,failed_grace_ack_committed,failed_grace_ready_committed immediate");
+            assertGraceReadDenied(same,exact);
+            try(var workers=new BoundedWorkers()){
+                assertThat(workers.submit(()->{transaction.requiresNew(()->{assertThat(count("stripe_billing_failed_grace_ready")).isZero();assertGraceReadDenied(independent,exact);return true;});return true;}).get(5,TimeUnit.SECONDS)).isTrue();
+            }catch(Exception failure){throw new IllegalStateException("Independent uncommitted grace read failed",failure);}
+            checked.set(true);throw new IllegalStateException("rollback uncommitted READY control");
+        }};f.queue();assertThatThrownBy(f::advance).isInstanceOf(PaymentApplicationException.class);assertThat(checked).isTrue();
+        assertThat(count("stripe_billing_failed_grace_ready")).isZero();assertThat(rows("stripe_billing_failed_grace_acks")).isEqualTo(originalAck[0]);
+        assertThat(count("stripe_billing_failed_grace_cleanup")).isEqualTo(1);assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);assertGraceReadDenied(graceReadTime(),exact);
+    }
+    private Subscription graceSuppliedCopy(Subscription s,String mutation){
+        var product=mutation.equals("product")?new dev.genericpayments.platform.catalog.domain.ProductId(UUID.randomUUID()):s.productId();
+        var t=s.billingPrice();var terms=new SubscriptionPriceTerms(mutation.equals("price")?new dev.genericpayments.platform.catalog.domain.PriceId(UUID.randomUUID()):t.priceId(),t.priceKey(),t.version(),product,t.regularAmount(),t.interval(),t.trialDays(),t.trialPolicy(),t.taxMode());
+        var debt=s.debt();if(mutation.equals("debt")||mutation.equals("time"))debt=new Subscription.Debt(mutation.equals("debt")?UUID.randomUUID():debt.billingRecordId(),debt.unpaidPeriod(),mutation.equals("time")?debt.graceDeadline().plusSeconds(1):debt.graceDeadline());
+        return new Subscription(mutation.equals("id")?UUID.randomUUID():s.id(),mutation.equals("site")?new SiteId(UUID.randomUUID()):s.siteId(),mutation.equals("customer")?new CustomerId(UUID.randomUUID()):s.customerId(),product,
+            mutation.equals("account")?new PaymentAccountId(UUID.randomUUID()):s.paymentAccountId(),terms,mutation.equals("product")?terms:s.entitledPrice(),s.billingStatus(),s.providerReference(),s.currentPeriod(),s.paidThrough(),s.trial(),s.cancellation(),s.pendingChange(),debt,s.terminalReason(),mutation.equals("revision")?s.revision()+1:s.revision(),s.createdAt(),s.updatedAt(),s.lastReconciledAt());
+    }
+    @ParameterizedTest @ValueSource(strings={"id","account","site","customer","product","revision","debt","price","time"})
+    void graceReadRejectsForeignSiblingAndStaleSuppliedRecordsWithoutSeedingAnotherPositive(String mutation){
+        var p=gracePrepared();var f=new GraceSdk(p);f.queue();f.advance();assertGraceReadDenied(graceReadTime(),graceSuppliedCopy(current(),mutation));assertPersistedSampleUnchanged();
+    }
+    @ParameterizedTest @ValueSource(strings={"credentials","disabled","policy","stop","source","debt","grace","sequence","bill"})
+    void graceCommittedReadRefusesCurrentAuthorityAndDebtDriftWithoutAnyAdditionalEffect(String mutation){
+        var p=gracePrepared();var f=new GraceSdk(p);f.queue();f.advance();var before=graceReadRows();var exact=current();var selector=graceReadTime();
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            switch(mutation){
+                case "credentials"->jdbc.update("update payment_accounts set credentials_ref='negative-grace-read-drift' where id=?",billing.id().value());
+                case "disabled"->jdbc.update("update payment_accounts set account_status='DISABLED' where id=?",billing.id().value());
+                case "policy"->jdbc.update("update site_subscription_policies set enabled=false,version=version+1 where site_id=?",site.value());
+                case "stop"->{jdbc.execute("alter table stripe_billing_failed_renewal_stops disable trigger failed_stop_proof");jdbc.update("insert into stripe_billing_failed_renewal_stops(admission_id,reason,stopped_at) values(?,'AUTHORITY_DRIFT',clock_timestamp())",p.setup().admission().id());jdbc.execute("alter table stripe_billing_failed_renewal_stops enable trigger failed_stop_proof");}
+                case "source"->{jdbc.execute("alter table stripe_billing_failed_renewals disable trigger failed_renewal_immutable");jdbc.update("update stripe_billing_failed_renewals set source_sha=repeat('f',40) where id=?",p.setup().admission().id());jdbc.execute("alter table stripe_billing_failed_renewals enable trigger failed_renewal_immutable");}
+                case "debt"->jdbc.update("update subscriptions set debt_billing_record_id=null,debt_period_start=null,debt_period_end=null,grace_deadline=null where id=?",exact.id());
+                case "grace"->jdbc.update("update subscriptions set grace_deadline=grace_deadline+interval '1 second' where id=?",exact.id());
+                case "sequence"->jdbc.update("update subscriptions set observation_sequence=observation_sequence+1 where id=?",exact.id());
+                case "bill"->jdbc.update("update subscription_billing_records set version=version+1 where id=?",exact.debt().billingRecordId());
+                default->throw new AssertionError();
+            }
+            assertGraceReadDenied(selector,exact);throw new IllegalStateException("rollback grace read current drift");
+        })).hasMessage("rollback grace read current drift");assertThat(graceReadRows()).isEqualTo(before);
+        assertThat(transaction.required(()->selector.sampleForRead(exact,Instant.now())).billingAt()).isEqualTo(Instant.ofEpochSecond(p.context().preparation().target()));
+    }
+    @ParameterizedTest @ValueSource(strings={"missing-ready","missing-ack","missing-claim","claim-reader-transaction","claim-ack-transaction","claim-budget-before-ack",
+        "ack-reader-transaction","ack-reference","ack-name","ack-frozen","ack-target","ack-future",
+        "ready-reader-transaction","ready-ack-transaction","ready-reference","ready-type","ready-live","ready-name","ready-created","ready-deletes","ready-frozen","ready-status","ready-target","ready-future"})
+    void graceCommittedReadAuthenticatesOriginalReceiptClockTransactionAndChronologyWithRollbackOnlyDamage(String mutation){
+        var p=gracePrepared();var f=new GraceSdk(p);f.queue();f.advance();var exact=current();var selector=graceReadTime();var before=graceReadRows();
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            if(mutation.startsWith("missing-")){
+                damageGraceReceipt("stripe_billing_failed_grace_ready","failed_grace_ready_immutable","delete from stripe_billing_failed_grace_ready where preparation_id=?",p);
+                if(!mutation.equals("missing-ready"))damageGraceReceipt("stripe_billing_failed_grace_acks","failed_grace_ack_immutable","delete from stripe_billing_failed_grace_acks where preparation_id=?",p);
+                if(mutation.equals("missing-claim"))damageGraceReceipt("stripe_billing_failed_grace_claims","failed_grace_claim_immutable","delete from stripe_billing_failed_grace_claims where preparation_id=?",p);
+            }else{
+                var phase=mutation.split("-")[0];String table=phase.equals("claim")?"stripe_billing_failed_grace_claims":phase.equals("ack")?"stripe_billing_failed_grace_acks":"stripe_billing_failed_grace_ready";
+                if(mutation.equals("claim-budget-before-ack"))assertThat(jdbc.queryForObject("select a.observed_at>q.claimed_at+interval '1 microsecond' from stripe_billing_failed_grace_claims q join stripe_billing_failed_grace_acks a using(preparation_id) where q.preparation_id=?",Boolean.class,p.context().preparation().id())).isTrue();
+                String assignment=switch(mutation){
+                    case "claim-reader-transaction","ack-reader-transaction","ready-reader-transaction"->"recorded_transaction=pg_current_xact_id()";
+                    case "claim-ack-transaction","ready-ack-transaction"->"recorded_transaction=(select recorded_transaction from stripe_billing_failed_grace_acks where preparation_id='"+p.context().preparation().id()+"')";
+                    // Preserve claimed_at/deadline and their nondeferrable ACK FK; only the recorded 30-second invocation budget is shortened.
+                    case "claim-budget-before-ack"->"entered_at=claimed_at+interval '1 microsecond'-interval '30 seconds',deadline_at=claimed_at+interval '1 microsecond'";
+                    case "ack-reference","ready-reference"->"reference='clock_negativeForeign'";
+                    case "ack-name","ready-name"->"name='negative-clock-name'";
+                    case "ack-frozen","ready-frozen"->"frozen_time="+(p.context().preparation().target()+1);
+                    case "ack-target","ready-target"->"advancing_target="+(p.context().preparation().target()+1);
+                    case "ack-future"->"observed_at=clock_timestamp()+interval '1 hour',acknowledged_at=clock_timestamp()+interval '1 hour 1 second'";
+                    case "ready-type"->"object_type='negative_clock'";case "ready-live"->"livemode=true";
+                    case "ready-created"->"provider_created=provider_created+1";case "ready-deletes"->"provider_deletes_after=provider_deletes_after+1";
+                    case "ready-status"->"status='advancing'";case "ready-future"->"observed_at=clock_timestamp()+interval '1 hour'";
+                    default->throw new AssertionError();
+                };
+                damageGraceReceipt(table,"failed_grace_"+phase+"_immutable","update "+table+" set "+assignment+" where preparation_id=?",p);
+            }
+            assertGraceReadDenied(selector,exact);throw new IllegalStateException("rollback grace read receipt damage");
+        })).hasMessage("rollback grace read receipt damage");
+        assertThat(graceReadRows()).isEqualTo(before);assertThat(transaction.required(()->selector.sampleForRead(exact,Instant.now())).billingAt()).isEqualTo(Instant.ofEpochSecond(p.context().preparation().target()));
+    }
+    /** Negative-only corruption, exact named trigger restored before sampling, all edits rolled back. */
+    private void damageGraceReceipt(String table,String trigger,String statement,GracePrepared p){
+        jdbc.execute("alter table "+table+" disable trigger "+trigger);
+        assertThat(jdbc.update(statement,p.context().preparation().id())).isEqualTo(1);
+        jdbc.execute("alter table "+table+" enable trigger "+trigger);
+    }
     private Map<String,List<String>> graceSelectorRows(){
         var state=new TreeMap<>(selectorRows());
         state.put("stripe_billing_failed_grace_preparations",rows("stripe_billing_failed_grace_preparations"));
@@ -735,6 +907,9 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                 assertThat(holder).isNotNull();assertThat(holder.isSynchronizedWithTransaction()).isTrue();
                 try{assertThat(holder.getConnection().getAutoCommit()).isEqualTo(autoCommit);}catch(java.sql.SQLException e){throw new IllegalStateException(e);}
                 var wrong=new JdbcOwnedFailedRenewalStore(secondary,entityManagerFactory);
+                var wrongReadTime=new OwnedFailedGraceBillingTime(secondary,entityManagerFactory,
+                    new OwnedFailedRenewalBillingTime(secondary,new OwnedFirstRenewalBillingTime(secondary,new OwnedSubscriptionBillingTime(secondary))));
+                assertThatThrownBy(()->wrongReadTime.sampleForRead(current(),Instant.now())).hasMessage("OWNED_TIME_REQUIRES_CALLER_TRANSACTION");
                 for(Runnable entry:List.<Runnable>of(()->wrong.lockGraceLastSecondInTransaction(s.admission()),()->wrong.prepareGraceLastSecondInTransaction(s.admission(),f,Instant.now()),()->wrong.requireGraceLastSecondInTransaction(s.admission(),null)))
                     assertThatThrownBy(entry::run).hasMessage("Owned failed renewal requires caller DataSource transaction");
                 var graceWrong=new JdbcOwnedFailedGraceAdvanceStore(secondary,entityManagerFactory);var budget=new InvocationBudget(Clock.systemUTC(),System::nanoTime);var at=Instant.now();
