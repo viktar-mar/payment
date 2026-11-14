@@ -2,6 +2,11 @@ package dev.genericpayments.platform.provider.adapter.out.persistence;
 
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedGraceAdvance;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedGraceBoundary;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedGraceBoundary.BoundaryReady;
+import dev.genericpayments.platform.provider.application.port.out.OwnedFailedGraceBoundaryStore;
+import dev.genericpayments.platform.provider.application.service.OwnedFailedGraceBoundaryService;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedGraceBoundaryAdapter;
 import dev.genericpayments.platform.provider.application.service.OwnedFailedGraceAdvanceService;
 import dev.genericpayments.platform.provider.application.port.out.OwnedFailedGraceAdvanceStore;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedGraceAdvanceAdapter;
@@ -209,6 +214,249 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         void queue(){http.reply(clock(prepared.setup().ready().observation().frozenTime(),"ready"));http.reply(clock(prepared.context().preparation().target(),"advancing"));http.reply(clock(prepared.context().preparation().target(),"ready"));}
     }
     private List<String> graceSdkHistory(){return List.of("stripe_billing_failed_grace_claims","stripe_billing_failed_grace_acks","stripe_billing_failed_grace_ready","stripe_billing_failed_grace_cleanup").stream().map(table->table+rows(table)).toList();}
+    private final class BoundarySdk {
+        final GracePrepared prepared;final OwnedFailedGraceBoundary.Phase phase;OwnedFailedGraceBoundary.BoundaryContext context;final Clock adapterUtc;final java.util.concurrent.atomic.AtomicBoolean liveUtc;
+        InvocationBudget original;ProviderOperation originalClaim;OwnedFailedGraceBoundary.BoundaryAck returnedAck;
+        String writingPhase;java.util.function.Consumer<String> beforeCommit=phase->{},afterCommit=phase->{};
+        Throwable transactionFailure;final OwnedFailedGraceBoundaryService service;
+        BoundarySdk(GracePrepared p,OwnedFailedGraceBoundary.Phase phase){this(p,phase,Clock.systemUTC(),null);}
+        BoundarySdk(GracePrepared p,OwnedFailedGraceBoundary.Phase phase,Clock utc,java.util.concurrent.atomic.AtomicBoolean live){
+            prepared=p;this.phase=phase;adapterUtc=utc;liveUtc=live;var delegate=new JdbcOwnedFailedGraceBoundaryStore(jdbc,entityManagerFactory);
+            var store=(OwnedFailedGraceBoundaryStore)Proxy.newProxyInstance(OwnedFailedGraceBoundaryStore.class.getClassLoader(),new Class<?>[]{OwnedFailedGraceBoundaryStore.class},(proxy,method,args)->{
+                if(method.getName().equals("beforeAuthorityInTransaction")){if(original==null)original=(InvocationBudget)args[0];if(liveUtc!=null)liveUtc.set(true);}
+                Object result;try{result=method.invoke(delegate,args);}catch(InvocationTargetException failure){throw failure.getCause();}
+                switch(method.getName()){
+                    case "firstClaimInTransaction"->{context=(OwnedFailedGraceBoundary.BoundaryContext)args[0];originalClaim=(ProviderOperation)result;writingPhase="claim";}
+                    case "acknowledgeInTransaction"->{returnedAck=(OwnedFailedGraceBoundary.BoundaryAck)result;writingPhase="ack";}
+                    case "recordReadyInTransaction"->writingPhase="ready";
+                    case "uncertainInTransaction"->writingPhase="cleanup";
+                    default->{}
+                }return result;
+            });
+            var wrapped=new SubscriptionTransactionPort(){
+                public boolean active(){return transaction.active();}
+                public <T>T required(java.util.function.Supplier<T> effect){return requiresNew(effect);}
+                public <T>T requiresNew(java.util.function.Supplier<T> effect){
+                    writingPhase=null;final String[] committed={null};T result;
+                    try{result=transaction.requiresNew(()->{T value=effect.get();committed[0]=writingPhase;if(writingPhase!=null)beforeCommit.accept(writingPhase);return value;});}
+                    catch(RuntimeException|Error failure){transactionFailure=failure;throw failure;}
+                    if(committed[0]!=null)afterCommit.accept(committed[0]);return result;
+                }
+            };
+            service=new OwnedFailedGraceBoundaryService(p.failures(),store,wrapped,Clock.systemUTC());
+        }
+        BoundaryReady advance(){return new StripeBillingOwnedFailedGraceBoundaryAdapter(service,credentials,clients,adapterUtc).advance(prepared.setup().admission(),prepared.context().preparation(),phase);}
+        void queue(){long previous=prepared.context().preparation().target()+phase.number()-2;http.reply(clock(previous,"ready"));http.reply(clock(previous+1,"advancing"));http.reply(clock(previous+1,"ready"));}
+    }
+    private GracePrepared boundaryPrepared(OwnedFailedGraceBoundary.Phase phase){
+        var p=gracePrepared();var original=new GraceSdk(p);original.queue();original.advance();
+        if(phase==OwnedFailedGraceBoundary.Phase.AFTER)advanceBoundary(p,OwnedFailedGraceBoundary.Phase.AT,p.context().preparation().target());
+        return p;
+    }
+    private OwnedFailedGraceBoundaryService boundaryService(GracePrepared p){
+        return new OwnedFailedGraceBoundaryService(p.failures(),new JdbcOwnedFailedGraceBoundaryStore(jdbc,entityManagerFactory),transaction,Clock.systemUTC());
+    }
+    private BoundaryReady advanceBoundary(GracePrepared p,OwnedFailedGraceBoundary.Phase phase,long from){
+        var sdk=new BoundarySdk(p,phase);sdk.queue();
+        int calls=http.calls.size();var result=sdk.advance();
+        assertThat(result.observation().frozenTime()).isEqualTo(from+1);
+        assertThat(http.calls).hasSize(calls+3);assertThat(http.replies).isEmpty();return result;
+    }
+    @Test void boundarySdkCommitsBothExactTargetsWithIndependentProducerTransactions(){
+        var p=gracePrepared();var original=new GraceSdk(p);original.queue();original.advance();
+        var history=graceSdkHistory();var financial=financialState();var originalSub=current();
+        long from=p.context().preparation().target();
+        for(var phase:List.of(OwnedFailedGraceBoundary.Phase.AT,OwnedFailedGraceBoundary.Phase.AFTER)){
+            var before=boundaryRows();var ready=advanceBoundary(p,phase,from++);
+            var operation=ready.ack().operation().id();
+            assertThat(withoutBoundaryProduction(boundaryRows(),operation,null)).isEqualTo(before);
+            assertThat(ready.ack().phase()).isEqualTo(phase);assertThat(ready.observation().frozenTime()).isEqualTo(from);
+            Boolean independent=jdbc.queryForObject("""
+                select c.producer_xid<>a.producer_xid and c.producer_xid<>r.producer_xid and a.producer_xid<>r.producer_xid
+                from stripe_billing_failed_grace_boundary_claims c join stripe_billing_failed_grace_boundary_acks a using(operation_id)
+                join stripe_billing_failed_grace_boundary_ready r using(operation_id) where r.id=?
+                """,Boolean.class,ready.id());assertThat(Boolean.TRUE.equals(independent)).isTrue();
+            assertThat(graceSdkHistory()).isEqualTo(history);assertThat(current()).isEqualTo(originalSub);
+            assertThat(financialState()).isEqualTo(financial);assertPersistedSampleUnchanged();
+        }
+    }
+    private static final List<String> BOUNDARY_TABLES=List.of("stripe_billing_failed_grace_boundary_claims","stripe_billing_failed_grace_boundary_acks",
+        "stripe_billing_failed_grace_boundary_ready","stripe_billing_failed_grace_boundary_cleanup");
+    private Map<String,List<String>> boundaryRows(){
+        var state=new TreeMap<>(graceReadRows());for(var table:BOUNDARY_TABLES)state.put(table,rows(table));return state;
+    }
+    private Map<String,List<String>> withoutBoundaryProduction(Map<String,List<String>> rows,UUID operation,UUID stop){
+        var retained=gracePreservedRows(rows,operation,stop);
+        for(var table:BOUNDARY_TABLES)retained.put(table,withoutGraceRow(rows.get(table),"operation_id",operation));
+        return retained;
+    }
+    private boolean committedBoundary(GracePrepared p,OwnedFailedGraceBoundary.Phase phase){
+        return Boolean.TRUE.equals(jdbc.queryForObject("select owned_grace_phase_committed(?,?,clock_timestamp(),pg_current_xact_id())",
+            Boolean.class,p.context().preparation().id(),phase.number()));
+    }
+    private void insertBoundaryReservation(OwnedFailedGraceBoundary.BoundaryContext c,UUID operation,String fingerprint){
+        var account=c.original().account();
+        assertThat(jdbc.update("insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint) values(?,?,?,?,?,?,?,?)",
+            operation,account.id().value(),account.externalAccountId(),account.credentialsRef(),c.phase().kind().name(),c.original().preparation().id(),c.operationKey(),fingerprint)).isEqualTo(1);
+    }
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.EnumSource(OwnedFailedGraceBoundary.Phase.class)
+    void boundaryRawReservationNeedsExactIdentityAndAtomicClaimAndRefusesDuplicateBeforeAnySdk(OwnedFailedGraceBoundary.Phase phase){
+        var p=boundaryPrepared(phase);var b=new InvocationBudget(Clock.systemUTC(),System::nanoTime);
+        var c=boundaryService(p).inspect(p.setup().admission(),p.context().preparation(),phase,b);var before=boundaryRows();int calls=http.calls.size();
+        assertThatThrownBy(()->transaction.requiresNew(()->{insertBoundaryReservation(c,UUID.randomUUID(),"0".repeat(64));return true;}))
+            .satisfies(error->assertGraceSqlProof(error,"Invalid owned grace operation identity"));
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            insertBoundaryReservation(c,UUID.randomUUID(),c.fingerprint());
+            assertThat(committedBoundary(p,phase)).isFalse();
+            var store=new JdbcOwnedFailedGraceBoundaryStore(jdbc,entityManagerFactory);
+            assertThatThrownBy(()->store.beforeFreshEntryInTransaction(p.setup().admission(),p.context().preparation(),phase,b)).isInstanceOf(IllegalStateException.class);
+            return true;
+        })).satisfies(error->assertGraceSqlProof(error,"Missing committed original grace claim"));
+        assertThat(boundaryRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+    }
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.EnumSource(OwnedFailedGraceBoundary.Phase.class)
+    void boundaryIndependentReadyAndPriorPartialPhasesRefuseSameTransactionEvenAfterEarlyDrain(OwnedFailedGraceBoundary.Phase phase){
+        var p=boundaryPrepared(phase);var sdk=new BoundarySdk(p,phase);var before=boundaryRows();
+        var progress=new ArrayList<String>();
+        sdk.afterCommit=writing->{if(!writing.equals("claim")&&!writing.equals("ack"))return;
+            progress.add(writing);assertThat(committedBoundary(p,phase)).isFalse();
+            sdk.service.uncertain(sdk.context,sdk.originalClaim,sdk.returnedAck,new InvocationBudget(Clock.systemUTC(),System::nanoTime));
+            assertThat(count("stripe_billing_failed_grace_boundary_cleanup")).isZero();
+        };
+        sdk.beforeCommit=writing->{if(!writing.equals("ready"))return;
+            assertThat(committedBoundary(p,phase)).isFalse();
+            jdbc.execute("set constraints boundary_provider_committed,boundary_claim_committed,boundary_ack_committed,boundary_ready_committed immediate");
+            assertThat(committedBoundary(p,phase)).isFalse();progress.add("drained");
+            // Supported beforeCommit must flush, then reprove current source even after the deferred events ran.
+            graceTestAccounts.save(new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount(billing.id(),billing.key(),billing.provider(),
+                billing.mode(),billing.status(),billing.externalAccountId(),"boundary-negative-completion"));
+        };
+        sdk.queue();assertThatThrownBy(sdk::advance).isInstanceOf(PaymentApplicationException.class);
+        assertThat(progress).containsExactly("claim","ack","drained");assertGraceAdvanceSqlState(sdk.transactionFailure,"23514");
+        assertThat(operations.findById(sdk.originalClaim.id())).contains(sdk.returnedAck.operation());
+        assertThat(jdbc.queryForObject("select count(*) from stripe_billing_failed_grace_boundary_ready where operation_id=?",Long.class,sdk.originalClaim.id())).isZero();
+        assertThat(jdbc.queryForObject("select count(*) from stripe_billing_failed_grace_boundary_cleanup where operation_id=? and invocation=? and claimant=? and deadline=?",
+            Long.class,sdk.originalClaim.id(),sdk.original.invocation(),sdk.originalClaim.leaseOwner(),java.sql.Timestamp.from(sdk.originalClaim.leaseExpiresAt()))).isEqualTo(1);
+        assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);assertThat(committedBoundary(p,phase)).isFalse();
+        assertThat(withoutBoundaryProduction(boundaryRows(),sdk.originalClaim.id(),p.setup().admission().id())).isEqualTo(before);
+    }
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.EnumSource(OwnedFailedGraceBoundary.Phase.class)
+    void boundaryFreshAndSkipContendersRefuseBeforeHeldLifecycleAndCannotStopWinner(OwnedFailedGraceBoundary.Phase phase)throws Exception{
+        var p=boundaryPrepared(phase);var service=boundaryService(p);var b=new InvocationBudget(Clock.systemUTC(),System::nanoTime);
+        var c=service.inspect(p.setup().admission(),p.context().preparation(),phase,b);
+        var winner=service.claim(c,"boundary-race-owner",b);var locked=new CountDownLatch(1);var release=new CountDownLatch(1);
+        int calls=http.calls.size();var before=boundaryRows();
+        try(var workers=new BoundedWorkers()){
+            var holder=workers.submit(()->transaction.requiresNew(()->{jdbc.queryForList("select id from sites where id=? for update",site.value());locked.countDown();awaitRelease(release);return true;}));
+            try{
+                assertThat(locked.await(5,TimeUnit.SECONDS)).isTrue();
+                for(var attempt:OwnedFailedGraceBoundary.Phase.values()){
+                    assertThatThrownBy(()->service.inspect(p.setup().admission(),p.context().preparation(),attempt,new InvocationBudget(Clock.systemUTC(),System::nanoTime)))
+                        .hasMessage("OWNED_FAILED_GRACE_BOUNDARY_UNAVAILABLE");
+                    assertThatThrownBy(()->new BoundarySdk(p,attempt).advance()).isInstanceOf(PaymentApplicationException.class);
+                }
+                assertThat(holder.isDone()).isFalse();
+            }finally{release.countDown();}
+            assertThat(holder.get(5,TimeUnit.SECONDS)).isTrue();
+        }
+        assertThat(boundaryRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+        // Narrow cleanup refuses lock contention while its holder is still active; it
+        // cannot time out late and stop the lane after the holder is released.
+        var busy=new CountDownLatch(1);var unlock=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()){
+            var holder=workers.submit(()->transaction.requiresNew(()->{jdbc.queryForList("select id from stripe_billing_first_renewals where id=? for update",p.setup().upstream().id());busy.countDown();awaitRelease(unlock);return true;}));
+            try{
+                assertThat(busy.await(5,TimeUnit.SECONDS)).isTrue();
+                var refusal=workers.submit(()->{
+                    assertThatThrownBy(()->transaction.requiresNew(()->{new JdbcOwnedFailedGraceBoundaryStore(jdbc,entityManagerFactory)
+                        .uncertainInTransaction(c,winner,null,b,Instant.now());return true;})).satisfies(OwnedFailedRenewalIntegrationTest::assertGraceLockUnavailable);return true;
+                });
+                assertThat(refusal.get(4,TimeUnit.SECONDS)).isTrue();assertThat(holder.isDone()).isFalse();
+            }finally{unlock.countDown();}
+            assertThat(holder.get(5,TimeUnit.SECONDS)).isTrue();
+        }
+        assertThat(boundaryRows()).isEqualTo(before);
+        service.uncertain(c,winner,null,b);assertThat(operations.findById(winner.id()).orElseThrow().status()).isEqualTo(ProviderOperation.Status.UNKNOWN);
+        assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);
+    }
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.EnumSource(OwnedFailedGraceBoundary.Phase.class)
+    void boundaryCommittedChainRejectsRollbackOnlyClockDirectionOriginChronologyAndXidDamage(OwnedFailedGraceBoundary.Phase phase){
+        var p=boundaryPrepared(phase);var sdk=new BoundarySdk(p,phase);sdk.queue();var ready=sdk.advance();var before=boundaryRows();
+        for(var damaged:List.of("ack-clock","ready-direction","ready-chronology","ready-xid","claim-entry","origin-clock","current-alias")){
+            assertThatThrownBy(()->transaction.requiresNew(()->{
+                switch(damaged){
+                    case "origin-clock"->damageGraceReceipt("stripe_billing_failed_grace_ready","failed_grace_ready_immutable",
+                        "update stripe_billing_failed_grace_ready set name='negative-origin-clock' where preparation_id=?",p);
+                    case "current-alias"->assertThat(jdbc.update("update payment_accounts set credentials_ref='negative-boundary-alias' where id=?",billing.id().value())).isEqualTo(1);
+                    default->{
+                        String type=damaged.split("-")[0];String table="stripe_billing_failed_grace_boundary_"+(type.equals("ready")?"ready":type+"s");
+                        String value=switch(damaged){
+                            case "ack-clock"->"reference='clock_foreignNegative'";
+                            case "ready-direction"->"frozen_time=frozen_time-1";
+                            case "ready-chronology"->"observed_at=clock_timestamp()+interval '1 hour'";
+                            case "ready-xid"->"producer_xid=pg_current_xact_id()";
+                            case "claim-entry"->"entered_at=(select observed_at-interval '1 microsecond' from owned_grace_boundary_edge(?,?)),"
+                                +"deadline_at=(select observed_at-interval '1 microsecond'+interval '30 seconds' from owned_grace_boundary_edge(?,?))";
+                            default->throw new AssertionError();
+                        };
+                        jdbc.execute("alter table "+table+" disable trigger boundary_"+type+"_immutable");
+                        Object[] args=type.equals("claim")?new Object[]{p.context().preparation().id(),phase.number(),p.context().preparation().id(),phase.number(),sdk.originalClaim.id()}:new Object[]{sdk.originalClaim.id()};
+                        assertThat(jdbc.update("update "+table+" set "+value+" where operation_id=?",args)).isEqualTo(1);
+                        jdbc.execute("alter table "+table+" enable trigger boundary_"+type+"_immutable");
+                    }
+                }
+                assertThat(committedBoundary(p,phase)).as(damaged).isFalse();throw new IllegalStateException("rollback boundary damage");
+            })).hasMessage("rollback boundary damage");
+        }
+        for(String field:phase==OwnedFailedGraceBoundary.Phase.AT?List.of("original_grace_ready_id"):List.of("original_grace_ready_id","predecessor_ready_id")){
+            assertThatThrownBy(()->transaction.requiresNew(()->{
+                jdbc.execute("alter table stripe_billing_failed_grace_boundary_claims disable trigger boundary_claim_immutable");
+                jdbc.update("update stripe_billing_failed_grace_boundary_claims set "+field+"=? where operation_id=?",UUID.randomUUID(),sdk.originalClaim.id());return true;
+            })).satisfies(error->assertGraceAdvanceSqlState(error,"23503"));
+        }
+        // A wrong-preparation READY with this admission still closes the other phase's absence arm.
+        if(phase==OwnedFailedGraceBoundary.Phase.AT){
+            assertThatThrownBy(()->transaction.requiresNew(()->{
+                // Only the READY immutability and its two child-side UPDATE FK checks
+                // are suspended in this rollback-only damage control.
+                var triggers=jdbc.queryForList("""
+                    select quote_ident(t.tgname) from pg_trigger t join pg_constraint c on c.oid=t.tgconstraint
+                    where t.tgrelid='stripe_billing_failed_grace_boundary_ready'::regclass
+                    and c.conrelid=t.tgrelid and c.contype='f' and t.tgfoid='"RI_FKey_check_upd"'::regproc order by t.tgname
+                    """,String.class);
+                assertThat(triggers).hasSize(2);
+                jdbc.execute("alter table stripe_billing_failed_grace_boundary_ready disable trigger boundary_ready_immutable");
+                triggers.forEach(t->jdbc.execute("alter table stripe_billing_failed_grace_boundary_ready disable trigger "+t));
+                assertThat(jdbc.update("update stripe_billing_failed_grace_boundary_ready set phase=3,preparation_id=? where id=?",UUID.randomUUID(),ready.id())).isEqualTo(1);
+                triggers.forEach(t->jdbc.execute("alter table stripe_billing_failed_grace_boundary_ready enable trigger "+t));
+                jdbc.execute("alter table stripe_billing_failed_grace_boundary_ready enable trigger boundary_ready_immutable");
+                Boolean seen=jdbc.queryForObject("select owned_grace_boundary_present(?,3)",Boolean.class,p.context().preparation().id());
+                assertThat(seen).isTrue();assertThat(committedBoundary(p,OwnedFailedGraceBoundary.Phase.AFTER)).isFalse();
+                throw new IllegalStateException("rollback foreign preparation");
+            })).hasMessage("rollback foreign preparation");
+        }
+        assertThat(boundaryRows()).isEqualTo(before);assertThat(committedBoundary(p,phase)).isTrue();
+        // A delayed failed return cannot let even the exact original owner stop a committed READY.
+        sdk.service.uncertain(sdk.context,sdk.originalClaim,ready.ack(),sdk.original);
+        assertThat(boundaryRows()).isEqualTo(before);
+    }
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.EnumSource(OwnedFailedGraceBoundary.Phase.class)
+    void boundaryOriginalCleanupAfterExpiryAndCredentialDriftPreservesExactlyCommittedAck(OwnedFailedGraceBoundary.Phase phase){
+        var p=boundaryPrepared(phase);var expired=new java.util.concurrent.atomic.AtomicBoolean();
+        var clock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId zone){return this;}
+            public Instant instant(){return expired.get()?Instant.now().plusSeconds(90):Instant.now();}};
+        var sdk=new BoundarySdk(p,phase,clock,null);var before=boundaryRows();sdk.queue();
+        sdk.afterCommit=writing->{if(writing.equals("ack")){
+            assertThat(jdbc.update("update payment_accounts set credentials_ref='changed-after-boundary-ack' where id=?",billing.id().value())).isEqualTo(1);
+            expired.set(true);throw new IllegalStateException("ambiguous after independent ACK commit");
+        }};
+        try{assertThatThrownBy(sdk::advance).isInstanceOf(PaymentApplicationException.class);
+            assertThat(expired.get()).isTrue();assertThat(operations.findById(sdk.originalClaim.id())).contains(sdk.returnedAck.operation());
+            assertThat(jdbc.queryForObject("select count(*) from stripe_billing_failed_grace_boundary_cleanup u join stripe_billing_failed_renewal_stops s on s.admission_id=? and s.stopped_at=u.stopped_at where u.operation_id=? and u.phase=? and u.invocation=? and s.reason='UNCERTAIN'",Long.class,
+                p.setup().admission().id(),sdk.originalClaim.id(),phase.number(),sdk.original.invocation())).isEqualTo(1);
+        }finally{jdbc.update("update payment_accounts set credentials_ref=? where id=?",billing.credentialsRef(),billing.id().value());}
+        assertThat(withoutBoundaryProduction(boundaryRows(),sdk.originalClaim.id(),p.setup().admission().id())).isEqualTo(before);
+    }
     /** Exact-query composition deliberately uses the new selector and actual injected ports. */
     private OwnedFailedGraceBillingTime graceReadTime(){return new OwnedFailedGraceBillingTime(jdbc,entityManagerFactory,time.persisted);}
     private dev.genericpayments.platform.subscriptions.application.service.SubscriptionQueryService graceQueries(){
@@ -941,6 +1189,14 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                 var graceWrong=new JdbcOwnedFailedGraceAdvanceStore(secondary,entityManagerFactory);var budget=new InvocationBudget(Clock.systemUTC(),System::nanoTime);var at=Instant.now();
                 for(Runnable entry:List.<Runnable>of(()->graceWrong.beforeAuthorityInTransaction(budget),()->graceWrong.beforeFreshEntryInTransaction(s.admission(),null,budget),()->graceWrong.firstClaimInTransaction(null,"foreign-pool",at,budget),()->graceWrong.requireClaimInTransaction(null,null,at,budget),()->graceWrong.acknowledgeInTransaction(null,null,null,at,at,budget),()->graceWrong.requireAcknowledgedInTransaction(null,null,at,budget),()->graceWrong.recordReadyInTransaction(null,null,null,at,at,budget),()->graceWrong.uncertainInTransaction(null,null,null,budget,at)))
                     assertThatThrownBy(entry::run).isInstanceOf(IllegalStateException.class);
+                var boundaryWrong=new JdbcOwnedFailedGraceBoundaryStore(secondary,entityManagerFactory);
+                for(Runnable entry:List.<Runnable>of(()->boundaryWrong.beforeAuthorityInTransaction(budget),
+                    ()->boundaryWrong.beforeFreshEntryInTransaction(s.admission(),null,OwnedFailedGraceBoundary.Phase.AT,budget),
+                    ()->boundaryWrong.requirePredecessorInTransaction(null,OwnedFailedGraceBoundary.Phase.AFTER,budget),
+                    ()->boundaryWrong.firstClaimInTransaction(null,"foreign-pool",at,budget),()->boundaryWrong.requireClaimInTransaction(null,null,at,budget),
+                    ()->boundaryWrong.acknowledgeInTransaction(null,null,null,at,at,budget),()->boundaryWrong.requireAcknowledgedInTransaction(null,null,at,budget),
+                    ()->boundaryWrong.recordReadyInTransaction(null,null,null,at,at,budget),()->boundaryWrong.uncertainInTransaction(null,null,null,budget,at)))
+                    assertThatThrownBy(entry::run).hasMessage("Owned grace boundary requires caller DataSource transaction");
                 assertThat(proofQueries).hasValue(0);
                 // A separate physical connection can lock canonical rows immediately: refusal held none.
                 try(var probe=originalPool.getConnection()) {

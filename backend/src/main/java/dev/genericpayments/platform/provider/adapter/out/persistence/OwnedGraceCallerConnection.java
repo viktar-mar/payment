@@ -52,6 +52,13 @@ final class OwnedGraceCallerConnection {
             return manager;
         }catch(RuntimeException failure){throw new IllegalStateException(message);}
     }
+    EntityManager requireReadCommitted(){
+        var current=requireSame();
+        try{
+            if(physical.getTransactionIsolation()!=Connection.TRANSACTION_READ_COMMITTED)throw new IllegalStateException(message);
+        }catch(java.sql.SQLException failure){throw new IllegalStateException(message);}
+        return current;
+    }
     private static void verifyPhysical(EntityManager manager,Connection physical,String message){
         try{
             if(physical.getAutoCommit()||!Boolean.TRUE.equals(manager.unwrap(Session.class).doReturningWork(
