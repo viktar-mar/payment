@@ -345,6 +345,93 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         })).hasMessage("rollback AT id collision");
         assertThat(boundaryRows()).isEqualTo(before);
     }
+    private UUID foreignBoundaryAccount(){
+        var foreign=UUID.randomUUID();
+        assertThat(jdbc.update("""
+            insert into payment_accounts(id,account_key,provider,account_mode,account_status,external_account_id,credentials_ref,created_at)
+            values(?,'foreign-boundary-key-account','STRIPE','SANDBOX','ACTIVE','acct_foreignKey','foreign-boundary-key',clock_timestamp())
+            """,foreign)).isEqualTo(1);
+        return foreign;
+    }
+    private void insertOrdinaryBoundaryKey(UUID foreign,UUID admission,OwnedFailedGraceBoundary.Phase keyPhase){
+        assertThat(jdbc.update("""
+            insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint)
+            values(?,?,'acct_foreignKey','foreign-boundary-key','PRODUCT_CREATE',?,?,?)
+            """,UUID.randomUUID(),foreign,UUID.randomUUID(),keyPhase.operationKey(admission),"0".repeat(64))).isEqualTo(1);
+    }
+    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({
+        "AT,AT,claim","AT,AFTER,claim","AFTER,AFTER,claim","AT,AT,ack","AT,AFTER,ack","AFTER,AFTER,ack"})
+    void committedForeignPhaseKeyStopsTheOwnerBeforeItsNextClockCall(
+            OwnedFailedGraceBoundary.Phase phase,OwnedFailedGraceBoundary.Phase keyPhase,String atStage){
+        var p=boundaryPrepared(phase);var sdk=new BoundarySdk(p,phase);var foreign=foreignBoundaryAccount();
+        var admission=p.setup().admission().id();var preserved=new TreeMap<String,List<String>>();
+        var ackRows=new ArrayList<String>();var calls=http.calls.size();
+        sdk.afterCommit=writing->{
+            if(!writing.equals(atStage))return;
+            var operation=sdk.originalClaim.id();
+            transaction.requiresNew(()->{insertOrdinaryBoundaryKey(foreign,admission,keyPhase);return true;});
+            var before=boundaryRows();preserved.putAll(withoutBoundaryProduction(before,operation,admission));
+            ackRows.addAll(before.get("stripe_billing_failed_grace_boundary_acks"));
+            // A new invocation presenting the real owner's claim cannot consume it after the conflict.
+            sdk.service.uncertain(sdk.context,sdk.originalClaim,null,new InvocationBudget(Clock.systemUTC(),System::nanoTime));
+            assertThat(boundaryRows()).isEqualTo(before);
+            if(writing.equals("claim")){
+                assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update("""
+                    update provider_operations set status='ACKNOWLEDGED',provider_reference=?,lease_owner=null,lease_expires_at=null,version=2
+                    where id=?
+                    """,sdk.context.predecessor().observation().reference(),operation)))
+                    .satisfies(error->assertGraceSqlProof(error,"Invalid owned grace acknowledgment"));
+            }else{
+                assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update("""
+                    insert into stripe_billing_failed_grace_boundary_ready(id,preparation_id,phase,admission_id,operation_id,invocation,
+                    reference,object_type,livemode,name,frozen_time,status,provider_created,provider_deletes_after,advancing_target,observed_at)
+                    select ?,a.preparation_id,a.phase,?,a.operation_id,a.invocation,a.reference,a.object_type,a.livemode,a.name,?,'ready',
+                    a.provider_created,a.provider_deletes_after,null,clock_timestamp() from stripe_billing_failed_grace_boundary_acks a where a.operation_id=?
+                    """,UUID.randomUUID(),admission,sdk.context.target(),operation)))
+                    .satisfies(error->assertGraceSqlProof(error,"Invalid independent owned grace READY"));
+            }
+        };
+        sdk.queue();assertThatThrownBy(sdk::advance).isInstanceOf(PaymentApplicationException.class);
+        assertThat(preserved).isNotEmpty();
+        var expectedCalls=atStage.equals("claim")?List.<String>of():List.of("GET","POST");
+        assertThat(http.calls.subList(calls,http.calls.size()).stream().map(request->request.method().name()).toList()).isEqualTo(expectedCalls);
+        var operation=sdk.originalClaim.id();
+        assertThat(rows("stripe_billing_failed_grace_boundary_acks")).isEqualTo(ackRows);
+        if(atStage.equals("ack"))assertThat(operations.findById(operation)).contains(sdk.returnedAck.operation());
+        else assertThat(operations.findById(operation).orElseThrow().status()).isEqualTo(ProviderOperation.Status.UNKNOWN);
+        assertThat(jdbc.queryForObject("select count(*) from stripe_billing_failed_grace_boundary_ready where operation_id=?",Long.class,operation)).isZero();
+        assertThat(jdbc.queryForObject("""
+            select count(*) from stripe_billing_failed_grace_boundary_cleanup u join stripe_billing_failed_renewal_stops s
+            on s.admission_id=? and s.stopped_at=u.stopped_at and s.reason='UNCERTAIN'
+            where u.operation_id=? and u.phase=? and u.invocation=? and u.claimant=? and u.deadline=?
+            """,Long.class,admission,operation,phase.number(),sdk.original.invocation(),sdk.originalClaim.leaseOwner(),
+            java.sql.Timestamp.from(sdk.originalClaim.leaseExpiresAt()))).isEqualTo(1);
+        assertThat(withoutBoundaryProduction(boundaryRows(),operation,admission)).isEqualTo(preserved);
+    }
+    @ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void phaseConflictAfterReadyInsertionIsRejectedAtDeferredOrPostFlushProof(boolean drainEarly){
+        var phase=OwnedFailedGraceBoundary.Phase.AT;var p=boundaryPrepared(phase);var sdk=new BoundarySdk(p,phase);
+        var foreign=foreignBoundaryAccount();var admission=p.setup().admission().id();var before=boundaryRows();
+        var checkpoints=new ArrayList<String>();int calls=http.calls.size();
+        sdk.beforeCommit=writing->{
+            if(!writing.equals("ready"))return;
+            String drain="set constraints boundary_provider_committed,boundary_claim_committed,boundary_ack_committed,boundary_ready_committed immediate";
+            if(drainEarly)jdbc.execute(drain);
+            insertOrdinaryBoundaryKey(foreign,admission,OwnedFailedGraceBoundary.Phase.AFTER);
+            checkpoints.add("conflict");
+            if(!drainEarly)jdbc.execute(drain);
+            checkpoints.add("postflush");
+        };
+        sdk.queue();assertThatThrownBy(sdk::advance).isInstanceOf(PaymentApplicationException.class);
+        assertGraceSqlProof(sdk.transactionFailure,"Owned grace positive authority changed before commit");
+        assertThat(checkpoints).isEqualTo(drainEarly?List.of("conflict","postflush"):List.of("conflict"));
+        var operation=sdk.originalClaim.id();
+        assertThat(http.calls).hasSize(calls+3);assertThat(operations.findById(operation)).contains(sdk.returnedAck.operation());
+        assertThat(jdbc.queryForObject("select count(*) from stripe_billing_failed_grace_boundary_ready where operation_id=?",Long.class,operation)).isZero();
+        assertThat(jdbc.queryForObject("select count(*) from stripe_billing_failed_grace_boundary_cleanup where operation_id=? and invocation=?",Long.class,operation,sdk.original.invocation())).isEqualTo(1);
+        assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);
+        assertThat(withoutBoundaryProduction(boundaryRows(),operation,admission)).isEqualTo(before);
+    }
     private void insertBoundaryReservation(OwnedFailedGraceBoundary.BoundaryContext c,UUID operation,String fingerprint){
         var account=c.original().account();
         assertThat(jdbc.update("insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint) values(?,?,?,?,?,?,?,?)",
@@ -706,11 +793,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(transaction.required(()->selector.sampleForRead(exact,Instant.now())).billingAt()).isEqualTo(originalTime);
         for(var kind:List.of(phase.kind().name(),"PRODUCT_CREATE")){
             assertThatThrownBy(()->transaction.requiresNew(()->{
-                var foreign=UUID.randomUUID();var resource=UUID.randomUUID();
-                assertThat(jdbc.update("""
-                    insert into payment_accounts(id,account_key,provider,account_mode,account_status,external_account_id,credentials_ref,created_at)
-                    values(?,'foreign-boundary-key-account','STRIPE','SANDBOX','ACTIVE','acct_foreignKey','foreign-boundary-key',clock_timestamp())
-                    """,foreign)).isEqualTo(1);
+                var foreign=foreignBoundaryAccount();var resource=UUID.randomUUID();
                 // The phase INSERT proof ordinarily rejects the foreign phase operation.
                 // Its suspension and this deliberately wrong RESERVED row roll back together.
                 if(kind.equals(phase.kind().name()))jdbc.execute("alter table provider_operations disable trigger aaaa_owned_grace_boundary_operation");

@@ -202,6 +202,14 @@ create function owned_grace_boundary_ack_shape(q stripe_billing_failed_grace_bou
   and ($1).producer_xid<>($2).producer_xid and ($2).observed_at>=($1).claimed_at
   and ($2).acknowledged_at>=($2).observed_at and ($2).acknowledged_at<= $4 and ($2).acknowledged_at<least(($1).deadline,($1).deadline_at))
 $$;
+-- A typed resource or a canonical admission key independently locates a possible operation.
+-- The account and kind of a key match are deliberately unrestricted.
+create function owned_grace_boundary_operations(p uuid,h integer) returns table(id uuid) language sql stable as $$
+ select o.id from provider_operations o
+ where (o.resource_id=$1 and o.kind=case $2 when 2 then 'OWNED_GRACE_AT_CLOCK_ADVANCE' when 3 then 'OWNED_GRACE_AFTER_CLOCK_ADVANCE' end)
+ or o.operation_key=(select 'billing-failed-grace-boundary-v1:'||p.admission_id::text||case $2 when 2 then ':at' when 3 then ':after' end
+  from stripe_billing_failed_grace_preparations p where p.id=$1)
+$$;
 create function owned_grace_boundary_receipt(p uuid,h integer,utc timestamptz,reader xid8) returns boolean language sql stable set join_collapse_limit=1 as $$
  select exists(select 1 from stripe_billing_failed_grace_boundary_claims q
  join stripe_billing_failed_grace_preparations p on p.id=q.preparation_id and p.admission_id=q.admission_id
@@ -214,8 +222,7 @@ create function owned_grace_boundary_receipt(p uuid,h integer,utc timestamptz,re
  where q.preparation_id=$1 and q.phase=$2 and owned_grace_boundary_owns($1,$2,o)
  and ($2<>2 or r.id<>q.original_grace_ready_id)
  -- Keep conflicting siblings discovered by resource, admission, operation or invocation.
- and not exists(select 1 from provider_operations other where other.id<>o.id
-  and ((other.kind=e.kind and other.resource_id=$1) or other.operation_key=e.operation_key))
+ and not exists(select 1 from owned_grace_boundary_operations($1,$2) other where other.id<>o.id)
  and not exists(select 1 from stripe_billing_failed_grace_boundary_claims x
   where x.phase=$2 and (x.preparation_id=$1 or x.admission_id=q.admission_id) and x.operation_id<>o.id)
  and not exists(select 1 from stripe_billing_failed_grace_boundary_ready x
@@ -256,9 +263,7 @@ create function owned_grace_predecessor_committed(p uuid,h integer,utc timestamp
 $$;
 create function owned_grace_boundary_present(p uuid,h integer) returns boolean language sql stable as $$
  with root as materialized(select admission_id from stripe_billing_failed_grace_preparations where id=$1),
- ops as materialized(select id from provider_operations
-  where (resource_id=$1 and kind=case $2 when 2 then 'OWNED_GRACE_AT_CLOCK_ADVANCE' else 'OWNED_GRACE_AFTER_CLOCK_ADVANCE' end)
-   or operation_key=(select 'billing-failed-grace-boundary-v1:'||admission_id::text||case $2 when 2 then ':at' when 3 then ':after' end from root)),
+ ops as materialized(select id from owned_grace_boundary_operations($1,$2)),
  claims as materialized(select operation_id,invocation from stripe_billing_failed_grace_boundary_claims
    where (phase=$2 and (preparation_id=$1 or admission_id=(select admission_id from root))) or operation_id in(select id from ops))
  select exists(select 1 from ops) or exists(select 1 from claims)
@@ -268,6 +273,12 @@ create function owned_grace_boundary_present(p uuid,h integer) returns boolean l
    or operation_id in(select id from ops union all select operation_id from claims) or invocation in(select invocation from claims))
  or exists(select 1 from stripe_billing_failed_grace_boundary_cleanup where (preparation_id=$1 and phase=$2)
    or operation_id in(select id from ops union all select operation_id from claims) or invocation in(select invocation from claims))
+$$;
+-- Only AT production requires AFTER to be absent. A historical AT receipt remains
+-- independently provable as ancestry of a legitimate AFTER claim or receipt.
+create function owned_grace_boundary_writer_exclusive(p uuid,h integer,selected uuid) returns boolean language sql stable as $$
+ select not exists(select 1 from owned_grace_boundary_operations($1,$2) other where other.id is distinct from $3)
+ and ($2<>2 or not owned_grace_boundary_present($1,3))
 $$;
 create function owned_grace_boundary_fresh(p uuid,h integer) returns boolean language plpgsql volatile as $$
 begin
@@ -295,6 +306,7 @@ begin
  select * into step from provider_operations where id=new.operation_id for update nowait;db_at:=clock_timestamp();
  select * into edge from owned_grace_boundary_edge(new.preparation_id,new.phase);
  if not found or new.producer_xid<>pg_current_xact_id() or not owned_grace_boundary_owns(new.preparation_id,new.phase,step)
+  or not owned_grace_boundary_writer_exclusive(new.preparation_id,new.phase,step.id)
   or not owned_grace_predecessor_committed(new.preparation_id,new.phase,db_at,pg_current_xact_id())
   or not exists(select 1 from provider_operations where id=step.id and xmin=pg_current_xact_id()::xid)
   or new.admission_id is distinct from admission or new.original_grace_ready_id is distinct from edge.original_id
@@ -330,7 +342,8 @@ begin
   perform owned_failed_grace_limits(30000,false);
   if not owned_grace_boundary_fresh(p.id,h) then raise exception 'Owned grace firstclaim already consumed' using errcode='23514';end if;
   perform lock_owned_grace_boundary(p.id,h,false);
-  if not owned_grace_predecessor_committed(p.id,h,clock_timestamp(),pg_current_xact_id()) or new.status<>'RESERVED' or new.version<>0
+  if not owned_grace_boundary_writer_exclusive(p.id,h,null)
+   or not owned_grace_predecessor_committed(p.id,h,clock_timestamp(),pg_current_xact_id()) or new.status<>'RESERVED' or new.version<>0
    or num_nonnulls(new.provider_reference,new.first_dispatched_at,new.retry_before,new.lease_owner,new.lease_expires_at,new.safe_error_code)<>0
    or new.recovery_attempts<>0 or new.manual_review_required or new.next_attempt_at<>transaction_timestamp()
   then raise exception 'Invalid pristine owned grace reservation' using errcode='23514';end if;return new;
@@ -345,6 +358,7 @@ begin
  if not owned_grace_boundary_claim_shape(q,old) then raise exception 'Boundary claim lost original identity' using errcode='23514';end if;
  if old.status='RESERVED' and old.version=0 and new.status='DISPATCHING' and new.version=1 then
   if q.producer_xid<>pg_current_xact_id() or not owned_grace_predecessor_committed(p.id,h,clock_timestamp(),pg_current_xact_id())
+   or not owned_grace_boundary_writer_exclusive(p.id,h,old.id)
    or row(new.first_dispatched_at,new.lease_owner,new.lease_expires_at) is distinct from row(q.claimed_at,q.claimant,q.deadline)
    or new.retry_before<>q.claimed_at+interval '23 hours' or new.provider_reference is not null or db_at>=q.deadline_at or db_at>=q.deadline
   then raise exception 'Invalid original owned grace dispatch' using errcode='23514';end if;
@@ -356,7 +370,8 @@ begin
   then raise exception 'Independently committed original grace claim required' using errcode='23514';end if;
   if new.status='ACKNOWLEDGED' then
    select r.reference into expected_clock from stripe_billing_first_renewal_ready r where r.id=p.predecessor_ready;
-   if not owned_grace_predecessor_committed(p.id,h,clock_timestamp(),pg_current_xact_id()) or db_at>=q.deadline_at or db_at>=q.deadline or new.provider_reference is distinct from expected_clock
+   if not owned_grace_boundary_writer_exclusive(p.id,h,old.id)
+    or not owned_grace_predecessor_committed(p.id,h,clock_timestamp(),pg_current_xact_id()) or db_at>=q.deadline_at or db_at>=q.deadline or new.provider_reference is distinct from expected_clock
    then raise exception 'Invalid owned grace acknowledgment' using errcode='23514';end if;
   elsif new.provider_reference is not null or exists(select 1 from stripe_billing_failed_grace_boundary_ready where preparation_id=p.id and phase=h) then
    raise exception 'Invalid owned grace uncertainty' using errcode='23514';end if;
@@ -377,6 +392,7 @@ begin
  select * into original from owned_grace_boundary_edge(p.id,new.phase);db_at:=clock_timestamp();
  if new.producer_xid<>pg_current_xact_id() or q.producer_xid=pg_current_xact_id()
   or not owned_grace_boundary_ack_shape(q,new,step,db_at) or not owned_grace_predecessor_committed(p.id,new.phase,clock_timestamp(),pg_current_xact_id())
+  or not owned_grace_boundary_writer_exclusive(p.id,new.phase,step.id)
   or row(new.preparation_id,new.operation_id,new.invocation,new.claimant,new.deadline) is distinct from row(q.preparation_id,q.operation_id,q.invocation,q.claimant,q.deadline)
   or step.status<>'ACKNOWLEDGED' or step.version<>2 or step.provider_reference is distinct from new.reference
   or new.observed_at<q.claimed_at or new.acknowledged_at>db_at or new.acknowledged_at>=q.deadline_at or new.acknowledged_at>=q.deadline
@@ -402,6 +418,7 @@ begin
  select * into step from provider_operations where id=new.operation_id for update nowait;db_at:=clock_timestamp();
  if new.producer_xid<>pg_current_xact_id() or ack.preparation_id is null or ack.producer_xid=pg_current_xact_id() or q.producer_xid=pg_current_xact_id()
   or not owned_grace_boundary_ack_shape(q,ack,step,db_at) or not owned_grace_predecessor_committed(p.id,new.phase,clock_timestamp(),pg_current_xact_id())
+  or not owned_grace_boundary_writer_exclusive(p.id,new.phase,step.id)
   or row(new.preparation_id,new.operation_id,new.invocation) is distinct from row(ack.preparation_id,ack.operation_id,ack.invocation)
   or new.admission_id<>p.admission_id or (new.phase=2 and new.id=q.original_grace_ready_id)
   or step.status<>'ACKNOWLEDGED' or step.version<>2 or step.provider_reference is distinct from new.reference
@@ -483,7 +500,8 @@ create function require_owned_boundary_positive(q stripe_billing_failed_grace_bo
  returns void language plpgsql volatile as $$
 declare db_at timestamptz;
 begin
- if not owned_grace_predecessor_committed(q.preparation_id,q.phase,clock_timestamp(),pg_current_xact_id()) then
+ if not owned_grace_boundary_writer_exclusive(q.preparation_id,q.phase,q.operation_id)
+  or not owned_grace_predecessor_committed(q.preparation_id,q.phase,clock_timestamp(),pg_current_xact_id()) then
   raise exception 'Owned grace positive authority changed before commit' using errcode='23514';end if;
  db_at:=clock_timestamp();
  if db_at>=q.deadline_at or db_at>=q.deadline then

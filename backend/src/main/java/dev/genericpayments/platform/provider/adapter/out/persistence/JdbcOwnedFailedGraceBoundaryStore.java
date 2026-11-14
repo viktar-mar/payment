@@ -198,30 +198,42 @@ public final class JdbcOwnedFailedGraceBoundaryStore implements OwnedFailedGrace
         var p=original.preparation();immutablePreparation(original.admission(),p);
         if(!failures.failureRow(original.admission().id()).equals(original.failure()))throw denied();
         jdbc.queryForList("select lock_owned_grace_boundary(?,?,false)",p.id(),phase.number());
-        var context=committedEdge(original,phase);
+        var context=committedEdge(original,phase,b);
         require(Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from payment_accounts where id=? and account_key=?)",
             Boolean.class,original.account().id().value(),original.account().key())));
         require(!micro(b.enteredAt()).isBefore(context.predecessor().observedAt()));b.remainingNanos(null);return context;
     }
     /** Nonlocking snapshot description. It confers no permission to mutate without the locked recheck. */
-    BoundaryContext committedEdge(PreparationContext original,Phase phase){
-        caller();return edge(original,phase,true);
+    BoundaryContext committedEdge(PreparationContext original,Phase phase,InvocationBudget b){
+        caller();return edge(original,phase,Objects.requireNonNull(b).invocation());
     }
-    private BoundaryContext edge(PreparationContext original,Phase phase,boolean positive){
+    private BoundaryContext edge(PreparationContext original,Phase phase,UUID invocation){
+        // Fresh callers have no claim to exclude. During a continuation, derive the one
+        // permitted operation from the exact invocation and persisted claim. A null invocation
+        // requests only the immutable edge description for cleanup.
         var rows=jdbc.query("""
-            select e.* from owned_grace_boundary_edge(?,?) e where not ? or
-              owned_grace_predecessor_committed(?,?,clock_timestamp(),pg_current_xact_id())
-            """,(r,n)->new BoundaryContext(original,phase,r.getObject("original_id",UUID.class),
-                new ReadyOrigin(r.getObject("previous_id",UUID.class),r.getObject("operation_id",UUID.class),r.getObject("invocation",UUID.class),
-                    r.getString("operation_fingerprint"),new TestClockReady(r.getString("reference"),r.getString("object_type"),r.getBoolean("livemode"),
-                    r.getString("name"),r.getLong("frozen_time"),r.getString("status"),r.getLong("provider_created"),r.getLong("provider_deletes_after"),
-                    r.getObject("advancing_target",Long.class)),instant(r,"observed_at")),r.getLong("target"),r.getString("operation_key"),r.getString("fingerprint")),
-                original.preparation().id(),phase.number(),positive,original.preparation().id(),phase.number());
+            select e.*, case when i.invocation is null then true else
+              owned_grace_boundary_writer_exclusive(i.preparation,i.phase,(
+                select q.operation_id from stripe_billing_failed_grace_boundary_claims q
+                join provider_operations o on o.id=q.operation_id
+                where q.preparation_id=i.preparation and q.phase=i.phase and q.invocation=i.invocation
+                  and owned_grace_boundary_claim_shape(q,o))) end as phase_exclusive
+            from (values(cast(? as uuid),cast(? as integer),cast(? as uuid))) i(preparation,phase,invocation)
+            cross join lateral owned_grace_boundary_edge(i.preparation,i.phase) e
+            where i.invocation is null or owned_grace_predecessor_committed(i.preparation,i.phase,clock_timestamp(),pg_current_xact_id())
+            """,(r,n)->{
+                require(r.getBoolean("phase_exclusive"));
+                return new BoundaryContext(original,phase,r.getObject("original_id",UUID.class),
+                    new ReadyOrigin(r.getObject("previous_id",UUID.class),r.getObject("operation_id",UUID.class),r.getObject("invocation",UUID.class),
+                        r.getString("operation_fingerprint"),new TestClockReady(r.getString("reference"),r.getString("object_type"),r.getBoolean("livemode"),
+                        r.getString("name"),r.getLong("frozen_time"),r.getString("status"),r.getLong("provider_created"),r.getLong("provider_deletes_after"),
+                        r.getObject("advancing_target",Long.class)),instant(r,"observed_at")),r.getLong("target"),r.getString("operation_key"),r.getString("fingerprint"));
+            },original.preparation().id(),phase.number(),invocation);
         if(rows.size()!=1)throw denied();return rows.getFirst();
     }
     private void immutable(BoundaryContext c){
         immutablePreparation(c.original().admission(),c.original().preparation());
-        if(!c.equals(edge(c.original(),c.phase(),false))||!failures.failureRow(c.original().admission().id()).equals(c.original().failure()))throw denied();
+        if(!c.equals(edge(c.original(),c.phase(),null))||!failures.failureRow(c.original().admission().id()).equals(c.original().failure()))throw denied();
     }
     private void immutablePreparation(Admission a,GraceLastSecondPreparation preparation){
         JdbcOwnedFirstRenewalStore.requireStoredFailedIdentity(jdbc,a.firstRenewalAdmission(),a.ready(),a.boundary());
@@ -236,7 +248,8 @@ public final class JdbcOwnedFailedGraceBoundaryStore implements OwnedFailedGrace
         return Boolean.TRUE.equals(jdbc.queryForObject("""
             select exists(select 1 from stripe_billing_failed_grace_boundary_claims q join provider_operations o on o.id=q.operation_id where owned_grace_boundary_claim_shape(q,o) and q.phase=? and q.preparation_id=? and q.operation_id=? and q.invocation=?
              and q.entered_at=? and q.deadline_at=? and q.claimed_at=? and q.producer_xid<>pg_current_xact_id()
-             and (?=false or (clock_timestamp()<q.deadline_at and clock_timestamp()<q.deadline)))
+             and case when ? then clock_timestamp()<q.deadline_at and clock_timestamp()<q.deadline
+               and owned_grace_boundary_writer_exclusive(q.preparation_id,q.phase,q.operation_id) else true end)
             """,Boolean.class,c.phase().number(),c.original().preparation().id(),o.id(),b.invocation(),stamp(b.enteredAt()),stamp(b.deadlineAt()),stamp(o.firstDispatchedAt()),live));
     }
     private BoundaryAck ack(BoundaryContext c,ProviderOperation operation){var rows=jdbc.query("select a.* from stripe_billing_failed_grace_boundary_acks a join stripe_billing_failed_grace_boundary_claims q using(operation_id) join provider_operations o on o.id=a.operation_id where q.preparation_id=? and q.operation_id=? and owned_grace_boundary_ack_shape(q,a,o,clock_timestamp())",(r,n)->new BoundaryAck(c.phase(),c.original().preparation().id(),operation,r.getObject("invocation",UUID.class),r.getString("claimant"),instant(r,"deadline"),new TestClockAck(r.getString("reference"),r.getString("object_type"),r.getBoolean("livemode"),r.getString("name"),r.getLong("frozen_time"),r.getString("status"),r.getLong("provider_created"),r.getLong("provider_deletes_after"),r.getObject("advancing_target",Long.class)),instant(r,"observed_at"),instant(r,"acknowledged_at")),c.original().preparation().id(),operation.id());if(rows.size()!=1)throw denied();return rows.getFirst();}

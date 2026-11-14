@@ -40,7 +40,7 @@ public final class OwnedFailedGraceBoundary {
         public BoundaryContext {
             required(original,phase,originalGraceReadyId,predecessor);
             var p=original.preparation();var saved=original.admission().ready().observation();var previous=predecessor.observation();
-            if(phase==Phase.AT!=originalGraceReadyId.equals(predecessor.readyId())
+            if((phase==Phase.AT)!=originalGraceReadyId.equals(predecessor.readyId())
                     ||phase==Phase.AT&&!p.fingerprint().equals(predecessor.operationFingerprint())
                     ||predecessor.observedAt().isBefore(p.preparedAt())
                     ||!saved.reference().equals(previous.reference())||!saved.object().equals(previous.object())||saved.livemode()!=previous.livemode()

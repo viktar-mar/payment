@@ -58,7 +58,7 @@ class OwnedFailedGraceBoundaryStoreTransactionTest {
         try{
             for(var phase:Phase.values()){
                 if(phase==Phase.AFTER)fixture.complete(Phase.AT);
-                var c=fixture.inspect(phase,fixture.base.newBudget());var p=c.predecessor();var obs=p.observation();
+                var budget=fixture.base.newBudget();var c=fixture.inspect(phase,budget);var p=c.predecessor();var obs=p.observation();
                 var fields=new HashMap<String,Object>();
                 fields.put("original_id",c.originalGraceReadyId());fields.put("previous_id",p.readyId());fields.put("invocation",p.invocation());
                 fields.put("operation_id",p.operationId());fields.put("operation_fingerprint",p.operationFingerprint());fields.put("observed_at",Timestamp.from(p.observedAt()));
@@ -66,13 +66,15 @@ class OwnedFailedGraceBoundaryStoreTransactionTest {
                 fields.put("frozen_time",obs.frozenTime());fields.put("provider_created",obs.created());fields.put("provider_deletes_after",obs.deletesAfter());
                 fields.put("status","ready");fields.put("advancing_target",obs.advancingTarget());fields.put("target",c.target());
                 fields.put("operation_key",c.operationKey());fields.put("fingerprint",c.fingerprint());
-                for(var scenario:List.of("exact","missing","ambiguous","foreign-target","foreign-origin")){
+                for(var scenario:List.of("exact","missing","ambiguous","foreign-target","foreign-origin","conflicting-phase")){
                     var output=new HashMap<>(fields);if(scenario.equals("foreign-target"))output.put("target",c.target()+1);
                     if(scenario.equals("foreign-origin"))output.put("original_id",java.util.UUID.randomUUID());
+                    // The predecessor can remain fully authentic while this writer loses phase exclusivity.
+                    output.put("phase_exclusive",!scenario.equals("conflicting-phase"));
                     var count=scenario.equals("missing")?0:scenario.equals("ambiguous")?2:1;
                     var jdbc=new JdbcTemplate(h.dataSource){
                         @Override public <T>List<T> query(String sql,RowMapper<T> mapper,Object... args){
-                            assertThat(args).containsExactly(c.original().preparation().id(),phase==Phase.AT?2:3,true,c.original().preparation().id(),phase==Phase.AT?2:3);
+                            assertThat(args).containsExactly(c.original().preparation().id(),phase==Phase.AT?2:3,budget.invocation());
                             var rows=new java.util.ArrayList<T>();for(int i=0;i<count;i++){
                                 ResultSet rs=(ResultSet)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{ResultSet.class},(proxy,m,a)->{
                                     if(!List.of("getObject","getString","getLong","getBoolean","getTimestamp").contains(m.getName())||!output.containsKey(a[0]))throw new AssertionError("unexpected result column");
@@ -83,8 +85,10 @@ class OwnedFailedGraceBoundaryStoreTransactionTest {
                         }
                     };
                     var store=new JdbcOwnedFailedGraceBoundaryStore(jdbc,h.factory);
-                    if(scenario.equals("exact"))assertThat(store.committedEdge(c.original(),phase)).isEqualTo(c);
-                    else assertThatThrownBy(()->store.committedEdge(c.original(),phase)).as(scenario).isInstanceOf(RuntimeException.class);
+                    if(scenario.equals("exact"))assertThat(store.committedEdge(c.original(),phase,budget)).isEqualTo(c);
+                    else if(scenario.equals("conflicting-phase"))
+                        assertThatThrownBy(()->store.committedEdge(c.original(),phase,budget)).as(scenario).hasMessage("OWNED_FAILED_GRACE_BOUNDARY_UNAVAILABLE");
+                    else assertThatThrownBy(()->store.committedEdge(c.original(),phase,budget)).as(scenario).isInstanceOf(RuntimeException.class);
                 }
             }
         }finally{h.unbind();}
