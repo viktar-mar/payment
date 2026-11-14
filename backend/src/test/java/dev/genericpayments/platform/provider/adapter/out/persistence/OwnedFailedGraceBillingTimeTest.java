@@ -54,6 +54,15 @@ class OwnedFailedGraceBillingTimeTest {
     @Test void historicalReturnedReady2StillRequiresTheEntireCurrentSubscription(){
         withRows((h,jdbc)->{jdbc.results.add(List.of(candidate(true,READY2)));assertThat(selector(h,jdbc).sampleForRead(subscription(),UTC)).isEqualTo(new Sample(Instant.ofEpochSecond(READY2),Mode.ISOLATED));assertThat(jdbc.calls).isEqualTo(1);});
     }
+    @Test void committedBoundaryRowsMapTheExactDeadlineAndFollowingSecondInOneStatement(){
+        for(long epoch:new long[]{1703283200L,1703283201L})withRows((h,jdbc)->{
+            jdbc.results.add(List.of(candidate(true,epoch)));
+            var selector=selector(h,jdbc);
+            assertThat(selector.sampleForRead(subscription(),UTC)).isEqualTo(new Sample(Instant.ofEpochSecond(epoch),Mode.ISOLATED));
+            assertThat(selector.sampledTransaction).isEqualTo("inert-reader-xact");
+            assertThat(jdbc.calls).isOne();
+        });
+    }
     @Test void everyMappedFieldMismatchRefusesBothHistoricalAndGraceCandidatesWithoutFallback(){
         // Mutate the returned current record, while preserving a valid supplied record.
         var mutations=new LinkedHashMap<String,Object>();
@@ -69,7 +78,7 @@ class OwnedFailedGraceBillingTimeTest {
         mutations.put("created_at",Timestamp.from(Instant.ofEpochSecond(1699999999L)));
         mutations.put("updated_at",Timestamp.from(Instant.ofEpochSecond(1702682001L)));
         mutations.put("last_reconciled_at",Timestamp.from(Instant.ofEpochSecond(1702682001L)));
-        for(long frozen:new long[]{READY2,LAST_SECOND})for(var mutation:mutations.entrySet())withRows((h,jdbc)->{
+        for(long frozen:new long[]{READY2,LAST_SECOND,1703283200L,1703283201L})for(var mutation:mutations.entrySet())withRows((h,jdbc)->{
             var row=candidate(true,frozen);row.put(mutation.getKey(),mutation.getValue());jdbc.results.add(List.of(row));
             assertThatThrownBy(()->selector(h,jdbc).sampleForRead(subscription(),UTC)).as(mutation.getKey()).hasMessage("OWNED_TIME_AUTHORITY_MISSING");assertThat(jdbc.calls).isEqualTo(1);
         });
@@ -93,10 +102,25 @@ class OwnedFailedGraceBillingTimeTest {
     }
     @Test void zeroCandidatesUsesConcreteFallbackAndOrdinaryResultClearsPreviousTransactionDiagnostic(){
         withRows((h,jdbc)->{
-            jdbc.results.add(List.of(candidate(true,LAST_SECOND)));for(int n=0;n<4;n++)jdbc.results.add(List.of());
+            jdbc.results.add(List.of(candidate(true,LAST_SECOND)));for(int n=0;n<3;n++)jdbc.results.add(List.of());
             var selector=selector(h,jdbc);assertThat(selector.sampleForRead(subscription(),UTC).billingAt()).isEqualTo(Instant.ofEpochSecond(LAST_SECOND));
             assertThat(selector.sampleForRead(subscription(),UTC)).isEqualTo(new Sample(UTC,Mode.ORDINARY));
-            assertThat(selector.sampledTransaction).isNull();assertThat(jdbc.calls).isEqualTo(5);
+            assertThat(selector.sampledTransaction).isNull();assertThat(jdbc.calls).isEqualTo(4);
+        });
+    }
+    @Test void failedAdmissionArrivingAfterTheEmptySnapshotCannotSupplyReadTime(){
+        withRows((h,jdbc)->{
+            jdbc.results.add(List.of());
+            jdbc.afterQuery=()->{
+                // The failed tier now has a READY2. Give the two concrete selectors distinct
+                // column values so the result identifies which selector actually mapped it.
+                jdbc.afterQuery=()->{};
+                jdbc.results.add(List.of(Map.of("valid",true,"frozen_time",READY2,"target",1702678400L,
+                    "transaction_id","later-snapshot")));
+            };
+            var selector=selector(h,jdbc);
+            assertThat(selector.sampleForRead(subscription(),UTC)).isEqualTo(new Sample(Instant.ofEpochSecond(1702678400L),Mode.ISOLATED));
+            assertThat(jdbc.calls).isEqualTo(2);
         });
     }
     @Test void zeroFailedCandidatesPreservesConcretePredecessorIsolatedTimeAndRefusal(){
@@ -125,14 +149,14 @@ class OwnedFailedGraceBillingTimeTest {
             var foreignHolder=new ConnectionHolder(other.physical);foreignHolder.setSynchronizedWithTransaction(true);
             TransactionSynchronizationManager.bindResource(other.dataSource,foreignHolder);
             try{
-                for(int n=0;n<3;n++)primary.results.add(List.of());
+                for(int n=0;n<2;n++)primary.results.add(List.of());
                 primary.results.add(result.equals("ordinary")?List.of():List.of(oldCandidate(!result.equals("refused"))));
                 // A different otherwise valid foreign result must never be consulted, even for ordinary fallback.
                 var foreignRow=new HashMap<String,Object>(oldCandidate(true));foreignRow.put("frozen_time",READY2+99);foreignRow.put("target",READY2+99);foreignRow.put("transaction_id","inert-foreign-xact");foreign.results.add(List.of(foreignRow));
                 var selector=new OwnedFailedGraceBillingTime(primary,h.factory,mixedLegacy(primary,foreign,tier));
                 if(result.equals("refused"))assertThatThrownBy(()->selector.sampleForRead(subscription(),UTC)).as(tier).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
                 else assertThat(selector.sampleForRead(subscription(),UTC)).as(tier+" "+result).isEqualTo(result.equals("ordinary")?new Sample(UTC,Mode.ORDINARY):new Sample(Instant.ofEpochSecond(READY2),Mode.ISOLATED));
-                assertThat(foreign.calls).as("No foreign proof SQL at "+tier).isZero();assertThat(primary.calls).isEqualTo(4);
+                assertThat(foreign.calls).as("No foreign proof SQL at "+tier).isZero();assertThat(primary.calls).isEqualTo(3);
                 if(result.equals("ordinary"))assertThat(selector.sampledTransaction).isNull();
             }finally{TransactionSynchronizationManager.unbindResource(other.dataSource);}
         });

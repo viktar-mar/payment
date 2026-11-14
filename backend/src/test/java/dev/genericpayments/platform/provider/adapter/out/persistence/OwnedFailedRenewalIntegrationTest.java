@@ -359,6 +359,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThatThrownBy(()->transaction.requiresNew(()->{
             insertBoundaryReservation(c,UUID.randomUUID(),c.fingerprint());
             assertThat(committedBoundary(p,phase)).isFalse();
+            assertGraceReadDenied(graceReadTime(),current());
             var store=new JdbcOwnedFailedGraceBoundaryStore(jdbc,entityManagerFactory);
             assertThatThrownBy(()->store.beforeFreshEntryInTransaction(p.setup().admission(),p.context().preparation(),phase,b)).isInstanceOf(IllegalStateException.class);
             return true;
@@ -367,17 +368,30 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     }
     @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"AT,false","AFTER,false","AT,true","AFTER,true"})
     void boundaryIndependentReadyAndPriorPartialPhasesRefuseSameTransactionEvenAfterEarlyDrain(OwnedFailedGraceBoundary.Phase phase,boolean changeKey){
-        var p=boundaryPrepared(phase);var sdk=new BoundarySdk(p,phase);var before=boundaryRows();
+        var p=boundaryPrepared(phase);var sdk=new BoundarySdk(p,phase);
+        var actor=managementContext("boundary-partial-read").actor();var query=graceQueries();var exact=current();
+        var before=boundaryRows();
         var progress=new ArrayList<String>();
         sdk.afterCommit=writing->{if(!writing.equals("claim")&&!writing.equals("ack"))return;
             progress.add(writing);assertThat(committedBoundary(p,phase)).isFalse();
+            var incomplete=boundaryRows();int calls=http.calls.size();
+            assertThatThrownBy(()->query.get(actor,site,exact.id())).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+            assertThatThrownBy(()->query.access(actor,site,customer,exact.productId())).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+            assertThat(boundaryRows()).isEqualTo(incomplete);assertThat(http.calls).hasSize(calls);
             sdk.service.uncertain(sdk.context,sdk.originalClaim,sdk.returnedAck,new InvocationBudget(Clock.systemUTC(),System::nanoTime));
             assertThat(count("stripe_billing_failed_grace_boundary_cleanup")).isZero();
         };
-        sdk.beforeCommit=writing->{if(!writing.equals("ready"))return;
+        sdk.beforeCommit=writing->{if(writing.equals("claim"))assertGraceReadDenied(graceReadTime(),exact);
+            if(!writing.equals("ready"))return;
             assertThat(committedBoundary(p,phase)).isFalse();
+            assertGraceReadDenied(graceReadTime(),exact);
             jdbc.execute("set constraints boundary_provider_committed,boundary_claim_committed,boundary_ack_committed,boundary_ready_committed immediate");
             assertThat(committedBoundary(p,phase)).isFalse();progress.add("drained");
+            assertGraceReadDenied(graceReadTime(),exact);
+            transaction.requiresNew(()->{
+                assertThat(jdbc.queryForObject("select count(*) from stripe_billing_failed_grace_boundary_ready where operation_id=?",Long.class,sdk.originalClaim.id())).isZero();
+                assertGraceReadDenied(graceReadTime(),exact);return true;
+            });
             // Supported beforeCommit must flush, then reprove current source even after the deferred events ran.
             graceTestAccounts.save(new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount(billing.id(),changeKey?"boundary-negative-key":billing.key(),billing.provider(),
                 billing.mode(),billing.status(),billing.externalAccountId(),changeKey?billing.credentialsRef():"boundary-negative-completion"));
@@ -393,6 +407,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             Long.class,sdk.originalClaim.id(),sdk.original.invocation(),sdk.originalClaim.leaseOwner(),java.sql.Timestamp.from(sdk.originalClaim.leaseExpiresAt()))).isEqualTo(1);
         assertThat(count("stripe_billing_failed_renewal_stops")).isEqualTo(1);assertThat(committedBoundary(p,phase)).isFalse();
         assertThat(withoutBoundaryProduction(boundaryRows(),sdk.originalClaim.id(),p.setup().admission().id())).isEqualTo(before);
+        assertGraceReadDenied(graceReadTime(),exact);
     }
     @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.EnumSource(OwnedFailedGraceBoundary.Phase.class)
     void boundaryFreshAndSkipContendersRefuseBeforeHeldLifecycleAndCannotStopWinner(OwnedFailedGraceBoundary.Phase phase)throws Exception{
@@ -459,7 +474,9 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                         jdbc.execute("alter table "+table+" enable trigger boundary_"+type+"_immutable");
                     }
                 }
-                assertThat(committedBoundary(p,phase)).as(damaged).isFalse();throw new IllegalStateException("rollback boundary damage");
+                assertThat(committedBoundary(p,phase)).as(damaged).isFalse();
+                assertGraceReadDenied(graceReadTime(),current());
+                throw new IllegalStateException("rollback boundary damage");
             })).hasMessage("rollback boundary damage");
         }
         for(String field:phase==OwnedFailedGraceBoundary.Phase.AT?List.of("original_grace_ready_id"):List.of("original_grace_ready_id","predecessor_ready_id")){
@@ -486,6 +503,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                 jdbc.execute("alter table stripe_billing_failed_grace_boundary_ready enable trigger boundary_ready_immutable");
                 Boolean seen=jdbc.queryForObject("select owned_grace_boundary_present(?,3)",Boolean.class,p.context().preparation().id());
                 assertThat(seen).isTrue();assertThat(committedBoundary(p,OwnedFailedGraceBoundary.Phase.AFTER)).isFalse();
+                assertGraceReadDenied(graceReadTime(),current());
                 throw new IllegalStateException("rollback foreign preparation");
             })).hasMessage("rollback foreign preparation");
         }
@@ -535,16 +553,54 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                 "subscriptions","subscription_operations","subscription_billing_records","subscription_provider_objects","subscription_trial_eligibility",
                 "subscription_event_sequences","subscription_events","subscription_quotes","subscription_action_capabilities","subscription_portal_sessions",
                 "subscription_admin_receipts","subscription_change_intents","subscription_confirmation_chains","subscription_confirmation_attempts",
-                "payments","payment_events","provider_charge_receipts","outbox_events","site_subscription_policies","subscription_plan_transitions",
+                "stripe_billing_owned_subscriptions","stripe_billing_owned_subscription_receipts","stripe_billing_customers",
+                "payments","payment_events","provider_charge_receipts","outbox_events","outbox_deliveries","outbox_retry_requests","site_subscription_policies","subscription_plan_transitions",
                 "products","prices","provider_product_mappings","provider_price_mappings","customer_sessions"))state.put(table,rows(table));
         return state;
     }
     private void assertGraceReadDenied(OwnedFailedGraceBillingTime selector,Subscription supplied){
         transaction.required(()->{
-            var before=graceReadRows();int calls=http.calls.size();
+            var before=boundaryRows();int calls=http.calls.size();
             assertThatThrownBy(()->selector.sampleForRead(supplied,Instant.now())).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
-            assertThat(graceReadRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);return true;
+            assertThat(boundaryRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);return true;
         });
+    }
+    @Test void committedAtAndAfterDenyRealGetAndAccessEvenAfterTheirOriginalBudgetsExpire()throws InterruptedException{
+        var p=boundaryPrepared(OwnedFailedGraceBoundary.Phase.AT);
+        var actor=managementContext("boundary-exact-read").actor();var query=graceQueries();
+        var exact=current();var deadline=exact.debt().graceDeadline();var financial=financialState();
+        assertThat(exact.billingStatus()).isEqualTo(Subscription.Status.PAST_DUE);
+        assertThat(exact.debt().billingRecordId()).isEqualTo(p.context().failure().billId());
+        assertThat(p.context().preparation().target()).isEqualTo(deadline.minusSeconds(1).getEpochSecond());
+        for(var phase:List.of(OwnedFailedGraceBoundary.Phase.AT,OwnedFailedGraceBoundary.Phase.AFTER)){
+            var selected=phase==OwnedFailedGraceBoundary.Phase.AT?deadline:deadline.plusSeconds(1);
+            var ready=advanceBoundary(p,phase,selected.minusSeconds(1).getEpochSecond());
+            var before=boundaryRows();int calls=http.calls.size();
+            for(boolean historical:List.of(false,true)){
+                if(historical)awaitBoundaryProducerExpiry(ready.ack().operation().id());
+                for(int repeat=0;repeat<2;repeat++){
+                    var view=query.get(actor,site,exact.id());var access=query.access(actor,site,customer,exact.productId());
+                    assertThat(view.subscription()).isEqualTo(exact);assertThat(view.access()).isEqualTo(access);
+                    assertThat(view.permittedActions()).isEmpty();assertThat(access.allowed()).isFalse();
+                    assertThat(access.reason()).isEqualTo(AccessDecision.Reason.EXPIRED);
+                    assertThat(access.evaluatedAt()).isEqualTo(selected);assertThat(access.validUntil()).isNull();
+                    assertThat(view.debt().billingRecordId()).isEqualTo(exact.debt().billingRecordId());
+                    assertThat(view.debt().graceDeadline()).isEqualTo(deadline);
+                }
+                assertThat(current()).isEqualTo(exact);
+                assertThat(jdbc.queryForObject("select settlement from subscription_billing_records where id=?",String.class,exact.debt().billingRecordId())).isEqualTo("OPEN");
+                assertThat(boundaryRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(financial);assertThat(http.calls).hasSize(calls);
+                assertPersistedSampleUnchanged();
+            }
+        }
+    }
+    private void awaitBoundaryProducerExpiry(UUID operation)throws InterruptedException{
+        var limit=Instant.now().plusSeconds(70);
+        while(Instant.now().isBefore(limit)){
+            if(Boolean.TRUE.equals(jdbc.queryForObject("select clock_timestamp()>greatest(deadline_at,deadline) from stripe_billing_failed_grace_boundary_claims where operation_id=?",Boolean.class,operation)))return;
+            Thread.sleep(150);
+        }
+        throw new AssertionError("Expected both recorded producer deadlines to elapse");
     }
     private void assertGraceQueryRead(dev.genericpayments.platform.subscriptions.application.service.SubscriptionQueryService query,
             SubscriptionActor actor,Subscription exact,Instant selected){
@@ -587,6 +643,35 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(graceReadRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);assertPersistedSampleUnchanged();
         methodService(new JdbcOwnedFailedRenewalMethodStore(jdbc)).reserveMethod(p.setup().admission(),managementContext("read-before-legacy-method"),true);
         var legacy=graceReadRows();assertThat(transaction.required(()->selector.sampleForRead(current(),Instant.now()))).isEqualTo(persistedExpected());assertThat(graceReadRows()).isEqualTo(legacy);
+    }
+    @ParameterizedTest @org.junit.jupiter.params.provider.EnumSource(OwnedFailedGraceBoundary.Phase.class)
+    void boundaryForeignReadyNamingAnAdmissionWithNoPreparationClosesReady2Fallback(OwnedFailedGraceBoundary.Phase phase){
+        time.usePersisted();var s=setup();fail(s,service(store(),null));
+        var exact=current();var selector=graceReadTime();var before=boundaryRows();
+        assertThat(count("stripe_billing_failed_grace_preparations")).isZero();
+        assertThat(transaction.required(()->selector.sampleForRead(exact,Instant.now()))).isEqualTo(persistedExpected());
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            // Negative orphan only. Neither the claimed preparation nor operation exists.
+            // Suspend just the INSERT proof, its deferred proof and the two child INSERT FKs.
+            var table="stripe_billing_failed_grace_boundary_ready";
+            var triggers=new ArrayList<>(jdbc.queryForList("""
+                select quote_ident(t.tgname) from pg_trigger t join pg_constraint c on c.oid=t.tgconstraint
+                where t.tgrelid='stripe_billing_failed_grace_boundary_ready'::regclass and c.conrelid=t.tgrelid
+                 and c.contype='f' and t.tgfoid='"RI_FKey_check_ins"'::regproc order by t.tgname
+                """,String.class));
+            assertThat(triggers).hasSize(2);triggers.add("boundary_ready_proof");triggers.add("boundary_ready_committed");
+            triggers.forEach(t->jdbc.execute("alter table "+table+" disable trigger "+t));
+            assertThat(jdbc.update("""
+                insert into stripe_billing_failed_grace_boundary_ready(id,preparation_id,admission_id,phase,operation_id,invocation,
+                 reference,object_type,livemode,name,frozen_time,status,provider_created,provider_deletes_after,observed_at)
+                values(?,?,?,?,?,?,'foreign','invalid',false,'orphan',0,'invalid',0,0,clock_timestamp())
+                """,UUID.randomUUID(),UUID.randomUUID(),s.admission().id(),phase.number(),UUID.randomUUID(),UUID.randomUUID())).isEqualTo(1);
+            triggers.forEach(t->jdbc.execute("alter table "+table+" enable trigger "+t));
+            assertGraceReadDenied(selector,exact);
+            throw new IllegalStateException("rollback orphan boundary receipt");
+        })).hasMessage("rollback orphan boundary receipt");
+        assertThat(boundaryRows()).isEqualTo(before);
+        assertThat(transaction.required(()->selector.sampleForRead(exact,Instant.now()))).isEqualTo(persistedExpected());
     }
     @Test void graceDedicatedReservationBeforeClaimAlreadyRefusesHistoricalFallback(){
         var p=gracePrepared();var selector=graceReadTime();var before=graceReadRows();var exact=current();
@@ -635,23 +720,69 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     }
     @ParameterizedTest @ValueSource(strings={"credentials","disabled","policy","stop","source","debt","grace","sequence","bill"})
     void graceCommittedReadRefusesCurrentAuthorityAndDebtDriftWithoutAnyAdditionalEffect(String mutation){
-        var p=gracePrepared();var f=new GraceSdk(p);f.queue();f.advance();var before=graceReadRows();var exact=current();var selector=graceReadTime();
+        var p=gracePrepared();var f=new GraceSdk(p);f.queue();f.advance();var exact=current();var selector=graceReadTime();
+        assertGraceReadRejectsDrift(p,exact,selector,mutation);
+        assertThat(transaction.required(()->selector.sampleForRead(exact,Instant.now())).billingAt()).isEqualTo(Instant.ofEpochSecond(p.context().preparation().target()));
+    }
+    @ParameterizedTest @org.junit.jupiter.params.provider.EnumSource(OwnedFailedGraceBoundary.Phase.class)
+    void boundaryReadRequiresOriginalCurrentAuthorityAndEntireSuppliedRecord(OwnedFailedGraceBoundary.Phase phase)throws Exception{
+        var p=boundaryPrepared(phase);var sdk=new BoundarySdk(p,phase);sdk.queue();sdk.advance();
+        var exact=current();var selector=graceReadTime();var deadline=exact.debt().graceDeadline();
+        for(var mutation:List.of("id","account","site","customer","product","revision","debt","price","time"))
+            assertGraceReadDenied(selector,graceSuppliedCopy(exact,mutation));
+        for(var mutation:List.of("credentials","disabled","policy","stop","source","debt","grace","sequence","bill"))
+            assertGraceReadRejectsDrift(p,exact,selector,mutation);
+        if(phase==OwnedFailedGraceBoundary.Phase.AFTER){
+            var before=boundaryRows();
+            assertThatThrownBy(()->transaction.requiresNew(()->{
+                damageGraceReceipt("stripe_billing_failed_grace_boundary_ready","boundary_ready_immutable",
+                    "update stripe_billing_failed_grace_boundary_ready set name='different-AT-clock' where preparation_id=? and phase=2",p);
+                assertGraceReadDenied(selector,exact);throw new IllegalStateException("rollback AT predecessor damage");
+            })).hasMessage("rollback AT predecessor damage");
+            assertThat(boundaryRows()).isEqualTo(before);
+        }
+        assertThat(transaction.required(()->selector.sampleForRead(exact,Instant.now())).billingAt())
+            .isEqualTo(phase==OwnedFailedGraceBoundary.Phase.AT?deadline:deadline.plusSeconds(1));
+        var before=boundaryRows();int calls=http.calls.size();
+        for(boolean autoCommit:List.of(false,true))assertForeignBoundaryReadRefused(exact,autoCommit);
+        assertThat(boundaryRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+    }
+    private void assertForeignBoundaryReadRefused(Subscription exact,boolean autoCommit)throws Exception{
+        var config=new com.zaxxer.hikari.HikariConfig();jdbc.getDataSource().unwrap(com.zaxxer.hikari.HikariDataSource.class).copyStateTo(config);
+        config.setPoolName("boundary-foreign-reader-"+UUID.randomUUID());config.setMaximumPoolSize(1);config.setMinimumIdle(0);config.setAutoCommit(autoCommit);
+        try(var pool=new com.zaxxer.hikari.HikariDataSource(config)){
+            var foreign=new org.springframework.jdbc.core.JdbcTemplate(pool){
+                @Override public <T>List<T> query(String sql,org.springframework.jdbc.core.RowMapper<T> mapper,Object... args){throw new AssertionError("Foreign caller reached boundary proof");}
+            };
+            var selector=new OwnedFailedGraceBillingTime(foreign,entityManagerFactory,time.persisted);
+            transaction.required(()->{
+                assertThat(new org.springframework.jdbc.core.JdbcTemplate(pool).queryForObject("select 1",Integer.class)).isEqualTo(1);
+                var holder=(org.springframework.jdbc.datasource.ConnectionHolder)org.springframework.transaction.support.TransactionSynchronizationManager.getResource(pool);
+                assertThat(holder).isNotNull();assertThat(holder.isSynchronizedWithTransaction()).isTrue();
+                try{assertThat(holder.getConnection().getAutoCommit()).isEqualTo(autoCommit);}catch(java.sql.SQLException e){throw new IllegalStateException(e);}
+                assertThatThrownBy(()->selector.sampleForRead(exact,Instant.now())).hasMessage("OWNED_TIME_REQUIRES_CALLER_TRANSACTION");
+                return true;
+            });
+        }
+    }
+    private void assertGraceReadRejectsDrift(GracePrepared p,Subscription exact,OwnedFailedGraceBillingTime selector,String mutation){
+        var before=boundaryRows();
         assertThatThrownBy(()->transaction.requiresNew(()->{
-            switch(mutation){
+            int changed=switch(mutation){
                 case "credentials"->jdbc.update("update payment_accounts set credentials_ref='negative-grace-read-drift' where id=?",billing.id().value());
                 case "disabled"->jdbc.update("update payment_accounts set account_status='DISABLED' where id=?",billing.id().value());
                 case "policy"->jdbc.update("update site_subscription_policies set enabled=false,version=version+1 where site_id=?",site.value());
-                case "stop"->{jdbc.execute("alter table stripe_billing_failed_renewal_stops disable trigger failed_stop_proof");jdbc.update("insert into stripe_billing_failed_renewal_stops(admission_id,reason,stopped_at) values(?,'AUTHORITY_DRIFT',clock_timestamp())",p.setup().admission().id());jdbc.execute("alter table stripe_billing_failed_renewal_stops enable trigger failed_stop_proof");}
-                case "source"->{jdbc.execute("alter table stripe_billing_failed_renewals disable trigger failed_renewal_immutable");jdbc.update("update stripe_billing_failed_renewals set source_sha=repeat('f',40) where id=?",p.setup().admission().id());jdbc.execute("alter table stripe_billing_failed_renewals enable trigger failed_renewal_immutable");}
+                case "stop"->{jdbc.execute("alter table stripe_billing_failed_renewal_stops disable trigger failed_stop_proof");int n=jdbc.update("insert into stripe_billing_failed_renewal_stops(admission_id,reason,stopped_at) values(?,'AUTHORITY_DRIFT',clock_timestamp())",p.setup().admission().id());jdbc.execute("alter table stripe_billing_failed_renewal_stops enable trigger failed_stop_proof");yield n;}
+                case "source"->{jdbc.execute("alter table stripe_billing_failed_renewals disable trigger failed_renewal_immutable");int n=jdbc.update("update stripe_billing_failed_renewals set source_sha=repeat('f',40) where id=?",p.setup().admission().id());jdbc.execute("alter table stripe_billing_failed_renewals enable trigger failed_renewal_immutable");yield n;}
                 case "debt"->jdbc.update("update subscriptions set debt_billing_record_id=null,debt_period_start=null,debt_period_end=null,grace_deadline=null where id=?",exact.id());
                 case "grace"->jdbc.update("update subscriptions set grace_deadline=grace_deadline+interval '1 second' where id=?",exact.id());
                 case "sequence"->jdbc.update("update subscriptions set observation_sequence=observation_sequence+1 where id=?",exact.id());
                 case "bill"->jdbc.update("update subscription_billing_records set version=version+1 where id=?",exact.debt().billingRecordId());
                 default->throw new AssertionError();
-            }
+            };
+            assertThat(changed).as(mutation).isEqualTo(1);
             assertGraceReadDenied(selector,exact);throw new IllegalStateException("rollback grace read current drift");
-        })).hasMessage("rollback grace read current drift");assertThat(graceReadRows()).isEqualTo(before);
-        assertThat(transaction.required(()->selector.sampleForRead(exact,Instant.now())).billingAt()).isEqualTo(Instant.ofEpochSecond(p.context().preparation().target()));
+        })).hasMessage("rollback grace read current drift");assertThat(boundaryRows()).isEqualTo(before);
     }
     @ParameterizedTest @ValueSource(strings={"missing-ready","missing-ack","missing-claim","claim-reader-transaction","claim-ack-transaction","claim-budget-before-ack",
         "ack-reader-transaction","ack-reference","ack-name","ack-frozen","ack-target","ack-future",
@@ -1230,6 +1361,35 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             });
         }
         assertThat(graceReadRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(finance);assertThat(http.calls).hasSize(calls);
+    }
+    @Test void failedAdmissionAndDebtCommittedAfterEmptyReadSnapshotNeverReenterTheFailedTier(){
+        time.usePersisted();var p=predecessor();var supplied=current();var svc=service(store(),null);
+        var calls=new java.util.concurrent.atomic.AtomicInteger();
+        var interleaved=new org.springframework.jdbc.core.JdbcTemplate(jdbc.getDataSource()){
+            @Override public <T> List<T> query(String sql,org.springframework.jdbc.core.RowMapper<T> mapper,Object... args){
+                int statement=calls.incrementAndGet();
+                var result=super.query(sql,mapper,args);
+                if(statement==1){
+                    assertThat(result).isEmpty();
+                    try(var workers=new BoundedWorkers()){
+                        var committed=workers.submit(()->{
+                            var admitted=svc.admit(p.upstream(),p.ready(),p.boundary());
+                            return fail(new Setup(p.upstream(),p.ready(),p.boundary(),admitted),svc);
+                        });
+                        assertThat(committed.get(20,TimeUnit.SECONDS).billId()).isNotNull();
+                    }catch(Exception failure){throw new AssertionError("Failed admission did not commit between snapshots",failure);}
+                }
+                return result;
+            }
+        };
+        var selector=new OwnedFailedGraceBillingTime(interleaved,entityManagerFactory,time.persisted);
+        transaction.required(()->{
+            // A second failed-tier discovery would now return READY2. The genuine first-renewal
+            // selector sees the new unpaid debt and refuses its original paid projection.
+            assertThatThrownBy(()->selector.sampleForRead(supplied,Instant.now())).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+            assertThat(calls).hasValue(2);return true;
+        });
+        assertPersistedSampleUnchanged();assertThat(current().debt()).isNotNull();
     }
     @ParameterizedTest @ValueSource(booleans={true,false})
     void graceRejectsPretouchedSecondaryPoolRegardlessOfAutoCommitWithoutProofSqlOrLocks(boolean autoCommit)throws Exception {

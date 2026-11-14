@@ -87,6 +87,32 @@ class SubscriptionBillingTimeServiceTest {
         assertThatThrownBy(()->query.get(null,s.siteId(),s.id())).isInstanceOf(IllegalStateException.class).hasMessage("AUTHORITY_REFUSED");
         assertThatThrownBy(()->query.access(null,s.siteId(),s.customerId(),s.productId())).isInstanceOf(IllegalStateException.class).hasMessage("AUTHORITY_REFUSED");
     }
+    @Test void exactGetAndAccessDenyUnpaidDebtAtTheDeadlineAndFollowingSecond(){
+        var base=SubscriptionFixtures.active(Instant.parse("2026-08-01T00:00:00Z"),Instant.parse("2026-09-01T00:00:00Z"));
+        var period=new Subscription.Period(base.paidThrough(),UTC);
+        var s=base.renewalFailed(UUID.randomUUID(),period,3,base.paidThrough(),UTC);
+        var bill=new BillingRecord(s.debt().billingRecordId(),s.siteId(),s.id(),s.paymentAccountId(),"invoice",BillingRecord.Kind.RENEWAL,s.billingPrice(),null,period,1000,"EUR",BillingRecord.Settlement.OPEN,0,UTC,UTC);
+        var reads=port(SubscriptionReadPort.class,(m,a)->switch(m){case "current"->Optional.of(s);case "unresolvedOperation"->Optional.empty();case "bill"->Optional.of(bill);default->throw new AssertionError(m);});
+        assertThat(s.debt().graceDeadline()).isEqualTo(Instant.parse("2026-09-04T00:00:00Z"));
+        for(var at:List.of(Instant.parse("2026-09-04T00:00:00Z"),Instant.parse("2026-09-04T00:00:01Z"))){
+            var time=port(SubscriptionBillingTimePort.class,(method,args)->{
+                assertThat(method).isEqualTo("sampleForRead");
+                assertThat(args).containsExactly(s,UTC);
+                return new SubscriptionBillingTimePort.Sample(at,SubscriptionBillingTimePort.Mode.ISOLATED);
+            });
+            var query=query(s,time,reads);
+            var view=query.get(null,s.siteId(),s.id());
+            var access=query.access(null,s.siteId(),s.customerId(),s.productId());
+            assertThat(view.subscription()).isSameAs(s);
+            assertThat(view.debt().billingRecordId()).isEqualTo(bill.id());
+            assertThat(view.permittedActions()).isEmpty();
+            assertThat(view.access()).isEqualTo(access);
+            assertThat(access.allowed()).isFalse();
+            assertThat(access.reason()).isEqualTo(AccessDecision.Reason.EXPIRED);
+            assertThat(access.validUntil()).isNull();
+            assertThat(access.evaluatedAt()).isEqualTo(at);
+        }
+    }
     @Test void accessWithoutSubscriptionUsesOperationalUtcWithoutReadTimeSelection() {
         var s=SubscriptionFixtures.active(UTC,UTC.plus(Duration.ofDays(30)));
         var reads=port(SubscriptionReadPort.class,(m,a)->{assertThat(m).isEqualTo("current");return Optional.empty();});

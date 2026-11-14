@@ -4,6 +4,14 @@ Status on 2026-11-06: **Stage 5B NOT_ACCEPTED**. The combined native initial EUR
 
 [Stage 5A acceptance](stage-5a-acceptance.md) remains unchanged and does not supply Billing acceptance. The protected historical EUR13 and anonymous DISPATCHING records are excluded from 5B fixtures and retries. No runtime, provider request, credential operation or test-clock advance is authorized by this document.
 
+## Owned grace deadline and following second — 2026-11-14
+
+The original G−1 reader passed at `03f3757`. All four full-workflow jobs passed, including both runtime packaging checks. The disjoint backend partitions recorded 5,818 broad and 394 owned failed-renewal cases, with one existing skip among the 6,212 total. The dedicated lane passed 379 overlapping cases. [Full Offline CI 42549494652](https://github.com/viktar-mar/payment/actions/runs/42549494652) and [dedicated renewal CI 42549494637](https://github.com/viktar-mar/payment/actions/runs/42549494637).
+
+The V40 hosted acceptance case follows the same unpaid bill from the original G−1 READY through two independently committed clock advances. At the saved grace deadline G and one second later, both real subscription queries must return EXPIRED with access denied, the exact evaluation time, no valid-until time and an empty action set on the subscription view. The complete subscription, original OPEN bill, cash, journal, event, outbox and receipt rows must survive repeated reads, including after the producer deadlines pass. [Finite boundary design](superpowers/specs/2026-11-14-owned-grace-boundary-continuation-design.md).
+
+Exact-head V40 full CI, dedicated renewal and both packaging checks are **PENDING** at this source checkpoint. Recovered PAID access at G+1 requires a separate recovery and settlement proof. Native failed-renewal/grace remains **NOT_RUN** and full Stage 5B remains **NOT_ACCEPTED**.
+
 ## Original G−1 exact-read selection — 2026-11-09
 
 The published V39 producer predecessor is `48867911041b2cfa48ba222530c4529f92289c79`. Root verified [full Offline CI 42535721190](https://github.com/viktar-mar/payment/actions/runs/42535721190), all four jobs successful: **5,801 broad backend cases**, zero failures/errors and one existing opt-in skip, plus disjoint **344/344 owned failed-renewal cases**, zero skips, totaling **6,145 backend invocations** including that skip. Both first-payment and first-renewal packaging markers passed without runtime launch. [Dedicated renewal CI 42535721193](https://github.com/viktar-mar/payment/actions/runs/42535721193) passed **379/379**; its overlapping cases are not added. These receipts supersede the dated V39 pending-hosted history below for that predecessor only.
