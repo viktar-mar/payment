@@ -682,6 +682,50 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             assertThat(count("stripe_billing_failed_grace_claims")).isZero();assertGraceReadDenied(selector,exact);throw new IllegalStateException("rollback partial grace reservation");
         })).hasMessage("rollback partial grace reservation");assertThat(graceReadRows()).isEqualTo(before);assertPersistedSampleUnchanged();
     }
+    @ParameterizedTest @org.junit.jupiter.params.provider.EnumSource(OwnedFailedGraceBoundary.Phase.class)
+    void canonicalPhaseKeyOnForeignResourceClosesHistoricalAndCommittedFallbacks(OwnedFailedGraceBoundary.Phase phase){
+        var p=boundaryPrepared(OwnedFailedGraceBoundary.Phase.AT);
+        var admission=p.setup().admission().id();var g=current().debt().graceDeadline();
+        assertCanonicalKeyDamageRefuses(admission,phase,g.minusSeconds(1));
+        advanceBoundary(p,OwnedFailedGraceBoundary.Phase.AT,g.minusSeconds(1).getEpochSecond());
+        // A foreign AT sibling invalidates the otherwise complete AT. A foreign AFTER
+        // reservation with no corresponding receipt prevents return of the lower AT.
+        assertCanonicalKeyDamageRefuses(admission,phase,g);
+        advanceBoundary(p,OwnedFailedGraceBoundary.Phase.AFTER,g.getEpochSecond());
+        // Both an invalid AT predecessor and an invalid AFTER sibling must close G+1.
+        assertCanonicalKeyDamageRefuses(admission,phase,g.plusSeconds(1));
+    }
+    @ParameterizedTest @org.junit.jupiter.params.provider.EnumSource(OwnedFailedGraceBoundary.Phase.class)
+    void canonicalPhaseKeyWithNoPreparationClosesFailedReady2(OwnedFailedGraceBoundary.Phase phase){
+        time.usePersisted();var s=setup();fail(s,service(store(),null));
+        assertThat(count("stripe_billing_failed_grace_preparations")).isZero();
+        assertCanonicalKeyDamageRefuses(s.admission().id(),phase,persistedExpected().billingAt());
+    }
+    private void assertCanonicalKeyDamageRefuses(UUID admission,OwnedFailedGraceBoundary.Phase phase,Instant originalTime){
+        var selector=graceReadTime();var exact=current();var before=boundaryRows();int calls=http.calls.size();
+        assertThat(transaction.required(()->selector.sampleForRead(exact,Instant.now())).billingAt()).isEqualTo(originalTime);
+        for(var kind:List.of(phase.kind().name(),"PRODUCT_CREATE")){
+            assertThatThrownBy(()->transaction.requiresNew(()->{
+                var foreign=UUID.randomUUID();var resource=UUID.randomUUID();
+                assertThat(jdbc.update("""
+                    insert into payment_accounts(id,account_key,provider,account_mode,account_status,external_account_id,credentials_ref,created_at)
+                    values(?,'foreign-boundary-key-account','STRIPE','SANDBOX','ACTIVE','acct_foreignKey','foreign-boundary-key',clock_timestamp())
+                    """,foreign)).isEqualTo(1);
+                // The phase INSERT proof ordinarily rejects the foreign phase operation.
+                // Its suspension and this deliberately wrong RESERVED row roll back together.
+                if(kind.equals(phase.kind().name()))jdbc.execute("alter table provider_operations disable trigger aaaa_owned_grace_boundary_operation");
+                var key="billing-failed-grace-boundary-v1:"+admission+(phase==OwnedFailedGraceBoundary.Phase.AT?":at":":after");
+                assertThat(jdbc.update("""
+                    insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint)
+                    values(?,?,'acct_foreignKey','foreign-boundary-key',?,?,?,?)
+                    """,UUID.randomUUID(),foreign,kind,resource,key,"0".repeat(64))).isEqualTo(1);
+                assertGraceReadDenied(selector,exact);
+                throw new IllegalStateException("rollback foreign canonical key control");
+            })).hasMessage("rollback foreign canonical key control");
+            assertThat(boundaryRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+        }
+        assertThat(transaction.required(()->selector.sampleForRead(exact,Instant.now())).billingAt()).isEqualTo(originalTime);
+    }
     @Test void graceDispatchAndCommittedAckNeverSupplyReadTimeWhileWriterKeepsReady2(){
         var p=gracePrepared();var f=new GraceSdk(p);var selector=graceReadTime();var actor=managementContext("grace-incomplete-read").actor();var query=graceQueries();
         f.afterCommit=phase->{if(phase.equals("claim")||phase.equals("ack")){

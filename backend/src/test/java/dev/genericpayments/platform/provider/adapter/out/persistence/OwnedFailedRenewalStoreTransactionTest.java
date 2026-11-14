@@ -41,11 +41,19 @@ class OwnedFailedRenewalStoreTransactionTest {
     static final class JpaBoundary {
         final java.util.concurrent.atomic.AtomicInteger queries=new java.util.concurrent.atomic.AtomicInteger();
         boolean closedAfterCapture; Runnable afterFlush;
+        Exception isolationFailure;
         final String mode;final DataSource dataSource;final Connection physical,sessionConnection;final EntityManagerFactory factory;final EntityManager em;final JdbcTemplate jdbc;
         JpaBoundary(String mode) {
             this.mode=mode;
             dataSource=proxy(DataSource.class,(method,args)->identity(method,args,"inert-known-source"));
-            physical=proxy(Connection.class,(method,args)->switch(method){case "getAutoCommit"->{if(mode.equals("brokenConnection"))throw new java.sql.SQLException("inert-closed");yield mode.equals("autoCommit");}case "getTransactionIsolation"->mode.equals("repeatableRead")?Connection.TRANSACTION_REPEATABLE_READ:Connection.TRANSACTION_READ_COMMITTED;default->identity(method,args,"inert-physical");});
+            physical=proxy(Connection.class,(method,args)->switch(method){
+                case "getAutoCommit"->{if(mode.equals("brokenConnection"))throw new java.sql.SQLException("inert-closed");yield mode.equals("autoCommit");}
+                case "getTransactionIsolation"->{
+                    if(isolationFailure!=null)throw isolationFailure;
+                    yield mode.equals("repeatableRead")?Connection.TRANSACTION_REPEATABLE_READ:Connection.TRANSACTION_READ_COMMITTED;
+                }
+                default->identity(method,args,"inert-physical");
+            });
             sessionConnection=mode.equals("foreignConnection")?proxy(Connection.class,(method,args)->method.equals("getAutoCommit")?false:identity(method,args,"inert-other-physical")):physical;
             factory=proxy(EntityManagerFactory.class,(method,args)->identity(method,args,"inert-known-factory"));
             var tx=proxy(EntityTransaction.class,(method,args)->method.equals("isActive")?!mode.equals("inactive"):identity(method,args,"inert-entity-transaction"));

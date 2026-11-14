@@ -43,6 +43,20 @@ class OwnedFailedGraceBillingTimeTest {
         try{var jdbc=new Rows(h);assertThatThrownBy(()->selector(h,jdbc).sampleForRead(subscription(),UTC)).hasMessage("OWNED_TIME_REQUIRES_CALLER_TRANSACTION");assertThat(jdbc.calls).isZero();}
         finally{TransactionSynchronizationManager.bindResource(h.dataSource,holder);h.unbind();}
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"true,false","false,false","true,true","false,true"})
+    void isolationMetadataFailuresAlwaysUseRedactedCallerDiagnostic(boolean checked,boolean afterQuery){
+        withRows((h,jdbc)->{
+            var error=checked?new SQLException("private driver detail"):new IllegalArgumentException("private pool detail");
+            if(afterQuery){
+                jdbc.results.add(List.of(candidate(true,1703283201L)));
+                jdbc.afterQuery=()->h.isolationFailure=error;
+            }else h.isolationFailure=error;
+            assertThatThrownBy(()->selector(h,jdbc).sampleForRead(subscription(),UTC))
+                .isExactlyInstanceOf(IllegalStateException.class).hasMessage("OWNED_TIME_REQUIRES_CALLER_TRANSACTION").hasNoCause();
+            assertThat(jdbc.calls).isEqualTo(afterQuery?1:0);
+        });
+    }
     @Test void exactFullMappedSubscriptionReturnsStoredOriginalGraceTimeAndCallerDiagnostic(){
         withRows((h,jdbc)->{
             jdbc.results.add(List.of(candidate(true,LAST_SECOND)));var selector=selector(h,jdbc);

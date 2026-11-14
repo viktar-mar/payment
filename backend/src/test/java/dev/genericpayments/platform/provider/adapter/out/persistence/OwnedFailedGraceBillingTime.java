@@ -105,11 +105,14 @@ public final class OwnedFailedGraceBillingTime implements SubscriptionBillingTim
           and a.subscription_id=d.subscription_id and a.source_sha=d.source_sha
          left join stripe_billing_first_renewal_ready predecessor on predecessor.id=d.ready_id and predecessor.admission_id=d.first_renewal_admission
          left join stripe_billing_failed_grace_preparations p on p.admission_id=d.id
-         -- A missing local preparation cannot hide a phase receipt that names this admission.
+         -- Without a local preparation, receipts and exact operation keys still identify
+         -- conflicts by admission. These locators can only cause refusal.
          left join lateral (
           select bool_or(e.phase=2) as at_present,bool_or(e.phase=3) as after_present from (
            select phase from stripe_billing_failed_grace_boundary_claims where admission_id=d.id
            union all select phase from stripe_billing_failed_grace_boundary_ready where admission_id=d.id
+           union all select 2 from provider_operations where operation_key='billing-failed-grace-boundary-v1:'||d.id::text||':at'
+           union all select 3 from provider_operations where operation_key='billing-failed-grace-boundary-v1:'||d.id::text||':after'
           ) e
          ) orphan on p.id is null
          left join provider_operations o on o.kind='OWNED_GRACE_CLOCK_ADVANCE' and o.resource_id=p.id

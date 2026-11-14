@@ -214,7 +214,8 @@ create function owned_grace_boundary_receipt(p uuid,h integer,utc timestamptz,re
  where q.preparation_id=$1 and q.phase=$2 and owned_grace_boundary_owns($1,$2,o)
  and ($2<>2 or r.id<>q.original_grace_ready_id)
  -- Keep conflicting siblings discovered by resource, admission, operation or invocation.
- and not exists(select 1 from provider_operations other where other.kind=e.kind and other.resource_id=$1 and other.id<>o.id)
+ and not exists(select 1 from provider_operations other where other.id<>o.id
+  and ((other.kind=e.kind and other.resource_id=$1) or other.operation_key=e.operation_key))
  and not exists(select 1 from stripe_billing_failed_grace_boundary_claims x
   where x.phase=$2 and (x.preparation_id=$1 or x.admission_id=q.admission_id) and x.operation_id<>o.id)
  and not exists(select 1 from stripe_billing_failed_grace_boundary_ready x
@@ -255,7 +256,9 @@ create function owned_grace_predecessor_committed(p uuid,h integer,utc timestamp
 $$;
 create function owned_grace_boundary_present(p uuid,h integer) returns boolean language sql stable as $$
  with root as materialized(select admission_id from stripe_billing_failed_grace_preparations where id=$1),
- ops as materialized(select id from provider_operations where resource_id=$1 and kind=case $2 when 2 then 'OWNED_GRACE_AT_CLOCK_ADVANCE' else 'OWNED_GRACE_AFTER_CLOCK_ADVANCE' end),
+ ops as materialized(select id from provider_operations
+  where (resource_id=$1 and kind=case $2 when 2 then 'OWNED_GRACE_AT_CLOCK_ADVANCE' else 'OWNED_GRACE_AFTER_CLOCK_ADVANCE' end)
+   or operation_key=(select 'billing-failed-grace-boundary-v1:'||admission_id::text||case $2 when 2 then ':at' when 3 then ':after' end from root)),
  claims as materialized(select operation_id,invocation from stripe_billing_failed_grace_boundary_claims
    where (phase=$2 and (preparation_id=$1 or admission_id=(select admission_id from root))) or operation_id in(select id from ops))
  select exists(select 1 from ops) or exists(select 1 from claims)

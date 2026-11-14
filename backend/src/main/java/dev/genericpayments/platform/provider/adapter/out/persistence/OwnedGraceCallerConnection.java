@@ -56,7 +56,7 @@ final class OwnedGraceCallerConnection {
         var current=requireSame();
         try{
             if(physical.getTransactionIsolation()!=Connection.TRANSACTION_READ_COMMITTED)throw new IllegalStateException(message);
-        }catch(java.sql.SQLException failure){throw new IllegalStateException(message);}
+        }catch(java.sql.SQLException|RuntimeException failure){throw new IllegalStateException(message);}
         return current;
     }
     private static void verifyPhysical(EntityManager manager,Connection physical,String message){
