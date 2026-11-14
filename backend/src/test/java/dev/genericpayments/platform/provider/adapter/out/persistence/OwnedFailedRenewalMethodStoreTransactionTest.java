@@ -7,6 +7,23 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Explicit socket-free test: no DataSource, context or provider calls. */
 class OwnedFailedRenewalMethodStoreTransactionTest {
+    @Test void successorDefaultsAndUnconfiguredJdbcDenyBeforeLookingUpAnySource() {
+        var port=dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore.class;
+        var defaults=(dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore)
+            java.lang.reflect.Proxy.newProxyInstance(port.getClassLoader(),new Class<?>[]{port},(proxy,method,args)->{
+                if(!method.isDefault())throw new AssertionError("unexpected fallback to "+method.getName());
+                return java.lang.reflect.InvocationHandler.invokeDefault(proxy,method,args);
+            });
+        var unconfigured=new JdbcOwnedFailedRenewalMethodStore(new JdbcTemplate());
+        var tx=org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive();
+        try{
+            org.springframework.transaction.support.TransactionSynchronizationManager.setActualTransactionActive(true);
+            for(var store:List.of(defaults,unconfigured)){
+                assertThatThrownBy(()->store.requireGraceSuccessorEntryInTransaction(null,null,null)).isInstanceOf(IllegalStateException.class);
+                assertThatThrownBy(()->store.reserveBrowserAfterGraceInTransaction(null,null,null,null,null,null,null,null)).isInstanceOf(IllegalStateException.class);
+            }
+        }finally{org.springframework.transaction.support.TransactionSynchronizationManager.setActualTransactionActive(tx);}
+    }
     @Test void everyStoreEntryRequiresTheCallerTransactionBeforeAnySql() {
         var s=new JdbcOwnedFailedRenewalMethodStore(new JdbcTemplate());
         List<Runnable> calls=List.of(

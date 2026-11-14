@@ -15,6 +15,9 @@ import java.util.*;
 
 /** All operations join an existing caller transaction. No provider calls or transaction suspension. */
 public interface OwnedFailedRenewalMethodStore {
+    default void requireGraceSuccessorEntryInTransaction(OwnedFailedRenewal.Admission admission,GraceSuccessor after,Instant now){throw browserDenied();}
+    default Reservation reserveBrowserAfterGraceInTransaction(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,SubscriptionOperation o,
+            CustomerBinding binding,Sample sample,Instant now,Enrollment enrollment,GraceSuccessor after){throw browserDenied();}
     default Reservation reserveBrowserInTransaction(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,SubscriptionOperation o,CustomerBinding b,Sample sample,Instant now,Enrollment enrollment){throw browserDenied();}
     default Enrollment requireBrowserSetupEnrollmentInTransaction(Reservation r,CustomerSessionContext originalSession,Instant now){throw browserDenied();}
     /** Read-only immutable locator binding before any operation/session lock; never a live authority grant. */

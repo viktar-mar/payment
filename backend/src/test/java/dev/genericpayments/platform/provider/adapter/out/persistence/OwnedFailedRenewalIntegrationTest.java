@@ -262,6 +262,147 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(result.observation().frozenTime()).isEqualTo(from+1);
         assertThat(http.calls).hasSize(calls+3);assertThat(http.replies).isEmpty();return result;
     }
+    private record AfterEntry(GracePrepared prepared,OwnedFailedRenewalMethod.GraceSuccessor successor){}
+    private AfterEntry afterEntry(){
+        var p=boundaryPrepared(OwnedFailedGraceBoundary.Phase.AFTER);var prep=p.context().preparation();
+        var ready=advanceBoundary(p,OwnedFailedGraceBoundary.Phase.AFTER,prep.target()+1);
+        return new AfterEntry(p,new OwnedFailedRenewalMethod.GraceSuccessor(prep.id(),ready.id(),ready.observation(),ready.observedAt()));
+    }
+    @Test void originalBrowserEntryAfterGracePersistsExactIndependentAfterAndOldWriterSample(){
+        var e=afterEntry();var a=e.prepared().setup().admission();var s=e.successor();
+        var context=managementContext("method-after-grace");var session=((SubscriptionActor.Customer)context.actor()).session();
+        var store=new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory);var svc=methodService(store);
+        var financial=financialState();int calls=http.calls.size();var history=graceSdkHistory();
+        var r=svc.reserveBrowserMethodAfterGrace(a,s,context,true);
+        assertThat(r.remoteClock()).isEqualTo(s.clock());assertThat(r.billingSample()).isEqualTo(persistedExpected());
+        var saved=transaction.required(()->store.requireReservationInTransaction(r));assertThat(saved).isEqualTo(r);
+        Boolean exact=jdbc.queryForObject("""
+            select r.after_phase=3 and r.after_preparation_id=? and r.after_ready_id=? and r.handoff_xid<>b.producer_xid
+             and r.browser_session_id=? and r.browser_origin=? and r.browser_session_expires_at=?
+             and b.observed_at<=o.created_at and o.created_at<=r.reserved_at and r.reserved_at<=clock_timestamp()
+             and o.status='RESERVED' and o.version=0 and o.key_digest=? and o.fingerprint=r.request_fingerprint
+             and owned_grace_successor_identity(r.id,clock_timestamp(),pg_current_xact_id())
+             and owned_grace_history_committed(r.after_preparation_id,clock_timestamp(),pg_current_xact_id())
+             and not owned_grace_original_committed(r.after_preparation_id,clock_timestamp(),pg_current_xact_id())
+            from stripe_billing_failed_method_reservations r join stripe_billing_failed_grace_boundary_ready b on b.id=r.after_ready_id
+            join subscription_operations o on o.id=r.setup_operation where r.id=?
+            """,Boolean.class,s.preparationId(),s.afterReadyId(),session.sessionId().value(),session.origin(),
+            java.sql.Timestamp.from(session.expiresAt()),digest.sha256Hex(context.idempotencyKey()),r.id());
+        assertThat(exact).isTrue();
+        var before=boundaryRows();
+        assertThatThrownBy(()->svc.reserveBrowserMethodAfterGrace(a,s,context,true)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->svc.reserveBrowserMethod(a,context,true)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->svc.reserveMethod(a,context,true)).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(()->e.prepared().failures().reserveExistingRecovery(a)).isInstanceOf(RuntimeException.class);
+        assertThat(boundaryRows()).isEqualTo(before);assertThat(graceSdkHistory()).isEqualTo(history);
+        assertThat(financialState()).isEqualTo(financial);assertThat(http.calls).hasSize(calls);assertPersistedSampleUnchanged();
+    }
+    @ParameterizedTest @ValueSource(strings={"original","at","after-claim","after-ack","after-ready-local"})
+    void partialGraceAndSameWriterAfterSavepointCannotHandOff(String stage){
+        var p=gracePrepared();var prep=p.context().preparation();var a=p.setup().admission();
+        var store=new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory);var context=managementContext("partial-grace");
+        var original=new GraceSdk(p);
+        if(!stage.equals("original")){original.queue();original.advance();}
+        if(stage.startsWith("after"))advanceBoundary(p,OwnedFailedGraceBoundary.Phase.AT,prep.target());
+        var old=a.ready().observation();var expected=new OwnedFirstRenewal.TestClockReady(old.reference(),old.object(),false,old.name(),prep.target()+2,"ready",old.created(),old.deletesAfter(),null);
+        Runnable refused=()->{
+            var proposed=new OwnedFailedRenewalMethod.GraceSuccessor(prep.id(),UUID.randomUUID(),expected,a.ready().observedAt());
+            assertThat(jdbc.queryForObject("select owned_grace_history_committed(?,clock_timestamp(),pg_current_xact_id())",Boolean.class,prep.id())).isFalse();
+            assertThatThrownBy(()->methodService(store).reserveBrowserMethodAfterGrace(a,proposed,context,true)).isInstanceOf(RuntimeException.class);
+            assertThat(count("stripe_billing_failed_method_reservations")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+        };
+        if(!stage.startsWith("after")){refused.run();return;}
+        var sdk=new BoundarySdk(p,OwnedFailedGraceBoundary.Phase.AFTER);var checked=new java.util.concurrent.atomic.AtomicBoolean();
+        sdk.afterCommit=step->{if(stage.equals("after-"+step)){refused.run();checked.set(true);}};
+        sdk.beforeCommit=step->{if(step.equals("ready")&&stage.equals("after-ready-local")){
+            jdbc.execute((org.springframework.jdbc.core.ConnectionCallback<Void>)connection->{
+                var sp=connection.setSavepoint();jdbc.execute("set constraints all immediate");connection.releaseSavepoint(sp);return null;
+            });
+            assertThat(jdbc.queryForObject("select owned_grace_history_committed(?,clock_timestamp(),pg_current_xact_id())",Boolean.class,prep.id())).isFalse();
+            checked.set(true);
+        }};
+        sdk.queue();sdk.advance();assertThat(checked).isTrue();
+    }
+    @ParameterizedTest @ValueSource(strings={"root","phase","observed","sibling","session","consent","legacy","browser","one-arg"})
+    void successorEntryRefusesChangedDescriptionOrAuthorityWithoutPoisoningAfter(String mutation){
+        var e=afterEntry();var a=e.prepared().setup().admission();var s=e.successor();var ctx=managementContext("entry-negative");
+        UUID at=jdbc.queryForObject("select id from stripe_billing_failed_grace_boundary_ready where preparation_id=? and phase=2",UUID.class,s.preparationId());
+        var supplied=new OwnedFailedRenewalMethod.GraceSuccessor(mutation.equals("root")?UUID.randomUUID():s.preparationId(),
+            mutation.equals("phase")?at:s.afterReadyId(),s.clock(),mutation.equals("observed")?s.observedAt().minusSeconds(1):s.observedAt());
+        if(mutation.equals("sibling"))insertOrdinaryBoundaryKey(foreignBoundaryAccount(),a.id(),OwnedFailedGraceBoundary.Phase.AFTER);
+        if(mutation.equals("session"))jdbc.update("update customer_sessions set revoked_at=clock_timestamp() where id=?",((SubscriptionActor.Customer)ctx.actor()).session().sessionId().value());
+        var svc=methodService(mutation.equals("one-arg")?new JdbcOwnedFailedRenewalMethodStore(jdbc):new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory));
+        var before=boundaryRows();int calls=http.calls.size();
+        assertThatThrownBy(()->{
+            if(mutation.equals("legacy"))svc.reserveMethod(a,ctx,true);
+            else if(mutation.equals("browser"))svc.reserveBrowserMethod(a,ctx,true);
+            else svc.reserveBrowserMethodAfterGrace(a,supplied,ctx,!mutation.equals("consent"));
+        }).isInstanceOf(RuntimeException.class);
+        assertThat(count("stripe_billing_failed_method_reservations")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+        assertThat(boundaryRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+    }
+    @ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void drainedHandoffWithSubsequentAuthorityDriftDistinguishesRawReceiptFromSupportedCompletion(boolean supported){
+        var e=afterEntry();var a=e.prepared().setup().admission();var s=e.successor();var ctx=managementContext("after-drain");
+        var real=new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory);var reached=new java.util.concurrent.atomic.AtomicBoolean();
+        var negative=(OwnedFailedRenewalMethodStore)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{OwnedFailedRenewalMethodStore.class},(proxy,method,args)->{
+            if(!method.getName().equals("reserveBrowserAfterGraceInTransaction")){try{return method.invoke(real,args);}catch(InvocationTargetException f){throw f.getCause();}}
+            var op=(SubscriptionOperation)args[2];var binding=(dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort.CustomerBinding)args[3];
+            var sample=(SubscriptionBillingTimePort.Sample)args[4];var now=(Instant)args[5];var session=(OwnedMethodBrowser.Enrollment)args[6];
+            OwnedFailedRenewalMethod.Reservation r;
+            if(supported){try{r=(OwnedFailedRenewalMethod.Reservation)method.invoke(real,args);}catch(InvocationTargetException f){throw f.getCause();}}
+            else{
+                // Raw negative control, using genuine caller SETUP, enrolled original session and saved AFTER.
+                r=new OwnedFailedRenewalMethod.Reservation(UUID.randomUUID(),a,e.prepared().context().failure(),op.id(),op.fingerprint(),0,binding,sample,now,s);
+                var raw=r;
+                jdbc.execute((org.springframework.jdbc.core.ConnectionCallback<Void>)connection->{
+                    var sp=connection.setSavepoint();
+                    assertThat(jdbc.update("""
+                    insert into stripe_billing_failed_method_reservations(id,admission_id,setup_operation,request_fingerprint,initial_operation_version,
+                     operation_snapshot,binding_id,binding_version,binding_reference,binding_creation_operation,billing_at,billing_mode,reserved_at,
+                     browser_session_id,browser_origin,browser_session_expires_at,after_ready_id,after_preparation_id,after_phase)
+                    select ?,?,o.id,o.fingerprint,0,to_jsonb(o),?,?,?,?,?,'ISOLATED',?,?,?,?,?,?,3 from subscription_operations o where o.id=?
+                    """,raw.id(),a.id(),binding.id(),binding.version(),binding.providerReference(),binding.creationOperationId(),java.sql.Timestamp.from(sample.billingAt()),
+                    java.sql.Timestamp.from(now),session.sessionId(),session.origin(),java.sql.Timestamp.from(session.sessionExpiresAt()),s.afterReadyId(),s.preparationId(),op.id())).isOne();
+                    connection.releaseSavepoint(sp);return null;
+                });
+            }
+            jdbc.execute("set constraints all immediate");
+            assertThat(jdbc.queryForObject("select handoff_xid=pg_current_xact_id() and not owned_grace_successor_identity(id,clock_timestamp(),pg_current_xact_id()) from stripe_billing_failed_method_reservations where id=?",Boolean.class,r.id())).isTrue();
+            reached.set(true);
+            if(supported)graceTestAccounts.save(new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount(billing.id(),billing.key(),billing.provider(),billing.mode(),billing.status(),billing.externalAccountId(),"negative-handoff-drift"));
+            else assertThat(jdbc.update("update payment_accounts set credentials_ref='negative-handoff-drift' where id=?",billing.id().value())).isOne();
+            return r;
+        });
+        var svc=methodService(negative);
+        if(supported){
+            assertThatThrownBy(()->svc.reserveBrowserMethodAfterGrace(a,s,ctx,true)).isInstanceOf(RuntimeException.class);
+            assertThat(count("stripe_billing_failed_method_reservations")).isZero();
+            assertThat(jdbc.queryForObject("select credentials_ref from payment_accounts where id=?",String.class,billing.id().value())).isEqualTo(billing.credentialsRef());
+        }else{
+            var stale=svc.reserveBrowserMethodAfterGrace(a,s,ctx,true);
+            assertThat(count("stripe_billing_failed_method_reservations")).isOne();
+            Boolean live=jdbc.queryForObject("select owned_method_lineage(?)",Boolean.class,stale.id());assertThat(live).isFalse();
+            assertThatThrownBy(()->methodService(real).inspectBrowserSetupPreparation(stale,ctx)).isInstanceOf(RuntimeException.class);
+        }
+        assertThat(reached).isTrue();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @Test void afterEntryRefusesHeldAfterForeignKeyAndExactlyOneConcurrentEntrantWins() throws Exception{
+        var e=afterEntry();var a=e.prepared().setup().admission();var s=e.successor();var svc=methodService(new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory));
+        var ctx=managementContext("after-lock");var held=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var workers=new BoundedWorkers()){
+            var holder=workers.submit(()->transaction.requiresNew(()->{jdbc.queryForList("select id from stripe_billing_failed_grace_boundary_ready where id=? for update",s.afterReadyId());held.countDown();awaitRelease(release);return true;}));
+            try{assertThat(held.await(5,TimeUnit.SECONDS)).isTrue();
+                var blocked=workers.submit(()->{assertThatThrownBy(()->svc.reserveBrowserMethodAfterGrace(a,s,ctx,true)).satisfies(OwnedFailedRenewalIntegrationTest::assertGraceLockUnavailable);return true;});
+                assertThat(blocked.get(4,TimeUnit.SECONDS)).isTrue();assertThat(holder.isDone()).isFalse();
+            }finally{release.countDown();}holder.get(5,TimeUnit.SECONDS);
+            var start=new CountDownLatch(1);
+            java.util.concurrent.Callable<Boolean> attempt=()->{awaitRelease(start);try{svc.reserveBrowserMethodAfterGrace(a,s,ctx,true);return true;}catch(RuntimeException lost){return false;}};
+            var first=workers.submit(attempt);var second=workers.submit(attempt);start.countDown();
+            assertThat(List.of(first.get(10,TimeUnit.SECONDS),second.get(10,TimeUnit.SECONDS))).containsExactlyInAnyOrder(true,false);
+        }
+        assertThat(count("stripe_billing_failed_method_reservations")).isOne();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
     @Test void boundarySdkCommitsBothExactTargetsWithIndependentProducerTransactions(){
         var p=gracePrepared();var original=new GraceSdk(p);original.queue();original.advance();
         var history=graceSdkHistory();var financial=financialState();var originalSub=current();

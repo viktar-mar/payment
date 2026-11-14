@@ -2,6 +2,7 @@ package dev.genericpayments.platform.provider.adapter.out.persistence;
 
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod;
+import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.TestClockReady;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.*;
 import dev.genericpayments.platform.provider.application.model.OwnedMethodBrowser.*;
 import dev.genericpayments.platform.customers.application.model.CustomerSessionContext;
@@ -23,13 +24,19 @@ import java.sql.*;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
+import jakarta.persistence.EntityManagerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /** Explicit constructor only; caller owns the transaction and lifecycle locks. V35 guards every insert. */
 public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenewalMethodStore {
     private final JdbcTemplate jdbc;
-    public JdbcOwnedFailedRenewalMethodStore(JdbcTemplate jdbc) { this.jdbc=Objects.requireNonNull(jdbc); }
+    private final EntityManagerFactory factory;
+    public JdbcOwnedFailedRenewalMethodStore(JdbcTemplate jdbc) { this(jdbc,null); }
+    public JdbcOwnedFailedRenewalMethodStore(JdbcTemplate jdbc,EntityManagerFactory factory) {
+        this.jdbc=Objects.requireNonNull(jdbc);this.factory=factory;
+    }
 
     static boolean ownedStepResource(JdbcTemplate jdbc,PaymentAccountId account,UUID resource) {
         return !jdbc.queryForList("""
@@ -74,38 +81,78 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
 
     @Override public Reservation reserveInTransaction(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,
             SubscriptionOperation setup,CustomerBinding binding,Sample sample,Instant now) {
-        return reserve(a,f,setup,binding,sample,now,null);
+        return reserve(a,f,setup,binding,sample,now,null,null);
     }
     @Override public Reservation reserveBrowserInTransaction(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,
             SubscriptionOperation setup,CustomerBinding binding,Sample sample,Instant now,Enrollment enrollment) {
-        transaction();if(enrollment==null)throw unavailable();return reserve(a,f,setup,binding,sample,now,enrollment);
+        transaction();if(enrollment==null)throw unavailable();return reserve(a,f,setup,binding,sample,now,enrollment,null);
+    }
+    private OwnedGraceCallerConnection successorCaller(){
+        var caller=OwnedGraceCallerConnection.capture(jdbc,factory,"Owned grace successor requires original caller");
+        caller.requireReadCommitted();return caller;
+    }
+    @Override public void requireGraceSuccessorEntryInTransaction(OwnedFailedRenewal.Admission a,GraceSuccessor after,Instant now){
+        var caller=successorCaller();
+        requireAfterDescription(a,after,now);
+        String entry="select owned_grace_successor_entry(?,clock_timestamp(),pg_current_xact_id())";
+        require(entry,after.preparationId());
+        jdbc.queryForList("select lock_owned_grace_boundary(?,3,false)",after.preparationId());
+        require(entry,after.preparationId());
+        caller.requireReadCommitted();
+    }
+    private void requireAfterDescription(OwnedFailedRenewal.Admission a,GraceSuccessor after,Instant now){
+        if(a==null||after==null||now==null||after.observedAt().isAfter(now)
+                ||!JdbcOwnedFirstRenewalStore.storedFailedAdmission(jdbc,a.id()).equals(a)
+                ||!after.equals(successor(a.id(),after.preparationId(),after.afterReadyId())))throw unavailable();
+    }
+    @Override public Reservation reserveBrowserAfterGraceInTransaction(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,
+            SubscriptionOperation setup,CustomerBinding binding,Sample sample,Instant now,Enrollment enrollment,GraceSuccessor after){
+        var caller=successorCaller();
+        if(!TransactionSynchronizationManager.isSynchronizationActive()||enrollment==null)throw unavailable();
+        requireAfterDescription(a,after,now);
+        var r=reserve(a,f,setup,binding,sample,now,enrollment,after);
+        caller.requireReadCommitted();
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization(){
+            @Override public void beforeCommit(boolean readOnly){
+                if(readOnly)throw unavailable();
+                caller.requireReadCommitted().flush();caller.requireReadCommitted();
+                require("select owned_grace_handoff_current(?,clock_timestamp(),pg_current_xact_id())",r.id());
+                caller.requireReadCommitted();
+            }
+        });
+        return r;
     }
     private Reservation reserve(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,
-            SubscriptionOperation setup,CustomerBinding binding,Sample sample,Instant now,Enrollment enrollment) {
+            SubscriptionOperation setup,CustomerBinding binding,Sample sample,Instant now,Enrollment enrollment,GraceSuccessor after) {
         transaction();if(a==null||f==null||setup==null)throw unavailable();
         JdbcOwnedFirstRenewalStore.requireStoredFailedPredecessor(jdbc,a.firstRenewalAdmission(),a.ready(),a.boundary());
         if(!JdbcOwnedFirstRenewalStore.storedFailedAdmission(jdbc,a.id()).equals(a)
                 ||!new JdbcOwnedFailedRenewalStore(jdbc).failureRow(a.id()).equals(f)
                 ||setup.kind()!=SubscriptionOperation.Kind.SETUP||setup.status()!=SubscriptionOperation.Status.RESERVED||setup.version()!=0)throw unavailable();
-        jdbc.queryForList("select lock_owned_renewal_branch(?)",a.firstRenewalAdmission().id());
-        var r=new Reservation(UUID.randomUUID(),a,f,setup.id(),setup.fingerprint(),setup.version(),binding,sample,utc(now));
+        if(after==null)jdbc.queryForList("select lock_owned_renewal_branch(?)",a.firstRenewalAdmission().id());
+        var r=new Reservation(UUID.randomUUID(),a,f,setup.id(),setup.fingerprint(),setup.version(),binding,sample,utc(now),after);
         if(!operation(r,setup.id()).equals(setup))throw unavailable();
         int count=jdbc.update("""
             insert into stripe_billing_failed_method_reservations(id,admission_id,setup_operation,request_fingerprint,initial_operation_version,
              operation_snapshot,binding_id,binding_version,binding_reference,binding_creation_operation,billing_at,billing_mode,reserved_at,
-             browser_session_id,browser_origin,browser_session_expires_at)
-            select ?,?,?,?, ?,to_jsonb(o),?,?,?,?,?,'ISOLATED',?,?,?,? from subscription_operations o where o.id=?
+             browser_session_id,browser_origin,browser_session_expires_at,after_preparation_id,after_ready_id,after_phase)
+            select ?,?,?,?, ?,to_jsonb(o),?,?,?,?,?,'ISOLATED',?,?,?,?,?,?,? from subscription_operations o where o.id=?
             """,r.id(),a.id(),setup.id(),r.requestFingerprint(),r.initialOperationVersion(),binding.id(),binding.version(),binding.providerReference(),
             binding.creationOperationId(),time(sample.billingAt()),time(r.reservedAt()),enrollment==null?null:enrollment.sessionId(),
-            enrollment==null?null:enrollment.origin(),enrollment==null?null:time(enrollment.sessionExpiresAt()),setup.id());
+            enrollment==null?null:enrollment.origin(),enrollment==null?null:time(enrollment.sessionExpiresAt()),
+            after==null?null:after.preparationId(),after==null?null:after.afterReadyId(),after==null?null:3,setup.id());
         if(count!=1)throw unavailable();
         return requireReservationInTransaction(r);
     }
     private JdbcOwnedMethodBrowserStore browser(){return new JdbcOwnedMethodBrowserStore(jdbc,this);}
-    @Override public Enrollment requireBrowserSetupEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().setupEnrollment(r,s,now);}
+    private void requireSuccessorCaller(Reservation r){
+        if(r!=null&&r.successor()!=null)successorCaller();
+    }
+    private JdbcOwnedMethodBrowserStore browser(Reservation r){requireSuccessorCaller(r);return browser();}
+    @Override public Enrollment requireBrowserSetupEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser(r).setupEnrollment(r,s,now);}
     @Override public Enrollment requireBrowserRecoveryIdentityInTransaction(Reservation r,CustomerSessionContext s){return browser().recoveryIdentity(r,s);}
-    @Override public Enrollment requireBrowserRecoveryEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().recoveryEnrollment(r,s,now);}
-    @Override public Optional<Enrollment> requireReplyEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().replyEnrollment(r,s,now);}
+    @Override public Enrollment requireBrowserRecoveryEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser(r).recoveryEnrollment(r,s,now);}
+    @Override public Optional<Enrollment> requireReplyEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser(r).replyEnrollment(r,s,now);}
     @Override public BoundSetup requireBrowserBoundSetupInTransaction(Reservation r,CustomerSessionContext s,Instant now){
         return requireBrowserSetup(r,s,now,true);
     }
@@ -113,6 +160,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         return requireBrowserSetup(r,s,now,false);
     }
     private BoundSetup requireBrowserSetup(Reservation r,CustomerSessionContext s,Instant now,boolean methodRequired){
+        requireSuccessorCaller(r);
         transaction();if(r==null||s==null||now==null)throw unavailable();
         var owner=r.admission().firstRenewalAdmission().receipt().intent().clock().owner();
         var o=operation(r,r.setupOperationId());
@@ -165,13 +213,14 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
     static void requireBoundSetupRootChronology(Root root,ProviderOperation setupStep){
         if(root==null||setupStep==null||setupStep.firstDispatchedAt()==null||root.issuedAt().isBefore(setupStep.firstDispatchedAt()))throw unavailable();
     }
-    @Override public Pending requireBrowserPendingInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser().pending(r,s,now);}
+    @Override public Pending requireBrowserPendingInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser(r).pending(r,s,now);}
     @Override public Optional<Root> browserRootInTransaction(UUID r){return browser().root(r);}
-    @Override public Root insertBrowserRootInTransaction(Pending p,Root r){return browser().insert(p,r);}
-    @Override public void requireBrowserActionInTransaction(Pending p,Root r,Instant now){browser().action(p,r,now);}
-    @Override public Selection startBrowserSelectionInTransaction(Pending p,Root r,String key,Instant now){return browser().start(p,r,key,now);}
-    @Override public void finishBrowserSelectionInTransaction(Pending p,Root r,Selection s,Instant now){browser().finish(p,r,s,now);}
-    @Override public boolean consumeBrowserFirstInTransaction(Pending p,Root r,String key,String fingerprint,Instant now){return browser().consume(p,r,key,fingerprint,now);}
+    private JdbcOwnedMethodBrowserStore browser(Pending p){return browser(p==null?null:p.reservation());}
+    @Override public Root insertBrowserRootInTransaction(Pending p,Root r){return browser(p).insert(p,r);}
+    @Override public void requireBrowserActionInTransaction(Pending p,Root r,Instant now){browser(p).action(p,r,now);}
+    @Override public Selection startBrowserSelectionInTransaction(Pending p,Root r,String key,Instant now){return browser(p).start(p,r,key,now);}
+    @Override public void finishBrowserSelectionInTransaction(Pending p,Root r,Selection s,Instant now){browser(p).finish(p,r,s,now);}
+    @Override public boolean consumeBrowserFirstInTransaction(Pending p,Root r,String key,String fingerprint,Instant now){return browser(p).consume(p,r,key,fingerprint,now);}
     @Override public Reservation requireReservationInTransaction(Reservation expected) {
         transaction();if(expected==null)throw unavailable();
         var a=expected.admission();
@@ -182,6 +231,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         return expected;
     }
     @Override public MethodReadContext requirePreparedMethodInTransaction(Reservation r) {
+        requireSuccessorCaller(r);
         requireReservationInTransaction(r);
         require("select owned_method_debt(?,0,?) and owned_method_steps(?) and owned_method_initial_operation(?)",r.id(),r.setupOperationId(),r.id(),r.id());
         var o=operation(r,r.setupOperationId());
@@ -189,6 +239,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         return methodContext(r,o);
     }
     @Override public ReadClaim claimReadInTransaction(Reservation r,Phase phase,UUID invocation,Fence fence,Sample sample,Instant now) {
+        requireSuccessorCaller(r);
         requireReservationInTransaction(r);
         var at=utc(now);var q=new ReadClaim(UUID.randomUUID(),r.id(),phase,invocation,at,at.plusSeconds(30),fence,sample);
         if(!sample.equals(r.billingSample()))throw unavailable();
@@ -232,6 +283,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         return methodContext(r,operation(r,q.fence().operationId()));
     }
     @Override public Completion recordCompletionInTransaction(Reservation r,ReadClaim q,MethodEvidence e,Instant now) {
+        requireSuccessorCaller(r);
         // Effects already happened. Authenticate the saved claim directly, never call requireRead/prestate here.
         requireReservationInTransaction(r);storedRead(r,q);liveWindow(q);
         if(q.phase()!=Phase.METHOD||e==null)throw unavailable();
@@ -258,6 +310,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         return expected;
     }
     @Override public Recovery associateRecoveryInTransaction(Reservation r,Completion c,SubscriptionOperation recover,Instant now) {
+        requireSuccessorCaller(r);
         requireCompletionInTransaction(r,c);
         if(recover==null||recover.kind()!=SubscriptionOperation.Kind.RECOVER||recover.status()!=SubscriptionOperation.Status.RESERVED
                 ||recover.version()!=0||!operation(r,recover.id()).equals(recover))throw unavailable();
@@ -304,6 +357,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
                 ||!expected.account().credentialsRef().equals(owner.credentialsRef()))throw unavailable();
     }
     @Override public Publication recordPublicationInTransaction(Reservation r,ReadClaim q,Instant now) {
+        requireSuccessorCaller(r);
         requireReservationInTransaction(r);storedRead(r,q);liveWindow(q);
         if(q.phase()!=Phase.RECOVERED)throw unavailable();q.requireAccepted(now,now);
         int count=jdbc.update("""
@@ -364,9 +418,19 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
             var a=JdbcOwnedFirstRenewalStore.storedFailedAdmission(jdbc,uuid(row,"admission_id"));
             var owner=a.firstRenewalAdmission().receipt().intent().clock().owner();
             var b=new CustomerBinding(uuid(row,"binding_id"),owner.account(),owner.site(),owner.customer(),row.getString("binding_reference"),uuid(row,"binding_creation_operation"),row.getLong("binding_version"));
+            var ready=uuid(row,"after_ready_id");
+            var after=ready==null?null:successor(a.id(),uuid(row,"after_preparation_id"),ready);
             return new Reservation(uuid(row,"id"),a,new JdbcOwnedFailedRenewalStore(jdbc).failureRow(a.id()),uuid(row,"setup_operation"),row.getString("request_fingerprint"),
-                row.getLong("initial_operation_version"),b,new Sample(instant(row,"billing_at"),Mode.valueOf(row.getString("billing_mode"))),instant(row,"reserved_at"));
+                row.getLong("initial_operation_version"),b,new Sample(instant(row,"billing_at"),Mode.valueOf(row.getString("billing_mode"))),instant(row,"reserved_at"),after);
         },id).stream().findFirst().orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable);
+    }
+    private GraceSuccessor successor(UUID admission,UUID preparation,UUID ready){
+        return jdbc.query("""
+            select * from stripe_billing_failed_grace_boundary_ready where admission_id=? and preparation_id=? and phase=3 and id=?
+            """,(row,n)->new GraceSuccessor(preparation,ready,new TestClockReady(row.getString("reference"),row.getString("object_type"),
+                row.getBoolean("livemode"),row.getString("name"),row.getLong("frozen_time"),row.getString("status"),
+                row.getLong("provider_created"),row.getLong("provider_deletes_after"),row.getObject("advancing_target",Long.class)),
+                instant(row,"observed_at")),admission,preparation,ready).stream().findFirst().orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable);
     }
     private ReadClaim storedRead(Reservation r,ReadClaim q) {
         if(q==null||!r.id().equals(q.reservationId())||!jdbc.query("select * from stripe_billing_failed_method_reads where id=? and reservation_id=?",this::readRow,q.id(),r.id()).stream().anyMatch(q::equals))throw unavailable();

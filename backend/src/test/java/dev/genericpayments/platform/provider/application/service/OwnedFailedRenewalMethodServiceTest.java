@@ -20,6 +20,49 @@ import static dev.genericpayments.platform.provider.application.service.OwnedFai
 
 /** Stateful caller transactions and actual FactService; all provider/persistence ports are inert. */
 class OwnedFailedRenewalMethodServiceTest {
+    private static GraceSuccessor after(Harness h,long target,String reference,Instant observed) {
+        var old=h.b.ready.observation();
+        return new GraceSuccessor(id(210),id(211),new OwnedFirstRenewal.TestClockReady(reference,old.object(),old.livemode(),
+            old.name(),target,old.status(),old.created(),old.deletesAfter(),null),observed);
+    }
+    @Test void successorPinsOriginalClockWholeSecondGraceAndPeriodEndWhileWriterKeepsReadyTwo() {
+        var h=new Harness(300000);var old=h.reserve();
+        assertThat(old.successor()).isNull();assertThat(old.remoteClock()).isEqualTo(h.b.ready.observation());
+        assertThat(h.b.failure.graceDeadline()).isEqualTo(Instant.ofEpochSecond(260300));
+        var expected=after(h,260301,"clock_owned",h.b.utc);
+        java.util.function.Function<GraceSuccessor,Reservation> describe=s->new Reservation(old.id(),old.admission(),old.failure(),
+            old.setupOperationId(),old.requestFingerprint(),0,old.binding(),old.billingSample(),old.reservedAt(),s);
+        var tagged=describe.apply(expected);
+        assertThat(tagged.remoteClock()).isEqualTo(expected.clock());assertThat(tagged.billingSample().billingAt()).isEqualTo(Instant.ofEpochSecond(4700));
+        for(var wrong:List.of(after(h,260300,"clock_owned",h.b.utc),after(h,260301,"clock_other",h.b.utc),
+                after(h,260301,"clock_owned",h.b.utc.plusSeconds(1)))) {
+            assertThatThrownBy(()->describe.apply(wrong)).isInstanceOf(IllegalArgumentException.class);
+        }
+        assertThatThrownBy(()->describe.apply(after(h,260301,"clock_owned",h.b.utc.minusNanos(1)))).isInstanceOf(IllegalArgumentException.class);
+        var shortPeriod=new Harness(260301);var r=shortPeriod.reserve();
+        assertThatThrownBy(()->new Reservation(r.id(),r.admission(),r.failure(),r.setupOperationId(),r.requestFingerprint(),0,
+            r.binding(),r.billingSample(),r.reservedAt(),after(shortPeriod,260301,"clock_owned",shortPeriod.b.utc))).isInstanceOf(IllegalArgumentException.class);
+    }
+    @Test void explicitSuccessorChecksSavedAfterBeforeClaimAndRollsBackLosingEnrollment() {
+        for(String scenario:List.of("original","consent","foreign","current","insert")) {
+            var h=new Harness(300000);h.savedAfter=after(h,260301,"clock_owned",h.b.utc);
+            var selected=scenario.equals("foreign")?new GraceSuccessor(id(212),id(213),h.savedAfter.clock(),h.b.utc):h.savedAfter;
+            h.authorized=!scenario.equals("current");h.failReceipt=scenario.equals("insert");
+            Supplier<Reservation> entry=()->h.service.reserveBrowserMethodAfterGrace(h.b.admission,selected,h.context,!scenario.equals("consent"));
+            if(scenario.equals("original")){
+                var r=entry.get();assertThat(r.successor()).isEqualTo(selected);
+                assertThat(h.enrollment.sessionId()).isEqualTo(((SubscriptionActor.Customer)h.context.actor()).session().sessionId().value());
+                assertThat(h.b.trace).containsSubsequence("after-entry","claim","authority","lifecycle","after-reserve");
+                assertThatThrownBy(entry::get).isInstanceOf(RuntimeException.class);
+                assertThat(h.reservation).isEqualTo(r);assertThat(h.b.ops).hasSize(2);
+            }else{
+                assertThatThrownBy(entry::get).isInstanceOf(RuntimeException.class);
+                if(scenario.equals("foreign")||scenario.equals("consent"))assertThat(h.b.trace).doesNotContain("claim");
+                assertThat(h.b.ops).hasSize(1);assertThat(h.reservation).isNull();assertThat(h.enrollment).isNull();
+            }
+            assertThat(h.b.stopped).isFalse();assertThat(h.b.trace).doesNotContain("reservation");
+        }
+    }
     @Test void browserEnrollmentIsAtomicWithTheActualOriginalSetupAndGetNeedsNoReservationKey() {
         var h=new Harness(true);var r=h.service.reserveBrowserMethod(h.b.admission,h.context,true);
         var session=((SubscriptionActor.Customer)h.context.actor()).session();
@@ -173,7 +216,12 @@ class OwnedFailedRenewalMethodServiceTest {
             this(customerActor,credentialsRef,sessionExpiry,value->"digest:"+value);
         }
         Harness(boolean customerActor,String credentialsRef,Instant sessionExpiry,dev.genericpayments.platform.shared.application.port.out.DigestPort authenticationDigest){
-            b=new OwnedFailedRenewalServiceTest.Harness(true,credentialsRef);
+            this(customerActor,credentialsRef,sessionExpiry,authenticationDigest,10000);
+        }
+        GraceSuccessor savedAfter;
+        Harness(long periodEnd){this(true,"alias",UTC.plusSeconds(600),value->"digest:"+value,periodEnd);}
+        Harness(boolean customerActor,String credentialsRef,Instant sessionExpiry,dev.genericpayments.platform.shared.application.port.out.DigestPort authenticationDigest,long periodEnd){
+            b=new OwnedFailedRenewalServiceTest.Harness(true,credentialsRef,periodEnd);
             b.fail();b.trace.clear();
             SubscriptionActor actor=customerActor?new SubscriptionActor.Customer(new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(new dev.genericpayments.platform.customers.domain.CustomerSessionId(UUID.randomUUID()),b.owner.site(),b.owner.customer(),"https://test.example",Set.of(dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_MANAGE),sessionExpiry)):new SubscriptionActor.Admin(new dev.genericpayments.platform.admin.application.port.in.AuthenticatedAdmin(new dev.genericpayments.platform.admin.domain.AdminUserId(UUID.randomUUID()),"admin",new dev.genericpayments.platform.admin.domain.AdminSessionId(UUID.randomUUID()),UTC.plusSeconds(600)));
             context=new SubscriptionCommandContext(actor,b.owner.site(),b.owner.customer(),"https://test.example","setup-key","test");
@@ -185,6 +233,19 @@ class OwnedFailedRenewalMethodServiceTest {
                 return result;
             }};
             var store=port(OwnedFailedRenewalMethodStore.class,(m,a)->{assertThat(b.active).isTrue();return switch(m){
+                case "requireGraceSuccessorEntryInTransaction"->{
+                    b.trace.add("after-entry");
+                    if(!b.admission.equals(a[0])||savedAfter==null||!savedAfter.equals(a[1])||reservation!=null)throw new IllegalStateException("invalid AFTER");
+                    yield null;
+                }
+                case "reserveBrowserAfterGraceInTransaction"->{
+                    b.trace.add("after-reserve");
+                    if(!b.admission.equals(a[0])||!b.failure.equals(a[1])||!savedAfter.equals(a[7])||reservation!=null)throw new IllegalStateException("invalid handoff");
+                    var op=(SubscriptionOperation)a[2];enrollment=(OwnedMethodBrowser.Enrollment)a[6];
+                    reservation=new Reservation(UUID.randomUUID(),b.admission,b.failure,op.id(),op.fingerprint(),0,b.binding,(SubscriptionBillingTimePort.Sample)a[4],(Instant)a[5],savedAfter);
+                    if(failReceipt)throw new IllegalStateException("enrollment failed");
+                    yield reservation;
+                }
                 case "reserveInTransaction","reserveBrowserInTransaction"->{b.trace.add("reservation");if(reservation!=null)throw new IllegalStateException("duplicate");var o=(SubscriptionOperation)a[2];reservation=new Reservation(UUID.randomUUID(),b.admission,b.failure,o.id(),o.fingerprint(),0,b.binding,(SubscriptionBillingTimePort.Sample)a[4],(Instant)a[5]);if(m.equals("reserveBrowserInTransaction")){enrollment=(OwnedMethodBrowser.Enrollment)a[6];if(failReceipt)throw new IllegalStateException("enrollment failed");}yield reservation;}
                 case "requireBrowserPendingInTransaction"->{same((Reservation)a[0]);var s=(dev.genericpayments.platform.customers.application.model.CustomerSessionContext)a[1];if(!acks||enrollment==null||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())||!enrollment.sessionExpiresAt().equals(s.expiresAt()))throw new IllegalStateException("browser unavailable");var o=b.ops.get(reservation.setupOperationId());yield new OwnedMethodBrowser.Pending(reservation,enrollment,b.account,b.s,o,b.binding,new SubscriptionBillingProofStore.Setup(o.id(),b.s.id(),b.account.id(),id(91),"seti_owned",null),step(o,false));}
                 case "requireBrowserSetupEnrollmentInTransaction","requireReplyEnrollmentInTransaction"->{

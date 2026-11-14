@@ -19,9 +19,20 @@ public final class OwnedFailedRenewalMethod {
         return "owned-failed-renewal-method:"+q.reservationId()+":"+q.phase()+":"+q.invocation();
     }
     public static String recoveryAuthority(Reservation r) { return OwnedFailedRenewal.recoveryAuthority(r.admission()); }
+    /** Describes the saved AFTER observation. Only the durable link and reauthenticated history grant entry. */
+    public record GraceSuccessor(UUID preparationId,UUID afterReadyId,OwnedFirstRenewal.TestClockReady clock,Instant observedAt) {
+        public GraceSuccessor {
+            required(preparationId,afterReadyId,clock,observedAt);
+            if(observedAt.getNano()%1000!=0)throw invalid();
+        }
+    }
     public record Reservation(UUID id,OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.Failure failure,
             UUID setupOperationId,String requestFingerprint,long initialOperationVersion,CustomerBinding binding,
-            Sample billingSample,Instant reservedAt) {
+            Sample billingSample,Instant reservedAt,GraceSuccessor successor) {
+        public Reservation(UUID id,OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.Failure failure,
+                UUID setupOperationId,String requestFingerprint,long initialOperationVersion,CustomerBinding binding,Sample billingSample,Instant reservedAt){
+            this(id,admission,failure,setupOperationId,requestFingerprint,initialOperationVersion,binding,billingSample,reservedAt,null);
+        }
         public Reservation {
             required(id,admission,failure,setupOperationId,binding,reservedAt);isolated(billingSample);
             var i=admission.firstRenewalAdmission().receipt().intent();var owner=i.clock().owner();
@@ -33,7 +44,15 @@ public final class OwnedFailedRenewalMethod {
                     ||!i.customerReference().equals(binding.providerReference())
                     ||!billingSample.billingAt().equals(Instant.ofEpochSecond(admission.ready().ack().advance().target()))
                     ||reservedAt.isBefore(failure.recordedAt()))throw invalid();
+            if(successor!=null){
+                var original=admission.ready().observation();var after=successor.clock();
+                long target=Math.addExact(OwnedFailedRenewal.graceLastSecondTarget(admission,failure),2);
+                if(!original.reference().equals(after.reference())||!original.object().equals(after.object())||original.livemode()!=after.livemode()
+                        ||!original.name().equals(after.name())||original.created()!=after.created()||original.deletesAfter()!=after.deletesAfter()
+                        ||after.frozenTime()!=target||successor.observedAt().isAfter(reservedAt)||successor.observedAt().isBefore(failure.recordedAt()))throw invalid();
+            }
         }
+        public OwnedFirstRenewal.TestClockReady remoteClock(){return successor==null?admission.ready().observation():successor.clock();}
     }
     public record ReadClaim(UUID id,UUID reservationId,Phase phase,UUID invocation,Instant startedAt,
             Instant deadlineAt,Fence fence,Sample billingSample) {

@@ -58,18 +58,29 @@ public final class OwnedFailedRenewalMethodService {
         this.authority=Objects.requireNonNull(authority);this.digest=Objects.requireNonNull(digest);
     }
     public Reservation reserveMethod(OwnedFailedRenewal.Admission admission,SubscriptionCommandContext context,boolean recurringConsent){
-        return reserve(admission,context,recurringConsent,false);
+        return reserve(admission,context,recurringConsent,false,null);
     }
     public Reservation reserveBrowserMethod(OwnedFailedRenewal.Admission admission,SubscriptionCommandContext context,boolean recurringConsent){
-        return reserve(admission,context,recurringConsent,true);
+        return reserve(admission,context,recurringConsent,true,null);
     }
-    private Reservation reserve(OwnedFailedRenewal.Admission admission,SubscriptionCommandContext context,boolean recurringConsent,boolean browser){
+    public Reservation reserveBrowserMethodAfterGrace(OwnedFailedRenewal.Admission admission,GraceSuccessor successor,SubscriptionCommandContext context,boolean recurringConsent){
+        return reserve(admission,context,recurringConsent,true,Objects.requireNonNull(successor));
+    }
+    private Reservation reserve(OwnedFailedRenewal.Admission admission,SubscriptionCommandContext context,boolean recurringConsent,boolean browser,GraceSuccessor successor){
         fresh();Objects.requireNonNull(admission);validateContext(context);
         if(!recurringConsent)throw new IllegalArgumentException("Recurring consent required");
         if(browser)customer(context,utc());
+        if(successor!=null){
+            var owner=admission.firstRenewalAdmission().receipt().intent().clock().owner();
+            if(!owner.site().equals(context.siteId())||!owner.customer().equals(context.customerId()))throw unavailable();
+        }
         Supplier<Reservation> work=()->{
-            var failure=transaction.requiresNew(()->failed.requireFailureInTransaction(admission));
+            var failure=transaction.requiresNew(()->{
+                if(successor!=null)store.requireGraceSuccessorEntryInTransaction(admission,successor,utc());
+                return failed.requireFailureInTransaction(admission);
+            });
             return transaction.requiresNew(()->{
+                if(successor!=null)store.requireGraceSuccessorEntryInTransaction(admission,successor,utc());
                 var intent=admission.firstRenewalAdmission().receipt().intent();var owner=intent.clock().owner();var id=UUID.randomUUID();var at=utc();
                 var candidate=new SubscriptionOperation(id,owner.site(),owner.customer(),intent.subscription(),SubscriptionOperation.Kind.SETUP,
                     SubscriptionOperation.Status.RESERVED,methodAuthority(admission),digest.sha256Hex(context.idempotencyKey()),request(admission,failure,context),
@@ -78,8 +89,11 @@ public final class OwnedFailedRenewalMethodService {
                 if(!claim.owner()||!candidate.equals(claim.operation()))throw unavailable();
                 var state=lock(admission,failure,Set.of(id),context);requireDebt(state,failure,0);
                 selected(state,id,SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Status.RESERVED,0,null);
-                if(browser){var session=customer(context,utc());return store.reserveBrowserInTransaction(admission,failure,candidate,state.binding(),state.sample(),state.utcAt(),
-                    new Enrollment(session.sessionId().value(),session.origin(),session.expiresAt()));}
+                if(browser){
+                    var session=customer(context,utc());var enrollment=new Enrollment(session.sessionId().value(),session.origin(),session.expiresAt());
+                    if(successor!=null)return store.reserveBrowserAfterGraceInTransaction(admission,failure,candidate,state.binding(),state.sample(),state.utcAt(),enrollment,successor);
+                    return store.reserveBrowserInTransaction(admission,failure,candidate,state.binding(),state.sample(),state.utcAt(),enrollment);
+                }
                 return store.reserveInTransaction(admission,failure,candidate,state.binding(),state.sample(),state.utcAt());
             });
         };
