@@ -9,15 +9,23 @@ import dev.genericpayments.platform.shared.application.PaymentApplicationExcepti
 import java.time.*;
 import java.lang.reflect.Proxy;
 import java.util.*;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import static org.assertj.core.api.Assertions.*;
 
 /** Shares scripted negative rows with the existing confirmation isolation test; no connection. */
 class OwnedFailedGraceAdvanceIsolationTest {
     private static final Instant NOW=Instant.parse("2026-11-08T12:00:00Z");
-    @Test void ordinaryReserveAndAllGenericMutationBoundariesRefuseGraceBeforeAccountWork(){
+    @ParameterizedTest @EnumSource(value=Kind.class,names={"OWNED_GRACE_AT_CLOCK_ADVANCE","OWNED_GRACE_AFTER_CLOCK_ADVANCE"})
+    void laterLockingSnapshotCannotMutateEitherBoundaryKind(Kind kind){
+        var j=new OwnedRecoveryConfirmIsolationTest.LaterSnapshotJdbc(false,kind);var row=j.boundary.row;
+        assertThatThrownBy(()->new JdbcProviderOperationStore(j).unknown(row.id(),row.leaseOwner(),row.version())).isInstanceOf(PaymentApplicationException.class);
+        assertThat(j.lockingQueries).hasSize(1);assertThat(j.writes).isEmpty();
+    }
+    @ParameterizedTest @EnumSource(value=Kind.class,names={"OWNED_GRACE_CLOCK_ADVANCE","OWNED_GRACE_AT_CLOCK_ADVANCE","OWNED_GRACE_AFTER_CLOCK_ADVANCE"})
+    void ordinaryReserveAndAllGenericMutationBoundariesRefuseGraceBeforeAccountWork(Kind kind){
         for(var action:List.of("reserve","claim","ack","ackTx","unknown","bind","bindTx","recovery","resume","plan","mutation")){
-            var j=new OwnedRecoveryConfirmIsolationTest.BoundaryJdbc(Kind.OWNED_GRACE_CLOCK_ADVANCE);var s=new JdbcProviderOperationStore(j);var o=j.row;
+            var j=new OwnedRecoveryConfirmIsolationTest.BoundaryJdbc(kind);var s=new JdbcProviderOperationStore(j);var o=j.row;
             assertThatThrownBy(()->{switch(action){
                 case "reserve"->s.reserve(j.account,o.kind(),o.resourceId(),o.operationKey(),o.fingerprint());
                 case "claim"->s.claim(o.id(),"foreign",NOW,Duration.ofSeconds(60));
@@ -28,21 +36,23 @@ class OwnedFailedGraceAdvanceIsolationTest {
             assertThat(j.writes).isEmpty();assertThat(j.reads).noneSatisfy(sql->assertThat(sql).contains("from payment_accounts"));if(action.equals("reserve"))assertThat(j.reads).isEmpty();
         }
     }
-    @Test void schedulerSelectionFinishAndClearCannotConsumeGraceEvenWithForgedCallerKind(){
+    @ParameterizedTest @EnumSource(value=Kind.class,names={"OWNED_GRACE_CLOCK_ADVANCE","OWNED_GRACE_AT_CLOCK_ADVANCE","OWNED_GRACE_AFTER_CLOCK_ADVANCE"})
+    void schedulerSelectionFinishAndClearCannotConsumeGraceEvenWithForgedCallerKind(Kind kind){
         for(boolean explicit:List.of(false,true)){
-            var j=new OwnedRecoveryConfirmIsolationTest.BoundaryJdbc(Kind.OWNED_GRACE_CLOCK_ADVANCE);var scheduler=new PendingProviderRecoveryPersistenceAdapter(j,OwnedRecoveryConfirmIsolationTest.findOnly(j),Clock.fixed(NOW,ZoneOffset.UTC));
+            var j=new OwnedRecoveryConfirmIsolationTest.BoundaryJdbc(kind);var scheduler=new PendingProviderRecoveryPersistenceAdapter(j,OwnedRecoveryConfirmIsolationTest.findOnly(j),Clock.fixed(NOW,ZoneOffset.UTC));
             assertThat(explicit?scheduler.claim(j.row.id()):scheduler.claimNext()).isEmpty();assertThat(j.writes).isEmpty();assertThat(j.schedulerRowReads).isZero();
         }
         for(var outcome:Outcome.values()){
-            var j=new OwnedRecoveryConfirmIsolationTest.BoundaryJdbc(Kind.OWNED_GRACE_CLOCK_ADVANCE);var o=j.row;
+            var j=new OwnedRecoveryConfirmIsolationTest.BoundaryJdbc(kind);var o=j.row;
             var forged=new ProviderOperation(o.id(),o.accountId(),o.externalAccountId(),o.credentialsRef(),Kind.PAYMENT_PREPARE,o.resourceId(),o.operationKey(),o.fingerprint(),o.status(),null,o.firstDispatchedAt(),o.retryBefore(),o.leaseOwner(),o.leaseExpiresAt(),o.version());
             var scheduler=new PendingProviderRecoveryPersistenceAdapter(j,OwnedRecoveryConfirmIsolationTest.findOnly(j),Clock.fixed(NOW,ZoneOffset.UTC));
             assertThatThrownBy(()->scheduler.finish(new Claim(forged,1,NOW.plusSeconds(120)),outcome)).as(outcome.name()).isInstanceOf(RuntimeException.class);assertThat(j.writes).isEmpty();
             j.reads.clear();scheduler.clearResolved(o);assertThat(j.reads).isEmpty();assertThat(j.writes).isEmpty();
         }
     }
-    @Test void ordinaryRecoveryProofRefusesGraceWithoutLoadingAccountCredentialsOrClient(){
-        var j=new OwnedRecoveryConfirmIsolationTest.BoundaryJdbc(Kind.OWNED_GRACE_CLOCK_ADVANCE);var touched=new ArrayList<String>();
+    @ParameterizedTest @EnumSource(value=Kind.class,names={"OWNED_GRACE_CLOCK_ADVANCE","OWNED_GRACE_AT_CLOCK_ADVANCE","OWNED_GRACE_AFTER_CLOCK_ADVANCE"})
+    void ordinaryRecoveryProofRefusesGraceWithoutLoadingAccountCredentialsOrClient(Kind kind){
+        var j=new OwnedRecoveryConfirmIsolationTest.BoundaryJdbc(kind);var touched=new ArrayList<String>();
         var accounts=(dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort.class},(p,m,a)->{touched.add(m.getName());throw new AssertionError("account touched");});
         var adapter=new StripeRecoveryProofAdapter(accounts,null,null,null,null,null,null,null,null,null,null,null,null);
         assertThatThrownBy(()->adapter.request(j.row)).isInstanceOf(PaymentApplicationException.class);assertThat(touched).isEmpty();

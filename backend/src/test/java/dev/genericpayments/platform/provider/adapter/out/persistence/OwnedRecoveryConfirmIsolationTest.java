@@ -105,14 +105,15 @@ class OwnedRecoveryConfirmIsolationTest {
     }
 
     /** Separate READ COMMITTED snapshots. A missing early guard reaches a real modeled UNKNOWN write. */
-    private static final class LaterSnapshotJdbc extends JdbcTemplate {
-        final BoundaryJdbc boundary=new BoundaryJdbc();final boolean initialMiss;final List<String> lockingQueries=new ArrayList<>(),writes=new ArrayList<>();
-        LaterSnapshotJdbc(boolean initialMiss){this.initialMiss=initialMiss;}
+    static final class LaterSnapshotJdbc extends JdbcTemplate {
+        final BoundaryJdbc boundary;final boolean initialMiss;final List<String> lockingQueries=new ArrayList<>(),writes=new ArrayList<>();
+        LaterSnapshotJdbc(boolean initialMiss){this(initialMiss,DEDICATED);}
+        LaterSnapshotJdbc(boolean initialMiss,Kind kind){this.initialMiss=initialMiss;boundary=new BoundaryJdbc(kind);}
         @Override @SuppressWarnings("unchecked") public <T> List<T> query(String sql,RowMapper<T> mapper,Object... args){
             if(sql.stripLeading().startsWith("update ")){writes.add(sql);return (List<T>)List.of(boundary.row);}
             if(sql.contains("for update")){
                 lockingQueries.add(sql);
-                boolean excluded=java.util.regex.Pattern.compile("kind\\s*<>\\s*'OWNED_RECOVERY_INTENT_CONFIRM'").matcher(sql).find();
+                boolean excluded=java.util.regex.Pattern.compile("kind\\s*<>\\s*'"+boundary.row.kind().name()+"'").matcher(sql).find();
                 return (List<T>)(excluded?List.<ProviderOperation>of():List.of(boundary.row));
             }
             assertThat(sql).contains("select * from provider_operations where id=?");
