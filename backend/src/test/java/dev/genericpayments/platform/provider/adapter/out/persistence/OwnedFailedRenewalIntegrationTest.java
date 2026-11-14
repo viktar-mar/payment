@@ -294,6 +294,57 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         return Boolean.TRUE.equals(jdbc.queryForObject("select owned_grace_phase_committed(?,?,clock_timestamp(),pg_current_xact_id())",
             Boolean.class,p.context().preparation().id(),phase.number()));
     }
+    @Test void foreignAccountOriginalSiblingClosesSharedProofAndFreshAtGate(){
+        var phase=OwnedFailedGraceBoundary.Phase.AT;var p=boundaryPrepared(phase);var prep=p.context().preparation();
+        var before=boundaryRows();int calls=http.calls.size();
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            var foreign=UUID.randomUUID();
+            assertThat(jdbc.update("""
+                insert into payment_accounts(id,account_key,provider,account_mode,account_status,external_account_id,credentials_ref,created_at)
+                values(?,'boundary-negative-sibling','STRIPE','SANDBOX','ACTIVE','acct_negativeSibling','negative-sibling',clock_timestamp())
+                """,foreign)).isEqualTo(1);
+            // The raw original forbids this damage. Roll back its trigger state along with the sibling.
+            jdbc.execute("alter table provider_operations disable trigger aaaa_owned_failed_grace_operation");
+            assertThat(jdbc.update("""
+                insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint)
+                values(?,?,'acct_negativeSibling','negative-sibling','OWNED_GRACE_CLOCK_ADVANCE',?,?,?)
+                """,UUID.randomUUID(),foreign,prep.id(),prep.operationKey(),prep.fingerprint())).isEqualTo(1);
+            Boolean valid=jdbc.queryForObject("select owned_grace_original_committed(?,clock_timestamp(),pg_current_xact_id())",Boolean.class,prep.id());
+            assertThat(valid).isFalse();
+            var store=new JdbcOwnedFailedGraceBoundaryStore(jdbc,entityManagerFactory);
+            assertThatThrownBy(()->store.beforeFreshEntryInTransaction(p.setup().admission(),prep,phase,new InvocationBudget(Clock.systemUTC(),System::nanoTime)))
+                .hasMessage("OWNED_FAILED_GRACE_BOUNDARY_UNAVAILABLE");
+            assertThat(count("stripe_billing_failed_grace_boundary_claims")).isZero();assertThat(http.calls).hasSize(calls);
+            throw new IllegalStateException("rollback original sibling");
+        })).hasMessage("rollback original sibling");
+        assertThat(boundaryRows()).isEqualTo(before);
+    }
+    @Test void atReadyCannotReuseOriginalReadyIdAtInsertionOrInCommittedProof(){
+        var phase=OwnedFailedGraceBoundary.Phase.AT;var p=boundaryPrepared(phase);var sdk=new BoundarySdk(p,phase);
+        var rawRejected=new java.util.concurrent.atomic.AtomicBoolean();
+        sdk.afterCommit=writing->{if(writing.equals("ack")){
+            assertThatThrownBy(()->transaction.requiresNew(()->{
+                jdbc.update("""
+                    insert into stripe_billing_failed_grace_boundary_ready(id,preparation_id,phase,admission_id,operation_id,invocation,
+                    reference,object_type,livemode,name,frozen_time,status,provider_created,provider_deletes_after,advancing_target,observed_at)
+                    select ?,a.preparation_id,a.phase,?,a.operation_id,a.invocation,a.reference,a.object_type,a.livemode,a.name,?,'ready',
+                    a.provider_created,a.provider_deletes_after,null,clock_timestamp() from stripe_billing_failed_grace_boundary_acks a where a.operation_id=?
+                    """,sdk.context.originalGraceReadyId(),p.setup().admission().id(),sdk.context.target(),sdk.originalClaim.id());return true;
+            })).satisfies(error->assertGraceSqlProof(error,"Invalid independent owned grace READY"));rawRejected.set(true);
+        }};
+        sdk.queue();var ready=sdk.advance();assertThat(rawRejected).isTrue();var before=boundaryRows();int calls=http.calls.size();
+        assertThatThrownBy(()->transaction.requiresNew(()->{
+            jdbc.execute("alter table stripe_billing_failed_grace_boundary_ready disable trigger boundary_ready_immutable");
+            assertThat(jdbc.update("update stripe_billing_failed_grace_boundary_ready set id=? where id=?",sdk.context.originalGraceReadyId(),ready.id())).isEqualTo(1);
+            jdbc.execute("alter table stripe_billing_failed_grace_boundary_ready enable trigger boundary_ready_immutable");
+            assertThat(committedBoundary(p,phase)).isFalse();
+            var store=new JdbcOwnedFailedGraceBoundaryStore(jdbc,entityManagerFactory);
+            assertThatThrownBy(()->store.beforeFreshEntryInTransaction(p.setup().admission(),p.context().preparation(),OwnedFailedGraceBoundary.Phase.AFTER,
+                new InvocationBudget(Clock.systemUTC(),System::nanoTime))).hasMessage("OWNED_FAILED_GRACE_BOUNDARY_UNAVAILABLE");
+            assertThat(http.calls).hasSize(calls);throw new IllegalStateException("rollback AT id collision");
+        })).hasMessage("rollback AT id collision");
+        assertThat(boundaryRows()).isEqualTo(before);
+    }
     private void insertBoundaryReservation(OwnedFailedGraceBoundary.BoundaryContext c,UUID operation,String fingerprint){
         var account=c.original().account();
         assertThat(jdbc.update("insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint) values(?,?,?,?,?,?,?,?)",
@@ -314,8 +365,8 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         })).satisfies(error->assertGraceSqlProof(error,"Missing committed original grace claim"));
         assertThat(boundaryRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
     }
-    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.EnumSource(OwnedFailedGraceBoundary.Phase.class)
-    void boundaryIndependentReadyAndPriorPartialPhasesRefuseSameTransactionEvenAfterEarlyDrain(OwnedFailedGraceBoundary.Phase phase){
+    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"AT,false","AFTER,false","AT,true","AFTER,true"})
+    void boundaryIndependentReadyAndPriorPartialPhasesRefuseSameTransactionEvenAfterEarlyDrain(OwnedFailedGraceBoundary.Phase phase,boolean changeKey){
         var p=boundaryPrepared(phase);var sdk=new BoundarySdk(p,phase);var before=boundaryRows();
         var progress=new ArrayList<String>();
         sdk.afterCommit=writing->{if(!writing.equals("claim")&&!writing.equals("ack"))return;
@@ -328,11 +379,14 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             jdbc.execute("set constraints boundary_provider_committed,boundary_claim_committed,boundary_ack_committed,boundary_ready_committed immediate");
             assertThat(committedBoundary(p,phase)).isFalse();progress.add("drained");
             // Supported beforeCommit must flush, then reprove current source even after the deferred events ran.
-            graceTestAccounts.save(new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount(billing.id(),billing.key(),billing.provider(),
-                billing.mode(),billing.status(),billing.externalAccountId(),"boundary-negative-completion"));
+            graceTestAccounts.save(new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount(billing.id(),changeKey?"boundary-negative-key":billing.key(),billing.provider(),
+                billing.mode(),billing.status(),billing.externalAccountId(),changeKey?billing.credentialsRef():"boundary-negative-completion"));
         };
         sdk.queue();assertThatThrownBy(sdk::advance).isInstanceOf(PaymentApplicationException.class);
-        assertThat(progress).containsExactly("claim","ack","drained");assertGraceAdvanceSqlState(sdk.transactionFailure,"23514");
+        assertThat(progress).containsExactly("claim","ack","drained");
+        if(changeKey)assertThat(sdk.transactionFailure).isInstanceOf(IllegalStateException.class).hasMessage("OWNED_FAILED_GRACE_BOUNDARY_UNAVAILABLE");
+        else assertGraceAdvanceSqlState(sdk.transactionFailure,"23514");
+        assertThat(jdbc.queryForObject("select account_key from payment_accounts where id=?",String.class,billing.id().value())).isEqualTo(billing.key());
         assertThat(operations.findById(sdk.originalClaim.id())).contains(sdk.returnedAck.operation());
         assertThat(jdbc.queryForObject("select count(*) from stripe_billing_failed_grace_boundary_ready where operation_id=?",Long.class,sdk.originalClaim.id())).isZero();
         assertThat(jdbc.queryForObject("select count(*) from stripe_billing_failed_grace_boundary_cleanup where operation_id=? and invocation=? and claimant=? and deadline=?",
@@ -447,6 +501,16 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             public Instant instant(){return expired.get()?Instant.now().plusSeconds(90):Instant.now();}};
         var sdk=new BoundarySdk(p,phase,clock,null);var before=boundaryRows();sdk.queue();
         sdk.afterCommit=writing->{if(writing.equals("ack")){
+            var direct=new JdbcOwnedFailedGraceBoundaryStore(jdbc,entityManagerFactory);
+            var claim=sdk.originalClaim;var saved=boundaryRows();
+            for(boolean wrongRetry:List.of(false,true)){
+                var forged=new ProviderOperation(claim.id(),claim.accountId(),claim.externalAccountId(),claim.credentialsRef(),claim.kind(),
+                    claim.resourceId(),claim.operationKey(),claim.fingerprint(),claim.status(),wrongRetry?null:"clock_negativeBorrowed",
+                    claim.firstDispatchedAt(),wrongRetry?claim.retryBefore().plusSeconds(1):claim.retryBefore(),claim.leaseOwner(),claim.leaseExpiresAt(),claim.version());
+                assertThatThrownBy(()->transaction.requiresNew(()->{direct.uncertainInTransaction(sdk.context,forged,null,sdk.original,Instant.now());return true;}))
+                    .isInstanceOf(IllegalStateException.class).hasMessage("OWNED_FAILED_GRACE_BOUNDARY_UNAVAILABLE");
+                assertThat(boundaryRows()).isEqualTo(saved);
+            }
             assertThat(jdbc.update("update payment_accounts set credentials_ref='changed-after-boundary-ack' where id=?",billing.id().value())).isEqualTo(1);
             expired.set(true);throw new IllegalStateException("ambiguous after independent ACK commit");
         }};

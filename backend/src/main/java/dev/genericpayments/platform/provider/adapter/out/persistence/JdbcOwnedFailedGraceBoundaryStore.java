@@ -97,7 +97,11 @@ public final class JdbcOwnedFailedGraceBoundaryStore implements OwnedFailedGrace
     }
     @Override public void uncertainInTransaction(BoundaryContext c,ProviderOperation originalClaim,BoundaryAck suppliedAck,InvocationBudget b,Instant now){
         var writer=writingCaller();limits(2000,true);if(c==null||b==null||now==null)throw denied();immutable(c);owned(c,originalClaim);
-        if(originalClaim.status()!=Status.DISPATCHING||originalClaim.version()!=1||originalClaim.firstDispatchedAt()==null||originalClaim.leaseOwner()==null||originalClaim.leaseExpiresAt()==null)throw denied();
+        var dispatched=originalClaim.firstDispatchedAt();
+        if(originalClaim.status()!=Status.DISPATCHING||originalClaim.version()!=1||originalClaim.providerReference()!=null
+                ||dispatched==null||!dispatched.equals(micro(dispatched))||!dispatched.plusSeconds(23*3600).equals(originalClaim.retryBefore())
+                ||!OwnedFailedGraceAdvance.validClaimant(originalClaim.leaseOwner())
+                ||!dispatched.plusSeconds(60).equals(originalClaim.leaseExpiresAt()))throw denied();
         jdbc.queryForList("select lock_owned_grace_boundary(?,?,true)",c.original().preparation().id(),c.phase().number());var current=lock(c);
         if(!current.id().equals(originalClaim.id())||!original(c,current,b,false))return;
         if(!Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from stripe_billing_failed_grace_boundary_claims where preparation_id=? and operation_id=? and claimant=? and claimed_at=? and deadline=?)",Boolean.class,c.original().preparation().id(),originalClaim.id(),originalClaim.leaseOwner(),stamp(originalClaim.firstDispatchedAt()),stamp(originalClaim.leaseExpiresAt()))))return;
@@ -159,12 +163,15 @@ public final class JdbcOwnedFailedGraceBoundaryStore implements OwnedFailedGrace
                     left join stripe_billing_failed_grace_boundary_ready r on r.operation_id=q.operation_id
                     where q.preparation_id=? and q.operation_id=? and q.invocation=? and q.entered_at=? and q.deadline_at=?
                       and owned_grace_boundary_claim_shape(q,o)
+                      and exists(select 1 from payment_accounts account
+                        where account.id=o.payment_account_id and account.id=? and account.account_key=?)
                       and case cast(? as text)
                         when 'claim' then q.producer_xid=pg_current_xact_id() and o.status='DISPATCHING' and o.version=1
                         when 'ack' then a.producer_xid=pg_current_xact_id() and o.status='ACKNOWLEDGED' and o.version=2
                         when 'ready' then r.producer_xid=pg_current_xact_id() and o.status='ACKNOWLEDGED' and o.version=2
                         else false end
-                    """,c.original().preparation().id(),operation,b.invocation(),stamp(b.enteredAt()),stamp(b.deadlineAt()),phase);
+                    """,c.original().preparation().id(),operation,b.invocation(),stamp(b.enteredAt()),stamp(b.deadlineAt()),
+                    c.original().account().id().value(),c.original().account().key(),phase);
                 require(proof.size()==1);
                 // Check again after the final SQL round trip, without starting another
                 // positive statement between this original-budget check and completion.

@@ -30,7 +30,7 @@ class OwnedFailedGraceBoundaryStoreTransactionTest {
                     @Override public List<Map<String,Object>> queryForList(String sql,Object... args){
                         if(args.length==2){assertThat((long)args[0]).isBetween(1L,30000L);assertThat(args[1]).isEqualTo(false);events.add("limit");return List.of();}
                         assertThat(args).containsExactly(c.original().preparation().id(),claim.id(),b.invocation(),Timestamp.from(b.enteredAt()),
-                            Timestamp.from(b.deadlineAt()),"claim");events.add("proof");
+                            Timestamp.from(b.deadlineAt()),c.original().account().id().value(),c.original().account().key(),"claim");events.add("proof");
                         return outcome.equals("missing")?List.of():outcome.equals("ambiguous")?List.of(Map.of(),Map.of()):List.of(Map.of());
                     }
                 };

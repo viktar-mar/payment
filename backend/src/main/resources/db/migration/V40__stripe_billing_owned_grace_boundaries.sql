@@ -70,7 +70,13 @@ create function owned_grace_original_committed(preparation uuid, utc timestamptz
  join stripe_billing_failed_grace_claims q on q.preparation_id=p.id
  join stripe_billing_failed_grace_acks ack on ack.preparation_id=p.id
  join stripe_billing_failed_grace_ready ready on ready.preparation_id=p.id
- where p.id=$1 and not exists(select 1 from stripe_billing_failed_grace_cleanup where preparation_id=p.id)
+ where p.id=$1
+ and not exists(select 1 from provider_operations sibling
+  where sibling.kind='OWNED_GRACE_CLOCK_ADVANCE' and sibling.resource_id=p.id and sibling.id<>o.id)
+ and not exists(select 1 from stripe_billing_failed_grace_ready sibling
+  where (sibling.preparation_id=p.id or sibling.admission_id=d.id) and sibling.id<>ready.id)
+ and not exists(select 1 from stripe_billing_failed_grace_cleanup cleanup
+  where cleanup.preparation_id=p.id or cleanup.operation_id=o.id)
  and owned_failed_grace_owns(p.id,o)
  and exists(select 1 from stripe_billing_failed_renewals current_d
   join stripe_billing_first_renewals current_a on current_a.id=current_d.first_renewal_admission
@@ -206,6 +212,7 @@ create function owned_grace_boundary_receipt(p uuid,h integer,utc timestamptz,re
  join stripe_billing_failed_grace_boundary_ready r on (r.preparation_id,r.admission_id,r.phase,r.operation_id,r.invocation)
  =(q.preparation_id,q.admission_id,q.phase,q.operation_id,q.invocation)
  where q.preparation_id=$1 and q.phase=$2 and owned_grace_boundary_owns($1,$2,o)
+ and ($2<>2 or r.id<>q.original_grace_ready_id)
  -- Keep conflicting siblings discovered by resource, admission, operation or invocation.
  and not exists(select 1 from provider_operations other where other.kind=e.kind and other.resource_id=$1 and other.id<>o.id)
  and not exists(select 1 from stripe_billing_failed_grace_boundary_claims x
@@ -393,7 +400,8 @@ begin
  if new.producer_xid<>pg_current_xact_id() or ack.preparation_id is null or ack.producer_xid=pg_current_xact_id() or q.producer_xid=pg_current_xact_id()
   or not owned_grace_boundary_ack_shape(q,ack,step,db_at) or not owned_grace_predecessor_committed(p.id,new.phase,clock_timestamp(),pg_current_xact_id())
   or row(new.preparation_id,new.operation_id,new.invocation) is distinct from row(ack.preparation_id,ack.operation_id,ack.invocation)
-  or new.admission_id<>p.admission_id or step.status<>'ACKNOWLEDGED' or step.version<>2 or step.provider_reference is distinct from new.reference
+  or new.admission_id<>p.admission_id or (new.phase=2 and new.id=q.original_grace_ready_id)
+  or step.status<>'ACKNOWLEDGED' or step.version<>2 or step.provider_reference is distinct from new.reference
   or row(new.reference,new.object_type,new.livemode,new.name,new.provider_created,new.provider_deletes_after)
    is distinct from row(ack.reference,ack.object_type,ack.livemode,ack.name,ack.provider_created,ack.provider_deletes_after)
   or new.status<>'ready' or new.frozen_time<>(p.target+new.phase-1) or new.advancing_target is not null and new.advancing_target<>(p.target+new.phase-1)
