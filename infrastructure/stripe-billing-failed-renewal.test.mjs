@@ -1,19 +1,25 @@
 import test,{before,after} from 'node:test';
 import assert from 'node:assert/strict';
-import {opts,scope,initial,prepared,confirmed,confirmRequest,methods,routes,responses,id,E,G,iso} from './fixtures/failed-renewal-descriptors.mjs';
+import {opts,scope,initial,prepared,confirmed,confirmRequest,methods,routes,responses,id,F,E,G,iso} from './fixtures/failed-renewal-descriptors.mjs';
+import {data,inspect} from './fixtures/failed-renewal-evidence-rows.mjs';
+import * as initialEvidence from './stripe-billing-first-payment-evidence.mjs';
 import * as owners from './stripe-billing-first-payment.mjs';
 import * as clients from './stripe-billing-first-payment-runtime.mjs';
 const saved=globalThis.fetch;let escapes=0;
 before(()=>{globalThis.fetch=()=>{escapes++;throw Error('network blocked');};});after(()=>{globalThis.fetch=saved;assert.equal(escapes,0);});
 const limits=()=>({deadline:Date.now()+5000});
 const proof=()=>({ownedVerified:true,cashVerified:true,journalVerified:true,signedCallbacksVerified:true});
+const initialProof=()=>({...proof(),anchor:{
+ initial_bill_id:id(11),initial_payment_id:id(12),initial_invoice_id:'in_original',
+ initial_allocation_id:'inpay_original',initial_payment_intent_id:'pi_original'
+}});
 function harness(){
  const calls=[],mark=name=>async()=>{calls.push(name);return true;},vs=responses();
  const fixture={resources:scope,provision:mark('fixture'),acknowledgeCustomer:mark('customer'),beforeDispatch:mark('dispatch'),acknowledge:mark('initial-ack'),beforeDeclineArm:mark('arm-dispatch'),acknowledgeDeclineArm:mark('arm-ack'),close:mark('fixture-close')};
  const bootstrap={resources:()=>({cliDirectory:'/inert'}),prepare:mark('prepare'),start:mark('start'),stop:mark('stop'),verifyForwardTarget(){},persistWebhookSecret(){}};
  const cli={validateBinding:mark('binding'),startListener:mark('listener'),stopListener:mark('listener-stop'),assertBillingListener:mark('listen-check')};
  const runtime={ready:mark('ready'),prepare:async()=>prepared(),confirm:async()=>confirmed(),observe:async()=>{calls.push('observe');return initial();},...Object.fromEntries(methods.map((name,i)=>[name,async()=>{calls.push(name);return vs[i];}])),close:mark('runtime-close')};
- const dependencies={preflight:mark('preflight'),createBootstrap:async()=>bootstrap,createCli:async()=>cli,createFixture:async()=>fixture,createRuntime:()=>runtime,login:mark('login'),pause:mark('pause'),prove:async()=>{calls.push('initial-proof');return proof();},proveFailedRenewal:async()=>{calls.push('final-proof');return proof();}};
+ const dependencies={preflight:mark('preflight'),createBootstrap:async()=>bootstrap,createCli:async()=>cli,createFixture:async()=>fixture,createRuntime:()=>runtime,login:mark('login'),pause:mark('pause'),prove:async()=>{calls.push('initial-proof');return initialProof();},proveFailedRenewal:async()=>{calls.push('final-proof');return proof();}};
  const journey={initial:async(p,l)=>{await p.prepare({token:'inert',origin:scope().endpoints.demo},'sdk-create',l);await p.confirm(confirmRequest(),l);},method:async(p,l)=>{
   assert.deepEqual(Object.keys(p).sort(),['confirmMethod','prepareMethod','selectMethod']);
   const {subscriptionId,operationId,action}=await p.prepareMethod(l),session=await p.selectMethod(l),permit=await p.confirmMethod(l);
@@ -23,6 +29,97 @@ function harness(){
  return {journey,calls,vs,fixture,bootstrap,cli,runtime,dependencies};
 }
 const owner=h=>owners.createOwnedBillingFailedRenewal(opts(),h.dependencies);
+function useIndependentInitialProof(h){
+ const callbacks=data().row.callbacks.slice(0,2);
+ const row={callbacks,owner_run:id(1),clock_reference:'clock_original',frozen_time:F,
+  receipt_period_start:F,receipt_period_end:E,period_start:F,period_end:E,
+  customer_reference:'cus_original',subscription_reference:'sub_original',product_reference:'prod_original',price_reference:'price_original',
+  payment_id:id(12),billing_record_id:id(11),invoice_reference:'in_original',allocation_reference:'inpay_original',intent_reference:'pi_original',
+  proof:{cash:true,journal:true,original:true,owned:true}};
+ h.bootstrap.withDatabaseCredentials=cb=>cb({});
+ h.fixture.inspectCallbacks=async()=>{h.calls.push('initial-receiver');return inspect(callbacks);};
+ const connect=()=>({
+  begin:async(mode,cb)=>{assert.equal(mode,'read only');return cb({unsafe:async query=>{
+   if(query.startsWith('set local'))return [];
+   h.calls.push('initial-select');return [row];
+  }});},
+  end:async()=>{}
+ });
+ h.dependencies.prove=async(options,l)=>{
+  // Exercise the current four-flag reader on the baseline so the test reaches the arm gate there.
+  const read=initialEvidence.proveBillingFailedRenewalInitialEvidence??initialEvidence.proveBillingFirstPaymentEvidence;
+  const verified=await read(options,l,{connect});
+  h.calls.push('initial-proof');return verified;
+ };
+}
+for(const [field,substitute] of Object.entries({
+ initial_bill_id:id(77),initial_payment_id:id(78),initial_invoice_id:'in_other',
+ initial_allocation_id:'inpay_other',initial_payment_intent_id:'pi_other'
+}))test('boundary cannot substitute '+field+' from the independently verified initial payment',async()=>{
+ const h=harness();
+ useIndependentInitialProof(h);
+ for(const v of h.vs)v[field]=substitute;
+ const o=await owner(h);
+ await assert.rejects(o.run(h.journey,limits()));
+ assert.deepEqual(h.calls.filter(v=>['initial-select','initial-receiver','initial-proof','boundary'].includes(v)),
+  ['initial-select','initial-receiver','initial-proof','boundary']);
+ assert.equal(h.calls.includes('arm-dispatch'),false);
+ assert.equal(h.calls.includes('armDecline'),false);
+ assert.equal((await o.close()).failedRenewalAccepted,false);
+});
+test('four legacy proof flags alone cannot authorize failed renewal',async()=>{
+ const h=harness();
+ h.dependencies.prove=async()=>proof();
+ const o=await owner(h);
+ await assert.rejects(o.run(h.journey,limits()));
+ assert.equal(h.calls.includes('arm-dispatch'),false);
+ assert.equal(h.calls.includes('armDecline'),false);
+});
+for(const pending of ['invocation','listener','ledger'])test('owner detaches session before '+pending+' completes',async()=>{
+ const h=harness(),session={token:'original',origin:scope().endpoints.demo},transport=client();
+ const change=async()=>{session.token='substituted';session.origin='https://other.invalid';return true;};
+ if(pending==='listener')h.cli.assertBillingListener=change;
+ if(pending==='ledger')h.fixture.beforeDispatch=change;
+ h.runtime.ready=transport.runtime.ready;
+ h.runtime.prepare=transport.runtime.prepare;
+ h.journey.initial=async(p,l)=>{
+  const sent=p.prepare(session,'sdk-create',l);
+  if(pending==='invocation')await change();
+  await sent;
+  await p.confirm(confirmRequest(),l);
+ };
+ const o=await owner(h);
+ await o.run(h.journey,limits());
+ assert.equal(transport.calls.length,2);
+ assert.equal(new URL(transport.calls[1][0]).pathname,'/initial-payment/prepare');
+ assert.deepEqual(JSON.parse(transport.calls[1][1].body),{
+  run_id:id(1),source_sha:opts().expectedSource,account_id:id(2),site_id:id(3),
+  customer_id:id(4),price_id:id(5),origin:scope().endpoints.demo,create_key:'sdk-create',customer_token:'original'
+ });
+});
+test('owner rejects session accessors before listener, ledger or transport without invoking them',async()=>{
+ const h=harness(),session={origin:scope().endpoints.demo};let reads=0,sends=0;
+ Object.defineProperty(session,'token',{enumerable:true,get(){reads++;return 'inert';}});
+ h.journey.initial=(p,l)=>p.prepare(session,'sdk-create',l);
+ h.runtime.prepare=async()=>{sends++;return prepared();};
+ const o=await owner(h);
+ await assert.rejects(o.run(h.journey,limits()));
+ assert.equal(reads,0);assert.equal(sends,0);
+ assert.equal(h.calls.includes('listen-check'),false);assert.equal(h.calls.includes('dispatch'),false);
+});
+test('owner detaches initial confirmation at invocation',async()=>{
+ const h=harness(),request=confirmRequest(),bodies=[];
+ h.runtime.confirm=async body=>{bodies.push({...body});return confirmed();};
+ h.journey.initial=async(p,l)=>{
+  await p.prepare({token:'inert',origin:scope().endpoints.demo},'sdk-create',l);
+  const sent=p.confirm(request,l);
+  request.confirmation_token='ctoken_substituted';request.idempotency_key='sdk-substituted';
+  await sent;
+ };
+ const o=await owner(h);
+ await o.run(h.journey,limits());
+ assert.deepEqual(bodies,[confirmRequest()]);
+});
 test('same held journey, original proof before E, ledger before fixed arm, genuine publication before proof and definite close',async()=>{
  const h=harness(),o=await owner(h),r=await o.run(h.journey,limits());
  assert.deepEqual(h.calls.slice(h.calls.indexOf('observe')),['observe','initial-proof','boundary','arm-dispatch','armDecline','arm-ack',...methods.slice(2,9),'manual-confirm',...methods.slice(9),'final-proof','browser-close','runtime-close','listener-stop','stop','fixture-close']);
@@ -62,6 +159,34 @@ function client(rewrite){
  return {runtime,calls};
 }
 async function settle(r,l){await r.ready(l);await r.prepare(scope(),l);await r.confirm(confirmRequest(),l);await r.observe(l);}
+test('failed client sends the original selected confirmation body after the caller mutates every field',async()=>{
+ const {runtime:r,calls}=client(),l=limits(),original=confirmRequest();
+ await r.ready(l);await r.prepare(scope(),l);
+ const sent=r.confirm(original,l);
+ Object.assign(original,{attempt_id:id(77),capability:'foreign',confirmation_token:'ctoken_other',idempotency_key:'sdk-other'});
+ await sent;
+ assert.equal(calls.length,3);
+ assert.equal(new URL(calls[2][0]).pathname,'/initial-payment/confirm');
+ assert.deepEqual(JSON.parse(calls[2][1].body),confirmRequest());
+});
+for(const [name,change] of [
+ ['wrong attempt',p=>{p.attempt_id=id(77);}],
+ ['wrong capability',p=>{p.capability='foreign';}],
+ ['extra property',p=>{p.target='foreign';}],
+ ['hidden extra',p=>Object.defineProperty(p,'extra',{value:'foreign'})],
+ ['custom prototype',p=>Object.setPrototypeOf(p,{extra:true})],
+ ['attempt accessor',(p,touched)=>Object.defineProperty(p,'attempt_id',{get(){touched();return id(9);}})],
+ ['token accessor',(p,touched)=>Object.defineProperty(p,'confirmation_token',{get(){touched();return 'ctoken_other';}})],
+ ['toJSON',(p,touched)=>{p.toJSON=()=>{touched();return confirmRequest();};}]
+])test('failed client consumes '+name+' without dispatch or invoking caller code',async()=>{
+ const {runtime:r,calls}=client(),l=limits(),original=confirmRequest();let touches=0;
+ await r.ready(l);await r.prepare(scope(),l);
+ change(original,()=>{touches++;});
+ await assert.rejects(r.confirm(original,l));
+ await assert.rejects(r.confirm(confirmRequest(),l));
+ assert.equal(calls.length,2);
+ assert.equal(touches,0);
+});
 test('private client exposes only fixed operations, posts exact empty bodies and consumes once',async()=>{
  const {runtime:r,calls}=client(),l=limits();assert.deepEqual(Object.keys(r).sort(),['ready','prepare','confirm','observe','close',...methods].sort());
  await settle(r,l);for(const m of methods)await r[m](l);assert.deepEqual(calls.slice(4).map(([u,v])=>[new URL(u).pathname,v.method,v.body]),routes.map(s=>['/failed-renewal/'+s,'POST','{}']));await assert.rejects(r.observeRecovery(l));assert.equal(calls.length,16);

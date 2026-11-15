@@ -143,10 +143,12 @@ select g.owner_run,g.stored_source source_sha,g.initial_frozen_time frozen_time,
  (select jsonb_agg(jsonb_build_object('id',j.id,'type',j.callback_type,'kind',j.kind,'payload',j.payload,
    'delivered',case
      when j.endpoint_url<>'http://callback-receiver:8080/callback' then null
+     when exists(select 1 from outbox_retry_requests r where r.outbox_event_id=j.id) then null
      when j.status='PENDING' and j.attempt_count in (0,1)
       and not exists(select 1 from outbox_deliveries d where d.outbox_event_id=j.id) then false
      when j.status='DELIVERED' and j.attempt_count=1
-      and (select count(*)=1 and count(*) filter(where d.status='SUCCEEDED' and d.http_status=204)=1
+      and (select count(*)=1 and count(*) filter(where d.delivery_mode='AUTOMATIC' and d.attempt_number=1
+           and d.status='SUCCEEDED' and d.http_status=204)=1
            from outbox_deliveries d where d.outbox_event_id=j.id) then true
      else null end) order by j.id) from journal j) callbacks
 from graph g limit 2

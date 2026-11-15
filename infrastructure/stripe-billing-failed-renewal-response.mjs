@@ -35,6 +35,19 @@ export function instantNanos(v){
 }
 const seconds=v=>{const ns=instantNanos(v);need(ns%1000000000n===0n);return Number(ns/1000000000n);};
 const opaque=v=>typeof v==='string'&&v.length>0&&v.length<=8192&&!/[\u0000-\u001f\u007f]/.test(v);
+/** Copy caller-controlled request fields before listener checks, ledger writes or transport. */
+export function snapshotInitialSession(raw){
+ const session=exactRecord(raw,['token','origin']);
+ need(opaque(session.token)&&opaque(session.origin));
+ return Object.freeze(session);
+}
+export function snapshotInitialConfirmation(raw,selected){
+ need(raw&&Object.getPrototypeOf(raw)===Object.prototype);
+ const request=exactRecord(raw,['attempt_id','capability','confirmation_token','idempotency_key']);
+ need(Object.values(request).every(opaque)&&selected&&request.attempt_id===selected.attemptId
+  &&request.capability===selected.capability&&request.idempotency_key!==selected.createKey);
+ return Object.freeze(request);
+}
 /** The failed owner additionally validates injected initial ports before retaining a session. */
 export function checkedInitialResponse(raw,route){
  const extras={prepare:['action','session'],confirm:['protocol','attempt_id','state','retry_allowed','successor_attempt_id','next_action_allowed','expires_at']};

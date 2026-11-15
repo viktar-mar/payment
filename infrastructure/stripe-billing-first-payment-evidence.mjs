@@ -15,8 +15,15 @@ export function validateBillingFirstPaymentEvidence(scope,row,inspection,configu
  need(p.state==='ACTIVE'&&p.access_allowed===true&&p.billing_record_id===row.billing_record_id&&Date.parse(p.occurred_at)/1000===configuration.frozenTime&&Date.parse(p.access_valid_until)/1000===configuration.frozenTime+300);
  return Object.freeze({ownedVerified:true,cashVerified:proof.cashVerified,journalVerified:proof.journalVerified,signedCallbacksVerified:proof.signedCallbacksVerified});
 }
+export function proveBillingFirstPaymentEvidence(options,limits,dependencies={}){
+ return readInitialEvidence(options,limits,dependencies,false);
+}
+/** Private pre-arm evidence. Its verified identities stay inside the failed owner. */
+export function proveBillingFailedRenewalInitialEvidence(options,limits,dependencies={}){
+ return readInitialEvidence(options,limits,dependencies,true);
+}
 /** Credentials remain in one bounded read-only callback, ending before receiver inspection. */
-export async function proveBillingFirstPaymentEvidence({configuration,bootstrap,fixture,settlement},limits,dependencies={}){
+async function readInitialEvidence({configuration,bootstrap,fixture,settlement},limits,dependencies,retainAnchor){
  const scope=fixture.resources();need(scope.runId===configuration.runId&&scope.expectedSource===configuration.expectedSource);
  for(const k of ['accountId','siteId','customerId','subscriptionId','operationId','attemptId','productId','priceId'])need(billingUuid(scope[k]));
  need(/^[a-f0-9]{64}$/.test(scope.createKeyHash)&&/^[a-f0-9]{64}$/.test(scope.confirmKeyHash));
@@ -26,5 +33,14 @@ export async function proveBillingFirstPaymentEvidence({configuration,bootstrap,
   try{sql=connect({...credentials,max:1,idle_timeout:1,connect_timeout:5,prepare:false,onnotice:()=>{},debug:false});const abort=()=>{void sql.end({timeout:0}).catch(()=>{});};limits.signal?.addEventListener('abort',abort,{once:true});
    try{row=await billingBounded(limits,async l=>{for(;;){const rows=await sql.begin('read only',async tx=>{await tx.unsafe("set local statement_timeout='5000'");return tx.unsafe(query,[scope.accountId,scope.siteId,scope.customerId,scope.subscriptionId,scope.operationId,scope.attemptId,scope.productId,scope.priceId,scope.createKeyHash,scope.confirmKeyHash,scope.endpoints.demo,configuration.runId,configuration.frozenTime]);});billingCheck(l);need(rows.length===1);const result=rows[0];need(['cash','journal','original','owned'].every(k=>result.proof?.[k]===true));need(Array.isArray(result.callbacks)&&result.callbacks.length===2);if(result.callbacks.every(c=>c.delivered===true))return result;await billingBounded(l,()=>new Promise(r=>setTimeout(r,250)),1000);}},90000);}finally{limits.signal?.removeEventListener('abort',abort);}billingCheck(limits);return true;
   }finally{if(sql)await billingBounded({deadline:Date.now()+5000},()=>sql.end({timeout:0}),5000);}
- },limits)===true);billingCheck(limits);need(row);const inspection=await fixture.inspectCallbacks(limits);billingCheck(limits);return validateBillingFirstPaymentEvidence(scope,row,inspection,configuration,settlement);
+ },limits)===true);billingCheck(limits);need(row);const inspection=await fixture.inspectCallbacks(limits);billingCheck(limits);
+ const proof=validateBillingFirstPaymentEvidence(scope,row,inspection,configuration,settlement);
+ if(!retainAnchor)return proof;
+ need(billingUuid(row.billing_record_id)&&billingUuid(row.payment_id));
+ const anchor=Object.freeze({
+  initial_bill_id:row.billing_record_id,initial_payment_id:row.payment_id,
+  initial_invoice_id:row.invoice_reference,initial_allocation_id:row.allocation_reference,
+  initial_payment_intent_id:row.intent_reference
+ });
+ return Object.freeze({...proof,anchor});
 }

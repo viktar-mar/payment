@@ -1,8 +1,42 @@
-import test from 'node:test';import assert from 'node:assert/strict';import {createHash,createHmac} from 'node:crypto';import {Readable} from 'node:stream';import {EventEmitter} from 'node:events';import {createReceiver} from './callback-receiver.mjs';
+import test,{before,after} from 'node:test';import assert from 'node:assert/strict';import {createHash,createHmac} from 'node:crypto';import {Readable} from 'node:stream';import {EventEmitter} from 'node:events';import {createReceiver} from './callback-receiver.mjs';
+const savedFetch=globalThis.fetch;let escaped=0;
+before(()=>{globalThis.fetch=()=>{escaped++;throw Error('network blocked');};});
+after(()=>{globalThis.fetch=savedFetch;assert.equal(escaped,0);});
 const api=await import('./stripe-billing-first-payment-evidence.mjs').catch(()=>({}));
 const id=n=>`${String(n).padStart(8,'0')}-2222-4333-8444-555555555555`;
 const scope={runId:id(1),expectedSource:'e'.repeat(40),accountId:id(2),siteId:id(3),customerId:id(4),subscriptionId:id(5),operationId:id(6),attemptId:id(7),priceId:id(8),productId:id(9),createKeyHash:'a'.repeat(64),confirmKeyHash:'b'.repeat(64),endpoints:{demo:'http://127.0.0.1:18081'}};
 const canonical=p=>JSON.stringify(Object.fromEntries(Object.keys(p).sort().map(k=>[k,p[k]])));
+test('private failed anchor uses the same initial read and callback proof while legacy callers receive only their flags',async()=>{
+ const f=fixture();
+ const flags={ownedVerified:true,cashVerified:true,journalVerified:true,signedCallbacksVerified:true};
+ assert.deepEqual(api.validateBillingFirstPaymentEvidence(scope,f.row,f.inspection,f.configuration,f.settlement),flags);
+ const queries=[],calls=[];
+ const options={
+  configuration:f.configuration,settlement:f.settlement,
+  bootstrap:{withDatabaseCredentials:async cb=>{calls.push('enter');try{return await cb({});}finally{calls.push('leave');}}},
+  fixture:{resources:()=>scope,inspectCallbacks:async()=>{calls.push('receiver');return f.inspection;}}
+ };
+ const connect=()=>({
+  begin:async(mode,cb)=>{assert.equal(mode,'read only');return cb({unsafe:async(q,args)=>{
+   if(q.startsWith('set local'))return [];
+   queries.push([q,args]);calls.push('select');return [f.row];
+  }});},
+  end:async()=>{calls.push('close');}
+ });
+ const limits=()=>({deadline:Date.now()+5000});
+ assert.deepEqual(await api.proveBillingFirstPaymentEvidence(options,limits(),{connect}),flags);
+ assert.equal(typeof api.proveBillingFailedRenewalInitialEvidence,'function');
+ const proved=await api.proveBillingFailedRenewalInitialEvidence(options,limits(),{connect});
+ assert.deepEqual(proved,{...flags,anchor:{
+  initial_bill_id:f.row.billing_record_id,initial_payment_id:f.row.payment_id,
+  initial_invoice_id:f.row.invoice_reference,initial_allocation_id:f.row.allocation_reference,
+  initial_payment_intent_id:f.row.intent_reference
+ }});
+ assert.deepEqual(calls,Array(2).fill(['enter','select','close','leave','receiver']).flat());
+ assert.equal(queries.length,2);assert.deepEqual(queries[1],queries[0]);
+ f.inspection.events[0].sha256='0'.repeat(64);
+ await assert.rejects(api.proveBillingFailedRenewalInitialEvidence(options,limits(),{connect}));
+});
 function fixture(){const common={site_id:scope.siteId,customer_id:scope.customerId,subscription_id:scope.subscriptionId,product_id:scope.productId,occurred_at:'2026-10-29T12:00:00Z'};const payment={...common,schema_version:3,event_id:id(12),event_type:'payment.succeeded',payment_id:id(10),billing_record_id:id(11),external_order_id:null,payment_status:'SUCCEEDED',amount_minor:2000,currency:'EUR',billing_kind:'INITIAL',price_id:scope.priceId,price_version:1,period_start:'2026-10-29T12:00:00Z',period_end:'2026-11-29T12:00:00Z'};const lifecycle={...common,schema_version:4,event_id:id(13),event_type:'subscription.updated',revision:3,state:'ACTIVE',access_allowed:true,access_valid_until:'2026-10-29T12:05:00Z',billing_record_id:id(11),payment_id:null};const row={owner_run:scope.runId,clock_reference:'clock_original',frozen_time:1793275200,receipt_period_start:1793275200,receipt_period_end:1795953600,customer_reference:'cus_original',subscription_reference:'sub_original',product_reference:'prod_original',price_reference:'price_original',invoice_reference:'in_original',allocation_reference:'inpay_original',intent_reference:'pi_original',period_start:1793275200,period_end:1795953600,payment_id:id(10),billing_record_id:id(11),proof:{cash:true,journal:true,original:true,owned:true},callbacks:[payment,lifecycle].map(payload=>({id:payload.event_id,type:payload.event_type,payload,delivered:true}))};const inspection={count:2,duplicates:0,events:row.callbacks.map(e=>({event_id:e.id,event_type:e.type,count:1,sha256:createHash('sha256').update(canonical(e.payload)).digest('hex')}))};const settlement={period_start:payment.period_start,paid_through:payment.period_end,access_evaluated_at:common.occurred_at,access_valid_until:lifecycle.access_valid_until};return {row,inspection,settlement,configuration:{runId:scope.runId,expectedSource:scope.expectedSource,frozenTime:row.frozen_time}};}
 test('owned proof accepts exact initial receipt cash and signed callbacks without inbound webhook evidence',()=>{assert.equal(typeof api.validateBillingFirstPaymentEvidence,'function');const f=fixture(),result=api.validateBillingFirstPaymentEvidence(scope,f.row,f.inspection,f.configuration,f.settlement);assert.equal(result.ownedVerified,true);assert.equal(result.signedCallbacksVerified,true);assert.equal(result.graph,undefined);assert.ok(!JSON.stringify(result).includes('reference'));});
 for(const change of [f=>f.row.proof.owned=false,f=>f.row.owner_run=id(90),f=>f.row.frozen_time++,f=>f.row.receipt_period_end++,f=>f.settlement.paid_through=f.settlement.access_valid_until,f=>f.row.callbacks[1].payload.access_valid_until=f.settlement.paid_through,f=>f.inspection.duplicates++,f=>f.inspection.events[0].sha256='0'.repeat(64),f=>f.row.proof.cash=false])test('owned evidence rejects mismatched authority receipt access or delivery',()=>{const f=fixture();change(f);assert.throws(()=>api.validateBillingFirstPaymentEvidence(scope,f.row,f.inspection,f.configuration,f.settlement));});

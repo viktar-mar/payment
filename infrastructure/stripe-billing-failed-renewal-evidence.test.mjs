@@ -1,24 +1,50 @@
-import test,{before,after} from 'node:test';import assert from 'node:assert/strict';import {createHash} from 'node:crypto';
-import {opts,scope,responses,id,F,E,T,N,G,iso} from './fixtures/failed-renewal-descriptors.mjs';
+import test,{before,after} from 'node:test';import assert from 'node:assert/strict';
+import {opts,scope,id,T,G,iso} from './fixtures/failed-renewal-descriptors.mjs';
+import {data,flags,inspect} from './fixtures/failed-renewal-evidence-rows.mjs';
 import {validateBillingFailedRenewalEvidence as validate,proveBillingFailedRenewalEvidence as prove} from './stripe-billing-failed-renewal-evidence.mjs';
 import {createHmac} from 'node:crypto';
+import {readFile} from 'node:fs/promises';
 import {Readable} from 'node:stream';
 import {EventEmitter} from 'node:events';
 import {createReceiver} from './callback-receiver.mjs';
 const saved=globalThis.fetch;let escaped=0;before(()=>{globalThis.fetch=()=>{escaped++;throw Error('blocked');};});after(()=>{globalThis.fetch=saved;assert.equal(escaped,0);});
-const flags=['owned','original','lineage','cash','operations','journal'],result={ownedVerified:true,cashVerified:true,journalVerified:true,signedCallbacksVerified:true};
-function data(){
- const settlement=responses().at(-1),s=scope();
- const common={site_id:s.siteId,customer_id:s.customerId,subscription_id:s.subscriptionId,product_id:s.productId};
- const event=(n,type,kind,fields)=>{const payload={...common,event_id:id(n),event_type:type,...fields};return {id:id(n),type,kind,delivered:true,payload};};
- const payment=(n,kind,p,b,start,end)=>event(n,'payment.succeeded','PAYMENT_SUCCEEDED',{schema_version:3,occurred_at:iso(start),payment_id:id(p),billing_record_id:id(b),external_order_id:null,payment_status:'SUCCEEDED',amount_minor:2000,currency:'EUR',billing_kind:kind,price_id:s.priceId,price_version:1,period_start:iso(start),period_end:iso(end)});
- const lifecycle=(n,kind,b,at,revision,state)=>event(n,'subscription.updated',kind,{schema_version:4,occurred_at:iso(at),revision,state,access_allowed:true,access_valid_until:iso(at+300),billing_record_id:id(b),payment_id:null});
- const callbacks=[payment(101,'INITIAL',12,11,F,E),lifecycle(102,'PERIOD_PAID',11,F,2,'ACTIVE'),lifecycle(103,'RENEWAL_FAILED',23,T,3,'PAST_DUE'),payment(104,'RENEWAL',42,23,E,N),lifecycle(105,'PERIOD_PAID',23,T,4,'ACTIVE')];
- const lineage=Object.fromEntries(Object.entries(settlement).filter(([k])=>!['phase','code','run_id','account_id','site_id','customer_id','price_id','operation_id','subscription_id','source_sha','original_frozen_time'].includes(k)&&!k.startsWith('access_')&&!k.startsWith('arm_')));
- return {settlement,row:{owner_run:s.runId,source_sha:s.expectedSource,frozen_time:F,lineage,callbacks,proof:Object.fromEntries(flags.map(k=>[k,true]))}};
-}
-const inspect=cs=>({count:cs.length,duplicates:0,events:cs.map(({id:event_id,type:event_type,payload})=>({event_id,event_type,count:1,sha256:createHash('sha256').update(JSON.stringify(Object.fromEntries(Object.keys(payload).sort().map(k=>[k,payload[k]])))).digest('hex')}))});
+const result={ownedVerified:true,cashVerified:true,journalVerified:true,signedCallbacksVerified:true};
 const verify=(f,i=inspect(f.row.callbacks))=>validate(scope(),f.row,i,opts(),f.settlement);
+test('shipped callback projection rejects any scoped retry and identifies the first automatic 204',async()=>{
+ const sql=await readFile(new URL('./stripe-billing-failed-renewal-proof.sql',import.meta.url),'utf8');
+ const delivery=sql.slice(sql.indexOf("'delivered',case")).replace(/\s+/g,' ');
+ // The guard covers both pending and delivered branches and every retry status, including PENDING.
+ assert.match(delivery,/when exists\s*\(\s*select 1 from outbox_retry_requests (\w+) where \1\.outbox_event_id\s*=\s*j\.id\s*\)\s*then null.*when j\.status='PENDING'/i);
+ const terminal=delivery.slice(delivery.indexOf("when j.status='DELIVERED'"),delivery.indexOf('then true'));
+ assert.match(terminal,/d\.attempt_number\s*=\s*1\b/);
+ assert.match(terminal,/d\.delivery_mode\s*=\s*'AUTOMATIC'/);
+ assert.match(terminal,/d\.status\s*=\s*'SUCCEEDED'/);
+ assert.match(terminal,/d\.http_status\s*=\s*204\b/);
+});
+function proofWithDeliveryRows(f,markers){
+ const calls=[];
+ const connect=()=>({
+  begin:async(mode,cb)=>{assert.equal(mode,'read only');return cb({unsafe:async q=>{
+   if(q.startsWith('set local'))return [];
+   calls.push('select');assert.ok(markers.length,'unexpected proof poll');
+   const row=structuredClone(f.row);row.callbacks[2].delivered=markers.shift();return [row];
+  }});},
+  end:async()=>{calls.push('close');}
+ });
+ const bootstrap={withDatabaseCredentials:cb=>cb({})};
+ const fixture={resources:scope,inspectCallbacks:async()=>{calls.push('receiver');return inspect(f.row.callbacks);}};
+ return {calls,read:()=>prove({configuration:opts(),settlement:f.settlement,bootstrap,fixture},{deadline:Date.now()+5000},{connect})};
+}
+test('rejecting delivery projection for a queued retry terminates before polling or reading five matching digests',async()=>{
+ const f=data(),p=proofWithDeliveryRows(f,[null]);
+ await assert.rejects(p.read());
+ assert.deepEqual(p.calls,['select','close']);
+});
+test('ordinary pending automatic first delivery may settle on a subsequent bounded read',async()=>{
+ const f=data(),p=proofWithDeliveryRows(f,[false,true]);
+ assert.deepEqual(await p.read(),result);
+ assert.deepEqual(p.calls,['select','select','close','receiver']);
+});
 test('exact five signed digests and actual persisted graph, distinct historical and final clocks',()=>{const f=data();assert.deepEqual(verify(f),result);});
 for(const [name,change] of [
  ...flags.map(k=>[k,f=>f.row.proof[k]=false]),['source',f=>f.row.source_sha='0'.repeat(40)],['run',f=>f.row.owner_run=id(99)],['debt',f=>f.row.lineage.failed_bill_id=id(99)],['other ACK',f=>f.row.lineage.recovery_confirm_operation_id=id(99)],['other initial',f=>f.row.lineage.initial_payment_id=id(99)],['no AFTER',f=>delete f.row.lineage.grace_after_ready_id],['wrong final access',f=>f.settlement.access_evaluated_at=iso(T)],['wrong failed time',f=>f.row.callbacks[2].payload.occurred_at=iso(G+1)],['wrong recovered callback',f=>f.row.callbacks[4].payload.access_valid_until=iso(G+301)],['replacement debt',f=>f.row.callbacks[3].payload.billing_record_id=id(92)],['extra method event',f=>f.row.callbacks.push({...f.row.callbacks[2],kind:'METHOD_UPDATED'})],['missing event',f=>f.row.callbacks.splice(2,1)],['undelivered',f=>f.row.callbacks[2].delivered=false],['foreign payload',f=>f.row.callbacks[0].payload.unknown='hidden'],['duplicate paid',f=>f.row.callbacks[4]=f.row.callbacks[1]]
