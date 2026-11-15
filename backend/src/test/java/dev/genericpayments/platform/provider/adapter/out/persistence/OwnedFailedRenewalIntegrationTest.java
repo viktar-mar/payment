@@ -454,6 +454,87 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         }
         p.service().terminateSuccessorWrite(r,claim,owner);assertTerminalDelta(before,r,claim.id(),"SETUP_WRITE",digest,"UNCERTAIN",claim);
     }
+    @ParameterizedTest @ValueSource(booleans={true,false})
+    void actualWriteAckMustCommitBeforeSetupProofOrMethodProcessing(boolean setup) throws Exception{
+        var reserved=successorReservedMethod();var r=reserved.reservation();var money=financialState();
+        var checked=new java.util.concurrent.atomic.AtomicInteger();
+        var checking=(ProviderOperationStore)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{ProviderOperationStore.class},(proxy,method,args)->{
+            if(method.getName().equals("acknowledge")){
+                assertThat(args).hasSize(5);
+                var dispatch=operations.findById((UUID)args[0]).orElseThrow();
+                assertThat(dispatch.status()).isEqualTo(ProviderOperation.Status.DISPATCHING);
+                var rows=successorRows();int calls=http.calls.size();String reference=(String)args[3];
+                for(String mode:List.of("ordinary","early-drain","released-savepoint")){
+                    assertThatThrownBy(()->transaction.requiresNew(()->jdbc.execute((org.springframework.jdbc.core.ConnectionCallback<Void>)connection->{
+                        var sp=mode.equals("released-savepoint")?connection.setSavepoint():null;
+                        assertThat(jdbc.update("""
+                            update provider_operations set status='ACKNOWLEDGED',provider_reference=?,version=2,lease_owner=null,lease_expires_at=null
+                             where id=? and status='DISPATCHING' and version=1 and lease_owner=?
+                            """,reference,dispatch.id(),dispatch.leaseOwner())).isOne();
+                        if(!mode.equals("ordinary"))jdbc.execute("set constraints all immediate");
+                        if(sp!=null)connection.releaseSavepoint(sp);
+                        assertThat(jdbc.queryForObject("""
+                            select p.status='ACKNOWLEDGED' and p.version=2 and p.provider_reference=?
+                              and q.successor_producer_xid<>pg_current_xact_id()
+                             from provider_operations p join stripe_billing_failed_grace_method_claims q on q.operation_id=p.id where p.id=?
+                            """,Boolean.class,reference,dispatch.id())).isTrue();
+                        if(setup){
+                            jdbc.update("""
+                                insert into stripe_subscription_setup_proofs(operation_id,site_id,customer_id,subscription_id,payment_account_id,
+                                  operation_kind,step_id,setup_reference) values(?,?,?,?,?,'SETUP',?,?)
+                                """,r.setupOperationId(),site.value(),customer.value(),r.admission().firstRenewalAdmission().receipt().intent().subscription(),
+                                billing.id().value(),dispatch.id(),reference);
+                        }else{
+                            assertThat(jdbc.queryForObject("select owned_method_steps(?)",Boolean.class,r.id())).isTrue();
+                            jdbc.update("""
+                                update subscription_operations set status='PROCESSING',provider_reference=?,updated_at=clock_timestamp(),
+                                 version=version+1 where id=?
+                                """,reference,r.setupOperationId());
+                        }
+                        throw new AssertionError("own WRITE ACK authorized downstream transition: "+mode);
+                    }))).satisfies(error->assertGraceAdvanceSqlState(error,"23514"))
+                        .rootCause().hasMessageContaining(setup?"Original live grace SETUP proof required":"Original grace METHOD writes required");
+                    assertThat(successorRows()).isEqualTo(rows);assertThat(http.calls).hasSize(calls);checked.incrementAndGet();
+                }
+                String ackCte="""
+                    with acknowledged as (
+                      update provider_operations set status='ACKNOWLEDGED',provider_reference=?,version=2,lease_owner=null,lease_expires_at=null
+                       where id=? and status='DISPATCHING' and version=1 and lease_owner=?
+                       returning id,resource_id,payment_account_id,provider_reference)
+                    """;
+                String consume=setup?"""
+                    insert into stripe_subscription_setup_proofs(operation_id,site_id,customer_id,subscription_id,payment_account_id,
+                      operation_kind,step_id,setup_reference)
+                    select o.id,o.site_id,o.customer_id,o.subscription_id,a.payment_account_id,'SETUP',a.id,a.provider_reference
+                     from acknowledged a join subscription_operations o on o.id=a.resource_id
+                    """:"""
+                    update subscription_operations o set status='PROCESSING',provider_reference=a.provider_reference,
+                      updated_at=clock_timestamp(),version=o.version+1 from acknowledged a where o.id=a.resource_id and o.status='RESERVED'
+                    """;
+                assertThatThrownBy(()->transaction.requiresNew(()->{
+                    assertThat(jdbc.update(ackCte+consume,reference,dispatch.id(),dispatch.leaseOwner())).isOne();
+                    throw new AssertionError("one statement consumed its own WRITE ACK");
+                })).satisfies(error->assertGraceAdvanceSqlState(error,"23514")).rootCause().satisfies(error->{
+                    String message=error.getMessage();
+                    String consumer=setup?"Original live grace SETUP proof required":"Original grace METHOD writes required";
+                    assertThat(message.contains(consumer)||message.contains("Original grace provider write unavailable")).as(message).isTrue();
+                });
+                assertThat(successorRows()).isEqualTo(rows);assertThat(http.calls).hasSize(calls);checked.incrementAndGet();
+            }
+            try{return method.invoke(operations,args);}catch(InvocationTargetException error){throw error.getCause();}
+        });
+        if(setup){
+            int start=http.calls.size();var proof=setupProducer(reserved,checking,originalSetupProofs(reserved,false,name->{})).prepare(r,reserved.context());
+            var ack=operations.findById(proof.step()).orElseThrow();assertOriginalSetupRequest(reserved,ack,start);
+            assertThat(ack.providerReference()).isEqualTo(proof.reference());assertThat(methodBillingProofs.setup(billing.id(),r.setupOperationId())).contains(proof);
+        }else{
+            var pending=pendingMethod(reserved,true);controllerBrowserPermission(pending,false);var bound=boundMethod(pending);
+            int start=http.calls.size();http.reply(methodUpdateBody(bound));var ack=methodProducer(pending,checking).apply(r,pending.context());
+            assertOriginalMethodRequest(bound,ack,start);
+            assertThat(pending.service().recordMethodUpdateReply(r,pending.context()).status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        }
+        assertThat(checked.get()).isEqualTo(4);assertThat(count(SUCCESSOR_TERMINALS)).isZero();assertThat(financialState()).isEqualTo(money);
+    }
     @Test void taggedWriteFirstClaimIsSealedAndCopiedLeaseCannotContinueOrFinishIt(){
         var p=successorReservedMethod();var r=p.reservation();var kind=ProviderOperation.Kind.SETUP_INTENT_CREATE;
         var owner=OwnedFailedRenewalMethod.SuccessorOwner.create();var copied=OwnedFailedRenewalMethod.SuccessorOwner.create();
@@ -3823,6 +3904,54 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var origin=Origin.RECOVERY_CONFIRM;var step=successorCalls.dispatches.get(origin);
         assertThat(http.calls.getLast().url().getPath()).isEqualTo("/v1/payment_intents/pi_renewal/confirm");
         assertTerminalDelta(successorCalls.beforeFailure,r,step.id(),origin.name(),successorCalls.owners.get(origin).commitment(origin,step.id()),"UNCERTAIN",step);
+    }
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void foreignConfirmKeyCannotReachPreflightOrSendPostAfterOriginalClaim(boolean afterClaim) throws Exception{
+        successorCalls=new SuccessorCalls();
+        var p=recoveryPrepared(pendingMethod(successorReservedMethod(),true),false);var r=p.pending().reservation();
+        var c=inspectRecovery(p);var money=financialState();
+        var damaged=new java.util.concurrent.atomic.AtomicReference<Map<String,List<String>>>();
+        Runnable insertSibling=()->{
+            transaction.requiresNew(()->{
+                assertThat(jdbc.update("""
+                    insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint)
+                    values(?,?,'acct_foreignKey','foreign-boundary-key','PRODUCT_CREATE',?,?,?)
+                    """,UUID.randomUUID(),foreignBoundaryAccount(),UUID.randomUUID(),c.recoveryOperation().providerOperationKey()+":CONFIRM","0".repeat(64))).isOne();
+                return null;
+            });
+            damaged.set(successorRows());
+            assertThat(jdbc.queryForObject("select owned_failed_renewal_association(?,?) or owned_recovery_confirm_pre(?)",
+                Boolean.class,r.admission().id(),c.recoveryOperation().id(),r.id())).isFalse();
+        };
+        var tx=new SubscriptionTransactionPort(){
+            public boolean active(){return transaction.active();}
+            public <T>T required(java.util.function.Supplier<T> work){throw new AssertionError("confirmation must use a fresh transaction");}
+            public <T>T requiresNew(java.util.function.Supplier<T> work){
+                T returned=transaction.requiresNew(work);
+                if(afterClaim&&damaged.get()==null&&returned instanceof ProviderOperation step&&step.status()==ProviderOperation.Status.DISPATCHING){
+                    assertThat(operations.findById(step.id())).contains(step);
+                    insertSibling.run();
+                }
+                return returned;
+            }
+        };
+        var confirmer=new OwnedRecoveryConfirmService(p.pending().service(),
+            observeSuccessorPort(OwnedRecoveryConfirmStore.class,new JdbcOwnedRecoveryConfirmStore(jdbc,entityManagerFactory)),tx,Clock.systemUTC());
+        var reader=new StripeBillingOwnedFailedRenewalRecoveryReader(p.pending().service(),methodBillingProofs,operations,credentials,clients,digest,Clock.systemUTC());
+        var adapter=new StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter(p.pending().service(),reader,confirmer,credentials,clients,digest,Clock.systemUTC());
+        if(!afterClaim)insertSibling.run();
+        queueRecoveryCompositionConfirmation(p);int start=http.calls.size();
+        assertThatThrownBy(()->adapter.confirm(r,p.completion(),p.recovery(),p.pending().context())).isInstanceOf(PaymentApplicationException.class)
+            .hasMessage("Owned recovery confirmation unavailable");
+        assertThat(damaged.get()).isNotNull();var attempted=http.calls.subList(start,http.calls.size());
+        assertThat(attempted).hasSize(afterClaim?17:0).allSatisfy(call->assertThat(call.method().name()).isEqualTo("GET"));
+        assertThat(financialState()).isEqualTo(money);assertThat(count("stripe_billing_failed_recovery_confirm_acks")).isZero();
+        if(afterClaim){
+            var origin=Origin.RECOVERY_CONFIRM;var claim=successorCalls.dispatches.get(origin);assertThat(claim).isNotNull();
+            assertTerminalDelta(damaged.get(),r,claim.id(),origin.name(),successorCalls.owners.get(origin).commitment(origin,claim.id()),"UNCERTAIN",claim);
+        }else{
+            assertThat(successorRows()).isEqualTo(damaged.get());assertThat(count("stripe_billing_failed_recovery_confirm_claims")).isZero();
+        }
     }
 
     private OwnedBillingFailedRenewalRecovery recoveryComposition(RecoveryPrepared p) {

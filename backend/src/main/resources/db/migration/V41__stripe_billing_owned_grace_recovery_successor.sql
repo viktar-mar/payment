@@ -473,6 +473,14 @@ alter table stripe_billing_failed_method_publications add successor_producer_xid
 alter table stripe_billing_failed_recovery_confirm_claims add successor_owner_digest text check(successor_owner_digest ~ '^[a-f0-9]{64}$');
 alter table stripe_billing_failed_recovery_confirm_acks add successor_producer_xid xid8;
 
+-- This backend's tagged ACK marker lasts until transaction end, including after
+-- savepoint release. Presence can only refuse consumption of the original ACK.
+create function owned_grace_local_write_ack(operation uuid) returns boolean language sql volatile strict as $$
+ select exists(select 1 from pg_locks where locktype='advisory' and pid=pg_backend_pid() and granted
+   and database=(select oid from pg_database where datname=current_database()) and objsubid=2
+   and classid=1499220551::oid and objid=hashtext($1::text)::oid)
+$$;
+
 create function owned_grace_method_writes_acked(reservation uuid,reader xid8) returns boolean language sql stable as $$
  select exists(select 1 from stripe_billing_failed_method_reservations r join subscription_operations o on o.id=r.setup_operation
  join stripe_subscription_setup_proofs proof on proof.operation_id=o.id
@@ -488,6 +496,15 @@ create function owned_grace_method_writes_acked(reservation uuid,reader xid8) re
     sibling.operation_key in(o.provider_operation_key||':SETUP',o.provider_operation_key||':METHOD'))
   and sibling.id not in(setup.id,method.id)))
 $$;
+
+-- Only a producer about to consume these ACKs needs this backend's live marker.
+-- Historical readers use the sealed rows and their already guarded READ origin.
+create function owned_grace_method_writes_consumable(reservation uuid,reader xid8) returns boolean language sql volatile as $$
+ select owned_grace_method_writes_acked($1,$2) and not exists(
+  select 1 from stripe_billing_failed_grace_method_claims q
+  where q.reservation_id=$1 and owned_grace_local_write_ack(q.operation_id))
+$$;
+
 -- This predicate may be used after financial projection; do not re-enter V37's pre-confirm debt state.
 create function owned_grace_confirm_ack_committed(reservation uuid,latest timestamptz,reader xid8) returns boolean language sql stable as $$
  select exists(select 1 from stripe_billing_failed_method_reservations r join stripe_billing_failed_renewal_failures f on f.admission_id=r.admission_id
@@ -526,7 +543,8 @@ begin
   raise exception 'Invalid grace read provenance' using errcode='23514';end if;
  if tagged then
   perform require_live_grace_successor(new.reservation_id);
-  if not owned_grace_read_predecessor(new.reservation_id,new.phase,new.started_at,pg_current_xact_id()) then
+  if not owned_grace_method_writes_consumable(new.reservation_id,pg_current_xact_id())
+    or (new.phase='RECOVERED' and not owned_grace_confirm_ack_committed(new.reservation_id,new.started_at,pg_current_xact_id())) then
    raise exception 'Missing committed grace read predecessor' using errcode='23514';end if;
   new.successor_producer_xid:=pg_current_xact_id();
  end if;
@@ -746,9 +764,7 @@ begin
  -- The unchanged ACK row has no writer xid. Only refuse on this backend's tagged
  -- ACK marker. Even an unrelated hash collision can only deny cleanup.
  if new.origin in ('SETUP_WRITE','METHOD_WRITE') and exists(select 1 from provider_operations where id=new.origin_id and status='ACKNOWLEDGED')
-    and exists(select 1 from pg_locks where locktype='advisory' and pid=pg_backend_pid() and granted
-      and database=(select oid from pg_database where datname=current_database()) and objsubid=2
-      and classid=1499220551::oid and objid=hashtext(new.origin_id::text)::oid)
+    and owned_grace_local_write_ack(new.origin_id)
  then raise exception 'Independent original WRITE acknowledgment required' using errcode='23514';end if;
  new.owner_nonce:=null;return new;
 end $$;
@@ -856,7 +872,7 @@ begin
  if not exists(select 1 from stripe_billing_failed_grace_method_claims q join provider_operations p on p.id=q.operation_id
    where q.reservation_id=target and q.operation_id=new.step_id and q.step_kind='SETUP_INTENT_CREATE'
    and p.status='ACKNOWLEDGED' and p.provider_reference=new.setup_reference and owned_grace_write_claim_matches(target,p)
-   and q.successor_producer_xid<>pg_current_xact_id())
+   and q.successor_producer_xid<>pg_current_xact_id() and not owned_grace_local_write_ack(p.id))
  then raise exception 'Original live grace SETUP proof required' using errcode='23514';end if;
  return new;
 end $$;
@@ -871,7 +887,7 @@ begin
     select 1 from stripe_billing_failed_method_recoveries x where x.reservation_id=r.id and x.operation_id=old.id));
  if target is not null then
   perform require_live_grace_successor(target);
-  if old.kind='SETUP' and new.status='PROCESSING' and not owned_grace_method_writes_acked(target,pg_current_xact_id()) then
+  if old.kind='SETUP' and new.status='PROCESSING' and not owned_grace_method_writes_consumable(target,pg_current_xact_id()) then
    raise exception 'Original grace METHOD writes required' using errcode='23514';end if;
  end if;
  return new;

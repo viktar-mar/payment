@@ -364,7 +364,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         return methodContext(r,o);
     }
     private void requireSealedMethodWrites(Reservation r){
-        if(r.successor()!=null)require("select owned_grace_method_writes_acked(?,pg_current_xact_id())",r.id());
+        if(r.successor()!=null)require("select owned_grace_method_writes_consumable(?,pg_current_xact_id())",r.id());
     }
     @Override public ReadClaim claimReadInTransaction(Reservation r,Phase phase,UUID invocation,Fence fence,Sample sample,Instant now) {
         return claimReadInTransaction(r,phase,invocation,fence,sample,now,null);
