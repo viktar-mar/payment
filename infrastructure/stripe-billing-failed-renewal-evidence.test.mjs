@@ -10,6 +10,17 @@ import {createReceiver} from './callback-receiver.mjs';
 const saved=globalThis.fetch;let escaped=0;before(()=>{globalThis.fetch=()=>{escaped++;throw Error('blocked');};});after(()=>{globalThis.fetch=saved;assert.equal(escaped,0);});
 const result={ownedVerified:true,cashVerified:true,journalVerified:true,signedCallbacksVerified:true};
 const verify=(f,i=inspect(f.row.callbacks))=>validate(scope(),f.row,i,opts(),f.settlement);
+test('hosted evidence bridge exposes only four fixed failure codes and its exact success marker',async()=>{
+ const source=await readFile(new URL('./fixtures/stripe-billing-failed-renewal-row-consumer.mjs',import.meta.url),'utf8');
+ const fixture=await readFile(new URL('../backend/src/test/java/dev/genericpayments/acceptance/runtime/OwnedBillingFailedRenewalScenarioIntegrationTest.java',import.meta.url),'utf8');
+ assert.deepEqual([...source.matchAll(/\bfailureCode\s*=\s*(\d+)/g)].map(match=>Number(match[1])),[71,72,73,74]);
+ assert.deepEqual([...source.matchAll(/process\.(?:stdout|stderr)\.write\(([^)]+)\)/g)].map(match=>match[1]),["'combined_actual_sql_and_signed_union_verified\\n'"]);
+ assert.doesNotMatch(source,/\bconsole\.|node:(?:child_process|https?|net|fs)|\bfetch\s*\(/);
+ assert.match(source,/process\.exitCode\s*=\s*failureCode\b/);
+ for(const [code,stage] of [[71,'INPUT'],[72,'PUBLICATION'],[73,'POSITIVE'],[74,'QUEUED_RETRY']])
+  assert.match(fixture,new RegExp('case '+code+'\\s*->\\s*"'+stage+'"'));
+ assert.match(fixture,/default\s*->\s*"TRANSPORT"/);
+});
 test('shipped callback projection rejects any scoped retry and identifies the first automatic 204',async()=>{
  const sql=await readFile(new URL('./stripe-billing-failed-renewal-proof.sql',import.meta.url),'utf8');
  const delivery=sql.slice(sql.indexOf("'delivered',case")).replace(/\s+/g,' ');

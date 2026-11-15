@@ -487,6 +487,11 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         exactReads(after,"PAID",Math.min(after+300,next));
         var good=proofRow(paid);
         assertThat(callbackMarkers(good)).containsOnly("true").hasSize(5);
+        var proof=good.getAsJsonObject("proof");
+        var flags=List.of("owned","original","lineage","cash","operations","journal");
+        assertThat(proof.keySet().equals(Set.copyOf(flags))).as("closed failed renewal proof flags").isTrue();
+        for(String flag:flags)assertThat(proof.get(flag).isJsonPrimitive() && proof.getAsJsonPrimitive(flag).isBoolean()
+            && proof.get(flag).getAsBoolean()).as("actual failed renewal SQL proof.%s",flag).isTrue();
         var first=claims.getFirst().eventId();
         var history=jdbc.queryForList("select * from outbox_deliveries order by id");
         var eventsBefore=jdbc.queryForList("select * from outbox_events order by id");
@@ -570,8 +575,10 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
     private java.util.concurrent.CountDownLatch gated,releaseGate,revoked;
     private void pauseBookend(Class<?> type){
         if(gateBean!=type || requests.isEmpty())return;
-        String last=requests.getLast().url().getPath();
-        if(!last.endsWith("/attach")&&!last.equals("/v1/test_helpers/test_clocks/clock_owned"))return;
+        var last=requests.getLast();
+        boolean arm=type==CustomerSessionResolver.class;
+        String expectedPath=arm?"/v1/payment_methods/pm_card_chargeCustomerFail/attach":"/v1/test_helpers/test_clocks/clock_owned";
+        if(!last.method().name().equals(arm?"POST":"GET") || !last.url().getPath().equals(expectedPath))return;
         gated.countDown();
         long end=System.nanoTime()+java.util.concurrent.TimeUnit.SECONDS.toNanos(6);
         while(System.nanoTime()<end){
@@ -604,6 +611,9 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         try{
             var running=pool.submit(()->{handler.handle(producer);return true;});
             assertThat(gated.await(5,time)).isTrue();
+            var priorWrites=requests.subList(before,requests.size()).stream().filter(r->r.method().name().equals("POST")).map(r->r.url().getPath()).toList();
+            assertThat(priorWrites).as("the selected producer write completed before the cancellation gate")
+                .containsExactly(arm?"/v1/payment_methods/pm_card_chargeCustomerFail/attach":"/v1/test_helpers/test_clocks");
             var stopping=pool.submit(()->{handler.handle(terminal);return true;});
             assertThat(revoked.await(2,time)).as("real State revoked while original ticket remains owned").isTrue();
             assertThat(stopping.isDone()).isFalse();assertThat(terminal.code).isZero();
@@ -695,6 +705,24 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         var builder=new ProcessBuilder("node","../infrastructure/fixtures/stripe-billing-failed-renewal-row-consumer.mjs").redirectError(ProcessBuilder.Redirect.DISCARD);
         var path=Objects.requireNonNull(System.getenv("PATH"));builder.environment().clear();builder.environment().put("PATH",path);
         builder.environment().put("LANG","C");builder.environment().put("LC_ALL","C");
-        OwnedBillingFirstRenewalEvidenceConsumer.verify(input.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8),builder::start,Duration.ofSeconds(10));
+        var child=new java.util.concurrent.atomic.AtomicReference<Process>();
+        try{
+            OwnedBillingFirstRenewalEvidenceConsumer.verify(input.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8),()->{
+                var process=builder.start();
+                child.set(process);
+                return process;
+            },Duration.ofSeconds(10));
+        }catch(IllegalStateException rejectedInput){
+            var process=child.get();
+            int exit=process!=null && !process.isAlive()?process.exitValue():-1;
+            String phase=switch(exit){
+                case 71 -> "INPUT";
+                case 72 -> "PUBLICATION";
+                case 73 -> "POSITIVE";
+                case 74 -> "QUEUED_RETRY";
+                default -> "TRANSPORT";
+            };
+            throw new AssertionError("FAILED_RENEWAL_EVIDENCE_"+phase);
+        }
     }
 }

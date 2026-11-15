@@ -2,7 +2,9 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {validateBillingFailedRenewalEvidence} from '../stripe-billing-failed-renewal-evidence.mjs';
+import {validateFailedRenewalPublication} from '../stripe-billing-failed-renewal-response.mjs';
 
+let failureCode = 71;
 try {
   const chunks = [];
   let bytes = 0;
@@ -24,7 +26,11 @@ try {
     }),
   };
   const validate = candidate => validateBillingFailedRenewalEvidence(scope, candidate, inspection, configuration, settlement);
+  failureCode = 72;
+  validateFailedRenewalPublication(settlement, scope, configuration);
+  failureCode = 73;
   assert.deepEqual(validate(row), {ownedVerified: true, cashVerified: true, journalVerified: true, signedCallbacksVerified: true});
+  failureCode = 74;
   const marker = queuedRetryRow.callbacks.find(event => event.id === retryEvent);
   assert.equal(marker.delivered, null);
   assert.equal(queuedRetryRow.callbacks.filter(event => event.delivered === true).length, 4);
@@ -35,6 +41,5 @@ try {
   assert.throws(() => validate(queuedRetryRow));
   process.stdout.write('combined_actual_sql_and_signed_union_verified\n');
 } catch {
-  process.stderr.write('failed_renewal_actual_evidence_rejected\n');
-  process.exitCode = 1;
+  process.exitCode = failureCode;
 }
