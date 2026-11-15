@@ -147,6 +147,11 @@ class Control {
 }
 async function fixture(change = '') {
   const runAbort=new AbortController(),docEvents=new Map<string,Function>();
+  const asynchronousStart=change.startsWith('async_');
+  let startTask:Promise<unknown>|undefined,releasePreparation!:()=>void,markPreparationPending!:()=>void,markReadyWaiting!:()=>void;
+  const preparationHold=new Promise<void>(resolve=>{releasePreparation=resolve;});
+  const preparationPending=new Promise<void>(resolve=>{markPreparationPending=resolve;});
+  const readyWaiting=new Promise<void>(resolve=>{markReadyWaiting=resolve;});
   const {installFailedRenewalPage} = await import(source('../../src/billing-failed-renewal-page.ts').href);
   const {runFailedRenewalBrowser} = await import(source('./stripe-billing-failed-renewal.ts').href);
   const counts:string[] = [], replies:any[] = [], controls = new Map<string,Control>();
@@ -175,9 +180,19 @@ async function fixture(change = '') {
   const frame = {url:()=>url}, callbacks = new Map<string,Function>(),bindings=new Map<string,Function>();
   let routeHandler:Function;
   async function request(target:string,method:string,data?:any) {
+    const bridge=target.endsWith('/action')?'action':target.endsWith('/confirmation-session')?'session':target.endsWith('/confirm')?'confirm':'';
+    if(bridge && method!=='OPTIONS' && change===bridge+'_preflight_delivery')await request(target,'OPTIONS');
     let contents=data===undefined?null:JSON.stringify(data);
     const headers:Record<string,string>={origin:demo,...(data?{'content-type':'application/json'}:{}),
       ...(!target.startsWith(otpUrl)&&target.startsWith(backend)?{authorization:'Bearer '+token,...(method==='POST'?{'idempotency-key':crypto.randomUUID()}:{})}:{})};
+    if(method==='OPTIONS'){
+      delete headers.authorization;
+      headers['access-control-request-method']=bridge==='action'?'GET':'POST';
+      headers['access-control-request-headers']='authorization,content-type,idempotency-key';
+    }
+    if(change==='action_provider_header'&&target==='https://js.stripe.com/v3/')headers.authorization='Bearer '+token;
+    if(change==='action_asset_header'&&target===demo+'/assets/inert.js')headers.authorization='Bearer '+token;
+    if(bridge && change===bridge+'_early_header')headers.cookie='fixture=refused';
     let requestFrame=frame;
     if(target.endsWith('/action-confirmations')) {
       if(change==='frame')requestFrame={url:()=>url};
@@ -192,11 +207,16 @@ async function fixture(change = '') {
     const req={url:()=>target,method:()=>method,allHeaders:async()=>headers,frame:()=>requestFrame,postData:()=>contents,
       redirectedFrom:()=>null,isNavigationRequest:()=>false,resourceType:()=> 'fetch'};
     await routeHandler({request:()=>req,abort:async()=>{denied=true;},fallback:async()=>{assert.ok(target==='https://js.stripe.com/v3/'||target===otpUrl||target===otpUrl+'/'+id(10)+'/verify');},
-      fulfill:async(r:any)=>{if((change==='action_delivery'&&target.endsWith('/action'))||(change==='session_delivery'&&target.endsWith('/confirmation-session')))throw Error('secret_fixture canary');assert.equal(r.headers['Cache-Control'],'no-store');assert.equal(r.headers['Access-Control-Allow-Origin'],demo);reply=r;replies.push(r);}});
+      fulfill:async(r:any)=>{if((method==='OPTIONS'&&change===bridge+'_preflight_delivery')||(change==='action_delivery'&&target.endsWith('/action'))||(change==='session_delivery'&&target.endsWith('/confirmation-session')))throw Error('secret_fixture canary');assert.equal(r.headers['Cache-Control'],'no-store');assert.equal(r.headers['Access-Control-Allow-Origin'],demo);reply=r;replies.push(r);}});
     if(denied)throw Error('denied mock request');
     return reply;
   }
-  const subscriptions={action:async(input:any)=>{assert.strictEqual(input.session,session);return (await request(base(input.operationId)+'/action','GET')).json;},
+  const subscriptions={action:async(input:any)=>{
+      assert.strictEqual(input.session,session);
+      if(change==='action_provider_header')await request('https://js.stripe.com/v3/','GET');
+      if(change==='action_asset_header')await request(demo+'/assets/inert.js','GET');
+      return (await request(base(input.operationId)+'/action','GET')).json;
+    },
     confirmationSession:async(input:any)=>{assert.strictEqual(input.session,session);return (await request(base(input.operationId)+'/confirmation-session','POST',{action_token:input.action.secret})).json;}};
   const sdk = {createGenericPaymentClient:()=>{counts.push('client');return {subscriptions,
     requestEmailOtp:async()=>{counts.push('challenge');await request(otpUrl,'POST',{site_key:'fixture',email:'fixture@example.test',intent:'AUTHENTICATE'});return {challengeId:id(10),expiresAt:expires};},
@@ -213,13 +233,25 @@ async function fixture(change = '') {
         counts.push('confirmSetup');p.onRetire?.();return {operationId:id(9),subscriptionId:id(6),status:'RESERVED',actionAvailable:false};}};}};
   installFailedRenewalPage(sdk);
   const labels:Record<string,string>={'Request code':'request','Verify code':'verify','Start payment':'start','Pay':'pay','Confirm test method':'confirm-method','I consent to recurring payments':'consent','Six-digit code':'code'};
-  function locator(id:string):any {const c=ctrl(id);return {click:()=>c.activate(),check:async()=>{c.checked=true;},fill:async()=>{if(change===id)throw Error('secret_fixture canary');},isVisible:async()=>{if(change==='postal_check')throw Error('secret_fixture canary');return true;},isEnabled:async()=>!c.disabled,
+  function locator(id:string):any {const c=ctrl(id);return {click:async()=>{
+      if(id==='start'&&asynchronousStart){
+        // DOM dispatch does not await an async event handler. Keep its task
+        // separately so READY can wait for the page without making click do so.
+        startTask=c.activate();void startTask.catch(()=>{});return;
+      }
+      await c.activate();
+    },check:async()=>{c.checked=true;},fill:async()=>{if(change===id)throw Error('secret_fixture canary');},isVisible:async()=>{if(change==='postal_check')throw Error('secret_fixture canary');return true;},isEnabled:async()=>!c.disabled,
     getAttribute:async()=>body.dataset.phase,evaluate:async(f:Function,arg:any)=>id==='code'?(arg===undefined||((c.value=arg),true)):change==='manual_arm'&&id==='pay'?false:f(c,arg),
     frameLocator:()=>({locator:(s:string)=>locator(s.match(/name="([^"]+)"/)?.[1]??'card')})};}
   const page:any={mainFrame:()=>frame,url:()=>url,on:(n:string,f:Function)=>callbacks.set(n,f),goto:async(target:string)=>{assert.equal(target,demo+path);url=target;callbacks.get('framenavigated')?.(frame);},
     evaluate:async(f:Function,arg:unknown)=>f(arg),locator:(s:string)=>locator(s.replace(/^#/,'')),
     getByRole:(_role:string,o:{name:string})=>locator(labels[o.name]!),
     waitForFunction:async(f:Function,arg:unknown)=>{
+      if(asynchronousStart&&arg==='READY'){
+        markReadyWaiting();
+        if(change==='async_readiness_failure')throw Error('secret_fixture canary');
+        await startTask;
+      }
       if(change==='pre_ready'&&arg==='READY')throw Error('secret_fixture canary');
       if(arg==='OBSERVE'||arg==='METHOD_CONFIRMED'){
         const b=ctrl(arg==='OBSERVE'?'pay':'confirm-method');
@@ -232,8 +264,18 @@ async function fixture(change = '') {
     route:async(_pattern:string,f:Function)=>{routeHandler=f;},routeWebSocket:async()=>{},close:async()=>{closed++;callbacks.get('close')?.();w.__failedRenewalStop?.();}};
   const journey=runFailedRenewalBrowser({newContext:async()=>{counts.push('context');return context;}},runAbort);
   const initialPort={resources:()=>({runId:id(1),accountId:id(2),siteId:id(3),priceId:id(5),siteKey:'fixture',email:'fixture@example.test',endpoints:{demo,backend}}),
-    withOtpCode:async(f:Function)=>f(otp),acknowledgeCustomer:async(v:any)=>{assert.deepEqual(v,{customerId:id(4),siteId:id(3)});return true;},
-    prepare:async(v:any)=>{assert.deepEqual(v,{origin:demo,token});counts.push('prepare');return prepared;},
+    withOtpCode:async(f:Function)=>f(otp),acknowledgeCustomer:async(v:any)=>{
+      assert.deepEqual(v,{customerId:id(4),siteId:id(3)});
+      if(change==='async_ack_page_loss'){markPreparationPending();await preparationHold;}
+      return true;
+    },
+    prepare:async(v:any)=>{
+      assert.deepEqual(v,{origin:demo,token});counts.push('prepare');
+      if(asynchronousStart&&change!=='async_ack_page_loss'){markPreparationPending();await preparationHold;}
+      // The port has completed CREATE_ACK; the controller must still verify
+      // prepared identity before granting ACTION/SESSION/CONFIRM access.
+      return change==='async_prepare_identity'?{...prepared,customer_id:id(12)}:prepared;
+    },
     confirm:async()=>{counts.push('confirm');return {...identity,phase:'OBSERVE',code:'OK',protocol:'SERVER_CONFIRM_V2',attempt_id:id(8),state:'OBSERVE',retry_allowed:false,successor_attempt_id:null,next_action_allowed:false,expires_at:expires};}};
   const methodPort={prepareMethod:async()=>{counts.push('prepareMethod');return {subscriptionId:id(6),operationId:change==='old_operation'?id(7):id(9),action:action(actionSecret)};},
     selectMethod:async()=>{counts.push('selectMethod');return selected;},confirmMethod:async()=>{counts.push('permit');if(change==='permit_error')throw Error(selected.client_secret);return {browser_confirm_allowed:true,state:'RESERVED'};}};
@@ -244,7 +286,7 @@ async function fixture(change = '') {
       await Promise.resolve().then(()=>f(src,...args)).catch(()=>{});
     }
   };
-  return {request,counts,replies,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
+  return {request,counts,replies,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
     restore:async()=>{try{runAbort.abort();await journey.close(nowLimits());}finally{w.__failedRenewalStop?.();restore();}}};
 }
 
@@ -267,6 +309,9 @@ test('actual held helper preserves browser checkpoint through owner abort race a
 
 for(const [change,checkpoint] of [
   ['action_delivery','BROWSER_ACTION_BRIDGE'],['session_delivery','BROWSER_SESSION_BRIDGE'],
+  ['action_preflight_delivery','BROWSER_ACTION_BRIDGE'],['session_preflight_delivery','BROWSER_SESSION_BRIDGE'],['confirm_preflight_delivery','BROWSER_CONFIRM_BRIDGE'],
+  ['action_early_header','BROWSER_ACTION_BRIDGE'],['session_early_header','BROWSER_SESSION_BRIDGE'],['confirm_early_header','BROWSER_CONFIRM_BRIDGE'],
+  ['action_provider_header','BROWSER_WAIT_READY'],['action_asset_header','BROWSER_WAIT_READY'],
   ['pre_ready','BROWSER_WAIT_READY'],['mount_refusal','BROWSER_WAIT_READY'],
   ['number','BROWSER_CARD_NUMBER'],['expiry','BROWSER_CARD_EXPIRY'],['cvc','BROWSER_CARD_CVC'],
   ['postal_check','BROWSER_POSTAL_CHECK'],['postalCode','BROWSER_POSTAL_FILL'],
@@ -286,6 +331,55 @@ for(const [change,checkpoint] of [
     assert.equal(browserDiagnostic(first),checkpoint);assert.equal(browserCleanupConfirmed(first),true);
     assert.equal(h.closed(),1);assert.equal(h.counts.filter(v=>v==='prepare').length,1);
   }finally{await h.restore();}
+});
+
+for(const change of ['async_prepare_identity','async_prepare_page_loss','async_ack_page_loss','async_readiness_failure'] as const)
+test('detached Start keeps precise failure checkpoint on '+change,async()=>{
+  const h=await fixture(change),expected=change==='async_readiness_failure'?'BROWSER_WAIT_READY':'BROWSER_PREPARE';
+  let first:unknown;
+  // Attach the rejection observer before releasing either deterministic gate.
+  const rejected=assert.rejects(h.journey.initial(h.initialPort,nowLimits()),(error:unknown)=>{first=error;return true;});
+  try{
+    await h.preparationPending;await h.readyWaiting;
+    if(change!=='async_readiness_failure')assert.equal(h.phase(),'PREPARING');
+    assert.equal(h.counts.filter(v=>v==='prepare').length,change==='async_ack_page_loss'?0:1);
+    if(change==='async_prepare_page_loss'||change==='async_ack_page_loss'){
+      h.lose('crash');
+      assert.equal(h.runAbort.signal.aborted,true);
+    }
+    if(change==='async_readiness_failure'){
+      // READY's own rejection must retain WAIT_READY even though the binding
+      // remains suspended and subsequently fails its current-page assertion.
+      await rejected;assert.equal(h.runAbort.signal.aborted,true);
+    }
+    h.releasePreparation();await rejected;
+    assert.equal(browserDiagnostic(first),expected);
+    assert.doesNotMatch(String(first),/secret_fixture|canary|bga1_|Bearer|ctoken_/);
+    assert.equal(h.runAbort.signal.aborted,true);
+    assert.equal(h.counts.includes('confirm'),false);assert.equal(h.counts.includes('mountInitial'),false);
+    assert.equal(h.replies.length,0);
+    await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>error===first);
+    await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>error===first);
+    assert.equal(await h.journey.close(nowLimits()),true);
+    assert.equal(browserDiagnostic(first),expected);assert.equal(browserCleanupConfirmed(first),true);
+    assert.equal(h.closed(),1);
+  }finally{h.releasePreparation();await rejected;await h.restore();}
+});
+
+test('detached Start completes preparation before the two attended phases proceed',async()=>{
+  const h=await fixture('async_success');
+  const initial=h.journey.initial(h.initialPort,nowLimits());void initial.catch(()=>{});
+  try{
+    await h.preparationPending;await h.readyWaiting;
+    assert.equal(h.phase(),'PREPARING');assert.equal(h.counts.includes('confirm'),false);
+    h.releasePreparation();assert.equal(await initial,true);
+    assert.equal(h.phase(),'OBSERVE');assert.equal(h.closed(),0);assert.equal(h.runAbort.signal.aborted,false);
+    assert.equal(await h.journey.method(h.methodPort,nowLimits()),true);
+    assert.equal(h.phase(),'METHOD_CONFIRMED');
+    assert.equal(h.counts.filter(v=>v==='prepare').length,1);assert.equal(h.counts.filter(v=>v==='confirm').length,1);
+    assert.equal(h.counts.filter(v=>v==='permit').length,1);
+    assert.equal(await h.journey.close(nowLimits()),true);assert.equal(h.closed(),1);
+  }finally{h.releasePreparation();await initial.catch(()=>{});await h.restore();}
 });
 
 for(const change of ['rejection','page_loss'] as const)test('method preparation preserves current checkpoint through teardown on '+change,async()=>{

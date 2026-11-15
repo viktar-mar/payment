@@ -52,13 +52,15 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   const lifetime=new AbortController(),pending=new Set<Promise<unknown>>();
   const usedKeys=new Set<string>();
   let finalDelivery:Promise<void>|undefined;
-  let checkpoint='BROWSER_CONTEXT',firstFailure:Error|undefined;
+  let checkpoint='BROWSER_CONTEXT',firstFailure:Error|undefined,preparationActive=false;
   function latch(code:string):Error {
     firstFailure??=browserFailure(code);
     return firstFailure;
   }
   async function at<T>(code:string,work:()=>Promise<T>):Promise<T> {
-    checkpoint=code;
+    // DOM click completion can precede its async preparation binding. READY
+    // owns its own rejection, while page loss still belongs to active prepare.
+    if(!(preparationActive && code==='BROWSER_WAIT_READY'))checkpoint=code;
     try{return await work();}catch{throw latch(code);}
   }
   const track=<T>(work:Promise<T>)=>{
@@ -140,6 +142,10 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     try {
       current();
       const request=route.request(),url=new URL(request.url());
+      // Select backend provenance before even reading headers or delivering a
+      // preflight. Provider and asset routes retain the outer checkpoint.
+      if(url.origin===binding.endpoints.backend && (step==='ACTION'||step==='SESSION'||step==='CONFIRM'))
+        routeCheckpoint=step==='ACTION'?'BROWSER_ACTION_BRIDGE':step==='SESSION'?'BROWSER_SESSION_BRIDGE':'BROWSER_CONFIRM_BRIDGE';
       const headers=await request.allHeaders();
       current();
       need(!request.redirectedFrom() && !url.username && !url.password);
@@ -166,7 +172,6 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       }
       need(request.method()===verb && (verb==='GET'?!request.postData():headers['content-type']==='application/json'));
       const previous=step;
-      if(previous==='ACTION'||previous==='SESSION'||previous==='CONFIRM')routeCheckpoint=previous==='ACTION'?'BROWSER_ACTION_BRIDGE':previous==='SESSION'?'BROWSER_SESSION_BRIDGE':'BROWSER_CONFIRM_BRIDGE';
       step='BUSY';
       if(previous==='CHALLENGE' || previous==='VERIFY'){
         need(!headers.authorization && !headers['idempotency-key']);
@@ -257,9 +262,10 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       }catch{const error=latch(checkpoint);lost();throw error;}
     });
     await context.exposeBinding('__failedRenewalPrepare',({frame,page:source},value:unknown)=>track((async()=>{
+      let prepareCheckpoint=checkpoint;
       try {
         assertPage();need(source===page && frame===page!.mainFrame() && state==='INITIAL' && step==='PREPARE' && initialPort);
-        checkpoint='BROWSER_PREPARE';
+        preparationActive=true;prepareCheckpoint=checkpoint='BROWSER_PREPARE';
         step='BUSY';
         const v=fields(value,['token','origin','customerId','siteId','expiresAt']);
         need(v.origin===binding.endpoints.demo && v.siteId===binding.siteId && uuid(v.customerId) && (!binding.customerId||binding.customerId===v.customerId) &&
@@ -272,9 +278,10 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
         assertPage();need(p.customer_id===v.customerId && p.site_id===binding.siteId && p.account_id===binding.accountId && p.run_id===binding.runId && p.price_id===binding.priceId && uuid(p.subscription_id) && uuid(p.operation_id) && p.session.publishable_key.startsWith('pk_test_'));
         initial=p;initialBridge=createFirstPaymentBridge({binding,prepared:p,token,port:initialPort,limits:scoped(),latchFailure:latch});
         step='ACTION';
+        preparationActive=false;
         checkpoint='BROWSER_WAIT_READY';
         return {subscriptionId:p.subscription_id,operationId:p.operation_id};
-      }catch{const error=latch(checkpoint);lost();throw error;}
+      }catch{const error=latch(prepareCheckpoint);lost();throw error;}
     })()));
     await at('BROWSER_NAVIGATION',()=>page!.goto(binding.endpoints.demo+pagePath,{timeout:timeout()}));
     assertPage();
