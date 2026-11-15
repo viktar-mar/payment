@@ -79,7 +79,7 @@ class OwnedBillingFailedRenewalRuntimeTest {
     }
     @Test void recoveryConfirmationDescriptorUsesThePersistedMicrosecondOfTheOriginalReceipt() {
         var dispatched=Instant.parse("2026-11-08T12:00:00Z");
-        var observed=dispatched.plusNanos(123456788);
+        var observed=dispatched.plusNanos(123455999);
         var acknowledged=dispatched.plusNanos(123456789);
         var operation=new ProviderOperation(UUID.randomUUID(),new PaymentAccountId(UUID.randomUUID()),"acct_owned","alias",
             ProviderOperation.Kind.OWNED_RECOVERY_INTENT_CONFIRM,UUID.randomUUID(),"owned:CONFIRM","fingerprint",
