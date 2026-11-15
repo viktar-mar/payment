@@ -21,6 +21,36 @@ import static org.assertj.core.api.Assertions.*;
 /** Real original-method authentication and lifecycle, with rollback-aware inert receipt storage only.
  * No Spring context, SQL engine, file, SDK, socket, scheduler, or financial producer is reachable. */
 class OwnedRecoveryConfirmServiceTest {
+    @Test void taggedConfirmationRequiresOriginalOwnerBeforeClaimAndEveryPositiveContinuation(){
+        var original=new OwnedRecoveryInertFixture(value->"digest:"+value,true);
+        var h=new OwnedRecoveryConfirmInertFixture(original);var c=h.expected;var before=original.state();
+        var owner=dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner.create();
+        var copy=dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner.create();
+        assertThatThrownBy(()->h.service.claim(c,original.command(),"claimant",h.budget)).isInstanceOf(RuntimeException.class);
+        assertThat(h.store.writes).isZero();assertThat(h.store.acks).isEmpty();
+        var rollback=new OwnedRecoveryConfirmInertFixture(new OwnedRecoveryInertFixture(value->"digest:"+value,true));
+        var beforeClaim=rollback.receiptState();rollback.afterEffect(rollback.f::revoke);
+        assertThatThrownBy(()->rollback.service.claim(rollback.expected,rollback.f.command(),"failed-first",rollback.budget,owner))
+            .isInstanceOf(RuntimeException.class);
+        assertThat(rollback.store.effectReached).isTrue();assertThat(rollback.receiptState()).isEqualTo(beforeClaim);
+        var claim=h.service.claim(c,original.command(),"claimant",h.budget,owner);
+        assertThat(h.store.ownerDigest).isEqualTo(owner.commitment(dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Origin.RECOVERY_CONFIRM,claim.id()));
+        for(Runnable attempt:List.<Runnable>of(()->h.service.inspectClaim(c,claim,original.command(),h.budget),
+                ()->h.service.inspectClaim(c,claim,original.command(),h.budget,copy),
+                ()->h.service.acknowledge(c,claim,h.reply(),original.command(),h.budget),
+                ()->h.service.acknowledge(c,claim,h.reply(),original.command(),h.budget,copy))){
+            assertThatThrownBy(attempt::run).isInstanceOf(RuntimeException.class);
+            assertThat(h.store.row).isEqualTo(claim);assertThat(h.store.acks).isEmpty();assertThat(h.store.writes).isEqualTo(1);
+        }
+        h.service.uncertain(c,claim,h.budget);h.service.uncertain(c,claim,h.budget,copy);
+        assertThat(h.store.calls).doesNotContain("unknown");assertThat(h.store.row).isEqualTo(claim);
+        assertThat(original.trace()).contains("typed-confirm-cleanup");assertThat(original.state()).isEqualTo(before);
+        assertThat(h.service.inspectClaim(c,claim,original.command(),h.budget,owner)).isEqualTo(claim);
+        var ack=h.service.acknowledge(c,claim,h.reply(),original.command(),h.budget,owner);
+        h.service.uncertain(c,claim,h.budget,owner);
+        assertThat(h.store.acks).containsExactly(ack);assertThat(h.store.row).isEqualTo(ack.operation());
+        assertThat(h.store.writes).isEqualTo(2);assertThat(original.state()).isEqualTo(before);
+    }
     @Test void firstClaimCommitsOnceAndExactAckDoesNotPublishOrSettleAnything(){
         var h=new Harness();var before=h.f.state();var claim=h.claim();
         assertThat(claim.kind()).isEqualTo(Kind.OWNED_RECOVERY_INTENT_CONFIRM);

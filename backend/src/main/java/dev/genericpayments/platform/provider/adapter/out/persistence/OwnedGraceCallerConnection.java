@@ -13,6 +13,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 /** No connection/manager acquisition or fallback: only the already-bound known caller is valid. */
 final class OwnedGraceCallerConnection {
+    private final JdbcTemplate jdbc;
     private final DataSource source;
     private final EntityManagerFactory factory;
     private final ConnectionHolder holder;
@@ -21,9 +22,9 @@ final class OwnedGraceCallerConnection {
     private final Connection physical;
     private final String message;
 
-    private OwnedGraceCallerConnection(DataSource source,EntityManagerFactory factory,ConnectionHolder holder,
+    private OwnedGraceCallerConnection(JdbcTemplate jdbc,DataSource source,EntityManagerFactory factory,ConnectionHolder holder,
             EntityManagerHolder owner,EntityManager manager,Connection physical,String message){
-        this.source=source;this.factory=factory;this.holder=holder;this.owner=owner;this.manager=manager;this.physical=physical;this.message=message;
+        this.jdbc=jdbc;this.source=source;this.factory=factory;this.holder=holder;this.owner=owner;this.manager=manager;this.physical=physical;this.message=message;
     }
     static void require(JdbcTemplate jdbc,EntityManagerFactory factory,String message){
         capture(jdbc,factory,message);
@@ -38,7 +39,7 @@ final class OwnedGraceCallerConnection {
             if(!manager.isOpen()||!manager.getTransaction().isActive())throw new IllegalStateException(message);
             var physical=DataSourceUtils.getTargetConnection(holder.getConnection());
             verifyPhysical(manager,physical,message);
-            return new OwnedGraceCallerConnection(source,factory,holder,owner,manager,physical,message);
+            return new OwnedGraceCallerConnection(jdbc,source,factory,holder,owner,manager,physical,message);
         }catch(RuntimeException failure){throw new IllegalStateException(message);}
     }
     EntityManager requireSame(){
@@ -58,6 +59,10 @@ final class OwnedGraceCallerConnection {
             if(physical.getTransactionIsolation()!=Connection.TRANSACTION_READ_COMMITTED)throw new IllegalStateException(message);
         }catch(java.sql.SQLException|RuntimeException failure){throw new IllegalStateException(message);}
         return current;
+    }
+    EntityManager requireReadCommitted(JdbcTemplate configuredJdbc,EntityManagerFactory configuredFactory){
+        if(configuredJdbc!=jdbc||configuredFactory!=factory||configuredJdbc.getDataSource()!=source)throw new IllegalStateException(message);
+        return requireReadCommitted();
     }
     private static void verifyPhysical(EntityManager manager,Connection physical,String message){
         try{

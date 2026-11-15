@@ -31,9 +31,13 @@ public final class OwnedRecoveryInertFixture {
         var id=(UUID)args[0];stepLocators.add(id);return Optional.ofNullable(steps.get(id));
     });
     public OwnedRecoveryInertFixture(DigestPort digest){
+        this(digest,false);
+    }
+    public OwnedRecoveryInertFixture(DigestPort digest,boolean tagged){
         this.digest=digest;
-        h=new OwnedFailedRenewalMethodServiceTest.Harness(true,"stripe-sandbox-default",UTC.plusSeconds(600).plusNanos(123456789),digest);
-        var r=h.service.reserveBrowserMethod(h.b.admission,h.context,true);
+        h=new OwnedFailedRenewalMethodServiceTest.Harness(true,"stripe-sandbox-default",UTC.plusSeconds(600).plusNanos(123456789),digest,tagged?300000:10000);
+        if(tagged)h.savedAfter=OwnedFailedRenewalMethodServiceTest.after(h,260301,"clock_owned",h.b.utc);
+        var r=tagged?h.service.reserveBrowserMethodAfterGrace(h.b.admission,h.savedAfter,h.context,true):h.service.reserveBrowserMethod(h.b.admission,h.context,true);
         h.acks=true;h.browserConsumed=true;h.recoveryPreparationEnabled=true;h.enforceSessionExpiry=true;
         proof=new SubscriptionBillingProofStore.Setup(r.setupOperationId(),h.b.s.id(),h.b.account.id(),id(91),"seti_owned","pm_owned");
         h.b.methodSetup=proof;var o=h.b.ops.get(r.setupOperationId());var s=h.b.s;var a=h.b.account;
@@ -45,8 +49,10 @@ public final class OwnedRecoveryInertFixture {
         setup=fingerprint(setup,sf);method=fingerprint(method,mf);
         h.providerSteps.put(setup.operationKey(),setup);h.providerSteps.put(method.operationKey(),method);h.providerEvidence=true;
         steps.put(setup.id(),setup);steps.put(method.id(),method);
-        h.service.recordMethodUpdateReply(r,h.context);var q=h.service.beginMethodRead(r,UUID.randomUUID());
-        var completion=h.service.publishMethod(r,q,h.evidence(),h.service.inspectMethodRead(r,q));
+        h.service.recordMethodUpdateReply(r,h.context);var readOwner=tagged?SuccessorOwner.create():null;
+        var q=tagged?h.service.beginMethodRead(r,UUID.randomUUID(),readOwner):h.service.beginMethodRead(r,UUID.randomUUID());
+        var completion=tagged?h.service.publishMethod(r,q,h.evidence(),h.service.inspectMethodRead(r,q,readOwner),readOwner)
+            :h.service.publishMethod(r,q,h.evidence(),h.service.inspectMethodRead(r,q));
         var recovery=h.service.reserveRecovery(r,completion);h.b.recovery=recovery.association();h.b.trace.clear();
     }
     private static ProviderOperation fingerprint(ProviderOperation s,String fp){return new ProviderOperation(s.id(),s.accountId(),s.externalAccountId(),s.credentialsRef(),s.kind(),s.resourceId(),s.operationKey(),fp,s.status(),s.providerReference(),s.firstDispatchedAt(),s.retryBefore(),s.leaseOwner(),s.leaseExpiresAt(),s.version());}
@@ -65,5 +71,6 @@ public final class OwnedRecoveryInertFixture {
     public void afterAuthentication(Runnable action){h.afterRecoveryEnrollment=action;}
     public void driftSequence(){h.b.sequence++;}
     public List<String> trace(){return h.b.trace;}
+    public List<List<Object>> writeTerminalCalls(){return List.copyOf(h.writeTerminalCalls);}
     public Object state(){return Arrays.asList(h.b.s,new LinkedHashMap<>(h.b.ops),new LinkedHashMap<>(h.b.records),new LinkedHashSet<>(h.b.cash),new ArrayList<>(h.b.events),h.b.callbacks,h.b.sequence,h.b.effects,h.b.stopped,h.reservation,h.enrollment,h.completion,h.recovery,h.publication,new HashMap<>(h.claims),h.b.methodSetup,new LinkedHashMap<>(h.providerSteps));}
 }

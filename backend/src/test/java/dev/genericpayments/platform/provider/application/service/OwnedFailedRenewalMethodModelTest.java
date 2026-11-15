@@ -9,6 +9,26 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
 class OwnedFailedRenewalMethodModelTest {
+    @Test void privateOwnerCommitsToExactOriginKindAndIdWithoutAnInjectableNonce() {
+        var original=SuccessorOwner.create();var copy=SuccessorOwner.create();var id=UUID.randomUUID();
+        assertThat(original.nonce()).isNotNull().isNotEqualTo(copy.nonce());
+        assertThat(java.lang.reflect.Modifier.isFinal(SuccessorOwner.class.getModifiers())).isTrue();
+        assertThat(SuccessorOwner.class.getDeclaredConstructors()).allSatisfy(c->{
+            assertThat(java.lang.reflect.Modifier.isPrivate(c.getModifiers())).isTrue();
+            assertThat(c.getParameterCount()).isZero();
+        });
+        assertThat(Origin.values()).containsExactlyInAnyOrder(Origin.SETUP_WRITE,Origin.METHOD_WRITE,Origin.METHOD_READ,
+            Origin.RECOVERED_READ,Origin.RECOVERY_CONFIRM);
+        var hashes=new java.util.HashSet<String>();
+        for(var origin:Origin.values()){
+            String expected=dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.fingerprint(
+                "owned-grace-successor-owner-v1",origin.name(),id,original.nonce());
+            assertThat(original.commitment(origin,id)).matches("[0-9a-f]{64}").isEqualTo(expected);
+            assertThat(original.toString()).doesNotContain(original.nonce().toString(),expected);
+            assertThat(hashes.add(expected)).isTrue();assertThat(copy.commitment(origin,id)).isNotEqualTo(expected);
+            assertThat(original.commitment(origin,UUID.randomUUID())).isNotEqualTo(expected);
+        }
+    }
     final Instant at=Instant.parse("2026-11-01T12:00:00Z");
     final UUID reservation=UUID.randomUUID(), operation=UUID.randomUUID();
     final Sample sample=new Sample(Instant.ofEpochSecond(4700),Mode.ISOLATED);

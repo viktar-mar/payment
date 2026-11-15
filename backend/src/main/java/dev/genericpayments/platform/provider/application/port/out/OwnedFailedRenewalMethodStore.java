@@ -1,6 +1,8 @@
 package dev.genericpayments.platform.provider.application.port.out;
 
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal;
+import dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.InvocationBudget;
+import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.*;
 import dev.genericpayments.platform.provider.application.model.OwnedMethodBrowser.*;
 import dev.genericpayments.platform.customers.application.model.CustomerSessionContext;
@@ -45,6 +47,13 @@ public interface OwnedFailedRenewalMethodStore {
     MethodReadContext requirePreparedMethodInTransaction(Reservation r);
     ReadClaim claimReadInTransaction(Reservation r,Phase phase,UUID invocation,Fence fence,Sample sample,Instant now);
     ReadClaim requireReadInTransaction(Reservation r,ReadClaim expected);
+    default ReadClaim claimReadInTransaction(Reservation r,Phase phase,UUID invocation,Fence fence,Sample sample,Instant now,SuccessorOwner owner){throw browserDenied();}
+    default ReadClaim requireReadInTransaction(Reservation r,ReadClaim expected,SuccessorOwner owner){throw browserDenied();}
+    default MethodReadContext requireMethodContextInTransaction(Reservation r,ReadClaim q,SuccessorOwner owner){throw browserDenied();}
+    default RecoveredReadContext requireRecoveredContextInTransaction(Reservation r,ReadClaim q,SuccessorOwner owner){throw browserDenied();}
+    default Completion recordCompletionInTransaction(Reservation r,ReadClaim q,MethodEvidence evidence,Instant now,SuccessorOwner owner){throw browserDenied();}
+    default Publication recordPublicationInTransaction(Reservation r,ReadClaim q,Instant now,SuccessorOwner owner){throw browserDenied();}
+    default <T>T withSuccessorFactInTransaction(Reservation r,ReadClaim q,SuccessorOwner owner,java.util.function.Supplier<T> effect){throw browserDenied();}
     MethodReadContext requireMethodContextInTransaction(Reservation r,ReadClaim q);
     Completion recordCompletionInTransaction(Reservation r,ReadClaim q,MethodEvidence evidence,Instant now);
     Completion requireCompletionInTransaction(Reservation r,Completion expected);
@@ -54,6 +63,9 @@ public interface OwnedFailedRenewalMethodStore {
     default void requireUnobservedRecoveryInTransaction(Reservation r,Recovery expected){throw browserDenied();}
     /** Immutable cleanup identity only, independent of current session/account/debt authority. */
     default void requireRecoveryConfirmationIdentityInTransaction(RecoveryPreparationContext expected){throw browserDenied();}
+    default void terminateSuccessorConfirmationInTransaction(RecoveryPreparationContext expected,ProviderOperation claim,InvocationBudget budget,SuccessorOwner owner){throw browserDenied();}
+    default void terminateSuccessorWriteInTransaction(Reservation r,ProviderOperation original,SuccessorOwner owner){throw browserDenied();}
+    default void terminateSuccessorReadInTransaction(Reservation r,ReadClaim q,OwnedFailedRenewal.Reason reason,SuccessorOwner owner){throw browserDenied();}
     RecoveredReadContext requireRecoveredContextInTransaction(Reservation r,ReadClaim q);
     Publication recordPublicationInTransaction(Reservation r,ReadClaim q,Instant now);
     Optional<Publication> publicationInTransaction(Reservation r);

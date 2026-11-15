@@ -20,7 +20,56 @@ import static dev.genericpayments.platform.provider.application.service.OwnedFai
 
 /** Stateful caller transactions and actual FactService; all provider/persistence ports are inert. */
 class OwnedFailedRenewalMethodServiceTest {
-    private static GraceSuccessor after(Harness h,long target,String reference,Instant observed) {
+    @Test void taggedCleanupRequiresOriginalReturnedReadAndOwnerEvenAfterItsPositiveWindowExpires(){
+        var h=new Harness(300000);var r=h.taggedPrepared();var owner=SuccessorOwner.create();
+        var q=h.service.beginMethodRead(r,UUID.randomUUID(),owner);var reason=OwnedFailedRenewal.Reason.AUTHORITY_DRIFT;
+        assertThatThrownBy(()->h.service.stop(r,reason)).isInstanceOf(IllegalStateException.class);
+        assertThat(h.b.stopped).isFalse();h.authorized=false;h.b.utc=q.deadlineAt().plusSeconds(1);
+        var borrowed=new ReadClaim(UUID.randomUUID(),q.reservationId(),q.phase(),q.invocation(),q.startedAt(),q.deadlineAt(),q.fence(),q.billingSample());
+        h.b.trace.clear();h.service.terminateSuccessorRead(r,borrowed,reason,owner);
+        h.service.terminateSuccessorRead(r,q,reason,SuccessorOwner.create());
+        assertThat(h.terminal).isNull();assertThat(h.b.stopped).isFalse();
+        h.service.terminateSuccessorRead(r,q,reason,owner);h.service.terminateSuccessorRead(r,q,reason,owner);
+        assertThat(h.terminal).isEqualTo(q.id());assertThat(h.terminalWrites).isEqualTo(1);
+        assertThat(h.b.stopped).isTrue();assertThat(h.b.trace).doesNotContain("authority","account","stop","facts");
+        assertThat(h.b.cash).containsExactly("pi_initial");assertThat(h.completion).isNull();
+    }
+    @Test void taggedReadOwnersGuardBothInspectionsFactsAndReceipts() {
+        var h=new Harness(300000);var r=h.taggedPrepared();
+        var owner=SuccessorOwner.create();var copied=SuccessorOwner.create();var invocation=UUID.randomUUID();
+        assertThatThrownBy(()->h.service.beginMethodRead(r,invocation)).isInstanceOf(RuntimeException.class);
+        var q=h.service.beginMethodRead(r,invocation,owner);var c=h.service.inspectMethodRead(r,q,owner);
+        for(Runnable bypass:List.<Runnable>of(()->h.service.inspectMethodRead(r,q),()->h.service.inspectMethodRead(r,q,copied),
+            ()->h.service.publishMethod(r,q,h.evidence(),c),()->h.service.publishMethod(r,q,h.evidence(),c,copied))){
+            long seq=h.b.sequence;assertThatThrownBy(bypass::run).isInstanceOf(RuntimeException.class);
+            assertThat(h.b.sequence).isEqualTo(seq);assertThat(h.completion).isNull();assertThat(h.b.stopped).isFalse();
+        }
+        // A caller can copy the exact command, APPLIED marker and every persisted claim field.
+        var raw=h.evidence().snapshot();String key=c.operation().providerOperationKey();String factKey=OwnedFailedRenewalMethod.factKey(q);
+        var marked=new Snapshot(raw.subscriptionReference(),raw.status(),raw.billingPrice(),raw.period(),raw.trial(),raw.cancellationAt(),
+            raw.invoices(),key,true,raw.providerRevision(),raw.observedAt(),new OperationObservation(key,OperationState.APPLIED),raw.recoveryObservations(),raw.trialEvidence(),raw.externalWithdrawalEvidence());
+        var cmd=new dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Command(h.b.account,h.b.s.id(),
+            marked,SubscriptionEvent.Source.RECONCILIATION,factKey,factKey,q.fence(),r.billingSample());
+        var before=h.b.effects;
+        assertThatThrownBy(()->h.b.transactionPort.required(()->{h.b.factsPort.apply(cmd);return null;})).isInstanceOf(IllegalStateException.class);
+        assertThat(h.b.effects).isEqualTo(before);
+        h.failReceipt=true;assertThatThrownBy(()->h.service.publishMethod(r,q,h.evidence(),c,owner)).hasMessage("receipt failed");
+        assertThat(h.scope).isNull();assertThat(h.b.effects).isEqualTo(before);assertThat(h.b.stopped).isFalse();
+        h.failReceipt=false;var completed=h.service.publishMethod(r,q,h.evidence(),c,owner);
+        assertThat(h.scope).isNull();assertThat(h.completion).isEqualTo(completed);
+        var recovery=h.service.reserveRecovery(r,completed);h.b.recovery=recovery.association();
+        var observer=SuccessorOwner.create();var readInvocation=UUID.randomUUID();
+        assertThatThrownBy(()->h.service.beginRecoveredRead(r,recovery,readInvocation,observer)).isInstanceOf(RuntimeException.class);
+        assertThat(h.b.stopped).isFalse();assertThat(h.claims).doesNotContainKey(Phase.RECOVERED);h.confirmAck=true;
+        var read=h.service.beginRecoveredRead(r,recovery,readInvocation,observer);var expected=h.service.inspectRecoveredRead(r,read,observer);
+        assertThatThrownBy(()->h.service.inspectRecoveredRead(r,read,owner)).isInstanceOf(RuntimeException.class);
+        var evidence=h.recoveredEvidence();
+        assertThatThrownBy(()->h.service.publishRecovery(r,read,evidence,expected,owner)).isInstanceOf(RuntimeException.class);
+        assertThat(h.b.cash).containsExactly("pi_initial");assertThat(h.publication).isNull();assertThat(h.b.stopped).isFalse();
+        assertThat(h.service.publishRecovery(r,read,evidence,expected,observer)).isEqualTo(h.publication);
+        assertThat(h.b.cash).containsExactly("pi_initial","pi_renewal");assertThat(h.scope).isNull();
+    }
+    static GraceSuccessor after(Harness h,long target,String reference,Instant observed) {
         var old=h.b.ready.observation();
         return new GraceSuccessor(id(210),id(211),new OwnedFirstRenewal.TestClockReady(reference,old.object(),old.livemode(),
             old.name(),target,old.status(),old.created(),old.deletesAfter(),null),observed);
@@ -219,6 +268,20 @@ class OwnedFailedRenewalMethodServiceTest {
             this(customerActor,credentialsRef,sessionExpiry,authenticationDigest,10000);
         }
         GraceSuccessor savedAfter;
+        final Map<UUID,String> readOwners=new HashMap<>();ReadClaim scope;boolean confirmAck;
+        UUID terminal;int terminalWrites;
+        final List<List<Object>> writeTerminalCalls=new ArrayList<>();
+        void owner(ReadClaim q,Object last){
+            if(reservation.successor()==null)return;
+            if(!(last instanceof SuccessorOwner owner)||!owner.commitment(q.phase()==Phase.METHOD?Origin.METHOD_READ:Origin.RECOVERED_READ,q.id())
+                    .equals(readOwners.get(q.id()))||q.phase()==Phase.RECOVERED&&!confirmAck)throw new IllegalStateException("read owner unavailable");
+        }
+        Reservation taggedPrepared(){
+            savedAfter=after(this,260301,"clock_owned",b.utc);
+            var r=service.reserveBrowserMethodAfterGrace(b.admission,savedAfter,context,true);
+            acks=true;b.methodSetup=new SubscriptionBillingProofStore.Setup(r.setupOperationId(),b.s.id(),b.account.id(),id(91),"seti_owned","pm_owned");
+            service.recordMethodUpdateReply(r,context);return r;
+        }
         Harness(long periodEnd){this(true,"alias",UTC.plusSeconds(600),value->"digest:"+value,periodEnd);}
         Harness(boolean customerActor,String credentialsRef,Instant sessionExpiry,dev.genericpayments.platform.shared.application.port.out.DigestPort authenticationDigest,long periodEnd){
             b=new OwnedFailedRenewalServiceTest.Harness(true,credentialsRef,periodEnd);
@@ -232,7 +295,31 @@ class OwnedFailedRenewalMethodServiceTest {
                 if(bindingEnabled&&oldSetup!=null&&oldSetup.method()==null&&b.methodSetup!=null&&b.methodSetup.method()!=null)afterBindingCommit.run();
                 return result;
             }};
-            var store=port(OwnedFailedRenewalMethodStore.class,(m,a)->{assertThat(b.active).isTrue();return switch(m){
+            var store=port(OwnedFailedRenewalMethodStore.class,(m,a)->{assertThat(b.active).isTrue();
+                if(reservation!=null&&reservation.successor()!=null){
+                    if(List.of("requireReadInTransaction","requireMethodContextInTransaction","requireRecoveredContextInTransaction",
+                        "recordCompletionInTransaction","recordPublicationInTransaction").contains(m))owner((ReadClaim)a[1],a[a.length-1]);
+                    if(List.of("recordCompletionInTransaction","recordPublicationInTransaction").contains(m)&&!a[1].equals(scope))
+                        throw new IllegalStateException("receipt outside fact scope");
+                }
+                return switch(m){
+                case "withSuccessorFactInTransaction"->{
+                    var q=(ReadClaim)a[1];same((Reservation)a[0]);read(q);owner(q,a[2]);
+                    if(scope!=null)throw new IllegalStateException("nested scope");scope=q;
+                    try{yield ((Supplier<?>)a[3]).get();}finally{scope=null;}
+                }
+                case "terminateSuccessorWriteInTransaction"->{writeTerminalCalls.add(List.of(a[0],a[1],a[2]));yield null;}
+                case "terminateSuccessorConfirmationInTransaction"->{
+                    // C's default-deny terminal port. D owns the atomic transition matrix.
+                    b.trace.add("typed-confirm-cleanup");throw new IllegalStateException("terminal unavailable");
+                }
+                case "terminateSuccessorReadInTransaction"->{
+                    var r=(Reservation)a[0];var q=(ReadClaim)a[1];var privateOwner=(SuccessorOwner)a[3];
+                    if(!reservation.equals(r)||!q.equals(claims.get(q.phase()))||terminal!=null||publication!=null||q.phase()==Phase.METHOD&&completion!=null)yield null;
+                    String digest=privateOwner.commitment(q.phase()==Phase.METHOD?Origin.METHOD_READ:Origin.RECOVERED_READ,q.id());
+                    if(digest.equals(readOwners.get(q.id()))){terminal=q.id();terminalWrites++;b.stopped=true;}
+                    yield null;
+                }
                 case "requireGraceSuccessorEntryInTransaction"->{
                     b.trace.add("after-entry");
                     if(!b.admission.equals(a[0])||savedAfter==null||!savedAfter.equals(a[1])||reservation!=null)throw new IllegalStateException("invalid AFTER");
@@ -304,7 +391,10 @@ class OwnedFailedRenewalMethodServiceTest {
                         if(setup==null||method==null||setup.status()!=ProviderOperation.Status.ACKNOWLEDGED||method.status()!=ProviderOperation.Status.ACKNOWLEDGED||b.methodSetup==null||b.methodSetup.method()==null)throw new IllegalStateException("not prepared");
                     }else if(!acks)throw new IllegalStateException("not prepared");
                     if(o.status()!=SubscriptionOperation.Status.RESERVED)throw new IllegalStateException("not prepared");yield methodContext();}
-                case "claimReadInTransaction"->{same((Reservation)a[0]);var phase=(Phase)a[1];if(claims.containsKey(phase))throw new IllegalStateException("duplicate claim");var q=new ReadClaim(UUID.randomUUID(),reservation.id(),phase,(UUID)a[2],(Instant)a[5],((Instant)a[5]).plusSeconds(30),(Fence)a[3],(SubscriptionBillingTimePort.Sample)a[4]);claims.put(phase,q);yield q;}
+                case "claimReadInTransaction"->{same((Reservation)a[0]);var phase=(Phase)a[1];if(claims.containsKey(phase))throw new IllegalStateException("duplicate claim");var q=new ReadClaim(UUID.randomUUID(),reservation.id(),phase,(UUID)a[2],(Instant)a[5],((Instant)a[5]).plusSeconds(30),(Fence)a[3],(SubscriptionBillingTimePort.Sample)a[4]);
+                    if(reservation.successor()!=null){if(a.length!=7||!(a[6] instanceof SuccessorOwner owner)||phase==Phase.RECOVERED&&!confirmAck)throw new IllegalStateException("claim owner/ACK required");
+                        readOwners.put(q.id(),owner.commitment(phase==Phase.METHOD?Origin.METHOD_READ:Origin.RECOVERED_READ,q.id()));}
+                    claims.put(phase,q);yield q;}
                 case "requireReadInTransaction"->{read((ReadClaim)a[1]);yield a[1];}
                 case "requireMethodContextInTransaction"->{read((ReadClaim)a[1]);yield methodContext();}
                 case "requireRecoveredContextInTransaction"->{read((ReadClaim)a[1]);yield new RecoveredReadContext(b.account,b.s,b.binding,b.ops.get(recovery.association().operationId()),completion,recovery,reservation.billingSample());}
@@ -325,6 +415,7 @@ class OwnedFailedRenewalMethodServiceTest {
                     yield null;
                 }
                 case "requireMethodFactInTransaction","requireRecoveryFactInTransaction"->{var c=(dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Command)a[0];var phase=m.equals("requireMethodFactInTransaction")?Phase.METHOD:Phase.RECOVERED;var q=claims.get(phase);read(q);assertThat(c.factKey()).isEqualTo(OwnedFailedRenewalMethod.factKey(q));assertThat(c.fence()).isEqualTo(q.fence());
+                    if(reservation.successor()!=null&&!q.equals(scope))throw new IllegalStateException("facts outside owner scope");
                     if(phase==Phase.RECOVERED){assertThat(c.snapshot().paymentMethodReady()).isFalse();assertThat(c.snapshot().operationKey()).isEqualTo(b.ops.get(recovery.association().operationId()).providerOperationKey());assertThat(c.snapshot().operationObservation()).isEqualTo(new OperationObservation(c.snapshot().operationKey(),OperationState.APPLIED));}yield null;}
                 case "recordPublicationInTransaction"->{b.trace.add("publication");if(failReceipt)throw new IllegalStateException("receipt failed");assertThat(b.s.debt()).isNull();publication=new Publication(reservation.id(),new OwnedFailedRenewal.Publication(b.admission.id(),((ReadClaim)a[1]).id(),recovery.association().operationId(),b.failure.billId(),UUID.randomUUID(),b.s.revision(),b.utc),b.sequence);yield publication;}
                 default->throw new AssertionError(m);

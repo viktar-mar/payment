@@ -21,6 +21,25 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Bare scripted JDBC and actual public adapters; no DataSource, Spring, SQL engine or SDK runtime. */
 class OwnedRecoveryConfirmIsolationTest {
+    @Test void taggedPositiveConfirmationRequiresKnownReadCommittedCallerBeforeSql(){
+        var f=new dev.genericpayments.platform.provider.application.service.OwnedRecoveryInertFixture(value->"digest:"+value,true);
+        var h=new dev.genericpayments.platform.provider.application.service.OwnedRecoveryConfirmInertFixture(f);
+        var owner=dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner.create();
+        var c=h.expected();var budget=new dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.InvocationBudget(f.clock(),()->0L);
+        var claim=h.service().claim(c,f.command(),"inert",budget,owner);
+        for(String mode:List.of("unconfigured","foreignFactory","foreignConnection","repeatableRead")){
+            var caller=new OwnedFailedRenewalStoreTransactionTest.JpaBoundary(mode);caller.bind();
+            try{
+                var configured=mode.equals("foreignFactory")?new OwnedFailedRenewalStoreTransactionTest.JpaBoundary("valid").factory:caller.factory;
+                var receipts=mode.equals("unconfigured")?new JdbcOwnedRecoveryConfirmStore(caller.jdbc):new JdbcOwnedRecoveryConfirmStore(caller.jdbc,configured);
+                for(Runnable attempt:List.<Runnable>of(()->receipts.insertAndClaimInTransaction(c,"inert",f.now(),budget,owner),
+                        ()->receipts.requireClaimInTransaction(c,claim,budget,f.now(),owner),
+                        ()->receipts.acknowledgeInTransaction(c,claim,null,f.now(),budget,owner)))
+                    assertThatThrownBy(attempt::run).as(mode).isInstanceOf(IllegalStateException.class).hasMessage("OWNED_RECOVERY_CONFIRM_UNAVAILABLE");
+                assertThat(caller.queries).hasValue(0);
+            }finally{caller.unbind();}
+        }
+    }
     private static final Instant NOW=Instant.parse("2026-11-08T12:00:00Z");
     private static final Kind DEDICATED=Kind.OWNED_RECOVERY_INTENT_CONFIRM;
 

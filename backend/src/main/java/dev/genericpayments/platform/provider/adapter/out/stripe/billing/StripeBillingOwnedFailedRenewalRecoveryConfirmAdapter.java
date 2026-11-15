@@ -48,10 +48,12 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
     }
     public ConfirmationAck confirm(Reservation reservation,Completion completion,Recovery recovery,SubscriptionCommandContext originalContext){
         RecoveryPreparationContext original=null;ProviderOperation owned=null;
+        SuccessorOwner privateOwner=null;
         final InvocationBudget budget;
         try{budget=new InvocationBudget(utc,nanos);}catch(RuntimeException failure){throw unavailable();}
         try{
             budget.remainingNanos(null);
+            if(reservation!=null&&reservation.successor()!=null)privateOwner=SuccessorOwner.create();
             var prepared=remotePreflight.inspect(reservation,completion,recovery,originalContext,budget);
             original=prepared.original();checkpoint(budget,null,original);
             if(!reservation.equals(original.reservation())||!completion.equals(original.completion())||!recovery.equals(original.recovery())
@@ -62,13 +64,17 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
             var resolved=credentials.resolve(original.account());checkpoint(budget,null,original);
             var client=clients.create(resolved);checkpoint(budget,null,original);
             String fingerprint=OwnedRecoveryConfirmService.fingerprint(original,digest);
-            var claim=confirmations.claim(original,originalContext,UUID.randomUUID().toString(),budget);
+            String claimant=UUID.randomUUID().toString();
+            var claim=privateOwner==null?confirmations.claim(original,originalContext,claimant,budget)
+                :confirmations.claim(original,originalContext,claimant,budget,privateOwner);
             // Only the service's successfully returned independently committed first claim owns cleanup.
             owned=claim;checkpoint(budget,claim,original);
             if(!fingerprint.equals(claim.fingerprint())||claim.kind()!=ProviderOperation.Kind.OWNED_RECOVERY_INTENT_CONFIRM
                     ||!original.recoveryOperation().id().equals(claim.resourceId())
                     ||!(original.recoveryOperation().providerOperationKey()+":CONFIRM").equals(claim.operationKey()))throw unavailable();
-            if(!claim.equals(confirmations.inspectClaim(original,claim,originalContext,budget)))throw unavailable();
+            var current=privateOwner==null?confirmations.inspectClaim(original,claim,originalContext,budget)
+                :confirmations.inspectClaim(original,claim,originalContext,budget,privateOwner);
+            if(!claim.equals(current))throw unavailable();
             checkpoint(budget,claim,original);
             String key=new ProviderOperationGuard().requireDispatch(claim,original.account(),fingerprint,utc.instant());
             var params=PaymentIntentConfirmParams.builder().setPaymentMethod(completion.method()).setOffSession(true).setErrorOnRequiresAction(true).build();
@@ -78,9 +84,13 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
             var reply=reply(remote,original,utc.instant());checkpoint(budget,claim,original);
             // Success changes the remote graph. Only fresh local original authority and the exact
             // claim/reply are checked by this atomic ACK; the independent observer owns settlement.
-            return confirmations.acknowledge(original,claim,reply,originalContext,budget);
+            return privateOwner==null?confirmations.acknowledge(original,claim,reply,originalContext,budget)
+                :confirmations.acknowledge(original,claim,reply,originalContext,budget,privateOwner);
         }catch(RuntimeException failure){
-            if(owned!=null&&original!=null)try{confirmations.uncertain(original,owned,budget);}catch(RuntimeException ignored){/* Keep consumed evidence. */}
+            if(owned!=null&&original!=null)try{
+                if(privateOwner==null)confirmations.uncertain(original,owned,budget);
+                else confirmations.uncertain(original,owned,budget,privateOwner);
+            }catch(RuntimeException ignored){/* Keep consumed evidence. */}
             throw unavailable();
         }
     }

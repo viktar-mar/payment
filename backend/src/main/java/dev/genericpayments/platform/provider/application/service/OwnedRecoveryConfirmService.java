@@ -1,6 +1,7 @@
 package dev.genericpayments.platform.provider.application.service;
 
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.RecoveryPreparationContext;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner;
 import dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.*;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation.*;
@@ -21,22 +22,36 @@ public final class OwnedRecoveryConfirmService {
         this.methods=Objects.requireNonNull(methods);this.store=Objects.requireNonNull(store);this.transactions=Objects.requireNonNull(transactions);this.clock=Objects.requireNonNull(clock);
     }
     public ProviderOperation claim(RecoveryPreparationContext expected,SubscriptionCommandContext originalContext,String claimant,InvocationBudget budget){
+        return claim(expected,originalContext,claimant,budget,null);
+    }
+    public ProviderOperation claim(RecoveryPreparationContext expected,SubscriptionCommandContext originalContext,String claimant,InvocationBudget budget,SuccessorOwner owner){
+        requireOwnerMode(expected,owner);
         if(claimant==null||claimant.isBlank()||claimant.length()>128||claimant.codePoints().anyMatch(Character::isISOControl))throw denied();
         return transition(expected,originalContext,budget,null,c->{
             if(store.lockInTransaction(c).isPresent())throw denied();
-        },c->{var claim=store.insertAndClaimInTransaction(c,claimant,clock.instant(),budget);requireExactClaim(c,claim);
+        },c->{var now=clock.instant();var claim=owner==null?store.insertAndClaimInTransaction(c,claimant,now,budget)
+                :store.insertAndClaimInTransaction(c,claimant,now,budget,owner);requireExactClaim(c,claim);
             if(!claimant.equals(claim.leaseOwner()))throw denied();return claim;});
     }
     public ProviderOperation inspectClaim(RecoveryPreparationContext expected,ProviderOperation claim,SubscriptionCommandContext originalContext,InvocationBudget budget){
+        return inspectClaim(expected,claim,originalContext,budget,null);
+    }
+    public ProviderOperation inspectClaim(RecoveryPreparationContext expected,ProviderOperation claim,SubscriptionCommandContext originalContext,InvocationBudget budget,SuccessorOwner owner){
+        requireOwnerMode(expected,owner);
         requireExactClaim(expected,claim);
         return transition(expected,originalContext,budget,claim,c->{if(!store.lockInTransaction(c).filter(claim::equals).isPresent())throw denied();},
-            c->{var current=store.requireClaimInTransaction(c,claim,budget,clock.instant());if(!claim.equals(current))throw denied();return current;});
+            c->requireClaim(c,claim,budget,owner));
     }
     public ConfirmationAck acknowledge(RecoveryPreparationContext expected,ProviderOperation claim,ConfirmReply reply,SubscriptionCommandContext originalContext,InvocationBudget budget){
+        return acknowledge(expected,claim,reply,originalContext,budget,null);
+    }
+    public ConfirmationAck acknowledge(RecoveryPreparationContext expected,ProviderOperation claim,ConfirmReply reply,SubscriptionCommandContext originalContext,InvocationBudget budget,SuccessorOwner owner){
+        requireOwnerMode(expected,owner);
         requireExactClaim(expected,claim);requireReply(expected,claim,reply);
         return transition(expected,originalContext,budget,claim,c->{if(!store.lockInTransaction(c).filter(claim::equals).isPresent())throw denied();},c->{
-            if(!claim.equals(store.requireClaimInTransaction(c,claim,budget,clock.instant())))throw denied();requireReply(c,claim,reply);
-            var ack=store.acknowledgeInTransaction(c,claim,reply,clock.instant(),budget);var op=ack.operation();
+            requireClaim(c,claim,budget,owner);requireReply(c,claim,reply);
+            var now=clock.instant();var ack=owner==null?store.acknowledgeInTransaction(c,claim,reply,now,budget)
+                :store.acknowledgeInTransaction(c,claim,reply,now,budget,owner);var op=ack.operation();
             if(!op.id().equals(claim.id())||!op.accountId().equals(claim.accountId())||!op.resourceId().equals(claim.resourceId())
                     ||!op.operationKey().equals(claim.operationKey())||!op.fingerprint().equals(claim.fingerprint())
                     ||!op.externalAccountId().equals(claim.externalAccountId())||!op.credentialsRef().equals(claim.credentialsRef())
@@ -45,14 +60,29 @@ public final class OwnedRecoveryConfirmService {
         });
     }
     public void uncertain(RecoveryPreparationContext expected,ProviderOperation claim,InvocationBudget budget){
+        uncertain(expected,claim,budget,null);
+    }
+    public void uncertain(RecoveryPreparationContext expected,ProviderOperation claim,InvocationBudget budget,SuccessorOwner owner){
         fresh();try{
             // Cleanup uses only the original immutable invocation identity, even after expiry.
-            if(budget==null)throw denied();
+            if(budget==null)throw denied();requireOwnerMode(expected,owner);
             requireExactClaim(expected,claim);
+            if(owner!=null){
+                transactions.requiresNew(()->{methods.terminateSuccessorConfirmationInTransaction(expected,claim,budget,owner);return null;});
+                return;
+            }
             transactions.requiresNew(()->{methods.consumeRecoveryConfirmationInTransaction(expected,()->{
                 if(!store.lockInTransaction(expected).filter(claim::equals).isPresent())return false;return store.unknownInTransaction(expected,claim,budget);
             });return null;});
         }catch(RuntimeException ignored){/* Preserve consumed evidence. Cleanup never reacquires authority. */}
+    }
+    private ProviderOperation requireClaim(RecoveryPreparationContext c,ProviderOperation claim,InvocationBudget budget,SuccessorOwner owner){
+        var now=clock.instant();var current=owner==null?store.requireClaimInTransaction(c,claim,budget,now)
+            :store.requireClaimInTransaction(c,claim,budget,now,owner);
+        if(!claim.equals(current))throw denied();return current;
+    }
+    private static void requireOwnerMode(RecoveryPreparationContext c,SuccessorOwner owner){
+        if(c==null||(c.reservation().successor()!=null)!=(owner!=null))throw denied();
     }
     private <T>T transition(RecoveryPreparationContext expected,SubscriptionCommandContext context,InvocationBudget budget,ProviderOperation claim,
             java.util.function.Consumer<RecoveryPreparationContext> lock,Function<RecoveryPreparationContext,T> effect){

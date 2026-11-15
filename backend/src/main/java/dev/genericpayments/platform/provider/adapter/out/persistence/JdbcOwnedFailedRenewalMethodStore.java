@@ -148,10 +148,134 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
     private void requireSuccessorCaller(Reservation r){
         if(r!=null&&r.successor()!=null)successorCaller();
     }
+    private static void readOwnerMode(Reservation r,SuccessorOwner owner){
+        transaction();if(r==null||(r.successor()!=null)!=(owner!=null))throw unavailable();
+    }
+    private static String readCommitment(ReadClaim q,SuccessorOwner owner){
+        return owner.commitment(q.phase()==Phase.METHOD?Origin.METHOD_READ:Origin.RECOVERED_READ,q.id());
+    }
+    @Override public void terminateSuccessorWriteInTransaction(Reservation r,ProviderOperation claim,SuccessorOwner owner){
+        terminate(r,owner,limit->{
+            if(claim==null||!r.setupOperationId().equals(claim.resourceId()))throw unavailable();
+            var origin=switch(claim.kind()){
+                case SETUP_INTENT_CREATE->Origin.SETUP_WRITE;
+                case SUBSCRIPTION_UPDATE->Origin.METHOD_WRITE;
+                default->throw unavailable();
+            };
+            requireOriginalDispatch(claim);
+            require("""
+                select exists(select 1 from stripe_billing_failed_grace_method_claims q where
+                  (q.reservation_id,q.operation_id,q.setup_operation,q.payment_account_id,q.step_kind,q.operation_key,q.fingerprint,
+                   q.external_account_id,q.credentials_ref,q.first_dispatched_at,q.lease_expires_at,q.retry_before,q.claim_version,q.successor_owner_digest)
+                  =(?,?,?,?,?,?,?,?,?,?,?,?,?,?) and q.successor_producer_xid<>pg_current_xact_id())
+                """,r.id(),claim.id(),claim.resourceId(),claim.accountId().value(),claim.kind().name(),claim.operationKey(),claim.fingerprint(),
+                claim.externalAccountId(),claim.credentialsRef(),time(claim.firstDispatchedAt()),time(claim.leaseExpiresAt()),time(claim.retryBefore()),claim.version(),claim.leaseOwner());
+            insertTerminal(r,origin,claim.id(),owner,OwnedFailedRenewal.Reason.UNCERTAIN,limit);
+        });
+    }
+    @Override public void terminateSuccessorReadInTransaction(Reservation r,ReadClaim q,OwnedFailedRenewal.Reason reason,SuccessorOwner owner){
+        terminate(r,owner,limit->{
+            storedRead(r,q);
+            insertTerminal(r,q.phase()==Phase.METHOD?Origin.METHOD_READ:Origin.RECOVERED_READ,q.id(),owner,Objects.requireNonNull(reason),limit);
+        });
+    }
+    @Override public void terminateSuccessorConfirmationInTransaction(RecoveryPreparationContext c,ProviderOperation claim,
+            dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.InvocationBudget budget,SuccessorOwner owner){
+        if(c==null)throw unavailable();
+        var r=c.reservation();
+        terminate(r,owner,limit->{
+            requireOriginalDispatch(claim);
+            if(budget==null||claim.kind()!=ProviderOperation.Kind.OWNED_RECOVERY_INTENT_CONFIRM
+                    ||!claim.resourceId().equals(c.recoveryOperation().id()))throw unavailable();
+            requireRecoveryConfirmationIdentityInTransaction(c);
+            var saved=JdbcProviderOperationStore.row(jdbc,claim.id()).orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable);
+            if(!claim.equals(saved))return;
+            require("""
+                select exists(select 1 from stripe_billing_failed_recovery_confirm_claims q where
+                  (q.reservation_id,q.provider_operation,q.claimant,q.claimed_at,q.deadline,q.invocation,q.entered_at,q.deadline_at)
+                  =(?,?,?,?,?,?,?,?) and q.recorded_transaction<>pg_current_xact_id())
+                """,r.id(),claim.id(),claim.leaseOwner(),time(claim.firstDispatchedAt()),time(claim.leaseExpiresAt()),budget.invocation(),
+                time(budget.enteredAt().truncatedTo(ChronoUnit.MICROS)),time(budget.deadlineAt().truncatedTo(ChronoUnit.MICROS)));
+            insertTerminal(r,Origin.RECOVERY_CONFIRM,claim.id(),owner,OwnedFailedRenewal.Reason.UNCERTAIN,limit);
+        });
+    }
+    private static void requireOriginalDispatch(ProviderOperation claim){
+        if(claim==null||claim.status()!=ProviderOperation.Status.DISPATCHING||claim.version()!=1||claim.providerReference()!=null
+                ||claim.firstDispatchedAt()==null||claim.firstDispatchedAt().getNano()%1000!=0||claim.leaseOwner()==null
+                ||!claim.firstDispatchedAt().plusSeconds(60).equals(claim.leaseExpiresAt())
+                ||!claim.firstDispatchedAt().plusSeconds(23*3600L).equals(claim.retryBefore()))throw unavailable();
+    }
+    private void terminate(Reservation r,SuccessorOwner owner,java.util.function.LongConsumer action){
+        long start=System.nanoTime();var caller=successorCaller();
+        if(!TransactionSynchronizationManager.isSynchronizationActive()||r==null||r.successor()==null||owner==null)throw unavailable();
+        terminalLimit(start);
+        jdbc.queryForList("select lock_owned_grace_successor_terminal(?)",r.id());
+        if(!reservation(r.id()).equals(r))throw unavailable();
+        terminalLimit(start);
+        if(Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from stripe_billing_failed_grace_successor_terminals where reservation_id=?)",
+                Boolean.class,r.id())))return;
+        action.accept(start);caller.requireReadCommitted();
+    }
+    private void terminalLimit(long start){
+        long elapsed=System.nanoTime()-start,remaining=(2_000_000_000L-elapsed)/1_000_000L;
+        if(elapsed<0||remaining<=0)throw unavailable();
+        jdbc.queryForList("select owned_failed_grace_limits(?,true)",remaining);
+    }
+    private void insertTerminal(Reservation r,Origin origin,UUID id,SuccessorOwner owner,OwnedFailedRenewal.Reason reason,long start){
+        terminalLimit(start);var caller=successorCaller();
+        jdbc.update("""
+            insert into stripe_billing_failed_grace_successor_terminals(reservation_id,admission_id,origin,origin_id,owner_nonce,successor_owner_digest,reason)
+            values(?,?,?,?,?,?,?)
+            """,r.id(),r.admission().id(),origin.name(),id,owner.nonce(),owner.commitment(origin,id),reason.name());
+        terminalLimit(start);
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization(){
+            @Override public void beforeCommit(boolean readOnly){
+                if(readOnly)throw unavailable();terminalLimit(start);
+                caller.requireReadCommitted().flush();caller.requireReadCommitted();terminalLimit(start);
+                require("select owned_grace_terminal_complete(?,pg_current_xact_id())",r.id());
+                terminalLimit(start);caller.requireReadCommitted();
+            }
+        });
+    }
+    private void beforeReadCommit(Runnable proof){
+        var caller=successorCaller();
+        if(!TransactionSynchronizationManager.isSynchronizationActive())throw unavailable();
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization(){
+            @Override public void beforeCommit(boolean readOnly){
+                if(readOnly)throw unavailable();
+                caller.requireReadCommitted().flush();caller.requireReadCommitted();
+                proof.run();caller.requireReadCommitted();
+            }
+        });
+    }
+    private static final Object FACT_SCOPE_KEY=new Object();
+    private record FactScope(Reservation reservation,ReadClaim claim,
+            SuccessorOwner owner,OwnedGraceCallerConnection caller){}
+    private FactScope requireFactScope(Reservation r,ReadClaim q,SuccessorOwner supplied){
+        if(!(TransactionSynchronizationManager.getResource(FACT_SCOPE_KEY) instanceof FactScope scope)
+                ||!scope.reservation().equals(r)||!scope.claim().equals(q)
+                ||supplied!=null&&supplied!=scope.owner())throw unavailable();
+        scope.caller().requireReadCommitted(jdbc,factory);return scope;
+    }
+    @Override public <T>T withSuccessorFactInTransaction(Reservation r,ReadClaim q,SuccessorOwner owner,java.util.function.Supplier<T> effect){
+        if(owner==null||effect==null||TransactionSynchronizationManager.hasResource(FACT_SCOPE_KEY))throw unavailable();
+        var caller=successorCaller();requireReadInTransaction(r,q,owner);caller.requireReadCommitted();
+        var scope=new FactScope(r,q,owner,caller);
+        TransactionSynchronizationManager.bindResource(FACT_SCOPE_KEY,scope);
+        try{
+            var result=effect.get();requireFactScope(r,q,owner);return result;
+        }finally{
+            if(TransactionSynchronizationManager.unbindResourceIfPossible(FACT_SCOPE_KEY)!=scope)throw unavailable();
+        }
+    }
     private JdbcOwnedMethodBrowserStore browser(Reservation r){requireSuccessorCaller(r);return browser();}
     @Override public Enrollment requireBrowserSetupEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser(r).setupEnrollment(r,s,now);}
     @Override public Enrollment requireBrowserRecoveryIdentityInTransaction(Reservation r,CustomerSessionContext s){return browser().recoveryIdentity(r,s);}
-    @Override public Enrollment requireBrowserRecoveryEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser(r).recoveryEnrollment(r,s,now);}
+    @Override public Enrollment requireBrowserRecoveryEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){
+        var enrollment=browser(r).recoveryEnrollment(r,s,now);
+        requireSealedMethodWrites(r);
+        return enrollment;
+    }
     @Override public Optional<Enrollment> requireReplyEnrollmentInTransaction(Reservation r,CustomerSessionContext s,Instant now){return browser(r).replyEnrollment(r,s,now);}
     @Override public BoundSetup requireBrowserBoundSetupInTransaction(Reservation r,CustomerSessionContext s,Instant now){
         return requireBrowserSetup(r,s,now,true);
@@ -233,30 +357,53 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
     @Override public MethodReadContext requirePreparedMethodInTransaction(Reservation r) {
         requireSuccessorCaller(r);
         requireReservationInTransaction(r);
+        requireSealedMethodWrites(r);
         require("select owned_method_debt(?,0,?) and owned_method_steps(?) and owned_method_initial_operation(?)",r.id(),r.setupOperationId(),r.id(),r.id());
         var o=operation(r,r.setupOperationId());
         if(o.status()!=SubscriptionOperation.Status.RESERVED||o.version()!=r.initialOperationVersion()||o.safeFailureCode()!=null)throw unavailable();
         return methodContext(r,o);
     }
+    private void requireSealedMethodWrites(Reservation r){
+        if(r.successor()!=null)require("select owned_grace_method_writes_acked(?,pg_current_xact_id())",r.id());
+    }
     @Override public ReadClaim claimReadInTransaction(Reservation r,Phase phase,UUID invocation,Fence fence,Sample sample,Instant now) {
+        return claimReadInTransaction(r,phase,invocation,fence,sample,now,null);
+    }
+    @Override public ReadClaim claimReadInTransaction(Reservation r,Phase phase,UUID invocation,Fence fence,Sample sample,Instant now,SuccessorOwner owner){
+        readOwnerMode(r,owner);
         requireSuccessorCaller(r);
         requireReservationInTransaction(r);
         var at=utc(now);var q=new ReadClaim(UUID.randomUUID(),r.id(),phase,invocation,at,at.plusSeconds(30),fence,sample);
         if(!sample.equals(r.billingSample()))throw unavailable();
         int count=jdbc.update("""
             insert into stripe_billing_failed_method_reads(id,reservation_id,phase,invocation,started_at,deadline_at,captured_revision,
-             observation_sequence,selected_operation,selected_version,operation_snapshot,setup_step_snapshot,method_step_snapshot,billing_at,billing_mode)
-            select ?,?,?,?,?,?,?,?,?,?,to_jsonb(o),to_jsonb(setup),to_jsonb(method),?,'ISOLATED'
+             observation_sequence,selected_operation,selected_version,operation_snapshot,setup_step_snapshot,method_step_snapshot,billing_at,billing_mode,successor_owner_digest)
+            select ?,?,?,?,?,?,?,?,?,?,to_jsonb(o),to_jsonb(setup),to_jsonb(method),?,'ISOLATED',?
             from stripe_subscription_setup_proofs p join provider_operations setup on setup.id=p.step_id
             join provider_operations method on method.resource_id=p.operation_id and method.payment_account_id=p.payment_account_id and method.kind='SUBSCRIPTION_UPDATE'
             join subscription_operations o on o.id=? where p.operation_id=?
             """,q.id(),r.id(),phase.name(),invocation,time(at),time(q.deadlineAt()),fence.revision(),fence.observationSequence(),
-            fence.operationId(),fence.operationVersion(),time(sample.billingAt()),fence.operationId(),r.setupOperationId());
+            fence.operationId(),fence.operationVersion(),time(sample.billingAt()),owner==null?null:readCommitment(q,owner),fence.operationId(),r.setupOperationId());
         if(count!=1)throw unavailable();
-        return requireReadInTransaction(r,q);
+        if(owner!=null)beforeReadCommit(()->checkRead(r,q,owner,true));
+        return checkRead(r,q,owner,true);
     }
     @Override public ReadClaim requireReadInTransaction(Reservation r,ReadClaim q) {
+        return requireReadInTransaction(r,q,null);
+    }
+    @Override public ReadClaim requireReadInTransaction(Reservation r,ReadClaim q,SuccessorOwner owner) {
+        readOwnerMode(r,owner);return checkRead(r,q,owner,false);
+    }
+    private ReadClaim checkRead(Reservation r,ReadClaim q,SuccessorOwner owner,boolean inserting){
+        if(owner!=null)successorCaller();
         requireReservationInTransaction(r);storedRead(r,q);liveWindow(q);
+        if(owner!=null){
+            require("""
+                select exists(select 1 from stripe_billing_failed_method_reads q where q.id=? and q.reservation_id=?
+                 and q.successor_owner_digest=? and (q.successor_producer_xid=pg_current_xact_id())=?
+                 and owned_grace_read_predecessor(q.reservation_id,q.phase,q.started_at,pg_current_xact_id()))
+                """,q.id(),r.id(),readCommitment(q,owner),inserting);
+        }
         if(!q.billingSample().equals(r.billingSample()))throw unavailable();
         require("""
             select exists(select 1 from stripe_billing_failed_method_reservations r join stripe_billing_failed_renewals d on d.id=r.admission_id
@@ -279,11 +426,20 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         return q;
     }
     @Override public MethodReadContext requireMethodContextInTransaction(Reservation r,ReadClaim q) {
-        requireReadInTransaction(r,q);if(q.phase()!=Phase.METHOD)throw unavailable();
+        return requireMethodContextInTransaction(r,q,null);
+    }
+    @Override public MethodReadContext requireMethodContextInTransaction(Reservation r,ReadClaim q,SuccessorOwner owner){
+        readOwnerMode(r,owner);
+        requireReadInTransaction(r,q,owner);if(q.phase()!=Phase.METHOD)throw unavailable();
         return methodContext(r,operation(r,q.fence().operationId()));
     }
     @Override public Completion recordCompletionInTransaction(Reservation r,ReadClaim q,MethodEvidence e,Instant now) {
+        return recordCompletionInTransaction(r,q,e,now,null);
+    }
+    @Override public Completion recordCompletionInTransaction(Reservation r,ReadClaim q,MethodEvidence e,Instant now,SuccessorOwner owner){
+        readOwnerMode(r,owner);
         requireSuccessorCaller(r);
+        if(owner!=null)requireFactScope(r,q,owner);
         // Effects already happened. Authenticate the saved claim directly, never call requireRead/prestate here.
         requireReservationInTransaction(r);storedRead(r,q);liveWindow(q);
         if(q.phase()!=Phase.METHOD||e==null)throw unavailable();
@@ -301,6 +457,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
             join provider_operations method on method.resource_id=o.id and method.payment_account_id=d.payment_account_id and method.kind='SUBSCRIPTION_UPDATE' where r.id=?
             """,r.id(),q.id(),time(now),r.id());
         if(count!=1)throw unavailable();
+        if(owner!=null)beforeReadCommit(()->require("select owned_method_lineage(?) and owned_method_completed(?) and owned_grace_method_writes_acked(?,pg_current_xact_id())",r.id(),r.id(),r.id()));
         return requireCompletionInTransaction(r,completion(r));
     }
     @Override public Completion requireCompletionInTransaction(Reservation r,Completion expected) {
@@ -326,6 +483,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
             insert into stripe_billing_failed_method_recoveries(reservation_id,operation_id,observation_sequence,operation_version,associated_at)
             values(?,?,?,?,?)
             """,r.id(),recover.id(),c.observationSequence(),recover.version(),time(now));
+        if(r.successor()!=null)beforeReadCommit(()->require("select owned_method_recovery_pre(?)",r.id()));
         return requireRecoveryInTransaction(r,recovery(r));
     }
     @Override public Recovery requireRecoveryInTransaction(Reservation r,Recovery expected) {
@@ -334,7 +492,11 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         require("select owned_method_recovery_pre(?)",r.id());return expected;
     }
     @Override public RecoveredReadContext requireRecoveredContextInTransaction(Reservation r,ReadClaim q) {
-        requireReadInTransaction(r,q);if(q.phase()!=Phase.RECOVERED)throw unavailable();
+        return requireRecoveredContextInTransaction(r,q,null);
+    }
+    @Override public RecoveredReadContext requireRecoveredContextInTransaction(Reservation r,ReadClaim q,SuccessorOwner owner){
+        readOwnerMode(r,owner);
+        requireReadInTransaction(r,q,owner);if(q.phase()!=Phase.RECOVERED)throw unavailable();
         return new RecoveredReadContext(account(r),subscription(r),r.binding(),operation(r,q.fence().operationId()),completion(r),recovery(r),q.billingSample());
     }
     @Override public void requireUnobservedRecoveryInTransaction(Reservation r,Recovery expected){
@@ -357,6 +519,11 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
                 ||!expected.account().credentialsRef().equals(owner.credentialsRef()))throw unavailable();
     }
     @Override public Publication recordPublicationInTransaction(Reservation r,ReadClaim q,Instant now) {
+        return recordPublicationInTransaction(r,q,now,null);
+    }
+    @Override public Publication recordPublicationInTransaction(Reservation r,ReadClaim q,Instant now,SuccessorOwner owner){
+        readOwnerMode(r,owner);
+        if(owner!=null)requireFactScope(r,q,owner);
         requireSuccessorCaller(r);
         requireReservationInTransaction(r);storedRead(r,q);liveWindow(q);
         if(q.phase()!=Phase.RECOVERED)throw unavailable();q.requireAccepted(now,now);
@@ -365,14 +532,22 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
             select ?,?,x.operation_id,state.renewal_payment,state.projected_revision,state.observation_sequence,?
             from stripe_billing_failed_method_recoveries x join owned_method_projected(x.reservation_id) state on true where x.reservation_id=?
             """,r.id(),q.id(),time(now),r.id());
-        if(count!=1)throw unavailable();return publicationInTransaction(r).orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable);
+        if(count!=1)throw unavailable();
+        if(owner!=null)beforeReadCommit(()->require("select owned_grace_publication_proof(?,clock_timestamp(),pg_current_xact_id(),true)",r.id()));
+        return publication(r,owner!=null).orElseThrow(JdbcOwnedFailedRenewalMethodStore::unavailable);
     }
     @Override public Optional<Publication> publicationInTransaction(Reservation r) {
+        return publication(r,false);
+    }
+    private Optional<Publication> publication(Reservation r,boolean producing){
         requireReservationInTransaction(r);
         var rows=jdbc.query("select * from stripe_billing_failed_method_publications where reservation_id=?",(row,n)->new Publication(r.id(),
             new OwnedFailedRenewal.Publication(r.admission().id(),uuid(row,"claim_id"),uuid(row,"operation_id"),r.failure().billId(),uuid(row,"renewal_payment"),
                 row.getLong("projected_revision"),instant(row,"published_at")),row.getLong("observation_sequence")),r.id());
-        if(!rows.isEmpty())require("select exists(select 1 from stripe_billing_failed_method_publications p join owned_method_projected(p.reservation_id) s on row(p.renewal_payment,p.projected_revision,p.observation_sequence)=row(s.renewal_payment,s.projected_revision,s.observation_sequence) where p.reservation_id=?)",r.id());
+        if(!rows.isEmpty()){
+            if(r.successor()!=null)require("select owned_grace_publication_proof(?,clock_timestamp(),pg_current_xact_id(),?)",r.id(),producing);
+            else require("select exists(select 1 from stripe_billing_failed_method_publications p join owned_method_projected(p.reservation_id) s on row(p.renewal_payment,p.projected_revision,p.observation_sequence)=row(s.renewal_payment,s.projected_revision,s.observation_sequence) where p.reservation_id=?)",r.id());
+        }
         return rows.stream().findFirst();
     }
     @Override public void requireMethodFactInTransaction(Command command,Subscription locked,List<SubscriptionOperation> operations,Instant billingAt,Instant utcAt) {
@@ -391,7 +566,9 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
             and ('owned-failed-renewal-method:'||r.id::text||':'||q.phase||':'||q.invocation::text)=?
             """,this::readRow,command.subscriptionId(),command.account().id().value(),phase.name(),command.factKey());
         if(rows.size()!=1)throw unavailable();
-        var q=rows.getFirst();var r=reservation(q.reservationId());requireReadInTransaction(r,q);
+        var q=rows.getFirst();var r=reservation(q.reservationId());
+        var owner=r.successor()==null?null:requireFactScope(r,q,null).owner();
+        requireReadInTransaction(r,q,owner);
         if(!command.fence().equals(q.fence())||!command.account().equals(account(r))||!locked.equals(subscription(r))
                 ||!command.subscriptionId().equals(locked.id())||!billingAt.equals(q.billingSample().billingAt())
                 ||!q.billingSample().equals(command.expectedBillingSample()))throw unavailable();

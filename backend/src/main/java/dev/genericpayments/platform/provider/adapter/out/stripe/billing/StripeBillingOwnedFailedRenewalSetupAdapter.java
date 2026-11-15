@@ -40,9 +40,10 @@ public final class StripeBillingOwnedFailedRenewalSetupAdapter {
         this.credentials=Objects.requireNonNull(credentials);this.clients=Objects.requireNonNull(clients);this.digest=Objects.requireNonNull(digest);this.utc=Objects.requireNonNull(utc);this.nanos=Objects.requireNonNull(nanos);
     }
     public SubscriptionBillingProofStore.Setup prepare(Reservation reservation,SubscriptionCommandContext originalContext){
-        ProviderOperation owned=null;
+        ProviderOperation owned=null;StripeBillingOwnedMethodWrite write=null;
         try{
             var budget=new Budget(utc,nanos);budget.remaining(null);
+            write=new StripeBillingOwnedMethodWrite(steps,reservation,ProviderOperation.Kind.SETUP_INTENT_CREATE);
             var original=methods.inspectBrowserSetupPreparation(reservation,originalContext);
             var account=original.account();var operation=original.operation();var subscription=original.subscription();
             if(!StripeBillingTestClockAdapter.API_VERSION.equals(reservation.admission().firstRenewalAdmission().receipt().intent().clock().owner().apiVersion()))throw unavailable();
@@ -50,13 +51,13 @@ public final class StripeBillingOwnedFailedRenewalSetupAdapter {
             budget.remaining(null);
             if(proofs.setup(account.id(),operation.id()).isPresent()||steps.find(account.id(),key).isPresent())throw unavailable();
             budget.remaining(null);
-            var reserved=steps.reserveOwnedFailedRenewalMethodStep(account,reservation,ProviderOperation.Kind.SETUP_INTENT_CREATE);
+            var reserved=write.reserve(account);
             requireIdentity(reserved,original,fingerprint);
             if(reserved.status()!=ProviderOperation.Status.RESERVED||reserved.version()!=0||reserved.providerReference()!=null
                     ||reserved.firstDispatchedAt()!=null||reserved.retryBefore()!=null||reserved.leaseOwner()!=null||reserved.leaseExpiresAt()!=null)throw unavailable();
             inspect(original,originalContext,budget,null);
-            String claimant=UUID.randomUUID().toString();Instant claimedAt=utc.instant().truncatedTo(ChronoUnit.MICROS);
-            var claim=steps.claim(reserved.id(),claimant,claimedAt,LEASE).orElseThrow(StripeBillingOwnedFailedRenewalSetupAdapter::unavailable);
+            String claimant=write.claimant(reserved.id());Instant claimedAt=utc.instant().truncatedTo(ChronoUnit.MICROS);
+            var claim=write.claim(reserved.id(),claimant,claimedAt,LEASE).orElseThrow(StripeBillingOwnedFailedRenewalSetupAdapter::unavailable);
             requireIdentity(claim,original,fingerprint);
             if(!reserved.id().equals(claim.id())||claim.status()!=ProviderOperation.Status.DISPATCHING||claim.version()!=1
                     ||!claimant.equals(claim.leaseOwner())||claim.providerReference()!=null||!claimedAt.equals(claim.firstDispatchedAt())
@@ -66,7 +67,7 @@ public final class StripeBillingOwnedFailedRenewalSetupAdapter {
             inspect(original,originalContext,budget,claim);
             proofs.authorizeSetup(subscription,operation);
             inspect(original,originalContext,budget,claim);
-            var dispatch=steps.requireOwnedFailedRenewalMethodDispatch(account,reservation,claim,utc.instant());
+            var dispatch=write.inspect(account,claim,utc.instant());
             if(!claim.equals(dispatch))throw unavailable();
             inspect(original,originalContext,budget,claim);
             var metadata=StripeBillingOwnership.metadata(account,subscription,operation);
@@ -80,10 +81,10 @@ public final class StripeBillingOwnedFailedRenewalSetupAdapter {
             StripeSubscriptionProviderAdapter.requireSetupRemote(remote,subscription,operation,original.binding(),claim);
             if(!"requires_payment_method".equals(remote.getStatus())||remote.getPaymentMethod()!=null||!metadata.equals(remote.getMetadata()))throw unavailable();
             inspect(original,originalContext,budget,claim);
-            if(!claim.equals(steps.requireOwnedFailedRenewalMethodDispatch(account,reservation,claim,utc.instant())))throw unavailable();
+            if(!claim.equals(write.inspect(account,claim,utc.instant())))throw unavailable();
             inspect(original,originalContext,budget,claim);
             new ProviderOperationGuard().requireDispatch(claim,account,fingerprint,utc.instant());
-            var ack=steps.acknowledge(claim.id(),claimant,claim.version(),remote.getId());
+            var ack=write.acknowledge(claim,remote.getId());
             requireIdentity(ack,original,fingerprint);
             if(!claim.id().equals(ack.id())||ack.status()!=ProviderOperation.Status.ACKNOWLEDGED||ack.version()!=2
                     ||!remote.getId().equals(ack.providerReference())||!claim.firstDispatchedAt().equals(ack.firstDispatchedAt())
@@ -96,7 +97,7 @@ public final class StripeBillingOwnedFailedRenewalSetupAdapter {
             // no browser authority, and must be returned truthfully without another deadline check.
             return proof;
         }catch(RuntimeException failure){
-            if(owned!=null)StripeBillingOwnedMethodWrite.terminate(methods,steps,reservation,owned);
+            if(owned!=null)write.terminate(methods,owned);
             throw unavailable();
         }
     }

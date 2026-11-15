@@ -2,6 +2,8 @@ package dev.genericpayments.platform.provider.adapter.out.persistence;
 
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.RecoveryPreparationContext;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Origin;
 import dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.*;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation.*;
@@ -10,20 +12,27 @@ import java.sql.*;
 import java.time.*;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
+import jakarta.persistence.EntityManagerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /** Explicit caller-transaction store; never starts/suspends a transaction and never calls a provider. */
 public final class JdbcOwnedRecoveryConfirmStore implements OwnedRecoveryConfirmStore {
     private final JdbcTemplate jdbc;
-    public JdbcOwnedRecoveryConfirmStore(JdbcTemplate jdbc){this.jdbc=Objects.requireNonNull(jdbc);}
+    private final EntityManagerFactory factory;
+    public JdbcOwnedRecoveryConfirmStore(JdbcTemplate jdbc){this(jdbc,null);}
+    public JdbcOwnedRecoveryConfirmStore(JdbcTemplate jdbc,EntityManagerFactory factory){this.jdbc=Objects.requireNonNull(jdbc);this.factory=factory;}
     @Override public Optional<ProviderOperation> lockInTransaction(RecoveryPreparationContext c){
         transaction();identity(c);
         var rows=jdbc.query("select * from provider_operations where payment_account_id=? and resource_id=? and kind='OWNED_RECOVERY_INTENT_CONFIRM' for update",this::row,c.account().id().value(),c.recoveryOperation().id());
         if(rows.size()>1)throw denied();if(rows.isEmpty())return Optional.empty();var o=rows.getFirst();requireOwned(c,o);return Optional.of(o);
     }
     @Override public ProviderOperation insertAndClaimInTransaction(RecoveryPreparationContext c,String claimant,Instant now,InvocationBudget budget){
-        transaction();identity(c);positive(c,budget,now,null);
+        return insertAndClaimInTransaction(c,claimant,now,budget,null);
+    }
+    @Override public ProviderOperation insertAndClaimInTransaction(RecoveryPreparationContext c,String claimant,Instant now,InvocationBudget budget,SuccessorOwner owner){
+        var caller=positiveCaller(c,owner);identity(c);positive(c,budget,now,null);
         if(claimant==null||claimant.isBlank()||claimant.length()>128)throw denied();
         var id=UUID.randomUUID();var at=now.truncatedTo(ChronoUnit.MICROS);
         String fingerprint=jdbc.queryForObject("select owned_recovery_confirm_fingerprint(?)",String.class,c.reservation().id());
@@ -33,28 +42,43 @@ public final class JdbcOwnedRecoveryConfirmStore implements OwnedRecoveryConfirm
             values(?,?,?,?,'OWNED_RECOVERY_INTENT_CONFIRM',?,?,?)
             """,id,c.account().id().value(),c.account().externalAccountId(),c.account().credentialsRef(),c.recoveryOperation().id(),c.recoveryOperation().providerOperationKey()+":CONFIRM",fingerprint);
         jdbc.update("""
-            insert into stripe_billing_failed_recovery_confirm_claims(reservation_id,provider_operation,claimant,claimed_at,deadline,invocation,entered_at,deadline_at)
-            values(?,?,?,?,?,?,?,?)
-            """,c.reservation().id(),id,claimant,stamp(at),stamp(at.plusSeconds(60)),budget.invocation(),stamp(budget.enteredAt()),stamp(budget.deadlineAt()));
+            insert into stripe_billing_failed_recovery_confirm_claims(reservation_id,provider_operation,claimant,claimed_at,deadline,invocation,entered_at,deadline_at,successor_owner_digest)
+            values(?,?,?,?,?,?,?,?,?)
+            """,c.reservation().id(),id,claimant,stamp(at),stamp(at.plusSeconds(60)),budget.invocation(),stamp(budget.enteredAt()),stamp(budget.deadlineAt()),
+            owner==null?null:owner.commitment(Origin.RECOVERY_CONFIRM,id));
         var claim=one(jdbc.query("""
             update provider_operations set status='DISPATCHING',first_dispatched_at=?,retry_before=?,lease_owner=?,lease_expires_at=?,version=1
             where id=? and status='RESERVED' and version=0 returning *
             """,this::row,stamp(at),stamp(at.plus(Duration.ofHours(23))),claimant,stamp(at.plusSeconds(60)),id));
-        positive(c,budget,now,claim);return claim;
+        positive(c,budget,now,claim);
+        if(caller!=null)beforeCommit(caller,()->{
+            positive(c,budget,now,claim);
+            require("select owned_grace_confirm_producer(?,?,'DISPATCHING',?,pg_current_xact_id())",c.reservation().id(),id,owner.commitment(Origin.RECOVERY_CONFIRM,id));
+        });
+        return claim;
     }
     @Override public ProviderOperation requireClaimInTransaction(RecoveryPreparationContext c,ProviderOperation claim,InvocationBudget budget,Instant now){
-        transaction();identity(c);requireOwned(c,claim);positive(c,budget,now,claim);
+        return requireClaimInTransaction(c,claim,budget,now,null);
+    }
+    @Override public ProviderOperation requireClaimInTransaction(RecoveryPreparationContext c,ProviderOperation claim,InvocationBudget budget,Instant now,SuccessorOwner owner){
+        var caller=positiveCaller(c,owner);identity(c);requireOwned(c,claim);positive(c,budget,now,claim);
         var current=lockInTransaction(c).filter(claim::equals).orElseThrow(JdbcOwnedRecoveryConfirmStore::denied);
         require("""
             select exists(select 1 from stripe_billing_failed_recovery_confirm_claims receipt
             where receipt.provider_operation=? and receipt.reservation_id=? and receipt.claimant=? and receipt.claimed_at=? and receipt.deadline=?
               and receipt.invocation=? and receipt.entered_at=? and receipt.deadline_at=?
-              and receipt.recorded_transaction<>pg_current_xact_id() and clock_timestamp()<receipt.deadline_at and clock_timestamp()<receipt.deadline)
-            """,claim.id(),c.reservation().id(),claim.leaseOwner(),stamp(claim.firstDispatchedAt()),stamp(claim.leaseExpiresAt()),budget.invocation(),stamp(budget.enteredAt()),stamp(budget.deadlineAt()));
-        if(current.status()!=Status.DISPATCHING||current.version()!=1)throw denied();positive(c,budget,now,claim);return current;
+              and receipt.recorded_transaction<>pg_current_xact_id() and clock_timestamp()<receipt.deadline_at and clock_timestamp()<receipt.deadline
+              and receipt.successor_owner_digest is not distinct from ?)
+            """,claim.id(),c.reservation().id(),claim.leaseOwner(),stamp(claim.firstDispatchedAt()),stamp(claim.leaseExpiresAt()),budget.invocation(),stamp(budget.enteredAt()),stamp(budget.deadlineAt()),
+            owner==null?null:owner.commitment(Origin.RECOVERY_CONFIRM,claim.id()));
+        if(current.status()!=Status.DISPATCHING||current.version()!=1)throw denied();positive(c,budget,now,claim);
+        if(caller!=null)caller.requireReadCommitted();return current;
     }
     @Override public ConfirmationAck acknowledgeInTransaction(RecoveryPreparationContext c,ProviderOperation claim,ConfirmReply reply,Instant now,InvocationBudget budget){
-        requireClaimInTransaction(c,claim,budget,now);
+        return acknowledgeInTransaction(c,claim,reply,now,budget,null);
+    }
+    @Override public ConfirmationAck acknowledgeInTransaction(RecoveryPreparationContext c,ProviderOperation claim,ConfirmReply reply,Instant now,InvocationBudget budget,SuccessorOwner owner){
+        var caller=positiveCaller(c,owner);requireClaimInTransaction(c,claim,budget,now,owner);
         var at=now.truncatedTo(ChronoUnit.MICROS);
         var acknowledged=one(jdbc.query("""
             update provider_operations set status='ACKNOWLEDGED',provider_reference=?,lease_owner=null,lease_expires_at=null,version=2
@@ -65,11 +89,15 @@ public final class JdbcOwnedRecoveryConfirmStore implements OwnedRecoveryConfirm
             values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,claim.id(),c.reservation().id(),claim.leaseOwner(),stamp(claim.leaseExpiresAt()),reply.paymentIntent(),reply.customer(),reply.method(),reply.currency(),reply.amount(),reply.received(),reply.capturable(),reply.charge(),stamp(reply.observedAt()),stamp(at));
         positive(c,budget,now,claim);
+        if(caller!=null)beforeCommit(caller,()->{
+            positive(c,budget,now,claim);
+            require("select owned_grace_confirm_producer(?,?,'ACKNOWLEDGED',?,pg_current_xact_id())",c.reservation().id(),claim.id(),owner.commitment(Origin.RECOVERY_CONFIRM,claim.id()));
+        });
         // Return original normalized nanosecond evidence; SQL persists its exact microsecond projection.
         return new ConfirmationAck(acknowledged,reply,now);
     }
     @Override public boolean unknownInTransaction(RecoveryPreparationContext c,ProviderOperation claim,InvocationBudget budget){
-        if(budget==null)throw denied();
+        if(budget==null||c==null||c.reservation().successor()!=null)throw denied();
         transaction();identity(c);requireOwned(c,claim);var current=lockInTransaction(c);
         if(current.isEmpty()||!current.get().equals(claim)||claim.status()!=Status.DISPATCHING||claim.version()!=1)return false;
         // Identity survives invocation/session/lease expiry; the first claim must still be independently committed.
@@ -86,8 +114,25 @@ public final class JdbcOwnedRecoveryConfirmStore implements OwnedRecoveryConfirm
             select exists(select 1 from stripe_billing_failed_method_reservations r
             join stripe_billing_failed_renewals d on d.id=r.admission_id
             join stripe_billing_failed_method_recoveries x on x.reservation_id=r.id
-            where r.id=? and d.payment_account_id=? and x.operation_id=? and owned_recovery_confirm_identity(r.id))
-            """,c.reservation().id(),c.account().id().value(),c.recoveryOperation().id());
+            where r.id=? and d.payment_account_id=? and x.operation_id=? and (r.after_ready_id is not null)=? and owned_recovery_confirm_identity(r.id))
+            """,c.reservation().id(),c.account().id().value(),c.recoveryOperation().id(),c.reservation().successor()!=null);
+    }
+    private OwnedGraceCallerConnection positiveCaller(RecoveryPreparationContext c,SuccessorOwner owner){
+        transaction();if(c==null||(c.reservation().successor()!=null)!=(owner!=null))throw denied();
+        if(owner==null)return null;
+        var caller=OwnedGraceCallerConnection.capture(jdbc,factory,"OWNED_RECOVERY_CONFIRM_UNAVAILABLE");
+        caller.requireReadCommitted();
+        new JdbcOwnedFailedRenewalMethodStore(jdbc,factory).requireRecoveryConfirmationIdentityInTransaction(c);
+        return caller;
+    }
+    private void beforeCommit(OwnedGraceCallerConnection caller,Runnable proof){
+        if(!TransactionSynchronizationManager.isSynchronizationActive())throw denied();
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization(){
+            @Override public void beforeCommit(boolean readOnly){
+                if(readOnly)throw denied();caller.requireReadCommitted().flush();caller.requireReadCommitted();
+                proof.run();caller.requireReadCommitted();
+            }
+        });
     }
     private void requireOwned(RecoveryPreparationContext c,ProviderOperation o){
         if(o==null||o.kind()!=Kind.OWNED_RECOVERY_INTENT_CONFIRM||!o.accountId().equals(c.account().id())||!o.resourceId().equals(c.recoveryOperation().id())

@@ -340,3 +340,542 @@ create or replace function owned_failed_renewal_association(target_admission uui
    and ((x.operation_id is null and o.status='RESERVED' and o.version=0 and owned_method_debt(r.id,1,o.id))
      or (x.operation_id=o.id and owned_recovery_confirm_identity(r.id))))))
 $$;
+
+-- Original provider WRITE claims. These survive ACK clearing lease_owner, without storing the preimage.
+create table stripe_billing_failed_grace_method_claims (
+ operation_id uuid primary key references provider_operations(id),
+ reservation_id uuid not null references stripe_billing_failed_method_reservations(id),
+ setup_operation uuid not null references subscription_operations(id),
+ payment_account_id uuid not null references payment_accounts(id),
+ step_kind varchar(32) not null check(step_kind in ('SETUP_INTENT_CREATE','SUBSCRIPTION_UPDATE')),
+ operation_key varchar(255) not null, fingerprint varchar(255) not null,
+ external_account_id varchar(255) not null, credentials_ref varchar(255) not null,
+ first_dispatched_at timestamptz not null, lease_expires_at timestamptz not null,
+ retry_before timestamptz not null, claim_version bigint not null check(claim_version=1),
+ successor_owner_digest text not null check(successor_owner_digest ~ '^[a-f0-9]{64}$'),
+ successor_producer_xid xid8 not null, unique(reservation_id,step_kind),
+ check(lease_expires_at=first_dispatched_at+interval '60 seconds' and retry_before=first_dispatched_at+interval '23 hours')
+);
+create function stamp_owned_grace_method_claim() returns trigger language plpgsql volatile as $$
+begin
+ if pg_trigger_depth()<>2 or new.successor_producer_xid is not null then
+  raise exception 'Original provider dispatch required' using errcode='23514';end if;
+ new.successor_producer_xid:=pg_current_xact_id();return new;
+end $$;
+create trigger grace_method_claim_insert before insert on stripe_billing_failed_grace_method_claims
+ for each row execute function stamp_owned_grace_method_claim();
+create trigger grace_method_claim_immutable before update or delete on stripe_billing_failed_grace_method_claims
+ for each row execute function protect_failed_renewal_evidence();
+
+-- Immutable lookup usable during cleanup even after positive authority has expired.
+create function owned_grace_write_claim_matches(reservation uuid,p provider_operations) returns boolean language sql stable as $$
+ select exists(select 1 from stripe_billing_failed_grace_method_claims q where q.operation_id=($2).id and q.reservation_id=$1
+ and (q.setup_operation,q.payment_account_id,q.step_kind,q.operation_key,q.fingerprint,q.external_account_id,q.credentials_ref,
+      q.first_dispatched_at,q.retry_before)
+ =(($2).resource_id,($2).payment_account_id,($2).kind,($2).operation_key,($2).fingerprint,($2).external_account_id,($2).credentials_ref,
+      ($2).first_dispatched_at,($2).retry_before)
+ and ((($2).status='DISPATCHING' and (($2).lease_owner,($2).lease_expires_at,($2).version)=(q.successor_owner_digest,q.lease_expires_at,q.claim_version))
+   or (($2).status in ('ACKNOWLEDGED','UNKNOWN') and ($2).version=q.claim_version+1 and ($2).lease_owner is null and ($2).lease_expires_at is null)))
+$$;
+
+create function owned_grace_write_current(reservation uuid,p provider_operations,utc timestamptz) returns boolean language sql stable as $$
+ select exists(select 1 from stripe_billing_failed_method_reservations r join stripe_billing_failed_renewals d on d.id=r.admission_id
+ join subscription_operations o on o.id=r.setup_operation join payment_accounts a on a.id=d.payment_account_id
+ join customer_sessions s on s.id=r.browser_session_id join site_allowed_origins origin on origin.site_id=d.site_id and origin.origin=s.origin
+ where r.id=$1 and r.after_ready_id is not null and owned_method_debt(r.id,0,o.id) and owned_method_initial_operation(r.id)
+ and (s.site_id,s.customer_id,s.origin,s.expires_at)=(d.site_id,d.customer_id,r.browser_origin,r.browser_session_expires_at)
+ and s.revoked_at is null and s.issued_at<=r.reserved_at and $3<s.expires_at and s.scopes ? 'SUBSCRIPTION_MANAGE'
+ and (a.provider,a.account_mode,a.account_status)=('STRIPE','SANDBOX','ACTIVE')
+ and (($2).payment_account_id,($2).external_account_id,($2).credentials_ref,($2).resource_id)=(a.id,a.external_account_id,a.credentials_ref,o.id)
+ and ($2).operation_key=o.provider_operation_key||case when ($2).kind='SETUP_INTENT_CREATE' then ':SETUP' else ':METHOD' end
+ and ($2).fingerprint=owned_method_step_fingerprint(r.id,($2).kind='SUBSCRIPTION_UPDATE')
+ and ((($2).kind='SETUP_INTENT_CREATE' and not exists(select 1 from stripe_subscription_setup_proofs where operation_id=o.id))
+ or (($2).kind='SUBSCRIPTION_UPDATE' and owned_method_browser_permit(o.id) and exists(
+  select 1 from stripe_subscription_setup_proofs proof join provider_operations step on step.id=proof.step_id
+  join stripe_billing_failed_grace_method_claims q on q.operation_id=step.id
+  where proof.operation_id=o.id and proof.method_reference ~ '^pm_[A-Za-z0-9]{1,252}$' and proof.setup_reference=step.provider_reference
+   and step.status='ACKNOWLEDGED' and step.kind='SETUP_INTENT_CREATE' and owned_grace_write_claim_matches(r.id,step)
+   and q.successor_producer_xid<>pg_current_xact_id()))))
+$$;
+
+-- Raw transitions also obey the original typed phase. A first dispatch is recorded by this
+-- actual row transition; an existing lease, receipt or version can never be adopted or reset.
+-- The terminal takes FOR UPDATE on this exact reservation. A fresh RC statement after
+-- acquiring this conflicting lock observes any terminal that won before the lock.
+create function require_live_grace_successor(reservation uuid) returns void language plpgsql volatile as $$
+begin
+ perform id from stripe_billing_failed_method_reservations where id=$1 and after_ready_id is not null for key share nowait;
+ if not found or current_setting('transaction_isolation')<>'read committed' or exists(
+  select 1 from stripe_billing_failed_renewal_stops s join stripe_billing_failed_method_reservations r on r.admission_id=s.admission_id where r.id=$1)
+ then raise exception 'Live grace successor required' using errcode='23514';end if;
+end $$;
+
+create function gate_owned_grace_method_write() returns trigger language plpgsql volatile as $$
+declare target uuid; utc timestamptz;
+begin
+ if (tg_op='INSERT' or old.kind not in ('SETUP_INTENT_CREATE','SUBSCRIPTION_UPDATE'))
+    and (tg_op='DELETE' or new.kind not in ('SETUP_INTENT_CREATE','SUBSCRIPTION_UPDATE')) then return null;end if;
+ if tg_op<>'INSERT' then
+  select r.id into target from stripe_billing_failed_method_reservations r where r.setup_operation=old.resource_id
+    and r.after_ready_id is not null and old.kind in ('SETUP_INTENT_CREATE','SUBSCRIPTION_UPDATE');
+ end if;
+ if target is null and tg_op<>'DELETE' then
+  select r.id into target from stripe_billing_failed_method_reservations r where r.setup_operation=new.resource_id
+    and r.after_ready_id is not null and new.kind in ('SETUP_INTENT_CREATE','SUBSCRIPTION_UPDATE');
+ end if;
+ if target is null then return null;end if;
+ if tg_op='INSERT' or (tg_op='UPDATE' and new.status in ('DISPATCHING','ACKNOWLEDGED')) then
+  perform require_live_grace_successor(target);
+ end if;
+ utc:=clock_timestamp();
+ if tg_op='INSERT' then
+  if new.status='RESERVED' and new.version=0 and new.recovery_attempts=0 and new.safe_error_code is null and not new.manual_review_required
+    and owned_grace_write_current(target,new,utc) then return null;end if;
+ elsif tg_op='UPDATE' and (to_jsonb(new)-array['status','version','lease_owner','lease_expires_at','first_dispatched_at','retry_before','provider_reference'])
+     =(to_jsonb(old)-array['status','version','lease_owner','lease_expires_at','first_dispatched_at','retry_before','provider_reference']) then
+  if old.status='RESERVED' and old.version=0 and new.status='DISPATCHING' and new.version=1 and new.first_dispatched_at<=utc
+    and new.first_dispatched_at>=(select reserved_at from stripe_billing_failed_method_reservations where id=target)
+    and utc<new.lease_expires_at and owned_grace_write_current(target,new,utc) then
+   insert into stripe_billing_failed_grace_method_claims(operation_id,reservation_id,setup_operation,payment_account_id,step_kind,
+    operation_key,fingerprint,external_account_id,credentials_ref,first_dispatched_at,lease_expires_at,retry_before,claim_version,successor_owner_digest)
+   values(new.id,target,new.resource_id,new.payment_account_id,new.kind,new.operation_key,new.fingerprint,new.external_account_id,
+    new.credentials_ref,new.first_dispatched_at,new.lease_expires_at,new.retry_before,new.version,new.lease_owner);return null;
+  elsif old.status='DISPATCHING' and new.status='UNKNOWN' and owned_grace_write_claim_matches(target,old)
+    and owned_grace_write_claim_matches(target,new) and exists(select 1 from stripe_billing_failed_grace_successor_terminals t
+     where t.reservation_id=target and t.origin_id=new.id and t.origin in ('SETUP_WRITE','METHOD_WRITE')
+     and t.successor_owner_digest=old.lease_owner and t.successor_producer_xid=pg_current_xact_id()) then return null;
+  elsif old.status='DISPATCHING' and new.status='ACKNOWLEDGED' and utc<old.lease_expires_at
+    and owned_grace_write_claim_matches(target,old) and owned_grace_write_claim_matches(target,new)
+    and exists(select 1 from stripe_billing_failed_grace_method_claims q where q.operation_id=old.id and q.successor_producer_xid<>pg_current_xact_id())
+    and owned_grace_write_current(target,new,utc)
+    and ((new.kind='SETUP_INTENT_CREATE' and new.provider_reference ~ '^seti_[A-Za-z0-9]{1,250}$') or
+     (new.kind='SUBSCRIPTION_UPDATE' and exists(select 1 from stripe_billing_failed_method_reservations r
+      join stripe_billing_failed_renewals d on d.id=r.admission_id join subscriptions s on s.id=d.subscription_id
+      where r.id=target and s.provider_reference=new.provider_reference))) then
+   -- Transaction-lifetime denial marker on this original tagged ACK. A released
+   -- savepoint retains the lock; rollback of the ACK also rolls back its marker.
+   if not pg_try_advisory_xact_lock_shared(1499220551,hashtext(new.id::text)) then
+    raise exception 'Original WRITE acknowledgment contended' using errcode='55P03';end if;
+   return null;
+  end if;
+ end if;
+ raise exception 'Original grace provider write unavailable' using errcode='23514';
+end $$;
+create trigger grace_method_write after insert or update or delete on provider_operations
+ for each row execute function gate_owned_grace_method_write();
+
+-- Only tagged emissions receive provenance. Descriptor rows and old receipt snapshots stay intact.
+alter table stripe_billing_failed_method_reads add successor_owner_digest text check(successor_owner_digest ~ '^[a-f0-9]{64}$'),
+ add successor_producer_xid xid8;
+alter table stripe_billing_failed_method_completions add successor_producer_xid xid8;
+alter table stripe_billing_failed_method_recoveries add successor_producer_xid xid8;
+alter table stripe_billing_failed_method_publications add successor_producer_xid xid8;
+alter table stripe_billing_failed_recovery_confirm_claims add successor_owner_digest text check(successor_owner_digest ~ '^[a-f0-9]{64}$');
+alter table stripe_billing_failed_recovery_confirm_acks add successor_producer_xid xid8;
+
+create function owned_grace_method_writes_acked(reservation uuid,reader xid8) returns boolean language sql stable as $$
+ select exists(select 1 from stripe_billing_failed_method_reservations r join subscription_operations o on o.id=r.setup_operation
+ join stripe_subscription_setup_proofs proof on proof.operation_id=o.id
+ join stripe_billing_failed_grace_method_claims a on a.reservation_id=r.id and a.step_kind='SETUP_INTENT_CREATE'
+ join stripe_billing_failed_grace_method_claims b on b.reservation_id=r.id and b.step_kind='SUBSCRIPTION_UPDATE'
+ join provider_operations setup on setup.id=a.operation_id join provider_operations method on method.id=b.operation_id
+ where r.id=$1 and r.after_ready_id is not null and owned_method_steps(r.id) and owned_method_browser_permit(o.id)
+ and proof.step_id=setup.id and setup.status='ACKNOWLEDGED' and method.status='ACKNOWLEDGED'
+ and owned_grace_write_claim_matches(r.id,setup) and owned_grace_write_claim_matches(r.id,method)
+ and a.successor_producer_xid<>b.successor_producer_xid and $2 not in(a.successor_producer_xid,b.successor_producer_xid)
+ and not exists(select 1 from provider_operations sibling where
+  ((sibling.resource_id=o.id and sibling.kind in ('SETUP_INTENT_CREATE','SUBSCRIPTION_UPDATE')) or
+    sibling.operation_key in(o.provider_operation_key||':SETUP',o.provider_operation_key||':METHOD'))
+  and sibling.id not in(setup.id,method.id)))
+$$;
+-- This predicate may be used after financial projection; do not re-enter V37's pre-confirm debt state.
+create function owned_grace_confirm_ack_committed(reservation uuid,latest timestamptz,reader xid8) returns boolean language sql stable as $$
+ select exists(select 1 from stripe_billing_failed_method_reservations r join stripe_billing_failed_renewal_failures f on f.admission_id=r.admission_id
+ join stripe_billing_failed_method_completions c on c.reservation_id=r.id
+ join stripe_billing_failed_method_reads m on (m.id,m.reservation_id,m.phase)=(c.claim_id,r.id,'METHOD')
+ join stripe_billing_failed_method_recoveries x on x.reservation_id=r.id join subscription_operations o on o.id=x.operation_id
+ join stripe_billing_failed_recovery_confirm_claims q on q.reservation_id=r.id join provider_operations step on step.id=q.provider_operation
+ join stripe_billing_failed_recovery_confirm_acks a on a.provider_operation=q.provider_operation and a.reservation_id=q.reservation_id
+ join subscription_billing_records bill on bill.id=f.renewal_bill
+ where r.id=$1 and r.after_ready_id is not null and owned_recovery_confirm_owns(r.id,step)
+ and owned_failed_renewal_association(r.admission_id,o.id) and owned_method_completed(r.id)
+ and q.successor_owner_digest is not null and m.successor_owner_digest is not null
+ and num_nulls(m.successor_producer_xid,c.successor_producer_xid,x.successor_producer_xid,a.successor_producer_xid)=0
+ and $3 not in(m.successor_producer_xid,c.successor_producer_xid,x.successor_producer_xid,q.recorded_transaction,a.successor_producer_xid)
+ and x.successor_producer_xid<>q.recorded_transaction and q.recorded_transaction<>a.successor_producer_xid
+ and c.completed_at<=x.associated_at and x.associated_at<=q.claimed_at
+ and q.entered_at<=q.claimed_at and q.claimed_at<=a.observed_at and a.observed_at<=a.acknowledged_at
+ and a.acknowledged_at<least(q.deadline_at,q.deadline) and a.acknowledged_at<=$2
+ and step.status='ACKNOWLEDGED' and step.version=2 and step.lease_owner is null and step.lease_expires_at is null
+ and step.first_dispatched_at=q.claimed_at and step.retry_before=q.claimed_at+interval '23 hours'
+ and (a.claimant,a.deadline,a.payment_intent,a.customer_reference,a.method_reference,a.currency,a.amount,a.received,a.capturable)
+ =(q.claimant,q.deadline,f.payment_intent_reference,r.binding_reference,c.method_reference,bill.currency,bill.amount_due_minor,bill.amount_due_minor,0::bigint)
+ and step.provider_reference=a.payment_intent and q.invocation is not null
+ and not exists(select 1 from provider_operations sibling where sibling.id<>step.id and
+    ((sibling.kind='OWNED_RECOVERY_INTENT_CONFIRM' and sibling.resource_id=o.id) or sibling.operation_key=o.provider_operation_key||':CONFIRM')))
+$$;
+create function owned_grace_read_predecessor(reservation uuid,phase text,started timestamptz,reader xid8) returns boolean language sql stable as $$
+ select owned_grace_method_writes_acked($1,$4) and ($2='METHOD' or ($2='RECOVERED' and owned_grace_confirm_ack_committed($1,$3,$4)))
+$$;
+
+create function stamp_owned_grace_read_origin() returns trigger language plpgsql volatile as $$
+declare tagged boolean;
+begin
+ select after_ready_id is not null into strict tagged from stripe_billing_failed_method_reservations where id=new.reservation_id;
+ if (new.successor_owner_digest is not null)<>tagged or new.successor_producer_xid is not null then
+  raise exception 'Invalid grace read provenance' using errcode='23514';end if;
+ if tagged then
+  perform require_live_grace_successor(new.reservation_id);
+  if not owned_grace_read_predecessor(new.reservation_id,new.phase,new.started_at,pg_current_xact_id()) then
+   raise exception 'Missing committed grace read predecessor' using errcode='23514';end if;
+  new.successor_producer_xid:=pg_current_xact_id();
+ end if;
+ return new;
+end $$;
+create trigger grace_read_origin before insert on stripe_billing_failed_method_reads for each row execute function stamp_owned_grace_read_origin();
+
+create function stamp_owned_grace_read_receipt() returns trigger language plpgsql volatile as $$
+declare tagged boolean; q stripe_billing_failed_method_reads%rowtype; reader xid8:=pg_current_xact_id();
+begin
+ select after_ready_id is not null into strict tagged from stripe_billing_failed_method_reservations where id=new.reservation_id;
+ if new.successor_producer_xid is not null then raise exception 'Producer xid is assigned by the database' using errcode='23514';end if;
+ if not tagged then return new;end if;
+ perform require_live_grace_successor(new.reservation_id);
+ if tg_table_name='stripe_billing_failed_method_recoveries' then
+  if not exists(select 1 from stripe_billing_failed_method_completions c where c.reservation_id=new.reservation_id and c.successor_producer_xid<>reader)
+   then raise exception 'Original committed METHOD completion required' using errcode='23514';end if;
+ else
+  select * into strict q from stripe_billing_failed_method_reads where id=new.claim_id and reservation_id=new.reservation_id;
+  if q.successor_producer_xid is null or q.successor_producer_xid=reader or q.successor_owner_digest is null
+    or not owned_grace_read_predecessor(q.reservation_id,q.phase,q.started_at,reader)
+  then raise exception 'Original committed grace read required' using errcode='23514';end if;
+ end if;
+ new.successor_producer_xid:=reader;return new;
+end $$;
+create trigger grace_method_receipt before insert on stripe_billing_failed_method_completions for each row execute function stamp_owned_grace_read_receipt();
+create trigger grace_associated_receipt before insert on stripe_billing_failed_method_recoveries for each row execute function stamp_owned_grace_read_receipt();
+create trigger grace_publication_receipt before insert on stripe_billing_failed_method_publications for each row execute function stamp_owned_grace_read_receipt();
+
+create function require_owned_grace_confirm_origin() returns trigger language plpgsql volatile as $$
+declare tagged boolean;
+begin
+ select after_ready_id is not null into strict tagged from stripe_billing_failed_method_reservations where id=new.reservation_id;
+ if tagged then perform require_live_grace_successor(new.reservation_id);end if;
+ if tg_table_name='stripe_billing_failed_recovery_confirm_claims' then
+  if (new.successor_owner_digest is not null)<>tagged or (tagged and not exists(select 1 from stripe_billing_failed_method_recoveries x
+     where x.reservation_id=new.reservation_id and x.successor_producer_xid<>pg_current_xact_id())) then
+   raise exception 'Original grace confirmation owner required' using errcode='23514';end if;
+ else
+  if new.successor_producer_xid is not null then raise exception 'Invalid grace confirmation producer' using errcode='23514';end if;
+  if tagged then new.successor_producer_xid:=pg_current_xact_id();end if;
+ end if;
+ return new;
+end $$;
+create trigger grace_confirm_origin before insert on stripe_billing_failed_recovery_confirm_claims for each row execute function require_owned_grace_confirm_origin();
+create trigger grace_confirm_ack_origin before insert on stripe_billing_failed_recovery_confirm_acks for each row execute function require_owned_grace_confirm_origin();
+
+-- The writer can inspect its own completed receipt. Every later reader must be independent.
+create function owned_grace_publication_proof(reservation uuid,utc timestamptz,reader xid8,writing boolean) returns boolean
+ language sql stable set join_collapse_limit=1 as $$
+ select exists(select 1 from stripe_billing_failed_method_reservations r
+ join stripe_billing_failed_method_publications p on p.reservation_id=r.id
+ join stripe_billing_failed_method_reads q on (q.id,q.reservation_id)=(p.claim_id,r.id)
+ join stripe_billing_failed_method_recoveries x on x.reservation_id=r.id
+ join owned_method_projected(r.id) projected on
+   (projected.renewal_payment,projected.projected_revision,projected.observation_sequence)=(p.renewal_payment,p.projected_revision,p.observation_sequence)
+ where r.id=$1 and r.after_ready_id is not null and owned_grace_successor_identity(r.id,$2,$3)
+ and (p.successor_producer_xid=$3)=$4 and q.successor_producer_xid<>$3 and q.successor_producer_xid<>p.successor_producer_xid
+ and q.successor_owner_digest is not null and q.phase='RECOVERED' and q.selected_operation=x.operation_id and p.operation_id=x.operation_id
+ and q.started_at<=p.published_at and p.published_at<q.deadline_at and p.published_at<=$2
+ and owned_grace_read_predecessor(r.id,'RECOVERED',q.started_at,$3))
+$$;
+
+create function check_owned_grace_read_committed() returns trigger language plpgsql volatile as $$
+declare reader xid8:=pg_current_xact_id();utc timestamptz:=clock_timestamp();valid boolean;
+begin
+ if new.successor_producer_xid is null then return null;end if;
+ if tg_table_name='stripe_billing_failed_method_reads' then
+  valid:=owned_grace_read_predecessor(new.reservation_id,new.phase,new.started_at,reader)
+    and case when new.phase='METHOD' then owned_method_pre(new.reservation_id) else owned_method_recovery_pre(new.reservation_id) end;
+ elsif tg_table_name='stripe_billing_failed_method_completions' then
+  valid:=owned_method_lineage(new.reservation_id) and owned_method_completed(new.reservation_id)
+   and owned_grace_method_writes_acked(new.reservation_id,reader);
+ elsif tg_table_name='stripe_billing_failed_method_recoveries' then
+  valid:=owned_method_recovery_pre(new.reservation_id);
+ else
+  valid:=owned_grace_publication_proof(new.reservation_id,utc,reader,true);
+ end if;
+ if valid is not true or new.successor_producer_xid<>reader then raise exception 'Invalid grace read completion' using errcode='23514';end if;
+ return null;
+end $$;
+create constraint trigger grace_read_committed after insert on stripe_billing_failed_method_reads deferrable initially deferred
+ for each row execute function check_owned_grace_read_committed();
+create constraint trigger grace_method_committed after insert on stripe_billing_failed_method_completions deferrable initially deferred
+ for each row execute function check_owned_grace_read_committed();
+create constraint trigger grace_associated_committed after insert on stripe_billing_failed_method_recoveries deferrable initially deferred
+ for each row execute function check_owned_grace_read_committed();
+create constraint trigger grace_publication_committed after insert on stripe_billing_failed_method_publications deferrable initially deferred
+ for each row execute function check_owned_grace_read_committed();
+
+-- V37 writer-local proof. The original claim predates its ACK; both precede the later observer.
+create function owned_grace_confirm_producer(reservation uuid,operation uuid,stage text,commitment text,writer xid8)
+ returns boolean language sql stable set join_collapse_limit=1 as $$
+ select exists(select 1 from stripe_billing_failed_method_reservations r
+ join stripe_billing_failed_method_recoveries x on x.reservation_id=r.id
+ join stripe_billing_failed_renewal_failures f on f.admission_id=r.admission_id
+ join stripe_billing_failed_method_completions c on c.reservation_id=r.id join subscription_billing_records bill on bill.id=f.renewal_bill
+ join stripe_billing_failed_recovery_confirm_claims q on q.reservation_id=r.id
+ join provider_operations step on step.id=q.provider_operation
+ left join stripe_billing_failed_recovery_confirm_acks a on a.provider_operation=step.id and a.reservation_id=r.id
+ where r.id=$1 and r.after_ready_id is not null and q.provider_operation=$2 and q.successor_owner_digest=$4
+ and x.successor_producer_xid<>q.recorded_transaction and x.associated_at<=q.claimed_at
+ and owned_grace_method_writes_acked(r.id,$5) and owned_recovery_confirm_pre(r.id) and owned_recovery_confirm_owns(r.id,step)
+ and step.first_dispatched_at=q.claimed_at and step.retry_before=q.claimed_at+interval '23 hours' and step.status=$3
+ and (($3='DISPATCHING' and q.recorded_transaction=$5 and a.provider_operation is null and step.version=1
+      and (step.lease_owner,step.lease_expires_at)=(q.claimant,q.deadline))
+  or ($3='ACKNOWLEDGED' and q.recorded_transaction<>$5 and a.successor_producer_xid=$5 and step.version=2
+      and step.lease_owner is null and step.lease_expires_at is null and step.provider_reference=a.payment_intent
+      and (a.claimant,a.deadline,a.payment_intent,a.customer_reference,a.method_reference,a.amount,a.currency)
+       =(q.claimant,q.deadline,f.payment_intent_reference,r.binding_reference,c.method_reference,bill.amount_due_minor,bill.currency)
+      and q.claimed_at<=a.observed_at and a.observed_at<=a.acknowledged_at and a.acknowledged_at<least(q.deadline_at,q.deadline))))
+$$;
+create function check_owned_grace_confirm_producer() returns trigger language plpgsql volatile as $$
+declare stage text; commitment text;
+begin
+ select successor_owner_digest into strict commitment from stripe_billing_failed_recovery_confirm_claims where provider_operation=new.provider_operation;
+ if commitment is null then return null;end if;
+ stage:=case when tg_table_name='stripe_billing_failed_recovery_confirm_claims' then 'DISPATCHING' else 'ACKNOWLEDGED' end;
+ if not owned_grace_confirm_producer(new.reservation_id,new.provider_operation,stage,commitment,pg_current_xact_id()) then
+  raise exception 'Invalid grace confirmation producer' using errcode='23514';end if;
+ return null;
+end $$;
+create constraint trigger grace_confirm_dispatch_committed after insert on stripe_billing_failed_recovery_confirm_claims deferrable initially deferred
+ for each row execute function check_owned_grace_confirm_producer();
+create constraint trigger grace_confirm_ack_committed after insert on stripe_billing_failed_recovery_confirm_acks deferrable initially deferred
+ for each row execute function check_owned_grace_confirm_producer();
+
+alter table stripe_billing_failed_renewal_stops add successor_producer_xid xid8;
+create table stripe_billing_failed_grace_successor_terminals (
+ reservation_id uuid primary key, admission_id uuid not null unique references stripe_billing_failed_renewals(id),
+ origin text not null check(origin in ('SETUP_WRITE','METHOD_WRITE','METHOD_READ','RECOVERED_READ','RECOVERY_CONFIRM')),
+ origin_id uuid not null,
+ write_claim uuid generated always as (case when origin in ('SETUP_WRITE','METHOD_WRITE') then origin_id end) stored references stripe_billing_failed_grace_method_claims(operation_id),
+ read_claim uuid generated always as (case when origin in ('METHOD_READ','RECOVERED_READ') then origin_id end) stored references stripe_billing_failed_method_reads(id),
+ confirm_claim uuid generated always as (case when origin='RECOVERY_CONFIRM' then origin_id end) stored references stripe_billing_failed_recovery_confirm_claims(provider_operation),
+ owner_nonce uuid check(owner_nonce is null), successor_owner_digest text not null check(successor_owner_digest ~ '^[a-f0-9]{64}$'),
+ reason text not null check(reason='UNCERTAIN' or (origin in ('METHOD_READ','RECOVERED_READ') and reason='AUTHORITY_DRIFT')),
+ stopped_at timestamptz not null, successor_producer_xid xid8 not null,
+ foreign key(reservation_id,admission_id) references stripe_billing_failed_method_reservations(id,admission_id)
+);
+create trigger grace_successor_terminal_immutable before update or delete on stripe_billing_failed_grace_successor_terminals
+ for each row execute function protect_failed_renewal_evidence();
+
+-- Serialize cleanup with each original phase and every FK written below. Never reacquire
+-- positive session, policy, debt, original invocation budget, or lease authority.
+create function lock_owned_grace_successor_terminal(reservation uuid) returns void language plpgsql volatile as $$
+declare r stripe_billing_failed_method_reservations%rowtype; recovery uuid;
+begin
+ select * into strict r from stripe_billing_failed_method_reservations where id=$1 and after_ready_id is not null;
+ perform owned_failed_grace_limits(2000,true);
+ perform lock_owned_grace_boundary(r.after_preparation_id,3,true);
+ perform id from stripe_billing_failed_method_reservations where id=r.id for update nowait;
+ select operation_id into recovery from stripe_billing_failed_method_recoveries where reservation_id=r.id;
+ perform id from subscription_operations where id in(r.setup_operation,recovery) order by id for update nowait;
+ perform id from provider_operations where resource_id in(r.setup_operation,recovery) order by id for update nowait;
+ perform operation_id from stripe_billing_failed_grace_method_claims where reservation_id=r.id order by operation_id for key share nowait;
+ perform operation_id from stripe_subscription_setup_proofs where operation_id=r.setup_operation for update nowait;
+ perform id from stripe_billing_failed_method_reads where reservation_id=r.id order by id for key share nowait;
+ perform reservation_id from stripe_billing_failed_method_completions where reservation_id=r.id for key share nowait;
+ perform reservation_id from stripe_billing_failed_method_recoveries where reservation_id=r.id for key share nowait;
+ perform provider_operation from stripe_billing_failed_recovery_confirm_claims where reservation_id=r.id for key share nowait;
+ perform provider_operation from stripe_billing_failed_recovery_confirm_acks where reservation_id=r.id for key share nowait;
+ perform reservation_id from stripe_billing_failed_method_publications where reservation_id=r.id for key share nowait;
+end $$;
+
+-- An immutable origin remains usable after expiry. Its successful next phase permanently
+-- fences off delayed failures. The two provider poststates are first UNKNOWN or a preserved WRITE ACK.
+create function owned_grace_terminal_origin(reservation uuid,src text,origin_id uuid,final_state boolean,writer xid8,stop_at timestamptz)
+ returns text language sql stable set join_collapse_limit=1 as $$
+ select evidence.commitment from stripe_billing_failed_method_reservations r join subscription_operations setup on setup.id=r.setup_operation
+ join lateral (
+  select q.successor_owner_digest as commitment from stripe_billing_failed_grace_method_claims q join provider_operations p on p.id=q.operation_id
+  where $2 in ('SETUP_WRITE','METHOD_WRITE') and q.operation_id=$3 and q.reservation_id=r.id
+   and q.step_kind=case when $2='SETUP_WRITE' then 'SETUP_INTENT_CREATE' else 'SUBSCRIPTION_UPDATE' end
+   and q.successor_producer_xid<>$5 and owned_grace_write_claim_matches(r.id,p) and q.first_dispatched_at<=$6
+   and ((p.status=case when $4 then 'UNKNOWN' else 'DISPATCHING' end) or p.status='ACKNOWLEDGED')
+   and setup.status='RESERVED' and setup.version=r.initial_operation_version
+   and not exists(select 1 from stripe_billing_failed_method_reads where reservation_id=r.id)
+   and not exists(select 1 from stripe_billing_failed_method_completions where reservation_id=r.id)
+   and ($2<>'SETUP_WRITE' or (not exists(select 1 from stripe_subscription_setup_proofs where operation_id=setup.id)
+    and not exists(select 1 from provider_operations sibling where sibling.resource_id=setup.id and sibling.kind='SUBSCRIPTION_UPDATE')))
+  union all
+  select q.successor_owner_digest from stripe_billing_failed_method_reads q
+  where $2 in ('METHOD_READ','RECOVERED_READ') and q.reservation_id=r.id and q.id=$3 and q.successor_producer_xid<>$5 and q.started_at<=$6
+   and (($2='METHOD_READ' and q.phase='METHOD' and q.selected_operation=r.setup_operation
+      and not exists(select 1 from stripe_billing_failed_method_completions where reservation_id=r.id))
+    or ($2='RECOVERED_READ' and q.phase='RECOVERED' and exists(select 1 from stripe_billing_failed_method_recoveries x
+       where x.reservation_id=r.id and x.operation_id=q.selected_operation)))
+  union all
+  select q.successor_owner_digest from stripe_billing_failed_recovery_confirm_claims q join provider_operations p on p.id=q.provider_operation
+  where $2='RECOVERY_CONFIRM' and q.reservation_id=r.id and q.provider_operation=$3 and q.recorded_transaction<>$5 and q.claimed_at<=$6
+   and owned_recovery_confirm_owns(r.id,p) and p.first_dispatched_at=q.claimed_at and p.retry_before=q.claimed_at+interval '23 hours'
+   and (($4 and p.status='UNKNOWN' and p.version=2 and p.lease_owner is null and p.lease_expires_at is null)
+      or (not $4 and p.status='DISPATCHING' and p.version=1 and (p.lease_owner,p.lease_expires_at)=(q.claimant,q.deadline)))
+   and not exists(select 1 from stripe_billing_failed_recovery_confirm_acks where reservation_id=r.id)
+   and not exists(select 1 from stripe_billing_failed_method_reads where reservation_id=r.id and phase='RECOVERED')
+ ) evidence on true
+ where r.id=$1 and r.handoff_xid<>$5 and owned_grace_setup_inserted(r) and owned_failed_grace_identity(r.after_preparation_id)
+ and exists(select 1 from stripe_billing_failed_grace_boundary_ready after_ready
+    where (after_ready.id,after_ready.preparation_id,after_ready.admission_id,after_ready.phase)=(r.after_ready_id,r.after_preparation_id,r.admission_id,3))
+ and not exists(select 1 from stripe_billing_failed_method_publications where reservation_id=r.id)
+$$;
+create function require_owned_grace_terminal() returns trigger language plpgsql volatile as $$
+declare original text;
+begin
+ perform lock_owned_grace_successor_terminal(new.reservation_id);
+ if new.stopped_at is not null or new.successor_producer_xid is not null or new.owner_nonce is null
+    or exists(select 1 from stripe_billing_failed_renewal_stops where admission_id=new.admission_id)
+ then raise exception 'Original grace invocation required' using errcode='23514';end if;
+ new.stopped_at:=clock_timestamp();new.successor_producer_xid:=pg_current_xact_id();
+ if new.stopped_at>=statement_timestamp()+interval '2 seconds' then
+  raise exception 'Grace terminal cleanup budget expired' using errcode='23514';end if;
+ original:=owned_grace_terminal_origin(new.reservation_id,new.origin,new.origin_id,false,new.successor_producer_xid,new.stopped_at);
+ if original is null or original is distinct from new.successor_owner_digest or
+    first_renewal_hash('owned-grace-successor-owner-v1',new.origin,new.origin_id::text,new.owner_nonce::text) is distinct from original
+ then raise exception 'Original grace invocation required' using errcode='23514';end if;
+ -- The unchanged ACK row has no writer xid. Only refuse on this backend's tagged
+ -- ACK marker. Even an unrelated hash collision can only deny cleanup.
+ if new.origin in ('SETUP_WRITE','METHOD_WRITE') and exists(select 1 from provider_operations where id=new.origin_id and status='ACKNOWLEDGED')
+    and exists(select 1 from pg_locks where locktype='advisory' and pid=pg_backend_pid() and granted
+      and database=(select oid from pg_database where datname=current_database()) and objsubid=2
+      and classid=1499220551::oid and objid=hashtext(new.origin_id::text)::oid)
+ then raise exception 'Independent original WRITE acknowledgment required' using errcode='23514';end if;
+ new.owner_nonce:=null;return new;
+end $$;
+create trigger grace_successor_terminal_proof before insert on stripe_billing_failed_grace_successor_terminals
+ for each row execute function require_owned_grace_terminal();
+
+create function finish_owned_grace_terminal() returns trigger language plpgsql volatile as $$
+begin
+ if new.origin in ('SETUP_WRITE','METHOD_WRITE','RECOVERY_CONFIRM') then
+  update provider_operations set status='UNKNOWN',version=2,lease_owner=null,lease_expires_at=null
+   where id=new.origin_id and status='DISPATCHING' and version=1;
+ end if;
+ insert into stripe_billing_failed_renewal_stops(admission_id,reason,stopped_at) values(new.admission_id,new.reason,new.stopped_at);
+ return null;
+end $$;
+create trigger grace_successor_terminal_finish after insert on stripe_billing_failed_grace_successor_terminals
+ for each row execute function finish_owned_grace_terminal();
+create function owned_grace_terminal_complete(reservation uuid,writer xid8) returns boolean language sql stable as $$
+ select exists(select 1 from stripe_billing_failed_grace_successor_terminals t join stripe_billing_failed_renewal_stops s using(admission_id)
+ where t.reservation_id=$1 and t.successor_producer_xid=$2 and s.successor_producer_xid=$2 and t.owner_nonce is null
+ and clock_timestamp()>=t.stopped_at and clock_timestamp()<t.stopped_at+interval '2 seconds'
+ and (s.reason,s.stopped_at)=(t.reason,t.stopped_at)
+ and owned_grace_terminal_origin(t.reservation_id,t.origin,t.origin_id,true,$2,t.stopped_at)=t.successor_owner_digest)
+$$;
+create function check_owned_grace_terminal_complete() returns trigger language plpgsql volatile as $$
+begin
+ if not owned_grace_terminal_complete(new.reservation_id,pg_current_xact_id()) then
+  raise exception 'Atomic grace terminal and stop required' using errcode='23514';end if;
+ return null;
+end $$;
+create constraint trigger grace_successor_terminal_committed after insert on stripe_billing_failed_grace_successor_terminals deferrable initially deferred
+ for each row execute function check_owned_grace_terminal_complete();
+
+-- Preserve the original V40 stop gate for other lanes. Tagged stops must belong to the
+-- just-written terminal after its exact original provider transition.
+create or replace function require_failed_renewal_stop() returns trigger language plpgsql volatile as $$
+declare upstream uuid; preparation uuid;
+begin
+ if current_setting('transaction_isolation')<>'read committed' then
+  raise exception 'Owned failed renewal stop requires READ COMMITTED' using errcode='23514';end if;
+ select first_renewal_admission into upstream from stripe_billing_failed_renewals where id=new.admission_id;
+ perform id from stripe_billing_first_renewals where id=upstream for update nowait;
+ -- Separate fresh statement after serialization, including for the old unclaimed lane.
+ select p.id into preparation from stripe_billing_failed_grace_preparations p join stripe_billing_failed_grace_claims q on q.preparation_id=p.id where p.admission_id=new.admission_id;
+ if new.successor_producer_xid is not null then raise exception 'Invalid terminal stop xid' using errcode='23514';end if;
+ if exists(select 1 from stripe_billing_failed_method_reservations r where r.admission_id=new.admission_id and r.after_ready_id is not null) then
+  if not exists(select 1 from stripe_billing_failed_grace_successor_terminals t
+    where t.admission_id=new.admission_id and (t.reason,t.stopped_at)=(new.reason,new.stopped_at)
+    and t.successor_producer_xid=pg_current_xact_id()
+    and owned_grace_terminal_origin(t.reservation_id,t.origin,t.origin_id,true,pg_current_xact_id(),t.stopped_at)=t.successor_owner_digest)
+   then raise exception 'Original successor terminal required' using errcode='23514';end if;
+  new.successor_producer_xid:=pg_current_xact_id();
+ elsif preparation is not null then
+  perform owned_failed_grace_limits(2000,true);
+  if new.reason<>'UNCERTAIN' or (not exists(select 1 from stripe_billing_failed_grace_cleanup c
+   join stripe_billing_failed_grace_claims q on row(q.preparation_id,q.operation_id,q.invocation)=row(c.preparation_id,c.operation_id,c.invocation)
+   join provider_operations o on o.id=q.operation_id
+   where c.preparation_id=preparation and c.recorded_transaction=pg_current_xact_id() and q.recorded_transaction<>pg_current_xact_id()
+    and c.stopped_at=new.stopped_at and o.status in ('UNKNOWN','ACKNOWLEDGED') and o.version=2
+    and not exists(select 1 from stripe_billing_failed_grace_ready r where r.preparation_id=preparation))
+  and not exists(select 1 from stripe_billing_failed_grace_boundary_cleanup c
+   join stripe_billing_failed_grace_boundary_claims q on
+    (q.preparation_id,q.phase,q.operation_id,q.invocation,q.claimant,q.deadline)=(c.preparation_id,c.phase,c.operation_id,c.invocation,c.claimant,c.deadline)
+   join provider_operations o on o.id=q.operation_id
+   left join stripe_billing_failed_grace_boundary_acks a on a.operation_id=o.id
+   where q.preparation_id=preparation and q.admission_id=new.admission_id and c.stopped_at=new.stopped_at
+   and c.producer_xid=pg_current_xact_id() and q.producer_xid<>pg_current_xact_id()
+   and owned_grace_boundary_claim_shape(q,o) and o.version=2
+   and ((o.status='UNKNOWN' and a.operation_id is null) or (o.status='ACKNOWLEDGED'
+     and a.producer_xid not in (c.producer_xid,q.producer_xid) and owned_grace_boundary_ack_shape(q,a,o,clock_timestamp())))
+   and not exists(select 1 from stripe_billing_failed_grace_boundary_ready r where r.preparation_id=q.preparation_id and r.phase=q.phase)))
+  then raise exception 'Only original grace cleanup may stop its claimed lane' using errcode='23514';end if;
+ end if;
+ -- Preserve every V34 condition for old unclaimed stops and the claimed original stop.
+ if new.stopped_at>clock_timestamp() or not exists(select 1 from stripe_billing_failed_renewals d where d.id=new.admission_id and new.stopped_at>=d.admitted_at)
+ then raise exception 'Invalid terminal failed renewal receipt' using errcode='23514';end if;return new;
+end $$;
+
+-- V37's ordinary UNKNOWN is valid for its legacy lane. For a tagged financial claim,
+-- the exact original terminal must already be performing its atomic transition.
+create function require_owned_grace_confirm_unknown() returns trigger language plpgsql volatile as $$
+declare target uuid;
+begin
+ select q.reservation_id into target from stripe_billing_failed_recovery_confirm_claims q
+  join stripe_billing_failed_method_reservations r on r.id=q.reservation_id
+  where q.provider_operation=old.id and r.after_ready_id is not null;
+ if target is not null and not exists(select 1 from stripe_billing_failed_grace_successor_terminals t
+   join stripe_billing_failed_recovery_confirm_claims q on q.provider_operation=t.origin_id and q.reservation_id=t.reservation_id
+   where t.reservation_id=target and t.origin='RECOVERY_CONFIRM' and t.origin_id=old.id
+   and t.successor_producer_xid=pg_current_xact_id() and q.successor_owner_digest=t.successor_owner_digest)
+ then raise exception 'Atomic successor confirmation termination required' using errcode='23514';end if;
+ return new;
+end $$;
+create trigger grace_confirm_unknown before update on provider_operations for each row
+ when(old.kind='OWNED_RECOVERY_INTENT_CONFIRM' and new.status='UNKNOWN') execute function require_owned_grace_confirm_unknown();
+
+-- Recording an unbound SETUP proof after its independent ACK, or binding its method later,
+-- races the terminal for this original reservation. Serialize before the first proof mutation.
+create function require_live_grace_setup_proof() returns trigger language plpgsql volatile as $$
+declare target uuid;
+begin
+ select id into target from stripe_billing_failed_method_reservations where setup_operation=new.operation_id and after_ready_id is not null;
+ if target is null then return new;end if;
+ perform require_live_grace_successor(target);
+ if not exists(select 1 from stripe_billing_failed_grace_method_claims q join provider_operations p on p.id=q.operation_id
+   where q.reservation_id=target and q.operation_id=new.step_id and q.step_kind='SETUP_INTENT_CREATE'
+   and p.status='ACKNOWLEDGED' and p.provider_reference=new.setup_reference and owned_grace_write_claim_matches(target,p)
+   and q.successor_producer_xid<>pg_current_xact_id())
+ then raise exception 'Original live grace SETUP proof required' using errcode='23514';end if;
+ return new;
+end $$;
+create trigger grace_live_setup_proof before insert or update on stripe_subscription_setup_proofs
+ for each row execute function require_live_grace_setup_proof();
+
+create function require_live_grace_operation_progress() returns trigger language plpgsql volatile as $$
+declare target uuid;
+begin
+ select r.id into target from stripe_billing_failed_method_reservations r
+  where r.after_ready_id is not null and (r.setup_operation=old.id or exists(
+    select 1 from stripe_billing_failed_method_recoveries x where x.reservation_id=r.id and x.operation_id=old.id));
+ if target is not null then
+  perform require_live_grace_successor(target);
+  if old.kind='SETUP' and new.status='PROCESSING' and not owned_grace_method_writes_acked(target,pg_current_xact_id()) then
+   raise exception 'Original grace METHOD writes required' using errcode='23514';end if;
+ end if;
+ return new;
+end $$;
+create trigger grace_live_operation_progress before update of status on subscription_operations for each row
+ when(old.kind in ('SETUP','RECOVER') and new.status in ('PROCESSING','SUCCEEDED') and new.status<>old.status)
+ execute function require_live_grace_operation_progress();

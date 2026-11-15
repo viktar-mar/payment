@@ -13,6 +13,19 @@ import static org.assertj.core.api.Assertions.*;
 
 /** No DataSource/context: verifies closed defaults and early typed admission, not SQL behavior. */
 class OwnedFailedRenewalMethodProviderGuardTest {
+    @Test void ownerAwareWriteDefaultsNeverForwardToLegacyAuthority() {
+        var old=(ProviderOperationStore)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{ProviderOperationStore.class},
+            (proxy,method,args)->{if(method.isDefault()&&method.getParameterTypes()[method.getParameterCount()-1]
+                    ==dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner.class)
+                return InvocationHandler.invokeDefault(proxy,method,args);throw new AssertionError("Unexpected ordinary fallback");});
+        var owner=dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner.create();
+        for(var attempt:java.util.List.<Runnable>of(
+            ()->old.reserveOwnedFailedRenewalMethodStep(null,null,ProviderOperation.Kind.SETUP_INTENT_CREATE,owner),
+            ()->old.requireOwnedFailedRenewalMethodDispatch(null,null,null,dispatchAt,owner),
+            ()->old.claim(UUID.randomUUID(),"copied",dispatchAt,java.time.Duration.ofSeconds(60),owner),
+            ()->old.acknowledge(UUID.randomUUID(),"copied",1,"seti_unavailable",owner)))
+            assertThatThrownBy(attempt::run).isInstanceOf(UnsupportedOperationException.class);
+    }
     @Test void ownedMethodOperationLocksBeforeProviderReceiptEvenForTerminalReplays() {
         var account=dispatchAccount();var claim=dispatchClaim(account,dispatchAt.plusSeconds(82800),dispatchAt.plusSeconds(60),1);
         var acknowledged=new ProviderOperation(claim.id(),claim.accountId(),claim.externalAccountId(),claim.credentialsRef(),claim.kind(),claim.resourceId(),claim.operationKey(),claim.fingerprint(),

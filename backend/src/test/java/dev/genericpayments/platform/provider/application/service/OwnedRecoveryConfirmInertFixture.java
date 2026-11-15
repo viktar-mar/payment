@@ -1,6 +1,8 @@
 package dev.genericpayments.platform.provider.application.service;
 
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.RecoveryPreparationContext;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Origin;
 import dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.*;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation.*;
@@ -22,9 +24,9 @@ public class OwnedRecoveryConfirmInertFixture {
             public boolean active(){return f.transactions().active();}public <T>T required(Supplier<T> work){throw new AssertionError("fresh transaction required");}
             public <T>T requiresNew(Supplier<T> work){
                 var old=store.row;var acks=new ArrayList<>(store.acks);boolean committed=store.committed;long created=store.creatingTransaction;
-                var invocation=store.invocation;var entered=store.entered;var deadline=store.deadline;
+                var invocation=store.invocation;var entered=store.entered;var deadline=store.deadline;var digest=store.ownerDigest;
                 transaction++;try{T result=f.transactions().requiresNew(work);if(store.creatingTransaction==transaction)store.committed=true;afterCommit.run();return result;}
-                catch(RuntimeException e){store.row=old;store.acks.clear();store.acks.addAll(acks);store.committed=committed;store.creatingTransaction=created;store.invocation=invocation;store.entered=entered;store.deadline=deadline;throw e;}
+                catch(RuntimeException e){store.row=old;store.acks.clear();store.acks.addAll(acks);store.committed=committed;store.creatingTransaction=created;store.invocation=invocation;store.entered=entered;store.deadline=deadline;store.ownerDigest=digest;throw e;}
             }
         };
         service=new OwnedRecoveryConfirmService(f.service(),store,tx,f.clock());f.trace().clear();f.h.b.operationLockTargets.clear();
@@ -36,7 +38,7 @@ public class OwnedRecoveryConfirmInertFixture {
     public ProviderOperation row(){return store.row;}
     public List<ConfirmationAck> acknowledgments(){return List.copyOf(store.acks);}
     public List<InvocationBudget> budgetUses(){return List.copyOf(store.budgets);}
-    public Object receiptState(){return Arrays.asList(store.row,new ArrayList<>(store.acks),store.invocation,store.entered,store.deadline,store.creatingTransaction,store.committed);}
+    public Object receiptState(){return Arrays.asList(store.row,new ArrayList<>(store.acks),store.invocation,store.entered,store.deadline,store.creatingTransaction,store.committed,store.ownerDigest);}
     public void afterCommit(Runnable action){afterCommit=Objects.requireNonNull(action);}
     public void afterLock(Runnable action){store.afterLock=Objects.requireNonNull(action);}
     public void afterEffect(Runnable action){store.afterEffect=Objects.requireNonNull(action);}
@@ -51,6 +53,21 @@ public class OwnedRecoveryConfirmInertFixture {
         final List<InvocationBudget> budgets=new ArrayList<>();int writes;long creatingTransaction;boolean committed,failAck,effectReached;
         UUID invocation;Instant entered,deadline;Runnable afterLock=()->{},afterEffect=()->{};
         Memory(OwnedRecoveryConfirmInertFixture h){this.h=h;}
+        String ownerDigest;
+        public ProviderOperation insertAndClaimInTransaction(RecoveryPreparationContext c,String claimant,Instant now,InvocationBudget budget,SuccessorOwner owner){
+            if(owner==null)throw new IllegalStateException("owner required");
+            var claim=insertAndClaimInTransaction(c,claimant,now,budget);
+            ownerDigest=owner.commitment(Origin.RECOVERY_CONFIRM,claim.id());return claim;
+        }
+        void requireOwner(ProviderOperation claim,SuccessorOwner owner){
+            if(owner==null||!owner.commitment(Origin.RECOVERY_CONFIRM,claim.id()).equals(ownerDigest))throw new IllegalStateException("owner unavailable");
+        }
+        public ProviderOperation requireClaimInTransaction(RecoveryPreparationContext c,ProviderOperation claim,InvocationBudget budget,Instant now,SuccessorOwner owner){
+            requireOwner(claim,owner);return requireClaimInTransaction(c,claim,budget,now);
+        }
+        public ConfirmationAck acknowledgeInTransaction(RecoveryPreparationContext c,ProviderOperation claim,ConfirmReply reply,Instant now,InvocationBudget budget,SuccessorOwner owner){
+            requireOwner(claim,owner);return acknowledgeInTransaction(c,claim,reply,now,budget);
+        }
         void active(){assertThat(h.f.transactions().active()).isTrue();}
         void context(RecoveryPreparationContext c){assertThat(c).isEqualTo(h.expected);}
         public Optional<ProviderOperation> lockInTransaction(RecoveryPreparationContext c){active();context(c);calls.add("lock");h.f.trace().add("confirm-lock");afterLock.run();return Optional.ofNullable(row);}

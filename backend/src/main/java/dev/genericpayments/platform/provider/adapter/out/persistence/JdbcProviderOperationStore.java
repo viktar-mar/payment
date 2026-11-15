@@ -7,6 +7,9 @@ import dev.genericpayments.platform.provider.application.model.ReadyClock;
 import dev.genericpayments.platform.provider.application.model.OwnedClockSubscription;
 import dev.genericpayments.platform.provider.application.model.OwnedClockSubscriptionReceipt;
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.*;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Origin;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner;
 import dev.genericpayments.platform.customers.domain.CustomerId;
 import dev.genericpayments.platform.sites.domain.SiteId;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind;
@@ -48,8 +51,16 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     }
     @Override
     public ProviderOperation reserveOwnedFailedRenewalMethodStep(PaymentAccount account,
-            dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reservation,Kind kind) {
+            Reservation reservation,Kind kind) {
+        return reserveMethodStep(account,reservation,kind,null);
+    }
+    @Override public ProviderOperation reserveOwnedFailedRenewalMethodStep(PaymentAccount account,Reservation reservation,Kind kind,SuccessorOwner owner){
+        if(owner==null)throw conflict();
+        return reserveMethodStep(account,reservation,kind,owner);
+    }
+    private ProviderOperation reserveMethodStep(PaymentAccount account,Reservation reservation,Kind kind,SuccessorOwner invocation) {
         if(account==null||reservation==null||(kind!=Kind.SETUP_INTENT_CREATE&&kind!=Kind.SUBSCRIPTION_UPDATE))throw conflict();
+        if((reservation.successor()!=null)!=(invocation!=null))throw conflict();
         // Browser phases already hold this row before authority/account/root locks.
         lockOwnedMethodOperation(reservation.setupOperationId());
         var store=new JdbcOwnedFailedRenewalMethodStore(jdbc);store.requireReservationInTransaction(reservation);
@@ -61,16 +72,28 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
             +(kind==Kind.SETUP_INTENT_CREATE?":SETUP":":METHOD");
         String fingerprint=jdbc.queryForObject("select owned_method_step_fingerprint(?,?)",String.class,reservation.id(),kind==Kind.SUBSCRIPTION_UPDATE);
         JdbcOwnedFailedRenewalMethodStore.requireStepResource(jdbc,account.id(),kind,reservation.setupOperationId(),key,fingerprint);
-        return reserveRow(account,kind,reservation.setupOperationId(),key,fingerprint);
+        var step=reserveRow(account,kind,reservation.setupOperationId(),key,fingerprint);
+        if(invocation!=null&&(step.status()!=Status.RESERVED||step.version()!=0))throw conflict();
+        return step;
     }
     @Override
     public ProviderOperation requireOwnedFailedRenewalMethodDispatch(PaymentAccount account,
-            dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reservation,ProviderOperation claim,Instant now) {
+            Reservation reservation,ProviderOperation claim,Instant now) {
+        return inspectMethodDispatch(account,reservation,claim,now,null);
+    }
+    @Override public ProviderOperation requireOwnedFailedRenewalMethodDispatch(PaymentAccount account,Reservation reservation,
+            ProviderOperation claim,Instant now,SuccessorOwner owner){
+        if(owner==null)throw conflict();
+        return inspectMethodDispatch(account,reservation,claim,now,owner);
+    }
+    private ProviderOperation inspectMethodDispatch(PaymentAccount account,Reservation reservation,ProviderOperation claim,Instant now,SuccessorOwner owner){
         if(account==null||reservation==null||claim==null||now==null||!claim.resourceId().equals(reservation.setupOperationId()))throw conflict();
+        if((reservation.successor()!=null)!=(owner!=null))throw conflict();
         return requireOwnedMethodDispatchAfterAuthentication(account,claim,now,()->{
             var current=lock(claim.id()).orElseThrow(JdbcProviderOperationStore::conflict);
             if(!current.equals(claim))throw conflict();
             new JdbcOwnedFailedRenewalMethodStore(jdbc).requireReservationInTransaction(reservation);
+            if(owner!=null)requireWriteOwner(current,current.leaseOwner(),owner,true);
             requirePinnedAccount(current);
             JdbcOwnedFailedRenewalMethodStore.requireStepResource(jdbc,current.accountId(),current.kind(),current.resourceId(),current.operationKey(),current.fingerprint());
             return current;
@@ -211,6 +234,12 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
 
     @Override
     public Optional<ProviderOperation> claim(UUID id, String owner, Instant now, Duration lease) {
+        return claimStep(id,owner,now,lease,null);
+    }
+    @Override public Optional<ProviderOperation> claim(UUID id,String claimant,Instant now,Duration lease,SuccessorOwner owner){
+        if(owner==null)throw conflict();return claimStep(id,claimant,now,lease,owner);
+    }
+    private Optional<ProviderOperation> claimStep(UUID id,String owner,Instant now,Duration lease,SuccessorOwner invocation){
         text(owner, 128);
         if (id == null || now == null || !Duration.ofSeconds(60).equals(lease)) throw conflict();
         now = now.truncatedTo(ChronoUnit.MICROS);
@@ -227,6 +256,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
             JdbcStripeBillingClockSubscriptionStore.operationIntent(jdbc,current.accountId(),current.resourceId())
                 .ifPresent(i->JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,i));
         if(current.kind()==Kind.TEST_CLOCK_ADVANCE)JdbcOwnedFirstRenewalStore.requireOperationAdvance(jdbc,current);
+        requireWriteOwner(current,owner,invocation,false);
         requirePinnedAccount(current);
         requireResource(current.accountId(), current.kind(), current.resourceId(),current.operationKey(),current.fingerprint());
         if(firstDispatchOnly(current) && current.firstDispatchedAt()!=null) return Optional.empty();
@@ -249,7 +279,10 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     @Override
     public ProviderOperation acknowledge(UUID id, String owner, long expectedVersion, String reference) {
         text(reference, 255);
-        return finishClaim(id, owner, expectedVersion, "ACKNOWLEDGED", reference);
+        return finishClaim(id, owner, expectedVersion, "ACKNOWLEDGED", reference,null);
+    }
+    @Override public ProviderOperation acknowledge(UUID id,String claimant,long version,String reference,SuccessorOwner owner){
+        if(owner==null)throw conflict();text(reference,255);return finishClaim(id,claimant,version,"ACKNOWLEDGED",reference,owner);
     }
     @Transactional(propagation=Propagation.MANDATORY)
     public ProviderOperation lockResumeReceipt(ProviderOperation expected){
@@ -271,19 +304,20 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         return current;
     }
     @Transactional(propagation=Propagation.MANDATORY)
-    public ProviderOperation acknowledgeInTransaction(UUID id,String owner,long version,String reference){text(reference,255);return finishClaim(id,owner,version,"ACKNOWLEDGED",reference);}
+    public ProviderOperation acknowledgeInTransaction(UUID id,String owner,long version,String reference){text(reference,255);return finishClaim(id,owner,version,"ACKNOWLEDGED",reference,null);}
 
     @Override
     public ProviderOperation unknown(UUID id, String owner, long expectedVersion) {
-        return finishClaim(id, owner, expectedVersion, "UNKNOWN", null);
+        return finishClaim(id, owner, expectedVersion, "UNKNOWN", null,null);
     }
 
-    private ProviderOperation finishClaim(UUID id, String owner, long version, String status, String reference) {
+    private ProviderOperation finishClaim(UUID id, String owner, long version, String status, String reference,SuccessorOwner invocation) {
         text(owner, 128);
         if (id == null || version < 0) throw conflict();
         // Acquire the row first: a blocked UPDATE could otherwise evaluate its clock predicate
         // before waiting for a lock and finish after the lease has expired.
         var current = lock(id).orElseThrow(JdbcProviderOperationStore::conflict);
+        requireWriteOwner(current,owner,invocation,true);
         if ("ACKNOWLEDGED".equals(status) && (!supportedResource(current.kind()) || ownedSubscription(current)||current.kind()==Kind.TEST_CLOCK_ADVANCE)) throw conflict();
         if ((current.kind() == Kind.TEST_CLOCK_CREATE||current.kind() == Kind.CUSTOMER_CREATE||current.kind()==Kind.SUBSCRIPTION_CREATE||current.kind()==Kind.SETUP_INTENT_CREATE||current.kind()==Kind.SUBSCRIPTION_UPDATE||current.kind()==Kind.SUBSCRIPTION_CANCEL||current.kind()==Kind.INVOICE_PAY||current.kind()==Kind.PORTAL_CONFIGURATION_CREATE||current.kind()==Kind.PORTAL_SESSION_CREATE) && "ACKNOWLEDGED".equals(status)) {
             requirePinnedAccount(current);
@@ -300,6 +334,24 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         } catch (DataIntegrityViolationException collision) {
             throw conflict();
         }
+    }
+
+    /** The public lease string is an identifier. Only the original invocation can reproduce it for this step. */
+    private void requireWriteOwner(ProviderOperation step,String claimant,SuccessorOwner owner,boolean sealed){
+        if(step.kind()!=Kind.SETUP_INTENT_CREATE&&step.kind()!=Kind.SUBSCRIPTION_UPDATE){
+            if(owner!=null)throw conflict();return;
+        }
+        var roots=jdbc.queryForList("""
+            select id from stripe_billing_failed_method_reservations where setup_operation=? and after_ready_id is not null
+            """,UUID.class,step.resourceId());
+        if(roots.isEmpty()){if(owner!=null)throw conflict();return;}
+        if(roots.size()!=1||owner==null)throw conflict();
+        var digest=owner.commitment(step.kind()==Kind.SETUP_INTENT_CREATE?Origin.SETUP_WRITE:Origin.METHOD_WRITE,step.id());
+        if(!digest.equals(claimant))throw conflict();
+        if(sealed&&(!digest.equals(step.leaseOwner())||!Boolean.TRUE.equals(jdbc.queryForObject("""
+            select owned_grace_write_claim_matches(?,p) and q.successor_owner_digest=? and q.successor_producer_xid<>pg_current_xact_id()
+            from provider_operations p join stripe_billing_failed_grace_method_claims q on q.operation_id=p.id where p.id=?
+            """,Boolean.class,roots.getFirst(),digest,step.id()))))throw conflict();
     }
 
     @Override

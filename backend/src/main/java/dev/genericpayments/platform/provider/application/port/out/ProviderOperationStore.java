@@ -3,6 +3,8 @@ package dev.genericpayments.platform.provider.application.port.out;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
@@ -27,6 +29,13 @@ public interface ProviderOperationStore {
             ProviderOperation claim,Instant now) {
         throw new UnsupportedOperationException("Owned failed renewal method dispatch is unavailable");
     }
+    default ProviderOperation reserveOwnedFailedRenewalMethodStep(PaymentAccount account,Reservation reservation,
+            ProviderOperation.Kind kind,SuccessorOwner owner){throw successorUnavailable();}
+    default ProviderOperation requireOwnedFailedRenewalMethodDispatch(PaymentAccount account,Reservation reservation,
+            ProviderOperation claim,Instant now,SuccessorOwner owner){throw successorUnavailable();}
+    default Optional<ProviderOperation> claim(UUID id,String claimant,Instant now,Duration lease,SuccessorOwner owner){throw successorUnavailable();}
+    default ProviderOperation acknowledge(UUID id,String claimant,long version,String reference,SuccessorOwner owner){throw successorUnavailable();}
+    private static UnsupportedOperationException successorUnavailable(){return new UnsupportedOperationException("Owned grace successor write unavailable");}
     default ProviderOperation reserveOwnedFirstRenewalAdvance(PaymentAccount account,
             dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.Advance advance) {
         throw new UnsupportedOperationException("Owned first renewal reservation is unavailable");

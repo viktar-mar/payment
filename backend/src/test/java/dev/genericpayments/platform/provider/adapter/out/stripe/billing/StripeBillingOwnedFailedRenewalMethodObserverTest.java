@@ -21,6 +21,17 @@ import static org.mockito.Mockito.*;
 /** Real descriptive readers and official inert SDK; only the durable service boundary is substituted.
  * Genuine store/service/FactService composition is separately hosted, never selected offline. */
 class StripeBillingOwnedFailedRenewalMethodObserverTest {
+    @Test void exactClockUsesSavedAfterForTaggedAndOriginalReadyForLegacy(){
+        for(boolean tagged:List.of(true,false)){
+            var f=new dev.genericpayments.platform.provider.application.service.OwnedRecoveryInertFixture(value->"digest:"+value,tagged);
+            var r=f.reservation();var expected=r.remoteClock();var remote=new com.stripe.model.testhelpers.TestClock();
+            remote.setId(expected.reference());remote.setObject(expected.object());remote.setLivemode(false);remote.setName(expected.name());
+            remote.setFrozenTime(expected.frozenTime());remote.setStatus("ready");remote.setCreated(expected.created());remote.setDeletesAfter(expected.deletesAfter());
+            StripeBillingOwnedFailedRenewalMethodObserver.exactClock(remote,r);
+            remote.setFrozenTime(tagged?r.admission().ready().observation().frozenTime():expected.frozenTime()+1);
+            assertThatThrownBy(()->StripeBillingOwnedFailedRenewalMethodObserver.exactClock(remote,r)).isInstanceOf(PaymentApplicationException.class);
+        }
+    }
     @ParameterizedTest @ValueSource(booleans={false,true})
     void returnsOnlyPersistedReceiptAndPublishesRawDescriptor(boolean recovered) {
         var h=new Harness(recovered);h.queue();assertThat(h.observe()).isSameAs(recovered?h.publication:h.completion);

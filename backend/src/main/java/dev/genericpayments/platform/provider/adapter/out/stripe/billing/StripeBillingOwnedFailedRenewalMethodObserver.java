@@ -40,61 +40,67 @@ public final class StripeBillingOwnedFailedRenewalMethodObserver {
     public Completion observeMethod(Reservation reservation) {
         Objects.requireNonNull(reservation);
         long actualStart=System.nanoTime(),start=nanos.getAsLong();var entry=now();var invocation=UUID.randomUUID();
+        var privateOwner=reservation.successor()==null?null:SuccessorOwner.create();
         ReadClaim claim;
-        // Begin and publication own their rollback/stop. Never stop those failures a second time.
-        try {claim=service.beginMethodRead(reservation,invocation);}
+        try {claim=privateOwner==null?service.beginMethodRead(reservation,invocation):service.beginMethodRead(reservation,invocation,privateOwner);}
         catch(RuntimeException failure) {throw serviceFailure(failure);}
         MethodReadContext context;MethodEvidence evidence;Reads reads=null;
         try {
             requireClaim(reservation,claim,Phase.METHOD,invocation,entry,reservation.setupOperationId(),reservation.initialOperationVersion()+1,
                 reservation.failure().observationSequence());
             var budget=new Budget(start,actualStart,claim.deadlineAt());budget.remaining();
-            context=inspectMethod(reservation,claim);budget.remaining();
+            context=inspectMethod(reservation,claim,privateOwner);budget.remaining();
             var expected=context;
-            reads=new Reads(budget,()->{if(!expected.equals(inspectMethod(reservation,claim)))throw new Drift();});
+            reads=new Reads(budget,()->{if(!expected.equals(inspectMethod(reservation,claim,privateOwner)))throw new Drift();});
             var client=clients.create(credentials.resolve(context.account()));budget.remaining();
             var reader=reads;var admission=reservation.admission();var intent=admission.firstRenewalAdmission().receipt().intent();
-            exactClock(reader.execute(()->client.v1().testHelpers().testClocks().retrieve(intent.clock().reference(),reader.options())),reservation);
+            var clock=reservation.remoteClock();
+            exactClock(reader.execute(()->client.v1().testHelpers().testClocks().retrieve(clock.reference(),reader.options())),reservation);
             var owner=new StripeBillingSnapshotMapper.Ownership(context.account(),context.subscription(),context.binding(),
                 List.of(new StripeBillingSnapshotMapper.PublishedPrice(intent.terms(),intent.priceReference(),intent.productReference())));
             var candidate=new StripeBillingSnapshotMapper.OwnedMethodCandidate(context.operation(),context.setupProof(),context.setupStep(),context.methodStep());
             var mapped=StripeBillingSnapshotMapper.retrieveOwnedMethodReady(client,owner,admission,reservation.failure(),candidate,digest,now(),reader);
-            exactClock(reader.execute(()->client.v1().testHelpers().testClocks().retrieve(intent.clock().reference(),reader.options())),reservation);
+            exactClock(reader.execute(()->client.v1().testHelpers().testClocks().retrieve(clock.reference(),reader.options())),reservation);
             reader.checkContext();budget.remaining();var accepted=now();claim.requireAccepted(mapped.snapshot().observedAt(),accepted);
             evidence=new MethodEvidence(mapped.snapshot(),mapped.setupIntent(),mapped.method(),accepted);
-        } catch(RuntimeException failure) {throw stopped(reservation,failure,reads);}
-        try {return service.publishMethod(reservation,claim,evidence,context);}
-        catch(RuntimeException failure) {throw serviceFailure(failure);}
+        } catch(RuntimeException failure) {throw stopped(reservation,claim,privateOwner,readFailure(failure,reads));}
+        try {return privateOwner==null?service.publishMethod(reservation,claim,evidence,context)
+            :service.publishMethod(reservation,claim,evidence,context,privateOwner);}
+        catch(RuntimeException failure) {throw publicationFailure(reservation,claim,privateOwner,failure);}
     }
 
     public Publication observeRecovery(Reservation reservation,Recovery recovery) {
         Objects.requireNonNull(reservation);Objects.requireNonNull(recovery);
         long actualStart=System.nanoTime(),start=nanos.getAsLong();var entry=now();var invocation=UUID.randomUUID();
+        var privateOwner=reservation.successor()==null?null:SuccessorOwner.create();
         ReadClaim claim;
-        try {claim=service.beginRecoveredRead(reservation,recovery,invocation);}
+        try {claim=privateOwner==null?service.beginRecoveredRead(reservation,recovery,invocation)
+            :service.beginRecoveredRead(reservation,recovery,invocation,privateOwner);}
         catch(RuntimeException failure) {throw serviceFailure(failure);}
         RecoveredReadContext context;OwnedFailedRenewal.RecoveredEvidence evidence;Reads reads=null;
         try {
             if(!reservation.id().equals(recovery.reservationId())||recovery.observationSequence()!=reservation.failure().observationSequence()+1)throw new Drift();
             requireClaim(reservation,claim,Phase.RECOVERED,invocation,entry,recovery.association().operationId(),recovery.association().operationVersion(),recovery.observationSequence());
             var budget=new Budget(start,actualStart,claim.deadlineAt());budget.remaining();
-            context=inspectRecovery(reservation,claim);budget.remaining();
+            context=inspectRecovery(reservation,claim,privateOwner);budget.remaining();
             if(!recovery.equals(context.recovery()))throw new Drift();
             var expected=context;
-            reads=new Reads(budget,()->{if(!expected.equals(inspectRecovery(reservation,claim)))throw new Drift();});
+            reads=new Reads(budget,()->{if(!expected.equals(inspectRecovery(reservation,claim,privateOwner)))throw new Drift();});
             var client=clients.create(credentials.resolve(context.account()));budget.remaining();
             var reader=reads;var admission=reservation.admission();var intent=admission.firstRenewalAdmission().receipt().intent();
-            exactClock(reader.execute(()->client.v1().testHelpers().testClocks().retrieve(intent.clock().reference(),reader.options())),reservation);
+            var clock=reservation.remoteClock();
+            exactClock(reader.execute(()->client.v1().testHelpers().testClocks().retrieve(clock.reference(),reader.options())),reservation);
             var owner=new StripeBillingSnapshotMapper.Ownership(context.account(),context.subscription(),context.binding(),
                 List.of(new StripeBillingSnapshotMapper.PublishedPrice(intent.terms(),intent.priceReference(),intent.productReference())));
             var mapped=StripeBillingSnapshotMapper.retrieveOwnedRecoveredRenewal(client,owner,admission,reservation.failure(),context.recovery().association(),context.operation(),now(),reader);
-            exactClock(reader.execute(()->client.v1().testHelpers().testClocks().retrieve(intent.clock().reference(),reader.options())),reservation);
+            exactClock(reader.execute(()->client.v1().testHelpers().testClocks().retrieve(clock.reference(),reader.options())),reservation);
             reader.checkContext();budget.remaining();var accepted=now();claim.requireAccepted(mapped.snapshot().observedAt(),accepted);
             evidence=new OwnedFailedRenewal.RecoveredEvidence(mapped.snapshot(),accepted);
-        } catch(RuntimeException failure) {throw stopped(reservation,failure,reads);}
+        } catch(RuntimeException failure) {throw stopped(reservation,claim,privateOwner,readFailure(failure,reads));}
         // Return the committed receipt even when commit itself consumed the remaining observation budget.
-        try {return service.publishRecovery(reservation,claim,evidence,context);}
-        catch(RuntimeException failure) {throw serviceFailure(failure);}
+        try {return privateOwner==null?service.publishRecovery(reservation,claim,evidence,context)
+            :service.publishRecovery(reservation,claim,evidence,context,privateOwner);}
+        catch(RuntimeException failure) {throw publicationFailure(reservation,claim,privateOwner,failure);}
     }
 
     private void requireClaim(Reservation r,ReadClaim q,Phase phase,UUID invocation,Instant entry,UUID operation,long version,long sequence) {
@@ -104,28 +110,42 @@ public final class StripeBillingOwnedFailedRenewalMethodObserver {
                 ||!operation.equals(q.fence().operationId())||!Objects.equals(version,q.fence().operationVersion())
                 ||!Objects.equals(sequence,q.fence().observationSequence())||q.fence().lease()!=null||q.fence().authority()!=null)throw new Drift();
     }
-    private MethodReadContext inspectMethod(Reservation r,ReadClaim q) {
-        try {var c=service.inspectMethodRead(r,q);if(c==null||!r.billingSample().equals(c.billingSample()))throw new Drift();return c;}
+    private MethodReadContext inspectMethod(Reservation r,ReadClaim q,SuccessorOwner owner) {
+        try {var c=owner==null?service.inspectMethodRead(r,q):service.inspectMethodRead(r,q,owner);if(c==null||!r.billingSample().equals(c.billingSample()))throw new Drift();return c;}
         catch(RuntimeException failure) {throw new Drift();}
     }
-    private RecoveredReadContext inspectRecovery(Reservation r,ReadClaim q) {
-        try {var c=service.inspectRecoveredRead(r,q);if(c==null||!r.billingSample().equals(c.billingSample()))throw new Drift();return c;}
+    private RecoveredReadContext inspectRecovery(Reservation r,ReadClaim q,SuccessorOwner owner) {
+        try {var c=owner==null?service.inspectRecoveredRead(r,q):service.inspectRecoveredRead(r,q,owner);if(c==null||!r.billingSample().equals(c.billingSample()))throw new Drift();return c;}
         catch(RuntimeException failure) {throw new Drift();}
     }
-    private PaymentApplicationException stopped(Reservation r,RuntimeException failure,Reads reads) {
-        var result=safe();var reason=failure instanceof Drift||reads!=null&&reads.drift?OwnedFailedRenewal.Reason.AUTHORITY_DRIFT:OwnedFailedRenewal.Reason.UNCERTAIN;
-        try {service.stop(r,reason);}catch(RuntimeException ignored) {result.addSuppressed(new IllegalStateException("Owned method stop unavailable"));}
+    private OwnedFailedRenewal.Reason readFailure(RuntimeException failure,Reads reads){
+        return failure instanceof Drift||reads!=null&&reads.drift?OwnedFailedRenewal.Reason.AUTHORITY_DRIFT:OwnedFailedRenewal.Reason.UNCERTAIN;
+    }
+    private PaymentApplicationException publicationFailure(Reservation r,ReadClaim q,SuccessorOwner owner,RuntimeException failure){
+        if(owner==null)return serviceFailure(failure);
+        var reason=failure instanceof IllegalArgumentException||failure instanceof IllegalStateException
+            ?OwnedFailedRenewal.Reason.AUTHORITY_DRIFT:OwnedFailedRenewal.Reason.UNCERTAIN;
+        return stopped(r,q,owner,reason);
+    }
+    private PaymentApplicationException stopped(Reservation r,ReadClaim q,SuccessorOwner owner,OwnedFailedRenewal.Reason reason) {
+        var result=safe();
+        try {if(owner==null)service.stop(r,reason);else service.terminateSuccessorRead(r,q,reason,owner);}
+        catch(RuntimeException ignored) {result.addSuppressed(new IllegalStateException("Owned method stop unavailable"));}
         return result;
     }
     private Instant now(){return utc.instant().truncatedTo(ChronoUnit.MICROS);}
     static void exactClock(TestClock remote,Reservation r) {
-        var expected=r.admission().ready().observation();
+        var expected=r.remoteClock();
         if(remote==null||!expected.reference().equals(remote.getId())||!"test_helpers.test_clock".equals(remote.getObject())
                 ||!Boolean.FALSE.equals(remote.getLivemode())||Boolean.TRUE.equals(remote.getDeleted())
                 ||!expected.name().equals(remote.getName())||!Objects.equals(expected.frozenTime(),remote.getFrozenTime())
                 ||!Objects.equals(expected.created(),remote.getCreated())||!Objects.equals(expected.deletesAfter(),remote.getDeletesAfter())
                 ||!"ready".equals(remote.getStatus())||remote.getStatusDetails()!=null&&remote.getStatusDetails().getAdvancing()!=null
                 &&!Objects.equals(expected.frozenTime(),remote.getStatusDetails().getAdvancing().getTargetFrozenTime()))throw safe();
+        if(r.successor()!=null){
+            var advancing=remote.getStatusDetails()==null?null:remote.getStatusDetails().getAdvancing();
+            if(!Objects.equals(expected.advancingTarget(),advancing==null?null:advancing.getTargetFrozenTime()))throw safe();
+        }
     }
     private final class Budget {
         private final long start,actualStart;private final Instant deadline;

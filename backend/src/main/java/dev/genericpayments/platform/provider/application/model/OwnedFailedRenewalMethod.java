@@ -15,6 +15,19 @@ import java.util.UUID;
 public final class OwnedFailedRenewalMethod {
     private OwnedFailedRenewalMethod() {}
     public enum Phase { METHOD, RECOVERED }
+    public enum Origin { SETUP_WRITE, METHOD_WRITE, METHOD_READ, RECOVERED_READ, RECOVERY_CONFIRM }
+    /** Invocation-local preimage. Persist only the origin-specific commitment. */
+    public static final class SuccessorOwner {
+        private final UUID nonce=UUID.randomUUID();
+        private SuccessorOwner(){}
+        public static SuccessorOwner create(){return new SuccessorOwner();}
+        public UUID nonce(){return nonce;}
+        public String commitment(Origin origin,UUID id){
+            required(origin,id);
+            return OwnedFirstRenewal.fingerprint("owned-grace-successor-owner-v1",origin.name(),id,nonce);
+        }
+        @Override public String toString(){return "SuccessorOwner[redacted]";}
+    }
     public static String factKey(ReadClaim q) {
         return "owned-failed-renewal-method:"+q.reservationId()+":"+q.phase()+":"+q.invocation();
     }

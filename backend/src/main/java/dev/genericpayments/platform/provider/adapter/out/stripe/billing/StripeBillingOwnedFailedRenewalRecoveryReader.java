@@ -74,9 +74,10 @@ public final class StripeBillingOwnedFailedRenewalRecoveryReader {
                 StripeBillingSnapshotMapper.requireOwnedRecoveryPreparation(owner,current,candidate,digest,budget.at(expiry));
                 budget.remaining(expiry);
             });
-            StripeBillingOwnedFailedRenewalMethodObserver.exactClock(reads.execute(()->client.v1().testHelpers().testClocks().retrieve(intent.clock().reference(),reads.options())),reservation);
+            var clock=original.reservation().remoteClock();
+            StripeBillingOwnedFailedRenewalMethodObserver.exactClock(reads.execute(()->client.v1().testHelpers().testClocks().retrieve(clock.reference(),reads.options())),reservation);
             var snapshot=StripeBillingSnapshotMapper.retrieveOwnedRecoveryPreparation(client,owner,original,candidate,digest,budget.at(expiry),reads);
-            StripeBillingOwnedFailedRenewalMethodObserver.exactClock(reads.execute(()->client.v1().testHelpers().testClocks().retrieve(intent.clock().reference(),reads.options())),reservation);
+            StripeBillingOwnedFailedRenewalMethodObserver.exactClock(reads.execute(()->client.v1().testHelpers().testClocks().retrieve(clock.reference(),reads.options())),reservation);
             reads.checkContext();budget.remaining(expiry);
             return new PreparedRecovery(original,snapshot);
         }catch(RuntimeException failure){throw unavailable();}

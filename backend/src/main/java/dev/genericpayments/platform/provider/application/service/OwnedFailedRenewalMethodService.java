@@ -195,7 +195,7 @@ public final class OwnedFailedRenewalMethodService {
     /** Both provider ACKs and management authority are authenticated in this exact save transaction. */
     public SubscriptionOperation recordMethodUpdateReply(Reservation reservation,SubscriptionCommandContext context){
         Objects.requireNonNull(reservation);validateContext(context);
-        return guarded(reservation.admission(),()->transaction.requiresNew(()->{
+        return guarded(reservation,()->transaction.requiresNew(()->{
             var state=current(reservation,context,null);requireDebt(state,reservation.failure(),0);
             var selected=selected(state,reservation.setupOperationId(),SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Status.RESERVED,reservation.initialOperationVersion(),null);
             if(!selected.authorityScope().equals(methodAuthority(reservation.admission()))||!selected.fingerprint().equals(request(reservation.admission(),reservation.failure(),context))
@@ -218,34 +218,49 @@ public final class OwnedFailedRenewalMethodService {
             ||!original.sessionExpiresAt().equals(session.expiresAt()))throw unavailable();
     }
     public ReadClaim beginMethodRead(Reservation reservation,UUID invocation){
-        return guarded(reservation.admission(),()->transaction.requiresNew(()->{
+        return beginMethodRead(reservation,invocation,null);
+    }
+    public ReadClaim beginMethodRead(Reservation reservation,UUID invocation,SuccessorOwner owner){
+        requireReadOwnerMode(reservation,owner);
+        return guarded(reservation,()->transaction.requiresNew(()->{
             var state=current(reservation,null,null);requireDebt(state,reservation.failure(),0);
             selected(state,reservation.setupOperationId(),SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Status.PROCESSING,reservation.initialOperationVersion()+1,null);
-            return store.claimReadInTransaction(reservation,Phase.METHOD,Objects.requireNonNull(invocation),state.fence(),state.sample(),state.utcAt());
+            return owner==null?store.claimReadInTransaction(reservation,Phase.METHOD,Objects.requireNonNull(invocation),state.fence(),state.sample(),state.utcAt()):store.claimReadInTransaction(reservation,Phase.METHOD,Objects.requireNonNull(invocation),state.fence(),state.sample(),state.utcAt(),owner);
         }));
     }
     public MethodReadContext inspectMethodRead(Reservation reservation,ReadClaim claim){
+        return inspectMethodRead(reservation,claim,null);
+    }
+    public MethodReadContext inspectMethodRead(Reservation reservation,ReadClaim claim,SuccessorOwner owner){
+        requireReadOwnerMode(reservation,owner);
         fresh();return transaction.requiresNew(()->{
-            var state=current(reservation,null,null);requireRead(reservation,claim,Phase.METHOD,state,null,null);
-            var context=store.requireMethodContextInTransaction(reservation,claim);requireMethodContext(state,context);return context;
+            var state=current(reservation,null,null);requireRead(reservation,claim,Phase.METHOD,state,null,null,owner);
+            var context=owner==null?store.requireMethodContextInTransaction(reservation,claim):store.requireMethodContextInTransaction(reservation,claim,owner);requireMethodContext(state,context);return context;
         });
     }
     public Completion publishMethod(Reservation reservation,ReadClaim claim,MethodEvidence evidence,MethodReadContext expected){
-        return guarded(reservation.admission(),()->transaction.requiresNew(()->{
-            var state=current(reservation,null,null);requireRead(reservation,claim,Phase.METHOD,state,evidence.snapshot(),evidence.acceptedAt());
-            var context=store.requireMethodContextInTransaction(reservation,claim);requireMethodContext(state,context);
+        return publishMethod(reservation,claim,evidence,expected,null);
+    }
+    public Completion publishMethod(Reservation reservation,ReadClaim claim,MethodEvidence evidence,MethodReadContext expected,SuccessorOwner owner){
+        requireReadOwnerMode(reservation,owner);
+        return guarded(reservation,()->transaction.requiresNew(()->{
+            var state=current(reservation,null,null);requireRead(reservation,claim,Phase.METHOD,state,evidence.snapshot(),evidence.acceptedAt(),owner);
+            var context=owner==null?store.requireMethodContextInTransaction(reservation,claim):store.requireMethodContextInTransaction(reservation,claim,owner);requireMethodContext(state,context);
             if(expected==null||!expected.equals(context)||!evidence.setupIntent().equals(context.setupProof().reference())||!evidence.method().equals(context.setupProof().method()))throw unavailable();
             requireSnapshot(reservation,evidence.snapshot(),false);
             var raw=evidence.snapshot();var key=context.operation().providerOperationKey();
             var applied=new Snapshot(raw.subscriptionReference(),raw.status(),raw.billingPrice(),raw.period(),raw.trial(),raw.cancellationAt(),raw.invoices(),key,raw.paymentMethodReady(),
                 raw.providerRevision(),raw.observedAt(),new OperationObservation(key,OperationState.APPLIED),raw.recoveryObservations(),raw.trialEvidence(),raw.externalWithdrawalEvidence());
+            if(owner!=null)return store.withSuccessorFactInTransaction(reservation,claim,owner,()->{
+                apply(state,claim,applied);
+                return store.recordCompletionInTransaction(reservation,claim,evidence,clock.instant(),owner);
+            });
             apply(state,claim,applied);
-            // Receipt authenticates poststate, never re-enters a PROCESSING/debt-sequence precondition.
             return store.recordCompletionInTransaction(reservation,claim,evidence,clock.instant());
         }));
     }
     public Recovery reserveRecovery(Reservation reservation,Completion completion){
-        return guarded(reservation.admission(),()->transaction.requiresNew(()->{
+        return guarded(reservation,()->transaction.requiresNew(()->{
             var a=reservation.admission();var f=reservation.failure();var intent=a.firstRenewalAdmission().receipt().intent();var owner=intent.clock().owner();
             var id=UUID.randomUUID();var at=utc();
             var fingerprint="v1.recover."+f.billId()+"."+OwnedFirstRenewal.fingerprint("owned-failed-renewal-recover-v1",a.id(),f.billId(),f.billVersion(),f.invoice(),f.allocation(),f.paymentIntent(),f.revision());
@@ -294,6 +309,11 @@ public final class OwnedFailedRenewalMethodService {
         for(var id:ids){var op=operations.lock(id);if(op==null||!op.siteId().equals(owner.site())||!op.customerId().equals(owner.customer())
                 ||!op.subscriptionId().equals(expected.subscription().id()))throw unavailable();}
         if(consume.get())failed.stopInTransaction(r.admission(),OwnedFailedRenewal.Reason.UNCERTAIN,clock.instant());
+    }
+    void terminateSuccessorConfirmationInTransaction(RecoveryPreparationContext expected,ProviderOperation claim,
+            dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.InvocationBudget budget,SuccessorOwner owner){
+        if(!transaction.active()||expected==null||expected.reservation().successor()==null||claim==null||budget==null||owner==null)throw unavailable();
+        store.terminateSuccessorConfirmationInTransaction(expected,claim,budget,owner);
     }
     private RecoveryPreparationContext inspectRecoveryInTransaction(Reservation reservation,Completion completion,Recovery recovery,
             SubscriptionCommandContext originalContext,RecoveryPreparationContext expected,java.util.function.Consumer<RecoveryPreparationContext> receiptLock){
@@ -360,32 +380,60 @@ public final class OwnedFailedRenewalMethodService {
             return new RecoveryPreparationContext(reservation,enrollment,state.account(),state.subscription(),setup,recover,state.binding(),completion,recovery,state.sample());
     }
     public ReadClaim beginRecoveredRead(Reservation reservation,Recovery recovery,UUID invocation){
-        return guarded(reservation.admission(),()->transaction.requiresNew(()->{
+        return beginRecoveredRead(reservation,recovery,invocation,null);
+    }
+    public ReadClaim beginRecoveredRead(Reservation reservation,Recovery recovery,UUID invocation,SuccessorOwner owner){
+        requireReadOwnerMode(reservation,owner);
+        return guarded(reservation,()->transaction.requiresNew(()->{
             var state=current(reservation,null,recovery.association().operationId());requireDebt(state,reservation.failure(),1);
             if(!recovery.equals(store.requireRecoveryInTransaction(reservation,recovery)))throw unavailable();
             selected(state,recovery.association().operationId(),SubscriptionOperation.Kind.RECOVER,SubscriptionOperation.Status.RESERVED,recovery.association().operationVersion(),reservation.setupOperationId());
-            return store.claimReadInTransaction(reservation,Phase.RECOVERED,Objects.requireNonNull(invocation),state.fence(),state.sample(),state.utcAt());
+            return owner==null?store.claimReadInTransaction(reservation,Phase.RECOVERED,Objects.requireNonNull(invocation),state.fence(),state.sample(),state.utcAt()):store.claimReadInTransaction(reservation,Phase.RECOVERED,Objects.requireNonNull(invocation),state.fence(),state.sample(),state.utcAt(),owner);
         }));
     }
     public RecoveredReadContext inspectRecoveredRead(Reservation reservation,ReadClaim claim){
+        return inspectRecoveredRead(reservation,claim,null);
+    }
+    public RecoveredReadContext inspectRecoveredRead(Reservation reservation,ReadClaim claim,SuccessorOwner owner){
+        requireReadOwnerMode(reservation,owner);
         fresh();return transaction.requiresNew(()->{
-            var state=current(reservation,null,claim.fence().operationId());requireRead(reservation,claim,Phase.RECOVERED,state,null,null);
-            var context=store.requireRecoveredContextInTransaction(reservation,claim);requireRecoveredContext(state,context);return context;
+            var state=current(reservation,null,claim.fence().operationId());requireRead(reservation,claim,Phase.RECOVERED,state,null,null,owner);
+            var context=owner==null?store.requireRecoveredContextInTransaction(reservation,claim):store.requireRecoveredContextInTransaction(reservation,claim,owner);requireRecoveredContext(state,context);return context;
         });
     }
     public Publication publishRecovery(Reservation reservation,ReadClaim claim,OwnedFailedRenewal.RecoveredEvidence evidence,RecoveredReadContext expected){
-        return guarded(reservation.admission(),()->transaction.requiresNew(()->{
-            var state=current(reservation,null,claim.fence().operationId());requireRead(reservation,claim,Phase.RECOVERED,state,evidence.snapshot(),evidence.acceptedAt());
-            var context=store.requireRecoveredContextInTransaction(reservation,claim);requireRecoveredContext(state,context);
+        return publishRecovery(reservation,claim,evidence,expected,null);
+    }
+    public Publication publishRecovery(Reservation reservation,ReadClaim claim,OwnedFailedRenewal.RecoveredEvidence evidence,RecoveredReadContext expected,SuccessorOwner owner){
+        requireReadOwnerMode(reservation,owner);
+        return guarded(reservation,()->transaction.requiresNew(()->{
+            var state=current(reservation,null,claim.fence().operationId());requireRead(reservation,claim,Phase.RECOVERED,state,evidence.snapshot(),evidence.acceptedAt(),owner);
+            var context=owner==null?store.requireRecoveredContextInTransaction(reservation,claim):store.requireRecoveredContextInTransaction(reservation,claim,owner);requireRecoveredContext(state,context);
             if(expected==null||!expected.equals(context))throw unavailable();
             requireSnapshot(reservation,evidence.snapshot(),true);
             var raw=evidence.snapshot();var key=context.operation().providerOperationKey();
             var applied=new Snapshot(raw.subscriptionReference(),raw.status(),raw.billingPrice(),raw.period(),raw.trial(),raw.cancellationAt(),raw.invoices(),key,raw.paymentMethodReady(),
                 raw.providerRevision(),raw.observedAt(),new OperationObservation(key,OperationState.APPLIED),raw.recoveryObservations(),raw.trialEvidence(),raw.externalWithdrawalEvidence());
+            if(owner!=null)return store.withSuccessorFactInTransaction(reservation,claim,owner,()->{
+                apply(state,claim,applied);
+                return store.recordPublicationInTransaction(reservation,claim,clock.instant(),owner);
+            });
             apply(state,claim,applied);return store.recordPublicationInTransaction(reservation,claim,clock.instant());
         }));
     }
-    public void stop(Reservation reservation,OwnedFailedRenewal.Reason reason){fresh();stopAdmission(reservation.admission(),reason);}
+    public void stop(Reservation reservation,OwnedFailedRenewal.Reason reason){
+        fresh();if(reservation.successor()!=null)throw unavailable();stopAdmission(reservation.admission(),reason);
+    }
+    public void terminateSuccessorWrite(Reservation r,ProviderOperation original,SuccessorOwner owner){
+        fresh();if(r==null||r.successor()==null||original==null||owner==null)return;
+        try{transaction.requiresNew(()->{store.terminateSuccessorWriteInTransaction(r,original,owner);return null;});}
+        catch(RuntimeException ignored){/* Preserve the original receipt when cleanup loses its fence. */}
+    }
+    public void terminateSuccessorRead(Reservation r,ReadClaim q,OwnedFailedRenewal.Reason reason,SuccessorOwner owner){
+        fresh();if(r==null||r.successor()==null||q==null||reason==null||owner==null)return;
+        try{transaction.requiresNew(()->{store.terminateSuccessorReadInTransaction(r,q,reason,owner);return null;});}
+        catch(RuntimeException ignored){/* No partial terminal survives the caller rollback. */}
+    }
     private void stopAdmission(OwnedFailedRenewal.Admission admission,OwnedFailedRenewal.Reason reason){transaction.requiresNew(()->{failed.stopInTransaction(admission,reason,clock.instant());return null;});}
     private <T>T guarded(OwnedFailedRenewal.Admission admission,Supplier<T> work){
         fresh();Objects.requireNonNull(admission);
@@ -393,6 +441,13 @@ public final class OwnedFailedRenewalMethodService {
             try{stopAdmission(admission,failure instanceof IllegalArgumentException||failure instanceof IllegalStateException?OwnedFailedRenewal.Reason.AUTHORITY_DRIFT:OwnedFailedRenewal.Reason.UNCERTAIN);}
             catch(RuntimeException stopFailure){failure.addSuppressed(stopFailure);}throw failure;
         }
+    }
+    private static void requireReadOwnerMode(Reservation r,SuccessorOwner owner){
+        if(r==null||(r.successor()!=null)!=(owner!=null))throw unavailable();
+    }
+    private <T>T guarded(Reservation r,Supplier<T> work){
+        if(r.successor()==null)return guarded(r.admission(),work);
+        fresh();return work.get();
     }
     private void fresh(){if(transaction.active())throw new IllegalStateException("Owned method transition requires an outer transaction boundary");}
     private Instant utc(){return clock.instant().truncatedTo(ChronoUnit.MICROS);}
@@ -452,9 +507,9 @@ public final class OwnedFailedRenewalMethodService {
         if(b.version()!=failure.billVersion()||b.settlement()!=BillingRecord.Settlement.OPEN||!b.providerInvoiceReference().equals(failure.invoice())||!b.period().equals(failure.period())||!b.billedPrice().equals(s.billingPrice())
             ||!b.siteId().equals(s.siteId())||!b.subscriptionId().equals(s.id())||!b.accountId().equals(s.paymentAccountId()))throw unavailable();
     }
-    private void requireRead(Reservation r,ReadClaim q,Phase phase,Locked state,Snapshot snapshot,Instant accepted){
+    private void requireRead(Reservation r,ReadClaim q,Phase phase,Locked state,Snapshot snapshot,Instant accepted,SuccessorOwner owner){
         if(q==null||q.phase()!=phase||!q.reservationId().equals(r.id())||!q.fence().equals(state.fence())||!q.billingSample().equals(state.sample())
-            ||!q.equals(store.requireReadInTransaction(r,q))||state.utcAt().isBefore(q.startedAt())||!state.utcAt().isBefore(q.deadlineAt()))throw unavailable();
+            ||!q.equals(owner==null?store.requireReadInTransaction(r,q):store.requireReadInTransaction(r,q,owner))||state.utcAt().isBefore(q.startedAt())||!state.utcAt().isBefore(q.deadlineAt()))throw unavailable();
         if(snapshot!=null){q.requireAccepted(snapshot.observedAt(),accepted);if(accepted.isAfter(state.utcAt()))throw unavailable();}
     }
     private static void requireMethodContext(Locked state,MethodReadContext context){
