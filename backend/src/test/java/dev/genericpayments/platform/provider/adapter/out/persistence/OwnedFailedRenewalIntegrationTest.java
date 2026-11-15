@@ -358,6 +358,17 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     private <T>T observeSuccessorPort(Class<T> type,T real){
         if(successorCalls==null)return real;
         return type.cast(Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{type},(proxy,method,args)->{
+            if(successorCalls.inspectPublication&&method.getName().equals("withSuccessorFactInTransaction")
+                    &&((OwnedFailedRenewalMethod.ReadClaim)args[1]).phase()==OwnedFailedRenewalMethod.Phase.RECOVERED){
+                var effect=(java.util.function.Supplier<?>)args[3];
+                args[3]=(java.util.function.Supplier<?>)()->{
+                    // The injected payment journal clock is fixed by this fixture. Sample
+                    // operational UTC inside the original observer's authenticated cash effect.
+                    var now=Instant.now();assertThat(new TestClock().instant()).isBeforeOrEqualTo(now);
+                    TestClock.set(now);
+                    return effect.get();
+                };
+            }
             if(successorCalls.inspectPublication&&method.getName().equals("recordPublicationInTransaction"))
                 successorCalls.publicationSavepoint=jdbc.execute((org.springframework.jdbc.core.ConnectionCallback<java.sql.Savepoint>)connection->connection.setSavepoint());
             try{var result=method.invoke(real,args);successorCalls.after(method.getName(),args,result);return result;}
@@ -367,7 +378,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     private Map<String,List<String>> successorRows(){
         var state=new TreeMap<>(boundaryRows());
         for(String t:List.of("stripe_billing_failed_grace_method_claims",SUCCESSOR_TERMINALS,"stripe_subscription_recovery_proofs",
-                "site_allowed_origins","audit_log","idempotency_records","customer_idempotency_records"))
+                "site_allowed_origins","audit_log","idempotency_records","customer_idempotency_records","payment_event_sequences"))
             state.put(t,rows(t));
         return state;
     }
@@ -3827,14 +3838,18 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         if(c.reservation().successor()!=null){
             assertThat(jdbc.queryForObject("""
                 select e.occurred_at=r.billing_at and e.received_at between q.started_at and p.published_at
+                 and cash_event.received_at between q.started_at and p.published_at
+                 and cash_journal.next_sequence=cash_event.sequence_number
                  and (o.payload->>'occurred_at')::timestamptz=r.billing_at and (o.payload->>'access_allowed')::boolean
                  and (o.payload->>'access_valid_until')::timestamptz=r.billing_at+interval '300 seconds'
                  and o.created_at between q.started_at and p.published_at and o.created_at=o.next_attempt_at
                  and o.lease_owner is null and o.lease_expires_at is null
                 from stripe_billing_failed_method_reservations r join stripe_billing_failed_method_publications p on p.reservation_id=r.id
                 join stripe_billing_failed_method_reads q on q.id=p.claim_id join subscription_events e on e.id=?
+                join payment_events cash_event on cash_event.id=? and cash_event.payment_id=p.renewal_payment
+                join payment_event_sequences cash_journal on cash_journal.payment_id=cash_event.payment_id
                 join outbox_events o on o.id=e.id where r.id=?
-                """,Boolean.class,recoverySubscriptionEvent.get("id"),c.reservation().id())).isTrue();
+                """,Boolean.class,recoverySubscriptionEvent.get("id"),recoveryPaymentEvent.get("id"),c.reservation().id())).isTrue();
             assertThat(count("outbox_deliveries")).isZero();
             assertThat(jdbc.queryForObject("select count(*) from provider_operations where kind='INVOICE_PAY'",Long.class)).isZero();
         }
@@ -3855,11 +3870,44 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     private void assertIncompleteSuccessorPublicationDenied(OwnedFailedRenewalMethod.Reservation r){
         var before=successorRows();int calls=http.calls.size();
         var paid=current();var selected=Instant.ofEpochSecond(r.remoteClock().frozenTime());
-        for(String damage:List.of("cash-without-publication","missing-ack","same-writer-ack","late-ack",
-                "confirm-key","method-key","confirm-kind","method-kind","publisher-self","xid-reuse","missing-owner",
-                "paid-sequence","bill-version","phase-clock","credentials","publication-claim","journal-amount")){
+        var publicationDamage=List.of("cash-without-publication","missing-ack","same-writer-ack","late-ack",
+                "confirm-key","method-key","confirm-kind","method-kind","publisher-self","missing-owner",
+                "paid-sequence","bill-version","phase-clock","credentials","publication-claim");
+        var exactReadDamage=List.of("xid-reuse","journal-amount","recovered-setup-snapshot","recovered-method-snapshot",
+                "method-operation-status","method-operation-version","method-version-as-string",
+                "recovered-operation-status","recovered-operation-version","recovered-version-as-string",
+                "payment-sequence-drift","payment-sequence-missing","payment-received-early","payment-received-late");
+        for(String damage:java.util.stream.Stream.concat(publicationDamage.stream(),exactReadDamage.stream()).toList()){
             assertThatThrownBy(()->transaction.requiresNew(()->{
                 switch(damage){
+                    case "recovered-setup-snapshot","recovered-method-snapshot"->{
+                        jdbc.execute("alter table stripe_billing_failed_method_reads disable trigger failed_method_read_immutable");
+                        String column=damage.equals("recovered-setup-snapshot")?"setup_step_snapshot":"method_step_snapshot";
+                        assertThat(jdbc.update("update stripe_billing_failed_method_reads set "+column+"='{}'::jsonb where reservation_id=? and phase='RECOVERED'",r.id())).isOne();
+                    }
+                    case "method-operation-status","method-operation-version","method-version-as-string",
+                            "recovered-operation-status","recovered-operation-version","recovered-version-as-string"->{
+                        jdbc.execute("alter table stripe_billing_failed_method_reads disable trigger failed_method_read_immutable");
+                        String phase=damage.startsWith("method-")?"METHOD":"RECOVERED";
+                        String replacement=switch(damage){
+                            case "method-operation-status","recovered-operation-status"->"jsonb_build_object('status','SUCCEEDED'::text)";
+                            case "method-version-as-string","recovered-version-as-string"->"jsonb_build_object('version',selected_version::text)";
+                            default->"jsonb_build_object('version',selected_version+1)";
+                        };
+                        assertThat(jdbc.update("update stripe_billing_failed_method_reads set operation_snapshot=operation_snapshot||"+replacement+" where reservation_id=? and phase=?",r.id(),phase)).isOne();
+                    }
+                    case "payment-sequence-drift","payment-sequence-missing"->{
+                        String mutation=damage.equals("payment-sequence-drift")?"update payment_event_sequences set next_sequence=next_sequence+1":"delete from payment_event_sequences";
+                        assertThat(jdbc.update(mutation+" where next_sequence=1 and payment_id=(select renewal_payment from stripe_billing_failed_method_publications where reservation_id=?)",r.id())).isOne();
+                    }
+                    case "payment-received-early","payment-received-late"->{
+                        jdbc.execute("alter table payment_events disable trigger trg_payment_events_append_only");
+                        String at=damage.equals("payment-received-early")?"obs.started_at-interval '1 microsecond'":"pub.published_at+interval '1 microsecond'";
+                        assertThat(jdbc.update("update payment_events e set received_at="+at+" "+"""
+                            from stripe_billing_failed_method_publications pub join stripe_billing_failed_method_reads obs on obs.id=pub.claim_id
+                            where pub.reservation_id=? and e.payment_id=pub.renewal_payment and e.event_type='PAYMENT_SUCCEEDED'
+                            """,r.id())).isOne();
+                    }
                     case "paid-sequence"->assertThat(jdbc.update("update subscriptions set observation_sequence=observation_sequence+1 where id=?",paid.id())).isOne();
                     case "bill-version"->assertThat(jdbc.update("update subscription_billing_records set version=version+1 where id=?",r.failure().billId())).isOne();
                     case "credentials"->assertThat(jdbc.update("update payment_accounts set credentials_ref='negative-paid-read' where id=?",billing.id().value())).isOne();
@@ -3930,7 +3978,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                     }
                 }
                 var damaged=successorRows();
-                if(!Set.of("xid-reuse","journal-amount").contains(damage))
+                if(publicationDamage.contains(damage))
                     assertThat(jdbc.queryForObject("select owned_grace_publication_proof(?,clock_timestamp(),pg_current_xact_id(),false)",Boolean.class,r.id())).as(damage).isFalse();
                 assertExactSampleMissing(current());assertThat(successorRows()).isEqualTo(damaged);
                 throw new IllegalStateException("rollback damaged successor");

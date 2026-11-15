@@ -970,11 +970,18 @@ create function owned_grace_successor_projected(reservation uuid,utc timestamptz
  join subscription_events period on period.subscription_id=sub.id and period.billing_record_id=f.renewal_bill and period.event_type='PERIOD_PAID'
  join subscription_event_sequences journal on journal.subscription_id=sub.id
  join payment_events paid on paid.payment_id=cash.id and paid.event_type='PAYMENT_SUCCEEDED'
+ join payment_event_sequences cash_journal on cash_journal.payment_id=paid.payment_id
  where r.id=$1 and r.after_ready_id is not null and owned_grace_publication_proof(r.id,$2,$3,false)
  and not exists(select 1 from owned_grace_successor_locators(r.admission_id) e where e.reservation_id is distinct from r.id)
  and sw.first_dispatched_at>=r.reserved_at and root.issued_at>=sw.first_dispatched_at
  and root.expires_at=least(root.issued_at+interval '600 seconds',r.browser_session_expires_at)
  and mw.first_dispatched_at>=consumed.consumed_at and m.started_at>=mw.first_dispatched_at
+ -- V35 verifies the METHOD snapshots against the actual ACK rows. The RECOVERED
+ -- claim must have captured those same rows, before its own cash publication.
+ and obs.setup_step_snapshot=m.setup_step_snapshot and obs.method_step_snapshot=m.method_step_snapshot
+ and m.selected_version=r.initial_operation_version+1
+ and m.operation_snapshot @> jsonb_build_object('status','PROCESSING'::text,'version',m.selected_version)
+ and obs.operation_snapshot @> jsonb_build_object('status','RESERVED'::text,'version',x.operation_version)
  and c.completed_at>=m.started_at and c.completed_at<m.deadline_at and x.associated_at>=c.completed_at
  and ack.acknowledged_at<=obs.started_at and obs.started_at<=pub.published_at and pub.published_at<=$2
  and (period.site_id,period.payment_account_id,period.revision,period.source,period.provider_reference,period.occurred_at)
@@ -983,6 +990,7 @@ create function owned_grace_successor_projected(reservation uuid,utc timestamptz
  and period.sequence_number=journal.next_sequence
  and (paid.site_id,paid.payment_account_id,paid.source,paid.sequence_number,paid.provider_object_id,paid.amount_minor,paid.currency)
   =(d.site_id,d.payment_account_id,'PROVIDER_EVENT',1,f.payment_intent_reference,cash.amount_minor,cash.currency)
+ and cash_journal.next_sequence=paid.sequence_number and paid.received_at between obs.started_at and pub.published_at
  and not exists(select 1 from payment_events extra where extra.payment_id=cash.id and extra.id<>paid.id)
  and not exists(select 1 from subscription_events extra where extra.subscription_id=sub.id
   and extra.billing_record_id=f.renewal_bill and extra.event_type='PERIOD_PAID' and extra.id<>period.id)
