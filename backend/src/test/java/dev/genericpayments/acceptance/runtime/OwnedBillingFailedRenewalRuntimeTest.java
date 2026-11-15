@@ -2,10 +2,15 @@ package dev.genericpayments.acceptance.runtime;
 
 import com.google.gson.JsonObject;
 import com.sun.net.httpserver.*;
+import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
+import dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.ConfirmationAck;
+import dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.ConfirmReply;
+import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import java.io.*;
 import java.lang.reflect.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -72,6 +77,23 @@ class OwnedBillingFailedRenewalRuntimeTest {
         assertThatThrownBy(()->OwnedSubscriptionRuntime.requireOptIn(stage4))
             .hasMessage("Explicit owned runtime opt-in required");
     }
+    @Test void recoveryConfirmationDescriptorUsesThePersistedMicrosecondOfTheOriginalReceipt() {
+        var dispatched=Instant.parse("2026-11-08T12:00:00Z");
+        var observed=dispatched.plusNanos(123456788);
+        var acknowledged=dispatched.plusNanos(123456789);
+        var operation=new ProviderOperation(UUID.randomUUID(),new PaymentAccountId(UUID.randomUUID()),"acct_owned","alias",
+            ProviderOperation.Kind.OWNED_RECOVERY_INTENT_CONFIRM,UUID.randomUUID(),"owned:CONFIRM","fingerprint",
+            ProviderOperation.Status.ACKNOWLEDGED,"pi_owned",dispatched,dispatched.plusSeconds(82800),null,null,2);
+        var reply=new ConfirmReply("pi_owned","cus_owned","pm_owned","EUR",2000,2000,0,"ch_owned",observed);
+        var ack=new ConfirmationAck(operation,reply,acknowledged);
+        var descriptor=new JsonObject();
+        OwnedBillingFailedRenewalSandboxScenario.recoveryConfirmationEvidence(descriptor,ack);
+        assertThat(descriptor.get("recovery_acknowledged_at").getAsString()).isEqualTo("2026-11-08T12:00:00.123456Z");
+        assertThat(ack.acknowledgedAt()).isEqualTo(acknowledged);
+        assertThat(ack.operation()).isSameAs(operation);assertThat(ack.reply()).isSameAs(reply);
+        assertThat(ack.reply().observedAt()).isEqualTo(observed);
+    }
+
     // Widening a fixed route or the empty body schema would dispatch the inert boundary below.
     @Test void everyFixedRouteDispatchesExactlyItsOwnOperationWithNoStore() throws Exception {
         for(String route:ROUTES){var ops=new Inert();var x=request("POST","/failed-renewal/"+route,"{}");handler(ops).handle(x);

@@ -9,6 +9,7 @@ import dev.genericpayments.platform.subscriptions.application.model.*;
 import dev.genericpayments.platform.subscriptions.application.port.in.*;
 import dev.genericpayments.platform.subscriptions.domain.*;
 import java.time.*;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.function.*;
 
@@ -177,9 +178,7 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
         if(reservedRecovery!=null){var original=reservedRecovery.association();id(result,"recovery_operation_id",original.operationId());id(result,"recovery_bill_id",original.billId());
             result.addProperty("recovery_allocation_id",original.allocation());result.addProperty("recovery_payment_intent_id",original.paymentIntent());}
         if(recovery!=null){
-            recovery.confirmation().ifPresent(ack->{id(result,"recovery_confirm_operation_id",ack.operation().id());id(result,"recovery_confirm_resource_id",ack.operation().resourceId());result.addProperty("recovery_confirm_operation_version",ack.operation().version());
-                result.addProperty("recovery_confirm_status",ack.operation().status().name());result.addProperty("recovery_acknowledged_at",ack.acknowledgedAt().toString());
-                result.addProperty("recovery_confirm_payment_intent_id",ack.reply().paymentIntent());result.addProperty("recovery_charge_id",ack.reply().charge());});
+            recovery.confirmation().ifPresent(ack->recoveryConfirmationEvidence(result,ack));
             recovery.publication().ifPresent(value->{var publication=value.publication();id(result,"recovery_publication_claim_id",publication.claimId());id(result,"recovery_publication_admission_id",publication.admissionId());
                 id(result,"recovery_publication_operation_id",publication.operationId());id(result,"recovery_publication_bill_id",publication.billId());id(result,"recovery_publication_reservation_id",value.reservationId());id(result,"recovery_payment_id",publication.paymentId());
                 result.addProperty("recovery_published_at",publication.publishedAt().toString());result.addProperty("recovery_revision",publication.revision());result.addProperty("recovery_observation_sequence",value.observationSequence());});
@@ -187,6 +186,15 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
         return result;
     }
     private static void id(JsonObject result,String name,UUID value){result.addProperty(name,value.toString());}
+    static void recoveryConfirmationEvidence(JsonObject result,OwnedRecoveryConfirm.ConfirmationAck ack){
+        id(result,"recovery_confirm_operation_id",ack.operation().id());
+        id(result,"recovery_confirm_resource_id",ack.operation().resourceId());
+        result.addProperty("recovery_confirm_operation_version",ack.operation().version());
+        result.addProperty("recovery_confirm_status",ack.operation().status().name());
+        result.addProperty("recovery_acknowledged_at",ack.acknowledgedAt().truncatedTo(ChronoUnit.MICROS).toString());
+        result.addProperty("recovery_confirm_payment_intent_id",ack.reply().paymentIntent());
+        result.addProperty("recovery_charge_id",ack.reply().charge());
+    }
     private static void boundaryEvidence(JsonObject result,String prefix,OwnedFailedGraceBoundary.BoundaryReady value){
         id(result,prefix+"_ready_id",value.id());id(result,prefix+"_operation_id",value.ack().operation().id());id(result,prefix+"_invocation_id",value.ack().invocation());result.addProperty(prefix+"_frozen_time",value.observation().frozenTime());
     }

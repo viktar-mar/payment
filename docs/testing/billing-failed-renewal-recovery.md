@@ -6,6 +6,8 @@
 
 The predecessor `b3ecc2dc00bf79a23877d84364dc67083fa526f0` passed all four hosted jobs, including 493 disjoint causal cases and the two previous runtime packaging checks. A separate, overlapping dedicated run passed 379 cases. At `86029e9`, the new EXCLUSIVE test expected a refusal during CREATE. The hosted run showed that CREATE succeeds. The corrected case retains that receipt and checks the original action graph for `PROVIDER_EVIDENCE_MISMATCH` before confirmation or cash. The 493-case partition and the dedicated 379 passed at that checkpoint. The new composition and third packaging gate require their own exact-source receipts. [Predecessor full CI](https://github.com/viktar-mar/payment/actions/runs/43673541949) · [Predecessor dedicated CI](https://github.com/viktar-mar/payment/actions/runs/43673541930) · [EXCLUSIVE checkpoint](https://github.com/viktar-mar/payment/actions/runs/43721050591) · [Checkpoint dedicated CI](https://github.com/viktar-mar/payment/actions/runs/43721050661)
 
+The private descriptor reports `recovery_acknowledged_at` in UTC at the microsecond precision persisted in the recovery confirmation row. The runtime retains the original nanosecond receipt. Only the independent recovered publication establishes payment.
+
 ### Future operator procedure
 
 This procedure is available for a separately authorized, single native Sandbox attempt. Preparation and hosted CI grant no native execution authority.
