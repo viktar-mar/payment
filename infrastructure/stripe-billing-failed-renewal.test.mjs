@@ -5,6 +5,7 @@ import {data,inspect} from './fixtures/failed-renewal-evidence-rows.mjs';
 import * as initialEvidence from './stripe-billing-first-payment-evidence.mjs';
 import * as owners from './stripe-billing-first-payment.mjs';
 import * as clients from './stripe-billing-first-payment-runtime.mjs';
+import {browserFailure,finishBrowserCleanup} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 const saved=globalThis.fetch;let escapes=0;
 before(()=>{globalThis.fetch=()=>{escapes++;throw Error('network blocked');};});after(()=>{globalThis.fetch=saved;assert.equal(escapes,0);});
 const limits=()=>({deadline:Date.now()+5000});
@@ -31,6 +32,34 @@ function harness(){
 const owner=h=>owners.createOwnedBillingFailedRenewal(opts(),h.dependencies);
 const persistCodes=['PERSIST_ADMISSION','PERSIST_OWNERSHIP','PERSIST_INPUT','PERSIST_UNCHANGED','PERSIST_FINAL_STORE','PERSIST_ACK'];
 const terminalLine=(checkpoint='PERSIST_FINAL_STORE',cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=LISTENER checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
+const browserLine=(checkpoint='BROWSER_CARD_NUMBER',cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=BROWSER checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
+for(const timing of ['rejection','abort-late'])for(const close of [true,false])test('browser terminal retains original held checkpoint '+timing+' close='+close,async()=>{
+ const h=harness(),controller=new AbortController(),error=browserFailure('BROWSER_CARD_NUMBER'),dispatches=[];let rejectInitial,leaked;
+ h.fixture.beforeDispatch=async kind=>{dispatches.push(kind);return true;};
+ h.journey.initial=async(p,l)=>{leaked=p;await p.prepare({token:'inert',origin:scope().endpoints.demo},'sdk-create',l);if(timing==='abort-late'){controller.abort();return new Promise((_,reject)=>{rejectInitial=reject;});}throw error;};
+ h.journey.close=async()=>{h.calls.push('browser-close');finishBrowserCleanup(error,close);rejectInitial?.(error);return close;};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,{...limits(),signal:controller.signal}));const result=await o.close();
+ assert.equal(result.phase,'BROWSER');assert.equal(result.code,timing==='abort-late'?'ABORTED':'BROWSER');assert.equal(result.diagnostic,'BROWSER_CARD_NUMBER');
+ assert.equal(result.cleanupConfirmed,close);assert.equal(result.cleanupFailure,close?null:'BROWSER_CLOSE');
+ assert.equal(result.initialAccepted,false);assert.equal(result.failedRenewalAccepted,false);assert.equal(result.full5bAccepted,false);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),browserLine('BROWSER_CARD_NUMBER',close?'CONFIRMED':'UNCONFIRMED',close?'NONE':'BROWSER_CLOSE'));
+ await assert.rejects(leaked.confirm(confirmRequest(),limits()));assert.deepEqual(dispatches,['create']);assert.equal(h.calls.includes('observe'),false);assert.equal(h.calls.includes('arm-dispatch'),false);assert.equal(h.calls.includes('manual-confirm'),false);
+});
+test('browser terminal never inspects foreign rejection or overwrites earlier owner failure',async()=>{
+ for(const earlier of [false,true]){
+  const h=harness();let reads=0;const foreign=new Proxy({}, {get(){reads++;throw Error('canary');}});
+  h.journey.initial=async(p,l)=>{if(earlier){try{await p.confirm(confirmRequest(),l);}catch{throw browserFailure('BROWSER_CARD_NUMBER');}}throw foreign;};
+  const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));const result=await o.close();
+  assert.equal(reads,0);assert.equal(result.diagnostic,null);assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),null);if(earlier)assert.equal(result.code,'CONFIRM');
+ }
+});
+test('browser terminal formatter and parser enforce stage-specific finite own data',()=>{
+ const valid={scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',status:'CLOSED',phase:'BROWSER',code:'ABORTED',diagnostic:'BROWSER_CARD_NUMBER',initialAccepted:false,failedRenewalAccepted:false,full5bAccepted:false,cleanupConfirmed:true,cleanupFailure:null};
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(valid),browserLine());assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(browserLine()),browserLine());
+ for(const change of [{phase:'LISTENER'},{code:'LISTENER'},{diagnostic:'PERSIST_ACK'},{initialAccepted:true},{failedRenewalAccepted:true},{full5bAccepted:true},{cleanupFailure:'BROWSER_CLOSE'}])assert.equal(owners.formatBillingFailedRenewalDiagnostic({...valid,...change}),null);
+ for(const line of [browserLine().replace('BROWSER_CARD_NUMBER','PERSIST_ACK'),terminalLine().replace('PERSIST_FINAL_STORE','BROWSER_CARD_NUMBER'),browserLine()+'\n',browserLine().replace('witness=NONE','witness=BROWSER_CLOSE')])assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),null);
+ let reads=0;const hostile={...valid};Object.defineProperty(hostile,'diagnostic',{get(){reads++;return 'BROWSER_CARD_NUMBER';}});assert.equal(owners.formatBillingFailedRenewalDiagnostic(hostile),null);assert.equal(reads,0);assert.equal(owners.formatBillingFailedRenewalDiagnostic(Object.create(valid)),null);
+});
 for(const checkpoint of persistCodes)for(const cleanup of ['confirmed','listener-refused','bootstrap-refused'])test('persistence terminal preserves LISTENER and '+checkpoint+' with '+cleanup,async()=>{
  const h=harness();h.bootstrap.persistenceDiagnostic=()=>checkpoint;
  h.cli.startListener=async()=>{h.calls.push('listener');throw Error('raw-secret-canary');};

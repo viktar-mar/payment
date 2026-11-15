@@ -42,7 +42,7 @@ const ownerModes={
 async function createOwner(options,dependencies,purpose){
  const mode=ownerModes[purpose];
  const failedRenewal=purpose==='FAILED_RENEWAL',firstRenewal=purpose==='FIRST_RENEWAL';
- let heldJourney,heldPending,terminalClose;
+ let heldJourney,heldPending,terminalClose,initialBrowserDiagnostic=null;
  function trackBrowser(body){
   const work=Promise.resolve().then(body);
   heldPending=work.then(()=>undefined,()=>undefined);
@@ -77,6 +77,9 @@ async function createOwner(options,dependencies,purpose){
    }catch{ok=false;}
    finally{heldJourney=undefined;heldPending=undefined;}
   }
+  // Only the original held initial rejection can restore provenance lost to
+  // the outer abort race, after the existing bounded browser drain.
+  if(failedRenewal&&phase==='BROWSER'&&(failure==='BROWSER'||failure==='ABORTED')&&diagnostic===null&&initialBrowserDiagnostic!==null)diagnostic=initialBrowserDiagnostic;
   // Capture the same conservative browser knowledge once; late settlement is not proof.
   if(!ok)cleanupFailure=journeySettled?'BROWSER_CLOSE':'BROWSER_UNSETTLED';
   const missing=code=>{ok=false;cleanupFailure??=code;};
@@ -154,7 +157,7 @@ async function createOwner(options,dependencies,purpose){
       });
      },
     });
-    await step('BROWSER',async()=>{journeyStarted=true;try{const result=heldJourney?await trackBrowser(()=>heldJourney.initial(port,active)):await journey(port,active);journeySettled=true;journeyClean=!heldJourney;return result;}catch(error){journeySettled=true;journeyClean=browserCleanupConfirmed(error);throw error;}finally{initialOpen=false;}},2700000);if(!prepareAck||!confirmAck)fail('ACK');
+    await step('BROWSER',async()=>{journeyStarted=true;try{const result=heldJourney?await trackBrowser(()=>heldJourney.initial(port,active)):await journey(port,active);journeySettled=true;journeyClean=!heldJourney;return result;}catch(error){if(failedRenewal)initialBrowserDiagnostic=browserDiagnostic(error);journeySettled=true;journeyClean=browserCleanupConfirmed(error);throw error;}finally{initialOpen=false;}},2700000);if(!prepareAck||!confirmAck)fail('ACK');
     let settlement;for(let i=0;i<30;i++){const reply=await step('OBSERVE',l=>runtime.observe(l));const v=failedRenewal?checkedInitialResponse(reply,'observe'):reply;checkIdentity(v);if(v.phase==='SETTLED_LOCAL'){settlement=v;break;}if(v.phase!=='OBSERVE')fail('OBSERVE');if(i<29)await step('OBSERVE',l=>(dependencies.pause??(()=>new Promise(r=>setTimeout(r,1000))))(l));}if(!settlement)fail('OBSERVE');
     phase='EVIDENCE';
     if(Date.parse(settlement.access_evaluated_at)/1000!==c.frozenTime||Date.parse(settlement.access_valid_until)/1000!==c.frozenTime+300||!(Date.parse(settlement.period_start)/1000<=c.frozenTime)||!(Date.parse(settlement.paid_through)/1000>c.frozenTime))fail('EVIDENCE');
@@ -241,22 +244,23 @@ export function parseBillingFirstRenewalDiagnosticLine(line){
 // Independent terminal-only missing proof; never provider state or extra cleanup authority.
 const cleanupCodes=new Set(['BROWSER_UNSETTLED','BROWSER_CLOSE','RUNTIME_CLOSE','LISTENER_STOP','START_SETTLEMENT','BOOTSTRAP_STOP','FIXTURE_CLOSE']);
 const isCleanupDiagnostic=code=>typeof code==='string'&&cleanupCodes.has(code);
-/** Failed-mode LISTENER checkpoint only; no raw result/error/resource fields are serialized. */
+/** Failed-mode terminal checkpoints; no raw result/error/resource fields are serialized. */
 export function formatBillingFailedRenewalDiagnostic(result){
  try{
   if(!result||Object.getPrototypeOf(result)!==Object.prototype)return null;
   const own=name=>Object.getOwnPropertyDescriptor(result,name)?.value;
-  if(own('scope')!=='OWNED_FAILED_RENEWAL_GRACE_RECOVERY'||own('status')!=='CLOSED'||own('phase')!=='LISTENER'||!['LISTENER','ABORTED'].includes(own('code'))||
+  const stage=own('phase');
+  if(own('scope')!=='OWNED_FAILED_RENEWAL_GRACE_RECOVERY'||own('status')!=='CLOSED'||!['LISTENER','BROWSER'].includes(stage)||![stage,'ABORTED'].includes(own('code'))||
      own('initialAccepted')!==false||own('failedRenewalAccepted')!==false||own('full5bAccepted')!==false)return null;
   const checkpoint=own('diagnostic'),confirmed=own('cleanupConfirmed'),witness=own('cleanupFailure');
-  if(!isPersistenceDiagnostic(checkpoint)||typeof confirmed!=='boolean'||(confirmed?witness!==null:!isCleanupDiagnostic(witness)))return null;
-  return 'owned_failed_renewal_diagnostic stage=LISTENER checkpoint='+checkpoint+' cleanup='+(confirmed?'CONFIRMED':'UNCONFIRMED')+' witness='+(confirmed?'NONE':witness);
+  if(!(stage==='LISTENER'?isPersistenceDiagnostic(checkpoint):isBrowserDiagnostic(checkpoint))||typeof confirmed!=='boolean'||(confirmed?witness!==null:!isCleanupDiagnostic(witness)))return null;
+  return 'owned_failed_renewal_diagnostic stage='+stage+' checkpoint='+checkpoint+' cleanup='+(confirmed?'CONFIRMED':'UNCONFIRMED')+' witness='+(confirmed?'NONE':witness);
  }catch{return null;}
 }
 export function parseBillingFailedRenewalDiagnosticLine(line){
  if(typeof line!=='string'||line.length>200)return null;
- const match=/^owned_failed_renewal_diagnostic stage=LISTENER checkpoint=([A-Z_]+) cleanup=(CONFIRMED|UNCONFIRMED) witness=([A-Z_]+)$/.exec(line);
- return match&&match[0]===line&&isPersistenceDiagnostic(match[1])&&(match[2]==='CONFIRMED'?match[3]==='NONE':isCleanupDiagnostic(match[3]))?line:null;
+ const match=/^owned_failed_renewal_diagnostic stage=(LISTENER|BROWSER) checkpoint=([A-Z_]+) cleanup=(CONFIRMED|UNCONFIRMED) witness=([A-Z_]+)$/.exec(line);
+ return match&&match[0]===line&&(match[1]==='LISTENER'?isPersistenceDiagnostic(match[2]):isBrowserDiagnostic(match[2]))&&(match[3]==='CONFIRMED'?match[4]==='NONE':isCleanupDiagnostic(match[4]))?line:null;
 }
 function formatCleanupDiagnostic(result,prefix){
  if(!result||result.status!=='CLOSED'||result.initialAccepted!==false||typeof result.code!=='string'||!result.code||result.cleanupConfirmed!==false||!isCleanupDiagnostic(result.cleanupFailure))return null;

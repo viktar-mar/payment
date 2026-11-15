@@ -10,6 +10,8 @@ Reuse the existing process-local WeakMap browser diagnostic provenance and close
 
 Extend only the dedicated failed-renewal formatter/parser to accept a terminal BROWSER checkpoint for an unaccepted initial payment, preserving LISTENER behavior. Emit only fixed stage/checkpoint/cleanup/witness fields after owner close, using the existing reporter provenance gate.
 
+Immediate revocation stays immediate. If cancellation wins the owner's outer wait, preserve only WeakMap provenance from that original held initial promise; after the existing bounded cleanup drain, fill a missing BROWSER/ABORTED diagnostic without replacing any earlier owner failure. No new reads, retries or cleanup authority follow from the diagnostic.
+
 ## Constraints and acceptance
 
 - Offline source work and inert memory tests only. No Docker, native browser, Stripe, SQL execution, installs, Python, archives, keys or old operations.

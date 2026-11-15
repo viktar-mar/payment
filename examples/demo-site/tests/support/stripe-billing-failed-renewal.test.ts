@@ -6,6 +6,7 @@ import type {TestCase,TestResult,FullResult} from '@playwright/test/reporter';
 // @ts-ignore Node's source-only offline test runner requires the explicit extension.
 import FailedRenewalReporter from './stripe-billing-failed-renewal-reporter.ts';
 import {browserDiagnostic,browserCleanupConfirmed} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
+import {createOwnedBillingFailedRenewal,formatBillingFailedRenewalDiagnostic} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 
 // The two source modules have only type imports from Playwright and the SDK.
 // Memory fixtures exercise the held journey without importing either runtime.
@@ -22,6 +23,7 @@ const nowLimits = () => ({deadline:Date.now()+240000});
 const inertFetch = async ():Promise<never> => {throw Error('external transport forbidden');};
 const diagnostic='owned_failed_renewal_diagnostic stage=LISTENER checkpoint=PERSIST_FINAL_STORE cleanup=UNCONFIRMED witness=LISTENER_STOP';
 const terminalAnnotation={type:'owned-failed-renewal-terminal',description:diagnostic};
+const browserTerminal='owned_failed_renewal_diagnostic stage=BROWSER checkpoint=BROWSER_CARD_NUMBER cleanup=CONFIRMED witness=NONE';
 const loginHandoff='Authorize the isolated Sandbox CLI at https://access.stripe.com/stripecli/oauth2/device using code ABCD-EFGH. Keep this terminal open.';
 function reporterCase(change:Record<string,unknown>={}):TestCase {
  return {title:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',expectedStatus:'passed',location:{file:fileURLToPath(source('../stripe-billing-failed-renewal.spec.ts')),line:1,column:1},parent:{project:()=>({name:'owned-failed-renewal-manual-chrome'})},annotations:[],...change} as unknown as TestCase;
@@ -35,6 +37,18 @@ async function captureReporter(body:(reporter:FailedRenewalReporter)=>void):Prom
  try{body(new FailedRenewalReporter());}finally{process.stdout.write=write;}
  return chunks.join('');
 }
+for(const kind of ['trusted','malformed','foreign','duplicate','static','stage-mismatch'] as const)test('actual reporter browser terminal delivery '+kind,async()=>{
+ const annotation={type:'owned-failed-renewal-terminal',description:browserTerminal};
+ const output=await captureReporter(r=>{
+  const testCase=reporterCase(),result=reporterResult({annotations:[]});
+  if(kind==='static')testCase.annotations=[annotation];
+  r.onTestBegin(testCase,result);r.onStdOut(browserTerminal+'\nraw canary\n');r.onStdErr();r.onError();
+  const delivered=kind==='malformed'?{...annotation,description:browserTerminal+' canary'}:kind==='foreign'?{...annotation,type:'foreign'}:kind==='stage-mismatch'?{...annotation,description:browserTerminal.replace('BROWSER_CARD_NUMBER','PERSIST_ACK')}:annotation;
+  result.annotations=kind==='duplicate'?[delivered,delivered]:[delivered];testCase.annotations=[...result.annotations];
+  r.onTestEnd(testCase,result);r.onTestEnd(testCase,result);r.onEnd({status:'failed'} as FullResult);
+ });
+ assert.equal(output.split('\n').filter(v=>v===browserTerminal).length,kind==='trusted'?1:0);assert.doesNotMatch(output,/canary|raw error|attachment/);
+});
 test('actual reporter emits one trusted post-handoff terminal diagnostic and suppresses raw channels',async()=>{
  const output=await captureReporter(r=>{
   const testCase=reporterCase({annotations:[{type:'foreign',description:'foreign annotation canary'}]}),result=reporterResult({annotations:[]});
@@ -233,6 +247,23 @@ async function fixture(change = '') {
   return {request,counts,replies,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
     restore:async()=>{try{runAbort.abort();await journey.close(nowLimits());}finally{w.__failedRenewalStop?.();restore();}}};
 }
+
+test('actual held helper preserves browser checkpoint through owner abort race and cleanup',async()=>{
+ const {opts,scope}=await import(source('../../../../infrastructure/fixtures/failed-renewal-descriptors.mjs').href);
+ const h=await fixture('number'),calls:string[]=[],yes=async()=>true;
+ try{
+  const options=opts();options.ports.demo=14173;
+  const bootstrap={resources:()=>({cliDirectory:'/inert'}),prepare:yes,start:yes,stop:yes};
+  const cli={validateBinding:yes,startListener:yes,stopListener:yes,assertBillingListener:yes};
+  const resources=()=>({...scope(),...h.initialPort.resources()});
+  const ownedFixture={resources,provision:yes,acknowledgeCustomer:h.initialPort.acknowledgeCustomer,withOtpCode:h.initialPort.withOtpCode,beforeDispatch:yes,acknowledge:yes,close:yes};
+  const runtime={ready:yes,prepare:async()=>h.initialPort.prepare({origin:demo,token}),confirm:async()=>{calls.push('confirm');throw Error('forbidden');},observe:async()=>{calls.push('observe');throw Error('forbidden');},close:yes};
+  const owner=await createOwnedBillingFailedRenewal(options,{preflight:yes,createBootstrap:async()=>bootstrap,createCli:async()=>cli,login:yes,createFixture:async()=>ownedFixture,createRuntime:()=>runtime});
+  await assert.rejects(owner.run(h.journey,{...nowLimits(),signal:h.runAbort.signal}));const result=await owner.close();
+  assert.equal(result.phase,'BROWSER');assert.equal(result.code,'ABORTED');assert.equal(result.diagnostic,'BROWSER_CARD_NUMBER');assert.equal(result.cleanupConfirmed,true);
+  assert.equal(formatBillingFailedRenewalDiagnostic(result),browserTerminal);assert.deepEqual(calls,[]);assert.equal(h.closed(),1);
+ }finally{await h.restore();}
+});
 
 for(const [change,checkpoint] of [
   ['action_delivery','BROWSER_ACTION_BRIDGE'],['session_delivery','BROWSER_SESSION_BRIDGE'],
