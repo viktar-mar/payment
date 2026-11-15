@@ -257,6 +257,30 @@ for(const [change,checkpoint] of [
   }finally{await h.restore();}
 });
 
+for(const change of ['rejection','page_loss'] as const)test('method preparation preserves current checkpoint through teardown on '+change,async()=>{
+  const h=await fixture();
+  try{
+    await h.journey.initial(h.initialPort,nowLimits());
+    let prepares=0,first:unknown;
+    const port={...h.methodPort,prepareMethod:async()=>{
+      prepares++;await Promise.resolve();
+      if(change==='page_loss')h.lose('crash');
+      throw Error('secret_fixture canary');
+    }};
+    await assert.rejects(h.journey.method(port,nowLimits()),(error:unknown)=>{first=error;return true;});
+    assert.equal(browserDiagnostic(first),'BROWSER_PREPARE');
+    assert.doesNotMatch(String(first),/secret_fixture|canary|bga1_|Bearer|ctoken_/);
+    assert.equal(h.runAbort.signal.aborted,true);
+    await assert.rejects(h.journey.method(port,nowLimits()),error=>error===first);
+    assert.equal(prepares,1);assert.equal(h.counts.includes('mountMethod'),false);
+    assert.equal(h.counts.includes('selectMethod'),false);assert.equal(h.counts.includes('permit'),false);
+    assert.equal(h.counts.filter(v=>v==='confirm').length,1);
+    assert.equal(await h.journey.close(nowLimits()),true);
+    assert.equal(browserDiagnostic(first),'BROWSER_PREPARE');assert.equal(browserCleanupConfirmed(first),true);
+    assert.equal(h.closed(),1);
+  }finally{await h.restore();}
+});
+
 test('one retained page, customer and SDK client across both separately attended phases',async()=>{
   const h=await fixture();
   try{

@@ -313,6 +313,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
         need(state==='HELD' && initial);stage=limits;assertPage();
         state='METHOD';methodPort=port;
         await billingBounded(scoped(),()=>track((async()=>{
+          checkpoint='BROWSER_PREPARE';
           need(await page!.locator('body').getAttribute('data-phase')==='OBSERVE');
           const m=await port.prepareMethod(scoped());
           assertPage();
