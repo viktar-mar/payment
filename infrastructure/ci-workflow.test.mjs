@@ -9,10 +9,13 @@ function jobs(text) {
   const section = text.split(/^jobs:\n/m)[1] ?? '';
   return Object.fromEntries([...section.matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:|$(?![\s\S]))/gm)].map(m => [m[1], m[2]]));
 }
+const earlyFailedRenewal = "./mvnw -B -ntp '-Dtest=dev.genericpayments.acceptance.runtime.OwnedBillingFailedRenewalScenarioIntegrationTest' test";
+const fullBackend = "./mvnw -B -ntp '-Dsurefire.excludes=**/*$*,dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java' verify";
 const gates = {
   backend: [
     'node infrastructure/init-local-customer-issuer.mjs',
-    "./mvnw -B -ntp '-Dsurefire.excludes=**/*$*,dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java' verify",
+    earlyFailedRenewal,
+    fullBackend,
     'sh backend/export-billing-first-payment-runtime.sh backend/target/test-classes',
     "echo 'first_payment_runtime_packaging_verified_without_launch'",
     'sh backend/export-billing-first-renewal-runtime.sh backend/target/test-classes',
@@ -89,15 +92,15 @@ test('CI admits untrusted PRs with read-only credentials and bounded cancellable
 test('backend partitions preserve default discovery and require the whole owned failed-renewal class', async () => {
   const blocks = jobs(await readWorkflow());
   const expected = {
-    backend: "./mvnw -B -ntp '-Dsurefire.excludes=**/*$*,dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java' verify",
-    'backend-owned-failed-renewal': "./mvnw -B -ntp '-Dtest=dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedRenewalIntegrationTest' test",
+    backend: [earlyFailedRenewal, fullBackend],
+    'backend-owned-failed-renewal': ["./mvnw -B -ntp '-Dtest=dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedRenewalIntegrationTest' test"],
   };
-  for (const [job, command] of Object.entries(expected)) {
+  for (const [job, commands] of Object.entries(expected)) {
     const block = blocks[job];
     assert.ok(block, `missing ${job} job`);
-    assert.deepEqual([...block.matchAll(/^\s+run: (\.\/mvnw[^\n]*)$/gm)].map(match => match[1]), [command], `${job}: exact complementary Maven invocation required`);
-    assert.equal([...block.matchAll(/\.\/mvnw\b/g)].length, 1, `${job}: no additional Maven invocation`);
-    assert.ok(block.includes(`working-directory: backend\n        run: ${command}`), `${job}: run Maven in backend`);
+    assert.deepEqual([...block.matchAll(/^\s+run: (\.\/mvnw[^\n]*)$/gm)].map(match => match[1]), commands, `${job}: exact Maven invocations required`);
+    assert.equal([...block.matchAll(/\.\/mvnw\b/g)].length, commands.length, `${job}: no additional Maven invocation`);
+    for (const command of commands) assert.ok(block.includes(`working-directory: backend\n        run: ${command}`), `${job}: run Maven in backend`);
     assert.doesNotMatch(block, /^\s+(?:env|needs):|-D[^\s'"]*(?:skip|ignore|failIfNo(?:Specified)?Tests)|PAYMENT_STRIPE|secrets\./im);
     assert.match(block, /uses: actions\/setup-java@dded0888837ed1f317902acf8a20df0ad188d165\b/);
     assert.match(block, /distribution: temurin/);
@@ -106,8 +109,24 @@ test('backend partitions preserve default discovery and require the whole owned 
     assert.match(block, /package-manager-cache: false/);
     assert.equal([...block.matchAll(/run: node infrastructure\/init-local-customer-issuer\.mjs$/gm)].length, 1, `${job}: fresh local issuer preparation required`);
   }
-  assert.doesNotMatch(blocks.backend, /-Dtest=|-(?:P|D)(?:groups|excludedGroups|surefire\.includes)/);
+  assert.doesNotMatch(blocks.backend.replace(earlyFailedRenewal, ''), /-Dtest=|-(?:P|D)(?:groups|excludedGroups|surefire\.includes)/);
   assert.ok((await stat(new URL('../backend/src/test/java/dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java', import.meta.url))).isFile(), 'explicitly selected owned failed-renewal source must exist');
+});
+
+test('the hosted failed-renewal scenario runs immediately after issuer preparation and before full backend verification', async () => {
+  const block = jobs(await readWorkflow()).backend;
+  assert.ok(block.includes([
+    '      - name: Prepare local test issuer',
+    '        run: node infrastructure/init-local-customer-issuer.mjs',
+    '      - name: Verify failed-renewal scenario',
+    '        working-directory: backend',
+    `        run: ${earlyFailedRenewal}`,
+    '      - name: Verify backend',
+    '        working-directory: backend',
+    `        run: ${fullBackend}`,
+    '      - name: Verify dedicated first-payment runtime packaging without launching it',
+  ].join('\n')));
+  assert.ok((await stat(new URL('../backend/src/test/java/dev/genericpayments/acceptance/runtime/OwnedBillingFailedRenewalScenarioIntegrationTest.java', import.meta.url))).isFile());
 });
 
 // Dropping the owned launcher, using production java -jar, widening the test

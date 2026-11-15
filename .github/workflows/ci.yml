@@ -44,6 +44,9 @@ jobs:
           docker buildx version
       - name: Prepare local test issuer
         run: node infrastructure/init-local-customer-issuer.mjs
+      - name: Verify failed-renewal scenario
+        working-directory: backend
+        run: ./mvnw -B -ntp '-Dtest=dev.genericpayments.acceptance.runtime.OwnedBillingFailedRenewalScenarioIntegrationTest' test
       - name: Verify backend
         working-directory: backend
         run: ./mvnw -B -ntp '-Dsurefire.excludes=**/*$*,dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java' verify

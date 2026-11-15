@@ -108,6 +108,8 @@ New owner `run(journey,limits)` takes exact closed `{initial,method,close}` func
 
 ### Task 5 source checkpoint
 
+After preparing the test issuer, the hosted backend job runs the complete failed-renewal scenario integration class so a fixture failure is visible before full backend verification. Acceptance still requires the full regression suite, all three packaging checks and the dedicated gates on the same commit.
+
 The genuine wrapper composition, queued-retry SQL refusal, EXCLUSIVE action-graph correction and hosted-only dedicated page bundle test are authored. The existing backend job now exports the failed runtime and checks ordinary-jar isolation and jdeps closure. Root observed the expected two missing-gate failures before the workflow edit, followed by seven passing workflow checks, a clean strict demo typecheck and cached compilation of the current main/genuine Java closure. The new PostgreSQL composition and dedicated Vite build are hosted-only execution gates. Preserve the independent task and final review, publication and exact-head CI receipts in the external task record. [Operator procedure](../../testing/billing-failed-renewal-recovery.md#future-operator-procedure)
 
 Status is **OFFLINE_PREPARED**, native **NOT_RUN**, full 5B **NOT_ACCEPTED**.
