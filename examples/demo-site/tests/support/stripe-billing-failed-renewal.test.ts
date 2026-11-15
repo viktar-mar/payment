@@ -22,6 +22,7 @@ class Control {
   async activate() {assert.equal(this.disabled,false);await this.onclick?.({isTrusted:true});}
 }
 async function fixture(change = '') {
+  const runAbort=new AbortController(),docEvents=new Map<string,Function>();
   const {installFailedRenewalPage} = await import(source('../../src/billing-failed-renewal-page.ts').href);
   const {runFailedRenewalBrowser} = await import(source('./stripe-billing-failed-renewal.ts').href);
   const counts:string[] = [], replies:any[] = [], controls = new Map<string,Control>();
@@ -31,7 +32,7 @@ async function fixture(change = '') {
   };
   const body = {dataset:{phase:'NEW'}};
   const doc = {body,visibilityState:'visible',querySelector:(s:string)=>ctrl(s.slice(1)),
-    querySelectorAll:()=>[...controls.values()],addEventListener:()=>{}};
+    querySelectorAll:()=>[...controls.values()],addEventListener:(n:string,f:Function)=>docEvents.set(n,f)};
   const w:any = {addEventListener:()=>{}};
   w.top = w;
   const globals = {window:w,document:doc,location:{origin:demo,href:demo+path},HTMLButtonElement:Control,fetch:inertFetch};
@@ -47,7 +48,7 @@ async function fixture(change = '') {
   const base = (op:string)=>backend+'/api/v1/customer/subscriptions/'+id(6)+'/operations/'+op;
   const otpUrl = backend+'/api/v1/public/customer-auth/email-otp/challenges';
   let url = 'about:blank', closed = 0;
-  const frame = {url:()=>url}, callbacks = new Map<string,Function>();
+  const frame = {url:()=>url}, callbacks = new Map<string,Function>(),bindings=new Map<string,Function>();
   let routeHandler:Function;
   async function request(target:string,method:string,data?:any) {
     let contents=data===undefined?null:JSON.stringify(data);
@@ -102,17 +103,24 @@ async function fixture(change = '') {
       }
       assert.equal(Boolean(f(arg)),true);
     }};
-  const context={on:()=>{},newPage:async()=>{counts.push('page');return page;},exposeBinding:async(n:string,f:Function)=>{w[n]=(...args:unknown[])=>f({page,frame},...args);},
-    route:async(_pattern:string,f:Function)=>{routeHandler=f;},routeWebSocket:async()=>{},close:async()=>{closed++;w.__failedRenewalStop?.();}};
-  const journey=runFailedRenewalBrowser({newContext:async()=>{counts.push('context');return context;}});
+  const context={on:()=>{},newPage:async()=>{counts.push('page');return page;},exposeBinding:async(n:string,f:Function)=>{bindings.set(n,f);w[n]=(...args:unknown[])=>f({page,frame},...args);},
+    route:async(_pattern:string,f:Function)=>{routeHandler=f;},routeWebSocket:async()=>{},close:async()=>{closed++;callbacks.get('close')?.();w.__failedRenewalStop?.();}};
+  const journey=runFailedRenewalBrowser({newContext:async()=>{counts.push('context');return context;}},runAbort);
   const initialPort={resources:()=>({runId:id(1),accountId:id(2),siteId:id(3),priceId:id(5),siteKey:'fixture',email:'fixture@example.test',endpoints:{demo,backend}}),
     withOtpCode:async(f:Function)=>f(otp),acknowledgeCustomer:async(v:any)=>{assert.deepEqual(v,{customerId:id(4),siteId:id(3)});return true;},
     prepare:async(v:any)=>{assert.deepEqual(v,{origin:demo,token});counts.push('prepare');return prepared;},
     confirm:async()=>{counts.push('confirm');return {...identity,phase:'OBSERVE',code:'OK',protocol:'SERVER_CONFIRM_V2',attempt_id:id(8),state:'OBSERVE',retry_allowed:false,successor_attempt_id:null,next_action_allowed:false,expires_at:expires};}};
   const methodPort={prepareMethod:async()=>{counts.push('prepareMethod');return {subscriptionId:id(6),operationId:change==='old_operation'?id(7):id(9),action:action(actionSecret)};},
     selectMethod:async()=>{counts.push('selectMethod');return selected;},confirmMethod:async()=>{counts.push('permit');if(change==='permit_error')throw Error(selected.client_secret);return {browser_confirm_allowed:true,state:'RESERVED'};}};
-  return {counts,replies,journey,initialPort,methodPort,closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
-    restore:()=>{w.__failedRenewalStop?.();restore();}};
+  const lose=(event:string)=>{if(event==='close')callbacks.get('close')?.();else{doc.visibilityState='hidden';docEvents.get('visibilitychange')?.();}};
+  const forgedTerminal=async()=>{
+    const f=bindings.get('__failedRenewalTerminal');assert.ok(f);
+    for(const [src,args] of [[{page,frame:{url:()=>url}},['STOPPED']],[{page:{},frame},['STOPPED']],[{page,frame},['OTHER']],[{page,frame},['STOPPED','extra']]] as const){
+      await Promise.resolve().then(()=>f(src,...args)).catch(()=>{});
+    }
+  };
+  return {counts,replies,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
+    restore:async()=>{try{runAbort.abort();await journey.close(nowLimits());}finally{w.__failedRenewalStop?.();restore();}}};
 }
 
 test('one retained page, customer and SDK client across both separately attended phases',async()=>{
@@ -127,7 +135,48 @@ test('one retained page, customer and SDK client across both separately attended
     assert.equal(h.status(),'METHOD_CONFIRMED');
     await assert.rejects(h.journey.method(h.methodPort,nowLimits()));
     await Promise.all([h.journey.close(nowLimits()),h.journey.close(nowLimits())]);assert.equal(h.closed(),1);
-  }finally{h.restore();}
+  }finally{await h.restore();}
+});
+test('intentional final context close preserves the owner completion signal',async()=>{
+  const h=await fixture();
+  try{
+    await h.journey.initial(h.initialPort,{...nowLimits(),signal:h.runAbort.signal});
+    await h.forgedTerminal();assert.equal(h.runAbort.signal.aborted,false);
+    await h.journey.method(h.methodPort,nowLimits());
+    assert.equal(await h.journey.close(nowLimits()),true);
+    assert.equal(h.runAbort.signal.aborted,false);assert.equal(h.closed(),1);
+  }finally{await h.restore();}
+});
+for(const event of ['close','hide'])test('actual owner refuses the next boundary dispatch after held-page '+event,async()=>{
+  const h=await fixture();
+  try{
+    const root='../../../../infrastructure/';
+    const {opts,initial,iso,F,E}=await import(source(root+'fixtures/failed-renewal-descriptors.mjs').href);
+    const {createOwnedBillingFailedRenewal}=await import(source(root+'stripe-billing-first-payment.mjs').href);
+    const calls:string[]=[],mark=(name:string)=>async()=>{calls.push(name);return true;};
+    const settlement={...initial(),subscription_id:id(6),operation_id:id(7),period_start:iso(F),paid_through:iso(E)};
+    const runtime={ready:mark('ready'),prepare:async(r:any)=>h.initialPort.prepare({origin:r.origin,token:r.customerToken}),confirm:h.initialPort.confirm,
+      observe:async()=>settlement,boundary:async()=>{calls.push('boundary');throw Error('unexpected financial dispatch');},
+      close:mark('runtime-close')};
+    const fixturePort={...h.initialPort,resources:()=>({...h.initialPort.resources(),customerId:id(4),productId:id(11)}),
+      provision:mark('fixture'),beforeDispatch:mark('dispatch'),acknowledge:mark('ack'),close:mark('fixture-close')};
+    const bootstrap={resources:()=>({cliDirectory:'/inert'}),prepare:mark('prepare'),start:mark('start'),stop:mark('bootstrap-stop')};
+    const cli={validateBinding:mark('binding'),startListener:mark('listener'),assertBillingListener:mark('check'),stopListener:mark('listener-stop')};
+    const owner=await createOwnedBillingFailedRenewal(opts(),{preflight:mark('preflight'),createBootstrap:async()=>bootstrap,login:mark('login'),
+      createCli:async()=>cli,createFixture:async()=>fixturePort,createRuntime:async()=>runtime,pause:mark('pause'),
+      prove:async()=>{
+        assert.equal(h.phase(),'OBSERVE');assert.equal(h.closed(),0);
+        calls.push('initial-proof');h.lose(event);
+        return {ownedVerified:true,cashVerified:true,journalVerified:true,signedCallbacksVerified:true,
+          anchor:{initial_bill_id:id(10),initial_payment_id:id(11),initial_invoice_id:'in_a',initial_allocation_id:'inpay_a',initial_payment_intent_id:'pi_a'}};
+      },proveFailedRenewal:mark('unexpected-final-proof')});
+    await assert.rejects(owner.run(h.journey,{...nowLimits(),signal:h.runAbort.signal}));
+    const result=await owner.close();
+    assert.ok(calls.includes('initial-proof'));assert.equal(calls.includes('boundary'),false);
+    assert.equal(h.runAbort.signal.aborted,true);assert.equal(result.cleanupConfirmed,true);
+    assert.equal(result.failedRenewalAccepted,false);assert.equal(h.closed(),1);
+    assert.deepEqual(calls.slice(-4),['runtime-close','listener-stop','bootstrap-stop','fixture-close']);
+  }finally{await h.restore();}
 });
 for(const change of ['frame','origin','identity','operation','body','extra','duplicate_key','old_operation','manual_timeout','permit_error','expired'])test('terminates once without a second financial call on '+change,async()=>{
   const h=await fixture(change);
@@ -140,7 +189,7 @@ for(const change of ['frame','origin','identity','operation','body','extra','dup
     assert.equal(h.counts.includes('confirmSetup'),false);
     assert.doesNotMatch(h.status(),/secret|bga1_|Bearer|ctoken_/);
     assert.equal(await h.journey.close(nowLimits()),true);assert.equal(h.closed(),1);
-  }finally{h.restore();}
+  }finally{await h.restore();}
 });
 test('dedicated build, exact-file health, manual Chrome config and default discovery',async()=>{
   const [html,vite,docker,nginx,ordinary,offline,config,entry,page]=await Promise.all([

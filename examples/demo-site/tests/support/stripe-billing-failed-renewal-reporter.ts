@@ -1,14 +1,14 @@
 import type {Reporter,TestCase,TestResult,FullResult} from '@playwright/test/reporter';
+import {fileURLToPath} from 'node:url';
 
+const targetFile=fileURLToPath(new URL('../stripe-billing-failed-renewal.spec.ts',import.meta.url));
 function isLoginHandoff(line:string):boolean {
-  const match=/^Authorize the isolated Sandbox CLI at (https:\/\/(?:access|dashboard)\.stripe\.com\/[^\s]*) using code ([A-Za-z0-9][A-Za-z0-9 -]{2,126}[A-Za-z0-9])\. Keep this terminal open\.$/.exec(line);
-  if(!match)return false;
-  try{
-    const url=new URL(match[1]!);
-    const decoded=decodeURIComponent(line);
-    return url.href===match[1] && !url.hash && !/[\\\x00-\x1f\x7f]|%[0-9a-f]{2}/i.test(decoded) &&
-      !/(?:[spr]k_(?:test|live)_|whsec_|bga1_|bca2_|ctoken_|_secret_|client[_ -]?secret|session[_ -]?token|bearer[ +])/i.test(decoded);
-  }catch{return false;}
+  // Only the supported device URL and eight-letter pairing code can leave
+  // this reporter. In particular the original opaque bearer fits neither.
+  const prefix='Authorize the isolated Sandbox CLI at https://access.stripe.com/stripecli/oauth2/device using code ';
+  const suffix='. Keep this terminal open.';
+  return line.length===prefix.length+9+suffix.length && line.startsWith(prefix) && line.endsWith(suffix) &&
+    /^[A-Z]{4}-[A-Z]{4}$/.test(line.slice(prefix.length,-suffix.length));
 }
 
 /** The process emits one bounded device-login handoff. All other output is opaque. */
@@ -16,6 +16,8 @@ export default class FailedRenewalReporter implements Reporter {
   private buffer='';
   private overflow=false;
   private handoff=false;
+  private completed=0;
+  private targetPassed=false;
   printsToStdio():boolean{return true;}
   onStdOut(chunk:string|Buffer):void {
     if(this.handoff)return;
@@ -35,11 +37,16 @@ export default class FailedRenewalReporter implements Reporter {
   }
   onStdErr():void {}
   onError():void{process.stdout.write('failed_renewal_setup_failed\n');}
-  onTestEnd(_test:TestCase,result:TestResult):void {
-    process.stdout.write(result.status==='passed'?'owned_failed_renewal_passed\n':'owned_failed_renewal_not_accepted\n');
+  onTestEnd(test:TestCase,result:TestResult):void {
+    this.completed++;
+    this.targetPassed=this.completed===1 && result.status==='passed' && result.retry===0 &&
+      test.expectedStatus==='passed' && test.title==='OWNED_FAILED_RENEWAL_GRACE_RECOVERY' &&
+      test.location.file===targetFile && test.parent.project()?.name==='owned-failed-renewal-manual-chrome';
+    process.stdout.write(this.targetPassed?'owned_failed_renewal_passed\n':'owned_failed_renewal_not_accepted\n');
   }
   onEnd(result:FullResult):void {
     this.buffer='';this.handoff=true;
-    process.stdout.write(result.status==='passed'?'owned_failed_renewal_result_passed full5b=NOT_ACCEPTED\n':'owned_failed_renewal_result_not_accepted full5b=NOT_ACCEPTED\n');
+    const accepted=this.completed===1 && this.targetPassed && result.status==='passed';
+    process.stdout.write(accepted?'owned_failed_renewal_result_passed full5b=NOT_ACCEPTED\n':'owned_failed_renewal_result_not_accepted full5b=NOT_ACCEPTED\n');
   }
 }

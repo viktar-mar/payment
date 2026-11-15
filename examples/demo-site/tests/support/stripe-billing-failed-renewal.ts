@@ -36,7 +36,8 @@ function providerOrigin(url:URL) {
 }
 
 /** A single owned page. Neither phase accepts a target from the page or chooses a provider operation. */
-export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>):BillingFailedRenewalJourney {
+export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAbort:AbortController):BillingFailedRenewalJourney {
+  need(runAbort instanceof AbortController && !runAbort.signal.aborted);
   let state:'NEW'|'INITIAL'|'HELD'|'METHOD'|'DONE'|'CLOSED'='NEW';
   let opening:Promise<BrowserContext>|undefined, closing:Promise<void>|undefined;
   let context:BrowserContext|undefined, page:Page|undefined;
@@ -62,6 +63,13 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>):Bill
       closing=opening.then(c=>c.close());
       void closing.catch(()=>{});
     }
+  }
+  function lost() {
+    // Intentional owner teardown calls stop before closing the context. A real
+    // page loss while held must revoke financial stages outside this helper.
+    if(state==='CLOSED')return;
+    stop();
+    runAbort.abort();
   }
   function current() {
     need(state!=='CLOSED');billingCheck(whole);billingCheck(stage);
@@ -205,7 +213,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>):Bill
       if(previous==='CONFIRM')finalDelivery=delivery;
       await delivery;
     }catch{
-      stop();await route.abort('failed').catch(()=>{});
+      lost();await route.abort('failed').catch(()=>{});
     }
   }
   async function setup(port:BillingFirstPaymentPort) {
@@ -214,16 +222,22 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>):Bill
     opening=browser.newContext({serviceWorkers:'block',acceptDownloads:false});
     context=await opening;current();
     page=await context.newPage();current();
-    context.on('page',other=>{if(other!==page)stop();});
-    page.on('framenavigated',frame=>{if(frame===page!.mainFrame() && (++navigation!==1 || frame.url()!==binding.endpoints.demo+pagePath))stop();});
-    page.on('close',stop);
+    context.on('page',other=>{if(other!==page)lost();});
+    context.on('close',lost);
+    page.on('framenavigated',frame=>{if(frame===page!.mainFrame() && (++navigation!==1 || frame.url()!==binding.endpoints.demo+pagePath))lost();});
+    page.on('close',lost);
     await context.routeWebSocket('**/*',socket=>socket.close());
     await context.route('**/*',r=>track(routeRequest(r)));
+    await context.exposeBinding('__failedRenewalTerminal',({frame,page:source},...args:unknown[])=>{
+      if(state==='CLOSED' || source!==page || frame!==page!.mainFrame() || frame.url()!==binding.endpoints.demo+pagePath ||
+          args.length!==1 || args[0]!=='STOPPED')return;
+      lost();
+    });
     await context.exposeBinding('__failedRenewalChallenge',({frame,page:source},value:unknown)=>{
       try{
         assertPage();need(source===page && frame===page!.mainFrame() && state==='INITIAL' && step==='CHALLENGE_ID' && uuid(value));
         challenge=value;step='VERIFY';
-      }catch{stop();throw failed();}
+      }catch{lost();throw failed();}
     });
     await context.exposeBinding('__failedRenewalPrepare',({frame,page:source},value:unknown)=>track((async()=>{
       try {
@@ -241,7 +255,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>):Bill
         initial=p;initialBridge=createFirstPaymentBridge({binding,prepared:p,token,port:initialPort,limits:scoped()});
         step='ACTION';
         return {subscriptionId:p.subscription_id,operationId:p.operation_id};
-      }catch{stop();throw failed();}
+      }catch{lost();throw failed();}
     })()));
     await page.goto(binding.endpoints.demo+pagePath,{timeout:timeout()});
     assertPage();
@@ -264,11 +278,11 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>):Bill
       try{
         need(state==='NEW');billingCheck(limits);need(limits.deadline<=Date.now()+2700000);
         whole=limits;stage=limits;state='INITIAL';
-        whole.signal?.addEventListener('abort',stop,{once:true});expires=setTimeout(stop,whole.deadline-Date.now());
+        whole.signal?.addEventListener('abort',stop,{once:true});expires=setTimeout(lost,whole.deadline-Date.now());
         await billingBounded(scoped(),()=>track(setup(port)),300000);
         assertPage();need(initial);initialPort=undefined;initialBridge=undefined;
         state='HELD';return true;
-      }catch{stop();throw failed();}
+      }catch{lost();throw failed();}
     },
     async method(port:BillingFailedRenewalMethodPort,limits:BillingLimits):Promise<true> {
       try{
@@ -285,7 +299,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>):Bill
           await awaitOperator('method');
         })()),300000);
         assertPage();state='DONE';return true;
-      }catch{stop();throw failed();}
+      }catch{lost();throw failed();}
     },
     async close(limits:BillingLimits):Promise<true>{
       stop();

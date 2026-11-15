@@ -24,6 +24,9 @@ export function installFailedRenewalPage(sdk:Sdk):void {
   function stop() {
     if (state === 'STOPPED') return;
     phase('STOPPED');
+    // The owner may be between browser phases. Revoke that run even when no
+    // controller call is currently waiting on a browser result.
+    try {void Promise.resolve((window as any).__failedRenewalTerminal('STOPPED')).catch(()=>{});} catch { /* page is closing */ }
     clearTimeout(timer);
     controller.abort();
     initial?.destroy(); method?.destroy();
