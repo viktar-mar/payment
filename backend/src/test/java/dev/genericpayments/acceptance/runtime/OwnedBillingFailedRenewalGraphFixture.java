@@ -120,12 +120,15 @@ final class DebtWire {
         renewalCharge.add("outcome",StripeBillingOwnedSubscriptionFixture.json("{\"type\":\"issuer_declined\",\"reason\":\"generic_decline\"}"));
     }
     List<String> bodies(String clock,String customer,boolean allocationPresent){
+        return bodies(clock,customer,renewalInvoice,allocationPresent?renewalAllocation:null,renewalPi,renewalCharge);
+    }
+    List<String> bodies(String clock,String customer,JsonObject invoice,JsonObject allocation,JsonObject pi,JsonObject charge){
         var replies = new ArrayList<String>();
         replies.add(clock);replies.add(customer);replies.add(graph.remote.toString());
-        replies.add(StripeBillingOwnedSubscriptionFixture.page(graph.invoice,renewalInvoice));replies.add(StripeBillingOwnedSubscriptionFixture.page(graph.line));
+        replies.add(StripeBillingOwnedSubscriptionFixture.page(graph.invoice,invoice));replies.add(StripeBillingOwnedSubscriptionFixture.page(graph.line));
         replies.add(StripeBillingOwnedSubscriptionFixture.page(graph.allocation));replies.add(graph.pi.toString());replies.add(graph.charge.toString());replies.add(StripeBillingOwnedSubscriptionFixture.page(graph.allocation));
-        replies.add(StripeBillingOwnedSubscriptionFixture.page(renewalLine));replies.add(allocationPresent?StripeBillingOwnedSubscriptionFixture.page(renewalAllocation):StripeBillingOwnedSubscriptionFixture.page());
-        if(allocationPresent){replies.add(renewalPi.toString());replies.add(renewalCharge.toString());replies.add(StripeBillingOwnedSubscriptionFixture.page(renewalAllocation));}
+        replies.add(StripeBillingOwnedSubscriptionFixture.page(renewalLine));replies.add(allocation==null?StripeBillingOwnedSubscriptionFixture.page():StripeBillingOwnedSubscriptionFixture.page(allocation));
+        if(allocation!=null){replies.add(pi.toString());replies.add(charge.toString());replies.add(StripeBillingOwnedSubscriptionFixture.page(allocation));}
         replies.add(clock);
         return replies;
     }

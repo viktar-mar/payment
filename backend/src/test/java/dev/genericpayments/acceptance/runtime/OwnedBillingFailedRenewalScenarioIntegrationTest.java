@@ -57,7 +57,16 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         if(request.method().name().equals("POST")&&request.url().getPath().equals("/v1/setup_intents"))
             return new StripeResponse(200,HttpHeaders.of(Map.of()),setupReply(request).toString());
         assertThat(boundaryReplies).as("Every SDK reply is planned in memory").isNotEmpty();
-        return new StripeResponse(200,HttpHeaders.of(Map.of()),boundaryReplies.removeFirst());
+        var wire=boundaryReplies.removeFirst();
+        var body=JsonParser.parseString(wire).getAsJsonObject();
+        var object=body.get("object").getAsString();
+        if(object.equals("charge")){
+            assertThat(request.method().name()).isEqualTo("GET");
+            assertThat(request.url().getPath()).isEqualTo("/v1/charges/"+body.get("id").getAsString());
+        }else if(object.equals("payment_intent")&&request.method().name().equals("GET")){
+            assertThat(request.url().getPath()).isEqualTo("/v1/payment_intents/"+body.get("id").getAsString());
+        }
+        return new StripeResponse(200,HttpHeaders.of(Map.of()),wire);
     }
 
     @Test void actualComponentsPreserveTheManagedRenewalStoreAcrossInitialSettlementAndBoundary() {
@@ -270,16 +279,22 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         var endClock=boundaryReplies.removeLast();
         Collections.addAll(boundaryReplies,setup.toString(),card("pm_saved").toString(),endClock);
     }
-    private void acknowledgeRecovery() throws Exception {
-        var before=financialRows();
-        methodGraph();
+    private JsonObject successfulOriginalIntent() {
         var pi=debt.renewalPi.deepCopy();
         pi.addProperty("amount_received",amount);pi.addProperty("amount_capturable",0);
         pi.addProperty("status","succeeded");pi.addProperty("payment_method","pm_saved");
+        pi.addProperty("latest_charge","ch_recovered");
         pi.add("last_payment_error",JsonNull.INSTANCE);
-        boundaryReplies.add(pi.toString());
+        return pi;
+    }
+    private void acknowledgeRecovery() throws Exception {
+        var before=financialRows();
+        methodGraph();
+        boundaryReplies.add(successfulOriginalIntent().toString());
         var result=stage("recovery/confirm","RECOVERY_ACKNOWLEDGED");
         assertThat(result.get("recovery_confirm_status").getAsString()).isEqualTo("ACKNOWLEDGED");
+        assertThat(result.get("recovery_charge_id").getAsString()).isEqualTo("ch_recovered");
+        assertThat(result.get("recovery_confirm_payment_intent_id")).isEqualTo(result.get("failed_payment_intent_id"));
         assertThat(financialRows()).isEqualTo(before);
         assertThat(count("stripe_billing_failed_recovery_confirm_acks")).isOne();
         assertThat(count("stripe_billing_failed_method_publications")).isZero();
@@ -287,16 +302,18 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
     }
     private void queuePaid() {
         graph.remote.addProperty("status","active");
-        debt.renewalInvoice.addProperty("status","paid");debt.renewalInvoice.addProperty("amount_paid",amount);
-        debt.renewalInvoice.addProperty("amount_remaining",0);debt.renewalInvoice.addProperty("ending_balance",0);
-        debt.renewalAllocation.addProperty("status","paid");debt.renewalAllocation.addProperty("amount_paid",amount);
-        debt.renewalAllocation.getAsJsonObject("status_transitions").addProperty("paid_at",after);
-        debt.renewalPi.addProperty("status","succeeded");debt.renewalPi.addProperty("amount_received",amount);
-        debt.renewalPi.remove("last_payment_error");
-        debt.renewalCharge.addProperty("status","succeeded");debt.renewalCharge.addProperty("paid",true);
-        debt.renewalCharge.addProperty("captured",true);debt.renewalCharge.addProperty("amount_captured",amount);
-        debt.renewalCharge.remove("failure_code");debt.renewalCharge.remove("outcome");
-        queueGraph(after,true);
+        var invoice=debt.renewalInvoice.deepCopy();
+        invoice.addProperty("status","paid");invoice.addProperty("amount_paid",amount);
+        invoice.addProperty("amount_remaining",0);invoice.addProperty("ending_balance",0);
+        var allocation=debt.renewalAllocation.deepCopy();
+        allocation.addProperty("status","paid");allocation.addProperty("amount_paid",amount);
+        allocation.getAsJsonObject("status_transitions").addProperty("paid_at",after);
+        var pi=successfulOriginalIntent();
+        var charge=graph.charge.deepCopy();
+        charge.add("id",pi.get("latest_charge"));
+        charge.add("payment_intent",pi.get("id"));
+        charge.addProperty("created",after);
+        boundaryReplies.addAll(debt.bodies(clock(after,"ready"),customerBody(),invoice,allocation,pi,charge));
     }
 
     private JsonObject setupReply(StripeRequest request) {
@@ -358,10 +375,24 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         var originalPayment=jdbc.queryForMap("select * from payments where id=?",id(boundary,"initial_payment_id"));
         var originalBill=jdbc.queryForMap("select * from subscription_billing_records where id=?",id(boundary,"initial_bill_id"));
         var failed=failure();
+        var declinedCharge=debt.renewalCharge.deepCopy();
+        assertThat(declinedCharge.get("id").getAsString()).isEqualTo("ch_renewal");
+        assertThat(declinedCharge.get("status").getAsString()).isEqualTo("failed");
+        assertThat(declinedCharge.get("payment_intent")).isEqualTo(failed.get("failed_payment_intent_id"));
+        var originalFailure=jdbc.queryForMap("select * from stripe_billing_failed_renewal_failures");
         graceAndMethod(failed);
         acknowledgeRecovery();
         queuePaid();
+        int beforeObservation=requests.size();
         var paid=stage("recovery/observe","RECOVERED_SETTLED_LOCAL");
+        assertThat(requests.subList(beforeObservation,requests.size())).allSatisfy(r->assertThat(r.method().name()).isEqualTo("GET"));
+        assertThat(requests.subList(beforeObservation,requests.size()).stream().map(r->r.url().getPath())
+            .filter(path->path.startsWith("/v1/payment_intents/")||path.startsWith("/v1/charges/")))
+            .containsExactly("/v1/payment_intents/"+boundary.get("initial_payment_intent_id").getAsString(),"/v1/charges/ch_owned",
+                "/v1/payment_intents/"+failed.get("failed_payment_intent_id").getAsString(),"/v1/charges/ch_recovered");
+        assertThat(paid.get("recovery_charge_id").getAsString()).isEqualTo("ch_recovered");
+        assertThat(debt.renewalCharge).as("original issuer-declined charge").isEqualTo(declinedCharge);
+        assertThat(jdbc.queryForMap("select * from stripe_billing_failed_renewal_failures")).isEqualTo(originalFailure);
         assertThat(paid.get("recovery_publication_bill_id")).isEqualTo(failed.get("failed_bill_id"));
         assertThat(jdbc.queryForMap("select * from payments where id=?",id(boundary,"initial_payment_id"))).isEqualTo(originalPayment);
         assertThat(jdbc.queryForMap("select * from subscription_billing_records where id=?",id(boundary,"initial_bill_id"))).isEqualTo(originalBill);
