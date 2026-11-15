@@ -5,6 +5,7 @@ import {fileURLToPath} from 'node:url';
 import type {TestCase,TestResult,FullResult} from '@playwright/test/reporter';
 // @ts-ignore Node's source-only offline test runner requires the explicit extension.
 import FailedRenewalReporter from './stripe-billing-failed-renewal-reporter.ts';
+import {browserDiagnostic,browserCleanupConfirmed} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 
 // The two source modules have only type imports from Playwright and the SDK.
 // Memory fixtures exercise the held journey without importing either runtime.
@@ -177,7 +178,7 @@ async function fixture(change = '') {
     const req={url:()=>target,method:()=>method,allHeaders:async()=>headers,frame:()=>requestFrame,postData:()=>contents,
       redirectedFrom:()=>null,isNavigationRequest:()=>false,resourceType:()=> 'fetch'};
     await routeHandler({request:()=>req,abort:async()=>{denied=true;},fallback:async()=>{assert.ok(target==='https://js.stripe.com/v3/'||target===otpUrl||target===otpUrl+'/'+id(10)+'/verify');},
-      fulfill:async(r:any)=>{assert.equal(r.headers['Cache-Control'],'no-store');assert.equal(r.headers['Access-Control-Allow-Origin'],demo);reply=r;replies.push(r);}});
+      fulfill:async(r:any)=>{if((change==='action_delivery'&&target.endsWith('/action'))||(change==='session_delivery'&&target.endsWith('/confirmation-session')))throw Error('secret_fixture canary');assert.equal(r.headers['Cache-Control'],'no-store');assert.equal(r.headers['Access-Control-Allow-Origin'],demo);reply=r;replies.push(r);}});
     if(denied)throw Error('denied mock request');
     return reply;
   }
@@ -186,7 +187,7 @@ async function fixture(change = '') {
   const sdk = {createGenericPaymentClient:()=>{counts.push('client');return {subscriptions,
     requestEmailOtp:async()=>{counts.push('challenge');await request(otpUrl,'POST',{site_key:'fixture',email:'fixture@example.test',intent:'AUTHENTICATE'});return {challengeId:id(10),expiresAt:expires};},
     verifyEmailOtp:async()=>{counts.push('verify');await request(otpUrl+'/'+id(10)+'/verify','POST',{site_key:'fixture',code:otp});return session;}};},
-    mountStripePaymentAttempt:async(p:any)=>{counts.push('mountInitial');assert.strictEqual(p.client,subscriptions);assert.strictEqual(p.input.session,session);
+    mountStripePaymentAttempt:async(p:any)=>{counts.push('mountInitial');if(change==='mount_refusal')throw Error('secret_fixture canary');assert.strictEqual(p.client,subscriptions);assert.strictEqual(p.input.session,session);
       return {destroy:()=>{},confirm:async()=>{await request(base(id(7))+'/confirmation-attempts/'+id(8)+'/confirm','POST',{capability,confirmation_token:'ctoken_inert'});
         p.onRetire?.();return {state:'OBSERVE',retryAllowed:false,successorAttemptId:null};}};},
     mountStripeSubscriptionMethod:async(p:any)=>{counts.push('mountMethod');assert.strictEqual(p.client,subscriptions);assert.strictEqual(p.session,session);
@@ -198,16 +199,17 @@ async function fixture(change = '') {
         counts.push('confirmSetup');p.onRetire?.();return {operationId:id(9),subscriptionId:id(6),status:'RESERVED',actionAvailable:false};}};}};
   installFailedRenewalPage(sdk);
   const labels:Record<string,string>={'Request code':'request','Verify code':'verify','Start payment':'start','Pay':'pay','Confirm test method':'confirm-method','I consent to recurring payments':'consent','Six-digit code':'code'};
-  function locator(id:string):any {const c=ctrl(id);return {click:()=>c.activate(),check:async()=>{c.checked=true;},fill:async()=>{},isVisible:async()=>true,isEnabled:async()=>!c.disabled,
-    getAttribute:async()=>body.dataset.phase,evaluate:async(f:Function,arg:any)=>id==='code'?(arg===undefined||((c.value=arg),true)):f(c,arg),
-    frameLocator:()=>({locator:()=>locator('card')})};}
+  function locator(id:string):any {const c=ctrl(id);return {click:()=>c.activate(),check:async()=>{c.checked=true;},fill:async()=>{if(change===id)throw Error('secret_fixture canary');},isVisible:async()=>{if(change==='postal_check')throw Error('secret_fixture canary');return true;},isEnabled:async()=>!c.disabled,
+    getAttribute:async()=>body.dataset.phase,evaluate:async(f:Function,arg:any)=>id==='code'?(arg===undefined||((c.value=arg),true)):change==='manual_arm'&&id==='pay'?false:f(c,arg),
+    frameLocator:()=>({locator:(s:string)=>locator(s.match(/name="([^"]+)"/)?.[1]??'card')})};}
   const page:any={mainFrame:()=>frame,url:()=>url,on:(n:string,f:Function)=>callbacks.set(n,f),goto:async(target:string)=>{assert.equal(target,demo+path);url=target;callbacks.get('framenavigated')?.(frame);},
     evaluate:async(f:Function,arg:unknown)=>f(arg),locator:(s:string)=>locator(s.replace(/^#/,'')),
     getByRole:(_role:string,o:{name:string})=>locator(labels[o.name]!),
     waitForFunction:async(f:Function,arg:unknown)=>{
+      if(change==='pre_ready'&&arg==='READY')throw Error('secret_fixture canary');
       if(arg==='OBSERVE'||arg==='METHOD_CONFIRMED'){
         const b=ctrl(arg==='OBSERVE'?'pay':'confirm-method');
-        if(change==='manual_timeout'&&arg==='METHOD_CONFIRMED')throw Error(selected.client_secret);
+        if((change==='manual_timeout'&&arg==='METHOD_CONFIRMED')||change==='initial_manual_timeout')throw Error(selected.client_secret);
         await b.activate();
       }
       assert.equal(Boolean(f(arg)),true);
@@ -231,6 +233,29 @@ async function fixture(change = '') {
   return {request,counts,replies,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
     restore:async()=>{try{runAbort.abort();await journey.close(nowLimits());}finally{w.__failedRenewalStop?.();restore();}}};
 }
+
+for(const [change,checkpoint] of [
+  ['action_delivery','BROWSER_ACTION_BRIDGE'],['session_delivery','BROWSER_SESSION_BRIDGE'],
+  ['pre_ready','BROWSER_WAIT_READY'],['mount_refusal','BROWSER_WAIT_READY'],
+  ['number','BROWSER_CARD_NUMBER'],['expiry','BROWSER_CARD_EXPIRY'],['cvc','BROWSER_CARD_CVC'],
+  ['postal_check','BROWSER_POSTAL_CHECK'],['postalCode','BROWSER_POSTAL_FILL'],
+  ['manual_arm','BROWSER_MANUAL_PAY_ARM'],['initial_manual_timeout','BROWSER_MANUAL_PAY_WAIT'],
+] as const)test('held browser preserves first checkpoint through teardown on '+change,async()=>{
+  const h=await fixture(change);
+  try{
+    let first:unknown;
+    await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),(error:unknown)=>{first=error;return true;});
+    assert.equal(browserDiagnostic(first),checkpoint);
+    assert.doesNotMatch(String(first),/secret_fixture|canary|bga1_|Bearer|ctoken_/);
+    assert.equal(h.runAbort.signal.aborted,true);
+    assert.equal(h.counts.includes('confirm'),false);
+    await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>error===first);
+    await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>error===first);
+    assert.equal(await h.journey.close(nowLimits()),true);
+    assert.equal(browserDiagnostic(first),checkpoint);assert.equal(browserCleanupConfirmed(first),true);
+    assert.equal(h.closed(),1);assert.equal(h.counts.filter(v=>v==='prepare').length,1);
+  }finally{await h.restore();}
+});
 
 test('one retained page, customer and SDK client across both separately attended phases',async()=>{
   const h=await fixture();

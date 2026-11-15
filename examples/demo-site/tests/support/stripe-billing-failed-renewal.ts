@@ -2,6 +2,7 @@ import type {Browser,BrowserContext,Page,Route} from '@playwright/test';
 import type {BillingBinding,BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {BillingFailedRenewalJourney,BillingFailedRenewalMethodPort,BillingFirstPaymentPort,FailedMethodSession,FirstPaymentPrepared} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
+import {browserFailure,browserDiagnostic,finishBrowserCleanup} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 // @ts-ignore Explicit source for dependency-free Node TS runner.
 import {createFirstPaymentBridge} from './stripe-billing-first-payment.ts';
 // @ts-ignore Explicit source for dependency-free Node TS runner.
@@ -51,6 +52,15 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   const lifetime=new AbortController(),pending=new Set<Promise<unknown>>();
   const usedKeys=new Set<string>();
   let finalDelivery:Promise<void>|undefined;
+  let checkpoint='BROWSER_CONTEXT',firstFailure:Error|undefined;
+  function latch(code:string):Error {
+    firstFailure??=browserFailure(code);
+    return firstFailure;
+  }
+  async function at<T>(code:string,work:()=>Promise<T>):Promise<T> {
+    checkpoint=code;
+    try{return await work();}catch{throw latch(code);}
+  }
   const track=<T>(work:Promise<T>)=>{
     pending.add(work);void work.then(()=>pending.delete(work),()=>pending.delete(work));return work;
   };
@@ -68,6 +78,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     // Intentional owner teardown calls stop before closing the context. A real
     // page loss while held must revoke financial stages outside this helper.
     if(state==='CLOSED')return;
+    latch(checkpoint);
     stop();
     runAbort.abort();
   }
@@ -89,21 +100,21 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   }
   async function awaitOperator(which:'initial'|'method') {
     const ready=which==='initial'?'READY':'METHOD_READY', label=which==='initial'?'Pay':'Confirm test method';
-    await waitPhase(ready);
+    await at('BROWSER_WAIT_READY',()=>waitPhase(ready));
     const button=page!.getByRole('button',{name:label,exact:true});
-    need(!(await button.isEnabled()));
+    await at('BROWSER_WAIT_READY',async()=>need(!(await button.isEnabled())));
     const frame=page!.locator('#provider').frameLocator('iframe[title="Secure payment input frame"]');
-    for(const [name,value] of [['number','4242424242424242'],['expiry','1230'],['cvc','123']] as const)
-      await frame.locator('input[name="'+name+'"]').fill(value,{timeout:timeout()});
+    for(const [name,value,code] of [['number','4242424242424242','BROWSER_CARD_NUMBER'],['expiry','1230','BROWSER_CARD_EXPIRY'],['cvc','123','BROWSER_CARD_CVC']] as const)
+      await at(code,()=>frame.locator('input[name="'+name+'"]').fill(value,{timeout:timeout()}));
     const postal=frame.locator('input[name="postalCode"]');
-    if(await postal.isVisible())await postal.fill('10001',{timeout:timeout()});
+    if(await at('BROWSER_POSTAL_CHECK',()=>postal.isVisible()))await at('BROWSER_POSTAL_FILL',()=>postal.fill('10001',{timeout:timeout()}));
     assertPage();need(step==='CONFIRM');
     manualArmed=true;
-    need(await button.evaluate((b,phase)=>{
+    await at('BROWSER_MANUAL_PAY_ARM',async()=>need(await button.evaluate((b,phase)=>{
       if(!(b instanceof HTMLButtonElement)||!b.disabled||document.body.dataset.phase!==phase)return false;
       b.disabled=false;return true;
-    },ready));
-    await waitPhase(which==='initial'?'OBSERVE':'METHOD_CONFIRMED',true);
+    },ready)));
+    await at('BROWSER_MANUAL_PAY_WAIT',()=>waitPhase(which==='initial'?'OBSERVE':'METHOD_CONFIRMED',true));
     need((step as string)==='ACK' && finalDelivery);
     await finalDelivery;assertPage();
     finalDelivery=undefined;
@@ -125,6 +136,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     }
   }
   async function routeRequest(route:Route) {
+    let routeCheckpoint=checkpoint;
     try {
       current();
       const request=route.request(),url=new URL(request.url());
@@ -154,6 +166,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       }
       need(request.method()===verb && (verb==='GET'?!request.postData():headers['content-type']==='application/json'));
       const previous=step;
+      if(previous==='ACTION'||previous==='SESSION'||previous==='CONFIRM')routeCheckpoint=previous==='ACTION'?'BROWSER_ACTION_BRIDGE':previous==='SESSION'?'BROWSER_SESSION_BRIDGE':'BROWSER_CONFIRM_BRIDGE';
       step='BUSY';
       if(previous==='CHALLENGE' || previous==='VERIFY'){
         need(!headers.authorization && !headers['idempotency-key']);
@@ -213,15 +226,18 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       if(previous==='CONFIRM')finalDelivery=delivery;
       await delivery;
     }catch{
+      latch(routeCheckpoint);
       lost();await route.abort('failed').catch(()=>{});
     }
   }
   async function setup(port:BillingFirstPaymentPort) {
     binding=port.resources();initialPort=port;
     need(loopback(binding.endpoints.backend) && loopback(binding.endpoints.demo) && binding.endpoints.backend!==binding.endpoints.demo);
+    checkpoint='BROWSER_CONTEXT';
     opening=browser.newContext({serviceWorkers:'block',acceptDownloads:false});
     context=await opening;current();
-    page=await context.newPage();current();
+    page=await at('BROWSER_PAGE',()=>context!.newPage());current();
+    checkpoint='BROWSER_SETUP';
     context.on('page',other=>{if(other!==page)lost();});
     context.on('close',lost);
     page.on('framenavigated',frame=>{if(frame===page!.mainFrame() && (++navigation!==1 || frame.url()!==binding.endpoints.demo+pagePath))lost();});
@@ -238,11 +254,12 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       try{
         assertPage();need(source===page && frame===page!.mainFrame() && state==='INITIAL' && step==='CHALLENGE_ID' && uuid(value));
         challenge=value;step='VERIFY';
-      }catch{lost();throw failed();}
+      }catch{const error=latch(checkpoint);lost();throw error;}
     });
     await context.exposeBinding('__failedRenewalPrepare',({frame,page:source},value:unknown)=>track((async()=>{
       try {
         assertPage();need(source===page && frame===page!.mainFrame() && state==='INITIAL' && step==='PREPARE' && initialPort);
+        checkpoint='BROWSER_PREPARE';
         step='BUSY';
         const v=fields(value,['token','origin','customerId','siteId','expiresAt']);
         need(v.origin===binding.endpoints.demo && v.siteId===binding.siteId && uuid(v.customerId) && (!binding.customerId||binding.customerId===v.customerId) &&
@@ -253,25 +270,31 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
         const createKey=crypto.randomUUID();usedKeys.add(createKey);
         const p=await initialPort.prepare({origin:v.origin!,token},createKey,scoped());
         assertPage();need(p.customer_id===v.customerId && p.site_id===binding.siteId && p.account_id===binding.accountId && p.run_id===binding.runId && p.price_id===binding.priceId && uuid(p.subscription_id) && uuid(p.operation_id) && p.session.publishable_key.startsWith('pk_test_'));
-        initial=p;initialBridge=createFirstPaymentBridge({binding,prepared:p,token,port:initialPort,limits:scoped()});
+        initial=p;initialBridge=createFirstPaymentBridge({binding,prepared:p,token,port:initialPort,limits:scoped(),latchFailure:latch});
         step='ACTION';
+        checkpoint='BROWSER_WAIT_READY';
         return {subscriptionId:p.subscription_id,operationId:p.operation_id};
-      }catch{lost();throw failed();}
+      }catch{const error=latch(checkpoint);lost();throw error;}
     })()));
-    await page.goto(binding.endpoints.demo+pagePath,{timeout:timeout()});
+    await at('BROWSER_NAVIGATION',()=>page!.goto(binding.endpoints.demo+pagePath,{timeout:timeout()}));
     assertPage();
-    await page.waitForFunction(()=>typeof (window as any).__failedRenewalConfigure==='function',undefined,{timeout:timeout()});
-    await page.evaluate(c=>(window as any).__failedRenewalConfigure(c),{backend:binding.endpoints.backend,siteKey:binding.siteKey,email:binding.email,deadline:whole.deadline});
+    await at('BROWSER_CONFIGURE',async()=>{
+      await page!.waitForFunction(()=>typeof (window as any).__failedRenewalConfigure==='function',undefined,{timeout:timeout()});
+      await page!.evaluate(c=>(window as any).__failedRenewalConfigure(c),{backend:binding.endpoints.backend,siteKey:binding.siteKey,email:binding.email,deadline:whole.deadline});
+    });
+    checkpoint='BROWSER_OTP_REQUEST';
     await page.getByRole('button',{name:'Request code',exact:true}).click({timeout:timeout()});
     await waitPhase('CODE');
     need(await port.withOtpCode(async v=>{
       assertPage();need(step==='VERIFY' && !code && /^\d{6}$/.test(v));
       code=v;await enterPrivateText(page!.getByRole('textbox',{name:'Six-digit code',exact:true}),v);return true as const;
     },scoped())===true);
+    checkpoint='BROWSER_OTP_VERIFY';
     await page.getByRole('button',{name:'Verify code',exact:true}).click({timeout:timeout()});
     await waitPhase('AUTHENTICATED');
     await page.getByRole('checkbox',{name:'I consent to recurring payments',exact:true}).check({timeout:timeout()});
-    await page.getByRole('button',{name:'Start payment',exact:true}).click({timeout:timeout()});
+    checkpoint='BROWSER_PREPARE';
+    await at('BROWSER_WAIT_READY',()=>page!.getByRole('button',{name:'Start payment',exact:true}).click({timeout:timeout()}));
     await awaitOperator('initial');
   }
   return Object.freeze({
@@ -283,7 +306,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
         await billingBounded(scoped(),()=>track(setup(port)),300000);
         assertPage();need(initial);initialPort=undefined;initialBridge=undefined;
         state='HELD';return true;
-      }catch{lost();throw failed();}
+      }catch{const error=latch(checkpoint);lost();throw error;}
     },
     async method(port:BillingFailedRenewalMethodPort,limits:BillingLimits):Promise<true> {
       try{
@@ -296,21 +319,25 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
           need(initial && m.subscriptionId===initial.subscription_id && uuid(m.operationId) && m.operationId!==initial.operation_id &&
             m.action.kind==='PROVIDER_CLIENT' && Date.now()<Date.parse(m.action.expires_at));
           method=m;step='ACTION';
-          await page!.evaluate(o=>(window as any).__failedRenewalMethod(o),{subscriptionId:m.subscriptionId,operationId:m.operationId});
+          await at('BROWSER_WAIT_READY',()=>page!.evaluate(o=>(window as any).__failedRenewalMethod(o),{subscriptionId:m.subscriptionId,operationId:m.operationId}));
           await awaitOperator('method');
         })()),300000);
         assertPage();stage=whole;methodPort=undefined;method=undefined;selected=undefined;state='DONE';return true;
-      }catch{lost();throw failed();}
+      }catch{const error=latch(checkpoint);lost();throw error;}
     },
     async close(limits:BillingLimits):Promise<true>{
       stop();
+      let cleanup=false;
       try{
-        return await billingBounded(limits,async()=>{
+        const result=await billingBounded(limits,async()=>{
           await closing;
           await Promise.allSettled([...pending]);
           return true as const;
         },30000);
-      }catch{throw failed();}
+        cleanup=!!context;
+        return result;
+      }catch{throw latch('BROWSER_CLOSE');}
+      finally{if(firstFailure && browserDiagnostic(firstFailure))finishBrowserCleanup(firstFailure,cleanup);}
     }
   });
 }
