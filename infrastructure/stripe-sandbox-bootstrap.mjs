@@ -186,6 +186,9 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   let terminalBuild=false,buildDiagnostic=null,buildxIdentity=null;
   // First-payment START only: local checkpoints and trusted internal failure categories.
   let startupCode=null,startupStage='ADMISSION',startupService='BOOTSTRAP';
+  // Failed-renewal persistence exposes only the first refused local checkpoint.
+  let persistenceCode=null,persistenceStage='PERSIST_ADMISSION';
+  const persistenceStep=stage=>{if(failedRenewal&&persistenceCode===null)persistenceStage=stage;};
   const backendHealthFailures=new Set(['HTTP_UNAVAILABLE','HTTP_REJECTED','HTTP_ERROR','CONNECTION_FAILED','PROBE_TIMEOUT']);
   const startupStep=(stage,service='BOOTSTRAP')=>{if(firstPayment&&startupCode===null){startupStage=stage;startupService=service==='BOOTSTRAP'?service:service.toUpperCase().replaceAll('-','_');}};
   function retainStartup(error,controller,external) {
@@ -212,6 +215,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     if(busy)throw fixed('OPERATION_BUSY');busy=true;
     const controller=new AbortController();let timer,external,original,onAbort;
     const captureStartup=firstPayment&&phase==='START'&&!pending;if(captureStartup)startupStep('ADMISSION');
+    const capturePersistence=failedRenewal&&phase==='PERSIST'&&persistenceCode===null;if(capturePersistence)persistenceStep('PERSIST_ADMISSION');
     try {
       if(pending&&!cleanup)fail();
       if(adminChild){
@@ -232,7 +236,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       const context={deadline:limits.deadline,signal:controller.signal,externalSignal:external};check(context);
       const result=await body(context);
       if(!diagnostic||context.buildCompleted!==true)check(context);return result;
-    } catch(error) {if(captureStartup)retainStartup(error,controller,external);pending=true;throw fixed(phase+'_PENDING');}
+    } catch(error) {if(captureStartup)retainStartup(error,controller,external);if(capturePersistence)persistenceCode=persistenceStage;pending=true;throw fixed(phase+'_PENDING');}
     finally {io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);original?.removeEventListener('abort',onAbort);busy=false;}
   }
   async function execute(file,args,settings,context) {
@@ -611,7 +615,8 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     if(Object.keys(assignments).length!==3||! /^(?:sk|rk)_test_[A-Za-z0-9]+$/.test(assignments[STRIPE_NAMES[0]])
       ||!/^pk_test_[A-Za-z0-9]+$/.test(assignments[STRIPE_NAMES[1]]))fail();
     if(Object.values(assignments).some(value=>/replace_me|your_key|synthetic|sentinel|example/i.test(value)))fail();
-    const previous=assignments[STRIPE_NAMES[2]];if(previous!==''&&previous!==secret)fail();
+    const previous=assignments[STRIPE_NAMES[2]];
+    if(previous!==''&&(failedRenewal?!/^whsec_[A-Za-z0-9_]{16,256}$/.test(previous):previous!==secret))fail();
     if(previous==='') {
       const line=lines[webhookIndex],offset=line.indexOf('=')+1,quote=["'",'"'].includes(line[offset])?line[offset]:'';
       lines[webhookIndex]=line.slice(0,offset)+quote+secret+quote+line.slice(offset+(quote?2:0));
@@ -627,7 +632,17 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   }
   async function persist(secret,context) {
     if(status!=='PREPARED'||!issuerProved||webhookReady||typeof secret!=='string'||!/^whsec_[A-Za-z0-9_]{16,256}$/.test(secret))fail();
+    persistenceStep('PERSIST_OWNERSHIP');
     await topology(context,false,true);await sourceIdentity(context);await intent('PERSIST_WEBHOOK','backend-key-persistence',context);
+    if(failedRenewal) {
+      let original;
+      try {
+        persistenceStep('PERSIST_INPUT');original=await userFile(context);const parsed=parsedUser(original.bytes,secret);
+        persistenceStep('PERSIST_UNCHANGED');await unchanged(original,context);
+        persistenceStep('PERSIST_FINAL_STORE');await exclusiveFile(directory+'/final.env',envText({...inputs,...parsed.assignments}),context);
+        persistenceStep('PERSIST_ACK');webhookReady=true;await acknowledgement(context);return true;
+      } finally {if(original)await original.file.close();}
+    }
     const writerPath=ROOT+'/test-results/stripe-sandbox/user-env.lock';
     const writer=await exclusiveFile(writerPath,runId+'\n',context,true);let complete=false,original;
     try {
@@ -727,8 +742,25 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     const ownedStartsOnly=firstPayment&&[...SERVICES,'issuer-installer','issuer-probe'].every(service=>recorded.containers[service])
       &&intents.every(value=>value.status==='ACKNOWLEDGED'||value.status==='DISPATCHING'&&value.action==='START_SERVICE'
         &&fullId(value.name)&&SERVICES.some(service=>recorded.containers[service].id===value.name));
-    if(firstPayment&&!ownedStartsOnly)fail();
+    const preparedServices=[...SERVICES,'issuer-installer','issuer-probe'];
+    const pendingPersistence=failedRenewal&&pending&&status==='PREPARED'&&issuerProved&&!retired&&!live&&!recorded.retiredBackend
+      &&Object.keys(recorded.containers).length===preparedServices.length&&preparedServices.every(service=>recorded.containers[service])
+      &&intents.length>0&&intents.at(-1).action==='PERSIST_WEBHOOK'&&intents.at(-1).name==='backend-key-persistence'&&intents.at(-1).status==='DISPATCHING'
+      &&intents.slice(0,-1).every(value=>value.status==='ACKNOWLEDGED'&&value.action!=='PERSIST_WEBHOOK'&&value.action!=='START_SERVICE');
+    if(firstPayment&&!ownedStartsOnly&&!pendingPersistence)fail();
     await infrastructureProof(context);await projectProof(context);
+    if(pendingPersistence) {
+      // This exception proves the live owner's untouched pre-start shape; it grants no stop or write authority.
+      for(const service of preparedServices) {
+        const container=recorded.containers[service],helper=service.startsWith('issuer-');
+        try {
+          const proof=await containerProof(service,container.id,context,{cleanupOnly:true,neverStarted:!helper});
+          if(helper&&(proof.state.Running||proof.state.Status!=='exited'||proof.state.ExitCode!==0||container.status!=='exited'
+            ||container.startedAt==='0001-01-01T00:00:00Z'||proof.state.StartedAt!==container.startedAt))fail();
+        } finally {recorded.containers[service]=container;}
+      }
+      await projectProof(context);await ledger(context);if(lock){await lock.close();lock=null;}return true;
+    }
     for(const [service,container] of Object.entries(recorded.containers))await containerProof(service,container.id,context,{cleanupOnly:true});
     for(const [service,container] of Object.entries(recorded.containers).reverse()) {
       await infrastructureProof(context);const proof=await containerProof(service,container.id,context,{cleanupOnly:true});
@@ -775,6 +807,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({host:'127.0.0.1',port:ports.postgres,database:'payment',user:'payment',password:inputs.PAYMENT_DB_PASSWORD}));}),context)!==true)fail();return true;
   },{adminChild:true});
   if(firstPayment)capabilities.startupDiagnostic=()=>startupCode;
+  if(failedRenewal)capabilities.persistenceDiagnostic=()=>persistenceCode;
   if(firstPayment)capabilities[failedRenewal?'withFailedRenewalRuntime':firstRenewal?'withFirstRenewalRuntime':'withFirstPaymentRuntime']=(callback,limits)=>operation('ADMIN',limits,async context=>{if(typeof callback!=='function'||!controlCapability)fail();await verify(context);if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({endpoint:'http://127.0.0.1:'+options.controlPort,capability:controlCapability}));}),context)!==true)fail();return true;},{adminChild:true});
   return Object.freeze(capabilities);
 }

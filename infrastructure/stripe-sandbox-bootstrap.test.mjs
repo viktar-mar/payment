@@ -1951,3 +1951,137 @@ test('first-renewal bootstrap mode rejection precedes all dependency access',asy
  assert.equal(typeof bootstrapModule.createOwnedBillingFirstRenewalBootstrap,'function');let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}}),f=firstRenewalFixture();
  await assert.rejects(bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,trap),/OPT_IN_REQUIRED/);f.options.env.PAYMENT_STRIPE_BILLING_FIRST_PAYMENT='true';await assert.rejects(bootstrapModule.createOwnedBillingFirstRenewalBootstrap(f.options,trap),/OPT_IN_REQUIRED/);assert.equal(reads,0);
 });
+
+// Break: failed-renewal persistence inherits the global writer and stale verifier policy.
+function failedRenewalPersistenceFixture(){
+ const f=firstPaymentFixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FAILED_RENEWAL:'true'};f.options.selectedCase='initial_failed_renewal_grace_recovery';
+ const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);return {...r,stdout:r.stdout.replaceAll('FIRST_PAYMENT','FAILED_RENEWAL').replaceAll('OwnedBillingFirstPaymentRuntime','OwnedBillingFailedRenewalRuntime').replaceAll('/app/initial-runtime','/app/failed-renewal-runtime').replaceAll('Dockerfile.billing-first-payment','Dockerfile.billing-failed-renewal')};};return f;
+}
+async function failedRenewalPersistencePrepared(configure=()=>{}){
+ const f=failedRenewalPersistenceFixture();configure(f);f.adapter=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);f.limits=LIMIT();await f.adapter.prepare(f.limits);return f;
+}
+const writerPath=ROOT+'/test-results/stripe-sandbox/user-env.lock';
+const persistenceIntents=f=>JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents;
+const persistenceMutations=events=>events.filter(e=>e.type==='process'&&(stoppedCompose(e)||e.args[4]==='container'&&['start','stop','rm'].includes(e.args[5])));
+function assertPrivatePersistenceOnly(f,events){
+ assert.equal(events.some(e=>e.path===writerPath||e.from===USERFILE||e.to===USERFILE||e.type==='unlink'&&e.path===USERFILE||e.type==='write'&&e.path===USERFILE),false);
+ assert.equal(events.some(e=>e.path===DIR+'/stripe-user.env.tmp'),false);
+}
+for(const previous of ['',SECRET,'whsec_A99999999999999999999'])for(const quote of ['',"'",'"'])for(const ending of ['\n','\r\n',''])
+test('failed-renewal private snapshot accepts '+(previous===''?'empty':previous===SECRET?'equal':'different')+' verifier '+JSON.stringify(quote)+' '+JSON.stringify(ending),async()=>{
+ const f=await failedRenewalPersistencePrepared(),entry=f.files.get(USERFILE);
+ const bytes=Buffer.from('# retained input'+(ending||'\n')+'PAYMENT_STRIPE_SANDBOX_SECRET_KEY=sk_test_A00112233445566778899'+(ending||'\n')+'PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY="pk_test_B00112233445566778899"'+(ending||'\n')+'PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET='+quote+previous+quote+ending);
+ entry.contents=bytes;const inode=entry.ino;
+ // Deliberately opaque and unsafe: the new mode has no authority even to inspect this entry.
+ const oldWriter={contents:Buffer.from('opaque historical writer'),ino:99999,dev:2,mode:0o100777,uid:-1,nlink:2,symlink:true};f.files.set(writerPath,oldWriter);
+ const before=f.events.length;assert.equal(await f.adapter.persistWebhookSecret(SECRET),true);
+ assert.equal(f.files.get(USERFILE),entry);assert.equal(entry.ino,inode);assert.deepEqual(entry.contents,bytes);assert.equal(f.files.get(writerPath),oldWriter);
+ const final=f.files.get(DIR+'/final.env').contents.toString();assert.ok(final.includes('PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET='+SECRET+'\n'));
+ if(previous&&previous!==SECRET)assert.equal(final.includes(previous),false);
+ assertPrivatePersistenceOnly(f,f.events.slice(before));assert.equal(f.events.slice(before).filter(e=>e.type==='rename').every(e=>e.to===DIR+'/runtime.json'),true);
+ assert.equal(typeof f.adapter.persistenceDiagnostic,'function');assert.equal(f.adapter.persistenceDiagnostic(),null);assert.equal(f.adapter.resources().webhookReady,true);
+ assert.deepEqual(persistenceIntents(f).at(-1),{action:'PERSIST_WEBHOOK',name:'backend-key-persistence',status:'ACKNOWLEDGED'});
+});
+for(const mode of ['sandbox','payment','renewal'])test('legacy '+mode+' keeps unequal webhook refusal and has no persistence diagnostic',async()=>{
+ const f=mode==='sandbox'?fixture():mode==='payment'?firstPaymentFixture():firstRenewalFixture();
+ const create=mode==='sandbox'?bootstrapModule.createOwnedSandboxBootstrap:mode==='payment'?bootstrapModule.createOwnedBillingFirstPaymentBootstrap:bootstrapModule.createOwnedBillingFirstRenewalBootstrap;
+ const b=await create(f.options,f.dependencies);await b.prepare(LIMIT());f.files.get(USERFILE).contents=Buffer.from(USERBYTES.replace('WEBHOOK_SECRET=','WEBHOOK_SECRET=whsec_A99999999999999999999'));
+ await rejects(b.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(b.persistenceDiagnostic,undefined);assert.equal(f.files.has(DIR+'/final.env'),false);
+});
+for(const [name,bytes]of [
+ ['unknown',USERBYTES+'OTHER=value\n'],['duplicate',USERBYTES+'PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET=\n'],['live',USERBYTES.replace('sk_test_','sk_live_')],
+ ['placeholder',USERBYTES.replace('sk_test_A00112233445566778899','sk_test_example')],['old malformed',USERBYTES.replace('WEBHOOK_SECRET=','WEBHOOK_SECRET=arbitrary')],
+ ['NUL',USERBYTES+'\0'],['UTF8',Buffer.concat([Buffer.from(USERBYTES),Buffer.from([255])])],['quoted trailing',USERBYTES.replace('WEBHOOK_SECRET=','WEBHOOK_SECRET="" tail')],
+])test('failed-renewal private input refuses '+name+' without global writer access',async()=>{
+ const f=await failedRenewalPersistencePrepared(),entry=f.files.get(USERFILE);entry.contents=Buffer.from(bytes);const before=f.events.length;
+ await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_INPUT');assert.deepEqual(entry.contents,Buffer.from(bytes));assert.equal(f.files.has(DIR+'/final.env'),false);assertPrivatePersistenceOnly(f,f.events.slice(before));
+});
+for(const [name,change]of [ ['public',e=>{e.mode=0o100644;}],['foreign',e=>{e.uid=-1;}],['linked',e=>{e.nlink=2;}],['symlink',e=>{e.symlink=true;}],['oversize',e=>{e.contents=Buffer.alloc(65537,65);}] ])
+test('failed-renewal private input refuses '+name+' metadata',async()=>{
+ const f=await failedRenewalPersistencePrepared();change(f.files.get(USERFILE));const before=f.events.length;
+ await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_INPUT');assert.equal(f.files.has(DIR+'/final.env'),false);assertPrivatePersistenceOnly(f,f.events.slice(before));
+});
+// Break: a local refusal leaks dependency errors, resets its checkpoint or redispatches persistence.
+for(const checkpoint of ['ADMISSION','OWNERSHIP','INPUT','UNCHANGED','FINAL_STORE','ACK'])
+test('failed-renewal persistence checkpoint '+checkpoint+' is finite sticky and never readiness',async()=>{
+ let fired=false;
+ // Dependencies are captured at factory construction, so inject through retained function closures.
+ const g=await failedRenewalPersistencePrepared(h=>{
+  const inspect=h.dependencies.execute,open=h.dependencies.open,stat=h.dependencies.lstat;
+  h.dependencies.execute=async(...args)=>{if(checkpoint==='OWNERSHIP'&&h.rejectPersistence&&args[1][4]==='network'){fired=true;throw new Error('private path /canary whsec_private');}return inspect(...args);};
+  h.dependencies.lstat=async path=>{if(checkpoint==='UNCHANGED'&&h.rejectPersistence&&path===USERFILE&&h.inputOpened){fired=true;throw new Error('private path /canary whsec_private');}return stat(path);};
+  h.dependencies.open=async(...args)=>{const file=await open(...args),path=args[0];if(path===USERFILE)h.inputOpened=true;return {...file,
+   read:async(...readArgs)=>{if(checkpoint==='INPUT'&&h.rejectPersistence){fired=true;throw new Error('private input');}return file.read(...readArgs);},
+   sync:async()=>{if(checkpoint==='FINAL_STORE'&&h.rejectPersistence&&path===DIR+'/final.env'){fired=true;throw new Error('private store');}return file.sync();},
+   writeFile:async bytes=>{if(checkpoint==='ACK'&&h.rejectPersistence&&path.startsWith(DIR+'/runtime.json.tmp-')&&String(bytes).includes('"action":"PERSIST_WEBHOOK","name":"backend-key-persistence","status":"ACKNOWLEDGED"')){fired=true;throw new Error('private ack');}return file.writeFile(bytes);},
+  };};
+ });
+ g.rejectPersistence=true;const before=g.events.length;await rejects(g.adapter.persistWebhookSecret(checkpoint==='ADMISSION'?'invalid':SECRET),'PERSIST_PENDING');
+ assert.equal(g.adapter.persistenceDiagnostic(),'PERSIST_'+checkpoint);if(checkpoint!=='ADMISSION')assert.equal(fired,true);
+ assert.equal(g.adapter.resources().status,'PENDING');assert.equal(g.adapter.startupDiagnostic(),null);assert.equal(persistenceMutations(g.events.slice(before)).length,0);assertPrivatePersistenceOnly(g,g.events.slice(before));
+ const count=g.events.length;await rejects(g.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');await rejects(g.adapter.start(g.limits),'START_PENDING');assert.equal(g.events.length,count);assert.equal(g.adapter.persistenceDiagnostic(),'PERSIST_'+checkpoint);
+});
+for(const drift of ['bytes','identity'])test('failed-renewal snapshot rejects concurrent '+drift+' before final store',async()=>{
+ const f=await failedRenewalPersistencePrepared(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{const file=await open(...args);if(args[0]!==USERFILE)return file;let reads=0;return {...file,read:async(...readArgs)=>{const r=await file.read(...readArgs);if(++reads===1){const entry=h.files.get(USERFILE);if(drift==='bytes')entry.contents=Buffer.from(USERBYTES+'# concurrent\n');else h.files.set(USERFILE,{...entry,ino:entry.ino+1000});}return r;}};};});
+ const before=f.events.length;await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_UNCHANGED');assert.equal(f.files.has(DIR+'/final.env'),false);assertPrivatePersistenceOnly(f,f.events.slice(before));assert.equal(persistenceIntents(f).at(-1).status,'DISPATCHING');
+});
+for(const interruption of ['timeout','abort'])test('failed-renewal persistence '+interruption+' keeps original authority consumed',async()=>{
+ const external=new AbortController();let clock=1000;
+ const f=failedRenewalPersistenceFixture(),open=f.dependencies.open;f.dependencies.now=()=>clock;
+ f.dependencies.open=async(...args)=>{const file=await open(...args);return {...file,sync:async()=>{if(args[0]===DIR+'/final.env'){if(interruption==='timeout')clock=121000;else external.abort();}return file.sync();}};};
+ f.adapter=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);f.limits={deadline:121000,signal:external.signal};await f.adapter.prepare(f.limits);const before=f.events.length;
+ await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_FINAL_STORE');assert.equal(persistenceIntents(f).at(-1).status,'DISPATCHING');assertPrivatePersistenceOnly(f,f.events.slice(before));
+ const count=f.events.length;await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');await rejects(f.adapter.start(f.limits),'START_PENDING');assert.equal(f.events.length,count);
+});
+test('failed-renewal persistence wrapper admission retains its finite checkpoint before body IO',async()=>{
+ let clock=Date.now();const f=await failedRenewalPersistencePrepared(h=>{h.dependencies.now=()=>clock;});clock=f.limits.deadline;
+ const before=f.events.length;await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_ADMISSION');assert.equal(f.events.length,before);
+ await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_ADMISSION');assert.equal(f.events.length,before);
+});
+test('failed-renewal held input close refusal preserves actual ACK and pending authority',async()=>{
+ const f=await failedRenewalPersistencePrepared(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{const file=await open(...args);return args[0]!==USERFILE?file:{...file,close:async()=>{await file.close();throw new Error('private close canary');}};};});
+ const before=f.events.length;await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_ACK');assertPrivatePersistenceOnly(f,f.events.slice(before));
+ assert.equal(persistenceIntents(f).at(-1).status,'ACKNOWLEDGED');assert.equal(f.adapter.resources().status,'PENDING');
+ const count=f.events.length;await rejects(f.adapter.start(f.limits),'START_PENDING');await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.events.length,count);
+});
+test('failed-renewal ACK file sync refusal preserves durable dispatch and memory uncertainty',async()=>{
+ const f=await failedRenewalPersistencePrepared(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{const file=await open(...args);let ack=false;return {...file,writeFile:async bytes=>{ack=args[0].startsWith(DIR+'/runtime.json.tmp-')&&String(bytes).includes('"action":"PERSIST_WEBHOOK","name":"backend-key-persistence","status":"ACKNOWLEDGED"');return file.writeFile(bytes);},sync:async()=>{if(ack)throw new Error('private sync canary');return file.sync();}};};});
+ const before=f.events.length;await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_ACK');assert.equal(persistenceIntents(f).at(-1).status,'DISPATCHING');assert.equal(f.adapter.resources().status,'PENDING');assertPrivatePersistenceOnly(f,f.events.slice(before));
+ const count=f.events.length;await rejects(f.adapter.start(f.limits),'START_PENDING');await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.events.length,count);
+});
+async function failedRenewalPendingPersistence(){
+ const f=await failedRenewalPersistencePrepared(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{const file=await open(...args);return {...file,sync:async()=>{if(args[0]===DIR+'/final.env')throw new Error('private canary');return file.sync();}};};});
+ await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');return f;
+}
+test('failed-renewal exact pending persistence fresh proves seven stopped IDs without dispatch or acknowledgement',async()=>{
+ const f=await failedRenewalPendingPersistence(),original=persistenceIntents(f),recorded=f.adapter.resources().containers,before=f.events.length;
+ assert.equal(Object.keys(recorded).length,7);assert.deepEqual(original.at(-1),{action:'PERSIST_WEBHOOK',name:'backend-key-persistence',status:'DISPATCHING'});
+ assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);assert.deepEqual(persistenceIntents(f),original);assert.equal(f.adapter.resources().status,'PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_FINAL_STORE');
+ assert.equal(persistenceMutations(f.events.slice(before)).length,0);assertPrivatePersistenceOnly(f,f.events.slice(before));
+ assert.deepEqual(f.adapter.resources().containers,recorded);assert.ok(f.events.slice(before).some(e=>e.type==='close'&&e.path===DIR+'/owner.lock'));
+ for(const container of Object.values(recorded))assert.ok(f.events.slice(before).some(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='inspect'&&e.args.at(-1)===container.id));
+ const count=f.events.length;await rejects(f.adapter.start(f.limits),'START_PENDING');await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.events.length,count);
+});
+for(const [name,mutate]of [
+ ['missing',f=>f.containers.delete(f.adapter.resources().containers.backend.id)],['extra',f=>f.containers.set(id(999),{Id:id(999)})],
+ ['foreign',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Labels['payment.sandbox.run']='foreign';}],
+ ['replaced',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Id=id(999);}],
+ ['image drift',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Image=image(999);}],
+ ['network drift',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Networks[PROJECT+'-network'].NetworkID=id(999);}],
+ ['running',f=>{const c=f.containers.get(f.adapter.resources().containers.backend.id);c.State={...c.State,Running:true,Status:'running'};}],
+ ['started',f=>{f.containers.get(f.adapter.resources().containers.backend.id).State.StartedAt='2026-11-15T00:00:00Z';}],
+ ['exited service',f=>{f.containers.get(f.adapter.resources().containers.backend.id).State.Status='exited';}],
+ ['running helper',f=>{const c=f.containers.get(f.adapter.resources().containers['issuer-probe'].id);c.State={...c.State,Running:true,Status:'running'};}],
+ ['helper exit failure',f=>{f.containers.get(f.adapter.resources().containers['issuer-probe'].id).State.ExitCode=1;}],
+])test('failed-renewal pending persistence refuses '+name+' before any start stop removal',async()=>{
+ const f=await failedRenewalPendingPersistence(),original=persistenceIntents(f),recorded=f.adapter.resources().containers;mutate(f);const before=f.events.length;
+ await rejects(f.adapter.stop({deadline:f.limits.deadline+120000}),'STOP_PENDING');assert.equal(persistenceMutations(f.events.slice(before)).length,0);assertPrivatePersistenceOnly(f,f.events.slice(before));assert.deepEqual(persistenceIntents(f),original);assert.deepEqual(f.adapter.resources().containers,recorded);assert.equal(f.events.slice(before).some(e=>e.type==='close'&&e.path===DIR+'/owner.lock'),false);
+});
+test('failed-renewal pending persistence cannot renew cleanup budget',async()=>{
+ const f=await failedRenewalPendingPersistence(),before=f.events.length;await rejects(f.adapter.stop({deadline:f.limits.deadline+120001}),'STOP_PENDING');assert.equal(f.events.length,before);assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_FINAL_STORE');
+});
+for(const action of ['CREATE_STOPPED','CREATE_FINAL_BACKEND'])test('failed-renewal uncertain '+action+' cannot gain stopped-proof authority',async()=>{
+ const f=failedRenewalPersistenceFixture(),execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{if(stoppedCompose({type:'process',args:args[1]})&&args[1].includes(DIR+(action==='CREATE_STOPPED'?'/app.env':'/final.env'))){await execute(...args);throw null;}return execute(...args);};
+ const b=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies),limits=LIMIT();if(action==='CREATE_STOPPED')await rejects(b.prepare(limits),'PREPARE_PENDING');else{await b.prepare(limits);await b.persistWebhookSecret(SECRET);await rejects(b.start(limits),'START_PENDING');}
+ const original=persistenceIntents(f),before=f.events.length;assert.equal(original.at(-1).action,action);await rejects(b.stop({deadline:limits.deadline+120000}),'STOP_PENDING');assert.equal(persistenceMutations(f.events.slice(before)).length,0);assert.deepEqual(persistenceIntents(f),original);
+});
