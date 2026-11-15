@@ -17,6 +17,8 @@ const gates = {
     "echo 'first_payment_runtime_packaging_verified_without_launch'",
     'sh backend/export-billing-first-renewal-runtime.sh backend/target/test-classes',
     "echo 'first_renewal_runtime_packaging_verified_without_launch'",
+    'sh backend/export-billing-failed-renewal-runtime.sh "$PWD/backend/target/test-classes" "$packaging_root/runtime"',
+    "echo 'failed_renewal_runtime_packaging_verified_without_launch'",
   ],
   'backend-owned-failed-renewal': [
     'node infrastructure/init-local-customer-issuer.mjs',
@@ -42,6 +44,19 @@ const gates = {
     'node --test --test-timeout=30000 --test-concurrency=1 infrastructure/*.test.mjs',
   ],
 };
+
+test('failed renewal packaging checks isolation and dependency closure without launching the runtime', async () => {
+  const block = jobs(await readWorkflow()).backend.split('      - name: ').find(step =>
+    step.includes("echo 'failed_renewal_runtime_packaging_verified_without_launch'"));
+  assert.ok(block);
+  for (const required of ['set -euo pipefail', gates.backend.at(-2), 'jar tf "$backend_jar"',
+    'OwnedBillingFailedRenewal', 'OwnedFailedGraceBillingTime', 'OwnedGraceSubscriptionRows',
+    'jar xf "$backend_jar" BOOT-INF/lib', 'jdeps --multi-release 25', '-verbose:class -filter:none',
+    '--class-path "backend/target/classes:$packaging_root/BOOT-INF/lib/*"', 'not found',
+    'org\\.junit', 'org\\.mockito', 'org\\.testcontainers', 'org\\.springframework\\.test',
+    'org\\.springframework\\.boot\\.test', 'exit 1']) assert.ok(block.includes(required), required);
+  assert.doesNotMatch(block, /(?:^|\s)(?:java|docker|mvnw|node)\s|--class-path[^\n]*test-classes/m);
+});
 
 test('CI admits untrusted PRs with read-only credentials and bounded cancellable jobs', async () => {
   const text = await readWorkflow();

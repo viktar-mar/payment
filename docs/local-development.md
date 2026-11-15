@@ -1,5 +1,9 @@
 # Local development through Stage 4
 
+## Fresh failed-renewal operator checkpoint — 2026-11-15
+
+The separate `PAYMENT_STRIPE_BILLING_FAILED_RENEWAL` manual case is **OFFLINE_PREPARED**. Native execution is **NOT_RUN** and full Stage 5B is **NOT_ACCEPTED**. A future authorized run requires the exact passing source, fresh run UUID, a fresh Sandbox subscription and its original customer session throughout. The operator confirms the initial EUR20 payment and later confirms one replacement method on the same Chrome page. The owner verifies the original EUR20 renewal debt and its recovery, with a EUR40 cash ceiling. The procedure includes fixed settings, stage budgets, first-failure stop, private evidence and scoped cleanup. [Future operator procedure](testing/billing-failed-renewal-recovery.md#future-operator-procedure)
+
 ## Stage 5A offline regression and explicit Sandbox acceptance
 
 The default Maven suite includes `@stripe-sandbox` Cucumber scenarios using real PostgreSQL,

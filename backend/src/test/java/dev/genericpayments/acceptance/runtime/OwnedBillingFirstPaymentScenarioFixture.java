@@ -34,6 +34,7 @@ abstract class OwnedBillingFirstPaymentScenarioFixture extends StripeBillingCloc
     @Autowired CallbackPayloadPort payload;
     protected OwnedBillingFirstPaymentRuntime.Operations scenario;
     protected JsonObject prepared,prepareRequest;
+    protected final List<String> delivered=new ArrayList<>();
     protected final List<StripeRequest> requests=new ArrayList<>();
     protected String outcome="succeeded";
     protected boolean driftAfterConfirm,staleDuringRead,consumeDuringRead;
@@ -49,7 +50,7 @@ abstract class OwnedBillingFirstPaymentScenarioFixture extends StripeBillingCloc
         jdbc.update("insert into provider_price_mappings(payment_account_id,price_id,provider_price_id,created_at) values (?,?,'price_first',now())",billing.id().value(),firstPrice);
         createCommand=new dev.genericpayments.platform.subscriptions.application.port.in.CreateSubscriptionUseCase.Command(createCommand.context(),new dev.genericpayments.platform.catalog.domain.PriceId(firstPrice),true);
         callbacks.configure(site.value(),"https://example.com/callback",true);
-        var session=sessions.issue(site,customer,"https://shop.test");
+        var session=fixtureSession();
         var admission=new OwnedBillingFirstPaymentRuntime.Admission(run,"a".repeat(40),FROZEN,"q".repeat(43),8099,"127.0.0.1");
         inertClients=new StripeClientFactory(){@Override public StripeClient create(StripeCredentials ignored){return StripeClient.builder().setApiKey("sk_test_INERT").setApiBase("https://api.stripe.com").setMaxNetworkRetries(0).setHttpClient(new HttpClient(){@Override public StripeResponse request(StripeRequest request)throws StripeException{return respond(request);}}).build();}};
         scenario=createScenario(admission);
@@ -147,5 +148,46 @@ abstract class OwnedBillingFirstPaymentScenarioFixture extends StripeBillingCloc
             var key=index>=11?"owned":"original";
             assertThat(flags.get(key).getAsBoolean()).as("initial SQL mismatched binding[%s] proof.%s",index,key).isFalse();
         }
+    }
+
+    protected void deliverSigned(int expected) {
+        var claims=outbox.claimAutomatic("combined",10,OwnedBillingFirstPaymentRuntimeTest.callbackClaimUtc(Instant.now()),Duration.ofSeconds(30));assertThat(claims).hasSize(expected);
+        deliverSigned(claims);
+    }
+    protected void deliverSigned(List<OutboxPort.Claim> claims) {
+        for(var claim:claims)new CallbackDeliveryService(outbox,encryption,payload,(endpoint,headers,bytes)->{
+            assertThat(endpoint).as("combined signed callback receiver binding").isEqualTo("http://callback-receiver:8080/callback");
+            long timestamp=Long.parseLong(headers.get("Payment-Timestamp"));assertThat(Instant.ofEpochSecond(timestamp)).isBetween(began,Instant.now());
+            assertThat(headers.get("Payment-Signature")).isEqualTo("v1="+new CallbackSigner().sign(Base64.getUrlDecoder().decode(encryption.decrypt(claim.secret())),timestamp,bytes));
+            var json=JsonParser.parseString(new String(bytes,java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();assertThat(json.get("subscription_id").getAsString()).isEqualTo(prepared.get("subscription_id").getAsString());delivered.add(json.toString());return CallbackHttpPort.Result.success(204);
+        },Clock.systemUTC()).deliver(claim);
+    }
+
+    /** Catalog provider operations are real reservations/claims/ACKs; only SDK HTTP is inert. */
+    protected void publishCatalogOperations() {
+        var price=application.getBean(dev.genericpayments.platform.catalog.application.port.out.LoadPricePort.class).findById(createCommand.priceId()).orElseThrow();
+        var product=application.getBean(dev.genericpayments.platform.catalog.application.port.out.LoadProductPort.class).findById(price.productId()).orElseThrow();
+        var mappings=application.getBean(dev.genericpayments.platform.catalog.application.port.out.ProviderCatalogMappingPort.class);
+        var catalogRequests=new ArrayList<String>();
+        var catalogClients=new dev.genericpayments.platform.provider.adapter.out.stripe.StripeClientFactory(){
+            @Override public com.stripe.StripeClient create(dev.genericpayments.platform.provider.adapter.out.stripe.StripeCredentials ignored) {
+                return com.stripe.StripeClient.builder().setApiKey("sk_test_INERT").setMaxNetworkRetries(0).setHttpClient(new HttpClient(){
+                    @Override public StripeResponse request(StripeRequest request) {
+                        assertThat(org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
+                        assertThat(request.method().name()).isEqualTo("POST");var path=request.url().getPath();assertThat(path).isIn("/v1/products","/v1/prices");catalogRequests.add(path);
+                        var key=path.equals("/v1/products")?"catalog_product_"+billing.id().value()+"_"+product.id().value():"catalog_price_"+billing.id().value()+"_"+price.id().value()+"_v1";
+                        assertThat(request.headers().map().get("Idempotency-Key")).containsExactly(key);
+                        assertThat(jdbc.queryForObject("select status from provider_operations where payment_account_id=? and operation_key=?",String.class,billing.id().value(),key)).isEqualTo("DISPATCHING");
+                        var json=new JsonObject();json.addProperty("id",path.equals("/v1/products")?"prod_owned":"price_first");json.addProperty("object",path.equals("/v1/products")?"product":"price");json.addProperty("livemode",false);
+                        return new StripeResponse(200,HttpHeaders.of(Map.of()),json.toString());
+                    }
+                }).build();
+            }
+        };
+        var adapter=new dev.genericpayments.platform.provider.adapter.out.stripe.StripeCatalogProviderAdapter(credentials,catalogClients,operations,mappings,digest,verification);
+        assertThat(adapter.ensureProduct(billing,product)).isEqualTo(mappings.findProduct(billing.id(),product.id()).orElseThrow());
+        assertThat(adapter.createPrice(billing,product,price)).isEqualTo(mappings.findPrice(billing.id(),price.id()).orElseThrow());
+        assertThat(catalogRequests).containsExactly("/v1/products","/v1/prices");
+        assertThat(jdbc.queryForList("select status from provider_operations where kind in ('PRODUCT_CREATE','PRICE_CREATE')",String.class)).containsExactlyInAnyOrder("ACKNOWLEDGED","ACKNOWLEDGED");
     }
 }

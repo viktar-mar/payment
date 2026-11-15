@@ -44,15 +44,20 @@ public abstract class StripeBillingClockCustomerFixture extends ProviderTestFixt
     @Autowired protected DigestPort digest;
     @Autowired protected StripeBillingInertSdkFixture.Transport http;
     @Autowired protected Verification verification;
-    protected final CustomerId customer = new CustomerId(UUID.randomUUID());
+    protected CustomerId customer = new CustomerId(UUID.randomUUID());
     protected PaymentAccount billing;
 
     @BeforeEach void prepareClockCustomer() {
         http.calls.clear(); http.replies.clear(); http.afterResponse = null; verification.accounts.clear();
         jdbc.update("update payment_accounts set provider='STRIPE',external_account_id='acct_clock',credentials_ref='stripe-sandbox-default' where id=?", account.id().value());
         billing = accounts.findById(account.id()).orElseThrow();
+        customer=createFixtureCustomer();
+    }
+    protected CustomerId createFixtureCustomer() {
+        var id = customer;
         jdbc.update("insert into customers(id,site_id,status,email_ciphertext,email_nonce,email_key_version,email_digest,email_digest_key_version,created_at,updated_at) values (?,?,'ACTIVE',decode(repeat('00',16),'hex'),decode(repeat('00',12),'hex'),'test-only',?,'v1',now(),now())",
-            customer.value(), site.value(), "digest-" + customer.value());
+            id.value(), site.value(), "digest-" + id.value());
+        return id;
     }
     protected ClockOwner admit() {
         return clocks.admitFresh(billing, site, customer, UUID.randomUUID(), StripeBillingTestClockAdapter.API_VERSION, FROZEN, Instant.now());

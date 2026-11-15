@@ -44,12 +44,20 @@ public abstract class StripeBillingClockSubscriptionCompositionFixture extends S
     protected Instant began;
     protected int sdkCallbacks;
 
+    protected dev.genericpayments.platform.customers.application.model.CustomerSessionCreation fixtureSession() {
+        return sessions.issue(site,customer,"https://shop.test");
+    }
+
+    protected void prepareFixturePolicy() {
+        policies.save(new SubscriptionPolicy(site,0,true,3,false,false,false,Set.of()),0);
+    }
+
     @BeforeEach void prepareSubscriptionComposition() {
         began = Instant.now().minusSeconds(1);
         TestClock.set(Instant.now());
         billingTime.lastSample=null; billingTime.sampledTransaction=null; billingTime.sampledConnectionHolder=null;
-        policies.save(new SubscriptionPolicy(site,0,true,3,false,false,false,Set.of()),0);
-        var session = sessions.issue(site,customer,"https://shop.test");
+        prepareFixturePolicy();
+        var session = fixtureSession();
         var actor = new SubscriptionActor.Customer(sessions.resolveRequired(session.rawToken(),"https://shop.test"));
         UUID product=UUID.randomUUID(), price=UUID.randomUUID();
         jdbc.update("insert into products(id,site_id,product_key,name,status,created_at,updated_at) values (?,?,'owned-plan','Owned plan','ACTIVE',now(),now())",product,site.value());

@@ -19,7 +19,6 @@ import static org.assertj.core.api.Assertions.*;
 @Import(StripeBillingFirstRenewalCompositionFixture.RenewalTimeConfiguration.class)
 class OwnedBillingFirstRenewalScenarioIntegrationTest extends OwnedBillingFirstPaymentScenarioFixture {
     private final Deque<String> renewalReplies=new ArrayDeque<>();
-    private final List<String> delivered=new ArrayList<>();
     private long end,next;
     private String failure;
     private boolean sampledBeforeReady;
@@ -58,7 +57,7 @@ class OwnedBillingFirstRenewalScenarioIntegrationTest extends OwnedBillingFirstP
         prepare();noMoney();scenario.confirm(confirmRequest());noMoney();paidGraph();
         var settled=observe();assertThat(settled.get("phase").getAsString()).isEqualTo("SETTLED_LOCAL");
         end=Instant.parse(settled.get("paid_through").getAsString()).getEpochSecond();next=end+31*86400;
-        deliver();verifyOwnedInitialSql();assertThat(count("payments")).isEqualTo(1);assertThat(posts()).isEqualTo(4);
+        deliverSigned(2);verifyOwnedInitialSql();assertThat(count("payments")).isEqualTo(1);assertThat(posts()).isEqualTo(4);
     }
     private String clock(long frozen,String status){var c=JsonParser.parseString(clockJson(owner)).getAsJsonObject();c.addProperty("frozen_time",frozen);c.addProperty("status",status);return c.toString();}
     private void advanceReplies(boolean finalization){long before=finalization?end:FROZEN,target=finalization?end+3600:end;renewalReplies.add(clock(before,"ready"));renewalReplies.add(clock(before,"advancing"));renewalReplies.add(clock(target,"ready"));}
@@ -82,15 +81,6 @@ class OwnedBillingFirstRenewalScenarioIntegrationTest extends OwnedBillingFirstP
         refreshObservationClock();var x=new OwnedBillingFirstPaymentRuntimeTest.MemoryExchange("POST",path,"{}",true);
         new OwnedBillingFirstRenewalRuntime.Handler(combined(),"q".repeat(43)).handle(x);assertThat(x.code).as(x.output.toString()).isEqualTo(200);return JsonParser.parseString(x.output.toString()).getAsJsonObject();
     }
-    private void deliver() {
-        var claims=outbox.claimAutomatic("combined",10,OwnedBillingFirstPaymentRuntimeTest.callbackClaimUtc(Instant.now()),Duration.ofSeconds(30));assertThat(claims).hasSize(2);
-        for(var claim:claims)new CallbackDeliveryService(outbox,encryption,payload,(endpoint,headers,bytes)->{
-            assertThat(endpoint).as("combined signed callback receiver binding").isEqualTo("http://callback-receiver:8080/callback");
-            long timestamp=Long.parseLong(headers.get("Payment-Timestamp"));assertThat(Instant.ofEpochSecond(timestamp)).isBetween(began,Instant.now());
-            assertThat(headers.get("Payment-Signature")).isEqualTo("v1="+new CallbackSigner().sign(Base64.getUrlDecoder().decode(encryption.decrypt(claim.secret())),timestamp,bytes));
-            var json=JsonParser.parseString(new String(bytes,java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();assertThat(json.get("subscription_id").getAsString()).isEqualTo(prepared.get("subscription_id").getAsString());delivered.add(json.toString());return CallbackHttpPort.Result.success(204);
-        },Clock.systemUTC()).deliver(claim);
-    }
     @Test void genuineInitialAndExactlyOneRenewalPreserveOriginalLineageAndDeliverFourSignedCallbacks() throws Exception {
         publishCatalogOperations();initial();var original=jdbc.queryForList("select id,payload::text from outbox_events order by id");
         advanceReplies(false);graphReplies(false,false);var b=stage("/first-renewal/boundary");
@@ -108,7 +98,7 @@ class OwnedBillingFirstRenewalScenarioIntegrationTest extends OwnedBillingFirstP
         assertThat(jdbc.queryForList("select target from stripe_billing_first_renewal_steps order by ordinal",Long.class)).containsExactly(end,end+3600);
         assertThat(count("payment_events")).isEqualTo(2);assertThat(jdbc.queryForList("select event_type from subscription_events",String.class)).containsExactly("PERIOD_PAID","PERIOD_PAID");
         assertThat(requests.stream().filter(r->r.method().name().equals("POST")&&r.url().getPath().endsWith("/advance")).map(r->Long.parseLong(r.params().get("frozen_time").toString())).toList()).containsExactly(end,end+3600);
-        assertThat(posts()).isEqualTo(6);assertThat(renewalReplies).isEmpty();deliver();assertThat(delivered).hasSize(4);assertThat(new HashSet<>(delivered)).hasSize(4);verifyFinalSqlAndSignedUnion(b,done);assertThat(jdbc.queryForList("select status from outbox_events",String.class)).containsOnly("DELIVERED");
+        assertThat(posts()).isEqualTo(6);assertThat(renewalReplies).isEmpty();deliverSigned(2);assertThat(delivered).hasSize(4);assertThat(new HashSet<>(delivered)).hasSize(4);verifyFinalSqlAndSignedUnion(b,done);assertThat(jdbc.queryForList("select status from outbox_events",String.class)).containsOnly("DELIVERED");
         assertThatThrownBy(combined()::finalization).hasMessage("FIRST_RENEWAL_STOPPED");assertThatThrownBy(combined()::boundary).hasMessage("FIRST_RENEWAL_STOPPED");assertThat(posts()).isEqualTo(6);
     }
     @org.junit.jupiter.params.ParameterizedTest
@@ -212,32 +202,5 @@ class OwnedBillingFirstRenewalScenarioIntegrationTest extends OwnedBillingFirstP
             result.put(table,values);
         }
         return result;
-    }
-    /** Catalog provider operations are real reservations/claims/ACKs; only SDK HTTP is inert. */
-    private void publishCatalogOperations() {
-        var price=application.getBean(dev.genericpayments.platform.catalog.application.port.out.LoadPricePort.class).findById(createCommand.priceId()).orElseThrow();
-        var product=application.getBean(dev.genericpayments.platform.catalog.application.port.out.LoadProductPort.class).findById(price.productId()).orElseThrow();
-        var mappings=application.getBean(dev.genericpayments.platform.catalog.application.port.out.ProviderCatalogMappingPort.class);
-        var catalogRequests=new ArrayList<String>();
-        var catalogClients=new dev.genericpayments.platform.provider.adapter.out.stripe.StripeClientFactory(){
-            @Override public com.stripe.StripeClient create(dev.genericpayments.platform.provider.adapter.out.stripe.StripeCredentials ignored) {
-                return com.stripe.StripeClient.builder().setApiKey("sk_test_INERT").setMaxNetworkRetries(0).setHttpClient(new HttpClient(){
-                    @Override public StripeResponse request(StripeRequest request) {
-                        assertThat(org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
-                        assertThat(request.method().name()).isEqualTo("POST");var path=request.url().getPath();assertThat(path).isIn("/v1/products","/v1/prices");catalogRequests.add(path);
-                        var key=path.equals("/v1/products")?"catalog_product_"+billing.id().value()+"_"+product.id().value():"catalog_price_"+billing.id().value()+"_"+price.id().value()+"_v1";
-                        assertThat(request.headers().map().get("Idempotency-Key")).containsExactly(key);
-                        assertThat(jdbc.queryForObject("select status from provider_operations where payment_account_id=? and operation_key=?",String.class,billing.id().value(),key)).isEqualTo("DISPATCHING");
-                        var json=new JsonObject();json.addProperty("id",path.equals("/v1/products")?"prod_owned":"price_first");json.addProperty("object",path.equals("/v1/products")?"product":"price");json.addProperty("livemode",false);
-                        return new StripeResponse(200,HttpHeaders.of(Map.of()),json.toString());
-                    }
-                }).build();
-            }
-        };
-        var adapter=new dev.genericpayments.platform.provider.adapter.out.stripe.StripeCatalogProviderAdapter(credentials,catalogClients,operations,mappings,digest,verification);
-        assertThat(adapter.ensureProduct(billing,product)).isEqualTo(mappings.findProduct(billing.id(),product.id()).orElseThrow());
-        assertThat(adapter.createPrice(billing,product,price)).isEqualTo(mappings.findPrice(billing.id(),price.id()).orElseThrow());
-        assertThat(catalogRequests).containsExactly("/v1/products","/v1/prices");
-        assertThat(jdbc.queryForList("select status from provider_operations where kind in ('PRODUCT_CREATE','PRICE_CREATE')",String.class)).containsExactlyInAnyOrder("ACKNOWLEDGED","ACKNOWLEDGED");
     }
 }

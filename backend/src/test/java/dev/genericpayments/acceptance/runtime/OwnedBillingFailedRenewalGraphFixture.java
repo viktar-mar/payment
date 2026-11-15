@@ -18,7 +18,7 @@ abstract class OwnedBillingFailedRenewalGraphFixture extends StripeBillingFirstR
     @Autowired protected ApplicationContext application;
     protected long amount=2000;
     protected String currency="EUR",interval="MONTH",taxMode="INCLUSIVE";
-    protected JsonObject renewalInvoice,renewalLine,renewalAllocation,renewalPi,renewalCharge;
+    protected JsonObject renewalInvoice,renewalLine;
     protected OwnedBillingFailedRenewalComponents components;
     protected record ReadyPath(OwnedFirstRenewal.Admission upstream,OwnedFirstRenewal.Pending pending,OwnedFirstRenewal.LaterReady finalReady){}
 
@@ -80,8 +80,30 @@ abstract class OwnedBillingFailedRenewalGraphFixture extends StripeBillingFirstR
         assertThat(http.replies).isEmpty();assertThat(transaction.active()).isFalse();
         return new ReadyPath(upstream,pending,ready);
     }
+    private DebtWire debt;
     protected void makeRenewal(boolean failed){
-        long end=receipt.periodEnd(),next=end+(interval.equals("YEAR")?365:31)*86400L;
+        long end=receipt.periodEnd(), next=end+(interval.equals("YEAR")?365:31)*86400L;
+        debt=new DebtWire(graph,end,next,amount,failed);
+        renewalInvoice=debt.renewalInvoice;
+        renewalLine=debt.renewalLine;
+    }
+    protected void queueRenewal(long at,boolean failed){
+        debt.bodies(clock(at,"ready"),customerJson("clock_owned"),failed).forEach(http::reply);
+    }
+    protected Map<String,List<Map<String,Object>>> moneyRows(){
+        var rows=new LinkedHashMap<String,List<Map<String,Object>>>();
+        for(var table:List.of("payments","payment_events","subscription_billing_records","subscription_events","outbox_events","outbox_deliveries"))
+            rows.put(table,jdbc.queryForList("select row_to_json(e)::text as row from "+table+" e order by row_to_json(e)::text"));
+        return rows;
+    }
+}
+
+/** Only provider wire bodies. The caller's genuine producers own all receipts and facts. */
+final class DebtWire {
+    private final StripeBillingOwnedSubscriptionFixture graph;
+    final JsonObject renewalInvoice,renewalLine,renewalAllocation,renewalPi,renewalCharge;
+    DebtWire(StripeBillingOwnedSubscriptionFixture graph,long end,long next,long amount,boolean failed){
+        this.graph=graph;
         renewalInvoice=graph.invoice.deepCopy();renewalInvoice.addProperty("id","in_renewal");renewalInvoice.addProperty("billing_reason","subscription_cycle");
         renewalInvoice.addProperty("status",failed?"open":"draft");renewalInvoice.addProperty("amount_paid",0);renewalInvoice.addProperty("amount_remaining",amount);renewalInvoice.addProperty("amount_paid_off_stripe",0);
         renewalLine=graph.line.deepCopy();renewalLine.addProperty("id","il_renewal");renewalLine.addProperty("invoice","in_renewal");renewalLine.remove("subscription");renewalLine.remove("subscription_item");
@@ -97,18 +119,14 @@ abstract class OwnedBillingFailedRenewalGraphFixture extends StripeBillingFirstR
         renewalCharge.getAsJsonObject("payment_method_details").add("card",new JsonObject());
         renewalCharge.add("outcome",StripeBillingOwnedSubscriptionFixture.json("{\"type\":\"issuer_declined\",\"reason\":\"generic_decline\"}"));
     }
-    protected void queueRenewal(long at,boolean failed){
-        http.reply(clock(at,"ready"));http.reply(customerJson("clock_owned"));http.reply(graph.remote.toString());
-        http.reply(StripeBillingOwnedSubscriptionFixture.page(graph.invoice,renewalInvoice));http.reply(StripeBillingOwnedSubscriptionFixture.page(graph.line));
-        http.reply(StripeBillingOwnedSubscriptionFixture.page(graph.allocation));http.reply(graph.pi.toString());http.reply(graph.charge.toString());http.reply(StripeBillingOwnedSubscriptionFixture.page(graph.allocation));
-        http.reply(StripeBillingOwnedSubscriptionFixture.page(renewalLine));http.reply(failed?StripeBillingOwnedSubscriptionFixture.page(renewalAllocation):StripeBillingOwnedSubscriptionFixture.page());
-        if(failed){http.reply(renewalPi.toString());http.reply(renewalCharge.toString());http.reply(StripeBillingOwnedSubscriptionFixture.page(renewalAllocation));}
-        http.reply(clock(at,"ready"));
-    }
-    protected Map<String,List<Map<String,Object>>> moneyRows(){
-        var rows=new LinkedHashMap<String,List<Map<String,Object>>>();
-        for(var table:List.of("payments","payment_events","subscription_billing_records","subscription_events","outbox_events","outbox_deliveries"))
-            rows.put(table,jdbc.queryForList("select row_to_json(e)::text as row from "+table+" e order by row_to_json(e)::text"));
-        return rows;
+    List<String> bodies(String clock,String customer,boolean allocationPresent){
+        var replies = new ArrayList<String>();
+        replies.add(clock);replies.add(customer);replies.add(graph.remote.toString());
+        replies.add(StripeBillingOwnedSubscriptionFixture.page(graph.invoice,renewalInvoice));replies.add(StripeBillingOwnedSubscriptionFixture.page(graph.line));
+        replies.add(StripeBillingOwnedSubscriptionFixture.page(graph.allocation));replies.add(graph.pi.toString());replies.add(graph.charge.toString());replies.add(StripeBillingOwnedSubscriptionFixture.page(graph.allocation));
+        replies.add(StripeBillingOwnedSubscriptionFixture.page(renewalLine));replies.add(allocationPresent?StripeBillingOwnedSubscriptionFixture.page(renewalAllocation):StripeBillingOwnedSubscriptionFixture.page());
+        if(allocationPresent){replies.add(renewalPi.toString());replies.add(renewalCharge.toString());replies.add(StripeBillingOwnedSubscriptionFixture.page(renewalAllocation));}
+        replies.add(clock);
+        return replies;
     }
 }

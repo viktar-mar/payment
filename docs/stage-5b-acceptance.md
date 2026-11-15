@@ -1,5 +1,11 @@
 # Stripe Billing Stage 5B acceptance
 
+## Fresh failed renewal, grace and recovery — 2026-11-15
+
+**OFFLINE_PREPARED · native NOT_RUN · full Stage 5B NOT_ACCEPTED.** The fresh EUR20 initial payment, one failed renewal, saved G−1/G/G+1 reads and one same-debt EUR20 recovery have a dedicated source-bound owner, runtime and manual browser entry. The hosted composition checks five signed deliveries and actual read-only SQL on its genuine records. Its positive, rollback and queued-retry cases await exact-source hosted verification at this preparation checkpoint. The new runtime also requires the third no-launch packaging marker. [Preparation and hosted checkpoints](testing/billing-failed-renewal-recovery.md#fresh-eur20-failed-renewal-and-recovery--2026-11-15)
+
+The passing predecessor `b3ecc2dc00bf79a23877d84364dc67083fa526f0` includes the 493-case causal suite. Dedicated renewal CI passed 379 overlapping cases. The earlier accepted native initial/first-successful-renewal receipt continues to cover its own two payments. The new failed case has no native receipt. [Full predecessor CI](https://github.com/viktar-mar/payment/actions/runs/43673541949) · [Dedicated CI](https://github.com/viktar-mar/payment/actions/runs/43673541930)
+
 Status on 2026-11-06: **Stage 5B NOT_ACCEPTED**. The combined native initial EUR20 payment and first unchanged-terms EUR20 renewal are accepted at the exact source below. Billing backend, SDK Elements and constrained Portal paths have the separately scoped hosted and offline evidence recorded here. This checkpoint does not establish complete Stripe Billing interoperability or completion of Task 12. The accepted [design](superpowers/specs/2026-10-28-stripe-billing-5b-design.md) and [implementation plan](superpowers/plans/2026-10-28-stripe-billing-5b-implementation.md) remain the requirements, as amended for fresh PAYMENT by the [bounded server-confirm v2 spec](superpowers/specs/2026-10-29-billing-confirmation-retry-v2.md); their original checkboxes are planning history, not an execution report.
 
 [Stage 5A acceptance](stage-5a-acceptance.md) remains unchanged and does not supply Billing acceptance. The protected historical EUR13 and anonymous DISPATCHING records are excluded from 5B fixtures and retries. No runtime, provider request, credential operation or test-clock advance is authorized by this document.

@@ -82,9 +82,22 @@ class OwnedBillingFailedInclusiveProfileIntegrationTest extends OwnedBillingFail
     }
     @Test void exclusiveTermsRemainClosedAtTheRealOriginalOwnershipGuardBeforePositiveFinancialFacts(){
         profile(2000,"EUR","MONTH","EXCLUSIVE",3,null);
-        // EXCLUSIVE cannot reach an authentic original receipt, so this is explicitly NOT V34 behavior coverage.
-        assertThatThrownBy(this::beginConfirmation).isInstanceOf(RuntimeException.class);
-        for(var table:java.util.List.of("stripe_billing_owned_subscription_receipts","stripe_billing_first_renewals","stripe_billing_failed_renewals",
+        beginConfirmation();
+        assertThat(owned.requireReceipt(billing.id(),current().id())).isEqualTo(receipt);
+        int before = http.calls.size();
+        openGraph();
+        assertThatThrownBy(() -> action.nextAction(scope))
+            .isInstanceOfSatisfying(dev.genericpayments.platform.shared.application.PaymentApplicationException.class,
+                e -> assertThat(e.code()).isEqualTo("PROVIDER_EVIDENCE_MISMATCH"));
+        assertThat(action.selectionFailureStage()).isEqualTo("ACTION_GRAPH");
+        // The original clock bookend precedes the mapper's local EXCLUSIVE guard.
+        assertThat(http.calls.subList(before,http.calls.size())).singleElement().satisfies(request -> {
+            assertThat(request.method().name()).isEqualTo("GET");
+            assertThat(request.url().getPath()).isEqualTo("/v1/test_helpers/test_clocks/clock_owned");
+        });
+        assertThat(count("stripe_billing_owned_subscription_receipts")).isOne();
+        for(var table:java.util.List.of("subscription_action_capabilities","subscription_confirmation_chains",
+                "subscription_confirmation_attempts","stripe_billing_first_renewals","stripe_billing_failed_renewals",
                 "stripe_billing_failed_renewal_failures","subscription_billing_records","payments","payment_events","subscription_events","outbox_events","outbox_deliveries"))
             assertThat(count(table)).as("No positive fact from unsupported EXCLUSIVE: %s",table).isZero();
     }
