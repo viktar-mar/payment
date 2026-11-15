@@ -333,9 +333,8 @@ for(const [change,checkpoint] of [
   }finally{await h.restore();}
 });
 
-for(const change of ['async_prepare_identity','async_prepare_page_loss','async_ack_page_loss','async_readiness_failure'] as const)
-test('detached Start keeps precise failure checkpoint on '+change,async()=>{
-  const h=await fixture(change),expected=change==='async_readiness_failure'?'BROWSER_WAIT_READY':'BROWSER_PREPARE';
+async function assertDetachedStartFailure(change:string,h:Awaited<ReturnType<typeof fixture>>) {
+  const expected=change==='async_readiness_failure'?'BROWSER_WAIT_READY':'BROWSER_PREPARE';
   let first:unknown;
   // Attach the rejection observer before releasing either deterministic gate.
   const rejected=assert.rejects(h.journey.initial(h.initialPort,nowLimits()),(error:unknown)=>{first=error;return true;});
@@ -363,7 +362,23 @@ test('detached Start keeps precise failure checkpoint on '+change,async()=>{
     assert.equal(await h.journey.close(nowLimits()),true);
     assert.equal(browserDiagnostic(first),expected);assert.equal(browserCleanupConfirmed(first),true);
     assert.equal(h.closed(),1);
-  }finally{h.releasePreparation();await rejected;await h.restore();}
+  }finally{h.releasePreparation();await rejected.catch(()=>{});await h.restore();}
+}
+
+for(const change of ['async_prepare_identity','async_prepare_page_loss','async_ack_page_loss','async_readiness_failure'] as const)
+test('detached Start keeps precise failure checkpoint on '+change,async()=>{
+  await assertDetachedStartFailure(change,await fixture(change));
+});
+
+test('unexpected detached Start success restores the fixture while preserving the failed assertion',async()=>{
+  const names=['window','document','location','HTMLButtonElement','fetch'];
+  const before=new Map(names.map(name=>[name,Object.getOwnPropertyDescriptor(globalThis,name)]));
+  const h=await fixture('async_success');
+  try{
+    await assert.rejects(assertDetachedStartFailure('async_success',h),{code:'ERR_ASSERTION',operator:'rejects'});
+    for(const name of names)assert.deepEqual(Object.getOwnPropertyDescriptor(globalThis,name),before.get(name),name+' must be restored');
+    assert.equal(h.closed(),1);
+  }finally{await h.restore();}
 });
 
 test('detached Start completes preparation before the two attended phases proceed',async()=>{
