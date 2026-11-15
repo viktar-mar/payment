@@ -31,9 +31,9 @@ function protectReturnRequests(server: ViteDevServer | PreviewServer): void {
 }
 
 export default defineConfig(({mode}):UserConfig=>({
-  resolve: ['form-diagnostic','manual-payment','billing-first-payment'].includes(mode)?{alias:{'@generic-payments/sdk':fileURLToPath(new URL('../../frontend/sdk/src/index.ts',import.meta.url))}}:undefined,
+  resolve: ['form-diagnostic','manual-payment','billing-first-payment','billing-failed-renewal'].includes(mode)?{alias:{'@generic-payments/sdk':fileURLToPath(new URL('../../frontend/sdk/src/index.ts',import.meta.url))}}:undefined,
   plugins: [
-    ...(mode === 'billing-first-payment' ? [{
+    ...(['billing-first-payment','billing-failed-renewal'].includes(mode) ? [{
       name: 'owned-first-payment-health',
       generateBundle() {this.emitFile({type:'asset', fileName:'health', source:'ok\n'});},
     } satisfies import('vite').Plugin] : []),
@@ -42,7 +42,7 @@ export default defineConfig(({mode}):UserConfig=>({
     configureServer: protectReturnRequests,
     configurePreviewServer: protectReturnRequests,
   }],
-  build: { manifest:mode==='manual-payment',rollupOptions: { input: mode==='billing-first-payment'?{billingFirstPayment:'billing-first-payment.html'}:mode==='manual-payment'?{manualPayment:'manual-payment.html'}:mode==='form-diagnostic'?{formDiagnostic:'form-load-diagnostic.html',formManual:'form-load-manual.html'}:{main:'index.html',paymentReturn:'payment-return.html',subscriptionReturn:'subscription-return.html'} } },
+  build: { manifest:mode==='manual-payment',rollupOptions: { input: mode==='billing-failed-renewal'?{billingFailedRenewal:'billing-failed-renewal.html'}:mode==='billing-first-payment'?{billingFirstPayment:'billing-first-payment.html'}:mode==='manual-payment'?{manualPayment:'manual-payment.html'}:mode==='form-diagnostic'?{formDiagnostic:'form-load-diagnostic.html',formManual:'form-load-manual.html'}:{main:'index.html',paymentReturn:'payment-return.html',subscriptionReturn:'subscription-return.html'} } },
   server: {
     host: "127.0.0.1",
     port: 4173,
