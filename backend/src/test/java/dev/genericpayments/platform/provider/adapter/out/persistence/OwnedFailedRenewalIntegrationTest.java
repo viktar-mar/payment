@@ -5743,17 +5743,32 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     }
     @Test void methodReadForeignKeySurvivesDisabledPhaseGuard() {
         var s=setup();var failure=fail(s,service(store(),null));var r=reserveMethod(s,failure);
+        String fk="stripe_billing_failed_method_reads_reservation_id_fkey";
         assertThatThrownBy(()->transaction.requiresNew(()->{
-            // Isolate the FK negative from the stronger prestate trigger. Transaction rollback restores it.
+            // Both BEFORE guards inspect the reservation before the FK can reject its missing ID.
             jdbc.execute("alter table stripe_billing_failed_method_reads disable trigger failed_method_read_proof");
+            jdbc.execute("alter table stripe_billing_failed_method_reads disable trigger grace_read_origin");
             jdbc.update("""
                 insert into stripe_billing_failed_method_reads(id,reservation_id,phase,invocation,started_at,deadline_at,captured_revision,
                  observation_sequence,selected_operation,selected_version,operation_snapshot,setup_step_snapshot,method_step_snapshot,billing_at,billing_mode)
                 values(?,?,'METHOD',?,transaction_timestamp(),transaction_timestamp()+interval '30 seconds',?,?,?,0,'{}','{}','{}',?,'ISOLATED')
                 """,UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),failure.revision(),failure.observationSequence(),r.setupOperationId(),java.sql.Timestamp.from(time.selected));
-            return true;
-        })).hasStackTraceContaining("stripe_billing_failed_method_reads_reservation_id_fkey");
+            throw new AssertionError("Missing reservation passed its foreign key");
+        })).rootCause().isInstanceOfSatisfying(org.postgresql.util.PSQLException.class,error->{
+            assertThat(error.getSQLState()).isEqualTo("23503");
+            assertThat(error.getServerErrorMessage().getConstraint()).isEqualTo(fk);
+        });
         assertThat(count("stripe_billing_failed_method_reads")).isZero();
+        assertThat(jdbc.queryForList("""
+            select tgname::text from pg_trigger where tgrelid='stripe_billing_failed_method_reads'::regclass
+             and tgname in ('failed_method_read_proof','grace_read_origin') and tgenabled='O'
+            """,String.class)).containsExactlyInAnyOrder("failed_method_read_proof","grace_read_origin");
+        assertThat(jdbc.queryForObject("""
+            select exists(select 1 from pg_constraint c join pg_trigger t on t.tgconstraint=c.oid
+             where c.conname=? and c.contype='f' and c.convalidated and c.conrelid='stripe_billing_failed_method_reads'::regclass
+              and c.confrelid='stripe_billing_failed_method_reservations'::regclass and t.tgrelid=c.conrelid
+              and t.tgfoid='"RI_FKey_check_ins"'::regproc and t.tgenabled='O')
+            """,Boolean.class,fk)).isTrue();
     }
     @Test void methodExclusionRechecksCommittedReservationAfterWaitingForCommonAdmissionLock() throws Exception {
         var s=setup();var failure=fail(s,service(store(),null));
