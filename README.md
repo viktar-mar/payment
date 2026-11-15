@@ -52,7 +52,7 @@ The historical EUR13/local-state issue and an earlier anonymous DISPATCHING dona
 
 Earlier authorized Docker cleanup removed 39 stopped/created synthetic containers, 10 one-run images and 4 empty Fake networks. Controller metadata checks confirmed the seven original Stripe containers remained exited and all volumes and other Docker objects were preserved; generated configs/logs and test evidence remain. These observations were not reproduced during this documentation update.
 
-Stage 5B Stripe Billing/subscriptions and Customer Portal, then Stage 5C expanded reconciliation, payment methods and cloud readiness remain future work. See the [Stage 5 roadmap](docs/superpowers/specs/2026-10-14-stripe-sandbox-design.md#1-последовательность-этапа) and the [acceptance boundaries](docs/local-development.md#stage-5a-offline-regression-and-explicit-sandbox-acceptance).
+Stage 5B Stripe Billing/subscriptions and Customer Portal is in progress: the first EUR20 payment and first EUR20 renewal have their scoped accepted receipt; full 5B remains unaccepted. See the [current 5B matrix](docs/stage-5b-acceptance.md). Stage 5C expanded reconciliation, payment methods and cloud readiness follows 5B. The [Stage 5 roadmap](docs/superpowers/specs/2026-10-14-stripe-sandbox-design.md#1-последовательность-этапа) and [acceptance boundaries](docs/local-development.md#stage-5a-offline-regression-and-explicit-sandbox-acceptance) define the remaining scope.
 
 ## Checks and guides
 
