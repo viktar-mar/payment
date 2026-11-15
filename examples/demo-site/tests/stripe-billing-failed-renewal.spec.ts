@@ -1,5 +1,5 @@
 import {test} from '@playwright/test';
-import {createOwnedBillingFailedRenewal} from '../../../infrastructure/stripe-billing-first-payment.mjs';
+import {createOwnedBillingFailedRenewal,formatBillingFailedRenewalDiagnostic} from '../../../infrastructure/stripe-billing-first-payment.mjs';
 import {snapshotBillingFailedRenewalEnvironment} from '../../../infrastructure/stripe-billing-failed-renewal-options.mjs';
 import {runFailedRenewalBrowser} from './support/stripe-billing-failed-renewal';
 import {failedRenewalRunSettingsAllowed} from './support/stripe-billing-failed-renewal-settings';
@@ -19,11 +19,16 @@ test.beforeAll(async({},info)=>{
     selectedCase:'initial_failed_renewal_grace_recovery',
   });
 });
-test('OWNED_FAILED_RENEWAL_GRACE_RECOVERY',async({browser})=>{
+test('OWNED_FAILED_RENEWAL_GRACE_RECOVERY',async({browser},info)=>{
   const controller=new AbortController();
   try{
     const result=await owner.run(runFailedRenewalBrowser(browser,controller),{deadline:Date.now()+2700000,signal:controller.signal});
     if(result.scope!=='OWNED_FAILED_RENEWAL_GRACE_RECOVERY' || !result.initialAccepted || !result.failedRenewalAccepted ||
         !result.cleanupConfirmed || result.full5bAccepted!==false)throw Error('failed_renewal_NOT_ACCEPTED');
-  }finally{controller.abort();await owner.close();}
+  }finally{
+    controller.abort();
+    const terminal=await owner.close();
+    const diagnostic=formatBillingFailedRenewalDiagnostic(terminal);
+    if(diagnostic)info.annotations.push({type:'owned-failed-renewal-terminal',description:diagnostic});
+  }
 });

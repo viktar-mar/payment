@@ -1,5 +1,6 @@
 import type {Reporter,TestCase,TestResult,FullResult} from '@playwright/test/reporter';
 import {fileURLToPath} from 'node:url';
+import {parseBillingFailedRenewalDiagnosticLine} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 
 const targetFile=fileURLToPath(new URL('../stripe-billing-failed-renewal.spec.ts',import.meta.url));
 function isLoginHandoff(line:string):boolean {
@@ -11,13 +12,31 @@ function isLoginHandoff(line:string):boolean {
     /^[A-Z]{4}-[A-Z]{4}$/.test(line.slice(prefix.length,-suffix.length));
 }
 
-/** The process emits one bounded device-login handoff. All other output is opaque. */
+function terminalDiagnostic(result:TestResult):string|null {
+  // Only the post-close annotation in this invocation's result is a terminal channel.
+  // Do not inspect errors, attachments, stdout or the case's aggregate annotations.
+  try{
+    const annotations=Object.getOwnPropertyDescriptor(result,'annotations')?.value;
+    if(!Array.isArray(annotations))return null;
+    let diagnostic:string|null=null,count=0;
+    for(let index=0;index<annotations.length;index++){
+      const annotation=Object.getOwnPropertyDescriptor(annotations,String(index))?.value;
+      if(!annotation||Object.getOwnPropertyDescriptor(annotation,'type')?.value!=='owned-failed-renewal-terminal')continue;
+      count++;
+      diagnostic=parseBillingFailedRenewalDiagnosticLine(Object.getOwnPropertyDescriptor(annotation,'description')?.value);
+    }
+    return count===1?diagnostic:null;
+  }catch{return null;}
+}
+
+/** Only the bounded device handoff and trusted finite terminal annotation may leave. */
 export default class FailedRenewalReporter implements Reporter {
   private buffer='';
   private overflow=false;
   private handoff=false;
   private completed=0;
   private targetPassed=false;
+  private terminalEmitted=false;
   printsToStdio():boolean{return true;}
   onStdOut(chunk:string|Buffer):void {
     if(this.handoff)return;
@@ -39,9 +58,14 @@ export default class FailedRenewalReporter implements Reporter {
   onError():void{process.stdout.write('failed_renewal_setup_failed\n');}
   onTestEnd(test:TestCase,result:TestResult):void {
     this.completed++;
-    this.targetPassed=this.completed===1 && result.status==='passed' && result.retry===0 &&
+    const target=this.completed===1 && result.retry===0 &&
       test.expectedStatus==='passed' && test.title==='OWNED_FAILED_RENEWAL_GRACE_RECOVERY' &&
       test.location.file===targetFile && test.parent.project()?.name==='owned-failed-renewal-manual-chrome';
+    this.targetPassed=target && result.status==='passed';
+    if(target && !this.terminalEmitted && ['failed','timedOut','interrupted'].includes(result.status)){
+      const diagnostic=terminalDiagnostic(result);
+      if(diagnostic){this.terminalEmitted=true;process.stdout.write(diagnostic+'\n');}
+    }
     process.stdout.write(this.targetPassed?'owned_failed_renewal_passed\n':'owned_failed_renewal_not_accepted\n');
   }
   onEnd(result:FullResult):void {

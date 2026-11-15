@@ -51,6 +51,9 @@ export interface BillingFailedRenewalJourney {
 export interface BillingFailedRenewalResult extends Omit<BillingFirstPaymentResult,'scope'> {
  scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY';failedRenewalAccepted:boolean;
 }
+/** Closed failed-mode LISTENER checkpoint and independent cleanup witness; never acceptance. */
+export function formatBillingFailedRenewalDiagnostic(result:BillingFailedRenewalResult):string|null;
+export function parseBillingFailedRenewalDiagnosticLine(line:unknown):string|null;
 export function createOwnedBillingFailedRenewal(options:unknown,dependencies?:Record<string,unknown>):Promise<{
  resources():BillingFailedRenewalResult;
  run(journey:BillingFailedRenewalJourney,limits:BillingLimits):Promise<BillingFailedRenewalResult>;

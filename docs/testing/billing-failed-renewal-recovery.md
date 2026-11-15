@@ -8,6 +8,22 @@ The predecessor `b3ecc2dc00bf79a23877d84364dc67083fa526f0` passed all four hoste
 
 The private descriptor reports `recovery_acknowledged_at` in UTC at the microsecond precision persisted in the recovery confirmation row. The runtime retains the original nanosecond receipt. Only the independent recovered publication establishes payment.
 
+### Listener persistence failure and terminal reporting — 2026-11-15
+
+The historical attempt `17a34495-d4ae-4c89-b3a9-4d4505d6c8ae` at `a69815e` stopped before operational START, with its final `PERSIST_WEBHOOK` intent still `DISPATCHING`. All seven containers were previously observed nonrunning. Its persistence outcome remains **UNKNOWN**: the retained evidence does not establish the actual listener secret or the exact original refusal. The dedicated reporter did not publish owner terminal fields. This offline repair does not rewrite those receipts, acknowledge the old intent, release or adopt its historical shared writer, or rerun that attempt. Failed renewal, grace and recovered-cash acceptance remain unestablished; full Stage 5B remains **NOT_ACCEPTED**.
+
+For a separately authorized fresh failed-renewal run, the validated current listener webhook is scoped to that run's exclusive durable `final.env`. The existing private local three-assignment file must still pass bounded identity, grammar and unchanged-file checks; a stored webhook must be empty or well formed. Its value is not this fresh invocation's verifier. Failed-renewal persistence does not replace the shared user file or acquire, inspect or unlink its `user-env.lock`. Other acceptance modes retain their existing empty-or-equal rule and shared-writer policy. Successful durable private storage and its original acknowledgement are both required before START. A failed store or acknowledgement consumes persistence authority, keeps the pending fence and never authorizes a write retry.
+
+After the dedicated spec closes its actual owner, it may attach one trusted terminal annotation. The reporter accepts only that invocation's result for the exact dedicated case, file and project, with zero retry. It emits at most one canonical line, even after the login handoff; raw stdout, stderr, errors, attachments and case-level annotations cannot supply this diagnostic. A failure example is:
+
+```text
+owned_failed_renewal_diagnostic stage=LISTENER checkpoint=PERSIST_FINAL_STORE cleanup=UNCONFIRMED witness=LISTENER_STOP
+```
+
+`stage=LISTENER` identifies the owner stage; the original failure or cancellation code remains unchanged in the owner result. The fixed checkpoint is one of `PERSIST_ADMISSION`, `PERSIST_OWNERSHIP`, `PERSIST_INPUT`, `PERSIST_UNCHANGED`, `PERSIST_FINAL_STORE`, `PERSIST_ACK`, or `PERSIST_UNKNOWN` when no trusted checkpoint is available. A checkpoint describes where local persistence refused; it does not prove whether an uncertain write took effect. No path, identifier, credential, provider reply or raw exception is printed. Other failure stages do not use this narrowly scoped diagnostic.
+
+`cleanup=CONFIRMED witness=NONE` means the owner's required cleanup proofs all succeeded. `cleanup=UNCONFIRMED` identifies the first missing finite cleanup proof: `BROWSER_UNSETTLED`, `BROWSER_CLOSE`, `RUNTIME_CLOSE`, `LISTENER_STOP`, `START_SETTLEMENT`, `BOOTSTRAP_STOP` or `FIXTURE_CLOSE`. In particular the CLI can retain `LISTENER_STOP` uncertainty after rejected persistence even if bootstrap stop independently proves that this fresh run's seven pre-start containers are inactive. That stopped-resource proof neither clears pending persistence nor establishes rollback, shared-writer release or acceptance. Identity drift and unrelated pending actions still refuse bootstrap cleanup. Diagnostics and stopped proof grant no browser, provider, financial, replay or resume authority.
+
 ### Future operator procedure
 
 This procedure is available for a separately authorized, single native Sandbox attempt. Preparation and hosted CI grant no native execution authority.

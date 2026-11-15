@@ -24,6 +24,12 @@ const isTerminalDiagnostic=code=>isBillingFirstPaymentDiagnostic(code)||isBrowse
 function startupDiagnostic(bootstrap){
  try{const read=Object.getOwnPropertyDescriptor(bootstrap,'startupDiagnostic')?.value;if(typeof read!=='function')return null;const code=read.call(bootstrap);return typeof code==='string'&&startupCodes.has(code)?code:null;}catch{return null;}
 }
+const persistenceCodes=new Set(['PERSIST_ADMISSION','PERSIST_OWNERSHIP','PERSIST_INPUT','PERSIST_UNCHANGED','PERSIST_FINAL_STORE','PERSIST_ACK']);
+const isPersistenceDiagnostic=code=>typeof code==='string'&&(persistenceCodes.has(code)||code==='PERSIST_UNKNOWN');
+function persistenceDiagnostic(bootstrap){
+ try{const read=Object.getOwnPropertyDescriptor(bootstrap,'persistenceDiagnostic')?.value;if(typeof read==='function'){const code=read.call(bootstrap);if(typeof code==='string'&&persistenceCodes.has(code))return code;}}catch{}
+ return 'PERSIST_UNKNOWN';
+}
 /** Single owner: construction is inert, run is explicit, uncertainty consumes all authority. */
 export async function createOwnedBillingFirstPayment(options,dependencies={}){return createOwner(options,dependencies,'INITIAL');}
 export async function createOwnedBillingFirstRenewal(options,dependencies={}){return createOwner(options,dependencies,'FIRST_RENEWAL');}
@@ -58,7 +64,7 @@ async function createOwner(options,dependencies,purpose){
   if(failedRenewal&&state==='CLOSED')throw billingError('CLOSED');
   if(failure===null){
    if(detail==='PREPARE_REQUEST')detail=billingFirstPaymentPrepareCheckpoint(runtime)??detail;
-   diagnostic=isTerminalDiagnostic(detail)?detail:confirmAck?postConfirmCheckpoints[phase]??null:null;
+   diagnostic=failedRenewal&&phase==='LISTENER'&&(code==='LISTENER'||code==='ABORTED')&&isPersistenceDiagnostic(detail)?detail:isTerminalDiagnostic(detail)?detail:confirmAck?postConfirmCheckpoints[phase]??null:null;
   }
   failure??=code;lifetime.abort();throw billingError(failure);
  };
@@ -90,8 +96,8 @@ async function createOwner(options,dependencies,purpose){
      heldJourney=Object.freeze(j);
     }else if(typeof journey!=='function')fail('LIMITS');
     if(limits.deadline>Date.now()+2700000)fail('LIMITS');const abort=()=>lifetime.abort();limits.signal?.addEventListener('abort',abort,{once:true});remove=()=>limits.signal?.removeEventListener('abort',abort);timer=setTimeout(abort,Math.max(1,limits.deadline-Date.now()));active={deadline:limits.deadline,signal:lifetime.signal};
-    async function step(name,body,max=120000){if(failure)fail(failure);phase=name;try{return await billingBounded(active,body,max);}catch(error){fail(active.signal.aborted?'ABORTED':name,name==='START'?startupDiagnostic(bootstrap):preparePending?'PREPARE_REQUEST':name==='BROWSER'?browserDiagnostic(error):name==='RENEWAL_BOUNDARY'?billingFirstPaymentDiagnostic(error):null);}}
-    const requireTrue=async(name,body,max)=>{if(await step(name,body,max)!==true)fail(name,name==='START'?startupDiagnostic(bootstrap):null);};
+    async function step(name,body,max=120000){if(failure)fail(failure);phase=name;try{return await billingBounded(active,body,max);}catch(error){fail(active.signal.aborted?'ABORTED':name,failedRenewal&&name==='LISTENER'?persistenceDiagnostic(bootstrap):name==='START'?startupDiagnostic(bootstrap):preparePending?'PREPARE_REQUEST':name==='BROWSER'?browserDiagnostic(error):name==='RENEWAL_BOUNDARY'?billingFirstPaymentDiagnostic(error):null);}}
+    const requireTrue=async(name,body,max)=>{if(await step(name,body,max)!==true)fail(name,failedRenewal&&name==='LISTENER'?persistenceDiagnostic(bootstrap):name==='START'?startupDiagnostic(bootstrap):null);};
     const pf=await step('PREFLIGHT',async l=>(dependencies.preflight??(await import('./stripe-sandbox-owned.mjs'))[mode.preflight])(c,...(dependencies.preflight?[l]:[{},l])));if(pf!==true&&pf?.status!=='READY')fail('PREFLIGHT');
     bootstrap=await step('BOOTSTRAP',async()=>(dependencies.createBootstrap??(await import('./stripe-sandbox-bootstrap.mjs'))[mode.bootstrap])(c));
     await requireTrue('PREPARE',()=>bootstrap.prepare(active),2700000);
@@ -235,6 +241,23 @@ export function parseBillingFirstRenewalDiagnosticLine(line){
 // Independent terminal-only missing proof; never provider state or extra cleanup authority.
 const cleanupCodes=new Set(['BROWSER_UNSETTLED','BROWSER_CLOSE','RUNTIME_CLOSE','LISTENER_STOP','START_SETTLEMENT','BOOTSTRAP_STOP','FIXTURE_CLOSE']);
 const isCleanupDiagnostic=code=>typeof code==='string'&&cleanupCodes.has(code);
+/** Failed-mode LISTENER checkpoint only; no raw result/error/resource fields are serialized. */
+export function formatBillingFailedRenewalDiagnostic(result){
+ try{
+  if(!result||Object.getPrototypeOf(result)!==Object.prototype)return null;
+  const own=name=>Object.getOwnPropertyDescriptor(result,name)?.value;
+  if(own('scope')!=='OWNED_FAILED_RENEWAL_GRACE_RECOVERY'||own('status')!=='CLOSED'||own('phase')!=='LISTENER'||!['LISTENER','ABORTED'].includes(own('code'))||
+     own('initialAccepted')!==false||own('failedRenewalAccepted')!==false||own('full5bAccepted')!==false)return null;
+  const checkpoint=own('diagnostic'),confirmed=own('cleanupConfirmed'),witness=own('cleanupFailure');
+  if(!isPersistenceDiagnostic(checkpoint)||typeof confirmed!=='boolean'||(confirmed?witness!==null:!isCleanupDiagnostic(witness)))return null;
+  return 'owned_failed_renewal_diagnostic stage=LISTENER checkpoint='+checkpoint+' cleanup='+(confirmed?'CONFIRMED':'UNCONFIRMED')+' witness='+(confirmed?'NONE':witness);
+ }catch{return null;}
+}
+export function parseBillingFailedRenewalDiagnosticLine(line){
+ if(typeof line!=='string'||line.length>200)return null;
+ const match=/^owned_failed_renewal_diagnostic stage=LISTENER checkpoint=([A-Z_]+) cleanup=(CONFIRMED|UNCONFIRMED) witness=([A-Z_]+)$/.exec(line);
+ return match&&match[0]===line&&isPersistenceDiagnostic(match[1])&&(match[2]==='CONFIRMED'?match[3]==='NONE':isCleanupDiagnostic(match[3]))?line:null;
+}
 function formatCleanupDiagnostic(result,prefix){
  if(!result||result.status!=='CLOSED'||result.initialAccepted!==false||typeof result.code!=='string'||!result.code||result.cleanupConfirmed!==false||!isCleanupDiagnostic(result.cleanupFailure))return null;
  return prefix+' code='+result.cleanupFailure;

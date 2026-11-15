@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
+import type {TestCase,TestResult,FullResult} from '@playwright/test/reporter';
+// @ts-ignore Node's source-only offline test runner requires the explicit extension.
+import FailedRenewalReporter from './stripe-billing-failed-renewal-reporter.ts';
 
 // The two source modules have only type imports from Playwright and the SDK.
 // Memory fixtures exercise the held journey without importing either runtime.
@@ -15,6 +19,63 @@ const paySecret = 'bga1_' + 'I'.repeat(43);
 const capability = 'bca2_' + 'C'.repeat(43);
 const nowLimits = () => ({deadline:Date.now()+240000});
 const inertFetch = async ():Promise<never> => {throw Error('external transport forbidden');};
+const diagnostic='owned_failed_renewal_diagnostic stage=LISTENER checkpoint=PERSIST_FINAL_STORE cleanup=UNCONFIRMED witness=LISTENER_STOP';
+const terminalAnnotation={type:'owned-failed-renewal-terminal',description:diagnostic};
+const loginHandoff='Authorize the isolated Sandbox CLI at https://access.stripe.com/stripecli/oauth2/device using code ABCD-EFGH. Keep this terminal open.';
+function reporterCase(change:Record<string,unknown>={}):TestCase {
+ return {title:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',expectedStatus:'passed',location:{file:fileURLToPath(source('../stripe-billing-failed-renewal.spec.ts')),line:1,column:1},parent:{project:()=>({name:'owned-failed-renewal-manual-chrome'})},annotations:[],...change} as unknown as TestCase;
+}
+function reporterResult(change:Record<string,unknown>={}):TestResult {
+ return {status:'failed',retry:0,annotations:[terminalAnnotation],stdout:['raw stdout canary'],stderr:['raw stderr canary'],errors:[{message:'raw error canary'}],attachments:[{name:'canary',contentType:'text/plain',body:Buffer.from('raw attachment canary')}],...change} as unknown as TestResult;
+}
+async function captureReporter(body:(reporter:FailedRenewalReporter)=>void):Promise<string> {
+ const write=process.stdout.write;const chunks:string[]=[];
+ process.stdout.write=((chunk:unknown)=>{chunks.push(String(chunk));return true;}) as typeof write;
+ try{body(new FailedRenewalReporter());}finally{process.stdout.write=write;}
+ return chunks.join('');
+}
+test('actual reporter emits one trusted post-handoff terminal diagnostic and suppresses raw channels',async()=>{
+ const output=await captureReporter(r=>{
+  r.onStdOut(diagnostic+'\nraw before canary\n'+loginHandoff+'\n');
+  r.onStdOut(diagnostic+'\nraw after canary\n');r.onStdErr();r.onError();
+  r.onTestEnd(reporterCase({annotations:[{type:'foreign',description:'foreign annotation canary'}]}),reporterResult());
+  r.onTestEnd(reporterCase(),reporterResult());r.onEnd({status:'failed'} as FullResult);
+ });
+ assert.equal(output.split('\n').filter(v=>v===diagnostic).length,1);assert.ok(output.startsWith(loginHandoff+'\n'));
+ assert.doesNotMatch(output,/canary|attachment|raw error/);assert.match(output,/owned_failed_renewal_not_accepted/);assert.match(output,/full5b=NOT_ACCEPTED/);
+});
+for(const [name,caseChange,resultChange] of [
+ ['foreign title',{title:'other'},{}],['foreign file',{location:{file:'/foreign',line:1,column:1}},{}],
+ ['foreign project',{parent:{project:()=>({name:'other'})}},{}],['unexpected expected status',{expectedStatus:'failed'},{}],
+ ['retried',{}, {retry:1}],['passed',{}, {status:'passed'}],
+ ['case-only annotation',{annotations:[terminalAnnotation]},{annotations:[]}],
+ ['foreign annotation',{}, {annotations:[{...terminalAnnotation,type:'foreign'}]}],
+ ['malformed annotation',{}, {annotations:[{...terminalAnnotation,description:diagnostic+' canary'}]}],
+ ['duplicate annotation',{}, {annotations:[terminalAnnotation,terminalAnnotation]}],
+ ['nonstring annotation',{}, {annotations:[{...terminalAnnotation,description:{toString:()=>diagnostic}}]}],
+ ['contradictory cleanup',{}, {annotations:[{...terminalAnnotation,description:diagnostic.replace('UNCONFIRMED','CONFIRMED')}]}],
+ ['unknown checkpoint',{}, {annotations:[{...terminalAnnotation,description:diagnostic.replace('PERSIST_FINAL_STORE','PERSIST_CANARY')}]}],
+] as const)test('actual reporter suppresses '+name+' terminal annotation',async()=>{
+ const output=await captureReporter(r=>{r.onTestEnd(reporterCase(caseChange),reporterResult(resultChange));r.onEnd({status:'failed'} as FullResult);});
+ assert.doesNotMatch(output,/owned_failed_renewal_diagnostic|canary/);
+});
+test('actual reporter retains the exact single-case success predicate',async()=>{
+ for(const [testCase,result,full,accepted] of [
+  [reporterCase(),reporterResult({status:'passed',annotations:[]}),{status:'passed'},true],
+  [reporterCase(),reporterResult({status:'passed',retry:1,annotations:[]}),{status:'passed'},false],
+  [reporterCase(),reporterResult({status:'passed',annotations:[]}),{status:'failed'},false],
+ ] as const){
+  const output=await captureReporter(r=>{r.onTestEnd(testCase,result);r.onEnd(full as FullResult);});
+  assert.equal(output.includes('owned_failed_renewal_result_passed full5b=NOT_ACCEPTED'),accepted);
+ }
+ const output=await captureReporter(r=>{r.onTestEnd(reporterCase(),reporterResult({status:'passed'}));r.onTestEnd(reporterCase(),reporterResult({status:'passed'}));r.onEnd({status:'passed'} as FullResult);});
+ assert.match(output,/owned_failed_renewal_result_not_accepted full5b=NOT_ACCEPTED/);assert.doesNotMatch(output,/owned_failed_renewal_diagnostic/);
+});
+test('dedicated spec attaches trusted terminal only after finally closes the actual owner',async()=>{
+ const entry=await read('../stripe-billing-failed-renewal.spec.ts');
+ assert.match(entry,/async\(\{browser\},info\)=>/);
+ assert.match(entry,/finally\s*\{\s*controller\.abort\(\);\s*const terminal=await owner\.close\(\);\s*const diagnostic=formatBillingFailedRenewalDiagnostic\(terminal\);\s*if\(diagnostic\)info\.annotations\.push\(\{type:'owned-failed-renewal-terminal',description:diagnostic\}\);\s*\}/);
+});
 
 class Control {
   disabled = true; checked = false; hidden = false; value = ''; textContent = '';

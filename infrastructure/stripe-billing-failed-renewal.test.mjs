@@ -29,6 +29,55 @@ function harness(){
  return {journey,calls,vs,fixture,bootstrap,cli,runtime,dependencies};
 }
 const owner=h=>owners.createOwnedBillingFailedRenewal(opts(),h.dependencies);
+const persistCodes=['PERSIST_ADMISSION','PERSIST_OWNERSHIP','PERSIST_INPUT','PERSIST_UNCHANGED','PERSIST_FINAL_STORE','PERSIST_ACK'];
+const terminalLine=(checkpoint='PERSIST_FINAL_STORE',cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=LISTENER checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
+for(const checkpoint of persistCodes)for(const cleanup of ['confirmed','listener-refused','bootstrap-refused'])test('persistence terminal preserves LISTENER and '+checkpoint+' with '+cleanup,async()=>{
+ const h=harness();h.bootstrap.persistenceDiagnostic=()=>checkpoint;
+ h.cli.startListener=async()=>{h.calls.push('listener');throw Error('raw-secret-canary');};
+ if(cleanup==='listener-refused')h.cli.stopListener=async()=>{h.calls.push('listener-stop');throw Error('raw-cleanup-canary');};
+ if(cleanup==='bootstrap-refused')h.bootstrap.stop=async()=>{h.calls.push('stop');return false;};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,limits()),{message:'billing_LISTENER'});
+ const result=await o.close(),confirmed=cleanup==='confirmed',witness=confirmed?'NONE':cleanup==='listener-refused'?'LISTENER_STOP':'BOOTSTRAP_STOP';
+ assert.equal(result.code,'LISTENER');assert.equal(result.phase,'LISTENER');assert.equal(result.diagnostic,checkpoint);
+ assert.equal(result.cleanupConfirmed,confirmed);assert.equal(result.cleanupFailure,confirmed?null:witness);
+ assert.equal(result.failedRenewalAccepted,false);assert.equal(result.initialAccepted,false);assert.equal(result.full5bAccepted,false);
+ assert.deepEqual(h.calls,['preflight','prepare','login','binding','listener','browser-close','listener-stop','stop']);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),terminalLine(checkpoint,confirmed?'CONFIRMED':'UNCONFIRMED',witness));
+ await assert.rejects(o.run(h.journey,limits()));assert.equal(h.calls.filter(v=>v==='listener').length,1);
+});
+for(const kind of ['missing','getter','inherited','throw','object','foreign'])test('persistence terminal refuses hostile '+kind+' checkpoint without printing values',async()=>{
+ const h=harness();let reads=0;
+ if(kind==='getter')Object.defineProperty(h.bootstrap,'persistenceDiagnostic',{get(){reads++;throw Error('canary');}});
+ if(kind==='inherited')Object.setPrototypeOf(h.bootstrap,{persistenceDiagnostic(){reads++;return 'PERSIST_ACK';}});
+ if(kind==='throw')h.bootstrap.persistenceDiagnostic=()=>{throw Error('canary');};
+ if(kind==='object')h.bootstrap.persistenceDiagnostic=()=>({toString(){reads++;return 'canary';}});
+ if(kind==='foreign')h.bootstrap.persistenceDiagnostic=()=> 'PERSIST_ACK canary';
+ h.cli.startListener=async()=>{throw Error('canary');};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));const result=await o.close();
+ assert.equal(reads,0);assert.equal(result.diagnostic,'PERSIST_UNKNOWN');assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),terminalLine('PERSIST_UNKNOWN'));
+});
+for(const outcome of ['aborted','false'])test('persistence terminal preserves '+outcome+' LISTENER refusal and its checkpoint',async()=>{
+ const h=harness(),controller=new AbortController();h.bootstrap.persistenceDiagnostic=()=> 'PERSIST_ACK';
+ h.cli.startListener=async()=>{h.calls.push('listener');if(outcome==='aborted')controller.abort();return false;};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,{...limits(),signal:controller.signal}));const result=await o.close();
+ assert.equal(result.code,outcome==='aborted'?'ABORTED':'LISTENER');assert.equal(result.phase,'LISTENER');assert.equal(result.diagnostic,'PERSIST_ACK');
+ assert.equal(result.cleanupConfirmed,true);assert.equal(result.cleanupFailure,null);assert.equal(result.failedRenewalAccepted,false);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),terminalLine('PERSIST_ACK'));
+ assert.deepEqual(h.calls,['preflight','prepare','login','binding','listener','browser-close','listener-stop','stop']);
+});
+test('persistence formatter and parser accept only closed finite own data',()=>{
+ const valid={scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',status:'CLOSED',phase:'LISTENER',code:'LISTENER',diagnostic:'PERSIST_ACK',initialAccepted:false,failedRenewalAccepted:false,full5bAccepted:false,cleanupConfirmed:true,cleanupFailure:null};
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(valid),terminalLine('PERSIST_ACK'));
+ for(const change of [{status:'RUNNING'},{scope:'OWNED_INITIAL_PAYMENT'},{phase:'START'},{code:'START'},{diagnostic:'secret'},{initialAccepted:true},{failedRenewalAccepted:true},{full5bAccepted:true},{cleanupConfirmed:true,cleanupFailure:'LISTENER_STOP'},{cleanupConfirmed:false,cleanupFailure:null},{cleanupConfirmed:false,cleanupFailure:'canary'}])assert.equal(owners.formatBillingFailedRenewalDiagnostic({...valid,...change}),null);
+ let reads=0;const hostile={...valid};Object.defineProperty(hostile,'diagnostic',{get(){reads++;return 'PERSIST_ACK';}});
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(hostile),null);assert.equal(reads,0);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(Object.create(valid)),null);
+ for(const code of [...persistCodes,'PERSIST_UNKNOWN']){
+  const line=terminalLine(code);assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+  for(const bad of [line+'\n',line+' canary',' '+line,line.replace('LISTENER','START'),line.replace(code,'PERSIST_CANARY'),line.replace('witness=NONE','witness=LISTENER_STOP')])assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(bad),null);
+ }
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine({toString(){reads++;return terminalLine();}}),null);assert.equal(reads,0);
+});
 function useIndependentInitialProof(h){
  const callbacks=data().row.callbacks.slice(0,2);
  const row={callbacks,owner_run:id(1),clock_reference:'clock_original',frozen_time:F,
