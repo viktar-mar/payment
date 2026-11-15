@@ -437,6 +437,7 @@ public final class StripeBillingSnapshotMapper {
         Admission renewalAdmission;
         OwnedFailedRenewal.Failure debtFailure;
         boolean recoveredDebt;
+        boolean failedInclusiveHistory;
         ReadExecutor executor;
         TrialEvidence trialEvidence;
         Read(StripeClient client,Ownership owner,Instant at){this(client,owner,at,null);}
@@ -487,6 +488,7 @@ public final class StripeBillingSnapshotMapper {
         }
         RenewalResult firstRenewal(LaterReady ready,Boundary saved,RenewalLane lane) throws StripeException {
             var admission=renewalAdmission;var receipt=admission.receipt();var intent=receipt.intent();var clock=intent.clock();var scope=clock.owner();
+            failedInclusiveHistory=lane==RenewalLane.FAILED&&intent.terms().taxMode()==dev.genericpayments.platform.catalog.domain.TaxMode.INCLUSIVE;
             var a=owner.account();var s=owner.subscription();var b=owner.customer();
             require(ready!=null&&ready.admissionId().equals(admission.id())&&at!=null&&!at.isBefore(ready.observedAt()));
             long target=ready.ack().advance().step()==Step.BOUNDARY?receipt.periodEnd():Math.addExact(receipt.periodEnd(),3600);
@@ -756,6 +758,9 @@ public final class StripeBillingSnapshotMapper {
             boolean originalHistory=original!=null&&(renewalAdmission==null||renewalAdmission.invoice().equals(invoice.getId())&&"subscription_create".equals(invoice.getBillingReason()));
             boolean ownedRenewal=renewalAdmission!=null&&!originalHistory;
             if(recoveredDebt)require(StripeBillingMutationAdapter.noNonAmountAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
+            // Authenticate historical inclusive taxes before FAILED can publish the original debt.
+            // Reuse this unique fetched line; historical amount/balance tolerances remain below.
+            if(failedInclusiveHistory&&originalHistory)require(StripeBillingMutationAdapter.noNonAmountAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
             requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&(remote.getId().equals(line.getSubscription())||(originalHistory||ownedRenewal)&&line.getSubscription()==null)&&Objects.equals(line.getQuantity(),1L)
                 &&line.getParent()!=null&&"subscription_item_details".equals(line.getParent().getType())&&line.getParent().getSubscriptionItemDetails()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             var detail=line.getParent().getSubscriptionItemDetails();

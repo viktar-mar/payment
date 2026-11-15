@@ -14,13 +14,15 @@ import java.util.*;
 public final class StripeBillingOwnedSubscriptionFixture {
     public final StripeBillingInertSdkFixture f=new StripeBillingInertSdkFixture();
     public final Instant utc=Instant.parse("2026-10-29T12:00:00Z");
-    public final SubscriptionPriceTerms terms=new SubscriptionPriceTerms(new PriceId(new UUID(0,7)),"monthly",1,new ProductId(new UUID(0,8)),Money.of(1000,"EUR"),BillingInterval.MONTH,0,TrialPaymentMethodPolicy.OPTIONAL_DURING_TRIAL,TaxMode.NONE);
+    public final SubscriptionPriceTerms terms;
     public final UUID subscriptionId=new UUID(0,12),operationId=new UUID(0,13),bindingId=new UUID(0,10),customerStep=new UUID(0,11);
     public final OwnedClockSubscription intent;
     public Subscription local;
     public SubscriptionOperation operation;
     public final JsonObject customer,remote,invoice,line,allocation,pi,charge;
-    public StripeBillingOwnedSubscriptionFixture(){
+    public StripeBillingOwnedSubscriptionFixture(){this(TaxMode.NONE,1000);}
+    public StripeBillingOwnedSubscriptionFixture(TaxMode taxMode,long amount){
+        terms=new SubscriptionPriceTerms(new PriceId(new UUID(0,7)),"monthly",1,new ProductId(new UUID(0,8)),Money.of(amount,"EUR"),BillingInterval.MONTH,0,TrialPaymentMethodPolicy.OPTIONAL_DURING_TRIAL,taxMode);
         f.admit();f.ready=new ReadyClock(f.owner,new UUID(0,6),"clock_owned",1700000000,1800000000,1801000000,utc.minusSeconds(50),"b".repeat(64));
         String key="subscription:"+f.account.id().value()+":"+operationId+":CREATE";
         intent=new OwnedClockSubscription(new UUID(0,9),f.ready,bindingId,customerStep,"cus_owned",subscriptionId,operationId,key,"v1.paid."+"d".repeat(64),0,1,terms,"price_owned","prod_owned","c".repeat(64),utc);
@@ -62,6 +64,12 @@ public final class StripeBillingOwnedSubscriptionFixture {
           {"id":"ch_owned","object":"charge","livemode":false,"created":1500000001,"customer":"cus_owned","payment_intent":"pi_owned","currency":"eur","amount":1000,"amount_captured":1000,
            "paid":true,"captured":true,"status":"succeeded","payment_method_details":{"type":"card"},"amount_refunded":0,"refunded":false}
           """);
+        price().addProperty("unit_amount",amount);
+        for(var field:List.of("amount_due","amount_remaining","total","subtotal"))invoice.addProperty(field,amount);
+        line.addProperty("amount",amount);
+        for(var field:List.of("amount_paid","amount_requested"))allocation.addProperty(field,amount);
+        for(var field:List.of("amount","amount_received"))pi.addProperty(field,amount);
+        for(var field:List.of("amount","amount_captured"))charge.addProperty(field,amount);
     }
     /** Mutate only the duplicate flat representation; the authoritative nested graph is unchanged. */
     public void flatSubscription(String representation){
