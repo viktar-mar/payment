@@ -40,7 +40,7 @@ class OwnedFailedRenewalStoreTransactionTest {
     }
     static final class JpaBoundary {
         final java.util.concurrent.atomic.AtomicInteger queries=new java.util.concurrent.atomic.AtomicInteger();
-        boolean closedAfterCapture; Runnable afterFlush;
+        boolean closedAfterCapture,rollbackOnly; Runnable afterFlush;
         Exception isolationFailure;
         final String mode;final DataSource dataSource;final Connection physical,sessionConnection;final EntityManagerFactory factory;final EntityManager em;final JdbcTemplate jdbc;
         JpaBoundary(String mode) {
@@ -56,7 +56,12 @@ class OwnedFailedRenewalStoreTransactionTest {
             });
             sessionConnection=mode.equals("foreignConnection")?proxy(Connection.class,(method,args)->method.equals("getAutoCommit")?false:identity(method,args,"inert-other-physical")):physical;
             factory=proxy(EntityManagerFactory.class,(method,args)->identity(method,args,"inert-known-factory"));
-            var tx=proxy(EntityTransaction.class,(method,args)->method.equals("isActive")?!mode.equals("inactive"):identity(method,args,"inert-entity-transaction"));
+            var tx=proxy(EntityTransaction.class,(method,args)->switch(method){
+                case "isActive"->!mode.equals("inactive");
+                case "setRollbackOnly"->{rollbackOnly=true;yield null;}
+                case "getRollbackOnly"->rollbackOnly;
+                default->identity(method,args,"inert-entity-transaction");
+            });
             var session=proxy(Session.class,(method,args)->{if(method.equals("doReturningWork"))return ((ReturningWork<?>)args[0]).execute(sessionConnection);return identity(method,args,"inert-session");});
             em=proxy(EntityManager.class,(method,args)->switch(method){case "flush"->{if(afterFlush==null)throw new AssertionError("Unexpected inert flush");afterFlush.run();yield null;}case "isOpen"->!closedAfterCapture&&!mode.equals("closedEm");case "getTransaction"->tx;case "unwrap"->{assertThat(args[0]).isEqualTo(Session.class);yield session;}default->identity(method,args,"inert-entity-manager");});
             jdbc=new JdbcTemplate(dataSource){@Override public <T> List<T> query(String sql,RowMapper<T> mapper,Object... args){queries.incrementAndGet();throw new AssertionError("INERT_PROOF_BOUNDARY");}@Override public List<Map<String,Object>> queryForList(String sql,Object... args){queries.incrementAndGet();throw new AssertionError("INERT_PROOF_BOUNDARY");}};

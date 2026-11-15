@@ -2,6 +2,7 @@ package dev.genericpayments.platform.provider.adapter.out.persistence;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
+import jakarta.persistence.EntityTransaction;
 import java.sql.Connection;
 import javax.sql.DataSource;
 import org.hibernate.Session;
@@ -19,12 +20,14 @@ final class OwnedGraceCallerConnection {
     private final ConnectionHolder holder;
     private final EntityManagerHolder owner;
     private final EntityManager manager;
+    private final EntityTransaction transaction;
     private final Connection physical;
     private final String message;
 
     private OwnedGraceCallerConnection(JdbcTemplate jdbc,DataSource source,EntityManagerFactory factory,ConnectionHolder holder,
-            EntityManagerHolder owner,EntityManager manager,Connection physical,String message){
-        this.jdbc=jdbc;this.source=source;this.factory=factory;this.holder=holder;this.owner=owner;this.manager=manager;this.physical=physical;this.message=message;
+            EntityManagerHolder owner,EntityManager manager,EntityTransaction transaction,Connection physical,String message){
+        this.jdbc=jdbc;this.source=source;this.factory=factory;this.holder=holder;this.owner=owner;this.manager=manager;
+        this.transaction=transaction;this.physical=physical;this.message=message;
     }
     static void require(JdbcTemplate jdbc,EntityManagerFactory factory,String message){
         capture(jdbc,factory,message);
@@ -36,10 +39,12 @@ final class OwnedGraceCallerConnection {
                 ||!(TransactionSynchronizationManager.getResource(factory) instanceof EntityManagerHolder owner))throw new IllegalStateException(message);
         try{
             var manager=owner.getEntityManager();
-            if(!manager.isOpen()||!manager.getTransaction().isActive())throw new IllegalStateException(message);
+            if(!manager.isOpen())throw new IllegalStateException(message);
+            var transaction=manager.getTransaction();
+            if(!transaction.isActive())throw new IllegalStateException(message);
             var physical=DataSourceUtils.getTargetConnection(holder.getConnection());
             verifyPhysical(manager,physical,message);
-            return new OwnedGraceCallerConnection(jdbc,source,factory,holder,owner,manager,physical,message);
+            return new OwnedGraceCallerConnection(jdbc,source,factory,holder,owner,manager,transaction,physical,message);
         }catch(RuntimeException failure){throw new IllegalStateException(message);}
     }
     EntityManager requireSame(){
@@ -63,6 +68,18 @@ final class OwnedGraceCallerConnection {
     EntityManager requireReadCommitted(JdbcTemplate configuredJdbc,EntityManagerFactory configuredFactory){
         if(configuredJdbc!=jdbc||configuredFactory!=factory||configuredJdbc.getDataSource()!=source)throw new IllegalStateException(message);
         return requireReadCommitted();
+    }
+    void requireFactReceiptOrRollback(Runnable proof){
+        try{
+            requireReadCommitted();
+            proof.run();
+            requireReadCommitted();
+        }catch(RuntimeException|Error failure){
+            // The calling thread may now have different holders. Only the original
+            // managed transaction may roll back the fact that this caller authorized.
+            transaction.setRollbackOnly();
+            throw failure;
+        }
     }
     private static void verifyPhysical(EntityManager manager,Connection physical,String message){
         try{

@@ -5534,8 +5534,11 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(http.calls).hasSize(calls);assertThat(count("stripe_billing_failed_method_completions")).isZero();
         assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
     }
-    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"METHOD,false","METHOD,true","RECOVERED,false","RECOVERED,true"})
-    void taggedRealFactCannotCommitWithoutItsReceiptEvenWhenOuterCallerCatches(OwnedFailedRenewalMethod.Phase phase,boolean catchCallback) throws Exception{
+    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({
+        "METHOD,false,body","METHOD,true,body","RECOVERED,false,body","RECOVERED,true,body",
+        "METHOD,false,beforeCommit","METHOD,true,beforeCommit","RECOVERED,false,beforeCommit","RECOVERED,true,beforeCommit",
+        "METHOD,false,beforeCompletion","METHOD,true,beforeCompletion","RECOVERED,false,beforeCompletion","RECOVERED,true,beforeCompletion"})
+    void taggedRealFactCannotCommitWithoutItsReceiptEvenWhenOuterCallerCatches(OwnedFailedRenewalMethod.Phase phase,boolean throwsAfterEffect,String timing) throws Exception{
         var pending=pendingMethod(successorReservedMethod(),true);var r=pending.reservation();var owner=SuccessorOwner.create();
         var methods=new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory);var facts=methodFacts(methods);
         boolean recovered=phase==OwnedFailedRenewalMethod.Phase.RECOVERED;
@@ -5557,8 +5560,14 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var key=OwnedFailedRenewalMethod.factKey(claim);
         var cmd=new ApplySubscriptionSnapshotUseCase.Command(billing,operation.subscriptionId(),marked,SubscriptionEvent.Source.RECONCILIATION,key,key,claim.fence(),r.billingSample());
         var before=successorRows();var money=financialState();long sequence=observations.captureFence(current());int calls=http.calls.size();
-        var reachedCommit=new java.util.concurrent.atomic.AtomicBoolean();
-        assertThatThrownBy(()->transaction.required(()->{
+        var effectWitness=new java.util.concurrent.atomic.AtomicBoolean();var returnedToCaller=new java.util.concurrent.atomic.AtomicBoolean();
+        var rollbackOnly=new java.util.concurrent.atomic.AtomicBoolean();
+        var scopeFailure=new java.util.concurrent.atomic.AtomicReference<RuntimeException>();
+        var callbackFailure=new IllegalStateException("after actual fact without receipt");
+        var commitFailure=catchThrowable(()->transaction.required(()->{
+            var holder=(org.springframework.orm.jpa.EntityManagerHolder)
+                org.springframework.transaction.support.TransactionSynchronizationManager.getResource(entityManagerFactory);
+            var originalTransaction=holder.getEntityManager().getTransaction();
             java.util.function.Supplier<Void> effect=()->{
                 TestClock.set(Instant.now());
                 facts.apply(cmd);
@@ -5571,15 +5580,33 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                     assertThat(count("subscription_events")).isEqualTo(before.get("subscription_events").size()+1);
                     assertThat(count("outbox_events")).isEqualTo(before.get("outbox_events").size()+2);
                 }
-                if(catchCallback)throw new IllegalStateException("after actual fact without receipt");
+                effectWitness.set(true);
+                if(throwsAfterEffect)throw callbackFailure;
                 return null;
             };
-            if(catchCallback)
-                assertThatThrownBy(()->methods.withSuccessorFactInTransaction(r,claim,owner,effect)).hasMessage("after actual fact without receipt");
-            else methods.withSuccessorFactInTransaction(r,claim,owner,effect);
-            reachedCommit.set(true);return null;
-        })).hasMessage("Owned method transition authority unavailable");
-        assertThat(reachedCommit).isTrue();assertThat(successorRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(money);
+            Runnable attempt=()->{
+                try{methods.withSuccessorFactInTransaction(r,claim,owner,effect);}
+                catch(RuntimeException caught){scopeFailure.set(caught);}
+                rollbackOnly.set(originalTransaction.getRollbackOnly());
+                returnedToCaller.set(true);
+            };
+            if(timing.equals("body"))attempt.run();
+            else org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
+                new org.springframework.transaction.support.TransactionSynchronization(){
+                    @Override public void beforeCommit(boolean readOnly){if(timing.equals("beforeCommit"))attempt.run();}
+                    @Override public void beforeCompletion(){if(timing.equals("beforeCompletion"))attempt.run();}
+                });
+            return null;
+        }));
+        if(commitFailure!=null)assertThat(commitFailure).isInstanceOf(RuntimeException.class);
+        // These witnesses must survive even when Spring logs an exception from beforeCompletion and continues.
+        assertThat(effectWitness).isTrue();assertThat(returnedToCaller).isTrue();
+        if(throwsAfterEffect){
+            assertThat(scopeFailure.get()).isSameAs(callbackFailure);
+            assertThat(callbackFailure.getSuppressed()).singleElement().satisfies(error->
+                assertThat(error).isInstanceOf(IllegalStateException.class).hasMessage("Owned method transition authority unavailable"));
+        }else assertThat(scopeFailure.get()).isInstanceOf(IllegalStateException.class).hasMessage("Owned method transition authority unavailable");
+        assertThat(rollbackOnly).isTrue();assertThat(successorRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(money);
         assertThat(http.calls).hasSize(calls);
     }
     private dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reserveMethod(Setup s,Failure failure) {

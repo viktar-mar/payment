@@ -7,6 +7,31 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Explicit socket-free test: no DataSource, context or provider calls. */
 class OwnedFailedRenewalMethodStoreTransactionTest {
+    @Test void factReceiptFailureMarksOnlyTheOriginalJpaTransactionEvenAfterCallerRebind(){
+        for(String mode:List.of("present","missing","foreign-before","foreign-after")){
+            var original=new OwnedFailedRenewalStoreTransactionTest.JpaBoundary("valid");
+            var foreign=new OwnedFailedRenewalStoreTransactionTest.JpaBoundary("valid");original.bind();
+            try{
+                var caller=OwnedGraceCallerConnection.capture(original.jdbc,original.factory,"original fact caller unavailable");
+                var proofCalls=new java.util.concurrent.atomic.AtomicInteger();
+                Runnable proof=()->{
+                    proofCalls.incrementAndGet();
+                    if(mode.equals("missing"))throw new IllegalStateException("missing phase receipt");
+                    if(mode.equals("foreign-after")){original.unbind();foreign.bind();}
+                };
+                if(mode.equals("foreign-before")){original.unbind();foreign.bind();}
+                if(mode.equals("present"))caller.requireFactReceiptOrRollback(proof);
+                else assertThatThrownBy(()->caller.requireFactReceiptOrRollback(proof))
+                    .hasMessage(mode.equals("missing")?"missing phase receipt":"original fact caller unavailable");
+                assertThat(proofCalls).hasValue(mode.equals("foreign-before")?0:1);
+                assertThat(original.rollbackOnly).isEqualTo(!mode.equals("present"));assertThat(foreign.rollbackOnly).isFalse();
+                assertThat(original.queries).hasValue(0);assertThat(foreign.queries).hasValue(0);
+            }finally{
+                if(org.springframework.transaction.support.TransactionSynchronizationManager.hasResource(foreign.factory))foreign.unbind();
+                else original.unbind();
+            }
+        }
+    }
     @Test void taggedFactScopeRequiresPrecommitSynchronizationBeforeAnyProofLookup(){
         var fixture=new dev.genericpayments.platform.provider.application.service.OwnedRecoveryInertFixture(value->"digest:"+value,true);
         var r=fixture.reservation();var owner=dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner.create();

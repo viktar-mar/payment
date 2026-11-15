@@ -252,13 +252,35 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         });
     }
     private static final Object FACT_SCOPE_KEY=new Object();
-    private record FactScope(Reservation reservation,ReadClaim claim,
-            SuccessorOwner owner,OwnedGraceCallerConnection caller){}
+    private final class FactScope implements AutoCloseable{
+        private final Reservation reservation;
+        private final ReadClaim claim;
+        private final SuccessorOwner owner;
+        private final OwnedGraceCallerConnection caller;
+        private Runnable receiptProof;
+        FactScope(Reservation reservation,ReadClaim claim,SuccessorOwner owner,OwnedGraceCallerConnection caller){
+            this.reservation=reservation;this.claim=claim;this.owner=owner;this.caller=caller;
+        }
+        void requireReceipt(Runnable proof){
+            beforeReadCommit(caller,proof);
+            receiptProof=proof;
+        }
+        @Override public void close(){
+            if(receiptProof==null)return;
+            // A synchronization registered during beforeCommit may miss that pass.
+            // Verify this invocation's receipt while the original scope is still bound.
+            caller.requireFactReceiptOrRollback(()->{
+                if(TransactionSynchronizationManager.getResource(FACT_SCOPE_KEY)!=this)throw unavailable();
+                receiptProof.run();
+                if(TransactionSynchronizationManager.getResource(FACT_SCOPE_KEY)!=this)throw unavailable();
+            });
+        }
+    }
     private FactScope requireFactScope(Reservation r,ReadClaim q,SuccessorOwner supplied){
         if(!(TransactionSynchronizationManager.getResource(FACT_SCOPE_KEY) instanceof FactScope scope)
-                ||!scope.reservation().equals(r)||!scope.claim().equals(q)
-                ||supplied!=null&&supplied!=scope.owner())throw unavailable();
-        scope.caller().requireReadCommitted(jdbc,factory);return scope;
+                ||!scope.reservation.equals(r)||!scope.claim.equals(q)
+                ||supplied!=null&&supplied!=scope.owner)throw unavailable();
+        scope.caller.requireReadCommitted(jdbc,factory);return scope;
     }
     @Override public <T>T withSuccessorFactInTransaction(Reservation r,ReadClaim q,SuccessorOwner owner,java.util.function.Supplier<T> effect){
         if(owner==null||effect==null||!TransactionSynchronizationManager.isSynchronizationActive()
@@ -266,7 +288,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         var caller=successorCaller();requireReadInTransaction(r,q,owner);caller.requireReadCommitted();
         var scope=new FactScope(r,q,owner,caller);
         TransactionSynchronizationManager.bindResource(FACT_SCOPE_KEY,scope);
-        try{
+        try(scope){
             var result=effect.get();requireFactScope(r,q,owner);return result;
         }finally{
             if(TransactionSynchronizationManager.unbindResourceIfPossible(FACT_SCOPE_KEY)!=scope)throw unavailable();
@@ -572,7 +594,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
         if(rows.size()!=1)throw unavailable();
         var q=rows.getFirst();var r=reservation(q.reservationId());
         var scope=r.successor()==null?null:requireFactScope(r,q,null);
-        requireReadInTransaction(r,q,scope==null?null:scope.owner());
+        requireReadInTransaction(r,q,scope==null?null:scope.owner);
         if(!command.fence().equals(q.fence())||!command.account().equals(account(r))||!locked.equals(subscription(r))
                 ||!command.subscriptionId().equals(locked.id())||!billingAt.equals(q.billingSample().billingAt())
                 ||!q.billingSample().equals(command.expectedBillingSample()))throw unavailable();
@@ -591,7 +613,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
             // FactService may now mutate the original projection. The transaction keeps
             // this check even if its caller catches an exception after the scope unwinds.
             String receiptTable=phase==Phase.METHOD?"stripe_billing_failed_method_completions":"stripe_billing_failed_method_publications";
-            beforeReadCommit(scope.caller(),()->require("select exists(select 1 from "+receiptTable+
+            scope.requireReceipt(()->require("select exists(select 1 from "+receiptTable+
                 " where reservation_id=? and claim_id=? and successor_producer_xid=pg_current_xact_id())",r.id(),q.id()));
         }
     }
