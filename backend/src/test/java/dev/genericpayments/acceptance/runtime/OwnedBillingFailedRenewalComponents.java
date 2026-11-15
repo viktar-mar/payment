@@ -35,7 +35,7 @@ final class OwnedBillingFailedRenewalComponents {
         this.beans=Objects.requireNonNull(beans);this.utc=Objects.requireNonNull(utc);
         var jdbc=bean(JdbcTemplate.class);var emf=bean(EntityManagerFactory.class);
         transaction=bean(SubscriptionTransactionPort.class);
-        renewals=new JdbcOwnedFirstRenewalStore(jdbc);failedStore=new JdbcOwnedFailedRenewalStore(jdbc,emf);
+        renewals=bean(OwnedFirstRenewalStore.class);failedStore=new JdbcOwnedFailedRenewalStore(jdbc,emf);
         methodStore=new JdbcOwnedFailedRenewalMethodStore(jdbc,emf);
         time=new OwnedFailedGraceBillingTime(jdbc,emf,new OwnedFailedRenewalBillingTime(jdbc,new OwnedFirstRenewalBillingTime(jdbc,new OwnedSubscriptionBillingTime(jdbc))));
         credentials=bean(StripeCredentialResolver.class);clients=bean(StripeClientFactory.class);digest=bean(DigestPort.class);
