@@ -179,6 +179,10 @@ public final class OwnedBillingFirstPaymentScenario implements OwnedBillingFirst
         state.check();var authority=context("first-renewal-access-"+admission.run());
         return bean(QuerySubscriptionsUseCase.class).get(authority.actor(),site,reserved.subscription().id());
     }
+    /** Original customer session only; no token or caller-selected owner is exposed. */
+    synchronized SubscriptionCommandContext authenticatedContext(String key) {
+        state.check();require(state.phase().equals("SETTLED_LOCAL"));return context(key(key));
+    }
     private Subscription current(){return bean(SubscriptionStore.class).find(site,reserved.subscription().id()).orElseThrow();}
     private SubscriptionCommandContext context(String key) {
         var session=bean(CustomerSessionResolver.class).resolveRequired(token,origin);
