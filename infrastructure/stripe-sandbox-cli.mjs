@@ -1,3 +1,4 @@
+import {billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
 import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
 import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
@@ -33,7 +34,7 @@ const fail=()=>{throw null;};
 const fixed=code=>new Error('stripe_sandbox_cli_'+code);
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 // Closed purposes are private capabilities, never caller-supplied modes or flags.
-const SANDBOX=Symbol('sandbox'),REFUND=Symbol('refund'),REMAINDER=Symbol('remainder'),BILLING=Symbol('billing'),FIRST_PAYMENT=Symbol('first-payment'),FIRST_RENEWAL=Symbol('first-renewal');
+const SANDBOX=Symbol('sandbox'),REFUND=Symbol('refund'),REMAINDER=Symbol('remainder'),BILLING=Symbol('billing'),FIRST_PAYMENT=Symbol('first-payment'),FIRST_RENEWAL=Symbol('first-renewal'),FAILED_RENEWAL=Symbol('failed-renewal');
 const ORIGINAL='031b5ae7-6603-4339-b1b3-77231291ff34',PRIOR='34941d87-12d3-4c74-8c5a-b62b7c914390';
 function exactData(value,keys){
   if(!object(value)||![Object.prototype,null].includes(Object.getPrototypeOf(value)))fail();
@@ -71,16 +72,17 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
 }
 /** The caller supplies an owned configuration and two bootstrap capabilities, never commands. */
 export async function createBillingFirstPaymentCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,FIRST_PAYMENT);}
+export async function createBillingFailedRenewalCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,FAILED_RENEWAL);}
 export async function createBillingFirstRenewalCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,FIRST_RENEWAL);}
 export async function createBillingCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,BILLING);}
 async function createBillingModeCliAdapter(options,dependencies,purpose) {
   let selected,configuration;
-  try{selected=exactData(options,['configuration','cliDirectory','verifyForwardTarget','persistWebhookSecret']);configuration=(purpose===FIRST_RENEWAL?validateBillingFirstRenewalOptions:purpose===FIRST_PAYMENT?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(selected.configuration);if(!configuration)fail();}
+  try{selected=exactData(options,['configuration','cliDirectory','verifyForwardTarget','persistWebhookSecret']);configuration=(purpose===FAILED_RENEWAL?validateBillingFailedRenewalOptions:purpose===FIRST_RENEWAL?validateBillingFirstRenewalOptions:purpose===FIRST_PAYMENT?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(selected.configuration);if(!configuration)fail();}
   catch{throw fixed('OPT_IN_REQUIRED');}
   return createCliAdapter({...configuration,cliDirectory:selected.cliDirectory,backendPort:configuration.ports.backend,accountKey:'stripe-sandbox-default',verifyForwardTarget:selected.verifyForwardTarget,persistWebhookSecret:selected.persistWebhookSecret},dependencies,purpose);
 }
 async function createCliAdapter(options,dependencies,purpose) {
-  const firstRenewal=purpose===FIRST_RENEWAL,firstPayment=purpose===FIRST_PAYMENT||firstRenewal,billingMode=purpose===BILLING||firstPayment,remainderMode=purpose===REMAINDER,refundMode=purpose===REFUND||remainderMode;
+  const failedRenewal=purpose===FAILED_RENEWAL,firstRenewal=purpose===FIRST_RENEWAL,firstPayment=purpose===FIRST_PAYMENT||firstRenewal||failedRenewal,billingMode=purpose===BILLING||firstPayment,remainderMode=purpose===REMAINDER,refundMode=purpose===REFUND||remainderMode;
   const descriptor=Object.getOwnPropertyDescriptor(options??{},'env');
   const rawEnv=descriptor?.enumerable&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined;
   if(!billingMode&&!billingAcceptanceExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
@@ -93,7 +95,7 @@ async function createCliAdapter(options,dependencies,purpose) {
     threeDSecure=selected?.value==='true';if(threeDSecure&&(refundMode||!manualPaymentOptIn(rawEnv)))fail();
   }catch{throw fixed('OPT_IN_REQUIRED');}
   try {const optIn=rawEnv;manualPaymentMode=!refundMode&&optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=remainderMode?manualRefundRemainderOptIn(optIn):refundMode?manualRefundOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
-  if(billingMode)enabled=(firstRenewal?billingFirstRenewalOptIn:firstPayment?billingFirstPaymentOptIn:billingAcceptanceOptIn)(rawEnv);
+  if(billingMode)enabled=(failedRenewal?billingFailedRenewalOptIn:firstRenewal?billingFirstRenewalOptIn:firstPayment?billingFirstPaymentOptIn:billingAcceptanceOptIn)(rawEnv);
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {

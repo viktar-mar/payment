@@ -31,3 +31,28 @@ export function formatBillingFirstPaymentCleanupDiagnostic(result:BillingFirstPa
 export function parseBillingFirstPaymentCleanupDiagnosticLine(line:unknown):string|null;
 export function formatBillingFirstRenewalCleanupDiagnostic(result:BillingFirstRenewalResult):string|null;
 export function parseBillingFirstRenewalCleanupDiagnosticLine(line:unknown):string|null;
+
+export type FailedMethodAction=FirstPaymentPrepared['action'];
+export interface FailedMethodSession {
+ protocol:'BROWSER_CONFIRM_V1';provider:'stripe';flow:'SETUP';publishable_key:string;client_secret:string;
+ action_token:string;attempt_id:null;capability:null;expires_at:string;
+}
+export interface FailedMethodPermit {browser_confirm_allowed:true;state:'RESERVED'}
+export interface BillingFailedRenewalMethodPort {
+ prepareMethod(limits:BillingLimits):Promise<{subscriptionId:string;operationId:string;action:FailedMethodAction}>;
+ selectMethod(limits:BillingLimits):Promise<FailedMethodSession>;
+ confirmMethod(limits:BillingLimits):Promise<FailedMethodPermit>;
+}
+export interface BillingFailedRenewalJourney {
+ initial(port:BillingFirstPaymentPort,limits:BillingLimits):Promise<unknown>;
+ method(port:BillingFailedRenewalMethodPort,limits:BillingLimits):Promise<true>;
+ close(limits:BillingLimits):Promise<true>;
+}
+export interface BillingFailedRenewalResult extends Omit<BillingFirstPaymentResult,'scope'> {
+ scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY';failedRenewalAccepted:boolean;
+}
+export function createOwnedBillingFailedRenewal(options:unknown,dependencies?:Record<string,unknown>):Promise<{
+ resources():BillingFailedRenewalResult;
+ run(journey:BillingFailedRenewalJourney,limits:BillingLimits):Promise<BillingFailedRenewalResult>;
+ close():Promise<BillingFailedRenewalResult>;
+}>;

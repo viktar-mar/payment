@@ -1,6 +1,6 @@
 const PREFIX='PAYMENT_STRIPE_SANDBOX_';
 const REQUIRED=['ENABLED','ALLOW_TEST_OPERATIONS','OWNED_RUN','REMAINING_ONLY'].map(key=>PREFIX+key);
-const EXCLUDED=['MANUAL_REFUND','MANUAL_REFUND_REMAINDER','FULL_RUN','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT'].map(key=>PREFIX+key).concat('PAYMENT_STRIPE_BILLING_FIRST_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_PAYMENT','PAYMENT_STRIPE_BILLING_ACCEPTANCE');
+const EXCLUDED=['MANUAL_REFUND','MANUAL_REFUND_REMAINDER','FULL_RUN','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT'].map(key=>PREFIX+key).concat('PAYMENT_STRIPE_BILLING_FAILED_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_PAYMENT','PAYMENT_STRIPE_BILLING_ACCEPTANCE');
 const DEBUG=['DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE'];
 /** Capture own data only; no remaining-mode selector is forwarded to underlying capabilities. */
 export function remainingOnlyEnvironment(env) {
@@ -24,7 +24,9 @@ export const remainingOnlyOptIn=env=>remainingOnlyEnvironment(env)!==null;
 export function remainingOnlyExcluded(env) {
   try {
     if(!env||typeof env!=='object')return false;
-    const key=PREFIX+'REMAINING_ONLY',descriptor=Object.getOwnPropertyDescriptor(env,key);
-    return descriptor?descriptor.enumerable&&Object.hasOwn(descriptor,'value')&&[undefined,'','false'].includes(descriptor.value):!(key in env);
+    return [PREFIX+'REMAINING_ONLY','PAYMENT_STRIPE_BILLING_FAILED_RENEWAL'].every(key=>{
+      const d=Object.getOwnPropertyDescriptor(env,key);
+      return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);
+    });
   }catch{return false;}
 }

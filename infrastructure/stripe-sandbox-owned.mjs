@@ -1,3 +1,4 @@
+import {billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
 import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
 import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {billingBounded} from './stripe-billing-limits.mjs';
@@ -59,9 +60,10 @@ export async function preflightOwnedSandbox(options,dependencies={}) {
 }
 export async function preflightOwnedBillingFirstPayment(options,dependencies={},limits){return preflightBilling(options,dependencies,limits,'first-payment');}
 export async function preflightOwnedBillingFirstRenewal(options,dependencies={},limits){return preflightBilling(options,dependencies,limits,'first-renewal');}
+export async function preflightOwnedBillingFailedRenewal(options,dependencies={},limits){return preflightBilling(options,dependencies,limits,'failed-renewal');}
 export async function preflightOwnedBilling(options,dependencies={},limits){return preflightBilling(options,dependencies,limits,'billing');}
 async function preflightBilling(options,dependencies,limits,mode) {
-  const selected=(mode==='first-renewal'?validateBillingFirstRenewalOptions:mode==='first-payment'?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(options);
+  const selected=(mode==='failed-renewal'?validateBillingFailedRenewalOptions:mode==='first-renewal'?validateBillingFirstRenewalOptions:mode==='first-payment'?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(options);
   if(!selected)return pending('OPT_IN','OPT_IN_REQUIRED');
   if(limits!==undefined){
     const raw=dependencies;
@@ -114,15 +116,15 @@ async function preflight(options,dependencies,diagnostic) {
   let phase='OPT_IN',code='OPT_IN_REQUIRED';
   try {
     const env=Object.getOwnPropertyDescriptor(options??{},'env')?.value;
-    if(diagnostic==='first-renewal'?!billingFirstRenewalOptIn(env):diagnostic==='first-payment'?!billingFirstPaymentOptIn(env):diagnostic==='billing'?!billingAcceptanceOptIn(env):!billingAcceptanceExcluded(env))return pending(phase,code);
-    if(!['billing','first-payment','first-renewal'].includes(diagnostic)&&!remainderExcluded(env))return pending(phase,code);
-    if(env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'||(['billing','first-payment','first-renewal'].includes(diagnostic)?false:diagnostic==='payment'?!manualPaymentOptIn(env):diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'
+    if(diagnostic==='failed-renewal'?!billingFailedRenewalOptIn(env):diagnostic==='first-renewal'?!billingFirstRenewalOptIn(env):diagnostic==='first-payment'?!billingFirstPaymentOptIn(env):diagnostic==='billing'?!billingAcceptanceOptIn(env):!billingAcceptanceExcluded(env))return pending(phase,code);
+    if(!['billing','first-payment','first-renewal','failed-renewal'].includes(diagnostic)&&!remainderExcluded(env))return pending(phase,code);
+    if(env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'||(['billing','first-payment','first-renewal','failed-renewal'].includes(diagnostic)?false:diagnostic==='payment'?!manualPaymentOptIn(env):diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'
       ||env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'||env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC==='true')))return pending(phase,code);
     phase='INPUTS';code='CONFIGURATION';
     if(![undefined,''].includes(env.DEBUG)||![undefined,''].includes(env.NODE_DEBUG)||![undefined,'','0'].includes(env.PWDEBUG))return pending(phase,code);
     const topology=validateFormDiagnosticTopology(options);if(!topology)return pending(phase,code);
     const {expectedSource,daemon,ports}=topology,url=new URL(daemon);
-    const selectedPorts=PORTS.map(name=>ports[name]);if(['first-payment','first-renewal'].includes(diagnostic))selectedPorts.push(options.controlPort);if(diagnostic==='manual'||diagnostic==='payment')selectedPorts.push(options.manualPort);
+    const selectedPorts=PORTS.map(name=>ports[name]);if(['first-payment','first-renewal','failed-renewal'].includes(diagnostic))selectedPorts.push(options.controlPort);if(diagnostic==='manual'||diagnostic==='payment')selectedPorts.push(options.manualPort);
 
     phase='SOURCE';code='SOURCE_MISMATCH';
     const execute=dependencies.execute??executeFile;

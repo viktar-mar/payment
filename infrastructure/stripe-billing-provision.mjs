@@ -1,3 +1,4 @@
+import {billingFailedRenewalExcluded,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
 import {constants} from 'node:fs';
 import {open,lstat,realpath} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
@@ -9,7 +10,17 @@ export const billingUuid=value=>typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{
 const need=value=>{if(!value)throw billingError('FIXTURE');};
 const digest=value=>createHash('sha256').update(value).digest('hex');
 /** Fresh recurring fixture only. Cookies and callback secrets never enter its append-only public ledger. */
-export async function createBillingFixture({configuration:c,bootstrap,cli},dependencies={}) {
+export async function createBillingFixture(options,dependencies={}) {
+ need(billingFailedRenewalExcluded(options?.configuration?.env??{}));
+ return createFixture(options,dependencies,'INITIAL');
+}
+export async function createBillingFailedRenewalFixture({configuration,bootstrap,cli},dependencies={}) {
+ const c=validateBillingFailedRenewalOptions(configuration);need(c);
+ return createFixture({configuration:c,bootstrap,cli},dependencies,'FAILED_RENEWAL');
+}
+async function createFixture({configuration:c,bootstrap,cli},dependencies,purpose) {
+ const failed=purpose==='FAILED_RENEWAL',graceDays=failed?3:0;
+ let provisionClaimed=false,confirmRecorded=false,armState='NEW',armBoundary;
  const fetcher=dependencies.fetch??globalThis.fetch,write=dependencies.write??writeOwned;
  const suffix=c.runId.replaceAll('-',''),siteKey='s5a-'+suffix,email='billing-'+suffix+'@example.test';
  const endpoints=Object.fromEntries(['backend','demo','receiver'].map(k=>[k,'http://127.0.0.1:'+c.ports[k]]));
@@ -45,7 +56,7 @@ export async function createBillingFixture({configuration:c,bootstrap,cli},depen
  }
  return Object.freeze({resources,
   async provision(limits){
-   need(!provisioned&&!busy&&!closed);busy=true;started=Date.now();
+   need(!provisioned&&!busy&&!closed&&(!failed||!provisionClaimed));provisionClaimed=true;busy=true;started=Date.now();
    try{
     need(await cli.validateBinding(limits)===true);
     let admin;need(await bootstrap.withAdminCredentials(credentials=>{admin={username:credentials.username,password:credentials.password};return true;},limits)===true);
@@ -62,7 +73,7 @@ export async function createBillingFixture({configuration:c,bootstrap,cli},depen
     const base='/api/v1/admin/sites/'+siteId;
     const providers=await read(base+'/identity-providers',limits);need(Array.isArray(providers)&&providers.length===1&&providers[0].mode==='EMAIL_OTP'&&providers[0].readiness==='READY'&&providers[0].status==='ACTIVE');
     const policy=await read(base+'/subscription-policy',limits);need(Number.isSafeInteger(policy.version));
-    await mutate('policy',base+'/subscription-policy',{version:policy.version,enabled:true,grace_days:0,allow_immediate_cancellation:false,portal_enabled:false,defer_upgrades:false,portal_return_urls:[]},200,limits,v=>v?.enabled===true&&v.portal_enabled===false);
+    await mutate('policy',base+'/subscription-policy',{version:policy.version,enabled:true,grace_days:graceDays,allow_immediate_cancellation:false,portal_enabled:false,defer_upgrades:false,portal_return_urls:[]},200,limits,v=>v?.enabled===true&&v.portal_enabled===false&&(!failed||v.grace_days===3));
     const product=await mutate('product','/api/admin/v1/sites/'+siteId+'/products',{key:'billing-product-'+suffix,name:'Initial monthly Billing',description:null},201,limits,v=>billingUuid(v?.id)&&v.site_id===siteId&&v.status==='ACTIVE');productId=product.id;
     const price=await mutate('price','/api/admin/v1/products/'+productId+'/prices',{price_key:'billing-price-'+suffix,type:'SUBSCRIPTION',amount_minor:2000,currency:'EUR',billing_interval:'MONTH',trial_days:0,tax_mode:'INCLUSIVE',tax_code:null},201,limits,v=>billingUuid(v?.id)&&v.site_id===siteId&&v.product_id===productId&&v.version===1&&v.status==='DRAFT');priceId=price.id;
     const published=await mutate('publish','/api/admin/v1/prices/'+priceId+'/publish',undefined,200,limits,v=>v?.id===priceId&&v.type==='SUBSCRIPTION'&&v.status==='PUBLISHED'&&v.version===1&&v.amount_minor===2000&&v.currency==='EUR'&&v.billing_interval==='MONTH'&&v.trial_days===0&&v.tax_mode==='INCLUSIVE'&&/^price_[A-Za-z0-9]+$/.test(v.provider_price_id));priceReference=published.provider_price_id;
@@ -97,8 +108,28 @@ export async function createBillingFixture({configuration:c,bootstrap,cli},depen
   async acknowledge(kind,value,limits){
    if(kind==='create'){need(createKey&&!subscriptionId&&billingUuid(value?.subscriptionId)&&billingUuid(value.operationId)&&value.subscriptionId!==value.operationId);subscriptionId=value.subscriptionId;operationId=value.operationId;}
    else need(kind==='confirm'&&confirmKey&&value?.state==='OBSERVE'&&value.attemptId===attemptId&&value.nextActionAllowed===false);
-   await save(kind+'-ack',{phase:'ACKNOWLEDGED',subscriptionId,operationId,...(kind==='confirm'?{attemptId}:{})},limits);return true;
+   await save(kind+'-ack',{phase:'ACKNOWLEDGED',subscriptionId,operationId,...(kind==='confirm'?{attemptId}:{})},limits);if(kind==='confirm')confirmRecorded=true;return true;
   },
+  ...(failed?{
+   async beforeDeclineArm(v,limits){
+    need(provisioned&&!closed&&confirmRecorded&&armState==='NEW');
+    armState='WRITING_INTENT';
+    need(v?.phase==='RENEWAL_BOUNDARY'&&v.code==='OK');
+    need(v.run_id===c.runId&&v.source_sha===c.expectedSource&&v.original_frozen_time===c.frozenTime&&v.account_id===accountId&&v.site_id===siteId&&v.customer_id===customerId&&v.price_id===priceId&&v.subscription_id===subscriptionId&&v.operation_id===operationId);
+    need([v.renewal_admission_id,v.boundary_id,v.initial_bill_id,v.initial_payment_id].every(billingUuid));
+    armBoundary=Object.freeze({admissionId:v.renewal_admission_id,boundaryId:v.boundary_id,initialBillId:v.initial_bill_id,initialPaymentId:v.initial_payment_id});
+    await save('decline-arm-dispatch',{phase:'DISPATCHING',subscriptionId,operationId,customerId,...armBoundary},limits);
+    armState='DISPATCHING';return true;
+   },
+   async acknowledgeDeclineArm(v,limits){
+    need(!closed&&armState==='DISPATCHING');
+    armState='WRITING_ACK';
+    need(v?.phase==='DECLINE_ARMED'&&v.code==='OK'&&v.arm_run_id===c.runId&&v.source_sha===c.expectedSource&&v.subscription_id===subscriptionId&&v.arm_boundary_id===armBoundary.boundaryId&&v.arm_admission_id===armBoundary.admissionId);
+    need(typeof v.arm_payment_method_id==='string'&&/^pm_[a-zA-Z0-9]+$/.test(v.arm_payment_method_id)&&Number.isFinite(Date.parse(v.arm_acknowledged_at)));
+    await save('decline-arm-ack',{phase:'ACKNOWLEDGED',subscriptionId,operationId,customerId,...armBoundary,acknowledgedAt:v.arm_acknowledged_at},limits);
+    armState='ACKNOWLEDGED';return true;
+   }
+  }:{}),
   async inspectCallbacks(limits){return read('/inspection/digests',limits,{target:'receiver'});},
   async close(){closed=true;cookie='';csrf='';createKey=undefined;confirmKey=undefined;return true;},
  });

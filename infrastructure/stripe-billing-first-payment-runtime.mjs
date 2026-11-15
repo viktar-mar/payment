@@ -1,3 +1,5 @@
+import {validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
+import {checkInitialSettlementTime,checkedInitialResponse,failedStages,checkFailedWireKeys,validateFailedRenewalStage} from './stripe-billing-failed-renewal-response.mjs';
 import {billingBounded,billingCheck,billingError} from './stripe-billing-limits.mjs';
 import {validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
 import {validateRenewalBoundary,validateRenewalFinalization} from './stripe-billing-first-renewal-response.mjs';
@@ -21,10 +23,13 @@ function responseShape(v,route){
  if(route==='prepare'){need(exact(v.action,['kind','secret','expires_at'])&&v.action.kind==='PROVIDER_CLIENT'&&typeof v.action.secret==='string'&&Number.isFinite(Date.parse(v.action.expires_at)));need(exact(v.session,['protocol','provider','flow','publishable_key','client_secret','action_token','attempt_id','capability','expires_at'])&&v.session.protocol==='SERVER_CONFIRM_V2'&&v.session.provider==='stripe'&&v.session.flow==='PAYMENT'&&v.session.action_token===null&&['publishable_key','client_secret','attempt_id','capability'].every(k=>typeof v.session[k]==='string'&&v.session[k].length>0)&&Number.isFinite(Date.parse(v.session.expires_at)));}
 }
 /** Inert private client. No credentials or arbitrary URLs/operations are exposed. */
-export function createBillingFirstPaymentRuntime(options,dependencies={}){return createRuntime(options,dependencies,false);}
-export function createBillingFirstRenewalRuntime(options,dependencies={}){return createRuntime(options,dependencies,true);}
-function createRuntime({configuration,bootstrap},dependencies,firstRenewal){
- const c=(firstRenewal?validateBillingFirstRenewalOptions:validateBillingFirstPaymentOptions)(configuration);need(c);let phase='NEW',failed=false,busy=false,observations=0,deadline,diagnostic=null,failureLatched=false,originalIdentity,initialSettlement,renewalBoundary;
+export function createBillingFirstPaymentRuntime(options,dependencies={}){return createRuntime(options,dependencies,'INITIAL');}
+export function createBillingFirstRenewalRuntime(options,dependencies={}){return createRuntime(options,dependencies,'FIRST_RENEWAL');}
+export function createBillingFailedRenewalRuntime(options,dependencies={}){return createRuntime(options,dependencies,'FAILED_RENEWAL');}
+function createRuntime({configuration,bootstrap},dependencies,purpose){
+ const failedRenewal=purpose==='FAILED_RENEWAL',firstRenewal=purpose==='FIRST_RENEWAL',extended=failedRenewal||firstRenewal;
+ let priorFailedStage,initialAttempt;
+ const c=(failedRenewal?validateBillingFailedRenewalOptions:firstRenewal?validateBillingFirstRenewalOptions:validateBillingFirstPaymentOptions)(configuration);need(c);let phase='NEW',failed=false,busy=false,observations=0,deadline,diagnostic=null,failureLatched=false,originalIdentity,initialSettlement,renewalBoundary;
  const failure=code=>{if(!failureLatched){failureLatched=true;if(isBillingFirstPaymentDiagnostic(code))diagnostic=code;}const error=billingError('RUNTIME');if(diagnostic!==null)ownDiagnostics.set(error,diagnostic);return error;};
  async function request(route,body,limits){
   if(failed||busy){failed=true;throw failure();}busy=true;
@@ -33,16 +38,17 @@ function createRuntime({configuration,bootstrap},dependencies,firstRenewal){
    billingCheck(limits);if(deadline===undefined){need(limits.deadline<=Date.now()+2700000);deadline=limits.deadline;}need(limits.deadline<=deadline);
    let result,entered=false;if(route==='prepare')checkpoint='PREPARE_AUTHORITY';
    if(route==='prepare')ownPrepareCheckpoints.set(runtime,'PREPARE_REQUEST_AUTHORITY');
-   const admitted=await bootstrap[firstRenewal?'withFirstRenewalRuntime':'withFirstPaymentRuntime'](async privateRuntime=>{
-    if(route==='prepare')checkpoint='PREPARE_AUTHORITY';if(firstRenewal||route==='prepare'){need(!entered);entered=true;}
+   const failedStage=failedRenewal?failedStages.find(s=>s.path===route):undefined;
+   const admitted=await bootstrap[failedRenewal?'withFailedRenewalRuntime':firstRenewal?'withFirstRenewalRuntime':'withFirstPaymentRuntime'](async privateRuntime=>{
+    if(route==='prepare')checkpoint='PREPARE_AUTHORITY';if(extended||route==='prepare'){need(!entered);entered=true;}
     need(!failed);
     need(privateRuntime.endpoint==='http://127.0.0.1:'+c.controlPort&&/^[A-Za-z0-9_-]{43}$/.test(privateRuntime.capability));
     if(route==='prepare')checkpoint='PREPARE_REQUEST';
     result=await billingBounded(limits,async l=>{
      if(route==='prepare')ownPrepareCheckpoints.set(runtime,'PREPARE_REQUEST_TRANSPORT');
-     const response=await (dependencies.fetch??globalThis.fetch)(privateRuntime.endpoint+(['boundary','finalization'].includes(route)?'/first-renewal/':'/initial-payment/')+route,{method:body===undefined?'GET':'POST',redirect:'error',signal:l.signal,headers:{Accept:'application/json',Authorization:'Bearer '+privateRuntime.capability,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});
+     const response=await (dependencies.fetch??globalThis.fetch)(privateRuntime.endpoint+(failedStage?'/failed-renewal/':['boundary','finalization'].includes(route)?'/first-renewal/':'/initial-payment/')+route,{method:body===undefined?'GET':'POST',redirect:'error',signal:l.signal,headers:{Accept:'application/json',Authorization:'Bearer '+privateRuntime.capability,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});
      if(route==='prepare')ownPrepareCheckpoints.set(runtime,'PREPARE_REQUEST_RESPONSE');
-     let count=0;const chunks=[];const stopped=route==='prepare'&&response.status===400,boundaryStopped=route==='boundary'&&response.status===400;
+     let count=0;const chunks=[];const stopped=route==='prepare'&&response.status===400,boundaryStopped=firstRenewal&&route==='boundary'&&response.status===400;
      if(route==='prepare')checkpoint=response.status===200?'PREPARE_RESPONSE':'PREPARE_HTTP';
      if(route==='boundary')checkpoint=response.status===200?'POST_CONFIRM_RENEWAL_BOUNDARY_RESPONSE':'POST_CONFIRM_RENEWAL_BOUNDARY_HTTP';
      try{
@@ -64,6 +70,8 @@ function createRuntime({configuration,bootstrap},dependencies,firstRenewal){
       need(renewalBoundaryCodes.has(code));checkpoint=code;throw failure(code);
      }
      need(v&&v.code==='OK'&&v.run_id===c.runId);
+     if(failedRenewal)checkFailedWireKeys(text);
+     if(failedStage){return validateFailedRenewalStage(failedStage.method,v,originalIdentity,initialSettlement,c,priorFailedStage);}
      if(route==='boundary'||route==='finalization'){
       // Both fixed responses are flat string records. Reject duplicate keys and escaped aliases before validation.
       const field='"[a-z_]+"\\s*:\\s*"[A-Za-z0-9_:.-]+"';
@@ -71,24 +79,30 @@ function createRuntime({configuration,bootstrap},dependencies,firstRenewal){
       need((text.match(/"[a-z_]+"\s*:/g)??[]).length===Object.keys(v).length);
       return route==='boundary'?validateRenewalBoundary(v,originalIdentity,initialSettlement):validateRenewalFinalization(v,originalIdentity,renewalBoundary);
      }
+     if(failedRenewal&&route!=='status')return checkedInitialResponse(v,route);
      responseShape(v,route);return v;
     },120000);return true;
    },limits);
    if(route==='prepare'&&(admitted!==true||!entered||result===undefined))checkpoint='PREPARE_AUTHORITY';
-   need(admitted===true&&(!(firstRenewal||route==='prepare')||entered&&result!==undefined));billingCheck(limits);need(!failed);return result;
+   need(admitted===true&&(!(extended||route==='prepare')||entered&&result!==undefined));billingCheck(limits);need(!failed);return result;
   }catch{failed=true;throw failure(route==='prepare'&&(limits?.signal?.aborted||Date.now()>=limits?.deadline)?'PREPARE_REQUEST':checkpoint);}finally{busy=false;}
  }
  const stop=code=>{failed=true;throw failure(code);};
  const runtime=Object.freeze({
   async ready(l){if(phase!=='NEW')stop();const v=await request('status',undefined,l);if(v.phase!=='NEW')stop();phase='READY';return true;},
-  async prepare(s,l){if(phase!=='READY')stop();phase='PREPARING';const v=await request('prepare',{run_id:c.runId,source_sha:c.expectedSource,account_id:s.accountId,site_id:s.siteId,customer_id:s.customerId,price_id:s.priceId,origin:s.origin,create_key:s.createKey,customer_token:s.customerToken},l);if(v.phase!=='PREPARED')stop('PREPARE_RESPONSE');if(firstRenewal){for(const [k,n]of [['run_id','runId'],['account_id','accountId'],['site_id','siteId'],['customer_id','customerId'],['price_id','priceId']])if(v[k]!==s[n])stop('PREPARE_ACK');originalIdentity=Object.fromEntries(identity.slice(2).map(k=>[k,v[k]]));}phase='PREPARED';return v;},
-  async confirm(original,l){if(phase!=='PREPARED')stop();phase='CONFIRMING';const v=await request('confirm',original,l);if(v.phase!=='OBSERVE'||v.state!=='OBSERVE'||v.next_action_allowed!==false||v.retry_allowed!==false||v.successor_attempt_id!==null)stop();if(firstRenewal&&Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))stop();phase='OBSERVE';return v;},
-  async observe(l){if(phase!=='OBSERVE'||++observations>30)stop();const v=await request('observe',{},l);if(!['OBSERVE','SETTLED_LOCAL'].includes(v.phase))stop();if(firstRenewal&&Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))stop();if(v.phase==='SETTLED_LOCAL'){phase=v.phase;initialSettlement=firstRenewal?Object.freeze({...v}):v;}return v;},
+  async prepare(s,l){if(phase!=='READY')stop();phase='PREPARING';const v=await request('prepare',{run_id:c.runId,source_sha:c.expectedSource,account_id:s.accountId,site_id:s.siteId,customer_id:s.customerId,price_id:s.priceId,origin:s.origin,create_key:s.createKey,customer_token:s.customerToken},l);if(v.phase!=='PREPARED')stop('PREPARE_RESPONSE');if(extended){for(const [k,n]of [['run_id','runId'],['account_id','accountId'],['site_id','siteId'],['customer_id','customerId'],['price_id','priceId']])if(v[k]!==s[n])stop('PREPARE_ACK');originalIdentity=Object.fromEntries(identity.slice(2).map(k=>[k,v[k]]));}if(failedRenewal)initialAttempt=v.session.attempt_id;phase='PREPARED';return v;},
+  async confirm(original,l){if(phase!=='PREPARED'||failedRenewal&&original?.attempt_id!==initialAttempt)stop();phase='CONFIRMING';const v=await request('confirm',original,l);if(failedRenewal&&v.attempt_id!==initialAttempt||v.phase!=='OBSERVE'||v.state!=='OBSERVE'||v.next_action_allowed!==false||v.retry_allowed!==false||v.successor_attempt_id!==null)stop();if(extended&&Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))stop();phase='OBSERVE';return v;},
+  async observe(l){if(phase!=='OBSERVE'||++observations>30)stop();const v=await request('observe',{},l);if(!['OBSERVE','SETTLED_LOCAL'].includes(v.phase))stop();if(extended&&Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))stop();if(v.phase==='SETTLED_LOCAL'){if(failedRenewal)try{checkInitialSettlementTime(v,c);}catch{stop();}phase=v.phase;initialSettlement=extended?Object.freeze({...v}):v;}return v;},
+  ...(failedRenewal?Object.fromEntries(failedStages.map((stage,index)=>[stage.method,async function(l){
+   if(arguments.length!==1||phase!==(index===0?'SETTLED_LOCAL':failedStages[index-1].phase))stop();
+   phase='DISPATCHING';
+   const v=await request(stage.path,{},l);priorFailedStage=v;phase=stage.phase;return v;
+  }])):{}),
   ...(firstRenewal?{
    async boundary(l){if(phase!=='SETTLED_LOCAL')stop();phase='BOUNDARY_RUNNING';const v=await request('boundary',{},l);renewalBoundary=v;phase='RENEWAL_BOUNDARY';return v;},
    async finalization(l){if(phase!=='RENEWAL_BOUNDARY')stop();phase='FINALIZATION_RUNNING';const v=await request('finalization',{},l);phase='RENEWAL_SETTLED_LOCAL';return v;},
   }:{}),
-  async close(){failed=true;failureLatched=true;phase='CLOSED';return true;},
+  async close(){failed=true;failureLatched=true;phase='CLOSED';priorFailedStage=undefined;return true;},
  });
  ownPrepareCheckpoints.set(runtime,null);return runtime;
 }

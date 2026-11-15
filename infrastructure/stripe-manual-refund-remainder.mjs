@@ -6,7 +6,7 @@ import {validateManualRefundRemainderReport,formatManualRefundRemainderReport} f
 
 const ROOT=fileURLToPath(new URL('..',import.meta.url)).replace(/\/$/,'');
 const ORIGINAL='031b5ae7-6603-4339-b1b3-77231291ff34',PRIOR='34941d87-12d3-4c74-8c5a-b62b7c914390';
-const FLAGS=['ENABLED','ALLOW_TEST_OPERATIONS','MANUAL_REFUND_REMAINDER','MANUAL_REFUND','FULL_RUN','OWNED_RUN','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT'].map(key=>'PAYMENT_STRIPE_SANDBOX_'+key).concat(['DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE']);
+const FLAGS=['ENABLED','ALLOW_TEST_OPERATIONS','MANUAL_REFUND_REMAINDER','MANUAL_REFUND','FULL_RUN','OWNED_RUN','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT'].map(key=>'PAYMENT_STRIPE_SANDBOX_'+key).concat(['PAYMENT_STRIPE_BILLING_FAILED_RENEWAL','DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE']);
 const EMPTY=Object.freeze({version:1,mode:'MANUAL_REFUND_REMAINDER',result:'FAILED',phase:'ADMISSION',target_verified:false,prior_partial_verified:false,prior_callback_delivery_verified:false,callback_rotated:false,remainder_confirmed:false,provider_verified:false,webhook_verified:false,journal_verified:false,callback_signature_verified:false,final_total_verified:false,listener_closed:false,runtime_closed:false,provenance:'CONTROLLER_REPORTED'});
 const rejected=()=>Object.freeze({report:EMPTY,exitCode:1});
 const fail=()=>{throw null;};
