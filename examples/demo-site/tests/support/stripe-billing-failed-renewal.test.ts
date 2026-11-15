@@ -36,9 +36,11 @@ async function captureReporter(body:(reporter:FailedRenewalReporter)=>void):Prom
 }
 test('actual reporter emits one trusted post-handoff terminal diagnostic and suppresses raw channels',async()=>{
  const output=await captureReporter(r=>{
+  const testCase=reporterCase({annotations:[{type:'foreign',description:'foreign annotation canary'}]}),result=reporterResult({annotations:[]});
+  r.onTestBegin(testCase,result);
   r.onStdOut(diagnostic+'\nraw before canary\n'+loginHandoff+'\n');
   r.onStdOut(diagnostic+'\nraw after canary\n');r.onStdErr();r.onError();
-  r.onTestEnd(reporterCase({annotations:[{type:'foreign',description:'foreign annotation canary'}]}),reporterResult());
+  testCase.annotations=[...testCase.annotations,terminalAnnotation];result.annotations=[...testCase.annotations];r.onTestEnd(testCase,result);
   r.onTestEnd(reporterCase(),reporterResult());r.onEnd({status:'failed'} as FullResult);
  });
  assert.equal(output.split('\n').filter(v=>v===diagnostic).length,1);assert.ok(output.startsWith(loginHandoff+'\n'));
@@ -56,8 +58,54 @@ for(const [name,caseChange,resultChange] of [
  ['contradictory cleanup',{}, {annotations:[{...terminalAnnotation,description:diagnostic.replace('UNCONFIRMED','CONFIRMED')}]}],
  ['unknown checkpoint',{}, {annotations:[{...terminalAnnotation,description:diagnostic.replace('PERSIST_FINAL_STORE','PERSIST_CANARY')}]}],
 ] as const)test('actual reporter suppresses '+name+' terminal annotation',async()=>{
- const output=await captureReporter(r=>{r.onTestEnd(reporterCase(caseChange),reporterResult(resultChange));r.onEnd({status:'failed'} as FullResult);});
+ const output=await captureReporter(r=>{
+  const testCase=reporterCase(caseChange),result=reporterResult({...resultChange,annotations:[]});
+  r.onTestBegin(testCase,result);result.annotations=reporterResult(resultChange).annotations;
+  r.onTestEnd(testCase,result);r.onEnd({status:'failed'} as FullResult);
+ });
  assert.doesNotMatch(output,/owned_failed_renewal_diagnostic|canary/);
+});
+test('actual reporter rejects a reserved static annotation copied into both end arrays on setup failure',async()=>{
+ const output=await captureReporter(r=>{
+  const testCase=reporterCase({annotations:[terminalAnnotation]}),result=reporterResult({annotations:[]});
+  if(typeof r.onTestBegin==='function')r.onTestBegin(testCase,result);
+  // Playwright copies declared annotations into testInfo before setup and both
+  // end arrays when the setup failure is delivered, without running owner close.
+  result.annotations=[...testCase.annotations];testCase.annotations=[...result.annotations];
+  r.onTestEnd(testCase,result);r.onEnd({status:'failed'} as FullResult);
+ });
+ assert.doesNotMatch(output,/owned_failed_renewal_diagnostic|canary/);assert.match(output,/owned_failed_renewal_not_accepted/);
+});
+test('actual reporter rejects foreign target at begin despite matching end identity',async()=>{
+ const output=await captureReporter(r=>{
+  const testCase=reporterCase({title:'foreign case'}),result=reporterResult({annotations:[]});
+  r.onTestBegin(testCase,result);
+  testCase.title='OWNED_FAILED_RENEWAL_GRACE_RECOVERY';result.annotations=[terminalAnnotation];testCase.annotations=[terminalAnnotation];
+  r.onTestEnd(testCase,result);r.onEnd({status:'failed'} as FullResult);
+ });
+ assert.doesNotMatch(output,/owned_failed_renewal_diagnostic|canary/);
+});
+for(const boundary of ['absent begin','different case','different result','repeated begin','reserved result baseline','malformed reserved case baseline','retry at begin'])
+test('actual reporter rejects terminal delivery with '+boundary,async()=>{
+ const output=await captureReporter(r=>{
+  const testCase=reporterCase(),result=reporterResult({annotations:[]});
+  if(boundary==='reserved result baseline')result.annotations=[terminalAnnotation];
+  if(boundary==='malformed reserved case baseline')testCase.annotations=[{type:'owned-failed-renewal-terminal',description:'malformed canary'}];
+  if(boundary==='retry at begin')result.retry=1;
+  if(boundary!=='absent begin')r.onTestBegin(boundary==='different case'?reporterCase():testCase,boundary==='different result'?reporterResult({annotations:[]}):result);
+  if(boundary==='repeated begin')r.onTestBegin(testCase,result);
+  result.retry=0;result.annotations=[terminalAnnotation];testCase.annotations=[terminalAnnotation];
+  r.onTestEnd(testCase,result);r.onEnd({status:'failed'} as FullResult);
+ });
+ assert.doesNotMatch(output,/owned_failed_renewal_diagnostic|canary/);
+});
+test('actual reporter accepts clean begin and late post-close annotation in both native end arrays once',async()=>{
+ const output=await captureReporter(r=>{
+  const testCase=reporterCase(),result=reporterResult({annotations:[]});r.onTestBegin(testCase,result);
+  result.annotations=[terminalAnnotation];testCase.annotations=[...result.annotations];
+  r.onTestEnd(testCase,result);r.onTestEnd(testCase,result);r.onEnd({status:'failed'} as FullResult);
+ });
+ assert.equal(output.split('\n').filter(v=>v===diagnostic).length,1);assert.doesNotMatch(output,/canary/);
 });
 test('actual reporter retains the exact single-case success predicate',async()=>{
  for(const [testCase,result,full,accepted] of [

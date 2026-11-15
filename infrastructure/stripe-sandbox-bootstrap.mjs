@@ -743,11 +743,15 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       &&intents.every(value=>value.status==='ACKNOWLEDGED'||value.status==='DISPATCHING'&&value.action==='START_SERVICE'
         &&fullId(value.name)&&SERVICES.some(service=>recorded.containers[service].id===value.name));
     const preparedServices=[...SERVICES,'issuer-installer','issuer-probe'];
-    const pendingPersistence=failedRenewal&&pending&&status==='PREPARED'&&issuerProved&&!retired&&!live&&!recorded.retiredBackend
+    const failedPersistence=failedRenewal&&persistenceCode!==null;
+    const pendingPersistence=failedPersistence&&lock!==null&&pending&&status==='PREPARED'&&issuerProved&&!retired&&!live&&!recorded.retiredBackend
       &&Object.keys(recorded.containers).length===preparedServices.length&&preparedServices.every(service=>recorded.containers[service])
-      &&intents.length>0&&intents.at(-1).action==='PERSIST_WEBHOOK'&&intents.at(-1).name==='backend-key-persistence'&&intents.at(-1).status==='DISPATCHING'
+      &&intents.length>0&&intents.at(-1).action==='PERSIST_WEBHOOK'&&intents.at(-1).name==='backend-key-persistence'
+      &&(intents.at(-1).status==='DISPATCHING'||persistenceCode==='PERSIST_ACK'&&intents.at(-1).status==='ACKNOWLEDGED')
       &&intents.slice(0,-1).every(value=>value.status==='ACKNOWLEDGED'&&value.action!=='PERSIST_WEBHOOK'&&value.action!=='START_SERVICE');
-    if(firstPayment&&!ownedStartsOnly&&!pendingPersistence)fail();
+    // Memory ACK can precede an uncertain durable write or a failing input close.
+    // Every failed persistence stays outside the generic stop-and-ledger path.
+    if(failedPersistence?!pendingPersistence:firstPayment&&!ownedStartsOnly)fail();
     await infrastructureProof(context);await projectProof(context);
     if(pendingPersistence) {
       // This exception proves the live owner's untouched pre-start shape; it grants no stop or write authority.
@@ -759,7 +763,10 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
             ||container.startedAt==='0001-01-01T00:00:00Z'||proof.state.StartedAt!==container.startedAt))fail();
         } finally {recorded.containers[service]=container;}
       }
-      await projectProof(context);await ledger(context);if(lock){await lock.close();lock=null;}return true;
+      await projectProof(context);
+      // Preserve the exact existing ledger bytes, including absent/ambiguous ACKs.
+      // Consume this retained descriptor even when its close outcome is uncertain.
+      const owner=lock;lock=null;await owner.close();return true;
     }
     for(const [service,container] of Object.entries(recorded.containers))await containerProof(service,container.id,context,{cleanupOnly:true});
     for(const [service,container] of Object.entries(recorded.containers).reverse()) {

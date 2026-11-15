@@ -2053,6 +2053,60 @@ async function failedRenewalPendingPersistence(){
  const f=await failedRenewalPersistencePrepared(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{const file=await open(...args);return {...file,sync:async()=>{if(args[0]===DIR+'/final.env')throw new Error('private canary');return file.sync();}};};});
  await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');return f;
 }
+// Each injected refusal is one-shot so cleanup cannot hide a ledger rewrite behind it.
+async function failedRenewalDurableUncertainty(boundary){
+ let fired=false,ackRenamed=false;
+ const f=await failedRenewalPersistencePrepared(h=>{
+  const open=h.dependencies.open,rename=h.dependencies.rename;
+  h.dependencies.rename=async(from,to)=>{await rename(from,to);if(h.rejectPersistence&&to===DIR+'/runtime.json'&&persistenceIntents(h).at(-1)?.status==='ACKNOWLEDGED')ackRenamed=true;};
+  h.dependencies.open=async(...args)=>{
+   const file=await open(...args),path=args[0];let dispatch=false,ack=false;
+   const refuse=()=>{fired=true;throw new Error('synthetic durable uncertainty');};
+   return {...file,
+    writeFile:async bytes=>{
+     dispatch=path.startsWith(DIR+'/runtime.json.tmp-')&&String(bytes).includes('"action":"PERSIST_WEBHOOK","name":"backend-key-persistence","status":"DISPATCHING"');
+     ack=path.startsWith(DIR+'/runtime.json.tmp-')&&String(bytes).includes('"action":"PERSIST_WEBHOOK","name":"backend-key-persistence","status":"ACKNOWLEDGED"');
+     if(h.rejectPersistence&&!fired&&(boundary==='intent write'&&dispatch||boundary==='ACK write'&&ack))refuse();
+     return file.writeFile(bytes);
+    },
+    sync:async()=>{if(h.rejectPersistence&&!fired&&(boundary==='ACK file sync'&&ack||boundary==='ACK renamed directory sync'&&path===DIR&&ackRenamed))refuse();return file.sync();},
+    close:async()=>{await file.close();if(h.rejectPersistence&&!fired&&boundary==='post-ACK input close'&&path===USERFILE)refuse();},
+   };
+  };
+ });
+ f.rejectPersistence=true;await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(fired,true);
+ return f;
+}
+for(const boundary of ['intent write','ACK write','ACK file sync','ACK renamed directory sync','post-ACK input close']){
+ for(const state of ['inactive','running service','running helper'])test('failed-renewal '+boundary+' cleanup preserves exact durable bytes with '+state,async()=>{
+  const f=await failedRenewalDurableUncertainty(boundary),bytes=Buffer.from(f.files.get(DIR+'/runtime.json').contents),memory=f.adapter.resources();
+  const last=persistenceIntents(f).at(-1);
+  if(boundary==='intent write')assert.notEqual(last.action,'PERSIST_WEBHOOK');
+  else assert.equal(last.status,['ACK renamed directory sync','post-ACK input close'].includes(boundary)?'ACKNOWLEDGED':'DISPATCHING');
+  if(state!=='inactive'){
+   const service=state==='running service'?'backend':'issuer-probe',container=f.containers.get(memory.containers[service].id);
+   container.State={...container.State,Running:true,Status:'running'};
+  }
+  const before=f.events.length,limits={deadline:f.limits.deadline+120000};
+  if(state==='inactive')assert.equal(await f.adapter.stop(limits),true);else await rejects(f.adapter.stop(limits),'STOP_PENDING');
+  assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,bytes);assert.deepEqual(f.adapter.resources(),memory);
+  const cleanup=f.events.slice(before);assert.equal(persistenceMutations(cleanup).length,0);assertPrivatePersistenceOnly(f,cleanup);
+  assert.equal(cleanup.some(e=>e.type==='write'||e.type==='rename'||e.type==='unlink'),false);
+  assert.equal(cleanup.filter(e=>e.type==='close'&&e.path===DIR+'/owner.lock').length,state==='inactive'?1:0);
+  if(state==='inactive'){
+   for(const container of Object.values(memory.containers))assert.ok(cleanup.some(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='inspect'&&e.args.at(-1)===container.id));
+   const after=f.events.length;await rejects(f.adapter.stop(limits),'STOP_PENDING');assert.equal(f.events.length,after);
+   assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,bytes);assert.deepEqual(f.adapter.resources(),memory);
+  }
+ });
+}
+test('failed-renewal proof-only cleanup cannot reuse an ambiguously closed owner descriptor',async()=>{
+ const f=await failedRenewalPersistencePrepared(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{const file=await open(...args);return {...file,sync:async()=>{if(args[0]===DIR+'/final.env')throw null;return file.sync();},close:async()=>{await file.close();if(args[0]===DIR+'/owner.lock')throw null;}};};});
+ await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');const bytes=Buffer.from(f.files.get(DIR+'/runtime.json').contents);
+ await rejects(f.adapter.stop({deadline:f.limits.deadline+120000}),'STOP_PENDING');const after=f.events.length;
+ await rejects(f.adapter.stop({deadline:f.limits.deadline+120000}),'STOP_PENDING');assert.equal(f.events.length,after);assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,bytes);
+ assert.equal(f.events.filter(e=>e.type==='close'&&e.path===DIR+'/owner.lock').length,1);
+});
 test('failed-renewal exact pending persistence fresh proves seven stopped IDs without dispatch or acknowledgement',async()=>{
  const f=await failedRenewalPendingPersistence(),original=persistenceIntents(f),recorded=f.adapter.resources().containers,before=f.events.length;
  assert.equal(Object.keys(recorded).length,7);assert.deepEqual(original.at(-1),{action:'PERSIST_WEBHOOK',name:'backend-key-persistence',status:'DISPATCHING'});

@@ -23,6 +23,8 @@
 - Pending unknown creation, extra/foreign/replaced/running resource: no new cleanup authority.
 - Existing stale/malformed/foreign writer: no access, unlink, adoption or false release claim.
 - Reporter handoff followed by canary/error/duplicate/foreign annotations: no sensitive output or false pass.
+- Every failed persistence stays outside generic all-ACK cleanup. Exact seven-resource proof requires the retained owner descriptor, publishes no ledger and preserves exact durable bytes and memory projections through dispatch/ACK/close uncertainty; the descriptor grants one proof only.
+- Terminal delivery requires exactly one clean pre-end onTestBegin baseline matching the exact target case/file/project/expected status, zero retry and the same TestCase/TestResult identities. Reject reserved static annotations even when setup failure copies them into both native end arrays; preserve the existing success predicate.
 
 ### Task 1: Failed-mode run-scoped persistence and exact stopped proof
 
@@ -45,3 +47,10 @@
 - [ ] Root audit and explicit RED, then release minimal integration. No broad reporter overrides, raw error output or new IO.
 - [ ] Document run-scoped verifier, untouched historical writer and the distinction between stopped proof and consumed persistence. Preserve old historical failure evidence and current Stage5B NOT_ACCEPTED.
 - [ ] Root targeted/related GREEN and strict cached TS checks, independent task review/fixes, commit. One final strongest-model source review of this bugfix range; no native run. Keep branch and evidence; choose publication under standing user authority after tests/reviews, never claim prior-head CI as current proof.
+
+### Consolidated final review fixes
+
+- [x] Author source-only regressions for initial intent write, ACK temporary write/file sync/post-rename directory sync and post-ACK input close. Each covers inactive proof, unexpected running service/helper, exact durable bytes and repeated-stop refusal; cover ambiguous owner close separately.
+- [x] Author actual reporter regressions for copied reserved static annotations on setup failure, clean late native end delivery, missing/mismatched/repeated begin proof and reserved/retried baselines.
+- [x] After Root's intended RED release, implement exclusive one-use proof-only failed-persistence cleanup without ledger publication and reporter clean-begin provenance; update design/runbook.
+- [ ] Root runs audited affected/related regressions and strict cached Playwright 1.63.0 typecheck, then one scoped independent re-review. Worker makes no execution claim; native spec remains unexecuted. Historical persistence remains UNKNOWN and full Stage 5B remains NOT_ACCEPTED.
