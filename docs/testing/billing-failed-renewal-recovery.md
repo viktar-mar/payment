@@ -1,5 +1,13 @@
 # Failed renewal, fixed grace and recovery — offline guide
 
+## Recovered access after G+1
+
+The unpaid baseline at `3388363cac2046b5c3354b6d2456005ff2f84752` is verified separately. In the new hosted case the same customer and subscription first receive GRACE at G−1 and EXPIRED at G and G+1. An explicit browser METHOD reservation pins the original AFTER. From reservation through SETUP, METHOD, RECOVER and confirmation ACK, exact reads refuse with `OWNED_TIME_AUTHORITY_MISSING`. Neither an ACK nor an ACTIVE row proves receipt of money.
+
+The original independent 15-GET observer and FactService must commit the cash, journals and publication for the original bill and intent. Exact get/access then return PAID at the saved AFTER, with no debt, no isolated actions and validity through the earlier of G+1 plus 300 seconds and paid-through. The writer still evaluates at original READY2; receipt and enqueue times use operational UTC. Repeated reads, including after recorded producer leases and budgets expire, must leave every receipt, payment, event, pending outbox row, delivery and retry row unchanged.
+
+These genuine cases are compile-only locally. Exact-head hosted checks for the new source are **PENDING**; see the [acceptance record](../stage-5b-acceptance.md#owned-grace-deadline-and-following-second--2026-11-14) for the separate intermediate failures. No native provider call or delivered callback is established. Native failed renewal, grace and recovery are **NOT_RUN**; full Stage 5B is **NOT_ACCEPTED**.
+
 Status at the offline pre-publication checkpoint on 2026-11-06: the internal owned-recovery backend has the source-bound hosted verification recorded [below](#owned-failed-renewal-backend-checkpoint-offline). The later persisted failed-renewal observer is prepared and verified with local in-memory SDK tests; its new JDBC composition is authored and compiled, with **hosted execution PENDING at that checkpoint**. Subsequent exact-source CI results are recorded separately in the observer plan ledger and publication receipt. Native failed-renewal recovery is **NOT_RUN** and full Stage 5B remains **NOT_ACCEPTED**. The earlier test-only component at source `28acc7c0438d61f36962c37a3a3d3a0f18cbd943` and its synthetic fixture retain their historical scope. This guide grants no Sandbox invocation or financial authority.
 
 The [2026-11-08 checkpoint](#persisted-original-ready2-billing-time--2026-11-08) records the verified recovery composition and persisted-time selector. The V38 G−1 preparation subsequently passed at `70149417c0f9a2b08f399aee70c2364bcf0cd02a`, the V39 producer at `48867911041b2cfa48ba222530c4529f92289c79` and the original exact-read selector at `03f3757`. The current V40 checkpoint and earlier dated evidence follow.

@@ -113,6 +113,25 @@ class SubscriptionBillingTimeServiceTest {
             assertThat(access.evaluatedAt()).isEqualTo(at);
         }
     }
+    @Test void recoveredPaidGetAndAccessUseSavedAfterAndCapValidityAtPaidThrough(){
+        var after=Instant.parse("2026-09-04T00:00:01Z");
+        for(var end:List.of(Instant.parse("2026-10-01T00:00:00Z"),after.plusSeconds(20))){
+            var s=SubscriptionFixtures.active(Instant.parse("2026-09-01T00:00:00Z"),end);
+            var reads=port(SubscriptionReadPort.class,(m,a)->switch(m){case "current"->Optional.of(s);case "unresolvedOperation"->Optional.empty();default->throw new AssertionError(m);});
+            var selected=new ArrayList<Subscription>();
+            var time=port(SubscriptionBillingTimePort.class,(m,a)->{
+                assertThat(m).isEqualTo("sampleForRead");assertThat(a).containsExactly(s,UTC);selected.add((Subscription)a[0]);
+                return new SubscriptionBillingTimePort.Sample(after,SubscriptionBillingTimePort.Mode.ISOLATED);
+            });
+            var query=query(s,time,reads);
+            var view=query.get(null,s.siteId(),s.id());var access=query.access(null,s.siteId(),s.customerId(),s.productId());
+            assertThat(selected).containsExactly(s,s);assertThat(view.subscription()).isSameAs(s);
+            assertThat(view.subscription().billingStatus()).isEqualTo(Subscription.Status.ACTIVE);
+            assertThat(view.debt()).isNull();assertThat(view.permittedActions()).isEmpty();
+            assertThat(view.access()).isEqualTo(access);assertThat(access.allowed()).isTrue();assertThat(access.reason()).isEqualTo(AccessDecision.Reason.PAID);
+            assertThat(access.evaluatedAt()).isEqualTo(after);assertThat(access.validUntil()).isEqualTo(end.isBefore(after.plusSeconds(300))?end:after.plusSeconds(300));
+        }
+    }
     @Test void accessWithoutSubscriptionUsesOperationalUtcWithoutReadTimeSelection() {
         var s=SubscriptionFixtures.active(UTC,UTC.plus(Duration.ofDays(30)));
         var reads=port(SubscriptionReadPort.class,(m,a)->{assertThat(m).isEqualTo("current");return Optional.empty();});

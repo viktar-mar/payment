@@ -215,6 +215,28 @@ class OwnedFailedGraceBillingTimeTest {
         row.put("paid_through",Timestamp.from(Instant.ofEpochSecond(1702678400L)));row.put("debt_billing_record_id",id(7));row.put("grace_deadline",Timestamp.from(Instant.ofEpochSecond(LAST_SECOND+1)));row.put("revision",3L);
         row.put("created_at",Timestamp.from(Instant.ofEpochSecond(1700000000L)));row.put("updated_at",Timestamp.from(Instant.ofEpochSecond(READY2)));return row;
     }
+    @Test void taggedCandidateSelectsOnlyIndependentlyProjectedPaidAfterEvenWhenLowerPhaseIsValid(){
+        var old=subscription();var period=old.currentPeriod();
+        var paid=new Subscription(old.id(),old.siteId(),old.customerId(),old.productId(),old.paymentAccountId(),
+            old.billingPrice(),old.entitledPrice(),Subscription.Status.ACTIVE,old.providerReference(),period,period.end(),
+            null,null,null,null,null,4,old.createdAt(),old.updatedAt(),null);
+        for(String proof:List.of("complete","partial","missing-after","foreign","ambiguous"))withRows((h,jdbc)->{
+            // The old G−1 phase is good. Discovery of a tag must eclipse it even if the
+            // independent publication flag is false/NULL, or the AFTER tuple is incomplete.
+            var row=candidate(true,LAST_SECOND);row.put("billing_status","ACTIVE");row.put("revision",4L);
+            row.put("paid_through",Timestamp.from(period.end()));
+            for(String field:List.of("debt_billing_record_id","debt_period_start","debt_period_end","grace_deadline"))row.put(field,null);
+            row.put("owned_successor_present",true);
+            row.put("owned_successor_projected",proof.equals("foreign")?null:!proof.equals("partial"));
+            row.put("owned_after_frozen_time",proof.equals("missing-after")?null:LAST_SECOND+2);
+            jdbc.results.add(proof.equals("ambiguous")?List.of(row,candidate(false,READY2)):List.of(row));
+            var selector=selector(h,jdbc);
+            if(proof.equals("complete"))assertThat(selector.sampleForRead(paid,UTC)).isEqualTo(new Sample(Instant.ofEpochSecond(LAST_SECOND+2),Mode.ISOLATED));
+            else assertThatThrownBy(()->selector.sampleForRead(paid,UTC)).as(proof)
+                .hasMessage(proof.equals("ambiguous")?"OWNED_TIME_AUTHORITY_AMBIGUOUS":"OWNED_TIME_AUTHORITY_MISSING");
+            assertThat(jdbc.calls).isOne();
+        });
+    }
     private static Map<String,Object> oldCandidate(boolean valid){return Map.of("valid",valid,"frozen_time",READY2,"target",READY2,"transaction_id","inert-old-xact");}
     /** No connection acquisition, driver, SQL, context, threads, provider or database. */
     private static final class Rows extends JdbcTemplate{

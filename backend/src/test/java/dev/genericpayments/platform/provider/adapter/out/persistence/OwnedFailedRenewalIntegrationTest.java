@@ -287,7 +287,8 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         final Map<Origin,ProviderOperation> dispatches=new EnumMap<>(Origin.class);
         Map<String,List<String>> beforeFailure;
         Origin failAfterAck,failReceipt,observeClaim;
-        boolean drainAck,receiptVisibleBeforeRollback;int observedAckChecks;
+        boolean drainAck,inspectPublication,receiptVisibleBeforeRollback;int observedAckChecks,publicationChecks;
+        java.sql.Savepoint publicationSavepoint;
         private void remember(Origin origin,UUID id,SuccessorOwner owner,Runnable action){
             assertThat(ids.putIfAbsent(origin,id)).isNull();assertThat(owners.containsValue(owner)).isFalse();
             owners.put(origin,owner);delayed.put(origin,action);
@@ -309,6 +310,22 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                 remember(origin,q.id(),owner,()->methodService(new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory))
                     .terminateSuccessorRead(reservation,q,OwnedFailedRenewal.Reason.UNCERTAIN,owner));
                 if(observeClaim==origin)beforeFailure=successorRows();
+            }else if(name.equals("recordPublicationInTransaction")&&inspectPublication){
+                // Actual publication and projected cash already exist on this physical caller.
+                jdbc.execute((org.springframework.jdbc.core.ConnectionCallback<Void>)connection->{
+                    assertThat(count("stripe_billing_failed_method_publications")).isOne();
+                    var paid=current();assertThat(paid.billingStatus()).isEqualTo(Subscription.Status.ACTIVE);
+                    assertExactSampleMissing(paid);jdbc.execute("set constraints all immediate");connection.releaseSavepoint(publicationSavepoint);
+                    assertExactSampleMissing(paid);
+                    try(var workers=new BoundedWorkers()){
+                        assertThat(workers.submit(()->transaction.required(()->{
+                            assertThat(count("stripe_billing_failed_method_publications")).isZero();
+                            var prior=current();assertThat(prior.billingStatus()).isEqualTo(Subscription.Status.PAST_DUE);
+                            assertExactSampleMissing(prior);return true;
+                        })).get(5,TimeUnit.SECONDS)).isTrue();
+                    }catch(Exception failure){throw new IllegalStateException("Independent publication reader failed",failure);}
+                    publicationChecks++;return null;
+                });
             }else if(failReceipt!=null&&name.equals(failReceipt==Origin.METHOD_READ?"recordCompletionInTransaction":"recordPublicationInTransaction")){
                 assertThat(count(failReceipt==Origin.METHOD_READ?"stripe_billing_failed_method_completions":"stripe_billing_failed_method_publications")).isEqualTo(1);
                 receiptVisibleBeforeRollback=true;
@@ -341,13 +358,16 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     private <T>T observeSuccessorPort(Class<T> type,T real){
         if(successorCalls==null)return real;
         return type.cast(Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{type},(proxy,method,args)->{
+            if(successorCalls.inspectPublication&&method.getName().equals("recordPublicationInTransaction"))
+                successorCalls.publicationSavepoint=jdbc.execute((org.springframework.jdbc.core.ConnectionCallback<java.sql.Savepoint>)connection->connection.setSavepoint());
             try{var result=method.invoke(real,args);successorCalls.after(method.getName(),args,result);return result;}
             catch(InvocationTargetException error){throw error.getCause();}
         }));
     }
     private Map<String,List<String>> successorRows(){
         var state=new TreeMap<>(boundaryRows());
-        for(String t:List.of("stripe_billing_failed_grace_method_claims",SUCCESSOR_TERMINALS,"stripe_subscription_recovery_proofs"))
+        for(String t:List.of("stripe_billing_failed_grace_method_claims",SUCCESSOR_TERMINALS,"stripe_subscription_recovery_proofs",
+                "site_allowed_origins","audit_log","idempotency_records","customer_idempotency_records"))
             state.put(t,rows(t));
         return state;
     }
@@ -403,7 +423,10 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(finalRows.toString()).doesNotContain(owner.nonce().toString());assertThat(http.calls).hasSize(calls);
     }
     private ReservedMethod successorReservedMethod(){
-        var e=afterEntry();var p=e.prepared();var auth=managementAuthentication("genuine-successor-method");
+        return successorReservedMethod(afterEntry(),managementAuthentication("genuine-successor-method"));
+    }
+    private ReservedMethod successorReservedMethod(AfterEntry e,ManagementAuthentication auth){
+        var p=e.prepared();
         var service=methodService(observeSuccessorPort(OwnedFailedRenewalMethodStore.class,new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory)));
         var r=service.reserveBrowserMethodAfterGrace(p.setup().admission(),e.successor(),auth.context(),true);
         if(successorCalls!=null)successorCalls.reservation=r;
@@ -700,6 +723,9 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             var prior=svc.reserveBrowserMethodAfterGrace(a,s,ctx,true);
             assertThat(lifecycleOperations.find(site,current().id(),prior.setupOperationId()).orElseThrow().status()).isEqualTo(SubscriptionOperation.Status.RESERVED);
             assertThat(count("stripe_billing_failed_method_reservations")).isZero();
+            assertThat(count("stripe_billing_failed_grace_setup_origins")).isOne();
+            assertThat(jdbc.queryForObject("select owned_grace_successor_present(?)",Boolean.class,a.id())).isTrue();
+            assertGraceReadDenied(graceReadTime(),current());
             var session=((SubscriptionActor.Customer)ctx.actor()).session();var enrollment=new OwnedMethodBrowser.Enrollment(session.sessionId().value(),session.origin(),session.expiresAt());
             // B has every genuine input except the SETUP INSERT. It must fail without any early drain.
             assertThatThrownBy(()->transaction.requiresNew(()->{insertRawHandoff(prior,enrollment);return true;}))
@@ -3580,16 +3606,33 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     }
     @ParameterizedTest @ValueSource(booleans={false,true})
     void bothBrowserPathsConfirmOnceAtActualAfterThenOnlyOriginalIndependentObserverSettles(boolean legacy) throws Exception{
-        successorCalls=new SuccessorCalls();successorCalls.drainAck=true;
-        var pending=pendingMethod(successorReservedMethod(),true);var r=pending.reservation();
+        successorCalls=new SuccessorCalls();successorCalls.drainAck=true;successorCalls.inspectPublication=true;
+        var g=gracePrepared();var auth=managementAuthentication("genuine-successor-method");var actor=auth.context().actor();
+        var original=new GraceSdk(g);original.queue();original.advance();
+        var debt=current();var deadline=debt.debt().graceDeadline();var selected=deadline.plusSeconds(1);
+        assertThat(debt.debt().billingRecordId()).isEqualTo(g.context().failure().billId());
+        assertSuccessorView(actor,debt,deadline.minusSeconds(1),AccessDecision.Reason.GRACE);
+        advanceBoundary(g,OwnedFailedGraceBoundary.Phase.AT,deadline.minusSeconds(1).getEpochSecond());
+        assertSuccessorView(actor,debt,deadline,AccessDecision.Reason.EXPIRED);
+        var after=advanceBoundary(g,OwnedFailedGraceBoundary.Phase.AFTER,deadline.getEpochSecond());
+        assertSuccessorView(actor,debt,selected,AccessDecision.Reason.EXPIRED);
+        var saved=new OwnedFailedRenewalMethod.GraceSuccessor(g.context().preparation().id(),after.id(),after.observation(),after.observedAt());
+        var entry=successorReservedMethod(new AfterEntry(g,saved),auth);var r=entry.reservation();
+        assertThat(r.successor()).isEqualTo(saved);assertThat(r.failure()).isEqualTo(g.context().failure());
+        assertSuccessorViewsMissing(actor,debt);
+        var pending=pendingMethod(entry,true);assertSuccessorViewsMissing(actor,debt);
         var history=graceSdkHistory();var boundaries=new TreeMap<String,List<String>>();
         for(String table:BOUNDARY_TABLES)boundaries.put(table,rows(table));
         successorCalls.stale(Origin.SETUP_WRITE);
         var p=recoveryPrepared(pending,legacy);successorCalls.stale(Origin.SETUP_WRITE,Origin.METHOD_WRITE,Origin.METHOD_READ);
+        assertSuccessorViewsMissing(actor,debt);
         var before=successorRows();int calls=http.calls.size();
         assertThatThrownBy(()->methodObserver(pending.service()).observeRecovery(r,p.recovery())).isInstanceOf(PaymentApplicationException.class);
         assertThat(successorRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
         assertSingleUseRecoveryComposition(p,true);
+        assertThat(successorCalls.publicationChecks).isOne();
+        var paid=current();assertThat(paid.id()).isEqualTo(debt.id());assertThat(paid.paidThrough()).isEqualTo(debt.debt().unpaidPeriod().end());
+        assertSuccessorView(actor,paid,selected,AccessDecision.Reason.PAID);
         assertThat(successorCalls.observedAckChecks).isEqualTo(1);assertThat(successorCalls.ids).hasSize(5);
         assertThat(count("stripe_billing_failed_grace_method_claims")).isEqualTo(2);assertThat(count(SUCCESSOR_TERMINALS)).isZero();
         assertThat(jdbc.queryForObject("select owned_grace_publication_proof(?,clock_timestamp(),pg_current_xact_id(),false)",Boolean.class,r.id())).isTrue();
@@ -3606,8 +3649,57 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         successorCalls.stale(Origin.values());
         var allRows=successorRows().toString();
         for(var owner:successorCalls.owners.values())assertThat(allRows).doesNotContain(owner.nonce().toString());
-        boundaries.forEach((table,saved)->assertThat(rows(table)).isEqualTo(saved));assertThat(graceSdkHistory()).isEqualTo(history);
+        boundaries.forEach((table,originalRows)->assertThat(rows(table)).isEqualTo(originalRows));assertThat(graceSdkHistory()).isEqualTo(history);
         assertIncompleteSuccessorPublicationDenied(r);
+        for(String field:List.of("id","account","site","customer","price","product","revision")){
+            transaction.required(()->{assertExactSampleMissing(graceSuppliedCopy(paid,field));return true;});
+        }
+        var finalRows=successorRows();int finalCalls=http.calls.size();
+        awaitSuccessorProducerExpiry(r);
+        assertSuccessorView(actor,paid,selected,AccessDecision.Reason.PAID);
+        assertThat(successorRows()).isEqualTo(finalRows);assertThat(http.calls).hasSize(finalCalls);
+    }
+    private void assertExactSampleMissing(Subscription supplied){
+        assertThatThrownBy(()->graceReadTime().sampleForRead(supplied,Instant.now())).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+    }
+    private void assertSuccessorViewsMissing(SubscriptionActor actor,Subscription exact){
+        var before=successorRows();int calls=http.calls.size();var query=graceQueries();
+        assertThatThrownBy(()->query.get(actor,site,exact.id())).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+        assertThatThrownBy(()->query.access(actor,site,customer,exact.productId())).hasMessage("OWNED_TIME_AUTHORITY_MISSING");
+        assertThat(successorRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+    }
+    private void assertSuccessorView(SubscriptionActor actor,Subscription exact,Instant selected,AccessDecision.Reason reason){
+        var before=successorRows();int calls=http.calls.size();var query=graceQueries();
+        for(int repeat=0;repeat<2;repeat++){
+            var view=query.get(actor,site,exact.id());var access=query.access(actor,site,customer,exact.productId());
+            assertThat(view.subscription()).isEqualTo(exact);assertThat(view.access()).isEqualTo(access);assertThat(view.permittedActions()).isEmpty();
+            assertThat(access.evaluatedAt()).isEqualTo(selected);assertThat(access.reason()).isEqualTo(reason);
+            assertThat(access.allowed()).isEqualTo(reason!=AccessDecision.Reason.EXPIRED);
+            if(reason==AccessDecision.Reason.PAID){
+                assertThat(exact.billingStatus()).isEqualTo(Subscription.Status.ACTIVE);assertThat(exact.debt()).isNull();assertThat(view.debt()).isNull();
+                assertThat(access.validUntil()).isEqualTo(selected.plusSeconds(300).isBefore(exact.paidThrough())?selected.plusSeconds(300):exact.paidThrough());
+            }else{
+                assertThat(exact.billingStatus()).isEqualTo(Subscription.Status.PAST_DUE);assertThat(view.debt().billingRecordId()).isEqualTo(exact.debt().billingRecordId());
+                assertThat(view.debt().graceDeadline()).isEqualTo(exact.debt().graceDeadline());
+                assertThat(access.validUntil()).isEqualTo(reason==AccessDecision.Reason.GRACE?exact.debt().graceDeadline():null);
+            }
+        }
+        assertPersistedSampleUnchanged();assertThat(successorRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+    }
+    private void awaitSuccessorProducerExpiry(OwnedFailedRenewalMethod.Reservation r)throws InterruptedException{
+        var limit=Instant.now().plusSeconds(70);
+        while(Instant.now().isBefore(limit)){
+            if(Boolean.TRUE.equals(jdbc.queryForObject("""
+                select clock_timestamp()>greatest(
+                 (select greatest(deadline_at,deadline) from stripe_billing_failed_grace_claims where preparation_id=?),
+                 (select max(greatest(deadline_at,deadline)) from stripe_billing_failed_grace_boundary_claims where preparation_id=?),
+                 (select max(lease_expires_at) from stripe_billing_failed_grace_method_claims where reservation_id=?),
+                 (select max(deadline_at) from stripe_billing_failed_method_reads where reservation_id=?),
+                 (select greatest(deadline_at,deadline) from stripe_billing_failed_recovery_confirm_claims where reservation_id=?))
+                """,Boolean.class,r.successor().preparationId(),r.successor().preparationId(),r.id(),r.id(),r.id())))return;
+            Thread.sleep(150);
+        }
+        throw new AssertionError("Original producer leases and invocation deadlines did not expire");
     }
     private void assertSingleUseRecoveryComposition(RecoveryPrepared p,boolean persistedTime){
         var c=inspectRecovery(p);var before=financialState();
@@ -3638,6 +3730,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(recovery.state()).isEqualTo(State.NEW);assertThat(recovery.confirmation()).isEmpty();assertThat(recovery.publication()).isEmpty();
         recoveryCompositionRefused(recovery::observe);assertThat(recovery.state()).isEqualTo(State.NEW);assertThat(http.calls).hasSize(start);
         var ack=recovery.confirm();assertThat(recovery.state()).isEqualTo(State.CONFIRMED);assertThat(recovery.confirmation()).containsSame(ack);assertThat(recovery.publication()).isEmpty();
+        if(c.reservation().successor()!=null)assertSuccessorViewsMissing(p.pending().context().actor(),current());
         if(successorCalls!=null)successorCalls.stale(Origin.RECOVERY_CONFIRM);
         if(persistedTime)assertPersistedSampleUnchanged();
         var calls=http.calls.subList(start,http.calls.size());assertThat(calls).hasSize(18);
@@ -3731,6 +3824,20 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             .containsEntry("site_id",site.value().toString()).containsEntry("subscription_id",originalSubscription.toString()).containsEntry("billing_record_id",originalDebt.toString())
             .containsEntry("customer_id",customer.value().toString()).containsEntry("revision",Long.toString(c.subscription().revision()+1))
             .containsEntry("state","ACTIVE").containsEntry("payment_id",null);
+        if(c.reservation().successor()!=null){
+            assertThat(jdbc.queryForObject("""
+                select e.occurred_at=r.billing_at and e.received_at between q.started_at and p.published_at
+                 and (o.payload->>'occurred_at')::timestamptz=r.billing_at and (o.payload->>'access_allowed')::boolean
+                 and (o.payload->>'access_valid_until')::timestamptz=r.billing_at+interval '300 seconds'
+                 and o.created_at between q.started_at and p.published_at and o.created_at=o.next_attempt_at
+                 and o.lease_owner is null and o.lease_expires_at is null
+                from stripe_billing_failed_method_reservations r join stripe_billing_failed_method_publications p on p.reservation_id=r.id
+                join stripe_billing_failed_method_reads q on q.id=p.claim_id join subscription_events e on e.id=?
+                join outbox_events o on o.id=e.id where r.id=?
+                """,Boolean.class,recoverySubscriptionEvent.get("id"),c.reservation().id())).isTrue();
+            assertThat(count("outbox_deliveries")).isZero();
+            assertThat(jdbc.queryForObject("select count(*) from provider_operations where kind='INVOICE_PAY'",Long.class)).isZero();
+        }
         var settled=financialState();var settledReceipts=confirmationRows();int settledCalls=http.calls.size();
         recoveryCompositionRefused(recovery::confirm);recoveryCompositionRefused(recovery::observe);
         assertThat(recovery.state()).isEqualTo(State.COMPLETE);assertThat(recovery.confirmation()).containsSame(ack);assertThat(recovery.publication()).containsSame(publication);
@@ -3747,10 +3854,44 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
 
     private void assertIncompleteSuccessorPublicationDenied(OwnedFailedRenewalMethod.Reservation r){
         var before=successorRows();int calls=http.calls.size();
+        var paid=current();var selected=Instant.ofEpochSecond(r.remoteClock().frozenTime());
         for(String damage:List.of("cash-without-publication","missing-ack","same-writer-ack","late-ack",
-                "confirm-key","method-key","confirm-kind","method-kind","publisher-self")){
+                "confirm-key","method-key","confirm-kind","method-kind","publisher-self","xid-reuse","missing-owner",
+                "paid-sequence","bill-version","phase-clock","credentials","publication-claim","journal-amount")){
             assertThatThrownBy(()->transaction.requiresNew(()->{
                 switch(damage){
+                    case "paid-sequence"->assertThat(jdbc.update("update subscriptions set observation_sequence=observation_sequence+1 where id=?",paid.id())).isOne();
+                    case "bill-version"->assertThat(jdbc.update("update subscription_billing_records set version=version+1 where id=?",r.failure().billId())).isOne();
+                    case "credentials"->assertThat(jdbc.update("update payment_accounts set credentials_ref='negative-paid-read' where id=?",billing.id().value())).isOne();
+                    case "journal-amount"->{
+                        jdbc.execute("alter table payment_events disable trigger trg_payment_events_append_only");
+                        assertThat(jdbc.update("""
+                            update payment_events e set amount_minor=e.amount_minor+1 from stripe_billing_failed_method_publications p
+                            where p.reservation_id=? and e.payment_id=p.renewal_payment and e.event_type='PAYMENT_SUCCEEDED'
+                            """,r.id())).isOne();
+                    }
+                    case "publication-claim"->{
+                        jdbc.execute("alter table stripe_billing_failed_method_publications disable trigger failed_method_publication_immutable");
+                        assertThat(jdbc.update("""
+                            update stripe_billing_failed_method_publications p set claim_id=q.id from stripe_billing_failed_method_reads q
+                            where p.reservation_id=q.reservation_id and q.phase='METHOD' and p.reservation_id=?
+                            """,r.id())).isOne();
+                    }
+                    case "phase-clock"->{
+                        jdbc.execute("alter table stripe_billing_failed_grace_boundary_ready disable trigger boundary_ready_immutable");
+                        assertThat(jdbc.update("update stripe_billing_failed_grace_boundary_ready set name='wrong-AT' where preparation_id=? and phase=2",r.successor().preparationId())).isOne();
+                    }
+                    case "missing-owner"->{
+                        jdbc.execute("alter table stripe_billing_failed_method_reads disable trigger failed_method_read_immutable");
+                        assertThat(jdbc.update("update stripe_billing_failed_method_reads set successor_owner_digest=null where reservation_id=? and phase='METHOD'",r.id())).isOne();
+                    }
+                    case "xid-reuse"->{
+                        jdbc.execute("alter table stripe_billing_failed_method_publications disable trigger failed_method_publication_immutable");
+                        assertThat(jdbc.update("""
+                            update stripe_billing_failed_method_publications p set successor_producer_xid=r.handoff_xid
+                            from stripe_billing_failed_method_reservations r where p.reservation_id=r.id and r.id=?
+                            """,r.id())).isOne();
+                    }
                     case "cash-without-publication"->{
                         jdbc.execute("alter table stripe_billing_failed_method_publications disable trigger failed_method_publication_immutable");
                         assertThat(jdbc.update("delete from stripe_billing_failed_method_publications where reservation_id=?",r.id())).isEqualTo(1);
@@ -3788,10 +3929,14 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
                         jdbc.execute("alter table stripe_billing_failed_recovery_confirm_acks enable trigger owned_recovery_confirm_ack_immutable");
                     }
                 }
-                assertThat(jdbc.queryForObject("select owned_grace_publication_proof(?,clock_timestamp(),pg_current_xact_id(),false)",Boolean.class,r.id())).as(damage).isFalse();
+                var damaged=successorRows();
+                if(!Set.of("xid-reuse","journal-amount").contains(damage))
+                    assertThat(jdbc.queryForObject("select owned_grace_publication_proof(?,clock_timestamp(),pg_current_xact_id(),false)",Boolean.class,r.id())).as(damage).isFalse();
+                assertExactSampleMissing(current());assertThat(successorRows()).isEqualTo(damaged);
                 throw new IllegalStateException("rollback damaged successor");
             })).hasMessage("rollback damaged successor");
             assertThat(successorRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
+            assertThat(transaction.required(()->graceReadTime().sampleForRead(paid,Instant.now())).billingAt()).as(damage).isEqualTo(selected);
         }
     }
     private void insertForeignMethodKey(OwnedFailedRenewalMethod.Reservation r,String key){
@@ -3888,6 +4033,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(jdbc.queryForObject("select successor_owner_digest from stripe_billing_failed_method_reads where id=?",String.class,id)).isEqualTo(owner.commitment(origin,id));
         String reason=failure.equals("rollback")?"AUTHORITY_DRIFT":"UNCERTAIN";
         assertTerminalDelta(successorCalls.beforeFailure,r,id,origin.name(),owner.commitment(origin,id),reason,null);
+        assertSuccessorViewsMissing(pending.context().actor(),current());
         assertThat(financialState()).isEqualTo(money);assertThat(count("payments")).isEqualTo(1);successorCalls.stale(origin);
     }
     @ParameterizedTest @ValueSource(strings={"ready2-open","grace-close","bad-confirm"})

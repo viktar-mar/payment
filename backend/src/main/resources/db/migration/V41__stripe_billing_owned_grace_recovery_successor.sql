@@ -895,3 +895,106 @@ end $$;
 create trigger grace_live_operation_progress before update of status on subscription_operations for each row
  when(old.kind in ('SETUP','RECOVER') and new.status in ('PROCESSING','SUCCEEDED') and new.status<>old.status)
  execute function require_live_grace_operation_progress();
+
+-- Refusal locators, not proof. Start separately from each original ownership key:
+-- a broken reservation/preparation/AFTER/payment link must not hide a tagged child.
+-- NULL identifies a terminal, or an original SETUP insert with no matching handoff.
+create function owned_grace_successor_locators(admission uuid) returns table(reservation_id uuid)
+ language sql stable set join_collapse_limit=1 as $$
+ with d as materialized(select id,subscription_id from stripe_billing_failed_renewals where id=$1),
+ ops as materialized(select o.id from subscription_operations o,d where o.subscription_id=d.subscription_id
+   or o.authority_scope in ('owned-failed-renewal-method:'||d.id::text,'owned-failed-renewal:'||d.id::text)),
+ steps as materialized(select id from provider_operations where resource_id in(select id from ops)),
+ preps as materialized(select id from stripe_billing_failed_grace_preparations where admission_id=$1),
+ boundaries as materialized(select id from stripe_billing_failed_grace_boundary_ready
+   where admission_id=$1 or preparation_id in(select id from preps)),
+ origins as materialized(select o.* from stripe_billing_failed_grace_setup_origins o
+   where o.admission_id=$1 or o.setup_operation in(select id from ops) or o.after_ready_id in(select id from boundaries)
+     or o.after_preparation_id in(select id from preps)),
+ reservations as materialized(select r.* from stripe_billing_failed_method_reservations r
+   where r.admission_id=$1 or r.setup_operation in(select id from ops) or r.after_ready_id in(select id from boundaries)
+     or r.after_preparation_id in(select id from preps) or r.setup_operation in(select setup_operation from origins)),
+ reads as materialized(select q.* from stripe_billing_failed_method_reads q
+   where q.reservation_id in(select id from reservations) or q.selected_operation in(select id from ops)),
+ confirms as materialized(select q.* from stripe_billing_failed_recovery_confirm_claims q
+   where q.reservation_id in(select id from reservations) or q.provider_operation in(select id from steps))
+ select id from reservations where num_nonnulls(after_ready_id,after_preparation_id,after_phase,handoff_xid)>0
+ union all select r.id from origins o left join reservations r on
+   (r.setup_operation,r.admission_id,r.after_ready_id,r.after_preparation_id,r.after_phase,r.handoff_xid)
+   =(o.setup_operation,o.admission_id,o.after_ready_id,o.after_preparation_id,o.after_phase,o.producer_xid)
+ union all select q.reservation_id from stripe_billing_failed_grace_method_claims q where q.reservation_id in(select id from reservations)
+   or q.setup_operation in(select id from ops) or q.operation_id in(select id from steps)
+ union all select q.reservation_id from reads q where q.successor_producer_xid is not null or q.successor_owner_digest is not null
+ union all select c.reservation_id from stripe_billing_failed_method_completions c where c.successor_producer_xid is not null
+   and (c.reservation_id in(select id from reservations) or c.claim_id in(select id from reads) or c.setup_operation in(select id from ops)
+     or c.setup_step in(select id from steps) or c.method_step in(select id from steps))
+ union all select x.reservation_id from stripe_billing_failed_method_recoveries x where x.successor_producer_xid is not null
+   and (x.reservation_id in(select id from reservations) or x.operation_id in(select id from ops))
+ union all select q.reservation_id from confirms q where q.successor_owner_digest is not null
+ union all select a.reservation_id from stripe_billing_failed_recovery_confirm_acks a where a.successor_producer_xid is not null
+   and (a.reservation_id in(select id from reservations) or a.provider_operation in(select provider_operation from confirms)
+     or a.provider_operation in(select id from steps))
+ union all select p.reservation_id from stripe_billing_failed_method_publications p where p.successor_producer_xid is not null
+   and (p.reservation_id in(select id from reservations) or p.claim_id in(select id from reads) or p.operation_id in(select id from ops)
+     or p.renewal_payment in(select id from payments where subscription_id in(select subscription_id from d)
+       or billing_record_id in(select renewal_bill from stripe_billing_failed_renewal_failures where admission_id=$1)))
+ union all select null::uuid from stripe_billing_failed_grace_successor_terminals t where t.admission_id=$1
+   or t.reservation_id in(select id from reservations) or t.origin_id in(select id from steps union all select id from reads)
+ union all select null::uuid from stripe_billing_failed_renewal_stops where admission_id=$1 and successor_producer_xid is not null
+$$;
+create function owned_grace_successor_present(admission uuid) returns boolean language sql stable as $$
+ select exists(select 1 from owned_grace_successor_locators($1))
+$$;
+
+-- Exact reads consume the independently committed publication, never writer-local
+-- publication authority, pre-confirm debt eligibility, or a live WRITE ACK marker.
+create function owned_grace_successor_projected(reservation uuid,utc timestamptz,reader xid8) returns boolean
+ language sql stable set join_collapse_limit=1 as $$
+ select exists(select 1 from stripe_billing_failed_method_reservations r
+ join stripe_billing_failed_grace_method_claims sw on sw.reservation_id=r.id and sw.step_kind='SETUP_INTENT_CREATE'
+ join stripe_billing_failed_grace_method_claims mw on mw.reservation_id=r.id and mw.step_kind='SUBSCRIPTION_UPDATE'
+ join stripe_billing_method_browser_roots root on (root.reservation_id,root.setup_operation,root.setup_step)=(r.id,r.setup_operation,sw.operation_id)
+ join stripe_billing_method_browser_releases rel on rel.root_id=root.id
+ join stripe_billing_method_browser_consumptions consumed on consumed.root_id=root.id
+ join stripe_billing_failed_method_reads m on m.reservation_id=r.id and m.phase='METHOD'
+ join stripe_billing_failed_method_completions c on (c.reservation_id,c.claim_id)=(r.id,m.id)
+ join stripe_billing_failed_method_recoveries x on x.reservation_id=r.id
+ join stripe_billing_failed_recovery_confirm_claims q on q.reservation_id=r.id
+ join stripe_billing_failed_recovery_confirm_acks ack on (ack.reservation_id,ack.provider_operation)=(r.id,q.provider_operation)
+ join stripe_billing_failed_method_reads obs on obs.reservation_id=r.id and obs.phase='RECOVERED'
+ join stripe_billing_failed_method_publications pub on (pub.reservation_id,pub.claim_id)=(r.id,obs.id)
+ join stripe_billing_failed_renewals d on d.id=r.admission_id
+ join stripe_billing_failed_renewal_failures f on f.admission_id=d.id
+ join subscriptions sub on sub.id=d.subscription_id
+ join payments cash on cash.id=pub.renewal_payment and cash.billing_record_id=f.renewal_bill
+ join subscription_events period on period.subscription_id=sub.id and period.billing_record_id=f.renewal_bill and period.event_type='PERIOD_PAID'
+ join subscription_event_sequences journal on journal.subscription_id=sub.id
+ join payment_events paid on paid.payment_id=cash.id and paid.event_type='PAYMENT_SUCCEEDED'
+ where r.id=$1 and r.after_ready_id is not null and owned_grace_publication_proof(r.id,$2,$3,false)
+ and not exists(select 1 from owned_grace_successor_locators(r.admission_id) e where e.reservation_id is distinct from r.id)
+ and sw.first_dispatched_at>=r.reserved_at and root.issued_at>=sw.first_dispatched_at
+ and root.expires_at=least(root.issued_at+interval '600 seconds',r.browser_session_expires_at)
+ and mw.first_dispatched_at>=consumed.consumed_at and m.started_at>=mw.first_dispatched_at
+ and c.completed_at>=m.started_at and c.completed_at<m.deadline_at and x.associated_at>=c.completed_at
+ and ack.acknowledged_at<=obs.started_at and obs.started_at<=pub.published_at and pub.published_at<=$2
+ and (period.site_id,period.payment_account_id,period.revision,period.source,period.provider_reference,period.occurred_at)
+  =(d.site_id,d.payment_account_id,pub.projected_revision,'RECONCILIATION',sub.provider_reference,r.billing_at)
+ and period.received_at between obs.started_at and pub.published_at and period.operation_id is null and period.payment_id is null
+ and period.sequence_number=journal.next_sequence
+ and (paid.site_id,paid.payment_account_id,paid.source,paid.sequence_number,paid.provider_object_id,paid.amount_minor,paid.currency)
+  =(d.site_id,d.payment_account_id,'PROVIDER_EVENT',1,f.payment_intent_reference,cash.amount_minor,cash.currency)
+ and not exists(select 1 from payment_events extra where extra.payment_id=cash.id and extra.id<>paid.id)
+ and not exists(select 1 from subscription_events extra where extra.subscription_id=sub.id
+  and extra.billing_record_id=f.renewal_bill and extra.event_type='PERIOD_PAID' and extra.id<>period.id)
+ and (select count(distinct xid)=21 and bool_and(xid<>$3) from (
+   select unnest(array[r.handoff_xid,sw.successor_producer_xid,rel.recorded_transaction,consumed.recorded_transaction,
+    mw.successor_producer_xid,m.successor_producer_xid,c.successor_producer_xid,x.successor_producer_xid,q.recorded_transaction,
+    ack.successor_producer_xid,obs.successor_producer_xid,pub.successor_producer_xid]) xid
+   union all select unnest(array[g.recorded_transaction,a.recorded_transaction,b.recorded_transaction])
+    from stripe_billing_failed_grace_claims g join stripe_billing_failed_grace_acks a using(preparation_id)
+    join stripe_billing_failed_grace_ready b using(preparation_id) where g.preparation_id=r.after_preparation_id
+   union all select unnest(array[g.producer_xid,a.producer_xid,b.producer_xid])
+    from stripe_billing_failed_grace_boundary_claims g join stripe_billing_failed_grace_boundary_acks a using(preparation_id,phase)
+    join stripe_billing_failed_grace_boundary_ready b using(preparation_id,phase) where g.preparation_id=r.after_preparation_id
+   ) producers))
+$$;

@@ -19,7 +19,7 @@ import java.util.UUID;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
-/** Hosted exact-read selector for the original G−1 READY and its two finite successors. */
+/** Hosted exact reads from original grace receipts and their committed recovered successor. */
 public final class OwnedFailedGraceBillingTime implements SubscriptionBillingTimePort {
     private static final String CALLER="OWNED_TIME_REQUIRES_CALLER_TRANSACTION";
     private static final String MISSING="OWNED_TIME_AUTHORITY_MISSING";
@@ -79,7 +79,9 @@ public final class OwnedFailedGraceBillingTime implements SubscriptionBillingTim
     private Candidate candidate(ResultSet row,int index){
         try{
             boolean valid=row.getBoolean("owned_valid");valid=valid&&!row.wasNull();
-            long epoch=row.getLong("owned_frozen_time");Long frozen=row.wasNull()?null:epoch;
+            boolean successor=row.getBoolean("owned_successor_present");
+            if(successor)valid=valid&&row.getBoolean("owned_successor_projected")&&!row.wasNull();
+            long epoch=row.getLong(successor?"owned_after_frozen_time":"owned_frozen_time");Long frozen=row.wasNull()?null:epoch;
             var transaction=row.getString("owned_transaction_id");
             var current=row.getObject("id",UUID.class)==null?null:subscriptions.map(row,index);
             return new Candidate(valid,frozen,transaction,current);
@@ -92,6 +94,7 @@ public final class OwnedFailedGraceBillingTime implements SubscriptionBillingTim
         with caller as materialized(select pg_current_xact_id() as transaction_id,clock_timestamp() as utc),
         candidates as materialized(
          select d.id,d.payment_account_id=? as account_matches,d.subscription_id,p.id as preparation,
+          owned_grace_successor_present(d.id) as successor,method.id as reservation,method.after_ready_id,
           a.id is not null and predecessor.id is not null and d.admitted_at>=predecessor.observed_at as rooted,
           predecessor.frozen_time as ready2,ready.frozen_time as last_second,
           case when orphan.after_present or owned_grace_boundary_present(p.id,3) then 3
@@ -105,6 +108,7 @@ public final class OwnedFailedGraceBillingTime implements SubscriptionBillingTim
           and a.subscription_id=d.subscription_id and a.source_sha=d.source_sha
          left join stripe_billing_first_renewal_ready predecessor on predecessor.id=d.ready_id and predecessor.admission_id=d.first_renewal_admission
          left join stripe_billing_failed_grace_preparations p on p.admission_id=d.id
+         left join stripe_billing_failed_method_reservations method on method.admission_id=d.id and method.after_ready_id is not null
          -- Without a local preparation, receipts and exact operation keys still identify
          -- conflicts by admission. These locators can only cause refusal.
          left join lateral (
@@ -123,13 +127,18 @@ public final class OwnedFailedGraceBillingTime implements SubscriptionBillingTim
          where (d.site_id=? and d.customer_id=?) or d.subscription_id=?
         )
         select s.*,caller.transaction_id::text as owned_transaction_id,
+         c.successor as owned_successor_present,after_ready.frozen_time as owned_after_frozen_time,
+         case when c.successor and after_ready.id is not null then
+          owned_grace_successor_projected(c.reservation,caller.utc,caller.transaction_id) else false end as owned_successor_projected,
          case c.phase when 0 then c.ready2 when 1 then c.last_second else boundary.frozen_time end as owned_frozen_time,
          (c.account_matches and c.rooted and owned_failed_renewal_authority(c.id)
-          and case c.phase when 0 then c.preparation is null or owned_failed_grace_identity(c.preparation)
+          and case when c.successor then true else case c.phase when 0 then c.preparation is null or owned_failed_grace_identity(c.preparation)
               when 1 then owned_grace_original_committed(c.preparation,caller.utc,caller.transaction_id)
-              else owned_grace_phase_committed(c.preparation,c.phase,caller.utc,caller.transaction_id) end) as owned_valid
+              else owned_grace_phase_committed(c.preparation,c.phase,caller.utc,caller.transaction_id) end end) as owned_valid
         from candidates c cross join caller
         left join subscriptions s on s.id=c.subscription_id
+        left join stripe_billing_failed_grace_boundary_ready after_ready
+         on after_ready.id=c.after_ready_id and after_ready.preparation_id=c.preparation and after_ready.admission_id=c.id and after_ready.phase=3
         left join stripe_billing_failed_grace_boundary_ready boundary
          on boundary.preparation_id=c.preparation and boundary.admission_id=c.id and boundary.phase=c.phase
         """;
