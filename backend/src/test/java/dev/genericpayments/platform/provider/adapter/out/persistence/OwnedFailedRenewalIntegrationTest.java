@@ -343,7 +343,12 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var supplied=new OwnedFailedRenewalMethod.GraceSuccessor(mutation.equals("root")?UUID.randomUUID():s.preparationId(),
             mutation.equals("phase")?at:s.afterReadyId(),s.clock(),mutation.equals("observed")?s.observedAt().minusSeconds(1):s.observedAt());
         if(mutation.equals("sibling"))insertOrdinaryBoundaryKey(foreignBoundaryAccount(),a.id(),OwnedFailedGraceBoundary.Phase.AFTER);
-        if(mutation.equals("session"))jdbc.update("update customer_sessions set revoked_at=clock_timestamp() where id=?",((SubscriptionActor.Customer)ctx.actor()).session().sessionId().value());
+        if(mutation.equals("session")){
+            var sessionId=((SubscriptionActor.Customer)ctx.actor()).session().sessionId().value();
+            assertThat(jdbc.update("update customer_sessions set revoked_at=clock_timestamp(),revoked_reason='LOGOUT' where id=? and revoked_at is null",sessionId)).isOne();
+            Boolean revoked=jdbc.queryForObject("select revoked_at is not null and revoked_reason='LOGOUT' from customer_sessions where id=?",Boolean.class,sessionId);
+            assertThat(revoked).isTrue();
+        }
         var svc=methodService(mutation.equals("one-arg")?new JdbcOwnedFailedRenewalMethodStore(jdbc):new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory));
         var before=boundaryRows();int calls=http.calls.size();
         assertThatThrownBy(()->{
