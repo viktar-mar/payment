@@ -26,6 +26,7 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
     private OwnedFailedGraceBoundary.BoundaryReady at,after;
     private OwnedFailedRenewalMethod.Reservation reservation;private OwnedMethodBrowserService browser;
     private SubscriptionProviderModels.NextAction action;private SubscriptionConfirmationUseCase.Session selected;
+    private OwnedFailedRenewalMethod.Completion completion;private OwnedFailedRenewalMethod.Recovery reservedRecovery;
     private OwnedBillingFailedRenewalRecovery recovery;private boolean cleaned;
 
     public OwnedBillingFailedRenewalSandboxScenario(OwnedBillingFirstPaymentRuntime.Admission owner,Function<Class<?>,Object> beans,Clock utc,Instant deadline){
@@ -101,7 +102,7 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
     });}
     @Override public JsonObject selectMethod(){return stage("METHOD_PREPARED","METHOD_SELECTED",Stage.METHOD_SELECT,()->{
         management();selected=browser.select(new SubscriptionConfirmationUseCase.Scope(browserContext("selection"),upstream.receipt().intent().subscription(),reservation.setupOperationId()),action.secret());
-        require(selected.protocol().equals("BROWSER_CONFIRM_V1")&&selected.flow()==SubscriptionClientSession.Flow.SETUP&&selected.attemptId()==null&&selected.capability()==null&&selected.actionToken().equals(action.secret()));
+        require(selected.protocol().equals("BROWSER_CONFIRM_V1")&&selected.provider().equals("stripe")&&selected.flow()==SubscriptionClientSession.Flow.SETUP&&selected.attemptId()==null&&selected.capability()==null&&selected.actionToken().equals(action.secret()));
         missingAccess();var result=response("METHOD_SELECTED");var session=new JsonObject();session.addProperty("protocol",selected.protocol());session.addProperty("provider",selected.provider());session.addProperty("flow",selected.flow().name());session.addProperty("publishable_key",selected.publishableKey());session.addProperty("client_secret",selected.clientSecret());session.addProperty("action_token",selected.actionToken());session.add("attempt_id",JsonNull.INSTANCE);session.add("capability",JsonNull.INSTANCE);session.addProperty("expires_at",selected.expiresAt().toString());result.add("session",session);return result;
     });}
     @Override public JsonObject confirmMethod(){return stage("METHOD_SELECTED","METHOD_CONSUMED",Stage.METHOD_CONFIRM,()->{
@@ -111,8 +112,8 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
     });}
     @Override public JsonObject applyMethod(){return stage("METHOD_CONSUMED","METHOD_READY",Stage.METHOD_APPLY,()->{
         var c=parts();c.binding().bind(reservation,management());c.method().apply(reservation,management());
-        c.methods.recordMethodUpdateReply(reservation,management());management();var completion=c.methodObserver().observeMethod(reservation);
-        management();var reservedRecovery=c.methods.reserveRecovery(reservation,completion);
+        c.methods.recordMethodUpdateReply(reservation,management());management();completion=c.methodObserver().observeMethod(reservation);
+        management();reservedRecovery=c.methods.reserveRecovery(reservation,completion);
         recovery=new OwnedBillingFailedRenewalRecovery(reservation,completion,reservedRecovery,management(),c.confirmer(),c.methodObserver());
         missingAccess();selected=null;action=null;return response("METHOD_READY");
     });}
@@ -149,10 +150,45 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
     }
     private static void missing(Supplier<?> read){try{read.get();}catch(IllegalStateException expected){require("OWNED_TIME_AUTHORITY_MISSING".equals(expected.getMessage()));return;}throw denied();}
     private JsonObject response(String phase){var result=initial.status();result.addProperty("phase",phase);result.addProperty("code","OK");
-        if(upstream!=null)result.addProperty("renewal_admission_id",upstream.id().toString());
-        if(pending!=null){result.addProperty("boundary_time",pending.boundary().period().start().toString());result.addProperty("period_start",pending.boundary().period().start().toString());result.addProperty("period_end",pending.boundary().period().end().toString());}
-        if(failed!=null)result.addProperty("failed_admission_id",failed.id().toString());if(failure!=null)result.addProperty("grace_deadline",failure.graceDeadline().toString());
-        if(reservation!=null)result.addProperty("method_operation_id",reservation.setupOperationId().toString());return result;
+        result.addProperty("source_sha",owner.source());result.addProperty("original_frozen_time",owner.frozen());
+        if(upstream!=null){
+            id(result,"renewal_admission_id",upstream.id());id(result,"initial_bill_id",upstream.bill());id(result,"initial_payment_id",upstream.payment());
+            result.addProperty("initial_invoice_id",upstream.invoice());result.addProperty("initial_allocation_id",upstream.allocation());result.addProperty("initial_payment_intent_id",upstream.paymentIntent());
+        }
+        if(pending!=null){
+            var boundary=pending.boundary();var ready=pending.ready();id(result,"boundary_id",boundary.id());id(result,"boundary_ready_id",ready.id());
+            id(result,"boundary_advance_id",ready.ack().advance().id());id(result,"boundary_operation_id",ready.ack().operation().id());
+            result.addProperty("boundary_time",boundary.period().start().toString());result.addProperty("period_start",boundary.period().start().toString());result.addProperty("period_end",boundary.period().end().toString());
+            result.addProperty("renewal_invoice_id",boundary.renewalInvoice());id(result,"pending_graph_invocation_id",pending.claim().invocation());result.addProperty("pending_graph_accepted_at",pending.graphAcceptedAt().toString());
+        }
+        if(armEvidence!=null){id(result,"arm_admission_id",armEvidence.admission());id(result,"arm_boundary_id",armEvidence.boundary());id(result,"arm_run_id",armEvidence.run());
+            result.addProperty("arm_payment_method_id",armEvidence.attachedMethod());result.addProperty("arm_acknowledged_at",armEvidence.acknowledgedAt().toString());}
+        if(failed!=null){id(result,"failed_admission_id",failed.id());var ready=failed.ready();id(result,"finalization_ready_id",ready.id());
+            id(result,"finalization_advance_id",ready.ack().advance().id());id(result,"finalization_operation_id",ready.ack().operation().id());result.addProperty("finalization_time",ready.observation().frozenTime());}
+        if(failure!=null){id(result,"failure_claim_id",failure.claimId());id(result,"failed_bill_id",failure.billId());result.addProperty("failed_allocation_id",failure.allocation());
+            result.addProperty("failed_payment_intent_id",failure.paymentIntent());result.addProperty("grace_deadline",failure.graceDeadline().toString());result.addProperty("failed_recorded_at",failure.recordedAt().toString());}
+        if(preparation!=null){id(result,"grace_preparation_id",preparation.id());result.addProperty("grace_target",preparation.target());}
+        if(graceReady!=null){id(result,"grace_ready_id",graceReady.id());id(result,"grace_operation_id",graceReady.ack().operation().id());
+            id(result,"grace_invocation_id",graceReady.ack().invocation());result.addProperty("grace_frozen_time",graceReady.observation().frozenTime());}
+        if(at!=null)boundaryEvidence(result,"grace_at",at);if(after!=null)boundaryEvidence(result,"grace_after",after);
+        if(reservation!=null){id(result,"method_reservation_id",reservation.id());id(result,"method_operation_id",reservation.setupOperationId());}
+        if(completion!=null){id(result,"method_claim_id",completion.claimId());id(result,"method_setup_step_id",completion.setupStepId());id(result,"method_update_step_id",completion.methodStepId());
+            result.addProperty("method_completed_at",completion.completedAt().toString());result.addProperty("setup_intent_id",completion.setupIntent());result.addProperty("replacement_method_id",completion.method());}
+        if(reservedRecovery!=null){var original=reservedRecovery.association();id(result,"recovery_operation_id",original.operationId());id(result,"recovery_bill_id",original.billId());
+            result.addProperty("recovery_allocation_id",original.allocation());result.addProperty("recovery_payment_intent_id",original.paymentIntent());}
+        if(recovery!=null){
+            recovery.confirmation().ifPresent(ack->{id(result,"recovery_confirm_operation_id",ack.operation().id());id(result,"recovery_confirm_resource_id",ack.operation().resourceId());result.addProperty("recovery_confirm_operation_version",ack.operation().version());
+                result.addProperty("recovery_confirm_status",ack.operation().status().name());result.addProperty("recovery_acknowledged_at",ack.acknowledgedAt().toString());
+                result.addProperty("recovery_confirm_payment_intent_id",ack.reply().paymentIntent());result.addProperty("recovery_charge_id",ack.reply().charge());});
+            recovery.publication().ifPresent(value->{var publication=value.publication();id(result,"recovery_publication_claim_id",publication.claimId());id(result,"recovery_publication_admission_id",publication.admissionId());
+                id(result,"recovery_publication_operation_id",publication.operationId());id(result,"recovery_publication_bill_id",publication.billId());id(result,"recovery_publication_reservation_id",value.reservationId());id(result,"recovery_payment_id",publication.paymentId());
+                result.addProperty("recovery_published_at",publication.publishedAt().toString());result.addProperty("recovery_revision",publication.revision());result.addProperty("recovery_observation_sequence",value.observationSequence());});
+        }
+        return result;
+    }
+    private static void id(JsonObject result,String name,UUID value){result.addProperty(name,value.toString());}
+    private static void boundaryEvidence(JsonObject result,String prefix,OwnedFailedGraceBoundary.BoundaryReady value){
+        id(result,prefix+"_ready_id",value.id());id(result,prefix+"_operation_id",value.ack().operation().id());id(result,prefix+"_invocation_id",value.ack().invocation());result.addProperty(prefix+"_frozen_time",value.observation().frozenTime());
     }
     @Override public JsonObject status(){var phase=state.phase();if(phase.equals("INITIAL"))return initial.status();var result=response(phase);result.addProperty("code",phase.equals("STOPPED")?"FAILED_RENEWAL_STOPPED":"OK");return result;}
     @Override public void abort(){if(state.requestAbort())cleanup();}

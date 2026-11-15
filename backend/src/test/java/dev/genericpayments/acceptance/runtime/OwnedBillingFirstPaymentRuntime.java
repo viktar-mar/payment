@@ -28,7 +28,7 @@ public final class OwnedBillingFirstPaymentRuntime {
     public static Admission admit(Map<String,String> env,String source) {
         try {
             if(!"true".equals(env.get("PAYMENT_STRIPE_BILLING_FIRST_PAYMENT"))||!"true".equals(env.get("PAYMENT_STRIPE_SANDBOX_ENABLED")))throw new IllegalArgumentException();
-            for(String flag:List.of("PAYMENT_STRIPE_BILLING_FIRST_RENEWAL","PAYMENT_STRIPE_BILLING_ACCEPTANCE","PAYMENT_STAGE4_TEST_RUNTIME","PAYMENT_STRIPE_ACCEPTANCE","PAYMENT_STRIPE_NATIVE_ACCEPTANCE"))
+            for(String flag:List.of("PAYMENT_STRIPE_BILLING_FAILED_RENEWAL","PAYMENT_STRIPE_BILLING_FIRST_RENEWAL","PAYMENT_STRIPE_BILLING_ACCEPTANCE","PAYMENT_STAGE4_TEST_RUNTIME","PAYMENT_STRIPE_ACCEPTANCE","PAYMENT_STRIPE_NATIVE_ACCEPTANCE"))
                 if(!Set.of("","false").contains(env.getOrDefault(flag,"")))throw new IllegalArgumentException();
             for(String name:List.of("ALLOW_TEST_OPERATIONS","FULL_RUN","OWNED_RUN","REMAINING_ONLY","FORM_DIAGNOSTIC","MANUAL_FORM_DIAGNOSTIC","ALLOW_PREPARE_ONLY","MANUAL_PAYMENT","MANUAL_3DS","MANUAL_REFUND","MANUAL_REFUND_REMAINDER"))
                 if(!Set.of("","false").contains(env.getOrDefault("PAYMENT_STRIPE_SANDBOX_"+name,"")))throw new IllegalArgumentException();
