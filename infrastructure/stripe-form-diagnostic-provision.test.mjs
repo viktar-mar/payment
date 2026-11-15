@@ -326,7 +326,12 @@ test('unused proof refuses activity or a consumed permit',async()=>{const f=awai
 test('successful server proof refuses a changed original Attempt identity',async()=>{const f=await prepared();f.attempts=1;await f.p.markConfirmation(f.limits);f.success=true;f.mutate=d=>d.attempts[0].id=uuid(99);await assert.rejects(f.p.verifyPayment(f.limits));});
 test('unknown Checkout reply preserves DISPATCHING and never creates another checkout',async()=>{const f=paymentFixture(),fetch=f.dependencies.fetch;f.dependencies.fetch=async(url,settings)=>{const result=await fetch(url,settings);if(new URL(url).pathname.endsWith('/checkouts'))throw null;return result;};
  const p=await diagnosticModule.createManualPaymentProvisioner(f.options,f.dependencies),limits=LIMIT();await assert.rejects(p.prepare(limits));const n=writes(f);await assert.rejects(p.prepare(limits));assert.equal(writes(f),n);assert.equal(f.events.filter(e=>e.path?.endsWith('/checkouts')).length,1);const ledger=JSON.parse(f.files.get(DIR+'/form-provisioning.json').contents);assert.equal(ledger.intents.at(-1).status,'DISPATCHING');});
-test('server payment proof polls at most thirty times within a forty-five second child budget',async()=>{const f=await prepared();f.attempts=1;await f.p.markConfirmation(f.limits);f.fastPoll=true;const n=f.probes,financial=writes(f);await assert.rejects(f.p.verifyPayment(f.limits));assert.equal(f.probes-n,30);assert.ok(f.delays.includes(45000));assert.equal(writes(f),financial);await assert.rejects(f.p.verifyPayment(f.limits));});
+test('server payment proof polls at most thirty times within a forty-five second child budget',async t=>{
+ const now=Date.now();t.mock.method(Date,'now',()=>now);
+ const f=await prepared();f.attempts=1;await f.p.markConfirmation(f.limits);f.fastPoll=true;const n=f.probes,financial=writes(f);
+ await assert.rejects(f.p.verifyPayment(f.limits));assert.equal(f.probes-n,30);assert.ok(f.delays.includes(45000));
+ assert.equal(writes(f),financial);await assert.rejects(f.p.verifyPayment(f.limits));
+});
 test('a legitimate processing callback cannot hide the unique joined success callback',async()=>{const f=await prepared();f.attempts=1;await f.p.markConfirmation(f.limits);f.success=true;
  f.mutate=d=>{d.events.splice(-1,0,{id:uuid(69),event_type:'PAYMENT_PROCESSING'});d.outbox_events.unshift({id:uuid(69),callback_type:'payment.processing',status:'DELIVERED'});d.deliveries.unshift({outbox_event_id:uuid(69),status:'SUCCEEDED',http_status:204});};
  f.inspection={count:2,duplicates:1,events:[{event_id:uuid(69),event_type:'payment.processing',count:1},{event_id:uuid(70),event_type:'payment.succeeded',count:2}]};assert.equal((await f.p.verifyPayment(f.limits)).providerEventId,'evt_original');});

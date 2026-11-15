@@ -492,6 +492,7 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         assertThat(proof.keySet().equals(Set.copyOf(flags))).as("closed failed renewal proof flags").isTrue();
         for(String flag:flags)assertThat(proof.get(flag).isJsonPrimitive() && proof.getAsJsonPrimitive(flag).isBoolean()
             && proof.get(flag).getAsBoolean()).as("actual failed renewal SQL proof.%s",flag).isTrue();
+        assertRecoveredEvidence(paid,good);
         var first=claims.getFirst().eventId();
         var history=jdbc.queryForList("select * from outbox_deliveries order by id");
         var eventsBefore=jdbc.queryForList("select * from outbox_events order by id");
@@ -667,6 +668,57 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
     }
     private List<String> callbackMarkers(JsonObject row) {
         return row.getAsJsonArray("callbacks").asList().stream().map(e->e.getAsJsonObject().get("delivered").toString()).toList();
+    }
+    private void assertRecoveredEvidence(JsonObject paid,JsonObject row) {
+        assertThat(row.has("lineage") && row.get("lineage").isJsonObject()).as("recovered SQL lineage object").isTrue();
+        var lineage=row.getAsJsonObject("lineage");
+        var durable=new TreeSet<>(paid.keySet());
+        durable.removeAll(Set.of("run_id","account_id","site_id","customer_id","price_id","subscription_id","operation_id",
+            "source_sha","original_frozen_time","phase","code"));
+        durable.removeIf(field->field.startsWith("arm_") || field.startsWith("access_"));
+        assertThat(durable.size()==69 && durable.equals(lineage.keySet())).as("complete recovered SQL lineage").isTrue();
+        for(String field:durable){
+            var stored=lineage.get(field);
+            var reported=paid.get(field);
+            boolean matches=stored.isJsonPrimitive() && stored.equals(reported);
+            if(field.endsWith("_at") || Set.of("period_start","period_end","boundary_time","grace_deadline").contains(field)){
+                try{
+                    matches=stored.isJsonPrimitive() && stored.getAsJsonPrimitive().isString()
+                        && reported.isJsonPrimitive() && reported.getAsJsonPrimitive().isString()
+                        && Instant.parse(stored.getAsString()).equals(Instant.parse(reported.getAsString()));
+                }catch(java.time.format.DateTimeParseException invalid){matches=false;}
+            }
+            assertThat(matches).as("recovered SQL lineage.%s",field).isTrue();
+        }
+        var signed=new HashMap<String,JsonObject>();
+        for(String body:delivered){
+            var parsed=JsonParser.parseString(body);
+            assertThat(parsed.isJsonObject()).as("signed event object").isTrue();
+            var event=parsed.getAsJsonObject();
+            var id=event.get("event_id");
+            assertThat(id!=null && id.isJsonPrimitive() && id.getAsJsonPrimitive().isString()).as("signed event identity").isTrue();
+            assertThat(signed.put(id.getAsString(),event)==null).as("unique signed event").isTrue();
+        }
+        for(var element:row.getAsJsonArray("callbacks")){
+            assertThat(element.isJsonObject()).as("SQL callback object").isTrue();
+            var callback=element.getAsJsonObject();
+            assertThat(callback.has("payload") && callback.get("payload").isJsonObject()).as("SQL callback payload object").isTrue();
+            var payload=callback.getAsJsonObject("payload");
+            var id=callback.get("id");
+            var eventKind=callback.get("kind");
+            assertThat(id!=null && id.isJsonPrimitive() && id.getAsJsonPrimitive().isString()).as("SQL callback identity").isTrue();
+            assertThat(eventKind!=null && eventKind.isJsonPrimitive() && eventKind.getAsJsonPrimitive().isString()).as("SQL callback kind").isTrue();
+            String period=paid.get("initial_bill_id").equals(payload.get("billing_record_id"))?"INITIAL":"RENEWAL";
+            String kind=switch(eventKind.getAsString()){
+                case "PAYMENT_SUCCEEDED" -> "PAYMENT_SUCCEEDED";
+                case "PERIOD_PAID" -> "PERIOD_PAID";
+                case "RENEWAL_FAILED" -> "RENEWAL_FAILED";
+                default -> "UNKNOWN";
+            };
+            assertThat(payload.equals(signed.remove(id.getAsString())))
+                .as("signed delivery matches SQL payload for %s %s",period,kind).isTrue();
+        }
+        assertThat(signed.isEmpty()).as("all signed deliveries match an original outbox row").isTrue();
     }
     private UUID product(){return jdbc.queryForObject("select product_id from prices where id=?",UUID.class,createCommand.priceId().value());}
     private JsonObject proofRow(JsonObject paid) throws Exception {
