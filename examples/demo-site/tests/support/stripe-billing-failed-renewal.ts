@@ -226,6 +226,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     context.on('close',lost);
     page.on('framenavigated',frame=>{if(frame===page!.mainFrame() && (++navigation!==1 || frame.url()!==binding.endpoints.demo+pagePath))lost();});
     page.on('close',lost);
+    page.on('crash',lost);
     await context.routeWebSocket('**/*',socket=>socket.close());
     await context.route('**/*',r=>track(routeRequest(r)));
     await context.exposeBinding('__failedRenewalTerminal',({frame,page:source},...args:unknown[])=>{
@@ -298,7 +299,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
           await page!.evaluate(o=>(window as any).__failedRenewalMethod(o),{subscriptionId:m.subscriptionId,operationId:m.operationId});
           await awaitOperator('method');
         })()),300000);
-        assertPage();state='DONE';return true;
+        assertPage();stage=whole;methodPort=undefined;method=undefined;selected=undefined;state='DONE';return true;
       }catch{lost();throw failed();}
     },
     async close(limits:BillingLimits):Promise<true>{

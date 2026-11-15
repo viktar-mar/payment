@@ -13,7 +13,7 @@ const inventory=[
   runtime+'OwnedBillingFirstPaymentRuntime.class',
   ...['Admission','Operations','State','Handler','BillingTimeConfiguration','StartupResources'].map(n=>runtime+`OwnedBillingFirstPaymentRuntime$${n}.class`),
   runtime+'OwnedBillingFirstPaymentScenario.class',runtime+'OwnedBillingFailedRenewalRuntime.class',
-  ...['Handler','BillingTimeConfiguration'].map(n=>runtime+`OwnedBillingFailedRenewalRuntime$${n}.class`),
+  ...['Handler','BillingTimeConfiguration','ScopedClients','GuardedTransport'].map(n=>runtime+`OwnedBillingFailedRenewalRuntime$${n}.class`),
   runtime+'OwnedBillingFailedRenewalOperations.class',runtime+'OwnedBillingFailedRenewalSandboxScenario.class',
   ...['Stage','State'].map(n=>runtime+`OwnedBillingFailedRenewalSandboxScenario$${n}.class`),
   runtime+'OwnedBillingFailedRenewalComponents.class',runtime+'OwnedBillingFailedRenewalFailureArm.class',

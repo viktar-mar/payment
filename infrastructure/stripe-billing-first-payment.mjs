@@ -36,7 +36,7 @@ const ownerModes={
 async function createOwner(options,dependencies,purpose){
  const mode=ownerModes[purpose];
  const failedRenewal=purpose==='FAILED_RENEWAL',firstRenewal=purpose==='FIRST_RENEWAL';
- let heldJourney,heldPending;
+ let heldJourney,heldPending,terminalClose;
  function trackBrowser(body){
   const work=Promise.resolve().then(body);
   heldPending=work.then(()=>undefined,()=>undefined);
@@ -46,6 +46,12 @@ async function createOwner(options,dependencies,purpose){
  let state='NEW',phase='NEW',failure=null,diagnostic=null,accepted=false,cleanupConfirmed=false,cleanupFailure=null,bootstrap,cli,fixture,runtime,cleanupPromise,active,finish;
  let journeyStarted=false,journeySettled=false,journeyClean=false,startSettlement;
  const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
+ const revoke=()=>{
+  if(runtime&&!terminalClose){
+   const l={deadline:Math.min(Date.now()+30000,active.deadline+120000)};
+   terminalClose=billingBounded(l,x=>runtime.close(x),30000).then(v=>v===true,()=>false);
+  }
+ };
  const checkIdentity=v=>{if(!originalIdentity||Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))fail('ACK');};
  const resources=()=>Object.freeze({runId:c.runId,expectedSource:c.expectedSource,scope:mode.scope,status:state,phase,code:failure,diagnostic,initialAccepted:accepted,...(failedRenewal?{failedRenewalAccepted:accepted}:{}),...(firstRenewal?{renewalAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed,cleanupFailure});
  const fail=(code,detail=null)=>{
@@ -69,6 +75,7 @@ async function createOwner(options,dependencies,purpose){
   if(!ok)cleanupFailure=journeySettled?'BROWSER_CLOSE':'BROWSER_UNSETTLED';
   const missing=code=>{ok=false;cleanupFailure??=code;};
   for(const [o,m,code]of [[runtime,'close','RUNTIME_CLOSE'],[cli,'stopListener','LISTENER_STOP'],[bootstrap,'stop','BOOTSTRAP_STOP'],[fixture,'close','FIXTURE_CLOSE']])if(o){
+   if(o===runtime&&terminalClose){if(!await terminalClose)missing(code);continue;}
    // The canceled outer race can finish before START releases bootstrap's busy guard.
    // Settlement grants no success or ownership proof; stop retains its own checks.
    if(o===bootstrap&&startSettlement)try{await billingBounded(l,()=>startSettlement,120000);}catch{missing('START_SETTLEMENT');continue;}
@@ -94,7 +101,9 @@ async function createOwner(options,dependencies,purpose){
      const started=Promise.resolve().then(()=>bootstrap.start(active));
      startSettlement=started.then(()=>undefined,()=>undefined);return started;
     },2700000);
-    runtime=await step('RUNTIME',()=>(dependencies.createRuntime??mode.runtime)({configuration:c,bootstrap}));await requireTrue('RUNTIME',()=>runtime.ready(active));
+    runtime=await step('RUNTIME',()=>(dependencies.createRuntime??mode.runtime)({configuration:c,bootstrap}));
+    if(failedRenewal){lifetime.signal.addEventListener('abort',revoke,{once:true});if(lifetime.signal.aborted)revoke();}
+    await requireTrue('RUNTIME',()=>runtime.ready(active));
     fixture=await step('FIXTURE',async()=>(dependencies.createFixture??(await import('./stripe-billing-provision.mjs'))[mode.fixture])({configuration:c,bootstrap,cli}));await requireTrue('PROVISION',l=>fixture.provision(l));
     const child=l=>{billingCheck(active);billingCheck(l);return {deadline:Math.min(active.deadline,l.deadline),signal:l.signal?AbortSignal.any([active.signal,l.signal]):active.signal};};
     async function guarded(name,l,body){try{if(failure)fail(failure);return await billingBounded(child(l),body,120000);}catch(error){fail(name,billingFirstPaymentDiagnostic(error)??(name==='DISPATCH'&&preparePending?'PREPARE_REQUEST':null));}}
@@ -195,7 +204,7 @@ async function createOwner(options,dependencies,purpose){
      if(!renewalProof||!['ownedVerified','cashVerified','journalVerified','signedCallbacksVerified'].every(k=>renewalProof[k]===true))fail('RENEWAL_EVIDENCE');billingCheck(active);
     }
    }catch{if(failure===null){failure=lifetime.signal.aborted?'ABORTED':'FAILED';if(confirmAck)diagnostic=postConfirmCheckpoints[phase]??null;}}
-   finally{clearTimeout(timer);remove();lifetime.abort();selected=null;await cleanup();state='CLOSED';finish();}
+   finally{clearTimeout(timer);remove();if(failedRenewal)lifetime.signal.removeEventListener('abort',revoke);lifetime.abort();selected=null;await cleanup();state='CLOSED';finish();}
    if(failure)throw billingError(failure);accepted=true;phase='COMPLETE';return resources();
   },
   async close(){lifetime.abort();if(state==='RUNNING')await billingBounded({deadline:Date.now()+120000},()=>finished,120000);else{state='CLOSED';await cleanup();}return resources();},

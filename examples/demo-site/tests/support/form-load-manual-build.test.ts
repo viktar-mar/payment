@@ -44,7 +44,7 @@ test('Docker COPY filesystem typechecks and builds dedicated and production entr
     'examples/demo-site/package.json','examples/demo-site/pnpm-lock.yaml',
     'examples/demo-site/index.html','examples/demo-site/payment-return.html','examples/demo-site/subscription-return.html',
     'examples/demo-site/form-load-diagnostic.html','examples/demo-site/form-load-manual.html','examples/demo-site/manual-payment.html',
-    'examples/demo-site/billing-first-payment.html',
+    'examples/demo-site/billing-first-payment.html','examples/demo-site/billing-failed-renewal.html',
     'examples/demo-site/tsconfig.json','examples/demo-site/vite.config.ts','examples/demo-site/src',
     ...publicInfrastructure.map(name=>'infrastructure/'+name),
   ]);
@@ -114,7 +114,7 @@ test('Docker COPY filesystem typechecks and builds dedicated and production entr
     // stale SDK installation or source files outside the staged COPY tree.
     typecheck('frontend/sdk',['-p','tsconfig.json']);
     typecheck('examples/demo-site',['--noEmit']);
-    for(const mode of ['manual-payment','form-diagnostic','billing-first-payment','production'])await t.test(mode,async()=>{
+    for(const mode of ['manual-payment','form-diagnostic','billing-first-payment','billing-failed-renewal','production'])await t.test(mode,async()=>{
       assert.deepEqual((await readdir(join(directory,'infrastructure'))).sort(),[...publicInfrastructure].sort());
       const demo=join(directory,'examples/demo-site');
       await build({root:demo,configFile:join(demo,'vite.config.ts'),mode,logLevel:'silent'});
@@ -126,6 +126,12 @@ test('Docker COPY filesystem typechecks and builds dedicated and production entr
       }else if(mode==='billing-first-payment'){
         assert.deepEqual(documents.sort(),['assets','billing-first-payment.html','health']);
         assert.equal(await readFile(join(demo,'dist/health'),'utf8'),'ok\n');
+      }else if(mode==='billing-failed-renewal'){
+        assert.deepEqual(documents.sort(),['assets','billing-failed-renewal.html','health']);
+        assert.equal(await readFile(join(demo,'dist/health'),'utf8'),'ok\n');
+        const html=await readFile(join(demo,'dist/billing-failed-renewal.html'),'utf8');
+        const entry=html.match(/<script[^>]*src="\/(assets\/[\w.-]+\.js)"/)?.[1];
+        assert.ok(entry);assert.ok((await readFile(join(demo,'dist',entry))).length>0);
       }else if(mode==='form-diagnostic'){
         assert.ok(documents.includes('form-load-manual.html'));assert.ok(documents.includes('form-load-diagnostic.html'));
         assert.equal(documents.includes('index.html'),false);assert.equal(documents.includes('subscription-return.html'),false);
@@ -133,8 +139,9 @@ test('Docker COPY filesystem typechecks and builds dedicated and production entr
         assert.ok(documents.includes('index.html'));assert.ok(documents.includes('payment-return.html'));assert.ok(documents.includes('subscription-return.html'));
         assert.equal(documents.includes('form-load-manual.html'),false);assert.equal(documents.includes('form-load-diagnostic.html'),false);
       }
-      if(mode!=='billing-first-payment'){
-        assert.equal(documents.includes('billing-first-payment.html'),false);
+      if(mode!=='billing-first-payment')assert.equal(documents.includes('billing-first-payment.html'),false);
+      if(mode!=='billing-failed-renewal')assert.equal(documents.includes('billing-failed-renewal.html'),false);
+      if(mode!=='billing-first-payment'&&mode!=='billing-failed-renewal'){
         assert.equal(documents.includes('health'),false);
       }
       for(const name of await readdir(join(demo,'dist/assets'))){

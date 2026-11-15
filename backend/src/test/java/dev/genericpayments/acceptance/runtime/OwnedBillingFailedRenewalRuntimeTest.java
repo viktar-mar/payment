@@ -124,6 +124,22 @@ class OwnedBillingFailedRenewalRuntimeTest {
         }finally{release.countDown();thread.join(3000);}
         assertThat(thread.isAlive()).isFalse();assertThat(failures).isEmpty();assertThat(winner.code).isEqualTo(200);assertThat(ops.aborts).hasValue(0);
     }
+    @Test void terminalControlIsAuthenticatedClosedAndConsumed() throws Exception {
+        var ops=new Inert();var h=handler(ops);String route="/failed-renewal/abort";
+        for(var bad:List.of(request("GET",route,"{}"),request("POST",route,"{\"target\":\"arbitrary\"}"),
+                request("POST",route,"{}{}"),request("POST",route,"[]"))){
+            h.handle(bad);assertThat(bad.code).isNotEqualTo(200);
+            assertThat(ops.aborts).as("malformed terminal request owns no cancellation right").hasValue(0);
+        }
+        var denied=request("POST",route,"{}");denied.requests.set("Authorization","Bearer wrong");
+        h.handle(denied);assertThat(denied.code).isEqualTo(403);assertThat(ops.aborts).hasValue(0);
+        var accepted=request("POST",route,"{}");h.handle(accepted);
+        assertThat(accepted.code).isEqualTo(200);assertThat(accepted.output.toString()).isEqualTo("{\"code\":\"QUIESCENT\"}");
+        assertThat(accepted.responses.getFirst("Cache-Control")).isEqualTo("no-store");assertThat(ops.aborts).hasValue(1);
+        var replay=request("POST",route,"{}");h.handle(replay);assertThat(replay.code).isNotEqualTo(200);
+        var financial=request("POST","/failed-renewal/arm-decline","{}");h.handle(financial);
+        assertThat(financial.code).isNotEqualTo(200);assertThat(ops.effects).isEmpty();assertThat(ops.aborts).hasValue(1);
+    }
     private static void denied(Map<String,String> env,AtomicInteger calls){assertThatThrownBy(()->admitted(new String[0],env,a->{calls.incrementAndGet();return a;})).hasMessage("FAILED_RENEWAL_ADMISSION_DENIED");}
     @SuppressWarnings("unchecked") private static <T>T admitted(String[] args,Map<String,String> env,java.util.function.Function<OwnedBillingFirstPaymentRuntime.Admission,T> factory)throws Exception{
         var method=Class.forName(TYPE,false,OwnedBillingFailedRenewalRuntimeTest.class.getClassLoader()).getDeclaredMethod("admitted",String[].class,Map.class,java.util.function.Function.class);method.setAccessible(true);
@@ -133,6 +149,7 @@ class OwnedBillingFailedRenewalRuntimeTest {
     private static MemoryExchange request(String method,String route,String body){return new MemoryExchange(method,route,body);}
     static class Inert implements OwnedBillingFailedRenewalOperations {
         final List<String> effects=new CopyOnWriteArrayList<>();final AtomicInteger aborts=new AtomicInteger();
+        public boolean awaitQuiescence(long untilNanos){return true;}
         private JsonObject call(String name){effects.add(name);return new JsonObject();}
         public JsonObject prepare(JsonObject r){return call("initial-prepare");}public JsonObject confirm(JsonObject r){return call("initial-confirm");}
         public JsonObject observe(){return call("initial-observe");}public JsonObject status(){return call("status");}public void abort(){aborts.incrementAndGet();}

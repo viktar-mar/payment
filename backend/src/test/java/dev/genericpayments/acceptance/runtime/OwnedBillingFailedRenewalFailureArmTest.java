@@ -65,6 +65,81 @@ class OwnedBillingFailedRenewalFailureArmTest {
         assertThat(worker.isAlive()).isFalse();assertThat(failure.get()).isNull();assertThat(result.get()).isNotNull();assertThat(f.posts()).hasSize(2);
     }
 
+    @Test void lifecycleOrTermsDriftRefusesTheNextDistinctWriteAndNeverReplays() {
+        for(boolean afterAttach:List.of(false,true))for(var edit:List.of(
+                List.of("\"cancel_at_period_end\":false","\"cancel_at_period_end\":true"),
+                List.of("\"pending_update\":null","\"pending_update\":{}"),
+                List.of("\"schedule\":null","\"schedule\":\"sub_sched_other\""),
+                List.of("\"price_owned\"","\"price_replaced\""),
+                List.of("\"quantity\":1","\"quantity\":2"),
+                List.of("\"current_period_end\":1705270400","\"current_period_end\":1705356800"),
+                List.of("\"charge_automatically\"","\"send_invoice\""),
+                List.of("\"tax_behavior\":\"inclusive\"","\"tax_behavior\":\"exclusive\""),
+                List.of("\"automatic_tax\":{\"enabled\":false}","\"automatic_tax\":{\"enabled\":true}"),
+                List.of("\"has_more\":false","\"has_more\":true"),
+                List.of("\"cancel_at_period_end\":false,",""),
+                List.of("\"local_price_version\":\"1\"","\"local_price_version\":\"2\""))) {
+            var f=new Fixture();var arm=f.arm();
+            f.http.mutate=wire->afterAttach&&f.posts().isEmpty()?wire:wire.replace(edit.getFirst(),edit.getLast());
+            assertThatThrownBy(arm::arm).as("Reject drift in %s",edit.getFirst()).hasMessage("FAILED_RENEWAL_STOPPED");
+            assertThat(f.posts()).hasSize(afterAttach?1:0);
+            int calls=f.http.calls.size();assertThatThrownBy(arm::arm).hasMessage("FAILED_RENEWAL_STOPPED");
+            assertThat(f.http.calls).hasSize(calls);
+        }
+    }
+
+    @Test void aDetachedClientCannotBorrowTheNextProducerTicket() throws Exception {
+        var f=new Fixture();
+        var state=new OwnedBillingFailedRenewalSandboxScenario.State(f.utc,f.utc.start.plusSeconds(120));
+        var factory=new OwnedBillingFailedRenewalRuntime.ScopedClients(()->f.http);
+        var keys=new StripeCredentials("sk_test_INERT","pk_test_INERT","whsec_INERT");
+        var first=state.enter("INITIAL","FIRST");
+        var stale=factory.create(keys);
+        // Capture the first ticket when launching a worker as well as when creating a client.
+        var inherited=new FutureTask<Void>(()->{
+            assertThatThrownBy(()->factory.create(keys).v1().customers().retrieve("cus_owned")).isInstanceOf(Exception.class);
+            return null;
+        });
+        var detached=new Thread(inherited,"inert-old-financial-ticket");
+        state.complete(first,"FIRST","BOUNDARY");
+        var second=state.enter("BOUNDARY","SECOND");
+        try{
+            assertThatThrownBy(()->stale.v1().customers().retrieve("cus_owned")).isInstanceOf(Exception.class);
+            detached.start();inherited.get(1,TimeUnit.SECONDS);
+            assertThat(f.http.calls).isEmpty();
+            assertThat(factory.create(keys).v1().customers().retrieve("cus_owned").getId()).isEqualTo("cus_owned");
+            assertThat(f.http.calls).hasSize(1);
+        }finally{state.fail(second);detached.join(1000);}
+    }
+
+    @Test void aReturnedHandlerTicketCannotProveAnOutstandingSdkDelegateIsQuiescent() throws Exception {
+        var f=new Fixture();var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        var state=new OwnedBillingFailedRenewalSandboxScenario.State(f.utc,f.utc.start.plusSeconds(120));
+        var memory=new HttpClient(){
+            @Override public StripeResponse request(StripeRequest r){
+                entered.countDown();
+                try{if(!release.await(3,TimeUnit.SECONDS))throw new AssertionError("delegate did not receive release");}
+                catch(InterruptedException stopped){throw new AssertionError(stopped);}
+                return f.http.request(r);
+            }
+        };
+        var factory=new OwnedBillingFailedRenewalRuntime.ScopedClients(()->memory);
+        var ticket=state.enter("INITIAL","ARM_RUNNING");
+        var client=factory.create(new StripeCredentials("sk_test_INERT","pk_test_INERT","whsec_INERT"));
+        var io=new FutureTask<>(()->client.v1().customers().retrieve("cus_owned"));
+        var worker=new Thread(io,"inert-active-sdk-delegate");worker.start();
+        try{
+            assertThat(entered.await(1,TimeUnit.SECONDS)).isTrue();
+            assertThat(state.requestAbort()).isFalse();
+            assertThat(state.fail(ticket)).as("only producer owns cleanup").isTrue();
+            assertThat(state.awaitQuiescence(System.nanoTime()+TimeUnit.MILLISECONDS.toNanos(20))).isFalse();
+            assertThatThrownBy(()->client.v1().customers().retrieve("cus_owned")).isInstanceOf(Exception.class);
+        }finally{release.countDown();worker.join(3000);}
+        assertThat(worker.isAlive()).isFalse();assertThat(f.http.calls).hasSize(1);
+        assertThat(state.awaitQuiescence(System.nanoTime()+TimeUnit.SECONDS.toNanos(1))).isTrue();
+        assertThatThrownBy(()->state.enter("INITIAL","REPLAY")).hasMessage("FAILED_RENEWAL_STOPPED");
+    }
+
     @Test void higherPreparedOrUnknownFinalizationRefusesBeforeAnySdkCall() {
         for(String state:List.of("PREPARED","UNKNOWN","DISPATCHING")) {
             var f=new Fixture();f.store.higher=state;
@@ -174,6 +249,17 @@ class OwnedBillingFailedRenewalFailureArmTest {
     }
     static final class Transport extends HttpClient {
         final Fixture f;final List<StripeRequest> calls=new ArrayList<>();UnaryOperator<String> mutate=UnaryOperator.identity();Runnable afterAttach;boolean block;volatile boolean interrupted;
+        String subscription(String method){
+            return """
+                {"id":"sub_owned","object":"subscription","created":42,"livemode":false,"customer":"cus_owned","test_clock":"clock_owned","status":"active","latest_invoice":"in_renewal","default_payment_method":"%s","currency":"eur",
+                 "metadata":{"account_id":"%s","site_id":"%s","customer_id":"%s","subscription_id":"%s","operation_id":"%s"},
+                 "collection_method":"charge_automatically","billing_mode":{"type":"classic"},"payment_settings":{"payment_method_types":["card"],"save_default_payment_method":"on_subscription"},
+                 "pause_collection":null,"automatic_tax":{"enabled":false},"default_tax_rates":[],"cancel_at_period_end":false,"cancel_at":null,"schedule":null,"pending_update":null,"trial_start":null,"trial_end":null,"ended_at":null,"canceled_at":null,
+                 "items":{"object":"list","has_more":false,"data":[{"id":"si_owned","object":"subscription_item","subscription":"sub_owned","quantity":1,"tax_rates":[],
+                   "current_period_start":1702592000,"current_period_end":1705270400,"price":{"id":"price_owned","object":"price","livemode":false,"product":"prod_owned",
+                   "metadata":{"local_price_id":"%s","local_price_version":"1"},"currency":"eur","unit_amount":2000,"tax_behavior":"inclusive","type":"recurring","recurring":{"interval":"month","interval_count":1,"usage_type":"licensed"}}}]}}
+                """.formatted(method,f.account.id().value(),f.site.value(),f.customer.value(),f.intent.subscription(),f.intent.createOperation(),f.terms.priceId().value());
+        }
         Transport(Fixture f){this.f=f;}
         @Override public StripeResponse request(StripeRequest request) {
             if(block)try{new CountDownLatch(1).await();throw new AssertionError("Unreachable");}catch(InterruptedException stopped){interrupted=true;Thread.currentThread().interrupt();throw new IllegalStateException("Private inert interruption");}
@@ -181,7 +267,7 @@ class OwnedBillingFailedRenewalFailureArmTest {
             if(path.endsWith("/attach")) {body="{\"id\":\"pm_attached\",\"object\":\"payment_method\",\"livemode\":false,\"type\":\"card\",\"customer\":\"cus_owned\",\"card\":{\"brand\":\"visa\",\"last4\":\"0341\"}}";if(afterAttach!=null)afterAttach.run();}
             else if(path.equals("/v1/test_helpers/test_clocks/clock_owned"))body="{\"id\":\"clock_owned\",\"object\":\"test_helpers.test_clock\",\"livemode\":false,\"name\":\"owned-arm\",\"frozen_time\":1702592000,\"created\":1800000000,\"deletes_after\":1801000000,\"status\":\"ready\",\"status_details\":{}}";
             else if(path.equals("/v1/customers/cus_owned"))body="{\"id\":\"cus_owned\",\"object\":\"customer\",\"livemode\":false,\"test_clock\":\"clock_owned\"}";
-            else if(path.equals("/v1/subscriptions/sub_owned"))body="{\"id\":\"sub_owned\",\"object\":\"subscription\",\"livemode\":false,\"customer\":\"cus_owned\",\"test_clock\":\"clock_owned\",\"status\":\"active\",\"latest_invoice\":\"in_renewal\",\"default_payment_method\":\""+(post||f.posts().size()>1?"pm_attached":"pm_original")+"\"}";
+            else if(path.equals("/v1/subscriptions/sub_owned"))body=subscription(post||f.posts().size()>1?"pm_attached":"pm_original");
             else if(path.equals("/v1/invoices/in_renewal"))body="{\"id\":\"in_renewal\",\"object\":\"invoice\",\"livemode\":false,\"customer\":\"cus_owned\",\"test_clock\":\"clock_owned\",\"status\":\"draft\",\"amount_paid\":0,\"amount_due\":2000,\"currency\":\"eur\"}";
             else throw new AssertionError("Unplanned inert request "+request.method()+" "+path);
             return new StripeResponse(200,HttpHeaders.of(Map.of()),mutate.apply(body));

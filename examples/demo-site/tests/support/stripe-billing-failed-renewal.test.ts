@@ -53,7 +53,7 @@ async function fixture(change = '') {
   async function request(target:string,method:string,data?:any) {
     let contents=data===undefined?null:JSON.stringify(data);
     const headers:Record<string,string>={origin:demo,...(data?{'content-type':'application/json'}:{}),
-      ...(!target.startsWith(otpUrl)?{authorization:'Bearer '+token,...(method==='POST'?{'idempotency-key':crypto.randomUUID()}:{})}:{})};
+      ...(!target.startsWith(otpUrl)&&target.startsWith(backend)?{authorization:'Bearer '+token,...(method==='POST'?{'idempotency-key':crypto.randomUUID()}:{})}:{})};
     let requestFrame=frame;
     if(target.endsWith('/action-confirmations')) {
       if(change==='frame')requestFrame={url:()=>url};
@@ -67,7 +67,7 @@ async function fixture(change = '') {
     let reply:any,denied=false;
     const req={url:()=>target,method:()=>method,allHeaders:async()=>headers,frame:()=>requestFrame,postData:()=>contents,
       redirectedFrom:()=>null,isNavigationRequest:()=>false,resourceType:()=> 'fetch'};
-    await routeHandler({request:()=>req,abort:async()=>{denied=true;},fallback:async()=>{assert.ok(target===otpUrl||target===otpUrl+'/'+id(10)+'/verify');},
+    await routeHandler({request:()=>req,abort:async()=>{denied=true;},fallback:async()=>{assert.ok(target==='https://js.stripe.com/v3/'||target===otpUrl||target===otpUrl+'/'+id(10)+'/verify');},
       fulfill:async(r:any)=>{assert.equal(r.headers['Cache-Control'],'no-store');assert.equal(r.headers['Access-Control-Allow-Origin'],demo);reply=r;replies.push(r);}});
     if(denied)throw Error('denied mock request');
     return reply;
@@ -112,14 +112,14 @@ async function fixture(change = '') {
     confirm:async()=>{counts.push('confirm');return {...identity,phase:'OBSERVE',code:'OK',protocol:'SERVER_CONFIRM_V2',attempt_id:id(8),state:'OBSERVE',retry_allowed:false,successor_attempt_id:null,next_action_allowed:false,expires_at:expires};}};
   const methodPort={prepareMethod:async()=>{counts.push('prepareMethod');return {subscriptionId:id(6),operationId:change==='old_operation'?id(7):id(9),action:action(actionSecret)};},
     selectMethod:async()=>{counts.push('selectMethod');return selected;},confirmMethod:async()=>{counts.push('permit');if(change==='permit_error')throw Error(selected.client_secret);return {browser_confirm_allowed:true,state:'RESERVED'};}};
-  const lose=(event:string)=>{if(event==='close')callbacks.get('close')?.();else{doc.visibilityState='hidden';docEvents.get('visibilitychange')?.();}};
+  const lose=(event:string)=>{if(event==='close'||event==='crash')callbacks.get(event)?.();else{doc.visibilityState='hidden';docEvents.get('visibilitychange')?.();}};
   const forgedTerminal=async()=>{
     const f=bindings.get('__failedRenewalTerminal');assert.ok(f);
     for(const [src,args] of [[{page,frame:{url:()=>url}},['STOPPED']],[{page:{},frame},['STOPPED']],[{page,frame},['OTHER']],[{page,frame},['STOPPED','extra']]] as const){
       await Promise.resolve().then(()=>f(src,...args)).catch(()=>{});
     }
   };
-  return {counts,replies,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
+  return {request,counts,replies,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
     restore:async()=>{try{runAbort.abort();await journey.close(nowLimits());}finally{w.__failedRenewalStop?.();restore();}}};
 }
 
@@ -147,32 +147,37 @@ test('intentional final context close preserves the owner completion signal',asy
     assert.equal(h.runAbort.signal.aborted,false);assert.equal(h.closed(),1);
   }finally{await h.restore();}
 });
-for(const event of ['close','hide'])test('actual owner refuses the next boundary dispatch after held-page '+event,async()=>{
+for(const event of ['close','hide','crash','crash-after-method'])test('actual owner refuses the next financial dispatch after held-page '+event,async()=>{
   const h=await fixture();
   try{
     const root='../../../../infrastructure/';
-    const {opts,initial,iso,F,E}=await import(source(root+'fixtures/failed-renewal-descriptors.mjs').href);
+    const {opts,initial,iso,F,E,responses,methods}=await import(source(root+'fixtures/failed-renewal-descriptors.mjs').href);
     const {createOwnedBillingFailedRenewal}=await import(source(root+'stripe-billing-first-payment.mjs').href);
     const calls:string[]=[],mark=(name:string)=>async()=>{calls.push(name);return true;};
     const settlement={...initial(),subscription_id:id(6),operation_id:id(7),period_start:iso(F),paid_through:iso(E)};
-    const runtime={ready:mark('ready'),prepare:async(r:any)=>h.initialPort.prepare({origin:r.origin,token:r.customerToken}),confirm:h.initialPort.confirm,
-      observe:async()=>settlement,boundary:async()=>{calls.push('boundary');throw Error('unexpected financial dispatch');},
+    const stages=responses();
+    for(const v of stages){v.subscription_id=id(6);v.operation_id=id(7);if(v.method_operation_id)v.method_operation_id=id(9);}
+    stages[6].action=(await h.methodPort.prepareMethod()).action;stages[7].session=await h.methodPort.selectMethod();
+    const runtime={...Object.fromEntries(methods.map((name:string,i:number)=>[name,async()=>{calls.push(name);return stages[i];}])),ready:mark('ready'),prepare:async(r:any)=>h.initialPort.prepare({origin:r.origin,token:r.customerToken}),confirm:h.initialPort.confirm,
+      observe:async()=>settlement,
       close:mark('runtime-close')};
     const fixturePort={...h.initialPort,resources:()=>({...h.initialPort.resources(),customerId:id(4),productId:id(11)}),
-      provision:mark('fixture'),beforeDispatch:mark('dispatch'),acknowledge:mark('ack'),close:mark('fixture-close')};
+      provision:mark('fixture'),beforeDeclineArm:mark('arm-intent'),acknowledgeDeclineArm:mark('arm-ack'),beforeDispatch:mark('dispatch'),acknowledge:mark('ack'),close:mark('fixture-close')};
     const bootstrap={resources:()=>({cliDirectory:'/inert'}),prepare:mark('prepare'),start:mark('start'),stop:mark('bootstrap-stop')};
     const cli={validateBinding:mark('binding'),startListener:mark('listener'),assertBillingListener:mark('check'),stopListener:mark('listener-stop')};
     const owner=await createOwnedBillingFailedRenewal(opts(),{preflight:mark('preflight'),createBootstrap:async()=>bootstrap,login:mark('login'),
       createCli:async()=>cli,createFixture:async()=>fixturePort,createRuntime:async()=>runtime,pause:mark('pause'),
       prove:async()=>{
         assert.equal(h.phase(),'OBSERVE');assert.equal(h.closed(),0);
-        calls.push('initial-proof');h.lose(event);
+        calls.push('initial-proof');if(event!=='crash-after-method')h.lose(event);
         return {ownedVerified:true,cashVerified:true,journalVerified:true,signedCallbacksVerified:true,
-          anchor:{initial_bill_id:id(10),initial_payment_id:id(11),initial_invoice_id:'in_a',initial_allocation_id:'inpay_a',initial_payment_intent_id:'pi_a'}};
+          anchor:Object.fromEntries(['initial_bill_id','initial_payment_id','initial_invoice_id','initial_allocation_id','initial_payment_intent_id'].map(k=>[k,stages[0][k]]))};
       },proveFailedRenewal:mark('unexpected-final-proof')});
-    await assert.rejects(owner.run(h.journey,{...nowLimits(),signal:h.runAbort.signal}));
+    const journey={...h.journey,method:async(p:any,l:any)=>{await h.journey.method(p,l);assert.equal(h.phase(),'METHOD_CONFIRMED');h.lose('crash');return true;}};
+    await assert.rejects(owner.run(journey,{...nowLimits(),signal:h.runAbort.signal}));
     const result=await owner.close();
-    assert.ok(calls.includes('initial-proof'));assert.equal(calls.includes('boundary'),false);
+    assert.ok(calls.includes('initial-proof'));assert.equal(calls.includes('boundary'),event==='crash-after-method');
+    assert.equal(calls.includes('confirmMethod'),event==='crash-after-method');assert.equal(calls.includes('applyMethod'),false);
     assert.equal(h.runAbort.signal.aborted,true);assert.equal(result.cleanupConfirmed,true);
     assert.equal(result.failedRenewalAccepted,false);assert.equal(h.closed(),1);
     assert.deepEqual(calls.slice(-4),['runtime-close','listener-stop','bootstrap-stop','fixture-close']);
@@ -204,4 +209,17 @@ test('dedicated build, exact-file health, manual Chrome config and default disco
   for(const re of [/workers:\s*1/,/retries:\s*0/,/headless:\s*false/,/channel:\s*'chrome'/,/trace:\s*'off'/,/video:\s*'off'/,/screenshot:\s*'off'/,/preserveOutput:\s*'never'/,/stripe-billing-failed-renewal-reporter/])assert.match(config!,re);
   assert.match(entry!,/createOwnedBillingFailedRenewal/);assert.match(entry!,/runFailedRenewalBrowser/);
   assert.match(page!,/mountStripeSubscriptionMethod/);assert.match(page!,/@generic-payments\/sdk/);
+});
+
+test('held DONE page uses remaining session lifetime for assets but never reopens the financial bridge',async()=>{
+  const h=await fixture(),child=new AbortController();
+  try{
+    await h.journey.initial(h.initialPort,{...nowLimits(),signal:h.runAbort.signal});
+    await h.journey.method(h.methodPort,{...nowLimits(),signal:child.signal});
+    child.abort();
+    await h.request('https://js.stripe.com/v3/','GET');
+    assert.equal(h.runAbort.signal.aborted,false);
+    await assert.rejects(h.request(backend+'/api/v1/customer/subscriptions/'+id(6)+'/operations/'+id(9)+'/action-confirmations','POST',{action_token:actionSecret}));
+    assert.equal(h.counts.filter(n=>n==='permit').length,1);
+  }finally{await h.restore();}
 });

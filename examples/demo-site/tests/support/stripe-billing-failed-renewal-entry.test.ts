@@ -57,9 +57,13 @@ test('effective project capture and repeat settings are rejected before owner or
   const gate=hook.indexOf('failedRenewalRunSettingsAllowed(info)'),owner=hook.indexOf('await createOwnedBillingFailedRenewal(');
   assert.ok(gate>=0 && gate<owner,'effective settings gate must run before owner construction');
   const {failedRenewalRunSettingsAllowed}=await import(new URL('./stripe-billing-failed-renewal-settings.ts',import.meta.url).href);
-  const valid=()=>({config:{workers:1,fullyParallel:false,preserveOutput:'never'},project:{repeatEach:1,retries:0,
+  const reporter=new URL('./stripe-billing-failed-renewal-reporter.ts',import.meta.url).pathname;
+  const valid=()=>({config:{reporter:[[reporter,undefined]],workers:1,fullyParallel:false,preserveOutput:'never'},project:{repeatEach:1,retries:0,
     use:{trace:'off',screenshot:'off',video:'off'}},retry:0,repeatEachIndex:0});
   assert.equal(failedRenewalRunSettingsAllowed(valid()),true);
+  const previous=process.env.PW_TEST_REPORTER;
+  try{process.env.PW_TEST_REPORTER='json';assert.equal(failedRenewalRunSettingsAllowed(valid()),false);}
+  finally{if(previous===undefined)delete process.env.PW_TEST_REPORTER;else process.env.PW_TEST_REPORTER=previous;}
   for(const patch of [
     (i:any)=>{i.project.use.trace='on';},(i:any)=>{i.project.use.trace={mode:'retain-on-failure'};},
     (i:any)=>{i.project.use.video='on-first-retry';},(i:any)=>{i.project.use.screenshot='only-on-failure';},
@@ -69,6 +73,8 @@ test('effective project capture and repeat settings are rejected before owner or
     (i:any)=>{i.retry=1;},(i:any)=>{i.repeatEachIndex=1;},(i:any)=>{i.config.workers=2;},
     (i:any)=>{i.config.fullyParallel=true;},(i:any)=>{i.config.preserveOutput='always';},
     (i:any)=>{delete i.project.use.trace;},
+    (i:any)=>{i.config.reporter=[['json']];},(i:any)=>{i.config.reporter.push(['json']);},
+    (i:any)=>{i.config.reporter=[[reporter,{outputFile:'private'}]];},(i:any)=>{i.config.reporter=[['/other'+reporter]];},
   ]){
     const i=valid();patch(i);assert.equal(failedRenewalRunSettingsAllowed(i),false);
   }

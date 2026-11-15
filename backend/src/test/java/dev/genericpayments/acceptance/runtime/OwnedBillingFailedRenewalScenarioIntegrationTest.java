@@ -4,7 +4,10 @@ import com.google.gson.*;
 import com.stripe.net.*;
 import dev.genericpayments.platform.PaymentPlatformApplication;
 import dev.genericpayments.platform.provider.application.port.out.OwnedFirstRenewalStore;
+import dev.genericpayments.platform.payments.domain.PaymentStatus;
+import dev.genericpayments.platform.payments.domain.SubscriptionBillingContext;
 import dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase;
+import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionCashPort;
 import dev.genericpayments.platform.support.*;
 import dev.genericpayments.platform.customers.application.model.CustomerAuthenticationResult.AuthenticatedCustomer;
 import dev.genericpayments.platform.customers.application.model.CustomerSessionCreation;
@@ -39,14 +42,32 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
     private JsonObject setup;
     private CustomerSessionCreation originalSession;
 
+    @Override protected dev.genericpayments.platform.provider.adapter.out.stripe.StripeClientFactory fixtureClients(){
+        return new OwnedBillingFailedRenewalRuntime.ScopedClients(this::fixtureTransport);
+    }
+
     @Override protected OwnedBillingFirstPaymentRuntime.Operations createScenario(OwnedBillingFirstPaymentRuntime.Admission admission) {
         return new OwnedBillingFailedRenewalSandboxScenario(admission,this::runtimeBean,Clock.systemUTC(),Instant.now().plusSeconds(120));
     }
 
     @Override protected Object runtimeBean(Class<?> type) {
+        pauseBookend(type);
         if(type==ApplySubscriptionSnapshotUseCase.class){
             var actual=application.getBean(ApplySubscriptionSnapshotUseCase.class);
             return (ApplySubscriptionSnapshotUseCase)command->{refreshObservationClock();actual.apply(command);};
+        }
+        if(type==SubscriptionCashPort.class){
+            var actual=application.getBean(SubscriptionCashPort.class);
+            return (SubscriptionCashPort)command->{
+                if(command.context().kind()==SubscriptionBillingContext.Kind.RENEWAL && command.status()==PaymentStatus.SUCCEEDED){
+                    // Sample receipt time inside the authenticated RECOVERED fact transaction.
+                    assertThat(transaction.active()).isTrue();
+                    var received=OwnedBillingFirstPaymentRuntimeTest.observationUtc(Instant.now());
+                    assertThat(new TestClock().instant()).isBeforeOrEqualTo(received);
+                    TestClock.set(received);
+                }
+                return actual.record(command);
+            };
         }
         return super.runtimeBean(type);
     }
@@ -151,16 +172,27 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
     @TestConfiguration(proxyBeanMethods=false)
     static class TimeSelection {
         @Bean static BeanFactoryPostProcessor selectRuntimeTime() {
-            return factory->factory.getBeanDefinition("ownedSubscriptionTime").setPrimary(false);
+            return factory->{
+                factory.getBeanDefinition("ownedSubscriptionTime").setPrimary(false);
+                // Non-scenario application fixtures keep their inherited inert primary.
+                // The real scenario receives the same ticket guard with a memory delegate.
+                factory.getBeanDefinition("failedRenewalStripeClients").setPrimary(false);
+            };
         }
     }
 
     private OwnedBillingFailedRenewalSandboxScenario combined(){return (OwnedBillingFailedRenewalSandboxScenario)scenario;}
 
-    private JsonObject stage(String route,String phase) throws Exception {
+    private OwnedBillingFirstPaymentRuntimeTest.MemoryExchange exchange(String route) throws Exception {
         refreshObservationClock();
         var exchange=new OwnedBillingFirstPaymentRuntimeTest.MemoryExchange("POST","/failed-renewal/"+route,"{}",true);
         new OwnedBillingFailedRenewalRuntime.Handler(combined(),"q".repeat(43)).handle(exchange);
+        return exchange;
+    }
+    private JsonObject stage(String route,String phase) throws Exception {
+        return assertStage(route,phase,exchange(route));
+    }
+    private JsonObject assertStage(String route,String phase,OwnedBillingFirstPaymentRuntimeTest.MemoryExchange exchange) {
         assertThat(exchange.code).as("fixed route %s, checkpoint %s",route,combined().failureStage()).isEqualTo(200);
         assertThat(exchange.responses.getFirst("Cache-Control")).isEqualTo("no-store");
         var result=JsonParser.parseString(exchange.output.toString(java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();
@@ -198,11 +230,18 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         queueBoundary(Instant.parse(initial.get("paid_through").getAsString()).getEpochSecond());
         return stage("boundary","RENEWAL_BOUNDARY");
     }
-    private void armBookend(String defaultMethod) {
+    private JsonObject armSubscription(String defaultMethod) {
         var original=graph.remote.deepCopy();
+        original.add("automatic_tax",JsonParser.parseString("{\"enabled\":false}"));
+        original.add("default_tax_rates",new JsonArray());
+        for(String key:List.of("pause_collection","ended_at","canceled_at"))original.add(key,JsonNull.INSTANCE);
+        original.getAsJsonObject("items").getAsJsonArray("data").get(0).getAsJsonObject().add("tax_rates",new JsonArray());
         original.addProperty("latest_invoice",debt.renewalInvoice.get("id").getAsString());
         original.addProperty("default_payment_method",defaultMethod);
-        Collections.addAll(boundaryReplies,clock(end,"ready"),customerBody(),original.toString(),debt.renewalInvoice.toString());
+        return original;
+    }
+    private void armBookend(String defaultMethod){
+        Collections.addAll(boundaryReplies,clock(end,"ready"),customerBody(),armSubscription(defaultMethod).toString(),debt.renewalInvoice.toString());
     }
     private JsonObject card(String id) {
         var card=new JsonObject();
@@ -216,10 +255,7 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         boundaryReplies.add(card("pm_decline").toString());
         armBookend("pm_original");
         armBookend("pm_original");
-        var updated=graph.remote.deepCopy();
-        updated.addProperty("latest_invoice",debt.renewalInvoice.get("id").getAsString());
-        updated.addProperty("default_payment_method","pm_decline");
-        boundaryReplies.add(updated.toString());
+        boundaryReplies.add(armSubscription("pm_decline").toString());
         armBookend("pm_decline");
     }
     private JsonObject failure() throws Exception {
@@ -370,6 +406,28 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         assertThat(retainedState().equals(snapshot)).isTrue();
     }
     private static UUID id(JsonObject row,String key){return UUID.fromString(row.get(key).getAsString());}
+    private void assertRecoveryReads(int before,JsonObject boundary,JsonObject failed) {
+        var reads=requests.subList(before,requests.size());
+        String clockPath="/v1/test_helpers/test_clocks/clock_owned";
+        String initialInvoice=graph.invoice.get("id").getAsString();
+        String renewalInvoice=debt.renewalInvoice.get("id").getAsString();
+        String initialIntent=boundary.get("initial_payment_intent_id").getAsString();
+        String failedIntent=failed.get("failed_payment_intent_id").getAsString();
+        assertThat(reads).allSatisfy(r->{
+            assertThat(r.method().name()).isEqualTo("GET");
+            assertThat(r.options().getMaxNetworkRetries()).isZero();
+        });
+        assertThat(reads.stream().map(r->r.url().getPath())).containsExactly(
+            clockPath,"/v1/customers/"+graph.remote.get("customer").getAsString(),"/v1/subscriptions/"+graph.remote.get("id").getAsString(),
+            "/v1/invoices","/v1/invoices/"+initialInvoice+"/lines","/v1/invoice_payments","/v1/payment_intents/"+initialIntent,
+            "/v1/charges/ch_owned","/v1/invoice_payments","/v1/invoices/"+renewalInvoice+"/lines","/v1/invoice_payments",
+            "/v1/payment_intents/"+failedIntent,"/v1/charges/ch_recovered","/v1/invoice_payments",clockPath);
+        assertThat(reads.get(5).params()).containsEntry("invoice",initialInvoice);
+        assertThat(reads.get(8).params().get("payment")).isEqualTo(Map.of("type","payment_intent","payment_intent",initialIntent));
+        assertThat(reads.get(10).params()).containsEntry("invoice",renewalInvoice);
+        assertThat(reads.get(13).params().get("payment")).isEqualTo(Map.of("type","payment_intent","payment_intent",failedIntent));
+        assertThat(boundaryReplies).isEmpty();
+    }
     @Test void originalFailureGraceBrowserMethodAndRecoveryProduceTheFiveSignedEventsAndRejectAQueuedRetry() throws Exception {
         var boundary=settledBoundary();
         var originalPayment=jdbc.queryForMap("select * from payments where id=?",id(boundary,"initial_payment_id"));
@@ -384,12 +442,24 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         acknowledgeRecovery();
         queuePaid();
         int beforeObservation=requests.size();
-        var paid=stage("recovery/observe","RECOVERED_SETTLED_LOCAL");
-        assertThat(requests.subList(beforeObservation,requests.size())).allSatisfy(r->assertThat(r.method().name()).isEqualTo("GET"));
-        assertThat(requests.subList(beforeObservation,requests.size()).stream().map(r->r.url().getPath())
-            .filter(path->path.startsWith("/v1/payment_intents/")||path.startsWith("/v1/charges/")))
-            .containsExactly("/v1/payment_intents/"+boundary.get("initial_payment_intent_id").getAsString(),"/v1/charges/ch_owned",
-                "/v1/payment_intents/"+failed.get("failed_payment_intent_id").getAsString(),"/v1/charges/ch_recovered");
+        var recovery=exchange("recovery/observe");
+        assertRecoveryReads(beforeObservation,boundary,failed);
+        assertThat(jdbc.queryForList("""
+            select cash_event.received_at between q.started_at and pub.published_at
+              and period_event.received_at between q.started_at and pub.published_at
+              and period_event.occurred_at=r.billing_at
+            from stripe_billing_failed_method_publications pub
+            join stripe_billing_failed_method_reads q on (q.id,q.reservation_id)=(pub.claim_id,pub.reservation_id)
+            join stripe_billing_failed_method_reservations r on r.id=q.reservation_id
+            join payments paid on paid.id=pub.renewal_payment
+            join payment_events cash_event on cash_event.payment_id=paid.id and cash_event.event_type='PAYMENT_SUCCEEDED'
+            join subscription_events period_event on period_event.subscription_id=paid.subscription_id
+              and period_event.billing_record_id=paid.billing_record_id and period_event.event_type='PERIOD_PAID'
+            where q.phase='RECOVERED' and paid.subscription_id=? and paid.billing_record_id=? and paid.provider_payment_reference=?
+            """,Boolean.class,id(prepared,"subscription_id"),id(failed,"failed_bill_id"),failed.get("failed_payment_intent_id").getAsString()))
+            .as("recovered cash and period journal receipts fall within their authenticated read and publication")
+            .containsExactly(true);
+        var paid=assertStage("recovery/observe","RECOVERED_SETTLED_LOCAL",recovery);
         assertThat(paid.get("recovery_charge_id").getAsString()).isEqualTo("ch_recovered");
         assertThat(debt.renewalCharge).as("original issuer-declined charge").isEqualTo(declinedCharge);
         assertThat(jdbc.queryForMap("select * from stripe_billing_failed_renewal_failures")).isEqualTo(originalFailure);
@@ -439,13 +509,13 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
     }
 
     @Test void originalObserverRollsBackCashAndJournalAndAloneStopsItsFailedPublication() throws Exception {
-        settledBoundary();var failed=failure();graceAndMethod(failed);acknowledgeRecovery();
+        var boundary=settledBoundary();var failed=failure();graceAndMethod(failed);acknowledgeRecovery();
         var before=financialRows();
         var ack=jdbc.queryForMap("select * from stripe_billing_failed_recovery_confirm_acks");
         rejectJournal(dev.genericpayments.platform.payments.domain.PaymentEventType.PAYMENT_SUCCEEDED);
-        queuePaid();long writes=posts();
+        queuePaid();long writes=posts();int beforeObservation=requests.size();
         assertThatThrownBy(combined()::observeRecovery).hasMessage("FAILED_RENEWAL_STOPPED");
-        assertThat(boundaryReplies).as("entire independent recovered graph was read before rollback").isEmpty();
+        assertRecoveryReads(beforeObservation,boundary,failed);
         assertThat(count("stripe_billing_failed_method_publications")).isZero();
         assertThat(jdbc.queryForMap("select * from stripe_billing_failed_recovery_confirm_acks")).isEqualTo(ack);
         assertThat(financialRows()).isEqualTo(before);
@@ -494,6 +564,60 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         assertThat(financialRows()).isEqualTo(before);
     }
 
+    // Hold the actual handler between two distinct writes. Even an interrupt is not
+    // proof of quiescence: this test's bookend returns only when explicitly released.
+    private Class<?> gateBean;
+    private java.util.concurrent.CountDownLatch gated,releaseGate,revoked;
+    private void pauseBookend(Class<?> type){
+        if(gateBean!=type || requests.isEmpty())return;
+        String last=requests.getLast().url().getPath();
+        if(!last.endsWith("/attach")&&!last.equals("/v1/test_helpers/test_clocks/clock_owned"))return;
+        gated.countDown();
+        long end=System.nanoTime()+java.util.concurrent.TimeUnit.SECONDS.toNanos(6);
+        while(System.nanoTime()<end){
+            try{if(releaseGate.await(end-System.nanoTime(),java.util.concurrent.TimeUnit.NANOSECONDS))return;}
+            catch(InterruptedException interrupted){/* keep gate occupied until explicit release */}
+        }
+        throw new AssertionError("gated producer did not receive release");
+    }
+
+    @ParameterizedTest @ValueSource(strings={"after-clock","after-attach"})
+    void terminalControlRevokesActualProducerAndWaitsForTheLastBookend(String at) throws Exception {
+        boolean arm=at.equals("after-attach");
+        if(arm){settledBoundary();queueArm();}
+        var time=java.util.concurrent.TimeUnit.SECONDS;
+        gated=new java.util.concurrent.CountDownLatch(1);releaseGate=new java.util.concurrent.CountDownLatch(1);
+        revoked=new java.util.concurrent.CountDownLatch(1);
+        gateBean=arm?CustomerSessionResolver.class:dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingCustomerAdapter.class;
+        // Observe delivery to the real scenario; neither the proxy nor the exchange
+        // synthesizes quiescence, cancellation, a ticket or a financial response.
+        var observed=(OwnedBillingFailedRenewalOperations)java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),
+            new Class<?>[]{OwnedBillingFailedRenewalOperations.class},(proxy,method,args)->{
+                try{var result=method.invoke(combined(),args);if(method.getName().equals("abort"))revoked.countDown();return result;}
+                catch(java.lang.reflect.InvocationTargetException e){throw e.getCause();}
+            });
+        var handler=new OwnedBillingFailedRenewalRuntime.Handler(observed,"q".repeat(43));
+        int before=requests.size();
+        var producer=new OwnedBillingFailedRenewalRuntimeTest.MemoryExchange("POST",arm?"/failed-renewal/arm-decline":"/initial-payment/prepare",arm?"{}":prepareRequest.toString());
+        var terminal=new OwnedBillingFailedRenewalRuntimeTest.MemoryExchange("POST","/failed-renewal/abort","{}");
+        var pool=java.util.concurrent.Executors.newFixedThreadPool(2);
+        try{
+            var running=pool.submit(()->{handler.handle(producer);return true;});
+            assertThat(gated.await(5,time)).isTrue();
+            var stopping=pool.submit(()->{handler.handle(terminal);return true;});
+            assertThat(revoked.await(2,time)).as("real State revoked while original ticket remains owned").isTrue();
+            assertThat(stopping.isDone()).isFalse();assertThat(terminal.code).isZero();
+            releaseGate.countDown();running.get(5,time);stopping.get(5,time);
+            assertThat(terminal.code).isEqualTo(200);assertThat(terminal.output.toString()).isEqualTo("{\"code\":\"QUIESCENT\"}");
+            assertThat(producer.code).isEqualTo(400);assertThat(combined().status().get("phase").getAsString()).isEqualTo("STOPPED");
+            var writes=requests.subList(before,requests.size()).stream().filter(r->r.method().name().equals("POST")).map(r->r.url().getPath()).toList();
+            assertThat(writes).containsExactly(arm?"/v1/payment_methods/pm_card_chargeCustomerFail/attach":"/v1/test_helpers/test_clocks");
+            int consumed=requests.size();assertThatThrownBy(combined()::armDecline).hasMessage("FAILED_RENEWAL_STOPPED");
+            assertThatThrownBy(combined()::failedRenewal).hasMessage("FAILED_RENEWAL_STOPPED");
+            assertThat(requests).hasSize(consumed);assertThat(count("stripe_billing_failed_renewals")).isZero();
+        }finally{releaseGate.countDown();pool.shutdownNow();pool.awaitTermination(5,time);gateBean=null;}
+    }
+
     @Test void wrongSourceStopsBeforeCreatingAnyRemoteResource(){
         prepareRequest.addProperty("source_sha","b".repeat(40));
         assertThatThrownBy(this::prepare).hasMessage("FAILED_RENEWAL_STOPPED");
@@ -523,9 +647,11 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
             "/v1/payment_intents/"+paid.get("failed_payment_intent_id").getAsString()+"/confirm");
         assertThat(writes.stream().filter(r->r.url().getPath().equals(advance)).map(r->Long.valueOf(r.params().get("frozen_time").toString())))
             .containsExactly(end,end+3600,after-2,after-1,after);
-        assertThat(writes.get(5).params()).containsOnlyKeys("customer").containsEntry("customer",graph.remote.get("customer").getAsString());
-        assertThat(writes.get(6).params()).containsOnlyKeys("default_payment_method","proration_behavior").containsEntry("proration_behavior","none").containsEntry("default_payment_method","pm_decline");
-        assertThat(writes.get(12).params()).containsOnlyKeys("default_payment_method").containsEntry("default_payment_method","pm_saved");
+        var attach=writes.stream().filter(r->r.url().getPath().endsWith("/attach")).findFirst().orElseThrow();
+        var defaults=writes.stream().filter(r->sub.equals(r.url().getPath())).toList();
+        assertThat(attach.params()).containsOnlyKeys("customer").containsEntry("customer",graph.remote.get("customer").getAsString());
+        assertThat(defaults.getFirst().params()).containsOnlyKeys("default_payment_method","proration_behavior").containsEntry("proration_behavior","none").containsEntry("default_payment_method","pm_decline");
+        assertThat(defaults.getLast().params()).containsOnlyKeys("default_payment_method").containsEntry("default_payment_method","pm_saved");
         assertThat(writes.getLast().params()).containsOnlyKeys("payment_method","off_session","error_on_requires_action")
             .containsEntry("payment_method","pm_saved").containsEntry("off_session",true).containsEntry("error_on_requires_action",true);
     }

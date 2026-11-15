@@ -104,10 +104,39 @@ final class OwnedBillingFailedRenewalFailureArm {
         local();
     }
     private void subscription(JsonNode remote,String method){
-        require(text(remote,"id").equals(admission.receipt().reference())&&text(remote,"object").equals("subscription")&&!bool(remote,"livemode")
+        var receipt=admission.receipt();var intent=receipt.intent();var terms=intent.terms();var owner=intent.clock().owner();
+        require(text(remote,"id").equals(receipt.reference())&&text(remote,"object").equals("subscription")&&!bool(remote,"livemode")
             &&text(remote,"customer").equals(intent().customerReference())&&text(remote,"test_clock").equals(intent().clock().reference())
-            &&text(remote,"status").equals("active")&&text(remote,"latest_invoice").equals(pending.boundary().renewalInvoice())&&text(remote,"default_payment_method").equals(method));
+            &&text(remote,"status").equals("active")&&text(remote,"latest_invoice").equals(pending.boundary().renewalInvoice())&&text(remote,"default_payment_method").equals(method)
+            &&number(remote,"created")==receipt.providerCreated()&&text(remote,"currency").equals("eur")
+            &&text(remote,"collection_method").equals("charge_automatically")&&text(remote.path("billing_mode"),"type").equals("classic"));
+        require(!bool(remote,"cancel_at_period_end"));
+        for(String field:List.of("trial_start","trial_end","pending_update","schedule","cancel_at","canceled_at","ended_at","pause_collection"))
+            require(remote.path(field).isNull());
+        require(!bool(remote.path("automatic_tax"),"enabled")&&emptyArray(remote,"default_tax_rates"));
+        var payment=remote.path("payment_settings");var types=payment.path("payment_method_types");
+        require(text(payment,"save_default_payment_method").equals("on_subscription")&&types.isArray()&&types.size()==1&&"card".equals(types.get(0).textValue()));
+        var metadata=remote.path("metadata");
+        Map.of("account_id",owner.account().value(),"site_id",owner.site().value(),"customer_id",owner.customer().value(),
+            "subscription_id",intent.subscription(),"operation_id",intent.createOperation()).forEach((k,v)->require(text(metadata,k).equals(v.toString())));
+
+        var items=remote.path("items");var data=items.path("data");
+        require(!bool(items,"has_more")&&data.isArray()&&data.size()==1);
+        var item=data.get(0);var period=pending.boundary().period();
+        require(text(item,"id").equals(receipt.itemReference())&&text(item,"id").equals(pending.boundary().item())
+            &&text(item,"object").equals("subscription_item")&&text(item,"subscription").equals(receipt.reference())
+            &&number(item,"quantity")==1&&(!item.has("deleted")||!bool(item,"deleted"))&&emptyArray(item,"tax_rates")
+            &&number(item,"current_period_start")==period.start().getEpochSecond()&&number(item,"current_period_end")==period.end().getEpochSecond());
+        var price=item.path("price");var recurring=price.path("recurring");var local=price.path("metadata");
+        require(text(price,"id").equals(intent.priceReference())&&text(price,"object").equals("price")&&!bool(price,"livemode")
+            &&text(price,"product").equals(intent.productReference())&&number(price,"unit_amount")==terms.regularAmount().minorUnits()
+            &&text(price,"currency").equals(terms.regularAmount().currency().toLowerCase(Locale.ROOT))
+            &&text(price,"tax_behavior").equals("inclusive")&&text(price,"type").equals("recurring")
+            &&text(recurring,"interval").equals(terms.interval().name().toLowerCase(Locale.ROOT))&&number(recurring,"interval_count")==1
+            &&text(recurring,"usage_type").equals("licensed")&&text(local,"local_price_id").equals(terms.priceId().value().toString())
+            &&text(local,"local_price_version").equals(Integer.toString(terms.version())));
     }
+    private static boolean emptyArray(JsonNode node,String field){var value=node.path(field);return value.isArray()&&value.isEmpty();}
     @FunctionalInterface private interface Remote {StripeObject get(RequestOptions options)throws Exception;}
     private JsonNode call(Remote remote,String key){
         long callStart=System.nanoTime();

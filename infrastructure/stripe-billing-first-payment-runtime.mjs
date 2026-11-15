@@ -25,7 +25,7 @@ function snapshotPrepareScope(scope){
   need(field.enumerable&&Object.hasOwn(field,'value')&&typeof field.value==='string'&&field.value.length>0&&field.value.length<=8192);
   result[key]=field.value;
  }
- need(result.runId&&result.accountId&&result.siteId&&result.customerId&&result.priceId);
+ need(result.runId&&result.accountId&&result.siteId&&result.customerId&&result.priceId&&result.origin&&result.createKey&&result.customerToken);
  return Object.freeze(result);
 }
 function responseShape(v,route){
@@ -39,7 +39,7 @@ export function createBillingFirstRenewalRuntime(options,dependencies={}){return
 export function createBillingFailedRenewalRuntime(options,dependencies={}){return createRuntime(options,dependencies,'FAILED_RENEWAL');}
 function createRuntime({configuration,bootstrap},dependencies,purpose){
  const failedRenewal=purpose==='FAILED_RENEWAL',firstRenewal=purpose==='FIRST_RENEWAL',extended=failedRenewal||firstRenewal;
- let priorFailedStage,initialSelection;
+ let priorFailedStage,initialSelection,terminalRequest,terminalClose;
  const c=(failedRenewal?validateBillingFailedRenewalOptions:firstRenewal?validateBillingFirstRenewalOptions:validateBillingFirstPaymentOptions)(configuration);need(c);let phase='NEW',failed=false,busy=false,observations=0,deadline,diagnostic=null,failureLatched=false,originalIdentity,initialSettlement,renewalBoundary;
  const failure=code=>{if(!failureLatched){failureLatched=true;if(isBillingFirstPaymentDiagnostic(code))diagnostic=code;}const error=billingError('RUNTIME');if(diagnostic!==null)ownDiagnostics.set(error,diagnostic);return error;};
  async function request(route,body,limits){
@@ -54,8 +54,24 @@ function createRuntime({configuration,bootstrap},dependencies,purpose){
     if(route==='prepare')checkpoint='PREPARE_AUTHORITY';if(extended||route==='prepare'){need(!entered);entered=true;}
     need(!failed);
     need(privateRuntime.endpoint==='http://127.0.0.1:'+c.controlPort&&/^[A-Za-z0-9_-]{43}$/.test(privateRuntime.capability));
+    if(failedRenewal&&!terminalRequest){
+     // Capture only a closed terminal call from the admitted binding. A busy
+     // financial bootstrap callback or its aborted fetch cannot block revocation.
+     const endpoint=privateRuntime.endpoint+'/failed-renewal/abort',authorization='Bearer '+privateRuntime.capability;
+     terminalRequest=async l=>{
+      const response=await (dependencies.fetch??globalThis.fetch)(endpoint,{method:'POST',redirect:'error',signal:l.signal,
+       headers:{Accept:'application/json',Authorization:authorization,'Content-Type':'application/json'},body:'{}'});
+      const expected=Buffer.from('{"code":"QUIESCENT"}'),chunks=[];let size=0;
+      try{
+       need(response.status===200);
+       for await(const chunk of response.body??[]){billingCheck(l);size+=chunk.length;need(size<=expected.length);chunks.push(Buffer.from(chunk));}
+       billingCheck(l);need(expected.equals(Buffer.concat(chunks)));return true;
+      }finally{await response.body?.cancel().catch(()=>{});}
+     };
+    }
     if(route==='prepare')checkpoint='PREPARE_REQUEST';
     result=await billingBounded(limits,async l=>{
+     if(failedRenewal)need(!failed);
      if(route==='prepare')ownPrepareCheckpoints.set(runtime,'PREPARE_REQUEST_TRANSPORT');
      const response=await (dependencies.fetch??globalThis.fetch)(privateRuntime.endpoint+(failedStage?'/failed-renewal/':['boundary','finalization'].includes(route)?'/first-renewal/':'/initial-payment/')+route,{method:body===undefined?'GET':'POST',redirect:'error',signal:l.signal,headers:{Accept:'application/json',Authorization:'Bearer '+privateRuntime.capability,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});
      if(route==='prepare')ownPrepareCheckpoints.set(runtime,'PREPARE_REQUEST_RESPONSE');
@@ -135,7 +151,15 @@ function createRuntime({configuration,bootstrap},dependencies,purpose){
    async boundary(l){if(phase!=='SETTLED_LOCAL')stop();phase='BOUNDARY_RUNNING';const v=await request('boundary',{},l);renewalBoundary=v;phase='RENEWAL_BOUNDARY';return v;},
    async finalization(l){if(phase!=='RENEWAL_BOUNDARY')stop();phase='FINALIZATION_RUNNING';const v=await request('finalization',{},l);phase='RENEWAL_SETTLED_LOCAL';return v;},
   }:{}),
-  async close(){failed=true;failureLatched=true;phase='CLOSED';priorFailedStage=undefined;initialSelection=undefined;return true;},
+  async close(limits){
+   failed=true;failureLatched=true;phase='CLOSED';priorFailedStage=undefined;initialSelection=undefined;
+   if(!failedRenewal)return true;
+   if(!terminalClose){
+    const send=terminalRequest;terminalRequest=undefined;
+    terminalClose=send?billingBounded(limits??{deadline:Date.now()+30000},send,30000):Promise.resolve(true);
+   }
+   return terminalClose;
+  },
  });
  ownPrepareCheckpoints.set(runtime,null);return runtime;
 }

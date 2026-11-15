@@ -1,6 +1,10 @@
 package dev.genericpayments.acceptance.runtime;
 
 import com.google.gson.JsonObject;
+import com.stripe.exception.StripeException;
+import com.stripe.net.HttpClient;
+import com.stripe.net.StripeRequest;
+import com.stripe.net.StripeResponse;
 import com.sun.net.httpserver.*;
 import dev.genericpayments.platform.PaymentPlatformApplication;
 import dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedGraceBillingTime;
@@ -13,7 +17,8 @@ import java.security.MessageDigest;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
 import org.springframework.boot.SpringApplication;
 import org.springframework.context.annotation.*;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -49,16 +54,43 @@ public final class OwnedBillingFailedRenewalRuntime {
         private static final Set<String> STAGES=Set.of("UNCLASSIFIED","INITIAL","BOUNDARY","DECLINE_ARM","FAILED_RENEWAL","GRACE_LAST_SECOND","GRACE_AT","GRACE_AFTER",
             "METHOD_PREPARE","METHOD_SELECT","METHOD_CONFIRM","METHOD_APPLY","RECOVERY_CONFIRM","RECOVERY_OBSERVE");
         private final OwnedBillingFailedRenewalOperations operations;private final byte[] authorization;
-        private final OwnedBillingFirstPaymentRuntime.Handler initial;private final AtomicBoolean active=new AtomicBoolean();
+        private final OwnedBillingFirstPaymentRuntime.Handler initial;private boolean active,terminal;
         public Handler(OwnedBillingFailedRenewalOperations operations,String capability){this.operations=Objects.requireNonNull(operations);authorization=("Bearer "+capability).getBytes(StandardCharsets.US_ASCII);initial=new OwnedBillingFirstPaymentRuntime.Handler(operations,capability);}
+        private synchronized boolean enter(){if(active||terminal)return false;active=true;return true;}
+        private synchronized void leave(){active=false;notifyAll();}
+        private synchronized boolean claimTerminal(){if(terminal)return false;terminal=true;return true;}
+        private synchronized boolean awaitProducer(long until)throws InterruptedException{
+            while(active){long left=until-System.nanoTime();if(left<=0)return false;TimeUnit.NANOSECONDS.timedWait(this,left);}
+            return true;
+        }
+        private void terminate(HttpExchange exchange)throws IOException{
+            if(!exchange.getRequestMethod().equals("POST")){reply(exchange,405,OwnedBillingFirstPaymentRuntime.error("INVALID_REQUEST"));return;}
+            try{OwnedBillingFirstPaymentRuntime.fields(OwnedBillingFirstPaymentRuntime.Handler.read(exchange,false),Set.of());}
+            catch(Exception malformed){reply(exchange,400,OwnedBillingFirstPaymentRuntime.error("INVALID_REQUEST"));return;}
+            if(!claimTerminal()){reply(exchange,400,OwnedBillingFirstPaymentRuntime.error("FAILED_RENEWAL_STOPPED"));return;}
+            long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(25); // within the existing 30s runtime-close budget
+            var drain=new FutureTask<Boolean>(()->{
+                operations.abort();
+                return awaitProducer(until)&&operations.awaitQuiescence(until);
+            });
+            Thread.ofVirtual().name("failed-renewal-terminal").start(drain);
+            boolean proved=false;
+            try{proved=drain.get(Math.max(0,until-System.nanoTime()),TimeUnit.NANOSECONDS);}
+            catch(InterruptedException interrupted){Thread.currentThread().interrupt();}
+            catch(TimeoutException|ExecutionException unconfirmed){/* no terminal proof */}
+            finally{drain.cancel(true);}
+            reply(exchange,proved?200:400,OwnedBillingFirstPaymentRuntime.error(proved?"QUIESCENT":"FAILED_RENEWAL_STOPPED"));
+        }
         @Override public void handle(HttpExchange exchange)throws IOException {
             boolean owned=false;
             try{
                 var auth=exchange.getRequestHeaders().get("Authorization");
                 if(auth==null||auth.size()!=1||!MessageDigest.isEqual(authorization,auth.getFirst().getBytes(StandardCharsets.UTF_8))){reply(exchange,403,OwnedBillingFirstPaymentRuntime.error("DENIED"));return;}
+                String path=exchange.getRequestURI().toString();
+                if(path.equals("/failed-renewal/abort")){terminate(exchange);return;}
                 // Refusal carries no cleanup right. This also guards the original initial Handler.
-                if(!active.compareAndSet(false,true)){reply(exchange,400,OwnedBillingFirstPaymentRuntime.error("FAILED_RENEWAL_STOPPED"));return;}
-                owned=true;String path=exchange.getRequestURI().toString();
+                if(!enter()){reply(exchange,400,OwnedBillingFirstPaymentRuntime.error("FAILED_RENEWAL_STOPPED"));return;}
+                owned=true;
                 if(!PATHS.contains(path)){initial.handle(exchange);return;}
                 if(!exchange.getRequestMethod().equals("POST")){operations.abort();reply(exchange,405,OwnedBillingFirstPaymentRuntime.error("INVALID_REQUEST"));return;}
                 OwnedBillingFirstPaymentRuntime.fields(OwnedBillingFirstPaymentRuntime.Handler.read(exchange,false),Set.of());
@@ -74,12 +106,40 @@ public final class OwnedBillingFailedRenewalRuntime {
                 String stage;try{stage=operations.failureStage();}catch(RuntimeException unavailable){stage="UNCLASSIFIED";}
                 var response=OwnedBillingFirstPaymentRuntime.error("FAILED_RENEWAL_STOPPED");response.addProperty("stage",stage!=null&&STAGES.contains(stage)?stage:"UNCLASSIFIED");
                 operations.abort();reply(exchange,400,response);
-            }finally{if(owned)active.set(false);exchange.close();}
+            }finally{if(owned)leave();exchange.close();}
         }
         private static void reply(HttpExchange exchange,int code,JsonObject body)throws IOException{OwnedBillingFirstPaymentRuntime.Handler.reply(exchange,code,body);}
     }
+    /** Ordinary application calls retain their original transport. A private producer
+     * binds its immutable ticket before any SDK client or worker can be created. */
+    static class ScopedClients extends dev.genericpayments.platform.provider.adapter.out.stripe.StripeClientFactory {
+        private static final InheritableThreadLocal<UnaryOperator<HttpClient>> CURRENT=new InheritableThreadLocal<>();
+        private final Supplier<HttpClient> injected;
+        ScopedClients(){injected=null;}
+        ScopedClients(Supplier<HttpClient> injected){this.injected=Objects.requireNonNull(injected);}
+        static void bind(OwnedBillingFailedRenewalSandboxScenario.State state,long ticket){
+            CURRENT.set(delegate->new GuardedTransport(state,ticket,delegate));
+        }
+        static void unbind(){CURRENT.remove();}
+        @Override protected HttpClient transport(){
+            HttpClient delegate=injected==null?super.transport():injected.get();
+            var captured=CURRENT.get();return captured==null?delegate:captured.apply(delegate);
+        }
+    }
+    private static final class GuardedTransport extends HttpClient{
+        private final OwnedBillingFailedRenewalSandboxScenario.State state;
+        private final long ticket;private final HttpClient delegate;
+        GuardedTransport(OwnedBillingFailedRenewalSandboxScenario.State state,long ticket,HttpClient delegate){
+            this.state=state;this.ticket=ticket;this.delegate=Objects.requireNonNull(delegate);
+        }
+        @Override public StripeResponse request(StripeRequest request)throws StripeException{
+            state.beginTransport(ticket);
+            try{return delegate.request(request);}finally{state.endTransport();}
+        }
+    }
     @Configuration(proxyBeanMethods=false)
     public static class BillingTimeConfiguration {
+        @Bean @Primary ScopedClients failedRenewalStripeClients(){return new ScopedClients();}
         @Bean @Primary OwnedFailedGraceBillingTime ownedFailedGraceBillingTime(JdbcTemplate jdbc,EntityManagerFactory emf){
             return new OwnedFailedGraceBillingTime(jdbc,emf,new OwnedFailedRenewalBillingTime(jdbc,new OwnedFirstRenewalBillingTime(jdbc,new OwnedSubscriptionBillingTime(jdbc))));
         }

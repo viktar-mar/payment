@@ -13,6 +13,8 @@ public class StripeClientFactory {
         return StripeClient.builder().setApiKey(credentials.secretKey())
             .setApiBase("https://api.stripe.com")
             .setConnectTimeout(5_000).setReadTimeout(20_000).setMaxNetworkRetries(0)
-            .setHttpClient(new StripeSdkHttpClient());
+            .setHttpClient(transport());
     }
+
+    protected com.stripe.net.HttpClient transport() { return new StripeSdkHttpClient(); }
 }

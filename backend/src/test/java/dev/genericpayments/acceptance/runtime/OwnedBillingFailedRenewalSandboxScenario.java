@@ -192,6 +192,7 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
     }
     @Override public JsonObject status(){var phase=state.phase();if(phase.equals("INITIAL"))return initial.status();var result=response(phase);result.addProperty("code",phase.equals("STOPPED")?"FAILED_RENEWAL_STOPPED":"OK");return result;}
     @Override public void abort(){if(state.requestAbort())cleanup();}
+    @Override public boolean awaitQuiescence(long untilNanos)throws InterruptedException{return state.awaitQuiescence(untilNanos);}
     private synchronized void cleanup(){
         if(cleaned)return;cleaned=true;selected=null;action=null;
         // Each concrete delegate cleans only its owned claim. Do not synthesize a terminal
@@ -206,18 +207,29 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
     /** Actually used exclusive local dispatcher; losing callers never receive cleanup tickets. */
     static final class State {
         private final Clock utc;private final Instant deadline;private String phase="INITIAL";private long sequence,owner;private boolean cancelled;
+        private int transports;
         State(Clock utc,Instant deadline){this.utc=Objects.requireNonNull(utc);this.deadline=Objects.requireNonNull(deadline);}
         synchronized long enter(String expected,String running){
             if(owner!=0)throw denied();check();if(!phase.equals(expected)){phase="STOPPED";throw denied();}
-            owner=++sequence;phase=running;return owner;
+            owner=++sequence;phase=running;OwnedBillingFailedRenewalRuntime.ScopedClients.bind(this,owner);return owner;
         }
         synchronized void complete(long ticket,String running,String next){
-            if(ticket!=owner||owner==0||!phase.equals(running))throw denied();check();phase=next;owner=0;
+            if(ticket!=owner||owner==0||transports!=0||!phase.equals(running))throw denied();check();phase=next;retire();
         }
-        synchronized boolean fail(long ticket){if(ticket!=owner||owner==0)return false;phase="STOPPED";owner=0;return true;}
+        private void retire(){owner=0;OwnedBillingFailedRenewalRuntime.ScopedClients.unbind();notifyAll();}
+        synchronized boolean fail(long ticket){if(ticket!=owner||owner==0)return false;phase="STOPPED";retire();return true;}
         synchronized String phase(){if(!utc.instant().isBefore(deadline)&&owner==0)phase="STOPPED";return phase;}
         synchronized boolean stoppedIdle(){return owner==0&&phase.equals("STOPPED");}
-        synchronized boolean requestAbort(){if(owner!=0){cancelled=true;return false;}phase="STOPPED";return true;}
+        synchronized boolean requestAbort(){cancelled=true;if(owner!=0)return false;phase="STOPPED";notifyAll();return true;}
+        synchronized void beginTransport(long ticket){checkActive();if(owner!=ticket)throw denied();transports++;}
+        synchronized void endTransport(){transports--;notifyAll();}
+        synchronized boolean awaitQuiescence(long until)throws InterruptedException{
+            while(owner!=0||transports!=0){
+                long left=until-System.nanoTime();if(left<=0)return false;
+                java.util.concurrent.TimeUnit.NANOSECONDS.timedWait(this,left);
+            }
+            return cancelled&&phase.equals("STOPPED")&&System.nanoTime()<until;
+        }
         synchronized void checkActive(){if(owner==0)throw denied();check();}
         private void check(){if(cancelled||phase.equals("STOPPED")||!utc.instant().isBefore(deadline)){if(owner==0)phase="STOPPED";throw denied();}}
     }

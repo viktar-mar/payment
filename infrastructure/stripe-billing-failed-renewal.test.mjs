@@ -158,10 +158,11 @@ function client(rewrite){
  const runtime=clients.createBillingFailedRenewalRuntime({configuration:opts(),bootstrap:{withFailedRenewalRuntime:cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)})}},{fetch:async(url,r)=>{calls.push([url,r]);const row=queue.shift();return new Response(rewrite?rewrite(row,calls.length):JSON.stringify(row));}});
  return {runtime,calls};
 }
-async function settle(r,l){await r.ready(l);await r.prepare(scope(),l);await r.confirm(confirmRequest(),l);await r.observe(l);}
+const prepareScope=()=>({...scope(),origin:scope().endpoints.demo,createKey:'sdk-create',customerToken:'inert'});
+async function settle(r,l){await r.ready(l);await r.prepare(prepareScope(),l);await r.confirm(confirmRequest(),l);await r.observe(l);}
 test('failed client sends the original selected confirmation body after the caller mutates every field',async()=>{
  const {runtime:r,calls}=client(),l=limits(),original=confirmRequest();
- await r.ready(l);await r.prepare(scope(),l);
+ await r.ready(l);await r.prepare(prepareScope(),l);
  const sent=r.confirm(original,l);
  Object.assign(original,{attempt_id:id(77),capability:'foreign',confirmation_token:'ctoken_other',idempotency_key:'sdk-other'});
  await sent;
@@ -180,7 +181,7 @@ for(const [name,change] of [
  ['toJSON',(p,touched)=>{p.toJSON=()=>{touched();return confirmRequest();};}]
 ])test('failed client consumes '+name+' without dispatch or invoking caller code',async()=>{
  const {runtime:r,calls}=client(),l=limits(),original=confirmRequest();let touches=0;
- await r.ready(l);await r.prepare(scope(),l);
+ await r.ready(l);await r.prepare(prepareScope(),l);
  change(original,()=>{touches++;});
  await assert.rejects(r.confirm(original,l));
  await assert.rejects(r.confirm(confirmRequest(),l));
@@ -199,3 +200,52 @@ for(const wire of [t=>t.replace('"secret":','"secret":"other","secret":'),t=>t.r
  const {runtime:r}=client((v,n)=>n===11?wire(JSON.stringify(v)):JSON.stringify(v)),l=limits();await settle(r,l);for(const m of methods.slice(0,6))await r[m](l);await assert.rejects(r.prepareMethod(l));await assert.rejects(r.selectMethod(l));
 });
 test('expired arm never dispatches or resumes',async()=>{const {runtime:r,calls}=client(),l=limits();await settle(r,l);await r.boundary(l);await assert.rejects(r.armDecline({deadline:1}));await assert.rejects(r.armDecline(l));assert.equal(calls.length,5);});
+
+for(const key of ['origin','createKey','customerToken'])test('failed direct prepare requires own '+key+' before transport',async()=>{
+ for(const variant of ['missing','inherited','getter']){
+  const {runtime:r,calls}=client(),l=limits(),s=prepareScope();let reads=0;
+  await r.ready(l);delete s[key];
+  if(variant==='inherited')Object.setPrototypeOf(s,{[key]:'borrowed'});
+  if(variant==='getter')Object.defineProperty(s,key,{enumerable:true,get(){reads++;return 'borrowed';}});
+  await assert.rejects(r.prepare(s,l));await assert.rejects(r.prepare(prepareScope(),l));assert.equal(calls.length,1);assert.equal(reads,0);
+ }
+});
+
+for(const terminal of ['quiescent','unproved','transport-error'])test('actual owner sends one independent terminal control during a busy arm: '+terminal,async()=>{
+ const h=harness(),external=new AbortController(),financial=Promise.withResolvers(),browserClosing=Promise.withResolvers();
+ const release=Promise.withResolvers(),releaseBrowser=Promise.withResolvers(),calls=[],l=limits();
+ const queue=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),initial(),responses()[0]];
+ let busy=false;
+ h.bootstrap.withFailedRenewalRuntime=async cb=>{
+  assert.equal(busy,false,'ordinary bootstrap is busy during financial transport');busy=true;
+  try{return await cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});}finally{busy=false;}
+ };
+ h.dependencies.createRuntime=options=>clients.createBillingFailedRenewalRuntime(options,{fetch:async(url,r)=>{
+  const path=new URL(url).pathname;calls.push(path);
+  if(path==='/failed-renewal/arm-decline'){
+   financial.resolve();await release.promise;
+   if(terminal==='transport-error')throw Error('uncertain arm transport');
+   return new Response(JSON.stringify(responses()[1]));
+  }
+  if(path==='/failed-renewal/abort'){
+   assert.equal(external.signal.aborted,terminal!=='transport-error');assert.equal(r.signal.aborted,false);
+   assert.equal(r.method,'POST');assert.equal(r.body,'{}');assert.equal(r.redirect,'error');assert.equal(r.headers.Authorization,'Bearer '+'x'.repeat(43));
+   return new Response(JSON.stringify({code:terminal==='unproved'?'RECEIVED':'QUIESCENT'}));
+  }
+  assert.ok(queue.length);return new Response(JSON.stringify(queue.shift()));
+ }});
+ h.journey.close=async()=>{browserClosing.resolve();await releaseBrowser.promise;return true;};
+ const o=await owner(h),run=assert.rejects(o.run(h.journey,{...l,signal:external.signal}));
+ try{
+  await financial.promise;
+  if(terminal==='transport-error')release.resolve();else external.abort();
+  await browserClosing.promise;
+  await new Promise(r=>setImmediate(r));
+  assert.equal(calls.filter(p=>p==='/failed-renewal/abort').length,1,'revoke before browser drain, independent of busy callback');
+ }finally{release.resolve();releaseBrowser.resolve();await run;}
+ const result=await o.close();
+ assert.equal(result.cleanupConfirmed,terminal!=='unproved');assert.equal(result.failedRenewalAccepted,false);
+ assert.equal(calls.filter(p=>p==='/failed-renewal/abort').length,1);
+ assert.equal(calls.filter(p=>p==='/failed-renewal/arm-decline').length,1);
+ assert.ok(h.calls.includes('arm-dispatch'));assert.ok(!h.calls.includes('arm-ack'));assert.ok(!calls.includes('/failed-renewal/failed'));
+});

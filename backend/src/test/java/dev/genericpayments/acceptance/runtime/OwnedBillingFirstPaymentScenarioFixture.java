@@ -52,11 +52,13 @@ abstract class OwnedBillingFirstPaymentScenarioFixture extends StripeBillingCloc
         callbacks.configure(site.value(),"https://example.com/callback",true);
         var session=fixtureSession();
         var admission=new OwnedBillingFirstPaymentRuntime.Admission(run,"a".repeat(40),FROZEN,"q".repeat(43),8099,"127.0.0.1");
-        inertClients=new StripeClientFactory(){@Override public StripeClient create(StripeCredentials ignored){return StripeClient.builder().setApiKey("sk_test_INERT").setApiBase("https://api.stripe.com").setMaxNetworkRetries(0).setHttpClient(new HttpClient(){@Override public StripeResponse request(StripeRequest request)throws StripeException{return respond(request);}}).build();}};
+        inertClients=fixtureClients();
         scenario=createScenario(admission);
         prepareRequest=new JsonObject();prepareRequest.addProperty("run_id",run.toString());prepareRequest.addProperty("source_sha","a".repeat(40));prepareRequest.addProperty("account_id",billing.id().value().toString());prepareRequest.addProperty("site_id",site.value().toString());prepareRequest.addProperty("customer_id",customer.value().toString());prepareRequest.addProperty("price_id",createCommand.priceId().value().toString());prepareRequest.addProperty("origin","https://shop.test");prepareRequest.addProperty("create_key","original-create");prepareRequest.addProperty("customer_token",session.rawToken());
     }
     protected OwnedBillingFirstPaymentRuntime.Operations createScenario(OwnedBillingFirstPaymentRuntime.Admission admission) { return new OwnedBillingFirstPaymentScenario(admission,this::runtimeBean,Clock.systemUTC(),Instant.now().plusSeconds(120)); }
+    protected HttpClient fixtureTransport(){return new HttpClient(){@Override public StripeResponse request(StripeRequest request)throws StripeException{return respond(request);}};}
+    protected StripeClientFactory fixtureClients(){return new StripeClientFactory(){@Override public StripeClient create(StripeCredentials ignored){return StripeClient.builder().setApiKey("sk_test_INERT").setApiBase("https://api.stripe.com").setMaxNetworkRetries(0).setHttpClient(fixtureTransport()).build();}};}
     protected StripeResponse renewalResponse(StripeRequest request) throws StripeException { return null; }
     protected Object runtimeBean(Class<?> type) {
         if(type==StripeClientFactory.class)return inertClients;
