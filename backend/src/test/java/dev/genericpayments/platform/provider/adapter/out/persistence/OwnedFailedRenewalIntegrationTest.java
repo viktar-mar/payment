@@ -220,15 +220,25 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         String writingPhase;java.util.function.Consumer<String> beforeCommit=phase->{},afterCommit=phase->{};
         Throwable transactionFailure;final OwnedFailedGraceBoundaryService service;
         BoundarySdk(GracePrepared p,OwnedFailedGraceBoundary.Phase phase){this(p,phase,Clock.systemUTC(),null);}
+        boolean recordReadyInSavepoint;
+        BoundaryReady savedReady;
         BoundarySdk(GracePrepared p,OwnedFailedGraceBoundary.Phase phase,Clock utc,java.util.concurrent.atomic.AtomicBoolean live){
             prepared=p;this.phase=phase;adapterUtc=utc;liveUtc=live;var delegate=new JdbcOwnedFailedGraceBoundaryStore(jdbc,entityManagerFactory);
             var store=(OwnedFailedGraceBoundaryStore)Proxy.newProxyInstance(OwnedFailedGraceBoundaryStore.class.getClassLoader(),new Class<?>[]{OwnedFailedGraceBoundaryStore.class},(proxy,method,args)->{
                 if(method.getName().equals("beforeAuthorityInTransaction")){if(original==null)original=(InvocationBudget)args[0];if(liveUtc!=null)liveUtc.set(true);}
-                Object result;try{result=method.invoke(delegate,args);}catch(InvocationTargetException failure){throw failure.getCause();}
+                Object result;
+                if(recordReadyInSavepoint&&method.getName().equals("recordReadyInTransaction")){
+                    result=jdbc.execute((org.springframework.jdbc.core.ConnectionCallback<BoundaryReady>)connection->{
+                        var sp=connection.setSavepoint();
+                        var ready=delegate.recordReadyInTransaction((OwnedFailedGraceBoundary.BoundaryContext)args[0],(OwnedFailedGraceBoundary.BoundaryAck)args[1],
+                            (OwnedFirstRenewal.TestClockReady)args[2],(Instant)args[3],(Instant)args[4],(InvocationBudget)args[5]);
+                        connection.releaseSavepoint(sp);return ready;
+                    });
+                }else try{result=method.invoke(delegate,args);}catch(InvocationTargetException failure){throw failure.getCause();}
                 switch(method.getName()){
                     case "firstClaimInTransaction"->{context=(OwnedFailedGraceBoundary.BoundaryContext)args[0];originalClaim=(ProviderOperation)result;writingPhase="claim";}
                     case "acknowledgeInTransaction"->{returnedAck=(OwnedFailedGraceBoundary.BoundaryAck)result;writingPhase="ack";}
-                    case "recordReadyInTransaction"->writingPhase="ready";
+                    case "recordReadyInTransaction"->{savedReady=(BoundaryReady)result;writingPhase="ready";}
                     case "uncertainInTransaction"->writingPhase="cleanup";
                     default->{}
                 }return result;
@@ -313,11 +323,14 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         };
         if(!stage.startsWith("after")){refused.run();return;}
         var sdk=new BoundarySdk(p,OwnedFailedGraceBoundary.Phase.AFTER);var checked=new java.util.concurrent.atomic.AtomicBoolean();
+        sdk.recordReadyInSavepoint=stage.equals("after-ready-local");
         sdk.afterCommit=step->{if(stage.equals("after-"+step)){refused.run();checked.set(true);}};
         sdk.beforeCommit=step->{if(step.equals("ready")&&stage.equals("after-ready-local")){
-            jdbc.execute((org.springframework.jdbc.core.ConnectionCallback<Void>)connection->{
-                var sp=connection.setSavepoint();jdbc.execute("set constraints all immediate");connection.releaseSavepoint(sp);return null;
-            });
+            jdbc.execute("set constraints all immediate");
+            var actual=sdk.savedReady;
+            var supplied=new OwnedFailedRenewalMethod.GraceSuccessor(prep.id(),actual.id(),actual.observation(),actual.observedAt());
+            assertThat(jdbc.queryForObject("select producer_xid=pg_current_xact_id() from stripe_billing_failed_grace_boundary_ready where id=?",Boolean.class,actual.id())).isTrue();
+            assertThatThrownBy(()->store.requireGraceSuccessorEntryInTransaction(a,supplied,Instant.now())).isInstanceOf(IllegalStateException.class);
             assertThat(jdbc.queryForObject("select owned_grace_history_committed(?,clock_timestamp(),pg_current_xact_id())",Boolean.class,prep.id())).isFalse();
             checked.set(true);
         }};
@@ -341,8 +354,20 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(count("stripe_billing_failed_method_reservations")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
         assertThat(boundaryRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
     }
-    @ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
-    void drainedHandoffWithSubsequentAuthorityDriftDistinguishesRawReceiptFromSupportedCompletion(boolean supported){
+    private void insertRawHandoff(OwnedFailedRenewalMethod.Reservation r,OwnedMethodBrowser.Enrollment session){
+        var binding=r.binding();var s=r.successor();
+        assertThat(jdbc.update("""
+            insert into stripe_billing_failed_method_reservations(id,admission_id,setup_operation,request_fingerprint,initial_operation_version,
+             operation_snapshot,binding_id,binding_version,binding_reference,binding_creation_operation,billing_at,billing_mode,reserved_at,
+             browser_session_id,browser_origin,browser_session_expires_at,after_ready_id,after_preparation_id,after_phase)
+            select ?,?,o.id,o.fingerprint,0,to_jsonb(o),?,?,?,?,?,'ISOLATED',?,?,?,?,?,?,3 from subscription_operations o where o.id=?
+            """,r.id(),r.admission().id(),binding.id(),binding.version(),binding.providerReference(),binding.creationOperationId(),
+            java.sql.Timestamp.from(r.billingSample().billingAt()),java.sql.Timestamp.from(r.reservedAt()),session.sessionId(),session.origin(),
+            java.sql.Timestamp.from(session.sessionExpiresAt()),s.afterReadyId(),s.preparationId(),r.setupOperationId())).isOne();
+    }
+    @ParameterizedTest @ValueSource(strings={"supported","raw-drain","raw-deferred","prior-setup"})
+    void drainedHandoffWithSubsequentAuthorityDriftDistinguishesRawReceiptFromSupportedCompletion(String scenario){
+        boolean supported=scenario.equals("supported");
         var e=afterEntry();var a=e.prepared().setup().admission();var s=e.successor();var ctx=managementContext("after-drain");
         var real=new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory);var reached=new java.util.concurrent.atomic.AtomicBoolean();
         var negative=(OwnedFailedRenewalMethodStore)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{OwnedFailedRenewalMethodStore.class},(proxy,method,args)->{
@@ -354,28 +379,37 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             else{
                 // Raw negative control, using genuine caller SETUP, enrolled original session and saved AFTER.
                 r=new OwnedFailedRenewalMethod.Reservation(UUID.randomUUID(),a,e.prepared().context().failure(),op.id(),op.fingerprint(),0,binding,sample,now,s);
+                if(scenario.equals("prior-setup"))return r; // Negative transaction A commits only the real service SETUP claim.
                 var raw=r;
                 jdbc.execute((org.springframework.jdbc.core.ConnectionCallback<Void>)connection->{
                     var sp=connection.setSavepoint();
-                    assertThat(jdbc.update("""
-                    insert into stripe_billing_failed_method_reservations(id,admission_id,setup_operation,request_fingerprint,initial_operation_version,
-                     operation_snapshot,binding_id,binding_version,binding_reference,binding_creation_operation,billing_at,billing_mode,reserved_at,
-                     browser_session_id,browser_origin,browser_session_expires_at,after_ready_id,after_preparation_id,after_phase)
-                    select ?,?,o.id,o.fingerprint,0,to_jsonb(o),?,?,?,?,?,'ISOLATED',?,?,?,?,?,?,3 from subscription_operations o where o.id=?
-                    """,raw.id(),a.id(),binding.id(),binding.version(),binding.providerReference(),binding.creationOperationId(),java.sql.Timestamp.from(sample.billingAt()),
-                    java.sql.Timestamp.from(now),session.sessionId(),session.origin(),java.sql.Timestamp.from(session.sessionExpiresAt()),s.afterReadyId(),s.preparationId(),op.id())).isOne();
+                    insertRawHandoff(raw,session);
                     connection.releaseSavepoint(sp);return null;
                 });
             }
-            jdbc.execute("set constraints all immediate");
+            if(!scenario.equals("raw-deferred"))jdbc.execute("set constraints all immediate");
             assertThat(jdbc.queryForObject("select handoff_xid=pg_current_xact_id() and not owned_grace_successor_identity(id,clock_timestamp(),pg_current_xact_id()) from stripe_billing_failed_method_reservations where id=?",Boolean.class,r.id())).isTrue();
             reached.set(true);
             if(supported)graceTestAccounts.save(new dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount(billing.id(),billing.key(),billing.provider(),billing.mode(),billing.status(),billing.externalAccountId(),"negative-handoff-drift"));
             else assertThat(jdbc.update("update payment_accounts set credentials_ref='negative-handoff-drift' where id=?",billing.id().value())).isOne();
+            if(scenario.equals("raw-deferred"))jdbc.execute("set constraints grace_handoff_committed immediate");
             return r;
         });
         var svc=methodService(negative);
-        if(supported){
+        if(scenario.equals("prior-setup")){
+            var prior=svc.reserveBrowserMethodAfterGrace(a,s,ctx,true);
+            assertThat(lifecycleOperations.find(site,current().id(),prior.setupOperationId()).orElseThrow().status()).isEqualTo(SubscriptionOperation.Status.RESERVED);
+            assertThat(count("stripe_billing_failed_method_reservations")).isZero();
+            var session=((SubscriptionActor.Customer)ctx.actor()).session();var enrollment=new OwnedMethodBrowser.Enrollment(session.sessionId().value(),session.origin(),session.expiresAt());
+            // B has every genuine input except the SETUP INSERT. It must fail without any early drain.
+            assertThatThrownBy(()->transaction.requiresNew(()->{insertRawHandoff(prior,enrollment);return true;}))
+                .satisfies(error->assertGraceSqlProof(error,"Handoff requires original SETUP insertion"));
+            assertThat(count("stripe_billing_failed_method_reservations")).isZero();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();return;
+        }else if(scenario.equals("raw-deferred")){
+            assertThatThrownBy(()->svc.reserveBrowserMethodAfterGrace(a,s,ctx,true)).satisfies(error->assertGraceSqlProof(error,"Handoff authority changed before commit"));
+            assertThat(count("stripe_billing_failed_method_reservations")).isZero();
+            assertThat(jdbc.queryForObject("select credentials_ref from payment_accounts where id=?",String.class,billing.id().value())).isEqualTo(billing.credentialsRef());
+        }else if(supported){
             assertThatThrownBy(()->svc.reserveBrowserMethodAfterGrace(a,s,ctx,true)).isInstanceOf(RuntimeException.class);
             assertThat(count("stripe_billing_failed_method_reservations")).isZero();
             assertThat(jdbc.queryForObject("select credentials_ref from payment_accounts where id=?",String.class,billing.id().value())).isEqualTo(billing.credentialsRef());
@@ -386,6 +420,37 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
             assertThatThrownBy(()->methodService(real).inspectBrowserSetupPreparation(stale,ctx)).isInstanceOf(RuntimeException.class);
         }
         assertThat(reached).isTrue();assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @Test void originalSetupInsertedWithinReleasedSavepointCanCompleteAtomicHandoff(){
+        var e=afterEntry();var ctx=managementContext("setup-in-savepoint");var saved=new java.util.concurrent.atomic.AtomicBoolean();
+        var store=(SubscriptionOperationStore)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{SubscriptionOperationStore.class},(proxy,method,args)->{
+            if(method.getName().equals("claim"))return jdbc.execute((org.springframework.jdbc.core.ConnectionCallback<SubscriptionOperationStore.Claim>)connection->{
+                var sp=connection.setSavepoint();var claim=lifecycleOperations.claim((SubscriptionOperation)args[0]);assertThat(claim.owner()).isTrue();
+                connection.releaseSavepoint(sp);saved.set(true);return claim;
+            });
+            try{return method.invoke(lifecycleOperations,args);}catch(InvocationTargetException f){throw f.getCause();}
+        });
+        var r=methodService(new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory),store)
+            .reserveBrowserMethodAfterGrace(e.prepared().setup().admission(),e.successor(),ctx,true);
+        assertThat(saved).isTrue();assertThat(r.successor()).isEqualTo(e.successor());
+        Boolean independent=jdbc.queryForObject("select owned_grace_successor_identity(?,clock_timestamp(),pg_current_xact_id())",Boolean.class,r.id());
+        assertThat(independent).isTrue();assertThat(count("stripe_billing_failed_method_reservations")).isOne();
+        Boolean linked=jdbc.queryForObject("""
+            select origin.producer_xid=r.handoff_xid and origin.producer_xid<>pg_current_xact_id()
+            from stripe_billing_failed_grace_setup_origins origin join stripe_billing_failed_method_reservations r
+             on (r.setup_operation,r.admission_id,r.after_ready_id)=(origin.setup_operation,origin.admission_id,origin.after_ready_id)
+            where r.id=?
+            """,Boolean.class,r.id());
+        assertThat(linked).isTrue();
+        var origins=rows("stripe_billing_failed_grace_setup_origins");
+        for(String statement:List.of("""
+                insert into stripe_billing_failed_grace_setup_origins(setup_operation,admission_id,after_ready_id,after_preparation_id,after_phase)
+                select setup_operation,admission_id,after_ready_id,after_preparation_id,after_phase from stripe_billing_failed_grace_setup_origins
+                """,
+                "update stripe_billing_failed_grace_setup_origins set producer_xid=pg_current_xact_id()","delete from stripe_billing_failed_grace_setup_origins")){
+            assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update(statement))).satisfies(error->assertGraceAdvanceSqlState(error,"23514"));
+        }
+        assertThat(rows("stripe_billing_failed_grace_setup_origins")).isEqualTo(origins);
     }
     @Test void afterEntryRefusesHeldAfterForeignKeyAndExactlyOneConcurrentEntrantWins() throws Exception{
         var e=afterEntry();var a=e.prepared().setup().admission();var s=e.successor();var svc=methodService(new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory));
@@ -777,7 +842,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     private Map<String,List<String>> graceReadRows(){
         var state=new TreeMap<>(selectorRows());
         for(var table:List.of("stripe_billing_failed_grace_preparations","stripe_billing_failed_grace_claims","stripe_billing_failed_grace_acks",
-                "stripe_billing_failed_grace_ready","stripe_billing_failed_grace_cleanup","stripe_billing_failed_renewal_stops","provider_operations",
+                "stripe_billing_failed_grace_ready","stripe_billing_failed_grace_cleanup","stripe_billing_failed_grace_setup_origins","stripe_billing_failed_renewal_stops","provider_operations",
                 "subscriptions","subscription_operations","subscription_billing_records","subscription_provider_objects","subscription_trial_eligibility",
                 "subscription_event_sequences","subscription_events","subscription_quotes","subscription_action_capabilities","subscription_portal_sessions",
                 "subscription_admin_receipts","subscription_change_intents","subscription_confirmation_chains","subscription_confirmation_attempts",

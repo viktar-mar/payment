@@ -115,6 +115,60 @@ create function owned_grace_history_committed(preparation uuid, utc timestamptz,
  select owned_grace_original_history($1,$2,$3) and owned_grace_boundary_receipt($1,2,$2,$3) and owned_grace_boundary_receipt($1,3,$2,$3)
 $$;
 
+-- Keep insertion provenance outside subscription_operations: earlier immutable V35
+-- snapshots compare to_jsonb(operation) and must retain their original row shape.
+create table stripe_billing_failed_grace_setup_origins (
+ setup_operation uuid primary key references subscription_operations(id),
+ admission_id uuid not null, after_ready_id uuid not null, after_preparation_id uuid not null,
+ after_phase integer not null check(after_phase=3), producer_xid xid8 not null,
+ foreign key(after_ready_id,after_preparation_id,admission_id,after_phase)
+  references stripe_billing_failed_grace_boundary_ready(id,preparation_id,admission_id,phase)
+);
+
+-- The sole nested INSERT is capture_owned_grace_setup_origin, on actual operation INSERT.
+-- No default, caller-supplied xid, UPDATE, conflict/reload, or pre-V41 backfill mints an origin.
+create function stamp_owned_grace_setup_origin() returns trigger language plpgsql volatile as $$
+begin
+ if pg_trigger_depth()<>2 or new.producer_xid is not null then
+  raise exception 'SETUP origin requires original insertion' using errcode='23514';end if;
+ new.producer_xid:=pg_current_xact_id();return new;
+end $$;
+create trigger grace_setup_origin_insert before insert on stripe_billing_failed_grace_setup_origins
+ for each row execute function stamp_owned_grace_setup_origin();
+create trigger grace_setup_origin_immutable before update or delete on stripe_billing_failed_grace_setup_origins
+ for each row execute function protect_failed_renewal_evidence();
+
+create function capture_owned_grace_setup_origin() returns trigger language plpgsql volatile as $$
+declare after_row stripe_billing_failed_grace_boundary_ready%rowtype;
+begin
+ select b.* into after_row from stripe_billing_failed_renewals d
+ join stripe_billing_failed_renewal_failures f on f.admission_id=d.id
+ join stripe_billing_first_renewals a on a.id=d.first_renewal_admission
+ join stripe_billing_failed_grace_boundary_ready b on b.admission_id=d.id and b.phase=3
+ join subscription_operations inserted on inserted.id=new.id and inserted.subscription_id=d.subscription_id
+ where (d.site_id,d.customer_id,d.subscription_id)=(new.site_id,new.customer_id,new.subscription_id)
+ and new.authority_scope='owned-failed-renewal-method:'||d.id::text
+ and new.provider_operation_key='subscription:'||d.payment_account_id::text||':'||new.id::text||':SETUP'
+ and new.expected_revision=f.projected_revision and new.policy_version=a.policy_version
+ and new.provider_reference is null and new.safe_failure_code is null
+ and b.observed_at<=new.created_at and new.created_at<=clock_timestamp()
+ and owned_grace_history_committed(b.preparation_id,clock_timestamp(),pg_current_xact_id())
+ for key share of inserted,b nowait;
+ if found then
+  insert into stripe_billing_failed_grace_setup_origins(setup_operation,admission_id,after_ready_id,after_preparation_id,after_phase)
+  values(new.id,after_row.admission_id,after_row.id,after_row.preparation_id,after_row.phase);
+ end if;return null;
+end $$;
+create trigger grace_setup_origin after insert on subscription_operations for each row
+ when(new.kind='SETUP' and new.status='RESERVED' and new.version=0 and new.authority_scope like 'owned-failed-renewal-method:%')
+ execute function capture_owned_grace_setup_origin();
+
+create function owned_grace_setup_inserted(r stripe_billing_failed_method_reservations) returns boolean language sql stable as $$
+ select exists(select 1 from stripe_billing_failed_grace_setup_origins origin
+ where (origin.setup_operation,origin.admission_id,origin.after_ready_id,origin.after_preparation_id,origin.after_phase,origin.producer_xid)
+ =(($1).setup_operation,($1).admission_id,($1).after_ready_id,($1).after_preparation_id,($1).after_phase,($1).handoff_xid))
+$$;
+
 create function owned_grace_successor_entry(preparation uuid,utc timestamptz,reader xid8) returns boolean language sql stable as $$
  select exists(select 1 from stripe_billing_failed_grace_preparations p join stripe_billing_failed_renewals d on d.id=p.admission_id
  where p.id=$1 and owned_grace_history_committed(p.id,$2,$3) and owned_failed_renewal_failure_current(d.id,null)
@@ -143,7 +197,7 @@ $$;
 
 create function owned_grace_successor_identity(reservation uuid,utc timestamptz,reader xid8) returns boolean language sql stable as $$
  select exists(select 1 from stripe_billing_failed_method_reservations r where r.id=$1 and r.handoff_xid<>$3
- and owned_method_identity(r.id) and owned_grace_handoff_link(r,$2,$3)
+ and owned_grace_setup_inserted(r) and owned_method_identity(r.id) and owned_grace_handoff_link(r,$2,$3)
  and not exists(select 1 from stripe_billing_failed_grace_claims q join stripe_billing_failed_grace_acks a using(preparation_id)
   join stripe_billing_failed_grace_ready b using(preparation_id) where q.preparation_id=r.after_preparation_id
   and r.handoff_xid in(q.recorded_transaction,a.recorded_transaction,b.recorded_transaction))
@@ -170,7 +224,7 @@ $$;
 
 create function owned_grace_handoff_current(reservation uuid,utc timestamptz,reader xid8) returns boolean language sql stable as $$
  select exists(select 1 from stripe_billing_failed_method_reservations r where r.id=$1 and r.handoff_xid=$3
- and owned_method_identity(r.id) and owned_grace_handoff_prestate(r,$2,$3))
+ and owned_grace_setup_inserted(r) and owned_method_identity(r.id) and owned_grace_handoff_prestate(r,$2,$3))
 $$;
 
 -- Both branches keep the V39 exclusion. Only an explicit, fully authenticated tagged row
@@ -183,6 +237,8 @@ begin
    if new.handoff_xid is not null and new.handoff_xid<>pg_current_xact_id() then
     raise exception 'Invalid handoff transaction' using errcode='23514';end if;
    new.handoff_xid:=pg_current_xact_id();
+   if not owned_grace_setup_inserted(new) then
+    raise exception 'Handoff requires original SETUP insertion' using errcode='23514';end if;
    if not owned_grace_handoff_prestate(new,clock_timestamp(),pg_current_xact_id()) then
     raise exception 'Invalid handoff predecessor' using errcode='23514';end if;
    perform lock_owned_grace_boundary(new.after_preparation_id,3,false);
