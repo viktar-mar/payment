@@ -378,11 +378,33 @@ create function owned_grace_write_claim_matches(reservation uuid,p provider_oper
    or (($2).status in ('ACKNOWLEDGED','UNKNOWN') and ($2).version=q.claim_version+1 and ($2).lease_owner is null and ($2).lease_expires_at is null)))
 $$;
 
+-- Discover candidates by either typed resource or canonical key, across accounts.
+-- Before the current WRITE exists there may be no candidate. METHOD also admits
+-- the original sealed SETUP selected by the proof, without requiring a future METHOD ACK.
+create function owned_grace_write_resources_unambiguous(reservation uuid,step_kind text) returns boolean language sql stable as $$
+ select exists(select 1 from stripe_billing_failed_method_reservations r
+ join stripe_billing_failed_renewals d on d.id=r.admission_id join subscription_operations o on o.id=r.setup_operation
+ join payment_accounts a on a.id=d.payment_account_id
+ left join provider_operations step on (step.payment_account_id,step.external_account_id,step.credentials_ref,step.resource_id,step.kind)
+  =(a.id,a.external_account_id,a.credentials_ref,o.id,$2)
+  and step.operation_key=o.provider_operation_key||case when $2='SETUP_INTENT_CREATE' then ':SETUP' else ':METHOD' end
+  and step.fingerprint=owned_method_step_fingerprint(r.id,$2='SUBSCRIPTION_UPDATE')
+ left join stripe_subscription_setup_proofs proof on $2='SUBSCRIPTION_UPDATE' and proof.operation_id=o.id
+ left join provider_operations setup on setup.id=proof.step_id and setup.kind='SETUP_INTENT_CREATE'
+  and setup.status='ACKNOWLEDGED' and setup.provider_reference=proof.setup_reference and owned_grace_write_claim_matches(r.id,setup)
+ where r.id=$1 and r.after_ready_id is not null and $2 in ('SETUP_INTENT_CREATE','SUBSCRIPTION_UPDATE')
+ and not exists(select 1 from provider_operations sibling
+  where ((sibling.resource_id=o.id and sibling.kind in ('SETUP_INTENT_CREATE','SUBSCRIPTION_UPDATE'))
+    or sibling.operation_key in (o.provider_operation_key||':SETUP',o.provider_operation_key||':METHOD'))
+  and sibling.id is distinct from step.id and sibling.id is distinct from setup.id))
+$$;
+
 create function owned_grace_write_current(reservation uuid,p provider_operations,utc timestamptz) returns boolean language sql stable as $$
  select exists(select 1 from stripe_billing_failed_method_reservations r join stripe_billing_failed_renewals d on d.id=r.admission_id
  join subscription_operations o on o.id=r.setup_operation join payment_accounts a on a.id=d.payment_account_id
  join customer_sessions s on s.id=r.browser_session_id join site_allowed_origins origin on origin.site_id=d.site_id and origin.origin=s.origin
  where r.id=$1 and r.after_ready_id is not null and owned_method_debt(r.id,0,o.id) and owned_method_initial_operation(r.id)
+ and owned_grace_write_resources_unambiguous(r.id,($2).kind)
  and (s.site_id,s.customer_id,s.origin,s.expires_at)=(d.site_id,d.customer_id,r.browser_origin,r.browser_session_expires_at)
  and s.revoked_at is null and s.issued_at<=r.reserved_at and $3<s.expires_at and s.scopes ? 'SUBSCRIPTION_MANAGE'
  and (a.provider,a.account_mode,a.account_status)=('STRIPE','SANDBOX','ACTIVE')
@@ -981,7 +1003,7 @@ create function owned_grace_successor_projected(reservation uuid,utc timestamptz
  and obs.setup_step_snapshot=m.setup_step_snapshot and obs.method_step_snapshot=m.method_step_snapshot
  and m.selected_version=r.initial_operation_version+1
  and m.operation_snapshot @> jsonb_build_object('status','PROCESSING'::text,'version',m.selected_version)
- and obs.operation_snapshot @> jsonb_build_object('status','RESERVED'::text,'version',x.operation_version)
+ and obs.operation_snapshot @> jsonb_build_object('status','RESERVED'::text,'version',x.operation_version,'provider_reference',sub.provider_reference)
  and c.completed_at>=m.started_at and c.completed_at<m.deadline_at and x.associated_at>=c.completed_at
  and ack.acknowledged_at<=obs.started_at and obs.started_at<=pub.published_at and pub.published_at<=$2
  and (period.site_id,period.payment_account_id,period.revision,period.source,period.provider_reference,period.occurred_at)

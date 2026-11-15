@@ -3876,10 +3876,21 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var exactReadDamage=List.of("xid-reuse","journal-amount","recovered-setup-snapshot","recovered-method-snapshot",
                 "method-operation-status","method-operation-version","method-version-as-string",
                 "recovered-operation-status","recovered-operation-version","recovered-version-as-string",
+                "recovered-reference-missing","recovered-reference-foreign","recovered-reference-wrong-type",
                 "payment-sequence-drift","payment-sequence-missing","payment-received-early","payment-received-late");
         for(String damage:java.util.stream.Stream.concat(publicationDamage.stream(),exactReadDamage.stream()).toList()){
             assertThatThrownBy(()->transaction.requiresNew(()->{
                 switch(damage){
+                    case "recovered-reference-missing","recovered-reference-foreign","recovered-reference-wrong-type"->{
+                        jdbc.execute("alter table stripe_billing_failed_method_reads disable trigger failed_method_read_immutable");
+                        String mutation=switch(damage){
+                            case "recovered-reference-missing"->"operation_snapshot-'provider_reference'";
+                            case "recovered-reference-foreign"->"operation_snapshot||jsonb_build_object('provider_reference','sub_foreign'::text)";
+                            default->"operation_snapshot||jsonb_build_object('provider_reference',42)";
+                        };
+                        assertThat(jdbc.update("update stripe_billing_failed_method_reads set operation_snapshot="+mutation+
+                            " where reservation_id=? and phase='RECOVERED'",r.id())).isOne();
+                    }
                     case "recovered-setup-snapshot","recovered-method-snapshot"->{
                         jdbc.execute("alter table stripe_billing_failed_method_reads disable trigger failed_method_read_immutable");
                         String column=damage.equals("recovered-setup-snapshot")?"setup_step_snapshot":"method_step_snapshot";
@@ -3989,12 +4000,72 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
     }
     private void insertForeignMethodKey(OwnedFailedRenewalMethod.Reservation r,String key){
         assertThat(jdbc.queryForObject("select owned_grace_method_writes_acked(?,pg_current_xact_id())",Boolean.class,r.id())).isTrue();
+        insertForeignWriteKey(key);
+        assertThat(jdbc.queryForObject("select owned_method_steps(?) and not owned_grace_method_writes_acked(?,pg_current_xact_id())",
+            Boolean.class,r.id(),r.id())).isTrue();
+    }
+    private void insertForeignWriteKey(String key){
         assertThat(jdbc.update("""
             insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint)
             values(?,?,'acct_foreignKey','foreign-boundary-key','PRODUCT_CREATE',?,?,?)
             """,UUID.randomUUID(),foreignBoundaryAccount(),UUID.randomUUID(),key,"0".repeat(64))).isEqualTo(1);
-        assertThat(jdbc.queryForObject("select owned_method_steps(?) and not owned_grace_method_writes_acked(?,pg_current_xact_id())",
-            Boolean.class,r.id(),r.id())).isTrue();
+    }
+    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"SETUP_WRITE,false","SETUP_WRITE,true","METHOD_WRITE,false","METHOD_WRITE,true"})
+    void foreignCanonicalWriteKeyRefusesOriginalAdapterBeforePost(Origin origin,boolean afterDispatchInspection) throws Exception{
+        successorCalls=new SuccessorCalls();var reserved=successorReservedMethod();var r=reserved.reservation();
+        boolean setup=origin==Origin.SETUP_WRITE;
+        String key=lifecycleOperations.find(site,current().id(),r.setupOperationId()).orElseThrow().providerOperationKey()+(setup?":SETUP":":METHOD");
+        var damaged=new java.util.concurrent.atomic.AtomicReference<Map<String,List<String>>>();
+        Runnable insertSibling=()->{
+            transaction.requiresNew(()->{insertForeignWriteKey(key);return null;});
+            damaged.set(successorRows());
+        };
+        var steps=methodSteps(name->{},name->{
+            if(afterDispatchInspection&&damaged.get()==null&&name.equals("requireOwnedFailedRenewalMethodDispatch")){
+                var original=successorCalls.dispatches.get(origin);
+                assertThat(operations.findById(original.id())).contains(original);
+                insertSibling.run();
+                reserved.service().terminateSuccessorWrite(r,original,SuccessorOwner.create());
+                assertThat(successorRows()).isEqualTo(damaged.get());
+            }
+        });
+        Runnable attempt;
+        if(setup){
+            var adapter=setupProducer(reserved,steps,originalSetupProofs(reserved,false,name->{}));
+            attempt=()->setupUnavailable(()->adapter.prepare(r,reserved.context()));
+        }else{
+            var pending=pendingMethod(reserved,true);controllerBrowserPermission(pending,false);var bound=boundMethod(pending);
+            http.reply(methodUpdateBody(bound));var adapter=methodProducer(pending,steps);
+            attempt=()->methodUnavailable(()->adapter.apply(r,pending.context()));
+        }
+        var money=financialState();int start=http.calls.size();
+        if(!afterDispatchInspection)insertSibling.run();
+        long started=System.nanoTime();
+        attempt.run();
+        assertThat(System.nanoTime()-started).isLessThan(TimeUnit.SECONDS.toNanos(30));
+        assertThat(damaged.get()).isNotNull();assertThat(http.calls).hasSize(start);assertThat(financialState()).isEqualTo(money);
+        if(afterDispatchInspection){
+            var original=successorCalls.dispatches.get(origin);
+            assertTerminalDelta(damaged.get(),r,original.id(),origin.name(),original.leaseOwner(),"UNCERTAIN",original);
+        }else{
+            assertThat(successorCalls.dispatches).doesNotContainKey(origin);assertThat(successorRows()).isEqualTo(damaged.get());
+        }
+    }
+    @Test void configuredDispatchInspectionRequiresSealedMethodKeyAfterOriginalConfirmClaim() throws Exception{
+        var p=recoveryPrepared(pendingMethod(successorReservedMethod(),true),false);var c=inspectRecovery(p);var r=c.reservation();
+        var owner=SuccessorOwner.create();var budget=confirmationBudget();
+        var claim=recoveryConfirmer(p).claim(c,p.pending().context(),"original-confirm-dispatch",budget,owner);
+        var receipts=new JdbcOwnedRecoveryConfirmStore(jdbc,entityManagerFactory);int calls=http.calls.size();
+        assertThat(transaction.required(()->receipts.requireClaimInTransaction(c,claim,budget,browserNow(),owner))).isEqualTo(claim);
+        var before=successorRows();
+        assertThatThrownBy(()->transaction.required(()->{
+            insertForeignMethodKey(r,p.prepared().methodStep().operationKey());
+            assertThat(jdbc.queryForObject("select owned_recovery_confirm_pre(?)",Boolean.class,r.id())).isTrue();
+            assertThat(receipts.lockInTransaction(c)).contains(claim);
+            return receipts.requireClaimInTransaction(c,claim,budget,browserNow(),owner);
+        })).hasMessage("OWNED_RECOVERY_CONFIRM_UNAVAILABLE");
+        assertThat(budget.remainingNanos(claim)).isPositive();
+        assertThat(successorRows()).isEqualTo(before);assertThat(http.calls).hasSize(calls);
     }
     @Test void taggedMethodCannotEnterProcessingWithForeignCanonicalWriteKeyDespiteBothOriginalAcks() throws Exception{
         var p=pendingMethod(successorReservedMethod(),true);var r=p.reservation();controllerBrowserPermission(p,false);
@@ -5462,6 +5533,54 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(observations.captureFence(current())).isEqualTo(sequence);assertThat(financialState()).isEqualTo(before);
         assertThat(http.calls).hasSize(calls);assertThat(count("stripe_billing_failed_method_completions")).isZero();
         assertThat(count("stripe_billing_failed_renewal_stops")).isZero();
+    }
+    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"METHOD,false","METHOD,true","RECOVERED,false","RECOVERED,true"})
+    void taggedRealFactCannotCommitWithoutItsReceiptEvenWhenOuterCallerCatches(OwnedFailedRenewalMethod.Phase phase,boolean catchCallback) throws Exception{
+        var pending=pendingMethod(successorReservedMethod(),true);var r=pending.reservation();var owner=SuccessorOwner.create();
+        var methods=new JdbcOwnedFailedRenewalMethodStore(jdbc,entityManagerFactory);var facts=methodFacts(methods);
+        boolean recovered=phase==OwnedFailedRenewalMethod.Phase.RECOVERED;
+        OwnedFailedRenewalMethod.ReadClaim claim;SubscriptionOperation operation;
+        if(recovered){
+            var p=recoveryPrepared(pending,false);queueRecoveryCompositionConfirmation(p);recoveryComposition(p).confirm();
+            claim=pending.service().beginRecoveredRead(r,p.recovery(),UUID.randomUUID(),owner);
+            operation=pending.service().inspectRecoveredRead(r,claim,owner).operation();
+        }else{
+            controllerBrowserPermission(pending,false);preparedMethod(pending);
+            claim=pending.service().beginMethodRead(r,UUID.randomUUID(),owner);
+            operation=pending.service().inspectMethodRead(r,claim,owner).operation();
+        }
+        var operationKey=operation.providerOperationKey();
+        var raw=snapshot(pending.setup(),recovered,recovered?operationKey:null,browserNow());
+        var marked=new Snapshot(raw.subscriptionReference(),raw.status(),raw.billingPrice(),raw.period(),raw.trial(),raw.cancellationAt(),raw.invoices(),
+            operationKey,true,raw.providerRevision(),raw.observedAt(),new OperationObservation(operationKey,OperationState.APPLIED),
+            raw.recoveryObservations(),raw.trialEvidence(),raw.externalWithdrawalEvidence());
+        var key=OwnedFailedRenewalMethod.factKey(claim);
+        var cmd=new ApplySubscriptionSnapshotUseCase.Command(billing,operation.subscriptionId(),marked,SubscriptionEvent.Source.RECONCILIATION,key,key,claim.fence(),r.billingSample());
+        var before=successorRows();var money=financialState();long sequence=observations.captureFence(current());int calls=http.calls.size();
+        var reachedCommit=new java.util.concurrent.atomic.AtomicBoolean();
+        assertThatThrownBy(()->transaction.required(()->{
+            java.util.function.Supplier<Void> effect=()->{
+                TestClock.set(Instant.now());
+                facts.apply(cmd);
+                assertThat(observations.captureFence(current())).isEqualTo(sequence+1);
+                assertThat(count(recovered?"stripe_billing_failed_method_publications":"stripe_billing_failed_method_completions")).isZero();
+                if(recovered){
+                    assertThat(current().billingStatus()).isEqualTo(Subscription.Status.ACTIVE);
+                    assertThat(count("payments")).isEqualTo(2);
+                    assertThat(count("payment_events")).isEqualTo(before.get("payment_events").size()+1);
+                    assertThat(count("subscription_events")).isEqualTo(before.get("subscription_events").size()+1);
+                    assertThat(count("outbox_events")).isEqualTo(before.get("outbox_events").size()+2);
+                }
+                if(catchCallback)throw new IllegalStateException("after actual fact without receipt");
+                return null;
+            };
+            if(catchCallback)
+                assertThatThrownBy(()->methods.withSuccessorFactInTransaction(r,claim,owner,effect)).hasMessage("after actual fact without receipt");
+            else methods.withSuccessorFactInTransaction(r,claim,owner,effect);
+            reachedCommit.set(true);return null;
+        })).hasMessage("Owned method transition authority unavailable");
+        assertThat(reachedCommit).isTrue();assertThat(successorRows()).isEqualTo(before);assertThat(financialState()).isEqualTo(money);
+        assertThat(http.calls).hasSize(calls);
     }
     private dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reserveMethod(Setup s,Failure failure) {
         return underLifecycle(s.upstream(),()->{

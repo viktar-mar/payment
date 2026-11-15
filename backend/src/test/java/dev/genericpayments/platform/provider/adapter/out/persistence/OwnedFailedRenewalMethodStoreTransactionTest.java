@@ -7,6 +7,26 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Explicit socket-free test: no DataSource, context or provider calls. */
 class OwnedFailedRenewalMethodStoreTransactionTest {
+    @Test void taggedFactScopeRequiresPrecommitSynchronizationBeforeAnyProofLookup(){
+        var fixture=new dev.genericpayments.platform.provider.application.service.OwnedRecoveryInertFixture(value->"digest:"+value,true);
+        var r=fixture.reservation();var owner=dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner.create();
+        // Only a description is supplied. This caller cannot register the required commit proof,
+        // so looking up the description or attempting to authenticate an owner is already too late.
+        var claim=new dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.ReadClaim(
+            java.util.UUID.randomUUID(),r.id(),dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Phase.METHOD,
+            java.util.UUID.randomUUID(),fixture.now(),fixture.now().plusSeconds(30),
+            new dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Fence(
+                r.failure().revision(),r.setupOperationId(),r.initialOperationVersion()+1,null,null,r.failure().observationSequence()),r.billingSample());
+        var h=new OwnedFailedRenewalStoreTransactionTest.JpaBoundary("valid");h.bind();
+        try{
+            assertThat(org.springframework.transaction.support.TransactionSynchronizationManager.isSynchronizationActive()).isFalse();
+            var store=new JdbcOwnedFailedRenewalMethodStore(h.jdbc,h.factory);
+            assertThatThrownBy(()->store.withSuccessorFactInTransaction(r,claim,owner,()->{
+                throw new AssertionError("fact effect entered without a commit check");
+            })).hasMessage("Owned method transition authority unavailable");
+            assertThat(h.queries).hasValue(0);
+        }finally{h.unbind();}
+    }
     @Test void typedTerminalPortsFailClosedBeforeAnySqlOrCallerWork(){
         var type=dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore.class;
         var older=(dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalMethodStore)

@@ -145,7 +145,11 @@ public final class JdbcOwnedRecoveryConfirmStore implements OwnedRecoveryConfirm
         if(now.isBefore(budget.enteredAt())||!now.isBefore(budget.deadlineAt()))throw denied();
         // Inspection grants dispatch authority too: pin its exact origin grant, not only write-trigger paths.
         jdbc.queryForList("select lock_owned_recovery_confirm(?,true)",c.reservation().id());
-        require("select owned_recovery_confirm_pre(?) and ?<=clock_timestamp() and clock_timestamp()<?",c.reservation().id(),stamp(now),stamp(budget.deadlineAt()));
+        var r=c.reservation();
+        require("""
+            select owned_recovery_confirm_pre(?) and ?<=clock_timestamp() and clock_timestamp()<?
+             and case when ? then owned_grace_method_writes_consumable(?,pg_current_xact_id()) else true end
+            """,r.id(),stamp(now),stamp(budget.deadlineAt()),r.successor()!=null,r.id());
     }
     private void require(String sql,Object... args){if(!Boolean.TRUE.equals(jdbc.queryForObject(sql,Boolean.class,args)))throw denied();}
     private static void transaction(){if(!TransactionSynchronizationManager.isActualTransactionActive())throw denied();}

@@ -76,6 +76,7 @@ public final class StripeBillingOwnedFailedRenewalSetupAdapter {
                 .putAllMetadata(metadata).build();
             var client=clients.create(credentials.resolve(account));
             inspect(original,originalContext,budget,claim);
+            if(reservation.successor()!=null&&!claim.equals(write.inspect(account,claim,utc.instant())))throw unavailable();
             String dispatchKey=new ProviderOperationGuard().requireDispatch(dispatch,account,fingerprint,utc.instant());
             var remote=budget.call(claim,original.enrollment().sessionExpiresAt(),dispatchKey,options->client.v1().setupIntents().create(params,options));
             StripeSubscriptionProviderAdapter.requireSetupRemote(remote,subscription,operation,original.binding(),claim);

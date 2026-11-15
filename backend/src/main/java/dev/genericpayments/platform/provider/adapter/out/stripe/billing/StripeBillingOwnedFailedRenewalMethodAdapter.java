@@ -68,6 +68,7 @@ public final class StripeBillingOwnedFailedRenewalMethodAdapter {
             var params=SubscriptionUpdateParams.builder().setDefaultPaymentMethod(original.setupProof().method()).build();
             var client=clients.create(credentials.resolve(account));
             inspect(original,originalContext,budget,claim);
+            if(reservation.successor()!=null&&!claim.equals(write.inspect(account,claim,utc.instant())))throw unavailable();
             String dispatchKey=new ProviderOperationGuard().requireDispatch(dispatch,account,fingerprint,utc.instant());
             var remote=budget.call(claim,p.enrollment().sessionExpiresAt(),dispatchKey,options->client.v1().subscriptions().update(subscription.providerReference(),params,options));
             if(remote==null||!subscription.providerReference().equals(remote.getId())||!"subscription".equals(remote.getObject())

@@ -225,7 +225,10 @@ public final class OwnedFailedRenewalMethodService {
         return guarded(reservation,()->transaction.requiresNew(()->{
             var state=current(reservation,null,null);requireDebt(state,reservation.failure(),0);
             selected(state,reservation.setupOperationId(),SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Status.PROCESSING,reservation.initialOperationVersion()+1,null);
-            return owner==null?store.claimReadInTransaction(reservation,Phase.METHOD,Objects.requireNonNull(invocation),state.fence(),state.sample(),state.utcAt()):store.claimReadInTransaction(reservation,Phase.METHOD,Objects.requireNonNull(invocation),state.fence(),state.sample(),state.utcAt(),owner);
+            Objects.requireNonNull(invocation);
+            return owner==null
+                ?store.claimReadInTransaction(reservation,Phase.METHOD,invocation,state.fence(),state.sample(),state.utcAt())
+                :store.claimReadInTransaction(reservation,Phase.METHOD,invocation,state.fence(),state.sample(),state.utcAt(),owner);
         }));
     }
     public MethodReadContext inspectMethodRead(Reservation reservation,ReadClaim claim){
@@ -388,7 +391,10 @@ public final class OwnedFailedRenewalMethodService {
             var state=current(reservation,null,recovery.association().operationId());requireDebt(state,reservation.failure(),1);
             if(!recovery.equals(store.requireRecoveryInTransaction(reservation,recovery)))throw unavailable();
             selected(state,recovery.association().operationId(),SubscriptionOperation.Kind.RECOVER,SubscriptionOperation.Status.RESERVED,recovery.association().operationVersion(),reservation.setupOperationId());
-            return owner==null?store.claimReadInTransaction(reservation,Phase.RECOVERED,Objects.requireNonNull(invocation),state.fence(),state.sample(),state.utcAt()):store.claimReadInTransaction(reservation,Phase.RECOVERED,Objects.requireNonNull(invocation),state.fence(),state.sample(),state.utcAt(),owner);
+            Objects.requireNonNull(invocation);
+            return owner==null
+                ?store.claimReadInTransaction(reservation,Phase.RECOVERED,invocation,state.fence(),state.sample(),state.utcAt())
+                :store.claimReadInTransaction(reservation,Phase.RECOVERED,invocation,state.fence(),state.sample(),state.utcAt(),owner);
         }));
     }
     public RecoveredReadContext inspectRecoveredRead(Reservation reservation,ReadClaim claim){
