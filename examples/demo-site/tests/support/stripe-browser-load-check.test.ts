@@ -42,8 +42,21 @@ test('admission and browser environment never read unrelated secret values',asyn
   const {admitEnvironment,browserEnvironment}=await launcherModule();
   const isolated={...env,PATH:'/artificial/bin'};
   Object.defineProperty(isolated,'PRIVATE_ACCOUNT_KEY',{enumerable:true,get:()=>assert.fail('unrelated key discovery')});
+  Object.defineProperty(isolated,'SHARED_SECRET',{enumerable:true,get:()=>assert.fail('shared secret must not be read')});
   assert.equal(admitEnvironment(isolated),key);
   assert.deepEqual(browserEnvironment(isolated),{PATH:'/artificial/bin'});
+});
+
+test('admission accepts ordinary CHARSET value',async()=>{
+  const {admitEnvironment}=await launcherModule();
+  assert.equal(admitEnvironment({...env,CHARSET:'UTF-8'}),key);
+});
+
+test('admission refuses actual debug and capture flags',async()=>{
+  const {admitEnvironment}=await launcherModule();
+  for(const name of ['DEBUG','PWDEBUG','NODE_DEBUG','NODE_OPTIONS','VITE_INSPECT','PLAYWRIGHT_TRACE','PW_TEST_HTML_REPORT_OPEN','TRACE','SCREENSHOT','HAR','VIDEO','CAPTURE','RECORD_HAR_PATH','BROWSER_CAPTURE','ENABLE_DEBUG']){
+    assert.throws(()=>admitEnvironment({...env,[name]:'enabled'}),name);
+  }
 });
 
 test('controller admits a single string only, mounts deferred card Element and destroys after ready',async()=>{
@@ -83,7 +96,7 @@ test('route classifier never falls through financial API, navigation, auth, redi
 
 function runnerFixture(){
   const calls:string[]=[];let routeHandler:Function;let websocket:Function;const listeners:Record<string,Function>={};
-  const frame={};
+  const frame:{page:()=>any}={page:()=>page};
   const page={mainFrame:()=>frame,on:(name:string,fn:Function)=>{listeners[name]=fn;},goto:async()=>{calls.push('goto');},evaluate:async()=>{calls.push('configure');},waitForFunction:async()=>{},close:async()=>{calls.push('page.close');}};
   const context={route:async(_pattern:string,fn:Function)=>{routeHandler=fn;},routeWebSocket:async(_pattern:string,fn:Function)=>{websocket=fn;},on:(name:string,fn:Function)=>{listeners['context.'+name]=fn;},newPage:async()=>page,close:async()=>{calls.push('context.close');}};
   const browser={newContext:async(options:any)=>{calls.push('context');assert.deepEqual(options,{serviceWorkers:'block',acceptDownloads:false});return context;},close:async()=>{calls.push('browser.close');}};
@@ -103,7 +116,7 @@ test('runner refuses network before forwarding and closes after errors and late 
   const {runLoadCheck}=await launcherModule();
   for(const scenario of ['route','pageerror','popup','download','websocket','timeout']){
     const f=runnerFixture();f.page.waitForFunction=async()=>{
-      if(scenario==='route')await f.route()({request:()=>({url:()=> 'https://api.stripe.com/v1/payment_intents',method:()=> 'POST',allHeaders:async()=>({}),isNavigationRequest:()=>false,redirectedFrom:()=>null,frame:()=>null}),abort:async()=>{f.calls.push('abort');},continue:()=>assert.fail('financial forwarding'),fulfill:()=>assert.fail('financial fulfill')});
+      if(scenario==='route')await f.route()({request:()=>({url:()=> 'https://api.stripe.com/v1/payment_intents',method:()=> 'POST',allHeaders:async()=>({}),isNavigationRequest:()=>false,redirectedFrom:()=>null,frame:()=>f.page.mainFrame()}),abort:async()=>{f.calls.push('abort');},continue:()=>assert.fail('financial forwarding'),fulfill:()=>assert.fail('financial fulfill')});
       if(scenario==='pageerror')f.listeners.pageerror!(Error('secret'));
       if(scenario==='popup')f.listeners.popup!({close:async()=>{}});
       if(scenario==='download')f.listeners.download!({cancel:async()=>{}});
@@ -155,6 +168,46 @@ function providerRoute(f:ReturnType<typeof runnerFixture>,fetcher:(options:any)=
 function providerResponse(f:ReturnType<typeof runnerFixture>,status=200,location?:string){
   return {url:()=> 'https://api.stripe.com/v1/elements/sessions',status:()=>status,headers:()=>location?{location}:{},dispose:async()=>{f.calls.push('response.dispose');}};
 }
+
+test('registered route refuses foreign navigation before popup notification and unresolved frame ownership',async()=>{
+  const {runLoadCheck}=await launcherModule();
+  for(const ownership of ['foreign','missing','throwing']){
+    const f=runnerFixture();let forwardedBeforePopup:string[]=[];
+    f.page.waitForFunction=async()=>{
+      const foreignPage={};
+      const frame=ownership==='foreign'?{page:()=>foreignPage}:ownership==='missing'?{}:{page:()=>{throw Error('private ownership detail');}};
+      const route:any=providerRoute(f,async()=>{f.calls.push('fetch');return {...providerResponse(f),url:()=> 'https://js.stripe.com/v3/'};});
+      route.request=()=>({url:()=> 'https://js.stripe.com/v3/',method:()=> 'GET',allHeaders:async()=>({}),isNavigationRequest:()=>true,redirectedFrom:()=>null,frame:()=>frame as any});
+      route.continue=()=>{f.calls.push('continue');};
+      route.fulfill=async()=>{f.calls.push('fulfill');};
+      await f.route()(route);
+      forwardedBeforePopup=f.calls.filter(call=>['fetch','continue','fulfill'].includes(call));
+      f.listeners.popup!({close:async()=>{}});
+    };
+    const result=await runLoadCheck(env,f.ports);
+    assert.deepEqual(forwardedBeforePopup,[],ownership);
+    assert.equal(result,ownership==='foreign'?'NAVIGATION':'ELEMENT',ownership);
+    assert.equal(f.calls.filter(call=>call==='abort').length,1,ownership);
+    for(const name of ['context.close','browser.close','dispose'])assert.equal(f.calls.filter(call=>call===name).length,1,`${ownership}: ${name}`);
+  }
+});
+
+test('registered route preserves owned main document and owned provider subframe navigation',async()=>{
+  const {runLoadCheck}=await launcherModule();const f=runnerFixture();
+  f.page.waitForFunction=async()=>{
+    const documentRoute=providerRoute(f,async()=>assert.fail('local document fetch'));
+    documentRoute.request=()=>({url:()=> 'http://127.0.0.1:4173/stripe-browser-load-check.html',method:()=> 'GET',allHeaders:async()=>({}),isNavigationRequest:()=>true,redirectedFrom:()=>null,frame:()=>f.page.mainFrame()});
+    documentRoute.fulfill=async(options:any)=>{assert.equal(options.status,200);f.calls.push('document.fulfill');};
+    await f.route()(documentRoute);
+    const subframe={page:()=>f.page};
+    const route:any=providerRoute(f,async()=>{f.calls.push('fetch');return providerResponse(f);});
+    route.request=()=>({url:()=> 'https://api.stripe.com/v1/elements/sessions',method:()=> 'POST',allHeaders:async()=>({}),isNavigationRequest:()=>true,redirectedFrom:()=>null,frame:()=>subframe});
+    await f.route()(route);
+  };
+  assert.equal(await runLoadCheck(env,f.ports),'READY');
+  for(const name of ['document.fulfill','fetch','fulfill','response.dispose'])assert.equal(f.calls.filter(call=>call===name).length,1,name);
+  assert.ok(!f.calls.includes('abort'));
+});
 
 test('provider transport never follows redirects and validates before fulfill',async()=>{
   const {runLoadCheck}=await launcherModule();
