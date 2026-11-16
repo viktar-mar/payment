@@ -35,6 +35,10 @@ function providerOrigin(url:URL) {
   return url.protocol==='https:' && !url.port && !url.username && !url.password &&
     (['api.stripe.com','hooks.stripe.com','js.stripe.com'].includes(url.hostname) || url.hostname.endsWith('.js.stripe.com'));
 }
+function providerNetworkOrigin(url:URL):boolean {
+  return url.protocol==='https:' && !url.port && !url.username && !url.password &&
+    (url.hostname==='merchant-ui-api.stripe.com' || providerOrigin(url));
+}
 
 /** A single owned page. Neither phase accepts a target from the page or chooses a provider operation. */
 export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAbort:AbortController):BillingFailedRenewalJourney {
@@ -169,7 +173,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
             ((state==='INITIAL' && navigation===0 && url.pathname===pagePath && request.isNavigationRequest()) ||
             (!request.isNavigationRequest() && /^\/assets\/[\w.-]+\.(js|css)$/.test(url.pathname))));
         }else{
-          if(!providerOrigin(url)){
+          if(!providerNetworkOrigin(url)){
             // Syntax categories of the already refused parsed URL grant no authority.
             routeCheckpoint=url.protocol!=='https:'?'BROWSER_PROVIDER_ORIGIN_SCHEME':url.port?'BROWSER_PROVIDER_ORIGIN_PORT':
               url.hostname==='stripe.com'||url.hostname.endsWith('.stripe.com')?

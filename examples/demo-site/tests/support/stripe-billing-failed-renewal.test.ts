@@ -148,7 +148,7 @@ class Control {
   onclick?: (event:unknown)=>unknown;
   async activate() {assert.equal(this.disabled,false);await this.onclick?.({isTrusted:true});}
 }
-type ProviderProbe={target:string;headers?:Record<string,string>;headerFailure?:'getter'|'reject';redirect?:'throw'|'present';navigation?:'main'|'child'|'throw'|'frame';fallbackFailure?:boolean;hold?:boolean;method?:string};
+type ProviderProbe={target:string;headers?:Record<string,string>;headerFailure?:'getter'|'reject';redirect?:'throw'|'present';navigation?:'main'|'child'|'throw'|'frame';fallbackFailure?:boolean;hold?:boolean;method?:string;phase?:'initial'|'method'};
 async function fixture(change = '',provider?:ProviderProbe[]) {
   let releaseIO!:()=>void,markIO!:()=>void;
   const heldIO=new Promise<void>(resolve=>{releaseIO=resolve;}),ioPending=new Promise<void>(resolve=>{markIO=resolve;});
@@ -246,7 +246,7 @@ async function fixture(change = '',provider?:ProviderProbe[]) {
         assert.equal(runAbort.signal.aborted,false);
       }
       if(change==='page_action')throw Error('secret_fixture canary');
-      if(provider)for(const probe of provider)await probeProvider(probe);
+      if(provider)for(const probe of provider)if(!probe.phase || probe.phase===(input.operationId===id(9)?'method':'initial'))await probeProvider(probe);
       if(change==='action_provider_header')await request('https://js.stripe.com/v3/','GET');
       if(change==='action_asset_header')await request(demo+'/assets/inert.js','GET');
       const response=await request(base(input.operationId)+'/action','GET');
@@ -392,7 +392,8 @@ async function waitProviderHeader(ioPending:Promise<void>,settled:ReturnType<typ
 async function consumeProviderBoundary(h:Awaited<ReturnType<typeof fixture>>,probe:ProviderProbe,checkpoint:string,expectedOrigin?:string){
  const limits=nowLimits();let work:Promise<unknown>|undefined,first:unknown;
  try{
-  work=h.journey.initial(h.initialPort,limits);
+  if(probe.phase==='method')assert.equal(await h.journey.initial(h.initialPort,nowLimits()),true);
+  work=probe.phase==='method'?h.journey.method(h.methodPort,limits):h.journey.initial(h.initialPort,limits);
   const settled=providerWorkSettlement(work!);
   if(probe.hold){await waitProviderHeader(h.ioPending,settled);limits.deadline=0;h.releaseIO();}
   await assert.rejects(work!,(error:unknown)=>{first=error;return true;});
@@ -403,7 +404,7 @@ async function consumeProviderBoundary(h:Awaited<ReturnType<typeof fixture>>,pro
   if(expectedOrigin)assert.equal(Object.isFrozen(saved),true);
   assert.doesNotMatch(String(first),/secret_fixture|canary|Bearer|stripe|elsewhere|user|pass/);
   assert.equal(h.providerFallbacks(),probe.fallbackFailure?1:0);
-  assert.equal(h.counts.includes('confirm'),false);assert.equal(h.counts.includes('permit'),false);
+  assert.equal(h.counts.filter(v=>v==='confirm').length,probe.phase==='method'?1:0);assert.equal(h.counts.includes('permit'),false);
   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),e=>e===first);
   await assert.rejects(h.journey.method(h.methodPort,nowLimits()),e=>e===first);
   assert.equal(await h.journey.close(nowLimits()),true);assert.equal(h.closed(),1);
@@ -412,6 +413,34 @@ async function consumeProviderBoundary(h:Awaited<ReturnType<typeof fixture>>,pro
  }finally{h.releaseIO();await work?.catch(()=>{});await h.restore();}
 }
 for(const [name,probe,checkpoint,expectedOrigin] of providerCases)test('provider boundary '+name,async()=>{
+ await consumeProviderBoundary(await fixture('',[probe]),probe,checkpoint,expectedOrigin);
+});
+const merchantProviderCases:readonly [string,ProviderProbe,string,string?][]=[
+ ['header getter',{target:'https://merchant-ui-api.stripe.com/',headerFailure:'getter'},'BROWSER_PROVIDER_HEADERS'],
+ ['header rejection',{target:'https://merchant-ui-api.stripe.com/',headerFailure:'reject'},'BROWSER_PROVIDER_HEADERS'],
+ ['current',{target:'https://merchant-ui-api.stripe.com/',hold:true},'BROWSER_PROVIDER_CURRENT'],
+ ['redirect lookup before userinfo auth and origin',{target:'http://user:pass@merchant-ui-api.stripe.com:444/',redirect:'throw',headers:{authorization:'Bearer '+token}},'BROWSER_PROVIDER_REDIRECT'],
+ ['redirect refusal',{target:'https://merchant-ui-api.stripe.com/',redirect:'present'},'BROWSER_PROVIDER_REDIRECT'],
+ ['userinfo before auth and origin',{target:'http://user:pass@merchant-ui-api.stripe.com:444/',headers:{authorization:'Bearer provider'}},'BROWSER_PROVIDER_USERINFO'],
+ ['username',{target:'https://user@merchant-ui-api.stripe.com/'},'BROWSER_PROVIDER_USERINFO'],
+ ['password',{target:'https://:pass@merchant-ui-api.stripe.com/'},'BROWSER_PROVIDER_USERINFO'],
+ ['customer authorization',{target:'https://merchant-ui-api.stripe.com/',headers:{authorization:'Bearer '+token}},'BROWSER_PROVIDER_AUTH'],
+ ['foreign authorization',{target:'https://merchant-ui-api.stripe.com/',headers:{authorization:'Bearer provider'}},'BROWSER_PROVIDER_AUTH'],
+ ['normalized foreign authorization',{target:'https://MERCHANT-UI-API.STRIPE.COM:443/',headers:{authorization:'Bearer provider'}},'BROWSER_PROVIDER_AUTH'],
+ ['scheme before port and host',{target:'http://merchant-ui-api.stripe.com:444/'},'BROWSER_PROVIDER_ORIGIN_SCHEME'],
+ ['nondefault port',{target:'https://merchant-ui-api.stripe.com:444/'},'BROWSER_PROVIDER_ORIGIN_PORT'],
+ ['child origin before navigation',{target:'https://child.merchant-ui-api.stripe.com/',navigation:'main'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','https://child.merchant-ui-api.stripe.com'],
+ ['prefix lookalike',{target:'https://othermerchant-ui-api.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','https://othermerchant-ui-api.stripe.com'],
+ ['suffix lookalike',{target:'https://merchant-ui-api.stripe.com.evil.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
+ ['trailing dot',{target:'https://merchant-ui-api.stripe.com./'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
+ ['top navigation',{target:'https://merchant-ui-api.stripe.com/',navigation:'main'},'BROWSER_PROVIDER_NAVIGATION'],
+ ['navigation lookup',{target:'https://merchant-ui-api.stripe.com/',navigation:'throw'},'BROWSER_PROVIDER_NAVIGATION'],
+ ['frame lookup',{target:'https://merchant-ui-api.stripe.com/',navigation:'frame'},'BROWSER_PROVIDER_NAVIGATION'],
+ ['fallback refusal',{target:'https://merchant-ui-api.stripe.com/',fallbackFailure:true},'BROWSER_PROVIDER_FALLBACK'],
+];
+for(const phase of ['initial','method'] as const)for(const [name,input,checkpoint,expectedOrigin] of merchantProviderCases)
+test('merchant provider boundary '+phase+' '+name,async()=>{
+ const probe={...input,phase};
  await consumeProviderBoundary(await fixture('',[probe]),probe,checkpoint,expectedOrigin);
 });
 test('actual OTHER route keeps canonical private origin and original identity through replay and cleanup',async()=>{
@@ -457,6 +486,34 @@ test('provider permitted matrix preserves one-use journey and fallback',async()=
   assert.equal(h.counts.filter(v=>v==='confirm').length,1);assert.equal(h.counts.filter(v=>v==='permit').length,1);
   await h.journey.close(nowLimits());assert.equal(h.closed(),1);
  }finally{await h.restore();}
+});
+test('merchant provider permitted matrix preserves both attended one-use phases and fallback',async()=>{
+ const probes:ProviderProbe[]=[
+  {target:'https://merchant-ui-api.stripe.com/',method:'GET'},
+  {target:'https://merchant-ui-api.stripe.com/',method:'POST'},
+  {target:'https://MERCHANT-UI-API.STRIPE.COM:443/artificial_path?fixture=yes#part',method:'GET'},
+  {target:'https://MERCHANT-UI-API.STRIPE.COM:443/artificial_path?fixture=yes#part',method:'POST'},
+  {target:'https://merchant-ui-api.stripe.com/',method:'GET',navigation:'child'},
+  {target:'https://merchant-ui-api.stripe.com/',method:'POST',navigation:'child'},
+ ];
+ const h=await fixture('',probes);let phase:'initial'|'method'='initial',attendedChecks=0;
+ h.setStageHook(async()=>{
+  assert.equal(h.counts.filter(v=>v==='confirm').length,phase==='initial'?0:1);
+  assert.equal(h.counts.includes('permit'),false);assert.equal(h.counts.includes('confirmSetup'),false);
+  attendedChecks++;
+ });
+ try{
+  assert.equal(await h.journey.initial(h.initialPort,nowLimits()),true);
+  assert.equal(h.phase(),'OBSERVE');assert.equal(h.providerFallbacks(),6);
+  assert.equal(h.counts.filter(v=>v==='confirm').length,1);assert.equal(h.counts.includes('permit'),false);
+  phase='method';assert.equal(await h.journey.method(h.methodPort,nowLimits()),true);
+  assert.equal(h.phase(),'METHOD_CONFIRMED');assert.equal(h.providerFallbacks(),12);assert.equal(attendedChecks,4);
+  assert.equal(h.counts.filter(v=>v==='confirm').length,1);assert.equal(h.counts.filter(v=>v==='permit').length,1);
+  assert.equal(h.counts.filter(v=>v==='confirmSetup').length,1);assert.equal(h.runAbort.signal.aborted,false);
+  await assert.rejects(h.journey.method(h.methodPort,nowLimits()));
+  assert.equal(h.counts.filter(v=>v==='permit').length,1);assert.equal(h.counts.filter(v=>v==='confirmSetup').length,1);
+  assert.equal(await h.journey.close(nowLimits()),true);assert.equal(h.closed(),1);
+ }finally{h.setStageHook(undefined);await h.restore();}
 });
 async function consumeProviderPageFault(h:Awaited<ReturnType<typeof fixture>>){
  let work:Promise<unknown>|undefined,first:unknown;
