@@ -18,6 +18,7 @@ test('default Playwright discovery excludes both Node-only load-check support te
     assert.ok(patterns.some(pattern=>typeof pattern==='string'&&matchesGlob(filename,pattern)),`${filename} must be ignored by default Playwright`);
   }
 });
+const report=(loadResult:string,cleanupErrors:string[]=[])=>({loadResult,cleanupErrors});
 const deferred=()=>{let resolve!:(value:any)=>void;const promise=new Promise<any>(r=>{resolve=r;});return {promise,resolve};};
 
 function controllerFixture(load?:Promise<any>){
@@ -98,7 +99,7 @@ function runnerFixture(){
   const calls:string[]=[];let routeHandler:Function;let websocket:Function;const listeners:Record<string,Function>={};
   const frame:{page:()=>any}={page:()=>page};
   const page={mainFrame:()=>frame,on:(name:string,fn:Function)=>{listeners[name]=fn;},goto:async()=>{calls.push('goto');},evaluate:async()=>{calls.push('configure');},waitForFunction:async()=>{},close:async()=>{calls.push('page.close');}};
-  const context={route:async(_pattern:string,fn:Function)=>{routeHandler=fn;},routeWebSocket:async(_pattern:string,fn:Function)=>{websocket=fn;},on:(name:string,fn:Function)=>{listeners['context.'+name]=fn;},newPage:async()=>page,close:async()=>{calls.push('context.close');}};
+  const context={route:async(_pattern:string,fn:Function)=>{routeHandler=fn;},routeWebSocket:async(_pattern:string,fn:Function)=>{websocket=fn;},on:(name:string,fn:Function)=>{listeners['context.'+name]=fn;},newPage:async()=>{calls.push('context.newPage');return page;},close:async()=>{calls.push('context.close');}};
   const browser={newContext:async(options:any)=>{calls.push('context');assert.deepEqual(options,{serviceWorkers:'block',acceptDownloads:false});return context;},close:async()=>{calls.push('browser.close');}};
   const ports={build:async()=>{calls.push('build');return {assets:new Map([['/stripe-browser-load-check.html',{body:'html',contentType:'text/html'}]]),dispose:async()=>{calls.push('dispose');}};},launch:async()=>{calls.push('launch');return browser;},timeoutMs:30};
   return {calls,ports,browser,context,page,listeners,route:()=>routeHandler!,websocket:()=>websocket!};
@@ -106,8 +107,8 @@ function runnerFixture(){
 
 test('runner gates before build/launch and closes one owned context with fixed result',async()=>{
   const {runLoadCheck}=await launcherModule();const f=runnerFixture();
-  assert.equal(await runLoadCheck({},f.ports),'REFUSED');assert.deepEqual(f.calls,[]);
-  assert.equal(await runLoadCheck(env,f.ports),'READY');
+  assert.deepEqual(await runLoadCheck({},f.ports),report('REFUSED'));assert.deepEqual(f.calls,[]);
+  assert.deepEqual(await runLoadCheck(env,f.ports),report('READY'));
   for(const name of ['build','launch','context','goto','configure','context.close','browser.close','dispose'])assert.equal(f.calls.filter(x=>x===name).length,1,name);
   assert.equal(typeof f.websocket(),'function');
 });
@@ -124,12 +125,12 @@ test('runner refuses network before forwarding and closes after errors and late 
       await new Promise(()=>{});
     };
     const result=await runLoadCheck(env,f.ports);
-    assert.equal(result,({route:'API_PATH',pageerror:'ELEMENT',popup:'POPUP',download:'DOWNLOAD',websocket:'WEBSOCKET',timeout:'TIMEOUT'} as Record<string,string>)[scenario],scenario);
+    assert.equal(result.loadResult,({route:'API_PATH',pageerror:'ELEMENT',popup:'POPUP',download:'DOWNLOAD',websocket:'WEBSOCKET',timeout:'TIMEOUT'} as Record<string,string>)[scenario],scenario);
     assert.equal(f.calls.filter(x=>x==='context.close').length,1);assert.equal(f.calls.filter(x=>x==='browser.close').length,1);assert.equal(f.calls.filter(x=>x==='dispose').length,1);
   }
   const f=runnerFixture(),late=deferred();f.ports.launch=async()=>late.promise;
   const run=runLoadCheck(env,f.ports);await new Promise(r=>setTimeout(r,45));late.resolve(f.browser);
-  assert.notEqual(await run,'READY');await new Promise(r=>setTimeout(r,0));assert.equal(f.calls.filter(x=>x==='browser.close').length,1);assert.ok(!f.calls.includes('context'));
+  assert.deepEqual(await run,report('TIMEOUT'));await new Promise(r=>setTimeout(r,0));assert.equal(f.calls.filter(x=>x==='browser.close').length,1);assert.ok(!f.calls.includes('context'));
 });
 
 test('held provider headers cannot forward after readiness retirement or timeout',async()=>{
@@ -140,7 +141,7 @@ test('held provider headers cannot forward after readiness retirement or timeout
       requestFinished=f.route()({request:()=>({url:()=> 'https://js.stripe.com/v3/',method:()=> 'GET',allHeaders:()=>headers.promise,isNavigationRequest:()=>false,redirectedFrom:()=>null,frame:()=>f.page.mainFrame()}),abort:async()=>{f.calls.push('abort');},continue:async()=>{f.calls.push('continue');},fulfill:()=>assert.fail('provider fulfill')});
       if(terminal==='timeout')await new Promise(()=>{});
     };
-    assert.equal(await runLoadCheck(env,f.ports),terminal==='ready'?'READY':'TIMEOUT');
+    assert.deepEqual(await runLoadCheck(env,f.ports),report(terminal==='ready'?'READY':'TIMEOUT'));
     headers.resolve({});await requestFinished;
     assert.ok(!f.calls.includes('continue'),terminal);assert.equal(f.calls.filter(x=>x==='abort').length,1,terminal);
   }
@@ -150,14 +151,14 @@ test('acquisition failures retain stage and actual cleanup failures report uncer
   const {runLoadCheck}=await launcherModule();
   for(const stage of ['build','launch']){
     const f=runnerFixture();f.ports[stage as 'build']=async()=>{throw Error('private detail');};
-    assert.equal(await runLoadCheck(env,f.ports),stage.toUpperCase());
+    assert.deepEqual(await runLoadCheck(env,f.ports),report(stage.toUpperCase()));
   }
   const owned=runnerFixture();owned.context.close=async()=>{throw Error('private cleanup');};
-  assert.equal(await runLoadCheck(env,owned.ports),'CLEANUP');
+  assert.deepEqual(await runLoadCheck(env,owned.ports),report('READY',['CONTEXT_CLOSE']));
   const late=runnerFixture(),opening=deferred();late.ports.launch=async()=>opening.promise;
   late.browser.close=async()=>{throw Error('private late cleanup');};
   const result=runLoadCheck(env,late.ports);await new Promise(resolve=>setTimeout(resolve,45));opening.resolve(late.browser);
-  assert.equal(await result,'CLEANUP');
+  assert.deepEqual(await result,report('TIMEOUT',['LATE_BROWSER_CLOSE']));
 });
 
 function providerRoute(f:ReturnType<typeof runnerFixture>,fetcher:(options:any)=>Promise<any>){
@@ -186,7 +187,7 @@ test('registered route refuses foreign navigation before popup notification and 
     };
     const result=await runLoadCheck(env,f.ports);
     assert.deepEqual(forwardedBeforePopup,[],ownership);
-    assert.equal(result,ownership==='foreign'?'NAVIGATION':'ELEMENT',ownership);
+    assert.equal(result.loadResult,ownership==='foreign'?'NAVIGATION':'ELEMENT',ownership);
     assert.equal(f.calls.filter(call=>call==='abort').length,1,ownership);
     for(const name of ['context.close','browser.close','dispose'])assert.equal(f.calls.filter(call=>call===name).length,1,`${ownership}: ${name}`);
   }
@@ -204,7 +205,7 @@ test('registered route preserves owned main document and owned provider subframe
     route.request=()=>({url:()=> 'https://api.stripe.com/v1/elements/sessions',method:()=> 'POST',allHeaders:async()=>({}),isNavigationRequest:()=>true,redirectedFrom:()=>null,frame:()=>subframe});
     await f.route()(route);
   };
-  assert.equal(await runLoadCheck(env,f.ports),'READY');
+  assert.deepEqual(await runLoadCheck(env,f.ports),report('READY'));
   for(const name of ['document.fulfill','fetch','fulfill','response.dispose'])assert.equal(f.calls.filter(call=>call===name).length,1,name);
   assert.ok(!f.calls.includes('abort'));
 });
@@ -217,12 +218,12 @@ test('provider transport never follows redirects and validates before fulfill',a
       f.page.waitForFunction=async()=>{await f.route()(providerRoute(f,async(options:any)=>{
         assert.equal(options.maxRedirects,0);assert.equal(options.maxRetries,0);assert.ok(options.timeout>0&&options.timeout<=30);return response;
       }));};
-      assert.equal(await runLoadCheck(env,f.ports),'REDIRECT');
+      assert.deepEqual(await runLoadCheck(env,f.ports),report('REDIRECT'));
       assert.ok(!f.calls.includes('fulfill'));assert.equal(f.calls.filter(x=>x==='abort').length,1);assert.equal(f.calls.filter(x=>x==='response.dispose').length,1);
     }
   }
   const f=runnerFixture();f.page.waitForFunction=async()=>{await f.route()(providerRoute(f,async()=>providerResponse(f)));};
-  assert.equal(await runLoadCheck(env,f.ports),'READY');assert.equal(f.calls.filter(x=>x==='fulfill').length,1);assert.equal(f.calls.filter(x=>x==='response.dispose').length,1);
+  assert.deepEqual(await runLoadCheck(env,f.ports),report('READY'));assert.equal(f.calls.filter(x=>x==='fulfill').length,1);assert.equal(f.calls.filter(x=>x==='response.dispose').length,1);
 });
 
 test('late fetched response is disposed without fulfillment after retirement or timeout',async()=>{
@@ -233,12 +234,12 @@ test('late fetched response is disposed without fulfillment after retirement or 
       routing=f.route()(providerRoute(f,async()=>{started.resolve(undefined);return fetching.promise;}));
       if(terminal==='timeout')await new Promise(()=>{});
     };
-    let settled=false;const result=runLoadCheck(env,f.ports).then((value:string)=>{settled=true;return value;});
+    let settled=false;const result=runLoadCheck(env,f.ports).then((value:any)=>{settled=true;return value;});
     assert.equal(await Promise.race([started.promise.then(()=>true),result.then(()=>false)]),true,'expected non-following provider fetch to start before run settles');
     await new Promise(resolve=>setTimeout(resolve,terminal==='timeout'?45:0));
     assert.equal(settled,false,'do not return with an unresolved owned provider transport');
     fetching.resolve(providerResponse(f));await routing;
-    assert.equal(await result,terminal==='timeout'?'TIMEOUT':'READY');
+    assert.deepEqual(await result,report(terminal==='timeout'?'TIMEOUT':'READY'));
     assert.ok(!f.calls.includes('fulfill'));assert.equal(f.calls.filter(x=>x==='abort').length,1);assert.equal(f.calls.filter(x=>x==='response.dispose').length,1);
   }
 });
@@ -246,8 +247,164 @@ test('late fetched response is disposed without fulfillment after retirement or 
 test('provider fetch failure is safe and response disposal failure reports cleanup uncertainty',async()=>{
   const {runLoadCheck}=await launcherModule();
   const failed=runnerFixture();failed.page.waitForFunction=async()=>{await failed.route()(providerRoute(failed,async()=>{throw Error('private transport detail');}));};
-  assert.equal(await runLoadCheck(env,failed.ports),'ELEMENT');assert.ok(!failed.calls.includes('fulfill'));
+  assert.deepEqual(await runLoadCheck(env,failed.ports),report('ELEMENT'));assert.ok(!failed.calls.includes('fulfill'));
   const disposal=runnerFixture();const response=providerResponse(disposal);response.dispose=async()=>{throw Error('private disposal detail');};
   disposal.page.waitForFunction=async()=>{await disposal.route()(providerRoute(disposal,async()=>response));};
-  assert.equal(await runLoadCheck(env,disposal.ports),'CLEANUP');
+  assert.deepEqual(await runLoadCheck(env,disposal.ports),report('NOT_CONFIRMED',['RESPONSE_DISPOSE']));
+});
+
+test('formatter emits fixed safe diagnostics and exit status for both channels',async()=>{
+  const {formatLoadCheckResult}=await launcherModule();
+  for(const [value,line,exitCode] of [
+    [report('READY'),'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE',0],
+    [report('REFUSED'),'STRIPE_BROWSER_LOAD_CHECK load=REFUSED cleanup=OK components=NONE',1],
+    [report('READY',['CONTEXT_CLOSE','BUILD_DISPOSE']),'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=FAILED components=CONTEXT_CLOSE,BUILD_DISPOSE',1],
+    [report('private https://sentinel.test/key',['private /sentinel/path']),'STRIPE_BROWSER_LOAD_CHECK load=UNKNOWN cleanup=FAILED components=UNKNOWN',1],
+  ] as const)assert.deepEqual(formatLoadCheckResult(value),{line,exitCode});
+});
+
+test('primary failure and ready retain every owned cleanup category in fixed order',async()=>{
+  const {runLoadCheck,formatLoadCheckResult}=await launcherModule();
+  for(const primary of ['READY','API_PATH','TIMEOUT']){
+    const f=runnerFixture();const build=await f.ports.build();
+    f.ports.build=async()=>({...build,dispose:async()=>{f.calls.push('dispose');throw Error('private build');}});
+    f.context.close=async()=>{f.calls.push('context.close');throw Error('private context');};
+    f.browser.close=async()=>{f.calls.push('browser.close');throw Error('private browser');};
+    f.page.waitForFunction=async()=>{
+      if(primary==='API_PATH'){
+        const route:any=providerRoute(f,async()=>assert.fail('forbidden fetch'));
+        const request=route.request();route.request=()=>({...request,url:()=> 'https://api.stripe.com/v1/payment_intents'});
+        await f.route()(route);f.listeners.pageerror!(Error('later error'));
+      }
+      if(primary==='TIMEOUT')await new Promise(()=>{});
+    };
+    const result=await runLoadCheck(env,f.ports);
+    assert.deepEqual(result,report(primary,['CONTEXT_CLOSE','BROWSER_CLOSE','BUILD_DISPOSE']));
+    assert.equal(formatLoadCheckResult(result).exitCode,1);
+    for(const call of ['context.close','browser.close','dispose'])assert.equal(f.calls.filter(x=>x===call).length,1);
+  }
+});
+
+test('every late acquisition retires exactly once, waits disposal and never starts next stage',async()=>{
+  const {runLoadCheck}=await launcherModule();
+  for(const stage of ['build','browser','context','page'])for(const rejects of [false,true]){
+    const f=runnerFixture(),opening=deferred(),started=deferred(),disposing=deferred(),release=deferred();let disposals=0;
+    const lateDispose=async()=>{disposals++;disposing.resolve(undefined);await release.promise;if(rejects)throw Error('private late sentinel');};
+    const codes:Record<string,string>={build:'LATE_BUILD_DISPOSE',browser:'LATE_BROWSER_CLOSE',context:'LATE_CONTEXT_CLOSE',page:'LATE_PAGE_CLOSE'};
+    let value:any;
+    if(stage==='build'){value={assets:new Map(),dispose:lateDispose};f.ports.build=async()=>{started.resolve(undefined);return opening.promise;};}
+    if(stage==='browser'){value={...f.browser,close:lateDispose};f.ports.launch=async()=>{started.resolve(undefined);return opening.promise;};}
+    if(stage==='context'){value={...f.context,close:lateDispose};f.browser.newContext=async()=>{started.resolve(undefined);return opening.promise;};}
+    if(stage==='page'){value={...f.page,close:lateDispose};f.context.newPage=async()=>{started.resolve(undefined);return opening.promise;};}
+    let settled=false;const running=runLoadCheck(env,f.ports).then((r:any)=>{settled=true;return r;});
+    await started.promise;await new Promise(r=>setTimeout(r,45));opening.resolve(value);await disposing.promise;
+    assert.equal(settled,false);release.resolve(undefined);
+    assert.deepEqual(await running,report('TIMEOUT',rejects?[codes[stage]!]:[]));assert.equal(disposals,1);
+    assert.ok(!f.calls.includes(stage==='build'?'launch':stage==='browser'?'context':stage==='context'?'context.newPage':'goto'));
+  }
+});
+
+test('internal build disposal callback preserves BUILD and deduplicates finite diagnostics',async()=>{
+  const {runLoadCheck}=await launcherModule();const f=runnerFixture();
+  f.ports.build=async(...args:any[])=>{args[1]('BUILD_DISPOSE');args[1]('BUILD_DISPOSE');throw Error('private build sentinel');};
+  assert.deepEqual(await runLoadCheck(env,f.ports),report('BUILD',['BUILD_DISPOSE']));
+  assert.ok(!f.calls.includes('launch'));
+});
+
+test('response disposal before ready stops readiness; after failure or retirement preserves terminal outcome',async()=>{
+  const {runLoadCheck,formatLoadCheckResult}=await launcherModule();
+  for(const terminal of ['NOT_CONFIRMED','READY','API_PATH','TIMEOUT']){
+    const f=runnerFixture(),fetching=deferred(),started=deferred();const response=providerResponse(f);
+    response.dispose=async()=>{f.calls.push('response.dispose');throw Error('private https://sentinel.test/key /sentinel/path');};
+    f.page.waitForFunction=async()=>{
+      const routing=f.route()(providerRoute(f,async()=>{started.resolve(undefined);return terminal==='NOT_CONFIRMED'?response:fetching.promise;}));
+      if(terminal==='NOT_CONFIRMED'){await routing;await new Promise(()=>{});}
+      if(terminal==='API_PATH'){
+        const route:any=providerRoute(f,async()=>assert.fail('forbidden fetch'));const req=route.request();route.request=()=>({...req,url:()=> 'https://api.stripe.com/v1/payment_intents'});await f.route()(route);await new Promise(()=>{});
+      }
+      if(terminal==='TIMEOUT')await new Promise(()=>{});
+    };
+    const running=runLoadCheck(env,f.ports);await started.promise;
+    if(terminal!=='NOT_CONFIRMED'){await new Promise(r=>setTimeout(r,terminal==='TIMEOUT'?45:0));fetching.resolve(response);}
+    const result=await running;assert.deepEqual(result,report(terminal,['RESPONSE_DISPOSE']));
+    assert.equal(f.calls.filter(x=>x==='response.dispose').length,1);
+    if(terminal!=='NOT_CONFIRMED')assert.ok(!f.calls.includes('fulfill'));
+    assert.ok(!JSON.stringify(formatLoadCheckResult(result)).includes('sentinel'));
+  }
+});
+
+test('returned report is frozen and late headers and page events cannot alter snapshot',async()=>{
+  const {runLoadCheck}=await launcherModule();const f=runnerFixture(),headers=deferred();let routing:Promise<void>|undefined;
+  f.page.waitForFunction=async()=>{const route:any=providerRoute(f,async()=>assert.fail('late forwarding'));const req=route.request();route.request=()=>({...req,allHeaders:()=>headers.promise});routing=f.route()(route);};
+  const result=await runLoadCheck(env,f.ports);assert.deepEqual(result,report('READY'));
+  assert.equal(Object.isFrozen(result),true);assert.equal(Object.isFrozen(result.cleanupErrors),true);
+  headers.resolve({Authorization:'private sentinel'});await routing;f.listeners.pageerror!(Error('private sentinel'));f.listeners.close!();
+  assert.deepEqual(result,report('READY'));assert.equal(f.calls.filter(x=>x==='abort').length,1);
+});
+
+test('extra page and download cleanup is awaited, classified and deduplicated',async()=>{
+  const {runLoadCheck}=await launcherModule();
+  for(const kind of ['page','download']){
+    const f=runnerFixture(),started=deferred(),release=deferred();let disposals=0;
+    const dispose=async()=>{disposals++;started.resolve(undefined);await release.promise;throw Error('private event cleanup');};
+    f.page.waitForFunction=async()=>{
+      if(kind==='page'){
+        f.listeners['context.page']!(f.page);
+        const extra={close:dispose};f.listeners['context.page']!(extra);f.listeners.popup!(extra);
+      }else f.listeners.download!({cancel:dispose});
+      await new Promise(()=>{});
+    };
+    let settled=false;const running=runLoadCheck(env,f.ports).then((r:any)=>{settled=true;return r;});await started.promise;
+    await new Promise(r=>setTimeout(r,0));assert.equal(settled,false);release.resolve(undefined);
+    assert.deepEqual(await running,report(kind==='page'?'POPUP':'DOWNLOAD',[kind==='page'?'EXTRA_PAGE_CLOSE':'DOWNLOAD_CANCEL']));assert.equal(disposals,1);
+  }
+});
+
+test('first terminal observation survives later events while final cleanup is still pending',async()=>{
+  const {runLoadCheck}=await launcherModule();
+  for(const terminal of ['READY','API_PATH']){
+    const f=runnerFixture(),closing=deferred(),release=deferred();
+    f.context.close=async()=>{closing.resolve(undefined);await release.promise;throw Error('private context cleanup');};
+    f.page.waitForFunction=async()=>{
+      if(terminal==='API_PATH'){
+        const route:any=providerRoute(f,async()=>assert.fail('forbidden fetch'));const req=route.request();route.request=()=>({...req,url:()=> 'https://api.stripe.com/v1/payment_intents'});await f.route()(route);await new Promise(()=>{});
+      }
+    };
+    const running=runLoadCheck(env,f.ports);await closing.promise;f.listeners.pageerror!(Error('later terminal'));f.listeners.crash!();release.resolve(undefined);
+    assert.deepEqual(await running,report(terminal,['CONTEXT_CLOSE']));
+  }
+});
+
+test('formatter rejects sparse diagnostics',async()=>{
+  const {formatLoadCheckResult}=await launcherModule();
+  assert.deepEqual(formatLoadCheckResult(report('READY',Array(1))),{line:'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=FAILED components=UNKNOWN',exitCode:1});
+});
+
+test('formatter reads each candidate only once',async()=>{
+  const {formatLoadCheckResult}=await launcherModule();
+  let loadReads=0,cleanupReads=0;
+  const changing={get loadResult(){return ++loadReads===1?'READY':'private sentinel';},get cleanupErrors(){return ++cleanupReads===1?[]:['private sentinel'];}};
+  assert.deepEqual(formatLoadCheckResult(changing),{line:'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE',exitCode:0});
+  assert.equal(loadReads,1);assert.equal(cleanupReads,1);
+});
+
+test('formatter renders throwing diagnostics as finite failure',async()=>{
+  const {formatLoadCheckResult}=await launcherModule();
+  const unknown={line:'STRIPE_BROWSER_LOAD_CHECK load=UNKNOWN cleanup=FAILED components=UNKNOWN',exitCode:1};
+  for(const value of [
+    {get loadResult(){throw Error('private sentinel');},cleanupErrors:[]},
+    {loadResult:'READY',get cleanupErrors(){throw Error('private sentinel');}},
+    {loadResult:'READY',cleanupErrors:new Proxy([],{get(){throw Error('private sentinel');}})},
+  ])assert.deepEqual(formatLoadCheckResult(value),unknown);
+});
+
+test('formatter reads indexed cleanup entries without consulting a custom iterator',async()=>{
+  const {formatLoadCheckResult}=await launcherModule();
+  const errors=['CONTEXT_CLOSE'];
+  Object.defineProperty(errors,Symbol.iterator,{value:function*(){}});
+  const expected={line:'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=FAILED components=CONTEXT_CLOSE',exitCode:1};
+  assert.deepEqual(formatLoadCheckResult(report('READY',errors)),expected);
+  const unread=['CONTEXT_CLOSE'];
+  Object.defineProperty(unread,Symbol.iterator,{get(){assert.fail('cleanup array iterator must not be read');}});
+  assert.deepEqual(formatLoadCheckResult(report('READY',unread)),expected);
 });

@@ -1,4 +1,4 @@
-# Stripe browser load check (prepared, not run)
+# Stripe browser load check
 
 This separate, one-shot probe initializes the existing SDK Stripe loader and a
 deferred Payment Element before a PaymentIntent or SetupIntent exists. It uses
@@ -10,8 +10,12 @@ submit, confirmation, customer, backend, billing owner or CLI operation.
 Stripe documents this deferred initialization pattern in its
 [official deferred-payment guide](https://docs.stripe.com/payments/accept-a-payment-deferred?platform=web&type=payment).
 
-All verification in this change is injected or build-only. Actual Chrome and
-Stripe network execution is **NOT_RUN**. This is not native acceptance evidence.
+Verification of this separated-report version is injected or build-only. Its
+actual Chrome and Stripe network execution is **NOT_RUN**. A prior invocation of
+the earlier version recorded only `CLEANUP` and exit 1. That receipt cannot
+recover whether readiness occurred or which cleanup component rejected. This
+change does not establish the cause or resolution of that historical result and
+is not native acceptance evidence.
 
 After separately authorizing an external Chrome/Stripe run, from the repository
 root use an explicitly supplied public test publishable key:
@@ -55,18 +59,36 @@ browser/context acquisition is immediately closed. Vite build and resource
 cleanup lack a reliable cancellation deadline, so wall-clock completion can
 exceed 60 seconds while awaiting those operations. The launcher waits for owned
 acquisitions and cleanup rather than reporting completion with a background
-browser. If a cleanup API rejects, the result is `CLEANUP`; a hung acquisition or
-cleanup API can delay the result indefinitely. This is not a hard process
-termination guarantee.
+browser. A cleanup rejection is recorded independently of the first terminal
+load observation; a hung acquisition or cleanup API can delay the result
+indefinitely. This is not a hard process termination guarantee.
 
 The page shows fixed `IDLE`, `LOADING`, `READY` or terminal error status. It
 destroys the Element on readiness, loaderror, deadline, stop or page loss; the
 launcher then closes its context/browser and removes only its own temporary
-directory. Stdout contains only `STRIPE_BROWSER_LOAD_CHECK READY` or one finite
-failure checkpoint, such as `API_PATH`, `ORIGIN_STRIPE_COM_M`, `ELEMENT`,
-`TIMEOUT` or `CLEANUP`. No raw URLs, error text, keys, provider logs, screenshots,
-traces, videos or HAR files are recorded. Failures do not authorize a retry or
-policy widening. The launcher is outside CI and default Playwright discovery.
+directory. The immutable result contains `loadResult` and a deduplicated
+`cleanupErrors` array in fixed component order. Stdout contains one safe line,
+for example:
+
+```text
+STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE
+STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=FAILED components=CONTEXT_CLOSE
+STRIPE_BROWSER_LOAD_CHECK load=API_PATH cleanup=FAILED components=BROWSER_CLOSE,BUILD_DISPOSE
+STRIPE_BROWSER_LOAD_CHECK load=NOT_CONFIRMED cleanup=FAILED components=RESPONSE_DISPOSE
+```
+
+Exit 0 requires `READY` and no cleanup errors; every other report exits 1.
+`READY` requires the readiness wait to succeed. A cleanup-triggered retirement
+before a terminal load observation yields `NOT_CONFIRMED`. Later events and
+cleanup failures cannot replace an observed readiness, refusal or timeout.
+Cleanup categories identify context/browser closure, build disposal, response
+disposal, late build/browser/context/page retirement, extra-page closure and
+download cancellation. Invalid diagnostic categories render as fixed `UNKNOWN`
+instead of raw values. `cleanup=OK` means no owned cleanup rejection was
+observed; it is not a process inventory or proof of a whole payment flow.
+No raw URLs, error text, keys, provider logs, screenshots, traces, videos or HAR
+files are recorded. Failures do not authorize a retry or policy widening. The
+launcher is outside CI and default Playwright discovery.
 
 Deferred readiness would establish that the current Stripe script can initialize
 the Element under this egress gate. It does not establish client-secret payment
