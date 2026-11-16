@@ -91,6 +91,27 @@ test('witness validator admits only canonical bounded OTHER HTTPS DNS origins an
  assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,'https://api.stripe.com'),false);
  assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,'https://other.stripe.com'),true);
 });
+test('encoded origin labels stay canonical even when URL accepts unchanged ASCII origins',t=>{
+ t.mock.method(globalThis,'URL',function PermissiveURL(origin){return {origin};});
+ for(const origin of ['https://other.stripe.com','https://xn--bcher-kva.stripe.com','https://xn--bcher-kva.xn--bcher-kva.stripe.com']){
+  assert.equal(new URL(origin).origin,origin);
+  const candidate={...witness(),origin};
+  assert.equal(privateOrigin.isBrowserProviderOriginWitness(candidate),true,origin);
+  const error=browserFailure('BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');
+  assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,origin),true,origin);
+  assert.deepEqual(privateOrigin.browserProviderOrigin(error),candidate);
+ }
+ for(const label of ['xn--a','xn--8i7caa']){
+  for(const hostname of [label+'.stripe.com','xn--bcher-kva.'+label+'.stripe.com',label+'.xn--bcher-kva.stripe.com']){
+   const origin='https://'+hostname,candidate={...witness(),origin};
+   assert.equal(new URL(origin).origin,origin);
+   assert.equal(privateOrigin.isBrowserProviderOriginWitness(candidate),false,origin);
+   const error=browserFailure('BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');
+   assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,origin),false,origin);
+   assert.equal(privateOrigin.browserProviderOrigin(error),null);
+  }
+ }
+});
 test('witness validator rejects nonplain inherited extra and accessor fields without getter evaluation',()=>{
  assert.equal(typeof privateOrigin.isBrowserProviderOriginWitness,'function');
  let reads=0;const getter=()=>{reads++;throw Error('secret accessor');};
