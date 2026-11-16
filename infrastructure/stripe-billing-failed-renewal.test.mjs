@@ -5,7 +5,7 @@ import {data,inspect} from './fixtures/failed-renewal-evidence-rows.mjs';
 import * as initialEvidence from './stripe-billing-first-payment-evidence.mjs';
 import * as owners from './stripe-billing-first-payment.mjs';
 import * as clients from './stripe-billing-first-payment-runtime.mjs';
-import {browserFailure,finishBrowserCleanup} from './stripe-billing-first-payment-browser-diagnostic.mjs';
+import {browserFailure,finishBrowserCleanup,rememberBrowserProviderOrigin} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 const saved=globalThis.fetch;let escapes=0;
 before(()=>{globalThis.fetch=()=>{escapes++;throw Error('network blocked');};});after(()=>{globalThis.fetch=saved;assert.equal(escapes,0);});
 const limits=()=>({deadline:Date.now()+5000});
@@ -33,6 +33,58 @@ const owner=h=>owners.createOwnedBillingFailedRenewal(opts(),h.dependencies);
 const persistCodes=['PERSIST_ADMISSION','PERSIST_OWNERSHIP','PERSIST_INPUT','PERSIST_UNCHANGED','PERSIST_FINAL_STORE','PERSIST_ACK'];
 const terminalLine=(checkpoint='PERSIST_FINAL_STORE',cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=LISTENER checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
 const browserLine=(checkpoint='BROWSER_CARD_NUMBER',cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=BROWSER checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
+const privateOrigin='https://evidence-only.stripe.com';
+function originalOriginError(runId=opts().runId,source=opts().expectedSource){
+ const error=browserFailure('BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');assert.equal(rememberBrowserProviderOrigin(error,runId,source,privateOrigin),true);return error;
+}
+// Break: evidence is joined to owner work, mutates its first fault, or starts financial continuation.
+for(const sink of ['success','sync throw','hostile reject','hostile then','stall'])test('private refused origin '+sink+' is detached from owner close and STOP',{timeout:2000},async()=>{
+ const h=harness(),error=originalOriginError(),offers=[],l=limits(),dispatches=[];let reads=0;
+ const hostile=new Proxy({},{get(){reads++;throw Error('private rejection canary');}});
+ h.bootstrap.persistRefusedStripeOrigin=(w,budget)=>{offers.push({w,budget});if(sink==='sync throw')throw hostile;if(sink==='hostile reject')return Promise.reject(hostile);if(sink==='hostile then')return {get then(){throw hostile;}};if(sink==='stall')return new Promise(()=>{});return Promise.resolve(true);};
+ h.fixture.beforeDispatch=async kind=>{dispatches.push(kind);return true;};
+ h.journey.initial=async(p,child)=>{await p.prepare({token:'inert',origin:scope().endpoints.demo},'sdk-create',child);throw error;};
+ h.journey.close=async()=>{h.calls.push('browser-close');finishBrowserCleanup(error,true);return true;};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,l));const result=await o.close();
+ assert.equal(offers.length,1);assert.deepEqual(offers[0].w,{runId:opts().runId,expectedSource:opts().expectedSource,origin:privateOrigin});
+ assert.ok(offers[0].budget.deadline<=l.deadline+120000);assert.ok(offers[0].budget.deadline<=Date.now()+2000);
+ assert.equal(reads,0);assert.equal(result.status,'CLOSED');assert.equal(result.phase,'BROWSER');assert.equal(result.code,'BROWSER');assert.equal(result.diagnostic,'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');
+ assert.equal(result.cleanupConfirmed,true);assert.equal(result.cleanupFailure,null);assert.equal(result.initialAccepted,false);assert.equal(result.failedRenewalAccepted,false);assert.equal(result.full5bAccepted,false);
+ assert.deepEqual(dispatches,['create']);assert.equal(h.calls.filter(x=>x==='stop').length,1);assert.equal(h.calls.includes('arm-dispatch'),false);assert.equal(h.calls.includes('manual-confirm'),false);assert.equal(h.calls.some(x=>methods.includes(x)),false);
+ assert.equal(JSON.stringify(result).includes(privateOrigin),false);assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),browserLine('BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'));
+ await assert.rejects(o.run(h.journey,l));await o.close();assert.equal(offers.length,1);
+});
+for(const kind of ['foreign','mismatched run','mismatched source','earlier owner fault','missing capability','accessor capability','inherited capability'])test('private refused origin skips '+kind+' without evaluating foreign getters',async()=>{
+ const h=harness();let offers=0,reads=0;const error=kind==='mismatched run'?originalOriginError(id(99)):kind==='mismatched source'?originalOriginError(opts().runId,'a'.repeat(40)):originalOriginError();
+ const persist=()=>{offers++;return Promise.resolve(true);};
+ if(kind==='accessor capability')Object.defineProperty(h.bootstrap,'persistRefusedStripeOrigin',{get(){reads++;throw Error('private getter canary');}});
+ else if(kind==='inherited capability')Object.setPrototypeOf(h.bootstrap,{persistRefusedStripeOrigin:persist});
+ else if(kind!=='missing capability')h.bootstrap.persistRefusedStripeOrigin=persist;
+ h.journey.initial=async(p,l)=>{if(kind==='earlier owner fault'){try{await p.confirm(confirmRequest(),l);}catch{throw error;}}throw kind==='foreign'?new Proxy({},{get(){reads++;throw Error('foreign error canary');}}):error;};
+ h.journey.close=async()=>{h.calls.push('browser-close');finishBrowserCleanup(error,true);return true;};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));const result=await o.close();
+ assert.equal(offers,0);assert.equal(reads,0);assert.equal(result.cleanupConfirmed,true);assert.equal(h.calls.filter(x=>x==='stop').length,1);assert.equal(JSON.stringify(result).includes(privateOrigin),false);
+ if(kind==='earlier owner fault')assert.equal(result.code,'CONFIRM');
+});
+test('original private origin arriving during bounded browser drain survives the abort race once',async()=>{
+ const h=harness(),controller=new AbortController(),error=originalOriginError(),offers=[];let rejectInitial;
+ h.bootstrap.persistRefusedStripeOrigin=(...args)=>{offers.push(args);return new Promise(()=>{});};
+ h.journey.initial=async()=>{controller.abort();return new Promise((_,reject)=>{rejectInitial=reject;});};
+ h.journey.close=async()=>{h.calls.push('browser-close');finishBrowserCleanup(error,true);rejectInitial(error);return true;};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,{...limits(),signal:controller.signal}));const result=await o.close();
+ assert.equal(offers.length,1);assert.equal(result.code,'ABORTED');assert.equal(result.diagnostic,'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');assert.equal(result.cleanupConfirmed,true);assert.equal(h.calls.filter(x=>x==='stop').length,1);
+});
+test('private origin settled only after CLOSED cannot start evidence persistence',async()=>{
+ const h=harness(),error=originalOriginError();let rejectInitial,offers=0;
+ h.bootstrap.persistRefusedStripeOrigin=()=>{offers++;return Promise.resolve(true);};
+ h.journey.initial=async()=>new Promise((_,reject)=>{rejectInitial=reject;});
+ // A refused close does not await the unresolved held promise.
+ h.journey.close=async()=>{throw Error('inert close refusal');};
+ const o=await owner(h),running=o.run(h.journey,limits());
+ for(let i=0;i<100&&!rejectInitial;i++)await new Promise(r=>setImmediate(r));
+ assert.equal(typeof rejectInitial,'function');const closed=o.close();await assert.rejects(running);const result=await closed;assert.equal(result.status,'CLOSED');
+ rejectInitial(error);await new Promise(r=>setImmediate(r));assert.equal(offers,0);assert.equal(o.resources().diagnostic,null);assert.equal(h.calls.filter(x=>x==='stop').length,1);
+});
 for(const checkpoint of ['BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_COM'])test('failed-renewal refused-origin terminal roundtrip '+checkpoint,async()=>{
  for(const close of [true,false]){
   const h=harness(),error=browserFailure(checkpoint),dispatches=[];let leaked;

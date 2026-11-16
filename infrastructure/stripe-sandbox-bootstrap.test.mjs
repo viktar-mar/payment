@@ -1960,6 +1960,89 @@ function failedRenewalPersistenceFixture(){
 async function failedRenewalPersistencePrepared(configure=()=>{}){
  const f=failedRenewalPersistenceFixture();configure(f);f.adapter=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);f.limits=LIMIT();await f.adapter.prepare(f.limits);return f;
 }
+const refusedOriginPath=DIR+'/refused-provider-origin.private.json';
+const refusedWitness=()=>({runId:RUN,expectedSource:'e'.repeat(40),origin:'https://evidence-only.stripe.com'});
+async function failedRenewalOriginLive(configure=()=>{}){
+ const f=await failedRenewalPersistencePrepared(configure);await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(f.limits);return f;
+}
+// Break: private evidence becomes a ledger operation, caller-controlled path, retry, or public payload.
+test('refused origin writes only one fixed private bounded file for the original LIVE owner',async()=>{
+ const f=await failedRenewalOriginLive(),b=f.adapter,before=b.resources(),ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents),offset=f.events.length;
+ assert.equal(typeof b.persistRefusedStripeOrigin,'function');
+ assert.equal(await b.persistRefusedStripeOrigin(refusedWitness(),f.limits),true);
+ const entry=f.files.get(refusedOriginPath),events=f.events.slice(offset);
+ assert.deepEqual(JSON.parse(entry.contents),{runId:RUN,expectedSource:'e'.repeat(40),checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER',origin:'https://evidence-only.stripe.com'});
+ assert.ok(entry.contents.length<=1024);assert.equal(entry.mode&0o7777,0o600);assert.equal(f.files.get(DIR).mode&0o7777,0o700);
+ const opened=events.find(e=>e.type==='open'&&e.path===refusedOriginPath);assert.ok(opened.flags&constants.O_EXCL);assert.ok(opened.flags&constants.O_NOFOLLOW);assert.equal(opened.mode,0o600);
+ assert.deepEqual(b.resources(),before);assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,ledger);
+ assert.equal(events.some(e=>['write','rename','unlink'].includes(e.type)&&e.path!==refusedOriginPath),false);
+ assert.equal(events.some(e=>['preflight','port','random','crypto','health'].includes(e.type)),false);
+ assert.equal(events.some(e=>e.type==='process'),false);
+ const count=f.events.length;assert.equal(await b.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);assert.equal(f.events.length,count);
+ assert.equal(JSON.stringify(before).includes('evidence-only'),false);assert.equal(b.persistenceDiagnostic(),null);
+ await b.stop({deadline:f.limits.deadline+120000});
+});
+for(const [name,change] of [
+ ['historical run',w=>{w.runId='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';}],['foreign source',w=>{w.expectedSource='a'.repeat(40);}],
+ ['raw URL',w=>{w.origin+='/?sensitive=canary#private';}],['permitted host',w=>{w.origin='https://api.stripe.com';}],
+ ['extra field',w=>{w.path='/tmp/private-canary';}],['inherited',w=>Object.setPrototypeOf(w,{canary:true})],
+ ['accessor',(w,touch)=>Object.defineProperty(w,'origin',{enumerable:true,get(){touch();return 'https://evidence-only.stripe.com';}})]
+])test('refused origin consumes '+name+' without file IO or caller getter evaluation',async()=>{
+ const f=await failedRenewalOriginLive(),w=refusedWitness();let reads=0;change(w,()=>{reads++;});const offset=f.events.length;
+ assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');assert.equal(await f.adapter.persistRefusedStripeOrigin(w,f.limits),false);
+ assert.equal(reads,0);assert.equal(f.events.length,offset);assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);
+ assert.equal(f.files.has(refusedOriginPath),false);await f.adapter.stop({deadline:f.limits.deadline+120000});
+});
+test('refused origin uses each own descriptor snapshot once and never ordinary foreign property reads',async()=>{
+ const f=await failedRenewalOriginLive(),captures=new Map();let gets=0;
+ const w=new Proxy(refusedWitness(),{get(){gets++;throw null;},getOwnPropertyDescriptor(target,key){captures.set(key,(captures.get(key)??0)+1);const d=Reflect.getOwnPropertyDescriptor(target,key);return captures.get(key)===1?d:{...d,value:'https://substituted.invalid'};}});
+ assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');assert.equal(await f.adapter.persistRefusedStripeOrigin(w,f.limits),true);
+ assert.equal(gets,0);assert.deepEqual([...captures.values()],[1,1,1]);assert.equal(JSON.parse(f.files.get(refusedOriginPath).contents).origin,'https://evidence-only.stripe.com');
+ await f.adapter.stop({deadline:f.limits.deadline+120000});
+});
+for(const drift of ['directory inode','directory mode','lock inode','lock mode','lock hardlink','lock symlink','existing','symlink','hardlink'])test('refused origin refuses '+drift+' without overwrite unlink retry or pending fence',async()=>{
+ const f=await failedRenewalOriginLive(),before=f.adapter.resources();
+ if(drift.startsWith('directory')){const e=f.files.get(DIR);if(drift.endsWith('inode'))e.ino+=1000;else e.mode=0o40755;}
+ else if(drift.startsWith('lock')){const original=f.files.get(DIR+'/owner.lock'),e={...original};f.files.set(DIR+'/owner.lock',e);if(drift.endsWith('inode'))e.ino+=1000;else if(drift.endsWith('mode'))e.mode=0o100644;else if(drift.endsWith('hardlink'))e.nlink=2;else e.symlink=true;}
+ else f.files.set(refusedOriginPath,{...f.files.get(DIR+'/owner.lock'),contents:Buffer.from('retained canary'),ino:999999,symlink:drift==='symlink',nlink:drift==='hardlink'?2:1});
+ const original=f.files.get(refusedOriginPath)?.contents,offset=f.events.length;
+ assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);
+ assert.deepEqual(f.adapter.resources(),before);if(original)assert.deepEqual(f.files.get(refusedOriginPath).contents,original);else assert.equal(f.files.has(refusedOriginPath),false);
+ assert.equal(f.events.slice(offset).some(e=>e.type==='unlink'||e.type==='rename'||e.type==='write'),false);
+ const count=f.events.length;assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);assert.equal(f.events.length,count);
+});
+for(const state of ['NEW','PREPARED','STOPPED','busy','pending','expired'])test('refused origin refuses '+state+' independently of operation admission',async()=>{
+ const f=state==='NEW'?failedRenewalPersistenceFixture():state==='PREPARED'?await failedRenewalPersistencePrepared():await failedRenewalOriginLive();
+ if(state==='NEW')f.adapter=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);
+ assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');let release,operation;
+ if(state==='STOPPED')await f.adapter.stop({deadline:f.limits.deadline+120000});
+ if(state==='busy')operation=f.adapter.withAdminCredentials(()=>new Promise(resolve=>{release=resolve;}),f.limits);
+ if(state==='busy')for(let i=0;i<100&&!release;i++)await turn();
+ if(state==='pending')await assert.rejects(f.adapter.verify({deadline:0}));
+ const before=f.adapter.resources(),offset=f.events.length;
+ assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),state==='expired'?{deadline:Date.now()-1}:f.limits??LIMIT()),false);
+ assert.deepEqual(f.adapter.resources(),before);assert.equal(f.events.length,offset);assert.equal(f.files.has(refusedOriginPath),false);
+ if(release){release(true);await operation;await f.adapter.stop({deadline:f.limits.deadline+120000});}
+});
+for(const refusal of ['throw','hostile rejection','partial','stall'])test('refused origin '+refusal+' cannot poison STOP or allow a second offer',async()=>{
+ let release,entered;const entry=new Promise(r=>{entered=r;});
+ const f=await failedRenewalOriginLive(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{if(args[0]!==refusedOriginPath)return open(...args);if(refusal!=='stall')entered();if(refusal==='throw')throw null;if(refusal==='hostile rejection')throw new Proxy({},{get(){throw Error('must not inspect sink rejection');}});const file=await open(...args);return {...file,writeFile:async bytes=>{if(refusal==='partial'){await file.writeFile(String(bytes).slice(0,7));throw null;}return new Promise(r=>{release=r;entered();});}};};});
+ assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');const before=f.adapter.resources(),writing=f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits);await entry;
+ assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);assert.deepEqual(f.adapter.resources(),before);
+ if(refusal==='stall'){assert.equal(typeof release,'function');const timer=[...f.timers.values()].find(t=>t.ms<=2000);assert.ok(timer);timer.callback();}
+ assert.equal(await writing,false);assert.deepEqual(f.adapter.resources(),before);
+ assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);assert.equal(f.adapter.resources().status,'STOPPED');
+ if(release){release();await turn();}assert.equal(f.events.some(e=>e.type==='unlink'&&e.path===refusedOriginPath),false);
+});
+for(const remaining of [20000,500,0])test('refused origin independent timer clips to two seconds and original cleanup ceiling '+remaining,async()=>{
+ let clock=Date.now(),entered,release;const entry=new Promise(r=>{entered=r;});
+ const f=await failedRenewalOriginLive(h=>{h.dependencies.now=()=>clock;const open=h.dependencies.open;h.dependencies.open=async(...args)=>{if(args[0]!==refusedOriginPath)return open(...args);entered();return new Promise(r=>{release=()=>open(...args).then(r);});};});
+ assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');clock=f.limits.deadline+120000-remaining;
+ const before=f.adapter.resources(),writing=f.adapter.persistRefusedStripeOrigin(refusedWitness(),{deadline:clock+60000});
+ if(remaining){await entry;const timers=[...f.timers.values()];assert.equal(timers.length,1);assert.equal(timers[0].ms,Math.min(2000,remaining));timers[0].callback();}
+ assert.equal(await writing,false);assert.deepEqual(f.adapter.resources(),before);assert.equal(f.files.has(refusedOriginPath),false);
+ if(release){release();await turn();}assert.equal(f.adapter.persistenceDiagnostic(),null);
+});
 const writerPath=ROOT+'/test-results/stripe-sandbox/user-env.lock';
 const persistenceIntents=f=>JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents;
 const persistenceMutations=events=>events.filter(e=>e.type==='process'&&(stoppedCompose(e)||e.args[4]==='container'&&['start','stop','rm'].includes(e.args[5])));

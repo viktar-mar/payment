@@ -6,7 +6,7 @@ import {validateBillingFirstPaymentOptions} from './stripe-billing-first-payment
 import {billingBounded,billingCheck,billingError} from './stripe-billing-limits.mjs';
 import {createBillingFirstPaymentRuntime,createBillingFirstRenewalRuntime,createBillingFailedRenewalRuntime,billingFirstPaymentDiagnostic,billingFirstPaymentPrepareCheckpoint,isBillingFirstPaymentDiagnostic} from './stripe-billing-first-payment-runtime.mjs';
 import {billingUuid} from './stripe-billing-provision.mjs';
-import {isBrowserDiagnostic,browserDiagnostic,browserCleanupConfirmed} from './stripe-billing-first-payment-browser-diagnostic.mjs';
+import {isBrowserDiagnostic,browserDiagnostic,browserCleanupConfirmed,browserProviderOrigin,isBrowserProviderOriginWitness} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 // Terminal reporting only; the private PREPARE validator keeps its original set.
 const startupCodes=new Set([
  ...['HTTP_UNAVAILABLE','HTTP_REJECTED','HTTP_ERROR','CONNECTION_FAILED','PROBE_TIMEOUT'].map(hint=>'START_BACKEND_HEALTH_UNHEALTHY_'+hint),
@@ -42,7 +42,7 @@ const ownerModes={
 async function createOwner(options,dependencies,purpose){
  const mode=ownerModes[purpose];
  const failedRenewal=purpose==='FAILED_RENEWAL',firstRenewal=purpose==='FIRST_RENEWAL';
- let heldJourney,heldPending,terminalClose,initialBrowserDiagnostic=null;
+ let heldJourney,heldPending,terminalClose,initialBrowserDiagnostic=null,initialBrowserOrigin=null,originOffered=false;
  function trackBrowser(body){
   const work=Promise.resolve().then(body);
   heldPending=work.then(()=>undefined,()=>undefined);
@@ -68,6 +68,19 @@ async function createOwner(options,dependencies,purpose){
   }
   failure??=code;lifetime.abort();throw billingError(failure);
  };
+ function offerInitialOrigin(error){
+  if(!failedRenewal||state!=='RUNNING'||phase!=='BROWSER'||failure!==null&&!['BROWSER','ABORTED'].includes(failure)||originOffered||initialBrowserDiagnostic!=='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER')return;
+  const witness=browserProviderOrigin(error);
+  if(!isBrowserProviderOriginWitness(witness)||witness.runId!==c.runId||witness.expectedSource!==c.expectedSource)return;
+  initialBrowserOrigin=witness;originOffered=true;
+  // Optional on injected legacy fixtures. Never invoke a capability getter, join
+  // the sink, or make its outcome part of first-fault/cleanup decisions.
+  try {
+   const persist=Object.getOwnPropertyDescriptor(bootstrap,'persistRefusedStripeOrigin')?.value;
+   const deadline=Math.min(Date.now()+2000,active.deadline+120000);
+   if(typeof persist==='function'&&deadline>Date.now())Promise.resolve(persist.call(bootstrap,initialBrowserOrigin,{deadline})).catch(()=>{});
+  }catch{}
+ }
  async function cleanup(){return cleanupPromise??=(async()=>{
   let ok=!journeyStarted||(journeySettled&&journeyClean);const l={deadline:Math.min(Date.now()+120000,(active?.deadline??Date.now())+120000)};
   if(heldJourney){
@@ -157,7 +170,7 @@ async function createOwner(options,dependencies,purpose){
       });
      },
     });
-    await step('BROWSER',async()=>{journeyStarted=true;try{const result=heldJourney?await trackBrowser(()=>heldJourney.initial(port,active)):await journey(port,active);journeySettled=true;journeyClean=!heldJourney;return result;}catch(error){if(failedRenewal)initialBrowserDiagnostic=browserDiagnostic(error);journeySettled=true;journeyClean=browserCleanupConfirmed(error);throw error;}finally{initialOpen=false;}},2700000);if(!prepareAck||!confirmAck)fail('ACK');
+    await step('BROWSER',async()=>{journeyStarted=true;try{const result=heldJourney?await trackBrowser(()=>heldJourney.initial(port,active)):await journey(port,active);journeySettled=true;journeyClean=!heldJourney;return result;}catch(error){if(failedRenewal){initialBrowserDiagnostic=browserDiagnostic(error);offerInitialOrigin(error);}journeySettled=true;journeyClean=browserCleanupConfirmed(error);throw error;}finally{initialOpen=false;}},2700000);if(!prepareAck||!confirmAck)fail('ACK');
     let settlement;for(let i=0;i<30;i++){const reply=await step('OBSERVE',l=>runtime.observe(l));const v=failedRenewal?checkedInitialResponse(reply,'observe'):reply;checkIdentity(v);if(v.phase==='SETTLED_LOCAL'){settlement=v;break;}if(v.phase!=='OBSERVE')fail('OBSERVE');if(i<29)await step('OBSERVE',l=>(dependencies.pause??(()=>new Promise(r=>setTimeout(r,1000))))(l));}if(!settlement)fail('OBSERVE');
     phase='EVIDENCE';
     if(Date.parse(settlement.access_evaluated_at)/1000!==c.frozenTime||Date.parse(settlement.access_valid_until)/1000!==c.frozenTime+300||!(Date.parse(settlement.period_start)/1000<=c.frozenTime)||!(Date.parse(settlement.paid_through)/1000>c.frozenTime))fail('EVIDENCE');

@@ -1,4 +1,5 @@
 import {billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
+import {isBrowserProviderOriginWitness} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
 import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
@@ -176,6 +177,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   const endpoints=frozen({backend:'http://127.0.0.1:'+ports.backend,demo:'http://127.0.0.1:'+ports.demo,receiver:'http://127.0.0.1:'+ports.receiver,
     postgres:'postgresql://127.0.0.1:'+ports.postgres,mailpitHttp:'http://127.0.0.1:'+ports.mailpitHttp,mailpitSmtp:'smtp://127.0.0.1:'+ports.mailpitSmtp});
   let busy=false,pending=false,status='NEW',startup=null,lock=null,sequence=0,issuerProved=false,webhookReady=false,live=false,retired=false,manualDeadline=null;
+  let refusedOriginUsed=false,originalDirectory=null;
   let inputs=null,admin=null,providerKeys=null,diagnosticConfigured=false,controlCapability;
   const runtimePrefix=failedRenewal?'PAYMENT_STRIPE_BILLING_FAILED_RENEWAL':firstRenewal?'PAYMENT_STRIPE_BILLING_FIRST_RENEWAL':'PAYMENT_STRIPE_BILLING_FIRST_PAYMENT';
   const runtimeDockerfile=failedRenewal?'Dockerfile.billing-failed-renewal':firstRenewal?'Dockerfile.billing-first-renewal':'Dockerfile.billing-first-payment';
@@ -337,7 +339,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       const names=await io.readdir(dirname(path));if(!names.includes(path.slice(dirname(path).length+1)))await io.mkdir(path,{mode:0o700});
       await directoryProof(path,context,path.endsWith('/stripe-sandbox'));await syncDirectory(dirname(path),context);
     }
-    await io.mkdir(directory,{mode:0o700});await directoryProof(directory,context,true);await syncDirectory(dirname(directory),context);
+    await io.mkdir(directory,{mode:0o700});const ownedDirectory=await directoryProof(directory,context,true);originalDirectory={ino:ownedDirectory.ino,dev:ownedDirectory.dev};await syncDirectory(dirname(directory),context);
     lock=await exclusiveFile(directory+'/owner.lock',runId+'\n',context,true);await ledger(context);
     await io.mkdir(buildxDirectory,{mode:0o700});
     const owned=await directoryProof(buildxDirectory,context,true);buildxIdentity={ino:owned.ino,dev:owned.dev};
@@ -736,6 +738,60 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       if(context.signal.aborted)abort();
     });
   }
+  // Descriptive evidence only. This does not enter operation(), reserve busy,
+  // publish an intent, or participate in STOP. Dispatched FS calls may finish
+  // after this independent budget and may leave partial/unsynced bytes.
+  async function persistRefusedStripeOrigin(witness,limits) {
+    if(refusedOriginUsed)return false;refusedOriginUsed=true;
+    let timer,external,abort;
+    try {
+      if(!failedRenewal||busy||pending||status!=='LIVE'||!live||!lock||!originalDirectory||manualDeadline===null)return false;
+      if(!witness||typeof witness!=='object'||Object.getPrototypeOf(witness)!==Object.prototype)return false;
+      const descriptors=Object.getOwnPropertyDescriptors(witness);
+      if(Reflect.ownKeys(descriptors).length!==3)return false;
+      const snapshot={};
+      for(const name of ['runId','expectedSource','origin']) {
+        const field=descriptors[name];if(!field?.enumerable||!Object.hasOwn(field,'value'))return false;snapshot[name]=field.value;
+      }
+      Object.freeze(snapshot);
+      if(!isBrowserProviderOriginWitness(snapshot)||snapshot.runId!==runId||snapshot.expectedSource!==expectedSource)return false;
+      if(!limits||typeof limits!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(limits)))return false;
+      const fields=Object.getOwnPropertyDescriptors(limits);
+      if(Reflect.ownKeys(fields).some(name=>!['deadline','signal'].includes(name))||!fields.deadline||!Object.hasOwn(fields.deadline,'value')
+        ||fields.signal&&!Object.hasOwn(fields.signal,'value'))return false;
+      const deadline=fields.deadline.value;external=fields.signal?.value;
+      if(!Number.isSafeInteger(deadline)||(external!==undefined&&!(external instanceof AbortSignal)))return false;
+      const end=Math.min(deadline,io.now()+2000,manualDeadline+120000);
+      if(end<=io.now()||external?.aborted)return false;
+      const controller=new AbortController(),context={deadline:end,signal:controller.signal},owner=lock;
+      const current=()=>{check(context);if(busy||pending||status!=='LIVE'||!live||lock!==owner)fail();};
+      async function ownership() {
+        current();const actual=await directoryProof(directory,context,true);current();
+        if(actual.ino!==originalDirectory.ino||actual.dev!==originalDirectory.dev)fail();
+        const expected=privateIdentities.get(directory+'/owner.lock');
+        if(!expected)fail();
+        const held=await owner.stat();current();const named=await io.lstat(directory+'/owner.lock');current();
+        if(!validFile(held)||!validFile(named)||held.ino!==expected.ino||held.dev!==expected.dev||named.ino!==expected.ino||named.dev!==expected.dev)fail();
+        if(await io.realpath(directory+'/owner.lock')!==directory+'/owner.lock')fail();current();
+      }
+      return await new Promise(resolveWrite=>{
+        let settled=false;
+        const finish=value=>{if(settled)return;settled=true;resolveWrite(value);};
+        abort=()=>{controller.abort();finish(false);};
+        timer=io.setTimeout(abort,Math.max(1,end-io.now()));
+        external?.addEventListener('abort',abort,{once:true});if(external?.aborted)abort();
+        const work=(async()=>{
+          await ownership();
+          const contents=JSON.stringify({runId:snapshot.runId,expectedSource:snapshot.expectedSource,checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER',origin:snapshot.origin})+'\n';
+          if(Buffer.byteLength(contents)>1024)fail();current();
+          await exclusiveFile(directory+'/refused-provider-origin.private.json',contents,context);
+          await ownership();return true;
+        })();
+        work.then(()=>finish(true),()=>finish(false));
+      });
+    } catch {return false;}
+    finally {try{if(timer!==undefined)io.clearTimeout(timer);}catch{}try{if(abort)external?.removeEventListener('abort',abort);}catch{}}
+  }
   async function stop(context) {
     // Root must stop its R2 listener before calling this capability.
     // First-payment cleanup can prove stopped state without acknowledging an uncertain start.
@@ -814,7 +870,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({host:'127.0.0.1',port:ports.postgres,database:'payment',user:'payment',password:inputs.PAYMENT_DB_PASSWORD}));}),context)!==true)fail();return true;
   },{adminChild:true});
   if(firstPayment)capabilities.startupDiagnostic=()=>startupCode;
-  if(failedRenewal)capabilities.persistenceDiagnostic=()=>persistenceCode;
+  if(failedRenewal){capabilities.persistenceDiagnostic=()=>persistenceCode;capabilities.persistRefusedStripeOrigin=persistRefusedStripeOrigin;}
   if(firstPayment)capabilities[failedRenewal?'withFailedRenewalRuntime':firstRenewal?'withFirstRenewalRuntime':'withFirstPaymentRuntime']=(callback,limits)=>operation('ADMIN',limits,async context=>{if(typeof callback!=='function'||!controlCapability)fail();await verify(context);if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({endpoint:'http://127.0.0.1:'+options.controlPort,capability:controlCapability}));}),context)!==true)fail();return true;},{adminChild:true});
   return Object.freeze(capabilities);
 }
