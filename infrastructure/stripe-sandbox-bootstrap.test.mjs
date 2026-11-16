@@ -2043,6 +2043,32 @@ for(const remaining of [20000,500,0])test('refused origin independent timer clip
  assert.equal(await writing,false);assert.deepEqual(f.adapter.resources(),before);assert.equal(f.files.has(refusedOriginPath),false);
  if(release){release();await turn();}assert.equal(f.adapter.persistenceDiagnostic(),null);
 });
+// Break: an evidence call that was already dispatched before STOP authorizes a
+// new payload write or synchronization after STOP has released the owner lock.
+for(const boundary of ['initial stat','write','file sync'])test('refused origin resumed after STOP dispatches no new mutation from '+boundary,async()=>{
+ let entered,release;const paused=new Promise(resolve=>{entered=resolve;});
+ const f=await failedRenewalOriginLive(h=>{
+  const open=h.dependencies.open;
+  h.dependencies.open=async(...args)=>{
+   const file=await open(...args);if(args[0]!==refusedOriginPath)return file;
+   let stats=0;
+   const hold=value=>new Promise(resolve=>{release=()=>resolve(value);entered();});
+   return {...file,
+    stat:async()=>{const value=await file.stat();return boundary==='initial stat'&&++stats===1?hold(value):value;},
+    writeFile:async bytes=>{const value=await file.writeFile(bytes);return boundary==='write'?hold(value):value;},
+    sync:async()=>{const value=await file.sync();return boundary==='file sync'?hold(value):value;}
+   };
+  };
+ });
+ const writing=f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits);await paused;
+ assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);assert.equal(f.adapter.resources().status,'STOPPED');
+ const afterStop=f.events.length;release();assert.equal(await writing,false);await turn();
+ const late=f.events.slice(afterStop);
+ assert.equal(late.some(e=>e.type==='write'&&e.path===refusedOriginPath),false);
+ assert.equal(late.some(e=>e.type==='sync'&&[refusedOriginPath,DIR].includes(e.path)),false);
+ assert.equal(late.some(e=>['unlink','rename'].includes(e.type)),false);
+ assert.equal(f.adapter.resources().status,'STOPPED');assert.equal(f.adapter.persistenceDiagnostic(),null);
+});
 const writerPath=ROOT+'/test-results/stripe-sandbox/user-env.lock';
 const persistenceIntents=f=>JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents;
 const persistenceMutations=events=>events.filter(e=>e.type==='process'&&(stoppedCompose(e)||e.args[4]==='container'&&['start','stop','rm'].includes(e.args[5])));

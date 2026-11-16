@@ -278,25 +278,25 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     const actual=await directoryProof(buildxDirectory,context,true);
     if(!buildxIdentity||actual.ino!==buildxIdentity.ino||actual.dev!==buildxIdentity.dev)fail();
   }
-  async function syncDirectory(path,context,identity=null) {
-    check(context);const file=await io.open(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_DIRECTORY);
+  async function syncDirectory(path,context,identity=null,refusedOriginCurrent=null) {
+    check(context);refusedOriginCurrent?.();const file=await io.open(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_DIRECTORY);
     try {
       const s=await file.stat();if(!s.isDirectory()||s.isSymbolicLink()||(s.uid!==0&&s.uid!==process.getuid()))fail();
       if(identity&&(s.ino!==identity.ino||s.dev!==identity.dev||s.uid!==process.getuid()||(s.mode&0o7777)!==0o700))fail();
-      await file.sync();
+      refusedOriginCurrent?.();await file.sync();
     }
     finally {await file.close();}check(context);
   }
-  async function exclusiveFile(path,contents,context,hold=false) {
+  async function exclusiveFile(path,contents,context,hold=false,refusedOriginCurrent=null) {
     await directoryProof(dirname(path),context,true);
-    check(context);const file=await io.open(path,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o600);
+    check(context);refusedOriginCurrent?.();const file=await io.open(path,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o600);
     let retain=false;
     try {
       check(context);const initial=await file.stat();check(context);if(!validFile(initial))fail();
-      await file.writeFile(contents);check(context);
+      refusedOriginCurrent?.();await file.writeFile(contents);check(context);
       const actual=await file.stat(),named=await io.lstat(path);
       if(!validFile(actual)||!validFile(named)||actual.ino!==initial.ino||actual.dev!==initial.dev||named.ino!==initial.ino||named.dev!==initial.dev||await io.realpath(path)!==path)fail();
-      check(context);await file.sync();check(context);await syncDirectory(dirname(path),context);privateIdentities.set(path,{ino:actual.ino,dev:actual.dev});
+      check(context);refusedOriginCurrent?.();await file.sync();check(context);await syncDirectory(dirname(path),context,null,refusedOriginCurrent);privateIdentities.set(path,{ino:actual.ino,dev:actual.dev});
       check(context);retain=hold;return file;
     } finally {if(!retain)await file.close();}
   }
@@ -784,7 +784,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
           await ownership();
           const contents=JSON.stringify({runId:snapshot.runId,expectedSource:snapshot.expectedSource,checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER',origin:snapshot.origin})+'\n';
           if(Buffer.byteLength(contents)>1024)fail();current();
-          await exclusiveFile(directory+'/refused-provider-origin.private.json',contents,context);
+          await exclusiveFile(directory+'/refused-provider-origin.private.json',contents,context,false,current);
           await ownership();return true;
         })();
         work.then(()=>finish(true),()=>finish(false));
