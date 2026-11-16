@@ -6,7 +6,7 @@ const documentPath='/stripe-browser-load-check.html';
 const safeResults=new Set(['READY','REFUSED','BUILD','LAUNCH','CONTEXT','PAGE','ELEMENT','TIMEOUT','CLEANUP','HEADER','AUTH','REDIRECT','API_PATH','ORIGIN_STRIPE_COM_M','ORIGIN_STRIPE_COM_OTHER','ORIGIN','NAVIGATION','METHOD','LOCAL','POPUP','DOWNLOAD','WEBSOCKET']);
 export function admitEnvironment(env){
   if(env.PAYMENT_STRIPE_BROWSER_LOAD_CHECK!=='true'||typeof env.PAYMENT_STRIPE_BROWSER_LOAD_CHECK_PUBLISHABLE_KEY!=='string'||!/^pk_test_[A-Za-z0-9]+$/.test(env.PAYMENT_STRIPE_BROWSER_LOAD_CHECK_PUBLISHABLE_KEY))throw Error('REFUSED');
-  for(const name of Object.keys(env))if((/^(?:DEBUG|PWDEBUG|NODE_DEBUG|NODE_OPTIONS|VITE_INSPECT|PLAYWRIGHT_.*|PW_.*)$/.test(name)||/^(?:(?:BROWSER|RECORD|ENABLE)_)?(?:TRACE|SCREENSHOT|HAR|VIDEO|CAPTURE|DEBUG)(?:_(?:PATH|DIR|FILE|ENABLED))?$/i.test(name))&&env[name])throw Error('REFUSED');
+  for(const name of Object.keys(env))if((/^(?:DEBUG|PWDEBUG|NODE_DEBUG|NODE_DEBUG_NATIVE|NODE_OPTIONS|VITE_INSPECT|PLAYWRIGHT_.*|PW_.*)$/.test(name)||/^(?:(?:BROWSER|RECORD|ENABLE)_)?(?:TRACE|SCREENSHOT|HAR|VIDEO|CAPTURE|DEBUG)(?:_(?:PATH|DIR|FILE|ENABLED))?$/i.test(name))&&env[name])throw Error('REFUSED');
   return env.PAYMENT_STRIPE_BROWSER_LOAD_CHECK_PUBLISHABLE_KEY;
 }
 

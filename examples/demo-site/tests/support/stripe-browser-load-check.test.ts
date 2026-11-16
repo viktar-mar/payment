@@ -54,7 +54,7 @@ test('admission accepts ordinary CHARSET value',async()=>{
 
 test('admission refuses actual debug and capture flags',async()=>{
   const {admitEnvironment}=await launcherModule();
-  for(const name of ['DEBUG','PWDEBUG','NODE_DEBUG','NODE_OPTIONS','VITE_INSPECT','PLAYWRIGHT_TRACE','PW_TEST_HTML_REPORT_OPEN','TRACE','SCREENSHOT','HAR','VIDEO','CAPTURE','RECORD_HAR_PATH','BROWSER_CAPTURE','ENABLE_DEBUG']){
+  for(const name of ['DEBUG','PWDEBUG','NODE_DEBUG','NODE_DEBUG_NATIVE','NODE_OPTIONS','VITE_INSPECT','PLAYWRIGHT_TRACE','PW_TEST_HTML_REPORT_OPEN','TRACE','SCREENSHOT','HAR','VIDEO','CAPTURE','RECORD_HAR_PATH','BROWSER_CAPTURE','ENABLE_DEBUG']){
     assert.throws(()=>admitEnvironment({...env,[name]:'enabled'}),name);
   }
 });
