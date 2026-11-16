@@ -17,7 +17,7 @@ function providerOriginIdentity(runId,expectedSource,origin){
  const hostname=origin.slice(8);
  if(hostname.length>253||/[^a-z0-9.-]/.test(hostname)||
     !(hostname==='stripe.com'||hostname.endsWith('.stripe.com'))||
-    ['api.stripe.com','hooks.stripe.com','js.stripe.com','m.stripe.com','r.stripe.com'].includes(hostname)||hostname.endsWith('.js.stripe.com'))return false;
+    ['api.stripe.com','hooks.stripe.com','js.stripe.com','m.stripe.com','r.stripe.com','merchant-ui-api.stripe.com'].includes(hostname)||hostname.endsWith('.js.stripe.com'))return false;
  if(!hostname.split('.').every(label=>label.length>0&&label.length<=63&&/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)))return false;
  try{
   for(const label of hostname.split('.')){

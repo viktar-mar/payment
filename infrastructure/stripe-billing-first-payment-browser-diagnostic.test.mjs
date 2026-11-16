@@ -67,6 +67,21 @@ test('origin capture rejects foreign errors without evaluating their payloads',(
  }
  assert.equal(reads,0);
 });
+test('witness validator rejects the network-admitted merchant origin as new OTHER evidence',()=>{
+ assert.equal(privateOrigin.isBrowserProviderOriginWitness({...witness(),origin:'https://merchant-ui-api.stripe.com'}),false);
+});
+test('private capture rejects the network-admitted merchant origin as new OTHER evidence',()=>{
+ const error=browserFailure('BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');
+ assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,'https://merchant-ui-api.stripe.com'),false);
+ assert.equal(privateOrigin.browserProviderOrigin(error),null);
+});
+test('merchant origin descendant remains eligible for new OTHER evidence',()=>{
+ const error=browserFailure('BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');
+ const descendant='https://child.merchant-ui-api.stripe.com',descendantCandidate={...witness(),origin:descendant};
+ assert.equal(privateOrigin.isBrowserProviderOriginWitness(descendantCandidate),true);
+ assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,descendant),true);
+ assert.deepEqual(privateOrigin.browserProviderOrigin(error),descendantCandidate);
+});
 test('witness validator admits only canonical bounded OTHER HTTPS DNS origins and original lowercase identity',()=>{
  assert.equal(typeof privateOrigin.isBrowserProviderOriginWitness,'function');
  for(const origin of ['https://stripe.com','https://other.stripe.com','https://child.m.stripe.com','https://child.r.stripe.com','https://a-b.stripe.com','https://xn--bcher-kva.stripe.com']){

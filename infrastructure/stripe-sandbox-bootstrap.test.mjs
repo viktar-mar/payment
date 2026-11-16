@@ -1985,13 +1985,18 @@ test('refused origin writes only one fixed private bounded file for the original
 for(const [name,change] of [
  ['historical run',w=>{w.runId='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';}],['foreign source',w=>{w.expectedSource='a'.repeat(40);}],
  ['raw URL',w=>{w.origin+='/?sensitive=canary#private';}],['permitted host',w=>{w.origin='https://api.stripe.com';}],
+ ['merchant network host',w=>{w.origin='https://merchant-ui-api.stripe.com';}],
  ['extra field',w=>{w.path='/tmp/private-canary';}],['inherited',w=>Object.setPrototypeOf(w,{canary:true})],
  ['accessor',(w,touch)=>Object.defineProperty(w,'origin',{enumerable:true,get(){touch();return 'https://evidence-only.stripe.com';}})]
 ])test('refused origin consumes '+name+' without file IO or caller getter evaluation',async()=>{
- const f=await failedRenewalOriginLive(),w=refusedWitness();let reads=0;change(w,()=>{reads++;});const offset=f.events.length;
+ const f=await failedRenewalOriginLive(),w=refusedWitness();let reads=0;change(w,()=>{reads++;});
+ if(name==='merchant network host')f.files.set(refusedOriginPath,{...f.files.get(DIR+'/owner.lock'),contents:Buffer.from('retained historical canary'),ino:999999});
+ const retained=f.files.get(refusedOriginPath)?.contents,before=f.adapter.resources(),ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents),offset=f.events.length;
  assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');assert.equal(await f.adapter.persistRefusedStripeOrigin(w,f.limits),false);
- assert.equal(reads,0);assert.equal(f.events.length,offset);assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);
- assert.equal(f.files.has(refusedOriginPath),false);await f.adapter.stop({deadline:f.limits.deadline+120000});
+ assert.equal(reads,0);assert.equal(f.events.length,offset);assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);assert.equal(f.events.length,offset);
+ assert.deepEqual(f.adapter.resources(),before);assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,ledger);
+ if(retained)assert.deepEqual(f.files.get(refusedOriginPath).contents,retained);else assert.equal(f.files.has(refusedOriginPath),false);
+ assert.equal(f.adapter.persistenceDiagnostic(),null);assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);assert.equal(f.adapter.resources().status,'STOPPED');
 });
 test('refused origin uses each own descriptor snapshot once and never ordinary foreign property reads',async()=>{
  const f=await failedRenewalOriginLive(),captures=new Map();let gets=0;
