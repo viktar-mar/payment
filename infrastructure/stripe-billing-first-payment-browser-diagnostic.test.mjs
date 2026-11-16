@@ -16,6 +16,13 @@ test('bounded wait marker categories carry no payload and remain closed',()=>{
   assert.equal(isBrowserDiagnostic(code+'_PRIVATE'),false);
  }
 });
+test('provider boundaries are finite private provenance without payload',()=>{
+ for(const code of ['BROWSER_PROVIDER_HEADERS','BROWSER_PROVIDER_CURRENT','BROWSER_PROVIDER_REDIRECT','BROWSER_PROVIDER_USERINFO','BROWSER_PROVIDER_AUTH','BROWSER_PROVIDER_ORIGIN_SCHEME','BROWSER_PROVIDER_ORIGIN_PORT','BROWSER_PROVIDER_ORIGIN_STRIPE_COM','BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK','BROWSER_PROVIDER_ORIGIN_OTHER','BROWSER_PROVIDER_NAVIGATION','BROWSER_PROVIDER_FALLBACK']){
+  const error=browserFailure(code);assert.equal(browserDiagnostic(error),code);assert.deepEqual(Object.keys(error),[]);
+  assert.equal(String(error),'Error: first_payment_BROWSER');assert.equal(isBrowserDiagnostic(code+'_PRIVATE'),false);
+  finishBrowserCleanup(error,true);assert.equal(browserCleanupConfirmed(error),true);
+ }
+});
 test('foreign values and unreadable proxies cannot supply provenance',()=>{
  let reads=0;const hostile=new Proxy({diagnostic:'BROWSER_PAGE',cleanupConfirmed:true},{get(){reads++;throw null;},getPrototypeOf(){reads++;throw null;},ownKeys(){reads++;throw null;}});
  for(const e of [hostile,null,undefined,1,'BROWSER_PAGE',{code:'BROWSER_PAGE'},new Error('BROWSER_PAGE'),Object.create(browserFailure('BROWSER_PAGE'))]){assert.equal(browserDiagnostic(e),null);assert.equal(browserCleanupConfirmed(e),false);finishBrowserCleanup(e,true);}

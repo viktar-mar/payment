@@ -145,7 +145,8 @@ class Control {
   onclick?: (event:unknown)=>unknown;
   async activate() {assert.equal(this.disabled,false);await this.onclick?.({isTrusted:true});}
 }
-async function fixture(change = '') {
+type ProviderProbe={target:string;headers?:Record<string,string>;headerFailure?:'getter'|'reject';redirect?:'throw'|'present';navigation?:'main'|'child'|'throw'|'frame';fallbackFailure?:boolean;hold?:boolean;method?:string};
+async function fixture(change = '',provider?:ProviderProbe[]) {
   let releaseIO!:()=>void,markIO!:()=>void;
   const heldIO=new Promise<void>(resolve=>{releaseIO=resolve;}),ioPending=new Promise<void>(resolve=>{markIO=resolve;});
   let stageHook:((where:string)=>Promise<void>)|undefined;
@@ -159,6 +160,7 @@ async function fixture(change = '') {
   const {runFailedRenewalBrowser} = await import(source('./stripe-billing-failed-renewal.ts').href);
   const terminals:unknown[][]=[];
   const counts:string[] = [], replies:any[] = [], controls = new Map<string,Control>();
+  let providerFallbacks=0;
   const ctrl = (id:string) => {
     if(!controls.has(id))controls.set(id,Object.assign(new Control(),{id}));
     return controls.get(id)!;
@@ -184,6 +186,18 @@ async function fixture(change = '') {
   let url = 'about:blank', closed = 0;
   const frame = {url:()=>url}, callbacks = new Map<string,Function>(),bindings=new Map<string,Function>();
   let routeHandler:Function;
+  async function probeProvider(probe:ProviderProbe) {
+    let denied=false;
+    const fail=()=>{throw Error('secret_fixture canary');};
+    const req={url:()=>probe.target,method:()=>probe.method??'GET',
+      get allHeaders(){if(probe.headerFailure==='getter')fail();return async()=>{if(probe.headerFailure==='reject')fail();if(probe.hold){markIO();await heldIO;}return probe.headers??{};};},
+      redirectedFrom:()=>{if(probe.redirect==='throw')fail();return probe.redirect==='present'?{}:null;},
+      isNavigationRequest:()=>{if(probe.navigation==='throw')fail();return Boolean(probe.navigation);},
+      frame:()=>{if(probe.navigation==='frame')fail();return probe.navigation==='child'?{}:frame;},
+      resourceType:()=> 'other',postData:()=>null};
+    await routeHandler({request:()=>req,abort:async()=>{denied=true;},fallback:async()=>{providerFallbacks++;if(probe.fallbackFailure)fail();},fulfill:async()=>assert.fail('provider fulfillment')});
+    if(denied)throw Error('denied mock request');
+  }
   async function request(target:string,method:string,data?:any) {
     const bridge=target.endsWith('/action')?'action':target.endsWith('/confirmation-session')?'session':target.endsWith('/confirm')?'confirm':'';
     if(bridge && method!=='OPTIONS' && change===bridge+'_preflight_delivery')await request(target,'OPTIONS');
@@ -229,6 +243,7 @@ async function fixture(change = '') {
         assert.equal(runAbort.signal.aborted,false);
       }
       if(change==='page_action')throw Error('secret_fixture canary');
+      if(provider)for(const probe of provider)await probeProvider(probe);
       if(change==='action_provider_header')await request('https://js.stripe.com/v3/','GET');
       if(change==='action_asset_header')await request(demo+'/assets/inert.js','GET');
       const response=await request(base(input.operationId)+'/action','GET');
@@ -306,11 +321,80 @@ async function fixture(change = '') {
       await Promise.resolve().then(()=>f(src,...args)).catch(()=>{});
     }
   };
-  return {request,counts,replies,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,ioPending,releaseIO,
+  return {request,counts,replies,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,ioPending,releaseIO,providerFallbacks:()=>providerFallbacks,
     setStageHook:(hook:typeof stageHook)=>{stageHook=hook;},terminal:async(marker:unknown)=>bindings.get('__failedRenewalTerminal')!({page,frame},'STOPPED',marker),closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
     restore:async()=>{try{runAbort.abort();await journey.close(nowLimits());}finally{w.__failedRenewalStop?.();restore();}}};
 }
 
+const providerCases:readonly [string,ProviderProbe,string][]=[
+ ['header getter',{target:'https://js.stripe.com/',headerFailure:'getter'},'BROWSER_PROVIDER_HEADERS'],
+ ['header rejection',{target:'https://js.stripe.com/',headerFailure:'reject'},'BROWSER_PROVIDER_HEADERS'],
+ ['current',{target:'https://js.stripe.com/',hold:true},'BROWSER_PROVIDER_CURRENT'],
+ ['redirect lookup',{target:'https://user:pass@js.stripe.com/',redirect:'throw'},'BROWSER_PROVIDER_REDIRECT'],
+ ['redirect refusal',{target:'https://user:pass@js.stripe.com/',redirect:'present'},'BROWSER_PROVIDER_REDIRECT'],
+ ['userinfo',{target:'https://user:pass@js.stripe.com/'},'BROWSER_PROVIDER_USERINFO'],
+ ['owned auth',{target:'https://js.stripe.com/',headers:{authorization:'Bearer '+token}},'BROWSER_PROVIDER_AUTH'],
+ ['foreign origin auth',{target:'https://elsewhere.test/',headers:{authorization:'Bearer provider'}},'BROWSER_PROVIDER_AUTH'],
+ ['scheme',{target:'http://js.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_SCHEME'],
+ ['opaque scheme',{target:'data:text/plain,fixture'},'BROWSER_PROVIDER_ORIGIN_SCHEME'],
+ ['port',{target:'https://js.stripe.com:444/'},'BROWSER_PROVIDER_ORIGIN_PORT'],
+ ['stripe apex',{target:'https://stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM'],
+ ['stripe subdomain',{target:'https://other.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM'],
+ ['network apex',{target:'https://stripe.network/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
+ ['network subdomain',{target:'https://other.stripe.network/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
+ ['other',{target:'https://elsewhere.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
+ ['com lookalike',{target:'https://notstripe.com/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
+ ['network lookalike',{target:'https://notstripe.network/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
+ ['suffix lookalike',{target:'https://js.stripe.com.evil.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
+ ['trailing dot',{target:'https://js.stripe.com./'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
+ ['main navigation',{target:'https://js.stripe.com/',navigation:'main'},'BROWSER_PROVIDER_NAVIGATION'],
+ ['navigation lookup',{target:'https://js.stripe.com/',navigation:'throw'},'BROWSER_PROVIDER_NAVIGATION'],
+ ['frame lookup',{target:'https://js.stripe.com/',navigation:'frame'},'BROWSER_PROVIDER_NAVIGATION'],
+ ['fallback rejection',{target:'https://js.stripe.com/',fallbackFailure:true},'BROWSER_PROVIDER_FALLBACK'],
+];
+for(const [name,probe,checkpoint] of providerCases)test('provider boundary '+name,async()=>{
+ const h=await fixture('',[probe]),limits=nowLimits();let work:Promise<unknown>|undefined,first:unknown;
+ try{
+  work=h.journey.initial(h.initialPort,limits);
+  const rejected=assert.rejects(work!,(error:unknown)=>{first=error;return true;});
+  if(probe.hold){await h.ioPending;limits.deadline=0;h.releaseIO();}
+  await rejected;
+  assert.equal(browserDiagnostic(first),checkpoint);
+  assert.doesNotMatch(String(first),/secret_fixture|canary|Bearer|stripe|elsewhere|user|pass/);
+  assert.equal(h.providerFallbacks(),probe.fallbackFailure?1:0);
+  assert.equal(h.counts.includes('confirm'),false);assert.equal(h.counts.includes('permit'),false);
+  await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),e=>e===first);
+  await assert.rejects(h.journey.method(h.methodPort,nowLimits()),e=>e===first);
+  assert.equal(await h.journey.close(nowLimits()),true);assert.equal(h.closed(),1);
+  assert.equal(browserCleanupConfirmed(first),true);assert.equal(browserDiagnostic(first),checkpoint);
+ }finally{h.releaseIO();await work?.catch(()=>{});await h.restore();}
+});
+test('provider permitted matrix preserves one-use journey and fallback',async()=>{
+ const probes:ProviderProbe[]=['api.stripe.com','hooks.stripe.com','js.stripe.com','child.js.stripe.com'].map(host=>({target:'https://'+host+':443/arbitrary/path?fixture=yes#part',headers:{authorization:'Bearer provider'},method:'PATCH'}));
+ probes.push({target:'https://js.stripe.com/',navigation:'child'});
+ const h=await fixture('',probes);
+ try{
+  assert.equal(await h.journey.initial(h.initialPort,nowLimits()),true);
+  assert.equal(await h.journey.method(h.methodPort,nowLimits()),true);
+  assert.equal(h.providerFallbacks(),probes.length*2);
+  assert.equal(h.counts.filter(v=>v==='confirm').length,1);assert.equal(h.counts.filter(v=>v==='permit').length,1);
+  await h.journey.close(nowLimits());assert.equal(h.closed(),1);
+ }finally{await h.restore();}
+});
+test('earlier page fault wins pending provider currentness failure',async()=>{
+ const h=await fixture('',[{target:'https://js.stripe.com/',hold:true}]);let work:Promise<unknown>|undefined,first:unknown;
+ try{
+  work=h.journey.initial(h.initialPort,nowLimits());
+  const rejected=assert.rejects(work!,(error:unknown)=>{first=error;return true;});
+  await h.ioPending;h.lose('pagehide');assert.equal(h.runAbort.signal.aborted,true);
+  h.releaseIO();await rejected;
+  assert.equal(browserDiagnostic(first),'BROWSER_INITIAL_ACTION');assert.equal(h.providerFallbacks(),0);
+  assert.equal(h.counts.includes('confirm'),false);assert.equal(h.counts.includes('permit'),false);
+  await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),e=>e===first);
+  await assert.rejects(h.journey.method(h.methodPort,nowLimits()),e=>e===first);
+  await h.journey.close(nowLimits());assert.equal(h.closed(),1);assert.equal(browserCleanupConfirmed(first),true);
+ }finally{h.releaseIO();await work?.catch(()=>{});await h.restore();}
+});
 for(const where of ['card','manual'])test('completed readiness rejects stale original markers during '+where,async()=>{
   const h=await fixture();let phase='initial',checks=0;
   h.setStageHook(async at=>{
@@ -382,7 +466,7 @@ for(const [change,checkpoint] of [
   ['action_delivery','BROWSER_ACTION_BRIDGE'],['session_delivery','BROWSER_SESSION_BRIDGE'],
   ['action_preflight_delivery','BROWSER_ACTION_BRIDGE'],['session_preflight_delivery','BROWSER_SESSION_BRIDGE'],['confirm_preflight_delivery','BROWSER_CONFIRM_BRIDGE'],
   ['action_early_header','BROWSER_ACTION_BRIDGE'],['session_early_header','BROWSER_SESSION_BRIDGE'],['confirm_early_header','BROWSER_CONFIRM_BRIDGE'],
-  ['action_provider_header','BROWSER_PROVIDER_ROUTE'],['action_asset_header','BROWSER_ASSET_ROUTE'],
+  ['action_provider_header','BROWSER_PROVIDER_AUTH'],['action_asset_header','BROWSER_ASSET_ROUTE'],
   ['pre_ready','BROWSER_READY_PHASE'],['ready_button','BROWSER_READY_BUTTON'],['start_click','BROWSER_START_CLICK'],
   ['page_action','BROWSER_INITIAL_ACTION'],['page_session','BROWSER_INITIAL_SESSION'],
   ['page_action_decode','BROWSER_INITIAL_ACTION'],['page_session_decode','BROWSER_INITIAL_SESSION'],

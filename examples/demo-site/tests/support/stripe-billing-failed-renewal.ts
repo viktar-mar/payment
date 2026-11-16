@@ -151,18 +151,34 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       if(url.origin===binding.endpoints.backend && (step==='ACTION'||step==='SESSION'||step==='CONFIRM'))
         routeCheckpoint=step==='ACTION'?'BROWSER_ACTION_BRIDGE':step==='SESSION'?'BROWSER_SESSION_BRIDGE':'BROWSER_CONFIRM_BRIDGE';
       if(url.origin!==binding.endpoints.backend)routeCheckpoint=url.origin===binding.endpoints.demo?'BROWSER_ASSET_ROUTE':'BROWSER_PROVIDER_ROUTE';
+      const provider=url.origin!==binding.endpoints.backend && url.origin!==binding.endpoints.demo;
+      if(provider)routeCheckpoint='BROWSER_PROVIDER_HEADERS';
       const headers=await request.allHeaders();
+      if(provider)routeCheckpoint='BROWSER_PROVIDER_CURRENT';
       current();
-      need(!request.redirectedFrom() && !url.username && !url.password);
+      if(provider)routeCheckpoint='BROWSER_PROVIDER_REDIRECT';
+      need(!request.redirectedFrom());
+      if(provider)routeCheckpoint='BROWSER_PROVIDER_USERINFO';
+      need(!url.username && !url.password);
       if(url.origin!==binding.endpoints.backend) {
+        if(provider)routeCheckpoint='BROWSER_PROVIDER_AUTH';
         need(!headers.authorization || (providerOrigin(url) && headers.authorization!=='Bearer '+token));
         if(url.origin===binding.endpoints.demo){
           need(request.method()==='GET' && !url.search && !url.hash && request.frame()===page!.mainFrame() &&
             ((state==='INITIAL' && navigation===0 && url.pathname===pagePath && request.isNavigationRequest()) ||
             (!request.isNavigationRequest() && /^\/assets\/[\w.-]+\.(js|css)$/.test(url.pathname))));
         }else{
-          need(providerOrigin(url) && !(request.isNavigationRequest() && request.frame()===page!.mainFrame()));
+          if(!providerOrigin(url)){
+            // Syntax categories of the already refused parsed URL grant no authority.
+            routeCheckpoint=url.protocol!=='https:'?'BROWSER_PROVIDER_ORIGIN_SCHEME':url.port?'BROWSER_PROVIDER_ORIGIN_PORT':
+              url.hostname==='stripe.com'||url.hostname.endsWith('.stripe.com')?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM':
+              url.hostname==='stripe.network'||url.hostname.endsWith('.stripe.network')?'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK':'BROWSER_PROVIDER_ORIGIN_OTHER';
+            need(false);
+          }
+          routeCheckpoint='BROWSER_PROVIDER_NAVIGATION';
+          need(!(request.isNavigationRequest() && request.frame()===page!.mainFrame()));
         }
+        if(provider)routeCheckpoint='BROWSER_PROVIDER_FALLBACK';
         await route.fallback();return;
       }
       assertPage();
