@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import type {TestCase,TestResult,FullResult} from '@playwright/test/reporter';
+import type {BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
+import type {BillingFirstPaymentPort} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 // @ts-ignore Node's source-only offline test runner requires the explicit extension.
 import FailedRenewalReporter from './stripe-billing-failed-renewal-reporter.ts';
 import {browserDiagnostic,browserCleanupConfirmed} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
@@ -321,7 +323,7 @@ async function fixture(change = '',provider?:ProviderProbe[]) {
       await Promise.resolve().then(()=>f(src,...args)).catch(()=>{});
     }
   };
-  return {request,counts,replies,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,ioPending,releaseIO,providerFallbacks:()=>providerFallbacks,
+  return {request,counts,replies,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,ioPending,releaseIO,notifyIO:markIO,providerFallbacks:()=>providerFallbacks,
     setStageHook:(hook:typeof stageHook)=>{stageHook=hook;},terminal:async(marker:unknown)=>bindings.get('__failedRenewalTerminal')!({page,frame},'STOPPED',marker),closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
     restore:async()=>{try{runAbort.abort();await journey.close(nowLimits());}finally{w.__failedRenewalStop?.();restore();}}};
 }
@@ -352,13 +354,21 @@ const providerCases:readonly [string,ProviderProbe,string][]=[
  ['frame lookup',{target:'https://js.stripe.com/',navigation:'frame'},'BROWSER_PROVIDER_NAVIGATION'],
  ['fallback rejection',{target:'https://js.stripe.com/',fallbackFailure:true},'BROWSER_PROVIDER_FALLBACK'],
 ];
-for(const [name,probe,checkpoint] of providerCases)test('provider boundary '+name,async()=>{
- const h=await fixture('',[probe]),limits=nowLimits();let work:Promise<unknown>|undefined,first:unknown;
+function providerWorkSettlement(work:Promise<unknown>){
+ return work.then(()=>({kind:'resolved' as const}),(error:unknown)=>({kind:'rejected' as const,error}));
+}
+async function waitProviderHeader(ioPending:Promise<void>,settled:ReturnType<typeof providerWorkSettlement>){
+ const result=await Promise.race([ioPending.then(()=>({kind:'held' as const})),settled]);
+ if(result.kind==='rejected')throw result.error;
+ if(result.kind==='resolved')assert.fail('provider header hold not reached');
+}
+async function consumeProviderBoundary(h:Awaited<ReturnType<typeof fixture>>,probe:ProviderProbe,checkpoint:string){
+ const limits=nowLimits();let work:Promise<unknown>|undefined,first:unknown;
  try{
   work=h.journey.initial(h.initialPort,limits);
-  const rejected=assert.rejects(work!,(error:unknown)=>{first=error;return true;});
-  if(probe.hold){await h.ioPending;limits.deadline=0;h.releaseIO();}
-  await rejected;
+  const settled=providerWorkSettlement(work!);
+  if(probe.hold){await waitProviderHeader(h.ioPending,settled);limits.deadline=0;h.releaseIO();}
+  await assert.rejects(work!,(error:unknown)=>{first=error;return true;});
   assert.equal(browserDiagnostic(first),checkpoint);
   assert.doesNotMatch(String(first),/secret_fixture|canary|Bearer|stripe|elsewhere|user|pass/);
   assert.equal(h.providerFallbacks(),probe.fallbackFailure?1:0);
@@ -368,6 +378,9 @@ for(const [name,probe,checkpoint] of providerCases)test('provider boundary '+nam
   assert.equal(await h.journey.close(nowLimits()),true);assert.equal(h.closed(),1);
   assert.equal(browserCleanupConfirmed(first),true);assert.equal(browserDiagnostic(first),checkpoint);
  }finally{h.releaseIO();await work?.catch(()=>{});await h.restore();}
+}
+for(const [name,probe,checkpoint] of providerCases)test('provider boundary '+name,async()=>{
+ await consumeProviderBoundary(await fixture('',[probe]),probe,checkpoint);
 });
 test('provider permitted matrix preserves one-use journey and fallback',async()=>{
  const probes:ProviderProbe[]=['api.stripe.com','hooks.stripe.com','js.stripe.com','child.js.stripe.com'].map(host=>({target:'https://'+host+':443/arbitrary/path?fixture=yes#part',headers:{authorization:'Bearer provider'},method:'PATCH'}));
@@ -381,19 +394,54 @@ test('provider permitted matrix preserves one-use journey and fallback',async()=
   await h.journey.close(nowLimits());assert.equal(h.closed(),1);
  }finally{await h.restore();}
 });
-test('earlier page fault wins pending provider currentness failure',async()=>{
- const h=await fixture('',[{target:'https://js.stripe.com/',hold:true}]);let work:Promise<unknown>|undefined,first:unknown;
+async function consumeProviderPageFault(h:Awaited<ReturnType<typeof fixture>>){
+ let work:Promise<unknown>|undefined,first:unknown;
  try{
   work=h.journey.initial(h.initialPort,nowLimits());
-  const rejected=assert.rejects(work!,(error:unknown)=>{first=error;return true;});
-  await h.ioPending;h.lose('pagehide');assert.equal(h.runAbort.signal.aborted,true);
-  h.releaseIO();await rejected;
+  const settled=providerWorkSettlement(work!);
+  await waitProviderHeader(h.ioPending,settled);h.lose('pagehide');assert.equal(h.runAbort.signal.aborted,true);
+  h.releaseIO();await assert.rejects(work!,(error:unknown)=>{first=error;return true;});
   assert.equal(browserDiagnostic(first),'BROWSER_INITIAL_ACTION');assert.equal(h.providerFallbacks(),0);
   assert.equal(h.counts.includes('confirm'),false);assert.equal(h.counts.includes('permit'),false);
   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),e=>e===first);
   await assert.rejects(h.journey.method(h.methodPort,nowLimits()),e=>e===first);
   await h.journey.close(nowLimits());assert.equal(h.closed(),1);assert.equal(browserCleanupConfirmed(first),true);
  }finally{h.releaseIO();await work?.catch(()=>{});await h.restore();}
+}
+test('earlier page fault wins pending provider currentness failure',async()=>{
+ await consumeProviderPageFault(await fixture('',[{target:'https://js.stripe.com/',hold:true}]));
+});
+for(const consumer of ['boundary','page fault'] as const)for(const outcome of ['reject','resolve'] as const)test('held provider '+consumer+' restores globals after early '+outcome,async()=>{
+ const names=['window','document','location','HTMLButtonElement','fetch'];
+ const original=names.map(name=>Object.getOwnPropertyDescriptor(globalThis,name));
+ const h=await fixture(outcome==='reject'?'page_action':'');
+ let markSettled!:()=>void,originalFailure:unknown,completed=false;
+ const settled=new Promise<void>(resolve=>{markSettled=resolve;});
+ const initial=h.journey.initial.bind(h.journey);
+ const observedInitial:typeof h.journey.initial=(port:BillingFirstPaymentPort,limits:BillingLimits)=>{
+  const work=initial(port,limits);
+  void work.then(()=>markSettled(),(error:unknown)=>{originalFailure=error;markSettled();});
+  return work;
+ };
+ const owned={...h,journey:{...h.journey,initial:observedInitial}};
+ const consume=consumer==='boundary'?consumeProviderBoundary(owned,{target:'https://js.stripe.com/',hold:true},'BROWSER_PROVIDER_CURRENT'):consumeProviderPageFault(owned);
+ const observed=consume.then(()=>({error:undefined}),error=>({error})).then(result=>{completed=true;return result;});
+ let completedBeforeRecovery=false;
+ try{
+  await settled;
+  // A bounded event-loop gate lets the actual consumer react to settlement.
+  // Explicit notification then recovers the broken pre-fix wait without a timer.
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  completedBeforeRecovery=completed;
+ }finally{h.notifyIO();h.releaseIO();await observed;await h.restore();}
+ const result=await observed;
+ assert.equal(completedBeforeRecovery,true,'consumer must clean up before recovery notification');
+ assert.equal(h.closed(),1);
+ for(const [index,name] of names.entries())assert.deepEqual(Object.getOwnPropertyDescriptor(globalThis,name),original[index]);
+ if(outcome==='reject'){
+  assert.equal(result.error,originalFailure);assert.equal(browserDiagnostic(originalFailure),'BROWSER_INITIAL_ACTION');
+  assert.equal(browserCleanupConfirmed(originalFailure),true);assert.equal(h.counts.includes('confirm'),false);
+ }else assert.equal((result.error as Error)?.message,'provider header hold not reached');
 });
 for(const where of ['card','manual'])test('completed readiness rejects stale original markers during '+where,async()=>{
   const h=await fixture();let phase='initial',checks=0;
