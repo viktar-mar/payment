@@ -171,7 +171,9 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
           if(!providerOrigin(url)){
             // Syntax categories of the already refused parsed URL grant no authority.
             routeCheckpoint=url.protocol!=='https:'?'BROWSER_PROVIDER_ORIGIN_SCHEME':url.port?'BROWSER_PROVIDER_ORIGIN_PORT':
-              url.hostname==='stripe.com'||url.hostname.endsWith('.stripe.com')?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM':
+              url.hostname==='stripe.com'||url.hostname.endsWith('.stripe.com')?
+                url.hostname==='m.stripe.com'?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M':
+                url.hostname==='r.stripe.com'?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R':'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER':
               url.hostname==='stripe.network'||url.hostname.endsWith('.stripe.network')?'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK':'BROWSER_PROVIDER_ORIGIN_OTHER';
             need(false);
           }

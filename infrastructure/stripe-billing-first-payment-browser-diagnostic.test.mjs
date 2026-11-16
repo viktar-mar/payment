@@ -17,9 +17,15 @@ test('bounded wait marker categories carry no payload and remain closed',()=>{
  }
 });
 test('provider boundaries are finite private provenance without payload',()=>{
- for(const code of ['BROWSER_PROVIDER_HEADERS','BROWSER_PROVIDER_CURRENT','BROWSER_PROVIDER_REDIRECT','BROWSER_PROVIDER_USERINFO','BROWSER_PROVIDER_AUTH','BROWSER_PROVIDER_ORIGIN_SCHEME','BROWSER_PROVIDER_ORIGIN_PORT','BROWSER_PROVIDER_ORIGIN_STRIPE_COM','BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK','BROWSER_PROVIDER_ORIGIN_OTHER','BROWSER_PROVIDER_NAVIGATION','BROWSER_PROVIDER_FALLBACK']){
+ for(const code of ['BROWSER_PROVIDER_HEADERS','BROWSER_PROVIDER_CURRENT','BROWSER_PROVIDER_REDIRECT','BROWSER_PROVIDER_USERINFO','BROWSER_PROVIDER_AUTH','BROWSER_PROVIDER_ORIGIN_SCHEME','BROWSER_PROVIDER_ORIGIN_PORT','BROWSER_PROVIDER_ORIGIN_STRIPE_COM','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK','BROWSER_PROVIDER_ORIGIN_OTHER','BROWSER_PROVIDER_NAVIGATION','BROWSER_PROVIDER_FALLBACK']){
   const error=browserFailure(code);assert.equal(browserDiagnostic(error),code);assert.deepEqual(Object.keys(error),[]);
-  assert.equal(String(error),'Error: first_payment_BROWSER');assert.equal(isBrowserDiagnostic(code+'_PRIVATE'),false);
+  assert.equal(String(error),'Error: first_payment_BROWSER');assert.equal(isBrowserDiagnostic(code),true);assert.equal(isBrowserDiagnostic(code+'_PRIVATE'),false);
+  for(const forged of [code,{diagnostic:code,cleanupConfirmed:true},new Error(code),Object.create(error)]){
+   assert.equal(browserDiagnostic(forged),null);assert.equal(browserCleanupConfirmed(forged),false);finishBrowserCleanup(forged,true);assert.equal(browserCleanupConfirmed(forged),false);
+  }
+  for(const raw of [code+' https://m.stripe.com/private',code+'\n',code+'_PRIVATE']){
+   assert.equal(isBrowserDiagnostic(raw),false);assert.equal(browserDiagnostic(browserFailure(raw)),null);
+  }
   finishBrowserCleanup(error,true);assert.equal(browserCleanupConfirmed(error),true);
  }
 });

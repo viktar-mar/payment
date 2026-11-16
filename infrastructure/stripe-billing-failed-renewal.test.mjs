@@ -33,6 +33,41 @@ const owner=h=>owners.createOwnedBillingFailedRenewal(opts(),h.dependencies);
 const persistCodes=['PERSIST_ADMISSION','PERSIST_OWNERSHIP','PERSIST_INPUT','PERSIST_UNCHANGED','PERSIST_FINAL_STORE','PERSIST_ACK'];
 const terminalLine=(checkpoint='PERSIST_FINAL_STORE',cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=LISTENER checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
 const browserLine=(checkpoint='BROWSER_CARD_NUMBER',cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=BROWSER checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
+for(const checkpoint of ['BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_COM'])test('failed-renewal refused-origin terminal roundtrip '+checkpoint,async()=>{
+ for(const close of [true,false]){
+  const h=harness(),error=browserFailure(checkpoint),dispatches=[];let leaked;
+  h.fixture.beforeDispatch=async kind=>{dispatches.push(kind);return true;};
+  h.journey.initial=async(p,l)=>{leaked=p;await p.prepare({token:'inert',origin:scope().endpoints.demo},'sdk-create',l);throw error;};
+  h.journey.close=async()=>{h.calls.push('browser-close');finishBrowserCleanup(error,close);return close;};
+  const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));const result=await o.close();
+  assert.equal(result.status,'CLOSED');assert.equal(result.phase,'BROWSER');assert.equal(result.code,'BROWSER');assert.equal(result.diagnostic,checkpoint);
+  assert.equal(result.cleanupConfirmed,close);assert.equal(result.cleanupFailure,close?null:'BROWSER_CLOSE');
+  assert.equal(result.initialAccepted,false);assert.equal(result.failedRenewalAccepted,false);assert.equal(result.full5bAccepted,false);
+  const line=browserLine(checkpoint,close?'CONFIRMED':'UNCONFIRMED',close?'NONE':'BROWSER_CLOSE');
+  assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+  assert.equal(owners.formatBillingFailedRenewalDiagnostic({...result,status:'RUNNING'}),null);
+  assert.equal(owners.formatBillingFailedRenewalDiagnostic({...result,cleanupConfirmed:!close}),null);
+  for(const raw of [line+' https://m.stripe.com/private',line+'\n',line.replace(checkpoint,checkpoint+'_PRIVATE')])assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(raw),null);
+  await assert.rejects(leaked.confirm(confirmRequest(),limits()));assert.deepEqual(dispatches,['create']);
+  assert.equal(h.calls.includes('observe'),false);assert.equal(h.calls.includes('arm-dispatch'),false);assert.equal(h.calls.includes('manual-confirm'),false);
+  assert.equal(h.calls.some(call=>methods.includes(call)),false);
+ }
+});
+for(const checkpoint of ['BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_COM'])test('failed-renewal refuses forged origin terminal '+checkpoint,async()=>{
+ for(const foreign of [checkpoint,{diagnostic:checkpoint,cleanupConfirmed:true},new Error(checkpoint+' https://m.stripe.com/private')]){
+  const h=harness(),dispatches=[];
+  h.fixture.beforeDispatch=async kind=>{dispatches.push(kind);return true;};
+  h.journey.initial=async(p,l)=>{await p.prepare({token:'inert',origin:scope().endpoints.demo},'sdk-create',l);throw foreign;};
+  h.journey.close=async()=>{h.calls.push('browser-close');return false;};
+  const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));const result=await o.close();
+  assert.equal(result.status,'CLOSED');assert.equal(result.phase,'BROWSER');assert.equal(result.code,'BROWSER');assert.equal(result.diagnostic,null);
+  assert.equal(result.cleanupConfirmed,false);assert.equal(result.cleanupFailure,'BROWSER_CLOSE');
+  assert.equal(result.initialAccepted,false);assert.equal(result.failedRenewalAccepted,false);assert.equal(result.full5bAccepted,false);
+  assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),null);assert.deepEqual(dispatches,['create']);
+  assert.equal(h.calls.includes('observe'),false);assert.equal(h.calls.includes('arm-dispatch'),false);assert.equal(h.calls.includes('manual-confirm'),false);
+  assert.equal(h.calls.some(call=>methods.includes(call)),false);
+ }
+});
 for(const timing of ['rejection','abort-late'])for(const close of [true,false])test('browser terminal retains original held checkpoint '+timing+' close='+close,async()=>{
  const h=harness(),controller=new AbortController(),error=browserFailure('BROWSER_CARD_NUMBER'),dispatches=[];let rejectInitial,leaked;
  h.fixture.beforeDispatch=async kind=>{dispatches.push(kind);return true;};

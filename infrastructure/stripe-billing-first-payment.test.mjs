@@ -111,18 +111,28 @@ for(const renewal of [false,true])for(const code of cleanupCodes)test((renewal?'
  assert.equal(api.parseBillingFirstPaymentDiagnosticLine(line),null);assert.equal(api.parseBillingFirstRenewalDiagnosticLine(line),null);
 });
 const browserCodes=['BROWSER_CONTEXT','BROWSER_PAGE','BROWSER_SETUP','BROWSER_NAVIGATION','BROWSER_CONFIGURE','BROWSER_OTP_REQUEST','BROWSER_OTP_VERIFY','BROWSER_PREPARE','BROWSER_ACTION_BRIDGE','BROWSER_SESSION_BRIDGE','BROWSER_CONFIRM_BRIDGE','BROWSER_WAIT_READY','BROWSER_START_CLICK','BROWSER_READY_PHASE','BROWSER_READY_BUTTON','BROWSER_INITIAL_ACTION','BROWSER_INITIAL_SESSION','BROWSER_INITIAL_MOUNT','BROWSER_METHOD_MOUNT','BROWSER_PROVIDER_ROUTE','BROWSER_ASSET_ROUTE','BROWSER_CARD_NUMBER','BROWSER_CARD_EXPIRY','BROWSER_CARD_CVC','BROWSER_POSTAL_CHECK','BROWSER_POSTAL_FILL','BROWSER_PAY_CLICK','BROWSER_WAIT_OBSERVE','BROWSER_WAIT_OBSERVE_LAST_OBSERVED_SUBMIT','BROWSER_WAIT_OBSERVE_LAST_OBSERVED_TOKEN','BROWSER_CLOSE','BROWSER_CONFIRM_GUARD','BROWSER_CONFIRM_STATE','BROWSER_CONFIRM_SUBMIT_VALIDATION','BROWSER_CONFIRM_SUBMIT','BROWSER_CONFIRM_TOKEN_VALIDATION','BROWSER_CONFIRM_TOKEN','BROWSER_CONFIRM_CLIENT','BROWSER_CONFIRM_NEXT_ACTION','BROWSER_CONFIRM_RETIRED','BROWSER_CONFIRM_RECEIPT'];
-browserCodes.push('BROWSER_PROVIDER_HEADERS','BROWSER_PROVIDER_CURRENT','BROWSER_PROVIDER_REDIRECT','BROWSER_PROVIDER_USERINFO','BROWSER_PROVIDER_AUTH','BROWSER_PROVIDER_ORIGIN_SCHEME','BROWSER_PROVIDER_ORIGIN_PORT','BROWSER_PROVIDER_ORIGIN_STRIPE_COM','BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK','BROWSER_PROVIDER_ORIGIN_OTHER','BROWSER_PROVIDER_NAVIGATION','BROWSER_PROVIDER_FALLBACK');
+browserCodes.push('BROWSER_PROVIDER_HEADERS','BROWSER_PROVIDER_CURRENT','BROWSER_PROVIDER_REDIRECT','BROWSER_PROVIDER_USERINFO','BROWSER_PROVIDER_AUTH','BROWSER_PROVIDER_ORIGIN_SCHEME','BROWSER_PROVIDER_ORIGIN_PORT','BROWSER_PROVIDER_ORIGIN_STRIPE_COM','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK','BROWSER_PROVIDER_ORIGIN_OTHER','BROWSER_PROVIDER_NAVIGATION','BROWSER_PROVIDER_FALLBACK');
 for(const code of browserCodes)test('owner captures trusted '+code+' only at BROWSER after acknowledged CREATE',async()=>{
  const h=harness(),owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies),error=browserMeta.browserFailure(code);browserMeta.finishBrowserCleanup(error,true);
  await assert.rejects(owner.run(async p=>{await p.prepare({token:'customer-token',origin:scope().endpoints.demo},'original-create',limits());throw error;},limits()));
  const result=await owner.close();assert.equal(result.code,'BROWSER');assert.equal(result.diagnostic,code);assert.equal(result.cleanupConfirmed,true);assert.equal(result.initialAccepted,false);
- assert.equal(api.formatBillingFirstPaymentDiagnostic(result),'owned_initial_payment_diagnostic code='+code+' cleanup=CONFIRMED');
+ const line='owned_initial_payment_diagnostic code='+code+' cleanup=CONFIRMED';
+ assert.equal(api.formatBillingFirstPaymentDiagnostic(result),line);assert.equal(api.parseBillingFirstPaymentDiagnosticLine(line),line);
  assert.equal(h.calls.filter(c=>c==='create-ack').length,1);assert.ok(!h.calls.some(c=>c.startsWith('confirm-dispatch:')||c==='observe'));assert.equal(h.calls.filter(c=>c==='stop').length,1);
  assert.equal(runtimeApi.isBillingFirstPaymentDiagnostic(code),false);
 });
 test('foreign BROWSER rejection never supplies diagnostic or trustworthy close knowledge',async()=>{
  let reads=0;const foreign=new Proxy({diagnostic:'BROWSER_PAGE',cleanupConfirmed:true},{get(){reads++;throw null;},getPrototypeOf(){reads++;throw null;},ownKeys(){reads++;throw null;}});
  const h=harness(),owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);await assert.rejects(owner.run(async()=>{throw foreign;},limits()));const r=await owner.close();assert.equal(r.diagnostic,null);assert.equal(r.cleanupConfirmed,false);assert.equal(reads,0);
+});
+for(const code of ['BROWSER_PROVIDER_ORIGIN_STRIPE_COM','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'])test('owner refuses forged or raw refused-origin provenance '+code,async()=>{
+ for(const foreign of [code,{diagnostic:code,cleanupConfirmed:true},new Error(code+' https://m.stripe.com/private')]){
+  const h=harness(),owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);
+  await assert.rejects(owner.run(async p=>{await p.prepare({token:'customer-token',origin:scope().endpoints.demo},'original-create',limits());throw foreign;},limits()));
+  const result=await owner.close();assert.equal(result.code,'BROWSER');assert.equal(result.diagnostic,null);assert.equal(result.cleanupConfirmed,false);assert.equal(result.initialAccepted,false);
+  assert.equal(api.formatBillingFirstPaymentDiagnostic(result),null);assert.equal(h.calls.filter(c=>c==='create-ack').length,1);
+  assert.ok(!h.calls.some(c=>c.startsWith('confirm-dispatch:')||c==='observe'));assert.equal(h.calls.filter(c=>c==='stop').length,1);
+ }
 });
 for(const boundary of ['prepare','confirm'])test('trusted browser metadata grants no diagnostic outside BROWSER at '+boundary,async()=>{
  const h=harness(),error=browserMeta.browserFailure('BROWSER_CARD_NUMBER');browserMeta.finishBrowserCleanup(error,true);h.runtime[boundary]=async()=>{throw error;};const owner=await api.createOwnedBillingFirstPayment(options(),h.dependencies);
