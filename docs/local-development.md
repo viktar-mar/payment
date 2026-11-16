@@ -295,6 +295,15 @@ The fixture and real `.env` files are intentionally ignored by Git. Do not force
 
 ### Secret-free CI coverage
 
+Hosted Maven consumers cache `~/.m2/wrapper/dists` separately from the dependency
+repository cached by `setup-java`. The exact cache key includes runner OS/architecture,
+the POSIX wrapper and its properties; no partial-key restore or cache-based test
+skipping is used. A cold or evicted cache still requires Maven Central to be available.
+Distribution fetching retains three attempts with finite transport timeouts. A failed
+fetch reports the downloader exit code and the final validated HTTP status, or
+`UNKNOWN` when unavailable. Raw downloader responses and headers are suppressed;
+archive validation/extraction and Maven execution are never retried by this loop.
+
 [Offline CI](../.github/workflows/ci.yml) runs on pushes, pull requests and manual dispatch with
 Node 24, JDK 25, pnpm 11.1.3 and Docker. Its three bounded jobs run default Maven verification
 (including synthetic Stripe adapter/Cucumber fixtures), SDK and Admin tests/typechecks/builds,

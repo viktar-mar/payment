@@ -81,8 +81,28 @@ test('CI admits untrusted PRs with read-only credentials and bounded cancellable
     assert.match(block, /working-directory: \./);
     assert.match(block, /uses: actions\/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd\b/);
     assert.match(block, /uses: actions\/setup-node@a0853c24544627f65ddf259abe73b1d18a591444\b/);
-    for (const action of block.matchAll(/uses: (\S+)/g)) assert.match(action[1], /^(?:actions\/(?:checkout|setup-node|setup-java)|pnpm\/action-setup)@[a-f0-9]{40}$/);
+    for (const action of block.matchAll(/uses: (\S+)/g)) assert.match(action[1], /^(?:actions\/(?:checkout|setup-node|setup-java|cache)|pnpm\/action-setup)@[a-f0-9]{40}$/);
   }
+});
+
+test('every hosted Maven consumer restores only an exact wrapper distribution cache before execution', async () => {
+  const workflows = [
+    jobs(await readWorkflow()),
+    jobs(await readFile(new URL('../.github/workflows/owned-first-renewal-tests.yml', import.meta.url), 'utf8')),
+  ];
+  let consumers = 0;
+  for (const blocks of workflows) for (const [job, block] of Object.entries(blocks)) {
+    if (!block.includes('./mvnw')) continue;
+    consumers++;
+    const cache = block.split(/(?=^      - )/m).filter(step => step.includes('uses: actions/cache@'));
+    assert.equal(cache.length, 1, `${job}: exactly one wrapper cache`);
+    assert.match(cache[0], /uses: actions\/cache@5a3ec84eff668545956fd18022155c47e93e2684\b/);
+    assert.match(cache[0], /path: ~\/\.m2\/wrapper\/dists\n/);
+    assert.match(cache[0], /key: maven-wrapper-v1-\$\{\{ runner.os \}\}-\$\{\{ runner.arch \}\}-\$\{\{ hashFiles\('backend\/mvnw', 'backend\/\.mvn\/wrapper\/maven-wrapper.properties'\) \}\}/);
+    assert.doesNotMatch(cache[0], /restore-keys:|lookup-only:|save-always:|cache-hit|repository|settings.xml/);
+    assert.ok(block.indexOf(cache[0]) < block.indexOf('./mvnw'), `${job}: restore precedes Maven`);
+  }
+  assert.equal(consumers, 4);
 });
 
 // The emitted Maven invocations are our coverage boundary. Removing either

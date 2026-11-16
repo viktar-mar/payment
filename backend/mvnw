@@ -182,7 +182,7 @@ if ! command -v unzip >/dev/null; then
 fi
 
 # verbose opt
-__MVNW_QUIET_WGET=--quiet __MVNW_QUIET_CURL=--silent __MVNW_QUIET_UNZIP=-q __MVNW_QUIET_TAR=''
+__MVNW_QUIET_WGET=--no-verbose __MVNW_QUIET_CURL=--silent __MVNW_QUIET_UNZIP=-q __MVNW_QUIET_TAR=''
 [ "${MVNW_VERBOSE-}" != true ] || __MVNW_QUIET_WGET='' __MVNW_QUIET_CURL='' __MVNW_QUIET_UNZIP='' __MVNW_QUIET_TAR=v
 
 # normalize http auth
@@ -197,12 +197,26 @@ download_distribution() {
   download_attempt=1
   while :; do
     rm -f -- "$TMP_DOWNLOAD_DIR/$distributionUrlName"
-    if "$@" 2>"$TMP_DOWNLOAD_DIR/download.stderr"; then
+    if "$@" >"$TMP_DOWNLOAD_DIR/download.stdout" 2>"$TMP_DOWNLOAD_DIR/download.stderr"; then
       return 0
     else
       download_status=$?
     fi
-    printf '%s: download attempt %s failed (exit %s)\n' "$download_tool" "$download_attempt" "$download_status" >&2
+    # Emit only a validated HTTP code, never downloader text, URLs or headers.
+    download_http=UNKNOWN
+    if [ "$download_tool" = curl ]; then
+      IFS= read -r download_code <"$TMP_DOWNLOAD_DIR/download.stdout" || :
+      case "$download_code" in [1-5][0-9][0-9]) download_http="$download_code" ;; esac
+    else
+      while read -r download_protocol download_code download_rest; do
+        case "$download_protocol" in
+        HTTP/1.0 | HTTP/1.1 | HTTP/2 | HTTP/3)
+          case "$download_code" in [1-5][0-9][0-9]) download_http="$download_code" ;; esac
+          ;;
+        esac
+      done <"$TMP_DOWNLOAD_DIR/download.stderr"
+    fi
+    printf '%s: download attempt %s failed (exit %s, HTTP %s)\n' "$download_tool" "$download_attempt" "$download_status" "$download_http" >&2
     [ "$download_attempt" -lt 3 ] || die "$download_tool: distribution download failed after 3 attempts"
     sleep "$((download_attempt * 2))"
     download_attempt=$((download_attempt + 1))
@@ -211,10 +225,10 @@ download_distribution() {
 
 if [ -z "${MVNW_USERNAME-}" ] && command -v wget >/dev/null; then
   verbose "Found wget ... using wget"
-  download_distribution wget ${__MVNW_QUIET_WGET:+"$__MVNW_QUIET_WGET"} --tries=1 --timeout=30 "$distributionUrl" -O "$TMP_DOWNLOAD_DIR/$distributionUrlName"
+  download_distribution wget ${__MVNW_QUIET_WGET:+"$__MVNW_QUIET_WGET"} --server-response --tries=1 --timeout=30 "$distributionUrl" -O "$TMP_DOWNLOAD_DIR/$distributionUrlName"
 elif [ -z "${MVNW_USERNAME-}" ] && command -v curl >/dev/null; then
   verbose "Found curl ... using curl"
-  download_distribution curl ${__MVNW_QUIET_CURL:+"$__MVNW_QUIET_CURL"} --retry 0 --connect-timeout 10 --max-time 60 -f -L -o "$TMP_DOWNLOAD_DIR/$distributionUrlName" "$distributionUrl"
+  download_distribution curl ${__MVNW_QUIET_CURL:+"$__MVNW_QUIET_CURL"} --retry 0 --connect-timeout 10 --max-time 60 --write-out '%{http_code}\n' -f -L -o "$TMP_DOWNLOAD_DIR/$distributionUrlName" "$distributionUrl"
 elif set_java_home; then
   verbose "Falling back to use Java to download"
   javaSource="$TMP_DOWNLOAD_DIR/Downloader.java"

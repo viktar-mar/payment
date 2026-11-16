@@ -29,7 +29,11 @@ case 'wget': case 'curl': {
   const attempt = events().filter(e => e.name === name).length + 1;
   log({args, prior, attempt}); fs.writeFileSync(output, attempt <= config.failures ? 'partial-secret' : 'archive');
   process.stderr.write('RAW_SECRET credential=https://user:password@example.invalid\\n');
-  process.exit(attempt <= config.failures ? 23 : 0); break;
+  if (name === 'wget' && args.includes('--server-response')) {
+    process.stderr.write(config.headers ?? '  HTTP/1.1 302 Found\\n  Location: https://user:password@example.invalid\\n  HTTP/1.1 503 Service Unavailable\\n');
+  }
+  if (name === 'curl' && args.includes('--write-out')) process.stdout.write(config.httpCode ?? '503\\n');
+  process.exit(attempt <= config.failures ? (config.downloadExit ?? 23) : 0); break;
 }
 case 'unzip': {
   log({args}); if (config.extractionFailure) process.exit(9);
@@ -89,6 +93,32 @@ for (const tool of ['wget', 'curl']) {
         }
         assert.equal(r.events.filter(e => e.name === 'unzip').length, failures === 3 ? 0 : 1);
         assert.equal(r.events.filter(e => e.name === 'mvn').length, failures === 3 ? 0 : 1);
+      } finally { f.cleanup(); }
+    });
+  }
+}
+
+for (const tool of ['wget', 'curl']) {
+  test(`${tool}: HTTP rejection reports final status without response text or secrets`, () => {
+    const f = setup({tool, failures: 3, downloadExit: tool === 'wget' ? 8 : 22});
+    try {
+      const r = f.run();
+      assert.equal(r.status, 1);
+      assert.equal(r.fetches.length, 3);
+      assert.equal(r.events.filter(e => e.name === 'unzip' || e.name === 'mvn').length, 0);
+      assert.match(r.stderr, /HTTP 503/);
+      assert.doesNotMatch(r.stdout + r.stderr, /RAW_SECRET|password|Service Unavailable|Location|302/);
+    } finally { f.cleanup(); }
+  });
+
+  for (const invalid of ['', '000\n', '503secret\n']) {
+    test(`${tool}: absent or invalid HTTP status is UNKNOWN (${JSON.stringify(invalid)})`, () => {
+      const f = setup({tool, failures: 3, headers: invalid, httpCode: invalid});
+      try {
+        const r = f.run();
+        assert.equal(r.status, 1);
+        assert.match(r.stderr, /HTTP UNKNOWN/);
+        assert.doesNotMatch(r.stdout + r.stderr, /RAW_SECRET|password|503secret/);
       } finally { f.cleanup(); }
     });
   }
