@@ -342,9 +342,8 @@ const providerCases:readonly [string,ProviderProbe,string,string?][]=[
  ['opaque scheme',{target:'data:text/plain,fixture'},'BROWSER_PROVIDER_ORIGIN_SCHEME'],
  ['port',{target:'https://js.stripe.com:444/'},'BROWSER_PROVIDER_ORIGIN_PORT'],
  ['stripe m exact',{target:'https://m.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M'],
- ['stripe r exact',{target:'https://r.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R'],
+ // Exact r and normalized/default443 rejection cases moved to the permitted matrix below.
  ['stripe m normalized case and default port',{target:'https://M.STRIPE.COM:443/arbitrary/path?fixture=yes#part'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M'],
- ['stripe r normalized case and default port',{target:'https://R.STRIPE.COM:443/arbitrary/path?fixture=yes#part'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R'],
  ['stripe m child',{target:'https://child.m.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','https://child.m.stripe.com'],
  ['stripe r child',{target:'https://child.r.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','https://child.r.stripe.com'],
  ['stripe apex',{target:'https://stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','https://stripe.com'],
@@ -360,7 +359,7 @@ const providerCases:readonly [string,ProviderProbe,string,string?][]=[
  ['stripe m owned auth before origin',{target:'http://m.stripe.com:444/',headers:{authorization:'Bearer '+token}},'BROWSER_PROVIDER_AUTH'],
  ['stripe r foreign auth before origin',{target:'http://r.stripe.com:444/',headers:{authorization:'Bearer provider'}},'BROWSER_PROVIDER_AUTH'],
  ['stripe m origin before navigation',{target:'https://m.stripe.com/',navigation:'main'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M'],
- ['stripe r origin before navigation lookup',{target:'https://r.stripe.com/',navigation:'throw'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R'],
+ ['stripe r navigation lookup',{target:'https://r.stripe.com/',navigation:'throw'},'BROWSER_PROVIDER_NAVIGATION'],
  // URL parsing precedes provider classification and retains the active readiness checkpoint.
  ['malformed URL before provider classification',{target:'https://m.stripe.com:invalid/'},'BROWSER_READY_PHASE'],
  ['network apex',{target:'https://stripe.network/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
@@ -443,6 +442,14 @@ test('merchant provider boundary '+phase+' '+name,async()=>{
  const probe={...input,phase};
  await consumeProviderBoundary(await fixture('',[probe]),probe,checkpoint,expectedOrigin);
 });
+// Apply the same route-level refusals to r in both separately attended phases.
+// This also preserves the credential boundary: network admission grants no auth exception.
+for(const phase of ['initial','method'] as const)for(const [name,input,checkpoint,expectedOrigin] of merchantProviderCases)
+test('r provider boundary '+phase+' '+name,async()=>{
+ const probe={...input,target:input.target.replace(/merchant-ui-api/gi,match=>match==='MERCHANT-UI-API'?'R':'r'),phase};
+ const origin=expectedOrigin?.replace('merchant-ui-api','r');
+ await consumeProviderBoundary(await fixture('',[probe]),probe,checkpoint,origin);
+});
 test('actual OTHER route keeps canonical private origin and original identity through replay and cleanup',async()=>{
  const probe={target:'https://OTHER.STRIPE.COM:443/artificial_sensitive_path?artificial_secret_query=value#artificial_secret_fragment'};
  const h=await fixture('',[probe]);let first:unknown;
@@ -487,7 +494,7 @@ test('provider permitted matrix preserves one-use journey and fallback',async()=
   await h.journey.close(nowLimits());assert.equal(h.closed(),1);
  }finally{await h.restore();}
 });
-test('merchant provider permitted matrix preserves both attended one-use phases and fallback',async()=>{
+for(const host of ['merchant-ui-api','r'])test(host+' provider permitted matrix preserves both attended one-use phases and fallback',async()=>{
  const probes:ProviderProbe[]=[
   {target:'https://merchant-ui-api.stripe.com/',method:'GET'},
   {target:'https://merchant-ui-api.stripe.com/',method:'POST'},
@@ -496,7 +503,8 @@ test('merchant provider permitted matrix preserves both attended one-use phases 
   {target:'https://merchant-ui-api.stripe.com/',method:'GET',navigation:'child'},
   {target:'https://merchant-ui-api.stripe.com/',method:'POST',navigation:'child'},
  ];
- const h=await fixture('',probes);let phase:'initial'|'method'='initial',attendedChecks=0;
+ const admitted=probes.map(probe=>({...probe,target:probe.target.replace(/merchant-ui-api/gi,match=>match==='MERCHANT-UI-API'?host.toUpperCase():host)}));
+ const h=await fixture('',admitted);let phase:'initial'|'method'='initial',attendedChecks=0;
  h.setStageHook(async()=>{
   assert.equal(h.counts.filter(v=>v==='confirm').length,phase==='initial'?0:1);
   assert.equal(h.counts.includes('permit'),false);assert.equal(h.counts.includes('confirmSetup'),false);

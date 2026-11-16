@@ -37,7 +37,7 @@ function providerOrigin(url:URL) {
 }
 function providerNetworkOrigin(url:URL):boolean {
   return url.protocol==='https:' && !url.port && !url.username && !url.password &&
-    (url.hostname==='merchant-ui-api.stripe.com' || providerOrigin(url));
+    (url.hostname==='merchant-ui-api.stripe.com' || url.hostname==='r.stripe.com' || providerOrigin(url));
 }
 
 /** A single owned page. Neither phase accepts a target from the page or chooses a provider operation. */
