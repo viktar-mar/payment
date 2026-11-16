@@ -8,6 +8,7 @@ import type {BillingFirstPaymentPort} from '../../../../infrastructure/stripe-bi
 // @ts-ignore Node's source-only offline test runner requires the explicit extension.
 import FailedRenewalReporter from './stripe-billing-failed-renewal-reporter.ts';
 import {browserDiagnostic,browserCleanupConfirmed} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
+import * as privateOrigin from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 import {createOwnedBillingFailedRenewal,formatBillingFailedRenewalDiagnostic} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 
 // The two source modules have only type imports from Playwright and the SDK.
@@ -300,7 +301,7 @@ async function fixture(change = '',provider?:ProviderProbe[]) {
   const context={on:()=>{},newPage:async()=>{counts.push('page');return page;},exposeBinding:async(n:string,f:Function)=>{bindings.set(n,f);w[n]=(...args:unknown[])=>{if(n==='__failedRenewalTerminal')terminals.push(args);return f({page,frame},...args);};},
     route:async(_pattern:string,f:Function)=>{routeHandler=f;},routeWebSocket:async()=>{},close:async()=>{closed++;callbacks.get('close')?.();w.__failedRenewalStop?.();}};
   const journey=runFailedRenewalBrowser({newContext:async()=>{counts.push('context');return context;}},runAbort);
-  const initialPort={resources:()=>({runId:id(1),accountId:id(2),siteId:id(3),priceId:id(5),siteKey:'fixture',email:'fixture@example.test',endpoints:{demo,backend}}),
+  const initialPort={resources:()=>({runId:id(1),expectedSource:'a'.repeat(40),accountId:id(2),siteId:id(3),priceId:id(5),siteKey:'fixture',email:'fixture@example.test',endpoints:{demo,backend}}),
     withOtpCode:async(f:Function)=>f(otp),acknowledgeCustomer:async(v:any)=>{
       assert.deepEqual(v,{customerId:id(4),siteId:id(3)});
       if(change==='async_ack_page_loss'){markPreparationPending();await preparationHold;}
@@ -323,12 +324,12 @@ async function fixture(change = '',provider?:ProviderProbe[]) {
       await Promise.resolve().then(()=>f(src,...args)).catch(()=>{});
     }
   };
-  return {request,counts,replies,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,ioPending,releaseIO,notifyIO:markIO,providerFallbacks:()=>providerFallbacks,
+  return {request,probeProvider,counts,replies,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,ioPending,releaseIO,notifyIO:markIO,providerFallbacks:()=>providerFallbacks,
     setStageHook:(hook:typeof stageHook)=>{stageHook=hook;},terminal:async(marker:unknown)=>bindings.get('__failedRenewalTerminal')!({page,frame},'STOPPED',marker),closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
     restore:async()=>{try{runAbort.abort();await journey.close(nowLimits());}finally{w.__failedRenewalStop?.();restore();}}};
 }
 
-const providerCases:readonly [string,ProviderProbe,string][]=[
+const providerCases:readonly [string,ProviderProbe,string,string?][]=[
  ['header getter',{target:'https://js.stripe.com/',headerFailure:'getter'},'BROWSER_PROVIDER_HEADERS'],
  ['header rejection',{target:'https://js.stripe.com/',headerFailure:'reject'},'BROWSER_PROVIDER_HEADERS'],
  ['current',{target:'https://js.stripe.com/',hold:true},'BROWSER_PROVIDER_CURRENT'],
@@ -344,10 +345,10 @@ const providerCases:readonly [string,ProviderProbe,string][]=[
  ['stripe r exact',{target:'https://r.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R'],
  ['stripe m normalized case and default port',{target:'https://M.STRIPE.COM:443/arbitrary/path?fixture=yes#part'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M'],
  ['stripe r normalized case and default port',{target:'https://R.STRIPE.COM:443/arbitrary/path?fixture=yes#part'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R'],
- ['stripe m child',{target:'https://child.m.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'],
- ['stripe r child',{target:'https://child.r.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'],
- ['stripe apex',{target:'https://stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'],
- ['stripe subdomain',{target:'https://other.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'],
+ ['stripe m child',{target:'https://child.m.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','https://child.m.stripe.com'],
+ ['stripe r child',{target:'https://child.r.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','https://child.r.stripe.com'],
+ ['stripe apex',{target:'https://stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','https://stripe.com'],
+ ['stripe subdomain',{target:'https://other.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','https://other.stripe.com'],
  ['stripe m scheme before port and host',{target:'http://m.stripe.com:444/'},'BROWSER_PROVIDER_ORIGIN_SCHEME'],
  ['stripe r scheme before port and host',{target:'http://r.stripe.com:444/'},'BROWSER_PROVIDER_ORIGIN_SCHEME'],
  ['stripe m nondefault port before host',{target:'https://m.stripe.com:444/'},'BROWSER_PROVIDER_ORIGIN_PORT'],
@@ -388,7 +389,7 @@ async function waitProviderHeader(ioPending:Promise<void>,settled:ReturnType<typ
  if(result.kind==='rejected')throw result.error;
  if(result.kind==='resolved')assert.fail('provider header hold not reached');
 }
-async function consumeProviderBoundary(h:Awaited<ReturnType<typeof fixture>>,probe:ProviderProbe,checkpoint:string){
+async function consumeProviderBoundary(h:Awaited<ReturnType<typeof fixture>>,probe:ProviderProbe,checkpoint:string,expectedOrigin?:string){
  const limits=nowLimits();let work:Promise<unknown>|undefined,first:unknown;
  try{
   work=h.journey.initial(h.initialPort,limits);
@@ -396,6 +397,10 @@ async function consumeProviderBoundary(h:Awaited<ReturnType<typeof fixture>>,pro
   if(probe.hold){await waitProviderHeader(h.ioPending,settled);limits.deadline=0;h.releaseIO();}
   await assert.rejects(work!,(error:unknown)=>{first=error;return true;});
   assert.equal(browserDiagnostic(first),checkpoint);
+  assert.equal(typeof privateOrigin.browserProviderOrigin,'function');
+  const saved=privateOrigin.browserProviderOrigin(first);
+  assert.deepEqual(saved,expectedOrigin?{runId:id(1),expectedSource:'a'.repeat(40),origin:expectedOrigin}:null);
+  if(expectedOrigin)assert.equal(Object.isFrozen(saved),true);
   assert.doesNotMatch(String(first),/secret_fixture|canary|Bearer|stripe|elsewhere|user|pass/);
   assert.equal(h.providerFallbacks(),probe.fallbackFailure?1:0);
   assert.equal(h.counts.includes('confirm'),false);assert.equal(h.counts.includes('permit'),false);
@@ -403,10 +408,43 @@ async function consumeProviderBoundary(h:Awaited<ReturnType<typeof fixture>>,pro
   await assert.rejects(h.journey.method(h.methodPort,nowLimits()),e=>e===first);
   assert.equal(await h.journey.close(nowLimits()),true);assert.equal(h.closed(),1);
   assert.equal(browserCleanupConfirmed(first),true);assert.equal(browserDiagnostic(first),checkpoint);
+  assert.equal(JSON.stringify(first),'{}');assert.deepEqual(Object.keys(first as object),[]);
  }finally{h.releaseIO();await work?.catch(()=>{});await h.restore();}
 }
-for(const [name,probe,checkpoint] of providerCases)test('provider boundary '+name,async()=>{
- await consumeProviderBoundary(await fixture('',[probe]),probe,checkpoint);
+for(const [name,probe,checkpoint,expectedOrigin] of providerCases)test('provider boundary '+name,async()=>{
+ await consumeProviderBoundary(await fixture('',[probe]),probe,checkpoint,expectedOrigin);
+});
+test('actual OTHER route keeps canonical private origin and original identity through replay and cleanup',async()=>{
+ const probe={target:'https://OTHER.STRIPE.COM:443/artificial_sensitive_path?artificial_secret_query=value#artificial_secret_fragment'};
+ const h=await fixture('',[probe]);let first:unknown;
+ try{
+  await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>{first=error;return true;});
+  assert.equal(typeof privateOrigin.browserProviderOrigin,'function');
+  const expected={runId:id(1),expectedSource:'a'.repeat(40),origin:'https://other.stripe.com'};
+  assert.deepEqual(privateOrigin.browserProviderOrigin(first),expected);
+  await assert.rejects(h.probeProvider({target:'https://second.stripe.com/second_secret?secret=yes#secret'}));
+  assert.deepEqual(privateOrigin.browserProviderOrigin(first),expected);
+  assert.equal(browserDiagnostic(first),'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');
+  assert.equal(h.providerFallbacks(),0);assert.equal(h.counts.includes('confirm'),false);assert.equal(h.counts.includes('permit'),false);
+  await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>error===first);
+  await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>error===first);
+  assert.equal(await h.journey.close(nowLimits()),true);assert.equal(h.closed(),1);assert.equal(browserCleanupConfirmed(first),true);
+  assert.deepEqual(privateOrigin.browserProviderOrigin(first),expected);
+  assert.equal(JSON.stringify(first),'{}');assert.deepEqual(Object.keys(first as object),[]);
+  assert.doesNotMatch(String(first)+JSON.stringify(h.terminals)+h.status(),/stripe\.com|artificial_sensitive|artificial_secret|second_secret|aaaaaaaa/);
+ }finally{h.releaseIO();await h.restore();}
+});
+for(const change of ['page_action','action_early_header'])test('earlier page or bridge refusal cannot acquire a later OTHER witness '+change,async()=>{
+ const h=await fixture(change);let first:unknown;
+ try{
+  await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>{first=error;return true;});
+  await assert.rejects(h.probeProvider({target:'https://other.stripe.com/private?secret=fixture#secret'}));
+  assert.equal(typeof privateOrigin.browserProviderOrigin,'function');assert.equal(privateOrigin.browserProviderOrigin(first),null);
+  assert.equal(browserDiagnostic(first),change==='page_action'?'BROWSER_INITIAL_ACTION':'BROWSER_ACTION_BRIDGE');
+  assert.equal(h.providerFallbacks(),0);assert.equal(h.counts.includes('confirm'),false);assert.equal(h.counts.includes('permit'),false);
+  await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>error===first);
+  await h.journey.close(nowLimits());assert.equal(h.closed(),1);assert.equal(browserCleanupConfirmed(first),true);
+ }finally{h.releaseIO();await h.restore();}
 });
 test('provider permitted matrix preserves one-use journey and fallback',async()=>{
  const probes:ProviderProbe[]=['api.stripe.com','hooks.stripe.com','js.stripe.com','child.js.stripe.com'].map(host=>({target:'https://'+host+':443/arbitrary/path?fixture=yes#part',headers:{authorization:'Bearer provider'},method:'PATCH'}));
@@ -428,6 +466,7 @@ async function consumeProviderPageFault(h:Awaited<ReturnType<typeof fixture>>){
   await waitProviderHeader(h.ioPending,settled);h.lose('pagehide');assert.equal(h.runAbort.signal.aborted,true);
   h.releaseIO();await assert.rejects(work!,(error:unknown)=>{first=error;return true;});
   assert.equal(browserDiagnostic(first),'BROWSER_INITIAL_ACTION');assert.equal(h.providerFallbacks(),0);
+  assert.equal(typeof privateOrigin.browserProviderOrigin,'function');assert.equal(privateOrigin.browserProviderOrigin(first),null);
   assert.equal(h.counts.includes('confirm'),false);assert.equal(h.counts.includes('permit'),false);
   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),e=>e===first);
   await assert.rejects(h.journey.method(h.methodPort,nowLimits()),e=>e===first);
@@ -436,6 +475,9 @@ async function consumeProviderPageFault(h:Awaited<ReturnType<typeof fixture>>){
 }
 test('earlier page fault wins pending provider currentness failure',async()=>{
  await consumeProviderPageFault(await fixture('',[{target:'https://js.stripe.com/',hold:true}]));
+});
+test('earlier page fault wins pending refused OTHER origin without late capture',async()=>{
+ await consumeProviderPageFault(await fixture('',[{target:'https://other.stripe.com/private?secret=fixture#secret',hold:true}]));
 });
 for(const consumer of ['boundary','page fault'] as const)for(const outcome of ['reject','resolve'] as const)test('held provider '+consumer+' restores globals after early '+outcome,async()=>{
  const names=['window','document','location','HTMLButtonElement','fetch'];

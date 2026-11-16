@@ -2,7 +2,7 @@ import type {Browser,BrowserContext,Page,Route} from '@playwright/test';
 import type {BillingBinding,BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {BillingFailedRenewalJourney,BillingFailedRenewalMethodPort,BillingFirstPaymentPort,FailedMethodSession,FirstPaymentPrepared} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
-import {browserFailure,browserDiagnostic,finishBrowserCleanup} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
+import {browserFailure,browserDiagnostic,finishBrowserCleanup,rememberBrowserProviderOrigin} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 // @ts-ignore Explicit source for dependency-free Node TS runner.
 import {createFirstPaymentBridge} from './stripe-billing-first-payment.ts';
 // @ts-ignore Explicit source for dependency-free Node TS runner.
@@ -143,6 +143,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   }
   async function routeRequest(route:Route) {
     let routeCheckpoint=checkpoint;
+    let refusedOrigin:string|undefined;
     try {
       current();
       const request=route.request(),url=new URL(request.url());
@@ -175,6 +176,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
                 url.hostname==='m.stripe.com'?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M':
                 url.hostname==='r.stripe.com'?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R':'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER':
               url.hostname==='stripe.network'||url.hostname.endsWith('.stripe.network')?'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK':'BROWSER_PROVIDER_ORIGIN_OTHER';
+            if(routeCheckpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER')refusedOrigin=url.origin;
             need(false);
           }
           routeCheckpoint='BROWSER_PROVIDER_NAVIGATION';
@@ -256,7 +258,8 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       if(previous==='CONFIRM')finalDelivery=delivery;
       await delivery;
     }catch{
-      latch(routeCheckpoint);
+      const original=!firstFailure,error=latch(routeCheckpoint);
+      if(original && refusedOrigin)rememberBrowserProviderOrigin(error,binding.runId,binding.expectedSource,refusedOrigin);
       lost();await route.abort('failed').catch(()=>{});
     }
   }
