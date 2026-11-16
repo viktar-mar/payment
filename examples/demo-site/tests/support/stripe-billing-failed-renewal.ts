@@ -48,6 +48,8 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   let method:Awaited<ReturnType<BillingFailedRenewalMethodPort['prepareMethod']>>|undefined, selected:FailedMethodSession|undefined;
   let token='',sessionExpiry=Infinity,challenge='',code='';
   let step:'CHALLENGE'|'CHALLENGE_ID'|'VERIFY'|'PREPARE'|'ACTION'|'SESSION'|'CONFIRM'|'BUSY'|'ACK'='CHALLENGE';
+  let readiness:'INITIAL'|'METHOD'|undefined;
+  let inFlight:{phase:'INITIAL'|'METHOD';step:'ACTION'|'SESSION'}|undefined;
   let navigation=0,manualArmed=false,expires:ReturnType<typeof setTimeout>|undefined;
   const lifetime=new AbortController(),pending=new Set<Promise<unknown>>();
   const usedKeys=new Set<string>();
@@ -68,6 +70,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   };
   function stop() {
     state='CLOSED';lifetime.abort();clearTimeout(expires);
+    readiness=undefined;inFlight=undefined;
     whole?.signal?.removeEventListener('abort',stop);
     token='';code='';challenge='';initial=undefined;initialBridge=undefined;method=undefined;selected=undefined;initialPort=undefined;methodPort=undefined;
     usedKeys.clear();
@@ -103,6 +106,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   async function awaitOperator(which:'initial'|'method') {
     const ready=which==='initial'?'READY':'METHOD_READY', label=which==='initial'?'Pay':'Confirm test method';
     await at('BROWSER_READY_PHASE',()=>waitPhase(ready));
+    readiness=undefined;
     const button=page!.getByRole('button',{name:label,exact:true});
     await at('BROWSER_READY_BUTTON',async()=>need(!(await button.isEnabled())));
     const frame=page!.locator('#provider').frameLocator('iframe[title="Secure payment input frame"]');
@@ -173,6 +177,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       }
       need(request.method()===verb && (verb==='GET'?!request.postData():headers['content-type']==='application/json'));
       const previous=step;
+      if((state==='INITIAL'||state==='METHOD')&&(previous==='ACTION'||previous==='SESSION'))inFlight={phase:state,step:previous};
       step='BUSY';
       if(previous==='CHALLENGE' || previous==='VERIFY'){
         need(!headers.authorization && !headers['idempotency-key']);
@@ -199,6 +204,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
         if(previous==='CONFIRM')body(request.postData(),['capability','confirmation_token']);
         await initialBridge({request:()=>request,fulfill:async options=>{
           assertPage();
+          inFlight=undefined;
           step=previous==='ACTION'?'SESSION':previous==='SESSION'?'CONFIRM':'ACK';
           const delivery=route.fulfill(options);
           if(previous==='CONFIRM')finalDelivery=delivery;
@@ -208,7 +214,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       need(state==='METHOD' && method && methodPort && Date.now()<Date.parse(method.action.expires_at));
       let json:unknown,status=200;
       if(previous==='ACTION') {
-        json=method.action;step='SESSION';
+        json=method.action;inFlight=undefined;step='SESSION';
       }else{
         need(body(request.postData(),['action_token']).action_token===method.action.secret);
         if(previous==='SESSION'){
@@ -217,7 +223,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
           need(s.protocol==='BROWSER_CONFIRM_V1' && s.flow==='SETUP' && s.provider==='stripe' && s.attempt_id===null && s.capability===null &&
             s.action_token===method.action.secret && s.publishable_key.startsWith('pk_test_') && Date.now()<Date.parse(s.expires_at) &&
             Date.parse(s.expires_at)<=Math.min(sessionExpiry,Date.parse(method.action.expires_at)));
-          selected=s;json={protocol:s.protocol,provider:s.provider,flow:s.flow,publishable_key:s.publishable_key,client_secret:s.client_secret,action_token:s.action_token,expires_at:s.expires_at};step='CONFIRM';
+          selected=s;json={protocol:s.protocol,provider:s.provider,flow:s.flow,publishable_key:s.publishable_key,client_secret:s.client_secret,action_token:s.action_token,expires_at:s.expires_at};inFlight=undefined;step='CONFIRM';
         }else{
           need(previous==='CONFIRM' && selected && Date.now()<Date.parse(selected.expires_at));
           const permit=await methodPort.confirmMethod(scoped());
@@ -255,12 +261,15 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       if(state==='CLOSED' || source!==page || frame!==page!.mainFrame() || frame.url()!==binding.endpoints.demo+pagePath ||
           args.length!==2 || args[0]!=='STOPPED')return;
       const marker=args[1];
+      // BUSY is serialized transport, not a page stage. Only its exact original
+      // action/session may report a terminal until delivery advances the step.
+      const active=step==='BUSY'&&inFlight?.phase===state?inFlight.step:step;
       const valid=marker===null ||
-        (state==='INITIAL' && !preparationActive && (
-          (marker==='BROWSER_INITIAL_ACTION' && (step==='ACTION'||step==='SESSION')) ||
-          (marker==='BROWSER_INITIAL_SESSION' && (step==='SESSION'||step==='CONFIRM')) ||
-          (marker==='BROWSER_INITIAL_MOUNT' && step==='CONFIRM'))) ||
-        (state==='METHOD' && marker==='BROWSER_METHOD_MOUNT' && (step==='ACTION'||step==='SESSION'||step==='CONFIRM'));
+        (readiness==='INITIAL' && state==='INITIAL' && !preparationActive && (
+          (marker==='BROWSER_INITIAL_ACTION' && (active==='ACTION'||(step!=='BUSY'&&active==='SESSION'))) ||
+          (marker==='BROWSER_INITIAL_SESSION' && (active==='SESSION'||active==='CONFIRM')) ||
+          (marker==='BROWSER_INITIAL_MOUNT' && active==='CONFIRM'))) ||
+        (readiness==='METHOD' && state==='METHOD' && marker==='BROWSER_METHOD_MOUNT' && (active==='ACTION'||active==='SESSION'||active==='CONFIRM'));
       if(!valid)return;
       if(typeof marker==='string')latch(marker);
       lost();
@@ -288,6 +297,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
         assertPage();need(p.customer_id===v.customerId && p.site_id===binding.siteId && p.account_id===binding.accountId && p.run_id===binding.runId && p.price_id===binding.priceId && uuid(p.subscription_id) && uuid(p.operation_id) && p.session.publishable_key.startsWith('pk_test_'));
         initial=p;initialBridge=createFirstPaymentBridge({binding,prepared:p,token,port:initialPort,limits:scoped(),latchFailure:latch});
         step='ACTION';
+        readiness='INITIAL';
         preparationActive=false;
         checkpoint='BROWSER_READY_PHASE';
         return {subscriptionId:p.subscription_id,operationId:p.operation_id};
@@ -336,7 +346,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
           assertPage();
           need(initial && m.subscriptionId===initial.subscription_id && uuid(m.operationId) && m.operationId!==initial.operation_id &&
             m.action.kind==='PROVIDER_CLIENT' && Date.now()<Date.parse(m.action.expires_at));
-          method=m;step='ACTION';
+          method=m;step='ACTION';readiness='METHOD';
           await at('BROWSER_READY_PHASE',()=>page!.evaluate(o=>(window as any).__failedRenewalMethod(o),{subscriptionId:m.subscriptionId,operationId:m.operationId}));
           await awaitOperator('method');
         })()),300000);

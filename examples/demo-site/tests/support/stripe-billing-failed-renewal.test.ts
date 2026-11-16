@@ -146,6 +146,9 @@ class Control {
   async activate() {assert.equal(this.disabled,false);await this.onclick?.({isTrusted:true});}
 }
 async function fixture(change = '') {
+  let releaseIO!:()=>void,markIO!:()=>void;
+  const heldIO=new Promise<void>(resolve=>{releaseIO=resolve;}),ioPending=new Promise<void>(resolve=>{markIO=resolve;});
+  let stageHook:((where:string)=>Promise<void>)|undefined;
   const runAbort=new AbortController(),docEvents=new Map<string,Function>();
   const asynchronousStart=change.startsWith('async_');
   let startTask:Promise<unknown>|undefined,releasePreparation!:()=>void,markPreparationPending!:()=>void,markReadyWaiting!:()=>void;
@@ -163,7 +166,8 @@ async function fixture(change = '') {
   const body = {dataset:{phase:'NEW'}};
   const doc = {body,visibilityState:'visible',querySelector:(s:string)=>ctrl(s.slice(1)),
     querySelectorAll:()=>[...controls.values()],addEventListener:(n:string,f:Function)=>docEvents.set(n,f)};
-  const w:any = {addEventListener:()=>{}};
+  const windowEvents=new Map<string,Function>();
+  const w:any = {addEventListener:(n:string,f:Function)=>windowEvents.set(n,f)};
   w.top = w;
   const globals = {window:w,document:doc,location:{origin:demo,href:demo+path},HTMLButtonElement:Control,fetch:inertFetch};
   const original = new Map(Object.keys(globals).map(k=>[k,Object.getOwnPropertyDescriptor(globalThis,k)]));
@@ -205,7 +209,12 @@ async function fixture(change = '') {
       if(change==='duplicate_key')contents='{"action_token":"foreign","action_token":'+JSON.stringify(actionSecret)+'}';
     }
     let reply:any,denied=false;
-    const req={url:()=>target,method:()=>method,allHeaders:async()=>headers,frame:()=>requestFrame,postData:()=>contents,
+    let headerReads=0;
+    const req={url:()=>target,method:()=>method,allHeaders:async()=>{
+      headerReads++;
+      if(change==='hold_initial_'+bridge && headerReads===2){markIO();await heldIO;}
+      return headers;
+    },frame:()=>requestFrame,postData:()=>contents,
       redirectedFrom:()=>null,isNavigationRequest:()=>false,resourceType:()=> 'fetch'};
     await routeHandler({request:()=>req,abort:async()=>{denied=true;},fallback:async()=>{assert.ok(target==='https://js.stripe.com/v3/'||target===otpUrl||target===otpUrl+'/'+id(10)+'/verify');},
       fulfill:async(r:any)=>{if((method==='OPTIONS'&&change===bridge+'_preflight_delivery')||(change==='action_delivery'&&target.endsWith('/action'))||(change==='session_delivery'&&target.endsWith('/confirmation-session')))throw Error('secret_fixture canary');assert.equal(r.headers['Cache-Control'],'no-store');assert.equal(r.headers['Access-Control-Allow-Origin'],demo);reply=r;replies.push(r);}});
@@ -250,7 +259,7 @@ async function fixture(change = '') {
         startTask=c.activate();void startTask.catch(()=>{});return;
       }
       await c.activate();
-    },check:async()=>{c.checked=true;},fill:async()=>{if(change===id)throw Error('secret_fixture canary');},isVisible:async()=>{if(change==='postal_check')throw Error('secret_fixture canary');return true;},isEnabled:async()=>change==='ready_button'&&id==='pay'?true:!c.disabled,
+    },check:async()=>{c.checked=true;},fill:async()=>{if(id==='number')await stageHook?.('card');if(change===id)throw Error('secret_fixture canary');},isVisible:async()=>{if(change==='postal_check')throw Error('secret_fixture canary');return true;},isEnabled:async()=>change==='ready_button'&&id==='pay'?true:!c.disabled,
     getAttribute:async()=>body.dataset.phase,evaluate:async(f:Function,arg:any)=>id==='code'?(arg===undefined||((c.value=arg),true)):change==='manual_arm'&&id==='pay'?false:f(c,arg),
     frameLocator:()=>({locator:(s:string)=>locator(s.match(/name="([^"]+)"/)?.[1]??'card')})};}
   const page:any={mainFrame:()=>frame,url:()=>url,on:(n:string,f:Function)=>callbacks.set(n,f),goto:async(target:string)=>{assert.equal(target,demo+path);url=target;callbacks.get('framenavigated')?.(frame);},
@@ -264,6 +273,7 @@ async function fixture(change = '') {
       }
       if(change==='pre_ready'&&arg==='READY')throw Error('secret_fixture canary');
       if(arg==='OBSERVE'||arg==='METHOD_CONFIRMED'){
+        await stageHook?.('manual');
         const b=ctrl(arg==='OBSERVE'?'pay':'confirm-method');
         if((change==='manual_timeout'&&arg==='METHOD_CONFIRMED')||change==='initial_manual_timeout')throw Error(selected.client_secret);
         await b.activate();
@@ -288,17 +298,68 @@ async function fixture(change = '') {
     },
     confirm:async()=>{counts.push('confirm');return {...identity,phase:'OBSERVE',code:'OK',protocol:'SERVER_CONFIRM_V2',attempt_id:id(8),state:'OBSERVE',retry_allowed:false,successor_attempt_id:null,next_action_allowed:false,expires_at:expires};}};
   const methodPort={prepareMethod:async()=>{counts.push('prepareMethod');return {subscriptionId:id(6),operationId:change==='old_operation'?id(7):id(9),action:action(actionSecret)};},
-    selectMethod:async()=>{counts.push('selectMethod');return selected;},confirmMethod:async()=>{counts.push('permit');if(change==='permit_error')throw Error(selected.client_secret);return {browser_confirm_allowed:true,state:'RESERVED'};}};
-  const lose=(event:string)=>{if(event==='close'||event==='crash')callbacks.get(event)?.();else{doc.visibilityState='hidden';docEvents.get('visibilitychange')?.();}};
+    selectMethod:async()=>{counts.push('selectMethod');if(change==='hold_method_session'){markIO();await heldIO;}return selected;},confirmMethod:async()=>{counts.push('permit');if(change==='permit_error')throw Error(selected.client_secret);return {browser_confirm_allowed:true,state:'RESERVED'};}};
+  const lose=(event:string)=>{if(event==='close'||event==='crash')callbacks.get(event)?.();else if(event==='pagehide')windowEvents.get('pagehide')?.();else{doc.visibilityState='hidden';docEvents.get('visibilitychange')?.();}};
   const forgedTerminal=async()=>{
     const f=bindings.get('__failedRenewalTerminal');assert.ok(f);
     for(const [src,args] of [[{page,frame:{url:()=>url}},['STOPPED']],[{page:{},frame},['STOPPED']],[{page,frame},['OTHER']],[{page,frame},['STOPPED','extra']],[{page,frame},['STOPPED','BROWSER_INITIAL_MOUNT']],[{page,frame},['STOPPED','BROWSER_METHOD_MOUNT']],[{page,frame},['STOPPED',null,'extra']],[{page,frame:{url:()=>url}},['STOPPED','BROWSER_METHOD_MOUNT']],[{page:{},frame},['STOPPED','BROWSER_METHOD_MOUNT']]] as const){
       await Promise.resolve().then(()=>f(src,...args)).catch(()=>{});
     }
   };
-  return {request,counts,replies,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
+  return {request,counts,replies,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,ioPending,releaseIO,
+    setStageHook:(hook:typeof stageHook)=>{stageHook=hook;},terminal:async(marker:unknown)=>bindings.get('__failedRenewalTerminal')!({page,frame},'STOPPED',marker),closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
     restore:async()=>{try{runAbort.abort();await journey.close(nowLimits());}finally{w.__failedRenewalStop?.();restore();}}};
 }
+
+for(const where of ['card','manual'])test('completed readiness rejects stale original markers during '+where,async()=>{
+  const h=await fixture();let phase='initial',checks=0;
+  h.setStageHook(async at=>{
+    if(at!==where)return;
+    const markers=phase==='initial'?['BROWSER_INITIAL_ACTION','BROWSER_INITIAL_SESSION','BROWSER_INITIAL_MOUNT']:['BROWSER_METHOD_MOUNT'];
+    for(const marker of markers){await h.terminal(marker);assert.equal(h.runAbort.signal.aborted,false);checks++;}
+  });
+  try{
+    assert.equal(await h.journey.initial(h.initialPort,nowLimits()),true);phase='method';
+    assert.equal(await h.journey.method(h.methodPort,nowLimits()),true);
+    assert.equal(checks,4);assert.equal(h.phase(),'METHOD_CONFIRMED');
+    assert.equal(h.counts.filter(v=>v==='confirm').length,1);assert.equal(h.counts.filter(v=>v==='permit').length,1);
+    await h.journey.close(nowLimits());assert.equal(h.closed(),1);
+  }finally{h.setStageHook(undefined);h.releaseIO();await h.restore();}
+});
+
+test('earlier bridge refusal wins over later actual page stop',async()=>{
+  const h=await fixture('action_early_header');let first:unknown;
+  try{
+    await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>{first=error;return true;});
+    h.lose('pagehide');
+    assert.equal(browserDiagnostic(first),'BROWSER_ACTION_BRIDGE');
+    await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>error===first);
+    assert.equal(h.counts.includes('confirm'),false);assert.equal(h.counts.includes('permit'),false);
+    await h.journey.close(nowLimits());assert.equal(browserCleanupConfirmed(first),true);assert.equal(h.closed(),1);
+  }finally{h.releaseIO();await h.restore();}
+});
+
+for(const operation of ['initial_action','initial_session','method_session'])for(const event of ['hide','pagehide'])
+test('in-flight original terminal revokes before IO release '+operation+' '+event,async()=>{
+  const h=await fixture('hold_'+operation);let work:Promise<unknown>|undefined,first:unknown;
+  try{
+    if(operation==='method_session')await h.journey.initial(h.initialPort,nowLimits());
+    work=(operation==='method_session'?h.journey.method(h.methodPort,nowLimits()):h.journey.initial(h.initialPort,nowLimits()))
+      .then(()=>assert.fail('held journey must reject'),(error:unknown)=>{first=error;});
+    await h.ioPending;
+    const expected=operation==='initial_action'?'BROWSER_INITIAL_ACTION':operation==='initial_session'?'BROWSER_INITIAL_SESSION':'BROWSER_METHOD_MOUNT';
+    for(const wrong of ['BROWSER_INITIAL_ACTION','BROWSER_INITIAL_SESSION','BROWSER_INITIAL_MOUNT','BROWSER_METHOD_MOUNT'].filter(marker=>marker!==expected)){
+      await h.terminal(wrong);assert.equal(h.runAbort.signal.aborted,false);
+    }
+    h.lose(event);assert.equal(h.runAbort.signal.aborted,true);
+    assert.deepEqual(h.terminals.at(-1),['STOPPED',operation==='initial_action'?'BROWSER_INITIAL_ACTION':operation==='initial_session'?'BROWSER_INITIAL_SESSION':'BROWSER_METHOD_MOUNT']);
+    assert.equal(h.counts.filter(v=>v==='confirm').length,operation==='method_session'?1:0);assert.equal(h.counts.includes('permit'),false);
+    h.releaseIO();await work;
+    assert.equal(browserDiagnostic(first),operation==='initial_action'?'BROWSER_INITIAL_ACTION':operation==='initial_session'?'BROWSER_INITIAL_SESSION':'BROWSER_METHOD_MOUNT');
+    await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>error===first);
+    await h.journey.close(nowLimits());assert.equal(browserCleanupConfirmed(first),true);assert.equal(h.closed(),1);
+  }finally{h.releaseIO();await work?.catch(()=>{});await h.restore();}
+});
 
 test('actual held helper preserves browser checkpoint through owner abort race and cleanup',async()=>{
  const {opts,scope}=await import(source('../../../../infrastructure/fixtures/failed-renewal-descriptors.mjs').href);
