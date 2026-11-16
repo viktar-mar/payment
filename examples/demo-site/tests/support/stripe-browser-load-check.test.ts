@@ -95,6 +95,83 @@ test('route classifier never falls through financial API, navigation, auth, redi
   assert.equal(classifyRequest(request('http://127.0.0.1:4173/stripe-browser-load-check.html',{navigation:true,mainFrame:true}),assets,false),'REFUSE');
 });
 
+test('generic ORIGIN reports only its fixed cause through the registered route and safe formatter',async()=>{
+  const {runLoadCheck,formatLoadCheckResult}=await launcherModule();
+  const cases=[
+    ['https://[private-sentinel','URL_INVALID'],
+    ['http://private-sentinel.invalid:8443/private?key=secret','NON_HTTPS_SCHEME'],
+    ['data:text/plain,private-sentinel','NON_HTTPS_SCHEME'],
+    ['blob:https://js.stripe.com/private-sentinel','NON_HTTPS_SCHEME'],
+    ['https://private-sentinel.invalid:8443/path?key=secret','NON_DEFAULT_PORT'],
+    ['https://private-sentinel.invalid/path?key=secret','HOST_NOT_ALLOWED'],
+  ];
+  for(const [url,originReason] of cases){
+    const f=runnerFixture();
+    f.page.waitForFunction=async()=>{
+      const route:any=providerRoute(f,async()=>assert.fail('rejected origin must never be fetched'));
+      const req=route.request();route.request=()=>({...req,url:()=>url});
+      route.fulfill=async()=>assert.fail('rejected origin must never be fulfilled');
+      await f.route()(route);
+    };
+    const result=await runLoadCheck(env,f.ports);
+    assert.deepEqual(result,{...report('ORIGIN'),originReason});
+    assert.equal(Object.isFrozen(result),true);
+    assert.deepEqual(formatLoadCheckResult(result),{line:`STRIPE_BROWSER_LOAD_CHECK load=ORIGIN cleanup=OK components=NONE origin_reason=${originReason}`,exitCode:1});
+    assert.doesNotMatch(JSON.stringify(result)+JSON.stringify(formatLoadCheckResult(result)),/private-sentinel|secret|https?:|blob:|data:/);
+    for(const call of ['abort','context.close','browser.close','dispose'])assert.equal(f.calls.filter(x=>x===call).length,1,call);
+  }
+});
+
+test('ORIGIN cause belongs to the first failure and survives later refusal and cleanup failure',async()=>{
+  const {runLoadCheck}=await launcherModule();const f=runnerFixture();
+  f.context.close=async()=>{f.calls.push('context.close');throw Error('private cleanup');};
+  f.page.waitForFunction=async()=>{
+    for(const url of ['https://private-sentinel.invalid/path','http://private-sentinel.invalid/']){
+      const route:any=providerRoute(f,async()=>assert.fail('forbidden fetch'));
+      const req=route.request();route.request=()=>({...req,url:()=>url});await f.route()(route);
+    }
+    f.listeners.pageerror!(Error('private later error'));
+  };
+  assert.deepEqual(await runLoadCheck(env,f.ports),{...report('ORIGIN',['CONTEXT_CLOSE']),originReason:'HOST_NOT_ALLOWED'});
+});
+
+test('ORIGIN formatter bounds legacy, hostile and throwing causes without altering the primary result',async()=>{
+  const {formatLoadCheckResult}=await launcherModule();
+  const unknown={line:'STRIPE_BROWSER_LOAD_CHECK load=ORIGIN cleanup=OK components=NONE origin_reason=UNKNOWN',exitCode:1};
+  for(const originReason of [undefined,null,'private-sentinel https://outside.invalid/',{},['HOST_NOT_ALLOWED']]){
+    assert.deepEqual(formatLoadCheckResult({...report('ORIGIN'),originReason}),unknown);
+  }
+  assert.deepEqual(formatLoadCheckResult({...report('ORIGIN'),get originReason(){throw Error('private-sentinel');}}),unknown);
+  let reads=0;
+  assert.deepEqual(formatLoadCheckResult({...report('ORIGIN'),get originReason(){reads++;return reads===1?'HOST_NOT_ALLOWED':'private-sentinel';}}),
+    {line:'STRIPE_BROWSER_LOAD_CHECK load=ORIGIN cleanup=OK components=NONE origin_reason=HOST_NOT_ALLOWED',exitCode:1});
+  assert.equal(reads,1);
+  assert.deepEqual(formatLoadCheckResult({...report('READY'),get originReason(){return assert.fail('unrelated diagnostic must not be read');}}),
+    {line:'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE',exitCode:0});
+});
+
+test('origin diagnostics preserve existing authority gates, dedicated Stripe categories and default-port acceptance',async()=>{
+  const {runLoadCheck}=await launcherModule();
+  for(const [url,extra,expected] of [
+    ['https://m.stripe.com/private',{},'ORIGIN_STRIPE_COM_M'],
+    ['https://unknown.stripe.com/private',{},'ORIGIN_STRIPE_COM_OTHER'],
+    ['https://js.stripe.com:8443/private',{},'ORIGIN_STRIPE_COM_OTHER'],
+    ['https://user:secret@outside.invalid/',{},'AUTH'],
+    ['https://outside.invalid/',{redirectedFrom:()=>({})},'REDIRECT'],
+    ['https://outside.invalid/',{allHeaders:async()=>({Authorization:'secret'})},'HEADER'],
+    ['https://outside.invalid/',{method:()=> 'DELETE'},'METHOD'],
+    ['https://outside.invalid/',{isNavigationRequest:()=>true},'NAVIGATION'],
+  ] as const){
+    const f=runnerFixture();f.page.waitForFunction=async()=>{
+      const route:any=providerRoute(f,async()=>assert.fail('forbidden fetch'));
+      const req=route.request();route.request=()=>({...req,url:()=>url,...extra});await f.route()(route);
+    };
+    assert.deepEqual(await runLoadCheck(env,f.ports),report(expected));
+  }
+  const {classifyRequest}=await launcherModule();
+  assert.equal(classifyRequest({url:'https://js.stripe.com:443/v3/',method:'GET',headers:{},navigation:false,mainFrame:false,redirected:false},new Map(),false),'PROVIDER');
+});
+
 function runnerFixture(){
   const calls:string[]=[];let routeHandler:Function;let websocket:Function;const listeners:Record<string,Function>={};
   const frame:{page:()=>any}={page:()=>page};

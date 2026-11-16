@@ -10,9 +10,12 @@ submit, confirmation, customer, backend, billing owner or CLI operation.
 Stripe documents this deferred initialization pattern in its
 [official deferred-payment guide](https://docs.stripe.com/payments/accept-a-payment-deferred?platform=web&type=payment).
 
-Verification of this separated-report version is injected or build-only. Its
-actual Chrome and Stripe network execution is **NOT_RUN**. A prior invocation of
-the earlier version recorded only `CLEANUP` and exit 1. That receipt cannot
+One invocation of the separated-report version at `b50978a` recorded
+`load=ORIGIN cleanup=OK components=NONE` and exit 1. Readiness was not confirmed;
+the report cannot identify which generic origin predicate refused the request.
+The cause-diagnostic extension described below has injected/build-only verification;
+its actual Chrome and Stripe network execution is **NOT_RUN**. A prior invocation
+of the earlier version recorded only `CLEANUP` and exit 1. That receipt cannot
 recover whether readiness occurred or which cleanup component rejected. This
 change does not establish the cause or resolution of that historical result and
 is not native acceptance evidence.
@@ -75,7 +78,28 @@ STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE
 STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=FAILED components=CONTEXT_CLOSE
 STRIPE_BROWSER_LOAD_CHECK load=API_PATH cleanup=FAILED components=BROWSER_CLOSE,BUILD_DISPOSE
 STRIPE_BROWSER_LOAD_CHECK load=NOT_CONFIRMED cleanup=FAILED components=RESPONSE_DISPOSE
+STRIPE_BROWSER_LOAD_CHECK load=ORIGIN cleanup=OK components=NONE origin_reason=HOST_NOT_ALLOWED
 ```
+
+Only generic `load=ORIGIN` appends `origin_reason` and includes `originReason` in
+the immutable private report. These are fixed categories, not addresses:
+
+| Cause | Meaning |
+| --- | --- |
+| `URL_INVALID` | The existing URL parser rejected the request URL. |
+| `NON_HTTPS_SCHEME` | Outside the allowed virtual loopback origin, the scheme is not HTTPS. |
+| `NON_DEFAULT_PORT` | The HTTPS URL retains a non-default explicit port. |
+| `HOST_NOT_ALLOWED` | Its HTTPS host is outside the unchanged provider allowlist. |
+| `UNKNOWN` | The cause is absent, invalid or unavailable (including older reports). |
+
+The existing refusal order is preserved. After successful parsing, authentication,
+redirect, header, method, local-document and main-navigation gates run first. The
+existing `ORIGIN_STRIPE_COM_M` and `ORIGIN_STRIPE_COM_OTHER` categories stay unchanged.
+For generic `ORIGIN`, non-HTTPS precedes port, which precedes host refusal. The
+first terminal observation owns the cause; subsequent requests, page events and
+cleanup cannot replace it. No hostname, URL, path, query, raw error, extra request
+or origin permission is added. The old `b50978a` receipt cannot be retrospectively
+assigned one of these causes. The last example above is synthetic.
 
 Exit 0 requires `READY` and no cleanup errors; every other report exits 1.
 `READY` requires the readiness wait to succeed. A cleanup-triggered retirement

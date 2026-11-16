@@ -5,7 +5,9 @@ const localOrigin='http://127.0.0.1:4173';
 const documentPath='/stripe-browser-load-check.html';
 const safeResults=new Set(['READY','REFUSED','BUILD','LAUNCH','CONTEXT','PAGE','ELEMENT','TIMEOUT','NOT_CONFIRMED','HEADER','AUTH','REDIRECT','API_PATH','ORIGIN_STRIPE_COM_M','ORIGIN_STRIPE_COM_OTHER','ORIGIN','NAVIGATION','METHOD','LOCAL','POPUP','DOWNLOAD','WEBSOCKET']);
 const cleanupCodes=['CONTEXT_CLOSE','BROWSER_CLOSE','BUILD_DISPOSE','RESPONSE_DISPOSE','LATE_BUILD_DISPOSE','LATE_BROWSER_CLOSE','LATE_CONTEXT_CLOSE','LATE_PAGE_CLOSE','EXTRA_PAGE_CLOSE','DOWNLOAD_CANCEL','UNKNOWN'];
-const snapshot=(loadResult,cleanupErrors)=>Object.freeze({loadResult,cleanupErrors:Object.freeze([...cleanupErrors])});
+const originReasons=new Set(['URL_INVALID','NON_HTTPS_SCHEME','NON_DEFAULT_PORT','HOST_NOT_ALLOWED']);
+const safeOriginReason=value=>originReasons.has(value)?value:'UNKNOWN';
+const snapshot=(loadResult,cleanupErrors,originReason)=>Object.freeze({loadResult,cleanupErrors:Object.freeze([...cleanupErrors]),...(loadResult==='ORIGIN'?{originReason:safeOriginReason(originReason)}:{})});
 export function formatLoadCheckResult(report){
   try{
     const candidateLoad=report?.loadResult;
@@ -19,7 +21,12 @@ export function formatLoadCheckResult(report){
       normalized.add(cleanupCodes.includes(code)?code:'UNKNOWN');
     }
     const components=cleanupCodes.filter(code=>normalized.has(code));
-    return {line:`STRIPE_BROWSER_LOAD_CHECK load=${loadResult} cleanup=${components.length?'FAILED':'OK'} components=${components.join(',')||'NONE'}`,exitCode:loadResult==='READY'&&!components.length?0:1};
+    let originSuffix='';
+    if(loadResult==='ORIGIN'){
+      let reason='UNKNOWN';try{reason=safeOriginReason(report.originReason);}catch{}
+      originSuffix=` origin_reason=${reason}`;
+    }
+    return {line:`STRIPE_BROWSER_LOAD_CHECK load=${loadResult} cleanup=${components.length?'FAILED':'OK'} components=${components.join(',')||'NONE'}${originSuffix}`,exitCode:loadResult==='READY'&&!components.length?0:1};
   }catch{
     return {line:'STRIPE_BROWSER_LOAD_CHECK load=UNKNOWN cleanup=FAILED components=UNKNOWN',exitCode:1};
   }
@@ -30,8 +37,8 @@ export function admitEnvironment(env){
   return env.PAYMENT_STRIPE_BROWSER_LOAD_CHECK_PUBLISHABLE_KEY;
 }
 
-export function refusalReason(request,assets,firstDocument){
-  let url;try{url=new URL(request.url);}catch{return 'ORIGIN';}
+export function refusalReason(request,assets,firstDocument,onOriginRefusal){
+  let url;try{url=new URL(request.url);}catch{onOriginRefusal?.('URL_INVALID');return 'ORIGIN';}
   if(url.username||url.password)return 'AUTH';
   if(request.redirected)return 'REDIRECT';
   if(Object.keys(request.headers).some(name=>name.toLowerCase()==='authorization'||name.toLowerCase()==='proxy-authorization'))return 'HEADER';
@@ -43,7 +50,11 @@ export function refusalReason(request,assets,firstDocument){
     return null;
   }
   if(request.navigation&&request.mainFrame)return 'NAVIGATION';
-  if(!providerNetworkOrigin(url))return url.hostname==='m.stripe.com'?'ORIGIN_STRIPE_COM_M':url.hostname.endsWith('.stripe.com')?'ORIGIN_STRIPE_COM_OTHER':'ORIGIN';
+  if(!providerNetworkOrigin(url)){
+    const reason=url.hostname==='m.stripe.com'?'ORIGIN_STRIPE_COM_M':url.hostname.endsWith('.stripe.com')?'ORIGIN_STRIPE_COM_OTHER':'ORIGIN';
+    if(reason==='ORIGIN')onOriginRefusal?.(url.protocol!=='https:'?'NON_HTTPS_SCHEME':url.port?'NON_DEFAULT_PORT':'HOST_NOT_ALLOWED');
+    return reason;
+  }
   // This API gate precedes the broad provider-subresource origin decision.
   if(url.hostname==='api.stripe.com'&&url.pathname!=='/v1/elements/sessions')return 'API_PATH';
   return null;
@@ -58,7 +69,7 @@ export async function runLoadCheck(env,ports){
   let key;try{key=admitEnvironment(env);}catch{return snapshot('REFUSED',[]);}
   const timeoutMs=ports.timeoutMs??60000;
   const expires=Date.now()+timeoutMs;
-  let loadResult,signalFailure,build,browser,context,page,firstDocument=true,pageCount=0,finishing=false;
+  let loadResult,originReason,signalFailure,build,browser,context,page,firstDocument=true,pageCount=0,finishing=false;
   const cleanupErrors=new Set();
   const pendingCleanup=new Set();
   const retiredExtras=new WeakSet();
@@ -72,7 +83,7 @@ export async function runLoadCheck(env,ports){
   const transports=new Set();
   const abort=new AbortController();
   const failed=new Promise(resolve=>{signalFailure=resolve;});
-  const fail=code=>{if(!loadResult&&!finishing){loadResult=safeResults.has(code)?code:'ELEMENT';abort.abort();signalFailure(loadResult);}};
+  const fail=(code,originCause)=>{if(!loadResult&&!finishing){loadResult=safeResults.has(code)?code:'ELEMENT';if(loadResult==='ORIGIN')originReason=safeOriginReason(originCause);abort.abort();signalFailure(loadResult);}};
   const timer=setTimeout(()=>fail('TIMEOUT'),timeoutMs);
   const remaining=()=>Math.max(1,expires-Date.now());
   async function forwardProvider(route,url){
@@ -113,8 +124,9 @@ export async function runLoadCheck(env,ports){
         const view={url:request.url(),method:request.method(),headers:await request.allHeaders(),navigation:request.isNavigationRequest(),mainFrame:frame===page.mainFrame(),redirected:!!request.redirectedFrom()};
         // Header acquisition may outlive timeout or successful retirement.
         if(finishing||loadResult||Date.now()>=expires){if(!finishing)fail('TIMEOUT');await route.abort();return;}
-        const reason=loadResult??refusalReason(view,build.assets,firstDocument);
-        if(reason){fail(reason);await route.abort();return;}
+        let originCause;
+        const reason=loadResult??refusalReason(view,build.assets,firstDocument,value=>{originCause=value;});
+        if(reason){fail(reason,originCause);await route.abort();return;}
         if(new URL(view.url).origin===localOrigin){
           const url=new URL(view.url);if(view.navigation)firstDocument=false;
           const asset=build.assets.get(url.pathname);
@@ -162,7 +174,7 @@ export async function runLoadCheck(env,ports){
     }
     while(pendingCleanup.size)await Promise.allSettled([...pendingCleanup]);
   }
-  return snapshot(loadResult,cleanupCodes.filter(code=>cleanupErrors.has(code)));
+  return snapshot(loadResult,cleanupCodes.filter(code=>cleanupErrors.has(code)),originReason);
 }
 
 // Explicitly minimize the spawned browser environment; no account/provider keys.
