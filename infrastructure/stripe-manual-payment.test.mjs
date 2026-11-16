@@ -165,6 +165,7 @@ test('inert imports neither read private credentials nor launch any subprocess o
       'stripe-sandbox-extras.mjs','smoke-stage-5a.mjs',
       'stripe-billing-acceptance-options.mjs','stripe-billing-limits.mjs',
       'stripe-billing-first-payment-options.mjs','stripe-billing-first-renewal-options.mjs','stripe-billing-failed-renewal-options.mjs',
+      'stripe-billing-first-payment-browser-diagnostic.mjs',
     ].map(name=>new URL('infrastructure/'+name,root).href));
     const readSource=fs.readFileSync;
     registerHooks({load(url,context,nextLoad){
@@ -183,7 +184,8 @@ test('inert imports neither read private credentials nor launch any subprocess o
       'test-results/stripe-sandbox/synthetic/state.json','docs/local-development.md',
       'infrastructure/stripe-manual-payment.mjs','infrastructure/stripe-billing-acceptance-options.mjs',
       'infrastructure/stripe-billing-limits.mjs','infrastructure/stripe-billing-first-payment-options.mjs',
-      'infrastructure/stripe-billing-failed-renewal-options.mjs']){
+      'infrastructure/stripe-billing-failed-renewal-options.mjs',
+      'infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs']){
       assert.throws(()=>fs.readFileSync(new URL(file,root)),/private boundary touched/);
       await assert.rejects(async()=>fsp.readFile(new URL(file,root)),/private boundary touched/);
     }
