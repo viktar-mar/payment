@@ -11,6 +11,7 @@ export function installFailedRenewalPage(sdk:Sdk):void {
   const consent = document.querySelector<HTMLInputElement>('#consent')!;
   const host = document.querySelector<HTMLElement>('#provider')!;
   const controller = new AbortController();
+  let boundary:'BROWSER_INITIAL_ACTION'|'BROWSER_INITIAL_SESSION'|'BROWSER_INITIAL_MOUNT'|'BROWSER_METHOD_MOUNT'|null=null;
   let state = 'NEW', deadline = 0, sessionDeadline = Infinity;
   let timer:ReturnType<typeof setTimeout>|undefined;
   let initial:Payments.StripePaymentAttemptHandle|undefined, method:Payments.StripeSubscriptionHandle|undefined;
@@ -26,7 +27,8 @@ export function installFailedRenewalPage(sdk:Sdk):void {
     phase('STOPPED');
     // The owner may be between browser phases. Revoke that run even when no
     // controller call is currently waiting on a browser result.
-    try {void Promise.resolve((window as any).__failedRenewalTerminal('STOPPED')).catch(()=>{});} catch { /* page is closing */ }
+    try {void Promise.resolve((window as any).__failedRenewalTerminal('STOPPED',boundary)).catch(()=>{});} catch { /* page is closing */ }
+    boundary=null;
     clearTimeout(timer);
     controller.abort();
     initial?.destroy(); method?.destroy();
@@ -103,15 +105,18 @@ export function installFailedRenewalPage(sdk:Sdk):void {
       check('PREPARING');
       original = result;
       const input = {session,...original,signal:controller.signal};
+      boundary='BROWSER_INITIAL_ACTION';
       const action = await client.subscriptions.action(input);
       check('PREPARING');
+      boundary='BROWSER_INITIAL_SESSION';
       const context = await client.subscriptions.confirmationSession!({...input,action,idempotencyKey:crypto.randomUUID()});
       check('PREPARING');
       if(context.protocol!=='SERVER_CONFIRM_V2')throw Error();
+      boundary='BROWSER_INITIAL_MOUNT';
       const handle = await sdk.mountStripePaymentAttempt({client:client.subscriptions,input,context,container:host,
         isCurrent:()=>!controller.signal.aborted,locale:'en',onRetire:()=>{if(state!=='CONFIRMING')stop();}});
       if(controller.signal.aborted){handle.destroy();return;}
-      initial = handle;
+      initial = handle; boundary=null;
       phase('READY');
     } catch {stop();}
   };
@@ -133,10 +138,11 @@ export function installFailedRenewalPage(sdk:Sdk):void {
       if (!client || !session || operation.subscriptionId!==original?.subscriptionId || operation.operationId===original.operationId)throw Error();
       replacement = operation;
       arm(Date.now()+300000);
+      boundary='BROWSER_METHOD_MOUNT';
       const handle = await sdk.mountStripeSubscriptionMethod({client:client.subscriptions,session,...operation,container:host,locale:'en',
         signal:controller.signal,isCurrent:()=>!controller.signal.aborted,onRetire:()=>{if(state!=='CONFIRMING_METHOD')stop();}});
       if(controller.signal.aborted){handle.destroy();return;}
-      method = handle; phase('METHOD_READY');
+      method = handle; boundary=null; phase('METHOD_READY');
     } catch {stop();}
   });
   button('confirm-method').onclick = async event => {
