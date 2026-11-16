@@ -7,6 +7,8 @@ import {browserFailure,browserDiagnostic,finishBrowserCleanup,rememberBrowserPro
 import {createFirstPaymentBridge} from './stripe-billing-first-payment.ts';
 // @ts-ignore Explicit source for dependency-free Node TS runner.
 import {enterPrivateText} from './private-entry.ts';
+// @ts-ignore Explicit source for dependency-free Node TS runner.
+import {providerOrigin,providerNetworkOrigin} from './stripe-provider-origin.ts';
 
 const pagePath = '/billing-failed-renewal.html';
 const failed = () => new Error('failed_renewal_BROWSER');
@@ -31,15 +33,6 @@ function body(raw:string|null,names:string[]) {
   need(JSON.stringify(value)===raw);
   return fields(value,names);
 }
-function providerOrigin(url:URL) {
-  return url.protocol==='https:' && !url.port && !url.username && !url.password &&
-    (['api.stripe.com','hooks.stripe.com','js.stripe.com'].includes(url.hostname) || url.hostname.endsWith('.js.stripe.com'));
-}
-function providerNetworkOrigin(url:URL):boolean {
-  return url.protocol==='https:' && !url.port && !url.username && !url.password &&
-    (url.hostname==='merchant-ui-api.stripe.com' || url.hostname==='r.stripe.com' || providerOrigin(url));
-}
-
 /** A single owned page. Neither phase accepts a target from the page or chooses a provider operation. */
 export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAbort:AbortController):BillingFailedRenewalJourney {
   need(runAbort instanceof AbortController && !runAbort.signal.aborted);
