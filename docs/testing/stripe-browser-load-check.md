@@ -13,12 +13,20 @@ Stripe documents this deferred initialization pattern in its
 One invocation of the separated-report version at `b50978a` recorded
 `load=ORIGIN cleanup=OK components=NONE` and exit 1. Readiness was not confirmed;
 the report cannot identify which generic origin predicate refused the request.
-The cause-diagnostic extension described below has injected/build-only verification;
-its actual Chrome and Stripe network execution is **NOT_RUN**. A prior invocation
-of the earlier version recorded only `CLEANUP` and exit 1. That receipt cannot
-recover whether readiness occurred or which cleanup component rejected. This
+A prior invocation of the earlier version recorded only `CLEANUP` and exit 1.
+That receipt cannot recover whether readiness occurred or which cleanup component rejected. This
 change does not establish the cause or resolution of that historical result and
 is not native acceptance evidence.
+
+A later native report supplied by the user for `4e2464c` recorded
+`load=READY cleanup=FAILED components=RESPONSE_DISPOSE`, but its exact exception
+was not retained. Source inspection of installed Playwright 1.63.0 shows that
+context closure disposes the
+request channel used by response disposal. Injected tests reproduce the race
+when that channel closes before pending disposal completes. This supports the
+cleanup ordering fix below; it does not prove the cause of the historical
+exception. Actual native Chrome/Stripe verification of this cleanup-order fix
+is **NOT_RUN**.
 
 After separately authorizing an external Chrome/Stripe run, from the repository
 root use an explicitly supplied public test publishable key:
@@ -54,6 +62,17 @@ fulfillment, so the browser cannot follow a redirect outside the gate. Only a
 validated successful response is fulfilled; fetched responses are disposed on
 every path. A response arriving after retirement is aborted rather than
 fulfilled, and owned transports/disposal settle during cleanup.
+
+After the terminal load observation and runner retirement, cleanup lets the
+currently owned provider transports settle before context closure, bounded by
+the time left in the original load
+budget. This gives pending response disposal a chance to finish while its request
+channel is alive. If the original deadline has passed or the drain reaches it,
+cleanup attempts context closure to interrupt stuck fetch, fulfillment or
+disposal, then awaits those same transports. There is no new timeout budget or
+grace period. Independent disposal rejections, including any remaining failure
+after context-close fallback, still report `RESPONSE_DISPOSE`; observed `READY`
+and the first refusal or timeout remain unchanged.
 
 The standard 60-second budget begins before build acquisition and covers the
 load/readiness work; Chrome launch and navigation use the remaining budget.

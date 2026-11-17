@@ -165,10 +165,20 @@ export async function runLoadCheck(env,ports){
     // Acquisition APIs cannot all be cancelled. Wait for their late resources to
     // be retired; never report completion while a pending owned browser survives.
     await Promise.allSettled(acquisitions);
-    // Context closure interrupts transport. Settle owned fetch/disposal before
-    // returning; late responses must never be fulfilled into the retired page.
+    // Response disposal shares the context's request channel. Give owned
+    // transports only the remaining original budget before closing that channel.
+    const ownedTransports=[...transports];
+    const settledTransports=Promise.allSettled(ownedTransports);
+    const drainMs=Math.max(0,expires-Date.now());
+    if(ownedTransports.length&&drainMs>0){
+      let drainTimer;
+      try{await Promise.race([settledTransports,new Promise(resolve=>{drainTimer=setTimeout(resolve,drainMs);})]);}
+      finally{clearTimeout(drainTimer);}
+    }
+    // Closure interrupts stuck transport. Still await the same owned operations;
+    // late responses must never be fulfilled into the retired page.
     try{await context?.close();}catch{collectCleanup('CONTEXT_CLOSE');}
-    await Promise.allSettled([...transports]);
+    await settledTransports;
     for(const [code,close] of [['BROWSER_CLOSE',()=>browser?.close()],['BUILD_DISPOSE',()=>build?.dispose()]]){
       try{await close();}catch{collectCleanup(code);}
     }

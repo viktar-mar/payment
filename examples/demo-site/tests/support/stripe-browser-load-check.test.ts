@@ -247,6 +247,103 @@ function providerResponse(f:ReturnType<typeof runnerFixture>,status=200,location
   return {url:()=> 'https://api.stripe.com/v1/elements/sessions',status:()=>status,headers:()=>location?{location}:{},dispose:async()=>{f.calls.push('response.dispose');}};
 }
 
+for(const rejects of [false,true])test(`READY drains pending response disposal before destroying its request channel${rejects?' and retains an independent disposal failure':''}`,async t=>{
+  const {runLoadCheck,formatLoadCheckResult}=await launcherModule();
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=runnerFixture(),disposing=deferred(),release=deferred(),headers=deferred();
+  let channelClosed=false,routing:Promise<void>|undefined,heldHeaders:Promise<void>|undefined;
+  const response=providerResponse(f);
+  response.dispose=async()=>{
+    f.calls.push('response.dispose');disposing.resolve(undefined);await release.promise;
+    if(channelClosed)throw Error('request channel destroyed before response disposal');
+    if(rejects)throw Error('independent private disposal failure');
+    f.calls.push('response.disposed');
+  };
+  f.context.close=async()=>{f.calls.push('context.close');channelClosed=true;};
+  f.page.waitForFunction=async()=>{
+    routing=f.route()(providerRoute(f,async()=>{f.calls.push('fetch');return response;}));
+    await disposing.promise;
+    const held=providerRoute(f,async()=>assert.fail('headers released after retirement must not fetch'));
+    const request=held.request();held.request=()=>({...request,allHeaders:()=>headers.promise});
+    held.fulfill=async()=>assert.fail('headers released after retirement must not fulfill');
+    heldHeaders=f.route()(held);f.calls.push('ready.observed');
+  };
+  const running=runLoadCheck(env,f.ports);await disposing.promise;
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  const closedBeforeRelease=channelClosed;
+  headers.resolve({});await heldHeaders;
+  release.resolve(undefined);await routing;
+  const result=await running;
+  assert.deepEqual(result,report('READY',rejects?['RESPONSE_DISPOSE']:[]));
+  assert.equal(closedBeforeRelease,false,'keep the request channel alive during the remaining original budget');
+  assert.equal(formatLoadCheckResult(result).line,rejects?'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=FAILED components=RESPONSE_DISPOSE':'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE');
+  for(const call of ['fetch','fulfill','response.dispose','context.close','browser.close','dispose','abort'])assert.equal(f.calls.filter(value=>value===call).length,1,call);
+  assert.ok(f.calls.indexOf('response.dispose')<f.calls.indexOf('ready.observed'),'disposal is pending when readiness is observed');
+  if(!rejects){
+    assert.ok(f.calls.indexOf('ready.observed')<f.calls.indexOf('response.disposed'));
+    assert.ok(f.calls.indexOf('response.disposed')<f.calls.indexOf('context.close'));
+  }
+  t.mock.timers.tick(30);await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(f.calls.filter(value=>value==='context.close').length,1,'a cleared drain timer cannot close again');
+});
+
+for(const stuck of ['fulfill','dispose'])test(`READY closes at the original deadline when ${stuck} needs context closure to settle`,async t=>{
+  const {runLoadCheck}=await launcherModule();
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=runnerFixture(),blocked=deferred(),closed=deferred();let closeTime:number|undefined,channelClosed=false;
+  const response=providerResponse(f);
+  response.dispose=async()=>{
+    f.calls.push('response.dispose');
+    if(stuck==='dispose'){blocked.resolve(undefined);await closed.promise;}
+    if(channelClosed)throw Error('request channel closed during fallback');
+  };
+  f.context.close=async()=>{f.calls.push('context.close');closeTime=Date.now();channelClosed=true;closed.resolve(undefined);};
+  f.page.waitForFunction=async()=>{
+    const route=providerRoute(f,async()=>{f.calls.push('fetch');return response;});
+    if(stuck==='fulfill')route.fulfill=async()=>{f.calls.push('fulfill');blocked.resolve(undefined);await closed.promise;};
+    void f.route()(route);
+    await blocked.promise;t.mock.timers.setTime(1020);
+  };
+  const running=runLoadCheck(env,f.ports);await blocked.promise;
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  const closedBeforeDeadline=f.calls.includes('context.close');
+  t.mock.timers.tick(9);await new Promise<void>(resolve=>setImmediate(resolve));
+  const closedOneMsEarly=f.calls.includes('context.close');
+  t.mock.timers.tick(1);await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(f.calls.filter(value=>value==='context.close').length,1,'fallback closes without a fresh timeout or grace');
+  assert.deepEqual(await running,report('READY',['RESPONSE_DISPOSE']));
+  assert.equal(closedBeforeDeadline,false);assert.equal(closedOneMsEarly,false);
+  assert.equal(closeTime,1030,'only the ten remaining milliseconds belong to pre-close draining');
+  for(const call of ['fetch','fulfill','response.dispose','context.close','browser.close','dispose'])assert.equal(f.calls.filter(value=>value===call).length,1,call);
+});
+
+for(const terminal of ['TIMEOUT','ORIGIN'])test(`already expired ${terminal} closes without another drain budget and preserves the first result`,async t=>{
+  const {runLoadCheck}=await launcherModule();
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=runnerFixture(),disposing=deferred(),closed=deferred();let closeTime:number|undefined;
+  const response=providerResponse(f);
+  response.dispose=async()=>{f.calls.push('response.dispose');disposing.resolve(undefined);await closed.promise;throw Error('private channel disposal failure');};
+  f.context.close=async()=>{f.calls.push('context.close');closeTime=Date.now();closed.resolve(undefined);f.listeners.pageerror!(Error('later page failure'));};
+  f.page.waitForFunction=async()=>{
+    void f.route()(providerRoute(f,async()=>{f.calls.push('fetch');return response;}));
+    await disposing.promise;
+    if(terminal==='ORIGIN'){
+      const refused=providerRoute(f,async()=>assert.fail('refused origin must not fetch'));
+      const request=refused.request();refused.request=()=>({...request,url:()=> 'https://outside.invalid/private'});
+      refused.abort=async()=>{f.calls.push('abort');t.mock.timers.setTime(1030);};
+      await f.route()(refused);
+    }
+    await new Promise(()=>{});
+  };
+  const running=runLoadCheck(env,f.ports);await disposing.promise;
+  if(terminal==='TIMEOUT')t.mock.timers.tick(30);
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(f.calls.filter(value=>value==='context.close').length,1,'an expired budget does not receive even a one-millisecond grace');
+  assert.equal(closeTime,1030);
+  assert.deepEqual(await running,terminal==='ORIGIN'?{...report('ORIGIN',['RESPONSE_DISPOSE']),originReason:'HOST_NOT_ALLOWED'}:report('TIMEOUT',['RESPONSE_DISPOSE']));
+  for(const call of ['fetch','fulfill','response.dispose','context.close','browser.close','dispose'])assert.equal(f.calls.filter(value=>value===call).length,1,call);
+});
+
 test('registered route refuses foreign navigation before popup notification and unresolved frame ownership',async()=>{
   const {runLoadCheck}=await launcherModule();
   for(const ownership of ['foreign','missing','throwing']){
