@@ -161,7 +161,9 @@ test('host-family formatter bounds legacy, hostile and throwing metadata and rea
   assert.equal(reasonReads,1);assert.equal(groupReads,1);
   for(const value of [report('READY'),report('ORIGIN_STRIPE_COM_M'),report('ORIGIN_STRIPE_COM_OTHER'),{...report('ORIGIN'),originReason:'URL_INVALID'},{...report('ORIGIN'),originReason:'NON_HTTPS_SCHEME'},{...report('ORIGIN'),originReason:'NON_DEFAULT_PORT'},{...report('ORIGIN'),originReason:'private-sentinel'}]){
     const normal=formatLoadCheckResult(value);
-    assert.deepEqual(formatLoadCheckResult({...value,get originHostGroup(){return assert.fail('inapplicable group must not be read');}}),normal);
+    let inapplicableGroupReads=0;
+    assert.deepEqual(formatLoadCheckResult({...value,get originHostGroup(){inapplicableGroupReads++;return assert.fail('inapplicable group must not be read');}}),normal);
+    assert.equal(inapplicableGroupReads,0);
   }
 });
 
