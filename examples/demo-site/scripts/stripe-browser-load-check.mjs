@@ -7,7 +7,18 @@ const safeResults=new Set(['READY','REFUSED','BUILD','LAUNCH','CONTEXT','PAGE','
 const cleanupCodes=['CONTEXT_CLOSE','BROWSER_CLOSE','BUILD_DISPOSE','RESPONSE_DISPOSE','LATE_BUILD_DISPOSE','LATE_BROWSER_CLOSE','LATE_CONTEXT_CLOSE','LATE_PAGE_CLOSE','EXTRA_PAGE_CLOSE','DOWNLOAD_CANCEL','UNKNOWN'];
 const originReasons=new Set(['URL_INVALID','NON_HTTPS_SCHEME','NON_DEFAULT_PORT','HOST_NOT_ALLOWED']);
 const safeOriginReason=value=>originReasons.has(value)?value:'UNKNOWN';
-const snapshot=(loadResult,cleanupErrors,originReason)=>Object.freeze({loadResult,cleanupErrors:Object.freeze([...cleanupErrors]),...(loadResult==='ORIGIN'?{originReason:safeOriginReason(originReason)}:{})});
+const originHostGroups=new Set(['STRIPE_COM','STRIPE_NETWORK','OTHER']);
+const safeOriginHostGroup=value=>originHostGroups.has(value)?value:'UNKNOWN';
+const refusedHostGroup=url=>{
+  try{
+    const host=url.hostname;
+    if(typeof host!=='string'||!host)return 'UNKNOWN';
+    if(host==='stripe.com'||host.endsWith('.stripe.com'))return 'STRIPE_COM';
+    if(host==='stripe.network'||host.endsWith('.stripe.network'))return 'STRIPE_NETWORK';
+    return 'OTHER';
+  }catch{return 'UNKNOWN';}
+};
+const snapshot=(loadResult,cleanupErrors,originReason,originHostGroup)=>Object.freeze({loadResult,cleanupErrors:Object.freeze([...cleanupErrors]),...(loadResult==='ORIGIN'?{originReason:safeOriginReason(originReason),...(originReason==='HOST_NOT_ALLOWED'?{originHostGroup:safeOriginHostGroup(originHostGroup)}:{})}:{})});
 export function formatLoadCheckResult(report){
   try{
     const candidateLoad=report?.loadResult;
@@ -25,6 +36,10 @@ export function formatLoadCheckResult(report){
     if(loadResult==='ORIGIN'){
       let reason='UNKNOWN';try{reason=safeOriginReason(report.originReason);}catch{}
       originSuffix=` origin_reason=${reason}`;
+      if(reason==='HOST_NOT_ALLOWED'){
+        let group='UNKNOWN';try{group=safeOriginHostGroup(report.originHostGroup);}catch{}
+        originSuffix+=` host_group=${group}`;
+      }
     }
     return {line:`STRIPE_BROWSER_LOAD_CHECK load=${loadResult} cleanup=${components.length?'FAILED':'OK'} components=${components.join(',')||'NONE'}${originSuffix}`,exitCode:loadResult==='READY'&&!components.length?0:1};
   }catch{
@@ -52,7 +67,10 @@ export function refusalReason(request,assets,firstDocument,onOriginRefusal){
   if(request.navigation&&request.mainFrame)return 'NAVIGATION';
   if(!providerNetworkOrigin(url)){
     const reason=url.hostname==='m.stripe.com'?'ORIGIN_STRIPE_COM_M':url.hostname.endsWith('.stripe.com')?'ORIGIN_STRIPE_COM_OTHER':'ORIGIN';
-    if(reason==='ORIGIN')onOriginRefusal?.(url.protocol!=='https:'?'NON_HTTPS_SCHEME':url.port?'NON_DEFAULT_PORT':'HOST_NOT_ALLOWED');
+    if(reason==='ORIGIN'){
+      const cause=url.protocol!=='https:'?'NON_HTTPS_SCHEME':url.port?'NON_DEFAULT_PORT':'HOST_NOT_ALLOWED';
+      onOriginRefusal?.(cause,cause==='HOST_NOT_ALLOWED'?refusedHostGroup(url):undefined);
+    }
     return reason;
   }
   // This API gate precedes the broad provider-subresource origin decision.
@@ -69,7 +87,7 @@ export async function runLoadCheck(env,ports){
   let key;try{key=admitEnvironment(env);}catch{return snapshot('REFUSED',[]);}
   const timeoutMs=ports.timeoutMs??60000;
   const expires=Date.now()+timeoutMs;
-  let loadResult,originReason,signalFailure,build,browser,context,page,firstDocument=true,pageCount=0,finishing=false;
+  let loadResult,originReason,originHostGroup,signalFailure,build,browser,context,page,firstDocument=true,pageCount=0,finishing=false;
   const cleanupErrors=new Set();
   const pendingCleanup=new Set();
   const retiredExtras=new WeakSet();
@@ -83,7 +101,7 @@ export async function runLoadCheck(env,ports){
   const transports=new Set();
   const abort=new AbortController();
   const failed=new Promise(resolve=>{signalFailure=resolve;});
-  const fail=(code,originCause)=>{if(!loadResult&&!finishing){loadResult=safeResults.has(code)?code:'ELEMENT';if(loadResult==='ORIGIN')originReason=safeOriginReason(originCause);abort.abort();signalFailure(loadResult);}};
+  const fail=(code,originCause,hostGroup)=>{if(!loadResult&&!finishing){loadResult=safeResults.has(code)?code:'ELEMENT';if(loadResult==='ORIGIN'){originReason=safeOriginReason(originCause);if(originReason==='HOST_NOT_ALLOWED')originHostGroup=safeOriginHostGroup(hostGroup);}abort.abort();signalFailure(loadResult);}};
   const timer=setTimeout(()=>fail('TIMEOUT'),timeoutMs);
   const remaining=()=>Math.max(1,expires-Date.now());
   async function forwardProvider(route,url){
@@ -124,9 +142,9 @@ export async function runLoadCheck(env,ports){
         const view={url:request.url(),method:request.method(),headers:await request.allHeaders(),navigation:request.isNavigationRequest(),mainFrame:frame===page.mainFrame(),redirected:!!request.redirectedFrom()};
         // Header acquisition may outlive timeout or successful retirement.
         if(finishing||loadResult||Date.now()>=expires){if(!finishing)fail('TIMEOUT');await route.abort();return;}
-        let originCause;
-        const reason=loadResult??refusalReason(view,build.assets,firstDocument,value=>{originCause=value;});
-        if(reason){fail(reason,originCause);await route.abort();return;}
+        let originCause,hostGroup;
+        const reason=loadResult??refusalReason(view,build.assets,firstDocument,(value,group)=>{originCause=value;hostGroup=group;});
+        if(reason){fail(reason,originCause,hostGroup);await route.abort();return;}
         if(new URL(view.url).origin===localOrigin){
           const url=new URL(view.url);if(view.navigation)firstDocument=false;
           const asset=build.assets.get(url.pathname);
@@ -184,7 +202,7 @@ export async function runLoadCheck(env,ports){
     }
     while(pendingCleanup.size)await Promise.allSettled([...pendingCleanup]);
   }
-  return snapshot(loadResult,cleanupCodes.filter(code=>cleanupErrors.has(code)),originReason);
+  return snapshot(loadResult,cleanupCodes.filter(code=>cleanupErrors.has(code)),originReason,originHostGroup);
 }
 
 // Explicitly minimize the spawned browser environment; no account/provider keys.

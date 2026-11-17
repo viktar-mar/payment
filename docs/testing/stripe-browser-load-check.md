@@ -18,15 +18,23 @@ That receipt cannot recover whether readiness occurred or which cleanup componen
 change does not establish the cause or resolution of that historical result and
 is not native acceptance evidence.
 
-A later native report supplied by the user for `4e2464c` recorded
+A later native report at `4e2464c` recorded
 `load=READY cleanup=FAILED components=RESPONSE_DISPOSE`, but its exact exception
 was not retained. Source inspection of installed Playwright 1.63.0 shows that
 context closure disposes the
 request channel used by response disposal. Injected tests reproduce the race
 when that channel closes before pending disposal completes. This supports the
 cleanup ordering fix below; it does not prove the cause of the historical
-exception. Actual native Chrome/Stripe verification of this cleanup-order fix
-is **NOT_RUN**.
+exception. A subsequent native check at `ab85027` ran after the cleanup-order
+fix and did not report `RESPONSE_DISPOSE`, but failed with `ORIGIN` and did not
+confirm `READY`; it is not acceptance evidence.
+
+A native report at `ab85027` recorded
+`load=ORIGIN cleanup=OK components=NONE origin_reason=HOST_NOT_ALLOWED` and
+exit 1. Its hostname was not retained, so no host family or justified allowlist
+change can be inferred. The additional fixed host-family diagnostic below does
+not repair or establish loading compatibility. Native Chrome/Stripe verification
+of this new diagnostic is **NOT_RUN**.
 
 After separately authorizing an external Chrome/Stripe run, from the repository
 root use an explicitly supplied public test publishable key:
@@ -97,7 +105,7 @@ STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE
 STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=FAILED components=CONTEXT_CLOSE
 STRIPE_BROWSER_LOAD_CHECK load=API_PATH cleanup=FAILED components=BROWSER_CLOSE,BUILD_DISPOSE
 STRIPE_BROWSER_LOAD_CHECK load=NOT_CONFIRMED cleanup=FAILED components=RESPONSE_DISPOSE
-STRIPE_BROWSER_LOAD_CHECK load=ORIGIN cleanup=OK components=NONE origin_reason=HOST_NOT_ALLOWED
+STRIPE_BROWSER_LOAD_CHECK load=ORIGIN cleanup=OK components=NONE origin_reason=HOST_NOT_ALLOWED host_group=STRIPE_NETWORK
 ```
 
 Only generic `load=ORIGIN` appends `origin_reason` and includes `originReason` in
@@ -111,11 +119,28 @@ the immutable private report. These are fixed categories, not addresses:
 | `HOST_NOT_ALLOWED` | Its HTTPS host is outside the unchanged provider allowlist. |
 | `UNKNOWN` | The cause is absent, invalid or unavailable (including older reports). |
 
+Only the pair `load=ORIGIN origin_reason=HOST_NOT_ALLOWED` additionally includes
+immutable `originHostGroup` and appends `host_group` to stdout. This updates the
+private report format only for that pair. It groups the already parsed refused
+hostname without retaining its value:
+
+| Group | Meaning and examples |
+| --- | --- |
+| `STRIPE_COM` | `stripe.com` apex or a dot-delimited subdomain; dedicated Stripe refusal categories still take precedence, so generic cases are mostly the apex. |
+| `STRIPE_NETWORK` | `stripe.network` apex or a dot-delimited subdomain, such as `sub.stripe.network`; URL normalization handles case and explicit default port `:443`. |
+| `OTHER` | Any other parsed hostname, including `notstripe.network`, `stripe.network.evil.test`, `stripe.network.` and unrelated domains. |
+| `UNKNOWN` | Missing, invalid or unavailable group, including a throwing diagnostic getter or a legacy report without the field. |
+
+Non-HTTPS, non-default-port and all other results keep their previous report
+shape and CLI output. The new field cannot recover the unknown hostname or host
+family from the historical `ab85027` report. The example above is synthetic and
+does not authorize a refused request.
+
 The existing refusal order is preserved. After successful parsing, authentication,
 redirect, header, method, local-document and main-navigation gates run first. The
 existing `ORIGIN_STRIPE_COM_M` and `ORIGIN_STRIPE_COM_OTHER` categories stay unchanged.
 For generic `ORIGIN`, non-HTTPS precedes port, which precedes host refusal. The
-first terminal observation owns the cause; subsequent requests, page events and
+first terminal observation owns the cause and conditional group; subsequent requests, page events and
 cleanup cannot replace it. No hostname, URL, path, query, raw error, extra request
 or origin permission is added. The old `b50978a` receipt cannot be retrospectively
 assigned one of these causes. The last example above is synthetic.

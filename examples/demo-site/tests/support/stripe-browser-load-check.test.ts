@@ -103,6 +103,8 @@ test('generic ORIGIN reports only its fixed cause through the registered route a
     ['data:text/plain,private-sentinel','NON_HTTPS_SCHEME'],
     ['blob:https://js.stripe.com/private-sentinel','NON_HTTPS_SCHEME'],
     ['https://private-sentinel.invalid:8443/path?key=secret','NON_DEFAULT_PORT'],
+    ['http://stripe.network/private-sentinel','NON_HTTPS_SCHEME'],
+    ['https://stripe.network:8443/private-sentinel','NON_DEFAULT_PORT'],
     ['https://private-sentinel.invalid/path?key=secret','HOST_NOT_ALLOWED'],
   ];
   for(const [url,originReason] of cases){
@@ -114,11 +116,52 @@ test('generic ORIGIN reports only its fixed cause through the registered route a
       await f.route()(route);
     };
     const result=await runLoadCheck(env,f.ports);
-    assert.deepEqual(result,{...report('ORIGIN'),originReason});
+    assert.deepEqual(result,{...report('ORIGIN'),originReason,...(originReason==='HOST_NOT_ALLOWED'?{originHostGroup:'OTHER'}:{})});
     assert.equal(Object.isFrozen(result),true);
-    assert.deepEqual(formatLoadCheckResult(result),{line:`STRIPE_BROWSER_LOAD_CHECK load=ORIGIN cleanup=OK components=NONE origin_reason=${originReason}`,exitCode:1});
+    assert.deepEqual(formatLoadCheckResult(result),{line:`STRIPE_BROWSER_LOAD_CHECK load=ORIGIN cleanup=OK components=NONE origin_reason=${originReason}${originReason==='HOST_NOT_ALLOWED'?' host_group=OTHER':''}`,exitCode:1});
     assert.doesNotMatch(JSON.stringify(result)+JSON.stringify(formatLoadCheckResult(result)),/private-sentinel|secret|https?:|blob:|data:/);
     for(const call of ['abort','context.close','browser.close','dispose'])assert.equal(f.calls.filter(x=>x===call).length,1,call);
+  }
+});
+
+test('HOST_NOT_ALLOWED retains only a fixed host family from refused parsed URLs',async()=>{
+  const {runLoadCheck,formatLoadCheckResult}=await launcherModule();
+  for(const [host,originHostGroup] of [
+    ['stripe.com','STRIPE_COM'],['stripe.network','STRIPE_NETWORK'],['sub.stripe.network','STRIPE_NETWORK'],
+    ['SUB.STRIPE.NETWORK:443','STRIPE_NETWORK'],['notstripe.network','OTHER'],['stripe.network.evil.test','OTHER'],
+    ['stripe.network.','OTHER'],['unrelated.invalid','OTHER'],
+  ]){
+    const f=runnerFixture();f.page.waitForFunction=async()=>{
+      const route:any=providerRoute(f,async()=>assert.fail('refused host must not fetch'));
+      const request=route.request();route.request=()=>({...request,url:()=>`https://${host}/private-sentinel?key=secret`});
+      route.fulfill=async()=>assert.fail('refused host must not fulfill');await f.route()(route);
+    };
+    const result=await runLoadCheck(env,f.ports);
+    assert.deepEqual(result,{...report('ORIGIN'),originReason:'HOST_NOT_ALLOWED',originHostGroup});
+    assert.equal(Object.isFrozen(result),true);assert.equal(Object.isFrozen(result.cleanupErrors),true);
+    assert.throws(()=>{result.originHostGroup='OTHER';});
+    const formatted=formatLoadCheckResult(result);
+    assert.deepEqual(formatted,{line:`STRIPE_BROWSER_LOAD_CHECK load=ORIGIN cleanup=OK components=NONE origin_reason=HOST_NOT_ALLOWED host_group=${originHostGroup}`,exitCode:1});
+    assert.doesNotMatch(JSON.stringify(result)+JSON.stringify(formatted),/private-sentinel|secret|https:|stripe\.network|stripe\.com/);
+    assert.equal(f.calls.filter(call=>call==='abort').length,1);
+  }
+});
+
+test('host-family formatter bounds legacy, hostile and throwing metadata and reads applicable fields once',async()=>{
+  const {formatLoadCheckResult}=await launcherModule();
+  const base={...report('ORIGIN',['CONTEXT_CLOSE']),originReason:'HOST_NOT_ALLOWED'};
+  const expected=(group:string)=>({line:`STRIPE_BROWSER_LOAD_CHECK load=ORIGIN cleanup=FAILED components=CONTEXT_CLOSE origin_reason=HOST_NOT_ALLOWED host_group=${group}`,exitCode:1});
+  for(const originHostGroup of [undefined,null,'private-sentinel https://outside.invalid/',{},['OTHER'],'stripe.network'])
+    assert.deepEqual(formatLoadCheckResult({...base,originHostGroup}),expected('UNKNOWN'));
+  assert.deepEqual(formatLoadCheckResult({...base,get originHostGroup(){throw Error('private-sentinel');}}),expected('UNKNOWN'));
+  for(const originHostGroup of ['STRIPE_COM','STRIPE_NETWORK','OTHER','UNKNOWN'])
+    assert.deepEqual(formatLoadCheckResult({...base,originHostGroup}),expected(originHostGroup));
+  let reasonReads=0,groupReads=0;
+  assert.deepEqual(formatLoadCheckResult({...base,get originReason(){reasonReads++;return reasonReads===1?'HOST_NOT_ALLOWED':'URL_INVALID';},get originHostGroup(){groupReads++;return groupReads===1?'STRIPE_NETWORK':'private-sentinel';}}),expected('STRIPE_NETWORK'));
+  assert.equal(reasonReads,1);assert.equal(groupReads,1);
+  for(const value of [report('READY'),report('ORIGIN_STRIPE_COM_M'),report('ORIGIN_STRIPE_COM_OTHER'),{...report('ORIGIN'),originReason:'URL_INVALID'},{...report('ORIGIN'),originReason:'NON_HTTPS_SCHEME'},{...report('ORIGIN'),originReason:'NON_DEFAULT_PORT'},{...report('ORIGIN'),originReason:'private-sentinel'}]){
+    const normal=formatLoadCheckResult(value);
+    assert.deepEqual(formatLoadCheckResult({...value,get originHostGroup(){return assert.fail('inapplicable group must not be read');}}),normal);
   }
 });
 
@@ -126,13 +169,13 @@ test('ORIGIN cause belongs to the first failure and survives later refusal and c
   const {runLoadCheck}=await launcherModule();const f=runnerFixture();
   f.context.close=async()=>{f.calls.push('context.close');throw Error('private cleanup');};
   f.page.waitForFunction=async()=>{
-    for(const url of ['https://private-sentinel.invalid/path','http://private-sentinel.invalid/']){
+    for(const url of ['https://stripe.network/private-sentinel','https://stripe.com/private-sentinel','http://private-sentinel.invalid/']){
       const route:any=providerRoute(f,async()=>assert.fail('forbidden fetch'));
       const req=route.request();route.request=()=>({...req,url:()=>url});await f.route()(route);
     }
     f.listeners.pageerror!(Error('private later error'));
   };
-  assert.deepEqual(await runLoadCheck(env,f.ports),{...report('ORIGIN',['CONTEXT_CLOSE']),originReason:'HOST_NOT_ALLOWED'});
+  assert.deepEqual(await runLoadCheck(env,f.ports),{...report('ORIGIN',['CONTEXT_CLOSE']),originReason:'HOST_NOT_ALLOWED',originHostGroup:'STRIPE_NETWORK'});
 });
 
 test('ORIGIN formatter bounds legacy, hostile and throwing causes without altering the primary result',async()=>{
@@ -144,7 +187,7 @@ test('ORIGIN formatter bounds legacy, hostile and throwing causes without alteri
   assert.deepEqual(formatLoadCheckResult({...report('ORIGIN'),get originReason(){throw Error('private-sentinel');}}),unknown);
   let reads=0;
   assert.deepEqual(formatLoadCheckResult({...report('ORIGIN'),get originReason(){reads++;return reads===1?'HOST_NOT_ALLOWED':'private-sentinel';}}),
-    {line:'STRIPE_BROWSER_LOAD_CHECK load=ORIGIN cleanup=OK components=NONE origin_reason=HOST_NOT_ALLOWED',exitCode:1});
+    {line:'STRIPE_BROWSER_LOAD_CHECK load=ORIGIN cleanup=OK components=NONE origin_reason=HOST_NOT_ALLOWED host_group=UNKNOWN',exitCode:1});
   assert.equal(reads,1);
   assert.deepEqual(formatLoadCheckResult({...report('READY'),get originReason(){return assert.fail('unrelated diagnostic must not be read');}}),
     {line:'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE',exitCode:0});
@@ -340,7 +383,7 @@ for(const terminal of ['TIMEOUT','ORIGIN'])test(`already expired ${terminal} clo
   await new Promise<void>(resolve=>setImmediate(resolve));
   assert.equal(f.calls.filter(value=>value==='context.close').length,1,'an expired budget does not receive even a one-millisecond grace');
   assert.equal(closeTime,1030);
-  assert.deepEqual(await running,terminal==='ORIGIN'?{...report('ORIGIN',['RESPONSE_DISPOSE']),originReason:'HOST_NOT_ALLOWED'}:report('TIMEOUT',['RESPONSE_DISPOSE']));
+  assert.deepEqual(await running,terminal==='ORIGIN'?{...report('ORIGIN',['RESPONSE_DISPOSE']),originReason:'HOST_NOT_ALLOWED',originHostGroup:'OTHER'}:report('TIMEOUT',['RESPONSE_DISPOSE']));
   for(const call of ['fetch','fulfill','response.dispose','context.close','browser.close','dispose'])assert.equal(f.calls.filter(value=>value===call).length,1,call);
 });
 
