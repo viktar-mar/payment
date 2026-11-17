@@ -18,6 +18,19 @@ const refusedHostGroup=url=>{
     return 'OTHER';
   }catch{return 'UNKNOWN';}
 };
+// Witness validation is deliberately stricter than public host-family grouping.
+// Check raw authority first: URL normalization must not hide non-ASCII DNS input.
+const refusedNetworkOrigin=value=>{
+  try{
+    const authority=/^https:\/\/([A-Za-z0-9.-]+)(?::443)?(?:[/?#]|$)/i.exec(value);
+    if(!authority)return undefined;
+    const url=new URL(value),host=url.hostname;
+    if(url.protocol!=='https:'||url.username||url.password||url.port||host.length>253)return undefined;
+    if(host!=='stripe.network'&&!host.endsWith('.stripe.network'))return undefined;
+    if(!host.split('.').every(label=>label.length<=63&&/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)))return undefined;
+    return url.origin;
+  }catch{return undefined;}
+};
 const snapshot=(loadResult,cleanupErrors,originReason,originHostGroup)=>Object.freeze({loadResult,cleanupErrors:Object.freeze([...cleanupErrors]),...(loadResult==='ORIGIN'?{originReason:safeOriginReason(originReason),...(originReason==='HOST_NOT_ALLOWED'?{originHostGroup:safeOriginHostGroup(originHostGroup)}:{})}:{})});
 export function formatLoadCheckResult(report){
   try{
@@ -101,7 +114,7 @@ export async function runLoadCheck(env,ports){
   const transports=new Set();
   const abort=new AbortController();
   const failed=new Promise(resolve=>{signalFailure=resolve;});
-  const fail=(code,originCause,hostGroup)=>{if(!loadResult&&!finishing){loadResult=safeResults.has(code)?code:'ELEMENT';if(loadResult==='ORIGIN'){originReason=safeOriginReason(originCause);if(originReason==='HOST_NOT_ALLOWED')originHostGroup=safeOriginHostGroup(hostGroup);}abort.abort();signalFailure(loadResult);}};
+  const fail=(code,originCause,hostGroup)=>{if(!loadResult&&!finishing){loadResult=safeResults.has(code)?code:'ELEMENT';if(loadResult==='ORIGIN'){originReason=safeOriginReason(originCause);if(originReason==='HOST_NOT_ALLOWED')originHostGroup=safeOriginHostGroup(hostGroup);}abort.abort();signalFailure(loadResult);return true;}return false;};
   const timer=setTimeout(()=>fail('TIMEOUT'),timeoutMs);
   const remaining=()=>Math.max(1,expires-Date.now());
   async function forwardProvider(route,url){
@@ -144,7 +157,19 @@ export async function runLoadCheck(env,ports){
         if(finishing||loadResult||Date.now()>=expires){if(!finishing)fail('TIMEOUT');await route.abort();return;}
         let originCause,hostGroup;
         const reason=loadResult??refusalReason(view,build.assets,firstDocument,(value,group)=>{originCause=value;hostGroup=group;});
-        if(reason){fail(reason,originCause,hostGroup);await route.abort();return;}
+        if(reason){
+          const won=fail(reason,originCause,hostGroup);
+          if(won&&reason==='ORIGIN'&&originCause==='HOST_NOT_ALLOWED'&&hostGroup==='STRIPE_NETWORK'){
+            const origin=refusedNetworkOrigin(view.url);
+            if(origin)try{
+              // Trusted synchronous hook, read only for this winning refusal.
+              // Its failures (including returned thenables) never own load state.
+              const observer=ports.onRefusedNetworkOrigin;
+              if(typeof observer==='function')void Promise.resolve(observer(origin)).catch(()=>{});
+            }catch{}
+          }
+          await route.abort();return;
+        }
         if(new URL(view.url).origin===localOrigin){
           const url=new URL(view.url);if(view.navigation)firstDocument=false;
           const asset=build.assets.get(url.pathname);
@@ -236,9 +261,18 @@ async function realPorts(env){
     },
   };
 }
+/** Private harness entry; no capture writer or automatic observer is installed. */
+export async function runNativeLoadCheck(env,observer){
+  try{
+    admitEnvironment(env);
+    if(observer!==undefined&&typeof observer!=='function')return snapshot('REFUSED',[]);
+    const ports=await realPorts(env);
+    if(observer!==undefined)ports.onRefusedNetworkOrigin=observer;
+    return await runLoadCheck(env,ports);
+  }catch{return snapshot('REFUSED',[]);}
+}
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href){
-  let result=snapshot('REFUSED',[]);
-  try{admitEnvironment(process.env);result=await runLoadCheck(process.env,await realPorts(process.env));}catch{}
+  const result=await runNativeLoadCheck(process.env);
   const {line,exitCode}=formatLoadCheckResult(result);
   process.stdout.write(line+'\n');
   process.exitCode=exitCode;

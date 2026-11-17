@@ -141,8 +141,8 @@ redirect, header, method, local-document and main-navigation gates run first. Th
 existing `ORIGIN_STRIPE_COM_M` and `ORIGIN_STRIPE_COM_OTHER` categories stay unchanged.
 For generic `ORIGIN`, non-HTTPS precedes port, which precedes host refusal. The
 first terminal observation owns the cause and conditional group; subsequent requests, page events and
-cleanup cannot replace it. No hostname, URL, path, query, raw error, extra request
-or origin permission is added. The old `b50978a` receipt cannot be retrospectively
+cleanup cannot replace it. No hostname, URL, path, query or raw error is added to the public report or
+stdout; no extra request or origin permission is added. The old `b50978a` receipt cannot be retrospectively
 assigned one of these causes. The last example above is synthetic.
 
 Exit 0 requires `READY` and no cleanup errors; every other report exits 1.
@@ -163,3 +163,49 @@ the Element under this egress gate. It does not establish client-secret payment
 or setup compatibility, account binding, cash movement, renewal, recovery, SCA,
 settlement or full failed-renewal acceptance. Allowed provider requests can
 include telemetry; this is a future networked check, not a zero-egress test.
+
+## Optional private refusal witness
+
+The native receipt identified by `BLYqSg` reported
+`HOST_NOT_ALLOWED` / `STRIPE_NETWORK`; its exact hostname remains unidentified.
+This change prepares a private witness contract only. It does not establish host
+ownership, necessity, an allowlist repair or successful loading. Native
+verification of the witness is **NOT_RUN**; private evidence capture is
+**NOT_RUN**. The existing origin allowlist and CSP remain unchanged.
+
+The launcher exposes two private harness interfaces, outside the SDK:
+`runLoadCheck(env, ports)` accepts optional `ports.onRefusedNetworkOrigin(origin)`,
+and `runNativeLoadCheck(env, observer?)` accepts an explicit trusted callback.
+Native admission validates the environment and optional callback type before
+build or browser acquisition. The default CLI calls the native entry without an
+observer. There is no environment switch, automatic capture, filesystem writer
+or default persistence.
+
+Only the original winning `ORIGIN` / `HOST_NOT_ALLOWED` / `STRIPE_NETWORK`
+refusal can offer an origin. The runner commits its terminal result and abort
+signal before reading the observer once. It derives the candidate from the
+already captured URL, without reading the request again. Validation requires a
+raw ASCII HTTPS DNS authority, no userinfo, no non-default port, labels of 1–63
+characters with alphanumeric ends, and total hostname length at most 253. Only
+`stripe.network` or a dotted descendant qualifies. Trailing dots, empty labels,
+underscores, malformed hyphens, lookalikes and non-ASCII authority normalization
+are rejected. Case and explicit `:443` canonicalize; only `url.origin` is offered,
+so paths, queries and fragments are discarded.
+
+Other gates, malformed candidates, a preceding failure, readiness, timeout and
+retirement never read the observer. A throwing getter or callback, or a rejected
+return, cannot replace the refusal, change cleanup or trigger another offer.
+The runner does not await the return; returned promises are defensively rejection
+handled. The callback contract is a bounded synchronous writer. This defensive
+handling does not grant asynchronous work any authority or completion guarantee.
+
+A future caller requires separate explicit authorization for both external
+Chrome/Stripe execution and private evidence capture. That caller must supply
+its own trusted origin-only writer, create a fresh private receipt directory
+with mode `0700`, and create the evidence file exclusively with mode `0600`.
+It must bind the receipt to the actual invocation and source identity, and report
+capture success or failure separately from the unchanged load/cleanup result.
+It must not persist a URL path, query, fragment, headers, body, key or raw error.
+Those caller responsibilities are not implemented or exercised here. A missing
+witness or writer failure is not proof of host absence and does not authorize a
+retry, policy widening or a loading-fix claim.

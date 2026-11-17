@@ -627,3 +627,67 @@ test('formatter reads indexed cleanup entries without consulting a custom iterat
   Object.defineProperty(unread,Symbol.iterator,{get(){assert.fail('cleanup array iterator must not be read');}});
   assert.deepEqual(formatLoadCheckResult(report('READY',unread)),expected);
 });
+
+// Private witness tests use artificial origins and injected resources only.
+const networkRefusal={...report('ORIGIN'),originReason:'HOST_NOT_ALLOWED',originHostGroup:'STRIPE_NETWORK'};
+function witnessRoute(f:ReturnType<typeof runnerFixture>,url:string,extra:any={}){
+  const route=providerRoute(f,async()=>assert.fail('refused witness must never fetch'));
+  const request=route.request();let reads=0;
+  route.request=()=>({...request,url:()=>{reads++;return url;},...extra});
+  return {route,reads:()=>reads};
+}
+test('private native entry is inert and rejects invalid parameters before acquisition',async()=>{
+  const {runNativeLoadCheck}=await launcherModule();
+  assert.equal(typeof runNativeLoadCheck,'function');
+  assert.deepEqual(await runNativeLoadCheck({}),report('REFUSED'));
+  for(const observer of [null,false,{},'capture'])assert.deepEqual(await runNativeLoadCheck(env,observer),report('REFUSED'));
+});
+test('private witness offers canonical origin once after terminal abort without public leakage',async()=>{
+  const {runLoadCheck,formatLoadCheckResult}=await launcherModule();const f=runnerFixture();
+  let signal:AbortSignal|undefined,reads=0;const origins:string[]=[];
+  const build=f.ports.build;f.ports.build=async(...args:any[])=>{signal=args[0];return build();};
+  Object.defineProperty(f.ports,'onRefusedNetworkOrigin',{get(){reads++;return (origin:string)=>{assert.equal(signal?.aborted,true);origins.push(origin);f.listeners.pageerror!(Error('private callback failure'));};}});
+  const first=witnessRoute(f,'https://Witness-Private.stripe.network:443/private?secret=value#fragment');
+  f.page.waitForFunction=async()=>{await f.route()(first.route);await f.route()(witnessRoute(f,'https://later.stripe.network/').route);};
+  const result=await runLoadCheck(env,f.ports);
+  assert.deepEqual(result,networkRefusal);assert.deepEqual(origins,['https://witness-private.stripe.network']);assert.equal(reads,1);assert.equal(first.reads(),1);
+  assert.equal(Object.isFrozen(result),true);assert.ok(!JSON.stringify([result,formatLoadCheckResult(result)]).includes('witness-private'));
+  assert.equal(f.calls.filter(x=>x==='abort').length,2);
+});
+test('private witness never reads observer for inapplicable requests or malformed DNS',async()=>{
+  const {runLoadCheck}=await launcherModule();
+  for(const [url,extra] of [
+    ['http://witness.stripe.network/',{}],['https://witness.stripe.network:8443/',{}],['https://user:secret@witness.stripe.network/',{}],
+    ['https://witness.stripe.network/',{allHeaders:async()=>({Authorization:'private'})}],['https://witness.stripe.network/',{method:()=> 'DELETE'}],
+    ['https://witness.stripe.network/',{isNavigationRequest:()=>true}],['https://witness.stripe.network/',{redirectedFrom:()=>({})}],
+    ['https://other.invalid/',{}],['https://m.stripe.com/',{}],['https://stripe.network.evil.invalid/',{}],
+    ['https://bad_.stripe.network/',{}],['https://-bad.stripe.network/',{}],['https://bad-.stripe.network/',{}],['https://bad..stripe.network/',{}],
+    ['https://stripe.network./',{}],[`https://${'a'.repeat(64)}.stripe.network/`,{}],[`https://${Array(4).fill('a'.repeat(63)).join('.')}.stripe.network/`,{}],
+    ['https://ｗitness.stripe.network/',{}],['https://witness。stripe.network/',{}],
+  ] as const){
+    const f=runnerFixture();let reads=0;Object.defineProperty(f.ports,'onRefusedNetworkOrigin',{get(){reads++;throw Error('private observer read');}});
+    f.page.waitForFunction=async()=>{await f.route()(witnessRoute(f,url,extra).route);};
+    await runLoadCheck(env,f.ports);assert.equal(reads,0,url);
+  }
+});
+test('private witness ignores getter and callback failures and rejected returns without retry or result changes',async()=>{
+  const {runLoadCheck}=await launcherModule();
+  for(const mode of ['getter','throw','reject','then-getter']){
+    const f=runnerFixture();let reads=0,calls=0;
+    Object.defineProperty(f.ports,'onRefusedNetworkOrigin',{get(){reads++;if(mode==='getter')throw Error('private getter');return ()=>{calls++;if(mode==='throw')throw Error('private callback');if(mode==='reject')return Promise.reject(Error('private rejected callback'));return {get then(){throw Error('private then');}};};}});
+    f.context.close=async()=>{f.calls.push('context.close');throw Error('private cleanup');};
+    f.page.waitForFunction=async()=>{await f.route()(witnessRoute(f,'https://one.stripe.network/private').route);await f.route()(witnessRoute(f,'https://two.stripe.network/').route);};
+    assert.deepEqual(await runLoadCheck(env,f.ports),{...networkRefusal,cleanupErrors:['CONTEXT_CLOSE']});
+    await new Promise<void>(resolve=>setImmediate(resolve));assert.equal(reads,1);assert.equal(calls,mode==='getter'?0:1);
+    for(const name of ['context.close','browser.close','dispose'])assert.equal(f.calls.filter(x=>x===name).length,1);
+  }
+});
+test('private witness cannot observe late headers after READY, timeout, or a preceding failure',async()=>{
+  const {runLoadCheck}=await launcherModule();
+  for(const terminal of ['READY','TIMEOUT','ELEMENT']){
+    const f=runnerFixture(),headers=deferred();let routing:Promise<any>|undefined,reads=0;
+    Object.defineProperty(f.ports,'onRefusedNetworkOrigin',{get(){reads++;throw Error('late observer');}});
+    f.page.waitForFunction=async()=>{routing=f.route()(witnessRoute(f,'https://late.stripe.network/private',{allHeaders:()=>headers.promise}).route);if(terminal==='ELEMENT')f.listeners.pageerror!();if(terminal!=='READY')await new Promise(()=>{});};
+    assert.deepEqual(await runLoadCheck(env,f.ports),report(terminal));headers.resolve({});await routing;assert.equal(reads,0);
+  }
+});
