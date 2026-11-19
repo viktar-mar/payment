@@ -1962,16 +1962,20 @@ async function failedRenewalPersistencePrepared(configure=()=>{}){
 }
 const refusedOriginPath=DIR+'/refused-provider-origin.private.json';
 const refusedWitness=()=>({runId:RUN,expectedSource:'e'.repeat(40),origin:'https://evidence-only.stripe.com'});
+const otherRefusedWitness=()=>({...refusedWitness(),origin:'https://evidence-only.example',checkpoint:'BROWSER_PROVIDER_ORIGIN_OTHER'});
 async function failedRenewalOriginLive(configure=()=>{}){
  const f=await failedRenewalPersistencePrepared(configure);await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(f.limits);return f;
 }
 // Break: private evidence becomes a ledger operation, caller-controlled path, retry, or public payload.
-test('refused origin writes only one fixed private bounded file for the original LIVE owner',async()=>{
+for(const [name,witness,checkpoint] of [
+ ['Stripe family',refusedWitness,'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'],
+ ['other origin',otherRefusedWitness,'BROWSER_PROVIDER_ORIGIN_OTHER'],
+])test('refused origin writes only one fixed private bounded file for the original LIVE owner: '+name,async()=>{
  const f=await failedRenewalOriginLive(),b=f.adapter,before=b.resources(),ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents),offset=f.events.length;
  assert.equal(typeof b.persistRefusedStripeOrigin,'function');
- assert.equal(await b.persistRefusedStripeOrigin(refusedWitness(),f.limits),true);
+ assert.equal(await b.persistRefusedStripeOrigin(witness(),f.limits),true);
  const entry=f.files.get(refusedOriginPath),events=f.events.slice(offset);
- assert.deepEqual(JSON.parse(entry.contents),{runId:RUN,expectedSource:'e'.repeat(40),checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER',origin:'https://evidence-only.stripe.com'});
+ assert.deepEqual(JSON.parse(entry.contents),{runId:RUN,expectedSource:'e'.repeat(40),checkpoint,origin:witness().origin});
  assert.ok(entry.contents.length<=1024);assert.equal(entry.mode&0o7777,0o600);assert.equal(f.files.get(DIR).mode&0o7777,0o700);
  const opened=events.find(e=>e.type==='open'&&e.path===refusedOriginPath);assert.ok(opened.flags&constants.O_EXCL);assert.ok(opened.flags&constants.O_NOFOLLOW);assert.equal(opened.mode,0o600);
  assert.deepEqual(b.resources(),before);assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,ledger);
@@ -1986,6 +1990,11 @@ for(const [name,change] of [
  ['historical run',w=>{w.runId='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';}],['foreign source',w=>{w.expectedSource='a'.repeat(40);}],
  ['raw URL',w=>{w.origin+='/?sensitive=canary#private';}],['permitted host',w=>{w.origin='https://api.stripe.com';}],
  ['merchant network host',w=>{w.origin='https://merchant-ui-api.stripe.com';}],
+ ['other label with Stripe family origin',w=>{w.checkpoint='BROWSER_PROVIDER_ORIGIN_OTHER';}],
+ ['other origin without explicit label',w=>{w.origin='https://evidence-only.example';}],
+ ['other origin with wrong label',w=>Object.assign(w,otherRefusedWitness(),{checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'})],
+ ['other origin with query',w=>Object.assign(w,otherRefusedWitness(),{origin:'https://evidence-only.example/?key=canary'})],
+ ['other origin with checkpoint accessor',(w,touch)=>{Object.assign(w,otherRefusedWitness());Object.defineProperty(w,'checkpoint',{enumerable:true,get(){touch();return 'BROWSER_PROVIDER_ORIGIN_OTHER';}});}],
  ['extra field',w=>{w.path='/tmp/private-canary';}],['inherited',w=>Object.setPrototypeOf(w,{canary:true})],
  ['accessor',(w,touch)=>Object.defineProperty(w,'origin',{enumerable:true,get(){touch();return 'https://evidence-only.stripe.com';}})]
 ])test('refused origin consumes '+name+' without file IO or caller getter evaluation',async()=>{
@@ -2003,6 +2012,22 @@ test('refused origin uses each own descriptor snapshot once and never ordinary f
  const w=new Proxy(refusedWitness(),{get(){gets++;throw null;},getOwnPropertyDescriptor(target,key){captures.set(key,(captures.get(key)??0)+1);const d=Reflect.getOwnPropertyDescriptor(target,key);return captures.get(key)===1?d:{...d,value:'https://substituted.invalid'};}});
  assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');assert.equal(await f.adapter.persistRefusedStripeOrigin(w,f.limits),true);
  assert.equal(gets,0);assert.deepEqual([...captures.values()],[1,1,1]);assert.equal(JSON.parse(f.files.get(refusedOriginPath).contents).origin,'https://evidence-only.stripe.com');
+ await f.adapter.stop({deadline:f.limits.deadline+120000});
+});
+test('refused other origin preserves an existing private report and consumes the offer',async()=>{
+ const f=await failedRenewalOriginLive();
+ const original={...f.files.get(DIR+'/owner.lock'),contents:Buffer.from('original closed report'),ino:999999};
+ f.files.set(refusedOriginPath,original);
+ const offset=f.events.length;
+ assert.equal(await f.adapter.persistRefusedStripeOrigin(otherRefusedWitness(),f.limits),false);
+ const attempted=f.events.slice(offset).find(event=>event.type==='open'&&event.path===refusedOriginPath);
+ assert.ok(attempted?.flags&constants.O_EXCL);
+ assert.equal(f.files.get(refusedOriginPath),original);
+ assert.equal(original.contents.toString(),'original closed report');
+ assert.equal(f.events.slice(offset).some(event=>['write','rename','unlink'].includes(event.type)),false);
+ const after=f.events.length;
+ assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);
+ assert.equal(f.events.length,after);
  await f.adapter.stop({deadline:f.limits.deadline+120000});
 });
 for(const drift of ['directory inode','directory mode','lock inode','lock mode','lock hardlink','lock symlink','existing','symlink','hardlink'])test('refused origin refuses '+drift+' without overwrite unlink retry or pending fence',async()=>{

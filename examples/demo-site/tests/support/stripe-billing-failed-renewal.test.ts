@@ -364,17 +364,21 @@ const providerCases:readonly [string,ProviderProbe,string,string?][]=[
  ['malformed URL before provider classification',{target:'https://m.stripe.com:invalid/'},'BROWSER_READY_PHASE'],
  ['network apex',{target:'https://stripe.network/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
  ['network subdomain',{target:'https://other.stripe.network/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
- ['other',{target:'https://elsewhere.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
- ['com lookalike',{target:'https://notstripe.com/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
- ['network lookalike',{target:'https://notstripe.network/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
- ['suffix lookalike',{target:'https://js.stripe.com.evil.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
- ['stripe m prefix lookalike',{target:'https://mstripe.com/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
- ['stripe r prefix lookalike',{target:'https://rstripe.com/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
- ['stripe m suffix lookalike',{target:'https://m.stripe.com.evil.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
- ['stripe r suffix lookalike',{target:'https://r.stripe.com.evil.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
- ['stripe m trailing dot',{target:'https://m.stripe.com./'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
- ['stripe r trailing dot',{target:'https://r.stripe.com./'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
- ['trailing dot',{target:'https://js.stripe.com./'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
+ ['other',{target:'https://elsewhere.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://elsewhere.test'],
+ ['other redirect',{target:'https://elsewhere.test/',redirect:'present'},'BROWSER_PROVIDER_REDIRECT'],
+ ['other userinfo',{target:'https://user:pass@elsewhere.test/'},'BROWSER_PROVIDER_USERINFO'],
+ ['other authorization',{target:'https://elsewhere.test/',headers:{authorization:'Bearer provider'}},'BROWSER_PROVIDER_AUTH'],
+ ['other explicit port',{target:'https://elsewhere.test:444/'},'BROWSER_PROVIDER_ORIGIN_PORT'],
+ ['com lookalike',{target:'https://notstripe.com/'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://notstripe.com'],
+ ['network lookalike',{target:'https://notstripe.network/'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://notstripe.network'],
+ ['suffix lookalike',{target:'https://js.stripe.com.evil.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://js.stripe.com.evil.test'],
+ ['stripe m prefix lookalike',{target:'https://mstripe.com/'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://mstripe.com'],
+ ['stripe r prefix lookalike',{target:'https://rstripe.com/'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://rstripe.com'],
+ ['stripe m suffix lookalike',{target:'https://m.stripe.com.evil.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://m.stripe.com.evil.test'],
+ ['stripe r suffix lookalike',{target:'https://r.stripe.com.evil.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://r.stripe.com.evil.test'],
+ ['stripe m trailing dot',{target:'https://m.stripe.com./'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://m.stripe.com.'],
+ ['stripe r trailing dot',{target:'https://r.stripe.com./'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://r.stripe.com.'],
+ ['trailing dot',{target:'https://js.stripe.com./'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://js.stripe.com.'],
  ['main navigation',{target:'https://js.stripe.com/',navigation:'main'},'BROWSER_PROVIDER_NAVIGATION'],
  ['navigation lookup',{target:'https://js.stripe.com/',navigation:'throw'},'BROWSER_PROVIDER_NAVIGATION'],
  ['frame lookup',{target:'https://js.stripe.com/',navigation:'frame'},'BROWSER_PROVIDER_NAVIGATION'],
@@ -399,8 +403,12 @@ async function consumeProviderBoundary(h:Awaited<ReturnType<typeof fixture>>,pro
   assert.equal(browserDiagnostic(first),checkpoint);
   assert.equal(typeof privateOrigin.browserProviderOrigin,'function');
   const saved=privateOrigin.browserProviderOrigin(first);
-  assert.deepEqual(saved,expectedOrigin?{runId:id(1),expectedSource:'a'.repeat(40),origin:expectedOrigin}:null);
-  if(expectedOrigin)assert.equal(Object.isFrozen(saved),true);
+  const other=checkpoint==='BROWSER_PROVIDER_ORIGIN_OTHER';
+  const expected=expectedOrigin && !(other && probe.phase==='method')
+    ? {runId:id(1),expectedSource:'a'.repeat(40),origin:expectedOrigin,...(other?{checkpoint}:{})}
+    : null;
+  assert.deepEqual(saved,expected);
+  if(expected)assert.equal(Object.isFrozen(saved),true);
   assert.doesNotMatch(String(first),/secret_fixture|canary|Bearer|stripe|elsewhere|user|pass/);
   assert.equal(h.providerFallbacks(),probe.fallbackFailure?1:0);
   assert.equal(h.counts.filter(v=>v==='confirm').length,probe.phase==='method'?1:0);assert.equal(h.counts.includes('permit'),false);
@@ -430,8 +438,8 @@ const merchantProviderCases:readonly [string,ProviderProbe,string,string?][]=[
  ['nondefault port',{target:'https://merchant-ui-api.stripe.com:444/'},'BROWSER_PROVIDER_ORIGIN_PORT'],
  ['child origin before navigation',{target:'https://child.merchant-ui-api.stripe.com/',navigation:'main'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','https://child.merchant-ui-api.stripe.com'],
  ['prefix lookalike',{target:'https://othermerchant-ui-api.stripe.com/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','https://othermerchant-ui-api.stripe.com'],
- ['suffix lookalike',{target:'https://merchant-ui-api.stripe.com.evil.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
- ['trailing dot',{target:'https://merchant-ui-api.stripe.com./'},'BROWSER_PROVIDER_ORIGIN_OTHER'],
+ ['suffix lookalike',{target:'https://merchant-ui-api.stripe.com.evil.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://merchant-ui-api.stripe.com.evil.test'],
+ ['trailing dot',{target:'https://merchant-ui-api.stripe.com./'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://merchant-ui-api.stripe.com.'],
  ['top navigation',{target:'https://merchant-ui-api.stripe.com/',navigation:'main'},'BROWSER_PROVIDER_NAVIGATION'],
  ['navigation lookup',{target:'https://merchant-ui-api.stripe.com/',navigation:'throw'},'BROWSER_PROVIDER_NAVIGATION'],
  ['frame lookup',{target:'https://merchant-ui-api.stripe.com/',navigation:'frame'},'BROWSER_PROVIDER_NAVIGATION'],
@@ -450,24 +458,25 @@ test('r provider boundary '+phase+' '+name,async()=>{
  const origin=expectedOrigin?.replace('merchant-ui-api','r');
  await consumeProviderBoundary(await fixture('',[probe]),probe,checkpoint,origin);
 });
-test('actual OTHER route keeps canonical private origin and original identity through replay and cleanup',async()=>{
- const probe={target:'https://OTHER.STRIPE.COM:443/artificial_sensitive_path?artificial_secret_query=value#artificial_secret_fragment'};
+for(const [host,checkpoint] of [['other.stripe.com','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'],['only-private.example','BROWSER_PROVIDER_ORIGIN_OTHER']] as const)
+test(checkpoint+' route keeps canonical private origin and original identity through replay and cleanup',async()=>{
+ const probe={target:'https://'+host.toUpperCase()+':443/artificial_sensitive_path?artificial_secret_query=value#artificial_secret_fragment'};
  const h=await fixture('',[probe]);let first:unknown;
  try{
   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>{first=error;return true;});
   assert.equal(typeof privateOrigin.browserProviderOrigin,'function');
-  const expected={runId:id(1),expectedSource:'a'.repeat(40),origin:'https://other.stripe.com'};
+  const expected={runId:id(1),expectedSource:'a'.repeat(40),origin:'https://'+host,...(checkpoint==='BROWSER_PROVIDER_ORIGIN_OTHER'?{checkpoint}:{})};
   assert.deepEqual(privateOrigin.browserProviderOrigin(first),expected);
-  await assert.rejects(h.probeProvider({target:'https://second.stripe.com/second_secret?secret=yes#secret'}));
+  await assert.rejects(h.probeProvider({target:'https://second.example/second_secret?secret=yes#secret'}));
   assert.deepEqual(privateOrigin.browserProviderOrigin(first),expected);
-  assert.equal(browserDiagnostic(first),'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');
+  assert.equal(browserDiagnostic(first),checkpoint);
   assert.equal(h.providerFallbacks(),0);assert.equal(h.counts.includes('confirm'),false);assert.equal(h.counts.includes('permit'),false);
   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>error===first);
   await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>error===first);
   assert.equal(await h.journey.close(nowLimits()),true);assert.equal(h.closed(),1);assert.equal(browserCleanupConfirmed(first),true);
   assert.deepEqual(privateOrigin.browserProviderOrigin(first),expected);
   assert.equal(JSON.stringify(first),'{}');assert.deepEqual(Object.keys(first as object),[]);
-  assert.doesNotMatch(String(first)+JSON.stringify(h.terminals)+h.status(),/stripe\.com|artificial_sensitive|artificial_secret|second_secret|aaaaaaaa/);
+  assert.doesNotMatch(String(first)+JSON.stringify(h.terminals)+h.status(),/stripe\.com|only-private|artificial_sensitive|artificial_secret|second_secret|aaaaaaaa/);
  }finally{h.releaseIO();await h.restore();}
 });
 for(const change of ['page_action','action_early_header'])test('earlier page or bridge refusal cannot acquire a later OTHER witness '+change,async()=>{
@@ -543,6 +552,9 @@ test('earlier page fault wins pending provider currentness failure',async()=>{
 });
 test('earlier page fault wins pending refused OTHER origin without late capture',async()=>{
  await consumeProviderPageFault(await fixture('',[{target:'https://other.stripe.com/private?secret=fixture#secret',hold:true}]));
+});
+test('earlier page fault wins pending non-Stripe origin without late capture',async()=>{
+ await consumeProviderPageFault(await fixture('',[{target:'https://private.example/path?secret=fixture#secret',hold:true}]));
 });
 for(const consumer of ['boundary','page fault'] as const)for(const outcome of ['reject','resolve'] as const)test('held provider '+consumer+' restores globals after early '+outcome,async()=>{
  const names=['window','document','location','HTMLButtonElement','fetch'];

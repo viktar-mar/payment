@@ -37,6 +37,27 @@ const privateOrigin='https://evidence-only.stripe.com';
 function originalOriginError(runId=opts().runId,source=opts().expectedSource){
  const error=browserFailure('BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');assert.equal(rememberBrowserProviderOrigin(error,runId,source,privateOrigin),true);return error;
 }
+test('initial OTHER refusal offers the exact origin only to the private writer after CREATE',async()=>{
+ const h=harness(),checkpoint='BROWSER_PROVIDER_ORIGIN_OTHER',origin='https://private-provider.invalid';
+ const error=browserFailure(checkpoint),offers=[],dispatches=[];
+ assert.equal(rememberBrowserProviderOrigin(error,opts().runId,opts().expectedSource,origin),true);
+ h.bootstrap.persistRefusedStripeOrigin=async witness=>{offers.push(witness);};
+ h.fixture.beforeDispatch=async kind=>{dispatches.push(kind);return true;};
+ h.journey.initial=async(port,budget)=>{
+  await port.prepare({token:'inert',origin:scope().endpoints.demo},'sdk-create',budget);
+  throw error;
+ };
+ const controller=await owner(h);
+ await assert.rejects(controller.run(h.journey,limits()));
+ const result=await controller.close();
+ assert.deepEqual(offers,[{runId:opts().runId,expectedSource:opts().expectedSource,checkpoint,origin}]);
+ assert.deepEqual(dispatches,['create']);
+ assert.equal(h.calls.includes('arm-dispatch'),false);
+ assert.equal(result.failedRenewalAccepted,false);
+ assert.equal(result.cleanupConfirmed,true);
+ assert.equal(JSON.stringify(result).includes(origin),false);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),browserLine(checkpoint));
+});
 // Break: evidence is joined to owner work, mutates its first fault, or starts financial continuation.
 for(const sink of ['success','sync throw','hostile reject','hostile then','stall'])test('private refused origin '+sink+' is detached from owner close and STOP',{timeout:2000},async()=>{
  const h=harness(),error=originalOriginError(),offers=[],l=limits(),dispatches=[];let reads=0;

@@ -747,14 +747,11 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     try {
       if(!failedRenewal||busy||pending||status!=='LIVE'||!live||!lock||!originalDirectory||manualDeadline===null)return false;
       if(!witness||typeof witness!=='object'||Object.getPrototypeOf(witness)!==Object.prototype)return false;
-      const descriptors=Object.getOwnPropertyDescriptors(witness);
-      if(Reflect.ownKeys(descriptors).length!==3)return false;
-      const snapshot={};
-      for(const name of ['runId','expectedSource','origin']) {
-        const field=descriptors[name];if(!field?.enumerable||!Object.hasOwn(field,'value'))return false;snapshot[name]=field.value;
-      }
-      Object.freeze(snapshot);
+      // Capture caller descriptors once. The validator rejects accessors and
+      // extra fields before any values are read from the frozen copy.
+      const snapshot=Object.freeze(Object.create(Object.prototype,Object.getOwnPropertyDescriptors(witness)));
       if(!isBrowserProviderOriginWitness(snapshot)||snapshot.runId!==runId||snapshot.expectedSource!==expectedSource)return false;
+      const checkpoint=Object.hasOwn(snapshot,'checkpoint')?snapshot.checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER';
       if(!limits||typeof limits!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(limits)))return false;
       const fields=Object.getOwnPropertyDescriptors(limits);
       if(Reflect.ownKeys(fields).some(name=>!['deadline','signal'].includes(name))||!fields.deadline||!Object.hasOwn(fields.deadline,'value')
@@ -782,7 +779,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
         external?.addEventListener('abort',abort,{once:true});if(external?.aborted)abort();
         const work=(async()=>{
           await ownership();
-          const contents=JSON.stringify({runId:snapshot.runId,expectedSource:snapshot.expectedSource,checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER',origin:snapshot.origin})+'\n';
+          const contents=JSON.stringify({runId:snapshot.runId,expectedSource:snapshot.expectedSource,checkpoint,origin:snapshot.origin})+'\n';
           if(Buffer.byteLength(contents)>1024)fail();current();
           await exclusiveFile(directory+'/refused-provider-origin.private.json',contents,context,false,current);
           await ownership();return true;

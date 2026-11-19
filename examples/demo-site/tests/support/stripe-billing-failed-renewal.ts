@@ -173,7 +173,8 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
                 url.hostname==='m.stripe.com'?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M':
                 url.hostname==='r.stripe.com'?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R':'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER':
               url.hostname==='stripe.network'||url.hostname.endsWith('.stripe.network')?'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK':'BROWSER_PROVIDER_ORIGIN_OTHER';
-            if(routeCheckpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER')refusedOrigin=url.origin;
+            if(routeCheckpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER' ||
+                (state==='INITIAL' && routeCheckpoint==='BROWSER_PROVIDER_ORIGIN_OTHER'))refusedOrigin=url.origin;
             need(false);
           }
           routeCheckpoint='BROWSER_PROVIDER_NAVIGATION';

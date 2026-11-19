@@ -10,10 +10,23 @@ export const browserDiagnostic=error=>metadata.get(error)?.code??null;
 export const browserCleanupConfirmed=error=>metadata.get(error)?.cleanup===true;
 export function finishBrowserCleanup(error,confirmed){const value=metadata.get(error);if(value)value.cleanup=confirmed===true;}
 
-function providerOriginIdentity(runId,expectedSource,origin){
+const stripeComOther='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER';
+const generalOther='BROWSER_PROVIDER_ORIGIN_OTHER';
+function providerOriginIdentity(runId,expectedSource,origin,checkpoint){
  if(typeof runId!=='string'||runId.length!==36||!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(runId)||
     typeof expectedSource!=='string'||expectedSource.length!==40||!/^[0-9a-f]{40}$/.test(expectedSource)||
-    typeof origin!=='string'||!origin.startsWith('https://'))return false;
+    typeof origin!=='string'||origin.length>262||!origin.startsWith('https://'))return false;
+ if(checkpoint===generalOther){
+  // Preserve the browser's canonical host, including a final dot or IPv6 brackets.
+  // Equality excludes credentials, paths and query/fragment data from the private file.
+  try{
+   const url=new URL(origin);
+   return url.origin===origin && !url.port &&
+     url.hostname!=='stripe.com' && !url.hostname.endsWith('.stripe.com') &&
+     url.hostname!=='stripe.network' && !url.hostname.endsWith('.stripe.network');
+  }catch{return false;}
+ }
+ if(checkpoint!==stripeComOther)return false;
  const hostname=origin.slice(8);
  if(hostname.length>253||/[^a-z0-9.-]/.test(hostname)||
     !(hostname==='stripe.com'||hostname.endsWith('.stripe.com'))||
@@ -30,18 +43,25 @@ function providerOriginIdentity(runId,expectedSource,origin){
 }
 export function isBrowserProviderOriginWitness(value){
  try{
-  if(!value||typeof value!=='object'||Object.getPrototypeOf(value)!==Object.prototype||Reflect.ownKeys(value).length!==3)return false;
-  const fields={};
-  for(const name of ['runId','expectedSource','origin']){
+  if(!value||typeof value!=='object'||Object.getPrototypeOf(value)!==Object.prototype)return false;
+  const keys=Reflect.ownKeys(value),tagged=keys.includes('checkpoint');
+  const names=tagged?['runId','expectedSource','origin','checkpoint']:['runId','expectedSource','origin'];
+  if(keys.length!==names.length)return false;
+  const fields=Object.create(null);
+  for(const name of names){
    const descriptor=Object.getOwnPropertyDescriptor(value,name);
    if(!descriptor?.enumerable||!Object.hasOwn(descriptor,'value'))return false;
    fields[name]=descriptor.value;
   }
-  return providerOriginIdentity(fields.runId,fields.expectedSource,fields.origin);
+  if(tagged&&fields.checkpoint!==generalOther)return false;
+  return providerOriginIdentity(fields.runId,fields.expectedSource,fields.origin,tagged?generalOther:stripeComOther);
  }catch{return false;}
 }
 export function rememberBrowserProviderOrigin(error,runId,expectedSource,origin){
- if(metadata.get(error)?.code!=='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'||providerOrigins.has(error)||!providerOriginIdentity(runId,expectedSource,origin))return false;
- providerOrigins.set(error,Object.freeze({runId,expectedSource,origin}));return true;
+ const checkpoint=metadata.get(error)?.code;
+ if((checkpoint!==generalOther&&checkpoint!==stripeComOther)||providerOrigins.has(error)||!providerOriginIdentity(runId,expectedSource,origin,checkpoint))return false;
+ const witness={runId,expectedSource,origin};
+ if(checkpoint===generalOther)witness.checkpoint=checkpoint;
+ providerOrigins.set(error,Object.freeze(witness));return true;
 }
 export const browserProviderOrigin=error=>providerOrigins.get(error)??null;

@@ -42,7 +42,7 @@ const ownerModes={
 async function createOwner(options,dependencies,purpose){
  const mode=ownerModes[purpose];
  const failedRenewal=purpose==='FAILED_RENEWAL',firstRenewal=purpose==='FIRST_RENEWAL';
- let heldJourney,heldPending,terminalClose,initialBrowserDiagnostic=null,initialBrowserOrigin=null,originOffered=false;
+ let heldJourney,heldPending,terminalClose,initialBrowserDiagnostic=null,originOffered=false;
  function trackBrowser(body){
   const work=Promise.resolve().then(body);
   heldPending=work.then(()=>undefined,()=>undefined);
@@ -69,16 +69,16 @@ async function createOwner(options,dependencies,purpose){
   failure??=code;lifetime.abort();throw billingError(failure);
  };
  function offerInitialOrigin(error){
-  if(!failedRenewal||state!=='RUNNING'||phase!=='BROWSER'||failure!==null&&!['BROWSER','ABORTED'].includes(failure)||originOffered||initialBrowserDiagnostic!=='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER')return;
+  if(!failedRenewal||state!=='RUNNING'||phase!=='BROWSER'||failure!==null&&!['BROWSER','ABORTED'].includes(failure)||originOffered)return;
   const witness=browserProviderOrigin(error);
   if(!isBrowserProviderOriginWitness(witness)||witness.runId!==c.runId||witness.expectedSource!==c.expectedSource)return;
-  initialBrowserOrigin=witness;originOffered=true;
+  originOffered=true;
   // Optional on injected legacy fixtures. Never invoke a capability getter, join
   // the sink, or make its outcome part of first-fault/cleanup decisions.
   try {
    const persist=Object.getOwnPropertyDescriptor(bootstrap,'persistRefusedStripeOrigin')?.value;
    const deadline=Math.min(Date.now()+2000,active.deadline+120000);
-   if(typeof persist==='function'&&deadline>Date.now())Promise.resolve(persist.call(bootstrap,initialBrowserOrigin,{deadline})).catch(()=>{});
+   if(typeof persist==='function'&&deadline>Date.now())Promise.resolve(persist.call(bootstrap,witness,{deadline})).catch(()=>{});
   }catch{}
  }
  async function cleanup(){return cleanupPromise??=(async()=>{

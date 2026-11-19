@@ -143,3 +143,45 @@ test('witness validator rejects nonplain inherited extra and accessor fields wit
  assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,input.runId,input.expectedSource,input.origin),true);
  input.origin='https://changed.stripe.com';assert.deepEqual(privateOrigin.browserProviderOrigin(error),witness());
 });
+
+const otherCheckpoint='BROWSER_PROVIDER_ORIGIN_OTHER';
+test('a genuine general OTHER error retains its exact private origin only once',()=>{
+ for(const origin of ['https://outside.test','https://js.stripe.com.evil.test','https://stripe.network.',
+   'https://js.stripe.com.','https://xn--bcher-kva.test','https://192.0.2.1','https://[2001:db8::1]']){
+  const error=browserFailure(otherCheckpoint);
+  const candidate={runId:originRun,expectedSource:originSource,origin,checkpoint:otherCheckpoint};
+  assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,origin),true,origin);
+  assert.equal(privateOrigin.isBrowserProviderOriginWitness(candidate),true);
+  assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,'https://later.test'),false);
+  finishBrowserCleanup(error,true);
+  const saved=privateOrigin.browserProviderOrigin(error);
+  assert.deepEqual(saved,candidate);assert.ok(Object.isFrozen(saved));
+  assert.equal(privateOrigin.browserProviderOrigin(new Error(otherCheckpoint)),null);
+  assert.equal(browserDiagnostic(error),otherCheckpoint);assert.equal(JSON.stringify(error),'{}');
+  assert.equal(error.stack.includes(origin),false);
+ }
+});
+test('general OTHER evidence rejects raw URLs, other refusal categories and foreign errors',()=>{
+ for(const origin of ['https://stripe.com','https://other.stripe.com','https://js.stripe.com',
+   'https://m.stripe.com','https://stripe.network','https://other.stripe.network',
+   'http://outside.test','https://outside.test:8443','https://outside.test:443','https://OUTSIDE.test',
+   'https://user:pass@outside.test','https://outside.test/','https://outside.test/path',
+   'https://outside.test?private','https://outside.test#private','https://outside.test\n',
+   'https://'+'a'.repeat(255),'https://[0:0:0:0:0:0:0:1]','null','']){
+  const error=browserFailure(otherCheckpoint);
+  assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,origin),false,origin);
+  assert.equal(privateOrigin.browserProviderOrigin(error),null);
+  assert.equal(privateOrigin.isBrowserProviderOriginWitness({...witness(),origin,checkpoint:otherCheckpoint}),false);
+ }
+ const otherOrigin='https://outside.test';
+ for(const error of [new Error(otherCheckpoint),Object.create(browserFailure(otherCheckpoint)),browserFailure('BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER')]){
+  assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,otherOrigin),false);
+ }
+ const tagged={...witness(),origin:otherOrigin,checkpoint:otherCheckpoint};
+ const getter={...tagged};let reads=0;Object.defineProperty(getter,'checkpoint',{enumerable:true,get(){reads++;return otherCheckpoint;}});
+ for(const invalid of [{...witness(),origin:otherOrigin},{...tagged,checkpoint:undefined},{...tagged,checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'},
+   {...tagged,runId:'unrelated'},{...tagged,expectedSource:'bad'},{...tagged,extra:'private'},getter]){
+  assert.equal(privateOrigin.isBrowserProviderOriginWitness(invalid),false);
+ }
+ assert.equal(reads,0);
+});
