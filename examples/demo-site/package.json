@@ -13,6 +13,7 @@
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",
+    "@stripe/stripe-js": "10.1.0",
     "@types/node": "25.9.6",
     "postgres": "3.4.7",
     "typescript": "5.9.3",

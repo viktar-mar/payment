@@ -3,6 +3,10 @@
 This separate, one-shot probe initializes the existing SDK Stripe loader and a
 deferred Payment Element before a PaymentIntent or SetupIntent exists. It uses
 only `mode: 'payment'`, amount `2000`, currency `eur`, and card payment methods.
+In the dedicated probe bundle, the page calls the installed pure loader's
+`setLoadParameters({advancedFraudSignals: false})` before its first load.
+This requests Stripe.js with optional advanced fraud signals disabled in this
+fresh, card-free document. The payment and recovery pages use the SDK defaults.
 Apple Pay and Google Pay are disabled. The connected provider host is inert,
 unfocusable and ignores pointer events. There is no form, card entry, Pay button,
 submit, confirmation, customer, backend, billing owner or CLI operation.
@@ -32,9 +36,8 @@ confirm `READY`; it is not acceptance evidence.
 A native report at `ab85027` recorded
 `load=ORIGIN cleanup=OK components=NONE origin_reason=HOST_NOT_ALLOWED` and
 exit 1. Its hostname was not retained, so no host family or justified allowlist
-change can be inferred. The additional fixed host-family diagnostic below does
-not repair or establish loading compatibility. Native Chrome/Stripe verification
-of this new diagnostic is **NOT_RUN**.
+change can be inferred from that report. Later native checks recorded the host
+family as described in the private refusal witness section below.
 
 After separately authorizing an external Chrome/Stripe run, from the repository
 root use an explicitly supplied public test publishable key:
@@ -158,20 +161,31 @@ No raw URLs, error text, keys, provider logs, screenshots, traces, videos or HAR
 files are recorded. Failures do not authorize a retry or policy widening. The
 launcher is outside CI and default Playwright discovery.
 
-Deferred readiness would establish that the current Stripe script can initialize
-the Element under this egress gate. It does not establish client-secret payment
-or setup compatibility, account binding, cash movement, renewal, recovery, SCA,
-settlement or full failed-renewal acceptance. Allowed provider requests can
-include telemetry; this is a future networked check, not a zero-egress test.
+Deferred readiness covers initialization of the Element under this egress gate.
+Payment, setup, renewal and recovery have separate acceptance checks. Allowed
+provider requests can include telemetry.
 
 ## Optional private refusal witness
 
 The native receipt identified by `BLYqSg` reported
 `HOST_NOT_ALLOWED` / `STRIPE_NETWORK`; its exact hostname remains unidentified.
-This change prepares a private witness contract only. It does not establish host
-ownership, necessity, an allowlist repair or successful loading. Native
-verification of the witness is **NOT_RUN**; private evidence capture is
-**NOT_RUN**. The existing origin allowlist and CSP remain unchanged.
+The subsequent single run at `142a361` captured an exact origin for its own
+first refusal. It reported `load=ORIGIN cleanup=OK`. An offline comparison with
+the saved origin reproduced `HOST_NOT_ALLOWED` in the request gate. The record
+contains no request path, method or initiator.
+
+The installed Stripe.js loader documents how to omit optional advanced fraud
+signals at script initialization. The bundled-page regression checks the script
+URL produced by that loader before any external request. The local evidence
+does not identify which component requested the refused origin.
+
+On 2026-11-19, one headed Google Chrome run with the patched probe reported
+`load=READY cleanup=OK components=NONE` (exit 0). Run
+`708bce3c-c1ba-40b4-b604-d5b4494fd162` used the working tree based on
+`142a361`, with probe page SHA-256
+`9057d66e417c58f3f13560a9a1441ade31b80e2a274c7a9743f09e4632862bc0`.
+The Element emitted its ready event and cleanup completed. The run covered
+only the card-free probe with optional advanced fraud signals disabled.
 
 The launcher exposes two private harness interfaces, outside the SDK:
 `runLoadCheck(env, ports)` accepts optional `ports.onRefusedNetworkOrigin(origin)`,

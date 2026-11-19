@@ -44,12 +44,19 @@ export function createLoadController(ports:Ports){
   });
 }
 
+async function loadForBrowserCheck(key:string) {
+  const {loadStripe} = await import('@stripe/stripe-js/pure/index.js');
+  // The probe bundle resolves both imports to the same pure loader instance.
+  loadStripe.setLoadParameters({advancedFraudSignals:false});
+  return loadStripeClient(key);
+}
+
 // No loader or provider acquisition until the launcher explicitly configures this page.
 if(typeof document!=='undefined'){
   const host=document.getElementById('provider-host');
   const output=document.getElementById('status');
   if(host&&output){
-    const controller=createLoadController({host,load:loadStripeClient,status:state=>{output.textContent=state;},
+    const controller=createLoadController({host,load:loadForBrowserCheck,status:state=>{output.textContent=state;},
       onPageLoss:listener=>{window.addEventListener('pagehide',listener,{once:true});return ()=>window.removeEventListener('pagehide',listener);},
       deadline:listener=>{const timer=setTimeout(listener,60000);return ()=>clearTimeout(timer);},
     });
