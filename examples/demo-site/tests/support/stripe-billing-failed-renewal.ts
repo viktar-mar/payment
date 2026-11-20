@@ -232,11 +232,23 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
             // Syntax categories of the already refused parsed URL grant no authority.
             routeCheckpoint=refusal;
             if(staticTarget){
-              routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST';
+              routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_PHASE';
               need(renderPhase);
-              need(request.method()==='GET' && request.postData()===null && !request.isNavigationRequest() &&
-                url.href===url.origin+url.pathname && !('authorization' in headers) && !('cookie' in headers) && !('proxy-authorization' in headers));
-              const resource=request.resourceType(),asset=staticAssets.find(a=>a.resource===resource&&url.pathname.endsWith(a.suffix));
+              routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_METHOD';
+              need(request.method()==='GET');
+              routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_BODY';
+              need(request.postData()===null);
+              routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION';
+              need(!request.isNavigationRequest());
+              routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_URL';
+              need(url.href===url.origin+url.pathname);
+              routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_CREDENTIALS';
+              need(!('authorization' in headers) && !('cookie' in headers) && !('proxy-authorization' in headers));
+              routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_RESOURCE_TYPE';
+              const resource=request.resourceType();
+              need(staticAssets.some(a=>a.resource===resource));
+              routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_SUFFIX';
+              const asset=staticAssets.find(a=>a.resource===resource&&url.pathname.endsWith(a.suffix));
               need(asset);
               routeCheckpoint='BROWSER_PROVIDER_STATIC_FRAME';
               need(originalFrames && (!('origin' in headers)||headers.origin===new URL(originalFrames[0]!.href).origin));

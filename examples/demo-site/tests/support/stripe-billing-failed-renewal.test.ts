@@ -368,18 +368,28 @@ const refusedStaticProbes:Record<string,Partial<ProviderProbe>>={
  unmatched:{target:'https://untrusted.invalid/art/icon.svg'},family:{target:'https://elsewhere.stripe.com/icon.svg'},early:{atMount:false},
  main:{child:undefined},foreign:{child:'foreign'},foreignParent:{child:'foreign-parent'},detached:{child:'detached'},otherPage:{child:'other-page'},
  font:{resource:'font'},wrongOrigin:{headers:{origin:'https://untrusted.test'}},document:{resource:'document'},script:{resource:'script'},stylesheet:{resource:'stylesheet'},xhr:{resource:'xhr'},fetch:{resource:'fetch'},navigation:{navigation:'child'},
- cookie:{headers:{cookie:'private=1'}},authorization:{headers:{authorization:'Bearer other'}},proxy:{headers:{'proxy-authorization':'Basic secret'}},
- post:{method:'POST'},body:{postData:'private'},query:{target:staticProbe.target+'?private'},fragment:{target:staticProbe.target+'#private'},
+ cookie:{headers:{cookie:'private=1'}},authorization:{headers:{authorization:'Bearer other'}},emptyAuthorization:{headers:{authorization:''}},proxy:{headers:{'proxy-authorization':'Basic secret'}},
+ post:{method:'POST'},body:{postData:'private'},emptyBody:{postData:''},query:{target:staticProbe.target+'?private'},fragment:{target:staticProbe.target+'#private'},
  emptyQuery:{target:staticProbe.target+'?'},emptyFragment:{target:staticProbe.target+'#'},
+ methodBeforeBody:{method:'POST',postData:'private'},urlBeforeCredentials:{target:staticProbe.target+'?private',headers:{cookie:'private=1'}},
  redirect:{redirect:'present'},credentials:{target:'https://user:pass@static-provider.invalid/art'},nondefaultPort:{target:fixtureStaticOrigin+':8443/art'},
+};
+const requestCheckpoints:Record<string,string>={
+ early:'PHASE',post:'METHOD',body:'BODY',emptyBody:'BODY',navigation:'NAVIGATION',query:'URL',fragment:'URL',emptyQuery:'URL',emptyFragment:'URL',
+ methodBeforeBody:'METHOD',urlBeforeCredentials:'URL',
+ cookie:'CREDENTIALS',proxy:'CREDENTIALS',emptyAuthorization:'CREDENTIALS',font:'RESOURCE_TYPE',document:'RESOURCE_TYPE',xhr:'RESOURCE_TYPE',fetch:'RESOURCE_TYPE',
+ script:'SUFFIX',stylesheet:'SUFFIX',
 };
 for(const [name,change] of Object.entries(refusedStaticProbes))test('static gate blocks '+name+' before transport',async()=>{
  let fetched=0;const h=await fixture('',[{...staticProbe,...change}],{matches:fixtureMatchesStatic,fetch:async()=>{fetched++;throw Error('inert');}});
  try{
+   const requestCheck=requestCheckpoints[name];
    const reason=name==='unmatched'?'BROWSER_PROVIDER_ORIGIN_OTHER':name==='family'?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER':
      name==='authorization'?'BROWSER_PROVIDER_AUTH':name==='redirect'?'BROWSER_PROVIDER_REDIRECT':name==='credentials'?'BROWSER_PROVIDER_USERINFO':
-     name==='nondefaultPort'?'BROWSER_PROVIDER_ORIGIN_PORT':['foreign','main','foreignParent','otherPage','detached','wrongOrigin'].includes(name)?'BROWSER_PROVIDER_STATIC_FRAME':'BROWSER_PROVIDER_STATIC_REQUEST';
-   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>browserDiagnostic(error)===reason);assert.equal(h.runAbort.signal.aborted,true);
+     name==='nondefaultPort'?'BROWSER_PROVIDER_ORIGIN_PORT':requestCheck?'BROWSER_PROVIDER_STATIC_REQUEST_'+requestCheck:'BROWSER_PROVIDER_STATIC_FRAME';
+   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>{
+     assert.equal(browserDiagnostic(error),reason);assert.deepEqual(Object.keys(error as object),[]);return true;
+   });assert.equal(h.runAbort.signal.aborted,true);
    assert.equal(fetched,0);assert.equal(h.staticReplies.length,0);assert.equal(h.providerFallbacks(),0);assert.ok(!h.counts.includes('confirm'));
  }finally{await h.restore();}
 });

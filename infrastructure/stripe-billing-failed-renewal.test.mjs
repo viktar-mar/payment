@@ -106,7 +106,18 @@ test('private origin settled only after CLOSED cannot start evidence persistence
  assert.equal(typeof rejectInitial,'function');const closed=o.close();await assert.rejects(running);const result=await closed;assert.equal(result.status,'CLOSED');
  rejectInitial(error);await new Promise(r=>setImmediate(r));assert.equal(offers,0);assert.equal(o.resources().diagnostic,null);assert.equal(h.calls.filter(x=>x==='stop').length,1);
 });
-for(const checkpoint of ['BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_COM'])test('failed-renewal refused-origin terminal roundtrip '+checkpoint,async()=>{
+for(const checkpoint of [
+ 'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_COM',
+ 'BROWSER_PROVIDER_STATIC_REQUEST',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_PHASE',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_METHOD',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_BODY',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_URL',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_CREDENTIALS',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_RESOURCE_TYPE',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_SUFFIX',
+])test('failed-renewal provider refusal terminal roundtrip '+checkpoint,async()=>{
  for(const close of [true,false]){
   const h=harness(),error=browserFailure(checkpoint),dispatches=[];let leaked;
   h.fixture.beforeDispatch=async kind=>{dispatches.push(kind);return true;};
