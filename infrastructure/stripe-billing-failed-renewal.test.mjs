@@ -33,6 +33,8 @@ const owner=h=>owners.createOwnedBillingFailedRenewal(opts(),h.dependencies);
 const persistCodes=['PERSIST_ADMISSION','PERSIST_OWNERSHIP','PERSIST_INPUT','PERSIST_UNCHANGED','PERSIST_FINAL_STORE','PERSIST_ACK'];
 const terminalLine=(checkpoint='PERSIST_FINAL_STORE',cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=LISTENER checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
 const browserLine=(checkpoint='BROWSER_CARD_NUMBER',cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=BROWSER checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
+const commandCheckpoint='START_MAILPIT_COMMAND_NONZERO_EXIT';
+const startLine=(checkpoint=commandCheckpoint,cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=START checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
 const privateOrigin='https://evidence-only.stripe.com';
 function originalOriginError(runId=opts().runId,source=opts().expectedSource){
  const error=browserFailure('BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');assert.equal(rememberBrowserProviderOrigin(error,runId,source,privateOrigin),true);return error;
@@ -225,6 +227,84 @@ test('persistence formatter and parser accept only closed finite own data',()=>{
   for(const bad of [line+'\n',line+' canary',' '+line,line.replace('LISTENER','START'),line.replace(code,'PERSIST_CANARY'),line.replace('witness=NONE','witness=LISTENER_STOP')])assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(bad),null);
  }
  assert.equal(owners.parseBillingFailedRenewalDiagnosticLine({toString(){reads++;return terminalLine();}}),null);assert.equal(reads,0);
+});
+for(const cleanup of ['confirmed','listener-refused','bootstrap-refused'])test('Mailpit START command failure preserves its first checkpoint with '+cleanup,async()=>{
+ const h=harness();let checkpoint=commandCheckpoint,reads=0;
+ h.bootstrap.start=async()=>{h.calls.push('start');throw new Proxy({},{get(){reads++;throw Error('private command output');}});};
+ h.bootstrap.startupDiagnostic=()=>checkpoint;
+ h.cli.stopListener=async()=>{h.calls.push('listener-stop');checkpoint='START_BACKEND_COMMAND_ABORT';return cleanup!=='listener-refused';};
+ h.bootstrap.stop=async()=>{h.calls.push('stop');checkpoint=null;return cleanup!=='bootstrap-refused';};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,limits()),{message:'billing_START'});
+ const result=await o.close(),confirmed=cleanup==='confirmed',witness=confirmed?null:cleanup==='listener-refused'?'LISTENER_STOP':'BOOTSTRAP_STOP';
+ assert.equal(reads,0);assert.equal(result.status,'CLOSED');assert.equal(result.phase,'START');assert.equal(result.code,'START');assert.equal(result.diagnostic,commandCheckpoint);
+ assert.equal(result.initialAccepted,false);assert.equal(result.failedRenewalAccepted,false);assert.equal(result.full5bAccepted,false);
+ assert.equal(result.cleanupConfirmed,confirmed);assert.equal(result.cleanupFailure,witness);
+ assert.deepEqual(h.calls,['preflight','prepare','login','binding','listener','start','browser-close','listener-stop','stop']);
+ const line=startLine(commandCheckpoint,confirmed?'CONFIRMED':'UNCONFIRMED',witness??'NONE');
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ await assert.rejects(o.run(h.journey,limits()),/SINGLE_USE/);assert.deepEqual(await o.close(),result);
+});
+for(const kind of ['missing','getter','inherited','throw','object','foreign','malformed','wrong stage'])test('START uses a finite fallback for '+kind+' diagnostic capability',async()=>{
+ const h=harness();let reads=0;
+ if(kind==='getter')Object.defineProperty(h.bootstrap,'startupDiagnostic',{get(){reads++;return ()=>commandCheckpoint;}});
+ else if(kind==='inherited')Object.setPrototypeOf(h.bootstrap,{startupDiagnostic(){reads++;return commandCheckpoint;}});
+ else if(kind==='throw')h.bootstrap.startupDiagnostic=()=>{throw Error('private command output');};
+ else if(kind==='object')h.bootstrap.startupDiagnostic=()=>({toString(){reads++;return commandCheckpoint;}});
+ else if(kind==='foreign')h.bootstrap.startupDiagnostic=()=> 'START_PRIVATE_COMMAND_NONZERO_EXIT';
+ else if(kind==='malformed')h.bootstrap.startupDiagnostic=()=>commandCheckpoint+'\nprivate command output';
+ else if(kind==='wrong stage')h.bootstrap.startupDiagnostic=()=> 'PERSIST_ACK';
+ h.bootstrap.start=async()=>{throw Object.assign(Error(commandCheckpoint),{diagnostic:commandCheckpoint});};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,limits()),{message:'billing_START'});
+ const result=await o.close(),line=startLine('START_UNKNOWN');
+ assert.equal(reads,0);assert.equal(result.diagnostic,'START_UNKNOWN');
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+});
+test('START false retains an available checkpoint and a PREPARE failure has no START fallback',async()=>{
+ const h=harness();h.bootstrap.start=async()=>false;h.bootstrap.startupDiagnostic=()=> 'START_BOOTSTRAP_ADMISSION_REJECTED';
+ const o=await owner(h);await assert.rejects(o.run(h.journey,limits()),{message:'billing_START'});
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(await o.close()),startLine('START_BOOTSTRAP_ADMISSION_REJECTED'));
+ const beforeStart=harness();let reads=0;
+ beforeStart.bootstrap.prepare=async()=>false;beforeStart.bootstrap.startupDiagnostic=()=>{reads++;return commandCheckpoint;};
+ const rejected=await owner(beforeStart);await assert.rejects(rejected.run(beforeStart.journey,limits()),{message:'billing_PREPARE'});
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(await rejected.close()),null);assert.equal(reads,0);
+});
+for(const cancellation of ['abort','deadline'])for(const outcome of ['late checkpoint','retain checkpoint','unsettled'])test('START '+cancellation+' with '+outcome+' keeps bounded cleanup and its diagnostic',async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const h=harness(),controller=new AbortController();let enter,release,reads=0;
+ const entered=new Promise(r=>enter=r),held=new Promise((_,reject)=>release=()=>reject(new Proxy({},{get(){reads++;throw Error('private command output');}})));
+ let checkpoint=outcome==='retain checkpoint'?commandCheckpoint:null;
+ const lateCheckpoint='START_MAILPIT_COMMAND_'+(cancellation==='abort'?'ABORT':'TIMEOUT');
+ h.bootstrap.start=async()=>{h.calls.push('start');enter();try{return await held;}finally{checkpoint=lateCheckpoint;}};
+ h.bootstrap.startupDiagnostic=()=>checkpoint;
+ h.bootstrap.stop=async l=>{h.calls.push('stop');assert.equal(l.signal.aborted,false);assert.equal(checkpoint,lateCheckpoint);checkpoint=null;return true;};
+ const o=await owner(h),running=o.run(h.journey,{deadline:6000,signal:controller.signal}),rejected=assert.rejects(running,{message:'billing_ABORTED'});
+ await entered;
+ if(cancellation==='abort')controller.abort();else t.mock.timers.tick(5000);
+ await new Promise(r=>setImmediate(r));
+ assert.equal(o.resources().status,'RUNNING');assert.equal(owners.formatBillingFailedRenewalDiagnostic(o.resources()),null);
+ assert.deepEqual(h.calls.slice(-3),['start','browser-close','listener-stop']);
+ if(outcome==='unsettled')t.mock.timers.tick(120000);else release();
+ await rejected;const result=await o.close(),settled=outcome!=='unsettled';
+ assert.equal(result.phase,'START');assert.equal(result.code,'ABORTED');assert.equal(result.cleanupConfirmed,settled);assert.equal(result.cleanupFailure,settled?null:'START_SETTLEMENT');
+ const expected=outcome==='retain checkpoint'?commandCheckpoint:settled?lateCheckpoint:'START_UNKNOWN';
+ assert.equal(result.diagnostic,expected);
+ const line=startLine(expected,settled?'CONFIRMED':'UNCONFIRMED',settled?'NONE':'START_SETTLEMENT');
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ if(!settled){release();await new Promise(r=>setImmediate(r));}
+ assert.equal(reads,0);assert.equal(h.calls.filter(call=>call==='stop').length,settled?1:0);assert.deepEqual(await o.close(),result);
+});
+test('START formatter and parser accept only closed stage-specific finite own data',()=>{
+ const valid={scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',status:'CLOSED',phase:'START',code:'ABORTED',diagnostic:commandCheckpoint,initialAccepted:false,failedRenewalAccepted:false,full5bAccepted:false,cleanupConfirmed:true,cleanupFailure:null};
+ for(const checkpoint of [commandCheckpoint,'START_MAILPIT_COMMAND_SPAWN_FAILURE','START_MAILPIT_HEALTH_WAIT_TIMEOUT','START_BACKEND_HEALTH_UNHEALTHY_CONNECTION_FAILED','START_UNKNOWN']){
+  const line=startLine(checkpoint);assert.equal(owners.formatBillingFailedRenewalDiagnostic({...valid,diagnostic:checkpoint}),line);assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ }
+ for(const change of [{status:'RUNNING'},{scope:'OWNED_INITIAL_PAYMENT'},{phase:'LISTENER'},{phase:'BROWSER'},{code:'LISTENER'},{code:null},{diagnostic:'PERSIST_ACK'},{diagnostic:'BROWSER_CARD_NUMBER'},{diagnostic:'START_MAILPIT_COMMAND_PRIVATE'},{initialAccepted:true},{failedRenewalAccepted:true},{full5bAccepted:true},{cleanupFailure:'BOOTSTRAP_STOP'},{cleanupConfirmed:false},{cleanupConfirmed:false,cleanupFailure:'private'}])assert.equal(owners.formatBillingFailedRenewalDiagnostic({...valid,...change}),null);
+ for(const line of [startLine()+'\n',startLine()+' private',startLine('PERSIST_ACK'),startLine('BROWSER_CARD_NUMBER'),startLine('START_MAILPIT_COMMAND_PRIVATE'),terminalLine('START_UNKNOWN'),browserLine(commandCheckpoint),startLine(commandCheckpoint,'CONFIRMED','BOOTSTRAP_STOP'),startLine(commandCheckpoint,'UNCONFIRMED'),startLine(commandCheckpoint,'UNCONFIRMED','PRIVATE')])assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),null);
+ assert.equal(owners.parseBillingFirstPaymentDiagnosticLine('owned_initial_payment_diagnostic code=START_UNKNOWN cleanup=CONFIRMED'),null);
+ assert.equal(owners.parseBillingFirstRenewalDiagnosticLine('owned_initial_and_first_renewal_diagnostic code=START_UNKNOWN cleanup=CONFIRMED'),null);
+ let reads=0;const hostile={...valid};Object.defineProperty(hostile,'diagnostic',{get(){reads++;return commandCheckpoint;}});
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(hostile),null);assert.equal(owners.formatBillingFailedRenewalDiagnostic(Object.create(valid)),null);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine({toString(){reads++;return startLine();}}),null);assert.equal(reads,0);
 });
 function useIndependentInitialProof(h){
  const callbacks=data().row.callbacks.slice(0,2);

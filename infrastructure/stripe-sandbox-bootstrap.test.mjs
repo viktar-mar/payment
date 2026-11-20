@@ -2246,6 +2246,95 @@ test('failed-renewal proof-only cleanup cannot reuse an ambiguously closed owner
  await rejects(f.adapter.stop({deadline:f.limits.deadline+120000}),'STOP_PENDING');assert.equal(f.events.length,after);assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,bytes);
  assert.equal(f.events.filter(e=>e.type==='close'&&e.path===DIR+'/owner.lock').length,1);
 });
+
+async function failedRenewalUncertainStartAck(boundary,{closeRefuses=false,restartMailpit=false}={}){
+ let rejected=false,ackRenamed=false;
+ const lastIsMailpitAck=(intents,f)=>{
+  const last=intents.at(-1),mailpit=f.adapter.resources().containers.mailpit;
+  return last?.action==='START_SERVICE'&&last.name===mailpit?.id&&last.status==='ACKNOWLEDGED';
+ };
+ const f=await failedRenewalPersistencePrepared(h=>{
+  const open=h.dependencies.open,rename=h.dependencies.rename,execute=h.dependencies.execute;
+  const refuse=()=>{rejected=true;throw new Error('synthetic START ACK uncertainty');};
+  if(restartMailpit)h.dependencies.execute=async(file,args,settings)=>{
+   const result=await execute(file,args,settings);
+   if(args[4]==='container'&&args[5]==='stop'&&args.at(-1)===h.adapter.resources().containers.postgres.id){
+    const mailpit=h.containers.get(h.adapter.resources().containers.mailpit.id);
+    mailpit.State={...mailpit.State,Running:true,Status:'running'};
+   }
+   return result;
+  };
+  h.dependencies.rename=async(from,to)=>{
+   await rename(from,to);
+   if(to===DIR+'/runtime.json'&&lastIsMailpitAck(persistenceIntents(h),h))ackRenamed=true;
+  };
+  h.dependencies.open=async(path,...args)=>{
+   const file=await open(path,...args);let ack=false;
+   return {...file,
+    writeFile:async bytes=>{
+     ack=path.startsWith(DIR+'/runtime.json.tmp-')&&lastIsMailpitAck(JSON.parse(bytes).intents,h);
+     if(!rejected&&ack&&boundary==='ACK write')refuse();
+     await file.writeFile(bytes);
+    },
+    sync:async()=>{
+     if(!rejected&&(ack&&boundary==='ACK file sync'||ackRenamed&&path===DIR&&boundary==='ACK directory sync'))refuse();
+     await file.sync();
+    },
+    close:async()=>{
+     await file.close();
+     if(closeRefuses&&path===DIR+'/owner.lock')throw new Error('synthetic owner close refusal');
+    },
+   };
+  };
+ });
+ await f.adapter.persistWebhookSecret(SECRET);
+ await rejects(f.adapter.start(f.limits),'START_PENDING');
+ assert.equal(rejected,true);
+ assert.equal(f.adapter.startupDiagnostic(),'START_MAILPIT_ACK_REJECTED');
+ assert.deepEqual(persistenceIntents(f).at(-1),{
+  action:'START_SERVICE',name:f.adapter.resources().containers.mailpit.id,
+  status:boundary==='ACK directory sync'?'ACKNOWLEDGED':'DISPATCHING',
+ });
+ return f;
+}
+
+for(const boundary of ['ACK write','ACK file sync','ACK directory sync'])test('failed-renewal START '+boundary+' cleanup preserves exact ledger bytes',async()=>{
+ const f=await failedRenewalUncertainStartAck(boundary),b=f.adapter,{mailpit,postgres}=b.resources().containers;
+ const ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents),before=f.events.length;
+ const limits={deadline:f.limits.deadline+120000};
+ assert.equal(await b.stop(limits),true);
+ assert.ok(f.files.get(DIR+'/runtime.json').contents.equals(ledger),'cleanup preserves runtime ledger bytes');
+ const cleanup=f.events.slice(before);
+ assert.deepEqual(persistenceMutations(cleanup).map(e=>e.args.slice(5)),[['stop','--time','10',mailpit.id],['stop','--time','10',postgres.id]]);
+ assert.ok([...f.containers.values()].every(c=>!c.State.Running));
+ assert.equal(cleanup.some(e=>['write','rename','unlink'].includes(e.type)),false);
+ assert.equal(cleanup.filter(e=>e.type==='close'&&e.path===DIR+'/owner.lock').length,1);
+ assert.equal(b.resources().status,'PENDING');
+ assert.equal(b.startupDiagnostic(),'START_MAILPIT_ACK_REJECTED');
+ const after=f.events.length;
+ await rejects(b.stop(limits),'STOP_PENDING');
+ await rejects(b.start(f.limits),'START_PENDING');
+ await rejects(b.verify(f.limits),'VERIFY_PENDING');
+ assert.equal(f.events.length,after);
+});
+
+for(const failure of ['ownership drift','final stopped proof','ambiguous owner close'])test('failed-renewal START ACK uncertainty preserves ledger after '+failure,async()=>{
+ const f=await failedRenewalUncertainStartAck('ACK write',{
+  closeRefuses:failure==='ambiguous owner close',restartMailpit:failure==='final stopped proof',
+ }),b=f.adapter;
+ const ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents),limits={deadline:f.limits.deadline+120000};
+ if(failure==='ownership drift')f.containers.get(b.resources().containers.mailpit.id).Labels['payment.sandbox.run']='foreign';
+ await rejects(b.stop(limits),'STOP_PENDING');
+ assert.ok(f.files.get(DIR+'/runtime.json').contents.equals(ledger),'cleanup preserves runtime ledger bytes');
+ assert.equal(stopCalls(f).length,failure==='ownership drift'?0:2);
+ assert.equal(f.events.filter(e=>e.type==='close'&&e.path===DIR+'/owner.lock').length,failure==='ambiguous owner close'?1:0);
+ if(failure==='ambiguous owner close'){
+  const after=f.events.length;
+  await rejects(b.stop(limits),'STOP_PENDING');
+  assert.equal(f.events.length,after);
+ }
+});
+
 test('failed-renewal exact pending persistence fresh proves seven stopped IDs without dispatch or acknowledgement',async()=>{
  const f=await failedRenewalPendingPersistence(),original=persistenceIntents(f),recorded=f.adapter.resources().containers,before=f.events.length;
  assert.equal(Object.keys(recorded).length,7);assert.deepEqual(original.at(-1),{action:'PERSIST_WEBHOOK',name:'backend-key-persistence',status:'DISPATCHING'});
@@ -2277,4 +2366,50 @@ for(const action of ['CREATE_STOPPED','CREATE_FINAL_BACKEND'])test('failed-renew
  const f=failedRenewalPersistenceFixture(),execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{if(stoppedCompose({type:'process',args:args[1]})&&args[1].includes(DIR+(action==='CREATE_STOPPED'?'/app.env':'/final.env'))){await execute(...args);throw null;}return execute(...args);};
  const b=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies),limits=LIMIT();if(action==='CREATE_STOPPED')await rejects(b.prepare(limits),'PREPARE_PENDING');else{await b.prepare(limits);await b.persistWebhookSecret(SECRET);await rejects(b.start(limits),'START_PENDING');}
  const original=persistenceIntents(f),before=f.events.length;assert.equal(original.at(-1).action,action);await rejects(b.stop({deadline:limits.deadline+120000}),'STOP_PENDING');assert.equal(persistenceMutations(f.events.slice(before)).length,0);assert.deepEqual(persistenceIntents(f),original);
+});
+
+for(const scenario of ['never started','started despite error','unavailable during cleanup'])test('failed-renewal Mailpit start failure reports ownership proof for '+scenario,async()=>{
+ const f=failedRenewalPersistenceFixture(),execute=f.dependencies.execute;
+ let enter,finish,cleanup=false,unexpected=0;
+ const entered=new Promise(resolve=>enter=resolve),release=new Promise(resolve=>finish=resolve);
+ delete f.dependencies.execute;
+ f.dependencies.execFile=(file,args,settings,done)=>{
+  const child=new EventEmitter();
+  queueMicrotask(async()=>{
+   const mailpit=args[4]==='container'&&args[5]==='start'&&f.containers.get(args.at(-1))?.Name==='/'+PROJECT+'-mailpit';
+   try{
+    if(mailpit){
+     if(scenario==='started despite error')await execute(file,args,settings);
+     else f.events.push({type:'process',file,args,settings});
+     done({code:1},'','synthetic daemon error');enter();await release;child.emit('close',1,null);return;
+    }
+    if(cleanup&&scenario==='unavailable during cleanup'){done({code:1},'','synthetic daemon unavailable');child.emit('close',1,null);return;}
+    const result=await execute(file,args,settings);done(null,result.stdout,result.stderr);child.emit('close',0,null);
+   }catch(error){done(error,'','');child.emit('close',1,null);}
+  });
+  return child;
+ };
+ const bootstrap=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);
+ const {createOwnedBillingFailedRenewal,formatBillingFailedRenewalDiagnostic,parseBillingFailedRenewalDiagnosticLine}=await import('./stripe-billing-first-payment.mjs');
+ const unexpectedWork=async()=>{unexpected++;throw new Error('unexpected work after failed START');};
+ const owner=await createOwnedBillingFailedRenewal(f.options,{preflight:async()=>true,createBootstrap:async()=>bootstrap,login:async()=>true,
+  createCli:async()=>({validateBinding:async()=>true,startListener:()=>bootstrap.persistWebhookSecret(SECRET),stopListener:async()=>{cleanup=true;return true;}}),
+  createRuntime:unexpectedWork,createFixture:unexpectedWork});
+ const running=owner.run({initial:unexpectedWork,method:unexpectedWork,close:async()=>true},LIMIT());
+ const failed=assert.rejects(running,/START/);
+ await entered;
+ const before=persistenceIntents(f),ids=bootstrap.resources().containers;
+ try{
+  assert.deepEqual(before.at(-1),{action:'START_SERVICE',name:ids.mailpit.id,status:'DISPATCHING'});
+  assert.equal(bootstrap.startupDiagnostic(),null);assert.equal(cleanup,false);assert.equal(stopCalls(f).length,0);
+ }finally{finish();await failed;}
+ const result=await owner.close(),available=scenario!=='unavailable during cleanup';
+ assert.equal(result.diagnostic,'START_MAILPIT_COMMAND_NONZERO_EXIT');assert.equal(result.cleanupConfirmed,available);
+ assert.equal(result.cleanupFailure,available?null:'BOOTSTRAP_STOP');assert.equal(unexpected,0);
+ assert.equal(result.initialAccepted,false);assert.equal(result.failedRenewalAccepted,false);
+ assert.deepEqual(firstPaymentStarts(f).map(e=>e.args.at(-1)),[ids.postgres.id,ids.mailpit.id]);
+ assert.deepEqual(stopCalls(f).map(e=>e.args.at(-1)),!available?[]:scenario==='started despite error'?[ids.mailpit.id,ids.postgres.id]:[ids.postgres.id]);
+ assert.deepEqual(persistenceIntents(f),before);
+ const line='owned_failed_renewal_diagnostic stage=START checkpoint=START_MAILPIT_COMMAND_NONZERO_EXIT '+(available?'cleanup=CONFIRMED witness=NONE':'cleanup=UNCONFIRMED witness=BOOTSTRAP_STOP');
+ assert.equal(formatBillingFailedRenewalDiagnostic(result),line);assert.equal(parseBillingFailedRenewalDiagnosticLine(line),line);
 });

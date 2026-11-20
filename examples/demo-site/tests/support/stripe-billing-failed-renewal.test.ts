@@ -125,6 +125,17 @@ test('actual reporter accepts clean begin and late post-close annotation in both
  });
  assert.equal(output.split('\n').filter(v=>v===diagnostic).length,1);assert.doesNotMatch(output,/canary/);
 });
+test('actual reporter emits a late START checkpoint with the independent cleanup witness',async()=>{
+ const line='owned_failed_renewal_diagnostic stage=START checkpoint=START_MAILPIT_COMMAND_NONZERO_EXIT cleanup=UNCONFIRMED witness=BOOTSTRAP_STOP';
+ const output=await captureReporter(r=>{
+  const testCase=reporterCase(),result=reporterResult({annotations:[]});
+  r.onTestBegin(testCase,result);
+  result.annotations=[{...terminalAnnotation,description:line}];
+  r.onTestEnd(testCase,result);r.onEnd({status:'failed'} as FullResult);
+ });
+ assert.equal(output.split('\n').filter(v=>v===line).length,1);
+ assert.match(output,/owned_failed_renewal_result_not_accepted full5b=NOT_ACCEPTED/);
+});
 test('actual reporter retains the exact single-case success predicate',async()=>{
  for(const [testCase,result,full,accepted] of [
   [reporterCase(),reporterResult({status:'passed',annotations:[]}),{status:'passed'},true],

@@ -188,6 +188,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   let terminalBuild=false,buildDiagnostic=null,buildxIdentity=null;
   // First-payment START only: local checkpoints and trusted internal failure categories.
   let startupCode=null,startupStage='ADMISSION',startupService='BOOTSTRAP';
+  let startAckUncertain=false;
   // Failed-renewal persistence exposes only the first refused local checkpoint.
   let persistenceCode=null,persistenceStage='PERSIST_ADMISSION';
   const persistenceStep=stage=>{if(failedRenewal&&persistenceCode===null)persistenceStage=stage;};
@@ -723,7 +724,9 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       startupStep('INTENT',service);await intent('START_SERVICE',recorded.containers[service].id,context);startupStep('COMMAND',service);
       const commandAndHealthy=async budget=>{await docker(['container','start',recorded.containers[service].id],budget);await healthy(service,budget);};
       if(firstPayment&&service==='backend')await dedicatedBackendStartup(context,commandAndHealthy);else await commandAndHealthy(context);
-      startupStep('ACK',service);await acknowledgement(context);
+      startupStep('ACK',service);
+      try {await acknowledgement(context);}
+      catch(error) {if(failedRenewal)startAckUncertain=true;throw error;}
     }
     startupStep('FINAL_PROOF');await topology(context,true);await healthRequests(context);live=true;status='LIVE';startupStep('LEDGER');await ledger(context);return true;
   }
@@ -791,6 +794,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   }
   async function stop(context) {
     // Root must stop its R2 listener before calling this capability.
+    if(startAckUncertain&&lock===null)fail();
     // First-payment cleanup can prove stopped state without acknowledging an uncertain start.
     const ownedStartsOnly=firstPayment&&[...SERVICES,'issuer-installer','issuer-probe'].every(service=>recorded.containers[service])
       &&intents.every(value=>value.status==='ACKNOWLEDGED'||value.status==='DISPATCHING'&&value.action==='START_SERVICE'
@@ -834,7 +838,12 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       if(proof.state.Running||!['exited','created'].includes(proof.state.Status))fail();
     }
     await projectProof(context);if(!ownedStartsOnly&&intents.some(value=>value.status!=='ACKNOWLEDGED'))fail();
-    live=false;status='STOPPED';await ledger(context);if(lock) {await lock.close();lock=null;}return true;
+    live=false;status='STOPPED';
+    if(startAckUncertain) {
+      // A rejected ACK write may have renamed the ledger. Preserve whichever bytes remain.
+      const owner=lock;lock=null;await owner.close();return true;
+    }
+    await ledger(context);if(lock) {await lock.close();lock=null;}return true;
   }
 
   const capabilities={

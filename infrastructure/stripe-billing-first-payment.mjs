@@ -95,14 +95,20 @@ async function createOwner(options,dependencies,purpose){
   if(failedRenewal&&phase==='BROWSER'&&(failure==='BROWSER'||failure==='ABORTED')&&diagnostic===null&&initialBrowserDiagnostic!==null)diagnostic=initialBrowserDiagnostic;
   // Capture the same conservative browser knowledge once; late settlement is not proof.
   if(!ok)cleanupFailure=journeySettled?'BROWSER_CLOSE':'BROWSER_UNSETTLED';
+  const missingStartupDiagnostic=failedRenewal&&phase==='START'&&(failure==='START'||failure==='ABORTED')&&diagnostic===null;
   const missing=code=>{ok=false;cleanupFailure??=code;};
   for(const [o,m,code]of [[runtime,'close','RUNTIME_CLOSE'],[cli,'stopListener','LISTENER_STOP'],[bootstrap,'stop','BOOTSTRAP_STOP'],[fixture,'close','FIXTURE_CLOSE']])if(o){
    if(o===runtime&&terminalClose){if(!await terminalClose)missing(code);continue;}
    // The canceled outer race can finish before START releases bootstrap's busy guard.
    // Settlement grants no success or ownership proof; stop retains its own checks.
-   if(o===bootstrap&&startSettlement)try{await billingBounded(l,()=>startSettlement,120000);}catch{missing('START_SETTLEMENT');continue;}
+   if(o===bootstrap&&startSettlement){
+    try{await billingBounded(l,()=>startSettlement,120000);}catch{missing('START_SETTLEMENT');continue;}
+    // START may retain its first checkpoint while the canceled operation settles.
+    if(missingStartupDiagnostic)diagnostic=startupDiagnostic(bootstrap);
+   }
    try{if(await billingBounded(l,x=>o[m](x),o===bootstrap?120000:30000)!==true)missing(code);}catch{missing(code);}
   }
+  if(missingStartupDiagnostic&&diagnostic===null)diagnostic='START_UNKNOWN';
   cleanupConfirmed=ok;if(!ok&&failure===null){failure='CLEANUP';if(confirmAck)diagnostic='POST_CONFIRM_CLEANUP';}return ok;
  })();}
  return Object.freeze({resources,
@@ -257,23 +263,31 @@ export function parseBillingFirstRenewalDiagnosticLine(line){
 // Independent terminal-only missing proof; never provider state or extra cleanup authority.
 const cleanupCodes=new Set(['BROWSER_UNSETTLED','BROWSER_CLOSE','RUNTIME_CLOSE','LISTENER_STOP','START_SETTLEMENT','BOOTSTRAP_STOP','FIXTURE_CLOSE']);
 const isCleanupDiagnostic=code=>typeof code==='string'&&cleanupCodes.has(code);
+function isFailedRenewalCheckpoint(stage,checkpoint){
+ switch(stage){
+  case 'LISTENER':return isPersistenceDiagnostic(checkpoint);
+  case 'START':return checkpoint==='START_UNKNOWN'||startupCodes.has(checkpoint);
+  case 'BROWSER':return isBrowserDiagnostic(checkpoint);
+  default:return false;
+ }
+}
 /** Failed-mode terminal checkpoints; no raw result/error/resource fields are serialized. */
 export function formatBillingFailedRenewalDiagnostic(result){
  try{
   if(!result||Object.getPrototypeOf(result)!==Object.prototype)return null;
   const own=name=>Object.getOwnPropertyDescriptor(result,name)?.value;
   const stage=own('phase');
-  if(own('scope')!=='OWNED_FAILED_RENEWAL_GRACE_RECOVERY'||own('status')!=='CLOSED'||!['LISTENER','BROWSER'].includes(stage)||![stage,'ABORTED'].includes(own('code'))||
+  if(own('scope')!=='OWNED_FAILED_RENEWAL_GRACE_RECOVERY'||own('status')!=='CLOSED'||![stage,'ABORTED'].includes(own('code'))||
      own('initialAccepted')!==false||own('failedRenewalAccepted')!==false||own('full5bAccepted')!==false)return null;
   const checkpoint=own('diagnostic'),confirmed=own('cleanupConfirmed'),witness=own('cleanupFailure');
-  if(!(stage==='LISTENER'?isPersistenceDiagnostic(checkpoint):isBrowserDiagnostic(checkpoint))||typeof confirmed!=='boolean'||(confirmed?witness!==null:!isCleanupDiagnostic(witness)))return null;
+  if(!isFailedRenewalCheckpoint(stage,checkpoint)||typeof confirmed!=='boolean'||(confirmed?witness!==null:!isCleanupDiagnostic(witness)))return null;
   return 'owned_failed_renewal_diagnostic stage='+stage+' checkpoint='+checkpoint+' cleanup='+(confirmed?'CONFIRMED':'UNCONFIRMED')+' witness='+(confirmed?'NONE':witness);
  }catch{return null;}
 }
 export function parseBillingFailedRenewalDiagnosticLine(line){
  if(typeof line!=='string'||line.length>200)return null;
- const match=/^owned_failed_renewal_diagnostic stage=(LISTENER|BROWSER) checkpoint=([A-Z_]+) cleanup=(CONFIRMED|UNCONFIRMED) witness=([A-Z_]+)$/.exec(line);
- return match&&match[0]===line&&(match[1]==='LISTENER'?isPersistenceDiagnostic(match[2]):isBrowserDiagnostic(match[2]))&&(match[3]==='CONFIRMED'?match[4]==='NONE':isCleanupDiagnostic(match[4]))?line:null;
+ const match=/^owned_failed_renewal_diagnostic stage=(LISTENER|START|BROWSER) checkpoint=([A-Z_]+) cleanup=(CONFIRMED|UNCONFIRMED) witness=([A-Z_]+)$/.exec(line);
+ return match&&match[0]===line&&isFailedRenewalCheckpoint(match[1],match[2])&&(match[3]==='CONFIRMED'?match[4]==='NONE':isCleanupDiagnostic(match[4]))?line:null;
 }
 function formatCleanupDiagnostic(result,prefix){
  if(!result||result.status!=='CLOSED'||result.initialAccepted!==false||typeof result.code!=='string'||!result.code||result.cleanupConfirmed!==false||!isCleanupDiagnostic(result.cleanupFailure))return null;
