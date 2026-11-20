@@ -2,6 +2,7 @@ import {test} from '@playwright/test';
 import {createOwnedBillingFailedRenewal,formatBillingFailedRenewalDiagnostic} from '../../../infrastructure/stripe-billing-first-payment.mjs';
 import {snapshotBillingFailedRenewalEnvironment} from '../../../infrastructure/stripe-billing-failed-renewal-options.mjs';
 import {runFailedRenewalBrowser} from './support/stripe-billing-failed-renewal';
+import {loadFailedRenewalStaticOriginMatcher} from './support/stripe-billing-failed-renewal-static-origin-pin';
 import {failedRenewalRunSettingsAllowed} from './support/stripe-billing-failed-renewal-settings';
 
 let owner:Awaited<ReturnType<typeof createOwnedBillingFailedRenewal>>;
@@ -22,7 +23,7 @@ test.beforeAll(async({},info)=>{
 test('OWNED_FAILED_RENEWAL_GRACE_RECOVERY',async({browser},info)=>{
   const controller=new AbortController();
   try{
-    const result=await owner.run(runFailedRenewalBrowser(browser,controller),{deadline:Date.now()+2700000,signal:controller.signal});
+    const result=await owner.run(runFailedRenewalBrowser(browser,controller,loadFailedRenewalStaticOriginMatcher()),{deadline:Date.now()+2700000,signal:controller.signal});
     if(result.scope!=='OWNED_FAILED_RENEWAL_GRACE_RECOVERY' || !result.initialAccepted || !result.failedRenewalAccepted ||
         !result.cleanupConfirmed || result.full5bAccepted!==false)throw Error('failed_renewal_NOT_ACCEPTED');
   }finally{

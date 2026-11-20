@@ -148,8 +148,11 @@ class Control {
   onclick?: (event:unknown)=>unknown;
   async activate() {assert.equal(this.disabled,false);await this.onclick?.({isTrusted:true});}
 }
-type ProviderProbe={target:string;headers?:Record<string,string>;headerFailure?:'getter'|'reject';redirect?:'throw'|'present';navigation?:'main'|'child'|'throw'|'frame';fallbackFailure?:boolean;hold?:boolean;method?:string;phase?:'initial'|'method'};
-async function fixture(change = '',provider?:ProviderProbe[]) {
+type ProviderProbe={target:string;headers?:Record<string,string>;headerFailure?:'getter'|'reject';redirect?:'throw'|'present';navigation?:'main'|'child'|'throw'|'frame';fallbackFailure?:boolean;hold?:boolean;method?:string;phase?:'initial'|'method';
+  atMount?:boolean;resource?:string;postData?:string;detachBeforeDispatch?:boolean;frameUrl?:string;parentUrl?:string;
+  child?:'owned'|'nested'|'foreign'|'foreign-parent'|'detached'|'other-page'};
+type StaticFixture={matches:(origin:string)=>boolean;fetch:typeof fetch};
+async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:StaticFixture) {
   let releaseIO!:()=>void,markIO!:()=>void;
   const heldIO=new Promise<void>(resolve=>{releaseIO=resolve;}),ioPending=new Promise<void>(resolve=>{markIO=resolve;});
   let stageHook:((where:string)=>Promise<void>)|undefined;
@@ -174,7 +177,7 @@ async function fixture(change = '',provider?:ProviderProbe[]) {
   const windowEvents=new Map<string,Function>();
   const w:any = {addEventListener:(n:string,f:Function)=>windowEvents.set(n,f)};
   w.top = w;
-  const globals = {window:w,document:doc,location:{origin:demo,href:demo+path},HTMLButtonElement:Control,fetch:inertFetch};
+  const globals = {window:w,document:doc,location:{origin:demo,href:demo+path},HTMLButtonElement:Control,fetch:staticFixture?.fetch??inertFetch};
   const original = new Map(Object.keys(globals).map(k=>[k,Object.getOwnPropertyDescriptor(globalThis,k)]));
   for(const [k,v] of Object.entries(globals))Object.defineProperty(globalThis,k,{configurable:true,value:v});
   const restore = () => {for(const [k,d] of original) {if(d)Object.defineProperty(globalThis,k,d);else Reflect.deleteProperty(globalThis,k);}};
@@ -189,16 +192,22 @@ async function fixture(change = '',provider?:ProviderProbe[]) {
   let url = 'about:blank', closed = 0;
   const frame = {url:()=>url}, callbacks = new Map<string,Function>(),bindings=new Map<string,Function>();
   let routeHandler:Function;
+  const staticReplies:{headers:Record<string,string>;body:Buffer}[]=[];
   async function probeProvider(probe:ProviderProbe) {
     let denied=false;
     const fail=()=>{throw Error('secret_fixture canary');};
+    const parent={url:()=>probe.child==='foreign-parent'?'https://untrusted.test/':probe.parentUrl??'https://inner.js.stripe.com/',isDetached:()=>false,page:()=>page,parentFrame:()=>frame};
+    const child={url:()=>probe.child==='foreign'?'https://untrusted.test/':probe.frameUrl??'https://js.stripe.com/element',isDetached:()=>probe.child==='detached',page:()=>probe.child==='other-page'?{}:page,parentFrame:()=>{
+      if(probe.detachBeforeDispatch)queueMicrotask(()=>{probe.child='detached';});
+      return probe.child==='nested'||probe.child==='foreign-parent'?parent:frame;
+    }};
     const req={url:()=>probe.target,method:()=>probe.method??'GET',
       get allHeaders(){if(probe.headerFailure==='getter')fail();return async()=>{if(probe.headerFailure==='reject')fail();if(probe.hold){markIO();await heldIO;}return probe.headers??{};};},
       redirectedFrom:()=>{if(probe.redirect==='throw')fail();return probe.redirect==='present'?{}:null;},
       isNavigationRequest:()=>{if(probe.navigation==='throw')fail();return Boolean(probe.navigation);},
-      frame:()=>{if(probe.navigation==='frame')fail();return probe.navigation==='child'?{}:frame;},
-      resourceType:()=> 'other',postData:()=>null};
-    await routeHandler({request:()=>req,abort:async()=>{denied=true;},fallback:async()=>{providerFallbacks++;if(probe.fallbackFailure)fail();},fulfill:async()=>assert.fail('provider fulfillment')});
+      frame:()=>{if(probe.navigation==='frame')fail();return probe.child?child:probe.navigation==='child'?{}:frame;},
+      resourceType:()=>probe.resource??'other',postData:()=>probe.postData??null};
+    await routeHandler({request:()=>req,abort:async()=>{denied=true;},fallback:async()=>{providerFallbacks++;if(probe.fallbackFailure)fail();},fulfill:async(response:any)=>{assert.ok(staticFixture);staticReplies.push(response);}});
     if(denied)throw Error('denied mock request');
   }
   async function request(target:string,method:string,data?:any) {
@@ -246,7 +255,7 @@ async function fixture(change = '',provider?:ProviderProbe[]) {
         assert.equal(runAbort.signal.aborted,false);
       }
       if(change==='page_action')throw Error('secret_fixture canary');
-      if(provider)for(const probe of provider)if(!probe.phase || probe.phase===(input.operationId===id(9)?'method':'initial'))await probeProvider(probe);
+      if(provider)for(const probe of provider)if(!probe.atMount&&(!probe.phase || probe.phase===(input.operationId===id(9)?'method':'initial')))await probeProvider(probe);
       if(change==='action_provider_header')await request('https://js.stripe.com/v3/','GET');
       if(change==='action_asset_header')await request(demo+'/assets/inert.js','GET');
       const response=await request(base(input.operationId)+'/action','GET');
@@ -258,12 +267,14 @@ async function fixture(change = '',provider?:ProviderProbe[]) {
     requestEmailOtp:async()=>{counts.push('challenge');await request(otpUrl,'POST',{site_key:'fixture',email:'fixture@example.test',intent:'AUTHENTICATE'});return {challengeId:id(10),expiresAt:expires};},
     verifyEmailOtp:async()=>{counts.push('verify');await request(otpUrl+'/'+id(10)+'/verify','POST',{site_key:'fixture',code:otp});return session;}};},
     mountStripePaymentAttempt:async(p:any)=>{counts.push('mountInitial');if(change==='mount_retire'){p.onRetire?.();throw Error('secret_fixture canary');}if(change==='mount_refusal')throw Error('secret_fixture canary');assert.strictEqual(p.client,subscriptions);assert.strictEqual(p.input.session,session);
+      for(const probe of provider??[])if(probe.atMount&&probe.phase!=='method')await probeProvider(probe);
       return {destroy:()=>{},confirm:async()=>{await request(base(id(7))+'/confirmation-attempts/'+id(8)+'/confirm','POST',{capability,confirmation_token:'ctoken_inert'});
         p.onRetire?.();return {state:'OBSERVE',retryAllowed:false,successorAttemptId:null};}};},
     mountStripeSubscriptionMethod:async(p:any)=>{counts.push('mountMethod');if(change==='method_mount_refusal'){p.onRetire?.();throw Error('secret_fixture canary');}assert.strictEqual(p.client,subscriptions);assert.strictEqual(p.session,session);
       assert.equal(p.subscriptionId,id(6));assert.equal(p.operationId,id(9));
       const a=await subscriptions.action(p),s=await subscriptions.confirmationSession({...p,action:a});
       assert.deepEqual(s,{protocol:'BROWSER_CONFIRM_V1',provider:'stripe',flow:'SETUP',publishable_key:selected.publishable_key,client_secret:selected.client_secret,action_token:actionSecret,expires_at:expires});
+      for(const probe of provider??[])if(probe.atMount&&probe.phase==='method')await probeProvider(probe);
       return {destroy:()=>{},confirm:async()=>{const permit=await request(base(id(9))+'/action-confirmations','POST',{action_token:s.action_token});
         assert.equal(permit.status,202);assert.deepEqual(permit.json,{operation_id:id(9),subscription_id:id(6),status:'RESERVED',action_available:false,next_action:null,browser_confirm_allowed:true});
         counts.push('confirmSetup');p.onRetire?.();return {operationId:id(9),subscriptionId:id(6),status:'RESERVED',actionAvailable:false};}};}};
@@ -300,7 +311,7 @@ async function fixture(change = '',provider?:ProviderProbe[]) {
     }};
   const context={on:()=>{},newPage:async()=>{counts.push('page');return page;},exposeBinding:async(n:string,f:Function)=>{bindings.set(n,f);w[n]=(...args:unknown[])=>{if(n==='__failedRenewalTerminal')terminals.push(args);return f({page,frame},...args);};},
     route:async(_pattern:string,f:Function)=>{routeHandler=f;},routeWebSocket:async()=>{},close:async()=>{closed++;callbacks.get('close')?.();w.__failedRenewalStop?.();}};
-  const journey=runFailedRenewalBrowser({newContext:async()=>{counts.push('context');return context;}},runAbort);
+  const journey=runFailedRenewalBrowser({newContext:async()=>{counts.push('context');return context;}},runAbort,staticFixture?.matches);
   const initialPort={resources:()=>({runId:id(1),expectedSource:'a'.repeat(40),accountId:id(2),siteId:id(3),priceId:id(5),siteKey:'fixture',email:'fixture@example.test',endpoints:{demo,backend}}),
     withOtpCode:async(f:Function)=>f(otp),acknowledgeCustomer:async(v:any)=>{
       assert.deepEqual(v,{customerId:id(4),siteId:id(3)});
@@ -324,10 +335,182 @@ async function fixture(change = '',provider?:ProviderProbe[]) {
       await Promise.resolve().then(()=>f(src,...args)).catch(()=>{});
     }
   };
-  return {request,probeProvider,counts,replies,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,ioPending,releaseIO,notifyIO:markIO,providerFallbacks:()=>providerFallbacks,
+  return {request,probeProvider,counts,replies,staticReplies,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,ioPending,releaseIO,notifyIO:markIO,providerFallbacks:()=>providerFallbacks,
     setStageHook:(hook:typeof stageHook)=>{stageHook=hook;},terminal:async(marker:unknown)=>bindings.get('__failedRenewalTerminal')!({page,frame},'STOPPED',marker),closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
     restore:async()=>{try{runAbort.abort();await journey.close(nowLimits());}finally{w.__failedRenewalStop?.();restore();}}};
 }
+
+const fixtureStaticOrigin='https://static-provider.invalid';
+const staticProbe:ProviderProbe={target:fixtureStaticOrigin+'/art/icon.svg',atMount:true,resource:'image',child:'owned'};
+const fixtureMatchesStatic=(origin:string)=>origin===fixtureStaticOrigin;
+for(const phase of ['initial','method'] as const)for(const [resource,file,mime] of [
+ ['image','icon.svg','image/svg+xml'],['image','icon.png','image/png'],['stylesheet','form.css','text/css'],['script','form.js','application/javascript'],
+] as const)test('only the approved static '+file+' is fetched during '+phase+' mount',async()=>{
+ const probe:ProviderProbe={...staticProbe,phase,resource,child:'nested',target:fixtureStaticOrigin+'/assets/'+file,headers:{referer:'https://js.stripe.com/frame?private-context',origin:'https://js.stripe.com'}};
+ let fetched=0;
+ const h=await fixture('',[probe],{matches:fixtureMatchesStatic,fetch:async(input,options)=>{
+   fetched++;assert.equal(String(input),probe.target);assert.equal(options?.redirect,'error');assert.equal(options?.credentials,'omit');
+   const headers=new Headers(options?.headers);assert.equal(headers.has('referer'),false);assert.equal(headers.has('cookie'),false);
+   assert.deepEqual([...headers],[['origin','https://js.stripe.com']]);
+   return new Response('static fixture',{headers:{'Content-Type':mime,'Access-Control-Allow-Origin':'*','Set-Cookie':'private=1','X-Private':'private','Cross-Origin-Resource-Policy':'same-origin','Content-Security-Policy':"default-src 'none'" }});
+ }});
+ try{
+   assert.equal(await h.journey.initial(h.initialPort,nowLimits()),true);
+   if(phase==='method')assert.equal(await h.journey.method(h.methodPort,nowLimits()),true);
+   assert.equal(fetched,1);assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,1);
+   const response=h.staticReplies[0]!,headers=new Headers(response.headers);
+   assert.equal(headers.get('content-type'),mime);assert.equal(headers.get('set-cookie'),null);assert.equal(headers.get('x-private'),null);
+   assert.equal(headers.get('x-content-type-options'),'nosniff');assert.equal(response.body.toString(),'static fixture');
+   assert.equal(headers.get('cross-origin-resource-policy'),'same-origin');assert.equal(headers.get('content-security-policy'),"default-src 'none'");
+ }finally{await h.restore();}
+});
+const refusedStaticProbes:Record<string,Partial<ProviderProbe>>={
+ unmatched:{target:'https://untrusted.invalid/art/icon.svg'},family:{target:'https://elsewhere.stripe.com/icon.svg'},early:{atMount:false},
+ main:{child:undefined},foreign:{child:'foreign'},foreignParent:{child:'foreign-parent'},detached:{child:'detached'},otherPage:{child:'other-page'},
+ font:{resource:'font'},wrongOrigin:{headers:{origin:'https://untrusted.test'}},document:{resource:'document'},script:{resource:'script'},stylesheet:{resource:'stylesheet'},xhr:{resource:'xhr'},fetch:{resource:'fetch'},navigation:{navigation:'child'},
+ cookie:{headers:{cookie:'private=1'}},authorization:{headers:{authorization:'Bearer other'}},proxy:{headers:{'proxy-authorization':'Basic secret'}},
+ post:{method:'POST'},body:{postData:'private'},query:{target:staticProbe.target+'?private'},fragment:{target:staticProbe.target+'#private'},
+ emptyQuery:{target:staticProbe.target+'?'},emptyFragment:{target:staticProbe.target+'#'},
+ redirect:{redirect:'present'},credentials:{target:'https://user:pass@static-provider.invalid/art'},nondefaultPort:{target:fixtureStaticOrigin+':8443/art'},
+};
+for(const [name,change] of Object.entries(refusedStaticProbes))test('static gate blocks '+name+' before transport',async()=>{
+ let fetched=0;const h=await fixture('',[{...staticProbe,...change}],{matches:fixtureMatchesStatic,fetch:async()=>{fetched++;throw Error('inert');}});
+ try{
+   const reason=name==='unmatched'?'BROWSER_PROVIDER_ORIGIN_OTHER':name==='family'?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER':
+     name==='authorization'?'BROWSER_PROVIDER_AUTH':name==='redirect'?'BROWSER_PROVIDER_REDIRECT':name==='credentials'?'BROWSER_PROVIDER_USERINFO':
+     name==='nondefaultPort'?'BROWSER_PROVIDER_ORIGIN_PORT':['foreign','main','foreignParent','otherPage','detached','wrongOrigin'].includes(name)?'BROWSER_PROVIDER_STATIC_FRAME':'BROWSER_PROVIDER_STATIC_REQUEST';
+   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>browserDiagnostic(error)===reason);assert.equal(h.runAbort.signal.aborted,true);
+   assert.equal(fetched,0);assert.equal(h.staticReplies.length,0);assert.equal(h.providerFallbacks(),0);assert.ok(!h.counts.includes('confirm'));
+ }finally{await h.restore();}
+});
+for(const [name,makeResponse] of Object.entries({
+ redirect:()=>new Response(null,{status:302,headers:{location:'https://not-allowed.invalid/'}}),error:()=>new Response(null,{status:404}),
+ activeContent:()=>new Response('<script></script>',{headers:{'content-type':'text/html'}}),
+ tooLarge:()=>new Response(new Uint8Array(2**20+1),{headers:{'content-type':'image/svg+xml'}}),
+}))test('static gate aborts '+name+' response without exposing it to browser',async()=>{
+ let fetched=0;const h=await fixture('',[staticProbe],{matches:fixtureMatchesStatic,fetch:async()=>{fetched++;return makeResponse();}});
+ try{
+   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>browserDiagnostic(error)==='BROWSER_PROVIDER_STATIC_RESPONSE');assert.equal(fetched,1);
+   assert.equal(h.staticReplies.length,0);assert.equal(h.providerFallbacks(),0);assert.ok(!h.counts.includes('confirm'));
+ }finally{await h.restore();}
+});
+
+test('static resource during attended READY wait uses no credentials and preserves absent CORS',async()=>{
+ const h=await fixture('',[],{matches:fixtureMatchesStatic,fetch:async()=>new Response('fixture',{headers:{'content-type':'image/svg+xml'}})});
+ h.setStageHook(async stage=>{if(stage==='manual')await h.probeProvider(staticProbe);});
+ try {
+   assert.equal(await h.journey.initial(h.initialPort,nowLimits()),true);
+   assert.equal(h.staticReplies.length,1);assert.equal(new Headers(h.staticReplies[0]!.headers).has('access-control-allow-origin'),false);
+   await assert.rejects(h.probeProvider(staticProbe));
+   assert.equal(h.staticReplies.length,1);assert.equal(h.providerFallbacks(),0);
+ } finally {await h.restore();}
+});
+for(const cors of [null,'https://foreign.invalid','https://js.stripe.com, https://another.invalid','null'])test('CORS request needs original upstream ACAO: '+cors,async()=>{
+ const h=await fixture('',[{...staticProbe,headers:{origin:'https://js.stripe.com'}}],{
+   matches:fixtureMatchesStatic,fetch:async()=>new Response('fixture',{headers:{
+     'content-type':'image/svg+xml',...(cors===null?{}:{'access-control-allow-origin':cors}),
+   }}),
+ });
+ try {
+   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),e=>browserDiagnostic(e)==='BROWSER_PROVIDER_STATIC_RESPONSE');
+   assert.equal(h.staticReplies.length,0);assert.equal(h.providerFallbacks(),0);
+ } finally {await h.restore();}
+});
+test('static response for detached original frame cannot be released',async()=>{
+ const probe={...staticProbe};const h=await fixture('',[probe],{matches:fixtureMatchesStatic,fetch:async()=>{
+   probe.child='detached';return new Response('fixture',{headers:{'content-type':'image/svg+xml'}});
+ }});
+ try {
+   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>browserDiagnostic(error)==='BROWSER_PROVIDER_STATIC_FRAME');
+   assert.equal(h.staticReplies.length,0);assert.equal(h.providerFallbacks(),0);
+ } finally {await h.restore();}
+});
+test('static transport checks attachment again before dispatch',async()=>{
+ let fetched=0;
+ const h=await fixture('',[{...staticProbe,detachBeforeDispatch:true}],{matches:fixtureMatchesStatic,fetch:async()=>{
+   fetched++;return new Response('fixture',{headers:{'content-type':'image/svg+xml'}});
+ }});
+ try{
+   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),e=>browserDiagnostic(e)==='BROWSER_PROVIDER_STATIC_FRAME');
+   assert.equal(fetched,0);assert.equal(h.staticReplies.length,0);assert.equal(h.providerFallbacks(),0);
+ }finally{await h.restore();}
+});
+test('late approved asset is discarded after user confirmation without aborting the held journey',async()=>{
+ let finish!:()=>void,started!:()=>void;
+ const waiting=new Promise<void>(resolve=>{started=resolve;});
+ const response=new Promise<void>(resolve=>{finish=resolve;});
+ const h=await fixture('',[],{matches:fixtureMatchesStatic,fetch:async()=>{
+   started();await response;return new Response('fixture',{headers:{'content-type':'image/svg+xml'}});
+ }});
+ let asset:Promise<void>|undefined;
+ h.setStageHook(async stage=>{
+   if(stage==='manual'){asset=h.probeProvider(staticProbe);void asset.catch(()=>{});await waiting;}
+ });
+ try{
+   assert.equal(await h.journey.initial(h.initialPort,nowLimits()),true);finish();
+   await assert.rejects(asset!);assert.equal(h.staticReplies.length,0);
+   assert.equal(h.runAbort.signal.aborted,false);assert.equal(h.providerFallbacks(),0);
+ }finally{finish();await asset?.catch(()=>{});await h.restore();}
+});
+for(const child of ['owned','detached'] as const)test('admitted static request with late headers cannot use or revoke the next phase: '+child,async()=>{
+ let fetched=0,asset:Promise<void>|undefined;
+ const probe:ProviderProbe={...staticProbe,hold:true};
+ const h=await fixture('',[],{matches:fixtureMatchesStatic,fetch:async()=>{fetched++;throw Error('unexpected transport');}});
+ h.setStageHook(async stage=>{
+   if(stage==='manual'){
+     asset=h.probeProvider(probe);void asset.catch(()=>{});
+     await h.ioPending;
+   }
+ });
+ try{
+   assert.equal(await h.journey.initial(h.initialPort,nowLimits()),true);
+   probe.child=child;
+   h.releaseIO();await assert.rejects(asset!);
+   assert.equal(fetched,0);assert.equal(h.staticReplies.length,0);
+   assert.equal(h.providerFallbacks(),0);assert.equal(h.runAbort.signal.aborted,false);
+ }finally{h.releaseIO();await asset?.catch(()=>{});await h.restore();}
+});
+for(const changed of ['frame','ancestor','foreign'] as const)test('static request keeps its original document across delayed headers: '+changed,async()=>{
+ let fetched=0;
+ const probe:ProviderProbe={...staticProbe,hold:true,child:changed==='foreign'?'foreign':'nested'};
+ const h=await fixture('',[probe],{matches:fixtureMatchesStatic,fetch:async()=>{
+   fetched++;return new Response('fixture',{headers:{'content-type':'image/svg+xml'}});
+ }});
+ try{
+   const initial=h.journey.initial(h.initialPort,nowLimits());void initial.catch(()=>{});
+   await h.ioPending;
+   if(changed==='ancestor')probe.parentUrl='https://inner.js.stripe.com/another-document';
+   else if(changed==='foreign')probe.child='owned';
+   else probe.frameUrl='https://js.stripe.com/another-document';
+   h.releaseIO();await assert.rejects(initial,error=>browserDiagnostic(error)==='BROWSER_PROVIDER_STATIC_FRAME');
+   assert.equal(fetched,0);assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,0);
+ }finally{h.releaseIO();await h.restore();}
+});
+for(const release of ['drain','timeout'])test('cleanup accounts for abort-ignoring static transport '+release,async()=>{
+ let finish!:()=>void,started!:()=>void,asset:Promise<void>|undefined;
+ const waiting=new Promise<void>(resolve=>{started=resolve;});
+ const response=new Promise<void>(resolve=>{finish=resolve;});
+ const h=await fixture('',[],{matches:fixtureMatchesStatic,fetch:async()=>{
+   started();await response;return new Response('fixture',{headers:{'content-type':'image/svg+xml'}});
+ }});
+ h.setStageHook(async stage=>{
+   if(stage==='manual'){asset=h.probeProvider(staticProbe);void asset.catch(()=>{});await waiting;}
+ });
+ try{
+   assert.equal(await h.journey.initial(h.initialPort,nowLimits()),true);
+   const limit=release==='drain'?nowLimits():{deadline:Date.now()+100};
+   const closing=h.journey.close(limit);
+   let settled=false;void closing.then(()=>{settled=true;},()=>{settled=true;});
+   await assert.rejects(asset!);
+   if(release==='drain'){
+     await new Promise<void>(resolve=>setImmediate(resolve));assert.equal(settled,false);
+     finish();assert.equal(await closing,true);
+   }else{
+     await assert.rejects(closing,error=>browserDiagnostic(error)==='BROWSER_CLOSE' && !browserCleanupConfirmed(error));
+   }
+   assert.equal(h.staticReplies.length,0);assert.equal(h.providerFallbacks(),0);assert.equal(h.closed(),1);
+ }finally{finish();await asset?.catch(()=>{});await h.restore();}
+});
 
 const providerCases:readonly [string,ProviderProbe,string,string?][]=[
  ['header getter',{target:'https://js.stripe.com/',headerFailure:'getter'},'BROWSER_PROVIDER_HEADERS'],

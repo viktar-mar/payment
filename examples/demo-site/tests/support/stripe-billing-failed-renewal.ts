@@ -1,4 +1,4 @@
-import type {Browser,BrowserContext,Page,Route} from '@playwright/test';
+import type {Browser,BrowserContext,Frame,Page,Route} from '@playwright/test';
 import type {BillingBinding,BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {BillingFailedRenewalJourney,BillingFailedRenewalMethodPort,BillingFirstPaymentPort,FailedMethodSession,FirstPaymentPrepared} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
@@ -33,8 +33,66 @@ function body(raw:string|null,names:string[]) {
   need(JSON.stringify(value)===raw);
   return fields(value,names);
 }
+const staticAssets=[
+  {resource:'image',suffix:'.png',media:['image/png']},
+  {resource:'image',suffix:'.svg',media:['image/svg+xml']},
+  {resource:'stylesheet',suffix:'.css',media:['text/css']},
+  {resource:'script',suffix:'.js',media:['text/javascript','application/javascript']},
+];
+function providerRefusal(url:URL) {
+  if(providerNetworkOrigin(url))return undefined;
+  if(url.protocol!=='https:')return 'BROWSER_PROVIDER_ORIGIN_SCHEME';
+  if(url.port)return 'BROWSER_PROVIDER_ORIGIN_PORT';
+  if(url.hostname==='m.stripe.com')return 'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M';
+  if(url.hostname==='r.stripe.com')return 'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R';
+  if(url.hostname==='stripe.com'||url.hostname.endsWith('.stripe.com'))return 'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER';
+  if(url.hostname==='stripe.network'||url.hostname.endsWith('.stripe.network'))return 'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK';
+  return 'BROWSER_PROVIDER_ORIGIN_OTHER';
+}
+function stripeFrameChain(route:Route,page:Page) {
+  // Header retrieval is asynchronous. Remember which documents initiated the request.
+  try{
+    const chain:{frame:Frame;href:string}[]=[],main=page.mainFrame();
+    for(let frame:Frame|null=route.request().frame();frame!==main;frame=frame.parentFrame()){
+      if(!frame || frame.page()!==page || frame.isDetached())return undefined;
+      const href=frame.url(),url=new URL(href);
+      if(!providerOrigin(url) || !(url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com')))return undefined;
+      chain.push({frame,href});
+    }
+    return chain.length?chain:undefined;
+  }catch{return undefined;}
+}
+async function fetchStaticAsset(url:URL,media:string[],origin:string|undefined,signal:AbortSignal) {
+  const controller=new AbortController();
+  try {
+    const response=await fetch(url,{method:'GET',redirect:'error',credentials:'omit',referrerPolicy:'no-referrer',
+      headers:origin?{Origin:origin}:undefined,signal:AbortSignal.any([signal,controller.signal])});
+    const type=response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase();
+    need(response.status===200 && !response.redirected && type && media.includes(type) && response.body);
+    // Playwright can add CORS headers on fulfill when ACAO is absent.
+    // Never fulfill a CORS request the upstream response did not authorize.
+    const allowedOrigin=response.headers.get('access-control-allow-origin');
+    need(!origin || allowedOrigin===origin || allowedOrigin==='*');
+    const maxBytes=1024*1024;
+    const reader=response.body.getReader(),chunks:Uint8Array[]=[];
+    let size=0;
+    while(true){
+      const {value,done}=await reader.read();
+      if(done)break;
+      size+=value.byteLength;need(size<=maxBytes);chunks.push(value);
+    }
+    need(size>0);
+    const headers:Record<string,string>={'Content-Type':response.headers.get('content-type')!,
+      'X-Content-Type-Options':'nosniff','Cache-Control':'no-store'};
+    for(const name of ['access-control-allow-origin','access-control-allow-credentials','cross-origin-resource-policy',
+      'cross-origin-embedder-policy','content-security-policy','content-security-policy-report-only','content-disposition','referrer-policy']){
+      const header=response.headers.get(name);if(header!==null)headers[name]=header;
+    }
+    return {headers,body:Buffer.concat(chunks,size)};
+  } finally {controller.abort();}
+}
 /** A single owned page. Neither phase accepts a target from the page or chooses a provider operation. */
-export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAbort:AbortController):BillingFailedRenewalJourney {
+export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAbort:AbortController,matchesStaticOrigin?:(origin:string)=>boolean):BillingFailedRenewalJourney {
   need(runAbort instanceof AbortController && !runAbort.signal.aborted);
   let state:'NEW'|'INITIAL'|'HELD'|'METHOD'|'DONE'|'CLOSED'='NEW';
   let opening:Promise<BrowserContext>|undefined, closing:Promise<void>|undefined;
@@ -144,12 +202,16 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     try {
       current();
       const request=route.request(),url=new URL(request.url());
+      const renderPhase=(state==='INITIAL'||state==='METHOD') && step==='CONFIRM'?state:undefined;
       // Select backend provenance before even reading headers or delivering a
       // preflight. Non-backend refusals get a fixed route boundary.
       if(url.origin===binding.endpoints.backend && (step==='ACTION'||step==='SESSION'||step==='CONFIRM'))
         routeCheckpoint=step==='ACTION'?'BROWSER_ACTION_BRIDGE':step==='SESSION'?'BROWSER_SESSION_BRIDGE':'BROWSER_CONFIRM_BRIDGE';
       if(url.origin!==binding.endpoints.backend)routeCheckpoint=url.origin===binding.endpoints.demo?'BROWSER_ASSET_ROUTE':'BROWSER_PROVIDER_ROUTE';
       const provider=url.origin!==binding.endpoints.backend && url.origin!==binding.endpoints.demo;
+      const refusal=provider?providerRefusal(url):undefined;
+      const staticTarget=refusal==='BROWSER_PROVIDER_ORIGIN_OTHER' && matchesStaticOrigin?.(url.origin)===true;
+      const originalFrames=staticTarget && renderPhase && page?stripeFrameChain(route,page):undefined;
       if(provider)routeCheckpoint='BROWSER_PROVIDER_HEADERS';
       const headers=await request.allHeaders();
       if(provider)routeCheckpoint='BROWSER_PROVIDER_CURRENT';
@@ -166,13 +228,42 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
             ((state==='INITIAL' && navigation===0 && url.pathname===pagePath && request.isNavigationRequest()) ||
             (!request.isNavigationRequest() && /^\/assets\/[\w.-]+\.(js|css)$/.test(url.pathname))));
         }else{
-          if(!providerNetworkOrigin(url)){
+          if(refusal){
             // Syntax categories of the already refused parsed URL grant no authority.
-            routeCheckpoint=url.protocol!=='https:'?'BROWSER_PROVIDER_ORIGIN_SCHEME':url.port?'BROWSER_PROVIDER_ORIGIN_PORT':
-              url.hostname==='stripe.com'||url.hostname.endsWith('.stripe.com')?
-                url.hostname==='m.stripe.com'?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M':
-                url.hostname==='r.stripe.com'?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R':'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER':
-              url.hostname==='stripe.network'||url.hostname.endsWith('.stripe.network')?'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK':'BROWSER_PROVIDER_ORIGIN_OTHER';
+            routeCheckpoint=refusal;
+            if(staticTarget){
+              routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST';
+              need(renderPhase);
+              need(request.method()==='GET' && request.postData()===null && !request.isNavigationRequest() &&
+                url.href===url.origin+url.pathname && !('authorization' in headers) && !('cookie' in headers) && !('proxy-authorization' in headers));
+              const resource=request.resourceType(),asset=staticAssets.find(a=>a.resource===resource&&url.pathname.endsWith(a.suffix));
+              need(asset);
+              routeCheckpoint='BROWSER_PROVIDER_STATIC_FRAME';
+              need(originalFrames && (!('origin' in headers)||headers.origin===new URL(originalFrames[0]!.href).origin));
+              const isRendering=()=>state===renderPhase && step==='CONFIRM';
+              try{
+                // The old form can detach its frame while request headers are pending.
+                need(isRendering());
+                const checkOwner=()=>{
+                  need(isRendering());routeCheckpoint='BROWSER_PROVIDER_STATIC_FRAME';assertPage();
+                  const actual=stripeFrameChain(route,page!);
+                  need(actual && actual.length===originalFrames.length &&
+                    actual.every(({frame,href},i)=>frame===originalFrames[i]!.frame && href===originalFrames[i]!.href));
+                  routeCheckpoint='BROWSER_PROVIDER_STATIC_RESPONSE';
+                };
+                await billingBounded(scoped(),limits=>track((async()=>{
+                  checkOwner();
+                  const reply=await fetchStaticAsset(url,asset.media,headers.origin,limits.signal!);
+                  billingCheck(limits);
+                  checkOwner();
+                  await route.fulfill({...reply,status:200});
+                })()),15000);
+              }catch{
+                if(isRendering())throw failed();
+                await route.abort('failed').catch(()=>{});
+              }
+              return;
+            }
             if(routeCheckpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER' ||
                 (state==='INITIAL' && routeCheckpoint==='BROWSER_PROVIDER_ORIGIN_OTHER'))refusedOrigin=url.origin;
             need(false);

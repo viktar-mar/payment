@@ -17,7 +17,7 @@ test('the beforeAll gate validates authority, project and owner before requestin
   assert.doesNotMatch(hook,/runFailedRenewalBrowser\(|newContext\(|\.run\(/);
   assert.match(spec.slice(testCase),/async\s*\(\s*\{\s*browser\s*\}/);
   assert.doesNotMatch(spec.slice(testCase),/await createOwnedBillingFailedRenewal\(/);
-  assert.match(spec.slice(testCase),/runFailedRenewalBrowser\(browser,\s*controller\)/);
+  assert.match(spec.slice(testCase),/runFailedRenewalBrowser\(browser,\s*controller,\s*loadFailedRenewalStaticOriginMatcher\(\)\)/);
   assert.match(spec.slice(testCase),/signal:\s*controller\.signal/);
 });
 
