@@ -108,13 +108,22 @@ test('private origin settled only after CLOSED cannot start evidence persistence
  assert.equal(typeof rejectInitial,'function');const closed=o.close();await assert.rejects(running);const result=await closed;assert.equal(result.status,'CLOSED');
  rejectInitial(error);await new Promise(r=>setImmediate(r));assert.equal(offers,0);assert.equal(o.resources().diagnostic,null);assert.equal(h.calls.filter(x=>x==='stop').length,1);
 });
+const providerOriginCheckpoints=['BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_COM'];
+const providerNavigationCheckpoints=[
+ 'BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_MAIN_FRAME',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_CHECKOUT_CHILD',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_STRIPE_PARENT',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_OTHER_PARENT',
+ 'BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_FRAME_UNAVAILABLE',
+];
 for(const checkpoint of [
- 'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_COM',
+ ...providerOriginCheckpoints,
  'BROWSER_PROVIDER_STATIC_REQUEST',
  'BROWSER_PROVIDER_STATIC_REQUEST_PHASE',
  'BROWSER_PROVIDER_STATIC_REQUEST_METHOD',
  'BROWSER_PROVIDER_STATIC_REQUEST_BODY',
- 'BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION',
+ ...providerNavigationCheckpoints,
  'BROWSER_PROVIDER_STATIC_REQUEST_URL',
  'BROWSER_PROVIDER_STATIC_REQUEST_CREDENTIALS',
  'BROWSER_PROVIDER_STATIC_REQUEST_RESOURCE_TYPE',
@@ -134,12 +143,13 @@ for(const checkpoint of [
   assert.equal(owners.formatBillingFailedRenewalDiagnostic({...result,status:'RUNNING'}),null);
   assert.equal(owners.formatBillingFailedRenewalDiagnostic({...result,cleanupConfirmed:!close}),null);
   for(const raw of [line+' https://m.stripe.com/private',line+'\n',line.replace(checkpoint,checkpoint+'_PRIVATE')])assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(raw),null);
+  for(const diagnostic of [checkpoint+' https://m.stripe.com/private',checkpoint+'\n',checkpoint+'_PRIVATE'])assert.equal(owners.formatBillingFailedRenewalDiagnostic({...result,diagnostic}),null);
   await assert.rejects(leaked.confirm(confirmRequest(),limits()));assert.deepEqual(dispatches,['create']);
   assert.equal(h.calls.includes('observe'),false);assert.equal(h.calls.includes('arm-dispatch'),false);assert.equal(h.calls.includes('manual-confirm'),false);
   assert.equal(h.calls.some(call=>methods.includes(call)),false);
  }
 });
-for(const checkpoint of ['BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_COM'])test('failed-renewal refuses forged origin terminal '+checkpoint,async()=>{
+for(const checkpoint of [...providerOriginCheckpoints,...providerNavigationCheckpoints])test('failed-renewal refuses forged provider terminal '+checkpoint,async()=>{
  for(const foreign of [checkpoint,{diagnostic:checkpoint,cleanupConfirmed:true},new Error(checkpoint+' https://m.stripe.com/private')]){
   const h=harness(),dispatches=[];
   h.fixture.beforeDispatch=async kind=>{dispatches.push(kind);return true;};

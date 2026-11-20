@@ -1,4 +1,4 @@
-import type {Browser,BrowserContext,Frame,Page,Route} from '@playwright/test';
+import type {Browser,BrowserContext,Frame,Page,Request,Route} from '@playwright/test';
 import type {BillingBinding,BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {BillingFailedRenewalJourney,BillingFailedRenewalMethodPort,BillingFirstPaymentPort,FailedMethodSession,FirstPaymentPrepared} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
@@ -49,14 +49,33 @@ function providerRefusal(url:URL) {
   if(url.hostname==='stripe.network'||url.hostname.endsWith('.stripe.network'))return 'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK';
   return 'BROWSER_PROVIDER_ORIGIN_OTHER';
 }
+function isStripeScriptDocument(href:string):boolean {
+  const url=new URL(href);
+  return providerOrigin(url) && (url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com'));
+}
+function staticNavigationTarget(request:Request,page:Page) {
+  // Keep this sample descriptive. Playwright exposes the destination frame,
+  // which can still be unassociated, and does not identify the initiator.
+  try {if(!request.isNavigationRequest())return null;}
+  catch {return null;}
+  try {
+    const frame=request.frame(),main=page.mainFrame();
+    if(frame.page()!==page || frame.isDetached())return 'FRAME_UNAVAILABLE';
+    if(frame===main)return 'MAIN_FRAME';
+    const parent=frame.parentFrame();
+    if(!parent || parent.page()!==page || parent.isDetached())return 'FRAME_UNAVAILABLE';
+    if(parent===main)return 'CHECKOUT_CHILD';
+    return isStripeScriptDocument(parent.url())?'STRIPE_PARENT':'OTHER_PARENT';
+  }catch{return 'FRAME_UNAVAILABLE';}
+}
 function stripeFrameChain(route:Route,page:Page) {
-  // Header retrieval is asynchronous. Remember which documents initiated the request.
+  // Snapshot the frame chain for the static subresource ownership check.
   try{
     const chain:{frame:Frame;href:string}[]=[],main=page.mainFrame();
     for(let frame:Frame|null=route.request().frame();frame!==main;frame=frame.parentFrame()){
       if(!frame || frame.page()!==page || frame.isDetached())return undefined;
-      const href=frame.url(),url=new URL(href);
-      if(!providerOrigin(url) || !(url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com')))return undefined;
+      const href=frame.url();
+      if(!isStripeScriptDocument(href))return undefined;
       chain.push({frame,href});
     }
     return chain.length?chain:undefined;
@@ -212,6 +231,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       const refusal=provider?providerRefusal(url):undefined;
       const staticTarget=refusal==='BROWSER_PROVIDER_ORIGIN_OTHER' && matchesStaticOrigin?.(url.origin)===true;
       const originalFrames=staticTarget && renderPhase && page?stripeFrameChain(route,page):undefined;
+      const navigationTarget=staticTarget && renderPhase && page?staticNavigationTarget(request,page):null;
       if(provider)routeCheckpoint='BROWSER_PROVIDER_HEADERS';
       const headers=await request.allHeaders();
       if(provider)routeCheckpoint='BROWSER_PROVIDER_CURRENT';
@@ -239,7 +259,10 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
               routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_BODY';
               need(request.postData()===null);
               routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION';
-              need(!request.isNavigationRequest());
+              if(request.isNavigationRequest()){
+                if(navigationTarget!==null)routeCheckpoint+='_'+navigationTarget;
+                throw failed();
+              }
               routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_URL';
               need(url.href===url.origin+url.pathname);
               routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_CREDENTIALS';

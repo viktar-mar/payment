@@ -160,7 +160,7 @@ class Control {
   async activate() {assert.equal(this.disabled,false);await this.onclick?.({isTrusted:true});}
 }
 type ProviderProbe={target:string;headers?:Record<string,string>;headerFailure?:'getter'|'reject';redirect?:'throw'|'present';navigation?:'main'|'child'|'throw'|'frame';fallbackFailure?:boolean;hold?:boolean;method?:string;phase?:'initial'|'method';
-  atMount?:boolean;resource?:string;postData?:string;detachBeforeDispatch?:boolean;frameUrl?:string;parentUrl?:string;
+  atMount?:boolean;resource?:string;postData?:string;detachBeforeDispatch?:boolean;frameUrl?:string;parentUrl?:string;parentDetached?:boolean;onHeaders?:()=>void;
   child?:'owned'|'nested'|'foreign'|'foreign-parent'|'detached'|'other-page'};
 type StaticFixture={matches:(origin:string)=>boolean;fetch:typeof fetch};
 async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:StaticFixture) {
@@ -201,19 +201,19 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
   const base = (op:string)=>backend+'/api/v1/customer/subscriptions/'+id(6)+'/operations/'+op;
   const otpUrl = backend+'/api/v1/public/customer-auth/email-otp/challenges';
   let url = 'about:blank', closed = 0;
-  const frame = {url:()=>url}, callbacks = new Map<string,Function>(),bindings=new Map<string,Function>();
+  const frame = {url:()=>url,page:()=>page,isDetached:()=>false}, callbacks = new Map<string,Function>(),bindings=new Map<string,Function>();
   let routeHandler:Function;
   const staticReplies:{headers:Record<string,string>;body:Buffer}[]=[];
   async function probeProvider(probe:ProviderProbe) {
     let denied=false;
     const fail=()=>{throw Error('secret_fixture canary');};
-    const parent={url:()=>probe.child==='foreign-parent'?'https://untrusted.test/':probe.parentUrl??'https://inner.js.stripe.com/',isDetached:()=>false,page:()=>page,parentFrame:()=>frame};
+    const parent={url:()=>probe.child==='foreign-parent'?'https://untrusted.test/':probe.parentUrl??'https://inner.js.stripe.com/',isDetached:()=>probe.parentDetached===true,page:()=>page,parentFrame:()=>frame};
     const child={url:()=>probe.child==='foreign'?'https://untrusted.test/':probe.frameUrl??'https://js.stripe.com/element',isDetached:()=>probe.child==='detached',page:()=>probe.child==='other-page'?{}:page,parentFrame:()=>{
       if(probe.detachBeforeDispatch)queueMicrotask(()=>{probe.child='detached';});
       return probe.child==='nested'||probe.child==='foreign-parent'?parent:frame;
     }};
     const req={url:()=>probe.target,method:()=>probe.method??'GET',
-      get allHeaders(){if(probe.headerFailure==='getter')fail();return async()=>{if(probe.headerFailure==='reject')fail();if(probe.hold){markIO();await heldIO;}return probe.headers??{};};},
+      get allHeaders(){if(probe.headerFailure==='getter')fail();return async()=>{if(probe.headerFailure==='reject')fail();if(probe.hold){markIO();await heldIO;}probe.onHeaders?.();return probe.headers??{};};},
       redirectedFrom:()=>{if(probe.redirect==='throw')fail();return probe.redirect==='present'?{}:null;},
       isNavigationRequest:()=>{if(probe.navigation==='throw')fail();return Boolean(probe.navigation);},
       frame:()=>{if(probe.navigation==='frame')fail();return probe.child?child:probe.navigation==='child'?{}:frame;},
@@ -237,7 +237,7 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
     if(bridge && change===bridge+'_early_header')headers.cookie='fixture=refused';
     let requestFrame=frame;
     if(target.endsWith('/action-confirmations')) {
-      if(change==='frame')requestFrame={url:()=>url};
+      if(change==='frame')requestFrame={...frame};
       if(change==='origin')headers.origin='http://localhost:14173';
       if(change==='identity')headers.authorization='Bearer '+'F'.repeat(43);
       if(change==='operation')target=target.replace(id(9),id(7));
@@ -378,16 +378,19 @@ for(const phase of ['initial','method'] as const)for(const [resource,file,mime] 
 const refusedStaticProbes:Record<string,Partial<ProviderProbe>>={
  unmatched:{target:'https://untrusted.invalid/art/icon.svg'},family:{target:'https://elsewhere.stripe.com/icon.svg'},early:{atMount:false},
  main:{child:undefined},foreign:{child:'foreign'},foreignParent:{child:'foreign-parent'},detached:{child:'detached'},otherPage:{child:'other-page'},
- font:{resource:'font'},wrongOrigin:{headers:{origin:'https://untrusted.test'}},document:{resource:'document'},script:{resource:'script'},stylesheet:{resource:'stylesheet'},xhr:{resource:'xhr'},fetch:{resource:'fetch'},navigation:{navigation:'child'},
+ font:{resource:'font'},wrongOrigin:{headers:{origin:'https://untrusted.test'}},document:{resource:'document'},script:{resource:'script'},stylesheet:{resource:'stylesheet'},xhr:{resource:'xhr'},fetch:{resource:'fetch'},navigation:{navigation:'child',resource:'document'},
  cookie:{headers:{cookie:'private=1'}},authorization:{headers:{authorization:'Bearer other'}},emptyAuthorization:{headers:{authorization:''}},proxy:{headers:{'proxy-authorization':'Basic secret'}},
  post:{method:'POST'},body:{postData:'private'},emptyBody:{postData:''},query:{target:staticProbe.target+'?private'},fragment:{target:staticProbe.target+'#private'},
  emptyQuery:{target:staticProbe.target+'?'},emptyFragment:{target:staticProbe.target+'#'},
  methodBeforeBody:{method:'POST',postData:'private'},urlBeforeCredentials:{target:staticProbe.target+'?private',headers:{cookie:'private=1'}},
+ earlyNavigation:{atMount:false,navigation:'child',resource:'document'},
+ postNavigation:{method:'POST',navigation:'child',resource:'document'},navigationCheckUnavailable:{navigation:'throw',resource:'document'},
  redirect:{redirect:'present'},credentials:{target:'https://user:pass@static-provider.invalid/art'},nondefaultPort:{target:fixtureStaticOrigin+':8443/art'},
 };
 const requestCheckpoints:Record<string,string>={
- early:'PHASE',post:'METHOD',body:'BODY',emptyBody:'BODY',navigation:'NAVIGATION',query:'URL',fragment:'URL',emptyQuery:'URL',emptyFragment:'URL',
+ early:'PHASE',post:'METHOD',body:'BODY',emptyBody:'BODY',navigation:'NAVIGATION_CHECKOUT_CHILD',query:'URL',fragment:'URL',emptyQuery:'URL',emptyFragment:'URL',
  methodBeforeBody:'METHOD',urlBeforeCredentials:'URL',
+ earlyNavigation:'PHASE',postNavigation:'METHOD',navigationCheckUnavailable:'NAVIGATION',
  cookie:'CREDENTIALS',proxy:'CREDENTIALS',emptyAuthorization:'CREDENTIALS',font:'RESOURCE_TYPE',document:'RESOURCE_TYPE',xhr:'RESOURCE_TYPE',fetch:'RESOURCE_TYPE',
  script:'SUFFIX',stylesheet:'SUFFIX',
 };
@@ -402,6 +405,35 @@ for(const [name,change] of Object.entries(refusedStaticProbes))test('static gate
      assert.equal(browserDiagnostic(error),reason);assert.deepEqual(Object.keys(error as object),[]);return true;
    });assert.equal(h.runAbort.signal.aborted,true);
    assert.equal(fetched,0);assert.equal(h.staticReplies.length,0);assert.equal(h.providerFallbacks(),0);assert.ok(!h.counts.includes('confirm'));
+ }finally{await h.restore();}
+});
+const navigationProbes:readonly [string,Partial<ProviderProbe>,string][]=[
+ ['top-level document',{navigation:'main',child:undefined},'MAIN_FRAME'],
+ ['new child of a Stripe.js frame',{child:'nested',frameUrl:'about:blank'},'STRIPE_PARENT'],
+ ['child of another frame',{child:'foreign-parent'},'OTHER_PARENT'],
+ ['unassociated frame',{navigation:'frame'},'FRAME_UNAVAILABLE'],
+ ['detached target',{child:'detached'},'FRAME_UNAVAILABLE'],
+ ['detached parent',{child:'nested',parentDetached:true},'FRAME_UNAVAILABLE'],
+ ['foreign page',{child:'other-page'},'FRAME_UNAVAILABLE'],
+];
+for(const [name,change,checkpoint] of navigationProbes)test('static navigation blocks '+name+' without transport',async()=>{
+ const probe:ProviderProbe={...staticProbe,navigation:'child',resource:'document',...change};
+ let fetched=0;const h=await fixture('',[probe],{matches:fixtureMatchesStatic,fetch:async()=>{fetched++;throw Error('inert');}});
+ try{
+   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>{
+     assert.equal(browserDiagnostic(error),'BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_'+checkpoint);
+     assert.deepEqual(Object.keys(error as object),[]);return true;
+   });
+   assert.equal(h.runAbort.signal.aborted,true);assert.equal(h.closed(),1);
+   assert.equal(fetched,0);assert.equal(h.staticReplies.length,0);assert.equal(h.providerFallbacks(),0);assert.ok(!h.counts.includes('confirm'));
+ }finally{await h.restore();}
+});
+test('static navigation reports its target at interception before headers can change ancestry',async()=>{
+ const probe:ProviderProbe={...staticProbe,navigation:'child',resource:'document',child:'nested',onHeaders:()=>{probe.child='foreign-parent';}};
+ const h=await fixture('',[probe],{matches:fixtureMatchesStatic,fetch:inertFetch});
+ try{
+   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>browserDiagnostic(error)==='BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_STRIPE_PARENT');
+   assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,0);assert.ok(!h.counts.includes('confirm'));
  }finally{await h.restore();}
 });
 for(const [name,makeResponse] of Object.entries({
