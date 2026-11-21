@@ -31,6 +31,7 @@ export function finishBrowserCleanup(error,confirmed){const value=metadata.get(e
 
 const stripeComOther='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER';
 const generalOther='BROWSER_PROVIDER_ORIGIN_OTHER';
+const stripeNetwork='BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK';
 function providerOriginIdentity(runId,expectedSource,origin,checkpoint){
  if(typeof runId!=='string'||runId.length!==36||!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(runId)||
     typeof expectedSource!=='string'||expectedSource.length!==40||!/^[0-9a-f]{40}$/.test(expectedSource)||
@@ -45,11 +46,11 @@ function providerOriginIdentity(runId,expectedSource,origin,checkpoint){
      url.hostname!=='stripe.network' && !url.hostname.endsWith('.stripe.network');
   }catch{return false;}
  }
- if(checkpoint!==stripeComOther)return false;
+ if(checkpoint!==stripeComOther&&checkpoint!==stripeNetwork)return false;
  const hostname=origin.slice(8);
- if(hostname.length>253||/[^a-z0-9.-]/.test(hostname)||
-    !(hostname==='stripe.com'||hostname.endsWith('.stripe.com'))||
-    ['api.stripe.com','hooks.stripe.com','js.stripe.com','m.stripe.com','r.stripe.com','merchant-ui-api.stripe.com'].includes(hostname)||hostname.endsWith('.js.stripe.com'))return false;
+ const family=checkpoint===stripeNetwork?'stripe.network':'stripe.com';
+ if(hostname.length>253||/[^a-z0-9.-]/.test(hostname)||!(hostname===family||hostname.endsWith('.'+family)))return false;
+ if(checkpoint===stripeComOther&&(['api.stripe.com','hooks.stripe.com','js.stripe.com','m.stripe.com','r.stripe.com','merchant-ui-api.stripe.com'].includes(hostname)||hostname.endsWith('.js.stripe.com')))return false;
  if(!hostname.split('.').every(label=>label.length>0&&label.length<=63&&/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)))return false;
  try{
   for(const label of hostname.split('.')){
@@ -72,15 +73,15 @@ export function isBrowserProviderOriginWitness(value){
    if(!descriptor?.enumerable||!Object.hasOwn(descriptor,'value'))return false;
    fields[name]=descriptor.value;
   }
-  if(tagged&&fields.checkpoint!==generalOther)return false;
-  return providerOriginIdentity(fields.runId,fields.expectedSource,fields.origin,tagged?generalOther:stripeComOther);
+  if(tagged&&fields.checkpoint!==generalOther&&fields.checkpoint!==stripeNetwork)return false;
+  return providerOriginIdentity(fields.runId,fields.expectedSource,fields.origin,tagged?fields.checkpoint:stripeComOther);
  }catch{return false;}
 }
 export function rememberBrowserProviderOrigin(error,runId,expectedSource,origin){
  const checkpoint=metadata.get(error)?.code;
- if((checkpoint!==generalOther&&checkpoint!==stripeComOther)||providerOrigins.has(error)||!providerOriginIdentity(runId,expectedSource,origin,checkpoint))return false;
+ if(!checkpoint||providerOrigins.has(error)||!providerOriginIdentity(runId,expectedSource,origin,checkpoint))return false;
  const witness={runId,expectedSource,origin};
- if(checkpoint===generalOther)witness.checkpoint=checkpoint;
+ if(checkpoint!==stripeComOther)witness.checkpoint=checkpoint;
  providerOrigins.set(error,Object.freeze(witness));return true;
 }
 export const browserProviderOrigin=error=>providerOrigins.get(error)??null;

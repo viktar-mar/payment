@@ -39,8 +39,11 @@ const privateOrigin='https://evidence-only.stripe.com';
 function originalOriginError(runId=opts().runId,source=opts().expectedSource){
  const error=browserFailure('BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');assert.equal(rememberBrowserProviderOrigin(error,runId,source,privateOrigin),true);return error;
 }
-test('initial OTHER refusal offers the exact origin only to the private writer after CREATE',async()=>{
- const h=harness(),checkpoint='BROWSER_PROVIDER_ORIGIN_OTHER',origin='https://private-provider.invalid';
+for(const [checkpoint,origin] of [
+ ['BROWSER_PROVIDER_ORIGIN_OTHER','https://private-provider.invalid'],
+ ['BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK','https://private-provider.stripe.network'],
+])test('initial refusal offers the exact origin only to the private writer after CREATE: '+checkpoint,async()=>{
+ const h=harness();
  const error=browserFailure(checkpoint),offers=[],dispatches=[];
  assert.equal(rememberBrowserProviderOrigin(error,opts().runId,opts().expectedSource,origin),true);
  h.bootstrap.persistRefusedStripeOrigin=async witness=>{offers.push(witness);};

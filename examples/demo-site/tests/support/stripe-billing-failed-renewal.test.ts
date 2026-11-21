@@ -292,6 +292,7 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
     mountStripePaymentAttempt:async(p:any)=>{counts.push('mountInitial');if(change==='mount_retire'){p.onRetire?.();throw Error('secret_fixture canary');}if(change==='mount_refusal')throw Error('secret_fixture canary');assert.strictEqual(p.client,subscriptions);assert.strictEqual(p.input.session,session);
       for(const probe of provider??[])if(probe.atMount&&probe.phase!=='method')await probeProvider(probe);
       return {destroy:()=>{},confirm:async()=>{await request(base(id(7))+'/confirmation-attempts/'+id(8)+'/confirm','POST',{capability,confirmation_token:'ctoken_inert'});
+        if(change==='after_initial_confirm')await stageHook?.('confirmed');
         p.onRetire?.();return {state:'OBSERVE',retryAllowed:false,successorAttemptId:null};}};},
     mountStripeSubscriptionMethod:async(p:any)=>{counts.push('mountMethod');if(change==='method_mount_refusal'){p.onRetire?.();throw Error('secret_fixture canary');}assert.strictEqual(p.client,subscriptions);assert.strictEqual(p.session,session);
       assert.equal(p.subscriptionId,id(6));assert.equal(p.operationId,id(9));
@@ -793,8 +794,15 @@ const providerCases:readonly [string,ProviderProbe,string,string?][]=[
  ['stripe r navigation lookup',{target:'https://r.stripe.com/',navigation:'throw'},'BROWSER_PROVIDER_NAVIGATION'],
  // URL parsing precedes provider classification and retains the active readiness checkpoint.
  ['malformed URL before provider classification',{target:'https://m.stripe.com:invalid/'},'BROWSER_READY_PHASE'],
- ['network apex',{target:'https://stripe.network/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
- ['network subdomain',{target:'https://other.stripe.network/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
+ ['network apex',{target:'https://stripe.network/',atMount:true},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK','https://stripe.network'],
+ ['network subdomain',{target:'https://other.stripe.network/',atMount:true},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK','https://other.stripe.network'],
+ ['network before session selection has no private witness',{target:'https://other.stripe.network/'},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
+ ['network method phase has no private witness',{target:'https://other.stripe.network/',phase:'method',atMount:true},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
+ ['network authorization before origin',{target:'https://other.stripe.network/',headers:{authorization:'Bearer provider'},atMount:true},'BROWSER_PROVIDER_AUTH'],
+ ['network invalid DNS label',{target:'https://bad_.stripe.network/',atMount:true},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
+ ['network encoded authority',{target:'https://%77itness.stripe.network/',atMount:true},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
+ ['network Unicode authority',{target:'https://ｗitness.stripe.network/',atMount:true},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
+ ['network backslash authority',{target:'https://other.stripe.network\\private',atMount:true},'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
  ['other',{target:'https://elsewhere.test/'},'BROWSER_PROVIDER_ORIGIN_OTHER','https://elsewhere.test'],
  ['other redirect',{target:'https://elsewhere.test/',redirect:'present'},'BROWSER_PROVIDER_REDIRECT'],
  ['other userinfo',{target:'https://user:pass@elsewhere.test/'},'BROWSER_PROVIDER_USERINFO'],
@@ -834,9 +842,9 @@ async function consumeProviderBoundary(h:Awaited<ReturnType<typeof fixture>>,pro
   assert.equal(browserDiagnostic(first),checkpoint);
   assert.equal(typeof privateOrigin.browserProviderOrigin,'function');
   const saved=privateOrigin.browserProviderOrigin(first);
-  const other=checkpoint==='BROWSER_PROVIDER_ORIGIN_OTHER';
-  const expected=expectedOrigin && !(other && probe.phase==='method')
-    ? {runId:id(1),expectedSource:'a'.repeat(40),origin:expectedOrigin,...(other?{checkpoint}:{})}
+  const tagged=checkpoint==='BROWSER_PROVIDER_ORIGIN_OTHER'||checkpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK';
+  const expected=expectedOrigin && !(tagged && probe.phase==='method')
+    ? {runId:id(1),expectedSource:'a'.repeat(40),origin:expectedOrigin,...(tagged?{checkpoint}:{})}
     : null;
   assert.deepEqual(saved,expected);
   if(expected)assert.equal(Object.isFrozen(saved),true);
@@ -889,14 +897,14 @@ test('r provider boundary '+phase+' '+name,async()=>{
  const origin=expectedOrigin?.replace('merchant-ui-api','r');
  await consumeProviderBoundary(await fixture('',[probe]),probe,checkpoint,origin);
 });
-for(const [host,checkpoint] of [['other.stripe.com','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'],['only-private.example','BROWSER_PROVIDER_ORIGIN_OTHER']] as const)
+for(const [host,checkpoint] of [['other.stripe.com','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'],['only-private.example','BROWSER_PROVIDER_ORIGIN_OTHER'],['only-private.stripe.network','BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK']] as const)
 test(checkpoint+' route keeps canonical private origin and original identity through replay and cleanup',async()=>{
- const probe={target:'https://'+host.toUpperCase()+':443/artificial_sensitive_path?artificial_secret_query=value#artificial_secret_fragment'};
+ const probe={target:'https://'+host.toUpperCase()+':443/artificial_sensitive_path?artificial_secret_query=value#artificial_secret_fragment',atMount:checkpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'};
  const h=await fixture('',[probe]);let first:unknown;
  try{
   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>{first=error;return true;});
   assert.equal(typeof privateOrigin.browserProviderOrigin,'function');
-  const expected={runId:id(1),expectedSource:'a'.repeat(40),origin:'https://'+host,...(checkpoint==='BROWSER_PROVIDER_ORIGIN_OTHER'?{checkpoint}:{})};
+  const expected={runId:id(1),expectedSource:'a'.repeat(40),origin:'https://'+host,...(checkpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'?{}:{checkpoint})};
   assert.deepEqual(privateOrigin.browserProviderOrigin(first),expected);
   await assert.rejects(h.probeProvider({target:'https://second.example/second_secret?secret=yes#secret'}));
   assert.deepEqual(privateOrigin.browserProviderOrigin(first),expected);
@@ -909,6 +917,35 @@ test(checkpoint+' route keeps canonical private origin and original identity thr
   assert.equal(JSON.stringify(first),'{}');assert.deepEqual(Object.keys(first as object),[]);
   assert.doesNotMatch(String(first)+JSON.stringify(h.terminals)+h.status(),/stripe\.com|only-private|artificial_sensitive|artificial_secret|second_secret|aaaaaaaa/);
  }finally{h.releaseIO();await h.restore();}
+});
+for(const window of ['prepare to ready','ready to confirm dispatch','after confirm acknowledgement'] as const)
+test('network refusal outside the initial rendering window keeps only the public reason: '+window,async()=>{
+ const h=await fixture(window==='after confirm acknowledgement'?'after_initial_confirm':''),target='https://late.stripe.network/private?secret=value';
+ let pending:Promise<void>|undefined,dispatched=0;
+ const startHeld=async()=>{
+  pending=assert.rejects(h.probeProvider({target,hold:true}),/denied mock request/);
+  await h.ioPending;
+ };
+ const release=async()=>{assert.ok(pending);h.releaseIO();await pending;};
+ const port={...h.initialPort,
+  prepare:async(input:unknown)=>{if(window==='prepare to ready')await startHeld();return h.initialPort.prepare(input);},
+  confirm:async()=>{dispatched++;if(window==='ready to confirm dispatch')await release();return h.initialPort.confirm();},
+ };
+ h.setReadyHook(async()=>{
+  if(window==='prepare to ready')await release();
+  if(window==='ready to confirm dispatch')await startHeld();
+ });
+ if(window==='after confirm acknowledgement')h.setStageHook(async stage=>{
+  if(stage==='confirmed')await assert.rejects(h.probeProvider({target}),/denied mock request/);
+ });
+ try{
+  await assert.rejects(h.journey.initial(port,nowLimits()),error=>{
+   assert.equal(browserDiagnostic(error),'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK');
+   assert.equal(privateOrigin.browserProviderOrigin(error),null);return true;
+  });
+  assert.equal(dispatched,window==='prepare to ready'?0:1);
+  assert.deepEqual(h.providerAborts,['failed']);assert.equal(h.providerFallbacks(),0);
+ }finally{h.releaseIO();await pending;await h.restore();}
 });
 for(const change of ['page_action','action_early_header'])test('earlier page or bridge refusal cannot acquire a later OTHER witness '+change,async()=>{
  const h=await fixture(change);let first:unknown;

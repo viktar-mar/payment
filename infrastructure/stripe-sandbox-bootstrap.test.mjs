@@ -1970,6 +1970,7 @@ async function failedRenewalOriginLive(configure=()=>{}){
 for(const [name,witness,checkpoint] of [
  ['Stripe family',refusedWitness,'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'],
  ['other origin',otherRefusedWitness,'BROWSER_PROVIDER_ORIGIN_OTHER'],
+ ['Stripe network',()=>({...refusedWitness(),origin:'https://evidence-only.stripe.network',checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'}),'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
 ])test('refused origin writes only one fixed private bounded file for the original LIVE owner: '+name,async()=>{
  const f=await failedRenewalOriginLive(),b=f.adapter,before=b.resources(),ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents),offset=f.events.length;
  assert.equal(typeof b.persistRefusedStripeOrigin,'function');

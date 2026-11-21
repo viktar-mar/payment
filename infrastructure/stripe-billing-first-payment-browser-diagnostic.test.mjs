@@ -161,6 +161,25 @@ test('witness validator rejects nonplain inherited extra and accessor fields wit
 });
 
 const otherCheckpoint='BROWSER_PROVIDER_ORIGIN_OTHER';
+test('private network evidence requires the matching category, a canonical DNS origin and original error',()=>{
+ const checkpoint='BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK',origin='https://one.stripe.network';
+ const candidate={runId:originRun,expectedSource:originSource,checkpoint,origin};
+ const error=browserFailure(checkpoint);
+ assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,origin),true);
+ assert.deepEqual(privateOrigin.browserProviderOrigin(error),candidate);
+ assert.equal(privateOrigin.isBrowserProviderOriginWitness(candidate),true);
+ assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,'https://two.stripe.network'),false);
+ assert.equal(privateOrigin.rememberBrowserProviderOrigin(new Error(checkpoint),originRun,originSource,origin),false);
+ assert.equal(privateOrigin.isBrowserProviderOriginWitness({...witness(),origin}),false);
+ assert.equal(privateOrigin.isBrowserProviderOriginWitness({...candidate,checkpoint:otherCheckpoint}),false);
+ assert.equal(JSON.stringify(error),'{}');
+ for(const invalid of ['https://stripe.network.evil.test','https://notstripe.network','https://other.stripe.com','https://stripe.network.',
+   'https://other.stripe.network:443','https://other.stripe.network:444','https://user@other.stripe.network','https://other.stripe.network/private',
+   'https://other.stripe.network?private','https://other.stripe.network#private','https://bad..stripe.network','https://_bad.stripe.network',
+   'https://-bad.stripe.network','https://'+'a'.repeat(64)+'.stripe.network']){
+  assert.equal(privateOrigin.isBrowserProviderOriginWitness({...candidate,origin:invalid}),false,invalid);
+ }
+});
 test('a genuine general OTHER error retains its exact private origin only once',()=>{
  for(const origin of ['https://outside.test','https://js.stripe.com.evil.test','https://stripe.network.',
    'https://js.stripe.com.','https://xn--bcher-kva.test','https://192.0.2.1','https://[2001:db8::1]']){

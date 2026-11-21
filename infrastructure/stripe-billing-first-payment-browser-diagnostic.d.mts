@@ -7,7 +7,7 @@ export interface BrowserProviderOriginWitness {
  readonly runId:string;
  readonly expectedSource:string;
  readonly origin:string;
- readonly checkpoint?:'BROWSER_PROVIDER_ORIGIN_OTHER';
+ readonly checkpoint?:'BROWSER_PROVIDER_ORIGIN_OTHER'|'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK';
 }
 export function rememberBrowserProviderOrigin(error: unknown, runId: string, expectedSource: string, origin: string): boolean;
 export function browserProviderOrigin(error: unknown): BrowserProviderOriginWitness | null;

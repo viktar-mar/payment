@@ -40,6 +40,8 @@ const staticAssets=[
   {resource:'stylesheet',suffix:'.css',media:['text/css']},
   {resource:'script',suffix:'.js',media:['text/javascript','application/javascript']},
 ];
+// Check the original authority before URL parsing can normalize malformed input.
+const plainHttpsAuthority=/^https:\/\/[A-Za-z0-9.-]+(?::443)?(?:[/?#]|$)/i;
 function providerRefusal(url:URL) {
   if(providerNetworkOrigin(url))return undefined;
   if(url.protocol!=='https:')return 'BROWSER_PROVIDER_ORIGIN_SCHEME';
@@ -249,7 +251,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     let blockIssued=false;
     try {
       current();
-      const request=route.request(),url=new URL(request.url());
+      const request=route.request(),rawUrl=request.url(),url=new URL(rawUrl);
       const renderPhase=(state==='INITIAL'||state==='METHOD') && step==='CONFIRM'?state:undefined;
       // Select backend provenance before even reading headers or delivering a
       // preflight. Non-backend refusals get a fixed route boundary.
@@ -263,7 +265,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       const originalFrames=staticTarget && renderPhase && page && navigationTarget===null?stripeFrameChain(page,()=>request.frame()):undefined;
       const checkoutUrl=binding.endpoints.demo+pagePath;
       const originalNavigation=renderPhase==='INITIAL' && navigationTarget==='STRIPE_PARENT' && page &&
-        request.method()==='GET' && /^https:\/\/[A-Za-z0-9.-]+(?::443)?(?:[/?#]|$)/i.test(request.url())
+        request.method()==='GET' && plainHttpsAuthority.test(rawUrl)
         ?stripeNavigationChain(request,page,checkoutUrl):undefined;
       const interceptedBeforePay=initialFormBeforePay();
       // Even an ineligible pinned document can reach READY before its original
@@ -365,7 +367,9 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
               }
               return;
             }
-            if(routeCheckpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER' ||
+            const initialNetworkWitness=routeCheckpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK' &&
+              renderPhase==='INITIAL' && state==='INITIAL' && step==='CONFIRM' && plainHttpsAuthority.test(rawUrl);
+            if(initialNetworkWitness || routeCheckpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER' ||
                 (state==='INITIAL' && routeCheckpoint==='BROWSER_PROVIDER_ORIGIN_OTHER'))refusedOrigin=url.origin;
             need(false);
           }
