@@ -429,6 +429,441 @@ test('registered route preserves owned main document and owned provider subframe
   assert.ok(!f.calls.includes('abort'));
 });
 
+const nestedEnv={...env,PAYMENT_STRIPE_BROWSER_LOAD_CHECK_BLOCK_NESTED_DOCUMENT:'true'};
+const recoveryPresentationFlag='PAYMENT_STRIPE_BROWSER_LOAD_CHECK_RECOVERY_PRESENTATION';
+const recoveryPresentationEnv={...nestedEnv,[recoveryPresentationFlag]:'true'};
+const probeOrigin='https://nested-probe.invalid';
+const probeDocument='http://127.0.0.1:4173/stripe-browser-load-check.html';
+const nestedReport=(loadResult:string,nestedDocument:'BLOCKED'|'NOT_OBSERVED')=>({...report(loadResult),nestedDocument});
+
+function nestedDocumentFixture(){
+  const f=runnerFixture();
+  const ownedFrame=()=>({page:()=>f.page,isDetached:()=>false});
+  const main=Object.assign(f.page.mainFrame(),ownedFrame(),{url:()=>probeDocument,parentFrame:()=>null});
+  const outer={...ownedFrame(),url:()=> 'https://js.stripe.com/outer.html',parentFrame:()=>main};
+  const parent={...ownedFrame(),url:()=> 'https://elements.js.stripe.com/inner.html',parentFrame:()=>outer};
+  const target={...ownedFrame(),url:()=> 'about:blank',parentFrame:()=>parent};
+  const ports={...f.ports,timeoutMs:300,matchesNestedDocumentOrigin:(origin:string)=>origin===probeOrigin};
+  const makeRequest=()=>({url:()=>probeOrigin+'/private-sentinel?query=hidden',method:()=> 'GET',allHeaders:async()=>({}) as Record<string,string>,
+    isNavigationRequest:()=>true,redirectedFrom:()=>null as object|null,frame:()=>target as ReturnType<typeof ownedFrame>,
+    postData:()=>null as string|null,resourceType:()=> 'document'});
+  const abortCodes:(string|undefined)[][]=[];
+  const blockedRoute=(change:Partial<ReturnType<typeof makeRequest>>={},autoSignal=true)=>{
+    const request={...makeRequest(),...change},codes:(string|undefined)[]=[];
+    abortCodes.push(codes);
+    let failure:{errorText:string}|null=null;
+    const routedRequest={...request,failure:()=>failure};
+    const signalFailure=(errorText:string,unrelated=false)=>{
+      const observed={errorText};
+      if(!unrelated)failure=observed;
+      f.listeners.requestfailed?.(unrelated?{...routedRequest,failure:()=>observed}:routedRequest);
+    };
+    return {request:()=>routedRequest,signalFailure,abort:async(code?:string)=>{
+      codes.push(code);
+      if(autoSignal&&code==='blockedbyclient')signalFailure('net::ERR_BLOCKED_BY_CLIENT');
+    },
+      fetch:async()=>{f.calls.push('nested.fetch');throw Error('forbidden fetch');},
+      fallback:async()=>{f.calls.push('nested.fallback');},continue:async()=>{f.calls.push('nested.continue');},
+      fulfill:async()=>{f.calls.push('nested.fulfill');}};
+  };
+  f.page.goto=async()=>{
+    const document=blockedRoute({url:()=>probeDocument,frame:()=>main});
+    abortCodes.pop();
+    document.fulfill=async()=>{f.calls.push('document.fulfill');};
+    await f.route()(document);
+  };
+  const onFirstReadyWait=(work:()=>Promise<void>)=>{
+    let started=false;
+    f.page.waitForFunction=async()=>{
+      if(started)return;
+      started=true;
+      await work();
+    };
+  };
+  return {...f,main,outer,target,ports,blockedRoute,abortCodes,onFirstReadyWait};
+}
+
+test('nested document probe aborts the eligible request locally and reports observed readiness',async()=>{
+  const {runLoadCheck,formatLoadCheckResult}=await launcherModule();const f=nestedDocumentFixture();
+  f.onFirstReadyWait(async()=>{await f.route()(f.blockedRoute());});
+  const result=await runLoadCheck(nestedEnv,f.ports);
+  assert.deepEqual(result,nestedReport('READY','BLOCKED'));
+  assert.deepEqual(formatLoadCheckResult(result),{line:'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE nested_document=BLOCKED',exitCode:0});
+  assert.deepEqual(f.abortCodes,[['blockedbyclient']]);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+  assert.doesNotMatch(JSON.stringify(result),/private-sentinel|query=|nested-probe/);
+});
+
+test('nested document probe reports a ready Element without observing the document separately',async()=>{
+  const {runLoadCheck,formatLoadCheckResult}=await launcherModule();const f=nestedDocumentFixture();
+  const result=await runLoadCheck(nestedEnv,f.ports);
+  assert.deepEqual(result,nestedReport('READY','NOT_OBSERVED'));
+  assert.deepEqual(formatLoadCheckResult(result),{line:'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE nested_document=NOT_OBSERVED',exitCode:0});
+  assert.deepEqual(f.abortCodes,[]);
+});
+
+test('recovery presentation keeps observing after READY and blocks the delayed nested document without transport',async t=>{
+  const {runLoadCheck,formatLoadCheckResult}=await launcherModule();
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=nestedDocumentFixture(),firstReady=deferred();
+  f.ports.timeoutMs=10000;
+  const configurations:unknown[][]=[];
+  f.page.evaluate=(async(...args:unknown[])=>{configurations.push(args);}) as typeof f.page.evaluate;
+  let waits=0;
+  f.page.waitForFunction=async()=>{if(++waits===1)firstReady.resolve(undefined);};
+  const pending=runLoadCheck(recoveryPresentationEnv,f.ports);
+  await firstReady.promise;
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  t.mock.timers.tick(100);
+  assert.ok(!f.calls.includes('context.close'));
+  await f.route()(f.blockedRoute());
+  const result=await pending;
+  assert.equal(waits,2);
+  assert.deepEqual(configurations.map(args=>args[1]),[{key:env.PAYMENT_STRIPE_BROWSER_LOAD_CHECK_PUBLISHABLE_KEY,profile:'recovery-presentation'}]);
+  assert.deepEqual(result,{...nestedReport('READY','BLOCKED'),profile:'RECOVERY_PRESENTATION'});
+  assert.deepEqual(formatLoadCheckResult(result),{line:'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE nested_document=BLOCKED profile=RECOVERY_PRESENTATION',exitCode:0});
+  assert.deepEqual(f.abortCodes,[['blockedbyclient']]);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+});
+
+test('recovery presentation bounds passive observation and does not count READY alone as reproduction',async t=>{
+  const {runLoadCheck,formatLoadCheckResult}=await launcherModule();
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=nestedDocumentFixture(),firstReady=deferred();
+  f.ports.timeoutMs=10000;
+  let waits=0;
+  f.page.waitForFunction=async()=>{if(++waits===1)firstReady.resolve(undefined);};
+  const pending=runLoadCheck(recoveryPresentationEnv,f.ports);
+  await firstReady.promise;
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  t.mock.timers.tick(4999);
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.ok(!f.calls.includes('context.close'));
+  t.mock.timers.tick(1);
+  const result=await pending;
+  assert.equal(waits,2);
+  assert.deepEqual(result,{...nestedReport('READY','NOT_OBSERVED'),profile:'RECOVERY_PRESENTATION'});
+  assert.deepEqual(formatLoadCheckResult(result),{line:'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE nested_document=NOT_OBSERVED profile=RECOVERY_PRESENTATION',exitCode:1});
+  assert.deepEqual(f.abortCodes,[]);
+});
+
+test('recovery presentation accounts for an intercepted document during the final readiness read',async t=>{
+  const {runLoadCheck}=await launcherModule();
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=nestedDocumentFixture(),firstReady=deferred();
+  f.ports.timeoutMs=10000;
+  const route=f.blockedRoute({},false);
+  let waits=0;
+  f.page.waitForFunction=async()=>{
+    waits++;
+    if(waits===1)firstReady.resolve(undefined);
+    if(waits===2)await f.route()(route);
+  };
+  const pending=runLoadCheck(recoveryPresentationEnv,f.ports);
+  await firstReady.promise;
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  t.mock.timers.tick(5000);
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  const closedBeforeEvent=f.calls.includes('context.close');
+  route.signalFailure('net::ERR_BLOCKED_BY_CLIENT');
+  assert.deepEqual(await pending,{...nestedReport('READY','BLOCKED'),profile:'RECOVERY_PRESENTATION'});
+  assert.equal(closedBeforeEvent,false);
+  assert.equal(waits,3);
+  assert.deepEqual(f.abortCodes,[['blockedbyclient']]);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+});
+
+test('recovery presentation lets an in-window pinned document finish header classification within the original deadline',async t=>{
+  const {runLoadCheck}=await launcherModule();
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=nestedDocumentFixture(),firstReady=deferred(),reading=deferred(),headers=deferred();
+  f.ports.timeoutMs=10000;
+  let waits=0;
+  f.page.waitForFunction=async()=>{if(++waits===1)firstReady.resolve(undefined);};
+  const pending=runLoadCheck(recoveryPresentationEnv,f.ports);
+  await firstReady.promise;
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  t.mock.timers.tick(4999);
+  const route=f.blockedRoute({allHeaders:async()=>{reading.resolve(undefined);await headers.promise;return {};}});
+  const routing=f.route()(route);
+  await reading.promise;
+  t.mock.timers.tick(1);
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  const closedWhileReadingHeaders=f.calls.includes('context.close');
+  headers.resolve(undefined);
+  await routing;
+  assert.deepEqual(await pending,{...nestedReport('READY','BLOCKED'),profile:'RECOVERY_PRESENTATION'});
+  assert.equal(closedWhileReadingHeaders,false);
+  assert.deepEqual(f.abortCodes,[['blockedbyclient']]);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+});
+
+test('recovery presentation cannot extend the original deadline',async t=>{
+  const {runLoadCheck}=await launcherModule();
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=nestedDocumentFixture(),firstReady=deferred();
+  f.ports.timeoutMs=40;
+  let contextClosedAt:number|undefined;
+  f.context.close=async()=>{contextClosedAt=Date.now();};
+  f.page.waitForFunction=async()=>{firstReady.resolve(undefined);};
+  const pending=runLoadCheck(recoveryPresentationEnv,f.ports);
+  await firstReady.promise;
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  t.mock.timers.tick(39);
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(contextClosedAt,undefined);
+  t.mock.timers.tick(1);
+  assert.deepEqual(await pending,{...nestedReport('TIMEOUT','NOT_OBSERVED'),profile:'RECOVERY_PRESENTATION'});
+  assert.equal(contextClosedAt,1040);
+});
+
+test('recovery presentation times out with pending candidate headers and cannot block after retirement',async t=>{
+  const {runLoadCheck}=await launcherModule();
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=nestedDocumentFixture(),firstReady=deferred(),reading=deferred(),headers=deferred();
+  f.ports.timeoutMs=6000;
+  f.page.waitForFunction=async()=>{firstReady.resolve(undefined);};
+  const pending=runLoadCheck(recoveryPresentationEnv,f.ports);
+  await firstReady.promise;
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  const route=f.blockedRoute({allHeaders:async()=>{reading.resolve(undefined);await headers.promise;return {};}});
+  const routing=f.route()(route);
+  await reading.promise;
+  t.mock.timers.tick(5000);
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.ok(!f.calls.includes('context.close'));
+  t.mock.timers.tick(1000);
+  assert.deepEqual(await pending,{...nestedReport('TIMEOUT','NOT_OBSERVED'),profile:'RECOVERY_PRESENTATION'});
+  headers.resolve(undefined);
+  await routing;
+  assert.deepEqual(f.abortCodes,[[undefined]]);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+});
+
+test('recovery presentation is explicit and requires the existing exact-origin block opt-in',async()=>{
+  const {runLoadCheck}=await launcherModule();
+  for(const rejected of [{...env,[recoveryPresentationFlag]:'true'},{...nestedEnv,[recoveryPresentationFlag]:'1'}]){
+    const f=nestedDocumentFixture();
+    assert.deepEqual(await runLoadCheck(rejected,f.ports),report('REFUSED'));
+    assert.deepEqual(f.calls,[]);
+  }
+});
+
+test('recovery presentation retains a financial API refusal after first READY',async t=>{
+  const {runLoadCheck}=await launcherModule();
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=nestedDocumentFixture(),firstReady=deferred();
+  f.ports.timeoutMs=10000;
+  f.page.waitForFunction=async()=>{firstReady.resolve(undefined);};
+  const pending=runLoadCheck(recoveryPresentationEnv,f.ports);
+  await firstReady.promise;
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  await f.route()(f.blockedRoute({url:()=> 'https://api.stripe.com/v1/payment_intents',method:()=> 'POST',isNavigationRequest:()=>false}));
+  assert.deepEqual(await pending,{...nestedReport('API_PATH','NOT_OBSERVED'),profile:'RECOVERY_PRESENTATION'});
+  assert.deepEqual(f.abortCodes,[[undefined]]);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+});
+
+test('nested document probe formatter omits unrecognized or throwing metadata',async()=>{
+  const {formatLoadCheckResult}=await launcherModule();
+  const expected={line:'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE',exitCode:0};
+  const unknown={...report('READY'),nestedDocument:'private-sentinel https://nested-probe.invalid/'};
+  const throwing={...report('READY'),get nestedDocument(){throw Error('private-sentinel');}};
+  assert.deepEqual(formatLoadCheckResult(unknown),expected);
+  assert.deepEqual(formatLoadCheckResult(throwing),expected);
+});
+
+test('nested document probe remains off by default even with a matcher supplied',async()=>{
+  const {runLoadCheck,formatLoadCheckResult}=await launcherModule();const f=nestedDocumentFixture();let matcherReads=0;
+  Object.defineProperty(f.ports,'matchesNestedDocumentOrigin',{get(){matcherReads++;return ()=>true;}});
+  f.onFirstReadyWait(async()=>{await f.route()(f.blockedRoute());});
+  const result=await runLoadCheck(env,f.ports);
+  assert.deepEqual(result,{...report('ORIGIN'),originReason:'HOST_NOT_ALLOWED',originHostGroup:'OTHER'});
+  assert.equal(matcherReads,0);
+  assert.doesNotMatch(formatLoadCheckResult(result).line,/nested_document/);
+  assert.equal(f.abortCodes[0]?.length,1);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+});
+
+test('nested document probe refuses malformed opt-in and missing matcher before acquisition',async()=>{
+  const {runLoadCheck}=await launcherModule();const ordinary=runnerFixture(),nested=nestedDocumentFixture();
+  for(const value of ['','1','TRUE','true ']){
+    assert.deepEqual(await runLoadCheck({...env,PAYMENT_STRIPE_BROWSER_LOAD_CHECK_BLOCK_NESTED_DOCUMENT:value},nested.ports),report('REFUSED'));
+  }
+  assert.deepEqual(await runLoadCheck(nestedEnv,ordinary.ports),report('REFUSED'));
+  assert.deepEqual(ordinary.calls,[]);
+  assert.deepEqual(nested.calls,[]);
+});
+
+test('nested document probe leaves ineligible requests fatal and never forwards them',async()=>{
+  const {runLoadCheck}=await launcherModule();
+  type Fixture=ReturnType<typeof nestedDocumentFixture>;
+  type Change=Parameters<Fixture['blockedRoute']>[0];
+  const cases:readonly [string,(f:Fixture)=>Change][]=[
+    ['unmatched origin',()=>({url:()=> 'https://other-probe.invalid/private'})],
+    ['top-level navigation',f=>({frame:()=>f.main})],
+    ['direct checkout child',f=>({frame:()=>({...f.target,parentFrame:()=>f.main})})],
+    ['authorization header',()=>({allHeaders:async()=>({Authorization:'fixture'})})],
+    ['cookie header',()=>({allHeaders:async()=>({Cookie:'fixture'})})],
+    ['proxy authorization header',()=>({allHeaders:async()=>({'Proxy-Authorization':'fixture'})})],
+    ['POST',()=>({method:()=> 'POST'})],
+    ['GET with body',()=>({postData:()=> 'fixture'})],
+    ['redirect',()=>({redirectedFrom:()=>({})})],
+    ['credential-bearing URL',()=>({url:()=> 'https://fixture:fixture@nested-probe.invalid/private'})],
+    ['normalized non-ASCII host',()=>({url:()=> 'https://ｎested-probe.invalid/private'})],
+    ['unsupported resource type',()=>({resourceType:()=> 'script'})],
+    ['detached target',f=>{f.target.isDetached=()=>true;return {};}],
+    ['detached ancestor',f=>{f.outer.isDetached=()=>true;return {};}],
+    ['non-Stripe outer ancestor',f=>{f.outer.url=()=> 'https://other-probe.invalid/outer.html';return {};}],
+    ['changed ancestor URL while reading headers',f=>({allHeaders:async()=>{f.outer.url=()=> 'https://js.stripe.com/another.html';return {};}})],
+    ['changed target while reading headers',f=>{
+      let frame=f.target;
+      return {frame:()=>frame,allHeaders:async()=>{frame={...f.target};return {};}};
+    }],
+    ['owned local document was never fulfilled',f=>{f.page.goto=async()=>{};return {};}],
+  ];
+  for(const [label,change] of cases){
+    const f=nestedDocumentFixture(),requestChange=change(f);
+    f.onFirstReadyWait(async()=>{await f.route()(f.blockedRoute(requestChange));});
+    const result=await runLoadCheck(nestedEnv,f.ports);
+    assert.notEqual(result.loadResult,'READY',label);
+    assert.equal(result.nestedDocument,'NOT_OBSERVED',label);
+    assert.equal(f.abortCodes[0]?.length,1,label);
+    assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[],label);
+  }
+});
+
+test('nested document probe makes a second matching request fatal without forwarding',async()=>{
+  const {runLoadCheck}=await launcherModule();const f=nestedDocumentFixture();
+  f.onFirstReadyWait(async()=>{
+    await f.route()(f.blockedRoute());
+    await f.route()(f.blockedRoute());
+  });
+  const result=await runLoadCheck(nestedEnv,f.ports);
+  assert.notEqual(result.loadResult,'READY');
+  assert.equal(result.nestedDocument,'BLOCKED');
+  assert.deepEqual(f.abortCodes.map(codes=>codes.length),[1,1]);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+});
+
+test('nested document probe cannot claim a second matching request while the first abort is pending',async()=>{
+  const {runLoadCheck}=await launcherModule();const f=nestedDocumentFixture(),started=deferred(),release=deferred();
+  const route=f.blockedRoute(),abort=route.abort;
+  route.abort=async(code?:string)=>{await abort(code);started.resolve(undefined);await release.promise;};
+  let routing:Promise<void>|undefined;
+  f.onFirstReadyWait(async()=>{
+    routing=f.route()(route);
+    await started.promise;
+    try {await f.route()(f.blockedRoute());} finally {release.resolve(undefined);}
+  });
+  const result=await runLoadCheck(nestedEnv,f.ports);
+  release.resolve(undefined);
+  await routing;
+  assert.notEqual(result.loadResult,'READY');
+  assert.equal(f.abortCodes[0]?.length,1);
+  assert.equal(f.abortCodes[1]?.length,1);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+});
+
+test('nested document probe awaits the local abort before finalizing readiness',async()=>{
+  const {runLoadCheck}=await launcherModule();const f=nestedDocumentFixture(),started=deferred(),release=deferred();
+  let routing:Promise<void>|undefined,waits=0;
+  const route=f.blockedRoute(),abort=route.abort;
+  route.abort=async(code?:string)=>{await abort(code);started.resolve(undefined);await release.promise;};
+  f.page.waitForFunction=async()=>{
+    waits++;
+    if(waits===1){routing=f.route()(route);await started.promise;}
+  };
+  const pending=runLoadCheck(nestedEnv,f.ports);
+  await Promise.race([started.promise,pending]);
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  const closedBeforeAbort=f.calls.includes('context.close');
+  release.resolve(undefined);
+  const result=await pending;
+  await routing;
+  assert.equal(closedBeforeAbort,false);
+  assert.deepEqual(result,nestedReport('READY','BLOCKED'));
+  assert.deepEqual(f.abortCodes,[['blockedbyclient']]);
+  assert.equal(waits,2,'observe readiness again after the abort settles');
+});
+
+test('nested document probe treats a rejected abort as fatal without retry',async()=>{
+  const {runLoadCheck}=await launcherModule();const f=nestedDocumentFixture(),route=f.blockedRoute({},false),abort=route.abort;
+  route.abort=async(code?:string)=>{await abort(code);throw Error('private abort error');};
+  f.onFirstReadyWait(async()=>{await f.route()(route);});
+  const result=await runLoadCheck(nestedEnv,f.ports);
+  assert.deepEqual(result,nestedReport('ELEMENT','NOT_OBSERVED'));
+  assert.deepEqual(f.abortCodes,[['blockedbyclient']]);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+  assert.doesNotMatch(JSON.stringify(result),/private abort error/);
+});
+
+test('nested document probe waits for the matching failure event after abort settles',async()=>{
+  const {runLoadCheck}=await launcherModule();const f=nestedDocumentFixture();
+  const route=f.blockedRoute({},false),abort=route.abort,aborted=deferred();
+  route.abort=async(code?:string)=>{await abort(code);aborted.resolve(undefined);};
+  f.onFirstReadyWait(async()=>{void f.route()(route);await aborted.promise;});
+  const pending=runLoadCheck(nestedEnv,f.ports);
+  await Promise.race([aborted.promise,pending]);
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  const closedBeforeEvent=f.calls.includes('context.close');
+  route.signalFailure('net::ERR_BLOCKED_BY_CLIENT');
+  assert.deepEqual(await pending,nestedReport('READY','BLOCKED'));
+  assert.equal(closedBeforeEvent,false);
+  assert.deepEqual(f.abortCodes,[['blockedbyclient']]);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+});
+
+for(const evidence of ['no event','a different request','a different failure reason'])test(`nested document probe times out when abort resolves with ${evidence}`,async t=>{
+  const {runLoadCheck}=await launcherModule();
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=nestedDocumentFixture(),aborted=deferred();
+  f.ports.timeoutMs=30;
+  const route=f.blockedRoute({},false),abort=route.abort;
+  route.abort=async(code?:string)=>{
+    await abort(code);
+    if(evidence==='a different request')route.signalFailure('net::ERR_BLOCKED_BY_CLIENT',true);
+    if(evidence==='a different failure reason')route.signalFailure('net::ERR_ABORTED');
+    aborted.resolve(undefined);
+  };
+  let contextClosedAt:number|undefined;
+  f.context.close=async()=>{contextClosedAt=Date.now();};
+  f.onFirstReadyWait(async()=>{void f.route()(route);await aborted.promise;});
+  const pending=runLoadCheck(nestedEnv,f.ports);
+  await aborted.promise;
+  t.mock.timers.tick(29);
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  const closedBeforeDeadline=contextClosedAt!==undefined;
+  t.mock.timers.tick(1);
+  assert.deepEqual(await pending,nestedReport('TIMEOUT','NOT_OBSERVED'));
+  assert.equal(closedBeforeDeadline,false);
+  assert.equal(contextClosedAt,1030);
+  assert.deepEqual(f.abortCodes,[['blockedbyclient']]);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+});
+
+test('nested document probe keeps the original deadline when context close releases a pending abort',async t=>{
+  const {runLoadCheck}=await launcherModule();
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=nestedDocumentFixture(),started=deferred(),closed=deferred();
+  f.ports.timeoutMs=30;
+  const route=f.blockedRoute(),abort=route.abort;
+  route.abort=async(code?:string)=>{await abort(code);started.resolve(undefined);await closed.promise;};
+  let contextClosedAt:number|undefined;
+  f.context.close=async()=>{contextClosedAt=Date.now();closed.resolve(undefined);};
+  f.onFirstReadyWait(async()=>{void f.route()(route);await started.promise;});
+  const pending=runLoadCheck(nestedEnv,f.ports);
+  await started.promise;
+  t.mock.timers.tick(29);
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(contextClosedAt,undefined);
+  t.mock.timers.tick(1);
+  assert.deepEqual(await pending,nestedReport('TIMEOUT','NOT_OBSERVED'));
+  assert.equal(contextClosedAt,1030);
+  assert.deepEqual(f.abortCodes,[['blockedbyclient']]);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+});
+
 test('provider transport never follows redirects and validates before fulfill',async()=>{
   const {runLoadCheck}=await launcherModule();
   for(const location of ['https://api.stripe.com/v1/payment_intents','https://foreign.test/private']){

@@ -161,12 +161,14 @@ class Control {
 }
 type ProviderProbe={target:string;headers?:Record<string,string>;headerFailure?:'getter'|'reject';redirect?:'throw'|'present';navigation?:'main'|'child'|'throw'|'frame';fallbackFailure?:boolean;hold?:boolean;method?:string;phase?:'initial'|'method';
   atMount?:boolean;resource?:string;postData?:string;detachBeforeDispatch?:boolean;frameUrl?:string;parentUrl?:string;parentDetached?:boolean;onHeaders?:()=>void;
+  blockEvent?:'match'|'wrong-request'|'wrong-error'|'none';holdAbort?:boolean;failAbort?:boolean;onBlock?:()=>void;outerUrl?:string;
   child?:'owned'|'nested'|'foreign'|'foreign-parent'|'detached'|'other-page'};
 type StaticFixture={matches:(origin:string)=>boolean;fetch:typeof fetch};
 async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:StaticFixture) {
   let releaseIO!:()=>void,markIO!:()=>void;
   const heldIO=new Promise<void>(resolve=>{releaseIO=resolve;}),ioPending=new Promise<void>(resolve=>{markIO=resolve;});
   let stageHook:((where:string)=>Promise<void>)|undefined;
+  let readyHook:(()=>Promise<void>)|undefined;
   const runAbort=new AbortController(),docEvents=new Map<string,Function>();
   const asynchronousStart=change.startsWith('async_');
   let startTask:Promise<unknown>|undefined,releasePreparation!:()=>void,markPreparationPending!:()=>void,markReadyWaiting!:()=>void;
@@ -204,10 +206,12 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
   const frame = {url:()=>url,page:()=>page,isDetached:()=>false}, callbacks = new Map<string,Function>(),bindings=new Map<string,Function>();
   let routeHandler:Function;
   const staticReplies:{headers:Record<string,string>;body:Buffer}[]=[];
+  const providerAborts:(string|undefined)[]=[];
   async function probeProvider(probe:ProviderProbe) {
     let denied=false;
     const fail=()=>{throw Error('secret_fixture canary');};
-    const parent={url:()=>probe.child==='foreign-parent'?'https://untrusted.test/':probe.parentUrl??'https://inner.js.stripe.com/',isDetached:()=>probe.parentDetached===true,page:()=>page,parentFrame:()=>frame};
+    const outer={url:()=>probe.outerUrl??'https://js.stripe.com/',page:()=>page,isDetached:()=>false,parentFrame:()=>frame};
+    const parent={url:()=>probe.child==='foreign-parent'?'https://untrusted.test/':probe.parentUrl??'https://inner.js.stripe.com/',isDetached:()=>probe.parentDetached===true,page:()=>page,parentFrame:()=>probe.outerUrl?outer:frame};
     const child={url:()=>probe.child==='foreign'?'https://untrusted.test/':probe.frameUrl??'https://js.stripe.com/element',isDetached:()=>probe.child==='detached',page:()=>probe.child==='other-page'?{}:page,parentFrame:()=>{
       if(probe.detachBeforeDispatch)queueMicrotask(()=>{probe.child='detached';});
       return probe.child==='nested'||probe.child==='foreign-parent'?parent:frame;
@@ -217,8 +221,16 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
       redirectedFrom:()=>{if(probe.redirect==='throw')fail();return probe.redirect==='present'?{}:null;},
       isNavigationRequest:()=>{if(probe.navigation==='throw')fail();return Boolean(probe.navigation);},
       frame:()=>{if(probe.navigation==='frame')fail();return probe.child?child:probe.navigation==='child'?{}:frame;},
-      resourceType:()=>probe.resource??'other',postData:()=>probe.postData??null};
-    await routeHandler({request:()=>req,abort:async()=>{denied=true;},fallback:async()=>{providerFallbacks++;if(probe.fallbackFailure)fail();},fulfill:async(response:any)=>{assert.ok(staticFixture);staticReplies.push(response);}});
+      resourceType:()=>probe.resource??'other',postData:()=>probe.postData??null,
+      failure:()=>({errorText:probe.blockEvent==='wrong-error'?'net::ERR_ABORTED':'net::ERR_BLOCKED_BY_CLIENT'})};
+    await routeHandler({request:()=>req,abort:async(reason?:string)=>{
+      providerAborts.push(reason);
+      if(reason!=='blockedbyclient'){denied=true;return;}
+      probe.onBlock?.();
+      if(probe.blockEvent!=='none')callbacks.get('requestfailed')?.(probe.blockEvent==='wrong-request'?{...req}:req);
+      if(probe.holdAbort){markIO();await heldIO;}
+      if(probe.failAbort){denied=true;fail();}
+    },fallback:async()=>{providerFallbacks++;if(probe.fallbackFailure)fail();},fulfill:async(response:any)=>{assert.ok(staticFixture);staticReplies.push(response);}});
     if(denied)throw Error('denied mock request');
   }
   async function request(target:string,method:string,data?:any) {
@@ -312,6 +324,7 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
         await startTask;
       }
       if(change==='pre_ready'&&arg==='READY')throw Error('secret_fixture canary');
+      if(arg==='READY')await readyHook?.();
       if(arg==='OBSERVE'||arg==='METHOD_CONFIRMED'){
         await stageHook?.('manual');
         const b=ctrl(arg==='OBSERVE'?'pay':'confirm-method');
@@ -346,8 +359,9 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
       await Promise.resolve().then(()=>f(src,...args)).catch(()=>{});
     }
   };
-  return {request,probeProvider,counts,replies,staticReplies,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,ioPending,releaseIO,notifyIO:markIO,providerFallbacks:()=>providerFallbacks,
-    setStageHook:(hook:typeof stageHook)=>{stageHook=hook;},terminal:async(marker:unknown)=>bindings.get('__failedRenewalTerminal')!({page,frame},'STOPPED',marker),closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
+  return {request,probeProvider,counts,replies,staticReplies,providerAborts,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,ioPending,releaseIO,notifyIO:markIO,providerFallbacks:()=>providerFallbacks,
+    setStageHook:(hook:typeof stageHook)=>{stageHook=hook;},setReadyHook:(hook:typeof readyHook)=>{readyHook=hook;},
+    terminal:async(marker:unknown)=>bindings.get('__failedRenewalTerminal')!({page,frame},'STOPPED',marker),closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
     restore:async()=>{try{runAbort.abort();await journey.close(nowLimits());}finally{w.__failedRenewalStop?.();restore();}}};
 }
 
@@ -409,7 +423,7 @@ for(const [name,change] of Object.entries(refusedStaticProbes))test('static gate
 });
 const navigationProbes:readonly [string,Partial<ProviderProbe>,string][]=[
  ['top-level document',{navigation:'main',child:undefined},'MAIN_FRAME'],
- ['new child of a Stripe.js frame',{child:'nested',frameUrl:'about:blank'},'STRIPE_PARENT'],
+ ['wrong resource under a Stripe.js frame',{child:'nested',frameUrl:'about:blank',resource:'image'},'STRIPE_PARENT'],
  ['child of another frame',{child:'foreign-parent'},'OTHER_PARENT'],
  ['unassociated frame',{navigation:'frame'},'FRAME_UNAVAILABLE'],
  ['detached target',{child:'detached'},'FRAME_UNAVAILABLE'],
@@ -427,6 +441,187 @@ for(const [name,change,checkpoint] of navigationProbes)test('static navigation b
    assert.equal(h.runAbort.signal.aborted,true);assert.equal(h.closed(),1);
    assert.equal(fetched,0);assert.equal(h.staticReplies.length,0);assert.equal(h.providerFallbacks(),0);assert.ok(!h.counts.includes('confirm'));
  }finally{await h.restore();}
+});
+const pinnedDocument:ProviderProbe={...staticProbe,target:fixtureStaticOrigin+'/nested?opaque=fixture',navigation:'child',
+ child:'nested',frameUrl:'about:blank',outerUrl:'https://js.stripe.com/',resource:'document',blockEvent:'match'};
+test('confirmed nested pin block lets the original initial form continue without forwarding the document',async()=>{
+ let fetched=0;
+ const h=await fixture('',[pinnedDocument],{matches:fixtureMatchesStatic,fetch:async()=>{fetched++;throw Error('inert');}});
+ try{
+   assert.equal(await h.journey.initial(h.initialPort,nowLimits()),true);
+   assert.deepEqual(h.providerAborts,['blockedbyclient']);
+   assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,0);assert.equal(fetched,0);
+   assert.equal(h.counts.filter(v=>v==='confirm').length,1);
+ }finally{await h.restore();}
+});
+test('a second nested pin document refuses without another eligible block or financial dispatch',async()=>{
+ const h=await fixture('',[pinnedDocument,{...pinnedDocument}],{matches:fixtureMatchesStatic,fetch:inertFetch});
+ try{
+   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>browserDiagnostic(error)==='BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_STRIPE_PARENT');
+   assert.deepEqual(h.providerAborts,['blockedbyclient','failed']);
+   assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,0);assert.ok(!h.counts.includes('confirm'));
+ }finally{await h.restore();}
+});
+test('a concurrent second nested pin document stops the journey while the first block is pending',async()=>{
+ const h=await fixture('',[{...pinnedDocument,holdAbort:true}],{matches:fixtureMatchesStatic,fetch:inertFetch});
+ let observed:ReturnType<typeof providerWorkSettlement>|undefined;
+ try{
+   observed=providerWorkSettlement(h.journey.initial(h.initialPort,nowLimits()));
+   await waitProviderHeader(h.ioPending,observed);
+   await assert.rejects(h.probeProvider(pinnedDocument));
+   h.releaseIO();
+   const outcome=await observed;
+   assert.equal(outcome.kind,'rejected');
+   assert.equal(browserDiagnostic('error' in outcome?outcome.error:undefined),'BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_STRIPE_PARENT');
+   assert.deepEqual(h.providerAborts,['blockedbyclient','failed']);
+   assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,0);assert.ok(!h.counts.includes('confirm'));
+ }finally{h.releaseIO();await observed;await h.restore();}
+});
+for(const stage of ['manual','method'] as const)test('nested pin document remains refused in the '+stage+' stage',async()=>{
+ const h=await fixture('',stage==='method'?[{...pinnedDocument,phase:'method'}]:[],{matches:fixtureMatchesStatic,fetch:inertFetch});
+ try{
+   if(stage==='manual'){
+     h.setStageHook(async name=>{if(name==='manual')await h.probeProvider(pinnedDocument);});
+     await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>browserDiagnostic(error)==='BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_STRIPE_PARENT');
+   }else{
+     assert.equal(await h.journey.initial(h.initialPort,nowLimits()),true);
+     await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>browserDiagnostic(error)==='BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_STRIPE_PARENT');
+   }
+   assert.deepEqual(h.providerAborts,['failed']);
+   assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,0);
+   assert.equal(h.counts.filter(v=>v==='confirm').length,stage==='method'?1:0);
+   assert.ok(!h.counts.includes('permit'));
+ }finally{await h.restore();}
+});
+for(const [name,change] of [
+ ['foreign grandparent',{outerUrl:'https://untrusted.test/'}],
+ ['empty authorization',{headers:{authorization:''}}],
+ ['cookie',{headers:{cookie:'private=1'}}],
+ ['proxy credentials',{headers:{'proxy-authorization':'Basic private'}}],
+] as const)test('nested pin document with '+name+' remains refused',async()=>{
+ const h=await fixture('',[{...pinnedDocument,...change}],{matches:fixtureMatchesStatic,fetch:inertFetch});
+ try{
+   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>browserDiagnostic(error)==='BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_STRIPE_PARENT');
+   assert.deepEqual(h.providerAborts,['failed']);
+   assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,0);assert.ok(!h.counts.includes('confirm'));
+ }finally{await h.restore();}
+});
+test('nested pin abort rejection retains the fixed diagnostic and is never attempted twice',async()=>{
+ const h=await fixture('',[{...pinnedDocument,failAbort:true}],{matches:fixtureMatchesStatic,fetch:inertFetch});
+ try{
+   await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>{
+     assert.equal(browserDiagnostic(error),'BROWSER_PROVIDER_STATIC_NAVIGATION_BLOCK');
+     assert.doesNotMatch(String(error),/canary|opaque|static-provider/);return true;
+   });
+   assert.deepEqual(h.providerAborts,['blockedbyclient']);
+   assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,0);assert.ok(!h.counts.includes('confirm'));
+ }finally{await h.restore();}
+});
+for(const blockEvent of ['wrong-request','wrong-error','none'] as const)test('nested pin block does not resume for '+blockEvent,async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ let markBlock!:()=>void;
+ const blockStarted=new Promise<void>(resolve=>{markBlock=resolve;});
+ const h=await fixture('',[{...pinnedDocument,blockEvent,onBlock:markBlock}],{matches:fixtureMatchesStatic,fetch:inertFetch});
+ const limits={deadline:Date.now()+100};
+ let observed:ReturnType<typeof providerWorkSettlement>|undefined;
+ try{
+   observed=providerWorkSettlement(h.journey.initial(h.initialPort,limits));
+   await waitProviderHeader(blockStarted,observed);
+   await new Promise<void>(resolve=>setImmediate(resolve));
+   t.mock.timers.tick(99);
+   await new Promise<void>(resolve=>setImmediate(resolve));
+   assert.equal(h.runAbort.signal.aborted,false);assert.ok(!h.counts.includes('confirm'));
+   t.mock.timers.tick(1);
+   const outcome=await observed;
+   assert.equal(outcome.kind,'rejected');
+   assert.equal(browserDiagnostic('error' in outcome?outcome.error:undefined),'BROWSER_PROVIDER_STATIC_NAVIGATION_BLOCK');
+   assert.deepEqual(h.providerAborts,['blockedbyclient']);
+   assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,0);assert.ok(!h.counts.includes('confirm'));
+ }finally{h.runAbort.abort();await observed;await h.restore();}
+});
+for(const held of ['headers','abort'] as const)test('initial READY cannot overtake nested pin '+held+' proof',async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const h=await fixture('',[],{matches:fixtureMatchesStatic,fetch:inertFetch});
+ let routing:Promise<void>|undefined;
+ let inspectedCard=0,manualWait=0;
+ h.setReadyHook(async()=>{
+   routing=h.probeProvider({...pinnedDocument,hold:held==='headers',holdAbort:held==='abort'});
+   void routing.catch(()=>{});
+   await h.ioPending;
+ });
+ h.setStageHook(async name=>{
+   if(name==='card')inspectedCard++;
+   if(name==='manual')manualWait++;
+ });
+ try{
+   const initial=h.journey.initial(h.initialPort,nowLimits());
+   const settled=providerWorkSettlement(initial);
+   await waitProviderHeader(h.ioPending,settled);
+   await new Promise<void>(resolve=>setImmediate(resolve));
+   t.mock.timers.tick(15001);
+   await new Promise<void>(resolve=>setImmediate(resolve));
+   const beforeRelease=[inspectedCard,manualWait];
+   const closedBeforeRelease=h.closed();
+   h.releaseIO();
+   await routing;
+   assert.equal(await initial,true);
+   assert.deepEqual(beforeRelease,[0,0]);
+   assert.equal(closedBeforeRelease,0);
+   assert.deepEqual([inspectedCard,manualWait],[1,1]);
+   assert.deepEqual(h.providerAborts,['blockedbyclient']);
+   assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,0);
+ }finally{h.releaseIO();await routing?.catch(()=>{});await h.restore();}
+});
+for(const [shape,change,checkpoint] of [
+ ['wrong method',{method:'POST'},'BROWSER_PROVIDER_STATIC_REQUEST_METHOD'],
+ ['foreign page',{child:'other-page'},'BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_FRAME_UNAVAILABLE'],
+] as const)test('initial READY waits for an in-flight pinned navigation with '+shape,async()=>{
+ const h=await fixture('',[],{matches:fixtureMatchesStatic,fetch:inertFetch});
+ let routing:Promise<void>|undefined,confirmedBeforeHeaders=false;
+ h.setReadyHook(async()=>{
+   routing=h.probeProvider({...pinnedDocument,...change,hold:true});
+   void routing.catch(()=>{});
+   await h.ioPending;
+ });
+ const pending=providerWorkSettlement(h.journey.initial(h.initialPort,nowLimits()));
+ try{
+   await waitProviderHeader(h.ioPending,pending);
+   await new Promise<void>(resolve=>setImmediate(resolve));
+   confirmedBeforeHeaders=h.counts.includes('confirm');
+   h.releaseIO();
+   await assert.rejects(routing!);
+   const result=await pending;
+   assert.equal(confirmedBeforeHeaders,false);
+   assert.equal(result.kind,'rejected');
+   assert.equal(browserDiagnostic('error' in result?result.error:undefined),checkpoint);
+   assert.deepEqual(h.providerAborts,['failed']);
+   assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,0);assert.ok(!h.counts.includes('confirm'));
+ }finally{h.releaseIO();await routing?.catch(()=>{});await h.restore();}
+});
+test('initial Pay stays disabled for a pinned document intercepted during card entry',async()=>{
+ const h=await fixture('',[],{matches:fixtureMatchesStatic,fetch:inertFetch});
+ let routing:Promise<void>|undefined,awaitingManualPay=false;
+ h.setStageHook(async name=>{
+   if(name==='card'){
+     routing=h.probeProvider({...pinnedDocument,hold:true});
+     void routing.catch(()=>{});
+     await h.ioPending;
+   }
+   if(name==='manual')awaitingManualPay=true;
+ });
+ const initial=h.journey.initial(h.initialPort,nowLimits());
+ try{
+   await waitProviderHeader(h.ioPending,providerWorkSettlement(initial));
+   await new Promise<void>(resolve=>setImmediate(resolve));
+   assert.equal(awaitingManualPay,false);
+   assert.ok(!h.counts.includes('confirm'));
+   h.releaseIO();
+   await routing;
+   assert.equal(await initial,true);
+   assert.equal(awaitingManualPay,true);
+   assert.deepEqual(h.providerAborts,['blockedbyclient']);
+   assert.equal(h.providerFallbacks(),0);assert.equal(h.staticReplies.length,0);
+ }finally{h.releaseIO();await routing?.catch(()=>{});await h.restore();}
 });
 test('static navigation reports its target at interception before headers can change ancestry',async()=>{
  const probe:ProviderProbe={...staticProbe,navigation:'child',resource:'document',child:'nested',onHeaders:()=>{probe.child='foreign-parent';}};

@@ -1,9 +1,9 @@
 # Stripe browser load check
 
 This separate, one-shot probe initializes the existing SDK Stripe loader and a
-deferred Payment Element before a PaymentIntent or SetupIntent exists. It uses
-only `mode: 'payment'`, amount `2000`, currency `eur`, and card payment methods.
-In the dedicated probe bundle, the page calls the installed pure loader's
+deferred Payment Element without creating a PaymentIntent or SetupIntent.
+The ordinary profile uses `mode: 'payment'`, amount `2000`, currency `eur` and
+card payment methods. In this profile, the page calls the installed pure loader's
 `setLoadParameters({advancedFraudSignals: false})` before its first load.
 This requests Stripe.js with optional advanced fraud signals disabled in this
 fresh, card-free document. The payment and recovery pages use the SDK defaults.
@@ -50,9 +50,9 @@ node examples/demo-site/scripts/stripe-browser-load-check.mjs
 
 Use the repository's supported Node version (native TypeScript source import is
 required), existing dependencies and already installed Google Chrome. The probe
-does not install anything. No account tools, old operations, key files, `.env`
-files, secret keys, live keys, client secrets or historical artifacts supply
-authority. Imports acquire no browser or build. Missing/invalid opt-in, a live or
+does not install anything. Ordinary mode reads no key files. No account tools,
+old operations, `.env` files, secret keys, live keys, client secrets or historical
+artifacts supply authority. Imports acquire no browser or build. Missing/invalid opt-in, a live or
 secret key, and debug/capture environment flags refuse before acquisition. The
 Chrome child receives a small OS environment allowlist, excluding provider keys.
 
@@ -97,9 +97,10 @@ load observation; a hung acquisition or cleanup API can delay the result
 indefinitely. This is not a hard process termination guarantee.
 
 The page shows fixed `IDLE`, `LOADING`, `READY` or terminal error status. It
-destroys the Element on readiness, loaderror, deadline, stop or page loss; the
-launcher then closes its context/browser and removes only its own temporary
-directory. The immutable result contains `loadResult` and a deduplicated
+destroys the Element on loaderror, deadline, stop or page loss. The ordinary
+profile also destroys it immediately on readiness. The launcher closes its
+context/browser and removes only its own temporary directory. The immutable
+result contains `loadResult` and a deduplicated
 `cleanupErrors` array in fixed component order. Stdout contains one safe line,
 for example:
 
@@ -164,6 +165,94 @@ launcher is outside CI and default Playwright discovery.
 Deferred readiness covers initialization of the Element under this egress gate.
 Payment, setup, renewal and recovery have separate acceptance checks. Allowed
 provider requests can include telemetry.
+
+## Nested document observation
+
+On a separately authorized native run, add
+`PAYMENT_STRIPE_BROWSER_LOAD_CHECK_BLOCK_NESTED_DOCUMENT=true` to the command
+above. Only this mode reads the existing local origin policy key used to
+authenticate the reviewed origin. The key is independent of any Stripe
+credentials or previous run artifacts. The probe still uses the deferred
+Element and the same Stripe.js load parameters.
+
+The new mode aborts one matching document GET locally and continues observing
+the Element within the original deadline. The request must have an empty body,
+no credentials and no redirect. The destination must be attached below at
+least one Stripe.js frame, with all non-main ancestors on the same checkout
+page hosting Stripe.js documents. Frame identity and ancestor URLs are checked
+before and after reading headers. An unmatched or repeated refusal still
+ends the load. There is no network request, substitute response or retry for
+the matching document.
+
+The report appends `nested_document=BLOCKED` once Chrome reports the expected
+local block for the same intercepted request, or `nested_document=NOT_OBSERVED`
+otherwise. Returning from the abort call alone cannot confirm the block. If
+the probe attempts a block and receives no matching event, it cannot report
+readiness and uses the remaining original deadline. With `load=READY` and
+`nested_document=BLOCKED`, readiness was observed with that document blocked
+in this deferred configuration. With `nested_document=NOT_OBSERVED`, the load
+result supplies no evidence about the document. This includes a run that
+never encountered the request or could not authenticate its origin using the
+local policy. Exit status still describes the load and cleanup. The probe
+records no frame URL, requested URL, header or body. Readiness with a client
+secret requires separate evidence from the
+[recovery workflow](billing-failed-renewal-recovery.md#confirming-a-local-document-block).
+
+### Recovery presentation
+
+One ordinary-profile Chrome check with document blocking enabled reported
+`load=READY cleanup=OK nested_document=NOT_OBSERVED`. Once the launcher
+classified an eligible request, it would have waited for the local block
+event or timed out. The ordinary probe disabled advanced fraud signals,
+used deferred payment mode and destroyed its Element at the first `ready`.
+The subscription payment driver uses Stripe.js defaults, a client secret, an
+English locale, and disables Link as well as Apple Pay and Google Pay. It keeps
+the form mounted. The evidence cannot tell which difference affected emission
+or whether the request arrived too late to classify before the probe retired.
+The historical payment checkpoint records the target's immediate Stripe.js
+parent only. The card-free check requires stable ownership of the whole frame
+chain and continues to require that proof.
+
+For a separately authorized one-shot Chrome check, use both opt-ins:
+
+```sh
+PAYMENT_STRIPE_BROWSER_LOAD_CHECK=true \
+PAYMENT_STRIPE_BROWSER_LOAD_CHECK_BLOCK_NESTED_DOCUMENT=true \
+PAYMENT_STRIPE_BROWSER_LOAD_CHECK_RECOVERY_PRESENTATION=true \
+PAYMENT_STRIPE_BROWSER_LOAD_CHECK_PUBLISHABLE_KEY=pk_test_REPLACE_WITH_EXPLICIT_PUBLIC_TEST_KEY \
+node examples/demo-site/scripts/stripe-browser-load-check.mjs
+```
+
+This profile restores Stripe.js default load parameters and uses deferred
+subscription mode with the same €20 amount, card-only configuration, English
+locale and wallet settings. It keeps the Element inert after `ready` and waits
+up to five seconds for a matching nested request, within the original deadline.
+An in-flight header read for a candidate can finish within that same original
+deadline.
+If a matching request is intercepted, the launcher waits for confirmation of
+the same local block and checks readiness again. All other refusals still end
+the load, including any telemetry a default loader requests outside the
+allowlist. The form still receives no client secret and provides no usable card
+input, Pay control or confirmation method. The only Stripe API path admitted is
+`/v1/elements/sessions`. There is no backend or CLI action.
+
+The report adds `profile=RECOVERY_PRESENTATION`. Exit zero requires `READY`,
+`BLOCKED` and successful cleanup. `READY / NOT_OBSERVED` still describes a
+successful form load, but exits one because it did not reproduce the request.
+The offline test injects a delayed synthetic navigation and verifies its
+blocking without network transport.
+
+One ordinary Chrome launch with the recovery presentation on the working tree
+exited zero with this result:
+
+```text
+STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE nested_document=BLOCKED profile=RECOVERY_PRESENTATION
+```
+
+Chrome confirmed the local block for the intercepted request, and the deferred
+subscription Element reached readiness with that document blocked. The check
+used no card input, Pay, client secret or payment. Readiness with a client
+secret and acceptance of the paid recovery workflow remain unverified.
 
 ## Optional private refusal witness
 

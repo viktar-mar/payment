@@ -1,5 +1,5 @@
 import {fileURLToPath,pathToFileURL} from 'node:url';
-import {providerNetworkOrigin} from '../tests/support/stripe-provider-origin.ts';
+import {providerNetworkOrigin,providerOrigin} from '../tests/support/stripe-provider-origin.ts';
 
 const localOrigin='http://127.0.0.1:4173';
 const documentPath='/stripe-browser-load-check.html';
@@ -9,6 +9,11 @@ const originReasons=new Set(['URL_INVALID','NON_HTTPS_SCHEME','NON_DEFAULT_PORT'
 const safeOriginReason=value=>originReasons.has(value)?value:'UNKNOWN';
 const originHostGroups=new Set(['STRIPE_COM','STRIPE_NETWORK','OTHER']);
 const safeOriginHostGroup=value=>originHostGroups.has(value)?value:'UNKNOWN';
+const nestedDocumentFlag='PAYMENT_STRIPE_BROWSER_LOAD_CHECK_BLOCK_NESTED_DOCUMENT';
+const nestedDocumentResults=new Set(['BLOCKED','NOT_OBSERVED']);
+const recoveryPresentationFlag='PAYMENT_STRIPE_BROWSER_LOAD_CHECK_RECOVERY_PRESENTATION';
+const recoveryPresentationProfile='RECOVERY_PRESENTATION';
+const postReadyObservationMs=5000;
 const refusedHostGroup=url=>{
   try{
     const host=url.hostname;
@@ -31,7 +36,12 @@ const refusedNetworkOrigin=value=>{
     return url.origin;
   }catch{return undefined;}
 };
-const snapshot=(loadResult,cleanupErrors,originReason,originHostGroup)=>Object.freeze({loadResult,cleanupErrors:Object.freeze([...cleanupErrors]),...(loadResult==='ORIGIN'?{originReason:safeOriginReason(originReason),...(originReason==='HOST_NOT_ALLOWED'?{originHostGroup:safeOriginHostGroup(originHostGroup)}:{})}:{})});
+const snapshot=(loadResult,cleanupErrors,originReason,originHostGroup,nestedDocument,recoveryPresentation)=>Object.freeze({
+  loadResult,cleanupErrors:Object.freeze([...cleanupErrors]),
+  ...(loadResult==='ORIGIN'?{originReason:safeOriginReason(originReason),...(originReason==='HOST_NOT_ALLOWED'?{originHostGroup:safeOriginHostGroup(originHostGroup)}:{})}:{}),
+  ...(nestedDocumentResults.has(nestedDocument)?{nestedDocument}:{}),
+  ...(recoveryPresentation?{profile:recoveryPresentationProfile}:{}),
+});
 export function formatLoadCheckResult(report){
   try{
     const candidateLoad=report?.loadResult;
@@ -54,13 +64,22 @@ export function formatLoadCheckResult(report){
         originSuffix+=` host_group=${group}`;
       }
     }
-    return {line:`STRIPE_BROWSER_LOAD_CHECK load=${loadResult} cleanup=${components.length?'FAILED':'OK'} components=${components.join(',')||'NONE'}${originSuffix}`,exitCode:loadResult==='READY'&&!components.length?0:1};
+    let nestedDocument,recoveryPresentation=false;
+    try{const result=report?.nestedDocument;if(nestedDocumentResults.has(result))nestedDocument=result;}catch{}
+    try{recoveryPresentation=report?.profile===recoveryPresentationProfile;}catch{}
+    const nestedSuffix=nestedDocument?` nested_document=${nestedDocument}`:'';
+    const profileSuffix=recoveryPresentation?` profile=${recoveryPresentationProfile}`:'';
+    const success=loadResult==='READY'&&!components.length&&(!recoveryPresentation||nestedDocument==='BLOCKED');
+    return {line:`STRIPE_BROWSER_LOAD_CHECK load=${loadResult} cleanup=${components.length?'FAILED':'OK'} components=${components.join(',')||'NONE'}${originSuffix}${nestedSuffix}${profileSuffix}`,exitCode:success?0:1};
   }catch{
     return {line:'STRIPE_BROWSER_LOAD_CHECK load=UNKNOWN cleanup=FAILED components=UNKNOWN',exitCode:1};
   }
 }
 export function admitEnvironment(env){
   if(env.PAYMENT_STRIPE_BROWSER_LOAD_CHECK!=='true'||typeof env.PAYMENT_STRIPE_BROWSER_LOAD_CHECK_PUBLISHABLE_KEY!=='string'||!/^pk_test_[A-Za-z0-9]+$/.test(env.PAYMENT_STRIPE_BROWSER_LOAD_CHECK_PUBLISHABLE_KEY))throw Error('REFUSED');
+  if(env[nestedDocumentFlag]!==undefined && !['true','false'].includes(env[nestedDocumentFlag]))throw Error('REFUSED');
+  if(env[recoveryPresentationFlag]!==undefined && !['true','false'].includes(env[recoveryPresentationFlag]))throw Error('REFUSED');
+  if(env[recoveryPresentationFlag]==='true'&&env[nestedDocumentFlag]!=='true')throw Error('REFUSED');
   for(const name of Object.keys(env))if((/^(?:DEBUG|PWDEBUG|NODE_DEBUG|NODE_DEBUG_NATIVE|NODE_OPTIONS|VITE_INSPECT|PLAYWRIGHT_.*|PW_.*)$/.test(name)||/^(?:(?:BROWSER|RECORD|ENABLE)_)?(?:TRACE|SCREENSHOT|HAR|VIDEO|CAPTURE|DEBUG)(?:_(?:PATH|DIR|FILE|ENABLED))?$/i.test(name))&&env[name])throw Error('REFUSED');
   return env.PAYMENT_STRIPE_BROWSER_LOAD_CHECK_PUBLISHABLE_KEY;
 }
@@ -95,9 +114,46 @@ export function classifyRequest(request,assets,firstDocument){
   return new URL(request.url).origin===localOrigin?'LOCAL':'PROVIDER';
 }
 
+function stripeParents(target,page){
+  try{
+    const main=page.mainFrame();
+    if(target===main||target.page()!==page||target.isDetached()||main.page()!==page||main.isDetached()||main.url()!==localOrigin+documentPath)return;
+    const parents=[];
+    const visited=new Set([target]);
+    for(let frame=target.parentFrame();frame!==main;frame=frame.parentFrame()){
+      if(!frame||visited.has(frame)||frame.page()!==page||frame.isDetached())return;
+      const href=frame.url();
+      const url=new URL(href);
+      if(!providerOrigin(url)||(url.hostname!=='js.stripe.com'&&!url.hostname.endsWith('.js.stripe.com')))return;
+      visited.add(frame);
+      parents.push({frame,href});
+    }
+    if(parents.length)return {main,parents};
+  }catch{}
+}
+
+function sameStripeParents(before,after){
+  return after&&before.main===after.main&&before.parents.length===after.parents.length&&
+    before.parents.every(({frame,href},index)=>frame===after.parents[index].frame&&href===after.parents[index].href);
+}
+
+function matchesPinnedNestedOrigin(url,match){
+  if(!/^https:\/\/[A-Za-z0-9.-]+(?::443)?(?:[/?#]|$)/i.test(url))return false;
+  let origin;try{origin=new URL(url).origin;}catch{return false;}
+  return match(origin)===true;
+}
+
 /** All acquisitions are injected; importing this module is inert. */
 export async function runLoadCheck(env,ports){
   let key;try{key=admitEnvironment(env);}catch{return snapshot('REFUSED',[]);}
+  const observeNested=env[nestedDocumentFlag]==='true';
+  const matchesNestedDocumentOrigin=observeNested?ports.matchesNestedDocumentOrigin:undefined;
+  if(observeNested&&typeof matchesNestedDocumentOrigin!=='function')return snapshot('REFUSED',[]);
+  const recoveryPresentation=env[recoveryPresentationFlag]==='true';
+  let nestedDocument=observeNested?'NOT_OBSERVED':undefined;
+  let nestedRequest,observeBrowserBlock,nestedObservation,signalNestedRequest;
+  const nestedStarted=recoveryPresentation?new Promise(resolve=>{signalNestedRequest=resolve;}):undefined;
+  const pendingNestedHeaders=new Set();
   const timeoutMs=ports.timeoutMs??60000;
   const expires=Date.now()+timeoutMs;
   let loadResult,originReason,originHostGroup,signalFailure,build,browser,context,page,firstDocument=true,pageCount=0,finishing=false;
@@ -148,15 +204,52 @@ export async function runLoadCheck(env,ports){
     checkpoint='CONTEXT';
     await acquire(()=>browser.newContext({serviceWorkers:'block',acceptDownloads:false}),value=>{context=value;},value=>value.close(),'LATE_CONTEXT_CLOSE');
     await context.route('**/*',async route=>{
+      let finishNestedHeaders;
       try{
         const request=route.request();
         const frame=request.frame();
         if(!page||!frame||frame.page()!==page){fail('NAVIGATION');await route.abort();return;}
-        const view={url:request.url(),method:request.method(),headers:await request.allHeaders(),navigation:request.isNavigationRequest(),mainFrame:frame===page.mainFrame(),redirected:!!request.redirectedFrom()};
+        const parents=observeNested&&!nestedRequest&&!firstDocument&&request.isNavigationRequest()?stripeParents(frame,page):undefined;
+        const url=request.url(),method=request.method();
+        const pinnedBeforeHeaders=recoveryPresentation&&parents&&method==='GET'&&
+          matchesPinnedNestedOrigin(url,matchesNestedDocumentOrigin);
+        if(pinnedBeforeHeaders){
+          let settle;
+          const classification=new Promise(resolve=>{settle=resolve;});
+          pendingNestedHeaders.add(classification);
+          finishNestedHeaders=()=>{pendingNestedHeaders.delete(classification);settle();};
+        }
+        const view={url,method,headers:await request.allHeaders(),navigation:request.isNavigationRequest(),mainFrame:frame===page.mainFrame(),redirected:!!request.redirectedFrom()};
         // Header acquisition may outlive timeout or successful retirement.
         if(finishing||loadResult||Date.now()>=expires){if(!finishing)fail('TIMEOUT');await route.abort();return;}
         let originCause,hostGroup;
         const reason=loadResult??refusalReason(view,build.assets,firstDocument,(value,group)=>{originCause=value;hostGroup=group;});
+        if(reason==='ORIGIN'&&originCause==='HOST_NOT_ALLOWED'&&parents&&!nestedRequest&&view.navigation&&
+          view.method==='GET'&&request.resourceType()==='document'&&request.postData()===null&&
+          !Object.keys(view.headers).some(name=>name.toLowerCase()==='cookie')&&
+          request.frame()===frame&&sameStripeParents(parents,stripeParents(frame,page))&&
+          (recoveryPresentation?pinnedBeforeHeaders:matchesPinnedNestedOrigin(view.url,matchesNestedDocumentOrigin))){
+          // Suppress one fatal refusal in this load-only probe. Never transmit the request.
+          nestedRequest=request;
+          const browserBlock=new Promise(resolve=>{observeBrowserBlock=resolve;});
+          const abortRequest=(async()=>{
+            try{await route.abort('blockedbyclient');}
+            catch{fail('ELEMENT');}
+          })();
+          // Chromium can return from abort() without confirming it applied the block.
+          nestedObservation=Promise.race([
+            Promise.all([abortRequest,browserBlock]).then(()=>{
+              if(!loadResult&&!finishing&&Date.now()<expires)nestedDocument='BLOCKED';
+            }),
+            failed,
+          ]);
+          signalNestedRequest?.();
+          finishNestedHeaders?.();
+          finishNestedHeaders=undefined;
+          transports.add(abortRequest);
+          try{await abortRequest;}finally{transports.delete(abortRequest);}
+          return;
+        }
         if(reason){
           const won=fail(reason,originCause,hostGroup);
           if(won&&reason==='ORIGIN'&&originCause==='HOST_NOT_ALLOWED'&&hostGroup==='STRIPE_NETWORK'){
@@ -180,6 +273,7 @@ export async function runLoadCheck(env,ports){
           try{await transport;}finally{transports.delete(transport);}
         }
       }catch{fail('ELEMENT');try{await route.abort();}catch{}}
+      finally{finishNestedHeaders?.();}
     });
     await context.routeWebSocket('**/*',socket=>{fail('WEBSOCKET');socket.close();});
     context.on('page',extra=>{pageCount++;if(pageCount>1){fail('POPUP');retireExtra(extra,'close','EXTRA_PAGE_CLOSE');}});
@@ -190,15 +284,47 @@ export async function runLoadCheck(env,ports){
     page.on('pageerror',()=>fail('ELEMENT'));
     page.on('crash',()=>fail('PAGE'));
     page.on('close',()=>fail('PAGE'));
+    if(observeNested)page.on('requestfailed',request=>{
+      if(request!==nestedRequest||loadResult||finishing||Date.now()>=expires)return;
+      try{if(request.failure()?.errorText==='net::ERR_BLOCKED_BY_CLIENT')observeBrowserBlock?.();}catch{}
+    });
     await Promise.race([(async()=>{
       await page.goto(localOrigin+documentPath,{waitUntil:'load',timeout:remaining()});
       if(loadResult)return;
-      await page.evaluate(key=>window.configureStripeBrowserLoadCheck(key),key);
+      if(recoveryPresentation){
+        await page.evaluate(({key,profile})=>window.configureStripeBrowserLoadCheck(key,profile),{key,profile:'recovery-presentation'});
+      }else{
+        await page.evaluate(key=>window.configureStripeBrowserLoadCheck(key),key);
+      }
       if(loadResult)return;
       checkpoint='ELEMENT';
-      await page.waitForFunction(()=>{const state=document.getElementById('status')?.textContent;if(state==='READY')return true;if(state&&state!=='IDLE'&&state!=='LOADING')throw Error('ELEMENT');return false;},{},{timeout:remaining()});
+      const waitForReady=()=>page.waitForFunction(()=>{const state=document.getElementById('status')?.textContent;if(state==='READY')return true;if(state&&state!=='IDLE'&&state!=='LOADING')throw Error('ELEMENT');return false;},{},{timeout:remaining()});
+      const blockedBeforeWait=nestedDocument==='BLOCKED';
+      await waitForReady();
+      const observeAfterReady=recoveryPresentation&&!nestedObservation&&!loadResult&&Date.now()<expires;
+      if(observeAfterReady){
+        let observationTimer;
+        try{
+          await Promise.race([nestedStarted,failed,new Promise(resolve=>{
+            observationTimer=setTimeout(resolve,Math.min(postReadyObservationMs,remaining()));
+          })]);
+        }finally{clearTimeout(observationTimer);}
+      }
+      if(observeAfterReady&&!nestedObservation&&!loadResult&&Date.now()<expires)await waitForReady();
+      // A matching navigation may have entered the route before readiness
+      // was rechecked while its headers were still pending.
+      if(!nestedObservation&&!loadResult&&pendingNestedHeaders.size){
+        await Promise.race([Promise.all([...pendingNestedHeaders]),failed]);
+      }
+      if(nestedObservation&&!blockedBeforeWait){
+        await nestedObservation;
+        if(!loadResult&&nestedDocument==='BLOCKED'&&Date.now()<expires)await waitForReady();
+      }
       // Readiness is a terminal observation, before any final disposal starts.
-      if(!loadResult&&!finishing)loadResult='READY';
+      if(!loadResult&&!finishing){
+        if(observeNested&&Date.now()>=expires)fail('TIMEOUT');
+        else loadResult='READY';
+      }
     })(),failed]);
   }catch{fail(checkpoint);}
   finally{
@@ -227,7 +353,7 @@ export async function runLoadCheck(env,ports){
     }
     while(pendingCleanup.size)await Promise.allSettled([...pendingCleanup]);
   }
-  return snapshot(loadResult,cleanupCodes.filter(code=>cleanupErrors.has(code)),originReason,originHostGroup);
+  return snapshot(loadResult,cleanupCodes.filter(code=>cleanupErrors.has(code)),originReason,originHostGroup,nestedDocument,recoveryPresentation);
 }
 
 // Explicitly minimize the spawned browser environment; no account/provider keys.
@@ -267,6 +393,10 @@ export async function runNativeLoadCheck(env,observer){
     admitEnvironment(env);
     if(observer!==undefined&&typeof observer!=='function')return snapshot('REFUSED',[]);
     const ports=await realPorts(env);
+    if(env[nestedDocumentFlag]==='true'){
+      const {loadFailedRenewalStaticOriginMatcher}=await import('../tests/support/stripe-billing-failed-renewal-static-origin-pin.ts');
+      ports.matchesNestedDocumentOrigin=loadFailedRenewalStaticOriginMatcher();
+    }
     if(observer!==undefined)ports.onRefusedNetworkOrigin=observer;
     return await runLoadCheck(env,ports);
   }catch{return snapshot('REFUSED',[]);}

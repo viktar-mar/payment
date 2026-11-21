@@ -11,6 +11,7 @@ import {enterPrivateText} from './private-entry.ts';
 import {providerOrigin,providerNetworkOrigin} from './stripe-provider-origin.ts';
 
 const pagePath = '/billing-failed-renewal.html';
+const navigationBlockCheckpoint='BROWSER_PROVIDER_STATIC_NAVIGATION_BLOCK';
 const failed = () => new Error('failed_renewal_BROWSER');
 function need(ok:unknown):asserts ok {if(!ok)throw failed();}
 const uuid = (v:unknown):v is string => typeof v==='string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(v);
@@ -68,18 +69,31 @@ function staticNavigationTarget(request:Request,page:Page) {
     return isStripeScriptDocument(parent.url())?'STRIPE_PARENT':'OTHER_PARENT';
   }catch{return 'FRAME_UNAVAILABLE';}
 }
-function stripeFrameChain(route:Route,page:Page) {
-  // Snapshot the frame chain for the static subresource ownership check.
+function stripeFrameChain(page:Page,start:()=>Frame|null) {
   try{
     const chain:{frame:Frame;href:string}[]=[],main=page.mainFrame();
-    for(let frame:Frame|null=route.request().frame();frame!==main;frame=frame.parentFrame()){
-      if(!frame || frame.page()!==page || frame.isDetached())return undefined;
+    const visited=new Set<Frame>();
+    for(let frame=start();frame!==main;frame=frame.parentFrame()){
+      if(!frame || visited.has(frame) || frame.page()!==page || frame.isDetached())return undefined;
       const href=frame.url();
       if(!isStripeScriptDocument(href))return undefined;
+      visited.add(frame);
       chain.push({frame,href});
     }
     return chain.length?chain:undefined;
   }catch{return undefined;}
+}
+function stripeNavigationChain(request:Request,page:Page,checkoutUrl:string) {
+  try{
+    const target=request.frame(),main=page.mainFrame();
+    if(target===main || target.page()!==page || target.isDetached() || main.page()!==page || main.isDetached() || main.url()!==checkoutUrl)return;
+    const parents=stripeFrameChain(page,()=>target.parentFrame());
+    if(parents)return {target,main,parents};
+  }catch{}
+}
+function sameStripeFrames(before:NonNullable<ReturnType<typeof stripeFrameChain>>,after:ReturnType<typeof stripeFrameChain>) {
+  return after && after.length===before.length &&
+    after.every(({frame,href},i)=>frame===before[i]!.frame && href===before[i]!.href);
 }
 async function fetchStaticAsset(url:URL,media:string[],origin:string|undefined,signal:AbortSignal) {
   const controller=new AbortController();
@@ -127,6 +141,9 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   let navigation=0,manualArmed=false,expires:ReturnType<typeof setTimeout>|undefined;
   const lifetime=new AbortController(),pending=new Set<Promise<unknown>>();
   const usedKeys=new Set<string>();
+  const pendingInitialNavigations=new Set<Promise<void>>();
+  let navigationBlockUsed=false;
+  let navigationBlock:{request:Request;confirm:()=>void}|undefined;
   let finalDelivery:Promise<void>|undefined;
   let checkpoint='BROWSER_CONTEXT',firstFailure:Error|undefined,preparationActive=false;
   function latch(code:string):Error {
@@ -144,6 +161,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   };
   function stop() {
     state='CLOSED';lifetime.abort();clearTimeout(expires);
+    navigationBlock=undefined;
     readiness=undefined;inFlight=undefined;
     whole?.signal?.removeEventListener('abort',stop);
     token='';code='';challenge='';initial=undefined;initialBridge=undefined;method=undefined;selected=undefined;initialPort=undefined;methodPort=undefined;
@@ -183,11 +201,14 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     readiness=undefined;
     const button=page!.getByRole('button',{name:label,exact:true});
     await at('BROWSER_READY_BUTTON',async()=>need(!(await button.isEnabled())));
+    while(which==='initial'&&pendingInitialNavigations.size)await waitForNavigationClassification();
     const frame=page!.locator('#provider').frameLocator('iframe[title="Secure payment input frame"]');
     for(const [name,value,code] of [['number','4242424242424242','BROWSER_CARD_NUMBER'],['expiry','1230','BROWSER_CARD_EXPIRY'],['cvc','123','BROWSER_CARD_CVC']] as const)
       await at(code,()=>frame.locator('input[name="'+name+'"]').fill(value,{timeout:timeout()}));
     const postal=frame.locator('input[name="postalCode"]');
     if(await at('BROWSER_POSTAL_CHECK',()=>postal.isVisible()))await at('BROWSER_POSTAL_FILL',()=>postal.fill('10001',{timeout:timeout()}));
+    // No await between the last empty-set check and arming Pay.
+    while(which==='initial'&&pendingInitialNavigations.size)await waitForNavigationClassification();
     assertPage();need(step==='CONFIRM');
     manualArmed=true;
     await at('BROWSER_MANUAL_PAY_ARM',async()=>need(await button.evaluate((b,phase)=>{
@@ -200,6 +221,12 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     finalDelivery=undefined;
     manualArmed=false;
   }
+  function waitForNavigationClassification() {
+    return at(navigationBlockCheckpoint,()=>billingBounded(scoped(),async()=>{
+      await Promise.all([...pendingInitialNavigations]);assertPage();
+    },Infinity));
+  }
+  const initialFormBeforePay=()=>state==='INITIAL'&&step==='CONFIRM'&&!manualArmed;
   const otpUrl=()=>binding.endpoints.backend+'/api/v1/public/customer-auth/email-otp/challenges';
   function expected() {
     if(state==='INITIAL' && step==='CHALLENGE')return [otpUrl(),'POST'];
@@ -218,6 +245,8 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   async function routeRequest(route:Route) {
     let routeCheckpoint=checkpoint;
     let refusedOrigin:string|undefined;
+    let finishNavigation:undefined|(()=>void);
+    let blockIssued=false;
     try {
       current();
       const request=route.request(),url=new URL(request.url());
@@ -230,8 +259,21 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       const provider=url.origin!==binding.endpoints.backend && url.origin!==binding.endpoints.demo;
       const refusal=provider?providerRefusal(url):undefined;
       const staticTarget=refusal==='BROWSER_PROVIDER_ORIGIN_OTHER' && matchesStaticOrigin?.(url.origin)===true;
-      const originalFrames=staticTarget && renderPhase && page?stripeFrameChain(route,page):undefined;
       const navigationTarget=staticTarget && renderPhase && page?staticNavigationTarget(request,page):null;
+      const originalFrames=staticTarget && renderPhase && page && navigationTarget===null?stripeFrameChain(page,()=>request.frame()):undefined;
+      const checkoutUrl=binding.endpoints.demo+pagePath;
+      const originalNavigation=renderPhase==='INITIAL' && navigationTarget==='STRIPE_PARENT' && page &&
+        request.method()==='GET' && /^https:\/\/[A-Za-z0-9.-]+(?::443)?(?:[/?#]|$)/i.test(request.url())
+        ?stripeNavigationChain(request,page,checkoutUrl):undefined;
+      const interceptedBeforePay=initialFormBeforePay();
+      // Even an ineligible pinned document can reach READY before its original
+      // refusal is decided. Its classification must also precede Pay.
+      if(renderPhase==='INITIAL'&&navigationTarget!==null){
+        let settle!:()=>void;
+        const classification=new Promise<void>(resolve=>{settle=resolve;});
+        pendingInitialNavigations.add(classification);
+        finishNavigation=()=>{pendingInitialNavigations.delete(classification);settle();};
+      }
       if(provider)routeCheckpoint='BROWSER_PROVIDER_HEADERS';
       const headers=await request.allHeaders();
       if(provider)routeCheckpoint='BROWSER_PROVIDER_CURRENT';
@@ -261,7 +303,33 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
               routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION';
               if(request.isNavigationRequest()){
                 if(navigationTarget!==null)routeCheckpoint+='_'+navigationTarget;
-                throw failed();
+                need(originalNavigation && interceptedBeforePay && initialFormBeforePay() && !navigationBlockUsed &&
+                  request.resourceType()==='document' &&
+                  !Object.keys(headers).some(name=>['authorization','cookie','proxy-authorization'].includes(name.toLowerCase())));
+                const checkNavigationTarget=()=>{
+                  const actual=stripeNavigationChain(request,page!,checkoutUrl);
+                  need(actual && actual.target===originalNavigation.target && actual.main===originalNavigation.main &&
+                    sameStripeFrames(originalNavigation.parents,actual.parents));
+                };
+                checkNavigationTarget();
+                routeCheckpoint=navigationBlockCheckpoint;
+                assertPage();
+                navigationBlockUsed=true;
+                let confirm!:()=>void;
+                const browserBlock=new Promise<void>(resolve=>{confirm=resolve;});
+                navigationBlock={request,confirm};
+                try{
+                  await billingBounded(scoped(),async()=>{
+                    need(initialFormBeforePay());
+                    checkNavigationTarget();
+                    blockIssued=true;
+                    await Promise.all([track(route.abort('blockedbyclient')),browserBlock]);
+                  },Infinity);
+                  // Chromium can replace the failed child document. The
+                  // checkout page and its unarmed initial form must still own the run.
+                  assertPage();need(initialFormBeforePay() && page!.mainFrame()===originalNavigation.main);
+                }finally{navigationBlock=undefined;}
+                return;
               }
               routeCheckpoint='BROWSER_PROVIDER_STATIC_REQUEST_URL';
               need(url.href===url.origin+url.pathname);
@@ -281,9 +349,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
                 need(isRendering());
                 const checkOwner=()=>{
                   need(isRendering());routeCheckpoint='BROWSER_PROVIDER_STATIC_FRAME';assertPage();
-                  const actual=stripeFrameChain(route,page!);
-                  need(actual && actual.length===originalFrames.length &&
-                    actual.every(({frame,href},i)=>frame===originalFrames[i]!.frame && href===originalFrames[i]!.href));
+                  need(sameStripeFrames(originalFrames,stripeFrameChain(page!,()=>route.request().frame())));
                   routeCheckpoint='BROWSER_PROVIDER_STATIC_RESPONSE';
                 };
                 await billingBounded(scoped(),limits=>track((async()=>{
@@ -341,7 +407,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
         const key=headers['idempotency-key'];
         need(uuid(key) && !usedKeys.has(key));usedKeys.add(key);
       }
-      if(previous==='CONFIRM')need(manualArmed);
+      if(previous==='CONFIRM')need(manualArmed && !pendingInitialNavigations.size);
       if(state==='INITIAL'){
         need(initial && initialBridge && Date.now()<Date.parse(initial.action.expires_at));
         if(previous==='SESSION')body(request.postData(),['action_token']);
@@ -384,8 +450,8 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     }catch{
       const original=!firstFailure,error=latch(routeCheckpoint);
       if(original && refusedOrigin)rememberBrowserProviderOrigin(error,binding.runId,binding.expectedSource,refusedOrigin);
-      lost();await route.abort('failed').catch(()=>{});
-    }
+      lost();if(!blockIssued)await route.abort('failed').catch(()=>{});
+    }finally{finishNavigation?.();}
   }
   async function setup(port:BillingFirstPaymentPort) {
     binding=port.resources();initialPort=port;
@@ -400,6 +466,14 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     page.on('framenavigated',frame=>{if(frame===page!.mainFrame() && (++navigation!==1 || frame.url()!==binding.endpoints.demo+pagePath))lost();});
     page.on('close',lost);
     page.on('crash',lost);
+    page.on('requestfailed',request=>{
+      const block=navigationBlock;
+      if(block?.request!==request || !initialFormBeforePay())return;
+      try{
+        assertPage();
+        if(request.failure()?.errorText==='net::ERR_BLOCKED_BY_CLIENT')block.confirm();
+      }catch{}
+    });
     await context.routeWebSocket('**/*',socket=>socket.close());
     await context.route('**/*',r=>track(routeRequest(r)));
     await context.exposeBinding('__failedRenewalTerminal',({frame,page:source},...args:unknown[])=>{
@@ -474,7 +548,11 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       try{
         need(state==='NEW');billingCheck(limits);need(limits.deadline<=Date.now()+2700000);
         whole=limits;stage=limits;state='INITIAL';
-        whole.signal?.addEventListener('abort',stop,{once:true});expires=setTimeout(lost,whole.deadline-Date.now());
+        whole.signal?.addEventListener('abort',stop,{once:true});
+        expires=setTimeout(()=>{
+          if(navigationBlock)latch(navigationBlockCheckpoint);
+          lost();
+        },whole.deadline-Date.now());
         await billingBounded(scoped(),()=>track(setup(port)),300000);
         assertPage();need(initial);initialPort=undefined;initialBridge=undefined;
         state='HELD';return true;

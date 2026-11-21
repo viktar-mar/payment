@@ -70,7 +70,47 @@ Attempt `a97adff9-ab30-4cb1-930d-8aebadb95b3d` on `0ecef9b` stopped during the i
 
 The controller now samples the target frame at interception, before awaiting headers. It adds one fixed suffix when the existing navigation check refuses the request. `MAIN_FRAME` refers to the checkout page itself. `CHECKOUT_CHILD` means a direct child of that page. `STRIPE_PARENT` means the attached target's immediate parent on the owned page currently has an HTTPS document hosted on `js.stripe.com` or a subdomain. `OTHER_PARENT` covers other attached non-main parents on the owned page. `FRAME_UNAVAILABLE` covers an unassociated target or an unavailable, detached or foreign frame or parent. This is a snapshot of the navigation destination and the parent's current document. It establishes neither the initiating script nor the requested document's necessity. The historical unqualified navigation code remains readable and applies if the navigation check itself fails. The controller aborts intercepted document navigations to the pinned origin before fallback or static fetch. No frame URLs, names or identifiers are written to the report.
 
+Attempt `708f2828-9a3f-4a7d-9f6e-2b8936b7d194` on `ebbdce1` reached
+`BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_STRIPE_PARENT` after CREATE_ACK.
+The report confirms cleanup, and the saved checkpoints contain no confirmation
+dispatch. The request satisfied the guards that precede the navigation check.
+It stopped before the remaining static asset checks and before network
+transport. The report contains no evidence about the requested document's
+purpose or effect on readiness. The separate
+[browser load check](stripe-browser-load-check.md#recovery-presentation)
+subsequently confirmed readiness and cleanup after blocking a matching
+document in deferred subscription Elements. This evidence covers the
+card-free check only.
+
 The local matcher uses a keyed SHA-256 tag. The independent random 32-byte key is provisioned in the originating checkout at `.superpowers/failed-renewal-static-origin/policy.key` (directory mode 0700, file mode 0600). Preserve that file for future native checks on this checkout. A fresh checkout needs the same privately transferred key to use the reviewed tag. A missing, changed or insecure key leaves the static origin blocked. The key is independent of payment credentials. The controller never reads a historical run report to select a destination.
+
+### Confirming a local document block
+
+During the initial form, before enabling Pay, the controller can continue
+after one local block for the entire journey. The request must be a bodyless, credentialless
+document GET to the exact pinned origin, with no redirect. Its destination
+must be attached beneath a Stripe.js frame on the owned page. The full chain
+of non-main ancestors must consist of Stripe.js documents, and the frame
+identities and ancestor URLs must remain stable across header acquisition
+and until the block is issued.
+All other document requests to the pinned origin retain their existing refusal.
+
+The controller reserves the one block before requesting it. Both the local
+abort and Chrome's `requestfailed` event with
+`net::ERR_BLOCKED_BY_CLIENT` for the same intercepted request must complete
+within the existing deadline. A duplicate or out-of-scope navigation still
+refuses. Missing or mismatched evidence cannot unblock the initial form.
+An eligible block that cannot be confirmed reports
+`BROWSER_PROVIDER_STATIC_NAVIGATION_BLOCK`. An intercepted candidate that is
+still being classified or blocked holds Pay disabled.
+The first existing failure owns the result, and no retry or extra deadline is
+created. The controller sends no network request and supplies no substitute
+response for this document. Payment confirmation still requires the original
+user action and server-side evidence.
+
+The deferred Chrome result supports testing this continuation in recovery.
+It does not establish that the initial form using a client secret will reach
+readiness or that the paid recovery workflow passes.
 
 ### Private refused-origin evidence
 
