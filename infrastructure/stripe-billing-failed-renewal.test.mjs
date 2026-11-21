@@ -510,6 +510,97 @@ test('same held journey, original proof before E, ledger before fixed arm, genui
  assert.deepEqual(h.calls.slice(h.calls.indexOf('observe')),['observe','initial-proof','boundary','arm-dispatch','armDecline','arm-ack',...methods.slice(2,9),'manual-confirm',...methods.slice(9),'final-proof','browser-close','runtime-close','listener-stop','stop','fixture-close']);
  assert.equal(r.scope,'OWNED_FAILED_RENEWAL_GRACE_RECOVERY');assert.equal(r.cleanupConfirmed,true);assert.equal(r.failedRenewalAccepted,true);assert.equal(r.initialAccepted,true);assert.equal(r.full5bAccepted,false);assert.ok(!JSON.stringify(r).includes('method-inert'));await assert.rejects(o.run(h.journey,limits()));
 });
+const postArmLine=(stage,checkpoint,cleanup='CONFIRMED',witness='NONE')=>
+ 'owned_failed_renewal_diagnostic stage='+stage+' checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
+const afterArm=[
+ ['failedRenewal','FAILED_RENEWAL'],['graceLastSecond','GRACE_LAST_SECOND'],['graceAt','GRACE_AT'],['graceAfter','GRACE_AFTER'],
+ ['prepareMethod','METHOD_PREPARE','METHOD_BROWSER'],['selectMethod','METHOD_SELECT','METHOD_BROWSER'],['confirmMethod','METHOD_CONFIRM','METHOD_BROWSER'],
+ ['applyMethod','METHOD_APPLY'],['confirmRecovery','RECOVERY_CONFIRM'],['observeRecovery','RECOVERY_OBSERVE']
+];
+for(const [method,operation,stage=operation] of afterArm)for(const boundary of ['REQUEST','RESPONSE'])
+test('post-arm '+method+' stops at its own '+boundary,async()=>{
+ const h=harness();let inspected=0;
+ const refused=new Proxy({},{get(){inspected++;throw Error('private fixture canary');}});
+ h.runtime[method]=async()=>{h.calls.push(method);if(boundary==='REQUEST')throw refused;return {secret:'private response canary'};};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));const r=await o.close();
+ const line=postArmLine(stage,operation+'_'+boundary);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(r),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ assert.equal(inspected,0);assert.equal(r.failedRenewalAccepted,false);
+ assert.deepEqual(h.calls.filter(v=>methods.includes(v)),methods.slice(0,methods.indexOf(method)+1));
+ assert.equal(h.calls.filter(v=>v==='arm-ack').length,1);assert.ok(!h.calls.includes('final-proof'));
+});
+for(const [stage,checkpoint,change] of [
+ ['ARM_ACK','ARM_ACK_PERSIST',h=>h.fixture.acknowledgeDeclineArm=async()=>false],
+ ['METHOD_BROWSER','METHOD_BROWSER_ACTION',h=>h.journey.method=async(p,l)=>{await p.prepareMethod(l);throw Error('private browser canary');}],
+ ['METHOD_BROWSER','METHOD_ORDER',h=>h.journey.method=async()=>true],
+ ['METHOD_BROWSER','METHOD_ORDER',h=>h.journey.method=(p,l)=>p.selectMethod(l)],
+ ['RECOVERY_EVIDENCE','RECOVERY_EVIDENCE_READ',h=>h.dependencies.proveFailedRenewal=async()=>{throw Error('private evidence canary');}],
+ ['RECOVERY_EVIDENCE','RECOVERY_EVIDENCE_VERIFY',h=>h.dependencies.proveFailedRenewal=async()=>null],
+ ['CLEANUP','POST_ARM_CLEANUP',h=>h.journey.close=async()=>false],
+])test('post-arm distinguishes '+stage+' / '+checkpoint,async()=>{
+ const h=harness();change(h);const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));
+ const r=await o.close(),line=postArmLine(stage,checkpoint,...(stage==='CLEANUP'?['UNCONFIRMED','BROWSER_CLOSE']:[]));
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(r),line);assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ assert.equal(r.failedRenewalAccepted,false);if(stage==='ARM_ACK')assert.ok(!h.calls.includes('failedRenewal'));
+});
+test('post-arm abort freezes the pending request before late response and independent cleanup refusal',async()=>{
+ const h=harness(),abort=new AbortController();let finish;
+ h.runtime.failedRenewal=async()=>{h.calls.push('failedRenewal');abort.abort();return new Promise(resolve=>{finish=resolve;});};
+ h.bootstrap.stop=async()=>false;
+ const o=await owner(h);await assert.rejects(o.run(h.journey,{...limits(),signal:abort.signal}));const r=await o.close();
+ const line=postArmLine('FAILED_RENEWAL','FAILED_RENEWAL_REQUEST','UNCONFIRMED','BOOTSTRAP_STOP');
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(r),line);
+ finish(h.vs[2]);await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(o.resources()),line);assert.ok(!h.calls.includes('graceLastSecond'));
+});
+test('cancellation as final recovery proof settles retains its verification checkpoint',async()=>{
+ // Exercise both the bounded proof and the outer final lifetime check.
+ for(const delay of [1,2,3,4,5]){
+  const h=harness(),abort=new AbortController();
+  h.dependencies.proveFailedRenewal=async()=>({
+   ...proof(),get signedCallbacksVerified(){
+    let ticks=delay;const cancel=()=>{if(--ticks===0)abort.abort();else queueMicrotask(cancel);};
+    queueMicrotask(cancel);return true;
+   }
+  });
+  const o=await owner(h);await assert.rejects(o.run(h.journey,{...limits(),signal:abort.signal}));
+  const result=await o.close();assert.equal(result.code,'ABORTED');
+  assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),postArmLine('RECOVERY_EVIDENCE','RECOVERY_EVIDENCE_VERIFY'));
+  assert.equal(result.failedRenewalAccepted,false);
+ }
+});
+for(const [fault,checkpoint] of [['refused','FAILED_RENEWAL_HTTP'],['invalid reply','FAILED_RENEWAL_RESPONSE'],['abort in fetch','FAILED_RENEWAL_TRANSPORT'],['server stage','FAILED_RENEWAL_SERVER_OBSERVATION']])
+test('post-arm owner uses the real runtime checkpoint on '+fault,async()=>{
+ const h=harness(),paths=[],abort=new AbortController();
+ const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),initial(),...h.vs.slice(0,2)];
+ h.dependencies.createRuntime=()=>clients.createBillingFailedRenewalRuntime({configuration:opts(),bootstrap:{
+  withFailedRenewalRuntime:cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)})
+ }},{fetch:async url=>{
+  const path=new URL(url).pathname;paths.push(path);
+  if(path==='/failed-renewal/abort')return new Response('{"code":"QUIESCENT"}');
+  if(path==='/failed-renewal/failed'){
+   if(fault==='abort in fetch'){abort.abort();return new Promise(()=>{});}
+   if(fault==='server stage')return new Response('{"code":"FAILED_RENEWAL_STOPPED","stage":"FAILED_RENEWAL_OBSERVATION"}',{status:400});
+   return new Response('private response canary',{status:fault==='refused'?503:200});
+  }
+  return new Response(JSON.stringify(replies.shift()));
+ }});
+ const o=await owner(h);await assert.rejects(o.run(h.journey,{...limits(),signal:abort.signal}));
+ const result=await o.close(),line=postArmLine('FAILED_RENEWAL',checkpoint);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ assert.equal(paths.at(-2),'/failed-renewal/failed');assert.equal(paths.at(-1),'/failed-renewal/abort');
+ assert.equal(paths.filter(path=>path==='/failed-renewal/failed').length,1);
+ assert.equal(result.failedRenewalAccepted,false);
+});
+test('post-arm terminal protocol rejects foreign stages, mismatched codes, arbitrary text and false cleanup claims',()=>{
+ const base={scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',status:'CLOSED',phase:'FAILED_RENEWAL',code:'FAILED_RENEWAL',diagnostic:'FAILED_RENEWAL_REQUEST',initialAccepted:false,failedRenewalAccepted:false,full5bAccepted:false,cleanupConfirmed:true,cleanupFailure:null};
+ for(const changes of [{diagnostic:'GRACE_AT_REQUEST'},{scope:'OWNED_INITIAL_PAYMENT'},{phase:'PRIVATE'},{code:'METHOD_ORDER'},{initialAccepted:true},{failedRenewalAccepted:true},{full5bAccepted:true},{status:'RUNNING'},{diagnostic:'FAILED_RENEWAL_PRIVATE'}])assert.equal(owners.formatBillingFailedRenewalDiagnostic({...base,...changes}),null);
+ for(const line of [postArmLine('FAILED_RENEWAL','GRACE_AT_REQUEST'),postArmLine('METHOD_BROWSER','GRACE_AT_RESPONSE'),postArmLine('GRACE_AT','FAILED_RENEWAL_SERVER_ADMISSION'),postArmLine('PRIVATE','PRIVATE_REQUEST'),postArmLine('CLEANUP','POST_ARM_CLEANUP'),postArmLine('FAILED_RENEWAL','FAILED_RENEWAL_REQUEST')+'\n'])assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),null);
+ assert.equal(owners.parseBillingFirstPaymentDiagnosticLine('owned_initial_payment_diagnostic code=FAILED_RENEWAL_REQUEST cleanup=CONFIRMED'),null);
+ assert.equal(owners.parseBillingFirstRenewalDiagnosticLine('owned_initial_and_first_renewal_diagnostic code=FAILED_RENEWAL_REQUEST cleanup=CONFIRMED'),null);
+});
 for(const [name,mutate,forbidden] of [
  ['initial proof',h=>h.dependencies.prove=async()=>null,'boundary'],
  ['arm intent',h=>h.fixture.beforeDeclineArm=async()=>false,'armDecline'],

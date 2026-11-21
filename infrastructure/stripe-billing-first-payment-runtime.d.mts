@@ -15,6 +15,8 @@ export function createBillingFirstRenewalRuntime(options:{configuration:unknown;
 export function billingFirstPaymentDiagnostic(error:unknown):string|null;
 export function billingFirstPaymentPrepareCheckpoint(runtime:unknown):'PREPARE_REQUEST_AUTHORITY'|'PREPARE_REQUEST_TRANSPORT'|'PREPARE_REQUEST_RESPONSE'|null;
 export function isBillingFirstPaymentDiagnostic(code:unknown):boolean;
+export function isFailedRenewalRuntimeCheckpoint(code:unknown):boolean;
+export function billingFailedRenewalRuntimeCheckpoint(runtime:unknown,limits:BillingLimits):string|null;
 
 type FailedIdentity=Omit<FirstPaymentIdentity,'phase'>&{source_sha:string;original_frozen_time:number};
 type Boundary=FailedIdentity&Record<'renewal_admission_id'|'initial_bill_id'|'initial_payment_id'|'boundary_id'|'boundary_ready_id'|'boundary_advance_id'|'boundary_operation_id'|'pending_graph_invocation_id'|'initial_invoice_id'|'initial_allocation_id'|'initial_payment_intent_id'|'renewal_invoice_id'|'boundary_time'|'period_start'|'period_end'|'pending_graph_accepted_at',string>;

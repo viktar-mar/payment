@@ -640,8 +640,11 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         settledBoundary();queueArm();stage("arm-decline","DECLINE_ARMED");
         var before=financialRows();
         debt=new DebtWire(graph,end,next,amount,true);
-        queueAdvance(end,end+3600);after=end+3600;queuePaid();
-        assertThatThrownBy(combined()::failedRenewal).hasMessage("FAILED_RENEWAL_STOPPED");
+        queueAdvance(end,end+3600);after=end+3600;queuePaid();refreshObservationClock();
+        var refused=catchThrowableOfType(IllegalStateException.class,combined()::failedRenewal);
+        assertThat(refused).hasMessage("FAILED_RENEWAL_STOPPED");
+        assertThat(combined().failureStage(refused)).isEqualTo("FAILED_RENEWAL_OBSERVATION");
+        assertThat(combined().failureStage(new IllegalStateException("synthetic"))).isEqualTo("FAILED_RENEWAL");
         assertThatThrownBy(combined()::graceLastSecond).hasMessage("FAILED_RENEWAL_STOPPED");
         assertThat(count("stripe_billing_failed_renewal_failures")).isZero();
         assertThat(count("stripe_billing_first_renewal_publications")).isZero();

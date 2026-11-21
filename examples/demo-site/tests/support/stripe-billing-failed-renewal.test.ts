@@ -151,6 +151,31 @@ test('actual reporter publishes the failed site preparation checkpoint only from
  assert.doesNotMatch(output,/canary/);
  assert.match(output,/owned_failed_renewal_result_not_accepted full5b=NOT_ACCEPTED/);
 });
+test('actual reporter publishes a failed renewal checkpoint only from the matching terminal annotation',async()=>{
+ const prefix='owned_failed_renewal_diagnostic stage=FAILED_RENEWAL checkpoint=';
+ const suffix=' cleanup=UNCONFIRMED witness=RUNTIME_CLOSE';
+ const server=prefix+'FAILED_RENEWAL_SERVER_OBSERVATION'+suffix;
+ const request=prefix+'FAILED_RENEWAL_REQUEST'+suffix;
+ for(const [description,expected] of [
+  [server,[server]],
+  [request,[request]],
+  [server.replace('stage=FAILED_RENEWAL','stage=BROWSER'),[]],
+  [server.replace('SERVER_OBSERVATION','SERVER_UNKNOWN_CANARY'),[]],
+  [server+' raw body canary',[]],
+ ] as const){
+  const output=await captureReporter(reporter=>{
+   const testCase=reporterCase(),result=reporterResult({annotations:[]});
+   reporter.onTestBegin(testCase,result);
+   reporter.onStdOut(loginHandoff+'\n'+server+'\nprivate response canary\n');
+   result.annotations=[{type:'owned-failed-renewal-terminal',description}];
+   reporter.onTestEnd(testCase,result);
+   reporter.onEnd({status:'failed'} as FullResult);
+  });
+  assert.deepEqual(output.trimEnd().split('\n'),[
+   loginHandoff,...expected,'owned_failed_renewal_not_accepted','owned_failed_renewal_result_not_accepted full5b=NOT_ACCEPTED',
+  ]);
+ }
+});
 test('actual reporter retains the exact single-case success predicate',async()=>{
  for(const [testCase,result,full,accepted] of [
   [reporterCase(),reporterResult({status:'passed',annotations:[]}),{status:'passed'},true],

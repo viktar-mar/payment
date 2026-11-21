@@ -53,6 +53,8 @@ public final class OwnedBillingFailedRenewalRuntime {
             "/failed-renewal/method/select","/failed-renewal/method/confirm","/failed-renewal/method/apply","/failed-renewal/recovery/confirm","/failed-renewal/recovery/observe");
         private static final Set<String> STAGES=Set.of("UNCLASSIFIED","INITIAL","BOUNDARY","DECLINE_ARM","FAILED_RENEWAL","GRACE_LAST_SECOND","GRACE_AT","GRACE_AFTER",
             "METHOD_PREPARE","METHOD_SELECT","METHOD_CONFIRM","METHOD_APPLY","RECOVERY_CONFIRM","RECOVERY_OBSERVE");
+        private static final Set<String> FAILED_SUBSTAGES=Set.of("FAILED_RENEWAL_CLOCK_ADVANCE","FAILED_RENEWAL_ADMISSION",
+            "FAILED_RENEWAL_OBSERVATION","FAILED_RENEWAL_EVIDENCE");
         private final OwnedBillingFailedRenewalOperations operations;private final byte[] authorization;
         private final OwnedBillingFirstPaymentRuntime.Handler initial;private boolean active,terminal;
         public Handler(OwnedBillingFailedRenewalOperations operations,String capability){this.operations=Objects.requireNonNull(operations);authorization=("Bearer "+capability).getBytes(StandardCharsets.US_ASCII);initial=new OwnedBillingFirstPaymentRuntime.Handler(operations,capability);}
@@ -82,7 +84,7 @@ public final class OwnedBillingFailedRenewalRuntime {
             reply(exchange,proved?200:400,OwnedBillingFirstPaymentRuntime.error(proved?"QUIESCENT":"FAILED_RENEWAL_STOPPED"));
         }
         @Override public void handle(HttpExchange exchange)throws IOException {
-            boolean owned=false;
+            boolean owned=false,dispatchedFailedRenewal=false;
             try{
                 var auth=exchange.getRequestHeaders().get("Authorization");
                 if(auth==null||auth.size()!=1||!MessageDigest.isEqual(authorization,auth.getFirst().getBytes(StandardCharsets.UTF_8))){reply(exchange,403,OwnedBillingFirstPaymentRuntime.error("DENIED"));return;}
@@ -95,7 +97,8 @@ public final class OwnedBillingFailedRenewalRuntime {
                 if(!exchange.getRequestMethod().equals("POST")){operations.abort();reply(exchange,405,OwnedBillingFirstPaymentRuntime.error("INVALID_REQUEST"));return;}
                 OwnedBillingFirstPaymentRuntime.fields(OwnedBillingFirstPaymentRuntime.Handler.read(exchange,false),Set.of());
                 var response=switch(path){
-                    case "/failed-renewal/boundary" -> operations.boundary();case "/failed-renewal/arm-decline" -> operations.armDecline();case "/failed-renewal/failed" -> operations.failedRenewal();
+                    case "/failed-renewal/boundary" -> operations.boundary();case "/failed-renewal/arm-decline" -> operations.armDecline();
+                    case "/failed-renewal/failed" -> {dispatchedFailedRenewal=true;yield operations.failedRenewal();}
                     case "/failed-renewal/grace-last-second" -> operations.graceLastSecond();case "/failed-renewal/grace-at" -> operations.graceAt();case "/failed-renewal/grace-after" -> operations.graceAfter();
                     case "/failed-renewal/method/prepare" -> operations.prepareMethod();case "/failed-renewal/method/select" -> operations.selectMethod();case "/failed-renewal/method/confirm" -> operations.confirmMethod();case "/failed-renewal/method/apply" -> operations.applyMethod();
                     case "/failed-renewal/recovery/confirm" -> operations.confirmRecovery();case "/failed-renewal/recovery/observe" -> operations.observeRecovery();default -> throw new IllegalStateException();
@@ -103,8 +106,9 @@ public final class OwnedBillingFailedRenewalRuntime {
                 reply(exchange,200,response);
             }catch(Exception invalid){
                 if(!owned)throw invalid instanceof IOException io?io:new IOException("FAILED_RENEWAL_STOPPED");
-                String stage;try{stage=operations.failureStage();}catch(RuntimeException unavailable){stage="UNCLASSIFIED";}
-                var response=OwnedBillingFirstPaymentRuntime.error("FAILED_RENEWAL_STOPPED");response.addProperty("stage",stage!=null&&STAGES.contains(stage)?stage:"UNCLASSIFIED");
+                String stage;try{stage=dispatchedFailedRenewal?operations.failureStage(invalid):operations.failureStage();}catch(RuntimeException unavailable){stage="UNCLASSIFIED";}
+                boolean known=stage!=null&&(STAGES.contains(stage)||dispatchedFailedRenewal&&FAILED_SUBSTAGES.contains(stage));
+                var response=OwnedBillingFirstPaymentRuntime.error("FAILED_RENEWAL_STOPPED");response.addProperty("stage",known?stage:"UNCLASSIFIED");
                 operations.abort();reply(exchange,400,response);
             }finally{if(owned)leave();exchange.close();}
         }

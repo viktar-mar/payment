@@ -4,7 +4,7 @@ import {validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal
 import {validateRenewalBoundary,validateRenewalFinalization} from './stripe-billing-first-renewal-response.mjs';
 import {validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {billingBounded,billingCheck,billingError} from './stripe-billing-limits.mjs';
-import {createBillingFirstPaymentRuntime,createBillingFirstRenewalRuntime,createBillingFailedRenewalRuntime,billingFirstPaymentDiagnostic,billingFirstPaymentPrepareCheckpoint,isBillingFirstPaymentDiagnostic} from './stripe-billing-first-payment-runtime.mjs';
+import {createBillingFirstPaymentRuntime,createBillingFirstRenewalRuntime,createBillingFailedRenewalRuntime,billingFirstPaymentDiagnostic,billingFirstPaymentPrepareCheckpoint,isBillingFirstPaymentDiagnostic,billingFailedRenewalRuntimeCheckpoint,isFailedRenewalRuntimeCheckpoint} from './stripe-billing-first-payment-runtime.mjs';
 import {billingUuid,billingFailedRenewalProvisionCheckpoint,isFailedRenewalProvisionCheckpoint} from './stripe-billing-provision.mjs';
 import {isBrowserDiagnostic,browserDiagnostic,browserCleanupConfirmed,browserProviderOrigin,isBrowserProviderOriginWitness} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 // Terminal reporting only; the private PREPARE validator keeps its original set.
@@ -21,6 +21,21 @@ const startupCodes=new Set([
 const postConfirmCheckpoints=Object.freeze({BROWSER:'POST_CONFIRM_BROWSER',OBSERVE:'POST_CONFIRM_OBSERVE',EVIDENCE:'POST_CONFIRM_EVIDENCE',RENEWAL_BOUNDARY:'POST_CONFIRM_RENEWAL_BOUNDARY',RENEWAL_FINALIZATION:'POST_CONFIRM_RENEWAL_FINALIZATION',RENEWAL_EVIDENCE:'POST_CONFIRM_RENEWAL_EVIDENCE'});
 const postConfirmCodes=new Set([...Object.values(postConfirmCheckpoints),'POST_CONFIRM_CLEANUP']);
 const isTerminalDiagnostic=code=>isBillingFirstPaymentDiagnostic(code)||isBrowserDiagnostic(code)||typeof code==='string'&&(startupCodes.has(code)||postConfirmCodes.has(code));
+// Owner operations, independent of the success-phase names on the response wire.
+const postArmOperations=new Map([
+ ['failedRenewal','FAILED_RENEWAL'],['graceLastSecond','GRACE_LAST_SECOND'],['graceAt','GRACE_AT'],['graceAfter','GRACE_AFTER'],
+ ['applyMethod','METHOD_APPLY'],['confirmRecovery','RECOVERY_CONFIRM'],['observeRecovery','RECOVERY_OBSERVE'],
+]);
+const browserMethodOperations=new Map([['prepareMethod','METHOD_PREPARE'],['selectMethod','METHOD_SELECT'],['confirmMethod','METHOD_CONFIRM']]);
+const postArmCheckpoints=new Map([
+ ['ARM_ACK',new Set(['ARM_ACK_PERSIST'])],['METHOD_BROWSER',new Set(['METHOD_ORDER','METHOD_BROWSER_ACTION'])],
+ ['RECOVERY_EVIDENCE',new Set(['RECOVERY_EVIDENCE_READ','RECOVERY_EVIDENCE_VERIFY'])],['CLEANUP',new Set(['POST_ARM_CLEANUP'])],
+]);
+for(const operation of postArmOperations.values())postArmCheckpoints.set(operation,new Set([operation+'_REQUEST',operation+'_RESPONSE']));
+for(const operation of browserMethodOperations.values()){
+ postArmCheckpoints.get('METHOD_BROWSER').add(operation+'_REQUEST');
+ postArmCheckpoints.get('METHOD_BROWSER').add(operation+'_RESPONSE');
+}
 function startupDiagnostic(bootstrap){
  try{const read=Object.getOwnPropertyDescriptor(bootstrap,'startupDiagnostic')?.value;if(typeof read!=='function')return null;const code=read.call(bootstrap);return typeof code==='string'&&startupCodes.has(code)?code:null;}catch{return null;}
 }
@@ -50,7 +65,7 @@ async function createOwner(options,dependencies,purpose){
  }
  const c=mode.validate(options);if(!c)throw billingError('OPT_IN_REQUIRED');
  let state='NEW',phase='NEW',failure=null,diagnostic=null,accepted=false,cleanupConfirmed=false,cleanupFailure=null,bootstrap,cli,fixture,runtime,cleanupPromise,active,finish;
- let journeyStarted=false,journeySettled=false,journeyClean=false,startSettlement,provisionLimits;
+ let journeyStarted=false,journeySettled=false,journeyClean=false,startSettlement,provisionLimits,postArmCheckpoint,failedRequestLimits;
  const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
  const revoke=()=>{
   if(runtime&&!terminalClose){
@@ -66,6 +81,11 @@ async function createOwner(options,dependencies,purpose){
    if(detail==='PREPARE_REQUEST')detail=billingFirstPaymentPrepareCheckpoint(runtime)??detail;
    if(failedRenewal&&phase==='PROVISION'&&(code==='PROVISION'||code==='ABORTED')){
     diagnostic=billingFailedRenewalProvisionCheckpoint(fixture,provisionLimits,c.runId,c.expectedSource)??'PROVISION_UNKNOWN';
+   }else if(failedRenewal&&postArmCheckpoints.has(phase)){
+    diagnostic=postArmCheckpoints.get(phase).has(postArmCheckpoint)?postArmCheckpoint:null;
+    if(phase==='FAILED_RENEWAL'&&diagnostic==='FAILED_RENEWAL_REQUEST'){
+     diagnostic=billingFailedRenewalRuntimeCheckpoint(runtime,failedRequestLimits)??diagnostic;
+    }
    }else{
     diagnostic=failedRenewal&&phase==='LISTENER'&&(code==='LISTENER'||code==='ABORTED')&&isPersistenceDiagnostic(detail)?detail:isTerminalDiagnostic(detail)?detail:confirmAck?postConfirmCheckpoints[phase]??null:null;
    }
@@ -113,7 +133,11 @@ async function createOwner(options,dependencies,purpose){
    try{if(await billingBounded(l,x=>o[m](x),o===bootstrap?120000:30000)!==true)missing(code);}catch{missing(code);}
   }
   if(missingStartupDiagnostic&&diagnostic===null)diagnostic='START_UNKNOWN';
-  cleanupConfirmed=ok;if(!ok&&failure===null){failure='CLEANUP';if(confirmAck)diagnostic='POST_CONFIRM_CLEANUP';}return ok;
+  cleanupConfirmed=ok;if(!ok&&failure===null){
+   failure='CLEANUP';
+   if(failedRenewal&&phase==='RECOVERY_EVIDENCE'){phase='CLEANUP';diagnostic='POST_ARM_CLEANUP';}
+   else if(confirmAck)diagnostic='POST_CONFIRM_CLEANUP';
+  }return ok;
  })();}
  return Object.freeze({resources,
   async run(journey,limits){if(state!=='NEW')throw billingError('SINGLE_USE');state='RUNNING';let timer,remove=()=>{};
@@ -198,25 +222,37 @@ async function createOwner(options,dependencies,purpose){
      const anchor=exactRecord(proof.anchor,['initial_bill_id','initial_payment_id','initial_invoice_id','initial_allocation_id','initial_payment_intent_id']);
      let previous,next=0;
      const dispatch=async(method,l)=>{
-      const stage=failedStages[next];if(!stage||stage.method!==method)fail('ORDER');
+      const stage=failedStages[next];if(!stage||stage.method!==method){
+       if(phase==='METHOD_BROWSER')postArmCheckpoint='METHOD_ORDER';
+       fail('ORDER');
+      }
       next++; // No new authority after an uncertain or concurrent dispatch.
-      const v=await guarded(stage.phase,l,async bound=>{
+      const operation=postArmOperations.get(method)??browserMethodOperations.get(method);
+      if(operation)postArmCheckpoint=operation+'_REQUEST';
+      const v=await guarded(operation?phase:stage.phase,l,async bound=>{
+       if(method==='failedRenewal')failedRequestLimits=bound;
        const reply=await runtime[stage.method](bound);billingCheck(bound);
+       if(operation)postArmCheckpoint=operation+'_RESPONSE';
        return validateFailedRenewalStage(method,reply,originalIdentity,settlement,c,previous);
       });
+      if(method==='failedRenewal')failedRequestLimits=undefined;
       previous=v;return v;
+     };
+     const runPostArm=method=>{
+      const operation=postArmOperations.get(method);postArmCheckpoint=operation+'_REQUEST';
+      return step(operation,l=>dispatch(method,l));
      };
      await step('RENEWAL_BOUNDARY',l=>dispatch('boundary',l));
      if(!Object.entries(anchor).every(([key,value])=>previous[key]===value))fail('EVIDENCE');
      const armBoundary=Object.freeze({...previous,...anchor});
      await requireTrue('ARM_INTENT',l=>fixture.beforeDeclineArm(armBoundary,l));
      await step('ARM_DECLINE',l=>dispatch('armDecline',l));
-     await requireTrue('ARM_ACK',l=>fixture.acknowledgeDeclineArm(previous,l));
-     for(const method of ['failedRenewal','graceLastSecond','graceAt','graceAfter'])await step(method.toUpperCase(),l=>dispatch(method,l));
+     postArmCheckpoint='ARM_ACK_PERSIST';await requireTrue('ARM_ACK',l=>fixture.acknowledgeDeclineArm(previous,l));
+     for(const method of ['failedRenewal','graceLastSecond','graceAt','graceAfter'])await runPostArm(method);
      let methodActive=true,methodBusy=false;
      const browserStep=async(method,l)=>{
-      if(!methodActive)throw billingError('CLOSED');if(methodBusy)fail('METHOD_ORDER');methodBusy=true;
-      try{return await dispatch(method,l);}finally{methodBusy=false;}
+      if(!methodActive)throw billingError('CLOSED');if(methodBusy){postArmCheckpoint='METHOD_ORDER';fail('METHOD_ORDER');}methodBusy=true;
+      try{const value=await dispatch(method,l);postArmCheckpoint='METHOD_BROWSER_ACTION';return value;}finally{methodBusy=false;}
      };
      const methodPort=Object.freeze({
       async prepareMethod(l){const v=await browserStep('prepareMethod',l);return Object.freeze({subscriptionId:v.subscription_id,operationId:v.method_operation_id,action:v.action});},
@@ -224,13 +260,18 @@ async function createOwner(options,dependencies,purpose){
       async confirmMethod(l){const v=await browserStep('confirmMethod',l);return Object.freeze({browser_confirm_allowed:v.browser_confirm_allowed,state:v.state});}
      });
      try{
+      postArmCheckpoint='METHOD_BROWSER_ACTION';
       await requireTrue('METHOD_BROWSER',l=>trackBrowser(()=>heldJourney.method(methodPort,l)),2700000);
-      if(methodBusy||previous.phase!=='METHOD_CONSUMED')fail('METHOD_ORDER');
+      if(methodBusy||previous.phase!=='METHOD_CONSUMED'){postArmCheckpoint='METHOD_ORDER';fail('METHOD_ORDER');}
      }finally{methodActive=false;}
-     for(const method of ['applyMethod','confirmRecovery','observeRecovery'])await step(method.toUpperCase(),l=>dispatch(method,l));
-     const evidence=await step('RECOVERY_EVIDENCE',async l=>(dependencies.proveFailedRenewal??(await import('./stripe-billing-failed-renewal-evidence.mjs')).proveBillingFailedRenewalEvidence)({configuration:c,bootstrap,fixture,settlement:previous},l));
-     if(!evidence||!['ownedVerified','cashVerified','journalVerified','signedCallbacksVerified'].every(k=>evidence[k]===true))fail('RECOVERY_EVIDENCE');
-     billingCheck(active);
+     for(const method of ['applyMethod','confirmRecovery','observeRecovery'])await runPostArm(method);
+     postArmCheckpoint='RECOVERY_EVIDENCE_READ';
+     await requireTrue('RECOVERY_EVIDENCE',async l=>{
+      const evidence=await (dependencies.proveFailedRenewal??(await import('./stripe-billing-failed-renewal-evidence.mjs')).proveBillingFailedRenewalEvidence)({configuration:c,bootstrap,fixture,settlement:previous},l);
+      billingCheck(l);postArmCheckpoint='RECOVERY_EVIDENCE_VERIFY';
+      return Boolean(evidence&&['ownedVerified','cashVerified','journalVerified','signedCallbacksVerified'].every(k=>evidence[k]===true));
+     });
+     try{billingCheck(active);}catch{fail('ABORTED');}
     }
     if(firstRenewal){
      const boundary=await step('RENEWAL_BOUNDARY',async l=>validateRenewalBoundary(await runtime.boundary(l),originalIdentity,settlement));
@@ -276,7 +317,7 @@ function isFailedRenewalCheckpoint(stage,checkpoint){
   case 'START':return checkpoint==='START_UNKNOWN'||startupCodes.has(checkpoint);
   case 'PROVISION':return checkpoint==='PROVISION_UNKNOWN'||isFailedRenewalProvisionCheckpoint(checkpoint);
   case 'BROWSER':return isBrowserDiagnostic(checkpoint);
-  default:return false;
+  default:return postArmCheckpoints.get(stage)?.has(checkpoint)===true||(stage==='FAILED_RENEWAL'&&isFailedRenewalRuntimeCheckpoint(checkpoint));
  }
 }
 /** Failed-mode terminal checkpoints; no raw result/error/resource fields are serialized. */
@@ -285,17 +326,19 @@ export function formatBillingFailedRenewalDiagnostic(result){
   if(!result||Object.getPrototypeOf(result)!==Object.prototype)return null;
   const own=name=>Object.getOwnPropertyDescriptor(result,name)?.value;
   const stage=own('phase');
-  if(own('scope')!=='OWNED_FAILED_RENEWAL_GRACE_RECOVERY'||own('status')!=='CLOSED'||![stage,'ABORTED'].includes(own('code'))||
+  const checkpoint=own('diagnostic'),code=own('code');
+  const methodOrder=stage==='METHOD_BROWSER'&&checkpoint==='METHOD_ORDER'&&(code==='ORDER'||code==='METHOD_ORDER');
+  if(own('scope')!=='OWNED_FAILED_RENEWAL_GRACE_RECOVERY'||own('status')!=='CLOSED'||(code!==stage&&code!=='ABORTED'&&!methodOrder)||
      own('initialAccepted')!==false||own('failedRenewalAccepted')!==false||own('full5bAccepted')!==false)return null;
-  const checkpoint=own('diagnostic'),confirmed=own('cleanupConfirmed'),witness=own('cleanupFailure');
-  if(!isFailedRenewalCheckpoint(stage,checkpoint)||typeof confirmed!=='boolean'||(confirmed?witness!==null:!isCleanupDiagnostic(witness)))return null;
+  const confirmed=own('cleanupConfirmed'),witness=own('cleanupFailure');
+  if(!isFailedRenewalCheckpoint(stage,checkpoint)||typeof confirmed!=='boolean'||(stage==='CLEANUP'&&(confirmed||code!=='CLEANUP'))||(confirmed?witness!==null:!isCleanupDiagnostic(witness)))return null;
   return 'owned_failed_renewal_diagnostic stage='+stage+' checkpoint='+checkpoint+' cleanup='+(confirmed?'CONFIRMED':'UNCONFIRMED')+' witness='+(confirmed?'NONE':witness);
  }catch{return null;}
 }
 export function parseBillingFailedRenewalDiagnosticLine(line){
  if(typeof line!=='string'||line.length>200)return null;
- const match=/^owned_failed_renewal_diagnostic stage=(LISTENER|START|PROVISION|BROWSER) checkpoint=([A-Z_]+) cleanup=(CONFIRMED|UNCONFIRMED) witness=([A-Z_]+)$/.exec(line);
- return match&&match[0]===line&&isFailedRenewalCheckpoint(match[1],match[2])&&(match[3]==='CONFIRMED'?match[4]==='NONE':isCleanupDiagnostic(match[4]))?line:null;
+ const match=/^owned_failed_renewal_diagnostic stage=([A-Z_]+) checkpoint=([A-Z_]+) cleanup=(CONFIRMED|UNCONFIRMED) witness=([A-Z_]+)$/.exec(line);
+ return match&&match[0]===line&&isFailedRenewalCheckpoint(match[1],match[2])&&(match[3]==='CONFIRMED'?match[1]!=='CLEANUP'&&match[4]==='NONE':isCleanupDiagnostic(match[4]))?line:null;
 }
 function formatCleanupDiagnostic(result,prefix){
  if(!result||result.status!=='CLOSED'||result.initialAccepted!==false||typeof result.code!=='string'||!result.code||result.cleanupConfirmed!==false||!isCleanupDiagnostic(result.cleanupFailure))return null;

@@ -8,5 +8,6 @@ public interface OwnedBillingFailedRenewalOperations extends OwnedBillingFirstPa
     JsonObject graceLastSecond();JsonObject graceAt();JsonObject graceAfter();
     JsonObject prepareMethod();JsonObject selectMethod();JsonObject confirmMethod();JsonObject applyMethod();
     JsonObject confirmRecovery();JsonObject observeRecovery();String failureStage();
+    default String failureStage(Exception refusal){return failureStage();}
     boolean awaitQuiescence(long untilNanos) throws InterruptedException;
 }

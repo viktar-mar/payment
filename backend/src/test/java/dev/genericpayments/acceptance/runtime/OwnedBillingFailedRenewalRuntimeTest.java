@@ -133,6 +133,37 @@ class OwnedBillingFailedRenewalRuntimeTest {
             assertThat(x.output.toString()).isEqualTo("{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\""+(stage.equals("private-secret")?"UNCLASSIFIED":stage)+"\"}");assertThat(ops.aborts).hasValue(1);
         }
     }
+    @Test void failedRenewalRouteProjectsOnlyTheFixedSubstageOfItsOwnRefusal() throws Exception {
+        for(var step:List.of("CLOCK_ADVANCE","ADMISSION","OBSERVATION","EVIDENCE","private")){
+            var fault=new IllegalStateException("private synthetic detail");
+            var ops=new Inert(){
+                public JsonObject failedRenewal(){throw fault;}
+                public String failureStage(Exception error){return error==fault?"FAILED_RENEWAL_"+step:"UNCLASSIFIED";}
+            };
+            var exchange=request("POST","/failed-renewal/failed","{}");
+            handler(ops).handle(exchange);
+            assertThat(exchange.code).isEqualTo(400);
+            var expected=step.equals("private")?"UNCLASSIFIED":"FAILED_RENEWAL_"+step;
+            assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\""+expected+"\"}");
+            assertThat(ops.aborts).hasValue(1);
+        }
+    }
+
+    @Test void otherRouteAndMalformedFailureRequestCannotPublishDetailedSubstages() throws Exception {
+        for(var exchange:List.of(request("POST","/failed-renewal/grace-at","{}"),
+                request("POST","/failed-renewal/failed","{\"unexpected\":true}"))){
+            var ops=new Inert(){
+                public JsonObject graceAt(){throw new IllegalStateException("synthetic");}
+                public String failureStage(){return "FAILED_RENEWAL_ADMISSION";}
+                public String failureStage(Exception error){throw new AssertionError("No selected failed-renewal call");}
+            };
+            handler(ops).handle(exchange);
+            assertThat(exchange.code).isEqualTo(400);
+            assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}");
+            assertThat(ops.effects).isEmpty();
+        }
+    }
+
     // A competing request must not call abort, cancelling the dispatched winner's authority.
     @Test void concurrentStageLosersCannotDispatchOrStealWinnerCleanup() throws Exception {
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var failures=new CopyOnWriteArrayList<Throwable>();

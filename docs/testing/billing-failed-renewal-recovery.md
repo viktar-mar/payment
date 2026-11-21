@@ -2,7 +2,28 @@
 
 ## Fresh EUR20 failed renewal and recovery — 2026-11-15
 
-**HOSTED VERIFIED; native attempts NOT_ACCEPTED. Native failed renewal, grace and recovery have not yet executed. Full Stage 5B is NOT_ACCEPTED.** The case is `initial_failed_renewal_grace_recovery` under `OWNED_FAILED_RENEWAL_GRACE_RECOVERY`. Runtime source `997252a6e6b07f611914a543daf442492f948706` passed all four jobs of [Offline CI 43771017914](https://github.com/viktar-mar/payment/actions/runs/43771017914), including the dedicated failed-renewal backend, browser support and all three no-launch packaging checks. The hosted composition uses PostgreSQL, the actual OTP and billing services, signed callback delivery and in-memory replies to official SDK requests. These synthetic provider replies do not establish native interoperability or acceptance. Local targeted checks passed 1,144 cases and strict TypeScript; independent review passed. [Scenario design](../superpowers/specs/2026-11-15-failed-renewal-sandbox-scenario-design.md)
+**HOSTED VERIFIED; native attempts NOT_ACCEPTED. The native evidence confirms the initial payment and the decline-method change. Renewal, grace and recovery remain unverified. Full Stage 5B is NOT_ACCEPTED.** The case is `initial_failed_renewal_grace_recovery` under `OWNED_FAILED_RENEWAL_GRACE_RECOVERY`. Runtime source `997252a6e6b07f611914a543daf442492f948706` passed all four jobs of [Offline CI 43771017914](https://github.com/viktar-mar/payment/actions/runs/43771017914), including the dedicated failed-renewal backend, browser support and all three no-launch packaging checks. The hosted composition uses PostgreSQL, the actual OTP and billing services, signed callback delivery and in-memory replies to official SDK requests. These synthetic provider replies do not establish native interoperability or acceptance. Local targeted checks passed 1,144 cases and strict TypeScript; independent review passed. [Scenario design](../superpowers/specs/2026-11-15-failed-renewal-sandbox-scenario-design.md)
+
+### Last receipt before the failed renewal
+
+On 2026-11-21, attempt `49b04998-2306-4ef1-ab84-74a4d299269d` at `1a761e5` ended with one failed run and no terminal checkpoint. The last receipt, `billing-022-decline-arm-ack.json`, contains `ACKNOWLEDGED`. Before writing it, the owner verified the initial €20 payment, its journal entry and signed callbacks, checked the renewal boundary and validated the response to the decline-method change.
+
+The next scheduled call was `failedRenewal`. It advances the test clock to finalization, admits the renewal, observes the failure and checks the returned invoice and grace deadline. If this route returned HTTP 400, the old client discarded the response before reading its stage. The old terminal report could not publish any of these steps. The ACK bytes can also be present before synchronization finishes, and the scenario writes no later fixture receipts. The retained evidence therefore cannot establish which operation failed, whether the server received the call, or whether the debt was created or recovered.
+
+For a fresh run, the terminal report names the operation pending when the first failure occurred. At the scenario level, a `_REQUEST` checkpoint covers the call to the runtime, including its own validation of the HTTP response. A `_RESPONSE` checkpoint covers the scenario's checks on evidence already returned by that call. The failed-renewal route also reports the narrower boundaries described below.
+
+| Stage | What the checkpoint identifies |
+| --- | --- |
+| `ARM_ACK` | Validating and persisting the decline-method acknowledgement. |
+| `FAILED_RENEWAL` | The runtime call, its authorization or transport, an HTTP refusal, or validation of the response. A recognized server refusal identifies the step that produced it. |
+| `GRACE_LAST_SECOND`, `GRACE_AT`, `GRACE_AFTER` | The request or returned evidence for the access check just before, at or just after the grace deadline. |
+| `METHOD_BROWSER`, `METHOD_APPLY` | The browser handoff, its ordered calls, or applying the confirmed replacement method. |
+| `RECOVERY_CONFIRM`, `RECOVERY_OBSERVE`, `RECOVERY_EVIDENCE` | Confirming repayment, observing settlement, or independently verifying the recovery evidence. |
+| `CLEANUP` | The scenario reached its final checks and cleanup was the first unconfirmed operation. |
+
+Only an exact, recognized error response from the failed-renewal request yields `FAILED_RENEWAL_SERVER_CLOCK_ADVANCE`, `FAILED_RENEWAL_SERVER_ADMISSION`, `FAILED_RENEWAL_SERVER_OBSERVATION` or `FAILED_RENEWAL_SERVER_EVIDENCE`. A generic HTTP checkpoint leaves the server step unknown. A transport checkpoint leaves delivery uncertain. The report records cleanup separately and excludes response bodies, exception messages and payment identifiers. A terminal checkpoint does not establish the outcome of a charge or authorize another attempt.
+
+### Earlier attempts
 
 On 2026-11-21, attempt `6f1fc018-ad2b-47e3-b65e-84663f57f9cb` at `eeda9b9` recorded CREATE_ACK and stopped before any recorded CONFIRM dispatch. The controller rejected an HTTPS request to the `stripe.network` apex or a subdomain at `BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK`. Cleanup was confirmed. That version saved no private origin for this category. The exact destination, frame, request purpose and effect on Element readiness remain unknown. The [deferred form check](stripe-browser-load-check.md) used no client secret and cannot identify this request. Failed renewal, grace and recovery remain unverified by this attempt.
 

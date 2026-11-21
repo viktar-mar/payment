@@ -20,6 +20,8 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
     private final OwnedBillingFirstPaymentScenario initial;private final OwnedBillingFirstPaymentRuntime.Admission owner;
     private final Function<Class<?>,Object> beans;private final Clock utc;private final Instant deadline;private final State state;
     private volatile Stage failureStage=Stage.UNCLASSIFIED;private OwnedBillingFailedRenewalComponents components;
+    private String failedRenewalStep;
+    private volatile RuntimeException failedRenewalRefusal;
     private OwnedFirstRenewal.Admission upstream;private OwnedFirstRenewal.Pending pending;
     private FailureArmEvidence armEvidence;
     private OwnedFailedRenewal.Admission failed;private OwnedFailedRenewal.Failure failure;
@@ -43,7 +45,12 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
         final long ticket;
         try{ticket=state.enter(expected,next+"_RUNNING");}catch(RuntimeException invalid){if(state.stoppedIdle())cleanup();throw denied();}
         try{failureStage=checkpoint;var result=work.get();state.complete(ticket,next+"_RUNNING",next);return result;}
-        catch(RuntimeException invalid){if(state.fail(ticket))cleanup();throw denied();}
+        catch(RuntimeException invalid){
+            if(state.fail(ticket))cleanup();
+            var refusal=denied();
+            if(checkpoint==Stage.FAILED_RENEWAL)failedRenewalRefusal=refusal;
+            throw refusal;
+        }
         catch(Error invalid){if(state.fail(ticket))cleanup();throw invalid;}
     }
     private JsonObject initial(Supplier<JsonObject> work){return stage("INITIAL","INITIAL",Stage.INITIAL,work);}
@@ -52,6 +59,10 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
     @Override public JsonObject observe(){return initial(initial::observe);}
     @Override public String prepareFailureStage(){return initial.prepareFailureStage();}
     @Override public String failureStage(){return failureStage.name();}
+    @Override public String failureStage(Exception refusal){
+        // Only the exception emitted by this consumed call can identify its inner step.
+        return refusal!=null&&refusal==failedRenewalRefusal?failedRenewalStep:failureStage();
+    }
     @Override public JsonObject boundary(){return stage("INITIAL","RENEWAL_BOUNDARY",Stage.BOUNDARY,()->{
         // Authenticate the original settled receipt BEFORE constructing any genuine factories.
         var receipt=initial.settledReceipt();management();var clock=receipt.intent().clock().owner();var terms=receipt.intent().terms();
@@ -70,9 +81,14 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
         return response("DECLINE_ARMED");
     });}
     @Override public JsonObject failedRenewal(){return stage("DECLINE_ARMED","FAILED_RENEWAL",Stage.FAILED_RENEWAL,()->{
+        failedRenewalStep="FAILED_RENEWAL_CLOCK_ADVANCE";
         management();var c=parts();var ready=c.advance().advance(upstream,OwnedFirstRenewal.Step.FINALIZATION);
         // This READY2 goes straight to the failed service; no successful Paid observer/publisher.
-        management();failed=c.failures.admit(upstream,ready,pending.boundary());management();failure=c.failureObserver().observe(failed);
+        failedRenewalStep="FAILED_RENEWAL_ADMISSION";
+        management();failed=c.failures.admit(upstream,ready,pending.boundary());
+        failedRenewalStep="FAILED_RENEWAL_OBSERVATION";
+        management();failure=c.failureObserver().observe(failed);
+        failedRenewalStep="FAILED_RENEWAL_EVIDENCE";
         var e=pending.boundary().period().start();require(ready.observation().frozenTime()==e.plusSeconds(3600).getEpochSecond()
             &&failure.graceDeadline().equals(e.plusSeconds(259200))&&failure.period().equals(pending.boundary().period())
             &&failure.invoice().equals(pending.boundary().renewalInvoice()));
