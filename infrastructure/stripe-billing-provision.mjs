@@ -9,6 +9,17 @@ const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 export const billingUuid=value=>typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
 const need=value=>{if(!value)throw billingError('FIXTURE');};
 const digest=value=>createHash('sha256').update(value).digest('hex');
+const failedRenewalCheckpoints=new WeakMap();
+const checkpointCodes=new Set([
+ 'PROVISION_CALLBACK_INTENT','PROVISION_CALLBACK_PUT','PROVISION_CALLBACK_VALIDATE',
+ 'PROVISION_RECEIVER_CONFIGURE','PROVISION_MAILPIT_READ','PROVISION_MAILPIT_EMPTY','PROVISION_FIXTURE_READY',
+]);
+export function billingFailedRenewalProvisionCheckpoint(fixture,limits,runId,expectedSource) {
+ const checkpoint=failedRenewalCheckpoints.get(fixture);
+ return checkpoint&&checkpoint.limits===limits&&checkpoint.runId===runId&&checkpoint.expectedSource===expectedSource
+  ? checkpoint.code : null;
+}
+export const isFailedRenewalProvisionCheckpoint=code=>checkpointCodes.has(code);
 /** Fresh recurring fixture only. Cookies and callback secrets never enter its append-only public ledger. */
 export async function createBillingFixture(options,dependencies={}) {
  need(billingFailedRenewalExcluded(options?.configuration?.env??{}));
@@ -54,7 +65,13 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
  async function mutate(name,path,body,status,l,check) {
   await save(name+'-dispatch',{phase:'DISPATCHING'},l);const v=await read(path,l,{method:'POST',body,status});need(check(v));await save(name+'-ack',{phase:'ACKNOWLEDGED',...(billingUuid(v?.id)?{id:v.id}:{})},l);return v;
  }
- return Object.freeze({resources,
+ function checkpoint(code,limits) {
+  if(failed){
+   billingCheck(limits);need(!closed);
+   failedRenewalCheckpoints.set(fixture,{code,limits,runId:c.runId,expectedSource:c.expectedSource});
+  }
+ }
+ const fixture=Object.freeze({resources,
   async provision(limits){
    need(!provisioned&&!busy&&!closed&&(!failed||!provisionClaimed));provisionClaimed=true;busy=true;started=Date.now();
    try{
@@ -78,12 +95,24 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
     const price=await mutate('price','/api/admin/v1/products/'+productId+'/prices',{price_key:'billing-price-'+suffix,type:'SUBSCRIPTION',amount_minor:2000,currency:'EUR',billing_interval:'MONTH',trial_days:0,tax_mode:'INCLUSIVE',tax_code:null},201,limits,v=>billingUuid(v?.id)&&v.site_id===siteId&&v.product_id===productId&&v.version===1&&v.status==='DRAFT');priceId=price.id;
     const published=await mutate('publish','/api/admin/v1/prices/'+priceId+'/publish',undefined,200,limits,v=>v?.id===priceId&&v.type==='SUBSCRIPTION'&&v.status==='PUBLISHED'&&v.version===1&&v.amount_minor===2000&&v.currency==='EUR'&&v.billing_interval==='MONTH'&&v.trial_days===0&&v.tax_mode==='INCLUSIVE'&&/^price_[A-Za-z0-9]+$/.test(v.provider_price_id));priceReference=published.provider_price_id;
     const empty=await read('/inspection',limits,{target:'receiver'});need(empty.count===0&&empty.duplicates===0&&empty.events?.length===0);
+    checkpoint('PROVISION_CALLBACK_INTENT',limits);
     await save('callback-dispatch',{phase:'DISPATCHING'},limits);
+    checkpoint('PROVISION_CALLBACK_PUT',limits);
     let callback=await read(base+'/callback',limits,{method:'PUT',body:{endpoint_url:'http://callback-receiver:8080/callback',enabled:true}});
+    checkpoint('PROVISION_CALLBACK_VALIDATE',limits);
     need(callback?.site_id===siteId&&callback.enabled===true&&callback.secret_version===1&&/^[A-Za-z0-9_-]{43}$/.test(callback.secret));
+    checkpoint('PROVISION_RECEIVER_CONFIGURE',limits);
     await read('/configure',limits,{method:'POST',target:'receiver',status:204,body:{secret:callback.secret,secret_version:1}});callback=null;
-    const messages=await read('/api/v1/messages',limits,{target:'mailpit'});need(messages.total===0&&messages.messages?.length===0);
-    provisioned=true;await save('fixture',{phase:'READY',accountId,siteId,productId,priceId},limits);return true;
+    checkpoint('PROVISION_MAILPIT_READ',limits);
+    const messages=await read('/api/v1/messages',limits,{target:'mailpit'});
+    checkpoint('PROVISION_MAILPIT_EMPTY',limits);
+    need(messages.total===0&&messages.messages?.length===0);
+    checkpoint('PROVISION_FIXTURE_READY',limits);
+    // Initial-payment fixtures already consume provisioning before writing READY.
+    if(!failed)provisioned=true;
+    await save('fixture',{phase:'READY',accountId,siteId,productId,priceId},limits);
+    if(failed){billingCheck(limits);need(!closed);failedRenewalCheckpoints.delete(fixture);provisioned=true;}
+    return true;
    }finally{busy=false;}
   },
   async withOtpCode(callback,limits){
@@ -133,4 +162,5 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
   async inspectCallbacks(limits){return read('/inspection/digests',limits,{target:'receiver'});},
   async close(){closed=true;cookie='';csrf='';createKey=undefined;confirmKey=undefined;return true;},
  });
+ return fixture;
 }

@@ -2,6 +2,7 @@ import test,{before,after} from 'node:test';
 import assert from 'node:assert/strict';
 import {opts,scope,initial,prepared,confirmed,confirmRequest,methods,routes,responses,id,F,E,G,iso} from './fixtures/failed-renewal-descriptors.mjs';
 import {data,inspect} from './fixtures/failed-renewal-evidence-rows.mjs';
+import {provisionHarness} from './fixtures/failed-renewal-provision-harness.mjs';
 import * as initialEvidence from './stripe-billing-first-payment-evidence.mjs';
 import * as owners from './stripe-billing-first-payment.mjs';
 import * as clients from './stripe-billing-first-payment-runtime.mjs';
@@ -35,6 +36,8 @@ const terminalLine=(checkpoint='PERSIST_FINAL_STORE',cleanup='CONFIRMED',witness
 const browserLine=(checkpoint='BROWSER_CARD_NUMBER',cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=BROWSER checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
 const commandCheckpoint='START_MAILPIT_COMMAND_NONZERO_EXIT';
 const startLine=(checkpoint=commandCheckpoint,cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=START checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
+const provisionLine=(checkpoint,cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=PROVISION checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
+const provisionCheckpoints=['PROVISION_CALLBACK_INTENT','PROVISION_CALLBACK_PUT','PROVISION_CALLBACK_VALIDATE','PROVISION_RECEIVER_CONFIGURE','PROVISION_MAILPIT_READ','PROVISION_MAILPIT_EMPTY','PROVISION_FIXTURE_READY','PROVISION_UNKNOWN'];
 const privateOrigin='https://evidence-only.stripe.com';
 function originalOriginError(runId=opts().runId,source=opts().expectedSource){
  const error=browserFailure('BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER');assert.equal(rememberBrowserProviderOrigin(error,runId,source,privateOrigin),true);return error;
@@ -319,6 +322,97 @@ test('START formatter and parser accept only closed stage-specific finite own da
  let reads=0;const hostile={...valid};Object.defineProperty(hostile,'diagnostic',{get(){reads++;return commandCheckpoint;}});
  assert.equal(owners.formatBillingFailedRenewalDiagnostic(hostile),null);assert.equal(owners.formatBillingFailedRenewalDiagnostic(Object.create(valid)),null);
  assert.equal(owners.parseBillingFailedRenewalDiagnosticLine({toString(){reads++;return startLine();}}),null);assert.equal(reads,0);
+});
+for(const refusal of ['throws','false'])test('PROVISION snapshots only fixture-owned evidence on '+refusal,async()=>{
+ const h=harness();let reads=0,provisions=0;
+ const hostile=new Proxy({},{get(){reads++;throw Error('private-callback-canary');}});
+ Object.defineProperty(h.fixture,'provisionDiagnostic',{get(){reads++;return 'PROVISION_CALLBACK_PUT';}});
+ h.fixture.provision=async()=>{provisions++;if(refusal==='throws')throw hostile;return false;};
+ h.fixture.close=async()=>{throw Error('private-cleanup-canary');};
+ const o=await owner(h);
+ await assert.rejects(o.run(h.journey,limits()),{message:'billing_PROVISION'});
+ const result=await o.close();
+ assert.equal(result.code,'PROVISION');assert.equal(result.diagnostic,'PROVISION_UNKNOWN');
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),provisionLine('PROVISION_UNKNOWN','UNCONFIRMED','FIXTURE_CLOSE'));
+ assert.equal(result.failedRenewalAccepted,false);assert.equal(result.full5bAccepted,false);
+ assert.equal(h.calls.includes('dispatch'),false);assert.equal(reads,0);
+ await assert.rejects(o.run(h.journey,limits()),/SINGLE_USE/);assert.equal(provisions,1);
+});
+test('PROVISION terminal protocol accepts only matching stage, scope, rejection and fixed checkpoint',()=>{
+ const valid={scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',status:'CLOSED',phase:'PROVISION',code:'PROVISION',diagnostic:'PROVISION_CALLBACK_PUT',initialAccepted:false,failedRenewalAccepted:false,full5bAccepted:false,cleanupConfirmed:true,cleanupFailure:null};
+ for(const diagnostic of provisionCheckpoints){
+  const line=provisionLine(diagnostic);
+  for(const code of ['PROVISION','ABORTED'])assert.equal(owners.formatBillingFailedRenewalDiagnostic({...valid,diagnostic,code}),line);
+  assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+  assert.equal(owners.formatBillingFirstPaymentDiagnostic({...valid,scope:'OWNED_INITIAL_PAYMENT',diagnostic}),null);
+  assert.equal(owners.parseBillingFirstPaymentDiagnosticLine('owned_initial_payment_diagnostic code='+diagnostic+' cleanup=CONFIRMED'),null);
+  assert.equal(owners.parseBillingFirstRenewalDiagnosticLine('owned_initial_and_first_renewal_diagnostic code='+diagnostic+' cleanup=CONFIRMED'),null);
+ }
+ for(const change of [{status:'RUNNING'},{scope:'OWNED_INITIAL_AND_FIRST_RENEWAL'},{phase:'START'},{code:'FIXTURE'},{diagnostic:'START_UNKNOWN'},{diagnostic:'PROVISION_CALLBACK_PUT_PRIVATE'},{initialAccepted:true},{failedRenewalAccepted:true},{full5bAccepted:true},{cleanupFailure:'FIXTURE_CLOSE'},{cleanupConfirmed:false}])assert.equal(owners.formatBillingFailedRenewalDiagnostic({...valid,...change}),null);
+ for(const line of [null,provisionLine('PERSIST_UNKNOWN'),startLine('PROVISION_CALLBACK_PUT'),browserLine('PROVISION_CALLBACK_PUT'),provisionLine('PROVISION_CALLBACK_PUT')+'\n',provisionLine('PROVISION_CALLBACK_PUT')+' private',provisionLine('PROVISION_'+'A'.repeat(250)),provisionLine('PROVISION_CALLBACK_VALIDATE','UNCONFIRMED','NONE')])assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),null);
+});
+for(const outcome of ['rejected','abort','deadline'])test('PROVISION records the active mock receiver request on '+outcome,async t=>{
+ if(outcome==='deadline')t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const h=harness(),controller=new AbortController(),entered=Promise.withResolvers(),release=Promise.withResolvers();
+ const {fixture,writes,requests}=await provisionHarness({onFetch:async(path,settings,response)=>{
+  if(path==='/configure'){entered.resolve();await release.promise;}
+  return response;
+ }});
+ h.dependencies.createFixture=async()=>fixture;
+ const o=await owner(h);
+ const code=outcome==='rejected'?'PROVISION':'ABORTED';
+ const run=assert.rejects(o.run(h.journey,{...limits(),signal:controller.signal}),{message:'billing_'+code});
+ await entered.promise;
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(o.resources()),null);
+ if(outcome==='deadline')t.mock.timers.tick(5000);
+ else if(outcome==='abort')controller.abort();
+ else release.reject(Error('private receiver canary'));
+ await run;
+ const result=await o.close(),line=provisionLine('PROVISION_RECEIVER_CONFIGURE');
+ assert.equal(result.phase,'PROVISION');assert.equal(result.code,code);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ release.resolve();await new Promise(r=>setImmediate(r));
+ assert.deepEqual(await o.close(),result);
+ assert.equal(writes.at(-1).name.endsWith('-callback-dispatch.json'),true);
+ assert.equal(requests.at(-1).path,'/configure');
+ assert.equal(requests.filter(r=>r.path.endsWith('/callback')).length,1);
+});
+test('PROVISION cannot report the checkpoint of a previously consumed genuine fixture',async()=>{
+ const h=harness(),{fixture,requests,writes}=await provisionHarness({onFetch(path,settings,response){
+  if(path==='/configure')throw Error('private receiver canary');
+  return response;
+ }});
+ await assert.rejects(fixture.provision(limits()));
+ assert.equal(requests.at(-1).path,'/configure');
+ const originalRequests=requests.length,originalWrites=writes.length;
+ h.dependencies.createFixture=async()=>fixture;
+ const o=await owner(h);
+ await assert.rejects(o.run(h.journey,limits()),{message:'billing_PROVISION'});
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(await o.close()),provisionLine('PROVISION_UNKNOWN'));
+ assert.equal(requests.length,originalRequests);assert.equal(writes.length,originalWrites);
+});
+for(const foreign of [{runId:id(77)},{expectedSource:'a'.repeat(40)}])test('PROVISION rejects a genuine checkpoint from a different '+Object.keys(foreign)[0],async()=>{
+ const h=harness(),{fixture,requests}=await provisionHarness({configuration:{...opts(),...foreign},onFetch(path,settings,response){
+  if(path==='/configure')throw Error('private receiver canary');
+  return response;
+ }});
+ h.dependencies.createFixture=async()=>fixture;
+ const o=await owner(h);
+ await assert.rejects(o.run(h.journey,limits()),{message:'billing_PROVISION'});
+ assert.equal(requests.at(-1).path,'/configure');
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(await o.close()),provisionLine('PROVISION_UNKNOWN'));
+});
+test('successful PROVISION leaves subsequent failures attributed to their own stage',async()=>{
+ const h=harness(),{fixture,writes}=await provisionHarness();
+ h.dependencies.createFixture=async()=>fixture;
+ h.journey.initial=async()=>{throw browserFailure('BROWSER_WAIT_READY');};
+ const o=await owner(h);
+ await assert.rejects(o.run(h.journey,limits()),{message:'billing_BROWSER'});
+ const result=await o.close();
+ assert.equal(writes.at(-1).name.endsWith('-fixture.json'),true);
+ assert.equal(result.phase,'BROWSER');assert.equal(result.diagnostic,'BROWSER_WAIT_READY');
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),browserLine('BROWSER_WAIT_READY'));
 });
 function useIndependentInitialProof(h){
  const callbacks=data().row.callbacks.slice(0,2);

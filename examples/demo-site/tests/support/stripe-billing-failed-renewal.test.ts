@@ -136,6 +136,21 @@ test('actual reporter emits a late START checkpoint with the independent cleanup
  assert.equal(output.split('\n').filter(v=>v===line).length,1);
  assert.match(output,/owned_failed_renewal_result_not_accepted full5b=NOT_ACCEPTED/);
 });
+test('actual reporter publishes the failed site preparation checkpoint only from the terminal annotation',async()=>{
+ const terminal='owned_failed_renewal_diagnostic stage=PROVISION checkpoint=PROVISION_RECEIVER_CONFIGURE cleanup=CONFIRMED witness=NONE';
+ const spoofed=terminal.replace('PROVISION_RECEIVER_CONFIGURE','PROVISION_CALLBACK_PUT');
+ const output=await captureReporter(reporter=>{
+  const testCase=reporterCase(),result=reporterResult({annotations:[]});
+  reporter.onTestBegin(testCase,result);
+  reporter.onStdOut(spoofed+'\ncallback-body-canary\n');
+  result.annotations=[{...terminalAnnotation,description:terminal}];
+  reporter.onTestEnd(testCase,result);
+  reporter.onEnd({status:'failed'} as FullResult);
+ });
+ assert.deepEqual(output.split('\n').filter(line=>line.startsWith('owned_failed_renewal_diagnostic')),[terminal]);
+ assert.doesNotMatch(output,/canary/);
+ assert.match(output,/owned_failed_renewal_result_not_accepted full5b=NOT_ACCEPTED/);
+});
 test('actual reporter retains the exact single-case success predicate',async()=>{
  for(const [testCase,result,full,accepted] of [
   [reporterCase(),reporterResult({status:'passed',annotations:[]}),{status:'passed'},true],

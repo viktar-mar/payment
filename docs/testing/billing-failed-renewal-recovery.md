@@ -22,6 +22,27 @@ The predecessor `b3ecc2dc00bf79a23877d84364dc67083fa526f0` passed all four hoste
 
 The private descriptor reports `recovery_acknowledged_at` in UTC at the microsecond precision persisted in the recovery confirmation row. The runtime retains the original nanosecond receipt. Only the independent recovered publication establishes payment.
 
+### Site preparation after callback dispatch — 2026-11-21
+
+In attempt `47d92eeb-7382-46dd-b8b7-156bcbf1b00d` at `707b4b2`, the €20 price publication was acknowledged and the callback receiver passed its empty-state check. The last saved receipt was `billing-014-callback-dispatch.json`, with phase `DISPATCHING`. There was no fixture-ready receipt or subscription CREATE receipt. The final report recorded one failed attempt without a preparation checkpoint.
+
+The dispatch receipt contains the intent to configure the site's callback. Its bytes can be present before the file and directory finish synchronizing. The failure could have occurred while finishing the dispatch receipt or at any subsequent step through writing the fixture-ready receipt. Whether the callback PUT reached the backend remains unknown. Time spent shutting down is included in the final timestamp.
+
+For a fresh failed-renewal run the terminal report can identify the pending operation at `stage=PROVISION`.
+
+| Checkpoint | Operation |
+| --- | --- |
+| `PROVISION_CALLBACK_INTENT` | Write and finish the callback dispatch receipt. |
+| `PROVISION_CALLBACK_PUT` | Send the callback configuration to the backend and read its response. |
+| `PROVISION_CALLBACK_VALIDATE` | Validate the returned site, enabled state, key version and signing secret. |
+| `PROVISION_RECEIVER_CONFIGURE` | Configure the isolated callback receiver. |
+| `PROVISION_MAILPIT_READ` | Read the message list from the test mailbox. |
+| `PROVISION_MAILPIT_EMPTY` | Verify that the returned mailbox list is empty. |
+| `PROVISION_FIXTURE_READY` | Write and finish the fixture-ready receipt. |
+| `PROVISION_UNKNOWN` | No trusted checkpoint was available for this preparation failure. |
+
+The owner holds the checkpoint in memory for the current provision call and emits it when it closes. An abrupt process exit can still leave only the durable receipts. The result of a remote write can remain uncertain. Cleanup has its own outcome and witness. Only fixed labels reach the report. A checkpoint grants no permission to retry a dispatch.
+
 ### Listener persistence failure and terminal reporting — 2026-11-15
 
 The historical attempt `17a34495-d4ae-4c89-b3a9-4d4505d6c8ae` at `a69815e` stopped before operational START, with its final `PERSIST_WEBHOOK` intent still `DISPATCHING`. All seven containers were previously observed nonrunning. Its persistence outcome remains **UNKNOWN**: the retained evidence does not establish the actual listener secret or the exact original refusal. The dedicated reporter did not publish owner terminal fields. This offline repair does not rewrite those receipts, acknowledge the old intent, release or adopt its historical shared writer, or rerun that attempt. Failed renewal, grace and recovered-cash acceptance remain unestablished; full Stage 5B remains **NOT_ACCEPTED**.
