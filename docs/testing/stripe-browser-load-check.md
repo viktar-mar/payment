@@ -6,7 +6,8 @@ The ordinary profile uses `mode: 'payment'`, amount `2000`, currency `eur` and
 card payment methods. In this profile, the page calls the installed pure loader's
 `setLoadParameters({advancedFraudSignals: false})` before its first load.
 This requests Stripe.js with optional advanced fraud signals disabled in this
-fresh, card-free document. The payment and recovery pages use the SDK defaults.
+fresh, card-free document. The dedicated failed-renewal Sandbox page uses the
+same setting. The production SDK uses Stripe's defaults.
 Apple Pay and Google Pay are disabled. The connected provider host is inert,
 unfocusable and ignores pointer events. There is no form, card entry, Pay button,
 submit, confirmation, customer, backend, billing owner or CLI operation.
@@ -205,9 +206,10 @@ One ordinary-profile Chrome check with document blocking enabled reported
 classified an eligible request, it would have waited for the local block
 event or timed out. The ordinary probe disabled advanced fraud signals,
 used deferred payment mode and destroyed its Element at the first `ready`.
-The subscription payment driver uses Stripe.js defaults, a client secret, an
-English locale, and disables Link as well as Apple Pay and Google Pay. It keeps
-the form mounted. The evidence cannot tell which difference affected emission
+In that historical attempt the subscription payment driver used the default
+Stripe.js settings, a client secret and an English locale. It kept the form
+mounted with Link, Apple Pay and Google Pay disabled. The evidence cannot
+tell which difference affected emission
 or whether the request arrived too late to classify before the probe retired.
 The historical payment checkpoint records the target's immediate Stripe.js
 parent only. The card-free check requires stable ownership of the whole frame

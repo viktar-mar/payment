@@ -32,7 +32,17 @@ function protectReturnRequests(server: ViteDevServer | PreviewServer): void {
 }
 
 export default defineConfig(({mode}):UserConfig=>({
-  resolve: mode==='stripe-browser-load-check'?{alias:{'@stripe/stripe-js/pure/index.js':createRequire(import.meta.resolve('@generic-payments/sdk')).resolve('@stripe/stripe-js/pure/index.js')}}:['form-diagnostic','manual-payment','billing-first-payment','billing-failed-renewal'].includes(mode)?{alias:{'@generic-payments/sdk':fileURLToPath(new URL('../../frontend/sdk/src/index.ts',import.meta.url))}}:undefined,
+  resolve: {
+    alias: {
+      ...(['form-diagnostic', 'manual-payment', 'billing-first-payment', 'billing-failed-renewal'].includes(mode) ? {
+        '@generic-payments/sdk': fileURLToPath(new URL('../../frontend/sdk/src/index.ts', import.meta.url)),
+      } : {}),
+      // Both the page configuration and the SDK mount must resolve the same pure loader.
+      ...(['stripe-browser-load-check', 'billing-failed-renewal'].includes(mode) ? {
+        '@stripe/stripe-js/pure/index.js': createRequire(import.meta.resolve('@generic-payments/sdk')).resolve('@stripe/stripe-js/pure/index.js'),
+      } : {}),
+    },
+  },
   plugins: [
     ...(['billing-first-payment','billing-failed-renewal'].includes(mode) ? [{
       name: 'owned-first-payment-health',

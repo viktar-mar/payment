@@ -22,6 +22,12 @@ The predecessor `b3ecc2dc00bf79a23877d84364dc67083fa526f0` passed all four hoste
 
 The private descriptor reports `recovery_acknowledged_at` in UTC at the microsecond precision persisted in the recovery confirmation row. The runtime retains the original nanosecond receipt. Only the independent recovered publication establishes payment.
 
+### Refusal before the first payment — 2026-11-21
+
+At `03e287f`, attempt `15be9c61-d048-4a2e-807f-bada63d4a35e` reached site readiness and CREATE_ACK. It stopped before a recorded CONFIRM dispatch with `BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK` and confirmed cleanup. An offline comparison matched its private origin exactly to the earlier card-free probe's refused origin. The ordinary probe subsequently reached `READY` with optional advanced fraud signals disabled. The saved origin identifies the destination only. The request's purpose and the outcome of using the same setting with a client secret remain unknown.
+
+The dedicated failed-renewal Sandbox page configures the Stripe.js pure loader with `advancedFraudSignals: false` before the SDK's first load. The initial payment and replacement method share that loader in the same document. Browser routing still refuses the observed origin and records a first failure under the existing policy if the request recurs. The production SDK uses Stripe's defaults.
+
 ### Site preparation after callback dispatch — 2026-11-21
 
 In attempt `47d92eeb-7382-46dd-b8b7-156bcbf1b00d` at `707b4b2`, the €20 price publication was acknowledged and the callback receiver passed its empty-state check. The last saved receipt was `billing-014-callback-dispatch.json`, with phase `DISPATCHING`. There was no fixture-ready receipt or subscription CREATE receipt. The final report recorded one failed attempt without a preparation checkpoint.
