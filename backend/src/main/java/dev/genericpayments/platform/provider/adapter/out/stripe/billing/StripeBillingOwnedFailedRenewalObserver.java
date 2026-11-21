@@ -37,7 +37,23 @@ public final class StripeBillingOwnedFailedRenewalObserver {
         this.nanos=Objects.requireNonNull(nanos);
     }
 
+    public enum Checkpoint {
+        CLAIM, AUTHORITY, CLOCK_BEFORE, GRAPH, CUSTOMER, SUBSCRIPTION, INVOICES, INITIAL_INVOICE, RENEWAL_INVOICE,
+        FAILED_ALLOCATION, FAILED_INTENT, FAILED_CHARGE, FAILED_REVERSE, CLOCK_AFTER, ACCEPTANCE, PUBLICATION
+    }
+
+    /** Per-invocation diagnostic for the isolated acceptance report. Contains no provider data. */
+    public static final class Diagnostic {
+        private Checkpoint checkpoint;
+        public Checkpoint checkpoint(){return checkpoint;}
+    }
+
     public Failure observe(Admission admission) {
+        return observe(admission,new Diagnostic());
+    }
+
+    public Failure observe(Admission admission, Diagnostic diagnostic) {
+        diagnostic.checkpoint=Checkpoint.CLAIM;
         long actualStart=System.nanoTime();
         var entry=now();
         long start=nanos.getAsLong();
@@ -56,18 +72,23 @@ public final class StripeBillingOwnedFailedRenewalObserver {
                     ||claim.startedAt().isBefore(entry)||claim.startedAt().isAfter(now()))throw new Drift();
             var budget=new Budget(start,actualStart,claim.deadlineAt());
             budget.remaining();
+            diagnostic.checkpoint=Checkpoint.AUTHORITY;
             context=inspect(admission,claim);
             budget.remaining();
             var client=clients.create(credentials.resolve(context.account()));
             budget.remaining();
-            reader=new Reads(admission,claim,context,budget);
+            reader=new Reads(admission,claim,context,budget,diagnostic);
             var reads=reader;
             var intent=admission.firstRenewalAdmission().receipt().intent();
+            diagnostic.checkpoint=Checkpoint.CLOCK_BEFORE;
             exactClock(reads.execute(()->client.v1().testHelpers().testClocks().retrieve(intent.clock().reference(),reads.options())),admission);
+            diagnostic.checkpoint=Checkpoint.GRAPH;
             var ownership=new StripeBillingSnapshotMapper.Ownership(context.account(),context.subscription(),context.binding(),
                 List.of(new StripeBillingSnapshotMapper.PublishedPrice(intent.terms(),intent.priceReference(),intent.productReference())));
             var mapped=StripeBillingSnapshotMapper.retrieveOwnedFailedRenewal(client,ownership,admission,now(),reads);
+            diagnostic.checkpoint=Checkpoint.CLOCK_AFTER;
             exactClock(reads.execute(()->client.v1().testHelpers().testClocks().retrieve(intent.clock().reference(),reads.options())),admission);
+            diagnostic.checkpoint=Checkpoint.ACCEPTANCE;
             reads.checkContext();
             budget.remaining();
             var accepted=now();
@@ -81,6 +102,7 @@ public final class StripeBillingOwnedFailedRenewalObserver {
             throw result;
         }
         // Return the actual persisted receipt. A delayed commit must never be retroactively rejected.
+        diagnostic.checkpoint=Checkpoint.PUBLICATION;
         try {return service.publishFailure(admission,claim,evidence,context);}
         catch(RuntimeException failure) {throw serviceFailure(failure);}
     }
@@ -117,16 +139,20 @@ public final class StripeBillingOwnedFailedRenewalObserver {
         private final ReadClaim claim;
         private final FailedReadContext context;
         private final Budget budget;
+        private final Diagnostic diagnostic;
         private int count;
         private boolean drift;
         private RequestOptions options;
-        Reads(Admission admission,ReadClaim claim,FailedReadContext context,Budget budget) {
-            this.admission=admission;this.claim=claim;this.context=context;this.budget=budget;
+        Reads(Admission admission,ReadClaim claim,FailedReadContext context,Budget budget,Diagnostic diagnostic) {
+            this.admission=admission;this.claim=claim;this.context=context;this.budget=budget;this.diagnostic=diagnostic;
+        }
+        @Override public void checkpoint(StripeBillingSnapshotMapper.RenewalCheckpoint checkpoint) {
+            diagnostic.checkpoint=Checkpoint.valueOf(checkpoint.name());
         }
         public RequestOptions options(){return options;}
         private void checkContext() {
             try {if(!context.equals(inspect(admission,claim)))throw new Drift();}
-            catch(Drift failure){drift=true;throw failure;}
+            catch(Drift failure){diagnostic.checkpoint=Checkpoint.AUTHORITY;drift=true;throw failure;}
         }
         public <T>T execute(StripeBillingSnapshotMapper.Call<T> call) {
             if(++count>100)throw safe();

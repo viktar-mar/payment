@@ -27,7 +27,9 @@ async function armed(reply){
  return {runtime,limits,sent,bootstrap};
 }
 
-for(const step of ['CLOCK_ADVANCE','ADMISSION','OBSERVATION','EVIDENCE'])test('failed renewal admits only its own server '+step+' refusal',async()=>{
+const observed=['CLAIM','AUTHORITY','CLOCK_BEFORE','GRAPH','CUSTOMER','SUBSCRIPTION','INVOICES','INITIAL_INVOICE','RENEWAL_INVOICE',
+ 'FAILED_ALLOCATION','FAILED_INTENT','FAILED_CHARGE','FAILED_REVERSE','CLOCK_AFTER','ACCEPTANCE','PUBLICATION'];
+for(const step of ['CLOCK_ADVANCE','ADMISSION','OBSERVATION','EVIDENCE',...observed.map(name=>'OBSERVATION_'+name)])test('failed renewal admits only its own server '+step+' refusal',async()=>{
  const {runtime,limits,sent}=await armed(()=>new Response(envelope(step),{status:400}));
  const code='FAILED_RENEWAL_SERVER_'+step;
  await assert.rejects(runtime.failedRenewal(limits),{message:'billing_RUNTIME'});
@@ -46,6 +48,8 @@ for(const [name,wire,status,code] of [
  ['suffix',envelope('ADMISSION')+'\n',400,'FAILED_RENEWAL_HTTP'],
  ['oversized', ' '.repeat(17000)+envelope('ADMISSION'),400,'FAILED_RENEWAL_HTTP'],
  ['foreign stage',envelope('private'),400,'FAILED_RENEWAL_HTTP'],
+ ['foreign observation step',envelope('OBSERVATION_PRIVATE'),400,'FAILED_RENEWAL_HTTP'],
+ ['escaped observation step',envelope('OBSERVATION_FAILED_INTENT').replace('INTENT','\\u0049NTENT'),400,'FAILED_RENEWAL_HTTP'],
  ['other route','{"code":"FAILED_RENEWAL_STOPPED","stage":"GRACE_AFTER"}',400,'FAILED_RENEWAL_HTTP'],
  ['unexpected HTTP status',envelope('OBSERVATION'),403,'FAILED_RENEWAL_HTTP'],
  ['failure body as success',envelope('OBSERVATION'),200,'FAILED_RENEWAL_RESPONSE'],

@@ -134,7 +134,10 @@ class OwnedBillingFailedRenewalRuntimeTest {
         }
     }
     @Test void failedRenewalRouteProjectsOnlyTheFixedSubstageOfItsOwnRefusal() throws Exception {
-        for(var step:List.of("CLOCK_ADVANCE","ADMISSION","OBSERVATION","EVIDENCE","private")){
+        for(var step:List.of("CLOCK_ADVANCE","ADMISSION","OBSERVATION","EVIDENCE","OBSERVATION_CLAIM","OBSERVATION_AUTHORITY",
+                "OBSERVATION_CLOCK_BEFORE","OBSERVATION_GRAPH","OBSERVATION_CUSTOMER","OBSERVATION_SUBSCRIPTION","OBSERVATION_INVOICES",
+                "OBSERVATION_INITIAL_INVOICE","OBSERVATION_RENEWAL_INVOICE","OBSERVATION_FAILED_ALLOCATION","OBSERVATION_FAILED_INTENT",
+                "OBSERVATION_FAILED_CHARGE","OBSERVATION_FAILED_REVERSE","OBSERVATION_CLOCK_AFTER","OBSERVATION_ACCEPTANCE","OBSERVATION_PUBLICATION","OBSERVATION_PRIVATE")){
             var fault=new IllegalStateException("private synthetic detail");
             var ops=new Inert(){
                 public JsonObject failedRenewal(){throw fault;}
@@ -143,24 +146,26 @@ class OwnedBillingFailedRenewalRuntimeTest {
             var exchange=request("POST","/failed-renewal/failed","{}");
             handler(ops).handle(exchange);
             assertThat(exchange.code).isEqualTo(400);
-            var expected=step.equals("private")?"UNCLASSIFIED":"FAILED_RENEWAL_"+step;
+            var expected=step.equals("OBSERVATION_PRIVATE")?"UNCLASSIFIED":"FAILED_RENEWAL_"+step;
             assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\""+expected+"\"}");
             assertThat(ops.aborts).hasValue(1);
         }
     }
 
     @Test void otherRouteAndMalformedFailureRequestCannotPublishDetailedSubstages() throws Exception {
-        for(var exchange:List.of(request("POST","/failed-renewal/grace-at","{}"),
-                request("POST","/failed-renewal/failed","{\"unexpected\":true}"))){
-            var ops=new Inert(){
-                public JsonObject graceAt(){throw new IllegalStateException("synthetic");}
-                public String failureStage(){return "FAILED_RENEWAL_ADMISSION";}
-                public String failureStage(Exception error){throw new AssertionError("No selected failed-renewal call");}
-            };
-            handler(ops).handle(exchange);
-            assertThat(exchange.code).isEqualTo(400);
-            assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}");
-            assertThat(ops.effects).isEmpty();
+        for(var stage:List.of("FAILED_RENEWAL_ADMISSION","FAILED_RENEWAL_OBSERVATION_FAILED_INTENT")){
+            for(var exchange:List.of(request("POST","/failed-renewal/grace-at","{}"),
+                    request("POST","/failed-renewal/failed","{\"unexpected\":true}"))){
+                var ops=new Inert(){
+                    public JsonObject graceAt(){throw new IllegalStateException("synthetic");}
+                    public String failureStage(){return stage;}
+                    public String failureStage(Exception error){throw new AssertionError("No selected failed-renewal call");}
+                };
+                handler(ops).handle(exchange);
+                assertThat(exchange.code).isEqualTo(400);
+                assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}");
+                assertThat(ops.effects).isEmpty();
+            }
         }
     }
 

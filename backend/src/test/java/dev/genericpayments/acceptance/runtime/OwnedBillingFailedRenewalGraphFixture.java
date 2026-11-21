@@ -110,7 +110,8 @@ final class DebtWire {
         renewalLine.getAsJsonObject("period").addProperty("start",end);renewalLine.getAsJsonObject("period").addProperty("end",next);
         graph.item().addProperty("current_period_start",end);graph.item().addProperty("current_period_end",next);graph.remote.addProperty("status",failed?"past_due":"active");
         renewalAllocation=graph.allocation.deepCopy();renewalAllocation.addProperty("id","inpay_renewal");renewalAllocation.addProperty("invoice","in_renewal");
-        renewalAllocation.addProperty("status","open");renewalAllocation.addProperty("is_default",true);renewalAllocation.addProperty("amount_paid",0);
+        renewalAllocation.addProperty("status","open");renewalAllocation.addProperty("is_default",true);
+        renewalAllocation.add("amount_paid",JsonNull.INSTANCE);
         renewalAllocation.getAsJsonObject("payment").addProperty("payment_intent","pi_renewal");renewalAllocation.getAsJsonObject("status_transitions").add("paid_at",JsonNull.INSTANCE);
         renewalPi=graph.pi.deepCopy();renewalPi.addProperty("id","pi_renewal");renewalPi.addProperty("status","requires_payment_method");renewalPi.addProperty("amount_received",0);renewalPi.addProperty("latest_charge","ch_renewal");
         renewalPi.add("last_payment_error",StripeBillingOwnedSubscriptionFixture.json("{\"type\":\"card_error\",\"code\":\"card_declined\",\"decline_code\":\"generic_decline\",\"charge\":\"ch_renewal\"}"));

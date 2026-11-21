@@ -570,7 +570,8 @@ test('cancellation as final recovery proof settles retains its verification chec
   assert.equal(result.failedRenewalAccepted,false);
  }
 });
-for(const [fault,checkpoint] of [['refused','FAILED_RENEWAL_HTTP'],['invalid reply','FAILED_RENEWAL_RESPONSE'],['abort in fetch','FAILED_RENEWAL_TRANSPORT'],['server stage','FAILED_RENEWAL_SERVER_OBSERVATION']])
+for(const [fault,checkpoint] of [['refused','FAILED_RENEWAL_HTTP'],['invalid reply','FAILED_RENEWAL_RESPONSE'],['abort in fetch','FAILED_RENEWAL_TRANSPORT'],
+ ['server stage','FAILED_RENEWAL_SERVER_OBSERVATION'],['observer substage','FAILED_RENEWAL_SERVER_OBSERVATION_FAILED_INTENT']])
 test('post-arm owner uses the real runtime checkpoint on '+fault,async()=>{
  const h=harness(),paths=[],abort=new AbortController();
  const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),initial(),...h.vs.slice(0,2)];
@@ -582,6 +583,7 @@ test('post-arm owner uses the real runtime checkpoint on '+fault,async()=>{
   if(path==='/failed-renewal/failed'){
    if(fault==='abort in fetch'){abort.abort();return new Promise(()=>{});}
    if(fault==='server stage')return new Response('{"code":"FAILED_RENEWAL_STOPPED","stage":"FAILED_RENEWAL_OBSERVATION"}',{status:400});
+   if(fault==='observer substage')return new Response('{"code":"FAILED_RENEWAL_STOPPED","stage":"FAILED_RENEWAL_OBSERVATION_FAILED_INTENT"}',{status:400});
    return new Response('private response canary',{status:fault==='refused'?503:200});
   }
   return new Response(JSON.stringify(replies.shift()));

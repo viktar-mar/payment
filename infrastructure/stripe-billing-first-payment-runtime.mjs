@@ -11,7 +11,9 @@ const ownDiagnostics=new WeakMap();
 const ownPrepareCheckpoints=new WeakMap();
 // The Java handler emits these exact ASCII envelopes for its owned /failed call.
 // Match bytes before parsing; duplicate keys, extra fields or an unrelated stage give no detail.
-const failedServerErrors=new Map(['CLOCK_ADVANCE','ADMISSION','OBSERVATION','EVIDENCE'].map(step=>[
+const observationSteps=['CLAIM','AUTHORITY','CLOCK_BEFORE','GRAPH','CUSTOMER','SUBSCRIPTION','INVOICES','INITIAL_INVOICE','RENEWAL_INVOICE',
+ 'FAILED_ALLOCATION','FAILED_INTENT','FAILED_CHARGE','FAILED_REVERSE','CLOCK_AFTER','ACCEPTANCE','PUBLICATION'];
+const failedServerErrors=new Map(['CLOCK_ADVANCE','ADMISSION','OBSERVATION','EVIDENCE',...observationSteps.map(name=>'OBSERVATION_'+name)].map(step=>[
  JSON.stringify({code:'FAILED_RENEWAL_STOPPED',stage:'FAILED_RENEWAL_'+step}), 'FAILED_RENEWAL_SERVER_'+step,
 ]));
 const failedErrorLimit=Math.max(...Array.from(failedServerErrors.keys(),value=>value.length));

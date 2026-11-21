@@ -33,6 +33,35 @@ class StripeBillingOwnedFailedRenewalObserverTest {
         "/v1/invoices/in_owned/lines","/v1/invoice_payments","/v1/payment_intents/pi_owned","/v1/charges/ch_owned",
         "/v1/invoice_payments","/v1/invoices/in_renewal/lines","/v1/invoice_payments","/v1/payment_intents/pi_renewal",
         "/v1/charges/ch_renewal","/v1/invoice_payments","/v1/test_helpers/test_clocks/clock_owned");
+    @ParameterizedTest
+    @ValueSource(strings={"CLAIM","AUTHORITY","CLOCK_BEFORE","CUSTOMER","SUBSCRIPTION","INVOICES","INITIAL_INVOICE",
+        "RENEWAL_INVOICE","FAILED_ALLOCATION","FAILED_INTENT","FAILED_CHARGE","FAILED_REVERSE","CLOCK_AFTER","ACCEPTANCE","PUBLICATION"})
+    void reportsOnlyTheStageOfTheFirstRefusal(String stage) {
+        var h=new Harness();h.graph();
+        switch(stage) {
+            case "CLAIM" -> h.claimTransform=c->{throw new IllegalStateException("PRIVATE claim");};
+            case "AUTHORITY" -> {h.inspectionAt=2;h.inspectionEffect=h::changeBinding;}
+            case "CLOCK_BEFORE","CLOCK_AFTER" -> h.replace(stage.equals("CLOCK_BEFORE")?0:14,j->j.addProperty("status","advancing"));
+            case "CUSTOMER" -> h.replace(1,j->j.addProperty("id","cus_foreign"));
+            case "SUBSCRIPTION" -> h.replace(2,j->j.addProperty("status","active"));
+            case "INVOICES" -> h.replace(3,j->j.getAsJsonArray("data").remove(1));
+            case "INITIAL_INVOICE" -> h.replace(6,j->j.addProperty("amount_received",0));
+            case "RENEWAL_INVOICE" -> h.replace(9,j->first(j).addProperty("quantity",2));
+            case "FAILED_ALLOCATION" -> h.replace(10,j->first(j).addProperty("is_default",false));
+            case "FAILED_INTENT" -> h.replace(11,j->j.addProperty("amount_received",1));
+            case "FAILED_CHARGE" -> h.replace(12,j->j.addProperty("paid",true));
+            case "FAILED_REVERSE" -> h.replace(13,j->first(j).addProperty("id","inpay_foreign"));
+            // The final local inspection follows the before/after inspections around all 15 GETs.
+            case "ACCEPTANCE" -> {h.inspectionAt=32;h.inspectionEffect=()->h.nanos=Duration.ofSeconds(30).toNanos();}
+            case "PUBLICATION" -> h.failReceipt=true;
+            default -> throw new AssertionError(stage);
+        }
+        var diagnostic=new StripeBillingOwnedFailedRenewalObserver.Diagnostic();
+        assertThat(diagnostic.checkpoint()).isNull();
+        assertSafe(catchThrowable(()->h.observer().observe(h.admission,diagnostic)));
+        assertThat(diagnostic.checkpoint()).isEqualTo(StripeBillingOwnedFailedRenewalObserver.Checkpoint.valueOf(stage));
+        assertThat(h.stops).isOne();assertThat(h.failure).isNull();assertPrefix(h);
+    }
     @Test void returnsPersistedDebtReceiptThroughFifteenCompleteGets() {
         var h=new Harness();h.graph();var result=h.observer().observe(h.admission);
         assertThat(result).isSameAs(h.failure);assertThat(h.f.local.debt().billingRecordId()).isEqualTo(result.billId());

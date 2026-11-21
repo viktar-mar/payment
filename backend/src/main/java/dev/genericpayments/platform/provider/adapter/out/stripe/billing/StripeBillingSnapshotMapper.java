@@ -417,7 +417,10 @@ public final class StripeBillingSnapshotMapper {
     }
     private static boolean exactRecoveryInvoice(SubscriptionProviderModels.Invoice invoice,BillingRecord bill){return invoice.reference().equals(bill.providerInvoiceReference())&&invoice.kind()==bill.kind()&&invoice.price().equals(bill.billedPrice())&&Objects.equals(invoice.previousPrice(),bill.previousPrice())&&invoice.period().equals(bill.period())&&invoice.amountDueMinor()==bill.amountDueMinor();}
     @FunctionalInterface interface Call<T>{T run() throws StripeException;}
-    enum RenewalCheckpoint { CUSTOMER,SUBSCRIPTION,INVOICES,INITIAL_INVOICE,RENEWAL_INVOICE }
+    enum RenewalCheckpoint {
+        CUSTOMER,SUBSCRIPTION,INVOICES,INITIAL_INVOICE,RENEWAL_INVOICE,
+        FAILED_ALLOCATION,FAILED_INTENT,FAILED_CHARGE,FAILED_REVERSE
+    }
     interface ReadExecutor {
         <T>T execute(Call<T> call);
         RequestOptions options();
@@ -585,12 +588,19 @@ public final class StripeBillingSnapshotMapper {
                 List.of(initial,next),null,methodReady,0,at,null,List.of(),null,null)),null);
         }
         private List<String> failedRenewal(com.stripe.model.Invoice invoice,Admission admission)throws StripeException {
+            checkpoint(RenewalCheckpoint.FAILED_ALLOCATION);
             var allocations=sourceAllocations.get(invoice.getId());require(allocations.size()==1);
             var allocation=allocations.getFirst();long due=invoice.getAmountDue();
+            // An open InvoicePayment can have an unfinalized amount_paid. The invoice, PI and Charge independently prove no cash.
+            var paid=allocation.getAmountPaid();
+            var transitions=allocation.getStatusTransitions();
+            boolean unfinalizedOrZero=paid==null?transitions!=null:paid==0L;
+            boolean closed=transitions!=null&&(transitions.getPaidAt()!=null||transitions.getCanceledAt()!=null);
             require(!admission.allocation().equals(allocation.getId())&&Boolean.TRUE.equals(allocation.getIsDefault())
-                &&"open".equals(allocation.getStatus())&&Objects.equals(due,allocation.getAmountRequested())&&zeros(allocation.getAmountPaid())
+                &&"open".equals(allocation.getStatus())&&Objects.equals(due,allocation.getAmountRequested())&&unfinalizedOrZero&&!closed
                 &&allocation.getPayment()!=null&&"payment_intent".equals(allocation.getPayment().getType()));
             var id=allocation.getPayment().getPaymentIntent();ref(id,"pi_");require(!id.equals(admission.paymentIntent()));
+            checkpoint(RenewalCheckpoint.FAILED_INTENT);
             var pi=get(()->client.v1().paymentIntents().retrieve(id,options()));
             require(id.equals(pi.getId())&&"payment_intent".equals(pi.getObject())&&Boolean.FALSE.equals(pi.getLivemode())
                 &&owner.customer().providerReference().equals(pi.getCustomer())&&invoice.getCurrency().equals(pi.getCurrency())
@@ -599,6 +609,7 @@ public final class StripeBillingSnapshotMapper {
             var error=pi.getLastPaymentError();require(error!=null&&"card_error".equals(error.getType())&&"card_declined".equals(error.getCode())
                 &&Set.of("generic_decline","insufficient_funds","do_not_honor").contains(error.getDeclineCode()));
             var chargeId=pi.getLatestCharge();ref(chargeId,"ch_");require(chargeId.equals(error.getCharge()));
+            checkpoint(RenewalCheckpoint.FAILED_CHARGE);
             var charge=get(()->client.v1().charges().retrieve(chargeId,options()));
             require(chargeId.equals(charge.getId())&&"charge".equals(charge.getObject())&&Boolean.FALSE.equals(charge.getLivemode())
                 &&owner.customer().providerReference().equals(charge.getCustomer())&&id.equals(charge.getPaymentIntent())&&invoice.getCurrency().equals(charge.getCurrency())
@@ -607,6 +618,7 @@ public final class StripeBillingSnapshotMapper {
                 &&charge.getPaymentMethodDetails()!=null&&"card".equals(charge.getPaymentMethodDetails().getType())&&charge.getPaymentMethodDetails().getCard()!=null
                 &&"card_declined".equals(charge.getFailureCode())&&charge.getOutcome()!=null&&"issuer_declined".equals(charge.getOutcome().getType())
                 &&error.getDeclineCode().equals(charge.getOutcome().getReason()));
+            checkpoint(RenewalCheckpoint.FAILED_REVERSE);
             var reverse=pages(after->client.v1().invoicePayments().list(InvoicePaymentListParams.builder().setPayment(InvoicePaymentListParams.Payment.builder()
                 .setType(InvoicePaymentListParams.Payment.Type.PAYMENT_INTENT).setPaymentIntent(id).build()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build(),options()));
             require(reverse.size()==1&&allocation.equals(reverse.getFirst()));

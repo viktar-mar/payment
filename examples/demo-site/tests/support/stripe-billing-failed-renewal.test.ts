@@ -155,9 +155,13 @@ test('actual reporter publishes a failed renewal checkpoint only from the matchi
  const prefix='owned_failed_renewal_diagnostic stage=FAILED_RENEWAL checkpoint=';
  const suffix=' cleanup=UNCONFIRMED witness=RUNTIME_CLOSE';
  const server=prefix+'FAILED_RENEWAL_SERVER_OBSERVATION'+suffix;
+ const observer=prefix+'FAILED_RENEWAL_SERVER_OBSERVATION_FAILED_ALLOCATION'+suffix;
  const request=prefix+'FAILED_RENEWAL_REQUEST'+suffix;
  for(const [description,expected] of [
   [server,[server]],
+  [observer,[observer]],
+  [observer.replace('stage=FAILED_RENEWAL','stage=GRACE_AT'),[]],
+  [observer.replace('FAILED_ALLOCATION','PRIVATE'),[]],
   [request,[request]],
   [server.replace('stage=FAILED_RENEWAL','stage=BROWSER'),[]],
   [server.replace('SERVER_OBSERVATION','SERVER_UNKNOWN_CANARY'),[]],

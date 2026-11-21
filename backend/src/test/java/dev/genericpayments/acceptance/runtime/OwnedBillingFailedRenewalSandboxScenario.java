@@ -3,6 +3,7 @@ package dev.genericpayments.acceptance.runtime;
 import com.google.gson.*;
 import dev.genericpayments.platform.catalog.domain.*;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalObserver;
 import dev.genericpayments.platform.provider.application.model.*;
 import dev.genericpayments.platform.provider.application.service.OwnedMethodBrowserService;
 import dev.genericpayments.platform.subscriptions.application.model.*;
@@ -87,7 +88,16 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
         failedRenewalStep="FAILED_RENEWAL_ADMISSION";
         management();failed=c.failures.admit(upstream,ready,pending.boundary());
         failedRenewalStep="FAILED_RENEWAL_OBSERVATION";
-        management();failure=c.failureObserver().observe(failed);
+        management();
+        var observer=c.failureObserver();
+        var diagnostic=new StripeBillingOwnedFailedRenewalObserver.Diagnostic();
+        try {
+            failure=observer.observe(failed,diagnostic);
+        } catch(RuntimeException refusal) {
+            var checkpoint=diagnostic.checkpoint();
+            if(checkpoint!=null)failedRenewalStep="FAILED_RENEWAL_OBSERVATION_"+checkpoint.name();
+            throw refusal;
+        }
         failedRenewalStep="FAILED_RENEWAL_EVIDENCE";
         var e=pending.boundary().period().start();require(ready.observation().frozenTime()==e.plusSeconds(3600).getEpochSecond()
             &&failure.graceDeadline().equals(e.plusSeconds(259200))&&failure.period().equals(pending.boundary().period())

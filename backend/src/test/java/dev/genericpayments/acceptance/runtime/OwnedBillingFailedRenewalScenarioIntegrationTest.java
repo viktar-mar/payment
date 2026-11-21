@@ -643,7 +643,7 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         queueAdvance(end,end+3600);after=end+3600;queuePaid();refreshObservationClock();
         var refused=catchThrowableOfType(IllegalStateException.class,combined()::failedRenewal);
         assertThat(refused).hasMessage("FAILED_RENEWAL_STOPPED");
-        assertThat(combined().failureStage(refused)).isEqualTo("FAILED_RENEWAL_OBSERVATION");
+        assertThat(combined().failureStage(refused)).isEqualTo("FAILED_RENEWAL_OBSERVATION_SUBSCRIPTION");
         assertThat(combined().failureStage(new IllegalStateException("synthetic"))).isEqualTo("FAILED_RENEWAL");
         assertThatThrownBy(combined()::graceLastSecond).hasMessage("FAILED_RENEWAL_STOPPED");
         assertThat(count("stripe_billing_failed_renewal_failures")).isZero();

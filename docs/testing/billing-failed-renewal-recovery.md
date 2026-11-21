@@ -6,6 +6,10 @@
 
 ### Last receipt before the failed renewal
 
+Attempt `ac22f018-7712-4454-b72f-9789268f6121` at `678ad81` verified the initial €20 payment, armed the decline and reached `FAILED_RENEWAL_SERVER_OBSERVATION` after clock advancement and admission. Cleanup was confirmed. This report did not identify the condition that stopped the observer. Grace and debt recovery remain unverified.
+
+The offline regression reproduced a refusal when the open invoice payment had an unfinalized `amount_paid`. The failed-renewal observer now handles that representation while still requiring the invoice's full outstanding balance, zero received on the intent, a linked declined charge with zero captured and refunded, and matching forward and reverse allocations. The previous run did not retain the provider's field value.
+
 On 2026-11-21, attempt `49b04998-2306-4ef1-ab84-74a4d299269d` at `1a761e5` ended with one failed run and no terminal checkpoint. The last receipt, `billing-022-decline-arm-ack.json`, contains `ACKNOWLEDGED`. Before writing it, the owner verified the initial €20 payment, its journal entry and signed callbacks, checked the renewal boundary and validated the response to the decline-method change.
 
 The next scheduled call was `failedRenewal`. It advances the test clock to finalization, admits the renewal, observes the failure and checks the returned invoice and grace deadline. If this route returned HTTP 400, the old client discarded the response before reading its stage. The old terminal report could not publish any of these steps. The ACK bytes can also be present before synchronization finishes, and the scenario writes no later fixture receipts. The retained evidence therefore cannot establish which operation failed, whether the server received the call, or whether the debt was created or recovered.
@@ -21,7 +25,7 @@ For a fresh run, the terminal report names the operation pending when the first 
 | `RECOVERY_CONFIRM`, `RECOVERY_OBSERVE`, `RECOVERY_EVIDENCE` | Confirming repayment, observing settlement, or independently verifying the recovery evidence. |
 | `CLEANUP` | The scenario reached its final checks and cleanup was the first unconfirmed operation. |
 
-Only an exact, recognized error response from the failed-renewal request yields `FAILED_RENEWAL_SERVER_CLOCK_ADVANCE`, `FAILED_RENEWAL_SERVER_ADMISSION`, `FAILED_RENEWAL_SERVER_OBSERVATION` or `FAILED_RENEWAL_SERVER_EVIDENCE`. A generic HTTP checkpoint leaves the server step unknown. A transport checkpoint leaves delivery uncertain. The report records cleanup separately and excludes response bodies, exception messages and payment identifiers. A terminal checkpoint does not establish the outcome of a charge or authorize another attempt.
+Only an exact, recognized error response from the failed-renewal request identifies a server checkpoint. The server distinguishes clock advancement, admission, observation and the final evidence check. During observation, a fixed suffix identifies the last step reached, from the local read claim through the provider reads to publication. For example, `FAILED_RENEWAL_SERVER_OBSERVATION_FAILED_ALLOCATION` identifies validation of the open renewal allocation. The unsuffixed `FAILED_RENEWAL_SERVER_OBSERVATION` remains valid when finer detail is unavailable. A generic HTTP checkpoint leaves the server step unknown. A transport checkpoint leaves delivery uncertain. The report records cleanup separately and excludes response bodies, exception messages and payment identifiers. Verifying a charge requires its own evidence.
 
 ### Earlier attempts
 

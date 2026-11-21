@@ -56,14 +56,65 @@ class StripeBillingFailedRenewalMappingTest {
         assertThat(calls).hasSizeLessThanOrEqualTo(READ_PATHS.size()).allSatisfy(request->assertThat(request.method().name()).isEqualTo("GET"));
         assertThat(calls.stream().map(request->request.url().getPath()).toList()).isEqualTo(READ_PATHS.subList(0,calls.size()));
     }
-    @Test void declineProducesDescriptiveOpenSnapshotAndOnlyGets(){
-        var f=paidLocal();var a=admission(f);var b=boundary(a,f);graph(f);var result=map(f,a,b);var snapshot=result.snapshot();
+    @ParameterizedTest @ValueSource(strings={"zero","zero-without-transitions","null","omitted"})
+    void declineProducesDescriptiveOpenSnapshotAndOnlyGets(String paidShape){
+        var f=paidLocal();var a=admission(f);var b=boundary(a,f);graph(f);
+        for(int index:List.of(9,12))replace(f,index,page->{
+            var allocation=first(page);
+            switch(paidShape){
+                case "zero"->allocation.addProperty("amount_paid",0);
+                case "zero-without-transitions"->{allocation.addProperty("amount_paid",0);allocation.remove("status_transitions");}
+                case "null"->allocation.add("amount_paid",JsonNull.INSTANCE);
+                case "omitted"->allocation.remove("amount_paid");
+                default->throw new AssertionError(paidShape);
+            }
+        });
+        var result=map(f,a,b);var snapshot=result.snapshot();
         assertThat(result.allocation()).isEqualTo("inpay_renewal");assertThat(result.paymentIntent()).isEqualTo("pi_renewal");
         assertThat(snapshot.status()).isEqualTo(Subscription.Status.PAST_DUE);assertThat(snapshot.period()).isEqualTo(b.period());
         assertThat(snapshot.invoices()).hasSize(2);assertThat(snapshot.invoices().getFirst().cashObjects().getFirst().reference()).isEqualTo("pi_owned");
         assertThat(snapshot.invoices().getLast().settlement()).isEqualTo(SettlementKind.OPEN);assertThat(snapshot.invoices().getLast().cashObjects()).isEmpty();
         assertThat(snapshot.paymentMethodReady()).isFalse();assertThat(snapshot.recoveryObservations()).isEmpty();assertThat(snapshot.operationKey()).isNull();assertThat(snapshot.operationObservation()).isNull();assertThat(snapshot.providerRevision()).isZero();
         assertThat(f.f.http.replies).isEmpty();assertThat(f.f.http.calls).hasSize(13);assertReadPrefix(f);
+    }
+    @ParameterizedTest @ValueSource(strings={"paid_at","canceled_at","missing-transitions","negative-paid","positive-paid"})
+    void contradictoryOrIncompleteOpenAllocationIsRefusedBeforeReadingTheIntent(String mutation){
+        var f=paidLocal();var a=admission(f);var b=boundary(a,f);graph(f);
+        for(int index:List.of(9,12))replace(f,index,page->{
+            var allocation=first(page);
+            switch(mutation){
+                case "paid_at","canceled_at"->allocation.getAsJsonObject("status_transitions").addProperty(mutation,1702678411);
+                case "missing-transitions"->{allocation.remove("status_transitions");allocation.add("amount_paid",JsonNull.INSTANCE);}
+                case "negative-paid"->allocation.addProperty("amount_paid",-1);
+                case "positive-paid"->allocation.addProperty("amount_paid",1);
+                default->throw new AssertionError(mutation);
+            }
+        });
+        assertMismatch(()->map(f,a,b));
+        assertThat(f.f.http.calls).hasSize(10);assertReadPrefix(f);
+    }
+    @ParameterizedTest @ValueSource(strings={"invoice-paid","invoice-remaining","intent-received","charge-captured","charge-refunded","reverse-amount"})
+    void unfinalizedAllocationStillRequiresIndependentUnpaidEvidence(String mutation){
+        var f=paidLocal();var a=admission(f);var b=boundary(a,f);graph(f);
+        for(int index:List.of(9,12))replace(f,index,page->first(page).add("amount_paid",JsonNull.INSTANCE));
+        switch(mutation){
+            case "invoice-paid"->replace(f,2,page->page.getAsJsonArray("data").get(1).getAsJsonObject().addProperty("amount_paid",1));
+            case "invoice-remaining"->replace(f,2,page->page.getAsJsonArray("data").get(1).getAsJsonObject().addProperty("amount_remaining",999));
+            case "intent-received"->replace(f,10,pi->pi.addProperty("amount_received",1));
+            case "charge-captured"->replace(f,11,ch->ch.addProperty("amount_captured",1));
+            case "charge-refunded"->replace(f,11,ch->ch.addProperty("amount_refunded",1));
+            case "reverse-amount"->replace(f,12,page->first(page).addProperty("amount_paid",0));
+            default->throw new AssertionError(mutation);
+        }
+        assertMismatch(()->map(f,a,b));
+        int expectedReads=switch(mutation){
+            case "invoice-paid","invoice-remaining"->10;
+            case "intent-received"->11;
+            case "charge-captured","charge-refunded"->12;
+            case "reverse-amount"->13;
+            default->throw new AssertionError(mutation);
+        };
+        assertThat(f.f.http.calls).hasSize(expectedReads);assertReadPrefix(f);
     }
     @Test void successEntryRefusesTheFailedGraph(){
         var f=paidLocal();var a=admission(f);var b=boundary(a,f);graph(f);
@@ -109,10 +160,10 @@ class StripeBillingFailedRenewalMappingTest {
         f.local=new Subscription(s.id(),s.siteId(),s.customerId(),s.productId(),account,s.billingPrice(),s.entitledPrice(),s.billingStatus(),s.providerReference(),s.currentPeriod(),s.paidThrough(),s.trial(),s.cancellation(),s.pendingChange(),s.debt(),s.terminalReason(),revision,s.createdAt(),s.updatedAt(),s.lastReconciledAt());
         graph(f);assertMismatch(()->map(f,a,b));assertThat(f.f.http.calls).isEmpty();assertReadPrefix(f);
     }
-    @ParameterizedTest @ValueSource(strings={"clock","customer","terms","third","credit","tax","period","initial-cash","split","canceled","not-default","unknown-paid","foreign-allocation","processing","action","succeeded","missing-error","error-code","error-charge","charge-paid","charge-captured","charge-amount","refund","refund-unknown","refunded","outcome","reverse","missing-default","requested","same-intent","charge-owner","charge-currency","charge-failure","unknown-received","error-type","error-missing-code","unknown-off-stripe","missing-card"})
+    @ParameterizedTest @ValueSource(strings={"clock","customer","terms","third","credit","tax","period","initial-cash","split","canceled","not-default","foreign-allocation","processing","action","succeeded","missing-error","error-code","error-charge","charge-paid","charge-captured","charge-amount","reverse-null-paid","refund","refund-unknown","refunded","outcome","reverse","missing-default","requested","same-intent","charge-owner","charge-currency","charge-failure","unknown-received","error-type","error-missing-code","unknown-off-stripe","missing-card"})
     void inconsistentGraphIsRefused(String mutation){
         var f=paidLocal();var a=admission(f);var b=boundary(a,f);graph(f);
-        int index=switch(mutation){case "clock","customer"->0;case "terms"->1;case "third","credit","tax","unknown-off-stripe"->2;case "period"->8;case "initial-cash"->5;case "split","canceled","not-default","unknown-paid","foreign-allocation","missing-default","requested","same-intent"->9;case "processing","action","succeeded","missing-error","error-code","error-charge","unknown-received","error-type","error-missing-code"->10;case "reverse"->12;default->11;};
+        int index=switch(mutation){case "clock","customer"->0;case "terms"->1;case "third","credit","tax","unknown-off-stripe"->2;case "period"->8;case "initial-cash"->5;case "split","canceled","not-default","foreign-allocation","missing-default","requested","same-intent"->9;case "processing","action","succeeded","missing-error","error-code","error-charge","unknown-received","error-type","error-missing-code"->10;case "reverse","reverse-null-paid"->12;default->11;};
         replace(f,index,j->{var x=first(j);switch(mutation){
             case "clock"->x.addProperty("test_clock","clock_other");case "customer"->x.addProperty("id","cus_other");
             case "terms"->x.getAsJsonObject("items").getAsJsonArray("data").get(0).getAsJsonObject().getAsJsonObject("price").addProperty("unit_amount",999);
@@ -121,7 +172,7 @@ class StripeBillingFailedRenewalMappingTest {
             case "tax"->j.getAsJsonArray("data").get(1).getAsJsonObject().add("total_taxes",JsonParser.parseString("[{\"amount\":5}]"));
             case "period"->x.getAsJsonObject("period").addProperty("start",1702678401);case "initial-cash"->x.addProperty("amount_received",0);
             case "split"->{var z=x.deepCopy();z.addProperty("id","inpay_split");j.getAsJsonArray("data").add(z);}
-            case "missing-default"->x.remove("is_default");case "requested"->x.addProperty("amount_requested",999);case "same-intent"->x.getAsJsonObject("payment").addProperty("payment_intent","pi_owned");case "canceled"->x.addProperty("status","canceled");case "not-default"->x.addProperty("is_default",false);case "unknown-paid"->x.add("amount_paid",JsonNull.INSTANCE);case "foreign-allocation"->x.addProperty("invoice","in_other");
+            case "missing-default"->x.remove("is_default");case "requested"->x.addProperty("amount_requested",999);case "same-intent"->x.getAsJsonObject("payment").addProperty("payment_intent","pi_owned");case "canceled"->x.addProperty("status","canceled");case "not-default"->x.addProperty("is_default",false);case "reverse-null-paid"->x.add("amount_paid",JsonNull.INSTANCE);case "foreign-allocation"->x.addProperty("invoice","in_other");
             case "processing"->x.addProperty("status","processing");case "action"->x.addProperty("status","requires_action");case "succeeded"->x.addProperty("status","succeeded");
             case "unknown-received"->x.remove("amount_received");case "error-type"->x.getAsJsonObject("last_payment_error").addProperty("type","api_error");case "error-missing-code"->x.getAsJsonObject("last_payment_error").remove("decline_code");case "missing-error"->x.remove("last_payment_error");case "error-code"->x.getAsJsonObject("last_payment_error").addProperty("decline_code","other");case "error-charge"->x.getAsJsonObject("last_payment_error").addProperty("charge","ch_other");
             case "missing-card"->x.getAsJsonObject("payment_method_details").remove("card");case "charge-owner"->x.addProperty("customer","cus_other");case "charge-currency"->x.addProperty("currency","usd");case "charge-failure"->x.addProperty("failure_code","other");case "refunded"->x.addProperty("refunded",true);case "charge-paid"->x.addProperty("paid",true);case "charge-captured"->x.addProperty("captured",true);case "charge-amount"->x.addProperty("amount",999);case "refund"->x.addProperty("amount_refunded",1);case "refund-unknown"->x.remove("amount_refunded");case "outcome"->x.getAsJsonObject("outcome").addProperty("reason","other");case "reverse"->x.addProperty("invoice","in_other");default->throw new AssertionError(mutation);

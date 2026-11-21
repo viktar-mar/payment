@@ -8,6 +8,7 @@ import com.stripe.net.StripeResponse;
 import com.sun.net.httpserver.*;
 import dev.genericpayments.platform.PaymentPlatformApplication;
 import dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedGraceBillingTime;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalObserver.Checkpoint;
 import dev.genericpayments.platform.support.*;
 import jakarta.persistence.EntityManagerFactory;
 import java.io.IOException;
@@ -53,8 +54,13 @@ public final class OwnedBillingFailedRenewalRuntime {
             "/failed-renewal/method/select","/failed-renewal/method/confirm","/failed-renewal/method/apply","/failed-renewal/recovery/confirm","/failed-renewal/recovery/observe");
         private static final Set<String> STAGES=Set.of("UNCLASSIFIED","INITIAL","BOUNDARY","DECLINE_ARM","FAILED_RENEWAL","GRACE_LAST_SECOND","GRACE_AT","GRACE_AFTER",
             "METHOD_PREPARE","METHOD_SELECT","METHOD_CONFIRM","METHOD_APPLY","RECOVERY_CONFIRM","RECOVERY_OBSERVE");
-        private static final Set<String> FAILED_SUBSTAGES=Set.of("FAILED_RENEWAL_CLOCK_ADVANCE","FAILED_RENEWAL_ADMISSION",
-            "FAILED_RENEWAL_OBSERVATION","FAILED_RENEWAL_EVIDENCE");
+        private static final Set<String> FAILED_SUBSTAGES=failedSubstages();
+        private static Set<String> failedSubstages(){
+            var stages=new HashSet<>(Set.of("FAILED_RENEWAL_CLOCK_ADVANCE","FAILED_RENEWAL_ADMISSION",
+                "FAILED_RENEWAL_OBSERVATION","FAILED_RENEWAL_EVIDENCE"));
+            for(var checkpoint:Checkpoint.values())stages.add("FAILED_RENEWAL_OBSERVATION_"+checkpoint.name());
+            return Set.copyOf(stages);
+        }
         private final OwnedBillingFailedRenewalOperations operations;private final byte[] authorization;
         private final OwnedBillingFirstPaymentRuntime.Handler initial;private boolean active,terminal;
         public Handler(OwnedBillingFailedRenewalOperations operations,String capability){this.operations=Objects.requireNonNull(operations);authorization=("Bearer "+capability).getBytes(StandardCharsets.US_ASCII);initial=new OwnedBillingFirstPaymentRuntime.Handler(operations,capability);}
