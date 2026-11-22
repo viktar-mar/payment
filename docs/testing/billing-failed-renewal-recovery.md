@@ -1,5 +1,20 @@
 # Failed renewal, fixed grace and recovery — offline guide
 
+### Docker readiness before the attempt
+
+If the local launcher stops at `DAEMON` with `attemptsStarted=0`, the payment scenario has not started. Older reports use `DAEMON_UNCONFIRMED` for the whole check. New failed-renewal preflight reports identify the point that stopped admission.
+
+| Code | What was observed |
+| --- | --- |
+| `DAEMON_SOCKET_UNCONFIRMED` | The local socket path, type or ownership could not be verified. |
+| `DAEMON_CONFIG_UNCONFIRMED` | The isolated CLI configuration directory or the absence of its config file could not be verified. |
+| `DAEMON_INFO_EXEC_FAILED` | The system reported an error launching the Docker CLI. |
+| `DAEMON_INFO_NONZERO_EXIT` | The CLI exited with a nonzero status. |
+| `DAEMON_INFO_TERMINATED` | The child process was terminated with SIGTERM. This alone cannot establish a timeout. |
+| `DAEMON_INFO_OUTPUT_LIMIT` | The command exceeded the existing output limit. |
+| `DAEMON_INFO_UNCONFIRMED` | The call failed without recognized process metadata. |
+| `DAEMON_OS_UNCONFIRMED` | The command returned, but its response did not prove the expected Linux engine. |
+
 ### Attended controls in an existing Chrome profile
 
 Run `node examples/demo-site/scripts/rehearse-profile-clicks.mjs` for the no-payment rehearsal. Open the printed local file in the intended Chrome profile. Click **Pay** and then **Confirm test method** in that same tab as each becomes available. The rehearsal forwards each click to the actual checkout page handlers with an in-memory provider. Its success marker is `Same checkout document: METHOD_CONFIRMED` followed by a successful exit.

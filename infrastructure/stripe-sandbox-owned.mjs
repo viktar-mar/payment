@@ -6,6 +6,7 @@ import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manua
 import {billingAcceptanceExcluded,billingAcceptanceOptIn,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {isProxy} from 'node:util/types';
 import {lstat,realpath} from 'node:fs/promises';
 import {createServer} from 'node:net';
 import {dirname,resolve} from 'node:path';
@@ -19,6 +20,23 @@ const CONFIG='/private/var/empty';
 const PORTS=['backend','demo','receiver','postgres','mailpitHttp','mailpitSmtp'];
 const executeFile=promisify(execFile);
 const pending=(phase,code)=>Object.freeze({status:'PENDING',phase,code});
+
+// Read native result data without invoking getters or proxy traps.
+function ownDataField(object, name) {
+  if (object === null || typeof object !== 'object' || isProxy(object)) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(object, name);
+  return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+}
+
+function daemonInfoFailure(error) {
+  const code = ownDataField(error, 'code');
+  if (code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return 'DAEMON_INFO_OUTPUT_LIMIT';
+  if (Number.isSafeInteger(code) && code !== 0) return 'DAEMON_INFO_NONZERO_EXIT';
+  if (['ENOENT','EACCES','ENOEXEC','EAGAIN'].includes(code)) return 'DAEMON_INFO_EXEC_FAILED';
+  if (ownDataField(error, 'killed') === true && ownDataField(error, 'signal') === 'SIGTERM') return 'DAEMON_INFO_TERMINATED';
+  return 'DAEMON_INFO_UNCONFIRMED';
+}
+
 // Nothing is inherited. Git status cannot refresh the index or invoke a configured fsmonitor.
 const CHILD_ENV=Object.freeze({PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C',
   GIT_OPTIONAL_LOCKS:'0',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_SYSTEM:'/dev/null'});
@@ -134,20 +152,28 @@ async function preflight(options,dependencies,diagnostic) {
     const status=await execute('/usr/bin/git',['-c','core.fsmonitor=false','status','--porcelain=v1','--untracked-files=no'],processOptions);
     if(status.stdout!=='')return pending(phase,code);
 
-    phase='DAEMON';code='DAEMON_UNCONFIRMED';
+    const reportDaemonStep = diagnostic === 'failed-renewal';
+    phase='DAEMON';code=reportDaemonStep?'DAEMON_SOCKET_UNCONFIRMED':'DAEMON_UNCONFIRMED';
     const inspect=dependencies.lstat??lstat,canonical=dependencies.realpath??realpath;
     const socket=await inspect(url.pathname);
     if(!socket.isSocket()||socket.isSymbolicLink()||socket.uid!==process.getuid()||await canonical(url.pathname)!==url.pathname)return pending(phase,code);
+    if(reportDaemonStep)code='DAEMON_CONFIG_UNCONFIRMED';
     const config=await inspect(CONFIG);
     if(!config.isDirectory()||config.isSymbolicLink()||config.uid!==0||!Number.isInteger(config.mode)||(config.mode&0o022)!==0||await canonical(CONFIG)!==CONFIG)return pending(phase,code);
     try {await inspect(CONFIG+'/config.json');return pending(phase,code);}
-    catch(error) {if(error?.code!=='ENOENT')return pending(phase,code);}
+    catch(error) {
+      const configError = reportDaemonStep ? ownDataField(error, 'code') : error?.code;
+      if(configError!=='ENOENT')return pending(phase,code);
+    }
+    if(reportDaemonStep)code='DAEMON_INFO_UNCONFIRMED';
     const docker=await execute(DOCKER,['--config',CONFIG,'--host',daemon,'info','--format','{{json .OSType}}'],processOptions);
-    if(docker.stdout!=='"linux"\n'&&docker.stdout!=='"linux"')return pending(phase,code);
+    if(reportDaemonStep)code='DAEMON_OS_UNCONFIRMED';
+    const os = reportDaemonStep ? ownDataField(docker, 'stdout') : docker.stdout;
+    if(os!=='"linux"\n'&&os!=='"linux"')return pending(phase,code);
 
     phase='PORTS';code='PORT_UNAVAILABLE';
     const available=dependencies.portAvailable??((port,host)=>portAvailable(port,host,dependencies));
     for(const port of selectedPorts)if(await available(port,'127.0.0.1')!==true)return pending(phase,code);
     return Object.freeze({status:'READY'});
-  }catch {return pending(phase,code);}
+  }catch(error) {return pending(phase,code==='DAEMON_INFO_UNCONFIRMED'?daemonInfoFailure(error):code);}
 }

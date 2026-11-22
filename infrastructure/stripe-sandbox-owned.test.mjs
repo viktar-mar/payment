@@ -19,6 +19,7 @@ import {EventEmitter} from 'node:events';
 import {fileURLToPath} from 'node:url';
 import {preflightOwnedSandbox,preflightOwnedFormDiagnostic} from './stripe-sandbox-owned.mjs';
 import * as owned from './stripe-sandbox-owned.mjs';
+import {opts as failedRenewalOptions} from './fixtures/failed-renewal-descriptors.mjs';
 
 const root=fileURLToPath(new URL('../',import.meta.url)).replace(/\/$/,'');
 const source='a'.repeat(40),daemon='unix:///tmp/owned-docker.sock';
@@ -53,6 +54,68 @@ function fixture({head=source+'\n',status='',docker='"linux"\n',metadata={},cano
 }
 function pending(phase,code) {return {status:'PENDING',phase,code};}
 function safe(result,want) {assert.deepEqual(result,want);assert.equal(Object.isFrozen(result),true);assert.equal(JSON.stringify(result).includes('PRIVATE_CANARY'),false);}
+
+// The native launcher stops on this result before opening ports or creating a run.
+for (const [name, code] of [
+  ['socket lookup', 'DAEMON_SOCKET_UNCONFIRMED'],
+  ['socket ownership', 'DAEMON_SOCKET_UNCONFIRMED'],
+  ['config directory', 'DAEMON_CONFIG_UNCONFIRMED'],
+  ['config present', 'DAEMON_CONFIG_UNCONFIRMED'],
+  ['config error accessor', 'DAEMON_CONFIG_UNCONFIRMED'],
+  ['config error proxy', 'DAEMON_CONFIG_UNCONFIRMED'],
+  ['command exit', 'DAEMON_INFO_NONZERO_EXIT'],
+  ['terminated command', 'DAEMON_INFO_TERMINATED'],
+  ['output limit', 'DAEMON_INFO_OUTPUT_LIMIT'],
+  ['missing executable', 'DAEMON_INFO_EXEC_FAILED'],
+  ['foreign rejection', 'DAEMON_INFO_UNCONFIRMED'],
+  ['error accessor', 'DAEMON_INFO_UNCONFIRMED'],
+  ['unexpected OS', 'DAEMON_OS_UNCONFIRMED'],
+  ['OS accessor', 'DAEMON_OS_UNCONFIRMED'],
+  ['OS proxy', 'DAEMON_OS_UNCONFIRMED'],
+  ['valid Linux reply', null],
+]) test('failed-renewal daemon admission: '+name, async () => {
+  const input = failedRenewalOptions();
+  const f = fixture({head:input.expectedSource, canonical:'/Users/test/docker.sock'});
+  const {execute, lstat} = f.dependencies;
+  let dockerCalls = 0, privateReads = 0;
+  const privateValue = () => { privateReads++; throw Error('PRIVATE_CANARY'); };
+  f.dependencies.lstat = async path => {
+    if (path === '/Users/test/docker.sock') {
+      if (name === 'socket lookup') throw Error('PRIVATE_CANARY');
+      if (name === 'socket ownership') return {...await lstat(path), uid:process.getuid()+1};
+    }
+    if (path === '/private/var/empty' && name === 'config directory') throw Error('PRIVATE_CANARY');
+    if (path === '/private/var/empty/config.json' && name === 'config present') return {};
+    if (path === '/private/var/empty/config.json' && name === 'config error accessor')
+      throw {get code(){privateReads++; return 'ENOENT';}};
+    if (path === '/private/var/empty/config.json' && name === 'config error proxy')
+      throw new Proxy({code:'ENOENT'}, {get:privateValue, getOwnPropertyDescriptor:privateValue});
+    return lstat(path);
+  };
+  f.dependencies.execute = async (file, args, settings) => {
+    if (file === '/usr/bin/git') return execute(file, args, settings);
+    dockerCalls++;
+    assert.deepEqual(args, ['--config','/private/var/empty','--host',input.daemon,'info','--format','{{json .OSType}}']);
+    const error = Error('PRIVATE_CANARY');
+    if (name === 'command exit') throw Object.assign(error, {code:1});
+    if (name === 'terminated command') throw Object.assign(error, {code:null, killed:true, signal:'SIGTERM'});
+    if (name === 'output limit') throw Object.assign(error, {code:'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', killed:true, signal:'SIGTERM'});
+    if (name === 'missing executable') throw Object.assign(error, {code:'ENOENT'});
+    if (name === 'foreign rejection') throw new Proxy(error, {get:privateValue, getOwnPropertyDescriptor:privateValue});
+    if (name === 'error accessor') throw Object.defineProperty(error, 'code', {get:privateValue});
+    if (name === 'OS accessor') return {get stdout(){privateReads++; return '"linux"';}};
+    if (name === 'OS proxy') return new Proxy({stdout:'"linux"'}, {
+      get(_target, key){return key === 'then' ? undefined : privateValue();},
+      getOwnPropertyDescriptor:privateValue,
+    });
+    return {stdout:name === 'unexpected OS' ? 'PRIVATE_CANARY' : '"linux"\n', get stderr(){return privateValue();}};
+  };
+  safe(await owned.preflightOwnedBillingFailedRenewal(input, f.dependencies),
+    code ? pending('DAEMON', code) : {status:'READY'});
+  assert.equal(privateReads, 0);
+  assert.equal(dockerCalls, name.startsWith('socket') || name.startsWith('config') ? 0 : 1);
+  assert.equal(f.calls.filter(call => call.type === 'port').length, code ? 0 : 7);
+});
 
 test('diagnostic preflight uses dedicated flags while full preflight refuses mixed modes',async()=>{
   const env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'},f=fixture();
