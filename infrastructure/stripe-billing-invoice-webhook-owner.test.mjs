@@ -56,6 +56,7 @@ for(const fault of ['none','uncertain customer','repeated create','foreign confi
    const result=await run;assert.equal(result.scope,'INITIAL_MISSED_REORDERED');assert.equal(result.invoiceWebhooksAccepted,true);
    assert.deepEqual(track,['arm','grant','bound','confirm','pair','baseline','admin','reconciled','deliver paid','proved paid','deliver finalized','proved finalized','finish']);
    assert.equal(h.writes.some(r=>JSON.stringify(r.value).includes(sentKey)),false);
+   revoke();assert.deepEqual(owner.resources(),result);
   }else{
    await assert.rejects(run);assert.equal(owner.resources().invoiceWebhooksAccepted,false);
    if(fault==='browser closure')assert.equal(owner.resources().cleanupConfirmed,false);

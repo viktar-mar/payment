@@ -1,4 +1,3 @@
-import {ownedInvoiceForwardTarget} from './stripe-billing-invoice-ingress.mjs';
 import {billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
 import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
 import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
@@ -77,16 +76,20 @@ export async function createBillingFailedRenewalCliAdapter(options,dependencies=
 export async function createBillingFirstRenewalCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,FIRST_RENEWAL);}
 export async function createBillingCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,BILLING);}
 async function createBillingModeCliAdapter(options,dependencies,purpose) {
-  let selected,configuration;
+  let selected,configuration,invoiceForwardTarget;
   try{
     const keys=['configuration','cliDirectory','verifyForwardTarget','persistWebhookSecret'];
     const hasIngress=Object.hasOwn(options,'invoiceIngress');
     selected=exactData(options,hasIngress?[...keys,'invoiceIngress']:keys);configuration=(purpose===FAILED_RENEWAL?validateBillingFailedRenewalOptions:purpose===FIRST_RENEWAL?validateBillingFirstRenewalOptions:purpose===FIRST_PAYMENT?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(selected.configuration);
     if(!configuration||hasIngress!==(purpose===BILLING&&configuration.selectedCase==='initial_missed_reordered'))fail();
-    if(hasIngress)ownedInvoiceForwardTarget(selected.invoiceIngress,configuration);
+    if(hasIngress){
+      const {ownedInvoiceForwardTarget}=await import('./stripe-billing-invoice-ingress.mjs');
+      invoiceForwardTarget=()=>ownedInvoiceForwardTarget(selected.invoiceIngress,configuration);
+      invoiceForwardTarget();
+    }
   }
   catch{throw fixed('OPT_IN_REQUIRED');}
-  return createCliAdapter({...configuration,invoiceIngress:selected.invoiceIngress,cliDirectory:selected.cliDirectory,backendPort:configuration.ports.backend,accountKey:'stripe-sandbox-default',verifyForwardTarget:selected.verifyForwardTarget,persistWebhookSecret:selected.persistWebhookSecret},dependencies,purpose);
+  return createCliAdapter({...configuration,invoiceIngress:selected.invoiceIngress,invoiceForwardTarget,cliDirectory:selected.cliDirectory,backendPort:configuration.ports.backend,accountKey:'stripe-sandbox-default',verifyForwardTarget:selected.verifyForwardTarget,persistWebhookSecret:selected.persistWebhookSecret},dependencies,purpose);
 }
 async function createCliAdapter(options,dependencies,purpose) {
   const failedRenewal=purpose===FAILED_RENEWAL,firstRenewal=purpose===FIRST_RENEWAL,firstPayment=purpose===FIRST_PAYMENT||firstRenewal||failedRenewal,billingMode=purpose===BILLING||firstPayment,remainderMode=purpose===REMAINDER,refundMode=purpose===REFUND||remainderMode;
@@ -245,7 +248,7 @@ async function createCliAdapter(options,dependencies,purpose) {
   }
   function listen(context) {
     const child=io.spawn('/usr/bin/sandbox-exec',[...args,'listen','--events',invoiceCase?'invoice.finalized,invoice.paid':billingMode?BILLING_EVENTS:EVENTS,'--events-from','@self','--forward-to',
-      invoiceCase?ownedInvoiceForwardTarget(options.invoiceIngress,options):'http://127.0.0.1:'+backendPort+'/api/v1/provider-webhooks/stripe/stripe-sandbox-default'],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe']});
+      invoiceCase?options.invoiceForwardTarget():'http://127.0.0.1:'+backendPort+'/api/v1/provider-webhooks/stripe/stripe-sandbox-default'],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe']});
     const pid=child.pid;
     if(!Number.isInteger(pid)||pid<=0) {uncertain=true;child.on('error',()=>{});fail();}
     let resolveReady,rejectReady,resolveExit;

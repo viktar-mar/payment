@@ -86,3 +86,17 @@ test('exact target includes the whole run topology and HTTP parser failures revo
  let destroyed=false;server.emit('clientError',Error('malformed'),{destroy(){destroyed=true;}});
  assert.equal(tainted,1);assert.equal(destroyed,true);assert.throws(()=>ownedInvoiceForwardTarget(h,config));await h.close();
 });
+for(const event of ['checkContinue','checkExpectation','connect','upgrade']){
+ test('unexpected HTTP server event revokes the current receiver: '+event,async()=>{
+  const server=Object.assign(new EventEmitter(),{listening:false,address:()=>({address:'127.0.0.1',port:25555}),
+   listen(_port,_host,cb){this.listening=true;cb();},close(cb){this.listening=false;cb();},closeAllConnections(){}});
+  let revoked=false,closed=false;
+  const receiver=createOwnedInvoiceIngress(config,{}, {createServer:()=>server,onFailure:()=>{revoked=true;}});
+  await receiver.open(limits());
+  server.emit(event,{}, {destroy(){closed=true;}});
+  assert.equal(revoked,true);
+  assert.equal(closed,true);
+  assert.throws(()=>ownedInvoiceForwardTarget(receiver,config));
+  await receiver.close();
+ });
+}

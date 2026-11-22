@@ -194,6 +194,7 @@ test('inert imports neither read private credentials nor launch any subprocess o
     await assert.rejects(import('./infrastructure/stripe-billing-acceptance-options.test.mjs'),/private boundary touched/);
     await assert.rejects(import('./infrastructure/stripe-billing-first-payment.test.mjs'),/private boundary touched/);
     await assert.rejects(import('./infrastructure/stripe-billing-failed-renewal-response.mjs'),/private boundary touched/);
+    await assert.rejects(import('./infrastructure/stripe-billing-invoice-ingress.mjs'),/private boundary touched/);
   `;
   const result=spawnSync(process.execPath,['--input-type=module','-e',script],{cwd:new URL('..',import.meta.url),env:{PATH:'/usr/bin:/bin',LANG:'C',LC_ALL:'C',NO_COLOR:'1'},encoding:'utf8'});assert.equal(result.status,0,result.stderr);assert.equal(result.stdout,'');
 });
