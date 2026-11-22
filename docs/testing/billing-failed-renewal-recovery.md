@@ -1,5 +1,11 @@
 # Failed renewal, fixed grace and recovery — offline guide
 
+### Attended controls in an existing Chrome profile
+
+Run `node examples/demo-site/scripts/rehearse-profile-clicks.mjs` for the no-payment rehearsal. Open the printed local file in the intended Chrome profile. Click **Pay** and then **Confirm test method** in that same tab as each becomes available. The rehearsal forwards each click to the actual checkout page handlers with an in-memory provider. Its success marker is `Same checkout document: METHOD_CONFIRMED` followed by a successful exit.
+
+For an authorized native run, set `PAYMENT_STRIPE_PROFILE_OPERATOR=1` in the dedicated worker environment. Open `<Playwright output directory>/<current run UUID>/operator.html` in the intended profile. The tab accepts the two actions in order and the isolated Chrome instance handles the test card in the background. The operator tab receives only the current button state. Each page claim is single-use. Refreshing the operator tab loses the claim. The terminal runner report records the payment, recovery and cleanup outcome.
+
 ## Fresh EUR20 failed renewal and recovery — 2026-11-15
 
 **HOSTED VERIFIED; native attempts NOT_ACCEPTED. Native evidence confirms the first €20 payment, failed renewal and all three grace checks. Replacement-method confirmation and recovery remain unverified. Full Stage 5B is NOT_ACCEPTED.** The case is `initial_failed_renewal_grace_recovery` under `OWNED_FAILED_RENEWAL_GRACE_RECOVERY`. Runtime source `997252a6e6b07f611914a543daf442492f948706` passed all four jobs of [Offline CI 43771017914](https://github.com/viktar-mar/payment/actions/runs/43771017914), including the dedicated failed-renewal backend, browser support and all three no-launch packaging checks. The hosted composition uses PostgreSQL, the actual OTP and billing services, signed callback delivery and in-memory replies to official SDK requests. These synthetic provider replies do not establish native interoperability or acceptance. Local targeted checks passed 1,144 cases and strict TypeScript; independent review passed. [Scenario design](../superpowers/specs/2026-11-15-failed-renewal-sandbox-scenario-design.md)

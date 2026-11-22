@@ -1,4 +1,6 @@
 import {test} from '@playwright/test';
+import {join} from 'node:path';
+import {openProfileOperator,writeProfileHandoff} from '../scripts/profile-operator.mjs';
 import {createOwnedBillingFailedRenewal,formatBillingFailedRenewalDiagnostic} from '../../../infrastructure/stripe-billing-first-payment.mjs';
 import {snapshotBillingFailedRenewalEnvironment} from '../../../infrastructure/stripe-billing-failed-renewal-options.mjs';
 import {runFailedRenewalBrowser} from './support/stripe-billing-failed-renewal';
@@ -22,14 +24,25 @@ test.beforeAll(async({},info)=>{
 });
 test('OWNED_FAILED_RENEWAL_GRACE_RECOVERY',async({browser},info)=>{
   const controller=new AbortController();
+  let operator:Awaited<ReturnType<typeof openProfileOperator>>|undefined;
   try{
-    const result=await owner.run(runFailedRenewalBrowser(browser,controller,loadFailedRenewalStaticOriginMatcher()),{deadline:Date.now()+2700000,signal:controller.signal});
+    if(process.env.PAYMENT_STRIPE_PROFILE_OPERATOR==='1'){
+      const runId=process.env.PAYMENT_STRIPE_SANDBOX_RUN_ID;
+      if(!runId || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(runId))throw Error('Invalid profile run');
+      operator=await openProfileOperator({rehearsal:false,onAbandon:()=>controller.abort()});
+      await writeProfileHandoff(join(info.project.outputDir,runId,'operator.html'),operator);
+    }
+    const journey=operator?runFailedRenewalBrowser(browser,controller,loadFailedRenewalStaticOriginMatcher(),operator.wait):
+      runFailedRenewalBrowser(browser,controller,loadFailedRenewalStaticOriginMatcher());
+    const result=await owner.run(journey,{deadline:Date.now()+2700000,signal:controller.signal});
     if(result.scope!=='OWNED_FAILED_RENEWAL_GRACE_RECOVERY' || !result.initialAccepted || !result.failedRenewalAccepted ||
         !result.cleanupConfirmed || result.full5bAccepted!==false)throw Error('failed_renewal_NOT_ACCEPTED');
   }finally{
     controller.abort();
-    const terminal=await owner.close();
-    const diagnostic=formatBillingFailedRenewalDiagnostic(terminal);
-    if(diagnostic)info.annotations.push({type:'owned-failed-renewal-terminal',description:diagnostic});
+    try{
+      const terminal=await owner.close();
+      const diagnostic=formatBillingFailedRenewalDiagnostic(terminal);
+      if(diagnostic)info.annotations.push({type:'owned-failed-renewal-terminal',description:diagnostic});
+    }finally{await operator?.close();}
   }
 });

@@ -1,4 +1,7 @@
 import type {Browser,BrowserContext,Frame,Page,Request,Route} from '@playwright/test';
+import type {WaitForProfileClick} from './profile-button';
+// @ts-ignore Explicit source for the Node TS runner.
+import {forwardProfileClick} from './profile-button.ts';
 import type {BillingBinding,BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {BillingFailedRenewalJourney,BillingFailedRenewalMethodPort,BillingFirstPaymentPort,FailedMethodSession,FirstPaymentPrepared} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
@@ -127,7 +130,7 @@ async function fetchStaticAsset(url:URL,media:string[],origin:string|undefined,s
   } finally {controller.abort();}
 }
 /** A single owned page. Neither phase accepts a target from the page or chooses a provider operation. */
-export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAbort:AbortController,matchesStaticOrigin?:(origin:string)=>boolean):BillingFailedRenewalJourney {
+export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAbort:AbortController,matchesStaticOrigin?:(origin:string)=>boolean,waitForClick?:WaitForProfileClick):BillingFailedRenewalJourney {
   need(runAbort instanceof AbortController && !runAbort.signal.aborted);
   let state:'NEW'|'INITIAL'|'HELD'|'METHOD'|'DONE'|'CLOSED'='NEW';
   let opening:Promise<BrowserContext>|undefined, closing:Promise<void>|undefined;
@@ -225,7 +228,18 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       if(!(b instanceof HTMLButtonElement)||!b.disabled||document.body.dataset.phase!==phase)return false;
       b.disabled=false;return true;
     },ready)));
-    await at('BROWSER_MANUAL_PAY_WAIT',()=>waitPhase(which==='initial'?'OBSERVE':'METHOD_CONFIRMED',true));
+    await at('BROWSER_MANUAL_PAY_WAIT',async()=>{
+      if(waitForClick){
+        const scope=scoped(),deadline=Math.min(scope.deadline,Date.now()+180000);
+        await forwardProfileClick(button,which,{deadline,signal:scope.signal},waitForClick,()=>{
+          assertPage();need(manualArmed&&step==='CONFIRM'&&!pendingInitialNavigations.size);
+        });
+        const target=which==='initial'?'OBSERVE':'METHOD_CONFIRMED';
+        const timeout=deadline-Date.now();need(timeout>0);
+        await page!.waitForFunction(value=>[value,'STOPPED'].includes(document.body.dataset.phase??''),target,{timeout});
+        assertPage();need(await page!.locator('body').getAttribute('data-phase')===target);
+      }else await waitPhase(which==='initial'?'OBSERVE':'METHOD_CONFIRMED',true);
+    });
     need((step as string)==='ACK' && finalDelivery);
     await finalDelivery;assertPage();
     finalDelivery=undefined;

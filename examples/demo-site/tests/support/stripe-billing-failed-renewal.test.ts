@@ -208,7 +208,7 @@ test('actual reporter retains the exact single-case success predicate',async()=>
 test('dedicated spec attaches trusted terminal only after finally closes the actual owner',async()=>{
  const entry=await read('../stripe-billing-failed-renewal.spec.ts');
  assert.match(entry,/async\(\{browser\},info\)=>/);
- assert.match(entry,/finally\s*\{\s*controller\.abort\(\);\s*const terminal=await owner\.close\(\);\s*const diagnostic=formatBillingFailedRenewalDiagnostic\(terminal\);\s*if\(diagnostic\)info\.annotations\.push\(\{type:'owned-failed-renewal-terminal',description:diagnostic\}\);\s*\}/);
+ assert.match(entry,/finally\s*\{\s*controller\.abort\(\);\s*try\s*\{\s*const terminal=await owner\.close\(\);\s*const diagnostic=formatBillingFailedRenewalDiagnostic\(terminal\);\s*if\(diagnostic\)info\.annotations\.push\(\{type:'owned-failed-renewal-terminal',description:diagnostic\}\);\s*\}\s*finally\s*\{\s*await operator\?\.close\(\);\s*\}/);
 });
 
 class Control {

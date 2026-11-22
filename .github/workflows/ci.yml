@@ -219,7 +219,7 @@ jobs:
       - name: Install offline browser
         run: pnpm --dir examples/demo-site exec playwright install --with-deps chromium
       - name: Verify synthetic native Node support fixtures
-        run: node --test --test-timeout=60000 --test-concurrency=1 examples/demo-site/tests/support/*.test.ts
+        run: node --test --test-timeout=60000 --test-concurrency=1 examples/demo-site/tests/support/*.test.ts examples/demo-site/scripts/profile*.test.mjs
       - name: Verify built offline return privacy with Chromium
         run: pnpm --dir examples/demo-site exec playwright test --config playwright.offline.config.ts --workers=1 --retries=0
       - name: Verify default Fake browser journeys in a fresh owned environment
