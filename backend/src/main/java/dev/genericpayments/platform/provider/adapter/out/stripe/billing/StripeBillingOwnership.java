@@ -253,16 +253,20 @@ public final class StripeBillingOwnership {
         if(original&&(r.getMetadata()==null||!r.getMetadata().entrySet().containsAll(metadata(a,s,o).entrySet())||!inWindow(r.getCreated(),step)))throw mismatch();
     }
     /** Common native shape; each caller separately establishes its own time and clock lineage. */
-    private static void requireRemoteStructure(com.stripe.model.Subscription r,String customer,StripeBillingSnapshotMapper.PublishedPrice p){
+    static void requireRemoteStructure(com.stripe.model.Subscription r,String customer,StripeBillingSnapshotMapper.PublishedPrice p){
         if(r==null||r.getId()==null||!r.getId().matches("sub_[A-Za-z0-9]{1,251}")||!"subscription".equals(r.getObject())||!Boolean.FALSE.equals(r.getLivemode())
             ||!customer.equals(r.getCustomer())||!p.terms().regularAmount().currency().equalsIgnoreCase(r.getCurrency())
             ||!"charge_automatically".equals(r.getCollectionMethod())||r.getBillingMode()==null||!"classic".equals(r.getBillingMode().getType())
             ||r.getPauseCollection()!=null||r.getPaymentSettings()==null
             ||!List.of("card").equals(r.getPaymentSettings().getPaymentMethodTypes())||!"on_subscription".equals(r.getPaymentSettings().getSaveDefaultPaymentMethod())
             ||r.getItems()==null||!Boolean.FALSE.equals(r.getItems().getHasMore())||r.getItems().getData()==null||r.getItems().getData().size()!=1)throw mismatch();
-        var item=r.getItems().getData().getFirst();var price=item.getPrice();var t=p.terms();
-        if(item.getId()==null||!item.getId().matches("si_[A-Za-z0-9]{1,252}")||!"subscription_item".equals(item.getObject())||!r.getId().equals(item.getSubscription())||!Objects.equals(1L,item.getQuantity())||Boolean.TRUE.equals(item.getDeleted())
-            ||price==null||!"price".equals(price.getObject())||!"recurring".equals(price.getType())||!p.providerPriceReference().equals(price.getId())||!p.providerProductReference().equals(price.getProduct())||!Boolean.FALSE.equals(price.getLivemode())
+        var item=r.getItems().getData().getFirst();
+        if(item.getId()==null||!item.getId().matches("si_[A-Za-z0-9]{1,252}")||!"subscription_item".equals(item.getObject())||!r.getId().equals(item.getSubscription())||!Objects.equals(1L,item.getQuantity())||Boolean.TRUE.equals(item.getDeleted()))throw mismatch();
+        requirePublishedPrice(item.getPrice(),p);
+    }
+    static void requirePublishedPrice(com.stripe.model.Price price,StripeBillingSnapshotMapper.PublishedPrice p){
+        var t=p.terms();
+        if(price==null||!"price".equals(price.getObject())||!"recurring".equals(price.getType())||!p.providerPriceReference().equals(price.getId())||!p.providerProductReference().equals(price.getProduct())||!Boolean.FALSE.equals(price.getLivemode())
             ||!Objects.equals(t.regularAmount().minorUnits(),price.getUnitAmount())||!t.regularAmount().currency().equalsIgnoreCase(price.getCurrency())||!"inclusive".equals(price.getTaxBehavior())
             ||price.getRecurring()==null||!t.interval().name().equalsIgnoreCase(price.getRecurring().getInterval())||!Objects.equals(1L,price.getRecurring().getIntervalCount())
             ||!"licensed".equals(price.getRecurring().getUsageType())||price.getMetadata()==null||!t.priceId().value().toString().equals(price.getMetadata().get("local_price_id"))
