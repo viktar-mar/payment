@@ -1,5 +1,5 @@
-// Exercise the deployed entry entirely in Node. Only the SDK's local wire
-// responses are supplied. Inserting a script records its URL without loading it.
+// Execute the deployed entry, SDK and loader in Node with in-memory HTTP
+// responses and a synthetic provider. The inserted script never leaves the fixture.
 import assert from 'node:assert/strict';
 import {mkdtemp, readFile, readdir, rm, stat} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -8,32 +8,51 @@ import test from 'node:test';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {build} from 'vite';
 
-async function checkFirstCardLoad(entry: string) {
-  const expiresAt = new Date(Date.now() + 60_000).toISOString();
+async function checkCardForms(entry: string) {
+  const sessionExpiry = new Date(Date.now() + 300_000).toISOString();
+  const paymentExpiry = new Date(Date.now() + 60_000).toISOString();
+  const methodExpiry = new Date(Date.now() + 180_000).toISOString();
   const backend = 'http://127.0.0.1:3001';
   const challengeId = crypto.randomUUID(), subscriptionId = crypto.randomUUID(), operationId = crypto.randomUUID();
   const challenges = backend + '/api/v1/public/customer-auth/email-otp/challenges';
-  const operation = backend + '/api/v1/customer/subscriptions/' + subscriptionId + '/operations/' + operationId;
+  const base = backend + '/api/v1/customer/subscriptions/' + subscriptionId + '/operations/';
+  const attemptId = crypto.randomUUID(), replacementId = crypto.randomUUID();
+  const operation = base + operationId, replacement = base + replacementId;
+  const actionToken = 'bga1_' + 'M'.repeat(43);
   const replies = new Map<string, Response>([
-    [challenges, Response.json({challenge_id: challengeId, expires_at: expiresAt}, {status: 202})],
+    [challenges, Response.json({challenge_id: challengeId, expires_at: paymentExpiry}, {status: 202})],
     [challenges + '/' + challengeId + '/verify', Response.json({
-      session_token: 'T'.repeat(43), expires_at: expiresAt, site_id: crypto.randomUUID(),
+      session_token: 'T'.repeat(43), expires_at: sessionExpiry, site_id: crypto.randomUUID(),
       scopes: ['SUBSCRIPTION_READ', 'SUBSCRIPTION_MANAGE'],
       customer: {id: crypto.randomUUID(), status: 'ACTIVE', masked_email: null},
     })],
-    [operation + '/action', Response.json({kind: 'PROVIDER_CLIENT', secret: 'bga1_' + 'A'.repeat(43), expires_at: expiresAt})],
+    [operation + '/action', Response.json({kind: 'PROVIDER_CLIENT', secret: 'bga1_' + 'A'.repeat(43), expires_at: paymentExpiry})],
     [operation + '/confirmation-session', Response.json({
       protocol: 'SERVER_CONFIRM_V2', provider: 'stripe', flow: 'PAYMENT', publishable_key: 'pk_test_fixture',
-      client_secret: 'pi_fixture_secret_fixture', attempt_id: crypto.randomUUID(), capability: 'bca2_' + 'B'.repeat(43), expires_at: expiresAt,
+      client_secret: 'pi_fixture_secret_fixture', attempt_id: attemptId, capability: 'bca2_' + 'B'.repeat(43), expires_at: paymentExpiry,
     })],
+    [operation + '/confirmation-attempts/' + attemptId + '/confirm', Response.json({
+      protocol: 'SERVER_CONFIRM_V2', attempt_id: attemptId, state: 'OBSERVE', retry_allowed: false,
+      successor_attempt_id: null, next_action_allowed: false, expires_at: paymentExpiry,
+    })],
+    [replacement + '/action', Response.json({kind: 'PROVIDER_CLIENT', secret: actionToken, expires_at: methodExpiry})],
+    [replacement + '/confirmation-session', Response.json({
+      protocol: 'BROWSER_CONFIRM_V1', flow: 'SETUP', provider: 'stripe', publishable_key: 'pk_test_fixture',
+      client_secret: 'seti_fixture_secret_fixture', action_token: actionToken, expires_at: methodExpiry,
+    })],
+    [replacement + '/action-confirmations', Response.json({
+      subscription_id: subscriptionId, operation_id: replacementId, status: 'RESERVED', action_available: false,
+      next_action: null, browser_confirm_allowed: true,
+    }, {status: 202})],
   ]);
   const body = {dataset: {phase: 'NEW'}};
   const scripts: Array<EventTarget & {src: string}> = [];
   const firstScript = Promise.withResolvers<void>();
   const requests: string[] = [];
   const controls = new Map(['request', 'verify', 'code', 'consent', 'start', 'pay', 'confirm-method', 'status']
-    .map(id => [id, {disabled: true, checked: false, value: '', onclick: undefined as (() => Promise<void>) | undefined}]));
-  const host = {isConnected: true, getClientRects: () => [{width: 300, height: 100}], getRootNode: () => document};
+    .map(id => [id, {disabled: true, checked: false, value: '', onclick: undefined as ((event?: {isTrusted: boolean}) => Promise<void>) | undefined}]));
+  const host = {isConnected: true, get ownerDocument(): Document {return document as unknown as Document;},
+    getClientRects: () => [{width: 300, height: 100}], getRootNode: () => document};
   const document = Object.assign(new EventTarget(), {
     body, visibilityState: 'visible',
     querySelector: (selector: string) => selector === '#provider' ? host : controls.get(selector.slice(1)) ?? null,
@@ -48,20 +67,22 @@ async function checkFirstCardLoad(entry: string) {
   class PageWindow extends EventTarget {
     readonly top = this;
     declare __failedRenewalConfigure: (config: object) => void;
+    declare __failedRenewalMethod: (operation: object) => Promise<void>;
     declare __failedRenewalStop?: () => void;
     __failedRenewalPrepare() {return {subscriptionId, operationId};}
     __failedRenewalChallenge() {}
     __failedRenewalTerminal() {}
   }
   const window = new PageWindow();
+  Object.defineProperty(document, 'defaultView', {value: window});
   const globals = {
     window, document, location: {origin: 'http://localhost:3000'}, ShadowRoot: class {},
     getComputedStyle: () => ({display: 'block', visibility: 'visible', opacity: '1'}),
-    MutationObserver: class {observe() {} disconnect() {}},
+    MutationObserver: class {observe() {} disconnect() {} takeRecords() {return [];}},
     fetch: async (url: string) => {
       requests.push(url);
       const reply = replies.get(url);
-      assert.ok(reply, 'only the four local fixture responses are available');
+      assert.ok(reply, 'only local fixture responses are available');
       return reply;
     },
   };
@@ -71,7 +92,7 @@ async function checkFirstCardLoad(entry: string) {
     for (const [name, value] of Object.entries(globals)) Object.defineProperty(globalThis, name, {configurable: true, value});
     await import(pathToFileURL(entry).href);
     assert.equal(scripts.length, 0, 'opening the page must not load Stripe.js');
-    window.__failedRenewalConfigure({backend, siteKey: 'test-site', email: 'fixture@example.test', deadline: Date.parse(expiresAt)});
+    window.__failedRenewalConfigure({backend, siteKey: 'test-site', email: 'fixture@example.test', deadline: Date.parse(sessionExpiry)});
     await controls.get('request')!.onclick!();
     controls.get('code')!.value = '123456';
     await controls.get('verify')!.onclick!();
@@ -81,11 +102,47 @@ async function checkFirstCardLoad(entry: string) {
     start = controls.get('start')!.onclick!();
     await Promise.race([firstScript.promise, start]);
     assert.equal(body.dataset.phase, 'PREPARING');
-    assert.deepEqual(requests, [...replies.keys()]);
+    assert.deepEqual(requests, [...replies.keys()].slice(0, 4));
     assert.equal(scripts.length, 1, 'the real payment mount inserts one script');
     const url = new URL(scripts[0]!.src);
     assert.equal(url.origin, 'https://js.stripe.com');
     assert.deepEqual([...url.searchParams], [['advancedFraudSignals', 'false']]);
+    // Deliver the inserted script's load event locally. Neither form contacts a provider.
+    const calls: string[] = [];
+    const stripe = () => ({
+      elements: ({clientSecret}: {clientSecret: string}) => ({
+        submit: async () => ({}),
+        create: () => {
+          let ready: () => void;
+          const form = clientSecret.startsWith('pi_') ? 'payment' : 'setup';
+          return {
+            on(name: string, fn: () => void) {if (name === 'ready') ready = fn;},
+            mount() {calls.push(form); ready();},
+            off() {}, destroy() {},
+          };
+        },
+      }),
+      createConfirmationToken: async () => ({confirmationToken: {id: 'ctoken_fixture'}}),
+      confirmSetup: async () => {calls.push('confirmSetup'); return {};},
+    });
+    Object.assign(window, {Stripe: Object.assign(stripe, {version: 'endive'})});
+    scripts[0]!.dispatchEvent(new Event('load'));
+    await start;
+    assert.equal(body.dataset.phase, 'READY');
+    controls.get('pay')!.disabled = false;
+    await controls.get('pay')!.onclick!({isTrusted: true});
+    assert.equal(body.dataset.phase, 'OBSERVE');
+    await window.__failedRenewalMethod({subscriptionId, operationId: replacementId});
+    assert.equal(body.dataset.phase, 'METHOD_READY');
+    assert.equal(controls.get('confirm-method')!.disabled, true);
+    assert.deepEqual(calls, ['payment', 'setup']);
+    assert.deepEqual(requests, [...replies.keys()].slice(0, -1));
+    controls.get('confirm-method')!.disabled = false;
+    await controls.get('confirm-method')!.onclick!({isTrusted: true});
+    assert.equal(body.dataset.phase, 'METHOD_CONFIRMED');
+    assert.deepEqual(calls, ['payment', 'setup', 'confirmSetup']);
+    assert.deepEqual(requests, [...replies.keys()]);
+    assert.equal(scripts.length, 1);
   } finally {
     try {
       window.__failedRenewalStop?.();
@@ -99,7 +156,7 @@ async function checkFirstCardLoad(entry: string) {
   }
 }
 
-test('failed-renewal delivery loads one configured Stripe.js script on the first SDK card mount', async () => {
+test('failed-renewal delivery loads one configured script and requires separate clicks for payment and SETUP', async () => {
   const root = fileURLToPath(new URL('../..', import.meta.url));
   const sdk = resolve(root, '../../frontend/sdk/src');
   const privateDir = await mkdtemp(join(tmpdir(), 'failed-renewal-build-'));
@@ -135,7 +192,7 @@ test('failed-renewal delivery loads one configured Stripe.js script on the first
     assert.ok(modules.has(join(root, 'src/billing-failed-renewal-page.ts')));
     assert.equal([...modules].filter(id => id.includes('/@stripe/stripe-js/') && id.endsWith('/pure/index.js')).length, 1,
       'the deployed entry includes a single installed pure loader');
-    await checkFirstCardLoad(file);
+    await checkCardForms(file);
   } finally {
     await rm(privateDir, {recursive: true, force: true});
   }

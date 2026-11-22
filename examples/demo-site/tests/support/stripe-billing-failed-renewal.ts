@@ -148,15 +148,23 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   let navigationBlock:{request:Request;confirm:()=>void}|undefined;
   let finalDelivery:Promise<void>|undefined;
   let checkpoint='BROWSER_CONTEXT',firstFailure:Error|undefined,preparationActive=false;
-  function latch(code:string):Error {
-    firstFailure??=browserFailure(code);
+  function latch(code:string,source=state):Error {
+    // In-flight initial requests can finish after the replacement form opens.
+    // A rejection delivered only by teardown cannot establish a method fault.
+    const methodActive=source==='METHOD' && state==='METHOD';
+    // A permit ACK can arrive while Playwright still awaits the attended click's
+    // page result. A later SDK refusal or timeout belongs to confirmation.
+    const confirming=methodActive && manualArmed && step==='ACK' &&
+      (code==='BROWSER_MANUAL_PAY_WAIT'||code==='BROWSER_MANUAL_PAY_ARM');
+    firstFailure??=browserFailure(confirming?'BROWSER_METHOD_CONFIRM':code,methodActive?'METHOD':'INITIAL');
     return firstFailure;
   }
   async function at<T>(code:string,work:()=>Promise<T>):Promise<T> {
+    const source=state;
     // DOM click completion can precede its async preparation binding. READY
     // owns its own rejection, while page loss still belongs to active prepare.
     if(!(preparationActive && code==='BROWSER_READY_PHASE'))checkpoint=code;
-    try{return await work();}catch{throw latch(code);}
+    try{return await work();}catch{throw latch(code,source);}
   }
   const track=<T>(work:Promise<T>)=>{
     pending.add(work);void work.then(()=>pending.delete(work),()=>pending.delete(work));return work;
@@ -245,6 +253,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     }
   }
   async function routeRequest(route:Route) {
+    const requestPhase=state;
     let routeCheckpoint=checkpoint;
     let refusedOrigin:string|undefined;
     let finishNavigation:undefined|(()=>void);
@@ -452,7 +461,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       if(previous==='CONFIRM')finalDelivery=delivery;
       await delivery;
     }catch{
-      const original=!firstFailure,error=latch(routeCheckpoint);
+      const original=!firstFailure,error=latch(routeCheckpoint,requestPhase);
       if(original && refusedOrigin)rememberBrowserProviderOrigin(error,binding.runId,binding.expectedSource,refusedOrigin);
       lost();if(!blockIssued)await route.abort('failed').catch(()=>{});
     }finally{finishNavigation?.();}
@@ -501,10 +510,10 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       try{
         assertPage();need(source===page && frame===page!.mainFrame() && state==='INITIAL' && step==='CHALLENGE_ID' && uuid(value));
         challenge=value;step='VERIFY';
-      }catch{const error=latch(checkpoint);lost();throw error;}
+      }catch{const error=latch(state==='INITIAL'?checkpoint:'BROWSER_OTP_REQUEST','INITIAL');lost();throw error;}
     });
     await context.exposeBinding('__failedRenewalPrepare',({frame,page:source},value:unknown)=>track((async()=>{
-      let prepareCheckpoint=checkpoint;
+      let prepareCheckpoint=state==='INITIAL'?checkpoint:'BROWSER_PREPARE';
       try {
         assertPage();need(source===page && frame===page!.mainFrame() && state==='INITIAL' && step==='PREPARE' && initialPort);
         preparationActive=true;prepareCheckpoint=checkpoint='BROWSER_PREPARE';
@@ -518,13 +527,14 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
         const createKey=crypto.randomUUID();usedKeys.add(createKey);
         const p=await initialPort.prepare({origin:v.origin!,token},createKey,scoped());
         assertPage();need(p.customer_id===v.customerId && p.site_id===binding.siteId && p.account_id===binding.accountId && p.run_id===binding.runId && p.price_id===binding.priceId && uuid(p.subscription_id) && uuid(p.operation_id) && p.session.publishable_key.startsWith('pk_test_'));
-        initial=p;initialBridge=createFirstPaymentBridge({binding,prepared:p,token,port:initialPort,limits:scoped(),latchFailure:latch});
+        initial=p;initialBridge=createFirstPaymentBridge({binding,prepared:p,token,port:initialPort,limits:scoped(),
+          latchFailure:code=>latch(code,'INITIAL')});
         step='ACTION';
         readiness='INITIAL';
         preparationActive=false;
         checkpoint='BROWSER_READY_PHASE';
         return {subscriptionId:p.subscription_id,operationId:p.operation_id};
-      }catch{const error=latch(prepareCheckpoint);lost();throw error;}
+      }catch{const error=latch(prepareCheckpoint,'INITIAL');lost();throw error;}
     })()));
     await at('BROWSER_NAVIGATION',()=>page!.goto(binding.endpoints.demo+pagePath,{timeout:timeout()}));
     assertPage();
@@ -564,10 +574,9 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     },
     async method(port:BillingFailedRenewalMethodPort,limits:BillingLimits):Promise<true> {
       try{
-        need(state==='HELD' && initial);stage=limits;assertPage();
-        state='METHOD';methodPort=port;
+        need(state==='HELD' && initial);
+        state='METHOD';checkpoint='BROWSER_PREPARE';stage=limits;assertPage();methodPort=port;
         await billingBounded(scoped(),()=>track((async()=>{
-          checkpoint='BROWSER_PREPARE';
           need(await page!.locator('body').getAttribute('data-phase')==='OBSERVE');
           const m=await port.prepareMethod(scoped());
           assertPage();

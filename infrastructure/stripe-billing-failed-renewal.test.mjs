@@ -512,6 +512,87 @@ test('same held journey, original proof before E, ledger before fixed arm, genui
 });
 const postArmLine=(stage,checkpoint,cleanup='CONFIRMED',witness='NONE')=>
  'owned_failed_renewal_diagnostic stage='+stage+' checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
+for(const [checkpoint,abortFirst,close] of [
+ ['BROWSER_METHOD_MOUNT',false,true],
+ ['BROWSER_PROVIDER_STATIC_REQUEST_NAVIGATION_STRIPE_PARENT',true,true],
+ ['BROWSER_METHOD_CONFIRM',true,false],
+])test('method browser terminal preserves its original held rejection '+checkpoint,async()=>{
+ const h=harness(),abort=new AbortController(),error=browserFailure(checkpoint,'METHOD');
+ let rejectMethod;
+ h.journey.method=async(p,l)=>{
+  await p.prepareMethod(l);await p.selectMethod(l);
+  if(checkpoint==='BROWSER_METHOD_CONFIRM')await p.confirmMethod(l);
+  if(abortFirst){abort.abort();return new Promise((_,reject)=>{rejectMethod=reject;});}
+  throw error;
+ };
+ h.journey.close=async()=>{rejectMethod?.(error);return close;};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,{...limits(),signal:abort.signal}));
+ const result=await o.close(),line=postArmLine('METHOD_BROWSER',checkpoint,close?'CONFIRMED':'UNCONFIRMED',close?'NONE':'BROWSER_CLOSE');
+ assert.equal(result.code,abortFirst?'ABORTED':'METHOD_BROWSER');
+ assert.equal(result.diagnostic,checkpoint);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ assert.equal(result.failedRenewalAccepted,false);assert.ok(!h.calls.includes('applyMethod'));
+});
+test('method browser terminal excludes initial, fabricated and unknown errors',async()=>{
+ let reads=0;const code='BROWSER_CARD_NUMBER',trusted=browserFailure(code,'METHOD');
+ const hostile=new Proxy({},{get(){reads++;throw Error('private canary');}});
+ for(const error of [browserFailure(code),browserFailure('BROWSER_OTP_VERIFY','METHOD'),browserFailure('BROWSER_PRIVATE','METHOD'),Object.create(trusted),hostile,new Error(code),code]){
+  const h=harness();h.journey.method=async()=>{throw error;};
+  const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));
+  assert.equal(owners.formatBillingFailedRenewalDiagnostic(await o.close()),postArmLine('METHOD_BROWSER','METHOD_BROWSER_ACTION'));
+ }
+ const h=harness();h.journey.initial=async()=>{throw trusted;};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(await o.close()),null);
+ assert.equal(reads,0);
+ for(const code of ['BROWSER_OTP_VERIFY','BROWSER_INITIAL_MOUNT','BROWSER_PROVIDER_STATIC_NAVIGATION_BLOCK','BROWSER_CLOSE','BROWSER_PRIVATE']){
+  assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(postArmLine('METHOD_BROWSER',code)),null);
+ }
+ for(const code of ['BROWSER_METHOD_MOUNT','BROWSER_METHOD_CONFIRM']){
+  assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(browserLine(code)),null);
+ }
+});
+test('method browser terminal keeps earlier owner request, response or order failure',async()=>{
+ for(const boundary of ['REQUEST','RESPONSE','ORDER']){
+  const h=harness(),error=browserFailure('BROWSER_SESSION_BRIDGE','METHOD');
+  h.runtime.selectMethod=async()=>{if(boundary==='REQUEST')throw Error('private transport');return {};};
+  h.journey.method=async(p,l)=>{
+   if(boundary!=='ORDER')await p.prepareMethod(l);
+   try{await p.selectMethod(l);}catch{throw error;}
+   return true;
+  };
+  const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));
+  const checkpoint=boundary==='ORDER'?'METHOD_ORDER':'METHOD_SELECT_'+boundary;
+  assert.equal(owners.formatBillingFailedRenewalDiagnostic(await o.close()),postArmLine('METHOD_BROWSER',checkpoint));
+ }
+});
+test('a method-tagged private origin cannot reach the initial witness writer through either journey phase',async()=>{
+ for(const phase of ['initial','method']){
+  const h=harness(),code='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER',error=browserFailure(code,'METHOD');
+  let writes=0;
+  h.bootstrap.persistRefusedStripeOrigin=()=>{writes++;return true;};
+  assert.equal(rememberBrowserProviderOrigin(error,opts().runId,opts().expectedSource,privateOrigin),true);
+  h.journey[phase]=async()=>{throw error;};
+  const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));const result=await o.close();
+  assert.equal(writes,0);assert.equal(JSON.stringify(result).includes(privateOrigin),false);
+  assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),phase==='method'?postArmLine('METHOD_BROWSER',code):null);
+ }
+});
+test('method rejection arriving after a refused close cannot refine the closed terminal',async()=>{
+ const h=harness(),abort=new AbortController(),error=browserFailure('BROWSER_MANUAL_PAY_WAIT','METHOD');
+ let rejectMethod;
+ h.journey.method=async()=>{
+  abort.abort();return new Promise((_,reject)=>{rejectMethod=reject;});
+ };
+ h.journey.close=async()=>{throw error;};
+ const o=await owner(h);await assert.rejects(o.run(h.journey,{...limits(),signal:abort.signal}));
+ const line=postArmLine('METHOD_BROWSER','METHOD_BROWSER_ACTION','UNCONFIRMED','BROWSER_CLOSE');
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(await o.close()),line);
+ rejectMethod(error);await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(o.resources()),line);
+ assert.ok(!h.calls.includes('applyMethod'));
+});
 const afterArm=[
  ['failedRenewal','FAILED_RENEWAL'],['graceLastSecond','GRACE_LAST_SECOND'],['graceAt','GRACE_AT'],['graceAfter','GRACE_AFTER'],
  ['prepareMethod','METHOD_PREPARE','METHOD_BROWSER'],['selectMethod','METHOD_SELECT','METHOD_BROWSER'],['confirmMethod','METHOD_CONFIRM','METHOD_BROWSER'],

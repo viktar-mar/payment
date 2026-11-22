@@ -151,6 +151,19 @@ test('actual reporter publishes the failed site preparation checkpoint only from
  assert.doesNotMatch(output,/canary/);
  assert.match(output,/owned_failed_renewal_result_not_accepted full5b=NOT_ACCEPTED/);
 });
+test('actual reporter accepts a finite method browser failure only from the matching terminal annotation',async()=>{
+ const line='owned_failed_renewal_diagnostic stage=METHOD_BROWSER checkpoint=BROWSER_METHOD_CONFIRM cleanup=CONFIRMED witness=NONE';
+ for(const description of [line,line.replace('METHOD_BROWSER','BROWSER'),line.replace('BROWSER_METHOD_CONFIRM','BROWSER_OTP_VERIFY'),line+' raw canary']){
+  const output=await captureReporter(reporter=>{
+   const testCase=reporterCase(),result=reporterResult({annotations:[]});reporter.onTestBegin(testCase,result);
+   reporter.onStdOut(line+'\nprivate canary\n');
+   result.annotations=[{...terminalAnnotation,description}];reporter.onTestEnd(testCase,result);reporter.onEnd({status:'failed'} as FullResult);
+  });
+  assert.deepEqual(output.trimEnd().split('\n'),[
+   ...(description===line?[line]:[]),'owned_failed_renewal_not_accepted','owned_failed_renewal_result_not_accepted full5b=NOT_ACCEPTED',
+  ]);
+ }
+});
 test('actual reporter publishes a failed renewal checkpoint only from the matching terminal annotation',async()=>{
  const prefix='owned_failed_renewal_diagnostic stage=FAILED_RENEWAL checkpoint=';
  const suffix=' cleanup=UNCONFIRMED witness=RUNTIME_CLOSE';
@@ -309,8 +322,13 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
       return headers;
     },frame:()=>requestFrame,postData:()=>contents,
       redirectedFrom:()=>null,isNavigationRequest:()=>false,resourceType:()=> 'fetch'};
-    await routeHandler({request:()=>req,abort:async()=>{denied=true;},fallback:async()=>{assert.ok(target==='https://js.stripe.com/v3/'||target===otpUrl||target===otpUrl+'/'+id(10)+'/verify');},
-      fulfill:async(r:any)=>{if((method==='OPTIONS'&&change===bridge+'_preflight_delivery')||(change==='action_delivery'&&target.endsWith('/action'))||(change==='session_delivery'&&target.endsWith('/confirmation-session')))throw Error('secret_fixture canary');assert.equal(r.headers['Cache-Control'],'no-store');assert.equal(r.headers['Access-Control-Allow-Origin'],demo);reply=r;replies.push(r);}});
+    const lateDelivery=change==='late_initial_action' && target===base(id(7))+'/action';
+    const handling=routeHandler({request:()=>req,abort:async()=>{denied=true;},fallback:async()=>{assert.ok(target==='https://js.stripe.com/v3/'||target===otpUrl||target===otpUrl+'/'+id(10)+'/verify');},
+      fulfill:async(r:any)=>{if((method==='OPTIONS'&&change===bridge+'_preflight_delivery')||(change==='action_delivery'&&target.endsWith('/action'))||(change==='session_delivery'&&target.endsWith('/confirmation-session')))throw Error('secret_fixture canary');assert.equal(r.headers['Cache-Control'],'no-store');assert.equal(r.headers['Access-Control-Allow-Origin'],demo);reply=r;replies.push(r);
+        if(lateDelivery){markIO();await heldIO;throw Error('late delivery');}
+      }});
+    // The page receives the response while the controller still awaits its delivery.
+    if(lateDelivery)await Promise.race([ioPending,handling]);else await handling;
     if(denied)throw Error('denied mock request');
     return reply;
   }
@@ -340,12 +358,16 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
         p.onRetire?.();return {state:'OBSERVE',retryAllowed:false,successorAttemptId:null};}};},
     mountStripeSubscriptionMethod:async(p:any)=>{counts.push('mountMethod');if(change==='method_mount_refusal'){p.onRetire?.();throw Error('secret_fixture canary');}assert.strictEqual(p.client,subscriptions);assert.strictEqual(p.session,session);
       assert.equal(p.subscriptionId,id(6));assert.equal(p.operationId,id(9));
+      if(change==='late_challenge')await w.__failedRenewalChallenge(id(10));
+      if(change==='late_prepare')await w.__failedRenewalPrepare(session);
       const a=await subscriptions.action(p),s=await subscriptions.confirmationSession({...p,action:a});
       assert.deepEqual(s,{protocol:'BROWSER_CONFIRM_V1',provider:'stripe',flow:'SETUP',publishable_key:selected.publishable_key,client_secret:selected.client_secret,action_token:actionSecret,expires_at:expires});
       for(const probe of provider??[])if(probe.atMount&&probe.phase==='method')await probeProvider(probe);
       return {destroy:()=>{},confirm:async()=>{const permit=await request(base(id(9))+'/action-confirmations','POST',{action_token:s.action_token});
         assert.equal(permit.status,202);assert.deepEqual(permit.json,{operation_id:id(9),subscription_id:id(6),status:'RESERVED',action_available:false,next_action:null,browser_confirm_allowed:true});
-        counts.push('confirmSetup');p.onRetire?.();return {operationId:id(9),subscriptionId:id(6),status:'RESERVED',actionAvailable:false};}};}};
+        counts.push('confirmSetup');p.onRetire?.();
+        if(change==='method_provider_refusal')throw Error('private setup response');
+        return {operationId:id(9),subscriptionId:id(6),status:'RESERVED',actionAvailable:false};}};}};
   installFailedRenewalPage(sdk);
   const labels:Record<string,string>={'Request code':'request','Verify code':'verify','Start payment':'start','Pay':'pay','Confirm test method':'confirm-method','I consent to recurring payments':'consent','Six-digit code':'code'};
   function locator(id:string):any {const c=ctrl(id);return {click:async()=>{
@@ -1284,6 +1306,62 @@ for(const change of ['rejection','page_loss'] as const)test('method preparation 
   }finally{await h.restore();}
 });
 
+for(const [change,expected] of [['late_challenge','BROWSER_OTP_REQUEST'],['late_prepare','BROWSER_PREPARE']])
+test(change+' keeps initial binding provenance during replacement',async()=>{
+  const h=await fixture(change);
+  try{
+    await h.journey.initial(h.initialPort,nowLimits());
+    await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>{
+      assert.equal(browserDiagnostic(error,'METHOD'),null);
+      assert.equal(browserDiagnostic(error,'INITIAL'),expected);
+      return true;
+    });
+    assert.equal(h.runAbort.signal.aborted,true);
+    assert.equal(h.counts.filter(name=>name==='prepare').length,1);
+    assert.equal(h.counts.includes('permit'),false);
+  }finally{await h.restore();}
+});
+
+test('late initial action delivery refusal retains its original phase during replacement',async()=>{
+  const h=await fixture('late_initial_action');
+  try{
+    await h.journey.initial(h.initialPort,nowLimits());
+    h.setStageHook(async where=>{
+      if(where==='card'){h.releaseIO();await new Promise(resolve=>setImmediate(resolve));}
+    });
+    let first:unknown;
+    await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>{first=error;return true;});
+    assert.equal(browserDiagnostic(first,'METHOD'),null);
+    assert.equal(browserDiagnostic(first,'INITIAL'),'BROWSER_ACTION_BRIDGE');
+    await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>error===first);
+    assert.equal(h.counts.includes('permit'),false);
+    assert.equal(await h.journey.close(nowLimits()),true);
+    assert.equal(browserCleanupConfirmed(first),true);
+  }finally{h.releaseIO();await h.restore();}
+});
+
+for(const [change,code,permits] of [
+  ['expired','BROWSER_PREPARE',0],
+  ['manual_timeout','BROWSER_MANUAL_PAY_WAIT',0],
+  ['method_provider_refusal','BROWSER_METHOD_CONFIRM',1],
+] as const)test('replacement first failure distinguishes '+change,async()=>{
+  const h=await fixture(change);
+  try{
+    await h.journey.initial(h.initialPort,nowLimits());
+    const limits=change==='expired'?{deadline:Date.now()-1}:nowLimits();
+    let first:unknown;
+    await assert.rejects(h.journey.method(h.methodPort,limits),error=>{first=error;return true;});
+    assert.equal(browserDiagnostic(first),code);
+    assert.equal(browserDiagnostic(first,'METHOD'),code);
+    assert.equal(browserDiagnostic(first,'INITIAL'),null);
+    assert.equal(h.counts.filter(name=>name==='permit').length,permits);
+    assert.equal(h.counts.filter(name=>name==='confirmSetup').length,permits);
+    await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>error===first);
+    assert.equal(await h.journey.close(nowLimits()),true);
+    assert.equal(browserCleanupConfirmed(first),true);
+  }finally{await h.restore();}
+});
+
 test('one retained page, customer and SDK client across both separately attended phases',async()=>{
   const h=await fixture();
   try{
@@ -1309,12 +1387,13 @@ test('intentional final context close preserves the owner completion signal',asy
     assert.equal(h.runAbort.signal.aborted,false);assert.equal(h.closed(),1);
   }finally{await h.restore();}
 });
-for(const event of ['close','hide','crash','crash-after-method'])test('actual owner refuses the next financial dispatch after held-page '+event,async()=>{
-  const h=await fixture();
+for(const event of ['close','hide','crash','crash-after-method','method_provider_refusal'])test('actual owner refuses the next financial dispatch after '+event,async()=>{
+  const h=await fixture(event);
+  const reachesMethod=event==='crash-after-method'||event==='method_provider_refusal';
   try{
     const root='../../../../infrastructure/';
     const {opts,initial,iso,F,E,responses,methods}=await import(source(root+'fixtures/failed-renewal-descriptors.mjs').href);
-    const {createOwnedBillingFailedRenewal}=await import(source(root+'stripe-billing-first-payment.mjs').href);
+    const {createOwnedBillingFailedRenewal,parseBillingFailedRenewalDiagnosticLine}=await import(source(root+'stripe-billing-first-payment.mjs').href);
     const calls:string[]=[],mark=(name:string)=>async()=>{calls.push(name);return true;};
     const settlement={...initial(),subscription_id:id(6),operation_id:id(7),period_start:iso(F),paid_through:iso(E)};
     const stages=responses();
@@ -1331,15 +1410,22 @@ for(const event of ['close','hide','crash','crash-after-method'])test('actual ow
       createCli:async()=>cli,createFixture:async()=>fixturePort,createRuntime:async()=>runtime,pause:mark('pause'),
       prove:async()=>{
         assert.equal(h.phase(),'OBSERVE');assert.equal(h.closed(),0);
-        calls.push('initial-proof');if(event!=='crash-after-method')h.lose(event);
+        calls.push('initial-proof');if(!reachesMethod)h.lose(event);
         return {ownedVerified:true,cashVerified:true,journalVerified:true,signedCallbacksVerified:true,
           anchor:Object.fromEntries(['initial_bill_id','initial_payment_id','initial_invoice_id','initial_allocation_id','initial_payment_intent_id'].map(k=>[k,stages[0][k]]))};
       },proveFailedRenewal:mark('unexpected-final-proof')});
     const journey={...h.journey,method:async(p:any,l:any)=>{await h.journey.method(p,l);assert.equal(h.phase(),'METHOD_CONFIRMED');h.lose('crash');return true;}};
     await assert.rejects(owner.run(journey,{...nowLimits(),signal:h.runAbort.signal}));
     const result=await owner.close();
-    assert.ok(calls.includes('initial-proof'));assert.equal(calls.includes('boundary'),event==='crash-after-method');
-    assert.equal(calls.includes('confirmMethod'),event==='crash-after-method');assert.equal(calls.includes('applyMethod'),false);
+    assert.ok(calls.includes('initial-proof'));assert.equal(calls.includes('boundary'),reachesMethod);
+    assert.equal(calls.includes('confirmMethod'),reachesMethod);assert.equal(calls.includes('applyMethod'),false);
+    if(event==='method_provider_refusal'){
+      const line=formatBillingFailedRenewalDiagnostic(result);
+      assert.equal(line,'owned_failed_renewal_diagnostic stage=METHOD_BROWSER checkpoint=BROWSER_METHOD_CONFIRM cleanup=CONFIRMED witness=NONE');
+      assert.ok(parseBillingFailedRenewalDiagnosticLine(line));
+      assert.equal(calls.filter(n=>n==='confirmMethod').length,1);
+      for(const name of ['confirmRecovery','observeRecovery','unexpected-final-proof'])assert.equal(calls.includes(name),false);
+    }
     assert.equal(h.runAbort.signal.aborted,true);assert.equal(result.cleanupConfirmed,true);
     assert.equal(result.failedRenewalAccepted,false);assert.equal(h.closed(),1);
     assert.deepEqual(calls.slice(-4),['runtime-close','listener-stop','bootstrap-stop','fixture-close']);

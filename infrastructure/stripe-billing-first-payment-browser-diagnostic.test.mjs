@@ -54,6 +54,17 @@ test('foreign values and unreadable proxies cannot supply provenance',()=>{
 });
 
 const originRun='11111111-2222-4333-8444-000000000001',originSource='a'.repeat(40);
+test('method phase provenance and its private in-memory origin retain independent contracts',()=>{
+ const code='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER',error=browserFailure(code,'METHOD');
+ assert.equal(browserDiagnostic(error,'METHOD'),code);
+ assert.equal(browserDiagnostic(error,'INITIAL'),null);
+ assert.equal(browserDiagnostic(browserFailure(code),'METHOD'),null);
+ assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,'https://other.stripe.com'),true);
+ assert.deepEqual(privateOrigin.browserProviderOrigin(error),{runId:originRun,expectedSource:originSource,origin:'https://other.stripe.com'});
+ assert.equal(browserDiagnostic(browserFailure('BROWSER_METHOD_CONFIRM','METHOD')),'BROWSER_METHOD_CONFIRM');
+ assert.equal(browserDiagnostic(browserFailure('BROWSER_METHOD_CONFIRM')),null);
+ assert.equal(JSON.stringify(error),'{}');
+});
 const witness=()=>({runId:originRun,expectedSource:originSource,origin:'https://other.stripe.com'});
 test('only the original OTHER error retains one immutable private origin snapshot',()=>{
  assert.equal(typeof privateOrigin.rememberBrowserProviderOrigin,'function');
