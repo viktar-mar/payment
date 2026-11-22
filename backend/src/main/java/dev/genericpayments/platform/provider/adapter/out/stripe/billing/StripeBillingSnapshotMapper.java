@@ -693,7 +693,13 @@ public final class StripeBillingSnapshotMapper {
                     }
                 }
             }
-            var invoices=pages(after->{var page=client.v1().invoices().list(InvoiceListParams.builder().setSubscription(remote.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build());rememberExplicitNullAttempt(page);return page;});
+            var invoices=pages(after->{
+                var params=InvoiceListParams.builder().setSubscription(remote.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after);
+                if(original==null)params.addExpand("data.amount_paid_off_stripe");
+                var page=client.v1().invoices().list(params.build());
+                rememberExplicitNullAttempt(page);
+                return page;
+            });
             sourceInvoices=invoices;
             var normalized=new ArrayList<SubscriptionProviderModels.Invoice>();
             for(var invoice:invoices)normalized.add(invoice(invoice,remote,item,trial));

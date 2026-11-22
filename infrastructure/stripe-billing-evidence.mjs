@@ -4,6 +4,26 @@ import {readFile} from 'node:fs/promises';
 import {billingUuid} from './stripe-billing-provision.mjs';
 import {billingBounded,billingCheck,billingError} from './stripe-billing-limits.mjs';
 const need=v=>{if(!v)throw billingError('EVIDENCE');};
+// Only an accepted initial payment from this invocation can anchor a cancellation proof.
+const cancellationOrigins=new WeakMap();
+export function billingCancellationOrigin(baseline) { return cancellationOrigins.get(baseline); }
+
+function captureCancellationOrigin(result,row,inspection) {
+ const [cashEventId]=row.cash_journal_ids??[],[paidEventId]=row.paid_journal_ids??[];
+ const identity={paymentId:row.payment_id,billingRecordId:row.billing_record_id,cashEventId,paidEventId};
+ need(Object.values(identity).every(billingUuid)&&new Set(Object.values(identity)).size===4
+   &&row.cash_journal_ids.length===1&&row.paid_journal_ids.length===1);
+ const cash=row.callbacks.find(e=>e.id===cashEventId)?.payload,paid=row.callbacks.find(e=>e.id===paidEventId)?.payload;
+ need(cash?.schema_version===3&&cash.payment_id===identity.paymentId&&cash.billing_record_id===identity.billingRecordId
+   &&paid?.schema_version===4&&paid.event_type==='subscription.updated'&&paid.state==='ACTIVE'&&paid.access_allowed===true
+   &&paid.billing_record_id===identity.billingRecordId&&paid.payment_id===null);
+ const revision=Number(row.subscription_revision);
+ need(row.initial_unscheduled===true&&/^[0-9]+$/.test(String(row.subscription_revision))
+   &&Number.isSafeInteger(revision)&&Number.isSafeInteger(paid.revision)&&paid.revision<=revision);
+ const callbackDigests=Object.freeze(Object.fromEntries(inspection.events.map(event=>[event.event_id,event.sha256])));
+ cancellationOrigins.set(result,Object.freeze({...identity,revision,callbackDigests}));
+}
+
 const canonical=p=>JSON.stringify(Object.fromEntries(Object.keys(p).sort().map(k=>[k,p[k]])));
 /** Only sanitized proof flags and exact owned provider binding escape the in-memory SQL/callback comparison. */
 export function validateBillingEvidence(scope,row,inspection) {
@@ -14,8 +34,12 @@ export function validateBillingEvidence(scope,row,inspection) {
 export function validateBillingCallbackEvidence(scope,row,inspection) {validateCallbackPayloads(scope,row,inspection,'INITIAL');return callbackGraph(scope,row);}
 /** Separate fixed entry point; received RENEWAL payloads are never rewritten. */
 export function validateBillingRenewalCallbackEvidence(scope,row,inspection) {need(row?.callbacks?.length===2);validateCallbackPayloads(scope,row,inspection,'RENEWAL');return Object.freeze({cashVerified:true,journalVerified:true,signedCallbacksVerified:true});}
-function validateCallbackPayloads(scope,row,inspection,kind) {
- need(Array.isArray(row.callbacks)&&row.callbacks.length>=2&&row.callbacks.length<=100&&inspection?.duplicates===0&&inspection.count===row.callbacks.length&&inspection.events?.length===row.callbacks.length);
+export function validateBillingCancellationCallbackEvidence(scope,row,inspection) {
+ validateCallbackPayloads(scope,row,inspection,'INITIAL',102);
+ return callbackGraph(scope,row);
+}
+function validateCallbackPayloads(scope,row,inspection,kind,maximumCallbacks=100) {
+ need(Array.isArray(row.callbacks)&&row.callbacks.length>=2&&row.callbacks.length<=maximumCallbacks&&inspection?.duplicates===0&&inspection.count===row.callbacks.length&&inspection.events?.length===row.callbacks.length);
  const ids=new Set();let payments=0,lifecycle=0;
  for(const e of row.callbacks){const p=e.payload;need(e.delivered===true&&billingUuid(e.id)&&!ids.has(e.id));ids.add(e.id);
   need(p?.event_id===e.id&&p.event_type===e.type&&p.site_id===scope.siteId&&p.customer_id===scope.customerId&&p.subscription_id===scope.subscriptionId&&p.product_id===scope.productId);
@@ -59,5 +83,7 @@ export async function proveBillingEvidence({configuration,bootstrap,fixture},lim
    billingCheck(limits);return true;
   }finally{if(sql)await billingBounded({deadline:Date.now()+5000},()=>sql.end({timeout:0}),5000);}
  },limits)===true);billingCheck(limits);need(result);
- const inspection=await fixture.inspectCallbacks(limits);billingCheck(limits);return validateBillingEvidence(scope,result,inspection);
+ const inspection=await fixture.inspectCallbacks(limits);billingCheck(limits);const baseline=validateBillingEvidence(scope,result,inspection);
+ if(configuration.selectedCase==='initial_cancel_withdraw')captureCancellationOrigin(baseline,result,inspection);
+ return baseline;
 }

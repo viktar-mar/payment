@@ -121,11 +121,22 @@ async function createCliAdapter(options,dependencies,purpose) {
   let remainderTarget=null,priorIdentity=null,priorEventType=null,remainderIdentity=null,remainderEventType=null;
   const remainderSignals=new Set();
   let billingGraph=null,billingFailed=false,billingBound=false,billingStarted=false,billingDeadline=null,billingSignal;
+  const cancellationCase=purpose===BILLING&&options.selectedCase==='initial_cancel_withdraw';
+  let cancellationNext='initial',originalCancellationCash;
 
-  function check(context) {if(context.signal.aborted||Date.now()>=(context.proofDeadline??context.deadline)||remainderMode&&!context.cleanup&&[...remainderSignals].some(s=>s.aborted)||billingMode&&!context.cleanup&&billingSignal?.aborted)fail();}
+  function check(context) {
+    if(context.signal.aborted||Date.now()>=(context.proofDeadline??context.deadline))fail();
+    if(!context.cleanup){
+      if(remainderMode&&[...remainderSignals].some(s=>s.aborted))fail();
+      if(billingMode&&billingSignal?.aborted||cancellationCase&&billingFailed)fail();
+    }
+  }
   async function operation(code,limits,body) {
     if(billingMode&&billingFailed&&code!=='STOP')throw fixed(code);
-    if(busy)throw fixed('BUSY');
+    if(busy){
+      if(cancellationCase&&code!=='STOP')billingFailed=true;
+      throw fixed('BUSY');
+    }
     busy=true;let timer,external,onAbort;
     const controller=new AbortController();
     try {
@@ -591,8 +602,9 @@ async function createCliAdapter(options,dependencies,purpose) {
     if(!Number.isSafeInteger(v.periodStart)||v.periodStart<=0||!Number.isSafeInteger(v.periodEnd)||v.periodEnd<=v.periodStart)fail();
     billingGraph=Object.freeze(v);return true;
   }
-  async function observeOwnedBillingGraph(context){
+  async function observeOwnedBillingGraph(context,phase='initial'){
     billingListener(context);if(!billingGraph)fail();const t=billingGraph;
+    if(cancellationCase&&phase!==cancellationNext)fail();
     await binding(context);billingListener(context);
     const require=value=>{if(!value)fail();};
     const exact=(v,id,type)=>require(v?.id===id&&v.object===type&&v.livemode===false&&(v.account===undefined||v.account===ACCOUNT));
@@ -610,14 +622,31 @@ async function createCliAdapter(options,dependencies,purpose) {
     }
     const customer=await read('/v1/customers/'+t.customerReference);exact(customer,t.customerReference,'customer');require(customer.deleted!==true&&customer.test_clock===null);
     const local={account_id:t.accountId,site_id:t.siteId,customer_id:t.customerId};metadata(customer.metadata,local);
-    const subscription=await read('/v1/subscriptions/'+t.subscriptionReference);exact(subscription,t.subscriptionReference,'subscription');
-    metadata(subscription.metadata,{...local,subscription_id:t.subscriptionId,operation_id:t.operationId});
-    require(subscription.customer===t.customerReference&&subscription.status==='active'&&subscription.currency==='eur'&&subscription.latest_invoice===t.invoiceReference&&subscription.trial_start===null&&subscription.trial_end===null&&subscription.test_clock===null);
-    require(subscription.items?.object==='list'&&subscription.items.has_more===false&&Array.isArray(subscription.items.data)&&subscription.items.data.length===1);
-    const item=subscription.items.data[0];require(/^si_[A-Za-z0-9_]{1,200}$/.test(item.id)&&item.object==='subscription_item'&&item.subscription===t.subscriptionReference&&item.quantity===1&&item.price?.id===t.priceReference&&item.current_period_start===t.periodStart&&item.current_period_end===t.periodEnd);
+    function subscriptionItem(subscription){
+      exact(subscription,t.subscriptionReference,'subscription');
+      metadata(subscription.metadata,{...local,subscription_id:t.subscriptionId,operation_id:t.operationId});
+      require(subscription.customer===t.customerReference&&subscription.status==='active'&&subscription.currency==='eur'&&subscription.latest_invoice===t.invoiceReference&&subscription.trial_start===null&&subscription.trial_end===null&&subscription.test_clock===null);
+      require(subscription.items?.object==='list'&&subscription.items.has_more===false&&Array.isArray(subscription.items.data)&&subscription.items.data.length===1);
+      const item=subscription.items.data[0];require(/^si_[A-Za-z0-9_]{1,200}$/.test(item.id)&&item.object==='subscription_item'&&item.subscription===t.subscriptionReference&&item.quantity===1&&item.price?.id===t.priceReference&&item.current_period_start===t.periodStart&&item.current_period_end===t.periodEnd);
+      return item;
+    }
+    function cancellationTerms(subscription,item){
+      const now=Math.floor(Date.now()/1000);
+      require(t.periodStart<=now&&now<t.periodEnd&&subscription.schedule===null&&subscription.pending_update===null&&subscription.pause_collection===null
+        &&subscription.ended_at===null&&subscription.collection_method==='charge_automatically'&&empty(subscription.discounts));
+      require(Number.isSafeInteger(subscription.billing_cycle_anchor)&&subscription.billing_cycle_anchor>0
+        &&(subscription.default_payment_method===null||typeof subscription.default_payment_method==='string'&&/^pm_[A-Za-z0-9_]{1,200}$/.test(subscription.default_payment_method))
+        &&subscription.default_source===null);
+      if(phase==='scheduled')require(subscription.cancel_at===t.periodEnd&&typeof subscription.cancel_at_period_end==='boolean');
+      else require(subscription.cancel_at===null&&subscription.cancel_at_period_end===false);
+      return {itemId:item.id,billingCycleAnchor:subscription.billing_cycle_anchor,defaultPaymentMethod:subscription.default_payment_method};
+    }
+    const subscription=await read('/v1/subscriptions/'+t.subscriptionReference),item=subscriptionItem(subscription);
+    const terms=cancellationCase?cancellationTerms(subscription,item):null;
     const price=await read('/v1/prices/'+t.priceReference);exact(price,t.priceReference,'price');metadata(price.metadata,{local_price_id:t.priceId,local_price_version:String(t.priceVersion)});
     require(price.product===t.productReference&&price.active===true&&price.unit_amount===2000&&price.currency==='eur'&&price.type==='recurring'&&price.tax_behavior==='inclusive'&&price.recurring?.interval==='month'&&price.recurring.interval_count===1&&price.recurring.usage_type==='licensed');
-    const invoice=await read('/v1/invoices/'+t.invoiceReference);exact(invoice,t.invoiceReference,'invoice');
+    const invoice=await read('/v1/invoices/'+t.invoiceReference,cancellationCase?[['expand[]','amount_paid_off_stripe']]:[]);
+    exact(invoice,t.invoiceReference,'invoice');
     require(invoice.customer===t.customerReference&&invoice.parent?.type==='subscription_details'&&invoice.parent.subscription_details?.subscription===t.subscriptionReference&&invoice.billing_reason==='subscription_create'&&invoice.status==='paid'&&invoice.collection_method==='charge_automatically'&&invoice.currency==='eur');
     require(['amount_due','amount_paid','total','subtotal'].every(k=>invoice[k]===2000)&&['amount_remaining','amount_paid_off_stripe','amount_overpaid','starting_balance','ending_balance','pre_payment_credit_notes_amount','post_payment_credit_notes_amount'].every(k=>invoice[k]===0)&&['discounts','total_discount_amounts','total_pretax_credit_amounts'].every(k=>empty(invoice[k])));
     const invoices=await pages('/v1/invoices',[['subscription',t.subscriptionReference]]);require(invoices.length===1&&invoices[0].id===t.invoiceReference);
@@ -637,6 +666,20 @@ async function createCliAdapter(options,dependencies,purpose) {
     const reverse=await pages('/v1/invoice_payments',[['payment[type]','payment_intent'],['payment[payment_intent]',t.intentReference]]);require(reverse.length===1);allocationProof(reverse[0]);require(reverse[0].status_transitions.paid_at===allocations[0].status_transitions.paid_at);
     const latest=await read('/v1/payment_intents/'+t.intentReference);exact(latest,t.intentReference,'payment_intent');
     require(latest.latest_charge===chargeReference&&latest.customer===t.customerReference&&latest.status==='succeeded'&&latest.amount_received===2000&&latest.currency==='eur');
+    if(cancellationCase){
+      const invoices=await pages('/v1/invoices',[['customer',t.customerReference]]);
+      require(invoices.length===1);exact(invoices[0],t.invoiceReference,'invoice');require(invoices[0].customer===t.customerReference);
+      const charges=await pages('/v1/charges',[['customer',t.customerReference]]);
+      require(charges.length===1);exact(charges[0],chargeReference,'charge');
+      require(charges[0].customer===t.customerReference&&charges[0].payment_intent===t.intentReference);
+      const finalSubscription=await read('/v1/subscriptions/'+t.subscriptionReference);
+      const finalTerms=cancellationTerms(finalSubscription,subscriptionItem(finalSubscription));
+      require(Object.entries(terms).every(([key,value])=>value===finalTerms[key]));
+      const witness={...terms,lineId:line.id,chargeReference,paidAt:allocations[0].status_transitions.paid_at};
+      if(phase==='initial')originalCancellationCash=witness;
+      else require(Object.entries(witness).every(([key,value])=>value===originalCancellationCash[key]));
+      cancellationNext=phase==='initial'?'scheduled':phase==='scheduled'?'withdrawn':null;
+    }
     billingListener(context);return Object.freeze({providerVerified:true,initialCashVerified:true,lineCount:1,allocationCount:1,chargeCount:1});
   }
 
@@ -675,6 +718,11 @@ async function createCliAdapter(options,dependencies,purpose) {
       assertBillingListener,
       ...(!firstPayment?{bindOwnedBillingGraph:(value,limits)=>operation('BILLING_BINDING',limits,context=>bindOwnedBillingGraph(value,context)),
       observeOwnedBillingGraph:limits=>operation('BILLING_GRAPH',limits,observeOwnedBillingGraph)}:{}),
+      ...(cancellationCase?{observeOwnedBillingCancellation:(phase,limits)=>operation('BILLING_CANCELLATION',limits,async context=>{
+        if(phase!=='scheduled'&&phase!=='withdrawn')fail();
+        await observeOwnedBillingGraph(context,phase);
+        return true;
+      })}:{}),
     }:{
     bindMissedIntent,
     inspectIntent:limits=>operation('INTENT',limits,inspectIntent),

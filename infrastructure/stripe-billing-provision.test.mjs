@@ -6,8 +6,10 @@ test('Billing fixture factory does not provision at construction',async()=>{
  const fixture=await api.createBillingFixture({configuration:{runId:'11111111-2222-4333-8444-555555555555',ports:{backend:18080,demo:18081,receiver:18082,mailpitHttp:18025}},bootstrap:{verify(){calls++;throw null;}}});
  assert.equal(calls,0);assert.equal(fixture.resources().customerId,undefined);await assert.rejects(()=>fixture.beforeDispatch('confirm','key',{}, {deadline:Date.now()+1000}));
 });
-test('fresh recurring provisioning uses real request shapes and persists original financial keys before ACK',async()=>{
+for(const cancellation of [false,true])test('fresh recurring provisioning persists ordered receipts with cancellation='+cancellation,async()=>{
  const c={runId:'11111111-2222-4333-8444-555555555555',expectedSource:'e'.repeat(40),ports:{backend:18080,demo:18081,receiver:18082,mailpitHttp:18025},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR'}},ids=[1,2,3,4,5,6,7,8].map(n=>`${String(n).padStart(8,'0')}-2222-4333-8444-555555555555`),writes=[],requests=[];
+ if(cancellation)Object.assign(c,{env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',PAYMENT_STRIPE_BILLING_CASE:'initial_cancel_withdraw'},
+   selectedCase:'initial_cancel_withdraw',daemon:'unix:///Users/test/docker.sock',ports:{...c.ports,postgres:15432,mailpitSmtp:11025},approvedBinding:{...c.approvedBinding,apiVersion:'2026-09-30.endive'}});
  const fetch=async(url,settings)=>{
   const path=new URL(url).pathname,body=settings.body&&JSON.parse(settings.body);requests.push({path,...settings,body});let value=null,status=200,headers={};
   if(path==='/api/admin/v1/auth/sessions'){status=204;headers={'set-cookie':['PAYMENT_ADMIN_SESSION=abc; Path=/','XSRF-TOKEN=def; Path=/']};}
@@ -34,5 +36,19 @@ test('fresh recurring provisioning uses real request shapes and persists origina
  await fixture.acknowledge('create',{subscriptionId:ids[5],operationId:ids[6]},{deadline:Date.now()+1000});
  await fixture.beforeDispatch('confirm','sdk-original-confirm',{subscriptionId:ids[5],operationId:ids[6],attemptId:ids[7]},{deadline:Date.now()+1000});
  await fixture.acknowledge('confirm',{attemptId:ids[7],state:'OBSERVE',nextActionAllowed:false},{deadline:Date.now()+1000});
+ if(cancellation){
+  const limits={deadline:Date.now()+5000},key='a'.repeat(64),next='b'.repeat(64);
+  const opA='10000000-2222-4333-8444-555555555555',opB='20000000-2222-4333-8444-555555555555';
+  await assert.rejects(()=>fixture.beforeCancellation('withdraw',next,limits));
+  await fixture.beforeCancellation('schedule',key,limits);
+  assert.equal(writes.at(-1).value.phase,'DISPATCHING');
+  await assert.rejects(()=>fixture.beforeCancellation('schedule',key,limits));
+  await fixture.acknowledgeCancellation('schedule',opA,limits);
+  await fixture.beforeCancellation('withdraw',next,limits);
+  await fixture.acknowledgeCancellation('withdraw',opB,limits);
+  assert.equal(writes.at(-1).value.phase,'ACKNOWLEDGED');
+  assert.equal(writes.at(-1).value.operationId,opB);
+  assert.equal(writes.at(-1).value.subscriptionId,ids[5]);
+ }else assert.equal(fixture.beforeCancellation,undefined);
  assert.ok(!JSON.stringify(writes).includes('secret-sentinel'));assert.ok(!requests.some(r=>/fake|checkout|donation|clock/.test(r.path)));assert.equal(requests.some(r=>r.path==='/api/v1/customer/subscriptions'),false);
 });

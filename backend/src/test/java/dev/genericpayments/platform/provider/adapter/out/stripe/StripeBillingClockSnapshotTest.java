@@ -25,6 +25,11 @@ class StripeBillingClockSnapshotTest {
             }else if(owned)assertThatThrownBy(()->owned(f)).isInstanceOf(PaymentApplicationException.class);
             else assertThat(StripeBillingSnapshotMapper.retrieve(f.f.clients.create(null),f.ordinary(),f.utc).invoices().getFirst().settlement()).isEqualTo(dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind.UNSUPPORTED);
             assertThat(f.f.http.calls).hasSize(paid&&(owned||indicator.equals("zero"))&&!java.util.List.of("positive","negative").contains(indicator)?8:5).allMatch(c->c.method().name().equals("GET"));
+            var invoiceList=f.f.http.calls.stream().filter(request->request.url().getPath().equals("/v1/invoices")).toList();
+            assertThat(invoiceList).singleElement().satisfies(request->{
+                if(owned)assertThat(request.params()).doesNotContainKey("expand");
+                else assertThat(request.params()).containsEntry("expand",java.util.List.of("data.amount_paid_off_stripe"));
+            });
         }
     }
     static void indicator(StripeBillingOwnedSubscriptionFixture f,String state){

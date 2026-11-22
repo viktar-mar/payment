@@ -502,12 +502,160 @@ async function billingSetup(mutate=()=>{}){
 }
 test('Billing CLI exposes only lifecycle and exact graph reads with fixed supported listener events',async()=>{
   const f=await billingSetup();assert.equal(f.adapter.bindMissedIntent,undefined);assert.equal(f.adapter.bindManualPayment,undefined);
+  assert.equal(f.adapter.observeOwnedBillingCancellation,undefined);
   await f.adapter.validateBinding(f.limits);await start(f);const args=f.calls.find(c=>c.child).args,events=args[args.indexOf('--events')+1].split(',');
   assert.ok(events.includes('invoice.paid'));assert.ok(events.includes('customer.subscription.created'));assert.ok(events.includes('payment_intent.succeeded'));assert.equal(events.some(e=>e.startsWith('refund.')),false);
   assert.equal(await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits),true);
   const result=await f.adapter.observeOwnedBillingGraph(f.limits);assert.deepEqual(result,{providerVerified:true,initialCashVerified:true,lineCount:1,allocationCount:1,chargeCount:1});
   assert.ok(f.calls.filter(c=>c.args.includes('get')&&!c.args.includes('/v1/balance')).every(c=>c.args.includes('--stripe-version')&&c.args.includes(VERSION)));
   assert.equal(JSON.stringify(result).includes('never-return'),false);await stop(f);
+});
+async function cancellationSetup(beforeExecute) {
+  const f=await billingSetup();
+  if(beforeExecute){
+    const execute=f.dependencies.execute;
+    f.dependencies.execute=async(file,args,settings)=>{
+      await beforeExecute(args,f.objects);
+      return execute(file,args,settings);
+    };
+  }
+  f.options.configuration.selectedCase='initial_cancel_withdraw';
+  f.options.configuration.env.PAYMENT_STRIPE_BILLING_CASE='initial_cancel_withdraw';
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingCliAdapter(f.options,f.dependencies);
+  const target=billingTarget(),now=Math.floor(Date.now()/1000);
+  target.periodStart=now-3600;
+  target.periodEnd=now+2592000;
+  const subscription=f.objects['/v1/subscriptions/sub_original'];
+  Object.assign(subscription,{cancel_at:null,cancel_at_period_end:false,schedule:null,pending_update:null,pause_collection:null,
+    ended_at:null,collection_method:'charge_automatically',billing_cycle_anchor:target.periodStart,default_payment_method:null,default_source:null,discounts:[]});
+  Object.assign(subscription.items.data[0],{current_period_start:target.periodStart,current_period_end:target.periodEnd});
+  f.objects['/v1/invoices/in_original/lines'].data[0].period={start:target.periodStart,end:target.periodEnd};
+  f.objects['/v1/invoice_payments'].data[0].status_transitions.paid_at=target.periodStart+1;
+  f.objects['/v1/charges']={object:'list',data:[f.objects['/v1/charges/ch_original']],has_more:false};
+  await f.adapter.validateBinding(f.limits);
+  await start(f);
+  await f.adapter.bindOwnedBillingGraph(target,f.limits);
+  return {...f,target,subscription};
+}
+for(const flag of [false,true])test('Billing cancellation accepts the explicit original boundary with period-end flag '+flag+' and proves withdrawal',async()=>{
+  const f=await cancellationSetup();
+  assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).initialCashVerified,true);
+  f.subscription.cancel_at=f.target.periodEnd;
+  f.subscription.cancel_at_period_end=flag;
+  assert.equal(await f.adapter.observeOwnedBillingCancellation('scheduled',f.limits),true);
+  f.subscription.cancel_at=null;
+  f.subscription.cancel_at_period_end=false;
+  assert.equal(await f.adapter.observeOwnedBillingCancellation('withdrawn',f.limits),true);
+  for(const path of ['/v1/charges','/v1/invoices']){
+    const inventory=f.calls.filter(c=>c.args.includes(path)&&c.args.includes('customer=cus_original'));
+    assert.equal(inventory.length,3);
+    assert.ok(inventory.every(c=>c.args.includes('get')&&c.args.includes('limit=100')&&c.args.includes(VERSION)));
+  }
+  const count=f.calls.length;
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation('withdrawn',f.limits),/BILLING_CANCELLATION/);
+  assert.equal(f.calls.length,count);
+  await stop(f);
+});
+test('Billing cancellation requests the expandable out-of-band amount on the original invoice only',async()=>{
+  const invoicePath='/v1/invoices/in_original';
+  const f=await cancellationSetup((args,objects)=>{
+    if(args.includes(invoicePath)&&!args.includes('expand[]=amount_paid_off_stripe'))delete objects[invoicePath].amount_paid_off_stripe;
+  });
+  assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).initialCashVerified,true);
+  f.subscription.cancel_at=f.target.periodEnd;
+  await f.adapter.observeOwnedBillingCancellation('scheduled',f.limits);
+  f.subscription.cancel_at=null;
+  await f.adapter.observeOwnedBillingCancellation('withdrawn',f.limits);
+  const expanded=f.calls.filter(c=>c.args.some(arg=>arg.startsWith('expand[')));
+  assert.equal(expanded.length,3);
+  for(const call of expanded){
+    const get=call.args.indexOf('get');
+    assert.deepEqual(call.args.slice(get,get+4),['get',invoicePath,'-d','expand[]=amount_paid_off_stripe']);
+  }
+  await stop(f);
+  const ordinary=await billingSetup();
+  await ordinary.adapter.validateBinding(ordinary.limits);await start(ordinary);
+  await ordinary.adapter.bindOwnedBillingGraph(billingTarget(),ordinary.limits);
+  assert.equal((await ordinary.adapter.observeOwnedBillingGraph(ordinary.limits)).initialCashVerified,true);
+  assert.ok(!ordinary.calls.some(c=>c.args.includes('expand[]=amount_paid_off_stripe')));
+  await stop(ordinary);
+});
+test('Billing cancellation abandons overlapping observations without permitting either result',async()=>{
+  let release,entered;
+  const waiting=new Promise(resolve=>{entered=resolve;});
+  const paused=new Promise(resolve=>{release=resolve;});
+  let block=false;
+  const f=await cancellationSetup(async args=>{
+    if(block&&args.includes('/v1/customers/cus_original')){entered();await paused;}
+  });
+  await f.adapter.observeOwnedBillingGraph(f.limits);
+  f.subscription.cancel_at=f.target.periodEnd;
+  block=true;
+  const scheduled=f.adapter.observeOwnedBillingCancellation('scheduled',f.limits);
+  await waiting;
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation('scheduled',f.limits),/BUSY/);
+  release();
+  await assert.rejects(scheduled,/BILLING_CANCELLATION/);
+  const count=f.calls.length;
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation('withdrawn',f.limits));
+  assert.equal(f.calls.length,count);
+  await stop(f);
+});
+test('Billing cancellation rechecks the observed schedule after reading invoices and charges',async()=>{
+  let clearDuringRead=false;
+  const f=await cancellationSetup((args,objects)=>{
+    if(clearDuringRead&&args.includes('/v1/charges'))objects['/v1/subscriptions/sub_original'].cancel_at=null;
+  });
+  await f.adapter.observeOwnedBillingGraph(f.limits);
+  f.subscription.cancel_at=f.target.periodEnd;
+  clearDuringRead=true;
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation('scheduled',f.limits),/BILLING_CANCELLATION/);
+  await stop(f);
+});
+for(const phase of ['before baseline','withdrawn','arbitrary','repeat scheduled'])test('Billing cancellation refuses '+phase+' before any new provider read',async()=>{
+  const f=await cancellationSetup();
+  if(phase!=='before baseline')await f.adapter.observeOwnedBillingGraph(f.limits);
+  if(phase==='repeat scheduled'){
+    f.subscription.cancel_at=f.target.periodEnd;
+    await f.adapter.observeOwnedBillingCancellation('scheduled',f.limits);
+  }
+  const count=f.calls.length;
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation(phase==='before baseline'||phase==='repeat scheduled'?'scheduled':phase,f.limits),/BILLING_CANCELLATION/);
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation('scheduled',f.limits),/BILLING_CANCELLATION/);
+  assert.equal(f.calls.length,count);
+  await stop(f);
+});
+for(const [name,phase,mutate] of [
+  ['preexisting schedule','baseline',f=>f.subscription.cancel_at=f.target.periodEnd],
+  ['terminal subscription','baseline',f=>f.subscription.ended_at=f.target.periodStart],
+  ['wrong boundary','scheduled',f=>f.subscription.cancel_at=f.target.periodEnd-1],
+  ['native boolean alone','scheduled',f=>{f.subscription.cancel_at=null;f.subscription.cancel_at_period_end=true;}],
+  ['missing flag','scheduled',f=>delete f.subscription.cancel_at_period_end],
+  ['subscription schedule','scheduled',f=>f.subscription.schedule='sub_sched_foreign'],
+  ['pending plan change','scheduled',f=>f.subscription.pending_update={expires_at:f.target.periodEnd}],
+  ['paused collection','scheduled',f=>f.subscription.pause_collection={behavior:'void'}],
+  ['unrelated default method','withdrawn',f=>f.subscription.default_payment_method='pm_other'],
+  ['item identity drift','withdrawn',f=>{f.subscription.items.data[0].id='si_other';f.objects['/v1/invoices/in_original/lines'].data[0].parent.subscription_item_details.subscription_item='si_other';}],
+  ['residual schedule flag','withdrawn',f=>f.subscription.cancel_at_period_end=true],
+  ['absent cleared boundary','withdrawn',f=>delete f.subscription.cancel_at],
+  ['different captured charge','withdrawn',f=>{const charge={...f.objects['/v1/charges/ch_original'],id:'ch_other'};f.objects['/v1/payment_intents/pi_original'].latest_charge=charge.id;f.objects['/v1/charges/ch_other']=charge;f.objects['/v1/charges'].data=[charge];}],
+  ['additional customer charge','withdrawn',f=>f.objects['/v1/charges'].data.push({...f.objects['/v1/charges/ch_original'],id:'ch_additional'})],
+  ['additional invoice','withdrawn',f=>f.objects['/v1/invoices'].data.push({...f.objects['/v1/invoices/in_original'],id:'in_additional'})],
+  ['missing out-of-band amount','withdrawn',f=>delete f.objects['/v1/invoices/in_original'].amount_paid_off_stripe],
+  ['out-of-band cash','withdrawn',f=>f.objects['/v1/invoices/in_original'].amount_paid_off_stripe=2000],
+  ['refund','withdrawn',f=>f.objects['/v1/refunds'].data.push({id:'re_pending'})],
+])test('Billing cancellation abandons '+name+' at '+phase,async()=>{
+  const f=await cancellationSetup();
+  if(phase!=='baseline')await f.adapter.observeOwnedBillingGraph(f.limits);
+  if(phase==='withdrawn'){f.subscription.cancel_at=f.target.periodEnd;await f.adapter.observeOwnedBillingCancellation('scheduled',f.limits);}
+  f.subscription.cancel_at=phase==='scheduled'?f.target.periodEnd:null;
+  mutate(f);
+  await assert.rejects(phase==='baseline'?f.adapter.observeOwnedBillingGraph(f.limits):f.adapter.observeOwnedBillingCancellation(phase,f.limits),/BILLING_(CANCELLATION|GRAPH)/);
+  const count=f.calls.length;
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation('scheduled',f.limits));
+  assert.equal(f.calls.length,count);
+  await stop(f);
 });
 for(const [name,mutate] of [
  ['foreign customer',o=>o['/v1/customers/cus_original'].metadata.account_id=RUN],['foreign subscription',o=>o['/v1/subscriptions/sub_original'].customer='cus_other'],['wrong price',o=>o['/v1/prices/price_original'].metadata.local_price_id=RUN],['out of band',o=>o['/v1/invoices/in_original'].amount_paid_off_stripe=2000],['extra line',o=>o['/v1/invoices/in_original/lines'].data.push({...o['/v1/invoices/in_original/lines'].data[0],id:'il_other'})],['split allocation',o=>o['/v1/invoice_payments'].data.push({...o['/v1/invoice_payments'].data[0],id:'inpay_other'})],['non-default',o=>o['/v1/invoice_payments'].data[0].is_default=false],['wrong intent',o=>o['/v1/invoice_payments'].data[0].payment.payment_intent='pi_other'],['uncaptured',o=>o['/v1/charges/ch_original'].captured=false],['refunded',o=>o['/v1/charges/ch_original'].amount_refunded=1],['live',o=>o['/v1/payment_intents/pi_original'].livemode=true],['endless pagination',o=>o['/v1/invoices/in_original/lines'].has_more=true],

@@ -9,7 +9,12 @@ select bc.provider_reference customer_reference, s.provider_reference subscripti
  pm.provider_product_id product_reference, pr.provider_price_id price_reference,
  g.billing_invoice_reference invoice_reference, g.billing_allocation_reference allocation_reference,
  g.billing_intent_reference intent_reference, extract(epoch from b.period_start)::bigint period_start,
- extract(epoch from b.period_end)::bigint period_end, p.id payment_id, b.id billing_record_id,
+ extract(epoch from b.period_end)::bigint period_end, s.revision subscription_revision,
+ s.cancellation_effective_at is null initial_unscheduled, p.id payment_id, b.id billing_record_id,
+ (select jsonb_agg(e.id) from payment_events e where e.site_id=x.site_id and e.payment_account_id=x.account_id
+       and e.payment_id=p.id and e.event_type='PAYMENT_SUCCEEDED' and e.amount_minor=2000 and e.currency='EUR') cash_journal_ids,
+ (select jsonb_agg(e.id) from subscription_events e where e.site_id=x.site_id and e.payment_account_id=x.account_id
+       and e.subscription_id=s.id and e.billing_record_id=b.id and e.event_type='PERIOD_PAID' and e.payment_id is null) paid_journal_ids,
  jsonb_build_object(
  'cash', s.billing_status='ACTIVE' and s.trial_start is null and s.trial_end is null
    and s.billing_price_id=x.price_id and s.billing_price_version=1 and s.billing_amount_minor=2000

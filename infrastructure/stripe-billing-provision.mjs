@@ -1,4 +1,5 @@
 import {billingFailedRenewalExcluded,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
+import {validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
 import {constants} from 'node:fs';
 import {open,lstat,realpath} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
@@ -23,6 +24,10 @@ export const isFailedRenewalProvisionCheckpoint=code=>checkpointCodes.has(code);
 /** Fresh recurring fixture only. Cookies and callback secrets never enter its append-only public ledger. */
 export async function createBillingFixture(options,dependencies={}) {
  need(billingFailedRenewalExcluded(options?.configuration?.env??{}));
+ if(options.configuration?.selectedCase==='initial_cancel_withdraw'){
+  const configuration=validateBillingAcceptanceOptions(options.configuration);need(configuration);
+  return createFixture({...options,configuration},dependencies,'CANCELLATION');
+ }
  return createFixture(options,dependencies,'INITIAL');
 }
 export async function createBillingFailedRenewalFixture({configuration,bootstrap,cli},dependencies={}) {
@@ -32,6 +37,7 @@ export async function createBillingFailedRenewalFixture({configuration,bootstrap
 async function createFixture({configuration:c,bootstrap,cli},dependencies,purpose) {
  const failed=purpose==='FAILED_RENEWAL',graceDays=failed?3:0;
  let provisionClaimed=false,confirmRecorded=false,armState='NEW',armBoundary;
+ let nextCancellation='schedule',scheduleHash,scheduleOperation;
  const fetcher=dependencies.fetch??globalThis.fetch,write=dependencies.write??writeOwned;
  const suffix=c.runId.replaceAll('-',''),siteKey='s5a-'+suffix,email='billing-'+suffix+'@example.test';
  const endpoints=Object.fromEntries(['backend','demo','receiver'].map(k=>[k,'http://127.0.0.1:'+c.ports[k]]));
@@ -73,7 +79,7 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
  }
  const fixture=Object.freeze({resources,
   async provision(limits){
-   need(!provisioned&&!busy&&!closed&&(!failed||!provisionClaimed));provisionClaimed=true;busy=true;started=Date.now();
+   need(!provisioned&&!busy&&!closed&&(purpose==='INITIAL'||!provisionClaimed));provisionClaimed=true;busy=true;started=Date.now();
    try{
     need(await cli.validateBinding(limits)===true);
     let admin;need(await bootstrap.withAdminCredentials(credentials=>{admin={username:credentials.username,password:credentials.password};return true;},limits)===true);
@@ -139,6 +145,25 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
    else need(kind==='confirm'&&confirmKey&&value?.state==='OBSERVE'&&value.attemptId===attemptId&&value.nextActionAllowed===false);
    await save(kind+'-ack',{phase:'ACKNOWLEDGED',subscriptionId,operationId,...(kind==='confirm'?{attemptId}:{})},limits);if(kind==='confirm')confirmRecorded=true;return true;
   },
+  ...(purpose==='CANCELLATION'?{
+   async beforeCancellation(kind,keyHash,limits){
+    need(!closed && provisioned && confirmRecorded && ['schedule','withdraw'].includes(kind) &&
+      nextCancellation===kind && typeof keyHash==='string' && /^[0-9a-f]{64}$/.test(keyHash) &&
+      ![digest(createKey),digest(confirmKey),scheduleHash].includes(keyHash));
+    nextCancellation='writing';
+    await save(kind+'-dispatch',{phase:'DISPATCHING',subscriptionId,customerId,keyHash},limits);
+    if(kind==='schedule')scheduleHash=keyHash;
+    nextCancellation=kind+'-sent';return true;
+   },
+   async acknowledgeCancellation(kind,id,limits){
+    need(!closed && ['schedule','withdraw'].includes(kind) && nextCancellation===kind+'-sent' &&
+      billingUuid(id) && id!==operationId && id!==scheduleOperation);
+    nextCancellation='writing';
+    await save(kind+'-ack',{phase:'ACKNOWLEDGED',subscriptionId,operationId:id},limits);
+    if(kind==='schedule')scheduleOperation=id;
+    nextCancellation=kind==='schedule'?'withdraw':'complete';return true;
+   },
+  }:{}),
   ...(failed?{
    async beforeDeclineArm(v,limits){
     need(provisioned&&!closed&&confirmRecorded&&armState==='NEW');

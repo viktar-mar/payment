@@ -5,7 +5,7 @@ import {billingCheck,billingError} from './stripe-billing-limits.mjs';
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const need=value=>{if(!value)throw billingError('LOGIN');};
 export function billingAuthorization(raw) {return authorization(raw,false);}
-function authorization(raw,failedRenewal) {
+function authorization(raw,deviceHandoff) {
  need(typeof raw==='string'&&raw.length<65536);
  const names=['browser_url','verification_code','next_step'],value=Object.create(null);let cursor=0;
  const quoted=/"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"/y;
@@ -14,7 +14,7 @@ function authorization(raw,failedRenewal) {
  const string=()=>{whitespace();quoted.lastIndex=cursor;const match=quoted.exec(raw);need(match);cursor=quoted.lastIndex;return JSON.parse(match[0]);};
  punctuation('{');for(let i=0;i<3;i++){if(i)punctuation(',');const key=string();need(names.includes(key)&&!Object.hasOwn(value,key));punctuation(':');value[key]=string();}punctuation('}');whitespace();need(cursor===raw.length&&value.next_step==='stripe login --complete-device');
  const code=value.verification_code;
- if(failedRenewal)need(value.browser_url==='https://access.stripe.com/stripecli/oauth2/device'&&code.length===9&&/^[A-Z]{4}-[A-Z]{4}$/.test(code));
+ if(deviceHandoff)need(value.browser_url==='https://access.stripe.com/stripecli/oauth2/device'&&code.length===9&&/^[A-Z]{4}-[A-Z]{4}$/.test(code));
  const url=new URL(value.browser_url);
  need(url.protocol==='https:'&&['access.stripe.com','dashboard.stripe.com'].includes(url.hostname)&&!url.port&&!url.username&&!url.password&&!url.hash&&!/[\s\\\x00-\x1f\x7f]/.test(value.browser_url)&&!/(?:[spr]k_(?:test|live)_|whsec_|client_secret|%0[0-9a-f])/i.test(decodeURIComponent(value.browser_url))&&/^[A-Za-z0-9](?:[A-Za-z0-9 -]{2,126}[A-Za-z0-9])$/.test(code)&&!/(?:[spr]k_(?:test|live)|whsec|client.secret)/i.test(code));
  return `Authorize the isolated Sandbox CLI at ${url.href} using code ${code}. Keep this terminal open.\n`;
@@ -36,6 +36,8 @@ export async function completeBillingLogin(cli,configuration,limits,dependencies
    catch{abort();}
   });
  }
- const first=await run(await cli.loginInvocation(limits),false);need(first.stderr==='');output(authorization(first.stdout,configuration.selectedCase==='initial_failed_renewal_grace_recovery'));
+ const first=await run(await cli.loginInvocation(limits),false);need(first.stderr==='');
+ const deviceHandoff=['initial_failed_renewal_grace_recovery','initial_cancel_withdraw'].includes(configuration.selectedCase);
+ output(authorization(first.stdout,deviceHandoff));
  await run(await cli.completeLoginInvocation(limits),true);return true;
 }

@@ -51,3 +51,49 @@ test('literal false cleanup receipt blocks acceptance',async()=>{const h=harness
 test('literal false listener readiness never permits financial dispatch',async()=>{const h=harness();h.cli.assertBillingListener=async()=>false;const owner=await api.createOwnedBillingAcceptance(options(),h.dependencies);await assert.rejects(()=>owner.run(journey,limits()));assert.equal(h.calls.includes('persist'),false);});
 test('hostile rejection accessors never enter failure diagnostics',async()=>{let reads=0;const h=harness({preflight:async()=>{throw Object.defineProperty({},'message',{get(){reads++;throw Error('secret');}});}}),owner=await api.createOwnedBillingAcceptance(options(),h.dependencies);await assert.rejects(()=>owner.run(journey,limits()),/^Error: billing_/);assert.equal(reads,0);assert.equal(owner.resources().initialAccepted,false);});
 test('resources distinguish owner closure from unconfirmed resource cleanup',async()=>{const h=harness();h.bootstrap.stop=async()=>false;const owner=await api.createOwnedBillingAcceptance(options(),h.dependencies);await assert.rejects(()=>owner.run(journey,limits()));assert.equal(owner.resources().cleanupConfirmed,false);});
+const cancelOptions=()=>({...options(),selectedCase:'initial_cancel_withdraw',env:{...options().env,PAYMENT_STRIPE_BILLING_CASE:'initial_cancel_withdraw'}});
+const keyA='10000000-0000-4000-a000-000000000001',keyB='20000000-0000-4000-a000-000000000002';
+const opA='30000000-0000-4000-a000-000000000003',opB='40000000-0000-4000-a000-000000000004';
+for(const mode of ['success','initial-only-owner','no-baseline','early-withdraw','duplicate','same-key','same-operation','lost-ack','provider-refused','no-local-proof','cleanup-refused','browser-refused','browser-unknown']){
+ test('non-clock cancellation owner: '+mode,async()=>{
+  const h=harness();
+  h.cli.observeOwnedBillingCancellation=async phase=>{h.calls.push('remote-'+phase);return mode!=='provider-refused';};
+  h.fixture.beforeCancellation=async(kind,hash)=>{assert.match(hash,/^[a-f0-9]{64}$/);h.calls.push('dispatch-'+kind);return true;};
+  h.fixture.acknowledgeCancellation=async(kind,id)=>{assert.equal(id,kind==='schedule'?opA:opB);h.calls.push('ack-'+kind);return true;};
+  h.dependencies.proveCancellation=async({phase,operations,baseline})=>{
+   assert.equal(baseline.cashVerified,true);assert.equal(operations.schedule.operationId,opA);
+   if(phase==='withdrawn')assert.equal(operations.withdraw.operationId,opB);
+   return mode!=='no-local-proof';
+  };
+  if(mode==='cleanup-refused')h.bootstrap.stop=async()=>false;
+  if(mode==='initial-only-owner'){
+   await assert.rejects(api.createOwnedBillingAcceptance(cancelOptions(),h.dependencies));
+   await assert.rejects(api.createOwnedBillingCancellation(options(),h.dependencies));
+   assert.deepEqual(h.calls,[]);return;
+  }
+  const owner=await api.createOwnedBillingCancellation(cancelOptions(),h.dependencies);
+  const run=owner.run(async p=>{
+   await journey(p);
+   if(mode!=='no-baseline')await p.verifyInitial();
+   await p.beforeCancellation(mode==='early-withdraw'?'withdraw':'schedule',keyA);
+   if(mode==='duplicate')await p.beforeCancellation('schedule',keyA);
+   if(mode==='lost-ack')return;
+   await p.verifyCancellation('schedule',opA);
+   await p.beforeCancellation('withdraw',mode==='same-key'?keyA:keyB);
+   await p.verifyCancellation('withdraw',mode==='same-operation'?opA:opB);
+   if(mode==='browser-unknown')return;
+   return mode!=='browser-refused';
+  },limits());
+  if(mode==='success'){
+   const result=await run;
+   assert.equal(result.cancellationAccepted,true);assert.equal(result.scope,'INITIAL_CANCEL_WITHDRAW');
+   assert.deepEqual(h.calls.filter(s=>/^(dispatch|remote|ack)-/.test(s)),['dispatch-schedule','remote-scheduled','ack-schedule','dispatch-withdraw','remote-withdrawn','ack-withdraw']);
+  }else{
+   await assert.rejects(run);assert.equal(owner.resources().cancellationAccepted,false);
+   if(['early-withdraw','no-baseline'].includes(mode))assert.ok(!h.calls.includes('dispatch-schedule')&&!h.calls.includes('dispatch-withdraw'));
+   if(['provider-refused','no-local-proof','duplicate','lost-ack','same-key'].includes(mode))assert.ok(!h.calls.includes('dispatch-withdraw'));
+  }
+  assert.equal(owner.resources().full5bAccepted,false);
+  await assert.rejects(()=>owner.run(journey,limits()),/SINGLE_USE/);
+ });
+}

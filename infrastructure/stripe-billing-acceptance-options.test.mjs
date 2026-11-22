@@ -55,3 +55,14 @@ test('explicit native environment snapshot admits process.env prototype without 
  let reads=0;for(const mutate of [v=>v.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS='true',v=>v.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT='true',v=>Object.defineProperty(v,'DEBUG',{enumerable:true,get(){reads++;return '';}}),v=>Object.setPrototypeOf(v,{PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND:'false'}),v=>delete v.PAYMENT_STRIPE_BILLING_ACCEPTANCE]){const value=Object.create({});Object.assign(value,options().env);mutate(value);assert.equal(module.snapshotBillingAcceptanceEnvironment(value),null);}
  const withUnrelated=Object.assign(Object.create({}),options().env);Object.defineProperty(withUnrelated,'UNRELATED_PRIVATE_VALUE',{get(){reads++;throw null;}});assert.ok(module.snapshotBillingAcceptanceEnvironment(withUnrelated));assert.equal(reads,0);
 });
+test('ordinary cancellation requires the exact case, scope and bounded budget',()=>{
+ const original=options(),caseName='initial_cancel_withdraw';
+ const value={...original,env:{...original.env,PAYMENT_STRIPE_BILLING_CASE:caseName},selectedCase:caseName};
+ const admitted=module.validateBillingAcceptanceOptions(value);
+ assert.ok(admitted);
+ assert.deepEqual(admitted.budget,{create:1,confirm:1,schedule:1,withdraw:1});
+ assert.deepEqual(module.validateBillingAcceptanceOptions(admitted),admitted);
+ assert.deepEqual(module.snapshotBillingAcceptanceEnvironment(value.env),value.env);
+ for(const bad of [{...value,env:original.env},{...value,selectedCase:'initial_success'},{...value,budget:{...admitted.budget,schedule:2}},
+   {...value,env:{...value.env,PAYMENT_STRIPE_BILLING_CASE:'other'}}])assert.equal(module.validateBillingAcceptanceOptions(bad),null);
+});
