@@ -211,19 +211,113 @@ public class StripeBillingSteps {
     private void respondPage(String path,List<JsonObject> items) { http.enqueue("GET",path,200,page(items)); }
     private void reconcile() { readGraph();bean(ReconcileSubscriptionUseCase.class).reconcile(new ReconcileSubscriptionUseCase.Command(context(key()),created.subscriptionId())); }
     private void signed(String event) throws Exception {
-        long at=Instant.now().getEpochSecond();String body="{\"id\":\""+event+"\",\"object\":\"event\",\"api_version\":\"2026-09-30.endive\",\"livemode\":false,\"created\":"+at+",\"type\":\"invoice.paid\",\"data\":{\"object\":{\"id\":\"in_initial\",\"object\":\"invoice\",\"livemode\":false}}}";
+        signed(event, "invoice.paid", now(), "paid");
+    }
+    private void signed(String event, String type, Instant eventTime, String invoiceStatus) throws Exception {
+        long at=Instant.now().getEpochSecond();
+        var envelope=json("""
+            {"object":"event","api_version":"2026-09-30.endive","livemode":false,
+             "data":{"object":{"id":"in_initial","object":"invoice","livemode":false}}}
+            """);
+        envelope.addProperty("id",event);
+        envelope.addProperty("type",type);
+        envelope.addProperty("created",eventTime.getEpochSecond());
+        envelope.getAsJsonObject("data").getAsJsonObject("object").addProperty("status", invoiceStatus);
+        String body=envelope.toString();
         var mac=Mac.getInstance("HmacSHA256");mac.init(new SecretKeySpec(StripeAcceptanceConfiguration.SIGNING.getBytes(StandardCharsets.UTF_8),"HmacSHA256"));
         String signature=HexFormat.of().formatHex(mac.doFinal((at+"."+body).getBytes(StandardCharsets.UTF_8)));
         var response=world.api().mvc.perform(post("/api/v1/provider-webhooks/stripe/stripe-billing-acceptance").header("Stripe-Signature","t="+at+",v1="+signature).contentType("application/json").content(body)).andReturn().getResponse();
         assertThat(response.getStatus()).as("Billing signed receipt HTTP status; payload withheld").isEqualTo(204);
     }
     private void processReceipt(String event) throws Exception {
-        signed(event);TestClock.set(Instant.now().truncatedTo(ChronoUnit.MICROS));identity();respond("GET","/v1/invoices/in_initial",invoices.getFirst().invoice());readGraph();
+        signed(event);
+        processReceivedInvoice(event);
+    }
+    private void processReceivedInvoice(String event) {
+        TestClock.set(Instant.now().truncatedTo(ChronoUnit.MICROS));identity();respond("GET","/v1/invoices/in_initial",invoices.getFirst().invoice());readGraph();
         bean(SubscriptionInboxWorker.class).runOnce();
         assertThat(count("provider_inbox","payment_account_id=? and provider_event_id=? and status='PROCESSED'",account.id().value(),event)).isEqualTo(1);
     }
     @When("its initial Stripe invoice is verified through a signed receipt") public void initialPaid() throws Exception {
         remote.addProperty("status","active");invoices.add(invoice("initial","subscription_create",start,end,"CASH"));processReceipt("evt_initial");
+    }
+    @When("its paid Stripe invoice is reconciled before any webhook arrives")
+    public void recoverMissingInvoiceNotification() {
+        remote.addProperty("status","active");
+        invoices.add(invoice("initial","subscription_create",start,end,"CASH"));
+        int before=http.calls().size();
+        TestClock.set(Instant.now().truncatedTo(ChronoUnit.MICROS));
+        reconcile();
+        assertThat(count("provider_inbox","payment_account_id=?",account.id().value())).isZero();
+        assertFreshInvoiceEvidence(before, false);
+    }
+
+    private void assertFreshInvoiceEvidence(int before, boolean receivedWebhook) {
+        var calls=http.calls().stream().skip(before).toList();
+        assertThat(calls).allSatisfy(call -> assertThat(call.method()).isEqualTo("GET"));
+        assertThat(calls).extracting(StripeHttpFixture.Call::path).contains("/v1/invoices/in_initial/lines",
+            "/v1/payment_intents/pi_initial","/v1/charges/ch_initial");
+        assertThat(calls).filteredOn(call -> call.path().equals("/v1/invoices/in_initial"))
+            .hasSize(receivedWebhook ? 1 : 0);
+        assertThat(calls).filteredOn(call -> call.path().equals("/v1/invoices")).singleElement()
+            .satisfies(call -> assertThat(call.query()).containsEntry("subscription","sub_billing"));
+        assertThat(calls).filteredOn(call -> call.path().equals("/v1/invoice_payments")).satisfiesExactly(
+            forward -> assertThat(forward.query()).containsEntry("invoice","in_initial"),
+            reverse -> assertThat(reverse.query()).containsEntry("payment[type]","payment_intent")
+                .containsEntry("payment[payment_intent]","pi_initial").doesNotContainKey("invoice"));
+    }
+
+    private record PublishedCash(UUID bill, UUID payment, UUID cashEvent, UUID periodEvent) {}
+
+    private PublishedCash originalPublishedCash() {
+        assertThat(count("subscription_billing_records","site_id=? and subscription_id=?",
+            site.value(),created.subscriptionId())).isOne();
+        assertThat(count("subscription_events","site_id=? and subscription_id=? and event_type='PERIOD_PAID'",
+            site.value(),created.subscriptionId())).isOne();
+        return jdbc.queryForObject("""
+            select b.id, p.id, cash.id, period.id from subscription_billing_records b
+            join payments p on p.billing_record_id=b.id and p.subscription_id=b.subscription_id and p.site_id=b.site_id
+              and p.payment_account_id=b.payment_account_id and p.provider_payment_reference='pi_initial'
+              and p.subscription_invoice_reference=b.provider_invoice_reference and p.status='SUCCEEDED'
+              and p.source='SUBSCRIPTION' and p.amount_minor=2000 and p.currency='EUR'
+            join payment_events cash on cash.payment_id=p.id and cash.event_type='PAYMENT_SUCCEEDED'
+              and cash.site_id=p.site_id and cash.payment_account_id=p.payment_account_id
+            join subscription_events period on period.billing_record_id=b.id and period.subscription_id=b.subscription_id
+              and period.site_id=b.site_id and period.payment_account_id=b.payment_account_id
+              and period.event_type='PERIOD_PAID' and period.source='RECONCILIATION'
+            join outbox_events pay_callback on pay_callback.id=cash.id and pay_callback.site_id=p.site_id
+              and pay_callback.payment_id=p.id and pay_callback.callback_type='payment.succeeded'
+            join outbox_events period_callback on period_callback.id=period.id and period_callback.site_id=b.site_id
+              and period_callback.subscription_id=b.subscription_id and period_callback.callback_type='subscription.updated'
+            where b.site_id=? and b.subscription_id=? and b.payment_account_id=? and p.customer_id=?
+              and b.provider_invoice_reference='in_initial' and b.kind='INITIAL' and b.settlement='CONFIRMED_CASH'
+              and b.currency='EUR' and b.amount_due_minor=2000
+            """,(row,index) -> new PublishedCash(row.getObject(1,UUID.class),row.getObject(2,UUID.class),
+                row.getObject(3,UUID.class),row.getObject(4,UUID.class)),
+            site.value(),created.subscriptionId(),account.id().value(),customer.id().value());
+    }
+
+    @When("its delayed paid and earlier finalized Stripe notifications arrive in reverse order")
+    public void reversedInvoiceNotifications() throws Exception {
+        var original=originalPublishedCash();
+        var paidTime=Instant.now().minusSeconds(1);
+        signed("evt_delayedpaid", "invoice.paid", paidTime, "paid");
+        int before=http.calls().size();
+        processReceivedInvoice("evt_delayedpaid");
+        assertFreshInvoiceEvidence(before, true);
+        assertThat(originalPublishedCash()).isEqualTo(original);
+        unchanged();
+        signed("evt_earlierfinalized", "invoice.finalized", paidTime.minusSeconds(1), "open");
+        before=http.calls().size();
+        processReceivedInvoice("evt_earlierfinalized");
+        assertFreshInvoiceEvidence(before, true);
+        assertThat(originalPublishedCash()).isEqualTo(original);
+        assertThat(count("provider_inbox","payment_account_id=? and status='PROCESSED'",account.id().value())).isEqualTo(2);
+        assertThat(jdbc.queryForList("""
+            select provider_event_id from provider_inbox where payment_account_id=? order by occurred_at
+            """,String.class,account.id().value())).containsExactly("evt_earlierfinalized","evt_delayedpaid");
+        assertThat(access().reason()).isEqualTo(AccessDecision.Reason.PAID);
+        assertThat(subscription().paidThrough()).isEqualTo(end);
     }
     @Then("one owned subscription cash payment and canonical callbacks exist") public void initialCash() {
         assertThat(cash()).isEqualTo(1);assertThat(subscription().paidThrough()).isEqualTo(end);assertThat(access().reason()).isEqualTo(AccessDecision.Reason.PAID);

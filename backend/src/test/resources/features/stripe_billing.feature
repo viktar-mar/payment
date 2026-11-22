@@ -13,6 +13,16 @@ Feature: Stripe Billing through the configured application and official SDK
     And its original Stripe create key and Account ownership remain intact
     And its canonical Site callbacks are signed and delivered exactly once
 
+  @billing-missed-webhook
+  Scenario: Reconciliation recovers a missed invoice and reversed late events preserve the original cash
+    Given an owned Stripe Billing subscription with 0 trial days
+    Then its Stripe create acknowledgement has no cash or paid access
+    When its paid Stripe invoice is reconciled before any webhook arrives
+    Then one owned subscription cash payment and canonical callbacks exist
+    When its delayed paid and earlier finalized Stripe notifications arrive in reverse order
+    Then its subscription cash, lifecycle facts and callbacks are unchanged
+    And its canonical Site callbacks are signed and delivered exactly once
+
   Scenario: An ordinary optional method trial proves ZERO without cash
     Given an owned Stripe Billing subscription with 7 trial days
     Then its Stripe create acknowledgement has no cash or paid access
