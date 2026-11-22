@@ -24,9 +24,9 @@ export const isFailedRenewalProvisionCheckpoint=code=>checkpointCodes.has(code);
 /** Fresh recurring fixture only. Cookies and callback secrets never enter its append-only public ledger. */
 export async function createBillingFixture(options,dependencies={}) {
  need(billingFailedRenewalExcluded(options?.configuration?.env??{}));
- if(['initial_cancel_withdraw','initial_decline_retry'].includes(options.configuration?.selectedCase)){
+ if(['initial_cancel_withdraw','initial_decline_retry','initial_3ds'].includes(options.configuration?.selectedCase)){
   const configuration=validateBillingAcceptanceOptions(options.configuration);need(configuration);
-  return createFixture({...options,configuration},dependencies,configuration.selectedCase==='initial_decline_retry'?'INITIAL_RETRY':'CANCELLATION');
+  return createFixture({...options,configuration},dependencies,configuration.selectedCase==='initial_3ds'?'INITIAL_3DS':configuration.selectedCase==='initial_decline_retry'?'INITIAL_RETRY':'CANCELLATION');
  }
  return createFixture(options,dependencies,'INITIAL');
 }
@@ -37,8 +37,8 @@ export async function createBillingFailedRenewalFixture({configuration,bootstrap
 async function createFixture({configuration:c,bootstrap,cli},dependencies,purpose) {
  const failed=purpose==='FAILED_RENEWAL',graceDays=failed?3:0;
  let provisionClaimed=false,confirmRecorded=false,armState='NEW',armBoundary;
- const retry=purpose==='INITIAL_RETRY';
- const retryLedger=['create-dispatch','create-ack','confirm-dispatch','confirm-ack','decline-proof','retry-dispatch','retry-ack','successor-confirm-dispatch','successor-confirm-ack','recovered-proof'];
+ const retry=purpose==='INITIAL_RETRY',challenge=purpose==='INITIAL_3DS';
+ const retryLedger=challenge?['create-dispatch','create-ack','confirm-dispatch','confirm-ack','challenge-dispatch','challenge-ack']:['create-dispatch','create-ack','confirm-dispatch','confirm-ack','decline-proof','retry-dispatch','retry-ack','successor-confirm-dispatch','successor-confirm-ack','recovered-proof'];
  let retryCursor=0,retryKeyHash,successorId,successorKeyHash;
  let nextCancellation='schedule',scheduleHash,scheduleOperation;
  const fetcher=dependencies.fetch??globalThis.fetch,write=dependencies.write??writeOwned;
@@ -59,7 +59,7 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
  }
  async function save(kind,value,limits){need(!closed);await billingBounded(limits,l=>write('billing-'+String(++sequence).padStart(3,'0')+'-'+kind+'.json',{runId:c.runId,expectedSource:c.expectedSource,...value},l));}
  async function financialReceipt(kind,value,limits) {
-  if(!retry)return save(kind,value,limits);
+  if(!retry&&!challenge)return save(kind,value,limits);
   need(retryLedger[retryCursor]===kind);
   const current=retryCursor;retryCursor=-1;
   await save(kind,value,limits);
@@ -153,11 +153,17 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
   async acknowledge(kind,value,limits){
    if(kind==='create'){need(createKey&&!subscriptionId&&billingUuid(value?.subscriptionId)&&billingUuid(value.operationId)&&value.subscriptionId!==value.operationId);subscriptionId=value.subscriptionId;operationId=value.operationId;}
    else {
-    need(kind==='confirm'&&confirmKey&&value?.attemptId===attemptId&&value.nextActionAllowed===false);
-    need(retry?value.state==='DECLINED'&&value.retryAllowed===true&&value.successorAttemptId===null:value.state==='OBSERVE');
+    need(kind==='confirm'&&confirmKey&&value?.attemptId===attemptId&&value.nextActionAllowed===challenge);
+    need(challenge?value.state==='REQUIRES_ACTION'&&value.retryAllowed===false&&value.successorAttemptId===null:retry?value.state==='DECLINED'&&value.retryAllowed===true&&value.successorAttemptId===null:value.state==='OBSERVE');
    }
-   await financialReceipt(kind+'-ack',{phase:'ACKNOWLEDGED',subscriptionId,operationId,...(kind==='confirm'?{attemptId,...(retry?{state:'DECLINED'}:{})}:{})},limits);if(kind==='confirm')confirmRecorded=true;return true;
+   await financialReceipt(kind+'-ack',{phase:'ACKNOWLEDGED',subscriptionId,operationId,...(kind==='confirm'?{attemptId,...(challenge?{state:'REQUIRES_ACTION'}:retry?{state:'DECLINED'}:{})}:{})},limits);if(kind==='confirm')confirmRecorded=true;return true;
   },
+  ...(challenge?{
+   async recordChallenge(kind,identity,limits){
+    need(confirmRecorded && ['challenge-dispatch','challenge-ack'].includes(kind) && identity.subscriptionId===subscriptionId && identity.operationId===operationId && identity.attemptId===attemptId);
+    await financialReceipt(kind,{subscriptionId,operationId,attemptId,phase:kind==='challenge-dispatch'?'DISPATCHING':'ACKNOWLEDGED'},limits);return true;
+   },
+  }:{}),
   ...(retry?{
    async recordRetry(kind,value,limits) {
     need(confirmRecorded && retryLedger[retryCursor]===kind);

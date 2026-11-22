@@ -538,6 +538,30 @@ async function cancellationSetup(beforeExecute) {
   await f.adapter.bindOwnedBillingGraph(target,f.limits);
   return {...f,target,subscription};
 }
+for(const variant of ['authenticated','absent','frictionless','attempted','v1','trailing-newline','different-charge','extra-charge']){
+ test('initial 3DS requires the authenticated challenge on the single original captured charge: '+variant,async()=>{
+  const f=await billingSetup(),target=billingTarget();
+  assert.equal(f.adapter.observeOwnedBillingInitial3ds,undefined);
+  const config=f.options.configuration;
+  config.selectedCase='initial_3ds';config.env.PAYMENT_STRIPE_BILLING_CASE=config.selectedCase;
+  const charge=f.objects['/v1/charges/ch_original'];
+  const evidence={result:variant==='attempted'?'attempt_acknowledged':'authenticated',
+   authentication_flow:variant==='frictionless'?'frictionless':'challenge',
+   version:variant==='v1'?'1.0.2':variant==='trailing-newline'?'2.2.0\n':'2.2.0'};
+  charge.payment_method_details.card=variant==='absent'?{}:{three_d_secure:evidence};
+  f.objects['/v1/charges']={object:'list',has_more:false,data:[variant==='different-charge'?{...charge,id:'ch_other'}:charge]};
+  if(variant==='extra-charge')f.objects['/v1/charges'].data.push({...charge,id:'ch_extra'});
+  f.objects['/v1/invoices'].data=[f.objects['/v1/invoices/in_original']];
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingCliAdapter(f.options,f.dependencies);
+  assert.equal(f.adapter.observeOwnedBillingGraph,undefined);
+  await f.adapter.validateBinding(f.limits);await start(f);
+  const inspect=()=>f.adapter.observeOwnedBillingInitial3ds(target,f.limits);
+  if(variant==='authenticated')assert.equal(await inspect(),true);else await assert.rejects(inspect);
+  const count=f.calls.length;await assert.rejects(inspect);assert.equal(f.calls.length,count);
+  await stop(f);
+ });
+}
 for(const flag of [false,true])test('Billing cancellation accepts the explicit original boundary with period-end flag '+flag+' and proves withdrawal',async()=>{
   const f=await cancellationSetup();
   assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).initialCashVerified,true);

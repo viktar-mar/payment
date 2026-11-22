@@ -28,6 +28,7 @@ class BillingAcceptanceSqlIntegrationTest extends PostgresIntegrationTest {
                 statement.setString(9, "a".repeat(64));
                 statement.setString(10, "b".repeat(64));
                 statement.setString(11, "http://127.0.0.1:18081");
+                statement.setBoolean(12, false);
                 statement.setQueryTimeout(5);
                 try (var rows = statement.executeQuery()) { assertThat(rows.next()).isFalse(); }
             } finally { connection.rollback(); }
@@ -44,6 +45,7 @@ class BillingAcceptanceSqlIntegrationTest extends PostgresIntegrationTest {
                 var initialSql = Files.readString(Path.of("../infrastructure/stripe-billing-proof.sql"));
                 try (var initial = connection.prepareStatement(initialSql.replaceAll("\\$[0-9]+", "?"))) {
                     bindInitial(initial);
+                    initial.setBoolean(12, false);
                     try (var first = initial.executeQuery()) {
                         assertThat(first.next()).isTrue();
                         var json = new ObjectMapper();
@@ -152,6 +154,37 @@ class BillingAcceptanceSqlIntegrationTest extends PostgresIntegrationTest {
                 callbacks.forEach(e -> assertThat(e.get("delivered").asBoolean()).isTrue());
                 assertThat(row.next()).isFalse();
             }
+        }
+    }
+
+    @Test void challengeAndOrdinaryProofRequireTheirOwnOriginalAttemptState() throws Exception {
+        var query = Files.readString(Path.of("../infrastructure/stripe-billing-proof.sql")).replaceAll("\\$[0-9]+", "?");
+        var fixture = Files.readString(Path.of("../infrastructure/fixtures/stripe-billing-cancellation-proof-rows.sql"));
+        try (var connection = source.getConnection(); var setup = connection.createStatement();
+             var select = connection.prepareStatement(query)) {
+            connection.setAutoCommit(false);
+            try {
+                setup.execute(fixture);
+                bindInitial(select);
+                for (var attemptState : java.util.List.of("OBSERVE", "REQUIRES_ACTION")) {
+                    try (var update = connection.prepareStatement("update pg_temp.subscription_confirmation_attempts set state=? where id=?")) {
+                        update.setString(1, attemptState);
+                        update.setObject(2, fixtureId(6));
+                        assertThat(update.executeUpdate()).isOne();
+                    }
+                    for (boolean challenge : new boolean[]{false, true}) {
+                        select.setBoolean(12, challenge);
+                        try (var row = select.executeQuery()) {
+                            assertThat(row.next()).isTrue();
+                            var proof = new ObjectMapper().readTree(row.getString("proof"));
+                            assertThat(proof.path("original").asBoolean()).isEqualTo(challenge == attemptState.equals("REQUIRES_ACTION"));
+                            assertThat(proof.path("cash").asBoolean()).isTrue();
+                            assertThat(proof.path("journal").asBoolean()).isTrue();
+                            assertThat(row.next()).isFalse();
+                        }
+                    }
+                }
+            } finally { connection.rollback(); }
         }
     }
 

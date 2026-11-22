@@ -21,3 +21,23 @@ test('abort disposes SQL and late rows cannot become accepted evidence',async()=
  const pending=api.proveBillingEvidence({configuration:scope,bootstrap:{withDatabaseCredentials:callback=>callback({password:'private-sentinel'})},fixture:{resources:()=>binding,inspectCallbacks:async()=>{inspections++;return f.inspection;}}},{deadline:Date.now()+1000,signal:controller.signal},{connect:()=>({begin:()=>new Promise(r=>{release=r;entered();}),end:async()=>{ended++;}})});
  pending.catch(()=>{});await entering;controller.abort();await assert.rejects(pending);release?.([f.row]);await new Promise(r=>setTimeout(r,5));assert.ok(ended>=1);assert.equal(inspections,0);
 });
+
+for(const scenario of ['verified','ordinary','provider-denied','local-cash-missing']){
+ test('initial 3DS joins its server and provider receipts: '+scenario,async()=>{
+  const f=fixture(),events=[];
+  const binding={...scope,createKeyHash:'a'.repeat(64),confirmKeyHash:'b'.repeat(64),endpoints:{demo:'http://127.0.0.1:18081'}};
+  if(scenario==='local-cash-missing')f.row.proof.cash=false;
+  const options={
+   configuration:{...scope,selectedCase:scenario==='ordinary'?'initial_success':'initial_3ds'},
+   bootstrap:{withDatabaseCredentials:callback=>callback({})},
+   fixture:{resources:()=>binding,inspectCallbacks:async()=>{events.push('callback');return f.inspection;}},
+   cli:{observeOwnedBillingInitial3ds:async graph=>{events.push('provider');assert.equal(graph.intentReference,'pi_original');return scenario!=='provider-denied';}},
+  };
+  const connect=()=>({begin:async(mode,cb)=>{assert.equal(mode,'read only');return cb({unsafe:async(query,params)=>{
+   if(!params)return [];events.push('sql');assert.equal(params.at(-1),true);return [f.row];
+  }});},end:async()=>{}});
+  const run=()=>api.proveBillingInitial3dsEvidence(options,{deadline:Date.now()+2000},{connect});
+  if(scenario==='verified')assert.equal(await run(),true);else await assert.rejects(run);
+  assert.deepEqual(events,scenario==='ordinary'?[]:scenario==='local-cash-missing'?['sql']:['sql','callback','provider']);
+ });
+}

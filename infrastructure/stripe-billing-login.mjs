@@ -37,7 +37,7 @@ export async function completeBillingLogin(cli,configuration,limits,dependencies
   });
  }
  const first=await run(await cli.loginInvocation(limits),false);need(first.stderr==='');
- const deviceHandoff=['initial_failed_renewal_grace_recovery','initial_cancel_withdraw','initial_decline_retry'].includes(configuration.selectedCase);
+ const deviceHandoff=['initial_failed_renewal_grace_recovery','initial_cancel_withdraw','initial_decline_retry','initial_3ds'].includes(configuration.selectedCase);
  output(authorization(first.stdout,deviceHandoff));
  await run(await cli.completeLoginInvocation(limits),true);return true;
 }

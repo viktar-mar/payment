@@ -123,6 +123,7 @@ async function createCliAdapter(options,dependencies,purpose) {
   let billingGraph=null,billingFailed=false,billingBound=false,billingStarted=false,billingDeadline=null,billingSignal;
   const cancellationCase=purpose===BILLING&&options.selectedCase==='initial_cancel_withdraw';
   const retryCase=purpose===BILLING&&options.selectedCase==='initial_decline_retry';
+  const initial3ds=purpose===BILLING&&options.selectedCase==='initial_3ds';
   let retryNext='declined',retryWitness;
   let cancellationNext='initial',originalCancellationCash;
 
@@ -407,10 +408,7 @@ async function createCliAdapter(options,dependencies,purpose) {
         ||ep.status!=='succeeded'||ep.amount!==2000||ep.amount_received!==2000||ep.currency!=='eur'||ep.latest_charge!==c.id||ep.customer!==null||ep.capture_method!=='automatic'
         ||!Array.isArray(ep.payment_method_types)||ep.payment_method_types.length!==1||ep.payment_method_types[0]!=='card'
         ||ep.metadata?.payment_id!==manual.paymentId||ep.metadata?.site_id!==manual.siteId||ep.metadata?.source!=='CATALOG')fail();
-      if(threeDSecure){
-        const evidence=c.payment_method_details.card?.three_d_secure;
-        if(!object(evidence)||evidence.result!=='authenticated'||evidence.authentication_flow!=='challenge'||typeof evidence.version!=='string'||!/^2\.[0-9]+\.[0-9]+$/.test(evidence.version)||/[\r\n]/.test(evidence.version))fail();
-      }
+      if(threeDSecure)requireAuthenticatedChallenge(c);
       return Object.freeze({captured:true,eventVerified:true,...(threeDSecure?{threeDSecureAuthenticated:true}:{})});
     });
   }
@@ -614,6 +612,11 @@ async function createCliAdapter(options,dependencies,purpose) {
     billingListener(context);if(billingGraph)fail();
     billingGraph=checkedBillingGraph(value);return true;
   }
+  function requireAuthenticatedChallenge(charge){
+    const evidence=charge.payment_method_details?.card?.three_d_secure;
+    if(!object(evidence)||evidence.result!=='authenticated'||evidence.authentication_flow!=='challenge'
+      ||typeof evidence.version!=='string'||!/^2\.[0-9]+\.[0-9]+$/.test(evidence.version)||/[\r\n]/.test(evidence.version))fail();
+  }
   async function observeOwnedBillingGraph(context,phase='initial',retryReceipt){
     billingListener(context);if(!billingGraph)fail();const t={...billingGraph};
     const declined=phase==='declined';
@@ -664,7 +667,7 @@ async function createCliAdapter(options,dependencies,purpose) {
     const terms=cancellationCase?cancellationTerms(subscription,item):null;
     const price=await read('/v1/prices/'+t.priceReference);exact(price,t.priceReference,'price');metadata(price.metadata,{local_price_id:t.priceId,local_price_version:String(t.priceVersion)});
     require(price.product===t.productReference&&price.active===true&&price.unit_amount===2000&&price.currency==='eur'&&price.type==='recurring'&&price.tax_behavior==='inclusive'&&price.recurring?.interval==='month'&&price.recurring.interval_count===1&&price.recurring.usage_type==='licensed');
-    const invoice=await read('/v1/invoices/'+t.invoiceReference,cancellationCase||retryCase?[['expand[]','amount_paid_off_stripe']]:[]);
+    const invoice=await read('/v1/invoices/'+t.invoiceReference,cancellationCase||retryCase||initial3ds?[['expand[]','amount_paid_off_stripe']]:[]);
     exact(invoice,t.invoiceReference,'invoice');
     require(invoice.customer===t.customerReference&&invoice.parent?.type==='subscription_details'&&invoice.parent.subscription_details?.subscription===t.subscriptionReference&&invoice.billing_reason==='subscription_create'&&invoice.status===(declined?'open':'paid')&&invoice.collection_method==='charge_automatically'&&invoice.currency==='eur');
     require(invoice.amount_paid===(declined?0:2000)&&invoice.amount_remaining===(declined?2000:0)
@@ -725,12 +728,17 @@ async function createCliAdapter(options,dependencies,purpose) {
       billingListener(context);retryNext=declined?'recovered':null;
       return true;
     }
-    if(cancellationCase){
+    if(cancellationCase||initial3ds){
       const invoices=await pages('/v1/invoices',[['customer',t.customerReference]]);
       require(invoices.length===1);exact(invoices[0],t.invoiceReference,'invoice');require(invoices[0].customer===t.customerReference);
       const charges=await pages('/v1/charges',[['customer',t.customerReference]]);
       require(charges.length===1);exact(charges[0],chargeReference,'charge');
       require(charges[0].customer===t.customerReference&&charges[0].payment_intent===t.intentReference);
+      if(initial3ds){
+        requireAuthenticatedChallenge(charge);
+        billingListener(context);
+        return true;
+      }
       const finalSubscription=await read('/v1/subscriptions/'+t.subscriptionReference);
       const finalTerms=cancellationTerms(finalSubscription,subscriptionItem(finalSubscription));
       require(Object.entries(terms).every(([key,value])=>value===finalTerms[key]));
@@ -775,8 +783,12 @@ async function createCliAdapter(options,dependencies,purpose) {
     stopListener:limits=>operation('STOP',limits,async context=>{if(billingMode)billingFailed=true;return stopListener(context);}),
     ...(billingMode?{
       assertBillingListener,
-      ...(!firstPayment&&!retryCase?{bindOwnedBillingGraph:(value,limits)=>operation('BILLING_BINDING',limits,context=>bindOwnedBillingGraph(value,context)),
+      ...(!firstPayment&&!retryCase&&!initial3ds?{bindOwnedBillingGraph:(value,limits)=>operation('BILLING_BINDING',limits,context=>bindOwnedBillingGraph(value,context)),
       observeOwnedBillingGraph:limits=>operation('BILLING_GRAPH',limits,observeOwnedBillingGraph)}:{}),
+      ...(initial3ds?{observeOwnedBillingInitial3ds:(value,limits)=>operation('BILLING_INITIAL_3DS',limits,async context=>{
+        bindOwnedBillingGraph(value,context);
+        return observeOwnedBillingGraph(context);
+      })}:{}),
       ...(retryCase?{observeOwnedBillingInitialRetry:(phase,value,receipt,limits)=>operation('BILLING_INITIAL_RETRY',limits,async context=>{
         billingListener(context);
         if(retryNext!==phase||!['declined','recovered'].includes(phase))fail();

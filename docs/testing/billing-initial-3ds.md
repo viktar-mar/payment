@@ -1,0 +1,19 @@
+# First subscription payment with a 3DS challenge
+
+This isolated case creates one ordinary EUR 20 Sandbox subscription. The first Pay uses a test card that requires authentication. After the server confirms the original PaymentIntent, only the browser that received that confirmation can continue the challenge.
+
+## Running the case
+
+Use a fresh billing run UUID, the exact committed source, dedicated ports and Docker endpoint, and the approved Sandbox account. The case uses the [reviewed checkout-local static asset policy](billing-failed-renewal-recovery.md#static-assets-in-the-owned-payment-frame). Select `PAYMENT_STRIPE_SANDBOX_ENABLED=true`, `PAYMENT_STRIPE_BILLING_ACCEPTANCE=true` and `PAYMENT_STRIPE_BILLING_CASE=initial_3ds`. From `examples/demo-site`, run the dedicated project:
+
+```sh
+pnpm exec playwright test --config=playwright.stripe-billing-initial-3ds.config.ts
+```
+
+There is one subscription creation, one confirmation and one SDK challenge. When the issuer's test page is ready, open this run's private `operator.html` in the operator's Chrome profile and use the challenge button once. By default the file is under `examples/demo-site/test-results/<run-uuid>/`. A custom Playwright output directory changes the parent directory. An unexpected issuer address, mismatched transaction, lost acknowledgement or expired browser authority ends the attempt. An unfinished operation cannot be submitted again.
+
+## What establishes a pass
+
+The original confirmation attempt must retain its winning `REQUIRES_ACTION` receipt. The terminal server records must show one paid invoice and one EUR 20 payment for the bound subscription, with matching journal entries and signed site callbacks. A separate read of the original PaymentIntent and latest captured Charge must show an authenticated 3DS 2.x challenge. Frictionless authentication, a different Charge or a second charge fails the check.
+
+Record the source, run ID, terminal marker and cleanup result. Ordinary CI uses synthetic fixtures. This case still needs a native Sandbox receipt.

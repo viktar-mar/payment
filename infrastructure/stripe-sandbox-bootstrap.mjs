@@ -366,6 +366,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     if(failedRenewal)demoBuildMode='billing-failed-renewal';
     else if(firstPayment)demoBuildMode='billing-first-payment';
     else if(billing && options.selectedCase==='initial_decline_retry')demoBuildMode='billing-decline-retry';
+    else if(billing && options.selectedCase==='initial_3ds')demoBuildMode='billing-initial-3ds';
     else if(manualPayment)demoBuildMode='manual-payment';
     else if(diagnostic)demoBuildMode='form-diagnostic';
     const buildArgs=demoBuildMode?['--build-arg','PAYMENT_DEMO_BUILD_MODE='+demoBuildMode]:[];

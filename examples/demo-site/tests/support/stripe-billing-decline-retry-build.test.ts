@@ -6,10 +6,10 @@ import {dirname,join} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {build} from 'vite';
 
-test('only the dedicated retry build configures the actual manager Stripe loader before Pay',async()=>{
+test('only the dedicated retry and 3DS builds configure the actual manager Stripe loader before Pay',async()=>{
  const root=fileURLToPath(new URL('../..',import.meta.url)),temp=await mkdtemp(join(tmpdir(),'decline-retry-demo-'));
  try{
-  for(const mode of ['billing-decline-retry','production']){
+  for(const mode of ['billing-decline-retry','billing-initial-3ds','production']){
    const outDir=join(temp,mode);
    const sdkDir=dirname(fileURLToPath(import.meta.resolve('@generic-payments/sdk')));
    const loader=join(sdkDir,'providers','stripe-loader.js'),modules=new Set<string>();

@@ -30,3 +30,17 @@ export function createOwnedBillingDeclineRetry(options:unknown,dependencies?:Rec
   run(journey:(port:BillingDeclineRetryPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingDeclineRetryResult>;
   close(limits?:BillingLimits):Promise<BillingDeclineRetryResult>;
 }>;
+
+export interface BillingInitial3dsPort extends BillingPort {
+  beforeChallenge(value:BillingRetryAttempt):Promise<true>;
+  acknowledgeChallenge(value:BillingRetryAttempt):Promise<true>;
+}
+export interface BillingInitial3dsResult extends Omit<BillingResult,'scope'> {
+  scope:'INITIAL_3DS';
+  initial3dsAccepted:boolean;
+}
+export function createOwnedBillingInitial3ds(options:unknown,dependencies?:Record<string,unknown>):Promise<{
+  resources():BillingInitial3dsResult;
+  run(journey:(port:BillingInitial3dsPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingInitial3dsResult>;
+  close(limits?:BillingLimits):Promise<BillingInitial3dsResult>;
+}>;

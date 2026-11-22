@@ -3,7 +3,7 @@
 with owned as (
  select $1::uuid account_id, $2::uuid site_id, $3::uuid customer_id, $4::uuid subscription_id,
         $5::uuid operation_id, $6::uuid attempt_id, $7::uuid product_id, $8::uuid price_id,
-        $9::text create_digest, $10::text confirm_digest, $11::text origin
+        $9::text create_digest, $10::text confirm_digest, $11::text origin, $12::boolean challenge_required
 )
 select bc.provider_reference customer_reference, s.provider_reference subscription_reference,
  pm.provider_product_id product_reference, pr.provider_price_id price_reference,
@@ -55,7 +55,14 @@ select bc.provider_reference customer_reference, s.provider_reference subscripti
    and g.recurring_consent and g.consent_purpose='CREATE' and g.client_session_id is null
    and g.superseded_at is null and g.confirmation_key_digest is null
    and chain.root_digest=g.token_digest and chain.origin=x.origin and chain.operation_id=x.operation_id
-   and a.state='OBSERVE' and a.predecessor is null and a.successor is null and a.retry_key is null
+   and a.state=case when x.challenge_required then 'REQUIRES_ACTION' else 'OBSERVE' end
+   and (not x.challenge_required or (
+       a.request_id is null and a.decline_code is null and a.charge_reference is null
+       and (select count(*)=1 from payments z where z.site_id=x.site_id)
+       and (select count(*)=1 from subscriptions z where z.site_id=x.site_id)
+       and (select count(*)=1 from payment_events z where z.site_id=x.site_id and z.event_type='PAYMENT_SUCCEEDED')
+       and (select count(*)=1 from subscription_events z where z.site_id=x.site_id and z.event_type='PERIOD_PAID')))
+   and a.predecessor is null and a.successor is null and a.retry_key is null
    and a.claimed_at is not null and a.confirm_key=x.confirm_digest
    and a.provider_key='billing-confirm-v2:'||x.attempt_id::text and a.token_digest ~ '^[0-9a-f]{64}$'
    and a.fingerprint ~ '^[0-9a-f]{64}$'

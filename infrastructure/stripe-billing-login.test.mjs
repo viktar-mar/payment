@@ -15,7 +15,7 @@ test('protected login requires callback and captured child close and emits only 
  assert.equal(await api.completeBillingLogin(cli,{runId},{deadline:Date.now()+1000},{execFile,output:text=>{assert.match(text,/^Authorize the isolated Sandbox CLI/);assert.ok(!text.includes('next_step'));events.push('output');}}),true);assert.equal(calls,2);assert.deepEqual(events,['closed','output','closed']);
 });
 
-for(const selectedCase of ['initial_failed_renewal_grace_recovery','initial_decline_retry']){
+for(const selectedCase of ['initial_failed_renewal_grace_recovery','initial_decline_retry','initial_3ds']){
 test(selectedCase+' login validates the fixed device URI and pairing code before output',async()=>{
  const device='https://access.stripe.com/stripecli/oauth2/device',opaque='T'.repeat(43);
  for(const [uri,code,allowed] of [[device,'ABCD-EFGH',true],[device+'?x='+opaque,'ABCD-EFGH',false],[device,opaque,false],

@@ -1462,8 +1462,8 @@ test('Billing bootstrap is inert and keeps a seventh distinct grant key in owned
   await b.stop(LIMIT());
 });
 
-for(const selectedCase of ['initial_success','initial_cancel_withdraw','initial_decline_retry']){
- test('only initial decline/retry selects its restricted demo build: '+selectedCase,async()=>{
+for(const selectedCase of ['initial_success','initial_cancel_withdraw','initial_decline_retry','initial_3ds']){
+ test('each non-clock case selects its reviewed demo build: '+selectedCase,async()=>{
   const f=fixture();
   f.options.selectedCase=selectedCase;
   f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',
@@ -1473,7 +1473,7 @@ for(const selectedCase of ['initial_success','initial_cancel_withdraw','initial_
   const builds=f.events.filter(e=>e.type==='process'&&e.args.includes('build')&&e.args.includes('--quiet'));
   assert.equal(builds.length,1);
   const args=builds[0].args.filter(value=>value.startsWith('PAYMENT_DEMO_BUILD_MODE='));
-  assert.deepEqual(args,selectedCase==='initial_decline_retry'?['PAYMENT_DEMO_BUILD_MODE=billing-decline-retry']:[]);
+  assert.deepEqual(args,selectedCase==='initial_3ds'?['PAYMENT_DEMO_BUILD_MODE=billing-initial-3ds']:selectedCase==='initial_decline_retry'?['PAYMENT_DEMO_BUILD_MODE=billing-decline-retry']:[]);
   await bootstrap.stop(LIMIT());
  });
 }

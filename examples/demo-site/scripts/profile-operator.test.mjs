@@ -78,3 +78,20 @@ test('leaving the claimed tab revokes the pending action and notifies the owner 
     assert.equal(abandoned,1);
   }finally{await operator.close();}
 });
+
+test('the issuer-only profile handoff accepts exactly one challenge gesture and no payment or replacement',async()=>{
+  const operator=await openProfileOperator({rehearsal:true,mode:'challenge'});
+  try{
+    const url=new URL(operator.url),post=(path,key)=>fetch(url.origin+'/'+path,{method:'POST',headers:{Origin:url.origin,'X-Operator-Session':key}});
+    const html=await (await fetch(url.origin)).text();
+    assert.match(html,/<button id="challenge" disabled>/);assert.doesNotMatch(html,/<button id="(?:method|initial)"/);
+    const token=await (await post('claim',url.hash.slice(1))).text();
+    const limits={deadline:Date.now()+1000,signal:new AbortController().signal};
+    await assert.rejects(operator.wait('initial',limits));
+    const wait=operator.wait('challenge',limits);void wait.catch(()=>{});
+    assert.equal((await post('method',token)).status,409);assert.equal((await post('initial',token)).status,409);
+    assert.equal((await post('challenge',token)).status,204);await wait;
+    assert.equal((await post('challenge',token)).status,409);
+    await assert.rejects(operator.wait('challenge',limits));
+  }finally{await operator.close();}
+});
