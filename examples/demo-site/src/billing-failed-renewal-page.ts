@@ -1,17 +1,21 @@
 import type * as Payments from '@generic-payments/sdk';
+import type * as AttemptDiagnostic from '../../../frontend/sdk/src/subscriptions/stripe-payment-attempt-diagnostic.js';
 
 type Sdk = Pick<typeof Payments, 'createGenericPaymentClient'|'mountStripePaymentAttempt'|'mountStripeSubscriptionMethod'>;
+type Diagnostics = Pick<typeof AttemptDiagnostic, 'observeStripePaymentAttemptPending'|'readStripePaymentAttemptFailure'>;
+type ConfirmBoundary = `BROWSER_CONFIRM_${AttemptDiagnostic.StripePaymentAttemptFailure | 'RECEIPT'}`;
 type Configuration = {backend:string;siteKey:string;email:string;deadline:number};
 type Operation = {subscriptionId:string;operationId:string};
 
 /** Capabilities live only in the original document and original SDK client. */
-export function installFailedRenewalPage(sdk:Sdk):void {
+export function installFailedRenewalPage(sdk:Sdk, diagnostics?:Diagnostics):void {
   const button = (id:string) => document.querySelector<HTMLButtonElement>('#'+id)!;
   const code = document.querySelector<HTMLInputElement>('#code')!;
   const consent = document.querySelector<HTMLInputElement>('#consent')!;
   const host = document.querySelector<HTMLElement>('#provider')!;
   const controller = new AbortController();
   let boundary:'BROWSER_INITIAL_ACTION'|'BROWSER_INITIAL_SESSION'|'BROWSER_INITIAL_MOUNT'|'BROWSER_METHOD_MOUNT'|null=null;
+  let confirmFailure:ConfirmBoundary|null=null;
   let state = 'NEW', deadline = 0, sessionDeadline = Infinity;
   let timer:ReturnType<typeof setTimeout>|undefined;
   let initial:Payments.StripePaymentAttemptHandle|undefined, method:Payments.StripeSubscriptionHandle|undefined;
@@ -24,10 +28,15 @@ export function installFailedRenewalPage(sdk:Sdk):void {
   }
   function stop() {
     if (state === 'STOPPED') return;
+    if (state === 'CONFIRMING') {
+      // Abort and destroy can themselves retire a pending confirm. Read its original failure first.
+      const failure = diagnostics?.readStripePaymentAttemptFailure(initial);
+      if (failure) confirmFailure = `BROWSER_CONFIRM_${failure}`;
+    }
     phase('STOPPED');
     // The owner may be between browser phases. Revoke that run even when no
     // controller call is currently waiting on a browser result.
-    try {void Promise.resolve((window as any).__failedRenewalTerminal('STOPPED',boundary)).catch(()=>{});} catch { /* page is closing */ }
+    try {void Promise.resolve((window as any).__failedRenewalTerminal('STOPPED',confirmFailure ?? boundary)).catch(()=>{});} catch { /* page is closing */ }
     boundary=null;
     clearTimeout(timer);
     controller.abort();
@@ -50,9 +59,17 @@ export function installFailedRenewalPage(sdk:Sdk):void {
   function expose(name:string, callback:Function) {
     Object.defineProperty(window,name,{value:callback,enumerable:false,configurable:false,writable:false});
   }
+  function reportPayProgress(stage:'ENTERED'|AttemptDiagnostic.StripePaymentAttemptPending|null) {
+    if (state !== 'CONFIRMING') return;
+    try {
+      const binding = Object.getOwnPropertyDescriptor(window,'__failedRenewalPayProgress');
+      if (typeof binding?.value === 'function') void Promise.resolve(binding.value(stage)).catch(()=>{});
+    } catch { /* observation cannot control confirmation */ }
+  }
   window.addEventListener('pagehide',stop,{once:true});
   document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')stop();});
   expose('__failedRenewalStop',stop);
+  expose('__failedRenewalInitialConfirmFailure',()=>state==='STOPPED'?confirmFailure:null);
   expose('__failedRenewalConfigure',(c:Configuration)=>{
     try {
       if (state!=='NEW' || !Number.isSafeInteger(c.deadline) || c.deadline<=Date.now() ||
@@ -121,16 +138,23 @@ export function installFailedRenewalPage(sdk:Sdk):void {
     } catch {stop();}
   };
   button('pay').onclick = async event => {
+    let disposePending:(()=>void)|undefined;
     try {
       if(!event.isTrusted || button('pay').disabled)throw Error();
       take('READY','CONFIRMING');
       button('pay').disabled = true;
+      reportPayProgress('ENTERED');
+      disposePending = diagnostics?.observeStripePaymentAttemptPending(initial,reportPayProgress);
       const result = await initial!.confirm();
       check('CONFIRMING');
-      if ('validationFailed' in result || result.state!=='OBSERVE' || result.retryAllowed!==false || result.successorAttemptId!==null) throw Error();
+      if ('validationFailed' in result) throw Error();
+      if (result.state!=='OBSERVE' || result.retryAllowed!==false || result.successorAttemptId!==null) {
+        confirmFailure = 'BROWSER_CONFIRM_RECEIPT';
+        throw Error();
+      }
       initial!.destroy(); initial = undefined;
       phase('OBSERVE'); arm(deadline);
-    } catch {stop();}
+    } catch {stop();} finally {disposePending?.();}
   };
   expose('__failedRenewalMethod',async (operation:Operation)=>{
     try {

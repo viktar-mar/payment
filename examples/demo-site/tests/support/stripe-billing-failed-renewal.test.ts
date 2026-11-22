@@ -221,7 +221,9 @@ type ProviderProbe={target:string;headers?:Record<string,string>;headerFailure?:
   blockEvent?:'match'|'wrong-request'|'wrong-error'|'none';holdAbort?:boolean;failAbort?:boolean;onBlock?:()=>void;outerUrl?:string;
   child?:'owned'|'nested'|'foreign'|'foreign-parent'|'detached'|'other-page'};
 type StaticFixture={matches:(origin:string)=>boolean;fetch:typeof fetch};
-async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:StaticFixture) {
+async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:StaticFixture,profile?:{
+  wait():Promise<void>;click?():Promise<void>;
+}) {
   let releaseIO!:()=>void,markIO!:()=>void;
   const heldIO=new Promise<void>(resolve=>{releaseIO=resolve;}),ioPending=new Promise<void>(resolve=>{markIO=resolve;});
   let stageHook:((where:string)=>Promise<void>)|undefined;
@@ -318,6 +320,7 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
     let headerReads=0;
     const req={url:()=>target,method:()=>method,allHeaders:async()=>{
       headerReads++;
+      if(change==='approval_after_interception' && bridge==='confirm' && headerReads===1){markIO();await heldIO;}
       if(change==='hold_initial_'+bridge && headerReads===2){markIO();await heldIO;}
       return headers;
     },frame:()=>requestFrame,postData:()=>contents,
@@ -355,6 +358,7 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
       for(const probe of provider??[])if(probe.atMount&&probe.phase!=='method')await probeProvider(probe);
       return {destroy:()=>{},confirm:async()=>{await request(base(id(7))+'/confirmation-attempts/'+id(8)+'/confirm','POST',{capability,confirmation_token:'ctoken_inert'});
         if(change==='after_initial_confirm')await stageHook?.('confirmed');
+        if(change==='late_receipt_diagnostic')return {state:'UNKNOWN',retryAllowed:false,successorAttemptId:null};
         p.onRetire?.();return {state:'OBSERVE',retryAllowed:false,successorAttemptId:null};}};},
     mountStripeSubscriptionMethod:async(p:any)=>{counts.push('mountMethod');if(change==='method_mount_refusal'){p.onRetire?.();throw Error('secret_fixture canary');}assert.strictEqual(p.client,subscriptions);assert.strictEqual(p.session,session);
       assert.equal(p.subscriptionId,id(6));assert.equal(p.operationId,id(9));
@@ -371,6 +375,7 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
   installFailedRenewalPage(sdk);
   const labels:Record<string,string>={'Request code':'request','Verify code':'verify','Start payment':'start','Pay':'pay','Confirm test method':'confirm-method','I consent to recurring payments':'consent','Six-digit code':'code'};
   function locator(id:string):any {const c=ctrl(id);return {click:async()=>{
+      if(id==='pay' && profile?.click){await profile.click();return;}
       if(id==='start'&&change==='start_click')throw Error('secret_fixture canary');
       if(id==='start'&&asynchronousStart){
         // DOM dispatch does not await an async event handler. Keep its task
@@ -396,13 +401,13 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
         await stageHook?.('manual');
         const b=ctrl(arg==='OBSERVE'?'pay':'confirm-method');
         if((change==='manual_timeout'&&arg==='METHOD_CONFIRMED')||change==='initial_manual_timeout')throw Error(selected.client_secret);
-        await b.activate();
+        if(!profile)await b.activate();
       }
       assert.equal(Boolean(f(arg)),true);
     }};
-  const context={on:()=>{},newPage:async()=>{counts.push('page');return page;},exposeBinding:async(n:string,f:Function)=>{bindings.set(n,f);w[n]=(...args:unknown[])=>{if(n==='__failedRenewalTerminal')terminals.push(args);return f({page,frame},...args);};},
+  const context={on:()=>{},newPage:async()=>{counts.push('page');return page;},exposeBinding:async(n:string,f:Function)=>{bindings.set(n,f);w[n]=(...args:unknown[])=>{if(n==='__failedRenewalTerminal'){terminals.push(args);if(change==='late_receipt_diagnostic')return;}return f({page,frame},...args);};},
     route:async(_pattern:string,f:Function)=>{routeHandler=f;},routeWebSocket:async()=>{},close:async()=>{closed++;callbacks.get('close')?.();w.__failedRenewalStop?.();}};
-  const journey=runFailedRenewalBrowser({newContext:async()=>{counts.push('context');return context;}},runAbort,staticFixture?.matches);
+  const journey=runFailedRenewalBrowser({newContext:async()=>{counts.push('context');return context;}},runAbort,staticFixture?.matches,profile?()=>profile.wait():undefined);
   const initialPort={resources:()=>({runId:id(1),expectedSource:'a'.repeat(40),accountId:id(2),siteId:id(3),priceId:id(5),siteKey:'fixture',email:'fixture@example.test',endpoints:{demo,backend}}),
     withOtpCode:async(f:Function)=>f(otp),acknowledgeCustomer:async(v:any)=>{
       assert.deepEqual(v,{customerId:id(4),siteId:id(3)});
@@ -429,6 +434,8 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
   return {request,probeProvider,counts,replies,staticReplies,providerAborts,terminals,journey,initialPort,methodPort,runAbort,lose,forgedTerminal,preparationPending,readyWaiting,releasePreparation,ioPending,releaseIO,notifyIO:markIO,providerFallbacks:()=>providerFallbacks,
     setStageHook:(hook:typeof stageHook)=>{stageHook=hook;},setReadyHook:(hook:typeof readyHook)=>{readyHook=hook;},
     terminal:async(marker:unknown)=>bindings.get('__failedRenewalTerminal')!({page,frame},'STOPPED',marker),closed:()=>closed,phase:()=>body.dataset.phase,status:()=>ctrl('status').textContent,
+    activateCheckout:(which:'initial'|'method')=>ctrl(which==='initial'?'pay':'confirm-method').activate(),
+    progress:(value:unknown,foreign=false)=>bindings.get('__failedRenewalPayProgress')?.({page,frame:foreign?{}:frame},value),
     restore:async()=>{try{runAbort.abort();await journey.close(nowLimits());}finally{w.__failedRenewalStop?.();restore();}}};
 }
 
@@ -1172,9 +1179,12 @@ test('in-flight original terminal revokes before IO release '+operation+' '+even
   }finally{h.releaseIO();await work?.catch(()=>{});await h.restore();}
 });
 
-test('actual held helper preserves browser checkpoint through owner abort race and cleanup',async()=>{
+for(const [change,checkpoint] of [['number','BROWSER_CARD_NUMBER'],['profile','BROWSER_WAIT_OBSERVE_LAST_OBSERVED_SUBMIT']] as const)
+test('actual held helper preserves '+checkpoint+' through owner abort race and cleanup',async()=>{
  const {opts,scope}=await import(source('../../../../infrastructure/fixtures/failed-renewal-descriptors.mjs').href);
- const h=await fixture('number'),calls:string[]=[],yes=async()=>true;
+ const h=await fixture(change,undefined,undefined,change==='profile'?{wait:async()=>{},click:async()=>{
+   await h.progress('ENTERED');await h.progress('SUBMIT');
+ }}:undefined),calls:string[]=[],yes=async()=>true;
  try{
   const options=opts();options.ports.demo=14173;
   const bootstrap={resources:()=>({cliDirectory:'/inert'}),prepare:yes,start:yes,stop:yes};
@@ -1184,8 +1194,8 @@ test('actual held helper preserves browser checkpoint through owner abort race a
   const runtime={ready:yes,prepare:async()=>h.initialPort.prepare({origin:demo,token}),confirm:async()=>{calls.push('confirm');throw Error('forbidden');},observe:async()=>{calls.push('observe');throw Error('forbidden');},close:yes};
   const owner=await createOwnedBillingFailedRenewal(options,{preflight:yes,createBootstrap:async()=>bootstrap,createCli:async()=>cli,login:yes,createFixture:async()=>ownedFixture,createRuntime:()=>runtime});
   await assert.rejects(owner.run(h.journey,{...nowLimits(),signal:h.runAbort.signal}));const result=await owner.close();
-  assert.equal(result.phase,'BROWSER');assert.equal(result.code,'ABORTED');assert.equal(result.diagnostic,'BROWSER_CARD_NUMBER');assert.equal(result.cleanupConfirmed,true);
-  assert.equal(formatBillingFailedRenewalDiagnostic(result),browserTerminal);assert.deepEqual(calls,[]);assert.equal(h.closed(),1);
+  assert.equal(result.phase,'BROWSER');assert.equal(result.code,'ABORTED');assert.equal(result.diagnostic,checkpoint);assert.equal(result.cleanupConfirmed,true);
+  assert.equal(formatBillingFailedRenewalDiagnostic(result),browserTerminal.replace('BROWSER_CARD_NUMBER',checkpoint));assert.deepEqual(calls,[]);assert.equal(h.closed(),1);
  }finally{await h.restore();}
 });
 
@@ -1359,6 +1369,126 @@ for(const [change,code,permits] of [
     await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>error===first);
     assert.equal(await h.journey.close(nowLimits()),true);
     assert.equal(browserCleanupConfirmed(first),true);
+  }finally{await h.restore();}
+});
+
+for(const [stage,markers,expected] of [
+  ['wait',[],'BROWSER_MANUAL_PAY_WAIT'],
+  ['click',[],'BROWSER_PAY_CLICK'],
+  ['observe',[],'BROWSER_WAIT_OBSERVE_MARKER_MISSING'],
+  ['observe',['ENTERED'],'BROWSER_WAIT_OBSERVE_PAY_SIGNAL_OBSERVED_MARKER_MISSING'],
+  ['observe',['ENTERED','SUBMIT'],'BROWSER_WAIT_OBSERVE_LAST_OBSERVED_SUBMIT'],
+  ['observe',['ENTERED','SUBMIT',null],'BROWSER_WAIT_OBSERVE_SUBMIT_CLEARED'],
+  ['observe',['ENTERED','SUBMIT',null,'TOKEN'],'BROWSER_WAIT_OBSERVE_LAST_OBSERVED_TOKEN'],
+  ['observe',['ENTERED','SUBMIT',null,'TOKEN',null],'BROWSER_WAIT_OBSERVE_TOKEN_CLEARED'],
+  ['observe',['ENTERED','TOKEN'],'BROWSER_WAIT_OBSERVE_MARKER_INVALID'],
+  ['terminal',['ENTERED','SUBMIT',null],'BROWSER_CONFIRM_SUBMIT_VALIDATION'],
+  ['terminal',['ENTERED','SUBMIT',null,'TOKEN',null],'BROWSER_CONFIRM_TOKEN'],
+] as const)test('profile Pay stops once at '+expected,async()=>{
+  let sent=0;
+  const h=await fixture('',undefined,undefined,{
+    wait:async()=>{
+      await h.progress('ENTERED'); // too early; no operator approval yet
+      if(stage==='wait')throw Error('private fixture');
+    },
+    click:async()=>{
+      sent++;
+      if(stage==='click')throw Error('private fixture');
+      await h.progress('ENTERED',true); // other frame cannot supply a signal
+      for(const marker of markers)await h.progress(marker);
+      await h.terminal('BROWSER_CONFIRM_BRIDGE'); // controller-owned only
+      await h.terminal('BROWSER_CONFIRM_NEXT_ACTION'); // no server ACK
+      assert.equal(h.runAbort.signal.aborted,false);
+      if(stage==='terminal')await h.terminal(expected);
+    },
+  });
+  try{
+    let first:unknown;
+    await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>{first=error;return true;});
+    assert.equal(browserDiagnostic(first),expected);
+    await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),error=>error===first);
+    assert.equal(sent,stage==='wait'?0:1);
+    assert.equal(h.counts.includes('confirm'),false);
+    assert.equal(await h.journey.close(nowLimits()),true);
+    assert.equal(browserCleanupConfirmed(first),true);
+  }finally{await h.restore();}
+});
+
+test('profile forwards both separate approved clicks through the original one-use ports',async()=>{
+  let gestures=0;
+  const h=await fixture('',undefined,undefined,{wait:async()=>{gestures++;}});
+  try{
+    await h.journey.initial(h.initialPort,nowLimits());
+    await h.journey.method(h.methodPort,nowLimits());
+    assert.equal(gestures,2);
+    for(const op of ['confirm','permit','confirmSetup'])assert.equal(h.counts.filter(v=>v===op).length,1);
+    assert.equal(h.phase(),'METHOD_CONFIRMED');
+  }finally{await h.restore();}
+});
+
+for(const phase of ['initial','method'] as const)test('profile approval gates the '+phase+' port',async()=>{
+  let waitingFor:'initial'|'method'='initial';
+  const h=await fixture('',undefined,undefined,{wait:async()=>{
+    if(waitingFor===phase)await h.activateCheckout(phase);
+    waitingFor='method';
+  }});
+  try{
+    if(phase==='method')await h.journey.initial(h.initialPort,nowLimits());
+    await assert.rejects(phase==='initial'?h.journey.initial(h.initialPort,nowLimits()):h.journey.method(h.methodPort,nowLimits()));
+    assert.equal(h.counts.filter(v=>v==='confirm').length,phase==='initial'?0:1);
+    assert.equal(h.counts.includes('permit'),false);
+    assert.equal(await h.journey.close(nowLimits()),true);
+  }finally{await h.restore();}
+});
+
+test('page loss while waiting for the SDK does not attribute the loss to submit',async()=>{
+  const h=await fixture('',undefined,undefined,{wait:async()=>{},click:async()=>{
+    await h.progress('ENTERED');await h.progress('SUBMIT');
+  }});
+  h.setStageHook(async stage=>{if(stage==='manual')h.lose('crash');});
+  try{
+    await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),err=>browserDiagnostic(err)==='BROWSER_WAIT_OBSERVE');
+    assert.equal(h.counts.includes('confirm'),false);
+    assert.equal(await h.journey.close(nowLimits()),true);
+  }finally{await h.restore();}
+});
+
+test('a request already waiting on headers cannot acquire the later profile click',async()=>{
+  let earlyRequest:Promise<unknown>|undefined;
+  const h=await fixture('approval_after_interception',undefined,undefined,{
+    wait:async()=>{
+      const target=backend+'/api/v1/customer/subscriptions/'+id(6)+'/operations/'+id(7)+'/confirmation-attempts/'+id(8)+'/confirm';
+      earlyRequest=h.request(target,'POST',{capability,confirmation_token:'ctoken_inert'}).catch(()=>{});
+      await h.ioPending;
+    },
+    click:async()=>{h.releaseIO();await earlyRequest;},
+  });
+  try{
+    await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),e=>browserDiagnostic(e)==='BROWSER_CONFIRM_BRIDGE');
+    assert.equal(h.counts.includes('confirm'),false);
+  }finally{h.releaseIO();await earlyRequest;await h.restore();}
+});
+
+test('approval expiring during bridge validation cannot reach the confirmation port',async t=>{
+  const h=await fixture('hold_initial_confirm',undefined,undefined,{wait:async()=>{}});
+  const realNow=Date.now;
+  let offset=0;
+  t.mock.method(Date,'now',()=>realNow()+offset);
+  const rejected=assert.rejects(h.journey.initial(h.initialPort,nowLimits()),e=>browserDiagnostic(e)==='BROWSER_CONFIRM_BRIDGE');
+  try{
+    await h.ioPending;
+    offset=180001;h.releaseIO();
+    await rejected;
+    assert.equal(h.counts.includes('confirm'),false);
+  }finally{h.releaseIO();await rejected.catch(()=>{});await h.restore();}
+});
+
+test('a stopped checkout preserves its invalid receipt when the terminal binding has not arrived',async()=>{
+  const h=await fixture('late_receipt_diagnostic',undefined,undefined,{wait:async()=>{}});
+  try{
+    await assert.rejects(h.journey.initial(h.initialPort,nowLimits()),e=>browserDiagnostic(e)==='BROWSER_CONFIRM_RECEIPT');
+    assert.equal(h.counts.filter(v=>v==='confirm').length,1);
+    assert.equal(await h.journey.close(nowLimits()),true);
   }finally{await h.restore();}
 });
 

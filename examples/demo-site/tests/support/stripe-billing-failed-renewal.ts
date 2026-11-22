@@ -15,6 +15,24 @@ import {providerOrigin,providerNetworkOrigin} from './stripe-provider-origin.ts'
 
 const pagePath = '/billing-failed-renewal.html';
 const navigationBlockCheckpoint='BROWSER_PROVIDER_STATIC_NAVIGATION_BLOCK';
+// Fixed observations from the original handle. Index counts matching signals;
+// -1 means that the sequence was inconsistent and no branch can be inferred.
+const initialPaySignals=['ENTERED','SUBMIT',null,'TOKEN',null] as const;
+const initialPayWaitCodes=[
+  'BROWSER_WAIT_OBSERVE_MARKER_MISSING','BROWSER_WAIT_OBSERVE_PAY_SIGNAL_OBSERVED_MARKER_MISSING',
+  'BROWSER_WAIT_OBSERVE_LAST_OBSERVED_SUBMIT','BROWSER_WAIT_OBSERVE_SUBMIT_CLEARED',
+  'BROWSER_WAIT_OBSERVE_LAST_OBSERVED_TOKEN','BROWSER_WAIT_OBSERVE_TOKEN_CLEARED',
+] as const;
+const beforeConfirmFailures=['BROWSER_CONFIRM_SUBMIT','BROWSER_CONFIRM_SUBMIT_VALIDATION',
+  'BROWSER_CONFIRM_TOKEN','BROWSER_CONFIRM_TOKEN_VALIDATION'];
+const afterConfirmFailures=['BROWSER_CONFIRM_NEXT_ACTION','BROWSER_CONFIRM_RECEIPT'];
+const commonConfirmFailures=['BROWSER_CONFIRM_GUARD','BROWSER_CONFIRM_STATE','BROWSER_CONFIRM_CLIENT','BROWSER_CONFIRM_RETIRED'];
+function initialTerminal(marker:unknown,step:string):boolean {
+  if(typeof marker!=='string')return false;
+  return (step==='CONFIRM' && beforeConfirmFailures.includes(marker)) ||
+    (step==='ACK' && afterConfirmFailures.includes(marker)) ||
+    (commonConfirmFailures.includes(marker) && (step==='CONFIRM'||step==='BUSY'||step==='ACK'));
+}
 const failed = () => new Error('failed_renewal_BROWSER');
 function need(ok:unknown):asserts ok {if(!ok)throw failed();}
 const uuid = (v:unknown):v is string => typeof v==='string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(v);
@@ -144,6 +162,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   let readiness:'INITIAL'|'METHOD'|undefined;
   let inFlight:{phase:'INITIAL'|'METHOD';step:'ACTION'|'SESSION'}|undefined;
   let navigation=0,manualArmed=false,expires:ReturnType<typeof setTimeout>|undefined;
+  let clickApprovedUntil=0,observedPaySignals=0;
   const lifetime=new AbortController(),pending=new Set<Promise<unknown>>();
   const usedKeys=new Set<string>();
   const pendingInitialNavigations=new Set<Promise<void>>();
@@ -151,7 +170,14 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   let navigationBlock:{request:Request;confirm:()=>void}|undefined;
   let finalDelivery:Promise<void>|undefined;
   let checkpoint='BROWSER_CONTEXT',firstFailure:Error|undefined,preparationActive=false;
-  function latch(code:string,source=state):Error {
+  function liveOwner() {
+    return !runAbort.signal.aborted && !whole.signal?.aborted && !stage.signal?.aborted &&
+      Date.now()<Math.min(whole.deadline,stage.deadline,sessionExpiry);
+  }
+  function initialClickActive() {
+    return state==='INITIAL' && manualArmed && Date.now()<clickApprovedUntil && liveOwner();
+  }
+  function latch(code:string,source=state,waitRejected=false):Error {
     // In-flight initial requests can finish after the replacement form opens.
     // A rejection delivered only by teardown cannot establish a method fault.
     const methodActive=source==='METHOD' && state==='METHOD';
@@ -159,6 +185,11 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     // page result. A later SDK refusal or timeout belongs to confirmation.
     const confirming=methodActive && manualArmed && step==='ACK' &&
       (code==='BROWSER_MANUAL_PAY_WAIT'||code==='BROWSER_MANUAL_PAY_ARM');
+    if(waitRejected && source==='INITIAL' && state==='INITIAL' && clickApprovedUntil && liveOwner() && step==='CONFIRM' &&
+        (code==='BROWSER_WAIT_OBSERVE' || (observedPaySignals!==0 &&
+          (code==='BROWSER_PAY_CLICK'||code==='BROWSER_MANUAL_PAY_WAIT')))){
+      code=initialPayWaitCodes[observedPaySignals]??'BROWSER_WAIT_OBSERVE_MARKER_INVALID';
+    }
     firstFailure??=browserFailure(confirming?'BROWSER_METHOD_CONFIRM':code,methodActive?'METHOD':'INITIAL');
     return firstFailure;
   }
@@ -167,7 +198,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     // DOM click completion can precede its async preparation binding. READY
     // owns its own rejection, while page loss still belongs to active prepare.
     if(!(preparationActive && code==='BROWSER_READY_PHASE'))checkpoint=code;
-    try{return await work();}catch{throw latch(code,source);}
+    try{return await work();}catch{throw latch(code,source,true);}
   }
   const track=<T>(work:Promise<T>)=>{
     pending.add(work);void work.then(()=>pending.delete(work),()=>pending.delete(work));return work;
@@ -203,10 +234,28 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
   }
   function assertPage() {current();need(page && page.mainFrame().url()===binding.endpoints.demo+pagePath);}
   const timeout=()=>Math.min(45000,scoped().deadline-Date.now());
-  async function waitPhase(expected:string,manual=false) {
-    const max=manual?Math.min(180000,scoped().deadline-Date.now()):timeout();
-    await page!.waitForFunction(value=>[value,'STOPPED'].includes(document.body.dataset.phase??''),expected,{timeout:max});
-    assertPage();need(await page!.locator('body').getAttribute('data-phase')===expected);
+  async function waitPhase(expected:string,manual=false,until?:number) {
+    const scope=scoped(),deadline=Math.min(scope.deadline,until??(Date.now()+(manual?180000:45000)));
+    const remaining=()=>{const ms=deadline-Date.now();need(ms>0);return ms;};
+    await page!.waitForFunction(value=>[value,'STOPPED'].includes(document.body.dataset.phase??''),expected,{timeout:remaining()});
+    assertPage();
+    const phase=await page!.locator('body').getAttribute('data-phase',{timeout:remaining()});
+    if(phase==='STOPPED' && expected==='OBSERVE' && initialClickActive() && !firstFailure){
+      // STOPPED can reach Playwright before the one-way terminal binding.
+      // Read the snapshot from the same document within the existing wait.
+      const allowed=[...beforeConfirmFailures,...afterConfirmFailures,...commonConfirmFailures].filter(marker=>initialTerminal(marker,step));
+      const marker=await billingBounded({deadline,signal:scope.signal},()=>page!.evaluate(({url,allowed})=>{
+        if(window!==window.top || location.href!==url || document.body.dataset.phase!=='STOPPED')return null;
+        const descriptor=Object.getOwnPropertyDescriptor(window,'__failedRenewalInitialConfirmFailure');
+        if(descriptor?.configurable!==false || descriptor.writable!==false || typeof descriptor.value!=='function')return null;
+        const result:unknown=descriptor.value();
+        return typeof result==='string' && allowed.includes(result)?result:null;
+      },{url:binding.endpoints.demo+pagePath,allowed}),1000).catch(()=>null);
+      assertPage();
+      if(initialClickActive() && typeof marker==='string' && initialTerminal(marker,step))throw latch(marker);
+      throw latch(checkpoint);
+    }
+    need(phase===expected);
   }
   async function awaitOperator(which:'initial'|'method') {
     const ready=which==='initial'?'READY':'METHOD_READY', label=which==='initial'?'Pay':'Confirm test method';
@@ -224,26 +273,27 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     while(which==='initial'&&pendingInitialNavigations.size)await waitForNavigationClassification();
     assertPage();need(step==='CONFIRM');
     manualArmed=true;
+    clickApprovedUntil=waitForClick?0:scoped().deadline;
     await at('BROWSER_MANUAL_PAY_ARM',async()=>need(await button.evaluate((b,phase)=>{
       if(!(b instanceof HTMLButtonElement)||!b.disabled||document.body.dataset.phase!==phase)return false;
       b.disabled=false;return true;
     },ready)));
-    await at('BROWSER_MANUAL_PAY_WAIT',async()=>{
-      if(waitForClick){
-        const scope=scoped(),deadline=Math.min(scope.deadline,Date.now()+180000);
-        await forwardProfileClick(button,which,{deadline,signal:scope.signal},waitForClick,()=>{
+    if(waitForClick){
+      const scope=scoped(),deadline=Math.min(scope.deadline,Date.now()+180000);
+      const clickCheckpoint=which==='initial'?'BROWSER_PAY_CLICK':'BROWSER_MANUAL_PAY_WAIT';
+      await at(clickCheckpoint,()=>forwardProfileClick(button,which,{deadline,signal:scope.signal},
+        (action,limits)=>at('BROWSER_MANUAL_PAY_WAIT',()=>waitForClick(action,limits)),()=>{
+          checkpoint=clickCheckpoint;
           assertPage();need(manualArmed&&step==='CONFIRM'&&!pendingInitialNavigations.size);
-        });
-        const target=which==='initial'?'OBSERVE':'METHOD_CONFIRMED';
-        const timeout=deadline-Date.now();need(timeout>0);
-        await page!.waitForFunction(value=>[value,'STOPPED'].includes(document.body.dataset.phase??''),target,{timeout});
-        assertPage();need(await page!.locator('body').getAttribute('data-phase')===target);
-      }else await waitPhase(which==='initial'?'OBSERVE':'METHOD_CONFIRMED',true);
-    });
+          clickApprovedUntil=deadline;
+        }));
+      await at(which==='initial'?'BROWSER_WAIT_OBSERVE':'BROWSER_MANUAL_PAY_WAIT',
+        ()=>waitPhase(which==='initial'?'OBSERVE':'METHOD_CONFIRMED',true,deadline));
+    }else await at('BROWSER_MANUAL_PAY_WAIT',()=>waitPhase(which==='initial'?'OBSERVE':'METHOD_CONFIRMED',true));
     need((step as string)==='ACK' && finalDelivery);
     await finalDelivery;assertPage();
     finalDelivery=undefined;
-    manualArmed=false;
+    manualArmed=false;clickApprovedUntil=0;
   }
   function waitForNavigationClassification() {
     return at(navigationBlockCheckpoint,()=>billingBounded(scoped(),async()=>{
@@ -275,6 +325,8 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     try {
       current();
       const request=route.request(),rawUrl=request.url(),url=new URL(rawUrl);
+      // Header reads can outlive the profile wait or its approval.
+      const approvedAtInterception=step==='CONFIRM' && manualArmed && Date.now()<clickApprovedUntil;
       const renderPhase=(state==='INITIAL'||state==='METHOD') && step==='CONFIRM'?state:undefined;
       // Select backend provenance before even reading headers or delivering a
       // preflight. Non-backend refusals get a fixed route boundary.
@@ -434,7 +486,8 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
         const key=headers['idempotency-key'];
         need(uuid(key) && !usedKeys.has(key));usedKeys.add(key);
       }
-      if(previous==='CONFIRM')need(manualArmed && !pendingInitialNavigations.size);
+      if(previous==='CONFIRM')need(requestPhase===state && approvedAtInterception && manualArmed &&
+        Date.now()<clickApprovedUntil && !pendingInitialNavigations.size);
       if(state==='INITIAL'){
         need(initial && initialBridge && Date.now()<Date.parse(initial.action.expires_at));
         if(previous==='SESSION')body(request.postData(),['action_token']);
@@ -503,6 +556,14 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     });
     await context.routeWebSocket('**/*',socket=>socket.close());
     await context.route('**/*',r=>track(routeRequest(r)));
+    await context.exposeBinding('__failedRenewalPayProgress',({frame,page:source},...args:unknown[])=>{
+      if(firstFailure||!initialClickActive()||step!=='CONFIRM'||
+          source!==page||frame!==page!.mainFrame()||frame.url()!==binding.endpoints.demo+pagePath)return;
+      if(observedPaySignals>=0){
+        observedPaySignals=args.length===1 && observedPaySignals<initialPaySignals.length &&
+          args[0]===initialPaySignals[observedPaySignals]?observedPaySignals+1:-1;
+      }
+    });
     await context.exposeBinding('__failedRenewalTerminal',({frame,page:source},...args:unknown[])=>{
       if(state==='CLOSED' || source!==page || frame!==page!.mainFrame() || frame.url()!==binding.endpoints.demo+pagePath ||
           args.length!==2 || args[0]!=='STOPPED')return;
@@ -511,6 +572,7 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       // action/session may report a terminal until delivery advances the step.
       const active=step==='BUSY'&&inFlight?.phase===state?inFlight.step:step;
       const valid=marker===null ||
+        (initialClickActive() && initialTerminal(marker,step)) ||
         (readiness==='INITIAL' && state==='INITIAL' && !preparationActive && (
           (marker==='BROWSER_INITIAL_ACTION' && (active==='ACTION'||(step!=='BUSY'&&active==='SESSION'))) ||
           (marker==='BROWSER_INITIAL_SESSION' && (active==='SESSION'||active==='CONFIRM')) ||
@@ -541,7 +603,12 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
         const createKey=crypto.randomUUID();usedKeys.add(createKey);
         const p=await initialPort.prepare({origin:v.origin!,token},createKey,scoped());
         assertPage();need(p.customer_id===v.customerId && p.site_id===binding.siteId && p.account_id===binding.accountId && p.run_id===binding.runId && p.price_id===binding.priceId && uuid(p.subscription_id) && uuid(p.operation_id) && p.session.publishable_key.startsWith('pk_test_'));
-        initial=p;initialBridge=createFirstPaymentBridge({binding,prepared:p,token,port:initialPort,limits:scoped(),
+        initial=p;initialBridge=createFirstPaymentBridge({binding,prepared:p,token,limits:scoped(),port:{
+          confirm:(request,limits)=>{
+            assertPage();need(initialClickActive() && step==='BUSY' && initialPort);
+            return initialPort.confirm(request,limits);
+          },
+        },
           latchFailure:code=>latch(code,'INITIAL')});
         step='ACTION';
         readiness='INITIAL';

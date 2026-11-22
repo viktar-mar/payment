@@ -49,6 +49,7 @@ async function checkCardForms(entry: string) {
   const scripts: Array<EventTarget & {src: string}> = [];
   const firstScript = Promise.withResolvers<void>();
   const requests: string[] = [];
+  const progress: unknown[][] = [];
   const controls = new Map(['request', 'verify', 'code', 'consent', 'start', 'pay', 'confirm-method', 'status']
     .map(id => [id, {disabled: true, checked: false, value: '', onclick: undefined as ((event?: {isTrusted: boolean}) => Promise<void>) | undefined}]));
   const host = {isConnected: true, get ownerDocument(): Document {return document as unknown as Document;},
@@ -72,6 +73,7 @@ async function checkCardForms(entry: string) {
     __failedRenewalPrepare() {return {subscriptionId, operationId};}
     __failedRenewalChallenge() {}
     __failedRenewalTerminal() {}
+    __failedRenewalPayProgress = (...args: unknown[]) => {progress.push(args);};
   }
   const window = new PageWindow();
   Object.defineProperty(document, 'defaultView', {value: window});
@@ -129,6 +131,7 @@ async function checkCardForms(entry: string) {
     scripts[0]!.dispatchEvent(new Event('load'));
     await start;
     assert.equal(body.dataset.phase, 'READY');
+    assert.deepEqual(progress, []);
     controls.get('pay')!.disabled = false;
     await controls.get('pay')!.onclick!({isTrusted: true});
     assert.equal(body.dataset.phase, 'OBSERVE');
@@ -140,6 +143,7 @@ async function checkCardForms(entry: string) {
     controls.get('confirm-method')!.disabled = false;
     await controls.get('confirm-method')!.onclick!({isTrusted: true});
     assert.equal(body.dataset.phase, 'METHOD_CONFIRMED');
+    assert.deepEqual(progress, [['ENTERED'], ['SUBMIT'], [null], ['TOKEN'], [null]]);
     assert.deepEqual(calls, ['payment', 'setup', 'confirmSetup']);
     assert.deepEqual(requests, [...replies.keys()]);
     assert.equal(scripts.length, 1);
