@@ -28,7 +28,7 @@ class OwnedOptionalTrialClaimIntegrationTest extends OwnedOptionalTrialFixture {
             """, String.class)).containsExactlyElementsOf(dev.genericpayments.platform.support.CurrentSchemaVersions.EXPECTED);
         assertThat(jdbc.queryForList("""
             select version from owned_optional_trial_schema_history where success and type='SQL' order by installed_rank
-            """, String.class)).containsExactly("1");
+            """, String.class)).containsExactly("1", "2");
     }
 
     private record Candidate(UUID run, UUID clock, UUID subscription, UUID operation, String fingerprint) {}

@@ -102,14 +102,16 @@ public final class OwnedOptionalTrialCreate {
     }
 
     private static void verifyPrerequisites(StripeClient client, Authority a) throws StripeException {
+        verifyClockCustomerPrice(client, a);
+        requireEmpty(client.v1().paymentMethods().list(PaymentMethodListParams.builder()
+            .setCustomer(a.customerReference()).setLimit(1L).build(),options(null)));
+        requireEmpty(client.v1().subscriptions().list(SubscriptionListParams.builder()
+            .setCustomer(a.customerReference()).setStatus(SubscriptionListParams.Status.ALL).setLimit(1L).build(),options(null)));
+    }
+
+    private static void verifyClockCustomerPrice(StripeClient client, Authority a) throws StripeException {
         var read=options(null);
-        var clock=client.v1().testHelpers().testClocks().retrieve(a.clockReference(),read);
-        require(clock!=null && a.clockReference().equals(clock.getId()) && "test_helpers.test_clock".equals(clock.getObject())
-            && Boolean.FALSE.equals(clock.getLivemode()) && !Boolean.TRUE.equals(clock.getDeleted())
-            && a.clockName().equals(clock.getName()) && "ready".equals(clock.getStatus())
-            && (clock.getStatusDetails()==null || clock.getStatusDetails().getAdvancing()==null)
-            && Objects.equals(a.frozen(),clock.getFrozenTime()) && Objects.equals(a.clockCreated(),clock.getCreated())
-            && Objects.equals(a.clockDeletesAfter(),clock.getDeletesAfter()));
+        verifyReady(client, a);
         var customer=client.v1().customers().retrieve(a.customerReference(),read);
         require(customer!=null && a.customerReference().equals(customer.getId()) && "customer".equals(customer.getObject())
             && a.clockReference().equals(customer.getTestClock()) && Boolean.FALSE.equals(customer.getLivemode())
@@ -121,10 +123,34 @@ public final class OwnedOptionalTrialCreate {
         var price=client.v1().prices().retrieve(a.priceReference(),read);
         StripeBillingOwnership.requirePublishedPrice(price,a.published());
         require(Boolean.TRUE.equals(price.getActive()));
+    }
+
+    private static void verifyReady(StripeClient client, Authority a) throws StripeException {
+        var read = options(null);
+        var clock=client.v1().testHelpers().testClocks().retrieve(a.clockReference(),read);
+        require(clock!=null && a.clockReference().equals(clock.getId()) && "test_helpers.test_clock".equals(clock.getObject())
+            && Boolean.FALSE.equals(clock.getLivemode()) && !Boolean.TRUE.equals(clock.getDeleted())
+            && a.clockName().equals(clock.getName()) && "ready".equals(clock.getStatus())
+            && (clock.getStatusDetails()==null || clock.getStatusDetails().getAdvancing()==null)
+            && Objects.equals(a.frozen(),clock.getFrozenTime()) && Objects.equals(a.clockCreated(),clock.getCreated())
+            && Objects.equals(a.clockDeletesAfter(),clock.getDeletesAfter()));
+    }
+
+    static void reread(StripeClient client, Authority a, Created original) throws StripeException {
+        verifyClockCustomerPrice(client, a);
+        var read = options(null);
         requireEmpty(client.v1().paymentMethods().list(PaymentMethodListParams.builder()
-            .setCustomer(a.customerReference()).setLimit(1L).build(),read));
-        requireEmpty(client.v1().subscriptions().list(SubscriptionListParams.builder()
-            .setCustomer(a.customerReference()).setStatus(SubscriptionListParams.Status.ALL).setLimit(1L).build(),read));
+            .setCustomer(a.customerReference()).setLimit(1L).build(), read));
+        var subs = client.v1().subscriptions().list(SubscriptionListParams.builder()
+            .setCustomer(a.customerReference()).setStatus(SubscriptionListParams.Status.ALL).setLimit(2L).build(), read);
+        require(subs != null && "list".equals(subs.getObject()) && Boolean.FALSE.equals(subs.getHasMore())
+            && subs.getData() != null && subs.getData().size() == 1 && original.equals(verifyCreated(subs.getData().getFirst(), a)));
+        var invoices = client.v1().invoices().list(InvoiceListParams.builder()
+            .setSubscription(original.subscription()).setLimit(2L).build(), read);
+        require(invoices != null && "list".equals(invoices.getObject()) && Boolean.FALSE.equals(invoices.getHasMore())
+            && invoices.getData() != null && invoices.getData().size() == 1 && original.invoice().equals(invoices.getData().getFirst().getId()));
+        verifyZeroInvoice(client, a, original);
+        verifyReady(client, a);
     }
 
     private static Created verifyCreated(Subscription remote, Authority a) {

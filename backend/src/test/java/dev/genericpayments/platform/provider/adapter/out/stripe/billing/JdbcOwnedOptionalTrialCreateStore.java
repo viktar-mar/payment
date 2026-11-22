@@ -2,6 +2,7 @@ package dev.genericpayments.platform.provider.adapter.out.stripe.billing;
 
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.sql.ResultSet;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -27,15 +28,19 @@ final class JdbcOwnedOptionalTrialCreateStore implements Store {
               and not exists(select 1 from stripe_billing_owned_optional_trial_creates r where r.clock_intent=c.clock_intent)
               and not exists(select 1 from provider_operations p where p.payment_account_id=c.account_id
                     and (p.resource_id=c.create_operation or p.operation_key=c.operation_key))
-            """,(r,n)->new Authority(r.getObject("run_id",UUID.class),r.getObject("clock_intent",UUID.class),
+            """,(r,n)->authority(r),
+            scope.run(),scope.clockIntent(),scope.subscription(),scope.createOperation());
+        return rows.size()==1 ? rows.getFirst() : null;
+    }
+
+    static Authority authority(ResultSet r) throws SQLException {
+        return new Authority(r.getObject("run_id",UUID.class),r.getObject("clock_intent",UUID.class),
                 r.getObject("account_id",UUID.class),r.getObject("site_id",UUID.class),r.getObject("customer_id",UUID.class),
                 r.getObject("subscription_id",UUID.class),r.getObject("create_operation",UUID.class),r.getObject("price_id",UUID.class),
                 r.getObject("product_id",UUID.class),r.getString("price_key"),r.getString("external_account"),r.getString("credentials_ref"),
                 r.getString("clock_reference"),r.getString("clock_name"),r.getString("customer_reference"),r.getString("price_reference"),
                 r.getString("product_reference"),r.getString("operation_key"),r.getLong("frozen_time"),r.getLong("clock_created"),
-                r.getLong("clock_deletes_after"),r.getLong("trial_end"),r.getString("fingerprint")),
-            scope.run(),scope.clockIntent(),scope.subscription(),scope.createOperation());
-        return rows.size()==1 ? rows.getFirst() : null;
+                r.getLong("clock_deletes_after"),r.getLong("trial_end"),r.getString("fingerprint"));
     }
 
     public boolean claim(Authority a, UUID claim) {

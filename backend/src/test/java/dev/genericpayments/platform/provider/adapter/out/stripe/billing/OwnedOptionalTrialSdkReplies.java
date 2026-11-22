@@ -8,6 +8,12 @@ import dev.genericpayments.platform.support.StripeBillingOwnedSubscriptionFixtur
 /** Owned, synthetic Stripe responses shared by the isolated and database composition tests. */
 final class OwnedOptionalTrialSdkReplies {
     static void queue(StripeBillingInertSdkFixture.Transport http,OwnedOptionalTrialCreate.Authority a,String fault){
+        replies(http, a, fault, false);
+    }
+    static void observation(StripeBillingInertSdkFixture.Transport http, OwnedOptionalTrialCreate.Authority a, String fault) {
+        replies(http, a, fault, true);
+    }
+    private static void replies(StripeBillingInertSdkFixture.Transport http, OwnedOptionalTrialCreate.Authority a, String fault, boolean observation) {
         var f=new StripeBillingOwnedSubscriptionFixture(TaxMode.INCLUSIVE,2000);
         var clock=StripeBillingOwnedSubscriptionFixture.json(f.f.clockJson());clock.addProperty("name",a.clockName());
         var customer=f.customer.deepCopy();
@@ -32,8 +38,15 @@ final class OwnedOptionalTrialSdkReplies {
         if(fault.equals("changed trial end"))response.addProperty("trial_end",a.trialEnd()+1);
         http.reply(clock.toString());http.reply(customer.toString());http.reply(price.toString());
         http.reply(fault.equals("attached method")?StripeBillingOwnedSubscriptionFixture.page(new JsonObject()):StripeBillingOwnedSubscriptionFixture.page());
-        http.reply(fault.equals("prior subscription")?StripeBillingOwnedSubscriptionFixture.page(new JsonObject()):StripeBillingOwnedSubscriptionFixture.page());
-        if(fault.equals("lost ack"))http.disconnect();else http.reply(response.toString());
+        if (observation) {
+            http.reply(StripeBillingOwnedSubscriptionFixture.page(response));
+            var original = new JsonObject(); original.addProperty("id","in_trial");
+            http.reply(fault.equals("extra invoice") ? "{\"object\":\"list\",\"has_more\":true,\"data\":[]}"
+                : StripeBillingOwnedSubscriptionFixture.page(original));
+        } else {
+            http.reply(fault.equals("prior subscription")?StripeBillingOwnedSubscriptionFixture.page(new JsonObject()):StripeBillingOwnedSubscriptionFixture.page());
+            if(fault.equals("lost ack"))http.disconnect();else http.reply(response.toString());
+        }
         var invoice=f.invoice.deepCopy();invoice.addProperty("id","in_trial");invoice.addProperty("status","paid");
         for(String field:java.util.List.of("amount_due","amount_remaining","total","subtotal"))invoice.addProperty(field,0);
         if(fault.equals("paid invoice"))invoice.addProperty("amount_paid",2000);
@@ -43,5 +56,9 @@ final class OwnedOptionalTrialSdkReplies {
         if(fault.equals("foreign line"))line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription_item","si_other");
         http.reply(StripeBillingOwnedSubscriptionFixture.page(line));
         http.reply(fault.equals("allocation")?"{\"object\":\"list\",\"data\":[{}],\"has_more\":false}":"{\"object\":\"list\",\"data\":[],\"has_more\":false}");
+        if (observation) {
+            if (fault.equals("advanced clock")) clock.addProperty("frozen_time",a.trialEnd());
+            http.reply(clock.toString());
+        }
     }
 }
