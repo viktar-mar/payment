@@ -1,5 +1,15 @@
 # Stripe Billing Stage 5B acceptance
 
+## Current acceptance status on 2026-11-22
+
+**Stage 5B remains open.** The earlier Stripe run `e7080356` verified the first €20 payment and first successful €20 renewal. Run `19107094` verified a failed renewal. Access was allowed one second before the grace deadline and denied at the deadline and one second after it. Confirmation of the replacement method and repayment of that original €20 debt still need native evidence.
+
+Source `076391b8ce5cfdfc01fbe949144cb05826a87ec3` passed [Offline CI](https://github.com/viktar-mar/payment/actions/runs/45019547486) and the [first-renewal tests](https://github.com/viktar-mar/payment/actions/runs/45019547413). In the local rehearsal, Pay and Confirm test method reached the same checkout document and the runner reported `METHOD_CONFIRMED`.
+
+Fresh run `a5d3c1ab-3bad-4cea-8445-1cab48ba94d2` stopped at the initial Docker check with `DAEMON_UNCONFIRMED` and `attemptsStarted=0`. The local operator created no subscription and sent no financial request. The report leaves the reason for Docker's missing readiness confirmation undetermined.
+
+The remaining native cases cover initial decline, retry and 3DS, trials, payment-method isolation and paused resumption, plan changes, scheduling and withdrawing cancellation, Portal navigation and return, and reordered or missed webhooks. The matrix below gives the implementation and evidence for each area.
+
 ## Fresh failed renewal, grace and recovery — 2026-11-15
 
 **HOSTED VERIFIED · native attempted, NOT_ACCEPTED · full Stage 5B NOT_ACCEPTED.** Runtime source `997252a6e6b07f611914a543daf442492f948706` passed [Offline CI 43771017914](https://github.com/viktar-mar/payment/actions/runs/43771017914): all four jobs (`backend`, `backend-owned-failed-renewal`, `frontend`, `infrastructure`) succeeded. This includes the genuine hosted composition, browser support regressions and all three no-launch runtime packaging checks. Local targeted verification recorded 1,144 passing inert checks and strict TypeScript success; independent source review passed. These results establish the tested source, not a native payment outcome. [Operator guide](testing/billing-failed-renewal-recovery.md#fresh-eur20-failed-renewal-and-recovery--2026-11-15)
