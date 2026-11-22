@@ -24,9 +24,9 @@ export const isFailedRenewalProvisionCheckpoint=code=>checkpointCodes.has(code);
 /** Fresh recurring fixture only. Cookies and callback secrets never enter its append-only public ledger. */
 export async function createBillingFixture(options,dependencies={}) {
  need(billingFailedRenewalExcluded(options?.configuration?.env??{}));
- if(options.configuration?.selectedCase==='initial_cancel_withdraw'){
+ if(['initial_cancel_withdraw','initial_decline_retry'].includes(options.configuration?.selectedCase)){
   const configuration=validateBillingAcceptanceOptions(options.configuration);need(configuration);
-  return createFixture({...options,configuration},dependencies,'CANCELLATION');
+  return createFixture({...options,configuration},dependencies,configuration.selectedCase==='initial_decline_retry'?'INITIAL_RETRY':'CANCELLATION');
  }
  return createFixture(options,dependencies,'INITIAL');
 }
@@ -37,6 +37,9 @@ export async function createBillingFailedRenewalFixture({configuration,bootstrap
 async function createFixture({configuration:c,bootstrap,cli},dependencies,purpose) {
  const failed=purpose==='FAILED_RENEWAL',graceDays=failed?3:0;
  let provisionClaimed=false,confirmRecorded=false,armState='NEW',armBoundary;
+ const retry=purpose==='INITIAL_RETRY';
+ const retryLedger=['create-dispatch','create-ack','confirm-dispatch','confirm-ack','decline-proof','retry-dispatch','retry-ack','successor-confirm-dispatch','successor-confirm-ack','recovered-proof'];
+ let retryCursor=0,retryKeyHash,successorId,successorKeyHash;
  let nextCancellation='schedule',scheduleHash,scheduleOperation;
  const fetcher=dependencies.fetch??globalThis.fetch,write=dependencies.write??writeOwned;
  const suffix=c.runId.replaceAll('-',''),siteKey='s5a-'+suffix,email='billing-'+suffix+'@example.test';
@@ -55,6 +58,13 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
   const dir=await open(directory,constants.O_RDONLY|constants.O_NOFOLLOW);try{await dir.sync();}finally{await dir.close();}billingCheck(limits);
  }
  async function save(kind,value,limits){need(!closed);await billingBounded(limits,l=>write('billing-'+String(++sequence).padStart(3,'0')+'-'+kind+'.json',{runId:c.runId,expectedSource:c.expectedSource,...value},l));}
+ async function financialReceipt(kind,value,limits) {
+  if(!retry)return save(kind,value,limits);
+  need(retryLedger[retryCursor]===kind);
+  const current=retryCursor;retryCursor=-1;
+  await save(kind,value,limits);
+  retryCursor=current+1;
+ }
  async function request(path,limits,{method='GET',body,status=200,target='backend'}={}) {
   return billingBounded(limits,async l=>{
    need(!closed);need(await bootstrap.verify(l)===true);
@@ -138,13 +148,40 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
    need(provisioned&&customerId&&!closed&&typeof key==='string'&&/^[A-Za-z0-9:_-]{1,255}$/.test(key));
    if(kind==='create'){need(!createKey&&!subscriptionId);createKey=key;}
    else{need(kind==='confirm'&&subscriptionId&&operationId&&!confirmKey&&billingUuid(identity?.attemptId)&&identity.subscriptionId===subscriptionId&&identity.operationId===operationId);confirmKey=key;attemptId=identity.attemptId;}
-   await save(kind+'-dispatch',{phase:'DISPATCHING',key,customerId,...(kind==='confirm'?{subscriptionId,operationId,attemptId}:{priceId})},limits);return true;
+   await financialReceipt(kind+'-dispatch',{phase:'DISPATCHING',key,customerId,...(kind==='confirm'?{subscriptionId,operationId,attemptId}:{priceId})},limits);return true;
   },
   async acknowledge(kind,value,limits){
    if(kind==='create'){need(createKey&&!subscriptionId&&billingUuid(value?.subscriptionId)&&billingUuid(value.operationId)&&value.subscriptionId!==value.operationId);subscriptionId=value.subscriptionId;operationId=value.operationId;}
-   else need(kind==='confirm'&&confirmKey&&value?.state==='OBSERVE'&&value.attemptId===attemptId&&value.nextActionAllowed===false);
-   await save(kind+'-ack',{phase:'ACKNOWLEDGED',subscriptionId,operationId,...(kind==='confirm'?{attemptId}:{})},limits);if(kind==='confirm')confirmRecorded=true;return true;
+   else {
+    need(kind==='confirm'&&confirmKey&&value?.attemptId===attemptId&&value.nextActionAllowed===false);
+    need(retry?value.state==='DECLINED'&&value.retryAllowed===true&&value.successorAttemptId===null:value.state==='OBSERVE');
+   }
+   await financialReceipt(kind+'-ack',{phase:'ACKNOWLEDGED',subscriptionId,operationId,...(kind==='confirm'?{attemptId,...(retry?{state:'DECLINED'}:{})}:{})},limits);if(kind==='confirm')confirmRecorded=true;return true;
   },
+  ...(retry?{
+   async recordRetry(kind,value,limits) {
+    need(confirmRecorded && retryLedger[retryCursor]===kind);
+    const base={subscriptionId,operationId,customerId};
+    if(kind==='decline-proof' || kind==='recovered-proof'){
+     await financialReceipt(kind,{...base,phase:'VERIFIED',attemptId:kind==='decline-proof'?attemptId:successorId},limits);
+    }else if(kind==='retry-dispatch' || kind==='successor-confirm-dispatch'){
+     const expected=kind==='retry-dispatch'?attemptId:successorId;
+     need(value.attemptId===expected && value.subscriptionId===subscriptionId && value.operationId===operationId &&
+       typeof value.keyHash==='string' && /^[a-f0-9]{64}$/.test(value.keyHash) &&
+       ![digest(createKey),digest(confirmKey),retryKeyHash,successorKeyHash].includes(value.keyHash));
+     if(kind==='retry-dispatch')retryKeyHash=value.keyHash;else successorKeyHash=value.keyHash;
+     await financialReceipt(kind,{...base,phase:'DISPATCHING',attemptId:expected,keyHash:value.keyHash},limits);
+    }else if(kind==='retry-ack'){
+     need(value.attemptId===attemptId && billingUuid(value.successorAttemptId) && value.successorAttemptId!==attemptId);
+     successorId=value.successorAttemptId;
+     await financialReceipt(kind,{...base,phase:'ACKNOWLEDGED',attemptId,successorAttemptId:successorId},limits);
+    }else{
+     need(kind==='successor-confirm-ack' && value.attemptId===successorId && value.state==='OBSERVE' && value.nextActionAllowed===false);
+     await financialReceipt(kind,{...base,phase:'ACKNOWLEDGED',attemptId:successorId,state:'OBSERVE'},limits);
+    }
+    return true;
+   },
+  }:{}),
   ...(purpose==='CANCELLATION'?{
    async beforeCancellation(kind,keyHash,limits){
     need(!closed && provisioned && confirmRecorded && ['schedule','withdraw'].includes(kind) &&

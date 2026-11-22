@@ -1462,6 +1462,22 @@ test('Billing bootstrap is inert and keeps a seventh distinct grant key in owned
   await b.stop(LIMIT());
 });
 
+for(const selectedCase of ['initial_success','initial_cancel_withdraw','initial_decline_retry']){
+ test('only initial decline/retry selects its restricted demo build: '+selectedCase,async()=>{
+  const f=fixture();
+  f.options.selectedCase=selectedCase;
+  f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',
+    ...(selectedCase==='initial_success'?{}:{PAYMENT_STRIPE_BILLING_CASE:selectedCase})};
+  const bootstrap=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);
+  await bootstrap.prepare(LIMIT());
+  const builds=f.events.filter(e=>e.type==='process'&&e.args.includes('build')&&e.args.includes('--quiet'));
+  assert.equal(builds.length,1);
+  const args=builds[0].args.filter(value=>value.startsWith('PAYMENT_DEMO_BUILD_MODE='));
+  assert.deepEqual(args,selectedCase==='initial_decline_retry'?['PAYMENT_DEMO_BUILD_MODE=billing-decline-retry']:[]);
+  await bootstrap.stop(LIMIT());
+ });
+}
+
 test('Billing grant entropy collision fails before owned service creation',async()=>{
   const f=fixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';
   let n=0;f.dependencies.randomBytes=size=>Buffer.alloc(size,++n===7?1:n);

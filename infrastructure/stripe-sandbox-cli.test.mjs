@@ -848,3 +848,47 @@ test('failed-renewal stop cannot confirm a spawned listener without an owned PID
   await rejects(f.adapter.stopListener(f.limits),'STOP');
   assert.deepEqual(f.children[0].signals,[]);
 });
+
+async function initialRetrySetup(){
+  const f=await billingSetup(),t=billingTarget(),o=f.objects;
+  f.options.configuration.selectedCase='initial_decline_retry';
+  f.options.configuration.env.PAYMENT_STRIPE_BILLING_CASE='initial_decline_retry';
+  f.adapter=await (await import('./stripe-sandbox-cli.mjs')).createBillingCliAdapter(f.options,f.dependencies);
+  await f.adapter.validateBinding(f.limits);await start(f);
+  const receipt={chargeReference:'ch_declined',declineCode:'generic_decline'};
+  const captured=o['/v1/charges/ch_original'];
+  const failed={...captured,id:receipt.chargeReference,status:'failed',paid:false,captured:false,amount_captured:0,
+    failure_code:'card_declined',outcome:{type:'issuer_declined',reason:receipt.declineCode}};
+  o['/v1/charges/ch_declined']=failed;
+  const fresh=billingObjects(),pi=o['/v1/payment_intents/pi_original'];
+  o['/v1/subscriptions/sub_original'].status='incomplete';
+  Object.assign(o['/v1/invoices/in_original'],{status:'open',amount_paid:0,amount_remaining:2000});
+  Object.assign(o['/v1/invoice_payments'].data[0],{status:'open',amount_paid:0,status_transitions:{paid_at:null}});
+  Object.assign(pi,{status:'requires_payment_method',amount_received:0,latest_charge:failed.id,
+    last_payment_error:{type:'card_error',code:'card_declined',decline_code:receipt.declineCode,charge:failed.id}});
+  o['/v1/charges']={object:'list',data:[failed],has_more:false};
+  function settle(){Object.assign(o,fresh);o['/v1/invoices'].data=[o['/v1/invoices/in_original']];o['/v1/charges'].data=[failed,captured];}
+  return {f,t,o,receipt,settle,decline:()=>f.adapter.observeOwnedBillingInitialRetry('declined',{...t,periodStart:null,periodEnd:null},receipt,f.limits),
+    recover:()=>f.adapter.observeOwnedBillingInitialRetry('recovered',t,receipt,f.limits)};
+}
+test('initial Retry requires the original failed card charge and one different captured charge on the same intent',async()=>{
+  const {f,decline,recover,settle}=await initialRetrySetup();
+  assert.equal(await decline(),true);settle();assert.equal(await recover(),true);await stop(f);
+});
+for(const [name,change] of [
+  ['decline attributed to another intent',o=>o['/v1/charges/ch_declined'].payment_intent='pi_other'],
+  ['extra charge on the customer',o=>o['/v1/charges'].data.push(o['/v1/charges/ch_original'])],
+  ['foreign allocation',o=>o['/v1/invoice_payments'].data[0].invoice='in_foreign'],
+  ['absent explicit unpaid allocation',o=>delete o['/v1/invoice_payments'].data[0].amount_paid],
+])test('initial Retry denies '+name,async()=>{
+  const {f,o,decline}=await initialRetrySetup();change(o);await assert.rejects(decline(),/BILLING_INITIAL_RETRY/);await stop(f);
+});
+test('initial Retry refuses missing failed-charge history after settlement',async()=>{
+  const {f,o,decline,recover,settle}=await initialRetrySetup();await decline();settle();o['/v1/charges'].data.shift();
+  await assert.rejects(recover(),/BILLING_INITIAL_RETRY/);await stop(f);
+});
+test('an open allocation may omit transition timestamps only with zero cash and an exact failed charge',async()=>{
+  const {f,o,decline}=await initialRetrySetup();
+  delete o['/v1/invoice_payments'].data[0].status_transitions;
+  assert.equal(await decline(),true);await stop(f);
+});

@@ -13,3 +13,20 @@ export interface BillingCancellationResult extends Omit<BillingResult,'scope'> {
 export function createOwnedBillingCancellation(options:unknown,dependencies?:Record<string,unknown>):Promise<{resources():BillingCancellationResult;run(journey:(port:BillingCancellationPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingCancellationResult>;close(limits?:BillingLimits):Promise<BillingCancellationResult>}>;
 export interface BillingResult {scope:'INITIAL_NON_CLOCK';initialAccepted:boolean;full5bAccepted:false;cleanupConfirmed:boolean;status:string;phase:string;code:string|null}
 export function createOwnedBillingAcceptance(options:unknown,dependencies?:Record<string,unknown>):Promise<{resources():BillingResult;run(journey:(port:BillingPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingResult>;close(limits?:BillingLimits):Promise<BillingResult>}>;
+
+export interface BillingRetryAttempt {subscriptionId:string;operationId:string;attemptId:string}
+export interface BillingDeclineRetryPort extends BillingPort {
+  beforeRetry(key:string,original:BillingRetryAttempt):Promise<true>;
+  acknowledgeRetry(value:{attemptId:string;successorAttemptId:string}):Promise<true>;
+  beforeSuccessorConfirm(key:string,successor:BillingRetryAttempt):Promise<true>;
+  acknowledgeSuccessor(value:{attemptId:string;state:'OBSERVE';nextActionAllowed:false}):Promise<true>;
+}
+export interface BillingDeclineRetryResult extends Omit<BillingResult,'scope'> {
+  scope:'INITIAL_DECLINE_RETRY';
+  declineRetryAccepted:boolean;
+}
+export function createOwnedBillingDeclineRetry(options:unknown,dependencies?:Record<string,unknown>):Promise<{
+  resources():BillingDeclineRetryResult;
+  run(journey:(port:BillingDeclineRetryPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingDeclineRetryResult>;
+  close(limits?:BillingLimits):Promise<BillingDeclineRetryResult>;
+}>;

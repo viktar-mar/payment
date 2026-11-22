@@ -1,6 +1,6 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {readFile} from 'node:fs/promises';
 // @ts-expect-error Native Node type erasure requires explicit source extension.
-import {forwardBillingDispatch,runInitialBillingBrowser,runBillingCancellationBrowser} from './stripe-billing-acceptance.ts';
+import {forwardBillingDispatch,runInitialBillingBrowser,runBillingCancellationBrowser,runBillingDeclineRetryBrowser} from './stripe-billing-acceptance.ts';
 import type {BillingBinding,BillingPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {Route} from '@playwright/test';
 const binding={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081',receiver:'http://127.0.0.1:18082'},priceId:'11111111-2222-4333-8444-555555555555'} as BillingBinding;
@@ -22,7 +22,7 @@ test('native runner reserves cleanup and scheduling time beyond the unchanged ow
  assert.equal(ownerBudget,45*60*1000);
  assert.equal(number(owner,/limits\.deadline-Date\.now\(\)>(\d+)/),ownerBudget);
  assert.equal(cleanupBudget,120*1000);
- assert.equal(number(owner,/let ok=true;const limits=\{deadline:Date\.now\(\)\+(\d+)/),cleanupBudget);
+ assert.equal(number(owner,/const limits=\{deadline:Date\.now\(\)\+(\d+)/),cleanupBudget);
  assert.equal(runnerBudget,ownerBudget+cleanupBudget+60*1000);
  assert.equal(runnerBudget,48*60*1000);
  assert.equal(globalBudget,50*60*1000);
@@ -32,9 +32,9 @@ test('native runner reserves cleanup and scheduling time beyond the unchanged ow
 // A single in-memory page sends SDK-shaped requests only in response to visible manager
 // controls. It cannot make network calls. Responses retain their originating request.
 import type {Browser, Request, Response} from '@playwright/test';
-import type {BillingCancellationPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
+import type {BillingCancellationPort,BillingDeclineRetryPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 
-function cancellationPage(fault = '') {
+function cancellationPage(fault = '', declineRetry = false) {
  const id = (n:number) => '11111111-2222-4333-8444-' + String(n).padStart(12, '0');
  const b = {...binding, siteKey:'demo-key', email:'user@example.test', siteId:id(1), productId:id(2)};
  const [sub, create, attempt, schedule, withdraw] = [id(3), id(4), id(5), id(6), id(7)];
@@ -45,10 +45,29 @@ function cancellationPage(fault = '') {
  const cancel = base + '/' + sub + '/cancellation';
  const select = base + '/' + sub + '/operations/' + create + '/confirmation-session';
  const confirm = base + '/' + sub + '/operations/' + create + '/confirmation-attempts/' + attempt + '/confirm';
- const trace:string[] = [], sent:string[] = [];
+ const trace:string[] = [], sent:string[] = [], numbers:string[]=[];
+ const successor=id(21),retry=confirm.replace(/confirm$/,'retry'),nextConfirm=confirm.replace(attempt!,successor);
+ const sessionFor=(id:string)=>({protocol:'SERVER_CONFIRM_V2',provider:'stripe',flow:'PAYMENT',attempt_id:id,publishable_key:'pk_test_fixture',
+  capability:'bca2_'+(id===attempt?'C':'D').repeat(43),client_secret:'pi_original_secret_fixture',expires_at:boundary});
+ const receiptFor=(id:string,state:string,retry_allowed:boolean,successor_attempt_id:string|null)=>({protocol:'SERVER_CONFIRM_V2',attempt_id:id,state,retry_allowed,successor_attempt_id,expires_at:boundary});
+ let payCount=0,retryClicked=false,nonce=30,staticProbed=false;
+ let requestFailed=(request:Request)=>{void request;};
+ const presentation:string[]=[];
+ async function staticPresentation(){
+  const document=fault!=='static-image';
+  const nested={parentFrame:()=>stripeFrame,page:()=>page,isDetached:()=>false,url:()=>''};
+  const request={url:()=>document?'https://private.example/presentation?frame=1':'https://private.example/image.png',method:()=>'GET',
+   frame:()=>document?nested:stripeFrame,resourceType:()=>document?'document':'image',isNavigationRequest:()=>document,
+   postData:()=>null,redirectedFrom:()=>null,allHeaders:async()=>({}),failure:()=>({errorText:'net::ERR_BLOCKED_BY_CLIENT'})} as unknown as Request;
+  await handler({request:()=>request,abort:async(reason:string)=>{
+   presentation.push('abort '+reason);if(reason==='blockedbyclient')requestFailed(fault==='static-foreign-event'?{...request} as Request:request);
+  },fulfill:async(reply:{status:number})=>{presentation.push('fulfilled '+reply.status);}} as unknown as Route);
+ }
  const frame = {page:()=>page,isDetached:()=>false,url:()=>documentUrl};
  const stripeFrame = {page:()=>page,isDetached:()=>verified&&fault==='detached',url:()=>verified&&fault==='wrong-parent'?'https://unowned.invalid/':'https://js.stripe.com/v3/frame.html',parentFrame:()=>frame};
  const providerSent:string[]=[];
+ let releaseFirstToken:undefined|(()=>void),delayedToken:Promise<void>|undefined;
+ const delayedHeaders=Promise.withResolvers<void>();
  let payClicked=false, interceptsProvider=false;
  let documentUrl = '', closed = false, verified = false, displayed:'initial'|'schedule'|'withdraw' = 'initial';
  let ack:'schedule'|'withdraw'|undefined, refreshed = false;
@@ -62,14 +81,16 @@ function cancellationPage(fault = '') {
   const response = {request:()=>request,url:()=>request.url(),status:()=>status,fromServiceWorker:()=>false,body:async()=>Buffer.from(JSON.stringify(json))} as Response;
   for(const w of waiters) if(w.predicate(response)){waiters.delete(w);w.resolve(response);}
  }
- async function provider(url:string,owner:unknown=stripeFrame){
+ async function provider(url:string,owner:unknown=stripeFrame,delay=false){
   if(!interceptsProvider){providerSent.push(url);return;}
   const tokenCall=url.endsWith('/confirmation_tokens');
   const badSupport=!tokenCall;
   let tokenResponse:Response|null=null;
   const request={url:()=>url,method:()=>'POST',frame:()=>owner,isNavigationRequest:()=>false,redirectedFrom:()=>badSupport&&fault==='telemetry-redirect'?{}:null,
    existingResponse:()=>tokenResponse,
-   allHeaders:async()=>badSupport&&fault==='telemetry-auth'?{authorization:'Bearer '+token}:badSupport&&fault==='telemetry-cookie'?{cookie:'provider=demo'}:{origin:'https://js.stripe.com'}} as unknown as Request;
+   allHeaders:async()=>{
+    if(delay){delayedHeaders.resolve();await new Promise<void>(r=>{releaseFirstToken=r;});}
+    return badSupport&&fault==='telemetry-auth'?{authorization:'Bearer '+token}:badSupport&&fault==='telemetry-cookie'?{cookie:'provider=demo'}:{origin:'https://js.stripe.com'};}} as unknown as Request;
   await handler({request:()=>request,fallback:async()=>{
    providerSent.push(url);
    if(tokenCall&&fault!=='missing-token-response')tokenResponse={
@@ -78,7 +99,7 @@ function cancellationPage(fault = '') {
     body:async()=>{
      if(fault==='pending-token-body')await new Promise<void>(resolve=>{setTimeout(resolve,5);});
      if(fault==='concurrent-confirm')await new Promise<void>(resolve=>{releaseBody=resolve;void duplicateConfirm?.().catch(()=>{}).finally(resolve);});
-     return Buffer.from(JSON.stringify({object:fault==='token-type'?'payment_method':'confirmation_token',id:'ctoken_demo',livemode:fault==='live-token'}));
+     return Buffer.from(JSON.stringify({object:fault==='token-type'?'payment_method':'confirmation_token',id:declineRetry&&payCount===2&&fault!=='reused-token'?'ctoken_second':'ctoken_demo',livemode:fault==='live-token'}));
     }
    } as Response;
   },continue:async()=>{providerSent.push(url);},abort:async()=>{}} as unknown as Route);
@@ -86,7 +107,7 @@ function cancellationPage(fault = '') {
  }
  async function send(url:string, value:object, result:object, status=202, method='POST') {
   const schedulePost = url===cancel, withdrawPost=url===cancel+'/withdraw';
-  const key = schedulePost?id(9):withdrawPost?(fault==='same-key'?id(9):id(10)):'initial-key';
+  const key = declineRetry?id(nonce++):schedulePost?id(9):withdrawPost?(fault==='same-key'?id(9):id(10)):'initial-key';
   const headers = {'idempotency-key':key,authorization:'Bearer '+token,origin:b.endpoints.demo,'content-type':'application/json'};
   if(schedulePost && fault==='origin')headers.origin='https://elsewhere.invalid';
   if(schedulePost && fault==='cookie')Object.assign(headers,{cookie:'session=demo'});
@@ -102,7 +123,7 @@ function cancellationPage(fault = '') {
   } as unknown as Request;
   const route = {request:()=>request,continue:async(...args:unknown[])=>{
    assert.deepEqual(args,[]);sent.push(request.url());
-   publish(schedulePost&&fault==='foreign-request'?{...request} as Request:request,status,result);
+   publish((schedulePost&&fault==='foreign-request'||url===retry&&fault==='wrong-retry-response')?{...request} as Request:request,status,result);
   },abort:async()=>{}} as unknown as Route;
   await handler(route);
   if(closed)throw new Error('closed');
@@ -113,11 +134,12 @@ function cancellationPage(fault = '') {
  };
  const manager = {
   state:{phase:'ready',authorityRevision:1,subscription,operation:null},
+  evaluateHandle:async()=>({evaluate:async(fn:(check:()=>boolean)=>boolean)=>fn(()=>manager.state.authorityRevision===1)}),
   evaluate:async(fn:(m:unknown)=>unknown)=>fn(manager),
-  frameLocator:()=>({locator:()=>({fill:async()=>{},isVisible:async()=>false})}),
+  frameLocator:()=>({locator:(selector:string)=>({fill:async(v:string)=>{if(selector.includes('number'))numbers.push(v);},isVisible:async()=>false})}),
   getByRole:(_role:string,opts:{name:string})=>({
    check:async()=>{trace.push(opts.name);},waitFor:async()=>{},
-   evaluate:async()=>true,evaluateHandle:async()=>({evaluate:async(fn:(get:()=>boolean)=>boolean)=>fn(()=>payClicked)}),
+   evaluate:async()=>true,evaluateHandle:async()=>{const n=payCount;return {evaluate:async(fn:(get:()=>boolean)=>boolean)=>fn(()=>opts.name==='Retry payment'?retryClicked:opts.name==='Create subscription'?trace.includes('Create subscription'):declineRetry?payCount>n:payClicked)};},
    click:async()=>{
     const name=opts.name;
     trace.push(name);
@@ -130,17 +152,34 @@ function cancellationPage(fault = '') {
     }
     if(name==='Create subscription'){
      await send(base,{price_id:b.priceId,recurring_consent:true},{subscription_id:sub,operation_id:create,status:'PROCESSING'});
-     void send(select,{action_token:'bga1_'+'G'.repeat(43)},{protocol:'SERVER_CONFIRM_V2',provider:'stripe',flow:'PAYMENT',attempt_id:attempt},200).catch(()=>{});
+     void send(select,{action_token:'bga1_'+'G'.repeat(43)},sessionFor(attempt!),200).catch(()=>{});
     }
     if(name==='Pay'){
      if(fault==='before-actual-click')await provider('https://api.stripe.com/v1/confirmation_tokens');
-     payClicked=true;
+     payClicked=true;payCount++;
+     if(fault==='late-first-token'){
+      if(payCount===1){delayedToken=provider('https://api.stripe.com/v1/confirmation_tokens',stripeFrame,true);void delayedToken.catch(()=>{});await delayedHeaders.promise;}
+      else{releaseFirstToken!();await delayedToken;}
+     }
      if(fault!=='absent-token'&&fault!=='initial-only')await provider('https://api.stripe.com/v1/confirmation_tokens');
      if(fault==='token-replay')await provider('https://api.stripe.com/v1/confirmation_tokens');
      const submit=()=>send(confirm,{capability:'bca2_'+'C'.repeat(43),confirmation_token:fault==='substituted-token'?'ctoken_other':'ctoken_demo'},{protocol:'SERVER_CONFIRM_V2',attempt_id:attempt,state:'OBSERVE',next_action_allowed:false,retry_allowed:false,successor_attempt_id:null},200);
+     if(declineRetry){
+      const first=payCount===1;
+      await send(first?confirm:nextConfirm,{capability:sessionFor(first?attempt!:successor).capability,confirmation_token:first||fault==='reused-token'?'ctoken_demo':'ctoken_second'},
+       {...receiptFor(first?attempt!:successor,first?(fault==='unknown-first'?'UNKNOWN':'DECLINED'):'OBSERVE',first,null),next_action_allowed:false},200);
+      if(first&&fault==='early-retry')await send(retry,{},receiptFor(attempt!,'DECLINED',false,successor),200);
+      return;
+     }
      duplicateConfirm=submit;
      await submit();
      if(fault==='early')await send(cancel,{mode:'PERIOD_END'},{});
+    }
+    if(name==='Retry payment'){
+     retryClicked=true;
+     await send(retry,{},receiptFor(attempt!,'DECLINED',false,fault==='same-successor'?attempt!:successor),200);
+     if(fault==='repeat-retry')await send(retry,{},receiptFor(attempt!,'DECLINED',false,successor),200);
+     void send(nextConfirm.replace(/confirm$/,'client-session'),{}, {...sessionFor(successor),...(fault==='different-pi'?{client_secret:'pi_foreign_secret_fixture'}:{})},200).catch(()=>{});
     }
     if(name==='Refresh status' && ack){
      if(fault==='lost-authority')manager.state.authorityRevision++;
@@ -169,8 +208,13 @@ function cancellationPage(fault = '') {
   })
  };
  const page={
-  mainFrame:()=>frame,url:()=>documentUrl,waitForFunction:async()=>{},
-  on:(event:string,fn:typeof navigate)=>{if(event==='framenavigated')navigate=fn;},
+  mainFrame:()=>frame,url:()=>documentUrl,waitForFunction:async()=>{
+   if(declineRetry&&!staticProbed&&fault.startsWith('static-')){
+    staticProbed=true;void staticPresentation().catch(()=>{});
+    if(fault==='static-duplicate')void staticPresentation().catch(()=>{});
+   }
+  },
+  on:(event:string,fn:typeof navigate)=>{if(event==='framenavigated')navigate=fn;if(event==='requestfailed')requestFailed=fn;},
   goto:async(url:string)=>{documentUrl=url;},locator:()=>({first:()=>manager}),
   waitForResponse:(predicate:(r:Response)=>boolean)=>new Promise<Response>((resolve,reject)=>{if(closed)reject(new Error('closed'));else waiters.add({predicate,resolve,reject});})
  };
@@ -182,13 +226,15 @@ function cancellationPage(fault = '') {
   resources:()=>b,beforeDispatch:async(kind:string)=>{
    if(kind==='confirm'&&fault==='duplicate-during-persist')await new Promise<void>(resolve=>{releaseDispatch=resolve;void duplicateConfirm?.().catch(()=>{}).finally(resolve);});
    return true;
-  },acknowledge:async()=>true,acknowledgeCustomer:async()=>true,
+  },acknowledge:async(kind:string)=>{if(declineRetry&&kind==='confirm'){trace.push('decline proof');return fault!=='no-decline-proof';}return true;},acknowledgeCustomer:async()=>true,
+  beforeRetry:async()=>{trace.push('persist retry');if(fault==='retired-retry')manager.state.authorityRevision++;return true;},acknowledgeRetry:async()=>{trace.push('ack retry');return true;},
+  beforeSuccessorConfirm:async()=>{trace.push('persist successor');if(fault==='retired-successor')manager.state.authorityRevision++;return true;},acknowledgeSuccessor:async()=>{trace.push('recovered proof');return true;},
   withOtpCode:async(callback:(code:string)=>Promise<true>)=>callback('123456'),
   verifyInitial:async()=>{trace.push('verify initial');verified=true;return fault!=='initial-proof';},
   beforeCancellation:async(kind:string,key:string)=>{trace.push('persist '+kind+' '+key);return fault!=='persist';},
   verifyCancellation:async(kind:string,operation:string)=>{trace.push('verify '+kind+' '+operation);return fault!=='proof';}
- } as BillingCancellationPort;
- return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed};
+ } as BillingCancellationPort&BillingDeclineRetryPort;
+ return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,presentation,displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed};
 }
 test('same-page manager schedules and withdraws once after the initial paid proof',async()=>{
  const f=cancellationPage();
@@ -242,5 +288,50 @@ for(const fault of ['absent-token','missing-token-response','substituted-token',
 test('matching token verification can finish reading the response after backend interception',async()=>{
  const f=cancellationPage('pending-token-body');
  await runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+3000});
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+});
+
+test('the same manager explicitly retries a proven decline before paying with fresh details',async()=>{
+ const f=cancellationPage('',true);
+ await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000});
+ assert.deepEqual(f.trace.filter(x=>['Pay','decline proof','Retry payment','persist retry','ack retry','persist successor','recovered proof'].includes(x)),
+  ['Pay','decline proof','Retry payment','persist retry','ack retry','Pay','persist successor','recovered proof']);
+ assert.deepEqual(f.numbers,['4000000000000002','4242424242424242']);
+ assert.deepEqual(f.providerSent,['https://api.stripe.com/v1/confirmation_tokens','https://api.stripe.com/v1/confirmation_tokens']);
+ assert.equal(f.sent.filter(u=>u.endsWith('/confirm')).length,2);
+ assert.equal(f.sent.filter(u=>u.endsWith('/retry')).length,1);
+ assert.ok(f.closed());
+});
+for(const fault of ['unknown-first','early-retry','no-decline-proof','repeat-retry','wrong-retry-response','same-successor','different-pi','reused-token','retired-retry','retired-successor']){
+ test('decline retry refuses '+fault+' before a second confirm',async()=>{
+  const f=cancellationPage(fault,true);
+  await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+1500}),/^Error: billing_BROWSER$/);
+  assert.equal(f.sent.filter(u=>u.endsWith('/confirm')).length,1);
+  assert.equal(f.sent.filter(u=>u.endsWith('/retry')).length,['unknown-first','early-retry','no-decline-proof','retired-retry'].includes(fault)?0:1);
+  assert.ok(!f.trace.includes('recovered proof'));assert.ok(f.closed());
+ });
+}
+
+for(const mode of ['static-block','static-image','static-duplicate','static-foreign-event']){
+ test('decline retry applies the reviewed presentation policy: '+mode,async t=>{
+  const f=cancellationPage(mode,true);
+  const asset=t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
+   assert.equal(mode,'static-image');assert.equal(options.redirect,'error');assert.equal(options.credentials,'omit');
+   return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+  });
+  const accepted=mode==='static-block'||mode==='static-image';
+  const result=runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+(accepted?1500:300)},o=>o==='https://private.example');
+  if(accepted)assert.equal(await result,true);else await assert.rejects(result);
+  assert.equal(f.sent.filter(u=>u.endsWith('/confirm')).length,accepted?2:0);
+  assert.equal(asset.mock.callCount(),mode==='static-image'?1:0);
+  assert.ok(f.presentation.includes(mode==='static-image'?'fulfilled 200':'abort blockedbyclient'));
+ });
+}
+
+test('a token intercepted on the first Pay cannot use the successor gesture after its headers arrive',async()=>{
+ const f=cancellationPage('late-first-token',true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+1500}),/^Error: billing_BROWSER$/);
+ assert.equal(f.trace.filter(x=>x==='Pay').length,2);
+ assert.deepEqual(f.providerSent,['https://api.stripe.com/v1/confirmation_tokens']);
  assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
 });

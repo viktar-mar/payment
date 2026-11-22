@@ -73,6 +73,52 @@ class BillingAcceptanceSqlIntegrationTest extends PostgresIntegrationTest {
         }
     }
 
+    @Test void retryProofRequiresCausalDeclineNoCashAndOnePaidSuccessor() throws Exception {
+        var dir = Path.of("../infrastructure");
+        var query = Files.readString(dir.resolve("stripe-billing-initial-retry-proof.sql"));
+        try (var connection = source.getConnection(); var setup = connection.createStatement()) {
+            connection.setAutoCommit(false);
+            try {
+                setup.execute(Files.readString(dir.resolve("fixtures/stripe-billing-cancellation-proof-rows.sql")));
+                setup.execute(Files.readString(dir.resolve("fixtures/stripe-billing-initial-retry-proof-rows.sql")));
+                assertRetryRow(connection, query, true, true, true, true);
+                var paid = connection.setSavepoint();
+                setup.execute("update pg_temp.subscription_confirmation_attempts set predecessor=null where id=pg_temp.cid(51)");
+                assertRetryRow(connection, query, true, false, true, true);
+                connection.rollback(paid);
+                setup.execute("insert into pg_temp.payments(site_id,customer_id) values(pg_temp.cid(2),pg_temp.cid(80))");
+                assertRetryRow(connection, query, true, true, false, true);
+                connection.rollback(paid);
+                setup.execute("call pg_temp.only_original_decline()");
+                assertRetryRow(connection, query, false, true, true, false);
+                setup.execute("insert into pg_temp.payment_events(site_id) values(pg_temp.cid(2))");
+                assertRetryRow(connection, query, false, true, false, false);
+            } finally {
+                connection.rollback();
+            }
+        }
+    }
+
+    private static void assertRetryRow(Connection connection, String query, boolean recovered, boolean lineage,
+                                       boolean phaseProof, boolean journal) throws Exception {
+        try (var select = connection.prepareStatement(query.replaceAll("\\$[0-9]+", "?"))) {
+            bindInitial(select);
+            select.setString(12, "s5a-" + fixtureId(99).toString().replace("-", ""));
+            select.setObject(13, recovered ? fixtureId(51) : null);
+            select.setString(14, recovered ? "3".repeat(64) : null);
+            select.setString(15, recovered ? "4".repeat(64) : null);
+            select.setQueryTimeout(5);
+            try (var row = select.executeQuery()) {
+                assertThat(row.next()).isTrue();
+                assertThat(row.getBoolean("original")).isTrue();
+                assertThat(row.getBoolean("lineage")).isEqualTo(lineage);
+                assertThat(row.getBoolean("phase_proof")).isEqualTo(phaseProof);
+                assertThat(row.getBoolean("journal")).isEqualTo(journal);
+                assertThat(row.next()).isFalse();
+            }
+        }
+    }
+
     private static void assertCancellationRow(Connection c, String sql, boolean withdrawn, boolean original, boolean closed)
         throws Exception {
         var json = new ObjectMapper();

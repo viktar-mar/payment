@@ -1,3 +1,4 @@
+import {initialRetryFlow} from './stripe-billing-initial-retry-port.mjs';
 import {validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
 import {createOwnedBillingBootstrap} from './stripe-sandbox-bootstrap.mjs';
 import {createBillingCliAdapter} from './stripe-sandbox-cli.mjs';
@@ -8,23 +9,28 @@ import {billingUuid} from './stripe-billing-provision.mjs';
 
 /** Inert admission. Native capabilities are constructed only by the explicit, single-use run. */
 export async function createOwnedBillingAcceptance(options,dependencies={}) {
- return createOwner(options,dependencies,false);
+ return createOwner(options,dependencies,'initial_success');
 }
 export async function createOwnedBillingCancellation(options,dependencies={}) {
- return createOwner(options,dependencies,true);
+ return createOwner(options,dependencies,'initial_cancel_withdraw');
 }
-async function createOwner(options,dependencies,cancellation) {
+export async function createOwnedBillingDeclineRetry(options,dependencies={}) {
+ return createOwner(options,dependencies,'initial_decline_retry');
+}
+async function createOwner(options,dependencies,selectedCase) {
+ const cancellation=selectedCase==='initial_cancel_withdraw',retry=selectedCase==='initial_decline_retry';
  const configuration=validateBillingAcceptanceOptions(options);
- if(!configuration || configuration.selectedCase!==(cancellation?'initial_cancel_withdraw':'initial_success'))throw billingError('OPT_IN_REQUIRED');
+ if(!configuration || configuration.selectedCase!==selectedCase)throw billingError('OPT_IN_REQUIRED');
+ let retryBrowserUnconfirmed=false;
  let finishRun;const finished=new Promise(resolve=>finishRun=resolve);
  let state='NEW',phase='NEW',failure=null,bootstrap,cli,fixture,cleanupPromise,active,accepted=false,cleanupConfirmed=false;
  const lifetime=new AbortController(),counts={create:0,confirm:0},acks={create:false,confirm:false};
- const resources=()=>Object.freeze({runId:configuration.runId,expectedSource:configuration.expectedSource,scope:cancellation?'INITIAL_CANCEL_WITHDRAW':'INITIAL_NON_CLOCK',status:state,phase,code:failure,initialAccepted:accepted,...(cancellation?{cancellationAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
+ const resources=()=>Object.freeze({runId:configuration.runId,expectedSource:configuration.expectedSource,scope:retry?'INITIAL_DECLINE_RETRY':cancellation?'INITIAL_CANCEL_WITHDRAW':'INITIAL_NON_CLOCK',status:state,phase,code:failure,initialAccepted:accepted,...(cancellation?{cancellationAccepted:accepted}:{}),...(retry?{declineRetryAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
  const fail=code=>{failure??=code;lifetime.abort();throw billingError(failure);};
  async function cleanup() {
   if(cleanupPromise)return cleanupPromise;
   cleanupPromise=(async()=>{
-   let ok=true;const limits={deadline:Date.now()+120000};
+   let ok=!retryBrowserUnconfirmed;const limits={deadline:Date.now()+120000};
    for(const [object,method] of [[fixture,'close'],[cli,'stopListener'],[bootstrap,'stop']])if(object)try{if(await billingBounded(limits,l=>object[method](l),30000)!==true)ok=false;}catch{ok=false;}
    cleanupConfirmed=ok;if(!ok)failure??='CLEANUP';return ok;
   })();return cleanupPromise;
@@ -62,6 +68,7 @@ async function createOwner(options,dependencies,cancellation) {
      if(next!==expected||failure)fail('CANCELLATION_ORDER');
      next='busy';
     }
+    const retryFlow=retry?initialRetryFlow({configuration,bootstrap,cli,fixture,active,step,fail,prove:dependencies.proveInitialRetry}):null;
     const port=Object.freeze({resources:()=>fixture.resources(),
      beforeDispatch:async(kind,key,identity)=>{
       billingCheck(active);if(failure)fail(failure);
@@ -75,6 +82,7 @@ async function createOwner(options,dependencies,cancellation) {
      },
      withOtpCode:async(callback,l)=>{billingCheck(active);return fixture.withOtpCode(callback,{deadline:Math.min(active.deadline,l.deadline),signal:active.signal});},
      acknowledgeCustomer:async(value)=>{billingCheck(active);return fixture.acknowledgeCustomer(value,active);},
+     ...(retryFlow?.port),
      ...(cancellation?{
       async verifyInitial(){claim('baseline');baseline=await verifyInitial();next='schedule';return true;},
       async beforeCancellation(kind,key){
@@ -104,8 +112,15 @@ async function createOwner(options,dependencies,cancellation) {
       },
      }:{}),
     });
-    const browserResult=await step('BROWSER',()=>browserJourney(port,active),2700000);
-    if(cancellation){
+    const browserResult=await step('BROWSER',()=>{
+     if(retry)retryBrowserUnconfirmed=true;
+     return browserJourney(port,active);
+    },2700000);
+    if(retryFlow){
+     if(browserResult!==true)fail('BROWSER');
+     retryBrowserUnconfirmed=false;
+     retryFlow.requireComplete();
+    }else if(cancellation){
      if(next!=='complete')fail('CANCELLATION_ORDER');
      if(browserResult!==true)fail('BROWSER');
     }else await verifyInitial();

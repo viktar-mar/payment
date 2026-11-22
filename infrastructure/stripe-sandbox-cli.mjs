@@ -122,19 +122,21 @@ async function createCliAdapter(options,dependencies,purpose) {
   const remainderSignals=new Set();
   let billingGraph=null,billingFailed=false,billingBound=false,billingStarted=false,billingDeadline=null,billingSignal;
   const cancellationCase=purpose===BILLING&&options.selectedCase==='initial_cancel_withdraw';
+  const retryCase=purpose===BILLING&&options.selectedCase==='initial_decline_retry';
+  let retryNext='declined',retryWitness;
   let cancellationNext='initial',originalCancellationCash;
 
   function check(context) {
     if(context.signal.aborted||Date.now()>=(context.proofDeadline??context.deadline))fail();
     if(!context.cleanup){
       if(remainderMode&&[...remainderSignals].some(s=>s.aborted))fail();
-      if(billingMode&&billingSignal?.aborted||cancellationCase&&billingFailed)fail();
+      if(billingMode&&billingSignal?.aborted||(cancellationCase||retryCase)&&billingFailed)fail();
     }
   }
   async function operation(code,limits,body) {
     if(billingMode&&billingFailed&&code!=='STOP')throw fixed(code);
     if(busy){
-      if(cancellationCase&&code!=='STOP')billingFailed=true;
+      if((cancellationCase||retryCase)&&code!=='STOP')billingFailed=true;
       throw fixed('BUSY');
     }
     busy=true;let timer,external,onAbort;
@@ -599,17 +601,22 @@ async function createCliAdapter(options,dependencies,purpose) {
       billingListener({deadline,signal:signal??{aborted:false}});return true;
     }catch{billingFailed=true;throw fixed('BILLING_LISTENER');}
   }
-  function bindOwnedBillingGraph(value,context){
-    billingListener(context);if(billingGraph)fail();
+  function checkedBillingGraph(value,allowMissingPeriod=false){
     const keys=['runId','expectedSource','accountId','siteId','customerId','subscriptionId','operationId','priceId','priceVersion','customerReference','subscriptionReference','productReference','priceReference','invoiceReference','allocationReference','intentReference','periodStart','periodEnd'];
     const v=exactData(value,keys);
     if(v.runId!==runId||v.expectedSource!==options.expectedSource||!['accountId','siteId','customerId','subscriptionId','operationId','priceId'].every(k=>typeof v[k]==='string'&&UUID.test(v[k]))||v.priceVersion!==1)fail();
     for(const [name,prefix] of Object.entries({customer:'cus',subscription:'sub',product:'prod',price:'price',invoice:'in',allocation:'inpay',intent:'pi'}))if(typeof v[name+'Reference']!=='string'||!new RegExp('^'+prefix+'_[A-Za-z0-9_]{1,200}$').test(v[name+'Reference']))fail();
-    if(!Number.isSafeInteger(v.periodStart)||v.periodStart<=0||!Number.isSafeInteger(v.periodEnd)||v.periodEnd<=v.periodStart)fail();
-    billingGraph=Object.freeze(v);return true;
+    if(!(allowMissingPeriod&&v.periodStart===null&&v.periodEnd===null)
+        &&(!Number.isSafeInteger(v.periodStart)||v.periodStart<=0||!Number.isSafeInteger(v.periodEnd)||v.periodEnd<=v.periodStart))fail();
+    return Object.freeze(v);
   }
-  async function observeOwnedBillingGraph(context,phase='initial'){
-    billingListener(context);if(!billingGraph)fail();const t=billingGraph;
+  function bindOwnedBillingGraph(value,context){
+    billingListener(context);if(billingGraph)fail();
+    billingGraph=checkedBillingGraph(value);return true;
+  }
+  async function observeOwnedBillingGraph(context,phase='initial',retryReceipt){
+    billingListener(context);if(!billingGraph)fail();const t={...billingGraph};
+    const declined=phase==='declined';
     if(cancellationCase&&phase!==cancellationNext)fail();
     await binding(context);billingListener(context);
     const require=value=>{if(!value)fail();};
@@ -631,9 +638,15 @@ async function createCliAdapter(options,dependencies,purpose) {
     function subscriptionItem(subscription){
       exact(subscription,t.subscriptionReference,'subscription');
       metadata(subscription.metadata,{...local,subscription_id:t.subscriptionId,operation_id:t.operationId});
-      require(subscription.customer===t.customerReference&&subscription.status==='active'&&subscription.currency==='eur'&&subscription.latest_invoice===t.invoiceReference&&subscription.trial_start===null&&subscription.trial_end===null&&subscription.test_clock===null);
+      require(subscription.customer===t.customerReference&&subscription.status===(declined?'incomplete':'active')&&subscription.currency==='eur'&&subscription.latest_invoice===t.invoiceReference&&subscription.trial_start===null&&subscription.trial_end===null&&subscription.test_clock===null);
       require(subscription.items?.object==='list'&&subscription.items.has_more===false&&Array.isArray(subscription.items.data)&&subscription.items.data.length===1);
-      const item=subscription.items.data[0];require(/^si_[A-Za-z0-9_]{1,200}$/.test(item.id)&&item.object==='subscription_item'&&item.subscription===t.subscriptionReference&&item.quantity===1&&item.price?.id===t.priceReference&&item.current_period_start===t.periodStart&&item.current_period_end===t.periodEnd);
+      const item=subscription.items.data[0];
+      if(declined&&t.periodStart===null){
+        require(Number.isSafeInteger(item.current_period_start)&&item.current_period_start>0
+          &&Number.isSafeInteger(item.current_period_end)&&item.current_period_end>item.current_period_start);
+        t.periodStart=item.current_period_start;t.periodEnd=item.current_period_end;
+      }
+      require(/^si_[A-Za-z0-9_]{1,200}$/.test(item.id)&&item.object==='subscription_item'&&item.subscription===t.subscriptionReference&&item.quantity===1&&item.price?.id===t.priceReference&&item.current_period_start===t.periodStart&&item.current_period_end===t.periodEnd);
       return item;
     }
     function cancellationTerms(subscription,item){
@@ -651,27 +664,67 @@ async function createCliAdapter(options,dependencies,purpose) {
     const terms=cancellationCase?cancellationTerms(subscription,item):null;
     const price=await read('/v1/prices/'+t.priceReference);exact(price,t.priceReference,'price');metadata(price.metadata,{local_price_id:t.priceId,local_price_version:String(t.priceVersion)});
     require(price.product===t.productReference&&price.active===true&&price.unit_amount===2000&&price.currency==='eur'&&price.type==='recurring'&&price.tax_behavior==='inclusive'&&price.recurring?.interval==='month'&&price.recurring.interval_count===1&&price.recurring.usage_type==='licensed');
-    const invoice=await read('/v1/invoices/'+t.invoiceReference,cancellationCase?[['expand[]','amount_paid_off_stripe']]:[]);
+    const invoice=await read('/v1/invoices/'+t.invoiceReference,cancellationCase||retryCase?[['expand[]','amount_paid_off_stripe']]:[]);
     exact(invoice,t.invoiceReference,'invoice');
-    require(invoice.customer===t.customerReference&&invoice.parent?.type==='subscription_details'&&invoice.parent.subscription_details?.subscription===t.subscriptionReference&&invoice.billing_reason==='subscription_create'&&invoice.status==='paid'&&invoice.collection_method==='charge_automatically'&&invoice.currency==='eur');
-    require(['amount_due','amount_paid','total','subtotal'].every(k=>invoice[k]===2000)&&['amount_remaining','amount_paid_off_stripe','amount_overpaid','starting_balance','ending_balance','pre_payment_credit_notes_amount','post_payment_credit_notes_amount'].every(k=>invoice[k]===0)&&['discounts','total_discount_amounts','total_pretax_credit_amounts'].every(k=>empty(invoice[k])));
+    require(invoice.customer===t.customerReference&&invoice.parent?.type==='subscription_details'&&invoice.parent.subscription_details?.subscription===t.subscriptionReference&&invoice.billing_reason==='subscription_create'&&invoice.status===(declined?'open':'paid')&&invoice.collection_method==='charge_automatically'&&invoice.currency==='eur');
+    require(invoice.amount_paid===(declined?0:2000)&&invoice.amount_remaining===(declined?2000:0)
+      &&['amount_due','total','subtotal'].every(k=>invoice[k]===2000)&&['amount_paid_off_stripe','amount_overpaid','starting_balance','ending_balance','pre_payment_credit_notes_amount','post_payment_credit_notes_amount'].every(k=>invoice[k]===0)&&['discounts','total_discount_amounts','total_pretax_credit_amounts'].every(k=>empty(invoice[k])));
     const invoices=await pages('/v1/invoices',[['subscription',t.subscriptionReference]]);require(invoices.length===1&&invoices[0].id===t.invoiceReference);
     const lines=await pages('/v1/invoices/'+t.invoiceReference+'/lines');require(lines.length===1);const line=lines[0];exact(line,line.id,'line_item');require(/^il_/.test(line.id));
     const detail=line.parent?.subscription_item_details;
     require(line.invoice===t.invoiceReference&&line.subscription===t.subscriptionReference&&line.quantity===1&&line.currency==='eur'&&line.amount===2000&&line.parent?.type==='subscription_item_details'&&detail?.subscription===t.subscriptionReference&&detail.subscription_item===item.id&&detail.proration===false&&line.pricing?.type==='price_details'&&line.pricing.price_details?.price===t.priceReference&&line.pricing.price_details.product===t.productReference&&line.period?.start===t.periodStart&&line.period.end===t.periodEnd&&empty(line.discount_amounts)&&empty(line.pretax_credit_amounts));
-    function allocationProof(v){exact(v,t.allocationReference,'invoice_payment');require(v.invoice===t.invoiceReference&&v.currency==='eur'&&v.is_default===true&&v.status==='paid'&&v.amount_paid===2000&&v.amount_requested===2000&&v.payment?.type==='payment_intent'&&v.payment.payment_intent===t.intentReference&&Number.isSafeInteger(v.status_transitions?.paid_at)&&v.status_transitions.paid_at>0);}
+    function allocationProof(v){
+      exact(v,t.allocationReference,'invoice_payment');
+      require(v.invoice===t.invoiceReference&&v.currency==='eur'&&v.is_default===true&&v.amount_requested===2000
+        &&v.payment?.type==='payment_intent'&&v.payment.payment_intent===t.intentReference);
+      const transitions=v.status_transitions;
+      if(declined){
+        require(v.status==='open'&&v.amount_paid===0
+          &&(transitions==null||object(transitions)&&transitions.paid_at==null&&transitions.canceled_at==null));
+      }else require(v.status==='paid'&&v.amount_paid===2000&&Number.isSafeInteger(transitions?.paid_at)&&transitions.paid_at>0);
+    }
     const allocations=await pages('/v1/invoice_payments',[['invoice',t.invoiceReference]]);require(allocations.length===1);allocationProof(allocations[0]);
     const intent=await read('/v1/payment_intents/'+t.intentReference);exact(intent,t.intentReference,'payment_intent');
-    require(intent.customer===t.customerReference&&intent.status==='succeeded'&&intent.amount===2000&&intent.amount_received===2000&&intent.currency==='eur'&&intent.capture_method==='automatic'&&Array.isArray(intent.payment_method_types)&&intent.payment_method_types.length===1&&intent.payment_method_types[0]==='card'&&typeof intent.latest_charge==='string'&&/^ch_[A-Za-z0-9_]{1,200}$/.test(intent.latest_charge));
+    require(intent.customer===t.customerReference&&intent.status===(declined?'requires_payment_method':'succeeded')&&intent.amount===2000&&intent.amount_received===(declined?0:2000)&&intent.currency==='eur'&&intent.capture_method==='automatic'&&Array.isArray(intent.payment_method_types)&&intent.payment_method_types.length===1&&intent.payment_method_types[0]==='card'&&typeof intent.latest_charge==='string'&&/^ch_[A-Za-z0-9_]{1,200}$/.test(intent.latest_charge));
     const chargeReference=intent.latest_charge;
     const charge=await read('/v1/charges/'+chargeReference);exact(charge,chargeReference,'charge');
-    require(charge.customer===t.customerReference&&charge.payment_intent===t.intentReference&&charge.status==='succeeded'&&charge.paid===true&&charge.captured===true&&charge.amount===2000&&charge.amount_captured===2000&&charge.currency==='eur'&&charge.payment_method_details?.type==='card'&&charge.amount_refunded===0&&charge.refunded===false);
+    function verifyFailedCharge(c){
+      exact(c,retryReceipt.chargeReference,'charge');
+      require(c.customer===t.customerReference&&c.payment_intent===t.intentReference&&c.amount===2000&&c.currency==='eur'
+        &&c.status==='failed'&&c.paid===false&&c.captured===false&&c.amount_captured===0&&c.amount_refunded===0&&c.refunded===false
+        &&c.payment_method_details?.type==='card'&&c.failure_code==='card_declined'
+        &&c.outcome?.type==='issuer_declined'&&c.outcome.reason===retryReceipt.declineCode);
+    }
+    if(declined){
+      require(chargeReference===retryReceipt.chargeReference&&intent.last_payment_error?.charge===chargeReference
+        &&intent.last_payment_error.type==='card_error'&&intent.last_payment_error.code==='card_declined'
+        &&intent.last_payment_error.decline_code===retryReceipt.declineCode);
+      verifyFailedCharge(charge);
+    }else require(charge.customer===t.customerReference&&charge.payment_intent===t.intentReference&&charge.status==='succeeded'&&charge.paid===true&&charge.captured===true&&charge.amount===2000&&charge.amount_captured===2000&&charge.currency==='eur'&&charge.payment_method_details?.type==='card'&&charge.amount_refunded===0&&charge.refunded===false);
     const noRefunds=value=>value?.object==='list'&&empty(value.data)&&value.has_more===false;
     if(Object.hasOwn(charge,'refunds'))require(noRefunds(charge.refunds));
     require(noRefunds(await read('/v1/refunds',[['charge',chargeReference],['limit',100]])));
-    const reverse=await pages('/v1/invoice_payments',[['payment[type]','payment_intent'],['payment[payment_intent]',t.intentReference]]);require(reverse.length===1);allocationProof(reverse[0]);require(reverse[0].status_transitions.paid_at===allocations[0].status_transitions.paid_at);
+    const reverse=await pages('/v1/invoice_payments',[['payment[type]','payment_intent'],['payment[payment_intent]',t.intentReference]]);require(reverse.length===1);allocationProof(reverse[0]);if(!declined)require(reverse[0].status_transitions.paid_at===allocations[0].status_transitions.paid_at);
     const latest=await read('/v1/payment_intents/'+t.intentReference);exact(latest,t.intentReference,'payment_intent');
-    require(latest.latest_charge===chargeReference&&latest.customer===t.customerReference&&latest.status==='succeeded'&&latest.amount_received===2000&&latest.currency==='eur');
+    require(latest.latest_charge===chargeReference&&latest.customer===t.customerReference&&latest.status===intent.status&&latest.amount_received===intent.amount_received&&latest.currency==='eur');
+    if(retryCase){
+      const invoices=await pages('/v1/invoices',[['customer',t.customerReference]]);
+      require(invoices.length===1);exact(invoices[0],t.invoiceReference,'invoice');
+      require(invoices[0].customer===t.customerReference);
+      const charges=await pages('/v1/charges',[['customer',t.customerReference]]);
+      require(charges.length===(declined?1:2));
+      verifyFailedCharge(charges.find(c=>c.id===retryReceipt.chargeReference));
+      if(!declined){
+        require(chargeReference!==retryReceipt.chargeReference&&charges.some(c=>c.id===chargeReference
+          &&c.customer===t.customerReference&&c.payment_intent===t.intentReference));
+        verifyFailedCharge(await read('/v1/charges/'+retryReceipt.chargeReference));
+        require(noRefunds(await read('/v1/refunds',[['charge',retryReceipt.chargeReference],['limit',100]])));
+        require(retryWitness.lineId===line.id&&retryWitness.itemId===item.id
+          &&retryWitness.periodStart===t.periodStart&&retryWitness.periodEnd===t.periodEnd);
+      }else retryWitness=Object.freeze({...retryReceipt,lineId:line.id,itemId:item.id,periodStart:t.periodStart,periodEnd:t.periodEnd});
+      billingListener(context);retryNext=declined?'recovered':null;
+      return true;
+    }
     if(cancellationCase){
       const invoices=await pages('/v1/invoices',[['customer',t.customerReference]]);
       require(invoices.length===1);exact(invoices[0],t.invoiceReference,'invoice');require(invoices[0].customer===t.customerReference);
@@ -722,8 +775,23 @@ async function createCliAdapter(options,dependencies,purpose) {
     stopListener:limits=>operation('STOP',limits,async context=>{if(billingMode)billingFailed=true;return stopListener(context);}),
     ...(billingMode?{
       assertBillingListener,
-      ...(!firstPayment?{bindOwnedBillingGraph:(value,limits)=>operation('BILLING_BINDING',limits,context=>bindOwnedBillingGraph(value,context)),
+      ...(!firstPayment&&!retryCase?{bindOwnedBillingGraph:(value,limits)=>operation('BILLING_BINDING',limits,context=>bindOwnedBillingGraph(value,context)),
       observeOwnedBillingGraph:limits=>operation('BILLING_GRAPH',limits,observeOwnedBillingGraph)}:{}),
+      ...(retryCase?{observeOwnedBillingInitialRetry:(phase,value,receipt,limits)=>operation('BILLING_INITIAL_RETRY',limits,async context=>{
+        billingListener(context);
+        if(retryNext!==phase||!['declined','recovered'].includes(phase))fail();
+        const graph=checkedBillingGraph(value,phase==='declined');
+        const cause=exactData(receipt,['chargeReference','declineCode']);
+        if(typeof cause.chargeReference!=='string'||!/^ch_[A-Za-z0-9_]{1,200}$/.test(cause.chargeReference)
+          ||!['generic_decline','do_not_honor','insufficient_funds'].includes(cause.declineCode))fail();
+        if(phase==='recovered'){
+          if(!retryWitness||cause.chargeReference!==retryWitness.chargeReference||cause.declineCode!==retryWitness.declineCode
+            ||Object.keys(graph).some(k=>k!=='periodStart'&&k!=='periodEnd'&&graph[k]!==billingGraph[k])
+            ||graph.periodStart!==retryWitness.periodStart||graph.periodEnd!==retryWitness.periodEnd)fail();
+        }
+        billingGraph=graph;
+        return observeOwnedBillingGraph(context,phase,cause);
+      })}:{}),
       ...(cancellationCase?{observeOwnedBillingCancellation:(phase,limits)=>operation('BILLING_CANCELLATION',limits,async context=>{
         if(phase!=='scheduled'&&phase!=='withdrawn')fail();
         await observeOwnedBillingGraph(context,phase);
