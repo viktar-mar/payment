@@ -1957,6 +1957,42 @@ function failedRenewalPersistenceFixture(){
  const f=firstPaymentFixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FAILED_RENEWAL:'true'};f.options.selectedCase='initial_failed_renewal_grace_recovery';
  const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);return {...r,stdout:r.stdout.replaceAll('FIRST_PAYMENT','FAILED_RENEWAL').replaceAll('OwnedBillingFirstPaymentRuntime','OwnedBillingFailedRenewalRuntime').replaceAll('/app/initial-runtime','/app/failed-renewal-runtime').replaceAll('Dockerfile.billing-first-payment','Dockerfile.billing-failed-renewal')};};return f;
 }
+for (const valid of [true,false]) test('failed-renewal bootstrap rechecks '+(valid?'valid':'malformed')+' source keys before the socket', async () => {
+  const f = failedRenewalPersistenceFixture();
+  delete f.dependencies.preflight;
+  if (!valid) f.files.get(USERFILE).contents = Buffer.from('PRIVATE_CANARY');
+  const bootstrap = await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options, f.dependencies);
+  // The fixture has no socket. A valid input must reach this next gate.
+  await rejects(bootstrap.prepare(LIMIT()), 'PREPARE_PENDING');
+  assert.equal(f.events.some(e => e.type === 'close' && e.path === USERFILE), true);
+  assert.equal(f.events.some(e => e.type === 'lstat' && e.path === '/Users/test/docker.sock'), valid);
+  assert.equal(f.events.some(e => e.type === 'process' && e.file !== '/usr/bin/git'), false);
+  assert.equal(f.files.has(DIR), false);
+});
+test('cancelled bootstrap admission never opens the input after a delayed file stat', async () => {
+  const f = failedRenewalPersistenceFixture(), stat = f.dependencies.lstat;
+  delete f.dependencies.preflight;
+  // Exercise the bootstrap's injected clock, independently of the process clock.
+  f.dependencies.now = () => 1000;
+  let entered, resume;
+  const inspecting = new Promise(resolve => { entered = resolve; });
+  const released = new Promise(resolve => { resume = resolve; });
+  f.dependencies.lstat = async path => {
+    if (path === USERFILE) { entered(); await released; }
+    return stat(path);
+  };
+  const controller = new AbortController();
+  const bootstrap = await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options, f.dependencies);
+  const refusal = rejects(bootstrap.prepare({deadline:121000,signal:controller.signal}), 'PREPARE_PENDING');
+  await inspecting;
+  controller.abort();
+  resume();
+  await refusal;
+  await turn();
+  assert.equal(f.events.some(e => e.type === 'open' && e.path === USERFILE), false);
+  assert.equal(f.events.some(e => e.type === 'process' && e.file !== '/usr/bin/git'), false);
+  assert.equal(f.files.has(DIR), false);
+});
 async function failedRenewalPersistencePrepared(configure=()=>{}){
  const f=failedRenewalPersistenceFixture();configure(f);f.adapter=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);f.limits=LIMIT();await f.adapter.prepare(f.limits);return f;
 }

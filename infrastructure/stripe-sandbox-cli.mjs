@@ -300,13 +300,19 @@ async function createCliAdapter(options,dependencies,purpose) {
     }
   }
   async function stopListener(context) {
-    if(uncertain)fail();
-    if(owner===null)return true;
-    if(owner.explicitStop&&(billingMode?owner.closed:owner.exited))return true;
-    check(context);
     const record=owner;
+    // A failed-renewal webhook write can stay unresolved after its child closes.
+    // After teardown, wait only for that child's close within this cleanup deadline.
+    if(uncertain){
+      if(!failedRenewal||!record||record.child.pid!==record.pid)fail();
+      await controlled(record.termination,context);
+    }
+    if(record===null)return true;
+    if(!failedRenewal&&record.explicitStop&&(billingMode?record.closed:record.exited))return true;
+    check(context);
     record.stopping=true;
     if(!await terminate(record,Math.min(10000,Math.max(2,context.deadline-Date.now()))))fail();
+    if(failedRenewal&&(record!==owner||record.child.pid!==record.pid||!record.closed))fail();
     check(context);record.explicitStop=true;
     return true;
   }

@@ -16,6 +16,9 @@ test('remainder exclusion precedes snapshots configuration and dependencies',asy
   assert.equal(reads,0);
 });
 import {EventEmitter} from 'node:events';
+import {chmod, link, lstat, mkdtemp, open, rm, symlink, writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {preflightOwnedSandbox,preflightOwnedFormDiagnostic} from './stripe-sandbox-owned.mjs';
 import * as owned from './stripe-sandbox-owned.mjs';
@@ -55,6 +58,91 @@ function fixture({head=source+'\n',status='',docker='"linux"\n',metadata={},cano
 function pending(phase,code) {return {status:'PENDING',phase,code};}
 function safe(result,want) {assert.deepEqual(result,want);assert.equal(Object.isFrozen(result),true);assert.equal(JSON.stringify(result).includes('PRIVATE_CANARY'),false);}
 
+// Only the exact source input maps to a temporary file. All daemon probes use the inert fixture.
+const keyFile = root+'/infrastructure/stripe-sandbox.env.local';
+const keyBytes = 'PAYMENT_STRIPE_SANDBOX_SECRET_KEY=sk_test_A0\r\n'
+  + 'PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY="pk_test_B0"\r\n'
+  + 'PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET=\r\n';
+async function failedRenewalFixture(t) {
+  const options = failedRenewalOptions();
+  const f = fixture({head:options.expectedSource, canonical:'/Users/test/docker.sock'});
+  const directory = await mkdtemp(join(tmpdir(), 'failed-renewal-env-'));
+  t.after(() => rm(directory, {recursive:true, force:true}));
+  const file = join(directory, 'stripe-sandbox.env.local');
+  const filesystem = f.dependencies;
+  const originalStat = filesystem.lstat, originalCanonical = filesystem.realpath;
+  filesystem.lstat = async path => path === keyFile ? lstat(file)
+    : path === root+'/infrastructure' ? lstat(directory) : originalStat(path);
+  filesystem.realpath = async path => [keyFile,root+'/infrastructure'].includes(path) ? path : originalCanonical(path);
+  filesystem.open = (path, flags) => {
+    assert.equal(path, keyFile);
+    return open(file, flags);
+  };
+  return {...f, options, file};
+}
+
+for (const mode of ['launcher','bounded worker']) {
+  for (const state of ['missing','public','link','symlink','live key','extra assignment','bad verifier','valid','prior verifier']) {
+    test('failed-renewal '+mode+' checks '+state+' source configuration before Docker', async t => {
+      const f = await failedRenewalFixture(t);
+      const contents = state === 'live key' ? keyBytes.replace('sk_test_', 'sk_live_')
+        : state === 'extra assignment' ? keyBytes+'OTHER=PRIVATE_CANARY\n'
+        : state === 'bad verifier' ? keyBytes.replace('WEBHOOK_SECRET=', 'WEBHOOK_SECRET=PRIVATE_CANARY')
+        : state === 'prior verifier' ? keyBytes.replace('WEBHOOK_SECRET=', 'WEBHOOK_SECRET=whsec_A0011223344556677')
+        : keyBytes;
+      if (state === 'symlink') {
+        await writeFile(f.file+'.target', contents, {mode:0o600});
+        await symlink(f.file+'.target', f.file);
+      } else if (state !== 'missing') await writeFile(f.file, contents, {mode:0o600});
+      if (state === 'public') await chmod(f.file, 0o644);
+      if (state === 'link') await link(f.file, f.file+'.other');
+      const allowed = state === 'valid' || state === 'prior verifier';
+      const limits = mode === 'bounded worker' ? {deadline:Date.now()+5000} : undefined;
+      const result = await owned.preflightOwnedBillingFailedRenewal(f.options, f.dependencies, limits);
+      safe(result, allowed ? {status:'READY'} : pending('INPUTS','SANDBOX_ENV_UNCONFIRMED'));
+      const afterSource = f.calls.filter(call => call.type !== 'execute' || call.file !== '/usr/bin/git');
+      if (!allowed) assert.deepEqual(afterSource, []);
+      else assert.equal(afterSource.filter(call => call.type === 'port').length, 7);
+    });
+  }
+}
+
+test('failed-renewal source mismatch stops before private file inspection', async () => {
+  const f = fixture({head:'other source'});
+  safe(await owned.preflightOwnedBillingFailedRenewal(failedRenewalOptions(), f.dependencies),
+    pending('SOURCE','SOURCE_MISMATCH'));
+  assert.deepEqual(f.calls.map(call => [call.type,call.file]), [['execute','/usr/bin/git']]);
+});
+
+test('cancelled failed-renewal admission closes a late file handle before reading it', async t => {
+  const f = await failedRenewalFixture(t);
+  await writeFile(f.file, keyBytes, {mode:0o600});
+  let entered, resume, closed;
+  const opening = new Promise(resolve => { entered = resolve; });
+  const released = new Promise(resolve => { resume = resolve; });
+  const cleanup = new Promise(resolve => { closed = resolve; });
+  let reads = 0;
+  f.dependencies.open = async (path, flags) => {
+    assert.equal(path, keyFile);
+    const held = await open(f.file, flags);
+    entered();
+    await released;
+    return {
+      stat:() => held.stat(), read:(...args) => { reads++; return held.read(...args); },
+      close:async () => { await held.close(); closed(); },
+    };
+  };
+  const controller = new AbortController();
+  const run = owned.preflightOwnedBillingFailedRenewal(f.options, f.dependencies, {deadline:Date.now()+5000, signal:controller.signal});
+  await opening;
+  controller.abort();
+  resume();
+  await cleanup;
+  safe(await run, pending('INPUTS','SANDBOX_ENV_UNCONFIRMED'));
+  assert.equal(reads, 0);
+  assert.deepEqual(f.calls.map(call => call.file), ['/usr/bin/git','/usr/bin/git']);
+});
+
 // The native launcher stops on this result before opening ports or creating a run.
 for (const [name, code] of [
   ['socket lookup', 'DAEMON_SOCKET_UNCONFIRMED'],
@@ -73,9 +161,10 @@ for (const [name, code] of [
   ['OS accessor', 'DAEMON_OS_UNCONFIRMED'],
   ['OS proxy', 'DAEMON_OS_UNCONFIRMED'],
   ['valid Linux reply', null],
-]) test('failed-renewal daemon admission: '+name, async () => {
-  const input = failedRenewalOptions();
-  const f = fixture({head:input.expectedSource, canonical:'/Users/test/docker.sock'});
+]) test('failed-renewal daemon admission: '+name, async t => {
+  const f = await failedRenewalFixture(t);
+  const input = f.options;
+  await writeFile(f.file, keyBytes, {mode:0o600});
   const {execute, lstat} = f.dependencies;
   let dockerCalls = 0, privateReads = 0;
   const privateValue = () => { privateReads++; throw Error('PRIVATE_CANARY'); };

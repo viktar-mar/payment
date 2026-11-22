@@ -1,7 +1,8 @@
 import {billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
 import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
 import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
-import {billingBounded} from './stripe-billing-limits.mjs';
+import {validateFailedRenewalUserEnv} from './stripe-sandbox-user-env.mjs';
+import {billingBounded,billingCheck} from './stripe-billing-limits.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
 import {billingAcceptanceExcluded,billingAcceptanceOptIn,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
 import {execFile} from 'node:child_process';
@@ -83,8 +84,10 @@ export async function preflightOwnedBilling(options,dependencies={},limits){retu
 async function preflightBilling(options,dependencies,limits,mode) {
   const selected=(mode==='failed-renewal'?validateBillingFailedRenewalOptions:mode==='first-renewal'?validateBillingFirstRenewalOptions:mode==='first-payment'?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(options);
   if(!selected)return pending('OPT_IN','OPT_IN_REQUIRED');
+  const raw=dependencies;
+  const checkUserEnv=()=>limits===undefined ? validateFailedRenewalUserEnv(raw)
+    : billingBounded(limits,l=>validateFailedRenewalUserEnv(raw,()=>billingCheck(l)));
   if(limits!==undefined){
-    const raw=dependencies;
     // Runtime-only authority is explicit; each boundary rechecks it before dispatch and after completion.
     dependencies={
       execute:(file,args,settings)=>billingBounded(limits,l=>(raw.execute??executeFile)(file,args,{...settings,signal:l.signal,timeout:Math.min(settings.timeout,l.deadline-Date.now())}),10000),
@@ -93,7 +96,7 @@ async function preflightBilling(options,dependencies,limits,mode) {
       portAvailable:(port,host)=>billingBounded(limits,()=>raw.portAvailable?raw.portAvailable(port,host):portAvailable(port,host,raw),4000),
     };
   }
-  return preflight(selected,dependencies,mode);
+  return preflight(selected,dependencies,mode,checkUserEnv);
 }
 
 // This gate runs before consulting dependencies or any private configuration.
@@ -130,7 +133,7 @@ export async function preflightOwnedManualPayment(options,dependencies={}) {
   const selected=validateManualPaymentOptions(options);if(!selected)return pending('INPUTS','CONFIGURATION');
   return preflight(selected,dependencies,'payment');
 }
-async function preflight(options,dependencies,diagnostic) {
+async function preflight(options,dependencies,diagnostic,checkUserEnv) {
   let phase='OPT_IN',code='OPT_IN_REQUIRED';
   try {
     const env=Object.getOwnPropertyDescriptor(options??{},'env')?.value;
@@ -151,6 +154,11 @@ async function preflight(options,dependencies,diagnostic) {
     if(head.stdout!==expectedSource+'\n'&&head.stdout!==expectedSource)return pending(phase,code);
     const status=await execute('/usr/bin/git',['-c','core.fsmonitor=false','status','--porcelain=v1','--untracked-files=no'],processOptions);
     if(status.stdout!=='')return pending(phase,code);
+
+    if(diagnostic==='failed-renewal') {
+      phase='INPUTS';code='SANDBOX_ENV_UNCONFIRMED';
+      await checkUserEnv();
+    }
 
     const reportDaemonStep = diagnostic === 'failed-renewal';
     phase='DAEMON';code=reportDaemonStep?'DAEMON_SOCKET_UNCONFIRMED':'DAEMON_UNCONFIRMED';

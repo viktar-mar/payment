@@ -72,7 +72,7 @@ async function createOwner(options,dependencies,purpose){
  }
  const c=mode.validate(options);if(!c)throw billingError('OPT_IN_REQUIRED');
  let state='NEW',phase='NEW',failure=null,diagnostic=null,accepted=false,cleanupConfirmed=false,cleanupFailure=null,bootstrap,cli,fixture,runtime,cleanupPromise,active,finish;
- let journeyStarted=false,journeySettled=false,journeyClean=false,startSettlement,provisionLimits,postArmCheckpoint,failedRequestLimits;
+ let journeyStarted=false,journeySettled=false,journeyClean=false,startSettlement,listenerSettlement,provisionLimits,postArmCheckpoint,failedRequestLimits;
  const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
  const revoke=()=>{
   if(runtime&&!terminalClose){
@@ -140,7 +140,14 @@ async function createOwner(options,dependencies,purpose){
     // START may retain its first checkpoint while the canceled operation settles.
     if(missingStartupDiagnostic)diagnostic=startupDiagnostic(bootstrap);
    }
-   try{if(await billingBounded(l,x=>o[m](x),o===bootstrap?120000:30000)!==true)missing(code);}catch{missing(code);}
+   try{
+    const stopped=await billingBounded(l,async x=>{
+     // Startup owns the child until its error handler finishes terminating it.
+     if(o===cli&&listenerSettlement){await listenerSettlement;billingCheck(x);}
+     return o[m](x);
+    },o===bootstrap?120000:30000);
+    if(stopped!==true)missing(code);
+   }catch{missing(code);}
   }
   if(missingStartupDiagnostic&&diagnostic===null)diagnostic='START_UNKNOWN';
   cleanupConfirmed=ok;if(!ok&&failure===null){
@@ -163,7 +170,13 @@ async function createOwner(options,dependencies,purpose){
     await requireTrue('PREPARE',()=>bootstrap.prepare(active),2700000);
     cli=await step('CLI',async()=>(dependencies.createCli??(await import('./stripe-sandbox-cli.mjs'))[mode.cli])({configuration:c,cliDirectory:bootstrap.resources().cliDirectory,verifyForwardTarget:bootstrap.verifyForwardTarget,persistWebhookSecret:bootstrap.persistWebhookSecret}));
     await requireTrue('LOGIN',async()=>(dependencies.login??(await import('./stripe-billing-login.mjs')).completeBillingLogin)(cli,c,active),780000);
-    await requireTrue('BINDING',()=>cli.validateBinding(active));await requireTrue('LISTENER',()=>cli.startListener(active));await requireTrue('START',()=>{
+    await requireTrue('BINDING',()=>cli.validateBinding(active));
+    await requireTrue('LISTENER',()=>{
+     const starting=cli.startListener(active);
+     if(failedRenewal)listenerSettlement=Promise.resolve(starting).then(()=>undefined,()=>undefined);
+     return starting;
+    });
+    await requireTrue('START',()=>{
      const started=Promise.resolve().then(()=>bootstrap.start(active));
      startSettlement=started.then(()=>undefined,()=>undefined);return started;
     },2700000);

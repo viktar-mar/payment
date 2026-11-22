@@ -495,7 +495,7 @@ function billingObjects(){
 async function billingSetup(mutate=()=>{}){
   const module=await import('./stripe-sandbox-cli.mjs');assert.equal(typeof module.createBillingCliAdapter,'function');
   const f=fixture(),base=f.dependencies.execute;f.objects=billingObjects();f.objects['/v1/invoices']={object:'list',data:[f.objects['/v1/invoices/in_original']],has_more:false};mutate(f.objects);
-  const spawn=f.dependencies.spawn;f.dependencies.spawn=(...args)=>{const child=spawn(...args);child.on('exit',()=>queueMicrotask(()=>child.emit('close',0)));return child;};
+  const spawn=f.dependencies.spawn;f.dependencies.spawn=(...args)=>{const child=spawn(...args);child.on('exit',()=>{if(child.autoClose!==false)queueMicrotask(()=>child.emit('close',0));});return child;};
   f.dependencies.execute=async(file,args,settings)=>{const path=args.find(a=>a.startsWith('/v1/'));if(path&&path!=='/v1/balance'){f.calls.push({file,args,settings});return {stdout:JSON.stringify(f.objects[path]),stderr:''};}return base(file,args,settings);};
   f.options={configuration:{env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'},runId:RUN,expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports:{backend:18080,demo:18081,receiver:18082,postgres:15432,mailpitHttp:18025,mailpitSmtp:11025},approvedBinding:{externalAccountId:ACCOUNT,apiVersion:VERSION},selectedCase:'initial_success'},cliDirectory:DIR,verifyForwardTarget:async()=>true,persistWebhookSecret:async()=>true};
   f.adapter=await module.createBillingCliAdapter(f.options,f.dependencies);assert.equal(f.calls.length,0);f.limits=LIMIT();return f;
@@ -755,4 +755,96 @@ test('first-renewal CLI exposes binding and listener only and rejects mixed mode
  assert.equal(f.calls.some(c=>c.args.includes('post')||c.args.some(a=>a.startsWith('/v1/')&&!['/v1/balance','/v1/account'].includes(a))),false);
  let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}});await assert.rejects(module.createBillingFirstPaymentCliAdapter(f.options,trap),/OPT_IN_REQUIRED/);
  f.options.configuration.env.PAYMENT_STRIPE_BILLING_FIRST_PAYMENT='true';await assert.rejects(module.createBillingFirstRenewalCliAdapter(f.options,trap),/OPT_IN_REQUIRED/);assert.equal(reads,0);
+});
+
+async function failedRenewalCli(persistWebhookSecret=async()=>true,configureChild=()=>{}) {
+  const f=await billingSetup();
+  Object.assign(f.options.configuration,{
+    env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FAILED_RENEWAL:'true'},
+    selectedCase:'initial_failed_renewal_grace_recovery',controlPort:18083,frozenTime:1790000000,
+  });
+  const spawn=f.dependencies.spawn;
+  f.dependencies.spawn=(...args)=>{const child=spawn(...args);configureChild(child);return child;};
+  f.options.persistWebhookSecret=persistWebhookSecret;
+  const {createBillingFailedRenewalCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingFailedRenewalCliAdapter(f.options,f.dependencies);
+  await f.adapter.validateBinding(f.limits);
+  return f;
+}
+
+for(const outcome of ['rejected','aborted'])test('failed-renewal listener close proves cleanup after '+outcome+' persistence',async()=>{
+  let writes=0,finishWrite;
+  const f=await failedRenewalCli(async()=>{
+    writes++;
+    if(outcome==='rejected')throw Error('synthetic persistence refusal');
+    return new Promise(resolve=>{finishWrite=resolve;});
+  });
+  const abort=new AbortController();
+  const starting=rejects(f.adapter.startListener({...f.limits,signal:abort.signal}),'LISTENER');
+  await turn();
+  const child=f.children[0];
+  child.stderr.write(READY);
+  await turn();
+  assert.equal(writes,1);
+  if(outcome==='aborted')abort.abort();
+  await starting;
+  const count=f.calls.length;
+  assert.deepEqual(child.signals,['SIGINT']);
+  assert.equal(await f.adapter.stopListener(f.limits),true);
+  finishWrite?.(true);
+  await turn();
+  assert.throws(()=>f.adapter.assertBillingListener(f.limits),/BILLING_LISTENER/);
+  await rejects(f.adapter.validateBinding(f.limits),'BINDING');
+  await rejects(f.adapter.startListener(f.limits),'LISTENER');
+  assert.equal(f.calls.length,count);
+  assert.equal(writes,1);
+  assert.deepEqual(child.signals,['SIGINT']);
+});
+
+for(const evidence of ['owned close','PID drift','deadline'])test('failed-renewal cleanup waits passively after startup teardown: '+evidence,async()=>{
+  const f=await failedRenewalCli(async()=>false,child=>{child.autoClose=false;});
+  const starting=rejects(f.adapter.startListener(f.limits),'LISTENER');
+  await turn();
+  const child=f.children[0];
+  child.stderr.write(READY);
+  await turn();
+  assert.deepEqual(child.signals,['SIGINT']);
+  f.fire(5000);await turn();
+  f.fire(5000);await starting;
+  let settled=false;
+  const stopping=f.adapter.stopListener(f.limits).then(value=>value,error=>error.message).finally(()=>{settled=true;});
+  await turn();
+  assert.equal(settled,false);
+  if(evidence==='deadline'){
+    const timers=[...f.timers.values()];
+    assert.equal(timers.length,1);
+    timers[0].callback();
+  }else{
+    if(evidence==='PID drift')child.pid++;
+    child.emit('close',0);
+  }
+  assert.equal(await stopping,evidence==='owned close'?true:'stripe_sandbox_cli_STOP');
+  assert.deepEqual(child.signals,['SIGINT','SIGTERM']);
+});
+
+test('failed-renewal listener stop rejects a PID change before owned close',async()=>{
+  const f=await failedRenewalCli(async()=>true,child=>{child.autoClose=false;});
+  await start(f);
+  const child=f.children[0];
+  const closing=rejects(f.adapter.stopListener(f.limits),'STOP');
+  await turn();
+  assert.deepEqual(child.signals,['SIGINT']);
+  child.pid++;
+  child.emit('close',0);
+  await closing;
+  await rejects(f.adapter.stopListener(f.limits),'STOP');
+  assert.deepEqual(child.signals,['SIGINT']);
+});
+
+test('failed-renewal stop cannot confirm a spawned listener without an owned PID',async()=>{
+  const f=await failedRenewalCli(async()=>true,child=>{child.pid=undefined;});
+  await rejects(f.adapter.startListener(f.limits),'LISTENER');
+  f.children[0].emit('close',1);
+  await rejects(f.adapter.stopListener(f.limits),'STOP');
+  assert.deepEqual(f.children[0].signals,[]);
 });

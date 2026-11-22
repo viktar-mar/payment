@@ -198,6 +198,25 @@ test('browser terminal formatter and parser enforce stage-specific finite own da
  for(const line of [browserLine().replace('BROWSER_CARD_NUMBER','PERSIST_ACK'),terminalLine().replace('PERSIST_FINAL_STORE','BROWSER_CARD_NUMBER'),browserLine()+'\n',browserLine().replace('witness=NONE','witness=BROWSER_CLOSE')])assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),null);
  let reads=0;const hostile={...valid};Object.defineProperty(hostile,'diagnostic',{get(){reads++;return 'BROWSER_CARD_NUMBER';}});assert.equal(owners.formatBillingFailedRenewalDiagnostic(hostile),null);assert.equal(reads,0);assert.equal(owners.formatBillingFailedRenewalDiagnostic(Object.create(valid)),null);
 });
+for(const settled of [true,false])test('listener cancellation waits within the stop budget for startup to settle: '+settled,async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const h=harness(),controller=new AbortController();
+ const entered=Promise.withResolvers(),startup=Promise.withResolvers();
+ let starting=true,stops=0;
+ h.bootstrap.persistenceDiagnostic=()=>'PERSIST_INPUT';
+ h.cli.startListener=async()=>{entered.resolve();try{return await startup.promise;}finally{starting=false;}};
+ h.cli.stopListener=async()=>{stops++;return !starting;};
+ const o=await owner(h),rejected=assert.rejects(o.run(h.journey,{deadline:200000,signal:controller.signal}),{message:'billing_ABORTED'});
+ await entered.promise;controller.abort();await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(stops,0);
+ if(settled)startup.resolve(false);else t.mock.timers.tick(30000);
+ await rejected;const result=await o.close();
+ assert.equal(result.phase,'LISTENER');assert.equal(result.diagnostic,'PERSIST_INPUT');
+ assert.equal(result.cleanupConfirmed,settled);assert.equal(result.cleanupFailure,settled?null:'LISTENER_STOP');
+ assert.equal(result.initialAccepted,false);assert.equal(h.calls.includes('start'),false);
+ if(!settled){startup.resolve(false);await new Promise(resolve=>setImmediate(resolve));}
+ assert.equal(stops,settled?1:0);
+});
 for(const checkpoint of persistCodes)for(const cleanup of ['confirmed','listener-refused','bootstrap-refused'])test('persistence terminal preserves LISTENER and '+checkpoint+' with '+cleanup,async()=>{
  const h=harness();h.bootstrap.persistenceDiagnostic=()=>checkpoint;
  h.cli.startListener=async()=>{h.calls.push('listener');throw Error('raw-secret-canary');};

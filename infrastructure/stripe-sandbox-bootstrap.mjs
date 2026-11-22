@@ -1,3 +1,4 @@
+import {openSandboxUserEnv,parseSandboxUserEnv,requireSandboxUserEnvUnchanged,sandboxUserFile as USERFILE,stripeKeyNames as STRIPE_NAMES,validPrivateFile as validFile} from './stripe-sandbox-user-env.mjs';
 import {billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
 import {isBrowserProviderOriginWitness} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
@@ -18,10 +19,8 @@ import {manualPaymentOptIn,validateManualPaymentOptions} from './stripe-manual-p
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const DOCKER='/Applications/Docker.app/Contents/Resources/bin/docker';
-const USERFILE=ROOT+'/infrastructure/stripe-sandbox.env.local';
 const SERVICES=['postgres','mailpit','backend','demo-site','callback-receiver'];
 const PORT_NAMES=['backend','demo','receiver','postgres','mailpitHttp','mailpitSmtp'];
-const STRIPE_NAMES=['PAYMENT_STRIPE_SANDBOX_SECRET_KEY','PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY','PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET'];
 const BILLING_CONFIG=Object.freeze({PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:'buildOnly'});
 const EXHAUSTED=new Set(['2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-429f-a34c-e4f69ba2ce18']);
 const CHILD_ENV=Object.freeze({PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C'});
@@ -268,7 +267,6 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     return ['compose','-p',project,'--project-directory',ROOT+'/infrastructure','--env-file',envFile,'-f',ROOT+'/infrastructure/compose.yaml',
       ...(firstPayment?['-f',directory+'/runtime-build.yaml']:[]),...(override?['-f',directory+'/owned.yaml']:[]),...(stripe?['-f',ROOT+'/infrastructure/compose.stripe-sandbox.yaml']:[]),'--profile','smoke',...action];
   }
-  const validFile=s=>s.isFile()&&!s.isSymbolicLink()&&s.uid===process.getuid()&&(s.mode&0o7777)===0o600&&s.nlink===1&&Number.isSafeInteger(s.size)&&s.size>=0&&s.size<=65536;
   async function directoryProof(path,context,privateMode=false) {
     check(context);const s=await io.lstat(path);
     if(!s.isDirectory()||s.isSymbolicLink()||(s.uid!==0&&s.uid!==process.getuid())||await io.realpath(path)!==path
@@ -317,8 +315,10 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   async function intent(action,name,context) {intents.push({action,name,status:'DISPATCHING'});await ledger(context);}
   async function acknowledgement(context) {intents.at(-1).status='ACKNOWLEDGED';await ledger(context);}
   async function sourceGate(context,portsCheck=true) {
-    const result=await io.preflight({runId,expectedSource,daemon,ports,env,...(billing?{approvedBinding:options.approvedBinding,selectedCase:options.selectedCase}:{}),...(firstPayment?{controlPort:options.controlPort,frozenTime:options.frozenTime}:{}),...(manualPayment?{manualPort:options.manualPort}:{})},{lstat:io.lstat,realpath:io.realpath,
-      execute:(file,args,settings)=>execute(file,args,settings,context),portAvailable:(port,host)=>io.portAvailable(port,host,context)});
+    // Preflight uses the process clock. Carry the remaining bootstrap budget and its live signal.
+    const limits=failedRenewal?{deadline:Date.now()+(context.deadline-io.now()),signal:context.signal}:undefined;
+    const result=await io.preflight({runId,expectedSource,daemon,ports,env,...(billing?{approvedBinding:options.approvedBinding,selectedCase:options.selectedCase}:{}),...(firstPayment?{controlPort:options.controlPort,frozenTime:options.frozenTime}:{}),...(manualPayment?{manualPort:options.manualPort}:{})},{lstat:io.lstat,realpath:io.realpath,...(failedRenewal?{open:io.open}:{}),
+      execute:(file,args,settings)=>execute(file,args,settings,context),portAvailable:(port,host)=>io.portAvailable(port,host,context)},limits);
     check(context);if(!object(result)||Object.keys(result).length!==1||result.status!=='READY')fail();
     if(portsCheck)for(const port of [...Object.values(ports),...(manualPayment?[options.manualPort]:[]),...(firstPayment?[options.controlPort]:[])]) {check(context);if(await io.portAvailable(port,'127.0.0.1',context)!==true)fail();}
   }
@@ -563,29 +563,8 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     return true;
   }
 
-  async function boundedRead(file,context) {
-    check(context);const buffer=Buffer.alloc(65537),result=await file.read(buffer,0,buffer.length,0);
-    if(!Number.isInteger(result.bytesRead)||result.bytesRead<0||result.bytesRead>65536)fail();check(context);
-    return buffer.subarray(0,result.bytesRead);
-  }
-  async function userFile(context) {
-    await directoryProof(ROOT+'/infrastructure',context);
-    const before=await io.lstat(USERFILE);
-    if(!validFile(before)||await io.realpath(USERFILE)!==USERFILE)fail();
-    const file=await io.open(USERFILE,constants.O_RDONLY|constants.O_NOFOLLOW);
-    try {
-      const actual=await file.stat();
-      if(!validFile(actual)||actual.ino!==before.ino||actual.dev!==before.dev)fail();
-      const bytes=await boundedRead(file,context);
-      if(bytes.length!==actual.size)fail();return {file,stat:actual,bytes};
-    } catch {await file.close();fail();}
-  }
-  async function unchanged(original,context) {
-    const current=await io.lstat(USERFILE),held=await original.file.stat();
-    if(!validFile(current)||!validFile(held)||current.ino!==original.stat.ino||current.dev!==original.stat.dev
-      ||held.ino!==original.stat.ino||held.dev!==original.stat.dev||await io.realpath(USERFILE)!==USERFILE
-      ||!(await boundedRead(original.file,context)).equals(original.bytes))fail();
-  }
+  const userFile=context=>openSandboxUserEnv(io,()=>check(context));
+  const unchanged=(original,context)=>requireSandboxUserEnvUnchanged(original,io,()=>check(context));
   async function configureDiagnostic(context) {
     const original=await userFile(context);
     try {
@@ -605,21 +584,9 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     }finally{await original.file.close();}
   }
   function parsedUser(bytes,secret) {
-    const text=bytes.toString('utf8');if(!Buffer.from(text).equals(bytes)||text.includes('\0'))fail();
-    const assignments={},lines=text.split(/(?<=\n)/);let webhookIndex=-1;
-    for(let index=0;index<lines.length;index++) {
-      const body=lines[index].replace(/\r?\n$/,'');
-      if(/^\s*(?:#.*)?$/.test(body))continue;
-      const match=/^([A-Z_]+)=(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s'"\r\n]*))$/.exec(body);
-      if(!match||!STRIPE_NAMES.includes(match[1])||Object.hasOwn(assignments,match[1]))fail();
-      assignments[match[1]]=match[2]??match[3]??match[4];
-      if(match[1]===STRIPE_NAMES[2])webhookIndex=index;
-    }
-    if(Object.keys(assignments).length!==3||! /^(?:sk|rk)_test_[A-Za-z0-9]+$/.test(assignments[STRIPE_NAMES[0]])
-      ||!/^pk_test_[A-Za-z0-9]+$/.test(assignments[STRIPE_NAMES[1]]))fail();
-    if(Object.values(assignments).some(value=>/replace_me|your_key|synthetic|sentinel|example/i.test(value)))fail();
+    const {assignments,lines,webhookIndex}=parseSandboxUserEnv(bytes);
     const previous=assignments[STRIPE_NAMES[2]];
-    if(previous!==''&&(failedRenewal?!/^whsec_[A-Za-z0-9_]{16,256}$/.test(previous):previous!==secret))fail();
+    if(!failedRenewal&&previous!==''&&previous!==secret)fail();
     if(previous==='') {
       const line=lines[webhookIndex],offset=line.indexOf('=')+1,quote=["'",'"'].includes(line[offset])?line[offset]:'';
       lines[webhookIndex]=line.slice(0,offset)+quote+secret+quote+line.slice(offset+(quote?2:0));
