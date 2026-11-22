@@ -12,7 +12,13 @@ export async function forwardProfileClick(button:Locator, action:ProfileAction, 
   const timeout=limits.deadline-Date.now();
   if(limits.signal.aborted || timeout<=0 || !await button.isEnabled())throw Error('Profile click expired');
   validate();
-  const remaining=limits.deadline-Date.now();
+  let remaining=limits.deadline-Date.now();
+  if(remaining<=0||limits.signal.aborted)throw Error('Profile click expired');
+  // Leaving an Elements field can resize its frame. Move focus before
+  // Playwright chooses the coordinates for the single trusted click.
+  await button.focus({timeout:Math.min(remaining,5000)});
+  validate();
+  remaining=limits.deadline-Date.now();
   if(remaining<=0||limits.signal.aborted)throw Error('Profile click expired');
   await button.click({timeout:Math.min(remaining,5000)});
 }

@@ -4,18 +4,27 @@ import {openProfileOperator} from './profile-operator.mjs';
 import {forwardProfileClick} from '../tests/support/profile-button.ts';
 
 test('forwarding revalidates the original target after the click arrives',async()=>{
-  for(const mode of ['valid','stale','disabled','aborted','refused']){
+  for(const mode of ['valid','stale','disabled','aborted','refused','abort-on-focus','stale-on-focus']){
     const controller=new AbortController();
     const calls=[];
-    const target={isEnabled:async()=>mode!=='disabled',click:async()=>{calls.push('clicked');}};
+    const target={
+      isEnabled:async()=>mode!=='disabled',
+      async focus(){
+        calls.push('focused');
+        if(mode==='abort-on-focus')controller.abort();
+      },
+      async click(){calls.push('clicked');},
+    };
     const forwarded=forwardProfileClick(target,'method',{deadline:Date.now()+2000,signal:controller.signal},
       async which=>{
         assert.equal(which,'method');
         if(mode==='refused')throw Error('closed');
         if(mode==='aborted')controller.abort();
-      },()=>{if(mode==='stale')throw Error('stale');});
+      },()=>{
+        if(mode==='stale'||(mode==='stale-on-focus'&&calls.includes('focused')))throw Error('stale');
+      });
     if(mode==='valid')await forwarded;else await assert.rejects(forwarded);
-    assert.deepEqual(calls,mode==='valid'?['clicked']:[]);
+    assert.deepEqual(calls,mode==='valid'?['focused','clicked']:mode.endsWith('-on-focus')?['focused']:[]);
   }
 });
 

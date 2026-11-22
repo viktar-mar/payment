@@ -383,7 +383,7 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
         startTask=c.activate();void startTask.catch(()=>{});return;
       }
       await c.activate();
-    },check:async()=>{c.checked=true;},fill:async()=>{if(id==='number')await stageHook?.('card');if(change===id)throw Error('secret_fixture canary');},isVisible:async()=>{if(change==='postal_check')throw Error('secret_fixture canary');return true;},isEnabled:async()=>change==='ready_button'&&id==='pay'?true:!c.disabled,
+    },focus:async()=>{},check:async()=>{c.checked=true;},fill:async()=>{if(id==='number')await stageHook?.('card');if(change===id)throw Error('secret_fixture canary');},isVisible:async()=>{if(change==='postal_check')throw Error('secret_fixture canary');return true;},isEnabled:async()=>change==='ready_button'&&id==='pay'?true:!c.disabled,
     getAttribute:async()=>body.dataset.phase,evaluate:async(f:Function,arg:any)=>id==='code'?(arg===undefined||((c.value=arg),true)):change==='manual_arm'&&id==='pay'?false:f(c,arg),
     frameLocator:()=>({locator:(s:string)=>locator(s.match(/name="([^"]+)"/)?.[1]??'card')})};}
   const page:any={mainFrame:()=>frame,url:()=>url,on:(n:string,f:Function)=>callbacks.set(n,f),goto:async(target:string)=>{assert.equal(target,demo+path);url=target;callbacks.get('framenavigated')?.(frame);},
