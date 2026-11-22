@@ -62,7 +62,7 @@ async function createOwner(options,dependencies,selectedCase) {
     await step('PREPARE',()=>bootstrap.prepare(active),2700000);
     if(invoiceCase){
      ingress=(dependencies.createInvoiceIngress??createOwnedInvoiceIngress)(configuration,bootstrap,{onFailure(){
-      failure??='INGRESS';lifetime.abort();
+      if(state==='RUNNING'){failure??='INGRESS';lifetime.abort();}
      }});
      if(await step('INGRESS',l=>ingress.open(l))!==true)fail('INGRESS');
     }

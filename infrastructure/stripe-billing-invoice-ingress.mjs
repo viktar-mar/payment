@@ -31,7 +31,8 @@ function signature(raw,header,key,now){
 }
 export function ownedInvoiceForwardTarget(ingress,configuration){
  const owner=live.get(ingress);need(owner && owner.runId===configuration.runId && owner.source===configuration.expectedSource &&
-  owner.backend===configuration.ports.backend && configuration.selectedCase==='initial_missed_reordered');return owner.url();
+  owner.daemon===configuration.daemon && Object.keys(owner.ports).length===Object.keys(configuration.ports).length &&
+  Object.entries(owner.ports).every(([k,v])=>configuration.ports[k]===v) && configuration.selectedCase==='initial_missed_reordered');return owner.url();
 }
 
 /** Receives only the original CLI's invoice notifications. No generic forwarding or resend surface. */
@@ -80,7 +81,7 @@ export function createOwnedInvoiceIngress(configuration,bootstrap,dependencies={
    reading=true;claimed=true;let count=0;
    for await(const chunk of req){check();count+=chunk.length;need(count<=maxBytes);chunks.push(Buffer.from(chunk));}
    need(count>0 && (length===undefined || count===Number(length)));
-   raw=Buffer.concat(chunks);capture(raw,headers.get('stripe-signature'));retained=true;res.writeHead(204);res.end();
+   raw=Buffer.concat(chunks);capture(raw,headers.get('stripe-signature'));retained=true;res.shouldKeepAlive=false;res.writeHead(204);res.end();
   }catch{stop();res.writeHead(400);res.end();}
   finally{if(claimed)reading=false;for(const b of chunks)b.fill(0);if(raw&&!retained)raw.fill(0);}
  }
@@ -101,7 +102,11 @@ export function createOwnedInvoiceIngress(configuration,bootstrap,dependencies={
   async open(limits){
    check();need(state==='new');state='opening';
    server=listen({maxHeaderSize:8192,requestTimeout:10000,headersTimeout:5000},receive);
-   server.maxConnections=4;
+   server.maxConnections=4;server.maxRequestsPerSocket=1;
+   const rejectConnection=(_request,connection)=>{stop();connection.destroy();};
+   server.on('drop',stop);
+   for(const event of ['clientError','dropRequest','checkContinue','checkExpectation','connect','upgrade'])
+    server.on(event,rejectConnection);
    opening=new Promise((resolve,reject)=>{
     server.once('error',reject);server.listen(0,'127.0.0.1',()=>{server.removeListener('error',reject);server.on('error',stop);resolve();});
    });
@@ -160,7 +165,7 @@ export function createOwnedInvoiceIngress(configuration,bootstrap,dependencies={
    closing=(async()=>{if(opening)await opening.catch(()=>{});if(server?.listening)await new Promise((resolve,reject)=>{server.close(e=>e?reject(e):resolve());server.closeAllConnections();});need(!server?.listening);return true;})();return closing;
   },
  });
- live.set(ingress,{runId:configuration.runId,source:configuration.expectedSource,backend:configuration.ports.backend,
+ live.set(ingress,{runId:configuration.runId,source:configuration.expectedSource,ports:Object.freeze({...configuration.ports}),daemon:configuration.daemon,
   url(){check();need(server?.listening && origin && server.address()?.port===Number(new URL(origin).port));return origin+route;}});
  return ingress;
 }
