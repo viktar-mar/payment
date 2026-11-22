@@ -37,6 +37,8 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
     private final SubscriptionAuthorityPort authority;
     @org.springframework.beans.factory.annotation.Autowired private SubscriptionBillingProofStore billingProofs;
     @org.springframework.beans.factory.annotation.Autowired private SubscriptionPlanProofStore planProofs;
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private SubscriptionIsolatedTrialProofPort trialProof = SubscriptionIsolatedTrialProofPort.denied();
     private final SubscriptionBillingTimePort billingTime;
     private final SubscriptionIsolatedRecoveryProofPort recoveryProof;
     private SubscriptionIsolatedMethodProofPort methodProof=SubscriptionIsolatedMethodProofPort.denied();
@@ -316,6 +318,11 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
     }
     /** This seam supports facts and reads only; command/time proof expansion requires separate work. */
     private void requireIsolatedShape(Command command,Subscription s,Snapshot snapshot,List<SubscriptionOperation> locked,Instant billingAt,Instant utcAt){
+        if (snapshot.trialEvidence()!=null) {
+            requireIsolatedTrialShape(command,s,snapshot,locked,billingAt);
+            trialProof.requireAuthorized(command,s,locked,billingAt,utcAt);
+            return;
+        }
         var statuses=Set.of(Subscription.Status.INCOMPLETE,Subscription.Status.ACTIVE,Subscription.Status.PAST_DUE,Subscription.Status.UNPAID);
         if(!statuses.contains(s.billingStatus())||!statuses.contains(snapshot.status())||s.trial()!=null||snapshot.trial()!=null
             ||s.cancellation()!=null||snapshot.cancellationAt()!=null||s.pendingChange()!=null||snapshot.trialEvidence()!=null
@@ -390,6 +397,30 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
         if(initial.size()!=1||renewal.size()!=1||initial.getFirst().settlement()!=SettlementKind.CASH
             ||renewal.getFirst().settlement()!=SettlementKind.OPEN||!renewal.getFirst().cashObjects().isEmpty()
             ||!renewal.getFirst().period().equals(s.debt().unpaidPeriod()))throw isolatedUnsupported();
+    }
+    private static void requireIsolatedTrialShape(Command command, Subscription s, Snapshot snapshot,
+                                                  List<SubscriptionOperation> locked, Instant billingAt) {
+        var proof = snapshot.trialEvidence();
+        if (command.source()!=SubscriptionEvent.Source.RECONCILIATION || command.fence()==null
+            || command.expectedBillingSample()==null || !command.expectedBillingSample().isolated()
+            || s.billingStatus()!=Subscription.Status.INCOMPLETE || s.entitledPrice()!=null || s.trial()!=null
+            || s.paidThrough()!=null || s.debt()!=null || s.pendingChange()!=null || s.cancellation()!=null
+            || snapshot.status()!=Subscription.Status.TRIALING || snapshot.providerRevision()!=0 || snapshot.paymentMethodReady()
+            || !s.billingPrice().equals(proof.price()) || !s.billingPrice().equals(snapshot.billingPrice())
+            || proof.price().trialPolicy()!=dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.OPTIONAL_DURING_TRIAL
+            || !proof.period().equals(snapshot.trial()) || !proof.period().equals(snapshot.period())
+            || !billingAt.equals(proof.period().start()) || proof.originalMethod()!=null || snapshot.cancellationAt()!=null
+            || snapshot.externalWithdrawalEvidence()!=null || !snapshot.recoveryObservations().isEmpty()
+            || snapshot.invoices().size()!=1 || locked.size()!=1) throw isolatedUnsupported();
+        var invoice = snapshot.invoices().getFirst();
+        var operation = locked.getFirst();
+        if (invoice.kind()!=BillingRecord.Kind.INITIAL || invoice.settlement()!=SettlementKind.ZERO
+            || invoice.previousPrice()!=null || !invoice.price().equals(proof.price()) || !invoice.period().equals(proof.period())
+            || !invoice.reference().equals(proof.invoice()) || operation.kind()!=SubscriptionOperation.Kind.CREATE
+            || operation.status()!=SubscriptionOperation.Status.RESERVED || !operation.id().equals(proof.operation())
+            || !operation.id().equals(command.fence().operationId()) || !operation.providerOperationKey().equals(snapshot.operationKey())
+            || !new OperationObservation(operation.providerOperationKey(),OperationState.APPLIED).equals(snapshot.operationObservation()))
+            throw isolatedUnsupported();
     }
     private static IllegalStateException isolatedUnsupported(){return new IllegalStateException("ISOLATED_BILLING_UNSUPPORTED");}
     private boolean stripeResumeCash(Subscription s,List<SubscriptionOperation> locked,Snapshot snapshot,Invoice invoice){

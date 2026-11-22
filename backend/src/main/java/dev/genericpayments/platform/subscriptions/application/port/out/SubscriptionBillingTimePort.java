@@ -8,8 +8,7 @@ import java.time.Instant;
 import java.util.Objects;
 
 /** Exact-owner lifecycle evaluation, separate from the caller's operational clock.
- * Isolated mode is limited to unchanged-term paid/unpaid projection, exact reads and expiry.
- * It does not authorize provider commands, trials or native TestClock use. */
+ * The sample supplies an evaluation time. FactService requires separate authority for an isolated trial. */
 public interface SubscriptionBillingTimePort {
     enum Mode { ORDINARY, ISOLATED }
     record Sample(Instant billingAt, Mode mode) {
