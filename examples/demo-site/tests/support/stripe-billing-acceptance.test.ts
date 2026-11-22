@@ -1,7 +1,7 @@
 import {createHash} from 'node:crypto';
 import test from 'node:test';import assert from 'node:assert/strict';import {readFile} from 'node:fs/promises';
 // @ts-expect-error Native Node type erasure requires explicit source extension.
-import {forwardBillingDispatch,runInitialBillingBrowser,runBillingCancellationBrowser,runBillingDeclineRetryBrowser,runBillingInitial3dsBrowser} from './stripe-billing-acceptance.ts';
+import {forwardBillingDispatch,runInitialBillingBrowser,runBillingCancellationBrowser,runBillingDeclineRetryBrowser,runBillingInitial3dsBrowser,runBillingInvoiceWebhooksBrowser} from './stripe-billing-acceptance.ts';
 import type {BillingBinding,BillingPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {Route} from '@playwright/test';
 const binding={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081',receiver:'http://127.0.0.1:18082'},priceId:'11111111-2222-4333-8444-555555555555'} as BillingBinding;
@@ -33,9 +33,9 @@ test('native runner reserves cleanup and scheduling time beyond the unchanged ow
 // A single in-memory page sends SDK-shaped requests only in response to visible manager
 // controls. It cannot make network calls. Responses retain their originating request.
 import type {Browser, Request, Response} from '@playwright/test';
-import type {BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
+import type {BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort,BillingInvoiceWebhooksPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 
-function cancellationPage(fault = '', declineRetry = false, sca = false) {
+function cancellationPage(fault = '', declineRetry = false, sca = false, invoiceCase = false) {
  const id = (n:number) => '11111111-2222-4333-8444-' + String(n).padStart(12, '0');
  const b = {...binding, siteKey:'demo-key', email:'user@example.test', siteId:id(1), productId:id(2)};
  const [sub, create, attempt, schedule, withdraw] = [id(3), id(4), id(5), id(6), id(7)];
@@ -134,7 +134,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false) {
   const rec=devtools.get(target),networkId='net'+(++networkSequence),request={url,method};
   rec?.get('Network.requestWillBeSent')?.({requestId:networkId,frameId:'frame',request});
   return async(label:string,status:number)=>{
-   if(!sca)return;
+   if(!sca&&!invoiceCase)return;
    const redirect=fault==='redirect-'+label;
    const covered=armedPatterns.get(target)?.some(pattern=>{
     const escaped=pattern.split('*').map(part=>part.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'));
@@ -171,7 +171,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false) {
  }
  async function send(url:string, value:object, result:object, status=202, method='POST') {
   const schedulePost = url===cancel, withdrawPost=url===cancel+'/withdraw';
-  const key = declineRetry||sca?id(nonce++):schedulePost?id(9):withdrawPost?(fault==='same-key'?id(9):id(10)):'initial-key';
+  const key = declineRetry||sca||invoiceCase?id(nonce++):schedulePost?id(9):withdrawPost?(fault==='same-key'?id(9):id(10)):'initial-key';
   const headers = {'idempotency-key':key,authorization:'Bearer '+token,origin:b.endpoints.demo,'content-type':'application/json'};
   if(schedulePost && fault==='origin')headers.origin='https://elsewhere.invalid';
   if(schedulePost && fault==='cookie')Object.assign(headers,{cookie:'session=demo'});
@@ -289,7 +289,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false) {
    }};
   }}),
   mainFrame:()=>frame,url:()=>documentUrl,waitForFunction:async()=>{
-   if(sca){
+   if(sca||invoiceCase){
     await provider('https://api.stripe.com/v1/elements/sessions',stripeFrame,false,'GET');
     await provider('https://r.stripe.com/b',stripeFrame);
     await provider('https://merchant-ui-api.stripe.com/telemetry',stripeFrame);
@@ -301,7 +301,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false) {
   },
   on:(event:string,fn:typeof navigate)=>{if(event==='framenavigated')navigationListeners.push(fn);if(event==='requestfailed')requestFailed=fn;},
   goto:async(url:string)=>{
-   if(sca){
+   if(sca||invoiceCase){
     documentUrl='about:blank';
     const method='GET',reply=observeNetwork(frame,url,method);
     const request={url:()=>url,method:()=>method,frame:()=>frame,redirectedFrom:()=>null};
@@ -309,7 +309,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false) {
     if(closed)throw Error('closed');
    }
    documentUrl=url;
-   if(sca)await provider('https://js.stripe.com/v3/',frame,false,'GET');
+   if(sca||invoiceCase)await provider('https://js.stripe.com/v3/',frame,false,'GET');
   },locator:()=>({first:()=>manager}),
   waitForResponse:(predicate:(r:Response)=>boolean)=>new Promise<Response>((resolve,reject)=>{if(closed)reject(new Error('closed'));else waiters.add({predicate,resolve,reject});})
  };
@@ -321,7 +321,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false) {
   resources:()=>b,beforeDispatch:async(kind:string)=>{
    if(kind==='confirm'&&fault==='duplicate-during-persist')await new Promise<void>(resolve=>{releaseDispatch=resolve;void duplicateConfirm?.().catch(()=>{}).finally(resolve);});
    return true;
-  },acknowledge:async(kind:string)=>{if(declineRetry&&kind==='confirm'){trace.push('decline proof');return fault!=='no-decline-proof';}return true;},acknowledgeCustomer:async()=>true,
+  },releaseOriginalConfirm:()=>{trace.push('release original confirm');if(fault==='invalid ingress')throw Error('tainted');return true;},
+  acknowledge:async(kind:string)=>{if(invoiceCase&&kind==='confirm'){trace.push('completed invoice proof');if(fault==='invalid evidence')throw Error();}if(declineRetry&&kind==='confirm'){trace.push('decline proof');return fault!=='no-decline-proof';}return true;},acknowledgeCustomer:async()=>true,
   beforeChallenge:async()=>{trace.push('persist challenge');return true;},acknowledgeChallenge:async()=>{trace.push('issuer witnessed');return true;},
   beforeRetry:async()=>{trace.push('persist retry');if(fault==='retired-retry')manager.state.authorityRevision++;return true;},acknowledgeRetry:async()=>{trace.push('ack retry');return true;},
   beforeSuccessorConfirm:async()=>{trace.push('persist successor');if(fault==='retired-successor')manager.state.authorityRevision++;return true;},acknowledgeSuccessor:async()=>{trace.push('recovered proof');return true;},
@@ -329,7 +330,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false) {
   verifyInitial:async()=>{trace.push('verify initial');verified=true;return fault!=='initial-proof';},
   beforeCancellation:async(kind:string,key:string)=>{trace.push('persist '+kind+' '+key);return fault!=='persist';},
   verifyCancellation:async(kind:string,operation:string)=>{trace.push('verify '+kind+' '+operation);return fault!=='proof';}
- } as BillingCancellationPort&BillingDeclineRetryPort&BillingInitial3dsPort;
+ } as BillingCancellationPort&BillingDeclineRetryPort&BillingInitial3dsPort&BillingInvoiceWebhooksPort;
  return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,presentation,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed};
 }
 test('same-page manager schedules and withdraws once after the initial paid proof',async()=>{
@@ -455,5 +456,18 @@ for(const label of ['demo','js.stripe.com','otp','verify','read','create','selec
   await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+2000},async()=>{}),/billing_BROWSER/);
   assert.equal(f.trace.some(value=>value.startsWith('followed redirect ')),false);
   assert.ok(f.closed());assert.equal(f.trace.includes('issuer witnessed'),false);
+ });
+}
+
+for(const fault of ['none','invalid ingress','invalid evidence','redirect-token','redirect-confirm']){
+ test('single original Pay through held invoice browser: '+fault,async()=>{
+  const f=cancellationPage(fault,false,false,true);
+  const run=runBillingInvoiceWebhooksBrowser(f.browser,f.port,{deadline:Date.now()+3000},()=>false);
+  if(fault==='none')assert.equal(await run,true);else await assert.rejects(run,/billing_BROWSER/);
+  assert.deepEqual(f.numbers,['4242424242424242']);assert.ok(f.closed());
+  assert.equal(f.trace.filter(x=>x==='Create subscription').length,1);assert.equal(f.trace.filter(x=>x==='Pay').length,1);
+  assert.equal(f.sent.filter(x=>x.endsWith('/confirm')).length,['invalid ingress','redirect-token'].includes(fault)?0:1);
+  assert.equal(f.trace.includes('completed invoice proof'),['none','invalid evidence'].includes(fault));
+  assert.equal(f.trace.some(x=>x.startsWith('followed redirect ')||x==='Retry payment'||x==='issuer Complete'),false);
  });
 }

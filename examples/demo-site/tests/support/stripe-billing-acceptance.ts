@@ -1,5 +1,5 @@
 import type {Browser,Route,Request,Response,BrowserContext,Page,Locator,Frame,JSHandle} from '@playwright/test';
-import type {BillingPort,BillingBinding,BillingLimits,BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
+import type {BillingPort,BillingBinding,BillingLimits,BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort,BillingInvoiceWebhooksPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {GenericSubscriptionManager} from '@generic-payments/sdk';
 import type {ManagerState} from '../../../../frontend/sdk/src/subscriptions/manager-state';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
@@ -21,7 +21,7 @@ const exact=(v:unknown,keys:string[]):v is Record<string,unknown>=>object(v)&&Ob
 const duration=(l:BillingLimits)=>{billingCheck(l);return Math.min(45000,l.deadline-Date.now());};
 async function body(response:Response,l:BillingLimits):Promise<Record<string,unknown>>{const bytes=await billingBounded(l,()=>response.body());need(bytes.length<=65536);const v:unknown=JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(bytes));need(object(v));return v as Record<string,unknown>;}
 /** Observes and persists the SDK's own key. Never changes body/headers, fetches, replays or fulfills a financial request. */
-export async function forwardBillingDispatch(route:Pick<Route,'request'|'continue'>,port:Pick<BillingPort,'beforeDispatch'>,binding:BillingBinding,authority:string,kind:'create'|'confirm',identity:Record<string,string>|undefined,limits:BillingLimits,confirmation?:{token:string;check:()=>void},check?:()=>void|Promise<void>,authorizeResponse?:(request:Request)=>Promise<void>):Promise<void>{
+export async function forwardBillingDispatch(route:Pick<Route,'request'|'continue'>,port:Pick<BillingPort,'beforeDispatch'>,binding:BillingBinding,authority:string,kind:'create'|'confirm',identity:Record<string,string>|undefined,limits:BillingLimits,confirmation?:{token:string;check:()=>void},check?:()=>void|Promise<void>,authorizeResponse?:(request:Request)=>Promise<void>,beforeForward?:()=>true):Promise<void>{
  try{billingCheck(limits);const request=route.request(),base=binding.endpoints.backend+'/api/v1/customer/subscriptions';
   const expected=kind==='create'?base:base+'/'+identity?.subscriptionId+'/operations/'+identity?.operationId+'/confirmation-attempts/'+identity?.attemptId+'/confirm';
   need(request.url()===expected&&request.method()==='POST'&&!request.redirectedFrom());const headers=await request.allHeaders(),value:unknown=JSON.parse(request.postData()??'');
@@ -31,7 +31,7 @@ export async function forwardBillingDispatch(route:Pick<Route,'request'|'continu
   confirmation?.check();
   await check?.();need(await port.beforeDispatch(kind,headers['idempotency-key']!,identity)===true);
   if(authorizeResponse)await authorizeResponse(request);
-  billingCheck(limits);await check?.();confirmation?.check();await route.continue();billingCheck(limits);
+  billingCheck(limits);await check?.();confirmation?.check();billingCheck(limits);if(beforeForward)need(beforeForward()===true);await route.continue();billingCheck(limits);
  }catch{fail();}
 }
 const stripeScriptOrigin = (url:URL) => providerOrigin(url) && (url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com'));
@@ -155,8 +155,11 @@ export function runBillingDeclineRetryBrowser(browser:Browser,port:BillingDeclin
 export function runBillingInitial3dsBrowser(browser:Browser,port:BillingInitial3dsPort,limits:BillingLimits,waitForGesture:WaitForIssuerGesture,matchesStaticOrigin?:(origin:string)=>boolean):Promise<true>{
  return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,{port,waitForGesture});
 }
-async function runBillingBrowser(browser:Browser,port:BillingPort,limits:BillingLimits,cancellationPort?:BillingCancellationPort,retryPort?:BillingDeclineRetryPort,matchesStaticOrigin?:(origin:string)=>boolean,challenge?:{port:BillingInitial3dsPort;waitForGesture:WaitForIssuerGesture}):Promise<true>{
- const bound=!!(retryPort||challenge),guarded=!!(cancellationPort||bound);
+export function runBillingInvoiceWebhooksBrowser(browser:Browser,port:BillingInvoiceWebhooksPort,limits:BillingLimits,matchesStaticOrigin:(origin:string)=>boolean):Promise<true>{
+ return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,undefined,port);
+}
+async function runBillingBrowser(browser:Browser,port:BillingPort,limits:BillingLimits,cancellationPort?:BillingCancellationPort,retryPort?:BillingDeclineRetryPort,matchesStaticOrigin?:(origin:string)=>boolean,challenge?:{port:BillingInitial3dsPort;waitForGesture:WaitForIssuerGesture},invoiceCase?:BillingInvoiceWebhooksPort):Promise<true>{
+ const bound=!!(retryPort||challenge||invoiceCase),guarded=!!(cancellationPort||bound);
  const lifecycle=new AbortController();
  limits={deadline:limits.deadline,signal:limits.signal?AbortSignal.any([limits.signal,lifecycle.signal]):lifecycle.signal};
  let context:BrowserContext|undefined,abandoned=false,closing:Promise<void>|undefined,failure=false;
@@ -179,7 +182,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   let originalManager:JSHandle<()=>boolean>|undefined;
   async function checkManager(){
    check();
-   if(challenge && firstAttempt)need(sessionExpiry>Date.now());
+   if((challenge || invoiceCase) && firstAttempt)need(sessionExpiry>Date.now());
    if(bound)need(originalManager && await originalManager.evaluate(current=>current()));
    check();
   }
@@ -214,7 +217,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    return undefined;
   },()=>!payInFlight && confirmPosts===0):undefined;
   const winning=Promise.withResolvers<void>();
-  const redirects=challenge?await guardChallengeRedirects(page,()=>{failure=true;abort();},binding.endpoints):undefined;
+  const redirects=challenge||invoiceCase?await guardChallengeRedirects(page,()=>{failure=true;abort();},binding.endpoints):undefined;
   const sca=challenge?initial3dsChallenge({page,limits,demo:binding.endpoints.demo,owner:()=>({secret:firstSecret,key:publishableKey??''}),
    stripeFrames:req=>stripeFrames(page,req,false,false,binding.endpoints.demo),authorizeResponse:req=>redirects!.authorize(req),check:checkManager,waitForGesture:challenge.waitForGesture,
    winning:async()=>{
@@ -273,7 +276,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   const check=()=>{billingCheck(limits);if(failure||abandoned)fail();};
   const invalidate=()=>{failure=true;abort();};
   if(guarded){
-   if(sca)context.on('request',request=>{if(request.redirectedFrom())invalidate();});
+   if(redirects)context.on('request',request=>{if(request.redirectedFrom())invalidate();});
    context.on('page',invalidate);
    await context.routeWebSocket('**/*',socket=>{try{socket.close();}finally{invalidate();}});
   }
@@ -352,7 +355,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
      confirmation={token:token.id,check};
     }
     const dispatch=successor?{beforeDispatch:(_kind:unknown,key:string)=>retryPort!.beforeSuccessorConfirm(key,{subscriptionId,operationId,attemptId})}:port;
-    await forwardBillingDispatch(route,dispatch,binding,authority,'confirm',{subscriptionId,operationId,attemptId},limits,confirmation,checkManager,redirects?.authorize);
+    await forwardBillingDispatch(route,dispatch,binding,authority,'confirm',{subscriptionId,operationId,attemptId},limits,confirmation,checkManager,redirects?.authorize,invoiceCase?.releaseOriginalConfirm);
    }catch{failure=true;abort();await route.abort('failed').catch(()=>{});}})();pending.add(work);void work.finally(()=>pending.delete(work));return work;
   });
   const url=new URL('/',binding.endpoints.demo);for(const [k,v] of Object.entries({api_base_url:binding.endpoints.backend,site_key:binding.siteKey,subscription_product_1_id:binding.productId,subscription_price_1_id:binding.priceId,locale:'en'}))url.searchParams.set(k,v);

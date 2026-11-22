@@ -4,7 +4,7 @@ import {constants} from 'node:fs';
 import {open,lstat,realpath} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {resolve,dirname} from 'node:path';
-import {createHash} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import {billingBounded,billingCheck,billingError} from './stripe-billing-limits.mjs';
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 export const billingUuid=value=>typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
@@ -24,9 +24,9 @@ export const isFailedRenewalProvisionCheckpoint=code=>checkpointCodes.has(code);
 /** Fresh recurring fixture only. Cookies and callback secrets never enter its append-only public ledger. */
 export async function createBillingFixture(options,dependencies={}) {
  need(billingFailedRenewalExcluded(options?.configuration?.env??{}));
- if(['initial_cancel_withdraw','initial_decline_retry','initial_3ds'].includes(options.configuration?.selectedCase)){
+ if(['initial_cancel_withdraw','initial_decline_retry','initial_3ds','initial_missed_reordered'].includes(options.configuration?.selectedCase)){
   const configuration=validateBillingAcceptanceOptions(options.configuration);need(configuration);
-  return createFixture({...options,configuration},dependencies,configuration.selectedCase==='initial_3ds'?'INITIAL_3DS':configuration.selectedCase==='initial_decline_retry'?'INITIAL_RETRY':'CANCELLATION');
+  return createFixture({...options,configuration},dependencies,configuration.selectedCase==='initial_missed_reordered'?'INVOICE_WEBHOOKS':configuration.selectedCase==='initial_3ds'?'INITIAL_3DS':configuration.selectedCase==='initial_decline_retry'?'INITIAL_RETRY':'CANCELLATION');
  }
  return createFixture(options,dependencies,'INITIAL');
 }
@@ -37,8 +37,10 @@ export async function createBillingFailedRenewalFixture({configuration,bootstrap
 async function createFixture({configuration:c,bootstrap,cli},dependencies,purpose) {
  const failed=purpose==='FAILED_RENEWAL',graceDays=failed?3:0;
  let provisionClaimed=false,confirmRecorded=false,armState='NEW',armBoundary;
+ const invoices=purpose==='INVOICE_WEBHOOKS';
+ let reconciliationClaimed=false;
  const retry=purpose==='INITIAL_RETRY',challenge=purpose==='INITIAL_3DS';
- const retryLedger=challenge?['create-dispatch','create-ack','confirm-dispatch','confirm-ack','challenge-dispatch','challenge-ack']:['create-dispatch','create-ack','confirm-dispatch','confirm-ack','decline-proof','retry-dispatch','retry-ack','successor-confirm-dispatch','successor-confirm-ack','recovered-proof'];
+ const retryLedger=invoices?['create-dispatch','create-ack','confirm-dispatch','confirm-ack','reconcile-dispatch','reconcile-ack','paid-dispatch','paid-ack','finalized-dispatch','finalized-ack']:challenge?['create-dispatch','create-ack','confirm-dispatch','confirm-ack','challenge-dispatch','challenge-ack']:['create-dispatch','create-ack','confirm-dispatch','confirm-ack','decline-proof','retry-dispatch','retry-ack','successor-confirm-dispatch','successor-confirm-ack','recovered-proof'];
  let retryCursor=0,retryKeyHash,successorId,successorKeyHash;
  let nextCancellation='schedule',scheduleHash,scheduleOperation;
  const fetcher=dependencies.fetch??globalThis.fetch,write=dependencies.write??writeOwned;
@@ -59,18 +61,19 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
  }
  async function save(kind,value,limits){need(!closed);await billingBounded(limits,l=>write('billing-'+String(++sequence).padStart(3,'0')+'-'+kind+'.json',{runId:c.runId,expectedSource:c.expectedSource,...value},l));}
  async function financialReceipt(kind,value,limits) {
-  if(!retry&&!challenge)return save(kind,value,limits);
+  if(!retry&&!challenge&&!invoices)return save(kind,value,limits);
   need(retryLedger[retryCursor]===kind);
   const current=retryCursor;retryCursor=-1;
   await save(kind,value,limits);
   retryCursor=current+1;
  }
- async function request(path,limits,{method='GET',body,status=200,target='backend'}={}) {
+ async function request(path,limits,{method='GET',body,status=200,target='backend',idempotencyKey,beforeSend}={}) {
   return billingBounded(limits,async l=>{
    need(!closed);need(await bootstrap.verify(l)===true);
    const origin=target==='mailpit'?'http://127.0.0.1:'+c.ports.mailpitHttp:endpoints[target];
    const admin=target==='backend'&&path!=='/api/admin/v1/auth/sessions';
-   const response=await fetcher(origin+path,{method,redirect:'error',signal:l.signal,headers:{Accept:'application/json',...(body===undefined?{}:{'Content-Type':'application/json'}),...(admin?{Cookie:cookie,...(method==='GET'?{}:{'X-XSRF-TOKEN':csrf,'Idempotency-Key':'billing:'+c.runId+':'+sequence})}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});
+   billingCheck(l);if(beforeSend)need(beforeSend()===true);
+   const response=await fetcher(origin+path,{method,redirect:'error',signal:l.signal,headers:{Accept:'application/json',...(body===undefined?{}:{'Content-Type':'application/json'}),...(admin?{Cookie:cookie,...(method==='GET'?{}:{'X-XSRF-TOKEN':csrf,'Idempotency-Key':idempotencyKey??('billing:'+c.runId+':'+sequence)})}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});
    let bytes=0;const chunks=[];
    try{billingCheck(l);need(response.status===status);for await(const chunk of response.body??[]){billingCheck(l);bytes+=chunk.length;need(bytes<=65536);chunks.push(Buffer.from(chunk));}}
    finally{await response.body?.cancel().catch(()=>{});}
@@ -158,6 +161,24 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
    }
    await financialReceipt(kind+'-ack',{phase:'ACKNOWLEDGED',subscriptionId,operationId,...(kind==='confirm'?{attemptId,...(challenge?{state:'REQUIRES_ACTION'}:retry?{state:'DECLINED'}:{})}:{})},limits);if(kind==='confirm')confirmRecorded=true;return true;
   },
+  ...(invoices?{
+   async reconcile(beforeSend,limits){
+    need(!closed && provisioned && confirmRecorded && !reconciliationClaimed);reconciliationClaimed=true;
+    const key=randomUUID(),keyHash=digest(key);
+    need(key!==confirmKey && key!==createKey);
+    await financialReceipt('reconcile-dispatch',{phase:'DISPATCHING',subscriptionId,originalOperationId:operationId,keyHash},limits);
+    const path='/api/v1/admin/subscriptions/'+subscriptionId+'/reconcile?site_id='+siteId;
+    const value=await read(path,limits,{method:'POST',body:{},status:202,idempotencyKey:key,beforeSend});
+    need(value?.subscription_id===subscriptionId && billingUuid(value.operation_id) && value.operation_id!==operationId &&
+      value.status==='SUCCEEDED' && value.action_available===false && value.browser_confirm_allowed===false && value.next_action===null);
+    const receipt=Object.freeze({operationId:value.operation_id,keyHash});
+    await financialReceipt('reconcile-ack',{phase:'ACKNOWLEDGED',subscriptionId,...receipt},limits);return receipt;
+   },
+   async recordInvoiceDelivery(kind,ack,eventId,limits){
+    need(!closed && ['paid','finalized'].includes(kind) && ['dispatch','ack'].includes(ack) && typeof eventId==='string' && /^evt_[A-Za-z0-9]{1,200}$/.test(eventId));
+    await financialReceipt(kind+'-'+ack,{phase:ack==='dispatch'?'DISPATCHING':'ACKNOWLEDGED',subscriptionId,eventId},limits);return true;
+   },
+  }:{}),
   ...(challenge?{
    async recordChallenge(kind,identity,limits){
     need(confirmRecorded && ['challenge-dispatch','challenge-ack'].includes(kind) && identity.subscriptionId===subscriptionId && identity.operationId===operationId && identity.attemptId===attemptId);

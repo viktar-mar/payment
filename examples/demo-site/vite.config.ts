@@ -38,13 +38,13 @@ export default defineConfig(({mode}):UserConfig=>({
         '@generic-payments/sdk': fileURLToPath(new URL('../../frontend/sdk/src/index.ts', import.meta.url)),
       } : {}),
       // Both the page configuration and the SDK mount must resolve the same pure loader.
-      ...(['stripe-browser-load-check', 'billing-failed-renewal', 'billing-decline-retry', 'billing-initial-3ds'].includes(mode) ? {
+      ...(['stripe-browser-load-check', 'billing-failed-renewal', 'billing-decline-retry', 'billing-initial-3ds','billing-invoice-webhooks'].includes(mode) ? {
         '@stripe/stripe-js/pure/index.js': createRequire(import.meta.resolve('@generic-payments/sdk')).resolve('@stripe/stripe-js/pure/index.js'),
       } : {}),
     },
   },
   plugins: [
-    ...(['billing-decline-retry','billing-initial-3ds'].includes(mode) ? [{
+    ...(['billing-decline-retry','billing-initial-3ds','billing-invoice-webhooks'].includes(mode) ? [{
       name:'owned-decline-retry-loader',
       transformIndexHtml:{order:'pre',handler(_html,context){
         if(context.path==='/index.html')return [{tag:'script',attrs:{type:'module',src:'/src/billing-decline-retry-loader.ts'},injectTo:'head-prepend'}];

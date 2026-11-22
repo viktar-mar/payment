@@ -25,6 +25,7 @@ function captureCancellationOrigin(result,row,inspection) {
 }
 
 const canonical=p=>JSON.stringify(Object.fromEntries(Object.keys(p).sort().map(k=>[k,p[k]])));
+export const billingCallbackDigest=payload=>createHash('sha256').update(canonical(payload)).digest('hex');
 /** Only sanitized proof flags and exact owned provider binding escape the in-memory SQL/callback comparison. */
 export function validateBillingEvidence(scope,row,inspection) {
  need(row&&['cash','journal','original','webhook'].every(k=>row.proof?.[k]===true));
@@ -43,7 +44,7 @@ function validateCallbackPayloads(scope,row,inspection,kind,maximumCallbacks=100
  const ids=new Set();let payments=0,lifecycle=0;
  for(const e of row.callbacks){const p=e.payload;need(e.delivered===true&&billingUuid(e.id)&&!ids.has(e.id));ids.add(e.id);
   need(p?.event_id===e.id&&p.event_type===e.type&&p.site_id===scope.siteId&&p.customer_id===scope.customerId&&p.subscription_id===scope.subscriptionId&&p.product_id===scope.productId);
-  const receipt=inspection.events.filter(v=>v.event_id===e.id);need(receipt.length===1&&receipt[0].event_type===e.type&&receipt[0].count===1&&receipt[0].sha256===createHash('sha256').update(canonical(p)).digest('hex'));
+  const receipt=inspection.events.filter(v=>v.event_id===e.id);need(receipt.length===1&&receipt[0].event_type===e.type&&receipt[0].count===1&&receipt[0].sha256===billingCallbackDigest(p));
   if(p.schema_version===3){payments++;need(p.event_type==='payment.succeeded'&&p.payment_status==='SUCCEEDED'&&p.payment_id===row.payment_id&&p.billing_record_id===row.billing_record_id&&p.amount_minor===2000&&p.currency==='EUR'&&p.billing_kind===kind&&p.price_id===scope.priceId&&p.price_version===1&&Date.parse(p.period_start)/1000===Number(row.period_start)&&Date.parse(p.period_end)/1000===Number(row.period_end));}
   else {need(p.schema_version===4&&['subscription.updated','subscription.access_changed'].includes(p.event_type));if(p.state==='ACTIVE'&&p.access_allowed===true){need(p.payment_id===null||p.payment_id===row.payment_id);if(p.billing_record_id===row.billing_record_id)lifecycle++;}}
  }

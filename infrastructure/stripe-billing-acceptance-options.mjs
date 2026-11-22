@@ -3,6 +3,7 @@ import {validateFormDiagnosticTopology} from './stripe-manual-form-options.mjs';
 const FLAG='PAYMENT_STRIPE_BILLING_ACCEPTANCE';
 const CASE='PAYMENT_STRIPE_BILLING_CASE';
 const cancelCase='initial_cancel_withdraw';
+const invoiceCase='initial_missed_reordered';
 const challengeCase='initial_3ds';
 const retryCase='initial_decline_retry';
 const EXCLUDED=['ALLOW_TEST_OPERATIONS','FULL_RUN','OWNED_RUN','REMAINING_ONLY','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT','MANUAL_3DS','MANUAL_REFUND','MANUAL_REFUND_REMAINDER'].map(name=>'PAYMENT_STRIPE_SANDBOX_'+name).concat('PAYMENT_STRIPE_BILLING_FAILED_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_PAYMENT');
@@ -19,7 +20,7 @@ export function billingAcceptanceOptIn(env){
 function admittedFlags(d){
   for(const key of [FLAG,CASE,'PAYMENT_STRIPE_SANDBOX_ENABLED',...EXCLUDED,'DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE'])if(d[key]&&(!d[key].enumerable||!Object.hasOwn(d[key],'value')))return false;
     return data(d,FLAG)==='true'&&data(d,'PAYMENT_STRIPE_SANDBOX_ENABLED')==='true'&&EXCLUDED.every(k=>[undefined,'','false'].includes(d[k]?.value))
-      &&(!d[CASE] || [cancelCase,retryCase,challengeCase].includes(data(d,CASE)))
+      &&(!d[CASE] || [cancelCase,retryCase,challengeCase,invoiceCase].includes(data(d,CASE)))
       &&[undefined,''].includes(d.DEBUG?.value)&&[undefined,''].includes(d.NODE_DEBUG?.value)&&[undefined,'','0'].includes(d.PWDEBUG?.value)&&[undefined,'','off'].includes(d.PW_TRACE?.value);
 }
 /** Pure admission. The generated snapshot is also accepted, without widening authority. */
@@ -32,7 +33,7 @@ export function validateBillingAcceptanceOptions(value){
     if(!base||OLD_RUNS.has(base.runId)||resolve(new URL(base.daemon).pathname)!==new URL(base.daemon).pathname||input.selectedCase!==selectedCase)return null;
     const bd=descriptors(input.approvedBinding);if(Reflect.ownKeys(bd).length!==2||data(bd,'externalAccountId')!=='acct_1UPiMpELswAd8tpR'||data(bd,'apiVersion')!=='2026-09-30.endive')return null;
     if(d.protocol&&data(d,'protocol')!=='SERVER_CONFIRM_V2')return null;
-    const expectedBudget=selectedCase===challengeCase?{create:1,confirm:1,nextAction:1}:selectedCase===retryCase?{create:1,confirm:2,retry:1}:selectedCase===cancelCase?{create:1,confirm:1,schedule:1,withdraw:1}:{create:1,confirm:1};
+    const expectedBudget=selectedCase===invoiceCase?{create:1,confirm:1,reconcile:1,deliver:2}:selectedCase===challengeCase?{create:1,confirm:1,nextAction:1}:selectedCase===retryCase?{create:1,confirm:2,retry:1}:selectedCase===cancelCase?{create:1,confirm:1,schedule:1,withdraw:1}:{create:1,confirm:1};
     if(d.budget){const budget=descriptors(data(d,'budget'));if(Reflect.ownKeys(budget).length!==Object.keys(expectedBudget).length||Object.keys(expectedBudget).some(k=>data(budget,k)!==expectedBudget[k]))return null;}
     return Object.freeze({...base,env:Object.freeze({PAYMENT_STRIPE_SANDBOX_ENABLED:'true',[FLAG]:'true',...(selectedCase==='initial_success'?{}:{[CASE]:selectedCase})}),approvedBinding:Object.freeze({externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'}),selectedCase:input.selectedCase,protocol:'SERVER_CONFIRM_V2',budget:Object.freeze(expectedBudget)});
   }catch{return null;}

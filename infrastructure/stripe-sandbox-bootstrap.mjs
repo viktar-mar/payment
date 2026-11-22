@@ -21,6 +21,10 @@ const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const DOCKER='/Applications/Docker.app/Contents/Resources/bin/docker';
 const SERVICES=['postgres','mailpit','backend','demo-site','callback-receiver'];
 const PORT_NAMES=['backend','demo','receiver','postgres','mailpitHttp','mailpitSmtp'];
+// Explicit property names keep only the subscription sweep paused while the real inbox and callback workers run.
+const invoiceWorkerConfig=JSON.stringify({'payment.subscriptions.scheduling-enabled':false,'payment.inbox.scheduling-enabled':true,'payment.callbacks.scheduling-enabled':true});
+const workerEnv='SPRING_APPLICATION_JSON='+invoiceWorkerConfig;
+const invoiceContainerFormat=CONTAINER_FORMAT.slice(0,-1)+',"InvoiceWorkers":{{$seen := false}}{{$duplicate := false}}{{$ok := false}}{{range .Config.Env}}{{if eq (index (split . "=") 0) "SPRING_APPLICATION_JSON"}}{{if $seen}}{{$duplicate = true}}{{end}}{{$seen = true}}{{if eq . '+JSON.stringify(workerEnv)+'}}{{$ok = true}}{{end}}{{end}}{{end}}{{and $ok (not $duplicate)}}}';
 const BILLING_CONFIG=Object.freeze({PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:'buildOnly'});
 const EXHAUSTED=new Set(['2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-429f-a34c-e4f69ba2ce18']);
 const CHILD_ENV=Object.freeze({PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C'});
@@ -132,6 +136,7 @@ export async function createOwnedBillingFailedRenewalBootstrap(options,dependenc
  return createBootstrap(selected,dependencies,false,false,true,'FAILED_RENEWAL');
 }
 async function createBootstrap(options,dependencies,diagnostic,manualPayment=false,billing=false,purpose=null) {
+  const invoiceCase=billing&&options.selectedCase==='initial_missed_reordered';
   const firstPayment=purpose!==null,firstRenewal=purpose==='FIRST_RENEWAL',failedRenewal=purpose==='FAILED_RENEWAL';
   const descriptor=Object.getOwnPropertyDescriptor(options??{},'env');
   const rawEnv=descriptor?.enumerable&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined;
@@ -366,6 +371,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     if(failedRenewal)demoBuildMode='billing-failed-renewal';
     else if(firstPayment)demoBuildMode='billing-first-payment';
     else if(billing && options.selectedCase==='initial_decline_retry')demoBuildMode='billing-decline-retry';
+    else if(invoiceCase)demoBuildMode='billing-invoice-webhooks';
     else if(billing && options.selectedCase==='initial_3ds')demoBuildMode='billing-initial-3ds';
     else if(manualPayment)demoBuildMode='manual-payment';
     else if(diagnostic)demoBuildMode='form-diagnostic';
@@ -440,7 +446,8 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     for(const volume of Object.values(recorded.volumes))if(!same(await inspect('volume',volume.Name,VOLUME_FORMAT,context),volume))fail();
   }
   async function containerProof(service,selector,context,{liveRequired=false,neverStarted=false,cleanupOnly=false}={}) {
-    const value=await inspect('container',selector,firstPayment&&service==='backend'?runtimeContainerFormat({...runtimeEnv(controlCapability),PAYMENT_RUNTIME_SOURCE_SHA:expectedSource,PAYMENT_STRIPE_SANDBOX_ENABLED:retired?'true':'false'}):CONTAINER_FORMAT,context),recordedContainer=recorded.containers[service];
+    const value=await inspect('container',selector,firstPayment&&service==='backend'?runtimeContainerFormat({...runtimeEnv(controlCapability),PAYMENT_RUNTIME_SOURCE_SHA:expectedSource,PAYMENT_STRIPE_SANDBOX_ENABLED:retired?'true':'false'}):invoiceCase&&service==='backend'?invoiceContainerFormat:CONTAINER_FORMAT,context),recordedContainer=recorded.containers[service];
+    if(invoiceCase&&service==='backend'&&value.InvoiceWorkers!==true)fail();
     if(firstPayment&&service==='backend')proveRuntime(value,'container');
     const proof=proveOwnedContainer(value,{service,project,runId,network:recorded.network,sourceImage:recorded.images[service.startsWith('issuer-')?'backend':service],
       recordedContainer,expectedMounts:expectedMounts(service),expectedPorts:expectedPorts(service),liveRequired,neverStarted,cleanupOnly,backendStripeEnabled:Boolean(retired||diagnosticConfigured)});
@@ -501,6 +508,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       for(const [key,value] of Object.entries(ownLabels('container')))lines.push('      '+key+': '+value);
       lines.push('    ports: !override');for(const [port,bindings] of Object.entries(expectedPorts(service)))for(const binding of bindings)lines.push('      - "127.0.0.1:'+binding.HostPort+':'+port.split('/')[0]+'"');
       if(service==='backend')lines.push('    environment:','      PAYMENT_STRIPE_SANDBOX_ENABLED: "false"','    volumes: !override','      - type: volume','        source: owned-issuer','        target: /app/local-fixtures','        read_only: true');
+      if(service==='backend'&&invoiceCase)lines.splice(lines.indexOf('    volumes: !override'),0,"      SPRING_APPLICATION_JSON: '"+invoiceWorkerConfig+"'");
       if(service==='backend'&&firstPayment){const at=lines.indexOf('    volumes: !override');lines.splice(at,0,...Object.keys(runtimeEnv('')).map(name=>'      '+name+': "${'+name+':?owned initial runtime required}"'));}
       if(service==='backend'&&billing){const at=lines.indexOf('    volumes: !override');lines.splice(at,0,'      PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED: "true"','      PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS: "v1"','      PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION: "v1"','      PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1: "${PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:?owned Billing key required}"');}
     }
@@ -534,6 +542,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       }
       if(STRIPE_NAMES.some(name=>Object.hasOwn(value.environment??{},name))||(service==='backend'&&value.environment?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='false'))fail();
       if(firstPayment){const expected=runtimeEnv('buildOnly');if(Object.entries(expected).some(([name,want])=>service==='backend'?value.environment?.[name]!==want:Object.hasOwn(value.environment??{},name)))fail();if(service==='backend'&&(value.build?.context!==ROOT+'/backend'||value.build?.dockerfile!==runtimeDockerfile||!same(value.build?.args,{PAYMENT_RUNTIME_SOURCE_SHA:expectedSource})||(value.entrypoint!==undefined&&value.entrypoint!==null)||(value.command!==undefined&&value.command!==null)))fail();}
+      if(invoiceCase&&(service==='backend'?value.environment?.SPRING_APPLICATION_JSON!==invoiceWorkerConfig:Object.hasOwn(value.environment??{},'SPRING_APPLICATION_JSON')))fail();
       if(billing&&Object.entries(BILLING_CONFIG).some(([name,expected])=>service==='backend'?value.environment?.[name]!==expected:Object.hasOwn(value.environment??{},name)))fail();
     }
   }

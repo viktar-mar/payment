@@ -916,3 +916,49 @@ test('an open allocation may omit transition timestamps only with zero cash and 
   delete o['/v1/invoice_payments'].data[0].status_transitions;
   assert.equal(await decline(),true);await stop(f);
 });
+for(const fault of ['none','extra charge','second invoice','changed charge','foreign graph','missing final period','changed period','unexpected exit','unexpected close','unexpected error','readiness changed','unbranded ingress']){
+ test('only two original invoice events and an unchanged captured provider graph: '+fault,async()=>{
+  const f=await billingSetup(),cfg=f.options.configuration;
+  cfg.selectedCase='initial_missed_reordered';cfg.env.PAYMENT_STRIPE_BILLING_CASE=cfg.selectedCase;
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  const {createOwnedInvoiceIngress,ownedInvoiceForwardTarget}=await import('./stripe-billing-invoice-ingress.mjs');
+  const fake=Object.assign(new EventEmitter(),{listening:false,address:()=>({address:'127.0.0.1',port:25555}),
+   listen(_port,_host,ready){this.listening=true;ready();},close(done){this.listening=false;done();},closeAllConnections(){}});
+  let lost=0;
+  const ingress=createOwnedInvoiceIngress(cfg,{verify:async()=>true},{createServer:()=>fake,onFailure:()=>{lost++;}});await ingress.open(f.limits);
+  try{
+   const opts={...f.options,invoiceIngress:fault==='unbranded ingress'?{url:'http://localhost/foreign'}:ingress};
+   if(fault==='unbranded ingress'){await assert.rejects(createBillingCliAdapter(opts,f.dependencies));assert.equal(f.calls.length,0);return;}
+   f.adapter=await createBillingCliAdapter(opts,f.dependencies);
+   assert.equal(f.adapter.bindOwnedBillingGraph,undefined);assert.equal(f.adapter.observeOwnedBillingCancellation,undefined);
+   await f.adapter.validateBinding(f.limits);await start(f);
+   const args=f.calls.find(v=>v.child).args;assert.equal(args[args.indexOf('--forward-to')+1],ownedInvoiceForwardTarget(ingress,cfg));
+   assert.equal(args[args.indexOf('--events')+1],'invoice.finalized,invoice.paid');assert.equal(args[args.indexOf('--events-from')+1],'@self');
+   const graph=billingTarget(),charge=f.objects['/v1/charges/ch_original'];
+   f.objects['/v1/charges']={object:'list',has_more:false,data:[charge]};
+   if(fault==='extra charge')f.objects['/v1/charges'].data.push({...charge,id:'ch_foreign'});
+   if(fault==='second invoice')f.objects['/v1/invoices'].data.push({...f.objects['/v1/invoices/in_original'],id:'in_foreign'});
+   const inspect=g=>f.adapter.observeOwnedBillingCapturedInvoice(g,f.limits);
+   const first={...graph,periodStart:null,periodEnd:null};
+   if(['extra charge','second invoice'].includes(fault))await assert.rejects(inspect(first));
+   else{
+    assert.equal(await inspect(first),true);
+    if(fault==='foreign graph')graph.operationId=graph.subscriptionId;
+    if(fault==='missing final period')Object.assign(graph,{periodStart:null,periodEnd:null});
+    if(fault==='changed period')graph.periodEnd++;
+    if(fault==='changed charge'){
+     f.objects['/v1/payment_intents/pi_original'].latest_charge='ch_other';
+     const other={...charge,id:'ch_other'};f.objects['/v1/charges/ch_other']=other;f.objects['/v1/charges'].data=[other];
+    }
+    if(['none','unexpected exit','unexpected close','unexpected error','readiness changed'].includes(fault)){
+     assert.equal(await inspect(graph),true);
+     if(fault==='readiness changed')f.children[0].stderr.write(READY.replace(SECRET,'whsec_changed'));
+     if(fault.startsWith('unexpected '))f.children[0].emit(fault.slice('unexpected '.length));
+     assert.equal(lost,fault==='none'?0:1);
+    }else await assert.rejects(inspect(graph));
+   }
+   const last=f.calls.length;await assert.rejects(inspect(graph));assert.equal(f.calls.length,last);await stop(f);
+   assert.equal(lost,fault.startsWith('unexpected ')||fault==='readiness changed'?1:0);
+  }finally{await ingress.close();}
+ });
+}
