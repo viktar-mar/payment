@@ -3,6 +3,7 @@ package dev.genericpayments.acceptance.runtime;
 import com.google.gson.*;
 import dev.genericpayments.platform.catalog.domain.*;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedGraceAdvanceAdapter;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalObserver;
 import dev.genericpayments.platform.provider.application.model.*;
 import dev.genericpayments.platform.provider.application.service.OwnedMethodBrowserService;
@@ -21,8 +22,8 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
     private final OwnedBillingFirstPaymentScenario initial;private final OwnedBillingFirstPaymentRuntime.Admission owner;
     private final Function<Class<?>,Object> beans;private final Clock utc;private final Instant deadline;private final State state;
     private volatile Stage failureStage=Stage.UNCLASSIFIED;private OwnedBillingFailedRenewalComponents components;
-    private String failedRenewalStep;
-    private volatile RuntimeException failedRenewalRefusal;
+    private String detailedStep;
+    private volatile RuntimeException detailedRefusal;
     private OwnedFirstRenewal.Admission upstream;private OwnedFirstRenewal.Pending pending;
     private FailureArmEvidence armEvidence;
     private OwnedFailedRenewal.Admission failed;private OwnedFailedRenewal.Failure failure;
@@ -45,11 +46,11 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
     private JsonObject stage(String expected,String next,Stage checkpoint,Supplier<JsonObject> work){
         final long ticket;
         try{ticket=state.enter(expected,next+"_RUNNING");}catch(RuntimeException invalid){if(state.stoppedIdle())cleanup();throw denied();}
-        try{failureStage=checkpoint;var result=work.get();state.complete(ticket,next+"_RUNNING",next);return result;}
+        try{failureStage=checkpoint;detailedStep=null;var result=work.get();state.complete(ticket,next+"_RUNNING",next);return result;}
         catch(RuntimeException invalid){
             if(state.fail(ticket))cleanup();
             var refusal=denied();
-            if(checkpoint==Stage.FAILED_RENEWAL)failedRenewalRefusal=refusal;
+            if(detailedStep!=null)detailedRefusal=refusal;
             throw refusal;
         }
         catch(Error invalid){if(state.fail(ticket))cleanup();throw invalid;}
@@ -62,7 +63,7 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
     @Override public String failureStage(){return failureStage.name();}
     @Override public String failureStage(Exception refusal){
         // Only the exception emitted by this consumed call can identify its inner step.
-        return refusal!=null&&refusal==failedRenewalRefusal?failedRenewalStep:failureStage();
+        return refusal!=null&&refusal==detailedRefusal?detailedStep:failureStage();
     }
     @Override public JsonObject boundary(){return stage("INITIAL","RENEWAL_BOUNDARY",Stage.BOUNDARY,()->{
         // Authenticate the original settled receipt BEFORE constructing any genuine factories.
@@ -82,12 +83,12 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
         return response("DECLINE_ARMED");
     });}
     @Override public JsonObject failedRenewal(){return stage("DECLINE_ARMED","FAILED_RENEWAL",Stage.FAILED_RENEWAL,()->{
-        failedRenewalStep="FAILED_RENEWAL_CLOCK_ADVANCE";
+        detailedStep="FAILED_RENEWAL_CLOCK_ADVANCE";
         management();var c=parts();var ready=c.advance().advance(upstream,OwnedFirstRenewal.Step.FINALIZATION);
         // This READY2 goes straight to the failed service; no successful Paid observer/publisher.
-        failedRenewalStep="FAILED_RENEWAL_ADMISSION";
+        detailedStep="FAILED_RENEWAL_ADMISSION";
         management();failed=c.failures.admit(upstream,ready,pending.boundary());
-        failedRenewalStep="FAILED_RENEWAL_OBSERVATION";
+        detailedStep="FAILED_RENEWAL_OBSERVATION";
         management();
         var observer=c.failureObserver();
         var diagnostic=new StripeBillingOwnedFailedRenewalObserver.Diagnostic();
@@ -95,18 +96,30 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
             failure=observer.observe(failed,diagnostic);
         } catch(RuntimeException refusal) {
             var checkpoint=diagnostic.checkpoint();
-            if(checkpoint!=null)failedRenewalStep="FAILED_RENEWAL_OBSERVATION_"+checkpoint.name();
+            if(checkpoint!=null)detailedStep="FAILED_RENEWAL_OBSERVATION_"+checkpoint.name();
             throw refusal;
         }
-        failedRenewalStep="FAILED_RENEWAL_EVIDENCE";
+        detailedStep="FAILED_RENEWAL_EVIDENCE";
         var e=pending.boundary().period().start();require(ready.observation().frozenTime()==e.plusSeconds(3600).getEpochSecond()
             &&failure.graceDeadline().equals(e.plusSeconds(259200))&&failure.period().equals(pending.boundary().period())
             &&failure.invoice().equals(pending.boundary().renewalInvoice()));
         return response("FAILED_RENEWAL");
     });}
     @Override public JsonObject graceLastSecond(){return stage("FAILED_RENEWAL","GRACE_LAST_SECOND",Stage.GRACE_LAST_SECOND,()->{
-        management();var c=parts();preparation=c.failures.prepareGraceLastSecond(failed);management();graceReady=c.graceAdapter().advance(failed,preparation);
+        detailedStep="GRACE_LAST_SECOND_PREPARATION";
+        management();var c=parts();preparation=c.failures.prepareGraceLastSecond(failed);
+        detailedStep="GRACE_LAST_SECOND_CLOCK_ADVANCE";
+        management();var adapter=c.graceAdapter();
+        var diagnostic=new StripeBillingOwnedFailedGraceAdvanceAdapter.Diagnostic();
+        try{graceReady=adapter.advance(failed,preparation,diagnostic);}
+        catch(RuntimeException refusal){
+            var checkpoint=diagnostic.checkpoint();
+            if(checkpoint!=null)detailedStep="GRACE_LAST_SECOND_CLOCK_"+checkpoint.name();
+            throw refusal;
+        }
+        detailedStep="GRACE_LAST_SECOND_CLOCK_EVIDENCE";
         require(graceReady.observation().frozenTime()==failure.graceDeadline().minusSeconds(1).getEpochSecond());
+        detailedStep="GRACE_LAST_SECOND_ACCESS";
         return accessResponse("GRACE_LAST_SECOND",failure.graceDeadline().minusSeconds(1),AccessDecision.Reason.GRACE,failure.graceDeadline());
     });}
     @Override public JsonObject graceAt(){return stage("GRACE_LAST_SECOND","GRACE_AT",Stage.GRACE_AT,()->{

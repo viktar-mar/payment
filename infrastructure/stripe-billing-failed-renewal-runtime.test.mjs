@@ -5,7 +5,7 @@ import {opts,scope,id,prepared,confirmed,confirmRequest,initial,responses} from 
 
 const envelope=step=>JSON.stringify({code:'FAILED_RENEWAL_STOPPED',stage:'FAILED_RENEWAL_'+step});
 
-async function armed(reply){
+async function armed(reply,graceReply){
  const sent=[],queue=[{code:'OK',run_id:id(1),phase:'NEW'},prepared(),confirmed(),initial(),...responses().slice(0,2)];
  const configuration=opts();
  const binding={endpoint:'http://127.0.0.1:'+configuration.controlPort,capability:'x'.repeat(43)};
@@ -14,6 +14,7 @@ async function armed(reply){
   const path=new URL(url).pathname;
   sent.push(path);
   if(path==='/failed-renewal/failed')return reply();
+  if(path==='/failed-renewal/grace-last-second'&&graceReply)return graceReply();
   if(path==='/failed-renewal/abort')return new Response('{"code":"QUIESCENT"}');
   assert.ok(queue.length);return new Response(JSON.stringify(queue.shift()));
  }});
@@ -26,6 +27,27 @@ async function armed(reply){
  await runtime.armDecline(limits);
  return {runtime,limits,sent,bootstrap};
 }
+
+for(const [name,stage,status,expected] of [
+ ['preparation','GRACE_LAST_SECOND_PREPARATION',400,'SERVER_PREPARATION'],
+ ['clock advance','GRACE_LAST_SECOND_CLOCK_POST',400,'SERVER_CLOCK_POST'],
+ ['access decision','GRACE_LAST_SECOND_ACCESS',400,'SERVER_ACCESS'],
+ ['wrong route','FAILED_RENEWAL_ADMISSION',400,'HTTP'],
+ ['unclassified','GRACE_LAST_SECOND_PRIVATE',400,'HTTP'],
+ ['unexpected status','GRACE_LAST_SECOND_ACCESS',403,'HTTP'],
+ ['invalid success','GRACE_LAST_SECOND_ACCESS',200,'RESPONSE'],
+])test('grace last second distinguishes '+name,async()=>{
+ const {runtime,limits,sent}=await armed(()=>new Response(JSON.stringify(responses()[2])),
+  ()=>new Response(JSON.stringify({code:'FAILED_RENEWAL_STOPPED',stage}),{status}));
+ await runtime.failedRenewal(limits);
+ await assert.rejects(runtime.graceLastSecond(limits),{message:'billing_RUNTIME'});
+ assert.equal(clients.billingFailedRenewalRuntimeCheckpoint(runtime,limits),'GRACE_LAST_SECOND_'+expected);
+ assert.equal(clients.billingFailedRenewalRuntimeCheckpoint(runtime,{...limits}),null);
+ await assert.rejects(runtime.graceLastSecond(limits));
+ await assert.rejects(runtime.graceAt(limits));
+ assert.equal(sent.filter(path=>path==='/failed-renewal/grace-last-second').length,1);
+ assert.equal(sent.at(-1),'/failed-renewal/grace-last-second');
+});
 
 const observed=['CLAIM','AUTHORITY','CLOCK_BEFORE','GRAPH','CUSTOMER','SUBSCRIPTION','INVOICES','INITIAL_INVOICE','RENEWAL_INVOICE',
  'FAILED_ALLOCATION','FAILED_INTENT','FAILED_CHARGE','FAILED_REVERSE','CLOCK_AFTER','ACCEPTANCE','PUBLICATION'];
@@ -84,13 +106,20 @@ test('only the original HTTP status can admit a server substage',async()=>{
  assert.equal(reads,1);
 });
 
-test('late server refusal after cancel cannot replace a pending transport checkpoint',async()=>{
+for(const [method,stage,expected] of [
+ ['failedRenewal','FAILED_RENEWAL_EVIDENCE','FAILED_RENEWAL_TRANSPORT'],
+ ['graceLastSecond','GRACE_LAST_SECOND_ACCESS','GRACE_LAST_SECOND_TRANSPORT'],
+])test('late refusal after cancel cannot replace a pending '+method+' transport checkpoint',async()=>{
  const entered=Promise.withResolvers(),release=Promise.withResolvers();
- const {runtime,limits}=await armed(()=>{entered.resolve();return release.promise;});
+ const late=()=>{entered.resolve();return release.promise;};
+ const {runtime,limits}=method==='failedRenewal'
+  ?await armed(late)
+  :await armed(()=>new Response(JSON.stringify(responses()[2])),late);
+ if(method==='graceLastSecond')await runtime.failedRenewal(limits);
  const abort=new AbortController(),budget={...limits,signal:abort.signal};
- const pending=assert.rejects(runtime.failedRenewal(budget));
+ const pending=assert.rejects(runtime[method](budget));
  await entered.promise;abort.abort();await pending;await runtime.close(limits);
- release.resolve(new Response(envelope('EVIDENCE'),{status:400}));
+ release.resolve(new Response(JSON.stringify({code:'FAILED_RENEWAL_STOPPED',stage}),{status:400}));
  await new Promise(resolve=>setImmediate(resolve));
- assert.equal(clients.billingFailedRenewalRuntimeCheckpoint(runtime,budget),'FAILED_RENEWAL_TRANSPORT');
+ assert.equal(clients.billingFailedRenewalRuntimeCheckpoint(runtime,budget),expected);
 });

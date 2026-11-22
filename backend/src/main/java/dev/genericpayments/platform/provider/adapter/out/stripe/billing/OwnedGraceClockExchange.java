@@ -12,6 +12,7 @@ import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.TestClockReady;
 import dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.InvocationBudget;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedGraceAdvanceAdapter.Checkpoint;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -31,42 +32,56 @@ final class OwnedGraceClockExchange {
     private final Clock utc;
     private final LongSupplier nanos;
     private final Consumer<Duration> wait;
+    private final Consumer<Checkpoint> checkpoint;
 
     OwnedGraceClockExchange(StripeClient client,TestClockReady previous,long target,String key,InvocationBudget budget,
             ProviderOperation claim,Clock utc,LongSupplier nanos,Consumer<Duration> wait){
+        this(client,previous,target,key,budget,claim,utc,nanos,wait,ignored->{});
+    }
+    OwnedGraceClockExchange(StripeClient client,TestClockReady previous,long target,String key,InvocationBudget budget,
+            ProviderOperation claim,Clock utc,LongSupplier nanos,Consumer<Duration> wait,Consumer<Checkpoint> checkpoint){
         this.client=client;this.previous=previous;this.target=target;this.key=key;this.budget=budget;
-        this.claim=claim;this.utc=utc;this.nanos=nanos;this.wait=wait;
+        this.claim=claim;this.utc=utc;this.nanos=nanos;this.wait=wait;this.checkpoint=checkpoint;
     }
 
     <A>A acknowledge(Runnable inspectClaim,BiFunction<TestClockAck,Instant,A> acknowledge){
         var reference=previous.reference();
+        checkpoint.accept(Checkpoint.PRE_READ);
         inspectClaim.run();
         var before=call(budget,claim,null,options->client.v1().testHelpers().testClocks().retrieve(reference,options));
+        checkpoint.accept(Checkpoint.PRE_VALIDATE);
         inspectClaim.run();
         var predecessor=observation(before,previous);
         if(!"ready".equals(predecessor.status())||predecessor.frozenTime()!=previous.frozenTime()
                 ||predecessor.advancingTarget()!=null&&predecessor.advancingTarget()!=predecessor.frozenTime())throw unavailable();
+        checkpoint.accept(Checkpoint.POST);
         inspectClaim.run();
         var params=TestClockAdvanceParams.builder().setFrozenTime(target).build();
         var post=call(budget,claim,key,options->client.v1().testHelpers().testClocks().advance(reference,params,options));
+        checkpoint.accept(Checkpoint.POST_VALIDATE);
         inspectClaim.run();
         var accepted=observation(post,previous);requireProgress(accepted,previous.frozenTime(),target);budget.remainingNanos(claim);
+        checkpoint.accept(Checkpoint.ACK_STORE);
         return acknowledge.apply(accepted,utc.instant());
     }
 
     <R>R recordReady(Runnable inspectAcknowledged,BiFunction<TestClockReady,Instant,R> recordReady){
         for(int poll=0;poll<12;poll++){
-            if(poll>0)space(budget,claim);
+            if(poll>0){checkpoint.accept(Checkpoint.POLL_WAIT);space(budget,claim);}
+            checkpoint.accept(Checkpoint.POLL_READ);
             inspectAcknowledged.run();
             var remote=call(budget,claim,null,options->client.v1().testHelpers().testClocks().retrieve(previous.reference(),options));
+            checkpoint.accept(Checkpoint.POLL_VALIDATE);
             inspectAcknowledged.run();
             var observed=observation(remote,previous);requireProgress(observed,previous.frozenTime(),target);budget.remainingNanos(claim);
             if("ready".equals(observed.status())){
                 var ready=new TestClockReady(observed.reference(),observed.object(),observed.livemode(),observed.name(),observed.frozenTime(),
                     observed.status(),observed.created(),observed.deletesAfter(),observed.advancingTarget());
+                checkpoint.accept(Checkpoint.READY_STORE);
                 return recordReady.apply(ready,utc.instant());
             }
         }
+        checkpoint.accept(Checkpoint.POLL_EXHAUSTED);
         throw unavailable();
     }
     private static void requireProgress(TestClockAck observed,long previous,long target){

@@ -4,6 +4,8 @@ import com.stripe.StripeClient;
 import com.stripe.exception.StripeException;
 import com.stripe.net.*;
 import dev.genericpayments.platform.provider.adapter.out.stripe.*;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedGraceAdvanceAdapter.Checkpoint;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedGraceAdvanceAdapter.Diagnostic;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedGraceAdvance.*;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.provider.application.service.OwnedFailedGraceAdvanceInertFixture;
@@ -43,8 +45,22 @@ class StripeBillingOwnedFailedGraceAdvanceAdapterTest {
     @Test void advancingPollsAreFreshSpacedFiniteAndUseAckAuthority(){
         var f=new Fixture();f.sdk.http.reply(f.clock(f.previous(),"ready"));f.sdk.http.reply(f.clock(f.previous(),"advancing"));
         for(int i=0;i<12;i++)f.sdk.http.reply(f.clock(f.previous(),"advancing"));
-        refused(f::advance);f.onlyAck();assertThat(f.gets()).hasSize(13);assertThat(f.posts()).hasSize(1);assertThat(f.waits).hasSize(11).allSatisfy(d->assertThat(d).isGreaterThanOrEqualTo(Duration.ofMillis(250)));
+        var diagnostic=new Diagnostic();refused(()->f.advance(diagnostic));assertThat(diagnostic.checkpoint()).isEqualTo(Checkpoint.POLL_EXHAUSTED);
+        f.onlyAck();assertThat(f.gets()).hasSize(13);assertThat(f.posts()).hasSize(1);assertThat(f.waits).hasSize(11).allSatisfy(d->assertThat(d).isGreaterThanOrEqualTo(Duration.ofMillis(250)));
         assertThat(f.local.receiptCalls().stream().filter("requireAck"::equals).count()).isGreaterThanOrEqualTo(12);
+    }
+    @Test void unavailableClockCallsKeepTheOriginalReadPostOrPollCheckpoint(){
+        for(var checkpoint:List.of(Checkpoint.PRE_READ,Checkpoint.POST,Checkpoint.POLL_READ)){
+            var f=new Fixture();
+            if(checkpoint!=Checkpoint.PRE_READ)f.sdk.http.reply(f.clock(f.previous(),"ready"));
+            if(checkpoint==Checkpoint.POLL_READ)f.sdk.http.reply(f.clock(f.target(),"ready"));
+            f.sdk.http.disconnect();
+            var diagnostic=new Diagnostic();
+            refused(()->f.advance(diagnostic));
+            assertThat(diagnostic.checkpoint()).isEqualTo(checkpoint);
+            if(checkpoint==Checkpoint.POLL_READ)f.onlyAck();else f.onlyUnknown();
+            assertThat(f.posts()).hasSize(checkpoint==Checkpoint.PRE_READ?0:1);
+        }
     }
     @Test void subsequentReadyPollIsAcceptedWithoutRetryingThePost(){
         var f=new Fixture();f.sdk.http.reply(f.clock(f.previous(),"ready"));f.sdk.http.reply(f.clock(f.previous(),"advancing"));f.sdk.http.reply(f.clock(f.previous(),"advancing"));f.sdk.http.reply(f.clock(f.target(),"ready"));
@@ -180,6 +196,7 @@ class StripeBillingOwnedFailedGraceAdvanceAdapterTest {
         final StripeClientFactory clients=new StripeClientFactory(){public StripeClient create(StripeCredentials credentials){assertThat(Thread.currentThread()).isSameAs(caller);assertThat(local.active()).isFalse();clientsCreated.incrementAndGet();beforeClient.run();return StripeClient.builder().setApiKey("sk_test_INERT").setMaxNetworkRetries(0).setHttpClient(transport).build();}};
         StripeBillingOwnedFailedGraceAdvanceAdapter adapter(){return new StripeBillingOwnedFailedGraceAdvanceAdapter(local.service,sdk.credentials,clients,invocationClock,invocationNanos,d->{waits.add(d);local.elapsed(local.nanos()+d.toNanos());local.at(local.now().plus(d));});}
         GraceAdvanceReady advance(){return adapter().advance(local.context.admission(),local.context.preparation());}
+        GraceAdvanceReady advance(Diagnostic diagnostic){return adapter().advance(local.context.admission(),local.context.preparation(),diagnostic);}
         long previous(){return local.context.admission().ready().observation().frozenTime();}long target(){return local.context.preparation().target();}
         String clock(long frozen,String status){var c=local.context.admission().ready().observation();return "{\"id\":\""+c.reference()+"\",\"object\":\""+c.object()+"\",\"livemode\":false,\"name\":\""+c.name()+"\",\"created\":"+c.created()+",\"deletes_after\":"+c.deletesAfter()+",\"frozen_time\":"+frozen+",\"status\":\""+status+"\",\"status_details\":{}}";}
         String phaseClock(String phase){return phase.equals("get")?clock(previous(),"ready"):phase.equals("post")?clock(previous(),"advancing"):clock(target(),"ready");}

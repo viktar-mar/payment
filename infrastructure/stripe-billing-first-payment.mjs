@@ -72,7 +72,7 @@ async function createOwner(options,dependencies,purpose){
  }
  const c=mode.validate(options);if(!c)throw billingError('OPT_IN_REQUIRED');
  let state='NEW',phase='NEW',failure=null,diagnostic=null,accepted=false,cleanupConfirmed=false,cleanupFailure=null,bootstrap,cli,fixture,runtime,cleanupPromise,active,finish;
- let journeyStarted=false,journeySettled=false,journeyClean=false,startSettlement,listenerSettlement,provisionLimits,postArmCheckpoint,failedRequestLimits;
+ let journeyStarted=false,journeySettled=false,journeyClean=false,startSettlement,listenerSettlement,provisionLimits,postArmCheckpoint,postArmRequestLimits;
  const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
  const revoke=()=>{
   if(runtime&&!terminalClose){
@@ -90,8 +90,9 @@ async function createOwner(options,dependencies,purpose){
     diagnostic=billingFailedRenewalProvisionCheckpoint(fixture,provisionLimits,c.runId,c.expectedSource)??'PROVISION_UNKNOWN';
    }else if(failedRenewal&&postArmCheckpoints.has(phase)){
     diagnostic=postArmCheckpoints.get(phase).has(postArmCheckpoint)?postArmCheckpoint:null;
-    if(phase==='FAILED_RENEWAL'&&diagnostic==='FAILED_RENEWAL_REQUEST'){
-     diagnostic=billingFailedRenewalRuntimeCheckpoint(runtime,failedRequestLimits)??diagnostic;
+    if(postArmRequestLimits&&diagnostic===phase+'_REQUEST'){
+     const requestCheckpoint=billingFailedRenewalRuntimeCheckpoint(runtime,postArmRequestLimits);
+     if(isFailedRenewalRuntimeCheckpoint(requestCheckpoint,phase))diagnostic=requestCheckpoint;
     }
    }else{
     diagnostic=failedRenewal&&phase==='LISTENER'&&(code==='LISTENER'||code==='ABORTED')&&isPersistenceDiagnostic(detail)?detail:isTerminalDiagnostic(detail)?detail:confirmAck?postConfirmCheckpoints[phase]??null:null;
@@ -253,12 +254,12 @@ async function createOwner(options,dependencies,purpose){
       const operation=postArmOperations.get(method)??browserMethodOperations.get(method);
       if(operation)postArmCheckpoint=operation+'_REQUEST';
       const v=await guarded(operation?phase:stage.phase,l,async bound=>{
-       if(method==='failedRenewal')failedRequestLimits=bound;
+       if(method==='failedRenewal'||method==='graceLastSecond')postArmRequestLimits=bound;
        const reply=await runtime[stage.method](bound);billingCheck(bound);
        if(operation)postArmCheckpoint=operation+'_RESPONSE';
        return validateFailedRenewalStage(method,reply,originalIdentity,settlement,c,previous);
       });
-      if(method==='failedRenewal')failedRequestLimits=undefined;
+      postArmRequestLimits=undefined;
       previous=v;return v;
      };
      const runPostArm=method=>{
@@ -341,7 +342,7 @@ function isFailedRenewalCheckpoint(stage,checkpoint){
   case 'PROVISION':return checkpoint==='PROVISION_UNKNOWN'||isFailedRenewalProvisionCheckpoint(checkpoint);
   case 'BROWSER':return checkpoint!=='BROWSER_METHOD_MOUNT'&&isBrowserDiagnostic(checkpoint);
   case 'METHOD_BROWSER':return isMethodBrowserDiagnostic(checkpoint)||postArmCheckpoints.get(stage).has(checkpoint);
-  default:return postArmCheckpoints.get(stage)?.has(checkpoint)===true||(stage==='FAILED_RENEWAL'&&isFailedRenewalRuntimeCheckpoint(checkpoint));
+  default:return postArmCheckpoints.get(stage)?.has(checkpoint)===true||isFailedRenewalRuntimeCheckpoint(checkpoint,stage);
  }
 }
 /** Failed-mode terminal checkpoints; no raw result/error/resource fields are serialized. */

@@ -696,6 +696,26 @@ test('post-arm owner uses the real runtime checkpoint on '+fault,async()=>{
  assert.equal(paths.filter(path=>path==='/failed-renewal/failed').length,1);
  assert.equal(result.failedRenewalAccepted,false);
 });
+test('post-arm owner reports the grace clock refusal without invoking another financial step',async()=>{
+ const h=harness(),paths=[];
+ const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),initial(),...h.vs.slice(0,3)];
+ h.dependencies.createRuntime=()=>clients.createBillingFailedRenewalRuntime({configuration:opts(),bootstrap:{
+  withFailedRenewalRuntime:cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)})
+ }},{fetch:async url=>{
+  const path=new URL(url).pathname;paths.push(path);
+  if(path==='/failed-renewal/abort')return new Response('{"code":"QUIESCENT"}');
+  if(path==='/failed-renewal/grace-last-second')
+   return new Response('{"code":"FAILED_RENEWAL_STOPPED","stage":"GRACE_LAST_SECOND_CLOCK_POST"}',{status:400});
+  return new Response(JSON.stringify(replies.shift()));
+ }});
+ const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));
+ const result=await o.close(),line=postArmLine('GRACE_LAST_SECOND','GRACE_LAST_SECOND_SERVER_CLOCK_POST');
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(postArmLine('GRACE_AT','GRACE_LAST_SECOND_SERVER_CLOCK_POST')),null);
+ assert.deepEqual(paths.slice(-3),['/failed-renewal/failed','/failed-renewal/grace-last-second','/failed-renewal/abort']);
+ assert.equal(result.failedRenewalAccepted,false);
+});
 test('post-arm terminal protocol rejects foreign stages, mismatched codes, arbitrary text and false cleanup claims',()=>{
  const base={scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',status:'CLOSED',phase:'FAILED_RENEWAL',code:'FAILED_RENEWAL',diagnostic:'FAILED_RENEWAL_REQUEST',initialAccepted:false,failedRenewalAccepted:false,full5bAccepted:false,cleanupConfirmed:true,cleanupFailure:null};
  for(const changes of [{diagnostic:'GRACE_AT_REQUEST'},{scope:'OWNED_INITIAL_PAYMENT'},{phase:'PRIVATE'},{code:'METHOD_ORDER'},{initialAccepted:true},{failedRenewalAccepted:true},{full5bAccepted:true},{status:'RUNNING'},{diagnostic:'FAILED_RENEWAL_PRIVATE'}])assert.equal(owners.formatBillingFailedRenewalDiagnostic({...base,...changes}),null);

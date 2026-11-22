@@ -152,6 +152,26 @@ class OwnedBillingFailedRenewalRuntimeTest {
         }
     }
 
+    @Test void graceLastSecondPublishesOnlyTheSelectedRoutesFixedRefusal() throws Exception {
+        for(var path:List.of("grace-last-second","grace-at","failed")){
+            for(var body:List.of("{}","{\"unexpected\":true}")){
+                var fault=new IllegalStateException("private synthetic detail");
+                var ops=new Inert(){
+                    public JsonObject graceLastSecond(){throw fault;}
+                    public JsonObject graceAt(){throw fault;}
+                    public JsonObject failedRenewal(){throw fault;}
+                    public String failureStage(Exception error){return error==fault?"GRACE_LAST_SECOND_CLOCK_POST":"UNCLASSIFIED";}
+                };
+                var exchange=request("POST","/failed-renewal/"+path,body);
+                handler(ops).handle(exchange);
+                assertThat(exchange.code).isEqualTo(400);
+                var expected=path.equals("grace-last-second")&&body.equals("{}")?"GRACE_LAST_SECOND_CLOCK_POST":"UNCLASSIFIED";
+                assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\""+expected+"\"}");
+                assertThat(ops.aborts).hasValue(1);
+            }
+        }
+    }
+
     @Test void otherRouteAndMalformedFailureRequestCannotPublishDetailedSubstages() throws Exception {
         for(var stage:List.of("FAILED_RENEWAL_ADMISSION","FAILED_RENEWAL_OBSERVATION_FAILED_INTENT")){
             for(var exchange:List.of(request("POST","/failed-renewal/grace-at","{}"),

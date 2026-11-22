@@ -9,17 +9,28 @@ const prepareCodes=new Set(['PREPARE_AUTHORITY','PREPARE_REQUEST','PREPARE_REQUE
 const renewalBoundaryCodes=new Set([...['TRANSPORT','HTTP','RESPONSE'].map(stage=>'POST_CONFIRM_RENEWAL_BOUNDARY_'+stage),...['INITIAL_RECEIPT','ADMISSION','CLOCK_ADVANCE','CLOCK_ADVANCE_AUTHORITY','CLOCK_ADVANCE_PREPARE','CLOCK_ADVANCE_ACCOUNT','CLOCK_ADVANCE_RESERVE','CLOCK_ADVANCE_CLAIM','CLOCK_ADVANCE_CLIENT','CLOCK_ADVANCE_PRE_READ','CLOCK_ADVANCE_PRE_VALIDATE','CLOCK_ADVANCE_POST','CLOCK_ADVANCE_POST_VALIDATE','CLOCK_ADVANCE_ACK_STORE','CLOCK_ADVANCE_POLL_WAIT','CLOCK_ADVANCE_POLL_READ','CLOCK_ADVANCE_POLL_VALIDATE','CLOCK_ADVANCE_POLL_EXHAUSTED','CLOCK_ADVANCE_READY_STORE','GRAPH','GRAPH_OBSERVER_INIT','GRAPH_CLAIM','GRAPH_CLOCK_BEFORE','GRAPH_REMOTE_PRECHECK','GRAPH_CUSTOMER','GRAPH_SUBSCRIPTION','GRAPH_INVOICES','GRAPH_INITIAL_INVOICE','GRAPH_RENEWAL_INVOICE','GRAPH_CLOCK_AFTER','GRAPH_ACCEPT','GRAPH_ASSERT','BOUNDARY_RESPONSE'].map(stage=>'POST_CONFIRM_RENEWAL_BOUNDARY_SERVER_'+stage)]);
 const ownDiagnostics=new WeakMap();
 const ownPrepareCheckpoints=new WeakMap();
-// The Java handler emits these exact ASCII envelopes for its owned /failed call.
+// The Java handler emits these exact ASCII envelopes for two owned routes.
 // Match bytes before parsing; duplicate keys, extra fields or an unrelated stage give no detail.
 const observationSteps=['CLAIM','AUTHORITY','CLOCK_BEFORE','GRAPH','CUSTOMER','SUBSCRIPTION','INVOICES','INITIAL_INVOICE','RENEWAL_INVOICE',
  'FAILED_ALLOCATION','FAILED_INTENT','FAILED_CHARGE','FAILED_REVERSE','CLOCK_AFTER','ACCEPTANCE','PUBLICATION'];
-const failedServerErrors=new Map(['CLOCK_ADVANCE','ADMISSION','OBSERVATION','EVIDENCE',...observationSteps.map(name=>'OBSERVATION_'+name)].map(step=>[
- JSON.stringify({code:'FAILED_RENEWAL_STOPPED',stage:'FAILED_RENEWAL_'+step}), 'FAILED_RENEWAL_SERVER_'+step,
-]));
-const failedErrorLimit=Math.max(...Array.from(failedServerErrors.keys(),value=>value.length));
-const failedRuntimeCodes=new Set(['FAILED_RENEWAL_AUTHORITY','FAILED_RENEWAL_TRANSPORT','FAILED_RENEWAL_HTTP','FAILED_RENEWAL_RESPONSE',...failedServerErrors.values()]);
+const graceClockSteps=['INSPECT','CREDENTIALS','CLAIM','PRE_READ','PRE_VALIDATE','POST','POST_VALIDATE','ACK_STORE',
+ 'POLL_WAIT','POLL_READ','POLL_VALIDATE','POLL_EXHAUSTED','READY_STORE'];
+function requestDiagnostics(stage,steps){
+ const errors=new Map(steps.map(step=>[
+  JSON.stringify({code:'FAILED_RENEWAL_STOPPED',stage:stage+'_'+step}),stage+'_SERVER_'+step,
+ ]));
+ return {stage,errors,limit:Math.max(...Array.from(errors.keys(),value=>value.length)),
+  codes:new Set([...['AUTHORITY','TRANSPORT','HTTP','RESPONSE'].map(step=>stage+'_'+step),...errors.values()])};
+}
+const failedRequestDiagnostics=new Map([
+ ['failed',requestDiagnostics('FAILED_RENEWAL',['CLOCK_ADVANCE','ADMISSION','OBSERVATION','EVIDENCE',...observationSteps.map(name=>'OBSERVATION_'+name)])],
+ ['grace-last-second',requestDiagnostics('GRACE_LAST_SECOND',['PREPARATION','CLOCK_ADVANCE','CLOCK_EVIDENCE','ACCESS',...graceClockSteps.map(name=>'CLOCK_'+name)])],
+]);
 const failedRuntimeSteps=new WeakMap();
-export const isFailedRenewalRuntimeCheckpoint=code=>failedRuntimeCodes.has(code);
+export function isFailedRenewalRuntimeCheckpoint(code,stage='FAILED_RENEWAL'){
+ for(const diagnostic of failedRequestDiagnostics.values())if(diagnostic.stage===stage)return diagnostic.codes.has(code);
+ return false;
+}
 export function billingFailedRenewalRuntimeCheckpoint(runtime,limits){
  const step=failedRuntimeSteps.get(runtime);
  return step&&step.limits===limits?step.code:null;
@@ -59,7 +70,8 @@ function createRuntime({configuration,bootstrap},dependencies,purpose){
  const failure=code=>{if(!failureLatched){failureLatched=true;if(isBillingFirstPaymentDiagnostic(code))diagnostic=code;}const error=billingError('RUNTIME');if(diagnostic!==null)ownDiagnostics.set(error,diagnostic);return error;};
  async function request(route,body,limits){
   if(failed||busy){failed=true;throw failure();}busy=true;
-  const failedStep=failedRenewal&&route==='failed'?{limits,code:'FAILED_RENEWAL_AUTHORITY'}:null;
+  const requestDiagnostic=failedRenewal?failedRequestDiagnostics.get(route):undefined;
+  const failedStep=requestDiagnostic?{limits,code:requestDiagnostic.stage+'_AUTHORITY'}:null;
   if(failedStep)failedRuntimeSteps.set(runtime,failedStep);
   let checkpoint=route==='prepare'?'PREPARE_REQUEST':route==='boundary'?'POST_CONFIRM_RENEWAL_BOUNDARY_TRANSPORT':null;
   try{
@@ -90,7 +102,7 @@ function createRuntime({configuration,bootstrap},dependencies,purpose){
     result=await billingBounded(limits,async l=>{
      if(failedRenewal)need(!failed);
      if(route==='prepare')ownPrepareCheckpoints.set(runtime,'PREPARE_REQUEST_TRANSPORT');
-     if(failedStep)failedStep.code='FAILED_RENEWAL_TRANSPORT';
+     if(failedStep)failedStep.code=requestDiagnostic.stage+'_TRANSPORT';
      const response=await (dependencies.fetch??globalThis.fetch)(privateRuntime.endpoint+(failedStage?'/failed-renewal/':['boundary','finalization'].includes(route)?'/first-renewal/':'/initial-payment/')+route,{method:body===undefined?'GET':'POST',redirect:'error',signal:l.signal,headers:{Accept:'application/json',Authorization:'Bearer '+privateRuntime.capability,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});
      if(route==='prepare')ownPrepareCheckpoints.set(runtime,'PREPARE_REQUEST_RESPONSE');
      let count=0;const chunks=[];const stopped=route==='prepare'&&response.status===400,boundaryStopped=firstRenewal&&route==='boundary'&&response.status===400;
@@ -98,14 +110,14 @@ function createRuntime({configuration,bootstrap},dependencies,purpose){
      if(route==='boundary')checkpoint=response.status===200?'POST_CONFIRM_RENEWAL_BOUNDARY_RESPONSE':'POST_CONFIRM_RENEWAL_BOUNDARY_HTTP';
      try{
       const httpStatus=response.status;
-      if(failedStep){billingCheck(l);need(!failed);failedStep.code=httpStatus===200?'FAILED_RENEWAL_RESPONSE':'FAILED_RENEWAL_HTTP';}
+      if(failedStep){billingCheck(l);need(!failed);failedStep.code=requestDiagnostic.stage+(httpStatus===200?'_RESPONSE':'_HTTP');}
       const failedStopped=failedStep&&httpStatus===400;
       need(httpStatus===200||stopped||boundaryStopped||failedStopped);
-      const limit=failedStopped?failedErrorLimit:16384;
+      const limit=failedStopped?requestDiagnostic.limit:16384;
       for await(const chunk of response.body??[]){billingCheck(l);count+=chunk.length;need(count<=limit);chunks.push(Buffer.from(chunk));}
       if(failedStopped){
        billingCheck(l);need(!failed);
-       const detail=failedServerErrors.get(Buffer.concat(chunks).toString('latin1'));
+       const detail=requestDiagnostic.errors.get(Buffer.concat(chunks).toString('latin1'));
        if(detail)failedStep.code=detail;
        throw billingError('RUNTIME');
       }
@@ -137,7 +149,7 @@ function createRuntime({configuration,bootstrap},dependencies,purpose){
      if(failedRenewal&&route!=='status')return checkedInitialResponse(v,route);
      responseShape(v,route);return v;
     },120000);
-    if(failedStep){billingCheck(limits);need(!failed);failedStep.code='FAILED_RENEWAL_AUTHORITY';}
+    if(failedStep){billingCheck(limits);need(!failed);failedStep.code=requestDiagnostic.stage+'_AUTHORITY';}
     return true;
    },limits);
    if(route==='prepare'&&(admitted!==true||!entered||result===undefined))checkpoint='PREPARE_AUTHORITY';

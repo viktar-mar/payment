@@ -14,6 +14,14 @@ import java.util.function.*;
 
 /** Explicit original G−1 writer. It has no runtime registration or financial continuation. */
 public final class StripeBillingOwnedFailedGraceAdvanceAdapter {
+    public enum Checkpoint {
+        INSPECT, CREDENTIALS, CLAIM, PRE_READ, PRE_VALIDATE, POST, POST_VALIDATE, ACK_STORE,
+        POLL_WAIT, POLL_READ, POLL_VALIDATE, POLL_EXHAUSTED, READY_STORE
+    }
+    public static final class Diagnostic {
+        private Checkpoint checkpoint;
+        public Checkpoint checkpoint(){return checkpoint;}
+    }
     private final OwnedFailedGraceAdvanceService service;
     private final StripeCredentialResolver credentials;private final StripeClientFactory clients;
     private final Clock utc;private final LongSupplier nanos;private final Consumer<Duration> wait;
@@ -30,18 +38,24 @@ public final class StripeBillingOwnedFailedGraceAdvanceAdapter {
         this.utc=Objects.requireNonNull(utc);this.nanos=Objects.requireNonNull(nanos);this.wait=Objects.requireNonNull(wait);
     }
     public GraceAdvanceReady advance(Admission admission,GraceLastSecondPreparation preparation){
+        return advance(admission,preparation,new Diagnostic());
+    }
+    public GraceAdvanceReady advance(Admission admission,GraceLastSecondPreparation preparation,Diagnostic diagnostic){
+        Objects.requireNonNull(diagnostic).checkpoint=Checkpoint.INSPECT;
         final InvocationBudget budget;
         try{budget=new InvocationBudget(utc,nanos);}catch(RuntimeException failure){throw unavailable();}
         PreparationContext original=null;ProviderOperation owned=null;AdvanceAck acknowledged=null;
         try{
             var context=service.inspect(admission,preparation,budget);original=context;
             if(!StripeBillingTestClockAdapter.API_VERSION.equals(context.admission().firstRenewalAdmission().receipt().intent().clock().owner().apiVersion()))throw unavailable();
+            diagnostic.checkpoint=Checkpoint.CREDENTIALS;
             budget.remainingNanos(null);var resolved=credentials.resolve(context.account());budget.remainingNanos(null);
             var client=clients.create(resolved);budget.remainingNanos(null);
             // Assignment occurs only after the fresh firstclaim transaction has actually returned.
+            diagnostic.checkpoint=Checkpoint.CLAIM;
             var claim=service.claim(context,UUID.randomUUID().toString(),budget);owned=claim;budget.remainingNanos(claim);
             var exchange=new OwnedGraceClockExchange(client,context.admission().ready().observation(),context.preparation().target(),
-                context.preparation().operationKey(),budget,claim,utc,nanos,wait);
+                context.preparation().operationKey(),budget,claim,utc,nanos,wait,checkpoint->diagnostic.checkpoint=checkpoint);
             var ack=exchange.acknowledge(()->service.inspectClaim(context,claim,budget),
                 (observation,at)->service.acknowledge(context,claim,observation,at,budget));
             acknowledged=ack;

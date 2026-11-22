@@ -4,6 +4,8 @@
 
 **Stage 5B remains open.** The earlier Stripe run `e7080356` verified the first €20 payment and first successful €20 renewal. Run `19107094` verified a failed renewal. Access was allowed one second before the grace deadline and denied at the deadline and one second after it. Confirmation of the replacement method and repayment of that original €20 debt still need native evidence.
 
+Run `1b3af271-5567-41d3-8701-3001492593a4` at `b4ee8d7` verified the initial €20 payment and the failed renewal. It stopped at `GRACE_LAST_SECOND_REQUEST`. The saved checkpoint leaves the cause of that request failure unresolved. The replacement-method confirmation and repayment were pending. The owner reported confirmed cleanup and all seven run-owned containers were observed exited. [Grace request diagnosis](testing/billing-failed-renewal-recovery.md#grace-last-second-request)
+
 Source `076391b8ce5cfdfc01fbe949144cb05826a87ec3` passed [Offline CI](https://github.com/viktar-mar/payment/actions/runs/45019547486) and the [first-renewal tests](https://github.com/viktar-mar/payment/actions/runs/45019547413). In the local rehearsal, Pay and Confirm test method reached the same checkout document and the runner reported `METHOD_CONFIRMED`.
 
 Fresh run `a5d3c1ab-3bad-4cea-8445-1cab48ba94d2` stopped at the initial Docker check with `DAEMON_UNCONFIRMED` and `attemptsStarted=0`. The local operator created no subscription and sent no financial request. The report leaves the reason for Docker's missing readiness confirmation undetermined.
