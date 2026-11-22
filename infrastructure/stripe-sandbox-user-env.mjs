@@ -1,8 +1,9 @@
 import {constants} from 'node:fs';
 import {lstat, open, realpath} from 'node:fs/promises';
+import {dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
-const directory = fileURLToPath(new URL('.', import.meta.url)).replace(/\/$/, '');
+const directory = dirname(fileURLToPath(import.meta.url));
 export const sandboxUserFile = directory + '/stripe-sandbox.env.local';
 export const stripeKeyNames = Object.freeze([
   'PAYMENT_STRIPE_SANDBOX_SECRET_KEY',

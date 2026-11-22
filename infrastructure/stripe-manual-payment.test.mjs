@@ -159,7 +159,7 @@ test('inert imports neither read private credentials nor launch any subprocess o
       'stripe-manual-payment-schema.mjs','stripe-manual-payment-auth.mjs',
       'stripe-form-diagnostic-provision.mjs','stripe-form-diagnostic-settlement.mjs',
       'stripe-manual-form-options.mjs','stripe-sandbox-acceptance.mjs','stripe-sandbox-remaining-options.mjs',
-      'stripe-sandbox-bootstrap.mjs','stripe-sandbox-owned.mjs',
+      'stripe-sandbox-bootstrap.mjs','stripe-sandbox-user-env.mjs','stripe-sandbox-owned.mjs',
       'stripe-sandbox-cli.mjs','stripe-sandbox-provision.mjs',
       'stripe-sandbox-ownership.mjs','stripe-manual-refund-options.mjs','stripe-manual-refund-remainder-options.mjs',
       'stripe-sandbox-extras.mjs','smoke-stage-5a.mjs',
@@ -173,14 +173,16 @@ test('inert imports neither read private credentials nor launch any subprocess o
       if(!sources.has(url))return trap();
       return {format:'module',source:readSource(new URL(url),'utf8'),shortCircuit:true};
     }});
-    cp.execFile=cp.spawn=cp.spawnSync=trap;fs.readFileSync=trap;fsp.readFile=trap;
+    cp.execFile=cp.spawn=cp.spawnSync=trap;fs.readFileSync=trap;
+    fsp.readFile=fsp.lstat=fsp.realpath=fsp.open=trap;
     http.createServer=net.createServer=trap;globalThis.fetch=trap;syncBuiltinESMExports();
     await import('./infrastructure/stripe-manual-payment.mjs');
     await import('./infrastructure/stripe-manual-payment-auth.mjs');
     await import('./infrastructure/stripe-billing-first-payment-options.mjs');
     // Negative probes never read the filesystem, including an otherwise allowed
     // source path. No private path is exempted by suffix or repository prefix.
-    for(const file of ['infrastructure/.env','infrastructure/fixtures/customer-issuer-private.jwks.json',
+    for(const file of ['infrastructure/.env','infrastructure/stripe-sandbox.env.local','infrastructure/stripe-sandbox-user-env.mjs',
+      'infrastructure/fixtures/customer-issuer-private.jwks.json',
       'test-results/stripe-sandbox/synthetic/state.json','docs/local-development.md',
       'infrastructure/stripe-manual-payment.mjs','infrastructure/stripe-billing-acceptance-options.mjs',
       'infrastructure/stripe-billing-limits.mjs','infrastructure/stripe-billing-first-payment-options.mjs',
