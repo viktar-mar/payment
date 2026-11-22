@@ -1,3 +1,4 @@
+import {ownedInvoiceForwardTarget} from './stripe-billing-invoice-ingress.mjs';
 import {billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
 import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
 import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
@@ -77,9 +78,15 @@ export async function createBillingFirstRenewalCliAdapter(options,dependencies={
 export async function createBillingCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,BILLING);}
 async function createBillingModeCliAdapter(options,dependencies,purpose) {
   let selected,configuration;
-  try{selected=exactData(options,['configuration','cliDirectory','verifyForwardTarget','persistWebhookSecret']);configuration=(purpose===FAILED_RENEWAL?validateBillingFailedRenewalOptions:purpose===FIRST_RENEWAL?validateBillingFirstRenewalOptions:purpose===FIRST_PAYMENT?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(selected.configuration);if(!configuration)fail();}
+  try{
+    const keys=['configuration','cliDirectory','verifyForwardTarget','persistWebhookSecret'];
+    const hasIngress=Object.hasOwn(options,'invoiceIngress');
+    selected=exactData(options,hasIngress?[...keys,'invoiceIngress']:keys);configuration=(purpose===FAILED_RENEWAL?validateBillingFailedRenewalOptions:purpose===FIRST_RENEWAL?validateBillingFirstRenewalOptions:purpose===FIRST_PAYMENT?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(selected.configuration);
+    if(!configuration||hasIngress!==(purpose===BILLING&&configuration.selectedCase==='initial_missed_reordered'))fail();
+    if(hasIngress)ownedInvoiceForwardTarget(selected.invoiceIngress,configuration);
+  }
   catch{throw fixed('OPT_IN_REQUIRED');}
-  return createCliAdapter({...configuration,cliDirectory:selected.cliDirectory,backendPort:configuration.ports.backend,accountKey:'stripe-sandbox-default',verifyForwardTarget:selected.verifyForwardTarget,persistWebhookSecret:selected.persistWebhookSecret},dependencies,purpose);
+  return createCliAdapter({...configuration,invoiceIngress:selected.invoiceIngress,cliDirectory:selected.cliDirectory,backendPort:configuration.ports.backend,accountKey:'stripe-sandbox-default',verifyForwardTarget:selected.verifyForwardTarget,persistWebhookSecret:selected.persistWebhookSecret},dependencies,purpose);
 }
 async function createCliAdapter(options,dependencies,purpose) {
   const failedRenewal=purpose===FAILED_RENEWAL,firstRenewal=purpose===FIRST_RENEWAL,firstPayment=purpose===FIRST_PAYMENT||firstRenewal||failedRenewal,billingMode=purpose===BILLING||firstPayment,remainderMode=purpose===REMAINDER,refundMode=purpose===REFUND||remainderMode;
@@ -123,6 +130,8 @@ async function createCliAdapter(options,dependencies,purpose) {
   let billingGraph=null,billingFailed=false,billingBound=false,billingStarted=false,billingDeadline=null,billingSignal;
   const cancellationCase=purpose===BILLING&&options.selectedCase==='initial_cancel_withdraw';
   const retryCase=purpose===BILLING&&options.selectedCase==='initial_decline_retry';
+  const invoiceCase=purpose===BILLING&&options.selectedCase==='initial_missed_reordered';
+  let invoiceReads=0,invoiceWitness;
   const initial3ds=purpose===BILLING&&options.selectedCase==='initial_3ds';
   let retryNext='declined',retryWitness;
   let cancellationNext='initial',originalCancellationCash;
@@ -131,13 +140,13 @@ async function createCliAdapter(options,dependencies,purpose) {
     if(context.signal.aborted||Date.now()>=(context.proofDeadline??context.deadline))fail();
     if(!context.cleanup){
       if(remainderMode&&[...remainderSignals].some(s=>s.aborted))fail();
-      if(billingMode&&billingSignal?.aborted||(cancellationCase||retryCase)&&billingFailed)fail();
+      if(billingMode&&billingSignal?.aborted||(cancellationCase||retryCase||invoiceCase)&&billingFailed)fail();
     }
   }
   async function operation(code,limits,body) {
     if(billingMode&&billingFailed&&code!=='STOP')throw fixed(code);
     if(busy){
-      if((cancellationCase||retryCase)&&code!=='STOP')billingFailed=true;
+      if((cancellationCase||retryCase||invoiceCase)&&code!=='STOP')billingFailed=true;
       throw fixed('BUSY');
     }
     busy=true;let timer,external,onAbort;
@@ -235,8 +244,8 @@ async function createCliAdapter(options,dependencies,purpose) {
     uncertain=true;return false;
   }
   function listen(context) {
-    const child=io.spawn('/usr/bin/sandbox-exec',[...args,'listen','--events',billingMode?BILLING_EVENTS:EVENTS,'--events-from','@self','--forward-to',
-      'http://127.0.0.1:'+backendPort+'/api/v1/provider-webhooks/stripe/stripe-sandbox-default'],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe']});
+    const child=io.spawn('/usr/bin/sandbox-exec',[...args,'listen','--events',invoiceCase?'invoice.finalized,invoice.paid':billingMode?BILLING_EVENTS:EVENTS,'--events-from','@self','--forward-to',
+      invoiceCase?ownedInvoiceForwardTarget(options.invoiceIngress,options):'http://127.0.0.1:'+backendPort+'/api/v1/provider-webhooks/stripe/stripe-sandbox-default'],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe']});
     const pid=child.pid;
     if(!Number.isInteger(pid)||pid<=0) {uncertain=true;child.on('error',()=>{});fail();}
     let resolveReady,rejectReady,resolveExit;
@@ -245,9 +254,10 @@ async function createCliAdapter(options,dependencies,purpose) {
     record.readiness.catch(()=>{});
     record.termination=new Promise(resolveWait=>{resolveExit=resolveWait;});
     owner=record;
-    const invalidate=()=>{record.valid=false;record.invalidated=true;rejectReady(null);};
-    child.on('exit',()=>{record.exited=true;record.valid=false;if(!record.stopping)record.invalidated=true;rejectReady(null);if(!refundMode&&!billingMode)resolveExit();});
-    if(refundMode||billingMode)child.on('close',()=>{record.closed=true;record.exited=true;record.valid=false;rejectReady(null);resolveExit();});
+    const listenerLost=()=>{if(invoiceCase&&!record.stopping)options.invoiceIngress.listenerLost();};
+    const invalidate=()=>{record.valid=false;record.invalidated=true;rejectReady(null);listenerLost();};
+    child.on('exit',()=>{record.exited=true;record.valid=false;if(!record.stopping)record.invalidated=true;rejectReady(null);if(!refundMode&&!billingMode)resolveExit();listenerLost();});
+    if(refundMode||billingMode)child.on('close',()=>{record.closed=true;record.exited=true;record.valid=false;rejectReady(null);resolveExit();listenerLost();});
     child.on('error',invalidate);
     function line(raw) {
       const text=raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'').replace(/\r$/,'');
@@ -261,6 +271,7 @@ async function createCliAdapter(options,dependencies,purpose) {
       Promise.resolve().then(()=>{if(!record.valid||record.exited)fail();return persistSecret(originalSecret,...(refundMode?[context]:[]));}).then(result=>{
         record.persisting=false;
         if(result!==true||!record.valid||record.exited||context.signal.aborted) {uncertain=true;invalidate();return;}
+        if(invoiceCase){try{if(options.invoiceIngress.signingKey(originalSecret)!==true)fail();}catch{invalidate();return;}}
         record.persisted=true;record.ready=true;resolveReady(true);
       },()=>{record.persisting=false;uncertain=true;invalidate();});
     }
@@ -644,7 +655,7 @@ async function createCliAdapter(options,dependencies,purpose) {
       require(subscription.customer===t.customerReference&&subscription.status===(declined?'incomplete':'active')&&subscription.currency==='eur'&&subscription.latest_invoice===t.invoiceReference&&subscription.trial_start===null&&subscription.trial_end===null&&subscription.test_clock===null);
       require(subscription.items?.object==='list'&&subscription.items.has_more===false&&Array.isArray(subscription.items.data)&&subscription.items.data.length===1);
       const item=subscription.items.data[0];
-      if(declined&&t.periodStart===null){
+      if((declined||invoiceCase)&&t.periodStart===null){
         require(Number.isSafeInteger(item.current_period_start)&&item.current_period_start>0
           &&Number.isSafeInteger(item.current_period_end)&&item.current_period_end>item.current_period_start);
         t.periodStart=item.current_period_start;t.periodEnd=item.current_period_end;
@@ -667,7 +678,7 @@ async function createCliAdapter(options,dependencies,purpose) {
     const terms=cancellationCase?cancellationTerms(subscription,item):null;
     const price=await read('/v1/prices/'+t.priceReference);exact(price,t.priceReference,'price');metadata(price.metadata,{local_price_id:t.priceId,local_price_version:String(t.priceVersion)});
     require(price.product===t.productReference&&price.active===true&&price.unit_amount===2000&&price.currency==='eur'&&price.type==='recurring'&&price.tax_behavior==='inclusive'&&price.recurring?.interval==='month'&&price.recurring.interval_count===1&&price.recurring.usage_type==='licensed');
-    const invoice=await read('/v1/invoices/'+t.invoiceReference,cancellationCase||retryCase||initial3ds?[['expand[]','amount_paid_off_stripe']]:[]);
+    const invoice=await read('/v1/invoices/'+t.invoiceReference,cancellationCase||retryCase||initial3ds||invoiceCase?[['expand[]','amount_paid_off_stripe']]:[]);
     exact(invoice,t.invoiceReference,'invoice');
     require(invoice.customer===t.customerReference&&invoice.parent?.type==='subscription_details'&&invoice.parent.subscription_details?.subscription===t.subscriptionReference&&invoice.billing_reason==='subscription_create'&&invoice.status===(declined?'open':'paid')&&invoice.collection_method==='charge_automatically'&&invoice.currency==='eur');
     require(invoice.amount_paid===(declined?0:2000)&&invoice.amount_remaining===(declined?2000:0)
@@ -728,12 +739,18 @@ async function createCliAdapter(options,dependencies,purpose) {
       billingListener(context);retryNext=declined?'recovered':null;
       return true;
     }
-    if(cancellationCase||initial3ds){
+    if(cancellationCase||initial3ds||invoiceCase){
       const invoices=await pages('/v1/invoices',[['customer',t.customerReference]]);
       require(invoices.length===1);exact(invoices[0],t.invoiceReference,'invoice');require(invoices[0].customer===t.customerReference);
       const charges=await pages('/v1/charges',[['customer',t.customerReference]]);
       require(charges.length===1);exact(charges[0],chargeReference,'charge');
       require(charges[0].customer===t.customerReference&&charges[0].payment_intent===t.intentReference);
+      if(invoiceCase){
+        const witness={...t,chargeReference,itemId:item.id,lineId:line.id,paidAt:allocations[0].status_transitions.paid_at};
+        if(invoiceReads===1)invoiceWitness=Object.freeze(witness);
+        else require(Object.entries(witness).every(([k,v])=>invoiceWitness[k]===v));
+        billingListener(context);return true;
+      }
       if(initial3ds){
         requireAuthenticatedChallenge(charge);
         billingListener(context);
@@ -783,8 +800,14 @@ async function createCliAdapter(options,dependencies,purpose) {
     stopListener:limits=>operation('STOP',limits,async context=>{if(billingMode)billingFailed=true;return stopListener(context);}),
     ...(billingMode?{
       assertBillingListener,
-      ...(!firstPayment&&!retryCase&&!initial3ds?{bindOwnedBillingGraph:(value,limits)=>operation('BILLING_BINDING',limits,context=>bindOwnedBillingGraph(value,context)),
+      ...(!firstPayment&&!retryCase&&!initial3ds&&!invoiceCase?{bindOwnedBillingGraph:(value,limits)=>operation('BILLING_BINDING',limits,context=>bindOwnedBillingGraph(value,context)),
       observeOwnedBillingGraph:limits=>operation('BILLING_GRAPH',limits,observeOwnedBillingGraph)}:{}),
+      ...(invoiceCase?{observeOwnedBillingCapturedInvoice:(value,limits)=>operation('BILLING_INVOICE',limits,async context=>{
+        billingListener(context);if(++invoiceReads>2)fail();
+        const graph=checkedBillingGraph(value,invoiceReads===1);
+        if(invoiceReads===2&&Object.entries(graph).some(([k,v])=>invoiceWitness[k]!==v))fail();
+        billingGraph=graph;return observeOwnedBillingGraph(context);
+      })}:{}),
       ...(initial3ds?{observeOwnedBillingInitial3ds:(value,limits)=>operation('BILLING_INITIAL_3DS',limits,async context=>{
         bindOwnedBillingGraph(value,context);
         return observeOwnedBillingGraph(context);

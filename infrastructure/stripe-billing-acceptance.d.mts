@@ -44,3 +44,14 @@ export function createOwnedBillingInitial3ds(options:unknown,dependencies?:Recor
   run(journey:(port:BillingInitial3dsPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingInitial3dsResult>;
   close(limits?:BillingLimits):Promise<BillingInitial3dsResult>;
 }>;
+
+export interface BillingInvoiceWebhooksPort extends BillingPort {releaseOriginalConfirm():true}
+export interface BillingInvoiceWebhooksResult extends Omit<BillingResult,'scope'> {
+  scope:'INITIAL_MISSED_REORDERED';
+  invoiceWebhooksAccepted:boolean;
+}
+export function createOwnedBillingInvoiceWebhooks(options:unknown,dependencies?:Record<string,unknown>):Promise<{
+  resources():BillingInvoiceWebhooksResult;
+  run(journey:(port:BillingInvoiceWebhooksPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingInvoiceWebhooksResult>;
+  close(limits?:BillingLimits):Promise<BillingInvoiceWebhooksResult>;
+}>;

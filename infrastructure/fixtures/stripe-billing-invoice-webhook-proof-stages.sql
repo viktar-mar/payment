@@ -1,0 +1,73 @@
+-- After reconciled cash and exact receipt, callbacks alone may still be pending.
+call pg_temp.webhook_stage('reconciled',true,false);
+savepoint reconciled_cash;
+delete from pg_temp.outbox_deliveries where outbox_event_id=pg_temp.cid(12);
+update pg_temp.outbox_events set status='PENDING' where id=pg_temp.cid(12);
+call pg_temp.webhook_stage('reconciled',false,true);
+update pg_temp.outbox_events set endpoint_url='http://foreign.invalid' where id=pg_temp.cid(12);
+call pg_temp.webhook_stage('reconciled',false,false);
+rollback to savepoint reconciled_cash;
+
+call pg_temp.add_original_invoice_event(true);
+call pg_temp.webhook_stage('reconciled',false,false);
+call pg_temp.webhook_stage('paid',true,false);
+savepoint first_receipt;
+update pg_temp.provider_inbox set status='PENDING',attempt_count=0;
+call pg_temp.webhook_stage('paid',false,true);
+update pg_temp.provider_inbox set provider_object_id='in_foreign';
+call pg_temp.webhook_stage('paid',false,false);
+rollback to savepoint first_receipt;
+call pg_temp.add_original_invoice_event(false);
+call pg_temp.webhook_stage('finalized',true,false);
+update pg_temp.provider_inbox set received_at=received_at-interval '3 seconds' where provider_event_id='evt_finalized';
+call pg_temp.webhook_stage('finalized',false,false);
+rollback to savepoint first_receipt;
+update pg_temp.provider_inbox set occurred_at=occurred_at+interval '1 second';
+call pg_temp.webhook_stage('paid',false,false);
+rollback to savepoint reconciled_cash;
+update pg_temp.subscription_operations set authority_scope='partner:foreign' where kind='RECONCILE';
+call pg_temp.webhook_stage('reconciled',false,false);
+rollback to savepoint reconciled_cash;
+insert into pg_temp.payments(site_id,customer_id) values(pg_temp.cid(2),pg_temp.cid(98));
+call pg_temp.webhook_stage('reconciled',false,false);
+rollback to savepoint reconciled_cash;
+update pg_temp.subscription_events set source='PROVIDER_WEBHOOK' where event_type='PERIOD_PAID';
+call pg_temp.webhook_stage('reconciled',false,false);
+rollback to savepoint reconciled_cash;
+
+insert into pg_temp.subscription_provider_objects(site_id,subscription_id,payment_account_id,provider_type,object_type,provider_reference)
+values(pg_temp.cid(2),pg_temp.cid(4),pg_temp.cid(1),'STRIPE','SETUP','seti_extra');
+call pg_temp.webhook_stage('reconciled',false,false);
+rollback to savepoint reconciled_cash;
+update pg_temp.payment_events set provider_object_id='pi_foreign';
+call pg_temp.webhook_stage('reconciled',false,false);
+rollback to savepoint reconciled_cash;
+update pg_temp.subscription_events set received_at=transaction_timestamp()-interval '1 hour' where event_type='PERIOD_PAID';
+call pg_temp.webhook_stage('reconciled',false,false);
+rollback to savepoint reconciled_cash;
+
+-- Rewind the synthetic paid rows on this connection to the already-acknowledged confirm.
+delete from pg_temp.subscription_operations where kind='RECONCILE';
+update pg_temp.subscription_operations set status='REQUIRES_ACTION';
+update pg_temp.subscriptions set billing_status='INCOMPLETE',entitled_price_id=null,paid_through=null,revision=2;
+update pg_temp.subscription_billing_records set settlement='OPEN';
+delete from pg_temp.payments;
+delete from pg_temp.subscription_provider_objects where object_type='PAYMENT';
+delete from pg_temp.payment_events;
+delete from pg_temp.subscription_events where event_type<>'CREATED';
+delete from pg_temp.outbox_events where id<>pg_temp.cid(16);
+delete from pg_temp.outbox_deliveries where outbox_event_id<>pg_temp.cid(16);
+call pg_temp.webhook_stage('beforeReconcile',true,false);
+savepoint no_cash;
+insert into pg_temp.payment_events(site_id) values(pg_temp.cid(2));
+call pg_temp.webhook_stage('beforeReconcile',false,false);
+rollback to savepoint no_cash;
+update pg_temp.outbox_events set payload=jsonb_set(payload,'{access_allowed}','true');
+call pg_temp.webhook_stage('beforeReconcile',false,false);
+rollback to savepoint no_cash;
+update pg_temp.subscription_action_capabilities set consumed_at=null;
+update pg_temp.subscription_confirmation_attempts set state='READY',confirm_key=null,claimed_at=null,token_digest=null,fingerprint=null;
+call pg_temp.webhook_stage('beforeConfirm',true,false);
+call pg_temp.webhook_stage('beforeReconcile',false,false);
+update pg_temp.subscription_confirmation_attempts set state='DISPATCHING';
+call pg_temp.webhook_stage('beforeConfirm',false,false);

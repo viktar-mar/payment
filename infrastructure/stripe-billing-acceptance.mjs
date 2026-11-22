@@ -1,3 +1,5 @@
+import {createOwnedInvoiceIngress} from './stripe-billing-invoice-ingress.mjs';
+import {invoiceWebhookFlow} from './stripe-billing-invoice-webhook-port.mjs';
 import {initialChallengeFlow} from './stripe-billing-initial-3ds-port.mjs';
 import {initialRetryFlow} from './stripe-billing-initial-retry-port.mjs';
 import {validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
@@ -21,7 +23,12 @@ export async function createOwnedBillingDeclineRetry(options,dependencies={}) {
 export async function createOwnedBillingInitial3ds(options,dependencies={}) {
  return createOwner(options,dependencies,'initial_3ds');
 }
+export async function createOwnedBillingInvoiceWebhooks(options,dependencies={}) {
+ return createOwner(options,dependencies,'initial_missed_reordered');
+}
 async function createOwner(options,dependencies,selectedCase) {
+ const invoiceCase=selectedCase==='initial_missed_reordered';
+ let ingress;
  const challenge=selectedCase==='initial_3ds';
  const cancellation=selectedCase==='initial_cancel_withdraw',retry=selectedCase==='initial_decline_retry';
  const configuration=validateBillingAcceptanceOptions(options);
@@ -30,13 +37,13 @@ async function createOwner(options,dependencies,selectedCase) {
  let finishRun;const finished=new Promise(resolve=>finishRun=resolve);
  let state='NEW',phase='NEW',failure=null,bootstrap,cli,fixture,cleanupPromise,active,accepted=false,cleanupConfirmed=false;
  const lifetime=new AbortController(),counts={create:0,confirm:0},acks={create:false,confirm:false};
- const resources=()=>Object.freeze({runId:configuration.runId,expectedSource:configuration.expectedSource,scope:challenge?'INITIAL_3DS':retry?'INITIAL_DECLINE_RETRY':cancellation?'INITIAL_CANCEL_WITHDRAW':'INITIAL_NON_CLOCK',status:state,phase,code:failure,initialAccepted:accepted,...(cancellation?{cancellationAccepted:accepted}:{}),...(retry?{declineRetryAccepted:accepted}:{}),...(challenge?{initial3dsAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
+ const resources=()=>Object.freeze({runId:configuration.runId,expectedSource:configuration.expectedSource,scope:invoiceCase?'INITIAL_MISSED_REORDERED':challenge?'INITIAL_3DS':retry?'INITIAL_DECLINE_RETRY':cancellation?'INITIAL_CANCEL_WITHDRAW':'INITIAL_NON_CLOCK',status:state,phase,code:failure,initialAccepted:accepted,...(cancellation?{cancellationAccepted:accepted}:{}),...(retry?{declineRetryAccepted:accepted}:{}),...(challenge?{initial3dsAccepted:accepted}:{}),...(invoiceCase?{invoiceWebhooksAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
  const fail=code=>{failure??=code;lifetime.abort();throw billingError(failure);};
  async function cleanup() {
   if(cleanupPromise)return cleanupPromise;
   cleanupPromise=(async()=>{
    let ok=!browserUnconfirmed;const limits={deadline:Date.now()+120000};
-   for(const [object,method] of [[fixture,'close'],[cli,'stopListener'],[bootstrap,'stop']])if(object)try{if(await billingBounded(limits,l=>object[method](l),30000)!==true)ok=false;}catch{ok=false;}
+   for(const [object,method] of [[fixture,'close'],[cli,'stopListener'],[ingress,'close'],[bootstrap,'stop']])if(object)try{if(await billingBounded(limits,l=>object[method](l),30000)!==true)ok=false;}catch{ok=false;}
    cleanupConfirmed=ok;if(!ok)failure??='CLEANUP';return ok;
   })();return cleanupPromise;
  }
@@ -53,7 +60,13 @@ async function createOwner(options,dependencies,selectedCase) {
     if(preflight!==true&&preflight?.status!=='READY')fail('PREFLIGHT');
     bootstrap=await step('BOOTSTRAP',()=>(dependencies.createBootstrap??createOwnedBillingBootstrap)(configuration));
     await step('PREPARE',()=>bootstrap.prepare(active),2700000);
-    cli=await step('CLI',()=>(dependencies.createCli??createBillingCliAdapter)({configuration,cliDirectory:bootstrap.resources().cliDirectory,verifyForwardTarget:bootstrap.verifyForwardTarget,persistWebhookSecret:bootstrap.persistWebhookSecret}));
+    if(invoiceCase){
+     ingress=(dependencies.createInvoiceIngress??createOwnedInvoiceIngress)(configuration,bootstrap,{onFailure(){
+      failure??='INGRESS';lifetime.abort();
+     }});
+     if(await step('INGRESS',l=>ingress.open(l))!==true)fail('INGRESS');
+    }
+    cli=await step('CLI',()=>(dependencies.createCli??createBillingCliAdapter)({configuration,cliDirectory:bootstrap.resources().cliDirectory,verifyForwardTarget:bootstrap.verifyForwardTarget,persistWebhookSecret:bootstrap.persistWebhookSecret,...(invoiceCase?{invoiceIngress:ingress}:{})}));
     await step('LOGIN',async l=>{const login=dependencies.login??(await import('./stripe-billing-login.mjs')).completeBillingLogin;return login(cli,configuration,active);},780000);
     await step('BINDING',l=>cli.validateBinding(l));await step('LISTENER',l=>cli.startListener(l));
     await step('START',l=>bootstrap.start(l),2700000);
@@ -73,6 +86,7 @@ async function createOwner(options,dependencies,selectedCase) {
      if(next!==expected||failure)fail('CANCELLATION_ORDER');
      next='busy';
     }
+    const invoiceFlow=invoiceCase?invoiceWebhookFlow({configuration,bootstrap,cli,fixture,ingress,active,step,fail,createEvidence:dependencies.createInvoiceEvidence}):null;
     const retryFlow=retry?initialRetryFlow({configuration,bootstrap,cli,fixture,active,step,fail,prove:dependencies.proveInitialRetry}):null;
     const challengeFlow=challenge?initialChallengeFlow({configuration,bootstrap,cli,fixture,active,step,fail,prove:dependencies.proveInitial3ds}):null;
     const port=Object.freeze({resources:()=>fixture.resources(),
@@ -88,6 +102,7 @@ async function createOwner(options,dependencies,selectedCase) {
      },
      withOtpCode:async(callback,l)=>{billingCheck(active);return fixture.withOtpCode(callback,{deadline:Math.min(active.deadline,l.deadline),signal:active.signal});},
      acknowledgeCustomer:async(value)=>{billingCheck(active);return fixture.acknowledgeCustomer(value,active);},
+     ...(invoiceFlow?.port),
      ...(retryFlow?.port),
      ...(challengeFlow?.port),
      ...(cancellation?{
@@ -120,10 +135,14 @@ async function createOwner(options,dependencies,selectedCase) {
      }:{}),
     });
     const browserResult=await step('BROWSER',()=>{
-     if(retry||challenge)browserUnconfirmed=true;
+     if(retry||challenge||invoiceCase)browserUnconfirmed=true;
      return browserJourney(port,active);
     },2700000);
-    if(challengeFlow){
+    if(invoiceFlow){
+     if(browserResult!==true)fail('BROWSER');
+     browserUnconfirmed=false;
+     await invoiceFlow.finish();
+    }else if(challengeFlow){
      if(browserResult!==true)fail('BROWSER');
      browserUnconfirmed=false;
      await challengeFlow.verify();
