@@ -28,6 +28,7 @@ class BillingAcceptanceSqlIntegrationTest extends PostgresIntegrationTest {
                 statement.setString(9, "a".repeat(64));
                 statement.setString(10, "b".repeat(64));
                 statement.setString(11, "http://127.0.0.1:18081");
+                statement.setBoolean(12, false);
                 statement.setQueryTimeout(5);
                 try (var rows = statement.executeQuery()) { assertThat(rows.next()).isFalse(); }
             } finally { connection.rollback(); }
@@ -44,6 +45,7 @@ class BillingAcceptanceSqlIntegrationTest extends PostgresIntegrationTest {
                 var initialSql = Files.readString(Path.of("../infrastructure/stripe-billing-proof.sql"));
                 try (var initial = connection.prepareStatement(initialSql.replaceAll("\\$[0-9]+", "?"))) {
                     bindInitial(initial);
+                    initial.setBoolean(12, false);
                     try (var first = initial.executeQuery()) {
                         assertThat(first.next()).isTrue();
                         var json = new ObjectMapper();
@@ -69,6 +71,52 @@ class BillingAcceptanceSqlIntegrationTest extends PostgresIntegrationTest {
                 assertCancellationRow(connection, sql, true, false, false);
             } finally {
                 connection.rollback();
+            }
+        }
+    }
+
+    @Test void retryProofRequiresCausalDeclineNoCashAndOnePaidSuccessor() throws Exception {
+        var dir = Path.of("../infrastructure");
+        var query = Files.readString(dir.resolve("stripe-billing-initial-retry-proof.sql"));
+        try (var connection = source.getConnection(); var setup = connection.createStatement()) {
+            connection.setAutoCommit(false);
+            try {
+                setup.execute(Files.readString(dir.resolve("fixtures/stripe-billing-cancellation-proof-rows.sql")));
+                setup.execute(Files.readString(dir.resolve("fixtures/stripe-billing-initial-retry-proof-rows.sql")));
+                assertRetryRow(connection, query, true, true, true, true);
+                var paid = connection.setSavepoint();
+                setup.execute("update pg_temp.subscription_confirmation_attempts set predecessor=null where id=pg_temp.cid(51)");
+                assertRetryRow(connection, query, true, false, true, true);
+                connection.rollback(paid);
+                setup.execute("insert into pg_temp.payments(site_id,customer_id) values(pg_temp.cid(2),pg_temp.cid(80))");
+                assertRetryRow(connection, query, true, true, false, true);
+                connection.rollback(paid);
+                setup.execute("call pg_temp.only_original_decline()");
+                assertRetryRow(connection, query, false, true, true, false);
+                setup.execute("insert into pg_temp.payment_events(site_id) values(pg_temp.cid(2))");
+                assertRetryRow(connection, query, false, true, false, false);
+            } finally {
+                connection.rollback();
+            }
+        }
+    }
+
+    private static void assertRetryRow(Connection connection, String query, boolean recovered, boolean lineage,
+                                       boolean phaseProof, boolean journal) throws Exception {
+        try (var select = connection.prepareStatement(query.replaceAll("\\$[0-9]+", "?"))) {
+            bindInitial(select);
+            select.setString(12, "s5a-" + fixtureId(99).toString().replace("-", ""));
+            select.setObject(13, recovered ? fixtureId(51) : null);
+            select.setString(14, recovered ? "3".repeat(64) : null);
+            select.setString(15, recovered ? "4".repeat(64) : null);
+            select.setQueryTimeout(5);
+            try (var row = select.executeQuery()) {
+                assertThat(row.next()).isTrue();
+                assertThat(row.getBoolean("original")).isTrue();
+                assertThat(row.getBoolean("lineage")).isEqualTo(lineage);
+                assertThat(row.getBoolean("phase_proof")).isEqualTo(phaseProof);
+                assertThat(row.getBoolean("journal")).isEqualTo(journal);
+                assertThat(row.next()).isFalse();
             }
         }
     }
@@ -106,6 +154,37 @@ class BillingAcceptanceSqlIntegrationTest extends PostgresIntegrationTest {
                 callbacks.forEach(e -> assertThat(e.get("delivered").asBoolean()).isTrue());
                 assertThat(row.next()).isFalse();
             }
+        }
+    }
+
+    @Test void challengeAndOrdinaryProofRequireTheirOwnOriginalAttemptState() throws Exception {
+        var query = Files.readString(Path.of("../infrastructure/stripe-billing-proof.sql")).replaceAll("\\$[0-9]+", "?");
+        var fixture = Files.readString(Path.of("../infrastructure/fixtures/stripe-billing-cancellation-proof-rows.sql"));
+        try (var connection = source.getConnection(); var setup = connection.createStatement();
+             var select = connection.prepareStatement(query)) {
+            connection.setAutoCommit(false);
+            try {
+                setup.execute(fixture);
+                bindInitial(select);
+                for (var attemptState : java.util.List.of("OBSERVE", "REQUIRES_ACTION")) {
+                    try (var update = connection.prepareStatement("update pg_temp.subscription_confirmation_attempts set state=? where id=?")) {
+                        update.setString(1, attemptState);
+                        update.setObject(2, fixtureId(6));
+                        assertThat(update.executeUpdate()).isOne();
+                    }
+                    for (boolean challenge : new boolean[]{false, true}) {
+                        select.setBoolean(12, challenge);
+                        try (var row = select.executeQuery()) {
+                            assertThat(row.next()).isTrue();
+                            var proof = new ObjectMapper().readTree(row.getString("proof"));
+                            assertThat(proof.path("original").asBoolean()).isEqualTo(challenge == attemptState.equals("REQUIRES_ACTION"));
+                            assertThat(proof.path("cash").asBoolean()).isTrue();
+                            assertThat(proof.path("journal").asBoolean()).isTrue();
+                            assertThat(row.next()).isFalse();
+                        }
+                    }
+                }
+            } finally { connection.rollback(); }
         }
     }
 

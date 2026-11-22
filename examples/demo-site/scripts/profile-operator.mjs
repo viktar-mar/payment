@@ -55,11 +55,11 @@ function operateTab() {
       const phase=await post('state',current.signal);
       if(activeRead!==current)return;
       lock();
-      if(phase==='initial'||phase==='method'){
+      if(phase==='initial'||phase==='method'||phase==='challenge'){
         document.getElementById(phase).disabled=false;
-        status.textContent=phase==='initial'?'Ready for Pay':'Ready to confirm the replacement method';
+        status.textContent=phase==='challenge'?'The issuer challenge is ready':phase==='initial'?'Ready for Pay':'Ready to confirm the replacement method';
       }else if(phase==='done'){
-        cancelRead();finished=true;token='';status.textContent='Both clicks received. The runner verifies the result.';return;
+        cancelRead();finished=true;token='';status.textContent=document.getElementById('challenge')?'Challenge click received. The runner verifies the result.':'Both clicks received. The runner verifies the result.';return;
       }else if(phase==='waiting')status.textContent='Waiting for the test form';
       else throw Error();
       clearTimeout(readTimer);
@@ -86,19 +86,21 @@ const script='('+operateTab.toString()+')();';
 const hash=createHash('sha256').update(script).digest('base64');
 const denied=()=>new Error('Profile checkout closed');
 
-export async function openProfileOperator({rehearsal,onAbandon,handoffPath}) {
-  if(typeof rehearsal!=='boolean')throw denied();
+export async function openProfileOperator({rehearsal,onAbandon,handoffPath,mode='recovery'}) {
+  const challenge=mode==='challenge';
+  if(!['recovery','challenge'].includes(mode)||typeof rehearsal!=='boolean')throw denied();
   if(handoffPath!==undefined){
     if(rehearsal || typeof handoffPath!=='string' || !handoffPath)throw denied();
     await mkdir(dirname(handoffPath),{recursive:true,mode:0o700});
     if(lstatSync(handoffPath,{throwIfNoEntry:false}))throw denied();
   }
-  const title=rehearsal?'Checkout rehearsal':'Stripe Sandbox recovery';
+  const title=challenge?'Stripe test issuer challenge':rehearsal?'Checkout rehearsal':'Stripe Sandbox recovery';
   const description=rehearsal?'Local simulation. No charge.':'Test subscription: initial payment €20, then recovery of the original €20 debt.';
+  const controls=challenge?'Confirm the test issuer challenge for this subscription. Keep this tab open.</p><button id="challenge" disabled>Complete issuer challenge</button>':
+    description+' Keep this tab open for both actions.</p><button id="initial" disabled>Pay</button> <button id="method" disabled>Confirm test method</button>';
   const html='<!doctype html><html lang="en"><meta charset="utf-8"><title>'+title+'</title>'+
-    '<main><h1>'+title+'</h1><p>'+description+' Keep this tab open for both actions.</p><button id="initial" disabled>Pay</button> '+
-    '<button id="method" disabled>Confirm test method</button><p role="status" id="status">Connecting</p></main><script>'+script+'</script></html>';
-  let claim=randomBytes(32).toString('hex'), session='',phase='waiting',next='initial',pending,closing;
+    '<main><h1>'+title+'</h1><p>'+controls+'<p role="status" id="status">Connecting</p></main><script>'+script+'</script></html>';
+  let claim=randomBytes(32).toString('hex'), session='',phase='waiting',next=challenge?'challenge':'initial',pending,closing;
   let origin;
   const server=createServer({maxHeaderSize:4096,requestTimeout:5000,headersTimeout:5000},(req,res)=>{
     res.setHeader('Cache-Control','no-store');
@@ -138,7 +140,7 @@ export async function openProfileOperator({rehearsal,onAbandon,handoffPath}) {
   return {
     url,
     async wait(action,{deadline,signal}) {
-      if(closing||!['initial','method'].includes(action)||next!==action||pending||signal.aborted||
+      if(closing||!(challenge?['challenge']:['initial','method']).includes(action)||next!==action||pending||signal.aborted||
           !Number.isSafeInteger(deadline)||deadline<=Date.now())throw denied();
       deadline=Math.min(deadline,Date.now()+180000);
       phase=action;
@@ -151,7 +153,7 @@ export async function openProfileOperator({rehearsal,onAbandon,handoffPath}) {
         }
         pending={deadline,signal,finish};
         signal.addEventListener('abort',fail,{once:true});
-        if(action==='initial' && handoffPath){
+        if(action===(challenge?'challenge':'initial') && handoffPath){
           try{publishArmedHandoff(handoffPath,url,deadline,signal);}
           catch{claim='';fail();}
         }

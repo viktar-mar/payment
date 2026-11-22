@@ -55,7 +55,22 @@ function callbackGraph(scope,row){
  graph.periodStart=Number(row.period_start);graph.periodEnd=Number(row.period_end);need(Number.isSafeInteger(graph.periodStart)&&graph.periodStart>0&&Number.isSafeInteger(graph.periodEnd)&&graph.periodEnd>graph.periodStart);
  return Object.freeze({graph:Object.freeze(graph),cashVerified:true,journalVerified:true,signedCallbacksVerified:true});
 }
-export async function proveBillingEvidence({configuration,bootstrap,fixture},limits,dependencies={}) {
+export async function proveBillingEvidence(inputs,limits,dependencies={}) {
+ need(inputs.configuration.selectedCase!=='initial_3ds');
+ return readInitialEvidence(inputs,limits,dependencies,false);
+}
+
+export async function proveBillingInitial3dsEvidence(inputs,limits,dependencies={}) {
+ billingCheck(limits);
+ need(inputs.configuration.selectedCase==='initial_3ds');
+ const baseline=await readInitialEvidence(inputs,limits,dependencies,true);
+ billingCheck(limits);
+ need(await inputs.cli.observeOwnedBillingInitial3ds(baseline.graph,limits)===true);
+ billingCheck(limits);
+ return true;
+}
+
+async function readInitialEvidence({configuration,bootstrap,fixture},limits,dependencies,challengeRequired) {
  const scope=fixture.resources();need(scope.runId===configuration.runId&&scope.expectedSource===configuration.expectedSource);
  for(const k of ['accountId','siteId','customerId','subscriptionId','operationId','attemptId','productId','priceId'])need(billingUuid(scope[k]));
  need(/^[0-9a-f]{64}$/.test(scope.createKeyHash)&&/^[0-9a-f]{64}$/.test(scope.confirmKeyHash));
@@ -70,7 +85,7 @@ export async function proveBillingEvidence({configuration,bootstrap,fixture},lim
    const abort=()=>{void sql.end({timeout:0}).catch(()=>{});};limits.signal?.addEventListener('abort',abort,{once:true});
    try{result=await billingBounded(limits,async l=>{
     for(;;){
-     const rows=await sql.begin('read only',async tx=>{await tx.unsafe("set local statement_timeout='5000'");return tx.unsafe(query,[scope.accountId,scope.siteId,scope.customerId,scope.subscriptionId,scope.operationId,scope.attemptId,scope.productId,scope.priceId,scope.createKeyHash,scope.confirmKeyHash,scope.endpoints.demo]);});
+     const rows=await sql.begin('read only',async tx=>{await tx.unsafe("set local statement_timeout='5000'");return tx.unsafe(query,[scope.accountId,scope.siteId,scope.customerId,scope.subscriptionId,scope.operationId,scope.attemptId,scope.productId,scope.priceId,scope.createKeyHash,scope.confirmKeyHash,scope.endpoints.demo,challengeRequired]);});
      billingCheck(l);need(rows.length<=1);
      if(rows.length===1){const row=rows[0];
       // Cash/journal mismatches are terminal; pending transport is allowed only GET/SQL observation.

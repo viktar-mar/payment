@@ -50,8 +50,20 @@ public class StripeBillingConfirmationAdapter implements SubscriptionConfirmatio
   var proof=ownership.acknowledgedPayment(lookup);require(ownership.confirmationActionAvailable(proof,root.id()));verification.verify(proof.account());
   try{
    var pi=clients.create(credentials.resolve(lookup.account())).v1().paymentIntents().confirm(root.binding().intentReference(),PaymentIntentConfirmParams.builder().setConfirmationToken(token).setUseStripeSdk(true).build(),RequestOptions.builder().setIdempotencyKey(attempt.providerKey()).setMaxNetworkRetries(0).build());
-   if(!root.binding().intentReference().equals(pi.getId())||!root.binding().customerReference().equals(pi.getCustomer())||!Boolean.FALSE.equals(pi.getLivemode()))return unknown();
-   return new Outcome("requires_action".equals(pi.getStatus())?SubscriptionConfirmationAttempt.State.REQUIRES_ACTION:SubscriptionConfirmationAttempt.State.OBSERVE,null);
+   if(pi==null||!root.binding().intentReference().equals(pi.getId())||!root.binding().customerReference().equals(pi.getCustomer())||!Boolean.FALSE.equals(pi.getLivemode()))return unknown();
+   if("requires_action".equals(pi.getStatus())){
+    var action=pi.getNextAction();
+    if(proof instanceof StripeBillingOwnership.OriginalCreate){
+     var price=proof.price().terms().regularAmount();
+     if(!Objects.equals(pi.getAmount(),price.minorUnits())||!price.currency().equalsIgnoreCase(pi.getCurrency()))return unknown();
+    }
+    if(!"payment_intent".equals(pi.getObject())||!Objects.equals(pi.getAmountReceived(),0L)
+      ||!"automatic".equals(pi.getCaptureMethod())||!"automatic".equals(pi.getConfirmationMethod())
+      ||!List.of("card").equals(pi.getPaymentMethodTypes())||action==null||!"use_stripe_sdk".equals(action.getType())
+      ||action.getUseStripeSdk()==null||action.getUseStripeSdk().isEmpty())return unknown();
+    return new Outcome(SubscriptionConfirmationAttempt.State.REQUIRES_ACTION,null);
+   }
+   return new Outcome(SubscriptionConfirmationAttempt.State.OBSERVE,null);
   }catch(CardException original){
    var receipt=receipt(original,root.binding().intentReference());if(receipt==null)return unknown();
    try{var fresh=inspect(lookup,root,receipt);var embedded=original.getStripeError().getPaymentIntent();

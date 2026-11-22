@@ -22,6 +22,27 @@ class StripeBillingConfirmationAdapterTest {
  String error(){var g=fixture.fixture.graph;var last=com.google.gson.JsonParser.parseString("{\"type\":\"card_error\",\"code\":\"card_declined\",\"decline_code\":\"generic_decline\",\"charge\":\"ch_owned\"}").getAsJsonObject();g.intent.add("last_payment_error",last.deepCopy());var outer=last.deepCopy();outer.add("payment_intent",g.intent.deepCopy());var body=new com.google.gson.JsonObject();body.add("error",outer);return body.toString();}
  void eligibleGraph(boolean proof){fixture.graph();var g=fixture.fixture.graph;g.http.respond("GET","/v1/payment_intents/pi_owned",g.intent.toString());if(proof)g.http.respond("GET","/v1/charges/ch_owned",g.charge.toString());}
  void originalDecline(String error){fixture.fixture.identity();fixture.fixture.graph.http.respondError("POST","/v1/payment_intents/pi_owned/confirm",402,error,Map.of("Request-Id","req_original"));}
+ @ParameterizedTest @ValueSource(strings={"sdk","redirect","absent","empty-sdk","already-received","manual","non-card","wrong-amount","wrong-currency"})
+ void nextActionRequiresAnUnpaidCardIntentWithAnSdkChallenge(String shape){
+  fixture.fixture.identity();
+  var http=fixture.fixture.graph.http;
+  var pi=fixture.fixture.graph.intent.deepCopy();
+  pi.addProperty("status","requires_action");
+  pi.addProperty("confirmation_method",shape.equals("manual")?"manual":"automatic");
+  pi.addProperty("amount_received",shape.equals("already-received")?2000:0);
+  if(shape.equals("wrong-amount"))pi.addProperty("amount",500);
+  if(shape.equals("wrong-currency"))pi.addProperty("currency","usd");
+  var action=com.google.gson.JsonParser.parseString("{\"type\":\"use_stripe_sdk\",\"use_stripe_sdk\":{\"type\":\"stripe_3ds2_fingerprint\"}}").getAsJsonObject();
+  if(shape.equals("redirect"))action.addProperty("type","redirect_to_url");
+  if(shape.equals("empty-sdk"))action.add("use_stripe_sdk",new com.google.gson.JsonObject());
+  if(!shape.equals("absent"))pi.add("next_action",action);
+  if(shape.equals("non-card"))pi.add("payment_method_types",com.google.gson.JsonParser.parseString("[\"sepa_debit\"]"));
+  http.respond("POST","/v1/payment_intents/pi_owned/confirm",pi.toString());
+  var result=adapter.confirm(fixture.fixture.lookup(),root,claimed(null),"ctoken_original");
+  assertThat(result.state()).isEqualTo(shape.equals("sdk")?SubscriptionConfirmationAttempt.State.REQUIRES_ACTION:SubscriptionConfirmationAttempt.State.UNKNOWN);
+  assertThat(result.receipt()).isNull();
+  assertThat(http.requestCount("POST","/v1/payment_intents/pi_owned/confirm")).isEqualTo(1);
+ }
  @Test void original402ProofMakesSameIntentSuccessorUsableWithOnePostPerAttempt(){
   failedGraph();String error=error();var first=claimed(null);originalDecline(error);eligibleGraph(true);
   var declined=adapter.confirm(fixture.fixture.lookup(),root,first,"ctoken_original");assertThat(declined.state()).isEqualTo(SubscriptionConfirmationAttempt.State.DECLINED);assertThat(declined.receipt().charge()).isEqualTo("ch_owned");

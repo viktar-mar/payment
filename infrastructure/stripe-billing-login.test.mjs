@@ -15,7 +15,8 @@ test('protected login requires callback and captured child close and emits only 
  assert.equal(await api.completeBillingLogin(cli,{runId},{deadline:Date.now()+1000},{execFile,output:text=>{assert.match(text,/^Authorize the isolated Sandbox CLI/);assert.ok(!text.includes('next_step'));events.push('output');}}),true);assert.equal(calls,2);assert.deepEqual(events,['closed','output','closed']);
 });
 
-test('failed login producer validates the fixed device URI and pairing code before stdout fanout',async()=>{
+for(const selectedCase of ['initial_failed_renewal_grace_recovery','initial_decline_retry','initial_3ds']){
+test(selectedCase+' login validates the fixed device URI and pairing code before output',async()=>{
  const device='https://access.stripe.com/stripecli/oauth2/device',opaque='T'.repeat(43);
  for(const [uri,code,allowed] of [[device,'ABCD-EFGH',true],[device+'?x='+opaque,'ABCD-EFGH',false],[device,opaque,false],
   [device.replace('access.','dashboard.'),'ABCD-EFGH',false],[device,'abcd-efgh',false],[device+'?','ABCD-EFGH',false],
@@ -26,13 +27,14 @@ test('failed login producer validates the fixed device URI and pairing code befo
   const execFile=(_file,_args,_options,cb)=>{const child=new EventEmitter(),first=++calls===1;
    queueMicrotask(()=>{cb(null,first?JSON.stringify({browser_url:uri,verification_code:code,next_step:'stripe login --complete-device'}):'','');child.emit('close',0,null);});
    return child;};
-  const result=api.completeBillingLogin(cli,{runId,selectedCase:'initial_failed_renewal_grace_recovery'},
+  const result=api.completeBillingLogin(cli,{runId,selectedCase},
    {deadline:Date.now()+1000},{execFile,output:text=>output.push(text)});
   if(allowed)assert.equal(await result,true);else await assert.rejects(result);
   assert.deepEqual(output,allowed?['Authorize the isolated Sandbox CLI at '+device+' using code ABCD-EFGH. Keep this terminal open.\n']:[]);
   assert.equal(calls,allowed?2:1);
  }
 });
+}
 
 test('cancellation login starts completion only after producing a handoff its reporter displays',async()=>{
  const device='https://access.stripe.com/stripecli/oauth2/device';

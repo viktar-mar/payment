@@ -1,11 +1,18 @@
 import type {Browser,Route,Request,Response,BrowserContext,Page,Locator,Frame,JSHandle} from '@playwright/test';
-import type {BillingPort,BillingBinding,BillingLimits,BillingCancellationPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
+import type {BillingPort,BillingBinding,BillingLimits,BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
+import type {GenericSubscriptionManager} from '@generic-payments/sdk';
 import type {ManagerState} from '../../../../frontend/sdk/src/subscriptions/manager-state';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
 // @ts-ignore Native Node and bundlers use the same shared provider origin policy.
 import {providerOrigin,providerNetworkOrigin} from './stripe-provider-origin.ts';
 // @ts-ignore Node's offline test entry consumes source.
 import {enterPrivateText} from './private-entry.ts';
+// @ts-ignore Explicit source for the offline Node tests.
+import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
+// @ts-ignore Explicit source for the offline Node tests.
+import {initial3dsChallenge,type WaitForIssuerGesture} from './stripe-billing-initial-3ds.ts';
+// @ts-ignore Explicit source for the offline Node tests.
+import {pinnedRetryPresentation} from './stripe-billing-pinned-presentation.ts';
 const fail=():never=>{throw new Error('billing_BROWSER');};
 const need=(v:unknown):void=>{if(!v)fail();};
 const uuid=(v:unknown):v is string=>typeof v==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(v);
@@ -14,7 +21,7 @@ const exact=(v:unknown,keys:string[]):v is Record<string,unknown>=>object(v)&&Ob
 const duration=(l:BillingLimits)=>{billingCheck(l);return Math.min(45000,l.deadline-Date.now());};
 async function body(response:Response,l:BillingLimits):Promise<Record<string,unknown>>{const bytes=await billingBounded(l,()=>response.body());need(bytes.length<=65536);const v:unknown=JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(bytes));need(object(v));return v as Record<string,unknown>;}
 /** Observes and persists the SDK's own key. Never changes body/headers, fetches, replays or fulfills a financial request. */
-export async function forwardBillingDispatch(route:Pick<Route,'request'|'continue'>,port:Pick<BillingPort,'beforeDispatch'>,binding:BillingBinding,authority:string,kind:'create'|'confirm',identity:Record<string,string>|undefined,limits:BillingLimits,confirmation?:{token:string;check:()=>void}):Promise<void>{
+export async function forwardBillingDispatch(route:Pick<Route,'request'|'continue'>,port:Pick<BillingPort,'beforeDispatch'>,binding:BillingBinding,authority:string,kind:'create'|'confirm',identity:Record<string,string>|undefined,limits:BillingLimits,confirmation?:{token:string;check:()=>void},check?:()=>void|Promise<void>,authorizeResponse?:(request:Request)=>Promise<void>):Promise<void>{
  try{billingCheck(limits);const request=route.request(),base=binding.endpoints.backend+'/api/v1/customer/subscriptions';
   const expected=kind==='create'?base:base+'/'+identity?.subscriptionId+'/operations/'+identity?.operationId+'/confirmation-attempts/'+identity?.attemptId+'/confirm';
   need(request.url()===expected&&request.method()==='POST'&&!request.redirectedFrom());const headers=await request.allHeaders(),value:unknown=JSON.parse(request.postData()??'');
@@ -22,8 +29,9 @@ export async function forwardBillingDispatch(route:Pick<Route,'request'|'continu
   if(kind==='create')need(exact(value,['price_id','recurring_consent'])&&value.price_id===binding.priceId&&value.recurring_consent===true);
   else need(exact(value,['capability','confirmation_token'])&&typeof value.capability==='string'&&/^bca2_[A-Za-z0-9_-]{43}$/.test(value.capability)&&typeof value.confirmation_token==='string'&&/^ctoken_[A-Za-z0-9]{1,200}$/.test(value.confirmation_token)&&(!confirmation||value.confirmation_token===confirmation.token));
   confirmation?.check();
-  await port.beforeDispatch(kind,headers['idempotency-key']!,identity);
-  billingCheck(limits);confirmation?.check();await route.continue();billingCheck(limits);
+  await check?.();need(await port.beforeDispatch(kind,headers['idempotency-key']!,identity)===true);
+  if(authorizeResponse)await authorizeResponse(request);
+  billingCheck(limits);await check?.();confirmation?.check();await route.continue();billingCheck(limits);
  }catch{fail();}
 }
 const stripeScriptOrigin = (url:URL) => providerOrigin(url) && (url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com'));
@@ -141,11 +149,20 @@ export function runInitialBillingBrowser(browser:Browser,port:BillingPort,limits
 export function runBillingCancellationBrowser(browser:Browser,port:BillingCancellationPort,limits:BillingLimits):Promise<true>{
  return runBillingBrowser(browser,port,limits,port);
 }
-async function runBillingBrowser(browser:Browser,port:BillingPort,limits:BillingLimits,cancellationPort?:BillingCancellationPort):Promise<true>{
+export function runBillingDeclineRetryBrowser(browser:Browser,port:BillingDeclineRetryPort,limits:BillingLimits,matchesStaticOrigin?:(origin:string)=>boolean):Promise<true>{
+ return runBillingBrowser(browser,port,limits,undefined,port,matchesStaticOrigin);
+}
+export function runBillingInitial3dsBrowser(browser:Browser,port:BillingInitial3dsPort,limits:BillingLimits,waitForGesture:WaitForIssuerGesture,matchesStaticOrigin?:(origin:string)=>boolean):Promise<true>{
+ return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,{port,waitForGesture});
+}
+async function runBillingBrowser(browser:Browser,port:BillingPort,limits:BillingLimits,cancellationPort?:BillingCancellationPort,retryPort?:BillingDeclineRetryPort,matchesStaticOrigin?:(origin:string)=>boolean,challenge?:{port:BillingInitial3dsPort;waitForGesture:WaitForIssuerGesture}):Promise<true>{
+ const bound=!!(retryPort||challenge),guarded=!!(cancellationPort||bound);
+ const lifecycle=new AbortController();
+ limits={deadline:limits.deadline,signal:limits.signal?AbortSignal.any([limits.signal,lifecycle.signal]):lifecycle.signal};
  let context:BrowserContext|undefined,abandoned=false,closing:Promise<void>|undefined,failure=false;
  const close=(ctx:BrowserContext)=>{closing??=ctx.close();void closing.catch(()=>{});return closing;};
  const opening=browser.newContext({serviceWorkers:'block',acceptDownloads:false});void opening.then(c=>{if(abandoned)return close(c);},()=>{}).catch(()=>{});
- const abort=()=>{abandoned=true;if(context)void close(context);};limits.signal?.addEventListener('abort',abort,{once:true});
+ const abort=()=>{abandoned=true;lifecycle.abort();if(context)void close(context);};limits.signal?.addEventListener('abort',abort,{once:true});
  const pending=new Set<Promise<void>>();
  try{
   context=await billingBounded(limits,()=>opening);const page=await billingBounded(limits,()=>context!.newPage()),binding=port.resources();
@@ -154,8 +171,64 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   let acknowledgeCreate!:()=>void;const created=new Promise<void>(r=>acknowledgeCreate=r);
   let cancellation:ReturnType<typeof cancellationJourney>|undefined, challengeId:string|undefined;
   let payInFlight=false, trustedPayClick:JSHandle<()=>boolean>|undefined, tokenRequest:Request|undefined, publishableKey:string|undefined;
+  const requests=new Map<string,Request>(),keys=new Set<string>();
+  let sessionExpiry=0;
+  let firstAttempt='',firstSecret='',capability='',firstToken='',successorId='';
+  let trustedRetry:JSHandle<()=>boolean>|undefined,trustedCreate:JSHandle<()=>boolean>|undefined;
+  const successorAck=Promise.withResolvers<void>();
+  let originalManager:JSHandle<()=>boolean>|undefined;
+  async function checkManager(){
+   check();
+   if(challenge && firstAttempt)need(sessionExpiry>Date.now());
+   if(bound)need(originalManager && await originalManager.evaluate(current=>current()));
+   check();
+  }
+  function claim(kind:string,request:Request){
+   need(!requests.has(kind));requests.set(kind,request);
+  }
+  function paired(kind:string,response:Response){
+   if(bound)need(response.request()===requests.get(kind) && !response.fromServiceWorker() && !response.request().redirectedFrom());
+  }
+  function trustedClick(button:Locator){
+   return button.evaluateHandle(element=>{
+    let clicked=false;
+    element.addEventListener('click',event=>{clicked=event.isTrusted;},{once:true,capture:true});
+    return ()=>clicked;
+   });
+  }
+  function sessionContext(value:Record<string,unknown>,successor:boolean){
+   need(exact(value,['protocol','provider','flow','publishable_key','client_secret','attempt_id','capability','expires_at']) &&
+    value.protocol==='SERVER_CONFIRM_V2' && value.provider==='stripe' && value.flow==='PAYMENT' &&
+    typeof value.expires_at==='string' && Date.parse(value.expires_at)>Date.now() &&
+    typeof value.publishable_key==='string' && /^pk_test_[A-Za-z0-9_]+$/.test(value.publishable_key) &&
+    typeof value.capability==='string' && /^bca2_[A-Za-z0-9_-]{43}$/.test(value.capability) &&
+    typeof value.client_secret==='string' && /^pi_[A-Za-z0-9]+_secret_[A-Za-z0-9]+$/.test(value.client_secret));
+   if(successor)need(value.attempt_id===successorId && value.client_secret===firstSecret && value.capability!==capability && value.publishable_key===publishableKey);
+   else {firstAttempt=attemptId;sessionExpiry=Date.parse(value.expires_at as string);firstSecret=value.client_secret as string;publishableKey=value.publishable_key as string;}
+   capability=value.capability as string;
+  }
+  let checkoutUrl='';
+  const pinned=bound&&matchesStaticOrigin?pinnedRetryPresentation(page,()=>checkoutUrl,limits,()=>{
+   if(firstAttempt && !successorId && confirmPosts===0)return 'initial';
+   if(successorId && attemptId===successorId && confirmPosts===1)return 'successor';
+   return undefined;
+  },()=>!payInFlight && confirmPosts===0):undefined;
+  const winning=Promise.withResolvers<void>();
+  const redirects=challenge?await guardChallengeRedirects(page,()=>{failure=true;abort();},binding.endpoints):undefined;
+  const sca=challenge?initial3dsChallenge({page,limits,demo:binding.endpoints.demo,owner:()=>({secret:firstSecret,key:publishableKey??''}),
+   stripeFrames:req=>stripeFrames(page,req,false,false,binding.endpoints.demo),authorizeResponse:req=>redirects!.authorize(req),check:checkManager,waitForGesture:challenge.waitForGesture,
+   winning:async()=>{
+    const original=requests.get('original-confirm'),response=original?.existingResponse();
+    need(response && response.request()===original && response.status()===200 && !response.fromServiceWorker());
+    await billingBounded(limits,()=>winning.promise);
+   },
+  }):undefined;
   async function providerTraffic(route:Route,url:URL) {
    const request=route.request(),method=request.method(),navigation=request.isNavigationRequest();
+   if(sca?.owns(url)){await sca.forward(route,url);return;}
+   if(pinned && !providerNetworkOrigin(url) && !/(?:^|\.)stripe\.(?:com|network)$/.test(url.hostname) && matchesStaticOrigin!(url.origin)){
+    await pinned.forward(route,url);return;
+   }
    need(providerNetworkOrigin(url) && !request.redirectedFrom() && ['GET','POST','OPTIONS'].includes(method));
    const script=stripeScriptOrigin(url),api=url.hostname==='api.stripe.com';
    const support=url.hostname==='r.stripe.com'||url.hostname==='merchant-ui-api.stripe.com';
@@ -163,12 +236,17 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    const tokenPath=api && url.pathname==='/v1/confirmation_tokens';
    const original=stripeFrames(page,request,navigation,script && method==='GET',binding.endpoints.demo);
    need(original && (!navigation || script && method==='GET'));
-   if(tokenPath)need(payInFlight && trustedPayClick && await trustedPayClick.evaluate(clicked=>clicked()));
+   const click=trustedPayClick,interceptedAttempt=attemptId;
+   const samePay=()=>need(payInFlight && click && click===trustedPayClick && attemptId===interceptedAttempt);
+   if(tokenPath){samePay();need(await click!.evaluate(clicked=>clicked()));}
    const headers=await request.allHeaders();
    check();
-   const current=stripeFrames(page,request,navigation,script && method==='GET',binding.endpoints.demo);
-   need(current && original && current.target===original.target && current.frames.size===original.frames.size &&
-    [...original.frames].every(([frame,href])=>current.frames.get(frame)===href));
+   const sameFrames=()=>{
+    const current=stripeFrames(page,request,navigation,script && method==='GET',binding.endpoints.demo);
+    need(current && original && current.target===original.target && current.frames.size===original.frames.size &&
+     [...original.frames].every(([frame,href])=>current.frames.get(frame)===href));
+   };
+   sameFrames();
    need(!headers.cookie && !headers['proxy-authorization'] &&
     (!headers.authorization || api && !preflight && publishableKey && headers.authorization==='Bearer '+publishableKey));
    const intended=preflight?headers['access-control-request-method']:method;
@@ -181,42 +259,84 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     need(!navigation && !/^\/(?:v\d+|api)(?:\/|$)/i.test(url.pathname) && !url.pathname.includes('%'));
    }else if(api && !navigation && !cancellation && selectPosts===1){
     if(tokenPath){
-     need(payInFlight && !tokenRequest && intended==='POST' && !url.search);
+     samePay();need(!tokenRequest && intended==='POST' && !url.search);
+     await checkManager();samePay();need(!tokenRequest);
      if(!preflight)tokenRequest=request;
     }else need(url.pathname==='/v1/elements/sessions');
    }else fail();
+   if(redirects){
+    await redirects.authorize(request);check();sameFrames();
+    if(tokenPath){await checkManager();samePay();sameFrames();}
+   }
    await route.fallback();
   }
   const check=()=>{billingCheck(limits);if(failure||abandoned)fail();};
   const invalidate=()=>{failure=true;abort();};
-  if(cancellationPort){
+  if(guarded){
+   if(sca)context.on('request',request=>{if(request.redirectedFrom())invalidate();});
    context.on('page',invalidate);
    await context.routeWebSocket('**/*',socket=>{try{socket.close();}finally{invalidate();}});
   }
-  await context.route(cancellationPort?'**/*':binding.endpoints.backend+'/**',route=>{
+  await context.route(guarded?'**/*':binding.endpoints.backend+'/**',route=>{
    const work=(async()=>{try{
     billingCheck(limits);if(failure)fail();const req=route.request(),url=req.url(),method=req.method();
-    if(cancellationPort){
+    if(guarded){
      const target=new URL(url);
-     if(target.origin===binding.endpoints.demo){need(method==='GET' && !req.redirectedFrom());await route.fallback();return;}
+     if(target.origin===binding.endpoints.demo){
+      need(method==='GET' && !req.redirectedFrom());
+      if(redirects){await redirects.authorize(req);check();}
+      await route.fallback();return;
+     }
      if(target.origin!==binding.endpoints.backend){await providerTraffic(route,target);return;}
      if(cancellation && !['GET','OPTIONS'].includes(method)){await cancellation.forward(route);return;}
     }
-    if(method==='OPTIONS'){await route.continue();return;}
-    if(method==='GET'){await route.continue();return;}
+    if(bound)need(req.frame()===page.mainFrame() && !req.isNavigationRequest() && !req.redirectedFrom());
+    async function continueBackend(){
+     if(redirects){
+      await redirects.authorize(req);check();
+      need(req.frame()===page.mainFrame() && !req.isNavigationRequest() && !req.redirectedFrom());
+      if(originalManager)await checkManager();
+     }
+     await route.continue();
+    }
+    if(method==='OPTIONS' || method==='GET'){await continueBackend();return;}
     if(method!=='POST')fail();
-    if(cancellationPort)need(req.frame()===page.mainFrame() && !req.isNavigationRequest() && !req.redirectedFrom());
-    if(url===otp){need(++challengePosts===1);const v:unknown=JSON.parse(req.postData()??'');need(exact(v,['site_key','email','intent'])&&v.site_key===binding.siteKey&&v.email===binding.email&&v.intent==='AUTHENTICATE');await route.continue();return;}
-    if(url.startsWith(otp+'/')&&url.endsWith('/verify')){need(++verifyPosts===1 && (!cancellationPort || challengeId && url===otp+'/'+challengeId+'/verify'));await route.continue();return;}
-    if(url===base){need(++createPosts===1);await forwardBillingDispatch(route,port,binding,authority,'create',undefined,limits);return;}
-    if(cancellationPort && !subscriptionId)need(createPosts===1 && url.startsWith(base+'/') && url.endsWith('/confirmation-session'));
+    if(guarded)need(req.frame()===page.mainFrame() && !req.isNavigationRequest() && !req.redirectedFrom());
+    if(url===otp){need(++challengePosts===1);if(bound)claim('challenge',req);const v:unknown=JSON.parse(req.postData()??'');need(exact(v,['site_key','email','intent'])&&v.site_key===binding.siteKey&&v.email===binding.email&&v.intent==='AUTHENTICATE');await continueBackend();return;}
+    if(url.startsWith(otp+'/')&&url.endsWith('/verify')){need(++verifyPosts===1 && (!guarded || challengeId && url===otp+'/'+challengeId+'/verify'));if(bound)claim('verify',req);await continueBackend();return;}
+    if(bound){
+     const h=await req.allHeaders(),key=h['idempotency-key'];
+     need(uuid(key)&&!keys.has(key)&&h.authorization===authority&&h.origin===binding.endpoints.demo&&
+      h['content-type']==='application/json'&&!h.cookie&&!h['proxy-authorization']);
+     keys.add(key!);await checkManager();
+    }
+    if(url===base){
+     need(++createPosts===1);
+     if(bound){claim('create',req);need(trustedCreate && await trustedCreate.evaluate(clicked=>clicked()));}
+     await forwardBillingDispatch(route,port,binding,authority,'create',undefined,limits,undefined,checkManager,redirects?.authorize);return;
+    }
+    if(guarded && !subscriptionId)need(createPosts===1 && url.startsWith(base+'/') && url.endsWith('/confirmation-session'));
     await billingBounded(limits,()=>created);const original=base+'/'+subscriptionId+'/operations/'+operationId;
     if(url===original+'/confirmation-session'){
-     need(++selectPosts===1);const v:unknown=JSON.parse(req.postData()??''),h=await req.allHeaders();need(exact(v,['action_token'])&&typeof v.action_token==='string'&&/^bga1_[A-Za-z0-9_-]{43}$/.test(v.action_token)&&h.authorization===authority&&h.origin===binding.endpoints.demo&&!h.cookie);await route.continue();return;
+     need(++selectPosts===1);if(bound)claim('initial-session',req);const v:unknown=JSON.parse(req.postData()??''),h=await req.allHeaders();need(exact(v,['action_token'])&&typeof v.action_token==='string'&&/^bga1_[A-Za-z0-9_-]{43}$/.test(v.action_token)&&h.authorization===authority&&h.origin===binding.endpoints.demo&&!h.cookie);await continueBackend();return;
     }
-    need(url===original+'/confirmation-attempts/'+attemptId+'/confirm'&&++confirmPosts===1);
+    const attempts=original+'/confirmation-attempts/';
+    if(retryPort && url===attempts+firstAttempt+'/retry'){
+     claim('retry',req);
+     need(trustedRetry && await trustedRetry.evaluate(clicked=>clicked()) && req.postData()==='{}');
+     check();need(await retryPort.beforeRetry((await req.allHeaders())['idempotency-key']!,{subscriptionId,operationId,attemptId:firstAttempt})===true);
+     await checkManager();await route.continue();return;
+    }
+    if(retryPort && url.endsWith('/client-session')){
+     need(requests.has('retry') && req.postData()==='{}');claim('successor-session',req);
+     await billingBounded(limits,()=>successorAck.promise);check();
+     need(url===attempts+successorId+'/client-session');await checkManager();await route.continue();return;
+    }
+    const successor=!!retryPort&&!!successorId;
+    need(url===attempts+attemptId+'/confirm'&&++confirmPosts===(successor?2:1));
+    if(bound)claim(successor?'successor-confirm':'original-confirm',req);
     let confirmation:{token:string;check:()=>void}|undefined;
-    if(cancellationPort){
+    if(guarded){
      // The SDK cannot legitimately confirm until its own token POST has received a response.
      // Response headers precede the SDK's confirm. Our read of its JSON body may still be pending.
      const tokenResponse=tokenRequest?.existingResponse();
@@ -225,59 +345,118 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
      const token=await body(tokenResponse,limits);
      check();
      if(token.object!=='confirmation_token' || token.livemode!==false || typeof token.id!=='string' || !/^ctoken_[A-Za-z0-9]{1,200}$/.test(token.id))return fail();
+     if(bound){
+      need(req.postData()===JSON.stringify({capability,confirmation_token:token.id}));
+      if(successor)need(token.id!==firstToken);else firstToken=token.id;
+     }
      confirmation={token:token.id,check};
     }
-    await forwardBillingDispatch(route,port,binding,authority,'confirm',{subscriptionId,operationId,attemptId},limits,confirmation);
+    const dispatch=successor?{beforeDispatch:(_kind:unknown,key:string)=>retryPort!.beforeSuccessorConfirm(key,{subscriptionId,operationId,attemptId})}:port;
+    await forwardBillingDispatch(route,dispatch,binding,authority,'confirm',{subscriptionId,operationId,attemptId},limits,confirmation,checkManager,redirects?.authorize);
    }catch{failure=true;abort();await route.abort('failed').catch(()=>{});}})();pending.add(work);void work.finally(()=>pending.delete(work));return work;
   });
   const url=new URL('/',binding.endpoints.demo);for(const [k,v] of Object.entries({api_base_url:binding.endpoints.backend,site_key:binding.siteKey,subscription_product_1_id:binding.productId,subscription_price_1_id:binding.priceId,locale:'en'}))url.searchParams.set(k,v);
-  await page.goto(url.href,{timeout:duration(limits)});
-  if(cancellationPort){
+  checkoutUrl=url.href;await page.goto(url.href,{timeout:duration(limits)});
+  if(guarded){
    need(new URL(page.url()).origin===binding.endpoints.demo);
    page.on('framenavigated',frame=>{if(frame===page.mainFrame())invalidate();});
   }
   const widget=page.locator('generic-email-otp').first();
   await enterPrivateText(widget.getByRole('textbox',{name:'Email',exact:true}),binding.email);
-  const challenge=page.waitForResponse(r=>r.url()===otp&&r.request().method()==='POST',{timeout:duration(limits)});void challenge.catch(()=>{});await widget.getByRole('button',{name:'Request code',exact:true}).click({timeout:duration(limits)});
-  const challengeResponse=await challenge;need(challengeResponse.status()===202);const challengeBody=await body(challengeResponse,limits);need(uuid(challengeBody.challenge_id));challengeId=challengeBody.challenge_id as string;
+  const otpChallenge=page.waitForResponse(r=>r.url()===otp&&r.request().method()==='POST',{timeout:duration(limits)});void otpChallenge.catch(()=>{});await widget.getByRole('button',{name:'Request code',exact:true}).click({timeout:duration(limits)});
+  const challengeResponse=await otpChallenge;paired('challenge',challengeResponse);need(challengeResponse.status()===202);const challengeBody=await body(challengeResponse,limits);need(uuid(challengeBody.challenge_id));challengeId=challengeBody.challenge_id as string;
   await port.withOtpCode(async code=>{await enterPrivateText(widget.getByRole('textbox',{name:'Six-digit code',exact:true}),code);return true as const;},limits);
   const verification=page.waitForResponse(r=>r.url()===otp+'/'+challengeBody.challenge_id+'/verify'&&r.request().method()==='POST',{timeout:duration(limits)});void verification.catch(()=>{});
   const baseline=page.waitForResponse(r=>r.url().startsWith(base+'?')&&r.request().method()==='GET',{timeout:duration(limits)});void baseline.catch(()=>{});
-  await widget.getByRole('button',{name:'Verify code',exact:true}).click({timeout:duration(limits)});const response=await verification;need(response.status()===200);const session=await body(response,limits),customer=session.customer;
+  await widget.getByRole('button',{name:'Verify code',exact:true}).click({timeout:duration(limits)});const response=await verification;paired('verify',response);need(response.status()===200);const session=await body(response,limits),customer=session.customer;
   need(object(customer)&&uuid(customer.id)&&customer.status==='ACTIVE'&&session.site_id===binding.siteId&&Array.isArray(session.scopes)&&session.scopes.includes('SUBSCRIPTION_READ')&&session.scopes.includes('SUBSCRIPTION_MANAGE')&&typeof session.session_token==='string'&&/^[A-Za-z0-9_-]{43}$/.test(session.session_token));
   authority='Bearer '+session.session_token;await port.acknowledgeCustomer({customerId:(customer as Record<string,string>).id!,siteId:binding.siteId});
   const before=await body(await baseline,limits);need(Array.isArray(before.items)&&before.items.length===0&&before.next_cursor===null);
   const manager=page.locator('generic-subscription-manager').first();await manager.getByRole('checkbox',{name:'I consent to recurring payments',exact:true}).check({timeout:duration(limits)});
+  if(bound){
+   originalManager=await manager.evaluateHandle((element,expected)=>{
+    const m=element as GenericSubscriptionManager,revision=m.state.authorityRevision,session=m.customerSession;
+    let retired=false;
+    window.addEventListener('pagehide',()=>{retired=true;},{once:true});
+    document.addEventListener('visibilitychange',()=>{if(document.hidden)retired=true;});
+    return ()=>!retired && !document.hidden && m.isConnected && m.getClientRects().length>0 &&
+     document.querySelector('generic-subscription-manager')===m && m.state.authorityRevision===revision &&
+     m.priceId===expected.priceId && m.productId===expected.productId && !!session && m.customerSession===session &&
+     session.customer.id===expected.customerId && session.siteId===expected.siteId && Date.parse(session.expiresAt)>Date.now();
+   },{priceId:binding.priceId,productId:binding.productId,siteId:binding.siteId,customerId:(customer as Record<string,string>).id!});
+   await checkManager();
+  }
   const createResponse=page.waitForResponse(r=>r.url()===base&&r.request().method()==='POST',{timeout:duration(limits)});void createResponse.catch(()=>{});
-  await manager.getByRole('button',{name:'Create subscription',exact:true}).click({timeout:duration(limits)});const receipt=await createResponse;need(receipt.status()===202);const original=await body(receipt,limits);need(uuid(original.subscription_id)&&uuid(original.operation_id)&&['PROCESSING','REQUIRES_ACTION','RESERVED'].includes(String(original.status)));
+  const createButton=manager.getByRole('button',{name:'Create subscription',exact:true});
+  if(bound)trustedCreate=await trustedClick(createButton);
+  await createButton.click({timeout:duration(limits)});const receipt=await createResponse;paired('create',receipt);need(receipt.status()===202);const original=await body(receipt,limits);need(uuid(original.subscription_id)&&uuid(original.operation_id)&&['PROCESSING','REQUIRES_ACTION','RESERVED'].includes(String(original.status)));
   subscriptionId=original.subscription_id as string;operationId=original.operation_id as string;await port.acknowledge('create',{subscriptionId,operationId});
   const selection=page.waitForResponse(r=>r.url()===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-session'&&r.request().method()==='POST',{timeout:duration(limits)});void selection.catch(()=>{});acknowledgeCreate();
-  const selected=await selection;need(selected.status()===200);const selectedBody=await body(selected,limits);need(selectedBody.protocol==='SERVER_CONFIRM_V2'&&selectedBody.provider==='stripe'&&selectedBody.flow==='PAYMENT'&&uuid(selectedBody.attempt_id));attemptId=selectedBody.attempt_id as string;
+  const selected=await selection;paired('initial-session',selected);need(selected.status()===200);const selectedBody=await body(selected,limits);need(selectedBody.protocol==='SERVER_CONFIRM_V2'&&selectedBody.provider==='stripe'&&selectedBody.flow==='PAYMENT'&&uuid(selectedBody.attempt_id));attemptId=selectedBody.attempt_id as string;
+  if(bound)sessionContext(selectedBody,false);
   if(cancellationPort && typeof selectedBody.publishable_key==='string' && /^pk_test_[A-Za-z0-9_]+$/.test(selectedBody.publishable_key))publishableKey=selectedBody.publishable_key;
-  const pay=manager.getByRole('button',{name:'Pay',exact:true});await pay.waitFor({state:'visible',timeout:duration(limits)});
-  // Enabled Pay is controlled by the driver's real Element ready event, not iframe insertion.
-  await page.waitForFunction(()=>{const m=document.querySelector('generic-subscription-manager');return [...m?.shadowRoot?.querySelectorAll('button')??[]].some(b=>b.textContent?.trim()==='Pay'&&!b.disabled&&!!b.getClientRects().length);},undefined,{timeout:duration(limits)});
-  const frame=manager.frameLocator('iframe[title="Secure payment input frame"]');await frame.locator('input[name="number"]').fill('4242424242424242',{timeout:duration(limits)});await frame.locator('input[name="expiry"]').fill('1230',{timeout:duration(limits)});await frame.locator('input[name="cvc"]').fill('123',{timeout:duration(limits)});
-  const postal=frame.locator('input[name="postalCode"]');if(await postal.isVisible())await postal.fill('10001',{timeout:duration(limits)});
-  const confirmed=page.waitForResponse(r=>r.url()===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-attempts/'+attemptId+'/confirm'&&r.request().method()==='POST',{timeout:duration(limits)});void confirmed.catch(()=>{});
-  if(cancellationPort)trustedPayClick=await pay.evaluateHandle(button=>{
-   let clicked=false;
-   button.addEventListener('click',event=>{clicked=event.isTrusted;},{once:true,capture:true});
-   return ()=>clicked;
-  });
-  payInFlight=true;await pay.click({timeout:duration(limits)});const confirmResponse=await confirmed;payInFlight=false;need(confirmResponse.status()===200);const confirmation=await body(confirmResponse,limits);need(confirmation.protocol==='SERVER_CONFIRM_V2'&&confirmation.attempt_id===attemptId&&confirmation.state==='OBSERVE'&&confirmation.next_action_allowed===false&&confirmation.retry_allowed===false&&confirmation.successor_attempt_id===null);
-  await port.acknowledge('confirm',{attemptId,state:'OBSERVE',nextActionAllowed:false});
+  async function payOnce(card:string){
+   const pay=manager.getByRole('button',{name:'Pay',exact:true});await pay.waitFor({state:'visible',timeout:duration(limits)});
+   // Enabled Pay is controlled by the driver's real Element ready event, not iframe insertion.
+   await page.waitForFunction(()=>{const m=document.querySelector('generic-subscription-manager');return [...m?.shadowRoot?.querySelectorAll('button')??[]].some(b=>b.textContent?.trim()==='Pay'&&!b.disabled&&!!b.getClientRects().length);},undefined,{timeout:duration(limits)});
+   const frame=manager.frameLocator('iframe[title="Secure payment input frame"]');await frame.locator('input[name="number"]').fill(card,{timeout:duration(limits)});await frame.locator('input[name="expiry"]').fill('1230',{timeout:duration(limits)});await frame.locator('input[name="cvc"]').fill('123',{timeout:duration(limits)});
+   const postal=frame.locator('input[name="postalCode"]');if(await postal.isVisible())await postal.fill('10001',{timeout:duration(limits)});
+   const confirmed=page.waitForResponse(r=>r.url()===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-attempts/'+attemptId+'/confirm'&&r.request().method()==='POST',{timeout:duration(limits)});void confirmed.catch(()=>{});
+   if(guarded)trustedPayClick=await trustedClick(pay);
+   await checkManager();
+   while(pinned?.pending)await pinned.wait();
+   check();tokenRequest=undefined;payInFlight=true;
+   await pay.click({timeout:duration(limits)});const confirmResponse=await confirmed;payInFlight=false;
+   paired(successorId?'successor-confirm':'original-confirm',confirmResponse);
+   need(confirmResponse.status()===200);const confirmation=await body(confirmResponse,limits);check();
+   need(confirmation.protocol==='SERVER_CONFIRM_V2' && confirmation.attempt_id===attemptId && confirmation.next_action_allowed===!!challenge && confirmation.successor_attempt_id===null);
+   return confirmation;
+  }
+  const confirmation=await payOnce(challenge?'4000002500003155':retryPort?'4000000000000002':'4242424242424242');
+  if(retryPort){
+   need(confirmation.state==='DECLINED' && confirmation.retry_allowed===true);
+   need(await retryPort.acknowledge('confirm',{attemptId,state:'DECLINED',nextActionAllowed:false,retryAllowed:true,successorAttemptId:null})===true);check();
+   const prefix=base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-attempts/';
+   const retryButton=manager.getByRole('button',{name:'Retry payment',exact:true});
+   await retryButton.waitFor({state:'visible',timeout:duration(limits)});
+   const retried=page.waitForResponse(r=>r.url()===prefix+firstAttempt+'/retry' && r.request().method()==='POST',{timeout:duration(limits)});
+   const nextSession=page.waitForResponse(r=>r.url()===prefix+successorId+'/client-session' && r.request().method()==='POST',{timeout:duration(limits)});
+   void retried.catch(()=>{});void nextSession.catch(()=>{});
+   trustedRetry=await trustedClick(retryButton);await checkManager();await retryButton.click({timeout:duration(limits)});
+   const reply=await retried;paired('retry',reply);need(reply.status()===200);
+   const retry=await body(reply,limits);check();
+   need(retry.protocol==='SERVER_CONFIRM_V2' && retry.attempt_id===firstAttempt && retry.state==='DECLINED' &&
+    retry.retry_allowed===false && uuid(retry.successor_attempt_id) && retry.successor_attempt_id!==firstAttempt);
+   successorId=retry.successor_attempt_id as string;
+   need(await retryPort.acknowledgeRetry({attemptId:firstAttempt,successorAttemptId:successorId})===true);check();successorAck.resolve();
+   const session=await nextSession;paired('successor-session',session);need(session.status()===200);
+   sessionContext(await body(session,limits),true);check();attemptId=successorId;
+   const observed=await payOnce('4242424242424242');
+   need(observed.state==='OBSERVE' && observed.retry_allowed===false);
+   need(await retryPort.acknowledgeSuccessor({attemptId,state:'OBSERVE',nextActionAllowed:false})===true);check();
+  }else if(challenge && sca){
+   need(confirmation.state==='REQUIRES_ACTION' && confirmation.retry_allowed===false);
+   const scope={subscriptionId,operationId,attemptId};
+   need(await port.acknowledge('confirm',{attemptId,state:'REQUIRES_ACTION',nextActionAllowed:true,retryAllowed:false,successorAttemptId:null})===true);
+   await checkManager();need(await challenge.port.beforeChallenge(scope)===true);
+   winning.resolve();
+   await sca.attend();await checkManager();need(await challenge.port.acknowledgeChallenge(scope)===true);
+  }else{
+   need(confirmation.state==='OBSERVE' && confirmation.retry_allowed===false);
+   await port.acknowledge('confirm',{attemptId,state:'OBSERVE',nextActionAllowed:false});
+  }
   for(;;){billingCheck(limits);if(failure)fail();const settled=await manager.evaluate((element:Element)=>{const state=(element as Element&{state?:{phase:string;subscription?:{subscriptionId:string;billingStatus:string;access:{allowed:boolean;reason:string}};operation?:{status:string}}}).state;return {phase:state?.phase,id:state?.subscription?.subscriptionId,status:state?.subscription?.billingStatus,allowed:state?.subscription?.access.allowed,reason:state?.subscription?.access.reason,operation:state?.operation?.status};});
    need(!['unknown','error','expired'].includes(settled.phase??''));if(settled.id===subscriptionId&&settled.status==='ACTIVE'&&settled.allowed&&settled.reason==='PAID')break;
    await manager.getByRole('button',{name:'Refresh status',exact:true}).click({timeout:duration(limits)});await billingBounded(limits,()=>new Promise(r=>setTimeout(r,250)),1000);
   }
-  need(!failure&&createPosts===1&&confirmPosts===1&&selectPosts===1&&challengePosts===1&&verifyPosts===1);
+  need(!failure&&createPosts===1&&confirmPosts===(retryPort?2:1)&&selectPosts===1&&challengePosts===1&&verifyPosts===1);
   if(cancellationPort){
    cancellation=cancellationJourney(page,manager,cancellationPort,binding,authority,(customer as Record<string,string>).id!,subscriptionId,operationId,limits,check);
    await cancellation.run();
    await billingBounded(limits,()=>Promise.all(pending));check();
   }
+  if(bound){await billingBounded(limits,()=>Promise.all(pending));await checkManager();}
   authority='';return true;
  }catch{return fail();}
- finally{abandoned=true;limits.signal?.removeEventListener('abort',abort);if(context)await billingBounded({deadline:Date.now()+15000},async()=>{await close(context!);await Promise.allSettled(pending);});if(cancellationPort && failure)fail();}
+ finally{abandoned=true;limits.signal?.removeEventListener('abort',abort);lifecycle.abort();if(context)await billingBounded({deadline:Date.now()+15000},async()=>{await close(context!);await Promise.allSettled(pending);});if(guarded && failure)fail();}
 }

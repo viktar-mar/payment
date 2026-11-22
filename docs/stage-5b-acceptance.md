@@ -104,6 +104,8 @@ Ordinary operational/security time stays UTC; original READY clock F is immutabl
 
 ## Capability and acceptance matrix
 
+The [initial decline and explicit retry case](testing/billing-initial-decline-retry.md) checks both confirmations against the same invoice and PaymentIntent. The [initial 3DS case](testing/billing-initial-3ds.md) requires one authenticated challenge on the original captured Charge. Both cases still need native receipts.
+
 The [period-end cancellation and withdrawal case](testing/billing-cancellation-withdrawal.md) has a dedicated entry for one new EUR 20 subscription. Native evidence for scheduling and withdrawing cancellation is pending.
 
 “Implemented” describes the current source and its supported subset. Synthetic HTTP/Stripe.js fixtures and PostgreSQL tests establish different boundaries; neither establishes a real provider outcome.
