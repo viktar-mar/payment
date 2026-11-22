@@ -1,6 +1,68 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFile} from 'node:fs/promises';
+import {access,mkdtemp,readFile,rm,symlink,unlink,writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {openProfileOperator} from '../../scripts/profile-operator.mjs';
+
+test('native handoff first opens on armed Pay and the same claimed tab handles the method',async()=>{
+  const directory=await mkdtemp(join(tmpdir(),'native-handoff-')),handoffPath=join(directory,'operator.html');
+  const operator=await openProfileOperator({rehearsal:false,handoffPath});
+  const limits={deadline:Date.now()+10000,signal:new AbortController().signal};
+  const url=new URL(operator.url);
+  const send=(path:string,key:string)=>fetch(url.origin+path,{method:'POST',headers:{Origin:url.origin,'X-Operator-Session':key}});
+  try{
+    await assert.rejects(access(handoffPath),{code:'ENOENT'});
+    const first=operator.wait('initial',limits);
+    void first.catch(()=>{});
+    const html=await readFile(handoffPath,'utf8');
+    assert.ok(html.includes(operator.url));
+    const claim=await send('/claim',url.hash.slice(1));
+    assert.equal(claim.status,200);
+    const token=await claim.text();
+    assert.equal(await (await send('/state',token)).text(),'initial');
+    assert.equal((await send('/initial',token)).status,204);
+    await first;
+    await unlink(handoffPath);
+    const second=operator.wait('method',limits);
+    void second.catch(()=>{});
+    assert.equal(await (await send('/state',token)).text(),'method');
+    await assert.rejects(access(handoffPath),{code:'ENOENT'});
+    assert.equal((await send('/method',token)).status,204);
+    await second;
+  }finally{await operator.close();await rm(directory,{recursive:true,force:true});}
+});
+
+test('a refused native handoff never overwrites a file or grants a late click',async()=>{
+  const directory=await mkdtemp(join(tmpdir(),'native-handoff-')),handoffPath=join(directory,'operator.html');
+  const operator=await openProfileOperator({rehearsal:false,handoffPath});
+  const limits={deadline:Date.now()+2000,signal:new AbortController().signal};
+  try{
+    await assert.rejects(operator.wait('initial',{...limits,signal:AbortSignal.abort()}));
+    await assert.rejects(operator.wait('initial',{...limits,deadline:Date.now()-1}));
+    await assert.rejects(access(handoffPath),{code:'ENOENT'});
+    await writeFile(handoffPath,'existing',{flag:'wx'});
+    await assert.rejects(operator.wait('initial',limits));
+    const url=new URL(operator.url);
+    const claim=await fetch(url.origin+'/claim',{method:'POST',headers:{Origin:url.origin,'X-Operator-Session':url.hash.slice(1)}});
+    assert.equal(claim.status,403);
+    assert.equal(await readFile(handoffPath,'utf8'),'existing');
+    await unlink(handoffPath);
+    await assert.rejects(operator.wait('initial',{...limits,deadline:Date.now()+2000}));
+    await assert.rejects(access(handoffPath),{code:'ENOENT'});
+  }finally{await operator.close();await rm(directory,{recursive:true,force:true});}
+});
+
+test('an existing native handoff is refused before the owner can start',async()=>{
+  const directory=await mkdtemp(join(tmpdir(),'native-handoff-')),handoffPath=join(directory,'operator.html');
+  try{
+    await symlink(join(directory,'absent'),handoffPath);
+    await assert.rejects(async()=>{
+      const operator=await openProfileOperator({rehearsal:false,handoffPath});
+      await operator.close();
+    });
+  }finally{await rm(directory,{recursive:true,force:true});}
+});
 
 test('the beforeAll gate validates authority, project and owner before requesting the browser fixture',async()=>{
   const spec=await readFile(new URL('../stripe-billing-failed-renewal.spec.ts',import.meta.url),'utf8');

@@ -1,6 +1,6 @@
 import {test} from '@playwright/test';
 import {join} from 'node:path';
-import {openProfileOperator,writeProfileHandoff} from '../scripts/profile-operator.mjs';
+import {openProfileOperator} from '../scripts/profile-operator.mjs';
 import {createOwnedBillingFailedRenewal,formatBillingFailedRenewalDiagnostic} from '../../../infrastructure/stripe-billing-first-payment.mjs';
 import {snapshotBillingFailedRenewalEnvironment} from '../../../infrastructure/stripe-billing-failed-renewal-options.mjs';
 import {runFailedRenewalBrowser} from './support/stripe-billing-failed-renewal';
@@ -29,8 +29,8 @@ test('OWNED_FAILED_RENEWAL_GRACE_RECOVERY',async({browser},info)=>{
     if(process.env.PAYMENT_STRIPE_PROFILE_OPERATOR==='1'){
       const runId=process.env.PAYMENT_STRIPE_SANDBOX_RUN_ID;
       if(!runId || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(runId))throw Error('Invalid profile run');
-      operator=await openProfileOperator({rehearsal:false,onAbandon:()=>controller.abort()});
-      await writeProfileHandoff(join(info.project.outputDir,runId,'operator.html'),operator);
+      operator=await openProfileOperator({rehearsal:false,onAbandon:()=>controller.abort(),
+        handoffPath:join(info.project.outputDir,runId,'operator.html')});
     }
     const journey=operator?runFailedRenewalBrowser(browser,controller,loadFailedRenewalStaticOriginMatcher(),operator.wait):
       runFailedRenewalBrowser(browser,controller,loadFailedRenewalStaticOriginMatcher());
