@@ -26,7 +26,7 @@ const initialPayWaitCodes=[
   'BROWSER_WAIT_OBSERVE_LAST_OBSERVED_SUBMIT','BROWSER_WAIT_OBSERVE_SUBMIT_CLEARED',
   'BROWSER_WAIT_OBSERVE_LAST_OBSERVED_TOKEN','BROWSER_WAIT_OBSERVE_TOKEN_CLEARED',
 ] as const;
-const beforeConfirmFailures=['BROWSER_CONFIRM_SUBMIT','BROWSER_CONFIRM_SUBMIT_VALIDATION',
+const beforeConfirmFailures=['BROWSER_CARD_INCOMPLETE','BROWSER_CONFIRM_SUBMIT','BROWSER_CONFIRM_SUBMIT_VALIDATION',
   'BROWSER_CONFIRM_TOKEN','BROWSER_CONFIRM_TOKEN_VALIDATION'];
 const afterConfirmFailures=['BROWSER_CONFIRM_NEXT_ACTION','BROWSER_CONFIRM_RECEIPT'];
 const commonConfirmFailures=['BROWSER_CONFIRM_GUARD','BROWSER_CONFIRM_STATE','BROWSER_CONFIRM_CLIENT','BROWSER_CONFIRM_RETIRED'];
@@ -191,6 +191,14 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
       await at(code,()=>frame.locator('input[name="'+name+'"]').fill(value,{timeout:timeout()}));
     const postal=frame.locator('input[name="postalCode"]');
     if(await at('BROWSER_POSTAL_CHECK',()=>postal.isVisible()))await at('BROWSER_POSTAL_FILL',()=>postal.fill('10001',{timeout:timeout()}));
+    if(which==='initial')await at('BROWSER_CARD_INCOMPLETE',async()=>{
+      await page!.waitForFunction(url=>{
+        if(window!==window.top||location.href!==url||document.body.dataset.phase!=='READY')return false;
+        const proof=Object.getOwnPropertyDescriptor(window,'__failedRenewalInitialInputComplete');
+        return proof?.configurable===false&&proof.writable===false&&typeof proof.value==='function'&&proof.value()===true;
+      },binding.endpoints.demo+pagePath,{timeout:timeout()});
+      assertPage();
+    });
     // No await between the last empty-set check and arming Pay.
     while(which==='initial'&&pendingInitialNavigations.size)await waitForNavigationClassification();
     assertPage();need(step==='CONFIRM');
@@ -198,6 +206,10 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     clickApprovedUntil=waitForClick?0:scoped().deadline;
     await at('BROWSER_MANUAL_PAY_ARM',async()=>need(await button.evaluate((b,phase)=>{
       if(!(b instanceof HTMLButtonElement)||!b.disabled||document.body.dataset.phase!==phase)return false;
+      if(phase==='READY'){
+        const proof=Object.getOwnPropertyDescriptor(window,'__failedRenewalInitialInputComplete');
+        if(proof?.configurable!==false||proof.writable!==false||typeof proof.value!=='function'||proof.value()!==true)return false;
+      }
       b.disabled=false;return true;
     },ready)));
     if(waitForClick){

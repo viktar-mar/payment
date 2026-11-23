@@ -13,6 +13,9 @@ const nestedDocumentFlag='PAYMENT_STRIPE_BROWSER_LOAD_CHECK_BLOCK_NESTED_DOCUMEN
 const nestedDocumentResults=new Set(['BLOCKED','NOT_OBSERVED']);
 const recoveryPresentationFlag='PAYMENT_STRIPE_BROWSER_LOAD_CHECK_RECOVERY_PRESENTATION';
 const recoveryPresentationProfile='RECOVERY_PRESENTATION';
+const submitFlag='PAYMENT_STRIPE_BROWSER_LOAD_CHECK_SUBMIT';
+const recoverySubmitProfile='RECOVERY_SUBMIT';
+const submitResults=new Set(['SUBMIT_OK','SUBMIT_VALIDATION','SUBMIT_ERROR','INCOMPLETE']);
 const postReadyObservationMs=5000;
 const refusedHostGroup=url=>{
   try{
@@ -36,11 +39,12 @@ const refusedNetworkOrigin=value=>{
     return url.origin;
   }catch{return undefined;}
 };
-const snapshot=(loadResult,cleanupErrors,originReason,originHostGroup,nestedDocument,recoveryPresentation)=>Object.freeze({
+const snapshot=(loadResult,cleanupErrors,originReason,originHostGroup,nestedDocument,profile,submission)=>Object.freeze({
   loadResult,cleanupErrors:Object.freeze([...cleanupErrors]),
   ...(loadResult==='ORIGIN'?{originReason:safeOriginReason(originReason),...(originReason==='HOST_NOT_ALLOWED'?{originHostGroup:safeOriginHostGroup(originHostGroup)}:{})}:{}),
   ...(nestedDocumentResults.has(nestedDocument)?{nestedDocument}:{}),
-  ...(recoveryPresentation?{profile:recoveryPresentationProfile}:{}),
+  ...(profile?{profile}:{}),
+  ...(submitResults.has(submission)?{submission}:{}),
 });
 export function formatLoadCheckResult(report){
   try{
@@ -64,13 +68,20 @@ export function formatLoadCheckResult(report){
         originSuffix+=` host_group=${group}`;
       }
     }
-    let nestedDocument,recoveryPresentation=false;
+    let nestedDocument,profile;
     try{const result=report?.nestedDocument;if(nestedDocumentResults.has(result))nestedDocument=result;}catch{}
-    try{recoveryPresentation=report?.profile===recoveryPresentationProfile;}catch{}
+    try{const candidate=report?.profile;if(candidate===recoveryPresentationProfile||candidate===recoverySubmitProfile)profile=candidate;}catch{}
     const nestedSuffix=nestedDocument?` nested_document=${nestedDocument}`:'';
-    const profileSuffix=recoveryPresentation?` profile=${recoveryPresentationProfile}`:'';
-    const success=loadResult==='READY'&&!components.length&&(!recoveryPresentation||nestedDocument==='BLOCKED');
-    return {line:`STRIPE_BROWSER_LOAD_CHECK load=${loadResult} cleanup=${components.length?'FAILED':'OK'} components=${components.join(',')||'NONE'}${originSuffix}${nestedSuffix}${profileSuffix}`,exitCode:success?0:1};
+    const profileSuffix=profile?` profile=${profile}`:'';
+    let submission;
+    if(profile===recoverySubmitProfile){
+      const candidate=Object.getOwnPropertyDescriptor(report,'submission')?.value;
+      submission=submitResults.has(candidate)?candidate:'SUBMIT_ERROR';
+    }
+    const submitSuffix=submission?` submit=${submission}`:'';
+    const success=loadResult==='READY'&&!components.length&&
+      (profile===recoverySubmitProfile?submission==='SUBMIT_OK':profile!==recoveryPresentationProfile||nestedDocument==='BLOCKED');
+    return {line:`STRIPE_BROWSER_LOAD_CHECK load=${loadResult} cleanup=${components.length?'FAILED':'OK'} components=${components.join(',')||'NONE'}${originSuffix}${nestedSuffix}${profileSuffix}${submitSuffix}`,exitCode:success?0:1};
   }catch{
     return {line:'STRIPE_BROWSER_LOAD_CHECK load=UNKNOWN cleanup=FAILED components=UNKNOWN',exitCode:1};
   }
@@ -80,6 +91,8 @@ export function admitEnvironment(env){
   if(env[nestedDocumentFlag]!==undefined && !['true','false'].includes(env[nestedDocumentFlag]))throw Error('REFUSED');
   if(env[recoveryPresentationFlag]!==undefined && !['true','false'].includes(env[recoveryPresentationFlag]))throw Error('REFUSED');
   if(env[recoveryPresentationFlag]==='true'&&env[nestedDocumentFlag]!=='true')throw Error('REFUSED');
+  if(env[submitFlag]!==undefined&&!['true','false'].includes(env[submitFlag]))throw Error('REFUSED');
+  if(env[submitFlag]==='true'&&env[recoveryPresentationFlag]!=='true')throw Error('REFUSED');
   for(const name of Object.keys(env))if((/^(?:DEBUG|PWDEBUG|NODE_DEBUG|NODE_DEBUG_NATIVE|NODE_OPTIONS|VITE_INSPECT|PLAYWRIGHT_.*|PW_.*)$/.test(name)||/^(?:(?:BROWSER|RECORD|ENABLE)_)?(?:TRACE|SCREENSHOT|HAR|VIDEO|CAPTURE|DEBUG)(?:_(?:PATH|DIR|FILE|ENABLED))?$/i.test(name))&&env[name])throw Error('REFUSED');
   return env.PAYMENT_STRIPE_BROWSER_LOAD_CHECK_PUBLISHABLE_KEY;
 }
@@ -150,6 +163,8 @@ export async function runLoadCheck(env,ports){
   const matchesNestedDocumentOrigin=observeNested?ports.matchesNestedDocumentOrigin:undefined;
   if(observeNested&&typeof matchesNestedDocumentOrigin!=='function')return snapshot('REFUSED',[]);
   const recoveryPresentation=env[recoveryPresentationFlag]==='true';
+  const verifyInput=env[submitFlag]==='true';
+  let submission=verifyInput?'INCOMPLETE':undefined;
   let nestedDocument=observeNested?'NOT_OBSERVED':undefined;
   let nestedRequest,observeBrowserBlock,nestedObservation,signalNestedRequest;
   const nestedStarted=recoveryPresentation?new Promise(resolve=>{signalNestedRequest=resolve;}):undefined;
@@ -292,7 +307,8 @@ export async function runLoadCheck(env,ports){
       await page.goto(localOrigin+documentPath,{waitUntil:'load',timeout:remaining()});
       if(loadResult)return;
       if(recoveryPresentation){
-        await page.evaluate(({key,profile})=>window.configureStripeBrowserLoadCheck(key,profile),{key,profile:'recovery-presentation'});
+        await page.evaluate(({key,profile})=>window.configureStripeBrowserLoadCheck(key,profile),
+          {key,profile:verifyInput?'recovery-submit':'recovery-presentation'});
       }else{
         await page.evaluate(key=>window.configureStripeBrowserLoadCheck(key),key);
       }
@@ -319,6 +335,34 @@ export async function runLoadCheck(env,ports){
       if(nestedObservation&&!blockedBeforeWait){
         await nestedObservation;
         if(!loadResult&&nestedDocument==='BLOCKED'&&Date.now()<expires)await waitForReady();
+      }
+      if(verifyInput&&!loadResult){
+        const current=()=>{
+          if(!loadResult&&!finishing&&Date.now()>=expires)fail('TIMEOUT');
+          return !loadResult&&!finishing;
+        };
+        const frame=page.locator('#provider-host').frameLocator('iframe[title="Secure payment input frame"]');
+        for(const [name,value] of [['number','4242424242424242'],['expiry','1230'],['cvc','123']]){
+          if(!current())return;
+          await frame.locator('input[name="'+name+'"]').fill(value,{timeout:remaining()});
+        }
+        if(!current())return;
+        const postal=frame.locator('input[name="postalCode"]');
+        const postalVisible=await postal.isVisible();
+        if(!current())return;
+        if(postalVisible)await postal.fill('10001',{timeout:remaining()});
+        if(!current())return;
+        await page.waitForFunction(()=>window.stripeBrowserProbeInputComplete()===true,{},{timeout:remaining()});
+        const settleNested=async()=>{
+          while(current()&&pendingNestedHeaders.size)await Promise.race([Promise.all([...pendingNestedHeaders]),failed]);
+          if(nestedObservation&&current())await nestedObservation;
+        };
+        await settleNested();
+        if(!current())return;
+        const result=await page.evaluate(deadline=>window.stripeBrowserProbeSubmit(deadline),expires);
+        await settleNested();
+        if(!current())return;
+        submission=submitResults.has(result)?result:'SUBMIT_ERROR';
       }
       // Readiness is a terminal observation, before any final disposal starts.
       if(!loadResult&&!finishing){
@@ -353,7 +397,8 @@ export async function runLoadCheck(env,ports){
     }
     while(pendingCleanup.size)await Promise.allSettled([...pendingCleanup]);
   }
-  return snapshot(loadResult,cleanupCodes.filter(code=>cleanupErrors.has(code)),originReason,originHostGroup,nestedDocument,recoveryPresentation);
+  const profile=verifyInput?recoverySubmitProfile:recoveryPresentation?recoveryPresentationProfile:undefined;
+  return snapshot(loadResult,cleanupCodes.filter(code=>cleanupErrors.has(code)),originReason,originHostGroup,nestedDocument,profile,submission);
 }
 
 // Explicitly minimize the spawned browser environment; no account/provider keys.

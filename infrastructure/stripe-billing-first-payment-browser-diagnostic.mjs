@@ -32,6 +32,7 @@ for(const code of [
 }
 codes.add('BROWSER_PROVIDER_STATIC_REQUEST');
 codes.add('BROWSER_PROVIDER_STATIC_NAVIGATION_BLOCK');
+codes.add('BROWSER_CARD_INCOMPLETE');
 export const isBrowserDiagnostic=code=>typeof code==='string'&&codes.has(code);
 export const isMethodBrowserDiagnostic=code=>typeof code==='string'&&methodCodes.has(code);
 export function browserFailure(code,phase='INITIAL'){

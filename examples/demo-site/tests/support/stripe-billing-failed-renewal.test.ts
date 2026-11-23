@@ -373,7 +373,10 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
         counts.push('confirmSetup');p.onRetire?.();
         if(change==='method_provider_refusal')throw Error('private setup response');
         return {operationId:id(9),subscriptionId:id(6),status:'RESERVED',actionAvailable:false};}};}};
-  installFailedRenewalPage(sdk);
+  installFailedRenewalPage(sdk,{
+    readStripePaymentAttemptInputComplete:()=>change!=='input_incomplete',
+    readStripePaymentAttemptFailure:()=>null,observeStripePaymentAttemptPending:()=>()=>{},
+  });
   const labels:Record<string,string>={'Request code':'request','Verify code':'verify','Start payment':'start','Pay':'pay','Confirm test method':'confirm-method','I consent to recurring payments':'consent','Six-digit code':'code'};
   function locator(id:string):any {const c=ctrl(id);return {click:async()=>{
       if(id==='pay' && profile?.click){await profile.click();return;}
@@ -1212,6 +1215,7 @@ for(const [change,checkpoint] of [
   ['mount_refusal','BROWSER_INITIAL_MOUNT'],['mount_retire','BROWSER_INITIAL_MOUNT'],
   ['number','BROWSER_CARD_NUMBER'],['expiry','BROWSER_CARD_EXPIRY'],['cvc','BROWSER_CARD_CVC'],
   ['postal_check','BROWSER_POSTAL_CHECK'],['postalCode','BROWSER_POSTAL_FILL'],
+  ['input_incomplete','BROWSER_CARD_INCOMPLETE'],
   ['manual_arm','BROWSER_MANUAL_PAY_ARM'],['initial_manual_timeout','BROWSER_MANUAL_PAY_WAIT'],
 ] as const)test('held browser preserves first checkpoint through teardown on '+change,async()=>{
   const h=await fixture(change);

@@ -10,7 +10,7 @@ import {createLoadController} from '../../src/stripe-browser-load-check.ts';
 
 // Node records the script that the installed loader would insert. Its DOM
 // double does not download or execute scripts.
-async function checkFirstScript(outDir:string, html:string, profile?:'recovery-presentation') {
+async function checkFirstScript(outDir:string, html:string, profile?:'recovery-presentation'|'recovery-submit') {
   const entry = /<script\b[^>]*\bsrc="(\/assets\/[\w.-]+\.js)"/.exec(html)?.[1];
   assert.ok(entry, 'dedicated page entry');
   const scripts:string[] = [];
@@ -49,7 +49,7 @@ async function checkFirstScript(outDir:string, html:string, profile?:'recovery-p
     assert.equal(scripts.length,1);
     const url=new URL(scripts[0]!);
     assert.equal(url.origin,'https://js.stripe.com');
-    assert.deepEqual([...url.searchParams], profile ? [] : [['advancedFraudSignals','false']]);
+    assert.deepEqual([...url.searchParams], profile==='recovery-presentation' ? [] : [['advancedFraudSignals','false']]);
   } finally {
     for(const name of Object.keys(globals)) Reflect.deleteProperty(globalThis,name);
   }
@@ -59,7 +59,7 @@ test('dedicated build uses shared loader in isolated default and recovery profil
   const root=fileURLToPath(new URL('../..',import.meta.url));
   const directory=await mkdtemp(join(tmpdir(),'stripe-load-build-'));
   try{
-    for(const [directoryName,mode] of [['ordinary','stripe-browser-load-check'],['recovery','stripe-browser-load-check'],['production','production']] as const){
+    for(const [directoryName,mode] of [['ordinary','stripe-browser-load-check'],['presentation','stripe-browser-load-check'],['submit','stripe-browser-load-check'],['production','production']] as const){
       const modules=new Set<string>();const outDir=join(directory,directoryName);
       await build({root,configFile:join(root,'vite.config.ts'),configLoader:'runner',envFile:false,mode,logLevel:'silent',cacheDir:join(directory,'cache'),build:{outDir},plugins:[{name:'inspect-load-only',generateBundle(_options,bundle){for(const output of Object.values(bundle))if(output.type==='chunk')for(const id of output.moduleIds)modules.add(id);}}]});
       const files=await readdir(outDir);
@@ -72,7 +72,7 @@ test('dedicated build uses shared loader in isolated default and recovery profil
         assert.ok(![...modules].some(id=>/\/(?:client|runtime-factory|stripe-billing-failed-renewal|stripe-billing-first-payment)\.[mt]?[js]+$/.test(id)));
         const html=await readFile(join(outDir,'stripe-browser-load-check.html'),'utf8');
         assert.ok(!/<(?:form|input|button)\b/i.test(html));assert.match(html,/\binert\b/);assert.match(html,/tabindex="-1"/);
-        await checkFirstScript(outDir,html,directoryName==='recovery'?'recovery-presentation':undefined);
+        await checkFirstScript(outDir,html,directoryName==='presentation'?'recovery-presentation':directoryName==='submit'?'recovery-submit':undefined);
       }
     }
   }finally{await rm(directory,{recursive:true,force:true});}

@@ -10,6 +10,17 @@ export function readStripePaymentAttemptFailure(handle: unknown): StripePaymentA
   return suitable(handle) ? failures.get(handle) ?? null : null;
 }
 
+// Retain only the latest completeness bit for the original mount.
+const completeInputs = new WeakSet<object>();
+export function setStripePaymentAttemptInputComplete(handle: unknown, complete: boolean): void {
+  if (!suitable(handle)) return;
+  if (complete === true) completeInputs.add(handle);
+  else completeInputs.delete(handle);
+}
+export function readStripePaymentAttemptInputComplete(handle: unknown): boolean {
+  return suitable(handle) && completeInputs.has(handle);
+}
+
 // Pending observations are independent of immutable terminal failure provenance.
 export type StripePaymentAttemptPending = 'SUBMIT' | 'TOKEN';
 const pending = new WeakMap<object, StripePaymentAttemptPending>();

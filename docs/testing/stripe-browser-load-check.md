@@ -10,7 +10,8 @@ fresh, card-free document. The dedicated failed-renewal Sandbox page uses the
 same setting. The production SDK uses Stripe's defaults.
 Apple Pay and Google Pay are disabled. The connected provider host is inert,
 unfocusable and ignores pointer events. There is no form, card entry, Pay button,
-submit, confirmation, customer, backend, billing owner or CLI operation.
+submit, confirmation, customer, backend, billing owner or CLI operation in the
+load-only profiles.
 
 Stripe documents this deferred initialization pattern in its
 [official deferred-payment guide](https://docs.stripe.com/payments/accept-a-payment-deferred?platform=web&type=payment).
@@ -255,6 +256,22 @@ Chrome confirmed the local block for the intercepted request, and the deferred
 subscription Element reached readiness with that document blocked. The check
 used no card input, Pay, client secret or payment. Readiness with a client
 secret and acceptance of the paid recovery workflow remain unverified.
+
+### Local subscription form validation
+
+Set `PAYMENT_STRIPE_BROWSER_LOAD_CHECK_SUBMIT=true` together with the recovery
+presentation and nested-document flags. This selects `RECOVERY_SUBMIT` and uses
+the same Stripe.js load parameters as the paid recovery page. The probe uses
+only a public test publishable key to mount a deferred subscription Element.
+It fills the fixed test card, waits for the Element to report complete input,
+then calls `elements.submit()` once. It creates no token, PaymentIntent or
+SetupIntent, makes no confirmation call and needs no Docker or CLI login.
+The existing route policy applies throughout.
+
+A successful report has `load=READY`, `submit=SUBMIT_OK` and `cleanup=OK`.
+Nested-document observation is reported separately. The successful submit
+shows that the deferred form validated the test inputs. It does not establish
+client-secret form compatibility or settlement of a subscription payment.
 
 ## Optional private refusal witness
 

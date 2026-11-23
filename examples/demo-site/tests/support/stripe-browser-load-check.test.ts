@@ -21,12 +21,12 @@ test('default Playwright discovery excludes both Node-only load-check support te
 const report=(loadResult:string,cleanupErrors:string[]=[])=>({loadResult,cleanupErrors});
 const deferred=()=>{let resolve!:(value:any)=>void;const promise=new Promise<any>(r=>{resolve=r;});return {promise,resolve};};
 
-function controllerFixture(load?:Promise<any>){
+function controllerFixture(load?:Promise<any>,validateInput?:()=>Promise<{error?:unknown}>){
   const events:Record<string,Function>={};const statuses:string[]=[];const calls:any[]=[];
   let destroys=0;
   const financial=()=>assert.fail('financial API must never be invoked');
   const element={on:(name:string,fn:Function)=>{events[name]=fn;},mount:(host:any)=>{calls.push(['mount',host]);},destroy:()=>{destroys++;}};
-  const stripe={elements:(options:any)=>{calls.push(['elements',options]);return {create:(type:string,options:any)=>{calls.push(['create',type,options]);return element;},submit:financial};},confirmPayment:financial,confirmSetup:financial,createPaymentMethod:financial,createToken:financial,createConfirmationToken:financial};
+  const stripe={elements:(options:any)=>{calls.push(['elements',options]);return {create:(type:string,options:any)=>{calls.push(['create',type,options]);return element;},submit:validateInput??financial};},confirmPayment:financial,confirmSetup:financial,createPaymentMethod:financial,createToken:financial,createConfirmationToken:financial};
   const host={isConnected:true,inert:false,tabIndex:0,style:{pointerEvents:''}};
   const life:Record<string,Function>={};
   const ports={host,load:async(k:string)=>{calls.push(['load',k]);return load?await load:stripe;},status:(s:string)=>statuses.push(s),onPageLoss:(fn:Function)=>{life.loss=fn;return ()=>{delete life.loss;};},deadline:(_fn:Function)=>()=>{}};
@@ -83,6 +83,55 @@ test('controller loaderror, stop, page loss and late loader cannot resurrect hos
   assert.equal(f.calls.length,1);assert.equal(c.state(),'STOPPED');
   const disconnected=controllerFixture();disconnected.host.isConnected=false;
   await assert.rejects(()=>createLoadController(disconnected.ports).configure(key));assert.equal(disconnected.calls.length,0);
+});
+
+test('deferred subscription probe validates complete synthetic input once without a financial API',async()=>{
+  const {createLoadController}=await pageModule();
+  let submits=0;
+  const f=controllerFixture(undefined,async()=>{submits++;return {};});
+  const c=createLoadController(f.ports);
+  await c.configure(key,'recovery-submit');
+  f.events.ready!();
+  assert.equal(f.host.inert,false);
+  assert.equal(c.inputComplete(),false);
+  const deadline=Date.now()+10000;
+  assert.equal(await c.submit(deadline),'INCOMPLETE');
+  f.events.change!({elementType:'payment',empty:false,complete:true});
+  assert.equal(c.inputComplete(),true);
+  assert.equal(await c.submit(deadline),'SUBMIT_OK');
+  assert.equal(await c.submit(deadline),'INCOMPLETE');
+  assert.equal(submits,1);
+  c.stop();
+  assert.equal(c.inputComplete(),false);
+  assert.equal(f.destroys(),1);
+  assert.deepEqual(f.calls[1],['elements',{mode:'subscription',amount:2000,currency:'eur',allowedPaymentMethodTypes:['card'],locale:'en'}]);
+});
+
+test('submit probe refuses malformed results and prevents dispatch past its deadline',async()=>{
+  const {createLoadController}=await pageModule();
+  for(const reply of ['private',[],{unexpected:true},{selectedPaymentMethod:'link'},{error:'private'}]){
+    let calls=0;
+    const f=controllerFixture(undefined,async()=>{calls++;return reply as never;});
+    const c=createLoadController(f.ports);
+    await c.configure(key,'recovery-submit');
+    f.events.ready!();
+    f.events.change!({elementType:'payment',complete:true,empty:false});
+    assert.equal(await c.submit(Date.now()-1),'SUBMIT_ERROR');
+    assert.equal(calls,0);
+    assert.equal(await c.submit(Date.now()+10000),'SUBMIT_ERROR');
+    assert.equal(calls,1);
+    c.stop();
+  }
+});
+
+test('submit report needs its own profile and successful validation',async()=>{
+  const {formatLoadCheckResult}=await launcherModule();
+  const base={...report('READY'),nestedDocument:'BLOCKED'};
+  assert.equal(formatLoadCheckResult({...base,nestedDocument:'NOT_OBSERVED',profile:'RECOVERY_PRESENTATION',submission:'SUBMIT_OK'}).exitCode,1);
+  for(const submission of [undefined,'SUBMIT_VALIDATION','private'])assert.equal(formatLoadCheckResult({...base,profile:'RECOVERY_SUBMIT',submission}).exitCode,1);
+  assert.deepEqual(formatLoadCheckResult({...base,profile:'RECOVERY_SUBMIT',submission:'SUBMIT_OK'}),{
+    line:'STRIPE_BROWSER_LOAD_CHECK load=READY cleanup=OK components=NONE nested_document=BLOCKED profile=RECOVERY_SUBMIT submit=SUBMIT_OK',exitCode:0,
+  });
 });
 
 test('route classifier never falls through financial API, navigation, auth, redirect or unknown origins',async()=>{
@@ -482,6 +531,55 @@ function nestedDocumentFixture(){
   };
   return {...f,main,outer,target,ports,blockedRoute,abortCodes,onFirstReadyWait};
 }
+
+for(const mode of ['blocked','quiet','expired','late'] as const)test('submit probe preserves its owned route and validation order: '+mode,async t=>{
+  const {runLoadCheck,formatLoadCheckResult,admitEnvironment}=await launcherModule();
+  const optIn={...recoveryPresentationEnv,PAYMENT_STRIPE_BROWSER_LOAD_CHECK_SUBMIT:'true'};
+  assert.throws(()=>admitEnvironment({...env,PAYMENT_STRIPE_BROWSER_LOAD_CHECK_SUBMIT:'true'}));
+  assert.throws(()=>admitEnvironment({...optIn,PAYMENT_STRIPE_BROWSER_LOAD_CHECK_SUBMIT:'1'}));
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+  const f=nestedDocumentFixture(),firstReady=deferred(),submitStarted=deferred(),submitResult=deferred();
+  f.ports.timeoutMs=10000;
+  const calls:string[]=[];
+  let ready=false;
+  f.page.waitForFunction=async()=>{
+    if(!ready&&!calls.includes('fill:input[name="number"]')){
+      ready=true;firstReady.resolve(undefined);
+      if(mode!=='quiet')await f.route()(f.blockedRoute());
+      return;
+    }
+    if(!calls.includes('fill:input[name="number"]'))return;
+    calls.push('complete');
+    if(mode==='expired')t.mock.timers.setTime(11000);
+  };
+  f.page.evaluate=(async(_action:unknown,args:unknown)=>{
+    if(typeof args==='object'){assert.deepEqual(args,{key,profile:'recovery-submit'});return;}
+    assert.equal(args,11000);calls.push('submit');
+    if(mode==='late'){submitStarted.resolve(undefined);return submitResult.promise;}
+    return 'SUBMIT_OK';
+  }) as typeof f.page.evaluate;
+  Object.assign(f.page,{locator:(selector:string)=>{
+    assert.equal(selector,'#provider-host');
+    return {frameLocator:(frame:string)=>{
+      assert.equal(frame,'iframe[title="Secure payment input frame"]');
+      return {locator:(input:string)=>({fill:async()=>{calls.push('fill:'+input);},isVisible:async()=>true})};
+    }};
+  }});
+  const running=runLoadCheck(optIn,f.ports);
+  if(mode==='quiet'){
+    await firstReady.promise;await new Promise<void>(resolve=>setImmediate(resolve));t.mock.timers.tick(5000);
+  }
+  if(mode==='late'){
+    await submitStarted.promise;f.listeners.pageerror!(Error('synthetic failure'));submitResult.resolve('SUBMIT_OK');
+  }
+  const result=await running;
+  assert.deepEqual(calls,['fill:input[name="number"]','fill:input[name="expiry"]','fill:input[name="cvc"]',
+    'fill:input[name="postalCode"]','complete',...(mode==='expired'?[]:['submit'])]);
+  assert.deepEqual(result,{...nestedReport(mode==='expired'?'TIMEOUT':mode==='late'?'ELEMENT':'READY',mode==='quiet'?'NOT_OBSERVED':'BLOCKED'),
+    profile:'RECOVERY_SUBMIT',submission:mode==='expired'||mode==='late'?'INCOMPLETE':'SUBMIT_OK'});
+  assert.equal(formatLoadCheckResult(result).exitCode,mode==='expired'||mode==='late'?1:0);
+  assert.deepEqual(f.calls.filter(call=>call.startsWith('nested.')),[]);
+});
 
 test('nested document probe aborts the eligible request locally and reports observed readiness',async()=>{
   const {runLoadCheck,formatLoadCheckResult}=await launcherModule();const f=nestedDocumentFixture();

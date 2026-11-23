@@ -47,11 +47,12 @@ async function page(body:(f:any)=>Promise<void>, allowed=true) {
     const client={subscriptions,requestEmailOtp:vi.fn(async()=>({challengeId:'fixture'})),verifyEmailOtp:vi.fn(async()=>session)};
     const elements:any[]=[];
     const submit=vi.fn(async()=>({})),token=vi.fn(async()=>({confirmationToken:{id:'ctoken_fixture'}})),confirmSetup=vi.fn(async()=>({}));
-    provider.load.mockResolvedValue({elements:()=>({submit,create:()=>{
-      const events=new Map<string,()=>void>();
-      const element={events,on:vi.fn((name:string,fn:()=>void)=>events.set(name,fn)),off:vi.fn(),mount:vi.fn(),destroy:vi.fn()};
+    const createElements=vi.fn(()=>({submit,create:()=>{
+      const events=new Map<string,(event?:unknown)=>void>();
+      const element={events,on:vi.fn((name:string,fn:(event?:unknown)=>void)=>events.set(name,fn)),off:vi.fn(),mount:vi.fn(),destroy:vi.fn()};
       elements.push(element);return element;
-    }}),createConfirmationToken:token,confirmSetup});
+    }}));
+    provider.load.mockResolvedValue({elements:createElements,createConfirmationToken:token,confirmSetup});
     const terminal=vi.fn(),progress=vi.fn();
     w.__failedRenewalPayProgress=progress;w.__failedRenewalTerminal=terminal;w.__failedRenewalChallenge=vi.fn(async()=>{});w.__failedRenewalPrepare=vi.fn(async()=>({subscriptionId,operationId}));
     // Execute the actual coordinator. Only provider transport and the client wire
@@ -69,13 +70,13 @@ async function page(body:(f:any)=>Promise<void>, allowed=true) {
     await click('request');w.document.getElementById('code').value='123456';await click('verify');expect(phase()).toBe('AUTHENTICATED');
     w.document.getElementById('consent').checked=true;
     const start=()=>click('start');
-    const emit=(index:number,name:string)=>elements[index].events.get(name)!();
-    const ready=async()=>{const pending=start();await tick();expect(elements).toHaveLength(1);expect(phase()).toBe('PREPARING');emit(0,'ready');await pending;expect(phase()).toBe('READY');};
+    const emit=(index:number,name:string,event?:unknown)=>elements[index].events.get(name)?.(event);
+    const ready=async(complete=true)=>{const pending=start();await tick();expect(elements).toHaveLength(1);expect(phase()).toBe('PREPARING');emit(0,'ready');await pending;expect(phase()).toBe('READY');if(complete)emit(0,'change',{elementType:'payment',complete:true,empty:false});};
     // Synthetic trusted-shaped arguments exercise the handler's positive branch;
     // JSDOM events remain untrusted and do not establish browser acceptance.
     const pay=async()=>{w.document.getElementById('pay').disabled=false;await click('pay',{isTrusted:true});};
     const method=()=>track(w.__failedRenewalMethod({subscriptionId,operationId:methodId}));
-    await body({w,phase,click,start,ready,pay,method,emit,elements,terminal,progress,confirmPayment,permit,submit,token,confirmSetup,subscriptions,session,blocked});
+    await body({w,phase,click,start,ready,pay,method,emit,elements,createElements,context,terminal,progress,confirmPayment,permit,submit,token,confirmSetup,subscriptions,session,blocked});
     expect(blocked).not.toHaveBeenCalled();
   } finally {
     try {w.__failedRenewalStop?.();await Promise.allSettled(tasks);realm.window.close();}
@@ -98,6 +99,21 @@ it.each(['disabled','untrusted'])('initial %s Pay refuses confirmation after rea
   await f.ready();if(reason==='untrusted')f.w.document.getElementById('pay').disabled=false;
   await f.click('pay',reason==='disabled'?{isTrusted:true}:new f.w.Event('click'));expect(f.phase()).toBe('STOPPED');expect(f.terminal.mock.calls).toEqual([['STOPPED',null]]);expect(f.submit).not.toHaveBeenCalled();expect(f.confirmPayment).not.toHaveBeenCalled();
   expect(f.progress).not.toHaveBeenCalled();
+}));
+it('rejects Pay when Stripe reports that previously complete input became incomplete',async()=>page(async f=>{
+  await f.ready(false);
+  expect(f.createElements).toHaveBeenCalledExactlyOnceWith({clientSecret:f.context.clientSecret,locale:'en'});
+  expect(f.w.__failedRenewalInitialInputComplete?.()).toBe(false);
+  f.emit(0,'change',{elementType:'payment',complete:true,empty:false});
+  expect(f.w.__failedRenewalInitialInputComplete()).toBe(true);
+  f.emit(0,'change',{elementType:'payment',complete:false,empty:false});
+  expect(f.w.__failedRenewalInitialInputComplete()).toBe(false);
+  await f.pay();
+  expect(f.terminal.mock.calls).toEqual([['STOPPED','BROWSER_CARD_INCOMPLETE']]);
+  expect(f.w.__failedRenewalInitialInputComplete()).toBe(false);
+  expect(f.submit).not.toHaveBeenCalled();
+  expect(f.token).not.toHaveBeenCalled();
+  expect(f.confirmPayment).not.toHaveBeenCalled();
 }));
 it('actual initial synchronous successful retirement preserves OBSERVE and consumes original Pay once',async()=>page(async f=>{
   await f.ready();await f.pay();expect(f.phase()).toBe('OBSERVE');expect(f.elements[0].destroy).toHaveBeenCalledTimes(1);expect(f.confirmPayment).toHaveBeenCalledTimes(1);expect(f.confirmPayment.mock.calls[0][0].session).toBe(f.session);expect(f.submit).toHaveBeenCalledTimes(1);expect(f.token).toHaveBeenCalledTimes(1);expect(f.terminal).not.toHaveBeenCalled();

@@ -68,6 +68,7 @@ async function checkCardForms(entry: string) {
   class PageWindow extends EventTarget {
     readonly top = this;
     declare __failedRenewalConfigure: (config: object) => void;
+    declare __failedRenewalInitialInputComplete: () => boolean;
     declare __failedRenewalMethod: (operation: object) => Promise<void>;
     declare __failedRenewalStop?: () => void;
     __failedRenewalPrepare() {return {subscriptionId, operationId};}
@@ -111,14 +112,27 @@ async function checkCardForms(entry: string) {
     assert.deepEqual([...url.searchParams], [['advancedFraudSignals', 'false']]);
     // Deliver the inserted script's load event locally. Neither form contacts a provider.
     const calls: string[] = [];
+    let reportPaymentInput: ((complete: boolean) => void) | undefined;
+    let submissions = 0;
     const stripe = () => ({
-      elements: ({clientSecret}: {clientSecret: string}) => ({
-        submit: async () => ({}),
+      elements: ({clientSecret, locale}: {clientSecret: string; locale: string}) => ({
+        submit: async () => {submissions++; return {};},
         create: () => {
           let ready: () => void;
           const form = clientSecret.startsWith('pi_') ? 'payment' : 'setup';
+          if (form === 'payment') {
+            assert.equal(clientSecret, 'pi_fixture_secret_fixture');
+            assert.equal(locale, 'en');
+          } else {
+            assert.equal(clientSecret, 'seti_fixture_secret_fixture');
+          }
           return {
-            on(name: string, fn: () => void) {if (name === 'ready') ready = fn;},
+            on(name: string, fn: (event?: object) => void) {
+              if (name === 'ready') ready = fn;
+              if (name === 'change' && form === 'payment') {
+                reportPaymentInput = complete => fn({elementType: 'payment', empty: false, complete});
+              }
+            },
             mount() {calls.push(form); ready();},
             off() {}, destroy() {},
           };
@@ -131,10 +145,21 @@ async function checkCardForms(entry: string) {
     scripts[0]!.dispatchEvent(new Event('load'));
     await start;
     assert.equal(body.dataset.phase, 'READY');
+    assert.equal(controls.get('pay')!.disabled, true);
+    assert.equal(window.__failedRenewalInitialInputComplete(), false);
+    assert.ok(reportPaymentInput);
+    reportPaymentInput(true);
+    assert.equal(window.__failedRenewalInitialInputComplete(), true);
+    reportPaymentInput(false);
+    assert.equal(window.__failedRenewalInitialInputComplete(), false);
+    assert.equal(submissions, 0);
     assert.deepEqual(progress, []);
+    assert.deepEqual(requests, [...replies.keys()].slice(0, 4));
+    reportPaymentInput(true);
     controls.get('pay')!.disabled = false;
     await controls.get('pay')!.onclick!({isTrusted: true});
     assert.equal(body.dataset.phase, 'OBSERVE');
+    assert.equal(submissions, 1);
     await window.__failedRenewalMethod({subscriptionId, operationId: replacementId});
     assert.equal(body.dataset.phase, 'METHOD_READY');
     assert.equal(controls.get('confirm-method')!.disabled, true);

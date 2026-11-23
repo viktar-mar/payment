@@ -2,13 +2,13 @@ import type * as Payments from '@generic-payments/sdk';
 import type * as AttemptDiagnostic from '../../../frontend/sdk/src/subscriptions/stripe-payment-attempt-diagnostic.js';
 
 type Sdk = Pick<typeof Payments, 'createGenericPaymentClient'|'mountStripePaymentAttempt'|'mountStripeSubscriptionMethod'>;
-type Diagnostics = Pick<typeof AttemptDiagnostic, 'observeStripePaymentAttemptPending'|'readStripePaymentAttemptFailure'>;
-type ConfirmBoundary = `BROWSER_CONFIRM_${AttemptDiagnostic.StripePaymentAttemptFailure | 'RECEIPT'}`;
+type Diagnostics = Pick<typeof AttemptDiagnostic, 'observeStripePaymentAttemptPending'|'readStripePaymentAttemptFailure'|'readStripePaymentAttemptInputComplete'>;
+type ConfirmBoundary = `BROWSER_CONFIRM_${AttemptDiagnostic.StripePaymentAttemptFailure | 'RECEIPT'}`|'BROWSER_CARD_INCOMPLETE';
 type Configuration = {backend:string;siteKey:string;email:string;deadline:number};
 type Operation = {subscriptionId:string;operationId:string};
 
 /** Capabilities live only in the original document and original SDK client. */
-export function installFailedRenewalPage(sdk:Sdk, diagnostics?:Diagnostics):void {
+export function installFailedRenewalPage(sdk:Sdk, diagnostics:Diagnostics):void {
   const button = (id:string) => document.querySelector<HTMLButtonElement>('#'+id)!;
   const code = document.querySelector<HTMLInputElement>('#code')!;
   const consent = document.querySelector<HTMLInputElement>('#consent')!;
@@ -30,7 +30,7 @@ export function installFailedRenewalPage(sdk:Sdk, diagnostics?:Diagnostics):void
     if (state === 'STOPPED') return;
     if (state === 'CONFIRMING') {
       // Abort and destroy can themselves retire a pending confirm. Read its original failure first.
-      const failure = diagnostics?.readStripePaymentAttemptFailure(initial);
+      const failure = diagnostics.readStripePaymentAttemptFailure(initial);
       if (failure) confirmFailure = `BROWSER_CONFIRM_${failure}`;
     }
     phase('STOPPED');
@@ -70,6 +70,7 @@ export function installFailedRenewalPage(sdk:Sdk, diagnostics?:Diagnostics):void
   document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')stop();});
   expose('__failedRenewalStop',stop);
   expose('__failedRenewalInitialConfirmFailure',()=>state==='STOPPED'?confirmFailure:null);
+  expose('__failedRenewalInitialInputComplete',()=>state==='READY'&&diagnostics.readStripePaymentAttemptInputComplete(initial));
   expose('__failedRenewalConfigure',(c:Configuration)=>{
     try {
       if (state!=='NEW' || !Number.isSafeInteger(c.deadline) || c.deadline<=Date.now() ||
@@ -143,8 +144,12 @@ export function installFailedRenewalPage(sdk:Sdk, diagnostics?:Diagnostics):void
       if(!event.isTrusted || button('pay').disabled)throw Error();
       take('READY','CONFIRMING');
       button('pay').disabled = true;
+      if(!diagnostics.readStripePaymentAttemptInputComplete(initial)){
+        confirmFailure='BROWSER_CARD_INCOMPLETE';
+        throw Error();
+      }
       reportPayProgress('ENTERED');
-      disposePending = diagnostics?.observeStripePaymentAttemptPending(initial,reportPayProgress);
+      disposePending = diagnostics.observeStripePaymentAttemptPending(initial,reportPayProgress);
       const result = await initial!.confirm();
       check('CONFIRMING');
       if ('validationFailed' in result) throw Error();

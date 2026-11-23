@@ -11,6 +11,7 @@ function rehearse() {
   const paymentResult = {state: 'OBSERVE', retryAllowed: false, successorAttemptId: null};
   const methodResult = {...method, status: 'RESERVED', actionAvailable: false};
   const handle = result => ({confirm: async () => result, destroy() {}});
+  const payment = handle(paymentResult);
   const client = {
     requestEmailOtp: async () => ({challengeId:'local'}),
     verifyEmailOtp: async () => session,
@@ -21,8 +22,12 @@ function rehearse() {
   window.__failedRenewalTerminal = () => {};
   installRehearsalPage({
     createGenericPaymentClient: () => client,
-    mountStripePaymentAttempt: async () => handle(paymentResult),
+    mountStripePaymentAttempt: async () => payment,
     mountStripeSubscriptionMethod: async () => handle(methodResult),
+  }, {
+    readStripePaymentAttemptInputComplete: candidate => candidate === payment,
+    readStripePaymentAttemptFailure: () => null,
+    observeStripePaymentAttemptPending: () => () => {},
   });
   const get = id => document.getElementById(id);
   new MutationObserver(() => {
@@ -35,7 +40,7 @@ function rehearse() {
         get('consent').checked = true;
         get('start').click();
         break;
-      case 'READY': get('pay').disabled = false; break;
+      case 'READY': get('pay').disabled = !window.__failedRenewalInitialInputComplete(); break;
       case 'OBSERVE': void window.__failedRenewalMethod(method); break;
       case 'METHOD_READY': get('confirm-method').disabled = false; break;
     }
