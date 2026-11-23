@@ -10,6 +10,7 @@ import dev.genericpayments.platform.PaymentPlatformApplication;
 import dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedGraceBillingTime;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedGraceAdvanceAdapter;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalObserver.Checkpoint;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter;
 import dev.genericpayments.platform.support.*;
 import jakarta.persistence.EntityManagerFactory;
 import java.io.IOException;
@@ -57,6 +58,7 @@ public final class OwnedBillingFailedRenewalRuntime {
             "METHOD_PREPARE","METHOD_SELECT","METHOD_CONFIRM","METHOD_APPLY","RECOVERY_CONFIRM","RECOVERY_OBSERVE");
         private static final Set<String> FAILED_SUBSTAGES=failedSubstages();
         private static final Set<String> GRACE_LAST_SECOND_SUBSTAGES=graceLastSecondSubstages();
+        private static final Set<String> RECOVERY_CONFIRM_SUBSTAGES=recoveryConfirmSubstages();
         private static Set<String> failedSubstages(){
             var stages=new HashSet<>(Set.of("FAILED_RENEWAL_CLOCK_ADVANCE","FAILED_RENEWAL_ADMISSION",
                 "FAILED_RENEWAL_OBSERVATION","FAILED_RENEWAL_EVIDENCE"));
@@ -67,6 +69,13 @@ public final class OwnedBillingFailedRenewalRuntime {
             var stages=new HashSet<>(Set.of("GRACE_LAST_SECOND_PREPARATION","GRACE_LAST_SECOND_CLOCK_ADVANCE",
                 "GRACE_LAST_SECOND_CLOCK_EVIDENCE","GRACE_LAST_SECOND_ACCESS"));
             for(var checkpoint:StripeBillingOwnedFailedGraceAdvanceAdapter.Checkpoint.values())stages.add("GRACE_LAST_SECOND_CLOCK_"+checkpoint.name());
+            return Set.copyOf(stages);
+        }
+        private static Set<String> recoveryConfirmSubstages(){
+            var stages=new HashSet<>(Set.of("RECOVERY_CONFIRM_MANAGEMENT","RECOVERY_CONFIRM_CONFIRMATION",
+                "RECOVERY_CONFIRM_ACCESS","RECOVERY_CONFIRM_RESPONSE_BUILD"));
+            for(var checkpoint:StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter.Checkpoint.values())
+                stages.add("RECOVERY_CONFIRM_CONFIRMATION_"+checkpoint.name());
             return Set.copyOf(stages);
         }
         private final OwnedBillingFailedRenewalOperations operations;private final byte[] authorization;
@@ -117,7 +126,8 @@ public final class OwnedBillingFailedRenewalRuntime {
                     case "/failed-renewal/grace-last-second" -> {dispatchedSubstages=GRACE_LAST_SECOND_SUBSTAGES;yield operations.graceLastSecond();}
                     case "/failed-renewal/grace-at" -> operations.graceAt();case "/failed-renewal/grace-after" -> operations.graceAfter();
                     case "/failed-renewal/method/prepare" -> operations.prepareMethod();case "/failed-renewal/method/select" -> operations.selectMethod();case "/failed-renewal/method/confirm" -> operations.confirmMethod();case "/failed-renewal/method/apply" -> operations.applyMethod();
-                    case "/failed-renewal/recovery/confirm" -> operations.confirmRecovery();case "/failed-renewal/recovery/observe" -> operations.observeRecovery();default -> throw new IllegalStateException();
+                    case "/failed-renewal/recovery/confirm" -> {dispatchedSubstages=RECOVERY_CONFIRM_SUBSTAGES;yield operations.confirmRecovery();}
+                    case "/failed-renewal/recovery/observe" -> operations.observeRecovery();default -> throw new IllegalStateException();
                 };
                 reply(exchange,200,response);
             }catch(Exception invalid){

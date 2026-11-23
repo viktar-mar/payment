@@ -189,6 +189,62 @@ class OwnedBillingFailedRenewalRuntimeTest {
         }
     }
 
+    @Test void recoveryConfirmationPublishesOnlyFixedStepsForTheThrownRefusal() throws Exception {
+        var steps=Map.ofEntries(
+            Map.entry("RECOVERY_CONFIRM_MANAGEMENT","RECOVERY_CONFIRM_MANAGEMENT"),
+            Map.entry("RECOVERY_CONFIRM_CONFIRMATION","RECOVERY_CONFIRM_CONFIRMATION"),
+            Map.entry("RECOVERY_CONFIRM_ACCESS","RECOVERY_CONFIRM_ACCESS"),
+            Map.entry("RECOVERY_CONFIRM_RESPONSE_BUILD","RECOVERY_CONFIRM_RESPONSE_BUILD"),
+            Map.entry("RECOVERY_CONFIRM_CONFIRMATION_PREFLIGHT","RECOVERY_CONFIRM_CONFIRMATION_PREFLIGHT"),
+            Map.entry("RECOVERY_CONFIRM_CONFIRMATION_AUTHORITY","RECOVERY_CONFIRM_CONFIRMATION_AUTHORITY"),
+            Map.entry("RECOVERY_CONFIRM_CONFIRMATION_CLAIM","RECOVERY_CONFIRM_CONFIRMATION_CLAIM"),
+            Map.entry("RECOVERY_CONFIRM_CONFIRMATION_POST","RECOVERY_CONFIRM_CONFIRMATION_POST"),
+            Map.entry("RECOVERY_CONFIRM_CONFIRMATION_REPLY","RECOVERY_CONFIRM_CONFIRMATION_REPLY"),
+            Map.entry("RECOVERY_CONFIRM_CONFIRMATION_ACK","RECOVERY_CONFIRM_CONFIRMATION_ACK"),
+            Map.entry("RECOVERY_CONFIRM","RECOVERY_CONFIRM"),
+            Map.entry("RECOVERY_CONFIRM_CONFIRMATION_PRIVATE","UNCLASSIFIED"),
+            Map.entry("GRACE_LAST_SECOND_ACCESS","UNCLASSIFIED")
+        );
+        for(var step:steps.entrySet()){
+            var fault=new IllegalStateException("private synthetic detail");
+            var ops=new Inert(){
+                public JsonObject confirmRecovery(){throw fault;}
+                public String failureStage(){return "RECOVERY_CONFIRM";}
+                public String failureStage(Exception error){return error==fault&&aborts.get()==0?step.getKey():failureStage();}
+            };
+            var exchange=request("POST","/failed-renewal/recovery/confirm","{}");
+            handler(ops).handle(exchange);
+            assertThat(exchange.code).isEqualTo(400);
+            assertThat(exchange.output.toString()).as("checkpoint %s",step.getKey())
+                .isEqualTo("{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\""+step.getValue()+"\"}");
+            assertThat(exchange.responses.getFirst("Cache-Control")).isEqualTo("no-store");
+            assertThat(ops.aborts).hasValue(1);
+        }
+    }
+
+    @Test void requestsOutsideRecoveryConfirmationCannotPublishDetailedSubstages() throws Exception {
+        String route="/failed-renewal/recovery/confirm";
+        var unauthorized=request("POST",route,"{}");
+        unauthorized.requests.set("Authorization","Bearer wrong");
+        var responses=Map.of(
+            request("POST","/failed-renewal/recovery/observe","{}"),"{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}",
+            request("POST",route,"{\"private\":true}"),"{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}",
+            request("POST",route+"?private=true","{}"),"{\"code\":\"INVALID_REQUEST\"}",
+            request("GET",route,"{}"),"{\"code\":\"INVALID_REQUEST\"}",
+            unauthorized,"{\"code\":\"DENIED\"}"
+        );
+        for(var entry:responses.entrySet()){
+            var ops=new Inert(){
+                public JsonObject confirmRecovery(){throw new AssertionError("No admitted recovery confirmation");}
+                public JsonObject observeRecovery(){throw new IllegalStateException("private observation detail");}
+                public String failureStage(){return "RECOVERY_CONFIRM_CONFIRMATION_ACK";}
+                public String failureStage(Exception error){throw new AssertionError("No selected recovery confirmation");}
+            };
+            handler(ops).handle(entry.getKey());
+            assertThat(entry.getKey().output.toString()).isEqualTo(entry.getValue());
+        }
+    }
+
     // A competing request must not call abort, cancelling the dispatched winner's authority.
     @Test void concurrentStageLosersCannotDispatchOrStealWinnerCleanup() throws Exception {
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var failures=new CopyOnWriteArrayList<Throwable>();

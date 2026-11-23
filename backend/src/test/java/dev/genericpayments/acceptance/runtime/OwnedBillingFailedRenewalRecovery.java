@@ -2,6 +2,7 @@ package dev.genericpayments.acceptance.runtime;
 
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalMethodObserver;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter.Diagnostic;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Completion;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Publication;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Recovery;
@@ -36,10 +37,16 @@ public final class OwnedBillingFailedRenewalRecovery {
     }
 
     public ConfirmationAck confirm() {
+        return confirm(null);
+    }
+
+    public ConfirmationAck confirm(Diagnostic diagnostic) {
         // Refusal does not enter the owner's failure path or touch its delegates.
         if(!state.compareAndSet(State.NEW,State.CONFIRMING))throw unavailable();
         try {
-            var acknowledged=Objects.requireNonNull(confirmer.confirm(reservation,completion,recovery,originalContext));
+            var acknowledged=Objects.requireNonNull(diagnostic==null
+                ?confirmer.confirm(reservation,completion,recovery,originalContext)
+                :confirmer.confirm(reservation,completion,recovery,originalContext,diagnostic));
             confirmation=acknowledged;
             state.set(State.CONFIRMED);
             return acknowledged;

@@ -46,7 +46,20 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
         this.clients=Objects.requireNonNull(clients);this.digest=Objects.requireNonNull(digest);
         this.utc=Objects.requireNonNull(utc);this.nanos=Objects.requireNonNull(nanos);
     }
+    public enum Checkpoint { PREFLIGHT, AUTHORITY, CLAIM, POST, REPLY, ACK }
+
+    /** Created for a single acceptance invocation. Holds only its fixed current stage. */
+    public static final class Diagnostic {
+        private Checkpoint checkpoint;
+        public Checkpoint checkpoint(){return checkpoint;}
+    }
+
     public ConfirmationAck confirm(Reservation reservation,Completion completion,Recovery recovery,SubscriptionCommandContext originalContext){
+        return confirm(reservation,completion,recovery,originalContext,new Diagnostic());
+    }
+
+    public ConfirmationAck confirm(Reservation reservation,Completion completion,Recovery recovery,SubscriptionCommandContext originalContext,Diagnostic diagnostic){
+        Objects.requireNonNull(diagnostic).checkpoint=Checkpoint.PREFLIGHT;
         RecoveryPreparationContext original=null;ProviderOperation owned=null;
         SuccessorOwner privateOwner=null;
         final InvocationBudget budget;
@@ -55,6 +68,7 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
             budget.remainingNanos(null);
             if(reservation!=null&&reservation.successor()!=null)privateOwner=SuccessorOwner.create();
             var prepared=remotePreflight.inspect(reservation,completion,recovery,originalContext,budget);
+            diagnostic.checkpoint=Checkpoint.AUTHORITY;
             original=prepared.original();checkpoint(budget,null,original);
             if(!reservation.equals(original.reservation())||!completion.equals(original.completion())||!recovery.equals(original.recovery())
                     ||!StripeBillingTestClockAdapter.API_VERSION.equals(reservation.admission().firstRenewalAdmission().receipt().intent().clock().owner().apiVersion()))throw unavailable();
@@ -63,6 +77,7 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
             // Credentials and client construction are caller-side work within the same original budget.
             var resolved=credentials.resolve(original.account());checkpoint(budget,null,original);
             var client=clients.create(resolved);checkpoint(budget,null,original);
+            diagnostic.checkpoint=Checkpoint.CLAIM;
             String fingerprint=OwnedRecoveryConfirmService.fingerprint(original,digest);
             String claimant=UUID.randomUUID().toString();
             var claim=privateOwner==null?confirmations.claim(original,originalContext,claimant,budget)
@@ -78,12 +93,15 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
             checkpoint(budget,claim,original);
             String key=new ProviderOperationGuard().requireDispatch(claim,original.account(),fingerprint,utc.instant());
             var params=PaymentIntentConfirmParams.builder().setPaymentMethod(completion.method()).setOffSession(true).setErrorOnRequiresAction(true).build();
+            diagnostic.checkpoint=Checkpoint.POST;
             var remote=call(budget,claim,original.enrollment().sessionExpiresAt(),key,
                 options->client.v1().paymentIntents().confirm(reservation.failure().paymentIntent(),params,options));
+            diagnostic.checkpoint=Checkpoint.REPLY;
             checkpoint(budget,claim,original);
             var reply=reply(remote,original,utc.instant());checkpoint(budget,claim,original);
             // Success changes the remote graph. Only fresh local original authority and the exact
             // claim/reply are checked by this atomic ACK; the independent observer owns settlement.
+            diagnostic.checkpoint=Checkpoint.ACK;
             return privateOwner==null?confirmations.acknowledge(original,claim,reply,originalContext,budget)
                 :confirmations.acknowledge(original,claim,reply,originalContext,budget,privateOwner);
         }catch(RuntimeException failure){

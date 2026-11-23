@@ -57,6 +57,27 @@ class OwnedBillingFailedRenewalSandboxStateTest {
         }
     }
 
+    @Test void recoveryManagementCheckpointBelongsToTheConsumedCallsRefusal() throws ReflectiveOperationException {
+        var scenario=new OwnedBillingFailedRenewalSandboxScenario(admission(),type->{throw new AssertionError("Unexpected bean access");},
+            Clock.fixed(NOW,ZoneOffset.UTC),NOW.plusSeconds(120));
+        // Seed only the outer phase so the real management gate still rejects the missing initial authority.
+        var field=OwnedBillingFailedRenewalSandboxScenario.class.getDeclaredField("state");
+        field.setAccessible(true);
+        var state=(OwnedBillingFailedRenewalSandboxScenario.State)field.get(scenario);
+        long ticket=state.enter("INITIAL","METHOD_READY_RUNNING");
+        state.complete(ticket,"METHOD_READY_RUNNING","METHOD_READY");
+
+        var refusal=catchThrowableOfType(IllegalStateException.class,scenario::confirmRecovery);
+        assertThat(refusal).hasMessage("FAILED_RENEWAL_STOPPED").hasNoCause().hasNoSuppressedExceptions();
+        assertThat(scenario.failureStage(refusal)).isEqualTo("RECOVERY_CONFIRM_MANAGEMENT");
+        assertThat(scenario.failureStage()).isEqualTo("RECOVERY_CONFIRM");
+        assertThat(state.phase()).isEqualTo("STOPPED");
+
+        var replay=catchThrowableOfType(IllegalStateException.class,scenario::confirmRecovery);
+        assertThat(replay).isNotSameAs(refusal).hasMessage("FAILED_RENEWAL_STOPPED");
+        assertThat(scenario.failureStage(replay)).isEqualTo("RECOVERY_CONFIRM");
+    }
+
     private static void invoke(OwnedBillingFailedRenewalOperations scenario,String stage) {
         switch(stage) {
             case "boundary"->scenario.boundary();case "armDecline"->scenario.armDecline();case "failedRenewal"->scenario.failedRenewal();

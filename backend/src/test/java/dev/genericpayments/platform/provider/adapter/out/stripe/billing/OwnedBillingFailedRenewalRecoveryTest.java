@@ -2,6 +2,8 @@ package dev.genericpayments.platform.provider.adapter.out.stripe.billing;
 
 import dev.genericpayments.acceptance.runtime.OwnedBillingFailedRenewalRecovery;
 import dev.genericpayments.acceptance.runtime.OwnedBillingFailedRenewalRecovery.State;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter.Checkpoint;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter.Diagnostic;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
 import java.util.*;
@@ -86,10 +88,14 @@ class OwnedBillingFailedRenewalRecoveryTest {
 
     @Test void failedActualConfirmationConsumesTheInstanceWithoutInventingAnAckOrRetrying() {
         var f=new Fixture();var recovery=recovery(f);f.g.queueClocks();var bad=f.body();bad.addProperty("amount_received",999);f.g.sdk.http.reply(bad.toString());
-        refused(recovery::confirm);assertThat(recovery.state()).isEqualTo(State.FAILED);
+        var diagnostic=new Diagnostic();
+        refused(()->recovery.confirm(diagnostic));assertThat(recovery.state()).isEqualTo(State.FAILED);
+        assertThat(diagnostic.checkpoint()).isEqualTo(Checkpoint.REPLY);
         assertThat(recovery.confirmation()).isEmpty();assertThat(recovery.publication()).isEmpty();f.onlyOwnUnknown();
         var receipts=f.confirmation.receiptState();var before=f.g.local.state();int calls=f.g.sdk.http.calls.size();
-        refused(recovery::confirm);refused(recovery::observe);
+        var replayDiagnostic=new Diagnostic();
+        refused(()->recovery.confirm(replayDiagnostic));refused(recovery::observe);
+        assertThat(replayDiagnostic.checkpoint()).isNull();
         assertThat(recovery.state()).isEqualTo(State.FAILED);assertThat(f.g.sdk.http.calls).hasSize(calls);
         assertThat(f.confirmation.receiptState()).isEqualTo(receipts);assertThat(f.g.local.state()).isEqualTo(before);
     }

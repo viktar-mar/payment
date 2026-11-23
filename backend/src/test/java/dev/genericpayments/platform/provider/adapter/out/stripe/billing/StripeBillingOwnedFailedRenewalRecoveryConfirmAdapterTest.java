@@ -5,6 +5,8 @@ import com.stripe.StripeClient;
 import com.stripe.exception.StripeException;
 import com.stripe.net.*;
 import dev.genericpayments.platform.provider.adapter.out.stripe.*;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter.Checkpoint;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter.Diagnostic;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.*;
 import dev.genericpayments.platform.provider.application.model.OwnedRecoveryConfirm.*;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
@@ -17,12 +19,36 @@ import java.util.concurrent.atomic.*;
 import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedRecoveryPreparationMappingTest.*;
 import static org.assertj.core.api.Assertions.*;
 
 /** Actual original authentication and actual one-use service; only the official SDK transport is inert. */
 class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
+    @ParameterizedTest @EnumSource(Checkpoint.class)
+    void refusalRetainsOnlyItsInvocationCheckpoint(Checkpoint checkpoint) {
+        var f=new Fixture();
+        f.g.queueClocks();
+        var body=f.body();
+        switch(checkpoint) {
+            case PREFLIGHT -> f.g.change(1,j->StripeBillingFailedRenewalMappingTest.first(j).addProperty("id","cus_other"));
+            case AUTHORITY -> f.beforeConfirmClient=()->{throw new IllegalStateException("PRIVATE_PROVIDER_DETAIL");};
+            case CLAIM -> f.confirmation.service().claim(f.g.original,f.g.local.command(),"other-invocation",
+                    new InvocationBudget(f.g.local.clock(),f.nanos::get));
+            case POST -> f.postTransport=request->{throw new IllegalStateException("PRIVATE_PROVIDER_DETAIL");};
+            case REPLY -> body.addProperty("latest_charge","PRIVATE_PROVIDER_DETAIL");
+            case ACK -> f.confirmation.failAck(true);
+        }
+        f.g.sdk.http.reply(body.toString());
+        var diagnostic=new Diagnostic();
+        refused(()->f.adapter().confirm(f.g.local.reservation(),f.g.local.completion(),f.g.local.recovery(),f.g.local.command(),diagnostic));
+        assertThat(diagnostic.checkpoint()).isEqualTo(checkpoint);
+        assertThat(new Diagnostic().checkpoint()).isNull();
+        assertThat(diagnostic.toString()).doesNotContain("PRIVATE_PROVIDER_DETAIL","cus_other");
+        f.noAckOrFinancialChange();
+    }
+
     @Test void originalSeventeenGetsPrecedeOneExactConfirmAndAckHasNoFinancialAuthority(){
         var f=new Fixture();f.queue();var before=f.g.local.state();var ack=f.confirm();
         assertThat(ack.operation()).isEqualTo(f.confirmation.row());assertThat(ack.operation().status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);

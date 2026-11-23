@@ -785,6 +785,49 @@ test('post-arm owner reports the grace clock refusal without invoking another fi
  assert.deepEqual(paths.slice(-3),['/failed-renewal/failed','/failed-renewal/grace-last-second','/failed-renewal/abort']);
  assert.equal(result.failedRenewalAccepted,false);
 });
+for(const [fault,checkpoint] of [
+ ['authority','AUTHORITY'],['transport','TRANSPORT'],['late server reply','TRANSPORT'],['http','HTTP'],['invalid response','RESPONSE'],
+ ['server confirmation','SERVER_CONFIRMATION'],['server provider reply','SERVER_CONFIRMATION_REPLY'],
+ ['post-ack access','SERVER_ACCESS'],['extra server field','HTTP'],['wrong server route','HTTP'],
+])test('recovery confirmation preserves '+fault+' without observing or repeating the debt operation',async()=>{
+ const h=harness(),paths=[],abort=new AbortController();
+ let releaseLateReply;
+ const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),initial(),...h.vs.slice(0,10)];
+ h.dependencies.createRuntime=()=>clients.createBillingFailedRenewalRuntime({configuration:opts(),bootstrap:{
+  withFailedRenewalRuntime:cb=>fault==='authority'&&replies.length===0?false:cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)})
+ }},{fetch:async url=>{
+  const path=new URL(url).pathname;paths.push(path);
+  if(path==='/failed-renewal/abort')return new Response('{"code":"QUIESCENT"}');
+  if(path==='/failed-renewal/recovery/confirm'){
+   if(fault==='transport')throw Error('private recovery canary');
+   if(fault==='late server reply')return new Promise(resolve=>{releaseLateReply=resolve;abort.abort();});
+   if(fault==='http')return new Response('private recovery canary',{status:503});
+   if(fault==='invalid response')return new Response(JSON.stringify({...h.vs[10],recovery_charge_id:'private recovery canary'}));
+   const stage=fault==='wrong server route'?'FAILED_RENEWAL_ADMISSION':
+    'RECOVERY_CONFIRM_'+(checkpoint.startsWith('SERVER_')?checkpoint.slice('SERVER_'.length):'CONFIRMATION');
+   const body={code:'FAILED_RENEWAL_STOPPED',stage};
+   if(fault==='extra server field')body.detail='private recovery canary';
+   return new Response(JSON.stringify(body),{status:400});
+  }
+  return new Response(JSON.stringify(replies.shift()));
+ }});
+ const o=await owner(h);await assert.rejects(o.run(h.journey,{...limits(),signal:abort.signal}));
+ const result=await o.close(),line=postArmLine('RECOVERY_CONFIRM','RECOVERY_CONFIRM_'+checkpoint);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(postArmLine('RECOVERY_OBSERVE','RECOVERY_CONFIRM_'+checkpoint)),null);
+ assert.equal(paths.at(-1),'/failed-renewal/abort');
+ assert.equal(paths.filter(path=>path==='/failed-renewal/recovery/confirm').length,fault==='authority'?0:1);
+ assert.ok(!paths.includes('/failed-renewal/recovery/observe'));
+ assert.equal(result.failedRenewalAccepted,false);
+ assert.ok(!JSON.stringify(result).includes('private recovery canary'));
+ if(fault==='late server reply'){
+  assert.equal(result.code,'ABORTED');
+  releaseLateReply(new Response('{"code":"FAILED_RENEWAL_STOPPED","stage":"RECOVERY_CONFIRM_CONFIRMATION_POST"}',{status:400}));
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(owners.formatBillingFailedRenewalDiagnostic(o.resources()),line);
+ }
+});
 test('post-arm terminal protocol rejects foreign stages, mismatched codes, arbitrary text and false cleanup claims',()=>{
  const base={scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',status:'CLOSED',phase:'FAILED_RENEWAL',code:'FAILED_RENEWAL',diagnostic:'FAILED_RENEWAL_REQUEST',initialAccepted:false,failedRenewalAccepted:false,full5bAccepted:false,cleanupConfirmed:true,cleanupFailure:null};
  for(const changes of [{diagnostic:'GRACE_AT_REQUEST'},{scope:'OWNED_INITIAL_PAYMENT'},{phase:'PRIVATE'},{code:'METHOD_ORDER'},{initialAccepted:true},{failedRenewalAccepted:true},{full5bAccepted:true},{status:'RUNNING'},{diagnostic:'FAILED_RENEWAL_PRIVATE'}])assert.equal(owners.formatBillingFailedRenewalDiagnostic({...base,...changes}),null);

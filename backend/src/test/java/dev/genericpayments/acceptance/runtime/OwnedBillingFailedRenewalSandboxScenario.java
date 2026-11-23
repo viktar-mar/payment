@@ -5,6 +5,7 @@ import dev.genericpayments.platform.catalog.domain.*;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedGraceAdvanceAdapter;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalObserver;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter;
 import dev.genericpayments.platform.provider.application.model.*;
 import dev.genericpayments.platform.provider.application.service.OwnedMethodBrowserService;
 import dev.genericpayments.platform.subscriptions.application.model.*;
@@ -158,7 +159,22 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
         missingAccess();selected=null;action=null;return response("METHOD_READY");
     });}
     @Override public JsonObject confirmRecovery(){return stage("METHOD_READY","RECOVERY_ACKNOWLEDGED",Stage.RECOVERY_CONFIRM,()->{
-        management();recovery.confirm();missingAccess();return response("RECOVERY_ACKNOWLEDGED");
+        detailedStep="RECOVERY_CONFIRM_MANAGEMENT";
+        management();
+        var diagnostic=new StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter.Diagnostic();
+        detailedStep="RECOVERY_CONFIRM_CONFIRMATION";
+        try{recovery.confirm(diagnostic);}
+        catch(RuntimeException refusal){
+            var checkpoint=diagnostic.checkpoint();
+            if(checkpoint!=null)detailedStep="RECOVERY_CONFIRM_CONFIRMATION_"+checkpoint.name();
+            throw refusal;
+        }
+        detailedStep="RECOVERY_CONFIRM_ACCESS";
+        missingAccess();
+        detailedStep="RECOVERY_CONFIRM_RESPONSE_BUILD";
+        var result=response("RECOVERY_ACKNOWLEDGED");
+        detailedStep=null;
+        return result;
     });}
     @Override public JsonObject observeRecovery(){return stage("RECOVERY_ACKNOWLEDGED","RECOVERED_SETTLED_LOCAL",Stage.RECOVERY_OBSERVE,()->{
         management();recovery.observe();var evaluated=failure.graceDeadline().plusSeconds(1);var n=pending.boundary().period().end();
