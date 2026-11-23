@@ -2,7 +2,7 @@ package dev.genericpayments.platform.provider.adapter.out.stripe.billing;
 
 import com.google.gson.*;
 import com.stripe.StripeClient;
-import com.stripe.exception.StripeException;
+import com.stripe.exception.*;
 import com.stripe.net.*;
 import dev.genericpayments.platform.provider.adapter.out.stripe.*;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter.Checkpoint;
@@ -26,7 +26,7 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Actual original authentication and actual one-use service; only the official SDK transport is inert. */
 class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
-    @ParameterizedTest @EnumSource(Checkpoint.class)
+    @ParameterizedTest @EnumSource(value=Checkpoint.class,names={"PREFLIGHT","AUTHORITY","CLAIM","POST","REPLY","ACK"})
     void refusalRetainsOnlyItsInvocationCheckpoint(Checkpoint checkpoint) {
         var f=new Fixture();
         f.g.queueClocks();
@@ -167,8 +167,15 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
     }
     @Test void originalRawSessionBoundaryAtConfirmWorkerEntryRefusesWithLiveInvocationAndLease(){
         var f=new Fixture();f.g.local.at(f.g.original.enrollment().sessionExpiresAt().minusSeconds(1));f.entry=f.g.local.now();f.queue();var caller=Thread.currentThread();
-        f.invocationClock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId z){return this;}public Instant instant(){return Thread.currentThread()!=caller&&f.confirmation.row()!=null?f.g.original.enrollment().sessionExpiresAt():f.g.local.now();}};
-        refused(f::confirm);assertThat(f.gets()).hasSize(17);assertThat(f.posts()).isEmpty();f.onlyOwnUnknown();
+        var workerClockReads=new AtomicInteger();
+        f.invocationClock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId z){return this;}public Instant instant(){
+            // Keep the shared invocation clock unchanged. Expire the original session at the worker's separate check.
+            return Thread.currentThread()!=caller&&f.confirmation.row()!=null&&workerClockReads.incrementAndGet()>1
+                ?f.g.original.enrollment().sessionExpiresAt():f.g.local.now();
+        }};
+        var diagnostic=new Diagnostic();
+        refused(()->f.confirm(diagnostic));assertThat(f.gets()).hasSize(17);assertThat(f.posts()).isEmpty();f.onlyOwnUnknown();
+        assertThat(diagnostic.checkpoint().name()).isEqualTo("POST_WORKER_ADMISSION");
         assertThat(f.confirmation.budgetUses().getFirst().deadlineAt()).isAfter(f.g.original.enrollment().sessionExpiresAt());
         assertThat(f.confirmation.row().firstDispatchedAt().plusSeconds(60)).isAfter(f.g.original.enrollment().sessionExpiresAt());
     }
@@ -179,12 +186,20 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
     @Test void blockedConfirmHasActualTwoSecondCompleteCallBoundAndCancelsWithoutRetry()throws Exception{
         var f=new Fixture();f.g.queueClocks();var entered=new CountDownLatch(1);var cancelled=new CountDownLatch(1);var entries=new AtomicInteger();
         f.postTransport=request->{entries.incrementAndGet();entered.countDown();try{new CountDownLatch(1).await();throw new AssertionError("unreachable");}catch(InterruptedException e){cancelled.countDown();throw new IllegalStateException("PRIVATE_PROVIDER_DETAIL");}};
-        long started=System.nanoTime();refused(f::confirm);assertThat(Duration.ofNanos(System.nanoTime()-started)).isBetween(Duration.ofSeconds(1),Duration.ofSeconds(4));
+        var diagnostic=new Diagnostic();
+        long started=System.nanoTime();refused(()->f.confirm(diagnostic));assertThat(Duration.ofNanos(System.nanoTime()-started)).isBetween(Duration.ofSeconds(1),Duration.ofSeconds(4));
+        assertThat(diagnostic.checkpoint().name()).isEqualTo("POST_TIMEOUT");
         assertThat(entered.await(1,TimeUnit.SECONDS)).isTrue();assertThat(cancelled.await(1,TimeUnit.SECONDS)).isTrue();assertThat(entries).hasValue(1);f.onlyOwnUnknown();
     }
     @ParameterizedTest @ValueSource(strings={"injected","utc"})
     void completedConfirmAtExclusiveTwoSecondCallDeadlineIsUncertain(String clock){
-        var f=new Fixture();f.queue();f.afterPost=()->{if(clock.equals("injected"))f.nanos.addAndGet(TimeUnit.SECONDS.toNanos(2));else f.g.local.at(f.entry.plusSeconds(2));};refused(f::confirm);f.onlyOwnUnknown();assertThat(f.posts()).hasSize(1);
+        var f=new Fixture();f.queue();f.afterPost=()->{
+            awaitTimedWait(f.caller);
+            if(clock.equals("injected"))f.nanos.addAndGet(TimeUnit.SECONDS.toNanos(2));else f.g.local.at(f.entry.plusSeconds(2));
+        };
+        var diagnostic=new Diagnostic();
+        refused(()->f.confirm(diagnostic));f.onlyOwnUnknown();assertThat(f.posts()).hasSize(1);
+        assertThat(diagnostic.checkpoint().name()).isEqualTo("POST_REPLY_BUDGET");
     }
     @ParameterizedTest @ValueSource(strings={"injected","utc"})
     void confirmWorkerScheduledAtExclusiveCallDeadlineCannotEnterSdk(String clock){
@@ -199,8 +214,9 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
     @Test void callerInterruptionDuringPostCancelsWorkerAndConsumesOnlyItsOwnClaim()throws Exception{
         var entered=new CountDownLatch(1);var cancelled=new CountDownLatch(1);var preserved=new AtomicBoolean();var entries=new AtomicInteger();
         var task=new FutureTask<Void>(()->{var f=new Fixture();f.g.queueClocks();f.postTransport=request->{entries.incrementAndGet();entered.countDown();try{new CountDownLatch(1).await();throw new AssertionError("unreachable");}catch(InterruptedException e){cancelled.countDown();throw new IllegalStateException("PRIVATE_PROVIDER_DETAIL");}};
-            try{refused(f::confirm);preserved.set(Thread.currentThread().isInterrupted());f.onlyOwnUnknown();return null;}finally{Thread.interrupted();}});
-        var caller=Thread.ofVirtual().start(task);try{assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();caller.interrupt();task.get(2,TimeUnit.SECONDS);assertThat(preserved).isTrue();assertThat(cancelled.await(1,TimeUnit.SECONDS)).isTrue();assertThat(entries).hasValue(1);}finally{caller.interrupt();task.cancel(true);}
+            var diagnostic=new Diagnostic();
+            try{refused(()->f.confirm(diagnostic));preserved.set(Thread.currentThread().isInterrupted());assertThat(diagnostic.checkpoint().name()).isEqualTo("POST_INTERRUPTED");f.onlyOwnUnknown();return null;}finally{Thread.interrupted();}});
+        var caller=Thread.ofVirtual().start(task);try{assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();awaitTimedWait(caller);caller.interrupt();task.get(2,TimeUnit.SECONDS);assertThat(preserved).isTrue();assertThat(cancelled.await(1,TimeUnit.SECONDS)).isTrue();assertThat(entries).hasValue(1);}finally{caller.interrupt();task.cancel(true);}
     }
     @Test void existingCommittedClaimCannotBeAdoptedOrStoppedByAnotherAdapterInvocation(){
         var f=new Fixture();var budget=new InvocationBudget(f.g.local.clock(),f.nanos::get);var claim=f.confirmation.service().claim(f.g.original,f.g.local.command(),"other-invocation",budget);var before=f.confirmation.receiptState();f.queue();
@@ -210,6 +226,85 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
         var f=new Fixture();f.queue();f.confirmation.failAck(true);refused(f::confirm);f.onlyOwnUnknown();assertThat(f.g.local.trace()).containsSubsequence("confirm-ack","rollback","confirm-lock","stop","commit");
     }
 
+    @Test void lessThanOneMillisecondOfOriginalSessionBudgetRefusesBeforeSdk() {
+        var f=new Fixture();f.g.local.at(f.g.original.enrollment().sessionExpiresAt().minusSeconds(10));f.entry=f.g.local.now();f.queue();
+        var locks=new AtomicInteger();
+        f.confirmation.afterLock(()->{
+            if(locks.incrementAndGet()==2)f.g.local.at(f.g.original.enrollment().sessionExpiresAt().minusNanos(1));
+        });
+        var diagnostic=new Diagnostic();
+        refused(()->f.confirm(diagnostic));
+        assertThat(diagnostic.checkpoint().name()).isEqualTo("POST_ADMISSION");
+        assertThat(f.posts()).isEmpty();f.onlyOwnUnknown();
+    }
+
+    @Test void expiredWaitBudgetAfterSchedulingRemainsUncertain() {
+        var f=new Fixture();f.queue();
+        var diagnostic=new Diagnostic();var entries=new AtomicInteger();
+        f.postTransport=request->{entries.incrementAndGet();return f.g.sdk.http.request(request);};
+        f.invocationNanos=()->{
+            if(Thread.currentThread()==f.caller&&diagnostic.checkpoint()!=null&&diagnostic.checkpoint().name().equals("POST_WAIT_BUDGET"))
+                f.nanos.set(TimeUnit.SECONDS.toNanos(2));
+            return f.nanos.get();
+        };
+        refused(()->f.confirm(diagnostic));
+        assertThat(diagnostic.checkpoint().name()).isEqualTo("POST_WAIT_BUDGET");
+        assertThat(entries.get()).isBetween(0,1);
+        f.onlyOwnUnknown();
+    }
+
+    @Test void opaqueWorkerErrorIsNeverStringifiedOrReportedAsStripeRejection() {
+        var f=new Fixture();f.g.queueClocks();
+        var read=new AtomicBoolean();
+        f.postTransport=request->{throw new AssertionError(){
+            @Override public String getMessage(){read.set(true);return "PRIVATE_PROVIDER_DETAIL";}
+        };};
+        var diagnostic=new Diagnostic();
+        refused(()->f.confirm(diagnostic));
+        assertThat(read).isFalse();
+        assertThat(diagnostic.checkpoint()).isEqualTo(Checkpoint.POST);
+        f.onlyOwnUnknown();
+    }
+
+    @ParameterizedTest @ValueSource(strings={"CARD","INVALID_REQUEST","ACCESS","RATE_LIMIT","IDEMPOTENCY","CONNECTION","API","OTHER"})
+    void stripeSdkFailureExposesOnlyFixedTypeAndNeverRetries(String kind) {
+        var f=new Fixture();f.g.queueClocks();
+        var privateMessage="PRIVATE_PROVIDER_DETAIL sk_test_secret_INERT";
+        var privateId="req_PRIVATE_PROVIDER_DETAIL";
+        var privateCode="PRIVATE_PROVIDER_DETAIL";
+        StripeException failure=switch(kind){
+            case "CARD" -> new CardException(privateMessage,privateId,privateCode,"secret_INERT",null,null,402,null);
+            case "INVALID_REQUEST" -> new InvalidRequestException(privateMessage,"secret_INERT",privateId,privateCode,400,null);
+            case "ACCESS" -> new PermissionException(privateMessage,privateId,privateCode,403);
+            case "RATE_LIMIT" -> new RateLimitException(privateMessage,"secret_INERT",privateId,privateCode,429,null);
+            case "IDEMPOTENCY" -> new IdempotencyException(privateMessage,privateId,privateCode,409);
+            case "CONNECTION" -> new ApiConnectionException(privateMessage);
+            case "API" -> new ApiException(privateMessage,privateId,privateCode,500,null);
+            default -> new StripeException(privateMessage,privateId,privateCode,400) {
+                @Override public String getMessage(){throw new AssertionError("read private SDK message");}
+                @Override public com.stripe.model.StripeError getStripeError(){throw new AssertionError("read private Stripe error");}
+                @Override public String getCode(){throw new AssertionError("read private SDK code");}
+            };
+        };
+        var entries=new AtomicInteger();
+        f.postTransport=request->{entries.incrementAndGet();throw failure;};
+        var diagnostic=new Diagnostic();
+        refused(()->f.confirm(diagnostic));
+        assertThat(diagnostic.checkpoint().name()).isEqualTo("POST_STRIPE_"+kind);
+        f.onlyOwnUnknown();
+        var consumed=f.confirmation.receiptState();
+        f.g.queueClocks();refused(f::confirm);
+        assertThat(entries).hasValue(1);
+        assertThat(f.confirmation.receiptState()).isEqualTo(consumed);
+        assertThat(diagnostic.toString()).doesNotContain(privateMessage,privateId,privateCode);
+    }
+
+    private static void awaitTimedWait(Thread caller) {
+        long waitUntil=System.nanoTime()+TimeUnit.SECONDS.toNanos(1);
+        while(caller.getState()!=Thread.State.TIMED_WAITING&&System.nanoTime()<waitUntil)
+            java.util.concurrent.locks.LockSupport.parkNanos(100_000);
+        assertThat(caller.getState()).isEqualTo(Thread.State.TIMED_WAITING);
+    }
     static void refused(Runnable call){assertThatThrownBy(call::run).isExactlyInstanceOf(PaymentApplicationException.class).hasMessage("Owned recovery confirmation unavailable").hasNoCause().satisfies(e->{var p=(PaymentApplicationException)e;assertThat(p.code()).isEqualTo("OWNED_RECOVERY_CONFIRM_UNAVAILABLE");assertThat(p.status()).isEqualTo(409);assertThat(e.getSuppressed()).isEmpty();assertThat(e.toString()).doesNotContain("PRIVATE_PROVIDER_DETAIL","sk_test","secret_INERT","pm_","pi_");});}
     static void pauseThirtySeconds(){try{Thread.sleep(Duration.ofMillis(30100));}catch(InterruptedException e){Thread.currentThread().interrupt();throw new IllegalStateException("inert checkpoint interrupted");}}
     interface MemoryPost {StripeResponse request(StripeRequest request)throws StripeException;}
@@ -230,6 +325,7 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
         StripeBillingOwnedFailedRenewalRecoveryReader reader(){return new StripeBillingOwnedFailedRenewalRecoveryReader(g.local.service(),g.local.proofs,g.local.providerSteps,g.sdk.credentials,readClients,g.sdk.digest,invocationClock,invocationNanos);}
         StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter adapter(){return new StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter(g.local.service(),reader(),confirmation.service(),g.sdk.credentials,writeClients,g.sdk.digest,invocationClock,invocationNanos);}
         ConfirmationAck confirm(){return adapter().confirm(g.local.reservation(),g.local.completion(),g.local.recovery(),g.local.command());}
+        ConfirmationAck confirm(Diagnostic diagnostic){return adapter().confirm(g.local.reservation(),g.local.completion(),g.local.recovery(),g.local.command(),diagnostic);}
         JsonObject body(){return JsonParser.parseString("{\"id\":\"pi_renewal\",\"object\":\"payment_intent\",\"livemode\":false,\"status\":\"succeeded\",\"customer\":\"cus_owned\",\"payment_method\":\"pm_owned\",\"currency\":\"eur\",\"amount\":1000,\"amount_received\":1000,\"amount_capturable\":0,\"capture_method\":\"automatic\",\"payment_method_types\":[\"card\"],\"last_payment_error\":null,\"next_action\":null,\"latest_charge\":\"ch_recovered\"}").getAsJsonObject();}
         void queue(){g.queueClocks();g.sdk.http.reply(body().toString());}
         List<StripeRequest> posts(){return g.sdk.http.calls.stream().filter(r->r.method().name().equals("POST")).toList();}

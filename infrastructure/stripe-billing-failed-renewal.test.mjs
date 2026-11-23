@@ -755,7 +755,8 @@ test('cancellation as final recovery proof settles retains its verification chec
  }
 });
 for(const [fault,checkpoint] of [['refused','FAILED_RENEWAL_HTTP'],['invalid reply','FAILED_RENEWAL_RESPONSE'],['abort in fetch','FAILED_RENEWAL_TRANSPORT'],
- ['server stage','FAILED_RENEWAL_SERVER_OBSERVATION'],['observer substage','FAILED_RENEWAL_SERVER_OBSERVATION_FAILED_INTENT']])
+ ['server stage','FAILED_RENEWAL_SERVER_OBSERVATION'],['observer substage','FAILED_RENEWAL_SERVER_OBSERVATION_FAILED_INTENT'],
+ ['foreign recovery stage','FAILED_RENEWAL_HTTP']])
 test('post-arm owner uses the real runtime checkpoint on '+fault,async()=>{
  const h=harness(),paths=[],abort=new AbortController();
  const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),initial(),...h.vs.slice(0,2)];
@@ -768,6 +769,7 @@ test('post-arm owner uses the real runtime checkpoint on '+fault,async()=>{
    if(fault==='abort in fetch'){abort.abort();return new Promise(()=>{});}
    if(fault==='server stage')return new Response('{"code":"FAILED_RENEWAL_STOPPED","stage":"FAILED_RENEWAL_OBSERVATION"}',{status:400});
    if(fault==='observer substage')return new Response('{"code":"FAILED_RENEWAL_STOPPED","stage":"FAILED_RENEWAL_OBSERVATION_FAILED_INTENT"}',{status:400});
+   if(fault==='foreign recovery stage')return new Response('{"code":"FAILED_RENEWAL_STOPPED","stage":"RECOVERY_CONFIRM_CONFIRMATION_POST_STRIPE_CARD"}',{status:400});
    return new Response('private response canary',{status:fault==='refused'?503:200});
   }
   return new Response(JSON.stringify(replies.shift()));
@@ -864,10 +866,16 @@ test('post-arm owner reports the grace clock refusal without invoking another fi
  assert.deepEqual(paths.slice(-3),['/failed-renewal/failed','/failed-renewal/grace-last-second','/failed-renewal/abort']);
  assert.equal(result.failedRenewalAccepted,false);
 });
+const recoveryPostStages=[
+ 'ADMISSION','WORKER_ADMISSION','WAIT_BUDGET','TIMEOUT','INTERRUPTED','REPLY_BUDGET',
+ 'STRIPE_CARD','STRIPE_INVALID_REQUEST','STRIPE_ACCESS','STRIPE_RATE_LIMIT','STRIPE_IDEMPOTENCY',
+ 'STRIPE_CONNECTION','STRIPE_API','STRIPE_OTHER',
+];
 for(const [fault,checkpoint] of [
  ['authority','AUTHORITY'],['transport','TRANSPORT'],['late server reply','TRANSPORT'],['http','HTTP'],['invalid response','RESPONSE'],
- ['server confirmation','SERVER_CONFIRMATION'],['server provider reply','SERVER_CONFIRMATION_REPLY'],
- ['post-ack access','SERVER_ACCESS'],['extra server field','HTTP'],['wrong server route','HTTP'],
+ ['server confirmation','SERVER_CONFIRMATION'],['server post','SERVER_CONFIRMATION_POST'],['server provider reply','SERVER_CONFIRMATION_REPLY'],
+ ...recoveryPostStages.map(stage=>['server post '+stage,'SERVER_CONFIRMATION_POST_'+stage]),
+ ['post-ack access','SERVER_ACCESS'],['extra server field','HTTP'],['unknown server post suffix','HTTP'],['wrong server route','HTTP'],
 ])test('recovery confirmation preserves '+fault+' without observing or repeating the debt operation',async()=>{
  const h=harness(),paths=[],abort=new AbortController();
  let releaseLateReply;
@@ -882,8 +890,11 @@ for(const [fault,checkpoint] of [
    if(fault==='late server reply')return new Promise(resolve=>{releaseLateReply=resolve;abort.abort();});
    if(fault==='http')return new Response('private recovery canary',{status:503});
    if(fault==='invalid response')return new Response(JSON.stringify({...h.vs[10],recovery_charge_id:'private recovery canary'}));
+   const confirmPost='RECOVERY_CONFIRM_CONFIRMATION_POST_';
    const stage=fault==='wrong server route'?'FAILED_RENEWAL_ADMISSION':
-    'RECOVERY_CONFIRM_'+(checkpoint.startsWith('SERVER_')?checkpoint.slice('SERVER_'.length):'CONFIRMATION');
+    fault==='unknown server post suffix'?confirmPost+'PRIVATE':
+    fault==='extra server field'?confirmPost+'STRIPE_INVALID_REQUEST':
+    'RECOVERY_CONFIRM_'+checkpoint.slice('SERVER_'.length);
    const body={code:'FAILED_RENEWAL_STOPPED',stage};
    if(fault==='extra server field')body.detail='private recovery canary';
    return new Response(JSON.stringify(body),{status:400});
@@ -902,10 +913,14 @@ for(const [fault,checkpoint] of [
  assert.ok(!JSON.stringify(result).includes('private recovery canary'));
  if(fault==='late server reply'){
   assert.equal(result.code,'ABORTED');
-  releaseLateReply(new Response('{"code":"FAILED_RENEWAL_STOPPED","stage":"RECOVERY_CONFIRM_CONFIRMATION_POST"}',{status:400}));
+  releaseLateReply(new Response('{"code":"FAILED_RENEWAL_STOPPED","stage":"RECOVERY_CONFIRM_CONFIRMATION_POST_STRIPE_CONNECTION"}',{status:400}));
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(owners.formatBillingFailedRenewalDiagnostic(o.resources()),line);
  }
+ const requestCount=paths.length;
+ await assert.rejects(o.run(h.journey,limits()),/SINGLE_USE/);
+ assert.deepEqual(await o.close(),result);
+ assert.equal(paths.length,requestCount);
 });
 test('post-arm terminal protocol rejects foreign stages, mismatched codes, arbitrary text and false cleanup claims',()=>{
  const base={scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',status:'CLOSED',phase:'FAILED_RENEWAL',code:'FAILED_RENEWAL',diagnostic:'FAILED_RENEWAL_REQUEST',initialAccepted:false,failedRenewalAccepted:false,full5bAccepted:false,cleanupConfirmed:true,cleanupFailure:null};

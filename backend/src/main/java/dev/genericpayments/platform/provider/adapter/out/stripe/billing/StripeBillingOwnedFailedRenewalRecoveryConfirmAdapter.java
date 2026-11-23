@@ -1,5 +1,12 @@
 package dev.genericpayments.platform.provider.adapter.out.stripe.billing;
 
+import com.stripe.exception.ApiConnectionException;
+import com.stripe.exception.ApiException;
+import com.stripe.exception.AuthenticationException;
+import com.stripe.exception.CardException;
+import com.stripe.exception.IdempotencyException;
+import com.stripe.exception.InvalidRequestException;
+import com.stripe.exception.RateLimitException;
 import com.stripe.exception.StripeException;
 import com.stripe.model.PaymentIntent;
 import com.stripe.net.RequestOptions;
@@ -46,7 +53,13 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
         this.clients=Objects.requireNonNull(clients);this.digest=Objects.requireNonNull(digest);
         this.utc=Objects.requireNonNull(utc);this.nanos=Objects.requireNonNull(nanos);
     }
-    public enum Checkpoint { PREFLIGHT, AUTHORITY, CLAIM, POST, REPLY, ACK }
+    public enum Checkpoint {
+        PREFLIGHT, AUTHORITY, CLAIM,
+        POST, POST_ADMISSION, POST_WORKER_ADMISSION, POST_WAIT_BUDGET, POST_TIMEOUT, POST_INTERRUPTED, POST_REPLY_BUDGET,
+        POST_STRIPE_CARD, POST_STRIPE_INVALID_REQUEST, POST_STRIPE_ACCESS, POST_STRIPE_RATE_LIMIT,
+        POST_STRIPE_IDEMPOTENCY, POST_STRIPE_CONNECTION, POST_STRIPE_API, POST_STRIPE_OTHER,
+        REPLY, ACK
+    }
 
     /** Created for a single acceptance invocation. Holds only its fixed current stage. */
     public static final class Diagnostic {
@@ -93,8 +106,7 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
             checkpoint(budget,claim,original);
             String key=new ProviderOperationGuard().requireDispatch(claim,original.account(),fingerprint,utc.instant());
             var params=PaymentIntentConfirmParams.builder().setPaymentMethod(completion.method()).setOffSession(true).setErrorOnRequiresAction(true).build();
-            diagnostic.checkpoint=Checkpoint.POST;
-            var remote=call(budget,claim,original.enrollment().sessionExpiresAt(),key,
+            var remote=call(budget,claim,original.enrollment().sessionExpiresAt(),key,diagnostic,
                 options->client.v1().paymentIntents().confirm(reservation.failure().paymentIntent(),params,options));
             diagnostic.checkpoint=Checkpoint.REPLY;
             checkpoint(budget,claim,original);
@@ -148,7 +160,24 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
         }catch(java.io.IOException invalid){throw unavailable();}
     }
     private interface Call<T>{T run(RequestOptions options)throws StripeException;}
-    private <T>T call(InvocationBudget budget,ProviderOperation claim,Instant sessionExpiry,String key,Call<T> work){
+    private record PostResult<T>(T response,Checkpoint failure) {
+        @Override public String toString(){return "PostResult[redacted]";}
+    }
+    private static Checkpoint stripePostFailure(StripeException refusal) {
+        // Only the SDK exception class is used. Neither its message nor its provider payload is needed.
+        return switch(refusal){
+            case CardException ignored -> Checkpoint.POST_STRIPE_CARD;
+            case InvalidRequestException ignored -> Checkpoint.POST_STRIPE_INVALID_REQUEST;
+            case AuthenticationException ignored -> Checkpoint.POST_STRIPE_ACCESS;
+            case RateLimitException ignored -> Checkpoint.POST_STRIPE_RATE_LIMIT;
+            case IdempotencyException ignored -> Checkpoint.POST_STRIPE_IDEMPOTENCY;
+            case ApiConnectionException ignored -> Checkpoint.POST_STRIPE_CONNECTION;
+            case ApiException ignored -> Checkpoint.POST_STRIPE_API;
+            default -> Checkpoint.POST_STRIPE_OTHER;
+        };
+    }
+    private <T>T call(InvocationBudget budget,ProviderOperation claim,Instant sessionExpiry,String key,Diagnostic diagnostic,Call<T> work){
+        diagnostic.checkpoint=Checkpoint.POST_ADMISSION;
         // Capture all call clocks before scheduling; no worker can acquire new authority or time.
         long actualStart=System.nanoTime(),injectedStart=nanos.getAsLong();var entered=utc.instant();
         long allowance=Math.min(CALL_NANOS,remaining(budget,claim,sessionExpiry));var deadline=entered.plusNanos(allowance);
@@ -162,12 +191,31 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
         var optionsBuilder=RequestOptions.builder().setIdempotencyKey(key).setConnectTimeout(millis).setReadTimeout(millis).setMaxNetworkRetries(0);
         RequestOptions.RequestOptionsBuilder.unsafeSetStripeVersionOverride(optionsBuilder,StripeBillingTestClockAdapter.API_VERSION);
         var options=optionsBuilder.build();
-        var pending=new FutureTask<T>(()->{left.getAsLong();return work.run(options);});
+        var pending=new FutureTask<PostResult<T>>(() -> {
+            try{left.getAsLong();}
+            catch(RuntimeException|Error refused){return new PostResult<>(null,Checkpoint.POST_WORKER_ADMISSION);}
+            // Transfer only a fixed refusal code. FutureTask's ExecutionException can stringify its cause.
+            try{return new PostResult<>(work.run(options),null);}
+            catch(StripeException refused){return new PostResult<>(null,stripePostFailure(refused));}
+            catch(RuntimeException|Error refused){return new PostResult<>(null,Checkpoint.POST);}
+        });
         left.getAsLong();Thread.ofVirtual().name("owned-recovery-confirm-write").start(pending);
         try{
-            T result=pending.get(left.getAsLong(),TimeUnit.NANOSECONDS);left.getAsLong();return result;
-        }catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw unavailable();}
-        catch(ExecutionException|TimeoutException uncertain){throw unavailable();}
+            diagnostic.checkpoint=Checkpoint.POST_WAIT_BUDGET;
+            var result=pending.get(left.getAsLong(),TimeUnit.NANOSECONDS);
+            if(result.failure()!=null){diagnostic.checkpoint=result.failure();throw unavailable();}
+            diagnostic.checkpoint=Checkpoint.POST_REPLY_BUDGET;
+            left.getAsLong();return result.response();
+        }catch(InterruptedException interrupted){
+            diagnostic.checkpoint=Checkpoint.POST_INTERRUPTED;
+            Thread.currentThread().interrupt();throw unavailable();
+        }catch(TimeoutException uncertain){
+            diagnostic.checkpoint=Checkpoint.POST_TIMEOUT;
+            throw unavailable();
+        }catch(ExecutionException uncertain){
+            diagnostic.checkpoint=Checkpoint.POST;
+            throw unavailable();
+        }
         finally{pending.cancel(true);}
     }
     private long remaining(InvocationBudget budget,ProviderOperation claim,Instant sessionExpiry){
