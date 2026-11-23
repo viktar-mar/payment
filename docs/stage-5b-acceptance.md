@@ -6,6 +6,8 @@
 
 Run `b43a6560-e07b-4232-8cb3-193a99ff2558` at `4f3a806` removed that flag. Its runner stopped at `RECOVERY_CONFIRM_SERVER_CONFIRMATION_POST_TIMEOUT` and confirmed cleanup. A read-only Stripe check followed the new subscription from its initial paid invoice to the separate subscription-cycle invoice and its default PaymentIntent allocation. The renewal invoice was paid for €20 with €0 remaining. Its PaymentIntent succeeded and its captured charge was €20. This establishes the provider outcome. The stopped run supplied no completed local settlement, signed delivery or recovered-access receipt. The timed-out operation is consumed.
 
+Run `d39a1994-80d8-4300-895e-7c842bddbec7` at `3f28960` passed the Stripe Sandbox binding with the copied CLI authorization and presented the Pay form without issuing a new device code. The run stopped at `BROWSER_MANUAL_PAY_WAIT` with cleanup confirmed. Its journal records subscription creation and no payment confirmation dispatch. The recovery POST adjustment still needs a complete fresh run to verify local settlement, access restoration and signed delivery.
+
 ## Current acceptance status on 2026-11-22
 
 **Stage 5B remains open.** The earlier Stripe run `e7080356` verified the first €20 payment and first successful €20 renewal. Run `19107094` verified a failed renewal. Access was allowed one second before the grace deadline and denied at the deadline and one second after it. Confirmation of the replacement method and repayment of that original €20 debt still need native evidence.
