@@ -2,7 +2,7 @@ import {createBillingFailedRenewalFixture} from '../stripe-billing-provision.mjs
 import {id,opts} from './failed-renewal-descriptors.mjs';
 
 // All HTTP responses and receipt writes stay in memory.
-export async function provisionHarness({onFetch,onWrite,configuration=opts(),factory=createBillingFailedRenewalFixture}={}) {
+export async function provisionHarness({onFetch,onWrite,onVerify,configuration=opts(),factory=createBillingFailedRenewalFixture}={}) {
  const ids=[2,3,6,5,4,7,8,9].map(id),writes=[],requests=[];
  const fetch=async(url,settings)=>{
   const path=new URL(url).pathname,body=settings.body&&JSON.parse(settings.body);requests.push({path,...settings,body});let value=null,status=200,headers={};
@@ -23,6 +23,6 @@ export async function provisionHarness({onFetch,onWrite,configuration=opts(),fac
   else if(path==='/configure')status=204;else throw Error('Unexpected mutation');
   const response=new Response(status===204?null:JSON.stringify(value),{status});if(headers['set-cookie'])Object.defineProperty(response.headers,'getSetCookie',{value:()=>headers['set-cookie']});return onFetch ? onFetch(path,settings,response) : response;
  };
- const fixture=await factory({configuration,bootstrap:{verify:async()=>true,withAdminCredentials:async callback=>callback({username:'owned',password:'secret-sentinel'})},cli:{validateBinding:async()=>true}},{fetch,write:async(name,value)=>{writes.push({name,value});await onWrite?.(name,value);}});
+ const fixture=await factory({configuration,bootstrap:{verify:async()=>onVerify?onVerify({writes,requests}):true,withAdminCredentials:async callback=>callback({username:'owned',password:'secret-sentinel'})},cli:{validateBinding:async()=>true}},{fetch,write:async(name,value)=>{writes.push({name,value});await onWrite?.(name,value);}});
  return {fixture,ids,writes,requests};
 }

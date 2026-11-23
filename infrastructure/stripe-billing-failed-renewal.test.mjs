@@ -370,6 +370,75 @@ test('PROVISION terminal protocol accepts only matching stage, scope, rejection 
  for(const change of [{status:'RUNNING'},{scope:'OWNED_INITIAL_AND_FIRST_RENEWAL'},{phase:'START'},{code:'FIXTURE'},{diagnostic:'START_UNKNOWN'},{diagnostic:'PROVISION_CALLBACK_PUT_PRIVATE'},{initialAccepted:true},{failedRenewalAccepted:true},{full5bAccepted:true},{cleanupFailure:'FIXTURE_CLOSE'},{cleanupConfirmed:false}])assert.equal(owners.formatBillingFailedRenewalDiagnostic({...valid,...change}),null);
  for(const line of [null,provisionLine('PERSIST_UNKNOWN'),startLine('PROVISION_CALLBACK_PUT'),browserLine('PROVISION_CALLBACK_PUT'),provisionLine('PROVISION_CALLBACK_PUT')+'\n',provisionLine('PROVISION_CALLBACK_PUT')+' private',provisionLine('PROVISION_'+'A'.repeat(250)),provisionLine('PROVISION_CALLBACK_VALIDATE','UNCONFIRMED','NONE')])assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),null);
 });
+const refusal=new Error('private site preparation canary');
+const siteAck='billing-005-site-ack.json',policyDispatch='billing-006-policy-dispatch.json';
+const identitiesPath='/api/v1/admin/sites/'+id(3)+'/identity-providers';
+const policyPath='/api/v1/admin/sites/'+id(3)+'/subscription-policy';
+const refuseWrite=name=>({onWrite(file){if(file===name)throw refusal;}});
+const refuseVerifyAfter=(path,method)=>({onVerify({requests}){
+ const last=requests.at(-1);
+ return last?.path!==path||last.method!==method;
+}});
+const refuseRead=(target,reply)=>({onFetch(path,settings,response){return path===target&&settings.method==='GET'?reply():response;}});
+const httpRefusal=()=>new Response('private body canary',{status:503});
+const unavailableProvider=()=>Response.json([{mode:'EMAIL_OTP',status:'ACTIVE',readiness:'CONFIGURATION_UNAVAILABLE'}]);
+for(const [checkpoint,injection,lastPath,lastWrite=siteAck] of [
+ ['SITE_ACK',refuseWrite(siteAck),'/api/admin/v1/sites'],
+ ['IDENTITY_PROVIDERS_VERIFY',refuseVerifyAfter('/api/admin/v1/sites','POST'),'/api/admin/v1/sites'],
+ ['IDENTITY_PROVIDERS_REQUEST',refuseRead(identitiesPath,()=>{throw refusal;}),identitiesPath],
+ ['IDENTITY_PROVIDERS_HTTP',refuseRead(identitiesPath,httpRefusal),identitiesPath],
+ ['IDENTITY_PROVIDERS_RESPONSE',refuseRead(identitiesPath,()=>new Response('private invalid JSON')),identitiesPath],
+ ['IDENTITY_PROVIDERS_VALIDATE',refuseRead(identitiesPath,unavailableProvider),identitiesPath],
+ ['SUBSCRIPTION_POLICY_VERIFY',refuseVerifyAfter(identitiesPath,'GET'),identitiesPath],
+ ['SUBSCRIPTION_POLICY_REQUEST',refuseRead(policyPath,()=>{throw refusal;}),policyPath],
+ ['SUBSCRIPTION_POLICY_HTTP',refuseRead(policyPath,httpRefusal),policyPath],
+ ['SUBSCRIPTION_POLICY_RESPONSE',refuseRead(policyPath,()=>new Response('private invalid JSON')),policyPath],
+ ['SUBSCRIPTION_POLICY_VALIDATE',refuseRead(policyPath,()=>Response.json({version:'0'})),policyPath],
+ ['POLICY_INTENT',refuseWrite(policyDispatch),policyPath,policyDispatch],
+])test('PROVISION distinguishes a site preparation refusal at '+checkpoint,async()=>{
+ const h=harness(),{fixture,writes,requests}=await provisionHarness(injection);
+ h.dependencies.createFixture=async()=>fixture;
+ let initialCalls=0;
+ h.journey.initial=async()=>{initialCalls++;};
+ const o=await owner(h);
+ await assert.rejects(o.run(h.journey,limits()),{message:'billing_PROVISION'});
+ const result=await o.close(),line=provisionLine('PROVISION_'+checkpoint);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line+' private canary'),null);
+ assert.equal(writes.at(-1).name,lastWrite);
+ assert.equal(requests.at(-1).path,lastPath);
+ assert.equal(requests.filter(req=>req.path==='/api/admin/v1/sites'&&req.method==='POST').length,1);
+ assert.ok(!requests.some(req=>req.path===policyPath&&req.method==='POST'));
+ assert.equal(initialCalls,0);
+});
+
+test('PROVISION freezes the site preparation request checkpoint on abort',async()=>{
+ const h=harness(),entered=Promise.withResolvers(),release=Promise.withResolvers(),abort=new AbortController();
+ const {fixture,requests}=await provisionHarness(refuseRead(identitiesPath,()=>{entered.resolve();return release.promise;}));
+ h.dependencies.createFixture=async()=>fixture;
+ const o=await owner(h),closed=assert.rejects(o.run(h.journey,{...limits(),signal:abort.signal}),{message:'billing_ABORTED'});
+ await entered.promise;
+ abort.abort();await closed;
+ const result=await o.close();
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),provisionLine('PROVISION_IDENTITY_PROVIDERS_REQUEST'));
+ release.resolve(unavailableProvider());await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(requests.at(-1).path,identitiesPath);
+ assert.deepEqual(await o.close(),result);
+});
+
+test('PROVISION clears the policy intent checkpoint before sending the update',async()=>{
+ const h=harness(),{fixture,requests,writes}=await provisionHarness({onFetch(path,settings,response){
+  return path===policyPath&&settings.method==='POST'?httpRefusal():response;
+ }});
+ h.dependencies.createFixture=async()=>fixture;
+ const o=await owner(h);
+ await assert.rejects(o.run(h.journey,limits()),{message:'billing_PROVISION'});
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(await o.close()),provisionLine('PROVISION_UNKNOWN'));
+ assert.equal(writes.at(-1).name,policyDispatch);
+ assert.equal(requests.filter(req=>req.path===policyPath&&req.method==='POST').length,1);
+});
+
 for(const outcome of ['rejected','abort','deadline'])test('PROVISION records the active mock receiver request on '+outcome,async t=>{
  if(outcome==='deadline')t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
  const h=harness(),controller=new AbortController(),entered=Promise.withResolvers(),release=Promise.withResolvers();

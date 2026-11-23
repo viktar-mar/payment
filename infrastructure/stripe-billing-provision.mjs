@@ -11,7 +11,10 @@ export const billingUuid=value=>typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{
 const need=value=>{if(!value)throw billingError('FIXTURE');};
 const digest=value=>createHash('sha256').update(value).digest('hex');
 const failedRenewalCheckpoints=new WeakMap();
+const identityProviderRead='PROVISION_IDENTITY_PROVIDERS',policyRead='PROVISION_SUBSCRIPTION_POLICY';
 const checkpointCodes=new Set([
+ 'PROVISION_SITE_ACK','PROVISION_POLICY_INTENT',
+ ...[identityProviderRead,policyRead].flatMap(step=>['VERIFY','REQUEST','HTTP','RESPONSE','VALIDATE'].map(detail=>step+'_'+detail)),
  'PROVISION_CALLBACK_INTENT','PROVISION_CALLBACK_PUT','PROVISION_CALLBACK_VALIDATE',
  'PROVISION_RECEIVER_CONFIGURE','PROVISION_MAILPIT_READ','PROVISION_MAILPIT_EMPTY','PROVISION_FIXTURE_READY',
 ]);
@@ -67,22 +70,37 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
   await save(kind,value,limits);
   retryCursor=current+1;
  }
- async function request(path,limits,{method='GET',body,status=200,target='backend',idempotencyKey,beforeSend}={}) {
+ async function request(path,limits,{method='GET',body,status=200,target='backend',idempotencyKey,beforeSend,provisionRead}={}) {
   return billingBounded(limits,async l=>{
-   need(!closed);need(await bootstrap.verify(l)===true);
+   need(!closed);
+   if(provisionRead)checkpoint(provisionRead+'_VERIFY',limits);
+   need(await bootstrap.verify(l)===true);
    const origin=target==='mailpit'?'http://127.0.0.1:'+c.ports.mailpitHttp:endpoints[target];
    const admin=target==='backend'&&path!=='/api/admin/v1/auth/sessions';
    billingCheck(l);if(beforeSend)need(beforeSend()===true);
+   if(provisionRead)checkpoint(provisionRead+'_REQUEST',limits);
    const response=await fetcher(origin+path,{method,redirect:'error',signal:l.signal,headers:{Accept:'application/json',...(body===undefined?{}:{'Content-Type':'application/json'}),...(admin?{Cookie:cookie,...(method==='GET'?{}:{'X-XSRF-TOKEN':csrf,'Idempotency-Key':idempotencyKey??('billing:'+c.runId+':'+sequence)})}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});
    let bytes=0;const chunks=[];
-   try{billingCheck(l);need(response.status===status);for await(const chunk of response.body??[]){billingCheck(l);bytes+=chunk.length;need(bytes<=65536);chunks.push(Buffer.from(chunk));}}
+   try{
+    billingCheck(l);const expectedStatus=response.status===status;
+    if(provisionRead)checkpoint(provisionRead+(expectedStatus?'_RESPONSE':'_HTTP'),limits);
+    need(expectedStatus);
+    for await(const chunk of response.body??[]){billingCheck(l);bytes+=chunk.length;need(bytes<=65536);chunks.push(Buffer.from(chunk));}
+   }
    finally{await response.body?.cancel().catch(()=>{});}
    billingCheck(l);return {value:bytes?JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(Buffer.concat(chunks))):null,cookies:path==='/api/admin/v1/auth/sessions'?response.headers.getSetCookie():[]};
   });
  }
  const read=async(path,l,settings)=>(await request(path,l,settings)).value;
- async function mutate(name,path,body,status,l,check) {
-  await save(name+'-dispatch',{phase:'DISPATCHING'},l);const v=await read(path,l,{method:'POST',body,status});need(check(v));await save(name+'-ack',{phase:'ACKNOWLEDGED',...(billingUuid(v?.id)?{id:v.id}:{})},l);return v;
+ async function mutate(name,path,body,status,l,check,{dispatchCheckpoint,ackCheckpoint}={}) {
+  if(dispatchCheckpoint)checkpoint(dispatchCheckpoint,l);
+  await save(name+'-dispatch',{phase:'DISPATCHING'},l);
+  if(failed&&dispatchCheckpoint){
+   billingCheck(l);need(!closed);failedRenewalCheckpoints.delete(fixture);
+  }
+  const v=await read(path,l,{method:'POST',body,status});need(check(v));
+  if(ackCheckpoint)checkpoint(ackCheckpoint,l);
+  await save(name+'-ack',{phase:'ACKNOWLEDGED',...(billingUuid(v?.id)?{id:v.id}:{})},l);return v;
  }
  function checkpoint(code,limits) {
   if(failed){
@@ -105,11 +123,15 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
     const accounts=await read('/api/admin/v1/payment-accounts',limits),sites=await read('/api/admin/v1/sites',limits);need(Array.isArray(accounts)&&accounts.length===0&&Array.isArray(sites)&&sites.length===0);
     await save('fresh',{phase:'FRESH'},limits);
     const account=await mutate('account','/api/admin/v1/payment-accounts',{key:'stripe-sandbox-default',provider:'STRIPE',mode:'SANDBOX',external_account_id:c.approvedBinding.externalAccountId,credentials_ref:'stripe-sandbox-default'},201,limits,v=>billingUuid(v?.id)&&v.provider==='STRIPE'&&v.mode==='SANDBOX'&&v.status==='ACTIVE'&&v.external_account_id===c.approvedBinding.externalAccountId);accountId=account.id;
-    const site=await mutate('site','/api/admin/v1/sites',{key:siteKey,display_name:'Initial Billing acceptance',payment_account_id:accountId,allowed_origins:[endpoints.demo],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']},email_otp_provider:{provider_key:'billing-email-'+suffix,sender_ref:'local-default',template_key:'otp-default'}},201,limits,v=>billingUuid(v?.id)&&v.key===siteKey&&v.status==='ACTIVE'&&v.payment_account_id===accountId&&JSON.stringify(v.allowed_origins)===JSON.stringify([endpoints.demo])&&JSON.stringify(v.authentication_modes)==='["EMAIL_OTP"]');siteId=site.id;
+    const site=await mutate('site','/api/admin/v1/sites',{key:siteKey,display_name:'Initial Billing acceptance',payment_account_id:accountId,allowed_origins:[endpoints.demo],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']},email_otp_provider:{provider_key:'billing-email-'+suffix,sender_ref:'local-default',template_key:'otp-default'}},201,limits,v=>billingUuid(v?.id)&&v.key===siteKey&&v.status==='ACTIVE'&&v.payment_account_id===accountId&&JSON.stringify(v.allowed_origins)===JSON.stringify([endpoints.demo])&&JSON.stringify(v.authentication_modes)==='["EMAIL_OTP"]',{ackCheckpoint:'PROVISION_SITE_ACK'});siteId=site.id;
     const base='/api/v1/admin/sites/'+siteId;
-    const providers=await read(base+'/identity-providers',limits);need(Array.isArray(providers)&&providers.length===1&&providers[0].mode==='EMAIL_OTP'&&providers[0].readiness==='READY'&&providers[0].status==='ACTIVE');
-    const policy=await read(base+'/subscription-policy',limits);need(Number.isSafeInteger(policy.version));
-    await mutate('policy',base+'/subscription-policy',{version:policy.version,enabled:true,grace_days:graceDays,allow_immediate_cancellation:false,portal_enabled:false,defer_upgrades:false,portal_return_urls:[]},200,limits,v=>v?.enabled===true&&v.portal_enabled===false&&(!failed||v.grace_days===3));
+    const providers=await read(base+'/identity-providers',limits,{provisionRead:identityProviderRead});
+    checkpoint(identityProviderRead+'_VALIDATE',limits);
+    need(Array.isArray(providers)&&providers.length===1&&providers[0].mode==='EMAIL_OTP'&&providers[0].readiness==='READY'&&providers[0].status==='ACTIVE');
+    const policy=await read(base+'/subscription-policy',limits,{provisionRead:policyRead});
+    checkpoint(policyRead+'_VALIDATE',limits);
+    need(Number.isSafeInteger(policy.version));
+    await mutate('policy',base+'/subscription-policy',{version:policy.version,enabled:true,grace_days:graceDays,allow_immediate_cancellation:false,portal_enabled:false,defer_upgrades:false,portal_return_urls:[]},200,limits,v=>v?.enabled===true&&v.portal_enabled===false&&(!failed||v.grace_days===3),{dispatchCheckpoint:'PROVISION_POLICY_INTENT'});
     const product=await mutate('product','/api/admin/v1/sites/'+siteId+'/products',{key:'billing-product-'+suffix,name:'Initial monthly Billing',description:null},201,limits,v=>billingUuid(v?.id)&&v.site_id===siteId&&v.status==='ACTIVE');productId=product.id;
     const price=await mutate('price','/api/admin/v1/products/'+productId+'/prices',{price_key:'billing-price-'+suffix,type:'SUBSCRIPTION',amount_minor:2000,currency:'EUR',billing_interval:'MONTH',trial_days:0,tax_mode:'INCLUSIVE',tax_code:null},201,limits,v=>billingUuid(v?.id)&&v.site_id===siteId&&v.product_id===productId&&v.version===1&&v.status==='DRAFT');priceId=price.id;
     const published=await mutate('publish','/api/admin/v1/prices/'+priceId+'/publish',undefined,200,limits,v=>v?.id===priceId&&v.type==='SUBSCRIPTION'&&v.status==='PUBLISHED'&&v.version===1&&v.amount_minor===2000&&v.currency==='EUR'&&v.billing_interval==='MONTH'&&v.trial_days===0&&v.tax_mode==='INCLUSIVE'&&/^price_[A-Za-z0-9]+$/.test(v.provider_price_id));priceReference=published.provider_price_id;

@@ -108,8 +108,13 @@ The dispatch receipt contains the intent to configure the site's callback. Its b
 
 For a fresh failed-renewal run the terminal report can identify the pending operation at `stage=PROVISION`.
 
+Attempt `e3ddf00e-8b23-42bf-b31a-23604793a40a` at `600ce84` authenticated and received a site creation response. Its last visible receipt is `billing-005-site-ack.json`. The attempt reported `PROVISION_UNKNOWN` and confirmed cleanup before reaching subscription creation or payment. The site receipt could exist before its file and directory synchronization finished. The saved evidence also cannot establish whether the identity-provider or subscription-policy read was sent. Inert regressions reproduced the same generic report at each of these boundaries.
+
 | Checkpoint | Operation |
 | --- | --- |
+| `PROVISION_SITE_ACK` | Write and finish the site acknowledgement after validating the creation response. |
+| `PROVISION_IDENTITY_PROVIDERS_*`, `PROVISION_SUBSCRIPTION_POLICY_*` | Read the email OTP provider or subscription policy. `VERIFY` identifies the runtime check before sending, `REQUEST` the request before a response status was accepted, `HTTP` an unexpected status, `RESPONSE` response reading or decoding, and `VALIDATE` the checks on decoded data. |
+| `PROVISION_POLICY_INTENT` | Write and finish the policy dispatch receipt before sending the policy update. |
 | `PROVISION_CALLBACK_INTENT` | Write and finish the callback dispatch receipt. |
 | `PROVISION_CALLBACK_PUT` | Send the callback configuration to the backend and read its response. |
 | `PROVISION_CALLBACK_VALIDATE` | Validate the returned site, enabled state, key version and signing secret. |
