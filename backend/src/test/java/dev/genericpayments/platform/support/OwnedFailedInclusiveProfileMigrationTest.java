@@ -43,5 +43,5 @@ class OwnedFailedInclusiveProfileMigrationTest {
             withoutDefinitions=withoutDefinitions.replace(function(forward,name).replace("create function ","create or replace function "),"");
         assertThat(withoutDefinitions.replaceAll("(?m)--[^\\r\\n]*","")).isBlank();
     }
-    @Test void currentSchemaIncludesTheForwardMigration(){assertThat(CurrentSchemaVersions.EXPECTED).endsWith("41","42");}
+    @Test void currentSchemaIncludesTheForwardMigration(){assertThat(CurrentSchemaVersions.EXPECTED).containsSubsequence("41","42");}
 }

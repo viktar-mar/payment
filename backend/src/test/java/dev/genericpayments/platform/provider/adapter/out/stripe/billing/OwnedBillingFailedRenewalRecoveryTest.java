@@ -49,7 +49,7 @@ class OwnedBillingFailedRenewalRecoveryTest {
         assertThat(f.g.sdk.http.calls.stream().map(r->r.url().getPath()).toList()).isEqualTo(paths);
         assertThat(f.gets()).hasSize(17).allSatisfy(r->{assertThat(r.options().getIdempotencyKey()).isNull();f.options(r);});
         assertThat(f.posts()).singleElement().satisfies(post->{
-            assertThat(post.params()).containsExactlyInAnyOrderEntriesOf(Map.of("payment_method","pm_owned","off_session",true,"error_on_requires_action",true));
+            assertThat(post.params()).containsExactlyInAnyOrderEntriesOf(Map.of("payment_method","pm_owned","off_session",true));
             assertThat(post.options().getIdempotencyKey()).isEqualTo(f.g.original.recoveryOperation().providerOperationKey()+":CONFIRM");f.options(post);
         });
         assertThat(f.g.sdk.http.replies).isEmpty();assertThat(f.g.local.state()).isEqualTo(before);

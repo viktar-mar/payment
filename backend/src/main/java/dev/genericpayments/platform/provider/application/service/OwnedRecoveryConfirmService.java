@@ -114,9 +114,9 @@ public final class OwnedRecoveryConfirmService {
     private void fresh(){if(transactions.active())throw denied();}
     public static String fingerprint(RecoveryPreparationContext c,DigestPort digest){
         var f=c.reservation().failure();var r=c.recoveryOperation();var x=c.completion();
-        return ProviderRequestFingerprint.of(digest,c.account(),"OWNED_RECOVERY_CONFIRM_V1",r.id().toString(),r.providerOperationKey(),r.fingerprint(),c.reservation().id().toString(),
+        return ProviderRequestFingerprint.of(digest,c.account(),"OWNED_RECOVERY_CONFIRM_V2",r.id().toString(),r.providerOperationKey(),r.fingerprint(),c.reservation().id().toString(),
             f.billId().toString(),Long.toString(f.billVersion()),f.invoice(),f.allocation(),f.paymentIntent(),Long.toString(f.revision()),Long.toString(f.observationSequence()),
-            c.binding().id().toString(),c.binding().providerReference(),x.setupStepId().toString(),Long.toString(x.setupStepVersion()),x.methodStepId().toString(),Long.toString(x.methodStepVersion()),x.method(),"off_session:true","error_on_requires_action:true");
+            c.binding().id().toString(),c.binding().providerReference(),x.setupStepId().toString(),Long.toString(x.setupStepVersion()),x.methodStepId().toString(),Long.toString(x.methodStepVersion()),x.method(),"off_session:true");
     }
     private static IllegalStateException denied(){return new IllegalStateException("OWNED_RECOVERY_CONFIRM_UNAVAILABLE");}
 }

@@ -35,7 +35,7 @@ public final class JdbcOwnedRecoveryConfirmStore implements OwnedRecoveryConfirm
         var caller=positiveCaller(c,owner);identity(c);positive(c,budget,now,null);
         if(claimant==null||claimant.isBlank()||claimant.length()>128)throw denied();
         var id=UUID.randomUUID();var at=now.truncatedTo(ChronoUnit.MICROS);
-        String fingerprint=jdbc.queryForObject("select owned_recovery_confirm_fingerprint(?)",String.class,c.reservation().id());
+        String fingerprint=jdbc.queryForObject("select owned_recovery_confirm_fingerprint_v2(?)",String.class,c.reservation().id());
         // A uniqueness violation refuses every pre-existing row; there is deliberately no conflict adoption.
         jdbc.update("""
             insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint)
@@ -138,7 +138,7 @@ public final class JdbcOwnedRecoveryConfirmStore implements OwnedRecoveryConfirm
         if(o==null||o.kind()!=Kind.OWNED_RECOVERY_INTENT_CONFIRM||!o.accountId().equals(c.account().id())||!o.resourceId().equals(c.recoveryOperation().id())
                 ||!o.externalAccountId().equals(c.account().externalAccountId())||!o.credentialsRef().equals(c.account().credentialsRef())
                 ||!o.operationKey().equals(c.recoveryOperation().providerOperationKey()+":CONFIRM"))throw denied();
-        String fingerprint=jdbc.queryForObject("select owned_recovery_confirm_fingerprint(?)",String.class,c.reservation().id());if(!Objects.equals(fingerprint,o.fingerprint()))throw denied();
+        String fingerprint=jdbc.queryForObject("select owned_recovery_confirm_fingerprint_v2(?)",String.class,c.reservation().id());if(!Objects.equals(fingerprint,o.fingerprint()))throw denied();
     }
     private void positive(RecoveryPreparationContext c,InvocationBudget budget,Instant now,ProviderOperation claim){
         if(budget==null||now==null)throw denied();budget.remainingNanos(claim);

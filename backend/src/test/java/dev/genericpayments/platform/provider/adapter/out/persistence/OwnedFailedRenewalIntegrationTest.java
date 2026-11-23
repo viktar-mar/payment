@@ -3752,7 +3752,7 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         assertThat(calls.stream().map(r->r.url().getPath()).toList()).isEqualTo(paths);
         assertThat(calls.subList(0,17)).allSatisfy(r->{assertThat(r.method().name()).isEqualTo("GET");assertThat(r.options().getIdempotencyKey()).isNull();});
         var post=calls.getLast();assertThat(post.method().name()).isEqualTo("POST");
-        assertThat(post.params()).containsExactlyInAnyOrderEntriesOf(Map.of("payment_method","pm_saved","off_session",true,"error_on_requires_action",true));
+        assertThat(post.params()).containsExactlyInAnyOrderEntriesOf(Map.of("payment_method","pm_saved","off_session",true));
         assertThat(post.options().getIdempotencyKey()).isEqualTo(c.recoveryOperation().providerOperationKey()+":CONFIRM");
         assertThat(calls).allSatisfy(r->{assertThat(r.options().getMaxNetworkRetries()).isZero();assertThat(r.options().getReadTimeout()).isBetween(1,2000);assertThat(r.options().getConnectTimeout()).isBetween(1,2000);assertThat(r.headers().firstValue("Stripe-Version")).contains("2026-09-30.endive");});
         assertThat(http.replies).isEmpty();assertThat(ack.operation().kind()).isEqualTo(ProviderOperation.Kind.OWNED_RECOVERY_INTENT_CONFIRM);
@@ -4348,14 +4348,34 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var p=recoveryPrepared(false,0);var c=inspectRecovery(p);var f=c.reservation().failure();var r=c.recoveryOperation();var completion=c.completion();var a=c.account();
         // Independent golden field ordering; do not call the production fingerprint encoder here.
         var facts=List.of(a.id().value().toString(),a.externalAccountId(),a.credentialsRef(),a.provider().name(),a.mode().name(),
-            "OWNED_RECOVERY_CONFIRM_V1",r.id().toString(),r.providerOperationKey(),r.fingerprint(),c.reservation().id().toString(),
+            "OWNED_RECOVERY_CONFIRM_V2",r.id().toString(),r.providerOperationKey(),r.fingerprint(),c.reservation().id().toString(),
             f.billId().toString(),Long.toString(f.billVersion()),f.invoice(),f.allocation(),f.paymentIntent(),Long.toString(f.revision()),Long.toString(f.observationSequence()),
             c.binding().id().toString(),c.binding().providerReference(),completion.setupStepId().toString(),Long.toString(completion.setupStepVersion()),
-            completion.methodStepId().toString(),Long.toString(completion.methodStepVersion()),completion.method(),"off_session:true","error_on_requires_action:true");
+            completion.methodStepId().toString(),Long.toString(completion.methodStepVersion()),completion.method(),"off_session:true");
         StringBuilder canonical=new StringBuilder();facts.forEach(value->canonical.append(value.length()).append(':').append(value));String golden=digest.sha256Hex(canonical.toString());
         assertThat(OwnedRecoveryConfirmService.fingerprint(c,digest)).isEqualTo(golden);
-        assertThat(jdbc.queryForObject("select owned_recovery_confirm_fingerprint(?)",String.class,c.reservation().id())).isEqualTo(golden);
+        assertThat(jdbc.queryForObject("select owned_recovery_confirm_fingerprint_v2(?)",String.class,c.reservation().id())).isEqualTo(golden);
+        var legacy=jdbc.queryForObject("select owned_recovery_confirm_fingerprint(?)",String.class,c.reservation().id());
+        assertThat(legacy).isNotBlank().isNotEqualTo(golden);
+        assertThatThrownBy(()->transaction.requiresNew(()->jdbc.update("""
+            insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,kind,resource_id,operation_key,fingerprint)
+            values(?,?,?,?,'OWNED_RECOVERY_INTENT_CONFIRM',?,?,?)
+            """,UUID.randomUUID(),a.id().value(),a.externalAccountId(),a.credentialsRef(),r.id(),r.providerOperationKey()+":CONFIRM",legacy)))
+            .rootCause().isInstanceOfSatisfying(java.sql.SQLException.class,error->{
+                assertThat(error.getSQLState()).isEqualTo("23514");
+                assertThat(error.getMessage()).contains("Invalid owned recovery confirmation ownership");
+            });
         var budget=confirmationBudget();var claim=recoveryConfirmer(p).claim(c,p.pending().context(),"golden-claim",budget);assertThat(claim.fingerprint()).isEqualTo(golden);
+        // Exercise historical ownership with the committed claim and V1 fingerprint at the SQL boundary.
+        assertThat(jdbc.queryForObject("""
+            select owned_recovery_confirm_owns(?,jsonb_populate_record(step,jsonb_build_object('fingerprint',?::text)))
+              from provider_operations step where id=?
+            """,Boolean.class,c.reservation().id(),legacy,claim.id())).isTrue();
+        assertThat(jdbc.queryForObject("""
+            select owned_recovery_confirm_owns(?,jsonb_populate_record(step,
+                jsonb_build_object('fingerprint',?::text,'id',gen_random_uuid())))
+              from provider_operations step where id=?
+            """,Boolean.class,c.reservation().id(),legacy,claim.id())).isFalse();
     }
 
     @Test void dedicatedConfirmationDuplicateAndConcurrentFirstClaimantsNeverAdopt() throws Exception {

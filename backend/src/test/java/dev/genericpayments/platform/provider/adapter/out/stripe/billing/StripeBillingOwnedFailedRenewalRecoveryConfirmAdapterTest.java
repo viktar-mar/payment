@@ -51,7 +51,16 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
     }
 
     @Test void originalSeventeenGetsPrecedeOneExactConfirmAndAckHasNoFinancialAuthority(){
-        var f=new Fixture();f.queue();var before=f.g.local.state();var ack=f.confirm();
+        var f=new Fixture();f.queue();
+        f.postTransport=request->{
+            if(request.params().containsKey("error_on_requires_action")){
+                f.g.sdk.http.replies.removeLast();
+                f.g.sdk.http.replies.addLast(new StripeResponse(400,HttpHeaders.of(Map.of()),
+                    "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invoice-created intent rejects error_on_requires_action\"}}"));
+            }
+            return f.g.sdk.http.request(request);
+        };
+        var before=f.g.local.state();var ack=f.confirm();
         assertThat(ack.operation()).isEqualTo(f.confirmation.row());assertThat(ack.operation().status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
         assertThat(ack.operation().version()).isEqualTo(2);assertThat(ack.operation().providerReference()).isEqualTo("pi_renewal");
         assertThat(ack.reply()).isEqualTo(new ConfirmReply("pi_renewal","cus_owned","pm_owned","EUR",1000,1000,0,"ch_recovered",f.g.local.now()));
@@ -60,7 +69,7 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
         assertThat(f.g.sdk.http.calls.stream().map(r->r.url().getPath()).toList()).isEqualTo(paths);
         assertThat(f.gets()).hasSize(17).allSatisfy(r->{assertThat(r.options().getIdempotencyKey()).isNull();f.options(r);});
         var post=f.posts().getFirst();assertThat(post.url().toString()).isEqualTo("https://api.stripe.com/v1/payment_intents/pi_renewal/confirm");
-        assertThat(post.params()).containsExactlyInAnyOrderEntriesOf(Map.of("payment_method","pm_owned","off_session",true,"error_on_requires_action",true));
+        assertThat(post.params()).containsExactlyInAnyOrderEntriesOf(Map.of("payment_method","pm_owned","off_session",true));
         assertThat(post.options().getIdempotencyKey()).isEqualTo(f.g.original.recoveryOperation().providerOperationKey()+":CONFIRM");f.options(post);
         assertThat(f.confirmation.budgetUses()).hasSizeGreaterThanOrEqualTo(3).allSatisfy(b->assertThat(b).isSameAs(f.confirmation.budgetUses().getFirst()));
         var budget=f.confirmation.budgetUses().getFirst();assertThat(budget.enteredAt()).isEqualTo(f.entry);assertThat(budget.deadlineAt()).isEqualTo(f.entry.plusSeconds(30));

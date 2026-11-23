@@ -109,7 +109,9 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
             if(!claim.equals(current))throw unavailable();
             checkpoint(budget,claim,original);
             String key=new ProviderOperationGuard().requireDispatch(claim,original.account(),fingerprint,utc.instant());
-            var params=PaymentIntentConfirmParams.builder().setPaymentMethod(completion.method()).setOffSession(true).setErrorOnRequiresAction(true).build();
+            // Stripe rejects error_on_requires_action on invoice-created intents. The reply
+            // validator still requires succeeded and rejects all next actions.
+            var params=PaymentIntentConfirmParams.builder().setPaymentMethod(completion.method()).setOffSession(true).build();
             var remote=call(budget,claim,original.enrollment().sessionExpiresAt(),key,diagnostic,
                 options->client.v1().paymentIntents().confirm(reservation.failure().paymentIntent(),params,options));
             diagnostic.checkpoint=Checkpoint.REPLY;

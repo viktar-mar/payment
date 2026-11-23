@@ -666,8 +666,8 @@ class OwnedBillingFailedRenewalScenarioIntegrationTest extends OwnedBillingFirst
         assertThat(attach.params()).containsOnlyKeys("customer").containsEntry("customer",graph.remote.get("customer").getAsString());
         assertThat(defaults.getFirst().params()).containsOnlyKeys("default_payment_method","proration_behavior").containsEntry("proration_behavior","none").containsEntry("default_payment_method","pm_decline");
         assertThat(defaults.getLast().params()).containsOnlyKeys("default_payment_method").containsEntry("default_payment_method","pm_saved");
-        assertThat(writes.getLast().params()).containsOnlyKeys("payment_method","off_session","error_on_requires_action")
-            .containsEntry("payment_method","pm_saved").containsEntry("off_session",true).containsEntry("error_on_requires_action",true);
+        assertThat(writes.getLast().params()).containsOnlyKeys("payment_method","off_session")
+            .containsEntry("payment_method","pm_saved").containsEntry("off_session",true);
     }
     private List<String> callbackMarkers(JsonObject row) {
         return row.getAsJsonArray("callbacks").asList().stream().map(e->e.getAsJsonObject().get("delivered").toString()).toList();
