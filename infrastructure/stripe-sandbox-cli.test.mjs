@@ -27,6 +27,8 @@ test('remainder exclusion precedes snapshots configuration and dependencies',asy
 import childProcess from 'node:child_process';
 import {syncBuiltinESMExports} from 'node:module';
 import {constants} from 'node:fs';
+import {chmod,link,lstat,mkdir,open,readFile,readdir,realpath,rm,symlink,writeFile} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
 import {dirname,resolve} from 'node:path';
@@ -795,6 +797,103 @@ async function failedRenewalCli(persistWebhookSecret=async()=>true,configureChil
   await f.adapter.validateBinding(f.limits);
   return f;
 }
+
+const profileConfig='fake stripe cli project config\n',profileCredentials='{"fixture":"inert credential"}\n';
+async function failedRenewalProfile(t) {
+  const f=await billingSetup(),priors=ROOT+'/test-results/stripe-sandbox',prior=randomUUID(),run=randomUUID();
+  const cli=priors+'/'+run+'/cli',source=priors+'/'+prior+'/cli/config/stripe',destination=cli+'/config/stripe';
+  t.after(()=>Promise.all([prior,run].map(id=>rm(priors+'/'+id,{recursive:true,force:true}))));
+  for(const id of [prior,run]){
+    for(const path of ['/cli/home','/cli/config/stripe'])await mkdir(priors+'/'+id+path,{recursive:true,mode:0o700});
+  }
+  await writeFile(source+'/config.toml',profileConfig,{mode:0o600});
+  await writeFile(source+'/credentials.json',profileCredentials,{mode:0o600});
+  await writeFile(source+'/oauth_pending.json','unrelated',{mode:0o600});
+  await writeFile(destination+'/config.toml','',{mode:0o600});
+  Object.assign(f.options.configuration,{runId:run,env:{
+    PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FAILED_RENEWAL:'true',
+    PAYMENT_STRIPE_BILLING_FAILED_RENEWAL_CLI_PROFILE_RUN_ID:prior,
+  },selectedCase:'initial_failed_renewal_grace_recovery',controlPort:18083,frozenTime:1790000000});
+  f.options.cliDirectory=cli;
+  Object.assign(f.dependencies,{lstat,open,readdir,realpath});
+  return {f,cli,source,destination};
+}
+
+test('failed-renewal seeds only CLI authentication files into the fresh profile before binding and listening',async t=>{
+  const {f,cli,source,destination}=await failedRenewalProfile(t);
+  const {createBillingFailedRenewalCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingFailedRenewalCliAdapter(f.options,f.dependencies);
+  assert.equal(f.adapter.loginInvocation,undefined);
+  assert.equal(f.adapter.completeLoginInvocation,undefined);
+  assert.equal(await readFile(destination+'/config.toml','utf8'),'');
+  assert.equal(await f.adapter.validateBinding(f.limits),true);
+  assert.deepEqual((await readdir(destination)).sort(),['config.toml','credentials.json']);
+  for(const [file,contents] of [['config.toml',profileConfig],['credentials.json',profileCredentials]]){
+    assert.equal(await readFile(destination+'/'+file,'utf8'),contents);
+    assert.equal(await readFile(source+'/'+file,'utf8'),contents);
+    assert.equal((await lstat(destination+'/'+file)).mode&0o777,0o600);
+    assert.notEqual((await lstat(destination+'/'+file)).ino,(await lstat(source+'/'+file)).ino);
+  }
+  const starting=f.adapter.startListener(f.limits);
+  for(let i=0;i<200&&!f.children.length;i++)await new Promise(resolveTurn=>setTimeout(resolveTurn,5));
+  assert.equal(f.children.length,1);
+  f.children[0].stderr.write(READY);
+  assert.equal(await starting,true);
+  for(const call of f.calls){
+    assert.equal(call.file,'/usr/bin/sandbox-exec');
+    assert.equal(call.args[call.args.indexOf('--config')+1],destination+'/config.toml');
+    assert.equal(call.settings.env.HOME,cli+'/home');
+    assert.equal(call.settings.env.XDG_CONFIG_HOME,cli+'/config');
+    if(call.args.includes('/v1/balance'))assert.deepEqual(call.args.slice(-2),['--stripe-version',VERSION]);
+  }
+  assert.deepEqual(f.calls.map(c=>c.args[11]),['--version','whoami','get','--version','whoami','get','listen']);
+  assert.equal(await stop(f),true);
+});
+
+for(const reason of ['missing credentials','public credentials','linked credentials','symlinked profile','source changed',
+  'expired credentials','wrong account','extra scope','wrong API','live balance','wrong CLI'])test('failed-renewal profile refuses '+reason+' without login or listener',async t=>{
+  const {f,source,destination}=await failedRenewalProfile(t);
+  const credentials=source+'/credentials.json';
+  if(reason==='missing credentials')await rm(credentials);
+  if(reason==='public credentials')await chmod(credentials,0o644);
+  if(reason==='linked credentials')await link(credentials,source+'/another-link.json');
+  if(reason==='symlinked profile'){
+    await rm(source,{recursive:true});
+    await symlink(destination,source,'dir');
+  }
+  if(reason==='source changed')f.dependencies.open=async(path,...args)=>{
+    if(path===credentials)await writeFile(source+'/config.toml',profileConfig+'modified');
+    return open(path,...args);
+  };
+  const cliFailure=['expired credentials','wrong account','extra scope','wrong API','live balance','wrong CLI'].includes(reason);
+  const execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,settings)=>{
+    const result=await execute(file,args,settings);
+    if(args.includes('whoami')){
+      if(reason==='expired credentials')throw Error('private auth failure');
+      if(reason==='wrong account')return {stdout:JSON.stringify({...oauth(),account_id:'acct_wrong'}),stderr:''};
+      if(reason==='extra scope')return {stdout:JSON.stringify({...oauth(),authorized_accounts:[{id:ACCOUNT,modes:['test','extra']}]}),stderr:''};
+    }
+    if(reason==='wrong API'&&args.includes('/v1/balance'))return {...result,stderr:'< HTTP 200\n< Stripe-Version: other\n'};
+    if(reason==='live balance'&&args.includes('/v1/balance'))return {...result,stdout:JSON.stringify({object:'balance',livemode:true})};
+    if(reason==='wrong CLI'&&args.includes('--version'))return {...result,stdout:'stripe version 1.53.0\n'};
+    return result;
+  };
+  const {createBillingFailedRenewalCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingFailedRenewalCliAdapter(f.options,f.dependencies);
+  await rejects(f.adapter.validateBinding(f.limits),'BINDING');
+  await rejects(f.adapter.startListener(f.limits),'LISTENER');
+  assert.equal(f.adapter.loginInvocation,undefined);
+  assert.equal(f.adapter.completeLoginInvocation,undefined);
+  assert.equal(f.children.length,0);
+  assert.equal(f.calls.some(c=>c.args.includes('login')),false);
+  if(!cliFailure){
+    assert.equal(f.calls.length,0);
+    assert.equal(await readFile(destination+'/config.toml','utf8'),'');
+    assert.deepEqual(await readdir(destination),['config.toml']);
+  }
+  assert.equal(await stop(f),true);
+});
 
 for(const outcome of ['rejected','aborted'])test('failed-renewal listener close proves cleanup after '+outcome+' persistence',async()=>{
   let writes=0,finishWrite;

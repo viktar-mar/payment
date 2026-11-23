@@ -3754,7 +3754,9 @@ class OwnedFailedRenewalIntegrationTest extends StripeBillingFirstRenewalComposi
         var post=calls.getLast();assertThat(post.method().name()).isEqualTo("POST");
         assertThat(post.params()).containsExactlyInAnyOrderEntriesOf(Map.of("payment_method","pm_saved","off_session",true));
         assertThat(post.options().getIdempotencyKey()).isEqualTo(c.recoveryOperation().providerOperationKey()+":CONFIRM");
-        assertThat(calls).allSatisfy(r->{assertThat(r.options().getMaxNetworkRetries()).isZero();assertThat(r.options().getReadTimeout()).isBetween(1,2000);assertThat(r.options().getConnectTimeout()).isBetween(1,2000);assertThat(r.headers().firstValue("Stripe-Version")).contains("2026-09-30.endive");});
+        assertThat(calls).allSatisfy(r->{assertThat(r.options().getMaxNetworkRetries()).isZero();assertThat(r.options().getConnectTimeout()).isBetween(1,2000);assertThat(r.headers().firstValue("Stripe-Version")).contains("2026-09-30.endive");});
+        assertThat(calls.subList(0,17)).allSatisfy(r->assertThat(r.options().getReadTimeout()).isBetween(1,2000));
+        assertThat(post.options().getReadTimeout()).isBetween(1,10000);
         assertThat(http.replies).isEmpty();assertThat(ack.operation().kind()).isEqualTo(ProviderOperation.Kind.OWNED_RECOVERY_INTENT_CONFIRM);
         assertThat(ack.operation().status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);assertThat(ack.operation().version()).isEqualTo(2);
         assertThat(ack.operation().resourceId()).isEqualTo(c.recoveryOperation().id());assertThat(ack.operation().providerReference()).isEqualTo(c.reservation().failure().paymentIntent());

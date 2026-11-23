@@ -31,6 +31,22 @@ function harness(){
  return {journey,calls,vs,fixture,bootstrap,cli,runtime,dependencies};
 }
 const owner=h=>owners.createOwnedBillingFailedRenewal(opts(),h.dependencies);
+test('failed-renewal owner uses only binding when a prior CLI profile was selected',async()=>{
+ const o=opts();o.env.PAYMENT_STRIPE_BILLING_FAILED_RENEWAL_CLI_PROFILE_RUN_ID=id(99);
+ for(const accepted of [true,false]){
+  const h=harness();
+  h.dependencies.login=async()=>{h.calls.push('login');throw Error('unexpected login');};
+  h.cli.validateBinding=async()=>{h.calls.push('binding');return accepted;};
+  const controller=await owners.createOwnedBillingFailedRenewal(o,h.dependencies);
+  if(accepted)await controller.run(h.journey,limits());else await assert.rejects(controller.run(h.journey,limits()));
+  const result=await controller.close();
+  assert.equal(h.calls.includes('login'),false);
+  assert.equal(h.calls.includes('listener'),accepted);
+  assert.equal(h.calls.includes('fixture'),accepted);
+  assert.equal(result.failedRenewalAccepted,accepted);
+  if(!accepted)assert.equal(result.code,'BINDING');
+ }
+});
 const persistCodes=['PERSIST_ADMISSION','PERSIST_OWNERSHIP','PERSIST_INPUT','PERSIST_UNCHANGED','PERSIST_FINAL_STORE','PERSIST_ACK'];
 const terminalLine=(checkpoint='PERSIST_FINAL_STORE',cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=LISTENER checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;
 const browserLine=(checkpoint='BROWSER_CARD_NUMBER',cleanup='CONFIRMED',witness='NONE')=>'owned_failed_renewal_diagnostic stage=BROWSER checkpoint='+checkpoint+' cleanup='+cleanup+' witness='+witness;

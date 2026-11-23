@@ -1,5 +1,11 @@
 # Stripe Billing Stage 5B acceptance
 
+## Local recovery evidence on 2026-11-23
+
+**Stripe recovered the €20 renewal debt. Local end-to-end recovery acceptance remains open.** Run `c2dfc733-6915-45b8-8aa5-3792ccb31f42` at `0449bdd` passed the initial payment, declined renewal, grace checks and replacement-method confirmation. The exact Stripe Sandbox request log showed that the invoice-created PaymentIntent refused `error_on_requires_action`. Both the local runner and Stripe stopped that request.
+
+Run `b43a6560-e07b-4232-8cb3-193a99ff2558` at `4f3a806` removed that flag. Its runner stopped at `RECOVERY_CONFIRM_SERVER_CONFIRMATION_POST_TIMEOUT` and confirmed cleanup. A read-only Stripe check followed the new subscription from its initial paid invoice to the separate subscription-cycle invoice and its default PaymentIntent allocation. The renewal invoice was paid for €20 with €0 remaining. Its PaymentIntent succeeded and its captured charge was €20. This establishes the provider outcome. The stopped run supplied no completed local settlement, signed delivery or recovered-access receipt. The timed-out operation is consumed.
+
 ## Current acceptance status on 2026-11-22
 
 **Stage 5B remains open.** The earlier Stripe run `e7080356` verified the first €20 payment and first successful €20 renewal. Run `19107094` verified a failed renewal. Access was allowed one second before the grace deadline and denied at the deadline and one second after it. Confirmation of the replacement method and repayment of that original €20 debt still need native evidence.

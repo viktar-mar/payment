@@ -28,7 +28,8 @@ import java.util.function.LongSupplier;
 
 /** Explicit one-use original-intent producer. A provider ACK never grants settlement authority. */
 public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
-    private static final long CALL_NANOS=TimeUnit.SECONDS.toNanos(2);
+    private static final long CONFIRM_POST_NANOS=TimeUnit.SECONDS.toNanos(10);
+    private static final int CONNECT_TIMEOUT_MILLIS=2000;
     private static final com.fasterxml.jackson.databind.ObjectMapper RESPONSE_JSON=new com.fasterxml.jackson.databind.ObjectMapper()
         .enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
     private final OwnedFailedRenewalMethodService methods;
@@ -196,7 +197,7 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
         diagnostic.checkpoint=Checkpoint.POST_ADMISSION;
         // Capture all call clocks before scheduling; no worker can acquire new authority or time.
         long actualStart=System.nanoTime(),injectedStart=nanos.getAsLong();var entered=utc.instant();
-        long allowance=Math.min(CALL_NANOS,remaining(budget,claim,sessionExpiry));var deadline=entered.plusNanos(allowance);
+        long allowance=Math.min(CONFIRM_POST_NANOS,remaining(budget,claim,sessionExpiry));var deadline=entered.plusNanos(allowance);
         LongSupplier left=()->{
             long remaining=remaining(budget,claim,sessionExpiry),actualElapsed=System.nanoTime()-actualStart,injectedElapsed=nanos.getAsLong()-injectedStart;
             if(actualElapsed<0||injectedElapsed<0)throw unavailable();
@@ -204,7 +205,8 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
             if(remaining<=0)throw unavailable();return remaining;
         };
         int millis=(int)TimeUnit.NANOSECONDS.toMillis(left.getAsLong());if(millis<=0)throw unavailable();
-        var optionsBuilder=RequestOptions.builder().setIdempotencyKey(key).setConnectTimeout(millis).setReadTimeout(millis).setMaxNetworkRetries(0);
+        var optionsBuilder=RequestOptions.builder().setIdempotencyKey(key).setConnectTimeout(Math.min(millis,CONNECT_TIMEOUT_MILLIS))
+            .setReadTimeout(millis).setMaxNetworkRetries(0);
         RequestOptions.RequestOptionsBuilder.unsafeSetStripeVersionOverride(optionsBuilder,StripeBillingTestClockAdapter.API_VERSION);
         var options=optionsBuilder.build();
         var pending=new FutureTask<PostResult<T>>(() -> {

@@ -1,4 +1,4 @@
-import {validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
+import {FAILED_RENEWAL_CLI_PROFILE_RUN_ID,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
 import {checkedInitialResponse,exactRecord,failedStages,snapshotInitialConfirmation,snapshotInitialSession,validateFailedRenewalStage} from './stripe-billing-failed-renewal-response.mjs';
 import {validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
 import {validateRenewalBoundary,validateRenewalFinalization} from './stripe-billing-first-renewal-response.mjs';
@@ -181,7 +181,9 @@ async function createOwner(options,dependencies,purpose){
     bootstrap=await step('BOOTSTRAP',async()=>(dependencies.createBootstrap??(await import('./stripe-sandbox-bootstrap.mjs'))[mode.bootstrap])(c));
     await requireTrue('PREPARE',()=>bootstrap.prepare(active),2700000);
     cli=await step('CLI',async()=>(dependencies.createCli??(await import('./stripe-sandbox-cli.mjs'))[mode.cli])({configuration:c,cliDirectory:bootstrap.resources().cliDirectory,verifyForwardTarget:bootstrap.verifyForwardTarget,persistWebhookSecret:bootstrap.persistWebhookSecret}));
-    await requireTrue('LOGIN',async()=>(dependencies.login??(await import('./stripe-billing-login.mjs')).completeBillingLogin)(cli,c,active),780000);
+    if(!failedRenewal||!Object.hasOwn(c.env,FAILED_RENEWAL_CLI_PROFILE_RUN_ID)){
+     await requireTrue('LOGIN',async()=>(dependencies.login??(await import('./stripe-billing-login.mjs')).completeBillingLogin)(cli,c,active),780000);
+    }
     await requireTrue('BINDING',()=>cli.validateBinding(active));
     await requireTrue('LISTENER',()=>{
      const starting=cli.startListener(active);

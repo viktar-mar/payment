@@ -193,19 +193,33 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
         var f=new Fixture();f.queue();f.beforeConfirmClient=()->{throw new IllegalStateException("PRIVATE_PROVIDER_DETAIL sk_test_secret_INERT");};
         refused(f::confirm);assertThat(f.gets()).hasSize(17);assertThat(f.posts()).isEmpty();f.noAckOrFinancialChange();
     }
-    @Test void blockedConfirmHasActualTwoSecondCompleteCallBoundAndCancelsWithoutRetry()throws Exception{
+    @Test void slowSuccessfulConfirmCanAcknowledgeTheSingleOriginalWrite() {
+        var f=new Fixture();f.queue();
+        f.afterPost=()->{
+            awaitTimedWait(f.caller);
+            f.nanos.addAndGet(TimeUnit.SECONDS.toNanos(3));
+        };
+        var ack=f.confirm();
+        assertThat(f.confirmation.acknowledgments()).containsExactly(ack);
+        assertThat(f.posts()).singleElement().satisfies(post->{
+            assertThat(post.options().getReadTimeout()).isBetween(3001,10000);
+            assertThat(post.options().getConnectTimeout()).isBetween(1,2000);
+            assertThat(post.options().getMaxNetworkRetries()).isZero();
+        });
+    }
+    @Test void blockedConfirmHasActualTenSecondCompleteCallBoundAndCancelsWithoutRetry()throws Exception{
         var f=new Fixture();f.g.queueClocks();var entered=new CountDownLatch(1);var cancelled=new CountDownLatch(1);var entries=new AtomicInteger();
         f.postTransport=request->{entries.incrementAndGet();entered.countDown();try{new CountDownLatch(1).await();throw new AssertionError("unreachable");}catch(InterruptedException e){cancelled.countDown();throw new IllegalStateException("PRIVATE_PROVIDER_DETAIL");}};
         var diagnostic=new Diagnostic();
-        long started=System.nanoTime();refused(()->f.confirm(diagnostic));assertThat(Duration.ofNanos(System.nanoTime()-started)).isBetween(Duration.ofSeconds(1),Duration.ofSeconds(4));
+        long started=System.nanoTime();refused(()->f.confirm(diagnostic));assertThat(Duration.ofNanos(System.nanoTime()-started)).isBetween(Duration.ofSeconds(8),Duration.ofSeconds(13));
         assertThat(diagnostic.checkpoint().name()).isEqualTo("POST_TIMEOUT");
         assertThat(entered.await(1,TimeUnit.SECONDS)).isTrue();assertThat(cancelled.await(1,TimeUnit.SECONDS)).isTrue();assertThat(entries).hasValue(1);f.onlyOwnUnknown();
     }
     @ParameterizedTest @ValueSource(strings={"injected","utc"})
-    void completedConfirmAtExclusiveTwoSecondCallDeadlineIsUncertain(String clock){
+    void completedConfirmAtExclusiveTenSecondCallDeadlineIsUncertain(String clock){
         var f=new Fixture();f.queue();f.afterPost=()->{
             awaitTimedWait(f.caller);
-            if(clock.equals("injected"))f.nanos.addAndGet(TimeUnit.SECONDS.toNanos(2));else f.g.local.at(f.entry.plusSeconds(2));
+            if(clock.equals("injected"))f.nanos.addAndGet(TimeUnit.SECONDS.toNanos(10));else f.g.local.at(f.entry.plusSeconds(10));
         };
         var diagnostic=new Diagnostic();
         refused(()->f.confirm(diagnostic));f.onlyOwnUnknown();assertThat(f.posts()).hasSize(1);
@@ -214,8 +228,8 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
     @ParameterizedTest @ValueSource(strings={"injected","utc"})
     void confirmWorkerScheduledAtExclusiveCallDeadlineCannotEnterSdk(String clock){
         var f=new Fixture();f.queue();var caller=Thread.currentThread();
-        if(clock.equals("injected"))f.invocationNanos=()->Thread.currentThread()!=caller&&f.confirmation.row()!=null?TimeUnit.SECONDS.toNanos(2):0;
-        else f.invocationClock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId z){return this;}public Instant instant(){return Thread.currentThread()!=caller&&f.confirmation.row()!=null?f.entry.plusSeconds(2):f.g.local.now();}};
+        if(clock.equals("injected"))f.invocationNanos=()->Thread.currentThread()!=caller&&f.confirmation.row()!=null?TimeUnit.SECONDS.toNanos(10):0;
+        else f.invocationClock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId z){return this;}public Instant instant(){return Thread.currentThread()!=caller&&f.confirmation.row()!=null?f.entry.plusSeconds(10):f.g.local.now();}};
         refused(f::confirm);assertThat(f.gets()).hasSize(17);assertThat(f.posts()).isEmpty();f.onlyOwnUnknown();
     }
     @Test void callerInterruptionBeforeEntryPreservesFlagAndCannotClaim(){
@@ -254,7 +268,7 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
         f.postTransport=request->{entries.incrementAndGet();return f.g.sdk.http.request(request);};
         f.invocationNanos=()->{
             if(Thread.currentThread()==f.caller&&diagnostic.checkpoint()!=null&&diagnostic.checkpoint().name().equals("POST_WAIT_BUDGET"))
-                f.nanos.set(TimeUnit.SECONDS.toNanos(2));
+                f.nanos.set(TimeUnit.SECONDS.toNanos(10));
             return f.nanos.get();
         };
         refused(()->f.confirm(diagnostic));
@@ -373,7 +387,7 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
         void queue(){g.queueClocks();g.sdk.http.reply(body().toString());}
         List<StripeRequest> posts(){return g.sdk.http.calls.stream().filter(r->r.method().name().equals("POST")).toList();}
         List<StripeRequest> gets(){return g.sdk.http.calls.stream().filter(r->r.method().name().equals("GET")).toList();}
-        void options(StripeRequest r){assertThat(r.options().getMaxNetworkRetries()).isZero();assertThat(r.options().getConnectTimeout()).isBetween(1,2000);assertThat(r.options().getReadTimeout()).isBetween(1,2000);assertThat(r.options().getStripeAccount()).isNull();assertThat(r.headers().map().get("Stripe-Version")).containsExactly("2026-09-30.endive");}
+        void options(StripeRequest r){assertThat(r.options().getMaxNetworkRetries()).isZero();assertThat(r.options().getConnectTimeout()).isBetween(1,2000);assertThat(r.options().getReadTimeout()).isBetween(1,r.method().name().equals("POST")?10000:2000);assertThat(r.options().getStripeAccount()).isNull();assertThat(r.headers().map().get("Stripe-Version")).containsExactly("2026-09-30.endive");}
         Object financial(){var state=(List<?>)g.local.state();return List.of(state.get(0),state.get(1),state.get(2),state.get(3),state.get(4),state.get(5),state.get(7));}
         void noAckOrFinancialChange(){assertThat(confirmation.acknowledgments()).isEmpty();assertThat(financial()).isEqualTo(financialBefore);}
         void onlyOwnUnknown(){noAckOrFinancialChange();assertThat(confirmation.row()).isNotNull();assertThat(confirmation.row().status()).isEqualTo(ProviderOperation.Status.UNKNOWN);assertThat(confirmation.row().version()).isEqualTo(2);assertThat(confirmation.row().resourceId()).isEqualTo(g.original.recoveryOperation().id());assertThat(confirmation.row().operationKey()).isEqualTo(g.original.recoveryOperation().providerOperationKey()+":CONFIRM");assertThat(g.local.trace().stream().filter("stop"::equals)).hasSize(1);}

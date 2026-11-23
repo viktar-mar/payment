@@ -13,9 +13,28 @@ import {remainingOnlyOptIn,remainingOnlyExcluded} from './stripe-sandbox-remaini
 import {proveFailedRenewalRuntime,proveFirstPaymentRuntime,proveFirstRenewalRuntime,failedRenewalContainerFormat,firstPaymentContainerFormat,firstRenewalContainerFormat} from './stripe-sandbox-ownership.mjs';
 const saved=globalThis.fetch;let escaped=0;before(()=>{globalThis.fetch=()=>{escaped++;throw Error('blocked');};});after(()=>{globalThis.fetch=saved;assert.equal(escaped,0);});
 const budget={clock:1,customer:1,create:1,confirm:1,advance:5,declineAttach:1,declineUpdate:1,setup:1,method:1,recoveryConfirm:1};
+const profileFlag='PAYMENT_STRIPE_BILLING_FAILED_RENEWAL_CLI_PROFILE_RUN_ID';
 test('closed case, fixed persisted budget and snapshot without reading other process values',()=>{
  const o=opts();assert.deepEqual(validate(o).budget,budget);assert.equal(validate(o).protocol,'SERVER_CONFIRM_V2');assert.deepEqual(validate(validate(o)),validate(o));
  Object.defineProperty(o.env,'SECRET',{get(){assert.fail();}});assert.deepEqual(snapshot(o.env),opts().env);
+});
+test('failed-renewal snapshot and normalized options retain the selected prior profile',()=>{
+ const o=opts();o.env[profileFlag]=id(99);
+ assert.equal(snapshot(o.env)?.[profileFlag],id(99));
+ const checked=validate({...o,env:snapshot(o.env)});
+ assert.equal(checked?.env[profileFlag],id(99));
+ assert.deepEqual(validate(checked),checked);
+});
+test('failed-renewal profile selection rejects paths, noncanonical IDs and the current run',()=>{
+ for(const value of ['',null,undefined,'../'+id(99),'AAAAAAAA-2222-4333-8444-111111111111',id(99)+'\n']){
+  const o=opts();o.env[profileFlag]=value;
+  assert.equal(snapshot(o.env),null);
+  assert.equal(validate(o),null);
+ }
+ const o=opts();o.env[profileFlag]=o.runId;assert.equal(validate(o),null);
+ const exotic=opts();Object.defineProperty(exotic.env,profileFlag,{enumerable:true,get(){assert.fail('profile accessor invoked');}});
+ assert.equal(snapshot(exotic.env),null);assert.equal(validate(exotic),null);
+ assert.equal(snapshot(Object.assign(Object.create({[profileFlag]:id(99)}),opts().env)),null);
 });
 for(const mutate of [o=>o.selectedCase='initial_and_first_renewal',o=>o.provider='stripe',o=>o.budget={...budget,advance:4},o=>o.budget={...budget,post:1},o=>o.controlPort=o.ports.demo,o=>o.runId='031b5ae7-6603-4339-b1b3-77231291ff34',o=>o.expectedSource='e'.repeat(39),o=>o.approvedBinding.apiVersion='latest',o=>o.env.DEBUG='*',o=>Object.setPrototypeOf(o.ports,{extra:true}),o=>Object.defineProperty(o.env,'PAYMENT_STRIPE_BILLING_FAILED_RENEWAL',{get(){assert.fail();}}),o=>Object.defineProperty(o,'controlPort',{get(){assert.fail();}}),o=>o[Symbol()]=true])test('options reject unexpected authority',()=>{const o=opts();mutate(o);assert.equal(validate(o),null);});
 test('legacy gates reject active new authority, new gate rejects every other purpose',()=>{

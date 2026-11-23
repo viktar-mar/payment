@@ -1,4 +1,4 @@
-import {billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
+import {FAILED_RENEWAL_CLI_PROFILE_RUN_ID,billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
 import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
 import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
@@ -13,6 +13,7 @@ import {manualRefundOptIn} from './stripe-manual-refund-options.mjs';
 import {manualRefundRemainderOptIn} from './stripe-manual-refund-remainder-options.mjs';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
+const RUNS=ROOT+'/test-results/stripe-sandbox';
 const ACCOUNT='acct_1UPiMpELswAd8tpR',VERSION='2026-09-30.endive';
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const EXHAUSTED=new Set(['2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-429f-a34c-e4f69ba2ce18']);
@@ -107,13 +108,14 @@ async function createCliAdapter(options,dependencies,purpose) {
   try {const optIn=rawEnv;manualPaymentMode=!refundMode&&optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=remainderMode?manualRefundRemainderOptIn(optIn):refundMode?manualRefundOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
   if(billingMode)enabled=(failedRenewal?billingFailedRenewalOptIn:firstRenewal?billingFirstRenewalOptIn:firstPayment?billingFirstPaymentOptIn:billingAcceptanceOptIn)(rawEnv);
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
+  const profileRunId=failedRenewal?Object.getOwnPropertyDescriptor(rawEnv,FAILED_RENEWAL_CLI_PROFILE_RUN_ID)?.value:undefined;
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {
     const env=rawEnv;
     if(![undefined,''].includes(env.DEBUG)||![undefined,''].includes(env.NODE_DEBUG)||![undefined,'','0'].includes(env.PWDEBUG))fail();
     runId=options.runId;cliDirectory=options.cliDirectory;backendPort=options.backendPort;
     const binding=options.approvedBinding;
-    if(typeof runId!=='string'||!UUID.test(runId)||EXHAUSTED.has(runId)||cliDirectory!==ROOT+'/test-results/stripe-sandbox/'+runId+'/cli'
+    if(typeof runId!=='string'||!UUID.test(runId)||EXHAUSTED.has(runId)||cliDirectory!==RUNS+'/'+runId+'/cli'
       ||!Number.isInteger(backendPort)||backendPort<1024||backendPort>65535||options.accountKey!=='stripe-sandbox-default'
       ||binding?.externalAccountId!==ACCOUNT||binding?.apiVersion!==VERSION)fail();
     persistSecret=options.persistWebhookSecret;verifyTarget=options.verifyForwardTarget;
@@ -172,22 +174,74 @@ async function createCliAdapter(options,dependencies,purpose) {
     } catch {if(billingMode)billingFailed=true;throw fixed(code);}
     finally {try {io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);} catch {} busy=false;}
   }
+  const validPrivateFile=s=>s.isFile()&&!s.isSymbolicLink()&&s.uid===process.getuid()&&(s.mode&0o7777)===0o600&&s.nlink===1&&Number.isInteger(s.size)&&s.size>=0&&s.size<=65536;
   async function privateFile(path) {
-    const valid=s=>s.isFile()&&!s.isSymbolicLink()&&s.uid===process.getuid()&&(s.mode&0o7777)===0o600&&s.nlink===1&&Number.isInteger(s.size)&&s.size>=0&&s.size<=65536;
-    if(!valid(await io.lstat(path))||await io.realpath(path)!==path)fail();
+    if(!validPrivateFile(await io.lstat(path))||await io.realpath(path)!==path)fail();
     const file=await io.open(path,constants.O_RDONLY|constants.O_NOFOLLOW);
-    try {if(!valid(await file.stat()))fail();} finally {await file.close();}
+    try {if(!validPrivateFile(await file.stat()))fail();} finally {await file.close();}
   }
-  async function privateTree(context) {
-    for(const path of [cliDirectory,cliDirectory+'/home',cliDirectory+'/config',cliDirectory+'/config/stripe']) {
-      check(context);const s=await io.lstat(path);
-      if(!s.isDirectory()||s.isSymbolicLink()||s.uid!==process.getuid()||(s.mode&0o7777)!==0o700||await io.realpath(path)!==path)fail();
-    }
+  async function privateDirectory(path,context) {
+    check(context);const s=await io.lstat(path);
+    if(!s.isDirectory()||s.isSymbolicLink()||s.uid!==process.getuid()||(s.mode&0o7777)!==0o700||await io.realpath(path)!==path)fail();
+  }
+  async function privateTree(context,requireCredentials=Boolean(profileRunId)) {
+    for(const path of [cliDirectory,cliDirectory+'/home',cliDirectory+'/config',cliDirectory+'/config/stripe'])await privateDirectory(path,context);
     await privateFile(cliDirectory+'/config/stripe/config.toml');
     // Directory enumeration distinguishes absent credentials without inspecting thrown errors.
     const names=await io.readdir(cliDirectory+'/config/stripe');
-    if(names.includes('credentials.json'))await privateFile(cliDirectory+'/config/stripe/credentials.json');
+    if(requireCredentials||names.includes('credentials.json'))await privateFile(cliDirectory+'/config/stripe/credentials.json');
     check(context);
+  }
+  function sameProfileFile(actual,expected) {
+    return validPrivateFile(actual)&&actual.dev===expected.dev&&actual.ino===expected.ino&&actual.size===expected.size
+      &&actual.mtimeMs===expected.mtimeMs&&actual.ctimeMs===expected.ctimeMs;
+  }
+  async function profileFileInfo(path,context) {
+    check(context);
+    const info=await io.lstat(path);
+    if(!validPrivateFile(info)||await io.realpath(path)!==path)fail();
+    return info;
+  }
+  async function readProfileFile(path,context) {
+    const info=await profileFileInfo(path,context);
+    if(info.size===0)fail();
+    const file=await io.open(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+    try {
+      if(!sameProfileFile(await file.stat(),info))fail();
+      const buffer=Buffer.alloc(info.size+1);
+      const {bytesRead}=await file.read(buffer,0,buffer.length,0);
+      if(bytesRead!==info.size||!sameProfileFile(await file.stat(),info))fail();
+      return {path,info,contents:buffer.subarray(0,bytesRead)};
+    } finally {await file.close();}
+  }
+  async function seedProfile(context) {
+    const prior=RUNS+'/'+profileRunId,source=prior+'/cli/config/stripe';
+    const target=cliDirectory+'/config/stripe',targetConfig=target+'/config.toml';
+    for(const path of [RUNS,prior,prior+'/cli',prior+'/cli/config',source,RUNS+'/'+runId])await privateDirectory(path,context);
+    await privateTree(context,false);
+    const configuration=await readProfileFile(source+'/config.toml',context);
+    const credentials=await readProfileFile(source+'/credentials.json',context);
+    for(const snapshot of [configuration,credentials]){
+      if(!sameProfileFile(await profileFileInfo(snapshot.path,context),snapshot.info))fail();
+    }
+
+    // The destination belongs to the fresh run and starts with a blank config.
+    const targetInfo=await profileFileInfo(targetConfig,context);
+    if(targetInfo.size!==0)fail();
+    const configFile=await io.open(targetConfig,constants.O_WRONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+    try {
+      if(!sameProfileFile(await configFile.stat(),targetInfo))fail();
+      check(context);
+      const credentialsFile=await io.open(target+'/credentials.json',constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o600);
+      try {
+        if(!validPrivateFile(await credentialsFile.stat()))fail();
+        await credentialsFile.writeFile(credentials.contents);
+        await credentialsFile.sync();
+      } finally {await credentialsFile.close();}
+      check(context);
+      await configFile.writeFile(configuration.contents);
+      await configFile.sync();
+    } finally {await configFile.close();}
   }
   async function command(commandArgs,context) {
     await privateTree(context);check(context);
@@ -209,7 +263,8 @@ async function createCliAdapter(options,dependencies,purpose) {
     const identity=parseBody(await command(['whoami','--format','json'],context));
     if(identity.account_id!==ACCOUNT||identity.mode!=='test'||!Array.isArray(identity.authorized_accounts)||identity.authorized_accounts.length!==1)fail();
     const account=identity.authorized_accounts[0];
-    if(!object(account)||account.id!==ACCOUNT||!Array.isArray(account.modes)||!account.modes.includes('test')||account.modes.includes('live'))fail();
+    if(!object(account)||account.id!==ACCOUNT||!Array.isArray(account.modes)||!account.modes.includes('test')||account.modes.includes('live')
+      ||profileRunId&&account.modes.length!==1)fail();
     const result=await command(['get','/v1/balance','--show-headers'],context),body=parseBody(result,true);
     const lines=(result.stdout+'\n'+result.stderr).split(/\r?\n/),statuses=[],versions=[];
     for(const line of lines) {
@@ -798,7 +853,10 @@ async function createCliAdapter(options,dependencies,purpose) {
     inspectRefund:(value,limits)=>refundOperation('REFUND',limits,context=>inspectRefund(value,context)),}),
   });
   return Object.freeze({
-    validateBinding:limits=>operation('BINDING',limits,async context=>{const result=await binding(context);if(billingMode)billingBound=true;return result;}),
+    validateBinding:limits=>operation('BINDING',limits,async context=>{
+      if(profileRunId&&!billingBound)await seedProfile(context);
+      const result=await binding(context);if(billingMode)billingBound=true;return result;
+    }),
     startListener:limits=>operation('LISTENER',limits,async context=>{if(billingMode){if(!billingBound||billingStarted)fail();billingStarted=true;}return startListener(context);}),
     stopListener:limits=>operation('STOP',limits,async context=>{if(billingMode)billingFailed=true;return stopListener(context);}),
     ...(billingMode?{
@@ -844,15 +902,17 @@ async function createCliAdapter(options,dependencies,purpose) {
     inspectManualPayment:(eventId,limits)=>manualOperation('PAYMENT',limits,context=>inspectManualPayment(eventId,context)),
     inspectUnusedManualPayment:limits=>manualOperation('UNUSED',limits,inspectUnusedManualPayment),
     }),
-    loginInvocation:limits=>operation('LOGIN',limits,async context=>{
-      await privateTree(context);
-      return Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze([...args,'login']),options:Object.freeze({cwd:ROOT,env,shell:false,
-        stdio:Object.freeze(['pipe','pipe','pipe']),timeout:180000,maxBuffer:65536})});
-    }),
-    completeLoginInvocation:limits=>operation('LOGIN',limits,async context=>{
-      await privateTree(context);await privateFile(cliDirectory+'/config/stripe/oauth_pending.json');check(context);
-      return Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze([...args,'login','--complete-device']),options:Object.freeze({cwd:ROOT,env,shell:false,
-        stdio:Object.freeze(['pipe','pipe','pipe']),timeout:600000,maxBuffer:65536})});
-    }),
+    ...(!profileRunId?{
+      loginInvocation:limits=>operation('LOGIN',limits,async context=>{
+        await privateTree(context);
+        return Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze([...args,'login']),options:Object.freeze({cwd:ROOT,env,shell:false,
+          stdio:Object.freeze(['pipe','pipe','pipe']),timeout:180000,maxBuffer:65536})});
+      }),
+      completeLoginInvocation:limits=>operation('LOGIN',limits,async context=>{
+        await privateTree(context);await privateFile(cliDirectory+'/config/stripe/oauth_pending.json');check(context);
+        return Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze([...args,'login','--complete-device']),options:Object.freeze({cwd:ROOT,env,shell:false,
+          stdio:Object.freeze(['pipe','pipe','pipe']),timeout:600000,maxBuffer:65536})});
+      }),
+    }:{}),
   });
 }
