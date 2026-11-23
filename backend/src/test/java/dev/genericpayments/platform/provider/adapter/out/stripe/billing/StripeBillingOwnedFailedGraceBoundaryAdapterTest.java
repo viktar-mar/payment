@@ -56,7 +56,10 @@ class StripeBillingOwnedFailedGraceBoundaryAdapterTest {
         var f=new Fixture(Phase.AT);f.reply(260299,"ready");f.reply(260299,"advancing");
         for(int i=0;i<12;i++)f.reply(260299,"advancing");
         assertThatThrownBy(f::advance).isInstanceOf(PaymentApplicationException.class);
-        assertThat(f.waits).hasSize(11).containsOnly(Duration.ofMillis(250));assertThat(f.sdk.http.calls).hasSize(14);
+        assertThat(f.waits).hasSize(11).allSatisfy(delay->assertThat(delay).isGreaterThanOrEqualTo(Duration.ofMillis(250)));
+        assertThat(f.waits.getFirst()).isEqualTo(Duration.ofMillis(250));
+        assertThat(f.local.base.nanos()).isBetween(Duration.ofSeconds(20).toNanos(),Duration.ofSeconds(28).toNanos());
+        assertThat(f.sdk.http.calls).hasSize(14);
         assertThat(f.local.row(Phase.AT).stopped()).isTrue();
         var late=new Fixture(Phase.AT);late.reply(260299,"ready");late.reply(260300,"ready");late.reply(260300,"ready");
         late.local.afterCommit=()->{var r=late.local.row(Phase.AT);if(r!=null&&r.ready()!=null)late.local.base.elapsed(31_000_000_000L);};

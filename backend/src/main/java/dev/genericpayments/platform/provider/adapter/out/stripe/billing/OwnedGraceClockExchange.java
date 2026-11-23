@@ -21,6 +21,7 @@ import java.util.function.*;
 /** Clock transport for the original and boundary producers. All hooks run on the caller. */
 final class OwnedGraceClockExchange {
     private static final long CALL_NANOS=TimeUnit.SECONDS.toNanos(2),SPACE_NANOS=TimeUnit.MILLISECONDS.toNanos(250);
+    private static final int MAX_POLLS=12;
     private static final ObjectMapper RESPONSE_JSON=new ObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
         .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
     private final StripeClient client;
@@ -66,8 +67,8 @@ final class OwnedGraceClockExchange {
     }
 
     <R>R recordReady(Runnable inspectAcknowledged,BiFunction<TestClockReady,Instant,R> recordReady){
-        for(int poll=0;poll<12;poll++){
-            if(poll>0){checkpoint.accept(Checkpoint.POLL_WAIT);space(budget,claim);}
+        for(int poll=0;poll<MAX_POLLS;poll++){
+            if(poll>0){checkpoint.accept(Checkpoint.POLL_WAIT);space(poll);}
             checkpoint.accept(Checkpoint.POLL_READ);
             inspectAcknowledged.run();
             var remote=call(budget,claim,null,options->client.v1().testHelpers().testClocks().retrieve(previous.reference(),options));
@@ -115,9 +116,13 @@ final class OwnedGraceClockExchange {
     }
     private static boolean integral(JsonNode node){return node!=null&&node.isIntegralNumber()&&node.canConvertToLong();}
     private static boolean onlyFields(JsonNode node,Set<String> allowed){var fields=node.fieldNames();while(fields.hasNext())if(!allowed.contains(fields.next()))return false;return true;}
-    private void space(InvocationBudget budget,ProviderOperation claim){
-        if(budget.remainingNanos(claim)<=SPACE_NANOS+CALL_NANOS)throw unavailable();
-        wait.accept(Duration.ofNanos(SPACE_NANOS));budget.remainingNanos(claim);
+    private void space(int poll){
+        long remaining=budget.remainingNanos(claim);
+        if(remaining<=SPACE_NANOS+CALL_NANOS)throw unavailable();
+        // Keep the first follow-up fast and distribute later reads within the original budget.
+        long delay=poll==1?SPACE_NANOS:Math.max(SPACE_NANOS,(remaining-CALL_NANOS)/(MAX_POLLS-poll));
+        wait.accept(Duration.ofNanos(delay));
+        budget.remainingNanos(claim);
     }
     private interface SdkCall<T>{T run(RequestOptions options)throws StripeException;}
     private <T>T call(InvocationBudget budget,ProviderOperation claim,String key,SdkCall<T> work){

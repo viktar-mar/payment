@@ -66,6 +66,20 @@ class StripeBillingOwnedFailedGraceAdvanceAdapterTest {
         var f=new Fixture();f.sdk.http.reply(f.clock(f.previous(),"ready"));f.sdk.http.reply(f.clock(f.previous(),"advancing"));f.sdk.http.reply(f.clock(f.previous(),"advancing"));f.sdk.http.reply(f.clock(f.target(),"ready"));
         assertThat(f.advance()).isEqualTo(f.local.savedReady());assertThat(f.posts()).hasSize(1);assertThat(f.waits).containsExactly(Duration.ofMillis(250));assertThat(f.local.stops()).isZero();
     }
+    @Test void observesAClockThatBecomesReadySixSecondsAfterTheAdvance(){
+        var f=new Fixture();
+        f.sdk.http.reply(f.clock(f.previous(),"ready"));
+        f.sdk.http.reply(f.clock(f.previous(),"advancing"));
+        f.beforeRequest=request->{
+            if(f.sdk.http.calls.size()<2)return;
+            boolean ready=f.local.nanos()>=TimeUnit.SECONDS.toNanos(6);
+            f.sdk.http.reply(f.clock(ready?f.target():f.previous(),ready?"ready":"advancing"));
+        };
+        assertThat(f.advance()).isEqualTo(f.local.savedReady());
+        assertThat(f.posts()).hasSize(1);
+        assertThat(f.gets().size()).isLessThanOrEqualTo(13);
+        assertThat(f.local.nanos()).isBetween(TimeUnit.SECONDS.toNanos(6),TimeUnit.SECONDS.toNanos(30)-1);
+    }
     @ParameterizedTest @ValueSource(strings={"id","object","name","status","livemode","created","deletes_after","frozen_time"})
     void everyRequiredWireFieldMustBePresentWithNoPrimitiveDefault(String field){
         for(String phase:List.of("get","post","poll")){var f=new Fixture();f.queueBad(phase,remove(f.phaseClock(phase),field));refused(f::advance);f.consumed(phase);}

@@ -8,6 +8,8 @@ Run `b43a6560-e07b-4232-8cb3-193a99ff2558` at `4f3a806` removed that flag. Its r
 
 Run `d39a1994-80d8-4300-895e-7c842bddbec7` at `3f28960` passed the Stripe Sandbox binding with the copied CLI authorization and presented the Pay form without issuing a new device code. The run stopped at `BROWSER_MANUAL_PAY_WAIT` with cleanup confirmed. Its journal records subscription creation and no payment confirmation dispatch. The recovery POST adjustment still needs a complete fresh run to verify local settlement, access restoration and signed delivery.
 
+Run `564ce901-358a-4bbc-954b-e0e5df5a258f` at `8a6c6bc` reused the CLI authorization, acknowledged the initial €20 confirmation, and stopped at `GRACE_LAST_SECOND_SERVER_CLOCK_POLL_EXHAUSTED` with cleanup confirmed. The receipt identifies twelve validated advancing clock observations after ACK. A subsequent read matched the exact run customer using its account, site and customer metadata and found the linked test clock `ready`. The change spreads later reads within the existing 30-second invocation and original lease, preserving the maximum twelve polls, two seconds per call, one POST and zero SDK retries. An inert fixture reproduces the old failure when READY arrives after six seconds. The already consumed run has no recovery confirmation, settlement or access-restoration receipt.
+
 ## Current acceptance status on 2026-11-22
 
 **Stage 5B remains open.** The earlier Stripe run `e7080356` verified the first €20 payment and first successful €20 renewal. Run `19107094` verified a failed renewal. Access was allowed one second before the grace deadline and denied at the deadline and one second after it. Confirmation of the replacement method and repayment of that original €20 debt still need native evidence.
