@@ -19,6 +19,7 @@ import java.util.concurrent.atomic.*;
 import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedRecoveryPreparationMappingTest.*;
@@ -274,7 +275,9 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
         var privateCode="PRIVATE_PROVIDER_DETAIL";
         StripeException failure=switch(kind){
             case "CARD" -> new CardException(privateMessage,privateId,privateCode,"secret_INERT",null,null,402,null);
-            case "INVALID_REQUEST" -> new InvalidRequestException(privateMessage,"secret_INERT",privateId,privateCode,400,null);
+            case "INVALID_REQUEST" -> new InvalidRequestException(privateMessage,"secret_INERT",privateId,privateCode,400,null) {
+                @Override public String getParam(){throw new AssertionError("read foreign SDK parameter");}
+            };
             case "ACCESS" -> new PermissionException(privateMessage,privateId,privateCode,403);
             case "RATE_LIMIT" -> new RateLimitException(privateMessage,"secret_INERT",privateId,privateCode,429,null);
             case "IDEMPOTENCY" -> new IdempotencyException(privateMessage,privateId,privateCode,409);
@@ -297,6 +300,37 @@ class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapterTest {
         assertThat(entries).hasValue(1);
         assertThat(f.confirmation.receiptState()).isEqualTo(consumed);
         assertThat(diagnostic.toString()).doesNotContain(privateMessage,privateId,privateCode);
+    }
+
+    @ParameterizedTest
+    @CsvSource(value={
+        "payment_method, INVALID_PARAM_PAYMENT_METHOD",
+        "off_session, INVALID_PARAM_OFF_SESSION",
+        "error_on_requires_action, INVALID_PARAM_ERROR_ON_REQUIRES_ACTION",
+        "ABSENT, INVALID_REQUEST_NO_PARAM",
+        "'', INVALID_REQUEST_NO_PARAM",
+        "PRIVATE_PROVIDER_DETAIL, INVALID_PARAM_OTHER",
+        "'off_session ', INVALID_PARAM_OTHER",
+        "OFF_SESSION, INVALID_PARAM_OTHER"
+    }, nullValues="ABSENT")
+    void sdkInvalidRequestResponseReportsOnlyAnExactKnownParameter(String param,String suffix) {
+        var f=new Fixture();f.g.queueClocks();
+        var error=new JsonObject();
+        error.addProperty("type","invalid_request_error");
+        error.addProperty("code","PRIVATE_PROVIDER_DETAIL");
+        error.addProperty("message","PRIVATE_PROVIDER_DETAIL sk_test_secret_INERT");
+        if(param!=null)error.addProperty("param",param);
+        var body=new JsonObject();body.add("error",error);
+        f.g.sdk.http.replies.addLast(new StripeResponse(400,
+            HttpHeaders.of(Map.of("Request-Id",List.of("req_PRIVATE_PROVIDER_DETAIL"))),body.toString()));
+        var diagnostic=new Diagnostic();
+        refused(()->f.confirm(diagnostic));
+        assertThat(diagnostic.checkpoint().name()).isEqualTo("POST_STRIPE_"+suffix);
+        f.onlyOwnUnknown();
+        var consumed=f.confirmation.receiptState();
+        f.g.queueClocks();refused(f::confirm);
+        assertThat(f.posts()).hasSize(1);
+        assertThat(f.confirmation.receiptState()).isEqualTo(consumed);
     }
 
     private static void awaitTimedWait(Thread caller) {

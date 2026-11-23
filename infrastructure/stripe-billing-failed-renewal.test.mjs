@@ -868,7 +868,10 @@ test('post-arm owner reports the grace clock refusal without invoking another fi
 });
 const recoveryPostStages=[
  'ADMISSION','WORKER_ADMISSION','WAIT_BUDGET','TIMEOUT','INTERRUPTED','REPLY_BUDGET',
- 'STRIPE_CARD','STRIPE_INVALID_REQUEST','STRIPE_ACCESS','STRIPE_RATE_LIMIT','STRIPE_IDEMPOTENCY',
+ 'STRIPE_CARD','STRIPE_INVALID_REQUEST','STRIPE_INVALID_REQUEST_NO_PARAM',
+ 'STRIPE_INVALID_PARAM_PAYMENT_METHOD','STRIPE_INVALID_PARAM_OFF_SESSION',
+ 'STRIPE_INVALID_PARAM_ERROR_ON_REQUIRES_ACTION','STRIPE_INVALID_PARAM_OTHER',
+ 'STRIPE_ACCESS','STRIPE_RATE_LIMIT','STRIPE_IDEMPOTENCY',
  'STRIPE_CONNECTION','STRIPE_API','STRIPE_OTHER',
 ];
 for(const [fault,checkpoint] of [
@@ -892,7 +895,7 @@ for(const [fault,checkpoint] of [
    if(fault==='invalid response')return new Response(JSON.stringify({...h.vs[10],recovery_charge_id:'private recovery canary'}));
    const confirmPost='RECOVERY_CONFIRM_CONFIRMATION_POST_';
    const stage=fault==='wrong server route'?'FAILED_RENEWAL_ADMISSION':
-    fault==='unknown server post suffix'?confirmPost+'PRIVATE':
+    fault==='unknown server post suffix'?confirmPost+'STRIPE_INVALID_PARAM_PRIVATE':
     fault==='extra server field'?confirmPost+'STRIPE_INVALID_REQUEST':
     'RECOVERY_CONFIRM_'+checkpoint.slice('SERVER_'.length);
    const body={code:'FAILED_RENEWAL_STOPPED',stage};
@@ -921,6 +924,14 @@ for(const [fault,checkpoint] of [
  await assert.rejects(o.run(h.journey,limits()),/SINGLE_USE/);
  assert.deepEqual(await o.close(),result);
  assert.equal(paths.length,requestCount);
+});
+test('recovery confirmation reports the longest parameter checkpoint with an unconfirmed cleanup witness',()=>{
+ const diagnostic='RECOVERY_CONFIRM_SERVER_CONFIRMATION_POST_STRIPE_INVALID_PARAM_ERROR_ON_REQUIRES_ACTION';
+ const result={scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',status:'CLOSED',phase:'RECOVERY_CONFIRM',code:'RECOVERY_CONFIRM',
+  diagnostic,initialAccepted:false,failedRenewalAccepted:false,full5bAccepted:false,cleanupConfirmed:false,cleanupFailure:'BROWSER_UNSETTLED'};
+ const line=postArmLine('RECOVERY_CONFIRM',diagnostic,'UNCONFIRMED','BROWSER_UNSETTLED');
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
 });
 test('post-arm terminal protocol rejects foreign stages, mismatched codes, arbitrary text and false cleanup claims',()=>{
  const base={scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',status:'CLOSED',phase:'FAILED_RENEWAL',code:'FAILED_RENEWAL',diagnostic:'FAILED_RENEWAL_REQUEST',initialAccepted:false,failedRenewalAccepted:false,full5bAccepted:false,cleanupConfirmed:true,cleanupFailure:null};

@@ -56,7 +56,11 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
     public enum Checkpoint {
         PREFLIGHT, AUTHORITY, CLAIM,
         POST, POST_ADMISSION, POST_WORKER_ADMISSION, POST_WAIT_BUDGET, POST_TIMEOUT, POST_INTERRUPTED, POST_REPLY_BUDGET,
-        POST_STRIPE_CARD, POST_STRIPE_INVALID_REQUEST, POST_STRIPE_ACCESS, POST_STRIPE_RATE_LIMIT,
+        POST_STRIPE_CARD, POST_STRIPE_INVALID_REQUEST,
+        POST_STRIPE_INVALID_PARAM_PAYMENT_METHOD, POST_STRIPE_INVALID_PARAM_OFF_SESSION,
+        POST_STRIPE_INVALID_PARAM_ERROR_ON_REQUIRES_ACTION, POST_STRIPE_INVALID_REQUEST_NO_PARAM,
+        POST_STRIPE_INVALID_PARAM_OTHER,
+        POST_STRIPE_ACCESS, POST_STRIPE_RATE_LIMIT,
         POST_STRIPE_IDEMPOTENCY, POST_STRIPE_CONNECTION, POST_STRIPE_API, POST_STRIPE_OTHER,
         REPLY, ACK
     }
@@ -164,10 +168,10 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
         @Override public String toString(){return "PostResult[redacted]";}
     }
     private static Checkpoint stripePostFailure(StripeException refusal) {
-        // Only the SDK exception class is used. Neither its message nor its provider payload is needed.
+        // Keep only fixed categories. The Stripe message, code and response body are unused.
         return switch(refusal){
             case CardException ignored -> Checkpoint.POST_STRIPE_CARD;
-            case InvalidRequestException ignored -> Checkpoint.POST_STRIPE_INVALID_REQUEST;
+            case InvalidRequestException invalid -> invalidRequestCheckpoint(invalid);
             case AuthenticationException ignored -> Checkpoint.POST_STRIPE_ACCESS;
             case RateLimitException ignored -> Checkpoint.POST_STRIPE_RATE_LIMIT;
             case IdempotencyException ignored -> Checkpoint.POST_STRIPE_IDEMPOTENCY;
@@ -175,6 +179,16 @@ public final class StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter {
             case ApiException ignored -> Checkpoint.POST_STRIPE_API;
             default -> Checkpoint.POST_STRIPE_OTHER;
         };
+    }
+    private static Checkpoint invalidRequestCheckpoint(InvalidRequestException invalid) {
+        // Invoke only the SDK's concrete field accessor, never an overridden getter.
+        if(invalid.getClass()!=InvalidRequestException.class)return Checkpoint.POST_STRIPE_INVALID_REQUEST;
+        String param=invalid.getParam();
+        if(param==null||param.isEmpty())return Checkpoint.POST_STRIPE_INVALID_REQUEST_NO_PARAM;
+        if("payment_method".equals(param))return Checkpoint.POST_STRIPE_INVALID_PARAM_PAYMENT_METHOD;
+        if("off_session".equals(param))return Checkpoint.POST_STRIPE_INVALID_PARAM_OFF_SESSION;
+        if("error_on_requires_action".equals(param))return Checkpoint.POST_STRIPE_INVALID_PARAM_ERROR_ON_REQUIRES_ACTION;
+        return Checkpoint.POST_STRIPE_INVALID_PARAM_OTHER;
     }
     private <T>T call(InvocationBudget budget,ProviderOperation claim,Instant sessionExpiry,String key,Diagnostic diagnostic,Call<T> work){
         diagnostic.checkpoint=Checkpoint.POST_ADMISSION;
