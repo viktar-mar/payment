@@ -58,7 +58,13 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
     }
     private JsonObject initial(Supplier<JsonObject> work){return stage("INITIAL","INITIAL",Stage.INITIAL,work);}
     @Override public JsonObject prepare(JsonObject request){return initial(()->initial.prepare(request));}
-    @Override public JsonObject confirm(JsonObject request){return initial(()->initial.confirm(request));}
+    @Override public JsonObject confirm(JsonObject request){return initial(()->{
+        try{return initial.confirm(request);}
+        catch(RuntimeException refusal){detailedStep=initial.confirmFailureStage(refusal);throw refusal;}
+    });}
+    @Override public String confirmFailureStage(Exception refusal){
+        return refusal!=null&&refusal==detailedRefusal?detailedStep:"CONFIRM_UNCLASSIFIED";
+    }
     @Override public JsonObject observe(){return initial(initial::observe);}
     @Override public String prepareFailureStage(){return initial.prepareFailureStage();}
     @Override public String failureStage(){return failureStage.name();}

@@ -10,7 +10,9 @@ import java.io.*;
 import java.lang.reflect.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -125,6 +127,70 @@ class OwnedBillingFailedRenewalRuntimeTest {
         var observe=request("POST","/initial-payment/observe","{}");h.handle(observe);assertThat(observe.code).isEqualTo(200);
         var malformed=request("POST","/initial-payment/confirm","{\"target\":\"foreign\"}");h.handle(malformed);assertThat(malformed.code).isEqualTo(400);
         assertThat(ops.effects).containsExactly("status","initial-observe");assertThat(ops.aborts).hasValue(1);
+    }
+    private static final String CONFIRM_BODY=
+        "{\"attempt_id\":\"a\",\"capability\":\"b\",\"confirmation_token\":\"c\",\"idempotency_key\":\"d\"}";
+    @Test void initialConfirmationPublishesOnlyItsAllowlistedFailureBeforeAbort() throws Exception {
+        for (String stage:List.of("CONFIRM_STATE","CONFIRM_AUTHORITY","CONFIRM_SERVICE","CONFIRM_RESULT",
+                "CONFIRM_RESPONSE_BUILD","CONFIRM_UNCLASSIFIED","CONFIRM_SERVICE\" private body","RECOVERY_CONFIRM_ACCESS")) {
+            var refusal=new IllegalStateException("private provider response");
+            var reads=new AtomicInteger();
+            var ops=new Inert(){
+                public JsonObject confirm(JsonObject request){throw refusal;}
+                public String confirmFailureStage(Exception failure){
+                    assertThat(failure).isSameAs(refusal);
+                    assertThat(aborts).hasValue(0);
+                    reads.incrementAndGet();
+                    return stage;
+                }
+            };
+            var exchange=request("POST","/initial-payment/confirm",CONFIRM_BODY);
+            handler(ops).handle(exchange);
+            assertThat(exchange.code).isEqualTo(400);
+            String expected=stage.contains("private")||stage.startsWith("RECOVERY")?"CONFIRM_UNCLASSIFIED":stage;
+            assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\",\"stage\":\""+expected+"\"}");
+            assertThat(reads).hasValue(1);
+            assertThat(ops.aborts).hasValue(1);
+        }
+    }
+    @Test void malformedConfirmationAndOtherRoutesCannotReadConfirmationFailureStage() throws Exception {
+        for (String path:List.of("/initial-payment/confirm","/initial-payment/observe")) {
+            var ops=new Inert(){
+                public JsonObject confirm(JsonObject request){throw new AssertionError("malformed confirmation dispatched");}
+                public JsonObject observe(){throw new IllegalStateException("private provider response");}
+                public String confirmFailureStage(Exception failure){throw new AssertionError("wrong failure source read");}
+            };
+            var exchange=request("POST",path,"{}");
+            handler(ops).handle(exchange);
+            String body=path.endsWith("/confirm")
+                ? "{\"code\":\"INITIAL_PAYMENT_STOPPED\",\"stage\":\"CONFIRM_REQUEST\"}"
+                : "{\"code\":\"INITIAL_PAYMENT_STOPPED\"}";
+            assertThat(exchange.code).isEqualTo(400);
+            assertThat(exchange.output.toString()).isEqualTo(body);
+            assertThat(ops.aborts).hasValue(1);
+        }
+    }
+    @Test void legacyHandlerKeepsGenericConfirmationError() throws Exception {
+        var ops=new Inert(){
+            public JsonObject confirm(JsonObject request){throw new IllegalStateException("private provider response");}
+            public String confirmFailureStage(Exception failure){throw new AssertionError("legacy diagnostic was activated");}
+        };
+        var exchange=request("POST","/initial-payment/confirm",CONFIRM_BODY);
+        new OwnedBillingFirstPaymentRuntime.Handler(ops,KEY).handle(exchange);
+        assertThat(exchange.code).isEqualTo(400);
+        assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\"}");
+        assertThat(ops.aborts).hasValue(1);
+    }
+    @Test void confirmationBeforePrepareReportsActualScenarioStateWithoutLoadingAnyBean() throws Exception {
+        var admission=OwnedBillingFailedRenewalRuntime.admit(environment(),SHA);
+        var now=Instant.ofEpochSecond(admission.frozen());
+        var scenario=new OwnedBillingFailedRenewalSandboxScenario(admission,
+            type->{throw new AssertionError("unexpected dependency "+type.getName());},
+            Clock.fixed(now,ZoneOffset.UTC),now.plusSeconds(60));
+        var exchange=request("POST","/initial-payment/confirm",CONFIRM_BODY);
+        new OwnedBillingFailedRenewalRuntime.Handler(scenario,KEY).handle(exchange);
+        assertThat(exchange.code).isEqualTo(400);
+        assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"INITIAL_PAYMENT_STOPPED\",\"stage\":\"CONFIRM_STATE\"}");
     }
     @Test void errorsCaptureOnlyClosedStageBeforeAbortAndNeverExceptionDetails() throws Exception {
         for(String stage:List.of("BOUNDARY","DECLINE_ARM","FAILED_RENEWAL","GRACE_LAST_SECOND","GRACE_AT","GRACE_AFTER","METHOD_PREPARE","METHOD_SELECT","METHOD_CONFIRM","METHOD_APPLY","RECOVERY_CONFIRM","RECOVERY_OBSERVE","private-secret")){

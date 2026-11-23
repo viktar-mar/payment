@@ -33,6 +33,8 @@ public final class OwnedBillingFirstPaymentScenario implements OwnedBillingFirst
     private final Clock utc;
     private final OwnedBillingFirstPaymentRuntime.State state;
     private String prepareFailureStage;
+    private String confirmFailureStage;
+    private RuntimeException confirmRefusal;
     private PaymentAccount account;
     private SiteId site;private CustomerId customer;private PriceId price;
     private String token,origin,createKey,originalInvoice,originalIntent;
@@ -127,17 +129,31 @@ public final class OwnedBillingFirstPaymentScenario implements OwnedBillingFirst
         return checkpoint;
     }
     @Override public synchronized JsonObject confirm(JsonObject request) {
+        String checkpoint="CONFIRM_STATE";
         try {
             state.begin("PREPARED","CONFIRMING");
+            checkpoint="CONFIRM_REQUEST";
             OwnedBillingFirstPaymentRuntime.fields(request,Set.of("attempt_id","capability","confirmation_token","idempotency_key"));
             require(selected.attemptId().equals(uuid(request,"attempt_id")));
             var actualKey=key(text(request,"idempotency_key"));require(!actualKey.equals(createKey));
             // Resolve the retained real customer token again; provider and service bind THIS actual request Scope.
-            var scope=scope(actualKey);var result=service(scope).confirm(scope,selected.attemptId(),text(request,"capability"),text(request,"confirmation_token"));
+            checkpoint="CONFIRM_AUTHORITY";
+            var scope=scope(actualKey);
+            checkpoint="CONFIRM_SERVICE";
+            var result=service(scope).confirm(scope,selected.attemptId(),text(request,"capability"),text(request,"confirmation_token"));
+            checkpoint="CONFIRM_RESULT";
             require(result.status().state()==SubscriptionConfirmationAttempt.State.OBSERVE&&!result.status().retryAllowed()&&result.status().successorAttemptId()==null&&!result.nextActionAllowed());
+            checkpoint="CONFIRM_RESPONSE_BUILD";
             state.finish("CONFIRMING","OBSERVE");
             var response=status();response.addProperty("protocol","SERVER_CONFIRM_V2");response.addProperty("attempt_id",selected.attemptId().toString());response.addProperty("state","OBSERVE");response.addProperty("retry_allowed",false);response.add("successor_attempt_id",JsonNull.INSTANCE);response.addProperty("next_action_allowed",false);response.addProperty("expires_at",result.status().expiresAt().toString());return response;
-        }catch(RuntimeException invalid){abort();throw OwnedBillingFirstPaymentRuntime.denied();}
+        }catch(RuntimeException invalid){
+            var refusal=OwnedBillingFirstPaymentRuntime.denied();
+            if(confirmRefusal==null){confirmFailureStage=checkpoint;confirmRefusal=refusal;}
+            abort();throw refusal;
+        }
+    }
+    @Override public synchronized String confirmFailureStage(Exception refusal){
+        return refusal!=null&&refusal==confirmRefusal?confirmFailureStage:"CONFIRM_UNCLASSIFIED";
     }
     private SubscriptionConfirmationService service(SubscriptionConfirmationUseCase.Scope scope) {
         var phases=bean(SubscriptionInteractionTransaction.class);var roots=bean(SubscriptionActionStore.class);var confirmations=bean(SubscriptionConfirmationStore.class);

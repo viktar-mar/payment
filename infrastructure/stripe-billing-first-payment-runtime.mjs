@@ -15,14 +15,15 @@ const observationSteps=['CLAIM','AUTHORITY','CLOCK_BEFORE','GRAPH','CUSTOMER','S
  'FAILED_ALLOCATION','FAILED_INTENT','FAILED_CHARGE','FAILED_REVERSE','CLOCK_AFTER','ACCEPTANCE','PUBLICATION'];
 const graceClockSteps=['INSPECT','CREDENTIALS','CLAIM','PRE_READ','PRE_VALIDATE','POST','POST_VALIDATE','ACK_STORE',
  'POLL_WAIT','POLL_READ','POLL_VALIDATE','POLL_EXHAUSTED','READY_STORE'];
-function requestDiagnostics(stage,steps){
+function requestDiagnostics(stage,steps,code='FAILED_RENEWAL_STOPPED',wireStage=stage){
  const errors=new Map(steps.map(step=>[
-  JSON.stringify({code:'FAILED_RENEWAL_STOPPED',stage:stage+'_'+step}),stage+'_SERVER_'+step,
+  JSON.stringify({code,stage:wireStage+'_'+step}),stage+'_SERVER_'+step,
  ]));
  return {stage,errors,limit:Math.max(...Array.from(errors.keys(),value=>value.length)),
   codes:new Set([...['AUTHORITY','TRANSPORT','HTTP','RESPONSE'].map(step=>stage+'_'+step),...errors.values()])};
 }
 const failedRequestDiagnostics=new Map([
+ ['confirm',requestDiagnostics('INITIAL_CONFIRM',['REQUEST','STATE','AUTHORITY','SERVICE','RESULT','RESPONSE_BUILD','UNCLASSIFIED'],'INITIAL_PAYMENT_STOPPED','CONFIRM')],
  ['failed',requestDiagnostics('FAILED_RENEWAL',['CLOCK_ADVANCE','ADMISSION','OBSERVATION','EVIDENCE',...observationSteps.map(name=>'OBSERVATION_'+name)])],
  ['grace-last-second',requestDiagnostics('GRACE_LAST_SECOND',['PREPARATION','CLOCK_ADVANCE','CLOCK_EVIDENCE','ACCESS',...graceClockSteps.map(name=>'CLOCK_'+name)])],
  ['recovery/confirm',requestDiagnostics('RECOVERY_CONFIRM',[
@@ -158,7 +159,7 @@ function createRuntime({configuration,bootstrap},dependencies,purpose){
    },limits);
    if(route==='prepare'&&(admitted!==true||!entered||result===undefined))checkpoint='PREPARE_AUTHORITY';
    need(admitted===true&&(!(extended||route==='prepare')||entered&&result!==undefined));billingCheck(limits);need(!failed);
-   if(failedStep)failedRuntimeSteps.delete(runtime);
+   if(failedStep&&route!=='confirm')failedRuntimeSteps.delete(runtime);
    return result;
   }catch{failed=true;throw failure(route==='prepare'&&(limits?.signal?.aborted||Date.now()>=limits?.deadline)?'PREPARE_REQUEST':checkpoint);}finally{busy=false;}
  }
@@ -184,9 +185,12 @@ function createRuntime({configuration,bootstrap},dependencies,purpose){
    phase='CONFIRMING';
    if(failedRenewal)try{original=snapshotInitialConfirmation(original,initialSelection);}catch{stop();}
    const v=await request('confirm',original,l);
+   const confirmStep=failedRuntimeSteps.get(runtime);
+   if(confirmStep)confirmStep.code='INITIAL_CONFIRM_RESPONSE';
    if(failedRenewal&&v.attempt_id!==original.attempt_id)stop();
    if(v.phase!=='OBSERVE'||v.state!=='OBSERVE'||v.next_action_allowed!==false||v.retry_allowed!==false||v.successor_attempt_id!==null)stop();
    if(extended&&Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))stop();
+   if(confirmStep)failedRuntimeSteps.delete(runtime);
    initialSelection=undefined;phase='OBSERVE';return v;
   },
   async observe(l){if(phase!=='OBSERVE'||++observations>30)stop();const v=await request('observe',{},l);if(!['OBSERVE','SETTLED_LOCAL'].includes(v.phase))stop();if(extended&&Object.entries(originalIdentity).some(([k,value])=>v[k]!==value))stop();if(v.phase==='SETTLED_LOCAL'){if(failedRenewal)try{checkInitialSettlementTime(v,c);}catch{stop();}phase=v.phase;initialSettlement=extended?Object.freeze({...v}):v;}return v;},

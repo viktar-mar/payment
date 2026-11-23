@@ -21,6 +21,7 @@ const startupCodes=new Set([
 const postConfirmCheckpoints=Object.freeze({BROWSER:'POST_CONFIRM_BROWSER',OBSERVE:'POST_CONFIRM_OBSERVE',EVIDENCE:'POST_CONFIRM_EVIDENCE',RENEWAL_BOUNDARY:'POST_CONFIRM_RENEWAL_BOUNDARY',RENEWAL_FINALIZATION:'POST_CONFIRM_RENEWAL_FINALIZATION',RENEWAL_EVIDENCE:'POST_CONFIRM_RENEWAL_EVIDENCE'});
 const postConfirmCodes=new Set([...Object.values(postConfirmCheckpoints),'POST_CONFIRM_CLEANUP']);
 const isTerminalDiagnostic=code=>isBillingFirstPaymentDiagnostic(code)||isBrowserDiagnostic(code)||typeof code==='string'&&(startupCodes.has(code)||postConfirmCodes.has(code));
+const isInitialConfirmCheckpoint=code=>code==='INITIAL_CONFIRM_REQUEST'||code==='INITIAL_CONFIRM_ACK'||isFailedRenewalRuntimeCheckpoint(code,'INITIAL_CONFIRM');
 // Owner operations, independent of the success-phase names on the response wire.
 const postArmOperations=new Map([
  ['failedRenewal','FAILED_RENEWAL'],['graceLastSecond','GRACE_LAST_SECOND'],['graceAt','GRACE_AT'],['graceAfter','GRACE_AFTER'],
@@ -73,6 +74,7 @@ async function createOwner(options,dependencies,purpose){
  const c=mode.validate(options);if(!c)throw billingError('OPT_IN_REQUIRED');
  let state='NEW',phase='NEW',failure=null,diagnostic=null,accepted=false,cleanupConfirmed=false,cleanupFailure=null,bootstrap,cli,fixture,runtime,cleanupPromise,active,finish;
  let journeyStarted=false,journeySettled=false,journeyClean=false,startSettlement,listenerSettlement,provisionLimits,postArmCheckpoint,postArmRequestLimits;
+ let initialConfirm;
  const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
  const revoke=()=>{
   if(runtime&&!terminalClose){
@@ -88,6 +90,12 @@ async function createOwner(options,dependencies,purpose){
    if(detail==='PREPARE_REQUEST')detail=billingFirstPaymentPrepareCheckpoint(runtime)??detail;
    if(failedRenewal&&phase==='PROVISION'&&(code==='PROVISION'||code==='ABORTED')){
     diagnostic=billingFailedRenewalProvisionCheckpoint(fixture,provisionLimits,c.runId,c.expectedSource)??'PROVISION_UNKNOWN';
+   }else if(phase==='BROWSER'&&initialConfirm&&['CONFIRM','ACK','BROWSER','ABORTED'].includes(code)){
+    diagnostic=initialConfirm.checkpoint;
+    if(diagnostic==='INITIAL_CONFIRM_REQUEST'){
+     const requestCheckpoint=billingFailedRenewalRuntimeCheckpoint(runtime,initialConfirm.limits);
+     if(isFailedRenewalRuntimeCheckpoint(requestCheckpoint,'INITIAL_CONFIRM'))diagnostic=requestCheckpoint;
+    }
    }else if(failedRenewal&&postArmCheckpoints.has(phase)){
     diagnostic=postArmCheckpoints.get(phase).has(postArmCheckpoint)?postArmCheckpoint:null;
     if(postArmRequestLimits&&diagnostic===phase+'_REQUEST'){
@@ -225,9 +233,14 @@ async function createOwner(options,dependencies,purpose){
        if(!prepareAck||confirmUsed)fail('SINGLE_USE');confirmUsed=true;
        if(!original||Object.getPrototypeOf(original)!==Object.prototype||Object.keys(original).sort().join(',')!=='attempt_id,capability,confirmation_token,idempotency_key'||Object.values(Object.getOwnPropertyDescriptors(original)).some(d=>!Object.hasOwn(d,'value'))||Object.values(original).some(v=>typeof v!=='string'||!v||v.length>8192)||original.attempt_id!==selected.attemptId||original.capability!==selected.capability||original.idempotency_key===selected.createKey)fail('CONFIRM');
        const request=Object.freeze({...original});if(await cli.assertBillingListener(bound)!==true||await fixture.beforeDispatch('confirm',request.idempotency_key,selected,bound)!==true)fail('DISPATCH');
-       const reply=await runtime.confirm(request,bound);billingCheck(bound);const v=failedRenewal?checkedInitialResponse(reply,'confirm'):reply;checkIdentity(v);
+       if(failedRenewal)initialConfirm={checkpoint:'INITIAL_CONFIRM_REQUEST',limits:bound};
+       const reply=await runtime.confirm(request,bound);billingCheck(bound);
+       if(initialConfirm)initialConfirm.checkpoint='INITIAL_CONFIRM_RESPONSE';
+       const v=failedRenewal?checkedInitialResponse(reply,'confirm'):reply;checkIdentity(v);
        if(v.phase!=='OBSERVE'||v.protocol!=='SERVER_CONFIRM_V2'||v.attempt_id!==selected.attemptId||v.state!=='OBSERVE'||v.next_action_allowed!==false||v.retry_allowed!==false||v.successor_attempt_id!==null)fail('ACK');
-       if(await fixture.acknowledge('confirm',{attemptId:selected.attemptId,state:'OBSERVE',nextActionAllowed:false},bound)!==true)fail('ACK');confirmAck=true;selected=null;return v;
+       if(initialConfirm)initialConfirm.checkpoint='INITIAL_CONFIRM_ACK';
+       if(await fixture.acknowledge('confirm',{attemptId:selected.attemptId,state:'OBSERVE',nextActionAllowed:false},bound)!==true)fail('ACK');
+       confirmAck=true;initialConfirm=undefined;selected=null;return v;
       });
      },
     });
@@ -340,9 +353,12 @@ function isFailedRenewalCheckpoint(stage,checkpoint){
   case 'LISTENER':return isPersistenceDiagnostic(checkpoint);
   case 'START':return checkpoint==='START_UNKNOWN'||startupCodes.has(checkpoint);
   case 'PROVISION':return checkpoint==='PROVISION_UNKNOWN'||isFailedRenewalProvisionCheckpoint(checkpoint);
-  case 'BROWSER':return checkpoint!=='BROWSER_METHOD_MOUNT'&&isBrowserDiagnostic(checkpoint);
+  case 'BROWSER':return isInitialConfirmCheckpoint(checkpoint)||(checkpoint!=='BROWSER_METHOD_MOUNT'&&isBrowserDiagnostic(checkpoint));
   case 'METHOD_BROWSER':return isMethodBrowserDiagnostic(checkpoint)||postArmCheckpoints.get(stage).has(checkpoint);
-  default:return postArmCheckpoints.get(stage)?.has(checkpoint)===true||isFailedRenewalRuntimeCheckpoint(checkpoint,stage);
+  default:{
+   const checkpoints=postArmCheckpoints.get(stage);
+   return checkpoints!==undefined&&(checkpoints.has(checkpoint)||isFailedRenewalRuntimeCheckpoint(checkpoint,stage));
+  }
  }
 }
 /** Failed-mode terminal checkpoints; no raw result/error/resource fields are serialized. */
@@ -353,7 +369,8 @@ export function formatBillingFailedRenewalDiagnostic(result){
   const stage=own('phase');
   const checkpoint=own('diagnostic'),code=own('code');
   const methodOrder=stage==='METHOD_BROWSER'&&checkpoint==='METHOD_ORDER'&&(code==='ORDER'||code==='METHOD_ORDER');
-  if(own('scope')!=='OWNED_FAILED_RENEWAL_GRACE_RECOVERY'||own('status')!=='CLOSED'||(code!==stage&&code!=='ABORTED'&&!methodOrder)||
+  const initialConfirm=stage==='BROWSER'&&isInitialConfirmCheckpoint(checkpoint)&&(code==='CONFIRM'||code==='ACK');
+  if(own('scope')!=='OWNED_FAILED_RENEWAL_GRACE_RECOVERY'||own('status')!=='CLOSED'||(code!==stage&&code!=='ABORTED'&&!methodOrder&&!initialConfirm)||
      own('initialAccepted')!==false||own('failedRenewalAccepted')!==false||own('full5bAccepted')!==false)return null;
   const confirmed=own('cleanupConfirmed'),witness=own('cleanupFailure');
   if(!isFailedRenewalCheckpoint(stage,checkpoint)||typeof confirmed!=='boolean'||(stage==='CLEANUP'&&(confirmed||code!=='CLEANUP'))||(confirmed?witness!==null:!isCleanupDiagnostic(witness)))return null;

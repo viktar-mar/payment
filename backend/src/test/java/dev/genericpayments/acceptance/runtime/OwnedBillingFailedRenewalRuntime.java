@@ -80,7 +80,7 @@ public final class OwnedBillingFailedRenewalRuntime {
         }
         private final OwnedBillingFailedRenewalOperations operations;private final byte[] authorization;
         private final OwnedBillingFirstPaymentRuntime.Handler initial;private boolean active,terminal;
-        public Handler(OwnedBillingFailedRenewalOperations operations,String capability){this.operations=Objects.requireNonNull(operations);authorization=("Bearer "+capability).getBytes(StandardCharsets.US_ASCII);initial=new OwnedBillingFirstPaymentRuntime.Handler(operations,capability);}
+        public Handler(OwnedBillingFailedRenewalOperations operations,String capability){this.operations=Objects.requireNonNull(operations);authorization=("Bearer "+capability).getBytes(StandardCharsets.US_ASCII);initial=new OwnedBillingFirstPaymentRuntime.Handler(operations,capability,true);}
         private synchronized boolean enter(){if(active||terminal)return false;active=true;return true;}
         private synchronized void leave(){active=false;notifyAll();}
         private synchronized boolean claimTerminal(){if(terminal)return false;terminal=true;return true;}

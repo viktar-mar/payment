@@ -22,6 +22,8 @@ public final class OwnedBillingFirstPaymentRuntime {
     private static final Set<String> PREPARE_FAILURE_STAGES=Set.of("REQUEST","PREFLIGHT","CLOCK_ADMISSION","CLOCK_CREATE","CUSTOMER_CREATE",
         "LOCAL_RESERVE","SUBSCRIPTION_CREATE","LOCAL_RECORD","RECEIPT","ACTION_SELECT","ACTION_SCOPE","ACTION_AUTHORITY","ACTION_VERIFICATION","ACTION_GRAPH","ACTION_GRAPH_LINE_ASSOCIATION","ACTION_GRAPH_INVOICE_SETTLEMENT","ACTION_GRAPH_INVOICE_SETTLEMENT_PRORATION_FLAG","ACTION_GRAPH_INVOICE_SETTLEMENT_PRORATION_KIND","ACTION_GRAPH_INVOICE_SETTLEMENT_COLLECTION_METHOD","ACTION_GRAPH_INVOICE_SETTLEMENT_PAID_OFF_STRIPE","ACTION_GRAPH_INVOICE_SETTLEMENT_OVERPAID","ACTION_GRAPH_INVOICE_SETTLEMENT_STARTING_BALANCE","ACTION_GRAPH_INVOICE_SETTLEMENT_ENDING_BALANCE","ACTION_GRAPH_INVOICE_SETTLEMENT_PRE_CREDIT_NOTES","ACTION_GRAPH_INVOICE_SETTLEMENT_POST_CREDIT_NOTES","ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_DISCOUNTS","ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_DISCOUNT_AMOUNTS","ACTION_GRAPH_INVOICE_SETTLEMENT_INVOICE_PRETAX_CREDITS","ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_DISCOUNT_AMOUNTS","ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_PRETAX_CREDITS","ACTION_GRAPH_INVOICE_SETTLEMENT_TOTAL","ACTION_GRAPH_INVOICE_SETTLEMENT_SUBTOTAL","ACTION_GRAPH_INVOICE_SETTLEMENT_LINE_AMOUNT","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_DUE_POSITIVE","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_DUE_CATALOG","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_PAID","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_REMAINING","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_STATUS","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_PAYMENT","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_TYPE","ACTION_GRAPH_INVOICE_SETTLEMENT_OPEN_ALLOCATION_INTENT","ACTION_GRAPH_INVOICE_SETTLEMENT_SNAPSHOT_UNSUPPORTED","ACTION_GRAPH_INVOICE_SETTLEMENT_ACTION_OPEN_CASH","ACTION_GRAPH_INVOICE_SETTLEMENT_ACTION_OPEN","ACTION_GRAPH_PAYMENT_ALLOCATION","ACTION_GRAPH_PAYMENT_ALLOCATION_STATUS_UNAVAILABLE","ACTION_GRAPH_PAYMENT_ALLOCATION_STATUS_NOT_OPEN","ACTION_GRAPH_PAYMENT_ALLOCATION_DEFAULT_UNAVAILABLE","ACTION_GRAPH_PAYMENT_ALLOCATION_DEFAULT_NOT_TRUE","ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_REQUESTED_UNAVAILABLE","ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_REQUESTED_MISMATCH","ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_UNAVAILABLE","ACTION_GRAPH_PAYMENT_ALLOCATION_AMOUNT_PAID_NONZERO","ACTION_GRAPH_PAYMENT_ALLOCATION_PAYMENT_UNAVAILABLE","ACTION_GRAPH_PAYMENT_ALLOCATION_TYPE_UNAVAILABLE","ACTION_GRAPH_PAYMENT_ALLOCATION_TYPE_UNEXPECTED","ACTION_RESERVATION","ACTION_RESULT","ACTION_BINDING","SESSION_SELECT","RESPONSE_BUILD","UNCLASSIFIED");
     static final String PREFIX="PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_";
+    private static final Set<String> CONFIRM_FAILURE_STAGES=Set.of("CONFIRM_REQUEST","CONFIRM_STATE","CONFIRM_AUTHORITY",
+        "CONFIRM_SERVICE","CONFIRM_RESULT","CONFIRM_RESPONSE_BUILD","CONFIRM_UNCLASSIFIED");
     public record Admission(UUID run, String source, long frozen, String capability, int port, String bind) {
         @Override public String toString(){return "Admission[redacted]";}
     }
@@ -45,6 +47,7 @@ public final class OwnedBillingFirstPaymentRuntime {
         JsonObject prepare(JsonObject request);
         default String prepareFailureStage(){return "UNCLASSIFIED";}
         JsonObject confirm(JsonObject request);
+        default String confirmFailureStage(Exception refusal){return "CONFIRM_UNCLASSIFIED";}
         JsonObject observe();
         JsonObject status();
         void abort();
@@ -63,10 +66,15 @@ public final class OwnedBillingFirstPaymentRuntime {
     }
     static IllegalStateException denied(){return new IllegalStateException("INITIAL_PAYMENT_STOPPED");}
     public static final class Handler implements HttpHandler {
-        private final Operations operations;private final byte[] authorization;
-        public Handler(Operations operations,String capability){this.operations=operations;this.authorization=("Bearer "+capability).getBytes(StandardCharsets.US_ASCII);}
+        private final Operations operations;private final byte[] authorization;private final boolean detailedConfirm;
+        public Handler(Operations operations,String capability){this(operations,capability,false);}
+        Handler(Operations operations,String capability,boolean detailedConfirm){
+            this.operations=operations;this.authorization=("Bearer "+capability).getBytes(StandardCharsets.US_ASCII);
+            this.detailedConfirm=detailedConfirm;
+        }
         @Override public void handle(HttpExchange exchange) throws IOException {
             boolean prepare=false,prepareDispatched=false;
+            boolean confirm=false,confirmDispatched=false;
             try {
                 var headers=exchange.getRequestHeaders().get("Authorization");
                 if(headers==null||headers.size()!=1||!MessageDigest.isEqual(authorization,headers.getFirst().getBytes(StandardCharsets.UTF_8))){reply(exchange,403,error("DENIED"));return;}
@@ -75,16 +83,18 @@ public final class OwnedBillingFirstPaymentRuntime {
                 boolean status=path.endsWith("/status");
                 if(!exchange.getRequestMethod().equals(status?"GET":"POST")){operations.abort();reply(exchange,405,error("INVALID_REQUEST"));return;}
                 prepare=path.equals("/initial-payment/prepare");
+                confirm=detailedConfirm&&path.equals("/initial-payment/confirm");
                 JsonObject request=read(exchange,status);
                 JsonObject response=switch(path){
                     case "/initial-payment/prepare" -> {fields(request,Set.of("run_id","source_sha","account_id","site_id","customer_id","price_id","origin","create_key","customer_token"));prepareDispatched=true;yield operations.prepare(request);}
-                    case "/initial-payment/confirm" -> {fields(request,Set.of("attempt_id","capability","confirmation_token","idempotency_key"));yield operations.confirm(request);}
+                    case "/initial-payment/confirm" -> {fields(request,Set.of("attempt_id","capability","confirmation_token","idempotency_key"));confirmDispatched=true;yield operations.confirm(request);}
                     case "/initial-payment/observe" -> {fields(request,Set.of());yield operations.observe();}
                     default -> operations.status();
                 };
                 reply(exchange,200,response);
             }catch(Exception failure){
                 var response=prepare?prepareError(prepareDispatched):error("INITIAL_PAYMENT_STOPPED");
+                if(confirm)response.addProperty("stage",confirmFailureStage(confirmDispatched,failure));
                 operations.abort();reply(exchange,400,response);
             }
             finally{exchange.close();}
@@ -94,6 +104,14 @@ public final class OwnedBillingFirstPaymentRuntime {
             if(dispatched)try{stage=operations.prepareFailureStage();}catch(RuntimeException ignored){stage="UNCLASSIFIED";}
             var result=error("INITIAL_PAYMENT_STOPPED");
             result.addProperty("stage",stage!=null&&PREPARE_FAILURE_STAGES.contains(stage)?stage:"UNCLASSIFIED");return result;
+        }
+        private String confirmFailureStage(boolean dispatched,Exception refusal) {
+            if(!dispatched)return "CONFIRM_REQUEST";
+            try{
+                String stage=operations.confirmFailureStage(refusal);
+                if(stage!=null&&CONFIRM_FAILURE_STAGES.contains(stage))return stage;
+            }catch(RuntimeException ignored){/* Diagnostic lookup cannot replace the original refusal. */}
+            return "CONFIRM_UNCLASSIFIED";
         }
         static JsonObject read(HttpExchange exchange,boolean empty) throws Exception {
             var executor=Executors.newVirtualThreadPerTaskExecutor();

@@ -780,6 +780,70 @@ test('post-arm owner uses the real runtime checkpoint on '+fault,async()=>{
  assert.equal(paths.filter(path=>path==='/failed-renewal/failed').length,1);
  assert.equal(result.failedRenewalAccepted,false);
 });
+for(const [fault,checkpoint] of [
+ ['authority','INITIAL_CONFIRM_AUTHORITY'],
+ ['transport','INITIAL_CONFIRM_TRANSPORT'],
+ ['abort','INITIAL_CONFIRM_TRANSPORT'],
+ ['http','INITIAL_CONFIRM_HTTP'],
+ ['server','INITIAL_CONFIRM_SERVER_SERVICE'],
+ ['duplicate server stage','INITIAL_CONFIRM_HTTP'],
+ ['unknown server stage','INITIAL_CONFIRM_HTTP'],
+ ['invalid response','INITIAL_CONFIRM_RESPONSE'],
+ ['mismatched response','INITIAL_CONFIRM_RESPONSE'],
+ ['ack','INITIAL_CONFIRM_ACK'],
+])test('initial CONFIRM keeps a bounded terminal checkpoint for '+fault,async()=>{
+ const h=harness(),paths=[],ledger=[],abort=new AbortController();
+ const lateReply=fault==='abort'?Promise.withResolvers():null;
+ const initialPaths=['/initial-payment/status','/initial-payment/prepare'];
+ const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared()];
+ const confirmPath='/initial-payment/confirm',abortPath='/failed-renewal/abort';
+ h.fixture.beforeDispatch=async kind=>{ledger.push(kind+':DISPATCHING');return true;};
+ h.fixture.acknowledge=async kind=>{
+  if(kind==='confirm'&&fault==='ack')return false;
+  ledger.push(kind+':ACK');return true;
+ };
+ h.dependencies.createRuntime=()=>clients.createBillingFailedRenewalRuntime({configuration:opts(),bootstrap:{
+  withFailedRenewalRuntime:cb=>fault==='authority'&&replies.length===0?false:cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)})
+ }},{fetch:async url=>{
+  const path=new URL(url).pathname;paths.push(path);
+  if(path===abortPath)return new Response('{"code":"QUIESCENT"}');
+  if(path!==confirmPath)return new Response(JSON.stringify(replies.shift()));
+  switch(fault){
+   case 'abort':abort.abort();return lateReply.promise;
+   case 'transport':throw new Error('raw private transport canary');
+   case 'http':return new Response('raw private HTTP canary',{status:503});
+   case 'server':return new Response('{"code":"INITIAL_PAYMENT_STOPPED","stage":"CONFIRM_SERVICE"}',{status:400});
+   case 'duplicate server stage':return new Response('{"code":"INITIAL_PAYMENT_STOPPED","stage":"CONFIRM_SERVICE","stage":"CONFIRM_STATE"}',{status:400});
+   case 'unknown server stage':return new Response('{"code":"INITIAL_PAYMENT_STOPPED","stage":"CONFIRM_PRIVATE_CANARY"}',{status:400});
+   case 'invalid response':return new Response('raw private response canary');
+   case 'mismatched response':return new Response(JSON.stringify({...confirmed(),attempt_id:id(99)}));
+   default:return new Response(JSON.stringify(confirmed()));
+  }
+ }});
+ if(fault==='ack')h.bootstrap.stop=async()=>false;
+ const o=await owner(h);await assert.rejects(o.run(h.journey,{...limits(),signal:abort.signal}));const result=await o.close();
+ const line=fault==='ack'?browserLine(checkpoint,'UNCONFIRMED','BOOTSTRAP_STOP'):browserLine(checkpoint);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ for(const stage of ['PROVISION','INITIAL_CONFIRM']){
+  assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line.replace('stage=BROWSER','stage='+stage)),null);
+  assert.equal(owners.formatBillingFailedRenewalDiagnostic({...result,phase:stage,code:stage}),null);
+ }
+ assert.equal(JSON.stringify(result).toLowerCase().includes('canary'),false);
+ assert.equal(result.initialAccepted,false);
+ assert.equal(result.failedRenewalAccepted,false);
+ assert.deepEqual(ledger,['create:DISPATCHING','create:ACK','confirm:DISPATCHING']);
+ assert.deepEqual(paths,[...initialPaths,...(fault==='authority'?[]:[confirmPath]),abortPath]);
+ if(lateReply){
+  lateReply.resolve(new Response('{"code":"INITIAL_PAYMENT_STOPPED","stage":"CONFIRM_SERVICE"}',{status:400}));
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(owners.formatBillingFailedRenewalDiagnostic(o.resources()),line);
+ }
+ await assert.rejects(o.run(h.journey,limits()));
+ await o.close();
+ assert.equal(paths.filter(path=>path===confirmPath).length,fault==='authority'?0:1);
+ assert.equal(paths.filter(path=>path===abortPath).length,1);
+});
 test('post-arm owner reports the grace clock refusal without invoking another financial step',async()=>{
  const h=harness(),paths=[];
  const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),initial(),...h.vs.slice(0,3)];
