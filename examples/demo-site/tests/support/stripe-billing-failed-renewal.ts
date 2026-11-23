@@ -105,7 +105,8 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     // A permit ACK can arrive while Playwright still awaits the attended click's
     // page result. A later SDK refusal or timeout belongs to confirmation.
     const confirming=methodActive && manualArmed && step==='ACK' &&
-      (code==='BROWSER_MANUAL_PAY_WAIT'||code==='BROWSER_MANUAL_PAY_ARM');
+      (code==='BROWSER_MANUAL_PAY_WAIT'||code==='BROWSER_MANUAL_PAY_ARM'||
+        code==='BROWSER_METHOD_CLICK'||code==='BROWSER_METHOD_CONFIRM_WAIT');
     if(waitRejected && source==='INITIAL' && state==='INITIAL' && clickApprovedUntil && liveOwner() && step==='CONFIRM' &&
         (code==='BROWSER_WAIT_OBSERVE' || (observedPaySignals!==0 &&
           (code==='BROWSER_PAY_CLICK'||code==='BROWSER_MANUAL_PAY_WAIT')))){
@@ -201,14 +202,15 @@ export function runFailedRenewalBrowser(browser:Pick<Browser,'newContext'>,runAb
     },ready)));
     if(waitForClick){
       const scope=scoped(),deadline=Math.min(scope.deadline,Date.now()+180000);
-      const clickCheckpoint=which==='initial'?'BROWSER_PAY_CLICK':'BROWSER_MANUAL_PAY_WAIT';
+      const operatorCheckpoint=which==='initial'?'BROWSER_MANUAL_PAY_WAIT':'BROWSER_METHOD_OPERATOR_WAIT';
+      const clickCheckpoint=which==='initial'?'BROWSER_PAY_CLICK':'BROWSER_METHOD_CLICK';
       await at(clickCheckpoint,()=>forwardProfileClick(button,which,{deadline,signal:scope.signal},
-        (action,limits)=>at('BROWSER_MANUAL_PAY_WAIT',()=>waitForClick(action,limits)),()=>{
+        (action,limits)=>at(operatorCheckpoint,()=>waitForClick(action,limits)),()=>{
           checkpoint=clickCheckpoint;
           assertPage();need(manualArmed&&step==='CONFIRM'&&!pendingInitialNavigations.size);
           clickApprovedUntil=deadline;
         }));
-      await at(which==='initial'?'BROWSER_WAIT_OBSERVE':'BROWSER_MANUAL_PAY_WAIT',
+      await at(which==='initial'?'BROWSER_WAIT_OBSERVE':'BROWSER_METHOD_CONFIRM_WAIT',
         ()=>waitPhase(which==='initial'?'OBSERVE':'METHOD_CONFIRMED',true,deadline));
     }else await at('BROWSER_MANUAL_PAY_WAIT',()=>waitPhase(which==='initial'?'OBSERVE':'METHOD_CONFIRMED',true));
     need((step as string)==='ACK' && finalDelivery);

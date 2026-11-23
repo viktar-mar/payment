@@ -3,13 +3,14 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import type {TestCase,TestResult,FullResult} from '@playwright/test/reporter';
+import type {ProfileAction} from './profile-button';
 import type {BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {BillingFirstPaymentPort} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 // @ts-ignore Node's source-only offline test runner requires the explicit extension.
 import FailedRenewalReporter from './stripe-billing-failed-renewal-reporter.ts';
 import {browserDiagnostic,browserCleanupConfirmed} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 import * as privateOrigin from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
-import {createOwnedBillingFailedRenewal,formatBillingFailedRenewalDiagnostic} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
+import {createOwnedBillingFailedRenewal,formatBillingFailedRenewalDiagnostic,parseBillingFailedRenewalDiagnosticLine} from '../../../../infrastructure/stripe-billing-first-payment.mjs';
 
 // The two source modules have only type imports from Playwright and the SDK.
 // Memory fixtures exercise the held journey without importing either runtime.
@@ -222,7 +223,7 @@ type ProviderProbe={target:string;headers?:Record<string,string>;headerFailure?:
   child?:'owned'|'nested'|'foreign'|'foreign-parent'|'detached'|'other-page'};
 type StaticFixture={matches:(origin:string)=>boolean;fetch:typeof fetch};
 async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:StaticFixture,profile?:{
-  wait():Promise<void>;click?():Promise<void>;
+  wait(action:ProfileAction):Promise<void>;click?():Promise<void>;methodClick?():Promise<void>;
 }) {
   let releaseIO!:()=>void,markIO!:()=>void;
   const heldIO=new Promise<void>(resolve=>{releaseIO=resolve;}),ioPending=new Promise<void>(resolve=>{markIO=resolve;});
@@ -376,6 +377,7 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
   const labels:Record<string,string>={'Request code':'request','Verify code':'verify','Start payment':'start','Pay':'pay','Confirm test method':'confirm-method','I consent to recurring payments':'consent','Six-digit code':'code'};
   function locator(id:string):any {const c=ctrl(id);return {click:async()=>{
       if(id==='pay' && profile?.click){await profile.click();return;}
+      if(id==='confirm-method' && profile?.methodClick){await profile.methodClick();return;}
       if(id==='start'&&change==='start_click')throw Error('secret_fixture canary');
       if(id==='start'&&asynchronousStart){
         // DOM dispatch does not await an async event handler. Keep its task
@@ -407,7 +409,7 @@ async function fixture(change = '',provider?:ProviderProbe[],staticFixture?:Stat
     }};
   const context={on:()=>{},newPage:async()=>{counts.push('page');return page;},exposeBinding:async(n:string,f:Function)=>{bindings.set(n,f);w[n]=(...args:unknown[])=>{if(n==='__failedRenewalTerminal'){terminals.push(args);if(change==='late_receipt_diagnostic')return;}return f({page,frame},...args);};},
     route:async(_pattern:string,f:Function)=>{routeHandler=f;},routeWebSocket:async()=>{},close:async()=>{closed++;callbacks.get('close')?.();w.__failedRenewalStop?.();}};
-  const journey=runFailedRenewalBrowser({newContext:async()=>{counts.push('context');return context;}},runAbort,staticFixture?.matches,profile?()=>profile.wait():undefined);
+  const journey=runFailedRenewalBrowser({newContext:async()=>{counts.push('context');return context;}},runAbort,staticFixture?.matches,profile?(action:ProfileAction)=>profile.wait(action):undefined);
   const initialPort={resources:()=>({runId:id(1),expectedSource:'a'.repeat(40),accountId:id(2),siteId:id(3),priceId:id(5),siteKey:'fixture',email:'fixture@example.test',endpoints:{demo,backend}}),
     withOtpCode:async(f:Function)=>f(otp),acknowledgeCustomer:async(v:any)=>{
       assert.deepEqual(v,{customerId:id(4),siteId:id(3)});
@@ -1423,6 +1425,50 @@ test('profile forwards both separate approved clicks through the original one-us
     assert.equal(gestures,2);
     for(const op of ['confirm','permit','confirmSetup'])assert.equal(h.counts.filter(v=>v===op).length,1);
     assert.equal(h.phase(),'METHOD_CONFIRMED');
+  }finally{await h.restore();}
+});
+
+for(const [failure,expected] of [
+  ['operator','BROWSER_METHOD_OPERATOR_WAIT'],
+  ['forward','BROWSER_METHOD_CLICK'],
+  ['confirmation','BROWSER_METHOD_CONFIRM_WAIT'],
+  ['permit-before-click-error','BROWSER_METHOD_CONFIRM'],
+] as const)test('profile replacement reports '+failure+' separately without replaying Pay',async()=>{
+  const waited:string[]=[];
+  let forwarded=0;
+  const h=await fixture(failure==='confirmation'?'manual_timeout':'',undefined,undefined,{
+    wait:async action=>{
+      waited.push(action);
+      if(action==='method'&&failure==='operator')throw Error('private wait canary');
+    },
+    methodClick:async()=>{
+      forwarded++;
+      if(failure==='forward')throw Error('private forwarding canary');
+      if(failure==='permit-before-click-error'){
+        await h.activateCheckout('method');
+        throw Error('private post-permit click canary');
+      }
+    },
+  });
+  try{
+    await h.journey.initial(h.initialPort,nowLimits());
+    let first:unknown;
+    await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>{first=error;return true;});
+    assert.equal(browserDiagnostic(first,'METHOD'),expected);
+    assert.equal(browserDiagnostic(first,'INITIAL'),null);
+    const line='owned_failed_renewal_diagnostic stage=METHOD_BROWSER checkpoint='+expected+' cleanup=CONFIRMED witness=NONE';
+    assert.equal(parseBillingFailedRenewalDiagnosticLine(line),line);
+    assert.equal(parseBillingFailedRenewalDiagnosticLine(line.replace('stage=METHOD_BROWSER','stage=BROWSER')),null);
+    assert.doesNotMatch(String(first),/private|secret|canary/);
+    await assert.rejects(h.journey.method(h.methodPort,nowLimits()),error=>error===first);
+    assert.deepEqual(waited,['initial','method']);
+    assert.equal(forwarded,failure==='operator'?0:1);
+    assert.equal(h.counts.filter(v=>v==='confirm').length,1);
+    const permits=failure==='permit-before-click-error'?1:0;
+    assert.equal(h.counts.filter(v=>v==='permit').length,permits);
+    assert.equal(h.counts.filter(v=>v==='confirmSetup').length,permits);
+    assert.equal(await h.journey.close(nowLimits()),true);
+    assert.equal(browserCleanupConfirmed(first),true);
   }finally{await h.restore();}
 });
 

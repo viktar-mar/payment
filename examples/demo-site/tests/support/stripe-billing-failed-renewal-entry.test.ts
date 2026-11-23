@@ -1,35 +1,110 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {access,mkdtemp,readFile,rm,symlink,unlink,writeFile} from 'node:fs/promises';
+import {access,lstat,mkdtemp,readFile,readlink,rm,symlink,unlink,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {openProfileOperator} from '../../scripts/profile-operator.mjs';
 
-test('native handoff first opens on armed Pay and the same claimed tab handles the method',async()=>{
-  const directory=await mkdtemp(join(tmpdir(),'native-handoff-')),handoffPath=join(directory,'operator.html');
-  const operator=await openProfileOperator({rehearsal:false,handoffPath});
-  const limits={deadline:Date.now()+10000,signal:new AbortController().signal};
+function operatorRequests(operator:{url:string}){
   const url=new URL(operator.url);
   const send=(path:string,key:string)=>fetch(url.origin+path,{method:'POST',headers:{Origin:url.origin,'X-Operator-Session':key}});
+  return {send,claim:()=>send('/claim',url.hash.slice(1))};
+}
+
+test('native handoff first opens on armed Pay and the same claimed tab handles the method',async()=>{
+  const directory=await mkdtemp(join(tmpdir(),'native-handoff-')),handoffPath=join(directory,'operator.html');
+  const methodReadyPath=handoffPath+'.method-ready';
+  const operator=await openProfileOperator({rehearsal:false,handoffPath});
+  const limits={deadline:Date.now()+10000,signal:new AbortController().signal};
+  const {send,claim}=operatorRequests(operator);
   try{
     await assert.rejects(access(handoffPath),{code:'ENOENT'});
+    await assert.rejects(operator.wait('method',limits));
+    await assert.rejects(access(methodReadyPath),{code:'ENOENT'});
     const first=operator.wait('initial',limits);
     void first.catch(()=>{});
     const html=await readFile(handoffPath,'utf8');
     assert.ok(html.includes(operator.url));
-    const claim=await send('/claim',url.hash.slice(1));
-    assert.equal(claim.status,200);
-    const token=await claim.text();
+    const response=await claim();
+    assert.equal(response.status,200);
+    const token=await response.text();
     assert.equal(await (await send('/state',token)).text(),'initial');
+    assert.equal((await send('/method',token)).status,409);
+    await assert.rejects(access(methodReadyPath),{code:'ENOENT'});
     assert.equal((await send('/initial',token)).status,204);
     await first;
     await unlink(handoffPath);
+    await assert.rejects(operator.wait('method',{...limits,deadline:Date.now()-1}));
+    await assert.rejects(operator.wait('method',{...limits,signal:AbortSignal.abort()}));
+    await assert.rejects(access(methodReadyPath),{code:'ENOENT'});
+
     const second=operator.wait('method',limits);
     void second.catch(()=>{});
     assert.equal(await (await send('/state',token)).text(),'method');
+    assert.equal(await readFile(methodReadyPath,'utf8'),'METHOD_READY\n');
+    const receipt=await lstat(methodReadyPath);
+    assert.ok(receipt.isFile());
+    assert.equal(receipt.mode&0o777,0o600);
     await assert.rejects(access(handoffPath),{code:'ENOENT'});
+    assert.equal((await claim()).status,403);
+    assert.equal((await send('/method','unrelated-session')).status,403);
     assert.equal((await send('/method',token)).status,204);
     await second;
+    await operator.close();
+    assert.equal(await readFile(methodReadyPath,'utf8'),'METHOD_READY\n');
+  }finally{await operator.close();await rm(directory,{recursive:true,force:true});}
+});
+
+for(const conflict of ['file','symlink'])test('a method readiness '+conflict+' is preserved and blocks the method wait',async()=>{
+  const directory=await mkdtemp(join(tmpdir(),'native-handoff-')),handoffPath=join(directory,'operator.html');
+  const methodReadyPath=handoffPath+'.method-ready',target=join(directory,'absent');
+  const createConflict=()=>conflict==='file'?writeFile(methodReadyPath,'existing',{flag:'wx'}):symlink(target,methodReadyPath);
+  const open=()=>openProfileOperator({rehearsal:false,handoffPath});
+  let operator:Awaited<ReturnType<typeof open>>|undefined;
+  try{
+    await createConflict();
+    await assert.rejects(async()=>{operator=await open();});
+    await unlink(methodReadyPath);
+
+    operator=await open();
+    const {send,claim}=operatorRequests(operator);
+    const limits={deadline:Date.now()+10000,signal:new AbortController().signal};
+    const first=operator.wait('initial',limits);
+    void first.catch(()=>{});
+    const token=await (await claim()).text();
+    assert.equal((await send('/initial',token)).status,204);
+    await first;
+
+    await createConflict();
+    await assert.rejects(operator.wait('method',limits));
+    assert.equal(await (await send('/state',token)).text(),'closed');
+    assert.equal((await send('/method',token)).status,409);
+    if(conflict==='file')assert.equal(await readFile(methodReadyPath,'utf8'),'existing');
+    else{
+      assert.equal(await readlink(methodReadyPath),target);
+      await assert.rejects(access(target),{code:'ENOENT'});
+    }
+    await unlink(methodReadyPath);
+    await assert.rejects(operator.wait('method',limits));
+  }finally{await operator?.close();await rm(directory,{recursive:true,force:true});}
+});
+
+test('the issuer challenge does not publish a method readiness receipt',async()=>{
+  const directory=await mkdtemp(join(tmpdir(),'native-handoff-')),handoffPath=join(directory,'operator.html');
+  const methodReadyPath=handoffPath+'.method-ready';
+  const operator=await openProfileOperator({rehearsal:false,handoffPath,mode:'challenge'});
+  const limits={deadline:Date.now()+10000,signal:new AbortController().signal};
+  const {send,claim}=operatorRequests(operator);
+  try{
+    const challenge=operator.wait('challenge',limits);
+    void challenge.catch(()=>{});
+    assert.ok((await readFile(handoffPath,'utf8')).includes(operator.url));
+    const token=await (await claim()).text();
+    await assert.rejects(operator.wait('method',limits));
+    assert.equal((await send('/method',token)).status,409);
+    assert.equal((await send('/challenge',token)).status,204);
+    await challenge;
+    await assert.rejects(access(methodReadyPath),{code:'ENOENT'});
   }finally{await operator.close();await rm(directory,{recursive:true,force:true});}
 });
 

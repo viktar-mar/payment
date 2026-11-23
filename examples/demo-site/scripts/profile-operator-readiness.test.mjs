@@ -245,3 +245,33 @@ test('a late initial state cannot re-enable Pay after its one click',async()=>{
   assert.equal(tab.method.disabled,true);
   assert.deepEqual(tab.requests.filter(path=>path!=='/state'),['/claim','/initial','/method']);
 });
+
+test('the same tab exposes only the replacement action when focused after Pay',async()=>{
+  let phase='initial';
+  const tab=await openTab(path=>{
+    if(path==='/claim')return reply('session');
+    if(path==='/state')return reply(phase);
+    if(path==='/initial')phase='waiting';
+    if(path==='/method')phase='done';
+    return reply('');
+  });
+  assert.equal(tab.pay.disabled,false);
+  gesture(tab.pay);await settle();
+  assert.equal(tab.status.textContent,'Waiting for the test form');
+  tab.document.visibilityState='hidden';
+  tab.document.dispatchEvent(new Event('visibilitychange'));
+  phase='method';
+  // A background tab can be suspended before its next poll. Returning to
+  // it must discover the pending method without a reload or another claim.
+  assert.equal(tab.method.disabled,true);
+  tab.document.visibilityState='visible';
+  tab.document.dispatchEvent(new Event('visibilitychange'));
+  await settle();
+  assert.equal(tab.pay.disabled,true);
+  assert.equal(tab.method.disabled,false);
+  gesture(tab.method);
+  gesture(tab.method);
+  await settle();
+  assert.equal(tab.method.disabled,true);
+  assert.deepEqual(tab.requests.filter(path=>path!=='/state'),['/claim','/initial','/method']);
+});

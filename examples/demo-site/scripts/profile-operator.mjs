@@ -88,11 +88,16 @@ const denied=()=>new Error('Profile checkout closed');
 
 export async function openProfileOperator({rehearsal,onAbandon,handoffPath,mode='recovery'}) {
   const challenge=mode==='challenge';
+  let methodReadyPath;
   if(!['recovery','challenge'].includes(mode)||typeof rehearsal!=='boolean')throw denied();
   if(handoffPath!==undefined){
     if(rehearsal || typeof handoffPath!=='string' || !handoffPath)throw denied();
     await mkdir(dirname(handoffPath),{recursive:true,mode:0o700});
     if(lstatSync(handoffPath,{throwIfNoEntry:false}))throw denied();
+    if(!challenge){
+      methodReadyPath=handoffPath+'.method-ready';
+      if(lstatSync(methodReadyPath,{throwIfNoEntry:false}))throw denied();
+    }
   }
   const title=challenge?'Stripe test issuer challenge':rehearsal?'Checkout rehearsal':'Stripe Sandbox recovery';
   const description=rehearsal?'Local simulation. No charge.':'Test subscription: initial payment €20, then recovery of the original €20 debt.';
@@ -153,9 +158,11 @@ export async function openProfileOperator({rehearsal,onAbandon,handoffPath,mode=
         }
         pending={deadline,signal,finish};
         signal.addEventListener('abort',fail,{once:true});
-        if(action===(challenge?'challenge':'initial') && handoffPath){
-          try{publishArmedHandoff(handoffPath,url,deadline,signal);}
-          catch{claim='';fail();}
+        if(handoffPath){
+          try{
+            if(action==='method')publishArmedFile(methodReadyPath,'METHOD_READY\n',deadline,signal);
+            else publishArmedFile(handoffPath,handoffHtml(url),deadline,signal);
+          }catch{claim='';fail();}
         }
       });
     },
@@ -177,13 +184,12 @@ function handoffHtml(url){
   return '<!doctype html><meta name="referrer" content="no-referrer"><meta http-equiv="refresh" content="0; url='+destination.href+'">';
 }
 
-function publishArmedHandoff(path,url,deadline,signal){
-  // The launcher can open the path as soon as it exists. Link the complete
-  // file exclusively while the same wait still owns the action.
+function publishArmedFile(path,contents,deadline,signal){
+  // Link the complete file exclusively while the same wait still owns the action.
   const temporary=path+'.'+randomBytes(16).toString('hex');
   const fd=openSync(temporary,'wx',0o600);
   try{
-    try{writeFileSync(fd,handoffHtml(url));}finally{closeSync(fd);}
+    try{writeFileSync(fd,contents);}finally{closeSync(fd);}
     if(signal.aborted || Date.now()>=deadline)throw denied();
     linkSync(temporary,path);
   }finally{unlinkSync(temporary);}
