@@ -1979,6 +1979,100 @@ function failedRenewalPersistenceFixture(){
  const f=firstPaymentFixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FAILED_RENEWAL:'true'};f.options.selectedCase='initial_failed_renewal_grace_recovery';
  const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);return {...r,stdout:r.stdout.replaceAll('FIRST_PAYMENT','FAILED_RENEWAL').replaceAll('OwnedBillingFirstPaymentRuntime','OwnedBillingFailedRenewalRuntime').replaceAll('/app/initial-runtime','/app/failed-renewal-runtime').replaceAll('Dockerfile.billing-first-payment','Dockerfile.billing-failed-renewal')};};return f;
 }
+for(const [fault,checkpoint] of [
+ ['intent','INTENT_REJECTED'],
+ ['command','COMMAND_REJECTED'],
+ ['command abort','COMMAND_ABORT'],
+ ['command timeout','COMMAND_TIMEOUT'],
+ ['output','OUTPUT_REJECTED'],
+ ['proof','PROOF_REJECTED'],
+ ['ack','ACK_REJECTED'],
+])test('failed-renewal issuer helper create retains '+checkpoint+' without continuation',async()=>{
+ const f=failedRenewalPersistenceFixture(),execute=f.dependencies.execute,open=f.dependencies.open;
+ const installer=PROJECT+'-issuer-installer',abort=new AbortController();
+ const lateCreate=fault==='command abort'?Promise.withResolvers():null;
+ let createdId,reads=0,privateReads=0;
+ const privateError=new Proxy({},{get(){privateReads++;throw Error('private fault');}});
+ f.dependencies.execute=async(...args)=>{
+  const result=await execute(...args),a=args[1];
+  if(a[4]==='container'&&a[5]==='create'&&a.includes(installer)){
+   createdId=result.stdout.trim();
+   if(fault==='command')throw privateError;
+   if(lateCreate){abort.abort();await lateCreate.promise;}
+   if(fault==='output')return {...result,stdout:'PRIVATE_OUTPUT'};
+  }
+  if(fault==='proof'&&createdId&&a[4]==='container'&&a[5]==='inspect'&&a.at(-1)===createdId){
+   const row=JSON.parse(result.stdout);
+   row.ReadonlyRootfs=false;
+   return {...result,stdout:JSON.stringify(row)};
+  }
+  return result;
+ };
+ if(fault==='command timeout'){
+  const fake=f.dependencies.execute;
+  delete f.dependencies.execute;
+  f.dependencies.execFile=(file,args,settings,done)=>{
+   const child=new EventEmitter();
+   queueMicrotask(async()=>{
+    try{
+     const result=await fake(file,args,settings);
+     if(args[4]==='container'&&args[5]==='create'&&args.includes(installer)){
+      done({killed:true,signal:'SIGTERM'},'','PRIVATE_COMMAND_OUTPUT');
+      child.emit('close',null,'SIGTERM');return;
+     }
+     done(null,result.stdout,result.stderr);
+     child.emit('close',0,null);
+    }catch(error){done(error,'','');child.emit('close',1,null);}
+   });
+   return child;
+  };
+ }
+ f.dependencies.open=async(...args)=>{
+  const file=await open(...args);
+  if(!args[0].startsWith(DIR+'/runtime.json.tmp-'))return file;
+  return {...file,writeFile:async bytes=>{
+   const last=JSON.parse(String(bytes)).intents.at(-1);
+   if(last?.name===installer&&last.action==='CREATE_HELPER'&&(
+    fault==='intent'&&last.status==='DISPATCHING'||fault==='ack'&&last.status==='ACKNOWLEDGED'
+   ))throw privateError;
+   return file.writeFile(bytes);
+  }};
+ };
+ const bootstrap=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);
+ const {createOwnedBillingFailedRenewal,formatBillingFailedRenewalDiagnostic,parseBillingFailedRenewalDiagnosticLine}=await import('./stripe-billing-first-payment.mjs');
+ const unreachable=async()=>{reads++;throw Error('ran after a refused helper');};
+ const owner=await createOwnedBillingFailedRenewal(f.options,{preflight:async()=>true,createBootstrap:async()=>bootstrap,createCli:unreachable,login:unreachable});
+ const journey={initial:unreachable,method:unreachable,close:async()=>true},limits={...LIMIT(),signal:abort.signal};
+ await assert.rejects(owner.run(journey,limits));
+ const result=await owner.close(),code='PREPARE_ISSUER_INSTALLER_CREATE_'+checkpoint;
+ const line='owned_failed_renewal_diagnostic stage=PREPARE checkpoint='+code+' cleanup=UNCONFIRMED witness=BOOTSTRAP_STOP';
+ assert.equal(formatBillingFailedRenewalDiagnostic(result),line);
+ if(lateCreate){
+  const before=f.events.length;
+  lateCreate.resolve();
+  await turn();
+  assert.equal(f.events.length,before);
+  assert.equal(formatBillingFailedRenewalDiagnostic(owner.resources()),line);
+ }
+ assert.equal(parseBillingFailedRenewalDiagnosticLine(line),line);
+ assert.equal(parseBillingFailedRenewalDiagnosticLine(line.replace('stage=PREPARE','stage=START')),null);
+ assert.equal(parseBillingFailedRenewalDiagnosticLine(line.replace(checkpoint,'PRIVATE_OUTPUT')),null);
+ assert.equal(result.initialAccepted,false);
+ assert.equal(result.failedRenewalAccepted,false);
+ assert.equal(reads,0);
+ assert.equal(privateReads,0);
+ assert.equal(f.containers.size,fault==='intent'?0:1);
+ const record=persistenceIntents(f).at(-1);
+ if(fault==='intent')assert.equal(record.action,'CREATE_VOLUME');
+ else assert.deepEqual(record,{action:'CREATE_HELPER',name:installer,status:'DISPATCHING'});
+ assert.equal(f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='create').length,fault==='intent'?0:1);
+ assert.equal(f.events.some(e=>e.type==='process'&&e.args[4]==='container'&&['start','stop','rm'].includes(e.args[5])),false);
+ const count=f.events.length;
+ await rejects(bootstrap.prepare(limits),'PREPARE_PENDING');
+ await assert.rejects(owner.run(journey,limits),/SINGLE_USE/);
+ assert.equal(f.events.length,count);
+ assert.deepEqual(await owner.close(),result);
+});
 for (const valid of [true,false]) test('failed-renewal bootstrap rechecks '+(valid?'valid':'malformed')+' source keys before the socket', async () => {
   const f = failedRenewalPersistenceFixture();
   delete f.dependencies.preflight;

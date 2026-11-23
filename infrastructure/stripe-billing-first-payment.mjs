@@ -6,6 +6,7 @@ import {validateBillingFirstPaymentOptions} from './stripe-billing-first-payment
 import {billingBounded,billingCheck,billingError} from './stripe-billing-limits.mjs';
 import {createBillingFirstPaymentRuntime,createBillingFirstRenewalRuntime,createBillingFailedRenewalRuntime,billingFirstPaymentDiagnostic,billingFirstPaymentPrepareCheckpoint,isBillingFirstPaymentDiagnostic,billingFailedRenewalRuntimeCheckpoint,isFailedRenewalRuntimeCheckpoint} from './stripe-billing-first-payment-runtime.mjs';
 import {billingUuid,billingFailedRenewalProvisionCheckpoint,isFailedRenewalProvisionCheckpoint} from './stripe-billing-provision.mjs';
+import {billingFailedRenewalHelperCreateDiagnostic,isBillingFailedRenewalHelperCreateDiagnostic} from './stripe-sandbox-bootstrap.mjs';
 import {isBrowserDiagnostic,isMethodBrowserDiagnostic,browserDiagnostic,browserCleanupConfirmed,browserProviderOrigin,isBrowserProviderOriginWitness} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 // Terminal reporting only; the private PREPARE validator keeps its original set.
 const startupCodes=new Set([
@@ -90,6 +91,8 @@ async function createOwner(options,dependencies,purpose){
    if(detail==='PREPARE_REQUEST')detail=billingFirstPaymentPrepareCheckpoint(runtime)??detail;
    if(failedRenewal&&phase==='PROVISION'&&(code==='PROVISION'||code==='ABORTED')){
     diagnostic=billingFailedRenewalProvisionCheckpoint(fixture,provisionLimits,c.runId,c.expectedSource)??'PROVISION_UNKNOWN';
+   }else if(failedRenewal&&phase==='PREPARE'&&(code==='PREPARE'||code==='ABORTED')){
+    diagnostic=billingFailedRenewalHelperCreateDiagnostic(bootstrap);
    }else if(phase==='BROWSER'&&initialConfirm&&['CONFIRM','ACK','BROWSER','ABORTED'].includes(code)){
     diagnostic=initialConfirm.checkpoint;
     if(diagnostic==='INITIAL_CONFIRM_REQUEST'){
@@ -350,6 +353,7 @@ const cleanupCodes=new Set(['BROWSER_UNSETTLED','BROWSER_CLOSE','RUNTIME_CLOSE',
 const isCleanupDiagnostic=code=>typeof code==='string'&&cleanupCodes.has(code);
 function isFailedRenewalCheckpoint(stage,checkpoint){
  switch(stage){
+  case 'PREPARE':return isBillingFailedRenewalHelperCreateDiagnostic(checkpoint);
   case 'LISTENER':return isPersistenceDiagnostic(checkpoint);
   case 'START':return checkpoint==='START_UNKNOWN'||startupCodes.has(checkpoint);
   case 'PROVISION':return checkpoint==='PROVISION_UNKNOWN'||isFailedRenewalProvisionCheckpoint(checkpoint);

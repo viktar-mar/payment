@@ -44,6 +44,16 @@ const same=(a,b)=>JSON.stringify(canonical(a))===JSON.stringify(canonical(b));
 // Only internally created failures carry diagnostic metadata. Never traverse a dependency rejection.
 const failures=new WeakMap();
 const failedRenewalVerificationCheckpoints=new WeakMap();
+const helperCreateDiagnostics=new WeakMap();
+const helperCreateCategories=['REJECTED','ABORT','TIMEOUT'];
+const helperCreateCommandCategories=['NONZERO_EXIT','OUTPUT_LIMIT','SPAWN_FAILURE'];
+const helperCreateCodes=new Set(['ISSUER_INSTALLER','ISSUER_PROBE'].flatMap(service=>
+  ['INTENT','COMMAND','OUTPUT','PROOF','ACK'].flatMap(stage=>
+    [...helperCreateCategories,...(stage==='COMMAND'||stage==='PROOF'?helperCreateCommandCategories:[])]
+      .map(category=>'PREPARE_'+service+'_CREATE_'+stage+'_'+category))));
+
+export const isBillingFailedRenewalHelperCreateDiagnostic=code=>helperCreateCodes.has(code);
+export const billingFailedRenewalHelperCreateDiagnostic=bootstrap=>helperCreateDiagnostics.get(bootstrap)??null;
 
 /** Last local VERIFY boundary for the exact invocation, including while a cancelled child settles. */
 export function billingFailedRenewalVerificationCheckpoint(bootstrap,limits) {
@@ -198,6 +208,14 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   const proveRuntime=failedRenewal?proveFailedRenewalRuntime:firstRenewal?proveFirstRenewalRuntime:proveFirstPaymentRuntime;
   const runtimeEnv=key=>Object.fromEntries(Object.entries({'': 'true',_RUN_ID:runId,_SOURCE_SHA:expectedSource,_FROZEN_TIME:String(options.frozenTime),_CONTROL_PORT:String(options.controlPort),_CONTROL_BIND:'0.0.0.0',_CONTROL_KEY:key}).map(([suffix,value])=>[runtimePrefix+suffix,value]));
   let terminalBuild=false,buildDiagnostic=null,buildxIdentity=null;
+  let helperCreate=null;
+  function retainHelperCreate(error) {
+    if(!helperCreate||helperCreateDiagnostics.has(capabilities))return;
+    const {service,stage}=helperCreate;
+    const prefix='PREPARE_'+service+'_CREATE_'+stage+'_';
+    const code=prefix+failures.get(error)?.category;
+    helperCreateDiagnostics.set(capabilities,helperCreateCodes.has(code)?code:prefix+'REJECTED');
+  }
   // First-payment START only: local checkpoints and trusted internal failure categories.
   let startupCode=null,startupStage='ADMISSION',startupService='BOOTSTRAP';
   let startAckUncertain=false;
@@ -244,14 +262,23 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
         if(manualDeadline===null){if(limits.deadline>io.now()+45*60000)fail();manualDeadline=limits.deadline;}
         if(cleanup?limits.deadline>manualDeadline+120000:phase==='VERIFY'||adminChild?limits.deadline>manualDeadline:limits.deadline!==manualDeadline)fail();
       }
-      external=limits.signal;onAbort=()=>{if(captureStartup)retainStartup(diagnosticFailure(external?.aborted?'ABORT':'TIMEOUT'),controller,external);controller.abort();};external?.addEventListener('abort',onAbort,{once:true});if(external?.aborted)controller.abort();
+      external=limits.signal;onAbort=()=>{
+        if(captureStartup)retainStartup(diagnosticFailure(external?.aborted?'ABORT':'TIMEOUT'),controller,external);
+        if(phase==='PREPARE'&&helperCreate)retainHelperCreate(diagnosticFailure(external?.aborted?'ABORT':'TIMEOUT'));
+        controller.abort();
+      };external?.addEventListener('abort',onAbort,{once:true});if(external?.aborted)controller.abort();
       // A clipped manual child supplements the captured startup authority.
       original=adminChild?startup?.signal:undefined;original?.addEventListener('abort',onAbort,{once:true});if(original?.aborted)controller.abort();
       timer=io.setTimeout(onAbort,Math.min(limits.deadline-io.now(),2147483647));
       const context={deadline:limits.deadline,signal:controller.signal,externalSignal:external};check(context);
       const result=await body(context);
       if(!diagnostic||context.buildCompleted!==true)check(context);return result;
-    } catch(error) {if(captureStartup)retainStartup(error,controller,external);if(capturePersistence)persistenceCode=persistenceStage;pending=true;throw fixed(phase+'_PENDING');}
+    } catch(error) {
+      if(captureStartup)retainStartup(error,controller,external);
+      if(phase==='PREPARE')retainHelperCreate(error);
+      if(capturePersistence)persistenceCode=persistenceStage;
+      pending=true;throw fixed(phase+'_PENDING');
+    }
     finally {io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);original?.removeEventListener('abort',onAbort);busy=false;}
   }
   async function execute(file,args,settings,context) {
@@ -492,13 +519,17 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     }finally{await handle.close();}
   }
   async function helper(service,command,context) {
-    const installer=service==='issuer-installer',name=project+'-'+service;await intent('CREATE_HELPER',name,context);
+    const installer=service==='issuer-installer',name=project+'-'+service;
+    const createStep=stage=>{if(failedRenewal)helperCreate={service:installer?'ISSUER_INSTALLER':'ISSUER_PROBE',stage};};
+    createStep('INTENT');await intent('CREATE_HELPER',name,context);
     const args=['container','create','--name',name,'--pull','never','--network','none','--read-only','--user',installer?'0:0':'10001:10001','--cap-drop','ALL',
       ...(installer?['--cap-add','CHOWN','--cap-add','DAC_OVERRIDE']:[]),...Object.entries(containerLabels(service)).flatMap(([key,value])=>['--label',key+'='+value]),
       ...(installer?['--mount','type=bind,src='+directory+'/issuer.jwks.json,dst=/input/issuer.json,readonly']:[]),
       '--mount','type=volume,src='+volumeNames.issuer+',dst=/issuer'+(installer?'':',readonly'),'--entrypoint','/bin/sh',recorded.images.backend.id,'-ec',command];
-    const output=await docker(args,context),id=output.stdout.trim();if(!fullId(id))fail();
-    const proof=await containerProof(service,id,context,{neverStarted:true});recorded.containers[service]=proof.safe;await acknowledgement(context);
+    createStep('COMMAND');const output=await docker(args,context);
+    createStep('OUTPUT');const id=output.stdout.trim();if(!fullId(id))fail();
+    createStep('PROOF');const proof=await containerProof(service,id,context,{neverStarted:true});recorded.containers[service]=proof.safe;
+    createStep('ACK');await acknowledgement(context);helperCreate=null;
     await infrastructureProof(context);await containerProof(service,id,context,{neverStarted:true});await intent('START_HELPER',id,context);
     await docker(['container','start',id],context);const wait=await docker(['container','wait',id],context);
     if(!/^0\n?$/.test(wait.stdout))fail();const done=await containerProof(service,id,context);
