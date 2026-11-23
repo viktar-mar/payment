@@ -439,6 +439,21 @@ test('PROVISION clears the policy intent checkpoint before sending the update',a
  assert.equal(requests.filter(req=>req.path===policyPath&&req.method==='POST').length,1);
 });
 
+test('PROVISION preserves the publication verification stop before any publish request',async()=>{
+ const h=harness(),{fixture,requests,writes}=await provisionHarness({
+  onVerify:({writes})=>!writes.at(-1)?.name.endsWith('-publish-dispatch.json'),
+ });
+ h.dependencies.createFixture=async()=>fixture;
+ h.journey.initial=async()=>{assert.fail('browser must stay closed');};
+ const o=await owner(h);
+ await assert.rejects(o.run(h.journey,limits()),{message:'billing_PROVISION'});
+ const line=provisionLine('PROVISION_PUBLISH_VERIFY');
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(await o.close()),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ assert.equal(writes.at(-1).name,'billing-012-publish-dispatch.json');
+ assert.ok(!requests.some(request=>request.path.endsWith('/publish')));
+});
+
 for(const outcome of ['rejected','abort','deadline'])test('PROVISION records the active mock receiver request on '+outcome,async t=>{
  if(outcome==='deadline')t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
  const h=harness(),controller=new AbortController(),entered=Promise.withResolvers(),release=Promise.withResolvers();

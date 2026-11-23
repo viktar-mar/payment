@@ -2024,6 +2024,129 @@ const otherRefusedWitness=()=>({...refusedWitness(),origin:'https://evidence-onl
 async function failedRenewalOriginLive(configure=()=>{}){
  const f=await failedRenewalPersistencePrepared(configure);await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(f.limits);return f;
 }
+
+const {billingFailedRenewalVerificationCheckpoint: verificationCheckpoint}=bootstrapModule;
+test('publish reports its own genuine source verification refusal without dispatching HTTP',async()=>{
+ const {createBillingFailedRenewalFixture,billingFailedRenewalProvisionCheckpoint}=await import('./stripe-billing-provision.mjs');
+ const {provisionHarness}=await import('./fixtures/failed-renewal-provision-harness.mjs');
+ let refuse=false;
+ const f=await failedRenewalOriginLive(f=>{
+  const execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,settings)=>{
+   const result=await execute(file,args,settings);
+   return refuse&&file==='/usr/bin/git'&&args.includes('status')?{...result,stdout:'private source evidence'}:result;
+  };
+ });
+ const {fixture,requests,writes}=await provisionHarness({
+  configuration:f.options,
+  factory:(options,dependencies)=>createBillingFailedRenewalFixture({...options,bootstrap:f.adapter},dependencies),
+  onWrite(name){if(name.endsWith('-publish-dispatch.json'))refuse=true;},
+ });
+ const limits={deadline:Math.min(f.limits.deadline,Date.now()+10000)};
+ await assert.rejects(fixture.provision(limits),/VERIFY_PENDING/);
+ const code=billingFailedRenewalProvisionCheckpoint(fixture,limits,f.options.runId,f.options.expectedSource);
+ assert.equal(code,'PROVISION_PUBLISH_VERIFY_SOURCE');
+ assert.equal(writes.at(-1).name,'billing-012-publish-dispatch.json');
+ assert.ok(!requests.some(request=>request.path.endsWith('/publish')));
+ assert.equal(f.adapter.resources().status,'PENDING');
+ refuse=false;
+ assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);
+});
+
+for(const stage of ['ADMISSION','SOURCE','TOPOLOGY','HEALTH'])test('failed-renewal VERIFY retains only the '+stage+' checkpoint',async()=>{
+ let refuse=false;
+ const f=await failedRenewalOriginLive(f=>{
+  const execute=f.dependencies.execute,health=f.dependencies.health;
+  f.dependencies.execute=async(file,args,settings)=>{
+   const result=await execute(file,args,settings);
+   if(refuse&&((stage==='SOURCE'&&file==='/usr/bin/git'&&args.includes('status'))||(stage==='TOPOLOGY'&&args[4]==='ps')))return {...result,stdout:'private process evidence'};
+   return result;
+  };
+  f.dependencies.health=async(...args)=>{
+   if(refuse&&stage==='HEALTH')throw new Error('private readiness evidence');
+   return health(...args);
+  };
+ });
+ refuse=true;
+ const b=f.adapter,limits={deadline:stage==='ADMISSION'?0:f.limits.deadline};
+ await rejects(b.verify(limits),'VERIFY_PENDING');
+ assert.equal(verificationCheckpoint(b,limits),stage);
+ assert.equal(verificationCheckpoint(b,{...limits}),null);
+ assert.equal(verificationCheckpoint({verify:b.verify},limits),null);
+ const other=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);
+ assert.equal(verificationCheckpoint(other,limits),null);
+ assert.equal(b.resources().status,'PENDING');
+ refuse=false;
+ await b.stop({deadline:f.limits.deadline+120000});
+ assert.equal(verificationCheckpoint(b,limits),stage);
+ const next={...limits},before=f.events.length;
+ await rejects(b.verify(next),'VERIFY_PENDING');
+ assert.equal(f.events.length,before);
+ assert.equal(verificationCheckpoint(b,limits),null);
+ assert.equal(verificationCheckpoint(b,next),'ADMISSION');
+});
+
+test('failed-renewal VERIFY clears successful evidence and does not use credential checks',async()=>{
+ let refuse=false;
+ const f=await failedRenewalOriginLive(f=>{
+  const health=f.dependencies.health;
+  f.dependencies.health=(...args)=>refuse?false:health(...args);
+ });
+ const b=f.adapter,limits={...f.limits};
+ assert.equal(await b.verify(limits),true);
+ assert.equal(verificationCheckpoint(b,limits),null);
+ refuse=true;
+ await rejects(b.withAdminCredentials(()=>assert.fail('credentials exposed'),limits),'ADMIN_PENDING');
+ assert.equal(verificationCheckpoint(b,limits),null);
+ await b.stop({deadline:f.limits.deadline+120000});
+});
+
+test('first-renewal VERIFY cannot supply the failed-renewal checkpoint',async()=>{
+ const f=firstRenewalFixture(),b=await bootstrapModule.createOwnedBillingFirstRenewalBootstrap(f.options,f.dependencies),limits=LIMIT();
+ await rejects(b.verify(limits),'VERIFY_PENDING');
+ assert.equal(verificationCheckpoint(b,limits),null);
+});
+
+for(const interrupt of ['abort','timeout'])test('failed-renewal VERIFY keeps SOURCE at '+interrupt+' while the process settles',async()=>{
+ let hold=false,settings,now=Date.now();
+ const entered=Promise.withResolvers(),release=Promise.withResolvers();
+ const f=await failedRenewalOriginLive(f=>{
+  f.dependencies.now=()=>now;
+  const execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,options)=>{
+   if(hold&&file==='/usr/bin/git'){
+    hold=false;settings=options;entered.resolve();
+    await release.promise;
+   }
+   return execute(file,args,options);
+  };
+ });
+ const b=f.adapter,controller=new AbortController(),limits={deadline:now+10000,signal:controller.signal};
+ let settled=false;
+ hold=true;
+ const refused=rejects(b.verify(limits).finally(()=>{settled=true;}),'VERIFY_PENDING');
+ await entered.promise;
+ if(interrupt==='abort')controller.abort();
+ else {
+  now=limits.deadline;
+  [...f.timers.values()].find(timer=>timer.ms===10000).callback();
+ }
+ let checkpoint,stillSettling;
+ try{
+  const overlappingLimits={...limits};
+  await rejects(b.verify(overlappingLimits),'OPERATION_BUSY');
+  assert.equal(verificationCheckpoint(b,overlappingLimits),null);
+  checkpoint=verificationCheckpoint(b,limits);stillSettling=!settled;
+  await rejects(b.stop({deadline:f.limits.deadline+120000}),'OPERATION_BUSY');
+ }finally{release.resolve();await refused;}
+ assert.equal(settings.signal.aborted,true);
+ assert.equal(stillSettling,true);
+ assert.equal(checkpoint,'SOURCE');
+ assert.equal(verificationCheckpoint(b,limits),'SOURCE');
+ assert.equal(b.resources().status,'PENDING');
+ assert.equal(await b.stop({deadline:f.limits.deadline+120000}),true);
+});
+
 // Break: private evidence becomes a ledger operation, caller-controlled path, retry, or public payload.
 for(const [name,witness,checkpoint] of [
  ['Stripe family',refusedWitness,'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'],

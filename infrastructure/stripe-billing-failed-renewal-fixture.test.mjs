@@ -48,6 +48,105 @@ const checkpoints = [
 const {runId,expectedSource}=opts();
 const checkpoint=(fixture,limits)=>api.billingFailedRenewalProvisionCheckpoint(fixture,limits,runId,expectedSource);
 
+const publishRequest = replacement => replaceResponse('/publish', replacement);
+const publicationProblem = (body = {}) => ({
+ type:'urn:payment:problem:PROVIDER_RESULT_UNKNOWN',
+ title:'Provider result requires recovery',
+ status:409,
+ code:'PROVIDER_RESULT_UNKNOWN',
+ request_id:'private-request-canary',
+ ...body,
+});
+const publishConflict = text => new Response(text,{status:409,headers:{'Content-Type':'application/problem+json'}});
+for(const [stage,injection,sent] of [
+ ['INTENT',failWrite('-publish-dispatch.json'),false],
+ ['VERIFY',{onVerify:({writes})=>!writes.at(-1)?.name.endsWith('-publish-dispatch.json')},false],
+ ['REQUEST',publishRequest(()=>{throw Error('private transport failure');}),true],
+ ['HTTP_SERVER_ERROR',publishRequest(()=>new Response('private response',{status:503})),true],
+ ['HTTP_PROVIDER_RESULT_UNKNOWN',publishRequest(()=>publishConflict(JSON.stringify(publicationProblem()))),true],
+ ['HTTP_CONFLICT',publishRequest(()=>publishConflict(JSON.stringify(publicationProblem({extra:'private data'})))),true],
+ ['HTTP_CONFLICT',publishRequest(()=>publishConflict(JSON.stringify(publicationProblem()).replace('"status":409','"status":409,"status":409'))),true],
+ ['HTTP_CONFLICT',publishRequest(()=>publishConflict(JSON.stringify(publicationProblem({status:500})))),true],
+ ['HTTP_CONFLICT',publishRequest(()=>publishConflict(' '.repeat(1025)+JSON.stringify(publicationProblem()))),true],
+ ['RESPONSE',publishRequest(()=>new Response('private invalid JSON')),true],
+ ['VALIDATE',publishRequest(()=>Response.json({provider_price_id:'private invalid provider reference'})),true],
+ ['ACK',failWrite('-publish-ack.json'),true],
+])test('price publication preserves '+stage+' without another mutation',async()=>{
+ const {fixture,writes,requests}=await provisionHarness(injection);
+ const limits={deadline:Date.now()+10000};
+ await assert.rejects(fixture.provision(limits));
+ const code='PROVISION_PUBLISH_'+stage;
+ assert.equal(checkpoint(fixture,limits),code);
+ assert.equal(api.isFailedRenewalProvisionCheckpoint(code),true);
+ const publicationRequests=requests.filter(request=>request.path.endsWith('/publish'));
+ assert.equal(publicationRequests.length,Number(sent));
+ assert.ok(!requests.some(request=>request.path==='/inspection'));
+ assert.equal(writes.at(-1).name.endsWith(stage==='ACK'?'-publish-ack.json':'-publish-dispatch.json'),true);
+ const before=[writes.length,requests.length];
+ await assert.rejects(fixture.provision(limits));
+ assert.deepEqual([writes.length,requests.length],before);
+ await fixture.close();
+ assert.equal(checkpoint(fixture,limits),code);
+});
+
+test('a 409 retains its header checkpoint when the problem body arrives after abort',async()=>{
+ const entered=Promise.withResolvers(),release=Promise.withResolvers(),abort=new AbortController();
+ const body=new ReadableStream({async pull(stream){
+  entered.resolve();await release.promise;
+  stream.enqueue(Buffer.from(JSON.stringify(publicationProblem())));stream.close();
+ }},{highWaterMark:0});
+ const {fixture,writes}=await provisionHarness(publishRequest(()=>publishConflict(body)));
+ const limits={deadline:Date.now()+10000,signal:abort.signal};
+ const rejected=assert.rejects(fixture.provision(limits),/billing_ABORTED/);
+ await entered.promise;
+ assert.equal(checkpoint(fixture,limits),'PROVISION_PUBLISH_HTTP_CONFLICT');
+ abort.abort();await rejected;
+ release.resolve();
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(checkpoint(fixture,limits),'PROVISION_PUBLISH_HTTP_CONFLICT');
+ assert.equal(writes.at(-1).name.endsWith('-publish-dispatch.json'),true);
+});
+
+test('a slow publication can finish beyond the default HTTP budget without sending twice',async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const entered=Promise.withResolvers(),release=Promise.withResolvers();
+ const {fixture,requests}=await provisionHarness({async onFetch(path,settings,response){
+  if(path.endsWith('/publish')){entered.resolve(settings.signal);await release.promise;}
+  return response;
+ }});
+ const provision=fixture.provision({deadline:121000});
+ const checked=assert.doesNotReject(provision);
+ const signal=await entered.promise;
+ t.mock.timers.tick(16000);
+ const stillActive=!signal.aborted;
+ release.resolve();
+ await checked;
+ assert.equal(stillActive,true);
+ assert.equal(requests.filter(request=>request.path.endsWith('/publish')).length,1);
+});
+
+for(const budget of [25000,90000])test('publish stops at its effective '+budget+' ms limit and ignores a late success',async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const entered=Promise.withResolvers(),release=Promise.withResolvers();
+ const {fixture,requests,writes}=await provisionHarness({async onFetch(path,settings,response){
+  if(path.endsWith('/publish')){entered.resolve(settings.signal);await release.promise;}
+  return response;
+ }});
+ const limits={deadline:1000+(budget===25000?budget:120000)};
+ const rejected=assert.rejects(fixture.provision(limits),/billing_ABORTED/);
+ const signal=await entered.promise;
+ t.mock.timers.tick(budget-1);
+ assert.equal(signal.aborted,false);
+ t.mock.timers.tick(1);
+ await rejected;
+ release.resolve();
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(signal.aborted,true);
+ assert.equal(checkpoint(fixture,limits),'PROVISION_PUBLISH_REQUEST');
+ assert.equal(requests.filter(request=>request.path.endsWith('/publish')).length,1);
+ assert.equal(writes.at(-1).name.endsWith('-publish-dispatch.json'),true);
+});
+
 for (const [index, [expected, injection]] of checkpoints.entries()) {
  test('site preparation preserves '+expected+' after synthetic failure '+index, async () => {
   const {fixture,writes,requests}=await provisionHarness(injection);

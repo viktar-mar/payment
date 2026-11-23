@@ -1,5 +1,6 @@
 import {billingFailedRenewalExcluded,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
 import {validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
+import {billingFailedRenewalVerificationCheckpoint} from './stripe-sandbox-bootstrap.mjs';
 import {constants} from 'node:fs';
 import {open,lstat,realpath} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
@@ -11,19 +12,53 @@ export const billingUuid=value=>typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{
 const need=value=>{if(!value)throw billingError('FIXTURE');};
 const digest=value=>createHash('sha256').update(value).digest('hex');
 const failedRenewalCheckpoints=new WeakMap();
-const identityProviderRead='PROVISION_IDENTITY_PROVIDERS',policyRead='PROVISION_SUBSCRIPTION_POLICY';
+const identityProviderRead='PROVISION_IDENTITY_PROVIDERS',policyRead='PROVISION_SUBSCRIPTION_POLICY',publishStep='PROVISION_PUBLISH';
+// A fresh publication can run four sequential Stripe calls with a 20-second limit each.
+const publishRequestLimit=90000;
+const publishConflictTitles=new Map([
+ ['PROVIDER_RESULT_UNKNOWN','Provider result requires recovery'],
+ ['PROVIDER_OPERATION_CONFLICT','Provider operation conflicts with the request'],
+ ['PRICE_PUBLICATION_CONFLICT','Price publication conflicts with current catalog'],
+ ['resource_conflict','Resource conflict'],
+]);
 const checkpointCodes=new Set([
  'PROVISION_SITE_ACK','PROVISION_POLICY_INTENT',
- ...[identityProviderRead,policyRead].flatMap(step=>['VERIFY','REQUEST','HTTP','RESPONSE','VALIDATE'].map(detail=>step+'_'+detail)),
+ ...[identityProviderRead,policyRead,publishStep].flatMap(step=>['VERIFY','REQUEST','HTTP','RESPONSE','VALIDATE'].map(detail=>step+'_'+detail)),
+ ...['INTENT','ACK','HTTP_CONFLICT','HTTP_CLIENT_ERROR','HTTP_SERVER_ERROR'].map(detail=>publishStep+'_'+detail),
+ ...['ADMISSION','SOURCE','TOPOLOGY','HEALTH'].map(detail=>publishStep+'_VERIFY_'+detail),
+ ...Array.from(publishConflictTitles.keys(),code=>publishStep+'_HTTP_'+code.toUpperCase()),
  'PROVISION_CALLBACK_INTENT','PROVISION_CALLBACK_PUT','PROVISION_CALLBACK_VALIDATE',
  'PROVISION_RECEIVER_CONFIGURE','PROVISION_MAILPIT_READ','PROVISION_MAILPIT_EMPTY','PROVISION_FIXTURE_READY',
 ]);
 export function billingFailedRenewalProvisionCheckpoint(fixture,limits,runId,expectedSource) {
  const checkpoint=failedRenewalCheckpoints.get(fixture);
- return checkpoint&&checkpoint.limits===limits&&checkpoint.runId===runId&&checkpoint.expectedSource===expectedSource
-  ? checkpoint.code : null;
+ if(!checkpoint||checkpoint.limits!==limits||checkpoint.runId!==runId||checkpoint.expectedSource!==expectedSource)return null;
+ const step=checkpoint.verifying&&billingFailedRenewalVerificationCheckpoint(checkpoint.verifying.bootstrap,checkpoint.verifying.limits);
+ return step?checkpoint.code+'_'+step:checkpoint.code;
 }
 export const isFailedRenewalProvisionCheckpoint=code=>checkpointCodes.has(code);
+async function responseBytes(response,limits,maximum){
+ let bytes=0;const chunks=[];
+ for await(const chunk of response.body??[]){billingCheck(limits);bytes+=chunk.length;need(bytes<=maximum);chunks.push(Buffer.from(chunk));}
+ billingCheck(limits);return Buffer.concat(chunks);
+}
+function publishHttpCategory(status){
+ if(!Number.isInteger(status))return '_HTTP';
+ if(status===409)return '_HTTP_CONFLICT';
+ if(status>=400&&status<500)return '_HTTP_CLIENT_ERROR';
+ if(status>=500&&status<600)return '_HTTP_SERVER_ERROR';
+ return '_HTTP';
+}
+async function publishConflictCode(response,limits){
+ return billingBounded(limits,async l=>{
+  if(!/^application\/problem\+json(?:;\s*charset=utf-8)?$/i.test(response.headers.get('content-type')??''))return null;
+  const text=new TextDecoder('utf8',{fatal:true,ignoreBOM:true}).decode(await responseBytes(response,l,1024));
+  const v=JSON.parse(text),title=publishConflictTitles.get(v?.code);
+  if(!title||typeof v.request_id!=='string'||!/^[A-Za-z0-9_.:-]{1,128}$/.test(v.request_id))return null;
+  const exact=JSON.stringify({type:'urn:payment:problem:'+v.code,title,status:409,code:v.code,request_id:v.request_id});
+  return text===exact?v.code.toUpperCase():null;
+ },1000).catch(()=>null);
+}
 /** Fresh recurring fixture only. Cookies and callback secrets never enter its append-only public ledger. */
 export async function createBillingFixture(options,dependencies={}) {
  need(billingFailedRenewalExcluded(options?.configuration?.env??{}));
@@ -70,42 +105,50 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
   await save(kind,value,limits);
   retryCursor=current+1;
  }
- async function request(path,limits,{method='GET',body,status=200,target='backend',idempotencyKey,beforeSend,provisionRead}={}) {
+ async function request(path,limits,{method='GET',body,status=200,target='backend',idempotencyKey,beforeSend,provisionStep}={}) {
+  const publish=failed&&provisionStep===publishStep;
   return billingBounded(limits,async l=>{
    need(!closed);
-   if(provisionRead)checkpoint(provisionRead+'_VERIFY',limits);
+   if(provisionStep)checkpoint(provisionStep+'_VERIFY',limits,publish?l:undefined);
    need(await bootstrap.verify(l)===true);
    const origin=target==='mailpit'?'http://127.0.0.1:'+c.ports.mailpitHttp:endpoints[target];
    const admin=target==='backend'&&path!=='/api/admin/v1/auth/sessions';
    billingCheck(l);if(beforeSend)need(beforeSend()===true);
-   if(provisionRead)checkpoint(provisionRead+'_REQUEST',limits);
+   if(provisionStep)checkpoint(provisionStep+'_REQUEST',limits);
    const response=await fetcher(origin+path,{method,redirect:'error',signal:l.signal,headers:{Accept:'application/json',...(body===undefined?{}:{'Content-Type':'application/json'}),...(admin?{Cookie:cookie,...(method==='GET'?{}:{'X-XSRF-TOKEN':csrf,'Idempotency-Key':idempotencyKey??('billing:'+c.runId+':'+sequence)})}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});
-   let bytes=0;const chunks=[];
+   let payload;
    try{
-    billingCheck(l);const expectedStatus=response.status===status;
-    if(provisionRead)checkpoint(provisionRead+(expectedStatus?'_RESPONSE':'_HTTP'),limits);
+    billingCheck(l);const actualStatus=response.status,expectedStatus=actualStatus===status;
+    if(provisionStep)checkpoint(provisionStep+(expectedStatus?'_RESPONSE':publish?publishHttpCategory(actualStatus):'_HTTP'),limits);
+    if(publish&&!expectedStatus&&actualStatus===409){
+     const code=await publishConflictCode(response,l);
+     billingCheck(l);if(code)checkpoint(publishStep+'_HTTP_'+code,limits);
+    }
     need(expectedStatus);
-    for await(const chunk of response.body??[]){billingCheck(l);bytes+=chunk.length;need(bytes<=65536);chunks.push(Buffer.from(chunk));}
+    payload=await responseBytes(response,l,65536);
    }
    finally{await response.body?.cancel().catch(()=>{});}
-   billingCheck(l);return {value:bytes?JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(Buffer.concat(chunks))):null,cookies:path==='/api/admin/v1/auth/sessions'?response.headers.getSetCookie():[]};
-  });
+   billingCheck(l);return {value:payload.length?JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(payload)):null,cookies:path==='/api/admin/v1/auth/sessions'?response.headers.getSetCookie():[]};
+  },publish?publishRequestLimit:undefined);
  }
  const read=async(path,l,settings)=>(await request(path,l,settings)).value;
- async function mutate(name,path,body,status,l,check,{dispatchCheckpoint,ackCheckpoint}={}) {
+ async function mutate(name,path,body,status,l,check,{dispatchCheckpoint,ackCheckpoint,provisionStep}={}) {
   if(dispatchCheckpoint)checkpoint(dispatchCheckpoint,l);
   await save(name+'-dispatch',{phase:'DISPATCHING'},l);
   if(failed&&dispatchCheckpoint){
-   billingCheck(l);need(!closed);failedRenewalCheckpoints.delete(fixture);
+   billingCheck(l);need(!closed);if(!provisionStep)failedRenewalCheckpoints.delete(fixture);
   }
-  const v=await read(path,l,{method:'POST',body,status});need(check(v));
+  const v=await read(path,l,{method:'POST',body,status,provisionStep});
+  if(provisionStep)checkpoint(provisionStep+'_VALIDATE',l);
+  need(check(v));
   if(ackCheckpoint)checkpoint(ackCheckpoint,l);
   await save(name+'-ack',{phase:'ACKNOWLEDGED',...(billingUuid(v?.id)?{id:v.id}:{})},l);return v;
  }
- function checkpoint(code,limits) {
+ function checkpoint(code,limits,verificationLimits) {
   if(failed){
    billingCheck(limits);need(!closed);
-   failedRenewalCheckpoints.set(fixture,{code,limits,runId:c.runId,expectedSource:c.expectedSource});
+   failedRenewalCheckpoints.set(fixture,{code,limits,runId:c.runId,expectedSource:c.expectedSource,
+    verifying:verificationLimits?{bootstrap,limits:verificationLimits}:undefined});
   }
  }
  const fixture=Object.freeze({resources,
@@ -125,16 +168,20 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
     const account=await mutate('account','/api/admin/v1/payment-accounts',{key:'stripe-sandbox-default',provider:'STRIPE',mode:'SANDBOX',external_account_id:c.approvedBinding.externalAccountId,credentials_ref:'stripe-sandbox-default'},201,limits,v=>billingUuid(v?.id)&&v.provider==='STRIPE'&&v.mode==='SANDBOX'&&v.status==='ACTIVE'&&v.external_account_id===c.approvedBinding.externalAccountId);accountId=account.id;
     const site=await mutate('site','/api/admin/v1/sites',{key:siteKey,display_name:'Initial Billing acceptance',payment_account_id:accountId,allowed_origins:[endpoints.demo],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']},email_otp_provider:{provider_key:'billing-email-'+suffix,sender_ref:'local-default',template_key:'otp-default'}},201,limits,v=>billingUuid(v?.id)&&v.key===siteKey&&v.status==='ACTIVE'&&v.payment_account_id===accountId&&JSON.stringify(v.allowed_origins)===JSON.stringify([endpoints.demo])&&JSON.stringify(v.authentication_modes)==='["EMAIL_OTP"]',{ackCheckpoint:'PROVISION_SITE_ACK'});siteId=site.id;
     const base='/api/v1/admin/sites/'+siteId;
-    const providers=await read(base+'/identity-providers',limits,{provisionRead:identityProviderRead});
+    const providers=await read(base+'/identity-providers',limits,{provisionStep:identityProviderRead});
     checkpoint(identityProviderRead+'_VALIDATE',limits);
     need(Array.isArray(providers)&&providers.length===1&&providers[0].mode==='EMAIL_OTP'&&providers[0].readiness==='READY'&&providers[0].status==='ACTIVE');
-    const policy=await read(base+'/subscription-policy',limits,{provisionRead:policyRead});
+    const policy=await read(base+'/subscription-policy',limits,{provisionStep:policyRead});
     checkpoint(policyRead+'_VALIDATE',limits);
     need(Number.isSafeInteger(policy.version));
     await mutate('policy',base+'/subscription-policy',{version:policy.version,enabled:true,grace_days:graceDays,allow_immediate_cancellation:false,portal_enabled:false,defer_upgrades:false,portal_return_urls:[]},200,limits,v=>v?.enabled===true&&v.portal_enabled===false&&(!failed||v.grace_days===3),{dispatchCheckpoint:'PROVISION_POLICY_INTENT'});
     const product=await mutate('product','/api/admin/v1/sites/'+siteId+'/products',{key:'billing-product-'+suffix,name:'Initial monthly Billing',description:null},201,limits,v=>billingUuid(v?.id)&&v.site_id===siteId&&v.status==='ACTIVE');productId=product.id;
     const price=await mutate('price','/api/admin/v1/products/'+productId+'/prices',{price_key:'billing-price-'+suffix,type:'SUBSCRIPTION',amount_minor:2000,currency:'EUR',billing_interval:'MONTH',trial_days:0,tax_mode:'INCLUSIVE',tax_code:null},201,limits,v=>billingUuid(v?.id)&&v.site_id===siteId&&v.product_id===productId&&v.version===1&&v.status==='DRAFT');priceId=price.id;
-    const published=await mutate('publish','/api/admin/v1/prices/'+priceId+'/publish',undefined,200,limits,v=>v?.id===priceId&&v.type==='SUBSCRIPTION'&&v.status==='PUBLISHED'&&v.version===1&&v.amount_minor===2000&&v.currency==='EUR'&&v.billing_interval==='MONTH'&&v.trial_days===0&&v.tax_mode==='INCLUSIVE'&&/^price_[A-Za-z0-9]+$/.test(v.provider_price_id));priceReference=published.provider_price_id;
+    const published=await mutate('publish','/api/admin/v1/prices/'+priceId+'/publish',undefined,200,limits,
+     v=>v?.id===priceId&&v.type==='SUBSCRIPTION'&&v.status==='PUBLISHED'&&v.version===1&&v.amount_minor===2000&&v.currency==='EUR'&&v.billing_interval==='MONTH'&&v.trial_days===0&&v.tax_mode==='INCLUSIVE'&&/^price_[A-Za-z0-9]+$/.test(v.provider_price_id),
+     {dispatchCheckpoint:publishStep+'_INTENT',ackCheckpoint:publishStep+'_ACK',provisionStep:publishStep});
+    priceReference=published.provider_price_id;
+    if(failed)failedRenewalCheckpoints.delete(fixture);
     const empty=await read('/inspection',limits,{target:'receiver'});need(empty.count===0&&empty.duplicates===0&&empty.events?.length===0);
     checkpoint('PROVISION_CALLBACK_INTENT',limits);
     await save('callback-dispatch',{phase:'DISPATCHING'},limits);

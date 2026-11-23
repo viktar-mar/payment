@@ -43,6 +43,14 @@ function canonical(value) {
 const same=(a,b)=>JSON.stringify(canonical(a))===JSON.stringify(canonical(b));
 // Only internally created failures carry diagnostic metadata. Never traverse a dependency rejection.
 const failures=new WeakMap();
+const failedRenewalVerificationCheckpoints=new WeakMap();
+
+/** Last local VERIFY boundary for the exact invocation, including while a cancelled child settles. */
+export function billingFailedRenewalVerificationCheckpoint(bootstrap,limits) {
+  const verification=failedRenewalVerificationCheckpoints.get(bootstrap);
+  return verification&&verification.limits===limits ? verification.stage : null;
+}
+
 function diagnosticFailure(category,exitCode) {
   const error=Object.create(null);failures.set(error,{category,...(Number.isSafeInteger(exitCode)?{exitCode}:{})});return error;
 }
@@ -714,8 +722,26 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     }
     startupStep('FINAL_PROOF');await topology(context,true);await healthRequests(context);live=true;status='LIVE';startupStep('LEDGER');await ledger(context);return true;
   }
-  async function verify(context) {
-    if(!live||status!=='LIVE')fail();await sourceIdentity(context);await topology(context,true);await healthRequests(context);return true;
+  async function verify(context,verification) {
+    if(!live||status!=='LIVE')fail();
+    const step=stage=>{if(verification&&!context.signal.aborted)verification.stage=stage;};
+    step('SOURCE');await sourceIdentity(context);
+    step('TOPOLOGY');await topology(context,true);
+    step('HEALTH');await healthRequests(context);
+    return true;
+  }
+  async function verifyFailedRenewal(limits) {
+    // A contender cannot replace the checkpoint while the current child still owns the operation.
+    if(busy)return operation('VERIFY',limits,verify);
+    if(limits===null||typeof limits!=='object'){
+      failedRenewalVerificationCheckpoints.delete(capabilities);
+      return operation('VERIFY',limits,verify);
+    }
+    const verification={limits,stage:'ADMISSION'};
+    failedRenewalVerificationCheckpoints.set(capabilities,verification);
+    const result=await operation('VERIFY',limits,context=>verify(context,verification));
+    if(failedRenewalVerificationCheckpoints.get(capabilities)===verification)failedRenewalVerificationCheckpoints.delete(capabilities);
+    return result;
   }
   function controlled(promise,context) {
     check(context);
@@ -841,7 +867,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     verifyForwardTarget:()=>operation('FORWARD',startup,async context=>{if(status!=='PREPARED'&&!live)fail();await sourceIdentity(context);await topology(context,live,!live);
       if(!live) {await sourceGate(context);if(await io.portAvailable(ports.backend,'127.0.0.1',context)!==true)fail();}return true;}),
     persistWebhookSecret:secret=>operation('PERSIST',startup,context=>persist(secret,context)),
-    start:limits=>operation('START',limits,start),verify:limits=>operation('VERIFY',limits,verify),resources,
+    start:limits=>operation('START',limits,start),verify:failedRenewal?verifyFailedRenewal:limits=>operation('VERIFY',limits,verify),resources,
     withAdminCredentials:(callback,childLimits=undefined)=>operation('ADMIN',(manualPayment||billing)&&childLimits!==undefined?childLimits:startup,async context=>{
       if(typeof callback!=='function'||!live||status!=='LIVE')fail();await verify(context);
       if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({username:admin.username,password:admin.password}));}),context)!==true)fail();return true;
