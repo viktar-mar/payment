@@ -69,6 +69,37 @@ class OwnedFailedRenewalMethodServiceTest {
         assertThat(h.service.publishRecovery(r,read,evidence,expected,observer)).isEqualTo(h.publication);
         assertThat(h.b.cash).containsExactly("pi_initial","pi_renewal");assertThat(h.scope).isNull();
     }
+    @Test void onlyExactOwnedSuccessorClockCanExplainRecoveryCashAfterUtcObservation(){
+        var h=new Harness(300000);var reservation=h.taggedPrepared();var methodOwner=SuccessorOwner.create();
+        var read=h.service.beginMethodRead(reservation,UUID.randomUUID(),methodOwner);
+        var completion=h.service.publishMethod(reservation,read,h.evidence(),h.service.inspectMethodRead(reservation,read,methodOwner),methodOwner);
+        h.b.recovery=h.service.reserveRecovery(reservation,completion).association();
+        var raw=h.recoveredEvidence().snapshot();
+        var clockAt=Instant.ofEpochSecond(reservation.remoteClock().frozenTime());
+        var observedAt=clockAt.minusSeconds(30);
+        assertThatCode(()->OwnedFailedRenewalMethodService.requireSnapshot(reservation,
+            cashTimes(raw,observedAt,observedAt.minusSeconds(1),clockAt),true)).doesNotThrowAnyException();
+        for(var wrong:List.of(clockAt.minusSeconds(1),clockAt.plusSeconds(1)))
+            assertThatThrownBy(()->OwnedFailedRenewalMethodService.requireSnapshot(reservation,
+                cashTimes(raw,observedAt,observedAt.minusSeconds(1),wrong),true)).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(()->OwnedFailedRenewalMethodService.requireSnapshot(reservation,
+            cashTimes(raw,observedAt,clockAt,clockAt),true)).isInstanceOf(IllegalStateException.class);
+        var legacy=new Reservation(reservation.id(),reservation.admission(),reservation.failure(),reservation.setupOperationId(),
+            reservation.requestFingerprint(),reservation.initialOperationVersion(),reservation.binding(),reservation.billingSample(),reservation.reservedAt());
+        assertThatThrownBy(()->OwnedFailedRenewalMethodService.requireSnapshot(legacy,
+            cashTimes(raw,observedAt,observedAt.minusSeconds(1),clockAt),true)).isInstanceOf(IllegalStateException.class);
+    }
+    private static Snapshot cashTimes(Snapshot s,Instant observedAt,Instant initial,Instant renewal){
+        var invoices=new ArrayList<Invoice>();
+        for(var value:s.invoices()){
+            var cash=value.cashObjects().getFirst();
+            var paidAt=value.kind()==BillingRecord.Kind.INITIAL?initial:renewal;
+            invoices.add(new Invoice(value.reference(),value.kind(),value.price(),value.previousPrice(),value.period(),value.amountDueMinor(),
+                value.currency(),value.settlement(),List.of(new CashObject(cash.reference(),cash.amountMinor(),cash.currency(),cash.status(),paidAt))));
+        }
+        return new Snapshot(s.subscriptionReference(),s.status(),s.billingPrice(),s.period(),s.trial(),s.cancellationAt(),invoices,s.operationKey(),
+            s.paymentMethodReady(),s.providerRevision(),observedAt,s.operationObservation(),s.recoveryObservations(),s.trialEvidence(),s.externalWithdrawalEvidence());
+    }
     static GraceSuccessor after(Harness h,long target,String reference,Instant observed) {
         var old=h.b.ready.observation();
         return new GraceSuccessor(id(210),id(211),new OwnedFirstRenewal.TestClockReady(reference,old.object(),old.livemode(),

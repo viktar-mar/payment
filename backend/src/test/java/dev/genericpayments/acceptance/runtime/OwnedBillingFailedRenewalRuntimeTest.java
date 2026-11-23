@@ -238,6 +238,26 @@ class OwnedBillingFailedRenewalRuntimeTest {
         }
     }
 
+    @Test void recoveryObservationReturnsOnlyTheSelectedRoutesFixedRefusal() throws Exception {
+        for(var stage:List.of("RECOVERY_OBSERVE_OBSERVATION_PUBLICATION","RECOVERY_OBSERVE_ACCESS","RECOVERY_OBSERVE_PRIVATE","RECOVERY_CONFIRM_CONFIRMATION_POST")){
+            for(var path:List.of("recovery/observe","recovery/confirm")){
+                boolean observe=path.equals("recovery/observe");
+                var failure=new IllegalStateException("private synthetic detail");
+                var ops=new Inert(){
+                    public JsonObject observeRecovery(){throw failure;}
+                    public JsonObject confirmRecovery(){throw failure;}
+                    public String failureStage(Exception error){return error==failure?stage:"UNCLASSIFIED";}
+                };
+                var exchange=request("POST","/failed-renewal/"+path,"{}");
+                handler(ops).handle(exchange);
+                boolean allowed=observe?(stage.endsWith("PUBLICATION")||stage.equals("RECOVERY_OBSERVE_ACCESS")):stage.equals("RECOVERY_CONFIRM_CONFIRMATION_POST");
+                assertThat(exchange.code).isEqualTo(400);
+                assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\""+(allowed?stage:"UNCLASSIFIED")+"\"}");
+                assertThat(ops.aborts).hasValue(1);
+            }
+        }
+    }
+
     @Test void otherRouteAndMalformedFailureRequestCannotPublishDetailedSubstages() throws Exception {
         for(var stage:List.of("FAILED_RENEWAL_ADMISSION","FAILED_RENEWAL_OBSERVATION_FAILED_INTENT")){
             for(var exchange:List.of(request("POST","/failed-renewal/grace-at","{}"),
@@ -315,17 +335,19 @@ class OwnedBillingFailedRenewalRuntimeTest {
         unauthorized.requests.set("Authorization","Bearer wrong");
         var responses=Map.of(
             request("POST","/failed-renewal/recovery/observe","{}"),"{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}",
+            request("POST","/failed-renewal/recovery/observe","{\"private\":true}"),"{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}",
             request("POST",route,"{\"private\":true}"),"{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\"UNCLASSIFIED\"}",
             request("POST",route+"?private=true","{}"),"{\"code\":\"INVALID_REQUEST\"}",
             request("GET",route,"{}"),"{\"code\":\"INVALID_REQUEST\"}",
             unauthorized,"{\"code\":\"DENIED\"}"
         );
         for(var entry:responses.entrySet()){
+            var observationFailure=new IllegalStateException("private observation detail");
             var ops=new Inert(){
                 public JsonObject confirmRecovery(){throw new AssertionError("No admitted recovery confirmation");}
-                public JsonObject observeRecovery(){throw new IllegalStateException("private observation detail");}
+                public JsonObject observeRecovery(){throw observationFailure;}
                 public String failureStage(){return "RECOVERY_CONFIRM_CONFIRMATION_ACK";}
-                public String failureStage(Exception error){throw new AssertionError("No selected recovery confirmation");}
+                public String failureStage(Exception error){assertThat(error).isSameAs(observationFailure);return failureStage();}
             };
             handler(ops).handle(entry.getKey());
             assertThat(entry.getKey().output.toString()).isEqualTo(entry.getValue());

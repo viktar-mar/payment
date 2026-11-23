@@ -4,6 +4,7 @@ import com.google.gson.*;
 import dev.genericpayments.platform.catalog.domain.*;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedGraceAdvanceAdapter;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalMethodObserver.RecoveryDiagnostic;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalObserver;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter;
 import dev.genericpayments.platform.provider.application.model.*;
@@ -183,7 +184,18 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
         return result;
     });}
     @Override public JsonObject observeRecovery(){return stage("RECOVERY_ACKNOWLEDGED","RECOVERED_SETTLED_LOCAL",Stage.RECOVERY_OBSERVE,()->{
-        management();recovery.observe();var evaluated=failure.graceDeadline().plusSeconds(1);var n=pending.boundary().period().end();
+        detailedStep="RECOVERY_OBSERVE_MANAGEMENT";
+        management();
+        detailedStep="RECOVERY_OBSERVE_OBSERVATION";
+        var diagnostic=new RecoveryDiagnostic();
+        try{recovery.observe(diagnostic);}
+        catch(RuntimeException refusal){
+            var checkpoint=diagnostic.checkpoint();
+            if(checkpoint!=null)detailedStep="RECOVERY_OBSERVE_OBSERVATION_"+checkpoint.name();
+            throw refusal;
+        }
+        detailedStep="RECOVERY_OBSERVE_ACCESS";
+        var evaluated=failure.graceDeadline().plusSeconds(1);var n=pending.boundary().period().end();
         return accessResponse("RECOVERED_SETTLED_LOCAL",evaluated,AccessDecision.Reason.PAID,evaluated.plusSeconds(300).isBefore(n)?evaluated.plusSeconds(300):n);
     });}
     private JsonObject accessResponse(String phase,Instant at,AccessDecision.Reason reason,Instant expiry){

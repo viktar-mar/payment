@@ -66,6 +66,10 @@ public final class OwnedFailedRenewalMethod {
             }
         }
         public OwnedFirstRenewal.TestClockReady remoteClock(){return successor==null?admission.ready().observation():successor.clock();}
+        public boolean permitsRecoveryCashOccurrence(Instant occurredAt,Instant observedAt){
+            // A tagged recovery can carry the exact persisted G+1 billing time, ahead of observation UTC.
+            return !occurredAt.isAfter(observedAt)||successor!=null&&occurredAt.equals(Instant.ofEpochSecond(successor.clock().frozenTime()));
+        }
     }
     public record ReadClaim(UUID id,UUID reservationId,Phase phase,UUID invocation,Instant startedAt,
             Instant deadlineAt,Fence fence,Sample billingSample) {

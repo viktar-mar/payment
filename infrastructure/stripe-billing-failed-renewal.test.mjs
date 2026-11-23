@@ -949,6 +949,35 @@ test('recovery confirmation reports the longest parameter checkpoint with an unc
  assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);
  assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
 });
+for(const [stage,extra,checkpoint] of [
+ ['RECOVERY_OBSERVE_OBSERVATION_PUBLICATION',false,'SERVER_OBSERVATION_PUBLICATION'],
+ ['RECOVERY_OBSERVE_ACCESS',false,'SERVER_ACCESS'],
+ ['RECOVERY_CONFIRM_CONFIRMATION_POST',false,'HTTP'],
+ ['RECOVERY_OBSERVE_OBSERVATION_PRIVATE',false,'HTTP'],
+ ['RECOVERY_OBSERVE_OBSERVATION_PUBLICATION',true,'HTTP'],
+])test('recovery observation reports only its fixed stage '+stage+(extra?' with unexpected detail':''),async()=>{
+ const h=harness(),paths=[];
+ const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),initial(),...h.vs.slice(0,11)];
+ h.dependencies.createRuntime=()=>clients.createBillingFailedRenewalRuntime({configuration:opts(),bootstrap:{
+  withFailedRenewalRuntime:cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)})
+ }},{fetch:async url=>{
+  const path=new URL(url).pathname;paths.push(path);
+  if(path==='/failed-renewal/abort')return new Response('{"code":"QUIESCENT"}');
+  if(path==='/failed-renewal/recovery/observe'){
+   const body={code:'FAILED_RENEWAL_STOPPED',stage};
+   if(extra)body.detail='private recovery canary';
+   return new Response(JSON.stringify(body),{status:400});
+  }
+  return new Response(JSON.stringify(replies.shift()));
+ }});
+ const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));
+ const result=await o.close(),line=postArmLine('RECOVERY_OBSERVE','RECOVERY_OBSERVE_'+checkpoint);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ assert.deepEqual(paths.slice(-3),['/failed-renewal/recovery/confirm','/failed-renewal/recovery/observe','/failed-renewal/abort']);
+ assert.equal(result.failedRenewalAccepted,false);
+ assert.ok(!JSON.stringify(result).includes('private recovery canary'));
+});
 test('post-arm terminal protocol rejects foreign stages, mismatched codes, arbitrary text and false cleanup claims',()=>{
  const base={scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',status:'CLOSED',phase:'FAILED_RENEWAL',code:'FAILED_RENEWAL',diagnostic:'FAILED_RENEWAL_REQUEST',initialAccepted:false,failedRenewalAccepted:false,full5bAccepted:false,cleanupConfirmed:true,cleanupFailure:null};
  for(const changes of [{diagnostic:'GRACE_AT_REQUEST'},{scope:'OWNED_INITIAL_PAYMENT'},{phase:'PRIVATE'},{code:'METHOD_ORDER'},{initialAccepted:true},{failedRenewalAccepted:true},{full5bAccepted:true},{status:'RUNNING'},{diagnostic:'FAILED_RENEWAL_PRIVATE'}])assert.equal(owners.formatBillingFailedRenewalDiagnostic({...base,...changes}),null);

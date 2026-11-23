@@ -1,12 +1,38 @@
 package dev.genericpayments.platform.provider.adapter.out.persistence;
 
 import java.util.List;
+import java.time.Instant;
+import dev.genericpayments.platform.payments.domain.PaymentStatus;
+import dev.genericpayments.platform.provider.application.service.OwnedRecoveryInertFixture;
+import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
+import dev.genericpayments.platform.subscriptions.domain.BillingRecord;
+import dev.genericpayments.platform.subscriptions.domain.Subscription;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
 import static org.assertj.core.api.Assertions.*;
 
 /** Explicit socket-free test: no DataSource, context or provider calls. */
 class OwnedFailedRenewalMethodStoreTransactionTest {
+    @Test void recoveredFactSnapshotUsesOnlyTheExactTaggedClockForFutureCash(){
+        var fixture=new OwnedRecoveryInertFixture(value->"digest:"+value,true);
+        var r=fixture.reservation();var original=r.admission().firstRenewalAdmission();var receipt=original.receipt();
+        var terms=receipt.intent().terms();var period=r.failure().period();var key=fixture.inspect().recoveryOperation().providerOperationKey();
+        var exact=Instant.ofEpochSecond(r.remoteClock().frozenTime());var observed=exact.minusSeconds(30);
+        var firstPeriod=new Subscription.Period(Instant.ofEpochSecond(receipt.periodStart()),Instant.ofEpochSecond(receipt.periodEnd()));
+        var initial=new Invoice(original.invoice(),BillingRecord.Kind.INITIAL,terms,null,firstPeriod,terms.regularAmount().minorUnits(),terms.regularAmount().currency(),
+            SettlementKind.CASH,List.of(new CashObject(original.paymentIntent(),terms.regularAmount().minorUnits(),terms.regularAmount().currency(),PaymentStatus.SUCCEEDED,observed.minusSeconds(1))));
+        for(var paidAt:List.of(exact,exact.minusSeconds(1),exact.plusSeconds(1))){
+            var renewal=new Invoice(r.failure().invoice(),BillingRecord.Kind.RENEWAL,terms,null,period,terms.regularAmount().minorUnits(),terms.regularAmount().currency(),
+                SettlementKind.CASH,List.of(new CashObject(r.failure().paymentIntent(),terms.regularAmount().minorUnits(),terms.regularAmount().currency(),PaymentStatus.SUCCEEDED,paidAt)));
+            var snapshot=new Snapshot(receipt.reference(),Subscription.Status.ACTIVE,terms,period,null,null,List.of(initial,renewal),key,false,0,observed,
+                new OperationObservation(key,OperationState.APPLIED));
+            Runnable tagged=()->JdbcOwnedFailedRenewalStore.requireSnapshot(r.admission(),snapshot,true,r.failure().paymentIntent(),key,r);
+            if(paidAt.equals(exact))assertThatCode(tagged::run).doesNotThrowAnyException();
+            else assertThatThrownBy(tagged::run).isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(()->JdbcOwnedFailedRenewalStore.requireSnapshot(r.admission(),snapshot,true,r.failure().paymentIntent(),key))
+                .isInstanceOf(IllegalStateException.class);
+        }
+    }
     @Test void factReceiptFailureMarksOnlyTheOriginalJpaTransactionEvenAfterCallerRebind(){
         for(String mode:List.of("present","missing","foreign-before","foreign-after")){
             var original=new OwnedFailedRenewalStoreTransactionTest.JpaBoundary("valid");

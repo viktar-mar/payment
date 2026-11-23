@@ -49,6 +49,17 @@ class StripeBillingOwnedFailedRenewalMethodObserverTest {
             verify(h.service).stop(h.reservation,OwnedFailedRenewal.Reason.AUTHORITY_DRIFT);
         }
     }
+    @Test void rejectedRenewalInvoiceReportsItsCheckpointAndNeverPublishes(){
+        var h=new Harness(true);h.queue();
+        var replies=new ArrayList<>(h.g.f.f.http.replies);
+        var lines=dev.genericpayments.platform.support.StripeBillingOwnedSubscriptionFixture.json(((StripeResponse)replies.get(9)).body());
+        lines.add("data",new com.google.gson.JsonArray());
+        replies.set(9,new StripeResponse(200,HttpHeaders.of(Map.of()),lines.toString()));
+        h.g.f.f.http.replies.clear();h.g.f.f.http.replies.addAll(replies);
+        safe(h);
+        assertThat(h.recoveryDiagnostic.checkpoint()).isEqualTo(StripeBillingOwnedFailedRenewalMethodObserver.RecoveryCheckpoint.RENEWAL_INVOICE);
+        assertThat(h.g.f.f.http.calls).hasSize(10);
+    }
     @ParameterizedTest @ValueSource(ints={1,2,3,36})
     void callerContextDriftIsCheckedBeforeAfterAndFinally(int inspection) {
         var h=new Harness(false);h.queue();h.driftAt=inspection;safe(h);
@@ -133,6 +144,7 @@ class StripeBillingOwnedFailedRenewalMethodObserverTest {
         final StripeBillingOwnedRecoveryMappingTest.Graph cash=new StripeBillingOwnedRecoveryMappingTest.Graph();
         final StripeBillingOwnedMethodMappingTest.Graph g=cash.debt;
         final OwnedFailedRenewalMethodService service=mock(OwnedFailedRenewalMethodService.class);
+        final StripeBillingOwnedFailedRenewalMethodObserver.RecoveryDiagnostic recoveryDiagnostic=new StripeBillingOwnedFailedRenewalMethodObserver.RecoveryDiagnostic();
         final boolean recovered;final Thread caller=Thread.currentThread();
         final SubscriptionBillingTimePort.Sample sample=new SubscriptionBillingTimePort.Sample(Instant.ofEpochSecond(g.admission.ready().ack().advance().target()),SubscriptionBillingTimePort.Mode.ISOLATED);
         final Reservation reservation=new Reservation(UUID.randomUUID(),g.admission,g.failure,g.candidate.operation().id(),g.candidate.operation().fingerprint(),0,g.f.binding(),sample,g.failureAt.plusSeconds(1));
@@ -158,6 +170,6 @@ class StripeBillingOwnedFailedRenewalMethodObserverTest {
             return new ReadClaim(UUID.randomUUID(),claimMutation.equals("reservation")?UUID.randomUUID():reservation.id(),claimMutation.equals("phase")?(recovered?Phase.METHOD:Phase.RECOVERED):(recovered?Phase.RECOVERED:Phase.METHOD),claimMutation.equals("invocation")?UUID.randomUUID():invocation,start,start.plusSeconds(30),new Fence(claimMutation.equals("fence")?99:3,op.id(),op.version(),null,null,recovered?3L:2L),claimMutation.equals("sample")?new SubscriptionBillingTimePort.Sample(sample.billingAt().plusSeconds(1),sample.mode()):sample);}
         void queue(){if(recovered)cash.queue();else g.queue();var j=dev.genericpayments.platform.support.StripeBillingOwnedSubscriptionFixture.json(g.f.f.clockJson());j.addProperty("frozen_time",g.admission.ready().observation().frozenTime());String clock=j.toString();g.f.f.http.replies.addFirst(new StripeResponse(200,HttpHeaders.of(Map.of()),clock));g.f.f.http.reply(clock);g.f.f.http.afterResponse=new Runnable(){public void run(){ioOnCaller|=Thread.currentThread()==caller;g.f.f.http.afterResponse=this;}};}
         Object observe(){var clients=g.f.f.clients;if(blocker!=null)clients=new dev.genericpayments.platform.provider.adapter.out.stripe.StripeClientFactory(){@Override public com.stripe.StripeClient create(dev.genericpayments.platform.provider.adapter.out.stripe.StripeCredentials c){return com.stripe.StripeClient.builder().setApiKey("sk_test_INERT").setHttpClient(blocker).build();}};
-            var observer=new StripeBillingOwnedFailedRenewalMethodObserver(service,g.f.f.credentials,clients,g.f.f.digest,clock,()->workerExpired&&Thread.currentThread().isVirtual()?Duration.ofSeconds(31).toNanos():nanos);return recovered?observer.observeRecovery(reservation,recovery):observer.observeMethod(reservation);}
+            var observer=new StripeBillingOwnedFailedRenewalMethodObserver(service,g.f.f.credentials,clients,g.f.f.digest,clock,()->workerExpired&&Thread.currentThread().isVirtual()?Duration.ofSeconds(31).toNanos():nanos);return recovered?observer.observeRecovery(reservation,recovery,recoveryDiagnostic):observer.observeMethod(reservation);}
     }
 }

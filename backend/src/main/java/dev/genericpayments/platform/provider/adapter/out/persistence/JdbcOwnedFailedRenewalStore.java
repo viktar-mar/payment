@@ -2,6 +2,7 @@ package dev.genericpayments.platform.provider.adapter.out.persistence;
 
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewal.*;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation;
 import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal;
 import dev.genericpayments.platform.provider.application.port.out.OwnedFailedRenewalStore;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
@@ -322,6 +323,10 @@ public final class JdbcOwnedFailedRenewalStore implements OwnedFailedRenewalStor
             .stream().findFirst().orElseThrow(JdbcOwnedFailedRenewalStore::unavailable);
     }
     static void requireSnapshot(Admission admission,Snapshot snapshot,boolean recovered,String paymentIntent,String operationKey) {
+        requireSnapshot(admission,snapshot,recovered,paymentIntent,operationKey,null);
+    }
+    static void requireSnapshot(Admission admission,Snapshot snapshot,boolean recovered,String paymentIntent,String operationKey,Reservation recovery) {
+        if(recovery!=null&&(!recovered||!recovery.admission().equals(admission)||!recovery.failure().paymentIntent().equals(paymentIntent)))throw unavailable();
         var original=admission.firstRenewalAdmission();var receipt=original.receipt();var terms=receipt.intent().terms();
         if(!snapshot.subscriptionReference().equals(receipt.reference())||!snapshot.billingPrice().equals(terms)||!Objects.equals(snapshot.period(),admission.boundary().period())
                 ||snapshot.status()!=(recovered?Subscription.Status.ACTIVE:Subscription.Status.PAST_DUE)||snapshot.trial()!=null||snapshot.cancellationAt()!=null
@@ -342,15 +347,16 @@ public final class JdbcOwnedFailedRenewalStore implements OwnedFailedRenewalStor
             if(!invoice.price().equals(terms)||invoice.previousPrice()!=null||invoice.amountDueMinor()!=terms.regularAmount().minorUnits()
                     ||!invoice.currency().equals(terms.regularAmount().currency()))throw unavailable();
         }
-        cash(first,original.paymentIntent(),snapshot.observedAt());
-        if(recovered)cash(second,paymentIntent,snapshot.observedAt());
+        cash(first,original.paymentIntent(),snapshot.observedAt(),null);
+        if(recovered)cash(second,paymentIntent,snapshot.observedAt(),recovery);
         else if(!second.cashObjects().isEmpty())throw unavailable();
     }
-    private static void cash(Invoice invoice,String intent,Instant observedAt) {
+    private static void cash(Invoice invoice,String intent,Instant observedAt,Reservation recovery) {
         if(invoice.cashObjects().size()!=1)throw unavailable();
         var cash=invoice.cashObjects().getFirst();
+        boolean validTime=recovery==null?!cash.occurredAt().isAfter(observedAt):recovery.permitsRecoveryCashOccurrence(cash.occurredAt(),observedAt);
         if(!cash.reference().equals(intent)||cash.status()!=PaymentStatus.SUCCEEDED||cash.amountMinor()!=invoice.amountDueMinor()
-                ||!cash.currency().equals(invoice.currency())||cash.occurredAt().isAfter(observedAt))throw unavailable();
+                ||!cash.currency().equals(invoice.currency())||!validTime)throw unavailable();
     }
     private void require(String sql,Object... args) { if(!Boolean.TRUE.equals(jdbc.queryForObject(sql,Boolean.class,args)))throw unavailable(); }
     private static UUID uuid(ResultSet r,String field)throws SQLException { return r.getObject(field,UUID.class); }

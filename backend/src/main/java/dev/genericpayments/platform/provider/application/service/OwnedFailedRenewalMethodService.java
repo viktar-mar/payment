@@ -527,7 +527,7 @@ public final class OwnedFailedRenewalMethodService {
             ||!state.operations().contains(context.operation()))throw unavailable();
     }
     private void apply(Locked state,ReadClaim q,Snapshot snapshot){var key=OwnedFailedRenewalMethod.factKey(q);facts.apply(new ApplySubscriptionSnapshotUseCase.Command(state.account(),state.subscription().id(),snapshot,SubscriptionEvent.Source.RECONCILIATION,key,key,q.fence(),state.sample()));}
-    private static void requireSnapshot(Reservation r,Snapshot snapshot,boolean recovered){
+    static void requireSnapshot(Reservation r,Snapshot snapshot,boolean recovered){
         var original=r.admission().firstRenewalAdmission();var receipt=original.receipt();var terms=receipt.intent().terms();
         if(!receipt.reference().equals(snapshot.subscriptionReference())||!terms.equals(snapshot.billingPrice())||!r.failure().period().equals(snapshot.period())
             ||snapshot.status()!=(recovered?Subscription.Status.ACTIVE:Subscription.Status.PAST_DUE)||snapshot.trial()!=null||snapshot.cancellationAt()!=null||snapshot.providerRevision()!=0
@@ -538,11 +538,14 @@ public final class OwnedFailedRenewalMethodService {
         if(!first.reference().equals(original.invoice())||!first.period().equals(new Subscription.Period(Instant.ofEpochSecond(receipt.periodStart()),Instant.ofEpochSecond(receipt.periodEnd())))||first.settlement()!=SettlementKind.CASH
             ||!second.reference().equals(r.failure().invoice())||!second.period().equals(r.failure().period())||second.settlement()!=(recovered?SettlementKind.CASH:SettlementKind.OPEN))throw unavailable();
         for(var i:snapshot.invoices())if(!terms.equals(i.price())||i.previousPrice()!=null||i.amountDueMinor()!=terms.regularAmount().minorUnits()||!i.currency().equals(terms.regularAmount().currency()))throw unavailable();
-        requireCash(first,original.paymentIntent(),snapshot.observedAt());if(recovered)requireCash(second,r.failure().paymentIntent(),snapshot.observedAt());else if(!second.cashObjects().isEmpty())throw unavailable();
+        requireCash(first,original.paymentIntent(),snapshot.observedAt(),null);
+        if(recovered)requireCash(second,r.failure().paymentIntent(),snapshot.observedAt(),r);
+        else if(!second.cashObjects().isEmpty())throw unavailable();
     }
-    private static void requireCash(Invoice i,String reference,Instant observedAt){
+    private static void requireCash(Invoice i,String reference,Instant observedAt,Reservation recovery){
         if(i.cashObjects().size()!=1)throw unavailable();var c=i.cashObjects().getFirst();
-        if(!c.reference().equals(reference)||c.status()!=dev.genericpayments.platform.payments.domain.PaymentStatus.SUCCEEDED||c.amountMinor()!=i.amountDueMinor()||!c.currency().equals(i.currency())||c.occurredAt().isAfter(observedAt))throw unavailable();
+        boolean validTime=recovery==null?!c.occurredAt().isAfter(observedAt):recovery.permitsRecoveryCashOccurrence(c.occurredAt(),observedAt);
+        if(!c.reference().equals(reference)||c.status()!=dev.genericpayments.platform.payments.domain.PaymentStatus.SUCCEEDED||c.amountMinor()!=i.amountDueMinor()||!c.currency().equals(i.currency())||!validTime)throw unavailable();
     }
     private static String methodAuthority(OwnedFailedRenewal.Admission a){return "owned-failed-renewal-method:"+a.id();}
     private static String request(OwnedFailedRenewal.Admission a,OwnedFailedRenewal.Failure f,SubscriptionCommandContext c){return SubscriptionInteractionTransaction.request(c,"owned-failed-renewal-method-v1",a.id(),f.billId(),f.billVersion(),f.invoice(),f.allocation(),f.paymentIntent(),f.revision(),f.observationSequence(),"SETUP",true);}

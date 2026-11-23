@@ -1,6 +1,7 @@
 package dev.genericpayments.acceptance.runtime;
 
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalMethodObserver;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalMethodObserver.RecoveryDiagnostic;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnedFailedRenewalRecoveryConfirmAdapter.Diagnostic;
 import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Completion;
@@ -60,9 +61,13 @@ public final class OwnedBillingFailedRenewalRecovery {
     }
 
     public Publication observe() {
+        return observe(new RecoveryDiagnostic());
+    }
+
+    public Publication observe(RecoveryDiagnostic diagnostic) {
         if(!state.compareAndSet(State.CONFIRMED,State.OBSERVING))throw unavailable();
         try {
-            var published=Objects.requireNonNull(observer.observeRecovery(reservation,recovery));
+            var published=Objects.requireNonNull(observer.observeRecovery(reservation,recovery,diagnostic));
             publication=published;
             state.set(State.COMPLETE);
             return published;

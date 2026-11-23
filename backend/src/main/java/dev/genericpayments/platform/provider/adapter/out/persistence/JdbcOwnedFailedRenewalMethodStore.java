@@ -608,7 +608,7 @@ public final class JdbcOwnedFailedRenewalMethodStore implements OwnedFailedRenew
             var raw=new Snapshot(s.subscriptionReference(),s.status(),s.billingPrice(),s.period(),s.trial(),s.cancellationAt(),s.invoices(),null,true,
                 s.providerRevision(),s.observedAt(),null,s.recoveryObservations(),s.trialEvidence(),s.externalWithdrawalEvidence());
             JdbcOwnedFailedRenewalStore.requireSnapshot(r.admission(),raw,false,r.failure().paymentIntent(),null);
-        } else JdbcOwnedFailedRenewalStore.requireSnapshot(r.admission(),s,true,r.failure().paymentIntent(),selected.providerOperationKey());
+        } else JdbcOwnedFailedRenewalStore.requireSnapshot(r.admission(),s,true,r.failure().paymentIntent(),selected.providerOperationKey(),r);
         if(scope!=null){
             // FactService may now mutate the original projection. The transaction keeps
             // this check even if its caller catches an exception after the scope unwinds.

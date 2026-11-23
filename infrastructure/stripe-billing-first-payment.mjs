@@ -272,7 +272,7 @@ async function createOwner(options,dependencies,purpose){
       const operation=postArmOperations.get(method)??browserMethodOperations.get(method);
       if(operation)postArmCheckpoint=operation+'_REQUEST';
       const v=await guarded(operation?phase:stage.phase,l,async bound=>{
-       if(method==='failedRenewal'||method==='graceLastSecond'||method==='confirmRecovery')postArmRequestLimits=bound;
+       if(method==='failedRenewal'||method==='graceLastSecond'||method==='confirmRecovery'||method==='observeRecovery')postArmRequestLimits=bound;
        const reply=await runtime[stage.method](bound);billingCheck(bound);
        if(operation)postArmCheckpoint=operation+'_RESPONSE';
        return validateFailedRenewalStage(method,reply,originalIdentity,settlement,c,previous);

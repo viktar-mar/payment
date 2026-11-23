@@ -13,10 +13,19 @@ import java.time.*;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
 /** Explicit, unregistered observers. Descriptive SDK evidence gains authority only in the service publisher. */
 public final class StripeBillingOwnedFailedRenewalMethodObserver {
+    public enum RecoveryCheckpoint {
+        CLAIM, AUTHORITY, CLOCK_BEFORE, GRAPH, CUSTOMER, SUBSCRIPTION, INVOICES, INITIAL_INVOICE, RENEWAL_INVOICE,
+        CLOCK_AFTER, ACCEPTANCE, PUBLICATION
+    }
+    public static final class RecoveryDiagnostic {
+        private RecoveryCheckpoint checkpoint;
+        public RecoveryCheckpoint checkpoint(){return checkpoint;}
+    }
     private static final long TOTAL_NANOS=Duration.ofSeconds(30).toNanos();
     private static final long CALL_NANOS=Duration.ofSeconds(2).toNanos();
     private final OwnedFailedRenewalMethodService service;
@@ -70,6 +79,11 @@ public final class StripeBillingOwnedFailedRenewalMethodObserver {
     }
 
     public Publication observeRecovery(Reservation reservation,Recovery recovery) {
+        return observeRecovery(reservation,recovery,new RecoveryDiagnostic());
+    }
+
+    public Publication observeRecovery(Reservation reservation,Recovery recovery,RecoveryDiagnostic diagnostic) {
+        Objects.requireNonNull(diagnostic).checkpoint=RecoveryCheckpoint.CLAIM;
         Objects.requireNonNull(reservation);Objects.requireNonNull(recovery);
         long actualStart=System.nanoTime(),start=nanos.getAsLong();var entry=now();var invocation=UUID.randomUUID();
         var privateOwner=reservation.successor()==null?null:SuccessorOwner.create();
@@ -79,25 +93,39 @@ public final class StripeBillingOwnedFailedRenewalMethodObserver {
         catch(RuntimeException failure) {throw serviceFailure(failure);}
         RecoveredReadContext context;OwnedFailedRenewal.RecoveredEvidence evidence;Reads reads=null;
         try {
+            diagnostic.checkpoint=RecoveryCheckpoint.AUTHORITY;
             if(!reservation.id().equals(recovery.reservationId())||recovery.observationSequence()!=reservation.failure().observationSequence()+1)throw new Drift();
             requireClaim(reservation,claim,Phase.RECOVERED,invocation,entry,recovery.association().operationId(),recovery.association().operationVersion(),recovery.observationSequence());
             var budget=new Budget(start,actualStart,claim.deadlineAt());budget.remaining();
             context=inspectRecovery(reservation,claim,privateOwner);budget.remaining();
             if(!recovery.equals(context.recovery()))throw new Drift();
             var expected=context;
-            reads=new Reads(budget,()->{if(!expected.equals(inspectRecovery(reservation,claim,privateOwner)))throw new Drift();});
+            reads=new Reads(budget,()->{if(!expected.equals(inspectRecovery(reservation,claim,privateOwner)))throw new Drift();},
+                step->diagnostic.checkpoint=switch(step){
+                    case CUSTOMER -> RecoveryCheckpoint.CUSTOMER;
+                    case SUBSCRIPTION -> RecoveryCheckpoint.SUBSCRIPTION;
+                    case INVOICES -> RecoveryCheckpoint.INVOICES;
+                    case INITIAL_INVOICE -> RecoveryCheckpoint.INITIAL_INVOICE;
+                    case RENEWAL_INVOICE -> RecoveryCheckpoint.RENEWAL_INVOICE;
+                    default -> RecoveryCheckpoint.GRAPH;
+                });
             var client=clients.create(credentials.resolve(context.account()));budget.remaining();
             var reader=reads;var admission=reservation.admission();var intent=admission.firstRenewalAdmission().receipt().intent();
             var clock=reservation.remoteClock();
+            diagnostic.checkpoint=RecoveryCheckpoint.CLOCK_BEFORE;
             exactClock(reader.execute(()->client.v1().testHelpers().testClocks().retrieve(clock.reference(),reader.options())),reservation);
             var owner=new StripeBillingSnapshotMapper.Ownership(context.account(),context.subscription(),context.binding(),
                 List.of(new StripeBillingSnapshotMapper.PublishedPrice(intent.terms(),intent.priceReference(),intent.productReference())));
+            diagnostic.checkpoint=RecoveryCheckpoint.GRAPH;
             var mapped=StripeBillingSnapshotMapper.retrieveOwnedRecoveredRenewal(client,owner,admission,reservation.failure(),context.recovery().association(),context.operation(),now(),reader);
+            diagnostic.checkpoint=RecoveryCheckpoint.CLOCK_AFTER;
             exactClock(reader.execute(()->client.v1().testHelpers().testClocks().retrieve(clock.reference(),reader.options())),reservation);
+            diagnostic.checkpoint=RecoveryCheckpoint.ACCEPTANCE;
             reader.checkContext();budget.remaining();var accepted=now();claim.requireAccepted(mapped.snapshot().observedAt(),accepted);
             evidence=new OwnedFailedRenewal.RecoveredEvidence(mapped.snapshot(),accepted);
         } catch(RuntimeException failure) {throw stopped(reservation,claim,privateOwner,readFailure(failure,reads));}
         // Return the committed receipt even when commit itself consumed the remaining observation budget.
+        diagnostic.checkpoint=RecoveryCheckpoint.PUBLICATION;
         try {return privateOwner==null?service.publishRecovery(reservation,claim,evidence,context)
             :service.publishRecovery(reservation,claim,evidence,context,privateOwner);}
         catch(RuntimeException failure) {throw publicationFailure(reservation,claim,privateOwner,failure);}
@@ -155,8 +183,14 @@ public final class StripeBillingOwnedFailedRenewalMethodObserver {
             if(Thread.currentThread().isInterrupted()||actual<0||injected<0||left<=0)throw safe();return left;}
     }
     private final class Reads implements StripeBillingSnapshotMapper.ReadExecutor {
-        private final Budget budget;private final Runnable inspect;private int count;private boolean drift;private RequestOptions options;
-        Reads(Budget budget,Runnable inspect){this.budget=budget;this.inspect=inspect;}
+        private final Budget budget;private final Runnable inspect;
+        private final Consumer<StripeBillingSnapshotMapper.RenewalCheckpoint> checkpoints;
+        private int count;private boolean drift;private RequestOptions options;
+        Reads(Budget budget,Runnable inspect){this(budget,inspect,ignored->{});}
+        Reads(Budget budget,Runnable inspect,Consumer<StripeBillingSnapshotMapper.RenewalCheckpoint> checkpoints){
+            this.budget=budget;this.inspect=inspect;this.checkpoints=checkpoints;
+        }
+        @Override public void checkpoint(StripeBillingSnapshotMapper.RenewalCheckpoint step){checkpoints.accept(step);}
         public RequestOptions options(){return options;}
         void checkContext(){try {inspect.run();}catch(Drift failure){drift=true;throw failure;}}
         public <T>T execute(StripeBillingSnapshotMapper.Call<T> call) {
