@@ -65,6 +65,7 @@ public class StripeBillingSteps {
     private JsonObject remote, remoteCustomer;
     private final List<InvoiceGraph> invoices = new ArrayList<>();
     private List<Long> evidence;
+    private TrialPublication originalTrial;
     private int beforeDenied, beforeFake;
     private UUID fakeSubscription;
     private PriceId upgradePrice;
@@ -365,6 +366,87 @@ public class StripeBillingSteps {
         assertThat(count("subscription_billing_records","subscription_id=? and settlement='ZERO_AMOUNT'",created.subscriptionId())).isEqualTo(1);
         assertThat(operation(created.operationId()).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
     }
+
+    private record TrialPublication(String invoice, String eligibility, String proof, String started) {}
+
+    private TrialPublication trialPublication() {
+        return jdbc.queryForObject("""
+            select to_jsonb(b)::text, to_jsonb(e)::text, to_jsonb(p)::text, to_jsonb(j)::text
+            from subscription_billing_records b
+            join stripe_subscription_trial_proofs p on p.site_id=b.site_id and p.subscription_id=b.subscription_id
+              and p.payment_account_id=b.payment_account_id and p.invoice_reference=b.provider_invoice_reference
+            join subscription_trial_eligibility e on e.site_id=b.site_id and e.customer_id=p.customer_id
+              and e.product_id=b.product_id and e.reserved_by_operation=p.operation_id and e.consumed_at is not null
+            join subscription_events j on j.site_id=b.site_id and j.subscription_id=b.subscription_id
+              and j.payment_account_id=b.payment_account_id and j.event_type='TRIAL_STARTED'
+              and j.source='RECONCILIATION'
+            where b.site_id=? and b.subscription_id=? and b.payment_account_id=? and p.operation_id=?
+              and p.trial_start=? and p.requested_end=? and b.provider_invoice_reference='in_trial'
+              and b.kind='INITIAL' and b.settlement='ZERO_AMOUNT' and b.currency='EUR' and b.amount_due_minor=0
+            """, (row,index) -> new TrialPublication(row.getString(1),row.getString(2),row.getString(3),row.getString(4)),
+            site.value(),created.subscriptionId(),account.id().value(),created.operationId(),start.getEpochSecond(),end.getEpochSecond());
+    }
+
+    @When("the trial reaches its exact end without a payment method")
+    public void reachTrialEnd() {
+        originalTrial=trialPublication();
+        int callsBeforeAccess=http.calls().size();
+        TestClock.set(end.minusSeconds(1));
+        authenticate();
+        assertTrialAccess(Subscription.Status.TRIALING,AccessDecision.Reason.TRIAL,end);
+        TestClock.set(end);
+        assertTrialAccess(Subscription.Status.TRIALING,AccessDecision.Reason.EXPIRED,null);
+        assertThat(http.calls()).hasSize(callsBeforeAccess);
+    }
+
+    private void assertTrialAccess(Subscription.Status state, AccessDecision.Reason reason, Instant validUntil) {
+        var queries=bean(QuerySubscriptionsUseCase.class);
+        var view=queries.get(actor,site,created.subscriptionId());
+        assertThat(view.subscription().billingStatus()).isEqualTo(state);
+        var decision=queries.access(actor,site,customer.id(),product);
+        assertThat(decision).isEqualTo(view.access());
+        assertThat(decision.reason()).isEqualTo(reason);
+        assertThat(decision.allowed()).isEqualTo(validUntil!=null);
+        assertThat(decision.evaluatedAt()).isEqualTo(now());
+        assertThat(decision.validUntil()).isEqualTo(validUntil);
+    }
+
+    @When("Stripe reports the original trial subscription paused")
+    public void reconcilePausedTrial() {
+        int before=http.calls().size();
+        remote.addProperty("status","paused");
+        reconcile();
+        var calls=http.calls().stream().skip(before).toList();
+        assertThat(calls).extracting(StripeHttpFixture.Call::path).contains("/v1/subscriptions/sub_billing",
+            "/v1/invoices","/v1/invoices/in_trial/lines","/v1/invoice_payments");
+    }
+
+    @Then("the same subscription is paused without debt or a new invoice or payment")
+    public void pausedTrial() {
+        assertTrialAccess(Subscription.Status.PAUSED,AccessDecision.Reason.PAUSED,null);
+        var paused=subscription();
+        assertThat(paused.providerReference()).isEqualTo("sub_billing");
+        assertThat(paused.trial()).isEqualTo(new Subscription.Period(start,end));
+        assertThat(paused.paidThrough()).isNull();
+        assertThat(paused.debt()).isNull();
+        assertThat(trialPublication()).isEqualTo(originalTrial);
+        assertThat(count("subscription_billing_records","subscription_id=?",created.subscriptionId())).isOne();
+        assertThat(jdbc.queryForList("""
+            select event_type from subscription_events where subscription_id=? order by sequence_number
+            """,String.class,created.subscriptionId())).containsExactly("TRIAL_STARTED","PAUSED");
+        assertThat(count("payments","site_id=?",site.value())).isZero();
+        assertThat(count("payment_events","site_id=?",site.value())).isZero();
+        assertThat(count("outbox_events","site_id=? and callback_type='payment.succeeded'",site.value())).isZero();
+        var calls=http.calls();
+        var creates=calls.stream().filter(call -> call.method().equals("POST") && call.path().equals("/v1/subscriptions")).toList();
+        assertThat(creates).hasSize(1);
+        var trialCreate=creates.getFirst();
+        assertThat(trialCreate.form().get("trial_settings[end_behavior][missing_payment_method]")).isEqualTo("pause");
+        assertThat(trialCreate.form().containsKey("default_payment_method")).isFalse();
+        assertThat(calls.subList(calls.indexOf(trialCreate)+1,calls.size()))
+            .allSatisfy(call -> assertThat(call.method()).isEqualTo("GET"));
+    }
+
     private void next(String settlement) {
         start=end;end=end.plusSeconds(30L*86400);TestClock.set(start);authenticate();setPeriod(start,end);
         remote.addProperty("status",settlement.equals("CASH")?"active":"past_due");invoices.add(invoice("renewal","subscription_cycle",start,end,settlement));reconcile();

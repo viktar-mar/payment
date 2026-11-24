@@ -23,11 +23,14 @@ Feature: Stripe Billing through the configured application and official SDK
     Then its subscription cash, lifecycle facts and callbacks are unchanged
     And its canonical Site callbacks are signed and delivered exactly once
 
-  Scenario: An ordinary optional method trial proves ZERO without cash
+  Scenario: An ordinary optional method trial expires and pauses without cash or debt
     Given an owned Stripe Billing subscription with 7 trial days
     Then its Stripe create acknowledgement has no cash or paid access
     When its original zero Stripe trial invoice is reconciled
     Then trial access exists without a cash payment or payment succeeded fact
+    When the trial reaches its exact end without a payment method
+    And Stripe reports the original trial subscription paused
+    Then the same subscription is paused without debt or a new invoice or payment
 
   Scenario: Verified renewal cash advances the existing subscription
     Given an owned Stripe Billing subscription with 0 trial days
