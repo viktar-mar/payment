@@ -10,6 +10,8 @@ Run `e7080356` separately verified the initial €20 payment and the first succe
 
 The first native initial-decline/retry attempt, `a35eb316-f842-42b7-a1b0-157f942a8e99` at `d8bebcf163b3457e68f412ed4e6b7c582d349e69`, exited 1 with `phase=RETRY_ACK code=BROWSER cleanup=UNCONFIRMED`. The last durable operation was `CREATE_ACK`. The ledger contains no first confirmation, Retry or successor confirmation dispatch. The phase label is shared by several acknowledgements, including creation, and leaves the exact browser failure undetermined. A separate check found all seven containers exited and no Stripe listener for this run. Initial decline and retry remain pending native evidence.
 
+Run `5d72b0cc-89cb-4701-989e-0465119d92d1` at `f3eb684ca021506610dafba22c7909305e6db284` passed CLI authorization and recorded `CREATE_ACK`. It exited 1 with `phase=RETRY_ACK code=BROWSER_INITIAL_SESSION cleanup=CONFIRMED`, before the runner accepted a paired confirmation-session response. The checkpoint leaves open whether the manager requested a session and whether a response arrived. There is no confirmation or Retry dispatch in the journal. All seven containers were independently verified exited, with no run-owned Stripe listener.
+
 ## Earlier local recovery evidence on 2026-11-23
 
 Run `c2dfc733-6915-45b8-8aa5-3792ccb31f42` at `0449bdd` passed the initial payment, declined renewal, grace checks and replacement-method confirmation. The exact Stripe Sandbox request log showed that the invoice-created PaymentIntent refused `error_on_requires_action`. Both the local runner and Stripe stopped that request.
