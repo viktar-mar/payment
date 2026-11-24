@@ -2,7 +2,7 @@ import {createOwnedInvoiceIngress} from './stripe-billing-invoice-ingress.mjs';
 import {invoiceWebhookFlow} from './stripe-billing-invoice-webhook-port.mjs';
 import {initialChallengeFlow} from './stripe-billing-initial-3ds-port.mjs';
 import {initialRetryFlow} from './stripe-billing-initial-retry-port.mjs';
-import {validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
+import {RETRY_CLI_PROFILE_RUN_ID,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
 import {createOwnedBillingBootstrap} from './stripe-sandbox-bootstrap.mjs';
 import {createBillingCliAdapter} from './stripe-sandbox-cli.mjs';
 import {preflightOwnedBilling} from './stripe-sandbox-owned.mjs';
@@ -68,7 +68,9 @@ async function createOwner(options,dependencies,selectedCase) {
      if(await step('INGRESS',l=>ingress.open(l))!==true)fail('INGRESS');
     }
     cli=await step('CLI',()=>(dependencies.createCli??createBillingCliAdapter)({configuration,cliDirectory:bootstrap.resources().cliDirectory,verifyForwardTarget:bootstrap.verifyForwardTarget,persistWebhookSecret:bootstrap.persistWebhookSecret,...(invoiceCase?{invoiceIngress:ingress}:{})}));
-    await step('LOGIN',async l=>{const login=dependencies.login??(await import('./stripe-billing-login.mjs')).completeBillingLogin;return login(cli,configuration,active);},780000);
+    if(!Object.hasOwn(configuration.env,RETRY_CLI_PROFILE_RUN_ID)){
+     await step('LOGIN',async()=>{const login=dependencies.login??(await import('./stripe-billing-login.mjs')).completeBillingLogin;return login(cli,configuration,active);},780000);
+    }
     await step('BINDING',l=>cli.validateBinding(l));await step('LISTENER',l=>cli.startListener(l));
     await step('START',l=>bootstrap.start(l),2700000);
     fixture=await step('FIXTURE',async()=>{const factory=dependencies.createFixture??(await import('./stripe-billing-provision.mjs')).createBillingFixture;return factory({configuration,bootstrap,cli});});

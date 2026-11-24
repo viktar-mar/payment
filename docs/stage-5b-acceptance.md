@@ -14,6 +14,8 @@ Run `5d72b0cc-89cb-4701-989e-0465119d92d1` at `f3eb684ca021506610dafba22c7909305
 
 Run `8f405cac-0a19-428f-9abe-7e7f04f0813b` at `73ca3b505e85b2fe9dbff442ebcf74664db1e0f9` recorded `CREATE_ACK` and exited 1 with `phase=RETRY_ACK code=BROWSER_ACTION_CONFLICT cleanup=CONFIRMED`. The browser paired an HTTP 409 with the authenticated `/action` request for the newly acknowledged subscription and operation. The response body was outside the diagnostic, so the reason for the conflict is undetermined. The journal contains no confirmation or Retry dispatch. An independent check confirmed that all seven containers exited and no run-owned Stripe process remained. Initial decline and Retry remain pending.
 
+Run `79f1b618-065d-4dd2-aca9-9418bc54932f` at `547e56cc0ddaf8a026c2f97e150ee3fd7a4014bf` advanced to the paired confirmation-session POST. It stopped with `phase=RETRY_ACK code=BROWSER_INITIAL_SESSION_HTTP cleanup=CONFIRMED` because the server response failed the HTTP status check. The diagnostic did not retain the exact status or response body. The last journal entry is `CREATE_ACK` and there is no confirmation or Retry dispatch. An independent check found all seven containers exited and no run-owned Stripe process. A separate read-only check reused this run's test-only CLI authorization successfully without a new device code or payment request.
+
 ## Earlier local recovery evidence on 2026-11-23
 
 Run `c2dfc733-6915-45b8-8aa5-3792ccb31f42` at `0449bdd` passed the initial payment, declined renewal, grace checks and replacement-method confirmation. The exact Stripe Sandbox request log showed that the invoice-created PaymentIntent refused `error_on_requires_action`. Both the local runner and Stripe stopped that request.

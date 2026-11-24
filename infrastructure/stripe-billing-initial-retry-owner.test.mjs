@@ -9,6 +9,7 @@ import {id} from './fixtures/failed-renewal-descriptors.mjs';
 import {acceptanceBrowserFailure,finishBrowserCleanup} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 
 const scenario = 'initial_decline_retry';
+const profileFlag = 'PAYMENT_STRIPE_BILLING_RETRY_CLI_PROFILE_RUN_ID';
 const input = () => ({
   env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',PAYMENT_STRIPE_BILLING_CASE:scenario},
   runId:id(1),expectedSource:'a'.repeat(40),daemon:'unix:///Users/test/docker.sock',
@@ -40,14 +41,41 @@ test('initial retry requires matching explicit case and exact budget; legacy fac
   await assert.rejects(owners.createOwnedBillingDeclineRetry({...configuration,env:baseEnv,selectedCase:'initial_success'}),/OPT_IN_REQUIRED/);
 });
 
-async function harness({prove,write,clean=true}={}) {
+test('only initial retry retains a canonical prior Sandbox profile selection', () => {
+  const configuration = input();
+  configuration.env[profileFlag]=id(99);
+  const admitted = validateBillingAcceptanceOptions(configuration);
+  assert.equal(admitted?.env[profileFlag],id(99));
+  assert.deepEqual(validateBillingAcceptanceOptions(admitted),admitted);
+  assert.equal(snapshotBillingAcceptanceEnvironment(configuration.env)?.[profileFlag],id(99));
+  for (const invalid of ['',null,undefined,'../'+id(99),id(99)+'\n',configuration.runId,'031b5ae7-6603-4339-b1b3-77231291ff34']) {
+    const changed={...configuration,env:{...configuration.env,[profileFlag]:invalid}};
+    assert.equal(validateBillingAcceptanceOptions(changed),null);
+  }
+  for (const selectedCase of ['initial_cancel_withdraw','initial_3ds','initial_missed_reordered']) {
+    const changed={...configuration,selectedCase,env:{...configuration.env,PAYMENT_STRIPE_BILLING_CASE:selectedCase}};
+    assert.equal(snapshotBillingAcceptanceEnvironment(changed.env),null);
+    assert.equal(validateBillingAcceptanceOptions(changed),null);
+  }
+  const inherited=Object.assign(Object.create({[profileFlag]:id(99)}),input().env);
+  assert.equal(snapshotBillingAcceptanceEnvironment(inherited),null);
+  const accessor=input().env;
+  Object.defineProperty(accessor,profileFlag,{enumerable:true,get(){assert.fail('profile selector accessor invoked');}});
+  assert.equal(snapshotBillingAcceptanceEnvironment(accessor),null);
+});
+
+async function harness({prove,write,clean=true,profile,binding=true}={}) {
   const configuration = input(), calls = [];
+  if(profile)configuration.env[profileFlag]=id(99);
   const f = await provisionHarness({configuration,factory:createBillingFixture,onWrite:write});
   const yes = async () => true;
-  const cli = {validateBinding:yes,startListener:yes,assertBillingListener:yes,stopListener:yes};
-  const bootstrap = {prepare:yes,start:yes,resources:()=>({cliDirectory:'inert'}),stop:async()=>clean};
+  const authorization=[];
+  const cli = {validateBinding:async()=>{authorization.push('binding');return binding;},
+    startListener:async()=>{authorization.push('listener');return true;},assertBillingListener:yes,stopListener:yes};
+  const bootstrap = {prepare:yes,start:async()=>{authorization.push('runtime');return true;},resources:()=>({cliDirectory:'inert'}),stop:async()=>clean};
   const owner = await owners.createOwnedBillingDeclineRetry(configuration,{
-    preflight:yes,createBootstrap:async()=>bootstrap,createCli:async()=>cli,login:yes,createFixture:async()=>f.fixture,
+    preflight:yes,createBootstrap:async()=>bootstrap,createCli:async()=>cli,
+    login:async()=>{authorization.push('device login');return true;},createFixture:async()=>f.fixture,
     proveInitialRetry:async value => {
       calls.push(value.phase);
       assert.equal(value.cli,cli);assert.equal(value.bootstrap,bootstrap);assert.equal(value.fixture,f.fixture);
@@ -59,7 +87,7 @@ async function harness({prove,write,clean=true}={}) {
       return prove ? prove(value.phase) : true;
     },
   });
-  return {owner,...f,calls};
+  return {owner,...f,calls,authorization};
 }
 async function start(port) {
   await port.acknowledgeCustomer({customerId:id(4),siteId:id(3)});
@@ -86,6 +114,7 @@ test('owner proves the original decline before Retry and one recovered charge be
   assert.equal(result.declineRetryAccepted,true);
   assert.equal(result.cleanupConfirmed,true);assert.equal(result.full5bAccepted,false);
   assert.deepEqual(f.calls,['declined','recovered']);
+  assert.deepEqual(f.authorization,['device login','binding','listener','runtime']);
   const ledger = f.writes.slice(f.writes.findIndex(r=>r.name.endsWith('-create-dispatch.json')));
   assert.deepEqual(ledger.map(r=>r.name.slice(12)),['create-dispatch.json','create-ack.json','confirm-dispatch.json','confirm-ack.json',
     'decline-proof.json','retry-dispatch.json','retry-ack.json','successor-confirm-dispatch.json','successor-confirm-ack.json','recovered-proof.json']);
@@ -94,6 +123,19 @@ test('owner proves the original decline before Retry and one recovered charge be
   assert.equal(ledger[6].value.successorAttemptId,id(10));
   assert.equal(ledger[7].value.attemptId,id(10));
   assert.equal(f.fixture.resources().attemptId,id(9));
+});
+test('confirmed retry profile skips device login but verifies binding before listener and runtime',async()=>{
+ const f=await harness({profile:true});
+ const result=await f.owner.run(journey,limits());
+ assert.equal(result.declineRetryAccepted,true);
+ assert.deepEqual(f.authorization,['binding','listener','runtime']);
+});
+test('rejected retry profile ends before login, listener, runtime or subscription dispatch',async()=>{
+ const f=await harness({profile:true,binding:false});
+ await assert.rejects(f.owner.run(()=>assert.fail('browser used after binding refusal'),limits()),/billing_BINDING/);
+ assert.deepEqual(f.authorization,['binding']);
+ assert.equal(f.writes.some(r=>r.name.endsWith('-create-dispatch.json')),false);
+ assert.equal((await f.owner.close()).cleanupConfirmed,true);
 });
 for(const [kind,browserClosed,bootstrapStopped,expected,cleanup] of [
  ['trusted',true,true,'BROWSER_INITIAL_SESSION_HTTP',true],
