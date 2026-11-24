@@ -198,20 +198,33 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    })};
   },
  };
- const devtools=new Map<unknown,Map<string,(value:unknown)=>void>>();
+ const cdpFrames=[
+  {node:frame,id:'checkout-frame',parent:undefined},
+  {node:stripeFrame,id:'stripe-frame',parent:frame},
+  {node:outer,id:'outer-frame',parent:frame},
+  {node:inner,id:'inner-frame',parent:outer},
+  {node:issuer,id:'issuer-frame',parent:inner},
+ ];
+ function cdpFrameTree(entry:typeof cdpFrames[number]):unknown{
+  return {frame:{id:entry.id,url:entry.node.url()||'about:blank',name:entry.node.name()},
+   childFrames:cdpFrames.filter(child=>child.parent===entry.node).map(cdpFrameTree)};
+ }
+ const devtools=new Map<string,(value:unknown)=>void>();
  let networkSequence=0;
- const armedPatterns=new Map<unknown,string[]>(),abortedPauses=new Set<string>();
+ let armedPatterns:string[]=[];
+ const abortedPauses=new Set<string>();
  function observeNetwork(target:unknown,url:string,method:string){
-  const rec=devtools.get(target),networkId='net'+(++networkSequence),request={url,method};
-  rec?.get('Network.requestWillBeSent')?.({requestId:networkId,frameId:'frame',request});
+  const networkId='net'+(++networkSequence),request={url,method};
+  const frameId=cdpFrames.find(entry=>entry.node===target)?.id??'foreign-frame';
+  devtools.get('Network.requestWillBeSent')?.({requestId:networkId,frameId,request});
   return async(label:string,status:number)=>{
    if(!sca&&!invoiceCase)return;
    const redirect=fault==='redirect-'+label;
-   const covered=armedPatterns.get(target)?.some(pattern=>{
+   const covered=armedPatterns.some(pattern=>{
     const escaped=pattern.split('*').map(part=>part.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'));
     return new RegExp('^'+escaped.join('.*')+'$').test(url);
    });
-   if(covered)await rec?.get('Fetch.requestPaused')?.({requestId:networkId,networkId,frameId:'frame',request,responseStatusCode:redirect?307:status});
+   if(covered)await devtools.get('Fetch.requestPaused')?.({requestId:networkId,networkId,frameId,request,responseStatusCode:redirect?307:status});
    if(abortedPauses.has(networkId))throw Error('stopped response');
    if(redirect)trace.push('followed redirect '+label);
   };
@@ -436,11 +449,11 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  };
  const page={
   frames:()=>[frame,stripeFrame,issuer],context:()=>({newCDPSession:async(surface:unknown)=>{
-   const f=(surface===page?frame:surface) as {url:()=>string;name:()=>string};const listeners=new Map<string,(value:unknown)=>void>();devtools.set(f,listeners);
-   return {on:(event:string,fn:(v:unknown)=>void)=>listeners.set(event,fn),send:async(command:string,args:{requestId?:string;patterns?:{urlPattern:string}[]})=>{
-    if(command==='Fetch.enable')armedPatterns.set(f,args.patterns!.map(p=>p.urlPattern));
+   if(surface!==page)throw Error("This frame does not have a separate CDP session, it is a part of the parent frame's session");
+   return {on:(event:string,fn:(v:unknown)=>void)=>devtools.set(event,fn),send:async(command:string,args:{requestId?:string;patterns?:{urlPattern:string}[]})=>{
+    if(command==='Fetch.enable')armedPatterns=args.patterns!.map(p=>p.urlPattern);
     if(command==='Fetch.failRequest')abortedPauses.add(args.requestId!);
-    if(command==='Page.getFrameTree')return {frameTree:{frame:{id:'frame',url:f.url()||'about:blank',name:f.name()}}};
+    if(command==='Page.getFrameTree')return {frameTree:cdpFrameTree(cdpFrames[0]!)};
    }};
   }}),
   mainFrame:()=>frame,url:()=>documentUrl,waitForFunction:async()=>{

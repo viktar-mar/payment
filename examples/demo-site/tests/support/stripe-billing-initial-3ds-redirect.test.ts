@@ -1,9 +1,59 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {EventEmitter} from 'node:events';
 // @ts-ignore Offline source.
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
 
 const origins={backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081'};
+
+for(const during of ['route policy','identity probe'])test('a replacement iframe cannot inherit a request during '+during,async()=>{
+ const url='https://api.stripe.com/fixture-read',iframeUrl='https://js.stripe.com/fixture-frame.html';
+ const main={url:()=>origins.demo+'/',name:()=>'',isDetached:()=>false};
+ const child={url:()=>iframeUrl,name:()=>'fixture',isDetached:()=>false,parentFrame:()=>main};
+ const events=new EventEmitter(),commands:string[]=[],failures:string[]=[];
+ const identity=Promise.withResolvers<object>(),probing=Promise.withResolvers<void>();
+ const session={
+  on:events.on.bind(events),
+  async send(method:string,args?:{sessionId:string;message:string}){
+   if(method==='Page.getFrameTree')return {frameTree:{frame:{id:'main',url:main.url()}}};
+   if(method!=='Target.sendMessageToTarget')return {};
+   const {id,method:command}=JSON.parse(args!.message);
+   commands.push(command);
+   const result=command==='Page.getFrameTree'?{frameTree:{frame:{id:'iframe',url:iframeUrl,name:'fixture'}}}:{};
+   events.emit('Target.receivedMessageFromTarget',{sessionId:args!.sessionId,message:JSON.stringify({id,result})});
+   return {};
+  },
+ };
+ const page={mainFrame:()=>main,context:()=>({newCDPSession:async(frame:unknown)=>frame===child?{
+  send:async()=>{probing.resolve();return identity.promise;},detach:async()=>{},
+ }:session})};
+ const guard=await guardChallengeRedirects(page as never,code=>failures.push(code),origins);
+ const flush=()=>new Promise<void>(resolve=>setImmediate(resolve));
+ const passive={frameId:'iframe',request:{url,method:'GET'}};
+ const emit=(sessionId:string,method:string,params:object)=>events.emit('Target.receivedMessageFromTarget',{
+  sessionId,message:JSON.stringify({method,params}),
+ });
+ const attach=async(sessionId:string)=>{
+  events.emit('Target.attachedToTarget',{sessionId,targetInfo:{targetId:'iframe',type:'iframe'},waitingForDebugger:true});
+  await flush();
+  emit(sessionId,'Network.requestWillBeSent',{...passive,requestId:sessionId});
+ };
+ await attach('first');
+ const request={frame:()=>child,url:()=>url,method:()=>'GET'} as never;
+ guard.registerRoute(request);
+ const authorization=during==='identity probe'?guard.authorize(request):undefined;
+ if(authorization)await probing.promise;
+ events.emit('Target.detachedFromTarget',{sessionId:'first'});
+ await attach('replacement');
+ identity.resolve({targetInfo:{targetId:'iframe',type:'iframe'}});
+ await assert.rejects(authorization??guard.authorize(request),/^Error: billing_BROWSER$/);
+ emit('replacement','Fetch.requestPaused',{...passive,networkId:'replacement',requestId:'pause',responseStatusCode:200});
+ await flush();
+ assert.equal(commands.includes('Fetch.continueResponse'),false);
+ assert.equal(commands.at(-1),'Fetch.failRequest');
+ assert.deepEqual(failures,['BROWSER_GUARD_RESPONSE_UNCLAIMED']);
+});
+
 for(const [frameId,status,release] of [['checkout-frame',200,true],['wrong-frame',200,false],['checkout-frame',307,false]] as const)
  test('the paused main navigation uses the attached frame identity: '+frameId+' '+status,async()=>{
   const href=origins.demo+'/',events=new Map<string,(e:unknown)=>Promise<void>|void>(),commands:string[]=[];

@@ -1,4 +1,6 @@
 import type {CDPSession,Frame,Page,Request} from '@playwright/test';
+// @ts-ignore Native Node executes the same iframe guard source as Playwright.
+import {guardIframeTargets,type GuardSession} from './stripe-billing-chromium-iframe.ts';
 
 const refuse=():never=>{throw Error('billing_BROWSER');};
 // Keep response interception aligned with every original HTTP destination the guarded
@@ -10,7 +12,7 @@ type Preflight={origin:string;method:string;names?:string};
 type Entry={url:string;method:string;frameId?:string;allowed:boolean;preflight?:Preflight;initiator?:{id:string;entry?:Entry}};
 type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
  |'BROWSER_GUARD_RESPONSE_PAIR'|'BROWSER_GUARD_RESPONSE_REDIRECT'|'BROWSER_GUARD_RESPONSE_STATUS'|'BROWSER_GUARD_RESPONSE_NETWORK'
- |'BROWSER_GUARD_RESPONSE_PREFLIGHT'|'BROWSER_GUARD_RESPONSE_UNCLAIMED'|'BROWSER_GUARD_RESPONSE_RESUME';
+ |'BROWSER_GUARD_RESPONSE_PREFLIGHT'|'BROWSER_GUARD_RESPONSE_UNCLAIMED'|'BROWSER_GUARD_RESPONSE_RESUME'|'BROWSER_GUARD_IFRAME_SETUP';
 function stripeScript(url:URL){
  return url.protocol==='https:' && !url.port && !url.username && !url.password &&
   (url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com'));
@@ -37,7 +39,8 @@ function syntheticProbe(value:Preflight|undefined,status:number|undefined,header
  if(value.names!==undefined)expected.set('access-control-allow-headers',value.names);
  return headers.length===expected.size && headers.every(h=>expected.get(h.name.toLowerCase())===h.value && expected.delete(h.name.toLowerCase()));
 }
-type Target={session:CDPSession;root:Frame;requests:Map<string,Entry>};
+type Guard={session:GuardSession;requests:Map<string,Entry>};
+type Target=Guard&{root:Frame;current:()=>boolean;id?:string};
 type Tree={frame:{id:string;name?:string;url:string;urlFragment?:string};childFrames?:Tree[]};
 function frameId(tree:Tree,root:Frame,frame:Frame,uncommittedOwner?:string):string {
  const chain:Frame[]=[];
@@ -81,19 +84,10 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
  function tracked(raw:string){
   const url=new URL(raw);return exactOrigins.includes(url.origin)||stripeScript(url);
  }
- const targets=new WeakMap<Frame,Promise<Target>>();
- async function attach(root:Frame):Promise<Target>{
-  let session:CDPSession;
-  try{session=await page.context().newCDPSession(root===page.mainFrame()?page:root);}
-  catch(error){
-   const parent=root.parentFrame();
-   // Playwright 1.63 explicitly reports in-process frames as part of their parent's CDP target.
-   if(parent && error instanceof Error && error.message.endsWith("This frame does not have a separate CDP session, it is a part of the parent frame's session"))return target(parent);
-   throw Error('billing_BROWSER');
-  }
-  const requests=new Map<string,Entry>();let ready=false;
+ async function arm(session:GuardSession):Promise<Guard>{
+  const requests=new Map<string,Entry>();
   session.on('Network.requestWillBeSent',event=>{
-   if(!ready||!tracked(event.request.url))return;
+   if(!tracked(event.request.url))return;
    if(event.redirectResponse){onFailure('BROWSER_GUARD_REQUEST_REDIRECT');return;}
    if(requests.has(event.requestId)){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
    if(requests.size>=24){onFailure('BROWSER_GUARD_REQUEST_CAPACITY');return;}
@@ -150,31 +144,48 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   });
   await session.send('Network.enable');
   await session.send('Fetch.enable',{patterns:patterns.map(urlPattern=>({urlPattern,requestStage:'Response' as const}))});
-  ready=true;return {session,root,requests};
+  return {session,requests};
  }
- function target(frame:Frame):Promise<Target>{
-  const existing=targets.get(frame);if(existing)return existing;
-  const pending=attach(frame);targets.set(frame,pending);void pending.catch(()=>{});return pending;
+ const main=page.mainFrame(),mainGuard=await arm(await page.context().newCDPSession(page));
+ const iframeGuard=await guardIframeTargets(mainGuard.session,arm,()=>onFailure('BROWSER_GUARD_IFRAME_SETUP'));
+ const mainTarget={...mainGuard,root:main,current:()=>iframeGuard.active()&&!main.isDetached()};
+ async function target(frame:Frame,generation:number):Promise<Target>{
+  if(frame===main)return mainTarget;
+  let probe:CDPSession;
+  try{probe=await page.context().newCDPSession(frame);}
+  catch(error){
+   const parent=frame.parentFrame();
+   // In-process frames are covered by their nearest target and its exact frame tree.
+   if(parent && error instanceof Error && error.message.endsWith("This frame does not have a separate CDP session, it is a part of the parent frame's session"))return target(parent,generation);
+   return refuse();
+  }
+  try{
+   // The late probe identifies the current target. It never owns request evidence.
+   const {targetInfo}=await probe.send('Target.getTargetInfo');
+   if(targetInfo.type!=='iframe')return refuse();
+   const {guard,current}=await iframeGuard.get(targetInfo.targetId,generation);
+   return {...guard,root:frame,current,id:targetInfo.targetId};
+  }finally{await probe.detach();}
  }
- // A cross-origin commit can change which target owns a frame. Discover a fresh
- // child target when the previous owner was its parent, while keeping the parent's guard active.
- function refresh(frame:Frame){
-  const old=targets.get(frame);
-  if(!old){void target(frame);return;}
-  void old.then(previous=>{
-   if(previous.root!==frame && targets.get(frame)===old){targets.delete(frame);void target(frame);}
-  },()=>{if(targets.get(frame)===old){targets.delete(frame);void target(frame);}});
- }
- page.on('frameattached',frame=>{void target(frame);});page.on('framenavigated',refresh);
- await Promise.all(page.frames().map(target));
- const main=page.mainFrame(),mainTarget=await target(main);
  // The renderer cannot answer Page.getFrameTree while its own navigation is paused.
  // Bind the main CDP frame before navigation and keep requiring the matching network event.
  const {frameTree}=await mainTarget.session.send('Page.getFrameTree');
  const mainId=frameId(frameTree,main,main);
  if(!mainId)refuse();
- return {async authorize(request:Request){
-  const frame=request.frame(),origin=await target(frame);
+ const routes=new WeakMap<Request,number>();
+ return {
+ registerRoute(request:Request){
+  if(!routes.has(request))routes.set(request,iframeGuard.generation());
+ },
+ async authorize(request:Request){
+  // A replacement target cannot inherit a route that predates its attachment.
+  const generation=routes.get(request)??iframeGuard.generation();
+  const frame=request.frame(),origin=await target(frame,generation);
+  const tree=async()=>{
+   const {frameTree}=await origin.session.send('Page.getFrameTree');
+   if(origin.id!==undefined && frameTree.frame.id!==origin.id)return refuse();
+   return frameTree;
+  };
   let id:string;
   if(frame===main){
    if(page.mainFrame()!==main||main.isDetached()||origin!==mainTarget)refuse();
@@ -191,15 +202,15 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
      });
      const name=await readOwnerName();
      if(!name || !parent)return refuse();
-     const {frameTree}=await origin.session.send('Page.getFrameTree');
+     const frameTree=await tree();
      if(await owner.contentFrame()!==frame || await readOwnerName()!==name ||
         frame.parentFrame()!==parent || frame.isDetached())return refuse();
      id=frameId(frameTree,origin.root,frame,name);
     }finally{void owner.dispose().catch(()=>{});}
   }else{
-   const {frameTree}=await origin.session.send('Page.getFrameTree');
-   id=frameId(frameTree,origin.root,frame);
+   id=frameId(await tree(),origin.root,frame);
   }
+  if(!origin.current()||frame.isDetached())refuse();
   const matches=[...origin.requests.values()].filter(entry=>entry.frameId===id && entry.url===request.url() && entry.method===request.method());
   if(matches.length!==1 || matches[0]!.allowed || request.method()==='OPTIONS' && !matches[0]!.preflight)refuse();
   matches[0]!.allowed=true;

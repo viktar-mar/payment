@@ -427,6 +427,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   await context.route(guarded?'**/*':binding.endpoints.backend+'/**',route=>{
    const work=(async()=>{let routeCheckpoint:string|undefined;try{
     billingCheck(limits);if(failure)fail();const req=route.request(),url=req.url(),method=req.method();
+    redirects?.registerRoute(req);
     if(guarded){
      const target=new URL(url);
      if(target.origin===binding.endpoints.demo){
