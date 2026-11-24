@@ -829,7 +829,7 @@ async function failedRenewalCli(persistWebhookSecret=async()=>true,configureChil
 }
 
 const profileConfig='fake stripe cli project config\n',profileCredentials='{"fixture":"inert credential"}\n';
-async function failedRenewalProfile(t, retry=false) {
+async function failedRenewalProfile(t, acceptanceCase) {
   const f=await billingSetup(),priors=ROOT+'/test-results/stripe-sandbox',prior=randomUUID(),run=randomUUID();
   const cli=priors+'/'+run+'/cli',source=priors+'/'+prior+'/cli/config/stripe',destination=cli+'/config/stripe';
   t.after(()=>Promise.all([prior,run].map(id=>rm(priors+'/'+id,{recursive:true,force:true}))));
@@ -844,10 +844,11 @@ async function failedRenewalProfile(t, retry=false) {
     PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FAILED_RENEWAL:'true',
     PAYMENT_STRIPE_BILLING_FAILED_RENEWAL_CLI_PROFILE_RUN_ID:prior,
   },selectedCase:'initial_failed_renewal_grace_recovery',controlPort:18083,frozenTime:1790000000});
-  if(retry){
+  if(acceptanceCase){
+    const profileFlag=acceptanceCase==='initial_3ds'?'PAYMENT_STRIPE_BILLING_3DS_CLI_PROFILE_RUN_ID':'PAYMENT_STRIPE_BILLING_RETRY_CLI_PROFILE_RUN_ID';
     f.options.configuration.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',
-      PAYMENT_STRIPE_BILLING_CASE:'initial_decline_retry',PAYMENT_STRIPE_BILLING_RETRY_CLI_PROFILE_RUN_ID:prior};
-    f.options.configuration.selectedCase='initial_decline_retry';
+      PAYMENT_STRIPE_BILLING_CASE:acceptanceCase,[profileFlag]:prior};
+    f.options.configuration.selectedCase=acceptanceCase;
     delete f.options.configuration.controlPort;
     delete f.options.configuration.frozenTime;
   }
@@ -856,8 +857,8 @@ async function failedRenewalProfile(t, retry=false) {
   return {f,cli,source,destination};
 }
 
-for(const reason of ['valid','expired','extra scope','linked credentials'])test('initial retry reuses an isolated test-only profile: '+reason,async t=>{
-  const {f,source,destination}=await failedRenewalProfile(t,true);
+for(const selectedCase of ['initial_decline_retry','initial_3ds'])for(const reason of ['valid','expired','extra scope','linked credentials'])test(selectedCase+' reuses an isolated test-only profile: '+reason,async t=>{
+  const {f,source,destination}=await failedRenewalProfile(t,selectedCase);
   if(reason==='linked credentials')await link(source+'/credentials.json',source+'/linked.json');
   const execute=f.dependencies.execute;
   f.dependencies.execute=async(file,args,settings)=>{
@@ -885,9 +886,10 @@ for(const reason of ['valid','expired','extra scope','linked credentials'])test(
   assert.equal(await readFile(source+'/credentials.json','utf8'),profileCredentials);
 });
 
-test('initial retry owner carries a reused CLI binding through listener readiness',async t=>{
-  const {f,cli:cliDirectory}=await failedRenewalProfile(t,true);
-  const {createOwnedBillingDeclineRetry}=await import('./stripe-billing-acceptance.mjs');
+for(const selectedCase of ['initial_decline_retry','initial_3ds'])test(selectedCase+' carries a reused CLI binding through listener readiness',async t=>{
+  const {f,cli:cliDirectory}=await failedRenewalProfile(t,selectedCase);
+  const {createOwnedBillingDeclineRetry,createOwnedBillingInitial3ds}=await import('./stripe-billing-acceptance.mjs');
+  const createOwner=selectedCase==='initial_3ds'?createOwnedBillingInitial3ds:createOwnedBillingDeclineRetry;
   const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
   const events=[];
   const spawn=f.dependencies.spawn;
@@ -907,7 +909,7 @@ test('initial retry owner carries a reused CLI binding through listener readines
     },
     stop:async()=>{events.push('stop');return true;},
   };
-  const owner=await createOwnedBillingDeclineRetry(f.options.configuration,{
+  const owner=await createOwner(f.options.configuration,{
     preflight:async()=>true,createBootstrap:async()=>bootstrap,
     createCli:async options=>{f.adapter=await createBillingCliAdapter(options,f.dependencies);return f.adapter;},
     login:()=>assert.fail('saved profile must not prompt for a device code'),

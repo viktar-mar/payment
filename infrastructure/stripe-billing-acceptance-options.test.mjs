@@ -21,6 +21,36 @@ test('an explicit private bridge subnet belongs only to initial decline and retr
  }
  assert.equal(module.validateBillingAcceptanceOptions({...base,env:{...base.env,[key]:subnet}}),null);
 });
+test('initial 3DS admits its own saved Sandbox profile and aligned private bridge',()=>{
+ const base=options(),selectedCase='initial_3ds',profile='PAYMENT_STRIPE_BILLING_3DS_CLI_PROFILE_RUN_ID',subnet='PAYMENT_STRIPE_BILLING_3DS_SUBNET';
+ const env={...base.env,PAYMENT_STRIPE_BILLING_CASE:selectedCase,
+  [profile]:'22222222-3333-4444-8555-666666666666',[subnet]:'10.254.81.0/28'};
+ const input={...base,selectedCase,env};
+ assert.deepEqual(module.snapshotBillingAcceptanceEnvironment(env),env);
+ const admitted=module.validateBillingAcceptanceOptions(input);
+ assert.deepEqual(admitted?.env,env);
+ assert.deepEqual(admitted?.budget,{create:1,confirm:1,nextAction:1});
+ assert.deepEqual(module.validateBillingAcceptanceOptions(admitted),admitted);
+ for(const changed of [
+  {[profile]:'031b5ae7-6603-4339-b1b3-77231291ff34'}, {[profile]:base.runId}, {[profile]:'../private'},
+  {[subnet]:'192.168.81.0/28'}, {[subnet]:'10.254.81.1/28'}, {[subnet]:'10.254.81.0/24'},
+  {PAYMENT_STRIPE_BILLING_RETRY_CLI_PROFILE_RUN_ID:env[profile]},
+  {PAYMENT_STRIPE_BILLING_RETRY_SUBNET:env[subnet]},
+ ])assert.equal(module.validateBillingAcceptanceOptions({...input,env:{...env,...changed}}),null);
+ for(const other of ['initial_decline_retry','initial_cancel_withdraw','initial_missed_reordered']){
+  const changed={...env,PAYMENT_STRIPE_BILLING_CASE:other};
+  assert.equal(module.snapshotBillingAcceptanceEnvironment(changed),null);
+  assert.equal(module.validateBillingAcceptanceOptions({...input,env:changed,selectedCase:other}),null);
+ }
+ for(const key of [profile,subnet]){
+  const inherited=Object.assign(Object.create({[key]:env[key]}),env);
+  delete inherited[key];
+  assert.equal(module.snapshotBillingAcceptanceEnvironment(inherited),null);
+  const accessor={...env};
+  Object.defineProperty(accessor,key,{get(){assert.fail('runtime flag accessor invoked');},enumerable:true});
+  assert.equal(module.snapshotBillingAcceptanceEnvironment(accessor),null);
+ }
+});
 test('Billing own-data admission freezes fixed initial-success authority without reading accessors',()=>{
   assert.equal(typeof module.validateBillingAcceptanceOptions,'function');
   const input=options(),value=module.validateBillingAcceptanceOptions(input);assert.ok(value);

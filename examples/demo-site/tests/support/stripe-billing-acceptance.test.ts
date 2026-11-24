@@ -118,7 +118,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  function publish(request:Request, status:number, json:object|null) {
   const earlyInitial=fault.startsWith('early-static')&&request.url()===select;
   const earlySuccessor=fault.startsWith('successor-static-image')&&request.url().endsWith('/client-session');
-  const earlyStatic=declineRetry&&(earlyInitial||earlySuccessor);
+  const earlyStatic=((declineRetry||sca)&&earlyInitial)||(declineRetry&&earlySuccessor);
   const bodyAvailable=earlyStatic?Promise.withResolvers<void>():undefined;
   const response = {request:()=>request,url:()=>request.url(),status:()=>status,fromServiceWorker:()=>false,body:async()=>{
    if(request.url()===select && status!==200){
@@ -1040,6 +1040,26 @@ for(const fault of ['none','replayed-next-ack','foreign-next-pi','foreign-next-s
   assert.equal(f.providerSent.filter(x=>x.endsWith('/decision')).length,fault==='none'?1:0);
  });
 }
+
+for(const fault of ['create-pointer-lost','confirm-pointer-lost','early-static-image'])
+ test('initial 3DS survives the verified checkout race: '+fault,async t=>{
+  const f=cancellationPage(fault,false,true);
+  const fetch=t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
+   assert.equal(fault,'early-static-image');
+   assert.deepEqual(f.trace.filter(step=>['pinned asset intercepted','initial session body read','Pay'].includes(step)),
+    ['pinned asset intercepted','initial session body read']);
+   assert.equal(options.redirect,'error');
+   assert.equal(options.credentials,'omit');
+   return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+  });
+  assert.equal(await runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+3000},async()=>{},
+   origin=>origin==='https://private.example'),true);
+  assert.deepEqual(f.keysPressed,['Enter','Enter']);
+  assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+  assert.equal(f.providerSent.filter(url=>url.endsWith('/decision')).length,1);
+  assert.equal(fetch.mock.callCount(),fault==='early-static-image'?1:0);
+  if(fault==='early-static-image')assert.ok(f.presentation.includes('fulfilled 200'));
+ });
 
 for(const label of ['demo','js.stripe.com','otp','verify','read','create','selection','api.stripe.com','r.stripe.com','merchant-ui-api.stripe.com','token','confirm']){
  test('a response redirect never forwards the original '+label+' request to a second destination',async()=>{

@@ -1462,11 +1462,14 @@ test('Billing bootstrap is inert and keeps a seventh distinct grant key in owned
   await b.stop(LIMIT());
 });
 
-for(const matches of [true,false])test('the opt-in decline Retry subnet must match Docker IPAM: '+matches,async()=>{
- const subnet='10.254.76.0/28',selectedCase='initial_decline_retry',f=fixture();
+for(const [selectedCase,flag] of [
+ ['initial_decline_retry','PAYMENT_STRIPE_BILLING_RETRY_SUBNET'],
+ ['initial_3ds','PAYMENT_STRIPE_BILLING_3DS_SUBNET'],
+])for(const matches of [true,false])test('the owned subnet for '+selectedCase+' must match Docker IPAM: '+matches,async()=>{
+ const subnet='10.254.76.0/28',f=fixture();
  f.options.selectedCase=selectedCase;
  f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',
-  PAYMENT_STRIPE_BILLING_CASE:selectedCase,PAYMENT_STRIPE_BILLING_RETRY_SUBNET:subnet};
+  PAYMENT_STRIPE_BILLING_CASE:selectedCase,[flag]:subnet};
  const execute=f.dependencies.execute;
  f.dependencies.execute=async(file,args,settings)=>{
   const result=await execute(file,args,settings);
