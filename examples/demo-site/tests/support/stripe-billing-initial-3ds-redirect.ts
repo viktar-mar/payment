@@ -7,7 +7,7 @@ const stripeOrigins=['https://js.stripe.com','https://api.stripe.com','https://h
 type Origins={backend:string;demo:string};
 type Header={name:string;value:string};
 type Preflight={origin:string;method:string;names?:string};
-type Entry={url:string;method:string;frameId:string;allowed:boolean;preflight?:Preflight};
+type Entry={url:string;method:string;frameId:string;allowed:boolean;preflight?:Preflight;initiator?:{id:string;entry:Entry}};
 function stripeScript(url:URL){
  return url.protocol==='https:' && !url.port && !url.username && !url.password &&
   (url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com'));
@@ -78,9 +78,19 @@ export async function guardChallengeRedirects(page:Page,onFailure:()=>void,origi
   const requests=new Map<string,Entry>();let ready=false;
   session.on('Network.requestWillBeSent',event=>{
    if(!ready||!tracked(event.request.url))return;
-   if(!event.frameId || event.redirectResponse || requests.has(event.requestId) || requests.size>=24){onFailure();return;}
+   if(event.redirectResponse || requests.has(event.requestId) || requests.size>=24){onFailure();return;}
    const preflight=probe(event.request,event.initiator?.type,origins);
-   requests.set(event.requestId,{frameId:event.frameId,url:event.request.url,method:event.request.method,allowed:false,preflight});
+   let frameId=event.frameId,initiator:Entry['initiator'];
+   // Chromium can omit the preflight's frame ID before supplying it on the paired pause.
+   if(!frameId && preflight && event.initiator?.requestId){
+    const id=event.initiator.requestId,entry=requests.get(id);
+    if(entry && !entry.allowed && entry.url===event.request.url && entry.method===preflight.method){
+     frameId=entry.frameId;
+     initiator={id,entry};
+    }
+   }
+   if(!frameId){onFailure();return;}
+   requests.set(event.requestId,{frameId,url:event.request.url,method:event.request.method,allowed:false,preflight,initiator});
   });
   // Playwright 1.63 fulfills genuine browser preflights before exposing a user route.
   // A locally handled probe may finish without a response pause on this CDP target.
@@ -96,6 +106,10 @@ export async function guardChallengeRedirects(page:Page,onFailure:()=>void,origi
      const paused=probe(event.request,'preflight',origins),sent=original.preflight;
      if(!sent || !paused || paused.origin!==sent.origin || paused.method!==sent.method || paused.names!==sent.names ||
         !syntheticProbe(sent,event.responseStatusCode,event.responseHeaders))refuse();
+     if(original.initiator){
+      const {id,entry}=original.initiator;
+      if(requests.get(id)!==entry || entry.allowed)refuse();
+     }
     }else if(!original.allowed)refuse();
     requests.delete(event.networkId!);
     await session.send('Fetch.continueResponse',{requestId:event.requestId});
@@ -123,10 +137,22 @@ export async function guardChallengeRedirects(page:Page,onFailure:()=>void,origi
  }
  page.on('frameattached',frame=>{void target(frame);});page.on('framenavigated',refresh);
  await Promise.all(page.frames().map(target));
+ const main=page.mainFrame(),mainTarget=await target(main);
+ // The renderer cannot answer Page.getFrameTree while its own navigation is paused.
+ // Bind the main CDP frame before navigation and keep requiring the matching network event.
+ const {frameTree}=await mainTarget.session.send('Page.getFrameTree');
+ const mainId=frameId(frameTree,main,main);
+ if(!mainId)refuse();
  return {async authorize(request:Request){
-  const origin=await target(request.frame());
-  const {frameTree}=await origin.session.send('Page.getFrameTree');
-  const id=frameId(frameTree,origin.root,request.frame());
+  const frame=request.frame(),origin=await target(frame);
+  let id:string;
+  if(frame===main){
+   if(page.mainFrame()!==main||main.isDetached()||origin!==mainTarget)refuse();
+   id=mainId;
+  }else{
+   const {frameTree}=await origin.session.send('Page.getFrameTree');
+   id=frameId(frameTree,origin.root,frame);
+  }
   const matches=[...origin.requests.values()].filter(entry=>entry.frameId===id && entry.url===request.url() && entry.method===request.method());
   if(matches.length!==1 || matches[0]!.allowed || request.method()==='OPTIONS' && !matches[0]!.preflight)refuse();
   matches[0]!.allowed=true;

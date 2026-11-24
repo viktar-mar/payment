@@ -6,10 +6,10 @@ import {dirname,join} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {build} from 'vite';
 
-test('only the dedicated retry and 3DS builds configure the actual manager Stripe loader before Pay',async()=>{
+test('dedicated billing builds configure the manager before Pay and guarded builds avoid a favicon request',async()=>{
  const root=fileURLToPath(new URL('../..',import.meta.url)),temp=await mkdtemp(join(tmpdir(),'decline-retry-demo-'));
  try{
-  for(const mode of ['billing-decline-retry','billing-initial-3ds','production']){
+  for(const mode of ['billing-decline-retry','billing-initial-3ds','billing-invoice-webhooks','production']){
    const outDir=join(temp,mode);
    const sdkDir=dirname(fileURLToPath(import.meta.resolve('@generic-payments/sdk')));
    const loader=join(sdkDir,'providers','stripe-loader.js'),modules=new Set<string>();
@@ -28,6 +28,7 @@ test('only the dedicated retry and 3DS builds configure the actual manager Strip
    assert.equal([...modules].filter(id=>id.includes('/@stripe/stripe-js/')&&id.endsWith('/pure/index.js')).length,1);
    const html=await readFile(join(outDir,'index.html'),'utf8'),entry=/<script\b[^>]*src="\/(assets\/[\w.-]+\.js)"/.exec(html)?.[1];
    assert.ok(entry);
+   assert.equal(/<link rel="icon" href="data:,">/.test(html),['billing-initial-3ds','billing-invoice-webhooks'].includes(mode));
    const scripts:string[]=[];
    const document={
     querySelector:()=>null,querySelectorAll:()=>[],

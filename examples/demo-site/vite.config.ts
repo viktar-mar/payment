@@ -47,7 +47,12 @@ export default defineConfig(({mode}):UserConfig=>({
     ...(['billing-decline-retry','billing-initial-3ds','billing-invoice-webhooks'].includes(mode) ? [{
       name:'owned-decline-retry-loader',
       transformIndexHtml:{order:'pre',handler(_html,context){
-        if(context.path==='/index.html')return [{tag:'script',attrs:{type:'module',src:'/src/billing-decline-retry-loader.ts'},injectTo:'head-prepend'}];
+        if(context.path!=='/index.html')return;
+        return [
+          {tag:'script',attrs:{type:'module',src:'/src/billing-decline-retry-loader.ts'},injectTo:'head-prepend'},
+          // Chrome's implicit favicon request can bypass the user route in guarded checkout.
+          ...(mode==='billing-decline-retry'?[]:[{tag:'link',attrs:{rel:'icon',href:'data:,'}}]),
+        ];
       }},
     } satisfies import('vite').Plugin] : []),
     ...(['billing-first-payment','billing-failed-renewal'].includes(mode) ? [{

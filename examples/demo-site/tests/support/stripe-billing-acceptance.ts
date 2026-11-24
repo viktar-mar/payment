@@ -340,6 +340,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   },recordFailure):undefined;
   const winning=Promise.withResolvers<void>();
   const invalidate=()=>{recordFailure('BROWSER_INVALIDATED');abort();};
+  if(challenge||invoiceCase)checkpoint='BROWSER_SETUP';
   const redirects=challenge||invoiceCase?await guardChallengeRedirects(page,invalidate,binding.endpoints):undefined;
   const sca=challenge?initial3dsChallenge({page,limits,demo:binding.endpoints.demo,owner:()=>({secret:firstSecret,key:publishableKey??''}),
    stripeFrames:req=>stripeFrames(page,req,false,false,binding.endpoints.demo),authorizeResponse:req=>redirects!.authorize(req),check:checkManager,waitForGesture:challenge.waitForGesture,
@@ -516,16 +517,19 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    // The demo writes both product slots to the address on mount.
    subscription_product_2_id:'',
   }).toString();
+  if(bound)checkpoint='BROWSER_NAVIGATION';
   checkoutUrl=url.href;await page.goto(url.href,{timeout:duration(limits)});
   if(guarded){
    need(new URL(page.url()).origin===binding.endpoints.demo);
    page.on('framenavigated',frame=>{if(frame===page.mainFrame())invalidate();});
   }
+  if(bound)checkpoint='BROWSER_OTP_REQUEST';
   const widget=page.locator('generic-email-otp').first();
   await enterPrivateText(widget.getByRole('textbox',{name:'Email',exact:true}),binding.email);
   const otpChallenge=page.waitForResponse(r=>r.url()===otp&&r.request().method()==='POST',{timeout:duration(limits)});void otpChallenge.catch(()=>{});await widget.getByRole('button',{name:'Request code',exact:true}).click({timeout:duration(limits)});
   const challengeResponse=await otpChallenge;paired('challenge',challengeResponse);need(challengeResponse.status()===202);const challengeBody=await body(challengeResponse,limits);need(uuid(challengeBody.challenge_id));challengeId=challengeBody.challenge_id as string;
   await port.withOtpCode(async code=>{await enterPrivateText(widget.getByRole('textbox',{name:'Six-digit code',exact:true}),code);return true as const;},limits);
+  if(bound)checkpoint='BROWSER_OTP_VERIFY';
   const verification=page.waitForResponse(r=>r.url()===otp+'/'+challengeBody.challenge_id+'/verify'&&r.request().method()==='POST',{timeout:duration(limits)});void verification.catch(()=>{});
   const baseline=page.waitForResponse(r=>r.url().startsWith(base+'?')&&r.request().method()==='GET',{timeout:duration(limits)});void baseline.catch(()=>{});
   await widget.getByRole('button',{name:'Verify code',exact:true}).click({timeout:duration(limits)});const response=await verification;paired('verify',response);need(response.status()===200);const session=await body(response,limits),customer=session.customer;

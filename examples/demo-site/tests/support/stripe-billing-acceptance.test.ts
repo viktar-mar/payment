@@ -436,7 +436,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    return {on:(event:string,fn:(v:unknown)=>void)=>listeners.set(event,fn),send:async(command:string,args:{requestId?:string;patterns?:{urlPattern:string}[]})=>{
     if(command==='Fetch.enable')armedPatterns.set(f,args.patterns!.map(p=>p.urlPattern));
     if(command==='Fetch.failRequest')abortedPauses.add(args.requestId!);
-    if(command==='Page.getFrameTree')return {frameTree:{frame:{id:'frame',url:f.url(),name:f.name()}}};
+    if(command==='Page.getFrameTree')return {frameTree:{frame:{id:'frame',url:f.url()||'about:blank',name:f.name()}}};
    }};
   }}),
   mainFrame:()=>frame,url:()=>documentUrl,waitForFunction:async()=>{
