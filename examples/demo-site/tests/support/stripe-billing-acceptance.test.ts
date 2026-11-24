@@ -164,6 +164,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    existingResponse:()=>tokenResponse,
    allHeaders:async()=>{
     if(delay){delayedHeaders.resolve();await new Promise<void>(r=>{releaseFirstToken=r;});}
+    if(fault==='provider-route-cookie'&&url==='https://r.stripe.com/')return {cookie:'provider=demo'};
     return badSupport&&fault==='telemetry-auth'?{authorization:'Bearer '+token}:badSupport&&fault==='telemetry-cookie'?{cookie:'provider=demo'}:{origin:'https://js.stripe.com'};}} as unknown as Request;
   await handler({request:()=>request,fallback:async()=>{
    providerSent.push(url);await reply(tokenCall?'token':new URL(url).hostname,200);
@@ -318,6 +319,9 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
       action_available:directAction,next_action:directAction?{kind:'PROVIDER_CLIENT',secret:'bga1_'+'G'.repeat(43),expires_at:boundary}:null,browser_confirm_allowed:false});
      if(fault==='create-persist-pending'){void createSubscription().catch(()=>{});return;}
      await createSubscription();
+     if(fault==='provider-route-stripe-network')await provider('https://private-provider.stripe.network/?data=private-canary');
+     if(fault==='provider-route-frame')await provider('https://r.stripe.com/',frame);
+     if(fault==='provider-route-cookie')await provider('https://r.stripe.com/');
      const session=sessionFor(attempt!);
      if(fault.startsWith('early-static')&&fault.endsWith('-invalid-session'))session.capability='invalid';
      if(fault==='initial-session-wire-protocol')session.protocol='BROWSER_CONFIRM_V1';
@@ -1022,6 +1026,23 @@ test('a token intercepted on the first Pay cannot use the successor gesture afte
  assert.equal(f.trace.filter(x=>x==='Pay').length,2);
  assert.deepEqual(f.providerSent,['https://api.stripe.com/v1/confirmation_tokens']);
  assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+});
+
+for(const [fault,code] of Object.entries({
+ 'provider-route-stripe-network':'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK',
+ 'provider-route-frame':'BROWSER_PROVIDER_ROUTE_FRAME',
+ 'provider-route-cookie':'BROWSER_PROVIDER_AUTH',
+}))test('initial 3DS reports a safe provider refusal after CREATE: '+fault,async()=>{
+ const f=cancellationPage(fault,false,true);
+ await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+2000},async()=>{}),error=>{
+  assert.match(String(error),/^Error: billing_BROWSER$/);
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.ok(f.sent.includes(binding.endpoints.backend+'/api/v1/customer/subscriptions'));
+ assert.deepEqual(f.providerSent,['https://js.stripe.com/v3/']);
+ assert.ok(!f.trace.includes('Pay')&&!f.sent.some(url=>url.endsWith('/confirm')));
 });
 
 for(const fault of ['none','replayed-next-ack','foreign-next-pi','foreign-next-source','wrong-issuer-transaction','foreign-issuer-path','profile-retires','untrusted-issuer','substituted-issuer-form','premature-sdk-complete','same-url-issuer-replaced']){

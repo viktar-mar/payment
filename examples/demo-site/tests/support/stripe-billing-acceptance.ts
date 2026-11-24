@@ -350,34 +350,53 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     await billingBounded(limits,()=>winning.promise);
    },
   }):undefined;
-  async function providerTraffic(route:Route,url:URL) {
+  async function providerTraffic(route:Route,url:URL,report:(code:string)=>void) {
    const request=route.request(),method=request.method(),navigation=request.isNavigationRequest();
-   if(sca?.owns(url)){await sca.forward(route,url);return;}
+   if(sca?.owns(url)){report('BROWSER_PROVIDER_ROUTE_CHALLENGE');await sca.forward(route,url);return;}
    if(pinned && !providerNetworkOrigin(url) && !/(?:^|\.)stripe\.(?:com|network)$/.test(url.hostname) && matchesStaticOrigin!(url.origin)){
     await pinned.forward(route,url);return;
    }
-   need(providerNetworkOrigin(url) && !request.redirectedFrom() && ['GET','POST','OPTIONS'].includes(method));
+   if(!providerNetworkOrigin(url)){
+    const host=url.hostname;
+    report(url.protocol!=='https:'?'BROWSER_PROVIDER_ORIGIN_SCHEME':
+     url.port?'BROWSER_PROVIDER_ORIGIN_PORT':
+     url.username||url.password?'BROWSER_PROVIDER_USERINFO':
+     /(?:^|\.)stripe\.com$/.test(host)?'BROWSER_PROVIDER_ORIGIN_STRIPE_COM':
+     /(?:^|\.)stripe\.network$/.test(host)?'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK':'BROWSER_PROVIDER_ORIGIN_OTHER');
+    fail();
+   }
+   report('BROWSER_PROVIDER_REDIRECT');
+   need(!request.redirectedFrom());
+   report('BROWSER_PROVIDER_ROUTE_METHOD');
+   need(['GET','POST','OPTIONS'].includes(method));
    const script=stripeScriptOrigin(url),api=url.hostname==='api.stripe.com';
    const support=url.hostname==='r.stripe.com'||url.hostname==='merchant-ui-api.stripe.com';
    const preflight=method==='OPTIONS';
    const tokenPath=api && url.pathname==='/v1/confirmation_tokens';
+   report('BROWSER_PROVIDER_ROUTE_FRAME');
    const original=stripeFrames(page,request,navigation,script && method==='GET',binding.endpoints.demo);
    need(original && (!navigation || script && method==='GET'));
    const click=trustedPayClick,interceptedAttempt=attemptId;
    const samePay=()=>need(payInFlight && click && click===trustedPayClick && attemptId===interceptedAttempt);
-   if(tokenPath){samePay();need(await click!.evaluate(clicked=>clicked()));}
+   if(tokenPath){report('BROWSER_PROVIDER_ROUTE_PAY');samePay();need(await click!.evaluate(clicked=>clicked()));}
+   report('BROWSER_PROVIDER_HEADERS');
    const headers=await request.allHeaders();
+   report('BROWSER_PROVIDER_CURRENT');
    check();
    const sameFrames=()=>{
+    report('BROWSER_PROVIDER_ROUTE_FRAME');
     const current=stripeFrames(page,request,navigation,script && method==='GET',binding.endpoints.demo);
     need(current && original && current.target===original.target && current.frames.size===original.frames.size &&
      [...original.frames].every(([frame,href])=>current.frames.get(frame)===href));
    };
    sameFrames();
+   report('BROWSER_PROVIDER_AUTH');
    need(!headers.cookie && !headers['proxy-authorization'] &&
     (!headers.authorization || api && !preflight && publishableKey && headers.authorization==='Bearer '+publishableKey));
    const intended=preflight?headers['access-control-request-method']:method;
+   report('BROWSER_PROVIDER_ROUTE_METHOD');
    need(intended==='GET'||intended==='POST');
+   report('BROWSER_PROVIDER_ROUTE_POLICY');
    if(!script && headers.origin)need(headers.origin===new URL(request.frame().url()).origin);
    if(script)need(intended==='GET');
    else if(support){
@@ -392,9 +411,11 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     }else need(url.pathname==='/v1/elements/sessions');
    }else fail();
    if(redirects){
+    report('BROWSER_PROVIDER_ROUTE_GUARD');
     await redirects.authorize(request);check();sameFrames();
-    if(tokenPath){await checkManager();samePay();sameFrames();}
+    if(tokenPath){report('BROWSER_PROVIDER_ROUTE_PAY');await checkManager();samePay();sameFrames();}
    }
+   report('BROWSER_PROVIDER_FALLBACK');
    await route.fallback();
   }
   const check=()=>{billingCheck(limits);if(failure||abandoned)fail();};
@@ -413,7 +434,10 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
       if(redirects){await redirects.authorize(req);check();}
       await route.fallback();return;
      }
-     if(target.origin!==binding.endpoints.backend){routeCheckpoint='BROWSER_PROVIDER_ROUTE';await providerTraffic(route,target);return;}
+     if(target.origin!==binding.endpoints.backend){
+      routeCheckpoint='BROWSER_PROVIDER_ROUTE';
+      await providerTraffic(route,target,code=>{if(challenge)routeCheckpoint=code;});return;
+     }
      if(cancellation && !['GET','OPTIONS'].includes(method)){await cancellation.forward(route);return;}
     }
     const observingSession=exactInitialCheckout && !attemptId && method==='POST' && subscriptionId && operationId &&
