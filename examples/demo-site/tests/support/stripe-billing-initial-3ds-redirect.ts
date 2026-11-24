@@ -7,7 +7,7 @@ const stripeOrigins=['https://js.stripe.com','https://api.stripe.com','https://h
 type Origins={backend:string;demo:string};
 type Header={name:string;value:string};
 type Preflight={origin:string;method:string;names?:string};
-type Entry={url:string;method:string;frameId:string;allowed:boolean;preflight?:Preflight;initiator?:{id:string;entry:Entry}};
+type Entry={url:string;method:string;frameId?:string;allowed:boolean;preflight?:Preflight;initiator?:{id:string;entry?:Entry}};
 type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
  |'BROWSER_GUARD_RESPONSE_PAIR'|'BROWSER_GUARD_RESPONSE_REDIRECT'|'BROWSER_GUARD_RESPONSE_STATUS'|'BROWSER_GUARD_RESPONSE_NETWORK'
  |'BROWSER_GUARD_RESPONSE_PREFLIGHT'|'BROWSER_GUARD_RESPONSE_UNCLAIMED'|'BROWSER_GUARD_RESPONSE_RESUME';
@@ -55,6 +55,14 @@ function frameId(tree:Tree,root:Frame,frame:Frame):string {
  return tree.frame.id;
 }
 
+function bindPreflightInitiator(preflight:Entry,entry:Entry):boolean{
+ if(!preflight.initiator || !preflight.preflight || !entry.frameId || entry.allowed ||
+    entry.url!==preflight.url || entry.method!==preflight.preflight.method)return false;
+ preflight.frameId=entry.frameId;
+ preflight.initiator.entry=entry;
+ return true;
+}
+
 /** Playwright routes only the first URL in a redirect chain. Arm a response-stage guard
  * before each SDK request exists and require its passive network event on the exact frame. */
 export async function guardChallengeRedirects(page:Page,onFailure:(reason:RedirectGuardFailure)=>void,origins:Origins){
@@ -85,17 +93,21 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
    if(requests.has(event.requestId)){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
    if(requests.size>=24){onFailure('BROWSER_GUARD_REQUEST_CAPACITY');return;}
    const preflight=probe(event.request,event.initiator?.type,origins);
-   let frameId=event.frameId,initiator:Entry['initiator'];
-   // Chromium can omit the preflight's frame ID before supplying it on the paired pause.
-   if(!frameId && preflight && event.initiator?.requestId){
-    const id=event.initiator.requestId,entry=requests.get(id);
-    if(entry && !entry.allowed && entry.url===event.request.url && entry.method===preflight.method){
-     frameId=entry.frameId;
-     initiator={id,entry};
-    }
+   const entry:Entry={frameId:event.frameId,url:event.request.url,method:event.request.method,allowed:false,preflight};
+   if(!entry.frameId){
+    // Chrome may report a frameless preflight before the linked initiating request.
+    // Record the exact identifier, but require its frame and the synthetic 204 at the pause.
+    const id=event.initiator?.requestId;
+    if(!preflight || !id || id===event.requestId){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
+    entry.initiator={id};
+    const existing=requests.get(id);
+    if(existing && !bindPreflightInitiator(entry,existing)){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
    }
-   if(!frameId){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
-   requests.set(event.requestId,{frameId,url:event.request.url,method:event.request.method,allowed:false,preflight,initiator});
+   for(const request of requests.values()){
+    if(request.initiator?.id===event.requestId && !request.initiator.entry &&
+       !bindPreflightInitiator(request,entry)){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
+   }
+   requests.set(event.requestId,entry);
   });
   // Playwright 1.63 fulfills genuine browser preflights before exposing a user route.
   // A locally handled probe may finish without a response pause on this CDP target.
@@ -105,7 +117,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
    let reason:RedirectGuardFailure='BROWSER_GUARD_RESPONSE_PAIR';
    try{
     const original=event.networkId && requests.get(event.networkId);
-    if(!original || original.frameId!==event.frameId || original.url!==event.request.url ||
+    if(!original || !original.frameId || original.frameId!==event.frameId || original.url!==event.request.url ||
        original.method!==event.request.method)return refuse();
     if(event.responseErrorReason){reason='BROWSER_GUARD_RESPONSE_NETWORK';refuse();}
     const status=event.responseStatusCode;
@@ -120,7 +132,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
         !syntheticProbe(sent,event.responseStatusCode,event.responseHeaders))refuse();
      if(original.initiator){
       const {id,entry}=original.initiator;
-      if(requests.get(id)!==entry || entry.allowed)refuse();
+      if(!entry || requests.get(id)!==entry || entry.allowed)refuse();
      }
     }else if(!original.allowed){reason='BROWSER_GUARD_RESPONSE_UNCLAIMED';refuse();}
     requests.delete(event.networkId!);

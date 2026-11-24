@@ -85,7 +85,7 @@ for(const mode of ['valid','script options','unbound request','credential','body
  });
 }
 
-for(const mode of ['paired','missing initiator','wrong target','wrong method','different response frame','replaced initiator'])
+for(const mode of ['paired','preflight first','missing initiator','wrong target','wrong method','different response frame','replaced initiator','first initiator replaced','pause before initiator'])
  test('a preflight without frameId requires the exact initiating request: '+mode,async()=>{
   const url=origins.backend+'/auth',commands:string[]=[],events=new Map<string,(e:unknown)=>Promise<void>|void>();
   const frame={url:()=>origins.demo,name:()=>'',parentFrame:()=>null,isDetached:()=>false};
@@ -99,10 +99,12 @@ for(const mode of ['paired','missing initiator','wrong target','wrong method','d
   const network=events.get('Network.requestWillBeSent')!;
   const post={frameId:'checkout',requestId:'post',request:{url:mode==='wrong target'?url+'/other':url,
    method:mode==='wrong method'?'GET':'POST'}};
-  network(post);
+  const preflightFirst=['preflight first','first initiator replaced','pause before initiator'].includes(mode);
+  if(!preflightFirst)network(post);
   const request={url,method:'OPTIONS',headers:{Origin:origins.demo,'Access-Control-Request-Method':'POST'}};
   network({requestId:'probe',initiator:{type:'preflight',requestId:mode==='missing initiator'?'other':'post'},request});
-  if(mode==='replaced initiator'){
+  if(preflightFirst&&mode!=='pause before initiator')network(post);
+  if(mode==='replaced initiator'||mode==='first initiator replaced'){
    events.get('Network.loadingFailed')!({requestId:'post'});
    network(post);
   }
@@ -111,9 +113,10 @@ for(const mode of ['paired','missing initiator','wrong target','wrong method','d
     {name:'Access-Control-Allow-Origin',value:origins.demo},{name:'Access-Control-Allow-Methods',value:'POST'},
     {name:'Access-Control-Allow-Credentials',value:'true'},
    ]});
-  assert.equal(rejected,mode!=='paired');
-  assert.equal(commands.includes('Fetch.continueResponse'),mode==='paired');
-  if(mode==='paired'){
+  const released=['paired','preflight first'].includes(mode);
+  assert.equal(rejected,!released);
+  assert.equal(commands.includes('Fetch.continueResponse'),released);
+  if(released){
    // A successful preflight grants no authority to the POST itself.
    await events.get('Fetch.requestPaused')!({networkId:'post',requestId:'post-paused',frameId:'checkout',
     request:{url,method:'POST'},responseStatusCode:200});
