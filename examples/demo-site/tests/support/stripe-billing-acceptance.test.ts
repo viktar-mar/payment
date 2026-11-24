@@ -63,11 +63,14 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const presentation:string[]=[];
  async function staticPresentation(){
   const document=!fault.startsWith('static-image') && !fault.startsWith('early-static-image') && !fault.startsWith('successor-static-image');
-  const nested={parentFrame:()=>stripeFrame,page:()=>page,isDetached:()=>false,url:()=>''};
+  const nested={parentFrame:()=>fault==='static-nav-direct-child'?frame:stripeFrame,page:()=>page,isDetached:()=>false,url:()=>''};
   const request={url:()=>document?'https://private.example/presentation?frame=1':
     'https://private.example/image.png'+(fault==='static-image-query'?'?value=private-canary':''),
    method:()=>fault==='static-method'?'POST':'GET',
-   frame:()=>fault==='static-main-navigation'?frame:document?nested:stripeFrame,
+   frame:()=>{
+    if(fault==='static-nav-unavailable')throw Error('private frame canary');
+    return fault==='static-main-navigation'?frame:document?nested:stripeFrame;
+   },
    resourceType:()=>{
     if(fault==='static-image-frame-before-fetch')queueMicrotask(()=>{pinnedFrameChanged=true;});
     return document?'document':fault==='static-image-kind'?'xhr':'image';
@@ -81,8 +84,14 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   },fulfill:async(reply:{status:number})=>{presentation.push('fulfilled '+reply.status);}} as unknown as Route);
  }
  const frame = {name:()=>'',page:()=>page,isDetached:()=>false,url:()=>documentUrl};
- const stripeFrame = {name:()=>'stripe',page:()=>page,isDetached:()=>verified&&fault==='detached',
-  url:()=>verified&&fault==='wrong-parent'?'https://unowned.invalid/':pinnedFrameChanged?'https://js.stripe.com/v3/replaced.html':'https://js.stripe.com/v3/frame.html',parentFrame:()=>frame};
+ const stripeFrame = {name:()=>'stripe',page:()=>fault==='static-image-foreign-page'?{}:page,
+  isDetached:()=>fault==='static-image-detached'||verified&&fault==='detached',
+  url:()=>{
+   if(fault==='static-image-uncommitted')return '';
+   if(fault==='static-image-blank')return 'about:blank';
+   if(verified&&fault==='wrong-parent')return 'https://unowned.invalid/';
+   return pinnedFrameChanged?'https://js.stripe.com/v3/replaced.html':'https://js.stripe.com/v3/frame.html';
+  },parentFrame:()=>frame};
  const providerSent:string[]=[];
  let releaseFirstToken:undefined|(()=>void),delayedToken:Promise<void>|undefined;
  const delayedHeaders=Promise.withResolvers<void>();
@@ -123,6 +132,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    setImmediate(()=>{
     if(fault==='early-static-navigation')navigate(frame);
     if(fault==='early-static-image-frame-changed')pinnedFrameChanged=true;
+    if(fault==='early-static-image-same-url-navigation'||fault==='early-static-nav-parent-same-url')navigate(stripeFrame);
     bodyAvailable.resolve();
    });
   }
@@ -424,7 +434,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   beforeCancellation:async(kind:string,key:string)=>{trace.push('persist '+kind+' '+key);return fault!=='persist';},
   verifyCancellation:async(kind:string,operation:string)=>{trace.push('verify '+kind+' '+operation);return fault!=='proof';}
  } as BillingCancellationPort&BillingDeclineRetryPort&BillingInitial3dsPort&BillingInvoiceWebhooksPort;
- return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,presentation,sessionErrorBodyReads:()=>sessionErrorBodyReads,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed};
+ return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,presentation,sessionErrorBodyReads:()=>sessionErrorBodyReads,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),reloadStripe:()=>navigate(stripeFrame),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed};
 }
 test('same-page manager schedules and withdraws once after the initial paid proof',async()=>{
  const f=cancellationPage();
@@ -540,7 +550,8 @@ for(const [fault,expected] of [
  ['early-static-image-before-session','BROWSER_PINNED_PHASE'],
  ['early-static-image-unpaired','BROWSER_SESSION_UNPAIRED'],
  ['early-static-image-http-conflict','BROWSER_SESSION_HTTP_CONFLICT'],
- ['early-static-image-frame-changed','BROWSER_PINNED_FRAME'],
+ ['early-static-image-frame-changed','BROWSER_PINNED_FRAME_ASSET_FETCH_CHANGED'],
+ ['early-static-image-same-url-navigation','BROWSER_PINNED_FRAME_ASSET_FETCH_CHANGED'],
 ] as const)test('an early pinned asset stays closed at '+fault,async t=>{
  const f=cancellationPage(fault,true);
  const fetch=t.mock.method(globalThis,'fetch',async()=>assert.fail('unverified image must not be fetched'));
@@ -550,6 +561,19 @@ for(const [fault,expected] of [
   return true;
  });
  assert.equal(fetch.mock.callCount(),0);
+ assert.ok(!f.trace.includes('Pay'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('a same-url parent navigation retires the pinned document before the local block',async t=>{
+ const f=cancellationPage('early-static-nav-parent-same-url',true);
+ const fetch=t.mock.method(globalThis,'fetch',async()=>assert.fail('document must never be fetched'));
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_PINNED_FRAME_NAV_BLOCK_CHANGED');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(fetch.mock.callCount(),0);
+ assert.deepEqual(f.presentation,['abort failed']);
  assert.ok(!f.trace.includes('Pay'));
  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
 });
@@ -717,12 +741,18 @@ for(const mode of ['static-block','static-image','static-duplicate','static-fore
 }
 
 for(const [fault,code] of [
- ['static-main-navigation','BROWSER_PINNED_FRAME'],
+ ['static-main-navigation','BROWSER_PINNED_FRAME_NAV_CAPTURE_MAIN'],
+ ['static-nav-unavailable','BROWSER_PINNED_FRAME_NAV_CAPTURE_LOOKUP'],
+ ['static-nav-direct-child','BROWSER_PINNED_FRAME_NAV_CAPTURE_PARENT'],
+ ['static-image-uncommitted','BROWSER_PINNED_FRAME_ASSET_CAPTURE_UNCOMMITTED'],
+ ['static-image-blank','BROWSER_PINNED_FRAME_ASSET_CAPTURE_DOCUMENT'],
+ ['static-image-detached','BROWSER_PINNED_FRAME_ASSET_CAPTURE_DETACHED'],
+ ['static-image-foreign-page','BROWSER_PINNED_FRAME_ASSET_CAPTURE_FOREIGN_PAGE'],
  ['static-credentials','BROWSER_PINNED_CREDENTIALS'],
  ['static-method','BROWSER_PINNED_METHOD'],
  ['static-image-query','BROWSER_PINNED_ASSET_URL'],
  ['static-image-kind','BROWSER_PINNED_ASSET_KIND'],
- ['static-image-frame-before-fetch','BROWSER_PINNED_FRAME'],
+ ['static-image-frame-before-fetch','BROWSER_PINNED_FRAME_ASSET_FETCH_CHANGED'],
 ] as const)test('decline retry reports the pinned request failure for '+fault,async t=>{
  const f=cancellationPage(fault,true);
  const asset=t.mock.method(globalThis,'fetch',async()=>assert.fail('unowned asset transport'));
@@ -733,6 +763,22 @@ for(const [fault,code] of [
   return true;
  });
  assert.equal(asset.mock.callCount(),0);
+ assert.ok(!f.trace.includes('Pay'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('a same-url navigation during transport prevents the pinned response from reaching a new document',async t=>{
+ const f=cancellationPage('static-image',true);
+ const asset=t.mock.method(globalThis,'fetch',async()=>{
+  f.reloadStripe();
+  return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+ });
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},o=>o==='https://private.example'),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_PINNED_FRAME_ASSET_FULFILL_CHANGED');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(asset.mock.callCount(),1);
+ assert.deepEqual(f.presentation,['abort failed']);
  assert.ok(!f.trace.includes('Pay'));
  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
 });

@@ -43,15 +43,17 @@ test('the closed failed owner supplies only its finite phase, code and cleanup t
  const {runDeclineRetryCase}=await import('./stripe-billing-decline-retry-terminal.ts');
  const reporter=new Reporter(),lines:string[]=[];
  const terminal={scope:'INITIAL_DECLINE_RETRY',status:'CLOSED',phase:'RETRY_EVIDENCE',code:'RETRY_EVIDENCE',initialAccepted:false,declineRetryAccepted:false,full5bAccepted:false,cleanupConfirmed:true,runId:'private-id'};
- for(const mode of ['original','replaced-result','duplicate','preexisting','failed-close','canary','browser-session','browser-pinned']){
+ for(const mode of ['original','replaced-result','duplicate','preexisting','failed-close','canary','browser-session','browser-pinned','browser-frame','frame-detail-canary']){
   const report=mode==='original'?reporter:new Reporter();
-  const browserCode=mode==='browser-session'?'BROWSER_SESSION_REQUEST_REJECTED':mode==='browser-pinned'?'BROWSER_PINNED_ASSET_MEDIA':null;
+  const browserCode=mode==='browser-session'?'BROWSER_SESSION_REQUEST_REJECTED':mode==='browser-pinned'?'BROWSER_PINNED_ASSET_MEDIA':
+   mode==='browser-frame'?'BROWSER_PINNED_FRAME_ASSET_FULFILL_CHANGED':null;
   const t={expectedStatus:'passed',title:'OWNED_INITIAL_DECLINE_RETRY',location:{file:fileURLToPath(new URL('../stripe-billing-decline-retry.spec.ts',import.meta.url))},
    parent:{project:()=>({name:'owned-initial-decline-retry'})},annotations:[]} as unknown as TestCase;
   const r={retry:0,status:'failed',annotations:[]} as unknown as TestResult;
   const owner={run:async()=>{throw Error('raw-provider-canary');},resources:()=>terminal,close:async()=>{
    if(mode==='failed-close')throw Error('raw-close-canary');
    if(browserCode)return {...terminal,phase:'RETRY_ACK',code:browserCode};
+   if(mode==='frame-detail-canary')return {...terminal,phase:'RETRY_ACK',code:'BROWSER_PINNED_FRAME_ASSET_CAPTURE_PRIVATE_CANARY'};
    return mode==='canary'?{...terminal,code:'raw-canary'}:terminal;
   }};
   if(mode==='preexisting')r.annotations.push({type:'owned-decline-retry-terminal',description:'private'});

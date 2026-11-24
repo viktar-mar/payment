@@ -33,27 +33,42 @@ export function staticNavigationTarget(request:Request,page:Page) {
     return isStripeScriptDocument(parent.url())?'STRIPE_PARENT':'OTHER_PARENT';
   }catch{return 'FRAME_UNAVAILABLE';}
 }
-export function stripeFrameChain(page:Page,start:()=>Frame|null) {
+type FrameIssue='LOOKUP'|'MAIN'|'FOREIGN_PAGE'|'DETACHED'|'CHECKOUT'|'PARENT'|'CYCLE'|'UNCOMMITTED'|'DOCUMENT'|'CHANGED';
+type ReportFrameIssue=(issue:FrameIssue)=>void;
+function rejectFrame(report:ReportFrameIssue|undefined,issue:FrameIssue):undefined {
+  report?.(issue);
+  return undefined;
+}
+export function stripeFrameChain(page:Page,start:()=>Frame|null,report?:ReportFrameIssue) {
   try{
     const chain:{frame:Frame;href:string}[]=[],main=page.mainFrame();
     const visited=new Set<Frame>();
     for(let frame=start();frame!==main;frame=frame.parentFrame()){
-      if(!frame || visited.has(frame) || frame.page()!==page || frame.isDetached())return undefined;
+      if(!frame)return rejectFrame(report,'PARENT');
+      if(visited.has(frame))return rejectFrame(report,'CYCLE');
+      if(frame.page()!==page)return rejectFrame(report,'FOREIGN_PAGE');
+      if(frame.isDetached())return rejectFrame(report,'DETACHED');
       const href=frame.url();
-      if(!isStripeScriptDocument(href))return undefined;
+      if(href==='')return rejectFrame(report,'UNCOMMITTED');
+      if(!isStripeScriptDocument(href))return rejectFrame(report,'DOCUMENT');
       visited.add(frame);
       chain.push({frame,href});
     }
-    return chain.length?chain:undefined;
-  }catch{return undefined;}
+    return chain.length?chain:rejectFrame(report,'MAIN');
+  }catch{return rejectFrame(report,'LOOKUP');}
 }
-export function stripeNavigationChain(request:Request,page:Page,checkoutUrl:string) {
+export function stripeNavigationChain(request:Request,page:Page,checkoutUrl:string,report?:ReportFrameIssue) {
   try{
     const target=request.frame(),main=page.mainFrame();
-    if(target===main || target.page()!==page || target.isDetached() || main.page()!==page || main.isDetached() || main.url()!==checkoutUrl)return;
-    const parents=stripeFrameChain(page,()=>target.parentFrame());
+    if(target===main)return rejectFrame(report,'MAIN');
+    if(target.page()!==page || main.page()!==page)return rejectFrame(report,'FOREIGN_PAGE');
+    if(target.isDetached() || main.isDetached())return rejectFrame(report,'DETACHED');
+    if(main.url()!==checkoutUrl)return rejectFrame(report,'CHECKOUT');
+    const parent=target.parentFrame();
+    if(!parent || parent===main)return rejectFrame(report,'PARENT');
+    const parents=stripeFrameChain(page,()=>parent,report);
     if(parents)return {target,main,parents};
-  }catch{}
+  }catch{return rejectFrame(report,'LOOKUP');}
 }
 export function sameStripeFrames(before:NonNullable<ReturnType<typeof stripeFrameChain>>,after:ReturnType<typeof stripeFrameChain>) {
   return after && after.length===before.length &&
@@ -100,12 +115,20 @@ export async function fetchStaticAsset(url:URL,media:string[],origin:string|unde
 
 type PresentationPhase='initial'|'successor';
 type PendingPresentation={phase:PresentationPhase;ready:Promise<void>};
+type FrameStage='NAV_CAPTURE'|'NAV_BLOCK'|'ASSET_CAPTURE'|'ASSET_FETCH'|'ASSET_FULFILL';
 
 /** The one local block can only occur on the first form, before its Pay gesture. */
 export function pinnedRetryPresentation(page:Page,checkout:()=>string,limits:BillingLimits,
  form:()=>PresentationPhase|undefined,beforePay:()=>boolean,
  pendingForm:(kind:'document'|'asset')=>PendingPresentation|undefined,onFailure:(code:string)=>void){
  const pending=new Set<Promise<void>>();
+ const navigations=new WeakMap<Frame,number>();
+ // Playwright can retain the same Frame and URL across document navigations.
+ page.on('framenavigated',frame=>navigations.set(frame,(navigations.get(frame)??0)+1));
+ const captureDocumentVersions=(frames:Frame[])=>{
+  const versions=frames.map(frame=>[frame,navigations.get(frame)] as const);
+  return ()=>versions.every(([frame,version])=>navigations.get(frame)===version);
+ };
  let used=false,block:{request:Request;confirm:()=>void}|undefined;
  page.on('requestfailed',request=>{
   if(block && request===block.request && form()==='initial' && beforePay() &&
@@ -114,6 +137,7 @@ export function pinnedRetryPresentation(page:Page,checkout:()=>string,limits:Bil
  async function handle(route:Route,url:URL,checkpoint:(code:string)=>void){
   const request=route.request(),phaseAtRequest=form(),raw=request.url();
   const navigation=request.isNavigationRequest();
+  const frameCheck=(stage:FrameStage)=>(issue:FrameIssue)=>checkpoint('BROWSER_PINNED_FRAME_'+stage+'_'+issue);
   checkpoint('BROWSER_PINNED_PHASE');
   const staged=phaseAtRequest===undefined && (!navigation || request.resourceType()==='document')
    ?pendingForm(navigation?'document':'asset'):undefined;
@@ -124,10 +148,16 @@ export function pinnedRetryPresentation(page:Page,checkout:()=>string,limits:Bil
   checkpoint('BROWSER_PINNED_AUTHORITY');
   need(plainHttpsAuthority.test(raw) && url.protocol==='https:' && !url.username && !url.password && !url.port);
   checkpoint('BROWSER_PINNED_REDIRECT');need(!request.redirectedFrom());
-  checkpoint('BROWSER_PINNED_FRAME');
-  const originalNavigation=navigation?stripeNavigationChain(request,page,checkout()):undefined;
-  const frames=navigation?undefined:stripeFrameChain(page,()=>request.frame());
-  need(navigation?originalNavigation:frames);
+  const capture=frameCheck(navigation?'NAV_CAPTURE':'ASSET_CAPTURE');
+  capture('LOOKUP');
+  const originalNavigation=navigation?stripeNavigationChain(request,page,checkout(),capture):undefined;
+  const frames=navigation?undefined:stripeFrameChain(page,()=>request.frame(),capture);
+  const originalChain=originalNavigation?.parents??frames;
+  need(originalChain);
+  const originalMain=originalNavigation?.main??page.mainFrame();
+  const owners=[originalMain,...originalChain.map(({frame})=>frame)];
+  if(originalNavigation)owners.push(originalNavigation.target);
+  const sameDocuments=captureDocumentVersions(owners);
   checkpoint('BROWSER_PINNED_HEADERS');
   const headers=await request.allHeaders();
   checkpoint('BROWSER_PINNED_CURRENT');
@@ -153,10 +183,13 @@ export function pinnedRetryPresentation(page:Page,checkout:()=>string,limits:Bil
     await billingBounded(limits,()=>{
      checkpoint('BROWSER_PINNED_CURRENT');
      need(form()==='initial' && beforePay());
-     checkpoint('BROWSER_PINNED_FRAME');
-     const current=stripeNavigationChain(request,page,checkout());
-     need(current && current.main===originalNavigation.main && current.target===originalNavigation.target &&
-      sameStripeFrames(originalNavigation.parents,current.parents));
+     const recheck=frameCheck('NAV_BLOCK');
+     recheck('LOOKUP');
+     const current=stripeNavigationChain(request,page,checkout(),recheck);
+     need(current);
+     recheck('CHANGED');
+     need(current.main===originalNavigation.main && current.target===originalNavigation.target &&
+      sameStripeFrames(originalNavigation.parents,current.parents) && sameDocuments());
      checkpoint('BROWSER_PINNED_DOCUMENT_BLOCK');
      block={request,confirm:event.resolve};
      return Promise.all([route.abort('blockedbyclient'),event.promise]);
@@ -166,25 +199,29 @@ export function pinnedRetryPresentation(page:Page,checkout:()=>string,limits:Bil
    return;
   }
   checkpoint('BROWSER_PINNED_ASSET_URL');need(url.href===url.origin+url.pathname);
-  checkpoint('BROWSER_PINNED_FRAME');need(frames);
+  need(frames);
   checkpoint('BROWSER_PINNED_ASSET_ORIGIN');need(!('origin' in headers)||headers.origin===new URL(frames[0]!.href).origin);
   const resource=request.resourceType();
   checkpoint('BROWSER_PINNED_ASSET_KIND');need(staticAssets.some(a=>a.resource===resource));
   const asset=staticAssets.find(a=>a.resource===resource && url.pathname.endsWith(a.suffix));
   checkpoint('BROWSER_PINNED_ASSET_SUFFIX');
   need(asset);
-  const checkFrames=()=>{
+  const checkFrames=(stage:'ASSET_FETCH'|'ASSET_FULFILL')=>{
    checkpoint('BROWSER_PINNED_CURRENT');
    billingCheck(limits);need(form()===phase && page.mainFrame().url()===checkout());
-   checkpoint('BROWSER_PINNED_FRAME');
-   need(sameStripeFrames(frames,stripeFrameChain(page,()=>request.frame())));
+   const recheck=frameCheck(stage);
+   recheck('LOOKUP');
+   const current=stripeFrameChain(page,()=>request.frame(),recheck);
+   need(current);
+   recheck('CHANGED');
+   need(page.mainFrame()===originalMain && sameStripeFrames(frames,current) && sameDocuments());
   };
   checkpoint('BROWSER_PINNED_ASSET_TRANSPORT');
   await billingBounded(limits,async bounded=>{
-   checkFrames();
+   checkFrames('ASSET_FETCH');
    checkpoint('BROWSER_PINNED_ASSET_TRANSPORT');
    const reply=await fetchStaticAsset(url,asset.media,headers.origin,bounded.signal!,step=>checkpoint('BROWSER_PINNED_ASSET_'+step));
-   billingCheck(bounded);checkFrames();
+   billingCheck(bounded);checkFrames('ASSET_FULFILL');
    checkpoint('BROWSER_PINNED_ASSET_FULFILL');
    await route.fulfill({...reply,status:200});
   });

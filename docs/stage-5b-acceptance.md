@@ -24,6 +24,10 @@ Run `fc524c05-daef-4f12-9d6a-e003df9a8adf` at `e4b1b21` reused the saved authori
 
 An offline fixture reproduced this code when an otherwise admissible image arrived after the exact session HTTP 200 but before the browser controller validated its body. The fixture reproduced the ordering for both initial and successor sessions. For initial decline and Retry, eligible resource requests can now wait for the corresponding validated session and the original frame chain is checked again immediately before transport and delivery. Pay waits for already intercepted resources and rechecks the manager's authority. New fixed checkpoints identify the failed phase, frame, request policy, local document block or asset response. Only checkpoint codes reach the report. The historical request's exact failure remains undetermined.
 
+Run `75c5bc59-df07-4ba5-ad53-957df4472898` at `2b53b09` recorded CREATE_ACK and stopped with `phase=RETRY_ACK code=BROWSER_PINNED_FRAME cleanup=CONFIRMED`. The run journal contains no confirmation or Retry dispatch. The aggregate code covers the initial frame lookup, the check before blocking a nested document, and checks before fetching or delivering an asset. The saved report lacks the failing predicate.
+
+Offline tests reproduced a separate defect when Playwright kept the same frame object and URL across a navigation. The original comparison accepted the request after that navigation. The decline/Retry runner now also checks for navigation in the captured chain before blocking a nested document, before fetching an asset, and before delivering its response. Fixed categories identify the stage and frame check without logging the URL or exception text. Initial decline and Retry still need a native receipt.
+
 ## Earlier local recovery evidence on 2026-11-23
 
 Run `c2dfc733-6915-45b8-8aa5-3792ccb31f42` at `0449bdd` passed the initial payment, declined renewal, grace checks and replacement-method confirmation. The exact Stripe Sandbox request log showed that the invoice-created PaymentIntent refused `error_on_requires_action`. Both the local runner and Stripe stopped that request.
