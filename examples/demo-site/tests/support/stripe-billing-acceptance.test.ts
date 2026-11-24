@@ -183,7 +183,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   if(closed)throw new Error('closed');
  }
  const issuerUrl='https://hooks.stripe.com/test-fixture?run=one',actionUrl='https://hooks.stripe.com/test-fixture/decision';
- let issuerDocument='about:blank',trustedIssuer=false;
+ let issuerDocument='about:blank',issuerNonce:string|undefined;
+ let issuerReceipt:((source:{page:unknown;frame:unknown},nonce:unknown)=>void)|undefined;
  const ancestor=(name:string,href:string,parent:unknown)=>({page:()=>page,isDetached:()=>false,url:()=>href,name:()=>name,parentFrame:()=>parent});
  const outer=ancestor('__privateStripeFrame7','https://js.stripe.com/v3/three-ds-2-challenge-fixture.html',frame);
  const inner=ancestor('stripe-challenge-frame','https://js.stripe.com/v3/fixture-inner.html',outer);
@@ -193,8 +194,19 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    assert.equal(role,'button');assert.deepEqual(opts,{name:'Complete',exact:true});
    return {count:async()=>1,waitFor:async()=>{},elementHandle:async()=>({
     ownerFrame:async()=>issuer,isVisible:async()=>true,isEnabled:async()=>true,
-    evaluate:async()=>({action:actionUrl,bodyHash:createHash('sha256').update('decision=complete').digest('hex')}),evaluateHandle:async()=>({evaluate:async()=>trustedIssuer}),
-    click:async()=>{trace.push('issuer Complete');trustedIssuer=fault!=='untrusted-issuer';
+    evaluate:async(_fn:unknown,arm?:{name:string;nonce:string})=>{
+     if(arm){assert.equal(arm.name,'__billingIssuerComplete');issuerNonce=arm.nonce;return;}
+     return {action:actionUrl,bodyHash:createHash('sha256').update('decision=complete').digest('hex')};
+    },
+    click:async()=>{
+     trace.push('issuer Complete');
+     if(fault!=='untrusted-issuer'){
+      assert.ok(issuerReceipt && issuerNonce);
+      const source={page,frame:fault==='foreign-issuer-witness'?stripeFrame:issuer};
+      const receipt=issuerReceipt,nonce=fault==='wrong-issuer-nonce'?'foreign':issuerNonce;
+      if(fault==='late-issuer-witness')setImmediate(()=>receipt(source,nonce));
+      else receipt(source,nonce);
+     }
      if(fault==='premature-sdk-complete'){await wire('https://api.stripe.com/v1/3ds2/challenge_complete',stripeFrame,'source=src_fixture',{});return;}
      await wire(actionUrl,issuer,fault==='substituted-issuer-form'?'decision=other':'decision=complete',{},true);},
    })};
@@ -234,10 +246,20 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  async function wire(url:string,target:unknown,data:string|null,json:object,navigation=false){
   const reply=observeNetwork(target,url,data===null?'GET':'POST');
   let existing:Response|undefined;
+  const lateRetrieve=url.startsWith('https://api.stripe.com/v1/payment_intents/')&&fault.startsWith('late-source-');
   const headers=navigation?{'content-type':'application/x-www-form-urlencoded',origin:issuerDocument===issuerUrl?'https://hooks.stripe.com':'https://js.stripe.com'}:
    {authorization:'Bearer pk_test_fixture',origin:'https://js.stripe.com'};
   const request={url:()=>url,method:()=>data===null?'GET':'POST',frame:()=>target,isNavigationRequest:()=>navigation,resourceType:()=>navigation?'document':'xhr',
-   redirectedFrom:()=>null,postData:()=>data,allHeaders:async()=>headers,existingResponse:()=>existing} as unknown as Request;
+   redirectedFrom:()=>null,postData:()=>data,allHeaders:async()=>headers,existingResponse:()=>lateRetrieve?null:existing,
+   response:async()=>{
+    if(fault==='late-source-absent'||!existing)return null;
+    if(fault==='late-source-unobserved')return new Promise<never>(()=>{});
+    if(fault==='late-source-foreign-request')return {...existing,request:()=>({})};
+    if(fault==='late-source-foreign-url')return {...existing,url:()=>url+'/other'};
+    if(fault==='late-source-service-worker')return {...existing,fromServiceWorker:()=>true};
+    if(fault==='late-source-status')return {...existing,status:()=>202};
+    return existing;
+   }} as unknown as Request;
   await handler({request:()=>request,continue:async(...args:unknown[])=>{
    assert.deepEqual(args,[]);providerSent.push(url);
    await reply('issuer',200);
@@ -450,6 +472,9 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   }
  };
  const page={
+  exposeBinding:async(name:string,receipt:NonNullable<typeof issuerReceipt>)=>{
+   assert.equal(name,'__billingIssuerComplete');assert.equal(issuerReceipt,undefined);issuerReceipt=receipt;
+  },
   frames:()=>[frame,stripeFrame,issuer],context:()=>({newCDPSession:async(surface:unknown)=>{
    if(surface!==page)throw Error("This frame does not have a separate CDP session, it is a part of the parent frame's session");
    return {on:(event:string,fn:(v:unknown)=>void)=>devtools.set(event,fn),send:async(command:string,args:{requestId?:string;patterns?:{urlPattern:string}[]})=>{
@@ -1061,20 +1086,42 @@ for(const [fault,code] of Object.entries({
  assert.ok(!f.trace.includes('Pay')&&!f.sent.some(url=>url.endsWith('/confirm')));
 });
 
-for(const fault of ['none','replayed-next-ack','foreign-next-pi','foreign-next-source','wrong-issuer-transaction','foreign-issuer-path','profile-retires','untrusted-issuer','substituted-issuer-form','premature-sdk-complete','same-url-issuer-replaced']){
+const challengeRefusals:Record<string,string>={
+ 'foreign-next-pi':'BROWSER_CHALLENGE_SOURCE_RESPONSE',
+ 'foreign-next-source':'BROWSER_CHALLENGE_API_REQUEST',
+ 'wrong-issuer-transaction':'BROWSER_CHALLENGE_ISSUER_TRANSACTION',
+ 'foreign-issuer-path':'BROWSER_CHALLENGE_ISSUER_TRANSACTION',
+ 'untrusted-issuer':'BROWSER_CHALLENGE_ISSUER_SUBMISSION',
+ 'foreign-issuer-witness':'BROWSER_CHALLENGE_ISSUER_SUBMISSION',
+ 'wrong-issuer-nonce':'BROWSER_CHALLENGE_ISSUER_SUBMISSION',
+ 'late-source-absent':'BROWSER_CHALLENGE_SOURCE_RESPONSE',
+ 'late-source-unobserved':'BROWSER_CHALLENGE_SOURCE_RESPONSE',
+ 'late-source-foreign-request':'BROWSER_CHALLENGE_SOURCE_RESPONSE',
+ 'late-source-foreign-url':'BROWSER_CHALLENGE_SOURCE_RESPONSE',
+ 'late-source-service-worker':'BROWSER_CHALLENGE_SOURCE_RESPONSE',
+ 'late-source-status':'BROWSER_CHALLENGE_SOURCE_RESPONSE',
+};
+for(const fault of ['none','late-source-valid','late-issuer-witness','replayed-next-ack','profile-retires','substituted-issuer-form','premature-sdk-complete','same-url-issuer-replaced',...Object.keys(challengeRefusals)]){
  test('the real browser journey requires one original issuer challenge: '+fault,async()=>{
+  const success=['none','late-source-valid','late-issuer-witness'].includes(fault);
   const f=cancellationPage(fault,false,true);
   const run=runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+3000},async()=>{
    f.trace.push('operator');if(fault==='profile-retires')f.retire();if(fault==='same-url-issuer-replaced')f.reloadIssuer();
   });
-  if(fault==='none')assert.equal(await run,true);else await assert.rejects(run,/billing_BROWSER/);
+  if(success)assert.equal(await run,true);
+  else await assert.rejects(run,error=>{
+   assert.match(String(error),/^Error: billing_BROWSER$/);
+   if(challengeRefusals[fault])assert.equal(browserDiagnostic(error,'ACCEPTANCE'),challengeRefusals[fault]);
+   return true;
+  });
   assert.deepEqual(f.numbers,['4000002500003155']);
   assert.equal(f.trace.filter(x=>x==='Create subscription').length,1);assert.equal(f.trace.filter(x=>x==='Pay').length,1);
   assert.equal(f.sent.filter(x=>x.endsWith('/confirm')).length,1);assert.ok(f.closed());
-  assert.equal(f.trace.includes('issuer witnessed'),fault==='none');
-  assert.equal(f.trace.includes('issuer Complete'),['none','untrusted-issuer','substituted-issuer-form','premature-sdk-complete'].includes(fault));
+  assert.equal(f.trace.includes('issuer witnessed'),success);
+  assert.equal(f.trace.includes('issuer Complete'),success||['untrusted-issuer','foreign-issuer-witness','wrong-issuer-nonce','substituted-issuer-form','premature-sdk-complete'].includes(fault));
   if(fault==='premature-sdk-complete')assert.equal(f.providerSent.some(x=>x.endsWith('/challenge_complete')),false);
-  assert.equal(f.providerSent.filter(x=>x.endsWith('/decision')).length,fault==='none'?1:0);
+  if(fault.startsWith('late-source-'))assert.equal(f.providerSent.some(x=>x.endsWith('/3ds2/authenticate')),success);
+  assert.equal(f.providerSent.filter(x=>x.endsWith('/decision')).length,success?1:0);
  });
 }
 

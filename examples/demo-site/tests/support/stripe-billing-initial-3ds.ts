@@ -1,4 +1,4 @@
-import {createHash} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import type {Frame,Page,Request,Route} from '@playwright/test';
 import type {BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
@@ -70,7 +70,7 @@ function sameChain(a:FrameSnapshot|undefined,b:FrameSnapshot|undefined){
 export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,check,stripeFrames,waitForGesture}:Options){
  let retrieve:Request|undefined,authenticate:Request|undefined,completed=false,finalRead=false,boundSource:string|undefined;
  let issuer:Frame|undefined,issuerRequest:Request|undefined,submission:Request|undefined,binding:ReturnType<typeof issuerBinding>|undefined;
- let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:()=>Promise<boolean>}|undefined;
+ let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:Promise<void>}|undefined;
  const issuerReady=Promise.withResolvers<void>(),navigation=new WeakMap<Frame,number>();
  const revision=(frame:Frame)=>navigation.get(frame)??0;
  page.on('framenavigated',frame=>navigation.set(frame,revision(frame)+1));
@@ -96,57 +96,102 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   return true;
  }
  async function verifiedBody(request:Request|undefined){
-  requireValue(request);const response=request.existingResponse();
+  requireValue(request);
+  // Frame code can use a response before the Playwright client has observed it.
+  const response=request.existingResponse()??await billingBounded(limits,()=>request.response(),1000);
   requireValue(response && response.request()===request && response.url()===request.url() && !response.fromServiceWorker() && response.status()===200);
   const bytes=await billingBounded(limits,()=>response.body());requireValue(bytes.length<=65536);
   return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)) as unknown;
  }
  const owns=(url:URL)=>url.origin===issuerOrigin || url.origin==='https://api.stripe.com' &&
   (url.pathname.startsWith('/v1/payment_intents/') || url.pathname.startsWith('/v1/3ds2/'));
- async function forward(route:Route,url:URL){
+ async function forward(route:Route,url:URL,report:(code:string)=>void){
+  report('BROWSER_CHALLENGE_REQUEST');
   const request=route.request(),target=request.frame(),api=url.origin==='https://api.stripe.com',navigation=request.isNavigationRequest();
   requireValue(owns(url) && !request.redirectedFrom() && url.href===request.url() && !url.username && !url.password && !url.hash);
+  const frameCode=api?'BROWSER_CHALLENGE_API_FRAME':'BROWSER_CHALLENGE_ISSUER_FRAME';
+  report(frameCode);
   const chain=()=>stamped(api?stripeFrames(request):frameChain(target)),original=chain();
   requireValue(original);
-  await winning();await check();
+  report('BROWSER_CHALLENGE_WINNING');
+  await winning();
+  report('BROWSER_CHALLENGE_OWNER');
+  await check();
   const {secret,key}=owner();requireValue(/^pi_[A-Za-z0-9]+_secret_[A-Za-z0-9]+$/.test(secret) && /^pk_test_[A-Za-z0-9_]+$/.test(key));
+  report('BROWSER_CHALLENGE_HEADERS');
   const headers=await request.allHeaders(),method=request.method(),data=request.postData();
   requireValue(!headers.cookie && !headers['stripe-account'] && !headers['stripe-context'] && !headers['proxy-authorization'] && (!headers.authorization || api && headers.authorization==='Bearer '+key));
-  const current=async()=>{await check();sameChain(original,chain());};
-  const forwardOriginal=async()=>{await authorizeResponse(request);await current();await route.continue();};
+  const current=async()=>{
+   report('BROWSER_CHALLENGE_OWNER');
+   await check();
+   report(frameCode);
+   sameChain(original,chain());
+  };
+  const forwardOriginal=async()=>{
+   report('BROWSER_CHALLENGE_ROUTE_GUARD');
+   await authorizeResponse(request);
+   await current();
+   report('BROWSER_CHALLENGE_ROUTE_FORWARD');
+   await route.continue();
+  };
   if(api){
+   report('BROWSER_CHALLENGE_API_REQUEST');
    requireValue(!navigation && (!headers.origin||headers.origin===new URL(target.url()).origin));
    const path=url.pathname,isRetrieve=path==='/v1/payment_intents/'+secret.split('_secret_')[0];
    if(method==='OPTIONS'){
+    report('BROWSER_CHALLENGE_API_PREFLIGHT');
     requireValue(!headers.authorization && !data && headers['access-control-request-method']===(isRetrieve?'GET':'POST') &&
      (isRetrieve && (!retrieve || arm && !finalRead) || path==='/v1/3ds2/authenticate' && retrieve && !authenticate ||
       path==='/v1/3ds2/challenge_complete' && issuerResponded() && !completed));
     await current();await forwardOriginal();return;
    }
-   if(!isRetrieve && !boundSource)boundSource=challengeSource(await verifiedBody(retrieve),secret);
+   if(!isRetrieve && !boundSource){
+    report('BROWSER_CHALLENGE_SOURCE_RESPONSE');
+    const body=await verifiedBody(retrieve);
+    report('BROWSER_CHALLENGE_SOURCE_WIRE');
+    boundSource=challengeSource(body,secret);
+   }
+   report('BROWSER_CHALLENGE_API_REQUEST');
    const kind=challengeApiRequest(url,method,data,key,secret,boundSource);
    requireValue(headers.authorization==='Bearer '+key || (isRetrieve?url.searchParams:new URLSearchParams(data!)).get('key')===key);
    await current();
+   report('BROWSER_CHALLENGE_API_ORDER');
    if(kind==='retrieve'){
     if(retrieve){requireValue(issuerResponded() && !finalRead);finalRead=true;}else retrieve=request;
    }else if(kind==='authenticate'){requireValue(!authenticate);authenticate=request;}
-   else{requireValue(issuerResponded());await current();requireValue(!completed);completed=true;}
+   else{
+    requireValue(issuerResponded());await current();
+    report('BROWSER_CHALLENGE_API_ORDER');
+    requireValue(!completed);completed=true;
+   }
   }else{
+   report('BROWSER_CHALLENGE_ISSUER_REQUEST');
    requireValue(navigation && method==='POST' && request.resourceType()==='document' &&
     headers['content-type']?.split(';')[0]==='application/x-www-form-urlencoded');
    if(!issuerRequest){
-    const observed=issuerBinding(await verifiedBody(authenticate));
+    report('BROWSER_CHALLENGE_ISSUER_RESPONSE');
+    const body=await verifiedBody(authenticate);
+    report('BROWSER_CHALLENGE_ISSUER_BINDING');
+    const observed=issuerBinding(body);
+    report('BROWSER_CHALLENGE_ISSUER_TRANSACTION');
     const inner=target.parentFrame()!;
     const parentDocument=inner.url()==='about:blank'?inner.parentFrame()!.url():inner.url();
     requireValue(headers.origin===new URL(parentDocument).origin && matchingChallengeRequest(observed,url.href,data));
-    await current();requireValue(!issuerRequest);issuerRequest=request;issuer=target;binding=observed;
+    await current();
+    report('BROWSER_CHALLENGE_ISSUER_TRANSACTION');
+    requireValue(!issuerRequest);issuerRequest=request;issuer=target;binding=observed;
     expectedIssuerRevision=revision(target)+1;issuerParent={target,frames:new Map(original.frames)};issuerParent.frames.delete(target);
     await forwardOriginal();issuerReady.resolve();return;
    }
-   requireValue(arm);sameChain(arm.document,original);
-   requireValue(target===issuer && target.url()===binding?.url && url.href===arm.action && headers.origin===issuerOrigin &&
-    typeof data==='string' && data.length<=65536 && createHash('sha256').update(data).digest('hex')===arm.bodyHash && await arm.gesture());
-   await current();requireValue(!submission);submission=request;
+   report('BROWSER_CHALLENGE_ISSUER_SUBMISSION');
+   const armed=arm;
+   requireValue(armed);sameChain(armed.document,original);
+   requireValue(target===issuer && target.url()===binding?.url && url.href===armed.action && headers.origin===issuerOrigin &&
+    typeof data==='string' && data.length<=65536 && createHash('sha256').update(data).digest('hex')===armed.bodyHash);
+   await billingBounded(limits,()=>armed.gesture,1000);
+   await current();
+   report('BROWSER_CHALLENGE_ISSUER_SUBMISSION');
+   requireValue(!submission);submission=request;
   }
   await forwardOriginal();
  }
@@ -185,10 +230,22 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    requireValue(frame.url()===bound.url && current?.action===action.href && current.bodyHash===form.bodyHash && await element.isVisible() && await element.isEnabled());
   };
   await validate();await billingBounded(limits,l=>waitForGesture({deadline:l.deadline,signal:l.signal!}),180000);await validate();
-  const witness=await element.evaluateHandle(node=>{
-   let trusted=false;node.addEventListener('click',event=>{trusted=event.isTrusted;},{capture:true,once:true});return ()=>trusted;
+  // A pending form navigation can block evaluation in the issuer renderer.
+  // Keep the trusted click receipt in the runner, tied to the armed document.
+  const nonce=randomUUID(),gesture=Promise.withResolvers<void>(),name='__billingIssuerComplete';
+  const armed={document:original,action:action.href,bodyHash:form.bodyHash,gesture:gesture.promise};
+  await page.exposeBinding(name,(source,receipt:unknown)=>{
+   if(arm!==armed || source.page!==page || source.frame!==frame || receipt!==nonce)return;
+   try{sameChain(original,stamped(frameChain(frame)));}catch{return;}
+   gesture.resolve();
   });
-  arm={document:original,action:action.href,bodyHash:form.bodyHash,gesture:()=>witness.evaluate(gesture=>gesture())};
+  await validate();
+  await element.evaluate((node,{name,nonce})=>{
+   const send=(window as unknown as Record<string,(receipt:string)=>Promise<void>>)[name];
+   if(typeof send!=='function')throw Error('billing_BROWSER');
+   node.addEventListener('click',event=>{if(event.isTrusted)void send(nonce).catch(()=>{});},{capture:true,once:true});
+  },{name,nonce});
+  arm=armed;
   await validate();await element.click({timeout:Math.min(5000,limits.deadline-Date.now()),noWaitAfter:true});
   // Acknowledgement requires the issuer's own 2xx response to the original trusted form submission.
   await billingBounded(limits,async l=>{while(!issuerResponded()){billingCheck(l);await new Promise(r=>setTimeout(r,50));}},45000);

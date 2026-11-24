@@ -352,7 +352,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   }):undefined;
   async function providerTraffic(route:Route,url:URL,report:(code:string)=>void) {
    const request=route.request(),method=request.method(),navigation=request.isNavigationRequest();
-   if(sca?.owns(url)){report('BROWSER_PROVIDER_ROUTE_CHALLENGE');await sca.forward(route,url);return;}
+   if(sca?.owns(url)){await sca.forward(route,url,report);return;}
    if(pinned && !providerNetworkOrigin(url) && !/(?:^|\.)stripe\.(?:com|network)$/.test(url.hostname) && matchesStaticOrigin!(url.origin)){
     await pinned.forward(route,url);return;
    }
