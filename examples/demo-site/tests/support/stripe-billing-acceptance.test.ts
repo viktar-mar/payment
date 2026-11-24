@@ -2,6 +2,8 @@ import {createHash} from 'node:crypto';
 import test from 'node:test';import assert from 'node:assert/strict';import {readFile} from 'node:fs/promises';
 // @ts-expect-error Native Node type erasure requires explicit source extension.
 import {forwardBillingDispatch,runInitialBillingBrowser,runBillingCancellationBrowser,runBillingDeclineRetryBrowser,runBillingInitial3dsBrowser,runBillingInvoiceWebhooksBrowser} from './stripe-billing-acceptance.ts';
+// @ts-ignore Native Node executes the protocol fixture registration.
+import {registerChromiumProtocolFixture} from './stripe-billing-chromium-route.ts';
 import type {BillingBinding,BillingPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import {errors,type Route} from '@playwright/test';
 const binding={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081',receiver:'http://127.0.0.1:18082'},priceId:'11111111-2222-4333-8444-555555555555'} as BillingBinding;
@@ -501,6 +503,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    waiters.add(waiter);
   })
  };
+ if(sca||invoiceCase)registerChromiumProtocolFixture(page);
  const context={
   newPage:async()=>page,on:()=>{},routeWebSocket:async(_pattern:unknown,fn:typeof socketHandler)=>{socketHandler=fn;},route:async(pattern:unknown,fn:typeof handler)=>{interceptsProvider=pattern==='**/*';handler=fn;},
   close:async()=>{closed=true;releaseBody?.();releaseDispatch?.();for(const w of waiters)w.reject(new Error('closed'));waiters.clear();

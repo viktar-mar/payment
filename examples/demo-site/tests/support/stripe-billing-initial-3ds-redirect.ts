@@ -1,6 +1,8 @@
 import type {CDPSession,Frame,Page,Request} from '@playwright/test';
 // @ts-ignore Native Node executes the same iframe guard source as Playwright.
 import {guardIframeTargets,type GuardSession} from './stripe-billing-chromium-iframe.ts';
+// @ts-ignore Native Node executes the pinned Chromium identity reader.
+import {chromiumRouteReader,type ChromiumRouteEvidence} from './stripe-billing-chromium-route.ts';
 
 const refuse=():never=>{throw Error('billing_BROWSER');};
 // Keep response interception aligned with every original HTTP destination the guarded
@@ -12,7 +14,8 @@ type Preflight={origin:string;method:string;names?:string};
 type Entry={url:string;method:string;frameId?:string;allowed:boolean;preflight?:Preflight;initiator?:{id:string;entry?:Entry}};
 type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
  |'BROWSER_GUARD_RESPONSE_PAIR'|'BROWSER_GUARD_RESPONSE_REDIRECT'|'BROWSER_GUARD_RESPONSE_STATUS'|'BROWSER_GUARD_RESPONSE_NETWORK'
- |'BROWSER_GUARD_RESPONSE_PREFLIGHT'|'BROWSER_GUARD_RESPONSE_UNCLAIMED'|'BROWSER_GUARD_RESPONSE_RESUME'|'BROWSER_GUARD_IFRAME_SETUP';
+ |'BROWSER_GUARD_RESPONSE_PREFLIGHT'|'BROWSER_GUARD_RESPONSE_UNCLAIMED'|'BROWSER_GUARD_RESPONSE_RESUME'|'BROWSER_GUARD_IFRAME_SETUP'
+ |'BROWSER_GUARD_ROUTE_IDENTITY'|'BROWSER_GUARD_ROUTE_TARGET'|'BROWSER_GUARD_ROUTE_EVENT';
 function stripeScript(url:URL){
  return url.protocol==='https:' && !url.port && !url.username && !url.password &&
   (url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com'));
@@ -74,6 +77,7 @@ function bindPreflightInitiator(preflight:Entry,entry:Entry):boolean{
 /** Playwright routes only the first URL in a redirect chain. Arm a response-stage guard
  * before each SDK request exists and require its passive network event on the exact frame. */
 export async function guardChallengeRedirects(page:Page,onFailure:(reason:RedirectGuardFailure)=>void,origins:Origins){
+ const routeReader=chromiumRouteReader(page);
  for(const fresh of [origins.backend,origins.demo]){
   const url=new URL(fresh);
   if(url.origin!==fresh || !/^http:\/\/127\.0\.0\.1:[1-9]\d{3,4}$/.test(fresh))refuse();
@@ -171,15 +175,35 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
  // Bind the main CDP frame before navigation and keep requiring the matching network event.
  const {frameTree}=await mainTarget.session.send('Page.getFrameTree');
  const mainId=frameId(frameTree,main,main);
- if(!mainId)refuse();
- const routes=new WeakMap<Request,number>();
+ if(!mainId||routeReader&&routeReader.mainId!==mainId)refuse();
+ const routes=new WeakMap<Request,{generation:number;evidence?:ChromiumRouteEvidence|null}>();
  return {
  registerRoute(request:Request){
-  if(!routes.has(request))routes.set(request,iframeGuard.generation());
+  if(!routes.has(request))routes.set(request,{generation:iframeGuard.generation(),evidence:routeReader?.capture(request)});
  },
  async authorize(request:Request){
   // A replacement target cannot inherit a route that predates its attachment.
-  const generation=routes.get(request)??iframeGuard.generation();
+  const registered=routes.get(request);
+  const generation=registered?.generation??iframeGuard.generation();
+  if(routeReader){
+   let reason:RedirectGuardFailure='BROWSER_GUARD_ROUTE_IDENTITY';
+   try{
+    const evidence=registered?.evidence;
+    if(!evidence||!evidence.current())return refuse();
+    reason='BROWSER_GUARD_ROUTE_TARGET';
+    const origin=evidence.targetId===mainId?{guard:mainTarget,current:mainTarget.current}:
+     await iframeGuard.get(evidence.targetId,generation);
+    if(!origin.current())return refuse();
+    reason='BROWSER_GUARD_ROUTE_IDENTITY';
+    if(!evidence.current()||request.frame().isDetached())return refuse();
+    reason='BROWSER_GUARD_ROUTE_EVENT';
+    const entry=origin.guard.requests.get(evidence.networkId);
+    if(!entry||entry.frameId!==evidence.frameId||entry.url!==request.url()||entry.method!==request.method()||
+       entry.allowed||entry.method==='OPTIONS'&&!entry.preflight)return refuse();
+    entry.allowed=true;
+   }catch{onFailure(reason);return refuse();}
+   return;
+  }
   const frame=request.frame(),origin=await target(frame,generation);
   const tree=async()=>{
    const {frameTree}=await origin.session.send('Page.getFrameTree');

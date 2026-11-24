@@ -3,8 +3,65 @@ import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
 // @ts-ignore Offline source.
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
+// @ts-ignore Offline protocol fixture registration.
+import {registerChromiumProtocolFixture} from './stripe-billing-chromium-route.ts';
 
 const origins={backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081'};
+const protocolGuard=(page:object,onFailure:Parameters<typeof guardChallengeRedirects>[1])=>{
+ registerChromiumProtocolFixture(page);
+ return guardChallengeRedirects(page as never,onFailure,origins);
+};
+test('an unsupported driver cannot fall back to protocol fixture matching',async()=>{
+ await assert.rejects(guardChallengeRedirects({} as never,()=>{},origins),/^Error: billing_BROWSER$/);
+ assert.throws(()=>registerChromiumProtocolFixture({_connection:{}}),/^Error: billing_BROWSER$/);
+});
+
+for(const mode of ['exact request','same-URL decoy','replaced document'])test('Chromium route evidence rejects a false match: '+mode,async()=>{
+ const url='https://api.stripe.com/fixture-read',location=origins.demo+'/';
+ const frameId='checkout',networkId='actual-request',decoyId='decoy-request';
+ const browserSession={},symbol=Symbol('InterceptableRequest');
+ const main={_id:frameId,_page:undefined as unknown,_currentDocument:{},_isDetached:()=>false,parentFrame:()=>null};
+ const pending=new Map();
+ const impl={
+  frameManager:{frame:(id:string)=>id===frameId?main:undefined},
+  delegate:{_targetId:frameId,_sessions:new Map([[frameId,{_targetId:frameId,_client:browserSession}]]),
+   _networkManager:{_requestIdToRequest:pending}},
+ };
+ main._page=impl;
+ const connection={toImpl:(client:{driver:unknown})=>client.driver};
+ const original={frame:()=>main,method:()=>'GET',url:()=>url};
+ const intercepted={request:original,session:browserSession,_requestId:networkId,_interceptionId:'paused-request',_originalRequestRoute:{}};
+ Object.defineProperty(original,symbol,{value:intercepted});
+ pending.set(networkId,intercepted);
+ const frame={_connection:connection,driver:main,url:()=>location,name:()=>'',isDetached:()=>false};
+ const events=new Map<string,(value:unknown)=>void|Promise<void>>(),commands:string[]=[],failures:string[]=[];
+ const cdp={on:(event:string,listener:(value:unknown)=>void)=>events.set(event,listener),send:async(method:string)=>{
+  commands.push(method);
+  if(method==='Page.getFrameTree')return {frameTree:{frame:{id:frameId,url:location}}};
+ }};
+ const page={_connection:connection,driver:impl,mainFrame:()=>frame,context:()=>({newCDPSession:async()=>cdp})};
+ const request={_connection:connection,driver:original,frame:()=>frame,url:()=>url,method:()=>'GET',
+  redirectedFrom:()=>null,serviceWorker:()=>null} as never;
+ const guard=await guardChallengeRedirects(page as never,code=>failures.push(code),origins);
+ guard.registerRoute(request);
+ const passive={frameId,request:{url,method:'GET'}};
+ const record=(id:string)=>events.get('Network.requestWillBeSent')!({...passive,requestId:id});
+ const respond=(id:string)=>events.get('Fetch.requestPaused')!({...passive,networkId:id,requestId:id,responseStatusCode:200});
+ record(decoyId);
+ if(mode!=='same-URL decoy')record(networkId);
+ if(mode==='replaced document')main._currentDocument={};
+ if(mode==='exact request'){
+  await guard.authorize(request);
+  await respond(networkId);
+ }else await assert.rejects(guard.authorize(request),/^Error: billing_BROWSER$/);
+ await respond(decoyId);
+ assert.equal(commands.filter(method=>method==='Fetch.continueResponse').length,mode==='exact request'?1:0);
+ assert.equal(commands.at(-1),'Fetch.failRequest');
+ assert.deepEqual(failures,[
+  ...(mode==='same-URL decoy'?['BROWSER_GUARD_ROUTE_EVENT']:mode==='replaced document'?['BROWSER_GUARD_ROUTE_IDENTITY']:[]),
+  'BROWSER_GUARD_RESPONSE_UNCLAIMED',
+ ]);
+});
 
 for(const during of ['route policy','identity probe'])test('a replacement iframe cannot inherit a request during '+during,async()=>{
  const url='https://api.stripe.com/fixture-read',iframeUrl='https://js.stripe.com/fixture-frame.html';
@@ -27,7 +84,7 @@ for(const during of ['route policy','identity probe'])test('a replacement iframe
  const page={mainFrame:()=>main,context:()=>({newCDPSession:async(frame:unknown)=>frame===child?{
   send:async()=>{probing.resolve();return identity.promise;},detach:async()=>{},
  }:session})};
- const guard=await guardChallengeRedirects(page as never,code=>failures.push(code),origins);
+ const guard=await protocolGuard(page,code=>failures.push(code));
  const flush=()=>new Promise<void>(resolve=>setImmediate(resolve));
  const passive={frameId:'iframe',request:{url,method:'GET'}};
  const emit=(sessionId:string,method:string,params:object)=>events.emit('Target.receivedMessageFromTarget',{
@@ -67,7 +124,7 @@ for(const [frameId,status,release] of [['checkout-frame',200,true],['wrong-frame
    }
   }};
   const page={context:()=>({newCDPSession:async()=>session}),frames:()=>[frame],mainFrame:()=>frame,on:()=>{}};
-  const guard=await guardChallengeRedirects(page as never,()=>{},origins);
+  const guard=await protocolGuard(page,()=>{});
   paused=true;
   events.get('Network.requestWillBeSent')!({requestId:'nav',frameId,request:{url:href,method:'GET'}});
   const authorize=()=>guard.authorize({frame:()=>frame,method:()=>'GET',url:()=>href} as never);
@@ -107,7 +164,7 @@ for(const mode of ['first navigation','ID owner','unnamed sibling','committed bl
    if(surface===child)throw Error("This frame does not have a separate CDP session, it is a part of the parent frame's session");
    return session;
   }}),frames:()=>[main,child],mainFrame:()=>main,on:()=>{}};
-  const guard=await guardChallengeRedirects(page as never,reason=>refusals.push(reason),origins);
+  const guard=await protocolGuard(page,reason=>refusals.push(reason));
   const frameId=mode==='foreign request'?'other':'child';
   events.get('Network.requestWillBeSent')!({requestId:'iframe-navigation',frameId,request:{url:href,method:'GET'}});
   const authorize=()=>guard.authorize({frame:()=>child,url:()=>href,method:()=>'GET',redirectedFrom:()=>null,
@@ -133,7 +190,7 @@ for(const mode of ['eligible','redirect','not modified','missing request','forei
    if(command==='Fetch.continueResponse')assert.deepEqual(args,{requestId:'paused'});
   }};
   const page={context:()=>({newCDPSession:async()=>session}),frames:()=>[frame],mainFrame:()=>frame,on:()=>{}};
-  const guard=await guardChallengeRedirects(page as never,reason=>refusals.push(reason),origins);
+  const guard=await protocolGuard(page,reason=>refusals.push(reason));
   if(mode!=='missing request')events.get('Network.requestWillBeSent')!({requestId:'network',frameId:mode==='foreign frame'?'wrong':'frame',request:{url:href,method:'POST'}});
   const request={url:()=>href,method:()=>'POST',frame:()=>frame};
   if(['missing request','foreign frame'].includes(mode)){
@@ -164,7 +221,7 @@ for(const mode of ['valid','script options','unbound request','credential','body
    if(name==='Page.getFrameTree')return {frameTree:{frame:{id:'frame',url:location}}};
   }};
   const page={context:()=>({newCDPSession:async()=>session}),frames:()=>[frame],mainFrame:()=>frame,on:()=>{}};
-  await guardChallengeRedirects(page as never,()=>{failed=true;},origins);
+  await protocolGuard(page,()=>{failed=true;});
   const origin=mode==='foreign origin'?'https://foreign.invalid':location;
   const headers={Origin:origin,'Access-Control-Request-Method':mode==='wrong method'?'DELETE':'POST','Access-Control-Request-Headers':'authorization,content-type'};
   const request={url,method:mode==='pending non-options'?'POST':'OPTIONS',headers:{...headers,...(mode==='credential'?{Cookie:'private'}:{})},hasPostData:mode==='body'};
@@ -187,7 +244,7 @@ for(const mode of ['paired','preflight first','missing initiator','wrong target'
   }};
   const page={context:()=>({newCDPSession:async()=>session}),frames:()=>[frame],mainFrame:()=>frame,on:()=>{}};
   let rejected=false;
-  const guard=await guardChallengeRedirects(page as never,()=>{rejected=true;},origins);
+  const guard=await protocolGuard(page,()=>{rejected=true;});
   const network=events.get('Network.requestWillBeSent')!;
   const post={frameId:'checkout',requestId:'post',request:{url:mode==='wrong target'?url+'/other':url,
    method:mode==='wrong method'?'GET':'POST'}};
