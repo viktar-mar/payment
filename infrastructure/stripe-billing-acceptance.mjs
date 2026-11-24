@@ -71,7 +71,9 @@ async function createOwner(options,dependencies,selectedCase) {
     if(!Object.hasOwn(configuration.env,RETRY_CLI_PROFILE_RUN_ID)){
      await step('LOGIN',async()=>{const login=dependencies.login??(await import('./stripe-billing-login.mjs')).completeBillingLogin;return login(cli,configuration,active);},780000);
     }
-    await step('BINDING',l=>cli.validateBinding(l));await step('LISTENER',l=>cli.startListener(l));
+    // With a saved profile, binding is the first CLI call and captures the run's authority.
+    await step('BINDING',()=>cli.validateBinding(active));
+    await step('LISTENER',l=>cli.startListener(l));
     await step('START',l=>bootstrap.start(l),2700000);
     fixture=await step('FIXTURE',async()=>{const factory=dependencies.createFixture??(await import('./stripe-billing-provision.mjs')).createBillingFixture;return factory({configuration,bootstrap,cli});});
     await step('PROVISION',l=>fixture.provision(l));

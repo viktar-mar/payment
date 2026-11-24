@@ -885,6 +885,42 @@ for(const reason of ['valid','expired','extra scope','linked credentials'])test(
   assert.equal(await readFile(source+'/credentials.json','utf8'),profileCredentials);
 });
 
+test('initial retry owner carries a reused CLI binding through listener readiness',async t=>{
+  const {f,cli:cliDirectory}=await failedRenewalProfile(t,true);
+  const {createOwnedBillingDeclineRetry}=await import('./stripe-billing-acceptance.mjs');
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  const events=[];
+  const spawn=f.dependencies.spawn;
+  f.dependencies.spawn=(...args)=>{
+    const child=spawn(...args);
+    queueMicrotask(()=>child.stderr.write(READY));
+    return child;
+  };
+  const bootstrap={
+    prepare:async()=>true,resources:()=>({cliDirectory}),
+    verifyForwardTarget:async()=>{events.push('target');return true;},
+    persistWebhookSecret:async secret=>{assert.equal(secret,SECRET);events.push('ready');return true;},
+    start:async limits=>{
+      assert.equal(f.adapter.assertBillingListener({deadline:Math.min(limits.deadline,Date.now()+1000),signal:limits.signal}),true);
+      events.push('start');
+      return true;
+    },
+    stop:async()=>{events.push('stop');return true;},
+  };
+  const owner=await createOwnedBillingDeclineRetry(f.options.configuration,{
+    preflight:async()=>true,createBootstrap:async()=>bootstrap,
+    createCli:async options=>{f.adapter=await createBillingCliAdapter(options,f.dependencies);return f.adapter;},
+    login:()=>assert.fail('saved profile must not prompt for a device code'),
+    createFixture:async()=>({provision:async()=>false,close:async()=>true}),
+  });
+  await assert.rejects(owner.run(()=>assert.fail('browser after deliberate fixture stop'),{deadline:Date.now()+300000}),{message:'billing_PROVISION'});
+  assert.deepEqual(events,['target','ready','start','stop']);
+  assert.deepEqual(f.calls.map(c=>c.args[11]),['--version','whoami','get','--version','whoami','get','listen']);
+  assert.equal(f.children.length,1);
+  assert.deepEqual(f.children[0].signals,['SIGINT']);
+  assert.equal(owner.resources().cleanupConfirmed,true);
+});
+
 test('failed-renewal seeds only CLI authentication files into the fresh profile before binding and listening',async t=>{
   const {f,cli,source,destination}=await failedRenewalProfile(t);
   const {createBillingFailedRenewalCliAdapter}=await import('./stripe-sandbox-cli.mjs');
