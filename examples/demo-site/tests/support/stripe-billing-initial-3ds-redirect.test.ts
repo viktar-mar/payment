@@ -30,6 +30,48 @@ for(const [frameId,status,release] of [['checkout-frame',200,true],['wrong-frame
   assert.equal(commands.includes('Fetch.failRequest'),!release);
  });
 
+for(const mode of ['first navigation','ID owner','unnamed sibling','committed blank','different document','ambiguous blank',
+ 'foreign owner','disconnected owner','replaced owner','renamed owner','foreign request','not navigation','redirect'])
+ test('a new Stripe iframe still requires one exact CDP frame and request: '+mode,async()=>{
+  const href='https://js.stripe.com/v3/fixture-frame.html';
+  const events=new Map<string,(e:unknown)=>void|Promise<void>>(),commands:string[]=[],refusals:string[]=[];
+  const main={url:()=>origins.demo+'/',name:()=>'',parentFrame:()=>null,isDetached:()=>false};
+  const ownerName='fixture-stripe-frame';let label=ownerName;
+  const child={url:()=>mode==='different document'?'https://js.stripe.com/v3/other.html':mode==='committed blank'?'about:blank':'',
+   name:()=>mode==='committed blank'?ownerName:'',parentFrame:()=>main,isDetached:()=>false,
+   frameElement:async()=>({evaluate:async(read:(element:unknown)=>unknown)=>read({
+    localName:'iframe',isConnected:mode!=='disconnected owner',id:mode==='ID owner'?ownerName:'',
+    getAttribute:()=>mode==='ID owner'?null:mode==='foreign owner'?'foreign-frame':label,
+   }),contentFrame:async():Promise<unknown>=>mode==='replaced owner'?null:child,dispose:async()=>{}})};
+  const node={id:'child',url:mode==='committed blank'?'about:blank':'',name:ownerName};
+  const session={on:(name:string,listener:(e:unknown)=>void)=>events.set(name,listener),send:async(name:string)=>{
+   commands.push(name);
+   if(name==='Page.getFrameTree'){
+    if(mode==='renamed owner'&&commands.filter(command=>command==='Page.getFrameTree').length>1)label='renamed';
+    return {frameTree:{frame:{id:'main',url:main.url()},
+     childFrames:[{frame:node},...(mode==='ambiguous blank'||mode==='unnamed sibling'?
+      [{frame:{...node,id:'other',name:mode==='ambiguous blank'?ownerName:undefined}}]:[])]}};
+   }
+  }};
+  const page={context:()=>({newCDPSession:async(surface:unknown)=>{
+   if(surface===child)throw Error("This frame does not have a separate CDP session, it is a part of the parent frame's session");
+   return session;
+  }}),frames:()=>[main,child],mainFrame:()=>main,on:()=>{}};
+  const guard=await guardChallengeRedirects(page as never,reason=>refusals.push(reason),origins);
+  const frameId=mode==='foreign request'?'other':'child';
+  events.get('Network.requestWillBeSent')!({requestId:'iframe-navigation',frameId,request:{url:href,method:'GET'}});
+  const authorize=()=>guard.authorize({frame:()=>child,url:()=>href,method:()=>'GET',redirectedFrom:()=>null,
+   isNavigationRequest:()=>mode!=='not navigation'} as never);
+  const denied=['different document','ambiguous blank','foreign owner','disconnected owner','replaced owner','renamed owner',
+   'foreign request','not navigation'].includes(mode);
+  if(denied)await assert.rejects(authorize(),/^Error: billing_BROWSER$/);
+  else await authorize();
+  await events.get('Fetch.requestPaused')!({requestId:'response',networkId:'iframe-navigation',frameId,
+   request:{url:href,method:'GET'},responseStatusCode:mode==='redirect'?307:200});
+  assert.equal(commands.includes('Fetch.continueResponse'),!denied&&mode!=='redirect');
+  assert.deepEqual(refusals,denied?['BROWSER_GUARD_RESPONSE_UNCLAIMED']:mode==='redirect'?['BROWSER_GUARD_RESPONSE_REDIRECT']:[]);
+ });
+
 for(const mode of ['eligible','redirect','not modified','missing request','foreign frame','unclaimed response','error response','network failure','foreign response']){
  test('Chromium response interception retains original bytes and stops '+mode,async()=>{
   const href='https://api.stripe.com/v1/3ds2/authenticate',location='https://js.stripe.com/v3/frame';

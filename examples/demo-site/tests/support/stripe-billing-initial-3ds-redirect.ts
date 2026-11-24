@@ -39,13 +39,18 @@ function syntheticProbe(value:Preflight|undefined,status:number|undefined,header
 }
 type Target={session:CDPSession;root:Frame;requests:Map<string,Entry>};
 type Tree={frame:{id:string;name?:string;url:string;urlFragment?:string};childFrames?:Tree[]};
-function frameId(tree:Tree,root:Frame,frame:Frame):string {
+function frameId(tree:Tree,root:Frame,frame:Frame,uncommittedOwner?:string):string {
  const chain:Frame[]=[];
  for(let current:Frame|null=frame;current!==root;current=current.parentFrame()){
   if(!current||current.isDetached())return refuse();chain.unshift(current);
  }
  function matches(node:Tree,f:Frame){
-  return (node.frame.url+(node.frame.urlFragment??''))===(f.url()||'about:blank') && (node.frame.name??'')===f.name();
+  const document=node.frame.url+(node.frame.urlFragment??'');
+  const url=f.url(),name=f.name();
+  if(f===frame && uncommittedOwner!==undefined){
+   return url==='' && name==='' && document==='' && node.frame.name===uncommittedOwner;
+  }
+  return document===(url||'about:blank') && (node.frame.name??'')===name;
  }
  if(root.isDetached()||!matches(tree,root))return refuse();
  for(const child of chain){
@@ -174,6 +179,23 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   if(frame===main){
    if(page.mainFrame()!==main||main.isDetached()||origin!==mainTarget)refuse();
    id=mainId;
+  }else if(frame.url()==='' && frame.name()==='' && request.isNavigationRequest() &&
+     request.method()==='GET' && stripeScript(new URL(request.url())) && !request.redirectedFrom()){
+    // Before the first commit Playwright has no document name. Chromium already
+    // exposes the iframe element's name, or its ID when the name is empty.
+    const parent=frame.parentFrame(),owner=await frame.frameElement();
+    try{
+     const readOwnerName=()=>owner.evaluate(node=>{
+      const element=node as HTMLIFrameElement;
+      return element.localName==='iframe' && element.isConnected ? element.getAttribute('name') || element.id : null;
+     });
+     const name=await readOwnerName();
+     if(!name || !parent)return refuse();
+     const {frameTree}=await origin.session.send('Page.getFrameTree');
+     if(await owner.contentFrame()!==frame || await readOwnerName()!==name ||
+        frame.parentFrame()!==parent || frame.isDetached())return refuse();
+     id=frameId(frameTree,origin.root,frame,name);
+    }finally{void owner.dispose().catch(()=>{});}
   }else{
    const {frameTree}=await origin.session.send('Page.getFrameTree');
    id=frameId(frameTree,origin.root,frame);
