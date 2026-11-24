@@ -204,7 +204,7 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
             } else if(invoice.settlement()==SettlementKind.OPEN&&projected.nonTerminal()
                 &&(snapshot.status()==Subscription.Status.PAST_DUE||snapshot.status()==Subscription.Status.UNPAID||snapshot.status()==Subscription.Status.INCOMPLETE)
                 &&invoice.period().equals(snapshot.period())&&invoice.price().equals(snapshot.billingPrice())
-                &&!(sample.isolated()&&initialPending(projected,snapshot,invoice,locked))) {
+                &&!((sample.isolated()||unversioned&&invoice.amountDueMinor()>0)&&initialPending(projected,snapshot,invoice,locked))) {
                 var policy=policies.load(original.siteId());
                 var deadline=projected.paidThrough()!=null&&projected.entitledPrice()!=null?projected.paidThrough().plus(Duration.ofDays(policy.graceDays())):null;
                 var captured=metadata.captureOnce(bill,policy.version(),deadline);
@@ -305,7 +305,7 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
             if(status!=null)operations.save(new SubscriptionOperation(operation.id(),operation.siteId(),operation.customerId(),operation.subscriptionId(),operation.kind(),status,operation.authorityScope(),operation.keyDigest(),operation.fingerprint(),operation.providerOperationKey(),operation.expectedRevision(),operation.policyVersion(),snapshot.subscriptionReference(),status==SubscriptionOperation.Status.FAILED?"PROVIDER_DECLINED":null,operation.createdAt(),now,operation.version()+1),operation.version());
         }
     }
-    /** Original isolated unpaid CREATE remains incomplete; an OPEN invoice alone is not renewal failure. */
+    /** The original unpaid CREATE stays incomplete while its exact initial invoice is still pending. */
     private static boolean initialPending(Subscription s,Snapshot snapshot,Invoice invoice,List<SubscriptionOperation> locked){
         if(s.billingStatus()!=Subscription.Status.INCOMPLETE||snapshot.status()!=Subscription.Status.INCOMPLETE
             ||invoice.kind()!=BillingRecord.Kind.INITIAL||!invoice.cashObjects().isEmpty()

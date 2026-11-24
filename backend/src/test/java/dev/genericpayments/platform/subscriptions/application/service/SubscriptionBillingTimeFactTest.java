@@ -77,14 +77,56 @@ class SubscriptionBillingTimeFactTest {
         assertThat(h.operation.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
         assertThat(h.observations).isEqualTo(1);
     }
-    @Test void initialPendingExemptionPreservesOrdinaryAndActualFailureSemantics() {
-        for(String control:List.of("ordinary","pastDue","renewal","failedCash","applied")) {
+    @Test void ordinaryStripeInitialObservationPreservesTheRevisionHeldByTheConfirmationChain() {
+        var h=new Harness(UTC,PaymentProviderType.STRIPE);h.initial();h.isolated=false;
+        var before=h.s;
+        var invoice=h.initialSnapshot(Subscription.Status.INCOMPLETE,BillingRecord.Kind.INITIAL,List.of(),OperationState.PENDING);
+        h.apply(invoice);
+        h.apply(invoice);
+        assertThat(h.s).isSameAs(before);
+        assertThat(h.operation.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        assertThat(h.records.values()).singleElement().satisfies(bill->assertThat(bill.settlement()).isEqualTo(BillingRecord.Settlement.OPEN));
+        assertThat(h.journal).isEmpty();
+        assertThat(h.callbacks).isEmpty();
+        assertThat(h.cash).isEmpty();
+        assertThat(h.observations).isEqualTo(2);
+
+        var open=invoice.invoices().getFirst();
+        var captured=new CashObject("pi_paid",open.amountDueMinor(),open.currency(),dev.genericpayments.platform.payments.domain.PaymentStatus.SUCCEEDED,UTC);
+        var paid=new Invoice(open.reference(),open.kind(),open.price(),null,open.period(),open.amountDueMinor(),open.currency(),SettlementKind.CASH,List.of(captured));
+        var applied=new OperationObservation(h.operation.providerOperationKey(),OperationState.APPLIED);
+        h.apply(new Snapshot(invoice.subscriptionReference(),Subscription.Status.ACTIVE,invoice.billingPrice(),invoice.period(),
+            null,null,List.of(paid),applied.operationKey(),true,0,UTC,applied));
+        assertThat(h.s.billingStatus()).isEqualTo(Subscription.Status.ACTIVE);
+        assertThat(h.s.paidThrough()).isEqualTo(open.period().end());
+        assertThat(h.s.revision()).isEqualTo(before.revision()+1);
+        assertThat(h.operation.status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+        assertThat(h.cash).hasSize(1);
+        assertThat(h.journal).singleElement().satisfies(event->assertThat(event.type()).isEqualTo(SubscriptionEvent.Type.PERIOD_PAID));
+    }
+    @Test void ordinaryNonStripeInitialObservationKeepsItsExistingProjection() {
+        var h=new Harness(UTC,PaymentProviderType.FAKE);h.initial();h.isolated=false;
+        h.apply(h.initialSnapshot(Subscription.Status.INCOMPLETE,BillingRecord.Kind.INITIAL,List.of(),OperationState.PENDING));
+        assertThat(h.s.billingStatus()).isEqualTo(Subscription.Status.PAST_DUE);
+        assertThat(h.s.debt()).isNotNull();
+    }
+    @Test void ordinaryStripeInitialObservationMustMatchTheOriginalCreate() {
+        var h=new Harness(UTC,PaymentProviderType.STRIPE);h.initial();h.isolated=false;
+        var pending=h.initialSnapshot(Subscription.Status.INCOMPLETE,BillingRecord.Kind.INITIAL,List.of(),OperationState.PENDING);
+        var foreign=new OperationObservation("foreign-create",OperationState.PENDING);
+        h.apply(new Snapshot(pending.subscriptionReference(),pending.status(),pending.billingPrice(),pending.period(),
+            null,null,pending.invoices(),foreign.operationKey(),false,0,UTC,foreign));
+        assertThat(h.s.billingStatus()).isEqualTo(Subscription.Status.PAST_DUE);
+        assertThat(h.s.debt()).isNotNull();
+    }
+    @Test void initialPendingExemptionPreservesActualFailureSemantics() {
+        for(boolean isolated:List.of(false,true))for(String control:List.of("pastDue","renewal","failedCash","applied")) {
             var h=new Harness(BILLING,PaymentProviderType.STRIPE);h.initial();
-            if(control.equals("ordinary"))h.isolated=false;
+            h.isolated=isolated;
             var cash=control.equals("failedCash")?List.of(new CashObject("pi_failed",1000,"EUR",dev.genericpayments.platform.payments.domain.PaymentStatus.FAILED,BILLING)):List.<CashObject>of();
             h.apply(h.initialSnapshot(control.equals("pastDue")?Subscription.Status.PAST_DUE:Subscription.Status.INCOMPLETE,
                 control.equals("renewal")?BillingRecord.Kind.RENEWAL:BillingRecord.Kind.INITIAL,cash,control.equals("applied")?OperationState.APPLIED:OperationState.PENDING));
-            assertThat(h.s.billingStatus()).as(control).isEqualTo(Subscription.Status.PAST_DUE);
+            assertThat(h.s.billingStatus()).as("%s, isolated=%s",control,isolated).isEqualTo(Subscription.Status.PAST_DUE);
             assertThat(h.s.debt()).as(control).isNotNull();assertThat(h.s.entitledPrice()).isNull();
             assertThat(h.journal).singleElement().satisfies(e->assertThat(e.type()).isEqualTo(SubscriptionEvent.Type.RENEWAL_FAILED));
         }
@@ -103,7 +145,13 @@ class SubscriptionBillingTimeFactTest {
         Harness(Instant billing,PaymentProviderType provider){
             account=PaymentAccount.create(s.paymentAccountId(),"account",provider,PaymentAccountMode.SANDBOX,"fake","ref");
             this.billing=billing;
-            var operations=port(SubscriptionOperationStore.class,(m,a)->{if(m.equals("unresolved"))return operation==null?List.of():List.of(operation);if(m.equals("lock"))return operation;if(m.equals("find"))return Optional.ofNullable(operation);throw new AssertionError(m);});
+            var operations=port(SubscriptionOperationStore.class,(m,a)->switch(m){
+                case "unresolved"->operation==null?List.of():List.of(operation);
+                case "lock"->operation;
+                case "find"->Optional.ofNullable(operation);
+                case "save"->{operation=(SubscriptionOperation)a[0];yield operation;}
+                default->throw new AssertionError(m);
+            });
             var trials=port(TrialEligibilityStore.class,(m,a)->Optional.empty());
             var site=Site.create(s.siteId(),SiteKey.of("site"),"Site",s.paymentAccountId(),Set.of(java.net.URI.create("https://test.example")),Set.of(AuthenticationMode.SITE_TOKEN),PaymentMethodPolicy.automatic());
             var clock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId z){return this;}public Instant instant(){clockReads++;return UTC;}};
@@ -129,7 +177,7 @@ class SubscriptionBillingTimeFactTest {
             operation=new SubscriptionOperation(id,s.siteId(),s.customerId(),s.id(),SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Status.PROCESSING,"customer:test","digest","v1.paid."+"a".repeat(64),key,0,0,s.providerReference(),null,UTC,UTC,1);
         }
         Snapshot initialSnapshot(Subscription.Status status,BillingRecord.Kind kind,List<CashObject> cash,OperationState state){
-            var period=new Subscription.Period(BILLING.minusSeconds(10),BILLING.plusSeconds(100));
+            var period=new Subscription.Period(billing.minusSeconds(10),billing.plusSeconds(100));
             return new Snapshot(s.providerReference(),status,s.billingPrice(),period,null,null,List.of(new Invoice("initial",kind,s.billingPrice(),null,period,1000,"EUR",SettlementKind.OPEN,cash)),operation.providerOperationKey(),false,0,UTC,new OperationObservation(operation.providerOperationKey(),state));
         }
         void apply(Snapshot snapshot){service.apply(new dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Command(account,s.id(),snapshot,SubscriptionEvent.Source.RECONCILIATION,"fact","unit",new Fence(s.revision(),operation==null?null:operation.id(),operation==null?null:operation.version(),new SubscriptionSweepPort.Claim(s.siteId(),s.id(),"owner",UUID.randomUUID(),s.revision()),null,0L)));}

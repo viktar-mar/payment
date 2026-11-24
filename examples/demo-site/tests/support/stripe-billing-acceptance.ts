@@ -22,6 +22,51 @@ const object=(v:unknown):v is Record<string,unknown>=>!!v&&typeof v==='object'&&
 const exact=(v:unknown,keys:string[]):v is Record<string,unknown>=>object(v)&&Object.keys(v).sort().join(',')===[...keys].sort().join(',');
 const duration=(l:BillingLimits)=>{billingCheck(l);return Math.min(45000,l.deadline-Date.now());};
 async function body(response:Response,l:BillingLimits):Promise<Record<string,unknown>>{const bytes=await billingBounded(l,()=>response.body());need(bytes.length<=65536);const v:unknown=JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(bytes));need(object(v));return v as Record<string,unknown>;}
+
+function initialSessionStatus(status:number):string{
+ switch(status){
+  case 400:return 'BROWSER_SESSION_HTTP_BAD_REQUEST';
+  case 401:return 'BROWSER_SESSION_HTTP_UNAUTHORIZED';
+  case 403:return 'BROWSER_SESSION_HTTP_FORBIDDEN';
+  case 404:return 'BROWSER_SESSION_HTTP_NOT_FOUND';
+  case 409:return 'BROWSER_SESSION_HTTP_CONFLICT';
+  case 429:return 'BROWSER_SESSION_HTTP_RATE_LIMITED';
+  default:return status>=500&&status<600?'BROWSER_SESSION_HTTP_SERVER':'BROWSER_INITIAL_SESSION_HTTP';
+ }
+}
+
+/** Inspect only a small, already received problem from the owned session POST. */
+async function initialSessionConflict(response:Response,limits:BillingLimits){
+ try{
+  return await billingBounded(limits,async diagnostic=>{
+   const [type,encoding,length]=await Promise.all([
+    response.headerValue('content-type'),response.headerValue('content-encoding'),response.headerValue('content-length'),
+   ]);
+   if(!type || !/^application\/problem\+json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i.test(type.trim()) ||
+    encoding!==null&&encoding.trim().toLowerCase()!=='identity')return;
+   const maximum=4096;
+   if(!length||!/^[1-9][0-9]{0,3}$/.test(length))return;
+   const declaredSize=Number(length);
+   if(declaredSize>maximum)return;
+   billingCheck(diagnostic);
+   const {responseBodySize}=await response.request().sizes();
+   if(!Number.isSafeInteger(responseBodySize)||responseBodySize<1||responseBodySize>maximum)return;
+   billingCheck(diagnostic);
+   const bytes=await response.body();
+   billingCheck(diagnostic);
+   if(bytes.length!==declaredSize)return;
+   const problem:unknown=JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(bytes));
+   if(!object(problem)||problem.status!==409||typeof problem.code!=='string'||problem.type!=='urn:payment:problem:'+problem.code)return;
+   switch(problem.code){
+    case 'PROVIDER_EVIDENCE_MISMATCH':return 'BROWSER_SESSION_PROVIDER_EVIDENCE';
+    case 'SUBSCRIPTION_STATE_CONFLICT':return 'BROWSER_SESSION_STATE_CONFLICT';
+    case 'SUBSCRIPTION_CONFLICT':return 'BROWSER_SESSION_APPLICATION_CONFLICT';
+    case 'resource_conflict':return 'BROWSER_SESSION_RESOURCE_CONFLICT';
+   }
+  },2000);
+ }catch{return undefined;}
+}
+
 /** Observes and persists the SDK's own key. Never changes body/headers, fetches, replays or fulfills a financial request. */
 export async function forwardBillingDispatch(route:Pick<Route,'request'|'continue'>,port:Pick<BillingPort,'beforeDispatch'>,binding:BillingBinding,authority:string,kind:'create'|'confirm',identity:Record<string,string>|undefined,limits:BillingLimits,confirmation?:{token:string;check:()=>void},check?:()=>void|Promise<void>,authorizeResponse?:(request:Request)=>Promise<void>,beforeForward?:()=>true):Promise<void>{
  try{billingCheck(limits);const request=route.request(),base=binding.endpoints.backend+'/api/v1/customer/subscriptions';
@@ -462,7 +507,16 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   }finally{initialReads.length=0;}
   if(retryPort)checkpoint='BROWSER_SESSION_UNPAIRED';
   paired('initial-session',selected);
-  checkpoint='BROWSER_INITIAL_SESSION_HTTP';need(selected.status()===200);
+  const sessionStatus=selected.status();
+  if(sessionStatus!==200){
+   const ownsFailure=firstFailure===undefined;
+   recordFailure(retryPort?initialSessionStatus(sessionStatus):'BROWSER_INITIAL_SESSION_HTTP');
+   if(ownsFailure&&retryPort&&sessionStatus===409){
+    const category=await initialSessionConflict(selected,limits);
+    if(category)firstFailure=category;
+   }
+   fail();
+  }
   checkpoint='BROWSER_INITIAL_SESSION_WIRE';const selectedBody=await body(selected,limits);need(selectedBody.protocol==='SERVER_CONFIRM_V2'&&selectedBody.provider==='stripe'&&selectedBody.flow==='PAYMENT'&&uuid(selectedBody.attempt_id));attemptId=selectedBody.attempt_id as string;
   if(bound){sessionContext(selectedBody,false);initialPresentationReady.resolve();}
   if(cancellationPort && typeof selectedBody.publishable_key==='string' && /^pk_test_[A-Za-z0-9_]+$/.test(selectedBody.publishable_key))publishableKey=selectedBody.publishable_key;

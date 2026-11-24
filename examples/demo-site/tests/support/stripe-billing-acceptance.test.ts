@@ -36,7 +36,11 @@ import type {Browser, Request, Response} from '@playwright/test';
 import type {BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort,BillingInvoiceWebhooksPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import {browserCleanupConfirmed,browserDiagnostic} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 
-function cancellationPage(fault = '', declineRetry = false, sca = false, invoiceCase = false) {
+type SessionFailure = {
+ status:number; problem?:object; contentType?:string; contentEncoding?:string; contentLength?:string|null;
+ measuredSize?:number; unreadable?:boolean; holdSize?:()=>Promise<void>; holdBody?:()=>Promise<void>;
+};
+function cancellationPage(fault = '', declineRetry = false, sca = false, invoiceCase = false, sessionFailure?:SessionFailure) {
  const id = (n:number) => '11111111-2222-4333-8444-' + String(n).padStart(12, '0');
  const b = {...binding, siteKey:'demo-key', email:'user@example.test', siteId:id(1), productId:id(2)};
  const [sub, create, attempt, schedule, withdraw] = [id(3), id(4), id(5), id(6), id(7)];
@@ -53,7 +57,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const sessionFor=(id:string)=>({protocol:'SERVER_CONFIRM_V2',provider:'stripe',flow:'PAYMENT',attempt_id:id,publishable_key:'pk_test_fixture',
   capability:'bca2_'+(id===attempt?'C':'D').repeat(43),client_secret:'pi_original_secret_fixture',expires_at:boundary});
  const receiptFor=(id:string,state:string,retry_allowed:boolean,successor_attempt_id:string|null)=>({protocol:'SERVER_CONFIRM_V2',attempt_id:id,state,retry_allowed,successor_attempt_id,expires_at:boundary});
- let payCount=0,retryClicked=false,nonce=30,staticProbed=false;
+ let payCount=0,retryClicked=false,nonce=30,staticProbed=false,sessionErrorBodyReads=0;
  let requestFailed=(request:Request)=>{void request;};
  const presentation:string[]=[];
  async function staticPresentation(){
@@ -85,9 +89,18 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const earlyStatic=declineRetry && fault.startsWith('early-static') && request.url()===select;
   const bodyAvailable=earlyStatic?Promise.withResolvers<void>():undefined;
   const response = {request:()=>request,url:()=>request.url(),status:()=>status,fromServiceWorker:()=>false,body:async()=>{
+   if(request.url()===select && status!==200){
+    sessionErrorBodyReads++;
+    if(sessionFailure?.unreadable)throw Error('private diagnostic canary');
+    await sessionFailure?.holdBody?.();
+   }
    await bodyAvailable?.promise;
    return Buffer.from(JSON.stringify(json));
-  }} as Response;
+  },headerValue:async(name:string)=>{
+   if(name==='content-type')return sessionFailure?.contentType??null;
+   if(name==='content-length')return sessionFailure?.contentLength===undefined?String(Buffer.byteLength(JSON.stringify(json))):sessionFailure.contentLength;
+   return sessionFailure?.contentEncoding??null;
+  }} as unknown as Response;
   for(const w of waiters) if(w.predicate(response)){waiters.delete(w);w.resolve(response);}
   if(bodyAvailable){
    // The page got its session response. The observer's independent body read
@@ -205,6 +218,10 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     }
     return headers;
    },
+   sizes:async()=>{
+    await sessionFailure?.holdSize?.();
+    return {responseBodySize:sessionFailure?.measuredSize??Buffer.byteLength(JSON.stringify(result))};
+   },
    postData:()=>withdrawPost && fault==='malformed-withdraw'?'{"mode":"PERIOD_END"}':
     JSON.stringify(schedulePost&&fault==='immediate'?{mode:'IMMEDIATE'}:value)
   } as unknown as Request;
@@ -265,7 +282,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
       if(currentStatus!==200 || actionStatus!==200 || ['initial-session-not-sent','initial-foreign-action','initial-foreign-authority','initial-ambiguous-action','initial-too-many-reads','initial-read-headers-pending'].includes(fault))return;
      }
      const actionToken='bga1_'+'G'.repeat(fault==='initial-session-guard'?42:43);
-     await send(select,{action_token:actionToken},session,fault.startsWith('session-http')?409:200);
+     await send(select,{action_token:actionToken},sessionFailure?.problem??session,sessionFailure?.status??(fault.startsWith('session-http')?409:200));
     };
     void prepare().catch(()=>{});
     }
@@ -389,7 +406,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   beforeCancellation:async(kind:string,key:string)=>{trace.push('persist '+kind+' '+key);return fault!=='persist';},
   verifyCancellation:async(kind:string,operation:string)=>{trace.push('verify '+kind+' '+operation);return fault!=='proof';}
  } as BillingCancellationPort&BillingDeclineRetryPort&BillingInitial3dsPort&BillingInvoiceWebhooksPort;
- return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,presentation,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed};
+ return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,presentation,sessionErrorBodyReads:()=>sessionErrorBodyReads,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed};
 }
 test('same-page manager schedules and withdraws once after the initial paid proof',async()=>{
  const f=cancellationPage();
@@ -479,9 +496,9 @@ test('a pinned subresource cannot start transport before the original session is
  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
 });
 for(const [fault,expected,closed] of [
- ['session-http','BROWSER_INITIAL_SESSION_HTTP',true],
+ ['session-http','BROWSER_SESSION_HTTP_CONFLICT',true],
  ['early-static-invalid-session','BROWSER_INITIAL_SESSION_WIRE',true],
- ['session-http-close-fails','BROWSER_INITIAL_SESSION_HTTP',false],
+ ['session-http-close-fails','BROWSER_SESSION_HTTP_CONFLICT',false],
  ['early-static-navigation','BROWSER_INVALIDATED',true],
 ] as const)test('decline retry reports only the original safe session boundary for '+fault,async()=>{
  const f=cancellationPage(fault,true);
@@ -491,6 +508,71 @@ for(const [fault,expected,closed] of [
   assert.equal(String(error),'Error: billing_BROWSER');
   return true;
  });
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+const conflictProblem=(code:string)=>({type:'urn:payment:problem:'+code,code,status:409,title:'private diagnostic canary'});
+const conflictReply=(code:string):SessionFailure=>({status:409,contentType:'application/problem+json; charset=utf-8',problem:conflictProblem(code)});
+const providerConflict=conflictReply('PROVIDER_EVIDENCE_MISMATCH');
+for(const [fixture,expected,reads] of [
+ [providerConflict,'BROWSER_SESSION_PROVIDER_EVIDENCE',1],
+ [conflictReply('SUBSCRIPTION_STATE_CONFLICT'),'BROWSER_SESSION_STATE_CONFLICT',1],
+ [conflictReply('SUBSCRIPTION_CONFLICT'),'BROWSER_SESSION_APPLICATION_CONFLICT',1],
+ [conflictReply('resource_conflict'),'BROWSER_SESSION_RESOURCE_CONFLICT',1],
+ [conflictReply('private diagnostic canary'),'BROWSER_SESSION_HTTP_CONFLICT',1],
+ [{...providerConflict,problem:{...providerConflict.problem,type:'urn:payment:problem:other'}},'BROWSER_SESSION_HTTP_CONFLICT',1],
+ [{...providerConflict,contentType:'application/json'},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,contentType:'application/problem+json; charset=utf-8, application/json'},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,contentEncoding:'gzip'},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,contentLength:null},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,contentLength:'4097'},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,contentLength:'1, 1'},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,measuredSize:4097},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,measuredSize:4096,contentLength:'4096',problem:{...providerConflict.problem,title:'x'.repeat(4096)}},'BROWSER_SESSION_HTTP_CONFLICT',1],
+ [{...providerConflict,unreadable:true},'BROWSER_SESSION_HTTP_CONFLICT',1],
+ [{...providerConflict,status:400},'BROWSER_SESSION_HTTP_BAD_REQUEST',0],
+ [{...providerConflict,status:401},'BROWSER_SESSION_HTTP_UNAUTHORIZED',0],
+ [{...providerConflict,status:403},'BROWSER_SESSION_HTTP_FORBIDDEN',0],
+ [{...providerConflict,status:404},'BROWSER_SESSION_HTTP_NOT_FOUND',0],
+ [{...providerConflict,status:429},'BROWSER_SESSION_HTTP_RATE_LIMITED',0],
+ [{...providerConflict,status:503},'BROWSER_SESSION_HTTP_SERVER',0],
+ [{...providerConflict,status:418},'BROWSER_INITIAL_SESSION_HTTP',0],
+] as const)test('decline retry emits a fixed paired session failure code '+expected+' (reads '+reads+')',async()=>{
+ const f=cancellationPage('',true,false,false,fixture);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000}),(error:unknown)=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),expected);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(f.sessionErrorBodyReads(),reads);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('decline retry ignores even a valid problem from an unpaired session response',async()=>{
+ const f=cancellationPage('initial-session-unpaired',true,false,false,providerConflict);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000}),(error:unknown)=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_SESSION_UNPAIRED');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(f.sessionErrorBodyReads(),0);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [hold,reads] of [['holdSize',0],['holdBody',1]] as const)test('decline retry leaves the HTTP conflict unchanged after cancellation at '+hold,async()=>{
+ const started=Promise.withResolvers<void>(),release=Promise.withResolvers<void>();
+ const f=cancellationPage('',true,false,false,{...providerConflict,[hold]:()=>{started.resolve();return release.promise;}});
+ const controller=new AbortController();
+ const result=assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000,signal:controller.signal}),(error:unknown)=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_SESSION_HTTP_CONFLICT');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ try{
+  await Promise.race([started.promise,result]);
+  controller.abort();
+  await result;
+ }finally{release.resolve();}
+ await new Promise<void>(resolve=>setImmediate(resolve));
+ assert.equal(f.sessionErrorBodyReads(),reads);
  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
 });
 for(const [fault,expected] of [

@@ -10,6 +10,8 @@ import dev.genericpayments.platform.customers.domain.*;
 import dev.genericpayments.platform.sites.application.port.out.LoadSitePort;
 import dev.genericpayments.platform.sites.domain.*;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
+import dev.genericpayments.platform.shared.adapter.in.web.ApiExceptionHandler;
+import dev.genericpayments.platform.shared.application.PaymentApplicationException;
 import dev.genericpayments.platform.subscriptions.application.model.*;
 import dev.genericpayments.platform.subscriptions.application.port.in.SubscriptionConfirmationUseCase;
 import java.time.Instant;
@@ -28,7 +30,7 @@ class StripeSubscriptionConfirmationHttpTest {
  @BeforeEach void setup(){
   var sites=mock(LoadSitePort.class);when(sites.findAll()).thenReturn(List.of(Site.create(site,new SiteKey("shop"),"Shop",new PaymentAccountId(UUID.randomUUID()),Set.of(URI.create("https://shop.test")),Set.of(AuthenticationMode.SITE_TOKEN),PaymentMethodPolicy.automatic())));
   var sessions=mock(CustomerSessionResolver.class);when(sessions.resolveRequired(token,"https://shop.test")).thenReturn(session);
-  var mapper=new tools.jackson.databind.ObjectMapper();mvc=MockMvcBuilders.standaloneSetup(new SubscriptionConfirmationController(use)).addFilters(new SubscriptionRequestPolicyFilter(mapper,true),new CustomerSessionAuthenticationFilter(sessions,sites,mapper),new SubscriptionRequestPolicyFilter(mapper,false)).build();
+  var mapper=new tools.jackson.databind.ObjectMapper();mvc=MockMvcBuilders.standaloneSetup(new SubscriptionConfirmationController(use)).setControllerAdvice(new ApiExceptionHandler()).addFilters(new SubscriptionRequestPolicyFilter(mapper,true),new CustomerSessionAuthenticationFilter(sessions,sites,mapper),new SubscriptionRequestPolicyFilter(mapper,false)).build();
  }
  @AfterEach void clear(){SecurityContextHolder.clearContext();}
  org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder postTo(String path,String body){return post(base+path).header("Origin",session.origin()).header("Authorization","Bearer "+token).header("Idempotency-Key","command").contentType("application/json").content(body);}
@@ -43,6 +45,16 @@ class StripeSubscriptionConfirmationHttpTest {
  @Test void confirmationResponseAloneCarriesTheInvocationPermission()throws Exception{
   when(use.confirm(any(),eq(attempt),eq(capability),eq("ctoken_original"))).thenReturn(new SubscriptionConfirmationUseCase.Confirm(new SubscriptionConfirmationUseCase.Status(attempt,SubscriptionConfirmationAttempt.State.REQUIRES_ACTION,false,null,expiry),true));
   mvc.perform(postTo("/confirmation-attempts/"+attempt+"/confirm","{\"capability\":\""+capability+"\",\"confirmation_token\":\"ctoken_original\"}")).andExpect(status().isOk()).andExpect(jsonPath("$.next_action_allowed").value(true)).andExpect(jsonPath("$.client_secret").doesNotExist()).andExpect(header().string("Cache-Control","no-store"));
+ }
+ @Test void sessionConflictReturnsTheStableProblemContract()throws Exception{
+  var code="SUBSCRIPTION_STATE_CONFLICT";
+  when(use.select(any(),eq(root))).thenThrow(new PaymentApplicationException(code,409,"Subscription state conflict"));
+  var json=mvc.perform(postTo("/confirmation-session","{\"action_token\":\""+root+"\"}"))
+   .andExpect(status().isConflict()).andExpect(content().contentTypeCompatibleWith("application/problem+json"))
+   .andExpect(jsonPath("$.type").value("urn:payment:problem:"+code)).andExpect(jsonPath("$.status").value(409))
+   .andExpect(jsonPath("$.code").value(code)).andReturn().getResponse().getContentAsString();
+  assertThat(json).doesNotContain(secret,capability,root);
+  verify(use).select(any(),eq(root));verifyNoMoreInteractions(use);
  }
  @Test void strictBodiesAndAbsentOriginAreRejectedBeforeUse()throws Exception{
   for(String body:List.of("{\"force\":true}","{\"capability\":\"a\",\"capability\":\"b\"}"))mvc.perform(postTo("/confirmation-attempts/"+attempt+"/retry",body)).andExpect(status().isBadRequest()).andExpect(header().string("Cache-Control","no-store"));
