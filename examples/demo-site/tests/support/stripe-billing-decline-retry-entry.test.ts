@@ -50,7 +50,7 @@ test('the closed failed owner supplies only its finite phase, code and cleanup t
   const r={retry:0,status:'failed',annotations:[]} as unknown as TestResult;
   const owner={run:async()=>{throw Error('raw-provider-canary');},resources:()=>terminal,close:async()=>{
    if(mode==='failed-close')throw Error('raw-close-canary');
-   if(mode==='browser-session')return {...terminal,phase:'RETRY_ACK',code:'BROWSER_INITIAL_SESSION_HTTP'};
+   if(mode==='browser-session')return {...terminal,phase:'RETRY_ACK',code:'BROWSER_SESSION_REQUEST_REJECTED'};
    return mode==='canary'?{...terminal,code:'raw-canary'}:terminal;
   }};
   if(mode==='preexisting')r.annotations.push({type:'owned-decline-retry-terminal',description:'private'});
@@ -63,7 +63,7 @@ test('the closed failed owner supplies only its finite phase, code and cleanup t
    report.onTestEnd(t,mode==='replaced-result'?{...r}:r);
    report.onEnd({status:'failed'} as FullResult);
   }finally{process.stdout.write=write;}
-  const stage=mode==='browser-session'?'phase=RETRY_ACK code=BROWSER_INITIAL_SESSION_HTTP':'phase=RETRY_EVIDENCE code=RETRY_EVIDENCE';
+  const stage=mode==='browser-session'?'phase=RETRY_ACK code=BROWSER_SESSION_REQUEST_REJECTED':'phase=RETRY_EVIDENCE code=RETRY_EVIDENCE';
   const expected='owned_initial_decline_retry_terminal '+stage+' cleanup='+(mode==='failed-close'?'UNCONFIRMED':'CONFIRMED')+'\n';
   assert.deepEqual(lines, [...(['original','failed-close','browser-session'].includes(mode)?[expected]:[]),'owned_initial_decline_retry_not_accepted full5b=NOT_ACCEPTED\n']);
  }

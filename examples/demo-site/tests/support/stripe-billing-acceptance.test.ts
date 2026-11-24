@@ -3,7 +3,7 @@ import test from 'node:test';import assert from 'node:assert/strict';import {rea
 // @ts-expect-error Native Node type erasure requires explicit source extension.
 import {forwardBillingDispatch,runInitialBillingBrowser,runBillingCancellationBrowser,runBillingDeclineRetryBrowser,runBillingInitial3dsBrowser,runBillingInvoiceWebhooksBrowser} from './stripe-billing-acceptance.ts';
 import type {BillingBinding,BillingPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
-import type {Route} from '@playwright/test';
+import {errors,type Route} from '@playwright/test';
 const binding={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081',receiver:'http://127.0.0.1:18082'},priceId:'11111111-2222-4333-8444-555555555555'} as BillingBinding;
 function fixture(){const calls:string[]=[],headers={origin:binding.endpoints.demo,'content-type':'application/json',authorization:'Bearer '+'A'.repeat(43),'idempotency-key':'original-sdk-key'};let args:unknown[]=[];const request={url:()=>binding.endpoints.backend+'/api/v1/customer/subscriptions',method:()=> 'POST',redirectedFrom:()=>null,postData:()=>JSON.stringify({price_id:binding.priceId,recurring_consent:true}),allHeaders:async()=>headers};const route={request:()=>request,continue:async(...v:unknown[])=>{args=v;calls.push('continue');}} as unknown as Route;const port={beforeDispatch:async()=>{calls.push('persist');return true;}} as unknown as BillingPort;return {calls,headers,request,route,port,args:()=>args};}
 test('original browser CREATE waits for durable key before unmodified continuation',async()=>{const f=fixture();await forwardBillingDispatch(f.route,f.port,binding,'Bearer '+'A'.repeat(43),'create',undefined,{deadline:Date.now()+1000});assert.deepEqual(f.calls,['persist','continue']);assert.deepEqual(f.args(),[]);});
@@ -45,7 +45,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const base = b.endpoints.backend + '/api/v1/customer/subscriptions';
  const otp = b.endpoints.backend + '/api/v1/public/customer-auth/email-otp/challenges';
  const cancel = base + '/' + sub + '/cancellation';
- const select = base + '/' + sub + '/operations/' + create + '/confirmation-session';
+ const operation = base + '/' + sub + '/operations/' + create;
+ const select = operation + '/confirmation-session';
  const confirm = base + '/' + sub + '/operations/' + create + '/confirmation-attempts/' + attempt + '/confirm';
  const trace:string[] = [], sent:string[] = [], numbers:string[]=[];
  const successor=id(21),retry=confirm.replace(/confirm$/,'retry'),nextConfirm=confirm.replace(attempt!,successor);
@@ -80,7 +81,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const navigationListeners:((frame:unknown)=>void)[]=[];
  const navigate=(frame:unknown)=>{for(const listener of navigationListeners)listener(frame);};
  const waiters = new Set<{predicate:(r:Response)=>boolean;resolve:(r:Response)=>void;reject:(e:Error)=>void}>();
- function publish(request:Request, status:number, json:object) {
+ function publish(request:Request, status:number, json:object|null) {
   const earlyStatic=declineRetry && fault.startsWith('early-static') && request.url()===select;
   const bodyAvailable=earlyStatic?Promise.withResolvers<void>():undefined;
   const response = {request:()=>request,url:()=>request.url(),status:()=>status,fromServiceWorker:()=>false,body:async()=>{
@@ -184,10 +185,11 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:fault==='wrong-issuer-transaction'?server:acs})).toString('base64url');
   await wire(fault==='foreign-issuer-path'?issuerUrl+'/foreign':issuerUrl,issuer,'creq='+creq,{},true);
  }
- async function send(url:string, value:object, result:object, status=202, method='POST') {
+ async function send(url:string, value:object, result:object|null, status=202, method='POST') {
   const schedulePost = url===cancel, withdrawPost=url===cancel+'/withdraw';
   const key = declineRetry||sca||invoiceCase?id(nonce++):schedulePost?id(9):withdrawPost?(fault==='same-key'?id(9):id(10)):'initial-key';
   const headers = {'idempotency-key':key,authorization:'Bearer '+token,origin:b.endpoints.demo,'content-type':'application/json'};
+  if(fault==='initial-foreign-authority' && url===operation+'/action' && status===409)headers.authorization='Bearer '+'B'.repeat(43);
   if(schedulePost && fault==='origin')headers.origin='https://elsewhere.invalid';
   if(schedulePost && fault==='cookie')Object.assign(headers,{cookie:'session=demo'});
   if(schedulePost && fault==='token')headers.authorization='Bearer '+'B'.repeat(43);
@@ -196,8 +198,13 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    existingResponse:()=>existing,url:()=>schedulePost && fault==='foreign-endpoint'?url.replace(sub!,id(19)):
     schedulePost && fault==='foreign-host'?url.replace(b.endpoints.backend,'https://unowned.invalid'):url,
    method:()=>method,
-   frame:()=>schedulePost && fault==='wrong-frame'?{}:frame,isNavigationRequest:()=>false,
-   redirectedFrom:()=>schedulePost&&fault==='redirect'?{}:null,allHeaders:async()=>headers,
+   frame:()=>schedulePost && fault==='wrong-frame'||url===select && fault==='initial-session-frame'?{}:frame,isNavigationRequest:()=>false,
+   redirectedFrom:()=>schedulePost&&fault==='redirect'?{}:null,allHeaders:async()=>{
+    if(url===select && fault==='initial-session-headers-pending' || url===operation+'/action' && fault==='initial-read-headers-pending'){
+     await new Promise<void>(resolve=>{releaseDispatch=resolve;});
+    }
+    return headers;
+   },
    postData:()=>withdrawPost && fault==='malformed-withdraw'?'{"mode":"PERIOD_END"}':
     JSON.stringify(schedulePost&&fault==='immediate'?{mode:'IMMEDIATE'}:value)
   } as unknown as Request;
@@ -205,7 +212,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const label=url===otp?'otp':url.endsWith('/verify')?'verify':url===base?'create':url===select?'selection':url===confirm?'confirm':'read';
   const route = {request:()=>request,continue:async(...args:unknown[])=>{
    assert.deepEqual(args,[]);sent.push(request.url());await reply(label,status);
-   existing=publish((schedulePost&&fault==='foreign-request'||url===retry&&fault==='wrong-retry-response')?{...request} as Request:request,status,result);
+   if(url===select && fault==='initial-session-no-response')return;
+   existing=publish((schedulePost&&fault==='foreign-request'||url===retry&&fault==='wrong-retry-response'||url===select&&fault==='initial-session-unpaired')?{...request} as Request:request,status,result);
   },abort:async()=>{}} as unknown as Route;
   await handler(route);
   if(closed)throw new Error('closed');
@@ -233,10 +241,33 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      await send(base+'?limit=100',{}, {items:[],next_cursor:null},200,'GET');
     }
     if(name==='Create subscription'){
-     await send(base,{price_id:b.priceId,recurring_consent:true},{subscription_id:sub,operation_id:create,status:'PROCESSING'});
+     const directAction=fault==='initial-direct-action';
+     await send(base,{price_id:b.priceId,recurring_consent:true},{subscription_id:sub,operation_id:create,status:directAction?'REQUIRES_ACTION':'PROCESSING',
+      action_available:directAction,next_action:directAction?{kind:'PROVIDER_CLIENT',secret:'bga1_'+'G'.repeat(43),expires_at:boundary}:null,browser_confirm_allowed:false});
      const session=sessionFor(attempt!);
      if(fault==='early-static-invalid-session')session.capability='invalid';
-     void send(select,{action_token:'bga1_'+'G'.repeat(43)},session,fault.startsWith('session-http')?409:200).catch(()=>{});
+    const prepare = async()=>{
+     if(declineRetry){
+      if(fault==='initial-operation-missing' || fault==='initial-page-closed' || directAction)return;
+      const operationStatus=fault==='initial-operation-http'?503:200;
+      await send(operation,{}, {status:'PROCESSING',operation_id:create,subscription_id:sub,action_available:false},operationStatus,'GET');
+      if(operationStatus!==200)return;
+      if(fault==='initial-action-missing')return;
+      const actionStatus=fault==='initial-action-conflict'?409:fault==='initial-action-http'?503:200;
+      if(fault==='initial-foreign-action')await send(operation.replace(sub!,id(72))+'/action',{}, {},409,'GET');
+      if(fault==='initial-foreign-authority')await send(operation+'/action',{}, {},409,'GET');
+      if(fault==='initial-ambiguous-action')await send(operation+'/action',{}, {},409,'GET');
+      if(fault==='initial-too-many-reads')for(let n=80;n<93;n++)await send(operation.replace(sub!,id(n))+'/action',{}, {},409,'GET');
+      await send(operation+'/action',{}, {kind:'PROVIDER_CLIENT',secret:'bga1_'+'G'.repeat(43),expires_at:boundary},actionStatus,'GET');
+      if(fault==='initial-current-missing')return;
+      const currentStatus=fault==='initial-current-http'?503:200;
+      await send(operation+'/confirmation-attempts/current',{}, null,currentStatus,'GET');
+      if(currentStatus!==200 || actionStatus!==200 || ['initial-session-not-sent','initial-foreign-action','initial-foreign-authority','initial-ambiguous-action','initial-too-many-reads','initial-read-headers-pending'].includes(fault))return;
+     }
+     const actionToken='bga1_'+'G'.repeat(fault==='initial-session-guard'?42:43);
+     await send(select,{action_token:actionToken},session,fault.startsWith('session-http')?409:200);
+    };
+    void prepare().catch(()=>{});
     }
     if(name==='Pay'){
      if(fault==='before-actual-click')await provider('https://api.stripe.com/v1/confirmation_tokens');
@@ -328,7 +359,15 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    documentUrl=url;
    if(sca||invoiceCase)await provider('https://js.stripe.com/v3/',frame,false,'GET');
   },locator:()=>({first:()=>manager}),
-  waitForResponse:(predicate:(r:Response)=>boolean)=>new Promise<Response>((resolve,reject)=>{if(closed)reject(new Error('closed'));else waiters.add({predicate,resolve,reject});})
+  waitForResponse:(predicate:(r:Response)=>boolean,{timeout=3000}={})=>new Promise<Response>((resolve,reject)=>{
+   if(closed){reject(new Error('closed'));return;}
+   const waiter={predicate,resolve:(response:Response)=>{clearTimeout(timer);resolve(response);},reject:(error:Error)=>{clearTimeout(timer);reject(error);}};
+   const timer=setTimeout(()=>{
+    waiters.delete(waiter);
+    reject(fault==='initial-page-closed'?new Error('private page closed reason'):new errors.TimeoutError('private fixture URL during response wait'));
+   },timeout);
+   waiters.add(waiter);
+  })
  };
  const context={
   newPage:async()=>page,on:()=>{},routeWebSocket:async(_pattern:unknown,fn:typeof socketHandler)=>{socketHandler=fn;},route:async(pattern:unknown,fn:typeof handler)=>{interceptsProvider=pattern==='**/*';handler=fn;},
@@ -452,6 +491,38 @@ for(const [fault,expected,closed] of [
   assert.equal(String(error),'Error: billing_BROWSER');
   return true;
  });
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [fault,expected] of [
+ ['initial-operation-missing','BROWSER_OPERATION_NOT_SEEN'],
+ ['initial-page-closed','BROWSER_INITIAL_SESSION'],
+ ['initial-direct-action','BROWSER_SESSION_NOT_SENT'],
+ ['initial-operation-http','BROWSER_OPERATION_HTTP'],
+ ['initial-action-missing','BROWSER_ACTION_NOT_SEEN'],
+ ['initial-action-conflict','BROWSER_ACTION_CONFLICT'],
+ ['initial-action-http','BROWSER_ACTION_HTTP'],
+ ['initial-current-missing','BROWSER_CURRENT_NOT_SEEN'],
+ ['initial-current-http','BROWSER_CURRENT_HTTP'],
+ ['initial-session-not-sent','BROWSER_SESSION_NOT_SENT'],
+ ['initial-foreign-action','BROWSER_SESSION_NOT_SENT'],
+ ['initial-foreign-authority','BROWSER_SESSION_NOT_SENT'],
+ ['initial-ambiguous-action','BROWSER_INITIAL_SESSION'],
+ ['initial-read-headers-pending','BROWSER_INITIAL_SESSION'],
+ ['initial-too-many-reads','BROWSER_INITIAL_SESSION'],
+ ['initial-session-guard','BROWSER_SESSION_REQUEST_REJECTED'],
+ ['initial-session-frame','BROWSER_SESSION_REQUEST_REJECTED'],
+ ['initial-session-headers-pending','BROWSER_SESSION_REQUEST_PENDING'],
+ ['initial-session-no-response','BROWSER_SESSION_NO_RESPONSE'],
+ ['initial-session-unpaired','BROWSER_SESSION_UNPAIRED'],
+] as const)test('decline retry reports the exact original response boundary for '+fault,async()=>{
+ const f=cancellationPage(fault,true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+350}),(error:unknown)=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),expected);
+  assert.equal(browserCleanupConfirmed(error),true);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  return true;
+ });
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirmation-session')).length,['initial-session-no-response','initial-session-unpaired'].includes(fault)?1:0);
  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
 });
 for(const fault of ['unknown-first','early-retry','no-decline-proof','repeat-retry','wrong-retry-response','same-successor','different-pi','reused-token','retired-retry','retired-successor']){

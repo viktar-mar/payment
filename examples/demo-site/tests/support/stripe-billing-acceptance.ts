@@ -1,3 +1,4 @@
+import {errors} from '@playwright/test';
 import type {Browser,Route,Request,Response,BrowserContext,Page,Locator,Frame,JSHandle} from '@playwright/test';
 import type {BillingPort,BillingBinding,BillingLimits,BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort,BillingInvoiceWebhooksPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {GenericSubscriptionManager} from '@generic-payments/sdk';
@@ -178,6 +179,9 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   let cancellation:ReturnType<typeof cancellationJourney>|undefined, challengeId:string|undefined;
   let payInFlight=false, trustedPayClick:JSHandle<()=>boolean>|undefined, tokenRequest:Request|undefined, publishableKey:string|undefined;
   const requests=new Map<string,Request>(),keys=new Set<string>();
+  const initialReads:{url:string;request:Request;authorized?:boolean}[]=[];
+  const initialReadPath=/^\/[a-f0-9-]{36}\/operations\/[a-f0-9-]{36}(?:\/action|\/confirmation-attempts\/current)?$/;
+  let initialReadOverflow=false,initialSessionObserved=false,initialSessionForwarded=false;
   let sessionExpiry=0;
   let firstAttempt='',firstSecret='',capability='',firstToken='',successorId='';
   let trustedRetry:JSHandle<()=>boolean>|undefined,trustedCreate:JSHandle<()=>boolean>|undefined;
@@ -195,6 +199,40 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   }
   function paired(kind:string,response:Response){
    if(bound)need(response.request()===requests.get(kind) && !response.fromServiceWorker() && !response.request().redirectedFrom());
+  }
+  function observeInitialRead(url:string,request:Request){
+   if(initialReads.length===12){initialReadOverflow=true;return;}
+   const observation:{url:string;request:Request;authorized?:boolean}={url,request};
+   const expectedAuthority=authority;
+   initialReads.push(observation);
+   // Inspect request identity independently of continuation. A failed observation never controls routing.
+   void request.allHeaders().then(headers=>{
+    observation.authorized=!!expectedAuthority && headers.authorization===expectedAuthority && headers.origin===binding.endpoints.demo &&
+     !headers.cookie && !headers['proxy-authorization'];
+   }).catch(()=>{});
+  }
+  function initialSessionBoundary(original:string,expectsReads:boolean){
+   const session=requests.get('initial-session');
+   if(session?.existingResponse())return 'BROWSER_SESSION_UNPAIRED';
+   if(initialSessionForwarded)return 'BROWSER_SESSION_NO_RESPONSE';
+   if(initialSessionObserved || session)return 'BROWSER_SESSION_REQUEST_PENDING';
+   if(!expectsReads)return 'BROWSER_SESSION_NOT_SENT';
+   if(initialReadOverflow)return 'BROWSER_INITIAL_SESSION';
+   for(const [suffix,missing,http] of [
+    ['', 'BROWSER_OPERATION_NOT_SEEN', 'BROWSER_OPERATION_HTTP'],
+    ['/action', 'BROWSER_ACTION_NOT_SEEN', 'BROWSER_ACTION_HTTP'],
+    ['/confirmation-attempts/current', 'BROWSER_CURRENT_NOT_SEEN', 'BROWSER_CURRENT_HTTP'],
+   ] as const){
+    const url=original+suffix,owned=initialReads.filter(read=>read.url===url && read.authorized!==false);
+    const read=owned[0];
+    if(owned.length>1 || (read && !read.authorized))return 'BROWSER_INITIAL_SESSION';
+    const request=read?.request,response=request?.existingResponse();
+    if(!response || response.request()!==request || response.url()!==url || response.fromServiceWorker())return missing;
+    const status=response.status();
+    if(suffix==='/action' && status===409)return 'BROWSER_ACTION_CONFLICT';
+    if(status!==200)return http;
+   }
+   return 'BROWSER_SESSION_NOT_SENT';
   }
   function trustedClick(button:Locator){
    return button.evaluateHandle(element=>{
@@ -299,6 +337,9 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
      if(target.origin!==binding.endpoints.backend){routeCheckpoint='BROWSER_PROVIDER_ROUTE';await providerTraffic(route,target);return;}
      if(cancellation && !['GET','OPTIONS'].includes(method)){await cancellation.forward(route);return;}
     }
+    const observingSession=retryPort && !attemptId && method==='POST' && subscriptionId && operationId &&
+     url===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-session';
+    if(observingSession){initialSessionObserved=true;routeCheckpoint='BROWSER_SESSION_REQUEST_REJECTED';}
     if(bound)need(req.frame()===page.mainFrame() && !req.isNavigationRequest() && !req.redirectedFrom());
     async function continueBackend(){
      if(redirects){
@@ -308,7 +349,13 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
      }
      await route.continue();
     }
-    if(method==='OPTIONS' || method==='GET'){await continueBackend();return;}
+    if(method==='OPTIONS' || method==='GET'){
+     // The SDK may start its reads before the controller parses the CREATE response.
+     // Retain only a few request references. Classify them later against the exact receipt.
+     if(retryPort && createPosts===1 && !initialSessionObserved && !selectPosts && method==='GET' && url.startsWith(base) &&
+        initialReadPath.test(url.slice(base.length)))observeInitialRead(url,req);
+     await continueBackend();return;
+    }
     if(method!=='POST')fail();
     if(guarded)need(req.frame()===page.mainFrame() && !req.isNavigationRequest() && !req.redirectedFrom());
     if(url===otp){need(++challengePosts===1);if(bound)claim('challenge',req);const v:unknown=JSON.parse(req.postData()??'');need(exact(v,['site_key','email','intent'])&&v.site_key===binding.siteKey&&v.email===binding.email&&v.intent==='AUTHENTICATE');await continueBackend();return;}
@@ -327,7 +374,9 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     if(guarded && !subscriptionId)need(createPosts===1 && url.startsWith(base+'/') && url.endsWith('/confirmation-session'));
     await billingBounded(limits,()=>created);const original=base+'/'+subscriptionId+'/operations/'+operationId;
     if(url===original+'/confirmation-session'){
-     need(++selectPosts===1);if(bound)claim('initial-session',req);const v:unknown=JSON.parse(req.postData()??''),h=await req.allHeaders();need(exact(v,['action_token'])&&typeof v.action_token==='string'&&/^bga1_[A-Za-z0-9_-]{43}$/.test(v.action_token)&&h.authorization===authority&&h.origin===binding.endpoints.demo&&!h.cookie);await continueBackend();return;
+     if(retryPort)routeCheckpoint='BROWSER_SESSION_REQUEST_REJECTED';
+     need(++selectPosts===1);if(bound)claim('initial-session',req);const v:unknown=JSON.parse(req.postData()??''),h=await req.allHeaders();need(exact(v,['action_token'])&&typeof v.action_token==='string'&&/^bga1_[A-Za-z0-9_-]{43}$/.test(v.action_token)&&h.authorization===authority&&h.origin===binding.endpoints.demo&&!h.cookie);
+     await continueBackend();if(retryPort)initialSessionForwarded=true;return;
     }
     const attempts=original+'/confirmation-attempts/';
     if(retryPort && url===attempts+firstAttempt+'/retry'){
@@ -401,8 +450,18 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   await createButton.click({timeout:duration(limits)});const receipt=await createResponse;paired('create',receipt);need(receipt.status()===202);const original=await body(receipt,limits);need(uuid(original.subscription_id)&&uuid(original.operation_id)&&['PROCESSING','REQUIRES_ACTION','RESERVED'].includes(String(original.status)));
   subscriptionId=original.subscription_id as string;operationId=original.operation_id as string;await port.acknowledge('create',{subscriptionId,operationId});
   checkpoint='BROWSER_INITIAL_SESSION';
-  const selection=page.waitForResponse(r=>r.url()===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-session'&&r.request().method()==='POST',{timeout:duration(limits)});void selection.catch(()=>{});acknowledgeCreate();
-  const selected=await selection;paired('initial-session',selected);
+  const originalOperation=base+'/'+subscriptionId+'/operations/'+operationId;
+  const expectsActionReads=original.next_action===null && (original.status==='PROCESSING'||original.status==='REQUIRES_ACTION');
+  const selection=page.waitForResponse(r=>r.url()===originalOperation+'/confirmation-session'&&r.request().method()==='POST',{timeout:duration(limits)});void selection.catch(()=>{});acknowledgeCreate();
+  let selected:Response;
+  try{selected=await selection;}catch(error){
+   if(retryPort && error instanceof errors.TimeoutError && !firstFailure && !limits.signal?.aborted){
+    checkpoint=initialSessionBoundary(originalOperation,expectsActionReads);
+   }
+   throw error;
+  }finally{initialReads.length=0;}
+  if(retryPort)checkpoint='BROWSER_SESSION_UNPAIRED';
+  paired('initial-session',selected);
   checkpoint='BROWSER_INITIAL_SESSION_HTTP';need(selected.status()===200);
   checkpoint='BROWSER_INITIAL_SESSION_WIRE';const selectedBody=await body(selected,limits);need(selectedBody.protocol==='SERVER_CONFIRM_V2'&&selectedBody.provider==='stripe'&&selectedBody.flow==='PAYMENT'&&uuid(selectedBody.attempt_id));attemptId=selectedBody.attempt_id as string;
   if(bound){sessionContext(selectedBody,false);initialPresentationReady.resolve();}
