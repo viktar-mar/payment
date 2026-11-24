@@ -76,7 +76,7 @@ export async function forwardBillingDispatch(route:Pick<Route,'request'|'continu
   if(kind==='create')need(exact(value,['price_id','recurring_consent'])&&value.price_id===binding.priceId&&value.recurring_consent===true);
   else need(exact(value,['capability','confirmation_token'])&&typeof value.capability==='string'&&/^bca2_[A-Za-z0-9_-]{43}$/.test(value.capability)&&typeof value.confirmation_token==='string'&&/^ctoken_[A-Za-z0-9]{1,200}$/.test(value.confirmation_token)&&(!confirmation||value.confirmation_token===confirmation.token));
   confirmation?.check();
-  await check?.();need(await port.beforeDispatch(kind,headers['idempotency-key']!,identity)===true);
+  await check?.();confirmation?.check();need(await port.beforeDispatch(kind,headers['idempotency-key']!,identity)===true);
   if(authorizeResponse)await authorizeResponse(request);
   billingCheck(limits);await check?.();confirmation?.check();billingCheck(limits);if(beforeForward)need(beforeForward()===true);await route.continue();billingCheck(limits);
  }catch{fail();}
@@ -462,7 +462,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
       need(req.postData()===JSON.stringify({capability,confirmation_token:token.id}));
       if(successor)need(token.id!==firstToken);else firstToken=token.id;
      }
-     confirmation={token:token.id,check};
+     confirmation={token:token.id,check:()=>{check();need(payInFlight);}};
     }
     const dispatch=successor?{beforeDispatch:(_kind:unknown,key:string)=>retryPort!.beforeSuccessorConfirm(key,{subscriptionId,operationId,attemptId})}:port;
     await forwardBillingDispatch(route,dispatch,binding,authority,'confirm',{subscriptionId,operationId,attemptId},limits,confirmation,checkManager,redirects?.authorize,invoiceCase?.releaseOriginalConfirm);
@@ -539,6 +539,25 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   checkpoint='BROWSER_INITIAL_SESSION_WIRE';const selectedBody=await body(selected,limits);need(selectedBody.protocol==='SERVER_CONFIRM_V2'&&selectedBody.provider==='stripe'&&selectedBody.flow==='PAYMENT'&&uuid(selectedBody.attempt_id));attemptId=selectedBody.attempt_id as string;
   if(bound){sessionContext(selectedBody,false);initialPresentationReady.resolve();}
   if(cancellationPort && typeof selectedBody.publishable_key==='string' && /^pk_test_[A-Za-z0-9_]+$/.test(selectedBody.publishable_key))publishableKey=selectedBody.publishable_key;
+  async function confirmWaitBoundary(){
+   const request=requests.get(successorId?'successor-confirm':'original-confirm');
+   if(request)return request.existingResponse()?'BROWSER_CONFIRM_WAIT':'BROWSER_CONFIRM_REQUEST_NO_RESPONSE';
+   const token=tokenRequest;
+   if(token){
+    const reply=token.existingResponse();
+    if(!reply)return 'BROWSER_CONFIRM_TOKEN_NO_RESPONSE';
+    if(reply.request()!==token || reply.fromServiceWorker() ||
+     reply.url()!=='https://api.stripe.com/v1/confirmation_tokens')return 'BROWSER_CONFIRM_WAIT';
+    if(reply.status()!==200)return 'BROWSER_CONFIRM_TOKEN_HTTP';
+   }
+   return billingBounded(limits,async ()=>{
+    await checkManager();
+    if(!await trustedPayClick?.evaluate(clicked=>clicked()))return 'BROWSER_CONFIRM_CLICK_UNOBSERVED';
+    const validation=manager.locator('[role="alert"]').filter({hasText:/^Check your payment details and try Pay again\.$/});
+    if(await validation.isVisible())return 'BROWSER_CONFIRM_FORM_VALIDATION';
+    return token?'BROWSER_CONFIRM_REQUEST_NOT_SENT':'BROWSER_CONFIRM_TOKEN_NOT_SENT';
+   },1000);
+  }
   async function payOnce(card:string){
    checkpoint='BROWSER_WAIT_READY';
    const pay=manager.getByRole('button',{name:'Pay',exact:true});await pay.waitFor({state:'visible',timeout:duration(limits)});
@@ -547,16 +566,38 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    checkpoint='BROWSER_CARD_FIELDS';
    const frame=manager.frameLocator('iframe[title="Secure payment input frame"]');await frame.locator('input[name="number"]').fill(card,{timeout:duration(limits)});await frame.locator('input[name="expiry"]').fill('1230',{timeout:duration(limits)});await frame.locator('input[name="cvc"]').fill('123',{timeout:duration(limits)});
    const postal=frame.locator('input[name="postalCode"]');if(await postal.isVisible())await postal.fill('10001',{timeout:duration(limits)});
-   const confirmed=page.waitForResponse(r=>r.url()===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-attempts/'+attemptId+'/confirm'&&r.request().method()==='POST',{timeout:duration(limits)});void confirmed.catch(()=>{});
    if(guarded)trustedPayClick=await trustedClick(pay);
    await checkManager();
    while(pinned?.pending){
     await pinned.wait();
     await checkManager();
    }
-   checkpoint='BROWSER_CONFIRM_WAIT';
+   // Arm observation after presentation has settled, but before a click can dispatch.
+   checkpoint=retryPort?'BROWSER_CONFIRM_CLICK':'BROWSER_CONFIRM_WAIT';
+   const confirmUrl=base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-attempts/'+attemptId+'/confirm';
+   const responseFailure=Symbol();
+   let responseTimedOut=false;
+   const confirmed=page.waitForResponse(r=>r.url()===confirmUrl&&r.request().method()==='POST',{timeout:duration(limits)}).catch(error=>{
+    responseTimedOut=error instanceof errors.TimeoutError;
+    throw responseFailure;
+   });void confirmed.catch(()=>{});
    check();tokenRequest=undefined;payInFlight=true;
-   await pay.click({timeout:duration(limits)});const confirmResponse=await confirmed;payInFlight=false;
+   let confirmResponse:Response;
+   let clickFinished=false;
+   try{
+    const clicking=pay.click({timeout:duration(limits)}).then(()=>{clickFinished=true;});
+    // A timed-out response must close Pay authority even if the click is still pending.
+    [,confirmResponse]=await Promise.all([clicking,confirmed]);
+   }catch(error){
+    payInFlight=false;
+    if(error===responseFailure){
+     checkpoint=retryPort&&responseTimedOut&&!clickFinished?'BROWSER_CONFIRM_WAIT_CLICK_PENDING':'BROWSER_CONFIRM_WAIT';
+     if(retryPort && clickFinished && responseTimedOut && !firstFailure && !limits.signal?.aborted && Date.now()<limits.deadline){
+      checkpoint=await confirmWaitBoundary().catch(()=> 'BROWSER_CONFIRM_WAIT');
+     }
+    }
+    throw error;
+   }finally{payInFlight=false;}
    checkpoint='BROWSER_CONFIRM_RECEIPT';
    paired(successorId?'successor-confirm':'original-confirm',confirmResponse);
    need(confirmResponse.status()===200);const confirmation=await body(confirmResponse,limits);check();

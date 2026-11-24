@@ -7,6 +7,15 @@ import {errors,type Route} from '@playwright/test';
 const binding={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081',receiver:'http://127.0.0.1:18082'},priceId:'11111111-2222-4333-8444-555555555555'} as BillingBinding;
 function fixture(){const calls:string[]=[],headers={origin:binding.endpoints.demo,'content-type':'application/json',authorization:'Bearer '+'A'.repeat(43),'idempotency-key':'original-sdk-key'};let args:unknown[]=[];const request={url:()=>binding.endpoints.backend+'/api/v1/customer/subscriptions',method:()=> 'POST',redirectedFrom:()=>null,postData:()=>JSON.stringify({price_id:binding.priceId,recurring_consent:true}),allHeaders:async()=>headers};const route={request:()=>request,continue:async(...v:unknown[])=>{args=v;calls.push('continue');}} as unknown as Route;const port={beforeDispatch:async()=>{calls.push('persist');return true;}} as unknown as BillingPort;return {calls,headers,request,route,port,args:()=>args};}
 test('original browser CREATE waits for durable key before unmodified continuation',async()=>{const f=fixture();await forwardBillingDispatch(f.route,f.port,binding,'Bearer '+'A'.repeat(43),'create',undefined,{deadline:Date.now()+1000});assert.deepEqual(f.calls,['persist','continue']);assert.deepEqual(f.args(),[]);});
+test('browser confirmation does not persist a dispatch after Pay retires during manager validation',async()=>{
+ const f=fixture(),identity={subscriptionId:'subscription',operationId:'operation',attemptId:'attempt'};
+ f.request.url=()=>binding.endpoints.backend+'/api/v1/customer/subscriptions/subscription/operations/operation/confirmation-attempts/attempt/confirm';
+ f.request.postData=()=>JSON.stringify({capability:'bca2_'+'C'.repeat(43),confirmation_token:'ctoken_fixture'});
+ let current=true;
+ await assert.rejects(forwardBillingDispatch(f.route,f.port,binding,f.headers.authorization,'confirm',identity,
+  {deadline:Date.now()+1000},{token:'ctoken_fixture',check:()=>assert.ok(current)},async()=>{current=false;}),/billing_BROWSER/);
+ assert.deepEqual(f.calls,[]);
+});
 for(const kind of ['foreign-origin','cookie','authority','body','persist-failure'])test('browser dispatch refuses '+kind,async()=>{const f=fixture();if(kind==='foreign-origin')f.headers.origin='https://other.test';if(kind==='cookie')Object.assign(f.headers,{cookie:'session=bad'});if(kind==='authority')f.headers.authorization='Bearer '+'B'.repeat(43);if(kind==='body')f.request.postData=()=>'{"price_id":"foreign","recurring_consent":true}';if(kind==='persist-failure')f.port.beforeDispatch=async()=>{throw Error('secret-sentinel');};await assert.rejects(()=>forwardBillingDispatch(f.route,f.port,binding,'Bearer '+'A'.repeat(43),'create',undefined,{deadline:Date.now()+1000}),e=>e instanceof Error&&!e.message.includes('sentinel'));assert.ok(!f.calls.includes('continue'));});
 test('native Billing discovery is dedicated, bounded and explicitly excluded by default',async()=>{const config=await readFile(new URL('../../playwright.stripe-billing.config.ts',import.meta.url),'utf8'),normal=await readFile(new URL('../../playwright.config.ts',import.meta.url),'utf8');assert.match(config,/workers:1/);assert.match(config,/retries:0/);assert.match(config,/trace:'off'/);assert.doesNotMatch(config,/webServer/);assert.match(normal,/stripe-billing\.spec\.ts/);assert.match(normal,/stripe-billing-acceptance\.test\.ts/);assert.match(normal,/subscription-elements-browser\.test\.ts/);});
 test('native runner reserves cleanup and scheduling time beyond the unchanged owner budget',async()=>{
@@ -57,7 +66,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const sessionFor=(id:string)=>({protocol:'SERVER_CONFIRM_V2',provider:'stripe',flow:'PAYMENT',attempt_id:id,publishable_key:'pk_test_fixture',
   capability:'bca2_'+(id===attempt?'C':'D').repeat(43),client_secret:'pi_original_secret_fixture',expires_at:boundary});
  const receiptFor=(id:string,state:string,retry_allowed:boolean,successor_attempt_id:string|null)=>({protocol:'SERVER_CONFIRM_V2',attempt_id:id,state,retry_allowed,successor_attempt_id,expires_at:boundary});
- let payCount=0,retryClicked=false,nonce=30,staticProbed=false,sessionErrorBodyReads=0;
+ let payCount=0,armedPay=0,retryClicked=false,nonce=30,staticProbed=false,sessionErrorBodyReads=0;
+ let latePay:Promise<void>|undefined;
  let pinnedFrameChanged=false;
  let requestFailed=(request:Request)=>{void request;};
  const presentation:string[]=[];
@@ -151,9 +161,9 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     return badSupport&&fault==='telemetry-auth'?{authorization:'Bearer '+token}:badSupport&&fault==='telemetry-cookie'?{cookie:'provider=demo'}:{origin:'https://js.stripe.com'};}} as unknown as Request;
   await handler({request:()=>request,fallback:async()=>{
    providerSent.push(url);await reply(tokenCall?'token':new URL(url).hostname,200);
-   if(tokenCall&&fault!=='missing-token-response')tokenResponse={
+   if(tokenCall&&!['missing-token-response','confirm-token-no-response'].includes(fault))tokenResponse={
     request:()=>fault==='wrong-token-request'?{...request}:request,url:()=>url,
-    status:()=>fault==='token-failure'?402:200,fromServiceWorker:()=>fault==='token-worker',
+    status:()=>['token-failure','confirm-token-http'].includes(fault)?402:200,fromServiceWorker:()=>fault==='token-worker',
     body:async()=>{
      if(fault==='pending-token-body')await new Promise<void>(resolve=>{setTimeout(resolve,5);});
      if(fault==='concurrent-confirm')await new Promise<void>(resolve=>{releaseBody=resolve;void duplicateConfirm?.().catch(()=>{}).finally(resolve);});
@@ -255,6 +265,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const route = {request:()=>request,continue:async(...args:unknown[])=>{
    assert.deepEqual(args,[]);sent.push(request.url());await reply(label,status);
    if(url===select && fault==='initial-session-no-response')return;
+   if(url===confirm && fault==='confirm-backend-no-response')return;
    existing=publish((schedulePost&&fault==='foreign-request'||url===retry&&fault==='wrong-retry-response'||
     url===select&&['initial-session-unpaired','early-static-image-unpaired'].includes(fault))?{...request} as Request:request,status,result);
   },abort:async()=>{}} as unknown as Route;
@@ -269,10 +280,15 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   state:{phase:'ready',authorityRevision:1,subscription,operation:null},
   evaluateHandle:async()=>({evaluate:async(fn:(check:()=>boolean)=>boolean)=>fn(()=>manager.state.authorityRevision===1)}),
   evaluate:async(fn:(m:unknown)=>unknown)=>fn(manager),
+  locator:()=>({filter:()=>({isVisible:async()=>fault==='confirm-form-validation'})}),
   frameLocator:()=>({locator:(selector:string)=>({fill:async(v:string)=>{if(selector.includes('number'))numbers.push(v);},isVisible:async()=>false})}),
   getByRole:(_role:string,opts:{name:string})=>({
    check:async()=>{trace.push(opts.name);},waitFor:async()=>{},
-   evaluate:async()=>true,evaluateHandle:async()=>{const n=payCount;return {evaluate:async(fn:(get:()=>boolean)=>boolean)=>fn(()=>opts.name==='Retry payment'?retryClicked:opts.name==='Create subscription'?trace.includes('Create subscription'):declineRetry?payCount>n:payClicked)};},
+   evaluate:async()=>true,evaluateHandle:async()=>{
+    const n=payCount;
+    if(opts.name==='Pay')armedPay=n+1;
+    return {evaluate:async(fn:(get:()=>boolean)=>boolean)=>fn(()=>opts.name==='Retry payment'?retryClicked:opts.name==='Create subscription'?trace.includes('Create subscription'):declineRetry?payCount>n:payClicked)};
+   },
    click:async()=>{
     const name=opts.name;
     trace.push(name);
@@ -315,13 +331,18 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     void prepare().catch(()=>{});
     }
     if(name==='Pay'){
+     if(fault==='confirm-click-refused')throw new errors.TimeoutError('private click canary');
+     if(fault==='confirm-click-unobserved')return;
+     if(fault==='confirm-late-gesture')await (latePay=new Promise<void>(resolve=>setTimeout(resolve,50)));
      if(fault==='before-actual-click')await provider('https://api.stripe.com/v1/confirmation_tokens');
      payClicked=true;payCount++;
+     if(['confirm-before-token','confirm-form-validation'].includes(fault))return;
      if(fault==='late-first-token'){
       if(payCount===1){delayedToken=provider('https://api.stripe.com/v1/confirmation_tokens',stripeFrame,true);void delayedToken.catch(()=>{});await delayedHeaders.promise;}
       else{releaseFirstToken!();await delayedToken;}
      }
      if(fault!=='absent-token'&&fault!=='initial-only')await provider('https://api.stripe.com/v1/confirmation_tokens');
+     if(['confirm-token-no-response','confirm-token-http','confirm-backend-not-sent'].includes(fault))return;
      if(fault==='token-replay')await provider('https://api.stripe.com/v1/confirmation_tokens');
      const submit=()=>send(confirm,{capability:'bca2_'+'C'.repeat(43),confirmation_token:fault==='substituted-token'?'ctoken_other':'ctoken_demo'},{protocol:'SERVER_CONFIRM_V2',attempt_id:attempt,state:'OBSERVE',next_action_allowed:false,retry_allowed:false,successor_attempt_id:null},200);
      if(sca){
@@ -331,6 +352,11 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      }
      if(declineRetry){
       const first=payCount===1;
+      if(fault==='confirm-persist-pending'){
+       void send(confirm,{capability:sessionFor(attempt!).capability,confirmation_token:'ctoken_demo'},
+        {...receiptFor(attempt!,'DECLINED',true,null),next_action_allowed:false},200).catch(()=>{});
+       return;
+      }
       await send(first?confirm:nextConfirm,{capability:sessionFor(first?attempt!:successor).capability,confirmation_token:first||fault==='reused-token'?'ctoken_demo':'ctoken_second'},
        {...receiptFor(first?attempt!:successor,first?(fault==='unknown-first'?'UNKNOWN':'DECLINED'):'OBSERVE',first,null),next_action_allowed:false},200);
       if(first&&fault==='early-retry')await send(retry,{},receiptFor(attempt!,'DECLINED',false,successor),200);
@@ -413,11 +439,15 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   },locator:()=>({first:()=>manager}),
   waitForResponse:(predicate:(r:Response)=>boolean,{timeout=3000}={})=>new Promise<Response>((resolve,reject)=>{
    if(closed){reject(new Error('closed'));return;}
+   const ownConfirm=fault.startsWith('confirm-') && predicate({
+    url:()=>payCount===0?confirm:nextConfirm,request:()=>({method:()=> 'POST'}),
+   } as Response);
+   if(ownConfirm&&fault==='confirm-early-observer'&&armedPay!==payCount+1){reject(new errors.TimeoutError('confirm observer was armed too early'));return;}
    const waiter={predicate,resolve:(response:Response)=>{clearTimeout(timer);resolve(response);},reject:(error:Error)=>{clearTimeout(timer);reject(error);}};
    const timer=setTimeout(()=>{
     waiters.delete(waiter);
     reject(fault==='initial-page-closed'?new Error('private page closed reason'):new errors.TimeoutError('private fixture URL during response wait'));
-   },timeout);
+   },ownConfirm&&fault!=='confirm-early-observer'?25:timeout);
    waiters.add(waiter);
   })
  };
@@ -430,6 +460,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const port={
   resources:()=>b,beforeDispatch:async(kind:string)=>{
    if(kind==='confirm'&&fault==='duplicate-during-persist')await new Promise<void>(resolve=>{releaseDispatch=resolve;void duplicateConfirm?.().catch(()=>{}).finally(resolve);});
+   if(kind==='confirm'&&fault==='confirm-persist-pending')await new Promise<void>(resolve=>{releaseDispatch=resolve;});
    return true;
   },releaseOriginalConfirm:()=>{trace.push('release original confirm');if(fault==='invalid ingress')throw Error('tainted');return true;},
   acknowledge:async(kind:string)=>{if(invoiceCase&&kind==='confirm'){trace.push('completed invoice proof');if(fault==='invalid evidence')throw Error();}if(declineRetry&&kind==='confirm'){trace.push('decline proof');return fault!=='no-decline-proof';}return true;},acknowledgeCustomer:async()=>true,
@@ -441,7 +472,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   beforeCancellation:async(kind:string,key:string)=>{trace.push('persist '+kind+' '+key);return fault!=='persist';},
   verifyCancellation:async(kind:string,operation:string)=>{trace.push('verify '+kind+' '+operation);return fault!=='proof';}
  } as BillingCancellationPort&BillingDeclineRetryPort&BillingInitial3dsPort&BillingInvoiceWebhooksPort;
- return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,presentation,sessionErrorBodyReads:()=>sessionErrorBodyReads,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),reloadStripe:()=>navigate(stripeFrame),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed};
+ return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,presentation,sessionErrorBodyReads:()=>sessionErrorBodyReads,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),reloadStripe:()=>navigate(stripeFrame),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed,latePay:()=>latePay};
 }
 test('same-page manager schedules and withdraws once after the initial paid proof',async()=>{
  const f=cancellationPage();
@@ -496,6 +527,48 @@ test('matching token verification can finish reading the response after backend 
  const f=cancellationPage('pending-token-body');
  await runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+3000});
  assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+});
+
+test('decline retry arms confirmation observation after preparing the Pay gesture',async()=>{
+ const f=cancellationPage('confirm-early-observer',true);
+ assert.equal(await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),true);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
+ assert.equal(f.sent.filter(url=>url.endsWith('/retry')).length,1);
+});
+test('decline retry stops a late Pay gesture when the confirmation observer expires first',async()=>{
+ const f=cancellationPage('confirm-late-gesture',true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CONFIRM_WAIT_CLICK_PENDING');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ await f.latePay();
+ assert.equal(f.trace.filter(x=>x==='Pay').length,1);
+ assert.equal(f.providerSent.length,0);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+
+for(const [fault,expected] of [
+ ['confirm-click-refused','BROWSER_CONFIRM_CLICK'],
+ ['confirm-click-unobserved','BROWSER_CONFIRM_CLICK_UNOBSERVED'],
+ ['confirm-form-validation','BROWSER_CONFIRM_FORM_VALIDATION'],
+ ['confirm-before-token','BROWSER_CONFIRM_TOKEN_NOT_SENT'],
+ ['confirm-token-no-response','BROWSER_CONFIRM_TOKEN_NO_RESPONSE'],
+ ['confirm-token-http','BROWSER_CONFIRM_TOKEN_HTTP'],
+ ['confirm-backend-not-sent','BROWSER_CONFIRM_REQUEST_NOT_SENT'],
+ ['confirm-backend-no-response','BROWSER_CONFIRM_REQUEST_NO_RESPONSE'],
+ ['confirm-persist-pending','BROWSER_CONFIRM_REQUEST_NO_RESPONSE'],
+] as const)test('decline retry reports the Pay boundary for '+fault,async()=>{
+ const f=cancellationPage(fault,true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),expected);
+  assert.equal(browserCleanupConfirmed(error),true);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  return true;
+ });
+ assert.equal(f.trace.filter(x=>x==='Pay').length,1);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,fault==='confirm-backend-no-response'?1:0);
+ assert.ok(!f.sent.some(url=>url.endsWith('/retry')));
 });
 
 test('the same manager explicitly retries a proven decline before paying with fresh details',async()=>{

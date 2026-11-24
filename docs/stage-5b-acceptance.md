@@ -32,6 +32,10 @@ Run `f5e951d3-382a-4268-bcc7-fef96d5c82da` at `8044f47` reused the saved Sandbox
 
 An offline regression reproduced the mismatch when the demo's initial configuration added the empty second product slot through `history.replaceState`. The runner now includes the empty slot in the initial URL, which preserves exact address matching after configuration. The same regression verifies that a different product or path is refused before payment or Retry.
 
+Local runs at `e79e02f` first stopped on an expired saved CLI profile and then on automatic Docker subnet allocation before creating any containers. After selecting the refreshed profile and freeing an unused subnet, run `0e421ed2-aec3-4971-8910-6d14244775ff` passed checkout frame validation and reached `BROWSER_CONFIRM_WAIT` with confirmed cleanup. Its last receipt is CREATE_ACK. The journal has no confirmation or Retry dispatch.
+
+Offline tests reproduced a confirmation observer that timed out during Pay preparation. The runner now arms it after presentation checks and before the click. Fixed codes distinguish the trusted gesture, visible form validation, the owned token request and the backend confirmation response. The historical report leaves the exact reason for the wait undetermined.
+
 ## Earlier local recovery evidence on 2026-11-23
 
 Run `c2dfc733-6915-45b8-8aa5-3792ccb31f42` at `0449bdd` passed the initial payment, declined renewal, grace checks and replacement-method confirmation. The exact Stripe Sandbox request log showed that the invoice-created PaymentIntent refused `error_on_requires_action`. Both the local runner and Stripe stopped that request.
