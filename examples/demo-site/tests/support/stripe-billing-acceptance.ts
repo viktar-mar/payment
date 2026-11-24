@@ -230,7 +230,8 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   const base=binding.endpoints.backend+'/api/v1/customer/subscriptions',otp=binding.endpoints.backend+'/api/v1/public/customer-auth/email-otp/challenges';
   let acknowledgeCreate!:()=>void;const created=new Promise<void>(r=>acknowledgeCreate=r);
   let cancellation:ReturnType<typeof cancellationJourney>|undefined, challengeId:string|undefined;
-  let createGestureInFlight=false,payInFlight=false, trustedPayClick:JSHandle<()=>boolean>|undefined, tokenRequest:Request|undefined, publishableKey:string|undefined;
+  let createGestureInFlight=false,payInFlight=false,retryGestureInFlight=false;
+  let trustedPayClick:JSHandle<()=>boolean>|undefined, tokenRequest:Request|undefined, publishableKey:string|undefined;
   const requests=new Map<string,Request>(),keys=new Set<string>();
   const initialReads:{url:string;request:Request;authorized?:boolean}[]=[];
   const initialReadPath=/^\/[a-f0-9-]{36}\/operations\/[a-f0-9-]{36}(?:\/action|\/confirmation-attempts\/current)?$/;
@@ -417,6 +418,10 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
      url===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-session';
     if(retryPort&&url===base&&method==='POST')routeCheckpoint='BROWSER_CREATE_REQUEST_REJECTED';
     if(observingSession){initialSessionObserved=true;routeCheckpoint='BROWSER_SESSION_REQUEST_REJECTED';}
+    if(retryPort && firstAttempt && method==='POST' &&
+       url===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-attempts/'+firstAttempt+'/retry'){
+     routeCheckpoint='BROWSER_RETRY_REQUEST_REJECTED';
+    }
     if(bound)need(req.frame()===page.mainFrame() && !req.isNavigationRequest() && !req.redirectedFrom());
     async function continueBackend(){
      if(redirects){
@@ -437,8 +442,9 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     if(guarded)need(req.frame()===page.mainFrame() && !req.isNavigationRequest() && !req.redirectedFrom());
     if(url===otp){need(++challengePosts===1);if(bound)claim('challenge',req);const v:unknown=JSON.parse(req.postData()??'');need(exact(v,['site_key','email','intent'])&&v.site_key===binding.siteKey&&v.email===binding.email&&v.intent==='AUTHENTICATE');await continueBackend();return;}
     if(url.startsWith(otp+'/')&&url.endsWith('/verify')){need(++verifyPosts===1 && (!guarded || challengeId && url===otp+'/'+challengeId+'/verify'));if(bound)claim('verify',req);await continueBackend();return;}
+    let key:string|undefined;
     if(bound){
-     const h=await req.allHeaders(),key=h['idempotency-key'];
+     const h=await req.allHeaders();key=h['idempotency-key'];
      need(uuid(key)&&!keys.has(key)&&h.authorization===authority&&h.origin===binding.endpoints.demo&&
       h['content-type']==='application/json'&&!h.cookie&&!h['proxy-authorization']);
      keys.add(key!);await checkManager();
@@ -464,9 +470,12 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     const attempts=original+'/confirmation-attempts/';
     if(retryPort && url===attempts+firstAttempt+'/retry'){
      claim('retry',req);
-     need(trustedRetry && await trustedRetry.evaluate(clicked=>clicked()) && req.postData()==='{}');
-     check();need(await retryPort.beforeRetry((await req.allHeaders())['idempotency-key']!,{subscriptionId,operationId,attemptId:firstAttempt})===true);
-     await checkManager();await route.continue();return;
+     need(retryGestureInFlight && trustedRetry && await trustedRetry.evaluate(clicked=>clicked()) && req.postData()==='{}');
+     await checkManager();check();
+     if(!retryGestureInFlight||!key)return fail();
+     need(await retryPort.beforeRetry(key,{subscriptionId,operationId,attemptId:firstAttempt})===true);
+     await checkManager();check();need(retryGestureInFlight);
+     await route.continue();return;
     }
     if(retryPort && url.endsWith('/client-session')){
      need(requests.has('retry') && req.postData()==='{}');claim('successor-session',req);
@@ -676,18 +685,39 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    need(confirmation.state==='DECLINED' && confirmation.retry_allowed===true);
    need(await retryPort.acknowledge('confirm',{attemptId,state:'DECLINED',nextActionAllowed:false,retryAllowed:true,successorAttemptId:null})===true);check();
    const prefix=base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-attempts/';
+   checkpoint='BROWSER_RETRY_READY';
    const retryButton=manager.getByRole('button',{name:'Retry payment',exact:true});
    await retryButton.waitFor({state:'visible',timeout:duration(limits)});
-   const retried=page.waitForResponse(r=>r.url()===prefix+firstAttempt+'/retry' && r.request().method()==='POST',{timeout:duration(limits)});
+   checkpoint='BROWSER_RETRY_FOCUS';
+   const exactRetry=await focusExactButton(retryButton);
+   trustedRetry=await exactRetry.evaluateHandle(captureTrustedClick);
+   await checkManager();await requireButtonFocus(exactRetry);
+   const responseFailure=Symbol(),unobservedClick=Symbol();
+   const retried=page.waitForResponse(r=>r.url()===prefix+firstAttempt+'/retry' && r.request().method()==='POST',
+    {timeout:duration(limits)}).catch(()=>{throw responseFailure;});
    const nextSession=page.waitForResponse(r=>r.url()===prefix+successorId+'/client-session' && r.request().method()==='POST',{timeout:duration(limits)});
    void retried.catch(()=>{});void nextSession.catch(()=>{});
-   trustedRetry=await trustedClick(retryButton);await checkManager();await retryButton.click({timeout:duration(limits)});
-   const reply=await retried;paired('retry',reply);need(reply.status()===200);
+   checkpoint='BROWSER_RETRY_GESTURE';
+   check();retryGestureInFlight=true;
+   let reply:Response;
+   try{
+    const activating=exactRetry.press('Enter',{timeout:duration(limits)}).then(async()=>{
+     if(!await trustedRetry!.evaluate(clicked=>clicked()))throw unobservedClick;
+    });
+    [,reply]=await Promise.all([activating,retried]);
+   }catch(error){
+    if(error===responseFailure)checkpoint='BROWSER_RETRY_WAIT';
+    if(error===unobservedClick)checkpoint='BROWSER_RETRY_CLICK_UNOBSERVED';
+    throw error;
+   }finally{retryGestureInFlight=false;}
+   checkpoint='BROWSER_RETRY_RECEIPT';
+   paired('retry',reply);need(reply.status()===200);
    const retry=await body(reply,limits);check();
    need(retry.protocol==='SERVER_CONFIRM_V2' && retry.attempt_id===firstAttempt && retry.state==='DECLINED' &&
     retry.retry_allowed===false && uuid(retry.successor_attempt_id) && retry.successor_attempt_id!==firstAttempt);
    successorId=retry.successor_attempt_id as string;
    need(await retryPort.acknowledgeRetry({attemptId:firstAttempt,successorAttemptId:successorId})===true);check();successorAck.resolve();
+   checkpoint='BROWSER_RETRY_SUCCESSOR_SESSION';
    const session=await nextSession;paired('successor-session',session);need(session.status()===200);
    sessionContext(await body(session,limits),true);check();attemptId=successorId;
    successorPresentationReady.resolve();

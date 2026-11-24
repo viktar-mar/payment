@@ -270,7 +270,15 @@ export class GenericSubscriptionManager extends ElementBase {
     catch(error) { if (this.#current(revision) && !isAbort(error)) this.#error='unknown'; }
     finally { if (this.#current(revision)) {
       if(!validationFailed){if(v2&&this.#v2)this.#v2.attempted=true;this.#retireForm();if(v2){try{await this.#recoverAttempt(revision);}catch(error){this.#failure(error,revision);}}}
-      if(this.#current(revision)){this.#busy=false;this.#render();if(!validationFailed)void this.#observe(revision,op);}
+      if(this.#current(revision)){
+        const attempt=this.#v2?.status;
+        // An authoritative decline leaves the next action to the explicit Retry control.
+        const awaitingRetry=v2&&attempt?.state==='DECLINED'&&attempt.retryAllowed&&
+          !attempt.successorAttemptId&&!this.#v2?.retrySent&&Date.parse(attempt.expiresAt)>Date.now();
+        this.#busy=false;
+        this.#render();
+        if(!validationFailed&&!awaitingRetry)void this.#observe(revision,op);
+      }
     } }
   }
   async #recoverAttempt(revision:number):Promise<void>{
@@ -414,7 +422,12 @@ export class GenericSubscriptionManager extends ElementBase {
     visible.retryPayment=authenticated&&live&&attempt?.retryAllowed===true&&!attempt.successorAttemptId&&!this.#v2?.retrySent;
     visible.continuePayment=authenticated&&live&&!!(attempt?.successorAttemptId||attempt?.state==='READY'&&!this.#v2?.attempted);
     if(!this.#busy&&attempt?.state==='DECLINED')this.#status.textContent=t.paymentDeclined;
-    for (const [key, button] of this.#buttons) { button.textContent = t[key]; button.hidden = !visible[key]; button.disabled = this.#busy || (key==='pay' && !this.#formReady) || (key==='refresh' && this.#polling); }
+    for (const [key, button] of this.#buttons) {
+      button.textContent=t[key];
+      button.hidden=!visible[key];
+      const waitsForPoll=key==='refresh'||key==='retryPayment'||key==='continuePayment';
+      button.disabled=this.#busy||(key==='pay'&&!this.#formReady)||(waitsForPoll&&this.#polling);
+    }
     const list = (element: HTMLUListElement, items: string[]) => element.replaceChildren(...(items.length ? items : [t.noRecords]).map(text => { const li = document.createElement('li'); li.textContent = text; return li; }));
     this.#billingTitle.textContent = t.billing; this.#historyTitle.textContent = t.history;
     list(this.#billingList, this.#billing.items.map((b: SubscriptionBillingView) => `${b.kind} · ${this.#money(b.amountDueMinor, b.currency)} · ${b.settlement} · ${b.period.start} – ${b.period.end}`));

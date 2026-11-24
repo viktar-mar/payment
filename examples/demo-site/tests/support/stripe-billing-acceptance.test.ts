@@ -295,7 +295,10 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    evaluate:async()=>true,evaluateHandle:async()=>{
     const n=payCount;
     if(opts.name==='Pay')armedPay=n+1;
-    return {evaluate:async(fn:(get:()=>boolean)=>boolean)=>fn(()=>opts.name==='Retry payment'?retryClicked:opts.name==='Create subscription'?trace.includes('Create subscription'):declineRetry?payCount>n:payClicked)};
+    return {evaluate:async(fn:(get:()=>boolean)=>boolean)=>{
+     if(opts.name==='Retry payment'&&fault==='retry-owner-lost-during-gesture')manager.state.authorityRevision++;
+     return fn(()=>opts.name==='Retry payment'?retryClicked:opts.name==='Create subscription'?trace.includes('Create subscription'):declineRetry?payCount>n:payClicked);
+    }};
    },
    click:async()=>{
     const name=opts.name;
@@ -386,6 +389,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      if(fault==='early')await send(cancel,{mode:'PERIOD_END'},{});
     }
     if(name==='Retry payment'){
+     if(fault==='retry-click-unobserved'||fault==='retry-pointer-lost'&&!fromKeyboard)return;
      retryClicked=true;
      await send(retry,{},receiptFor(attempt!,'DECLINED',false,fault==='same-successor'?attempt!:successor),200);
      if(fault==='repeat-retry')await send(retry,{},receiptFor(attempt!,'DECLINED',false,successor),200);
@@ -419,7 +423,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    return {...control,elementHandle:async()=>({
     waitForElementState:async()=>{},
     focus:async()=>{},
-    evaluate:async()=>opts.name==='Create subscription'?fault!=='create-focus-lost':fault!=='confirm-focus-lost',
+    evaluate:async()=>opts.name==='Create subscription'?fault!=='create-focus-lost':
+     opts.name==='Retry payment'?fault!=='retry-focus-lost':fault!=='confirm-focus-lost',
     evaluateHandle:control.evaluateHandle,
     press:async(key:string)=>{keysPressed.push(key);fromKeyboard=true;await control.click();},
    })};
@@ -582,7 +587,7 @@ test('decline retry stops a late Pay gesture when the confirmation observer expi
 test('decline retry activates the pinned Pay button with one Enter per authorized attempt',async()=>{
  const f=cancellationPage('confirm-pointer-lost',true);
  assert.equal(await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),true);
- assert.deepEqual(f.keysPressed,['Enter','Enter','Enter']);
+ assert.deepEqual(f.keysPressed,['Enter','Enter','Enter','Enter']);
  assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
  assert.equal(f.sent.filter(url=>url.endsWith('/retry')).length,1);
 });
@@ -600,7 +605,7 @@ test('decline retry sends no key or payment when the exact Pay button cannot tak
 test('decline retry sends CREATE with the exact trusted keyboard gesture when the pointer would be lost',async()=>{
  const f=cancellationPage('create-pointer-lost',true);
  assert.equal(await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),true);
- assert.deepEqual(f.keysPressed,['Enter','Enter','Enter']);
+ assert.deepEqual(f.keysPressed,['Enter','Enter','Enter','Enter']);
  assert.equal(f.trace.filter(step=>step==='Create subscription').length,1);
  assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
 });
@@ -664,7 +669,7 @@ for(const [fault,expected] of [
 });
 
 test('the same manager explicitly retries a proven decline before paying with fresh details',async()=>{
- const f=cancellationPage('',true);
+ const f=cancellationPage('retry-pointer-lost',true);
  await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000});
  assert.deepEqual(f.trace.filter(x=>['Pay','decline proof','Retry payment','persist retry','ack retry','persist successor','recovered proof'].includes(x)),
   ['Pay','decline proof','Retry payment','persist retry','ack retry','Pay','persist successor','recovered proof']);
@@ -673,6 +678,22 @@ test('the same manager explicitly retries a proven decline before paying with fr
  assert.equal(f.sent.filter(u=>u.endsWith('/confirm')).length,2);
  assert.equal(f.sent.filter(u=>u.endsWith('/retry')).length,1);
  assert.ok(f.closed());
+});
+for(const [fault,code] of [
+ ['retry-focus-lost','BROWSER_RETRY_FOCUS'],
+ ['retry-click-unobserved','BROWSER_RETRY_CLICK_UNOBSERVED'],
+ ['retry-owner-lost-during-gesture','BROWSER_RETRY_REQUEST_REJECTED'],
+] as const)test('decline retry stops at '+code+' before retry dispatch',async()=>{
+ const f=cancellationPage(fault,true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.ok(f.trace.includes('decline proof'));
+ assert.ok(!f.trace.includes('persist retry'));
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+ assert.ok(!f.sent.some(url=>url.endsWith('/retry')||url.endsWith('/client-session')));
 });
 test('decline retry checks a staged Stripe document after validating the original session',async()=>{
  const f=cancellationPage('early-static',true);

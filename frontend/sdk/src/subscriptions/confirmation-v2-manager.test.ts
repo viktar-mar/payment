@@ -41,6 +41,27 @@ it('ships decline → explicit Retry → fresh same-operation form → second ex
  expect(f.calls.filter(r=>r.url.endsWith('/retry'))).toHaveLength(1);expect(f.calls.filter(r=>r.url.endsWith('/confirm')).every(r=>r.url.includes(`/subscriptions/${subscriptionId}/operations/${operationId}/`))).toBe(true);
  expect(f.root.innerHTML+f.manager.outerHTML+JSON.stringify(f.manager.state)).not.toMatch(/pi_original|bca2_|ctoken_/);
 });
+it('keeps a server-confirmed decline actionable even when operation polling would hang',async()=>{
+ const f=fixture(),original=globalThis.fetch;
+ const pending=Promise.withResolvers<void>();
+ let polls=0;
+ vi.stubGlobal('fetch',async(url:string,init:RequestInit)=>{
+  if(url.endsWith('/operations/'+operationId) && f.calls.some(request=>request.url.endsWith('/confirm'))){
+   polls++;
+   await pending.promise;
+  }
+  return original(url,init);
+ });
+ try{
+  await f.start();
+  await f.click('Pay');
+  await f.click('Retry payment');
+  await waitFor(()=>expect(f.calls.filter(request=>request.url.endsWith('/retry'))).toHaveLength(1));
+  await waitFor(()=>expect(f.mount).toHaveBeenCalledTimes(2));
+  expect(f.calls.filter(request=>request.url.endsWith('/confirm'))).toHaveLength(1);
+  expect(polls).toBe(0);
+ }finally{pending.resolve();}
+});
 it.each([false,true])('recovers a durable decline after lost Confirm ACK; Retry ACK lost=%s',async lostRetry=>{
  const f=fixture({lostConfirm:true,lostRetry});await f.start();await f.click('Pay');await waitFor(()=>expect(getByRole(f.root,'button',{name:'Retry payment'})).toBeEnabled());await f.click('Retry payment');
  if(lostRetry){await waitFor(()=>expect(getByRole(f.root,'button',{name:'Refresh status'})).toBeEnabled());const n=f.calls.length;await f.click('Refresh status');await waitFor(()=>expect(getByRole(f.root,'button',{name:'Continue payment'})).toBeEnabled());expect(f.calls.slice(n).every(r=>r.method==='GET')).toBe(true);await f.click('Continue payment');}

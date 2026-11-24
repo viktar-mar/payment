@@ -42,6 +42,10 @@ Run `8451973f-761d-4ffe-8721-11ec0d49a048` at `41a1214` accepted the first check
 
 Run `a44ec9fe-e686-4c8b-9a61-14813b26cf99` at `32831ed` stopped at the general `BROWSER` checkpoint with confirmed cleanup. The last receipt is customer acknowledgement. No CREATE, confirmation or Retry dispatch was recorded. The runner now distinguishes baseline, consent, manager ownership, exact Create button focus, gesture, request and receipt. The decline/Retry case uses one trusted keyboard activation on the exact Create control and expires dispatch authority if observation fails.
 
+Run `d894aff2-aa9f-4c62-a283-763c9326f714` at `532bedb` verified the expected decline of the first €20 payment against Stripe and the local journal, with no cash recorded. It stopped before Retry dispatch and confirmed cleanup. The terminal code, `BROWSER_CONFIRM_RECEIPT`, was left over from the completed first confirmation and did not identify the Retry boundary.
+
+A local regression reproduced an enabled Retry control whose handler ignored the click while generic operation polling was pending. The SDK now leaves a current, retryable decline actionable and continues observation for other outcomes. The runner checks one trusted activation of the exact Retry control and reports separate fixed checkpoints for readiness, dispatch and the successor session. The historical cause remains unconfirmed.
+
 ## Earlier local recovery evidence on 2026-11-23
 
 Run `c2dfc733-6915-45b8-8aa5-3792ccb31f42` at `0449bdd` passed the initial payment, declined renewal, grace checks and replacement-method confirmation. The exact Stripe Sandbox request log showed that the invoice-created PaymentIntent refused `error_on_requires_action`. Both the local runner and Stripe stopped that request.
