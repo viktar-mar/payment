@@ -61,7 +61,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const operation = base + '/' + sub + '/operations/' + create;
  const select = operation + '/confirmation-session';
  const confirm = base + '/' + sub + '/operations/' + create + '/confirmation-attempts/' + attempt + '/confirm';
- const trace:string[] = [], sent:string[] = [], numbers:string[]=[];
+ const trace:string[] = [], sent:string[] = [], numbers:string[]=[], keysPressed:string[]=[];
  const successor=id(21),retry=confirm.replace(/confirm$/,'retry'),nextConfirm=confirm.replace(attempt!,successor);
  const sessionFor=(id:string)=>({protocol:'SERVER_CONFIRM_V2',provider:'stripe',flow:'PAYMENT',attempt_id:id,publishable_key:'pk_test_fixture',
   capability:'bca2_'+(id===attempt?'C':'D').repeat(43),client_secret:'pi_original_secret_fixture',expires_at:boundary});
@@ -288,7 +288,9 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   evaluate:async(fn:(m:unknown)=>unknown)=>fn(manager),
   locator:()=>({filter:()=>({isVisible:async()=>fault==='confirm-form-validation'})}),
   frameLocator:()=>({locator:(selector:string)=>({fill:async(v:string)=>{if(selector.includes('number'))numbers.push(v);},isVisible:async()=>false})}),
-  getByRole:(_role:string,opts:{name:string})=>({
+  getByRole:(_role:string,opts:{name:string})=>{
+   let fromKeyboard=false;
+   const control={
    check:async()=>{trace.push(opts.name);},waitFor:async()=>{},
    evaluate:async()=>true,evaluateHandle:async()=>{
     const n=payCount;
@@ -343,6 +345,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     void prepare().catch(()=>{});
     }
     if(name==='Pay'){
+     if(fault==='confirm-pointer-lost'&&!fromKeyboard)return;
      if(fault==='confirm-click-refused')throw new errors.TimeoutError('private click canary');
      if(fault==='confirm-click-unobserved')return;
      if(fault==='confirm-late-gesture')await (latePay=new Promise<void>(resolve=>setTimeout(resolve,50)));
@@ -408,7 +411,15 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      if(fault==='duplicate'||fault==='duplicate-withdraw'&&kind==='withdraw')await send(path,payload,receipt);
     }
    }
-  })
+   };
+   return {...control,elementHandle:async()=>({
+    waitForElementState:async()=>{},
+    focus:async()=>{},
+    evaluate:async()=>fault!=='confirm-focus-lost',
+    evaluateHandle:control.evaluateHandle,
+    press:async(key:string)=>{keysPressed.push(key);fromKeyboard=true;await control.click();},
+   })};
+  }
  };
  const page={
   frames:()=>[frame,stripeFrame,issuer],context:()=>({newCDPSession:async(surface:unknown)=>{
@@ -484,7 +495,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   beforeCancellation:async(kind:string,key:string)=>{trace.push('persist '+kind+' '+key);return fault!=='persist';},
   verifyCancellation:async(kind:string,operation:string)=>{trace.push('verify '+kind+' '+operation);return fault!=='proof';}
  } as BillingCancellationPort&BillingDeclineRetryPort&BillingInitial3dsPort&BillingInvoiceWebhooksPort;
- return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,presentation,sessionErrorBodyReads:()=>sessionErrorBodyReads,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),reloadStripe:()=>navigate(stripeFrame),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed,latePay:()=>latePay};
+ return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,keysPressed,presentation,sessionErrorBodyReads:()=>sessionErrorBodyReads,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),reloadStripe:()=>navigate(stripeFrame),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed,latePay:()=>latePay};
 }
 test('same-page manager schedules and withdraws once after the initial paid proof',async()=>{
  const f=cancellationPage();
@@ -556,6 +567,24 @@ test('decline retry stops a late Pay gesture when the confirmation observer expi
  });
  await f.latePay();
  assert.equal(f.trace.filter(x=>x==='Pay').length,1);
+ assert.equal(f.providerSent.length,0);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('decline retry activates the pinned Pay button with one Enter per authorized attempt',async()=>{
+ const f=cancellationPage('confirm-pointer-lost',true);
+ assert.equal(await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),true);
+ assert.deepEqual(f.keysPressed,['Enter','Enter']);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
+ assert.equal(f.sent.filter(url=>url.endsWith('/retry')).length,1);
+});
+test('decline retry sends no key or payment when the exact Pay button cannot take focus',async()=>{
+ const f=cancellationPage('confirm-focus-lost',true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CONFIRM_FOCUS');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.deepEqual(f.keysPressed,[]);
  assert.equal(f.providerSent.length,0);
  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
 });

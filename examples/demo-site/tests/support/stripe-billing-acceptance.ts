@@ -288,13 +288,12 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    }
    return 'BROWSER_SESSION_NOT_SENT';
   }
-  function trustedClick(button:Locator){
-   return button.evaluateHandle(element=>{
-    let clicked=false;
-    element.addEventListener('click',event=>{clicked=event.isTrusted;},{once:true,capture:true});
-    return ()=>clicked;
-   });
+  function captureTrustedClick(element:HTMLElement|SVGElement){
+   let clicked=false;
+   element.addEventListener('click',event=>{clicked=event.isTrusted;},{once:true,capture:true});
+   return ()=>clicked;
   }
+  function trustedClick(button:Locator){return button.evaluateHandle(captureTrustedClick);}
   function sessionContext(value:Record<string,unknown>,successor:boolean,report?:(step:SessionWireCheckpoint)=>void){
    report?.('FIELDS');need(exact(value,['protocol','provider','flow','publishable_key','client_secret','attempt_id','capability','expires_at']));
    report?.('PROTOCOL');need(value.protocol==='SERVER_CONFIRM_V2' && value.provider==='stripe' && value.flow==='PAYMENT');
@@ -578,16 +577,32 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    checkpoint='BROWSER_CARD_FIELDS';
    const frame=manager.frameLocator('iframe[title="Secure payment input frame"]');await frame.locator('input[name="number"]').fill(card,{timeout:duration(limits)});await frame.locator('input[name="expiry"]').fill('1230',{timeout:duration(limits)});await frame.locator('input[name="cvc"]').fill('123',{timeout:duration(limits)});
    const postal=frame.locator('input[name="postalCode"]');if(await postal.isVisible())await postal.fill('10001',{timeout:duration(limits)});
-   if(guarded)trustedPayClick=await trustedClick(pay);
-   await checkManager();
-   while(pinned?.pending){
-    await pinned.wait();
+   const settlePresentation=async()=>{
     await checkManager();
+    while(pinned?.pending){
+     await pinned.wait();
+     await checkManager();
+    }
+   };
+   if(retryPort)await settlePresentation();
+   if(retryPort)checkpoint='BROWSER_CONFIRM_FOCUS';
+   const payButton=retryPort?await pay.elementHandle({timeout:duration(limits)}):undefined;
+   if(payButton){
+    await payButton.waitForElementState('stable',{timeout:duration(limits)});
+    await payButton.waitForElementState('enabled',{timeout:duration(limits)});
+    await billingBounded(limits,()=>payButton.focus(),duration(limits));
    }
+   if(guarded)trustedPayClick=payButton?await payButton.evaluateHandle(captureTrustedClick):await trustedClick(pay);
+   await settlePresentation();
+   if(payButton)need(await payButton.evaluate(element=>{
+    const root=element.getRootNode();
+    return element instanceof HTMLButtonElement && element.type==='button' && element.isConnected && !element.disabled &&
+     root instanceof ShadowRoot && root.host===document.querySelector('generic-subscription-manager') && root.activeElement===element;
+   }));
    // Arm observation after presentation has settled, but before a click can dispatch.
    checkpoint=retryPort?'BROWSER_CONFIRM_CLICK':'BROWSER_CONFIRM_WAIT';
    const confirmUrl=base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-attempts/'+attemptId+'/confirm';
-   const responseFailure=Symbol();
+   const responseFailure=Symbol(),unobservedClick=Symbol();
    let responseTimedOut=false;
    const confirmed=page.waitForResponse(r=>r.url()===confirmUrl&&r.request().method()==='POST',{timeout:duration(limits)}).catch(error=>{
     responseTimedOut=error instanceof errors.TimeoutError;
@@ -597,7 +612,12 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    let confirmResponse:Response;
    let clickFinished=false;
    try{
-    const clicking=pay.click({timeout:duration(limits)}).then(()=>{clickFinished=true;});
+    // Activate the exact focused control once, avoiding a pointer sequence across a layout change.
+    const activation=payButton?payButton.press('Enter',{timeout:duration(limits)}):pay.click({timeout:duration(limits)});
+    const clicking=activation.then(async()=>{
+     clickFinished=true;
+     if(payButton && !await trustedPayClick!.evaluate(clicked=>clicked()))throw unobservedClick;
+    });
     // A timed-out response must close Pay authority even if the click is still pending.
     [,confirmResponse]=await Promise.all([clicking,confirmed]);
    }catch(error){
@@ -608,6 +628,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
       checkpoint=await confirmWaitBoundary().catch(()=> 'BROWSER_CONFIRM_WAIT');
      }
     }
+    if(error===unobservedClick)checkpoint='BROWSER_CONFIRM_CLICK_UNOBSERVED';
     throw error;
    }finally{payInFlight=false;}
    checkpoint='BROWSER_CONFIRM_RECEIPT';

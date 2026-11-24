@@ -38,6 +38,8 @@ Offline tests reproduced a confirmation observer that timed out during Pay prepa
 
 Run `40a21c4a-567e-4afb-b731-2d645fe9b455` at `1d4c381` used the verified private bridge and reached CREATE_ACK. The paired confirmation-session response returned HTTP 200, then the browser stopped at `BROWSER_INITIAL_SESSION_WIRE` and confirmed cleanup. No confirmation or Retry dispatch was recorded. The runner now reports a fixed category for the original response read, decoding or failed session check. The existing session checks and one-read behavior are preserved.
 
+Run `8451973f-761d-4ffe-8721-11ec0d49a048` at `41a1214` accepted the first checkout session and stopped at `BROWSER_CONFIRM_CLICK_UNOBSERVED` with confirmed cleanup. The browser's Pay action completed without an observed trusted click. No confirmation or Retry dispatch entered the journal. A network-blocked Chromium fixture reproduced completion without a trusted event when the button became disabled during pointer activation. It produced one trusted event with Enter on the focused button. The decline/Retry driver now focuses and checks the exact Pay control before activating it once by keyboard. The historical pointer-event cause remains undetermined.
+
 ## Earlier local recovery evidence on 2026-11-23
 
 Run `c2dfc733-6915-45b8-8aa5-3792ccb31f42` at `0449bdd` passed the initial payment, declined renewal, grace checks and replacement-method confirmation. The exact Stripe Sandbox request log showed that the invoice-created PaymentIntent refused `error_on_requires_action`. Both the local runner and Stripe stopped that request.
