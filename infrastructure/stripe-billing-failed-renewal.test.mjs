@@ -978,6 +978,68 @@ for(const [stage,extra,checkpoint] of [
  assert.equal(result.failedRenewalAccepted,false);
  assert.ok(!JSON.stringify(result).includes('private recovery canary'));
 });
+for(const [stage,extra,checkpoint] of [
+ ['METHOD_SELECT_SETUP_READ',false,'SERVER_SETUP_READ'],
+ ['METHOD_SELECT_RELEASE',false,'SERVER_RELEASE'],
+ ['RECOVERY_OBSERVE_ACCESS',false,'HTTP'],
+ ['METHOD_SELECT_SETUP_READ',true,'HTTP'],
+])test('method selection reports its fixed refusal '+stage+(extra?' with unexpected detail':''),async()=>{
+ const h=harness(),paths=[];
+ const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),initial(),...h.vs.slice(0,7)];
+ h.dependencies.createRuntime=()=>clients.createBillingFailedRenewalRuntime({configuration:opts(),bootstrap:{
+  withFailedRenewalRuntime:cb=>cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)})
+ }},{fetch:async url=>{
+  const path=new URL(url).pathname;paths.push(path);
+  if(path==='/failed-renewal/abort')return new Response('{"code":"QUIESCENT"}');
+  if(path==='/failed-renewal/method/select'){
+   const body={code:'FAILED_RENEWAL_STOPPED',stage};
+   if(extra)body.detail='private selection canary';
+   return new Response(JSON.stringify(body),{status:400});
+  }
+  return new Response(JSON.stringify(replies.shift()));
+ }});
+ const o=await owner(h);await assert.rejects(o.run(h.journey,limits()));
+ const result=await o.close(),line=postArmLine('METHOD_BROWSER','METHOD_SELECT_'+checkpoint);
+ assert.equal(owners.formatBillingFailedRenewalDiagnostic(result),line);
+ assert.equal(owners.parseBillingFailedRenewalDiagnosticLine(line),line);
+ assert.deepEqual(paths.slice(-3),['/failed-renewal/method/prepare','/failed-renewal/method/select','/failed-renewal/abort']);
+ assert.equal(result.failedRenewalAccepted,false);
+ assert.ok(!JSON.stringify(result).includes('private selection canary'));
+});
+test('method cancellation waits for the owned bootstrap request to release before one stop, even without runtime proof',async()=>{
+ const h=harness(),controller=new AbortController(),paths=[],verifying=Promise.withResolvers();
+ const finishVerify=Promise.withResolvers(),listenerStopped=Promise.withResolvers();
+ const replies=[{phase:'NEW',code:'OK',run_id:id(1)},prepared(),confirmed(),initial(),...h.vs.slice(0,7)];
+ let uses=0,busy=false;
+ h.bootstrap.withFailedRenewalRuntime=async cb=>{
+  assert.equal(busy,false,'overlapping bootstrap request');
+  uses++;
+  busy=true;
+  try{
+   if(uses===12){verifying.resolve();await finishVerify.promise;throw Error('canceled owned verification');}
+   return await cb({endpoint:'http://127.0.0.1:18083',capability:'x'.repeat(43)});
+  }finally{busy=false;}
+ };
+ h.dependencies.createRuntime=options=>clients.createBillingFailedRenewalRuntime(options,{fetch:async url=>{
+  const path=new URL(url).pathname;paths.push(path);
+  if(path==='/failed-renewal/abort')return new Response('{"code":"RECEIVED"}');
+  assert.ok(replies.length);return new Response(JSON.stringify(replies.shift()));
+ }});
+ h.cli.stopListener=async()=>{h.calls.push('listener-stop');listenerStopped.resolve();return true;};
+ h.bootstrap.stop=async l=>{h.calls.push('stop');assert.equal(l.signal.aborted,false);assert.equal(busy,false);h.calls.push('stopped');return true;};
+ const o=await owner(h),run=assert.rejects(o.run(h.journey,{...limits(),signal:controller.signal}));
+ try{
+  await verifying.promise;controller.abort();
+  await listenerStopped.promise;
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(!h.calls.includes('stop'));
+ }finally{finishVerify.resolve();await run;}
+ assert.deepEqual(h.calls.slice(-4),['listener-stop','stop','stopped','fixture-close']);
+ const result=await o.close();
+ assert.equal(result.diagnostic,'METHOD_SELECT_AUTHORITY');
+ assert.equal(result.cleanupConfirmed,false);assert.equal(result.cleanupFailure,'RUNTIME_CLOSE');
+ assert.deepEqual(paths.slice(-2),['/failed-renewal/method/prepare','/failed-renewal/abort']);
+});
 test('post-arm terminal protocol rejects foreign stages, mismatched codes, arbitrary text and false cleanup claims',()=>{
  const base={scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY',status:'CLOSED',phase:'FAILED_RENEWAL',code:'FAILED_RENEWAL',diagnostic:'FAILED_RENEWAL_REQUEST',initialAccepted:false,failedRenewalAccepted:false,full5bAccepted:false,cleanupConfirmed:true,cleanupFailure:null};
  for(const changes of [{diagnostic:'GRACE_AT_REQUEST'},{scope:'OWNED_INITIAL_PAYMENT'},{phase:'PRIVATE'},{code:'METHOD_ORDER'},{initialAccepted:true},{failedRenewalAccepted:true},{full5bAccepted:true},{status:'RUNNING'},{diagnostic:'FAILED_RENEWAL_PRIVATE'}])assert.equal(owners.formatBillingFailedRenewalDiagnostic({...base,...changes}),null);

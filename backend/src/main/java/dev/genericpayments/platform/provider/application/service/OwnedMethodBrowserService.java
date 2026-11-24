@@ -20,6 +20,12 @@ public final class OwnedMethodBrowserService implements GetSubscriptionActionUse
     private final Reservation expected;private final OwnedFailedRenewalMethodService methods;
     private final OwnedFailedRenewalMethodStore store;private final OwnedMethodBrowserReader reader;
     private final OwnedMethodBrowserTokens tokens;private final Clock clock;
+    public enum SelectionCheckpoint { SELECTION_SCOPE, SELECTION_CLAIM, SETUP_READ, SETUP_RESULT, RELEASE, RETURN_BUDGET }
+    /** Finite progress only. A caller creates a fresh instance for one owned selection. */
+    public static final class SelectionDiagnostic {
+        private SelectionCheckpoint checkpoint;
+        public SelectionCheckpoint checkpoint(){return checkpoint;}
+    }
     public OwnedMethodBrowserService(Reservation expected,OwnedFailedRenewalMethodService methods,OwnedFailedRenewalMethodStore store,
             OwnedMethodBrowserReader reader,OwnedMethodBrowserTokens tokens,Clock clock){
         this.expected=Objects.requireNonNull(expected);this.methods=Objects.requireNonNull(methods);this.store=Objects.requireNonNull(store);
@@ -40,16 +46,22 @@ public final class OwnedMethodBrowserService implements GetSubscriptionActionUse
         });
     });}
     public SubscriptionClientSession issue(CreateSubscriptionClientSessionUseCase.Command c){return safely(()->{
-        if(c==null)throw unavailable();var release=release(c.context(),c.subscriptionId(),c.operationId(),c.actionToken());
+        if(c==null)throw unavailable();var release=release(c.context(),c.subscriptionId(),c.operationId(),c.actionToken(),null);
         return new SubscriptionClientSession("stripe",SubscriptionClientSession.Flow.SETUP,release.ephemeral().publishableKey(),release.ephemeral().clientSecret(),c.actionToken(),release.root().expiresAt());
     });}
-    public Session select(Scope s,String token){return safely(()->{
-        if(s==null)throw unavailable();var release=release(s.context(),s.subscription(),s.operation(),token);
+    public Session select(Scope s,String token){return select(s,token,null);}
+    public Session select(Scope s,String token,SelectionDiagnostic diagnostic){return safely(()->{
+        if(s==null)throw unavailable();var release=release(s.context(),s.subscription(),s.operation(),token,diagnostic);
         return new Session("BROWSER_CONFIRM_V1","stripe",SubscriptionClientSession.Flow.SETUP,release.ephemeral().publishableKey(),release.ephemeral().clientSecret(),token,null,null,release.root().expiresAt());
     });}
-    private Released release(SubscriptionCommandContext context,UUID subscription,UUID operation,String token){
+    private static void mark(SelectionDiagnostic diagnostic,SelectionCheckpoint checkpoint){
+        if(diagnostic!=null)diagnostic.checkpoint=checkpoint;
+    }
+    private Released release(SubscriptionCommandContext context,UUID subscription,UUID operation,String token,SelectionDiagnostic diagnostic){
+        mark(diagnostic,SelectionCheckpoint.SELECTION_SCOPE);
         scope(context,subscription,operation);requireToken(token);var key=key(context);
         // The start receipt commits before the sole SDK retrieve. Any later failure burns this opportunity.
+        mark(diagnostic,SelectionCheckpoint.SELECTION_CLAIM);
         var selected=methods.browserPhase(expected,context,p->{
             var root=store.browserRootInTransaction(expected.id()).orElseThrow(OwnedMethodBrowserService::unavailable);verify(p,root,token);
             var at=now();var selection=store.startBrowserSelectionInTransaction(p,root,key,at);
@@ -57,9 +69,12 @@ public final class OwnedMethodBrowserService implements GetSubscriptionActionUse
                 ||!selection.deadlineAt().equals(min(at.plusSeconds(30),root.expiresAt()))||!now().isBefore(selection.deadlineAt()))throw unavailable();
             return new Selected(p,root,selection);
         });
+        mark(diagnostic,SelectionCheckpoint.SETUP_READ);
         var ephemeral=reader.read(selected.pending(),selected.selection().deadlineAt());
+        mark(diagnostic,SelectionCheckpoint.SETUP_RESULT);
         requireEphemeral(selected.root(),ephemeral);
         // Persistence runs only on this caller; returning from browserPhase means release committed.
+        mark(diagnostic,SelectionCheckpoint.RELEASE);
         var released=methods.browserPhase(expected,context,p->{
             if(!selected.pending().equals(p))throw unavailable();
             var root=store.browserRootInTransaction(expected.id()).orElseThrow(OwnedMethodBrowserService::unavailable);
@@ -69,6 +84,7 @@ public final class OwnedMethodBrowserService implements GetSubscriptionActionUse
             return new Released(root,ephemeral);
         });
         // A lock/commit wait may consume the remaining window after the on-time release INSERT.
+        mark(diagnostic,SelectionCheckpoint.RETURN_BUDGET);
         var returnedAt=now();if(!returnedAt.isBefore(selected.selection().deadlineAt())||!returnedAt.isBefore(selected.root().expiresAt()))throw unavailable();
         return released;
     }

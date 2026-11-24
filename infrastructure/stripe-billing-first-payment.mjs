@@ -74,7 +74,7 @@ async function createOwner(options,dependencies,purpose){
  }
  const c=mode.validate(options);if(!c)throw billingError('OPT_IN_REQUIRED');
  let state='NEW',phase='NEW',failure=null,diagnostic=null,accepted=false,cleanupConfirmed=false,cleanupFailure=null,bootstrap,cli,fixture,runtime,cleanupPromise,active,finish;
- let journeyStarted=false,journeySettled=false,journeyClean=false,startSettlement,listenerSettlement,provisionLimits,postArmCheckpoint,postArmRequestLimits;
+ let journeyStarted=false,journeySettled=false,journeyClean=false,startSettlement,listenerSettlement,methodSelectionSettlement,provisionLimits,postArmCheckpoint,postArmRequestLimits;
  let initialConfirm;
  const lifetime=new AbortController(),finished=new Promise(r=>finish=r);let preparePending=false,prepareUsed=false,confirmUsed=false,prepareAck=false,confirmAck=false,selected,originalIdentity;
  const revoke=()=>{
@@ -101,9 +101,10 @@ async function createOwner(options,dependencies,purpose){
     }
    }else if(failedRenewal&&postArmCheckpoints.has(phase)){
     diagnostic=postArmCheckpoints.get(phase).has(postArmCheckpoint)?postArmCheckpoint:null;
-    if(postArmRequestLimits&&diagnostic===phase+'_REQUEST'){
+    const requestStage=phase==='METHOD_BROWSER'&&diagnostic==='METHOD_SELECT_REQUEST'?'METHOD_SELECT':phase;
+    if(postArmRequestLimits&&diagnostic===requestStage+'_REQUEST'){
      const requestCheckpoint=billingFailedRenewalRuntimeCheckpoint(runtime,postArmRequestLimits);
-     if(isFailedRenewalRuntimeCheckpoint(requestCheckpoint,phase))diagnostic=requestCheckpoint;
+     if(isFailedRenewalRuntimeCheckpoint(requestCheckpoint,requestStage))diagnostic=requestCheckpoint;
     }
    }else{
     diagnostic=failedRenewal&&phase==='LISTENER'&&(code==='LISTENER'||code==='ABORTED')&&isPersistenceDiagnostic(detail)?detail:isTerminalDiagnostic(detail)?detail:confirmAck?postConfirmCheckpoints[phase]??null:null;
@@ -151,6 +152,12 @@ async function createOwner(options,dependencies,purpose){
     try{await billingBounded(l,()=>startSettlement,120000);}catch{missing('START_SETTLEMENT');continue;}
     // START may retain its first checkpoint while the canceled operation settles.
     if(missingStartupDiagnostic)diagnostic=startupDiagnostic(bootstrap);
+   }
+   if(o===bootstrap&&methodSelectionSettlement){
+    // A canceled browser race can return before the owned runtime binding
+    // releases bootstrap's busy guard. Give that request time to wind down
+    // before the one independently authorized stop.
+    try{await billingBounded(l,()=>methodSelectionSettlement,10000);}catch{/* stop keeps its own proof and deadline */}
    }
    try{
     const stopped=await billingBounded(l,async x=>{
@@ -272,8 +279,10 @@ async function createOwner(options,dependencies,purpose){
       const operation=postArmOperations.get(method)??browserMethodOperations.get(method);
       if(operation)postArmCheckpoint=operation+'_REQUEST';
       const v=await guarded(operation?phase:stage.phase,l,async bound=>{
-       if(method==='failedRenewal'||method==='graceLastSecond'||method==='confirmRecovery'||method==='observeRecovery')postArmRequestLimits=bound;
-       const reply=await runtime[stage.method](bound);billingCheck(bound);
+       if(method==='failedRenewal'||method==='graceLastSecond'||method==='selectMethod'||method==='confirmRecovery'||method==='observeRecovery')postArmRequestLimits=bound;
+       const request=runtime[stage.method](bound);
+       if(method==='selectMethod')methodSelectionSettlement=Promise.resolve(request).then(()=>undefined,()=>undefined);
+       const reply=await request;billingCheck(bound);
        if(operation)postArmCheckpoint=operation+'_RESPONSE';
        return validateFailedRenewalStage(method,reply,originalIdentity,settlement,c,previous);
       });
@@ -360,7 +369,7 @@ function isFailedRenewalCheckpoint(stage,checkpoint){
   case 'START':return checkpoint==='START_UNKNOWN'||startupCodes.has(checkpoint);
   case 'PROVISION':return checkpoint==='PROVISION_UNKNOWN'||isFailedRenewalProvisionCheckpoint(checkpoint);
   case 'BROWSER':return isInitialConfirmCheckpoint(checkpoint)||(checkpoint!=='BROWSER_METHOD_MOUNT'&&isBrowserDiagnostic(checkpoint));
-  case 'METHOD_BROWSER':return isMethodBrowserDiagnostic(checkpoint)||postArmCheckpoints.get(stage).has(checkpoint);
+  case 'METHOD_BROWSER':return isMethodBrowserDiagnostic(checkpoint)||postArmCheckpoints.get(stage).has(checkpoint)||isFailedRenewalRuntimeCheckpoint(checkpoint,'METHOD_SELECT');
   default:{
    const checkpoints=postArmCheckpoints.get(stage);
    return checkpoints!==undefined&&(checkpoints.has(checkpoint)||isFailedRenewalRuntimeCheckpoint(checkpoint,stage));

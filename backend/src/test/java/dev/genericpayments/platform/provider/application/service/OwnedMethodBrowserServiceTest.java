@@ -66,7 +66,10 @@ class OwnedMethodBrowserServiceTest {
                 case "release"->f.failRelease=true;case "commit"->f.failCommit=true;
             }};
 
-            refused(()->s.select(scope(f,"select"),token));
+            var diagnostic=new OwnedMethodBrowserService.SelectionDiagnostic();
+            refused(()->s.select(scope(f,"select"),token,diagnostic));
+            assertThat(diagnostic.checkpoint()).isEqualTo(bad.equals("read")
+                ?OwnedMethodBrowserService.SelectionCheckpoint.SETUP_READ:OwnedMethodBrowserService.SelectionCheckpoint.RELEASE);
 
             f.authorized=true;f.failRelease=false;assertThat(f.selection).isNotNull();assertThat(f.released).isFalse();
             refused(()->s.select(scope(f,"second"),token));refused(()->s.confirm(confirm(f,"confirm",token)));

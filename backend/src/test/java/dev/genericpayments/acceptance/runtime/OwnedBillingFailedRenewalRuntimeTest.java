@@ -238,6 +238,27 @@ class OwnedBillingFailedRenewalRuntimeTest {
         }
     }
 
+    @Test void methodSelectionExposesOnlyFixedCheckpointsFromItsOwnDispatchedRequest() throws Exception {
+        for(var stage:List.of("METHOD_SELECT_SETUP_READ","METHOD_SELECT_RELEASE","METHOD_SELECT_PRIVATE")){
+            for(var path:List.of("method/select","method/confirm")){
+                for(var body:List.of("{}","{\"unexpected\":true}")){
+                    var refusal=new IllegalStateException("private setup intent detail");
+                    var ops=new Inert(){
+                        public JsonObject selectMethod(){throw refusal;}
+                        public JsonObject confirmMethod(){throw refusal;}
+                        public String failureStage(Exception error){return error==refusal?stage:"UNCLASSIFIED";}
+                    };
+                    var exchange=request("POST","/failed-renewal/"+path,body);
+                    handler(ops).handle(exchange);
+                    var expected=path.equals("method/select")&&body.equals("{}")&&!stage.endsWith("PRIVATE")?stage:"UNCLASSIFIED";
+                    assertThat(exchange.code).isEqualTo(400);
+                    assertThat(exchange.output.toString()).isEqualTo("{\"code\":\"FAILED_RENEWAL_STOPPED\",\"stage\":\""+expected+"\"}");
+                    assertThat(ops.aborts).hasValue(1);
+                }
+            }
+        }
+    }
+
     @Test void recoveryObservationReturnsOnlyTheSelectedRoutesFixedRefusal() throws Exception {
         for(var stage:List.of("RECOVERY_OBSERVE_OBSERVATION_PUBLICATION","RECOVERY_OBSERVE_ACCESS","RECOVERY_OBSERVE_PRIVATE","RECOVERY_CONFIRM_CONFIRMATION_POST")){
             for(var path:List.of("recovery/observe","recovery/confirm")){

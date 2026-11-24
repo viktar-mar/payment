@@ -171,6 +171,7 @@ test('actual reporter publishes a failed renewal checkpoint only from the matchi
  const server=prefix+'FAILED_RENEWAL_SERVER_OBSERVATION'+suffix;
  const observer=prefix+'FAILED_RENEWAL_SERVER_OBSERVATION_FAILED_ALLOCATION'+suffix;
  const request=prefix+'FAILED_RENEWAL_REQUEST'+suffix;
+ const selection='owned_failed_renewal_diagnostic stage=METHOD_BROWSER checkpoint=METHOD_SELECT_SERVER_SETUP_READ'+suffix;
  for(const [description,expected] of [
   [server,[server]],
   [observer,[observer]],
@@ -180,6 +181,9 @@ test('actual reporter publishes a failed renewal checkpoint only from the matchi
   [server.replace('stage=FAILED_RENEWAL','stage=BROWSER'),[]],
   [server.replace('SERVER_OBSERVATION','SERVER_UNKNOWN_CANARY'),[]],
   [server+' raw body canary',[]],
+  [selection,[selection]],
+  [selection.replace('METHOD_BROWSER','RECOVERY_OBSERVE'),[]],
+  [selection.replace('SETUP_READ','PRIVATE'),[]],
  ] as const){
   const output=await captureReporter(reporter=>{
    const testCase=reporterCase(),result=reporterResult({annotations:[]});

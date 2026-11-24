@@ -149,9 +149,22 @@ public final class OwnedBillingFailedRenewalSandboxScenario implements OwnedBill
         var result=response("METHOD_PREPARED");var value=new JsonObject();value.addProperty("kind",action.kind().name());value.addProperty("secret",action.secret());value.addProperty("expires_at",action.expiresAt().toString());result.add("action",value);return result;
     });}
     @Override public JsonObject selectMethod(){return stage("METHOD_PREPARED","METHOD_SELECTED",Stage.METHOD_SELECT,()->{
-        management();selected=browser.select(new SubscriptionConfirmationUseCase.Scope(browserContext("selection"),upstream.receipt().intent().subscription(),reservation.setupOperationId()),action.secret());
+        detailedStep="METHOD_SELECT_MANAGEMENT";
+        management();
+        var scope=new SubscriptionConfirmationUseCase.Scope(browserContext("selection"),upstream.receipt().intent().subscription(),reservation.setupOperationId());
+        detailedStep="METHOD_SELECT_SELECTION";
+        var diagnostic=new OwnedMethodBrowserService.SelectionDiagnostic();
+        try{selected=browser.select(scope,action.secret(),diagnostic);}
+        catch(RuntimeException refusal){
+            if(diagnostic.checkpoint()!=null)detailedStep="METHOD_SELECT_"+diagnostic.checkpoint().name();
+            throw refusal;
+        }
+        detailedStep="METHOD_SELECT_SESSION";
         require(selected.protocol().equals("BROWSER_CONFIRM_V1")&&selected.provider().equals("stripe")&&selected.flow()==SubscriptionClientSession.Flow.SETUP&&selected.attemptId()==null&&selected.capability()==null&&selected.actionToken().equals(action.secret()));
-        missingAccess();var result=response("METHOD_SELECTED");var session=new JsonObject();session.addProperty("protocol",selected.protocol());session.addProperty("provider",selected.provider());session.addProperty("flow",selected.flow().name());session.addProperty("publishable_key",selected.publishableKey());session.addProperty("client_secret",selected.clientSecret());session.addProperty("action_token",selected.actionToken());session.add("attempt_id",JsonNull.INSTANCE);session.add("capability",JsonNull.INSTANCE);session.addProperty("expires_at",selected.expiresAt().toString());result.add("session",session);return result;
+        detailedStep="METHOD_SELECT_ACCESS";
+        missingAccess();
+        detailedStep="METHOD_SELECT_RESPONSE_BUILD";
+        var result=response("METHOD_SELECTED");var session=new JsonObject();session.addProperty("protocol",selected.protocol());session.addProperty("provider",selected.provider());session.addProperty("flow",selected.flow().name());session.addProperty("publishable_key",selected.publishableKey());session.addProperty("client_secret",selected.clientSecret());session.addProperty("action_token",selected.actionToken());session.add("attempt_id",JsonNull.INSTANCE);session.add("capability",JsonNull.INSTANCE);session.addProperty("expires_at",selected.expiresAt().toString());result.add("session",session);return result;
     });}
     @Override public JsonObject confirmMethod(){return stage("METHOD_SELECTED","METHOD_CONSUMED",Stage.METHOD_CONFIRM,()->{
         management();var allowed=browser.confirm(new ConfirmSubscriptionActionUseCase.Command(browserContext("consumption"),upstream.receipt().intent().subscription(),reservation.setupOperationId(),selected.actionToken()));
