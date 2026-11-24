@@ -30,10 +30,10 @@ for(const [frameId,status,release] of [['checkout-frame',200,true],['wrong-frame
   assert.equal(commands.includes('Fetch.failRequest'),!release);
  });
 
-for(const mode of ['eligible','redirect','missing request','foreign frame','unclaimed response','error response','foreign response']){
+for(const mode of ['eligible','redirect','not modified','missing request','foreign frame','unclaimed response','error response','network failure','foreign response']){
  test('Chromium response interception retains original bytes and stops '+mode,async()=>{
   const href='https://api.stripe.com/v1/3ds2/authenticate',location='https://js.stripe.com/v3/frame';
-  const commands:string[]=[],events=new Map<string,(e:unknown)=>Promise<void>|void>();let invalid=false;
+  const commands:string[]=[],events=new Map<string,(e:unknown)=>Promise<void>|void>(),refusals:string[]=[];
   const frame={url:()=>location,name:()=>'',parentFrame:()=>null,isDetached:()=>false};
   const session={on:(event:string,listener:(e:unknown)=>Promise<void>)=>events.set(event,listener),send:async(command:string,args:unknown)=>{
    commands.push(command);
@@ -41,7 +41,7 @@ for(const mode of ['eligible','redirect','missing request','foreign frame','uncl
    if(command==='Fetch.continueResponse')assert.deepEqual(args,{requestId:'paused'});
   }};
   const page={context:()=>({newCDPSession:async()=>session}),frames:()=>[frame],mainFrame:()=>frame,on:()=>{}};
-  const guard=await guardChallengeRedirects(page as never,()=>{invalid=true;},origins);
+  const guard=await guardChallengeRedirects(page as never,reason=>refusals.push(reason),origins);
   if(mode!=='missing request')events.get('Network.requestWillBeSent')!({requestId:'network',frameId:mode==='foreign frame'?'wrong':'frame',request:{url:href,method:'POST'}});
   const request={url:()=>href,method:()=>'POST',frame:()=>frame};
   if(['missing request','foreign frame'].includes(mode)){
@@ -49,9 +49,16 @@ for(const mode of ['eligible','redirect','missing request','foreign frame','uncl
   }
   if(mode!=='unclaimed response')await guard.authorize(request as never);
   await events.get('Fetch.requestPaused')!({requestId:'paused',networkId:'network',frameId:'frame',
-   request:{url:mode==='foreign response'?href+'x':href,method:'POST'},responseStatusCode:mode==='redirect'?307:mode==='error response'?500:200});
+   request:{url:mode==='foreign response'?href+'x':href,method:'POST'},
+   responseStatusCode:mode==='redirect'?307:mode==='not modified'?304:mode==='error response'?500:200,
+   responseErrorReason:mode==='network failure'?'private failure canary':undefined});
   assert.equal(commands.includes('Fetch.continueResponse'),mode==='eligible');
-  assert.equal(commands.includes('Fetch.failRequest'),mode!=='eligible');assert.equal(invalid,mode!=='eligible');
+  assert.equal(commands.includes('Fetch.failRequest'),mode!=='eligible');
+  const expected=mode==='redirect'?'BROWSER_GUARD_RESPONSE_REDIRECT':
+   mode==='error response'||mode==='not modified'?'BROWSER_GUARD_RESPONSE_STATUS':
+   mode==='network failure'?'BROWSER_GUARD_RESPONSE_NETWORK':
+   mode==='unclaimed response'?'BROWSER_GUARD_RESPONSE_UNCLAIMED':'BROWSER_GUARD_RESPONSE_PAIR';
+  assert.deepEqual(refusals,mode==='eligible'?[]:[expected]);
  });
 }
 

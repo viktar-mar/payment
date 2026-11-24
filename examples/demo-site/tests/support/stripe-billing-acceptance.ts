@@ -339,7 +339,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     return {phase:'successor',ready:successorPresentationReady.promise};
   },recordFailure):undefined;
   const winning=Promise.withResolvers<void>();
-  const invalidate=()=>{recordFailure('BROWSER_INVALIDATED');abort();};
+  const invalidate=(reason:string)=>{recordFailure(reason);abort();};
   if(challenge||invoiceCase)checkpoint='BROWSER_SETUP';
   const redirects=challenge||invoiceCase?await guardChallengeRedirects(page,invalidate,binding.endpoints):undefined;
   const sca=challenge?initial3dsChallenge({page,limits,demo:binding.endpoints.demo,owner:()=>({secret:firstSecret,key:publishableKey??''}),
@@ -399,9 +399,9 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   }
   const check=()=>{billingCheck(limits);if(failure||abandoned)fail();};
   if(guarded){
-   if(redirects)context.on('request',request=>{if(request.redirectedFrom())invalidate();});
-   context.on('page',invalidate);
-   await context.routeWebSocket('**/*',socket=>{try{socket.close();}finally{invalidate();}});
+   if(redirects)context.on('request',request=>{if(request.redirectedFrom())invalidate('BROWSER_GUARD_REQUEST_REDIRECT');});
+   context.on('page',()=>invalidate('BROWSER_GUARD_POPUP'));
+   await context.routeWebSocket('**/*',socket=>{try{socket.close();}finally{invalidate('BROWSER_GUARD_WEBSOCKET');}});
   }
   await context.route(guarded?'**/*':binding.endpoints.backend+'/**',route=>{
    const work=(async()=>{let routeCheckpoint:string|undefined;try{
@@ -521,7 +521,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   checkoutUrl=url.href;await page.goto(url.href,{timeout:duration(limits)});
   if(guarded){
    need(new URL(page.url()).origin===binding.endpoints.demo);
-   page.on('framenavigated',frame=>{if(frame===page.mainFrame())invalidate();});
+   page.on('framenavigated',frame=>{if(frame===page.mainFrame())invalidate('BROWSER_GUARD_MAIN_NAVIGATION');});
   }
   if(bound)checkpoint='BROWSER_OTP_REQUEST';
   const widget=page.locator('generic-email-otp').first();

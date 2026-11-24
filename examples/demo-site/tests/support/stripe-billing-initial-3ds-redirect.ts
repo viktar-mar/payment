@@ -8,6 +8,9 @@ type Origins={backend:string;demo:string};
 type Header={name:string;value:string};
 type Preflight={origin:string;method:string;names?:string};
 type Entry={url:string;method:string;frameId:string;allowed:boolean;preflight?:Preflight;initiator?:{id:string;entry:Entry}};
+type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
+ |'BROWSER_GUARD_RESPONSE_PAIR'|'BROWSER_GUARD_RESPONSE_REDIRECT'|'BROWSER_GUARD_RESPONSE_STATUS'|'BROWSER_GUARD_RESPONSE_NETWORK'
+ |'BROWSER_GUARD_RESPONSE_PREFLIGHT'|'BROWSER_GUARD_RESPONSE_UNCLAIMED'|'BROWSER_GUARD_RESPONSE_RESUME';
 function stripeScript(url:URL){
  return url.protocol==='https:' && !url.port && !url.username && !url.password &&
   (url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com'));
@@ -54,7 +57,7 @@ function frameId(tree:Tree,root:Frame,frame:Frame):string {
 
 /** Playwright routes only the first URL in a redirect chain. Arm a response-stage guard
  * before each SDK request exists and require its passive network event on the exact frame. */
-export async function guardChallengeRedirects(page:Page,onFailure:()=>void,origins:Origins){
+export async function guardChallengeRedirects(page:Page,onFailure:(reason:RedirectGuardFailure)=>void,origins:Origins){
  for(const fresh of [origins.backend,origins.demo]){
   const url=new URL(fresh);
   if(url.origin!==fresh || !/^http:\/\/127\.0\.0\.1:[1-9]\d{3,4}$/.test(fresh))refuse();
@@ -78,7 +81,9 @@ export async function guardChallengeRedirects(page:Page,onFailure:()=>void,origi
   const requests=new Map<string,Entry>();let ready=false;
   session.on('Network.requestWillBeSent',event=>{
    if(!ready||!tracked(event.request.url))return;
-   if(event.redirectResponse || requests.has(event.requestId) || requests.size>=24){onFailure();return;}
+   if(event.redirectResponse){onFailure('BROWSER_GUARD_REQUEST_REDIRECT');return;}
+   if(requests.has(event.requestId)){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
+   if(requests.size>=24){onFailure('BROWSER_GUARD_REQUEST_CAPACITY');return;}
    const preflight=probe(event.request,event.initiator?.type,origins);
    let frameId=event.frameId,initiator:Entry['initiator'];
    // Chromium can omit the preflight's frame ID before supplying it on the paired pause.
@@ -89,7 +94,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:()=>void,origi
      initiator={id,entry};
     }
    }
-   if(!frameId){onFailure();return;}
+   if(!frameId){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
    requests.set(event.requestId,{frameId,url:event.request.url,method:event.request.method,allowed:false,preflight,initiator});
   });
   // Playwright 1.63 fulfills genuine browser preflights before exposing a user route.
@@ -97,12 +102,19 @@ export async function guardChallengeRedirects(page:Page,onFailure:()=>void,origi
   session.on('Network.loadingFinished',event=>requests.delete(event.requestId));
   session.on('Network.loadingFailed',event=>requests.delete(event.requestId));
   session.on('Fetch.requestPaused',async event=>{
+   let reason:RedirectGuardFailure='BROWSER_GUARD_RESPONSE_PAIR';
    try{
     const original=event.networkId && requests.get(event.networkId);
     if(!original || original.frameId!==event.frameId || original.url!==event.request.url ||
-       original.method!==event.request.method || !event.responseStatusCode || event.responseStatusCode<200 ||
-       event.responseStatusCode>=300 || event.responseErrorReason)throw Error('billing_BROWSER');
+       original.method!==event.request.method)return refuse();
+    if(event.responseErrorReason){reason='BROWSER_GUARD_RESPONSE_NETWORK';refuse();}
+    const status=event.responseStatusCode;
+    if(!status || status<200 || status>=300){
+     reason=status && [301,302,303,307,308].includes(status)?'BROWSER_GUARD_RESPONSE_REDIRECT':'BROWSER_GUARD_RESPONSE_STATUS';
+     refuse();
+    }
     if(original.method==='OPTIONS'){
+     reason='BROWSER_GUARD_RESPONSE_PREFLIGHT';
      const paused=probe(event.request,'preflight',origins),sent=original.preflight;
      if(!sent || !paused || paused.origin!==sent.origin || paused.method!==sent.method || paused.names!==sent.names ||
         !syntheticProbe(sent,event.responseStatusCode,event.responseHeaders))refuse();
@@ -110,12 +122,13 @@ export async function guardChallengeRedirects(page:Page,onFailure:()=>void,origi
       const {id,entry}=original.initiator;
       if(requests.get(id)!==entry || entry.allowed)refuse();
      }
-    }else if(!original.allowed)refuse();
+    }else if(!original.allowed){reason='BROWSER_GUARD_RESPONSE_UNCLAIMED';refuse();}
     requests.delete(event.networkId!);
+    reason='BROWSER_GUARD_RESPONSE_RESUME';
     await session.send('Fetch.continueResponse',{requestId:event.requestId});
    }catch{
     try{await session.send('Fetch.failRequest',{requestId:event.requestId,errorReason:'BlockedByClient'});}
-    catch{}finally{onFailure();}
+    catch{}finally{onFailure(reason);}
    }
   });
   await session.send('Network.enable');

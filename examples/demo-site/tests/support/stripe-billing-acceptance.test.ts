@@ -796,7 +796,7 @@ for(const [fault,expected,closed] of [
  ['session-http','BROWSER_SESSION_HTTP_CONFLICT',true],
  ['early-static-invalid-session','BROWSER_INITIAL_SESSION_WIRE_CAPABILITY',true],
  ['session-http-close-fails','BROWSER_SESSION_HTTP_CONFLICT',false],
- ['early-static-navigation','BROWSER_INVALIDATED',true],
+ ['early-static-navigation','BROWSER_GUARD_MAIN_NAVIGATION',true],
 ] as const)test('decline retry reports only the original safe session boundary for '+fault,async()=>{
  const f=cancellationPage(fault,true);
  await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),(error:unknown)=>{
