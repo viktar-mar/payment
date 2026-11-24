@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {chromium} from '@playwright/test';
+import {chromium,type CDPSession} from '@playwright/test';
 // @ts-ignore Native Node executes the guard source.
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
 
-for(const mode of ['first request','nested siblings','unnamed iframe','parallel same frame','redirect']){
+for(const mode of ['first request','nested siblings','unnamed iframe','parallel same frame','late CDP event','redirect']){
  test('Chrome guards '+mode+' in cross-process iframes', {timeout:25_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080';
  const stripe='https://js.stripe.com',nested='https://nested.js.stripe.com';
@@ -22,7 +22,27 @@ for(const mode of ['first request','nested siblings','unnamed iframe','parallel 
   let apiRequests=0;
   let followed=0;
   page.on('request',request=>{if(request.url()===tripwire)followed++;});
-  const guard=await guardChallengeRedirects(page,code=>refused.push(code),{demo,backend});
+  const delayedEvent=Promise.withResolvers<()=>void>();
+  // Delay the guard's copy of a real Chromium event. Playwright still receives
+  // the same event on its own session and can deliver the intercepted route.
+  const guardContext=Object.create(context) as typeof context;
+  guardContext.newCDPSession=async()=>{
+   const session=await context.newCDPSession(page);
+   const copy=Object.create(session) as CDPSession;
+   copy.on=((name:string,listener:(event:unknown)=>void)=>{
+    if(name==='Target.receivedMessageFromTarget')return session.on(name,event=>{
+     const message=JSON.parse(event.message);
+     if(message.method==='Network.requestWillBeSent'&&message.params.request.url===apiUrl){
+      delayedEvent.resolve(()=>listener(event));
+     }else listener(event);
+    });
+    return session.on(name as 'close',listener);
+   }) as CDPSession['on'];
+   return copy;
+  };
+  const guardPage=Object.create(page) as typeof page;
+  guardPage.context=()=>guardContext;
+  const guard=await guardChallengeRedirects(mode==='late CDP event'?guardPage:page,code=>refused.push(code),{demo,backend});
   const fetchExpression='fetch('+JSON.stringify(apiUrl)+',{cache:"no-store"}).then(r=>r.text())';
   const fetches=mode==='parallel same frame'?'Promise.all(['+fetchExpression+','+fetchExpression+']).then(body=>body.join(" "))':fetchExpression;
   const script='<!doctype html><body><script>'+fetches+'.then(t=>document.body.textContent=t).catch(()=>document.body.textContent="blocked")</script>';
@@ -44,7 +64,18 @@ for(const mode of ['first request','nested siblings','unnamed iframe','parallel 
     if(++apiRequests===2)bothRequests.resolve();
     await bothRequests.promise;
    }
-   try{await guard.authorize(request);}
+   try{
+    const authorization=guard.authorize(request);
+    if(mode==='late CDP event'&&request.url()===apiUrl){
+     let settled=false;
+     void authorization.then(()=>{settled=true;},()=>{settled=true;});
+     const deliver=await delayedEvent.promise;
+     await new Promise<void>(resolve=>setImmediate(resolve));
+     assert.equal(settled,false,'the exact route stays paused without the passive event');
+     deliver();
+    }
+    await authorization;
+   }
    catch{refused.push('authorize');await route.abort('blockedbyclient');return;}
    authorized.push(request.url());
    await route.fulfill(reply);

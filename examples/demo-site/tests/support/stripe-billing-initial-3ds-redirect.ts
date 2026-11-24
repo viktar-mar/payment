@@ -15,7 +15,10 @@ type Entry={url:string;method:string;frameId?:string;allowed:boolean;preflight?:
 type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
  |'BROWSER_GUARD_RESPONSE_PAIR'|'BROWSER_GUARD_RESPONSE_REDIRECT'|'BROWSER_GUARD_RESPONSE_STATUS'|'BROWSER_GUARD_RESPONSE_NETWORK'
  |'BROWSER_GUARD_RESPONSE_PREFLIGHT'|'BROWSER_GUARD_RESPONSE_UNCLAIMED'|'BROWSER_GUARD_RESPONSE_RESUME'|'BROWSER_GUARD_IFRAME_SETUP'
- |'BROWSER_GUARD_ROUTE_IDENTITY'|'BROWSER_GUARD_ROUTE_TARGET'|'BROWSER_GUARD_ROUTE_EVENT';
+ |'BROWSER_GUARD_ROUTE_IDENTITY'|'BROWSER_GUARD_ROUTE_TARGET'
+ |'BROWSER_GUARD_ROUTE_EVENT_MISSING'|'BROWSER_GUARD_ROUTE_EVENT_RETIRED'
+ |'BROWSER_GUARD_ROUTE_EVENT_FRAME'|'BROWSER_GUARD_ROUTE_EVENT_URL'|'BROWSER_GUARD_ROUTE_EVENT_METHOD'
+ |'BROWSER_GUARD_ROUTE_EVENT_CLAIMED'|'BROWSER_GUARD_ROUTE_EVENT_PREFLIGHT';
 function stripeScript(url:URL){
  return url.protocol==='https:' && !url.port && !url.username && !url.password &&
   (url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com'));
@@ -42,7 +45,8 @@ function syntheticProbe(value:Preflight|undefined,status:number|undefined,header
  if(value.names!==undefined)expected.set('access-control-allow-headers',value.names);
  return headers.length===expected.size && headers.every(h=>expected.get(h.name.toLowerCase())===h.value && expected.delete(h.name.toLowerCase()));
 }
-type Guard={session:GuardSession;requests:Map<string,Entry>};
+type ObservedEvent=Entry|'RETIRED'|undefined;
+type Guard={session:GuardSession;requests:Map<string,Entry>;waitForEvent:(id:string)=>Promise<ObservedEvent>};
 type Target=Guard&{root:Frame;current:()=>boolean;id?:string};
 type Tree={frame:{id:string;name?:string;url:string;urlFragment?:string};childFrames?:Tree[]};
 function frameId(tree:Tree,root:Frame,frame:Frame,uncommittedOwner?:string):string {
@@ -90,6 +94,15 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
  }
  async function arm(session:GuardSession):Promise<Guard>{
   const requests=new Map<string,Entry>();
+  const waiters=new Map<string,(event:ObservedEvent)=>void>();
+  let closed=false;
+  function waitForEvent(id:string):Promise<ObservedEvent>{
+   if(closed||waiters.has(id)||waiters.size>=24)return Promise.resolve(undefined);
+   return new Promise(resolve=>{
+    const timer=setTimeout(()=>waiters.get(id)?.(undefined),1000);
+    waiters.set(id,event=>{clearTimeout(timer);waiters.delete(id);resolve(event);});
+   });
+  }
   session.on('Network.requestWillBeSent',event=>{
    if(!tracked(event.request.url))return;
    if(event.redirectResponse){onFailure('BROWSER_GUARD_REQUEST_REDIRECT');return;}
@@ -111,11 +124,20 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
        !bindPreflightInitiator(request,entry)){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
    }
    requests.set(event.requestId,entry);
+   waiters.get(event.requestId)?.(entry);
   });
   // Playwright 1.63 fulfills genuine browser preflights before exposing a user route.
   // A locally handled probe may finish without a response pause on this CDP target.
-  session.on('Network.loadingFinished',event=>requests.delete(event.requestId));
-  session.on('Network.loadingFailed',event=>requests.delete(event.requestId));
+  const retire=({requestId}: {requestId:string})=>{
+   requests.delete(requestId);
+   waiters.get(requestId)?.('RETIRED');
+  };
+  session.on('Network.loadingFinished',retire);
+  session.on('Network.loadingFailed',retire);
+  session.on('close',()=>{
+   closed=true;requests.clear();
+   for(const settle of waiters.values())settle('RETIRED');
+  });
   session.on('Fetch.requestPaused',async event=>{
    let reason:RedirectGuardFailure='BROWSER_GUARD_RESPONSE_PAIR';
    try{
@@ -148,7 +170,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   });
   await session.send('Network.enable');
   await session.send('Fetch.enable',{patterns:patterns.map(urlPattern=>({urlPattern,requestStage:'Response' as const}))});
-  return {session,requests};
+  return {session,requests,waitForEvent};
  }
  const main=page.mainFrame(),mainGuard=await arm(await page.context().newCDPSession(page));
  const iframeGuard=await guardIframeTargets(mainGuard.session,arm,()=>onFailure('BROWSER_GUARD_IFRAME_SETUP'));
@@ -194,12 +216,27 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
     const origin=evidence.targetId===mainId?{guard:mainTarget,current:mainTarget.current}:
      await iframeGuard.get(evidence.targetId,generation);
     if(!origin.current())return refuse();
+    // Playwright's route and our passive CDP events travel on separate sessions.
+    // A route may arrive first. Keep it paused until its own event arrives.
+    let entry:ObservedEvent=origin.guard.requests.get(evidence.networkId);
+    if(!entry)entry=await origin.guard.waitForEvent(evidence.networkId);
+    if(!origin.current())return refuse();
+    reason='BROWSER_GUARD_ROUTE_EVENT_RETIRED';
+    if(entry==='RETIRED'||entry&&origin.guard.requests.get(evidence.networkId)!==entry)return refuse();
     reason='BROWSER_GUARD_ROUTE_IDENTITY';
     if(!evidence.current()||request.frame().isDetached())return refuse();
-    reason='BROWSER_GUARD_ROUTE_EVENT';
-    const entry=origin.guard.requests.get(evidence.networkId);
-    if(!entry||entry.frameId!==evidence.frameId||entry.url!==request.url()||entry.method!==request.method()||
-       entry.allowed||entry.method==='OPTIONS'&&!entry.preflight)return refuse();
+    reason='BROWSER_GUARD_ROUTE_EVENT_MISSING';
+    if(!entry)return refuse();
+    reason='BROWSER_GUARD_ROUTE_EVENT_FRAME';
+    if(entry.frameId!==evidence.frameId)return refuse();
+    reason='BROWSER_GUARD_ROUTE_EVENT_URL';
+    if(entry.url!==request.url())return refuse();
+    reason='BROWSER_GUARD_ROUTE_EVENT_METHOD';
+    if(entry.method!==request.method())return refuse();
+    reason='BROWSER_GUARD_ROUTE_EVENT_CLAIMED';
+    if(entry.allowed)return refuse();
+    reason='BROWSER_GUARD_ROUTE_EVENT_PREFLIGHT';
+    if(entry.method==='OPTIONS'&&!entry.preflight)return refuse();
     entry.allowed=true;
    }catch{onFailure(reason);return refuse();}
    return;

@@ -16,8 +16,11 @@ test('an unsupported driver cannot fall back to protocol fixture matching',async
  assert.throws(()=>registerChromiumProtocolFixture({_connection:{}}),/^Error: billing_BROWSER$/);
 });
 
-for(const mode of ['exact request','same-URL decoy','replaced document'])test('Chromium route evidence rejects a false match: '+mode,async()=>{
+for(const mode of ['exact request','late event','late event retired','ended while waiting','same-URL decoy',
+ 'replaced document','wrong frame','wrong URL','wrong method','duplicate claim','unverified OPTIONS'])
+ test('Chromium route evidence rejects a false match: '+mode,async()=>{
  const url='https://api.stripe.com/fixture-read',location=origins.demo+'/';
+ const method=mode==='unverified OPTIONS'?'OPTIONS':'GET';
  const frameId='checkout',networkId='actual-request',decoyId='decoy-request';
  const browserSession={},symbol=Symbol('InterceptableRequest');
  const main={_id:frameId,_page:undefined as unknown,_currentDocument:{},_isDetached:()=>false,parentFrame:()=>null};
@@ -29,7 +32,7 @@ for(const mode of ['exact request','same-URL decoy','replaced document'])test('C
  };
  main._page=impl;
  const connection={toImpl:(client:{driver:unknown})=>client.driver};
- const original={frame:()=>main,method:()=>'GET',url:()=>url};
+ const original={frame:()=>main,method:()=>method,url:()=>url};
  const intercepted={request:original,session:browserSession,_requestId:networkId,_interceptionId:'paused-request',_originalRequestRoute:{}};
  Object.defineProperty(original,symbol,{value:intercepted});
  pending.set(networkId,intercepted);
@@ -40,25 +43,44 @@ for(const mode of ['exact request','same-URL decoy','replaced document'])test('C
   if(method==='Page.getFrameTree')return {frameTree:{frame:{id:frameId,url:location}}};
  }};
  const page={_connection:connection,driver:impl,mainFrame:()=>frame,context:()=>({newCDPSession:async()=>cdp})};
- const request={_connection:connection,driver:original,frame:()=>frame,url:()=>url,method:()=>'GET',
+ const request={_connection:connection,driver:original,frame:()=>frame,url:()=>url,method:()=>method,
   redirectedFrom:()=>null,serviceWorker:()=>null} as never;
  const guard=await guardChallengeRedirects(page as never,code=>failures.push(code),origins);
  guard.registerRoute(request);
  const passive={frameId,request:{url,method:'GET'}};
- const record=(id:string)=>events.get('Network.requestWillBeSent')!({...passive,requestId:id});
+ const record=(id:string,original=passive)=>events.get('Network.requestWillBeSent')!({...original,requestId:id});
  const respond=(id:string)=>events.get('Fetch.requestPaused')!({...passive,networkId:id,requestId:id,responseStatusCode:200});
  record(decoyId);
- if(mode!=='same-URL decoy')record(networkId);
+ if(!['same-URL decoy','late event','late event retired','ended while waiting'].includes(mode)){
+  record(networkId,{frameId:mode==='wrong frame'?'foreign-frame':frameId,
+   request:{url:mode==='wrong URL'?url+'/different':url,method:mode==='wrong method'?'POST':method}});
+ }
  if(mode==='replaced document')main._currentDocument={};
- if(mode==='exact request'){
-  await guard.authorize(request);
+ if(mode==='duplicate claim')await guard.authorize(request);
+ const authorization=guard.authorize(request);
+ void authorization.catch(()=>{});
+ if(['late event','late event retired','ended while waiting'].includes(mode)){
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  if(mode!=='ended while waiting')record(networkId);
+  if(mode!=='late event')events.get('Network.loadingFailed')!({requestId:networkId});
+ }
+ const accepted=mode==='exact request'||mode==='late event';
+ if(accepted){
+  await authorization;
   await respond(networkId);
- }else await assert.rejects(guard.authorize(request),/^Error: billing_BROWSER$/);
+ }else await assert.rejects(authorization,/^Error: billing_BROWSER$/);
  await respond(decoyId);
- assert.equal(commands.filter(method=>method==='Fetch.continueResponse').length,mode==='exact request'?1:0);
+ assert.equal(commands.filter(method=>method==='Fetch.continueResponse').length,accepted?1:0);
  assert.equal(commands.at(-1),'Fetch.failRequest');
+ const faults:Record<string,string>={
+  'replaced document':'BROWSER_GUARD_ROUTE_IDENTITY',
+  'wrong frame':'BROWSER_GUARD_ROUTE_EVENT_FRAME','wrong URL':'BROWSER_GUARD_ROUTE_EVENT_URL',
+  'wrong method':'BROWSER_GUARD_ROUTE_EVENT_METHOD','duplicate claim':'BROWSER_GUARD_ROUTE_EVENT_CLAIMED',
+  'unverified OPTIONS':'BROWSER_GUARD_ROUTE_EVENT_PREFLIGHT','same-URL decoy':'BROWSER_GUARD_ROUTE_EVENT_MISSING',
+  'late event retired':'BROWSER_GUARD_ROUTE_EVENT_RETIRED','ended while waiting':'BROWSER_GUARD_ROUTE_EVENT_RETIRED',
+ };
  assert.deepEqual(failures,[
-  ...(mode==='same-URL decoy'?['BROWSER_GUARD_ROUTE_EVENT']:mode==='replaced document'?['BROWSER_GUARD_ROUTE_IDENTITY']:[]),
+  ...(accepted?[]:[faults[mode]]),
   'BROWSER_GUARD_RESPONSE_UNCLAIMED',
  ]);
 });
