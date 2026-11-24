@@ -123,11 +123,12 @@ class StripeBillingClockSnapshotTest {
             assertThatThrownBy(()->owned(f)).isInstanceOf(PaymentApplicationException.class);
         }
     }
-    @ParameterizedTest @ValueSource(strings={"omitted","null","foreign"})
-    void ordinaryNullClockStillRequiresExactFlatSubscription(String representation){
+    @ParameterizedTest @ValueSource(strings={"foreign","renewal"})
+    void ordinarySnapshotRefusesConflictingInitialOrUnprovedRenewalLineAssociation(String representation){
         var f=new StripeBillingOwnedSubscriptionFixture();
         for(var resource:java.util.List.of(f.customer,f.remote,f.invoice))resource.remove("test_clock");
-        if(representation.equals("foreign"))f.line.addProperty("subscription","sub_foreign");else f.flatSubscription(representation);
+        if(representation.equals("foreign"))f.line.addProperty("subscription","sub_foreign");
+        else{f.flatSubscription("omitted");f.invoice.addProperty("billing_reason","subscription_cycle");}
         f.graph();assertThatThrownBy(()->StripeBillingSnapshotMapper.retrieve(f.f.clients.create(null),f.ordinary(),f.utc)).isInstanceOf(PaymentApplicationException.class);
         assertThat(f.f.http.calls).hasSize(4).allMatch(c->c.method().name().equals("GET"));
     }
@@ -137,12 +138,21 @@ class StripeBillingClockSnapshotTest {
         assertThatThrownBy(()->StripeBillingSnapshotMapper.retrieveOwned(f.f.clients.create(null),foreign,new StripeBillingSnapshotMapper.OwnedInitial(f.receipt()),f.utc)).isInstanceOf(PaymentApplicationException.class);
         assertThat(f.f.http.calls).isEmpty();
     }
-    @Test void ordinaryCashKeepsFullCapturedProof(){
+    @ParameterizedTest @ValueSource(strings={"exact","omitted","null"})
+    void ordinaryCashKeepsFullCapturedProof(String representation){
         var f=new StripeBillingOwnedSubscriptionFixture();for(var resource:java.util.List.of(f.customer,f.remote,f.invoice))resource.remove("test_clock");
+        f.flatSubscription(representation);
         f.paidGraph();var s=StripeBillingSnapshotMapper.retrieve(f.f.clients.create(null),f.ordinary(),f.utc);
         assertThat(s.invoices().getFirst().settlement()).isEqualTo(dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind.CASH);
         assertThat(s.invoices().getFirst().cashObjects().getFirst().reference()).isEqualTo("pi_owned");assertThat(s.invoices().getFirst().cashObjects().getFirst().amountMinor()).isEqualTo(1000);
         assertThat(f.f.http.calls).hasSize(8).allMatch(c->c.method().name().equals("GET"));
+    }
+    @Test void ordinaryInitialCashStillNeedsAnExplicitPaidAllocationAmount(){
+        var f=new StripeBillingOwnedSubscriptionFixture();for(var resource:java.util.List.of(f.customer,f.remote,f.invoice))resource.remove("test_clock");
+        f.flatSubscription("omitted");f.allocation.add("amount_paid",com.google.gson.JsonNull.INSTANCE);f.paidGraph();
+        var snapshot=StripeBillingSnapshotMapper.retrieve(f.f.clients.create(null),f.ordinary(),f.utc);
+        assertThat(snapshot.invoices().getFirst().cashObjects()).isEmpty();
+        assertThat(snapshot.invoices().getFirst().settlement()).isEqualTo(dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind.UNSUPPORTED);
     }
     static dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Snapshot owned(StripeBillingOwnedSubscriptionFixture f){return StripeBillingSnapshotMapper.retrieveOwned(f.f.clients.create(null),f.ordinary(),new StripeBillingSnapshotMapper.OwnedInitial(f.receipt()),f.utc);}
 }

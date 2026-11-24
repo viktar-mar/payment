@@ -744,14 +744,19 @@ async function createCliAdapter(options,dependencies,purpose) {
     const invoices=await pages('/v1/invoices',[['subscription',t.subscriptionReference]]);require(invoices.length===1&&invoices[0].id===t.invoiceReference);
     const lines=await pages('/v1/invoices/'+t.invoiceReference+'/lines');require(lines.length===1);const line=lines[0];exact(line,line.id,'line_item');require(/^il_/.test(line.id));
     const detail=line.parent?.subscription_item_details;
-    require(line.invoice===t.invoiceReference&&line.subscription===t.subscriptionReference&&line.quantity===1&&line.currency==='eur'&&line.amount===2000&&line.parent?.type==='subscription_item_details'&&detail?.subscription===t.subscriptionReference&&detail.subscription_item===item.id&&detail.proration===false&&line.pricing?.type==='price_details'&&line.pricing.price_details?.price===t.priceReference&&line.pricing.price_details.product===t.productReference&&line.period?.start===t.periodStart&&line.period.end===t.periodEnd&&empty(line.discount_amounts)&&empty(line.pretax_credit_amounts));
+    require(line.invoice===t.invoiceReference&&line.quantity===1&&line.currency==='eur'&&line.amount===2000
+      &&line.parent?.type==='subscription_item_details'&&detail?.subscription===t.subscriptionReference
+      &&detail.subscription_item===item.id&&detail.proration===false
+      &&(line.subscription==null||line.subscription===t.subscriptionReference)
+      &&line.pricing?.type==='price_details'&&line.pricing.price_details?.price===t.priceReference&&line.pricing.price_details.product===t.productReference
+      &&line.period?.start===t.periodStart&&line.period.end===t.periodEnd&&empty(line.discount_amounts)&&empty(line.pretax_credit_amounts));
     function allocationProof(v){
       exact(v,t.allocationReference,'invoice_payment');
       require(v.invoice===t.invoiceReference&&v.currency==='eur'&&v.is_default===true&&v.amount_requested===2000
         &&v.payment?.type==='payment_intent'&&v.payment.payment_intent===t.intentReference);
       const transitions=v.status_transitions;
       if(declined){
-        require(v.status==='open'&&v.amount_paid===0
+        require(v.status==='open'&&(v.amount_paid==null||v.amount_paid===0)
           &&(transitions==null||object(transitions)&&transitions.paid_at==null&&transitions.canceled_at==null));
       }else require(v.status==='paid'&&v.amount_paid===2000&&Number.isSafeInteger(transitions?.paid_at)&&transitions.paid_at>0);
     }

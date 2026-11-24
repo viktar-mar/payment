@@ -280,7 +280,8 @@ public final class StripeBillingSnapshotMapper {
                 var invoice=r.sourceInvoices.stream().filter(v->v.getId().equals(i.reference())).findFirst().orElseThrow(StripeBillingSnapshotMapper::mismatch);
                 require(StripeBillingOwnership.inWindow(invoice.getCreated(),proof.step()));
             }
-            var graph=paymentGraph(r,i,proof.customer().providerReference());var a=graph.allocation();var pi=graph.intent();var secret=graph.secret();
+            var graph=paymentGraph(r,i,proof.customer().providerReference(),proof instanceof StripeBillingOwnership.OriginalCreate);
+            var a=graph.allocation();var pi=graph.intent();var secret=graph.secret();
             String canonical=dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.canonical(proof.step().fingerprint(),proof.operation().fingerprint(),i.period().start(),i.period().end());
             if(proof instanceof StripeBillingOwnership.OriginalChange change)canonical=dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.canonical("CHANGE_V1",canonical,change.result().quote().toString(),change.result().result().creditLine(),change.result().result().debitLine());
             if(proof instanceof StripeBillingOwnership.OriginalRecovery recovery){
@@ -353,7 +354,7 @@ public final class StripeBillingSnapshotMapper {
             r.requireSettlement(invoice.settlement()==SettlementKind.OPEN,invoice.settlement()==SettlementKind.CASH?SettlementReason.ACTION_OPEN_CASH:SettlementReason.ACTION_OPEN);
             require(invoice.price().equals(intent.terms())
                 &&invoice.period().equals(snapshot.period())&&invoice.period().start().getEpochSecond()==receipt.periodStart()&&invoice.period().end().getEpochSecond()==receipt.periodEnd());
-            var graph=paymentGraph(r,invoice,intent.customerReference());var pi=graph.intent();
+            var graph=paymentGraph(r,invoice,intent.customerReference(),false);var pi=graph.intent();
             require("requires_payment_method".equals(pi.getStatus())&&"automatic".equals(pi.getConfirmationMethod())&&pi.getLatestCharge()==null&&graph.secret().length()<=512);
             var binding=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionClientGrant.Binding(receipt.providerOperation(),intent.operationKey(),
                 dev.genericpayments.platform.provider.application.model.OwnedInitialConfirmationProof.hash(receipt,invoice.reference(),graph.allocation().getId(),pi.getId()),
@@ -364,7 +365,7 @@ public final class StripeBillingSnapshotMapper {
     private record PaymentGraph(InvoicePayment allocation,PaymentIntent intent,String secret){
         @Override public String toString(){return "PaymentGraph[redacted]";}
     }
-    private static PaymentGraph paymentGraph(Read r,SubscriptionProviderModels.Invoice i,String customer)throws StripeException{
+    private static PaymentGraph paymentGraph(Read r,SubscriptionProviderModels.Invoice i,String customer,boolean ordinaryCreate)throws StripeException{
             var client=r.client;
             var invoice=r.sourceInvoices.stream().filter(v->v.getId().equals(i.reference())).findFirst().orElseThrow(StripeBillingSnapshotMapper::mismatch);
             require("open".equals(invoice.getStatus()));
@@ -375,9 +376,13 @@ public final class StripeBillingSnapshotMapper {
             var status=a.getStatus();r.requireAllocation("open".equals(status),status==null?AllocationReason.STATUS_UNAVAILABLE:AllocationReason.STATUS_NOT_OPEN);
             var isDefault=a.getIsDefault();r.requireAllocation(Boolean.TRUE.equals(isDefault),isDefault==null?AllocationReason.DEFAULT_UNAVAILABLE:AllocationReason.DEFAULT_NOT_TRUE);
             var requested=a.getAmountRequested();r.requireAllocation(Objects.equals(due,requested),requested==null?AllocationReason.AMOUNT_REQUESTED_UNAVAILABLE:AllocationReason.AMOUNT_REQUESTED_MISMATCH);
-            // Stripe leaves allocation paid unfinalized until paid; only the proved owned initial graph admits null.
-            // Null remains unknown, never numeric zero or the full paid amount required by CASH.
-            var paid=a.getAmountPaid();r.requireAllocation(zeros(paid)||paid==null&&r.original!=null&&i.kind()==BillingRecord.Kind.INITIAL&&due>0,paid==null?AllocationReason.AMOUNT_PAID_UNAVAILABLE:AllocationReason.AMOUNT_PAID_NONZERO);
+            // Stripe leaves this amount unfinalized on open payments. The initial action still requires
+            // an unpaid invoice, zero amount received by its exact PaymentIntent, and reverse allocation proof.
+            var paid=a.getAmountPaid();
+            boolean positiveInitial=i.kind()==BillingRecord.Kind.INITIAL&&due>0;
+            boolean unfinalizedInitial=paid==null&&positiveInitial&&(r.original!=null||ordinaryCreate);
+            r.requireAllocation(zeros(paid)||unfinalizedInitial,paid==null?AllocationReason.AMOUNT_PAID_UNAVAILABLE:AllocationReason.AMOUNT_PAID_NONZERO);
+            if(ordinaryCreate&&positiveInitial)require(noAllocationSettlementTransition(a));
             var payment=a.getPayment();r.requireAllocation(payment!=null,AllocationReason.PAYMENT_UNAVAILABLE);
             var type=a.getPayment().getType();r.requireAllocation("payment_intent".equals(type),type==null?AllocationReason.TYPE_UNAVAILABLE:AllocationReason.TYPE_UNEXPECTED);
             ref(a.getPayment().getPaymentIntent(),"pi_");var pi=r.get(()->client.v1().paymentIntents().retrieve(a.getPayment().getPaymentIntent()));
@@ -396,6 +401,10 @@ public final class StripeBillingSnapshotMapper {
             String secret=pi.getClientSecret();require(secret!=null&&secret.startsWith(pi.getId()+"_secret_")&&secret.length()<=1024&&secret.matches("[A-Za-z0-9_-]+"));
             if(invoice.getConfirmationSecret()!=null)require("payment_intent".equals(invoice.getConfirmationSecret().getType())&&secret.equals(invoice.getConfirmationSecret().getClientSecret()));
             return new PaymentGraph(a,pi,secret);
+    }
+    private static boolean noAllocationSettlementTransition(InvoicePayment allocation){
+        var transitions=allocation.getStatusTransitions();
+        return transitions==null||transitions.getPaidAt()==null&&transitions.getCanceledAt()==null;
     }
     public record RecoveryRead(Snapshot snapshot,String allocation,String intent,String method,boolean firstPay) {}
     public static RecoveryRead retrieveRecovery(StripeClient client,StripeBillingOwnership.OriginalRecovery proof,Instant at){
@@ -772,14 +781,17 @@ public final class StripeBillingSnapshotMapper {
             if(!matching.isEmpty()){require(matching.size()==1);return proration(invoice,lines,matching.getFirst());}
             // Multi-line proration needs the original quote's exact debit/credit proof.
             require(lines.size()==1);var line=lines.getFirst();ref(line.getId(),"il_");
-            // Only a typed original receipt permits an absent duplicate flat reference; nested ownership remains mandatory.
             boolean originalHistory=original!=null&&(renewalAdmission==null||renewalAdmission.invoice().equals(invoice.getId())&&"subscription_create".equals(invoice.getBillingReason()));
             boolean ownedRenewal=renewalAdmission!=null&&!originalHistory;
+            // Stripe moved the subscription association to parent.subscription_item_details.
+            // On an ordinary first invoice, a legacy root value, if present, must still agree.
+            boolean ordinaryInitial=original==null&&owner.trial()==null&&"subscription_create".equals(invoice.getBillingReason())
+                &&invoice.getAmountDue()!=null&&invoice.getAmountDue()>0&&("open".equals(invoice.getStatus())||"paid".equals(invoice.getStatus()));
             if(recoveredDebt)require(StripeBillingMutationAdapter.noNonAmountAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
             // Authenticate historical inclusive taxes before FAILED can publish the original debt.
             // Reuse this unique fetched line; historical amount/balance tolerances remain below.
             if(failedInclusiveHistory&&originalHistory)require(StripeBillingMutationAdapter.noNonAmountAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
-            requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&(remote.getId().equals(line.getSubscription())||(originalHistory||ownedRenewal)&&line.getSubscription()==null)&&Objects.equals(line.getQuantity(),1L)
+            requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&(remote.getId().equals(line.getSubscription())||(originalHistory||ownedRenewal||ordinaryInitial)&&line.getSubscription()==null)&&Objects.equals(line.getQuantity(),1L)
                 &&line.getParent()!=null&&"subscription_item_details".equals(line.getParent().getType())&&line.getParent().getSubscriptionItemDetails()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             var detail=line.getParent().getSubscriptionItemDetails();
             if(ownedRenewal)require((!renewalFlatItems.containsKey(line.getId())||item.getId().equals(renewalFlatItems.get(line.getId())))

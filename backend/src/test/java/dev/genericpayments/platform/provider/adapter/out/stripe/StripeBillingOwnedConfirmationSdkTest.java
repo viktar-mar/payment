@@ -219,8 +219,8 @@ class StripeBillingOwnedConfirmationSdkTest {
             assertThat(h.inserts).isZero();assertThat(h.f.f.http.calls).hasSize(18).allMatch(c->c.method().name().equals("GET"));
         }
     }
-    @ParameterizedTest @ValueSource(strings={"nullPaid","missingPaid","positivePaid","negativePaid","notDefault","nullDefault","missingDefault","nullRequested","missingRequested","zeroRequested","negativeRequested","wrongRequested","overRequested","canceled"})
-    void ordinaryAllocationRefusesTheSameUnavailableAndMismatchedValues(String variant){
+    @ParameterizedTest @ValueSource(strings={"positivePaid","negativePaid","notDefault","nullDefault","missingDefault","nullRequested","missingRequested","zeroRequested","negativeRequested","wrongRequested","overRequested","canceled"})
+    void ordinaryAllocationRefusesMismatchedAmountsAndMissingIndependentProof(String variant){
         var f=new StripeBillingOwnedSubscriptionFixture();prepareOpen(f);mutateAllocation(f,variant);
         for(var resource:List.of(f.customer,f.remote,f.invoice))resource.remove("test_clock");f.remote.addProperty("created",f.utc.getEpochSecond());queueGraph(f);
         var step=new ProviderOperation(f.receipt().providerOperation(),f.f.account.id(),f.f.account.externalAccountId(),f.f.account.credentialsRef(),ProviderOperation.Kind.SUBSCRIPTION_CREATE,f.operationId,f.intent.operationKey(),f.intent.fingerprint(),ProviderOperation.Status.ACKNOWLEDGED,"sub_owned",f.utc,f.utc.plusSeconds(82800),null,null,2);

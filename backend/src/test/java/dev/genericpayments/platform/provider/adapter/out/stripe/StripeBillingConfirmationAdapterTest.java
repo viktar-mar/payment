@@ -43,7 +43,12 @@ class StripeBillingConfirmationAdapterTest {
   assertThat(result.receipt()).isNull();
   assertThat(http.requestCount("POST","/v1/payment_intents/pi_owned/confirm")).isEqualTo(1);
  }
- @Test void original402ProofMakesSameIntentSuccessorUsableWithOnePostPerAttempt(){
+ @ParameterizedTest @ValueSource(strings={"legacy","modern"})
+ void original402ProofMakesSameIntentSuccessorUsableWithOnePostPerAttempt(String representation){
+  if(representation.equals("modern")){
+   fixture.fixture.graph.line.remove("subscription");
+   fixture.fixture.graph.allocation.add("amount_paid",com.google.gson.JsonNull.INSTANCE);
+  }
   failedGraph();String error=error();var first=claimed(null);originalDecline(error);eligibleGraph(true);
   var declined=adapter.confirm(fixture.fixture.lookup(),root,first,"ctoken_original");assertThat(declined.state()).isEqualTo(SubscriptionConfirmationAttempt.State.DECLINED);assertThat(declined.receipt().charge()).isEqualTo("ch_owned");
   eligibleGraph(true);assertThat(adapter.read(fixture.fixture.lookup(),root,declined.receipt()).clientSecret()).isEqualTo("pi_owned_secret_canary");

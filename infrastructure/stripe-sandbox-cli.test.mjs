@@ -512,6 +512,36 @@ test('Billing CLI exposes only lifecycle and exact graph reads with fixed suppor
   assert.ok(f.calls.filter(c=>c.args.includes('get')&&!c.args.includes('/v1/balance')).every(c=>c.args.includes('--stripe-version')&&c.args.includes(VERSION)));
   assert.equal(JSON.stringify(result).includes('never-return'),false);await stop(f);
 });
+for(const legacySubscription of [undefined,null])test(`Billing graph accepts a canonical invoice line with legacy subscription ${legacySubscription}`,async()=>{
+  const f=await billingSetup(o=>o['/v1/invoices/in_original/lines'].data[0].subscription=legacySubscription);
+  await f.adapter.validateBinding(f.limits);
+  await start(f);
+  await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).initialCashVerified,true);
+  await stop(f);
+});
+for(const [name,mutateLine] of [
+  ['a conflicting legacy subscription',line=>line.subscription='sub_other'],
+  ['a missing nested subscription',line=>{
+    delete line.subscription;
+    delete line.parent.subscription_item_details.subscription;
+  }],
+  ['a foreign nested subscription',line=>{
+    delete line.subscription;
+    line.parent.subscription_item_details.subscription='sub_other';
+  }],
+  ['a foreign nested subscription item',line=>{
+    delete line.subscription;
+    line.parent.subscription_item_details.subscription_item='si_other';
+  }],
+])test(`Billing graph rejects an invoice line with ${name}`,async()=>{
+  const f=await billingSetup(o=>mutateLine(o['/v1/invoices/in_original/lines'].data[0]));
+  await f.adapter.validateBinding(f.limits);
+  await start(f);
+  await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  await rejects(f.adapter.observeOwnedBillingGraph(f.limits),'BILLING_GRAPH');
+  await stop(f);
+});
 async function cancellationSetup(beforeExecute) {
   const f=await billingSetup();
   if(beforeExecute){
@@ -998,13 +1028,35 @@ test('initial Retry requires the original failed card charge and one different c
   const {f,decline,recover,settle}=await initialRetrySetup();
   assert.equal(await decline(),true);settle();assert.equal(await recover(),true);await stop(f);
 });
+for(const amount of [undefined,null])test(`initial Retry accepts an open allocation with amount_paid ${amount}`,async()=>{
+  const {f,o,decline,recover,settle}=await initialRetrySetup();
+  o['/v1/invoice_payments'].data[0].amount_paid=amount;
+  assert.equal(await decline(),true);
+  settle();
+  assert.equal(await recover(),true);
+  await stop(f);
+});
 for(const [name,change] of [
   ['decline attributed to another intent',o=>o['/v1/charges/ch_declined'].payment_intent='pi_other'],
   ['extra charge on the customer',o=>o['/v1/charges'].data.push(o['/v1/charges/ch_original'])],
   ['foreign allocation',o=>o['/v1/invoice_payments'].data[0].invoice='in_foreign'],
-  ['absent explicit unpaid allocation',o=>delete o['/v1/invoice_payments'].data[0].amount_paid],
+  ['a nonzero open allocation amount',o=>o['/v1/invoice_payments'].data[0].amount_paid=1],
+  ['a negative open allocation amount',o=>o['/v1/invoice_payments'].data[0].amount_paid=-1],
+  ['a string open allocation amount',o=>o['/v1/invoice_payments'].data[0].amount_paid='0'],
+  ['received cash with an unpaid allocation',o=>{
+    o['/v1/invoice_payments'].data[0].amount_paid=null;
+    o['/v1/payment_intents/pi_original'].amount_received=1;
+  }],
 ])test('initial Retry denies '+name,async()=>{
   const {f,o,decline}=await initialRetrySetup();change(o);await assert.rejects(decline(),/BILLING_INITIAL_RETRY/);await stop(f);
+});
+for(const amount of [undefined,null,0,1999])test(`initial Retry rejects a paid allocation with amount_paid ${amount}`,async()=>{
+  const {f,o,decline,recover,settle}=await initialRetrySetup();
+  await decline();
+  settle();
+  o['/v1/invoice_payments'].data[0].amount_paid=amount;
+  await rejects(recover(),'BILLING_INITIAL_RETRY');
+  await stop(f);
 });
 test('initial Retry refuses missing failed-charge history after settlement',async()=>{
   const {f,o,decline,recover,settle}=await initialRetrySetup();await decline();settle();o['/v1/charges'].data.shift();

@@ -22,7 +22,7 @@ class StripeBillingActionAdapterTest {
   when(store.billing(anyString())).thenAnswer(x->Optional.ofNullable(row).filter(r->r.tokenDigest().equals(x.getArgument(0))));
   doAnswer(x->{row=x.getArgument(0);return null;}).when(store).reserveBilling(any());
   var g=fixture.graph;g.subscription.addProperty("status","incomplete");g.invoice.addProperty("billing_reason","subscription_create");g.invoice.addProperty("status","open");g.invoice.addProperty("amount_paid",0);g.invoice.addProperty("amount_remaining",1000);
-  g.allocation.addProperty("status","open");g.allocation.addProperty("is_default",true);g.allocation.addProperty("amount_paid",0);
+  g.allocation.addProperty("status","open");g.allocation.addProperty("is_default",true);g.allocation.addProperty("amount_paid",0);g.allocation.remove("status_transitions");
   g.intent.addProperty("status","requires_payment_method");g.intent.addProperty("amount_received",0);g.intent.remove("latest_charge");g.intent.addProperty("client_secret","pi_owned_secret_canary");
   adapter=adapter(true);
  }
@@ -40,6 +40,44 @@ class StripeBillingActionAdapterTest {
   graph();assertThat(adapter(true).nextAction(fixture.lookup())).isEqualTo(first);
   graph();var session=adapter.retrieve(fixture.lookup(),row,first.secret());assertThat(session.provider()).isEqualTo("stripe");assertThat(session.flow()).isEqualTo(SubscriptionClientSession.Flow.PAYMENT);assertThat(session.clientSecret()).isEqualTo("pi_owned_secret_canary");assertThat(session.actionToken()).isEqualTo(first.secret());assertThat(session.toString()).doesNotContain(first.secret(),session.clientSecret());assertThat(row.toString()).doesNotContain(first.secret(),session.clientSecret());
   assertThat(fixture.graph.http.requestCount("POST","/v1/subscriptions")).isEqualTo(1);assertThat(fixture.graph.http.calls().stream().filter(c->c.method().equals("POST"))).hasSize(1);
+ }
+ @ParameterizedTest @ValueSource(strings={"line","allocation","bothNull","bothOmitted"})
+ void documentedOpenInitialInvoiceIssuesTheSameBoundAction(String representation){
+  var g=fixture.graph;
+  if(representation.equals("line")||representation.equals("bothOmitted"))g.line.remove("subscription");
+  if(representation.equals("allocation")||representation.equals("bothNull"))g.allocation.add("amount_paid",com.google.gson.JsonNull.INSTANCE);
+  if(representation.equals("bothNull"))g.line.add("subscription",com.google.gson.JsonNull.INSTANCE);
+  if(representation.equals("bothOmitted"))g.allocation.remove("amount_paid");
+  graph();var action=adapter.nextAction(fixture.lookup());
+  assertThat(action.kind()).isEqualTo(ActionKind.PROVIDER_CLIENT);
+  assertThat(row.binding().invoiceReference()).isEqualTo("in_owned");
+  assertThat(row.binding().intentReference()).isEqualTo("pi_owned");
+  graph();assertThat(adapter.retrieve(fixture.lookup(),row,action.secret()).clientSecret()).isEqualTo("pi_owned_secret_canary");
+  assertThat(g.http.calls().stream().filter(c->c.method().equals("POST"))).hasSize(1);
+ }
+ @ParameterizedTest @ValueSource(strings={"foreignFlat","foreignNested","foreignItem","amountReceived","nonzeroPaid","paidAt","canceledAt","zeroPaidAt","zeroCanceledAt","unknownOffStripe","nonzeroOffStripe"})
+ void documentedInitialShapeStillRequiresIndependentPaymentAndOwnershipProof(String fault){
+  var g=fixture.graph;g.line.remove("subscription");g.allocation.remove("amount_paid");
+  switch(fault){
+   case "foreignFlat"->g.line.addProperty("subscription","sub_foreign");
+   case "foreignNested"->g.line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription","sub_foreign");
+   case "foreignItem"->g.line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription_item","si_foreign");
+   case "amountReceived"->g.intent.addProperty("amount_received",1);
+   case "nonzeroPaid"->g.allocation.addProperty("amount_paid",1);
+   case "paidAt","canceledAt","zeroPaidAt","zeroCanceledAt"->{
+    if(fault.startsWith("zero"))g.allocation.addProperty("amount_paid",0);
+    var transitions=new com.google.gson.JsonObject();
+    transitions.addProperty(fault.equals("paidAt")||fault.equals("zeroPaidAt")?"paid_at":"canceled_at",1800000000);
+    g.allocation.add("status_transitions",transitions);
+   }
+   case "unknownOffStripe"->g.invoice.remove("amount_paid_off_stripe");
+   case "nonzeroOffStripe"->g.invoice.addProperty("amount_paid_off_stripe",1);
+   default->throw new AssertionError(fault);
+  }
+  graph();assertThatThrownBy(()->adapter.nextAction(fixture.lookup())).isInstanceOfSatisfying(PaymentApplicationException.class,e->{
+   assertThat(e.status()).isEqualTo(409);assertThat(e.code()).isEqualTo("PROVIDER_EVIDENCE_MISMATCH");
+  });
+  assertThat(row).isNull();
  }
  @Test void nullKeyCannotCreateOrRotateAndConsumedNeverReopens(){
   var nullKey=new Lookup(fixture.account,fixture.local.id(),"sub_owned",null);assertThat(adapter.nextAction(nullKey)).isNull();assertThat(row).isNull();

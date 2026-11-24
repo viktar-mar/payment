@@ -77,7 +77,7 @@ class StripeBillingSettlementEvaluationTest {
             var invoices=readType.getDeclaredField("sourceInvoices");invoices.setAccessible(true);invoices.set(read,List.of(ApiResource.GSON.fromJson(f.invoice.toString(),Invoice.class)));
             var allocations=readType.getDeclaredField("sourceAllocations");allocations.setAccessible(true);
             @SuppressWarnings("unchecked") var values=(java.util.Map<String,List<com.stripe.model.InvoicePayment>>)allocations.get(read);values.put("in_owned",List.of(allocation));
-            graph=StripeBillingSnapshotMapper.class.getDeclaredMethod("paymentGraph",readType,dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Invoice.class,String.class);graph.setAccessible(true);
+            graph=StripeBillingSnapshotMapper.class.getDeclaredMethod("paymentGraph",readType,dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Invoice.class,String.class,boolean.class);graph.setAccessible(true);
         }
         void load() throws Exception {
             var parsed=ApiResource.GSON.fromJson(f.allocation.toString(),com.stripe.model.InvoicePayment.class);
@@ -86,7 +86,7 @@ class StripeBillingSettlementEvaluationTest {
         }
         Throwable evaluate() throws Exception {
             var invoice=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Invoice("in_owned",dev.genericpayments.platform.subscriptions.domain.BillingRecord.Kind.INITIAL,f.terms,null,new dev.genericpayments.platform.subscriptions.domain.Subscription.Period(java.time.Instant.ofEpochSecond(1699999900),java.time.Instant.ofEpochSecond(1702678400)),1000,"EUR",dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind.OPEN,List.of());
-            try{graph.invoke(null,read,invoice,"cus_owned");return null;}catch(java.lang.reflect.InvocationTargetException e){return e.getCause();}
+            try{graph.invoke(null,read,invoice,"cus_owned",false);return null;}catch(java.lang.reflect.InvocationTargetException e){return e.getCause();}
         }
         String reason() throws Exception {var method=failure.getClass().getDeclaredMethod("allocation");method.setAccessible(true);var value=method.invoke(failure);return value==null?null:((Enum<?>)value).name();}
     }
