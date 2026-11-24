@@ -6,6 +6,7 @@ import {validateBillingAcceptanceOptions, snapshotBillingAcceptanceEnvironment} 
 import {createBillingFixture} from './stripe-billing-provision.mjs';
 import {provisionHarness} from './fixtures/failed-renewal-provision-harness.mjs';
 import {id} from './fixtures/failed-renewal-descriptors.mjs';
+import {acceptanceBrowserFailure,finishBrowserCleanup} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 
 const scenario = 'initial_decline_retry';
 const input = () => ({
@@ -93,6 +94,27 @@ test('owner proves the original decline before Retry and one recovered charge be
   assert.equal(ledger[6].value.successorAttemptId,id(10));
   assert.equal(ledger[7].value.attemptId,id(10));
   assert.equal(f.fixture.resources().attemptId,id(9));
+});
+for(const [kind,browserClosed,bootstrapStopped,expected,cleanup] of [
+ ['trusted',true,true,'BROWSER_INITIAL_SESSION_HTTP',true],
+ ['trusted',true,false,'BROWSER_INITIAL_SESSION_HTTP',false],
+ ['trusted',false,true,'BROWSER_INITIAL_SESSION_HTTP',false],
+ ['foreign',true,true,'BROWSER',false],
+])test('the owner retains only the trusted browser refusal and checked cleanup '+[kind,browserClosed,bootstrapStopped].join('/'),async()=>{
+  const f=await harness({clean:bootstrapStopped});
+  const error=kind==='trusted'?acceptanceBrowserFailure('BROWSER_INITIAL_SESSION_HTTP'):Error('BROWSER_INITIAL_SESSION_HTTP');
+  finishBrowserCleanup(error,browserClosed);
+  await assert.rejects(f.owner.run(async port=>{
+    await port.acknowledgeCustomer({customerId:id(4),siteId:id(3)});
+    await port.beforeDispatch('create',id(11));
+    await port.acknowledge('create',{subscriptionId:id(7),operationId:id(8)});
+    throw error;
+  },limits()));
+  const result=await f.owner.close();
+  assert.equal(result.phase,'RETRY_ACK');
+  assert.equal(result.code,expected);
+  assert.equal(result.cleanupConfirmed,cleanup);
+  assert.ok(!f.writes.some(row=>row.name.endsWith('-confirm-dispatch.json')));
 });
 for(const mode of ['unproved decline','wrong response','orphan retry','foreign scope','reused key','same successor','subscription as successor','stale successor','second confirm','unproved recovery','cleanup']) {
   test('retry owner stops on '+mode,async()=>{

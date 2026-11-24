@@ -6,6 +6,7 @@ import {validateBillingAcceptanceOptions} from './stripe-billing-acceptance-opti
 import {createOwnedBillingBootstrap} from './stripe-sandbox-bootstrap.mjs';
 import {createBillingCliAdapter} from './stripe-sandbox-cli.mjs';
 import {preflightOwnedBilling} from './stripe-sandbox-owned.mjs';
+import {browserDiagnostic,browserCleanupConfirmed} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 import {billingBounded, billingCheck, billingError} from './stripe-billing-limits.mjs';
 import {createHash} from 'node:crypto';
 import {billingUuid} from './stripe-billing-provision.mjs';
@@ -134,9 +135,15 @@ async function createOwner(options,dependencies,selectedCase) {
       },
      }:{}),
     });
-    const browserResult=await step('BROWSER',()=>{
-     if(retry||challenge||invoiceCase)browserUnconfirmed=true;
-     return browserJourney(port,active);
+    const browserResult=await step('BROWSER',async()=>{
+     const bound=retry||challenge||invoiceCase;
+     if(bound)browserUnconfirmed=true;
+     try{return await browserJourney(port,active);}
+     catch(error){
+      const checkpoint=bound?browserDiagnostic(error,'ACCEPTANCE'):null;
+      if(checkpoint){browserUnconfirmed=!browserCleanupConfirmed(error);fail(checkpoint);}
+      throw error;
+     }
     },2700000);
     if(invoiceFlow){
      if(browserResult!==true)fail('BROWSER');

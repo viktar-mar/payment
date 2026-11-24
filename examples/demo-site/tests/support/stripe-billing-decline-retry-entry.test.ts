@@ -43,12 +43,16 @@ test('the closed failed owner supplies only its finite phase, code and cleanup t
  const {runDeclineRetryCase}=await import('./stripe-billing-decline-retry-terminal.ts');
  const reporter=new Reporter(),lines:string[]=[];
  const terminal={scope:'INITIAL_DECLINE_RETRY',status:'CLOSED',phase:'RETRY_EVIDENCE',code:'RETRY_EVIDENCE',initialAccepted:false,declineRetryAccepted:false,full5bAccepted:false,cleanupConfirmed:true,runId:'private-id'};
- for(const mode of ['original','replaced-result','duplicate','preexisting','failed-close','canary']){
+ for(const mode of ['original','replaced-result','duplicate','preexisting','failed-close','canary','browser-session']){
   const report=mode==='original'?reporter:new Reporter();
   const t={expectedStatus:'passed',title:'OWNED_INITIAL_DECLINE_RETRY',location:{file:fileURLToPath(new URL('../stripe-billing-decline-retry.spec.ts',import.meta.url))},
    parent:{project:()=>({name:'owned-initial-decline-retry'})},annotations:[]} as unknown as TestCase;
   const r={retry:0,status:'failed',annotations:[]} as unknown as TestResult;
-  const owner={run:async()=>{throw Error('raw-provider-canary');},resources:()=>terminal,close:async()=>{if(mode==='failed-close')throw Error('raw-close-canary');return mode==='canary'?{...terminal,code:'raw-canary'}:terminal;}};
+  const owner={run:async()=>{throw Error('raw-provider-canary');},resources:()=>terminal,close:async()=>{
+   if(mode==='failed-close')throw Error('raw-close-canary');
+   if(mode==='browser-session')return {...terminal,phase:'RETRY_ACK',code:'BROWSER_INITIAL_SESSION_HTTP'};
+   return mode==='canary'?{...terminal,code:'raw-canary'}:terminal;
+  }};
   if(mode==='preexisting')r.annotations.push({type:'owned-decline-retry-terminal',description:'private'});
   report.onTestBegin(t,r);
   await assert.rejects(runDeclineRetryCase(owner as never,async()=>true,r.annotations),/billing_NOT_ACCEPTED/);
@@ -59,8 +63,9 @@ test('the closed failed owner supplies only its finite phase, code and cleanup t
    report.onTestEnd(t,mode==='replaced-result'?{...r}:r);
    report.onEnd({status:'failed'} as FullResult);
   }finally{process.stdout.write=write;}
-  const expected='owned_initial_decline_retry_terminal phase=RETRY_EVIDENCE code=RETRY_EVIDENCE cleanup='+(mode==='failed-close'?'UNCONFIRMED':'CONFIRMED')+'\n';
-  assert.deepEqual(lines, [...(['original','failed-close'].includes(mode)?[expected]:[]),'owned_initial_decline_retry_not_accepted full5b=NOT_ACCEPTED\n']);
+  const stage=mode==='browser-session'?'phase=RETRY_ACK code=BROWSER_INITIAL_SESSION_HTTP':'phase=RETRY_EVIDENCE code=RETRY_EVIDENCE';
+  const expected='owned_initial_decline_retry_terminal '+stage+' cleanup='+(mode==='failed-close'?'UNCONFIRMED':'CONFIRMED')+'\n';
+  assert.deepEqual(lines, [...(['original','failed-close','browser-session'].includes(mode)?[expected]:[]),'owned_initial_decline_retry_not_accepted full5b=NOT_ACCEPTED\n']);
  }
 });
 

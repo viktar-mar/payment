@@ -17,3 +17,11 @@ The runner permits one subscription creation, two distinct confirmations and one
 The ordinary subscription mapper requires an explicit zero for the unpaid allocation's `amount_paid`. An earlier test-clock invoice omitted that value. An ordinary invoice with the same omission would stop the case before Pay. Acceptance still requires an actual ordinary Sandbox invoice, the original failed charge and the successor's successful charge.
 
 Record the run ID, exact source, terminal result and cleanup result in the acceptance matrix. The passing marker is `owned_initial_decline_retry_passed full5b=NOT_ACCEPTED`. The initial 3DS challenge has a separate acceptance requirement.
+
+## Failure after creation
+
+Run `a35eb316-f842-42b7-a1b0-157f942a8e99` recorded creation acknowledgement and stopped before the first confirmation dispatch. The terminal label `RETRY_ACK` also covers creation acknowledgement in this case. Its old browser code leaves the exact failed check unknown.
+
+An offline regression reproduced a request for a nested Stripe document while the runner was still validating the original confirmation-session response. The runner now waits inside the existing request budget for the paired, validated session. It rechecks the original frame chain and retains the existing local document-block confirmation. Early images, stylesheets and scripts still refuse. A mismatched or failed session cannot release the staged document.
+
+The terminal report now distinguishes waiting for the session, HTTP refusal, session validation, trusted presentation, form readiness and confirmation. It keeps the first fixed code and requires separate completion of browser close and request drain before reporting confirmed cleanup. These diagnostics contain no request contents.

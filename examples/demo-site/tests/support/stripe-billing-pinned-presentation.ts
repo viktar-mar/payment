@@ -91,7 +91,7 @@ export async function fetchStaticAsset(url:URL,media:string[],origin:string|unde
 
 /** The one local block can only occur on the first form, before its Pay gesture. */
 export function pinnedRetryPresentation(page:Page,checkout:()=>string,limits:BillingLimits,
- form:()=>'initial'|'successor'|undefined,beforePay:()=>boolean){
+ form:()=>'initial'|'successor'|undefined,beforePay:()=>boolean,initialReady?:()=>Promise<void>|undefined){
  const documents=new Set<Promise<void>>();
  let used=false,block:{request:Request;confirm:()=>void}|undefined;
  page.on('requestfailed',request=>{
@@ -99,15 +99,24 @@ export function pinnedRetryPresentation(page:Page,checkout:()=>string,limits:Bil
     request.failure()?.errorText==='net::ERR_BLOCKED_BY_CLIENT')block.confirm();
  });
  async function handle(route:Route,url:URL){
-  const request=route.request(),phase=form(),raw=request.url();
-  need(phase && request.method()==='GET' && request.postData()===null && plainHttpsAuthority.test(raw) &&
-   url.protocol==='https:' && !url.username && !url.password && !url.port && !request.redirectedFrom());
+  const request=route.request(),phaseAtRequest=form(),raw=request.url();
   const navigation=request.isNavigationRequest();
+  const pendingInitial=phaseAtRequest===undefined && navigation && request.resourceType()==='document'
+   ?initialReady?.():undefined;
+  need((phaseAtRequest || pendingInitial) && request.method()==='GET' && request.postData()===null && plainHttpsAuthority.test(raw) &&
+   url.protocol==='https:' && !url.username && !url.password && !url.port && !request.redirectedFrom());
   const originalNavigation=navigation?stripeNavigationChain(request,page,checkout()):undefined;
   const frames=navigation?undefined:stripeFrameChain(page,()=>request.frame());
+  need(navigation?originalNavigation:frames);
   const headers=await request.allHeaders();
-  billingCheck(limits);need(form()===phase && page.mainFrame().url()===checkout() &&
+  billingCheck(limits);need(page.mainFrame().url()===checkout() &&
    !Object.keys(headers).some(key=>['authorization','proxy-authorization','cookie'].includes(key.toLowerCase())));
+  // The SDK can mount after receiving the session while the independent
+  // response-body read is still pending. Do not relay or block until that
+  // exact session has passed validation. Retain the pre-wait frame snapshot.
+  if(pendingInitial)await billingBounded(limits,()=>pendingInitial);
+  const phase=phaseAtRequest??'initial';
+  billingCheck(limits);need(form()===phase && page.mainFrame().url()===checkout());
   if(navigation){
    need(phase==='initial' && beforePay() && !used && request.resourceType()==='document' && originalNavigation);
    const current=stripeNavigationChain(request,page,checkout());

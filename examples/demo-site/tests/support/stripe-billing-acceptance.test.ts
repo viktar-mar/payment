@@ -34,6 +34,7 @@ test('native runner reserves cleanup and scheduling time beyond the unchanged ow
 // controls. It cannot make network calls. Responses retain their originating request.
 import type {Browser, Request, Response} from '@playwright/test';
 import type {BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort,BillingInvoiceWebhooksPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
+import {browserCleanupConfirmed,browserDiagnostic} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 
 function cancellationPage(fault = '', declineRetry = false, sca = false, invoiceCase = false) {
  const id = (n:number) => '11111111-2222-4333-8444-' + String(n).padStart(12, '0');
@@ -55,7 +56,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  let requestFailed=(request:Request)=>{void request;};
  const presentation:string[]=[];
  async function staticPresentation(){
-  const document=fault!=='static-image';
+  const document=fault!=='static-image' && fault!=='early-static-image';
   const nested={parentFrame:()=>stripeFrame,page:()=>page,isDetached:()=>false,url:()=>''};
   const request={url:()=>document?'https://private.example/presentation?frame=1':'https://private.example/image.png',method:()=>'GET',
    frame:()=>document?nested:stripeFrame,resourceType:()=>document?'document':'image',isNavigationRequest:()=>document,
@@ -80,8 +81,22 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const navigate=(frame:unknown)=>{for(const listener of navigationListeners)listener(frame);};
  const waiters = new Set<{predicate:(r:Response)=>boolean;resolve:(r:Response)=>void;reject:(e:Error)=>void}>();
  function publish(request:Request, status:number, json:object) {
-  const response = {request:()=>request,url:()=>request.url(),status:()=>status,fromServiceWorker:()=>false,body:async()=>Buffer.from(JSON.stringify(json))} as Response;
+  const earlyStatic=declineRetry && fault.startsWith('early-static') && request.url()===select;
+  const bodyAvailable=earlyStatic?Promise.withResolvers<void>():undefined;
+  const response = {request:()=>request,url:()=>request.url(),status:()=>status,fromServiceWorker:()=>false,body:async()=>{
+   await bodyAvailable?.promise;
+   return Buffer.from(JSON.stringify(json));
+  }} as Response;
   for(const w of waiters) if(w.predicate(response)){waiters.delete(w);w.resolve(response);}
+  if(bodyAvailable){
+   // The page got its session response. The observer's independent body read
+   // can still be pending when the browser requests the first Stripe asset.
+   void staticPresentation().catch(()=>{});
+   setImmediate(()=>{
+    if(fault==='early-static-navigation')navigate(frame);
+    bodyAvailable.resolve();
+   });
+  }
   return response;
  }
  async function provider(url:string,owner:unknown=stripeFrame,delay=false,method='POST'){
@@ -219,7 +234,9 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     }
     if(name==='Create subscription'){
      await send(base,{price_id:b.priceId,recurring_consent:true},{subscription_id:sub,operation_id:create,status:'PROCESSING'});
-     void send(select,{action_token:'bga1_'+'G'.repeat(43)},sessionFor(attempt!),200).catch(()=>{});
+     const session=sessionFor(attempt!);
+     if(fault==='early-static-invalid-session')session.capability='invalid';
+     void send(select,{action_token:'bga1_'+'G'.repeat(43)},session,fault.startsWith('session-http')?409:200).catch(()=>{});
     }
     if(name==='Pay'){
      if(fault==='before-actual-click')await provider('https://api.stripe.com/v1/confirmation_tokens');
@@ -315,7 +332,9 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  };
  const context={
   newPage:async()=>page,on:()=>{},routeWebSocket:async(_pattern:unknown,fn:typeof socketHandler)=>{socketHandler=fn;},route:async(pattern:unknown,fn:typeof handler)=>{interceptsProvider=pattern==='**/*';handler=fn;},
-  close:async()=>{closed=true;releaseBody?.();releaseDispatch?.();for(const w of waiters)w.reject(new Error('closed'));waiters.clear();}
+  close:async()=>{closed=true;releaseBody?.();releaseDispatch?.();for(const w of waiters)w.reject(new Error('closed'));waiters.clear();
+   if(fault==='session-http-close-fails')throw Error('private close reason');
+  }
  };
  const port={
   resources:()=>b,beforeDispatch:async(kind:string)=>{
@@ -398,6 +417,42 @@ test('the same manager explicitly retries a proven decline before paying with fr
  assert.equal(f.sent.filter(u=>u.endsWith('/confirm')).length,2);
  assert.equal(f.sent.filter(u=>u.endsWith('/retry')).length,1);
  assert.ok(f.closed());
+});
+test('decline retry checks a staged Stripe document after validating the original session',async()=>{
+ const f=cancellationPage('early-static',true);
+ await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example');
+ assert.deepEqual(f.presentation,['abort blockedbyclient']);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
+ assert.equal(f.sent.filter(url=>url.endsWith('/retry')).length,1);
+});
+test('an invalid original session cannot release a staged Stripe document',async()=>{
+ const f=cancellationPage('early-static-invalid-session',true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'));
+ assert.deepEqual(f.presentation,['abort failed']);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('a pinned subresource cannot start transport before the original session is validated',async t=>{
+ const f=cancellationPage('early-static-image',true);
+ const fetch=t.mock.method(globalThis,'fetch',async()=>assert.fail('early pinned asset must not be fetched'));
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'));
+ assert.equal(fetch.mock.callCount(),0);
+ assert.deepEqual(f.presentation,['abort failed']);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [fault,expected,closed] of [
+ ['session-http','BROWSER_INITIAL_SESSION_HTTP',true],
+ ['early-static-invalid-session','BROWSER_INITIAL_SESSION_WIRE',true],
+ ['session-http-close-fails','BROWSER_INITIAL_SESSION_HTTP',false],
+ ['early-static-navigation','BROWSER_INVALIDATED',true],
+] as const)test('decline retry reports only the original safe session boundary for '+fault,async()=>{
+ const f=cancellationPage(fault,true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),(error:unknown)=>{
+  assert.equal(browserDiagnostic(error),expected);
+  assert.equal(browserCleanupConfirmed(error),closed);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  return true;
+ });
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
 });
 for(const fault of ['unknown-first','early-retry','no-decline-proof','repeat-retry','wrong-retry-response','same-successor','different-pi','reused-token','retired-retry','retired-successor']){
  test('decline retry refuses '+fault+' before a second confirm',async()=>{

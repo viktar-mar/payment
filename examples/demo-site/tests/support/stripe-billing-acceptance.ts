@@ -3,6 +3,7 @@ import type {BillingPort,BillingBinding,BillingLimits,BillingCancellationPort,Bi
 import type {GenericSubscriptionManager} from '@generic-payments/sdk';
 import type {ManagerState} from '../../../../frontend/sdk/src/subscriptions/manager-state';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
+import {acceptanceBrowserFailure,finishBrowserCleanup} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 // @ts-ignore Native Node and bundlers use the same shared provider origin policy.
 import {providerOrigin,providerNetworkOrigin} from './stripe-provider-origin.ts';
 // @ts-ignore Node's offline test entry consumes source.
@@ -163,6 +164,8 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
  const lifecycle=new AbortController();
  limits={deadline:limits.deadline,signal:limits.signal?AbortSignal.any([limits.signal,lifecycle.signal]):lifecycle.signal};
  let context:BrowserContext|undefined,abandoned=false,closing:Promise<void>|undefined,failure=false;
+ let checkpoint='BROWSER',firstFailure:string|undefined,cleanupConfirmed=false;
+ const recordFailure=(code=checkpoint)=>{firstFailure??=code;failure=true;};
  const close=(ctx:BrowserContext)=>{closing??=ctx.close();void closing.catch(()=>{});return closing;};
  const opening=browser.newContext({serviceWorkers:'block',acceptDownloads:false});void opening.then(c=>{if(abandoned)return close(c);},()=>{}).catch(()=>{});
  const abort=()=>{abandoned=true;lifecycle.abort();if(context)void close(context);};limits.signal?.addEventListener('abort',abort,{once:true});
@@ -179,6 +182,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   let firstAttempt='',firstSecret='',capability='',firstToken='',successorId='';
   let trustedRetry:JSHandle<()=>boolean>|undefined,trustedCreate:JSHandle<()=>boolean>|undefined;
   const successorAck=Promise.withResolvers<void>();
+  const initialPresentationReady=Promise.withResolvers<void>();
   let originalManager:JSHandle<()=>boolean>|undefined;
   async function checkManager(){
    check();
@@ -215,9 +219,11 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    if(firstAttempt && !successorId && confirmPosts===0)return 'initial';
    if(successorId && attemptId===successorId && confirmPosts===1)return 'successor';
    return undefined;
-  },()=>!payInFlight && confirmPosts===0):undefined;
+  },()=>!payInFlight && confirmPosts===0,()=>!firstAttempt && selectPosts===1 && requests.has('initial-session')?
+   initialPresentationReady.promise:undefined):undefined;
   const winning=Promise.withResolvers<void>();
-  const redirects=challenge||invoiceCase?await guardChallengeRedirects(page,()=>{failure=true;abort();},binding.endpoints):undefined;
+  const invalidate=()=>{recordFailure('BROWSER_INVALIDATED');abort();};
+  const redirects=challenge||invoiceCase?await guardChallengeRedirects(page,invalidate,binding.endpoints):undefined;
   const sca=challenge?initial3dsChallenge({page,limits,demo:binding.endpoints.demo,owner:()=>({secret:firstSecret,key:publishableKey??''}),
    stripeFrames:req=>stripeFrames(page,req,false,false,binding.endpoints.demo),authorizeResponse:req=>redirects!.authorize(req),check:checkManager,waitForGesture:challenge.waitForGesture,
    winning:async()=>{
@@ -230,7 +236,8 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    const request=route.request(),method=request.method(),navigation=request.isNavigationRequest();
    if(sca?.owns(url)){await sca.forward(route,url);return;}
    if(pinned && !providerNetworkOrigin(url) && !/(?:^|\.)stripe\.(?:com|network)$/.test(url.hostname) && matchesStaticOrigin!(url.origin)){
-    await pinned.forward(route,url);return;
+    try{await pinned.forward(route,url);}catch(error){recordFailure('BROWSER_PINNED_PRESENTATION');throw error;}
+    return;
    }
    need(providerNetworkOrigin(url) && !request.redirectedFrom() && ['GET','POST','OPTIONS'].includes(method));
    const script=stripeScriptOrigin(url),api=url.hostname==='api.stripe.com';
@@ -274,14 +281,13 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    await route.fallback();
   }
   const check=()=>{billingCheck(limits);if(failure||abandoned)fail();};
-  const invalidate=()=>{failure=true;abort();};
   if(guarded){
    if(redirects)context.on('request',request=>{if(request.redirectedFrom())invalidate();});
    context.on('page',invalidate);
    await context.routeWebSocket('**/*',socket=>{try{socket.close();}finally{invalidate();}});
   }
   await context.route(guarded?'**/*':binding.endpoints.backend+'/**',route=>{
-   const work=(async()=>{try{
+   const work=(async()=>{let routeCheckpoint:string|undefined;try{
     billingCheck(limits);if(failure)fail();const req=route.request(),url=req.url(),method=req.method();
     if(guarded){
      const target=new URL(url);
@@ -290,7 +296,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
       if(redirects){await redirects.authorize(req);check();}
       await route.fallback();return;
      }
-     if(target.origin!==binding.endpoints.backend){await providerTraffic(route,target);return;}
+     if(target.origin!==binding.endpoints.backend){routeCheckpoint='BROWSER_PROVIDER_ROUTE';await providerTraffic(route,target);return;}
      if(cancellation && !['GET','OPTIONS'].includes(method)){await cancellation.forward(route);return;}
     }
     if(bound)need(req.frame()===page.mainFrame() && !req.isNavigationRequest() && !req.redirectedFrom());
@@ -356,7 +362,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     }
     const dispatch=successor?{beforeDispatch:(_kind:unknown,key:string)=>retryPort!.beforeSuccessorConfirm(key,{subscriptionId,operationId,attemptId})}:port;
     await forwardBillingDispatch(route,dispatch,binding,authority,'confirm',{subscriptionId,operationId,attemptId},limits,confirmation,checkManager,redirects?.authorize,invoiceCase?.releaseOriginalConfirm);
-   }catch{failure=true;abort();await route.abort('failed').catch(()=>{});}})();pending.add(work);void work.finally(()=>pending.delete(work));return work;
+   }catch{recordFailure(routeCheckpoint);abort();await route.abort('failed').catch(()=>{});}})();pending.add(work);void work.finally(()=>pending.delete(work));return work;
   });
   const url=new URL('/',binding.endpoints.demo);for(const [k,v] of Object.entries({api_base_url:binding.endpoints.backend,site_key:binding.siteKey,subscription_product_1_id:binding.productId,subscription_price_1_id:binding.priceId,locale:'en'}))url.searchParams.set(k,v);
   checkoutUrl=url.href;await page.goto(url.href,{timeout:duration(limits)});
@@ -394,22 +400,29 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   if(bound)trustedCreate=await trustedClick(createButton);
   await createButton.click({timeout:duration(limits)});const receipt=await createResponse;paired('create',receipt);need(receipt.status()===202);const original=await body(receipt,limits);need(uuid(original.subscription_id)&&uuid(original.operation_id)&&['PROCESSING','REQUIRES_ACTION','RESERVED'].includes(String(original.status)));
   subscriptionId=original.subscription_id as string;operationId=original.operation_id as string;await port.acknowledge('create',{subscriptionId,operationId});
+  checkpoint='BROWSER_INITIAL_SESSION';
   const selection=page.waitForResponse(r=>r.url()===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-session'&&r.request().method()==='POST',{timeout:duration(limits)});void selection.catch(()=>{});acknowledgeCreate();
-  const selected=await selection;paired('initial-session',selected);need(selected.status()===200);const selectedBody=await body(selected,limits);need(selectedBody.protocol==='SERVER_CONFIRM_V2'&&selectedBody.provider==='stripe'&&selectedBody.flow==='PAYMENT'&&uuid(selectedBody.attempt_id));attemptId=selectedBody.attempt_id as string;
-  if(bound)sessionContext(selectedBody,false);
+  const selected=await selection;paired('initial-session',selected);
+  checkpoint='BROWSER_INITIAL_SESSION_HTTP';need(selected.status()===200);
+  checkpoint='BROWSER_INITIAL_SESSION_WIRE';const selectedBody=await body(selected,limits);need(selectedBody.protocol==='SERVER_CONFIRM_V2'&&selectedBody.provider==='stripe'&&selectedBody.flow==='PAYMENT'&&uuid(selectedBody.attempt_id));attemptId=selectedBody.attempt_id as string;
+  if(bound){sessionContext(selectedBody,false);initialPresentationReady.resolve();}
   if(cancellationPort && typeof selectedBody.publishable_key==='string' && /^pk_test_[A-Za-z0-9_]+$/.test(selectedBody.publishable_key))publishableKey=selectedBody.publishable_key;
   async function payOnce(card:string){
+   checkpoint='BROWSER_WAIT_READY';
    const pay=manager.getByRole('button',{name:'Pay',exact:true});await pay.waitFor({state:'visible',timeout:duration(limits)});
    // Enabled Pay is controlled by the driver's real Element ready event, not iframe insertion.
    await page.waitForFunction(()=>{const m=document.querySelector('generic-subscription-manager');return [...m?.shadowRoot?.querySelectorAll('button')??[]].some(b=>b.textContent?.trim()==='Pay'&&!b.disabled&&!!b.getClientRects().length);},undefined,{timeout:duration(limits)});
+   checkpoint='BROWSER_CARD_FIELDS';
    const frame=manager.frameLocator('iframe[title="Secure payment input frame"]');await frame.locator('input[name="number"]').fill(card,{timeout:duration(limits)});await frame.locator('input[name="expiry"]').fill('1230',{timeout:duration(limits)});await frame.locator('input[name="cvc"]').fill('123',{timeout:duration(limits)});
    const postal=frame.locator('input[name="postalCode"]');if(await postal.isVisible())await postal.fill('10001',{timeout:duration(limits)});
    const confirmed=page.waitForResponse(r=>r.url()===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-attempts/'+attemptId+'/confirm'&&r.request().method()==='POST',{timeout:duration(limits)});void confirmed.catch(()=>{});
    if(guarded)trustedPayClick=await trustedClick(pay);
    await checkManager();
    while(pinned?.pending)await pinned.wait();
+   checkpoint='BROWSER_CONFIRM_WAIT';
    check();tokenRequest=undefined;payInFlight=true;
    await pay.click({timeout:duration(limits)});const confirmResponse=await confirmed;payInFlight=false;
+   checkpoint='BROWSER_CONFIRM_RECEIPT';
    paired(successorId?'successor-confirm':'original-confirm',confirmResponse);
    need(confirmResponse.status()===200);const confirmation=await body(confirmResponse,limits);check();
    need(confirmation.protocol==='SERVER_CONFIRM_V2' && confirmation.attempt_id===attemptId && confirmation.next_action_allowed===!!challenge && confirmation.successor_attempt_id===null);
@@ -459,7 +472,20 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    await billingBounded(limits,()=>Promise.all(pending));check();
   }
   if(bound){await billingBounded(limits,()=>Promise.all(pending));await checkManager();}
-  authority='';return true;
- }catch{return fail();}
- finally{abandoned=true;limits.signal?.removeEventListener('abort',abort);lifecycle.abort();if(context)await billingBounded({deadline:Date.now()+15000},async()=>{await close(context!);await Promise.allSettled(pending);});if(guarded && failure)fail();}
+  authority='';
+ }catch{recordFailure();}
+ finally{
+  abandoned=true;limits.signal?.removeEventListener('abort',abort);lifecycle.abort();
+  if(context)try{
+   await billingBounded({deadline:Date.now()+15000},async()=>{await close(context!);await Promise.allSettled(pending);});
+   cleanupConfirmed=true;
+  }catch{recordFailure('BROWSER_CLEANUP');}
+ }
+ if(firstFailure || guarded && failure){
+  if(!bound)fail();
+  const error=acceptanceBrowserFailure(firstFailure??checkpoint);
+  finishBrowserCleanup(error,cleanupConfirmed);
+  throw error;
+ }
+ return true;
 }
