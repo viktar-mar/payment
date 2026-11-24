@@ -270,8 +270,9 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  async function challengeTraffic(){
   const secret=sessionFor(attempt!).client_secret,source='src_fixture',server=id(90),acs=id(91);
   const target='https://api.stripe.com/v1/payment_intents/'+(fault==='foreign-next-pi'?'pi_other':'pi_original')+'?client_secret='+secret;
+  const actionType=fault==='preexisting-issuer-challenge'?'stripe_3ds2_challenge':'stripe_3ds2_fingerprint';
   await wire(target,stripeFrame,null,{object:'payment_intent',livemode:false,id:'pi_original',client_secret:secret,status:'requires_action',
-   next_action:{type:'use_stripe_sdk',use_stripe_sdk:{type:'stripe_3ds2_fingerprint',three_d_secure_2_source:source}}});
+   next_action:{type:'use_stripe_sdk',use_stripe_sdk:{type:actionType,three_d_secure_2_source:source}}});
   await wire('https://api.stripe.com/v1/3ds2/authenticate',stripeFrame,'source='+(fault==='foreign-next-source'?'src_other':source),
    {state:'challenge_required',ares:{messageType:'ARes',transStatus:'C',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,acsURL:issuerUrl}});
   const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:fault==='wrong-issuer-transaction'?server:acs})).toString('base64url');
@@ -1089,6 +1090,7 @@ for(const [fault,code] of Object.entries({
 const challengeRefusals:Record<string,string>={
  'foreign-next-pi':'BROWSER_CHALLENGE_SOURCE_RESPONSE',
  'foreign-next-source':'BROWSER_CHALLENGE_API_REQUEST',
+ 'preexisting-issuer-challenge':'BROWSER_CHALLENGE_SOURCE_WIRE_SDK_CHALLENGE',
  'wrong-issuer-transaction':'BROWSER_CHALLENGE_ISSUER_TRANSACTION',
  'foreign-issuer-path':'BROWSER_CHALLENGE_ISSUER_TRANSACTION',
  'untrusted-issuer':'BROWSER_CHALLENGE_ISSUER_SUBMISSION',
@@ -1121,6 +1123,7 @@ for(const fault of ['none','late-source-valid','late-issuer-witness','replayed-n
   assert.equal(f.trace.includes('issuer Complete'),success||['untrusted-issuer','foreign-issuer-witness','wrong-issuer-nonce','substituted-issuer-form','premature-sdk-complete'].includes(fault));
   if(fault==='premature-sdk-complete')assert.equal(f.providerSent.some(x=>x.endsWith('/challenge_complete')),false);
   if(fault.startsWith('late-source-'))assert.equal(f.providerSent.some(x=>x.endsWith('/3ds2/authenticate')),success);
+  if(fault==='preexisting-issuer-challenge')assert.equal(f.providerSent.some(x=>x.endsWith('/3ds2/authenticate')),false);
   assert.equal(f.providerSent.filter(x=>x.endsWith('/decision')).length,success?1:0);
  });
 }

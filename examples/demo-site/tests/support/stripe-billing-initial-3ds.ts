@@ -14,12 +14,27 @@ function exactUrl(value:unknown){
  const url=new URL(value);requireValue(url.href===value && !url.username && !url.password && !url.hash && url.pathname!=='/');
  return url;
 }
-export function challengeSource(raw:unknown,secret:string):string{
- const intent=object(raw),action=object(intent.next_action),sdk=object(action.use_stripe_sdk);
- requireValue(intent.object==='payment_intent' && intent.livemode===false && intent.id===secret.split('_secret_')[0] &&
-  intent.client_secret===secret && intent.status==='requires_action' && action.type==='use_stripe_sdk' &&
-  sdk.type==='stripe_3ds2_fingerprint' && typeof sdk.three_d_secure_2_source==='string' && /^src_[A-Za-z0-9]{1,200}$/.test(sdk.three_d_secure_2_source));
- return sdk.three_d_secure_2_source;
+export function challengeSource(raw:unknown,secret:string,report?:(code:string)=>void):string{
+ report?.('BROWSER_CHALLENGE_SOURCE_WIRE_OBJECT');
+ const intent=object(raw);requireValue(intent.object==='payment_intent');
+ report?.('BROWSER_CHALLENGE_SOURCE_WIRE_IDENTITY');
+ requireValue(intent.id===secret.split('_secret_')[0]);
+ report?.('BROWSER_CHALLENGE_SOURCE_WIRE_SECRET');
+ requireValue(intent.client_secret===secret);
+ report?.('BROWSER_CHALLENGE_SOURCE_WIRE_MODE');
+ requireValue(intent.livemode===false);
+ report?.('BROWSER_CHALLENGE_SOURCE_WIRE_STATE');
+ requireValue(intent.status==='requires_action');
+ report?.('BROWSER_CHALLENGE_SOURCE_WIRE_ACTION');
+ const action=object(intent.next_action);requireValue(action.type==='use_stripe_sdk');
+ report?.('BROWSER_CHALLENGE_SOURCE_WIRE_SDK');
+ const sdk=object(action.use_stripe_sdk);
+ report?.(sdk.type==='stripe_3ds2_challenge'?'BROWSER_CHALLENGE_SOURCE_WIRE_SDK_CHALLENGE':'BROWSER_CHALLENGE_SOURCE_WIRE_SDK_TYPE');
+ requireValue(sdk.type==='stripe_3ds2_fingerprint');
+ const source=sdk.three_d_secure_2_source;
+ report?.(source===undefined||source===null?'BROWSER_CHALLENGE_SOURCE_WIRE_VALUE_MISSING':'BROWSER_CHALLENGE_SOURCE_WIRE_VALUE_INVALID');
+ requireValue(typeof source==='string' && /^src_[A-Za-z0-9]{1,200}$/.test(source));
+ return source;
 }
 export function issuerBinding(raw:unknown){
  const result=object(raw),ares=object(result.ares);
@@ -148,8 +163,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    if(!isRetrieve && !boundSource){
     report('BROWSER_CHALLENGE_SOURCE_RESPONSE');
     const body=await verifiedBody(retrieve);
-    report('BROWSER_CHALLENGE_SOURCE_WIRE');
-    boundSource=challengeSource(body,secret);
+    boundSource=challengeSource(body,secret,report);
    }
    report('BROWSER_CHALLENGE_API_REQUEST');
    const kind=challengeApiRequest(url,method,data,key,secret,boundSource);
