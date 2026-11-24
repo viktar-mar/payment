@@ -40,6 +40,8 @@ Run `40a21c4a-567e-4afb-b731-2d645fe9b455` at `1d4c381` used the verified privat
 
 Run `8451973f-761d-4ffe-8721-11ec0d49a048` at `41a1214` accepted the first checkout session and stopped at `BROWSER_CONFIRM_CLICK_UNOBSERVED` with confirmed cleanup. The browser's Pay action completed without an observed trusted click. No confirmation or Retry dispatch entered the journal. A network-blocked Chromium fixture reproduced completion without a trusted event when the button became disabled during pointer activation. It produced one trusted event with Enter on the focused button. The decline/Retry driver now focuses and checks the exact Pay control before activating it once by keyboard. The historical pointer-event cause remains undetermined.
 
+Run `a44ec9fe-e686-4c8b-9a61-14813b26cf99` at `32831ed` stopped at the general `BROWSER` checkpoint with confirmed cleanup. The last receipt is customer acknowledgement. No CREATE, confirmation or Retry dispatch was recorded. The runner now distinguishes baseline, consent, manager ownership, exact Create button focus, gesture, request and receipt. The decline/Retry case uses one trusted keyboard activation on the exact Create control and expires dispatch authority if observation fails.
+
 ## Earlier local recovery evidence on 2026-11-23
 
 Run `c2dfc733-6915-45b8-8aa5-3792ccb31f42` at `0449bdd` passed the initial payment, declined renewal, grace checks and replacement-method confirmation. The exact Stripe Sandbox request log showed that the invoice-created PaymentIntent refused `error_on_requires_action`. Both the local runner and Stripe stopped that request.

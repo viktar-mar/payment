@@ -121,7 +121,7 @@ type FrameStage='NAV_CAPTURE'|'NAV_BLOCK'|'ASSET_CAPTURE'|'ASSET_FETCH'|'ASSET_F
 export function pinnedRetryPresentation(page:Page,checkout:()=>string,limits:BillingLimits,
  form:()=>PresentationPhase|undefined,beforePay:()=>boolean,
  pendingForm:(kind:'document'|'asset')=>PendingPresentation|undefined,onFailure:(code:string)=>void){
- const pending=new Set<Promise<void>>();
+ const pending=new Map<Promise<void>,()=>string>();
  const navigations=new WeakMap<Frame,number>();
  // Playwright can retain the same Frame and URL across document navigations.
  page.on('framenavigated',frame=>navigations.set(frame,(navigations.get(frame)??0)+1));
@@ -233,10 +233,20 @@ export function pinnedRetryPresentation(page:Page,checkout:()=>string,limits:Bil
     onFailure(code);
     throw error;
    });
-   pending.add(work);
+   pending.set(work,()=>code);
    try{await work;}finally{pending.delete(work);}
   },
   get pending(){return pending.size;},
-  wait:()=>billingBounded(limits,()=>Promise.all([...pending]),Infinity),
+  async wait(){
+   const waiting=[...pending.keys()];
+   try{await billingBounded(limits,()=>Promise.all(waiting),Infinity);}
+   catch(error){
+    // The outer wait can time out before a single owned route reports its own checkpoint.
+    const outstanding=waiting.filter(work=>pending.has(work));
+    const checkpoint=outstanding.length===1?pending.get(outstanding[0]!):undefined;
+    if(checkpoint && !limits.signal?.aborted)onFailure(checkpoint());
+    throw error;
+   }
+  },
  };
 }

@@ -67,7 +67,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   capability:'bca2_'+(id===attempt?'C':'D').repeat(43),client_secret:'pi_original_secret_fixture',expires_at:boundary});
  const receiptFor=(id:string,state:string,retry_allowed:boolean,successor_attempt_id:string|null)=>({protocol:'SERVER_CONFIRM_V2',attempt_id:id,state,retry_allowed,successor_attempt_id,expires_at:boundary});
  let payCount=0,armedPay=0,retryClicked=false,nonce=30,staticProbed=false,sessionErrorBodyReads=0;
- let latePay:Promise<void>|undefined;
+ let latePay:Promise<void>|undefined,lateCreate:Promise<void>|undefined;
  let pinnedFrameChanged=false;
  let requestFailed=(request:Request)=>{void request;};
  const presentation:string[]=[];
@@ -305,12 +305,16 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     if(name==='Request code') await send(otp, {site_key:b.siteKey,email:b.email,intent:'AUTHENTICATE'}, {challenge_id:id(8)});
     if(name==='Verify code'){
      await send(otp+'/'+id(8)+'/verify',{}, {customer:{id:id(11),status:'ACTIVE'},site_id:b.siteId,scopes:['SUBSCRIPTION_READ','SUBSCRIPTION_MANAGE'],session_token:token},200);
-     await send(base+'?limit=100',{}, {items:[],next_cursor:null},200,'GET');
+     await send(base+'?limit=100',{}, {items:fault==='create-nonempty-baseline'?[{id:id(99)}]:[],next_cursor:null},200,'GET');
     }
     if(name==='Create subscription'){
+     if(fault==='create-pointer-lost'&&!fromKeyboard)return;
+     if(fault==='create-late-gesture')await (lateCreate=new Promise<void>(resolve=>setTimeout(resolve,50)));
      const directAction=fault==='initial-direct-action';
-     await send(base,{price_id:b.priceId,recurring_consent:true},{subscription_id:sub,operation_id:create,status:directAction?'REQUIRES_ACTION':'PROCESSING',
+     const createSubscription=()=>send(base,{price_id:b.priceId,recurring_consent:true},{subscription_id:sub,operation_id:create,status:directAction?'REQUIRES_ACTION':'PROCESSING',
       action_available:directAction,next_action:directAction?{kind:'PROVIDER_CLIENT',secret:'bga1_'+'G'.repeat(43),expires_at:boundary}:null,browser_confirm_allowed:false});
+     if(fault==='create-persist-pending'){void createSubscription().catch(()=>{});return;}
+     await createSubscription();
      const session=sessionFor(attempt!);
      if(fault.startsWith('early-static')&&fault.endsWith('-invalid-session'))session.capability='invalid';
      if(fault==='initial-session-wire-protocol')session.protocol='BROWSER_CONFIRM_V1';
@@ -415,7 +419,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    return {...control,elementHandle:async()=>({
     waitForElementState:async()=>{},
     focus:async()=>{},
-    evaluate:async()=>fault!=='confirm-focus-lost',
+    evaluate:async()=>opts.name==='Create subscription'?fault!=='create-focus-lost':fault!=='confirm-focus-lost',
     evaluateHandle:control.evaluateHandle,
     press:async(key:string)=>{keysPressed.push(key);fromKeyboard=true;await control.click();},
    })};
@@ -465,12 +469,13 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    const ownConfirm=fault.startsWith('confirm-') && predicate({
     url:()=>payCount===0?confirm:nextConfirm,request:()=>({method:()=> 'POST'}),
    } as Response);
+   const lateCreateObservation=['create-late-gesture','create-persist-pending'].includes(fault)&&predicate({url:()=>base,request:()=>({method:()=> 'POST'})} as Response);
    if(ownConfirm&&fault==='confirm-early-observer'&&armedPay!==payCount+1){reject(new errors.TimeoutError('confirm observer was armed too early'));return;}
    const waiter={predicate,resolve:(response:Response)=>{clearTimeout(timer);resolve(response);},reject:(error:Error)=>{clearTimeout(timer);reject(error);}};
    const timer=setTimeout(()=>{
     waiters.delete(waiter);
     reject(fault==='initial-page-closed'?new Error('private page closed reason'):new errors.TimeoutError('private fixture URL during response wait'));
-   },ownConfirm&&fault!=='confirm-early-observer'?25:timeout);
+   },lateCreateObservation||ownConfirm&&fault!=='confirm-early-observer'?25:timeout);
    waiters.add(waiter);
   })
  };
@@ -482,6 +487,10 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  };
  const port={
   resources:()=>b,beforeDispatch:async(kind:string)=>{
+   if(kind==='create'&&fault==='create-persist-pending'){
+    trace.push('persist CREATE');
+    await new Promise<void>(resolve=>{releaseDispatch=resolve;});
+   }
    if(kind==='confirm'&&fault==='duplicate-during-persist')await new Promise<void>(resolve=>{releaseDispatch=resolve;void duplicateConfirm?.().catch(()=>{}).finally(resolve);});
    if(kind==='confirm'&&fault==='confirm-persist-pending')await new Promise<void>(resolve=>{releaseDispatch=resolve;});
    return true;
@@ -495,7 +504,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   beforeCancellation:async(kind:string,key:string)=>{trace.push('persist '+kind+' '+key);return fault!=='persist';},
   verifyCancellation:async(kind:string,operation:string)=>{trace.push('verify '+kind+' '+operation);return fault!=='proof';}
  } as BillingCancellationPort&BillingDeclineRetryPort&BillingInitial3dsPort&BillingInvoiceWebhooksPort;
- return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,keysPressed,presentation,sessionErrorBodyReads:()=>sessionErrorBodyReads,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),reloadStripe:()=>navigate(stripeFrame),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed,latePay:()=>latePay};
+ return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,keysPressed,presentation,sessionErrorBodyReads:()=>sessionErrorBodyReads,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),reloadStripe:()=>navigate(stripeFrame),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed,latePay:()=>latePay,lateCreate:()=>lateCreate};
 }
 test('same-page manager schedules and withdraws once after the initial paid proof',async()=>{
  const f=cancellationPage();
@@ -573,7 +582,7 @@ test('decline retry stops a late Pay gesture when the confirmation observer expi
 test('decline retry activates the pinned Pay button with one Enter per authorized attempt',async()=>{
  const f=cancellationPage('confirm-pointer-lost',true);
  assert.equal(await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),true);
- assert.deepEqual(f.keysPressed,['Enter','Enter']);
+ assert.deepEqual(f.keysPressed,['Enter','Enter','Enter']);
  assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
  assert.equal(f.sent.filter(url=>url.endsWith('/retry')).length,1);
 });
@@ -584,10 +593,52 @@ test('decline retry sends no key or payment when the exact Pay button cannot tak
   assert.equal(browserCleanupConfirmed(error),true);
   return true;
  });
- assert.deepEqual(f.keysPressed,[]);
+ assert.deepEqual(f.keysPressed,['Enter']);
  assert.equal(f.providerSent.length,0);
  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
 });
+test('decline retry sends CREATE with the exact trusted keyboard gesture when the pointer would be lost',async()=>{
+ const f=cancellationPage('create-pointer-lost',true);
+ assert.equal(await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),true);
+ assert.deepEqual(f.keysPressed,['Enter','Enter','Enter']);
+ assert.equal(f.trace.filter(step=>step==='Create subscription').length,1);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
+});
+test('decline retry refuses a late CREATE gesture after the response observer expires',async()=>{
+ const f=cancellationPage('create-late-gesture',true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CREATE_WAIT');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ await f.lateCreate();
+ assert.deepEqual(f.keysPressed,['Enter']);
+ assert.ok(!f.sent.includes(binding.endpoints.backend+'/api/v1/customer/subscriptions'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('decline retry refuses transport when CREATE persistence finishes after the response observer expires',async()=>{
+ const f=cancellationPage('create-persist-pending',true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CREATE_WAIT');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(f.trace.filter(step=>step==='persist CREATE').length,1);
+ assert.ok(!f.sent.includes(binding.endpoints.backend+'/api/v1/customer/subscriptions'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [fault,code] of [['create-nonempty-baseline','BROWSER_CREATE_BASELINE'],['create-focus-lost','BROWSER_CREATE_FOCUS']] as const)
+ test('decline retry records '+code+' before any CREATE gesture',async()=>{
+  const f=cancellationPage(fault,true);
+  await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+   assert.equal(browserCleanupConfirmed(error),true);
+   return true;
+  });
+  assert.deepEqual(f.keysPressed,[]);
+  assert.ok(!f.trace.includes('Create subscription'));
+  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+ });
 
 for(const [fault,expected] of [
  ['confirm-click-refused','BROWSER_CONFIRM_CLICK'],

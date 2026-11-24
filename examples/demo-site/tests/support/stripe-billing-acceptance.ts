@@ -1,5 +1,5 @@
 import {errors} from '@playwright/test';
-import type {Browser,Route,Request,Response,BrowserContext,Page,Locator,Frame,JSHandle} from '@playwright/test';
+import type {Browser,Route,Request,Response,BrowserContext,Page,Locator,Frame,JSHandle,ElementHandle} from '@playwright/test';
 import type {BillingPort,BillingBinding,BillingLimits,BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort,BillingInvoiceWebhooksPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {GenericSubscriptionManager} from '@generic-payments/sdk';
 import type {ManagerState} from '../../../../frontend/sdk/src/subscriptions/manager-state';
@@ -230,7 +230,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   const base=binding.endpoints.backend+'/api/v1/customer/subscriptions',otp=binding.endpoints.backend+'/api/v1/public/customer-auth/email-otp/challenges';
   let acknowledgeCreate!:()=>void;const created=new Promise<void>(r=>acknowledgeCreate=r);
   let cancellation:ReturnType<typeof cancellationJourney>|undefined, challengeId:string|undefined;
-  let payInFlight=false, trustedPayClick:JSHandle<()=>boolean>|undefined, tokenRequest:Request|undefined, publishableKey:string|undefined;
+  let createGestureInFlight=false,payInFlight=false, trustedPayClick:JSHandle<()=>boolean>|undefined, tokenRequest:Request|undefined, publishableKey:string|undefined;
   const requests=new Map<string,Request>(),keys=new Set<string>();
   const initialReads:{url:string;request:Request;authorized?:boolean}[]=[];
   const initialReadPath=/^\/[a-f0-9-]{36}\/operations\/[a-f0-9-]{36}(?:\/action|\/confirmation-attempts\/current)?$/;
@@ -294,6 +294,20 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    return ()=>clicked;
   }
   function trustedClick(button:Locator){return button.evaluateHandle(captureTrustedClick);}
+  async function focusExactButton(locator:Locator){
+   const button=await locator.elementHandle({timeout:duration(limits)});
+   await button.waitForElementState('stable',{timeout:duration(limits)});
+   await button.waitForElementState('enabled',{timeout:duration(limits)});
+   await billingBounded(limits,()=>button.focus(),duration(limits));
+   return button;
+  }
+  async function requireButtonFocus(button:ElementHandle<HTMLElement|SVGElement>){
+   need(await button.evaluate(element=>{
+    const root=element.getRootNode();
+    return element instanceof HTMLButtonElement && element.type==='button' && element.isConnected && !element.disabled &&
+     root instanceof ShadowRoot && root.host===document.querySelector('generic-subscription-manager') && root.activeElement===element;
+   }));
+  }
   function sessionContext(value:Record<string,unknown>,successor:boolean,report?:(step:SessionWireCheckpoint)=>void){
    report?.('FIELDS');need(exact(value,['protocol','provider','flow','publishable_key','client_secret','attempt_id','capability','expires_at']));
    report?.('PROTOCOL');need(value.protocol==='SERVER_CONFIRM_V2' && value.provider==='stripe' && value.flow==='PAYMENT');
@@ -401,6 +415,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     }
     const observingSession=retryPort && !attemptId && method==='POST' && subscriptionId && operationId &&
      url===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-session';
+    if(retryPort&&url===base&&method==='POST')routeCheckpoint='BROWSER_CREATE_REQUEST_REJECTED';
     if(observingSession){initialSessionObserved=true;routeCheckpoint='BROWSER_SESSION_REQUEST_REJECTED';}
     if(bound)need(req.frame()===page.mainFrame() && !req.isNavigationRequest() && !req.redirectedFrom());
     async function continueBackend(){
@@ -431,7 +446,13 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     if(url===base){
      need(++createPosts===1);
      if(bound){claim('create',req);need(trustedCreate && await trustedCreate.evaluate(clicked=>clicked()));}
-     await forwardBillingDispatch(route,port,binding,authority,'create',undefined,limits,undefined,checkManager,redirects?.authorize);return;
+     const requireCreateGesture=():true=>{need(createGestureInFlight);return true;};
+     const createOwner:Pick<BillingPort,'beforeDispatch'>=retryPort?{beforeDispatch:(kind,key,identity)=>{
+      requireCreateGesture();
+      return port.beforeDispatch(kind,key,identity);
+     }}:port;
+     await forwardBillingDispatch(route,createOwner,binding,authority,'create',undefined,limits,undefined,checkManager,
+      redirects?.authorize,retryPort?requireCreateGesture:undefined);return;
     }
     if(guarded && !subscriptionId)need(createPosts===1 && url.startsWith(base+'/') && url.endsWith('/confirmation-session'));
     await billingBounded(limits,()=>created);const original=base+'/'+subscriptionId+'/operations/'+operationId;
@@ -500,8 +521,11 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   await widget.getByRole('button',{name:'Verify code',exact:true}).click({timeout:duration(limits)});const response=await verification;paired('verify',response);need(response.status()===200);const session=await body(response,limits),customer=session.customer;
   need(object(customer)&&uuid(customer.id)&&customer.status==='ACTIVE'&&session.site_id===binding.siteId&&Array.isArray(session.scopes)&&session.scopes.includes('SUBSCRIPTION_READ')&&session.scopes.includes('SUBSCRIPTION_MANAGE')&&typeof session.session_token==='string'&&/^[A-Za-z0-9_-]{43}$/.test(session.session_token));
   authority='Bearer '+session.session_token;await port.acknowledgeCustomer({customerId:(customer as Record<string,string>).id!,siteId:binding.siteId});
+  if(retryPort)checkpoint='BROWSER_CREATE_BASELINE';
   const before=await body(await baseline,limits);need(Array.isArray(before.items)&&before.items.length===0&&before.next_cursor===null);
+  if(retryPort)checkpoint='BROWSER_CREATE_CONSENT';
   const manager=page.locator('generic-subscription-manager').first();await manager.getByRole('checkbox',{name:'I consent to recurring payments',exact:true}).check({timeout:duration(limits)});
+  if(retryPort)checkpoint='BROWSER_CREATE_OWNER';
   if(bound){
    originalManager=await manager.evaluateHandle((element,expected)=>{
     const m=element as GenericSubscriptionManager,revision=m.state.authorityRevision,session=m.customerSession;
@@ -515,10 +539,29 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    },{priceId:binding.priceId,productId:binding.productId,siteId:binding.siteId,customerId:(customer as Record<string,string>).id!});
    await checkManager();
   }
-  const createResponse=page.waitForResponse(r=>r.url()===base&&r.request().method()==='POST',{timeout:duration(limits)});void createResponse.catch(()=>{});
   const createButton=manager.getByRole('button',{name:'Create subscription',exact:true});
-  if(bound)trustedCreate=await trustedClick(createButton);
-  await createButton.click({timeout:duration(limits)});const receipt=await createResponse;paired('create',receipt);need(receipt.status()===202);const original=await body(receipt,limits);need(uuid(original.subscription_id)&&uuid(original.operation_id)&&['PROCESSING','REQUIRES_ACTION','RESERVED'].includes(String(original.status)));
+  if(retryPort)checkpoint='BROWSER_CREATE_FOCUS';
+  const exactCreate=retryPort?await focusExactButton(createButton):undefined;
+  if(bound)trustedCreate=exactCreate?await exactCreate.evaluateHandle(captureTrustedClick):await trustedClick(createButton);
+  if(exactCreate){await checkManager();await requireButtonFocus(exactCreate);}
+  if(retryPort)checkpoint='BROWSER_CREATE_GESTURE';
+  const createObservationFailed=Symbol();
+  const createResponse=page.waitForResponse(r=>r.url()===base&&r.request().method()==='POST',{timeout:duration(limits)})
+   .catch(()=>{throw createObservationFailed;});void createResponse.catch(()=>{});
+  let receipt:Response;
+  createGestureInFlight=true;
+  try{
+   const activation=exactCreate?exactCreate.press('Enter',{timeout:duration(limits)}):createButton.click({timeout:duration(limits)});
+   const observed=activation.then(async()=>{
+    if(exactCreate)need(await trustedCreate!.evaluate(clicked=>clicked()));
+   });
+   [,receipt]=await Promise.all([observed,createResponse]);
+  }catch(error){
+   if(retryPort&&error===createObservationFailed)checkpoint='BROWSER_CREATE_WAIT';
+   throw error;
+  }finally{createGestureInFlight=false;}
+  if(retryPort)checkpoint='BROWSER_CREATE_RECEIPT';
+  paired('create',receipt);need(receipt.status()===202);const original=await body(receipt,limits);need(uuid(original.subscription_id)&&uuid(original.operation_id)&&['PROCESSING','REQUIRES_ACTION','RESERVED'].includes(String(original.status)));
   subscriptionId=original.subscription_id as string;operationId=original.operation_id as string;await port.acknowledge('create',{subscriptionId,operationId});
   checkpoint='BROWSER_INITIAL_SESSION';
   const originalOperation=base+'/'+subscriptionId+'/operations/'+operationId;
@@ -586,19 +629,10 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    };
    if(retryPort)await settlePresentation();
    if(retryPort)checkpoint='BROWSER_CONFIRM_FOCUS';
-   const payButton=retryPort?await pay.elementHandle({timeout:duration(limits)}):undefined;
-   if(payButton){
-    await payButton.waitForElementState('stable',{timeout:duration(limits)});
-    await payButton.waitForElementState('enabled',{timeout:duration(limits)});
-    await billingBounded(limits,()=>payButton.focus(),duration(limits));
-   }
+   const payButton=retryPort?await focusExactButton(pay):undefined;
    if(guarded)trustedPayClick=payButton?await payButton.evaluateHandle(captureTrustedClick):await trustedClick(pay);
    await settlePresentation();
-   if(payButton)need(await payButton.evaluate(element=>{
-    const root=element.getRootNode();
-    return element instanceof HTMLButtonElement && element.type==='button' && element.isConnected && !element.disabled &&
-     root instanceof ShadowRoot && root.host===document.querySelector('generic-subscription-manager') && root.activeElement===element;
-   }));
+   if(payButton)await requireButtonFocus(payButton);
    // Arm observation after presentation has settled, but before a click can dispatch.
    checkpoint=retryPort?'BROWSER_CONFIRM_CLICK':'BROWSER_CONFIRM_WAIT';
    const confirmUrl=base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-attempts/'+attemptId+'/confirm';
