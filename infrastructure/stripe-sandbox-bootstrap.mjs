@@ -4,7 +4,7 @@ import {isBrowserProviderOriginWitness} from './stripe-billing-first-payment-bro
 import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
 import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
-import {billingAcceptanceExcluded,billingAcceptanceOptIn,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
+import {RETRY_NETWORK_SUBNET,billingAcceptanceExcluded,billingAcceptanceOptIn,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
 import {preflightOwnedBillingFailedRenewal,preflightOwnedBillingFirstRenewal,preflightOwnedBillingFirstPayment,preflightOwnedBilling} from './stripe-sandbox-owned.mjs';
 import {failedRenewalContainerFormat,proveFailedRenewalRuntime,firstRenewalContainerFormat,firstRenewalImageFormat,proveFirstRenewalRuntime,firstPaymentContainerFormat,firstPaymentImageFormat,proveFirstPaymentRuntime,proveOwnedContainer,proveOwnedPorts as portProof,CONTAINER_FORMAT,NETWORK_FORMAT,VOLUME_FORMAT} from './stripe-sandbox-ownership.mjs';
 import {execFile} from 'node:child_process';
@@ -452,9 +452,14 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     await absent(['ps','--all','--no-trunc','--filter','label=com.docker.compose.project='+project,'--format','{{.ID}}'],context);
     await absent(['network','ls','--no-trunc','--filter','name='+networkName,'--format','{{.ID}}'],context);
     await intent('CREATE_NETWORK',networkName,context);
-    const output=await docker(['network','create','--driver','bridge',...Object.entries(ownLabels('network')).flatMap(([key,value])=>['--label',key+'='+value]),networkName],context);
+    const subnet=billing&&options.selectedCase==='initial_decline_retry'?env[RETRY_NETWORK_SUBNET]:undefined;
+    const output=await docker(['network','create','--driver','bridge',...(subnet?['--subnet',subnet]:[]),...Object.entries(ownLabels('network')).flatMap(([key,value])=>['--label',key+'='+value]),networkName],context);
     const network=await inspect('network',networkName,NETWORK_FORMAT,context);
     if(!fullId(network.Id)||output.stdout.trim()!==network.Id||network.Name!==networkName||network.Driver!=='bridge'||network.Scope!=='local'||!same(network.Labels,ownLabels('network')))fail();
+    if(subnet){
+      const ipam=await inspect('network',network.Id,'{"Config":{{json .IPAM.Config}}}',context);
+      if(!Array.isArray(ipam.Config)||ipam.Config.length!==1||ipam.Config[0]?.Subnet!==subnet)fail();
+    }
     recorded.network=network;await acknowledgement(context);
     for(const [kind,name] of Object.entries(volumeNames)) {
       await absent(['volume','ls','--filter','name='+name,'--format','{{.Name}}'],context);await intent('CREATE_VOLUME',name,context);

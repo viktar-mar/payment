@@ -1462,6 +1462,31 @@ test('Billing bootstrap is inert and keeps a seventh distinct grant key in owned
   await b.stop(LIMIT());
 });
 
+for(const matches of [true,false])test('the opt-in decline Retry subnet must match Docker IPAM: '+matches,async()=>{
+ const subnet='10.254.76.0/28',selectedCase='initial_decline_retry',f=fixture();
+ f.options.selectedCase=selectedCase;
+ f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',
+  PAYMENT_STRIPE_BILLING_CASE:selectedCase,PAYMENT_STRIPE_BILLING_RETRY_SUBNET:subnet};
+ const execute=f.dependencies.execute;
+ f.dependencies.execute=async(file,args,settings)=>{
+  const result=await execute(file,args,settings);
+  if(args[4]==='network'&&args[5]==='inspect'&&args.some(arg=>arg.includes('.IPAM.Config')))
+   return {...result,stdout:JSON.stringify({Config:[{Subnet:matches?subnet:'10.254.76.16/28'}]})};
+  return result;
+ };
+ const bootstrap=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);
+ if(matches)assert.equal(await bootstrap.prepare(LIMIT()),true);
+ else await assert.rejects(bootstrap.prepare(LIMIT()),/PREPARE_PENDING/);
+ const commands=f.events.filter(e=>e.type==='process'&&e.args[4]==='network'&&e.args[5]==='create');
+ assert.equal(commands.length,1);
+ assert.equal(commands[0].args[commands[0].args.indexOf('--subnet')+1],subnet);
+ if(!matches){
+  assert.equal(bootstrap.resources().network,null);
+  assert.equal(f.containers.size,0);
+  assert.equal(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents.at(-1).status,'DISPATCHING');
+ }
+});
+
 for(const selectedCase of ['initial_success','initial_cancel_withdraw','initial_decline_retry','initial_3ds','initial_missed_reordered']){
  test('each non-clock case selects its reviewed demo build: '+selectedCase,async()=>{
   const f=fixture();

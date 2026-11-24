@@ -5,6 +5,22 @@ import * as cli from './stripe-sandbox-cli.mjs';
 import * as owned from './stripe-sandbox-owned.mjs';
 const module=await import('./stripe-billing-acceptance-options.mjs').catch(()=>({}));
 const options=()=>({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'},runId:'11111111-2222-4333-8444-555555555555',expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports:{backend:18080,demo:18081,receiver:18082,postgres:15432,mailpitHttp:18025,mailpitSmtp:11025},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_success'});
+test('an explicit private bridge subnet belongs only to initial decline and retry',()=>{
+ const key='PAYMENT_STRIPE_BILLING_RETRY_SUBNET',subnet='10.254.76.0/28',base=options();
+ const selectedCase='initial_decline_retry';
+ const input={...base,selectedCase,env:{...base.env,PAYMENT_STRIPE_BILLING_CASE:selectedCase,[key]:subnet}};
+ const snapshot=module.snapshotBillingAcceptanceEnvironment(input.env);
+ assert.equal(snapshot?.[key],subnet);
+ const admitted=module.validateBillingAcceptanceOptions(input);
+ assert.equal(admitted?.env[key],subnet);
+ assert.deepEqual(module.validateBillingAcceptanceOptions(admitted),admitted);
+ for(const bad of ['', '10.254.76.1/28', '10.254.76.0/16', '10.254.076.0/28', '10.255.256.0/28', '192.168.76.0/28','8.8.8.0/28','10.254.76.0/28\n']){
+  const env={...input.env,[key]:bad};
+  assert.equal(module.snapshotBillingAcceptanceEnvironment(env),null);
+  assert.equal(module.validateBillingAcceptanceOptions({...input,env}),null);
+ }
+ assert.equal(module.validateBillingAcceptanceOptions({...base,env:{...base.env,[key]:subnet}}),null);
+});
 test('Billing own-data admission freezes fixed initial-success authority without reading accessors',()=>{
   assert.equal(typeof module.validateBillingAcceptanceOptions,'function');
   const input=options(),value=module.validateBillingAcceptanceOptions(input);assert.ok(value);
