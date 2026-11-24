@@ -247,17 +247,19 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const reply=observeNetwork(target,url,data===null?'GET':'POST');
   let existing:Response|undefined;
   const lateRetrieve=url.startsWith('https://api.stripe.com/v1/payment_intents/')&&fault.startsWith('late-source-');
+  const lateIssuer=url===actionUrl&&fault.startsWith('late-issuer-response-');
+  const responseFault=lateRetrieve?fault.slice('late-source-'.length):lateIssuer?fault.slice('late-issuer-response-'.length):'';
   const headers=navigation?{'content-type':'application/x-www-form-urlencoded',origin:issuerDocument===issuerUrl?'https://hooks.stripe.com':'https://js.stripe.com'}:
    {authorization:'Bearer pk_test_fixture',origin:'https://js.stripe.com'};
   const request={url:()=>url,method:()=>data===null?'GET':'POST',frame:()=>target,isNavigationRequest:()=>navigation,resourceType:()=>navigation?'document':'xhr',
-   redirectedFrom:()=>null,postData:()=>data,allHeaders:async()=>headers,existingResponse:()=>lateRetrieve?null:existing,
+   redirectedFrom:()=>null,postData:()=>data,allHeaders:async()=>headers,existingResponse:()=>lateRetrieve||lateIssuer?null:existing,
    response:async()=>{
-    if(fault==='late-source-absent'||!existing)return null;
-    if(fault==='late-source-unobserved')return new Promise<never>(()=>{});
-    if(fault==='late-source-foreign-request')return {...existing,request:()=>({})};
-    if(fault==='late-source-foreign-url')return {...existing,url:()=>url+'/other'};
-    if(fault==='late-source-service-worker')return {...existing,fromServiceWorker:()=>true};
-    if(fault==='late-source-status')return {...existing,status:()=>202};
+    if(responseFault==='absent'||!existing)return null;
+    if(responseFault==='unobserved')return new Promise<never>(()=>{});
+    if(responseFault==='foreign-request')return {...existing,request:()=>({})};
+    if(responseFault==='foreign-url')return {...existing,url:()=>url+'/other'};
+    if(responseFault==='service-worker')return {...existing,fromServiceWorker:()=>true};
+    if(responseFault==='status')return {...existing,status:()=>lateIssuer?503:202};
     return existing;
    }} as unknown as Request;
   await handler({request:()=>request,continue:async(...args:unknown[])=>{
@@ -1102,6 +1104,11 @@ const challengeRefusals:Record<string,string>={
  'late-source-foreign-url':'BROWSER_CHALLENGE_SOURCE_RESPONSE',
  'late-source-service-worker':'BROWSER_CHALLENGE_SOURCE_RESPONSE',
  'late-source-status':'BROWSER_CHALLENGE_SOURCE_RESPONSE',
+ 'late-issuer-response-absent':'BROWSER_CHALLENGE_WAIT',
+ 'late-issuer-response-foreign-request':'BROWSER_CHALLENGE_WAIT',
+ 'late-issuer-response-foreign-url':'BROWSER_CHALLENGE_WAIT',
+ 'late-issuer-response-service-worker':'BROWSER_CHALLENGE_WAIT',
+ 'late-issuer-response-status':'BROWSER_CHALLENGE_WAIT',
 };
 for(const fault of ['none','late-source-valid','late-issuer-witness','replayed-next-ack','profile-retires','substituted-issuer-form','premature-sdk-complete','same-url-issuer-replaced',...Object.keys(challengeRefusals)]){
  test('the real browser journey requires one original issuer challenge: '+fault,async()=>{
@@ -1120,11 +1127,12 @@ for(const fault of ['none','late-source-valid','late-issuer-witness','replayed-n
   assert.equal(f.trace.filter(x=>x==='Create subscription').length,1);assert.equal(f.trace.filter(x=>x==='Pay').length,1);
   assert.equal(f.sent.filter(x=>x.endsWith('/confirm')).length,1);assert.ok(f.closed());
   assert.equal(f.trace.includes('issuer witnessed'),success);
-  assert.equal(f.trace.includes('issuer Complete'),success||['untrusted-issuer','foreign-issuer-witness','wrong-issuer-nonce','substituted-issuer-form','premature-sdk-complete'].includes(fault));
+  const issuerSent=success||fault.startsWith('late-issuer-response-');
+  assert.equal(f.trace.includes('issuer Complete'),issuerSent||['untrusted-issuer','foreign-issuer-witness','wrong-issuer-nonce','substituted-issuer-form','premature-sdk-complete'].includes(fault));
   if(fault==='premature-sdk-complete')assert.equal(f.providerSent.some(x=>x.endsWith('/challenge_complete')),false);
   if(fault.startsWith('late-source-'))assert.equal(f.providerSent.some(x=>x.endsWith('/3ds2/authenticate')),success);
   if(fault==='preexisting-issuer-challenge')assert.equal(f.providerSent.some(x=>x.endsWith('/3ds2/authenticate')),false);
-  assert.equal(f.providerSent.filter(x=>x.endsWith('/decision')).length,success?1:0);
+  assert.equal(f.providerSent.filter(x=>x.endsWith('/decision')).length,issuerSent?1:0);
  });
 }
 

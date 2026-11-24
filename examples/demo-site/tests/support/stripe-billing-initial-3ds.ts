@@ -86,7 +86,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
  let retrieve:Request|undefined,authenticate:Request|undefined,completed=false,finalRead=false,boundSource:string|undefined;
  let issuer:Frame|undefined,issuerRequest:Request|undefined,submission:Request|undefined,binding:ReturnType<typeof issuerBinding>|undefined;
  let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:Promise<void>}|undefined;
- const issuerReady=Promise.withResolvers<void>(),navigation=new WeakMap<Frame,number>();
+ const issuerReady=Promise.withResolvers<void>(),issuerDispatched=Promise.withResolvers<void>(),navigation=new WeakMap<Frame,number>();
  const revision=(frame:Frame)=>navigation.get(frame)??0;
  page.on('framenavigated',frame=>navigation.set(frame,revision(frame)+1));
  function stamped(chain:FrameSnapshot|undefined){
@@ -105,16 +105,22 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   }
   return {target,frames};
  }
- function issuerResponded(){
-  const response=submission?.existingResponse();if(!response)return false;
-  requireValue(response.request()===submission && response.url()===submission!.url() && !response.fromServiceWorker() && response.status()>=200 && response.status()<300);
+ async function issuerResponded(active:BillingLimits,maximum=1000){
+  const request=submission;
+  if(!request)return false;
+  const response=await originalResponse(request,active,maximum);
+  requireValue(response.status()>=200 && response.status()<300);
   return true;
+ }
+ async function originalResponse(request:Request,active:BillingLimits,maximum:number){
+  // Frame code can use a response before the Playwright client has observed it.
+  const response=request.existingResponse()??await billingBounded(active,()=>request.response(),maximum);
+  requireValue(response && response.request()===request && response.url()===request.url() && !response.fromServiceWorker());
+  return response;
  }
  async function verifiedBody(request:Request|undefined){
   requireValue(request);
-  // Frame code can use a response before the Playwright client has observed it.
-  const response=request.existingResponse()??await billingBounded(limits,()=>request.response(),1000);
-  requireValue(response && response.request()===request && response.url()===request.url() && !response.fromServiceWorker() && response.status()===200);
+  const response=await originalResponse(request,limits,1000);requireValue(response.status()===200);
   const bytes=await billingBounded(limits,()=>response.body());requireValue(bytes.length<=65536);
   return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)) as unknown;
  }
@@ -157,7 +163,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     report('BROWSER_CHALLENGE_API_PREFLIGHT');
     requireValue(!headers.authorization && !data && headers['access-control-request-method']===(isRetrieve?'GET':'POST') &&
      (isRetrieve && (!retrieve || arm && !finalRead) || path==='/v1/3ds2/authenticate' && retrieve && !authenticate ||
-      path==='/v1/3ds2/challenge_complete' && issuerResponded() && !completed));
+      path==='/v1/3ds2/challenge_complete' && await issuerResponded(limits) && !completed));
     await current();await forwardOriginal();return;
    }
    if(!isRetrieve && !boundSource){
@@ -171,10 +177,14 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    await current();
    report('BROWSER_CHALLENGE_API_ORDER');
    if(kind==='retrieve'){
-    if(retrieve){requireValue(issuerResponded() && !finalRead);finalRead=true;}else retrieve=request;
+    if(retrieve){
+     requireValue(await issuerResponded(limits));await current();
+     report('BROWSER_CHALLENGE_API_ORDER');
+     requireValue(!finalRead);finalRead=true;
+    }else retrieve=request;
    }else if(kind==='authenticate'){requireValue(!authenticate);authenticate=request;}
    else{
-    requireValue(issuerResponded());await current();
+    requireValue(await issuerResponded(limits));await current();
     report('BROWSER_CHALLENGE_API_ORDER');
     requireValue(!completed);completed=true;
    }
@@ -208,6 +218,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    requireValue(!submission);submission=request;
   }
   await forwardOriginal();
+  if(!api)issuerDispatched.resolve();
  }
  async function attend(){
   await billingBounded(limits,()=>issuerReady.promise,45000);
@@ -262,7 +273,11 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   arm=armed;
   await validate();await element.click({timeout:Math.min(5000,limits.deadline-Date.now()),noWaitAfter:true});
   // Acknowledgement requires the issuer's own 2xx response to the original trusted form submission.
-  await billingBounded(limits,async l=>{while(!issuerResponded()){billingCheck(l);await new Promise(r=>setTimeout(r,50));}},45000);
+  await billingBounded(limits,async l=>{
+   await issuerDispatched.promise;
+   billingCheck(l);
+   requireValue(await issuerResponded(l,45000));
+  },45000);
  }
  return {owns,forward,attend};
 }
