@@ -232,6 +232,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   let trustedRetry:JSHandle<()=>boolean>|undefined,trustedCreate:JSHandle<()=>boolean>|undefined;
   const successorAck=Promise.withResolvers<void>();
   const initialPresentationReady=Promise.withResolvers<void>();
+  const successorPresentationReady=Promise.withResolvers<void>();
   let originalManager:JSHandle<()=>boolean>|undefined;
   async function checkManager(){
    check();
@@ -298,12 +299,22 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    capability=value.capability as string;
   }
   let checkoutUrl='';
+  function acceptedSessionHeaders(kind:'initial-session'|'successor-session'){
+   const request=requests.get(kind),response=request?.existingResponse();
+   return !!request && response?.request()===request && response.url()===request.url() &&
+    response.status()===200 && !response.fromServiceWorker() && !request.redirectedFrom();
+  }
   const pinned=bound&&matchesStaticOrigin?pinnedRetryPresentation(page,()=>checkoutUrl,limits,()=>{
    if(firstAttempt && !successorId && confirmPosts===0)return 'initial';
    if(successorId && attemptId===successorId && confirmPosts===1)return 'successor';
    return undefined;
-  },()=>!payInFlight && confirmPosts===0,()=>!firstAttempt && selectPosts===1 && requests.has('initial-session')?
-   initialPresentationReady.promise:undefined):undefined;
+  },()=>!payInFlight && confirmPosts===0,kind=>{
+   if(!firstAttempt && selectPosts===1 && requests.has('initial-session') &&
+      (kind==='document' || retryPort && acceptedSessionHeaders('initial-session')))
+    return {phase:'initial',ready:initialPresentationReady.promise};
+   if(kind==='asset' && retryPort && successorId && attemptId!==successorId && confirmPosts===1 && acceptedSessionHeaders('successor-session'))
+    return {phase:'successor',ready:successorPresentationReady.promise};
+  },recordFailure):undefined;
   const winning=Promise.withResolvers<void>();
   const invalidate=()=>{recordFailure('BROWSER_INVALIDATED');abort();};
   const redirects=challenge||invoiceCase?await guardChallengeRedirects(page,invalidate,binding.endpoints):undefined;
@@ -319,8 +330,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    const request=route.request(),method=request.method(),navigation=request.isNavigationRequest();
    if(sca?.owns(url)){await sca.forward(route,url);return;}
    if(pinned && !providerNetworkOrigin(url) && !/(?:^|\.)stripe\.(?:com|network)$/.test(url.hostname) && matchesStaticOrigin!(url.origin)){
-    try{await pinned.forward(route,url);}catch(error){recordFailure('BROWSER_PINNED_PRESENTATION');throw error;}
-    return;
+    await pinned.forward(route,url);return;
    }
    need(providerNetworkOrigin(url) && !request.redirectedFrom() && ['GET','POST','OPTIONS'].includes(method));
    const script=stripeScriptOrigin(url),api=url.hostname==='api.stripe.com';
@@ -531,7 +541,10 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    const confirmed=page.waitForResponse(r=>r.url()===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-attempts/'+attemptId+'/confirm'&&r.request().method()==='POST',{timeout:duration(limits)});void confirmed.catch(()=>{});
    if(guarded)trustedPayClick=await trustedClick(pay);
    await checkManager();
-   while(pinned?.pending)await pinned.wait();
+   while(pinned?.pending){
+    await pinned.wait();
+    await checkManager();
+   }
    checkpoint='BROWSER_CONFIRM_WAIT';
    check();tokenRequest=undefined;payInFlight=true;
    await pay.click({timeout:duration(limits)});const confirmResponse=await confirmed;payInFlight=false;
@@ -560,6 +573,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    need(await retryPort.acknowledgeRetry({attemptId:firstAttempt,successorAttemptId:successorId})===true);check();successorAck.resolve();
    const session=await nextSession;paired('successor-session',session);need(session.status()===200);
    sessionContext(await body(session,limits),true);check();attemptId=successorId;
+   successorPresentationReady.resolve();
    const observed=await payOnce('4242424242424242');
    need(observed.state==='OBSERVE' && observed.retry_allowed===false);
    need(await retryPort.acknowledgeSuccessor({attemptId,state:'OBSERVE',nextActionAllowed:false})===true);check();

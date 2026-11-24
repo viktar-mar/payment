@@ -58,20 +58,31 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   capability:'bca2_'+(id===attempt?'C':'D').repeat(43),client_secret:'pi_original_secret_fixture',expires_at:boundary});
  const receiptFor=(id:string,state:string,retry_allowed:boolean,successor_attempt_id:string|null)=>({protocol:'SERVER_CONFIRM_V2',attempt_id:id,state,retry_allowed,successor_attempt_id,expires_at:boundary});
  let payCount=0,retryClicked=false,nonce=30,staticProbed=false,sessionErrorBodyReads=0;
+ let pinnedFrameChanged=false;
  let requestFailed=(request:Request)=>{void request;};
  const presentation:string[]=[];
  async function staticPresentation(){
-  const document=fault!=='static-image' && fault!=='early-static-image';
+  const document=!fault.startsWith('static-image') && !fault.startsWith('early-static-image') && !fault.startsWith('successor-static-image');
   const nested={parentFrame:()=>stripeFrame,page:()=>page,isDetached:()=>false,url:()=>''};
-  const request={url:()=>document?'https://private.example/presentation?frame=1':'https://private.example/image.png',method:()=>'GET',
-   frame:()=>document?nested:stripeFrame,resourceType:()=>document?'document':'image',isNavigationRequest:()=>document,
-   postData:()=>null,redirectedFrom:()=>null,allHeaders:async()=>({}),failure:()=>({errorText:'net::ERR_BLOCKED_BY_CLIENT'})} as unknown as Request;
+  const request={url:()=>document?'https://private.example/presentation?frame=1':
+    'https://private.example/image.png'+(fault==='static-image-query'?'?value=private-canary':''),
+   method:()=>fault==='static-method'?'POST':'GET',
+   frame:()=>fault==='static-main-navigation'?frame:document?nested:stripeFrame,
+   resourceType:()=>{
+    if(fault==='static-image-frame-before-fetch')queueMicrotask(()=>{pinnedFrameChanged=true;});
+    return document?'document':fault==='static-image-kind'?'xhr':'image';
+   },isNavigationRequest:()=>document,
+   postData:()=>null,redirectedFrom:()=>null,
+   allHeaders:async()=>fault==='static-credentials'?{cookie:'private-canary'}:fault==='static-image-cors'?{origin:'https://js.stripe.com'}:{},
+   failure:()=>({errorText:'net::ERR_BLOCKED_BY_CLIENT'})} as unknown as Request;
+  if(fault.startsWith('early-static-image')||fault.startsWith('successor-static-image'))trace.push('pinned asset intercepted');
   await handler({request:()=>request,abort:async(reason:string)=>{
    presentation.push('abort '+reason);if(reason==='blockedbyclient')requestFailed(fault==='static-foreign-event'?{...request} as Request:request);
   },fulfill:async(reply:{status:number})=>{presentation.push('fulfilled '+reply.status);}} as unknown as Route);
  }
  const frame = {name:()=>'',page:()=>page,isDetached:()=>false,url:()=>documentUrl};
- const stripeFrame = {name:()=>'stripe',page:()=>page,isDetached:()=>verified&&fault==='detached',url:()=>verified&&fault==='wrong-parent'?'https://unowned.invalid/':'https://js.stripe.com/v3/frame.html',parentFrame:()=>frame};
+ const stripeFrame = {name:()=>'stripe',page:()=>page,isDetached:()=>verified&&fault==='detached',
+  url:()=>verified&&fault==='wrong-parent'?'https://unowned.invalid/':pinnedFrameChanged?'https://js.stripe.com/v3/replaced.html':'https://js.stripe.com/v3/frame.html',parentFrame:()=>frame};
  const providerSent:string[]=[];
  let releaseFirstToken:undefined|(()=>void),delayedToken:Promise<void>|undefined;
  const delayedHeaders=Promise.withResolvers<void>();
@@ -86,7 +97,9 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const navigate=(frame:unknown)=>{for(const listener of navigationListeners)listener(frame);};
  const waiters = new Set<{predicate:(r:Response)=>boolean;resolve:(r:Response)=>void;reject:(e:Error)=>void}>();
  function publish(request:Request, status:number, json:object|null) {
-  const earlyStatic=declineRetry && fault.startsWith('early-static') && request.url()===select;
+  const earlyInitial=fault.startsWith('early-static')&&request.url()===select;
+  const earlySuccessor=fault.startsWith('successor-static-image')&&request.url().endsWith('/client-session');
+  const earlyStatic=declineRetry&&(earlyInitial||earlySuccessor);
   const bodyAvailable=earlyStatic?Promise.withResolvers<void>():undefined;
   const response = {request:()=>request,url:()=>request.url(),status:()=>status,fromServiceWorker:()=>false,body:async()=>{
    if(request.url()===select && status!==200){
@@ -95,6 +108,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     await sessionFailure?.holdBody?.();
    }
    await bodyAvailable?.promise;
+   if(earlyStatic)trace.push(earlyInitial?'initial session body read':'successor session body read');
    return Buffer.from(JSON.stringify(json));
   },headerValue:async(name:string)=>{
    if(name==='content-type')return sessionFailure?.contentType??null;
@@ -105,9 +119,10 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   if(bodyAvailable){
    // The page got its session response. The observer's independent body read
    // can still be pending when the browser requests the first Stripe asset.
-   void staticPresentation().catch(()=>{});
+   queueMicrotask(()=>void staticPresentation().catch(()=>{}));
    setImmediate(()=>{
     if(fault==='early-static-navigation')navigate(frame);
+    if(fault==='early-static-image-frame-changed')pinnedFrameChanged=true;
     bodyAvailable.resolve();
    });
   }
@@ -230,7 +245,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const route = {request:()=>request,continue:async(...args:unknown[])=>{
    assert.deepEqual(args,[]);sent.push(request.url());await reply(label,status);
    if(url===select && fault==='initial-session-no-response')return;
-   existing=publish((schedulePost&&fault==='foreign-request'||url===retry&&fault==='wrong-retry-response'||url===select&&fault==='initial-session-unpaired')?{...request} as Request:request,status,result);
+   existing=publish((schedulePost&&fault==='foreign-request'||url===retry&&fault==='wrong-retry-response'||
+    url===select&&['initial-session-unpaired','early-static-image-unpaired'].includes(fault))?{...request} as Request:request,status,result);
   },abort:async()=>{}} as unknown as Route;
   await handler(route);
   if(closed)throw new Error('closed');
@@ -262,7 +278,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      await send(base,{price_id:b.priceId,recurring_consent:true},{subscription_id:sub,operation_id:create,status:directAction?'REQUIRES_ACTION':'PROCESSING',
       action_available:directAction,next_action:directAction?{kind:'PROVIDER_CLIENT',secret:'bga1_'+'G'.repeat(43),expires_at:boundary}:null,browser_confirm_allowed:false});
      const session=sessionFor(attempt!);
-     if(fault==='early-static-invalid-session')session.capability='invalid';
+     if(fault.startsWith('early-static')&&fault.endsWith('-invalid-session'))session.capability='invalid';
     const prepare = async()=>{
      if(declineRetry){
       if(fault==='initial-operation-missing' || fault==='initial-page-closed' || directAction)return;
@@ -282,7 +298,9 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
       if(currentStatus!==200 || actionStatus!==200 || ['initial-session-not-sent','initial-foreign-action','initial-foreign-authority','initial-ambiguous-action','initial-too-many-reads','initial-read-headers-pending'].includes(fault))return;
      }
      const actionToken='bga1_'+'G'.repeat(fault==='initial-session-guard'?42:43);
-     await send(select,{action_token:actionToken},sessionFailure?.problem??session,sessionFailure?.status??(fault.startsWith('session-http')?409:200));
+     if(fault==='early-static-image-before-session')await staticPresentation();
+     const status=fault.startsWith('session-http')||fault==='early-static-image-http-conflict'?409:200;
+     await send(select,{action_token:actionToken},sessionFailure?.problem??session,sessionFailure?.status??status);
     };
     void prepare().catch(()=>{});
     }
@@ -316,7 +334,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      retryClicked=true;
      await send(retry,{},receiptFor(attempt!,'DECLINED',false,fault==='same-successor'?attempt!:successor),200);
      if(fault==='repeat-retry')await send(retry,{},receiptFor(attempt!,'DECLINED',false,successor),200);
-     void send(nextConfirm.replace(/confirm$/,'client-session'),{}, {...sessionFor(successor),...(fault==='different-pi'?{client_secret:'pi_foreign_secret_fixture'}:{})},200).catch(()=>{});
+     void send(nextConfirm.replace(/confirm$/,'client-session'),{}, {...sessionFor(successor),...(['different-pi','successor-static-image-invalid-session'].includes(fault)?{client_secret:'pi_foreign_secret_fixture'}:{})},200).catch(()=>{});
     }
     if(name==='Refresh status' && ack){
      if(fault==='lost-authority')manager.state.authorityRevision++;
@@ -487,12 +505,74 @@ test('an invalid original session cannot release a staged Stripe document',async
  assert.deepEqual(f.presentation,['abort failed']);
  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
 });
-test('a pinned subresource cannot start transport before the original session is validated',async t=>{
- const f=cancellationPage('early-static-image',true);
+for(const [phase,mode,previousPay] of [['initial','early-static-image',[]],['successor','successor-static-image',['Pay']]] as const)
+test('an early pinned image waits for the '+phase+' session before any asset transport or its Pay',async t=>{
+ const f=cancellationPage(mode,true);
+ const fetch=t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
+  const bodyRead=phase+' session body read';
+  assert.deepEqual(f.trace.filter(step=>['pinned asset intercepted',bodyRead,'Pay'].includes(step)),
+   [...previousPay,'pinned asset intercepted',bodyRead]);
+  assert.equal(options.method,'GET');
+  assert.equal(options.redirect,'error');
+  assert.equal(options.credentials,'omit');
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(f.trace.filter(step=>step==='Pay').length,previousPay.length);
+  return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+ });
+ assert.equal(await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),true);
+ assert.equal(fetch.mock.callCount(),1);
+ assert.deepEqual(f.presentation,['fulfilled 200']);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
+});
+test('an early pinned subresource performs no transport when the owned session is invalid',async t=>{
+ const f=cancellationPage('early-static-image-invalid-session',true);
  const fetch=t.mock.method(globalThis,'fetch',async()=>assert.fail('early pinned asset must not be fetched'));
- await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'));
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_INITIAL_SESSION_WIRE');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
  assert.equal(fetch.mock.callCount(),0);
  assert.deepEqual(f.presentation,['abort failed']);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [fault,expected] of [
+ ['early-static-image-before-session','BROWSER_PINNED_PHASE'],
+ ['early-static-image-unpaired','BROWSER_SESSION_UNPAIRED'],
+ ['early-static-image-http-conflict','BROWSER_SESSION_HTTP_CONFLICT'],
+ ['early-static-image-frame-changed','BROWSER_PINNED_FRAME'],
+] as const)test('an early pinned asset stays closed at '+fault,async t=>{
+ const f=cancellationPage(fault,true);
+ const fetch=t.mock.method(globalThis,'fetch',async()=>assert.fail('unverified image must not be fetched'));
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),expected);
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(fetch.mock.callCount(),0);
+ assert.ok(!f.trace.includes('Pay'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('a staged pinned asset cannot leave after successor validation rejects a different intent',async t=>{
+ const f=cancellationPage('successor-static-image-invalid-session',true);
+ const fetch=t.mock.method(globalThis,'fetch',async()=>assert.fail('unverified successor asset'));
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'));
+ assert.deepEqual(f.presentation,['abort failed']);
+ assert.equal(fetch.mock.callCount(),0);
+ assert.equal(f.trace.filter(step=>step==='Pay').length,1);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+});
+test('Pay is refused when manager authority changes during the pinned asset wait',async t=>{
+ const f=cancellationPage('early-static-image',true);
+ const fetch=t.mock.method(globalThis,'fetch',async()=>{
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  f.retire();
+  return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+ });
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'));
+ assert.equal(fetch.mock.callCount(),1);
+ assert.deepEqual(f.presentation,['fulfilled 200']);
+ assert.ok(!f.trace.includes('Pay'));
  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
 });
 for(const [fault,expected,closed] of [
@@ -626,12 +706,60 @@ for(const mode of ['static-block','static-image','static-duplicate','static-fore
   });
   const accepted=mode==='static-block'||mode==='static-image';
   const result=runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+(accepted?1500:300)},o=>o==='https://private.example');
-  if(accepted)assert.equal(await result,true);else await assert.rejects(result);
+  if(accepted)assert.equal(await result,true);else await assert.rejects(result,error=>{
+   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),mode==='static-duplicate'?'BROWSER_PINNED_DOCUMENT_POLICY':'BROWSER_PINNED_DOCUMENT_BLOCK');
+   return true;
+  });
   assert.equal(f.sent.filter(u=>u.endsWith('/confirm')).length,accepted?2:0);
   assert.equal(asset.mock.callCount(),mode==='static-image'?1:0);
   assert.ok(f.presentation.includes(mode==='static-image'?'fulfilled 200':'abort blockedbyclient'));
  });
 }
+
+for(const [fault,code] of [
+ ['static-main-navigation','BROWSER_PINNED_FRAME'],
+ ['static-credentials','BROWSER_PINNED_CREDENTIALS'],
+ ['static-method','BROWSER_PINNED_METHOD'],
+ ['static-image-query','BROWSER_PINNED_ASSET_URL'],
+ ['static-image-kind','BROWSER_PINNED_ASSET_KIND'],
+ ['static-image-frame-before-fetch','BROWSER_PINNED_FRAME'],
+] as const)test('decline retry reports the pinned request failure for '+fault,async t=>{
+ const f=cancellationPage(fault,true);
+ const asset=t.mock.method(globalThis,'fetch',async()=>assert.fail('unowned asset transport'));
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(asset.mock.callCount(),0);
+ assert.ok(!f.trace.includes('Pay'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [fault,code] of [
+ ['static-image-transport','BROWSER_PINNED_ASSET_TRANSPORT'],
+ ['static-image-response','BROWSER_PINNED_ASSET_STATUS'],
+ ['static-image-media','BROWSER_PINNED_ASSET_MEDIA'],
+ ['static-image-cors','BROWSER_PINNED_ASSET_CORS'],
+ ['static-image-empty','BROWSER_PINNED_ASSET_BODY'],
+] as const)test('decline retry reports the pinned response failure for '+fault,async t=>{
+ const f=cancellationPage(fault,true);
+ const asset=t.mock.method(globalThis,'fetch',async()=>{
+  if(fault==='static-image-transport')throw Error('private canary');
+  const bytes=fault==='static-image-empty'?new Uint8Array():new Uint8Array([1]);
+  return new globalThis.Response(bytes,{status:fault==='static-image-response'?403:200,
+   headers:{'content-type':fault==='static-image-media'?'text/html':'image/png'}});
+ });
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(asset.mock.callCount(),1);
+ assert.ok(!f.trace.includes('Pay'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
 
 test('a token intercepted on the first Pay cannot use the successor gesture after its headers arrive',async()=>{
  const f=cancellationPage('late-first-token',true);

@@ -59,17 +59,26 @@ export function sameStripeFrames(before:NonNullable<ReturnType<typeof stripeFram
   return after && after.length===before.length &&
     after.every(({frame,href},i)=>frame===before[i]!.frame && href===before[i]!.href);
 }
-export async function fetchStaticAsset(url:URL,media:string[],origin:string|undefined,signal:AbortSignal) {
+type StaticAssetCheck='STATUS'|'MEDIA'|'CORS'|'BODY';
+export async function fetchStaticAsset(url:URL,media:string[],origin:string|undefined,signal:AbortSignal,
+ checkpoint?:(check:StaticAssetCheck)=>void) {
   const controller=new AbortController();
   try {
     const response=await fetch(url,{method:'GET',redirect:'error',credentials:'omit',referrerPolicy:'no-referrer',
       headers:origin?{Origin:origin}:undefined,signal:AbortSignal.any([signal,controller.signal])});
+    checkpoint?.('STATUS');
+    need(response.status===200 && !response.redirected);
+    checkpoint?.('MEDIA');
     const type=response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase();
-    need(response.status===200 && !response.redirected && type && media.includes(type) && response.body);
+    need(type && media.includes(type));
+    checkpoint?.('BODY');
+    need(response.body);
     // Playwright can add CORS headers on fulfill when ACAO is absent.
     // Never fulfill a CORS request the upstream response did not authorize.
+    checkpoint?.('CORS');
     const allowedOrigin=response.headers.get('access-control-allow-origin');
     need(!origin || allowedOrigin===origin || allowedOrigin==='*');
+    checkpoint?.('BODY');
     const maxBytes=1024*1024;
     const reader=response.body.getReader(),chunks:Uint8Array[]=[];
     let size=0;
@@ -89,65 +98,108 @@ export async function fetchStaticAsset(url:URL,media:string[],origin:string|unde
   } finally {controller.abort();}
 }
 
+type PresentationPhase='initial'|'successor';
+type PendingPresentation={phase:PresentationPhase;ready:Promise<void>};
+
 /** The one local block can only occur on the first form, before its Pay gesture. */
 export function pinnedRetryPresentation(page:Page,checkout:()=>string,limits:BillingLimits,
- form:()=>'initial'|'successor'|undefined,beforePay:()=>boolean,initialReady?:()=>Promise<void>|undefined){
- const documents=new Set<Promise<void>>();
+ form:()=>PresentationPhase|undefined,beforePay:()=>boolean,
+ pendingForm:(kind:'document'|'asset')=>PendingPresentation|undefined,onFailure:(code:string)=>void){
+ const pending=new Set<Promise<void>>();
  let used=false,block:{request:Request;confirm:()=>void}|undefined;
  page.on('requestfailed',request=>{
   if(block && request===block.request && form()==='initial' && beforePay() &&
     request.failure()?.errorText==='net::ERR_BLOCKED_BY_CLIENT')block.confirm();
  });
- async function handle(route:Route,url:URL){
+ async function handle(route:Route,url:URL,checkpoint:(code:string)=>void){
   const request=route.request(),phaseAtRequest=form(),raw=request.url();
   const navigation=request.isNavigationRequest();
-  const pendingInitial=phaseAtRequest===undefined && navigation && request.resourceType()==='document'
-   ?initialReady?.():undefined;
-  need((phaseAtRequest || pendingInitial) && request.method()==='GET' && request.postData()===null && plainHttpsAuthority.test(raw) &&
-   url.protocol==='https:' && !url.username && !url.password && !url.port && !request.redirectedFrom());
+  checkpoint('BROWSER_PINNED_PHASE');
+  const staged=phaseAtRequest===undefined && (!navigation || request.resourceType()==='document')
+   ?pendingForm(navigation?'document':'asset'):undefined;
+  const phase=phaseAtRequest??staged?.phase;
+  need(phase);
+  checkpoint('BROWSER_PINNED_METHOD');need(request.method()==='GET');
+  checkpoint('BROWSER_PINNED_BODY');need(request.postData()===null);
+  checkpoint('BROWSER_PINNED_AUTHORITY');
+  need(plainHttpsAuthority.test(raw) && url.protocol==='https:' && !url.username && !url.password && !url.port);
+  checkpoint('BROWSER_PINNED_REDIRECT');need(!request.redirectedFrom());
+  checkpoint('BROWSER_PINNED_FRAME');
   const originalNavigation=navigation?stripeNavigationChain(request,page,checkout()):undefined;
   const frames=navigation?undefined:stripeFrameChain(page,()=>request.frame());
   need(navigation?originalNavigation:frames);
+  checkpoint('BROWSER_PINNED_HEADERS');
   const headers=await request.allHeaders();
-  billingCheck(limits);need(page.mainFrame().url()===checkout() &&
-   !Object.keys(headers).some(key=>['authorization','proxy-authorization','cookie'].includes(key.toLowerCase())));
+  checkpoint('BROWSER_PINNED_CURRENT');
+  billingCheck(limits);need(page.mainFrame().url()===checkout());
+  checkpoint('BROWSER_PINNED_CREDENTIALS');
+  need(!Object.keys(headers).some(key=>['authorization','proxy-authorization','cookie'].includes(key.toLowerCase())));
   // The SDK can mount after receiving the session while the independent
   // response-body read is still pending. Do not relay or block until that
   // exact session has passed validation. Retain the pre-wait frame snapshot.
-  if(pendingInitial)await billingBounded(limits,()=>pendingInitial);
-  const phase=phaseAtRequest??'initial';
+  if(staged){
+   checkpoint('BROWSER_PINNED_SESSION');
+   await billingBounded(limits,()=>staged.ready);
+  }
+  checkpoint('BROWSER_PINNED_CURRENT');
   billingCheck(limits);need(form()===phase && page.mainFrame().url()===checkout());
   if(navigation){
+   checkpoint('BROWSER_PINNED_DOCUMENT_POLICY');
    need(phase==='initial' && beforePay() && !used && request.resourceType()==='document' && originalNavigation);
-   const current=stripeNavigationChain(request,page,checkout());
-   need(current && current.main===originalNavigation.main && current.target===originalNavigation.target &&
-    sameStripeFrames(originalNavigation.parents,current.parents));
    used=true;
-   const event=Promise.withResolvers<void>();block={request,confirm:event.resolve};
+   const event=Promise.withResolvers<void>();
+   checkpoint('BROWSER_PINNED_DOCUMENT_BLOCK');
    try{
-    await billingBounded(limits,()=>Promise.all([route.abort('blockedbyclient'),event.promise]),Infinity);
+    await billingBounded(limits,()=>{
+     checkpoint('BROWSER_PINNED_CURRENT');
+     need(form()==='initial' && beforePay());
+     checkpoint('BROWSER_PINNED_FRAME');
+     const current=stripeNavigationChain(request,page,checkout());
+     need(current && current.main===originalNavigation.main && current.target===originalNavigation.target &&
+      sameStripeFrames(originalNavigation.parents,current.parents));
+     checkpoint('BROWSER_PINNED_DOCUMENT_BLOCK');
+     block={request,confirm:event.resolve};
+     return Promise.all([route.abort('blockedbyclient'),event.promise]);
+    },Infinity);
     need(page.mainFrame()===originalNavigation.main && page.mainFrame().url()===checkout() && form()==='initial' && beforePay());
    }finally{block=undefined;}
    return;
   }
-  need(url.href===url.origin+url.pathname && frames && (!('origin' in headers)||headers.origin===new URL(frames[0]!.href).origin));
-  const asset=staticAssets.find(a=>a.resource===request.resourceType() && url.pathname.endsWith(a.suffix));
+  checkpoint('BROWSER_PINNED_ASSET_URL');need(url.href===url.origin+url.pathname);
+  checkpoint('BROWSER_PINNED_FRAME');need(frames);
+  checkpoint('BROWSER_PINNED_ASSET_ORIGIN');need(!('origin' in headers)||headers.origin===new URL(frames[0]!.href).origin);
+  const resource=request.resourceType();
+  checkpoint('BROWSER_PINNED_ASSET_KIND');need(staticAssets.some(a=>a.resource===resource));
+  const asset=staticAssets.find(a=>a.resource===resource && url.pathname.endsWith(a.suffix));
+  checkpoint('BROWSER_PINNED_ASSET_SUFFIX');
   need(asset);
-  const checkFrames=()=>{billingCheck(limits);need(form()===phase && page.mainFrame().url()===checkout() &&
-   sameStripeFrames(frames,stripeFrameChain(page,()=>request.frame())));};
-  checkFrames();
+  const checkFrames=()=>{
+   checkpoint('BROWSER_PINNED_CURRENT');
+   billingCheck(limits);need(form()===phase && page.mainFrame().url()===checkout());
+   checkpoint('BROWSER_PINNED_FRAME');
+   need(sameStripeFrames(frames,stripeFrameChain(page,()=>request.frame())));
+  };
+  checkpoint('BROWSER_PINNED_ASSET_TRANSPORT');
   await billingBounded(limits,async bounded=>{
-   const reply=await fetchStaticAsset(url,asset.media,headers.origin,bounded.signal!);
-   billingCheck(bounded);checkFrames();await route.fulfill({...reply,status:200});
+   checkFrames();
+   checkpoint('BROWSER_PINNED_ASSET_TRANSPORT');
+   const reply=await fetchStaticAsset(url,asset.media,headers.origin,bounded.signal!,step=>checkpoint('BROWSER_PINNED_ASSET_'+step));
+   billingCheck(bounded);checkFrames();
+   checkpoint('BROWSER_PINNED_ASSET_FULFILL');
+   await route.fulfill({...reply,status:200});
   });
  }
  return {
   async forward(route:Route,url:URL){
-   const navigation=route.request().isNavigationRequest(),work=handle(route,url);
-   if(navigation)documents.add(work);
-   try{await work;}finally{documents.delete(work);}
+   let code='BROWSER_PINNED_PRESENTATION';
+   const work=handle(route,url,next=>{code=next;}).catch(error=>{
+    onFailure(code);
+    throw error;
+   });
+   pending.add(work);
+   try{await work;}finally{pending.delete(work);}
   },
-  get pending(){return documents.size;},
-  wait:()=>billingBounded(limits,()=>Promise.all([...documents]),Infinity),
+  get pending(){return pending.size;},
+  wait:()=>billingBounded(limits,()=>Promise.all([...pending]),Infinity),
  };
 }
