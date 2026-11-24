@@ -18,6 +18,23 @@ test('only the authenticated original test PI fingerprint supplies the challenge
   {next_action:{type:'redirect_to_url'}},{next_action:{type:'use_stripe_sdk',use_stripe_sdk:{type:'stripe_3ds2_fingerprint'}}}])
   assert.throws(()=>challengeSource({...intent,...changed},secret));
 });
+test('binds an opaque Stripe source to both SDK requests without guessing its prefix',()=>{
+ const action=intent.next_action;
+ const withSource=(value:unknown)=>({...intent,next_action:{...action,
+  use_stripe_sdk:{...action.use_stripe_sdk,three_d_secure_2_source:value}}});
+ const opaque='fingerprint_fixture-v2';
+ const bound=challengeSource(withSource(opaque),secret);
+ assert.equal(bound,opaque);
+ for(const [endpoint,kind] of [['authenticate','authenticate'],['challenge_complete','complete']]){
+  const route=new URL('https://api.stripe.com/v1/3ds2/'+endpoint);
+  const body=(source:string)=>new URLSearchParams({source,key}).toString();
+  assert.equal(challengeApiRequest(route,'POST',body(opaque),key,secret,bound),kind);
+  assert.throws(()=>challengeApiRequest(route,'POST',body('fingerprint_other'),key,secret,bound));
+  assert.throws(()=>challengeApiRequest(route,'POST',body(opaque)+'&source='+opaque,key,secret,bound));
+ }
+ for(const invalid of ['',42,{},'fingerprint/fixture','fingerprint\n','fingerprint&key=other','a'.repeat(205)])
+  assert.throws(()=>challengeSource(withSource(invalid),secret));
+});
 test('a rejected challenge source reports only the first fixed field category',()=>{
  const action=intent.next_action,sdk=action.use_stripe_sdk;
  const withSdk=(value:unknown)=>({...intent,next_action:{...action,use_stripe_sdk:value}});
@@ -35,7 +52,10 @@ test('a rejected challenge source reports only the first fixed field category',(
   [withSdk({...sdk,type:'stripe_3ds2_challenge'}), 'SDK_CHALLENGE'],
   [withSdk({...sdk,type:'private_sdk_type'}), 'SDK_TYPE'],
   [withSdk({...sdk,three_d_secure_2_source:undefined}), 'VALUE_MISSING'],
-  [withSdk({...sdk,three_d_secure_2_source:'private_value'}), 'VALUE_INVALID'],
+  [withSdk({...sdk,three_d_secure_2_source:{token:'private_value'}}), 'VALUE_TYPE'],
+  [withSdk({...sdk,three_d_secure_2_source:''}), 'VALUE_LENGTH'],
+  [withSdk({...sdk,three_d_secure_2_source:'x'.repeat(205)}), 'VALUE_LENGTH'],
+  [withSdk({...sdk,three_d_secure_2_source:'private/value'}), 'VALUE_ALPHABET'],
  ];
  for(const [value,phase] of cases){
   let checkpoint:string|undefined;

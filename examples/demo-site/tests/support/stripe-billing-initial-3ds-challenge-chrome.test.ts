@@ -9,7 +9,7 @@ import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts'
 for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response'])
 test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
- const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='src_fixture',api='https://api.stripe.com';
+ const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
  const retrieve=api+'/v1/payment_intents/pi_fixture?client_secret='+secret+'&key='+key;
  const authenticate=api+'/v1/3ds2/authenticate',complete=api+'/v1/3ds2/challenge_complete';
  const outer=stripe+'/v3/three-ds-2-challenge-fixture.html',inner=stripe+'/v3/fixture-inner.html';

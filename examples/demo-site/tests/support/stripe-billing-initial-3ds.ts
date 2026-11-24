@@ -32,8 +32,15 @@ export function challengeSource(raw:unknown,secret:string,report?:(code:string)=
  report?.(sdk.type==='stripe_3ds2_challenge'?'BROWSER_CHALLENGE_SOURCE_WIRE_SDK_CHALLENGE':'BROWSER_CHALLENGE_SOURCE_WIRE_SDK_TYPE');
  requireValue(sdk.type==='stripe_3ds2_fingerprint');
  const source=sdk.three_d_secure_2_source;
- report?.(source===undefined||source===null?'BROWSER_CHALLENGE_SOURCE_WIRE_VALUE_MISSING':'BROWSER_CHALLENGE_SOURCE_WIRE_VALUE_INVALID');
- requireValue(typeof source==='string' && /^src_[A-Za-z0-9]{1,200}$/.test(source));
+ report?.('BROWSER_CHALLENGE_SOURCE_WIRE_VALUE_MISSING');
+ requireValue(source!==undefined && source!==null);
+ report?.('BROWSER_CHALLENGE_SOURCE_WIRE_VALUE_TYPE');
+ requireValue(typeof source==='string');
+ report?.('BROWSER_CHALLENGE_SOURCE_WIRE_VALUE_LENGTH');
+ requireValue(source.length>0 && source.length<=204);
+ // Stripe.js owns the token format. Trust only the exact value in this owned response.
+ report?.('BROWSER_CHALLENGE_SOURCE_WIRE_VALUE_ALPHABET');
+ requireValue(!/[^A-Za-z0-9_-]/.test(source));
  return source;
 }
 export function issuerBinding(raw:unknown){
