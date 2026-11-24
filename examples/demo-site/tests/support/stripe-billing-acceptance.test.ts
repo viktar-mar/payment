@@ -128,6 +128,12 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    }
    await bodyAvailable?.promise;
    if(earlyStatic)trace.push(earlyInitial?'initial session body read':'successor session body read');
+   if(request.url()===select){
+    if(fault==='initial-session-wire-read')throw Error('private response read canary');
+    if(fault==='initial-session-wire-size')return Buffer.alloc(65537);
+    if(fault==='initial-session-wire-json')return Buffer.from('private syntax canary');
+    if(fault==='initial-session-wire-object')return Buffer.from('null');
+   }
    return Buffer.from(JSON.stringify(json));
   },headerValue:async(name:string)=>{
    if(name==='content-type')return sessionFailure?.contentType??null;
@@ -305,6 +311,12 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
       action_available:directAction,next_action:directAction?{kind:'PROVIDER_CLIENT',secret:'bga1_'+'G'.repeat(43),expires_at:boundary}:null,browser_confirm_allowed:false});
      const session=sessionFor(attempt!);
      if(fault.startsWith('early-static')&&fault.endsWith('-invalid-session'))session.capability='invalid';
+     if(fault==='initial-session-wire-protocol')session.protocol='BROWSER_CONFIRM_V1';
+     if(fault==='initial-session-wire-attempt')session.attempt_id='private attempt canary';
+     if(fault==='initial-session-wire-fields')Object.assign(session,{extra:'private field canary'});
+     if(fault==='initial-session-wire-expiry')session.expires_at='2000-01-01T00:00:00Z';
+     if(fault==='initial-session-wire-key')session.publishable_key='pk_live_fixture';
+     if(fault==='initial-session-wire-intent')session.client_secret='private intent canary';
     const prepare = async()=>{
      if(declineRetry){
       if(fault==='initial-operation-missing' || fault==='initial-page-closed' || directAction)return;
@@ -618,7 +630,7 @@ test('an early pinned subresource performs no transport when the owned session i
  const f=cancellationPage('early-static-image-invalid-session',true);
  const fetch=t.mock.method(globalThis,'fetch',async()=>assert.fail('early pinned asset must not be fetched'));
  await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),error=>{
-  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_INITIAL_SESSION_WIRE');
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_INITIAL_SESSION_WIRE_CAPABILITY');
   assert.equal(browserCleanupConfirmed(error),true);
   return true;
  });
@@ -681,7 +693,7 @@ test('Pay is refused when manager authority changes during the pinned asset wait
 });
 for(const [fault,expected,closed] of [
  ['session-http','BROWSER_SESSION_HTTP_CONFLICT',true],
- ['early-static-invalid-session','BROWSER_INITIAL_SESSION_WIRE',true],
+ ['early-static-invalid-session','BROWSER_INITIAL_SESSION_WIRE_CAPABILITY',true],
  ['session-http-close-fails','BROWSER_SESSION_HTTP_CONFLICT',false],
  ['early-static-navigation','BROWSER_INVALIDATED',true],
 ] as const)test('decline retry reports only the original safe session boundary for '+fault,async()=>{
@@ -694,6 +706,19 @@ for(const [fault,expected,closed] of [
  });
  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
 });
+for(const part of ['read','size','json','object','protocol','attempt','fields','expiry','key','intent']){
+ test('decline retry reports the original session wire checkpoint for '+part,async()=>{
+  const f=cancellationPage('initial-session-wire-'+part,true);
+  await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_INITIAL_SESSION_WIRE_'+part.toUpperCase());
+   assert.equal(String(error),'Error: billing_BROWSER');
+   assert.equal(browserCleanupConfirmed(error),true);
+   return true;
+  });
+  assert.ok(!f.trace.includes('Pay'));
+  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+ });
+}
 const conflictProblem=(code:string)=>({type:'urn:payment:problem:'+code,code,status:409,title:'private diagnostic canary'});
 const conflictReply=(code:string):SessionFailure=>({status:409,contentType:'application/problem+json; charset=utf-8',problem:conflictProblem(code)});
 const providerConflict=conflictReply('PROVIDER_EVIDENCE_MISMATCH');

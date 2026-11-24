@@ -21,7 +21,15 @@ const uuid=(v:unknown):v is string=>typeof v==='string'&&/^[0-9a-f]{8}-[0-9a-f]{
 const object=(v:unknown):v is Record<string,unknown>=>!!v&&typeof v==='object'&&!Array.isArray(v);
 const exact=(v:unknown,keys:string[]):v is Record<string,unknown>=>object(v)&&Object.keys(v).sort().join(',')===[...keys].sort().join(',');
 const duration=(l:BillingLimits)=>{billingCheck(l);return Math.min(45000,l.deadline-Date.now());};
-async function body(response:Response,l:BillingLimits):Promise<Record<string,unknown>>{const bytes=await billingBounded(l,()=>response.body());need(bytes.length<=65536);const v:unknown=JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(bytes));need(object(v));return v as Record<string,unknown>;}
+type BodyCheckpoint='READ'|'SIZE'|'JSON'|'OBJECT';
+type SessionWireCheckpoint=BodyCheckpoint|'PROTOCOL'|'ATTEMPT'|'FIELDS'|'EXPIRY'|'KEY'|'CAPABILITY'|'INTENT';
+async function body(response:Response,l:BillingLimits,checkpoint?:(step:BodyCheckpoint)=>void):Promise<Record<string,unknown>>{
+ checkpoint?.('READ');const bytes=await billingBounded(l,()=>response.body());
+ checkpoint?.('SIZE');need(bytes.length<=65536);
+ checkpoint?.('JSON');const value:unknown=JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(bytes));
+ checkpoint?.('OBJECT');need(object(value));
+ return value as Record<string,unknown>;
+}
 
 function initialSessionStatus(status:number):string{
  switch(status){
@@ -287,13 +295,13 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     return ()=>clicked;
    });
   }
-  function sessionContext(value:Record<string,unknown>,successor:boolean){
-   need(exact(value,['protocol','provider','flow','publishable_key','client_secret','attempt_id','capability','expires_at']) &&
-    value.protocol==='SERVER_CONFIRM_V2' && value.provider==='stripe' && value.flow==='PAYMENT' &&
-    typeof value.expires_at==='string' && Date.parse(value.expires_at)>Date.now() &&
-    typeof value.publishable_key==='string' && /^pk_test_[A-Za-z0-9_]+$/.test(value.publishable_key) &&
-    typeof value.capability==='string' && /^bca2_[A-Za-z0-9_-]{43}$/.test(value.capability) &&
-    typeof value.client_secret==='string' && /^pi_[A-Za-z0-9]+_secret_[A-Za-z0-9]+$/.test(value.client_secret));
+  function sessionContext(value:Record<string,unknown>,successor:boolean,report?:(step:SessionWireCheckpoint)=>void){
+   report?.('FIELDS');need(exact(value,['protocol','provider','flow','publishable_key','client_secret','attempt_id','capability','expires_at']));
+   report?.('PROTOCOL');need(value.protocol==='SERVER_CONFIRM_V2' && value.provider==='stripe' && value.flow==='PAYMENT');
+   report?.('EXPIRY');need(typeof value.expires_at==='string' && Date.parse(value.expires_at)>Date.now());
+   report?.('KEY');need(typeof value.publishable_key==='string' && /^pk_test_[A-Za-z0-9_]+$/.test(value.publishable_key));
+   report?.('CAPABILITY');need(typeof value.capability==='string' && /^bca2_[A-Za-z0-9_-]{43}$/.test(value.capability));
+   report?.('INTENT');need(typeof value.client_secret==='string' && /^pi_[A-Za-z0-9]+_secret_[A-Za-z0-9]+$/.test(value.client_secret));
    if(successor)need(value.attempt_id===successorId && value.client_secret===firstSecret && value.capability!==capability && value.publishable_key===publishableKey);
    else {firstAttempt=attemptId;sessionExpiry=Date.parse(value.expires_at as string);firstSecret=value.client_secret as string;publishableKey=value.publishable_key as string;}
    capability=value.capability as string;
@@ -536,8 +544,12 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    }
    fail();
   }
-  checkpoint='BROWSER_INITIAL_SESSION_WIRE';const selectedBody=await body(selected,limits);need(selectedBody.protocol==='SERVER_CONFIRM_V2'&&selectedBody.provider==='stripe'&&selectedBody.flow==='PAYMENT'&&uuid(selectedBody.attempt_id));attemptId=selectedBody.attempt_id as string;
-  if(bound){sessionContext(selectedBody,false);initialPresentationReady.resolve();}
+  checkpoint='BROWSER_INITIAL_SESSION_WIRE';
+  const wire=retryPort?(step:SessionWireCheckpoint)=>{checkpoint='BROWSER_INITIAL_SESSION_WIRE_'+step;}:undefined;
+  const selectedBody=await body(selected,limits,wire);
+  wire?.('PROTOCOL');need(selectedBody.protocol==='SERVER_CONFIRM_V2'&&selectedBody.provider==='stripe'&&selectedBody.flow==='PAYMENT');
+  wire?.('ATTEMPT');need(uuid(selectedBody.attempt_id));attemptId=selectedBody.attempt_id as string;
+  if(bound){sessionContext(selectedBody,false,wire);initialPresentationReady.resolve();}
   if(cancellationPort && typeof selectedBody.publishable_key==='string' && /^pk_test_[A-Za-z0-9_]+$/.test(selectedBody.publishable_key))publishableKey=selectedBody.publishable_key;
   async function confirmWaitBoundary(){
    const request=requests.get(successorId?'successor-confirm':'original-confirm');
