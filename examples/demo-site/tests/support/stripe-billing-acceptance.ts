@@ -468,7 +468,16 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     await forwardBillingDispatch(route,dispatch,binding,authority,'confirm',{subscriptionId,operationId,attemptId},limits,confirmation,checkManager,redirects?.authorize,invoiceCase?.releaseOriginalConfirm);
    }catch{recordFailure(routeCheckpoint);abort();await route.abort('failed').catch(()=>{});}})();pending.add(work);void work.finally(()=>pending.delete(work));return work;
   });
-  const url=new URL('/',binding.endpoints.demo);for(const [k,v] of Object.entries({api_base_url:binding.endpoints.backend,site_key:binding.siteKey,subscription_product_1_id:binding.productId,subscription_price_1_id:binding.priceId,locale:'en'}))url.searchParams.set(k,v);
+  const url=new URL('/',binding.endpoints.demo);
+  url.search=new URLSearchParams({
+   api_base_url:binding.endpoints.backend,
+   site_key:binding.siteKey,
+   subscription_product_1_id:binding.productId,
+   subscription_price_1_id:binding.priceId,
+   locale:'en',
+   // The demo writes both product slots to the address on mount.
+   subscription_product_2_id:'',
+  }).toString();
   checkoutUrl=url.href;await page.goto(url.href,{timeout:duration(limits)});
   if(guarded){
    need(new URL(page.url()).origin===binding.endpoints.demo);

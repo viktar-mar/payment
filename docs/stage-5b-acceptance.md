@@ -28,6 +28,10 @@ Run `75c5bc59-df07-4ba5-ad53-957df4472898` at `2b53b09` recorded CREATE_ACK and 
 
 Offline tests reproduced a separate defect when Playwright kept the same frame object and URL across a navigation. The original comparison accepted the request after that navigation. The decline/Retry runner now also checks for navigation in the captured chain before blocking a nested document, before fetching an asset, and before delivering its response. Fixed categories identify the stage and frame check without logging the URL or exception text. Initial decline and Retry still need a native receipt.
 
+Run `f5e951d3-382a-4268-bcc7-fef96d5c82da` at `8044f47` reused the saved Sandbox authorization and reached CREATE_ACK. It stopped with `BROWSER_PINNED_FRAME_NAV_CAPTURE_CHECKOUT` and confirmed cleanup. The main-frame URL differed from the expected checkout address. The run journal contains no confirmation or Retry dispatch.
+
+An offline regression reproduced the mismatch when the demo's initial configuration added the empty second product slot through `history.replaceState`. The runner now includes the empty slot in the initial URL, which preserves exact address matching after configuration. The same regression verifies that a different product or path is refused before payment or Retry.
+
 ## Earlier local recovery evidence on 2026-11-23
 
 Run `c2dfc733-6915-45b8-8aa5-3792ccb31f42` at `0449bdd` passed the initial payment, declined renewal, grace checks and replacement-method confirmation. The exact Stripe Sandbox request log showed that the invoice-created PaymentIntent refused `error_on_requires_action`. Both the local runner and Stripe stopped that request.

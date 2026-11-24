@@ -402,6 +402,13 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     if(closed)throw Error('closed');
    }
    documentUrl=url;
+   if(fault.startsWith('static-checkout-')){
+    // The demo configures both product slots with history.replaceState on mount.
+    const configured=new URL(url);
+    configured.searchParams.set('subscription_product_2_id',fault==='static-checkout-foreign-product'?id(99):'');
+    if(fault==='static-checkout-foreign-path')configured.pathname='/other';
+    documentUrl=configured.href;
+   }
    if(sca||invoiceCase)await provider('https://js.stripe.com/v3/',frame,false,'GET');
   },locator:()=>({first:()=>manager}),
   waitForResponse:(predicate:(r:Response)=>boolean,{timeout=3000}={})=>new Promise<Response>((resolve,reject)=>{
@@ -721,20 +728,21 @@ for(const fault of ['unknown-first','early-retry','no-decline-proof','repeat-ret
  });
 }
 
-for(const mode of ['static-block','static-image','static-duplicate','static-foreign-event']){
+for(const mode of ['static-block','static-image','static-checkout-normalized','static-duplicate','static-foreign-event']){
  test('decline retry applies the reviewed presentation policy: '+mode,async t=>{
   const f=cancellationPage(mode,true);
   const asset=t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
    assert.equal(mode,'static-image');assert.equal(options.redirect,'error');assert.equal(options.credentials,'omit');
    return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
   });
-  const accepted=mode==='static-block'||mode==='static-image';
+  const accepted=['static-block','static-image','static-checkout-normalized'].includes(mode);
   const result=runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+(accepted?1500:300)},o=>o==='https://private.example');
   if(accepted)assert.equal(await result,true);else await assert.rejects(result,error=>{
    assert.equal(browserDiagnostic(error,'ACCEPTANCE'),mode==='static-duplicate'?'BROWSER_PINNED_DOCUMENT_POLICY':'BROWSER_PINNED_DOCUMENT_BLOCK');
    return true;
   });
   assert.equal(f.sent.filter(u=>u.endsWith('/confirm')).length,accepted?2:0);
+  assert.equal(f.sent.filter(u=>u.endsWith('/retry')).length,accepted?1:0);
   assert.equal(asset.mock.callCount(),mode==='static-image'?1:0);
   assert.ok(f.presentation.includes(mode==='static-image'?'fulfilled 200':'abort blockedbyclient'));
  });
@@ -744,6 +752,8 @@ for(const [fault,code] of [
  ['static-main-navigation','BROWSER_PINNED_FRAME_NAV_CAPTURE_MAIN'],
  ['static-nav-unavailable','BROWSER_PINNED_FRAME_NAV_CAPTURE_LOOKUP'],
  ['static-nav-direct-child','BROWSER_PINNED_FRAME_NAV_CAPTURE_PARENT'],
+ ['static-checkout-foreign-product','BROWSER_PINNED_FRAME_NAV_CAPTURE_CHECKOUT'],
+ ['static-checkout-foreign-path','BROWSER_PINNED_FRAME_NAV_CAPTURE_CHECKOUT'],
  ['static-image-uncommitted','BROWSER_PINNED_FRAME_ASSET_CAPTURE_UNCOMMITTED'],
  ['static-image-blank','BROWSER_PINNED_FRAME_ASSET_CAPTURE_DOCUMENT'],
  ['static-image-detached','BROWSER_PINNED_FRAME_ASSET_CAPTURE_DETACHED'],
