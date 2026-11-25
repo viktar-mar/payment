@@ -221,7 +221,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
  const ownerLimits=limits;
  limits={deadline:limits.deadline,signal:limits.signal?AbortSignal.any([limits.signal,lifecycle.signal]):lifecycle.signal};
  let context:BrowserContext|undefined,abandoned=false,closing:Promise<void>|undefined,failure=false;
- let checkpoint='BROWSER',firstFailure:string|undefined,cleanupConfirmed=false;
+ let checkpoint=cancellationPort?'BROWSER_SETUP':'BROWSER',firstFailure:string|undefined,cleanupConfirmed=false;
  let refusedOrigin:{runId:string;expectedSource:string;origin:string;issuerRelation:Promise<RefusedIssuerRelation>}|undefined;
  const recordFailure=(code=checkpoint)=>{firstFailure??=code;failure=true;};
  const close=(ctx:BrowserContext)=>{closing??=ctx.close();void closing.catch(()=>{});return closing;};
@@ -448,9 +448,9 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
      if(target.origin!==binding.endpoints.backend){
       routeCheckpoint='BROWSER_PROVIDER_ROUTE';
       await providerTraffic(route,target,code=>{
-       if(!challenge)return;
+       if(!challenge&&!cancellationPort)return;
        routeCheckpoint=code;
-       if(challengeDispatched&&code==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM')origin=target.origin;
+       if(challenge&&challengeDispatched&&code==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM')origin=target.origin;
       });return;
      }
      if(cancellation && !['GET','OPTIONS'].includes(method)){await cancellation.forward(route);return;}
@@ -566,29 +566,29 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    // The demo writes both product slots to the address on mount.
    subscription_product_2_id:'',
   }).toString();
-  if(bound)checkpoint='BROWSER_NAVIGATION';
+  if(guarded)checkpoint='BROWSER_NAVIGATION';
   checkoutUrl=url.href;await page.goto(url.href,{timeout:duration(limits)});
   if(guarded){
    need(new URL(page.url()).origin===binding.endpoints.demo);
    page.on('framenavigated',frame=>{if(frame===page.mainFrame())invalidate('BROWSER_GUARD_MAIN_NAVIGATION');});
   }
-  if(bound)checkpoint='BROWSER_OTP_REQUEST';
+  if(guarded)checkpoint='BROWSER_OTP_REQUEST';
   const widget=page.locator('generic-email-otp').first();
   await enterPrivateText(widget.getByRole('textbox',{name:'Email',exact:true}),binding.email);
   const otpChallenge=page.waitForResponse(r=>r.url()===otp&&r.request().method()==='POST',{timeout:duration(limits)});void otpChallenge.catch(()=>{});await widget.getByRole('button',{name:'Request code',exact:true}).click({timeout:duration(limits)});
   const challengeResponse=await otpChallenge;paired('challenge',challengeResponse);need(challengeResponse.status()===202);const challengeBody=await body(challengeResponse,limits);need(uuid(challengeBody.challenge_id));challengeId=challengeBody.challenge_id as string;
   await port.withOtpCode(async code=>{await enterPrivateText(widget.getByRole('textbox',{name:'Six-digit code',exact:true}),code);return true as const;},limits);
-  if(bound)checkpoint='BROWSER_OTP_VERIFY';
+  if(guarded)checkpoint='BROWSER_OTP_VERIFY';
   const verification=page.waitForResponse(r=>r.url()===otp+'/'+challengeBody.challenge_id+'/verify'&&r.request().method()==='POST',{timeout:duration(limits)});void verification.catch(()=>{});
   const baseline=page.waitForResponse(r=>r.url().startsWith(base+'?')&&r.request().method()==='GET',{timeout:duration(limits)});void baseline.catch(()=>{});
   await widget.getByRole('button',{name:'Verify code',exact:true}).click({timeout:duration(limits)});const response=await verification;paired('verify',response);need(response.status()===200);const session=await body(response,limits),customer=session.customer;
   need(object(customer)&&uuid(customer.id)&&customer.status==='ACTIVE'&&session.site_id===binding.siteId&&Array.isArray(session.scopes)&&session.scopes.includes('SUBSCRIPTION_READ')&&session.scopes.includes('SUBSCRIPTION_MANAGE')&&typeof session.session_token==='string'&&/^[A-Za-z0-9_-]{43}$/.test(session.session_token));
   authority='Bearer '+session.session_token;await port.acknowledgeCustomer({customerId:(customer as Record<string,string>).id!,siteId:binding.siteId});
-  if(exactInitialCheckout)checkpoint='BROWSER_CREATE_BASELINE';
+  if(exactInitialCheckout||cancellationPort)checkpoint='BROWSER_CREATE_BASELINE';
   const before=await body(await baseline,limits);need(Array.isArray(before.items)&&before.items.length===0&&before.next_cursor===null);
-  if(exactInitialCheckout)checkpoint='BROWSER_CREATE_CONSENT';
+  if(exactInitialCheckout||cancellationPort)checkpoint='BROWSER_CREATE_CONSENT';
   const manager=page.locator('generic-subscription-manager').first();await manager.getByRole('checkbox',{name:'I consent to recurring payments',exact:true}).check({timeout:duration(limits)});
-  if(exactInitialCheckout)checkpoint='BROWSER_CREATE_OWNER';
+  if(exactInitialCheckout||cancellationPort)checkpoint='BROWSER_CREATE_OWNER';
   if(bound){
    originalManager=await manager.evaluateHandle((element,expected)=>{
     const m=element as GenericSubscriptionManager,revision=m.state.authorityRevision,session=m.customerSession;
@@ -607,7 +607,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   const exactCreate=exactInitialCheckout?await focusExactButton(createButton):undefined;
   if(bound)trustedCreate=exactCreate?await exactCreate.evaluateHandle(captureTrustedClick):await trustedClick(createButton);
   if(exactCreate){await checkManager();await requireButtonFocus(exactCreate);}
-  if(exactInitialCheckout)checkpoint='BROWSER_CREATE_GESTURE';
+  if(exactInitialCheckout||cancellationPort)checkpoint='BROWSER_CREATE_GESTURE';
   const createObservationFailed=Symbol();
   const createResponse=page.waitForResponse(r=>r.url()===base&&r.request().method()==='POST',{timeout:duration(limits)})
    .catch(()=>{throw createObservationFailed;});void createResponse.catch(()=>{});
@@ -623,7 +623,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    if(exactInitialCheckout&&error===createObservationFailed)checkpoint='BROWSER_CREATE_WAIT';
    throw error;
   }finally{createGestureInFlight=false;}
-  if(exactInitialCheckout)checkpoint='BROWSER_CREATE_RECEIPT';
+  if(exactInitialCheckout||cancellationPort)checkpoint='BROWSER_CREATE_RECEIPT';
   paired('create',receipt);need(receipt.status()===202);const original=await body(receipt,limits);need(uuid(original.subscription_id)&&uuid(original.operation_id)&&['PROCESSING','REQUIRES_ACTION','RESERVED'].includes(String(original.status)));
   subscriptionId=original.subscription_id as string;operationId=original.operation_id as string;await port.acknowledge('create',{subscriptionId,operationId});
   checkpoint='BROWSER_INITIAL_SESSION';
@@ -637,7 +637,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    }
    throw error;
   }finally{initialReads.length=0;}
-  if(exactInitialCheckout)checkpoint='BROWSER_SESSION_UNPAIRED';
+  if(exactInitialCheckout||cancellationPort)checkpoint='BROWSER_SESSION_UNPAIRED';
   paired('initial-session',selected);
   const sessionStatus=selected.status();
   if(sessionStatus!==200){
@@ -791,6 +791,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    need(confirmation.state==='OBSERVE' && confirmation.retry_allowed===false);
    await port.acknowledge('confirm',{attemptId,state:'OBSERVE',nextActionAllowed:false});
   }
+  if(cancellationPort)checkpoint='BROWSER';
   for(;;){billingCheck(limits);if(failure)fail();const settled=await manager.evaluate((element:Element)=>{const state=(element as Element&{state?:{phase:string;subscription?:{subscriptionId:string;billingStatus:string;access:{allowed:boolean;reason:string}};operation?:{status:string}}}).state;return {phase:state?.phase,id:state?.subscription?.subscriptionId,status:state?.subscription?.billingStatus,allowed:state?.subscription?.access.allowed,reason:state?.subscription?.access.reason,operation:state?.operation?.status};});
    need(!['unknown','error','expired'].includes(settled.phase??''));if(settled.id===subscriptionId&&settled.status==='ACTIVE'&&settled.allowed&&settled.reason==='PAID')break;
    await manager.getByRole('button',{name:'Refresh status',exact:true}).click({timeout:duration(limits)});await billingBounded(limits,()=>new Promise(r=>setTimeout(r,250)),1000);
@@ -813,7 +814,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   }catch{recordFailure('BROWSER_CLEANUP');}
  }
  if(firstFailure || guarded && failure){
-  if(!bound)fail();
+  if(!guarded)fail();
   const error=acceptanceBrowserFailure(firstFailure??checkpoint);
   if(refusedOrigin)rememberBrowserProviderOrigin(error,refusedOrigin.runId,refusedOrigin.expectedSource,refusedOrigin.origin,await refusedOrigin.issuerRelation);
   finishBrowserCleanup(error,cleanupConfirmed);

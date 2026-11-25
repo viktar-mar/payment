@@ -365,6 +365,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    click:async()=>{
     const name=opts.name;
     trace.push(name);
+    if(fault==='cancellation-otp-request'&&name==='Request code' || fault==='cancellation-otp-verify'&&name==='Verify code')throw Error('private OTP canary');
     if(name==='Request code'&&fault==='websocket'){if(!socketHandler)throw new Error('socket escaped');socketHandler({close:()=>{providerSent.push('closed websocket');}});}
     if(name==='Request code'&&['early-provider-confirm','early-token','unknown-host'].includes(fault))await provider(fault==='unknown-host'?'https://unknown.invalid/anything':'https://api.stripe.com/v1/'+(fault==='early-token'?'confirmation_tokens':'payment_intents/pi_test/confirm'));
     if(name==='Request code') await send(otp, {site_key:b.siteKey,email:b.email,intent:'AUTHENTICATE'}, {challenge_id:id(8)});
@@ -520,6 +521,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   },
   on:(event:string,fn:typeof navigate)=>{if(event==='framenavigated')navigationListeners.push(fn);if(event==='requestfailed')requestFailed=fn;},
   goto:async(url:string)=>{
+   if(fault==='cancellation-navigation')throw Error('private navigation canary');
    if(sca||invoiceCase){
     documentUrl='about:blank';
     const method='GET',reply=observeNetwork(frame,url,method);
@@ -555,7 +557,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  };
  if(sca||invoiceCase)registerChromiumProtocolFixture(page);
  const context={
-  newPage:async()=>page,on:()=>{},routeWebSocket:async(_pattern:unknown,fn:typeof socketHandler)=>{socketHandler=fn;},route:async(pattern:unknown,fn:typeof handler)=>{interceptsProvider=pattern==='**/*';handler=fn;},
+  newPage:async()=>{if(fault==='cancellation-setup')throw Error('private setup canary');return page;},on:()=>{},routeWebSocket:async(_pattern:unknown,fn:typeof socketHandler)=>{socketHandler=fn;},route:async(pattern:unknown,fn:typeof handler)=>{interceptsProvider=pattern==='**/*';handler=fn;},
   close:async()=>{closed=true;releaseBody?.();releaseDispatch?.();for(const w of waiters)w.reject(new Error('closed'));waiters.clear();
    if(fault==='session-http-close-fails')throw Error('private close reason');
   }
@@ -608,6 +610,34 @@ test('initial-only browser never enables cancellation even with an extended port
  const early=cancellationPage('early');
  await assert.rejects(()=>runInitialBillingBrowser(early.browser,early.port,{deadline:Date.now()+1000}),/^Error: billing_BROWSER$/);
  assert.equal(early.sent.includes(early.cancel),false);
+});
+for(const [fault,code] of [
+ ['cancellation-setup','BROWSER_SETUP'],['cancellation-navigation','BROWSER_NAVIGATION'],
+ ['cancellation-otp-request','BROWSER_OTP_REQUEST'],['cancellation-otp-verify','BROWSER_OTP_VERIFY'],
+ ['unknown-host','BROWSER_PROVIDER_ORIGIN_OTHER'],
+] as const)test('early cancellation retains the exact safe browser checkpoint: '+fault,async()=>{
+ const f=cancellationPage(fault);
+ f.port.acknowledgeCustomer=async()=>assert.fail('early failure must precede customer acknowledgement');
+ await assert.rejects(runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+2000}),error=>{
+  assert.equal(String(error),'Error: billing_BROWSER');
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(browserCleanupConfirmed(error),true);
+  assert.equal(browserProviderOrigin(error),null);
+  return true;
+ });
+ assert.ok(f.closed());
+ assert.deepEqual(f.providerSent,[]);
+ assert.ok(!f.trace.some(step=>step==='Create subscription'||step==='Pay'||step.startsWith('persist ')));
+});
+
+test('cancellation reports a nonempty subscription baseline after OTP',async()=>{
+ const f=cancellationPage('create-nonempty-baseline');
+ await assert.rejects(runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+2000}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CREATE_BASELINE');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.ok(!f.trace.includes('Create subscription'));
 });
 
 test('original token and trailing uncredentialed provider-frame support can complete the journey',async()=>{

@@ -143,13 +143,13 @@ async function createOwner(options,dependencies,selectedCase) {
      }:{}),
     });
     const browserResult=await step('BROWSER',async()=>{
-     const bound=retry||challenge||invoiceCase;
+     const guarded=retry||challenge||invoiceCase||cancellation;
      const execution=Promise.resolve().then(()=>{billingCheck(active);return browserJourney(port,active);});
-     if(bound)browserCompletion=execution.then(result=>result===true,
+     if(guarded)browserCompletion=execution.then(result=>result===true,
       error=>browserDiagnostic(error,'ACCEPTANCE')!==null&&browserCleanupConfirmed(error));
      try{return await execution;}
      catch(error){
-      const checkpoint=bound?browserDiagnostic(error,'ACCEPTANCE'):null;
+      const checkpoint=guarded?browserDiagnostic(error,'ACCEPTANCE'):null;
       if(checkpoint){
        if(challengeFlow?.challengeDispatched()&&checkpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM'){
         const witness=browserProviderOrigin(error);

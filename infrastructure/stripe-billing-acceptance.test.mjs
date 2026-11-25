@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {acceptanceBrowserFailure,finishBrowserCleanup} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 const api=await import('./stripe-billing-acceptance.mjs').catch(()=>({}));
 export const options=()=>({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'},runId:'11111111-2222-4333-8444-555555555555',expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports:{backend:18080,demo:18081,receiver:18082,postgres:15432,mailpitHttp:18025,mailpitSmtp:11025},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_success'});
 const limits=()=>({deadline:Date.now()+10000});
@@ -52,6 +53,21 @@ test('literal false listener readiness never permits financial dispatch',async()
 test('hostile rejection accessors never enter failure diagnostics',async()=>{let reads=0;const h=harness({preflight:async()=>{throw Object.defineProperty({},'message',{get(){reads++;throw Error('secret');}});}}),owner=await api.createOwnedBillingAcceptance(options(),h.dependencies);await assert.rejects(()=>owner.run(journey,limits()),/^Error: billing_/);assert.equal(reads,0);assert.equal(owner.resources().initialAccepted,false);});
 test('resources distinguish owner closure from unconfirmed resource cleanup',async()=>{const h=harness();h.bootstrap.stop=async()=>false;const owner=await api.createOwnedBillingAcceptance(options(),h.dependencies);await assert.rejects(()=>owner.run(journey,limits()));assert.equal(owner.resources().cleanupConfirmed,false);});
 const cancelOptions=()=>({...options(),selectedCase:'initial_cancel_withdraw',env:{...options().env,PAYMENT_STRIPE_BILLING_CASE:'initial_cancel_withdraw'}});
+for(const cleanup of ['confirmed','unconfirmed','foreign error'])test('early cancellation trusts only branded browser cleanup: '+cleanup,async()=>{
+ const h=harness(),owner=await api.createOwnedBillingCancellation(cancelOptions(),h.dependencies);
+ const branded=acceptanceBrowserFailure('BROWSER_OTP_REQUEST');
+ finishBrowserCleanup(branded,cleanup==='confirmed');
+ const error=cleanup==='foreign error'?Object.assign(Error('private reason'),{code:'BROWSER_OTP_REQUEST',cleanupConfirmed:true}):branded;
+ const code=cleanup==='foreign error'?'BROWSER':'BROWSER_OTP_REQUEST';
+ await assert.rejects(owner.run(async()=>{throw error;},limits()),{message:'billing_'+code});
+ const result=owner.resources();
+ assert.equal(result.phase,'BROWSER');
+ assert.equal(result.code,code);
+ assert.equal(result.cleanupConfirmed,cleanup==='confirmed');
+ assert.equal(result.cancellationAccepted,false);
+ assert.ok(!h.calls.includes('persist'));
+ assert.ok(h.calls.includes('stop'));
+});
 const keyA='10000000-0000-4000-a000-000000000001',keyB='20000000-0000-4000-a000-000000000002';
 const opA='30000000-0000-4000-a000-000000000003',opB='40000000-0000-4000-a000-000000000004';
 for(const mode of ['success','initial-only-owner','no-baseline','early-withdraw','duplicate','same-key','same-operation','lost-ack','provider-refused','no-local-proof','cleanup-refused','browser-refused','browser-unknown']){
