@@ -6,19 +6,21 @@ import {initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 // @ts-ignore Native Node executes the guarded response source.
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
 
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked'])
-test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
+const stylesheetRejection='direct reviewed issuer stylesheet rejected';
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked',stylesheetRejection])
+test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before handoff':'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
  const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
  const retrieve=api+'/v1/payment_intents/pi_fixture?client_secret='+secret+'&key='+key;
  const authenticate=api+'/v1/3ds2/authenticate',complete=api+'/v1/3ds2/challenge_complete';
  const outer=stripe+'/v3/three-ds-2-challenge-fixture.html',inner=stripe+'/v3/fixture-inner.html';
  const blocksPassiveImage=mode==='direct reviewed issuer passive image blocked';
- const direct=mode==='direct Stripe EMVCo frame'||mode==='direct reviewed issuer origin'||blocksPassiveImage;
+ const rejectsStylesheet=mode===stylesheetRejection;
+ const direct=mode==='direct Stripe EMVCo frame'||mode==='direct reviewed issuer origin'||blocksPassiveImage||rejectsStylesheet;
  const issuerName=direct?'stripe-challenge-frame':'acsFrame';
- const approvedIssuerOrigin=mode==='direct reviewed issuer origin'||blocksPassiveImage?'https://reviewed-test-issuer.stripe.com':undefined;
+ const approvedIssuerOrigin=mode==='direct reviewed issuer origin'||blocksPassiveImage||rejectsStylesheet?'https://reviewed-test-issuer.stripe.com':undefined;
  const issuerOrigin=approvedIssuerOrigin??'https://hooks.stripe.com',issuer=issuerOrigin+'/fixture-issuer',decision=issuer+'/decision';
- const passiveImage=issuerOrigin+'/fixture-passive.png';
+ const passiveAsset=issuerOrigin+(rejectsStylesheet?'/fixture-private-stylesheet.css':'/fixture-passive.png');
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
  const script=`(async()=>{
@@ -40,10 +42,11 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
  })()`;
  const json=(value:object)=>({contentType:'application/json',headers:{'Access-Control-Allow-Origin':stripe},body:JSON.stringify(value)});
  const issuerButton='<button name="decision" value="complete">Complete</button>';
+ const revealButton="document.querySelector('form').append(document.querySelector('template').content.cloneNode(true))";
  const issuerBody='<!doctype html><form method="post" action="'+decision+'">'+
-  (blocksPassiveImage?'<template>'+issuerButton+'</template>':issuerButton)+'</form>'+
-  (blocksPassiveImage?`<img width="1" height="1" alt="" src="${passiveImage}"
-   onerror="document.querySelector('form').append(document.querySelector('template').content.cloneNode(true))">`:'');
+  (blocksPassiveImage||rejectsStylesheet?'<template>'+issuerButton+'</template>':issuerButton)+'</form>'+
+  (blocksPassiveImage?`<img width="1" height="1" alt="" src="${passiveAsset}" onerror="${revealButton}">`:
+   rejectsStylesheet?`<link rel="stylesheet" href="${passiveAsset}" onload="${revealButton}">`:'');
  const responses=new Map<string,NonNullable<Parameters<Route['fulfill']>[0]>>([
   [demo+'/',{contentType:'text/html',body:'<!doctype html><link rel="icon" href="data:,"><iframe name="__privateStripeFrame7" src="'+outer+'"></iframe>'}],
   [outer,{contentType:'text/html',body:direct?'<!doctype html><body><script>'+script+'</script></body>':
@@ -58,26 +61,30 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
   [decision,{contentType:'text/html',body:'<!doctype html><script>parent.postMessage("fixture decision",'+JSON.stringify(stripe)+')</script>'}],
   [complete,json({complete:true})],
  ]);
+ if(rejectsStylesheet)responses.set(passiveAsset,{contentType:'text/css',body:':root { color: black; }'});
  const channel=process.env.PAYMENT_TEST_CHROME_CHANNEL==='chrome'?'chrome':'chromium';
  const browser=await chromium.launch({channel,headless:true,timeout:10_000,args:[
   '--site-per-process','--disable-background-networking','--proxy-server=direct://','--host-resolver-rules=MAP * ~NOTFOUND',
   ...(mode==='separate issuer process'?['--isolate-origins='+stripe+','+new URL(issuer).origin]:[]),
  ]});
+ const stop=new AbortController();
+ let attendance:Promise<boolean>|undefined;
  try{
   const context=await browser.newContext({serviceWorkers:'block',acceptDownloads:false});
   const page=await context.newPage(),forwarded:string[]=[],refusals:string[]=[];
   const passiveRequests:Request[]=[],passiveFailures:Request[]=[],passiveResponses:Response[]=[];
   const passiveAborts:(string|undefined)[]=[],authorized:string[]=[];
-  page.on('requestfailed',request=>{if(request.url()===passiveImage)passiveFailures.push(request);});
-  page.on('response',response=>{if(response.url()===passiveImage)passiveResponses.push(response);});
-  const limits={deadline:Date.now()+15_000};
+  page.on('requestfailed',request=>{if(request.url()===passiveAsset)passiveFailures.push(request);});
+  page.on('response',response=>{if(response.url()===passiveAsset)passiveResponses.push(response);});
+  const limits={deadline:Date.now()+15_000,signal:stop.signal};
+  let stylesheetErrorRedacted=false;
   let issuerFrame:Frame|undefined,attachedIssuerFrame=false,separateIssuerTarget=false,gestures=0;
   const guard=await guardChallengeRedirects(page,reason=>refusals.push(reason),{demo,backend},undefined,approvedIssuerOrigin);
   const challenge=initial3dsChallenge({page,limits,demo,owner:()=>({key,secret}),winning:async()=>{},check:async()=>{},
    expectIssuerImageBlock:request=>guard.expectIssuerImageBlock(request),
    approvedIssuerOrigin,authorizeResponse:async request=>{
     authorized.push(request.url());
-    assert.notEqual(request.url(),passiveImage);
+    assert.notEqual(request.url(),passiveAsset);
     await guard.authorize(request);
    },waitForGesture:async()=>{
     gestures++;
@@ -101,7 +108,8 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
   });
   await context.route('**/*',async route=>{
    const request=route.request(),url=request.url(),response=responses.get(url);
-   const isPassiveImage=blocksPassiveImage&&url===passiveImage;
+   const isPassiveImage=blocksPassiveImage&&url===passiveAsset;
+   const isRejectedStylesheet=rejectsStylesheet&&url===passiveAsset;
    if(!response&&!isPassiveImage){await route.abort('blockedbyclient');return;}
    guard.registerRoute(request);
    let checkpoint='route refused';
@@ -116,8 +124,10 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
       forwarded.push(url);
       await route.fulfill(reply);
      };
-     if(isPassiveImage){
+     if(isPassiveImage||isRejectedStylesheet){
       passiveRequests.push(request);
+     }
+     if(isPassiveImage){
       actual.abort=async errorCode=>{passiveAborts.push(errorCode);await route.abort(errorCode);};
       actual.fallback=async()=>assert.fail('passive image must never reach fallback');
       actual.fulfill=async()=>assert.fail('passive image must never receive a synthetic response');
@@ -131,8 +141,38 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
      assert.ok(response);
      await guard.authorize(request);await route.fulfill(response);
     }
-   }catch{refusals.push(checkpoint);await route.abort('blockedbyclient').catch(()=>{});}
+   }catch(error){
+    refusals.push(checkpoint);
+    if(isRejectedStylesheet)stylesheetErrorRedacted=error instanceof Error&&String(error)==='Error: billing_BROWSER'&&JSON.stringify(error)==='{}';
+    await route.abort('blockedbyclient').catch(()=>{});
+   }
   });
+  if(rejectsStylesheet){
+   attendance=challenge.attend().then(()=>true,()=>false);
+   const [blocked]=await Promise.all([
+    page.waitForEvent('requestfailed',{predicate:request=>request.url()===passiveAsset,timeout:8_000}),
+    page.goto(demo+'/',{waitUntil:'domcontentloaded',timeout:7_000}),
+   ]);
+   assert.equal(attachedIssuerFrame,true);
+   assert.equal(refusals[0],'BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET');
+   // The owner retains the first failure. Chromium can also report its abort at the response guard.
+   assert.ok(refusals.length===1||refusals.length===2&&refusals[1]==='BROWSER_GUARD_RESPONSE_NETWORK');
+   assert.equal(stylesheetErrorRedacted,true);
+   assert.equal(passiveRequests.length,1);
+   assert.equal(passiveRequests[0]===blocked,true);
+   assert.equal(blocked.resourceType(),'stylesheet');
+   assert.equal(blocked.method(),'GET');
+   assert.equal(blocked.frame()===issuerFrame,true);
+   assert.equal(blocked.isNavigationRequest(),false);
+   assert.equal(blocked.serviceWorker(),null);
+   assert.match(blocked.failure()?.errorText??'',/^net::ERR_BLOCKED_BY_CLIENT(?:\.Inspector)?$/);
+   assert.equal(blocked.existingResponse(),null);
+   assert.equal(passiveResponses.length,0);
+   assert.deepEqual(forwarded,[retrieve,authenticate,issuer]);
+   assert.deepEqual(authorized,[retrieve,authenticate,issuer]);
+   assert.equal(gestures,0);
+   return;
+  }
   await page.goto(demo+'/',{waitUntil:'domcontentloaded',timeout:7_000});
   try{
    const stripeFrame=page.frameLocator('iframe');
@@ -163,5 +203,12 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
    assert.deepEqual(passiveResponses,[]);
    assert.deepEqual(authorized,[retrieve,authenticate,issuer,decision,complete,retrieve]);
   }
- }finally{await browser.close();}
+ }finally{
+  stop.abort();
+  await browser.close();
+  if(rejectsStylesheet){
+   assert.equal(browser.isConnected(),false);
+   if(attendance)assert.equal(await attendance,false);
+  }
+ }
 });
