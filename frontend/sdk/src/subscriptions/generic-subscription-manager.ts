@@ -20,6 +20,9 @@ const ElementBase = (typeof HTMLElement === 'undefined' ? class {} : HTMLElement
 const identity = (s?: CustomerSession): string => s ? JSON.stringify([s.apiBaseUrl, s.siteKey, s.siteId, s.origin, s.customer.id, s.customer.status, s.customer.maskedEmail, s.sessionToken, s.expiresAt, [...s.scopes].sort()]) : '';
 const unresolved = (op: SubscriptionOperation | null): boolean => !!op && !['SUCCEEDED', 'FAILED'].includes(op.status);
 const safeOperation = (op: SubscriptionOperation): SubscriptionOperation => ({ operationId: op.operationId, subscriptionId: op.subscriptionId, status: op.status, actionAvailable: op.actionAvailable });
+function assertStatusOnlyOperation(op: SubscriptionOperation): void {
+  if (op.status === 'REQUIRES_ACTION' || op.actionAvailable || op.nextAction) throw new PaymentSdkError('INVALID_RESPONSE');
+}
 
 export class GenericSubscriptionManager extends ElementBase {
   static observedAttributes = ['locale'];
@@ -36,6 +39,7 @@ export class GenericSubscriptionManager extends ElementBase {
   #loaded = false;
   #uncertain = false;
   #action?: SubscriptionAction;
+  #statusOnlyOperation?: Pick<SubscriptionOperation, 'operationId' | 'subscriptionId'>;
   #providerMount?: OwnedProviderMount;
   #stripeHandle?: StripeSubscriptionHandle | StripePaymentAttemptHandle;
   #v2?: { subscriptionId:string; operationId:string; attemptId?:string; status?:SubscriptionAttemptStatus; retrySent:boolean; attempted?:boolean };
@@ -140,6 +144,7 @@ export class GenericSubscriptionManager extends ElementBase {
   attributeChangedCallback(name: string, old: string | null, value: string | null): void { if (name === 'locale' && old !== value) this.locale = value === 'pt' ? 'pt' : 'en'; }
   #reset(): void {
     this.#retireForm(); this.#v2=undefined; this.#spentOperations.clear(); this.#polling = false;
+    this.#statusOnlyOperation = undefined;
     this.#controller?.abort(); this.#controller = undefined; if (this.#expiry !== undefined) clearTimeout(this.#expiry); this.#expiry = undefined;
     this.#state = { authorityRevision: this.#state.authorityRevision + 1, phase: 'idle', subscription: null, operation: null };
     this.#fingerprint = identity(this.#session); this.#busy = this.#loaded = this.#uncertain = false; this.#action = undefined; this.#offers = []; this.#quote = undefined; this.#cancelMode = undefined; this.#error = undefined;
@@ -188,19 +193,29 @@ export class GenericSubscriptionManager extends ElementBase {
       const billing = await client.billingRecords(input); if (!this.#current(revision)) return;
       const history = await client.history(input); if (!this.#current(revision)) return;
       this.#billing = billing; this.#history = history; this.#loaded = true;
-      this.#accept(revision, { subscription });
       const pointer = subscription.pendingOperation;
+      this.#statusOnlyOperation = pointer && (pointer.kind === 'CANCEL' || pointer.kind === 'WITHDRAW_CANCEL')
+        ? { operationId: pointer.operationId, subscriptionId: subscription.subscriptionId } : undefined;
+      this.#accept(revision, { subscription });
       if (pointer) { await this.#readOperation(revision, pointer.operationId, subscription.subscriptionId); return; }
-    } else { this.#billing = { items: [], nextCursor: null }; this.#history = { items: [], nextCursor: null }; }
+    } else {
+      this.#statusOnlyOperation = undefined;
+      this.#billing = { items: [], nextCursor: null }; this.#history = { items: [], nextCursor: null };
+    }
     this.#loaded = true; this.#action = undefined; this.#accept(revision, { subscription, phase: this.#uncertain ? 'unknown' : 'ready', operation: this.#uncertain ? this.#state.operation : null });
   }
   async #readOperation(revision: number, operationId: string, subscriptionId: string): Promise<void> {
     const input = { session: this.#session!, signal: this.#controller!.signal, subscriptionId, operationId }, client = this.#client!.subscriptions;
     const op = await client.operation(input); if (!this.#current(revision)) return;
+    const statusOnly = this.#statusOnlyOperation?.operationId === operationId && this.#statusOnlyOperation.subscriptionId === subscriptionId;
+    if (statusOnly) {
+      if (op.operationId !== operationId || op.subscriptionId !== subscriptionId) throw new PaymentSdkError('INVALID_RESPONSE');
+      assertStatusOnlyOperation(op);
+    }
     if (['SUCCEEDED','FAILED','UNKNOWN'].includes(op.status)) this.#retireForm();
     if (['SUCCEEDED','FAILED'].includes(op.status)) this.#v2=undefined;
     this.#action = undefined;
-    if (!this.#v2 && ['PROCESSING','REQUIRES_ACTION'].includes(op.status) && this.#formOperation!==operationId && !this.#spentOperations.has(operationId) && this.#session!.scopes.includes('SUBSCRIPTION_MANAGE')) {
+    if (!statusOnly && !this.#v2 && ['PROCESSING','REQUIRES_ACTION'].includes(op.status) && this.#formOperation!==operationId && !this.#spentOperations.has(operationId) && this.#session!.scopes.includes('SUBSCRIPTION_MANAGE')) {
       let action: SubscriptionAction | undefined;
       try {
         action = await client.action(input); if (!this.#current(revision)) return;
@@ -359,7 +374,14 @@ export class GenericSubscriptionManager extends ElementBase {
     this.#busy = true; this.#error = undefined; this.#quote = undefined; this.#cancelMode = undefined; this.#action = undefined; this.#accept(revision, { phase: 'processing' });
     let outcomeKnown = false;
     try {
-      const op = await call(this.#mutationInput()); if (!this.#current(revision)) return;
+      const input = this.#mutationInput();
+      const op = await call(input); if (!this.#current(revision)) return;
+      const statusOnly = permission === 'CANCEL_PERIOD_END' || permission === 'CANCEL_IMMEDIATE' || permission === 'WITHDRAW_CANCELLATION';
+      if (statusOnly) {
+        if (op.subscriptionId !== input.subscriptionId) throw new PaymentSdkError('INVALID_RESPONSE');
+        assertStatusOnlyOperation(op);
+      }
+      this.#statusOnlyOperation = statusOnly ? { operationId: op.operationId, subscriptionId: op.subscriptionId } : undefined;
       outcomeKnown = true;
       this.#action = op.nextAction; this.#uncertain = op.status === 'UNKNOWN';
       this.#accept(revision, { operation: safeOperation(op), phase: this.#phase(op) });

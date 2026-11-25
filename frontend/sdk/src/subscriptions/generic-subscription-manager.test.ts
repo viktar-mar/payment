@@ -155,6 +155,70 @@ it('explains cancellation date/refund and requires a separate confirmation', asy
   await waitFor(() => expect(seen.filter(r => r.url.endsWith('/cancellation'))).toHaveLength(1));
 });
 it.each([
+  ['CANCEL', '/cancellation'], ['WITHDRAW_CANCEL', '/cancellation/withdraw'],
+] as const)('reads %s status on mutation and refresh without requesting an unsupported action', async (kind, mutationPath) => {
+  const view = kind === 'CANCEL' ? subscriptionWire() : { ...subscriptionWire(), cancellation: { effective_at: '2026-02-01T00:00:00Z' }, permitted_actions: ['WITHDRAW_CANCELLATION'] };
+  const { seen, fetch } = server(view);
+  const respond = fetch.getMockImplementation()!;
+  fetch.mockImplementation(async (url, init) => {
+    if (url.endsWith(mutationPath)) { seen.push(new Request(url, init)); return json(mutationWire(), 202); }
+    if (url.endsWith('/action')) { seen.push(new Request(url, init)); return json({ code: 'CONFLICT' }, 409); }
+    if (url.endsWith('/confirmation-attempts/current')) { seen.push(new Request(url, init)); return json(null); }
+    return respond(url, init);
+  });
+  const element = mount(); await ready(element);
+  if (kind === 'CANCEL') {
+    fireEvent.click(getByRole(root(element), 'button', { name: 'Cancel at period end' }));
+    fireEvent.click(getByLabelText(root(element), 'I confirm cancellation'));
+    fireEvent.click(getByRole(root(element), 'button', { name: 'Confirm cancellation' }));
+  } else fireEvent.click(getByRole(root(element), 'button', { name: 'Withdraw cancellation' }));
+  await ready(element);
+  fireEvent.click(getByRole(root(element), 'button', { name: 'Refresh status' }));
+  await ready(element);
+  expect(seen.filter(r => r.method === 'POST').map(r => new URL(r.url).pathname)).toEqual([expect.stringMatching(new RegExp(`${subscriptionId}${mutationPath}$`))]);
+  expect(seen.filter(r => r.method === 'GET' && r.url.includes('/operations/')).map(r => new URL(r.url).pathname))
+    .toEqual(Array(2).fill(expect.stringMatching(new RegExp(`${subscriptionId}/operations/${operationId}$`))));
+  expect(root(element).textContent).toContain('PROCESSING');
+});
+it.each(['CANCEL', 'WITHDRAW_CANCEL', 'CREATE'] as const)('uses the exact pending %s kind from a newly loaded subscription', async kind => {
+  const { seen, fetch } = server({ ...subscriptionWire(), pending_operation: { operation_id: operationId, kind, status: 'PROCESSING' } });
+  const respond = fetch.getMockImplementation()!;
+  fetch.mockImplementation(async (url, init) => {
+    if (url.endsWith('/action')) { seen.push(new Request(url, init)); return json({ code: 'CONFLICT' }, 409); }
+    if (url.endsWith('/confirmation-attempts/current')) { seen.push(new Request(url, init)); return json(null); }
+    return respond(url, init);
+  });
+  const element = mount(); await ready(element);
+  expect(seen.filter(r => r.method === 'POST')).toHaveLength(0);
+  expect(seen.filter(r => r.url.includes('/operations/')).map(r => new URL(r.url).pathname.split(operationId).at(-1)))
+    .toEqual(kind === 'CREATE' ? ['', '/action', '/confirmation-attempts/current'] : ['']);
+  expect(root(element).textContent).toContain('PROCESSING');
+});
+it.each(['mutation', 'status'] as const)('rejects an action-bearing known cancellation %s', async source => {
+  const { seen, fetch } = server();
+  const respond = fetch.getMockImplementation()!;
+  const actionStatus = { ...operationWire(), status: 'REQUIRES_ACTION', action_available: true };
+  fetch.mockImplementation(async (url, init) => {
+    if (url.endsWith('/cancellation')) {
+      seen.push(new Request(url, init));
+      return json(source === 'mutation' ? { ...actionStatus, next_action: actionWire() } : mutationWire(), 202);
+    }
+    if (url.endsWith(`/operations/${operationId}`)) { seen.push(new Request(url, init)); return json(actionStatus); }
+    return respond(url, init);
+  });
+  const element = mount(); await ready(element);
+  const errors: unknown[] = [];
+  element.addEventListener('generic-subscription-error', event => errors.push((event as CustomEvent).detail));
+  fireEvent.click(getByRole(root(element), 'button', { name: 'Cancel at period end' }));
+  fireEvent.click(getByLabelText(root(element), 'I confirm cancellation'));
+  fireEvent.click(getByRole(root(element), 'button', { name: 'Confirm cancellation' }));
+  await ready(element);
+  expect(errors).toEqual([{ code: 'INVALID_RESPONSE' }]);
+  expect(seen.filter(r => r.method === 'POST')).toHaveLength(1);
+  expect(seen.filter(r => r.url.includes('/operations/'))).toHaveLength(source === 'status' ? 1 : 0);
+  expect(queryByRole(root(element), 'button', { name: 'Complete Fake action' })).toBeNull();
+});
+it.each([
   ['SUCCEEDED', '/offers'], ['SUCCEEDED', '/subscriptions?'], ['SUCCEEDED', '/billing-records'], ['SUCCEEDED', '/events'],
   ['FAILED', '/offers'], ['FAILED', '/subscriptions?'], ['FAILED', '/billing-records'], ['FAILED', '/events'],
 ] as const)('restores permitted controls after known terminal %s and a transient %s read failure without retrying the command', async (status, readPath) => {
