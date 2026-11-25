@@ -3,6 +3,8 @@ import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './str
 import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
 import {billingAcceptanceExcluded,billingAcceptanceOptIn,billingAcceptanceProfileRunId,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
+import {proveOwnedBillingRequiredTrialEvidence} from './stripe-billing-required-trial-evidence.mjs';
+import {billingBounded} from './stripe-billing-limits.mjs';
 import {execFile,spawn} from 'node:child_process';
 import {lstat,realpath,readdir,open} from 'node:fs/promises';
 import {constants} from 'node:fs';
@@ -110,6 +112,8 @@ async function createCliAdapter(options,dependencies,purpose) {
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
   const profileRunId=failedRenewal?Object.getOwnPropertyDescriptor(rawEnv,FAILED_RENEWAL_CLI_PROFILE_RUN_ID)?.value
     :purpose===BILLING?billingAcceptanceProfileRunId(rawEnv):undefined;
+  const requiredTrialCase=purpose===BILLING&&options.selectedCase==='initial_required_trial';
+  if(requiredTrialCase&&!profileRunId)throw fixed('OPT_IN_REQUIRED');
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {
     const env=rawEnv;
@@ -141,18 +145,29 @@ async function createCliAdapter(options,dependencies,purpose) {
   const initial3ds=purpose===BILLING&&options.selectedCase==='initial_3ds';
   let retryNext='declined',retryWitness;
   let cancellationNext='initial',originalCancellationCash;
+  let requiredTrialStarted=false,requiredTrialInFlight;
+  const rejectOverlap=cancellationCase||retryCase||invoiceCase||requiredTrialCase;
 
   function check(context) {
     if(context.signal.aborted||Date.now()>=(context.proofDeadline??context.deadline))fail();
     if(!context.cleanup){
       if(remainderMode&&[...remainderSignals].some(s=>s.aborted))fail();
-      if(billingMode&&billingSignal?.aborted||(cancellationCase||retryCase||invoiceCase)&&billingFailed)fail();
+      if(billingMode&&billingSignal?.aborted||rejectOverlap&&billingFailed)fail();
     }
   }
-  async function operation(code,limits,body) {
+  function operation(code,limits,body) {
+    const drainable=requiredTrialCase&&code!=='STOP'&&!busy;
+    const running=runOperation(code,limits,body);
+    if(!drainable)return running;
+    requiredTrialInFlight=running;
+    return running.finally(()=>{
+      if(requiredTrialInFlight===running)requiredTrialInFlight=undefined;
+    });
+  }
+  async function runOperation(code,limits,body) {
     if(billingMode&&billingFailed&&code!=='STOP')throw fixed(code);
     if(busy){
-      if((cancellationCase||retryCase||invoiceCase)&&code!=='STOP')billingFailed=true;
+      if(rejectOverlap&&code!=='STOP')billingFailed=true;
       throw fixed('BUSY');
     }
     busy=true;let timer,external,onAbort;
@@ -167,10 +182,10 @@ async function createCliAdapter(options,dependencies,purpose) {
       if(remainderMode&&code!=='STOP'&&remainderSignals.size)external=AbortSignal.any([...remainderSignals]);
       onAbort=()=>controller.abort();external?.addEventListener('abort',onAbort,{once:true});
       if(external?.aborted)controller.abort();
-      const boundedProof=remainderMode&&['PRIOR_PARTIAL','REMAINDER'].includes(code);
-      const proofDeadline=boundedProof?Math.min(deadline,Date.now()+45000):deadline;
+      const maximum=remainderMode&&['PRIOR_PARTIAL','REMAINDER'].includes(code)?45000:code==='BILLING_REQUIRED_TRIAL'?120000:null;
+      const proofDeadline=maximum===null?deadline:Math.min(deadline,Date.now()+maximum);
       timer=io.setTimeout(onAbort,Math.min(proofDeadline-Date.now(),2147483647));
-      const context={deadline,signal:controller.signal,...(boundedProof?{proofDeadline}:{}),...(code==='STOP'?{cleanup:true}:{})};check(context);
+      const context={deadline,signal:controller.signal,...(maximum!==null?{proofDeadline}:{}),...(code==='STOP'?{cleanup:true}:{})};check(context);
       const result=await body(context);if(billingMode)check(context);return result;
     } catch {if(billingMode)billingFailed=true;throw fixed(code);}
     finally {try {io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);} catch {} busy=false;}
@@ -244,12 +259,15 @@ async function createCliAdapter(options,dependencies,purpose) {
       await configFile.sync();
     } finally {await configFile.close();}
   }
-  async function command(commandArgs,context) {
+  async function command(commandArgs,context,guard) {
+    guard?.(context);
     await privateTree(context);check(context);
+    guard?.(context);
     if(remainderMode&&refundBinding)refundListener(context);
     const result=await io.execute('/usr/bin/sandbox-exec',[...args,...commandArgs,...(billingMode&&commandArgs[0]==='get'?['--stripe-version',VERSION]:[])],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe'],
       timeout:Math.min(context.manual||refundMode?10000:20000,Math.max(1,(context.proofDeadline??context.deadline)-Date.now())),maxBuffer:65536,signal:context.signal});
     check(context);
+    guard?.(context);
     if(remainderMode&&refundBinding)refundListener(context);
     if(typeof result.stdout!=='string'||typeof result.stderr!=='string'||Buffer.byteLength(result.stdout)+Buffer.byteLength(result.stderr)>65536)fail();
     return result;
@@ -258,21 +276,25 @@ async function createCliAdapter(options,dependencies,purpose) {
     const json=withHeaders?result.stdout.split(/\r?\n/).filter(line=>!line.startsWith('< ')&&!line.startsWith('> ')).join('\n'):result.stdout;
     const body=JSON.parse(json);if(!object(body))fail();return body;
   }
-  async function binding(context) {
-    const version=await command(['--version'],context);
-    if(!['stripe version 1.52.0','stripe version 1.52.0\n'].includes(version.stdout)||version.stderr!=='')fail();
-    const identity=parseBody(await command(['whoami','--format','json'],context));
-    if(identity.account_id!==ACCOUNT||identity.mode!=='test'||!Array.isArray(identity.authorized_accounts)||identity.authorized_accounts.length!==1)fail();
-    const account=identity.authorized_accounts[0];
-    if(!object(account)||account.id!==ACCOUNT||!Array.isArray(account.modes)||!account.modes.includes('test')||account.modes.includes('live')
-      ||profileRunId&&account.modes.length!==1)fail();
-    const result=await command(['get','/v1/balance','--show-headers'],context),body=parseBody(result,true);
+  function pinnedResponse(result) {
     const lines=(result.stdout+'\n'+result.stderr).split(/\r?\n/),statuses=[],versions=[];
     for(const line of lines) {
       if(/^<\s*HTTP/i.test(line)) {const match=/^< HTTP(?:\/1\.1|\/2)? 200(?: [A-Za-z ]+)?$/.exec(line);if(!match)fail();statuses.push(line);}
       if(/^<\s*stripe-version\b/i.test(line)) {const match=/^< stripe-version: ([^\s]+)$/i.exec(line);if(!match)fail();versions.push(match[1]);}
     }
-    if(statuses.length!==1||versions.length!==1||versions[0]!==VERSION||body.object!=='balance'||body.livemode!==false)fail();
+    if(statuses.length!==1||versions.length!==1||versions[0]!==VERSION)fail();
+    return parseBody(result,true);
+  }
+  async function binding(context,guard) {
+    const version=await command(['--version'],context,guard);
+    if(!['stripe version 1.52.0','stripe version 1.52.0\n'].includes(version.stdout)||version.stderr!=='')fail();
+    const identity=parseBody(await command(['whoami','--format','json'],context,guard));
+    if(identity.account_id!==ACCOUNT||identity.mode!=='test'||!Array.isArray(identity.authorized_accounts)||identity.authorized_accounts.length!==1)fail();
+    const account=identity.authorized_accounts[0];
+    if(!object(account)||account.id!==ACCOUNT||!Array.isArray(account.modes)||!account.modes.includes('test')||account.modes.includes('live')
+      ||profileRunId&&account.modes.length!==1)fail();
+    const body=pinnedResponse(await command(['get','/v1/balance','--show-headers'],context,guard));
+    if(body.object!=='balance'||body.livemode!==false)fail();
     return true;
   }
   function controlled(promise,context) {
@@ -669,6 +691,89 @@ async function createCliAdapter(options,dependencies,purpose) {
       billingListener({deadline,signal:signal??{aborted:false}});return true;
     }catch{billingFailed=true;throw fixed('BILLING_LISTENER');}
   }
+  function requiredTrialReadArgs(request){
+    const {method,path,parameters,runId:requestedRun,expectedSource}=exactData(request,['method','path','parameters','runId','expectedSource']);
+    if(method!=='GET'||requestedRun!==runId||expectedSource!==options.expectedSource||typeof path!=='string')fail();
+    const ref=(value,prefix)=>typeof value==='string'&&value.length<=255
+      &&new RegExp('^'+prefix+'_[A-Za-z0-9]+$').test(value);
+    const resource=/^\/v1\/(customers|setup_intents|payment_methods|subscriptions|invoices)\/([A-Za-z0-9_]+)$/.exec(path);
+    const args=['get',path,'--show-headers'];
+    if(resource){
+      const [,collection,id]=resource;
+      const prefix={customers:'cus',setup_intents:'seti',payment_methods:'pm',subscriptions:'sub',invoices:'in'}[collection];
+      if(!ref(id,prefix))fail();
+      if(collection!=='invoices'){
+        exactData(parameters,[]);
+        return args;
+      }
+      if(exactData(parameters,['expand[]'])['expand[]']!=='amount_paid_off_stripe')fail();
+      return [...args,'-d','expand[]=amount_paid_off_stripe'];
+    }
+    const filter={
+      '/v1/invoices':['subscription','sub',2],
+      '/v1/invoice_payments':['invoice','in',1],
+      '/v1/payment_intents':['customer','cus',1],
+      '/v1/charges':['customer','cus',1],
+    };
+    if(!Object.hasOwn(filter,path))fail();
+    const [key,prefix,limit]=filter[path],values=exactData(parameters,[key,'limit']);
+    if(!ref(values[key],prefix)||values.limit!==limit)fail();
+    return [...args,'-d',key+'='+values[key],'-d','limit='+limit];
+  }
+  async function proveOwnedBillingRequiredTrial(fixture,readOnly,limits){
+    const code='BILLING_REQUIRED_TRIAL';
+    if(requiredTrialStarted)throw fixed(code);
+    requiredTrialStarted=true;
+    return operation(code,limits,async context=>{
+      billingListener(context);
+      if(typeof readOnly!=='function')fail();
+      await binding(context,billingListener);
+      const configuration=Object.freeze({selectedCase:options.selectedCase,runId,
+        expectedSource:options.expectedSource,approvedBinding:options.approvedBinding});
+      const activeLimits={deadline:context.proofDeadline,signal:context.signal};
+      let pendingRead;
+      try {
+        const evidence=await proveOwnedBillingRequiredTrialEvidence({configuration,fixture},activeLimits,{
+          readOnly:async(request,active)=>{
+            billingListener(active);
+            const rows=await readOnly(request,active);
+            billingListener(active);
+            return rows;
+          },
+          readProvider:(request,active)=>{
+            pendingRead=(async()=>{
+              const response=await command(requiredTrialReadArgs(request),active,billingListener);
+              const body=pinnedResponse(response);
+              if(body.account!==undefined&&body.account!==ACCOUNT
+                ||body.livemode!==false&&(body.object!=='list'||body.livemode!==undefined))fail();
+              return {externalAccountId:ACCOUNT,apiVersion:VERSION,livemode:false,body};
+            })();
+            return pendingRead;
+          },
+        });
+        billingListener(context);
+        return evidence;
+      } finally {
+        // The evidence timeout can win before a signaled CLI process has closed.
+        await pendingRead?.catch(()=>{});
+      }
+    });
+  }
+  const stopOwnedListener=limits=>operation('STOP',limits,async context=>{
+    if(billingMode)billingFailed=true;
+    return stopListener(context);
+  });
+  async function stopRequiredTrialListener(limits){
+    const running=requiredTrialInFlight;
+    if(!running)return stopOwnedListener(limits);
+    try {
+      const {deadline,signal}=limits;
+      if(billingDeadline===null||deadline>billingDeadline+120000)fail();
+      const cleanupLimits={deadline,signal};
+      await billingBounded(cleanupLimits,()=>running.catch(()=>{}),deadline-Date.now());
+      return stopOwnedListener(cleanupLimits);
+    } catch {throw fixed('STOP');}
+  }
   function checkedBillingGraph(value,allowMissingPeriod=false){
     const keys=['runId','expectedSource','accountId','siteId','customerId','subscriptionId','operationId','priceId','priceVersion','customerReference','subscriptionReference','productReference','priceReference','invoiceReference','allocationReference','intentReference','periodStart','periodEnd'];
     const v=exactData(value,keys);
@@ -864,10 +969,11 @@ async function createCliAdapter(options,dependencies,purpose) {
       const result=await binding(context);if(billingMode)billingBound=true;return result;
     }),
     startListener:limits=>operation('LISTENER',limits,async context=>{if(billingMode){if(!billingBound||billingStarted)fail();billingStarted=true;}return startListener(context);}),
-    stopListener:limits=>operation('STOP',limits,async context=>{if(billingMode)billingFailed=true;return stopListener(context);}),
+    stopListener:requiredTrialCase?stopRequiredTrialListener:stopOwnedListener,
     ...(billingMode?{
       assertBillingListener,
-      ...(!firstPayment&&!retryCase&&!initial3ds&&!invoiceCase?{bindOwnedBillingGraph:(value,limits)=>operation('BILLING_BINDING',limits,context=>bindOwnedBillingGraph(value,context)),
+      ...(requiredTrialCase?{proveOwnedBillingRequiredTrial}:{}),
+      ...(!firstPayment&&!retryCase&&!initial3ds&&!invoiceCase&&!requiredTrialCase?{bindOwnedBillingGraph:(value,limits)=>operation('BILLING_BINDING',limits,context=>bindOwnedBillingGraph(value,context)),
       observeOwnedBillingGraph:limits=>operation('BILLING_GRAPH',limits,observeOwnedBillingGraph)}:{}),
       ...(invoiceCase?{observeOwnedBillingCapturedInvoice:(value,limits)=>operation('BILLING_INVOICE',limits,async context=>{
         billingListener(context);if(++invoiceReads>2)fail();

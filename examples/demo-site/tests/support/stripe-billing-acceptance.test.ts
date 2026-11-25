@@ -1,9 +1,10 @@
 import {createHash} from 'node:crypto';
 import test from 'node:test';import assert from 'node:assert/strict';import {readFile} from 'node:fs/promises';
 // @ts-expect-error Native Node type erasure requires explicit source extension.
-import {forwardBillingDispatch,runInitialBillingBrowser,runBillingCancellationBrowser,runBillingDeclineRetryBrowser,runBillingInitial3dsBrowser,runBillingInvoiceWebhooksBrowser} from './stripe-billing-acceptance.ts';
+import {forwardBillingDispatch,runInitialBillingBrowser,runBillingCancellationBrowser,runBillingDeclineRetryBrowser,runBillingInitial3dsBrowser,runBillingInvoiceWebhooksBrowser,runBillingRequiredTrialBrowser} from './stripe-billing-acceptance.ts';
 // @ts-ignore Native Node executes the protocol fixture registration.
 import {registerChromiumProtocolFixture} from './stripe-billing-chromium-route.ts';
+import type {SubscriptionOperation} from '@generic-payments/sdk';
 import type {BillingBinding,BillingPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import {errors,type Route} from '@playwright/test';
 const binding={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081',receiver:'http://127.0.0.1:18082'},priceId:'11111111-2222-4333-8444-555555555555'} as BillingBinding;
@@ -44,7 +45,7 @@ test('native runner reserves cleanup and scheduling time beyond the unchanged ow
 // A single in-memory page sends SDK-shaped requests only in response to visible manager
 // controls. It cannot make network calls. Responses retain their originating request.
 import type {Browser, Request, Response} from '@playwright/test';
-import type {BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort,BillingInvoiceWebhooksPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
+import type {BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort,BillingInvoiceWebhooksPort,BillingRequiredTrialPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import {browserCleanupConfirmed,browserDiagnostic,browserProviderOrigin} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 
 type SessionFailure = {
@@ -53,10 +54,10 @@ type SessionFailure = {
 };
 const approvedFixtureIssuer='https://approved-synthetic.stripe.com';
 function cancellationPage(fault = '', declineRetry = false, sca = false, invoiceCase = false, sessionFailure?:SessionFailure, pinnedCancellation=false,
- advancePassiveClock:(milliseconds:number)=>void=()=>{}) {
- const responseGuard=sca||invoiceCase||pinnedCancellation;
+ advancePassiveClock:(milliseconds:number)=>void=()=>{}, trial=false) {
+ const responseGuard=sca||invoiceCase||pinnedCancellation||trial;
  const id = (n:number) => '11111111-2222-4333-8444-' + String(n).padStart(12, '0');
- const b = {...binding, runId:id(99), expectedSource:'e'.repeat(40), siteKey:'demo-key', email:'user@example.test', siteId:id(1), productId:id(2)};
+ const b = {...binding, runId:id(99), expectedSource:'e'.repeat(40), siteKey:'demo-key', email:'user@example.test', siteId:id(1), productId:id(2),accountId:id(12)};
  const [sub, create, attempt, schedule, withdraw] = [id(3), id(4), id(5), id(6), id(7)];
  const boundary = new Date(Date.now() + 86400000).toISOString();
  const token = 'A'.repeat(43);
@@ -65,6 +66,18 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const cancel = base + '/' + sub + '/cancellation';
  const operation = base + '/' + sub + '/operations/' + create;
  const select = operation + '/confirmation-session';
+ const trialPermit=operation+'/action-confirmations', setupId='seti_fixture', setupSecret=setupId+'_secret_fixture';
+ const setupUrl='https://api.stripe.com/v1/setup_intents/'+setupId+'/confirm';
+ const grant='bga1_'+'G'.repeat(43);
+ const action={kind:'PROVIDER_CLIENT',secret:grant,expires_at:boundary};
+ const trialPeriod={start:new Date(Date.now()-1000).toISOString(),end:boundary};
+ let setupFinished=false, trialRefreshed=false,trialSettled=false,trialSamples=0;
+ const uncompletedTrial=fault==='trial-watch-expired'||fault==='trial-customer-expired';
+ const delayedTrial=trial && (uncompletedTrial||fault==='trial-delayed-settlement'||fault.startsWith('trial-terminal-'));
+ const trialSessionExpiry=fault==='trial-customer-expired'?new Date(Date.now()+120_000).toISOString():boundary;
+ const trialStatus=(status:SubscriptionOperation['status'],foreign=false):SubscriptionOperation=>({
+  subscriptionId:sub!,operationId:foreign?id(92):create!,status,actionAvailable:status==='REQUIRES_ACTION'
+ });
  const confirm = base + '/' + sub + '/operations/' + create + '/confirmation-attempts/' + attempt + '/confirm';
  const trace:string[] = [], sent:string[] = [], numbers:string[]=[], keysPressed:string[]=[];
  const successor=id(21),retry=confirm.replace(/confirm$/,'retry'),nextConfirm=confirm.replace(attempt!,successor);
@@ -125,10 +138,10 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  function publish(request:Request, status:number, json:object|null) {
   const earlyInitial=fault.startsWith('early-static')&&request.url()===select;
   const earlySuccessor=fault.startsWith('successor-static-image')&&request.url().endsWith('/client-session');
-  const earlyStatic=((declineRetry||sca)&&earlyInitial)||(declineRetry&&earlySuccessor);
+  const earlyStatic=((declineRetry||sca||trial)&&earlyInitial)||(declineRetry&&earlySuccessor);
   const bodyAvailable=earlyStatic?Promise.withResolvers<void>():undefined;
   const response = {request:()=>request,url:()=>request.url(),status:()=>status,
-   fromServiceWorker:()=>fault==='challenge-origin-worker'&&request.url()==='https://api.stripe.com/v1/3ds2/authenticate',body:async()=>{
+   fromServiceWorker:()=>fault==='trial-setup-worker'&&request.url()===setupUrl||fault==='challenge-origin-worker'&&request.url()==='https://api.stripe.com/v1/3ds2/authenticate',body:async()=>{
    if(request.url()==='https://api.stripe.com/v1/3ds2/authenticate'&&fault.startsWith('challenge-origin-')){
     trace.push('read original authenticate');
     if(fault==='challenge-origin-stalled')return new Promise<Buffer>(()=>{});
@@ -277,7 +290,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    ...(fault==='approved-issuer-block-foreign-origin-header'?{origin:'https://merchant-fixture.test'}:{})}:
    navigation||issuerShape?{'content-type':issuerShape==='media'?'application/json':'application/x-www-form-urlencoded',
    origin:issuerDocument===issuerUrl?issuerHost:'https://js.stripe.com'}:
-   {authorization:'Bearer pk_test_fixture',origin:'https://js.stripe.com'};
+   {authorization:'Bearer pk_test_fixture',origin:'https://js.stripe.com',
+    ...(trial?{'content-type':'application/x-www-form-urlencoded',...(fault==='trial-setup-cookie'?{cookie:'fixture'}:{})}:{})};
   const request={url:()=>url,method:()=>method,frame:()=>target,isNavigationRequest:()=>navigation,resourceType:()=>{
    if(url.startsWith('https://unlisted-fixture.stripe.com/')&&fault==='challenge-origin-unreadable-kind')throw Error('private-kind');
    if(passive){
@@ -305,8 +319,10 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    }} as unknown as Request;
   await handler({request:()=>request,continue:async(...args:unknown[])=>{
    assert.deepEqual(args,[]);providerSent.push(url);
-   await reply(navigation?(url===actionUrl?'issuer-submission':'issuer'):'issuer-api',200);
+   if(url===setupUrl)trace.push('forward trial setup');
+   await reply(navigation?(url===actionUrl?'issuer-submission':'issuer'):url===setupUrl?'trial-setup':'issuer-api',200);
    existing=publish(request,200,json);
+   if(url===setupUrl)setupFinished=true;
    if(navigation&&(url!==issuerUrl||fault!=='approved-issuer-block-uncommitted')){issuerDocument=url;navigate(issuer);}
    if(url===issuerUrl&&fault.startsWith('approved-issuer-later-')){
     const shape=fault.slice('approved-issuer-later-'.length);
@@ -405,6 +421,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const schedulePost = url===cancel, withdrawPost=url===cancel+'/withdraw';
   const key = declineRetry||responseGuard?id(nonce++):schedulePost?id(9):withdrawPost?(fault==='same-key'?id(9):id(10)):'initial-key';
   const headers = {'idempotency-key':key,authorization:'Bearer '+token,origin:b.endpoints.demo,'content-type':'application/json'};
+  if(trial&&url.startsWith(otp)){delete (headers as Record<string,unknown>).authorization;delete (headers as Record<string,unknown>)['idempotency-key'];}
+  if(trial&&method==='GET'){delete (headers as Record<string,unknown>)['idempotency-key'];delete (headers as Record<string,unknown>)['content-type'];}
   if(fault==='initial-foreign-authority' && url===operation+'/action' && status===409)headers.authorization='Bearer '+'B'.repeat(43);
   if(schedulePost && fault==='origin')headers.origin='https://elsewhere.invalid';
   if(schedulePost && fault==='cookie')Object.assign(headers,{cookie:'session=demo'});
@@ -425,13 +443,16 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     await sessionFailure?.holdSize?.();
     return {responseBodySize:sessionFailure?.measuredSize??Buffer.byteLength(JSON.stringify(result))};
    },
-   postData:()=>withdrawPost && fault==='malformed-withdraw'?'{"mode":"PERIOD_END"}':
+   postData:()=>trial&&method==='GET'?null:withdrawPost && fault==='malformed-withdraw'?'{"mode":"PERIOD_END"}':
+    url===trialPermit&&fault==='trial-permit-duplicate-fields'?'{"action_token":"'+grant+'","action_token":"'+grant+'"}':
     JSON.stringify(schedulePost&&fault==='immediate'?{mode:'IMMEDIATE'}:value)
   } as unknown as Request;
   const reply=observeNetwork(frame,request.url(),method);
-  const label=url===otp?'otp':url.endsWith('/verify')?'verify':url===base?'create':url===select?'selection':url===confirm?'confirm':schedulePost?'schedule':withdrawPost?'withdraw':'read';
+  const label=url===trialPermit?'trial-permit':url===otp?'otp':url.endsWith('/verify')?'verify':url===base?'create':url===select?'selection':url===confirm?'confirm':schedulePost?'schedule':withdrawPost?'withdraw':'read';
   const route = {request:()=>request,continue:async(...args:unknown[])=>{
-   assert.deepEqual(args,[]);sent.push(request.url());await reply(label,status);
+   assert.deepEqual(args,[]);sent.push(request.url());
+   if(url===trialPermit)trace.push('forward trial permit');
+   await reply(label,status);
    if(url===select && fault==='initial-session-no-response')return;
    if(url===confirm && fault==='confirm-backend-no-response')return;
    existing=publish((schedulePost&&fault==='foreign-request'||url===retry&&fault==='wrong-retry-response'||
@@ -444,10 +465,44 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   subscriptionId:sub!, siteId:b.siteId, customerId:id(11), productId:b.productId, billingPrice:{priceId:b.priceId},
   billingStatus:'ACTIVE', state:'ACTIVE', revision:4, paidThrough:boundary,period:{start:'2026-01-01T00:00:00Z',end:boundary},access:{allowed:true,reason:'PAID'},cancellation:null as {effectiveAt:string}|null, pendingOperation:null
  };
+ const trialProjection=()=>{
+  const allowed=trialSettled||fault==='trial-premature-access';
+  return {...subscription,subscriptionId:trialRefreshed&&fault==='trial-wrong-refresh'?id(63):sub,
+   paymentAccountId:b.accountId,billingPrice:{priceId:b.priceId,trialDays:1,trialPaymentMethodPolicy:'REQUIRED_BEFORE_TRIAL'},
+   state:allowed?'TRIALING':'INCOMPLETE',billingStatus:allowed?'TRIALING':'INCOMPLETE',
+   trial:allowed?trialPeriod:null,period:allowed?trialPeriod:null,paidThrough:null,entitledPrice:allowed?{priceId:b.priceId}:null,
+   cancellation:null,debt:null,pendingChange:null,revision:allowed?2:1,
+   pendingOperation:allowed?null:{kind:'CREATE',operationId:create,status:'PROCESSING'},
+   access:{allowed,reason:allowed?'TRIAL':'INITIAL_PAYMENT_REQUIRED',validUntil:allowed?new Date(Date.now()+60000).toISOString():null}};
+ };
  const manager = {
-  state:{phase:'ready',authorityRevision:1,subscription,operation:null},
+  client:{subscriptions:{
+   get:async()=>{await send(base+'/'+sub,{}, {},200,'GET');return trialProjection();},
+   operation:async()=>{
+    const op=trialStatus('SUCCEEDED',fault==='trial-terminal-read-foreign');
+    await send(operation,{}, {subscription_id:op.subscriptionId,operation_id:op.operationId,status:op.status,action_available:op.actionAvailable},200,'GET');
+    return op;
+   },
+  }},customerSession:{},
+  state:{phase:'ready',authorityRevision:1,subscription,operation:null as SubscriptionOperation|null},
   evaluateHandle:async()=>({evaluate:async(fn:(check:()=>boolean)=>boolean)=>fn(()=>manager.state.authorityRevision===1)}),
-  evaluate:async(fn:(m:unknown)=>unknown)=>fn(manager),
+  evaluate:async(fn:(m:unknown,arg:unknown)=>unknown,arg?:unknown)=>{
+   if(delayedTrial&&setupFinished&&!trialRefreshed&&arg===undefined){
+    ++trialSamples;
+    if(uncompletedTrial||fault==='trial-delayed-settlement'&&trialSamples<=42)advancePassiveClock(10_000);
+    const until=uncompletedTrial?Infinity:fault==='trial-delayed-settlement'?43:3;
+    if(trialSamples===until){
+     const terminal=fault==='trial-terminal-failed'?'FAILED':fault==='trial-terminal-unknown'?'UNKNOWN':
+      fault==='trial-terminal-action'?'REQUIRES_ACTION':'SUCCEEDED';
+     manager.state.operation=trialStatus(terminal);
+     manager.state.phase=terminal==='FAILED'?'error':terminal==='UNKNOWN'?'unknown':terminal==='REQUIRES_ACTION'?'requires_action':'ready';
+     if(terminal==='SUCCEEDED'){trialSettled=true;Object.assign(subscription,trialProjection());}
+     trace.push('trial status '+terminal);
+    }
+    if(fault==='trial-terminal-foreign'&&trialSamples===1)manager.state.operation=trialStatus('PROCESSING',true);
+   }
+   return fn(manager,arg);
+  },
   locator:()=>({filter:()=>({isVisible:async()=>fault==='confirm-form-validation'})}),
   frameLocator:()=>({locator:(selector:string)=>({fill:async(v:string)=>{if(selector.includes('number'))numbers.push(v);},isVisible:async()=>false})}),
   getByRole:(_role:string,opts:{name:string})=>{
@@ -459,7 +514,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     if(opts.name==='Pay')armedPay=n+1;
     return {evaluate:async(fn:(get:()=>boolean)=>boolean)=>{
      if(opts.name==='Retry payment'&&fault==='retry-owner-lost-during-gesture')manager.state.authorityRevision++;
-     return fn(()=>opts.name==='Retry payment'?retryClicked:opts.name==='Create subscription'?trace.includes('Create subscription'):declineRetry?payCount>n:payClicked);
+     return fn(()=>opts.name==='Refresh status'?trialRefreshed:opts.name==='Retry payment'?retryClicked:opts.name==='Create subscription'?trace.includes('Create subscription'):declineRetry?payCount>n:payClicked);
     }};
    },
    click:async()=>{
@@ -470,13 +525,14 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     if(name==='Request code'&&['early-provider-confirm','early-token','unknown-host'].includes(fault))await provider(fault==='unknown-host'?'https://unknown.invalid/anything':'https://api.stripe.com/v1/'+(fault==='early-token'?'confirmation_tokens':'payment_intents/pi_test/confirm'));
     if(name==='Request code') await send(otp, {site_key:b.siteKey,email:b.email,intent:'AUTHENTICATE'}, {challenge_id:id(8)});
     if(name==='Verify code'){
-     await send(otp+'/'+id(8)+'/verify',{}, {customer:{id:id(11),status:'ACTIVE'},site_id:b.siteId,scopes:['SUBSCRIPTION_READ','SUBSCRIPTION_MANAGE'],session_token:token},200);
-     await send(base+'?limit=100',{}, {items:fault==='create-nonempty-baseline'?[{id:id(99)}]:[],next_cursor:null},200,'GET');
+     await send(otp+'/'+id(8)+'/verify',trial?{site_key:b.siteKey,code:'123456'}:{}, {expires_at:trial?trialSessionExpiry:boundary,customer:{id:id(11),status:'ACTIVE'},site_id:b.siteId,scopes:['SUBSCRIPTION_READ','SUBSCRIPTION_MANAGE'],session_token:token},200);
+     const firstList=send(base+'?limit=100',{}, {items:fault==='create-nonempty-baseline'?[{id:id(99)}]:[],next_cursor:null},200,'GET');
+     if(trial)void firstList.catch(()=>{});else await firstList;
     }
     if(name==='Create subscription'){
      if(fault==='create-pointer-lost'&&!fromKeyboard)return;
      if(fault==='create-late-gesture')await (lateCreate=new Promise<void>(resolve=>setTimeout(resolve,50)));
-     const directAction=fault==='initial-direct-action';
+     const directAction=fault==='initial-direct-action'||fault==='trial-direct-action';
      const createSubscription=()=>send(base,{price_id:b.priceId,recurring_consent:true},{subscription_id:sub,operation_id:create,status:directAction?'REQUIRES_ACTION':'PROCESSING',
       action_available:directAction,next_action:directAction?{kind:'PROVIDER_CLIENT',secret:'bga1_'+'G'.repeat(43),expires_at:boundary}:null,browser_confirm_allowed:false});
      if(fault==='create-persist-pending'){void createSubscription().catch(()=>{});return;}
@@ -484,6 +540,17 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      if(fault==='provider-route-stripe-network')await provider('https://private-provider.stripe.network/?data=private-canary');
      if(fault==='provider-route-frame')await provider('https://r.stripe.com/',frame);
      if(fault==='provider-route-cookie')await provider('https://r.stripe.com/');
+     if(trial){
+      void (async()=>{
+       await send(operation,{}, {operation_id:create,subscription_id:sub,status:'PROCESSING',action_available:false},200,'GET');
+       await send(operation+'/action',{},action,200,'GET');
+       await send(operation+'/confirmation-attempts/current',{},null,200,'GET');
+       await send(select,{action_token:fault==='trial-foreign-grant'?'bga1_'+'B'.repeat(43):grant},{
+        protocol:'BROWSER_CONFIRM_V1',provider:'stripe',flow:fault==='trial-payment-session'?'PAYMENT':'SETUP',
+        publishable_key:'pk_test_fixture',client_secret:setupSecret,action_token:grant,expires_at:trialSessionExpiry},200);
+      })().catch(()=>{});
+      return;
+     }
      const session=sessionFor(attempt!);
      if(fault.startsWith('early-static')&&fault.endsWith('-invalid-session'))session.capability='invalid';
      if(fault==='initial-session-wire-protocol')session.protocol='BROWSER_CONFIRM_V1';
@@ -523,6 +590,30 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      if(fault==='confirm-click-unobserved')return;
      if(fault==='confirm-late-gesture')await (latePay=new Promise<void>(resolve=>setTimeout(resolve,50)));
      if(fault==='before-actual-click')await provider('https://api.stripe.com/v1/confirmation_tokens');
+     if(trial){
+      payClicked=fault!=='trial-untrusted';
+      const permit=()=>send(trialPermit,{action_token:grant},{subscription_id:sub,operation_id:fault==='trial-foreign-permit-receipt'?id(90):create,
+       status:'PROCESSING',action_available:false,next_action:null,browser_confirm_allowed:fault!=='trial-denied-permit'});
+      const confirmSetup=()=>wire(fault==='trial-payment-intent'?'https://api.stripe.com/v1/payment_intents/pi_fixture/confirm':
+       fault==='trial-confirmation-token'?'https://api.stripe.com/v1/confirmation_tokens':
+       fault==='trial-wrong-setup-id'?setupUrl.replace(setupId,'seti_other'):setupUrl,
+       fault==='trial-foreign-frame'?frame:stripeFrame,
+       new URLSearchParams({key:fault==='trial-wrong-provider-key'?'pk_test_other':'pk_test_fixture',
+        client_secret:fault==='trial-wrong-secret'?setupSecret+'other':setupSecret,
+        ...(fault==='trial-provider-token'?{confirmation_token:'ctoken_other'}:{})}).toString(),
+       {id:setupId,object:'setup_intent',status:fault==='trial-setup-pending'?'processing':'succeeded',client_secret:setupSecret,livemode:false});
+      if(fault==='trial-generic-mutation')await send(base+'/'+sub+'/method-setups',{recurring_consent:true},{});
+      if(fault==='trial-before-permit')await confirmSetup();
+      await permit();
+      if(fault==='trial-repeat-permit')await permit();
+      await confirmSetup();
+      if(fault==='trial-repeat-setup')await confirmSetup();
+      trialSettled=!delayedTrial;
+      manager.state.operation=trialStatus(trialSettled?'SUCCEEDED':'PROCESSING');
+      manager.state.phase=trialSettled?'ready':'processing';
+      Object.assign(subscription,trialProjection());
+      return;
+     }
      payClicked=true;payCount++;
      if(['confirm-before-token','confirm-form-validation'].includes(fault))return;
      if(fault==='late-first-token'){
@@ -561,6 +652,13 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      if(fault==='repeat-retry')await send(retry,{},receiptFor(attempt!,'DECLINED',false,successor),200);
      void send(nextConfirm.replace(/confirm$/,'client-session'),{}, {...sessionFor(successor),...(['different-pi','successor-static-image-invalid-session'].includes(fault)?{client_secret:'pi_foreign_secret_fixture'}:{})},200).catch(()=>{});
     }
+    if(trial&&name==='Refresh status'){
+     trialRefreshed=true;Object.assign(subscription,trialProjection());
+     await send(base+'?limit=100',{}, {items:[{subscription_id:sub,
+      site_id:fault==='trial-wrong-refresh-wire'?id(87):b.siteId,customer_id:id(11),product_id:b.productId,payment_account_id:b.accountId,
+      state:'TRIALING',billing_status:'TRIALING',paid_through:null,pending_operation:null,billing_price:{price_id:b.priceId},
+      revision:2,access:{subscription_id:sub,allowed:true,reason:'TRIAL'}}],next_cursor:null},200,'GET');
+    }
     if(name==='Refresh status' && ack){
      if(fault==='lost-authority')manager.state.authorityRevision++;
      if(fault==='unknown-state')manager.state.phase='unknown';
@@ -593,7 +691,10 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    }
    };
    return {...control,elementHandle:async()=>({
-    waitForElementState:async()=>{},
+    waitForElementState:async(state:string)=>{
+     if(delayedTrial&&state==='enabled'&&opts.name==='Refresh status'&&!trialSettled)
+      throw new errors.TimeoutError('synthetic Refresh is disabled while CREATE is processing');
+    },
     focus:async()=>{},
     evaluate:async()=>opts.name==='Create subscription'?fault!=='create-focus-lost':
      opts.name==='Retry payment'?fault!=='retry-focus-lost':fault!=='confirm-focus-lost',
@@ -678,7 +779,16 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    if(kind==='confirm'&&fault==='confirm-persist-pending')await new Promise<void>(resolve=>{releaseDispatch=resolve;});
    return true;
   },releaseOriginalConfirm:()=>{trace.push('release original confirm');if(fault==='invalid ingress')throw Error('tainted');return true;},
-  acknowledge:async(kind:string)=>{if(invoiceCase&&kind==='confirm'){trace.push('completed invoice proof');if(fault==='invalid evidence')throw Error();}if(declineRetry&&kind==='confirm'){trace.push('decline proof');return fault!=='no-decline-proof';}return true;},acknowledgeCustomer:async()=>true,
+  acknowledge:async(kind:string)=>{if(trial&&kind==='create')trace.push('ack trial create');if(invoiceCase&&kind==='confirm'){trace.push('completed invoice proof');if(fault==='invalid evidence')throw Error();}if(declineRetry&&kind==='confirm'){trace.push('decline proof');return fault!=='no-decline-proof';}return true;},acknowledgeCustomer:async()=>true,
+  beforeTrialSetup:async(kind:string,identity:unknown,key?:string)=>{
+   assert.deepEqual(identity,{subscriptionId:sub,operationId:create});assert.equal(typeof key,kind==='permit'?'string':'undefined');
+   trace.push('persist trial '+kind);
+   if(fault==='trial-retire-'+kind)manager.state.authorityRevision++;
+   return true;
+  },
+  acknowledgeTrialSetup:async(identity:unknown)=>{
+   assert.deepEqual(identity,{subscriptionId:sub,operationId:create});trace.push('verify setup');return true;
+  },
   beforeChallenge:async()=>{trace.push('persist challenge');return true;},acknowledgeChallenge:async()=>{trace.push('issuer witnessed');return true;},
   beforeRetry:async()=>{trace.push('persist retry');if(fault==='retired-retry')manager.state.authorityRevision++;return true;},acknowledgeRetry:async()=>{trace.push('ack retry');return true;},
   beforeSuccessorConfirm:async()=>{trace.push('persist successor');if(fault==='retired-successor')manager.state.authorityRevision++;return true;},acknowledgeSuccessor:async()=>{trace.push('recovered proof');return true;},
@@ -690,8 +800,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    return fault!=='persist';
   },
   verifyCancellation:async(kind:string,operation:string)=>{trace.push('verify '+kind+' '+operation);return fault!=='proof';}
- } as BillingCancellationPort&BillingDeclineRetryPort&BillingInitial3dsPort&BillingInvoiceWebhooksPort;
- return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,keysPressed,presentation,sessionErrorBodyReads:()=>sessionErrorBodyReads,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),reloadStripe:()=>navigate(stripeFrame),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed,latePay:()=>latePay,lateCreate:()=>lateCreate,requestPassiveIssuerAsset};
+ } as BillingCancellationPort&BillingDeclineRetryPort&BillingInitial3dsPort&BillingInvoiceWebhooksPort&BillingRequiredTrialPort;
+ return {browser:{newContext:async()=>context} as unknown as Browser,port,trace,sent,providerSent,cancel,id,numbers,trialPermit,setupUrl,keysPressed,presentation,sessionErrorBodyReads:()=>sessionErrorBodyReads,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>navigate(issuer),reloadStripe:()=>navigate(stripeFrame),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed,latePay:()=>latePay,lateCreate:()=>lateCreate,requestPassiveIssuerAsset};
 }
 test('same-page manager schedules and withdraws once after the initial paid proof',async()=>{
  const f=cancellationPage();
@@ -1586,3 +1696,89 @@ for(const fault of ['none','invalid ingress','invalid evidence','redirect-token'
   assert.equal(f.trace.some(x=>x.startsWith('followed redirect ')||x==='Retry payment'||x==='issuer Complete'),false);
  });
 }
+
+test('required trial creates once, spends the original setup permit, then refreshes the same trial',async()=>{
+ const f=cancellationPage('',false,false,false,undefined,false,undefined,true);
+ assert.equal(await runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:Date.now()+3000}),true);
+ assert.deepEqual(f.trace.filter(step=>['ack trial create','Pay','persist trial permit','forward trial permit','persist trial setup','forward trial setup','verify setup','Refresh status'].includes(step)),
+  ['ack trial create','Pay','persist trial permit','forward trial permit','persist trial setup','forward trial setup','verify setup','Refresh status']);
+ assert.deepEqual(f.keysPressed,['Enter','Enter','Enter']);
+ assert.deepEqual(f.providerSent.filter(url=>url.endsWith('/confirm')),[f.setupUrl]);
+ assert.equal(f.sent.filter(url=>url===f.trialPermit).length,1);
+ assert.ok(f.closed());
+});
+
+for(const [fault,permits,setups] of [
+ ['trial-direct-action',0,0],['trial-foreign-grant',0,0],['trial-payment-session',0,0],['trial-premature-access',0,0],
+ ['trial-untrusted',0,0],['trial-generic-mutation',0,0],['trial-before-permit',0,0],
+ ['trial-permit-duplicate-fields',0,0],['trial-foreign-permit-receipt',1,0],['trial-denied-permit',1,0],
+ ['trial-payment-intent',1,0],['trial-confirmation-token',1,0],['trial-wrong-setup-id',1,0],
+ ['trial-wrong-secret',1,0],['trial-wrong-provider-key',1,0],['trial-provider-token',1,0],['trial-foreign-frame',1,0],['trial-setup-cookie',1,0],
+ ['trial-retire-permit',0,0],['trial-retire-setup',1,0],
+ ['trial-setup-worker',1,1],['trial-setup-pending',1,1],['redirect-trial-setup',1,1],
+ ['trial-repeat-permit',1,0],['trial-repeat-setup',1,1],['trial-wrong-refresh',1,1],['trial-wrong-refresh-wire',1,1],
+] as const)test('required trial closes its browser authority for '+fault,async()=>{
+ const f=cancellationPage(fault,false,false,false,undefined,false,undefined,true);
+ await assert.rejects(runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:Date.now()+2000}),/billing_BROWSER/);
+ assert.equal(f.sent.filter(url=>url===f.trialPermit).length,permits);
+ assert.equal(f.providerSent.filter(url=>url===f.setupUrl).length,setups);
+ assert.equal(f.providerSent.some(url=>/payment_intents|confirmation_tokens/.test(url)),false);
+ assert.equal(f.trace.some(step=>step.startsWith('followed redirect ')),false);
+ assert.ok(f.closed());
+});
+
+test('required trial holds a pinned passive asset until its original SETUP session is valid',async t=>{
+ const f=cancellationPage('early-static-image',false,false,false,undefined,false,undefined,true);
+ const asset=t.mock.method(globalThis,'fetch',async(url:URL,options:RequestInit)=>{
+  assert.equal(url.href,'https://private.example/image.png');
+  assert.equal(options.redirect,'error');assert.equal(options.credentials,'omit');
+  assert.deepEqual(f.trace.filter(step=>step==='pinned asset intercepted'||step==='initial session body read'),
+   ['pinned asset intercepted','initial session body read']);
+  return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+ });
+ assert.equal(await runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:Date.now()+2000},origin=>origin==='https://private.example'),true);
+ assert.equal(asset.mock.callCount(),1);
+ assert.deepEqual(f.presentation,['fulfilled 200']);
+ assert.equal(f.providerSent.filter(url=>url===f.setupUrl).length,1);
+ assert.ok(f.closed());
+});
+
+test('required trial follows the original CREATE across both sweep delays before refreshing',async t=>{
+ const now=Date.now(),setTimer=globalThis.setTimeout;
+ let elapsed=0;
+ t.mock.method(Date,'now',()=>now+elapsed);
+ t.mock.method(globalThis,'setTimeout',(fn:()=>void,ms:number)=>setTimer(fn,ms===250?1:ms));
+ const f=cancellationPage('trial-delayed-settlement',false,false,false,undefined,false,ms=>{elapsed+=ms;},true);
+ assert.equal(await runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:now+600_000}),true);
+ assert.equal(elapsed,420_000);
+ assert.deepEqual(f.trace.filter(step=>step.startsWith('trial status ')||step==='Refresh status'),
+  ['trial status SUCCEEDED','Refresh status']);
+ assert.equal(f.trace.filter(step=>step==='Pay').length,1);
+ assert.equal(f.sent.filter(url=>url===f.trialPermit).length,1);
+ assert.deepEqual(f.providerSent.filter(url=>url.endsWith('/confirm')),[f.setupUrl]);
+ assert.ok(f.closed());
+});
+
+for(const fault of ['failed','unknown','action','foreign','read-foreign'])test('required trial refuses unsafe CREATE observation '+fault,async()=>{
+ const f=cancellationPage('trial-terminal-'+fault,false,false,false,undefined,false,undefined,true);
+ await assert.rejects(runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:Date.now()+2000}),/billing_BROWSER/);
+ assert.equal(f.trace.includes('Refresh status'),false);
+ assert.equal(f.sent.filter(url=>url===f.trialPermit).length,1);
+ assert.equal(f.providerSent.filter(url=>url===f.setupUrl).length,1);
+ assert.ok(f.closed());
+});
+
+for(const [fault,lifetime] of [['trial-watch-expired',600_000],['trial-customer-expired',120_000]] as const)
+ test('required trial stops processing at '+fault,async t=>{
+  const now=Date.now(),setTimer=globalThis.setTimeout;
+  let elapsed=0;
+  t.mock.method(Date,'now',()=>now+elapsed);
+  t.mock.method(globalThis,'setTimeout',(fn:()=>void,ms:number)=>setTimer(fn,ms===250?1:ms));
+  const f=cancellationPage(fault,false,false,false,undefined,false,ms=>{elapsed+=ms;},true);
+  await assert.rejects(runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:now+700_000}),/billing_BROWSER/);
+  assert.equal(elapsed,lifetime);
+  assert.equal(f.trace.includes('Refresh status'),false);
+  assert.equal(f.sent.filter(url=>url===f.trialPermit).length,1);
+  assert.deepEqual(f.providerSent.filter(url=>url.endsWith('/confirm')),[f.setupUrl]);
+  assert.ok(f.closed());
+ });

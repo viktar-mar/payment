@@ -27,8 +27,12 @@ export async function createOwnedBillingInitial3ds(options,dependencies={}) {
 export async function createOwnedBillingInvoiceWebhooks(options,dependencies={}) {
  return createOwner(options,dependencies,'initial_missed_reordered');
 }
+export async function createOwnedBillingRequiredTrial(options,dependencies={}) {
+ return createOwner(options,dependencies,'initial_required_trial');
+}
 async function createOwner(options,dependencies,selectedCase) {
- const invoiceCase=selectedCase==='initial_missed_reordered';
+ const invoiceCase=selectedCase==='initial_missed_reordered',requiredTrial=selectedCase==='initial_required_trial';
+ let trialStage='create';
  let ingress;
  const challenge=selectedCase==='initial_3ds';
  const cancellation=selectedCase==='initial_cancel_withdraw',retry=selectedCase==='initial_decline_retry';
@@ -38,7 +42,7 @@ async function createOwner(options,dependencies,selectedCase) {
  let finishRun;const finished=new Promise(resolve=>finishRun=resolve);
  let state='NEW',phase='NEW',failure=null,bootstrap,cli,fixture,cleanupPromise,active,accepted=false,cleanupConfirmed=false;
  const lifetime=new AbortController(),counts={create:0,confirm:0},acks={create:false,confirm:false};
- const resources=()=>Object.freeze({runId:configuration.runId,expectedSource:configuration.expectedSource,scope:invoiceCase?'INITIAL_MISSED_REORDERED':challenge?'INITIAL_3DS':retry?'INITIAL_DECLINE_RETRY':cancellation?'INITIAL_CANCEL_WITHDRAW':'INITIAL_NON_CLOCK',status:state,phase,code:failure,initialAccepted:accepted,...(cancellation?{cancellationAccepted:accepted}:{}),...(retry?{declineRetryAccepted:accepted}:{}),...(challenge?{initial3dsAccepted:accepted}:{}),...(invoiceCase?{invoiceWebhooksAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
+ const resources=()=>Object.freeze({runId:configuration.runId,expectedSource:configuration.expectedSource,scope:requiredTrial?'INITIAL_REQUIRED_TRIAL':invoiceCase?'INITIAL_MISSED_REORDERED':challenge?'INITIAL_3DS':retry?'INITIAL_DECLINE_RETRY':cancellation?'INITIAL_CANCEL_WITHDRAW':'INITIAL_NON_CLOCK',status:state,phase,code:failure,initialAccepted:!requiredTrial&&accepted,...(requiredTrial?{requiredTrialAccepted:accepted}:{}),...(cancellation?{cancellationAccepted:accepted}:{}),...(retry?{declineRetryAccepted:accepted}:{}),...(challenge?{initial3dsAccepted:accepted}:{}),...(invoiceCase?{invoiceWebhooksAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
  const fail=code=>{failure??=code;lifetime.abort();throw billingError(failure);};
  async function cleanup() {
   if(cleanupPromise)return cleanupPromise;
@@ -97,19 +101,63 @@ async function createOwner(options,dependencies,selectedCase) {
     const invoiceFlow=invoiceCase?invoiceWebhookFlow({configuration,bootstrap,cli,fixture,ingress,active,step,fail,createEvidence:dependencies.createInvoiceEvidence}):null;
     const retryFlow=retry?initialRetryFlow({configuration,bootstrap,cli,fixture,active,step,fail,prove:dependencies.proveInitialRetry}):null;
     const challengeFlow=challenge?initialChallengeFlow({configuration,bootstrap,cli,fixture,active,step,fail,prove:dependencies.proveInitial3ds}):null;
+    function claimTrial(stage,next){
+     billingCheck(active);
+     if(failure||trialStage!==stage)fail('TRIAL_ORDER');
+     trialStage=next;
+    }
+    async function recordTrial(stage,receipt,identity,key){
+     await step(stage,async l=>{
+      const scope=fixture.resources();
+      if(!scope.subscriptionId||!scope.operationId||identity?.subscriptionId!==scope.subscriptionId||identity?.operationId!==scope.operationId)fail(stage);
+      const permit=receipt==='trial-permit-dispatch';
+      if(permit?!billingUuid(key):key!==undefined)fail(stage);
+      const hash=permit?createHash('sha256').update(key).digest('hex'):undefined;
+      if((permit&&hash===scope.createKeyHash)||await cli.assertBillingListener(l)!==true||
+        await fixture.recordTrialSetup(receipt,scope,hash,l)!==true)fail(stage);
+     });
+    }
     const port=Object.freeze({resources:()=>fixture.resources(),
      beforeDispatch:async(kind,key,identity)=>{
       billingCheck(active);if(failure)fail(failure);
       if(!['create','confirm'].includes(kind)||counts[kind]!==0||(kind==='confirm'&&!acks.create))fail('DISPATCH');
-      counts[kind]++;await step('DISPATCH',async l=>{if(await cli.assertBillingListener(l)!==true||await fixture.beforeDispatch(kind,key,identity,l)!==true)fail('DISPATCH');});return true;
+      if(requiredTrial){
+       if(kind!=='create'||!billingUuid(key))fail('DISPATCH');
+       claimTrial('create','create-in-flight');
+      }
+      counts[kind]++;await step('DISPATCH',async l=>{if(await cli.assertBillingListener(l)!==true||await fixture.beforeDispatch(kind,key,identity,l)!==true)fail('DISPATCH');});
+      if(requiredTrial)trialStage='create-sent';return true;
      },
      acknowledge:async(kind,identity)=>{
       billingCheck(active);if(failure)fail(failure);
       if(!['create','confirm'].includes(kind)||counts[kind]!==1||acks[kind]||identity?.state==='UNKNOWN')fail('ACK');
-      if(await step('ACK',l=>fixture.acknowledge(kind,identity,l))!==true)fail('ACK');acks[kind]=true;return true;
+      if(requiredTrial)claimTrial('create-sent','creating');
+      if(await step('ACK',l=>fixture.acknowledge(kind,identity,l))!==true)fail('ACK');
+      acks[kind]=true;if(requiredTrial)trialStage='permit';return true;
      },
      withOtpCode:async(callback,l)=>{billingCheck(active);return fixture.withOtpCode(callback,{deadline:Math.min(active.deadline,l.deadline),signal:active.signal});},
-     acknowledgeCustomer:async(value)=>{billingCheck(active);return fixture.acknowledgeCustomer(value,active);},
+     acknowledgeCustomer:async(value)=>{
+      billingCheck(active);
+      if(requiredTrial)return step('CUSTOMER',async l=>{
+       if(await fixture.acknowledgeCustomer(value,l)!==true)fail('CUSTOMER');
+       return true;
+      });
+      return fixture.acknowledgeCustomer(value,active);
+     },
+     ...(requiredTrial?{
+      async beforeTrialSetup(kind,identity,key){
+       if(kind!=='permit'&&kind!=='setup')fail('TRIAL_ORDER');
+       claimTrial(kind,'writing');
+       await recordTrial(kind==='permit'?'TRIAL_SETUP_PERMIT':'TRIAL_SETUP_DISPATCH',
+        kind==='permit'?'trial-permit-dispatch':'trial-setup-dispatch',identity,key);
+       trialStage=kind==='permit'?'setup':'ack';return true;
+      },
+      async acknowledgeTrialSetup(identity){
+       claimTrial('ack','writing');
+       await recordTrial('TRIAL_SETUP_ACK','trial-setup-ack',identity);
+       trialStage='complete';return true;
+      },
+     }:{}),
      ...(invoiceFlow?.port),
      ...(retryFlow?.port),
      ...(challengeFlow?.port),
@@ -153,7 +201,7 @@ async function createOwner(options,dependencies,selectedCase) {
      }:{}),
     });
     const browserResult=await step('BROWSER',async()=>{
-     const guarded=retry||challenge||invoiceCase||cancellation;
+     const guarded=retry||challenge||invoiceCase||cancellation||requiredTrial;
      const execution=Promise.resolve().then(()=>{billingCheck(active);return browserJourney(port,active);});
      if(guarded)browserCompletion=execution.then(result=>result===true,
       error=>browserDiagnostic(error,'ACCEPTANCE')!==null&&browserCleanupConfirmed(error));
@@ -178,7 +226,14 @@ async function createOwner(options,dependencies,selectedCase) {
       throw error;
      }
     },2700000);
-    if(invoiceFlow){
+    if(requiredTrial){
+     if(browserResult!==true)fail('BROWSER');
+     claimTrial('complete','verification');
+     if(await step('TRIAL_EVIDENCE',async l=>{
+      const prove=dependencies.proveRequiredTrial??(await import('./stripe-billing-required-trial-runtime-evidence.mjs')).proveBillingRequiredTrialRuntime;
+      return prove({configuration,bootstrap,cli,fixture},l);
+     },180000)!==true)fail('TRIAL_EVIDENCE');
+    }else if(invoiceFlow){
      if(browserResult!==true)fail('BROWSER');
      await invoiceFlow.finish();
     }else if(challengeFlow){

@@ -1,7 +1,7 @@
 import type {BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import {isAcceptanceBrowserDiagnostic} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 
-export function billingTerminal(scope:string,field:string,marker:string,annotation:string,casePhases:string[],orderCode:string,caseCode?:(code:string)=>boolean){
+export function billingTerminal(scope:string,field:string,marker:string,annotation:string,casePhases:string[],orderCode:string,caseCode?:(code:string)=>boolean,initialAccepted=true){
 const phases=new Set(['NEW','PREFLIGHT','BOOTSTRAP','PREPARE','CLI','LOGIN','BINDING','LISTENER','START','FIXTURE','PROVISION','BROWSER','COMPLETE',...casePhases]);
 const codes=new Set([...phases,'LIMITS',orderCode,'ABORTED','FAILED','CLEANUP']);
 const knownCode=(code:string)=>codes.has(code)||isAcceptanceBrowserDiagnostic(code)||caseCode?.(code)===true;
@@ -27,7 +27,7 @@ function accepted(raw:unknown){
  if(!raw || typeof raw!=='object')return false;
  const value=(key:string)=>Object.getOwnPropertyDescriptor(raw,key)?.value;
  return value('scope')===scope && value('status')==='CLOSED' && value('phase')==='COMPLETE' && value('code')===null &&
-  value('initialAccepted')===true && value(field)===true && value('cleanupConfirmed')===true && value('full5bAccepted')===false;
+  value('initialAccepted')===initialAccepted && value(field)===true && value('cleanupConfirmed')===true && value('full5bAccepted')===false;
 }
 /** Worker-side boundary. Only this owner supplies the attempt's terminal annotation. */
 async function run<P>(owner:{run(journey:(port:P,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<unknown>;close():Promise<unknown>;resources():unknown},journey:(port:P,limits:BillingLimits)=>Promise<unknown>,annotations:{type:string;description?:string}[]){

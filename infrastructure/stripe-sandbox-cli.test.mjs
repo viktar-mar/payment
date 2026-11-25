@@ -505,6 +505,7 @@ async function billingSetup(mutate=()=>{}){
 test('Billing CLI exposes only lifecycle and exact graph reads with fixed supported listener events',async()=>{
   const f=await billingSetup();assert.equal(f.adapter.bindMissedIntent,undefined);assert.equal(f.adapter.bindManualPayment,undefined);
   assert.equal(f.adapter.observeOwnedBillingCancellation,undefined);
+  assert.equal(f.adapter.proveOwnedBillingRequiredTrial,undefined);
   await f.adapter.validateBinding(f.limits);await start(f);const args=f.calls.find(c=>c.child).args,events=args[args.indexOf('--events')+1].split(',');
   assert.ok(events.includes('invoice.paid'));assert.ok(events.includes('customer.subscription.created'));assert.ok(events.includes('payment_intent.succeeded'));assert.equal(events.some(e=>e.startsWith('refund.')),false);
   assert.equal(await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits),true);
@@ -851,7 +852,8 @@ async function failedRenewalProfile(t, acceptanceCase) {
     PAYMENT_STRIPE_BILLING_FAILED_RENEWAL_CLI_PROFILE_RUN_ID:prior,
   },selectedCase:'initial_failed_renewal_grace_recovery',controlPort:18083,frozenTime:1790000000});
   if(acceptanceCase){
-    const profileFlag=acceptanceProfileFlags[acceptanceCase];
+    const profileFlag=acceptanceCase==='initial_required_trial'
+      ?'PAYMENT_STRIPE_BILLING_REQUIRED_TRIAL_CLI_PROFILE_RUN_ID':acceptanceProfileFlags[acceptanceCase];
     f.options.configuration.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',
       PAYMENT_STRIPE_BILLING_CASE:acceptanceCase,[profileFlag]:prior};
     f.options.configuration.selectedCase=acceptanceCase;
@@ -862,6 +864,217 @@ async function failedRenewalProfile(t, acceptanceCase) {
   Object.assign(f.dependencies,{lstat,open,readdir,realpath});
   return {f,cli,source,destination};
 }
+
+async function requiredTrialCli(t,{startListener=true,beforeRequest,identity=oauth,execFile,
+  configureListener=child=>queueMicrotask(()=>child.stderr.write(READY))}={}){
+  const {f,destination}=await failedRenewalProfile(t,'initial_required_trial');
+  const {runId,expectedSource}=f.options.configuration;
+  const scope={...billingTarget(),runId,expectedSource,siteKey:'s5a-'+runId.replaceAll('-',''),
+    productId:'99999999-1111-4222-8333-444444444444',createKeyHash:'b'.repeat(64)};
+  const startTime=Math.floor(Date.now()/1000)-30,endTime=startTime+7*86400;
+  const trialStart=new Date(startTime*1000),trialEnd=new Date(endTime*1000);
+  const customer='/v1/customers/cus_original',subscription='/v1/subscriptions/sub_original',invoice='/v1/invoices/in_original';
+  const setup='/v1/setup_intents/seti_original',method='/v1/payment_methods/pm_original';
+  const list=(...data)=>({object:'list',has_more:false,data});
+  Object.assign(f.objects[subscription],{status:'trialing',trial_start:startTime,trial_end:endTime,
+    default_payment_method:'pm_original',billing_mode:{type:'classic'},collection_method:'charge_automatically',
+    pause_collection:null,cancel_at:null,cancel_at_period_end:false,schedule:null,pending_update:null,ended_at:null,
+    trial_settings:{end_behavior:{missing_payment_method:'pause'}}});
+  Object.assign(f.objects[subscription].items.data[0],{current_period_start:startTime,current_period_end:endTime});
+  const line=f.objects[invoice+'/lines'].data[0];
+  Object.assign(line,{amount:0,period:{start:startTime,end:endTime}});
+  Object.assign(f.objects[invoice],{test_clock:null,amount_due:0,amount_paid:0,total:0,subtotal:0,lines:list(line)});
+  Object.assign(f.objects,{
+    [setup]:{id:'seti_original',object:'setup_intent',livemode:false,customer:'cus_original',payment_method:'pm_original',
+      status:'succeeded',usage:'off_session',payment_method_types:['card'],metadata:f.objects[subscription].metadata,
+      client_secret:'private-setup-value'},
+    [method]:{id:'pm_original',object:'payment_method',livemode:false,customer:'cus_original',type:'card',card:{}},
+    '/v1/invoice_payments':list(),'/v1/payment_intents':list(),'/v1/charges':list(),
+  });
+  const cliRequests=[],events=[],execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,settings)=>{
+    if(args[11]==='whoami')return {stdout:JSON.stringify(identity()),stderr:''};
+    const path=args[12];
+    if(args[11]!=='get'||path==='/v1/balance')return execute(file,args,settings);
+    cliRequests.push({file,args,settings});
+    events.push(path);
+    const changed=await beforeRequest?.(f,path,settings);
+    return changed??{stdout:JSON.stringify(f.objects[path]),stderr:`< HTTP 200\n< Stripe-Version: ${VERSION}\n`};
+  };
+  if(execFile){
+    const executeCommand=f.dependencies.execute;
+    delete f.dependencies.execute;
+    f.dependencies.execFile=(...args)=>execFile(executeCommand,...args);
+  }
+  const seed=await readFile(new URL('./stripe-billing-required-trial-seed.sql',import.meta.url),'utf8');
+  const proof=await readFile(new URL('./stripe-billing-required-trial-proof.sql',import.meta.url),'utf8');
+  const seedArgs=[runId,scope.accountId,scope.siteId,scope.customerId,scope.productId,scope.priceId,
+    scope.subscriptionId,scope.operationId,scope.createKeyHash];
+  const ownedFixture={resources:()=>scope};
+  const readOnly=async(request,limits)=>{
+    assert.equal(request.mode,'read only');
+    assert.equal(limits.signal.aborted,false);
+    if(request.query===seed){
+      events.push('seed');
+      assert.deepEqual(request.args,seedArgs);
+      return [{customer_reference:'cus_original',setup_reference:'seti_original',method_reference:'pm_original',
+        subscription_reference:'sub_original',item_reference:'si_original',invoice_reference:'in_original',
+        provider_price_id:'price_original',provider_product_id:'prod_original',trial_start:trialStart,trial_end:trialEnd}];
+    }
+    assert.equal(request.query,proof);
+    events.push('proof');
+    assert.deepEqual(request.args,[...seedArgs,'cus_original','seti_original','pm_original','sub_original','si_original',
+      'in_original',trialStart.toISOString(),trialEnd.toISOString()]);
+    const evaluated=new Date();
+    return [{run_id:runId,billing_record_id:RUN,trial_started_event_id:scope.operationId,revision:1,
+      trial_start:trialStart,trial_end:trialEnd,access_evaluated_at:evaluated,access_valid_until:new Date(evaluated.getTime()+300000)}];
+  };
+  const spawn=f.dependencies.spawn;
+  f.dependencies.spawn=(...args)=>{
+    const child=spawn(...args);
+    configureListener(child);
+    return child;
+  };
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingCliAdapter(f.options,f.dependencies);
+  await f.adapter.validateBinding(f.limits);
+  if(startListener)await f.adapter.startListener(f.limits);
+  t.after(()=>f.adapter.stopListener(f.limits));
+  return {f,cliRequests,destination,events,ownedFixture,readOnly};
+}
+
+test('required-trial CLI exposes only the owned zero-cash proof and emits the nine scoped test-mode GETs',async t=>{
+  const {f,cliRequests,destination,events,ownedFixture,readOnly}=await requiredTrialCli(t);
+  assert.ok(Object.hasOwn(f.adapter,'proveOwnedBillingRequiredTrial'));
+  assert.deepEqual(Object.keys(f.adapter).sort(),['assertBillingListener','proveOwnedBillingRequiredTrial',
+    'startListener','stopListener','validateBinding']);
+  const limits={deadline:Date.now()+4000};
+  const result=await f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,limits);
+  assert.equal(result.trialVerified,true);
+  assert.equal(result.noCash,true);
+  assert.equal(result.runId,f.options.configuration.runId);
+  assert.equal(result.billingRecordId,RUN);
+  assert.doesNotMatch(JSON.stringify(result),/seti_original|private-setup-value|pm_original|whsec_/);
+  const expected=[
+    ['/v1/customers/cus_original'],
+    ['/v1/setup_intents/seti_original'],
+    ['/v1/payment_methods/pm_original'],
+    ['/v1/subscriptions/sub_original'],
+    ['/v1/invoices/in_original','-d','expand[]=amount_paid_off_stripe'],
+    ['/v1/invoices','-d','subscription=sub_original','-d','limit=2'],
+    ['/v1/invoice_payments','-d','invoice=in_original','-d','limit=1'],
+    ['/v1/payment_intents','-d','customer=cus_original','-d','limit=1'],
+    ['/v1/charges','-d','customer=cus_original','-d','limit=1'],
+  ];
+  assert.deepEqual(events,['seed',...expected.map(([path])=>path),'proof']);
+  assert.deepEqual(cliRequests.map(({args})=>args.slice(11)),expected.map(([path,...filters])=>
+    ['get',path,'--show-headers',...filters,'--stripe-version',VERSION]));
+  for(const {file,args,settings} of cliRequests){
+    assert.equal(file,'/usr/bin/sandbox-exec');
+    assert.equal(args[2],'/opt/homebrew/bin/stripe');
+    assert.equal(args[4],destination+'/config.toml');
+    assert.equal(settings.env.XDG_CONFIG_HOME,f.options.cliDirectory+'/config');
+    assert.equal(settings.env.HOME,f.options.cliDirectory+'/home');
+    assert.equal(settings.shell,false);
+    assert.ok(settings.timeout>0&&settings.timeout<=4000);
+  }
+  await rejects(f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,limits),'BILLING_REQUIRED_TRIAL');
+  assert.equal(cliRequests.length,9);
+});
+
+for(const [name,beforeRequest] of [
+  ['foreign API response version',()=>({stdout:'{}',stderr:'< HTTP 200\n< Stripe-Version: leaked-value\n'})],
+  ['foreign customer account',f=>{f.objects['/v1/customers/cus_original'].account='acct_other';}],
+  ['lost listener during a read',f=>{f.children[0].emit('exit',1);}],
+  ['untrusted command failure',()=>{throw new Proxy({},{get(){assert.fail('cannot inspect command failure');}});}],
+])test('required-trial CLI consumes a failed proof after '+name,async t=>{
+  const {f,events,ownedFixture,readOnly}=await requiredTrialCli(t,{beforeRequest});
+  await rejects(f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,f.limits),'BILLING_REQUIRED_TRIAL');
+  await rejects(f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,f.limits),'BILLING_REQUIRED_TRIAL');
+  assert.deepEqual(events,['seed','/v1/customers/cus_original']);
+});
+
+test('required-trial CLI requires ready listener ownership before seed or provider reads',async t=>{
+  const {f,events,ownedFixture,readOnly}=await requiredTrialCli(t,{startListener:false});
+  await rejects(f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,f.limits),'BILLING_REQUIRED_TRIAL');
+  assert.deepEqual(events,[]);
+});
+
+test('required-trial CLI rechecks the authenticated account before the proof begins',async t=>{
+  let accountId=ACCOUNT;
+  const {f,events,ownedFixture,readOnly}=await requiredTrialCli(t,{identity:()=>({...oauth(),account_id:accountId})});
+  accountId='acct_other';
+  await rejects(f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,f.limits),'BILLING_REQUIRED_TRIAL');
+  assert.deepEqual(events,[]);
+});
+
+for(const held of ['whoami','/v1/customers/cus_original'])test('required-trial stop awaits the aborted CLI close for '+held,async t=>{
+  let notifyStarted,hold=false;
+  const started=new Promise(resolve=>{notifyStarted=resolve;});
+  const {f,events,ownedFixture,readOnly}=await requiredTrialCli(t,{
+    execFile(execute,file,args,settings,callback){
+      const child=new EventEmitter();
+      void execute(file,args,settings).then(({stdout,stderr})=>{
+        if(hold&&args.includes(held)){
+          settings.signal.addEventListener('abort',()=>callback(new Error('private failure'),'',''),{once:true});
+          notifyStarted({child,signal:settings.signal});
+        }else{
+          callback(null,stdout,stderr);
+          child.emit('close',0);
+        }
+      });
+      return child;
+    },
+  });
+  hold=true;
+  const controller=new AbortController(),limits={...f.limits,signal:controller.signal};
+  const result=f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,limits);
+  const proofFailed=rejects(result,'BILLING_REQUIRED_TRIAL');
+  const {child,signal}=await started;
+  controller.abort();
+  const stopping=f.adapter.stopListener({deadline:f.limits.deadline+1000});
+  let stopSettled=false;
+  void stopping.then(()=>{stopSettled=true;},()=>{stopSettled=true;});
+  try {
+    await rejects(f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,limits),'BILLING_REQUIRED_TRIAL');
+    await turn();
+    assert.equal(signal.aborted,true);
+    assert.equal(stopSettled,false);
+    assert.deepEqual(f.children[0].signals,[]);
+  } finally {
+    child.emit('close',1);
+    await proofFailed;
+  }
+  assert.equal(await stopping,true);
+  assert.deepEqual(f.children[0].signals,['SIGINT']);
+  assert.deepEqual(events,held==='whoami'?[]:['seed',held]);
+});
+
+test('required-trial stop awaits the owned listener close after startup is aborted',async t=>{
+  let notifySpawn;
+  const spawned=new Promise(resolve=>{notifySpawn=resolve;});
+  const {f}=await requiredTrialCli(t,{startListener:false,configureListener:child=>{
+    child.autoClose=false;
+    notifySpawn(child);
+  }});
+  const controller=new AbortController();
+  const startFailed=rejects(f.adapter.startListener({...f.limits,signal:controller.signal}),'LISTENER');
+  const child=await spawned;
+  controller.abort();
+  const stopping=f.adapter.stopListener({deadline:f.limits.deadline+1000});
+  let stopSettled=false;
+  void stopping.then(()=>{stopSettled=true;},()=>{stopSettled=true;});
+  try {
+    await turn();
+    assert.equal(stopSettled,false);
+    assert.deepEqual(child.signals,['SIGINT']);
+  } finally {
+    child.emit('close',0);
+    await startFailed;
+  }
+  assert.equal(await stopping,true);
+  assert.deepEqual(child.signals,['SIGINT']);
+});
 
 for(const selectedCase of Object.keys(acceptanceProfileFlags))for(const reason of ['valid','expired','extra scope','linked credentials'])test(selectedCase+' reuses an isolated test-only profile: '+reason,async t=>{
   const {f,source,destination}=await failedRenewalProfile(t,selectedCase);

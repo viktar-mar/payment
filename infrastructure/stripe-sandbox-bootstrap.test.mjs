@@ -129,7 +129,7 @@ function fixture(overrides={}) {
   const options={runId:RUN,expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports:{...PORTS},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},env,...overrides};
   function container(service) {
     const helper=service.startsWith('issuer-'),name=PROJECT+'-'+service;
-    const value={...(service==='backend'&&options.selectedCase==='initial_missed_reordered'?{InvoiceWorkers:true}:{}),Id:id(++serial),Name:'/'+name,Image:images.get(helper?'backend':service),Labels:cLabels(service),
+    const value={...(service==='backend'&&['initial_missed_reordered','initial_required_trial'].includes(options.selectedCase)?{BillingWorkers:true}:{}),Id:id(++serial),Name:'/'+name,Image:images.get(helper?'backend':service),Labels:cLabels(service),
       State:{Status:'created',Running:false,ExitCode:0,StartedAt:'0001-01-01T00:00:00Z',Health:''},Mounts:mounts(service),
       Networks:helper?{none:{NetworkID:''}}:{[PROJECT+'-network']:{NetworkID:network.Id}},PortBindings:mapping(service),Ports:{},
       User:helper?(service==='issuer-installer'?'0:0':'10001:10001'):(service==='backend'?'payment':service==='demo-site'?'101:101':service==='callback-receiver'?'node':''),
@@ -178,7 +178,7 @@ function fixture(overrides={}) {
         if(a.includes('build')) {images.set('backend',image(1));images.set('demo-site',image(2));}
         if(a.includes('config'))stdout=JSON.stringify({services:Object.fromEntries(SERVICES.map(service=>[service,{
           image:service==='backend'?PROJECT+'-backend:latest':service==='demo-site'?PROJECT+'-demo-site:latest':service==='postgres'?'postgres:18-alpine':service==='mailpit'?'axllent/mailpit:v1.27':'node:24-alpine',
-          container_name:PROJECT+'-'+service,labels:labels('container'),networks:{default:null},environment:service==='backend'?{PAYMENT_STRIPE_SANDBOX_ENABLED:'false',...(options.selectedCase==='initial_missed_reordered'?{SPRING_APPLICATION_JSON:'{"payment.subscriptions.scheduling-enabled":false,"payment.inbox.scheduling-enabled":true,"payment.callbacks.scheduling-enabled":true}'}:{}),...(options.env.PAYMENT_STRIPE_BILLING_ACCEPTANCE==='true'?{PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:'buildOnly'}:{})}:{},
+          container_name:PROJECT+'-'+service,labels:labels('container'),networks:{default:null},environment:service==='backend'?{PAYMENT_STRIPE_SANDBOX_ENABLED:'false',...(['initial_missed_reordered','initial_required_trial'].includes(options.selectedCase)?{SPRING_APPLICATION_JSON:JSON.stringify({'payment.subscriptions.scheduling-enabled':options.selectedCase==='initial_required_trial','payment.inbox.scheduling-enabled':options.selectedCase==='initial_missed_reordered','payment.callbacks.scheduling-enabled':true})}:{}),...(options.env.PAYMENT_STRIPE_BILLING_ACCEPTANCE==='true'?{PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:'buildOnly'}:{})}:{},
           ports:Object.entries(mapping(service)).map(([port,binding])=>({target:Number(port.split('/')[0]),published:binding[0].HostPort,host_ip:binding[0].HostIp,protocol:'tcp',mode:'ingress'})),
           volumes:mounts(service).map(m=>({type:m.Type,source:m.Type==='bind'?m.Source:service==='backend'?'owned-issuer':'payment-postgres',target:m.Destination,read_only:!m.RW})),
         }])),networks:{default:{external:true,name:PROJECT+'-network'}},volumes:{'payment-postgres':{external:true,name:PROJECT+'-postgres'},'owned-issuer':{external:true,name:PROJECT+'-issuer'}}});
@@ -1492,24 +1492,24 @@ for(const [selectedCase,flag] of [
  }
 });
 
-for(const selectedCase of ['initial_success','initial_cancel_withdraw','initial_decline_retry','initial_3ds','initial_missed_reordered']){
+for(const selectedCase of ['initial_success','initial_cancel_withdraw','initial_decline_retry','initial_3ds','initial_missed_reordered','initial_required_trial']){
  test('each non-clock case selects its reviewed demo build: '+selectedCase,async()=>{
   const f=fixture();
   f.options.selectedCase=selectedCase;
   f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',
-    ...(selectedCase==='initial_success'?{}:{PAYMENT_STRIPE_BILLING_CASE:selectedCase})};
+    ...(selectedCase==='initial_success'?{}:{PAYMENT_STRIPE_BILLING_CASE:selectedCase}),...(selectedCase==='initial_required_trial'?{PAYMENT_STRIPE_BILLING_REQUIRED_TRIAL_CLI_PROFILE_RUN_ID:'22345678-1234-4234-8234-123456789abc'}:{})};
   const bootstrap=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);
   await bootstrap.prepare(LIMIT());
   const builds=f.events.filter(e=>e.type==='process'&&e.args.includes('build')&&e.args.includes('--quiet'));
   assert.equal(builds.length,1);
   const args=builds[0].args.filter(value=>value.startsWith('PAYMENT_DEMO_BUILD_MODE='));
-  if(selectedCase==='initial_missed_reordered'){
+  if(['initial_missed_reordered','initial_required_trial'].includes(selectedCase)){
    const yaml=f.files.get(DIR+'/owned.yaml').contents.toString();
-   assert.match(yaml,/"payment.subscriptions.scheduling-enabled":false/);
-   assert.match(yaml,/"payment.inbox.scheduling-enabled":true/);
+   assert.ok(yaml.includes('"payment.subscriptions.scheduling-enabled":'+(selectedCase==='initial_required_trial')));
+   assert.ok(yaml.includes('"payment.inbox.scheduling-enabled":'+(selectedCase==='initial_missed_reordered')));
    assert.match(yaml,/"payment.callbacks.scheduling-enabled":true/);
   }
-  assert.deepEqual(args,['initial_missed_reordered','initial_cancel_withdraw'].includes(selectedCase)?['PAYMENT_DEMO_BUILD_MODE=billing-invoice-webhooks']:selectedCase==='initial_3ds'?['PAYMENT_DEMO_BUILD_MODE=billing-initial-3ds']:selectedCase==='initial_decline_retry'?['PAYMENT_DEMO_BUILD_MODE=billing-decline-retry']:[]);
+  assert.deepEqual(args,['initial_missed_reordered','initial_cancel_withdraw','initial_required_trial'].includes(selectedCase)?['PAYMENT_DEMO_BUILD_MODE=billing-invoice-webhooks']:selectedCase==='initial_3ds'?['PAYMENT_DEMO_BUILD_MODE=billing-initial-3ds']:selectedCase==='initial_decline_retry'?['PAYMENT_DEMO_BUILD_MODE=billing-decline-retry']:[]);
   await bootstrap.stop(LIMIT());
  });
 }
@@ -2736,4 +2736,48 @@ for(const scenario of ['never started','started despite error','unavailable duri
  assert.deepEqual(persistenceIntents(f),before);
  const line='owned_failed_renewal_diagnostic stage=START checkpoint=START_MAILPIT_COMMAND_NONZERO_EXIT '+(available?'cleanup=CONFIRMED witness=NONE':'cleanup=UNCONFIRMED witness=BOOTSTRAP_STOP');
  assert.equal(formatBillingFailedRenewalDiagnostic(result),line);assert.equal(parseBillingFailedRenewalDiagnosticLine(line),line);
+});
+
+test('required-trial STOP drains aborted database ownership verification before stopping exact containers',async()=>{
+  const f=fixture(),selectedCase='initial_required_trial';
+  Object.assign(f.options,{selectedCase,env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',
+    PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',PAYMENT_STRIPE_BILLING_CASE:selectedCase,
+    PAYMENT_STRIPE_BILLING_REQUIRED_TRIAL_CLI_PROFILE_RUN_ID:'22345678-1234-4234-8234-123456789abc'}});
+  const execute=f.dependencies.execute;
+  let armed=false,release,entered;
+  const commandEntered=new Promise(resolve=>entered=resolve);
+  f.dependencies.execute=async(file,args,settings)=>{
+    const result=await execute(file,args,settings);
+    if(armed&&args.includes('inspect')){
+      armed=false;
+      await new Promise(resolve=>{release=()=>resolve(result);entered();});
+      assert.equal(settings.signal.aborted,true);
+    }
+    return result;
+  };
+  const b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);
+  const limits=LIMIT();
+  await b.prepare(limits);
+  await b.persistWebhookSecret(SECRET);
+  await b.start(limits);
+  const controller=new AbortController();
+  armed=true;
+  const read=b.withDatabaseCredentials(()=>assert.fail('aborted proof must not release credentials'),
+    {deadline:limits.deadline,signal:controller.signal});
+  const refusal=assert.rejects(read,/ADMIN_PENDING/);
+  await commandEntered;
+  controller.abort();
+  let stopped=false;
+  const stopping=b.stop(LIMIT()).then(outcome=>{stopped=true;return outcome;});
+  await turn();
+  const stops=()=>f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='stop');
+  assert.equal(stopped,false);
+  assert.equal(stops().length,0);
+  release();
+  await refusal;
+  assert.equal(await stopping,true);
+  assert.equal(b.resources().status,'STOPPED');
+  assert.deepEqual(new Set(stops().map(e=>e.args.at(-1))),
+    new Set(SERVICES.map(service=>b.resources().containers[service].id)));
+  assert.equal(stops().length,SERVICES.length);
 });

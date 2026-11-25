@@ -234,6 +234,8 @@ The ordinary subscription sweep passed through a pending SetupIntent, recorded t
 
 The scheduled-change fixture now uses the exact business clock sample during preview. A provider clock two seconds ahead reproduced the previous five-minute TTL rejection. The fixture keeps the original TTL and quote revalidation assertions. The combined local run passed all 12 scenarios, 119 steps, and 37 focused trial, method-isolation and SQL tests.
 
+The dedicated required-trial runner now binds one Stripe SetupIntent confirmation to its original CREATE and consumed browser permit, then verifies trial access, one zero invoice, no cash, and the signed trial-start callback. Its admission, browser flow, read-only evidence and cleanup have local regression coverage. This case still needs a fresh Stripe Sandbox receipt. [Required-trial scenario](testing/billing-required-trial.md)
+
 ## Fresh failed renewal, grace and recovery — 2026-11-15
 
 **HOSTED VERIFIED · native attempted, NOT_ACCEPTED · full Stage 5B NOT_ACCEPTED.** Runtime source `997252a6e6b07f611914a543daf442492f948706` passed [Offline CI 43771017914](https://github.com/viktar-mar/payment/actions/runs/43771017914): all four jobs (`backend`, `backend-owned-failed-renewal`, `frontend`, `infrastructure`) succeeded. This includes the genuine hosted composition, browser support regressions and all three no-launch runtime packaging checks. Local targeted verification recorded 1,144 passing inert checks and strict TypeScript success; independent source review passed. These results establish the tested source, not a native payment outcome. [Operator guide](testing/billing-failed-renewal-recovery.md#fresh-eur20-failed-renewal-and-recovery--2026-11-15)

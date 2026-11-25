@@ -55,3 +55,21 @@ export function createOwnedBillingInvoiceWebhooks(options:unknown,dependencies?:
   run(journey:(port:BillingInvoiceWebhooksPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingInvoiceWebhooksResult>;
   close(limits?:BillingLimits):Promise<BillingInvoiceWebhooksResult>;
 }>;
+
+export interface BillingRequiredTrialIdentity {subscriptionId:string;operationId:string}
+export interface BillingRequiredTrialPort extends Pick<BillingPort,'resources'|'withOtpCode'|'acknowledgeCustomer'> {
+  beforeDispatch(kind:'create',key:string):Promise<true>;
+  acknowledge(kind:'create',identity:BillingRequiredTrialIdentity):Promise<true>;
+  beforeTrialSetup(kind:'permit'|'setup',identity:BillingRequiredTrialIdentity,key?:string):Promise<true>;
+  acknowledgeTrialSetup(identity:BillingRequiredTrialIdentity):Promise<true>;
+}
+export interface BillingRequiredTrialResult extends Omit<BillingResult,'scope'|'initialAccepted'> {
+  scope:'INITIAL_REQUIRED_TRIAL';
+  initialAccepted:false;
+  requiredTrialAccepted:boolean;
+}
+export function createOwnedBillingRequiredTrial(options:unknown,dependencies?:Record<string,unknown>):Promise<{
+  resources():BillingRequiredTrialResult;
+  run(journey:(port:BillingRequiredTrialPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingRequiredTrialResult>;
+  close(limits?:BillingLimits):Promise<BillingRequiredTrialResult>;
+}>;

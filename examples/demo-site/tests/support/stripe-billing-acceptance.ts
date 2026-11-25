@@ -1,7 +1,7 @@
 import {errors} from '@playwright/test';
 import type {Browser,Route,Request,Response,BrowserContext,Page,Locator,Frame,JSHandle,ElementHandle} from '@playwright/test';
-import type {BillingPort,BillingBinding,BillingLimits,BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort,BillingInvoiceWebhooksPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
-import type {GenericSubscriptionManager} from '@generic-payments/sdk';
+import type {BillingPort,BillingBinding,BillingLimits,BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort,BillingInvoiceWebhooksPort,BillingRequiredTrialPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
+import type {GenericSubscriptionManager,SubscriptionView} from '@generic-payments/sdk';
 import type {ManagerState} from '../../../../frontend/sdk/src/subscriptions/manager-state';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
 import {acceptanceBrowserFailure,finishBrowserCleanup,rememberBrowserProviderOrigin} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
@@ -90,6 +90,8 @@ export async function forwardBillingDispatch(route:Pick<Route,'request'|'continu
   billingCheck(limits);await check?.();confirmation?.check();billingCheck(limits);if(beforeForward)need(beforeForward()===true);await route.continue();billingCheck(limits);
  }catch{fail();}
 }
+const actionGrant=/^bga1_[A-Za-z0-9_-]{43}$/;
+const setupSecretFormat=/^(seti_[A-Za-z0-9]{1,250})_secret_[A-Za-z0-9_-]+$/;
 const stripeScriptOrigin = (url:URL) => providerOrigin(url) && (url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com'));
 
 /** Capture live Stripe.js ancestors to the one checkout. A child of a foreign document cannot lend authority. */
@@ -238,11 +240,14 @@ export function runBillingInitial3dsBrowser(browser:Browser,port:BillingInitial3
 export function runBillingInvoiceWebhooksBrowser(browser:Browser,port:BillingInvoiceWebhooksPort,limits:BillingLimits,matchesStaticOrigin:(origin:string)=>boolean):Promise<true>{
  return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,undefined,port);
 }
-async function runBillingBrowser(browser:Browser,port:BillingPort,limits:BillingLimits,cancellationPort?:BillingCancellationPort,retryPort?:BillingDeclineRetryPort,matchesStaticOrigin?:(origin:string)=>boolean,challenge?:{port:BillingInitial3dsPort;waitForGesture:WaitForIssuerGesture;approvedIssuerOrigin?:string},invoiceCase?:BillingInvoiceWebhooksPort):Promise<true>{
+export function runBillingRequiredTrialBrowser(browser:Browser,port:BillingRequiredTrialPort,limits:BillingLimits,matchesStaticOrigin?:(origin:string)=>boolean):Promise<true>{
+ return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,undefined,undefined,port);
+}
+async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequiredTrialPort,limits:BillingLimits,cancellationPort?:BillingCancellationPort,retryPort?:BillingDeclineRetryPort,matchesStaticOrigin?:(origin:string)=>boolean,challenge?:{port:BillingInitial3dsPort;waitForGesture:WaitForIssuerGesture;approvedIssuerOrigin?:string},invoiceCase?:BillingInvoiceWebhooksPort,trialCase?:BillingRequiredTrialPort):Promise<true>{
  const pinnedCancellation=!!cancellationPort&&typeof matchesStaticOrigin==='function';
- const exactInitialCheckout=!!(retryPort||challenge||pinnedCancellation);
+ const exactInitialCheckout=!!(retryPort||challenge||pinnedCancellation||trialCase);
  const bound=exactInitialCheckout||!!invoiceCase,guarded=!!(cancellationPort||bound);
- const responseGuard=!!(challenge||invoiceCase||pinnedCancellation);
+ const responseGuard=!!(challenge||invoiceCase||pinnedCancellation||trialCase);
  const lifecycle=new AbortController();
  const ownerLimits=limits;
  limits={deadline:limits.deadline,signal:limits.signal?AbortSignal.any([limits.signal,lifecycle.signal]):lifecycle.signal};
@@ -270,6 +275,32 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   let createGestureInFlight=false,payInFlight=false,retryGestureInFlight=false;
   let trustedPayClick:JSHandle<()=>boolean>|undefined, tokenRequest:Request|undefined, publishableKey:string|undefined;
   const requests=new Map<string,Request>(),keys=new Set<string>();
+  const customerReady=Promise.withResolvers<void>();
+  const trialIdentity=()=>({subscriptionId,operationId});
+  const listUrl=base+'?limit=100';
+  let grantedAction:{token:string;expiry:number}|undefined,setup:{id:string;secret:string;expiry:number}|undefined;
+  let trialPermit:Promise<void>|undefined,trialRefresh:JSHandle<()=>boolean>|undefined;
+  let trialTerminalRead=false;
+  let otpCode:string|undefined,customerExpiry=0;
+  const readGrant=(raw:unknown)=>{
+   if(!exact(raw,['kind','secret','expires_at']) || raw.kind!=='PROVIDER_CLIENT' || typeof raw.secret!=='string' ||
+      !actionGrant.test(raw.secret) || typeof raw.expires_at!=='string' || !(Date.parse(raw.expires_at)>Date.now()))return fail();
+   return {token:raw.secret,expiry:Date.parse(raw.expires_at)};
+  };
+  const sameSetupGesture=async()=>{
+   await checkManager();
+   if(!setup || setup.expiry<=Date.now() || !payInFlight || !trustedPayClick ||
+      !await trustedPayClick.evaluate(clicked=>clicked()))return fail();
+   check();need(payInFlight && setup.expiry>Date.now());
+   return setup;
+  };
+  const setupUrl=()=>setup?'https://api.stripe.com/v1/setup_intents/'+setup.id+'/confirm':'';
+  function approvedSetupFields(value:URLSearchParams,headers:Record<string,string>,selected:NonNullable<typeof setup>){
+   const key=value.getAll('key');
+   need(value.getAll('client_secret').length===1 && value.get('client_secret')===selected.secret &&
+    key.length<=1 && (key.length===1 ? key[0]===publishableKey : headers.authorization==='Bearer '+publishableKey) &&
+    ![...value.keys()].some(name=>/^(?:client_secret|key)\[|(?:^|\[)(?:payment_intent|confirmation_token|stripe_account|stripe_context)(?:\[|\]|$)/i.test(name)));
+  }
   const initialReads:{url:string;request:Request;authorized?:boolean}[]=[];
   const initialReadPath=/^\/[a-f0-9-]{36}\/operations\/[a-f0-9-]{36}(?:\/action|\/confirmation-attempts\/current)?$/;
   let initialReadOverflow=false,initialSessionObserved=false,initialSessionForwarded=false;
@@ -364,11 +395,12 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     response.status()===200 && !response.fromServiceWorker() && !request.redirectedFrom();
   }
   const pinned=bound&&matchesStaticOrigin?pinnedRetryPresentation(page,()=>checkoutUrl,limits,()=>{
+   if(trialCase && setup && !requests.has('trial-setup'))return 'initial';
    if(firstAttempt && !successorId && confirmPosts===0)return 'initial';
    if(successorId && attemptId===successorId && confirmPosts===1)return 'successor';
    return undefined;
   },()=>!payInFlight && confirmPosts===0,kind=>{
-   if(!firstAttempt && selectPosts===1 && requests.has('initial-session') &&
+   if(!firstAttempt && !setup && selectPosts===1 && requests.has('initial-session') &&
       (kind==='document' || exactInitialCheckout && acceptedSessionHeaders('initial-session')))
     return {phase:'initial',ready:initialPresentationReady.promise};
    if(kind==='asset' && retryPort && successorId && attemptId!==successorId && confirmPosts===1 && acceptedSessionHeaders('successor-session'))
@@ -411,12 +443,20 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    const support=url.hostname==='r.stripe.com'||url.hostname==='merchant-ui-api.stripe.com';
    const preflight=method==='OPTIONS';
    const tokenPath=api && url.pathname==='/v1/confirmation_tokens';
+   const setupPath=!!trialCase && api && url.href===setupUrl();
+   const setupRead=!!trialCase && api && /^\/v1\/setup_intents\/seti_[A-Za-z0-9]{1,250}$/.test(url.pathname);
    report('BROWSER_PROVIDER_ROUTE_FRAME');
    const original=stripeFrames(page,request,navigation,script && method==='GET',binding.endpoints.demo);
    need(original && (!navigation || script && method==='GET'));
    const click=trustedPayClick,interceptedAttempt=attemptId;
    const samePay=()=>need(payInFlight && click && click===trustedPayClick && attemptId===interceptedAttempt);
-   if(tokenPath){report('BROWSER_PROVIDER_ROUTE_PAY');samePay();need(await click!.evaluate(clicked=>clicked()));}
+   if(tokenPath){report('BROWSER_PROVIDER_ROUTE_PAY');need(!trialCase);samePay();need(await click!.evaluate(clicked=>clicked()));}
+   if(setupPath){
+    const permit=requests.get('trial-permit'),receipt=permit?.existingResponse();
+    need(permit && receipt?.request()===permit && receipt.url()===permit.url() && receipt.status()===202 &&
+     !receipt.fromServiceWorker() && !permit.redirectedFrom());
+    if(!preflight)claim('trial-setup',request);
+   }
    report('BROWSER_PROVIDER_HEADERS');
    const headers=await request.allHeaders();
    report('BROWSER_PROVIDER_CURRENT');
@@ -436,13 +476,44 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    need(intended==='GET'||intended==='POST');
    report('BROWSER_PROVIDER_ROUTE_POLICY');
    if(!script && headers.origin)need(headers.origin===new URL(request.frame().url()).origin);
+   if(trialCase)need(!headers['stripe-account'] && !headers['stripe-context']);
    if(script)need(intended==='GET');
    else if(support){
     // These two network-only origins are approved for uncredentialed support requests.
     // Never forward API resources or navigation through a support origin.
     need(!navigation && !/^\/(?:v\d+|api)(?:\/|$)/i.test(url.pathname) && !url.pathname.includes('%'));
    }else if(api && !navigation && !cancellation && selectPosts===1){
-    if(tokenPath){
+    if(trialCase){
+     if(setupPath){
+      report('BROWSER_PROVIDER_ROUTE_PAY');
+      const selected=await sameSetupGesture();
+      if(!trialPermit)return fail();
+      await billingBounded(limits,()=>trialPermit!);check();
+      need(intended==='POST' && headers.origin===new URL(request.frame().url()).origin);
+      if(!preflight){
+       const form=request.postData();
+       need(['xhr','fetch'].includes(request.resourceType()) && typeof form==='string' && form.length>0 && form.length<=32768 && !/%(?![0-9a-f]{2})/i.test(form) &&
+        /^application\/x-www-form-urlencoded(?:\s*;\s*charset=utf-8)?$/i.test(headers['content-type']??''));
+       approvedSetupFields(new URLSearchParams(form!),headers,selected);
+       need(await billingBounded(limits,()=>trialCase.beforeTrialSetup('setup',trialIdentity()))===true);
+       await sameSetupGesture();sameFrames();
+      }
+     }else{
+      need(setupRead?intended==='GET':url.pathname==='/v1/elements/sessions' &&
+       (intended==='GET' || !requests.has('trial-setup')));
+      // Stripe.js can receive the approved session just before the controller reads it.
+      if(!setup){
+       need(acceptedSessionHeaders('initial-session'));
+       await billingBounded(limits,()=>initialPresentationReady.promise);
+      }
+      if(!setup || setup.expiry<=Date.now())return fail();
+      await checkManager();sameFrames();
+      if(setupRead){
+       need(url.pathname==='/v1/setup_intents/'+setup.id);
+       if(!preflight)approvedSetupFields(url.searchParams,headers,setup);
+      }
+     }
+    }else if(tokenPath){
      samePay();need(!tokenRequest && intended==='POST' && !url.search);
      await checkManager();samePay();need(!tokenRequest);
      if(!preflight)tokenRequest=request;
@@ -452,9 +523,10 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     report('BROWSER_PROVIDER_ROUTE_GUARD');
     await redirects.authorize(request);check();sameFrames();
     if(tokenPath){report('BROWSER_PROVIDER_ROUTE_PAY');await checkManager();samePay();sameFrames();}
+    if(setupPath){report('BROWSER_PROVIDER_ROUTE_PAY');await sameSetupGesture();sameFrames();}
    }
    report('BROWSER_PROVIDER_FALLBACK');
-   check();await route.fallback();
+   check();if(setupPath && !preflight)await route.continue();else await route.fallback();
   }
   const check=()=>{billingCheck(limits);if(failure||abandoned)fail();};
   if(guarded){
@@ -476,7 +548,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
      if(target.origin!==binding.endpoints.backend){
       routeCheckpoint='BROWSER_PROVIDER_ROUTE';
       await providerTraffic(route,target,code=>{
-       if(!challenge&&!cancellationPort)return;
+       if(!challenge&&!cancellationPort&&!trialCase)return;
        routeCheckpoint=code;
        if(challenge&&challengeDispatched&&code==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM')origin=target.origin;
       });return;
@@ -501,6 +573,24 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
      check();await route.continue();
     }
     if(method==='OPTIONS' || method==='GET'){
+     if(trialCase && method==='GET'){
+      await billingBounded(limits,()=>customerReady.promise);
+      const h=await req.allHeaders();
+      need(h.origin===binding.endpoints.demo && h.authorization===authority && !h.cookie && !h['proxy-authorization'] &&
+       !h['idempotency-key'] && req.postData()===null);
+      const offer=binding.endpoints.backend+'/api/v1/customer/subscription-products/'+binding.productId+'/offers';
+      if(url!==offer && url!==listUrl){
+       need(createPosts===1);
+       await billingBounded(limits,()=>created);
+       const sub=base+'/'+subscriptionId,original=sub+'/operations/'+operationId;
+       need([sub,original,original+'/action',original+'/confirmation-attempts/current',
+        sub+'/events?limit=20',sub+'/billing-records?limit=20'].includes(url));
+       if(url===original+'/action'){need(!selectPosts && !grantedAction);claim('trial-action',req);}
+       if(url===original && trialTerminalRead)claim('trial-terminal',req);
+      }
+      if(url===listUrl && trialRefresh && await trialRefresh.evaluate(clicked=>clicked()))claim('trial-refresh',req);
+      await continueBackend();return;
+     }
      // The SDK may start its reads before the controller parses the CREATE response.
      // Retain only a few request references. Classify them later against the exact receipt.
      if(exactInitialCheckout && createPosts===1 && !initialSessionObserved && !selectPosts && method==='GET' && url.startsWith(base) &&
@@ -509,8 +599,17 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     }
     if(method!=='POST')fail();
     if(guarded)need(req.frame()===page.mainFrame() && !req.isNavigationRequest() && !req.redirectedFrom());
-    if(url===otp){need(++challengePosts===1);if(bound)claim('challenge',req);const v:unknown=JSON.parse(req.postData()??'');need(exact(v,['site_key','email','intent'])&&v.site_key===binding.siteKey&&v.email===binding.email&&v.intent==='AUTHENTICATE');await continueBackend();return;}
-    if(url.startsWith(otp+'/')&&url.endsWith('/verify')){need(++verifyPosts===1 && (!guarded || challengeId && url===otp+'/'+challengeId+'/verify'));if(bound)claim('verify',req);await continueBackend();return;}
+    async function trialOtp(expected:object){
+     const h=await req.allHeaders();
+     need(h.origin===binding.endpoints.demo && h['content-type']==='application/json' && !h.authorization &&
+      !h.cookie && !h['proxy-authorization'] && !h['idempotency-key'] && req.postData()===JSON.stringify(expected));
+    }
+    if(url===otp){need(++challengePosts===1);if(bound)claim('challenge',req);const v:unknown=JSON.parse(req.postData()??'');need(exact(v,['site_key','email','intent'])&&v.site_key===binding.siteKey&&v.email===binding.email&&v.intent==='AUTHENTICATE');
+     if(trialCase)await trialOtp({site_key:binding.siteKey,email:binding.email,intent:'AUTHENTICATE'});
+     await continueBackend();return;}
+    if(url.startsWith(otp+'/')&&url.endsWith('/verify')){need(++verifyPosts===1 && (!guarded || challengeId && url===otp+'/'+challengeId+'/verify'));if(bound)claim('verify',req);
+     if(trialCase){need(otpCode && /^\d{6}$/.test(otpCode));await trialOtp({site_key:binding.siteKey,code:otpCode});otpCode=undefined;}
+     await continueBackend();return;}
     let key:string|undefined;
     if(bound){
      const h=await req.allHeaders();key=h['idempotency-key'];
@@ -520,12 +619,13 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     }
     if(url===base){
      need(++createPosts===1);
+     if(trialCase)need(req.postData()===JSON.stringify({price_id:binding.priceId,recurring_consent:true}));
      if(bound){claim('create',req);need(trustedCreate && await trustedCreate.evaluate(clicked=>clicked()));}
      const requireCreateGesture=():true=>{need(createGestureInFlight);return true;};
      const createOwner:Pick<BillingPort,'beforeDispatch'>=exactInitialCheckout?{beforeDispatch:(kind,key,identity)=>{
       requireCreateGesture();
-      return port.beforeDispatch(kind,key,identity);
-     }}:port;
+      return trialCase?trialCase.beforeDispatch('create',key):(port as BillingPort).beforeDispatch(kind,key,identity);
+     }}:port as BillingPort;
      await forwardBillingDispatch(route,createOwner,binding,authority,'create',undefined,limits,undefined,checkManager,
       redirects?.authorize,exactInitialCheckout?requireCreateGesture:undefined);return;
     }
@@ -533,8 +633,28 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     await billingBounded(limits,()=>created);const original=base+'/'+subscriptionId+'/operations/'+operationId;
     if(url===original+'/confirmation-session'){
      if(exactInitialCheckout)routeCheckpoint='BROWSER_SESSION_REQUEST_REJECTED';
-     need(++selectPosts===1);if(bound)claim('initial-session',req);const v:unknown=JSON.parse(req.postData()??''),h=await req.allHeaders();need(exact(v,['action_token'])&&typeof v.action_token==='string'&&/^bga1_[A-Za-z0-9_-]{43}$/.test(v.action_token)&&h.authorization===authority&&h.origin===binding.endpoints.demo&&!h.cookie);
+     need(++selectPosts===1);if(bound)claim('initial-session',req);const v:unknown=JSON.parse(req.postData()??''),h=await req.allHeaders();need(exact(v,['action_token'])&&typeof v.action_token==='string'&&actionGrant.test(v.action_token)&&h.authorization===authority&&h.origin===binding.endpoints.demo&&!h.cookie);
+     if(trialCase){
+      if(!grantedAction){
+       const issued=requests.get('trial-action')?.existingResponse();
+       if(!issued || issued.url()!==original+'/action' || issued.status()!==200)return fail();
+       paired('trial-action',issued);
+       grantedAction=readGrant(await body(issued,limits));
+      }
+      need(grantedAction.expiry>Date.now() && req.postData()===JSON.stringify({action_token:grantedAction.token}));
+     }
      await continueBackend();if(exactInitialCheckout)initialSessionForwarded=true;return;
+    }
+    if(trialCase){
+     routeCheckpoint='BROWSER_CONFIRM_WAIT';
+     if(url!==original+'/action-confirmations' || !key || !grantedAction)return fail();
+     claim('trial-permit',req);
+     need(req.postData()===JSON.stringify({action_token:grantedAction.token}));
+     await sameSetupGesture();
+     need(await billingBounded(limits,()=>trialCase.beforeTrialSetup('permit',trialIdentity(),key))===true);
+     await redirects!.authorize(req);
+     await sameSetupGesture();need(req.frame()===page.mainFrame());
+     await route.continue();check();return;
     }
     const attempts=original+'/confirmation-attempts/';
     if(retryPort && url===attempts+firstAttempt+'/retry'){
@@ -570,7 +690,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
      }
      confirmation={token:token.id,check:()=>{check();need(payInFlight);}};
     }
-    const dispatch=successor?{beforeDispatch:(_kind:unknown,key:string)=>retryPort!.beforeSuccessorConfirm(key,{subscriptionId,operationId,attemptId})}:port;
+    const dispatch=successor?{beforeDispatch:(_kind:unknown,key:string)=>retryPort!.beforeSuccessorConfirm(key,{subscriptionId,operationId,attemptId})}:port as BillingPort;
     await forwardBillingDispatch(route,dispatch,binding,authority,'confirm',{subscriptionId,operationId,attemptId},limits,confirmation,checkManager,redirects?.authorize,invoiceCase?.releaseOriginalConfirm);
    }catch{
     const capture=!firstFailure&&origin?sca:undefined;
@@ -605,13 +725,20 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   await enterPrivateText(widget.getByRole('textbox',{name:'Email',exact:true}),binding.email);
   const otpChallenge=page.waitForResponse(r=>r.url()===otp&&r.request().method()==='POST',{timeout:duration(limits)});void otpChallenge.catch(()=>{});await widget.getByRole('button',{name:'Request code',exact:true}).click({timeout:duration(limits)});
   const challengeResponse=await otpChallenge;paired('challenge',challengeResponse);need(challengeResponse.status()===202);const challengeBody=await body(challengeResponse,limits);need(uuid(challengeBody.challenge_id));challengeId=challengeBody.challenge_id as string;
-  await port.withOtpCode(async code=>{await enterPrivateText(widget.getByRole('textbox',{name:'Six-digit code',exact:true}),code);return true as const;},limits);
+  await port.withOtpCode(async code=>{if(trialCase)otpCode=code;await enterPrivateText(widget.getByRole('textbox',{name:'Six-digit code',exact:true}),code);return true as const;},limits);
   if(guarded)checkpoint='BROWSER_OTP_VERIFY';
   const verification=page.waitForResponse(r=>r.url()===otp+'/'+challengeBody.challenge_id+'/verify'&&r.request().method()==='POST',{timeout:duration(limits)});void verification.catch(()=>{});
   const baseline=page.waitForResponse(r=>r.url().startsWith(base+'?')&&r.request().method()==='GET',{timeout:duration(limits)});void baseline.catch(()=>{});
   await widget.getByRole('button',{name:'Verify code',exact:true}).click({timeout:duration(limits)});const response=await verification;paired('verify',response);need(response.status()===200);const session=await body(response,limits),customer=session.customer;
   need(object(customer)&&uuid(customer.id)&&customer.status==='ACTIVE'&&session.site_id===binding.siteId&&Array.isArray(session.scopes)&&session.scopes.includes('SUBSCRIPTION_READ')&&session.scopes.includes('SUBSCRIPTION_MANAGE')&&typeof session.session_token==='string'&&/^[A-Za-z0-9_-]{43}$/.test(session.session_token));
-  authority='Bearer '+session.session_token;await port.acknowledgeCustomer({customerId:(customer as Record<string,string>).id!,siteId:binding.siteId});
+  authority='Bearer '+session.session_token;
+  const customerId=(customer as Record<string,string>).id!;
+  const customerAcknowledged=await port.acknowledgeCustomer({customerId,siteId:binding.siteId});
+  if(trialCase){
+   if(customerAcknowledged!==true || typeof session.expires_at!=='string')return fail();
+   customerExpiry=Date.parse(session.expires_at);need(customerExpiry>Date.now());
+   customerReady.resolve();
+  }
   if(exactInitialCheckout||cancellationPort)checkpoint='BROWSER_CREATE_BASELINE';
   const before=await body(await baseline,limits);need(Array.isArray(before.items)&&before.items.length===0&&before.next_cursor===null);
   if(exactInitialCheckout||cancellationPort)checkpoint='BROWSER_CREATE_CONSENT';
@@ -653,7 +780,13 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   }finally{createGestureInFlight=false;}
   if(exactInitialCheckout||cancellationPort)checkpoint='BROWSER_CREATE_RECEIPT';
   paired('create',receipt);need(receipt.status()===202);const original=await body(receipt,limits);need(uuid(original.subscription_id)&&uuid(original.operation_id)&&['PROCESSING','REQUIRES_ACTION','RESERVED'].includes(String(original.status)));
-  subscriptionId=original.subscription_id as string;operationId=original.operation_id as string;await port.acknowledge('create',{subscriptionId,operationId});
+  subscriptionId=original.subscription_id as string;operationId=original.operation_id as string;
+  if(trialCase){
+   need(exact(original,['subscription_id','operation_id','status','action_available','next_action','browser_confirm_allowed']) &&
+    original.status==='PROCESSING' && original.next_action===null && original.action_available===false &&
+    original.browser_confirm_allowed===false);
+   need(await billingBounded(limits,()=>trialCase.acknowledge('create',trialIdentity()))===true);
+  }else await (port as BillingPort).acknowledge('create',{subscriptionId,operationId});
   checkpoint='BROWSER_INITIAL_SESSION';
   const originalOperation=base+'/'+subscriptionId+'/operations/'+operationId;
   const expectsActionReads=original.next_action===null && (original.status==='PROCESSING'||original.status==='REQUIRES_ACTION');
@@ -678,6 +811,167 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    fail();
   }
   checkpoint='BROWSER_INITIAL_SESSION_WIRE';
+  async function fillCard(card:string){
+   const frame=manager.frameLocator('iframe[title="Secure payment input frame"]');
+   await frame.locator('input[name="number"]').fill(card,{timeout:duration(limits)});
+   await frame.locator('input[name="expiry"]').fill('1230',{timeout:duration(limits)});
+   await frame.locator('input[name="cvc"]').fill('123',{timeout:duration(limits)});
+   const postal=frame.locator('input[name="postalCode"]');
+   if(await postal.isVisible())await postal.fill('10001',{timeout:duration(limits)});
+  }
+  const payControl=()=>manager.getByRole('button',{name:'Pay',exact:true});
+  async function waitForPay(){
+   await payControl().waitFor({state:'visible',timeout:duration(limits)});
+   // The driver enables Pay only after the original Stripe Element is ready.
+   await page.waitForFunction(()=>{const m=document.querySelector('generic-subscription-manager');return [...m?.shadowRoot?.querySelectorAll('button')??[]].some(b=>b.textContent?.trim()==='Pay'&&!b.disabled&&!!b.getClientRects().length);},undefined,{timeout:duration(limits)});
+  }
+  async function settlePresentation(){
+   await checkManager();
+   while(pinned?.pending){
+    await pinned.wait();
+    await checkManager();
+   }
+  }
+  async function runRequiredTrial(trialCase:BillingRequiredTrialPort){
+   const wire=await body(selected,limits);
+   if(!grantedAction || !exact(wire,['protocol','provider','flow','publishable_key','client_secret','action_token','expires_at']) ||
+    wire.protocol!=='BROWSER_CONFIRM_V1' || wire.provider!=='stripe' || wire.flow!=='SETUP' || wire.action_token!==grantedAction.token ||
+    typeof wire.publishable_key!=='string' || !/^pk_test_[A-Za-z0-9_]{1,247}$/.test(wire.publishable_key) ||
+    typeof wire.client_secret!=='string' || wire.client_secret.length>1024 || typeof wire.expires_at!=='string')return fail();
+   const setupId=setupSecretFormat.exec(wire.client_secret)?.[1],expiry=Date.parse(wire.expires_at);
+   if(!setupId || !(expiry>Date.now() && expiry<=Math.min(grantedAction.expiry,customerExpiry)))return fail();
+   publishableKey=wire.publishable_key;setup={id:setupId,secret:wire.client_secret,expiry};
+   initialPresentationReady.resolve();
+
+   checkpoint='BROWSER_WAIT_READY';
+   await waitForPay();
+   await checkManager();
+   const projection=await billingBounded(limits,()=>manager.evaluate(async(element,id)=>{
+    const m=element as GenericSubscriptionManager;
+    return await m.client!.subscriptions.get({session:m.customerSession!,subscriptionId:id});
+   },subscriptionId));
+   await checkManager();
+   const sameSubscription=(s:SubscriptionView)=>s.subscriptionId===subscriptionId && s.siteId===binding.siteId &&
+    s.customerId===customerId && s.productId===binding.productId && s.paymentAccountId===binding.accountId &&
+    s.billingPrice.priceId===binding.priceId && s.billingPrice.trialPaymentMethodPolicy==='REQUIRED_BEFORE_TRIAL' && s.billingPrice.trialDays>0;
+   const deniedTrial=(s:SubscriptionView)=>sameSubscription(s) && s.billingStatus==='INCOMPLETE' && s.state==='INCOMPLETE' &&
+    s.access.allowed===false && s.access.reason==='INITIAL_PAYMENT_REQUIRED' && s.access.validUntil===null && s.trial===null &&
+    s.paidThrough===null && s.pendingOperation?.kind==='CREATE' && s.pendingOperation.operationId===operationId &&
+    s.pendingOperation.status==='PROCESSING';
+   const allowedTrial=(s:SubscriptionView)=>sameSubscription(s) && s.revision>projection.revision && s.state==='TRIALING' &&
+    s.billingStatus==='TRIALING' && s.trial && Date.parse(s.trial.start)<=Date.now() && Date.parse(s.trial.end)>Date.now() &&
+    s.entitledPrice?.priceId===binding.priceId && s.paidThrough===null && s.pendingOperation===null &&
+    s.access.allowed===true && s.access.reason==='TRIAL';
+   need(deniedTrial(projection));
+
+   checkpoint='BROWSER_CARD_FIELDS';
+   await fillCard('4242424242424242');
+   await settlePresentation();
+   checkpoint='BROWSER_CONFIRM_FOCUS';
+   const pay=await focusExactButton(payControl());
+   trustedPayClick=await pay.evaluateHandle(captureTrustedClick);
+   await checkManager();await requireButtonFocus(pay);
+   checkpoint='BROWSER_CONFIRM_CLICK';
+   const permitUrl=originalOperation+'/action-confirmations',confirmUrl=setupUrl();
+   trialPermit=page.waitForResponse(r=>r.url()===permitUrl && r.request().method()==='POST',{timeout:duration(limits)}).then(async r=>{
+    paired('trial-permit',r);need(r.status()===202);
+    const v=await body(r,limits);
+    need(exact(v,['subscription_id','operation_id','status','action_available','next_action','browser_confirm_allowed']) &&
+     v.subscription_id===subscriptionId && v.operation_id===operationId && v.status==='PROCESSING' &&
+     v.action_available===false && v.next_action===null && v.browser_confirm_allowed===true);
+   });
+   void trialPermit.catch(()=>invalidate('BROWSER_CONFIRM_RECEIPT'));
+   const confirmation=page.waitForResponse(r=>r.url()===confirmUrl && r.request().method()==='POST',{timeout:duration(limits)});
+   void confirmation.catch(()=>{});
+   payInFlight=true;
+   let result:Response;
+   try{
+    [,result]=await Promise.all([pay.press('Enter',{timeout:duration(limits)}),confirmation,trialPermit]);
+   }finally{payInFlight=false;}
+   checkpoint='BROWSER_CONFIRM_RECEIPT';
+   paired('trial-setup',result);
+   need(result.status()===200 && result.url()===confirmUrl && await trustedPayClick.evaluate(clicked=>clicked()));
+   const accepted=await body(result,limits);
+   need(accepted.object==='setup_intent' && accepted.id===setup.id && accepted.client_secret===setup.secret &&
+    accepted.livemode===false && accepted.status==='succeeded');
+   await checkManager();
+   // The ordinary sweep can miss the 30s tick and defer the next attempt by 60s or 300s.
+   // The manager owns GET polling and keeps Refresh disabled until its 10-minute watch ends.
+   const settlement={...limits,deadline:Math.min(limits.deadline,customerExpiry,Date.now()+600_000)};
+   need(await billingBounded(settlement,()=>trialCase.acknowledgeTrialSetup(trialIdentity()))===true);
+   await billingBounded(settlement,checkManager);
+
+   checkpoint='BROWSER_WAIT_OBSERVE';
+   const readState=()=>manager.evaluate(element=>(element as GenericSubscriptionManager).state);
+   let settled:SubscriptionView,observedSuccess=false;
+   for(;;){
+    const {phase,subscription:s,operation}=await billingBounded(settlement,async()=>{await checkManager();return readState();});
+    need((phase==='processing' || phase==='ready') &&
+     (!operation || operation.subscriptionId===subscriptionId && operation.operationId===operationId && !operation.actionAvailable));
+    if(phase==='processing'){
+     need(!observedSuccess && operation?.status==='PROCESSING' && (!s || s.revision===projection.revision && deniedTrial(s)));
+    }else{
+     need(!operation || operation.status==='SUCCEEDED');
+     if(s && allowedTrial(s)){settled=s;break;}
+     // The manager first accepts the terminal operation, then loads the subscription.
+     need(operation?.status==='SUCCEEDED' && (!s || s.revision===projection.revision && deniedTrial(s)));
+     observedSuccess=true;
+    }
+    await billingBounded(settlement,()=>new Promise(resolve=>setTimeout(resolve,250)),1000);
+   }
+   await billingBounded(settlement,checkManager);
+   // The manager may already have cleared its completed operation. Pair one exact SDK
+   // GET of that CREATE with its terminal result before invoking the read-only Refresh.
+   const terminalResponse=page.waitForResponse(r=>r.url()===originalOperation && r.request().method()==='GET' &&
+    r.request()===requests.get('trial-terminal'),{timeout:duration(settlement)});
+   void terminalResponse.catch(()=>{});
+   trialTerminalRead=true;
+   try{
+    const [status,response]=await billingBounded(settlement,()=>Promise.all([manager.evaluate(async(element,identity)=>{
+     const m=element as GenericSubscriptionManager;
+     return await m.client!.subscriptions.operation({session:m.customerSession!,...identity});
+    },trialIdentity()),terminalResponse]));
+    paired('trial-terminal',response);
+    need(response.status()===200 && status.operationId===operationId && status.subscriptionId===subscriptionId &&
+     status.status==='SUCCEEDED' && status.actionAvailable===false);
+   }finally{trialTerminalRead=false;}
+   await billingBounded(settlement,checkManager);
+   const refresh=await focusExactButton(manager.getByRole('button',{name:'Refresh status',exact:true}));
+   trialRefresh=await refresh.evaluateHandle(captureTrustedClick);
+   await requireButtonFocus(refresh);
+   const read=page.waitForResponse(r=>r.url()===listUrl && r.request().method()==='GET' && r.request()===requests.get('trial-refresh'),
+    {timeout:duration(limits)});
+   void read.catch(()=>{});
+   const [,refreshed]=await Promise.all([refresh.press('Enter',{timeout:duration(limits)}),read]);
+   paired('trial-refresh',refreshed);need(refreshed.status()===200 && await trialRefresh.evaluate(clicked=>clicked()));
+   const list=await body(refreshed,limits);
+   if(!Array.isArray(list.items) || list.items.length!==1 || !object(list.items[0]) || list.next_cursor!==null)return fail();
+   const item=list.items[0],access=item.access;
+   need(item.subscription_id===subscriptionId && item.site_id===binding.siteId && item.customer_id===customerId &&
+    item.product_id===binding.productId && item.payment_account_id===binding.accountId && item.billing_status==='TRIALING' &&
+    item.state==='TRIALING' && item.paid_through===null && item.pending_operation===null &&
+    object(item.billing_price) && item.billing_price.price_id===binding.priceId &&
+    object(access) && access.subscription_id===subscriptionId && access.allowed===true && access.reason==='TRIAL' &&
+    Number.isSafeInteger(item.revision));
+   const projectionDeadline=Date.now()+duration(limits);
+   for(;;){
+    need(Date.now()<projectionDeadline);
+    await checkManager();
+    const {phase,subscription:s,operation}=await readState();
+    need(!['unknown','error','expired'].includes(phase));
+    if(phase==='ready' && s){
+     need(allowedTrial(s) && s.revision===item.revision && s.revision>=settled.revision &&
+      s.trial?.start===settled.trial?.start && s.trial?.end===settled.trial?.end &&
+      (!operation || operation.operationId===operationId && operation.subscriptionId===subscriptionId &&
+       operation.status==='SUCCEEDED' && !operation.actionAvailable));
+     break;
+    }
+    await billingBounded(limits,()=>new Promise(resolve=>setTimeout(resolve,100)),1000);
+   }
+   need(createPosts===1 && selectPosts===1 && confirmPosts===0 && challengePosts===1 && verifyPosts===1);
+   await billingBounded(limits,()=>Promise.all(pending));await checkManager();
+  }
+  async function runPayment(){
   const wire=exactInitialCheckout?(step:SessionWireCheckpoint)=>{checkpoint='BROWSER_INITIAL_SESSION_WIRE_'+step;}:undefined;
   const selectedBody=await body(selected,limits,wire);
   wire?.('PROTOCOL');need(selectedBody.protocol==='SERVER_CONFIRM_V2'&&selectedBody.provider==='stripe'&&selectedBody.flow==='PAYMENT');
@@ -705,19 +999,9 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   }
   async function payOnce(card:string){
    checkpoint='BROWSER_WAIT_READY';
-   const pay=manager.getByRole('button',{name:'Pay',exact:true});await pay.waitFor({state:'visible',timeout:duration(limits)});
-   // Enabled Pay is controlled by the driver's real Element ready event, not iframe insertion.
-   await page.waitForFunction(()=>{const m=document.querySelector('generic-subscription-manager');return [...m?.shadowRoot?.querySelectorAll('button')??[]].some(b=>b.textContent?.trim()==='Pay'&&!b.disabled&&!!b.getClientRects().length);},undefined,{timeout:duration(limits)});
+   const pay=payControl();await waitForPay();
    checkpoint='BROWSER_CARD_FIELDS';
-   const frame=manager.frameLocator('iframe[title="Secure payment input frame"]');await frame.locator('input[name="number"]').fill(card,{timeout:duration(limits)});await frame.locator('input[name="expiry"]').fill('1230',{timeout:duration(limits)});await frame.locator('input[name="cvc"]').fill('123',{timeout:duration(limits)});
-   const postal=frame.locator('input[name="postalCode"]');if(await postal.isVisible())await postal.fill('10001',{timeout:duration(limits)});
-   const settlePresentation=async()=>{
-    await checkManager();
-    while(pinned?.pending){
-     await pinned.wait();
-     await checkManager();
-    }
-   };
+   await fillCard(card);
    if(bound)await settlePresentation();
    if(bound)checkpoint='BROWSER_CONFIRM_FOCUS';
    const payButton=bound?await focusExactButton(pay):undefined;
@@ -810,7 +1094,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   }else if(challenge && sca){
    need(confirmation.state==='REQUIRES_ACTION' && confirmation.retry_allowed===false);
    const scope={subscriptionId,operationId,attemptId};
-   need(await port.acknowledge('confirm',{attemptId,state:'REQUIRES_ACTION',nextActionAllowed:true,retryAllowed:false,successorAttemptId:null})===true);
+   need(await (port as BillingPort).acknowledge('confirm',{attemptId,state:'REQUIRES_ACTION',nextActionAllowed:true,retryAllowed:false,successorAttemptId:null})===true);
    await checkManager();need(await challenge.port.beforeChallenge(scope)===true);
    challengeDispatched=true;
    winning.resolve();
@@ -818,7 +1102,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    await sca.attend();await checkManager();need(await challenge.port.acknowledgeChallenge(scope)===true);
   }else{
    need(confirmation.state==='OBSERVE' && confirmation.retry_allowed===false);
-   await port.acknowledge('confirm',{attemptId,state:'OBSERVE',nextActionAllowed:false});
+   await (port as BillingPort).acknowledge('confirm',{attemptId,state:'OBSERVE',nextActionAllowed:false});
   }
   if(cancellationPort)checkpoint='BROWSER';
   for(;;){billingCheck(limits);if(failure)fail();const settled=await manager.evaluate((element:Element)=>{const state=(element as Element&{state?:{phase:string;subscription?:{subscriptionId:string;billingStatus:string;access:{allowed:boolean;reason:string}};operation?:{status:string}}}).state;return {phase:state?.phase,id:state?.subscription?.subscriptionId,status:state?.subscription?.billingStatus,allowed:state?.subscription?.access.allowed,reason:state?.subscription?.access.reason,operation:state?.operation?.status};});
@@ -833,6 +1117,8 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    await billingBounded(limits,()=>Promise.all(pending));check();
   }
   if(bound){await billingBounded(limits,()=>Promise.all(pending));await checkManager();}
+  }
+  if(trialCase)await runRequiredTrial(trialCase);else await runPayment();
   authority='';
  }catch{recordFailure();}
  finally{
