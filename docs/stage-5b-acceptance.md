@@ -122,6 +122,8 @@ Run `6312d64b-32ef-4645-b4a6-f3c89c1e8991` at `ba2284c` reached the admitted ori
 
 Run `5f4ce04a-02ef-4634-a403-79cc82206732` at `e465296` reached the original issuer document and stopped at `BROWSER_CHALLENGE_ISSUER_ASSET_FONT` before operator handoff. The request passed the exact document, same-origin, credential-free GET, and path checks. All seven owned containers exited and the listener stopped. Only the fixed resource category is in the report. The browser now permits the existing one-request blocking procedure for a same-origin WOFF/WOFF2 font from that exact document. It still requires the original blocked-by-client event before handoff. [Local completion report](../.superpowers/native-initial-3ds/5f4ce04a-02ef-4634-a403-79cc82206732/completion.json)
 
+Run `53522ebc-50a2-40aa-ba94-dbce98f2ecbd` at `869cc2f` stopped at `BROWSER_CHALLENGE_ISSUER_ASSET_OWNER` with confirmed cleanup and without operator handoff. The fixed code covered six different predicates. Local regressions now distinguish handoff state, the one-request limit, issuer binding, service worker, request Origin and the original document. The same conditions are checked in the same order, and none of the passive requests receive network authority. [Local completion report](../.superpowers/native-initial-3ds/53522ebc-50a2-40aa-ba94-dbce98f2ecbd/completion.json)
+
 ### Earlier initial-decline and Retry attempts
 
 The first native initial-decline/retry attempt, `a35eb316-f842-42b7-a1b0-157f942a8e99` at `d8bebcf163b3457e68f412ed4e6b7c582d349e69`, exited 1 with `phase=RETRY_ACK code=BROWSER cleanup=UNCONFIRMED`. The last durable operation was `CREATE_ACK`. The ledger contains no first confirmation, Retry or successor confirmation dispatch. The phase label is shared by several acknowledgements, including creation, and leaves the exact browser failure undetermined. A separate check found all seven containers exited and no Stripe listener for this run. Initial decline and retry remain pending native evidence.
@@ -199,6 +201,8 @@ An isolated seven-day optional trial now verifies the original zero invoice and 
 The dedicated missed-notification case holds two original signed notifications, reconciles once, then releases paid before finalized. The PostgreSQL proof checks five stages, including the absence of cash before reconciliation and unchanged journal and delivery identities afterward. The local integration test and the fresh Sandbox run `57e25939` passed. [Missed and reordered invoice scenario](testing/billing-missed-reordered.md)
 
 The remaining native cases cover first-payment 3DS, trials, payment-method isolation and paused resumption, plan changes, and Portal navigation and return. The matrix below gives the implementation and evidence for each area.
+
+The local scheduled-change scenario now schedules a same-product €15 downgrade on the original €20 subscription and clears it before the captured boundary. The application and the pinned SDK loopback fixture verify the original creation, configuration and release keys, the same cash, price, paid-through date, and the exact signed schedule and clear deliveries. The complete Billing feature passed 11 scenarios and 108 steps on disposable PostgreSQL 14. Native scheduled-change acceptance remains open.
 
 ## Fresh failed renewal, grace and recovery — 2026-11-15
 

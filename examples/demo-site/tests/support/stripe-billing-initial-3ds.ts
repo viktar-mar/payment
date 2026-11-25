@@ -285,11 +285,21 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    }
   }else{
    if(approved && initialIssuerDispatched && !navigation){
-    report('BROWSER_CHALLENGE_ISSUER_ASSET_OWNER');
-    requireValue(!handoffStarted && !passiveBlock && binding && new URL(binding.url).origin===url.origin &&
-     request.serviceWorker()===null &&
-     (!headers.origin||headers.origin===url.origin));
-    sameChain(original,committedIssuerDocument(target));
+    report('BROWSER_CHALLENGE_ISSUER_ASSET_HANDOFF');
+    requireValue(!handoffStarted);
+    report('BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT');
+    requireValue(!passiveBlock);
+    report('BROWSER_CHALLENGE_ISSUER_ASSET_BINDING');
+    requireValue(binding && new URL(binding.url).origin===url.origin);
+    report('BROWSER_CHALLENGE_ISSUER_ASSET_WORKER');
+    requireValue(request.serviceWorker()===null);
+    report('BROWSER_CHALLENGE_ISSUER_ASSET_ORIGIN');
+    requireValue(!headers.origin||headers.origin===url.origin);
+    const requireIssuerDocument=()=>{
+     report('BROWSER_CHALLENGE_ISSUER_ASSET_DOCUMENT');
+     sameChain(original,committedIssuerDocument(target));
+    };
+    requireIssuerDocument();
     report('BROWSER_CHALLENGE_ISSUER_ASSET_METHOD');
     requireValue(method==='GET' && data===null && !headers['transfer-encoding'] &&
      (!headers['content-length']||headers['content-length']==='0'));
@@ -312,20 +322,17 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     const failed=Promise.withResolvers<void>();
     passiveBlock=billingBounded(limits,async active=>{
      await check();billingCheck(active);
-     report('BROWSER_CHALLENGE_ISSUER_ASSET_OWNER');
-     sameChain(original,committedIssuerDocument(target));
+     requireIssuerDocument();
      report('BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK');
      await expectIssuerAssetBlock(request);
      await check();billingCheck(active);
-     report('BROWSER_CHALLENGE_ISSUER_ASSET_OWNER');
-     sameChain(original,committedIssuerDocument(target));
+     requireIssuerDocument();
      report('BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK');
      passiveRequest={request,confirm:failed.resolve};
      // This optional asset never receives response-stage authority.
      await Promise.all([route.abort('blockedbyclient'),failed.promise]);
      await check();billingCheck(active);
-     report('BROWSER_CHALLENGE_ISSUER_ASSET_OWNER');
-     sameChain(original,committedIssuerDocument(target));
+     requireIssuerDocument();
     },750);
     try{await passiveBlock;}finally{passiveRequest=undefined;}
     return;

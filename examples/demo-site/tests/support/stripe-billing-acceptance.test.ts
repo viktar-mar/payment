@@ -270,7 +270,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const lateRetrieve=url.startsWith('https://api.stripe.com/v1/payment_intents/')&&fault.startsWith('late-source-');
   const lateIssuer=url===actionUrl&&fault.startsWith('late-issuer-response-');
   const responseFault=lateRetrieve?fault.slice('late-source-'.length):lateIssuer?fault.slice('late-issuer-response-'.length):'';
-  const headers=passive?{...(fault==='approved-issuer-block-credentials'?{cookie:'private-cookie'}:{})}:
+  const headers=passive?{...(fault==='approved-issuer-block-credentials'?{cookie:'private-cookie'}:{}),
+   ...(fault==='approved-issuer-block-foreign-origin-header'?{origin:'https://merchant-fixture.test'}:{})}:
    navigation||issuerShape?{'content-type':issuerShape==='media'?'application/json':'application/x-www-form-urlencoded',
    origin:issuerDocument===issuerUrl?issuerHost:'https://js.stripe.com'}:
    {authorization:'Bearer pk_test_fixture',origin:'https://js.stripe.com'};
@@ -1428,13 +1429,14 @@ for(const [suffix,expected,blocks] of [
  ['resource-unreadable','BROWSER_CHALLENGE_ISSUER_ASSET_KIND',0],
  ['suffix','BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX',0],
  ['image-font-suffix','BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX',0],
- ['duplicate','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',1],
- ['image-font','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',1],
- ['font-image','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',1],
- ['worker','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',0],
- ['uncommitted','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',0],
- ['cross-origin','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',0],
- ['after-handoff','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',0],
+ ['duplicate','BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT',1],
+ ['image-font','BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT',1],
+ ['font-image','BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT',1],
+ ['worker','BROWSER_CHALLENGE_ISSUER_ASSET_WORKER',0],
+ ['uncommitted','BROWSER_CHALLENGE_ISSUER_ASSET_DOCUMENT',0],
+ ['cross-origin','BROWSER_CHALLENGE_ISSUER_ASSET_BINDING',0],
+ ['foreign-origin-header','BROWSER_CHALLENGE_ISSUER_ASSET_ORIGIN',0],
+ ['after-handoff','BROWSER_CHALLENGE_ISSUER_ASSET_HANDOFF',0],
  ['foreign-frame','BROWSER_CHALLENGE_ISSUER_FRAME',0],
  ['credentials','BROWSER_CHALLENGE_HEADERS',0],
  ['abort-error','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',1],
@@ -1444,7 +1446,7 @@ for(const [suffix,expected,blocks] of [
  ['font-foreign-event','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',1],
  ['other-error','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',1],
  ['inspector-lookalike','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',1],
- ['replaced','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',1],
+ ['replaced','BROWSER_CHALLENGE_ISSUER_ASSET_DOCUMENT',1],
  ['response','BROWSER_GUARD_RESPONSE_UNCLAIMED',1],
  ['font-response','BROWSER_GUARD_RESPONSE_UNCLAIMED',1],
 ] as const)test('owned issuer passive block without network: '+suffix,async()=>{
