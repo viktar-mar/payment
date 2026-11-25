@@ -234,7 +234,9 @@ The ordinary subscription sweep passed through a pending SetupIntent, recorded t
 
 The scheduled-change fixture now uses the exact business clock sample during preview. A provider clock two seconds ahead reproduced the previous five-minute TTL rejection. The fixture keeps the original TTL and quote revalidation assertions. The combined local run passed all 12 scenarios, 119 steps, and 37 focused trial, method-isolation and SQL tests.
 
-The dedicated required-trial runner now binds one Stripe SetupIntent confirmation to its original CREATE and consumed browser permit, then verifies trial access, one zero invoice, no cash, and the signed trial-start callback. Its admission, browser flow, read-only evidence and cleanup have local regression coverage. This case still needs a fresh Stripe Sandbox receipt. [Required-trial scenario](testing/billing-required-trial.md)
+The dedicated required-trial runner now binds one Stripe SetupIntent confirmation to its original CREATE and consumed browser permit, then verifies trial access, one zero invoice, no cash, and the signed trial-start callback. Its admission, browser flow, read-only evidence and cleanup have local regression coverage. [Required-trial scenario](testing/billing-required-trial.md)
+
+Native run `8b352702-8aa0-4722-9646-900896a862e1` at `f2b4fd8` reused the saved CLI profile, provisioned the fixture and acknowledged the local customer. It then stopped at `CUSTOMER / BROWSER_CREATE_BASELINE`. No subscription CREATE or SetupIntent dispatch was recorded. Cleanup was confirmed: all seven owned containers were independently observed exited and the run listener was absent. The bounded report does not distinguish which baseline check refused. Native required-trial acceptance remains open.
 
 ## Fresh failed renewal, grace and recovery — 2026-11-15
 
