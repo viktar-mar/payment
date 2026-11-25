@@ -1223,6 +1223,31 @@ for(const label of ['demo','js.stripe.com','otp','verify','read','create','selec
  });
 }
 
+test('held invoice Pay completes with one trusted keyboard activation when pointer input is lost',async()=>{
+ const f=cancellationPage('confirm-pointer-lost',false,false,true);
+ assert.equal(await runBillingInvoiceWebhooksBrowser(f.browser,f.port,{deadline:Date.now()+1000},()=>false),true);
+ assert.deepEqual(f.keysPressed,['Enter']);
+ assert.equal(f.trace.filter(step=>step==='Pay').length,1);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+ assert.deepEqual(f.trace.filter(step=>step==='release original confirm'||step==='completed invoice proof'),
+  ['release original confirm','completed invoice proof']);
+ assert.ok(f.closed());
+});
+
+test('held invoice Pay cannot dispatch after the exact control loses focus',async()=>{
+ const f=cancellationPage('confirm-focus-lost',false,false,true);
+ await assert.rejects(runBillingInvoiceWebhooksBrowser(f.browser,f.port,{deadline:Date.now()+1000},()=>false),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CONFIRM_FOCUS');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.deepEqual(f.keysPressed,[]);
+ assert.equal(f.trace.some(step=>step==='Pay'||step==='release original confirm'),false);
+ assert.equal(f.providerSent.some(url=>url.endsWith('/confirmation_tokens')),false);
+ assert.equal(f.sent.some(url=>url.endsWith('/confirm')),false);
+ assert.ok(f.closed());
+});
+
 for(const fault of ['none','invalid ingress','invalid evidence','redirect-token','redirect-confirm']){
  test('single original Pay through held invoice browser: '+fault,async()=>{
   const f=cancellationPage(fault,false,false,true);

@@ -690,14 +690,14 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
      await checkManager();
     }
    };
-   if(exactInitialCheckout)await settlePresentation();
-   if(exactInitialCheckout)checkpoint='BROWSER_CONFIRM_FOCUS';
-   const payButton=exactInitialCheckout?await focusExactButton(pay):undefined;
+   if(bound)await settlePresentation();
+   if(bound)checkpoint='BROWSER_CONFIRM_FOCUS';
+   const payButton=bound?await focusExactButton(pay):undefined;
    if(guarded)trustedPayClick=payButton?await payButton.evaluateHandle(captureTrustedClick):await trustedClick(pay);
    await settlePresentation();
    if(payButton)await requireButtonFocus(payButton);
    // Arm observation after presentation has settled, but before a click can dispatch.
-   checkpoint=exactInitialCheckout?'BROWSER_CONFIRM_CLICK':'BROWSER_CONFIRM_WAIT';
+   checkpoint=bound?'BROWSER_CONFIRM_CLICK':'BROWSER_CONFIRM_WAIT';
    const confirmUrl=base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-attempts/'+attemptId+'/confirm';
    const responseFailure=Symbol(),unobservedClick=Symbol();
    let responseTimedOut=false;
@@ -720,8 +720,8 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    }catch(error){
     payInFlight=false;
     if(error===responseFailure){
-     checkpoint=exactInitialCheckout&&responseTimedOut&&!clickFinished?'BROWSER_CONFIRM_WAIT_CLICK_PENDING':'BROWSER_CONFIRM_WAIT';
-     if(exactInitialCheckout && clickFinished && responseTimedOut && !firstFailure && !limits.signal?.aborted && Date.now()<limits.deadline){
+     checkpoint=bound&&responseTimedOut&&!clickFinished?'BROWSER_CONFIRM_WAIT_CLICK_PENDING':'BROWSER_CONFIRM_WAIT';
+     if(bound && clickFinished && responseTimedOut && !firstFailure && !limits.signal?.aborted && Date.now()<limits.deadline){
       checkpoint=await confirmWaitBoundary().catch(()=> 'BROWSER_CONFIRM_WAIT');
      }
     }
