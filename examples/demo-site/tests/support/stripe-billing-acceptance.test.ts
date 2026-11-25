@@ -45,7 +45,7 @@ test('native runner reserves cleanup and scheduling time beyond the unchanged ow
 // controls. It cannot make network calls. Responses retain their originating request.
 import type {Browser, Request, Response} from '@playwright/test';
 import type {BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort,BillingInvoiceWebhooksPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
-import {browserCleanupConfirmed,browserDiagnostic} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
+import {browserCleanupConfirmed,browserDiagnostic,browserProviderOrigin} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 
 type SessionFailure = {
  status:number; problem?:object; contentType?:string; contentEncoding?:string; contentLength?:string|null;
@@ -53,7 +53,7 @@ type SessionFailure = {
 };
 function cancellationPage(fault = '', declineRetry = false, sca = false, invoiceCase = false, sessionFailure?:SessionFailure) {
  const id = (n:number) => '11111111-2222-4333-8444-' + String(n).padStart(12, '0');
- const b = {...binding, siteKey:'demo-key', email:'user@example.test', siteId:id(1), productId:id(2)};
+ const b = {...binding, runId:id(99), expectedSource:'e'.repeat(40), siteKey:'demo-key', email:'user@example.test', siteId:id(1), productId:id(2)};
  const [sub, create, attempt, schedule, withdraw] = [id(3), id(4), id(5), id(6), id(7)];
  const boundary = new Date(Date.now() + 86400000).toISOString();
  const token = 'A'.repeat(43);
@@ -277,6 +277,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    next_action:{type:'use_stripe_sdk',use_stripe_sdk:{type:actionType,three_d_secure_2_source:source}}});
   await wire('https://api.stripe.com/v1/3ds2/authenticate',stripeFrame,'source='+(fault==='foreign-next-source'?'src_other':source),
    {state:'challenge_required',ares:{messageType:'ARes',transStatus:'C',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,acsURL:issuerUrl}});
+  if(fault==='challenge-refused-origin')await provider('https://unlisted-fixture.stripe.com/private-path?query=private-canary');
   const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:fault==='wrong-issuer-transaction'?server:acs})).toString('base64url');
   await wire(fault==='foreign-issuer-path'?issuerUrl+'/foreign':issuerUrl,issuer,'creq='+creq,{},true);
  }
@@ -515,6 +516,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     documentUrl=configured.href;
    }
    if(sca||invoiceCase)await provider('https://js.stripe.com/v3/',frame,false,'GET');
+   if(fault==='early-refused-origin')await provider('https://unlisted-fixture.stripe.com/private-path?query=private-canary');
   },locator:()=>({first:()=>manager}),
   waitForResponse:(predicate:(r:Response)=>boolean,{timeout=3000}={})=>new Promise<Response>((resolve,reject)=>{
    if(closed){reject(new Error('closed'));return;}
@@ -1110,6 +1112,22 @@ const challengeRefusals:Record<string,string>={
  'late-issuer-response-service-worker':'BROWSER_CHALLENGE_WAIT',
  'late-issuer-response-status':'BROWSER_CHALLENGE_WAIT',
 };
+for(const fault of ['challenge-refused-origin','early-refused-origin'])test('3DS keeps only a private canonical origin after challenge dispatch: '+fault,async()=>{
+ const f=cancellationPage(fault,false,true);
+ await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+3000},async()=>{assert.fail('operator must remain locked');}),error=>{
+  const checkpoint='BROWSER_PROVIDER_ORIGIN_STRIPE_COM';
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),checkpoint);
+  assert.equal(browserCleanupConfirmed(error),true);
+  assert.deepEqual(browserProviderOrigin(error),fault==='challenge-refused-origin'?{
+   runId:f.port.resources().runId,expectedSource:f.port.resources().expectedSource,checkpoint,origin:'https://unlisted-fixture.stripe.com',
+  }:null);
+  assert.equal(JSON.stringify(error),'{}');
+  return true;
+ });
+ assert.equal(f.trace.includes('persist challenge'),fault==='challenge-refused-origin');
+ assert.equal(f.trace.includes('issuer Complete'),false);
+ assert.equal(f.providerSent.some(url=>url.includes('unlisted-fixture')),false);
+});
 for(const fault of ['none','late-source-valid','late-issuer-witness','replayed-next-ack','profile-retires','substituted-issuer-form','premature-sdk-complete','same-url-issuer-replaced',...Object.keys(challengeRefusals)]){
  test('the real browser journey requires one original issuer challenge: '+fault,async()=>{
   const success=['none','late-source-valid','late-issuer-witness'].includes(fault);

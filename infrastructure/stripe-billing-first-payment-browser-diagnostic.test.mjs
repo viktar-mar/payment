@@ -54,6 +54,25 @@ test('foreign values and unreadable proxies cannot supply provenance',()=>{
 });
 
 const originRun='11111111-2222-4333-8444-000000000001',originSource='a'.repeat(40);
+test('only the acceptance Stripe.com refusal retains its previously unrecognized origin',()=>{
+ const checkpoint='BROWSER_PROVIDER_ORIGIN_STRIPE_COM',origin='https://m.stripe.com';
+ const fresh=()=>privateOrigin.acceptanceBrowserFailure(checkpoint);
+ for(const invalid of ['https://hooks.stripe.com','https://child.js.stripe.com','https://r.stripe.com',
+  'https://merchant-ui-api.stripe.com','https://m.stripe.com:444','https://user@m.stripe.com',
+  'https://m.stripe.com/path?secret=canary','https://m.stripe.com#canary','https://notstripe.com','https://m.stripe.com.']){
+  assert.equal(privateOrigin.rememberBrowserProviderOrigin(fresh(),originRun,originSource,invalid),false);
+ }
+ for(const error of [browserFailure(checkpoint),browserFailure(checkpoint,'METHOD'),new Error(checkpoint)]){
+  assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,origin),false);
+ }
+ const error=fresh();
+ assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,origin),true);
+ assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,'https://later.stripe.com'),false);
+ const witness=privateOrigin.browserProviderOrigin(error);
+ assert.deepEqual(witness,{runId:originRun,expectedSource:originSource,origin,checkpoint});
+ assert.equal(privateOrigin.isBrowserProviderOriginWitness(witness),true);
+ assert.equal(JSON.stringify(error),'{}');
+});
 test('method phase provenance and its private in-memory origin retain independent contracts',()=>{
  const code='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER',error=browserFailure(code,'METHOD');
  assert.equal(browserDiagnostic(error,'METHOD'),code);

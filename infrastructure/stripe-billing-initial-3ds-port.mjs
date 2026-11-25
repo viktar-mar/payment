@@ -4,7 +4,7 @@ import {exactRecord} from './stripe-billing-failed-renewal-response.mjs';
 
 /** Each successful durable receipt enables exactly one subsequent action. */
 export function initialChallengeFlow({configuration,bootstrap,cli,fixture,active,step,fail,prove}){
-  let next='customer',subscriptionId,operationId,attemptId,createKey;
+  let next='customer',subscriptionId,operationId,attemptId,createKey,challengeDispatched=false;
   const need=value=>{billingCheck(active);if(!value)fail('CHALLENGE_ORDER');};
   function record(value,keys){try{return exactRecord(value,keys);}catch{fail('CHALLENGE_ORDER');}}
   function identity(value){
@@ -55,16 +55,20 @@ export function initialChallengeFlow({configuration,bootstrap,cli,fixture,active
         return fixture.acknowledge(kind,value,l);
       });
     },
-    beforeChallenge(raw){return once('challenge','challenged','DISPATCH',l=>{
-      const value=identity(raw);need(value.attemptId===attemptId);
-      return fixture.recordChallenge('challenge-dispatch',value,l);
-    });},
+    async beforeChallenge(raw){
+      await once('challenge','challenged','DISPATCH',l=>{
+        const value=identity(raw);need(value.attemptId===attemptId);
+        return fixture.recordChallenge('challenge-dispatch',value,l);
+      });
+      challengeDispatched=true;
+      return true;
+    },
     acknowledgeChallenge(raw){return once('challenged','evidence','ACK',l=>{
       const value=identity(raw);need(value.attemptId===attemptId);
       return fixture.recordChallenge('challenge-ack',value,l);
     });},
   };
-  return {port,async verify(){
+  return {port,challengeDispatched:()=>challengeDispatched,async verify(){
     return once('evidence','complete','EVIDENCE',async l=>{
       const verify=prove??(await import('./stripe-billing-evidence.mjs')).proveBillingInitial3dsEvidence;
       if(await verify({configuration,bootstrap,fixture,cli},l)!==true)fail('EVIDENCE');

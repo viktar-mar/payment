@@ -5,6 +5,7 @@ import {validateBillingAcceptanceOptions} from './stripe-billing-acceptance-opti
 import {createBillingFixture} from './stripe-billing-provision.mjs';
 import {provisionHarness} from './fixtures/failed-renewal-provision-harness.mjs';
 import {id} from './fixtures/failed-renewal-descriptors.mjs';
+import {acceptanceBrowserFailure,finishBrowserCleanup,rememberBrowserProviderOrigin} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 
 const scenario='initial_3ds';
 const configuration={
@@ -61,3 +62,35 @@ for(const fault of ['none','wrong confirm','second create','foreign challenge','
   await assert.rejects(owner.run(async()=>true,{deadline:Date.now()+1000}),/SINGLE_USE/);
  });
 }
+
+for(const fault of ['exact','foreign-run','sink-reject','forged-error','before-dispatch'])test('3DS owner keeps private refusal independent of its terminal outcome: '+fault,async()=>{
+ const checkpoint='BROWSER_PROVIDER_ORIGIN_STRIPE_COM',origin='https://evidence-only.stripe.com';
+ const f=await provisionHarness({configuration,factory:createBillingFixture});
+ const yes=async()=>true,calls=[];
+ const cli={validateBinding:yes,startListener:yes,assertBillingListener:yes,stopListener:yes};
+ const bootstrap={prepare:yes,start:yes,resources:()=>({cliDirectory:'inert'}),stop:async()=>{calls.push('stop');return true;},
+  persistRefusedStripeOrigin:async(witness,limits)=>{
+   calls.push(witness);assert.ok(limits.deadline>Date.now()&&limits.deadline<=Date.now()+2000);assert.ok(limits.signal instanceof AbortSignal);
+   if(fault==='sink-reject')throw Error('private sink details');return true;
+  }};
+ const owner=await owners.createOwnedBillingInitial3ds(configuration,{preflight:yes,createBootstrap:()=>bootstrap,
+  createCli:()=>cli,login:yes,createFixture:()=>f.fixture,proveInitial3ds:async()=>{assert.fail('must not verify');}});
+ const error=acceptanceBrowserFailure(checkpoint);
+ finishBrowserCleanup(error,true);
+ rememberBrowserProviderOrigin(error,fault==='foreign-run'?id(99):configuration.runId,configuration.expectedSource,origin);
+ await assert.rejects(owner.run(async p=>{
+  await p.acknowledgeCustomer({customerId:id(4),siteId:id(3)});
+  await p.beforeDispatch('create',id(11));
+  await p.acknowledge('create',{subscriptionId:id(7),operationId:id(8)});
+  await p.beforeDispatch('confirm',id(12),attempt);
+  await p.acknowledge('confirm',winning);
+  if(fault!=='before-dispatch')await p.beforeChallenge(attempt);
+  throw fault==='forged-error'?new Error(checkpoint):error;
+ },{deadline:Date.now()+5000}),{message:'billing_'+(fault==='forged-error'?'BROWSER':checkpoint)});
+ assert.deepEqual(calls,['exact','sink-reject'].includes(fault)?
+  [{runId:configuration.runId,expectedSource:configuration.expectedSource,checkpoint,origin},'stop']:['stop']);
+ assert.equal(owner.resources().cleanupConfirmed,fault!=='forged-error');
+ assert.equal(owner.resources().initial3dsAccepted,false);
+ assert.equal(JSON.stringify(owner.resources()).includes(origin),false);
+ assert.match(f.writes.at(-1).name,fault==='before-dispatch'?/-confirm-ack\.json$/:/-challenge-dispatch\.json$/);
+});

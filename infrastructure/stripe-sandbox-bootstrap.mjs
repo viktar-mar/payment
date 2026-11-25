@@ -156,6 +156,7 @@ export async function createOwnedBillingFailedRenewalBootstrap(options,dependenc
 async function createBootstrap(options,dependencies,diagnostic,manualPayment=false,billing=false,purpose=null) {
   const invoiceCase=billing&&options.selectedCase==='initial_missed_reordered';
   const firstPayment=purpose!==null,firstRenewal=purpose==='FIRST_RENEWAL',failedRenewal=purpose==='FAILED_RENEWAL';
+  const initial3ds=billing&&!firstPayment&&options.selectedCase==='initial_3ds';
   const descriptor=Object.getOwnPropertyDescriptor(options??{},'env');
   const rawEnv=descriptor?.enumerable&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined;
   if(!billing&&!billingAcceptanceExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
@@ -794,13 +795,14 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     if(refusedOriginUsed)return false;refusedOriginUsed=true;
     let timer,external,abort;
     try {
-      if(!failedRenewal||busy||pending||status!=='LIVE'||!live||!lock||!originalDirectory||manualDeadline===null)return false;
+      if(!(failedRenewal||initial3ds)||busy||pending||status!=='LIVE'||!live||!lock||!originalDirectory||manualDeadline===null)return false;
       if(!witness||typeof witness!=='object'||Object.getPrototypeOf(witness)!==Object.prototype)return false;
       // Capture caller descriptors once. The validator rejects accessors and
       // extra fields before any values are read from the frozen copy.
       const snapshot=Object.freeze(Object.create(Object.prototype,Object.getOwnPropertyDescriptors(witness)));
       if(!isBrowserProviderOriginWitness(snapshot)||snapshot.runId!==runId||snapshot.expectedSource!==expectedSource)return false;
       const checkpoint=Object.hasOwn(snapshot,'checkpoint')?snapshot.checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER';
+      if(initial3ds!==(checkpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM'))return false;
       if(!limits||typeof limits!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(limits)))return false;
       const fields=Object.getOwnPropertyDescriptors(limits);
       if(Reflect.ownKeys(fields).some(name=>!['deadline','signal'].includes(name))||!fields.deadline||!Object.hasOwn(fields.deadline,'value')
@@ -922,7 +924,8 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({host:'127.0.0.1',port:ports.postgres,database:'payment',user:'payment',password:inputs.PAYMENT_DB_PASSWORD}));}),context)!==true)fail();return true;
   },{adminChild:true});
   if(firstPayment)capabilities.startupDiagnostic=()=>startupCode;
-  if(failedRenewal){capabilities.persistenceDiagnostic=()=>persistenceCode;capabilities.persistRefusedStripeOrigin=persistRefusedStripeOrigin;}
+  if(failedRenewal)capabilities.persistenceDiagnostic=()=>persistenceCode;
+  if(failedRenewal||initial3ds)capabilities.persistRefusedStripeOrigin=persistRefusedStripeOrigin;
   if(firstPayment)capabilities[failedRenewal?'withFailedRenewalRuntime':firstRenewal?'withFirstRenewalRuntime':'withFirstPaymentRuntime']=(callback,limits)=>operation('ADMIN',limits,async context=>{if(typeof callback!=='function'||!controlCapability)fail();await verify(context);if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({endpoint:'http://127.0.0.1:'+options.controlPort,capability:controlCapability}));}),context)!==true)fail();return true;},{adminChild:true});
   return Object.freeze(capabilities);
 }

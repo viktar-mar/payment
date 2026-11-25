@@ -2270,6 +2270,24 @@ for(const interrupt of ['abort','timeout'])test('failed-renewal VERIFY keeps SOU
 });
 
 // Break: private evidence becomes a ledger operation, caller-controlled path, retry, or public payload.
+for(const selectedCase of ['initial_3ds','initial_decline_retry'])test('only the 3DS bootstrap can retain its exact private refusal: '+selectedCase,async()=>{
+ const f=fixture();
+ f.options.selectedCase=selectedCase;
+ f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',PAYMENT_STRIPE_BILLING_CASE:selectedCase};
+ const b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies),limits=LIMIT();
+ await b.prepare(limits);await b.persistWebhookSecret(SECRET);await b.start(limits);
+ try{
+  if(selectedCase!=='initial_3ds'){assert.equal(b.persistRefusedStripeOrigin,undefined);return;}
+  const checkpoint='BROWSER_PROVIDER_ORIGIN_STRIPE_COM',witness={...refusedWitness(),checkpoint};
+  const before=b.resources(),ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents);
+  assert.equal(await b.persistRefusedStripeOrigin(witness,limits),true);
+  const entry=f.files.get(refusedOriginPath);
+  assert.deepEqual(JSON.parse(entry.contents),witness);assert.equal(entry.mode&0o7777,0o600);
+  assert.deepEqual(b.resources(),before);assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,ledger);
+  assert.equal(await b.persistRefusedStripeOrigin(witness,limits),false);
+ }finally{await b.stop(LIMIT());}
+});
+
 for(const [name,witness,checkpoint] of [
  ['Stripe family',refusedWitness,'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'],
  ['other origin',otherRefusedWitness,'BROWSER_PROVIDER_ORIGIN_OTHER'],

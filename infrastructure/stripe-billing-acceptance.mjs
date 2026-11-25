@@ -6,7 +6,7 @@ import {RETRY_CLI_PROFILE_RUN_ID,THREE_DS_CLI_PROFILE_RUN_ID,validateBillingAcce
 import {createOwnedBillingBootstrap} from './stripe-sandbox-bootstrap.mjs';
 import {createBillingCliAdapter} from './stripe-sandbox-cli.mjs';
 import {preflightOwnedBilling} from './stripe-sandbox-owned.mjs';
-import {browserDiagnostic,browserCleanupConfirmed} from './stripe-billing-first-payment-browser-diagnostic.mjs';
+import {browserDiagnostic,browserCleanupConfirmed,browserProviderOrigin} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 import {billingBounded, billingCheck, billingError} from './stripe-billing-limits.mjs';
 import {createHash} from 'node:crypto';
 import {billingUuid} from './stripe-billing-provision.mjs';
@@ -145,7 +145,22 @@ async function createOwner(options,dependencies,selectedCase) {
      try{return await browserJourney(port,active);}
      catch(error){
       const checkpoint=bound?browserDiagnostic(error,'ACCEPTANCE'):null;
-      if(checkpoint){browserUnconfirmed=!browserCleanupConfirmed(error);fail(checkpoint);}
+      if(checkpoint){
+       browserUnconfirmed=!browserCleanupConfirmed(error);
+       if(challengeFlow?.challengeDispatched()&&checkpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM'){
+        const witness=browserProviderOrigin(error);
+        if(witness?.runId===configuration.runId&&witness.expectedSource===configuration.expectedSource){
+         // Private evidence is best effort. Preserve the original refusal even
+         // if cancellation or the evidence deadline wins before the file is saved.
+         failure??=checkpoint;
+         try{
+          const persist=Object.getOwnPropertyDescriptor(bootstrap,'persistRefusedStripeOrigin')?.value;
+          if(typeof persist==='function')await billingBounded(active,l=>persist.call(bootstrap,witness,l),2000);
+         }catch{}
+        }
+       }
+       fail(checkpoint);
+      }
       throw error;
      }
     },2700000);

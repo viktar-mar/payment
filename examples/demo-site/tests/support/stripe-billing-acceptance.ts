@@ -4,7 +4,7 @@ import type {BillingPort,BillingBinding,BillingLimits,BillingCancellationPort,Bi
 import type {GenericSubscriptionManager} from '@generic-payments/sdk';
 import type {ManagerState} from '../../../../frontend/sdk/src/subscriptions/manager-state';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
-import {acceptanceBrowserFailure,finishBrowserCleanup} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
+import {acceptanceBrowserFailure,finishBrowserCleanup,rememberBrowserProviderOrigin} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 // @ts-ignore Native Node and bundlers use the same shared provider origin policy.
 import {providerOrigin,providerNetworkOrigin} from './stripe-provider-origin.ts';
 // @ts-ignore Node's offline test entry consumes source.
@@ -220,6 +220,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
  limits={deadline:limits.deadline,signal:limits.signal?AbortSignal.any([limits.signal,lifecycle.signal]):lifecycle.signal};
  let context:BrowserContext|undefined,abandoned=false,closing:Promise<void>|undefined,failure=false;
  let checkpoint='BROWSER',firstFailure:string|undefined,cleanupConfirmed=false;
+ let refusedOrigin:{runId:string;expectedSource:string;origin:string}|undefined;
  const recordFailure=(code=checkpoint)=>{firstFailure??=code;failure=true;};
  const close=(ctx:BrowserContext)=>{closing??=ctx.close();void closing.catch(()=>{});return closing;};
  const opening=browser.newContext({serviceWorkers:'block',acceptDownloads:false});void opening.then(c=>{if(abandoned)return close(c);},()=>{}).catch(()=>{});
@@ -227,6 +228,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
  const pending=new Set<Promise<void>>();
  try{
   context=await billingBounded(limits,()=>opening);const page=await billingBounded(limits,()=>context!.newPage()),binding=port.resources();
+  let challengeDispatched=false;
   let authority='',subscriptionId='',operationId='',attemptId='',createPosts=0,confirmPosts=0,selectPosts=0,challengePosts=0,verifyPosts=0;
   const base=binding.endpoints.backend+'/api/v1/customer/subscriptions',otp=binding.endpoints.backend+'/api/v1/public/customer-auth/email-otp/challenges';
   let acknowledgeCreate!:()=>void;const created=new Promise<void>(r=>acknowledgeCreate=r);
@@ -425,7 +427,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    await context.routeWebSocket('**/*',socket=>{try{socket.close();}finally{invalidate('BROWSER_GUARD_WEBSOCKET');}});
   }
   await context.route(guarded?'**/*':binding.endpoints.backend+'/**',route=>{
-   const work=(async()=>{let routeCheckpoint:string|undefined;try{
+   const work=(async()=>{let routeCheckpoint:string|undefined,origin:string|undefined;try{
     billingCheck(limits);if(failure)fail();const req=route.request(),url=req.url(),method=req.method();
     redirects?.registerRoute(req);
     if(guarded){
@@ -437,7 +439,11 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
      }
      if(target.origin!==binding.endpoints.backend){
       routeCheckpoint='BROWSER_PROVIDER_ROUTE';
-      await providerTraffic(route,target,code=>{if(challenge)routeCheckpoint=code;});return;
+      await providerTraffic(route,target,code=>{
+       if(!challenge)return;
+       routeCheckpoint=code;
+       if(challengeDispatched&&code==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM')origin=target.origin;
+      });return;
      }
      if(cancellation && !['GET','OPTIONS'].includes(method)){await cancellation.forward(route);return;}
     }
@@ -530,7 +536,10 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     }
     const dispatch=successor?{beforeDispatch:(_kind:unknown,key:string)=>retryPort!.beforeSuccessorConfirm(key,{subscriptionId,operationId,attemptId})}:port;
     await forwardBillingDispatch(route,dispatch,binding,authority,'confirm',{subscriptionId,operationId,attemptId},limits,confirmation,checkManager,redirects?.authorize,invoiceCase?.releaseOriginalConfirm);
-   }catch{recordFailure(routeCheckpoint);abort();await route.abort('failed').catch(()=>{});}})();pending.add(work);void work.finally(()=>pending.delete(work));return work;
+   }catch{
+    if(!firstFailure&&origin)refusedOrigin={runId:binding.runId,expectedSource:binding.expectedSource,origin};
+    recordFailure(routeCheckpoint);abort();await route.abort('failed').catch(()=>{});
+   }})();pending.add(work);void work.finally(()=>pending.delete(work));return work;
   });
   const url=new URL('/',binding.endpoints.demo);
   url.search=new URLSearchParams({
@@ -759,6 +768,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    const scope={subscriptionId,operationId,attemptId};
    need(await port.acknowledge('confirm',{attemptId,state:'REQUIRES_ACTION',nextActionAllowed:true,retryAllowed:false,successorAttemptId:null})===true);
    await checkManager();need(await challenge.port.beforeChallenge(scope)===true);
+   challengeDispatched=true;
    winning.resolve();
    checkpoint='BROWSER_CHALLENGE_WAIT';
    await sca.attend();await checkManager();need(await challenge.port.acknowledgeChallenge(scope)===true);
@@ -789,6 +799,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
  if(firstFailure || guarded && failure){
   if(!bound)fail();
   const error=acceptanceBrowserFailure(firstFailure??checkpoint);
+  if(refusedOrigin)rememberBrowserProviderOrigin(error,refusedOrigin.runId,refusedOrigin.expectedSource,refusedOrigin.origin);
   finishBrowserCleanup(error,cleanupConfirmed);
   throw error;
  }
