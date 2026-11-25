@@ -1,6 +1,8 @@
 package dev.genericpayments.platform.provider.adapter.out.stripe.billing;
 
 import com.stripe.StripeClient;
+import com.stripe.exception.ApiConnectionException;
+import com.stripe.exception.InvalidRequestException;
 import com.stripe.exception.StripeException;
 import com.stripe.model.Invoice;
 import com.stripe.model.InvoiceLineItem;
@@ -14,6 +16,8 @@ import dev.genericpayments.platform.provider.application.model.ProviderOperation
 import dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore;
 import dev.genericpayments.platform.provider.application.service.ProviderOperationGuard;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.PaymentAccountVerificationPort;
+import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountMode;
+import dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType;
 import dev.genericpayments.platform.provider.adapter.out.stripe.*;
 import dev.genericpayments.platform.provider.application.port.out.StripeBillingBindingPort;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
@@ -25,10 +29,14 @@ import dev.genericpayments.platform.subscriptions.domain.*;
 import java.time.*;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingOwnership.*;
 
 /** Stripe plan preview and original-operation mutations; HTTP never belongs in a DB transaction. */
 public final class StripeBillingMutationAdapter {
+    private static final Logger LOG=LoggerFactory.getLogger(StripeBillingMutationAdapter.class);
     private final StripeBillingOwnership ownership;private final StripeBillingBindingPort bindings;
     private final SubscriptionPlanProofStore proofs;private final StripeCredentialResolver credentials;private final StripeClientFactory clients;
     private final PaymentAccountVerificationPort verification;private final Clock clock;
@@ -185,6 +193,14 @@ public final class StripeBillingMutationAdapter {
     /** Only explicit original CANCEL/WITHDRAW commands enter here; reads never call this method. */
     public Reply cancel(Command c,boolean withdraw,ProviderOperationStore steps,
                         SubscriptionCancellationProofStore cancellations,Clock securityClock){
+        boolean sandboxWithdrawal=withdraw&&c!=null&&c.operation().kind()==SubscriptionOperation.Kind.WITHDRAW_CANCEL
+            &&c.account().provider()==PaymentProviderType.STRIPE&&c.account().mode()==PaymentAccountMode.SANDBOX;
+        var diagnostic=new WithdrawalDiagnostic(sandboxWithdrawal);
+        try{return cancel(c,withdraw,steps,cancellations,securityClock,diagnostic);}
+        catch(RuntimeException failure){diagnostic.report(failure);throw failure;}
+    }
+    private Reply cancel(Command c,boolean withdraw,ProviderOperationStore steps,SubscriptionCancellationProofStore cancellations,
+                         Clock securityClock,WithdrawalDiagnostic diagnostic){
         var s=ownership.owned(c.account(),c.operation().subscriptionId());
         var o=ownership.lookupOperation(new Lookup(c.account(),s.id(),s.providerReference(),c.operation().providerOperationKey()));
         boolean immediate=!withdraw&&SubscriptionCancellationTransaction.immediate(o);
@@ -222,13 +238,17 @@ public final class StripeBillingMutationAdapter {
         else if(!immediate&&(s.cancellation()!=null||!boundary.equals(SubscriptionCancellationRules.liveBoundary(s,clock.instant()))))throw mismatch();
         var reserved=steps.reserve(c.account(),immediate?ProviderOperation.Kind.SUBSCRIPTION_CANCEL:ProviderOperation.Kind.SUBSCRIPTION_UPDATE,o.id(),o.providerOperationKey(),fp);
         if(reserved.status()==ProviderOperation.Status.ACKNOWLEDGED)throw mismatch();
+        diagnostic.stage=WithdrawalStage.CLAIM;
         String owner=UUID.randomUUID().toString();var claim=steps.claim(reserved.id(),owner,securityClock.instant(),Duration.ofSeconds(60));
-        if(claim.isEmpty())return new Reply(Outcome.UNKNOWN,null,null);var step=claim.get();
+        if(claim.isEmpty()){diagnostic.report(null);return new Reply(Outcome.UNKNOWN,null,null);}var step=claim.get();
         try{
+            diagnostic.stage=WithdrawalStage.PROVIDER_SETUP;
             verification.verify(c.account());var client=clients.create(credentials.resolve(c.account()));
+            diagnostic.stage=WithdrawalStage.CUSTOMER;
             var remoteCustomer=client.v1().customers().retrieve(customer.providerReference());
             if(!customer.providerReference().equals(remoteCustomer.getId())||!"customer".equals(remoteCustomer.getObject())
                 ||!Boolean.FALSE.equals(remoteCustomer.getLivemode())||Boolean.TRUE.equals(remoteCustomer.getDeleted()))throw mismatch();
+            diagnostic.stage=WithdrawalStage.SUBSCRIPTION;
             var remote=client.v1().subscriptions().retrieve(s.providerReference());
             requireCancellationRemote(remote,s,customer,ownership.price(c.account(),s,s.billingPrice()),boundary);
             boolean replay=reserved.firstDispatchedAt()!=null;
@@ -238,6 +258,7 @@ public final class StripeBillingMutationAdapter {
                 boolean nativeEnd=observed!=null&&remote.getCancelAt()==null&&Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())&&boundary.equals(itemPeriod(remote).end());
                 if(!Objects.equals(remote.getCancelAt(),boundary.getEpochSecond())&&!nativeEnd&&!(replay&&remote.getCancelAt()==null&&!Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())))throw mismatch();
             }else if(remote.getCancelAt()!=null&&!(replay&&remote.getCancelAt()==boundary.getEpochSecond())||Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())&&remote.getCancelAt()==null)throw mismatch();
+            diagnostic.stage=WithdrawalStage.AUTHORIZATION;
             cancellations.authorize(s,o);
             if(observed!=null)cancellations.requireObserved(s,observed);
             if(!immediate&&!clock.instant().isBefore(boundary))throw mismatch();
@@ -255,17 +276,58 @@ public final class StripeBillingMutationAdapter {
             var params=SubscriptionUpdateParams.builder().setProrationBehavior(SubscriptionUpdateParams.ProrationBehavior.NONE);
             if(withdraw)params.setCancelAt(com.stripe.param.common.EmptyParam.EMPTY).setCancelAtPeriodEnd(false);
             else params.setCancelAt(boundary.getEpochSecond());
+            diagnostic.stage=WithdrawalStage.PROVIDER_ERROR;
             var response=client.v1().subscriptions().update(s.providerReference(),params.build(),RequestOptions.builder().setIdempotencyKey(key).build());
+            diagnostic.stage=WithdrawalStage.RESPONSE;
             requireCancellationRemote(response,s,customer,ownership.price(c.account(),s,s.billingPrice()),boundary);
             if(withdraw?(response.getCancelAt()!=null||!Boolean.FALSE.equals(response.getCancelAtPeriodEnd())):!Objects.equals(response.getCancelAt(),boundary.getEpochSecond()))throw mismatch();
             // Receiving the complete original response before the deadline proves the write finished
             // before it. Dispatch time or a later status-null read cannot replace this evidence.
             var received=securityClock.instant().truncatedTo(ChronoUnit.MICROS);if(!received.isBefore(boundary))throw mismatch();
+            diagnostic.stage=WithdrawalStage.RECEIPT;
             var fresh=ownership.lookupOperation(new Lookup(c.account(),s.id(),s.providerReference(),o.providerOperationKey()));if(!fresh.equals(o))throw mismatch();
             if(observed==null)cancellations.record(s,o,step,owner,mode,boundary,prior==null?null:prior.operation(),received);
             else cancellations.recordObserved(s,o,step,owner,observed,received);
             return new Reply(Outcome.ACCEPTED,s.providerReference(),null);
-        }catch(StripeException|RuntimeException uncertain){steps.unknown(step.id(),owner,step.version());return new Reply(Outcome.UNKNOWN,null,null);}
+        }catch(StripeException|RuntimeException uncertain){
+            try{steps.unknown(step.id(),owner,step.version());}finally{diagnostic.report(uncertain);}
+            return new Reply(Outcome.UNKNOWN,null,null);
+        }
+    }
+    private enum WithdrawalStage {
+        PRE_CLAIM,CLAIM,PROVIDER_SETUP,CUSTOMER,SUBSCRIPTION,AUTHORIZATION,PROVIDER_ERROR,RESPONSE,RECEIPT,
+        PROVIDER_CONNECTION,PROVIDER_INVALID_REQUEST,PROVIDER_INVALID_CANCEL_AT,PROVIDER_INVALID_CANCEL_AT_PERIOD_END,PROVIDER_INVALID_PRORATION_BEHAVIOR
+    }
+    private static final class WithdrawalDiagnostic {
+        private final boolean enabled;
+        private WithdrawalStage stage=WithdrawalStage.PRE_CLAIM;
+        private boolean reported;
+        WithdrawalDiagnostic(boolean enabled){this.enabled=enabled;}
+        void report(Throwable failure){
+            if(!enabled||reported)return;
+            reported=true;
+            try{
+                var code=stage==WithdrawalStage.PROVIDER_ERROR?providerFailure(failure):stage;
+                // The default log pattern includes the HTTP request ID from MDC.
+                var context=MDC.getCopyOfContextMap();
+                try{
+                    MDC.clear();
+                    LOG.warn("STRIPE_SANDBOX_WITHDRAW_"+code.name());
+                }finally{
+                    if(context==null)MDC.clear();else MDC.setContextMap(context);
+                }
+            }catch(RuntimeException ignored){/* Diagnostics cannot change the command result. */}
+        }
+        private static WithdrawalStage providerFailure(Throwable failure){
+            if(failure instanceof ApiConnectionException)return WithdrawalStage.PROVIDER_CONNECTION;
+            if(failure instanceof InvalidRequestException invalid)return switch(invalid.getParam()){
+                case "cancel_at" -> WithdrawalStage.PROVIDER_INVALID_CANCEL_AT;
+                case "cancel_at_period_end" -> WithdrawalStage.PROVIDER_INVALID_CANCEL_AT_PERIOD_END;
+                case "proration_behavior" -> WithdrawalStage.PROVIDER_INVALID_PRORATION_BEHAVIOR;
+                case null,default -> WithdrawalStage.PROVIDER_INVALID_REQUEST;
+            };
+            return WithdrawalStage.PROVIDER_ERROR;
+        }
     }
     private static void requireCancellationRemote(com.stripe.model.Subscription r,dev.genericpayments.platform.subscriptions.domain.Subscription s,
         StripeBillingBindingPort.CustomerBinding customer,StripeBillingSnapshotMapper.PublishedPrice price,Instant boundary){

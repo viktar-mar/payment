@@ -2,10 +2,16 @@ package dev.genericpayments.platform.provider.adapter.out.stripe;
 
 import static org.assertj.core.api.Assertions.*;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.stripe.exception.ApiConnectionException;
 import com.stripe.net.RequestOptions;
 import com.stripe.param.SubscriptionUpdateParams;
 import com.stripe.param.common.EmptyParam;
+import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
+import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountMode;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingMutationAdapter;
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Lookup;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind;
@@ -23,8 +29,146 @@ import dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import static org.mockito.Mockito.*;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 class StripeSubscriptionCancellationTest {
+    @ParameterizedTest
+    @CsvSource({
+        "cancel_at,PROVIDER_INVALID_CANCEL_AT",
+        "cancel_at_period_end,PROVIDER_INVALID_CANCEL_AT_PERIOD_END",
+        "proration_behavior,PROVIDER_INVALID_PRORATION_BEHAVIOR",
+        "private-param-canary,PROVIDER_INVALID_REQUEST",
+        " ,PROVIDER_INVALID_REQUEST"
+    })
+    void withdrawalDiagnosticReportsOnlyKnownInvalidUpdateParameterCategories(String parameter,String expected)throws Exception{
+        try(var c=new CancellationCase()){
+            c.observeNativeSchedule();
+            c.current();
+            var problem=new com.google.gson.JsonObject();
+            problem.addProperty("type","invalid_request_error");
+            problem.addProperty("message","private-provider-message https://private.example/request");
+            if(parameter!=null)problem.addProperty("param",parameter);
+            var response=new com.google.gson.JsonObject();response.add("error",problem);
+            c.fixture.graph.http.respondError("POST",SUBSCRIPTION,400,response.toString(),Map.of("Request-Id","req_private_canary"));
+            assertWithdrawalDiagnostic(expected,()->assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.UNKNOWN));
+            assertThat(c.fixture.graph.http.requestCount("POST",SUBSCRIPTION)).isOne();
+            assertThat(c.fixture.steps.only().status()).isEqualTo(ProviderOperation.Status.UNKNOWN);
+            assertThat(c.receipts).isEmpty();
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "preclaim,PRE_CLAIM,0",
+        "setup,PROVIDER_SETUP,0",
+        "customer,CUSTOMER,0",
+        "subscription,SUBSCRIPTION,0",
+        "authorize,AUTHORIZATION,0",
+        "connection,PROVIDER_CONNECTION,1",
+        "provider,PROVIDER_ERROR,1",
+        "response,RESPONSE,1",
+        "receipt,RECEIPT,1"
+    })
+    void withdrawalDiagnosticIdentifiesTheFailedStageWithoutChangingProviderDispatch(String fault,String expected,int posts)throws Exception{
+        try(var c=new CancellationCase()){
+            c.observeNativeSchedule();
+            if(fault.equals("preclaim")){
+                when(c.proofs.observedSchedule(any(),any(),any())).thenThrow(new IllegalStateException("private-preclaim-message"));
+                assertWithdrawalDiagnostic(expected,()->assertThatThrownBy(()->c.fixture.adapter.withdrawCancel(c.command()))
+                    .isInstanceOf(IllegalStateException.class).hasMessage("private-preclaim-message"));
+            }else{
+                if(fault.equals("setup")){
+                    c.fixture.graph.http.respond("GET","/v1/account","{\"id\":\"acct_private_canary\",\"object\":\"account\"}");
+                }else{
+                    if(fault.equals("customer"))c.fixture.graph.customer.addProperty("id","cus_private_canary");
+                    if(fault.equals("subscription"))c.fixture.graph.item().addProperty("current_period_end",c.end.plusSeconds(1).getEpochSecond());
+                    c.current();
+                    switch(fault){
+                        case "authorize" -> doThrow(new IllegalStateException("private-auth-message")).when(c.proofs).authorize(any(),any());
+                        case "connection" -> c.fixture.graph.http.disconnectNext("POST",SUBSCRIPTION);
+                        case "provider" -> c.fixture.graph.http.respondError("POST",SUBSCRIPTION,500,
+                            "{\"error\":{\"type\":\"api_error\",\"message\":\"private-backend-message\"}}",Map.of());
+                        case "response" -> c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(false));
+                        case "receipt" -> {
+                            doThrow(new IllegalStateException("private-store-message")).when(c.proofs).recordObserved(any(),any(),any(),anyString(),any(),any());
+                            c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(true));
+                        }
+                        case "customer","subscription" -> {}
+                        default -> throw new AssertionError();
+                    }
+                }
+                assertWithdrawalDiagnostic(expected,()->assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.UNKNOWN));
+            }
+            assertThat(c.fixture.graph.http.requestCount("POST",SUBSCRIPTION)).isEqualTo(posts);
+            assertThat(c.receipts).isEmpty();
+        }
+    }
+
+    @Test
+    void withdrawalDiagnosticSeparatesAnUnclaimedStepFromProviderTransport()throws Exception{
+        try(var c=new CancellationCase()){
+            c.observeNativeSchedule();
+            var local=c.fixture.local;
+            var account=c.fixture.account;
+            var operation=c.fixture.operation;
+            var fingerprint=StripeBillingMutationAdapter.cancellationFingerprint(account,local,operation,c.fixture.customer,
+                SubscriptionCancellationProofStore.Mode.WITHDRAW,c.end,null,c.observed);
+            var step=c.fixture.steps.reserve(account,ProviderOperation.Kind.SUBSCRIPTION_UPDATE,operation.id(),operation.providerOperationKey(),fingerprint);
+            var original=c.fixture.steps.claim(step.id(),"other-owner",c.now,java.time.Duration.ofSeconds(60));
+            assertThat(original).isPresent();
+            assertWithdrawalDiagnostic("CLAIM",()->assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.UNKNOWN));
+            assertThat(c.fixture.steps.findById(step.id())).isEqualTo(original);
+            assertThat(c.fixture.graph.http.calls()).isEmpty();
+            assertThat(c.receipts).isEmpty();
+        }
+    }
+
+    @Test
+    void withdrawalDiagnosticStaysSilentForLiveAccountsAndForSchedule()throws Exception{
+        try(var c=new CancellationCase()){
+            c.observeNativeSchedule();
+            var account=c.fixture.account;
+            var live=new PaymentAccount(account.id(),account.key(),account.provider(),PaymentAccountMode.LIVE,account.status(),account.externalAccountId(),account.credentialsRef());
+            var original=c.command();
+            assertWithdrawalDiagnostic(null,()->assertThatThrownBy(()->c.fixture.adapter.withdrawCancel(new Command(live,original.operation(),original.current(),
+                null,original.providerSubscriptionReference(),null,null,false,false))).isInstanceOf(PaymentApplicationException.class));
+            assertThat(c.fixture.graph.http.calls()).isEmpty();
+        }
+        try(var c=new CancellationCase()){
+            c.current();c.fixture.graph.http.disconnectNext("POST",SUBSCRIPTION);
+            assertWithdrawalDiagnostic(null,()->assertThat(c.fixture.adapter.cancel(c.command(),false).outcome()).isEqualTo(Outcome.UNKNOWN));
+            assertThat(c.fixture.graph.http.requestCount("POST",SUBSCRIPTION)).isOne();
+        }
+    }
+
+    private static void assertWithdrawalDiagnostic(String expected,Runnable operation){
+        var logger=(Logger)LoggerFactory.getLogger(StripeBillingMutationAdapter.class);
+        var captured=new ListAppender<ILoggingEvent>(){
+            @Override protected void append(ILoggingEvent event){event.prepareForDeferredProcessing();super.append(event);}
+        };
+        var previous=MDC.getCopyOfContextMap();
+        var context=Map.of("request_id","private-request-canary","trace_id","private-trace-canary");
+        MDC.setContextMap(context);
+        captured.start();logger.addAppender(captured);
+        try{
+            operation.run();
+            assertThat(MDC.getCopyOfContextMap()).isEqualTo(context);
+            if(expected==null)assertThat(captured.list).isEmpty();
+            else assertThat(captured.list).singleElement().satisfies(event->{
+                assertThat(event.getFormattedMessage()).isEqualTo("STRIPE_SANDBOX_WITHDRAW_"+expected);
+                assertThat(event.getArgumentArray()).isNullOrEmpty();
+                assertThat(event.getThrowableProxy()).isNull();
+                assertThat(event.getMDCPropertyMap()).isEmpty();
+            });
+        }finally{
+            logger.detachAppender(captured);captured.stop();
+            if(previous==null)MDC.clear();else MDC.setContextMap(previous);
+        }
+    }
+
     @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(strings={"explicitFalse","missingCancelAt","missing","null","missingSchedule","missingPending","missingTrialStart","missingTrialEnd","schedule","pending","trial","period"})
     void nativeMapperToFencedProjectionRequiresPositiveSupportedWithdrawalState(String shape)throws Exception{
         try(var c=new CancellationCase()){
