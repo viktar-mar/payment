@@ -226,6 +226,8 @@ The local required-trial case creates a second trial for the same Customer after
 
 The [required-trial SQL proof](../infrastructure/stripe-billing-required-trial-proof.sql) verifies the exact owned run and original Customer, setup and subscription dispatches together with the scoped method, sole zero invoice, consumed eligibility, trial-start event and absence of cash. The app-backed PostgreSQL case proves the original record and refuses 27 substituted or incomplete graphs, including uncertain dispatches. The extended local suite passed 12 scenarios and 119 steps. Stripe Sandbox trial evidence remains outstanding.
 
+The [required-trial evidence adapter](../infrastructure/stripe-billing-required-trial-evidence.mjs) binds a fresh provider observation of the original SetupIntent, card, subscription item and zero invoice to all 17 arguments of that read-only SQL proof. It refuses cash, foreign relationships, owner replacement and an expired access lease. The local tests used injected observers. Native trial admission, the browser's SetupIntent confirmation, an independent Stripe reader and signed callback verification still need to be connected for this scenario.
+
 The scheduled-change fixture now uses the exact business clock sample during preview. A provider clock two seconds ahead reproduced the previous five-minute TTL rejection. The fixture keeps the original TTL and quote revalidation assertions. The combined local run passed all 12 scenarios, 119 steps, and 37 focused trial, method-isolation and SQL tests.
 
 ## Fresh failed renewal, grace and recovery — 2026-11-15
