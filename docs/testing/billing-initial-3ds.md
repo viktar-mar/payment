@@ -18,6 +18,8 @@ If a refused Stripe.com origin is the first failure after the challenge dispatch
 
 The private `issuerRelation` field records whether the refused form navigation matches the URL and 3DS transaction fields of the original Stripe authentication response. The runner aborts the route before reading that response and stops the read after 750 ms. It reads only an uncompressed response with a measured body size up to 64 KiB. A match is diagnostic evidence only. The request path, query, form data and response body are discarded.
 
+The dedicated entry can resolve the reviewed issuer origin from the owner-only report and checkout-local policy key. The complete report must match its reviewed HMAC, original run and source, and verified transaction-and-frame category. The rule applies to the original POST into the direct Stripe.js challenge iframe and the one trusted form submission on that same issuer origin. Both requests still require their original frame and paired nonredirect responses. If the report or policy key is unavailable, the checkout uses its existing issuer policy.
+
 ## What establishes a pass
 
 The original confirmation attempt must retain its winning `REQUIRES_ACTION` receipt. The terminal server records must show one paid invoice and one EUR 20 payment for the bound subscription, with matching journal entries and signed site callbacks. A separate read of the original PaymentIntent and latest captured Charge must show an authenticated 3DS 2.x challenge. Frictionless authentication, a different Charge or a second charge fails the check.

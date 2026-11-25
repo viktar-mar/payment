@@ -6,16 +6,17 @@ import {initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 // @ts-ignore Native Node executes the guarded response source.
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
 
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame'])
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin'])
 test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
  const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
  const retrieve=api+'/v1/payment_intents/pi_fixture?client_secret='+secret+'&key='+key;
  const authenticate=api+'/v1/3ds2/authenticate',complete=api+'/v1/3ds2/challenge_complete';
  const outer=stripe+'/v3/three-ds-2-challenge-fixture.html',inner=stripe+'/v3/fixture-inner.html';
- const direct=mode==='direct Stripe EMVCo frame';
+ const direct=mode==='direct Stripe EMVCo frame'||mode==='direct reviewed issuer origin';
  const issuerName=direct?'stripe-challenge-frame':'acsFrame';
- const issuerOrigin='https://hooks.stripe.com',issuer=issuerOrigin+'/fixture-issuer',decision=issuer+'/decision';
+ const approvedIssuerOrigin=mode==='direct reviewed issuer origin'?'https://reviewed-test-issuer.stripe.com':undefined;
+ const issuerOrigin=approvedIssuerOrigin??'https://hooks.stripe.com',issuer=issuerOrigin+'/fixture-issuer',decision=issuer+'/decision';
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
  const script=`(async()=>{
@@ -60,9 +61,9 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
   const page=await context.newPage(),forwarded:string[]=[],refusals:string[]=[];
   const limits={deadline:Date.now()+15_000};
   let issuerFrame:Frame|undefined,attachedIssuerFrame=false,separateIssuerTarget=false,gestures=0;
-  const guard=await guardChallengeRedirects(page,reason=>refusals.push(reason),{demo,backend});
+  const guard=await guardChallengeRedirects(page,reason=>refusals.push(reason),{demo,backend},undefined,approvedIssuerOrigin);
   const challenge=initial3dsChallenge({page,limits,demo,owner:()=>({key,secret}),winning:async()=>{},check:async()=>{},
-   authorizeResponse:request=>guard.authorize(request),waitForGesture:async()=>{
+   approvedIssuerOrigin,authorizeResponse:request=>guard.authorize(request),waitForGesture:async()=>{
     gestures++;
     if(mode==='separate issuer process'&&issuerFrame){
      const session=await context.newCDPSession(issuerFrame);

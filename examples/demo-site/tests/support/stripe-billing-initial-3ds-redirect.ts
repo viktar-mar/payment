@@ -3,6 +3,8 @@ import type {CDPSession,Frame,Page,Request} from '@playwright/test';
 import {guardIframeTargets,type GuardSession} from './stripe-billing-chromium-iframe.ts';
 // @ts-ignore Native Node executes the pinned Chromium identity reader.
 import {chromiumRouteReader,type ChromiumRouteEvidence} from './stripe-billing-chromium-route.ts';
+// @ts-ignore Native Node executes the same issuer-origin validator.
+import {isApprovedIssuerOrigin} from './stripe-billing-initial-3ds.ts';
 
 const refuse=():never=>{throw Error('billing_BROWSER');};
 // Keep response interception aligned with every original HTTP destination the guarded
@@ -86,15 +88,15 @@ function bindPreflightInitiator(preflight:Entry,entry:Entry):boolean{
 
 /** Playwright routes only the first URL in a redirect chain. Arm a response-stage guard
  * before each SDK request exists and require its passive network event on the exact frame. */
-export async function guardChallengeRedirects(page:Page,onFailure:(reason:RedirectGuardFailure)=>void,origins:Origins,signal?:AbortSignal){
- if(signal?.aborted)return refuse();
+export async function guardChallengeRedirects(page:Page,onFailure:(reason:RedirectGuardFailure)=>void,origins:Origins,signal?:AbortSignal,approvedIssuerOrigin?:string){
+ if(signal?.aborted || approvedIssuerOrigin!==undefined&&!isApprovedIssuerOrigin(approvedIssuerOrigin))return refuse();
  const routeReader=chromiumRouteReader(page);
  for(const fresh of [origins.backend,origins.demo]){
   const url=new URL(fresh);
   if(url.origin!==fresh || !/^http:\/\/127\.0\.0\.1:[1-9]\d{3,4}$/.test(fresh))refuse();
  }
  if(origins.backend===origins.demo)refuse();
- const exactOrigins=[...stripeOrigins,origins.backend,origins.demo];
+ const exactOrigins=[...stripeOrigins,origins.backend,origins.demo,...(approvedIssuerOrigin?[approvedIssuerOrigin]:[])];
  const patterns=exactOrigins.map(origin=>origin+'/*').concat('https://*.js.stripe.com/*');
  function tracked(raw:string){
   const url=new URL(raw);return exactOrigins.includes(url.origin)||stripeScript(url);
@@ -119,7 +121,8 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
     retire({requestId:event.requestId});onFailure('BROWSER_GUARD_REQUEST_PAIR');return;
    }
    if(requests.size>=24){onFailure('BROWSER_GUARD_REQUEST_CAPACITY');return;}
-   const preflight=probe(event.request,event.initiator?.type,origins);
+   const issuerTraffic=approvedIssuerOrigin&&new URL(event.request.url).origin===approvedIssuerOrigin;
+   const preflight=issuerTraffic?undefined:probe(event.request,event.initiator?.type,origins);
    const entry:Entry={frameId:event.frameId,url:event.request.url,method:event.request.method,allowed:false,preflight};
    if(!entry.frameId){
     // Chrome may report a frameless preflight before the linked initiating request.
@@ -276,6 +279,10 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   if(!routes.has(request))routes.set(request,{generation:iframeGuard.generation(),evidence:routeReader?.capture(request)});
  },
  async authorize(request:Request){
+  if(approvedIssuerOrigin && new URL(request.url()).origin===approvedIssuerOrigin &&
+     (request.method()!=='POST'||!request.isNavigationRequest()||request.resourceType()!=='document')){
+   onFailure('BROWSER_GUARD_ROUTE_IDENTITY');return refuse();
+  }
   // A replacement target cannot inherit a route that predates its attachment.
   const registered=routes.get(request);
   const generation=registered?.generation??iframeGuard.generation();

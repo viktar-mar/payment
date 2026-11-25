@@ -6,6 +6,7 @@ import {snapshotBillingAcceptanceEnvironment} from '../../../infrastructure/stri
 import {billingRunSettingsAllowed} from './support/stripe-billing-failed-renewal-settings';
 import {runInitial3dsCase} from './support/stripe-billing-initial-3ds-terminal';
 import {loadFailedRenewalStaticOriginMatcher} from './support/stripe-billing-failed-renewal-static-origin-pin';
+import {loadPinnedInitial3dsIssuerOrigin} from './support/stripe-billing-initial-3ds-issuer-pin';
 import {runBillingInitial3dsBrowser} from './support/stripe-billing-acceptance';
 
 let owner:Awaited<ReturnType<typeof createOwnedBillingInitial3ds>>;
@@ -31,7 +32,8 @@ test('OWNED_INITIAL_3DS',async({browser},info)=>{
     const operator=await openProfileOperator({rehearsal:false,mode:'challenge',onAbandon:()=>controller.abort(),
       handoffPath:join(info.project.outputDir,runId,'operator.html')});
     try{
-      return await runBillingInitial3dsBrowser(browser,port,{...limits,signal},l=>operator.wait('challenge',l),loadFailedRenewalStaticOriginMatcher());
+      return await runBillingInitial3dsBrowser(browser,port,{...limits,signal},l=>operator.wait('challenge',l),
+        loadFailedRenewalStaticOriginMatcher(),loadPinnedInitial3dsIssuerOrigin());
     }finally{controller.abort();await operator.close();}
   },info.annotations);
 });

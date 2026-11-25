@@ -215,13 +215,13 @@ export function runBillingCancellationBrowser(browser:Browser,port:BillingCancel
 export function runBillingDeclineRetryBrowser(browser:Browser,port:BillingDeclineRetryPort,limits:BillingLimits,matchesStaticOrigin?:(origin:string)=>boolean):Promise<true>{
  return runBillingBrowser(browser,port,limits,undefined,port,matchesStaticOrigin);
 }
-export function runBillingInitial3dsBrowser(browser:Browser,port:BillingInitial3dsPort,limits:BillingLimits,waitForGesture:WaitForIssuerGesture,matchesStaticOrigin?:(origin:string)=>boolean):Promise<true>{
- return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,{port,waitForGesture});
+export function runBillingInitial3dsBrowser(browser:Browser,port:BillingInitial3dsPort,limits:BillingLimits,waitForGesture:WaitForIssuerGesture,matchesStaticOrigin?:(origin:string)=>boolean,approvedIssuerOrigin?:string):Promise<true>{
+ return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,{port,waitForGesture,approvedIssuerOrigin});
 }
 export function runBillingInvoiceWebhooksBrowser(browser:Browser,port:BillingInvoiceWebhooksPort,limits:BillingLimits,matchesStaticOrigin:(origin:string)=>boolean):Promise<true>{
  return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,undefined,port);
 }
-async function runBillingBrowser(browser:Browser,port:BillingPort,limits:BillingLimits,cancellationPort?:BillingCancellationPort,retryPort?:BillingDeclineRetryPort,matchesStaticOrigin?:(origin:string)=>boolean,challenge?:{port:BillingInitial3dsPort;waitForGesture:WaitForIssuerGesture},invoiceCase?:BillingInvoiceWebhooksPort):Promise<true>{
+async function runBillingBrowser(browser:Browser,port:BillingPort,limits:BillingLimits,cancellationPort?:BillingCancellationPort,retryPort?:BillingDeclineRetryPort,matchesStaticOrigin?:(origin:string)=>boolean,challenge?:{port:BillingInitial3dsPort;waitForGesture:WaitForIssuerGesture;approvedIssuerOrigin?:string},invoiceCase?:BillingInvoiceWebhooksPort):Promise<true>{
  const pinnedCancellation=!!cancellationPort&&typeof matchesStaticOrigin==='function';
  const exactInitialCheckout=!!(retryPort||challenge||pinnedCancellation);
  const bound=exactInitialCheckout||!!invoiceCase,guarded=!!(cancellationPort||bound);
@@ -360,9 +360,10 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   const winning=Promise.withResolvers<void>();
   const invalidate=(reason:string)=>{recordFailure(reason);abort();};
   if(responseGuard)checkpoint='BROWSER_SETUP';
-  const redirects=responseGuard?await guardChallengeRedirects(page,invalidate,binding.endpoints,limits.signal):undefined;
+  const redirects=responseGuard?await guardChallengeRedirects(page,invalidate,binding.endpoints,limits.signal,challenge?.approvedIssuerOrigin):undefined;
   const sca=challenge?initial3dsChallenge({page,limits,demo:binding.endpoints.demo,owner:()=>({secret:firstSecret,key:publishableKey??''}),
    stripeFrames:req=>stripeFrames(page,req,false,false,binding.endpoints.demo),authorizeResponse:req=>redirects!.authorize(req),check:checkManager,waitForGesture:challenge.waitForGesture,
+   approvedIssuerOrigin:challenge.approvedIssuerOrigin,
    winning:async()=>{
     const original=requests.get('original-confirm'),response=original?.existingResponse();
     need(response && response.request()===original && response.status()===200 && !response.fromServiceWorker());

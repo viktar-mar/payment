@@ -11,6 +11,13 @@ function object(value:unknown):Record<string,unknown>{
 const uuid=(v:unknown)=>typeof v==='string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(v);
 const issuerOrigin='https://hooks.stripe.com';
 const directIssuerFrame='stripe-challenge-frame';
+const reservedStripeHosts=new Set(['api','hooks','js','m','r','merchant-ui-api']);
+export function isApprovedIssuerOrigin(value:unknown):value is string{
+ if(typeof value!=='string')return false;
+ const label=/^https:\/\/([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.stripe\.com$/.exec(value)?.[1];
+ if(!label||reservedStripeHosts.has(label))return false;
+ try{return new URL(value).origin===value;}catch{return false;}
+}
 function initialIssuerDocument(frame:Frame){
  return frame.name()!==directIssuerFrame||frame.url()==='about:blank';
 }
@@ -56,9 +63,10 @@ function observedIssuerBinding(raw:unknown){
  const url=exactUrl(ares.acsURL);
  return Object.freeze({url:url.href,version:ares.messageVersion,acs:ares.acsTransID,server:ares.threeDSServerTransID});
 }
-export function issuerBinding(raw:unknown){
+export function issuerBinding(raw:unknown,approvedOrigin?:string){
+ requireValue(approvedOrigin===undefined||isApprovedIssuerOrigin(approvedOrigin));
  const value=observedIssuerBinding(raw);
- requireValue(new URL(value.url).origin===issuerOrigin);
+ requireValue(new URL(value.url).origin===(approvedOrigin??issuerOrigin));
  return value;
 }
 export function matchingChallengeRequest(binding:ReturnType<typeof issuerBinding>,url:string,body:string|null){
@@ -93,13 +101,15 @@ type Options={
  page:Page;limits:BillingLimits;demo:string;owner:()=>{secret:string;key:string};
  winning:()=>Promise<void>;authorizeResponse:(req:Request)=>Promise<void>;check:()=>Promise<void>;
  stripeFrames:(req:Request)=>FrameSnapshot|undefined;waitForGesture:WaitForIssuerGesture;
+ approvedIssuerOrigin?:string;
 };
 function sameChain(a:FrameSnapshot|undefined,b:FrameSnapshot|undefined){
  requireValue(a && b && a.target===b.target && a.frames.size===b.frames.size && [...a.frames].every(([f,url])=>b.frames.get(f)===url));
 }
 
 /** Scoped to one original v2 session. Only Stripe.js sends requests and only the issuer UI completes the challenge. */
-export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,check,stripeFrames,waitForGesture}:Options){
+export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
+ requireValue(approvedIssuerOrigin===undefined||isApprovedIssuerOrigin(approvedIssuerOrigin));
  let retrieve:Request|undefined,authenticate:Request|undefined,admittedAuthenticate:Request|undefined;
  let completed=false,finalRead=false,boundSource:string|undefined;
  let issuer:Frame|undefined,issuerRequest:Request|undefined,submission:Request|undefined,binding:ReturnType<typeof issuerBinding>|undefined;
@@ -184,7 +194,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    },750);
   }catch{return 'AUTHENTICATE_UNVERIFIED';}
  }
- const owns=(url:URL)=>url.origin===issuerOrigin || url.origin==='https://api.stripe.com' &&
+ const owns=(url:URL)=>url.origin===issuerOrigin || url.origin===approvedIssuerOrigin || url.origin==='https://api.stripe.com' &&
   (url.pathname.startsWith('/v1/payment_intents/') || url.pathname.startsWith('/v1/3ds2/'));
  async function forward(route:Route,url:URL,report:(code:string)=>void){
   report('BROWSER_CHALLENGE_REQUEST');
@@ -192,6 +202,8 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   requireValue(owns(url) && !request.redirectedFrom() && url.href===request.url() && !url.username && !url.password && !url.hash);
   const frameCode=api?'BROWSER_CHALLENGE_API_FRAME':'BROWSER_CHALLENGE_ISSUER_FRAME';
   report(frameCode);
+  const approved=url.origin===approvedIssuerOrigin;
+  if(approved)requireValue(target.name()===directIssuerFrame);
   const chain=()=>stamped(api?stripeFrames(request):frameChain(target)),original=chain();
   requireValue(original);
   report('BROWSER_CHALLENGE_WINNING');
@@ -260,7 +272,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     report('BROWSER_CHALLENGE_ISSUER_RESPONSE');
     const body=await verifiedBody(admittedAuthenticate);
     report('BROWSER_CHALLENGE_ISSUER_BINDING');
-    const observed=issuerBinding(body);
+    const observed=issuerBinding(body,approved?approvedIssuerOrigin:undefined);
     report('BROWSER_CHALLENGE_ISSUER_TRANSACTION');
     const inner=target.parentFrame()!;
     const parentDocument=inner.url()==='about:blank'?inner.parentFrame()!.url():inner.url();
@@ -274,7 +286,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION');
    const armed=arm;
    requireValue(armed);sameChain(armed.document,original);
-   requireValue(target===issuer && target.url()===binding?.url && url.href===armed.action && headers.origin===issuerOrigin &&
+   requireValue(target===issuer && target.url()===binding?.url && url.href===armed.action && headers.origin===url.origin &&
     typeof data==='string' && data.length<=65536 && createHash('sha256').update(data).digest('hex')===armed.bodyHash);
    await billingBounded(limits,()=>armed.gesture,1000);
    await current();
@@ -312,7 +324,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    return {action:node.hasAttribute('formaction')?node.formAction:node.form.action,bodyHash};
   });
   const form=await getForm();requireValue(form);
-  const action=exactUrl(form.action);requireValue(action.origin===issuerOrigin);
+  const action=exactUrl(form.action);requireValue(action.origin===new URL(bound.url).origin);
   const validate=async()=>{
    await check();sameChain(original,stamped(frameChain(frame)));
    const current=await getForm();

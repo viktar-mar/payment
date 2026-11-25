@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type {Frame,Page,Request,Route} from '@playwright/test';
 // @ts-ignore Offline tests execute source.
-import {challengeSource,issuerBinding,matchingChallengeRequest,challengeApiRequest,initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
+import {challengeSource,issuerBinding,isApprovedIssuerOrigin,matchingChallengeRequest,challengeApiRequest,initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 // @ts-ignore Native Node executes the same terminal decoder as the launcher.
 import {challengeTerminalLine} from './stripe-billing-initial-3ds-terminal.ts';
 
@@ -13,6 +13,23 @@ const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444
 const url='https://hooks.stripe.com/test-only-fixture?bound=1';
 const result={state:'challenge_required',ares:{messageType:'ARes',transStatus:'C',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,acsURL:url}};
 const form=(override={})=>new URLSearchParams({creq:Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,...override})).toString('base64url')}).toString();
+test('issuer configuration accepts only a canonical external Stripe leaf and binds its exact ARes URL',()=>{
+ const approved='https://approved-synthetic.stripe.com',approval={...result,ares:{...result.ares,acsURL:approved+'/test-only?bound=1'}};
+ assert.equal(isApprovedIssuerOrigin(approved),true);
+ for(const value of [undefined,'https://stripe.com','https://api.stripe.com','https://js.stripe.com','https://r.stripe.com',
+  'https://hooks.stripe.com','https://m.stripe.com','https://merchant-ui-api.stripe.com','https://nested.approved-synthetic.stripe.com',
+  'https://approved-synthetic.stripe.com.evil.invalid','https://approved-synthetic.stripe.com:443','https://*.stripe.com',
+  approved+'/',approved+'?ignored=1',approved+'#ignored',approved+'\n','https://user@approved-synthetic.stripe.com',
+  'https://APPROVED-synthetic.stripe.com','http://approved-synthetic.stripe.com','https://-approved.stripe.com']){
+  assert.equal(isApprovedIssuerOrigin(value),false);
+ }
+ assert.throws(()=>issuerBinding(approval));
+ assert.throws(()=>issuerBinding(approval,'https://different-synthetic.stripe.com'));
+ assert.throws(()=>issuerBinding(approval,approved+':443'));
+ const binding=issuerBinding(approval,approved);
+ assert.equal(matchingChallengeRequest(binding,approval.ares.acsURL,form()),true);
+ assert.equal(matchingChallengeRequest(binding,approved+'/other-path',form()),false);
+});
 test('issuer traffic cannot continue when the lifetime ends after the last asynchronous guard',async()=>{
  const controller=new AbortController(),frame={url:()=> 'https://js.stripe.com/v3/fixture.html'} as Frame;
  const request={url:()=> 'https://api.stripe.com/v1/payment_intents/pi_test123?client_secret='+secret,frame:()=>frame,
