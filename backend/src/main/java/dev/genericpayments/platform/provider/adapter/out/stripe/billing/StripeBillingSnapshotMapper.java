@@ -784,19 +784,25 @@ public final class StripeBillingSnapshotMapper {
             boolean originalHistory=original!=null&&(renewalAdmission==null||renewalAdmission.invoice().equals(invoice.getId())&&"subscription_create".equals(invoice.getBillingReason()));
             boolean ownedRenewal=renewalAdmission!=null&&!originalHistory;
             // Stripe moved the subscription association to parent.subscription_item_details.
-            // On an ordinary first invoice, a legacy root value, if present, must still agree.
+            // The required-trial path proves the exact nested item and zero settlement below.
             boolean ordinaryInitial=original==null&&owner.trial()==null&&"subscription_create".equals(invoice.getBillingReason())
                 &&invoice.getAmountDue()!=null&&invoice.getAmountDue()>0&&("open".equals(invoice.getStatus())||"paid".equals(invoice.getStatus()));
+            var trialContext=owner.trial();
+            String legacySubscription=line.getSubscription();
+            boolean permitsMissingLegacySubscription=originalHistory||ownedRenewal||ordinaryInitial;
+            boolean nestedRequiredTrial=legacySubscription==null&&!permitsMissingLegacySubscription&&trialContext!=null&&trialContext.requiredSetup()!=null;
             if(recoveredDebt)require(StripeBillingMutationAdapter.noNonAmountAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
             // Authenticate historical inclusive taxes before FAILED can publish the original debt.
             // Reuse this unique fetched line; historical amount/balance tolerances remain below.
             if(failedInclusiveHistory&&originalHistory)require(StripeBillingMutationAdapter.noNonAmountAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
-            requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())&&(remote.getId().equals(line.getSubscription())||(originalHistory||ownedRenewal||ordinaryInitial)&&line.getSubscription()==null)&&Objects.equals(line.getQuantity(),1L)
+            requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())
+                &&(remote.getId().equals(legacySubscription)||legacySubscription==null&&(permitsMissingLegacySubscription||nestedRequiredTrial))
+                &&Objects.equals(line.getQuantity(),1L)
                 &&line.getParent()!=null&&"subscription_item_details".equals(line.getParent().getType())&&line.getParent().getSubscriptionItemDetails()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             var detail=line.getParent().getSubscriptionItemDetails();
             if(ownedRenewal)require((!renewalFlatItems.containsKey(line.getId())||item.getId().equals(renewalFlatItems.get(line.getId())))
                 &&ownedRenewalNoAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
-            var trialContext=owner.trial();boolean historicalTrial=trialContext!=null&&trialContext.request().verified()&&invoice.getId().equals(trialContext.request().invoice());
+            boolean historicalTrial=trialContext!=null&&trialContext.request().verified()&&invoice.getId().equals(trialContext.request().invoice());
             requireOwned(remote.getId().equals(detail.getSubscription())&&detail.getProration()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             require(line.getPricing()!=null&&"price_details".equals(line.getPricing().getType())&&line.getPricing().getPriceDetails()!=null);
             var pricing=line.getPricing().getPriceDetails();var mapped=prices.get(pricing.getPrice());require(mapped!=null&&mapped.providerProductReference().equals(pricing.getProduct()));
@@ -807,13 +813,16 @@ public final class StripeBillingSnapshotMapper {
                 &&mapped.equals(trialContext.original())&&period.end().getEpochSecond()==trialContext.request().requestedEnd()
                 &&StripeBillingOwnership.inWindow(period.start().getEpochSecond(),trialContext.step())&&StripeBillingOwnership.inWindow(invoice.getCreated(),trialContext.step())
                 &&(trial==null||trial.equals(period));
+            boolean matchingTrialInvoice=kind==BillingRecord.Kind.INITIAL&&trialContext!=null&&mapped.equals(trialContext.original())
+                &&(originalTrial||historicalTrial&&trial!=null&&trial.equals(period));
+            if(nestedRequiredTrial)requireOwned(matchingTrialInvoice&&invoice.getAmountDue()==0,OwnedActionGuard.LINE_ASSOCIATION);
             var scheduleHistory=owner.schedules().stream().filter(p->{var q=p.quote();var binding=p.schedule();return binding.releaseStep()==null&&binding.updateStep()!=null&&binding.targetEnd()!=null
                 &&q.customerReference().equals(invoice.getCustomer())&&q.subscriptionReference().equals(remote.getId())&&q.targetPrice().equals(pricing.getPrice())&&q.product().equals(pricing.getProduct())
                 &&line.getPeriod()!=null&&Objects.equals(line.getPeriod().getStart(),q.period().end().getEpochSecond())&&Objects.equals(line.getPeriod().getEnd(),binding.targetEnd());}).toList();
             require(scheduleHistory.size()<=1);
             if(!scheduleHistory.isEmpty()){require("subscription_cycle".equals(invoice.getBillingReason())&&Boolean.FALSE.equals(detail.getProration())&&detail.getSubscriptionItem()!=null&&detail.getSubscriptionItem().matches("si_[A-Za-z0-9]{1,252}")
                 &&StripeBillingMutationAdapter.noAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty())&&(line.getDiscounts()==null||line.getDiscounts().isEmpty()));}
-            else if(originalTrial)require(detail.getSubscriptionItem()!=null&&detail.getSubscriptionItem().matches("si_[A-Za-z0-9]{1,252}"));
+            else if(originalTrial&&!nestedRequiredTrial)require(detail.getSubscriptionItem()!=null&&detail.getSubscriptionItem().matches("si_[A-Za-z0-9]{1,252}"));
             else require((historicalTrial?trialContext.request().item():item.getId()).equals(detail.getSubscriptionItem()));
             var allocations=pages(after->client.v1().invoicePayments().list(InvoicePaymentListParams.builder().setInvoice(invoice.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build(),options()));
             sourceAllocations.put(invoice.getId(),allocations);
@@ -833,9 +842,7 @@ public final class StripeBillingSnapshotMapper {
             if(trace.first!=null)unsupportedReason=trace.first;
             switch(status){
                 case "paid"->{
-                    if(plain&&invoice.getAmountDue()==0&&zeros(invoice.getAmountPaid(),invoice.getAmountRemaining())&&allocations.isEmpty()
-                        &&kind==BillingRecord.Kind.INITIAL&&trialContext!=null&&mapped.equals(trialContext.original())
-                        &&(originalTrial||historicalTrial&&trial!=null&&trial.equals(period))){
+                    if(plain&&invoice.getAmountDue()==0&&zeros(invoice.getAmountPaid(),invoice.getAmountRemaining())&&allocations.isEmpty()&&matchingTrialInvoice){
                         require(trialEvidence==null);
                         trialEvidence=new TrialEvidence(trialContext.request().operation(),trialContext.step().id(),invoice.getId(),detail.getSubscriptionItem(),period,mapped.terms(),trialContext.requiredSetup()==null?null:trialContext.requiredSetup().method());
                         settlement=SettlementKind.ZERO;
@@ -852,6 +859,7 @@ public final class StripeBillingSnapshotMapper {
                 case "void"->{if(plain&&allocations.isEmpty())settlement=SettlementKind.VOID;}
                 default->throw mismatch();
             }
+            if(nestedRequiredTrial)requireOwned(settlement==SettlementKind.ZERO,OwnedActionGuard.LINE_ASSOCIATION);
             if(!scheduleHistory.isEmpty())require(settlement==SettlementKind.CASH||item.getId().equals(detail.getSubscriptionItem())&&settlement==SettlementKind.OPEN);
             var result=new SubscriptionProviderModels.Invoice(invoice.getId(),kind,mapped.terms(),null,period,invoice.getAmountDue(),mapped.terms().regularAmount().currency(),settlement,cash);
             if(actionFailure!=null&&settlement==SettlementKind.UNSUPPORTED)settlementReasons.put(result,unsupportedReason);

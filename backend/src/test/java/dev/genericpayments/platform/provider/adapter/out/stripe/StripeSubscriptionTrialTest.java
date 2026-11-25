@@ -23,6 +23,67 @@ class StripeSubscriptionTrialTest {
     @AfterEach void close(){f.close();}
 
     @Test void originalInitialZeroIsProvedOnFirstRead(){assertOriginalZero(false);}
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void requiredTrialRecognizesTheOwnedZeroInvoiceWithoutALegacyLineSubscription(boolean historical){
+        var result=readRequiredTrialWithoutLegacyLineSubscription(historical,g->{});
+        assertThat(result.trialEvidence()).satisfies(trial->{
+            assertThat(trial.invoice()).isEqualTo("in_owned");
+            assertThat(trial.item()).isEqualTo("si_owned");
+            assertThat(trial.originalMethod()).isEqualTo("pm_owned");
+        });
+        assertThat(result.invoices()).singleElement().satisfies(invoice->{
+            assertThat(invoice.settlement()).isEqualTo(SettlementKind.ZERO);
+            assertThat(invoice.cashObjects()).isEmpty();
+        });
+    }
+    @ParameterizedTest @ValueSource(strings={"root","parent","item","historicalItem","historicalAmount","historicalKind","historicalPeriod","price","period","creation","outsidePayment"})
+    void requiredTrialRefusesConflictingLineOrOriginalInvoiceEvidence(String fault){
+        assertThatThrownBy(()->readRequiredTrialWithoutLegacyLineSubscription(fault.startsWith("historical"),g->{
+            var detail=g.line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details");
+            switch(fault){
+                case "root"->g.line.addProperty("subscription","sub_foreign");
+                case "parent"->detail.addProperty("subscription","sub_foreign");
+                case "item"->detail.addProperty("subscription_item","si_foreign");
+                case "historicalItem"->detail.addProperty("subscription_item","si_current");
+                case "historicalAmount"->g.invoice.addProperty("amount_due",1000);
+                case "historicalKind"->g.invoice.addProperty("billing_reason","subscription_cycle");
+                case "price"->g.line.getAsJsonObject("pricing").getAsJsonObject("price_details").addProperty("price","price_foreign");
+                case "period","historicalPeriod"->g.line.getAsJsonObject("period").addProperty("end",proofs.trial.requestedEnd()+1);
+                case "creation"->g.invoice.addProperty("created",now.minusSeconds(1).getEpochSecond());
+                case "outsidePayment"->g.invoice.addProperty("amount_paid_off_stripe",1);
+                default->throw new IllegalArgumentException(fault);
+            }
+        })).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
+        if(fault.startsWith("historical"))assertThat(f.graph.http.requestCount("GET","/v1/invoice_payments")).isZero();
+    }
+    private Snapshot readRequiredTrialWithoutLegacyLineSubscription(boolean historical,java.util.function.Consumer<StripeBillingSnapshotMapperTest> mutate){
+        createRequiredFromSetup(false);
+        var g=f.graph;
+        long start=now.getEpochSecond(),end=proofs.trial.requestedEnd();
+        g.zeroTrial();
+        g.subscription.addProperty("trial_start",start);
+        g.subscription.addProperty("trial_end",end);
+        g.item().addProperty("current_period_start",start);
+        g.item().addProperty("current_period_end",end);
+        g.invoice.addProperty("created",start);
+        g.line.getAsJsonObject("period").addProperty("start",start);
+        g.line.getAsJsonObject("period").addProperty("end",end);
+        g.line.remove("subscription");
+        f.local=StripeSubscriptionCreateTest.copy(f.local,"sub_owned",historical?Subscription.Status.ACTIVE:Subscription.Status.INCOMPLETE);
+        if(historical){
+            var step=f.steps.find(f.account.id(),f.operation.providerOperationKey()).orElseThrow();
+            proofs.bindTrial(proofs.trial,step.id(),"sub_owned","si_owned","in_owned",start);
+            g.subscription.addProperty("status","active");
+            g.item().addProperty("id","si_current");
+        }
+        mutate.accept(g);
+        f.identity();
+        g.head();
+        g.lines();
+        g.http.respond("GET","/v1/invoice_payments",StripeBillingSnapshotMapperTest.page(false));
+        g.http.respond("GET","/v1/payment_methods/pm_owned","{\"id\":\"pm_owned\",\"object\":\"payment_method\",\"livemode\":false,\"customer\":\"cus_owned\",\"type\":\"card\",\"card\":{\"brand\":\"visa\"}}");
+        return f.adapter.retrieve(new Lookup(f.account,f.local.id(),"sub_owned",f.operation.providerOperationKey()));
+    }
     @Test void paidCreatedCardDefaultIsVerifiedPerSubscriptionWithoutAnySetup(){
         var g=f.graph;g.subscription.addProperty("default_payment_method","pm_paid");g.graph();g.http.respond("GET","/v1/payment_methods/pm_paid","{\"id\":\"pm_paid\",\"object\":\"payment_method\",\"livemode\":false,\"customer\":\"cus_owned\",\"type\":\"card\",\"card\":{\"brand\":\"visa\"}}");
         assertThat(g.read().paymentMethodReady()).isTrue();assertThat(proofs.setups).isEmpty();

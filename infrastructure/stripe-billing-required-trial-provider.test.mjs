@@ -127,6 +127,7 @@ for(const [name,change,last] of [
  ['missing out-of-band amount',f=>{delete f.bodies.get(invoice).amount_paid_off_stripe;},invoice],
  ['pretax credit',f=>{f.bodies.get(invoice).total_pretax_credit_amounts=[{}];},invoice],
  ['foreign invoice line item',f=>{f.bodies.get(invoice).lines.data[0].parent.subscription_item_details.subscription_item='si_other';},invoice],
+ ['conflicting legacy invoice line subscription',f=>{f.bodies.get(invoice).lines.data[0].subscription='sub_other';},invoice],
  ['another invoice',f=>{f.bodies.get('/v1/invoices').data.push(object('in_other','invoice',{}));},'/v1/invoices'],
  ['incomplete invoice inventory',f=>{f.bodies.get('/v1/invoices').has_more=true;},'/v1/invoices'],
  ['invoice allocation',f=>{f.bodies.get('/v1/invoice_payments').data.push({id:'inpay_other'});},'/v1/invoice_payments'],

@@ -197,6 +197,7 @@ async function observeOwnedTrial(inputs,scope,limits,{readOnly,readProvider}) {
  stripeObject(line,line.id,'line_item');
  const detail=line.parent?.subscription_item_details;
  need(line.invoice===invoice&&line.amount===0&&line.quantity===1&&line.currency==='eur'
+  &&(line.subscription==null||line.subscription===subscription)
   &&line.parent?.type==='subscription_item_details'&&detail?.subscription===subscription&&detail.subscription_item===item
   &&detail.proration===false&&line.pricing?.type==='price_details'&&line.pricing.price_details?.price===price.id
   &&line.pricing.price_details.product===price.product&&line.period?.start===start&&line.period.end===end
