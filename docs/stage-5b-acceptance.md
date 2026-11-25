@@ -1,6 +1,6 @@
 # Stripe Billing Stage 5B acceptance
 
-## Current acceptance status on 2026-11-24
+## Current acceptance status on 2026-11-25
 
 **Failed renewal, grace and recovery passed in Stripe Sandbox. Full Stage 5B remains open.** Run `fda11bdd-3006-4e2c-b148-3add30aa1235` at `e9ee6ccc92c477302c9f818b640a9908c1d47d23` exited 0 after one attempt. It verified the initial €20 payment, failed renewal, access at G−1/G/G+1, confirmation of the replacement method, and repayment of the original €20 renewal debt. The application recorded the recovered payment on the original renewal bill and restored paid access. The independent proof matched cash, journal entries and five signed callback receipts, each delivered once.
 
@@ -12,7 +12,7 @@ Run `e7080356` separately verified the initial €20 payment and the first succe
 
 Dedicated one-shot entries are ready for [initial 3DS](testing/billing-initial-3ds.md), [cancellation and withdrawal](testing/billing-cancellation-withdrawal.md), and [missed or reordered webhooks](testing/billing-missed-reordered.md). The remaining native cases are required and optional trials, paused resumption, per-subscription method isolation, pending/failed/paid upgrades, scheduled changes, and Portal policy and return. The [acceptance design](superpowers/specs/2026-10-28-stripe-billing-5b-design.md#7-приёмка-5b) defines the final evidence for all cases.
 
-The local offline check at `731c5d7` passed all 1,009 SDK tests, SDK typecheck and build, the initial-3DS demo build, and 170 infrastructure tests for Billing admission, initial 3DS and Retry, cancellation evidence and missed or reordered webhooks.
+The local offline check at `731c5d7` passed all 1,009 SDK tests, SDK typecheck and build, the initial-3DS demo build, and 170 infrastructure tests for Billing admission, initial 3DS and Retry, cancellation evidence and missed or reordered webhooks. At `3fbfb44`, all 243 Admin tests, typecheck, lint and production build passed. The six focused backend suites for plan changes, cancellation, recovery, Portal, provider observation and the SDK wire contract passed all 296 tests.
 
 The seven-day optional trial Cucumber scenarios check access one second before expiry and at the exact deadline. Read-only reconciliation records the original subscription as paused, with zero debt or cash. A subsequent card setup remains scoped to that subscription and leaves it paused. Explicit resumption binds one new invoice to the original subscription. The open invoice leaves access paused. The verified €20 capture grants one paid period and publishes both exact payment and subscription callbacks. A repeated reconciliation preserves those records and the original zero invoice, trial proof and trial-start event. Native trial and resumption remain pending. [Billing scenarios](../backend/src/test/resources/features/stripe_billing.feature)
 
