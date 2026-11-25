@@ -51,6 +51,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
  * SQL provisions catalog fixtures and reads evidence; no normalized provider snapshots bypass the mapper. */
 public class StripeBillingSteps {
     private static final String ORIGIN = "https://subscription-acceptance.test";
+    static final String REQUIRED_TRIAL_PROOF_SITE_KEY = "s5a-00000000000040008000000000000001";
+    private static final UUID REQUIRED_TRIAL_PROOF_RUN = UUID.fromString("00000000-0000-4000-8000-000000000001");
     private final ApplicationContext app;
     private final AcceptanceWorld world;
     private final JdbcTemplate jdbc;
@@ -72,6 +74,7 @@ public class StripeBillingSteps {
     private List<Long> evidence;
     private TrialPublication originalTrial;
     private SubscriptionOperationResult trialSetup, trialResume, requiredTrial;
+    private String requiredTrialCreateDigest;
     private ProductId requiredTrialProduct;
     private PriceId requiredTrialPrice;
     private JsonObject requiredTrialSetup, requiredTrialRemote;
@@ -147,12 +150,12 @@ public class StripeBillingSteps {
         var page=new JsonObject();page.addProperty("object","list");page.addProperty("has_more",false);
         var data=new JsonArray();objects.forEach(data::add);page.add("data",data);return page.toString();
     }
-    private void catalogFixture(int trialDays,boolean portalAcceptance) {
+    private void catalogFixture(int trialDays,boolean portalAcceptance,String siteKey) {
         site=new SiteId(UUID.randomUUID());var accountId=UUID.randomUUID();product=new ProductId(UUID.randomUUID());price=new PriceId(UUID.randomUUID());
         jdbc.update("insert into payment_accounts values (?,?,'STRIPE','SANDBOX','ACTIVE',?,'stripe-sandbox-default',now(),0)",
             accountId,portalAcceptance?"stripe-sandbox-default":"stripe-billing-acceptance",
             portalAcceptance?"acct_1UPiMpELswAd8tpR":"acct_billing");
-        jdbc.update("insert into sites values (?,'customer-one','Stripe Billing',?,'ACTIVE','AUTOMATIC',now(),now(),0)",site.value(),accountId);
+        jdbc.update("insert into sites values (?,?,'Stripe Billing',?,'ACTIVE','AUTOMATIC',now(),now(),0)",site.value(),siteKey,accountId);
         jdbc.update("insert into site_allowed_origins values (?,?)",site.value(),ORIGIN);
         jdbc.update("insert into site_authentication_modes values (?,'SITE_TOKEN')",site.value());
         jdbc.update("insert into products(id,site_id,product_key,name,status,created_at,updated_at) values (?,?,'billing','Billing','ACTIVE',?,?)",product.value(),site.value(),Timestamp.from(now()),Timestamp.from(now()));
@@ -170,11 +173,17 @@ public class StripeBillingSteps {
     @Given("an owned Stripe Billing subscription for Portal acceptance")
     public void createPortalFixture() throws Exception { create(0,true); }
 
-    private void create(int trialDays,boolean portalAcceptance) throws Exception {
+    @Given("an owned Stripe Billing subscription for a required trial proof run")
+    public void createRequiredTrialProofFixture() throws Exception {
+        create(7,false,REQUIRED_TRIAL_PROOF_SITE_KEY);
+    }
+
+    private void create(int trialDays,boolean portalAcceptance) throws Exception { create(trialDays,portalAcceptance,"customer-one"); }
+    private void create(int trialDays,boolean portalAcceptance,String siteKey) throws Exception {
         assertThat(trialDays).isIn(0,7);
         // Align this synthetic business fixture with ordinary provider UTC; security clocks stay untouched.
         TestClock.set(Instant.now().truncatedTo(ChronoUnit.SECONDS));
-        http=new StripeHttpFixture();factory.attach(http);attached=true;catalogFixture(trialDays,portalAcceptance);
+        http=new StripeHttpFixture();factory.attach(http);attached=true;catalogFixture(trialDays,portalAcceptance,siteKey);
         start=now();end=start.plusSeconds(30L*86400);
         remoteCustomer=json("{\"id\":\"cus_billing\",\"object\":\"customer\",\"livemode\":false}");
         remote=subscriptionJson();
@@ -450,7 +459,7 @@ public class StripeBillingSteps {
     }
 
     @When("the same customer requests a required-method Stripe trial for a second product")
-    public void startRequiredTrialSetup() {
+    public void startRequiredTrialSetup() throws NoSuchAlgorithmException {
         siblingTrial=subscription();
         siblingPublication=trialPublication();
         requiredTrialProduct=new ProductId(UUID.randomUUID());
@@ -477,8 +486,10 @@ public class StripeBillingSteps {
             requiredTrialSetup.addProperty("created",firstDispatch(call));
             return requiredTrialSetup.toString();
         });
+        var createKey=key();
+        requiredTrialCreateDigest=HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(createKey.getBytes(StandardCharsets.UTF_8)));
         requiredTrial=bean(CreateSubscriptionUseCase.class).create(
-            new CreateSubscriptionUseCase.Command(context(key()),requiredTrialPrice,true));
+            new CreateSubscriptionUseCase.Command(context(createKey),requiredTrialPrice,true));
     }
 
     @Then("the second trial has only its original setup receipt without cash or access")
@@ -514,7 +525,7 @@ public class StripeBillingSteps {
 
     @When("that exact setup succeeds and its original Stripe zero invoice is reconciled")
     public void verifyRequiredTrial() {
-        var providerNow=Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        var providerNow=Instant.now().truncatedTo(ChronoUnit.MICROS);
         StripeAcceptanceConfiguration.providerTime(providerNow);
         requiredTrialSetup.addProperty("status","succeeded");
         requiredTrialSetup.addProperty("payment_method","pm_required");
@@ -543,7 +554,8 @@ public class StripeBillingSteps {
         var continued=bean(ContinueOriginalSubscriptionSetupUseCase.class).api(context(key()),requiredTrial.subscriptionId(),requiredTrial.operationId());
         assertThat(continued.operationId()).isEqualTo(requiredTrial.operationId());
         assertThat(continued.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
-        assertThat(requiredTrialPeriod).isEqualTo(new Subscription.Period(providerNow,providerNow.plus(Duration.ofDays(7))));
+        var providerSecond=providerNow.truncatedTo(ChronoUnit.SECONDS);
+        assertThat(requiredTrialPeriod).isEqualTo(new Subscription.Period(providerSecond,providerSecond.plus(Duration.ofDays(7))));
         assertThat(bean(QuerySubscriptionsUseCase.class).get(actor,site,requiredTrial.subscriptionId()).access().allowed()).isFalse();
         TestClock.set(Instant.now().truncatedTo(ChronoUnit.MICROS));
         var zero=invoice("requiredtrial","subscription_create",requiredTrialPeriod.start(),requiredTrialPeriod.end(),"ZERO",REQUIRED);
@@ -610,6 +622,20 @@ public class StripeBillingSteps {
         assertTrialStartCallback(siblingTrial,created.operationId(),"in_trial");
         assertThat(count("outbox_events","site_id=?",site.value())).isEqualTo(2);
         deliverCallbacks(Set.of(local.id(),siblingTrial.id()));
+    }
+
+    @Then("the PostgreSQL proof verifies only the exact required trial and no cash")
+    public void requiredTrialSqlProof() throws Exception {
+        var id=requiredTrial.subscriptionId();
+        var bill=jdbc.queryForObject("select id from subscription_billing_records where site_id=? and subscription_id=? and provider_invoice_reference='in_requiredtrial'",
+            UUID.class,site.value(),id);
+        var event=jdbc.queryForObject("select id from subscription_events where site_id=? and subscription_id=? and event_type='TRIAL_STARTED'",
+            UUID.class,site.value(),id);
+        StripeBillingRequiredTrialSqlAssertions.verify(bean(javax.sql.DataSource.class),List.of(
+            REQUIRED_TRIAL_PROOF_RUN,account.id().value(),site.value(),customer.id().value(),requiredTrialProduct.value(),requiredTrialPrice.value(),
+            id,requiredTrial.operationId(),requiredTrialCreateDigest,"cus_billing","seti_required","pm_required",REQUIRED.subscription(),REQUIRED.item(),
+            "in_requiredtrial",Timestamp.from(requiredTrialPeriod.start()),Timestamp.from(requiredTrialPeriod.end())),
+            bill,event,subscription(id).revision());
     }
 
     private void assertTrialStartCallback(Subscription trial, UUID operationId, String invoice) {
@@ -1064,8 +1090,14 @@ public class StripeBillingSteps {
         var policies=bean(SubscriptionPolicyPort.class);
         policies.saveTransition(new PlanTransition(site,product,price,downgradePrice,PlanTransition.Direction.DOWNGRADE,false,policies.load(site).version()));
         readHead();
-        downgradeQuote=bean(PreviewSubscriptionChangeUseCase.class).preview(
-            new PreviewSubscriptionChangeUseCase.Query(context(null),created.subscriptionId(),downgradePrice,ChangeTiming.NEXT_PERIOD));
+        // The fixture business clock is fixed after invoice reconciliation. Keep this preview on that sample.
+        StripeAcceptanceConfiguration.providerTime(now());
+        try {
+            downgradeQuote=bean(PreviewSubscriptionChangeUseCase.class).preview(
+                new PreviewSubscriptionChangeUseCase.Query(context(null),created.subscriptionId(),downgradePrice,ChangeTiming.NEXT_PERIOD));
+        } finally {
+            StripeAcceptanceConfiguration.providerTime(null);
+        }
         assertThat(downgradeQuote.timing()).isEqualTo(ChangeTiming.NEXT_PERIOD);
         assertThat(downgradeQuote.dueNowMinor()).isZero();
         assertThat(downgradeQuote.nextAmountMinor()).isEqualTo(1500);
