@@ -86,7 +86,7 @@ Feature: Stripe Billing through the configured application and official SDK
     And its canonical Site callbacks are signed and delivered exactly once
 
   Scenario: A narrow owned Portal session preserves scope and grants no money on return
-    Given an owned Stripe Billing subscription with 0 trial days
+    Given an owned Stripe Billing subscription for Portal acceptance
     When its initial Stripe invoice is verified through a signed receipt
     And the customer opens the allowed narrow Stripe Billing Portal
     Then its Portal configuration and session have original persisted provider proofs

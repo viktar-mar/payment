@@ -32,7 +32,12 @@ import dev.genericpayments.platform.subscriptions.application.service.Subscripti
 import dev.genericpayments.platform.webhooks.application.service.SubscriptionInboxWorker;
 import io.cucumber.java.After;
 import io.cucumber.java.en.*;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.sql.Timestamp;
 import java.time.*;
 import java.time.temporal.ChronoUnit;
@@ -79,6 +84,10 @@ public class StripeBillingSteps {
     private Instant planAnchor;
     private UUID portalOperation;
     private String portalReturn,portalNavigation;
+    private PortalInputs portalInputs;
+
+    private record PortalInputs(PublishedCash cash,long policyVersion,String keyDigest,Instant expiresAt,
+                                long revision,Subscription.Period period) {}
 
     public StripeBillingSteps(ApplicationContext app, AcceptanceWorld world, JdbcTemplate jdbc,
             StripeAcceptanceConfiguration.FixtureFactory factory) {
@@ -111,16 +120,21 @@ public class StripeBillingSteps {
         }
         if(http!=null) { http.close(); http=null; }
     }
-    private void identity() { http.enqueue("GET","/v1/account",200,"{\"id\":\"acct_billing\",\"object\":\"account\"}"); }
+    private void identity() {
+        var provider=new JsonObject();provider.addProperty("id",account.externalAccountId());provider.addProperty("object","account");
+        respond("GET","/v1/account",provider);
+    }
     private void respond(String method,String path,JsonObject body) { http.enqueue(method,path,200,body.toString()); }
     private static JsonObject json(String body) { return JsonParser.parseString(body).getAsJsonObject(); }
     private static String page(Collection<JsonObject> objects) {
         var page=new JsonObject();page.addProperty("object","list");page.addProperty("has_more",false);
         var data=new JsonArray();objects.forEach(data::add);page.add("data",data);return page.toString();
     }
-    private void catalogFixture(int trialDays) {
+    private void catalogFixture(int trialDays,boolean portalAcceptance) {
         site=new SiteId(UUID.randomUUID());var accountId=UUID.randomUUID();product=new ProductId(UUID.randomUUID());price=new PriceId(UUID.randomUUID());
-        jdbc.update("insert into payment_accounts values (?,'stripe-billing-acceptance','STRIPE','SANDBOX','ACTIVE','acct_billing','stripe-sandbox-default',now(),0)",accountId);
+        jdbc.update("insert into payment_accounts values (?,?,'STRIPE','SANDBOX','ACTIVE',?,'stripe-sandbox-default',now(),0)",
+            accountId,portalAcceptance?"stripe-sandbox-default":"stripe-billing-acceptance",
+            portalAcceptance?"acct_1UPiMpELswAd8tpR":"acct_billing");
         jdbc.update("insert into sites values (?,'customer-one','Stripe Billing',?,'ACTIVE','AUTOMATIC',now(),now(),0)",site.value(),accountId);
         jdbc.update("insert into site_allowed_origins values (?,?)",site.value(),ORIGIN);
         jdbc.update("insert into site_authentication_modes values (?,'SITE_TOKEN')",site.value());
@@ -134,11 +148,16 @@ public class StripeBillingSteps {
         authenticate();
     }
     @Given("an owned Stripe Billing subscription with {int} trial days")
-    public void create(int trialDays) throws Exception {
+    public void create(int trialDays) throws Exception { create(trialDays,false); }
+
+    @Given("an owned Stripe Billing subscription for Portal acceptance")
+    public void createPortalFixture() throws Exception { create(0,true); }
+
+    private void create(int trialDays,boolean portalAcceptance) throws Exception {
         assertThat(trialDays).isIn(0,7);
         // Align this synthetic business fixture with ordinary provider UTC; security clocks stay untouched.
         TestClock.set(Instant.now().truncatedTo(ChronoUnit.SECONDS));
-        http=new StripeHttpFixture();factory.attach(http);attached=true;catalogFixture(trialDays);
+        http=new StripeHttpFixture();factory.attach(http);attached=true;catalogFixture(trialDays,portalAcceptance);
         start=now();end=start.plusSeconds(30L*86400);
         remoteCustomer=json("{\"id\":\"cus_billing\",\"object\":\"customer\",\"livemode\":false}");
         remote=subscriptionJson();
@@ -236,7 +255,7 @@ public class StripeBillingSteps {
         String body=envelope.toString();
         var mac=Mac.getInstance("HmacSHA256");mac.init(new SecretKeySpec(StripeAcceptanceConfiguration.SIGNING.getBytes(StandardCharsets.UTF_8),"HmacSHA256"));
         String signature=HexFormat.of().formatHex(mac.doFinal((at+"."+body).getBytes(StandardCharsets.UTF_8)));
-        var response=world.api().mvc.perform(post("/api/v1/provider-webhooks/stripe/stripe-billing-acceptance").header("Stripe-Signature","t="+at+",v1="+signature).contentType("application/json").content(body)).andReturn().getResponse();
+        var response=world.api().mvc.perform(post("/api/v1/provider-webhooks/stripe/"+account.key()).header("Stripe-Signature","t="+at+",v1="+signature).contentType("application/json").content(body)).andReturn().getResponse();
         assertThat(response.getStatus()).as("Billing signed receipt HTTP status; payload withheld").isEqualTo(204);
     }
     private void processReceipt(String event) throws Exception {
@@ -288,6 +307,10 @@ public class StripeBillingSteps {
     }
 
     private PublishedCash publishedCash(String invoiceReference, String paymentReference, BillingRecord.Kind kind) {
+        return publishedCash(invoiceReference,paymentReference,kind,SubscriptionEvent.Source.RECONCILIATION);
+    }
+
+    private PublishedCash publishedCash(String invoiceReference,String paymentReference,BillingRecord.Kind kind,SubscriptionEvent.Source source) {
         return jdbc.queryForObject("""
             select b.id, p.id, cash.id, period.id from subscription_billing_records b
             join payments p on p.billing_record_id=b.id and p.subscription_id=b.subscription_id and p.site_id=b.site_id
@@ -298,7 +321,7 @@ public class StripeBillingSteps {
               and cash.site_id=p.site_id and cash.payment_account_id=p.payment_account_id
             join subscription_events period on period.billing_record_id=b.id and period.subscription_id=b.subscription_id
               and period.site_id=b.site_id and period.payment_account_id=b.payment_account_id
-              and period.event_type='PERIOD_PAID' and period.source='RECONCILIATION'
+              and period.event_type='PERIOD_PAID' and period.source=?
             join outbox_events pay_callback on pay_callback.id=cash.id and pay_callback.site_id=p.site_id
               and pay_callback.payment_id=p.id and pay_callback.callback_type='payment.succeeded'
             join outbox_events period_callback on period_callback.id=period.id and period_callback.site_id=b.site_id
@@ -308,7 +331,7 @@ public class StripeBillingSteps {
               and b.currency='EUR' and b.amount_due_minor=2000
             """,(row,index) -> new PublishedCash(row.getObject(1,UUID.class),row.getObject(2,UUID.class),
                 row.getObject(3,UUID.class),row.getObject(4,UUID.class)),
-            paymentReference,site.value(),created.subscriptionId(),account.id().value(),customer.id().value(),
+            paymentReference,source.name(),site.value(),created.subscriptionId(),account.id().value(),customer.id().value(),
             invoiceReference,kind.name());
     }
 
@@ -772,9 +795,13 @@ public class StripeBillingSteps {
         var writes=http.calls().stream().filter(c->c.method().equals("POST")&&c.path().equals("/v1/subscriptions/sub_billing")).toList();
         assertThat(writes).singleElement().satisfies(c->{assertThat(c.header("Idempotency-Key")).isEqualTo(operation(upgraded.operationId()).providerOperationKey());assertThat(c.form()).containsEntry("payment_behavior","pending_if_incomplete").containsEntry("proration_behavior","always_invoice").containsEntry("proration_date",Long.toString(planAnchor.getEpochSecond())).containsEntry("items[0][price]","price_upgrade").containsEntry("items[0][id]","si_billing");});
     }
-    @When("the customer opens the allowed narrow Stripe Billing Portal") public void portal() {
+    @When("the customer opens the allowed narrow Stripe Billing Portal") public void portal() throws NoSuchAlgorithmException {
         var policies=bean(SubscriptionPolicyPort.class);var old=policies.load(site);portalReturn=ORIGIN+"/account";
-        policies.save(new SubscriptionPolicy(site,old.version(),true,3,true,true,false,Set.of(portalReturn)),old.version());
+        var policy=policies.save(new SubscriptionPolicy(site,old.version(),true,3,false,true,false,Set.of(portalReturn)),old.version());
+        var original=subscription();
+        var paid=publishedCash("in_initial","pi_initial",BillingRecord.Kind.INITIAL,SubscriptionEvent.Source.PROVIDER_WEBHOOK);
+        var portalKey=key();
+        var keyDigest=HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(portalKey.getBytes(StandardCharsets.UTF_8)));
         evidence=financialEvidence();portalNavigation="https://billing.stripe.com/p/session?secret=test_"+UUID.randomUUID().toString().replace("-","");
         identity();respond("GET","/v1/customers/cus_billing",remoteCustomer);respondPage("/v1/subscriptions",List.of(remote));respondPage("/v1/invoices",List.of(invoices.getFirst().invoice()));
         var configuration=json("""
@@ -783,14 +810,23 @@ public class StripeBillingSteps {
             """.formatted(portalReturn));
         http.enqueue("POST","/v1/billing_portal/configurations",200,call->{long at=dispatchSecond(call);configuration.addProperty("created",at);configuration.addProperty("updated",at);return configuration.toString();});
         http.enqueue("GET","/v1/billing_portal/configurations/bpc_billing",200,ignored->configuration.toString());
-        http.enqueue("POST","/v1/billing_portal/sessions",200,call->"""
+        http.enqueue("POST","/v1/billing_portal/sessions",200,call->{
+            long dispatched=dispatchSecond(call);
+            // Keep the fixture's fixed application time after the real SDK dispatch and before publication.
+            TestClock.set(Instant.now().truncatedTo(ChronoUnit.MICROS));
+            return """
             {"id":"bps_billing","object":"billing_portal.session","livemode":false,"created":%d,"customer":"cus_billing","configuration":"bpc_billing","url":"%s","return_url":"%s","flow":{"type":"subscription_cancel","subscription_cancel":{"subscription":"sub_billing"},"after_completion":{"type":"redirect","redirect":{"return_url":"%s"}}}}
-            """.formatted(dispatchSecond(call),portalNavigation,portalReturn,portalReturn));
-        var navigation=bean(CreateSubscriptionPortalUseCase.class).create(new CreateSubscriptionPortalUseCase.Command(context(key()),created.subscriptionId(),portalReturn));
+            """.formatted(dispatched,portalNavigation,portalReturn,portalReturn);
+        });
+        var navigation=bean(CreateSubscriptionPortalUseCase.class).create(new CreateSubscriptionPortalUseCase.Command(context(portalKey),created.subscriptionId(),portalReturn));
         assertThat(navigation.simulated()).isFalse();assertThat(navigation.navigationUrl().equals(portalNavigation)).as("exact ephemeral owned navigation; value withheld").isTrue();
+        portalInputs=new PortalInputs(paid,policy.version(),keyDigest,navigation.expiresAt(),original.revision(),original.currentPeriod());
         portalOperation=jdbc.queryForObject("select id from subscription_operations where subscription_id=? and kind='PORTAL'",UUID.class,created.subscriptionId());
     }
-    @Then("its Portal configuration and session have original persisted provider proofs") public void portalProofs() {
+    @Then("its Portal configuration and session have original persisted provider proofs") public void portalProofs() throws IOException {
+        var sql=Files.readString(Path.of("../infrastructure/stripe-billing-portal-proof.sql")).replaceAll("\\$[0-9]+","?");
+        assertThat(queryPortalProof(sql,portalInputs.expiresAt())).containsExactly(true);
+        assertThat(queryPortalProof(sql,portalInputs.expiresAt().plusNanos(1000))).isEmpty();
         assertThat(operation(portalOperation).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
         assertThat(count("stripe_portal_configurations","payment_account_id=? and site_id=? and configuration_reference='bpc_billing'",account.id().value(),site.value())).isEqualTo(1);
         assertThat(count("stripe_portal_session_receipts","operation_id=? and session_reference='bps_billing'",portalOperation)).isEqualTo(1);
@@ -803,6 +839,12 @@ public class StripeBillingSteps {
         assertThat(writes.getFirst().form()).containsEntry("features[invoice_history][enabled]","true").containsEntry("features[subscription_cancel][mode]","at_period_end").containsEntry("features[subscription_cancel][proration_behavior]","none").containsEntry("features[payment_method_update][enabled]","false").containsEntry("features[customer_update][enabled]","false").containsEntry("features[subscription_update][enabled]","false");
         assertThat(writes.getLast().header("Idempotency-Key")).isEqualTo(session.operationKey());assertThat(writes.getLast().form()).containsEntry("customer","cus_billing").containsEntry("configuration","bpc_billing").containsEntry("return_url",portalReturn).containsEntry("flow_data[type]","subscription_cancel").containsEntry("flow_data[subscription_cancel][subscription]","sub_billing");
         for(String table:List.of("stripe_portal_configuration_intents","stripe_portal_configurations","stripe_portal_session_intents","stripe_portal_session_receipts","subscription_portal_sessions","subscription_operations","outbox_events"))assertThat(jdbc.queryForList("select row_to_json(t)::text from "+table+" t").toString().contains(portalNavigation)).as("ephemeral Portal URL persistence scan; value withheld").isFalse();
+    }
+    private List<Boolean> queryPortalProof(String sql,Instant expiry) {
+        var inputs=portalInputs;
+        return jdbc.queryForList(sql,Boolean.class,account.id().value(),site.value(),customer.id().value(),created.subscriptionId(),
+            created.operationId(),inputs.cash().bill(),inputs.cash().payment(),price.value(),inputs.policyVersion(),inputs.keyDigest(),
+            portalReturn,Timestamp.from(expiry),inputs.revision(),Timestamp.from(inputs.period().start()),Timestamp.from(inputs.period().end()));
     }
     @Then("only its original customer and public operation can read the Portal return") public void scopedPortalReturn() {
         int before=http.calls().size();var service=bean(SubscriptionPortalService.class);assertThat(service.returned(context(null),created.subscriptionId(),portalOperation)).isEqualTo(subscription());
