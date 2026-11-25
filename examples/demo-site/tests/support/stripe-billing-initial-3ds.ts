@@ -10,6 +10,10 @@ function object(value:unknown):Record<string,unknown>{
 }
 const uuid=(v:unknown)=>typeof v==='string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(v);
 const issuerOrigin='https://hooks.stripe.com';
+const directIssuerFrame='stripe-challenge-frame';
+function initialIssuerDocument(frame:Frame){
+ return frame.name()!==directIssuerFrame||frame.url()==='about:blank';
+}
 function exactUrl(value:unknown){
  requireValue(typeof value==='string' && value.length<=4096);
  const url=new URL(value);requireValue(url.href===value && !url.username && !url.password && !url.hash && url.pathname!=='/');
@@ -110,11 +114,16 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
  let expectedIssuerRevision=-1,issuerParent:FrameSnapshot|undefined;
 
  function frameChain(target:Frame):FrameSnapshot{
-  const inner=target.parentFrame(),outer=inner?.parentFrame(),main=page.mainFrame();
-  requireValue(inner && outer && outer.parentFrame()===main && target.name()==='acsFrame' && inner.name()==='stripe-challenge-frame' &&
+  const parent=target.parentFrame(),main=page.mainFrame();
+  // Stripe.js EMVCo submits CReq directly into its named challenge frame.
+  const direct=target.name()===directIssuerFrame;
+  const outer=direct?parent:parent?.parentFrame();
+  requireValue(parent && outer && outer.parentFrame()===main &&
    /^__privateStripeFrame/.test(outer.name()) && /^https:\/\/js\.stripe\.com\/v3\/three-ds-2-challenge-[A-Za-z0-9_.-]+(?:[?#].*)?$/.test(outer.url()) &&
-   (inner.url()==='about:blank' || new URL(inner.url()).origin==='https://js.stripe.com') && new URL(main.url()).origin===demo);
-  const frames=new Map<Frame,string>();for(const f of [target,inner,outer,main]){
+   new URL(main.url()).origin===demo);
+  if(!direct)requireValue(target.name()==='acsFrame' && parent.name()===directIssuerFrame &&
+   (parent.url()==='about:blank' || new URL(parent.url()).origin==='https://js.stripe.com'));
+  const frames=new Map<Frame,string>();for(const f of direct?[target,outer,main]:[target,parent,outer,main]){
    requireValue(f.page()===page && !f.isDetached());frames.set(f,f.url());
   }
   return {target,frames};
@@ -141,20 +150,22 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
  // Descriptive only. Capture the refused frame shape, then read only the
  // response to the authenticate POST already admitted by the browser guard.
  async function refusedIssuerRelation(request:Request,active:BillingLimits):Promise<RefusedIssuerRelation>{
-  let parentOrigin:string,url:string,data:string|null;
   try{
    if(request.method()!=='POST'||!request.isNavigationRequest()||request.resourceType()!=='document'||request.redirectedFrom())return 'NOT_ISSUER_POST';
+  }catch{return 'ISSUER_FRAME_UNVERIFIED';}
+  let parentOrigin:string|undefined;
+  try{
    const target=request.frame();frameChain(target);
+   requireValue(initialIssuerDocument(target));
    const parent=target.parentFrame()!;
    parentOrigin=new URL(parent.url()==='about:blank'?parent.parentFrame()!.url():parent.url()).origin;
-   url=request.url();data=request.postData();
-  }catch{return 'ISSUER_FRAME_UNVERIFIED';}
+  }catch{/* The refused request can still be compared with the original transaction. */}
   const original=admittedAuthenticate;
   if(!original)return 'AUTHENTICATE_NOT_ADMITTED';
   try{
    return await billingBounded(active,async diagnostic=>{
     const headers=await request.allHeaders();
-    if(headers['content-type']?.split(';')[0]!=='application/x-www-form-urlencoded'||headers.origin!==parentOrigin||
+    if(headers['content-type']?.split(';')[0]!=='application/x-www-form-urlencoded'||!headers.origin||parentOrigin&&headers.origin!==parentOrigin||
        headers.cookie||headers.authorization||headers['proxy-authorization']||headers['stripe-account']||headers['stripe-context'])return 'ISSUER_FRAME_UNVERIFIED';
     const response=await originalResponse(original,diagnostic,750);
     requireValue(response.status()===200);
@@ -166,8 +177,10 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     const bytes=await response.body();
     billingCheck(diagnostic);requireValue(bytes.length<=65536);
     const observed=observedIssuerBinding(JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)));
+    const url=request.url();
     if(observed.url!==url)return 'ISSUER_URL_MISMATCH';
-    return matchingChallengeRequest(observed,url,data)?'ISSUER_TRANSACTION_MATCH':'ISSUER_TRANSACTION_MISMATCH';
+    if(!matchingChallengeRequest(observed,url,request.postData()))return 'ISSUER_TRANSACTION_MISMATCH';
+    return parentOrigin?'ISSUER_TRANSACTION_MATCH':'ISSUER_TRANSACTION_MATCH_FRAME_UNVERIFIED';
    },750);
   }catch{return 'AUTHENTICATE_UNVERIFIED';}
  }
@@ -242,8 +255,10 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    requireValue(navigation && method==='POST' && request.resourceType()==='document' &&
     headers['content-type']?.split(';')[0]==='application/x-www-form-urlencoded');
    if(!issuerRequest){
+    report(frameCode);
+    requireValue(initialIssuerDocument(target));
     report('BROWSER_CHALLENGE_ISSUER_RESPONSE');
-    const body=await verifiedBody(authenticate);
+    const body=await verifiedBody(admittedAuthenticate);
     report('BROWSER_CHALLENGE_ISSUER_BINDING');
     const observed=issuerBinding(body);
     report('BROWSER_CHALLENGE_ISSUER_TRANSACTION');

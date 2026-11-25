@@ -7,7 +7,7 @@ export function browserDiagnostic(error: unknown, phase?: 'INITIAL'|'METHOD'|'AC
 export function browserCleanupConfirmed(error: unknown): boolean;
 export function finishBrowserCleanup(error: unknown, confirmed: boolean): void;
 export type RefusedIssuerRelation='NOT_ISSUER_POST'|'ISSUER_FRAME_UNVERIFIED'|'AUTHENTICATE_NOT_ADMITTED'|'AUTHENTICATE_UNVERIFIED'|'AUTHENTICATE_BODY_UNBOUNDED'|
- 'ISSUER_URL_MISMATCH'|'ISSUER_TRANSACTION_MISMATCH'|'ISSUER_TRANSACTION_MATCH';
+ 'ISSUER_URL_MISMATCH'|'ISSUER_TRANSACTION_MISMATCH'|'ISSUER_TRANSACTION_MATCH'|'ISSUER_TRANSACTION_MATCH_FRAME_UNVERIFIED';
 export interface BrowserProviderOriginWitness {
  readonly runId:string;
  readonly expectedSource:string;

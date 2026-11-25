@@ -6,20 +6,22 @@ import {initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 // @ts-ignore Native Node executes the guarded response source.
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
 
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response'])
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame'])
 test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
  const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
  const retrieve=api+'/v1/payment_intents/pi_fixture?client_secret='+secret+'&key='+key;
  const authenticate=api+'/v1/3ds2/authenticate',complete=api+'/v1/3ds2/challenge_complete';
  const outer=stripe+'/v3/three-ds-2-challenge-fixture.html',inner=stripe+'/v3/fixture-inner.html';
+ const direct=mode==='direct Stripe EMVCo frame';
+ const issuerName=direct?'stripe-challenge-frame':'acsFrame';
  const issuerOrigin='https://hooks.stripe.com',issuer=issuerOrigin+'/fixture-issuer',decision=issuer+'/decision';
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
  const script=`(async()=>{
   await (await fetch(${JSON.stringify(retrieve)})).json();
   await (await fetch(${JSON.stringify(authenticate)},{method:'POST',body:new URLSearchParams({source:${JSON.stringify(source)},key:${JSON.stringify(key)}})})).json();
-  const frame=document.createElement('iframe');frame.name='acsFrame';document.body.append(frame);
+  const frame=document.createElement('iframe');frame.name=${JSON.stringify(issuerName)};document.body.append(frame);
   window.addEventListener('message',async event=>{
    if(event.source!==frame.contentWindow || event.origin!==${JSON.stringify(issuerOrigin)} || event.data!=='fixture decision')return;
    try{
@@ -36,7 +38,8 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
  const json=(value:object)=>({contentType:'application/json',headers:{'Access-Control-Allow-Origin':stripe},body:JSON.stringify(value)});
  const responses=new Map<string,NonNullable<Parameters<Route['fulfill']>[0]>>([
   [demo+'/',{contentType:'text/html',body:'<!doctype html><link rel="icon" href="data:,"><iframe name="__privateStripeFrame7" src="'+outer+'"></iframe>'}],
-  [outer,{contentType:'text/html',body:'<!doctype html><iframe name="stripe-challenge-frame" src="'+inner+'"></iframe>'}],
+  [outer,{contentType:'text/html',body:direct?'<!doctype html><body><script>'+script+'</script></body>':
+   '<!doctype html><iframe name="stripe-challenge-frame" src="'+inner+'"></iframe>'}],
   [inner,{contentType:'text/html',body:'<!doctype html><body><script>'+script+'</script></body>'}],
   [retrieve,json({object:'payment_intent',
    livemode:false,id:'pi_fixture',client_secret:secret,status:'requires_action',
@@ -71,6 +74,9 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
    },
    stripeFrames:request=>{
     const target=request.frame(),parent=target.parentFrame();
+    if(direct&&target.url()===outer&&parent===page.mainFrame()){
+     return {target,frames:new Map([[target,outer],[parent,demo+'/']])};
+    }
     if(target.url()===inner&&parent?.url()===outer&&parent.parentFrame()===page.mainFrame()){
      return {target,frames:new Map([[target,inner],[parent,outer]])};
     }
@@ -93,7 +99,7 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
      };
      if(url===issuer){
       issuerFrame=request.frame();
-      attachedIssuerFrame=issuerFrame.name()==='acsFrame'&&issuerFrame.url()==='about:blank';
+      attachedIssuerFrame=issuerFrame.name()===issuerName&&issuerFrame.url()==='about:blank';
      }
      await challenge.forward(actual,new URL(url),code=>{checkpoint=code;});
     }else{
@@ -103,7 +109,8 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
   });
   await page.goto(demo+'/',{waitUntil:'domcontentloaded',timeout:7_000});
   try{
-   const result=page.frameLocator('iframe').frameLocator('iframe').locator('body[data-fixture-result]');
+   const stripeFrame=page.frameLocator('iframe');
+   const result=(direct?stripeFrame:stripeFrame.frameLocator('iframe')).locator('body[data-fixture-result]');
    await Promise.all([challenge.attend(),result.waitFor({state:'attached',timeout:8_000})]);
    assert.equal(await result.getAttribute('data-fixture-result'),'succeeded');
   }catch{assert.fail(JSON.stringify({attachedIssuerFrame,separateIssuerTarget,refusals,gestures,forwarded:forwarded.length}));}

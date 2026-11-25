@@ -190,13 +190,16 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   if(closed)throw new Error('closed');
  }
  const issuerUrl='https://hooks.stripe.com/test-fixture?run=one',actionUrl='https://hooks.stripe.com/test-fixture/decision';
- let issuerDocument='about:blank',issuerNonce:string|undefined;
+ const directIssuer=fault.startsWith('direct-issuer-')||fault.startsWith('challenge-origin-direct');
+ let issuerDocument=fault.endsWith('-nonblank')?'https://js.stripe.com/v3/foreign.html':'about:blank',issuerNonce:string|undefined;
  let issuerReceipt:((source:{page:unknown;frame:unknown},nonce:unknown)=>void)|undefined;
  const ancestor=(name:string,href:string,parent:unknown)=>({page:()=>page,isDetached:()=>false,url:()=>href,name:()=>name,parentFrame:()=>parent});
- const outer=ancestor('__privateStripeFrame7','https://js.stripe.com/v3/three-ds-2-challenge-fixture.html',frame);
+ const outer=ancestor('__privateStripeFrame7',fault==='direct-issuer-wrong-wrapper'?'https://js.stripe.com/v3/foreign.html':
+  'https://js.stripe.com/v3/three-ds-2-challenge-fixture.html',frame);
  const inner=ancestor('stripe-challenge-frame','https://js.stripe.com/v3/fixture-inner.html',outer);
+ const issuerParent=directIssuer?outer:inner;
  const issuer={
-  ...ancestor('acsFrame','',inner),url:()=>issuerDocument,waitForURL:async(fn:(u:URL)=>boolean)=>assert.ok(fn(new URL(issuerDocument))),
+  ...ancestor(directIssuer?'stripe-challenge-frame':'acsFrame','',issuerParent),url:()=>issuerDocument,waitForURL:async(fn:(u:URL)=>boolean)=>assert.ok(fn(new URL(issuerDocument))),
   getByRole:(role:string,opts:{name:string;exact:boolean})=>{
    assert.equal(role,'button');assert.deepEqual(opts,{name:'Complete',exact:true});
    return {count:async()=>1,waitFor:async()=>{},elementHandle:async()=>({
@@ -223,8 +226,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   {node:frame,id:'checkout-frame',parent:undefined},
   {node:stripeFrame,id:'stripe-frame',parent:frame},
   {node:outer,id:'outer-frame',parent:frame},
-  {node:inner,id:'inner-frame',parent:outer},
-  {node:issuer,id:'issuer-frame',parent:inner},
+  ...(!directIssuer?[{node:inner,id:'inner-frame',parent:outer}]:[]),
+  {node:issuer,id:'issuer-frame',parent:issuerParent},
  ];
  function cdpFrameTree(entry:typeof cdpFrames[number]):unknown{
   return {frame:{id:entry.id,url:entry.node.url()||'about:blank',name:entry.node.name()},
@@ -258,7 +261,10 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const responseFault=lateRetrieve?fault.slice('late-source-'.length):lateIssuer?fault.slice('late-issuer-response-'.length):'';
   const headers=navigation?{'content-type':'application/x-www-form-urlencoded',origin:issuerDocument===issuerUrl?'https://hooks.stripe.com':'https://js.stripe.com'}:
    {authorization:'Bearer pk_test_fixture',origin:'https://js.stripe.com'};
-  const request={url:()=>url,method:()=>data===null?'GET':'POST',frame:()=>target,isNavigationRequest:()=>navigation,resourceType:()=>navigation?'document':'xhr',
+  const request={url:()=>url,method:()=>data===null?'GET':'POST',frame:()=>target,isNavigationRequest:()=>navigation,resourceType:()=>{
+   if(url.startsWith('https://unlisted-fixture.stripe.com/')&&fault==='challenge-origin-unreadable-kind')throw Error('private-kind');
+   return navigation?'document':'xhr';
+  },
    sizes:async()=>({responseBodySize:Buffer.byteLength(JSON.stringify(json))}),
    redirectedFrom:()=>null,postData:()=>data,allHeaders:async()=>headers,existingResponse:()=>lateRetrieve||lateIssuer?null:existing,
    response:async()=>{
@@ -1110,6 +1116,8 @@ const challengeRefusals:Record<string,string>={
  'foreign-next-source':'BROWSER_CHALLENGE_API_REQUEST',
  'preexisting-issuer-challenge':'BROWSER_CHALLENGE_SOURCE_WIRE_SDK_CHALLENGE',
  'wrong-issuer-transaction':'BROWSER_CHALLENGE_ISSUER_TRANSACTION',
+ 'direct-issuer-wrong-wrapper':'BROWSER_CHALLENGE_ISSUER_FRAME',
+ 'direct-issuer-nonblank':'BROWSER_CHALLENGE_ISSUER_FRAME',
  'foreign-issuer-path':'BROWSER_CHALLENGE_ISSUER_TRANSACTION',
  'untrusted-issuer':'BROWSER_CHALLENGE_ISSUER_SUBMISSION',
  'foreign-issuer-witness':'BROWSER_CHALLENGE_ISSUER_SUBMISSION',
@@ -1129,13 +1137,16 @@ const challengeRefusals:Record<string,string>={
 for(const [fault,issuerRelation] of [
  ['challenge-refused-origin','NOT_ISSUER_POST'],
  ['challenge-origin-match','ISSUER_TRANSACTION_MATCH'],
+ ['challenge-origin-direct','ISSUER_TRANSACTION_MATCH'],
+ ['challenge-origin-direct-nonblank','ISSUER_TRANSACTION_MATCH_FRAME_UNVERIFIED'],
+ ['challenge-origin-unreadable-kind','ISSUER_FRAME_UNVERIFIED'],
  ['challenge-origin-url','ISSUER_URL_MISMATCH'],
  ['challenge-origin-transaction','ISSUER_TRANSACTION_MISMATCH'],
  ['challenge-origin-worker','AUTHENTICATE_UNVERIFIED'],
  ['challenge-origin-before-authenticate','AUTHENTICATE_NOT_ADMITTED'],
  ['challenge-origin-compressed','AUTHENTICATE_BODY_UNBOUNDED'],
  ['challenge-origin-stalled','AUTHENTICATE_UNVERIFIED'],
- ['challenge-origin-foreign-frame','ISSUER_FRAME_UNVERIFIED'],
+ ['challenge-origin-foreign-frame','ISSUER_TRANSACTION_MATCH_FRAME_UNVERIFIED'],
  ['early-refused-origin',null],
 ] as const)test('3DS keeps only private origin and issuer relation after challenge dispatch: '+fault,{timeout:2400},async()=>{
  const f=cancellationPage(fault,false,true);
@@ -1157,9 +1168,9 @@ for(const [fault,issuerRelation] of [
    ['abort refused issuer','read original authenticate']);
  if(fault==='challenge-origin-compressed')assert.ok(!f.trace.includes('read original authenticate'));
 });
-for(const fault of ['none','late-source-valid','late-issuer-witness','replayed-next-ack','profile-retires','substituted-issuer-form','premature-sdk-complete','same-url-issuer-replaced',...Object.keys(challengeRefusals)]){
+for(const fault of ['none','direct-issuer-valid','late-source-valid','late-issuer-witness','replayed-next-ack','profile-retires','substituted-issuer-form','premature-sdk-complete','same-url-issuer-replaced',...Object.keys(challengeRefusals)]){
  test('the real browser journey requires one original issuer challenge: '+fault,async()=>{
-  const success=['none','late-source-valid','late-issuer-witness'].includes(fault);
+  const success=['none','direct-issuer-valid','late-source-valid','late-issuer-witness'].includes(fault);
   const f=cancellationPage(fault,false,true);
   const run=runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+3000},async()=>{
    f.trace.push('operator');if(fault==='profile-retires')f.retire();if(fault==='same-url-issuer-replaced')f.reloadIssuer();

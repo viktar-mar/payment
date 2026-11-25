@@ -121,7 +121,7 @@ const stripeComOther='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER';
 const generalOther='BROWSER_PROVIDER_ORIGIN_OTHER';
 const stripeNetwork='BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK';
 const issuerRelations=new Set(['NOT_ISSUER_POST','ISSUER_FRAME_UNVERIFIED','AUTHENTICATE_NOT_ADMITTED','AUTHENTICATE_UNVERIFIED','AUTHENTICATE_BODY_UNBOUNDED',
- 'ISSUER_URL_MISMATCH','ISSUER_TRANSACTION_MISMATCH','ISSUER_TRANSACTION_MATCH']);
+ 'ISSUER_URL_MISMATCH','ISSUER_TRANSACTION_MISMATCH','ISSUER_TRANSACTION_MATCH','ISSUER_TRANSACTION_MATCH_FRAME_UNVERIFIED']);
 function providerOriginIdentity(runId,expectedSource,origin,checkpoint){
  if(typeof runId!=='string'||runId.length!==36||!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(runId)||
     typeof expectedSource!=='string'||expectedSource.length!==40||!/^[0-9a-f]{40}$/.test(expectedSource)||
