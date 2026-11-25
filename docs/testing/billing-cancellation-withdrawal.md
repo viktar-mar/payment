@@ -14,6 +14,8 @@ Use the billing runner's fresh run UUID, exact committed source, dedicated Docke
 npx --no-install playwright test --config=playwright.stripe-billing-cancellation.config.ts
 ```
 
+For a local run, `PAYMENT_STRIPE_BILLING_CANCELLATION_CLI_PROFILE_RUN_ID` optionally selects a prior owned CLI profile. The runner copies it into the fresh private directory and verifies its binding to the single approved test account. An expired or differently scoped profile stops the run. Use `PAYMENT_STRIPE_BILLING_CANCELLATION_SUBNET` to select an unused, aligned `10.0.0.0/8` subnet with prefix `/28`. Check Docker networks and host routes for overlap before launch. The runner verifies the bridge IPAM before it starts services.
+
 Before scheduling cancellation, the runner verifies the original payment, journal, signed callbacks and Stripe objects. It then submits the schedule request once through the customer’s subscription manager. Withdrawal becomes available only after the runner verifies the scheduled state locally and in Stripe. It submits the withdrawal once and verifies the same subscription, original charge, access and paid-through date again.
 
 The financial budget is one subscription creation and one initial confirmation. Scheduling and withdrawal each have their own operation and receipt. An uncertain dispatch or failed check ends the run. Historical operations stay closed.

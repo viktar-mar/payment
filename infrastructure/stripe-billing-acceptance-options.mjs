@@ -7,18 +7,31 @@ export const RETRY_CLI_PROFILE_RUN_ID='PAYMENT_STRIPE_BILLING_RETRY_CLI_PROFILE_
 export const RETRY_NETWORK_SUBNET='PAYMENT_STRIPE_BILLING_RETRY_SUBNET';
 export const THREE_DS_CLI_PROFILE_RUN_ID='PAYMENT_STRIPE_BILLING_3DS_CLI_PROFILE_RUN_ID';
 export const THREE_DS_NETWORK_SUBNET='PAYMENT_STRIPE_BILLING_3DS_SUBNET';
+const CANCELLATION_CLI_PROFILE_RUN_ID='PAYMENT_STRIPE_BILLING_CANCELLATION_CLI_PROFILE_RUN_ID';
+const CANCELLATION_NETWORK_SUBNET='PAYMENT_STRIPE_BILLING_CANCELLATION_SUBNET';
+const INVOICE_WEBHOOKS_CLI_PROFILE_RUN_ID='PAYMENT_STRIPE_BILLING_INVOICE_WEBHOOKS_CLI_PROFILE_RUN_ID';
+const INVOICE_WEBHOOKS_NETWORK_SUBNET='PAYMENT_STRIPE_BILLING_INVOICE_WEBHOOKS_SUBNET';
 const cancelCase='initial_cancel_withdraw';
 const invoiceCase='initial_missed_reordered';
 const challengeCase='initial_3ds';
 const retryCase='initial_decline_retry';
 const EXCLUDED=['ALLOW_TEST_OPERATIONS','FULL_RUN','OWNED_RUN','REMAINING_ONLY','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT','MANUAL_3DS','MANUAL_REFUND','MANUAL_REFUND_REMAINDER'].map(name=>'PAYMENT_STRIPE_SANDBOX_'+name).concat('PAYMENT_STRIPE_BILLING_FAILED_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_PAYMENT');
 const OLD_RUNS=new Set(['031b5ae7-6603-4339-b1b3-77231291ff34','34941d87-12d3-4c74-8c5a-b62b7c914390']);
-const PROFILE_FLAGS=[[RETRY_CLI_PROFILE_RUN_ID,retryCase],[THREE_DS_CLI_PROFILE_RUN_ID,challengeCase]];
-const SUBNET_FLAGS=[[RETRY_NETWORK_SUBNET,retryCase],[THREE_DS_NETWORK_SUBNET,challengeCase]];
+const PROFILE_FLAGS=[[RETRY_CLI_PROFILE_RUN_ID,retryCase],[THREE_DS_CLI_PROFILE_RUN_ID,challengeCase],
+  [CANCELLATION_CLI_PROFILE_RUN_ID,cancelCase],[INVOICE_WEBHOOKS_CLI_PROFILE_RUN_ID,invoiceCase]];
+const SUBNET_FLAGS=[[RETRY_NETWORK_SUBNET,retryCase],[THREE_DS_NETWORK_SUBNET,challengeCase],
+  [CANCELLATION_NETWORK_SUBNET,cancelCase],[INVOICE_WEBHOOKS_NETWORK_SUBNET,invoiceCase]];
 const RUNTIME_FLAGS=[...PROFILE_FLAGS,...SUBNET_FLAGS].map(([key])=>key);
 const FLAGS=[FLAG,CASE,...RUNTIME_FLAGS,'PAYMENT_STRIPE_SANDBOX_ENABLED',...EXCLUDED,'DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE'];
 function descriptors(value){if(!value||typeof value!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(value)))throw null;return Object.getOwnPropertyDescriptors(value);}
 function data(d,key){const p=d[key];if(!p?.enumerable||!Object.hasOwn(p,'value'))throw null;return p.value;}
+function runtimeOption(d,flags){
+  const selected=flags.find(([,selectedCase])=>selectedCase===d[CASE]?.value);
+  return selected&&d[selected[0]]?.value;
+}
+/** Select options from an already validated acceptance environment. */
+export function billingAcceptanceProfileRunId(env){return runtimeOption(Object.getOwnPropertyDescriptors(env),PROFILE_FLAGS);}
+export function billingAcceptanceSubnet(env){return runtimeOption(Object.getOwnPropertyDescriptors(env),SUBNET_FLAGS);}
 /** Reciprocal gate for legacy factories, including exotic legacy environment records. */
 export function billingAcceptanceExcluded(env){
   try{if(!env||typeof env!=='object')return false;return [FLAG,'PAYMENT_STRIPE_BILLING_FAILED_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_PAYMENT'].every(key=>{const d=Object.getOwnPropertyDescriptor(env,key);return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);});}catch{return false;}
@@ -50,7 +63,7 @@ export function validateBillingAcceptanceOptions(value){
     const input=Object.fromEntries(keys.map(k=>[k,data(d,k)])),base=validateFormDiagnosticTopology(input);
     const selectedCase=Object.hasOwn(flags,CASE)?data(flags,CASE):'initial_success';
     if(!base||OLD_RUNS.has(base.runId)||resolve(new URL(base.daemon).pathname)!==new URL(base.daemon).pathname||input.selectedCase!==selectedCase)return null;
-    const profileRunId=flags[RETRY_CLI_PROFILE_RUN_ID]?.value??flags[THREE_DS_CLI_PROFILE_RUN_ID]?.value;
+    const profileRunId=runtimeOption(flags,PROFILE_FLAGS);
     if(profileRunId===base.runId)return null;
     const bd=descriptors(input.approvedBinding);if(Reflect.ownKeys(bd).length!==2||data(bd,'externalAccountId')!=='acct_1UPiMpELswAd8tpR'||data(bd,'apiVersion')!=='2026-09-30.endive')return null;
     if(d.protocol&&data(d,'protocol')!=='SERVER_CONFIRM_V2')return null;

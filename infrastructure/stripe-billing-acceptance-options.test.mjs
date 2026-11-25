@@ -51,6 +51,42 @@ test('initial 3DS admits its own saved Sandbox profile and aligned private bridg
   assert.equal(module.snapshotBillingAcceptanceEnvironment(accessor),null);
  }
 });
+for(const [selectedCase,kind,budget] of [
+ ['initial_cancel_withdraw','CANCELLATION',{create:1,confirm:1,schedule:1,withdraw:1}],
+ ['initial_missed_reordered','INVOICE_WEBHOOKS',{create:1,confirm:1,reconcile:1,deliver:2}],
+])test(selectedCase+' admits only its own prior Sandbox profile and private subnet',()=>{
+ const base=options(),profile='PAYMENT_STRIPE_BILLING_'+kind+'_CLI_PROFILE_RUN_ID',subnet='PAYMENT_STRIPE_BILLING_'+kind+'_SUBNET';
+ const env={...base.env,PAYMENT_STRIPE_BILLING_CASE:selectedCase,
+  [profile]:'22222222-3333-4444-8555-666666666666',[subnet]:'10.254.81.0/28'};
+ const input={...base,selectedCase,env};
+ assert.deepEqual(module.snapshotBillingAcceptanceEnvironment(env),env);
+ const admitted=module.validateBillingAcceptanceOptions(input);
+ assert.deepEqual(admitted?.env,env);
+ assert.deepEqual(admitted?.budget,budget);
+ assert.deepEqual(module.validateBillingAcceptanceOptions(admitted),admitted);
+ for(const override of [
+  {[profile]:base.runId},
+  {[profile]:'031b5ae7-6603-4339-b1b3-77231291ff34'},
+  {[profile]:'34941d87-12d3-4c74-8c5a-b62b7c914390'},
+  {[profile]:'../profile'},
+  {[subnet]:'192.168.81.0/28'}, {[subnet]:'10.254.81.1/28'}, {[subnet]:'10.254.81.0/24'},
+ ])assert.equal(module.validateBillingAcceptanceOptions({...input,env:{...env,...override}}),null);
+ const cases=['initial_success','initial_decline_retry','initial_3ds','initial_cancel_withdraw','initial_missed_reordered'];
+ for(const key of [profile,subnet]){
+  for(const other of cases.filter(value=>value!==selectedCase)){
+   const mixed={...base.env,[key]:env[key]};
+   if(other!=='initial_success')mixed.PAYMENT_STRIPE_BILLING_CASE=other;
+   assert.equal(module.snapshotBillingAcceptanceEnvironment(mixed),null);
+   assert.equal(module.validateBillingAcceptanceOptions({...input,env:mixed,selectedCase:other}),null);
+  }
+  const inherited=Object.assign(Object.create({[key]:env[key]}),env);
+  delete inherited[key];
+  assert.equal(module.snapshotBillingAcceptanceEnvironment(inherited),null);
+  const accessor={...env};
+  Object.defineProperty(accessor,key,{get(){assert.fail('runtime flag accessor invoked');},enumerable:true});
+  assert.equal(module.snapshotBillingAcceptanceEnvironment(accessor),null);
+ }
+});
 test('Billing own-data admission freezes fixed initial-success authority without reading accessors',()=>{
   assert.equal(typeof module.validateBillingAcceptanceOptions,'function');
   const input=options(),value=module.validateBillingAcceptanceOptions(input);assert.ok(value);

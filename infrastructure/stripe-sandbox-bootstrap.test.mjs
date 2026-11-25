@@ -1465,6 +1465,8 @@ test('Billing bootstrap is inert and keeps a seventh distinct grant key in owned
 for(const [selectedCase,flag] of [
  ['initial_decline_retry','PAYMENT_STRIPE_BILLING_RETRY_SUBNET'],
  ['initial_3ds','PAYMENT_STRIPE_BILLING_3DS_SUBNET'],
+ ['initial_cancel_withdraw','PAYMENT_STRIPE_BILLING_CANCELLATION_SUBNET'],
+ ['initial_missed_reordered','PAYMENT_STRIPE_BILLING_INVOICE_WEBHOOKS_SUBNET'],
 ])for(const matches of [true,false])test('the owned subnet for '+selectedCase+' must match Docker IPAM: '+matches,async()=>{
  const subnet='10.254.76.0/28',f=fixture();
  f.options.selectedCase=selectedCase;

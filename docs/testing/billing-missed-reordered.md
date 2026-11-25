@@ -12,6 +12,8 @@ Select `PAYMENT_STRIPE_SANDBOX_ENABLED=true`, `PAYMENT_STRIPE_BILLING_ACCEPTANCE
 pnpm exec playwright test --config=playwright.stripe-billing-invoice-webhooks.config.ts
 ```
 
+For a local run, `PAYMENT_STRIPE_BILLING_INVOICE_WEBHOOKS_CLI_PROFILE_RUN_ID` optionally selects a prior owned CLI profile. The runner copies it into the fresh private directory and verifies its binding to the single approved test account. An expired or differently scoped profile stops the run. Use `PAYMENT_STRIPE_BILLING_INVOICE_WEBHOOKS_SUBNET` to select an unused, aligned `10.0.0.0/8` subnet with prefix `/28`. Check Docker networks and host routes for overlap before launch. The runner verifies the bridge IPAM before it starts services.
+
 The case creates one subscription and submits Pay once. Its local receiver holds the original signed `invoice.finalized` and `invoice.paid` deliveries in memory. Both must belong to that run's customer, subscription and invoice. The listener and application must both accept the original signatures within their validity window. A missing receipt, expired signature or uncertain operation ends the run.
 
 ## Evidence required for acceptance

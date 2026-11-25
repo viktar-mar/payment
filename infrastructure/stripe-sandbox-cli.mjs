@@ -2,7 +2,7 @@ import {FAILED_RENEWAL_CLI_PROFILE_RUN_ID,billingFailedRenewalOptIn,validateBill
 import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
 import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
-import {RETRY_CLI_PROFILE_RUN_ID,THREE_DS_CLI_PROFILE_RUN_ID,billingAcceptanceExcluded,billingAcceptanceOptIn,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
+import {billingAcceptanceExcluded,billingAcceptanceOptIn,billingAcceptanceProfileRunId,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
 import {execFile,spawn} from 'node:child_process';
 import {lstat,realpath,readdir,open} from 'node:fs/promises';
 import {constants} from 'node:fs';
@@ -108,9 +108,8 @@ async function createCliAdapter(options,dependencies,purpose) {
   try {const optIn=rawEnv;manualPaymentMode=!refundMode&&optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=remainderMode?manualRefundRemainderOptIn(optIn):refundMode?manualRefundOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
   if(billingMode)enabled=(failedRenewal?billingFailedRenewalOptIn:firstRenewal?billingFirstRenewalOptIn:firstPayment?billingFirstPaymentOptIn:billingAcceptanceOptIn)(rawEnv);
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
-  const profileKey=failedRenewal?FAILED_RENEWAL_CLI_PROFILE_RUN_ID:purpose===BILLING
-    ?(options.selectedCase==='initial_3ds'?THREE_DS_CLI_PROFILE_RUN_ID:RETRY_CLI_PROFILE_RUN_ID):undefined;
-  const profileRunId=profileKey&&Object.getOwnPropertyDescriptor(rawEnv,profileKey)?.value;
+  const profileRunId=failedRenewal?Object.getOwnPropertyDescriptor(rawEnv,FAILED_RENEWAL_CLI_PROFILE_RUN_ID)?.value
+    :purpose===BILLING?billingAcceptanceProfileRunId(rawEnv):undefined;
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {
     const env=rawEnv;

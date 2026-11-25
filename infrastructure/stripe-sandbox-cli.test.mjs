@@ -829,6 +829,12 @@ async function failedRenewalCli(persistWebhookSecret=async()=>true,configureChil
 }
 
 const profileConfig='fake stripe cli project config\n',profileCredentials='{"fixture":"inert credential"}\n';
+const acceptanceProfileFlags={
+  initial_decline_retry:'PAYMENT_STRIPE_BILLING_RETRY_CLI_PROFILE_RUN_ID',
+  initial_3ds:'PAYMENT_STRIPE_BILLING_3DS_CLI_PROFILE_RUN_ID',
+  initial_cancel_withdraw:'PAYMENT_STRIPE_BILLING_CANCELLATION_CLI_PROFILE_RUN_ID',
+  initial_missed_reordered:'PAYMENT_STRIPE_BILLING_INVOICE_WEBHOOKS_CLI_PROFILE_RUN_ID',
+};
 async function failedRenewalProfile(t, acceptanceCase) {
   const f=await billingSetup(),priors=ROOT+'/test-results/stripe-sandbox',prior=randomUUID(),run=randomUUID();
   const cli=priors+'/'+run+'/cli',source=priors+'/'+prior+'/cli/config/stripe',destination=cli+'/config/stripe';
@@ -845,7 +851,7 @@ async function failedRenewalProfile(t, acceptanceCase) {
     PAYMENT_STRIPE_BILLING_FAILED_RENEWAL_CLI_PROFILE_RUN_ID:prior,
   },selectedCase:'initial_failed_renewal_grace_recovery',controlPort:18083,frozenTime:1790000000});
   if(acceptanceCase){
-    const profileFlag=acceptanceCase==='initial_3ds'?'PAYMENT_STRIPE_BILLING_3DS_CLI_PROFILE_RUN_ID':'PAYMENT_STRIPE_BILLING_RETRY_CLI_PROFILE_RUN_ID';
+    const profileFlag=acceptanceProfileFlags[acceptanceCase];
     f.options.configuration.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',
       PAYMENT_STRIPE_BILLING_CASE:acceptanceCase,[profileFlag]:prior};
     f.options.configuration.selectedCase=acceptanceCase;
@@ -857,8 +863,15 @@ async function failedRenewalProfile(t, acceptanceCase) {
   return {f,cli,source,destination};
 }
 
-for(const selectedCase of ['initial_decline_retry','initial_3ds'])for(const reason of ['valid','expired','extra scope','linked credentials'])test(selectedCase+' reuses an isolated test-only profile: '+reason,async t=>{
+for(const selectedCase of Object.keys(acceptanceProfileFlags))for(const reason of ['valid','expired','extra scope','linked credentials'])test(selectedCase+' reuses an isolated test-only profile: '+reason,async t=>{
   const {f,source,destination}=await failedRenewalProfile(t,selectedCase);
+  if(selectedCase==='initial_missed_reordered'){
+    const {syntheticInvoiceIngress}=await import('./fixtures/invoice-ingress-harness.mjs');
+    const {ingress}=syntheticInvoiceIngress(f.options.configuration);
+    await ingress.open(f.limits);
+    t.after(()=>ingress.close());
+    f.options.invoiceIngress=ingress;
+  }
   if(reason==='linked credentials')await link(source+'/credentials.json',source+'/linked.json');
   const execute=f.dependencies.execute;
   f.dependencies.execute=async(file,args,settings)=>{
@@ -876,7 +889,12 @@ for(const selectedCase of ['initial_decline_retry','initial_3ds'])for(const reas
     assert.equal(await f.adapter.validateBinding(f.limits),true);
     assert.deepEqual(f.calls.map(c=>c.args[11]),['--version','whoami','get']);
     assert.ok(f.calls.every(call=>call.args[call.args.indexOf('--config')+1]===destination+'/config.toml'));
-    assert.equal(await readFile(destination+'/credentials.json','utf8'),profileCredentials);
+    assert.deepEqual((await readdir(destination)).sort(),['config.toml','credentials.json']);
+    for(const [file,contents] of [['config.toml',profileConfig],['credentials.json',profileCredentials]]){
+      assert.equal(await readFile(destination+'/'+file,'utf8'),contents);
+      assert.equal((await lstat(destination+'/'+file)).mode&0o777,0o600);
+      assert.notEqual((await lstat(destination+'/'+file)).ino,(await lstat(source+'/'+file)).ino);
+    }
   }else{
     await rejects(f.adapter.validateBinding(f.limits),'BINDING');
     await rejects(f.adapter.startListener(f.limits),'LISTENER');
@@ -886,10 +904,16 @@ for(const selectedCase of ['initial_decline_retry','initial_3ds'])for(const reas
   assert.equal(await readFile(source+'/credentials.json','utf8'),profileCredentials);
 });
 
-for(const selectedCase of ['initial_decline_retry','initial_3ds'])test(selectedCase+' carries a reused CLI binding through listener readiness',async t=>{
+for(const selectedCase of Object.keys(acceptanceProfileFlags))test(selectedCase+' carries a reused CLI binding through listener readiness',async t=>{
   const {f,cli:cliDirectory}=await failedRenewalProfile(t,selectedCase);
-  const {createOwnedBillingDeclineRetry,createOwnedBillingInitial3ds}=await import('./stripe-billing-acceptance.mjs');
-  const createOwner=selectedCase==='initial_3ds'?createOwnedBillingInitial3ds:createOwnedBillingDeclineRetry;
+  const {createOwnedBillingDeclineRetry,createOwnedBillingInitial3ds,createOwnedBillingCancellation,createOwnedBillingInvoiceWebhooks}=await import('./stripe-billing-acceptance.mjs');
+  const createOwner={
+    initial_decline_retry:createOwnedBillingDeclineRetry,
+    initial_3ds:createOwnedBillingInitial3ds,
+    initial_cancel_withdraw:createOwnedBillingCancellation,
+    initial_missed_reordered:createOwnedBillingInvoiceWebhooks,
+  }[selectedCase];
+  const {syntheticInvoiceIngress}=await import('./fixtures/invoice-ingress-harness.mjs');
   const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
   const events=[];
   const spawn=f.dependencies.spawn;
@@ -911,6 +935,7 @@ for(const selectedCase of ['initial_decline_retry','initial_3ds'])test(selectedC
   };
   const owner=await createOwner(f.options.configuration,{
     preflight:async()=>true,createBootstrap:async()=>bootstrap,
+    createInvoiceIngress:(configuration,_bootstrap,{onFailure})=>syntheticInvoiceIngress(configuration,onFailure).ingress,
     createCli:async options=>{f.adapter=await createBillingCliAdapter(options,f.dependencies);return f.adapter;},
     login:()=>assert.fail('saved profile must not prompt for a device code'),
     createFixture:async()=>({provision:async()=>false,close:async()=>true}),
@@ -918,6 +943,13 @@ for(const selectedCase of ['initial_decline_retry','initial_3ds'])test(selectedC
   await assert.rejects(owner.run(()=>assert.fail('browser after deliberate fixture stop'),{deadline:Date.now()+300000}),{message:'billing_PROVISION'});
   assert.deepEqual(events,['target','ready','start','stop']);
   assert.deepEqual(f.calls.map(c=>c.args[11]),['--version','whoami','get','--version','whoami','get','listen']);
+  const listenerArgs=f.calls.at(-1).args;
+  const forwardTarget=listenerArgs[listenerArgs.indexOf('--forward-to')+1];
+  assert.equal(listenerArgs[listenerArgs.indexOf('--events-from')+1],'@self');
+  if(selectedCase==='initial_missed_reordered'){
+    assert.equal(listenerArgs[listenerArgs.indexOf('--events')+1],'invoice.finalized,invoice.paid');
+    assert.match(forwardTarget,/^http:\/\/127\.0\.0\.1:24555\/invoice\/[a-f0-9]{64}$/);
+  }else assert.equal(forwardTarget,'http://127.0.0.1:'+f.options.configuration.ports.backend+'/api/v1/provider-webhooks/stripe/stripe-sandbox-default');
   assert.equal(f.children.length,1);
   assert.deepEqual(f.children[0].signals,['SIGINT']);
   assert.equal(owner.resources().cleanupConfirmed,true);
