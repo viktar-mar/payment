@@ -82,6 +82,13 @@ public class StripeBillingSteps {
     private JsonObject changeInvoice,creditLine,debitLine;
     private InvoiceGraph changeCash;
     private Instant planAnchor;
+    private static final String PLAN_SCHEDULE = "sub_sched_billing";
+    private PriceId downgradePrice;
+    private SubscriptionQuote downgradeQuote;
+    private SubscriptionOperationResult scheduledChange, clearedChange;
+    private PublishedCash originalPlanCash;
+    private JsonObject releasedPlanSchedule;
+    private int beforePlan;
     private UUID portalOperation;
     private String portalReturn,portalNavigation;
     private PortalInputs portalInputs;
@@ -724,12 +731,15 @@ public class StripeBillingSteps {
         return 4+(remote.has("default_payment_method")?1:0)+invoices.stream().mapToInt(i->i.settlement().equals("CASH")?5:2).sum();
     }
 
-    private PriceId targetPrice(String key) {
+    private PriceId targetPrice(String key) { return targetPrice(key,4000,"price_upgrade"); }
+
+    private PriceId targetPrice(String key,long amount,String providerPrice) {
         var target=new PriceId(UUID.randomUUID());
-        jdbc.update("insert into prices(id,site_id,product_id,price_key,price_version,price_type,amount_minor,currency,billing_interval,trial_days,trial_payment_method_policy,tax_mode,status,published_at,created_at,updated_at) values (?,?,?,?,1,'SUBSCRIPTION',4000,'EUR','MONTH',0,'OPTIONAL_DURING_TRIAL','INCLUSIVE','PUBLISHED',?,?,?)",target.value(),site.value(),product.value(),key,Timestamp.from(now()),Timestamp.from(now()),Timestamp.from(now()));
-        bean(ProviderCatalogMappingPort.class).save(new ProviderCatalogMapping(account.id(),product,new ProviderProductRef("prod_billing"),target,new ProviderPriceRef("price_upgrade"),now()));
+        jdbc.update("insert into prices(id,site_id,product_id,price_key,price_version,price_type,amount_minor,currency,billing_interval,trial_days,trial_payment_method_policy,tax_mode,status,published_at,created_at,updated_at) values (?,?,?,?,1,'SUBSCRIPTION',?,'EUR','MONTH',0,'OPTIONAL_DURING_TRIAL','INCLUSIVE','PUBLISHED',?,?,?)",target.value(),site.value(),product.value(),key,amount,Timestamp.from(now()),Timestamp.from(now()),Timestamp.from(now()));
+        bean(ProviderCatalogMappingPort.class).save(new ProviderCatalogMapping(account.id(),product,new ProviderProductRef("prod_billing"),target,new ProviderPriceRef(providerPrice),now()));
         return target;
     }
+
     private void readHead() {
         identity();respond("GET","/v1/customers/cus_billing",remoteCustomer);respond("GET","/v1/subscriptions/sub_billing",remote);
     }
@@ -803,6 +813,176 @@ public class StripeBillingSteps {
         var writes=http.calls().stream().filter(c->c.method().equals("POST")&&c.path().equals("/v1/subscriptions/sub_billing")).toList();
         assertThat(writes).singleElement().satisfies(c->{assertThat(c.header("Idempotency-Key")).isEqualTo(operation(upgraded.operationId()).providerOperationKey());assertThat(c.form()).containsEntry("payment_behavior","pending_if_incomplete").containsEntry("proration_behavior","always_invoice").containsEntry("proration_date",Long.toString(planAnchor.getEpochSecond())).containsEntry("items[0][price]","price_upgrade").containsEntry("items[0][id]","si_billing");});
     }
+    private JsonObject planPhase(Instant from,Instant until,String nativePrice) {
+        return json("""
+            {"start_date":%d,"end_date":%d,"proration_behavior":"none","items":[{"price":"%s","quantity":1}]}
+            """.formatted(from.getEpochSecond(),until.getEpochSecond(),nativePrice));
+    }
+
+    private JsonObject planSchedule(boolean configured) {
+        var schedule=json("""
+            {"id":"%s","object":"subscription_schedule","livemode":false,"customer":"cus_billing",
+             "subscription":"sub_billing","status":"active","end_behavior":"release",
+             "current_phase":{"start_date":%d,"end_date":%d},
+             "default_settings":{"collection_method":"charge_automatically"}}
+            """.formatted(PLAN_SCHEDULE,start.getEpochSecond(),end.getEpochSecond()));
+        var phases=new JsonArray();
+        phases.add(planPhase(start,end,"price_billing"));
+        if(configured)phases.add(planPhase(end,end.atOffset(ZoneOffset.UTC).plusMonths(1).toInstant(),"price_downgrade"));
+        schedule.add("phases",phases);
+        return schedule;
+    }
+
+    @When("the customer schedules an allowed Stripe downgrade for the next period")
+    public void scheduleDowngrade() {
+        beforePlan=http.calls().size();
+        originalPlanCash=publishedCash("in_initial","pi_initial",BillingRecord.Kind.INITIAL,SubscriptionEvent.Source.PROVIDER_WEBHOOK);
+        downgradePrice=targetPrice("billing-downgrade",1500,"price_downgrade");
+        var policies=bean(SubscriptionPolicyPort.class);
+        policies.saveTransition(new PlanTransition(site,product,price,downgradePrice,PlanTransition.Direction.DOWNGRADE,false,policies.load(site).version()));
+        readHead();
+        downgradeQuote=bean(PreviewSubscriptionChangeUseCase.class).preview(
+            new PreviewSubscriptionChangeUseCase.Query(context(null),created.subscriptionId(),downgradePrice,ChangeTiming.NEXT_PERIOD));
+        assertThat(downgradeQuote.timing()).isEqualTo(ChangeTiming.NEXT_PERIOD);
+        assertThat(downgradeQuote.dueNowMinor()).isZero();
+        assertThat(downgradeQuote.nextAmountMinor()).isEqualTo(1500);
+        assertThat(downgradeQuote.effectiveAt()).isEqualTo(end);
+
+        readHead(); // Fresh quote before the application claims the mutation.
+        readHead(); // Fresh subscription before the provider schedule create.
+        http.enqueue("POST","/v1/subscription_schedules",200,call -> {
+            remote.addProperty("schedule",PLAN_SCHEDULE);
+            return planSchedule(false).toString();
+        });
+        var schedulePath="/v1/subscription_schedules/"+PLAN_SCHEDULE;
+        respond("GET",schedulePath,planSchedule(false));
+        respond("POST",schedulePath,planSchedule(true));
+        respond("GET",schedulePath,planSchedule(true));
+        scheduledChange=bean(ChangeSubscriptionPlanUseCase.class).change(
+            new ChangeSubscriptionPlanUseCase.Command(context(key()),created.subscriptionId(),downgradeQuote.id()));
+        assertThat(scheduledChange.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        assertThat(subscription().pendingChange().state()).isNotEqualTo(Subscription.ChangeState.SCHEDULED);
+    }
+
+    private void reconcilePlan(JsonObject providerSchedule) {
+        readGraph();
+        respond("GET","/v1/subscription_schedules/"+PLAN_SCHEDULE,providerSchedule);
+        bean(ReconcileSubscriptionUseCase.class).reconcile(new ReconcileSubscriptionUseCase.Command(context(key()),created.subscriptionId()));
+    }
+
+    private void assertOriginalPlanSettlement() {
+        var subscription=subscription();
+        assertThat(subscription.providerReference()).isEqualTo("sub_billing");
+        assertThat(subscription.currentPeriod()).isEqualTo(new Subscription.Period(start,end));
+        assertThat(subscription.paidThrough()).isEqualTo(end);
+        assertThat(subscription.billingPrice().priceId()).isEqualTo(price);
+        assertThat(subscription.entitledPrice().priceId()).isEqualTo(price);
+        assertThat(access().reason()).isEqualTo(AccessDecision.Reason.PAID);
+        assertThat(cash()).isEqualTo(1);
+        assertThat(publishedCash("in_initial","pi_initial",BillingRecord.Kind.INITIAL,SubscriptionEvent.Source.PROVIDER_WEBHOOK)).isEqualTo(originalPlanCash);
+        assertThat(count("subscription_billing_records","subscription_id=?",created.subscriptionId())).isEqualTo(1);
+        assertThat(count("subscription_events","subscription_id=? and event_type='CHANGE_APPLIED'",created.subscriptionId())).isZero();
+    }
+
+    @Then("the exact Stripe schedule is projected without changing paid terms")
+    public void scheduledDowngrade() {
+        reconcilePlan(planSchedule(true));
+        assertOriginalPlanSettlement();
+        var pending=subscription().pendingChange();
+        assertThat(pending.state()).isEqualTo(Subscription.ChangeState.SCHEDULED);
+        assertThat(pending.effectiveAt()).isEqualTo(end);
+        assertThat(pending.operationId()).isEqualTo(scheduledChange.operationId());
+        assertThat(pending.target().priceId()).isEqualTo(downgradePrice);
+        assertThat(operation(scheduledChange.operationId()).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+        assertThat(count("subscription_events","subscription_id=? and event_type='CHANGE_SCHEDULED'",created.subscriptionId())).isEqualTo(1);
+        assertPlanTransitionCallback(SubscriptionEvent.Type.CHANGE_SCHEDULED);
+    }
+
+    @When("the customer clears the original Stripe schedule before the paid boundary")
+    public void clearScheduledDowngrade() {
+        readHead();
+        var schedulePath="/v1/subscription_schedules/"+PLAN_SCHEDULE;
+        respond("GET",schedulePath,planSchedule(true));
+        http.enqueue("POST",schedulePath+"/release",200,call -> {
+            releasedPlanSchedule=json("""
+                {"id":"%s","object":"subscription_schedule","livemode":false,"customer":"cus_billing",
+                 "status":"released","released_at":%d,"subscription":null,"released_subscription":"sub_billing"}
+                """.formatted(PLAN_SCHEDULE,dispatchSecond(call)));
+            remote.remove("schedule");
+            return releasedPlanSchedule.toString();
+        });
+        clearedChange=bean(ClearSubscriptionChangeUseCase.class).clear(
+            new ClearSubscriptionChangeUseCase.Command(context(key()),created.subscriptionId()));
+        assertThat(clearedChange.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        assertThat(subscription().pendingChange().operationId()).isEqualTo(scheduledChange.operationId());
+        assertThat(releasedPlanSchedule.get("released_at").getAsLong()).isLessThan(end.getEpochSecond());
+    }
+
+    @Then("the release preserves the original Stripe cash and paid terms")
+    public void clearedDowngrade() {
+        reconcilePlan(releasedPlanSchedule);
+        assertOriginalPlanSettlement();
+        assertThat(subscription().pendingChange()).isNull();
+        var change=operation(scheduledChange.operationId());
+        var clear=operation(clearedChange.operationId());
+        assertThat(clear.status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+        assertThat(count("subscription_events","subscription_id=? and event_type='CHANGE_CLEARED'",created.subscriptionId())).isEqualTo(1);
+        assertPlanTransitionCallback(SubscriptionEvent.Type.CHANGE_CLEARED);
+
+        var proof=bean(SubscriptionPlanProofStore.class).schedule(account.id(),change.id()).orElseThrow();
+        assertThat(proof.reference()).isEqualTo(PLAN_SCHEDULE);
+        assertThat(proof.subscription()).isEqualTo(created.subscriptionId());
+        var nativeQuote=bean(SubscriptionPlanProofStore.class).quote(account.id(),proof.quote()).orElseThrow();
+        assertThat(nativeQuote.reference()).isEqualTo(downgradeQuote.providerQuoteReference());
+        assertThat(proof.clearOperation()).isEqualTo(clear.id());
+        assertPlanStep(proof.creationStep(),change,ProviderOperation.Kind.SCHEDULE_CREATE);
+        assertPlanStep(proof.updateStep(),change,ProviderOperation.Kind.SCHEDULE_UPDATE);
+        assertPlanStep(proof.releaseStep(),clear,ProviderOperation.Kind.SCHEDULE_RELEASE);
+
+        var nativePaths="/v1/subscription_schedules";
+        var writes=http.calls().subList(beforePlan,http.calls().size()).stream().filter(call->call.method().equals("POST")).toList();
+        assertThat(writes).extracting(StripeHttpFixture.Call::path).containsExactly(nativePaths,nativePaths+"/"+PLAN_SCHEDULE,nativePaths+"/"+PLAN_SCHEDULE+"/release");
+        assertThat(writes).extracting(call->call.header("Idempotency-Key")).containsExactly(
+            change.providerOperationKey()+":SCHEDULE_CREATE",change.providerOperationKey()+":SCHEDULE_UPDATE",clear.providerOperationKey()+":SCHEDULE_RELEASE");
+        assertThat(writes.getFirst().form()).containsExactlyEntriesOf(Map.of("from_subscription","sub_billing"));
+        assertThat(writes.get(1).form()).containsEntry("end_behavior","release").containsEntry("proration_behavior","none")
+            .containsEntry("phases[0][items][0][price]","price_billing").containsEntry("phases[0][end_date]",Long.toString(end.getEpochSecond()))
+            .containsEntry("phases[1][items][0][price]","price_downgrade").containsEntry("phases[1][start_date]",Long.toString(end.getEpochSecond()))
+            .containsEntry("phases[1][proration_behavior]","none");
+        assertThat(writes.getLast().form()).isEmpty();
+
+        var afterClear=financialEvidence();
+        reconcile();
+        assertThat(financialEvidence()).isEqualTo(afterClear);
+    }
+
+    private void assertPlanTransitionCallback(SubscriptionEvent.Type type) {
+        var matches=jdbc.queryForObject("""
+            select count(*) from subscription_events e
+            join outbox_events o on o.id=e.id and o.subscription_event_id=e.id
+              and o.site_id=e.site_id and o.subscription_id=e.subscription_id and o.payment_account_id=e.payment_account_id
+            where e.site_id=? and e.subscription_id=? and e.payment_account_id=? and e.event_type=?
+              and e.source='RECONCILIATION' and e.revision=?
+              and o.source_kind='SUBSCRIPTION' and o.callback_type='subscription.updated'
+              and o.payload->>'event_id'=e.id::text and o.payload->>'event_type'=o.callback_type
+              and o.payload->>'revision'=e.revision::text and o.payload->>'site_id'=e.site_id::text
+              and o.payload->>'subscription_id'=e.subscription_id::text and o.payload->>'customer_id'=?
+              and o.payload->>'state'='ACTIVE' and o.payload->>'access_allowed'='true'
+              and (o.payload->>'access_valid_until')::timestamptz=least(e.occurred_at+interval '5 minutes',?::timestamptz)
+            """,Long.class,site.value(),created.subscriptionId(),account.id().value(),type.name(),subscription().revision(),
+            customer.id().value().toString(),Timestamp.from(end));
+        assertThat(matches).as(type+" exact callback").isOne();
+    }
+
+    private void assertPlanStep(UUID id,SubscriptionOperation owner,ProviderOperation.Kind kind) {
+        var step=bean(ProviderOperationStore.class).findById(id).orElseThrow();
+        assertThat(step.status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
+        assertThat(step.kind()).isEqualTo(kind);
+        assertThat(step.resourceId()).isEqualTo(owner.id());
+        assertThat(step.operationKey()).isEqualTo(owner.providerOperationKey()+":"+kind);
+        assertThat(step.providerReference()).isEqualTo(PLAN_SCHEDULE);
+    }
+
     @When("the customer opens the allowed narrow Stripe Billing Portal") public void portal() throws NoSuchAlgorithmException {
         var policies=bean(SubscriptionPolicyPort.class);var old=policies.load(site);portalReturn=ORIGIN+"/account";
         var policy=policies.save(new SubscriptionPolicy(site,old.version(),true,3,false,true,false,Set.of(portalReturn)),old.version());

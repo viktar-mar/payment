@@ -85,6 +85,16 @@ Feature: Stripe Billing through the configured application and official SDK
     Then the upgraded entitlement has one additional cash payment and immutable change proof
     And its canonical Site callbacks are signed and delivered exactly once
 
+  @billing-plan-schedule
+  Scenario: A verified scheduled downgrade can be cleared before the paid boundary
+    Given an owned Stripe Billing subscription with 0 trial days
+    When its initial Stripe invoice is verified through a signed receipt
+    And the customer schedules an allowed Stripe downgrade for the next period
+    Then the exact Stripe schedule is projected without changing paid terms
+    When the customer clears the original Stripe schedule before the paid boundary
+    Then the release preserves the original Stripe cash and paid terms
+    And its canonical Site callbacks are signed and delivered exactly once
+
   Scenario: A narrow owned Portal session preserves scope and grants no money on return
     Given an owned Stripe Billing subscription for Portal acceptance
     When its initial Stripe invoice is verified through a signed receipt
