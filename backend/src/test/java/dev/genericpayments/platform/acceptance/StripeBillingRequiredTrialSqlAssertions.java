@@ -170,7 +170,13 @@ final class StripeBillingRequiredTrialSqlAssertions {
                     changed.setObject(1,parameter);
                     assertThat(changed.executeUpdate()).isOne();
                 }
-                refuses(connection,query,owned,"changed "+table);
+                // Keep the shadow query out of the stable proof's named-statement cache.
+                try (var statement=select(connection,"/* temp shadow assertion */\n"+query,owned)) {
+                    statement.unwrap(org.postgresql.PGStatement.class).setPrepareThreshold(0);
+                    try (var rows=statement.executeQuery()) {
+                        assertThat(rows.next()).as("changed "+table).isFalse();
+                    }
+                }
             } finally {
                 connection.rollback();
                 connection.setReadOnly(false);

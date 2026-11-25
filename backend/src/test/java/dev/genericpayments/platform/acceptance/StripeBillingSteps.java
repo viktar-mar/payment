@@ -13,9 +13,12 @@ import dev.genericpayments.platform.customers.domain.*;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.LoadPaymentAccountPort;
 import dev.genericpayments.platform.paymentaccounts.domain.*;
 import dev.genericpayments.platform.sites.domain.SiteId;
+import dev.genericpayments.platform.subscriptions.adapter.in.configuration.SubscriptionProperties;
 import dev.genericpayments.platform.subscriptions.application.model.*;
 import dev.genericpayments.platform.subscriptions.application.port.in.*;
 import dev.genericpayments.platform.subscriptions.application.port.out.*;
+import dev.genericpayments.platform.subscriptions.application.service.SubscriptionReconciliationService;
+import dev.genericpayments.platform.subscriptions.application.service.SubscriptionSweepWorker;
 import dev.genericpayments.platform.subscriptions.domain.*;
 import dev.genericpayments.platform.support.PostgresIntegrationTest.TestClock;
 import dev.genericpayments.platform.support.StripeHttpFixture;
@@ -464,16 +467,17 @@ public class StripeBillingSteps {
         siblingPublication=trialPublication();
         requiredTrialProduct=new ProductId(UUID.randomUUID());
         requiredTrialPrice=new PriceId(UUID.randomUUID());
+        var publishedAt=Timestamp.from(now());
         jdbc.update("""
             insert into products(id,site_id,product_key,name,status,created_at,updated_at)
-            select ?,site_id,'billing-required','Required trial','ACTIVE',created_at,updated_at from products where id=?
-            """,requiredTrialProduct.value(),product.value());
+            select ?,site_id,'billing-required','Required trial','ACTIVE',?,? from products where id=?
+            """,requiredTrialProduct.value(),publishedAt,publishedAt,product.value());
         jdbc.update("""
             insert into prices(id,site_id,product_id,price_key,price_version,price_type,amount_minor,currency,billing_interval,
               trial_days,trial_payment_method_policy,tax_mode,status,published_at,created_at,updated_at)
             select ?,site_id,?,'required-monthly',price_version,price_type,amount_minor,currency,billing_interval,
-              trial_days,'REQUIRED_BEFORE_TRIAL',tax_mode,status,published_at,created_at,updated_at from prices where id=?
-            """,requiredTrialPrice.value(),requiredTrialProduct.value(),price.value());
+              trial_days,'REQUIRED_BEFORE_TRIAL',tax_mode,status,?,?,? from prices where id=?
+            """,requiredTrialPrice.value(),requiredTrialProduct.value(),publishedAt,publishedAt,publishedAt,price.value());
         bean(ProviderCatalogMappingPort.class).save(new ProviderCatalogMapping(account.id(),requiredTrialProduct,
             new ProviderProductRef(REQUIRED.product()),requiredTrialPrice,new ProviderPriceRef(REQUIRED.price()),now()));
         requiredTrialSetup=json("""
@@ -523,9 +527,64 @@ public class StripeBillingSteps {
         assertThat(cash()).isZero();
     }
 
+    @When("the same customer requests a required-method trial for the ordinary sweep")
+    public void startRequiredTrialForSweep() throws NoSuchAlgorithmException {
+        // Advance only fixture business time across the backoff. Provider writes still use the real dispatch window.
+        var started=Instant.now().minus(bean(SubscriptionProperties.class).backoff(0)).minusSeconds(5).truncatedTo(ChronoUnit.MICROS);
+        TestClock.set(started);
+        startRequiredTrialSetup();
+    }
+
+    @When("the ordinary sweep observes the pending setup and later verifies that same setup and zero invoice")
+    public void sweepRequiredTrial() {
+        var defaults=bean(SubscriptionProperties.class);
+        // Process the unresolved trial first without sweeping its already-proved sibling.
+        var worker=new SubscriptionSweepWorker(bean(SubscriptionSweepPort.class),bean(SubscriptionReconciliationService.class),
+            new SubscriptionProperties(1,defaults.lease(),defaults.delay()),bean(Clock.class));
+        var original=operation(requiredTrial.operationId());
+        var started=now();
+        try {
+            int beforePending=http.calls().size();
+            identity();
+            respond("GET","/v1/setup_intents/seti_required",requiredTrialSetup);
+            worker.runOnce();
+            assertThat(http.calls().subList(beforePending,http.calls().size())).extracting(call -> call.method()+" "+call.path())
+                .containsExactly("GET /v1/account","GET /v1/setup_intents/seti_required");
+            requiredSetupRemainsPending();
+            var retry=jdbc.queryForObject("select next_reconcile_at from subscriptions where site_id=? and id=? and reconcile_attempts=1 and reconcile_lease_token is null",
+                Timestamp.class,site.value(),requiredTrial.subscriptionId()).toInstant();
+            assertThat(retry).isEqualTo(started.plus(defaults.backoff(0)));
+
+            var recoveredAt=Instant.now().truncatedTo(ChronoUnit.MICROS);
+            assertThat(recoveredAt).isAfterOrEqualTo(retry);
+            TestClock.set(recoveredAt);
+            arrangeRequiredTrialSuccess(recoveredAt);
+            var zero=invoice("requiredtrial","subscription_create",requiredTrialPeriod.start(),requiredTrialPeriod.end(),"ZERO",REQUIRED);
+            readGraph(requiredTrialRemote,List.of(zero));
+            worker.runOnce();
+            assertThat(operation(original.id()).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+            assertThat(count("subscription_operations","subscription_id=? and kind='RECONCILE'",requiredTrial.subscriptionId())).isZero();
+            assertThat(count("subscriptions","site_id=? and id=? and last_reconciled_at=? and next_reconcile_at=? and reconcile_attempts=0 and reconcile_lease_token is null",
+                site.value(),requiredTrial.subscriptionId(),Timestamp.from(recoveredAt),Timestamp.from(recoveredAt.plus(defaults.delay())))).isOne();
+        } finally {
+            StripeAcceptanceConfiguration.providerTime(null);
+        }
+    }
+
     @When("that exact setup succeeds and its original Stripe zero invoice is reconciled")
     public void verifyRequiredTrial() {
-        var providerNow=Instant.now().truncatedTo(ChronoUnit.MICROS);
+        arrangeRequiredTrialSuccess(Instant.now().truncatedTo(ChronoUnit.MICROS));
+        var continued=bean(ContinueOriginalSubscriptionSetupUseCase.class).api(context(key()),requiredTrial.subscriptionId(),requiredTrial.operationId());
+        assertThat(continued.operationId()).isEqualTo(requiredTrial.operationId());
+        assertThat(continued.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        assertThat(bean(QuerySubscriptionsUseCase.class).get(actor,site,requiredTrial.subscriptionId()).access().allowed()).isFalse();
+        TestClock.set(Instant.now().truncatedTo(ChronoUnit.MICROS));
+        var zero=invoice("requiredtrial","subscription_create",requiredTrialPeriod.start(),requiredTrialPeriod.end(),"ZERO",REQUIRED);
+        readGraph(requiredTrialRemote,List.of(zero));
+        bean(ReconcileSubscriptionUseCase.class).reconcile(new ReconcileSubscriptionUseCase.Command(context(key()),requiredTrial.subscriptionId()));
+    }
+
+    private void arrangeRequiredTrialSuccess(Instant providerNow) {
         StripeAcceptanceConfiguration.providerTime(providerNow);
         requiredTrialSetup.addProperty("status","succeeded");
         requiredTrialSetup.addProperty("payment_method","pm_required");
@@ -536,31 +595,29 @@ public class StripeBillingSteps {
         respond("GET","/v1/customers/cus_billing",remoteCustomer);
         identity();
         requiredTrialRemote=subscriptionJson(REQUIRED,requiredTrialPrice);
+        var from=providerNow.truncatedTo(ChronoUnit.SECONDS);
+        var until=from.plus(Duration.ofDays(7));
+        requiredTrialPeriod=new Subscription.Period(from,until);
+        requiredTrialRemote.addProperty("created",from.getEpochSecond());
+        requiredTrialRemote.addProperty("status","trialing");
+        requiredTrialRemote.addProperty("trial_start",from.getEpochSecond());
+        requiredTrialRemote.addProperty("trial_end",until.getEpochSecond());
+        requiredTrialRemote.add("trial_settings",json("{\"end_behavior\":{\"missing_payment_method\":\"pause\"}}"));
+        requiredTrialRemote.addProperty("default_payment_method","pm_required");
+        var metadata=new JsonObject();
+        metadata.addProperty("account_id",account.id().value().toString());
+        metadata.addProperty("site_id",site.value().toString());
+        metadata.addProperty("customer_id",customer.id().value().toString());
+        metadata.addProperty("subscription_id",requiredTrial.subscriptionId().toString());
+        metadata.addProperty("operation_id",requiredTrial.operationId().toString());
+        requiredTrialRemote.add("metadata",metadata);
+        setPeriod(requiredTrialRemote,from,until);
         http.enqueue("POST","/v1/subscriptions",200,call -> {
-            long dispatched=firstDispatch(call);
-            var from=Instant.ofEpochSecond(dispatched);
-            var until=Instant.ofEpochSecond(Long.parseLong(call.form().get("trial_end")));
-            requiredTrialPeriod=new Subscription.Period(from,until);
-            requiredTrialRemote.addProperty("created",dispatched);
-            requiredTrialRemote.addProperty("status","trialing");
-            requiredTrialRemote.addProperty("trial_start",dispatched);
-            requiredTrialRemote.addProperty("trial_end",until.getEpochSecond());
-            requiredTrialRemote.add("trial_settings",json("{\"end_behavior\":{\"missing_payment_method\":\"pause\"}}"));
-            requiredTrialRemote.addProperty("default_payment_method","pm_required");
-            requiredTrialRemote.add("metadata",fixtureMetadata(call,List.of("account_id","site_id","customer_id","subscription_id","operation_id")));
-            setPeriod(requiredTrialRemote,from,until);
+            assertThat(firstDispatch(call)).isEqualTo(from.getEpochSecond());
+            assertThat(call.form().get("trial_end")).isEqualTo(Long.toString(until.getEpochSecond()));
+            assertThat(fixtureMetadata(call,List.of("account_id","site_id","customer_id","subscription_id","operation_id"))).isEqualTo(metadata);
             return requiredTrialRemote.toString();
         });
-        var continued=bean(ContinueOriginalSubscriptionSetupUseCase.class).api(context(key()),requiredTrial.subscriptionId(),requiredTrial.operationId());
-        assertThat(continued.operationId()).isEqualTo(requiredTrial.operationId());
-        assertThat(continued.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
-        var providerSecond=providerNow.truncatedTo(ChronoUnit.SECONDS);
-        assertThat(requiredTrialPeriod).isEqualTo(new Subscription.Period(providerSecond,providerSecond.plus(Duration.ofDays(7))));
-        assertThat(bean(QuerySubscriptionsUseCase.class).get(actor,site,requiredTrial.subscriptionId()).access().allowed()).isFalse();
-        TestClock.set(Instant.now().truncatedTo(ChronoUnit.MICROS));
-        var zero=invoice("requiredtrial","subscription_create",requiredTrialPeriod.start(),requiredTrialPeriod.end(),"ZERO",REQUIRED);
-        readGraph(requiredTrialRemote,List.of(zero));
-        bean(ReconcileSubscriptionUseCase.class).reconcile(new ReconcileSubscriptionUseCase.Command(context(key()),requiredTrial.subscriptionId()));
     }
 
     @Then("only the second trial owns the verified card and the sibling trial is unchanged")

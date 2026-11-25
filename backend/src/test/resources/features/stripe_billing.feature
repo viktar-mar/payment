@@ -43,6 +43,17 @@ Feature: Stripe Billing through the configured application and official SDK
     Then only the second trial owns the verified card and the sibling trial is unchanged
     And the PostgreSQL proof verifies only the exact required trial and no cash
 
+  @billing-required-trial-sweep
+  Scenario: Ordinary reconciliation continues the original required trial after the owned setup succeeds
+    Given an owned Stripe Billing subscription for a required trial proof run
+    When its original zero Stripe trial invoice is reconciled
+    Then trial access exists without a cash payment or payment succeeded fact
+    When the same customer requests a required-method trial for the ordinary sweep
+    Then the second trial has only its original setup receipt without cash or access
+    When the ordinary sweep observes the pending setup and later verifies that same setup and zero invoice
+    Then only the second trial owns the verified card and the sibling trial is unchanged
+    And the PostgreSQL proof verifies only the exact required trial and no cash
+
   @billing-trial-resume
   Scenario: A paused optional trial resumes only after verified cash for its explicit resumption
     Given an owned Stripe Billing subscription with 7 trial days
