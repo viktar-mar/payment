@@ -153,8 +153,8 @@ public class StripeBillingSteps {
     private void catalogFixture(int trialDays,boolean portalAcceptance,String siteKey) {
         site=new SiteId(UUID.randomUUID());var accountId=UUID.randomUUID();product=new ProductId(UUID.randomUUID());price=new PriceId(UUID.randomUUID());
         jdbc.update("insert into payment_accounts values (?,?,'STRIPE','SANDBOX','ACTIVE',?,'stripe-sandbox-default',now(),0)",
-            accountId,portalAcceptance?"stripe-sandbox-default":"stripe-billing-acceptance",
-            portalAcceptance?"acct_1UPiMpELswAd8tpR":"acct_billing");
+            accountId,portalAcceptance||REQUIRED_TRIAL_PROOF_SITE_KEY.equals(siteKey)?"stripe-sandbox-default":"stripe-billing-acceptance",
+            portalAcceptance||REQUIRED_TRIAL_PROOF_SITE_KEY.equals(siteKey)?"acct_1UPiMpELswAd8tpR":"acct_billing");
         jdbc.update("insert into sites values (?,?,'Stripe Billing',?,'ACTIVE','AUTOMATIC',now(),now(),0)",site.value(),siteKey,accountId);
         jdbc.update("insert into site_allowed_origins values (?,?)",site.value(),ORIGIN);
         jdbc.update("insert into site_authentication_modes values (?,'SITE_TOKEN')",site.value());
@@ -635,7 +635,7 @@ public class StripeBillingSteps {
             REQUIRED_TRIAL_PROOF_RUN,account.id().value(),site.value(),customer.id().value(),requiredTrialProduct.value(),requiredTrialPrice.value(),
             id,requiredTrial.operationId(),requiredTrialCreateDigest,"cus_billing","seti_required","pm_required",REQUIRED.subscription(),REQUIRED.item(),
             "in_requiredtrial",Timestamp.from(requiredTrialPeriod.start()),Timestamp.from(requiredTrialPeriod.end())),
-            bill,event,subscription(id).revision());
+            bill,event,subscription(id).revision(),REQUIRED.price(),REQUIRED.product());
     }
 
     private void assertTrialStartCallback(Subscription trial, UUID operationId, String invoice) {
