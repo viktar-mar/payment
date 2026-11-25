@@ -63,6 +63,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const token = 'A'.repeat(43);
  const base = b.endpoints.backend + '/api/v1/customer/subscriptions';
  const otp = b.endpoints.backend + '/api/v1/public/customer-auth/email-otp/challenges';
+ const currentCustomer = b.endpoints.backend + '/api/v1/customer/me';
+ const trialOffer = b.endpoints.backend + '/api/v1/customer/subscription-products/' + b.productId + '/offers';
  const cancel = base + '/' + sub + '/cancellation';
  const operation = base + '/' + sub + '/operations/' + create;
  const select = operation + '/confirmation-session';
@@ -423,6 +425,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const headers = {'idempotency-key':key,authorization:'Bearer '+token,origin:b.endpoints.demo,'content-type':'application/json'};
   if(trial&&url.startsWith(otp)){delete (headers as Record<string,unknown>).authorization;delete (headers as Record<string,unknown>)['idempotency-key'];}
   if(trial&&method==='GET'){delete (headers as Record<string,unknown>)['idempotency-key'];delete (headers as Record<string,unknown>)['content-type'];}
+  if(url===currentCustomer && fault==='trial-baseline-cookie')Object.assign(headers,{cookie:'session=fixture'});
   if(fault==='initial-foreign-authority' && url===operation+'/action' && status===409)headers.authorization='Bearer '+'B'.repeat(43);
   if(schedulePost && fault==='origin')headers.origin='https://elsewhere.invalid';
   if(schedulePost && fault==='cookie')Object.assign(headers,{cookie:'session=demo'});
@@ -456,6 +459,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    if(url===select && fault==='initial-session-no-response')return;
    if(url===confirm && fault==='confirm-backend-no-response')return;
    existing=publish((schedulePost&&fault==='foreign-request'||url===retry&&fault==='wrong-retry-response'||
+    url===currentCustomer&&fault==='trial-baseline-unpaired'||
     url===select&&['initial-session-unpaired','early-static-image-unpaired'].includes(fault))?{...request} as Request:request,status,result);
   },abort:async()=>{}} as unknown as Route;
   await handler(route);
@@ -525,9 +529,16 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     if(name==='Request code'&&['early-provider-confirm','early-token','unknown-host'].includes(fault))await provider(fault==='unknown-host'?'https://unknown.invalid/anything':'https://api.stripe.com/v1/'+(fault==='early-token'?'confirmation_tokens':'payment_intents/pi_test/confirm'));
     if(name==='Request code') await send(otp, {site_key:b.siteKey,email:b.email,intent:'AUTHENTICATE'}, {challenge_id:id(8)});
     if(name==='Verify code'){
-     await send(otp+'/'+id(8)+'/verify',trial?{site_key:b.siteKey,code:'123456'}:{}, {expires_at:trial?trialSessionExpiry:boundary,customer:{id:id(11),status:'ACTIVE'},site_id:b.siteId,scopes:['SUBSCRIPTION_READ','SUBSCRIPTION_MANAGE'],session_token:token},200);
-     const firstList=send(base+'?limit=100',{}, {items:fault==='create-nonempty-baseline'?[{id:id(99)}]:[],next_cursor:null},200,'GET');
-     if(trial)void firstList.catch(()=>{});else await firstList;
+     await send(otp+'/'+id(8)+'/verify',trial?{site_key:b.siteKey,code:'123456'}:{}, {expires_at:trial?trialSessionExpiry:boundary,customer:{id:id(11),status:'ACTIVE'},site_id:b.siteId,scopes:['CUSTOMER_READ','SUBSCRIPTION_READ','SUBSCRIPTION_MANAGE'],session_token:token},200);
+     const firstList=()=>send(base+'?limit=100',{}, {items:fault==='create-nonempty-baseline'?[{id:id(99)}]:[],next_cursor:null},200,'GET');
+     if(trial)void (async()=>{
+      const current={id:fault==='trial-baseline-foreign-customer'?id(12):id(11),status:'ACTIVE',masked_email:null,authentication_modes:['EMAIL_OTP'],session_expires_at:trialSessionExpiry};
+      await send(currentCustomer+(fault==='trial-baseline-query'?'?extra=1':''),{},current,200,'GET');
+      if(fault==='trial-baseline-repeat')await send(currentCustomer,{},current,200,'GET');
+      await send(trialOffer,{}, {items:[]},200,'GET');
+      await firstList();
+     })().catch(()=>{});
+     else await firstList();
     }
     if(name==='Create subscription'){
      if(fault==='create-pointer-lost'&&!fromKeyboard)return;
@@ -1705,8 +1716,24 @@ test('required trial creates once, spends the original setup permit, then refres
  assert.deepEqual(f.keysPressed,['Enter','Enter','Enter']);
  assert.deepEqual(f.providerSent.filter(url=>url.endsWith('/confirm')),[f.setupUrl]);
  assert.equal(f.sent.filter(url=>url===f.trialPermit).length,1);
+ assert.deepEqual(f.sent.slice(2,6).map(url=>new URL(url).pathname),[
+  '/api/v1/customer/me','/api/v1/customer/subscription-products/'+f.id(2)+'/offers',
+  '/api/v1/customer/subscriptions','/api/v1/customer/subscriptions']);
  assert.ok(f.closed());
 });
+
+for(const fault of ['trial-baseline-query','trial-baseline-cookie','trial-baseline-repeat','trial-baseline-unpaired','trial-baseline-foreign-customer'])
+ test('required trial rejects an invalid restored customer before CREATE for '+fault,async()=>{
+  const f=cancellationPage(fault,false,false,false,undefined,false,undefined,true);
+  await assert.rejects(runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:Date.now()+2000}),error=>{
+   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CREATE_BASELINE');
+   assert.equal(browserCleanupConfirmed(error),true);
+   return true;
+  });
+  assert.equal(f.sent.filter(url=>new URL(url).pathname==='/api/v1/customer/me').length,
+   ['trial-baseline-repeat','trial-baseline-unpaired','trial-baseline-foreign-customer'].includes(fault)?1:0);
+  assert.ok(!f.trace.includes('Create subscription'));
+ });
 
 for(const [fault,permits,setups] of [
  ['trial-direct-action',0,0],['trial-foreign-grant',0,0],['trial-payment-session',0,0],['trial-premature-access',0,0],

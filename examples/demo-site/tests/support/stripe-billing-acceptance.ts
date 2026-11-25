@@ -278,6 +278,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
   const customerReady=Promise.withResolvers<void>();
   const trialIdentity=()=>({subscriptionId,operationId});
   const listUrl=base+'?limit=100';
+  const currentCustomerUrl=binding.endpoints.backend+'/api/v1/customer/me';
   let grantedAction:{token:string;expiry:number}|undefined,setup:{id:string;secret:string;expiry:number}|undefined;
   let trialPermit:Promise<void>|undefined,trialRefresh:JSHandle<()=>boolean>|undefined;
   let trialTerminalRead=false;
@@ -579,7 +580,10 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
       need(h.origin===binding.endpoints.demo && h.authorization===authority && !h.cookie && !h['proxy-authorization'] &&
        !h['idempotency-key'] && req.postData()===null);
       const offer=binding.endpoints.backend+'/api/v1/customer/subscription-products/'+binding.productId+'/offers';
-      if(url!==offer && url!==listUrl){
+      // The demo restores the OTP session before mounting the subscription manager.
+      if(url===currentCustomerUrl){need(!createPosts && customerExpiry>Date.now());claim('trial-customer',req);}
+      else if(url===listUrl && !createPosts)claim('trial-baseline',req);
+      else if(url!==offer && url!==listUrl){
        need(createPosts===1);
        await billingBounded(limits,()=>created);
        const sub=base+'/'+subscriptionId,original=sub+'/operations/'+operationId;
@@ -728,19 +732,28 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
   await port.withOtpCode(async code=>{if(trialCase)otpCode=code;await enterPrivateText(widget.getByRole('textbox',{name:'Six-digit code',exact:true}),code);return true as const;},limits);
   if(guarded)checkpoint='BROWSER_OTP_VERIFY';
   const verification=page.waitForResponse(r=>r.url()===otp+'/'+challengeBody.challenge_id+'/verify'&&r.request().method()==='POST',{timeout:duration(limits)});void verification.catch(()=>{});
-  const baseline=page.waitForResponse(r=>r.url().startsWith(base+'?')&&r.request().method()==='GET',{timeout:duration(limits)});void baseline.catch(()=>{});
+  const restoredCustomer=trialCase?page.waitForResponse(r=>r.url()===currentCustomerUrl&&r.request().method()==='GET',{timeout:duration(limits)}):undefined;
+  void restoredCustomer?.catch(()=>{});
+  const baseline=page.waitForResponse(r=>(trialCase?r.url()===listUrl:r.url().startsWith(base+'?'))&&r.request().method()==='GET',{timeout:duration(limits)});void baseline.catch(()=>{});
   await widget.getByRole('button',{name:'Verify code',exact:true}).click({timeout:duration(limits)});const response=await verification;paired('verify',response);need(response.status()===200);const session=await body(response,limits),customer=session.customer;
   need(object(customer)&&uuid(customer.id)&&customer.status==='ACTIVE'&&session.site_id===binding.siteId&&Array.isArray(session.scopes)&&session.scopes.includes('SUBSCRIPTION_READ')&&session.scopes.includes('SUBSCRIPTION_MANAGE')&&typeof session.session_token==='string'&&/^[A-Za-z0-9_-]{43}$/.test(session.session_token));
   authority='Bearer '+session.session_token;
   const customerId=(customer as Record<string,string>).id!;
   const customerAcknowledged=await port.acknowledgeCustomer({customerId,siteId:binding.siteId});
   if(trialCase){
-   if(customerAcknowledged!==true || typeof session.expires_at!=='string')return fail();
+   if(customerAcknowledged!==true || typeof session.expires_at!=='string' || !(session.scopes as unknown[]).includes('CUSTOMER_READ'))return fail();
    customerExpiry=Date.parse(session.expires_at);need(customerExpiry>Date.now());
    customerReady.resolve();
   }
   if(exactInitialCheckout||cancellationPort)checkpoint='BROWSER_CREATE_BASELINE';
-  const before=await body(await baseline,limits);need(Array.isArray(before.items)&&before.items.length===0&&before.next_cursor===null);
+  if(restoredCustomer){
+   const restored=await restoredCustomer;paired('trial-customer',restored);need(restored.status()===200);
+   const current=await body(restored,limits);
+   need(current.id===customerId && current.status==='ACTIVE' && current.session_expires_at===session.expires_at);
+  }
+  const listed=await baseline;
+  if(trialCase){paired('trial-baseline',listed);need(listed.status()===200);}
+  const before=await body(listed,limits);need(Array.isArray(before.items)&&before.items.length===0&&before.next_cursor===null);
   if(exactInitialCheckout||cancellationPort)checkpoint='BROWSER_CREATE_CONSENT';
   const manager=page.locator('generic-subscription-manager').first();await manager.getByRole('checkbox',{name:'I consent to recurring payments',exact:true}).check({timeout:duration(limits)});
   if(exactInitialCheckout||cancellationPort)checkpoint='BROWSER_CREATE_OWNER';
