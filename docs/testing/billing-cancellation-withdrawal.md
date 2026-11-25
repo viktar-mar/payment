@@ -2,7 +2,7 @@
 
 This case starts with one fresh ordinary subscription and one initial EUR 20 test payment. A customer requests cancellation at the end of the paid period and then withdraws that request before the period ends. Access should remain active through the same paid-through date at both checkpoints.
 
-Current verification covers synthetic provider responses and PostgreSQL. The ordinary first-payment path requires an explicit zero for the unpaid invoice allocation. A previous test-clock run observed a missing value before payment. If the ordinary subscription returns the same shape, its existing validation will stop before Pay. A native scheduling or withdrawal receipt is still outstanding.
+Current verification covers synthetic provider responses and PostgreSQL. Stripe Sandbox verified the initial €20 payment and scheduling at the original paid-through boundary. A later attempt paired the withdrawal POST with the application's `202 UNKNOWN` response. Native evidence that the provider withdrew the cancellation remains outstanding. See the [acceptance matrix](../stage-5b-acceptance.md#current-acceptance-status-on-2026-11-25).
 
 ## Running the case
 
