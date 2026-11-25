@@ -1,10 +1,10 @@
 import type {BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import {isAcceptanceBrowserDiagnostic} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 
-export function billingTerminal(scope:string,field:string,marker:string,annotation:string,casePhases:string[],orderCode:string){
+export function billingTerminal(scope:string,field:string,marker:string,annotation:string,casePhases:string[],orderCode:string,caseCode?:(code:string)=>boolean){
 const phases=new Set(['NEW','PREFLIGHT','BOOTSTRAP','PREPARE','CLI','LOGIN','BINDING','LISTENER','START','FIXTURE','PROVISION','BROWSER','COMPLETE',...casePhases]);
 const codes=new Set([...phases,'LIMITS',orderCode,'ABORTED','FAILED','CLEANUP']);
-const knownCode=(code:string)=>codes.has(code)||isAcceptanceBrowserDiagnostic(code);
+const knownCode=(code:string)=>codes.has(code)||isAcceptanceBrowserDiagnostic(code)||caseCode?.(code)===true;
 const prefix=marker+'_terminal ';
 const closeFailed=prefix+'phase=CLOSE code=CLOSE cleanup=UNCONFIRMED';
 function parse(raw:unknown):string|null{

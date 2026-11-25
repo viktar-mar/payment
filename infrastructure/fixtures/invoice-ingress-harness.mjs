@@ -21,9 +21,10 @@ export function syntheticInvoiceIngress(configuration=config,onFailure=()=>{}){
    parent:{type:'subscription_details',subscription_details:{subscription:refs.subscriptionReference,metadata:{account_id:local.accountId,
     site_id:local.siteId,customer_id:local.customerId,subscription_id:owner.subscriptionId,operation_id:owner.operationId}}}}},...changes};
  }
- async function post(v,{invalid=false,old=false,path=target().pathname,extra=[],content,repeat=false}={}){
+ async function post(v,{invalid=false,old=false,path=target().pathname,extra=[],content,repeat=false,signature}={}){
   const raw=Buffer.from(content??JSON.stringify(v,null,2)),t=Math.floor(now/1000)-(old?301:0);
-  const sig='t='+t+',v1='+createHmac('sha256',invalid?'foreign':secret).update(t+'.').update(raw).digest('hex');
+  const mac=createHmac('sha256',invalid?'foreign':secret).update(t+'.').update(raw).digest('hex');
+  const sig=signature?signature(t,mac):'t='+t+',v1='+mac;
   const headers=['Host',target().host,'Content-Type','application/json','Stripe-Signature',sig,'Content-Length',String(raw.length),...extra];
   if(repeat)headers.push('Stripe-Signature',sig);
   const req=Object.assign(Readable.from([raw]),{method:'POST',url:path,rawHeaders:headers,socket:{remoteAddress:'127.0.0.1'}});

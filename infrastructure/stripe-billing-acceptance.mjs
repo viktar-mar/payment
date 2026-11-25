@@ -1,4 +1,4 @@
-import {createOwnedInvoiceIngress} from './stripe-billing-invoice-ingress.mjs';
+import {createOwnedInvoiceIngress,isInvoiceIngressFailureCode} from './stripe-billing-invoice-ingress.mjs';
 import {invoiceWebhookFlow} from './stripe-billing-invoice-webhook-port.mjs';
 import {initialChallengeFlow} from './stripe-billing-initial-3ds-port.mjs';
 import {initialRetryFlow} from './stripe-billing-initial-retry-port.mjs';
@@ -34,7 +34,7 @@ async function createOwner(options,dependencies,selectedCase) {
  const cancellation=selectedCase==='initial_cancel_withdraw',retry=selectedCase==='initial_decline_retry';
  const configuration=validateBillingAcceptanceOptions(options);
  if(!configuration || configuration.selectedCase!==selectedCase)throw billingError('OPT_IN_REQUIRED');
- let browserUnconfirmed=false;
+ let browserCompletion;
  let finishRun;const finished=new Promise(resolve=>finishRun=resolve);
  let state='NEW',phase='NEW',failure=null,bootstrap,cli,fixture,cleanupPromise,active,accepted=false,cleanupConfirmed=false;
  const lifetime=new AbortController(),counts={create:0,confirm:0},acks={create:false,confirm:false};
@@ -43,8 +43,11 @@ async function createOwner(options,dependencies,selectedCase) {
  async function cleanup() {
   if(cleanupPromise)return cleanupPromise;
   cleanupPromise=(async()=>{
-   let ok=!browserUnconfirmed;const limits={deadline:Date.now()+120000};
+   let ok=true;const limits={deadline:Date.now()+120000};
+   // Run cancellation can win before the browser finishes closing its context.
+   const browserClosed=browserCompletion&&billingBounded(limits,()=>browserCompletion,20000).catch(()=>false);
    for(const [object,method] of [[fixture,'close'],[cli,'stopListener'],[ingress,'close'],[bootstrap,'stop']])if(object)try{if(await billingBounded(limits,l=>object[method](l),30000)!==true)ok=false;}catch{ok=false;}
+   if(browserClosed&&await browserClosed!==true)ok=false;
    cleanupConfirmed=ok;if(!ok)failure??='CLEANUP';return ok;
   })();return cleanupPromise;
  }
@@ -62,8 +65,8 @@ async function createOwner(options,dependencies,selectedCase) {
     bootstrap=await step('BOOTSTRAP',()=>(dependencies.createBootstrap??createOwnedBillingBootstrap)(configuration));
     await step('PREPARE',()=>bootstrap.prepare(active),2700000);
     if(invoiceCase){
-     ingress=(dependencies.createInvoiceIngress??createOwnedInvoiceIngress)(configuration,bootstrap,{onFailure(){
-      if(state==='RUNNING'){failure??='INGRESS';lifetime.abort();}
+     ingress=(dependencies.createInvoiceIngress??createOwnedInvoiceIngress)(configuration,bootstrap,{onFailure(code){
+      if(state==='RUNNING'){failure??=isInvoiceIngressFailureCode(code)?code:'INGRESS';lifetime.abort();}
      }});
      if(await step('INGRESS',l=>ingress.open(l))!==true)fail('INGRESS');
     }
@@ -141,12 +144,13 @@ async function createOwner(options,dependencies,selectedCase) {
     });
     const browserResult=await step('BROWSER',async()=>{
      const bound=retry||challenge||invoiceCase;
-     if(bound)browserUnconfirmed=true;
-     try{return await browserJourney(port,active);}
+     const execution=Promise.resolve().then(()=>{billingCheck(active);return browserJourney(port,active);});
+     if(bound)browserCompletion=execution.then(result=>result===true,
+      error=>browserDiagnostic(error,'ACCEPTANCE')!==null&&browserCleanupConfirmed(error));
+     try{return await execution;}
      catch(error){
       const checkpoint=bound?browserDiagnostic(error,'ACCEPTANCE'):null;
       if(checkpoint){
-       browserUnconfirmed=!browserCleanupConfirmed(error);
        if(challengeFlow?.challengeDispatched()&&checkpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM'){
         const witness=browserProviderOrigin(error);
         if(witness?.runId===configuration.runId&&witness.expectedSource===configuration.expectedSource){
@@ -166,15 +170,12 @@ async function createOwner(options,dependencies,selectedCase) {
     },2700000);
     if(invoiceFlow){
      if(browserResult!==true)fail('BROWSER');
-     browserUnconfirmed=false;
      await invoiceFlow.finish();
     }else if(challengeFlow){
      if(browserResult!==true)fail('BROWSER');
-     browserUnconfirmed=false;
      await challengeFlow.verify();
     }else if(retryFlow){
      if(browserResult!==true)fail('BROWSER');
-     browserUnconfirmed=false;
      retryFlow.requireComplete();
     }else if(cancellation){
      if(next!=='complete')fail('CANCELLATION_ORDER');

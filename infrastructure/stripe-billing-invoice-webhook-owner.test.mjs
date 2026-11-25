@@ -6,6 +6,7 @@ import {createBillingFixture} from './stripe-billing-provision.mjs';
 import {provisionHarness} from './fixtures/failed-renewal-provision-harness.mjs';
 import {id} from './fixtures/failed-renewal-descriptors.mjs';
 import {createHash} from 'node:crypto';
+import {acceptanceBrowserFailure,browserCleanupConfirmed,browserFailure,finishBrowserCleanup} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 
 const scenario='initial_missed_reordered',configuration={
  env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',PAYMENT_STRIPE_BILLING_CASE:scenario},
@@ -17,6 +18,31 @@ test('withheld invoices require their own admission and exact dispatch budget',a
  assert.deepEqual(validateBillingAcceptanceOptions(configuration)?.budget,{create:1,confirm:1,reconcile:1,deliver:2});
  assert.equal(validateBillingAcceptanceOptions({...configuration,budget:{create:1,confirm:1,reconcile:1,deliver:3}}),null);
  await assert.rejects(owners.createOwnedBillingAcceptance(configuration),/OPT_IN_REQUIRED/);
+});
+for(const proof of ['confirmed','unconfirmed','foreign'])test('invoice ingress abort waits for this browser cleanup proof: '+proof,async()=>{
+ const yes=async()=>true,closed=Promise.withResolvers(),teardown=Promise.withResolvers();
+ const error=proof==='foreign'?browserFailure('BROWSER_CONTEXT','INITIAL'):acceptanceBrowserFailure('BROWSER_PROVIDER_ROUTE');
+ const settled=proof!=='unconfirmed';
+ let revoke;
+ const owner=await owners.createOwnedBillingInvoiceWebhooks(configuration,{
+  preflight:yes,createBootstrap:()=>({prepare:yes,start:yes,resources:()=>({cliDirectory:'inert'}),stop:async()=>{
+   teardown.resolve();return true;
+  }}),createInvoiceIngress:(_c,_b,{onFailure})=>{revoke=onFailure;return {open:yes,close:yes};},
+  createCli:()=>({validateBinding:yes,startListener:yes,assertBillingListener:()=>true,stopListener:yes}),
+  login:yes,createFixture:()=>({provision:yes,close:yes}),createInvoiceEvidence:()=>({}),
+ });
+ const run=owner.run(async()=>{
+  revoke('INGRESS_SIGNATURE');await closed.promise;
+  finishBrowserCleanup(error,settled);throw error;
+ },{deadline:Date.now()+5000});
+ const rejection=assert.rejects(run,/^Error: billing_INGRESS_SIGNATURE$/);
+ await teardown.promise;
+ closed.resolve();await rejection;
+ const terminal=await owner.close();
+ assert.equal(browserCleanupConfirmed(error),settled);
+ assert.equal(terminal.cleanupConfirmed,proof==='confirmed');
+ assert.equal(terminal.code,'INGRESS_SIGNATURE');
+ assert.equal(terminal.invoiceWebhooksAccepted,false);
 });
 for(const fault of ['none','uncertain customer','repeated create','foreign confirm','premature completion','missing grant','missing paid baseline','uncertain reconcile','wrong recovery','paid uncertain','unprocessed paid','unprocessed finalized','tainted before confirm','tainted before reconcile','late ingress','browser closure']){
  test('withheld originals through real fixture and owner: '+fault,async()=>{

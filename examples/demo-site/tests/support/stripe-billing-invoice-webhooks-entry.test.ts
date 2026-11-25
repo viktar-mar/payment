@@ -5,9 +5,19 @@ import {fileURLToPath} from 'node:url';
 import type {TestCase,TestResult,FullResult} from '@playwright/test/reporter';
 import {createOwnedBillingInvoiceWebhooks} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 // @ts-ignore Offline tests execute the same worker and reporter modules.
-import {runInvoiceWebhooksCase} from './stripe-billing-invoice-webhooks-terminal.ts';
+import {invoiceTerminalLine,runInvoiceWebhooksCase} from './stripe-billing-invoice-webhooks-terminal.ts';
 // @ts-ignore Offline tests execute the same worker and reporter modules.
 import Reporter from './stripe-billing-invoice-webhooks-reporter.ts';
+
+test('the invoice reporter accepts fixed ingress diagnostics and rejects raw details',()=>{
+ const prefix='owned_initial_missed_reordered_terminal phase=ACK code=';
+ const suffix=' cleanup=CONFIRMED';
+ for(const code of ['INGRESS_SIGNATURE','INGRESS_REQUEST','INGRESS_ENVELOPE','INGRESS_INVOICE','INGRESS_ORDER','INGRESS_LISTENER','INGRESS_DELIVERY']){
+  const line=prefix+code+suffix;
+  assert.equal(invoiceTerminalLine(line),line);
+ }
+ for(const code of ['INGRESS_RAW','INGRESS_SIGNATURE secret=x','UNREVIEWED'])assert.equal(invoiceTerminalLine(prefix+code+suffix),null);
+});
 
 test('ordinary discovery excludes the invoice case and its synthetic checks',async()=>{
  const read=(name:string)=>readFile(new URL(name,import.meta.url),'utf8');
