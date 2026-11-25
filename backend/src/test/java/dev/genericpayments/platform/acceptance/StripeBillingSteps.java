@@ -66,6 +66,8 @@ public class StripeBillingSteps {
     private final List<InvoiceGraph> invoices = new ArrayList<>();
     private List<Long> evidence;
     private TrialPublication originalTrial;
+    private SubscriptionOperationResult trialSetup, trialResume;
+    private Subscription.Period resumedPeriod;
     private int beforeDenied, beforeFake;
     private UUID fakeSubscription;
     private PriceId upgradePrice;
@@ -102,7 +104,11 @@ public class StripeBillingSteps {
         actor=new SubscriptionActor.Customer(sessions.resolveRequired(sessions.issue(site,customer.id(),ORIGIN).rawToken(),ORIGIN));
     }
     @After("@stripe-billing") public void closeOwnedFixture() {
-        if(attached) { factory.detach(); attached=false; }
+        if(attached) {
+            StripeAcceptanceConfiguration.providerTime(null);
+            factory.detach();
+            attached=false;
+        }
         if(http!=null) { http.close(); http=null; }
     }
     private void identity() { http.enqueue("GET","/v1/account",200,"{\"id\":\"acct_billing\",\"object\":\"account\"}"); }
@@ -208,6 +214,9 @@ public class StripeBillingSteps {
                 respondPage("/v1/invoice_payments",List.of(graph.allocation()));
             }
         }
+        if (remote.has("default_payment_method")) {
+            respond("GET", "/v1/payment_methods/pm_trial", trialPaymentMethod());
+        }
     }
     private void respondPage(String path,List<JsonObject> items) { http.enqueue("GET",path,200,page(items)); }
     private void reconcile() { readGraph();bean(ReconcileSubscriptionUseCase.class).reconcile(new ReconcileSubscriptionUseCase.Command(context(key()),created.subscriptionId())); }
@@ -275,10 +284,14 @@ public class StripeBillingSteps {
             site.value(),created.subscriptionId())).isOne();
         assertThat(count("subscription_events","site_id=? and subscription_id=? and event_type='PERIOD_PAID'",
             site.value(),created.subscriptionId())).isOne();
+        return publishedCash("in_initial", "pi_initial", BillingRecord.Kind.INITIAL);
+    }
+
+    private PublishedCash publishedCash(String invoiceReference, String paymentReference, BillingRecord.Kind kind) {
         return jdbc.queryForObject("""
             select b.id, p.id, cash.id, period.id from subscription_billing_records b
             join payments p on p.billing_record_id=b.id and p.subscription_id=b.subscription_id and p.site_id=b.site_id
-              and p.payment_account_id=b.payment_account_id and p.provider_payment_reference='pi_initial'
+              and p.payment_account_id=b.payment_account_id and p.provider_payment_reference=?
               and p.subscription_invoice_reference=b.provider_invoice_reference and p.status='SUCCEEDED'
               and p.source='SUBSCRIPTION' and p.amount_minor=2000 and p.currency='EUR'
             join payment_events cash on cash.payment_id=p.id and cash.event_type='PAYMENT_SUCCEEDED'
@@ -291,11 +304,12 @@ public class StripeBillingSteps {
             join outbox_events period_callback on period_callback.id=period.id and period_callback.site_id=b.site_id
               and period_callback.subscription_id=b.subscription_id and period_callback.callback_type='subscription.updated'
             where b.site_id=? and b.subscription_id=? and b.payment_account_id=? and p.customer_id=?
-              and b.provider_invoice_reference='in_initial' and b.kind='INITIAL' and b.settlement='CONFIRMED_CASH'
+              and b.provider_invoice_reference=? and b.kind=? and b.settlement='CONFIRMED_CASH'
               and b.currency='EUR' and b.amount_due_minor=2000
             """,(row,index) -> new PublishedCash(row.getObject(1,UUID.class),row.getObject(2,UUID.class),
                 row.getObject(3,UUID.class),row.getObject(4,UUID.class)),
-            site.value(),created.subscriptionId(),account.id().value(),customer.id().value());
+            paymentReference,site.value(),created.subscriptionId(),account.id().value(),customer.id().value(),
+            invoiceReference,kind.name());
     }
 
     @When("its delayed paid and earlier finalized Stripe notifications arrive in reverse order")
@@ -393,13 +407,13 @@ public class StripeBillingSteps {
         int callsBeforeAccess=http.calls().size();
         TestClock.set(end.minusSeconds(1));
         authenticate();
-        assertTrialAccess(Subscription.Status.TRIALING,AccessDecision.Reason.TRIAL,end);
+        assertAccess(Subscription.Status.TRIALING,AccessDecision.Reason.TRIAL,end);
         TestClock.set(end);
-        assertTrialAccess(Subscription.Status.TRIALING,AccessDecision.Reason.EXPIRED,null);
+        assertAccess(Subscription.Status.TRIALING,AccessDecision.Reason.EXPIRED,null);
         assertThat(http.calls()).hasSize(callsBeforeAccess);
     }
 
-    private void assertTrialAccess(Subscription.Status state, AccessDecision.Reason reason, Instant validUntil) {
+    private void assertAccess(Subscription.Status state, AccessDecision.Reason reason, Instant validUntil) {
         var queries=bean(QuerySubscriptionsUseCase.class);
         var view=queries.get(actor,site,created.subscriptionId());
         assertThat(view.subscription().billingStatus()).isEqualTo(state);
@@ -423,7 +437,7 @@ public class StripeBillingSteps {
 
     @Then("the same subscription is paused without debt or a new invoice or payment")
     public void pausedTrial() {
-        assertTrialAccess(Subscription.Status.PAUSED,AccessDecision.Reason.PAUSED,null);
+        assertAccess(Subscription.Status.PAUSED,AccessDecision.Reason.PAUSED,null);
         var paused=subscription();
         assertThat(paused.providerReference()).isEqualTo("sub_billing");
         assertThat(paused.trial()).isEqualTo(new Subscription.Period(start,end));
@@ -445,6 +459,160 @@ public class StripeBillingSteps {
         assertThat(trialCreate.form().containsKey("default_payment_method")).isFalse();
         assertThat(calls.subList(calls.indexOf(trialCreate)+1,calls.size()))
             .allSatisfy(call -> assertThat(call.method()).isEqualTo("GET"));
+    }
+
+    private JsonObject trialPaymentMethod() {
+        return json("""
+            {"id":"pm_trial","object":"payment_method","livemode":false,"customer":"cus_billing",
+             "type":"card","card":{"brand":"visa","last4":"4242"}}
+            """);
+    }
+
+    @When("the customer sets up a card for that Stripe subscription")
+    public void setUpTrialCard() {
+        StripeAcceptanceConfiguration.providerTime(end);
+        var intent = json("""
+            {"id":"seti_trial","object":"setup_intent","livemode":false,"customer":"cus_billing",
+             "usage":"off_session","payment_method_types":["card"],"status":"requires_payment_method"}
+            """);
+        identity();
+        http.enqueue("POST", "/v1/setup_intents", 200, call -> {
+            var metadata = new JsonObject();
+            metadata.addProperty("operation_id", call.form().get("metadata[operation_id]"));
+            metadata.addProperty("subscription_id", call.form().get("metadata[subscription_id]"));
+            intent.add("metadata", metadata);
+            intent.addProperty("created", end.getEpochSecond());
+            return intent.toString();
+        });
+        trialSetup = bean(SetupSubscriptionMethodUseCase.class).setup(
+            new SetupSubscriptionMethodUseCase.Command(context(key()), created.subscriptionId(), true));
+        assertThat(trialSetup.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        assertThat(http.calls().stream().filter(call -> call.path().equals("/v1/setup_intents")))
+            .singleElement().satisfies(call -> {
+                assertThat(call.method()).isEqualTo("POST");
+                assertThat(call.header("Idempotency-Key")).isEqualTo(operation(trialSetup.operationId()).providerOperationKey() + ":SETUP");
+                assertThat(call.form()).containsEntry("customer", "cus_billing").containsEntry("usage", "off_session")
+                    .containsEntry("metadata[subscription_id]", created.subscriptionId().toString());
+            });
+        assertThat(access().reason()).isEqualTo(AccessDecision.Reason.PAUSED);
+        assertThat(cash()).isZero();
+
+        intent.addProperty("status", "succeeded");
+        intent.addProperty("payment_method", "pm_trial");
+        identity();
+        respond("GET", "/v1/setup_intents/seti_trial", intent);
+        respond("GET", "/v1/payment_methods/pm_trial", trialPaymentMethod());
+        identity();
+        remote.addProperty("default_payment_method", "pm_trial");
+        respond("POST", "/v1/subscriptions/sub_billing", remote);
+        var continued = bean(ContinueOriginalSubscriptionSetupUseCase.class).api(
+            context(key()), created.subscriptionId(), trialSetup.operationId());
+        assertThat(continued.operationId()).isEqualTo(trialSetup.operationId());
+        assertThat(continued.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        readGraph();
+        respond("GET", "/v1/subscriptions/sub_billing", remote);
+        bean(ReconcileSubscriptionUseCase.class).reconcile(
+            new ReconcileSubscriptionUseCase.Command(context(key()), created.subscriptionId()));
+    }
+
+    @Then("the card is saved without resuming the subscription or collecting cash")
+    public void trialSetupDoesNotResume() {
+        assertThat(operation(trialSetup.operationId()).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+        var proof = bean(SubscriptionBillingProofStore.class).setup(account.id(), trialSetup.operationId()).orElseThrow();
+        assertThat(proof.reference()).isEqualTo("seti_trial");
+        assertThat(proof.method()).isEqualTo("pm_trial");
+        assertThat(proof.subscription()).isEqualTo(created.subscriptionId());
+        assertThat(http.calls().stream().filter(call -> call.method().equals("POST") && call.path().equals("/v1/subscriptions/sub_billing")))
+            .singleElement().satisfies(call -> {
+                assertThat(call.header("Idempotency-Key")).isEqualTo(operation(trialSetup.operationId()).providerOperationKey() + ":METHOD");
+                assertThat(call.form()).containsExactlyEntriesOf(Map.of("default_payment_method", "pm_trial"));
+            });
+        assertThat(http.calls()).noneMatch(call -> call.path().endsWith("/resume") || call.path().endsWith("/pay"));
+        assertUnpaidTrialPause();
+        assertThat(count("subscription_billing_records", "subscription_id=?", created.subscriptionId())).isOne();
+    }
+
+    private void assertUnpaidTrialPause() {
+        assertAccess(Subscription.Status.PAUSED, AccessDecision.Reason.PAUSED, null);
+        assertThat(subscription().paidThrough()).isNull();
+        assertThat(subscription().debt()).isNull();
+        assertThat(trialPublication()).isEqualTo(originalTrial);
+        assertThat(cash()).isZero();
+        assertThat(count("payment_events", "site_id=?", site.value())).isZero();
+        assertThat(count("outbox_events", "site_id=? and callback_type='payment.succeeded'", site.value())).isZero();
+    }
+
+    @When("the customer explicitly resumes and Stripe leaves its new invoice open")
+    public void resumeTrialWithOpenInvoice() {
+        Instant anchor = end.plusSeconds(1);
+        TestClock.set(anchor);
+        StripeAcceptanceConfiguration.providerTime(anchor);
+        resumedPeriod = new Subscription.Period(anchor, anchor.atOffset(ZoneOffset.UTC).plusMonths(1).toInstant());
+        var open = invoice("resume", "subscription_cycle", resumedPeriod.start(), resumedPeriod.end(), "OPEN");
+        readGraph();
+        identity();
+        respond("GET", "/v1/subscriptions/sub_billing", remote);
+        respond("GET", "/v1/payment_methods/pm_trial", trialPaymentMethod());
+        var resumeResponse = remote.deepCopy();
+        resumeResponse.addProperty("latest_invoice", "in_resume");
+        respond("POST", "/v1/subscriptions/sub_billing/resume", resumeResponse);
+        respond("GET", "/v1/invoices/in_resume", open.invoice());
+        respondPage("/v1/invoices/in_resume/lines", List.of(open.line()));
+        trialResume = bean(ResumeSubscriptionUseCase.class).resume(
+            new ResumeSubscriptionUseCase.Command(context(key()), created.subscriptionId(), true));
+        assertThat(trialResume.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        assertThat(http.calls().stream().filter(call -> call.path().equals("/v1/subscriptions/sub_billing/resume")))
+            .singleElement().satisfies(call -> {
+                assertThat(call.method()).isEqualTo("POST");
+                assertThat(call.header("Idempotency-Key")).isEqualTo(operation(trialResume.operationId()).providerOperationKey());
+                assertThat(call.form()).containsExactlyInAnyOrderEntriesOf(Map.of("billing_cycle_anchor[type]", "now",
+                    "payment_behavior", "resume_on_payment_success", "proration_behavior", "none"));
+            });
+        invoices.add(open);
+        reconcile();
+    }
+
+    @Then("the resumption remains pending without paid access")
+    public void trialResumeStillPending() {
+        assertUnpaidTrialPause();
+        assertThat(operation(trialResume.operationId()).status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        var proof = bean(SubscriptionBillingProofStore.class).resume(account.id(), trialResume.operationId()).orElseThrow();
+        assertThat(proof.subscription()).isEqualTo(created.subscriptionId());
+        assertThat(proof.reference()).isEqualTo("sub_billing");
+        assertThat(proof.invoice()).isEqualTo("in_resume");
+        assertThat(proof.period()).isEqualTo(resumedPeriod);
+    }
+
+    @When("the original resumption invoice has verified cash")
+    public void reconcilePaidResumption() {
+        remote.addProperty("status", "active");
+        remote.addProperty("latest_invoice", "in_resume");
+        setPeriod(resumedPeriod.start(), resumedPeriod.end());
+        invoices.set(1, invoice("resume", "subscription_cycle", resumedPeriod.start(), resumedPeriod.end(), "CASH"));
+        reconcile();
+    }
+
+    @Then("that payment restores access once and preserves the original zero trial invoice")
+    public void trialResumed() {
+        assertAccess(Subscription.Status.ACTIVE, AccessDecision.Reason.PAID, now().plus(Duration.ofMinutes(5)));
+        assertThat(subscription().currentPeriod()).isEqualTo(resumedPeriod);
+        assertThat(subscription().paidThrough()).isEqualTo(resumedPeriod.end());
+        assertThat(subscription().debt()).isNull();
+        assertThat(subscription().trial()).isEqualTo(new Subscription.Period(start, end));
+        assertThat(trialPublication()).isEqualTo(originalTrial);
+        assertThat(operation(trialResume.operationId()).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+        assertThat(cash()).isOne();
+        assertThat(count("subscription_billing_records", "subscription_id=?", created.subscriptionId())).isEqualTo(2);
+        assertThat(count("payment_events", "site_id=? and event_type='PAYMENT_SUCCEEDED'", site.value())).isOne();
+        assertThat(count("subscription_events", "subscription_id=? and event_type='PERIOD_PAID'", created.subscriptionId())).isOne();
+        assertThat(count("outbox_events", "site_id=? and callback_type='payment.succeeded'", site.value())).isOne();
+
+        var publication = publishedCash("in_resume", "pi_resume", BillingRecord.Kind.RENEWAL);
+        var paid = financialEvidence();
+        reconcile();
+        assertThat(financialEvidence()).isEqualTo(paid);
+        assertThat(publishedCash("in_resume", "pi_resume", BillingRecord.Kind.RENEWAL)).isEqualTo(publication);
+        assertThat(trialPublication()).isEqualTo(originalTrial);
     }
 
     private void next(String settlement) {
@@ -521,7 +689,9 @@ public class StripeBillingSteps {
     @Then("Fake grants its paid access without using the Stripe transport") public void fakeIsolated() {
         assertThat(http.calls()).hasSize(beforeFake);assertThat(count("payments","subscription_id=? and source='SUBSCRIPTION' and status='SUCCEEDED'",fakeSubscription)).isEqualTo(1);assertThat(cash()).isEqualTo(1);assertThat(subscription().paymentAccountId()).isEqualTo(account.id());
     }
-    private int graphRequests() { return 4+invoices.stream().mapToInt(i->i.settlement().equals("CASH")?5:2).sum(); }
+    private int graphRequests() {
+        return 4+(remote.has("default_payment_method")?1:0)+invoices.stream().mapToInt(i->i.settlement().equals("CASH")?5:2).sum();
+    }
 
     private PriceId targetPrice(String key) {
         var target=new PriceId(UUID.randomUUID());

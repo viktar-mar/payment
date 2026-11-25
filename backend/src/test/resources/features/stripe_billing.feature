@@ -32,6 +32,20 @@ Feature: Stripe Billing through the configured application and official SDK
     And Stripe reports the original trial subscription paused
     Then the same subscription is paused without debt or a new invoice or payment
 
+  @billing-trial-resume
+  Scenario: A paused optional trial resumes only after verified cash for its explicit resumption
+    Given an owned Stripe Billing subscription with 7 trial days
+    When its original zero Stripe trial invoice is reconciled
+    And the trial reaches its exact end without a payment method
+    And Stripe reports the original trial subscription paused
+    Then the same subscription is paused without debt or a new invoice or payment
+    When the customer sets up a card for that Stripe subscription
+    Then the card is saved without resuming the subscription or collecting cash
+    When the customer explicitly resumes and Stripe leaves its new invoice open
+    Then the resumption remains pending without paid access
+    When the original resumption invoice has verified cash
+    Then that payment restores access once and preserves the original zero trial invoice
+
   Scenario: Verified renewal cash advances the existing subscription
     Given an owned Stripe Billing subscription with 0 trial days
     When its initial Stripe invoice is verified through a signed receipt
