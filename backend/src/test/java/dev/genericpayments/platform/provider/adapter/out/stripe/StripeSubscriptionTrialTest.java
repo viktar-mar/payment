@@ -5,10 +5,13 @@ import dev.genericpayments.platform.subscriptions.application.model.Subscription
 import dev.genericpayments.platform.subscriptions.domain.*;
 import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionBillingProofStore;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.*;
+import dev.genericpayments.platform.provider.application.model.ProviderOperation;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
 import java.time.*;
 import java.util.*;
 import org.junit.jupiter.api.*;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /** Synthetic owned SDK peer only. Real SQL/eligibility transactions are hosted separately. */
 class StripeSubscriptionTrialTest {
@@ -164,18 +167,52 @@ class StripeSubscriptionTrialTest {
         assertThat(f.graph.http.calls().stream().filter(c->c.path().equals("/v1/subscriptions")&&c.method().equals("POST"))).singleElement().satisfies(c->{assertThat(c.header("Idempotency-Key")).isEqualTo(f.operation.providerOperationKey());assertThat(c.form()).containsEntry("default_payment_method","pm_owned");});
         org.mockito.Mockito.verify(guard,org.mockito.Mockito.atLeast(2)).requireCurrent(command,fence);
     }
-    @Test void setupForOneSubscriptionNeverChangesAnotherWithTheSameCustomer(){
+    @ParameterizedTest @ValueSource(strings={"sub_owned","sub_other"})
+    void methodUpdateRequiresTheOriginalSubscriptionEvenForTheSameCustomer(String acknowledgedSubscription){
         var before=f.local;f.local=StripeSubscriptionCreateTest.copy(before,"sub_owned",Subscription.Status.ACTIVE);
         var o=f.operation;f.operation=new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),o.subscriptionId(),SubscriptionOperation.Kind.SETUP,o.status(),o.authorityScope(),o.keyDigest(),"b".repeat(64),"subscription:"+f.account.id().value()+":"+o.id()+":SETUP",o.expectedRevision(),o.policyVersion(),"sub_owned",null,o.createdAt(),o.updatedAt(),o.version());configure();
         var terms=before.billingPrice();var product=new dev.genericpayments.platform.catalog.domain.ProductId(UUID.randomUUID());var otherTerms=new SubscriptionPriceTerms(new dev.genericpayments.platform.catalog.domain.PriceId(UUID.randomUUID()),"other",1,product,terms.regularAmount(),terms.interval(),terms.trialDays(),terms.trialPolicy(),terms.taxMode());
         var other=new Subscription(UUID.randomUUID(),before.siteId(),before.customerId(),product,before.paymentAccountId(),otherTerms,otherTerms,Subscription.Status.ACTIVE,"sub_other",before.currentPeriod(),before.paidThrough(),null,null,null,null,null,0,before.createdAt(),before.updatedAt(),null);
+        var siblingProof=new SubscriptionBillingProofStore.Setup(UUID.randomUUID(),other.id(),f.account.id(),UUID.randomUUID(),"seti_other","pm_other");
+        proofs.setups.put(siblingProof.operation(),siblingProof);
         var setup=setupJson("requires_payment_method");f.identity();f.graph.http.respond("POST","/v1/setup_intents",setup.toString());
         var command=new Command(f.account,f.operation,f.local.billingPrice(),null,"sub_owned",null,null,true,false);f.adapter.setup(command);
         var guard=org.mockito.Mockito.mock(dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionSetupContinuationGuard.class);org.springframework.test.util.ReflectionTestUtils.setField(f.adapter,"continuationGuard",guard);
-        setup.addProperty("status","succeeded");setup.addProperty("payment_method","pm_owned");f.identity();f.graph.http.respond("GET","/v1/setup_intents/seti_owned",setup.toString());f.graph.http.respond("GET","/v1/payment_methods/pm_owned","{\"id\":\"pm_owned\",\"object\":\"payment_method\",\"livemode\":false,\"customer\":\"cus_owned\",\"type\":\"card\",\"card\":{\"brand\":\"visa\"}}");f.identity();
-        var remote=f.graph.subscription;remote.addProperty("default_payment_method","pm_owned");f.graph.http.respond("POST","/v1/subscriptions/sub_owned",remote.toString());
-        assertThatCode(()->assertThat(f.adapter.continueOriginalSetup(command,new InboxSetupFence(new dev.genericpayments.platform.webhooks.application.port.out.SubscriptionInboxPort.Claim(UUID.randomUUID(),"owned"))).progressed()).isTrue()).doesNotThrowAnyException();
+        setup.addProperty("status","succeeded");setup.addProperty("payment_method","pm_owned");
+        Runnable observeSetup=()->{
+            f.identity();
+            f.graph.http.respond("GET","/v1/setup_intents/seti_owned",setup.toString());
+            f.graph.http.respond("GET","/v1/payment_methods/pm_owned","{\"id\":\"pm_owned\",\"object\":\"payment_method\",\"livemode\":false,\"customer\":\"cus_owned\",\"type\":\"card\",\"card\":{\"brand\":\"visa\"}}");
+        };
+        observeSetup.run();
+        f.identity();
+        var remote=f.graph.subscription.deepCopy();
+        remote.addProperty("id",acknowledgedSubscription);
+        remote.addProperty("default_payment_method","pm_owned");
+        f.graph.http.respond("POST","/v1/subscriptions/sub_owned",remote.toString());
+        var fence=new InboxSetupFence(new dev.genericpayments.platform.webhooks.application.port.out.SubscriptionInboxPort.Claim(UUID.randomUUID(),"owned"));
+        var reply=f.adapter.continueOriginalSetup(command,fence).reply();
+        String methodKey=f.operation.providerOperationKey()+":METHOD";
+        var methodStep=f.steps.find(f.account.id(),methodKey).orElseThrow();
+        if(acknowledgedSubscription.equals(f.local.providerReference())){
+            assertThat(reply.outcome()).isEqualTo(Outcome.ACCEPTED);
+            assertThat(methodStep.status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
+            assertThat(methodStep.providerReference()).isEqualTo(f.local.providerReference());
+            observeSetup.run();
+            assertThat(f.adapter.continueOriginalSetup(command,fence).reply()).isEqualTo(reply);
+            assertThat(f.steps.find(f.account.id(),methodKey)).contains(methodStep);
+        }else{
+            assertThat(reply.outcome()).isEqualTo(Outcome.UNKNOWN);
+            assertThat(methodStep.status()).isEqualTo(ProviderOperation.Status.UNKNOWN);
+            assertThat(methodStep.providerReference()).isNull();
+        }
         assertThat(f.graph.http.calls().stream().filter(c->c.method().equals("POST"))).extracting(c->c.path()).containsExactly("/v1/setup_intents","/v1/subscriptions/sub_owned");
+        assertThat(f.graph.http.calls().stream().filter(c->c.method().equals("POST")&&c.path().equals("/v1/subscriptions/sub_owned")))
+            .singleElement().satisfies(c->{
+                assertThat(c.header("Idempotency-Key")).isEqualTo(methodKey);
+                assertThat(c.form()).containsExactlyEntriesOf(Map.of("default_payment_method","pm_owned"));
+            });
+        assertThat(proofs.method(f.account.id(),other.id(),"pm_other")).contains(siblingProof);
         assertThat(proofs.method(f.account.id(),other.id(),"pm_owned")).isEmpty();assertThat(proofs.method(f.account.id(),f.local.id(),"pm_owned")).isPresent();
     }
     @Test void explicitResumeBindsOnlyItsOriginalResultInvoiceAndDoesNotGrantFromAck(){
