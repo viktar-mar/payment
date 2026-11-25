@@ -5,6 +5,7 @@ import type {GenericSubscriptionManager} from '@generic-payments/sdk';
 import type {ManagerState} from '../../../../frontend/sdk/src/subscriptions/manager-state';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
 import {acceptanceBrowserFailure,finishBrowserCleanup,rememberBrowserProviderOrigin} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
+import type {RefusedIssuerRelation} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 // @ts-ignore Native Node and bundlers use the same shared provider origin policy.
 import {providerOrigin,providerNetworkOrigin} from './stripe-provider-origin.ts';
 // @ts-ignore Node's offline test entry consumes source.
@@ -217,14 +218,21 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
  const exactInitialCheckout=!!(retryPort||challenge);
  const bound=!!(retryPort||challenge||invoiceCase),guarded=!!(cancellationPort||bound);
  const lifecycle=new AbortController();
+ const ownerLimits=limits;
  limits={deadline:limits.deadline,signal:limits.signal?AbortSignal.any([limits.signal,lifecycle.signal]):lifecycle.signal};
  let context:BrowserContext|undefined,abandoned=false,closing:Promise<void>|undefined,failure=false;
  let checkpoint='BROWSER',firstFailure:string|undefined,cleanupConfirmed=false;
- let refusedOrigin:{runId:string;expectedSource:string;origin:string}|undefined;
+ let refusedOrigin:{runId:string;expectedSource:string;origin:string;issuerRelation:Promise<RefusedIssuerRelation>}|undefined;
  const recordFailure=(code=checkpoint)=>{firstFailure??=code;failure=true;};
  const close=(ctx:BrowserContext)=>{closing??=ctx.close();void closing.catch(()=>{});return closing;};
  const opening=browser.newContext({serviceWorkers:'block',acceptDownloads:false});void opening.then(c=>{if(abandoned)return close(c);},()=>{}).catch(()=>{});
- const abort=()=>{abandoned=true;lifecycle.abort();if(context)void close(context);};limits.signal?.addEventListener('abort',abort,{once:true});
+ const abort=()=>{
+  abandoned=true;lifecycle.abort();
+  const current=context;
+  if(!current)return;
+  if(refusedOrigin)void refusedOrigin.issuerRelation.then(()=>close(current)).catch(()=>{});
+  else void close(current);
+ };limits.signal?.addEventListener('abort',abort,{once:true});
  const pending=new Set<Promise<void>>();
  try{
   context=await billingBounded(limits,()=>opening);const page=await billingBounded(limits,()=>context!.newPage()),binding=port.resources();
@@ -418,7 +426,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     if(tokenPath){report('BROWSER_PROVIDER_ROUTE_PAY');await checkManager();samePay();sameFrames();}
    }
    report('BROWSER_PROVIDER_FALLBACK');
-   await route.fallback();
+   check();await route.fallback();
   }
   const check=()=>{billingCheck(limits);if(failure||abandoned)fail();};
   if(guarded){
@@ -462,7 +470,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
       need(req.frame()===page.mainFrame() && !req.isNavigationRequest() && !req.redirectedFrom());
       if(originalManager)await checkManager();
      }
-     await route.continue();
+     check();await route.continue();
     }
     if(method==='OPTIONS' || method==='GET'){
      // The SDK may start its reads before the controller parses the CREATE response.
@@ -537,8 +545,15 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
     const dispatch=successor?{beforeDispatch:(_kind:unknown,key:string)=>retryPort!.beforeSuccessorConfirm(key,{subscriptionId,operationId,attemptId})}:port;
     await forwardBillingDispatch(route,dispatch,binding,authority,'confirm',{subscriptionId,operationId,attemptId},limits,confirmation,checkManager,redirects?.authorize,invoiceCase?.releaseOriginalConfirm);
    }catch{
-    if(!firstFailure&&origin)refusedOrigin={runId:binding.runId,expectedSource:binding.expectedSource,origin};
-    recordFailure(routeCheckpoint);abort();await route.abort('failed').catch(()=>{});
+    const capture=!firstFailure&&origin?sca:undefined;
+    recordFailure(routeCheckpoint);
+    if(capture&&origin){
+     const blocked=route.abort('failed').catch(()=>{});
+     refusedOrigin={runId:binding.runId,expectedSource:binding.expectedSource,origin,
+      issuerRelation:capture.refusedIssuerRelation(route.request(),ownerLimits)};
+     abort();await blocked;return;
+    }
+    abort();await route.abort('failed').catch(()=>{});
    }})();pending.add(work);void work.finally(()=>pending.delete(work));return work;
   });
   const url=new URL('/',binding.endpoints.demo);
@@ -791,6 +806,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
  }catch{recordFailure();}
  finally{
   abandoned=true;limits.signal?.removeEventListener('abort',abort);lifecycle.abort();
+  await refusedOrigin?.issuerRelation;
   if(context)try{
    await billingBounded({deadline:Date.now()+15000},async()=>{await close(context!);await Promise.allSettled(pending);});
    cleanupConfirmed=true;
@@ -799,7 +815,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
  if(firstFailure || guarded && failure){
   if(!bound)fail();
   const error=acceptanceBrowserFailure(firstFailure??checkpoint);
-  if(refusedOrigin)rememberBrowserProviderOrigin(error,refusedOrigin.runId,refusedOrigin.expectedSource,refusedOrigin.origin);
+  if(refusedOrigin)rememberBrowserProviderOrigin(error,refusedOrigin.runId,refusedOrigin.expectedSource,refusedOrigin.origin,await refusedOrigin.issuerRelation);
   finishBrowserCleanup(error,cleanupConfirmed);
   throw error;
  }

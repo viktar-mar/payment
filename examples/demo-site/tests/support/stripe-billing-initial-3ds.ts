@@ -1,6 +1,7 @@
 import {createHash,randomUUID} from 'node:crypto';
 import type {Frame,Page,Request,Route} from '@playwright/test';
 import type {BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
+import type {RefusedIssuerRelation} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
 
 function requireValue(value:unknown):asserts value {if(!value)throw Error('billing_BROWSER');}
@@ -43,13 +44,18 @@ export function challengeSource(raw:unknown,secret:string,report?:(code:string)=
  requireValue(!/[^A-Za-z0-9_-]/.test(source));
  return source;
 }
-export function issuerBinding(raw:unknown){
+function observedIssuerBinding(raw:unknown){
  const result=object(raw),ares=object(result.ares);
  requireValue(result.state==='challenge_required' && ares.messageType==='ARes' && ares.transStatus==='C' &&
   typeof ares.messageVersion==='string' && /^2\.\d\.\d$/.test(ares.messageVersion) && uuid(ares.threeDSServerTransID) &&
   uuid(ares.acsTransID) && ares.acsTransID!==ares.threeDSServerTransID);
- const url=exactUrl(ares.acsURL);requireValue(url.origin===issuerOrigin);
+ const url=exactUrl(ares.acsURL);
  return Object.freeze({url:url.href,version:ares.messageVersion,acs:ares.acsTransID,server:ares.threeDSServerTransID});
+}
+export function issuerBinding(raw:unknown){
+ const value=observedIssuerBinding(raw);
+ requireValue(new URL(value.url).origin===issuerOrigin);
+ return value;
 }
 export function matchingChallengeRequest(binding:ReturnType<typeof issuerBinding>,url:string,body:string|null){
  try{
@@ -90,7 +96,8 @@ function sameChain(a:FrameSnapshot|undefined,b:FrameSnapshot|undefined){
 
 /** Scoped to one original v2 session. Only Stripe.js sends requests and only the issuer UI completes the challenge. */
 export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,check,stripeFrames,waitForGesture}:Options){
- let retrieve:Request|undefined,authenticate:Request|undefined,completed=false,finalRead=false,boundSource:string|undefined;
+ let retrieve:Request|undefined,authenticate:Request|undefined,admittedAuthenticate:Request|undefined;
+ let completed=false,finalRead=false,boundSource:string|undefined;
  let issuer:Frame|undefined,issuerRequest:Request|undefined,submission:Request|undefined,binding:ReturnType<typeof issuerBinding>|undefined;
  let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:Promise<void>}|undefined;
  const issuerReady=Promise.withResolvers<void>(),issuerDispatched=Promise.withResolvers<void>(),navigation=new WeakMap<Frame,number>();
@@ -131,6 +138,39 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   const bytes=await billingBounded(limits,()=>response.body());requireValue(bytes.length<=65536);
   return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)) as unknown;
  }
+ // Descriptive only. Capture the refused frame shape, then read only the
+ // response to the authenticate POST already admitted by the browser guard.
+ async function refusedIssuerRelation(request:Request,active:BillingLimits):Promise<RefusedIssuerRelation>{
+  let parentOrigin:string,url:string,data:string|null;
+  try{
+   if(request.method()!=='POST'||!request.isNavigationRequest()||request.resourceType()!=='document'||request.redirectedFrom())return 'NOT_ISSUER_POST';
+   const target=request.frame();frameChain(target);
+   const parent=target.parentFrame()!;
+   parentOrigin=new URL(parent.url()==='about:blank'?parent.parentFrame()!.url():parent.url()).origin;
+   url=request.url();data=request.postData();
+  }catch{return 'ISSUER_FRAME_UNVERIFIED';}
+  const original=admittedAuthenticate;
+  if(!original)return 'AUTHENTICATE_NOT_ADMITTED';
+  try{
+   return await billingBounded(active,async diagnostic=>{
+    const headers=await request.allHeaders();
+    if(headers['content-type']?.split(';')[0]!=='application/x-www-form-urlencoded'||headers.origin!==parentOrigin||
+       headers.cookie||headers.authorization||headers['proxy-authorization']||headers['stripe-account']||headers['stripe-context'])return 'ISSUER_FRAME_UNVERIFIED';
+    const response=await originalResponse(original,diagnostic,750);
+    requireValue(response.status()===200);
+    const encoding=await response.headerValue('content-encoding');
+    if(encoding!==null&&encoding.trim().toLowerCase()!=='identity')return 'AUTHENTICATE_BODY_UNBOUNDED';
+    const {responseBodySize}=await original.sizes();
+    if(!Number.isSafeInteger(responseBodySize)||responseBodySize<1||responseBodySize>65536)return 'AUTHENTICATE_BODY_UNBOUNDED';
+    billingCheck(diagnostic);
+    const bytes=await response.body();
+    billingCheck(diagnostic);requireValue(bytes.length<=65536);
+    const observed=observedIssuerBinding(JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)));
+    if(observed.url!==url)return 'ISSUER_URL_MISMATCH';
+    return matchingChallengeRequest(observed,url,data)?'ISSUER_TRANSACTION_MATCH':'ISSUER_TRANSACTION_MISMATCH';
+   },750);
+  }catch{return 'AUTHENTICATE_UNVERIFIED';}
+ }
  const owns=(url:URL)=>url.origin===issuerOrigin || url.origin==='https://api.stripe.com' &&
   (url.pathname.startsWith('/v1/payment_intents/') || url.pathname.startsWith('/v1/3ds2/'));
  async function forward(route:Route,url:URL,report:(code:string)=>void){
@@ -160,6 +200,8 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    await authorizeResponse(request);
    await current();
    report('BROWSER_CHALLENGE_ROUTE_FORWARD');
+   billingCheck(limits);
+   if(request===authenticate)admittedAuthenticate=request;
    await route.continue();
   };
   if(api){
@@ -278,7 +320,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    node.addEventListener('click',event=>{if(event.isTrusted)void send(nonce).catch(()=>{});},{capture:true,once:true});
   },{name,nonce});
   arm=armed;
-  await validate();await element.click({timeout:Math.min(5000,limits.deadline-Date.now()),noWaitAfter:true});
+  await validate();billingCheck(limits);await element.click({timeout:Math.min(5000,limits.deadline-Date.now()),noWaitAfter:true});
   // Acknowledgement requires the issuer's own 2xx response to the original trusted form submission.
   await billingBounded(limits,async l=>{
    await issuerDispatched.promise;
@@ -286,5 +328,5 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    requireValue(await issuerResponded(l,45000));
   },45000);
  }
- return {owns,forward,attend};
+ return {owns,forward,attend,refusedIssuerRelation};
 }

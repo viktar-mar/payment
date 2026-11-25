@@ -2278,7 +2278,7 @@ for(const selectedCase of ['initial_3ds','initial_decline_retry'])test('only the
  await b.prepare(limits);await b.persistWebhookSecret(SECRET);await b.start(limits);
  try{
   if(selectedCase!=='initial_3ds'){assert.equal(b.persistRefusedStripeOrigin,undefined);return;}
-  const checkpoint='BROWSER_PROVIDER_ORIGIN_STRIPE_COM',witness={...refusedWitness(),checkpoint};
+  const checkpoint='BROWSER_PROVIDER_ORIGIN_STRIPE_COM',witness={...refusedWitness(),checkpoint,issuerRelation:'ISSUER_TRANSACTION_MATCH'};
   const before=b.resources(),ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents);
   assert.equal(await b.persistRefusedStripeOrigin(witness,limits),true);
   const entry=f.files.get(refusedOriginPath);

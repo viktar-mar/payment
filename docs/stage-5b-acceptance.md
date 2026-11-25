@@ -70,6 +70,10 @@ Run `6d79cff0-9d57-46ec-bbde-221eabef28a6` at `3beab66` passed the earlier pairi
 
 For a future occurrence after challenge dispatch, the runner keeps only the canonical refused origin in a private file bound to the fresh run and source. The route still aborts and the terminal report still contains the same fixed category. Offline regressions test both the private write and the refusal before operator handoff. The completed Sandbox attempt cannot supply the missing origin.
 
+Run `2c44cf42-28fb-47e4-983a-143815ce285a` at `6427839` again recorded `REQUIRES_ACTION` and `CHALLENGE_DISPATCH`. It stopped with the same refusal before publishing the operator form. All seven containers exited and the listener stopped. The private report verified the exact canonical origin for this run. It does not show whether the blocked request was the issuer's CReq navigation. [Local completion report](../.superpowers/native-initial-3ds/2c44cf42-28fb-47e4-983a-143815ce285a/completion.json)
+
+The diagnostic now blocks the request, then checks whether it matches the ARes URL and transaction fields from the original admitted Stripe authentication response. This local observation has a 750 ms limit. The private report retains one fixed relation category. The issuer origin policy, action budget and terminal result stay as before.
+
 ### Earlier initial-decline and Retry attempts
 
 The first native initial-decline/retry attempt, `a35eb316-f842-42b7-a1b0-157f942a8e99` at `d8bebcf163b3457e68f412ed4e6b7c582d349e69`, exited 1 with `phase=RETRY_ACK code=BROWSER cleanup=UNCONFIRMED`. The last durable operation was `CREATE_ACK`. The ledger contains no first confirmation, Retry or successor confirmation dispatch. The phase label is shared by several acknowledgements, including creation, and leaves the exact browser failure undetermined. A separate check found all seven containers exited and no Stripe listener for this run. Initial decline and retry remain pending native evidence.

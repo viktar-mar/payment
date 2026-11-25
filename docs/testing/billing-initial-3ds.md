@@ -16,6 +16,8 @@ There is one subscription creation, one confirmation and one SDK challenge. When
 
 If a refused Stripe.com origin is the first failure after the challenge dispatch receipt, the runner attempts one write to `test-results/stripe-sandbox/<run-uuid>/refused-provider-origin.private.json` from the repository root. The owner-only file contains the canonical origin, run ID, source and fixed checkpoint. Keep the file in the private run directory. The terminal marker reports only the checkpoint, and the blocked request remains blocked if the file cannot be written.
 
+The private `issuerRelation` field records whether the refused form navigation matches the URL and 3DS transaction fields of the original Stripe authentication response. The runner aborts the route before reading that response and stops the read after 750 ms. It reads only an uncompressed response with a measured body size up to 64 KiB. A match is diagnostic evidence only. The request path, query, form data and response body are discarded.
+
 ## What establishes a pass
 
 The original confirmation attempt must retain its winning `REQUIRES_ACTION` receipt. The terminal server records must show one paid invoice and one EUR 20 payment for the bound subscription, with matching journal entries and signed site callbacks. A separate read of the original PaymentIntent and latest captured Charge must show an authenticated 3DS 2.x challenge. Frictionless authentication, a different Charge or a second charge fails the check.

@@ -54,6 +54,21 @@ test('foreign values and unreadable proxies cannot supply provenance',()=>{
 });
 
 const originRun='11111111-2222-4333-8444-000000000001',originSource='a'.repeat(40);
+test('private issuer relation is fixed and scoped to the 3DS refusal witness',()=>{
+ const origin='https://unlisted-fixture.stripe.com',checkpoint='BROWSER_PROVIDER_ORIGIN_STRIPE_COM';
+ const fresh=()=>privateOrigin.acceptanceBrowserFailure(checkpoint);
+ const relation='ISSUER_TRANSACTION_MATCH';
+ const error=fresh();
+ assert.equal(privateOrigin.rememberBrowserProviderOrigin(error,originRun,originSource,origin,relation),true);
+ const witness=privateOrigin.browserProviderOrigin(error);
+ assert.deepEqual(witness,{runId:originRun,expectedSource:originSource,origin,checkpoint,issuerRelation:relation});
+ assert.equal(privateOrigin.isBrowserProviderOriginWitness(witness),true);
+ assert.equal(privateOrigin.isBrowserProviderOriginWitness({...witness,checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'}),false);
+ assert.equal(privateOrigin.rememberBrowserProviderOrigin(fresh(),originRun,originSource,origin,'private canary'),false);
+ assert.equal(privateOrigin.isBrowserProviderOriginWitness({...witness,issuerRelation:42}),false);
+ assert.equal(privateOrigin.isBrowserProviderOriginWitness({...witness,get issuerRelation(){assert.fail('must not read accessor');}}),false);
+ assert.equal(JSON.stringify(error),'{}');
+});
 test('only the acceptance Stripe.com refusal retains its previously unrecognized origin',()=>{
  const checkpoint='BROWSER_PROVIDER_ORIGIN_STRIPE_COM',origin='https://m.stripe.com';
  const fresh=()=>privateOrigin.acceptanceBrowserFailure(checkpoint);

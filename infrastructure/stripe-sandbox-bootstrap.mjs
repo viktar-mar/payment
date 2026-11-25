@@ -830,7 +830,8 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
         external?.addEventListener('abort',abort,{once:true});if(external?.aborted)abort();
         const work=(async()=>{
           await ownership();
-          const contents=JSON.stringify({runId:snapshot.runId,expectedSource:snapshot.expectedSource,checkpoint,origin:snapshot.origin})+'\n';
+          const contents=JSON.stringify({runId:snapshot.runId,expectedSource:snapshot.expectedSource,checkpoint,origin:snapshot.origin,
+            ...(Object.hasOwn(snapshot,'issuerRelation')?{issuerRelation:snapshot.issuerRelation}:{})})+'\n';
           if(Buffer.byteLength(contents)>1024)fail();current();
           await exclusiveFile(directory+'/refused-provider-origin.private.json',contents,context,false,current);
           await ownership();return true;

@@ -120,6 +120,8 @@ const stripeCom='BROWSER_PROVIDER_ORIGIN_STRIPE_COM';
 const stripeComOther='BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER';
 const generalOther='BROWSER_PROVIDER_ORIGIN_OTHER';
 const stripeNetwork='BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK';
+const issuerRelations=new Set(['NOT_ISSUER_POST','ISSUER_FRAME_UNVERIFIED','AUTHENTICATE_NOT_ADMITTED','AUTHENTICATE_UNVERIFIED','AUTHENTICATE_BODY_UNBOUNDED',
+ 'ISSUER_URL_MISMATCH','ISSUER_TRANSACTION_MISMATCH','ISSUER_TRANSACTION_MATCH']);
 function providerOriginIdentity(runId,expectedSource,origin,checkpoint){
  if(typeof runId!=='string'||runId.length!==36||!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(runId)||
     typeof expectedSource!=='string'||expectedSource.length!==40||!/^[0-9a-f]{40}$/.test(expectedSource)||
@@ -153,8 +155,9 @@ function providerOriginIdentity(runId,expectedSource,origin,checkpoint){
 export function isBrowserProviderOriginWitness(value){
  try{
   if(!value||typeof value!=='object'||Object.getPrototypeOf(value)!==Object.prototype)return false;
-  const keys=Reflect.ownKeys(value),tagged=keys.includes('checkpoint');
+  const keys=Reflect.ownKeys(value),tagged=keys.includes('checkpoint'),hasRelation=keys.includes('issuerRelation');
   const names=tagged?['runId','expectedSource','origin','checkpoint']:['runId','expectedSource','origin'];
+  if(hasRelation)names.push('issuerRelation');
   if(keys.length!==names.length)return false;
   const fields=Object.create(null);
   for(const name of names){
@@ -163,15 +166,20 @@ export function isBrowserProviderOriginWitness(value){
    fields[name]=descriptor.value;
   }
   if(tagged&&fields.checkpoint!==generalOther&&fields.checkpoint!==stripeNetwork&&fields.checkpoint!==stripeCom)return false;
+  if(hasRelation&&(fields.checkpoint!==stripeCom||!issuerRelations.has(fields.issuerRelation)))return false;
   return providerOriginIdentity(fields.runId,fields.expectedSource,fields.origin,tagged?fields.checkpoint:stripeComOther);
  }catch{return false;}
 }
-export function rememberBrowserProviderOrigin(error,runId,expectedSource,origin){
+export function rememberBrowserProviderOrigin(error,runId,expectedSource,origin,issuerRelation){
  const checkpoint=browserDiagnostic(error);
  if(!checkpoint||(checkpoint===stripeCom&&browserDiagnostic(error,'ACCEPTANCE')!==stripeCom)||
     providerOrigins.has(error)||!providerOriginIdentity(runId,expectedSource,origin,checkpoint))return false;
  const witness={runId,expectedSource,origin};
  if(checkpoint!==stripeComOther)witness.checkpoint=checkpoint;
+ if(issuerRelation!==undefined){
+  if(checkpoint!==stripeCom||!issuerRelations.has(issuerRelation))return false;
+  witness.issuerRelation=issuerRelation;
+ }
  providerOrigins.set(error,Object.freeze(witness));return true;
 }
 export const browserProviderOrigin=error=>providerOrigins.get(error)??null;

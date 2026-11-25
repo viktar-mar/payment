@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import type {Frame,Page,Request,Route} from '@playwright/test';
 // @ts-ignore Offline tests execute source.
-import {challengeSource,issuerBinding,matchingChallengeRequest,challengeApiRequest} from './stripe-billing-initial-3ds.ts';
+import {challengeSource,issuerBinding,matchingChallengeRequest,challengeApiRequest,initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 // @ts-ignore Native Node executes the same terminal decoder as the launcher.
 import {challengeTerminalLine} from './stripe-billing-initial-3ds-terminal.ts';
 
@@ -12,6 +13,22 @@ const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444
 const url='https://hooks.stripe.com/test-only-fixture?bound=1';
 const result={state:'challenge_required',ares:{messageType:'ARes',transStatus:'C',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,acsURL:url}};
 const form=(override={})=>new URLSearchParams({creq:Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,...override})).toString('base64url')}).toString();
+test('issuer traffic cannot continue when the lifetime ends after the last asynchronous guard',async()=>{
+ const controller=new AbortController(),frame={url:()=> 'https://js.stripe.com/v3/fixture.html'} as Frame;
+ const request={url:()=> 'https://api.stripe.com/v1/payment_intents/pi_test123?client_secret='+secret,frame:()=>frame,
+  method:()=> 'GET',postData:()=>null,isNavigationRequest:()=>false,redirectedFrom:()=>null,
+  allHeaders:async()=>({authorization:'Bearer '+key,origin:'https://js.stripe.com'})} as unknown as Request;
+ let forwarded=0;
+ const route={request:()=>request,continue:async()=>{forwarded++;}} as unknown as Route;
+ const driver=initial3dsChallenge({page:{on:()=>{}} as unknown as Page,
+  limits:{deadline:Date.now()+1000,signal:controller.signal},demo:'http://127.0.0.1:18081',owner:()=>({key,secret}),
+  winning:async()=>{},authorizeResponse:async()=>{},check:async()=>{},
+  stripeFrames:()=>({target:frame,frames:new Map([[frame,frame.url()]])}),waitForGesture:async()=>{}});
+ await assert.rejects(driver.forward(route,new URL(request.url()),step=>{
+  if(step==='BROWSER_CHALLENGE_ROUTE_FORWARD')controller.abort();
+ }),/billing_ABORTED/);
+ assert.equal(forwarded,0);
+});
 test('only the authenticated original test PI fingerprint supplies the challenge source',()=>{
  assert.equal(challengeSource(intent,secret),source);
  for(const changed of [{livemode:true},{id:'pi_other'},{client_secret:'other'},{status:'succeeded'},

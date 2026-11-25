@@ -122,7 +122,12 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const earlySuccessor=fault.startsWith('successor-static-image')&&request.url().endsWith('/client-session');
   const earlyStatic=((declineRetry||sca)&&earlyInitial)||(declineRetry&&earlySuccessor);
   const bodyAvailable=earlyStatic?Promise.withResolvers<void>():undefined;
-  const response = {request:()=>request,url:()=>request.url(),status:()=>status,fromServiceWorker:()=>false,body:async()=>{
+  const response = {request:()=>request,url:()=>request.url(),status:()=>status,
+   fromServiceWorker:()=>fault==='challenge-origin-worker'&&request.url()==='https://api.stripe.com/v1/3ds2/authenticate',body:async()=>{
+   if(request.url()==='https://api.stripe.com/v1/3ds2/authenticate'&&fault.startsWith('challenge-origin-')){
+    trace.push('read original authenticate');
+    if(fault==='challenge-origin-stalled')return new Promise<Buffer>(()=>{});
+   }
    if(request.url()===select && status!==200){
     sessionErrorBodyReads++;
     if(sessionFailure?.unreadable)throw Error('private diagnostic canary');
@@ -138,6 +143,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    }
    return Buffer.from(JSON.stringify(json));
   },headerValue:async(name:string)=>{
+   if(request.url()==='https://api.stripe.com/v1/3ds2/authenticate'&&name==='content-encoding')
+    return fault==='challenge-origin-compressed'?'gzip':null;
    if(name==='content-type')return sessionFailure?.contentType??null;
    if(name==='content-length')return sessionFailure?.contentLength===undefined?String(Buffer.byteLength(JSON.stringify(json))):sessionFailure.contentLength;
    return sessionFailure?.contentEncoding??null;
@@ -252,6 +259,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const headers=navigation?{'content-type':'application/x-www-form-urlencoded',origin:issuerDocument===issuerUrl?'https://hooks.stripe.com':'https://js.stripe.com'}:
    {authorization:'Bearer pk_test_fixture',origin:'https://js.stripe.com'};
   const request={url:()=>url,method:()=>data===null?'GET':'POST',frame:()=>target,isNavigationRequest:()=>navigation,resourceType:()=>navigation?'document':'xhr',
+   sizes:async()=>({responseBodySize:Buffer.byteLength(JSON.stringify(json))}),
    redirectedFrom:()=>null,postData:()=>data,allHeaders:async()=>headers,existingResponse:()=>lateRetrieve||lateIssuer?null:existing,
    response:async()=>{
     if(responseFault==='absent'||!existing)return null;
@@ -266,20 +274,26 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    assert.deepEqual(args,[]);providerSent.push(url);
    await reply('issuer',200);
    existing=publish(request,200,json);if(navigation){issuerDocument=url;navigate(issuer);}
-  },abort:async()=>{}} as unknown as Route);
+  },abort:async()=>{if(url.startsWith('https://unlisted-fixture.stripe.com/'))trace.push('abort refused issuer');}} as unknown as Route);
   if(closed)throw Error('closed');
  }
  async function challengeTraffic(){
   const secret=sessionFor(attempt!).client_secret,source='src_fixture',server=id(90),acs=id(91);
+  const refused='https://unlisted-fixture.stripe.com/private-path?query=private-canary';
+  const refusedIssuer=fault.startsWith('challenge-origin-');
   const target='https://api.stripe.com/v1/payment_intents/'+(fault==='foreign-next-pi'?'pi_other':'pi_original')+'?client_secret='+secret;
   const actionType=fault==='preexisting-issuer-challenge'?'stripe_3ds2_challenge':'stripe_3ds2_fingerprint';
   await wire(target,stripeFrame,null,{object:'payment_intent',livemode:false,id:'pi_original',client_secret:secret,status:'requires_action',
    next_action:{type:'use_stripe_sdk',use_stripe_sdk:{type:actionType,three_d_secure_2_source:source}}});
+  if(fault==='challenge-origin-before-authenticate')await wire(refused,issuer,'creq=fixture',{},true);
   await wire('https://api.stripe.com/v1/3ds2/authenticate',stripeFrame,'source='+(fault==='foreign-next-source'?'src_other':source),
-   {state:'challenge_required',ares:{messageType:'ARes',transStatus:'C',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,acsURL:issuerUrl}});
+   {state:'challenge_required',ares:{messageType:'ARes',transStatus:'C',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,
+    acsURL:refusedIssuer&&fault!=='challenge-origin-url'?refused:issuerUrl}});
   if(fault==='challenge-refused-origin')await provider('https://unlisted-fixture.stripe.com/private-path?query=private-canary');
-  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:fault==='wrong-issuer-transaction'?server:acs})).toString('base64url');
-  await wire(fault==='foreign-issuer-path'?issuerUrl+'/foreign':issuerUrl,issuer,'creq='+creq,{},true);
+  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,
+   acsTransID:['wrong-issuer-transaction','challenge-origin-transaction'].includes(fault)?server:acs})).toString('base64url');
+  await wire(refusedIssuer?refused:fault==='foreign-issuer-path'?issuerUrl+'/foreign':issuerUrl,
+   fault==='challenge-origin-foreign-frame'?stripeFrame:issuer,'creq='+creq,{},true);
  }
  async function send(url:string, value:object, result:object|null, status=202, method='POST') {
   const schedulePost = url===cancel, withdrawPost=url===cancel+'/withdraw';
@@ -1112,21 +1126,36 @@ const challengeRefusals:Record<string,string>={
  'late-issuer-response-service-worker':'BROWSER_CHALLENGE_WAIT',
  'late-issuer-response-status':'BROWSER_CHALLENGE_WAIT',
 };
-for(const fault of ['challenge-refused-origin','early-refused-origin'])test('3DS keeps only a private canonical origin after challenge dispatch: '+fault,async()=>{
+for(const [fault,issuerRelation] of [
+ ['challenge-refused-origin','NOT_ISSUER_POST'],
+ ['challenge-origin-match','ISSUER_TRANSACTION_MATCH'],
+ ['challenge-origin-url','ISSUER_URL_MISMATCH'],
+ ['challenge-origin-transaction','ISSUER_TRANSACTION_MISMATCH'],
+ ['challenge-origin-worker','AUTHENTICATE_UNVERIFIED'],
+ ['challenge-origin-before-authenticate','AUTHENTICATE_NOT_ADMITTED'],
+ ['challenge-origin-compressed','AUTHENTICATE_BODY_UNBOUNDED'],
+ ['challenge-origin-stalled','AUTHENTICATE_UNVERIFIED'],
+ ['challenge-origin-foreign-frame','ISSUER_FRAME_UNVERIFIED'],
+ ['early-refused-origin',null],
+] as const)test('3DS keeps only private origin and issuer relation after challenge dispatch: '+fault,{timeout:2400},async()=>{
  const f=cancellationPage(fault,false,true);
  await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+3000},async()=>{assert.fail('operator must remain locked');}),error=>{
   const checkpoint='BROWSER_PROVIDER_ORIGIN_STRIPE_COM';
   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),checkpoint);
   assert.equal(browserCleanupConfirmed(error),true);
-  assert.deepEqual(browserProviderOrigin(error),fault==='challenge-refused-origin'?{
-   runId:f.port.resources().runId,expectedSource:f.port.resources().expectedSource,checkpoint,origin:'https://unlisted-fixture.stripe.com',
+  assert.deepEqual(browserProviderOrigin(error),issuerRelation?{
+   runId:f.port.resources().runId,expectedSource:f.port.resources().expectedSource,checkpoint,origin:'https://unlisted-fixture.stripe.com',issuerRelation,
   }:null);
   assert.equal(JSON.stringify(error),'{}');
   return true;
  });
- assert.equal(f.trace.includes('persist challenge'),fault==='challenge-refused-origin');
+ assert.equal(f.trace.includes('persist challenge'),issuerRelation!==null);
  assert.equal(f.trace.includes('issuer Complete'),false);
  assert.equal(f.providerSent.some(url=>url.includes('unlisted-fixture')),false);
+ if(['challenge-origin-match','challenge-origin-stalled'].includes(fault))
+  assert.deepEqual(f.trace.filter(event=>event==='abort refused issuer'||event==='read original authenticate'),
+   ['abort refused issuer','read original authenticate']);
+ if(fault==='challenge-origin-compressed')assert.ok(!f.trace.includes('read original authenticate'));
 });
 for(const fault of ['none','late-source-valid','late-issuer-witness','replayed-next-ack','profile-retires','substituted-issuer-form','premature-sdk-complete','same-url-issuer-replaced',...Object.keys(challengeRefusals)]){
  test('the real browser journey requires one original issuer challenge: '+fault,async()=>{
