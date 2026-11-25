@@ -15,7 +15,8 @@ const reservedStripeHosts=new Set(['api','hooks','js','m','r','merchant-ui-api']
 const issuerAssetBlockLimit=6;
 export function issuerAssetSuffixMatches(kind:string,pathname:string):boolean{
  if(kind==='image')return /\.(?:png|jpe?g|gif|webp|ico)$/.test(pathname);
- return kind==='font'&&/\.woff2?$/.test(pathname);
+ if(kind==='font')return /\.woff2?$/.test(pathname);
+ return kind==='stylesheet'&&/\.css$/.test(pathname);
 }
 export function isApprovedIssuerOrigin(value:unknown):value is string{
  if(typeof value!=='string')return false;
@@ -308,17 +309,15 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     requireValue(url.href===url.origin+url.pathname && !url.pathname.includes('%'));
     report('BROWSER_CHALLENGE_ISSUER_ASSET_KIND');
     const kind=request.resourceType();
-    if(kind!=='image'&&kind!=='font'){
-     switch(kind){
-      case 'script': report('BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT');break;
-      case 'stylesheet': report('BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET');break;
-      case 'xhr': report('BROWSER_CHALLENGE_ISSUER_ASSET_XHR');break;
-      case 'fetch': report('BROWSER_CHALLENGE_ISSUER_ASSET_FETCH');break;
-      default: report('BROWSER_CHALLENGE_ISSUER_ASSET_OTHER');
-     }
-     requireValue(false);
+    switch(kind){
+     case 'image': report('BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX');break;
+     case 'font': report('BROWSER_CHALLENGE_ISSUER_ASSET_FONT_SUFFIX');break;
+     case 'stylesheet': report('BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET_SUFFIX');break;
+     case 'script': report('BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT');break;
+     case 'xhr': report('BROWSER_CHALLENGE_ISSUER_ASSET_XHR');break;
+     case 'fetch': report('BROWSER_CHALLENGE_ISSUER_ASSET_FETCH');break;
+     default: report('BROWSER_CHALLENGE_ISSUER_ASSET_OTHER');
     }
-    report(kind==='image'?'BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX':'BROWSER_CHALLENGE_ISSUER_ASSET_FONT_SUFFIX');
     requireValue(issuerAssetSuffixMatches(kind,url.pathname));
     report('BROWSER_CHALLENGE_ISSUER_ASSET_REPEAT');
     requireValue(!passiveBlocks.has(url.pathname));

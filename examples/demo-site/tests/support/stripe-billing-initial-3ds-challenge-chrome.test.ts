@@ -7,10 +7,11 @@ import {initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
 
 const stylesheetRejection='direct reviewed issuer stylesheet rejected';
+const stylesheetBlock='direct reviewed issuer passive stylesheet blocked';
 const twoFonts='direct reviewed issuer two passive fonts blocked';
 const sixFonts='direct reviewed issuer six passive fonts blocked';
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetRejection])
-test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before handoff':'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,stylesheetRejection])
+test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet with an unsupported suffix before handoff':'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
  const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
  const retrieve=api+'/v1/payment_intents/pi_fixture?client_secret='+secret+'&key='+key;
@@ -18,13 +19,15 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before 
  const outer=stripe+'/v3/three-ds-2-challenge-fixture.html',inner=stripe+'/v3/fixture-inner.html';
  const blocksPassiveImage=mode==='direct reviewed issuer passive image blocked';
  const blocksPassiveFont=mode==='direct reviewed issuer passive font blocked'||mode===twoFonts||mode===sixFonts;
- const blocksPassiveAsset=blocksPassiveImage||blocksPassiveFont;
+ const blocksPassiveStylesheet=mode===stylesheetBlock;
+ const blocksPassiveAsset=blocksPassiveImage||blocksPassiveFont||blocksPassiveStylesheet;
  const rejectsStylesheet=mode===stylesheetRejection;
  const direct=mode==='direct Stripe EMVCo frame'||mode==='direct reviewed issuer origin'||blocksPassiveAsset||rejectsStylesheet;
  const issuerName=direct?'stripe-challenge-frame':'acsFrame';
  const approvedIssuerOrigin=mode==='direct reviewed issuer origin'||blocksPassiveAsset||rejectsStylesheet?'https://reviewed-test-issuer.stripe.com':undefined;
  const issuerOrigin=approvedIssuerOrigin??'https://hooks.stripe.com',issuer=issuerOrigin+'/fixture-issuer',decision=issuer+'/decision';
- const passiveAsset=issuerOrigin+(rejectsStylesheet?'/fixture-private-stylesheet.css':blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png');
+ const passiveAsset=issuerOrigin+(rejectsStylesheet?'/fixture-private-stylesheet.scss':blocksPassiveStylesheet?'/fixture-passive.css':
+  blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png');
  const fontCount=mode===sixFonts?6:mode===twoFonts?2:1;
  const assetUrls=[passiveAsset,...Array.from({length:fontCount-1},(_,index)=>issuerOrigin+`/fixture-passive-${index+2}.woff2`)];
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
@@ -55,6 +58,7 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before 
    blocksPassiveFont?`<style>${assetUrls.map((url,index)=>`@font-face{font-family:FixturePassive${index};src:url("${url}") format("woff2")}`).join('')}</style>
      <script>Promise.allSettled([${assetUrls.map((_,index)=>`document.fonts.load('16px FixturePassive${index}','X')`).join(',')}])
        .then(results=>{if(results.every(result=>result.status==='rejected')){${revealButton}}})</script>`:
+   blocksPassiveStylesheet?`<link rel="stylesheet" href="${passiveAsset}" onerror="${revealButton}">`:
    rejectsStylesheet?`<link rel="stylesheet" href="${passiveAsset}" onload="${revealButton}">`:'');
  const responses=new Map<string,NonNullable<Parameters<Route['fulfill']>[0]>>([
   [demo+'/',{contentType:'text/html',body:'<!doctype html><link rel="icon" href="data:,"><iframe name="__privateStripeFrame7" src="'+outer+'"></iframe>'}],
@@ -168,7 +172,7 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before 
     page.goto(demo+'/',{waitUntil:'domcontentloaded',timeout:7_000}),
    ]);
    assert.equal(attachedIssuerFrame,true);
-   assert.equal(refusals[0],'BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET');
+   assert.equal(refusals[0],'BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET_SUFFIX');
    // The owner retains the first failure. Chromium can also report its abort at the response guard.
    assert.ok(refusals.length===1||refusals.length===2&&refusals[1]==='BROWSER_GUARD_RESPONSE_NETWORK');
    assert.equal(stylesheetErrorRedacted,true);
@@ -205,7 +209,8 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before 
    assert.equal(passiveFailures.length,assetUrls.length);
    for(const asset of passiveRequests){
     assert.equal(asset.method(),'GET');
-    assert.equal(asset.resourceType(),blocksPassiveFont?'font':'image');
+    assert.equal(asset.postDataBuffer(),null);
+    assert.equal(asset.resourceType(),blocksPassiveFont?'font':blocksPassiveStylesheet?'stylesheet':'image');
     assert.equal(asset.isNavigationRequest(),false);
     assert.equal(asset.frame(),issuerFrame);
     assert.equal(asset.serviceWorker(),null);

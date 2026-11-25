@@ -328,8 +328,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      if(fault.startsWith('approved-issuer-block-batch-')){
       for(let index=2;index<=5;index++)await requestPassiveIssuerAsset('font',index);
       if(fault==='approved-issuer-block-batch-shared-deadline')advancePassiveClock(600);
-      await requestPassiveIssuerAsset('font',6);
-      if(fault==='approved-issuer-block-batch-overflow')await requestPassiveIssuerAsset('font',7);
+      await requestPassiveIssuerAsset('stylesheet',6);
+      if(fault==='approved-issuer-block-batch-overflow')await requestPassiveIssuerAsset('stylesheet',7);
       if(fault==='approved-issuer-block-batch-repeat')await requestPassiveIssuerAsset();
       if(fault==='approved-issuer-block-batch-script')await wire(approvedFixtureIssuer+'/fixture-passive.js',issuer,null,{},false,'script');
      }
@@ -353,7 +353,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      await new Promise(resolve=>setTimeout(resolve,25));
     if(fault==='approved-issuer-block-shared-deadline'&&ordinal===2)advancePassiveClock(151);
     if(fault==='approved-issuer-block-batch-shared-deadline'&&ordinal===6)advancePassiveClock(151);
-    if(fault==='approved-issuer-block-response'||fault==='approved-issuer-block-font-response')await reply('passive',200).catch(()=>{});
+    if(fault==='approved-issuer-block-response'||fault==='approved-issuer-block-font-response'||
+       fault==='approved-issuer-block-stylesheet-response')await reply('passive',200).catch(()=>{});
     reply.failed();
     if(fault==='approved-issuer-block-replaced')navigate(issuer);
     if(!fault.endsWith('-missing-event')){
@@ -366,12 +367,14 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   }} as unknown as Route);
   if(closed)throw Error('closed');
  }
- function requestPassiveIssuerAsset(resource:'image'|'font'=fault.startsWith('approved-issuer-block-font-')?'font':'image',pathOrdinal=1){
+ function requestPassiveIssuerAsset(resource:'image'|'font'|'stylesheet'=fault.startsWith('approved-issuer-block-font-')?'font':
+  fault.startsWith('approved-issuer-block-stylesheet-')?'stylesheet':'image',pathOrdinal=1){
   const suffix=fault==='approved-issuer-block-suffix'?'.svg':
    fault==='approved-issuer-block-font-ttf'?'.ttf':
    fault==='approved-issuer-block-font-uppercase'?'.WOFF2':
    fault==='approved-issuer-block-font-woff'?'.woff':
-   resource==='font'||fault==='approved-issuer-block-image-font-suffix'?'.woff2':'.png';
+   fault==='approved-issuer-block-stylesheet-uppercase'?'.CSS':
+   resource==='font'||fault==='approved-issuer-block-image-font-suffix'?'.woff2':resource==='stylesheet'?'.css':'.png';
   const asset=approvedFixtureIssuer+'/fixture-passive'+(pathOrdinal===1?'':'-'+pathOrdinal)+suffix+
    (fault==='approved-issuer-block-query'?'?private=canary':'');
   const data=['approved-issuer-block-post','approved-issuer-block-body'].includes(fault)?'private=data':null;
@@ -1439,6 +1442,7 @@ for(const [suffix,expected,blocks] of [
  ['valid',null,1],
  ['font-woff',null,1],
  ['font-woff2',null,1],
+ ['stylesheet-css',null,1],
  ['inspector',null,1],
  ['gated',null,1],
  ['gated-pair',null,2],
@@ -1446,7 +1450,8 @@ for(const [suffix,expected,blocks] of [
  ['body','BROWSER_CHALLENGE_ISSUER_ASSET_METHOD',0],
  ['query','BROWSER_CHALLENGE_ISSUER_ASSET_PATH',0],
  ['resource-script','BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT',0],
- ['resource-stylesheet','BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET',0],
+ ['resource-stylesheet','BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET_SUFFIX',0],
+ ['stylesheet-uppercase','BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET_SUFFIX',0],
  ['resource-font','BROWSER_CHALLENGE_ISSUER_ASSET_FONT_SUFFIX',0],
  ['font-ttf','BROWSER_CHALLENGE_ISSUER_ASSET_FONT_SUFFIX',0],
  ['font-uppercase','BROWSER_CHALLENGE_ISSUER_ASSET_FONT_SUFFIX',0],
@@ -1487,6 +1492,7 @@ for(const [suffix,expected,blocks] of [
  ['replaced','BROWSER_CHALLENGE_ISSUER_ASSET_DOCUMENT',1],
  ['response','BROWSER_GUARD_RESPONSE_UNCLAIMED',1],
  ['font-response','BROWSER_GUARD_RESPONSE_UNCLAIMED',1],
+ ['stylesheet-response','BROWSER_GUARD_RESPONSE_UNCLAIMED',1],
 ] as const)test('owned issuer passive block without network: '+suffix,async t=>{
  let now=Date.now();
  if(suffix==='second-late'||suffix.endsWith('shared-deadline'))t.mock.method(Date,'now',()=>now);
