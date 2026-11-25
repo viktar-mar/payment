@@ -5,6 +5,8 @@ import {EventEmitter} from 'node:events';
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
 // @ts-ignore Offline protocol fixture registration.
 import {registerChromiumProtocolFixture} from './stripe-billing-chromium-route.ts';
+// @ts-ignore Offline tests use the same terminal decoder as the launcher.
+import {challengeTerminalLine} from './stripe-billing-initial-3ds-terminal.ts';
 
 const origins={backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081'};
 const protocolGuard=(page:object,onFailure:Parameters<typeof guardChallengeRedirects>[1])=>{
@@ -201,7 +203,9 @@ for(const mode of ['first navigation','ID owner','unnamed sibling','committed bl
   assert.deepEqual(refusals,denied?['BROWSER_GUARD_RESPONSE_UNCLAIMED']:mode==='redirect'?['BROWSER_GUARD_RESPONSE_REDIRECT']:[]);
  });
 
-for(const mode of ['eligible','redirect','not modified','missing request','foreign frame','unclaimed response','error response','network failure','foreign response']){
+for(const mode of ['eligible','redirect','not modified','missing request','foreign frame','unclaimed response','error response',
+ 'network failure','absent response network ID','unknown response network ID','missing response frame','foreign response frame',
+ 'foreign response URL','foreign response method']){
  test('Chromium response interception retains original bytes and stops '+mode,async()=>{
   const href='https://api.stripe.com/v1/3ds2/authenticate',location='https://js.stripe.com/v3/frame';
   const commands:string[]=[],events=new Map<string,(e:unknown)=>Promise<void>|void>(),refusals:string[]=[];
@@ -219,17 +223,26 @@ for(const mode of ['eligible','redirect','not modified','missing request','forei
    await assert.rejects(guard.authorize(request as never));assert.equal(commands.includes('Fetch.continueResponse'),false);return;
   }
   if(mode!=='unclaimed response')await guard.authorize(request as never);
-  await events.get('Fetch.requestPaused')!({requestId:'paused',networkId:'network',frameId:'frame',
-   request:{url:mode==='foreign response'?href+'x':href,method:'POST'},
+  await events.get('Fetch.requestPaused')!({requestId:'paused',
+   networkId:mode==='absent response network ID'?undefined:mode==='unknown response network ID'?'other-network':'network',
+   frameId:mode==='missing response frame'?undefined:mode==='foreign response frame'?'other-frame':'frame',
+   request:{url:mode==='foreign response URL'?href+'x':href,method:mode==='foreign response method'?'GET':'POST'},
    responseStatusCode:mode==='redirect'?307:mode==='not modified'?304:mode==='error response'?500:200,
    responseErrorReason:mode==='network failure'?'private failure canary':undefined});
   assert.equal(commands.includes('Fetch.continueResponse'),mode==='eligible');
   assert.equal(commands.includes('Fetch.failRequest'),mode!=='eligible');
-  const expected=mode==='redirect'?'BROWSER_GUARD_RESPONSE_REDIRECT':
-   mode==='error response'||mode==='not modified'?'BROWSER_GUARD_RESPONSE_STATUS':
-   mode==='network failure'?'BROWSER_GUARD_RESPONSE_NETWORK':
-   mode==='unclaimed response'?'BROWSER_GUARD_RESPONSE_UNCLAIMED':'BROWSER_GUARD_RESPONSE_PAIR';
-  assert.deepEqual(refusals,mode==='eligible'?[]:[expected]);
+  const expected:Record<string,string>={
+   redirect:'REDIRECT','error response':'STATUS','not modified':'STATUS','network failure':'NETWORK',
+   'unclaimed response':'UNCLAIMED','absent response network ID':'PAIR_NETWORK_ID',
+   'unknown response network ID':'PAIR_REQUEST_MISSING','missing response frame':'PAIR_FRAME_MISSING',
+   'foreign response frame':'PAIR_FRAME','foreign response URL':'PAIR_URL','foreign response method':'PAIR_METHOD',
+  };
+  const code='BROWSER_GUARD_RESPONSE_'+expected[mode];
+  assert.deepEqual(refusals,mode==='eligible'?[]:[code]);
+  if(mode!=='eligible'){
+   const line='owned_initial_3ds_terminal phase=BROWSER code='+code+' cleanup=CONFIRMED';
+   assert.equal(challengeTerminalLine(line),line);
+  }
  });
 }
 
@@ -265,8 +278,8 @@ for(const mode of ['paired','preflight first','missing initiator','wrong target'
    if(name==='Page.getFrameTree')return {frameTree:{frame:{id:'checkout',url:origins.demo}}};
   }};
   const page={context:()=>({newCDPSession:async()=>session}),frames:()=>[frame],mainFrame:()=>frame,on:()=>{}};
-  let rejected=false;
-  const guard=await protocolGuard(page,()=>{rejected=true;});
+  const refusals:string[]=[];
+  const guard=await protocolGuard(page,code=>refusals.push(code));
   const network=events.get('Network.requestWillBeSent')!;
   const post={frameId:'checkout',requestId:'post',request:{url:mode==='wrong target'?url+'/other':url,
    method:mode==='wrong method'?'GET':'POST'}};
@@ -285,14 +298,15 @@ for(const mode of ['paired','preflight first','missing initiator','wrong target'
     {name:'Access-Control-Allow-Credentials',value:'true'},
    ]});
   const released=['paired','preflight first'].includes(mode);
-  assert.equal(rejected,!released);
+  assert.equal(refusals.length>0,!released);
   assert.equal(commands.includes('Fetch.continueResponse'),released);
+  if(mode==='pause before initiator')assert.deepEqual(refusals,['BROWSER_GUARD_RESPONSE_PAIR_FRAME_MISSING']);
   if(released){
    // A successful preflight grants no authority to the POST itself.
    await events.get('Fetch.requestPaused')!({networkId:'post',requestId:'post-paused',frameId:'checkout',
     request:{url,method:'POST'},responseStatusCode:200});
    assert.equal(commands.at(-1),'Fetch.failRequest');
-   assert.equal(rejected,true);
+   assert.deepEqual(refusals,['BROWSER_GUARD_RESPONSE_UNCLAIMED']);
    await assert.rejects(guard.authorize({frame:()=>frame,url:()=>url,method:()=>'OPTIONS'} as never));
   }
  });

@@ -13,7 +13,9 @@ type Header={name:string;value:string};
 type Preflight={origin:string;method:string;names?:string};
 type Entry={url:string;method:string;frameId?:string;allowed:boolean;preflight?:Preflight;initiator?:{id:string;entry?:Entry}};
 type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
- |'BROWSER_GUARD_RESPONSE_PAIR'|'BROWSER_GUARD_RESPONSE_REDIRECT'|'BROWSER_GUARD_RESPONSE_STATUS'|'BROWSER_GUARD_RESPONSE_NETWORK'
+ |'BROWSER_GUARD_RESPONSE_PAIR_NETWORK_ID'|'BROWSER_GUARD_RESPONSE_PAIR_REQUEST_MISSING'|'BROWSER_GUARD_RESPONSE_PAIR_FRAME_MISSING'
+ |'BROWSER_GUARD_RESPONSE_PAIR_FRAME'|'BROWSER_GUARD_RESPONSE_PAIR_URL'|'BROWSER_GUARD_RESPONSE_PAIR_METHOD'
+ |'BROWSER_GUARD_RESPONSE_REDIRECT'|'BROWSER_GUARD_RESPONSE_STATUS'|'BROWSER_GUARD_RESPONSE_NETWORK'
  |'BROWSER_GUARD_RESPONSE_PREFLIGHT'|'BROWSER_GUARD_RESPONSE_UNCLAIMED'|'BROWSER_GUARD_RESPONSE_RESUME'|'BROWSER_GUARD_IFRAME_SETUP'
  |'BROWSER_GUARD_ROUTE_IDENTITY'|'BROWSER_GUARD_ROUTE_TARGET'
  |'BROWSER_GUARD_ROUTE_EVENT_MISSING'|'BROWSER_GUARD_ROUTE_EVENT_RETIRED'
@@ -139,11 +141,21 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
    for(const settle of waiters.values())settle('RETIRED');
   });
   session.on('Fetch.requestPaused',async event=>{
-   let reason:RedirectGuardFailure='BROWSER_GUARD_RESPONSE_PAIR';
+   let reason:RedirectGuardFailure='BROWSER_GUARD_RESPONSE_PAIR_NETWORK_ID';
    try{
-    const original=event.networkId && requests.get(event.networkId);
-    if(!original || !original.frameId || original.frameId!==event.frameId || original.url!==event.request.url ||
-       original.method!==event.request.method)return refuse();
+    const networkId=event.networkId;
+    if(!networkId)return refuse();
+    reason='BROWSER_GUARD_RESPONSE_PAIR_REQUEST_MISSING';
+    const original=requests.get(networkId);
+    if(!original)return refuse();
+    reason='BROWSER_GUARD_RESPONSE_PAIR_FRAME_MISSING';
+    if(!original.frameId || !event.frameId)return refuse();
+    reason='BROWSER_GUARD_RESPONSE_PAIR_FRAME';
+    if(original.frameId!==event.frameId)return refuse();
+    reason='BROWSER_GUARD_RESPONSE_PAIR_URL';
+    if(original.url!==event.request.url)return refuse();
+    reason='BROWSER_GUARD_RESPONSE_PAIR_METHOD';
+    if(original.method!==event.request.method)return refuse();
     if(event.responseErrorReason){reason='BROWSER_GUARD_RESPONSE_NETWORK';refuse();}
     const status=event.responseStatusCode;
     if(!status || status<200 || status>=300){
@@ -160,7 +172,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
       if(!entry || requests.get(id)!==entry || entry.allowed)refuse();
      }
     }else if(!original.allowed){reason='BROWSER_GUARD_RESPONSE_UNCLAIMED';refuse();}
-    requests.delete(event.networkId!);
+    requests.delete(networkId);
     reason='BROWSER_GUARD_RESPONSE_RESUME';
     await session.send('Fetch.continueResponse',{requestId:event.requestId});
    }catch{
