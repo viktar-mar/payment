@@ -407,7 +407,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     if(failedRenewal)demoBuildMode='billing-failed-renewal';
     else if(firstPayment)demoBuildMode='billing-first-payment';
     else if(billing && options.selectedCase==='initial_decline_retry')demoBuildMode='billing-decline-retry';
-    else if(invoiceCase)demoBuildMode='billing-invoice-webhooks';
+    else if(invoiceCase || billing && options.selectedCase==='initial_cancel_withdraw')demoBuildMode='billing-invoice-webhooks';
     else if(billing && options.selectedCase==='initial_3ds')demoBuildMode='billing-initial-3ds';
     else if(manualPayment)demoBuildMode='manual-payment';
     else if(diagnostic)demoBuildMode='form-diagnostic';

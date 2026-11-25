@@ -1509,7 +1509,7 @@ for(const selectedCase of ['initial_success','initial_cancel_withdraw','initial_
    assert.match(yaml,/"payment.inbox.scheduling-enabled":true/);
    assert.match(yaml,/"payment.callbacks.scheduling-enabled":true/);
   }
-  assert.deepEqual(args,selectedCase==='initial_missed_reordered'?['PAYMENT_DEMO_BUILD_MODE=billing-invoice-webhooks']:selectedCase==='initial_3ds'?['PAYMENT_DEMO_BUILD_MODE=billing-initial-3ds']:selectedCase==='initial_decline_retry'?['PAYMENT_DEMO_BUILD_MODE=billing-decline-retry']:[]);
+  assert.deepEqual(args,['initial_missed_reordered','initial_cancel_withdraw'].includes(selectedCase)?['PAYMENT_DEMO_BUILD_MODE=billing-invoice-webhooks']:selectedCase==='initial_3ds'?['PAYMENT_DEMO_BUILD_MODE=billing-initial-3ds']:selectedCase==='initial_decline_retry'?['PAYMENT_DEMO_BUILD_MODE=billing-decline-retry']:[]);
   await bootstrap.stop(LIMIT());
  });
 }

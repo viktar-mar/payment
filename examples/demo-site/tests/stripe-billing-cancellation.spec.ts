@@ -4,6 +4,7 @@ import {snapshotBillingAcceptanceEnvironment} from '../../../infrastructure/stri
 import {billingRunSettingsAllowed} from './support/stripe-billing-failed-renewal-settings';
 import {runBillingCancellationBrowser} from './support/stripe-billing-acceptance';
 import {runCancellationCase} from './support/stripe-billing-cancellation-terminal';
+import {loadFailedRenewalStaticOriginMatcher} from './support/stripe-billing-failed-renewal-static-origin-pin';
 
 let owner:Awaited<ReturnType<typeof createOwnedBillingCancellation>>;
 test.beforeAll(async({},info)=>{
@@ -21,4 +22,4 @@ test.beforeAll(async({},info)=>{
     approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_cancel_withdraw'});
 });
 test('OWNED_PERIOD_END_CANCELLATION',async({browser},info)=>
-  runCancellationCase(owner,(port,limits)=>runBillingCancellationBrowser(browser,port,limits),info.annotations));
+  runCancellationCase(owner,(port,limits)=>runBillingCancellationBrowser(browser,port,limits,loadFailedRenewalStaticOriginMatcher()),info.annotations));

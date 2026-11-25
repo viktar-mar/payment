@@ -19,6 +19,7 @@ test('cancellation is isolated from ordinary test discovery and requires its own
   const start=entry.indexOf('test.beforeAll(async({},info)'),owner=entry.indexOf('owner=await createOwnedBillingCancellation'),browser=entry.indexOf('async({browser},info)');
   assert.ok(start>=0&&start<owner&&owner<browser);
   assert.match(entry,/runCancellationCase\(owner,.*info\.annotations\)/);
+  assert.match(entry,/runBillingCancellationBrowser\(browser,port,limits,loadFailedRenewalStaticOriginMatcher\(\)\)/);
 });
 
 for(const scenario of ['pass','wrong-file','retry','repeat','test-failed','overall-failed','no-test','setup-error']){

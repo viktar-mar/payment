@@ -110,7 +110,8 @@ type CancellationRequest = {kind:CancellationKind; url:string; request?:Request;
 
 /** Bind each 202 to the original, already persisted SDK request from this document. */
 function cancellationJourney(page:Page, manager:Locator, port:BillingCancellationPort, binding:BillingBinding,
- authority:string, customerId:string, subscriptionId:string, createId:string, limits:BillingLimits, check:()=>void) {
+ authority:string, customerId:string, subscriptionId:string, createId:string, limits:BillingLimits, check:()=>void,
+ authorizeResponse?:(request:Request)=>Promise<void>,checkOwner?:()=>Promise<void>) {
  const endpoint = binding.endpoints.backend+'/api/v1/customer/subscriptions/'+subscriptionId+'/cancellation';
  const usedKeys = new Set<string>(), operations = new Set([createId]);
  let armed:CancellationRequest|undefined;
@@ -192,7 +193,13 @@ function cancellationJourney(page:Page, manager:Locator, port:BillingCancellatio
    // The manager uses JSON.stringify for these exact bodies. Byte matching also excludes duplicate JSON members.
    need(req.postData()===(intent.kind==='schedule'?'{"mode":"PERIOD_END"}':'{}'));
    usedKeys.add(key!);
-   check();need(await port.beforeCancellation(intent.kind,key!)===true);check();
+   const current=()=>{check();need(armed===intent && intent.request===req);};
+   if(checkOwner)await checkOwner();
+   current();need(await port.beforeCancellation(intent.kind,key!)===true);
+   current();
+   if(authorizeResponse)await authorizeResponse(req);
+   if(checkOwner)await checkOwner();
+   current();
    intent.forwarded=true;
    await route.continue();check();
   }
@@ -202,8 +209,8 @@ function cancellationJourney(page:Page, manager:Locator, port:BillingCancellatio
 export function runInitialBillingBrowser(browser:Browser,port:BillingPort,limits:BillingLimits):Promise<true>{
  return runBillingBrowser(browser,port,limits);
 }
-export function runBillingCancellationBrowser(browser:Browser,port:BillingCancellationPort,limits:BillingLimits):Promise<true>{
- return runBillingBrowser(browser,port,limits,port);
+export function runBillingCancellationBrowser(browser:Browser,port:BillingCancellationPort,limits:BillingLimits,matchesStaticOrigin?:(origin:string)=>boolean):Promise<true>{
+ return runBillingBrowser(browser,port,limits,port,undefined,matchesStaticOrigin);
 }
 export function runBillingDeclineRetryBrowser(browser:Browser,port:BillingDeclineRetryPort,limits:BillingLimits,matchesStaticOrigin?:(origin:string)=>boolean):Promise<true>{
  return runBillingBrowser(browser,port,limits,undefined,port,matchesStaticOrigin);
@@ -215,8 +222,10 @@ export function runBillingInvoiceWebhooksBrowser(browser:Browser,port:BillingInv
  return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,undefined,port);
 }
 async function runBillingBrowser(browser:Browser,port:BillingPort,limits:BillingLimits,cancellationPort?:BillingCancellationPort,retryPort?:BillingDeclineRetryPort,matchesStaticOrigin?:(origin:string)=>boolean,challenge?:{port:BillingInitial3dsPort;waitForGesture:WaitForIssuerGesture},invoiceCase?:BillingInvoiceWebhooksPort):Promise<true>{
- const exactInitialCheckout=!!(retryPort||challenge);
- const bound=!!(retryPort||challenge||invoiceCase),guarded=!!(cancellationPort||bound);
+ const pinnedCancellation=!!cancellationPort&&typeof matchesStaticOrigin==='function';
+ const exactInitialCheckout=!!(retryPort||challenge||pinnedCancellation);
+ const bound=exactInitialCheckout||!!invoiceCase,guarded=!!(cancellationPort||bound);
+ const responseGuard=!!(challenge||invoiceCase||pinnedCancellation);
  const lifecycle=new AbortController();
  const ownerLimits=limits;
  limits={deadline:limits.deadline,signal:limits.signal?AbortSignal.any([limits.signal,lifecycle.signal]):lifecycle.signal};
@@ -256,7 +265,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   let originalManager:JSHandle<()=>boolean>|undefined;
   async function checkManager(){
    check();
-   if((challenge || invoiceCase) && firstAttempt)need(sessionExpiry>Date.now());
+   if(responseGuard && firstAttempt && !cancellation)need(sessionExpiry>Date.now());
    if(bound)need(originalManager && await originalManager.evaluate(current=>current()));
    check();
   }
@@ -350,8 +359,8 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   },recordFailure):undefined;
   const winning=Promise.withResolvers<void>();
   const invalidate=(reason:string)=>{recordFailure(reason);abort();};
-  if(challenge||invoiceCase)checkpoint='BROWSER_SETUP';
-  const redirects=challenge||invoiceCase?await guardChallengeRedirects(page,invalidate,binding.endpoints,limits.signal):undefined;
+  if(responseGuard)checkpoint='BROWSER_SETUP';
+  const redirects=responseGuard?await guardChallengeRedirects(page,invalidate,binding.endpoints,limits.signal):undefined;
   const sca=challenge?initial3dsChallenge({page,limits,demo:binding.endpoints.demo,owner:()=>({secret:firstSecret,key:publishableKey??''}),
    stripeFrames:req=>stripeFrames(page,req,false,false,binding.endpoints.demo),authorizeResponse:req=>redirects!.authorize(req),check:checkManager,waitForGesture:challenge.waitForGesture,
    winning:async()=>{
@@ -655,7 +664,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   wire?.('PROTOCOL');need(selectedBody.protocol==='SERVER_CONFIRM_V2'&&selectedBody.provider==='stripe'&&selectedBody.flow==='PAYMENT');
   wire?.('ATTEMPT');need(uuid(selectedBody.attempt_id));attemptId=selectedBody.attempt_id as string;
   if(bound){sessionContext(selectedBody,false,wire);initialPresentationReady.resolve();}
-  if(cancellationPort && typeof selectedBody.publishable_key==='string' && /^pk_test_[A-Za-z0-9_]+$/.test(selectedBody.publishable_key))publishableKey=selectedBody.publishable_key;
+  if(cancellationPort && !bound && typeof selectedBody.publishable_key==='string' && /^pk_test_[A-Za-z0-9_]+$/.test(selectedBody.publishable_key))publishableKey=selectedBody.publishable_key;
   async function confirmWaitBoundary(){
    const request=requests.get(successorId?'successor-confirm':'original-confirm');
    if(request)return request.existingResponse()?'BROWSER_CONFIRM_WAIT':'BROWSER_CONFIRM_REQUEST_NO_RESPONSE';
@@ -798,7 +807,8 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   }
   need(!failure&&createPosts===1&&confirmPosts===(retryPort?2:1)&&selectPosts===1&&challengePosts===1&&verifyPosts===1);
   if(cancellationPort){
-   cancellation=cancellationJourney(page,manager,cancellationPort,binding,authority,(customer as Record<string,string>).id!,subscriptionId,operationId,limits,check);
+   cancellation=cancellationJourney(page,manager,cancellationPort,binding,authority,(customer as Record<string,string>).id!,
+    subscriptionId,operationId,limits,check,redirects?.authorize,pinnedCancellation?checkManager:undefined);
    await cancellation.run();
    await billingBounded(limits,()=>Promise.all(pending));check();
   }
