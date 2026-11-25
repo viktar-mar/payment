@@ -9,9 +9,9 @@ import {registerChromiumProtocolFixture} from './stripe-billing-chromium-route.t
 import {challengeTerminalLine} from './stripe-billing-initial-3ds-terminal.ts';
 
 const origins={backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081'};
-const protocolGuard=(page:object,onFailure:Parameters<typeof guardChallengeRedirects>[1])=>{
+const protocolGuard=(page:object,onFailure:Parameters<typeof guardChallengeRedirects>[1],signal?:AbortSignal)=>{
  registerChromiumProtocolFixture(page);
- return guardChallengeRedirects(page as never,onFailure,origins);
+ return guardChallengeRedirects(page as never,onFailure,origins,signal);
 };
 test('an unsupported driver cannot fall back to protocol fixture matching',async()=>{
  await assert.rejects(guardChallengeRedirects({} as never,()=>{},origins),/^Error: billing_BROWSER$/);
@@ -234,7 +234,7 @@ for(const mode of ['eligible','redirect','not modified','missing request','forei
   const expected:Record<string,string>={
    redirect:'REDIRECT','error response':'STATUS','not modified':'STATUS','network failure':'NETWORK',
    'unclaimed response':'UNCLAIMED','absent response network ID':'PAIR_NETWORK_ID',
-   'unknown response network ID':'PAIR_REQUEST_MISSING','missing response frame':'PAIR_FRAME_MISSING',
+   'unknown response network ID':'PAIR_REQUEST_MISSING','missing response frame':'PAIR_FETCH_FRAME_MISSING',
    'foreign response frame':'PAIR_FRAME','foreign response URL':'PAIR_URL','foreign response method':'PAIR_METHOD',
   };
   const code='BROWSER_GUARD_RESPONSE_'+expected[mode];
@@ -269,41 +269,78 @@ for(const mode of ['valid','script options','unbound request','credential','body
  });
 }
 
-for(const mode of ['paired','preflight first','missing initiator','wrong target','wrong method','different response frame','replaced initiator','first initiator replaced','pause before initiator'])
+for(const mode of ['paired','preflight first','missing initiator','wrong target','wrong method','different response frame',
+ 'replaced initiator','first initiator replaced','pause before initiator','late foreign frame','late decoy','timed out',
+ 'initiator retired before observation','preflight retired before observation',
+ 'initiator retired before pause','initiator retired while paused','preflight retired while paused','retired after binding',
+ 'duplicate pending response','duplicate pause ID','session closed while paused','aborted while paused','early invalid response'])
  test('a preflight without frameId requires the exact initiating request: '+mode,async()=>{
-  const url=origins.backend+'/auth',commands:string[]=[],events=new Map<string,(e:unknown)=>Promise<void>|void>();
+  const url=origins.backend+'/auth',commands:string[]=[],events=new EventEmitter();
+  const handler=(name:string)=>events.listeners(name)[0] as (event:unknown)=>void|Promise<void>;
   const frame={url:()=>origins.demo,name:()=>'',parentFrame:()=>null,isDetached:()=>false};
-  const session={on:(name:string,listener:(e:unknown)=>void)=>events.set(name,listener),send:async(name:string)=>{
+  const session={on:events.on.bind(events),send:async(name:string)=>{
    commands.push(name);
    if(name==='Page.getFrameTree')return {frameTree:{frame:{id:'checkout',url:origins.demo}}};
   }};
   const page={context:()=>({newCDPSession:async()=>session}),frames:()=>[frame],mainFrame:()=>frame,on:()=>{}};
   const refusals:string[]=[];
-  const guard=await protocolGuard(page,code=>refusals.push(code));
-  const network=events.get('Network.requestWillBeSent')!;
-  const post={frameId:'checkout',requestId:'post',request:{url:mode==='wrong target'?url+'/other':url,
+  const controller=new AbortController();
+  const guard=await protocolGuard(page,code=>refusals.push(code),controller.signal);
+  const network=handler('Network.requestWillBeSent');
+  const post={frameId:mode==='late foreign frame'?'foreign':'checkout',requestId:'post',request:{url:mode==='wrong target'?url+'/other':url,
    method:mode==='wrong method'?'GET':'POST'}};
-  const preflightFirst=['preflight first','first initiator replaced','pause before initiator'].includes(mode);
+  const earlyPause=['pause before initiator','late foreign frame','late decoy','timed out','initiator retired before pause',
+   'initiator retired while paused','preflight retired while paused','retired after binding','duplicate pending response',
+   'initiator retired before observation','preflight retired before observation','duplicate pause ID',
+   'session closed while paused','aborted while paused','early invalid response'].includes(mode);
+  const preflightFirst=earlyPause||['preflight first','first initiator replaced'].includes(mode);
   if(!preflightFirst)network(post);
   const request={url,method:'OPTIONS',headers:{Origin:origins.demo,'Access-Control-Request-Method':'POST'}};
+  if(mode==='initiator retired before observation')events.emit('Network.loadingFailed',{requestId:'post'});
+  if(mode==='preflight retired before observation')events.emit('Network.loadingFailed',{requestId:'probe'});
   network({requestId:'probe',initiator:{type:'preflight',requestId:mode==='missing initiator'?'other':'post'},request});
-  if(preflightFirst&&mode!=='pause before initiator')network(post);
+  if(preflightFirst&&!earlyPause)network(post);
   if(mode==='replaced initiator'||mode==='first initiator replaced'){
-   events.get('Network.loadingFailed')!({requestId:'post'});
+   events.emit('Network.loadingFailed',{requestId:'post'});
    network(post);
   }
-  await events.get('Fetch.requestPaused')!({networkId:'probe',requestId:'paused',request,
+  const pause=(requestId:string,networkId='probe')=>handler('Fetch.requestPaused')({networkId,requestId,request,
    frameId:mode==='different response frame'?'foreign':'checkout',responseStatusCode:204,responseHeaders:[
-    {name:'Access-Control-Allow-Origin',value:origins.demo},{name:'Access-Control-Allow-Methods',value:'POST'},
+    {name:'Access-Control-Allow-Origin',value:mode==='early invalid response'?'*':origins.demo},{name:'Access-Control-Allow-Methods',value:'POST'},
     {name:'Access-Control-Allow-Credentials',value:'true'},
    ]});
-  const released=['paired','preflight first'].includes(mode);
+  if(mode==='initiator retired before pause')events.emit('Network.loadingFailed',{requestId:'post'});
+  const pending=pause('paused');
+  if(mode==='pause before initiator'){
+   assert.ok(!commands.includes('Fetch.continueResponse')&&!commands.includes('Fetch.failRequest'));
+  }
+  if(mode==='duplicate pending response')await pause('duplicate');
+  let duplicate;
+  if(mode==='duplicate pause ID'){
+   network({requestId:'probe-other',initiator:{type:'preflight',requestId:'post-other'},request});
+   duplicate=pause('paused','probe-other');
+   network({...post,requestId:'post-other'});
+  }
+  if(mode==='initiator retired while paused')events.emit('Network.loadingFailed',{requestId:'post'});
+  if(mode==='preflight retired while paused')events.emit('Network.loadingFinished',{requestId:'probe'});
+  if(mode==='session closed while paused')events.emit('close');
+  if(mode==='aborted while paused')controller.abort();
+  if(['pause before initiator','late foreign frame','initiator retired while paused','preflight retired while paused',
+      'initiator retired before pause','initiator retired before observation','preflight retired before observation',
+      'duplicate pending response','duplicate pause ID','retired after binding','aborted while paused'].includes(mode))network(post);
+  if(mode==='late decoy')network({...post,requestId:'same-url-decoy'});
+  if(mode==='retired after binding')events.emit('Network.loadingFinished',{requestId:'post'});
+  await pending;
+  await duplicate;
+  const released=['paired','preflight first','pause before initiator'].includes(mode);
   assert.equal(refusals.length>0,!released);
   assert.equal(commands.includes('Fetch.continueResponse'),released);
-  if(mode==='pause before initiator')assert.deepEqual(refusals,['BROWSER_GUARD_RESPONSE_PAIR_FRAME_MISSING']);
+  if(mode==='timed out')assert.deepEqual(refusals,['BROWSER_GUARD_RESPONSE_PAIR_NETWORK_FRAME_MISSING']);
+  if(mode==='early invalid response')assert.deepEqual(refusals,['BROWSER_GUARD_RESPONSE_PREFLIGHT']);
+  if(mode==='duplicate pending response'||mode==='duplicate pause ID')assert.equal(commands.filter(command=>command==='Fetch.failRequest').length,2);
   if(released){
    // A successful preflight grants no authority to the POST itself.
-   await events.get('Fetch.requestPaused')!({networkId:'post',requestId:'post-paused',frameId:'checkout',
+   await handler('Fetch.requestPaused')({networkId:'post',requestId:'post-paused',frameId:'checkout',
     request:{url,method:'POST'},responseStatusCode:200});
    assert.equal(commands.at(-1),'Fetch.failRequest');
    assert.deepEqual(refusals,['BROWSER_GUARD_RESPONSE_UNCLAIMED']);

@@ -11,9 +11,12 @@ const stripeOrigins=['https://js.stripe.com','https://api.stripe.com','https://h
 type Origins={backend:string;demo:string};
 type Header={name:string;value:string};
 type Preflight={origin:string;method:string;names?:string};
-type Entry={url:string;method:string;frameId?:string;allowed:boolean;preflight?:Preflight;initiator?:{id:string;entry?:Entry}};
+type FrameWait={settle:(matched:boolean)=>void;invalidated:boolean};
+type Entry={url:string;method:string;frameId?:string;allowed:boolean;preflight?:Preflight;
+ initiator?:{id:string;entry?:Entry};frameWait?:FrameWait};
 type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
- |'BROWSER_GUARD_RESPONSE_PAIR_NETWORK_ID'|'BROWSER_GUARD_RESPONSE_PAIR_REQUEST_MISSING'|'BROWSER_GUARD_RESPONSE_PAIR_FRAME_MISSING'
+ |'BROWSER_GUARD_RESPONSE_PAIR_NETWORK_ID'|'BROWSER_GUARD_RESPONSE_PAIR_REQUEST_MISSING'|'BROWSER_GUARD_RESPONSE_PAIR_DUPLICATE'
+ |'BROWSER_GUARD_RESPONSE_PAIR_NETWORK_FRAME_MISSING'|'BROWSER_GUARD_RESPONSE_PAIR_FETCH_FRAME_MISSING'
  |'BROWSER_GUARD_RESPONSE_PAIR_FRAME'|'BROWSER_GUARD_RESPONSE_PAIR_URL'|'BROWSER_GUARD_RESPONSE_PAIR_METHOD'
  |'BROWSER_GUARD_RESPONSE_REDIRECT'|'BROWSER_GUARD_RESPONSE_STATUS'|'BROWSER_GUARD_RESPONSE_NETWORK'
  |'BROWSER_GUARD_RESPONSE_PREFLIGHT'|'BROWSER_GUARD_RESPONSE_UNCLAIMED'|'BROWSER_GUARD_RESPONSE_RESUME'|'BROWSER_GUARD_IFRAME_SETUP'
@@ -77,12 +80,14 @@ function bindPreflightInitiator(preflight:Entry,entry:Entry):boolean{
     entry.url!==preflight.url || entry.method!==preflight.preflight.method)return false;
  preflight.frameId=entry.frameId;
  preflight.initiator.entry=entry;
+ preflight.frameWait?.settle(true);
  return true;
 }
 
 /** Playwright routes only the first URL in a redirect chain. Arm a response-stage guard
  * before each SDK request exists and require its passive network event on the exact frame. */
-export async function guardChallengeRedirects(page:Page,onFailure:(reason:RedirectGuardFailure)=>void,origins:Origins){
+export async function guardChallengeRedirects(page:Page,onFailure:(reason:RedirectGuardFailure)=>void,origins:Origins,signal?:AbortSignal){
+ if(signal?.aborted)return refuse();
  const routeReader=chromiumRouteReader(page);
  for(const fresh of [origins.backend,origins.demo]){
   const url=new URL(fresh);
@@ -97,6 +102,8 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
  async function arm(session:GuardSession):Promise<Guard>{
   const requests=new Map<string,Entry>();
   const waiters=new Map<string,(event:ObservedEvent)=>void>();
+  const retired=new Set<string>();
+  const pendingPauses=new Map<string,FrameWait>();
   let closed=false;
   function waitForEvent(id:string):Promise<ObservedEvent>{
    if(closed||waiters.has(id)||waiters.size>=24)return Promise.resolve(undefined);
@@ -106,9 +113,11 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
    });
   }
   session.on('Network.requestWillBeSent',event=>{
-   if(!tracked(event.request.url))return;
-   if(event.redirectResponse){onFailure('BROWSER_GUARD_REQUEST_REDIRECT');return;}
-   if(requests.has(event.requestId)){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
+   if(closed||!tracked(event.request.url))return;
+   if(event.redirectResponse){retire({requestId:event.requestId});onFailure('BROWSER_GUARD_REQUEST_REDIRECT');return;}
+   if(requests.has(event.requestId)||retired.has(event.requestId)){
+    retire({requestId:event.requestId});onFailure('BROWSER_GUARD_REQUEST_PAIR');return;
+   }
    if(requests.size>=24){onFailure('BROWSER_GUARD_REQUEST_CAPACITY');return;}
    const preflight=probe(event.request,event.initiator?.type,origins);
    const entry:Entry={frameId:event.frameId,url:event.request.url,method:event.request.method,allowed:false,preflight};
@@ -116,42 +125,71 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
     // Chrome may report a frameless preflight before the linked initiating request.
     // Record the exact identifier, but require its frame and the synthetic 204 at the pause.
     const id=event.initiator?.requestId;
-    if(!preflight || !id || id===event.requestId){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
+    if(!preflight || !id || id===event.requestId || retired.has(id)){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
     entry.initiator={id};
     const existing=requests.get(id);
     if(existing && !bindPreflightInitiator(entry,existing)){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
    }
    for(const request of requests.values()){
-    if(request.initiator?.id===event.requestId && !request.initiator.entry &&
-       !bindPreflightInitiator(request,entry)){onFailure('BROWSER_GUARD_REQUEST_PAIR');return;}
+    if(request.initiator?.id===event.requestId && !request.initiator.entry && !bindPreflightInitiator(request,entry)){
+     retire({requestId:event.requestId});
+     onFailure('BROWSER_GUARD_REQUEST_PAIR');return;
+    }
    }
    requests.set(event.requestId,entry);
    waiters.get(event.requestId)?.(entry);
   });
+  function invalidateFrameWait(wait:FrameWait|undefined){
+   if(!wait)return;
+   wait.invalidated=true;
+   wait.settle(false);
+  }
   // Playwright 1.63 fulfills genuine browser preflights before exposing a user route.
   // A locally handled probe may finish without a response pause on this CDP target.
-  const retire=({requestId}: {requestId:string})=>{
+  function retire({requestId}: {requestId:string}){
+   if(closed)return;
+   // Preserve retirement even when it is observed before the preflight or initiator.
+   if(!retired.has(requestId)&&retired.size>=4096){closeGuard();onFailure('BROWSER_GUARD_REQUEST_CAPACITY');return;}
+   retired.add(requestId);
+   invalidateFrameWait(requests.get(requestId)?.frameWait);
    requests.delete(requestId);
    waiters.get(requestId)?.('RETIRED');
-  };
+   for(const request of requests.values())if(request.initiator?.id===requestId)invalidateFrameWait(request.frameWait);
+  }
   session.on('Network.loadingFinished',retire);
   session.on('Network.loadingFailed',retire);
-  session.on('close',()=>{
-   closed=true;requests.clear();
+  function closeGuard(){
+   if(closed)return;
+   closed=true;
+   signal?.removeEventListener('abort',closeGuard);
+   for(const wait of pendingPauses.values())invalidateFrameWait(wait);
+   pendingPauses.clear();retired.clear();
+   requests.clear();
    for(const settle of waiters.values())settle('RETIRED');
-  });
+  }
+  session.on('close',closeGuard);
+  signal?.addEventListener('abort',closeGuard,{once:true});
+  if(signal?.aborted){closeGuard();return refuse();}
   session.on('Fetch.requestPaused',async event=>{
    let reason:RedirectGuardFailure='BROWSER_GUARD_RESPONSE_PAIR_NETWORK_ID';
+   let waitingClaim:FrameWait|undefined;
    try{
     const networkId=event.networkId;
+    const original=networkId?requests.get(networkId):undefined;
+    const repeated=pendingPauses.get(event.requestId);
+    if(repeated || original?.frameWait){
+     reason='BROWSER_GUARD_RESPONSE_PAIR_DUPLICATE';
+     invalidateFrameWait(repeated);
+     invalidateFrameWait(original?.frameWait);
+     return refuse();
+    }
     if(!networkId)return refuse();
     reason='BROWSER_GUARD_RESPONSE_PAIR_REQUEST_MISSING';
-    const original=requests.get(networkId);
     if(!original)return refuse();
-    reason='BROWSER_GUARD_RESPONSE_PAIR_FRAME_MISSING';
-    if(!original.frameId || !event.frameId)return refuse();
+    reason='BROWSER_GUARD_RESPONSE_PAIR_FETCH_FRAME_MISSING';
+    if(!event.frameId)return refuse();
     reason='BROWSER_GUARD_RESPONSE_PAIR_FRAME';
-    if(original.frameId!==event.frameId)return refuse();
+    if(original.frameId && original.frameId!==event.frameId)return refuse();
     reason='BROWSER_GUARD_RESPONSE_PAIR_URL';
     if(original.url!==event.request.url)return refuse();
     reason='BROWSER_GUARD_RESPONSE_PAIR_METHOD';
@@ -168,17 +206,39 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
      if(!sent || !paused || paused.origin!==sent.origin || paused.method!==sent.method || paused.names!==sent.names ||
         !syntheticProbe(sent,event.responseStatusCode,event.responseHeaders))refuse();
      if(original.initiator){
-      const {id,entry}=original.initiator;
-      if(!entry || requests.get(id)!==entry || entry.allowed)refuse();
+      const initiator=original.initiator;
+      if(!original.frameId){
+       // Only the exact linked Network event on this session can supply the frame.
+       // Keep the validated synthetic response paused while waiting for that event.
+       reason='BROWSER_GUARD_RESPONSE_PAIR_NETWORK_FRAME_MISSING';
+       if(retired.has(initiator.id))return refuse();
+       const waiting=Promise.withResolvers<boolean>();
+       const claim={settle:waiting.resolve,invalidated:false};
+       original.frameWait=claim;
+       waitingClaim=claim;
+       pendingPauses.set(event.requestId,claim);
+       const timer=setTimeout(()=>invalidateFrameWait(claim),1000);
+       try{
+        const matched=await waiting.promise;
+        if(!matched || claim.invalidated || closed || requests.get(networkId)!==original)return refuse();
+       }finally{clearTimeout(timer);}
+      }
+      reason='BROWSER_GUARD_RESPONSE_PREFLIGHT';
+      const entry=initiator.entry;
+      if(retired.has(initiator.id) || !entry || requests.get(initiator.id)!==entry || entry.allowed)refuse();
      }
     }else if(!original.allowed){reason='BROWSER_GUARD_RESPONSE_UNCLAIMED';refuse();}
+    reason='BROWSER_GUARD_RESPONSE_PAIR_NETWORK_FRAME_MISSING';
+    if(!original.frameId)return refuse();
+    reason='BROWSER_GUARD_RESPONSE_PAIR_FRAME';
+    if(original.frameId!==event.frameId)return refuse();
     requests.delete(networkId);
     reason='BROWSER_GUARD_RESPONSE_RESUME';
     await session.send('Fetch.continueResponse',{requestId:event.requestId});
    }catch{
     try{await session.send('Fetch.failRequest',{requestId:event.requestId,errorReason:'BlockedByClient'});}
     catch{}finally{onFailure(reason);}
-   }
+   }finally{if(waitingClaim)pendingPauses.delete(event.requestId);}
   });
   await session.send('Network.enable');
   await session.send('Fetch.enable',{patterns:patterns.map(urlPattern=>({urlPattern,requestStage:'Response' as const}))});

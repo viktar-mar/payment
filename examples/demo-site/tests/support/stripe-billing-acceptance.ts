@@ -341,7 +341,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   const winning=Promise.withResolvers<void>();
   const invalidate=(reason:string)=>{recordFailure(reason);abort();};
   if(challenge||invoiceCase)checkpoint='BROWSER_SETUP';
-  const redirects=challenge||invoiceCase?await guardChallengeRedirects(page,invalidate,binding.endpoints):undefined;
+  const redirects=challenge||invoiceCase?await guardChallengeRedirects(page,invalidate,binding.endpoints,limits.signal):undefined;
   const sca=challenge?initial3dsChallenge({page,limits,demo:binding.endpoints.demo,owner:()=>({secret:firstSecret,key:publishableKey??''}),
    stripeFrames:req=>stripeFrames(page,req,false,false,binding.endpoints.demo),authorizeResponse:req=>redirects!.authorize(req),check:checkManager,waitForGesture:challenge.waitForGesture,
    winning:async()=>{
