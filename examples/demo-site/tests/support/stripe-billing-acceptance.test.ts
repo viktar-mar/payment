@@ -52,7 +52,8 @@ type SessionFailure = {
  measuredSize?:number; unreadable?:boolean; holdSize?:()=>Promise<void>; holdBody?:()=>Promise<void>;
 };
 const approvedFixtureIssuer='https://approved-synthetic.stripe.com';
-function cancellationPage(fault = '', declineRetry = false, sca = false, invoiceCase = false, sessionFailure?:SessionFailure, pinnedCancellation=false) {
+function cancellationPage(fault = '', declineRetry = false, sca = false, invoiceCase = false, sessionFailure?:SessionFailure, pinnedCancellation=false,
+ advancePassiveClock:(milliseconds:number)=>void=()=>{}) {
  const responseGuard=sca||invoiceCase||pinnedCancellation;
  const id = (n:number) => '11111111-2222-4333-8444-' + String(n).padStart(12, '0');
  const b = {...binding, runId:id(99), expectedSource:'e'.repeat(40), siteKey:'demo-key', email:'user@example.test', siteId:id(1), productId:id(2)};
@@ -198,6 +199,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const issuerUrl=issuerHost+'/test-fixture?run=one';
  const actionUrl=(fault==='approved-issuer-foreign-form'?'https://hooks.stripe.com':issuerHost)+'/test-fixture/decision';
  const passiveBlockStarted=Promise.withResolvers<void>();
+ const passivePairStarted=Promise.withResolvers<void>();
+ let passiveAborts=0,firstPassiveRequest:Request|undefined;
  const directIssuer=fault.startsWith('direct-issuer-')||fault.startsWith('challenge-origin-direct')||approvedIssuer&&fault!=='approved-issuer-nested';
  let issuerDocument=fault.endsWith('-nonblank')?'https://js.stripe.com/v3/foreign.html':'about:blank',issuerNonce:string|undefined;
  let issuerReceipt:((source:{page:unknown;frame:unknown},nonce:unknown)=>void)|undefined;
@@ -310,7 +313,11 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     await wire(issuerHost+'/unowned-fixture',issuer,shape==='method'?null:'fixture=value',{},shape!=='navigation',shape);
    }
    if(url===issuerUrl&&fault.startsWith('approved-issuer-block-')&&fault!=='approved-issuer-block-after-handoff'){
-    if(fault.startsWith('approved-issuer-block-gated')){
+    if(fault==='approved-issuer-block-gated-pair'){
+     void requestPassiveIssuerAsset('image').catch(()=>{});
+     void requestPassiveIssuerAsset('font').catch(()=>{});
+     await passivePairStarted.promise;
+    }else if(fault.startsWith('approved-issuer-block-gated')){
      void requestPassiveIssuerAsset().catch(()=>{});
      await passiveBlockStarted.promise;
     }else{
@@ -318,33 +325,48 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      if(fault==='approved-issuer-block-duplicate')await requestPassiveIssuerAsset();
      if(fault==='approved-issuer-block-image-font')await requestPassiveIssuerAsset('font');
      if(fault==='approved-issuer-block-font-image')await requestPassiveIssuerAsset('image');
+     if(fault==='approved-issuer-block-third'){
+      await requestPassiveIssuerAsset('font');
+      await requestPassiveIssuerAsset('font',2);
+     }
+     if(fault==='approved-issuer-block-second-decoy')await requestPassiveIssuerAsset('font');
+     if(fault==='approved-issuer-block-second-late'||fault==='approved-issuer-block-shared-deadline'){
+      advancePassiveClock(fault==='approved-issuer-block-second-late'?750:600);
+      await requestPassiveIssuerAsset('font');
+     }
     }
    }
   },abort:async(reason:string)=>{
    if(url.startsWith('https://unlisted-fixture.stripe.com/'))trace.push('abort refused issuer');
    if(passive&&reason==='blockedbyclient'){
     trace.push('block passive asset');
+    const ordinal=++passiveAborts;
+    if(ordinal===1)firstPassiveRequest=request;
+    if(ordinal===2)passivePairStarted.resolve();
     passiveBlockStarted.resolve();
     if(fault==='approved-issuer-block-abort-error')throw Error('private abort');
-    if(fault==='approved-issuer-block-gated')await new Promise(resolve=>setTimeout(resolve,25));
+    if(fault==='approved-issuer-block-gated'||fault==='approved-issuer-block-gated-pair'&&ordinal===2)
+     await new Promise(resolve=>setTimeout(resolve,25));
+    if(fault==='approved-issuer-block-shared-deadline'&&ordinal===2)advancePassiveClock(151);
     if(fault==='approved-issuer-block-response'||fault==='approved-issuer-block-font-response')await reply('passive',200).catch(()=>{});
     reply.failed();
     if(fault==='approved-issuer-block-replaced')navigate(issuer);
     if(!fault.endsWith('-missing-event')){
      trace.push('passive block event');
-     requestFailed(fault.endsWith('-foreign-event')?{...request}:request);
+     requestFailed(fault==='approved-issuer-block-second-decoy'&&ordinal===2?firstPassiveRequest!:
+      fault.endsWith('-foreign-event')?{...request}:request);
     }
    }
   }} as unknown as Route);
   if(closed)throw Error('closed');
  }
- function requestPassiveIssuerAsset(resource:'image'|'font'=fault.startsWith('approved-issuer-block-font-')?'font':'image'){
+ function requestPassiveIssuerAsset(resource:'image'|'font'=fault.startsWith('approved-issuer-block-font-')?'font':'image',pathOrdinal=1){
   const suffix=fault==='approved-issuer-block-suffix'?'.svg':
    fault==='approved-issuer-block-font-ttf'?'.ttf':
    fault==='approved-issuer-block-font-uppercase'?'.WOFF2':
    fault==='approved-issuer-block-font-woff'?'.woff':
    resource==='font'||fault==='approved-issuer-block-image-font-suffix'?'.woff2':'.png';
-  const asset=approvedFixtureIssuer+'/fixture-passive'+suffix+
+  const asset=approvedFixtureIssuer+'/fixture-passive'+(pathOrdinal===1?'':'-'+pathOrdinal)+suffix+
    (fault==='approved-issuer-block-query'?'?private=canary':'');
   const data=['approved-issuer-block-post','approved-issuer-block-body'].includes(fault)?'private=data':null;
   return wire(asset,fault==='approved-issuer-block-foreign-frame'?stripeFrame:issuer,data,{},false,resource);
@@ -1413,6 +1435,7 @@ for(const [suffix,expected,blocks] of [
  ['font-woff2',null,1],
  ['inspector',null,1],
  ['gated',null,1],
+ ['gated-pair',null,2],
  ['post','BROWSER_CHALLENGE_ISSUER_ASSET_METHOD',0],
  ['body','BROWSER_CHALLENGE_ISSUER_ASSET_METHOD',0],
  ['query','BROWSER_CHALLENGE_ISSUER_ASSET_PATH',0],
@@ -1430,8 +1453,12 @@ for(const [suffix,expected,blocks] of [
  ['suffix','BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX',0],
  ['image-font-suffix','BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX',0],
  ['duplicate','BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT',1],
- ['image-font','BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT',1],
- ['font-image','BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT',1],
+ ['image-font',null,2],
+ ['font-image',null,2],
+ ['third','BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT',2],
+ ['second-late','BROWSER_CHALLENGE_ISSUER_ASSET_DEADLINE',1],
+ ['shared-deadline','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',2],
+ ['second-decoy','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',2],
  ['worker','BROWSER_CHALLENGE_ISSUER_ASSET_WORKER',0],
  ['uncommitted','BROWSER_CHALLENGE_ISSUER_ASSET_DOCUMENT',0],
  ['cross-origin','BROWSER_CHALLENGE_ISSUER_ASSET_BINDING',0],
@@ -1449,14 +1476,16 @@ for(const [suffix,expected,blocks] of [
  ['replaced','BROWSER_CHALLENGE_ISSUER_ASSET_DOCUMENT',1],
  ['response','BROWSER_GUARD_RESPONSE_UNCLAIMED',1],
  ['font-response','BROWSER_GUARD_RESPONSE_UNCLAIMED',1],
-] as const)test('owned issuer passive block without network: '+suffix,async()=>{
- const f=cancellationPage('approved-issuer-block-'+suffix,false,true);
+] as const)test('owned issuer passive block without network: '+suffix,async t=>{
+ let now=Date.now();
+ if(suffix==='second-late'||suffix==='shared-deadline')t.mock.method(Date,'now',()=>now);
+ const f=cancellationPage('approved-issuer-block-'+suffix,false,true,false,undefined,false,milliseconds=>{now+=milliseconds;});
  let handoffs=0;
  const run=runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+2200},async()=>{
   handoffs++;
   if(suffix==='after-handoff'){await f.requestPassiveIssuerAsset();return;}
-  assert.equal(f.trace.filter(step=>step==='block passive asset').length,1);
-  assert.ok(f.trace.includes('passive block event'));
+  assert.equal(f.trace.filter(step=>step==='block passive asset').length,blocks);
+  assert.equal(f.trace.filter(step=>step==='passive block event').length,blocks);
  },undefined,approvedFixtureIssuer);
  if(expected)await assert.rejects(run,error=>{
   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),expected);

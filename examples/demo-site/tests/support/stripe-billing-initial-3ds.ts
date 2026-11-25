@@ -119,15 +119,17 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
  let completed=false,finalRead=false,initialIssuerDispatched=false,boundSource:string|undefined;
  let issuer:Frame|undefined,issuerRequest:Request|undefined,submission:Request|undefined,binding:ReturnType<typeof issuerBinding>|undefined;
  let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:Promise<void>}|undefined;
- let handoffStarted=false,passiveBlock:Promise<void>|undefined;
- let passiveRequest:{request:Request;confirm:()=>void}|undefined;
+ let handoffStarted=false,passiveDeadline:number|undefined;
+ const passiveBlocks=new Map<string,Promise<void>>();
+ const passiveFailures=new Map<Request,()=>void>();
  const issuerReady=Promise.withResolvers<void>(),issuerDispatched=Promise.withResolvers<void>(),navigation=new WeakMap<Frame,number>();
  const revision=(frame:Frame)=>navigation.get(frame)??0;
  page.on('framenavigated',frame=>navigation.set(frame,revision(frame)+1));
  page.on('requestfailed',request=>{
-  if(passiveRequest?.request!==request)return;
+  const confirm=passiveFailures.get(request);
+  if(!confirm)return;
   const reason=request.failure()?.errorText;
-  if(reason==='net::ERR_BLOCKED_BY_CLIENT' || reason==='net::ERR_BLOCKED_BY_CLIENT.Inspector')passiveRequest.confirm();
+  if(reason==='net::ERR_BLOCKED_BY_CLIENT' || reason==='net::ERR_BLOCKED_BY_CLIENT.Inspector')confirm();
  });
  function stamped(chain:FrameSnapshot|undefined){
   if(!chain)return;
@@ -288,7 +290,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     report('BROWSER_CHALLENGE_ISSUER_ASSET_HANDOFF');
     requireValue(!handoffStarted);
     report('BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT');
-    requireValue(!passiveBlock);
+    requireValue(passiveBlocks.size<2&&!passiveBlocks.has(url.pathname));
     report('BROWSER_CHALLENGE_ISSUER_ASSET_BINDING');
     requireValue(binding && new URL(binding.url).origin===url.origin);
     report('BROWSER_CHALLENGE_ISSUER_ASSET_WORKER');
@@ -319,8 +321,14 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     }
     report(kind==='image'?'BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX':'BROWSER_CHALLENGE_ISSUER_ASSET_FONT_SUFFIX');
     requireValue(issuerAssetSuffixMatches(kind,url.pathname));
+    // Both distinct requests share the first request's deadline. A late second
+    // request cannot start a new proof window or inherit another request's receipt.
+    passiveDeadline??=Math.min(limits.deadline,Date.now()+750);
+    const blockLimits={deadline:passiveDeadline,signal:limits.signal};
+    report('BROWSER_CHALLENGE_ISSUER_ASSET_DEADLINE');
+    billingCheck(blockLimits);
     const failed=Promise.withResolvers<void>();
-    passiveBlock=billingBounded(limits,async active=>{
+    const block=billingBounded(blockLimits,async active=>{
      await check();billingCheck(active);
      requireIssuerDocument();
      report('BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK');
@@ -328,13 +336,14 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
      await check();billingCheck(active);
      requireIssuerDocument();
      report('BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK');
-     passiveRequest={request,confirm:failed.resolve};
+     passiveFailures.set(request,failed.resolve);
      // This optional asset never receives response-stage authority.
      await Promise.all([route.abort('blockedbyclient'),failed.promise]);
      await check();billingCheck(active);
      requireIssuerDocument();
     },750);
-    try{await passiveBlock;}finally{passiveRequest=undefined;}
+    passiveBlocks.set(url.pathname,block);
+    try{await block;}finally{passiveFailures.delete(request);}
     return;
    }
    const stage=initialIssuerDispatched?'LATER':'INITIAL';
@@ -407,7 +416,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   };
   handoffStarted=true;
   // Let the route's fixed checkpoint reach the owner on failure, while preventing handoff.
-  await passiveBlock?.catch(()=>billingBounded(limits,()=>new Promise<never>(()=>{}),750));
+  await Promise.all(passiveBlocks.values()).catch(()=>billingBounded(limits,()=>new Promise<never>(()=>{}),750));
   await validate();await billingBounded(limits,l=>waitForGesture({deadline:l.deadline,signal:l.signal!}),180000);await validate();
   // A pending form navigation can block evaluation in the issuer renderer.
   // Keep the trusted click receipt in the runner, tied to the armed document.
