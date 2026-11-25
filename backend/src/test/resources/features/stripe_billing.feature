@@ -32,6 +32,16 @@ Feature: Stripe Billing through the configured application and official SDK
     And Stripe reports the original trial subscription paused
     Then the same subscription is paused without debt or a new invoice or payment
 
+  @billing-required-trial-isolation
+  Scenario: A required trial starts only after its own card setup and leaves a sibling trial unchanged
+    Given an owned Stripe Billing subscription with 7 trial days
+    When its original zero Stripe trial invoice is reconciled
+    Then trial access exists without a cash payment or payment succeeded fact
+    When the same customer requests a required-method Stripe trial for a second product
+    Then the second trial has only its original setup receipt without cash or access
+    When that exact setup succeeds and its original Stripe zero invoice is reconciled
+    Then only the second trial owns the verified card and the sibling trial is unchanged
+
   @billing-trial-resume
   Scenario: A paused optional trial resumes only after verified cash for its explicit resumption
     Given an owned Stripe Billing subscription with 7 trial days

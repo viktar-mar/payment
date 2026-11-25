@@ -126,6 +126,8 @@ Run `53522ebc-50a2-40aa-ba94-dbce98f2ecbd` at `869cc2f` stopped at `BROWSER_CHAL
 
 Run `f041acfc-ad02-4e52-9bce-ce6988117579` at `3858c00` identified the exact failure as `BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT`. A second non-navigation issuer request reached the one-request limit before handoff. The run stopped before challenge acknowledgement or settlement and confirmed cleanup. The browser now supports blocking two distinct matching paths in one 750 ms window started by the first. Each exact Request must independently pass the same asset checks, produce its blocked-by-client event, and remain bound to the same original issuer document. [Local completion report](../.superpowers/native-initial-3ds/f041acfc-ad02-4e52-9bce-ce6988117579/completion.json)
 
+Run `01402923-54f8-4242-ad4e-1ccdc11b16bf` at `9eee37d` still reached `BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT` before handoff and confirmed cleanup. That code represented either a repeated path or an additional distinct path after two slots were used. The local diagnostic now reports repeated paths separately. Both checks still stop before handoff. The run supplied no native 3DS settlement evidence. [Local completion report](../.superpowers/native-initial-3ds/01402923-54f8-4242-ad4e-1ccdc11b16bf/completion.json)
+
 ### Earlier initial-decline and Retry attempts
 
 The first native initial-decline/retry attempt, `a35eb316-f842-42b7-a1b0-157f942a8e99` at `d8bebcf163b3457e68f412ed4e6b7c582d349e69`, exited 1 with `phase=RETRY_ACK code=BROWSER cleanup=UNCONFIRMED`. The last durable operation was `CREATE_ACK`. The ledger contains no first confirmation, Retry or successor confirmation dispatch. The phase label is shared by several acknowledgements, including creation, and leaves the exact browser failure undetermined. A separate check found all seven containers exited and no Stripe listener for this run. Initial decline and retry remain pending native evidence.
@@ -205,6 +207,8 @@ The dedicated missed-notification case holds two original signed notifications, 
 The remaining native cases cover first-payment 3DS, trials, payment-method isolation and paused resumption, plan changes, and Portal navigation and return. The matrix below gives the implementation and evidence for each area.
 
 The local scheduled-change scenario now schedules a same-product €15 downgrade on the original €20 subscription and clears it before the captured boundary. The application and the pinned SDK loopback fixture verify the original creation, configuration and release keys, the same cash, price, paid-through date, and the exact signed schedule and clear deliveries. The complete Billing feature passed 11 scenarios and 108 steps on disposable PostgreSQL 14. Native scheduled-change acceptance remains open.
+
+The local required-trial case creates a second trial for the same Customer after verifying the required trial's own setup and payment method. Both original zero invoices, trial grants, eligible products and signed events are proved separately. A subsequent Stripe Customer default on the shared account leaves the sibling without an inherited method and without new provider writes. The expanded Billing feature passed all 12 scenarios and 118 steps. The 27 focused Stripe trial and five method-isolation tests also passed. The runs used disposable PostgreSQL 14 and the pinned Stripe SDK against loopback responses. Native trial and method-isolation acceptance remain open.
 
 ## Fresh failed renewal, grace and recovery — 2026-11-15
 

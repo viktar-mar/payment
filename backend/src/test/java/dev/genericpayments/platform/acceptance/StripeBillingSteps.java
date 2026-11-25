@@ -71,7 +71,16 @@ public class StripeBillingSteps {
     private final List<InvoiceGraph> invoices = new ArrayList<>();
     private List<Long> evidence;
     private TrialPublication originalTrial;
-    private SubscriptionOperationResult trialSetup, trialResume;
+    private SubscriptionOperationResult trialSetup, trialResume, requiredTrial;
+    private ProductId requiredTrialProduct;
+    private PriceId requiredTrialPrice;
+    private JsonObject requiredTrialSetup, requiredTrialRemote;
+    private SubscriptionBillingProofStore.Setup pendingRequiredSetup;
+    private Subscription siblingTrial;
+    private TrialPublication siblingPublication;
+    private Subscription.Period requiredTrialPeriod;
+    private static final BillingRefs BILLING = new BillingRefs("sub_billing", "si_billing", "price_billing", "prod_billing");
+    private static final BillingRefs REQUIRED = new BillingRefs("sub_required", "si_required", "price_required", "prod_required");
     private Subscription.Period resumedPeriod;
     private int beforeDenied, beforeFake;
     private UUID fakeSubscription;
@@ -106,7 +115,8 @@ public class StripeBillingSteps {
     private SubscriptionCommandContext context(String key) {
         return new SubscriptionCommandContext(actor,site,customer.id(),ORIGIN,key,"stripe-billing-acceptance");
     }
-    private Subscription subscription() { return bean(SubscriptionStore.class).find(site,created.subscriptionId()).orElseThrow(); }
+    private Subscription subscription() { return subscription(created.subscriptionId()); }
+    private Subscription subscription(UUID id) { return bean(SubscriptionStore.class).find(site,id).orElseThrow(); }
     private SubscriptionOperation operation(UUID id) {
         return bean(SubscriptionTransactionPort.class).required(() -> bean(SubscriptionOperationStore.class).lock(id));
     }
@@ -190,18 +200,20 @@ public class StripeBillingSteps {
         assertThat(created.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
         assertThat(subscription().providerReference()).isEqualTo("sub_billing");
     }
-    private JsonObject subscriptionJson() {
+    private JsonObject subscriptionJson() { return subscriptionJson(BILLING, price); }
+    private JsonObject subscriptionJson(BillingRefs refs, PriceId localPrice) {
         return json("""
-            {"id":"sub_billing","object":"subscription","livemode":false,"customer":"cus_billing","status":"incomplete","currency":"eur",
+            {"id":"%s","object":"subscription","livemode":false,"customer":"cus_billing","status":"incomplete","currency":"eur",
              "collection_method":"charge_automatically","billing_mode":{"type":"classic"},"cancel_at_period_end":false,
              "payment_settings":{"payment_method_types":["card"],"save_default_payment_method":"on_subscription"},
-             "items":{"object":"list","has_more":false,"data":[{"id":"si_billing","object":"subscription_item","subscription":"sub_billing","quantity":1,
-              "current_period_start":%d,"current_period_end":%d,"price":{"id":"price_billing","object":"price","livemode":false,"product":"prod_billing","currency":"eur","unit_amount":2000,
+             "items":{"object":"list","has_more":false,"data":[{"id":"%s","object":"subscription_item","subscription":"%s","quantity":1,
+              "current_period_start":%d,"current_period_end":%d,"price":{"id":"%s","object":"price","livemode":false,"product":"%s","currency":"eur","unit_amount":2000,
               "tax_behavior":"inclusive","type":"recurring","recurring":{"interval":"month","interval_count":1,"usage_type":"licensed"},"metadata":{"local_price_id":"%s","local_price_version":"1"}}}]}}
-            """.formatted(start.getEpochSecond(),end.getEpochSecond(),price.value()));
+            """.formatted(refs.subscription(),refs.item(),refs.subscription(),start.getEpochSecond(),end.getEpochSecond(),refs.price(),refs.product(),localPrice.value()));
     }
-    private void setPeriod(Instant from,Instant until) {
-        var item=remote.getAsJsonObject("items").getAsJsonArray("data").get(0).getAsJsonObject();
+    private void setPeriod(Instant from,Instant until) { setPeriod(remote, from, until); }
+    private static void setPeriod(JsonObject subscription, Instant from, Instant until) {
+        var item=subscription.getAsJsonObject("items").getAsJsonArray("data").get(0).getAsJsonObject();
         item.addProperty("current_period_start",from.getEpochSecond());item.addProperty("current_period_end",until.getEpochSecond());
     }
     @Then("its Stripe create acknowledgement has no cash or paid access") public void acknowledgement() {
@@ -210,29 +222,34 @@ public class StripeBillingSteps {
         assertThat(count("payment_events","site_id=? and event_type='PAYMENT_SUCCEEDED'",site.value())).isZero();
     }
     private InvoiceGraph invoice(String suffix,String reason,Instant from,Instant until,String settlement) {
+        return invoice(suffix, reason, from, until, settlement, BILLING);
+    }
+    private InvoiceGraph invoice(String suffix,String reason,Instant from,Instant until,String settlement,BillingRefs refs) {
         String id="in_"+suffix;long amount=settlement.equals("ZERO")?0:2000;
         var invoice=json("""
             {"id":"%s","object":"invoice","livemode":false,"customer":"cus_billing","currency":"eur","status":"%s","billing_reason":"%s","created":%d,
              "collection_method":"charge_automatically","amount_due":%d,"amount_paid":%d,"amount_remaining":%d,"amount_paid_off_stripe":0,"amount_overpaid":0,"total":%d,"subtotal":%d,
              "starting_balance":0,"ending_balance":0,"pre_payment_credit_notes_amount":0,"post_payment_credit_notes_amount":0,"discounts":[],"total_discount_amounts":[],"total_pretax_credit_amounts":[],"total_taxes":[],
              "attempted":true,"attempt_count":1,"auto_advance":false,"next_payment_attempt":null,
-             "parent":{"type":"subscription_details","subscription_details":{"subscription":"sub_billing"}}}
-            """.formatted(id,settlement.equals("OPEN")?"open":"paid",reason,from.getEpochSecond(),amount,settlement.equals("OPEN")?0:amount,settlement.equals("OPEN")?amount:0,amount,amount));
+             "parent":{"type":"subscription_details","subscription_details":{"subscription":"%s"}}}
+            """.formatted(id,settlement.equals("OPEN")?"open":"paid",reason,from.getEpochSecond(),amount,settlement.equals("OPEN")?0:amount,settlement.equals("OPEN")?amount:0,amount,amount,refs.subscription()));
         var line=json("""
-            {"id":"il_%s","object":"line_item","livemode":false,"invoice":"%s","subscription":"sub_billing","currency":"eur","quantity":1,"amount":%d,"discount_amounts":[],"pretax_credit_amounts":[],
-             "period":{"start":%d,"end":%d},"parent":{"type":"subscription_item_details","subscription_item_details":{"subscription":"sub_billing","subscription_item":"si_billing","proration":false}},
-             "pricing":{"type":"price_details","price_details":{"price":"price_billing","product":"prod_billing"}}}
-            """.formatted(suffix,id,amount,from.getEpochSecond(),until.getEpochSecond()));
+            {"id":"il_%s","object":"line_item","livemode":false,"invoice":"%s","subscription":"%s","currency":"eur","quantity":1,"amount":%d,"discount_amounts":[],"pretax_credit_amounts":[],
+             "period":{"start":%d,"end":%d},"parent":{"type":"subscription_item_details","subscription_item_details":{"subscription":"%s","subscription_item":"%s","proration":false}},
+             "pricing":{"type":"price_details","price_details":{"price":"%s","product":"%s"}}}
+            """.formatted(suffix,id,refs.subscription(),amount,from.getEpochSecond(),until.getEpochSecond(),refs.subscription(),refs.item(),refs.price(),refs.product()));
         var allocation=json("{\"id\":\"inpay_"+suffix+"\",\"object\":\"invoice_payment\",\"livemode\":false,\"invoice\":\""+id+"\",\"currency\":\"eur\",\"status\":\"paid\",\"amount_paid\":2000,\"amount_requested\":2000,\"payment\":{\"type\":\"payment_intent\",\"payment_intent\":\"pi_"+suffix+"\"},\"status_transitions\":{\"paid_at\":"+from.getEpochSecond()+"}}");
         var intent=json("{\"id\":\"pi_"+suffix+"\",\"object\":\"payment_intent\",\"livemode\":false,\"customer\":\"cus_billing\",\"currency\":\"eur\",\"amount\":2000,\"amount_received\":2000,\"status\":\"succeeded\",\"capture_method\":\"automatic\",\"payment_method_types\":[\"card\"],\"latest_charge\":\"ch_"+suffix+"\"}");
         var charge=json("{\"id\":\"ch_"+suffix+"\",\"object\":\"charge\",\"livemode\":false,\"customer\":\"cus_billing\",\"payment_intent\":\"pi_"+suffix+"\",\"currency\":\"eur\",\"amount\":2000,\"amount_captured\":2000,\"paid\":true,\"captured\":true,\"status\":\"succeeded\",\"created\":"+from.getEpochSecond()+",\"payment_method_details\":{\"type\":\"card\"},\"amount_refunded\":0,\"refunded\":false}");
         return new InvoiceGraph(suffix,settlement,invoice,line,allocation,intent,charge);
     }
     /** Exact native transport order: complete invoice/line/allocation pages plus reverse allocation join. */
-    private void readGraph() {
-        identity();respond("GET","/v1/customers/cus_billing",remoteCustomer);respond("GET","/v1/subscriptions/sub_billing",remote);
-        http.enqueue("GET","/v1/invoices",200,page(invoices.stream().map(InvoiceGraph::invoice).toList()));
-        for(var graph:invoices) {
+    private void readGraph() { readGraph(remote, invoices); }
+    private void readGraph(JsonObject subscription, List<InvoiceGraph> billing) {
+        identity();respond("GET","/v1/customers/cus_billing",remoteCustomer);
+        respond("GET","/v1/subscriptions/"+subscription.get("id").getAsString(),subscription);
+        http.enqueue("GET","/v1/invoices",200,page(billing.stream().map(InvoiceGraph::invoice).toList()));
+        for(var graph:billing) {
             respondPage("/v1/invoices/in_"+graph.suffix()+"/lines",List.of(graph.line()));
             respondPage("/v1/invoice_payments",graph.settlement().equals("CASH")?List.of(graph.allocation()):List.of());
             if(graph.settlement().equals("CASH")) {
@@ -240,8 +257,9 @@ public class StripeBillingSteps {
                 respondPage("/v1/invoice_payments",List.of(graph.allocation()));
             }
         }
-        if (remote.has("default_payment_method")) {
-            respond("GET", "/v1/payment_methods/pm_trial", trialPaymentMethod());
+        if (subscription.has("default_payment_method")) {
+            String method=subscription.get("default_payment_method").getAsString();
+            respond("GET", "/v1/payment_methods/"+method, trialPaymentMethod(method));
         }
     }
     private void respondPage(String path,List<JsonObject> items) { http.enqueue("GET",path,200,page(items)); }
@@ -431,6 +449,210 @@ public class StripeBillingSteps {
             site.value(),created.subscriptionId(),account.id().value(),created.operationId(),start.getEpochSecond(),end.getEpochSecond());
     }
 
+    @When("the same customer requests a required-method Stripe trial for a second product")
+    public void startRequiredTrialSetup() {
+        siblingTrial=subscription();
+        siblingPublication=trialPublication();
+        requiredTrialProduct=new ProductId(UUID.randomUUID());
+        requiredTrialPrice=new PriceId(UUID.randomUUID());
+        jdbc.update("""
+            insert into products(id,site_id,product_key,name,status,created_at,updated_at)
+            select ?,site_id,'billing-required','Required trial','ACTIVE',created_at,updated_at from products where id=?
+            """,requiredTrialProduct.value(),product.value());
+        jdbc.update("""
+            insert into prices(id,site_id,product_id,price_key,price_version,price_type,amount_minor,currency,billing_interval,
+              trial_days,trial_payment_method_policy,tax_mode,status,published_at,created_at,updated_at)
+            select ?,site_id,?,'required-monthly',price_version,price_type,amount_minor,currency,billing_interval,
+              trial_days,'REQUIRED_BEFORE_TRIAL',tax_mode,status,published_at,created_at,updated_at from prices where id=?
+            """,requiredTrialPrice.value(),requiredTrialProduct.value(),price.value());
+        bean(ProviderCatalogMappingPort.class).save(new ProviderCatalogMapping(account.id(),requiredTrialProduct,
+            new ProviderProductRef(REQUIRED.product()),requiredTrialPrice,new ProviderPriceRef(REQUIRED.price()),now()));
+        requiredTrialSetup=json("""
+            {"id":"seti_required","object":"setup_intent","livemode":false,"customer":"cus_billing",
+             "usage":"off_session","payment_method_types":["card"],"status":"requires_payment_method"}
+            """);
+        identity();
+        http.enqueue("POST","/v1/setup_intents",200,call -> {
+            requiredTrialSetup.add("metadata",fixtureMetadata(call,List.of("operation_id","subscription_id")));
+            requiredTrialSetup.addProperty("created",firstDispatch(call));
+            return requiredTrialSetup.toString();
+        });
+        requiredTrial=bean(CreateSubscriptionUseCase.class).create(
+            new CreateSubscriptionUseCase.Command(context(key()),requiredTrialPrice,true));
+    }
+
+    @Then("the second trial has only its original setup receipt without cash or access")
+    public void requiredSetupRemainsPending() {
+        var original=operation(requiredTrial.operationId());
+        var local=subscription(requiredTrial.subscriptionId());
+        var steps=bean(ProviderOperationStore.class);
+        var proofs=bean(SubscriptionBillingProofStore.class);
+        var setupStep=steps.find(account.id(),original.providerOperationKey()+":SETUP").orElseThrow();
+        pendingRequiredSetup=proofs.setup(account.id(),original.id()).orElseThrow();
+        assertThat(requiredTrial.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        assertThat(original.kind()).isEqualTo(SubscriptionOperation.Kind.CREATE);
+        assertThat(original.providerReference()).isNull();
+        assertThat(setupStep.status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
+        assertThat(setupStep.resourceId()).isEqualTo(original.id());
+        assertThat(pendingRequiredSetup).isEqualTo(new SubscriptionBillingProofStore.Setup(original.id(),local.id(),account.id(),setupStep.id(),"seti_required",null));
+        assertThat(steps.find(account.id(),original.providerOperationKey())).isEmpty();
+        assertThat(proofs.trial(account.id(),local.id())).isEmpty();
+        assertThat(local.billingStatus()).isEqualTo(Subscription.Status.INCOMPLETE);
+        assertThat(local.providerReference()).isNull();
+        assertThat(local.trial()).isNull();
+        assertThat(bean(QuerySubscriptionsUseCase.class).get(actor,site,local.id()).access().allowed()).isFalse();
+        assertThat(bean(TrialEligibilityStore.class).find(site,customer.id(),requiredTrialProduct)).hasValueSatisfying(eligibility -> {
+            assertThat(eligibility.reservedByOperation()).isEqualTo(original.id());
+            assertThat(eligibility.consumedAt()).isNull();
+        });
+        assertThat(count("subscription_billing_records","subscription_id=?",local.id())).isZero();
+        assertThat(http.calls().stream().filter(call -> !call.method().equals("GET")))
+            .extracting(call -> call.method()+" "+call.path())
+            .containsExactly("POST /v1/customers","POST /v1/subscriptions","POST /v1/setup_intents");
+        assertThat(cash()).isZero();
+    }
+
+    @When("that exact setup succeeds and its original Stripe zero invoice is reconciled")
+    public void verifyRequiredTrial() {
+        var providerNow=Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        StripeAcceptanceConfiguration.providerTime(providerNow);
+        requiredTrialSetup.addProperty("status","succeeded");
+        requiredTrialSetup.addProperty("payment_method","pm_required");
+        identity();
+        respond("GET","/v1/setup_intents/seti_required",requiredTrialSetup);
+        respond("GET","/v1/payment_methods/pm_required",trialPaymentMethod("pm_required"));
+        identity();
+        respond("GET","/v1/customers/cus_billing",remoteCustomer);
+        identity();
+        requiredTrialRemote=subscriptionJson(REQUIRED,requiredTrialPrice);
+        http.enqueue("POST","/v1/subscriptions",200,call -> {
+            long dispatched=firstDispatch(call);
+            var from=Instant.ofEpochSecond(dispatched);
+            var until=Instant.ofEpochSecond(Long.parseLong(call.form().get("trial_end")));
+            requiredTrialPeriod=new Subscription.Period(from,until);
+            requiredTrialRemote.addProperty("created",dispatched);
+            requiredTrialRemote.addProperty("status","trialing");
+            requiredTrialRemote.addProperty("trial_start",dispatched);
+            requiredTrialRemote.addProperty("trial_end",until.getEpochSecond());
+            requiredTrialRemote.add("trial_settings",json("{\"end_behavior\":{\"missing_payment_method\":\"pause\"}}"));
+            requiredTrialRemote.addProperty("default_payment_method","pm_required");
+            requiredTrialRemote.add("metadata",fixtureMetadata(call,List.of("account_id","site_id","customer_id","subscription_id","operation_id")));
+            setPeriod(requiredTrialRemote,from,until);
+            return requiredTrialRemote.toString();
+        });
+        var continued=bean(ContinueOriginalSubscriptionSetupUseCase.class).api(context(key()),requiredTrial.subscriptionId(),requiredTrial.operationId());
+        assertThat(continued.operationId()).isEqualTo(requiredTrial.operationId());
+        assertThat(continued.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+        assertThat(requiredTrialPeriod).isEqualTo(new Subscription.Period(providerNow,providerNow.plus(Duration.ofDays(7))));
+        assertThat(bean(QuerySubscriptionsUseCase.class).get(actor,site,requiredTrial.subscriptionId()).access().allowed()).isFalse();
+        TestClock.set(Instant.now().truncatedTo(ChronoUnit.MICROS));
+        var zero=invoice("requiredtrial","subscription_create",requiredTrialPeriod.start(),requiredTrialPeriod.end(),"ZERO",REQUIRED);
+        readGraph(requiredTrialRemote,List.of(zero));
+        bean(ReconcileSubscriptionUseCase.class).reconcile(new ReconcileSubscriptionUseCase.Command(context(key()),requiredTrial.subscriptionId()));
+    }
+
+    @Then("only the second trial owns the verified card and the sibling trial is unchanged")
+    public void requiredTrialMethodIsolation() {
+        var original=operation(requiredTrial.operationId());
+        var local=subscription(requiredTrial.subscriptionId());
+        var proofs=bean(SubscriptionBillingProofStore.class);
+        var setup=new SubscriptionBillingProofStore.Setup(original.id(),local.id(),account.id(),pendingRequiredSetup.step(),"seti_required","pm_required");
+        var createStep=bean(ProviderOperationStore.class).find(account.id(),original.providerOperationKey()).orElseThrow();
+        assertThat(original.status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+        assertThat(original.providerReference()).isEqualTo(REQUIRED.subscription());
+        assertThat(createStep.status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
+        assertThat(createStep.resourceId()).isEqualTo(original.id());
+        assertThat(createStep.providerReference()).isEqualTo(REQUIRED.subscription());
+        assertThat(proofs.setup(account.id(),original.id())).contains(setup);
+        assertThat(proofs.method(account.id(),local.id(),"pm_required")).contains(setup);
+        assertThat(proofs.method(account.id(),siblingTrial.id(),"pm_required")).isEmpty();
+        assertThat(proofs.trial(account.id(),local.id())).contains(new SubscriptionBillingProofStore.Trial(original.id(),local.id(),account.id(),
+            requiredTrialPeriod.end().getEpochSecond(),createStep.id(),REQUIRED.subscription(),REQUIRED.item(),"in_requiredtrial",requiredTrialPeriod.start().getEpochSecond()));
+        assertThat(bean(TrialEligibilityStore.class).find(site,customer.id(),requiredTrialProduct)).hasValueSatisfying(eligibility -> {
+            assertThat(eligibility.reservedByOperation()).isEqualTo(original.id());
+            assertThat(eligibility.consumedAt()).isNotNull();
+        });
+        var decision=bean(QuerySubscriptionsUseCase.class).get(actor,site,local.id()).access();
+        assertThat(decision.reason()).isEqualTo(AccessDecision.Reason.TRIAL);
+        assertThat(decision.entitledPriceId()).isEqualTo(requiredTrialPrice);
+        assertThat(decision.validUntil()).isEqualTo(SubscriptionAccessPolicy.validUntil(now(),requiredTrialPeriod.end()));
+        assertThat(local.trial()).isEqualTo(requiredTrialPeriod);
+        assertThat(local.paidThrough()).isNull();
+        assertThat(count("subscription_billing_records","subscription_id=? and provider_invoice_reference='in_requiredtrial' and settlement='ZERO_AMOUNT' and amount_due_minor=0",local.id())).isOne();
+        assertThat(cash()).isZero();
+        assertThat(count("payment_events","site_id=?",site.value())).isZero();
+
+        // A Customer-level default is shared in the provider object, while each Subscription still owns its own method.
+        remoteCustomer.add("invoice_settings",json("{\"default_payment_method\":\"pm_required\"}"));
+        int before=http.calls().size();
+        readGraph();
+        var siblingRead=bean(SubscriptionProviderRegistry.class).forAccount(account).retrieve(
+            new SubscriptionProviderModels.Lookup(account,siblingTrial.id(),siblingTrial.providerReference(),operation(created.operationId()).providerOperationKey()));
+        assertThat(siblingRead.paymentMethodReady()).isFalse();
+        assertThat(http.calls().subList(before,http.calls().size())).allSatisfy(call -> {
+            assertThat(call.method()).isEqualTo("GET");
+            assertThat(call.path()).doesNotStartWith("/v1/payment_methods");
+        });
+        assertThat(subscription()).isEqualTo(siblingTrial);
+        assertThat(trialPublication()).isEqualTo(siblingPublication);
+        assertThat(proofs.method(account.id(),siblingTrial.id(),"pm_required")).isEmpty();
+        assertThat(proofs.method(account.id(),local.id(),"pm_required")).contains(setup);
+        var writes=http.calls().stream().filter(call -> !call.method().equals("GET")).toList();
+        assertThat(writes).extracting(call -> call.method()+" "+call.path())
+            .containsExactly("POST /v1/customers","POST /v1/subscriptions","POST /v1/setup_intents","POST /v1/subscriptions");
+        assertThat(writes.get(1).form()).doesNotContainKey("default_payment_method");
+        assertThat(writes.get(2).header("Idempotency-Key")).isEqualTo(original.providerOperationKey()+":SETUP");
+        assertThat(writes.get(2).form()).containsEntry("metadata[subscription_id]",local.id().toString()).containsEntry("metadata[operation_id]",original.id().toString());
+        assertThat(writes.get(3).header("Idempotency-Key")).isEqualTo(original.providerOperationKey());
+        assertThat(writes.get(3).form()).containsEntry("default_payment_method","pm_required")
+            .containsEntry("metadata[subscription_id]",local.id().toString()).containsEntry("metadata[operation_id]",original.id().toString());
+        assertTrialStartCallback(local,original.id(),"in_requiredtrial");
+        assertTrialStartCallback(siblingTrial,created.operationId(),"in_trial");
+        assertThat(count("outbox_events","site_id=?",site.value())).isEqualTo(2);
+        deliverCallbacks(Set.of(local.id(),siblingTrial.id()));
+    }
+
+    private void assertTrialStartCallback(Subscription trial, UUID operationId, String invoice) {
+        var payloads=jdbc.queryForList("""
+            select o.payload::text from subscription_events e
+            join outbox_events o on o.id=e.id and o.subscription_event_id=e.id
+              and o.site_id=e.site_id and o.subscription_id=e.subscription_id and o.payment_account_id=e.payment_account_id
+            join stripe_subscription_trial_proofs p on p.site_id=e.site_id and p.subscription_id=e.subscription_id
+              and p.payment_account_id=e.payment_account_id and p.operation_id=? and p.invoice_reference=?
+            join subscription_billing_records b on b.site_id=p.site_id and b.subscription_id=p.subscription_id
+              and b.payment_account_id=p.payment_account_id and b.provider_invoice_reference=p.invoice_reference
+            where e.site_id=? and e.subscription_id=? and e.payment_account_id=? and e.event_type='TRIAL_STARTED'
+              and e.source='RECONCILIATION' and e.revision=?
+              and b.kind='INITIAL' and b.settlement='ZERO_AMOUNT' and b.amount_due_minor=0
+              and (e.billing_record_id is null or e.billing_record_id=b.id)
+              and o.source_kind='SUBSCRIPTION' and o.callback_type='subscription.updated'
+              and o.payload->'schema_version'='4'::jsonb and o.payload->'revision'=to_jsonb(e.revision)
+              and o.payload->>'event_id'=e.id::text and o.payload->>'event_type'=o.callback_type
+              and o.payload->>'site_id'=e.site_id::text and o.payload->>'subscription_id'=e.subscription_id::text
+              and o.payload->>'customer_id'=? and o.payload->>'product_id'=?
+              and o.payload->>'state'='TRIALING' and o.payload->'access_allowed'='true'::jsonb
+              and (o.payload->>'occurred_at')::timestamptz=e.occurred_at
+              and o.payload->'billing_record_id'=coalesce(to_jsonb(e.billing_record_id),'null'::jsonb)
+              and e.payment_id is null and o.payload->'payment_id'='null'::jsonb
+              and (o.payload->>'access_valid_until')::timestamptz=least(e.occurred_at+interval '5 minutes',?::timestamptz)
+            """,String.class,operationId,invoice,site.value(),trial.id(),account.id().value(),trial.revision(),
+            customer.id().value().toString(),trial.productId().value().toString(),Timestamp.from(trial.trial().end()));
+        assertThat(payloads).singleElement().satisfies(payload -> assertThat(json(payload).keySet()).containsExactlyInAnyOrder(
+            "schema_version","event_id","event_type","site_id","subscription_id","customer_id","product_id","revision",
+            "state","access_allowed","access_valid_until","occurred_at","billing_record_id","payment_id"));
+    }
+
+    private static JsonObject fixtureMetadata(StripeHttpFixture.Call call, List<String> fields) {
+        var metadata=new JsonObject();
+        for (String field:fields) metadata.addProperty(field,call.form().get("metadata["+field+"]"));
+        return metadata;
+    }
+
+    private long firstDispatch(StripeHttpFixture.Call call) {
+        return jdbc.queryForObject("select floor(extract(epoch from first_dispatched_at))::bigint from provider_operations where operation_key=?",
+            Long.class,call.header("Idempotency-Key"));
+    }
+
     @When("the trial reaches its exact end without a payment method")
     public void reachTrialEnd() {
         originalTrial=trialPublication();
@@ -491,11 +713,12 @@ public class StripeBillingSteps {
             .allSatisfy(call -> assertThat(call.method()).isEqualTo("GET"));
     }
 
-    private JsonObject trialPaymentMethod() {
+    private JsonObject trialPaymentMethod() { return trialPaymentMethod("pm_trial"); }
+    private JsonObject trialPaymentMethod(String method) {
         return json("""
-            {"id":"pm_trial","object":"payment_method","livemode":false,"customer":"cus_billing",
+            {"id":"%s","object":"payment_method","livemode":false,"customer":"cus_billing",
              "type":"card","card":{"brand":"visa","last4":"4242"}}
-            """);
+            """.formatted(method));
     }
 
     @When("the customer sets up a card for that Stripe subscription")
@@ -1044,6 +1267,9 @@ public class StripeBillingSteps {
     }
     @Then("the Portal return leaves subscription cash and lifecycle facts unchanged") public void portalNoMoney() { assertThat(financialEvidence()).isEqualTo(evidence); }
     @Then("its canonical Site callbacks are signed and delivered exactly once") public void deliverCallbacks() {
+        deliverCallbacks(Set.of(created.subscriptionId()));
+    }
+    private void deliverCallbacks(Set<UUID> subscriptions) {
         var outbox=bean(OutboxPort.class);var encryption=bean(EncryptedSecretPort.class);var payloads=bean(CallbackPayloadPort.class);
         // Existing in-memory CallbackHttpPort seam, actual signer/canonical bytes/outbox completion.
         // These delivery scenarios use ordinary initial/change periods, never a future business advance.
@@ -1057,7 +1283,7 @@ public class StripeBillingSteps {
                 new CallbackDeliveryService(outbox,encryption,payloads,(endpoint,headers,body)->{
                     assertThat(bean(SubscriptionTransactionPort.class).active()).isFalse();assertThat(endpoint.toString()).isEqualTo("http://127.0.0.1:8081/callback");
                     long at=Long.parseLong(headers.get("Payment-Timestamp"));assertThat(at).isBetween(before,deliveryClock.instant().getEpochSecond());assertThat(headers.get("Payment-Signature")).isEqualTo("v1="+new CallbackSigner().sign(secret,at,body));
-                    var canonical=json(new String(body,StandardCharsets.UTF_8));assertThat(headers.get("Payment-Event-Id")).isEqualTo(canonical.get("event_id").getAsString());assertThat(canonical.get("site_id").getAsString()).isEqualTo(site.value().toString());assertThat(canonical.get("subscription_id").getAsString()).isEqualTo(created.subscriptionId().toString());assertThat(delivered.add(claim.eventId())).isTrue();return CallbackHttpPort.Result.success(204);
+                    var canonical=json(new String(body,StandardCharsets.UTF_8));assertThat(headers.get("Payment-Event-Id")).isEqualTo(canonical.get("event_id").getAsString());assertThat(canonical.get("site_id").getAsString()).isEqualTo(site.value().toString());assertThat(subscriptions).contains(UUID.fromString(canonical.get("subscription_id").getAsString()));assertThat(delivered.add(claim.eventId())).isTrue();return CallbackHttpPort.Result.success(204);
                 },deliveryClock).deliver(claim);
             } finally { Arrays.fill(secret,(byte)0); }
         }
@@ -1065,5 +1291,6 @@ public class StripeBillingSteps {
         assertThat(count("outbox_deliveries","outbox_event_id in (select id from outbox_events where site_id=?)",site.value())).isEqualTo(claims.size());
         assertThat(outbox.claimAutomatic("stripe-billing-callback-replay",20,now(),Duration.ofSeconds(30))).isEmpty();
     }
+    private record BillingRefs(String subscription,String item,String price,String product) {}
     private record InvoiceGraph(String suffix,String settlement,JsonObject invoice,JsonObject line,JsonObject allocation,JsonObject intent,JsonObject charge) {}
 }
