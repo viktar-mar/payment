@@ -6,12 +6,22 @@ import {initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 // @ts-ignore Native Node executes the guarded response source.
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
 
-const stylesheetRejection='direct reviewed issuer stylesheet rejected';
+const rejectedAssets=new Map([
+ ['direct reviewed issuer stylesheet rejected',{
+  path:'/fixture-private-stylesheet.scss',kind:'stylesheet',checkpoint:'BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET_SUFFIX',
+  contentType:'text/css',body:':root { color: black; }',
+ }],
+ ['direct reviewed issuer script rejected',{
+  path:'/fixture-private-script.js',kind:'script',checkpoint:'BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT',
+  contentType:'application/javascript',
+  body:"document.querySelector('form').append(document.querySelector('template').content.cloneNode(true))",
+ }],
+]);
 const stylesheetBlock='direct reviewed issuer passive stylesheet blocked';
 const twoFonts='direct reviewed issuer two passive fonts blocked';
 const sixFonts='direct reviewed issuer six passive fonts blocked';
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,stylesheetRejection])
-test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet with an unsupported suffix before handoff':'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,...rejectedAssets.keys()])
+test(rejectedAssets.has(mode)?mode+' before handoff':'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
  const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
  const retrieve=api+'/v1/payment_intents/pi_fixture?client_secret='+secret+'&key='+key;
@@ -21,15 +31,16 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet with an
  const blocksPassiveFont=mode==='direct reviewed issuer passive font blocked'||mode===twoFonts||mode===sixFonts;
  const blocksPassiveStylesheet=mode===stylesheetBlock;
  const blocksPassiveAsset=blocksPassiveImage||blocksPassiveFont||blocksPassiveStylesheet;
- const rejectsStylesheet=mode===stylesheetRejection;
- const direct=mode==='direct Stripe EMVCo frame'||mode==='direct reviewed issuer origin'||blocksPassiveAsset||rejectsStylesheet;
+ const rejectedAsset=rejectedAssets.get(mode);
+ const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||Boolean(rejectedAsset);
+ const direct=mode==='direct Stripe EMVCo frame'||scopedIssuer;
  const issuerName=direct?'stripe-challenge-frame':'acsFrame';
- const approvedIssuerOrigin=mode==='direct reviewed issuer origin'||blocksPassiveAsset||rejectsStylesheet?'https://reviewed-test-issuer.stripe.com':undefined;
+ const approvedIssuerOrigin=scopedIssuer?'https://reviewed-test-issuer.stripe.com':undefined;
  const issuerOrigin=approvedIssuerOrigin??'https://hooks.stripe.com',issuer=issuerOrigin+'/fixture-issuer',decision=issuer+'/decision';
- const passiveAsset=issuerOrigin+(rejectsStylesheet?'/fixture-private-stylesheet.scss':blocksPassiveStylesheet?'/fixture-passive.css':
-  blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png');
+ const assetPath=issuerOrigin+(rejectedAsset?.path??(blocksPassiveStylesheet?'/fixture-passive.css':
+  blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png'));
  const fontCount=mode===sixFonts?6:mode===twoFonts?2:1;
- const assetUrls=[passiveAsset,...Array.from({length:fontCount-1},(_,index)=>issuerOrigin+`/fixture-passive-${index+2}.woff2`)];
+ const assetUrls=[assetPath,...Array.from({length:fontCount-1},(_,index)=>issuerOrigin+`/fixture-passive-${index+2}.woff2`)];
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
  const script=`(async()=>{
@@ -53,13 +64,14 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet with an
  const issuerButton='<button name="decision" value="complete">Complete</button>';
  const revealButton="document.querySelector('form').append(document.querySelector('template').content.cloneNode(true))";
  const issuerBody='<!doctype html><form method="post" action="'+decision+'">'+
-  (blocksPassiveAsset||rejectsStylesheet?'<template>'+issuerButton+'</template>':issuerButton)+'</form>'+
-  (blocksPassiveImage?`<img width="1" height="1" alt="" src="${passiveAsset}" onerror="${revealButton}">`:
+  (blocksPassiveAsset||rejectedAsset?'<template>'+issuerButton+'</template>':issuerButton)+'</form>'+
+  (blocksPassiveImage?`<img width="1" height="1" alt="" src="${assetPath}" onerror="${revealButton}">`:
    blocksPassiveFont?`<style>${assetUrls.map((url,index)=>`@font-face{font-family:FixturePassive${index};src:url("${url}") format("woff2")}`).join('')}</style>
      <script>Promise.allSettled([${assetUrls.map((_,index)=>`document.fonts.load('16px FixturePassive${index}','X')`).join(',')}])
        .then(results=>{if(results.every(result=>result.status==='rejected')){${revealButton}}})</script>`:
-   blocksPassiveStylesheet?`<link rel="stylesheet" href="${passiveAsset}" onerror="${revealButton}">`:
-   rejectsStylesheet?`<link rel="stylesheet" href="${passiveAsset}" onload="${revealButton}">`:'');
+   blocksPassiveStylesheet?`<link rel="stylesheet" href="${assetPath}" onerror="${revealButton}">`:
+   rejectedAsset?.kind==='stylesheet'?`<link rel="stylesheet" href="${assetPath}" onload="${revealButton}">`:
+   rejectedAsset?.kind==='script'?`<script src="${assetPath}"></script>`:'');
  const responses=new Map<string,NonNullable<Parameters<Route['fulfill']>[0]>>([
   [demo+'/',{contentType:'text/html',body:'<!doctype html><link rel="icon" href="data:,"><iframe name="__privateStripeFrame7" src="'+outer+'"></iframe>'}],
   [outer,{contentType:'text/html',body:direct?'<!doctype html><body><script>'+script+'</script></body>':
@@ -74,7 +86,7 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet with an
   [decision,{contentType:'text/html',body:'<!doctype html><script>parent.postMessage("fixture decision",'+JSON.stringify(stripe)+')</script>'}],
   [complete,json({complete:true})],
  ]);
- if(rejectsStylesheet)responses.set(passiveAsset,{contentType:'text/css',body:':root { color: black; }'});
+ if(rejectedAsset)responses.set(assetPath,{contentType:rejectedAsset.contentType,body:rejectedAsset.body});
  const channel=process.env.PAYMENT_TEST_CHROME_CHANNEL==='chrome'?'chrome':'chromium';
  const browser=await chromium.launch({channel,headless:true,timeout:10_000,args:[
   '--site-per-process','--disable-background-networking','--proxy-server=direct://','--host-resolver-rules=MAP * ~NOTFOUND',
@@ -90,7 +102,7 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet with an
   page.on('requestfailed',request=>{if(assetUrls.includes(request.url()))passiveFailures.push(request);});
   page.on('response',response=>{if(assetUrls.includes(response.url()))passiveResponses.push(response);});
   const limits={deadline:Date.now()+15_000,signal:stop.signal};
-  let stylesheetErrorRedacted=false;
+  let assetErrorRedacted=false;
   let issuerFrame:Frame|undefined,attachedIssuerFrame=false,separateIssuerTarget=false,gestures=0;
   const guard=await guardChallengeRedirects(page,reason=>refusals.push(reason),{demo,backend},undefined,approvedIssuerOrigin);
   const challenge=initial3dsChallenge({page,limits,demo,owner:()=>({key,secret}),winning:async()=>{},check:async()=>{},
@@ -127,7 +139,7 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet with an
   await context.route('**/*',async route=>{
    const request=route.request(),url=request.url(),response=responses.get(url);
    const isPassiveAsset=blocksPassiveAsset&&assetUrls.includes(url);
-   const isRejectedStylesheet=rejectsStylesheet&&url===passiveAsset;
+   const isRejectedAsset=rejectedAsset&&url===assetPath;
    if(!response&&!isPassiveAsset){await route.abort('blockedbyclient');return;}
    guard.registerRoute(request);
    let checkpoint='route refused';
@@ -142,7 +154,7 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet with an
       forwarded.push(url);
       await route.fulfill(reply);
      };
-     if(isPassiveAsset||isRejectedStylesheet){
+     if(isPassiveAsset||isRejectedAsset){
       passiveRequests.push(request);
      }
      if(isPassiveAsset){
@@ -161,30 +173,31 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet with an
     }
    }catch(error){
     refusals.push(checkpoint);
-    if(isRejectedStylesheet)stylesheetErrorRedacted=error instanceof Error&&String(error)==='Error: billing_BROWSER'&&JSON.stringify(error)==='{}';
+    if(isRejectedAsset)assetErrorRedacted=error instanceof Error&&String(error)==='Error: billing_BROWSER'&&JSON.stringify(error)==='{}';
     await route.abort('blockedbyclient').catch(()=>{});
    }
   });
-  if(rejectsStylesheet){
+  if(rejectedAsset){
    attendance=challenge.attend().then(()=>true,()=>false);
    const [blocked]=await Promise.all([
-    page.waitForEvent('requestfailed',{predicate:request=>request.url()===passiveAsset,timeout:8_000}),
+    page.waitForEvent('requestfailed',{predicate:request=>request.url()===assetPath,timeout:8_000}),
     page.goto(demo+'/',{waitUntil:'domcontentloaded',timeout:7_000}),
    ]);
    assert.equal(attachedIssuerFrame,true);
-   assert.equal(refusals[0],'BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET_SUFFIX');
+   assert.equal(refusals[0],rejectedAsset.checkpoint);
    // The owner retains the first failure. Chromium can also report its abort at the response guard.
    assert.ok(refusals.length===1||refusals.length===2&&refusals[1]==='BROWSER_GUARD_RESPONSE_NETWORK');
-   assert.equal(stylesheetErrorRedacted,true);
+   assert.equal(assetErrorRedacted,true);
    assert.equal(passiveRequests.length,1);
    assert.equal(passiveRequests[0]===blocked,true);
-   assert.equal(blocked.resourceType(),'stylesheet');
+   assert.equal(blocked.resourceType(),rejectedAsset.kind);
    assert.equal(blocked.method(),'GET');
    assert.equal(blocked.frame()===issuerFrame,true);
    assert.equal(blocked.isNavigationRequest(),false);
    assert.equal(blocked.serviceWorker(),null);
    assert.match(blocked.failure()?.errorText??'',/^net::ERR_BLOCKED_BY_CLIENT(?:\.Inspector)?$/);
    assert.equal(blocked.existingResponse(),null);
+   assert.equal(await blocked.frame().locator('form button[name=decision]').count(),0);
    assert.equal(passiveResponses.length,0);
    assert.deepEqual(forwarded,[retrieve,authenticate,issuer]);
    assert.deepEqual(authorized,[retrieve,authenticate,issuer]);
@@ -223,7 +236,7 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet with an
  }finally{
   stop.abort();
   await browser.close();
-  if(blocksPassiveAsset||rejectsStylesheet){
+  if(blocksPassiveAsset||rejectedAsset){
    assert.equal(browser.isConnected(),false);
    if(attendance)assert.equal(await attendance,false);
   }

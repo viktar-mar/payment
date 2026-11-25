@@ -762,7 +762,8 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
    need(confirmation.protocol==='SERVER_CONFIRM_V2' && confirmation.attempt_id===attemptId && confirmation.next_action_allowed===!!challenge && confirmation.successor_attempt_id===null);
    return confirmation;
   }
-  const confirmation=await payOnce(challenge?'4000002500003155':retryPort?'4000000000000002':'4242424242424242');
+  // Stripe's web test fixture that requires successful 3DS2 for every payment.
+  const confirmation=await payOnce(challenge?'4000000000003220':retryPort?'4000000000000002':'4242424242424242');
   if(retryPort){
    need(confirmation.state==='DECLINED' && confirmation.retry_allowed===true);
    need(await retryPort.acknowledge('confirm',{attemptId,state:'DECLINED',nextActionAllowed:false,retryAllowed:true,successorAttemptId:null})===true);check();

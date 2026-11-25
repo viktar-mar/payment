@@ -1376,7 +1376,7 @@ for(const fault of ['none','direct-issuer-valid','late-source-valid','late-issue
    if(challengeRefusals[fault])assert.equal(browserDiagnostic(error,'ACCEPTANCE'),challengeRefusals[fault]);
    return true;
   });
-  assert.deepEqual(f.numbers,['4000002500003155']);
+  assert.deepEqual(f.numbers,['4000000000003220']);
   assert.equal(f.trace.filter(x=>x==='Create subscription').length,1);assert.equal(f.trace.filter(x=>x==='Pay').length,1);
   assert.equal(f.sent.filter(x=>x.endsWith('/confirm')).length,1);assert.ok(f.closed());
   assert.equal(f.trace.includes('issuer witnessed'),success);

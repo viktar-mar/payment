@@ -1,6 +1,6 @@
 # First subscription payment with a 3DS challenge
 
-This isolated case creates one ordinary EUR 20 Sandbox subscription. The first Pay uses a test card that requires authentication. After the server confirms the original PaymentIntent, only the browser that received that confirmation can continue the challenge.
+This isolated case creates one ordinary EUR 20 Sandbox subscription. The first Pay uses Stripe's web test card ending in 3220, which requires successful 3DS2 authentication. After the server confirms the original PaymentIntent, only the browser that received that confirmation can continue the challenge. Stripe does not document a fixed issuer resource set for this test card. [Stripe test cards](https://docs.stripe.com/payments/3d-secure/authentication-flow#test-the-3ds-flow)
 
 ## Running the case
 
