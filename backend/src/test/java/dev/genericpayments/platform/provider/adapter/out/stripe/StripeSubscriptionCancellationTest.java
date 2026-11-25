@@ -11,13 +11,21 @@ import com.stripe.param.SubscriptionUpdateParams;
 import com.stripe.param.common.EmptyParam;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountMode;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingMutationAdapter;
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
+import dev.genericpayments.platform.subscriptions.application.model.SubscriptionCommandContext;
+import dev.genericpayments.platform.subscriptions.application.model.SubscriptionOperationResult;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Lookup;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind;
+import dev.genericpayments.platform.subscriptions.application.port.in.WithdrawSubscriptionCancellationUseCase;
+import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionProviderRegistry;
+import dev.genericpayments.platform.subscriptions.application.service.SubscriptionCancellationService;
+import dev.genericpayments.platform.subscriptions.application.service.SubscriptionCancellationTransaction;
 import dev.genericpayments.platform.subscriptions.domain.Subscription;
 import dev.genericpayments.platform.subscriptions.domain.SubscriptionCancellationRules;
 import dev.genericpayments.platform.subscriptions.domain.SubscriptionFixtures;
+import dev.genericpayments.platform.subscriptions.domain.SubscriptionPolicy;
 import dev.genericpayments.platform.subscriptions.domain.SubscriptionRuleViolation;
 import java.time.Instant;
 import java.time.Clock;
@@ -46,7 +54,7 @@ class StripeSubscriptionCancellationTest {
     void withdrawalDiagnosticReportsOnlyKnownInvalidUpdateParameterCategories(String parameter,String expected)throws Exception{
         try(var c=new CancellationCase()){
             c.observeNativeSchedule();
-            c.current();
+            c.freshObservedCurrent();
             var problem=new com.google.gson.JsonObject();
             problem.addProperty("type","invalid_request_error");
             problem.addProperty("message","private-provider-message https://private.example/request");
@@ -85,7 +93,8 @@ class StripeSubscriptionCancellationTest {
                 }else{
                     if(fault.equals("customer"))c.fixture.graph.customer.addProperty("id","cus_private_canary");
                     if(fault.equals("subscription"))c.fixture.graph.item().addProperty("current_period_end",c.end.plusSeconds(1).getEpochSecond());
-                    c.current();
+                    if(fault.equals("customer")||fault.equals("subscription"))c.current();
+                    else c.freshObservedCurrent();
                     switch(fault){
                         case "authorize" -> doThrow(new IllegalStateException("private-auth-message")).when(c.proofs).authorize(any(),any());
                         case "connection" -> c.fixture.graph.http.disconnectNext("POST",SUBSCRIPTION);
@@ -111,18 +120,154 @@ class StripeSubscriptionCancellationTest {
     void withdrawalDiagnosticSeparatesAnUnclaimedStepFromProviderTransport()throws Exception{
         try(var c=new CancellationCase()){
             c.observeNativeSchedule();
-            var local=c.fixture.local;
-            var account=c.fixture.account;
-            var operation=c.fixture.operation;
-            var fingerprint=StripeBillingMutationAdapter.cancellationFingerprint(account,local,operation,c.fixture.customer,
-                SubscriptionCancellationProofStore.Mode.WITHDRAW,c.end,null,c.observed);
-            var step=c.fixture.steps.reserve(account,ProviderOperation.Kind.SUBSCRIPTION_UPDATE,operation.id(),operation.providerOperationKey(),fingerprint);
+            var step=c.reserveLegacyObservedStep();
             var original=c.fixture.steps.claim(step.id(),"other-owner",c.now,java.time.Duration.ofSeconds(60));
             assertThat(original).isPresent();
             assertWithdrawalDiagnostic("CLAIM",()->assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.UNKNOWN));
             assertThat(c.fixture.steps.findById(step.id())).isEqualTo(original);
             assertThat(c.fixture.graph.http.calls()).isEmpty();
             assertThat(c.receipts).isEmpty();
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={true,false})
+    void legacyObservedWithdrawalReplaysItsOriginalTwoFieldBody(boolean unknown)throws Exception{
+        try(var c=new CancellationCase()){
+            c.observeNativeSchedule();
+            var reserved=c.reserveLegacyObservedStep();
+            var original=c.fixture.steps.claim(reserved.id(),"legacy-owner",c.now.minusSeconds(90),java.time.Duration.ofSeconds(60)).orElseThrow();
+            if(unknown)c.fixture.steps.unknown(original.id(),original.leaseOwner(),original.version());
+            c.fixture.graph.subscription.add("cancel_at",com.google.gson.JsonNull.INSTANCE);
+            c.fixture.graph.subscription.addProperty("cancel_at_period_end",false);
+            c.current();
+            c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(true));
+
+            assertThat(c.fixture.adapter.continueOriginalCancellation(c.command()).outcome()).isEqualTo(Outcome.ACCEPTED);
+            var posts=c.fixture.graph.http.calls().stream().filter(p->p.method().equals("POST")).toList();
+            assertThat(posts).singleElement().satisfies(post->{
+                assertThat(post.path()).isEqualTo(SUBSCRIPTION);
+                assertThat(post.header("Idempotency-Key")).isEqualTo(original.operationKey());
+                assertThat(post.form()).containsExactlyInAnyOrderEntriesOf(Map.of("cancel_at","","cancel_at_period_end","false","proration_behavior","none"));
+            });
+            var acknowledged=c.fixture.steps.only();
+            assertThat(acknowledged.id()).isEqualTo(original.id());
+            assertThat(acknowledged.fingerprint()).isEqualTo(original.fingerprint());
+            assertThat(acknowledged.firstDispatchedAt()).isEqualTo(original.firstDispatchedAt());
+            assertThat(acknowledged.retryBefore()).isEqualTo(original.retryBefore());
+            assertThat(c.receipts.get(c.fixture.operation.id()).observed()).isEqualTo(c.observed);
+            int calls=c.fixture.graph.http.calls().size();
+            assertThat(c.fixture.adapter.continueOriginalCancellation(c.command()).outcome()).isEqualTo(Outcome.ACCEPTED);
+            assertThat(c.fixture.graph.http.calls()).hasSize(calls);
+        }
+    }
+
+    @Test void unknownV2WithdrawalMayRepeatFailedDiscoveryUnderItsOriginalKey()throws Exception{
+        try(var c=new CancellationCase()){
+            c.observeNativeSchedule();
+            c.fixture.graph.http.disconnectNext("GET","/v1/account");
+            assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.UNKNOWN);
+            var key=c.fixture.operation.providerOperationKey();
+            assertThat(c.fixture.steps.find(c.fixture.account.id(),key)).isEmpty();
+            assertThat(c.fixture.graph.http.requestCount("POST",SUBSCRIPTION)).isZero();
+
+            c.markWithdrawalUnknown();
+            c.freshObservedCurrent();
+            c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(true));
+            assertThat(c.fixture.adapter.continueOriginalCancellation(c.command()).outcome()).isEqualTo(Outcome.ACCEPTED);
+            var post=c.fixture.graph.http.calls().getLast();
+            assertThat(post.header("Idempotency-Key")).isEqualTo(key);
+            assertThat(post.form()).containsExactlyInAnyOrderEntriesOf(Map.of("cancel_at_period_end","false","proration_behavior","none"));
+            assertThat(c.receipts.get(c.fixture.operation.id()).observed()).isEqualTo(c.observed);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"v1,UNKNOWN,false","v2,PROCESSING,false","v2,PROCESSING,true"})
+    void undispatchedWithdrawalStaysReadOnlyUnlessItsV2DiscoveryFailed(String version,SubscriptionOperation.Status status,boolean prepared)throws Exception{
+        try(var c=new CancellationCase()){
+            c.observeNativeSchedule();
+            c.operation(SubscriptionOperation.Kind.WITHDRAW_CANCEL,"withdraw",c.end,version,status);
+            var before=prepared?Optional.of(c.reserveNativeObservedStep()):Optional.<ProviderOperation>empty();
+
+            assertThat(c.fixture.adapter.continueOriginalCancellation(c.command())).isNull();
+            assertThat(c.fixture.graph.http.calls()).isEmpty();
+            assertThat(c.fixture.steps.find(c.fixture.account.id(),c.fixture.operation.providerOperationKey())).isEqualTo(before);
+        }
+    }
+
+    @Test void unknownV2WithdrawalWithPreparedStepRetainsItsSelectedWireBody()throws Exception{
+        try(var c=new CancellationCase()){
+            c.observeNativeSchedule();
+            c.markWithdrawalUnknown();
+            var o=c.fixture.operation;
+            var prepared=c.reserveNativeObservedStep();
+            assertThat(prepared.firstDispatchedAt()).isNull();
+            c.current();
+            c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(true));
+
+            assertThat(c.fixture.adapter.continueOriginalCancellation(c.command()).outcome()).isEqualTo(Outcome.ACCEPTED);
+            var post=c.fixture.graph.http.calls().getLast();
+            assertThat(post.header("Idempotency-Key")).isEqualTo(o.providerOperationKey());
+            assertThat(post.form()).containsExactlyInAnyOrderEntriesOf(Map.of("cancel_at_period_end","false","proration_behavior","none"));
+            var acknowledged=c.fixture.steps.only();
+            assertThat(acknowledged.id()).isEqualTo(prepared.id());
+            assertThat(acknowledged.fingerprint()).isEqualTo(prepared.fingerprint());
+            assertThat(acknowledged.status()).isEqualTo(ProviderOperation.Status.ACKNOWLEDGED);
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={true,false})
+    void processingV2WithdrawalResumesTheOriginalDispatchAfterOwnerFailure(boolean unknown)throws Exception{
+        try(var c=new CancellationCase()){
+            c.observeNativeSchedule();
+            var prepared=c.reserveNativeObservedStep();
+            var original=c.fixture.steps.claim(prepared.id(),"initial-owner",c.now.minusSeconds(90),java.time.Duration.ofSeconds(60)).orElseThrow();
+            if(unknown)c.fixture.steps.unknown(original.id(),original.leaseOwner(),original.version());
+            c.fixture.graph.subscription.add("cancel_at",com.google.gson.JsonNull.INSTANCE);
+            c.fixture.graph.subscription.addProperty("cancel_at_period_end",false);
+            c.current();
+            c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(true));
+
+            assertThat(c.fixture.adapter.continueOriginalCancellation(c.command()).outcome()).isEqualTo(Outcome.ACCEPTED);
+            var posts=c.fixture.graph.http.calls().stream().filter(p->p.method().equals("POST")).toList();
+            assertThat(posts).singleElement().satisfies(post->{
+                assertThat(post.header("Idempotency-Key")).isEqualTo(original.operationKey());
+                assertThat(post.form()).containsExactlyInAnyOrderEntriesOf(Map.of("cancel_at_period_end","false","proration_behavior","none"));
+            });
+            var acknowledged=c.fixture.steps.only();
+            assertThat(acknowledged.id()).isEqualTo(original.id());
+            assertThat(acknowledged.fingerprint()).isEqualTo(original.fingerprint());
+            assertThat(acknowledged.firstDispatchedAt()).isEqualTo(original.firstDispatchedAt());
+        }
+    }
+
+    @Test void uncertainV2RetryDoesNotRewriteTheOriginalApplicationOperation()throws Exception{
+        try(var c=new CancellationCase()){
+            c.observeNativeSchedule();
+            c.markWithdrawalUnknown();
+            var o=c.fixture.operation;
+            var phases=mock(SubscriptionCancellationTransaction.class);
+            var registry=mock(SubscriptionProviderRegistry.class);
+            var candidate=new SubscriptionCancellationTransaction.Candidate(c.fixture.local,c.fixture.account,SubscriptionPolicy.defaults(c.fixture.local.siteId()));
+            var reserved=new SubscriptionCancellationTransaction.Reserved(o,c.fixture.local,c.fixture.account,false);
+            var current=new SubscriptionOperationResult(o.id(),o.subscriptionId(),SubscriptionOperation.Status.UNKNOWN,null);
+            when(phases.candidate(any(),any())).thenReturn(candidate);
+            when(phases.reserve(any(),any(),any(),any(),any(),any(),anyBoolean(),anyBoolean())).thenReturn(reserved);
+            when(phases.result(reserved)).thenReturn(current);
+            when(registry.forAccount(c.fixture.account)).thenReturn(c.fixture.adapter);
+            var service=new SubscriptionCancellationService(phases,registry);
+            var context=new SubscriptionCommandContext(null,c.fixture.local.siteId(),c.fixture.local.customerId(),"https://shop.test","original","retry");
+            c.fixture.identity();
+            c.fixture.graph.graph();
+            c.fixture.graph.http.respond("GET","/v1/account","{\"id\":\"acct_foreign\",\"object\":\"account\"}");
+
+            assertThat(service.withdraw(new WithdrawSubscriptionCancellationUseCase.Command(context,o.subscriptionId()))).isEqualTo(current);
+            verify(phases).beforeOriginalReplay(eq(context),eq(reserved),any());
+            verify(phases,never()).reply(any(),any());
+            assertThat(c.fixture.graph.http.requestCount("GET","/v1/account")).isEqualTo(2);
+            assertThat(c.fixture.graph.http.requestCount("POST",SUBSCRIPTION)).isZero();
         }
     }
 
@@ -204,9 +349,15 @@ class StripeSubscriptionCancellationTest {
         try(var c=new CancellationCase()){
             c.current();c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(false));assertThat(c.fixture.adapter.cancel(c.command(),false).outcome()).isEqualTo(Outcome.ACCEPTED);var historical=c.receipts.get(c.fixture.operation.id());
             c.fixture.local=c.fixture.local.scheduleCancellation(c.end,c.now).withdrawCancellation(c.now);c.observeNativeSchedule();var current=c.observed;
-            if(explicitBoundary){c.fixture.graph.subscription.addProperty("cancel_at",c.end.getEpochSecond());c.fixture.graph.subscription.addProperty("cancel_at_period_end",false);}
-            c.current();c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(true));assertThatCode(()->assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.ACCEPTED)).doesNotThrowAnyException();
+            c.fixture.graph.subscription.addProperty("cancel_at",c.end.getEpochSecond());
+            c.fixture.graph.subscription.addProperty("cancel_at_period_end",!explicitBoundary);
+            c.freshObservedCurrent();c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(true));assertThatCode(()->assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.ACCEPTED)).doesNotThrowAnyException();
             var receipt=c.receipts.get(c.fixture.operation.id());assertThat(receipt.observed()).isEqualTo(current);assertThat(receipt.priorOperation()).isNull();assertThat(c.receipts.get(historical.operation())).isEqualTo(historical);assertThat(c.fixture.graph.http.requestCount("POST",SUBSCRIPTION)).isEqualTo(2);
+            var post=c.fixture.graph.http.calls().getLast();
+            assertThat(post.header("Idempotency-Key")).isEqualTo(c.fixture.operation.providerOperationKey());
+            assertThat(post.form()).containsExactlyInAnyOrderEntriesOf(explicitBoundary
+                ? Map.of("cancel_at","","proration_behavior","none")
+                : Map.of("cancel_at_period_end","false","proration_behavior","none"));
         }
     }
     @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={true,false})
@@ -223,10 +374,17 @@ class StripeSubscriptionCancellationTest {
     }
     @Test void unknownObservedWithdrawalReplaysOnlyItsOriginalEventKeyAndPayload()throws Exception{
         try(var c=new CancellationCase()){
-            c.observeNativeSchedule();var original=c.observed;c.current();c.fixture.graph.http.disconnectNext("POST",SUBSCRIPTION);
+            c.observeNativeSchedule();var original=c.observed;c.freshObservedCurrent();c.fixture.graph.http.disconnectNext("POST",SUBSCRIPTION);
             assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.UNKNOWN);var first=c.fixture.steps.only();
-            c.current();c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(true));assertThatCode(()->assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.ACCEPTED)).doesNotThrowAnyException();
-            var posts=c.fixture.graph.http.calls().stream().filter(p->p.method().equals("POST")&&p.path().equals(SUBSCRIPTION)).toList();assertThat(posts).hasSize(2).allSatisfy(p->assertThat(p.header("Idempotency-Key")).isEqualTo(first.operationKey()));assertThat(posts.get(0).form()).isEqualTo(posts.get(1).form());
+            c.markWithdrawalUnknown();
+            c.fixture.graph.subscription.add("cancel_at",com.google.gson.JsonNull.INSTANCE);
+            c.fixture.graph.subscription.addProperty("cancel_at_period_end",false);
+            c.current();c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(true));assertThatCode(()->assertThat(c.fixture.adapter.continueOriginalCancellation(c.command()).outcome()).isEqualTo(Outcome.ACCEPTED)).doesNotThrowAnyException();
+            var posts=c.fixture.graph.http.calls().stream().filter(p->p.method().equals("POST")&&p.path().equals(SUBSCRIPTION)).toList();
+            assertThat(posts).hasSize(2).allSatisfy(p->{
+                assertThat(p.header("Idempotency-Key")).isEqualTo(first.operationKey());
+                assertThat(p.form()).containsExactlyInAnyOrderEntriesOf(Map.of("cancel_at_period_end","false","proration_behavior","none"));
+            });
             assertThat(c.fixture.steps.only().id()).isEqualTo(first.id());assertThat(c.fixture.steps.only().firstDispatchedAt()).isEqualTo(first.firstDispatchedAt());assertThat(c.receipts.get(c.fixture.operation.id()).observed()).isEqualTo(original);assertThat(c.receipts.get(c.fixture.operation.id()).priorOperation()).isNull();
             c.fixture.graph.subscription.addProperty("cancel_at_period_end",false);for(var field:List.of("cancel_at","schedule","pending_update","trial_start","trial_end"))c.fixture.graph.subscription.add(field,com.google.gson.JsonNull.INSTANCE);c.fixture.identity();c.fixture.graph.graph();
             var snapshot=c.fixture.adapter.retrieve(new Lookup(c.fixture.account,c.fixture.local.id(),"sub_owned",c.fixture.operation.providerOperationKey()));assertThat(snapshot.cancellationAt()).isNull();assertThat(snapshot.operationObservation().state()).isEqualTo(OperationState.APPLIED);assertThat(snapshot.externalWithdrawalEvidence()).isEqualTo(new ExternalWithdrawalEvidence(snapshot.subscriptionReference(),snapshot.billingPrice(),snapshot.period(),snapshot.observedAt()));
@@ -234,9 +392,25 @@ class StripeSubscriptionCancellationTest {
     }
     @Test void unknownObservedWithdrawalCannotSelectANewerEventToChangeItsFingerprint()throws Exception{
         try(var c=new CancellationCase()){
-            c.observeNativeSchedule();c.current();c.fixture.graph.http.disconnectNext("POST",SUBSCRIPTION);assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.UNKNOWN);var original=c.fixture.steps.only();
+            c.observeNativeSchedule();c.freshObservedCurrent();c.fixture.graph.http.disconnectNext("POST",SUBSCRIPTION);assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.UNKNOWN);var original=c.fixture.steps.only();
             c.observed=new SubscriptionCancellationProofStore.ObservedSchedule(UUID.randomUUID(),c.observed.revision(),c.end);
             assertThatThrownBy(()->c.fixture.adapter.withdrawCancel(c.command())).isInstanceOf(PaymentApplicationException.class);assertThat(c.fixture.steps.only()).isEqualTo(original);assertThat(c.fixture.graph.http.requestCount("POST",SUBSCRIPTION)).isEqualTo(1);assertThat(c.receipts).isEmpty();
+        }
+    }
+
+    @Test void freshObservedWithdrawalRefusesChangedCancellationFieldAfterClaim()throws Exception{
+        try(var c=new CancellationCase()){
+            c.observeNativeSchedule();
+            c.fixture.graph.subscription.addProperty("cancel_at",c.end.getEpochSecond());
+            c.current();
+            c.fixture.graph.subscription.addProperty("cancel_at_period_end",false);
+            c.current();
+
+            assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.UNKNOWN);
+            assertThat(c.fixture.graph.http.requestCount("GET",SUBSCRIPTION)).isEqualTo(2);
+            assertThat(c.fixture.graph.http.requestCount("POST",SUBSCRIPTION)).isZero();
+            assertThat(c.fixture.steps.only().status()).isEqualTo(ProviderOperation.Status.UNKNOWN);
+            assertThat(c.receipts).isEmpty();
         }
     }
     @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(strings={"missingBoolean","wrongBoundary","movedPeriod"})
@@ -264,7 +438,7 @@ class StripeSubscriptionCancellationTest {
                 var receipt=new SubscriptionCancellationProofStore.Receipt(o.id(),s.id(),s.paymentAccountId(),step.id(),s.providerReference(),SubscriptionCancellationProofStore.Mode.WITHDRAW,c.end,null,i.getArgument(5),observed);
                 c.receipts.put(o.id(),receipt);return receipt;
             });
-            c.fixture.graph.subscription.addProperty("cancel_at",c.end.getEpochSecond());c.current();c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(true));
+            c.fixture.graph.subscription.addProperty("cancel_at",c.end.getEpochSecond());c.freshObservedCurrent();c.fixture.graph.http.respond("POST",SUBSCRIPTION,c.response(true));
             assertThatCode(()->assertThat(c.fixture.adapter.withdrawCancel(c.command()).outcome()).isEqualTo(Outcome.ACCEPTED)).doesNotThrowAnyException();
             var receipt=c.receipts.get(c.fixture.operation.id());assertThat(receipt.priorOperation()).isNull();assertThat(receipt.observed()).isEqualTo(observed);
             assertThat(c.fixture.steps.only().operationKey()).isEqualTo(c.fixture.operation.providerOperationKey());
@@ -327,7 +501,7 @@ class StripeSubscriptionCancellationTest {
             assertThat(receipt.mode()).isEqualTo(SubscriptionCancellationProofStore.Mode.WITHDRAW);
             assertThat(receipt.acknowledgedAt()).isBefore(c.end);
             assertThat(c.fixture.local.cancellation().effectiveAt()).isEqualTo(c.end);
-            assertThat(c.fixture.graph.http.calls().getLast().form()).containsExactlyInAnyOrderEntriesOf(Map.of("cancel_at", "", "cancel_at_period_end", "false", "proration_behavior", "none"));
+            assertThat(c.fixture.graph.http.calls().getLast().form()).containsExactlyInAnyOrderEntriesOf(Map.of("cancel_at", "", "proration_behavior", "none"));
         }
     }
 
@@ -529,6 +703,7 @@ class StripeSubscriptionCancellationTest {
             fixture.local = new Subscription(s.id(),s.siteId(),s.customerId(),s.productId(),s.paymentAccountId(),s.billingPrice(),s.entitledPrice(),s.billingStatus(),s.providerReference(),new Subscription.Period(now.minusSeconds(100),end),end,null,null,null,null,null,s.revision(),now.minusSeconds(100),now,null);
             fixture.graph.item().addProperty("current_period_start", now.minusSeconds(100).getEpochSecond());
             fixture.graph.item().addProperty("current_period_end", end.getEpochSecond());
+            fixture.graph.subscription.addProperty("cancel_at_period_end", false);
             fixture.graph.line.getAsJsonObject("period").addProperty("start",now.minusSeconds(100).getEpochSecond());
             fixture.graph.line.getAsJsonObject("period").addProperty("end",end.getEpochSecond());
             org.springframework.test.util.ReflectionTestUtils.setField(fixture.adapter,"clock",Clock.fixed(now,ZoneOffset.UTC));
@@ -545,9 +720,17 @@ class StripeSubscriptionCancellationTest {
             when(fixture.operations.unresolved(any(),any())).thenAnswer(i -> List.of(fixture.operation));
         }
         void operation(SubscriptionOperation.Kind kind,String mode,Instant boundary) {
+            operation(kind,mode,boundary,kind==SubscriptionOperation.Kind.WITHDRAW_CANCEL?"v2":"v1",SubscriptionOperation.Status.PROCESSING);
+        }
+        void operation(SubscriptionOperation.Kind kind,String mode,Instant boundary,String version,SubscriptionOperation.Status status) {
             var s=fixture.local;var id=UUID.randomUUID();
-            fixture.operation=new SubscriptionOperation(id,s.siteId(),s.customerId(),s.id(),kind,SubscriptionOperation.Status.PROCESSING,"customer:owned","key","v1.cancel."+mode+"."+(boundary==null?"none":boundary.getEpochSecond()+"/"+boundary.getNano())+"."+"a".repeat(64),"subscription:"+fixture.account.id().value()+":"+id+":"+kind,s.revision(),1,s.providerReference(),null,now,now,1);
+            fixture.operation=new SubscriptionOperation(id,s.siteId(),s.customerId(),s.id(),kind,status,"customer:owned","key",version+".cancel."+mode+"."+(boundary==null?"none":boundary.getEpochSecond()+"/"+boundary.getNano())+"."+"a".repeat(64),"subscription:"+fixture.account.id().value()+":"+id+":"+kind,s.revision(),1,s.providerReference(),null,now,now,1);
             when(fixture.operations.find(eq(s.siteId()),eq(s.id()),any())).thenAnswer(i -> fixture.operation.id().equals(i.getArgument(2))?Optional.of(fixture.operation):Optional.empty());
+        }
+        void markWithdrawalUnknown(){
+            var o=fixture.operation;
+            fixture.operation=new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),o.subscriptionId(),o.kind(),SubscriptionOperation.Status.UNKNOWN,
+                o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),o.providerReference(),null,o.createdAt(),now,o.version()+1);
         }
         void observeNativeSchedule(){
             fixture.local=fixture.local.scheduleCancellation(end,now);operation(SubscriptionOperation.Kind.WITHDRAW_CANCEL,"withdraw",end);
@@ -561,6 +744,23 @@ class StripeSubscriptionCancellationTest {
         }
         Command command(){return new Command(fixture.account,fixture.operation,fixture.local.billingPrice(),null,"sub_owned",null,null,false,false);}
         void current(){fixture.identity();fixture.graph.http.respond("GET","/v1/customers/cus_owned",fixture.graph.customer.toString());fixture.graph.http.respond("GET",SUBSCRIPTION,fixture.graph.subscription.toString());}
+        void freshObservedCurrent(){current();current();}
+        ProviderOperation reserveLegacyObservedStep(){
+            operation(SubscriptionOperation.Kind.WITHDRAW_CANCEL,"withdraw",end,"v1",SubscriptionOperation.Status.PROCESSING);
+            var o=fixture.operation;
+            return fixture.steps.reserve(fixture.account,ProviderOperation.Kind.SUBSCRIPTION_UPDATE,o.id(),o.providerOperationKey(),observedFingerprint());
+        }
+        ProviderOperation reserveNativeObservedStep(){
+            var o=fixture.operation;var a=fixture.account;
+            var fingerprint=StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,a,"CANCELLATION_WITHDRAW_V2",observedFingerprint(),"PERIOD_END_FLAG");
+            return fixture.steps.reserve(a,ProviderOperation.Kind.SUBSCRIPTION_UPDATE,o.id(),o.providerOperationKey(),fingerprint);
+        }
+        String observedFingerprint(){
+            var o=fixture.operation;var s=fixture.local;
+            return StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,fixture.account,"CANCELLATION_OBSERVED_V1",o.id().toString(),o.providerOperationKey(),o.fingerprint(),
+                Long.toString(o.expectedRevision()),Long.toString(o.policyVersion()),s.id().toString(),s.providerReference(),fixture.customer.providerReference(),
+                "WITHDRAW",end.toString(),observed.event().toString(),Long.toString(observed.revision()),observed.boundary().toString(),"proration:none");
+        }
         String response(boolean withdraw){var r=fixture.graph.subscription.deepCopy();if(withdraw)r.add("cancel_at",com.google.gson.JsonNull.INSTANCE);else r.addProperty("cancel_at",end.getEpochSecond());r.addProperty("cancel_at_period_end",false);return r.toString();}
         public void close(){fixture.close();}
     }
@@ -589,7 +789,7 @@ class StripeSubscriptionCancellationTest {
     }
 
     @Test
-    void withdrawalWireClearsExplicitCancelAtAndPeriodEndFlagOnly() throws Exception {
+    void legacyWithdrawalWireSendsBothOriginalFields() throws Exception {
         try (var http = new StripeBillingHttpFixture()) {
             http.respond("POST", SUBSCRIPTION, subscription(null));
             var result = http.client().v1().subscriptions().update("sub_owned",

@@ -17,6 +17,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 
 @Component
 public class SubscriptionCancellationTransaction {
+    private static final String STRIPE_WITHDRAW_V2 = "v2.cancel.withdraw.";
     private final SubscriptionTransactionPort tx;
     private final SubscriptionOperationStore operations;
     private final SubscriptionStore subscriptions;
@@ -121,8 +122,9 @@ public class SubscriptionCancellationTransaction {
         Instant boundary=withdraw?(candidate.subscription().cancellation()==null?null:candidate.subscription().cancellation().effectiveAt()):
             mode==CancelSubscriptionUseCase.Mode.PERIOD_END?liveBoundary(candidate.subscription(),now):null;
         var requestHash=requestHash(c,id,mode,confirmation,kind);
-        var fingerprint="v1.cancel."+(withdraw?"withdraw":mode==CancelSubscriptionUseCase.Mode.IMMEDIATE?"immediate":"period_end")+"."
-            +(boundary==null?"none":boundary.getEpochSecond()+"/"+boundary.getNano())+"."+requestHash;
+        var prefix=withdraw&&candidate.account().provider()==PaymentProviderType.STRIPE?STRIPE_WITHDRAW_V2:
+            "v1.cancel."+(withdraw?"withdraw":mode==CancelSubscriptionUseCase.Mode.IMMEDIATE?"immediate":"period_end")+".";
+        var fingerprint=prefix+(boundary==null?"none":boundary.getEpochSecond()+"/"+boundary.getNano())+"."+requestHash;
         var proposed=new SubscriptionOperation(oid,c.siteId(),c.customerId(),id,kind,SubscriptionOperation.Status.RESERVED,principal(c),
             CreateSubscriptionFingerprint.digest(c.idempotencyKey()),fingerprint,"subscription:"+candidate.account().id().value()+":"+oid+":"+kind,
             candidate.subscription().revision(),candidate.policy().version(),candidate.subscription().providerReference(),null,now,now,0);
@@ -206,7 +208,12 @@ public class SubscriptionCancellationTransaction {
         try{var parts=value.split("/");return Optional.of(Instant.ofEpochSecond(Long.parseLong(parts[0]),Long.parseLong(parts[1])));}catch(RuntimeException invalid){return Optional.empty();}
     }
     public static boolean immediate(SubscriptionOperation o){return valid(o)&&o.kind()==SubscriptionOperation.Kind.CANCEL&&o.fingerprint().split("\\.")[2].equals("immediate");}
-    private static boolean valid(SubscriptionOperation o){return o.fingerprint().matches("v1\\.cancel\\.(immediate|period_end|withdraw)\\.(none|-?[0-9]+/[0-9]+)\\.[a-f0-9]{64}");}
+    public static boolean versionedWithdrawal(SubscriptionOperation o){
+        return o.kind()==SubscriptionOperation.Kind.WITHDRAW_CANCEL&&o.fingerprint().startsWith(STRIPE_WITHDRAW_V2)&&valid(o);
+    }
+    private static boolean valid(SubscriptionOperation o){
+        return o.fingerprint().matches("(v1\\.cancel\\.(immediate|period_end|withdraw)|v2\\.cancel\\.withdraw)\\.(none|-?[0-9]+/[0-9]+)\\.[a-f0-9]{64}");
+    }
     private static String requestHash(SubscriptionCommandContext c,UUID id,CancelSubscriptionUseCase.Mode mode,UUID confirmation,SubscriptionOperation.Kind kind){
         var value=new StringBuilder();for(Object field:Arrays.asList(kind,principal(c),c.siteId(),c.customerId(),c.origin(),id,mode,confirmation)){
             var text=String.valueOf(field);value.append(text.length()).append(':').append(text);

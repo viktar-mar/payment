@@ -2,7 +2,7 @@
 
 This case starts with one fresh ordinary subscription and one initial EUR 20 test payment. A customer requests cancellation at the end of the paid period and then withdraws that request before the period ends. Access should remain active through the same paid-through date at both checkpoints.
 
-Current verification covers synthetic provider responses and PostgreSQL. Stripe Sandbox verified the initial €20 payment and scheduling at the original paid-through boundary. A later attempt paired the withdrawal POST with the application's `202 UNKNOWN` response. Native evidence that the provider withdrew the cancellation remains outstanding. See the [acceptance matrix](../stage-5b-acceptance.md#current-acceptance-status-on-2026-11-25).
+Current verification covers synthetic provider responses and PostgreSQL. Stripe Sandbox verified the initial €20 payment and scheduling at the original paid-through boundary. A separate €0 check reproduced Stripe's rejection of two cancellation fields in the same update and verified both corrected single-field forms. The full application must still record withdrawal, unchanged payment and access, and confirmed cleanup in a fresh owned case. See the [acceptance matrix](../stage-5b-acceptance.md#current-acceptance-status-on-2026-11-25).
 
 ## Running the case
 

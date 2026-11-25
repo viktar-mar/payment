@@ -533,7 +533,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
             where o.id=? and s.payment_account_id=? and site.status='ACTIVE' and c.status='ACTIVE'
               and s.provider_reference is not null and o.provider_reference=s.provider_reference and ?=o.provider_operation_key
               and ((o.kind='CANCEL' and o.fingerprint ~ '^v1\\.cancel\\.period_end\\.[0-9]+/0\\.[a-f0-9]{64}$')
-                or (o.kind='WITHDRAW_CANCEL' and o.fingerprint ~ '^v1\\.cancel\\.withdraw\\.[0-9]+/0\\.[a-f0-9]{64}$'))
+                or (o.kind='WITHDRAW_CANCEL' and o.fingerprint ~ '^v[12]\\.cancel\\.withdraw\\.[0-9]+/0\\.[a-f0-9]{64}$'))
             """,UUID.class,resourceId,account.value(),key).size()==1)return;
         if(kind==Kind.SETUP_INTENT_CREATE||kind==Kind.SUBSCRIPTION_UPDATE){
             String suffix=kind==Kind.SETUP_INTENT_CREATE?":SETUP":":METHOD";

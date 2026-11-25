@@ -22,6 +22,7 @@ import dev.genericpayments.platform.provider.application.port.out.StripeBillingB
 import dev.genericpayments.platform.provider.application.service.ProviderOperationGuard;
 import dev.genericpayments.platform.sites.domain.SiteStatus;
 import dev.genericpayments.platform.subscriptions.application.service.CreateSubscriptionFingerprint;
+import dev.genericpayments.platform.subscriptions.application.service.SubscriptionCancellationTransaction;
 import dev.genericpayments.platform.subscriptions.domain.*;
 import java.time.*;
 import java.util.*;
@@ -432,7 +433,14 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
         var o=command.operation();
         if(!Set.of(SubscriptionOperation.Kind.CANCEL,SubscriptionOperation.Kind.WITHDRAW_CANCEL).contains(o.kind()))throw mismatch();
         var original=steps.find(command.account().id(),o.providerOperationKey()).orElse(null);
-        if(original==null||original.firstDispatchedAt()==null)return null;
+        if(original==null||original.firstDispatchedAt()==null){
+            // Discovery can fail before a Stripe step exists. Only a new, explicitly
+            // reauthorized withdrawal already marked UNKNOWN can try that first write.
+            if(o.status()==SubscriptionOperation.Status.UNKNOWN&&command.account().provider()==PaymentProviderType.STRIPE
+                &&command.account().mode()==PaymentAccountMode.SANDBOX&&SubscriptionCancellationTransaction.versionedWithdrawal(o))
+                return withdrawCancel(command);
+            return null;
+        }
         if(original.status()!=ProviderOperation.Status.ACKNOWLEDGED&&(!ProviderOperationGuard.withinWriteWindow(original.firstDispatchedAt(),providerClock.instant())
             ||original.retryBefore()==null||!providerClock.instant().isBefore(original.retryBefore())))return unknown();
         return o.kind()==SubscriptionOperation.Kind.WITHDRAW_CANCEL?withdrawCancel(command):cancel(command,dev.genericpayments.platform.subscriptions.application.service.SubscriptionCancellationTransaction.immediate(o));

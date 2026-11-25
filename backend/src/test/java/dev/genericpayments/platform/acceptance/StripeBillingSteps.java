@@ -671,7 +671,11 @@ public class StripeBillingSteps {
         assertThat(http.calls().stream().filter(c->c.path().endsWith("/pay")&&c.method().equals("POST"))).isEmpty();assertThat(cash()).isEqualTo(1);assertThat(subscription().debt().graceDeadline()).isEqualTo(grace);
     }
     private void cancellationWrite(boolean withdraw) {
-        readGraph();identity();respond("GET","/v1/customers/cus_billing",remoteCustomer);respond("GET","/v1/subscriptions/sub_billing",remote);
+        readGraph();
+        // The observed cancellation event selects the withdrawal form before the claimed recheck.
+        for(int read=0;read<(withdraw?2:1);read++) {
+            identity();respond("GET","/v1/customers/cus_billing",remoteCustomer);respond("GET","/v1/subscriptions/sub_billing",remote);
+        }
         http.enqueue("POST","/v1/subscriptions/sub_billing",200,call->{
             if(withdraw){remote.remove("cancel_at");remote.addProperty("cancel_at_period_end",false);}
             else remote.addProperty("cancel_at",end.getEpochSecond());
@@ -686,11 +690,15 @@ public class StripeBillingSteps {
         cancellationWrite(true);
     }
     @Then("the Stripe cancellation proofs preserve the paid period and cash") public void cancelledAndWithdrawn() {
-        assertThat(subscription().cancellation()).isNull();assertThat(subscription().paidThrough()).isEqualTo(end);assertThat(cash()).isEqualTo(1);assertThat(operation(withdrawal.operationId()).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+        assertThat(subscription().cancellation()).isNull();assertThat(subscription().paidThrough()).isEqualTo(end);assertThat(cash()).isEqualTo(1);
+        var withdrawn=operation(withdrawal.operationId());
+        assertThat(withdrawn.status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+        assertThat(withdrawn.fingerprint()).startsWith("v2.cancel.withdraw.");
         assertThat(count("stripe_subscription_cancellation_proofs","subscription_id=?",created.subscriptionId())).isEqualTo(2);
         var writes=http.calls().stream().filter(c->c.method().equals("POST")&&c.path().equals("/v1/subscriptions/sub_billing")).toList();assertThat(writes).hasSize(2);
-        assertThat(writes.get(0).header("Idempotency-Key")).isEqualTo(operation(cancel.operationId()).providerOperationKey());assertThat(writes.get(1).header("Idempotency-Key")).isEqualTo(operation(withdrawal.operationId()).providerOperationKey());
-        assertThat(writes.get(0).form()).containsEntry("cancel_at",Long.toString(end.getEpochSecond())).containsEntry("proration_behavior","none");assertThat(writes.get(1).form()).containsEntry("cancel_at","").containsEntry("cancel_at_period_end","false");
+        assertThat(writes.get(0).header("Idempotency-Key")).isEqualTo(operation(cancel.operationId()).providerOperationKey());assertThat(writes.get(1).header("Idempotency-Key")).isEqualTo(withdrawn.providerOperationKey());
+        assertThat(writes.get(0).form()).containsEntry("cancel_at",Long.toString(end.getEpochSecond())).containsEntry("proration_behavior","none");
+        assertThat(writes.get(1).form()).containsExactlyInAnyOrderEntriesOf(Map.of("cancel_at","","proration_behavior","none"));
     }
     @When("the customer requests a disallowed Stripe plan change and Portal return") public void deniedPolicy() {
         var target=new PriceId(UUID.randomUUID());

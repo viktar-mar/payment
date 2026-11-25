@@ -8,6 +8,7 @@ import com.stripe.model.Invoice;
 import com.stripe.model.InvoiceLineItem;
 import com.stripe.param.InvoiceCreatePreviewParams;
 import com.stripe.param.SubscriptionUpdateParams;
+import com.stripe.param.common.EmptyParam;
 import com.stripe.param.InvoiceLineItemListParams;
 import com.stripe.param.SubscriptionScheduleCreateParams;
 import com.stripe.param.SubscriptionScheduleUpdateParams;
@@ -16,6 +17,7 @@ import dev.genericpayments.platform.provider.application.model.ProviderOperation
 import dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore;
 import dev.genericpayments.platform.provider.application.service.ProviderOperationGuard;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.PaymentAccountVerificationPort;
+import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountMode;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType;
 import dev.genericpayments.platform.provider.adapter.out.stripe.*;
@@ -207,7 +209,7 @@ public final class StripeBillingMutationAdapter {
         var mode=withdraw?SubscriptionCancellationProofStore.Mode.WITHDRAW:immediate?SubscriptionCancellationProofStore.Mode.IMMEDIATE:SubscriptionCancellationProofStore.Mode.PERIOD_END;
         String expected=withdraw?"v1.cancel.withdraw.":immediate?"v1.cancel.immediate.none.":"v1.cancel.period_end.";
         if(!o.equals(c.operation())||o.kind()!=(withdraw?SubscriptionOperation.Kind.WITHDRAW_CANCEL:SubscriptionOperation.Kind.CANCEL)
-            ||!o.fingerprint().startsWith(expected)||!s.billingPrice().equals(c.current())
+            ||!(o.fingerprint().startsWith(expected)||withdraw&&SubscriptionCancellationTransaction.versionedWithdrawal(o))||!s.billingPrice().equals(c.current())
             ||!Objects.equals(s.providerReference(),c.providerSubscriptionReference())||c.target()!=null
             ||c.providerInvoiceReference()!=null||c.providerQuoteReference()!=null||c.startTrial()||c.recurringConsent())throw mismatch();
         var boundary=SubscriptionCancellationTransaction.boundary(o).orElse(null);
@@ -221,42 +223,53 @@ public final class StripeBillingMutationAdapter {
         if(observed!=null&&(observed.event()==null||observed.revision()!=o.expectedRevision()||!boundary.equals(observed.boundary())))throw mismatch();
         if(prior!=null&&(prior.mode()!=SubscriptionCancellationProofStore.Mode.PERIOD_END||!prior.account().equals(c.account().id())
             ||!prior.subscription().equals(s.id())||!prior.reference().equals(s.providerReference())||!boundary.equals(prior.boundary())))throw mismatch();
+        WithdrawalWire wire=null;
         if(withdraw){
             var original=steps.find(c.account().id(),o.providerOperationKey()).orElse(null);
             if(original!=null){
                 // A lost response retains exactly its original predecessor, fingerprint and key.
-                if(prior!=null&&original.fingerprint().equals(cancellationFingerprint(c.account(),s,o,customer,mode,boundary,prior.operation(),null)))observed=null;
-                else if(observed!=null&&original.fingerprint().equals(cancellationFingerprint(c.account(),s,o,customer,mode,boundary,null,observed)))prior=null;
+                if(prior!=null)wire=WithdrawalWire.match(c.account(),original.fingerprint(),
+                    cancellationFingerprint(c.account(),s,o,customer,mode,boundary,prior.operation(),null),false);
+                if(wire!=null)observed=null;
+                else if(observed!=null&&(wire=WithdrawalWire.match(c.account(),original.fingerprint(),
+                    cancellationFingerprint(c.account(),s,o,customer,mode,boundary,null,observed),true))!=null)prior=null;
                 else throw mismatch();
             }else if(observed!=null)prior=null;
             if(prior==null&&observed==null)throw mismatch();
         }
-        String fp=cancellationFingerprint(c.account(),s,o,customer,mode,boundary,prior==null?null:prior.operation(),observed);
         if(!Set.of(SubscriptionOperation.Status.PROCESSING,SubscriptionOperation.Status.UNKNOWN).contains(o.status())
             ||s.revision()!=o.expectedRevision()||!s.nonTerminal()||s.pendingChange()!=null||!immediate&&!clock.instant().isBefore(boundary))throw mismatch();
         if(withdraw){SubscriptionCancellationRules.requireWithdrawable(s,clock.instant());if(!boundary.equals(s.cancellation().effectiveAt()))throw mismatch();}
         else if(!immediate&&(s.cancellation()!=null||!boundary.equals(SubscriptionCancellationRules.liveBoundary(s,clock.instant()))))throw mismatch();
+        if(withdraw&&wire==null){
+            wire=WithdrawalWire.EXPLICIT_DATE;
+            if(observed!=null){
+                try{
+                    var client=cancellationClient(c,diagnostic);
+                    var remote=readCancellationRemote(c,s,customer,boundary,client,diagnostic);
+                    wire=Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())?WithdrawalWire.PERIOD_END_FLAG:WithdrawalWire.EXPLICIT_DATE;
+                    wire.requireRemote(remote,boundary,true,false);
+                }catch(StripeException|RuntimeException uncertain){
+                    diagnostic.report(uncertain);
+                    return new Reply(Outcome.UNKNOWN,null,null);
+                }
+            }
+        }
+        String legacyFp=cancellationFingerprint(c.account(),s,o,customer,mode,boundary,prior==null?null:prior.operation(),observed);
+        String fp=withdraw?wire.fingerprint(c.account(),legacyFp):legacyFp;
         var reserved=steps.reserve(c.account(),immediate?ProviderOperation.Kind.SUBSCRIPTION_CANCEL:ProviderOperation.Kind.SUBSCRIPTION_UPDATE,o.id(),o.providerOperationKey(),fp);
         if(reserved.status()==ProviderOperation.Status.ACKNOWLEDGED)throw mismatch();
         diagnostic.stage=WithdrawalStage.CLAIM;
         String owner=UUID.randomUUID().toString();var claim=steps.claim(reserved.id(),owner,securityClock.instant(),Duration.ofSeconds(60));
         if(claim.isEmpty()){diagnostic.report(null);return new Reply(Outcome.UNKNOWN,null,null);}var step=claim.get();
         try{
-            diagnostic.stage=WithdrawalStage.PROVIDER_SETUP;
-            verification.verify(c.account());var client=clients.create(credentials.resolve(c.account()));
-            diagnostic.stage=WithdrawalStage.CUSTOMER;
-            var remoteCustomer=client.v1().customers().retrieve(customer.providerReference());
-            if(!customer.providerReference().equals(remoteCustomer.getId())||!"customer".equals(remoteCustomer.getObject())
-                ||!Boolean.FALSE.equals(remoteCustomer.getLivemode())||Boolean.TRUE.equals(remoteCustomer.getDeleted()))throw mismatch();
-            diagnostic.stage=WithdrawalStage.SUBSCRIPTION;
-            var remote=client.v1().subscriptions().retrieve(s.providerReference());
-            requireCancellationRemote(remote,s,customer,ownership.price(c.account(),s,s.billingPrice()),boundary);
+            var client=cancellationClient(c,diagnostic);
+            var remote=readCancellationRemote(c,s,customer,boundary,client,diagnostic);
             boolean replay=reserved.firstDispatchedAt()!=null;
             if(immediate){
                 requireSafeImmediateInventory(client,s,customer);
             }else if(withdraw){
-                boolean nativeEnd=observed!=null&&remote.getCancelAt()==null&&Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())&&boundary.equals(itemPeriod(remote).end());
-                if(!Objects.equals(remote.getCancelAt(),boundary.getEpochSecond())&&!nativeEnd&&!(replay&&remote.getCancelAt()==null&&!Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())))throw mismatch();
+                wire.requireRemote(remote,boundary,observed!=null,replay);
             }else if(remote.getCancelAt()!=null&&!(replay&&remote.getCancelAt()==boundary.getEpochSecond())||Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())&&remote.getCancelAt()==null)throw mismatch();
             diagnostic.stage=WithdrawalStage.AUTHORIZATION;
             cancellations.authorize(s,o);
@@ -274,7 +287,7 @@ public final class StripeBillingMutationAdapter {
                 return new Reply(Outcome.ACCEPTED,s.providerReference(),null);
             }
             var params=SubscriptionUpdateParams.builder().setProrationBehavior(SubscriptionUpdateParams.ProrationBehavior.NONE);
-            if(withdraw)params.setCancelAt(com.stripe.param.common.EmptyParam.EMPTY).setCancelAtPeriodEnd(false);
+            if(withdraw)wire.apply(params);
             else params.setCancelAt(boundary.getEpochSecond());
             diagnostic.stage=WithdrawalStage.PROVIDER_ERROR;
             var response=client.v1().subscriptions().update(s.providerReference(),params.build(),RequestOptions.builder().setIdempotencyKey(key).build());
@@ -292,6 +305,54 @@ public final class StripeBillingMutationAdapter {
         }catch(StripeException|RuntimeException uncertain){
             try{steps.unknown(step.id(),owner,step.version());}finally{diagnostic.report(uncertain);}
             return new Reply(Outcome.UNKNOWN,null,null);
+        }
+    }
+    private StripeClient cancellationClient(Command c,WithdrawalDiagnostic diagnostic){
+        diagnostic.stage=WithdrawalStage.PROVIDER_SETUP;
+        verification.verify(c.account());
+        return clients.create(credentials.resolve(c.account()));
+    }
+    private com.stripe.model.Subscription readCancellationRemote(Command c,Subscription s,
+        StripeBillingBindingPort.CustomerBinding customer,Instant boundary,StripeClient client,WithdrawalDiagnostic diagnostic)throws StripeException{
+        diagnostic.stage=WithdrawalStage.CUSTOMER;
+        var remoteCustomer=client.v1().customers().retrieve(customer.providerReference());
+        if(!customer.providerReference().equals(remoteCustomer.getId())||!"customer".equals(remoteCustomer.getObject())
+            ||!Boolean.FALSE.equals(remoteCustomer.getLivemode())||Boolean.TRUE.equals(remoteCustomer.getDeleted()))throw mismatch();
+        diagnostic.stage=WithdrawalStage.SUBSCRIPTION;
+        var remote=client.v1().subscriptions().retrieve(s.providerReference());
+        requireCancellationRemote(remote,s,customer,ownership.price(c.account(),s,s.billingPrice()),boundary);
+        return remote;
+    }
+    private enum WithdrawalWire {
+        LEGACY_BOTH, EXPLICIT_DATE, PERIOD_END_FLAG;
+
+        String fingerprint(PaymentAccount account,String legacy){
+            return this==LEGACY_BOTH?legacy:StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,account,"CANCELLATION_WITHDRAW_V2",legacy,name());
+        }
+        static WithdrawalWire match(PaymentAccount account,String actual,String legacy,boolean observed){
+            if(actual.equals(legacy))return LEGACY_BOTH;
+            if(actual.equals(EXPLICIT_DATE.fingerprint(account,legacy)))return EXPLICIT_DATE;
+            if(observed&&actual.equals(PERIOD_END_FLAG.fingerprint(account,legacy)))return PERIOD_END_FLAG;
+            return null;
+        }
+        void apply(SubscriptionUpdateParams.Builder params){
+            // Stripe rejects both fields in one request. A previously reserved step retains
+            // its exact original body because Stripe binds idempotency to those parameters.
+            if(this!=PERIOD_END_FLAG)params.setCancelAt(EmptyParam.EMPTY);
+            if(this!=EXPLICIT_DATE)params.setCancelAtPeriodEnd(false);
+        }
+        void requireRemote(com.stripe.model.Subscription remote,Instant boundary,boolean observed,boolean replay){
+            var date=remote.getCancelAt();
+            var flag=remote.getCancelAtPeriodEnd();
+            boolean exactDate=Objects.equals(date,boundary.getEpochSecond());
+            boolean nativeEnd=observed&&Boolean.TRUE.equals(flag)&&boundary.equals(itemPeriod(remote).end());
+            boolean scheduled=switch(this){
+                case LEGACY_BOTH -> exactDate||date==null&&nativeEnd;
+                case EXPLICIT_DATE -> exactDate&&Boolean.FALSE.equals(flag);
+                case PERIOD_END_FLAG -> nativeEnd&&(date==null||exactDate);
+            };
+            boolean cleared=date==null&&(this==LEGACY_BOTH?!Boolean.TRUE.equals(flag):Boolean.FALSE.equals(flag));
+            if(!scheduled&&!(replay&&cleared))throw mismatch();
         }
     }
     private enum WithdrawalStage {
@@ -388,8 +449,11 @@ public final class StripeBillingMutationAdapter {
             ||receipt.acknowledgedAt()==null||step.firstDispatchedAt()==null||step.retryBefore()==null||receipt.acknowledgedAt().isBefore(step.firstDispatchedAt())||!receipt.acknowledgedAt().isBefore(step.retryBefore())
             ||!Objects.equals(receipt.boundary(),SubscriptionCancellationTransaction.boundary(o).orElse(null))||receipt.mode()!=SubscriptionCancellationProofStore.Mode.IMMEDIATE&&!receipt.acknowledgedAt().isBefore(receipt.boundary())
             ||receipt.observed()!=null&&(receipt.mode()!=SubscriptionCancellationProofStore.Mode.WITHDRAW||receipt.priorOperation()!=null
-                ||receipt.observed().revision()!=o.expectedRevision()||!receipt.boundary().equals(receipt.observed().boundary()))
-            ||!step.fingerprint().equals(cancellationFingerprint(a,s,o,customer,receipt.mode(),receipt.boundary(),receipt.priorOperation(),receipt.observed())))throw mismatch();
+                ||receipt.observed().event()==null||receipt.observed().revision()!=o.expectedRevision()||!receipt.boundary().equals(receipt.observed().boundary())))throw mismatch();
+        String legacyFp=cancellationFingerprint(a,s,o,customer,receipt.mode(),receipt.boundary(),receipt.priorOperation(),receipt.observed());
+        if(receipt.mode()==SubscriptionCancellationProofStore.Mode.WITHDRAW
+            ?WithdrawalWire.match(a,step.fingerprint(),legacyFp,receipt.observed()!=null)==null
+            :!step.fingerprint().equals(legacyFp))throw mismatch();
     }
     private void readScheduleSubscription(Command c,dev.genericpayments.platform.subscriptions.domain.Subscription s,Quote q,StripeClient client,String allowedSchedule)throws StripeException{
         readScheduleSubscription(c,s,q,client,allowedSchedule,false);

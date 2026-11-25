@@ -24,6 +24,9 @@ public class SubscriptionCancellationService implements CancelSubscriptionUseCas
                 ||!java.util.Set.of(dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation.Status.PROCESSING,dev.genericpayments.platform.subscriptions.domain.SubscriptionOperation.Status.UNKNOWN).contains(r.operation().status()))return transactions.result(r);
             transactions.beforeOriginalReplay(c,r,snapshot);
             Reply replay;try{replay=provider.continueOriginalCancellation(request);}catch(RuntimeException uncertain){replay=new Reply(Outcome.UNKNOWN,null,null);}
+            // An explicit duplicate may have raced with the owner of the first write.
+            if(replay!=null&&replay.outcome()==Outcome.UNKNOWN&&SubscriptionCancellationTransaction.versionedWithdrawal(r.operation()))
+                return transactions.result(r);
             return replay==null?transactions.result(r):transactions.reply(r,replay);
         }
         Reply reply;try{reply=withdraw?provider.withdrawCancel(request):provider.cancel(request,mode==CancelSubscriptionUseCase.Mode.IMMEDIATE);}
