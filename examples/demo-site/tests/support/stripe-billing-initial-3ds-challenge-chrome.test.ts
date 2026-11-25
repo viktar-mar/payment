@@ -1,22 +1,24 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {chromium,type Frame,type Route} from '@playwright/test';
+import {chromium,type Frame,type Request,type Response,type Route} from '@playwright/test';
 // @ts-ignore Native Node executes the same challenge source as Playwright.
 import {initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 // @ts-ignore Native Node executes the guarded response source.
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
 
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin'])
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked'])
 test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
  const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
  const retrieve=api+'/v1/payment_intents/pi_fixture?client_secret='+secret+'&key='+key;
  const authenticate=api+'/v1/3ds2/authenticate',complete=api+'/v1/3ds2/challenge_complete';
  const outer=stripe+'/v3/three-ds-2-challenge-fixture.html',inner=stripe+'/v3/fixture-inner.html';
- const direct=mode==='direct Stripe EMVCo frame'||mode==='direct reviewed issuer origin';
+ const blocksPassiveImage=mode==='direct reviewed issuer passive image blocked';
+ const direct=mode==='direct Stripe EMVCo frame'||mode==='direct reviewed issuer origin'||blocksPassiveImage;
  const issuerName=direct?'stripe-challenge-frame':'acsFrame';
- const approvedIssuerOrigin=mode==='direct reviewed issuer origin'?'https://reviewed-test-issuer.stripe.com':undefined;
+ const approvedIssuerOrigin=mode==='direct reviewed issuer origin'||blocksPassiveImage?'https://reviewed-test-issuer.stripe.com':undefined;
  const issuerOrigin=approvedIssuerOrigin??'https://hooks.stripe.com',issuer=issuerOrigin+'/fixture-issuer',decision=issuer+'/decision';
+ const passiveImage=issuerOrigin+'/fixture-passive.png';
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
  const script=`(async()=>{
@@ -37,6 +39,11 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
   form.append(field);document.body.append(form);form.submit();
  })()`;
  const json=(value:object)=>({contentType:'application/json',headers:{'Access-Control-Allow-Origin':stripe},body:JSON.stringify(value)});
+ const issuerButton='<button name="decision" value="complete">Complete</button>';
+ const issuerBody='<!doctype html><form method="post" action="'+decision+'">'+
+  (blocksPassiveImage?'<template>'+issuerButton+'</template>':issuerButton)+'</form>'+
+  (blocksPassiveImage?`<img width="1" height="1" alt="" src="${passiveImage}"
+   onerror="document.querySelector('form').append(document.querySelector('template').content.cloneNode(true))">`:'');
  const responses=new Map<string,NonNullable<Parameters<Route['fulfill']>[0]>>([
   [demo+'/',{contentType:'text/html',body:'<!doctype html><link rel="icon" href="data:,"><iframe name="__privateStripeFrame7" src="'+outer+'"></iframe>'}],
   [outer,{contentType:'text/html',body:direct?'<!doctype html><body><script>'+script+'</script></body>':
@@ -47,7 +54,7 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
    next_action:{type:'use_stripe_sdk',use_stripe_sdk:{type:'stripe_3ds2_fingerprint',three_d_secure_2_source:source}}})],
   [authenticate,json({state:'challenge_required',
    ares:{messageType:'ARes',transStatus:'C',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,acsURL:issuer}})],
-  [issuer,{contentType:'text/html',body:'<!doctype html><form method="post" action="'+decision+'"><button name="decision" value="complete">Complete</button></form>'}],
+  [issuer,{contentType:'text/html',body:issuerBody}],
   [decision,{contentType:'text/html',body:'<!doctype html><script>parent.postMessage("fixture decision",'+JSON.stringify(stripe)+')</script>'}],
   [complete,json({complete:true})],
  ]);
@@ -59,11 +66,20 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
  try{
   const context=await browser.newContext({serviceWorkers:'block',acceptDownloads:false});
   const page=await context.newPage(),forwarded:string[]=[],refusals:string[]=[];
+  const passiveRequests:Request[]=[],passiveFailures:Request[]=[],passiveResponses:Response[]=[];
+  const passiveAborts:(string|undefined)[]=[],authorized:string[]=[];
+  page.on('requestfailed',request=>{if(request.url()===passiveImage)passiveFailures.push(request);});
+  page.on('response',response=>{if(response.url()===passiveImage)passiveResponses.push(response);});
   const limits={deadline:Date.now()+15_000};
   let issuerFrame:Frame|undefined,attachedIssuerFrame=false,separateIssuerTarget=false,gestures=0;
   const guard=await guardChallengeRedirects(page,reason=>refusals.push(reason),{demo,backend},undefined,approvedIssuerOrigin);
   const challenge=initial3dsChallenge({page,limits,demo,owner:()=>({key,secret}),winning:async()=>{},check:async()=>{},
-   approvedIssuerOrigin,authorizeResponse:request=>guard.authorize(request),waitForGesture:async()=>{
+   expectIssuerImageBlock:request=>guard.expectIssuerImageBlock(request),
+   approvedIssuerOrigin,authorizeResponse:async request=>{
+    authorized.push(request.url());
+    assert.notEqual(request.url(),passiveImage);
+    await guard.authorize(request);
+   },waitForGesture:async()=>{
     gestures++;
     if(mode==='separate issuer process'&&issuerFrame){
      const session=await context.newCDPSession(issuerFrame);
@@ -85,7 +101,8 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
   });
   await context.route('**/*',async route=>{
    const request=route.request(),url=request.url(),response=responses.get(url);
-   if(!response){await route.abort('blockedbyclient');return;}
+   const isPassiveImage=blocksPassiveImage&&url===passiveImage;
+   if(!response&&!isPassiveImage){await route.abort('blockedbyclient');return;}
    guard.registerRoute(request);
    let checkpoint='route refused';
    try{
@@ -94,19 +111,27 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
      if(mode==='late issuer response'&&url===decision)request.existingResponse=()=>null;
      const actual=Object.create(route) as Route;
      actual.continue=async()=>{
+      assert.ok(response,'passive image must never reach continuation');
       const reply=url===retrieve&&forwarded.includes(complete)?json({status:'succeeded'}):response;
       forwarded.push(url);
       await route.fulfill(reply);
      };
+     if(isPassiveImage){
+      passiveRequests.push(request);
+      actual.abort=async errorCode=>{passiveAborts.push(errorCode);await route.abort(errorCode);};
+      actual.fallback=async()=>assert.fail('passive image must never reach fallback');
+      actual.fulfill=async()=>assert.fail('passive image must never receive a synthetic response');
+     }
      if(url===issuer){
       issuerFrame=request.frame();
       attachedIssuerFrame=issuerFrame.name()===issuerName&&issuerFrame.url()==='about:blank';
      }
      await challenge.forward(actual,new URL(url),code=>{checkpoint=code;});
     }else{
+     assert.ok(response);
      await guard.authorize(request);await route.fulfill(response);
     }
-   }catch{refusals.push(checkpoint);await route.abort('blockedbyclient');}
+   }catch{refusals.push(checkpoint);await route.abort('blockedbyclient').catch(()=>{});}
   });
   await page.goto(demo+'/',{waitUntil:'domcontentloaded',timeout:7_000});
   try{
@@ -114,11 +139,29 @@ test('an issuer iframe completes the exact challenge with '+mode, {timeout:35_00
    const result=(direct?stripeFrame:stripeFrame.frameLocator('iframe')).locator('body[data-fixture-result]');
    await Promise.all([challenge.attend(),result.waitFor({state:'attached',timeout:8_000})]);
    assert.equal(await result.getAttribute('data-fixture-result'),'succeeded');
-  }catch{assert.fail(JSON.stringify({attachedIssuerFrame,separateIssuerTarget,refusals,gestures,forwarded:forwarded.length}));}
+  }catch{assert.fail(JSON.stringify({attachedIssuerFrame,separateIssuerTarget,refusals,gestures,forwarded:forwarded.length,
+   passiveAborts:passiveAborts.length,passiveFailures:passiveFailures.length}));}
   assert.equal(attachedIssuerFrame,true);
   if(mode==='separate issuer process')assert.equal(separateIssuerTarget,true);
   assert.deepEqual(refusals,[]);
   assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision,complete,retrieve]);
   assert.equal(gestures,1);
+  if(blocksPassiveImage){
+   assert.equal(passiveRequests.length,1);
+   const [image]=passiveRequests;
+   assert.ok(image);
+   assert.equal(image.method(),'GET');
+   assert.equal(image.resourceType(),'image');
+   assert.equal(image.isNavigationRequest(),false);
+   assert.equal(image.frame(),issuerFrame);
+   assert.equal(image.serviceWorker(),null);
+   assert.deepEqual(passiveAborts,['blockedbyclient']);
+   assert.equal(passiveFailures.length,1);
+   assert.equal(passiveFailures[0],image);
+   assert.match(image.failure()?.errorText??'',/^net::ERR_BLOCKED_BY_CLIENT(?:\.Inspector)?$/);
+   assert.equal(image.existingResponse(),null);
+   assert.deepEqual(passiveResponses,[]);
+   assert.deepEqual(authorized,[retrieve,authenticate,issuer,decision,complete,retrieve]);
+  }
  }finally{await browser.close();}
 });

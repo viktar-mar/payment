@@ -19,9 +19,12 @@ test('an unsupported driver cannot fall back to protocol fixture matching',async
 });
 
 for(const mode of ['exact request','late event','late event retired','ended while waiting','same-URL decoy',
- 'replaced document','wrong frame','wrong URL','wrong method','duplicate claim','unverified OPTIONS'])
+ 'replaced document','wrong frame','wrong URL','wrong method','duplicate claim','unverified OPTIONS',
+ 'expected issuer block','expected issuer block with 200','expected issuer block with wrong error','expected issuer block with decoy'])
  test('Chromium route evidence rejects a false match: '+mode,async()=>{
- const url='https://api.stripe.com/fixture-read',location=origins.demo+'/';
+ const block=mode.startsWith('expected issuer block');
+ const approved=block?'https://reviewed-test-issuer.stripe.com':undefined;
+ const url=approved?approved+'/fixture.png':'https://api.stripe.com/fixture-read',location=origins.demo+'/';
  const method=mode==='unverified OPTIONS'?'OPTIONS':'GET';
  const frameId='checkout',networkId='actual-request',decoyId='decoy-request';
  const browserSession={},symbol=Symbol('InterceptableRequest');
@@ -46,8 +49,8 @@ for(const mode of ['exact request','late event','late event retired','ended whil
  }};
  const page={_connection:connection,driver:impl,mainFrame:()=>frame,context:()=>({newCDPSession:async()=>cdp})};
  const request={_connection:connection,driver:original,frame:()=>frame,url:()=>url,method:()=>method,
-  redirectedFrom:()=>null,serviceWorker:()=>null} as never;
- const guard=await guardChallengeRedirects(page as never,code=>failures.push(code),origins);
+  redirectedFrom:()=>null,serviceWorker:()=>null,isNavigationRequest:()=>false,resourceType:()=>block?'image':'xhr'} as never;
+ const guard=await guardChallengeRedirects(page as never,code=>failures.push(code),origins,undefined,approved);
  guard.registerRoute(request);
  const passive={frameId,request:{url,method:'GET'}};
  const record=(id:string,original=passive)=>events.get('Network.requestWillBeSent')!({...original,requestId:id});
@@ -56,6 +59,17 @@ for(const mode of ['exact request','late event','late event retired','ended whil
  if(!['same-URL decoy','late event','late event retired','ended while waiting'].includes(mode)){
   record(networkId,{frameId:mode==='wrong frame'?'foreign-frame':frameId,
    request:{url:mode==='wrong URL'?url+'/different':url,method:mode==='wrong method'?'POST':method}});
+ }
+ if(block){
+  await guard.expectIssuerImageBlock(request);
+  const exactFailure=mode==='expected issuer block',http=mode.endsWith('with 200');
+  const id=mode.endsWith('with decoy')?decoyId:networkId;
+  await events.get('Fetch.requestPaused')!({...passive,networkId:id,requestId:id,
+   ...(http?{responseStatusCode:200}:{responseErrorReason:mode.endsWith('wrong error')?'Failed':'BlockedByClient'})});
+  assert.equal(commands.includes('Fetch.continueResponse'),false);
+  assert.equal(commands.at(-1),'Fetch.failRequest');
+  assert.deepEqual(failures,exactFailure?[]:[http?'BROWSER_GUARD_RESPONSE_UNCLAIMED':'BROWSER_GUARD_RESPONSE_NETWORK']);
+  return;
  }
  if(mode==='replaced document')main._currentDocument={};
  if(mode==='duplicate claim')await guard.authorize(request);
