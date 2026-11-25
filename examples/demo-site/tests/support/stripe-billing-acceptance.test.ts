@@ -1452,7 +1452,7 @@ for(const [suffix,expected,blocks] of [
  ['resource-unreadable','BROWSER_CHALLENGE_ISSUER_ASSET_KIND',0],
  ['suffix','BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX',0],
  ['image-font-suffix','BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX',0],
- ['duplicate','BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT',1],
+ ['duplicate','BROWSER_CHALLENGE_ISSUER_ASSET_REPEAT',1],
  ['image-font',null,2],
  ['font-image',null,2],
  ['third','BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT',2],

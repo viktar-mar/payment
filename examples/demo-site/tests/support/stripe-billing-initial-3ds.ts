@@ -289,8 +289,10 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    if(approved && initialIssuerDispatched && !navigation){
     report('BROWSER_CHALLENGE_ISSUER_ASSET_HANDOFF');
     requireValue(!handoffStarted);
+    report('BROWSER_CHALLENGE_ISSUER_ASSET_REPEAT');
+    requireValue(!passiveBlocks.has(url.pathname));
     report('BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT');
-    requireValue(passiveBlocks.size<2&&!passiveBlocks.has(url.pathname));
+    requireValue(passiveBlocks.size<2);
     report('BROWSER_CHALLENGE_ISSUER_ASSET_BINDING');
     requireValue(binding && new URL(binding.url).origin===url.origin);
     report('BROWSER_CHALLENGE_ISSUER_ASSET_WORKER');
