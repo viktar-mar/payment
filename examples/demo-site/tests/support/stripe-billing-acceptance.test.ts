@@ -280,7 +280,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     const kind=fault.slice('approved-issuer-block-'.length);
     if(kind==='resource-unreadable')throw Error('private-asset-resource-canary');
     if(kind.startsWith('resource-'))return kind.slice('resource-'.length);
-    return 'image';
+    return issuerShape==='font'?'font':'image';
    }
    return issuerShape==='resource'?'image':navigation?'document':'xhr';
   },
@@ -315,6 +315,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     }else{
      await requestPassiveIssuerAsset();
      if(fault==='approved-issuer-block-duplicate')await requestPassiveIssuerAsset();
+     if(fault==='approved-issuer-block-image-font')await requestPassiveIssuerAsset('font');
+     if(fault==='approved-issuer-block-font-image')await requestPassiveIssuerAsset('image');
     }
    }
   },abort:async(reason:string)=>{
@@ -324,22 +326,27 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     passiveBlockStarted.resolve();
     if(fault==='approved-issuer-block-abort-error')throw Error('private abort');
     if(fault==='approved-issuer-block-gated')await new Promise(resolve=>setTimeout(resolve,25));
-    if(fault==='approved-issuer-block-response')await reply('passive',200).catch(()=>{});
+    if(fault==='approved-issuer-block-response'||fault==='approved-issuer-block-font-response')await reply('passive',200).catch(()=>{});
     reply.failed();
     if(fault==='approved-issuer-block-replaced')navigate(issuer);
     if(!fault.endsWith('-missing-event')){
      trace.push('passive block event');
-     requestFailed(fault==='approved-issuer-block-foreign-event'?{...request}:request);
+     requestFailed(fault.endsWith('-foreign-event')?{...request}:request);
     }
    }
   }} as unknown as Route);
   if(closed)throw Error('closed');
  }
- function requestPassiveIssuerAsset(){
-  const asset=approvedFixtureIssuer+'/fixture-passive'+(fault==='approved-issuer-block-suffix'?'.svg':'.png')+
+ function requestPassiveIssuerAsset(resource:'image'|'font'=fault.startsWith('approved-issuer-block-font-')?'font':'image'){
+  const suffix=fault==='approved-issuer-block-suffix'?'.svg':
+   fault==='approved-issuer-block-font-ttf'?'.ttf':
+   fault==='approved-issuer-block-font-uppercase'?'.WOFF2':
+   fault==='approved-issuer-block-font-woff'?'.woff':
+   resource==='font'||fault==='approved-issuer-block-image-font-suffix'?'.woff2':'.png';
+  const asset=approvedFixtureIssuer+'/fixture-passive'+suffix+
    (fault==='approved-issuer-block-query'?'?private=canary':'');
   const data=['approved-issuer-block-post','approved-issuer-block-body'].includes(fault)?'private=data':null;
-  return wire(asset,fault==='approved-issuer-block-foreign-frame'?stripeFrame:issuer,data,{});
+  return wire(asset,fault==='approved-issuer-block-foreign-frame'?stripeFrame:issuer,data,{},false,resource);
  }
  async function challengeTraffic(){
   const secret=sessionFor(attempt!).client_secret,source='src_fixture',server=id(90),acs=id(91);
@@ -1401,6 +1408,8 @@ for(const stage of ['initial','later'] as const)for(const shape of ['navigation'
 
 for(const [suffix,expected,blocks] of [
  ['valid',null,1],
+ ['font-woff',null,1],
+ ['font-woff2',null,1],
  ['inspector',null,1],
  ['gated',null,1],
  ['post','BROWSER_CHALLENGE_ISSUER_ASSET_METHOD',0],
@@ -1408,7 +1417,9 @@ for(const [suffix,expected,blocks] of [
  ['query','BROWSER_CHALLENGE_ISSUER_ASSET_PATH',0],
  ['resource-script','BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT',0],
  ['resource-stylesheet','BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET',0],
- ['resource-font','BROWSER_CHALLENGE_ISSUER_ASSET_FONT',0],
+ ['resource-font','BROWSER_CHALLENGE_ISSUER_ASSET_FONT_SUFFIX',0],
+ ['font-ttf','BROWSER_CHALLENGE_ISSUER_ASSET_FONT_SUFFIX',0],
+ ['font-uppercase','BROWSER_CHALLENGE_ISSUER_ASSET_FONT_SUFFIX',0],
  ['resource-xhr','BROWSER_CHALLENGE_ISSUER_ASSET_XHR',0],
  ['resource-fetch','BROWSER_CHALLENGE_ISSUER_ASSET_FETCH',0],
  ['resource-other','BROWSER_CHALLENGE_ISSUER_ASSET_OTHER',0],
@@ -1416,7 +1427,10 @@ for(const [suffix,expected,blocks] of [
  ['resource-input-canary','BROWSER_CHALLENGE_ISSUER_ASSET_OTHER',0],
  ['resource-unreadable','BROWSER_CHALLENGE_ISSUER_ASSET_KIND',0],
  ['suffix','BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX',0],
+ ['image-font-suffix','BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX',0],
  ['duplicate','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',1],
+ ['image-font','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',1],
+ ['font-image','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',1],
  ['worker','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',0],
  ['uncommitted','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',0],
  ['cross-origin','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',0],
@@ -1427,10 +1441,12 @@ for(const [suffix,expected,blocks] of [
  ['missing-event','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',1],
  ['gated-missing-event','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',1],
  ['foreign-event','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',1],
+ ['font-foreign-event','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',1],
  ['other-error','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',1],
  ['inspector-lookalike','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',1],
  ['replaced','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',1],
  ['response','BROWSER_GUARD_RESPONSE_UNCLAIMED',1],
+ ['font-response','BROWSER_GUARD_RESPONSE_UNCLAIMED',1],
 ] as const)test('owned issuer passive block without network: '+suffix,async()=>{
  const f=cancellationPage('approved-issuer-block-'+suffix,false,true);
  let handoffs=0;

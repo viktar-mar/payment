@@ -12,6 +12,10 @@ const uuid=(v:unknown)=>typeof v==='string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-
 const issuerOrigin='https://hooks.stripe.com';
 const directIssuerFrame='stripe-challenge-frame';
 const reservedStripeHosts=new Set(['api','hooks','js','m','r','merchant-ui-api']);
+export function issuerAssetSuffixMatches(kind:string,pathname:string):boolean{
+ if(kind==='image')return /\.(?:png|jpe?g|gif|webp|ico)$/.test(pathname);
+ return kind==='font'&&/\.woff2?$/.test(pathname);
+}
 export function isApprovedIssuerOrigin(value:unknown):value is string{
  if(typeof value!=='string')return false;
  const label=/^https:\/\/([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.stripe\.com$/.exec(value)?.[1];
@@ -100,7 +104,7 @@ interface FrameSnapshot {target:Frame;frames:Map<Frame,string>}
 type Options={
  page:Page;limits:BillingLimits;demo:string;owner:()=>{secret:string;key:string};
  winning:()=>Promise<void>;authorizeResponse:(req:Request)=>Promise<void>;check:()=>Promise<void>;
- expectIssuerImageBlock:(req:Request)=>Promise<void>;
+ expectIssuerAssetBlock:(req:Request)=>Promise<void>;
  stripeFrames:(req:Request)=>FrameSnapshot|undefined;waitForGesture:WaitForIssuerGesture;
  approvedIssuerOrigin?:string;
 };
@@ -109,7 +113,7 @@ function sameChain(a:FrameSnapshot|undefined,b:FrameSnapshot|undefined){
 }
 
 /** Scoped to one original v2 session. Only Stripe.js sends requests and only the issuer UI completes the challenge. */
-export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerImageBlock,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
+export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
  requireValue(approvedIssuerOrigin===undefined||isApprovedIssuerOrigin(approvedIssuerOrigin));
  let retrieve:Request|undefined,authenticate:Request|undefined,admittedAuthenticate:Request|undefined;
  let completed=false,finalRead=false,initialIssuerDispatched=false,boundSource:string|undefined;
@@ -293,26 +297,25 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     requireValue(url.href===url.origin+url.pathname && !url.pathname.includes('%'));
     report('BROWSER_CHALLENGE_ISSUER_ASSET_KIND');
     const kind=request.resourceType();
-    if(kind!=='image'){
+    if(kind!=='image'&&kind!=='font'){
      switch(kind){
       case 'script': report('BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT');break;
       case 'stylesheet': report('BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET');break;
-      case 'font': report('BROWSER_CHALLENGE_ISSUER_ASSET_FONT');break;
       case 'xhr': report('BROWSER_CHALLENGE_ISSUER_ASSET_XHR');break;
       case 'fetch': report('BROWSER_CHALLENGE_ISSUER_ASSET_FETCH');break;
       default: report('BROWSER_CHALLENGE_ISSUER_ASSET_OTHER');
      }
      requireValue(false);
     }
-    report('BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX');
-    requireValue(/\.(?:png|jpe?g|gif|webp|ico)$/.test(url.pathname));
+    report(kind==='image'?'BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX':'BROWSER_CHALLENGE_ISSUER_ASSET_FONT_SUFFIX');
+    requireValue(issuerAssetSuffixMatches(kind,url.pathname));
     const failed=Promise.withResolvers<void>();
     passiveBlock=billingBounded(limits,async active=>{
      await check();billingCheck(active);
      report('BROWSER_CHALLENGE_ISSUER_ASSET_OWNER');
      sameChain(original,committedIssuerDocument(target));
      report('BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK');
-     await expectIssuerImageBlock(request);
+     await expectIssuerAssetBlock(request);
      await check();billingCheck(active);
      report('BROWSER_CHALLENGE_ISSUER_ASSET_OWNER');
      sameChain(original,committedIssuerDocument(target));

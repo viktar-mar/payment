@@ -40,7 +40,7 @@ test('issuer traffic cannot continue when the lifetime ends after the last async
  const driver=initial3dsChallenge({page:{on:()=>{}} as unknown as Page,
   limits:{deadline:Date.now()+1000,signal:controller.signal},demo:'http://127.0.0.1:18081',owner:()=>({key,secret}),
   winning:async()=>{},authorizeResponse:async()=>{},check:async()=>{},
-  expectIssuerImageBlock:async()=>assert.fail('not an optional issuer image'),
+  expectIssuerAssetBlock:async()=>assert.fail('not an optional issuer asset'),
   stripeFrames:()=>({target:frame,frames:new Map([[frame,frame.url()]])}),waitForGesture:async()=>{}});
  await assert.rejects(driver.forward(route,new URL(request.url()),step=>{
   if(step==='BROWSER_CHALLENGE_ROUTE_FORWARD')controller.abort();

@@ -7,7 +7,7 @@ import {initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
 
 const stylesheetRejection='direct reviewed issuer stylesheet rejected';
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked',stylesheetRejection])
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',stylesheetRejection])
 test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before handoff':'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
  const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
@@ -15,12 +15,14 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before 
  const authenticate=api+'/v1/3ds2/authenticate',complete=api+'/v1/3ds2/challenge_complete';
  const outer=stripe+'/v3/three-ds-2-challenge-fixture.html',inner=stripe+'/v3/fixture-inner.html';
  const blocksPassiveImage=mode==='direct reviewed issuer passive image blocked';
+ const blocksPassiveFont=mode==='direct reviewed issuer passive font blocked';
+ const blocksPassiveAsset=blocksPassiveImage||blocksPassiveFont;
  const rejectsStylesheet=mode===stylesheetRejection;
- const direct=mode==='direct Stripe EMVCo frame'||mode==='direct reviewed issuer origin'||blocksPassiveImage||rejectsStylesheet;
+ const direct=mode==='direct Stripe EMVCo frame'||mode==='direct reviewed issuer origin'||blocksPassiveAsset||rejectsStylesheet;
  const issuerName=direct?'stripe-challenge-frame':'acsFrame';
- const approvedIssuerOrigin=mode==='direct reviewed issuer origin'||blocksPassiveImage||rejectsStylesheet?'https://reviewed-test-issuer.stripe.com':undefined;
+ const approvedIssuerOrigin=mode==='direct reviewed issuer origin'||blocksPassiveAsset||rejectsStylesheet?'https://reviewed-test-issuer.stripe.com':undefined;
  const issuerOrigin=approvedIssuerOrigin??'https://hooks.stripe.com',issuer=issuerOrigin+'/fixture-issuer',decision=issuer+'/decision';
- const passiveAsset=issuerOrigin+(rejectsStylesheet?'/fixture-private-stylesheet.css':'/fixture-passive.png');
+ const passiveAsset=issuerOrigin+(rejectsStylesheet?'/fixture-private-stylesheet.css':blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png');
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
  const script=`(async()=>{
@@ -44,8 +46,10 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before 
  const issuerButton='<button name="decision" value="complete">Complete</button>';
  const revealButton="document.querySelector('form').append(document.querySelector('template').content.cloneNode(true))";
  const issuerBody='<!doctype html><form method="post" action="'+decision+'">'+
-  (blocksPassiveImage||rejectsStylesheet?'<template>'+issuerButton+'</template>':issuerButton)+'</form>'+
+  (blocksPassiveAsset||rejectsStylesheet?'<template>'+issuerButton+'</template>':issuerButton)+'</form>'+
   (blocksPassiveImage?`<img width="1" height="1" alt="" src="${passiveAsset}" onerror="${revealButton}">`:
+   blocksPassiveFont?`<style>@font-face{font-family:FixturePassive;src:url("${passiveAsset}") format("woff2")}</style>
+     <script>document.fonts.load('16px FixturePassive','X').catch(()=>{${revealButton}})</script>`:
    rejectsStylesheet?`<link rel="stylesheet" href="${passiveAsset}" onload="${revealButton}">`:'');
  const responses=new Map<string,NonNullable<Parameters<Route['fulfill']>[0]>>([
   [demo+'/',{contentType:'text/html',body:'<!doctype html><link rel="icon" href="data:,"><iframe name="__privateStripeFrame7" src="'+outer+'"></iframe>'}],
@@ -81,12 +85,17 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before 
   let issuerFrame:Frame|undefined,attachedIssuerFrame=false,separateIssuerTarget=false,gestures=0;
   const guard=await guardChallengeRedirects(page,reason=>refusals.push(reason),{demo,backend},undefined,approvedIssuerOrigin);
   const challenge=initial3dsChallenge({page,limits,demo,owner:()=>({key,secret}),winning:async()=>{},check:async()=>{},
-   expectIssuerImageBlock:request=>guard.expectIssuerImageBlock(request),
+   expectIssuerAssetBlock:request=>guard.expectIssuerAssetBlock(request),
    approvedIssuerOrigin,authorizeResponse:async request=>{
     authorized.push(request.url());
     assert.notEqual(request.url(),passiveAsset);
     await guard.authorize(request);
    },waitForGesture:async()=>{
+    if(blocksPassiveAsset){
+     assert.equal(passiveRequests.length,1);
+     assert.equal(passiveFailures[0],passiveRequests[0]);
+     assert.deepEqual(passiveAborts,['blockedbyclient']);
+    }
     gestures++;
     if(mode==='separate issuer process'&&issuerFrame){
      const session=await context.newCDPSession(issuerFrame);
@@ -108,9 +117,9 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before 
   });
   await context.route('**/*',async route=>{
    const request=route.request(),url=request.url(),response=responses.get(url);
-   const isPassiveImage=blocksPassiveImage&&url===passiveAsset;
+   const isPassiveAsset=blocksPassiveAsset&&url===passiveAsset;
    const isRejectedStylesheet=rejectsStylesheet&&url===passiveAsset;
-   if(!response&&!isPassiveImage){await route.abort('blockedbyclient');return;}
+   if(!response&&!isPassiveAsset){await route.abort('blockedbyclient');return;}
    guard.registerRoute(request);
    let checkpoint='route refused';
    try{
@@ -119,18 +128,18 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before 
      if(mode==='late issuer response'&&url===decision)request.existingResponse=()=>null;
      const actual=Object.create(route) as Route;
      actual.continue=async()=>{
-      assert.ok(response,'passive image must never reach continuation');
+      assert.ok(response,'passive asset must never reach continuation');
       const reply=url===retrieve&&forwarded.includes(complete)?json({status:'succeeded'}):response;
       forwarded.push(url);
       await route.fulfill(reply);
      };
-     if(isPassiveImage||isRejectedStylesheet){
+     if(isPassiveAsset||isRejectedStylesheet){
       passiveRequests.push(request);
      }
-     if(isPassiveImage){
+     if(isPassiveAsset){
       actual.abort=async errorCode=>{passiveAborts.push(errorCode);await route.abort(errorCode);};
-      actual.fallback=async()=>assert.fail('passive image must never reach fallback');
-      actual.fulfill=async()=>assert.fail('passive image must never receive a synthetic response');
+      actual.fallback=async()=>assert.fail('passive asset must never reach fallback');
+      actual.fulfill=async()=>assert.fail('passive asset must never receive a synthetic response');
      }
      if(url===issuer){
       issuerFrame=request.frame();
@@ -186,27 +195,27 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before 
   assert.deepEqual(refusals,[]);
   assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision,complete,retrieve]);
   assert.equal(gestures,1);
-  if(blocksPassiveImage){
+  if(blocksPassiveAsset){
    assert.equal(passiveRequests.length,1);
-   const [image]=passiveRequests;
-   assert.ok(image);
-   assert.equal(image.method(),'GET');
-   assert.equal(image.resourceType(),'image');
-   assert.equal(image.isNavigationRequest(),false);
-   assert.equal(image.frame(),issuerFrame);
-   assert.equal(image.serviceWorker(),null);
+   const [asset]=passiveRequests;
+   assert.ok(asset);
+   assert.equal(asset.method(),'GET');
+   assert.equal(asset.resourceType(),blocksPassiveFont?'font':'image');
+   assert.equal(asset.isNavigationRequest(),false);
+   assert.equal(asset.frame(),issuerFrame);
+   assert.equal(asset.serviceWorker(),null);
    assert.deepEqual(passiveAborts,['blockedbyclient']);
    assert.equal(passiveFailures.length,1);
-   assert.equal(passiveFailures[0],image);
-   assert.match(image.failure()?.errorText??'',/^net::ERR_BLOCKED_BY_CLIENT(?:\.Inspector)?$/);
-   assert.equal(image.existingResponse(),null);
+   assert.equal(passiveFailures[0],asset);
+   assert.match(asset.failure()?.errorText??'',/^net::ERR_BLOCKED_BY_CLIENT(?:\.Inspector)?$/);
+   assert.equal(asset.existingResponse(),null);
    assert.deepEqual(passiveResponses,[]);
    assert.deepEqual(authorized,[retrieve,authenticate,issuer,decision,complete,retrieve]);
   }
  }finally{
   stop.abort();
   await browser.close();
-  if(rejectsStylesheet){
+  if(blocksPassiveAsset||rejectsStylesheet){
    assert.equal(browser.isConnected(),false);
    if(attendance)assert.equal(await attendance,false);
   }

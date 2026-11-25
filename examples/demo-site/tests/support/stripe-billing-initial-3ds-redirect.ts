@@ -4,7 +4,7 @@ import {guardIframeTargets,type GuardSession} from './stripe-billing-chromium-if
 // @ts-ignore Native Node executes the pinned Chromium identity reader.
 import {chromiumRouteReader,type ChromiumRouteEvidence} from './stripe-billing-chromium-route.ts';
 // @ts-ignore Native Node executes the same issuer-origin validator.
-import {isApprovedIssuerOrigin} from './stripe-billing-initial-3ds.ts';
+import {isApprovedIssuerOrigin,issuerAssetSuffixMatches} from './stripe-billing-initial-3ds.ts';
 
 const refuse=():never=>{throw Error('billing_BROWSER');};
 // Keep response interception aligned with every original HTTP destination the guarded
@@ -14,7 +14,7 @@ type Origins={backend:string;demo:string};
 type Header={name:string;value:string};
 type Preflight={origin:string;method:string;names?:string};
 type FrameWait={settle:(matched:boolean)=>void;invalidated:boolean};
-type Entry={url:string;method:string;frameId?:string;allowed:boolean;expectedImageBlock?:boolean;preflight?:Preflight;
+type Entry={url:string;method:string;frameId?:string;allowed:boolean;expectedAssetBlock?:boolean;preflight?:Preflight;
  initiator?:{id:string;entry?:Entry};frameWait?:FrameWait};
 type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
  |'BROWSER_GUARD_RESPONSE_PAIR_NETWORK_ID'|'BROWSER_GUARD_RESPONSE_PAIR_REQUEST_MISSING'|'BROWSER_GUARD_RESPONSE_PAIR_DUPLICATE'
@@ -199,7 +199,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
     if(original.method!==event.request.method)return refuse();
     if(event.responseErrorReason){
      reason='BROWSER_GUARD_RESPONSE_NETWORK';
-     if(original.expectedImageBlock && !original.allowed && original.frameId===event.frameId &&
+     if(original.expectedAssetBlock && !original.allowed && original.frameId===event.frameId &&
         event.responseErrorReason==='BlockedByClient' && event.responseStatusCode===undefined && !event.responseHeaders?.length){
       // Chromium can pause the synthetic abort a second time at the response stage.
       // The exact request remains blocked and never acquires response authority.
@@ -285,10 +285,12 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
  const mainId=frameId(frameTree,main,main);
  if(!mainId||routeReader&&routeReader.mainId!==mainId)refuse();
  const routes=new WeakMap<Request,{generation:number;evidence?:ChromiumRouteEvidence|null}>();
- async function claimRoute(request:Request,blockIssuerImage:boolean){
-  const fromApprovedIssuer=approvedIssuerOrigin!==undefined && new URL(request.url()).origin===approvedIssuerOrigin;
-  if(blockIssuerImage?
-     !routes.has(request) || !fromApprovedIssuer || request.method()!=='GET' || request.isNavigationRequest() || request.resourceType()!=='image':
+ async function claimRoute(request:Request,blockIssuerAsset:boolean){
+  const url=new URL(request.url());
+  const fromApprovedIssuer=approvedIssuerOrigin!==undefined && url.origin===approvedIssuerOrigin;
+  if(blockIssuerAsset?
+     !routes.has(request) || !fromApprovedIssuer || request.method()!=='GET' || request.isNavigationRequest() ||
+      !issuerAssetSuffixMatches(request.resourceType(),url.pathname) || url.href!==url.origin+url.pathname || url.pathname.includes('%'):
      fromApprovedIssuer && (request.method()!=='POST'||!request.isNavigationRequest()||request.resourceType()!=='document')){
    onFailure('BROWSER_GUARD_ROUTE_IDENTITY');return refuse();
   }
@@ -322,10 +324,10 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
     reason='BROWSER_GUARD_ROUTE_EVENT_METHOD';
     if(entry.method!==request.method())return refuse();
     reason='BROWSER_GUARD_ROUTE_EVENT_CLAIMED';
-    if(entry.allowed || entry.expectedImageBlock)return refuse();
+    if(entry.allowed || entry.expectedAssetBlock)return refuse();
     reason='BROWSER_GUARD_ROUTE_EVENT_PREFLIGHT';
     if(entry.method==='OPTIONS'&&!entry.preflight)return refuse();
-    if(blockIssuerImage)entry.expectedImageBlock=true;
+    if(blockIssuerAsset)entry.expectedAssetBlock=true;
     else entry.allowed=true;
    }catch{onFailure(reason);return refuse();}
    return;
@@ -362,9 +364,9 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   }
   if(!origin.current()||frame.isDetached())refuse();
   const matches=[...origin.requests.values()].filter(entry=>entry.frameId===id && entry.url===request.url() && entry.method===request.method());
-  if(matches.length!==1 || matches[0]!.allowed || matches[0]!.expectedImageBlock || request.method()==='OPTIONS' && !matches[0]!.preflight)refuse();
+  if(matches.length!==1 || matches[0]!.allowed || matches[0]!.expectedAssetBlock || request.method()==='OPTIONS' && !matches[0]!.preflight)refuse();
   // Only explicitly registered protocol fixtures use this branch.
-  if(blockIssuerImage)matches[0]!.expectedImageBlock=true;
+  if(blockIssuerAsset)matches[0]!.expectedAssetBlock=true;
   else matches[0]!.allowed=true;
  }
  return {
@@ -372,6 +374,6 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
    if(!routes.has(request))routes.set(request,{generation:iframeGuard.generation(),evidence:routeReader?.capture(request)});
   },
   authorize:(request:Request)=>claimRoute(request,false),
-  expectIssuerImageBlock:(request:Request)=>claimRoute(request,true),
+  expectIssuerAssetBlock:(request:Request)=>claimRoute(request,true),
  };
 }

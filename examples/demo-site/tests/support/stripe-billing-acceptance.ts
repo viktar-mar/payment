@@ -380,7 +380,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   const redirects=responseGuard?await guardChallengeRedirects(page,invalidate,binding.endpoints,limits.signal,challenge?.approvedIssuerOrigin):undefined;
   const sca=challenge?initial3dsChallenge({page,limits,demo:binding.endpoints.demo,owner:()=>({secret:firstSecret,key:publishableKey??''}),
    stripeFrames:req=>stripeFrames(page,req,false,false,binding.endpoints.demo),authorizeResponse:req=>redirects!.authorize(req),check:checkManager,waitForGesture:challenge.waitForGesture,
-   expectIssuerImageBlock:req=>redirects!.expectIssuerImageBlock(req),
+   expectIssuerAssetBlock:req=>redirects!.expectIssuerAssetBlock(req),
    approvedIssuerOrigin:challenge.approvedIssuerOrigin,
    winning:async()=>{
     const original=requests.get('original-confirm'),response=original?.existingResponse();
