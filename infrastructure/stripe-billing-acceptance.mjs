@@ -133,10 +133,20 @@ async function createOwner(options,dependencies,selectedCase) {
        operations[kind].operationId=operationId;
        const phase=kind==='schedule'?'scheduled':'withdrawn';
        await step('CANCELLATION_EVIDENCE',async l=>{
-        const prove=dependencies.proveCancellation??(await import('./stripe-billing-cancellation-evidence.mjs')).proveBillingCancellationEvidence;
-        if(await prove({configuration,bootstrap,fixture,phase,operations,baseline},l)!==true ||
-           await cli.observeOwnedBillingCancellation(phase,l)!==true ||
-           await fixture.acknowledgeCancellation(kind,operationId,l)!==true)fail('CANCELLATION_EVIDENCE');
+        let checkpoint='CANCELLATION_LOCAL_EVIDENCE';
+        try{
+         const prove=dependencies.proveCancellation??(await import('./stripe-billing-cancellation-evidence.mjs')).proveBillingCancellationEvidence;
+         if(await prove({configuration,bootstrap,fixture,phase,operations,baseline},l)!==true)fail(checkpoint);
+         billingCheck(l);
+         checkpoint='CANCELLATION_PROVIDER_EVIDENCE';
+         if(await cli.observeOwnedBillingCancellation(phase,l)!==true)fail(checkpoint);
+         billingCheck(l);
+         checkpoint='CANCELLATION_ACK_EVIDENCE';
+         if(await fixture.acknowledgeCancellation(kind,operationId,l)!==true)fail(checkpoint);
+        }catch{
+         billingCheck(l);
+         fail(checkpoint);
+        }
        });
        next=kind==='schedule'?'withdraw':'complete';return true;
       },

@@ -75,6 +75,40 @@ class BillingAcceptanceSqlIntegrationTest extends PostgresIntegrationTest {
         }
     }
 
+    @Test void cancellationProofAcceptsOnlyTheExactVersionedWithdrawalFingerprint() throws Exception {
+        var dir = Path.of("../infrastructure");
+        var sql = Files.readString(dir.resolve("stripe-billing-cancellation-proof.sql"));
+        var fixture = Files.readString(dir.resolve("fixtures/stripe-billing-cancellation-proof-rows.sql"));
+        try (var connection = source.getConnection(); var setup = connection.createStatement()) {
+            connection.setAutoCommit(false);
+            try {
+                setup.execute(fixture);
+                setup.execute("call pg_temp.record_cancel_command(false)");
+                setup.execute("call pg_temp.record_cancel_command(true)");
+                setup.execute("update pg_temp.subscription_operations set fingerprint=overlay(fingerprint placing 'v2' from 1 for 2) where id=pg_temp.cid(21)");
+                assertCancellationRow(connection, sql, true, true, true);
+
+                var original = connection.setSavepoint();
+                setup.execute("update pg_temp.subscription_operations set fingerprint=overlay(fingerprint placing 'v2' from 1 for 2) where id=pg_temp.cid(20)");
+                assertCancellationRow(connection, sql, true, true, true, false, true);
+                connection.rollback(original);
+
+                setup.execute("update pg_temp.subscription_operations set fingerprint=overlay(fingerprint placing 'v3' from 1 for 2) where id=pg_temp.cid(21)");
+                assertCancellationRow(connection, sql, true, true, true, true, false);
+                connection.rollback(original);
+
+                setup.execute("update pg_temp.subscription_operations set fingerprint=regexp_replace(fingerprint,'[0-9]+/0[.]','1/0.') where id=pg_temp.cid(21)");
+                assertCancellationRow(connection, sql, true, true, true, true, false);
+                connection.rollback(original);
+
+                setup.execute("update pg_temp.subscription_operations set fingerprint=left(fingerprint,length(fingerprint)-1)||'g' where id=pg_temp.cid(21)");
+                assertCancellationRow(connection, sql, true, true, true, true, false);
+            } finally {
+                connection.rollback();
+            }
+        }
+    }
+
     @Test void retryProofRequiresCausalDeclineNoCashAndOnePaidSuccessor() throws Exception {
         var dir = Path.of("../infrastructure");
         var query = Files.readString(dir.resolve("stripe-billing-initial-retry-proof.sql"));
@@ -123,6 +157,11 @@ class BillingAcceptanceSqlIntegrationTest extends PostgresIntegrationTest {
 
     private static void assertCancellationRow(Connection c, String sql, boolean withdrawn, boolean original, boolean closed)
         throws Exception {
+        assertCancellationRow(c, sql, withdrawn, original, closed, true, true);
+    }
+
+    private static void assertCancellationRow(Connection c, String sql, boolean withdrawn, boolean original, boolean closed,
+                                              boolean scheduleAcknowledged, boolean withdrawalAcknowledged) throws Exception {
         var json = new ObjectMapper();
         try (var select = c.prepareStatement(sql.replaceAll("\\$[0-9]+", "?"))) {
             bindInitial(select);
@@ -142,9 +181,10 @@ class BillingAcceptanceSqlIntegrationTest extends PostgresIntegrationTest {
                 assertThat(row.getObject("cancellation_at")).isEqualTo(withdrawn ? null : row.getObject("period_end"));
                 var receipts = json.readTree(row.getString("receipts"));
                 assertThat(receipts.size()).isEqualTo(withdrawn ? 2 : 1);
-                receipts.forEach(r -> assertThat(r.get("acknowledged").asBoolean()).isTrue());
+                assertThat(receipts.get(0).get("acknowledged").asBoolean()).as("schedule acknowledged").isEqualTo(scheduleAcknowledged);
                 assertThat(receipts.get(0).get("operation_id").asText()).isEqualTo(fixtureId(20).toString());
                 if (withdrawn) {
+                    assertThat(receipts.get(1).get("acknowledged").asBoolean()).as("withdrawal acknowledged").isEqualTo(withdrawalAcknowledged);
                     assertThat(receipts.get(1).get("operation_id").asText()).isEqualTo(fixtureId(21).toString());
                     assertThat(receipts.get(1).get("prior_event").asText()).isEqualTo(receipts.get(0).get("event_id").asText());
                     assertThat(receipts.get(1).get("prior_event_revision")).isEqualTo(receipts.get(0).get("revision"));

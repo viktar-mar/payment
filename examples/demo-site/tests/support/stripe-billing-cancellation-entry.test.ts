@@ -48,9 +48,11 @@ for(const mode of ['original','unconfirmed','copied result','duplicate','foreign
     const t={expectedStatus:'passed',title:'OWNED_PERIOD_END_CANCELLATION',location:{file:fileURLToPath(new URL('../stripe-billing-cancellation.spec.ts',import.meta.url))},
       parent:{project:()=>({name:mode==='foreign project'?'other':'owned-period-end-cancellation'})},annotations:[]} as unknown as TestCase;
     const r={retry:mode==='second attempt'?1:0,status:'failed',annotations:[]} as unknown as TestResult;
-    const line='owned_period_end_cancellation_terminal phase=BROWSER code=BROWSER_OTP_REQUEST cleanup='+(mode==='unconfirmed'?'UNCONFIRMED':'CONFIRMED');
+    const phase=mode==='original'?'CANCELLATION_EVIDENCE':'BROWSER';
+    const code=mode==='original'?'CANCELLATION_LOCAL_EVIDENCE':'BROWSER_OTP_REQUEST';
+    const line='owned_period_end_cancellation_terminal phase='+phase+' code='+code+' cleanup='+(mode==='unconfirmed'?'UNCONFIRMED':'CONFIRMED');
     reporter.onTestBegin(t,r);
-    const terminal={scope:'INITIAL_CANCEL_WITHDRAW',status:'CLOSED',phase:'BROWSER',code:'BROWSER_OTP_REQUEST',
+    const terminal={scope:'INITIAL_CANCEL_WITHDRAW',status:'CLOSED',phase,code,
       full5bAccepted:false,initialAccepted:false,cancellationAccepted:false,cleanupConfirmed:mode!=='unconfirmed'};
     const owner={run:async()=>{throw Error('private worker failure canary');},close:async()=>terminal,resources:()=>terminal};
     await assert.rejects(runCancellationCase(owner,async()=>assert.fail(),r.annotations),/billing_NOT_ACCEPTED/);

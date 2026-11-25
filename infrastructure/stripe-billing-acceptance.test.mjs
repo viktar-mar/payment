@@ -70,15 +70,24 @@ for(const cleanup of ['confirmed','unconfirmed','foreign error'])test('early can
 });
 const keyA='10000000-0000-4000-a000-000000000001',keyB='20000000-0000-4000-a000-000000000002';
 const opA='30000000-0000-4000-a000-000000000003',opB='40000000-0000-4000-a000-000000000004';
-for(const mode of ['success','initial-only-owner','no-baseline','early-withdraw','duplicate','same-key','same-operation','lost-ack','provider-refused','no-local-proof','cleanup-refused','browser-refused','browser-unknown']){
+const cancellationEvidenceFailures={
+ 'no-local-proof':'CANCELLATION_LOCAL_EVIDENCE',
+ 'local-error':'CANCELLATION_LOCAL_EVIDENCE',
+ 'provider-refused':'CANCELLATION_PROVIDER_EVIDENCE',
+ 'provider-error':'CANCELLATION_PROVIDER_EVIDENCE',
+ 'ack-refused':'CANCELLATION_ACK_EVIDENCE',
+ 'ack-error':'CANCELLATION_ACK_EVIDENCE',
+};
+for(const mode of ['success','initial-only-owner','no-baseline','early-withdraw','duplicate','same-key','same-operation','lost-ack',...Object.keys(cancellationEvidenceFailures),'cleanup-refused','browser-refused','browser-unknown']){
  test('non-clock cancellation owner: '+mode,async()=>{
   const h=harness();
-  h.cli.observeOwnedBillingCancellation=async phase=>{h.calls.push('remote-'+phase);return mode!=='provider-refused';};
+  h.cli.observeOwnedBillingCancellation=async phase=>{h.calls.push('remote-'+phase);if(mode==='provider-error')throw Error('private provider evidence');return mode!=='provider-refused';};
   h.fixture.beforeCancellation=async(kind,hash)=>{assert.match(hash,/^[a-f0-9]{64}$/);h.calls.push('dispatch-'+kind);return true;};
-  h.fixture.acknowledgeCancellation=async(kind,id)=>{assert.equal(id,kind==='schedule'?opA:opB);h.calls.push('ack-'+kind);return true;};
+  h.fixture.acknowledgeCancellation=async(kind,id)=>{assert.equal(id,kind==='schedule'?opA:opB);h.calls.push('ack-'+kind);if(mode==='ack-error')throw Error('private ack evidence');return mode!=='ack-refused';};
   h.dependencies.proveCancellation=async({phase,operations,baseline})=>{
    assert.equal(baseline.cashVerified,true);assert.equal(operations.schedule.operationId,opA);
    if(phase==='withdrawn')assert.equal(operations.withdraw.operationId,opB);
+   if(mode==='local-error')throw Error('private local evidence');
    return mode!=='no-local-proof';
   };
   if(mode==='cleanup-refused')h.bootstrap.stop=async()=>false;
@@ -105,7 +114,16 @@ for(const mode of ['success','initial-only-owner','no-baseline','early-withdraw'
    assert.equal(result.cancellationAccepted,true);assert.equal(result.scope,'INITIAL_CANCEL_WITHDRAW');
    assert.deepEqual(h.calls.filter(s=>/^(dispatch|remote|ack)-/.test(s)),['dispatch-schedule','remote-scheduled','ack-schedule','dispatch-withdraw','remote-withdrawn','ack-withdraw']);
   }else{
-   await assert.rejects(run);assert.equal(owner.resources().cancellationAccepted,false);
+   const code=cancellationEvidenceFailures[mode];
+   if(code){
+    await assert.rejects(run,{message:'billing_'+code});
+    assert.equal(owner.resources().phase,'CANCELLATION_EVIDENCE');
+    assert.equal(owner.resources().code,code);
+    assert.equal(h.calls.includes('remote-scheduled'),code!=='CANCELLATION_LOCAL_EVIDENCE');
+    assert.equal(h.calls.includes('ack-schedule'),code==='CANCELLATION_ACK_EVIDENCE');
+    assert.ok(!h.calls.includes('dispatch-withdraw'));
+   }else await assert.rejects(run);
+   assert.equal(owner.resources().cancellationAccepted,false);
    if(['early-withdraw','no-baseline'].includes(mode))assert.ok(!h.calls.includes('dispatch-schedule')&&!h.calls.includes('dispatch-withdraw'));
    if(['provider-refused','no-local-proof','duplicate','lost-ack','same-key'].includes(mode))assert.ok(!h.calls.includes('dispatch-withdraw'));
   }

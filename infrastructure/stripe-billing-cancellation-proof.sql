@@ -14,7 +14,8 @@ with owned as (
          (o.status='SUCCEEDED' and o.safe_failure_code is null and o.key_digest=w.digest and p.mode=w.mode
           and o.authority_scope='customer:'||x.customer_id::text and o.policy_version=policy.version and policy.enabled
           and o.provider_operation_key='subscription:'||x.account_id::text||':'||o.id::text||':'||w.kind
-          and o.fingerprint ~ ('^v1[.]cancel[.]'||lower(w.mode)||'[.]'||extract(epoch from p.boundary)::bigint::text||'/0[.][a-f0-9]{64}$')
+          and o.fingerprint ~ ('^'||case when w.kind='WITHDRAW_CANCEL' then 'v[12]' else 'v1' end
+            ||'[.]cancel[.]'||lower(w.mode)||'[.]'||extract(epoch from p.boundary)::bigint::text||'/0[.][a-f0-9]{64}$')
           and o.provider_reference=s.provider_reference and p.subscription_reference=s.provider_reference and p.boundary=s.paid_through
           and step.status='ACKNOWLEDGED' and step.operation_key=o.provider_operation_key
           and step.external_account_id='acct_1UPiMpELswAd8tpR' and step.credentials_ref='stripe-sandbox-default'
