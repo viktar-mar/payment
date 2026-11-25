@@ -128,6 +128,10 @@ Run `f041acfc-ad02-4e52-9bce-ce6988117579` at `3858c00` identified the exact fai
 
 Run `01402923-54f8-4242-ad4e-1ccdc11b16bf` at `9eee37d` still reached `BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT` before handoff and confirmed cleanup. That code represented either a repeated path or an additional distinct path after two slots were used. The local diagnostic now reports repeated paths separately. Both checks still stop before handoff. The run supplied no native 3DS settlement evidence. [Local completion report](../.superpowers/native-initial-3ds/01402923-54f8-4242-ad4e-1ccdc11b16bf/completion.json)
 
+Run `e7a5b2ad-cfce-4e90-a918-e64875a9a41c` at `b0cae32` used the split codes and stopped at `BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT`. The third distinct issuer path arrived after the first two slots were reserved. The budget check occurred before classifying that request. Cleanup was confirmed. Operator handoff and native settlement remain outstanding. [Local completion report](../.superpowers/native-initial-3ds/e7a5b2ad-cfce-4e90-a918-e64875a9a41c/completion.json)
+
+The browser now checks ownership, request shape and supported asset type before enforcing a single local batch limit of six. Each request still needs its own exact blocked-by-client event within the same original 750 ms window. A refusal at the batch limit identifies a further eligible distinct path. Passive files are always blocked.
+
 ### Earlier initial-decline and Retry attempts
 
 The first native initial-decline/retry attempt, `a35eb316-f842-42b7-a1b0-157f942a8e99` at `d8bebcf163b3457e68f412ed4e6b7c582d349e69`, exited 1 with `phase=RETRY_ACK code=BROWSER cleanup=UNCONFIRMED`. The last durable operation was `CREATE_ACK`. The ledger contains no first confirmation, Retry or successor confirmation dispatch. The phase label is shared by several acknowledgements, including creation, and leaves the exact browser failure undetermined. A separate check found all seven containers exited and no Stripe listener for this run. Initial decline and retry remain pending native evidence.

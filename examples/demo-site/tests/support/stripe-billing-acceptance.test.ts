@@ -284,7 +284,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     const kind=fault.slice('approved-issuer-block-'.length);
     if(kind==='resource-unreadable')throw Error('private-asset-resource-canary');
     if(kind.startsWith('resource-'))return kind.slice('resource-'.length);
-    return issuerShape==='font'?'font':'image';
+    return issuerShape??'image';
    }
    return issuerShape==='resource'?'image':navigation?'document':'xhr';
   },
@@ -325,9 +325,13 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
      if(fault==='approved-issuer-block-duplicate')await requestPassiveIssuerAsset();
      if(fault==='approved-issuer-block-image-font')await requestPassiveIssuerAsset('font');
      if(fault==='approved-issuer-block-font-image')await requestPassiveIssuerAsset('image');
-     if(fault==='approved-issuer-block-third'){
-      await requestPassiveIssuerAsset('font');
-      await requestPassiveIssuerAsset('font',2);
+     if(fault.startsWith('approved-issuer-block-batch-')){
+      for(let index=2;index<=5;index++)await requestPassiveIssuerAsset('font',index);
+      if(fault==='approved-issuer-block-batch-shared-deadline')advancePassiveClock(600);
+      await requestPassiveIssuerAsset('font',6);
+      if(fault==='approved-issuer-block-batch-overflow')await requestPassiveIssuerAsset('font',7);
+      if(fault==='approved-issuer-block-batch-repeat')await requestPassiveIssuerAsset();
+      if(fault==='approved-issuer-block-batch-script')await wire(approvedFixtureIssuer+'/fixture-passive.js',issuer,null,{},false,'script');
      }
      if(fault==='approved-issuer-block-second-decoy')await requestPassiveIssuerAsset('font');
      if(fault==='approved-issuer-block-second-late'||fault==='approved-issuer-block-shared-deadline'){
@@ -348,12 +352,14 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     if(fault==='approved-issuer-block-gated'||fault==='approved-issuer-block-gated-pair'&&ordinal===2)
      await new Promise(resolve=>setTimeout(resolve,25));
     if(fault==='approved-issuer-block-shared-deadline'&&ordinal===2)advancePassiveClock(151);
+    if(fault==='approved-issuer-block-batch-shared-deadline'&&ordinal===6)advancePassiveClock(151);
     if(fault==='approved-issuer-block-response'||fault==='approved-issuer-block-font-response')await reply('passive',200).catch(()=>{});
     reply.failed();
     if(fault==='approved-issuer-block-replaced')navigate(issuer);
     if(!fault.endsWith('-missing-event')){
      trace.push('passive block event');
-     requestFailed(fault==='approved-issuer-block-second-decoy'&&ordinal===2?firstPassiveRequest!:
+     const isDecoy=fault==='approved-issuer-block-second-decoy'&&ordinal===2 || fault==='approved-issuer-block-batch-decoy'&&ordinal===6;
+     requestFailed(isDecoy?firstPassiveRequest!:
       fault.endsWith('-foreign-event')?{...request}:request);
     }
    }
@@ -1455,7 +1461,12 @@ for(const [suffix,expected,blocks] of [
  ['duplicate','BROWSER_CHALLENGE_ISSUER_ASSET_REPEAT',1],
  ['image-font',null,2],
  ['font-image',null,2],
- ['third','BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT',2],
+ ['batch-six',null,6],
+ ['batch-overflow','BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT',6],
+ ['batch-repeat','BROWSER_CHALLENGE_ISSUER_ASSET_REPEAT',6],
+ ['batch-script','BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT',6],
+ ['batch-shared-deadline','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',6],
+ ['batch-decoy','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',6],
  ['second-late','BROWSER_CHALLENGE_ISSUER_ASSET_DEADLINE',1],
  ['shared-deadline','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',2],
  ['second-decoy','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',2],
@@ -1478,7 +1489,7 @@ for(const [suffix,expected,blocks] of [
  ['font-response','BROWSER_GUARD_RESPONSE_UNCLAIMED',1],
 ] as const)test('owned issuer passive block without network: '+suffix,async t=>{
  let now=Date.now();
- if(suffix==='second-late'||suffix==='shared-deadline')t.mock.method(Date,'now',()=>now);
+ if(suffix==='second-late'||suffix.endsWith('shared-deadline'))t.mock.method(Date,'now',()=>now);
  const f=cancellationPage('approved-issuer-block-'+suffix,false,true,false,undefined,false,milliseconds=>{now+=milliseconds;});
  let handoffs=0;
  const run=runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+2200},async()=>{

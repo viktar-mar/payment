@@ -8,7 +8,8 @@ import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts'
 
 const stylesheetRejection='direct reviewed issuer stylesheet rejected';
 const twoFonts='direct reviewed issuer two passive fonts blocked';
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,stylesheetRejection])
+const sixFonts='direct reviewed issuer six passive fonts blocked';
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetRejection])
 test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before handoff':'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
  const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
@@ -16,7 +17,7 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before 
  const authenticate=api+'/v1/3ds2/authenticate',complete=api+'/v1/3ds2/challenge_complete';
  const outer=stripe+'/v3/three-ds-2-challenge-fixture.html',inner=stripe+'/v3/fixture-inner.html';
  const blocksPassiveImage=mode==='direct reviewed issuer passive image blocked';
- const blocksPassiveFont=mode==='direct reviewed issuer passive font blocked'||mode===twoFonts;
+ const blocksPassiveFont=mode==='direct reviewed issuer passive font blocked'||mode===twoFonts||mode===sixFonts;
  const blocksPassiveAsset=blocksPassiveImage||blocksPassiveFont;
  const rejectsStylesheet=mode===stylesheetRejection;
  const direct=mode==='direct Stripe EMVCo frame'||mode==='direct reviewed issuer origin'||blocksPassiveAsset||rejectsStylesheet;
@@ -24,7 +25,8 @@ test(mode===stylesheetRejection?'rejects a same-origin issuer stylesheet before 
  const approvedIssuerOrigin=mode==='direct reviewed issuer origin'||blocksPassiveAsset||rejectsStylesheet?'https://reviewed-test-issuer.stripe.com':undefined;
  const issuerOrigin=approvedIssuerOrigin??'https://hooks.stripe.com',issuer=issuerOrigin+'/fixture-issuer',decision=issuer+'/decision';
  const passiveAsset=issuerOrigin+(rejectsStylesheet?'/fixture-private-stylesheet.css':blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png');
- const assetUrls=mode===twoFonts?[passiveAsset,issuerOrigin+'/fixture-second.woff2']:[passiveAsset];
+ const fontCount=mode===sixFonts?6:mode===twoFonts?2:1;
+ const assetUrls=[passiveAsset,...Array.from({length:fontCount-1},(_,index)=>issuerOrigin+`/fixture-passive-${index+2}.woff2`)];
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
  const script=`(async()=>{

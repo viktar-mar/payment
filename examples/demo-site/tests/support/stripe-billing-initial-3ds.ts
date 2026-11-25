@@ -12,6 +12,7 @@ const uuid=(v:unknown)=>typeof v==='string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-
 const issuerOrigin='https://hooks.stripe.com';
 const directIssuerFrame='stripe-challenge-frame';
 const reservedStripeHosts=new Set(['api','hooks','js','m','r','merchant-ui-api']);
+const issuerAssetBlockLimit=6;
 export function issuerAssetSuffixMatches(kind:string,pathname:string):boolean{
  if(kind==='image')return /\.(?:png|jpe?g|gif|webp|ico)$/.test(pathname);
  return kind==='font'&&/\.woff2?$/.test(pathname);
@@ -289,10 +290,6 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    if(approved && initialIssuerDispatched && !navigation){
     report('BROWSER_CHALLENGE_ISSUER_ASSET_HANDOFF');
     requireValue(!handoffStarted);
-    report('BROWSER_CHALLENGE_ISSUER_ASSET_REPEAT');
-    requireValue(!passiveBlocks.has(url.pathname));
-    report('BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT');
-    requireValue(passiveBlocks.size<2);
     report('BROWSER_CHALLENGE_ISSUER_ASSET_BINDING');
     requireValue(binding && new URL(binding.url).origin===url.origin);
     report('BROWSER_CHALLENGE_ISSUER_ASSET_WORKER');
@@ -323,8 +320,12 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     }
     report(kind==='image'?'BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX':'BROWSER_CHALLENGE_ISSUER_ASSET_FONT_SUFFIX');
     requireValue(issuerAssetSuffixMatches(kind,url.pathname));
-    // Both distinct requests share the first request's deadline. A late second
-    // request cannot start a new proof window or inherit another request's receipt.
+    report('BROWSER_CHALLENGE_ISSUER_ASSET_REPEAT');
+    requireValue(!passiveBlocks.has(url.pathname));
+    report('BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT');
+    requireValue(passiveBlocks.size<issuerAssetBlockLimit);
+    // All claims share the first request's deadline. A late request cannot
+    // start a new proof window or inherit another request's receipt.
     passiveDeadline??=Math.min(limits.deadline,Date.now()+750);
     const blockLimits={deadline:passiveDeadline,signal:limits.signal};
     report('BROWSER_CHALLENGE_ISSUER_ASSET_DEADLINE');
