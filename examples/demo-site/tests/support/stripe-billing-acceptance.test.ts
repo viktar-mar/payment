@@ -276,7 +276,12 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    {authorization:'Bearer pk_test_fixture',origin:'https://js.stripe.com'};
   const request={url:()=>url,method:()=>method,frame:()=>target,isNavigationRequest:()=>navigation,resourceType:()=>{
    if(url.startsWith('https://unlisted-fixture.stripe.com/')&&fault==='challenge-origin-unreadable-kind')throw Error('private-kind');
-   if(passive)return fault==='approved-issuer-block-script'?'script':'image';
+   if(passive){
+    const kind=fault.slice('approved-issuer-block-'.length);
+    if(kind==='resource-unreadable')throw Error('private-asset-resource-canary');
+    if(kind.startsWith('resource-'))return kind.slice('resource-'.length);
+    return 'image';
+   }
    return issuerShape==='resource'?'image':navigation?'document':'xhr';
   },
    failure:()=>({errorText:fault==='approved-issuer-block-other-error'?'net::ERR_FAILED':
@@ -1401,8 +1406,16 @@ for(const [suffix,expected,blocks] of [
  ['post','BROWSER_CHALLENGE_ISSUER_ASSET_METHOD',0],
  ['body','BROWSER_CHALLENGE_ISSUER_ASSET_METHOD',0],
  ['query','BROWSER_CHALLENGE_ISSUER_ASSET_PATH',0],
- ['script','BROWSER_CHALLENGE_ISSUER_ASSET_KIND',0],
- ['suffix','BROWSER_CHALLENGE_ISSUER_ASSET_KIND',0],
+ ['resource-script','BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT',0],
+ ['resource-stylesheet','BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET',0],
+ ['resource-font','BROWSER_CHALLENGE_ISSUER_ASSET_FONT',0],
+ ['resource-xhr','BROWSER_CHALLENGE_ISSUER_ASSET_XHR',0],
+ ['resource-fetch','BROWSER_CHALLENGE_ISSUER_ASSET_FETCH',0],
+ ['resource-other','BROWSER_CHALLENGE_ISSUER_ASSET_OTHER',0],
+ ['resource-__proto__','BROWSER_CHALLENGE_ISSUER_ASSET_OTHER',0],
+ ['resource-input-canary','BROWSER_CHALLENGE_ISSUER_ASSET_OTHER',0],
+ ['resource-unreadable','BROWSER_CHALLENGE_ISSUER_ASSET_KIND',0],
+ ['suffix','BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX',0],
  ['duplicate','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',1],
  ['worker','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',0],
  ['uncommitted','BROWSER_CHALLENGE_ISSUER_ASSET_OWNER',0],
@@ -1430,6 +1443,8 @@ for(const [suffix,expected,blocks] of [
  if(expected)await assert.rejects(run,error=>{
   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),expected);
   assert.equal(browserCleanupConfirmed(error),true);
+  assert.equal(JSON.stringify(error),'{}');
+  assert.match(String(error),/^Error: billing_BROWSER$/);
   return true;
  });
  else assert.equal(await run,true);

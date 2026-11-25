@@ -292,7 +292,20 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     report('BROWSER_CHALLENGE_ISSUER_ASSET_PATH');
     requireValue(url.href===url.origin+url.pathname && !url.pathname.includes('%'));
     report('BROWSER_CHALLENGE_ISSUER_ASSET_KIND');
-    requireValue(request.resourceType()==='image' && /\.(?:png|jpe?g|gif|webp|ico)$/.test(url.pathname));
+    const kind=request.resourceType();
+    if(kind!=='image'){
+     switch(kind){
+      case 'script': report('BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT');break;
+      case 'stylesheet': report('BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET');break;
+      case 'font': report('BROWSER_CHALLENGE_ISSUER_ASSET_FONT');break;
+      case 'xhr': report('BROWSER_CHALLENGE_ISSUER_ASSET_XHR');break;
+      case 'fetch': report('BROWSER_CHALLENGE_ISSUER_ASSET_FETCH');break;
+      default: report('BROWSER_CHALLENGE_ISSUER_ASSET_OTHER');
+     }
+     requireValue(false);
+    }
+    report('BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX');
+    requireValue(/\.(?:png|jpe?g|gif|webp|ico)$/.test(url.pathname));
     const failed=Promise.withResolvers<void>();
     passiveBlock=billingBounded(limits,async active=>{
      await check();billingCheck(active);
