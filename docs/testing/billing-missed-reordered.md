@@ -24,4 +24,4 @@ The case creates one subscription and submits Pay once. Its local receiver holds
 4. The receiver forwards the newer paid notification, waits for the application's processed receipt, then forwards the older finalized notification. The application must retain the same payment, bill, journal events and signed callback deliveries. A final independent Stripe read must still find the original charge.
 5. The terminal report records acceptance and cleanup independently. Keep the source, run ID and terminal report with the stage matrix.
 
-The PostgreSQL regressions use synthetic provider events. A native receipt requires a separate completed Stripe Sandbox run for this case.
+The PostgreSQL regressions use synthetic provider events. The dedicated Stripe Sandbox run `57e25939-b17d-46ba-af17-5d2188504809` passed all five checks at `7d45473`. The terminal report records one completed attempt and confirmed cleanup. [Local completion report](../../.superpowers/native-initial-missed-reordered/57e25939-b17d-46ba-af17-5d2188504809/completion.json)
