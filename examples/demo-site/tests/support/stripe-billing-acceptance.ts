@@ -110,7 +110,7 @@ type CancellationRequest = {kind:CancellationKind; url:string; request?:Request;
 
 /** Bind each 202 to the original, already persisted SDK request from this document. */
 function cancellationJourney(page:Page, manager:Locator, port:BillingCancellationPort, binding:BillingBinding,
- authority:string, customerId:string, subscriptionId:string, createId:string, limits:BillingLimits, check:()=>void,
+ authority:string, customerId:string, subscriptionId:string, createId:string, limits:BillingLimits, check:()=>void,recordFailure:(code:string)=>void,
  authorizeResponse?:(request:Request)=>Promise<void>,checkOwner?:()=>Promise<void>) {
  const endpoint = binding.endpoints.backend+'/api/v1/customer/subscriptions/'+subscriptionId+'/cancellation';
  const usedKeys = new Set<string>(), operations = new Set([createId]);
@@ -156,21 +156,31 @@ function cancellationJourney(page:Page, manager:Locator, port:BillingCancellatio
   const intent:CancellationRequest={kind,url:kind==='schedule'?endpoint:endpoint+'/withdraw'};
   const receipt=page.waitForResponse(r=>r.url()===intent.url && r.request().method()==='POST',{timeout:duration(limits)});
   void receipt.catch(()=>{});
+  let checkpoint:string|undefined='BROWSER_CANCELLATION_WITHDRAW_RESPONSE';
   armed=intent;
   try {
    await click(kind==='schedule'?'Confirm cancellation':'Withdraw cancellation');
    const response=await receipt;
    check();
-   need(intent.forwarded && response.request()===intent.request && !response.fromServiceWorker() && response.status()===202);
+   need(intent.forwarded && response.request()===intent.request && !response.fromServiceWorker());
+   checkpoint='BROWSER_CANCELLATION_WITHDRAW_HTTP';
+   need(response.status()===202);
+   checkpoint='BROWSER_CANCELLATION_WITHDRAW_RECEIPT';
    const ack=await body(response,limits);
    need(exact(ack,['subscription_id','operation_id','status','action_available','next_action','browser_confirm_allowed']) &&
     ack.subscription_id===subscriptionId && uuid(ack.operation_id) && !operations.has(ack.operation_id) &&
-    (ack.status==='PROCESSING' || ack.status==='SUCCEEDED') && ack.next_action===null && ack.action_available===false && ack.browser_confirm_allowed===false);
+    ack.next_action===null && ack.action_available===false && ack.browser_confirm_allowed===false);
+   if(ack.status==='UNKNOWN')checkpoint='BROWSER_CANCELLATION_WITHDRAW_UNKNOWN';
+   need(ack.status==='PROCESSING' || ack.status==='SUCCEEDED');
+   checkpoint=undefined;
    const operationId=ack.operation_id as string;
    operations.add(operationId);
    armed=undefined;
    check();need(await port.verifyCancellation(kind,operationId)===true);
    return await waitForProjection(kind,operationId,previous);
+  }catch(error){
+   if(kind==='withdraw' && checkpoint)recordFailure(checkpoint);
+   throw error;
   }finally{armed=undefined;}
  }
  return {
@@ -181,7 +191,7 @@ function cancellationJourney(page:Page, manager:Locator, port:BillingCancellatio
    await mutate('withdraw',scheduled);
    check();
   },
-  async forward(route:Route){
+  async forward(route:Route,report:(code:string)=>void){
    check();
    const req=route.request(),intent=armed;
    if(!intent || intent.request || req.url()!==intent.url || req.method()!=='POST' || req.redirectedFrom() ||
@@ -194,12 +204,19 @@ function cancellationJourney(page:Page, manager:Locator, port:BillingCancellatio
    need(req.postData()===(intent.kind==='schedule'?'{"mode":"PERIOD_END"}':'{}'));
    usedKeys.add(key!);
    const current=()=>{check();need(armed===intent && intent.request===req);};
+   const withdrawCheckpoint=(stage:'OWNER'|'FORWARD')=>{
+    if(intent.kind==='withdraw')report('BROWSER_CANCELLATION_WITHDRAW_'+stage);
+   };
+   withdrawCheckpoint('OWNER');
    if(checkOwner)await checkOwner();
    current();need(await port.beforeCancellation(intent.kind,key!)===true);
    current();
+   withdrawCheckpoint('FORWARD');
    if(authorizeResponse)await authorizeResponse(req);
+   withdrawCheckpoint('OWNER');
    if(checkOwner)await checkOwner();
    current();
+   withdrawCheckpoint('FORWARD');
    intent.forwarded=true;
    await route.continue();check();
   }
@@ -463,7 +480,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
        if(challenge&&challengeDispatched&&code==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM')origin=target.origin;
       });return;
      }
-     if(cancellation && !['GET','OPTIONS'].includes(method)){await cancellation.forward(route);return;}
+     if(cancellation && !['GET','OPTIONS'].includes(method)){await cancellation.forward(route,code=>{routeCheckpoint=code;});return;}
     }
     const observingSession=exactInitialCheckout && !attemptId && method==='POST' && subscriptionId && operationId &&
      url===base+'/'+subscriptionId+'/operations/'+operationId+'/confirmation-session';
@@ -809,7 +826,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort,limits:Billing
   need(!failure&&createPosts===1&&confirmPosts===(retryPort?2:1)&&selectPosts===1&&challengePosts===1&&verifyPosts===1);
   if(cancellationPort){
    cancellation=cancellationJourney(page,manager,cancellationPort,binding,authority,(customer as Record<string,string>).id!,
-    subscriptionId,operationId,limits,check,redirects?.authorize,pinnedCancellation?checkManager:undefined);
+    subscriptionId,operationId,limits,check,recordFailure,redirects?.authorize,pinnedCancellation?checkManager:undefined);
    await cancellation.run();
    await billingBounded(limits,()=>Promise.all(pending));check();
   }

@@ -111,7 +111,7 @@ function sameChain(a:FrameSnapshot|undefined,b:FrameSnapshot|undefined){
 export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
  requireValue(approvedIssuerOrigin===undefined||isApprovedIssuerOrigin(approvedIssuerOrigin));
  let retrieve:Request|undefined,authenticate:Request|undefined,admittedAuthenticate:Request|undefined;
- let completed=false,finalRead=false,boundSource:string|undefined;
+ let completed=false,finalRead=false,initialIssuerDispatched=false,boundSource:string|undefined;
  let issuer:Frame|undefined,issuerRequest:Request|undefined,submission:Request|undefined,binding:ReturnType<typeof issuerBinding>|undefined;
  let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:Promise<void>}|undefined;
  const issuerReady=Promise.withResolvers<void>(),issuerDispatched=Promise.withResolvers<void>(),navigation=new WeakMap<Frame,number>();
@@ -227,6 +227,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    report('BROWSER_CHALLENGE_ROUTE_FORWARD');
    billingCheck(limits);
    if(request===authenticate)admittedAuthenticate=request;
+   if(request===issuerRequest)initialIssuerDispatched=true;
    await route.continue();
   };
   if(api){
@@ -263,9 +264,12 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     requireValue(!completed);completed=true;
    }
   }else{
-   report('BROWSER_CHALLENGE_ISSUER_REQUEST');
-   requireValue(navigation && method==='POST' && request.resourceType()==='document' &&
-    headers['content-type']?.split(';')[0]==='application/x-www-form-urlencoded');
+   const stage=initialIssuerDispatched?'LATER':'INITIAL';
+   report('BROWSER_CHALLENGE_ISSUER_'+stage+'_NAVIGATION');requireValue(navigation);
+   report('BROWSER_CHALLENGE_ISSUER_'+stage+'_METHOD');requireValue(method==='POST');
+   report('BROWSER_CHALLENGE_ISSUER_'+stage+'_RESOURCE');requireValue(request.resourceType()==='document');
+   report('BROWSER_CHALLENGE_ISSUER_'+stage+'_MEDIA');
+   requireValue(headers['content-type']?.split(';')[0]==='application/x-www-form-urlencoded');
    if(!issuerRequest){
     report(frameCode);
     requireValue(initialIssuerDocument(target));
