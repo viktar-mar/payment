@@ -59,6 +59,48 @@ async function publishConflictCode(response,limits){
   return text===exact?v.code.toUpperCase():null;
  },1000).catch(()=>null);
 }
+
+function matchesPortalPolicy(value,siteId,expected) {
+ return value?.site_id===siteId&&value.version===expected.version&&value.enabled===expected.enabled
+  &&value.grace_days===expected.grace_days&&value.allow_immediate_cancellation===expected.allow_immediate_cancellation
+  &&value.portal_enabled===expected.portal_enabled&&value.defer_upgrades===expected.defer_upgrades
+  &&Array.isArray(value.portal_return_urls)&&value.portal_return_urls.length===expected.portal_return_urls.length
+  &&expected.portal_return_urls.every((url,index)=>value.portal_return_urls[index]===url);
+}
+
+/** Describe a Portal policy change for acknowledged fixture resources. The caller owns transport and dispatch. */
+export function buildBillingPortalPolicyRequest(configuration,receipts) {
+ const c=validateBillingAcceptanceOptions(configuration);
+ need(c?.selectedCase==='initial_success');
+ const {account,site,product,price,policy}=receipts??{};
+ const backend='http://127.0.0.1:'+c.ports.backend,demo='http://127.0.0.1:'+c.ports.demo;
+ const siteKey='s5a-'+c.runId.replaceAll('-','');
+ need(billingUuid(account?.id)&&account.provider==='STRIPE'&&account.mode==='SANDBOX'&&account.status==='ACTIVE'
+  &&account.external_account_id===c.approvedBinding.externalAccountId);
+ need(billingUuid(site?.id)&&site.key===siteKey&&site.status==='ACTIVE'&&site.payment_account_id===account.id
+  &&Array.isArray(site.allowed_origins)&&site.allowed_origins.length===1&&site.allowed_origins[0]===demo
+  &&Array.isArray(site.authentication_modes)&&site.authentication_modes.length===1&&site.authentication_modes[0]==='EMAIL_OTP');
+ need(billingUuid(product?.id)&&product.site_id===site.id&&product.status==='ACTIVE');
+ need(billingUuid(price?.id)&&price.site_id===site.id&&price.product_id===product.id&&price.type==='SUBSCRIPTION'
+  &&price.status==='PUBLISHED'&&price.version===1&&price.amount_minor===2000&&price.currency==='EUR'
+  &&price.billing_interval==='MONTH'&&price.trial_days===0&&price.tax_mode==='INCLUSIVE'
+  &&typeof price.provider_price_id==='string'&&/^price_[A-Za-z0-9]+$/.test(price.provider_price_id));
+ const defaults={version:0,enabled:false,grace_days:3,allow_immediate_cancellation:false,portal_enabled:false,defer_upgrades:false,portal_return_urls:[]};
+ const siteId=site.id;
+ need(matchesPortalPolicy(policy,siteId,defaults));
+ const returnUrl=new URL('/',demo);
+ // The manager's canonical address includes the empty second product slot.
+ returnUrl.search=new URLSearchParams({api_base_url:backend,site_key:siteKey,subscription_product_1_id:product.id,
+  subscription_price_1_id:price.id,locale:'en',subscription_product_2_id:''}).toString();
+ const portalReturnUrl=returnUrl.href;
+ const body=Object.freeze({...defaults,enabled:true,grace_days:0,portal_enabled:true,portal_return_urls:Object.freeze([portalReturnUrl])});
+ return Object.freeze({method:'POST',url:backend+'/api/v1/admin/sites/'+siteId+'/subscription-policy',body,
+  validateResponse(value){
+   need(matchesPortalPolicy(value,siteId,{...body,version:1}));
+   return Object.freeze({portalReturnUrl,portalPolicyVersion:1});
+  }});
+}
+
 /** Fresh recurring fixture only. Cookies and callback secrets never enter its append-only public ledger. */
 export async function createBillingFixture(options,dependencies={}) {
  need(billingFailedRenewalExcluded(options?.configuration?.env??{}));
