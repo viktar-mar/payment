@@ -32,6 +32,7 @@ const demo='http://127.0.0.1:48000';
 // Use the same Stripe.js load option as the other isolated payment checks.
 const stripeScript='https://js.stripe.com/endive/stripe.js?advancedFraudSignals=false';
 const stripeSetupDependency=/^https:\/\/js\.stripe\.com\/v3\/fingerprinted\/js\/(?:elements-easel-frame|trusted-types-checker)-[a-f0-9]{32}\.js$/;
+const elementReadyBudget=30_000;
 const usedIntents=new Set<string>();
 const secretPattern=/^(seti_[A-Za-z0-9]{1,250})_secret_[A-Za-z0-9_]+$/;
 const documentBody=`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Save test card</title>
@@ -150,6 +151,14 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
     void open.then(ctx=>{if(limits.signal.aborted)return close(ctx);},()=>{}).catch(()=>{});
     context=await billingBounded(limits,()=>open!);
     const page=await billingBounded(limits,()=>context!.newPage());
+    const presentationSessions=new WeakSet<Request>();
+    let observedSession:'NONE'|'REQUESTED'|'RESPONDED'='NONE';
+    page.on('response',response=>{
+      const request=response.request();
+      if(presentationSessions.has(request) && response.url()===request.url() &&
+        response.status()>=200 && response.status()<300 && !response.fromServiceWorker())
+        observedSession='RESPONDED';
+    });
     context.on('page',other=>{if(other!==page)stop('BROWSER_GUARD_POPUP');});
     page.on('close',()=>{if(!completed)stop('BROWSER_INVALIDATED');});
     page.on('download',()=>stop('BROWSER_INVALIDATED'));
@@ -216,6 +225,7 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         need(providerNetworkOrigin(target) && ['GET','POST','OPTIONS'].includes(method));
         const script=providerOrigin(target) && (target.hostname==='js.stripe.com'||target.hostname.endsWith('.js.stripe.com'));
         const api=target.hostname==='api.stripe.com';
+        const elementsSession=api && target.pathname==='/v1/elements/sessions';
         const support=target.hostname==='r.stripe.com'||target.hostname==='merchant-ui-api.stripe.com';
         const preflight=method==='OPTIONS',childNavigation=script && method==='GET' && navigation;
         const confirming=raw===confirmUrl,setupRead=target.origin+target.pathname===intentUrl;
@@ -254,7 +264,7 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
             if(!active)readAuthority=capture(before.target);
           }
         }else{
-          need(api && target.pathname==='/v1/elements/sessions' && (intended==='GET'||!exchange.dispatched));
+          need(elementsSession && (intended==='GET'||!exchange.dispatched));
           if(!active && !preflight){
             const rawForm=method==='POST' && /^application\/x-www-form-urlencoded/i.test(headers['content-type']??'')?request.postData():null;
             const fields=rawForm && rawForm.length<=32768?new URLSearchParams(rawForm):target.searchParams;
@@ -274,6 +284,10 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         const current=stripeFrames(page,request,childNavigation,allowMain(),demo);
         need(current && current.target===before.target && current.frames.size===before.frames.size &&
           [...before.frames].every(([frame,location])=>current.frames.get(frame)===location));
+        if(elementsSession && !preflight){
+          presentationSessions.add(request);
+          if(observedSession==='NONE')observedSession='REQUESTED';
+        }
         routeCheckpoint='BROWSER_PROVIDER_FALLBACK';
         if(confirming && !preflight)await route.continue();
         else await route.fallback();
@@ -330,10 +344,19 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
     },{publishableKey:granted.publishableKey,clientSecret:granted.clientSecret,setupIntentId:granted.setupIntentId,
       expires:limits.deadline,documentUrl:url}));
     checkpoint='BROWSER_SETUP_ELEMENT_READY';
-    await billingBounded(limits,()=>page.waitForFunction(()=>{
-      const state=document.querySelector<HTMLButtonElement>('#confirm-setup')?.dataset.elementState;
-      return state==='READY' || state==='FAILED';
-    },undefined,{timeout:timeout()}));
+    try{
+      await billingBounded(limits,()=>page.waitForFunction(()=>{
+        const state=document.querySelector<HTMLButtonElement>('#confirm-setup')?.dataset.elementState;
+        return state==='READY' || state==='FAILED';
+      },undefined,{timeout:Math.min(timeout(),elementReadyBudget)}),elementReadyBudget);
+    }catch(error){
+      checkpoint={
+        NONE:'BROWSER_SETUP_ELEMENT_SESSION_NOT_SENT',
+        REQUESTED:'BROWSER_SETUP_ELEMENT_SESSION_NO_SUCCESS',
+        RESPONDED:'BROWSER_SETUP_ELEMENT_NO_READY_EVENT',
+      }[observedSession];
+      throw error;
+    }
     checkpoint='BROWSER_SETUP_ELEMENT_LOAD_ERROR';
     need(await billingBounded(limits,()=>page.evaluate(()=>
       document.querySelector<HTMLButtonElement>('#confirm-setup')?.dataset.elementState==='READY')));

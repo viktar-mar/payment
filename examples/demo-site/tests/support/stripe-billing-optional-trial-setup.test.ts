@@ -92,10 +92,11 @@ for(const fault of ['other request','other intent','other secret','live','requir
 }
 
 // Runs the real routing and page callbacks against VM DOM and CDP values only.
-function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'trusted types asset'|'easel query'|'easel delayed'|'other main asset'|'delayed element ready'|'element load error'|'missing card number'){
+function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'trusted types asset'|'easel query'|'easel delayed'|'other main asset'|'delayed element ready'|'element load error'|'missing card number'|'element no session'|'element no response'|'element no ready event'){
   const picked={...permit,setupIntentId:'seti_'+mode.replaceAll(' ',''),
     clientSecret:'seti_'+mode.replaceAll(' ','')+'_secret_fixture'};
   const url='https://api.stripe.com/v1/setup_intents/'+picked.setupIntentId+'/confirm';
+  const sessionUrl='https://api.stripe.com/v1/elements/sessions';
   const easel='https://js.stripe.com/v3/fingerprinted/js/elements-easel-frame-'+'a'.repeat(32)+'.js';
   const extraScript=mode==='easel asset'||mode==='easel delayed'?easel:mode==='easel query'?easel+'?mode=synthetic':
     mode==='trusted types asset'?easel.replace('elements-easel-frame','trusted-types-checker'):
@@ -143,6 +144,11 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
           assert.equal(options.clientSecret,picked.clientSecret);
           return {create:()=>({on:(name:string,fn:(event?:unknown)=>void)=>paymentEvents.set(name,fn),
             mount:()=>{
+              if(mode==='element no response' || mode==='element no ready event'){
+                pendingPresentation=request(sessionUrl,'GET',stripe,false,'fetch');
+                return;
+              }
+              if(mode==='element no session')return;
               if(mode.startsWith('uncommitted child'))
                 pendingPresentation=request(frameOrigin+'/v3/controller-fixture.html','GET',uncommitted,true,'document');
               if(['approved helper','card reload during helper trust'].includes(mode))pendingPresentation=request(url.replace('/confirm','')+'?'+new URLSearchParams({
@@ -229,6 +235,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
     })}),
     waitForResponse:(predicate:(r:Response)=>boolean)=>{governingResponse=predicate;return found.promise;},
     waitForFunction:async(fn:Function)=>{
+      await pendingPresentation;
       for(let n=0;n<25 && !evaluate<boolean>(fn);n++)await new Promise(resolve=>setImmediate(resolve));
       assert.equal(evaluate<boolean>(fn),true);
     },
@@ -269,6 +276,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
     const respond=async()=>{
       if(frame===uncommitted)childLoads++;
       if(target===extraScript)extraLoads++;
+      if(target===sessionUrl&&mode==='element no response')return;
       const redirected=mode==='script redirect' && resource==='script';
       await devtools.get('Fetch.requestPaused')!({requestId:id,networkId:id,frameId,request:wire,responseStatusCode:redirected?302:200});
       if(redirected)return;
@@ -278,6 +286,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
           client_secret:picked.clientSecret,livemode:false,status:'succeeded'})),
       } as Response;
       result.resolve(accepted);
+      emit('response',accepted);
       if(method==='POST'){
         writes.push(target);
         if(governingResponse?.(accepted))found.resolve(accepted);
@@ -321,6 +330,17 @@ test('setup reports '+mode+' without forwarding a confirmation',async()=>{
     assert.equal(String(error),'Error: billing_BROWSER');
     return true;
   });
+  assert.deepEqual(f.writes,[]);
+});
+
+for(const [mode,code] of [
+  ['element no session','BROWSER_SETUP_ELEMENT_SESSION_NOT_SENT'],
+  ['element no response','BROWSER_SETUP_ELEMENT_SESSION_NO_SUCCESS'],
+  ['element no ready event','BROWSER_SETUP_ELEMENT_NO_READY_EVENT'],
+] as const)
+test('setup diagnoses '+mode+' before any confirmation',async()=>{
+  const f=checkout(mode);
+  await assert.rejects(f.run(),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')===code && browserCleanupConfirmed(error));
   assert.deepEqual(f.writes,[]);
 });
 
