@@ -865,8 +865,8 @@ async function failedRenewalProfile(t, acceptanceCase) {
   return {f,cli,source,destination};
 }
 
-test('optional trial authenticates the copied Sandbox profile and offers only the owned listener',async t=>{
- const {f,source,destination}=await failedRenewalProfile(t);
+async function optionalTrialProfile(t,expiry=new Date(Date.now()+600000).toISOString()){
+ const paths=await failedRenewalProfile(t),{f,source}=paths;
  const old=f.options.configuration.env.PAYMENT_STRIPE_BILLING_FAILED_RENEWAL_CLI_PROFILE_RUN_ID;
  f.options.configuration.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL:'true',
   PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL_CLI_PROFILE_RUN_ID:old,PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL_SUBNET:'10.94.40.0/28'};
@@ -874,12 +874,23 @@ test('optional trial authenticates the copied Sandbox profile and offers only th
  delete f.options.configuration.frozenTime;
  const spawn=f.dependencies.spawn;
  f.dependencies.spawn=(...args)=>{const child=spawn(...args);queueMicrotask(()=>child.stderr.write(READY));return child;};
+ const credentials=JSON.stringify({fixture:'inert credential',oauth_uat_expires_at:expiry});
+ await writeFile(source+'/credentials.json',credentials,{mode:0o600});
  const {createOwnedBillingOptionalTrialCliAdapter}=await import('./stripe-sandbox-cli.mjs');
  f.adapter=await createOwnedBillingOptionalTrialCliAdapter(f.options,f.dependencies);
- assert.deepEqual(Object.keys(f.adapter).sort(),['assertBillingListener','startListener','stopListener','validateBinding']);
+ return {...paths,credentials};
+}
+
+test('optional trial reads a fresh profile before writes, then authenticates its copy',async t=>{
+ const {f,source,destination,credentials}=await optionalTrialProfile(t);
+ assert.deepEqual(Object.keys(f.adapter).sort(),['assertBillingListener','checkSavedProfile','startListener','stopListener','validateBinding']);
+ assert.equal(await f.adapter.checkSavedProfile(f.limits),'READY');
+ assert.equal(await readFile(destination+'/config.toml','utf8'),'');
+ assert.deepEqual(await readdir(destination),['config.toml']);
+ assert.equal(f.calls.length,0);
  await f.adapter.validateBinding(f.limits);
  assert.equal(await readFile(destination+'/config.toml','utf8'),profileConfig);
- assert.equal(await readFile(destination+'/credentials.json','utf8'),profileCredentials);
+ assert.equal(await readFile(destination+'/credentials.json','utf8'),credentials);
  assert.equal(await readFile(source+'/config.toml','utf8'),profileConfig);
  assert.deepEqual((await readdir(destination)).sort(),['config.toml','credentials.json']);
  assert.equal(await f.adapter.startListener(f.limits),true);
@@ -887,6 +898,61 @@ test('optional trial authenticates the copied Sandbox profile and offers only th
  await stop(f);
  assert.ok(f.calls.every(call=>!call.args.includes('post')
   &&!call.args.some(arg=>arg.startsWith('/v1/')&&!['/v1/account','/v1/balance'].includes(arg))));
+});
+
+test('optional trial reports expired OAuth without invoking Stripe or writing a profile copy',async t=>{
+ const {f,source,destination,credentials}=await optionalTrialProfile(t,new Date(Date.now()-600000).toISOString());
+ assert.equal(await f.adapter.checkSavedProfile(f.limits),'EXPIRED');
+ await rejects(f.adapter.validateBinding(f.limits),'BINDING');
+ assert.equal(await readFile(source+'/credentials.json','utf8'),credentials);
+ assert.deepEqual(await readdir(destination),['config.toml']);
+ assert.equal(f.calls.length,0);
+ assert.equal(await stop(f),true);
+});
+
+test('optional trial rechecks expiration of the profile snapshot it will copy',async t=>{
+ const {f,source,destination}=await optionalTrialProfile(t);
+ assert.equal(await f.adapter.checkSavedProfile(f.limits),'READY');
+ await writeFile(source+'/credentials.json',JSON.stringify({oauth_uat_expires_at:'2000-01-01T00:00:00Z'}));
+ await rejects(f.adapter.validateBinding(f.limits),'BINDING');
+ assert.deepEqual(await readdir(destination),['config.toml']);
+ assert.equal(f.calls.length,0);
+ assert.equal(await stop(f),true);
+});
+
+test('optional trial rejects malformed expiration without returning profile data',async t=>{
+ const {f,destination}=await optionalTrialProfile(t,'synthetic private detail');
+ await rejects(f.adapter.checkSavedProfile(f.limits),'CLI_PROFILE');
+ assert.deepEqual(await readdir(destination),['config.toml']);
+ assert.equal(f.calls.length,0);
+ assert.equal(await stop(f),true);
+});
+
+test('aborted optional-trial profile inspection never opens credentials after a delayed stat',async t=>{
+  const {f,source}=await optionalTrialProfile(t);
+  const target=source+'/credentials.json', abort=new AbortController();
+  let statStarted, releaseStat, opened=0;
+  const entered=new Promise(resolve=>{statStarted=resolve;});
+  const blocked=new Promise(resolve=>{releaseStat=resolve;});
+  const stat=f.dependencies.lstat, fileOpen=f.dependencies.open;
+  f.dependencies.lstat=async name=>{
+    if(name===target){statStarted();await blocked;}
+    return stat(name);
+  };
+  f.dependencies.open=(name,...args)=>{
+    if(name===target)opened++;
+    return fileOpen(name,...args);
+  };
+  const {createOwnedBillingOptionalTrialCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createOwnedBillingOptionalTrialCliAdapter(f.options,f.dependencies);
+  const refused=rejects(f.adapter.checkSavedProfile({...f.limits,signal:abort.signal}),'CLI_PROFILE');
+  await entered;
+  abort.abort();
+  releaseStat();
+  await refused;
+  assert.equal(opened,0);
+  assert.equal(f.calls.length,0);
+  assert.equal(await stop(f),true);
 });
 
 async function requiredTrialCli(t,{startListener=true,beforeRequest,identity=oauth,execFile,

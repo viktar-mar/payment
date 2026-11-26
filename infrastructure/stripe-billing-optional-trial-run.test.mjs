@@ -67,7 +67,11 @@ function fixture(fault) {
         assert.equal(ownerSignal.aborted,false);
         return cb({endpoint:'http://127.0.0.1:18511',capability:(fault==='new-capability'&&calls.includes('open')?'x':'s').repeat(43)});
       }}),
-    createCli:()=>({validateBinding:async limits=>{
+    createCli:()=>({checkSavedProfile:async ()=>{
+      calls.push('profile');
+      if(fault==='profile-error')throw Error('synthetic credential data');
+      return fault==='profile-expired'?'EXPIRED':'READY';
+    },validateBinding:async limits=>{
       assert.equal(limits.signal,ownerSignal);
       assert.equal(limits.deadline,ownerDeadline);
       return cleanup('binding')();
@@ -90,11 +94,22 @@ test('runs only the original scope, with evidence before pay and cleanup before 
   const result=await run.run(f.browser,f.limits);
   assert.equal(result.optionalTrialAccepted,true);
   assert.equal(result.cleanupConfirmed,true);
-  assert.deepEqual(f.calls,['preflight','prepare','binding','listen','start','provision','open','advance','pause-proof',
+  assert.deepEqual(f.calls,['preflight','profile','prepare','binding','listen','start','provision','open','advance','pause-proof',
     'setup-permit','browser','setup-install','resume','open-proof','pay','paid-proof','abort','fixture-close','listener-stop','bootstrap-stop']);
   assert.doesNotMatch(JSON.stringify(result),/synthetic|secret_|Bearer/);
   await assert.rejects(run.run(f.browser,f.limits),/SINGLE_USE/);
 });
+
+for(const [fault,code] of [['profile-expired','CLI_PROFILE_EXPIRED'],['profile-error','CLI_PROFILE']]) {
+  test('refuses '+fault+' before preparing or stopping any Docker resources',async ()=>{
+    const f=fixture(fault),run=f.create();
+    await assert.rejects(run.run(f.browser,f.limits),{message:'billing_'+code});
+    assert.deepEqual(f.calls,['preflight','profile','listener-stop']);
+    assert.equal(run.resources().phase,'CLI_PROFILE');
+    assert.equal(run.resources().code,code);
+    assert.equal(run.resources().cleanupConfirmed,true);
+  });
+}
 
 for (const [fault,stop] of [['foreign-scope','advance'],['new-capability','open'],['pause-proof','pause-proof'],['browser','browser'],
   ['setup-install','setup-install'],['open-proof','open-proof'],['pay','pay'],['paid-proof','paid-proof'],['abort','paid-proof']]) {

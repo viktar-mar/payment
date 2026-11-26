@@ -149,7 +149,7 @@ export function createOwnedBillingOptionalTrial(options, dependencies={}) {
   const fetcher = dependencies.fetch ?? globalThis.fetch;
   const lifetime = new AbortController();
   let phase='NEW', failure, accepted=false, claimed=false, closed=false, cleanupConfirmed=false;
-  let bootstrap, cli, fixture, runtime, browserCompletion, finished;
+  let bootstrap, prepareStarted=false, cli, fixture, runtime, browserCompletion, finished;
   const resources = () => Object.freeze({runId:configuration.runId,expectedSource:configuration.expectedSource,
     scope:'OPTIONAL_TRIAL_PAUSE_RESUME',status:closed?'CLOSED':claimed?'RUNNING':'NEW',phase,code:failure??null,
     optionalTrialAccepted:accepted,initialAccepted:false,full5bAccepted:false,cleanupConfirmed});
@@ -158,7 +158,7 @@ export function createOwnedBillingOptionalTrial(options, dependencies={}) {
     let ok = true;
     const limits = {deadline:Date.now()+120000};
     if (browserCompletion && !await billingBounded(limits,()=>browserCompletion,25000).catch(()=>false)) ok=false;
-    for (const [owner,method] of [[runtime,'abort'],[fixture,'close'],[cli,'stopListener'],[bootstrap,'stop']]) {
+    for (const [owner,method] of [[runtime,'abort'],[fixture,'close'],[cli,'stopListener'],[prepareStarted?bootstrap:null,'stop']]) {
       if (owner && await billingBounded(limits,l=>owner[method](l),30000).catch(()=>false)!==true) ok=false;
     }
     cleanupConfirmed = ok;
@@ -187,11 +187,20 @@ export function createOwnedBillingOptionalTrial(options, dependencies={}) {
           ?dependencies.preflight(configuration,l):preflightOwnedBillingOptionalTrial(configuration,{},l),120000);
         need(preflight===true || preflight?.status==='READY');
         bootstrap = await step('BOOTSTRAP',()=>(dependencies.createBootstrap??createOwnedBillingOptionalTrialBootstrap)(configuration));
-        await requireStep('PREPARE',()=>bootstrap.prepare(active),2700000);
         cli = await step('CLI',()=>(dependencies.createCli??createOwnedBillingOptionalTrialCliAdapter)({
           configuration,cliDirectory:bootstrap.resources().cliDirectory,
           verifyForwardTarget:bootstrap.verifyForwardTarget,persistWebhookSecret:bootstrap.persistWebhookSecret,
         }));
+        const profile = await step('CLI_PROFILE',()=>cli.checkSavedProfile(active),10000);
+        if(profile==='EXPIRED'){
+          failure='CLI_PROFILE_EXPIRED';
+          throw billingError(failure);
+        }
+        need(profile==='READY');
+        await requireStep('PREPARE',()=>{
+          prepareStarted=true;
+          return bootstrap.prepare(active);
+        },2700000);
         await requireStep('BINDING',()=>cli.validateBinding(active),120000);
         await requireStep('LISTENER',()=>cli.startListener(active),120000);
         await requireStep('START',()=>bootstrap.start(active),2700000);
@@ -225,7 +234,7 @@ export function createOwnedBillingOptionalTrial(options, dependencies={}) {
         await requireStep('PAID_PROOF',l=>evidence.paid(paid,l),120000);
         billingCheck(active);
       } catch(error) {
-        failure = phase==='BROWSER'?(browserDiagnostic(error,'ACCEPTANCE')??phase):phase==='NEW'?'LIMITS':phase;
+        failure ??= phase==='BROWSER'?(browserDiagnostic(error,'ACCEPTANCE')??phase):phase==='NEW'?'LIMITS':phase;
       } finally {
         clearTimeout(timer);
         limits?.signal?.removeEventListener('abort',abort);

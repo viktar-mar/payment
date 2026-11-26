@@ -188,7 +188,8 @@ async function createCliAdapter(options,dependencies,purpose) {
       if(remainderMode&&code!=='STOP'&&remainderSignals.size)external=AbortSignal.any([...remainderSignals]);
       onAbort=()=>controller.abort();external?.addEventListener('abort',onAbort,{once:true});
       if(external?.aborted)controller.abort();
-      const maximum=remainderMode&&['PRIOR_PARTIAL','REMAINDER'].includes(code)?45000:code==='BILLING_REQUIRED_TRIAL'?120000:null;
+      const maximum=code==='CLI_PROFILE'?10000:remainderMode&&['PRIOR_PARTIAL','REMAINDER'].includes(code)?45000:
+        code==='BILLING_REQUIRED_TRIAL'?120000:null;
       const proofDeadline=maximum===null?deadline:Math.min(deadline,Date.now()+maximum);
       timer=io.setTimeout(onAbort,Math.min(proofDeadline-Date.now(),2147483647));
       const context={deadline,signal:controller.signal,...(maximum!==null?{proofDeadline}:{}),...(code==='STOP'?{cleanup:true}:{})};check(context);
@@ -221,25 +222,51 @@ async function createCliAdapter(options,dependencies,purpose) {
   async function profileFileInfo(path,context) {
     check(context);
     const info=await io.lstat(path);
+    check(context);
     if(!validPrivateFile(info)||await io.realpath(path)!==path)fail();
+    check(context);
     return info;
   }
   async function readProfileFile(path,context) {
     const info=await profileFileInfo(path,context);
     if(info.size===0)fail();
+    check(context);
     const file=await io.open(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
     try {
+      check(context);
       if(!sameProfileFile(await file.stat(),info))fail();
       const buffer=Buffer.alloc(info.size+1);
+      check(context);
       const {bytesRead}=await file.read(buffer,0,buffer.length,0);
+      check(context);
       if(bytesRead!==info.size||!sameProfileFile(await file.stat(),info))fail();
       return {path,info,contents:buffer.subarray(0,bytesRead)};
     } finally {await file.close();}
   }
-  async function seedProfile(context) {
+  async function savedProfileDirectory(context) {
     const prior=RUNS+'/'+profileRunId,source=prior+'/cli/config/stripe';
+    for(const path of [RUNS,prior,prior+'/cli',prior+'/cli/config',source])await privateDirectory(path,context);
+    return source;
+  }
+  function savedProfileExpiration(credentials) {
+    const metadata=JSON.parse(credentials.contents.toString('utf8'));
+    const expires=object(metadata)&&metadata.oauth_uat_expires_at;
+    if(typeof expires!=='string'||!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(expires))fail();
+    const timestamp=Date.parse(expires);
+    if(!Number.isFinite(timestamp)||new Date(timestamp).toISOString().slice(0,19)!==expires.slice(0,19))fail();
+    return timestamp;
+  }
+  async function checkSavedProfile(context) {
+    const source=await savedProfileDirectory(context);
+    if(!(await profileFileInfo(source+'/config.toml',context)).size)fail();
+    const credentials=await readProfileFile(source+'/credentials.json',context);
+    try {return savedProfileExpiration(credentials)<=Date.now()?'EXPIRED':'READY';}
+    finally {credentials.contents.fill(0);}
+  }
+  async function seedProfile(context) {
+    const source=await savedProfileDirectory(context);
     const target=cliDirectory+'/config/stripe',targetConfig=target+'/config.toml';
-    for(const path of [RUNS,prior,prior+'/cli',prior+'/cli/config',source,RUNS+'/'+runId])await privateDirectory(path,context);
+    await privateDirectory(RUNS+'/'+runId,context);
     await privateTree(context,false);
     const configuration=await readProfileFile(source+'/config.toml',context);
     const credentials=await readProfileFile(source+'/credentials.json',context);
@@ -250,6 +277,7 @@ async function createCliAdapter(options,dependencies,purpose) {
     // The destination belongs to the fresh run and starts with a blank config.
     const targetInfo=await profileFileInfo(targetConfig,context);
     if(targetInfo.size!==0)fail();
+    if(optionalTrial&&savedProfileExpiration(credentials)<=Date.now())fail();
     const configFile=await io.open(targetConfig,constants.O_WRONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
     try {
       if(!sameProfileFile(await configFile.stat(),targetInfo))fail();
@@ -970,6 +998,7 @@ async function createCliAdapter(options,dependencies,purpose) {
     inspectRefund:(value,limits)=>refundOperation('REFUND',limits,context=>inspectRefund(value,context)),}),
   });
   return Object.freeze({
+    ...(optionalTrial?{checkSavedProfile:limits=>operation('CLI_PROFILE',limits,checkSavedProfile)}:{}),
     validateBinding:limits=>operation('BINDING',limits,async context=>{
       if(profileRunId&&!billingBound)await seedProfile(context);
       const result=await binding(context);if(billingMode)billingBound=true;return result;

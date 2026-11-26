@@ -34,4 +34,6 @@ test('terminal limits failure to allowlisted phase and error labels',()=>{
   const label='owned_optional_trial_pause_resume_terminal phase=SETUP_PERMIT code=';
   assert.equal(optionalTrialTerminalLine(label+'SETUP_PERMIT cleanup=CONFIRMED'),label+'SETUP_PERMIT cleanup=CONFIRMED');
   assert.equal(optionalTrialTerminalLine(label+'SECRET_VALUE cleanup=CONFIRMED'),null);
+  const expired='owned_optional_trial_pause_resume_terminal phase=CLI_PROFILE code=CLI_PROFILE_EXPIRED cleanup=CONFIRMED';
+  assert.equal(optionalTrialTerminalLine(expired),expired);
 });
