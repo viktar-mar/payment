@@ -16,8 +16,78 @@ import java.util.stream.IntStream;
 import javax.sql.DataSource;
 
 /** Verifies the production-shaped SELECT against real committed Cucumber receipts and isolated bad rows. */
-final class StripeBillingRequiredTrialSqlAssertions {
-    private StripeBillingRequiredTrialSqlAssertions() {}
+final class StripeBillingTrialSqlAssertions {
+    private StripeBillingTrialSqlAssertions() {}
+
+    static void verifyOptionalPause(DataSource source, List<Object> owned, UUID pauseEvent, long revision) throws Exception {
+        var sql=Files.readString(Path.of("../infrastructure/stripe-billing-optional-trial-pause-proof.sql"));
+        var placeholders=Pattern.compile("\\$[0-9]+");
+        assertThat(placeholders.matcher(sql).results().map(MatchResult::group).toList())
+            .containsExactlyElementsOf(IntStream.rangeClosed(1,14).mapToObj(position -> "$"+position).toList());
+        assertThat(owned).hasSize(14);
+        var query=placeholders.matcher(sql).replaceAll("?");
+        try (var connection=source.getConnection()) {
+            connection.setAutoCommit(false);
+            connection.setReadOnly(true);
+            try (var statement=select(connection,query,owned); var rows=statement.executeQuery()) {
+                assertThat(rows.next()).as("owned optional trial pause").isTrue();
+                assertThat(rows.getObject("subscription_id")).isEqualTo(owned.get(6));
+                assertThat(rows.getObject("billing_record_id")).isEqualTo(owned.get(8));
+                assertThat(rows.getObject("trial_started_event_id")).isEqualTo(owned.get(9));
+                assertThat(rows.getObject("paused_event_id")).isEqualTo(pauseEvent);
+                assertThat(rows.getLong("revision")).isEqualTo(revision);
+                assertThat(rows.getTimestamp("trial_end")).isEqualTo(owned.get(13));
+                assertThat(rows.next()).isFalse();
+            }
+            for (int i=0;i<owned.size();i++) {
+                var substituted=new ArrayList<>(owned);
+                var value=owned.get(i);
+                substituted.set(i,switch(value) {
+                    case UUID id -> UUID.randomUUID();
+                    case Timestamp time -> Timestamp.from(time.toInstant().plusSeconds(1));
+                    default -> value+"foreign";
+                });
+                refuses(connection,query,substituted,"substituted pause parameter "+(i+1));
+            }
+            connection.rollback();
+        }
+        refusesChangedReceipt(source,query,owned,"subscriptions",
+            "update pg_temp.subscriptions set billing_status='TRIALING' where id=?",owned.get(6));
+        refusesChangedReceipt(source,query,owned,"subscriptions",
+            "update pg_temp.subscriptions set debt_billing_record_id=id where id=?",owned.get(6));
+        refusesChangedReceipt(source,query,owned,"subscriptions",
+            "update pg_temp.subscriptions set paid_through=trial_end where id=?",owned.get(6));
+        refusesChangedReceipt(source,query,owned,"subscriptions",
+            "update pg_temp.subscriptions set billing_trial_policy='REQUIRED_BEFORE_TRIAL' where id=?",owned.get(6));
+        refusesChangedReceipt(source,query,owned,"subscription_billing_records",
+            "update pg_temp.subscription_billing_records set provider_invoice_reference='in_foreign' where id=?",owned.get(8));
+        refusesChangedReceipt(source,query,owned,"subscription_billing_records",
+            """
+            insert into pg_temp.subscription_billing_records (id,site_id,subscription_id,payment_account_id)
+            select gen_random_uuid(),site_id,subscription_id,payment_account_id
+            from public.subscription_billing_records where id=?
+            """,owned.get(8));
+        refusesChangedReceipt(source,query,owned,"subscription_events",
+            "update pg_temp.subscription_events set occurred_at=occurred_at-interval '1 second' where id=?",pauseEvent);
+        refusesChangedReceipt(source,query,owned,"subscription_provider_objects",
+            "update pg_temp.subscription_provider_objects set provider_reference='in_foreign' where billing_record_id=? and object_type='INVOICE'",owned.get(8));
+        refusesChangedReceipt(source,query,owned,"subscription_provider_objects",
+            """
+            insert into pg_temp.subscription_provider_objects
+                (id,site_id,subscription_id,payment_account_id,provider_type,object_type,provider_reference,billing_record_id)
+            select gen_random_uuid(),site_id,subscription_id,payment_account_id,'STRIPE','INVOICE','in_foreign',billing_record_id
+            from public.subscription_provider_objects where billing_record_id=? and object_type='INVOICE'
+            """,owned.get(8));
+        refusesChangedReceipt(source,query,owned,"provider_operations",
+            "update pg_temp.provider_operations set status='DISPATCHING' where resource_id=? and kind='SUBSCRIPTION_CREATE'",owned.get(7));
+        refusesChangedReceipt(source,query,owned,"stripe_subscription_setup_proofs",
+            """
+            insert into pg_temp.stripe_subscription_setup_proofs (site_id,subscription_id,payment_account_id)
+            select site_id,subscription_id,payment_account_id from stripe_subscription_trial_proofs where operation_id=?
+            """,owned.get(7));
+        refusesChangedReceipt(source,query,owned,"payments","insert into pg_temp.payments(site_id) values (?)",owned.getFirst());
+        refusesChangedReceipt(source,query,owned,"payment_events","insert into pg_temp.payment_events(site_id) values (?)",owned.getFirst());
+    }
 
     static void verify(DataSource source, List<Object> owned, UUID bill, UUID event, long revision, String providerPrice, String providerProduct) throws Exception {
         verifySeed(source,owned,providerPrice,providerProduct);

@@ -220,6 +220,8 @@ The missed-webhook regression recovered one EUR 20 payment by reconciliation bef
 
 An isolated seven-day optional trial now verifies the original zero invoice and records one trial start. Its 105 local checks covered the owned create, the default denial, a second subscription on the same test clock and publication without a cash payment. The later expiry and paid resumption still need separate evidence. [Trial publication test](../backend/src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/OwnedOptionalTrialPublicationIntegrationTest.java)
 
+The [read-only pause proof](../infrastructure/stripe-billing-optional-trial-pause-proof.sql) verifies the same subscription at the original trial deadline, before card setup. It requires the original €0 invoice, its exact Stripe mappings, the trial-start and pause events, and zero local debt and cash. The application-backed PostgreSQL scenario checks the proof and its refusal of substituted scope, extra invoices, uncertain creation and local payment records.
+
 The dedicated missed-notification case holds two original signed notifications, reconciles once, then releases paid before finalized. The PostgreSQL proof checks five stages, including the absence of cash before reconciliation and unchanged journal and delivery identities afterward. The local integration test and the fresh Sandbox run `57e25939` passed. [Missed and reordered invoice scenario](testing/billing-missed-reordered.md)
 
 The remaining native cases cover first-payment 3DS, optional trial, payment-method isolation and paused resumption, plan changes, and Portal navigation and return. The matrix below gives the implementation and evidence for each area.

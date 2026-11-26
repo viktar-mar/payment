@@ -688,7 +688,7 @@ public class StripeBillingSteps {
             UUID.class,site.value(),id);
         var event=jdbc.queryForObject("select id from subscription_events where site_id=? and subscription_id=? and event_type='TRIAL_STARTED'",
             UUID.class,site.value(),id);
-        StripeBillingRequiredTrialSqlAssertions.verify(bean(javax.sql.DataSource.class),List.of(
+        StripeBillingTrialSqlAssertions.verify(bean(javax.sql.DataSource.class),List.of(
             REQUIRED_TRIAL_PROOF_RUN,account.id().value(),site.value(),customer.id().value(),requiredTrialProduct.value(),requiredTrialPrice.value(),
             id,requiredTrial.operationId(),requiredTrialCreateDigest,"cus_billing","seti_required","pm_required",REQUIRED.subscription(),REQUIRED.item(),
             "in_requiredtrial",Timestamp.from(requiredTrialPeriod.start()),Timestamp.from(requiredTrialPeriod.end())),
@@ -771,7 +771,7 @@ public class StripeBillingSteps {
     }
 
     @Then("the same subscription is paused without debt or a new invoice or payment")
-    public void pausedTrial() {
+    public void pausedTrial() throws Exception {
         assertAccess(Subscription.Status.PAUSED,AccessDecision.Reason.PAUSED,null);
         var paused=subscription();
         assertThat(paused.providerReference()).isEqualTo("sub_billing");
@@ -794,6 +794,17 @@ public class StripeBillingSteps {
         assertThat(trialCreate.form().containsKey("default_payment_method")).isFalse();
         assertThat(calls.subList(calls.indexOf(trialCreate)+1,calls.size()))
             .allSatisfy(call -> assertThat(call.method()).isEqualTo("GET"));
+        var bill=json(originalTrial.invoice());
+        var pauseId=jdbc.queryForObject("""
+            select id from subscription_events where subscription_id=? and event_type='PAUSED'
+            """,UUID.class,created.subscriptionId());
+        StripeBillingTrialSqlAssertions.verifyOptionalPause(bean(javax.sql.DataSource.class),List.of(
+            site.value(),"customer-one",customer.id().value(),account.id().value(),product.value(),price.value(),
+            created.subscriptionId(),created.operationId(), UUID.fromString(bill.get("id").getAsString()),
+            UUID.fromString(json(originalTrial.started()).get("id").getAsString()),
+            json(originalTrial.proof()).get("subscription_reference").getAsString(),
+            bill.get("provider_invoice_reference").getAsString(), Timestamp.from(start),Timestamp.from(end)),
+            pauseId,paused.revision());
     }
 
     private JsonObject trialPaymentMethod() { return trialPaymentMethod("pm_trial"); }
