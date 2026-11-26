@@ -86,6 +86,28 @@ class OwnedBillingOptionalTrialRuntimeTest {
         assertThat(calls.get()).isEqualTo(2);
     }
 
+    @Test void resumeFailureResponseKeepsOnlyARecognizedCodeFromTheResumeRequest() throws Exception {
+        var known = "OPTIONAL_TRIAL_RESUME_STRIPE_PAYMENT_BEHAVIOR";
+        for (var phase : java.util.List.of("resume", "pay")) {
+            for (var failure : java.util.List.of(known, known + "_PRIVATE")) {
+                var bounded = handler(new OwnedBillingOptionalTrialRuntime.Operations() {
+                    public JsonObject dispatch(String selected, JsonObject body) {
+                        throw new IllegalStateException(failure, new IllegalArgumentException("PRIVATE_CAUSE"));
+                    }
+                    public void stop() {}
+                });
+                var terminal = exchange(phase,"{}",true);
+                bounded.handle(terminal);
+                assertThat(terminal.code).isEqualTo(400);
+                var result = JsonParser.parseString(terminal.output.toString()).getAsJsonObject();
+                assertThat(result.get("stage").getAsString()).isEqualTo("OPTIONAL_TRIAL_STOPPED");
+                assertThat(result.has("code")).isEqualTo(phase.equals("resume") && failure.equals(known));
+                if (result.has("code")) assertThat(result.get("code").getAsString()).isEqualTo(known);
+                assertThat(terminal.output.toString()).doesNotContain("PRIVATE");
+            }
+        }
+    }
+
     @Test void terminalProofWaitsForTrackedTransportAndDisablesFutureRequests() throws Exception {
         var gate = new OwnedBillingOptionalTrialRuntime.Gate();
         var entered = new CountDownLatch(1);

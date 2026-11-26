@@ -1,5 +1,6 @@
 package dev.genericpayments.platform.provider.adapter.out.stripe.billing;
 
+import com.stripe.exception.InvalidRequestException;
 import dev.genericpayments.platform.catalog.domain.TaxMode;
 import dev.genericpayments.platform.support.StripeBillingOwnedSubscriptionFixture;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind;
@@ -8,6 +9,7 @@ import java.time.ZoneOffset;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.OwnedOptionalTrialCreate.*;
@@ -26,6 +28,20 @@ class OwnedOptionalTrialResumeGraphTest {
     private final Created original = new Created("sub_owned", "si_owned", "in_trial", authority.frozen());
     private final OwnedOptionalTrialResumeGraph.Identity identity =
         new OwnedOptionalTrialResumeGraph.Identity("in_owned", "inpay_owned", "pi_owned");
+
+    @ParameterizedTest
+    @CsvSource({
+        "billing_cycle_anchor,STRIPE_BILLING_CYCLE_ANCHOR",
+        "billing_cycle_anchor[type],STRIPE_BILLING_CYCLE_ANCHOR",
+        "payment_behavior,STRIPE_PAYMENT_BEHAVIOR",
+        "proration_behavior,STRIPE_PRORATION_BEHAVIOR",
+        "private_parameter,STRIPE_INVALID_REQUEST",
+        ",STRIPE_INVALID_REQUEST"
+    })
+    void rejectedResumeParametersAreLimitedToKnownFieldNames(String parameter, OwnedOptionalTrialResume.Stage stage) {
+        var failure = new InvalidRequestException("PRIVATE_MESSAGE",parameter,"req_PRIVATE","PRIVATE_CODE",400,null);
+        assertThat(OwnedOptionalTrialResume.rejectedResumeParameter(failure)).isEqualTo(stage);
+    }
 
     @Test void paidEvidenceKeepsTheSameFrozenPeriodAndCaptureIdentity() throws Exception {
         queue(false, "");

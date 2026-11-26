@@ -94,9 +94,11 @@ class OwnedOptionalTrialAcceptanceTest {
         session.prepareSetup(setupContext, true);
         session.completeSetup();
         when(publication.startResume(account, scope, setupId, resumeCommand, resume)).thenReturn(
-            new SubscriptionOperationResult(resumeId, scope.subscription(), SubscriptionOperation.Status.UNKNOWN, null));
+            new OwnedOptionalTrialResume.Attempt(
+                new SubscriptionOperationResult(resumeId, scope.subscription(), SubscriptionOperation.Status.UNKNOWN, null),
+                OwnedOptionalTrialResume.Stage.STRIPE_PAYMENT_BEHAVIOR));
         assertThatThrownBy(() -> session.resume(resumeContext, true)).isInstanceOf(IllegalStateException.class)
-            .hasMessage("OPTIONAL_TRIAL_RESUME_OPEN");
+            .hasMessage("OPTIONAL_TRIAL_RESUME_STRIPE_PAYMENT_BEHAVIOR").hasNoCause();
         assertThat(session.snapshot()).isEqualTo(new OwnedOptionalTrialAcceptance.Snapshot(scope,
             OwnedOptionalTrialAcceptance.Status.STOPPED, setupId, resumeId));
         assertThatThrownBy(session::pay).isInstanceOf(IllegalStateException.class);
@@ -133,7 +135,8 @@ class OwnedOptionalTrialAcceptanceTest {
         when(prepared.operation()).thenReturn(setupId);
         when(setup.claimBrowserPermit(account, scope, setupContext, prepared)).thenReturn(permit);
         when(publication.startResume(account, scope, setupId, resumeCommand, resume)).thenReturn(
-            new SubscriptionOperationResult(resumeId, scope.subscription(), SubscriptionOperation.Status.PROCESSING, null));
+            new OwnedOptionalTrialResume.Attempt(
+                new SubscriptionOperationResult(resumeId, scope.subscription(), SubscriptionOperation.Status.PROCESSING, null), null));
         return acceptance.open(request);
     }
 }

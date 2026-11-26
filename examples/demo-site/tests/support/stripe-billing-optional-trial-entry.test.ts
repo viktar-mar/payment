@@ -37,3 +37,33 @@ test('terminal limits failure to allowlisted phase and error labels',()=>{
   const expired='owned_optional_trial_pause_resume_terminal phase=CLI_PROFILE code=CLI_PROFILE_EXPIRED cleanup=CONFIRMED';
   assert.equal(optionalTrialTerminalLine(expired),expired);
 });
+
+const resumeDiagnostic='OPTIONAL_TRIAL_RESUME_STRIPE_BILLING_CYCLE_ANCHOR';
+
+test('terminal publishes only approved optional trial resume diagnostics',async()=>{
+  const code=resumeDiagnostic;
+  const stopped={...complete,phase:'RESUME',code,optionalTrialAccepted:false};
+  const annotations:{type:string;description?:string}[]=[];
+  await assert.rejects(runOptionalTrialCase({
+    run:async()=>{throw Error('billing_'+code);},close:async()=>stopped,resources:()=>stopped,
+  },async()=>true,annotations),/billing_NOT_ACCEPTED/);
+  const prefix='owned_optional_trial_pause_resume_terminal phase=RESUME code=';
+  const line=prefix+code+' cleanup=CONFIRMED';
+  assert.deepEqual(annotations,[{type:'owned-optional-trial-terminal',description:line}]);
+  assert.equal(optionalTrialTerminalLine(line),line);
+  assert.equal(optionalTrialTerminalLine(prefix+'OPTIONAL_TRIAL_RESUME_PRIVATE_DETAIL cleanup=CONFIRMED'),null);
+});
+
+test('terminal parser rejects a resume code from a different phase',()=>{
+  const line='owned_optional_trial_pause_resume_terminal phase=OPEN_PROOF code='+resumeDiagnostic+' cleanup=CONFIRMED';
+  assert.equal(optionalTrialTerminalLine(line),null);
+});
+
+test('terminal formatter withholds a resume code from a different phase',async()=>{
+  const stopped={...complete,phase:'OPEN_PROOF',code:resumeDiagnostic,optionalTrialAccepted:false};
+  const annotations:{type:string;description?:string}[]=[];
+  await assert.rejects(runOptionalTrialCase({
+    run:async()=>{throw Error('billing_OPEN_PROOF');},close:async()=>stopped,resources:()=>stopped,
+  },async()=>true,annotations),/billing_NOT_ACCEPTED/);
+  assert.deepEqual(annotations,[]);
+});

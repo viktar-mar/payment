@@ -240,7 +240,8 @@ class OwnedOptionalTrialPublicationIntegrationTest extends OwnedOptionalTrialFix
         var command=new ResumeSubscriptionUseCase.Command(resumeContext,a.subscription(),true);
         var resumeFault=fault.startsWith("confirmation ")?"":fault;
         OwnedOptionalTrialResumeSdkReplies.dispatch(http,a,original,prepared.operation(),saved.reference(),saved.method(),resumeFault);
-        var reserved=publication.startResume(billing,a.scope(),prepared.operation(),command,resume);
+        var attempt=publication.startResume(billing,a.scope(),prepared.operation(),command,resume);
+        var reserved=attempt.result();
         assertThat(reserved.status().name()).isEqualTo(resumeFault.isEmpty()?"PROCESSING":"UNKNOWN");
         int callsBeforePrematurePay=http.calls.size();
         assertThatThrownBy(()->publication.startResume(billing,a.scope(),prepared.operation(),command,resume))

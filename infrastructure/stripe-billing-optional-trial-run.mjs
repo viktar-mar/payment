@@ -2,6 +2,7 @@ import {billingBounded, billingCheck, billingError} from './stripe-billing-limit
 import {browserCleanupConfirmed, browserDiagnostic} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 import {validateBillingOptionalTrialOptions} from './stripe-billing-optional-trial-options.mjs';
 import {billingUuid, createBillingOptionalTrialFixture} from './stripe-billing-provision.mjs';
+import {parseRefundRetainedJSON as parseJsonWithoutDuplicateKeys} from './stripe-manual-refund-retained.mjs';
 import {createOwnedBillingOptionalTrialBootstrap} from './stripe-sandbox-bootstrap.mjs';
 import {createOwnedBillingOptionalTrialCliAdapter} from './stripe-sandbox-cli.mjs';
 import {preflightOwnedBillingOptionalTrial} from './stripe-sandbox-owned.mjs';
@@ -20,22 +21,51 @@ const same = (reference, value) => Object.entries(reference).every(([key,expecte
 const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value,key));
 
-async function json(fetcher, url, body, headers, status, limits) {
+const resumeDiagnostics = new Set([
+  'OPTIONAL_TRIAL_RESUME_PRECHECK',
+  'OPTIONAL_TRIAL_RESUME_OBSERVE_CLOCK',
+  'OPTIONAL_TRIAL_RESUME_OBSERVE_SUBSCRIPTION',
+  'OPTIONAL_TRIAL_RESUME_OBSERVE_CASH',
+  'OPTIONAL_TRIAL_RESUME_CLAIM',
+  'OPTIONAL_TRIAL_RESUME_DISPATCH_CLOCK',
+  'OPTIONAL_TRIAL_RESUME_STRIPE_INVALID_REQUEST',
+  'OPTIONAL_TRIAL_RESUME_STRIPE_BILLING_CYCLE_ANCHOR',
+  'OPTIONAL_TRIAL_RESUME_STRIPE_PAYMENT_BEHAVIOR',
+  'OPTIONAL_TRIAL_RESUME_STRIPE_PRORATION_BEHAVIOR',
+  'OPTIONAL_TRIAL_RESUME_DISPATCH_RESPONSE',
+  'OPTIONAL_TRIAL_RESUME_READ_INVOICE',
+  'OPTIONAL_TRIAL_RESUME_FINISH',
+  'OPTIONAL_TRIAL_RESUME_RESULT',
+  'OPTIONAL_TRIAL_RESUME_PROJECT',
+  'OPTIONAL_TRIAL_RESUME_OPEN',
+]);
+export const isOptionalTrialResumeDiagnostic = code => resumeDiagnostics.has(code);
+
+async function json(fetcher, url, body, headers, status, limits, onResumeStopped) {
   billingCheck(limits);
   const response = await fetcher(url, {method:'POST',redirect:'error',signal:limits.signal,
     headers:{Accept:'application/json','Content-Type':'application/json',...headers},body:JSON.stringify(body)});
   try {
-    need(response.status === status);
+    const stopped = response.status === 400 && onResumeStopped !== undefined;
+    need(response.status === status || stopped);
+    const maxBytes = stopped ? 256 : 8192;
     let size = 0;
     const chunks = [];
     for await (const chunk of response.body ?? []) {
       billingCheck(limits);
       size += chunk.length;
-      need(size <= 8192);
+      need(size <= maxBytes);
       chunks.push(Buffer.from(chunk));
     }
     billingCheck(limits);
-    return JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(Buffer.concat(chunks)));
+    const text = new TextDecoder('utf8',{fatal:true}).decode(Buffer.concat(chunks));
+    if (!stopped) return JSON.parse(text);
+    let diagnostic;
+    try { diagnostic = parseJsonWithoutDuplicateKeys(text); }
+    catch { throw billingError('OPTIONAL_TRIAL'); }
+    if (exact(diagnostic,['stage','code']) && diagnostic.stage === 'OPTIONAL_TRIAL_STOPPED'
+      && isOptionalTrialResumeDiagnostic(diagnostic.code)) onResumeStopped(diagnostic.code);
+    throw billingError('OPTIONAL_TRIAL');
   } finally {
     await response.body?.cancel().catch(() => {});
   }
@@ -54,8 +84,9 @@ function setupPermit(response) {
 }
 
 function runtimeClient(configuration, bootstrap, fetcher) {
-  let next = 0, original, setupOperationId, resumeOperationId, controlKey, terminate, abort;
+  let next = 0, original, setupOperationId, resumeOperationId, resumeFailure, controlKey, terminate, abort;
   return Object.freeze({
+    get resumeFailure() { return resumeFailure; },
     async step(route, body, limits) {
       const index = next;
       need(routes[index] === route);
@@ -69,7 +100,9 @@ function runtimeClient(configuration, bootstrap, fetcher) {
         need(controlKey === capability);
         const headers = {Authorization:'Bearer '+capability};
         terminate ??= limit => json(fetcher,endpoint+'/optional-trial/abort',{},headers,200,limit);
-        result = await json(fetcher,endpoint+'/optional-trial/'+route,body,headers,200,limits);
+        // Bootstrap wraps callback errors. Keep the vetted code within this client.
+        const onResumeStopped = route === 'resume' ? code => { resumeFailure = code; } : undefined;
+        result = await json(fetcher,endpoint+'/optional-trial/'+route,body,headers,200,limits,onResumeStopped);
         return true;
       },limits) === true && entered);
       billingCheck(limits);
@@ -234,7 +267,9 @@ export function createOwnedBillingOptionalTrial(options, dependencies={}) {
         await requireStep('PAID_PROOF',l=>evidence.paid(paid,l),120000);
         billingCheck(active);
       } catch(error) {
-        failure ??= phase==='BROWSER'?(browserDiagnostic(error,'ACCEPTANCE')??phase):phase==='NEW'?'LIMITS':phase;
+        if(phase==='BROWSER')failure ??= browserDiagnostic(error,'ACCEPTANCE');
+        if(phase==='RESUME')failure ??= runtime?.resumeFailure;
+        failure ??= phase==='NEW'?'LIMITS':phase;
       } finally {
         clearTimeout(timer);
         limits?.signal?.removeEventListener('abort',abort);

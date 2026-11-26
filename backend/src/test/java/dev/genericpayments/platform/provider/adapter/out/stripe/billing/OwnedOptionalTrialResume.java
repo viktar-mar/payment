@@ -1,6 +1,7 @@
 package dev.genericpayments.platform.provider.adapter.out.stripe.billing;
 
 import com.stripe.StripeClient;
+import com.stripe.exception.InvalidRequestException;
 import com.stripe.exception.StripeException;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.PaymentAccountVerificationPort;
 import dev.genericpayments.platform.paymentaccounts.domain.*;
@@ -34,6 +35,20 @@ import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.O
 
 /** Explicit isolated RESUME. Dispatch and read authority are limited to the admitted original graph. */
 final class OwnedOptionalTrialResume {
+    enum Stage {
+        OBSERVE_CLOCK, OBSERVE_SUBSCRIPTION, OBSERVE_CASH, CLAIM, DISPATCH_CLOCK, DISPATCH_RESPONSE,
+        STRIPE_INVALID_REQUEST, STRIPE_BILLING_CYCLE_ANCHOR, STRIPE_PAYMENT_BEHAVIOR, STRIPE_PRORATION_BEHAVIOR,
+        READ_INVOICE, FINISH, RESULT;
+
+        String code() { return "OPTIONAL_TRIAL_RESUME_" + name(); }
+    }
+
+    record Attempt(SubscriptionOperationResult result, Stage failure) {}
+
+    static final class Failure extends IllegalStateException {
+        Failure(Stage stage) { super(stage.code()); }
+    }
+
     private final JdbcTemplate jdbc;
     private final StripeCredentialResolver credentials;
     private final StripeClientFactory clients;
@@ -71,7 +86,7 @@ final class OwnedOptionalTrialResume {
         }
     }
 
-    SubscriptionOperationResult resume(PaymentAccount account, Authority authority, Created original, long frozen,
+    Attempt resume(PaymentAccount account, Authority authority, Created original, long frozen,
             UUID setupOperation, ResumeSubscriptionUseCase.Command command, Runnable requireCurrent) {
         recovery.requireOutsideTransaction();
         requireAccount(account, authority);
@@ -91,24 +106,29 @@ final class OwnedOptionalTrialResume {
                    and not exists(select 1 from stripe_billing_owned_optional_trial_resumes where clock_intent=?)
                 """, Boolean.class, authority.subscription(), authority.clockIntent())));
             var graph = new OwnedOptionalTrialResumeGraph(client(account, current), authority, original, frozen, current);
+            Stage observation = Stage.OBSERVE_CLOCK;
             try {
                 graph.verifyReadyClock();
+                observation = Stage.OBSERVE_SUBSCRIPTION;
                 graph.verifySubscriptionAndSetup(setupOperation, setup.reference(), setup.method(), original.invoice(), false);
+                observation = Stage.OBSERVE_CASH;
                 graph.verifyNoPayment();
+                observation = Stage.OBSERVE_CLOCK;
                 graph.verifyReadyClock();
                 return new Snapshot(original.subscription(), Subscription.Status.PAUSED, authority.published().terms(),
                     trialPeriod(authority), trialPeriod(authority), null, List.of(), null, true, 0, utc.instant());
-            } catch (StripeException failure) {
-                throw unavailable();
+            } catch (StripeException | RuntimeException failure) {
+                throw new Failure(observation);
             }
         });
         var operation = reserved.operation();
-        if (!reserved.owner()) return recovery.readResult(operation.id());
+        if (!reserved.owner()) return new Attempt(recovery.readResult(operation.id()), null);
         require(account.equals(reserved.account()) && authority.subscription().equals(reserved.subscription().id()));
         var claim = UUID.randomUUID();
         var fingerprint = fingerprint(account, authority, original, operation, setup, OwnedOptionalTrialResumeGraph.resumedPeriod(frozen));
         Reply reply = new Reply(Outcome.UNKNOWN, null, null);
         UUID stepId = null;
+        Stage stage = Stage.CLAIM;
         try {
             current.run();
             stepId = jdbc.queryForObject("select claim_owned_optional_trial_resume(?,?,?,?,?,?,?,?,?)", UUID.class,
@@ -123,20 +143,44 @@ final class OwnedOptionalTrialResume {
                     new ProviderOperationGuard().requireDispatch(step, account, fingerprint, utc.instant());
                 };
                 var dispatch = new OwnedOptionalTrialResumeGraph(client(account, dispatchCurrent), authority, original, frozen, dispatchCurrent);
+                stage = Stage.DISPATCH_CLOCK;
                 dispatch.verifyReadyClock();
+                stage = Stage.DISPATCH_RESPONSE;
                 var invoice = dispatch.dispatch(setup.method(), step.operationKey());
+                stage = Stage.READ_INVOICE;
                 var open = dispatch.readInvoice(invoice, setup.method(), false, null);
+                stage = Stage.DISPATCH_CLOCK;
                 dispatch.verifyReadyClock();
                 var identity = open.identity();
+                stage = Stage.FINISH;
                 require(Boolean.TRUE.equals(jdbc.queryForObject("select finish_owned_optional_trial_resume(?,?,?,?,?)",
                     Boolean.class, claim, identity.invoice(), identity.allocation(), identity.intent(),
                     open.invoice().period().end().getEpochSecond())));
                 reply = new Reply(Outcome.ACCEPTED, original.subscription(), null);
+                stage = null;
             }
         } catch (StripeException | RuntimeException failure) {
             if (stepId != null) finishUnknown(claim);
+            if (stage == Stage.DISPATCH_RESPONSE && failure instanceof InvalidRequestException invalid) {
+                stage = rejectedResumeParameter(invalid);
+            }
         }
-        return recovery.recordReply(operation.id(), reply);
+        try {
+            return new Attempt(recovery.recordReply(operation.id(), reply), stage);
+        } catch (RuntimeException failure) {
+            throw new Failure(Stage.RESULT);
+        }
+    }
+
+    static Stage rejectedResumeParameter(InvalidRequestException failure) {
+        String parameter = failure.getParam();
+        if (parameter == null) return Stage.STRIPE_INVALID_REQUEST;
+        return switch (parameter) {
+            case "billing_cycle_anchor", "billing_cycle_anchor[type]" -> Stage.STRIPE_BILLING_CYCLE_ANCHOR;
+            case "payment_behavior" -> Stage.STRIPE_PAYMENT_BEHAVIOR;
+            case "proration_behavior" -> Stage.STRIPE_PRORATION_BEHAVIOR;
+            default -> Stage.STRIPE_INVALID_REQUEST;
+        };
     }
 
     Snapshot observe(PaymentAccount account, Authority authority, Created original, long frozen, UUID setupOperation,

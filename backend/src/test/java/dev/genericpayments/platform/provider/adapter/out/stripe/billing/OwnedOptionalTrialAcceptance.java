@@ -130,16 +130,21 @@ public final class OwnedOptionalTrialAcceptance {
             step(Status.SETUP_INSTALLED, Status.OPEN, "OPTIONAL_TRIAL_RESUME_OPEN", () -> {
                 if (!recurringConsent) throw new IllegalStateException();
                 var command = new ResumeSubscriptionUseCase.Command(context, scope.subscription(), recurringConsent);
-                var result = publication.startResume(account, scope, setupOperation, command, resume);
+                var attempt = checked("OPTIONAL_TRIAL_RESUME_PRECHECK", () ->
+                    publication.startResume(account, scope, setupOperation, command, resume));
+                var result = attempt.result();
                 if (!scope.subscription().equals(result.subscriptionId()) || result.operationId() == null) {
-                    throw new IllegalStateException();
+                    throw new PhaseFailure("OPTIONAL_TRIAL_RESUME_RESULT");
                 }
                 resumeOperation = result.operationId();
                 if (result.status() != SubscriptionOperation.Status.PROCESSING
-                        || result.nextAction() != null || result.browserConfirmAllowed()) {
-                    throw new IllegalStateException();
+                        || result.nextAction() != null || result.browserConfirmAllowed() || attempt.failure() != null) {
+                    throw new PhaseFailure(attempt.failure() == null ? "OPTIONAL_TRIAL_RESUME_RESULT" : attempt.failure().code());
                 }
-                publication.observeResume(account, scope, setupOperation, resumeOperation, resume, false);
+                checked("OPTIONAL_TRIAL_RESUME_PROJECT", () -> {
+                    publication.observeResume(account, scope, setupOperation, resumeOperation, resume, false);
+                    return null;
+                });
                 return null;
             });
         }
@@ -181,7 +186,7 @@ public final class OwnedOptionalTrialAcceptance {
     private static <T> T checked(String code, Supplier<T> action) {
         try {
             return action.get();
-        } catch (PhaseFailure failure) {
+        } catch (PhaseFailure | OwnedOptionalTrialResume.Failure failure) {
             throw failure;
         } catch (RuntimeException failure) {
             throw new PhaseFailure(code);

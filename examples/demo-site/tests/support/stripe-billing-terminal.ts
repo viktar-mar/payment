@@ -1,17 +1,17 @@
 import type {BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import {isAcceptanceBrowserDiagnostic} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 
-export function billingTerminal(scope:string,field:string,marker:string,annotation:string,casePhases:string[],orderCode:string,caseCode?:(code:string)=>boolean,initialAccepted=true){
+export function billingTerminal(scope:string,field:string,marker:string,annotation:string,casePhases:string[],orderCode:string,caseCode?:(code:string,phase:string)=>boolean,initialAccepted=true){
 const phases=new Set(['NEW','PREFLIGHT','BOOTSTRAP','PREPARE','CLI','LOGIN','BINDING','LISTENER','START','FIXTURE','PROVISION','BROWSER','COMPLETE',...casePhases]);
 const codes=new Set([...phases,'LIMITS',orderCode,'ABORTED','FAILED','CLEANUP']);
-const knownCode=(code:string)=>codes.has(code)||isAcceptanceBrowserDiagnostic(code)||caseCode?.(code)===true;
+const knownCode=(code:string,phase:string)=>codes.has(code)||isAcceptanceBrowserDiagnostic(code)||caseCode?.(code,phase)===true;
 const prefix=marker+'_terminal ';
 const closeFailed=prefix+'phase=CLOSE code=CLOSE cleanup=UNCONFIRMED';
 function parse(raw:unknown):string|null{
  if(typeof raw!=='string'||raw.length>140||!raw.startsWith(prefix))return null;
  if(raw===closeFailed)return raw;
  const fields=raw.slice(prefix.length),parts=/^phase=([A-Z_]+) code=([A-Z_]+) cleanup=(CONFIRMED|UNCONFIRMED)$/.exec(fields);
- if(!parts||parts[0]!==fields||!phases.has(parts[1]!)||!knownCode(parts[2]!))return null;
+ if(!parts||parts[0]!==fields||!phases.has(parts[1]!)||!knownCode(parts[2]!,parts[1]!))return null;
  return raw;
 }
 function formatTerminal(raw:unknown,failedClose:boolean):string|null{
@@ -20,7 +20,7 @@ function formatTerminal(raw:unknown,failedClose:boolean):string|null{
  if(value('scope')!==scope||value('full5bAccepted')!==false||value('initialAccepted')!==false||
     value(field)!==false||(!failedClose&&value('status')!=='CLOSED')||typeof value('cleanupConfirmed')!=='boolean')return null;
  const phase=value('phase'),code=value('code');
- if(typeof phase!=='string'||typeof code!=='string'||!phases.has(phase)||!knownCode(code))return null;
+ if(typeof phase!=='string'||typeof code!=='string'||!phases.has(phase)||!knownCode(code,phase))return null;
  return prefix+'phase='+phase+' code='+code+' cleanup='+(!failedClose&&value('cleanupConfirmed')?'CONFIRMED':'UNCONFIRMED');
 }
 function accepted(raw:unknown){

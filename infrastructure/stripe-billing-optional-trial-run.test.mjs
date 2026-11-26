@@ -13,7 +13,7 @@ const options = {
   approvedBinding: {externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},
 };
 
-function fixture(fault) {
+function fixture(fault, runtimeResponse) {
   const calls = [];
   let ownerSignal, ownerDeadline;
   const binding = {runId:options.runId, expectedSource:options.expectedSource, siteId:id(2), accountId:id(3),
@@ -53,6 +53,8 @@ function fixture(fault) {
     if(name==='open')assert.deepEqual(body,{accountId:binding.accountId,siteId:binding.siteId,priceId:binding.priceId,
       customerId:id(9),origin:binding.endpoints.demo,customerToken:'x'.repeat(43),recurringConsent:true});
     else assert.deepEqual(body,{});
+    const overridden = runtimeResponse?.(name);
+    if(overridden)return overridden;
     if(fault===name)return response({error:'privateStripeDetail'},400);
     return response({stage:stages[name],...identity,...(fault==='foreign-scope'&&name==='advance'?{subscriptionId:id(91)}:{}),
       ...(order.indexOf(name)>=2?{setupOperationId:id(11)}:{}),...(order.indexOf(name)>=4?{resumeOperationId:id(12)}:{}),
@@ -65,7 +67,11 @@ function fixture(fault) {
       resources:()=>({cliDirectory:'/tmp/synthetic'}),stop:cleanup('bootstrap-stop'),
       withOptionalTrialRuntime:async cb=>{
         assert.equal(ownerSignal.aborted,false);
-        return cb({endpoint:'http://127.0.0.1:18511',capability:(fault==='new-capability'&&calls.includes('open')?'x':'s').repeat(43)});
+        try {
+          return await cb({endpoint:'http://127.0.0.1:18511',capability:(fault==='new-capability'&&calls.includes('open')?'x':'s').repeat(43)});
+        } catch {
+          throw Error('billing_ADMIN_PENDING');
+        }
       }}),
     createCli:()=>({checkSavedProfile:async ()=>{
       calls.push('profile');
@@ -99,6 +105,35 @@ test('runs only the original scope, with evidence before pay and cleanup before 
   assert.doesNotMatch(JSON.stringify(result),/synthetic|secret_|Bearer/);
   await assert.rejects(run.run(f.browser,f.limits),/SINGLE_USE/);
 });
+
+const resumeStop = {
+  stage:'OPTIONAL_TRIAL_STOPPED',code:'OPTIONAL_TRIAL_RESUME_STRIPE_BILLING_CYCLE_ANCHOR',
+};
+for(const [name,route,status,body,code] of [
+  ['known resume label','resume',400,JSON.stringify(resumeStop),'OPTIONAL_TRIAL_RESUME_STRIPE_BILLING_CYCLE_ANCHOR'],
+  ['unrecognized resume label','resume',400,JSON.stringify({...resumeStop,code:'OPTIONAL_TRIAL_RESUME_PRIVATE_DETAIL'}),'RESUME'],
+  ['unexpected stage','resume',400,JSON.stringify({...resumeStop,stage:'WRONG_STAGE'}),'RESUME'],
+  ['extra field','resume',400,JSON.stringify({...resumeStop,error:'privateStripeDetail'}),'RESUME'],
+  ['duplicate code','resume',400,'{"code":"privateStripeDetail",'+JSON.stringify(resumeStop).slice(1),'RESUME'],
+  ['unstructured body','resume',400,'privateStripeDetail','RESUME'],
+  ['oversized body','resume',400,' '.repeat(8193)+JSON.stringify(resumeStop),'RESUME'],
+  ['success status','resume',200,JSON.stringify(resumeStop),'RESUME'],
+  ['other HTTP status','resume',500,JSON.stringify(resumeStop),'RESUME'],
+  ['other runtime command','setup-install',400,JSON.stringify(resumeStop),'SETUP_INSTALL'],
+]) {
+  test('reports the owned optional trial failure for '+name, async () => {
+    const f=fixture(undefined,command=>command===route
+      ? new Response(body,{status,headers:{'content-type':'application/json'}}):undefined);
+    const run=f.create();
+    await assert.rejects(run.run(f.browser,f.limits),{message:'billing_'+code});
+    assert.deepEqual(f.calls.slice(-5),[route,'abort','fixture-close','listener-stop','bootstrap-stop']);
+    assert.equal(f.calls.filter(call=>call===route).length,1);
+    assert.equal(run.resources().phase,route==='resume'?'RESUME':'SETUP_INSTALL');
+    assert.equal(run.resources().code,code);
+    assert.equal(run.resources().optionalTrialAccepted,false);
+    assert.equal(run.resources().cleanupConfirmed,true);
+  });
+}
 
 for(const [fault,code] of [['profile-expired','CLI_PROFILE_EXPIRED'],['profile-error','CLI_PROFILE']]) {
   test('refuses '+fault+' before preparing or stopping any Docker resources',async ()=>{

@@ -8,7 +8,6 @@ import dev.genericpayments.platform.provider.adapter.out.stripe.StripeClientFact
 import dev.genericpayments.platform.provider.adapter.out.stripe.StripeCredentialResolver;
 import dev.genericpayments.platform.provider.adapter.out.stripe.billing.OwnedOptionalTrialPaymentConfirmation.PaymentReceipt;
 import dev.genericpayments.platform.sites.domain.SiteId;
-import dev.genericpayments.platform.subscriptions.application.model.SubscriptionOperationResult;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
 import dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase;
 import dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Command;
@@ -150,7 +149,7 @@ public final class OwnedOptionalTrialPublication implements SubscriptionBillingT
             setup.id(),false,null));
     }
 
-    SubscriptionOperationResult startResume(PaymentAccount account, Scope scope, UUID setupId,
+    OwnedOptionalTrialResume.Attempt startResume(PaymentAccount account, Scope scope, UUID setupId,
                                             ResumeSubscriptionUseCase.Command command, OwnedOptionalTrialResume resumer) {
         require(!transactions.active());
         var lifecycle=lifecycle(scope);

@@ -46,8 +46,15 @@ public final class OwnedBillingOptionalTrialRuntime {
     private static final Set<String> PHASES = Set.of("open","advance","setup-permit","setup-install","resume","pay","abort");
     private static final Set<String> OPEN_FIELDS = Set.of("accountId","siteId","customerId","priceId","origin","customerToken","recurringConsent");
     private static final Set<String> FAILURE_STAGES = Set.of("OPTIONAL_TRIAL_ADMISSION","OPTIONAL_TRIAL_CREATE","OPTIONAL_TRIAL_TRIALING",
-        "OPTIONAL_TRIAL_ADVANCE_AND_PAUSE","OPTIONAL_TRIAL_SETUP_PERMIT","OPTIONAL_TRIAL_SETUP_INSTALL","OPTIONAL_TRIAL_RESUME_OPEN",
+        "OPTIONAL_TRIAL_ADVANCE_AND_PAUSE","OPTIONAL_TRIAL_SETUP_PERMIT","OPTIONAL_TRIAL_SETUP_INSTALL",
         "OPTIONAL_TRIAL_PAYMENT_CONFIRMATION","OPTIONAL_TRIAL_PAYMENT_OBSERVATION");
+    private static final Set<String> RESUME_FAILURE_STAGES = Set.of(
+        "OPTIONAL_TRIAL_RESUME_OPEN","OPTIONAL_TRIAL_RESUME_PRECHECK","OPTIONAL_TRIAL_RESUME_OBSERVE_CLOCK","OPTIONAL_TRIAL_RESUME_OBSERVE_SUBSCRIPTION",
+        "OPTIONAL_TRIAL_RESUME_OBSERVE_CASH","OPTIONAL_TRIAL_RESUME_CLAIM","OPTIONAL_TRIAL_RESUME_DISPATCH_CLOCK",
+        "OPTIONAL_TRIAL_RESUME_DISPATCH_RESPONSE","OPTIONAL_TRIAL_RESUME_STRIPE_INVALID_REQUEST",
+        "OPTIONAL_TRIAL_RESUME_STRIPE_BILLING_CYCLE_ANCHOR","OPTIONAL_TRIAL_RESUME_STRIPE_PAYMENT_BEHAVIOR",
+        "OPTIONAL_TRIAL_RESUME_STRIPE_PRORATION_BEHAVIOR","OPTIONAL_TRIAL_RESUME_READ_INVOICE","OPTIONAL_TRIAL_RESUME_FINISH",
+        "OPTIONAL_TRIAL_RESUME_RESULT","OPTIONAL_TRIAL_RESUME_PROJECT");
 
     private OwnedBillingOptionalTrialRuntime() {}
 
@@ -221,8 +228,9 @@ public final class OwnedBillingOptionalTrialRuntime {
                     gate.stop();
                     operations.stop();
                     var error = status("OPTIONAL_TRIAL_STOPPED");
-                    if (failure.getMessage() != null && FAILURE_STAGES.contains(failure.getMessage())) {
-                        error.addProperty("code",failure.getMessage());
+                    String code = failure.getMessage();
+                    if (code != null && (FAILURE_STAGES.contains(code) || phase.equals("resume") && RESUME_FAILURE_STAGES.contains(code))) {
+                        error.addProperty("code",code);
                     }
                     reply(exchange,400,error);
                 } catch (IOException lostReply) {
