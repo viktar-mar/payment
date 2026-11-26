@@ -88,6 +88,7 @@ public class StripeBillingSteps {
     private static final BillingRefs BILLING = new BillingRefs("sub_billing", "si_billing", "price_billing", "prod_billing");
     private static final BillingRefs REQUIRED = new BillingRefs("sub_required", "si_required", "price_required", "prod_required");
     private Subscription.Period resumedPeriod;
+    private UUID pausedTrialEvent, trialResumeBill;
     private int beforeDenied, beforeFake;
     private UUID fakeSubscription;
     private PriceId upgradePrice;
@@ -794,17 +795,30 @@ public class StripeBillingSteps {
         assertThat(trialCreate.form().containsKey("default_payment_method")).isFalse();
         assertThat(calls.subList(calls.indexOf(trialCreate)+1,calls.size()))
             .allSatisfy(call -> assertThat(call.method()).isEqualTo("GET"));
-        var bill=json(originalTrial.invoice());
-        var pauseId=jdbc.queryForObject("""
+        pausedTrialEvent=jdbc.queryForObject("""
             select id from subscription_events where subscription_id=? and event_type='PAUSED'
             """,UUID.class,created.subscriptionId());
-        StripeBillingTrialSqlAssertions.verifyOptionalPause(bean(javax.sql.DataSource.class),List.of(
+        StripeBillingTrialSqlAssertions.verifyOptionalPause(bean(javax.sql.DataSource.class),
+            optionalTrialProofParameters(),pausedTrialEvent,paused.revision());
+    }
+
+    private List<Object> optionalTrialProofParameters() {
+        var bill=json(originalTrial.invoice());
+        return List.of(
             site.value(),"customer-one",customer.id().value(),account.id().value(),product.value(),price.value(),
             created.subscriptionId(),created.operationId(), UUID.fromString(bill.get("id").getAsString()),
             UUID.fromString(json(originalTrial.started()).get("id").getAsString()),
             json(originalTrial.proof()).get("subscription_reference").getAsString(),
-            bill.get("provider_invoice_reference").getAsString(), Timestamp.from(start),Timestamp.from(end)),
-            pauseId,paused.revision());
+            bill.get("provider_invoice_reference").getAsString(), Timestamp.from(start),Timestamp.from(end));
+    }
+
+    private List<Object> trialResumeProofParameters(String phase, String paymentReference) {
+        var parameters=new ArrayList<>(optionalTrialProofParameters());
+        parameters.addAll(List.of(pausedTrialEvent,trialSetup.operationId(),trialResume.operationId(),"in_resume",
+            Timestamp.from(resumedPeriod.start()),Timestamp.from(resumedPeriod.end()),trialResumeBill));
+        parameters.add(paymentReference);
+        parameters.add(phase);
+        return parameters;
     }
 
     private JsonObject trialPaymentMethod() { return trialPaymentMethod("pm_trial"); }
@@ -920,7 +934,7 @@ public class StripeBillingSteps {
     }
 
     @Then("the resumption remains pending without paid access")
-    public void trialResumeStillPending() {
+    public void trialResumeStillPending() throws Exception {
         assertUnpaidTrialPause();
         assertThat(operation(trialResume.operationId()).status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
         var proof = bean(SubscriptionBillingProofStore.class).resume(account.id(), trialResume.operationId()).orElseThrow();
@@ -928,6 +942,12 @@ public class StripeBillingSteps {
         assertThat(proof.reference()).isEqualTo("sub_billing");
         assertThat(proof.invoice()).isEqualTo("in_resume");
         assertThat(proof.period()).isEqualTo(resumedPeriod);
+        trialResumeBill=jdbc.queryForObject("""
+            select id from subscription_billing_records
+            where subscription_id=? and provider_invoice_reference='in_resume' and settlement='OPEN'
+            """,UUID.class,created.subscriptionId());
+        StripeBillingTrialSqlAssertions.verifyOptionalResume(bean(javax.sql.DataSource.class),
+            trialResumeProofParameters("PENDING",null),null,null,null);
     }
 
     @When("the original resumption invoice has verified cash")
@@ -940,7 +960,7 @@ public class StripeBillingSteps {
     }
 
     @Then("that payment restores access once and preserves the original zero trial invoice")
-    public void trialResumed() {
+    public void trialResumed() throws Exception {
         assertAccess(Subscription.Status.ACTIVE, AccessDecision.Reason.PAID, now().plus(Duration.ofMinutes(5)));
         assertThat(subscription().currentPeriod()).isEqualTo(resumedPeriod);
         assertThat(subscription().paidThrough()).isEqualTo(resumedPeriod.end());
@@ -955,11 +975,14 @@ public class StripeBillingSteps {
         assertThat(count("outbox_events", "site_id=? and callback_type='payment.succeeded'", site.value())).isOne();
 
         var publication = publishedCash("in_resume", "pi_resume", BillingRecord.Kind.RENEWAL);
+        assertThat(publication.bill()).isEqualTo(trialResumeBill);
         var paid = financialEvidence();
         reconcile();
         assertThat(financialEvidence()).isEqualTo(paid);
         assertThat(publishedCash("in_resume", "pi_resume", BillingRecord.Kind.RENEWAL)).isEqualTo(publication);
         assertThat(trialPublication()).isEqualTo(originalTrial);
+        StripeBillingTrialSqlAssertions.verifyOptionalResume(bean(javax.sql.DataSource.class),
+            trialResumeProofParameters("PAID","pi_resume"),publication.payment(),publication.cashEvent(),publication.periodEvent());
     }
 
     @Then("the trial start, pause and paid resumption have exactly one signed callback each")

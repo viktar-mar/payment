@@ -222,6 +222,8 @@ An isolated seven-day optional trial now verifies the original zero invoice and 
 
 The [read-only pause proof](../infrastructure/stripe-billing-optional-trial-pause-proof.sql) verifies the same subscription at the original trial deadline, before card setup. It requires the original €0 invoice, its exact Stripe mappings, the trial-start and pause events, and zero local debt and cash. The application-backed PostgreSQL scenario checks the proof and its refusal of substituted scope, extra invoices, uncertain creation and local payment records.
 
+The [read-only resumption proof](../infrastructure/stripe-billing-optional-trial-resume-proof.sql) checks two checkpoints on the same subscription and resumption invoice. The open invoice keeps access paused with zero cash after the scoped card setup. The paid checkpoint requires the same bill, the verified €20 payment and matching journal and callback entries, while the original €0 trial invoice stays intact. Both checkpoints are exercised by the application-backed loopback scenario.
+
 The dedicated missed-notification case holds two original signed notifications, reconciles once, then releases paid before finalized. The PostgreSQL proof checks five stages, including the absence of cash before reconciliation and unchanged journal and delivery identities afterward. The local integration test and the fresh Sandbox run `57e25939` passed. [Missed and reordered invoice scenario](testing/billing-missed-reordered.md)
 
 The remaining native cases cover first-payment 3DS, optional trial, payment-method isolation and paused resumption, plan changes, and Portal navigation and return. The matrix below gives the implementation and evidence for each area.

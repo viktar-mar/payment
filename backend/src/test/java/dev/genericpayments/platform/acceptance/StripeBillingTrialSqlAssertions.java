@@ -19,6 +19,84 @@ import javax.sql.DataSource;
 final class StripeBillingTrialSqlAssertions {
     private StripeBillingTrialSqlAssertions() {}
 
+    static void verifyOptionalResume(DataSource source, List<Object> parameters, UUID payment, UUID cashEvent, UUID periodEvent)
+            throws Exception {
+        var sql=Files.readString(Path.of("../infrastructure/stripe-billing-optional-trial-resume-proof.sql"));
+        var placeholders=Pattern.compile("\\$[0-9]+");
+        assertThat(placeholders.matcher(sql).results().map(MatchResult::group).toList())
+            .containsExactlyElementsOf(IntStream.rangeClosed(1,23).mapToObj(position -> "$"+position).toList());
+        assertThat(parameters).hasSize(23);
+        var query=placeholders.matcher(sql).replaceAll("?");
+        try (var connection=source.getConnection()) {
+            connection.setAutoCommit(false);
+            connection.setReadOnly(true);
+            try (var statement=select(connection,query,parameters); var rows=statement.executeQuery()) {
+                assertThat(rows.next()).as("owned optional trial resumption").isTrue();
+                assertThat(rows.getObject("subscription_id")).isEqualTo(parameters.get(6));
+                assertThat(rows.getObject("trial_bill_id")).isEqualTo(parameters.get(8));
+                assertThat(rows.getObject("resume_bill_id")).isEqualTo(parameters.get(20));
+                assertThat(rows.getObject("payment_id")).isEqualTo(payment);
+                assertThat(rows.getObject("cash_event_id")).isEqualTo(cashEvent);
+                assertThat(rows.getObject("period_event_id")).isEqualTo(periodEvent);
+                assertThat(rows.next()).isFalse();
+            }
+            for (int i=0;i<parameters.size();i++) {
+                var substituted=new ArrayList<>(parameters);
+                var value=parameters.get(i);
+                substituted.set(i,switch(value) {
+                    case null -> "pi_foreign";
+                    case UUID id -> UUID.randomUUID();
+                    case Timestamp time -> Timestamp.from(time.toInstant().plusSeconds(1));
+                    default -> value+"foreign";
+                });
+                refuses(connection,query,substituted,"substituted resume parameter "+(i+1));
+            }
+            connection.rollback();
+        }
+        refusesChangedReceipt(source,query,parameters,"stripe_subscription_resume_proofs",
+            "update pg_temp.stripe_subscription_resume_proofs set invoice_reference='in_foreign' where operation_id=?",parameters.get(16));
+        refusesChangedReceipt(source,query,parameters,"stripe_subscription_setup_proofs",
+            "update pg_temp.stripe_subscription_setup_proofs set method_reference=null where operation_id=?",parameters.get(15));
+        refusesChangedReceipt(source,query,parameters,"subscription_operations",
+            "update pg_temp.subscription_operations set updated_at=updated_at+interval '1 day' where id=?",parameters.get(15));
+        refusesChangedReceipt(source,query,parameters,"provider_operations",
+            "update pg_temp.provider_operations set status='DISPATCHING' where resource_id=? and kind='SETUP_INTENT_CREATE'",parameters.get(15));
+        refusesChangedReceipt(source,query,parameters,"provider_operations",
+            "update pg_temp.provider_operations set status='DISPATCHING' where resource_id=? and kind='SUBSCRIPTION_UPDATE'",parameters.get(16));
+        refusesChangedReceipt(source,query,parameters,"subscription_billing_records",
+            "update pg_temp.subscription_billing_records set amount_due_minor=1 where id=?",parameters.get(8));
+        refusesChangedReceipt(source,query,parameters,"subscription_provider_objects",
+            "delete from pg_temp.subscription_provider_objects where billing_record_id=? and object_type='INVOICE'",parameters.get(8));
+        refusesChangedReceipt(source,query,parameters,"subscription_provider_objects",
+            """
+            insert into pg_temp.subscription_provider_objects
+                (id,site_id,subscription_id,payment_account_id,provider_type,object_type,provider_reference,billing_record_id)
+            select gen_random_uuid(),site_id,subscription_id,payment_account_id,'STRIPE','INVOICE','in_foreign',billing_record_id
+            from public.subscription_provider_objects where billing_record_id=? and object_type='INVOICE'
+            """,parameters.get(20));
+        if (payment==null) {
+            refusesChangedReceipt(source,query,parameters,"subscriptions",
+                "update pg_temp.subscriptions set paid_through=trial_end where id=?",parameters.get(6));
+            refusesChangedReceipt(source,query,parameters,"payments",
+                "insert into pg_temp.payments(site_id) values (?)",parameters.getFirst());
+        } else {
+            refusesChangedReceipt(source,query,parameters,"payments",
+                "update pg_temp.payments set subscription_invoice_reference='in_foreign' where id=?",payment);
+            refusesChangedReceipt(source,query,parameters,"payments",
+                "update pg_temp.payments set amount_minor=1900 where id=?",payment);
+            refusesChangedReceipt(source,query,parameters,"payments",
+                "update pg_temp.payments set refunded_amount_minor=100 where id=?",payment);
+            refusesChangedReceipt(source,query,parameters,"payment_events",
+                "update pg_temp.payment_events set amount_minor=1900 where id=?",cashEvent);
+            refusesChangedReceipt(source,query,parameters,"subscription_events",
+                "update pg_temp.subscription_events set billing_record_id=null where id=?",periodEvent);
+            refusesChangedReceipt(source,query,parameters,"subscription_provider_objects",
+                "update pg_temp.subscription_provider_objects set payment_id=null where payment_id=? and object_type='PAYMENT'",payment);
+            refusesChangedReceipt(source,query,parameters,"outbox_events",
+                "delete from pg_temp.outbox_events where id=?",cashEvent);
+        }
+    }
+
     static void verifyOptionalPause(DataSource source, List<Object> owned, UUID pauseEvent, long revision) throws Exception {
         var sql=Files.readString(Path.of("../infrastructure/stripe-billing-optional-trial-pause-proof.sql"));
         var placeholders=Pattern.compile("\\$[0-9]+");
