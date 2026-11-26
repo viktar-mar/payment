@@ -312,7 +312,8 @@ final class OwnedOptionalTrialResume {
             a.subscription().toString(), a.createOperation().toString(), a.fingerprint(), o.id().toString(), o.providerOperationKey(),
             o.fingerprint(), original.subscription(), original.item(), original.invoice(), a.clockReference(), a.customerReference(),
             a.priceReference(), a.productReference(), setup.operation().toString(), setup.step().toString(), setup.reference(), setup.method(),
-            period.start().toString(), period.end().toString(), "EUR:2000", "anchor:now", "payment:success", "proration:none", "consent:true");
+            period.start().toString(), period.end().toString(), "EUR:2000", "anchor:now",
+            "payment:" + OwnedOptionalTrialResumeGraph.PAYMENT_BEHAVIOR.getValue(), "proration:none", "consent:true");
     }
 
     private void finishUnknown(UUID claim) {

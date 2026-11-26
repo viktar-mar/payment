@@ -1,6 +1,7 @@
 package dev.genericpayments.platform.provider.adapter.out.stripe.billing;
 
 import com.stripe.exception.InvalidRequestException;
+import com.stripe.exception.StripeException;
 import dev.genericpayments.platform.catalog.domain.TaxMode;
 import dev.genericpayments.platform.support.StripeBillingOwnedSubscriptionFixture;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.SettlementKind;
@@ -41,6 +42,23 @@ class OwnedOptionalTrialResumeGraphTest {
     void rejectedResumeParametersAreLimitedToKnownFieldNames(String parameter, OwnedOptionalTrialResume.Stage stage) {
         var failure = new InvalidRequestException("PRIVATE_MESSAGE",parameter,"req_PRIVATE","PRIVATE_CODE",400,null);
         assertThat(OwnedOptionalTrialResume.rejectedResumeParameter(failure)).isEqualTo(stage);
+    }
+
+    @Test void resumeWireLeavesTheInvoiceForTheSeparatePaymentStep() {
+        f.f.http.disconnect();
+        var client = f.f.clients.create(f.f.credentials.resolve(f.f.account));
+        var graph = new OwnedOptionalTrialResumeGraph(client, authority, original, frozen, () -> {});
+        assertThatThrownBy(() -> graph.dispatch("pm_trial", "owned-resume-key")).isInstanceOf(StripeException.class);
+        assertThat(f.f.http.calls).singleElement().satisfies(call -> {
+            assertThat(call.method().name()).isEqualTo("POST");
+            assertThat(call.url().getPath()).isEqualTo("/v1/subscriptions/sub_owned/resume");
+            assertThat(call.params()).containsOnlyKeys("billing_cycle_anchor","payment_behavior","proration_behavior")
+                .containsEntry("payment_behavior","resume_on_payment_attempt")
+                .containsEntry("proration_behavior","none");
+            assertThat(call.params().get("billing_cycle_anchor")).isEqualTo(java.util.Map.of("type","now"));
+            assertThat(call.options().getIdempotencyKey()).isEqualTo("owned-resume-key");
+            assertThat(call.options().getMaxNetworkRetries()).isZero();
+        });
     }
 
     @Test void paidEvidenceKeepsTheSameFrozenPeriodAndCaptureIdentity() throws Exception {

@@ -21,6 +21,10 @@ import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.S
 
 /** Closed, clocked Stripe graph for the single owned optional trial. */
 final class OwnedOptionalTrialResumeGraph {
+    // Finalize the invoice here. The separately claimed PAY phase confirms its exact intent.
+    static final SubscriptionResumeParams.PaymentBehavior PAYMENT_BEHAVIOR =
+        SubscriptionResumeParams.PaymentBehavior.RESUME_ON_PAYMENT_ATTEMPT;
+
     record Identity(String invoice, String allocation, String intent) {}
     record Settlement(Identity identity, Invoice invoice) {}
 
@@ -129,7 +133,7 @@ final class OwnedOptionalTrialResumeGraph {
         var response = call(() -> client.v1().subscriptions().resume(original.subscription(), SubscriptionResumeParams.builder()
             .setBillingCycleAnchor(SubscriptionResumeParams.BillingCycleAnchor.builder()
                 .setType(SubscriptionResumeParams.BillingCycleAnchor.Type.NOW).build())
-            .setPaymentBehavior(SubscriptionResumeParams.PaymentBehavior.RESUME_ON_PAYMENT_SUCCESS)
+            .setPaymentBehavior(PAYMENT_BEHAVIOR)
             .setProrationBehavior(SubscriptionResumeParams.ProrationBehavior.NONE).build(), options(key)));
         var invoice = response.getLatestInvoice();
         require(reference(invoice, "in") && !invoice.equals(original.invoice()));
