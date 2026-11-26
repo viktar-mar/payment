@@ -15,7 +15,7 @@ type Header={name:string;value:string};
 type Preflight={origin:string;method:string;names?:string};
 type FrameWait={settle:(matched:boolean)=>void;invalidated:boolean};
 type Entry={url:string;method:string;frameId?:string;allowed:boolean;expectedAssetBlock?:boolean;preflight?:Preflight;
- issuerParserDocument?:string;allowedIssuerScript?:boolean;
+ issuerParser?:{url:string;loaderId:string};allowedIssuerScript?:boolean;
  initiator?:{id:string;entry?:Entry};frameWait?:FrameWait};
 type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
  |'BROWSER_GUARD_RESPONSE_PAIR_NETWORK_ID'|'BROWSER_GUARD_RESPONSE_PAIR_REQUEST_MISSING'|'BROWSER_GUARD_RESPONSE_PAIR_DUPLICATE'
@@ -132,7 +132,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
    const preflight=issuerTraffic?undefined:probe(event.request,event.initiator?.type,origins);
    const entry:Entry={frameId:event.frameId,url:event.request.url,method:event.request.method,allowed:false,preflight};
    if(issuerTraffic && event.type==='Script' && event.initiator?.type==='parser' &&
-      event.initiator.url===event.documentURL)entry.issuerParserDocument=event.documentURL;
+      event.initiator.url===event.documentURL && event.loaderId)entry.issuerParser={url:event.documentURL,loaderId:event.loaderId};
    if(!entry.frameId){
     // Chrome may report a frameless preflight before the linked initiating request.
     // Record the exact identifier, but require its frame and the synthetic 204 at the pause.
@@ -298,12 +298,14 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
  const mainId=frameId(frameTree,main,main);
  if(!mainId||routeReader&&routeReader.mainId!==mainId)refuse();
  const routes=new WeakMap<Request,{generation:number;evidence?:ChromiumRouteEvidence|null}>();
- async function claimRoute(request:Request,blockIssuerAsset:boolean,issuerScriptDocument?:string){
+ async function claimRoute(request:Request,blockIssuerAsset:boolean,issuerDocument?:Request){
   const url=new URL(request.url());
   const fromApprovedIssuer=approvedIssuerOrigin!==undefined && url.origin===approvedIssuerOrigin;
+  const issuerScriptDocument=issuerDocument?.url();
   if(issuerScriptDocument!==undefined?
      !routeReader || !fromApprovedIssuer || !routes.has(request) || !URL.canParse(issuerScriptDocument) ||
       new URL(issuerScriptDocument).origin!==url.origin || request.frame().url()!==issuerScriptDocument ||
+      issuerDocument!.frame()!==request.frame() || issuerDocument!.method()!=='POST' ||
       request.method()!=='GET' || request.isNavigationRequest() || request.resourceType()!=='script' ||
       url.href!==url.origin+url.pathname || !isIssuerScriptPath(url.pathname):
     blockIssuerAsset?
@@ -347,7 +349,9 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
     if(entry.method==='OPTIONS'&&!entry.preflight)return refuse();
     if(issuerScriptDocument!==undefined){
      reason='BROWSER_GUARD_ROUTE_ISSUER_SCRIPT_PARSER';
-     if(entry.issuerParserDocument!==issuerScriptDocument || request.frame().url()!==issuerScriptDocument)return refuse();
+     if(entry.issuerParser?.url!==issuerScriptDocument || entry.issuerParser.loaderId!==evidence.documentId ||
+        evidence.documentId!==routeReader.navigationDocument(issuerDocument!) ||
+        request.frame().url()!==issuerScriptDocument)return refuse();
      entry.allowedIssuerScript=true;
     }
     if(blockIssuerAsset)entry.expectedAssetBlock=true;
@@ -398,6 +402,6 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   },
   authorize:(request:Request)=>claimRoute(request,false),
   expectIssuerAssetBlock:(request:Request)=>claimRoute(request,true),
-  authorizeIssuerScript:(request:Request,documentUrl:string)=>claimRoute(request,false,documentUrl),
+  authorizeIssuerScript:(request:Request,document:Request)=>claimRoute(request,false,document),
  };
 }

@@ -21,8 +21,9 @@ const stylesheetBlock='direct reviewed issuer passive stylesheet blocked';
 const twoFonts='direct reviewed issuer two passive fonts blocked';
 const sixFonts='direct reviewed issuer six passive fonts blocked';
 const parserScript='one parser-initiated script from the exact issuer document';
+const decisionScript='one parser-initiated script from the issuer decision document';
 const wrongScriptMime='issuer script with the wrong MIME type is refused';
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,wrongScriptMime,...rejectedAssets.keys()])
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,wrongScriptMime,...rejectedAssets.keys()])
 test(rejectedAssets.has(mode)?mode+' before handoff':mode===wrongScriptMime?mode:
  'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
@@ -35,14 +36,16 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===wrongScriptMime?mode
  const blocksPassiveStylesheet=mode===stylesheetBlock;
  const blocksPassiveAsset=blocksPassiveImage||blocksPassiveFont||blocksPassiveStylesheet;
  const badMime=mode===wrongScriptMime,loadsScript=mode===parserScript||badMime;
+ const loadsDecisionScript=mode===decisionScript;
  const rejectedAsset=rejectedAssets.get(mode);
- const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||loadsScript||Boolean(rejectedAsset);
+ const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||loadsScript||loadsDecisionScript||Boolean(rejectedAsset);
  const direct=mode==='direct Stripe EMVCo frame'||scopedIssuer;
  const issuerName=direct?'stripe-challenge-frame':'acsFrame';
  const approvedIssuerOrigin=scopedIssuer?'https://reviewed-test-issuer.stripe.com':undefined;
  const issuerOrigin=approvedIssuerOrigin??'https://hooks.stripe.com',issuer=issuerOrigin+'/fixture-issuer',decision=issuer+'/decision';
  const assetPath=issuerOrigin+(rejectedAsset?.path??(loadsScript?'/fixture-required.js':blocksPassiveStylesheet?'/fixture-passive.css':
   blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png'));
+ const decisionAsset=issuerOrigin+'/fixture-decision.js';
  const fontCount=mode===sixFonts?6:mode===twoFonts?2:1;
  const assetUrls=[assetPath,...Array.from({length:fontCount-1},(_,index)=>issuerOrigin+`/fixture-passive-${index+2}.woff2`)];
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
@@ -53,6 +56,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===wrongScriptMime?mode
   const frame=document.createElement('iframe');frame.name=${JSON.stringify(issuerName)};document.body.append(frame);
   window.addEventListener('message',async event=>{
    if(event.source!==frame.contentWindow || event.origin!==${JSON.stringify(issuerOrigin)} || event.data!=='fixture decision')return;
+   ${loadsDecisionScript?'frame.remove();':''}
    try{
     const reply=await fetch(${JSON.stringify(complete)},{method:'POST',body:new URLSearchParams({source:${JSON.stringify(source)},key:${JSON.stringify(key)}})});
     if(!(await reply.json()).complete)throw Error();
@@ -67,6 +71,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===wrongScriptMime?mode
  const json=(value:object)=>({contentType:'application/json',headers:{'Access-Control-Allow-Origin':stripe},body:JSON.stringify(value)});
  const issuerButton='<button name="decision" value="complete">Complete</button>';
  const revealButton="document.querySelector('form').append(document.querySelector('template').content.cloneNode(true))";
+ const issuerDecision='parent.postMessage("fixture decision",'+JSON.stringify(stripe)+')';
  const issuerBody='<!doctype html><form method="post" action="'+decision+'">'+
   (blocksPassiveAsset||rejectedAsset||loadsScript?'<template>'+issuerButton+'</template>':issuerButton)+'</form>'+
   (blocksPassiveImage?`<img width="1" height="1" alt="" src="${assetPath}" onerror="${revealButton}">`:
@@ -88,11 +93,13 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===wrongScriptMime?mode
   [authenticate,json({state:'challenge_required',
    ares:{messageType:'ARes',transStatus:'C',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,acsURL:issuer}})],
   [issuer,{contentType:'text/html',body:issuerBody}],
-  [decision,{contentType:'text/html',body:'<!doctype html><script>parent.postMessage("fixture decision",'+JSON.stringify(stripe)+')</script>'}],
+  [decision,{contentType:'text/html',body:loadsDecisionScript?`<!doctype html><script src="${decisionAsset}"></script>`:
+   '<!doctype html><script>'+issuerDecision+'</script>'}],
   [complete,json({complete:true})],
  ]);
  if(rejectedAsset)responses.set(assetPath,{contentType:rejectedAsset.contentType,body:rejectedAsset.body});
  if(loadsScript)responses.set(assetPath,{contentType:badMime?'text/html':'application/javascript',body:revealButton});
+ if(loadsDecisionScript)responses.set(decisionAsset,{contentType:'application/javascript',body:issuerDecision});
  const channel=process.env.PAYMENT_TEST_CHROME_CHANNEL==='chrome'?'chrome':'chromium';
  const browser=await chromium.launch({channel,headless:true,timeout:10_000,args:[
   '--site-per-process','--disable-background-networking','--proxy-server=direct://','--host-resolver-rules=MAP * ~NOTFOUND',
@@ -236,7 +243,8 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===wrongScriptMime?mode
   assert.equal(attachedIssuerFrame,true);
   if(mode==='separate issuer process')assert.equal(separateIssuerTarget,true);
   assert.deepEqual(refusals,[]);
-  assert.deepEqual(forwarded,[retrieve,authenticate,issuer,...(loadsScript?[assetPath]:[]),decision,complete,retrieve]);
+  assert.deepEqual(forwarded,[retrieve,authenticate,issuer,...(loadsScript?[assetPath]:[]),decision,
+   ...(loadsDecisionScript?[decisionAsset]:[]),complete,retrieve]);
   assert.equal(gestures,1);
   if(blocksPassiveAsset){
    assert.deepEqual(passiveRequests.map(asset=>asset.url()).sort(),[...assetUrls].sort());

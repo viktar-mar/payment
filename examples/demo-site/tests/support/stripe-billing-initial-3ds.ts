@@ -111,7 +111,7 @@ type Options={
  page:Page;limits:BillingLimits;demo:string;owner:()=>{secret:string;key:string};
  winning:()=>Promise<void>;authorizeResponse:(req:Request)=>Promise<void>;check:()=>Promise<void>;
  expectIssuerAssetBlock:(req:Request)=>Promise<void>;
- authorizeIssuerScript?:(req:Request,documentUrl:string)=>Promise<void>;
+ authorizeIssuerScript?:(req:Request,document:Request)=>Promise<void>;
  stripeFrames:(req:Request)=>FrameSnapshot|undefined;waitForGesture:WaitForIssuerGesture;
  approvedIssuerOrigin?:string;
 };
@@ -126,9 +126,11 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
  let completed=false,finalRead=false,initialIssuerDispatched=false,boundSource:string|undefined;
  let issuer:Frame|undefined,issuerRequest:Request|undefined,submission:Request|undefined,binding:ReturnType<typeof issuerBinding>|undefined;
  let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:Promise<void>}|undefined;
- let handoffStarted=false,passiveDeadline:number|undefined;
- const passiveBlocks=new Map<string,Promise<void>>();
- const issuerScripts=new Map<string,Promise<void>>();
+ let handoffStarted=false;
+ const issuerAssets=()=>({
+  blocks:new Map<string,Promise<void>>(),scripts:new Map<string,Promise<void>>(),deadline:undefined as number|undefined,
+ });
+ const challengeAssets=issuerAssets(),decisionAssets=issuerAssets();
  const passiveFailures=new Map<Request,()=>void>();
  const issuerReady=Promise.withResolvers<void>(),issuerDispatched=Promise.withResolvers<void>(),navigation=new WeakMap<Frame,number>();
  const revision=(frame:Frame)=>navigation.get(frame)??0;
@@ -160,11 +162,15 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   }
   return {target,frames};
  }
- function committedIssuerDocument(frame:Frame){
-  requireValue(binding && issuerRequest && frame===issuer && frame.url()===binding.url);
-  const html=issuerRequest.existingResponse();
-  requireValue(html && html.request()===issuerRequest && html.status()===200 && html.url()===binding.url && !html.fromServiceWorker());
-  const document=stamped(frameChain(frame))!;requireValue(revision(frame)===expectedIssuerRevision);
+ function committedIssuerDocument(frame:Frame,request=issuerRequest){
+  requireValue(binding && request && frame===issuer);
+  const challengeDocument=request===issuerRequest;
+  const documentUrl=challengeDocument?binding.url:request.url();
+  requireValue((challengeDocument || request===submission) && frame.url()===documentUrl);
+  const html=request.existingResponse();
+  requireValue(html && html.request()===request && html.status()===200 && html.url()===documentUrl && !html.fromServiceWorker());
+  const document=stamped(frameChain(frame))!;
+  requireValue(revision(frame)===expectedIssuerRevision+(challengeDocument?0:1));
   const parents={target:frame,frames:new Map(document.frames)};parents.frames.delete(frame);sameChain(issuerParent,parents);
   return document;
  }
@@ -296,7 +302,12 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   }else{
    if(approved && initialIssuerDispatched && !navigation){
     report('BROWSER_CHALLENGE_ISSUER_ASSET_HANDOFF');
-    requireValue(!handoffStarted);
+    const decisionDocument=handoffStarted;
+    const documentRequest=decisionDocument?submission:issuerRequest;
+    requireValue(documentRequest && (!decisionDocument ||
+     target.url()===documentRequest.url() && revision(target)===expectedIssuerRevision+1));
+    // After the gesture, only the committed reply to the one trusted form POST can load assets.
+    const assets=decisionDocument?decisionAssets:challengeAssets;
     report('BROWSER_CHALLENGE_ISSUER_ASSET_BINDING');
     requireValue(binding && new URL(binding.url).origin===url.origin);
     report('BROWSER_CHALLENGE_ISSUER_ASSET_WORKER');
@@ -305,7 +316,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     requireValue(!headers.origin||headers.origin===url.origin);
     const requireIssuerDocument=()=>{
      report('BROWSER_CHALLENGE_ISSUER_ASSET_DOCUMENT');
-     sameChain(original,committedIssuerDocument(target));
+     sameChain(original,committedIssuerDocument(target,documentRequest));
     };
     requireIssuerDocument();
     report('BROWSER_CHALLENGE_ISSUER_ASSET_METHOD');
@@ -318,19 +329,20 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     if(kind==='script'){
      report('BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT');
      requireValue(authorizeIssuerScript && binding && isIssuerScriptPath(url.pathname) &&
-      !issuerScripts.has(url.pathname) && issuerScripts.size<issuerScriptLimit);
-     const documentUrl=binding.url;
+      !assets.scripts.has(url.pathname) && assets.scripts.size<issuerScriptLimit);
      const forwarded=billingBounded(limits,async active=>{
-      await authorizeIssuerScript(request,documentUrl);
+      await authorizeIssuerScript(request,documentRequest);
       await check();billingCheck(active);requireIssuerDocument();
       report('BROWSER_CHALLENGE_ROUTE_FORWARD');
       await route.continue();
       const response=await originalResponse(request,active,5000);
       requireValue(response.status()===200 &&
        await billingBounded(active,()=>response.finished(),5000)===null && request.failure()===null);
-      await check();billingCheck(active);requireIssuerDocument();
+      await check();billingCheck(active);
+      // Stripe.js may retire the issuer after the successfully loaded decision script posts back.
+      if(!decisionDocument)requireIssuerDocument();
      },10000);
-     issuerScripts.set(url.pathname,forwarded);
+     assets.scripts.set(url.pathname,forwarded);
      return await forwarded;
     }
     switch(kind){
@@ -343,13 +355,13 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     }
     requireValue(issuerAssetSuffixMatches(kind,url.pathname));
     report('BROWSER_CHALLENGE_ISSUER_ASSET_REPEAT');
-    requireValue(!passiveBlocks.has(url.pathname));
+    requireValue(!assets.blocks.has(url.pathname));
     report('BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT');
-    requireValue(passiveBlocks.size<issuerAssetBlockLimit);
+    requireValue(assets.blocks.size<issuerAssetBlockLimit);
     // All claims share the first request's deadline. A late request cannot
     // start a new proof window or inherit another request's receipt.
-    passiveDeadline??=Math.min(limits.deadline,Date.now()+750);
-    const blockLimits={deadline:passiveDeadline,signal:limits.signal};
+    assets.deadline??=Math.min(limits.deadline,Date.now()+750);
+    const blockLimits={deadline:assets.deadline,signal:limits.signal};
     report('BROWSER_CHALLENGE_ISSUER_ASSET_DEADLINE');
     billingCheck(blockLimits);
     const failed=Promise.withResolvers<void>();
@@ -367,7 +379,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
      await check();billingCheck(active);
      requireIssuerDocument();
     },750);
-    passiveBlocks.set(url.pathname,block);
+    assets.blocks.set(url.pathname,block);
     try{await block;}finally{passiveFailures.delete(request);}
     return;
    }
@@ -441,7 +453,8 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   };
   handoffStarted=true;
   // Let the route's fixed checkpoint reach the owner on failure, while preventing handoff.
-  await Promise.all([...passiveBlocks.values(),...issuerScripts.values()]).catch(()=>billingBounded(limits,()=>new Promise<never>(()=>{}),750));
+  await Promise.all([...challengeAssets.blocks.values(),...challengeAssets.scripts.values()])
+   .catch(()=>billingBounded(limits,()=>new Promise<never>(()=>{}),750));
   await validate();await billingBounded(limits,l=>waitForGesture({deadline:l.deadline,signal:l.signal!}),180000);await validate();
   // A pending form navigation can block evaluation in the issuer renderer.
   // Keep the trusted click receipt in the runner, tied to the armed document.

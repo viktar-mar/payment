@@ -3,10 +3,10 @@ import type {Page,Request} from '@playwright/test';
 
 type ClientObject={_connection?:{toImpl?:(client:unknown)=>unknown}};
 type DriverFrame={
- _id:string;_page:DriverPage;_currentDocument:object;
+ _id:string;_page:DriverPage;_currentDocument:{documentId?:string};
  parentFrame():DriverFrame|null;_isDetached():boolean;
 };
-type DriverRequest={frame():DriverFrame;method():string;url():string};
+type DriverRequest={frame():DriverFrame;method():string;url():string;_documentId?:string};
 type DriverRoute={
  request:DriverRequest;session:object;_requestId:string;_interceptionId:string;
  _originalRequestRoute?:{_alreadyContinuedParams?:unknown;_fulfilled?:boolean};
@@ -20,7 +20,7 @@ type DriverPage={
  };
 };
 export type ChromiumRouteEvidence={
- targetId:string;frameId:string;networkId:string;current:()=>boolean;
+ targetId:string;frameId:string;networkId:string;documentId?:string;current:()=>boolean;
 };
 const refuse=()=>Error('billing_BROWSER');
 const protocolFixtures=new WeakSet<object>();
@@ -49,6 +49,15 @@ export function chromiumRouteReader(page:Page){
     main._page!==impl||main._id!==delegate._targetId||frameManager.frame(main._id)!==main)throw refuse();
  return {
   mainId:main._id,
+  navigationDocument(request:Request):string|undefined{
+   try{
+    if((request as ClientObject)._connection!==connection||!request.isNavigationRequest()||
+       request.redirectedFrom()||request.serviceWorker())return;
+    const original=connection.toImpl!(request) as DriverRequest;
+    if(original.frame()===connection.toImpl!(request.frame())&&original.method()===request.method()&&
+       original.url()===request.url()&&typeof original._documentId==='string')return original._documentId;
+   }catch{return;}
+  },
   capture(request:Request):ChromiumRouteEvidence|null{
    try{
     const frame=request.frame(),original=connection.toImpl!(request) as DriverRequest;
@@ -69,7 +78,7 @@ export function chromiumRouteReader(page:Page){
      ancestry.set(node,node._currentDocument);
     }
     if(!ancestry.has(main)||![...ancestry.keys()].some(frame=>frame._id===targetId))return null;
-    const frameId=sourceFrame._id,url=request.url(),method=request.method();
+    const frameId=sourceFrame._id,documentId=sourceFrame._currentDocument.documentId,url=request.url(),method=request.method();
     const current=()=>{
      if(pending.get(networkId)!==route||route.request!==original||route.session!==session||
         route._requestId!==networkId||route._interceptionId!==interception||
@@ -81,7 +90,7 @@ export function chromiumRouteReader(page:Page){
      return chain.every(([node,document],index)=>node._page===impl&&!node._isDetached()&&
       frameManager.frame(node._id)===node&&node._currentDocument===document&&node.parentFrame()===(chain[index+1]?.[0]??null));
     };
-    return current()?{targetId,frameId,networkId,current}:null;
+    return current()?{targetId,frameId,networkId,documentId,current}:null;
    }catch{return null;}
   },
  };
