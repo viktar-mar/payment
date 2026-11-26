@@ -22,6 +22,40 @@ test('abort disposes SQL and late rows cannot become accepted evidence',async()=
  pending.catch(()=>{});await entering;controller.abort();await assert.rejects(pending);release?.([f.row]);await new Promise(r=>setTimeout(r,5));assert.ok(ended>=1);assert.equal(inspections,0);
 });
 
+for(const selectedCase of ['initial_portal','initial_cancel_withdraw','initial_success']) {
+ test('the initial payment witness stays bound to its acceptance case: '+selectedCase,async()=>{
+  const f=fixture();
+  const {row,inspection}=f;
+  row.initial_unscheduled=true;
+  row.subscription_revision=3;
+  row.cash_journal_ids=[id(12)];
+  row.paid_journal_ids=[id(13)];
+  const paid=row.callbacks[1];
+  paid.type=paid.payload.event_type='subscription.updated';
+  inspection.events[1].event_type=paid.type;
+  inspection.events[1].sha256=createHash('sha256').update(canonical(paid.payload)).digest('hex');
+  const binding={...scope,createKeyHash:'a'.repeat(64),confirmKeyHash:'b'.repeat(64),endpoints:{demo:'http://127.0.0.1:18081'}};
+  const result=await api.proveBillingEvidence({
+   configuration:{...scope,selectedCase},bootstrap:{withDatabaseCredentials:callback=>callback({})},
+   fixture:{resources:()=>binding,inspectCallbacks:async()=>inspection},
+  },{deadline:Date.now()+1000},{connect:()=>({
+   begin:async(_mode,callback)=>callback({unsafe:async query=>query.startsWith('set local')?[]:[row]}),
+   end:async()=>{},
+  })});
+  for(const [acceptanceCase,read] of [['initial_portal',api.billingPortalOrigin],['initial_cancel_withdraw',api.billingCancellationOrigin]]) {
+   const witness=read(result);
+   if(acceptanceCase===selectedCase) {
+    assert.equal(witness.paymentId,id(10));
+    assert.equal(witness.billingRecordId,id(11));
+    assert.equal(witness.revision,3);
+    assert.deepEqual(Object.keys(witness.callbackDigests),[id(12),id(13)]);
+    assert.ok(Object.isFrozen(witness)&&Object.isFrozen(witness.callbackDigests));
+   } else assert.equal(witness,undefined);
+   assert.equal(read({...result}),undefined);
+  }
+ });
+}
+
 for(const scenario of ['verified','ordinary','provider-denied','local-cash-missing']){
  test('initial 3DS joins its server and provider receipts: '+scenario,async()=>{
   const f=fixture(),events=[];

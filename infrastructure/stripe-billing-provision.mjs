@@ -14,6 +14,7 @@ const need=value=>{if(!value)throw billingError('FIXTURE');};
 const digest=value=>createHash('sha256').update(value).digest('hex');
 const failedRenewalCheckpoints=new WeakMap();
 const initial3dsCheckpoints=new WeakMap();
+const readyPortalPolicies=new WeakMap();
 const initial3dsReads=['PROVISION_LOGIN','PROVISION_ACCOUNTS','PROVISION_SITES'];
 const initial3dsCodes=new Set([
  'PROVISION_BINDING','PROVISION_ADMIN','PROVISION_LOGIN_COOKIES','PROVISION_FRESHNESS','PROVISION_FRESH_RECEIPT',
@@ -50,6 +51,17 @@ export function billingInitial3dsProvisionCheckpoint(fixture,limits,runId,expect
   ?checkpoint?.code??null:null;
 }
 export const isInitial3dsProvisionCheckpoint=code=>initial3dsCodes.has(code);
+
+export function billingPortalFixturePolicy(fixture,scope) {
+ const policy=readyPortalPolicies.get(fixture);
+ if(!policy)return null;
+ const owned=fixture.resources();
+ const fields=['runId','expectedSource','siteKey','accountId','siteId','customerId','subscriptionId','operationId',
+  'attemptId','productId','priceId','createKeyHash','confirmKeyHash'];
+ if(!fields.every(key=>typeof owned[key]==='string'&&owned[key]===scope?.[key])||
+  owned.endpoints.demo!==scope?.endpoints?.demo||owned.endpoints.backend!==scope?.endpoints?.backend)return null;
+ return policy;
+}
 async function responseBytes(response,limits,maximum){
  let bytes=0;const chunks=[];
  for await(const chunk of response.body??[]){billingCheck(limits);bytes+=chunk.length;need(bytes<=maximum);chunks.push(Buffer.from(chunk));}
@@ -84,7 +96,7 @@ function matchesPortalPolicy(value,siteId,expected) {
 /** Describe a Portal policy change for acknowledged fixture resources. The caller owns transport and dispatch. */
 export function buildBillingPortalPolicyRequest(configuration,receipts) {
  const c=validateBillingAcceptanceOptions(configuration);
- need(c?.selectedCase==='initial_success');
+ need(c?.selectedCase==='initial_success'||c?.selectedCase==='initial_portal');
  const {account,site,product,price,policy}=receipts??{};
  const backend='http://127.0.0.1:'+c.ports.backend,demo='http://127.0.0.1:'+c.ports.demo;
  const siteKey='s5a-'+c.runId.replaceAll('-','');
@@ -117,12 +129,18 @@ export function buildBillingPortalPolicyRequest(configuration,receipts) {
 /** Fresh recurring fixture only. Cookies and callback secrets never enter its append-only public ledger. */
 export async function createBillingFixture(options,dependencies={}) {
  const env=options?.configuration?.env??{};
- need(billingFailedRenewalExcluded(env)&&billingOptionalTrialExcluded(env)&&options?.configuration?.selectedCase!=='optional_trial_pause_resume');
+ need(billingFailedRenewalExcluded(env)&&billingOptionalTrialExcluded(env)&&
+  !['optional_trial_pause_resume','initial_portal'].includes(options?.configuration?.selectedCase)&&
+  Object.getOwnPropertyDescriptor(env,'PAYMENT_STRIPE_BILLING_CASE')?.value!=='initial_portal');
  if(['initial_cancel_withdraw','initial_decline_retry','initial_3ds','initial_missed_reordered','initial_required_trial'].includes(options.configuration?.selectedCase)){
   const configuration=validateBillingAcceptanceOptions(options.configuration);need(configuration);
   return createFixture({...options,configuration},dependencies,configuration.selectedCase==='initial_required_trial'?'REQUIRED_TRIAL':configuration.selectedCase==='initial_missed_reordered'?'INVOICE_WEBHOOKS':configuration.selectedCase==='initial_3ds'?'INITIAL_3DS':configuration.selectedCase==='initial_decline_retry'?'INITIAL_RETRY':'CANCELLATION');
  }
  return createFixture(options,dependencies,'INITIAL');
+}
+export async function createBillingPortalFixture({configuration,bootstrap,cli},dependencies={}) {
+ const c=validateBillingAcceptanceOptions(configuration);need(c?.selectedCase==='initial_portal');
+ return createFixture({configuration:c,bootstrap,cli},dependencies,'PORTAL');
 }
 export async function createBillingFailedRenewalFixture({configuration,bootstrap,cli},dependencies={}) {
  const c=validateBillingFailedRenewalOptions(configuration);need(c);
@@ -139,13 +157,18 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
  let provisionClaimed=false,confirmRecorded=false,armState='NEW',armBoundary;
  const invoices=purpose==='INVOICE_WEBHOOKS',requiredTrial=purpose==='REQUIRED_TRIAL';
  const optionalTrial=purpose==='OPTIONAL_TRIAL';
+ const portal=purpose==='PORTAL';
  let trialSetupStage='trial-permit-dispatch',trialPermitKeyHash;
  const trialDays=requiredTrial||optionalTrial?7:0;
  const trialPolicy=requiredTrial?'REQUIRED_BEFORE_TRIAL':optionalTrial?'OPTIONAL_DURING_TRIAL':null;
  let reconciliationClaimed=false;
  const retry=purpose==='INITIAL_RETRY',challenge=purpose==='INITIAL_3DS';
- const retryLedger=invoices?['create-dispatch','create-ack','confirm-dispatch','confirm-ack','reconcile-dispatch','reconcile-ack','paid-dispatch','paid-ack','finalized-dispatch','finalized-ack']:challenge?['create-dispatch','create-ack','confirm-dispatch','confirm-ack','challenge-dispatch','challenge-ack']:['create-dispatch','create-ack','confirm-dispatch','confirm-ack','decline-proof','retry-dispatch','retry-ack','successor-confirm-dispatch','successor-confirm-ack','recovered-proof'];
- let retryCursor=0,retryKeyHash,successorId,successorKeyHash;
+ const initialReceipts=['create-dispatch','create-ack','confirm-dispatch','confirm-ack'];
+ const financialLedger=invoices?[...initialReceipts,'reconcile-dispatch','reconcile-ack','paid-dispatch','paid-ack','finalized-dispatch','finalized-ack']
+  :challenge?[...initialReceipts,'challenge-dispatch','challenge-ack']
+  :retry?[...initialReceipts,'decline-proof','retry-dispatch','retry-ack','successor-confirm-dispatch','successor-confirm-ack','recovered-proof']
+  :portal?initialReceipts:null;
+ let financialCursor=0,retryKeyHash,successorId,successorKeyHash;
  let nextCancellation='schedule',scheduleHash,scheduleOperation;
  const fetcher=dependencies.fetch??globalThis.fetch,write=dependencies.write??writeOwned;
  const suffix=c.runId.replaceAll('-',''),siteKey='s5a-'+suffix,email='billing-'+suffix+'@example.test';
@@ -153,8 +176,9 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
  const directory=ROOT+'/test-results/stripe-sandbox/'+c.runId;
  let sequence=0,cookie='',csrf='',provisioned=false,closed=false,busy=false,started=0,customerId,subscriptionId,operationId,attemptId,createKey,confirmKey;
  let accountId,siteId,productId,priceId,priceReference;
+ let portalPolicy,portalKeyDigest,portalOpening='READY';
  const resources=()=>Object.freeze({runId:c.runId,expectedSource:c.expectedSource,endpoints:Object.freeze({...endpoints}),siteKey,email,accountId,siteId,productId,priceId,priceReference,customerId,subscriptionId,operationId,attemptId,createKeyHash:createKey&&digest(createKey),confirmKeyHash:confirmKey&&digest(confirmKey),
-  ...(requiredTrial?{trialPermitKeyHash}:{})});
+  ...(requiredTrial?{trialPermitKeyHash}:{}),...(portal&&provisioned&&!closed?portalPolicy:{})});
  async function writeOwned(name,value,limits) {
   billingCheck(limits);
   for(const path of [ROOT,ROOT+'/test-results',ROOT+'/test-results/stripe-sandbox',directory]){
@@ -166,11 +190,11 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
  }
  async function save(kind,value,limits){need(!closed);await billingBounded(limits,l=>write('billing-'+String(++sequence).padStart(3,'0')+'-'+kind+'.json',{runId:c.runId,expectedSource:c.expectedSource,...value},l));}
  async function financialReceipt(kind,value,limits) {
-  if(!retry&&!challenge&&!invoices)return save(kind,value,limits);
-  need(retryLedger[retryCursor]===kind);
-  const current=retryCursor;retryCursor=-1;
+  if(!financialLedger)return save(kind,value,limits);
+  need(financialLedger[financialCursor]===kind);
+  const current=financialCursor;financialCursor=-1;
   await save(kind,value,limits);
-  retryCursor=current+1;
+  financialCursor=current+1;
  }
  async function request(path,limits,{method='GET',body,status=200,target='backend',idempotencyKey,beforeSend,provisionStep}={}) {
   const publish=(failed||optionalTrial)&&provisionStep===publishStep;
@@ -250,16 +274,30 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
     const providers=await read(base+'/identity-providers',limits,{provisionStep:identityProviderRead});
     checkpoint(identityProviderRead+'_VALIDATE',limits);
     need(Array.isArray(providers)&&providers.length===1&&providers[0].mode==='EMAIL_OTP'&&providers[0].readiness==='READY'&&providers[0].status==='ACTIVE');
-    const policy=await read(base+'/subscription-policy',limits,{provisionStep:policyRead});
-    checkpoint(policyRead+'_VALIDATE',limits);
-    need(Number.isSafeInteger(policy.version));
-    await mutate('policy',base+'/subscription-policy',{version:policy.version,enabled:true,grace_days:graceDays,allow_immediate_cancellation:false,portal_enabled:false,defer_upgrades:false,portal_return_urls:[]},200,limits,v=>v?.enabled===true&&v.portal_enabled===false&&(!failed||v.grace_days===3),{dispatchCheckpoint:'PROVISION_POLICY_INTENT'});
+    const policyPath=base+'/subscription-policy';
+    if(!portal){
+     const policy=await read(policyPath,limits,{provisionStep:policyRead});
+     checkpoint(policyRead+'_VALIDATE',limits);
+     need(Number.isSafeInteger(policy.version));
+     await mutate('policy',policyPath,{version:policy.version,enabled:true,grace_days:graceDays,allow_immediate_cancellation:false,portal_enabled:false,defer_upgrades:false,portal_return_urls:[]},200,limits,v=>v?.enabled===true&&v.portal_enabled===false&&(!failed||v.grace_days===3),{dispatchCheckpoint:'PROVISION_POLICY_INTENT'});
+    }
     const product=await mutate('product','/api/admin/v1/sites/'+siteId+'/products',{key:'billing-product-'+suffix,name:'Initial monthly Billing',description:null},201,limits,v=>billingUuid(v?.id)&&v.site_id===siteId&&v.status==='ACTIVE');productId=product.id;
     const price=await mutate('price','/api/admin/v1/products/'+productId+'/prices',{price_key:'billing-price-'+suffix,type:'SUBSCRIPTION',amount_minor:2000,currency:'EUR',billing_interval:'MONTH',trial_days:trialDays,...(trialPolicy?{trial_payment_method_policy:trialPolicy}:{}),tax_mode:'INCLUSIVE',tax_code:null},201,limits,v=>billingUuid(v?.id)&&v.site_id===siteId&&v.product_id===productId&&v.version===1&&v.status==='DRAFT');priceId=price.id;
     const published=await mutate('publish','/api/admin/v1/prices/'+priceId+'/publish',undefined,200,limits,
-     v=>v?.id===priceId&&v.type==='SUBSCRIPTION'&&v.status==='PUBLISHED'&&v.version===1&&v.amount_minor===2000&&v.currency==='EUR'&&v.billing_interval==='MONTH'&&v.trial_days===trialDays&&(!trialPolicy||v.trial_payment_method_policy===trialPolicy)&&v.tax_mode==='INCLUSIVE'&&/^price_[A-Za-z0-9]+$/.test(v.provider_price_id),
+     v=>v?.id===priceId&&v.type==='SUBSCRIPTION'&&v.status==='PUBLISHED'&&v.version===1&&v.amount_minor===2000&&v.currency==='EUR'&&v.billing_interval==='MONTH'&&v.trial_days===trialDays&&(!trialPolicy||v.trial_payment_method_policy===trialPolicy)&&v.tax_mode==='INCLUSIVE'&&/^price_[A-Za-z0-9]+$/.test(v.provider_price_id)
+      &&(!portal||v.site_id===siteId&&v.product_id===productId),
      {dispatchCheckpoint:publishStep+'_INTENT',ackCheckpoint:publishStep+'_ACK',provisionStep:publishStep});
     priceReference=published.provider_price_id;
+    if(portal){
+     const policy=await read(policyPath,limits);
+     const request=buildBillingPortalPolicyRequest(c,{account,site,product,price:published,policy});
+     need(request.url===endpoints.backend+policyPath&&request.method==='POST');
+     await save('portal-policy-dispatch',{phase:'DISPATCHING',siteId,policyVersion:request.body.version},limits);
+     const ack=await read(policyPath,limits,{method:request.method,body:request.body,beforeSend:()=>!closed});
+     const verified=request.validateResponse(ack);
+     await save('portal-policy-ack',{phase:'ACKNOWLEDGED',siteId,policyVersion:verified.portalPolicyVersion},limits);
+     portalPolicy=verified;
+    }
     if(failed)failedRenewalCheckpoints.delete(fixture);
     const empty=await read('/inspection',limits,{target:'receiver'});need(empty.count===0&&empty.duplicates===0&&empty.events?.length===0);
     checkpoint('PROVISION_CALLBACK_INTENT',limits);
@@ -276,8 +314,9 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
     need(messages.total===0&&messages.messages?.length===0);
     checkpoint('PROVISION_FIXTURE_READY',limits);
     // Initial-payment fixtures already consume provisioning before writing READY.
-    if(!failed)provisioned=true;
+    if(!failed&&!portal)provisioned=true;
     await save('fixture',{phase:'READY',accountId,siteId,productId,priceId},limits);
+    if(portal){billingCheck(limits);need(!closed);provisioned=true;}
     if(failed){billingCheck(limits);need(!closed);failedRenewalCheckpoints.delete(fixture);provisioned=true;}
     return true;
    }finally{busy=false;}
@@ -307,7 +346,12 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
     need(!requiredTrial&&kind==='confirm'&&confirmKey&&value?.attemptId===attemptId&&value.nextActionAllowed===challenge);
     need(challenge?value.state==='REQUIRES_ACTION'&&value.retryAllowed===false&&value.successorAttemptId===null:retry?value.state==='DECLINED'&&value.retryAllowed===true&&value.successorAttemptId===null:value.state==='OBSERVE');
    }
-   await financialReceipt(kind+'-ack',{phase:'ACKNOWLEDGED',subscriptionId,operationId,...(kind==='confirm'?{attemptId,...(challenge?{state:'REQUIRES_ACTION'}:retry?{state:'DECLINED'}:{})}:{})},limits);if(kind==='confirm')confirmRecorded=true;return true;
+   await financialReceipt(kind+'-ack',{phase:'ACKNOWLEDGED',subscriptionId,operationId,...(kind==='confirm'?{attemptId,...(challenge?{state:'REQUIRES_ACTION'}:retry?{state:'DECLINED'}:{})}:{})},limits);
+   if(kind==='confirm'){
+    if(portal){billingCheck(limits);need(!closed);readyPortalPolicies.set(fixture,portalPolicy);}
+    confirmRecorded=true;
+   }
+   return true;
   },
   ...(requiredTrial?{
    async recordTrialSetup(stage,identity,keyHash,limits){
@@ -352,7 +396,7 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
   }:{}),
   ...(retry?{
    async recordRetry(kind,value,limits) {
-    need(confirmRecorded && retryLedger[retryCursor]===kind);
+    need(confirmRecorded && financialLedger[financialCursor]===kind);
     const base={subscriptionId,operationId,customerId};
     if(kind==='decline-proof' || kind==='recovered-proof'){
      await financialReceipt(kind,{...base,phase:'VERIFIED',attemptId:kind==='decline-proof'?attemptId:successorId},limits);
@@ -393,6 +437,28 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
     nextCancellation=kind==='schedule'?'withdraw':'complete';return true;
    },
   }:{}),
+  ...(portal?{
+   async beforePortalOpening(scope,keyDigest,limits){
+    billingCheck(limits);
+    need(portalOpening==='READY'&&billingPortalFixturePolicy(fixture,scope)&&
+     typeof keyDigest==='string'&&/^[0-9a-f]{64}$/.test(keyDigest)&&
+     ![digest(createKey),digest(confirmKey)].includes(keyDigest));
+    portalOpening='WRITING';
+    await save('portal-session-dispatch',{phase:'DISPATCHING',subscriptionId,customerId,keyDigest,
+     policyVersion:portalPolicy.portalPolicyVersion},limits);
+    billingCheck(limits);need(!closed);
+    portalKeyDigest=keyDigest;portalOpening='SENT';return true;
+   },
+   async acknowledgePortalOpening(scope,keyDigest,limits){
+    billingCheck(limits);
+    need(portalOpening==='SENT'&&portalKeyDigest===keyDigest&&billingPortalFixturePolicy(fixture,scope));
+    portalOpening='WRITING';
+    await save('portal-session-ack',{phase:'ACKNOWLEDGED',subscriptionId,customerId,keyDigest,
+     policyVersion:portalPolicy.portalPolicyVersion},limits);
+    billingCheck(limits);need(!closed);
+    portalOpening='COMPLETE';return true;
+   },
+  }:{}),
   ...(failed?{
    async beforeDeclineArm(v,limits){
     need(provisioned&&!closed&&confirmRecorded&&armState==='NEW');
@@ -414,7 +480,7 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
    }
   }:{}),
   async inspectCallbacks(limits){return read('/inspection/digests',limits,{target:'receiver'});},
-  async close(){closed=true;cookie='';csrf='';createKey=undefined;confirmKey=undefined;return true;},
+  async close(){closed=true;if(portal)readyPortalPolicies.delete(fixture);cookie='';csrf='';createKey=undefined;confirmKey=undefined;return true;},
  });
  return fixture;
 }

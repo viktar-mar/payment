@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as bootstrap from './stripe-sandbox-bootstrap.mjs';
 import * as cli from './stripe-sandbox-cli.mjs';
 import * as owned from './stripe-sandbox-owned.mjs';
+import {createOwnedBillingAcceptance} from './stripe-billing-acceptance.mjs';
 const module=await import('./stripe-billing-acceptance-options.mjs').catch(()=>({}));
 const options=()=>({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'},runId:'11111111-2222-4333-8444-555555555555',expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports:{backend:18080,demo:18081,receiver:18082,postgres:15432,mailpitHttp:18025,mailpitSmtp:11025},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_success'});
 test('an explicit private bridge subnet belongs only to initial decline and retry',()=>{
@@ -97,6 +98,51 @@ test('Billing own-data admission freezes fixed initial-success authority without
   let reads=0;
   for(const mutate of [o=>delete o.env.PAYMENT_STRIPE_BILLING_ACCEPTANCE,o=>o.env.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS='true',o=>o.env=Object.create(o.env),o=>Object.defineProperty(o.env,'PAYMENT_STRIPE_BILLING_ACCEPTANCE',{enumerable:true,get(){reads++;return 'true';}}),o=>Object.defineProperty(o,'runId',{enumerable:true,get(){reads++;return input.runId;}}),o=>o.budget={create:2,confirm:1},o=>o.selectedCase='initial_decline_retry',o=>o.ports.backend=o.ports.demo,o=>o.approvedBinding.externalAccountId='acct_other',o=>o.priorRunId=input.runId,o=>o.daemon='unix:///tmp/../test.sock']){const bad=options();mutate(bad);assert.equal(module.validateBillingAcceptanceOptions(bad),null);}
   assert.equal(reads,0);
+});
+test('Portal admission binds a saved Sandbox profile and one Portal opening to its own case',async()=>{
+ const base=options(),selectedCase='initial_portal';
+ const profile='PAYMENT_STRIPE_BILLING_PORTAL_CLI_PROFILE_RUN_ID',subnet='PAYMENT_STRIPE_BILLING_PORTAL_SUBNET';
+ const env={...base.env,PAYMENT_STRIPE_BILLING_CASE:selectedCase,
+  [profile]:'22222222-3333-4444-8555-666666666666',[subnet]:'10.254.81.0/28'};
+ const input={...base,selectedCase,env};
+ assert.deepEqual(module.snapshotBillingAcceptanceEnvironment(env),env);
+ const admitted=module.validateBillingAcceptanceOptions(input);
+ assert.ok(admitted);
+ assert.equal(admitted.protocol,'SERVER_CONFIRM_V2');
+ assert.deepEqual(admitted.budget,{create:1,confirm:1,portal:1});
+ assert.equal(module.billingAcceptanceProfileRunId(admitted.env),env[profile]);
+ assert.equal(module.billingAcceptanceSubnet(admitted.env),env[subnet]);
+ assert.deepEqual(module.validateBillingAcceptanceOptions(admitted),admitted);
+ await assert.rejects(createOwnedBillingAcceptance(admitted,new Proxy({},{
+  get(){assert.fail('ordinary owner reached dependencies for the Portal case');},
+ })),/billing_OPT_IN_REQUIRED/);
+ for(const budget of [{create:1,confirm:1},{create:1,confirm:1,portal:2},{...admitted.budget,refund:1}]){
+  assert.equal(module.validateBillingAcceptanceOptions({...input,budget}),null);
+ }
+ const withoutProfile={...env};delete withoutProfile[profile];
+ assert.equal(module.snapshotBillingAcceptanceEnvironment(withoutProfile),null);
+ assert.equal(module.validateBillingAcceptanceOptions({...input,env:withoutProfile}),null);
+ for(const override of [
+  {[profile]:base.runId},{[profile]:'031b5ae7-6603-4339-b1b3-77231291ff34'},
+  {[profile]:'34941d87-12d3-4c74-8c5a-b62b7c914390'},{[profile]:'../profile'},
+  {[subnet]:'192.168.81.0/28'},{[subnet]:'10.254.81.1/28'},{[subnet]:'10.254.81.0/24'},
+  {PAYMENT_STRIPE_BILLING_RETRY_CLI_PROFILE_RUN_ID:env[profile]},
+  {PAYMENT_STRIPE_BILLING_RETRY_SUBNET:env[subnet]},
+  {PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true'},
+ ])assert.equal(module.validateBillingAcceptanceOptions({...input,env:{...env,...override}}),null);
+ const withoutSubnet={...env};delete withoutSubnet[subnet];
+ assert.equal(module.billingAcceptanceSubnet(module.validateBillingAcceptanceOptions({...input,env:withoutSubnet}).env),undefined);
+ for(const key of [profile,subnet]){
+  const inherited=Object.assign(Object.create({[key]:env[key]}),env);
+  delete inherited[key];
+  assert.equal(module.snapshotBillingAcceptanceEnvironment(inherited),null);
+  const accessor={...env};
+  Object.defineProperty(accessor,key,{get(){assert.fail('Portal runtime flag accessor invoked');},enumerable:true});
+  assert.equal(module.snapshotBillingAcceptanceEnvironment(accessor),null);
+  assert.equal(module.validateBillingAcceptanceOptions({...base,env:{...base.env,[key]:env[key]}}),null);
+  assert.equal(module.validateBillingAcceptanceOptions({...input,selectedCase:'initial_3ds',
+   env:{...env,PAYMENT_STRIPE_BILLING_CASE:'initial_3ds'}}),null);
+ }
 });
 test('Billing factories reject absent or mixed authority before dependencies',async()=>{
   for(const create of [bootstrap.createOwnedBillingBootstrap,cli.createBillingCliAdapter,owned.preflightOwnedBilling])assert.equal(typeof create,'function');

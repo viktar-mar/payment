@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {billingCallbackDigest,proveBillingEvidence} from './stripe-billing-evidence.mjs';
+import {createBillingPortalFlow} from '../examples/demo-site/tests/support/stripe-billing-portal-flow.node.mjs';
 const api=await import('./stripe-billing-provision.mjs').catch(()=>({}));
 test('Billing fixture factory does not provision at construction',async()=>{
  assert.equal(typeof api.createBillingFixture,'function');let calls=0;
@@ -47,6 +49,10 @@ for(const purpose of ['initial','cancellation','optional-trial'])test('fresh rec
  const fixture=await create({configuration:c,bootstrap:{verify:async()=>true,withAdminCredentials:async callback=>callback({username:'owned',password:'secret-sentinel'})},
   cli:{validateBinding:async()=>true,assertBillingListener:async()=>true}},{fetch,write:async(name,value)=>writes.push({name,value})});
  await fixture.provision({deadline:Date.now()+10000});assert.equal(requests.filter(r=>r.path.endsWith('/prices'))[0].body.type,'SUBSCRIPTION');assert.equal(requests.find(r=>r.path.endsWith('/subscription-policy')&&r.method==='POST').headers['Idempotency-Key'].startsWith('billing:'),true);
+ const ordinaryPolicy=requests.find(r=>r.path.endsWith('/subscription-policy')&&r.method==='POST');
+ assert.equal(ordinaryPolicy.body.portal_enabled,false);
+ assert.equal(fixture.resources().portalReturnUrl,undefined);
+ assert.ok(!writes.some(r=>r.name.includes('portal-policy')));
  await fixture.acknowledgeCustomer({customerId:ids[4],siteId:ids[1]},{deadline:Date.now()+1000});
  if(optionalTrial){
   const price=requests.find(r=>r.path.endsWith('/prices')).body;
@@ -138,4 +144,237 @@ for(const patch of [
  const {configuration,receipts}=portalPolicyInputs();
  const request=api.buildBillingPortalPolicyRequest(configuration,receipts);
  assert.throws(()=>request.validateResponse({site_id:receipts.site.id,...request.body,version:1,...patch}),{message:'billing_FIXTURE'});
+});
+
+function portalFixtureInputs(){
+ const {configuration,receipts}=portalPolicyInputs();
+ return {receipts,configuration:{...configuration,selectedCase:'initial_portal',
+  env:{...configuration.env,PAYMENT_STRIPE_BILLING_CASE:'initial_portal',
+   PAYMENT_STRIPE_BILLING_PORTAL_CLI_PROFILE_RUN_ID:'22222222-3333-4444-8555-666666666666',
+   PAYMENT_STRIPE_BILLING_PORTAL_SUBNET:'10.254.81.0/28'}}};
+}
+
+async function portalFixtureHarness(fault){
+ const {configuration,receipts}=portalFixtureInputs(),{account,site,product,price,policy}=receipts;
+ const events=[],requests=[],writes=[];
+ let fixture,callbackInspection;
+ const fetch=async(url,settings)=>{
+  const path=new URL(url).pathname,method=settings.method,body=settings.body&&JSON.parse(settings.body);
+  events.push(method+' '+path);requests.push({path,method,body,headers:settings.headers});
+  let status=200,value=null;
+  if(path.endsWith('/auth/sessions')){
+   const response=new Response(null,{status:204});
+   Object.defineProperty(response.headers,'getSetCookie',{value:()=>['PAYMENT_ADMIN_SESSION=privateCookie; Path=/','XSRF-TOKEN=privateCsrf; Path=/']});
+   return response;
+  }
+  if(method==='GET'){
+   if(path.endsWith('/payment-accounts')||path.endsWith('/sites'))value=[];
+   else if(path.endsWith('/identity-providers'))value=[{mode:'EMAIL_OTP',readiness:'READY',status:'ACTIVE'}];
+   else if(path.endsWith('/subscription-policy'))value=fault==='v0-changed'?{...policy,version:1}:policy;
+   else if(path==='/inspection')value={count:0,duplicates:0,events:[]};
+   else if(path==='/inspection/digests')value=callbackInspection;
+   else if(path==='/api/v1/messages')value={total:0,messages:[]};
+   else assert.fail('unexpected GET');
+  }else if(path.endsWith('/payment-accounts')){status=201;value=account;}
+  else if(path.endsWith('/sites')){status=201;value=site;}
+  else if(path.endsWith('/products')){status=201;value=product;}
+  else if(path.endsWith('/prices')){status=201;value={...price,status:'DRAFT'};}
+  else if(path.endsWith('/publish'))value=fault==='foreign-price'?{...price,product_id:site.id}:price;
+  else if(path.endsWith('/subscription-policy')){
+   if(fault==='uncertain-http'){status=409;value={code:'PRIVATE_RESPONSE'};}
+   else value={site_id:site.id,...body,version:fault==='wrong-ack'?2:1};
+  }else if(path.endsWith('/callback'))value={site_id:site.id,enabled:true,secret_version:1,secret:'A'.repeat(43)};
+  else if(path==='/configure')status=204;
+  else assert.fail('unexpected mutation');
+  return new Response(status===204?null:JSON.stringify(value),{status});
+ };
+ const write=async(name,value)=>{
+  const kind=name.replace(/^billing-\d{3}-/,'').replace(/\.json$/,'');
+  if(kind===fault)throw Error('PRIVATE_WRITE_ERROR');
+  writes.push({kind,value});events.push('saved '+kind);
+ };
+ const bootstrap={
+  async verify(){
+   if(fault==='closed-before-policy-post'&&writes.at(-1)?.kind==='portal-policy-dispatch')await fixture.close();
+   return true;
+  },
+  withAdminCredentials:async callback=>callback({username:'owned',password:'privateAdmin'}),
+ };
+ fixture=await api.createBillingPortalFixture({configuration,bootstrap,cli:{validateBinding:async()=>true}},{fetch,write});
+ return {configuration,receipts,fixture,events,requests,writes,recordCallbackInspection:value=>{callbackInspection=value;}};
+}
+
+test('Portal requires its dedicated fixture and explicit admitted configuration before dependencies',async()=>{
+ const dependencies=new Proxy({}, {get(){assert.fail('nonadmitted fixture reached dependencies');}});
+ const {configuration}=portalFixtureInputs(),ordinary=portalPolicyInputs().configuration;
+ assert.equal(typeof api.createBillingPortalFixture,'function');
+ for(const input of [configuration,{...ordinary,env:configuration.env}])
+  await assert.rejects(api.createBillingFixture({configuration:input},dependencies),/billing_FIXTURE/);
+ for(const input of [ordinary,{...configuration,env:ordinary.env}])
+  await assert.rejects(api.createBillingPortalFixture({configuration:input},dependencies),/billing_FIXTURE/);
+});
+
+test('Portal writes one exact v1 policy after the owned price publish acknowledgement',async()=>{
+ const h=await portalFixtureHarness(),{fixture,events,requests,writes,receipts,configuration}=h;
+ const limits={deadline:Date.now()+5000};
+ assert.equal(fixture.resources().portalReturnUrl,undefined);
+ assert.equal(await fixture.provision(limits),true);
+ const expected=api.buildBillingPortalPolicyRequest(configuration,receipts);
+ const policyPath=new URL(expected.url).pathname;
+ const policyPosts=requests.filter(r=>r.method==='POST'&&r.path===policyPath);
+ assert.equal(policyPosts.length,1);
+ assert.deepEqual(policyPosts[0].body,expected.body);
+ assert.equal(policyPosts[0].headers['Idempotency-Key'].startsWith('billing:'),true);
+ const order=['saved publish-ack','GET '+policyPath,'saved portal-policy-dispatch','POST '+policyPath,
+  'saved portal-policy-ack','saved callback-dispatch','saved fixture'];
+ assert.deepEqual(events.filter(e=>order.includes(e)),order);
+ assert.equal(writes.find(r=>r.kind==='portal-policy-dispatch').value.phase,'DISPATCHING');
+ assert.equal(writes.find(r=>r.kind==='portal-policy-dispatch').value.policyVersion,0);
+ assert.equal(writes.find(r=>r.kind==='portal-policy-ack').value.phase,'ACKNOWLEDGED');
+ assert.equal(writes.find(r=>r.kind==='portal-policy-ack').value.policyVersion,1);
+ assert.equal(fixture.resources().portalReturnUrl,expected.body.portal_return_urls[0]);
+ assert.equal(fixture.resources().portalPolicyVersion,1);
+ assert.equal(fixture.resources().portalNavigationUrl,undefined);
+ assert.ok(!requests.some(r=>r.path.includes('/portal-sessions')));
+ assert.doesNotMatch(JSON.stringify(writes),/private(Admin|Cookie|Csrf)/);
+ const once=events.length;
+ await assert.rejects(()=>fixture.provision(limits),/billing_FIXTURE/);
+ assert.equal(events.length,once);
+ await fixture.close();
+ assert.equal(fixture.resources().portalReturnUrl,undefined);
+});
+
+for(const origin of ['owned','foreign-fixture','foreign-subscription','closed','forged-payment','pending-confirm','publication-unproved','callback-drift'])test('Portal flow binds the ready fixture policy: '+origin,async()=>{
+ const {fixture,configuration,receipts,writes,recordCallbackInspection}=await portalFixtureHarness();
+ const limits={deadline:Date.now()+5000};
+ const id=n=>String(n).padStart(8,'0')+'-2222-4333-8444-555555555555';
+ await fixture.provision(limits);
+ await fixture.acknowledgeCustomer({siteId:receipts.site.id,customerId:id(20)},limits);
+ await fixture.beforeDispatch('create','owned-create',undefined,limits);
+ await fixture.acknowledge('create',{subscriptionId:id(21),operationId:id(22)},limits);
+ await fixture.beforeDispatch('confirm','owned-confirm',{subscriptionId:id(21),operationId:id(22),attemptId:id(23)},limits);
+ if(origin!=='pending-confirm')await fixture.acknowledge('confirm',{attemptId:id(23),state:'OBSERVE',nextActionAllowed:false},limits);
+ const original=fixture.resources();
+ const scope=origin==='foreign-subscription'?{...original,subscriptionId:id(30)}:original;
+ if(origin==='closed')await fixture.close();
+ const now=Math.floor(Date.now()/1000),periodStart=now-10,periodEnd=now+3600;
+ const utc=epoch=>new Date(epoch*1000).toISOString();
+ const base={site_id:scope.siteId,customer_id:scope.customerId,subscription_id:scope.subscriptionId,product_id:scope.productId};
+ const payment={...base,schema_version:3,event_id:id(35),event_type:'payment.succeeded',payment_status:'SUCCEEDED',
+  payment_id:id(34),billing_record_id:id(33),amount_minor:2000,currency:'EUR',billing_kind:'INITIAL',price_id:scope.priceId,
+  price_version:1,period_start:utc(periodStart),period_end:utc(periodEnd)};
+ const paid={...base,schema_version:4,event_id:id(36),event_type:'subscription.updated',
+  state:'ACTIVE',access_allowed:true,revision:3,billing_record_id:id(33),payment_id:null};
+ const callbacks=[payment,paid].map(payload=>({id:payload.event_id,type:payload.event_type,delivered:true,payload}));
+ const inspection={count:2,duplicates:0,events:callbacks.map(({id,type,payload})=>({
+  event_id:id,event_type:type,count:1,sha256:billingCallbackDigest(payload),
+ }))};
+ recordCallbackInspection(origin==='callback-drift'?{...inspection,duplicates:1}:inspection);
+ const initialRow={customer_reference:'cus_fixture',subscription_reference:'sub_fixture',product_reference:'prod_fixture',
+  price_reference:'price_fixture',invoice_reference:'in_fixture',allocation_reference:'inpay_fixture',intent_reference:'pi_fixture',
+  period_start:periodStart,period_end:periodEnd,payment_id:id(34),billing_record_id:id(33),initial_unscheduled:true,
+  subscription_revision:3,cash_journal_ids:[id(35)],paid_journal_ids:[id(36)],callbacks,
+  proof:{cash:true,journal:true,original:true,webhook:true}};
+ const bootstrap={withDatabaseCredentials:async fn=>fn({})};
+ const baseline=await proveBillingEvidence({configuration,bootstrap,
+  fixture:{resources:()=>scope,inspectCallbacks:async()=>inspection}},limits,
+ {connect:()=>({begin:async(_mode,fn)=>fn({unsafe:async(_query,args)=>args?[initialRow]:[]}),end:async()=>{}})});
+ let openings=0,sqlCalls=0;
+ const page={},hostedDocument={},returnDocument={},digest='f'.repeat(64);
+ const flow=()=>createBillingPortalFlow({
+  configuration,scope,bootstrap,fixture:origin==='foreign-fixture'?{resources:()=>original}:fixture,
+ },{
+  verifyInitial:async()=>({baseline:origin==='forged-payment'?{...baseline}:baseline,
+   provider:{providerVerified:true,initialCashVerified:true,lineCount:1,allocationCount:1,chargeCount:1}}),
+  assertListener:async()=>true,
+  connect:()=>({begin:async(mode,fn)=>{
+   assert.equal(mode,'read only');
+   return fn({unsafe:async(_query,args)=>{
+    if(!args)return [];
+    sqlCalls++;
+    assert.equal(args[10],original.portalReturnUrl);
+    assert.equal(args[6],id(34));
+    return [{portal_verified:origin!=='publication-unproved'}];
+   }});
+  },end:async()=>{}}),
+  recordOpeningIntent:async()=>assert.fail('native flow must write the owned journal itself'),
+  async openPortal(port){
+   openings++;assert.equal(port.returnUrl,original.portalReturnUrl);
+   await port.beforeDispatch(digest);
+   const opening=await port.observe201({expiresAt:utc(now+120)});
+   return {opening,tab:page,document:hostedDocument,origin:'https://billing.stripe.com',providerMutationCount:0};
+  },
+  observeMerchantReturn:async()=>({tab:page,sourceDocument:hostedDocument,document:returnDocument,
+   initiator:'PROVIDER_DOCUMENT',method:'GET',url:original.portalReturnUrl,providerMutationCount:0}),
+  readReturnedSubscription:async()=>({tab:page,document:returnDocument,method:'GET',status:200,
+   siteId:scope.siteId,customerId:scope.customerId,subscriptionId:scope.subscriptionId,
+   billingStatus:'ACTIVE',access:{allowed:true,reason:'PAID'},revision:3,paidThrough:utc(periodEnd)}),
+ },limits);
+ const terminal=await flow().run();
+ const unproved=origin==='publication-unproved';
+ const reachedReturn=origin==='owned'||origin==='callback-drift';
+ assert.equal(terminal.code,origin==='owned'?'OK':origin==='callback-drift'?'PORTAL_PROOF_AFTER_RETURN':
+  origin==='forged-payment'?'PORTAL_INITIAL':unproved?'PORTAL_PROOF_BEFORE_OPEN':'PORTAL_POLICY');
+ assert.equal(openings,reachedReturn||unproved?1:0);
+ assert.equal(sqlCalls,reachedReturn?2:unproved?1:0);
+ const portalWrites=()=>writes.filter(row=>row.kind.startsWith('portal-session-')).map(row=>row.kind);
+ assert.deepEqual(portalWrites(),reachedReturn?['portal-session-dispatch','portal-session-ack']:unproved?['portal-session-dispatch']:[]);
+ if(unproved){
+  assert.equal((await flow().run()).code,'PORTAL_DISPATCH');
+  assert.deepEqual(portalWrites(),['portal-session-dispatch']);
+  assert.equal(sqlCalls,1);
+ }
+});
+
+for(const [fault,posts,intent,ack] of [
+ ['foreign-price',0,false,false],
+ ['v0-changed',0,false,false],
+ ['portal-policy-dispatch',0,false,false],
+ ['closed-before-policy-post',0,true,false],
+ ['uncertain-http',1,true,false],
+ ['wrong-ack',1,true,false],
+ ['portal-policy-ack',1,true,false],
+ ['fixture',1,true,true],
+])test('Portal stays fenced after '+fault,async()=>{
+ const {fixture,events,requests,writes,receipts}=await portalFixtureHarness(fault);
+ const limits={deadline:Date.now()+5000};
+ await assert.rejects(()=>fixture.provision(limits));
+ const once=events.length;
+ await assert.rejects(()=>fixture.provision(limits),/billing_FIXTURE/);
+ await assert.rejects(()=>fixture.acknowledgeCustomer({customerId:receipts.product.id,siteId:receipts.site.id},limits),/billing_FIXTURE/);
+ assert.equal(events.length,once);
+ assert.equal(fixture.resources().portalReturnUrl,undefined);
+ assert.equal(fixture.resources().portalPolicyVersion,undefined);
+ assert.equal(requests.filter(r=>r.method==='POST'&&r.path.endsWith('/subscription-policy')).length,posts);
+ assert.equal(writes.some(r=>r.kind==='portal-policy-dispatch'),intent);
+ assert.equal(writes.some(r=>r.kind==='portal-policy-ack'),ack);
+ assert.ok(!writes.some(r=>r.kind==='fixture'));
+});
+
+for(const fault of ['create-ack','confirm-ack'])test('Portal loses opening authority after an uncertain '+fault,async()=>{
+ const {fixture,receipts,writes}=await portalFixtureHarness(fault);
+ const limits={deadline:Date.now()+5000};
+ const id=n=>String(n).padStart(8,'0')+'-2222-4333-8444-555555555555';
+ const create={subscriptionId:id(21),operationId:id(22)};
+ const confirm={attemptId:id(23),state:'OBSERVE',nextActionAllowed:false};
+ const createAck=()=>fixture.acknowledge('create',create,limits);
+ const confirmDispatch=()=>fixture.beforeDispatch('confirm','owned-confirm',{...create,attemptId:id(23)},limits);
+ const confirmAck=()=>fixture.acknowledge('confirm',confirm,limits);
+ await fixture.provision(limits);
+ await fixture.acknowledgeCustomer({siteId:receipts.site.id,customerId:id(20)},limits);
+ await fixture.beforeDispatch('create','owned-create',undefined,limits);
+ if(fault==='create-ack') {
+  await assert.rejects(createAck,/PRIVATE_WRITE_ERROR/);
+  await assert.rejects(createAck,/billing_FIXTURE/);
+  await assert.rejects(confirmDispatch,/billing_FIXTURE/);
+  assert.ok(!writes.some(row=>row.kind==='confirm-dispatch'));
+ } else {
+  await createAck();
+  await confirmDispatch();
+  await assert.rejects(confirmAck,/PRIVATE_WRITE_ERROR/);
+  await assert.rejects(confirmAck,/billing_FIXTURE/);
+ }
+ assert.equal(api.billingPortalFixturePolicy(fixture,fixture.resources()),null);
+ await assert.rejects(()=>fixture.beforePortalOpening(fixture.resources(),'f'.repeat(64),limits),/billing_FIXTURE/);
+ assert.ok(!writes.some(row=>row.kind.startsWith('portal-session-')));
 });

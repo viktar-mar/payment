@@ -11,6 +11,41 @@ export interface BillingCancellationResult extends Omit<BillingResult,'scope'> {
   cancellationAccepted:boolean;
 }
 export function createOwnedBillingCancellation(options:unknown,dependencies?:Record<string,unknown>):Promise<{resources():BillingCancellationResult;run(journey:(port:BillingCancellationPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingCancellationResult>;close(limits?:BillingLimits):Promise<BillingCancellationResult>}>;
+declare const portalOpening: unique symbol;
+export interface BillingPortalOpeningPort {
+  readonly returnUrl:string;
+  beforeDispatch(keyDigest:string):Promise<true>;
+  observe201(receipt:{expiresAt:string}):Promise<{readonly [portalOpening]:true}>;
+}
+export interface BillingPortalDocument {tab:object; document:object}
+export interface BillingPortalBrowserContinuation {
+  openPortal(this:void,port:BillingPortalOpeningPort,limits:BillingLimits):Promise<BillingPortalDocument&{
+    opening:Awaited<ReturnType<BillingPortalOpeningPort['observe201']>>;
+    origin:'https://billing.stripe.com';
+    providerMutationCount:0;
+  }>;
+  observeMerchantReturn(this:void,hosted:BillingPortalDocument,limits:BillingLimits):Promise<BillingPortalDocument&{
+    sourceDocument:object; initiator:'PROVIDER_DOCUMENT'; method:'GET'; url:string; providerMutationCount:0;
+  }>;
+  readReturnedSubscription(this:void,returned:BillingPortalDocument,limits:BillingLimits):Promise<BillingPortalDocument&{
+    siteId:string; customerId:string; subscriptionId:string; method:'GET'; status:200; billingStatus:'ACTIVE';
+    access:{allowed:true; reason:'PAID'}; revision:number; paidThrough:string;
+  }>;
+}
+export interface BillingPortalPort extends BillingPort {
+  continuePortal(continuation:BillingPortalBrowserContinuation):Promise<true>;
+}
+export interface BillingPortalResult extends Omit<BillingResult,'scope'> {
+  scope:'INITIAL_PORTAL';
+  runId:string;
+  expectedSource:string;
+  portalAccepted:boolean;
+}
+export function createOwnedBillingPortal(options:unknown,dependencies?:Record<string,unknown>):Promise<{
+  resources():BillingPortalResult;
+  run(journey:(port:BillingPortalPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingPortalResult>;
+  close(limits?:BillingLimits):Promise<BillingPortalResult>;
+}>;
 export interface BillingResult {scope:'INITIAL_NON_CLOCK';initialAccepted:boolean;full5bAccepted:false;cleanupConfirmed:boolean;status:string;phase:string;code:string|null}
 export function createOwnedBillingAcceptance(options:unknown,dependencies?:Record<string,unknown>):Promise<{resources():BillingResult;run(journey:(port:BillingPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingResult>;close(limits?:BillingLimits):Promise<BillingResult>}>;
 

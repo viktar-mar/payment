@@ -9,7 +9,10 @@ import {preflightOwnedBilling} from './stripe-sandbox-owned.mjs';
 import {browserDiagnostic,browserCleanupConfirmed,browserProviderOrigin} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 import {billingBounded, billingCheck, billingError} from './stripe-billing-limits.mjs';
 import {createHash} from 'node:crypto';
-import {billingInitial3dsProvisionCheckpoint,billingUuid} from './stripe-billing-provision.mjs';
+import {isProxy} from 'node:util/types';
+import {billingInitial3dsProvisionCheckpoint,billingPortalFixturePolicy,billingUuid,createBillingPortalFixture} from './stripe-billing-provision.mjs';
+import {createBillingPortalFlow} from './stripe-billing-portal-flow.mjs';
+import {exactRecord} from './stripe-billing-failed-renewal-response.mjs';
 
 /** Inert admission. Native capabilities are constructed only by the explicit, single-use run. */
 export async function createOwnedBillingAcceptance(options,dependencies={}) {
@@ -30,7 +33,11 @@ export async function createOwnedBillingInvoiceWebhooks(options,dependencies={})
 export async function createOwnedBillingRequiredTrial(options,dependencies={}) {
  return createOwner(options,dependencies,'initial_required_trial');
 }
+export async function createOwnedBillingPortal(options,dependencies={}) {
+ return createOwner(options,dependencies,'initial_portal');
+}
 async function createOwner(options,dependencies,selectedCase) {
+ const portal=selectedCase==='initial_portal';
  const invoiceCase=selectedCase==='initial_missed_reordered',requiredTrial=selectedCase==='initial_required_trial';
  let trialStage='create';
  let ingress;
@@ -42,7 +49,7 @@ async function createOwner(options,dependencies,selectedCase) {
  let finishRun;const finished=new Promise(resolve=>finishRun=resolve);
  let state='NEW',phase='NEW',failure=null,bootstrap,cli,fixture,cleanupPromise,active,accepted=false,cleanupConfirmed=false;
  const lifetime=new AbortController(),counts={create:0,confirm:0},acks={create:false,confirm:false};
- const resources=()=>Object.freeze({runId:configuration.runId,expectedSource:configuration.expectedSource,scope:requiredTrial?'INITIAL_REQUIRED_TRIAL':invoiceCase?'INITIAL_MISSED_REORDERED':challenge?'INITIAL_3DS':retry?'INITIAL_DECLINE_RETRY':cancellation?'INITIAL_CANCEL_WITHDRAW':'INITIAL_NON_CLOCK',status:state,phase,code:failure,initialAccepted:!requiredTrial&&accepted,...(requiredTrial?{requiredTrialAccepted:accepted}:{}),...(cancellation?{cancellationAccepted:accepted}:{}),...(retry?{declineRetryAccepted:accepted}:{}),...(challenge?{initial3dsAccepted:accepted}:{}),...(invoiceCase?{invoiceWebhooksAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
+ const resources=()=>Object.freeze({runId:configuration.runId,expectedSource:configuration.expectedSource,scope:portal?'INITIAL_PORTAL':requiredTrial?'INITIAL_REQUIRED_TRIAL':invoiceCase?'INITIAL_MISSED_REORDERED':challenge?'INITIAL_3DS':retry?'INITIAL_DECLINE_RETRY':cancellation?'INITIAL_CANCEL_WITHDRAW':'INITIAL_NON_CLOCK',status:state,phase,code:failure,initialAccepted:!requiredTrial&&accepted,...(requiredTrial?{requiredTrialAccepted:accepted}:{}),...(cancellation?{cancellationAccepted:accepted}:{}),...(retry?{declineRetryAccepted:accepted}:{}),...(challenge?{initial3dsAccepted:accepted}:{}),...(invoiceCase?{invoiceWebhooksAccepted:accepted}:{}),...(portal?{portalAccepted:accepted}:{}),full5bAccepted:false,cleanupConfirmed});
  const fail=code=>{failure??=code;lifetime.abort();throw billingError(failure);};
  async function cleanup() {
   if(cleanupPromise)return cleanupPromise;
@@ -86,7 +93,10 @@ async function createOwner(options,dependencies,selectedCase) {
     await step('BINDING',()=>cli.validateBinding(active));
     await step('LISTENER',l=>cli.startListener(l));
     await step('START',l=>bootstrap.start(l),2700000);
-    fixture=await step('FIXTURE',async()=>{const factory=dependencies.createFixture??(await import('./stripe-billing-provision.mjs')).createBillingFixture;return factory({configuration,bootstrap,cli});});
+    fixture=await step('FIXTURE',async()=>{
+     const factory=dependencies.createFixture??(portal?createBillingPortalFixture:(await import('./stripe-billing-provision.mjs')).createBillingFixture);
+     return factory({configuration,bootstrap,cli});
+    });
     let provisionLimits;
     try{await step('PROVISION',l=>{provisionLimits=l;return fixture.provision(l);});}
     catch(error){
@@ -99,8 +109,14 @@ async function createOwner(options,dependencies,selectedCase) {
      if(!acks.create||!acks.confirm)fail('ACK');
      const proof=await step('EVIDENCE',async l=>{const prove=dependencies.prove??(await import('./stripe-billing-evidence.mjs')).proveBillingEvidence;return prove({configuration,bootstrap,fixture},l);},120000);
      if(!proof||!['cashVerified','journalVerified','signedCallbacksVerified'].every(k=>proof[k]===true))fail('EVIDENCE');
-     await step('GRAPH',async l=>{if(await cli.bindOwnedBillingGraph(proof.graph,l)!==true)fail('EVIDENCE');const p=await cli.observeOwnedBillingGraph(l);if(p?.providerVerified!==true||p.initialCashVerified!==true||p.lineCount!==1||p.allocationCount!==1||p.chargeCount!==1)fail('EVIDENCE');});
-     return proof;
+     const provider=await step('GRAPH',async l=>{
+      if(await cli.bindOwnedBillingGraph(proof.graph,l)!==true)fail('EVIDENCE');
+      const observed=await cli.observeOwnedBillingGraph(l);
+      if(observed?.providerVerified!==true||observed.initialCashVerified!==true||
+        observed.lineCount!==1||observed.allocationCount!==1||observed.chargeCount!==1)fail('EVIDENCE');
+      return observed;
+     });
+     return portal?{baseline:proof,provider}:proof;
     }
     let next='baseline',baseline;
     const operations=Object.create(null);
@@ -112,6 +128,40 @@ async function createOwner(options,dependencies,selectedCase) {
     const invoiceFlow=invoiceCase?invoiceWebhookFlow({configuration,bootstrap,cli,fixture,ingress,active,step,fail,createEvidence:dependencies.createInvoiceEvidence}):null;
     const retryFlow=retry?initialRetryFlow({configuration,bootstrap,cli,fixture,active,step,fail,prove:dependencies.proveInitialRetry}):null;
     const challengeFlow=challenge?initialChallengeFlow({configuration,bootstrap,cli,fixture,active,step,fail,prove:dependencies.proveInitial3ds}):null;
+    const portalSent={create:false,confirm:false};
+    let portalStage='ready',portalCustomer='awaiting';
+    async function continuePortal(browser) {
+     billingCheck(active);if(failure)fail(failure);
+     if(portalStage!=='ready'||!acks.create||!acks.confirm)fail('PORTAL_ORDER');
+     portalStage='running';
+     const methods=['openPortal','observeMerchantReturn','readReturnedSubscription'];
+     let continuation;
+     try {
+      if(isProxy(browser))fail('PORTAL_ORDER');
+      continuation=exactRecord(browser,methods);
+      if(methods.some(name=>typeof continuation[name]!=='function'||isProxy(continuation[name])))fail('PORTAL_ORDER');
+     }catch{fail('PORTAL_ORDER');}
+     const scope=fixture.resources();
+     if(scope.runId!==configuration.runId||scope.expectedSource!==configuration.expectedSource||
+       scope.siteKey!=='s5a-'+configuration.runId.replaceAll('-','')||
+       ['backend','demo','receiver'].some(name=>scope.endpoints?.[name]!=='http://127.0.0.1:'+configuration.ports[name])||
+       !billingPortalFixturePolicy(fixture,scope))fail('PORTAL_POLICY');
+     const proof=await verifyInitial();
+     const {openPortal,observeMerchantReturn,readReturnedSubscription}=continuation;
+     await step('PORTAL',async limits=>{
+      const flow=createBillingPortalFlow({configuration,scope,fixture,bootstrap},{
+       verifyInitial:()=>proof,
+       assertListener:l=>cli.assertBillingListener(l),
+       connect:dependencies.portalConnect,
+       openPortal:(port,l)=>openPortal(port,l),
+       observeMerchantReturn:(witness,l)=>observeMerchantReturn(witness,l),
+       readReturnedSubscription:(witness,l)=>readReturnedSubscription(witness,l),
+      },limits);
+      const result=await flow.run();
+      if(result.portalAccepted!==true)fail(result.code);
+     },240000);
+     portalStage='complete';return true;
+    }
     function claimTrial(stage,next){
      billingCheck(active);
      if(failure||trialStage!==stage)fail('TRIAL_ORDER');
@@ -132,16 +182,23 @@ async function createOwner(options,dependencies,selectedCase) {
      beforeDispatch:async(kind,key,identity)=>{
       billingCheck(active);if(failure)fail(failure);
       if(!['create','confirm'].includes(kind)||counts[kind]!==0||(kind==='confirm'&&!acks.create))fail('DISPATCH');
+      if(portal&&(portalCustomer!=='ready'||!billingUuid(key)||
+        (kind==='confirm'&&createHash('sha256').update(key).digest('hex')===fixture.resources().createKeyHash)))fail('DISPATCH');
       if(requiredTrial){
        if(kind!=='create'||!billingUuid(key))fail('DISPATCH');
        claimTrial('create','create-in-flight');
       }
       counts[kind]++;await step('DISPATCH',async l=>{if(await cli.assertBillingListener(l)!==true||await fixture.beforeDispatch(kind,key,identity,l)!==true)fail('DISPATCH');});
+      if(portal)portalSent[kind]=true;
       if(requiredTrial)trialStage='create-sent';return true;
      },
      acknowledge:async(kind,identity)=>{
       billingCheck(active);if(failure)fail(failure);
       if(!['create','confirm'].includes(kind)||counts[kind]!==1||acks[kind]||identity?.state==='UNKNOWN')fail('ACK');
+      if(portal){
+       if(!portalSent[kind])fail('ACK');
+       portalSent[kind]=false;
+      }
       if(requiredTrial)claimTrial('create-sent','creating');
       if(await step('ACK',l=>fixture.acknowledge(kind,identity,l))!==true)fail('ACK');
       acks[kind]=true;if(requiredTrial)trialStage='permit';return true;
@@ -149,6 +206,12 @@ async function createOwner(options,dependencies,selectedCase) {
      withOtpCode:async(callback,l)=>{billingCheck(active);return fixture.withOtpCode(callback,{deadline:Math.min(active.deadline,l.deadline),signal:active.signal});},
      acknowledgeCustomer:async(value)=>{
       billingCheck(active);
+      if(portal){
+       if(portalCustomer!=='awaiting')fail('CUSTOMER');
+       portalCustomer='writing';
+       await step('CUSTOMER',async l=>{if(await fixture.acknowledgeCustomer(value,l)!==true)fail('CUSTOMER');});
+       portalCustomer='ready';return true;
+      }
       if(requiredTrial)return step('CUSTOMER',async l=>{
        if(await fixture.acknowledgeCustomer(value,l)!==true)fail('CUSTOMER');
        return true;
@@ -172,6 +235,7 @@ async function createOwner(options,dependencies,selectedCase) {
      ...(invoiceFlow?.port),
      ...(retryFlow?.port),
      ...(challengeFlow?.port),
+     ...(portal?{continuePortal}:{}),
      ...(cancellation?{
       async verifyInitial(){claim('baseline');baseline=await verifyInitial();next='schedule';return true;},
       async beforeCancellation(kind,key){
@@ -212,7 +276,7 @@ async function createOwner(options,dependencies,selectedCase) {
      }:{}),
     });
     const browserResult=await step('BROWSER',async()=>{
-     const guarded=retry||challenge||invoiceCase||cancellation||requiredTrial;
+     const guarded=retry||challenge||invoiceCase||cancellation||requiredTrial||portal;
      const execution=Promise.resolve().then(()=>{billingCheck(active);return browserJourney(port,active);});
      if(guarded)browserCompletion=execution.then(result=>result===true,
       error=>browserDiagnostic(error,'ACCEPTANCE')!==null&&browserCleanupConfirmed(error));
@@ -237,7 +301,10 @@ async function createOwner(options,dependencies,selectedCase) {
       throw error;
      }
     },2700000);
-    if(requiredTrial){
+    if(portal){
+     if(browserResult!==true)fail('BROWSER');
+     if(portalStage!=='complete')fail('PORTAL_ORDER');
+    }else if(requiredTrial){
      if(browserResult!==true)fail('BROWSER');
      claimTrial('complete','verification');
      if(await step('TRIAL_EVIDENCE',async l=>{

@@ -13,7 +13,10 @@ const INVOICE_WEBHOOKS_CLI_PROFILE_RUN_ID='PAYMENT_STRIPE_BILLING_INVOICE_WEBHOO
 const INVOICE_WEBHOOKS_NETWORK_SUBNET='PAYMENT_STRIPE_BILLING_INVOICE_WEBHOOKS_SUBNET';
 const REQUIRED_TRIAL_CLI_PROFILE_RUN_ID='PAYMENT_STRIPE_BILLING_REQUIRED_TRIAL_CLI_PROFILE_RUN_ID';
 const REQUIRED_TRIAL_NETWORK_SUBNET='PAYMENT_STRIPE_BILLING_REQUIRED_TRIAL_SUBNET';
+export const PORTAL_CLI_PROFILE_RUN_ID='PAYMENT_STRIPE_BILLING_PORTAL_CLI_PROFILE_RUN_ID';
+export const PORTAL_NETWORK_SUBNET='PAYMENT_STRIPE_BILLING_PORTAL_SUBNET';
 const requiredTrialCase='initial_required_trial';
+const portalCase='initial_portal';
 const cancelCase='initial_cancel_withdraw';
 const invoiceCase='initial_missed_reordered';
 const challengeCase='initial_3ds';
@@ -22,9 +25,11 @@ const OTHER_BILLING=['PAYMENT_STRIPE_BILLING_FAILED_RENEWAL','PAYMENT_STRIPE_BIL
 const EXCLUDED=['ALLOW_TEST_OPERATIONS','FULL_RUN','OWNED_RUN','REMAINING_ONLY','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT','MANUAL_3DS','MANUAL_REFUND','MANUAL_REFUND_REMAINDER'].map(name=>'PAYMENT_STRIPE_SANDBOX_'+name).concat(OTHER_BILLING);
 const OLD_RUNS=new Set(['031b5ae7-6603-4339-b1b3-77231291ff34','34941d87-12d3-4c74-8c5a-b62b7c914390']);
 const PROFILE_FLAGS=[[RETRY_CLI_PROFILE_RUN_ID,retryCase],[THREE_DS_CLI_PROFILE_RUN_ID,challengeCase],
-  [CANCELLATION_CLI_PROFILE_RUN_ID,cancelCase],[INVOICE_WEBHOOKS_CLI_PROFILE_RUN_ID,invoiceCase],[REQUIRED_TRIAL_CLI_PROFILE_RUN_ID,requiredTrialCase]];
+  [CANCELLATION_CLI_PROFILE_RUN_ID,cancelCase],[INVOICE_WEBHOOKS_CLI_PROFILE_RUN_ID,invoiceCase],
+  [REQUIRED_TRIAL_CLI_PROFILE_RUN_ID,requiredTrialCase],[PORTAL_CLI_PROFILE_RUN_ID,portalCase]];
 const SUBNET_FLAGS=[[RETRY_NETWORK_SUBNET,retryCase],[THREE_DS_NETWORK_SUBNET,challengeCase],
-  [CANCELLATION_NETWORK_SUBNET,cancelCase],[INVOICE_WEBHOOKS_NETWORK_SUBNET,invoiceCase],[REQUIRED_TRIAL_NETWORK_SUBNET,requiredTrialCase]];
+  [CANCELLATION_NETWORK_SUBNET,cancelCase],[INVOICE_WEBHOOKS_NETWORK_SUBNET,invoiceCase],
+  [REQUIRED_TRIAL_NETWORK_SUBNET,requiredTrialCase],[PORTAL_NETWORK_SUBNET,portalCase]];
 const RUNTIME_FLAGS=[...PROFILE_FLAGS,...SUBNET_FLAGS].map(([key])=>key);
 const FLAGS=[FLAG,CASE,...RUNTIME_FLAGS,'PAYMENT_STRIPE_SANDBOX_ENABLED',...EXCLUDED,'DEBUG','NODE_DEBUG','PWDEBUG','PW_TRACE'];
 function descriptors(value){if(!value||typeof value!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(value)))throw null;return Object.getOwnPropertyDescriptors(value);}
@@ -56,8 +61,9 @@ function admittedFlags(d){
       if(!isIPv4(address)||Number(address.split('.').at(-1))%16!==0)return false;
     }
     if(d[CASE]?.value===requiredTrialCase&&!Object.hasOwn(d,REQUIRED_TRIAL_CLI_PROFILE_RUN_ID))return false;
+    if(d[CASE]?.value===portalCase&&!Object.hasOwn(d,PORTAL_CLI_PROFILE_RUN_ID))return false;
     return data(d,FLAG)==='true'&&data(d,'PAYMENT_STRIPE_SANDBOX_ENABLED')==='true'&&EXCLUDED.every(k=>[undefined,'','false'].includes(d[k]?.value))
-      &&(!d[CASE] || [cancelCase,retryCase,challengeCase,invoiceCase,requiredTrialCase].includes(data(d,CASE)))
+      &&(!d[CASE] || [cancelCase,retryCase,challengeCase,invoiceCase,requiredTrialCase,portalCase].includes(data(d,CASE)))
       &&[undefined,''].includes(d.DEBUG?.value)&&[undefined,''].includes(d.NODE_DEBUG?.value)&&[undefined,'','0'].includes(d.PWDEBUG?.value)&&[undefined,'','off'].includes(d.PW_TRACE?.value);
 }
 /** Pure admission. The generated snapshot is also accepted, without widening authority. */
@@ -73,7 +79,8 @@ export function validateBillingAcceptanceOptions(value){
     const bd=descriptors(input.approvedBinding);if(Reflect.ownKeys(bd).length!==2||data(bd,'externalAccountId')!=='acct_1UPiMpELswAd8tpR'||data(bd,'apiVersion')!=='2026-09-30.endive')return null;
     const protocol=selectedCase===requiredTrialCase?'BROWSER_CONFIRM_V1':'SERVER_CONFIRM_V2';
     if(d.protocol&&data(d,'protocol')!==protocol)return null;
-    const expectedBudget=selectedCase===requiredTrialCase?{create:1,setupPermit:1,setupConfirm:1}:selectedCase===invoiceCase?{create:1,confirm:1,reconcile:1,deliver:2}:selectedCase===challengeCase?{create:1,confirm:1,nextAction:1}:selectedCase===retryCase?{create:1,confirm:2,retry:1}:selectedCase===cancelCase?{create:1,confirm:1,schedule:1,withdraw:1}:{create:1,confirm:1};
+    const expectedBudget=selectedCase===requiredTrialCase?{create:1,setupPermit:1,setupConfirm:1}:selectedCase===invoiceCase?{create:1,confirm:1,reconcile:1,deliver:2}:selectedCase===challengeCase?{create:1,confirm:1,nextAction:1}:selectedCase===retryCase?{create:1,confirm:2,retry:1}:selectedCase===cancelCase?{create:1,confirm:1,schedule:1,withdraw:1}
+      :selectedCase===portalCase?{create:1,confirm:1,portal:1}:{create:1,confirm:1};
     if(d.budget){const budget=descriptors(data(d,'budget'));if(Reflect.ownKeys(budget).length!==Object.keys(expectedBudget).length||Object.keys(expectedBudget).some(k=>data(budget,k)!==expectedBudget[k]))return null;}
     const runtime=Object.fromEntries(RUNTIME_FLAGS.filter(key=>Object.hasOwn(flags,key)).map(key=>[key,data(flags,key)]));
     return Object.freeze({...base,env:Object.freeze({PAYMENT_STRIPE_SANDBOX_ENABLED:'true',[FLAG]:'true',...(selectedCase==='initial_success'?{}:{[CASE]:selectedCase}),

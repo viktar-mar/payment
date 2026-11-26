@@ -4,11 +4,16 @@ import {readFile} from 'node:fs/promises';
 import {billingUuid} from './stripe-billing-provision.mjs';
 import {billingBounded,billingCheck,billingError} from './stripe-billing-limits.mjs';
 const need=v=>{if(!v)throw billingError('EVIDENCE');};
-// Only an accepted initial payment from this invocation can anchor a cancellation proof.
-const cancellationOrigins=new WeakMap();
-export function billingCancellationOrigin(baseline) { return cancellationOrigins.get(baseline); }
+// Only this invocation's initial payment can anchor a follow-up proof for the same case.
+const initialOrigins=new WeakMap();
+function originFor(baseline,selectedCase) {
+ const entry=initialOrigins.get(baseline);
+ return entry?.selectedCase===selectedCase?entry.origin:undefined;
+}
+export const billingCancellationOrigin=baseline=>originFor(baseline,'initial_cancel_withdraw');
+export const billingPortalOrigin=baseline=>originFor(baseline,'initial_portal');
 
-function captureCancellationOrigin(result,row,inspection) {
+function captureInitialOrigin(selectedCase,result,row,inspection) {
  const [cashEventId]=row.cash_journal_ids??[],[paidEventId]=row.paid_journal_ids??[];
  const identity={paymentId:row.payment_id,billingRecordId:row.billing_record_id,cashEventId,paidEventId};
  need(Object.values(identity).every(billingUuid)&&new Set(Object.values(identity)).size===4
@@ -21,7 +26,7 @@ function captureCancellationOrigin(result,row,inspection) {
  need(row.initial_unscheduled===true&&/^[0-9]+$/.test(String(row.subscription_revision))
    &&Number.isSafeInteger(revision)&&Number.isSafeInteger(paid.revision)&&paid.revision<=revision);
  const callbackDigests=Object.freeze(Object.fromEntries(inspection.events.map(event=>[event.event_id,event.sha256])));
- cancellationOrigins.set(result,Object.freeze({...identity,revision,callbackDigests}));
+ initialOrigins.set(result,Object.freeze({selectedCase,origin:Object.freeze({...identity,revision,callbackDigests})}));
 }
 
 const canonical=p=>JSON.stringify(Object.fromEntries(Object.keys(p).sort().map(k=>[k,p[k]])));
@@ -100,6 +105,7 @@ async function readInitialEvidence({configuration,bootstrap,fixture},limits,depe
   }finally{if(sql)await billingBounded({deadline:Date.now()+5000},()=>sql.end({timeout:0}),5000);}
  },limits)===true);billingCheck(limits);need(result);
  const inspection=await fixture.inspectCallbacks(limits);billingCheck(limits);const baseline=validateBillingEvidence(scope,result,inspection);
- if(configuration.selectedCase==='initial_cancel_withdraw')captureCancellationOrigin(baseline,result,inspection);
+ if(['initial_cancel_withdraw','initial_portal'].includes(configuration.selectedCase))
+  captureInitialOrigin(configuration.selectedCase,baseline,result,inspection);
  return baseline;
 }
