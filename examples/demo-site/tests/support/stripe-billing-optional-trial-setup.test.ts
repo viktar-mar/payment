@@ -6,7 +6,7 @@ import {browserCleanupConfirmed,browserDiagnostic} from '../../../../infrastruct
 // @ts-ignore Native Node executes the same protocol fixture registration.
 import {registerChromiumProtocolFixture} from './stripe-billing-chromium-route.ts';
 // @ts-ignore Native Node executes the same source as Playwright.
-import {optionalTrialSetupExchange,runOptionalTrialSetupBrowser,type OptionalTrialSetupPermit} from './stripe-billing-optional-trial-setup.ts';
+import {optionalTrialSetupExchange,runOptionalTrialSetupBrowser,type OptionalTrialSetupPermit,type OptionalTrialScriptWitness} from './stripe-billing-optional-trial-setup.ts';
 
 const permit:OptionalTrialSetupPermit = {
   setupIntentId:'seti_owned', publishableKey:'pk_test_fixture', clientSecret:'seti_owned_secret_fixture',
@@ -92,13 +92,13 @@ for(const fault of ['other request','other intent','other secret','live','requir
 }
 
 // Runs the real routing and page callbacks against VM DOM and CDP values only.
-function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'trusted types asset'|'easel query'|'easel delayed'|'other main asset'|'delayed element ready'|'element load error'|'missing card number'|'element no session'|'element no response'|'element no ready event'|'unobserved helper read'|'helper without response'|'late helper response',onHelperResponse=()=>{}){
+function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'trusted types asset'|'easel query'|'easel bare query'|'easel delayed'|'other main asset'|'delayed element ready'|'element load error'|'missing card number'|'element no session'|'element no response'|'element no ready event'|'unobserved helper read'|'helper without response'|'late helper response',onHelperResponse=()=>{}){
   const picked={...permit,setupIntentId:'seti_'+mode.replaceAll(' ',''),
     clientSecret:'seti_'+mode.replaceAll(' ','')+'_secret_fixture'};
   const url='https://api.stripe.com/v1/setup_intents/'+picked.setupIntentId+'/confirm';
   const sessionUrl='https://api.stripe.com/v1/elements/sessions';
   const easel='https://js.stripe.com/v3/fingerprinted/js/elements-easel-frame-'+'a'.repeat(32)+'.js';
-  const extraScript=mode==='easel asset'||mode==='easel delayed'?easel:mode==='easel query'?easel+'?mode=synthetic':
+  const extraScript=mode==='easel asset'||mode==='easel delayed'?easel:mode==='easel query'?easel+'?mode=synthetic':mode==='easel bare query'?easel+'?':
     mode==='trusted types asset'?easel.replace('elements-easel-frame','trusted-types-checker'):
     mode==='other main asset'?easel.replace('elements-easel-frame','unreviewed'):undefined;
   let path='about:blank',closed=0,nextId=0,trustChecks=0,childLoads=0,extraLoads=0;
@@ -107,6 +107,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
   const listeners=new Map<string,((event?:unknown)=>void)[]>();
   const emit=(name:string,event?:unknown)=>{for(const listener of listeners.get(name)??[])listener(event);};
   const writes:string[]=[];
+  const scriptWitnesses:OptionalTrialScriptWitness[]=[];
   const found=Promise.withResolvers<Response>();
   const assetPaused=Promise.withResolvers<void>(), resumeAsset=Promise.withResolvers<void>();
   let delayedAsset:Promise<void>|undefined;
@@ -309,8 +310,8 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
   }
   registerChromiumProtocolFixture(page);
   const browser={newContext:async()=>context} as unknown as Browser;
-  return {browser,picked,writes,url,closed:()=>closed,childLoads:()=>childLoads,extraLoads:()=>extraLoads,run:(timeout=2000)=>runOptionalTrialSetupBrowser(browser,picked,
-    {deadline:Date.now()+timeout},()=>false)};
+  return {browser,picked,writes,url,scriptWitnesses,closed:()=>closed,childLoads:()=>childLoads,extraLoads:()=>extraLoads,run:(timeout=2000)=>runOptionalTrialSetupBrowser(browser,picked,
+    {deadline:Date.now()+timeout},()=>false,witness=>{scriptWitnesses.push(witness);})};
 }
 
 test('the held document forwards one original charge-free setup POST after one trusted keyboard gesture',async()=>{
@@ -374,12 +375,17 @@ test('a paused entry dependency loses main-frame authority at confirmation',asyn
   assert.deepEqual(f.writes,[]);
 });
 
-for(const mode of ['easel query','other main asset'] as const)
+for(const mode of ['easel query','easel bare query','other main asset'] as const)
 test('the setup document refuses an unreviewed main-frame script on '+mode,async()=>{
   const f=checkout(mode);
   await assert.rejects(f.run(),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')==='BROWSER_SETUP_ROUTE_FRAME_MAIN_SCRIPT');
   assert.equal(f.extraLoads(),0);
   assert.deepEqual(f.writes,[]);
+  const name=mode==='other main asset'?'unreviewed':'elements-easel-frame';
+  assert.deepEqual(f.scriptWitnesses,[{
+    path:'/v3/fingerprinted/js/'+name+'-'+'a'.repeat(32)+'.js',
+    queryPresent:mode!=='other main asset', phase:'PRESENTATION',
+  }]);
 });
 
 for(const [fault,code] of [['cookie','BROWSER_PROVIDER_AUTH'],['foreign parent','BROWSER_SETUP_ROUTE_FRAME_CHILD_NAVIGATION']] as const)

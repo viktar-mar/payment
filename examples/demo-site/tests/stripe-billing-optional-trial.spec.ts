@@ -1,4 +1,6 @@
 import {test} from '@playwright/test';
+import {mkdirSync,writeFileSync} from 'node:fs';
+import {join} from 'node:path';
 import {createOwnedBillingOptionalTrial} from '../../../infrastructure/stripe-billing-optional-trial-run.mjs';
 import {snapshotBillingOptionalTrialEnvironment} from '../../../infrastructure/stripe-billing-optional-trial-options.mjs';
 import {billingRunSettingsAllowed} from './support/stripe-billing-failed-renewal-settings';
@@ -25,6 +27,12 @@ test.beforeAll(async ({},info)=>{
     approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'}});
 });
 test('OWNED_OPTIONAL_TRIAL_PAUSE_RESUME',async ({browser},info)=>{
+  const outputDirectory=info.project.outputDir;
   await runOptionalTrialCase(owner,(permit,limits)=>runOptionalTrialSetupBrowser(
-    browser,permit,limits,loadFailedRenewalStaticOriginMatcher()),info.annotations);
+    browser,permit,limits,loadFailedRenewalStaticOriginMatcher(),witness=>{
+      // Preserve just this public-asset witness after Playwright discards per-test output.
+      mkdirSync(outputDirectory,{recursive:true,mode:0o700});
+      writeFileSync(join(outputDirectory,'optional-trial-script-witness.json'),
+        JSON.stringify(witness)+'\n',{flag:'wx',mode:0o600});
+    }),info.annotations);
 });

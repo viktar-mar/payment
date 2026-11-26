@@ -21,6 +21,12 @@ export interface OptionalTrialSetupPermit {
   readonly expiresAt:string;
 }
 
+export interface OptionalTrialScriptWitness {
+  readonly path:string|null;
+  readonly queryPresent:boolean;
+  readonly phase:'PRESENTATION'|'AFTER_ACTIVATION';
+}
+
 const refused=()=>new Error('billing_OPTIONAL_TRIAL_SETUP_BROWSER');
 function need(value:unknown):asserts value {if(!value)throw refused();}
 function terminalFailure(cleanupConfirmed:boolean,code='BROWSER') {
@@ -109,7 +115,7 @@ export function optionalTrialSetupExchange(permit:OptionalTrialSetupPermit) {
 
 /** No application requests are made from this isolated checkout document. */
 export async function runOptionalTrialSetupBrowser(browser:Browser,permit:OptionalTrialSetupPermit,owner:BillingLimits,
-    matchesStaticOrigin:(origin:string)=>boolean):Promise<true> {
+    matchesStaticOrigin:(origin:string)=>boolean,retainScriptWitness?:(witness:OptionalTrialScriptWitness)=>void):Promise<true> {
   const granted=Object.freeze({setupIntentId:permit?.setupIntentId,publishableKey:permit?.publishableKey,
     clientSecret:permit?.clientSecret,expiresAt:permit?.expiresAt});
   let expiresAt:number;
@@ -256,6 +262,12 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
             confirming?'BROWSER_SETUP_ROUTE_FRAME_CONFIRM':'BROWSER_SETUP_ROUTE_FRAME_ENTRY';
         }
         const before=stripeFrames(page,request,childNavigation,allowMain(),demo);
+        if(!before && ownScript && routeFrame===page.mainFrame() && target.hostname==='js.stripe.com'){
+          const publicAsset=/^\/v3\/fingerprinted\/js\/[a-z0-9-]{1,80}-[a-f0-9]{32}\.js$/;
+          const path=publicAsset.test(target.pathname)?target.pathname:null;
+          try{retainScriptWitness?.({path,queryPresent:raw.includes('?'),phase:active?'AFTER_ACTIVATION':'PRESENTATION'});}
+          catch{/* Diagnostic write failure leaves the route denied. */}
+        }
         need(before && (!navigation || childNavigation));
         redirects.registerRoute(request);
         routeCheckpoint='BROWSER_PROVIDER_HEADERS';
