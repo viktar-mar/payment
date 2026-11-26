@@ -57,6 +57,21 @@ class OwnedOptionalTrialPaymentConfirmationSdkTest {
         assertThat(f.http.calls).hasSize(1);
     }
 
+    @Test void aBadOpenIntentReportsTheReadStageWithoutPostingOrLeakingItsContents() {
+        var body = json(succeeded());
+        body.addProperty("status","requires_action");
+        body.addProperty("client_secret","PRIVATE_RESPONSE");
+        f.http.reply(body.toString());
+        var client = f.clients.create(f.credentials.resolve(f.account));
+        assertThatThrownBy(() -> OwnedOptionalTrialPaymentConfirmation.verifyOpenIntent(client,
+                "cus_scoped","pi_resume","pm_scoped"))
+            .hasMessage("OPTIONAL_TRIAL_PAY_OPEN_INTENT").hasNoCause();
+        assertThat(f.http.calls).singleElement().satisfies(call -> {
+            assertThat(call.method().name()).isEqualTo("GET");
+            assertThat(call.url().getPath()).isEqualTo("/v1/payment_intents/pi_resume");
+        });
+    }
+
     private String confirm() throws Exception {
         var client = f.clients.create(f.credentials.resolve(f.account));
         return OwnedOptionalTrialPaymentConfirmation.postConfirm(client, "cus_scoped", "pi_resume", "pm_scoped", "owned-resume:CONFIRM");

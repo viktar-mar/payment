@@ -193,8 +193,8 @@ public final class OwnedOptionalTrialAcceptance {
         }
     }
 
-    private static final class PhaseFailure extends IllegalStateException {
-        private PhaseFailure(String code) {
+    static final class PhaseFailure extends IllegalStateException {
+        PhaseFailure(String code) {
             super(code);
         }
     }

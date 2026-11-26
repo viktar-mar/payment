@@ -8,6 +8,7 @@ export interface OptionalTrialBrowserPermit {
 }
 
 export function isOptionalTrialResumeDiagnostic(code: unknown): boolean;
+export function isOptionalTrialPayDiagnostic(code: unknown): boolean;
 
 export function createOwnedBillingOptionalTrial(options: unknown): {
   run(journey: (permit: OptionalTrialBrowserPermit, limits: BillingLimits) => Promise<true>, limits: BillingLimits): Promise<unknown>;

@@ -109,6 +109,10 @@ test('runs only the original scope, with evidence before pay and cleanup before 
 const resumeStop = {
   stage:'OPTIONAL_TRIAL_STOPPED',code:'OPTIONAL_TRIAL_RESUME_STRIPE_BILLING_CYCLE_ANCHOR',
 };
+const payStop = {
+  stage:'OPTIONAL_TRIAL_STOPPED',code:'OPTIONAL_TRIAL_PAY_STRIPE_INVALID_REQUEST',
+};
+const paymentObservation = {...payStop,code:'OPTIONAL_TRIAL_PAYMENT_OBSERVATION'};
 for(const [name,route,status,body,code] of [
   ['known resume label','resume',400,JSON.stringify(resumeStop),'OPTIONAL_TRIAL_RESUME_STRIPE_BILLING_CYCLE_ANCHOR'],
   ['unrecognized resume label','resume',400,JSON.stringify({...resumeStop,code:'OPTIONAL_TRIAL_RESUME_PRIVATE_DETAIL'}),'RESUME'],
@@ -120,6 +124,17 @@ for(const [name,route,status,body,code] of [
   ['success status','resume',200,JSON.stringify(resumeStop),'RESUME'],
   ['other HTTP status','resume',500,JSON.stringify(resumeStop),'RESUME'],
   ['other runtime command','setup-install',400,JSON.stringify(resumeStop),'SETUP_INSTALL'],
+  ['known pay label','pay',400,JSON.stringify(payStop),'OPTIONAL_TRIAL_PAY_STRIPE_INVALID_REQUEST'],
+  ['known payment observation label','pay',400,JSON.stringify(paymentObservation),'OPTIONAL_TRIAL_PAYMENT_OBSERVATION'],
+  ['unrecognized pay label','pay',400,JSON.stringify({...payStop,code:'OPTIONAL_TRIAL_PAY_PRIVATE_DETAIL'}),'PAY'],
+  ['unexpected pay stage','pay',400,JSON.stringify({...payStop,stage:'WRONG_STAGE'}),'PAY'],
+  ['pay extra field','pay',400,JSON.stringify({...payStop,error:'privateStripeDetail'}),'PAY'],
+  ['pay duplicate code','pay',400,'{"code":"privateStripeDetail",'+JSON.stringify(payStop).slice(1),'PAY'],
+  ['oversized pay body','pay',400,' '.repeat(257)+JSON.stringify(payStop),'PAY'],
+  ['pay success status','pay',200,JSON.stringify(payStop),'PAY'],
+  ['pay other HTTP status','pay',500,JSON.stringify(payStop),'PAY'],
+  ['pay label on resume command','resume',400,JSON.stringify(payStop),'RESUME'],
+  ['resume label on pay command','pay',400,JSON.stringify(resumeStop),'PAY'],
 ]) {
   test('reports the owned optional trial failure for '+name, async () => {
     const f=fixture(undefined,command=>command===route
@@ -128,7 +143,7 @@ for(const [name,route,status,body,code] of [
     await assert.rejects(run.run(f.browser,f.limits),{message:'billing_'+code});
     assert.deepEqual(f.calls.slice(-5),[route,'abort','fixture-close','listener-stop','bootstrap-stop']);
     assert.equal(f.calls.filter(call=>call===route).length,1);
-    assert.equal(run.resources().phase,route==='resume'?'RESUME':'SETUP_INSTALL');
+    assert.equal(run.resources().phase,route.toUpperCase().replaceAll('-','_'));
     assert.equal(run.resources().code,code);
     assert.equal(run.resources().optionalTrialAccepted,false);
     assert.equal(run.resources().cleanupConfirmed,true);

@@ -49,12 +49,32 @@ const resumeDiagnostics = new Set([
 ]);
 export const isOptionalTrialResumeDiagnostic = code => resumeDiagnostics.has(code);
 
-async function json(fetcher, url, body, headers, status, limits, onResumeStopped) {
+const payDiagnostics = new Set([
+  'OPTIONAL_TRIAL_PAYMENT_CONFIRMATION',
+  'OPTIONAL_TRIAL_PAYMENT_OBSERVATION',
+  'OPTIONAL_TRIAL_PAY_PRECHECK',
+  'OPTIONAL_TRIAL_PAY_OPEN_GRAPH',
+  'OPTIONAL_TRIAL_PAY_OPEN_INTENT',
+  'OPTIONAL_TRIAL_PAY_CLAIM',
+  'OPTIONAL_TRIAL_PAY_DISPATCH_PROOF',
+  'OPTIONAL_TRIAL_PAY_STRIPE_INVALID_REQUEST',
+  'OPTIONAL_TRIAL_PAY_STRIPE',
+  'OPTIONAL_TRIAL_PAY_RESPONSE',
+  'OPTIONAL_TRIAL_PAY_ACK',
+]);
+export const isOptionalTrialPayDiagnostic = code => payDiagnostics.has(code);
+
+const controlDiagnostics = new Map([
+  ['resume',isOptionalTrialResumeDiagnostic],
+  ['pay',isOptionalTrialPayDiagnostic],
+]);
+
+async function json(fetcher, url, body, headers, status, limits, onStopped) {
   billingCheck(limits);
   const response = await fetcher(url, {method:'POST',redirect:'error',signal:limits.signal,
     headers:{Accept:'application/json','Content-Type':'application/json',...headers},body:JSON.stringify(body)});
   try {
-    const stopped = response.status === 400 && onResumeStopped !== undefined;
+    const stopped = response.status === 400 && onStopped !== undefined;
     need(response.status === status || stopped);
     const maxBytes = stopped ? 256 : 8192;
     let size = 0;
@@ -71,8 +91,7 @@ async function json(fetcher, url, body, headers, status, limits, onResumeStopped
     let diagnostic;
     try { diagnostic = parseJsonWithoutDuplicateKeys(text); }
     catch { throw billingError('OPTIONAL_TRIAL'); }
-    if (exact(diagnostic,['stage','code']) && diagnostic.stage === 'OPTIONAL_TRIAL_STOPPED'
-      && isOptionalTrialResumeDiagnostic(diagnostic.code)) onResumeStopped(diagnostic.code);
+    if (exact(diagnostic,['stage','code']) && diagnostic.stage === 'OPTIONAL_TRIAL_STOPPED') onStopped(diagnostic.code);
     throw billingError('OPTIONAL_TRIAL');
   } finally {
     await response.body?.cancel().catch(() => {});
@@ -92,9 +111,11 @@ function setupPermit(response) {
 }
 
 function runtimeClient(configuration, bootstrap, fetcher) {
-  let next = 0, original, setupOperationId, resumeOperationId, resumeFailure, controlKey, terminate, abort;
+  let next = 0, original, setupOperationId, resumeOperationId, stoppedFailure, controlKey, terminate, abort;
   return Object.freeze({
-    get resumeFailure() { return resumeFailure; },
+    diagnosticForPhase(phase) {
+      if (stoppedFailure?.phase===phase) return stoppedFailure.code;
+    },
     async step(route, body, limits) {
       const index = next;
       need(routes[index] === route);
@@ -109,8 +130,11 @@ function runtimeClient(configuration, bootstrap, fetcher) {
         const headers = {Authorization:'Bearer '+capability};
         terminate ??= limit => json(fetcher,endpoint+'/optional-trial/abort',{},headers,200,limit);
         // Bootstrap wraps callback errors. Keep the vetted code within this client.
-        const onResumeStopped = route === 'resume' ? code => { resumeFailure = code; } : undefined;
-        result = await json(fetcher,endpoint+'/optional-trial/'+route,body,headers,200,limits,onResumeStopped);
+        const allowedDiagnostic = controlDiagnostics.get(route);
+        const onStopped = allowedDiagnostic && (code => {
+          if (allowedDiagnostic(code)) stoppedFailure = {phase:route.toUpperCase(),code};
+        });
+        result = await json(fetcher,endpoint+'/optional-trial/'+route,body,headers,200,limits,onStopped);
         return true;
       },limits) === true && entered);
       billingCheck(limits);
@@ -276,7 +300,7 @@ export function createOwnedBillingOptionalTrial(options, dependencies={}) {
         billingCheck(active);
       } catch(error) {
         if(phase==='BROWSER')failure ??= browserDiagnostic(error,'ACCEPTANCE');
-        if(phase==='RESUME')failure ??= runtime?.resumeFailure;
+        failure ??= runtime?.diagnosticForPhase(phase);
         failure ??= phase==='NEW'?'LIMITS':phase;
       } finally {
         clearTimeout(timer);

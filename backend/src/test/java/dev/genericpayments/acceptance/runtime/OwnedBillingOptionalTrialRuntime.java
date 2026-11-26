@@ -46,8 +46,12 @@ public final class OwnedBillingOptionalTrialRuntime {
     private static final Set<String> PHASES = Set.of("open","advance","setup-permit","setup-install","resume","pay","abort");
     private static final Set<String> OPEN_FIELDS = Set.of("accountId","siteId","customerId","priceId","origin","customerToken","recurringConsent");
     private static final Set<String> FAILURE_STAGES = Set.of("OPTIONAL_TRIAL_ADMISSION","OPTIONAL_TRIAL_CREATE","OPTIONAL_TRIAL_TRIALING",
-        "OPTIONAL_TRIAL_ADVANCE_AND_PAUSE","OPTIONAL_TRIAL_SETUP_PERMIT","OPTIONAL_TRIAL_SETUP_INSTALL",
-        "OPTIONAL_TRIAL_PAYMENT_CONFIRMATION","OPTIONAL_TRIAL_PAYMENT_OBSERVATION");
+        "OPTIONAL_TRIAL_ADVANCE_AND_PAUSE","OPTIONAL_TRIAL_SETUP_PERMIT","OPTIONAL_TRIAL_SETUP_INSTALL");
+    private static final Set<String> PAYMENT_FAILURE_STAGES = Set.of(
+        "OPTIONAL_TRIAL_PAYMENT_CONFIRMATION","OPTIONAL_TRIAL_PAYMENT_OBSERVATION","OPTIONAL_TRIAL_PAY_PRECHECK",
+        "OPTIONAL_TRIAL_PAY_OPEN_GRAPH","OPTIONAL_TRIAL_PAY_OPEN_INTENT","OPTIONAL_TRIAL_PAY_CLAIM",
+        "OPTIONAL_TRIAL_PAY_DISPATCH_PROOF","OPTIONAL_TRIAL_PAY_STRIPE_INVALID_REQUEST","OPTIONAL_TRIAL_PAY_STRIPE",
+        "OPTIONAL_TRIAL_PAY_RESPONSE","OPTIONAL_TRIAL_PAY_ACK");
     private static final Set<String> RESUME_FAILURE_STAGES = Set.of(
         "OPTIONAL_TRIAL_RESUME_OPEN","OPTIONAL_TRIAL_RESUME_PRECHECK","OPTIONAL_TRIAL_RESUME_OBSERVE_CLOCK","OPTIONAL_TRIAL_RESUME_OBSERVE_SUBSCRIPTION",
         "OPTIONAL_TRIAL_RESUME_OBSERVE_CASH","OPTIONAL_TRIAL_RESUME_CLAIM","OPTIONAL_TRIAL_RESUME_DISPATCH_CLOCK",
@@ -237,7 +241,9 @@ public final class OwnedBillingOptionalTrialRuntime {
                     operations.stop();
                     var error = status("OPTIONAL_TRIAL_STOPPED");
                     String code = failure.getMessage();
-                    if (code != null && (FAILURE_STAGES.contains(code) || phase.equals("resume") && RESUME_FAILURE_STAGES.contains(code))) {
+                    if (code != null && (FAILURE_STAGES.contains(code)
+                        || phase.equals("resume") && RESUME_FAILURE_STAGES.contains(code)
+                        || phase.equals("pay") && PAYMENT_FAILURE_STAGES.contains(code))) {
                         error.addProperty("code",code);
                     }
                     reply(exchange,400,error);

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.stripe.StripeClient;
+import com.stripe.exception.InvalidRequestException;
 import com.stripe.exception.StripeException;
 import com.stripe.model.PaymentIntent;
 import com.stripe.net.RequestOptions;
@@ -13,6 +14,7 @@ import dev.genericpayments.platform.paymentaccounts.application.port.out.Payment
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
 import dev.genericpayments.platform.provider.adapter.out.stripe.StripeClientFactory;
 import dev.genericpayments.platform.provider.adapter.out.stripe.StripeCredentialResolver;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.OwnedOptionalTrialAcceptance.PhaseFailure;
 import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
@@ -88,28 +90,40 @@ final class OwnedOptionalTrialPaymentConfirmation {
                 """, Boolean.class, a.clockIntent())));
         };
 
-        unclaimed.run();
-        verification.verify(account);
-        unclaimed.run();
-        var client = clients.create(credentials.resolve(account));
+        StripeClient client;
+        try {
+            unclaimed.run();
+            verification.verify(account);
+            unclaimed.run();
+            client = clients.create(credentials.resolve(account));
+        } catch (RuntimeException failure) {
+            throw new PhaseFailure("OPTIONAL_TRIAL_PAY_PRECHECK");
+        }
         verifyOpen(client, candidate, setupOperation, unclaimed);
         unclaimed.run();
 
         var claim = UUID.randomUUID();
-        require(committed("select claim_owned_optional_trial_payment_confirmation(?,?,?,?,?,?,?,?)",
-            a.run(), a.clockIntent(), a.subscription(), a.createOperation(), setupOperation, resumeOperation,
-            candidate.fingerprint(), claim));
+        try {
+            require(committed("select claim_owned_optional_trial_payment_confirmation(?,?,?,?,?,?,?,?)",
+                a.run(), a.clockIntent(), a.subscription(), a.createOperation(), setupOperation, resumeOperation,
+                candidate.fingerprint(), claim));
+        } catch (RuntimeException failure) {
+            throw new PhaseFailure("OPTIONAL_TRIAL_PAY_CLAIM");
+        }
         Runnable owned = () -> {
             current.run();
             require(Boolean.TRUE.equals(jdbc.queryForObject("select owned_optional_trial_payment_confirmation_dispatchable(?)",
                 Boolean.class, claim)));
         };
+        String checkpoint = "OPTIONAL_TRIAL_PAY_DISPATCH_PROOF";
         try {
             var graph = new OwnedOptionalTrialResumeGraph(client, a, original, frozen, owned);
             verifyOpenPayment(client, graph, candidate, owned);
             graph.verifyReadyClock();
             owned.run();
+            checkpoint = "OPTIONAL_TRIAL_PAY_RESPONSE";
             var charge = postConfirm(client, a.customerReference(), candidate.identity().intent(), candidate.method(), candidate.key());
+            checkpoint = "OPTIONAL_TRIAL_PAY_ACK";
             owned.run();
             require(committed("select finish_owned_optional_trial_payment_confirmation(?,?)", claim, charge));
         } catch (StripeException | RuntimeException failure) {
@@ -118,7 +132,12 @@ final class OwnedOptionalTrialPaymentConfirmation {
             } catch (RuntimeException ignored) {
                 // The immutable first claim still consumes the dispatch budget.
             }
-            throw unavailable();
+            if (failure instanceof PhaseFailure diagnosed) throw diagnosed;
+            if (checkpoint.equals("OPTIONAL_TRIAL_PAY_RESPONSE") && failure instanceof StripeException) {
+                checkpoint = failure instanceof InvalidRequestException
+                    ? "OPTIONAL_TRIAL_PAY_STRIPE_INVALID_REQUEST" : "OPTIONAL_TRIAL_PAY_STRIPE";
+            }
+            throw new PhaseFailure(checkpoint);
         }
     }
 
@@ -131,8 +150,10 @@ final class OwnedOptionalTrialPaymentConfirmation {
             graph.verifySubscriptionAndSetup(setupOperation, candidate.setup(), candidate.method(), identity.invoice(), false);
             verifyOpenPayment(client, graph, candidate, current);
             graph.verifyReadyClock();
+        } catch (PhaseFailure diagnosed) {
+            throw diagnosed;
         } catch (StripeException | RuntimeException failure) {
-            throw unavailable();
+            throw new PhaseFailure("OPTIONAL_TRIAL_PAY_OPEN_GRAPH");
         }
     }
 
@@ -141,8 +162,16 @@ final class OwnedOptionalTrialPaymentConfirmation {
         var identity = candidate.identity();
         graph.readInvoice(identity.invoice(), candidate.method(), false, identity);
         current.run();
-        var intent = client.v1().paymentIntents().retrieve(identity.intent(), options(null));
-        verifyIntent(intent, candidate.authority().customerReference(), identity.intent(), candidate.method(), false);
+        verifyOpenIntent(client, candidate.authority().customerReference(), identity.intent(), candidate.method());
+    }
+
+    static void verifyOpenIntent(StripeClient client, String customer, String intentId, String method) {
+        try {
+            var intent = client.v1().paymentIntents().retrieve(intentId, options(null));
+            verifyIntent(intent, customer, intentId, method, false);
+        } catch (StripeException | RuntimeException failure) {
+            throw new PhaseFailure("OPTIONAL_TRIAL_PAY_OPEN_INTENT");
+        }
     }
 
     private Candidate candidate(Authority a, UUID setup, UUID resume) {
