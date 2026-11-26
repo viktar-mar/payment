@@ -33,6 +33,7 @@ const demo='http://127.0.0.1:48000';
 const stripeScript='https://js.stripe.com/endive/stripe.js?advancedFraudSignals=false';
 const stripeSetupDependency=/^https:\/\/js\.stripe\.com\/v3\/fingerprinted\/js\/(?:elements-easel-frame|trusted-types-checker)-[a-f0-9]{32}\.js$/;
 const elementReadyBudget=30_000;
+const setupReadReceiptBudget=15_000;
 const usedIntents=new Set<string>();
 const secretPattern=/^(seti_[A-Za-z0-9]{1,250})_secret_[A-Za-z0-9_]+$/;
 const documentBody=`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Save test card</title>
@@ -180,6 +181,14 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         document.parentFrame()===parent && generations.get(document)===generation);
     }
     const setupReaders=new Map<Frame,()=>boolean>();
+    const pendingSetupReads=new WeakMap<Request,{frame:Frame;current:()=>boolean;expiresAt:number}>();
+    page.on('response',response=>{
+      const request=response.request(),witness=pendingSetupReads.get(request);
+      if(!witness)return;
+      pendingSetupReads.delete(request);
+      if(!active && !limits.signal.aborted && Date.now()<witness.expiresAt && response.url()===request.url() && response.status()===200 &&
+        !response.fromServiceWorker() && witness.current())setupReaders.set(witness.frame,witness.current);
+    });
     let transports:ReadonlyMap<Frame,()=>boolean>|undefined;
     let cardCurrent:(()=>Promise<void>)|undefined,cardDocumentIsCurrent:(()=>boolean)|undefined;
     let trusted:JSHandle<()=>boolean>|undefined;
@@ -288,15 +297,11 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
           presentationSessions.add(request);
           if(observedSession==='NONE')observedSession='REQUESTED';
         }
+        if(readAuthority)pendingSetupReads.set(request,{frame:before.target,current:readAuthority,
+          expiresAt:Math.min(limits.deadline,Date.now()+setupReadReceiptBudget)});
         routeCheckpoint='BROWSER_PROVIDER_FALLBACK';
         if(confirming && !preflight)await route.continue();
         else await route.fallback();
-        if(readAuthority){
-          routeCheckpoint='BROWSER_INITIAL_SESSION_WIRE_READ';
-          const observed=await billingBounded(limits,()=>request.response());
-          if(!active && readAuthority() && observed?.request()===request && observed.url()===raw &&
-              observed.status()===200 && !observed.fromServiceWorker())setupReaders.set(before.target,readAuthority);
-        }
       } catch {
         stop(routeCheckpoint);
         await route.abort('failed').catch(()=>{});

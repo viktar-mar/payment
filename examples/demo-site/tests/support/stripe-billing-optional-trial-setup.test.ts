@@ -92,7 +92,7 @@ for(const fault of ['other request','other intent','other secret','live','requir
 }
 
 // Runs the real routing and page callbacks against VM DOM and CDP values only.
-function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'trusted types asset'|'easel query'|'easel delayed'|'other main asset'|'delayed element ready'|'element load error'|'missing card number'|'element no session'|'element no response'|'element no ready event'){
+function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'trusted types asset'|'easel query'|'easel delayed'|'other main asset'|'delayed element ready'|'element load error'|'missing card number'|'element no session'|'element no response'|'element no ready event'|'unobserved helper read'|'helper without response'|'late helper response',onHelperResponse=()=>{}){
   const picked={...permit,setupIntentId:'seti_'+mode.replaceAll(' ',''),
     clientSecret:'seti_'+mode.replaceAll(' ','')+'_secret_fixture'};
   const url='https://api.stripe.com/v1/setup_intents/'+picked.setupIntentId+'/confirm';
@@ -151,7 +151,8 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
               if(mode==='element no session')return;
               if(mode.startsWith('uncommitted child'))
                 pendingPresentation=request(frameOrigin+'/v3/controller-fixture.html','GET',uncommitted,true,'document');
-              if(['approved helper','card reload during helper trust'].includes(mode))pendingPresentation=request(url.replace('/confirm','')+'?'+new URLSearchParams({
+              if(['approved helper','card reload during helper trust','unobserved helper read','helper without response','late helper response'].includes(mode))
+                pendingPresentation=request(url.replace('/confirm','')+'?'+new URLSearchParams({
                 key:picked.publishableKey,client_secret:picked.clientSecret}), 'GET',sibling,false,'fetch');
               const render=()=>{
                 rendered=true;
@@ -169,7 +170,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
           }
           if(mode==='card reload')emit('framenavigated',stripe);
           const frame=mode==='foreign frame'?foreign:mode==='main transport'?main:
-            ['sibling confirm','approved helper','card reload during helper trust'].includes(mode)?sibling:stripe;
+            ['sibling confirm','approved helper','card reload during helper trust','helper without response','late helper response'].includes(mode)?sibling:stripe;
           await request(url,'POST',frame,false,'fetch');
           if(mode==='repeat')await request(url,'POST',stripe,false,'fetch');
           return {setupIntent:{id:picked.setupIntentId,status:'succeeded'}};
@@ -277,6 +278,13 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
       if(frame===uncommitted)childLoads++;
       if(target===extraScript)extraLoads++;
       if(target===sessionUrl&&mode==='element no response')return;
+      if(target.startsWith(url.replace('/confirm','')+'?')){
+        if(['unobserved helper read','helper without response'].includes(mode))return;
+        if(mode==='late helper response'){
+          await new Promise(resolve=>setImmediate(resolve));
+          onHelperResponse();
+        }
+      }
       const redirected=mode==='script redirect' && resource==='script';
       await devtools.get('Fetch.requestPaused')!({requestId:id,networkId:id,frameId,request:wire,responseStatusCode:redirected?302:200});
       if(redirected)return;
@@ -301,8 +309,8 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
   }
   registerChromiumProtocolFixture(page);
   const browser={newContext:async()=>context} as unknown as Browser;
-  return {browser,picked,writes,url,closed:()=>closed,childLoads:()=>childLoads,extraLoads:()=>extraLoads,run:()=>runOptionalTrialSetupBrowser(browser,picked,
-    {deadline:Date.now()+2000},()=>false)};
+  return {browser,picked,writes,url,closed:()=>closed,childLoads:()=>childLoads,extraLoads:()=>extraLoads,run:(timeout=2000)=>runOptionalTrialSetupBrowser(browser,picked,
+    {deadline:Date.now()+timeout},()=>false)};
 }
 
 test('the held document forwards one original charge-free setup POST after one trusted keyboard gesture',async()=>{
@@ -417,4 +425,23 @@ for(const shape of ['main transport','approved helper'] as const)test('confirms 
   assert.equal(await f.run(),true);
   assert.deepEqual(f.writes,[f.url]);
   assert.equal(f.closed(),1);
+});
+
+test('an unobserved helper read cannot stall the original card frame',async()=>{
+  const f=checkout('unobserved helper read');
+  assert.equal(await f.run(),true);
+  assert.deepEqual(f.writes,[f.url]);
+});
+
+test('a helper without its matched read response cannot forward confirmation',async()=>{
+  const f=checkout('helper without response');
+  await assert.rejects(f.run(),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')==='BROWSER_PROVIDER_ROUTE_PAY');
+  assert.deepEqual(f.writes,[]);
+});
+
+test('a late helper receipt cannot authorize a confirmation transport',async(t)=>{
+  t.mock.timers.enable({apis:['Date'],now:Date.now()});
+  const f=checkout('late helper response',()=>t.mock.timers.setTime(Date.now()+15_001));
+  await assert.rejects(f.run(45_000),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')==='BROWSER_PROVIDER_ROUTE_PAY');
+  assert.deepEqual(f.writes,[]);
 });
