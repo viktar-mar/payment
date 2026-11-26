@@ -91,7 +91,7 @@ for(const fault of ['other request','other intent','other secret','live','requir
 }
 
 // Runs the real routing and page callbacks against VM DOM and CDP values only.
-function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'){
+function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'){
   const picked={...permit,setupIntentId:'seti_'+mode.replaceAll(' ',''),
     clientSecret:'seti_'+mode.replaceAll(' ','')+'_secret_fixture'};
   const url='https://api.stripe.com/v1/setup_intents/'+picked.setupIntentId+'/confirm';
@@ -231,7 +231,9 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
       response:()=>result.promise,
     };
     const respond=async()=>{
-      await devtools.get('Fetch.requestPaused')!({requestId:id,networkId:id,frameId,request:wire,responseStatusCode:200});
+      const redirected=mode==='script redirect' && resource==='script';
+      await devtools.get('Fetch.requestPaused')!({requestId:id,networkId:id,frameId,request:wire,responseStatusCode:redirected?302:200});
+      if(redirected)return;
       const accepted={
         request:()=>original,url:()=>target,status:()=>200,fromServiceWorker:()=>false,
         body:async()=>Buffer.from(JSON.stringify({object:'setup_intent',id:picked.setupIntentId,
@@ -269,12 +271,26 @@ for(const fault of ['untrusted','foreign frame','repeat','close fails','card rel
   const f=checkout(fault);
   await assert.rejects(f.run(),(error:unknown)=>{
     assert.equal(browserCleanupConfirmed(error),fault!=='close fails');
-    if(fault==='close fails')assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CLEANUP');
+    const code={untrusted:'BROWSER_CONFIRM_WAIT','foreign frame':'BROWSER_PROVIDER_ROUTE_FRAME',
+      repeat:'BROWSER_PROVIDER_ROUTE_PAY','close fails':'BROWSER_CLEANUP','card reload':'BROWSER_PROVIDER_ROUTE_PAY',
+      'sibling confirm':'BROWSER_PROVIDER_ROUTE_PAY','card reload during helper trust':'BROWSER_PROVIDER_ROUTE_PAY'}[fault];
+    assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
     assert.equal(String(error),'Error: billing_BROWSER');
     return true;
   });
   assert.deepEqual(f.writes,['repeat','close fails'].includes(fault)?[f.url]:[]);
   assert.equal(f.closed(),1);
+});
+
+test('the browser preserves the fixed CDP refusal before the form can submit',async()=>{
+  const f=checkout('script redirect');
+  await assert.rejects(f.run(),(error:unknown)=>{
+    assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_GUARD_RESPONSE_REDIRECT');
+    assert.equal(browserCleanupConfirmed(error),true);
+    assert.equal(String(error),'Error: billing_BROWSER');
+    return true;
+  });
+  assert.deepEqual(f.writes,[]);
 });
 
 for(const shape of ['main transport','approved helper'] as const)test('confirms through the exact prebound '+shape,async()=>{

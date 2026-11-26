@@ -3,7 +3,7 @@ import type {Browser,BrowserContext,Frame,JSHandle,Request,Response} from '@play
 import type {Stripe} from '@stripe/stripe-js';
 import type {BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
-import {acceptanceBrowserFailure,finishBrowserCleanup} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
+import {acceptanceBrowserFailure,finishBrowserCleanup,isAcceptanceBrowserDiagnostic} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 import {parseRefundRetainedJSON as parseJsonWithoutDuplicateKeys} from '../../../../infrastructure/stripe-manual-refund-retained.mjs';
 // @ts-ignore Native Node tests load the same support source as Playwright.
 import {stripeFrames} from './stripe-billing-acceptance.ts';
@@ -23,8 +23,8 @@ export interface OptionalTrialSetupPermit {
 
 const refused=()=>new Error('billing_OPTIONAL_TRIAL_SETUP_BROWSER');
 function need(value:unknown):asserts value {if(!value)throw refused();}
-function terminalFailure(cleanupConfirmed:boolean) {
-  const error=acceptanceBrowserFailure(cleanupConfirmed?'BROWSER':'BROWSER_CLEANUP');
+function terminalFailure(cleanupConfirmed:boolean,code='BROWSER') {
+  const error=acceptanceBrowserFailure(cleanupConfirmed?code:'BROWSER_CLEANUP');
   finishBrowserCleanup(error,cleanupConfirmed);
   return error;
 }
@@ -114,7 +114,7 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
     need(!usedIntents.has(granted.setupIntentId) && typeof matchesStaticOrigin==='function');
     usedIntents.add(granted.setupIntentId);
     billingCheck(owner);
-  }catch{throw terminalFailure(true);}
+  }catch{throw terminalFailure(true,'BROWSER_SETUP');}
   const lifetime=new AbortController();
   const limits={deadline:Math.min(owner.deadline,expiresAt),
     signal:owner.signal?AbortSignal.any([owner.signal,lifetime.signal]):lifetime.signal};
@@ -125,27 +125,33 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
   const exchange=optionalTrialSetupExchange(granted);
   let context:BrowserContext|undefined,closing:Promise<void>|undefined,open:Promise<BrowserContext>|undefined;
   let failed=false,completed=false,cleanupConfirmed=false;
+  let checkpoint='BROWSER_SETUP',failureCode:string|undefined;
   function close(ctx:BrowserContext){
     closing??=Promise.resolve().then(()=>ctx.close());
     void closing.catch(()=>{});
     return closing;
   }
-  function stop(){
+  function recordFailure(code:string){
     failed=true;
+    failureCode??=isAcceptanceBrowserDiagnostic(code)?code:'BROWSER';
+  }
+  function stop(code=checkpoint){
+    recordFailure(code);
     lifetime.abort();
     if(context)void close(context).catch(()=>{});
   }
-  limits.signal.addEventListener('abort',stop,{once:true});
+  const onAbort=()=>stop();
+  limits.signal.addEventListener('abort',onAbort,{once:true});
   try {
     check();
     open=browser.newContext({serviceWorkers:'block',acceptDownloads:false});
     void open.then(ctx=>{if(limits.signal.aborted)return close(ctx);},()=>{}).catch(()=>{});
     context=await billingBounded(limits,()=>open!);
     const page=await billingBounded(limits,()=>context!.newPage());
-    context.on('page',other=>{if(other!==page)stop();});
-    page.on('close',()=>{if(!completed)stop();});
-    page.on('download',stop);
-    await billingBounded(limits,()=>context!.routeWebSocket('**/*',socket=>{try{socket.close();}finally{stop();}}));
+    context.on('page',other=>{if(other!==page)stop('BROWSER_GUARD_POPUP');});
+    page.on('close',()=>{if(!completed)stop('BROWSER_INVALIDATED');});
+    page.on('download',()=>stop('BROWSER_INVALIDATED'));
+    await billingBounded(limits,()=>context!.routeWebSocket('**/*',socket=>{try{socket.close();}finally{stop('BROWSER_GUARD_WEBSOCKET');}}));
     const redirects=await billingBounded(limits,()=>guardChallengeRedirects(page,stop,{demo,backend:'http://127.0.0.1:48001'},limits.signal));
     let documentServed=false,active=false;
     const generations=new WeakMap<Frame,number>();
@@ -180,11 +186,16 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
       need(active && trusted===click && currentCard() && currentFrame());
     };
     await billingBounded(limits,()=>context!.route('**/*',async route=>{
+      let routeCheckpoint='BROWSER_PROVIDER_ROUTE';
       try {
         check();
         const request=route.request(),raw=request.url(),method=request.method(),navigation=request.isNavigationRequest();
-        need(!request.redirectedFrom() && !request.serviceWorker());
+        routeCheckpoint='BROWSER_PROVIDER_REDIRECT';
+        need(!request.redirectedFrom());
+        routeCheckpoint='BROWSER_PROVIDER_ROUTE_POLICY';
+        need(!request.serviceWorker());
         if(raw===url){
+          routeCheckpoint='BROWSER_NAVIGATION';
           need(!documentServed && method==='GET' && navigation && request.frame()===page.mainFrame());
           documentServed=true;
           redirects.registerRoute(request);
@@ -208,13 +219,16 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         const confirming=raw===confirmUrl,setupRead=target.origin+target.pathname===intentUrl;
         const ownScript=script && method==='GET' && raw===stripeScript && request.resourceType()==='script';
         const allowMain=ownScript || api && confirming && method==='POST';
+        routeCheckpoint='BROWSER_PROVIDER_ROUTE_FRAME';
         const before=stripeFrames(page,request,childNavigation,allowMain,demo);
         need(before && (!navigation || childNavigation));
         redirects.registerRoute(request);
+        routeCheckpoint='BROWSER_PROVIDER_HEADERS';
         const headers=await request.allHeaders();
         check();
         const source=new URL(request.frame().url()).origin;
         need(unprivileged(headers) && (!headers.authorization || api && !preflight && headers.authorization==='Bearer '+granted.publishableKey));
+        routeCheckpoint='BROWSER_PROVIDER_ROUTE_POLICY';
         const intended=preflight?headers['access-control-request-method']:method;
         need(intended==='GET'||intended==='POST');
         if(!script && headers.origin)need(headers.origin===source);
@@ -222,6 +236,7 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         if(script)need(intended==='GET');
         else if(support)need(!navigation && !/^\/(?:v\d+|api)(?:\/|$)/i.test(target.pathname) && !target.pathname.includes('%'));
         else if(api && confirming){
+          routeCheckpoint='BROWSER_PROVIDER_ROUTE_PAY';
           need(intended==='POST' && headers.origin===source);
           await checkClick(request);
           if(preflight)need(!exchange.dispatched);
@@ -242,27 +257,36 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
           }
         }
 
+        routeCheckpoint='BROWSER_PROVIDER_ROUTE_GUARD';
         await redirects.authorize(request);
-        if(confirming)await checkClick(request);
+        if(confirming){
+          routeCheckpoint='BROWSER_PROVIDER_ROUTE_PAY';
+          await checkClick(request);
+        }
         check();
+        routeCheckpoint='BROWSER_PROVIDER_ROUTE_FRAME';
         const current=stripeFrames(page,request,childNavigation,allowMain,demo);
         need(current && current.target===before.target && current.frames.size===before.frames.size &&
           [...before.frames].every(([frame,location])=>current.frames.get(frame)===location));
+        routeCheckpoint='BROWSER_PROVIDER_FALLBACK';
         if(confirming && !preflight)await route.continue();
         else await route.fallback();
         if(readAuthority){
+          routeCheckpoint='BROWSER_INITIAL_SESSION_WIRE_READ';
           const observed=await billingBounded(limits,()=>request.response());
           if(!active && readAuthority() && observed?.request()===request && observed.url()===raw &&
               observed.status()===200 && !observed.fromServiceWorker())setupReaders.set(before.target,readAuthority);
         }
       } catch {
-        stop();
+        stop(routeCheckpoint);
         await route.abort('failed').catch(()=>{});
       }
     }));
+    checkpoint='BROWSER_NAVIGATION';
     await billingBounded(limits,()=>page.goto(url,{timeout:timeout()}));
     need(documentServed && page.url()===url);
-    page.on('framenavigated',frame=>{if(frame===page.mainFrame())stop();});
+    page.on('framenavigated',frame=>{if(frame===page.mainFrame())stop('BROWSER_GUARD_MAIN_NAVIGATION');});
+    checkpoint='BROWSER_WAIT_READY';
     await billingBounded(limits,()=>page.evaluate(({publishableKey,clientSecret,setupIntentId,expires,documentUrl})=>{
       const owner=window as Window&{Stripe?:(key:string)=>Stripe};
       const host=document.querySelector('#payment-element');
@@ -312,6 +336,7 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
       need(card());
     };
     await cardCurrent();
+    checkpoint='BROWSER_CARD_FIELDS';
     for(const [field,value] of [['number','4242424242424242'],['expiry','1230'],['cvc','123']]){
       await billingBounded(limits,()=>frame.locator(`input[name="${field}"]`).fill(value!,{timeout:timeout()}));
       await cardCurrent();
@@ -320,9 +345,11 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
     if(await billingBounded(limits,()=>postal.isVisible()))
       await billingBounded(limits,()=>postal.fill('10001',{timeout:timeout()}));
 
+    checkpoint='BROWSER_WAIT_READY';
     const button=await billingBounded(limits,()=>page.getByRole('button',{name:'Save test card',exact:true}).elementHandle({timeout:timeout()}));
     await billingBounded(limits,()=>button.waitForElementState('enabled',{timeout:timeout()}));
     await pinned.wait();
+    checkpoint='BROWSER_CONFIRM_FOCUS';
     await billingBounded(limits,()=>button.focus());
     trusted=await billingBounded(limits,()=>button.evaluateHandle(element=>{
       const current=()=>element instanceof HTMLButtonElement && element.isConnected && !document.hidden &&
@@ -346,7 +373,9 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
     const response=page.waitForResponse(exchange.isResponse,{timeout:timeout()});
     void response.catch(()=>{});
     active=true;
+    checkpoint='BROWSER_CONFIRM_WAIT';
     const [accepted]=await billingBounded(limits,()=>Promise.all([response,button.press('Enter',{timeout:timeout()})]),45_000);
+    checkpoint='BROWSER_CONFIRM_RECEIPT';
     await billingBounded(limits,()=>exchange.verify(accepted));
     await billingBounded(limits,()=>page.waitForFunction(()=>document.querySelector('#confirm-setup[data-confirmed="true"]')!==null,
       undefined,{timeout:timeout()}));
@@ -354,15 +383,15 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
     active=false;
     need(!failed);
     completed=true;
-  } catch {failed=true;}
+  } catch {recordFailure(checkpoint);}
   finally {
-    limits.signal.removeEventListener('abort',stop);
+    limits.signal.removeEventListener('abort',onAbort);
     lifetime.abort();
     try{
       if(open)await billingBounded({deadline:Date.now()+15_000},async()=>close(context??await open!));
       cleanupConfirmed=true;
     } catch {failed=true;}
   }
-  if(!completed || failed || owner.signal?.aborted || Date.now()>=limits.deadline)throw terminalFailure(cleanupConfirmed);
+  if(!completed || failed || owner.signal?.aborted || Date.now()>=limits.deadline)throw terminalFailure(cleanupConfirmed,failureCode??checkpoint);
   return true;
 }
