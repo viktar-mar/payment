@@ -13,6 +13,12 @@ export const billingUuid=value=>typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{
 const need=value=>{if(!value)throw billingError('FIXTURE');};
 const digest=value=>createHash('sha256').update(value).digest('hex');
 const failedRenewalCheckpoints=new WeakMap();
+const initial3dsCheckpoints=new WeakMap();
+const initial3dsReads=['PROVISION_LOGIN','PROVISION_ACCOUNTS','PROVISION_SITES'];
+const initial3dsCodes=new Set([
+ 'PROVISION_BINDING','PROVISION_ADMIN','PROVISION_LOGIN_COOKIES','PROVISION_FRESHNESS','PROVISION_FRESH_RECEIPT',
+ ...initial3dsReads.flatMap(step=>['VERIFY','REQUEST','HTTP','RESPONSE'].map(detail=>step+'_'+detail)),
+]);
 const identityProviderRead='PROVISION_IDENTITY_PROVIDERS',policyRead='PROVISION_SUBSCRIPTION_POLICY',publishStep='PROVISION_PUBLISH';
 // A fresh publication can run four sequential Stripe calls with a 20-second limit each.
 const publishRequestLimit=90000;
@@ -38,6 +44,12 @@ export function billingFailedRenewalProvisionCheckpoint(fixture,limits,runId,exp
  return step?checkpoint.code+'_'+step:checkpoint.code;
 }
 export const isFailedRenewalProvisionCheckpoint=code=>checkpointCodes.has(code);
+export function billingInitial3dsProvisionCheckpoint(fixture,limits,runId,expectedSource) {
+ const checkpoint=initial3dsCheckpoints.get(fixture);
+ return checkpoint?.limits===limits&&checkpoint?.runId===runId&&checkpoint?.expectedSource===expectedSource
+  ?checkpoint?.code??null:null;
+}
+export const isInitial3dsProvisionCheckpoint=code=>initial3dsCodes.has(code);
 async function responseBytes(response,limits,maximum){
  let bytes=0;const chunks=[];
  for await(const chunk of response.body??[]){billingCheck(limits);bytes+=chunk.length;need(bytes<=maximum);chunks.push(Buffer.from(chunk));}
@@ -204,22 +216,34 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
    billingCheck(limits);need(!closed);
    failedRenewalCheckpoints.set(fixture,{code,limits,runId:c.runId,expectedSource:c.expectedSource,
     verifying:verificationLimits?{bootstrap,limits:verificationLimits}:undefined});
+  }else if(challenge&&isInitial3dsProvisionCheckpoint(code)){
+   billingCheck(limits);need(!closed);
+   initial3dsCheckpoints.set(fixture,{code,limits,runId:c.runId,expectedSource:c.expectedSource});
   }
  }
  const fixture=Object.freeze({resources,
   async provision(limits){
    need(!provisioned&&!busy&&!closed&&(purpose==='INITIAL'||!provisionClaimed));provisionClaimed=true;busy=true;started=Date.now();
    try{
+    if(challenge)checkpoint('PROVISION_BINDING',limits);
     need(await (optionalTrial?cli.assertBillingListener(limits):cli.validateBinding(limits))===true);
+    if(challenge)checkpoint('PROVISION_ADMIN',limits);
     let admin;need(await bootstrap.withAdminCredentials(credentials=>{admin={username:credentials.username,password:credentials.password};return true;},limits)===true);
     try {
-     const login=await request('/api/admin/v1/auth/sessions',limits,{method:'POST',body:admin,status:204});
+     const login=await request('/api/admin/v1/auth/sessions',limits,{method:'POST',body:admin,status:204,
+      provisionStep:challenge?'PROVISION_LOGIN':undefined});
+     if(challenge)checkpoint('PROVISION_LOGIN_COOKIES',limits);
      need(login.value===null&&login.cookies.length===2);const values={};
      for(const item of login.cookies){need(typeof item==='string'&&!/[\r\n]/.test(item)&&!/;\s*domain=/i.test(item));const m=/^(PAYMENT_ADMIN_SESSION|XSRF-TOKEN)=([A-Za-z0-9_-]{1,512});/.exec(item);need(m&&!values[m[1]]);values[m[1]]=m[2];}
      need(values.PAYMENT_ADMIN_SESSION&&values['XSRF-TOKEN']);cookie='PAYMENT_ADMIN_SESSION='+values.PAYMENT_ADMIN_SESSION+'; XSRF-TOKEN='+values['XSRF-TOKEN'];csrf=values['XSRF-TOKEN'];
     }finally{admin=null;}
-    const accounts=await read('/api/admin/v1/payment-accounts',limits),sites=await read('/api/admin/v1/sites',limits);need(Array.isArray(accounts)&&accounts.length===0&&Array.isArray(sites)&&sites.length===0);
+    const accounts=await read('/api/admin/v1/payment-accounts',limits,{provisionStep:challenge?'PROVISION_ACCOUNTS':undefined});
+    const sites=await read('/api/admin/v1/sites',limits,{provisionStep:challenge?'PROVISION_SITES':undefined});
+    if(challenge)checkpoint('PROVISION_FRESHNESS',limits);
+    need(Array.isArray(accounts)&&accounts.length===0&&Array.isArray(sites)&&sites.length===0);
+    if(challenge)checkpoint('PROVISION_FRESH_RECEIPT',limits);
     await save('fresh',{phase:'FRESH'},limits);
+    if(challenge)initial3dsCheckpoints.delete(fixture);
     const account=await mutate('account','/api/admin/v1/payment-accounts',{key:'stripe-sandbox-default',provider:'STRIPE',mode:'SANDBOX',external_account_id:c.approvedBinding.externalAccountId,credentials_ref:'stripe-sandbox-default'},201,limits,v=>billingUuid(v?.id)&&v.provider==='STRIPE'&&v.mode==='SANDBOX'&&v.status==='ACTIVE'&&v.external_account_id===c.approvedBinding.externalAccountId);accountId=account.id;
     const site=await mutate('site','/api/admin/v1/sites',{key:siteKey,display_name:'Initial Billing acceptance',payment_account_id:accountId,allowed_origins:[endpoints.demo],authentication_modes:['EMAIL_OTP'],payment_method_policy:{mode:'ALLOWLIST',methods:['CARD']},email_otp_provider:{provider_key:'billing-email-'+suffix,sender_ref:'local-default',template_key:'otp-default'}},201,limits,v=>billingUuid(v?.id)&&v.key===siteKey&&v.status==='ACTIVE'&&v.payment_account_id===accountId&&JSON.stringify(v.allowed_origins)===JSON.stringify([endpoints.demo])&&JSON.stringify(v.authentication_modes)==='["EMAIL_OTP"]',{ackCheckpoint:'PROVISION_SITE_ACK'});siteId=site.id;
     const base='/api/v1/admin/sites/'+siteId;

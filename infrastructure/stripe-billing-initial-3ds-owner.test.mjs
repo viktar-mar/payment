@@ -24,6 +24,54 @@ test('3DS admission requires its own case and exact single-action budget',async(
   for(const budget of [{create:1,confirm:1},{create:1,confirm:2,nextAction:1},{create:1,confirm:1,nextAction:2}])
     assert.equal(validateBillingAcceptanceOptions({...configuration,budget}),null);
 });
+
+for(const [fault,code] of [
+ ['binding','PROVISION_BINDING'],
+ ['credentials','PROVISION_ADMIN'],
+ ['login verify','PROVISION_LOGIN_VERIFY'],
+ ['login request','PROVISION_LOGIN_REQUEST'],
+ ['login HTTP','PROVISION_LOGIN_HTTP'],
+ ['login cookies','PROVISION_LOGIN_COOKIES'],
+ ['accounts response','PROVISION_ACCOUNTS_RESPONSE'],
+ ['sites HTTP','PROVISION_SITES_HTTP'],
+ ['nonempty','PROVISION_FRESHNESS'],
+ ['first receipt','PROVISION_FRESH_RECEIPT'],
+ ['forged','PROVISION'],
+])test('3DS reports the owned pre-provision checkpoint for '+fault,async()=>{
+ const yes=async()=>true;
+ const localLogin='/api/admin/v1/auth/sessions',accounts='/api/admin/v1/payment-accounts',sites='/api/admin/v1/sites';
+ const arbitrary=()=>{throw Error('private_sentinel');};
+ const f=await provisionHarness({configuration,factory:(input,dependencies)=>createBillingFixture({
+  ...input,
+  cli:{validateBinding:fault==='binding'?arbitrary:yes},
+  bootstrap:{...input.bootstrap,...(fault==='credentials'?{withAdminCredentials:arbitrary}:{})},
+ },dependencies),onVerify:fault==='login verify'?arbitrary:undefined,
+ onFetch(path,settings,response){
+  if(path===localLogin){
+   if(fault==='login request')arbitrary();
+   if(fault==='login HTTP')return new Response(null,{status:503});
+   if(fault==='login cookies')return new Response(null,{status:204});
+  }
+  if(path===accounts&&fault==='accounts response')return new Response('invalid JSON');
+  if(path===sites&&fault==='sites HTTP')return new Response(null,{status:404});
+  if(path===sites&&fault==='nonempty')return new Response('[{}]');
+  return response;
+ },onWrite:fault==='first receipt'?arbitrary:undefined});
+ const fixture=fault==='forged'?{provision:async()=>{throw Error('billing_PROVISION_BINDING');},close:yes}:f.fixture;
+ const cleanup=[];
+ const cli={validateBinding:yes,startListener:yes,stopListener:async()=>{cleanup.push('listener');return true;}};
+ const bootstrap={prepare:yes,start:yes,resources:()=>({cliDirectory:'inert'}),stop:async()=>{cleanup.push('runtime');return true;}};
+ const owner=await owners.createOwnedBillingInitial3ds(configuration,{preflight:yes,createBootstrap:()=>bootstrap,
+  createCli:()=>cli,login:yes,createFixture:()=>fixture});
+ await assert.rejects(owner.run(async()=>assert.fail('browser must not start'),{deadline:Date.now()+5000}),{message:'billing_'+code});
+ const result=owner.resources();
+ assert.equal(result.phase,'PROVISION');
+ assert.equal(result.code,code);
+ assert.equal(result.cleanupConfirmed,true);
+ assert.deepEqual(cleanup,['listener','runtime']);
+ assert.ok(f.requests.every(request=>request.method==='GET'||request.path===localLogin));
+ assert.ok(f.writes.every(row=>row.name.endsWith('-fresh.json')));
+});
 for(const fault of ['none','wrong confirm','second create','foreign challenge','missing completion','duplicate challenge','uncertain customer','unproved','browser close']){
  test('initial 3DS owner and real fixture with '+fault,async()=>{
   const f=await provisionHarness({configuration,factory:createBillingFixture,onWrite:name=>{

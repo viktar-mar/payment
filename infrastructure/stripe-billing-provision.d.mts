@@ -4,6 +4,7 @@ import type {FailedRenewalRuntime} from './stripe-billing-first-payment-runtime.
 export function billingUuid(value:unknown):value is string;
 export function billingFailedRenewalProvisionCheckpoint(fixture:unknown,limits:BillingLimits,runId:string,expectedSource:string):string|null;
 export function isFailedRenewalProvisionCheckpoint(code:unknown):code is string;
+export function isInitial3dsProvisionCheckpoint(code:unknown):code is string;
 type FixtureOptions={configuration:unknown;bootstrap:unknown;cli:unknown};
 type FixtureResources=Pick<BillingBinding,'runId'|'expectedSource'|'endpoints'|'siteKey'|'email'>
  &Partial<Pick<BillingBinding,'accountId'|'siteId'|'productId'|'priceId'|'customerId'|'subscriptionId'|'operationId'|'attemptId'>>

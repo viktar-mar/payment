@@ -49,6 +49,37 @@ test('caught persistence failure remains sticky and cannot regain financial auth
 test('cleanup failure cannot turn complete evidence into acceptance',async()=>{const h=harness();h.bootstrap.stop=async()=>{throw Error('secret');};const owner=await api.createOwnedBillingAcceptance(options(),h.dependencies);await assert.rejects(()=>owner.run(journey,limits()),/CLEANUP/);assert.equal(owner.resources().initialAccepted,false);});
 test('deadline bounds a hanging step and cancels its owned signal',async()=>{let signal;const h=harness({preflight:(_c,l)=>{signal=l.signal;return new Promise(()=>{});}}),owner=await api.createOwnedBillingAcceptance(options(),h.dependencies);await assert.rejects(()=>owner.run(journey,{deadline:Date.now()+20}));assert.equal(signal.aborted,true);assert.equal(owner.resources().initialAccepted,false);});
 test('literal false cleanup receipt blocks acceptance',async()=>{const h=harness();h.bootstrap.stop=async()=>false;const owner=await api.createOwnedBillingAcceptance(options(),h.dependencies);await assert.rejects(()=>owner.run(journey,limits()),/CLEANUP/);});
+for(const [delay,confirmed] of [[31000,true],[120001,false]])test('initial 3DS cleanup shares the bounded runtime stop budget: '+delay,async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:10000});
+ const h=harness(),entered=Promise.withResolvers();
+ let aborted;
+ h.fixture.provision=async()=>{throw Error('private provisioning failure');};
+ h.bootstrap.stop=stopLimits=>{
+  h.calls.push('stop');entered.resolve();
+  return new Promise(resolve=>setTimeout(()=>{aborted=stopLimits.signal.aborted;resolve(!aborted);},delay));
+ };
+ const base=options(),owner=await api.createOwnedBillingInitial3ds({...base,selectedCase:'initial_3ds',
+  env:{...base.env,PAYMENT_STRIPE_BILLING_CASE:'initial_3ds'}},h.dependencies);
+ const failed=assert.rejects(owner.run(journey,limits()),{message:'billing_PROVISION'});
+ await entered.promise;
+ t.mock.timers.tick(delay);
+ await failed;
+ assert.equal(aborted,!confirmed);
+ assert.equal(owner.resources().cleanupConfirmed,confirmed);
+ assert.deepEqual(h.calls.slice(-3),['fixture-close','listener-stop','stop']);
+ assert.equal(h.calls.includes('persist'),false);
+});
+test('runtime stop stays within original authority when cleanup starts after the run deadline',async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:10000});
+ const h=harness(),runLimits=limits();
+ let stopDeadline;
+ h.fixture.provision=async()=>{t.mock.timers.tick(10001);return true;};
+ h.bootstrap.stop=async stopLimits=>{stopDeadline=stopLimits.deadline;return true;};
+ const owner=await api.createOwnedBillingAcceptance(options(),h.dependencies);
+ await assert.rejects(owner.run(journey,runLimits),{message:'billing_ABORTED'});
+ assert.equal(stopDeadline,runLimits.deadline+120000);
+ assert.equal(owner.resources().cleanupConfirmed,true);
+});
 test('literal false listener readiness never permits financial dispatch',async()=>{const h=harness();h.cli.assertBillingListener=async()=>false;const owner=await api.createOwnedBillingAcceptance(options(),h.dependencies);await assert.rejects(()=>owner.run(journey,limits()));assert.equal(h.calls.includes('persist'),false);});
 test('hostile rejection accessors never enter failure diagnostics',async()=>{let reads=0;const h=harness({preflight:async()=>{throw Object.defineProperty({},'message',{get(){reads++;throw Error('secret');}});}}),owner=await api.createOwnedBillingAcceptance(options(),h.dependencies);await assert.rejects(()=>owner.run(journey,limits()),/^Error: billing_/);assert.equal(reads,0);assert.equal(owner.resources().initialAccepted,false);});
 test('resources distinguish owner closure from unconfirmed resource cleanup',async()=>{const h=harness();h.bootstrap.stop=async()=>false;const owner=await api.createOwnedBillingAcceptance(options(),h.dependencies);await assert.rejects(()=>owner.run(journey,limits()));assert.equal(owner.resources().cleanupConfirmed,false);});

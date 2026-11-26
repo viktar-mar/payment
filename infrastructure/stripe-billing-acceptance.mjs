@@ -9,7 +9,7 @@ import {preflightOwnedBilling} from './stripe-sandbox-owned.mjs';
 import {browserDiagnostic,browserCleanupConfirmed,browserProviderOrigin} from './stripe-billing-first-payment-browser-diagnostic.mjs';
 import {billingBounded, billingCheck, billingError} from './stripe-billing-limits.mjs';
 import {createHash} from 'node:crypto';
-import {billingUuid} from './stripe-billing-provision.mjs';
+import {billingInitial3dsProvisionCheckpoint,billingUuid} from './stripe-billing-provision.mjs';
 
 /** Inert admission. Native capabilities are constructed only by the explicit, single-use run. */
 export async function createOwnedBillingAcceptance(options,dependencies={}) {
@@ -47,10 +47,14 @@ async function createOwner(options,dependencies,selectedCase) {
  async function cleanup() {
   if(cleanupPromise)return cleanupPromise;
   cleanupPromise=(async()=>{
-   let ok=true;const limits={deadline:Date.now()+120000};
+   let ok=true;
+   const now=Date.now(),limits={deadline:Math.min(now,active?.deadline??now)+120000};
    // Run cancellation can win before the browser finishes closing its context.
    const browserClosed=browserCompletion&&billingBounded(limits,()=>browserCompletion,20000).catch(()=>false);
-   for(const [object,method] of [[fixture,'close'],[cli,'stopListener'],[ingress,'close'],[bootstrap,'stop']])if(object)try{if(await billingBounded(limits,l=>object[method](l),30000)!==true)ok=false;}catch{ok=false;}
+   for(const [object,method] of [[fixture,'close'],[cli,'stopListener'],[ingress,'close'],[bootstrap,'stop']])if(object)try{
+    // Topology shutdown re-proves and stops each owned container in sequence.
+    if(await billingBounded(limits,l=>object[method](l),method==='stop'?120000:30000)!==true)ok=false;
+   }catch{ok=false;}
    if(browserClosed&&await browserClosed!==true)ok=false;
    cleanupConfirmed=ok;if(!ok)failure??='CLEANUP';return ok;
   })();return cleanupPromise;
@@ -83,7 +87,14 @@ async function createOwner(options,dependencies,selectedCase) {
     await step('LISTENER',l=>cli.startListener(l));
     await step('START',l=>bootstrap.start(l),2700000);
     fixture=await step('FIXTURE',async()=>{const factory=dependencies.createFixture??(await import('./stripe-billing-provision.mjs')).createBillingFixture;return factory({configuration,bootstrap,cli});});
-    await step('PROVISION',l=>fixture.provision(l));
+    let provisionLimits;
+    try{await step('PROVISION',l=>{provisionLimits=l;return fixture.provision(l);});}
+    catch(error){
+     if(challenge&&failure==='PROVISION'&&provisionLimits){
+      failure=billingInitial3dsProvisionCheckpoint(fixture,provisionLimits,configuration.runId,configuration.expectedSource)??failure;
+     }
+     throw error;
+    }
     async function verifyInitial() {
      if(!acks.create||!acks.confirm)fail('ACK');
      const proof=await step('EVIDENCE',async l=>{const prove=dependencies.prove??(await import('./stripe-billing-evidence.mjs')).proveBillingEvidence;return prove({configuration,bootstrap,fixture},l);},120000);

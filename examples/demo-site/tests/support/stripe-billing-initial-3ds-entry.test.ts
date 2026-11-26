@@ -5,7 +5,7 @@ import {fileURLToPath} from 'node:url';
 import type {TestCase,TestResult,FullResult} from '@playwright/test/reporter';
 import {createOwnedBillingInitial3ds} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 // @ts-ignore Offline tests execute the same worker and reporter modules.
-import {runInitial3dsCase} from './stripe-billing-initial-3ds-terminal.ts';
+import {challengeTerminalLine,runInitial3dsCase} from './stripe-billing-initial-3ds-terminal.ts';
 // @ts-ignore Offline tests execute the same worker and reporter modules.
 import Reporter from './stripe-billing-initial-3ds-reporter.ts';
 
@@ -18,6 +18,21 @@ test('ordinary discovery excludes the challenge and its synthetic checks',async(
  assert.match(isolated,/workers:1,retries:0/);assert.match(isolated,/trace:'off',video:'off',screenshot:'off'/);
  assert.match(entry,/PAYMENT_STRIPE_BILLING_CASE!=='initial_3ds'/);
  assert.ok(entry.indexOf('owner=await createOwnedBillingInitial3ds')<entry.indexOf('async({browser},info)'));
+});
+test('3DS terminal accepts only fixed provisioning diagnostics in the provisioning phase',async()=>{
+ const terminal=(phase:string,code:string)=>'owned_initial_3ds_terminal phase='+phase+' code='+code+' cleanup=CONFIRMED';
+ const exact=terminal('PROVISION','PROVISION_LOGIN_VERIFY');
+ assert.equal(challengeTerminalLine(exact),exact);
+ assert.equal(challengeTerminalLine(terminal('BROWSER','PROVISION_LOGIN_VERIFY')),null);
+ assert.equal(challengeTerminalLine(terminal('PROVISION','PROVISION_LOGIN_PRIVATE')),null);
+ assert.equal(challengeTerminalLine(exact+' detail=private'),null);
+ const state={scope:'INITIAL_3DS',status:'CLOSED',phase:'PROVISION',code:'PROVISION_LOGIN_VERIFY',
+  initialAccepted:false,initial3dsAccepted:false,full5bAccepted:false,cleanupConfirmed:true};
+ const annotations:{type:string;description?:string}[]=[];
+ const owner={run:async()=>{throw new Error('private sentinel');},close:async()=>state,resources:()=>state};
+ await assert.rejects(runInitial3dsCase(owner,async()=>assert.fail(),annotations),/billing_NOT_ACCEPTED/);
+ assert.equal(annotations[0]?.description,exact);
+ assert.equal(annotations.length,1);
 });
 for(const mode of ['original','copied result','duplicate','foreign project','second attempt']){
  test('new owner failure reaches only its own result: '+mode,async()=>{
