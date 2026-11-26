@@ -406,6 +406,17 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     expectedIssuerRevision=revision(target)+1;issuerParent={target,frames:new Map(original.frames)};issuerParent.frames.delete(target);
     await forwardOriginal();issuerReady.resolve();return;
    }
+   if(submission){
+    // The original form spends the only submission slot. Classify a later,
+    // always-denied POST only against the unchanged target document.
+    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT');
+    sameChain(original,committedIssuerDocument(target,submission));
+    requireValue(headers.origin===new URL(submission.url()).origin);
+    const repeat=url.href===submission.url() && typeof data==='string' &&
+     data.length<=65536 && createHash('sha256').update(data).digest('hex')===arm?.bodyHash;
+    report(repeat?'BROWSER_CHALLENGE_ISSUER_SUBMISSION_REPEAT':'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP');
+    requireValue(false);
+   }
    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION');
    const armed=arm;
    requireValue(armed);sameChain(armed.document,original);

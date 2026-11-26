@@ -35,7 +35,7 @@ test('native runner reserves cleanup and scheduling time beyond the unchanged ow
  assert.equal(ownerBudget,45*60*1000);
  assert.equal(number(owner,/limits\.deadline-Date\.now\(\)>(\d+)/),ownerBudget);
  assert.equal(cleanupBudget,120*1000);
- assert.equal(number(owner,/const limits=\{deadline:Date\.now\(\)\+(\d+)/),cleanupBudget);
+ assert.equal(number(owner,/limits=\{deadline:Math\.min\(now,active\?\.deadline\?\?now\)\+(\d+)/),cleanupBudget);
  assert.equal(runnerBudget,ownerBudget+cleanupBudget+60*1000);
  assert.equal(runnerBudget,48*60*1000);
  assert.equal(globalBudget,50*60*1000);
@@ -291,7 +291,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   const headers=passive?{...(fault==='approved-issuer-block-credentials'?{cookie:'private-cookie'}:{}),
    ...(fault==='approved-issuer-block-foreign-origin-header'?{origin:'https://merchant-fixture.test'}:{})}:
    navigation||issuerShape?{'content-type':issuerShape==='media'?'application/json':'application/x-www-form-urlencoded',
-   origin:issuerDocument===issuerUrl?issuerHost:'https://js.stripe.com'}:
+   origin:issuerDocument===issuerUrl?issuerHost:
+    fault.startsWith('second-issuer-')&&issuerDocument===actionUrl?new URL(actionUrl).origin:'https://js.stripe.com'}:
    {authorization:'Bearer pk_test_fixture',origin:'https://js.stripe.com',
     ...(trial?{'content-type':'application/x-www-form-urlencoded',...(fault==='trial-setup-cookie'?{cookie:'fixture'}:{})}:{})};
   const request={url:()=>url,method:()=>method,frame:()=>target,isNavigationRequest:()=>navigation,resourceType:()=>{
@@ -309,7 +310,13 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     fault==='approved-issuer-block-inspector-lookalike'?'net::ERR_BLOCKED_BY_CLIENT.Inspector.unexpected':'net::ERR_BLOCKED_BY_CLIENT'}),
    serviceWorker:()=>passive&&fault==='approved-issuer-block-worker'?{}:null,
    sizes:async()=>({responseBodySize:Buffer.byteLength(JSON.stringify(json))}),
-   redirectedFrom:()=>null,postData:()=>data,allHeaders:async()=>headers,existingResponse:()=>lateRetrieve||lateIssuer?null:existing,
+   redirectedFrom:()=>null,postData:()=>data,allHeaders:async()=>{
+    if(fault==='second-issuer-commit-during-headers' && url===actionUrl && trace.includes('issuer witnessed')){
+     issuerDocument=actionUrl;
+     navigate(issuer);
+    }
+    return headers;
+   },existingResponse:()=>lateRetrieve||lateIssuer?null:existing,
    response:async()=>{
     if(responseFault==='absent'||!existing)return null;
     if(responseFault==='unobserved')return new Promise<never>(()=>{});
@@ -325,7 +332,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    await reply(navigation?(url===actionUrl?'issuer-submission':'issuer'):url===setupUrl?'trial-setup':'issuer-api',200);
    existing=publish(request,200,json);
    if(url===setupUrl)setupFinished=true;
-   if(navigation&&(url!==issuerUrl||fault!=='approved-issuer-block-uncommitted')){issuerDocument=url;navigate(issuer);}
+   if(navigation&&(url!==issuerUrl||fault!=='approved-issuer-block-uncommitted') &&
+    (url!==actionUrl||fault!=='second-issuer-commit-during-headers')){issuerDocument=url;navigate(issuer);}
    if(url===issuerUrl&&fault.startsWith('approved-issuer-later-')){
     const shape=fault.slice('approved-issuer-later-'.length);
     await wire(issuerHost+'/unowned-fixture',issuer,shape==='method'?null:'fixture=value',{},shape!=='navigation',shape);
@@ -800,7 +808,17 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
   acknowledgeTrialSetup:async(identity:unknown)=>{
    assert.deepEqual(identity,{subscriptionId:sub,operationId:create});trace.push('verify setup');return true;
   },
-  beforeChallenge:async()=>{trace.push('persist challenge');return true;},acknowledgeChallenge:async()=>{trace.push('issuer witnessed');return true;},
+  beforeChallenge:async()=>{trace.push('persist challenge');return true;},acknowledgeChallenge:async()=>{
+   trace.push('issuer witnessed');
+   if(fault==='second-issuer-same-form')await wire(actionUrl,issuer,'decision=complete',{},true);
+   if(fault==='second-issuer-different-form')await wire(issuerHost+'/test-fixture/finish',issuer,'result=fixture',{},true);
+   if(fault==='second-issuer-commit-during-headers')await wire(actionUrl,issuer,'decision=complete',{},true);
+   if(fault==='second-issuer-replaced-document'){
+    navigate(issuer);
+    await wire(actionUrl,issuer,'decision=complete',{},true);
+   }
+   return true;
+  },
   beforeRetry:async()=>{trace.push('persist retry');if(fault==='retired-retry')manager.state.authorityRevision++;return true;},acknowledgeRetry:async()=>{trace.push('ack retry');return true;},
   beforeSuccessorConfirm:async()=>{trace.push('persist successor');if(fault==='retired-successor')manager.state.authorityRevision++;return true;},acknowledgeSuccessor:async()=>{trace.push('recovered proof');return true;},
   withOtpCode:async(callback:(code:string)=>Promise<true>)=>callback('123456'),
@@ -1509,6 +1527,26 @@ for(const fault of ['none','direct-issuer-valid','late-source-valid','late-issue
   assert.equal(f.providerSent.filter(x=>x.endsWith('/decision')).length,issuerSent?1:0);
  });
 }
+
+for(const [fault,checkpoint] of [
+ ['second-issuer-same-form','BROWSER_CHALLENGE_ISSUER_SUBMISSION_REPEAT'],
+ ['second-issuer-different-form','BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
+ ['second-issuer-replaced-document','BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT'],
+ ['second-issuer-commit-during-headers','BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT'],
+] as const)test('3DS blocks a second issuer document POST after the original 2xx: '+fault,async()=>{
+ const f=cancellationPage(fault,false,true);
+ await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+3000},async()=>{}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),checkpoint);
+  assert.equal(browserCleanupConfirmed(error),true);
+  assert.equal(JSON.stringify(error),'{}');
+  return true;
+ });
+ assert.equal(f.trace.filter(step=>step==='issuer witnessed').length,1);
+ assert.equal(f.trace.filter(step=>step==='issuer Complete').length,1);
+ assert.equal(f.providerSent.filter(url=>url.endsWith('/decision')).length,1);
+ assert.equal(f.providerSent.some(url=>url.endsWith('/finish')),false);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+});
 
 for(const [fault,expected,initialSent,expectedGestures] of [
  ['approved-issuer-valid',null,2,1],
