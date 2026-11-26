@@ -1547,6 +1547,93 @@ for(const interruption of ['before-callback','root-abort','child-deadline'])test
 function firstPaymentFixture(backendConfig={}){const f=fixture({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT:'true'},selectedCase:'initial_success',controlPort:18083,frozenTime:1790000000});const execute=f.dependencies.execute;
 f.dependencies.execute=async(file,args,settings)=>{const r=await execute(file,args,settings);if(args.includes('inspect')){const v=JSON.parse(r.stdout);if(args[4]==='image'&&args.at(-1)===PROJECT+'-backend:latest'){v.RuntimeSource=true;v.Entrypoint=['java','-Dloader.path=/app/initial-runtime','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentRuntime','-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher'];v.Cmd=null;}if(args[4]==='container'&&v.Name==='/'+PROJECT+'-backend'){v.RuntimeIdentity=true;v.Entrypoint=['java','-Dloader.path=/app/initial-runtime','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentRuntime','-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher'];v.Cmd=null;v.PortBindings['18083/tcp']=[{HostIp:'127.0.0.1',HostPort:'18083'}];if(v.State.Running)v.Ports['18083/tcp']=v.PortBindings['18083/tcp'];}r.stdout=JSON.stringify(v);}if(args.includes('config')&&args.includes('--format')){const v=JSON.parse(r.stdout),b=v.services.backend;b.build={context:ROOT+'/backend',dockerfile:'Dockerfile.billing-first-payment',args:{PAYMENT_RUNTIME_SOURCE_SHA:'e'.repeat(40)}};Object.assign(b,{entrypoint:null,command:null},backendConfig);Object.assign(b.environment,{PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:'buildOnly',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT:'true',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_RUN_ID:RUN,PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_SOURCE_SHA:'e'.repeat(40),PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_FROZEN_TIME:'1790000000',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_CONTROL_PORT:'18083',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_CONTROL_BIND:'0.0.0.0',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_CONTROL_KEY:'buildOnly'});b.ports.push({target:18083,published:'18083',host_ip:'127.0.0.1',protocol:'tcp'});r.stdout=JSON.stringify(v);}return r;};return f;}
 test('first-payment bootstrap privately binds dedicated source image entrypoint env and seventh port',async()=>{assert.equal(typeof bootstrapModule.createOwnedBillingFirstPaymentBootstrap,'function');const f=firstPaymentFixture(),b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),l=LIMIT();assert.equal(f.events.length,0);await b.prepare(l);await b.persistWebhookSecret(SECRET);await b.start(l);assert.equal(b.startupDiagnostic(),null);assert.equal(Object.isFrozen(b),true);let privateRuntime;await b.withFirstPaymentRuntime(v=>{privateRuntime=v;return true;},l);assert.match(privateRuntime.capability,/^[A-Za-z0-9_-]{43}$/);assert.equal(privateRuntime.endpoint,'http://127.0.0.1:18083');assert.equal(JSON.stringify(b.resources()).includes(privateRuntime.capability),false);assert.ok(f.events.some(e=>e.type==='port'&&e.port===18083));const yaml=f.files.get(DIR+'/runtime-build.yaml').contents.toString();assert.match(yaml,/Dockerfile.billing-first-payment/);assert.match(yaml,/PAYMENT_RUNTIME_SOURCE_SHA/);assert.ok(f.events.find(e=>e.type==='process'&&e.args.includes('build')&&e.args.includes('--quiet')).args.includes('PAYMENT_DEMO_BUILD_MODE=billing-first-payment'));assert.ok(f.events.filter(e=>e.type==='process'&&e.args.includes('build')).every(e=>e.args.includes(DIR+'/runtime-build.yaml')));await b.stop(LIMIT());});
+
+test('optional trial bootstrap refuses ignored inputs at the last boundary before build',async()=>{
+ const f=firstPaymentFixture(),prefix='PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL';
+ delete f.options.frozenTime;
+ Object.assign(f.options,{selectedCase:'optional_trial_pause_resume',env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',[prefix]:'true',
+  [prefix+'_CLI_PROFILE_RUN_ID']:'22345678-1234-4234-8234-123456789abc',[prefix+'_SUBNET']:'10.94.40.0/28'}});
+ const execute=f.dependencies.execute;
+ f.dependencies.execute=async(file,args,settings)=>{
+  const result=await execute(file,args,settings);
+  return args.includes('--others')?{...result,stdout:'examples/demo-site/src/PRIVATE_CANARY.ts\0'}:result;
+ };
+ const bootstrap=await bootstrapModule.createOwnedBillingOptionalTrialBootstrap(f.options,f.dependencies);
+ await assert.rejects(bootstrap.prepare(LIMIT()),{message:'stripe_sandbox_bootstrap_PREPARE_PENDING'});
+ assert.ok(f.events.some(e=>e.type==='process'&&e.args.includes('--others')));
+ assert.ok(!f.events.some(e=>e.type==='process'&&e.args.includes('build')));
+ assert.equal(f.containers.size,0);
+ assert.ok(!f.files.has(DIR+'/runtime.json')||!JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents.some(i=>i.action==='BUILD'));
+ assert.ok(!JSON.stringify(bootstrap.resources()).includes('PRIVATE_CANARY'));
+});
+
+test('optional trial bootstrap proves its source, topology, runtime worker isolation and exact cleanup',async()=>{
+ const f=firstPaymentFixture(),subnet='10.94.40.0/28',prefix='PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL';
+ delete f.options.frozenTime;
+ Object.assign(f.options,{selectedCase:'optional_trial_pause_resume',env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',[prefix]:'true',
+  [prefix+'_CLI_PROFILE_RUN_ID']:'22345678-1234-4234-8234-123456789abc',[prefix+'_SUBNET']:subnet}});
+ const entry=['java','-Dloader.path=/app/optional-trial-runtime,/app/optional-trial-libs','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingOptionalTrialRuntime',
+  '-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher'];
+ const execute=f.dependencies.execute,workers='{"payment.subscriptions.scheduling-enabled":false,"payment.inbox.scheduling-enabled":false,"payment.callbacks.scheduling-enabled":true}';
+ let hold=false,entered,release;
+ const blocked=new Promise(resolve=>{entered=resolve;});
+ f.dependencies.execute=async(file,args,settings)=>{
+  const result=await execute(file,args,settings);
+  if(hold&&args[5]==='inspect'){
+   hold=false;
+   await new Promise(resolve=>{release=resolve;entered();});
+   assert.equal(settings.signal.aborted,true);
+  }
+  if(args[4]==='network'&&args[5]==='inspect'&&args.some(arg=>arg.includes('.IPAM.Config')))return {...result,stdout:JSON.stringify({Config:[{Subnet:subnet}]})};
+  if(args[5]==='inspect'&&['container','image'].includes(args[4])){
+   const value=JSON.parse(result.stdout);
+   if(value.Entrypoint)value.Entrypoint=entry;
+   return {...result,stdout:JSON.stringify(value)};
+  }
+  if(args.includes('config')&&args.includes('--format')){
+   const value=JSON.parse(result.stdout),backend=value.services.backend;
+   backend.build.dockerfile='Dockerfile.billing-optional-trial';
+   for(const [key,setting] of Object.entries(backend.environment))if(key.startsWith('PAYMENT_STRIPE_BILLING_FIRST_PAYMENT')){
+    delete backend.environment[key];
+    if(!key.endsWith('_FROZEN_TIME'))backend.environment[key.replace('PAYMENT_STRIPE_BILLING_FIRST_PAYMENT',prefix)]=setting;
+   }
+   backend.environment.SPRING_APPLICATION_JSON=workers;
+   return {...result,stdout:JSON.stringify(value)};
+  }
+  return result;
+ };
+ const bootstrap=await bootstrapModule.createOwnedBillingOptionalTrialBootstrap(f.options,f.dependencies),limits=LIMIT();
+ const previous=Buffer.from(USERBYTES.toString().replace('WEBHOOK_SECRET=', 'WEBHOOK_SECRET=whsec_prior_A001122334455'));
+ f.files.get(USERFILE).contents=previous;
+ await bootstrap.prepare(limits);await bootstrap.persistWebhookSecret(SECRET);await bootstrap.start(limits);
+ assert.deepEqual(f.files.get(USERFILE).contents,previous);
+ assert.match(f.files.get(DIR+'/runtime-build.yaml').contents.toString(),/Dockerfile.billing-optional-trial/);
+ assert.match(f.files.get(DIR+'/owned.yaml').contents.toString(),/127\.0\.0\.1:18083:18083/);
+ assert.ok(f.events.some(e=>e.type==='process'&&e.args.includes('PAYMENT_DEMO_BUILD_MODE=billing-optional-trial')));
+ assert.ok(f.events.some(e=>e.type==='process'&&e.args.includes('--subnet')&&e.args.includes(subnet)));
+ assert.ok(f.events.some(e=>e.type==='health'&&e.url==='http://127.0.0.1:18081/healthz'));
+ assert.ok(!f.events.some(e=>e.type==='health'&&e.url==='http://127.0.0.1:18081/health'));
+ assert.ok(f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='inspect')
+  .some(e=>e.args.some(arg=>arg.includes(JSON.stringify('SPRING_APPLICATION_JSON='+workers)))));
+ assert.ok(f.events.filter(e=>e.type==='preflight').every(e=>!Object.hasOwn(e.input,'frozenTime')&&e.input.controlPort===18083));
+ const env=f.files.get(DIR+'/final.env').contents.toString();
+ assert.doesNotMatch(env,/PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL_(FROZEN_TIME|ACCOUNT_ID)/);
+ assert.match(env,new RegExp('PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET='+SECRET));
+ let control;
+ await bootstrap.withOptionalTrialRuntime(v=>{control=v;return true;},limits);
+ assert.equal(control.endpoint,'http://127.0.0.1:18083');
+ assert.match(control.capability,/^[A-Za-z0-9_-]{43}$/);
+ assert.equal(JSON.stringify(bootstrap.resources()).includes(control.capability),false);
+ hold=true;
+ const read=assert.rejects(bootstrap.withDatabaseCredentials(()=>assert.fail('no credentials after abort'),limits),/ADMIN_PENDING/);
+ await blocked;
+ const stopping=bootstrap.stop(limits);
+ await turn();
+ assert.equal(f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='stop').length,0);
+ release();await read;
+ assert.equal(await stopping,true);
+ assert.ok(Object.values(bootstrap.resources().containers).every(container=>container.status==='exited'));
+});
 for(const drift of ['source','entrypoint','environment','port'])test('first-payment bootstrap rejects '+drift+' drift before start',async()=>{assert.equal(typeof bootstrapModule.createOwnedBillingFirstPaymentBootstrap,'function');const f=firstPaymentFixture(),execute=f.dependencies.execute;f.dependencies.execute=async(file,args,settings)=>{const r=await execute(file,args,settings);if(args[4]==='image'&&args[5]==='inspect'&&args.at(-1)===PROJECT+'-backend:latest'){const v=JSON.parse(r.stdout);if(drift==='source')v.RuntimeSource=false;if(drift==='entrypoint')v.Entrypoint=['java','-jar','app.jar'];r.stdout=JSON.stringify(v);}if(args[4]==='container'&&args[5]==='inspect'){const v=JSON.parse(r.stdout);if(v.Name==='/'+PROJECT+'-backend'){if(drift==='environment')v.RuntimeIdentity=false;if(drift==='port')v.PortBindings['18083/tcp'][0].HostIp='0.0.0.0';}r.stdout=JSON.stringify(v);}return r;};const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies);await assert.rejects(b.prepare(LIMIT()));assert.equal(f.events.some(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='start'&&e.args.at(-1)===b.resources().containers.backend?.id),false);});
 
 // Break: inherited null or absent command fields are mistaken for explicit overrides.

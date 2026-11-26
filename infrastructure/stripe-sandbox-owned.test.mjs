@@ -114,6 +114,21 @@ test('failed-renewal source mismatch stops before private file inspection', asyn
   assert.deepEqual(f.calls.map(call => [call.type,call.file]), [['execute','/usr/bin/git']]);
 });
 
+test('optional trial preflight refuses ignored Docker inputs before private admission or daemon probes',async()=>{
+  const input=options({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL:'true',
+    PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL_CLI_PROFILE_RUN_ID:'22345678-1234-4234-8234-123456789abc',
+    PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL_SUBNET:'10.94.40.0/28'},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',
+    apiVersion:'2026-09-30.endive'},selectedCase:'optional_trial_pause_resume',controlPort:56127});
+  const f=fixture(),execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,settings)=>{
+    const result=await execute(file,args,settings);
+    return args.includes('--others')?{...result,stdout:'backend/src/main/resources/META-INF/PRIVATE_CANARY.class\0'}:result;
+  };
+  safe(await owned.preflightOwnedBillingOptionalTrial(input,f.dependencies),pending('SOURCE','SOURCE_MISMATCH'));
+  assert.ok(f.calls.some(call=>call.args?.includes('--others')));
+  assert.ok(f.calls.every(call=>call.type==='execute'&&call.file==='/usr/bin/git'));
+});
+
 test('cancelled failed-renewal admission closes a late file handle before reading it', async t => {
   const f = await failedRenewalFixture(t);
   await writeFile(f.file, keyBytes, {mode:0o600});

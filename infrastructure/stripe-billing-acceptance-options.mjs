@@ -18,7 +18,8 @@ const cancelCase='initial_cancel_withdraw';
 const invoiceCase='initial_missed_reordered';
 const challengeCase='initial_3ds';
 const retryCase='initial_decline_retry';
-const EXCLUDED=['ALLOW_TEST_OPERATIONS','FULL_RUN','OWNED_RUN','REMAINING_ONLY','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT','MANUAL_3DS','MANUAL_REFUND','MANUAL_REFUND_REMAINDER'].map(name=>'PAYMENT_STRIPE_SANDBOX_'+name).concat('PAYMENT_STRIPE_BILLING_FAILED_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_PAYMENT');
+const OTHER_BILLING=['PAYMENT_STRIPE_BILLING_FAILED_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_PAYMENT','PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL'];
+const EXCLUDED=['ALLOW_TEST_OPERATIONS','FULL_RUN','OWNED_RUN','REMAINING_ONLY','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT','MANUAL_3DS','MANUAL_REFUND','MANUAL_REFUND_REMAINDER'].map(name=>'PAYMENT_STRIPE_SANDBOX_'+name).concat(OTHER_BILLING);
 const OLD_RUNS=new Set(['031b5ae7-6603-4339-b1b3-77231291ff34','34941d87-12d3-4c74-8c5a-b62b7c914390']);
 const PROFILE_FLAGS=[[RETRY_CLI_PROFILE_RUN_ID,retryCase],[THREE_DS_CLI_PROFILE_RUN_ID,challengeCase],
   [CANCELLATION_CLI_PROFILE_RUN_ID,cancelCase],[INVOICE_WEBHOOKS_CLI_PROFILE_RUN_ID,invoiceCase],[REQUIRED_TRIAL_CLI_PROFILE_RUN_ID,requiredTrialCase]];
@@ -37,7 +38,7 @@ export function billingAcceptanceProfileRunId(env){return runtimeOption(Object.g
 export function billingAcceptanceSubnet(env){return runtimeOption(Object.getOwnPropertyDescriptors(env),SUBNET_FLAGS);}
 /** Reciprocal gate for legacy factories, including exotic legacy environment records. */
 export function billingAcceptanceExcluded(env){
-  try{if(!env||typeof env!=='object')return false;return [FLAG,'PAYMENT_STRIPE_BILLING_FAILED_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_RENEWAL','PAYMENT_STRIPE_BILLING_FIRST_PAYMENT'].every(key=>{const d=Object.getOwnPropertyDescriptor(env,key);return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);});}catch{return false;}
+  try{if(!env||typeof env!=='object')return false;return [FLAG,...OTHER_BILLING].every(key=>{const d=Object.getOwnPropertyDescriptor(env,key);return d?d.enumerable&&Object.hasOwn(d,'value')&&[undefined,'','false'].includes(d.value):!(key in env);});}catch{return false;}
 }
 export function billingAcceptanceOptIn(env){
   try{return admittedFlags(descriptors(env));}catch{return false;}

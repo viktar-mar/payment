@@ -1,4 +1,5 @@
 import {FAILED_RENEWAL_CLI_PROFILE_RUN_ID,billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
+import {OPTIONAL_TRIAL_CLI_PROFILE_RUN_ID,billingOptionalTrialOptIn,validateBillingOptionalTrialOptions} from './stripe-billing-optional-trial-options.mjs';
 import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
 import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
@@ -37,7 +38,7 @@ const fail=()=>{throw null;};
 const fixed=code=>new Error('stripe_sandbox_cli_'+code);
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 // Closed purposes are private capabilities, never caller-supplied modes or flags.
-const SANDBOX=Symbol('sandbox'),REFUND=Symbol('refund'),REMAINDER=Symbol('remainder'),BILLING=Symbol('billing'),FIRST_PAYMENT=Symbol('first-payment'),FIRST_RENEWAL=Symbol('first-renewal'),FAILED_RENEWAL=Symbol('failed-renewal');
+const SANDBOX=Symbol('sandbox'),REFUND=Symbol('refund'),REMAINDER=Symbol('remainder'),BILLING=Symbol('billing'),FIRST_PAYMENT=Symbol('first-payment'),FIRST_RENEWAL=Symbol('first-renewal'),FAILED_RENEWAL=Symbol('failed-renewal'),OPTIONAL_TRIAL=Symbol('optional-trial');
 const ORIGINAL='031b5ae7-6603-4339-b1b3-77231291ff34',PRIOR='34941d87-12d3-4c74-8c5a-b62b7c914390';
 function exactData(value,keys){
   if(!object(value)||![Object.prototype,null].includes(Object.getPrototypeOf(value)))fail();
@@ -77,13 +78,14 @@ export async function createSandboxCliAdapter(options,dependencies={}) {
 export async function createBillingFirstPaymentCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,FIRST_PAYMENT);}
 export async function createBillingFailedRenewalCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,FAILED_RENEWAL);}
 export async function createBillingFirstRenewalCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,FIRST_RENEWAL);}
+export async function createOwnedBillingOptionalTrialCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,OPTIONAL_TRIAL);}
 export async function createBillingCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,BILLING);}
 async function createBillingModeCliAdapter(options,dependencies,purpose) {
   let selected,configuration,invoiceForwardTarget;
   try{
     const keys=['configuration','cliDirectory','verifyForwardTarget','persistWebhookSecret'];
     const hasIngress=Object.hasOwn(options,'invoiceIngress');
-    selected=exactData(options,hasIngress?[...keys,'invoiceIngress']:keys);configuration=(purpose===FAILED_RENEWAL?validateBillingFailedRenewalOptions:purpose===FIRST_RENEWAL?validateBillingFirstRenewalOptions:purpose===FIRST_PAYMENT?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(selected.configuration);
+    selected=exactData(options,hasIngress?[...keys,'invoiceIngress']:keys);configuration=(purpose===OPTIONAL_TRIAL?validateBillingOptionalTrialOptions:purpose===FAILED_RENEWAL?validateBillingFailedRenewalOptions:purpose===FIRST_RENEWAL?validateBillingFirstRenewalOptions:purpose===FIRST_PAYMENT?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(selected.configuration);
     if(!configuration||hasIngress!==(purpose===BILLING&&configuration.selectedCase==='initial_missed_reordered'))fail();
     if(hasIngress){
       const {ownedInvoiceForwardTarget}=await import('./stripe-billing-invoice-ingress.mjs');
@@ -95,7 +97,9 @@ async function createBillingModeCliAdapter(options,dependencies,purpose) {
   return createCliAdapter({...configuration,invoiceIngress:selected.invoiceIngress,invoiceForwardTarget,cliDirectory:selected.cliDirectory,backendPort:configuration.ports.backend,accountKey:'stripe-sandbox-default',verifyForwardTarget:selected.verifyForwardTarget,persistWebhookSecret:selected.persistWebhookSecret},dependencies,purpose);
 }
 async function createCliAdapter(options,dependencies,purpose) {
-  const failedRenewal=purpose===FAILED_RENEWAL,firstRenewal=purpose===FIRST_RENEWAL,firstPayment=purpose===FIRST_PAYMENT||firstRenewal||failedRenewal,billingMode=purpose===BILLING||firstPayment,remainderMode=purpose===REMAINDER,refundMode=purpose===REFUND||remainderMode;
+  const optionalTrial=purpose===OPTIONAL_TRIAL,failedRenewal=purpose===FAILED_RENEWAL,firstRenewal=purpose===FIRST_RENEWAL;
+  const firstPayment=purpose===FIRST_PAYMENT||firstRenewal||failedRenewal||optionalTrial,billingMode=purpose===BILLING||firstPayment,remainderMode=purpose===REMAINDER,refundMode=purpose===REFUND||remainderMode;
+  const verifyListenerClose=failedRenewal||optionalTrial;
   const descriptor=Object.getOwnPropertyDescriptor(options??{},'env');
   const rawEnv=descriptor?.enumerable&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined;
   if(!billingMode&&!billingAcceptanceExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
@@ -108,12 +112,13 @@ async function createCliAdapter(options,dependencies,purpose) {
     threeDSecure=selected?.value==='true';if(threeDSecure&&(refundMode||!manualPaymentOptIn(rawEnv)))fail();
   }catch{throw fixed('OPT_IN_REQUIRED');}
   try {const optIn=rawEnv;manualPaymentMode=!refundMode&&optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=remainderMode?manualRefundRemainderOptIn(optIn):refundMode?manualRefundOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
-  if(billingMode)enabled=(failedRenewal?billingFailedRenewalOptIn:firstRenewal?billingFirstRenewalOptIn:firstPayment?billingFirstPaymentOptIn:billingAcceptanceOptIn)(rawEnv);
+  if(billingMode)enabled=(optionalTrial?billingOptionalTrialOptIn:failedRenewal?billingFailedRenewalOptIn:firstRenewal?billingFirstRenewalOptIn:firstPayment?billingFirstPaymentOptIn:billingAcceptanceOptIn)(rawEnv);
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
-  const profileRunId=failedRenewal?Object.getOwnPropertyDescriptor(rawEnv,FAILED_RENEWAL_CLI_PROFILE_RUN_ID)?.value
+  const profileRunId=optionalTrial?Object.getOwnPropertyDescriptor(rawEnv,OPTIONAL_TRIAL_CLI_PROFILE_RUN_ID)?.value:
+    failedRenewal?Object.getOwnPropertyDescriptor(rawEnv,FAILED_RENEWAL_CLI_PROFILE_RUN_ID)?.value
     :purpose===BILLING?billingAcceptanceProfileRunId(rawEnv):undefined;
   const requiredTrialCase=purpose===BILLING&&options.selectedCase==='initial_required_trial';
-  if(requiredTrialCase&&!profileRunId)throw fixed('OPT_IN_REQUIRED');
+  if((requiredTrialCase||optionalTrial)&&!profileRunId)throw fixed('OPT_IN_REQUIRED');
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {
     const env=rawEnv;
@@ -146,7 +151,8 @@ async function createCliAdapter(options,dependencies,purpose) {
   let retryNext='declined',retryWitness;
   let cancellationNext='initial',originalCancellationCash;
   let requiredTrialStarted=false,requiredTrialInFlight;
-  const rejectOverlap=cancellationCase||retryCase||invoiceCase||requiredTrialCase;
+  const drainableListener=requiredTrialCase||optionalTrial;
+  const rejectOverlap=cancellationCase||retryCase||invoiceCase||drainableListener;
 
   function check(context) {
     if(context.signal.aborted||Date.now()>=(context.proofDeadline??context.deadline))fail();
@@ -156,7 +162,7 @@ async function createCliAdapter(options,dependencies,purpose) {
     }
   }
   function operation(code,limits,body) {
-    const drainable=requiredTrialCase&&code!=='STOP'&&!busy;
+    const drainable=drainableListener&&code!=='STOP'&&!busy;
     const running=runOperation(code,limits,body);
     if(!drainable)return running;
     requiredTrialInFlight=running;
@@ -399,15 +405,15 @@ async function createCliAdapter(options,dependencies,purpose) {
     // A failed-renewal webhook write can stay unresolved after its child closes.
     // After teardown, wait only for that child's close within this cleanup deadline.
     if(uncertain){
-      if(!failedRenewal||!record||record.child.pid!==record.pid)fail();
+      if(!verifyListenerClose||!record||record.child.pid!==record.pid)fail();
       await controlled(record.termination,context);
     }
     if(record===null)return true;
-    if(!failedRenewal&&record.explicitStop&&(billingMode?record.closed:record.exited))return true;
+    if(!verifyListenerClose&&record.explicitStop&&(billingMode?record.closed:record.exited))return true;
     check(context);
     record.stopping=true;
     if(!await terminate(record,Math.min(10000,Math.max(2,context.deadline-Date.now()))))fail();
-    if(failedRenewal&&(record!==owner||record.child.pid!==record.pid||!record.closed))fail();
+    if(verifyListenerClose&&(record!==owner||record.child.pid!==record.pid||!record.closed))fail();
     check(context);record.explicitStop=true;
     return true;
   }
@@ -969,7 +975,7 @@ async function createCliAdapter(options,dependencies,purpose) {
       const result=await binding(context);if(billingMode)billingBound=true;return result;
     }),
     startListener:limits=>operation('LISTENER',limits,async context=>{if(billingMode){if(!billingBound||billingStarted)fail();billingStarted=true;}return startListener(context);}),
-    stopListener:requiredTrialCase?stopRequiredTrialListener:stopOwnedListener,
+    stopListener:drainableListener?stopRequiredTrialListener:stopOwnedListener,
     ...(billingMode?{
       assertBillingListener,
       ...(requiredTrialCase?{proveOwnedBillingRequiredTrial}:{}),

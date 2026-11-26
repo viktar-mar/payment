@@ -1,0 +1,285 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createContext,runInContext} from 'node:vm';
+import type {Browser,Request,Response,Route} from '@playwright/test';
+import {browserCleanupConfirmed,browserDiagnostic} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
+// @ts-ignore Native Node executes the same protocol fixture registration.
+import {registerChromiumProtocolFixture} from './stripe-billing-chromium-route.ts';
+// @ts-ignore Native Node executes the same source as Playwright.
+import {optionalTrialSetupExchange,runOptionalTrialSetupBrowser,type OptionalTrialSetupPermit} from './stripe-billing-optional-trial-setup.ts';
+
+const permit:OptionalTrialSetupPermit = {
+  setupIntentId:'seti_owned', publishableKey:'pk_test_fixture', clientSecret:'seti_owned_secret_fixture',
+  expiresAt:new Date(Date.now()+60_000).toISOString(),
+};
+const confirmUrl='https://api.stripe.com/v1/setup_intents/seti_owned/confirm';
+const frameOrigin='https://js.stripe.com';
+const redacted=/^Error: billing_OPTIONAL_TRIAL_SETUP_BROWSER$/;
+function fixture(){
+  const headers:Record<string,string>={origin:frameOrigin,'content-type':'application/x-www-form-urlencoded'};
+  const form=new URLSearchParams({client_secret:permit.clientSecret,key:permit.publishableKey,'payment_method_data[type]':'card'});
+  const request={
+    url:()=>confirmUrl,method:()=>'POST',redirectedFrom:()=>null,serviceWorker:()=>null,
+    isNavigationRequest:()=>false,resourceType:()=>'fetch',postData:()=>form.toString(),allHeaders:async()=>headers,
+  };
+  const value:Record<string,unknown>={object:'setup_intent',id:permit.setupIntentId,client_secret:permit.clientSecret,
+    livemode:false,status:'succeeded',next_action:null};
+  const response={
+    request:()=>request,url:()=>confirmUrl,status:()=>200,fromServiceWorker:()=>false,
+    body:async()=>Buffer.from(JSON.stringify(value)),
+  };
+  const exchange=optionalTrialSetupExchange(permit);
+  return {headers,form,value,request,response,exchange,
+    claim:(trusted=true)=>exchange.claim(request as unknown as Request,headers,frameOrigin,trusted),
+    verify:()=>exchange.verify(response as unknown as Response)};
+}
+
+test('pairs one trusted original SetupIntent POST and its succeeded test-mode response',async()=>{
+  const f=fixture();
+  f.claim();
+  assert.equal(f.exchange.isResponse(f.response as unknown as Response),true);
+  assert.throws(()=>f.claim(),redacted);
+  await f.verify();
+});
+
+for(const fault of ['untrusted','wrong path','payment intent','secret','duplicate secret','wrong key','mixed keys','foreign frame',
+ 'confirmation token','other method','connect override','cookie','navigation','redirect']){
+  test('refuses setup confirmation before forwarding on '+fault,()=>{
+    const f=fixture();
+    switch(fault){
+      case 'wrong path':f.request.url=()=>confirmUrl.replace('seti_owned','seti_other');break;
+      case 'payment intent':f.request.url=()=>confirmUrl.replace('/setup_intents/seti_owned','/payment_intents/pi_other');break;
+      case 'secret':f.form.set('client_secret','seti_other_secret_fixture');break;
+      case 'duplicate secret':f.form.append('client_secret',permit.clientSecret);break;
+      case 'wrong key':f.form.set('key','pk_test_foreign');break;
+      case 'mixed keys':f.headers.authorization='Bearer pk_test_other';break;
+      case 'foreign frame':f.headers.origin='https://other.test';break;
+      case 'confirmation token':f.form.set('confirmation_token','ctoken_other');break;
+      case 'other method':f.form.set('payment_method','pm_other');break;
+      case 'connect override':f.headers['stripe-account']='acct_other';break;
+      case 'cookie':f.headers.cookie='anything';break;
+      case 'navigation':f.request.isNavigationRequest=()=>true;break;
+      case 'redirect':Object.assign(f.request,{redirectedFrom:()=>({})});break;
+    }
+    assert.throws(()=>f.claim(fault!=='untrusted'),redacted);
+    assert.equal(f.exchange.isResponse(f.response as unknown as Response),false);
+  });
+}
+
+for(const fault of ['other request','other intent','other secret','live','requires action','action despite success','service worker','failed HTTP','oversize','duplicate id alias','duplicate test mode','duplicate secret alias']){
+  test('rejects an unverified setup response on '+fault,async()=>{
+    const f=fixture();f.claim();
+    switch(fault){
+      case 'other request':f.response.request=()=>({...f.request});break;
+      case 'other intent':f.value.id='seti_other';break;
+      case 'other secret':f.value.client_secret='seti_other_secret_fixture';break;
+      case 'live':f.value.livemode=true;break;
+      case 'requires action':f.value.status='requires_action';break;
+      case 'action despite success':f.value.next_action={type:'redirect_to_url'};break;
+      case 'service worker':f.response.fromServiceWorker=()=>true;break;
+      case 'failed HTTP':f.response.status=()=>402;break;
+      case 'oversize':f.response.body=async()=>Buffer.alloc(65_537);break;
+      case 'duplicate id alias':f.response.body=async()=>Buffer.from(JSON.stringify(f.value)
+        .replace('"id":','"\\u0069d":"seti_other","id":'));break;
+      case 'duplicate test mode':f.response.body=async()=>Buffer.from(JSON.stringify(f.value)
+        .replace('"livemode":','"livemode":true,"livemode":'));break;
+      case 'duplicate secret alias':f.response.body=async()=>Buffer.from(JSON.stringify(f.value)
+        .replace('"client_secret":','"client_\\u0073ecret":"seti_other_secret_fixture","client_secret":'));break;
+    }
+    await assert.rejects(f.verify(),redacted);
+  });
+}
+
+// Runs the real routing and page callbacks against VM DOM and CDP values only.
+function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'){
+  const picked={...permit,setupIntentId:'seti_'+mode.replaceAll(' ',''),
+    clientSecret:'seti_'+mode.replaceAll(' ','')+'_secret_fixture'};
+  const url='https://api.stripe.com/v1/setup_intents/'+picked.setupIntentId+'/confirm';
+  let path='about:blank',closed=0,nextId=0,trustChecks=0;
+  let routeHandler:((route:Route)=>Promise<void>)|undefined;
+  const devtools=new Map<string,(event:unknown)=>void|Promise<void>>();
+  const listeners=new Map<string,((event?:unknown)=>void)[]>();
+  const emit=(name:string,event?:unknown)=>{for(const listener of listeners.get(name)??[])listener(event);};
+  const writes:string[]=[];
+  const found=Promise.withResolvers<Response>();
+  let governingResponse:((r:Response)=>boolean)|undefined;
+  const host={isConnected:true};
+  const cardOwner={isConnected:true};
+  let pendingPresentation:Promise<void>|undefined;
+  const document={
+    hidden:false,activeElement:undefined as unknown,
+    querySelector:(selector:string)=>selector==='#payment-element'?host:
+      selector==='#confirm-setup' || selector==='#confirm-setup[data-confirmed="true"]'&&button.dataset.confirmed?button:
+      selector.includes('Secure payment input frame')?cardOwner:null,
+    addEventListener:()=>{},
+  };
+  class TestButton {
+    dataset:Record<string,string>={};isConnected=true;
+    handlers:{event:string;fn:(event:{isTrusted:boolean})=>void;capture:boolean}[]=[];
+    private inactive=true;
+    get disabled(){return this.inactive;}
+    set disabled(value:boolean){this.inactive=value;if(value&&document.activeElement===this)document.activeElement=undefined;}
+    addEventListener(event:string,fn:(event:{isTrusted:boolean})=>void,options?:{capture:boolean}) {
+      this.handlers.push({event,fn,capture:options?.capture??false});
+    }
+  }
+  const button=new TestButton();
+  const paymentEvents=new Map<string,(event?:unknown)=>void>();
+  const location={get href(){return path;}};
+  const window={
+    get top(){return window;},addEventListener:()=>{},
+    Stripe:(key:string)=>{
+      assert.equal(key,picked.publishableKey);
+      return {
+        elements:(options:{clientSecret:string})=>{
+          assert.equal(options.clientSecret,picked.clientSecret);
+          return {create:()=>({on:(name:string,fn:(event?:unknown)=>void)=>paymentEvents.set(name,fn),
+            mount:()=>{
+              if(['approved helper','card reload during helper trust'].includes(mode))pendingPresentation=request(url.replace('/confirm','')+'?'+new URLSearchParams({
+                key:picked.publishableKey,client_secret:picked.clientSecret}), 'GET',sibling,false,'fetch');
+              paymentEvents.get('ready')!();paymentEvents.get('change')!({complete:true});
+            }})};
+        },
+        confirmSetup:async()=>{
+          if(mode==='card reload')emit('framenavigated',stripe);
+          const frame=mode==='foreign frame'?foreign:mode==='main transport'?main:
+            ['sibling confirm','approved helper','card reload during helper trust'].includes(mode)?sibling:stripe;
+          await request(url,'POST',frame,false,'fetch');
+          if(mode==='repeat')await request(url,'POST',stripe,false,'fetch');
+          return {setupIntent:{id:picked.setupIntentId,status:'succeeded'}};
+        },
+      };
+    },
+  };
+  const script=createContext({window,document,location,HTMLElement:Object,HTMLButtonElement:TestButton});
+  function evaluate<T>(fn:Function,argument?:unknown):T {
+    Object.assign(script,{argument});
+    return runInContext('('+fn.toString()+')(argument)',script) as T;
+  }
+  const main={page:()=>page,url:()=>path,isDetached:()=>false,parentFrame:()=>null as unknown,name:()=>''};
+  const stripe={page:()=>page,url:()=>frameOrigin+'/fixture',isDetached:()=>false,parentFrame:()=>main,name:()=>'stripe',
+    locator:()=>({fill:async()=>{await pendingPresentation;},isVisible:async()=>false}),
+    waitForURL:async(predicate:(value:URL)=>boolean)=>{assert.equal(predicate(new URL(stripe.url())),true);}};
+  const sibling={...stripe,name:()=>'sibling'};
+  const foreign={...stripe,name:()=>'foreign',url:()=>'https://other.test/fixture'};
+  const page={
+    mainFrame:()=>main,url:()=>path,context:()=>context,on:(name:string,fn:(event?:unknown)=>void)=>{
+      listeners.set(name,[...listeners.get(name)??[],fn]);
+    },
+    goto:async(target:string)=>{
+      await request(target,'GET',main,true,'document');
+      path=target;
+      await request('https://js.stripe.com/endive/stripe.js','GET',main,false,'script');
+    },
+    evaluate:async(fn:Function,arg?:unknown)=>evaluate(fn,arg),
+    locator:()=>({frameLocator:()=>({locator:()=>stripe.locator()}),locator:()=>({
+      elementHandle:async()=>({contentFrame:async()=>stripe,evaluate:async(fn:Function,selector:string)=>{
+        Object.assign(script,{element:cardOwner,selector});return runInContext('('+fn.toString()+')(element,selector)',script);
+      }})
+    })}),
+    getByRole:()=>({elementHandle:async()=>({
+      waitForElementState:async()=>{assert.equal(button.disabled,false);},
+      focus:async()=>{document.activeElement=button;},
+      evaluateHandle:async(fn:Function)=>{
+        const witness=evaluate<()=>boolean>(fn,button);
+        return {evaluate:async(reader:(value:()=>boolean)=>boolean)=>{
+          const clicked=reader(witness);
+          if(++trustChecks===2 && mode==='card reload during helper trust')emit('framenavigated',stripe);
+          return clicked;
+        }};
+      },
+      press:async(key:string)=>{
+        assert.equal(key,'Enter');
+        for(const listener of [...button.handlers].sort((a,b)=>Number(b.capture)-Number(a.capture)))
+          listener.fn({isTrusted:mode!=='untrusted'});
+        if(mode==='untrusted')throw new Error('private untrusted attempt details');
+      },
+    })}),
+    waitForResponse:(predicate:(r:Response)=>boolean)=>{governingResponse=predicate;return found.promise;},
+    waitForFunction:async(fn:Function)=>{
+      for(let n=0;n<25 && !evaluate<boolean>(fn);n++)await new Promise(resolve=>setImmediate(resolve));
+      assert.equal(evaluate<boolean>(fn),true);
+    },
+  };
+  const context={
+    newPage:async()=>page,on:()=>{},routeWebSocket:async()=>{},
+    route:async(pattern:string,fn:typeof routeHandler)=>{assert.equal(pattern,'**/*');routeHandler=fn;},
+    newCDPSession:async(surface:unknown)=>{
+      if(surface!==page)throw Error('This frame does not have a separate CDP session, it is a part of the parent frame\'s session');
+      return {
+        on:(name:string,fn:(event:unknown)=>void)=>devtools.set(name,fn),
+        send:async(command:string):Promise<unknown>=>command==='Page.getFrameTree'?{frameTree:{frame:{id:'main',url:path},
+          childFrames:[stripe,sibling,foreign].map(frame=>({frame:{id:frame.name(),url:frame.url(),name:frame.name()}}))}}:undefined,
+      };
+    },
+    close:async()=>{
+      closed++;
+      emit('close');
+      if(governingResponse)found.reject(Error('private close details'));
+      if(mode==='close fails')throw Error('private close details');
+    },
+  };
+  async function request(target:string,method:string,frame:typeof main|typeof stripe,navigation:boolean,resource:string){
+    const id=String(++nextId),frameId=frame===main?'main':frame.name(),wire={url:target,method};
+    const result=Promise.withResolvers<Response>();
+    await devtools.get('Network.requestWillBeSent')!({requestId:id,frameId,request:wire});
+    const original:unknown={
+      url:()=>target,method:()=>method,frame:()=>frame,isNavigationRequest:()=>navigation,resourceType:()=>resource,
+      redirectedFrom:()=>null,serviceWorker:()=>null,allHeaders:async()=>method==='POST'?
+        {origin:new URL(frame.url()).origin,'content-type':'application/x-www-form-urlencoded'}:{},
+      postData:()=>new URLSearchParams({key:picked.publishableKey,client_secret:picked.clientSecret}).toString(),
+      response:()=>result.promise,
+    };
+    const respond=async()=>{
+      await devtools.get('Fetch.requestPaused')!({requestId:id,networkId:id,frameId,request:wire,responseStatusCode:200});
+      const accepted={
+        request:()=>original,url:()=>target,status:()=>200,fromServiceWorker:()=>false,
+        body:async()=>Buffer.from(JSON.stringify({object:'setup_intent',id:picked.setupIntentId,
+          client_secret:picked.clientSecret,livemode:false,status:'succeeded'})),
+      } as Response;
+      result.resolve(accepted);
+      if(method==='POST'){
+        writes.push(target);
+        if(governingResponse?.(accepted))found.resolve(accepted);
+      }
+    };
+    await routeHandler!({request:()=>original,continue:respond,fallback:respond,abort:async()=>{},
+      fulfill:async({body}:{body:string})=>{
+        assert.match(target,/^http:\/\/127\.0\.0\.1:\d{4,5}\/owned-trial-setup\//);
+        assert.doesNotMatch(body,/seti_|pk_test_|secret_fixture/);await respond();
+      }} as unknown as Route);
+  }
+  registerChromiumProtocolFixture(page);
+  const browser={newContext:async()=>context} as unknown as Browser;
+  return {browser,picked,writes,url,closed:()=>closed,run:()=>runOptionalTrialSetupBrowser(browser,picked,
+    {deadline:Date.now()+2000},()=>false)};
+}
+
+test('the held document forwards one original charge-free setup POST after one trusted keyboard gesture',async()=>{
+  const f=checkout('normal');
+  assert.equal(await f.run(),true);
+  assert.deepEqual(f.writes,[f.url]);
+  assert.equal(f.closed(),1);
+  await assert.rejects(f.run(),(error:unknown)=>browserCleanupConfirmed(error) && !String(error).includes(f.picked.clientSecret));
+  assert.deepEqual(f.writes,[f.url]);
+  assert.equal(f.closed(),1);
+});
+
+for(const fault of ['untrusted','foreign frame','repeat','close fails','card reload','sibling confirm','card reload during helper trust'] as const)test('isolated setup stops and reports cleanup for '+fault,async()=>{
+  const f=checkout(fault);
+  await assert.rejects(f.run(),(error:unknown)=>{
+    assert.equal(browserCleanupConfirmed(error),fault!=='close fails');
+    if(fault==='close fails')assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CLEANUP');
+    assert.equal(String(error),'Error: billing_BROWSER');
+    return true;
+  });
+  assert.deepEqual(f.writes,['repeat','close fails'].includes(fault)?[f.url]:[]);
+  assert.equal(f.closed(),1);
+});
+
+for(const shape of ['main transport','approved helper'] as const)test('confirms through the exact prebound '+shape,async()=>{
+  const f=checkout(shape);
+  assert.equal(await f.run(),true);
+  assert.deepEqual(f.writes,[f.url]);
+  assert.equal(f.closed(),1);
+});

@@ -865,6 +865,30 @@ async function failedRenewalProfile(t, acceptanceCase) {
   return {f,cli,source,destination};
 }
 
+test('optional trial authenticates the copied Sandbox profile and offers only the owned listener',async t=>{
+ const {f,source,destination}=await failedRenewalProfile(t);
+ const old=f.options.configuration.env.PAYMENT_STRIPE_BILLING_FAILED_RENEWAL_CLI_PROFILE_RUN_ID;
+ f.options.configuration.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL:'true',
+  PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL_CLI_PROFILE_RUN_ID:old,PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL_SUBNET:'10.94.40.0/28'};
+ f.options.configuration.selectedCase='optional_trial_pause_resume';
+ delete f.options.configuration.frozenTime;
+ const spawn=f.dependencies.spawn;
+ f.dependencies.spawn=(...args)=>{const child=spawn(...args);queueMicrotask(()=>child.stderr.write(READY));return child;};
+ const {createOwnedBillingOptionalTrialCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+ f.adapter=await createOwnedBillingOptionalTrialCliAdapter(f.options,f.dependencies);
+ assert.deepEqual(Object.keys(f.adapter).sort(),['assertBillingListener','startListener','stopListener','validateBinding']);
+ await f.adapter.validateBinding(f.limits);
+ assert.equal(await readFile(destination+'/config.toml','utf8'),profileConfig);
+ assert.equal(await readFile(destination+'/credentials.json','utf8'),profileCredentials);
+ assert.equal(await readFile(source+'/config.toml','utf8'),profileConfig);
+ assert.deepEqual((await readdir(destination)).sort(),['config.toml','credentials.json']);
+ assert.equal(await f.adapter.startListener(f.limits),true);
+ assert.equal(await f.adapter.assertBillingListener(f.limits),true);
+ await stop(f);
+ assert.ok(f.calls.every(call=>!call.args.includes('post')
+  &&!call.args.some(arg=>arg.startsWith('/v1/')&&!['/v1/account','/v1/balance'].includes(arg))));
+});
+
 async function requiredTrialCli(t,{startListener=true,beforeRequest,identity=oauth,execFile,
   configureListener=child=>queueMicrotask(()=>child.stderr.write(READY))}={}){
   const {f,destination}=await failedRenewalProfile(t,'initial_required_trial');

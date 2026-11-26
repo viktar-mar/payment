@@ -95,7 +95,7 @@ const setupSecretFormat=/^(seti_[A-Za-z0-9]{1,250})_secret_[A-Za-z0-9_-]+$/;
 const stripeScriptOrigin = (url:URL) => providerOrigin(url) && (url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com'));
 
 /** Capture live Stripe.js ancestors to the one checkout. A child of a foreign document cannot lend authority. */
-function stripeFrames(page:Page,request:Request,assetNavigation:boolean,allowMain:boolean,demo:string) {
+export function stripeFrames(page:Page,request:Request,assetNavigation:boolean,allowMain:boolean,demo:string) {
  const main=page.mainFrame(),target=request.frame();
  if(main.isDetached() || main.page()!==page || new URL(main.url()).origin!==demo || target.page()!==page || target.isDetached())return;
  if(target===main && (!allowMain || assetNavigation))return;

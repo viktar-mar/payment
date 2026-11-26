@@ -1,4 +1,5 @@
 import {billingFailedRenewalExcluded,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
+import {billingOptionalTrialExcluded,validateBillingOptionalTrialOptions} from './stripe-billing-optional-trial-options.mjs';
 import {validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
 import {billingFailedRenewalVerificationCheckpoint} from './stripe-sandbox-bootstrap.mjs';
 import {constants} from 'node:fs';
@@ -103,7 +104,8 @@ export function buildBillingPortalPolicyRequest(configuration,receipts) {
 
 /** Fresh recurring fixture only. Cookies and callback secrets never enter its append-only public ledger. */
 export async function createBillingFixture(options,dependencies={}) {
- need(billingFailedRenewalExcluded(options?.configuration?.env??{}));
+ const env=options?.configuration?.env??{};
+ need(billingFailedRenewalExcluded(env)&&billingOptionalTrialExcluded(env)&&options?.configuration?.selectedCase!=='optional_trial_pause_resume');
  if(['initial_cancel_withdraw','initial_decline_retry','initial_3ds','initial_missed_reordered','initial_required_trial'].includes(options.configuration?.selectedCase)){
   const configuration=validateBillingAcceptanceOptions(options.configuration);need(configuration);
   return createFixture({...options,configuration},dependencies,configuration.selectedCase==='initial_required_trial'?'REQUIRED_TRIAL':configuration.selectedCase==='initial_missed_reordered'?'INVOICE_WEBHOOKS':configuration.selectedCase==='initial_3ds'?'INITIAL_3DS':configuration.selectedCase==='initial_decline_retry'?'INITIAL_RETRY':'CANCELLATION');
@@ -114,12 +116,20 @@ export async function createBillingFailedRenewalFixture({configuration,bootstrap
  const c=validateBillingFailedRenewalOptions(configuration);need(c);
  return createFixture({configuration:c,bootstrap,cli},dependencies,'FAILED_RENEWAL');
 }
+export async function createBillingOptionalTrialFixture({configuration,bootstrap,cli},dependencies={}) {
+ const c=validateBillingOptionalTrialOptions(configuration);need(c);
+ const {resources,provision,withOtpCode,acknowledgeCustomer,inspectCallbacks,close}=
+  await createFixture({configuration:c,bootstrap,cli},dependencies,'OPTIONAL_TRIAL');
+ return Object.freeze({resources,provision,withOtpCode,acknowledgeCustomer,inspectCallbacks,close});
+}
 async function createFixture({configuration:c,bootstrap,cli},dependencies,purpose) {
  const failed=purpose==='FAILED_RENEWAL',graceDays=failed?3:0;
  let provisionClaimed=false,confirmRecorded=false,armState='NEW',armBoundary;
  const invoices=purpose==='INVOICE_WEBHOOKS',requiredTrial=purpose==='REQUIRED_TRIAL';
+ const optionalTrial=purpose==='OPTIONAL_TRIAL';
  let trialSetupStage='trial-permit-dispatch',trialPermitKeyHash;
- const trialDays=requiredTrial?7:0;
+ const trialDays=requiredTrial||optionalTrial?7:0;
+ const trialPolicy=requiredTrial?'REQUIRED_BEFORE_TRIAL':optionalTrial?'OPTIONAL_DURING_TRIAL':null;
  let reconciliationClaimed=false;
  const retry=purpose==='INITIAL_RETRY',challenge=purpose==='INITIAL_3DS';
  const retryLedger=invoices?['create-dispatch','create-ack','confirm-dispatch','confirm-ack','reconcile-dispatch','reconcile-ack','paid-dispatch','paid-ack','finalized-dispatch','finalized-ack']:challenge?['create-dispatch','create-ack','confirm-dispatch','confirm-ack','challenge-dispatch','challenge-ack']:['create-dispatch','create-ack','confirm-dispatch','confirm-ack','decline-proof','retry-dispatch','retry-ack','successor-confirm-dispatch','successor-confirm-ack','recovered-proof'];
@@ -151,7 +161,7 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
   retryCursor=current+1;
  }
  async function request(path,limits,{method='GET',body,status=200,target='backend',idempotencyKey,beforeSend,provisionStep}={}) {
-  const publish=failed&&provisionStep===publishStep;
+  const publish=(failed||optionalTrial)&&provisionStep===publishStep;
   return billingBounded(limits,async l=>{
    need(!closed);
    if(provisionStep)checkpoint(provisionStep+'_VERIFY',limits,publish?l:undefined);
@@ -200,7 +210,7 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
   async provision(limits){
    need(!provisioned&&!busy&&!closed&&(purpose==='INITIAL'||!provisionClaimed));provisionClaimed=true;busy=true;started=Date.now();
    try{
-    need(await cli.validateBinding(limits)===true);
+    need(await (optionalTrial?cli.assertBillingListener(limits):cli.validateBinding(limits))===true);
     let admin;need(await bootstrap.withAdminCredentials(credentials=>{admin={username:credentials.username,password:credentials.password};return true;},limits)===true);
     try {
      const login=await request('/api/admin/v1/auth/sessions',limits,{method:'POST',body:admin,status:204});
@@ -221,9 +231,9 @@ async function createFixture({configuration:c,bootstrap,cli},dependencies,purpos
     need(Number.isSafeInteger(policy.version));
     await mutate('policy',base+'/subscription-policy',{version:policy.version,enabled:true,grace_days:graceDays,allow_immediate_cancellation:false,portal_enabled:false,defer_upgrades:false,portal_return_urls:[]},200,limits,v=>v?.enabled===true&&v.portal_enabled===false&&(!failed||v.grace_days===3),{dispatchCheckpoint:'PROVISION_POLICY_INTENT'});
     const product=await mutate('product','/api/admin/v1/sites/'+siteId+'/products',{key:'billing-product-'+suffix,name:'Initial monthly Billing',description:null},201,limits,v=>billingUuid(v?.id)&&v.site_id===siteId&&v.status==='ACTIVE');productId=product.id;
-    const price=await mutate('price','/api/admin/v1/products/'+productId+'/prices',{price_key:'billing-price-'+suffix,type:'SUBSCRIPTION',amount_minor:2000,currency:'EUR',billing_interval:'MONTH',trial_days:trialDays,...(requiredTrial?{trial_payment_method_policy:'REQUIRED_BEFORE_TRIAL'}:{}),tax_mode:'INCLUSIVE',tax_code:null},201,limits,v=>billingUuid(v?.id)&&v.site_id===siteId&&v.product_id===productId&&v.version===1&&v.status==='DRAFT');priceId=price.id;
+    const price=await mutate('price','/api/admin/v1/products/'+productId+'/prices',{price_key:'billing-price-'+suffix,type:'SUBSCRIPTION',amount_minor:2000,currency:'EUR',billing_interval:'MONTH',trial_days:trialDays,...(trialPolicy?{trial_payment_method_policy:trialPolicy}:{}),tax_mode:'INCLUSIVE',tax_code:null},201,limits,v=>billingUuid(v?.id)&&v.site_id===siteId&&v.product_id===productId&&v.version===1&&v.status==='DRAFT');priceId=price.id;
     const published=await mutate('publish','/api/admin/v1/prices/'+priceId+'/publish',undefined,200,limits,
-     v=>v?.id===priceId&&v.type==='SUBSCRIPTION'&&v.status==='PUBLISHED'&&v.version===1&&v.amount_minor===2000&&v.currency==='EUR'&&v.billing_interval==='MONTH'&&v.trial_days===trialDays&&(!requiredTrial||v.trial_payment_method_policy==='REQUIRED_BEFORE_TRIAL')&&v.tax_mode==='INCLUSIVE'&&/^price_[A-Za-z0-9]+$/.test(v.provider_price_id),
+     v=>v?.id===priceId&&v.type==='SUBSCRIPTION'&&v.status==='PUBLISHED'&&v.version===1&&v.amount_minor===2000&&v.currency==='EUR'&&v.billing_interval==='MONTH'&&v.trial_days===trialDays&&(!trialPolicy||v.trial_payment_method_policy===trialPolicy)&&v.tax_mode==='INCLUSIVE'&&/^price_[A-Za-z0-9]+$/.test(v.provider_price_id),
      {dispatchCheckpoint:publishStep+'_INTENT',ackCheckpoint:publishStep+'_ACK',provisionStep:publishStep});
     priceReference=published.provider_price_id;
     if(failed)failedRenewalCheckpoints.delete(fixture);

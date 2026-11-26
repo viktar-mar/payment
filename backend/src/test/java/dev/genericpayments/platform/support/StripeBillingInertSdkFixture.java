@@ -76,9 +76,25 @@ public final class StripeBillingInertSdkFixture {
     @SuppressWarnings("unchecked") public static <T>T port(Class<T> type,Function<Call,Object> fn){return (T)Proxy.newProxyInstance(type.getClassLoader(),new Class<?>[]{type},(p,m,a)->fn.apply(new Call(m.getName(),a==null?new Object[0]:a)));}
     public static final class Transport extends HttpClient {
         public final List<StripeRequest> calls=new ArrayList<>();public final Deque<Object> replies=new ArrayDeque<>();public Runnable afterResponse;
+        private record DynamicReply(Function<StripeRequest,String> json) {}
         public void reply(String json){replies.add(new StripeResponse(200,HttpHeaders.of(Map.of()),json));}
+        public void reply(Function<StripeRequest,String> json){replies.add(new DynamicReply(json));}
         public void error(int code){replies.add(new StripeResponse(code,HttpHeaders.of(Map.of()),"{\"error\":{\"type\":\"api_error\",\"message\":\"synthetic\"}}"));}
         public void disconnect(){replies.add(new ApiConnectionException("inert disconnect"));}
-        @Override public synchronized StripeResponse request(StripeRequest request)throws StripeException{calls.add(request);if(replies.isEmpty())throw new AssertionError("Unplanned inert SDK request");var response=replies.remove();if(response instanceof StripeException error)throw error;if(afterResponse!=null){var effect=afterResponse;afterResponse=null;effect.run();}return (StripeResponse)response;}
+        @Override public synchronized StripeResponse request(StripeRequest request)throws StripeException {
+            calls.add(request);
+            if(replies.isEmpty())throw new AssertionError("Unplanned inert SDK request");
+            var response=replies.remove();
+            if(response instanceof StripeException error)throw error;
+            if(afterResponse!=null){
+                var effect=afterResponse;
+                afterResponse=null;
+                effect.run();
+            }
+            if(response instanceof DynamicReply dynamic){
+                return new StripeResponse(200,HttpHeaders.of(Map.of()),dynamic.json().apply(request));
+            }
+            return (StripeResponse)response;
+        }
     }
 }

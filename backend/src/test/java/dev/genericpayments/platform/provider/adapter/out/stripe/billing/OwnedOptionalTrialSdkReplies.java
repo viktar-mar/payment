@@ -8,14 +8,19 @@ import dev.genericpayments.platform.support.StripeBillingOwnedSubscriptionFixtur
 /** Owned, synthetic Stripe responses shared by the isolated and database composition tests. */
 final class OwnedOptionalTrialSdkReplies {
     static void queue(StripeBillingInertSdkFixture.Transport http,OwnedOptionalTrialCreate.Authority a,String fault){
-        replies(http, a, fault, false);
+        replies(http, a, fault, false, false);
     }
     static void observation(StripeBillingInertSdkFixture.Transport http, OwnedOptionalTrialCreate.Authority a, String fault) {
-        replies(http, a, fault, true);
+        replies(http, a, fault, true, false);
     }
-    private static void replies(StripeBillingInertSdkFixture.Transport http, OwnedOptionalTrialCreate.Authority a, String fault, boolean observation) {
+    static void clockScopedObservation(StripeBillingInertSdkFixture.Transport http, OwnedOptionalTrialCreate.Authority a, String fault) {
+        replies(http, a, fault, true, true);
+    }
+
+    private static void replies(StripeBillingInertSdkFixture.Transport http, OwnedOptionalTrialCreate.Authority a,
+                                String fault, boolean observation, boolean clockScoped) {
         var f=new StripeBillingOwnedSubscriptionFixture(TaxMode.INCLUSIVE,2000);
-        var clock=StripeBillingOwnedSubscriptionFixture.json(f.f.clockJson());clock.addProperty("name",a.clockName());
+        var clock=StripeBillingOwnedSubscriptionFixture.json(OwnedOptionalTrialClockAdvanceSdkReplies.ready(a,a.frozen()));
         var customer=f.customer.deepCopy();
         customer.add("invoice_settings",new JsonObject());
         customer.getAsJsonObject("metadata").addProperty("account_id",a.account().toString());
@@ -36,11 +41,22 @@ final class OwnedOptionalTrialSdkReplies {
         var item=response.getAsJsonObject("items").getAsJsonArray("data").get(0).getAsJsonObject();
         item.addProperty("current_period_start",a.frozen());item.addProperty("current_period_end",a.trialEnd());
         if(fault.equals("changed trial end"))response.addProperty("trial_end",a.trialEnd()+1);
-        http.reply(clock.toString());http.reply(customer.toString());http.reply(price.toString());
+        http.reply(clock.toString());
+        if (clockScoped) {
+            var other = customer.deepCopy();
+            other.addProperty("id","cus_other");
+            http.reply(fault.equals("extra clock customer") ? StripeBillingOwnedSubscriptionFixture.page(customer,other)
+                : StripeBillingOwnedSubscriptionFixture.page(customer));
+        } else http.reply(customer.toString());
+        http.reply(price.toString());
         http.reply(fault.equals("attached method")?StripeBillingOwnedSubscriptionFixture.page(new JsonObject()):StripeBillingOwnedSubscriptionFixture.page());
         if (observation) {
-            http.reply(StripeBillingOwnedSubscriptionFixture.page(response));
-            var original = new JsonObject(); original.addProperty("id","in_trial");
+            var other = response.deepCopy();
+            other.addProperty("id","sub_other");
+            http.reply(fault.equals("extra clock subscription") ? StripeBillingOwnedSubscriptionFixture.page(response,other)
+                : StripeBillingOwnedSubscriptionFixture.page(response));
+            var original = clockScoped ? f.invoice.deepCopy() : new JsonObject();
+            original.addProperty("id","in_trial");
             http.reply(fault.equals("extra invoice") ? "{\"object\":\"list\",\"has_more\":true,\"data\":[]}"
                 : StripeBillingOwnedSubscriptionFixture.page(original));
         } else {

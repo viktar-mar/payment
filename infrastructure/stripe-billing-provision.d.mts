@@ -19,6 +19,7 @@ interface BillingFixture {
  close():Promise<true>;
 }
 export function createBillingFixture(options:FixtureOptions,dependencies?:Record<string,unknown>):Promise<Readonly<BillingFixture>>;
+export function createBillingOptionalTrialFixture(options:FixtureOptions,dependencies?:Record<string,unknown>):Promise<Readonly<Omit<BillingFixture,'beforeDispatch'|'acknowledge'>>>;
 export function createBillingFailedRenewalFixture(options:FixtureOptions,dependencies?:Record<string,unknown>):Promise<Readonly<BillingFixture&{
  beforeDeclineArm(value:Awaited<ReturnType<FailedRenewalRuntime['boundary']>>,limits:BillingLimits):Promise<true>;
  acknowledgeDeclineArm(value:Awaited<ReturnType<FailedRenewalRuntime['armDecline']>>,limits:BillingLimits):Promise<true>;

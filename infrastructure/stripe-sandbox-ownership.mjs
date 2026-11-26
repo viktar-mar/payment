@@ -60,6 +60,7 @@ export function proveOwnedContainer(value,{service,project,runId,network,sourceI
 const INITIAL_ENTRYPOINT=['java','-Dloader.path=/app/initial-runtime','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentRuntime','-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher'];
 const RENEWAL_ENTRYPOINT=['java','-Dloader.path=/app/renewal-runtime','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstRenewalRuntime','-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher'];
 const FAILED_ENTRYPOINT=['java','-Dloader.path=/app/failed-renewal-runtime','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFailedRenewalRuntime','-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher'];
+const OPTIONAL_TRIAL_ENTRYPOINT=['java','-Dloader.path=/app/optional-trial-runtime,/app/optional-trial-libs','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingOptionalTrialRuntime','-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher'];
 const EXECUTION_FORMAT='"Entrypoint":{{json .Config.Entrypoint}},"Cmd":{{json .Config.Cmd}}';
 // Select the final reference without reading earlier attempt fields. Only a closed hint leaves inspect.
 const BACKEND_HEALTH_FORMAT='"BackendHealthFailure":{{$hint := "UNAVAILABLE"}}{{$last := false}}{{if .State.Health}}{{range .State.Health.Log}}{{$last = .}}{{end}}{{end}}'+
@@ -73,13 +74,24 @@ export const firstRenewalImageFormat=firstPaymentImageFormat;
 export function firstPaymentContainerFormat(expected){return runtimeContainerFormat(expected,'PAYMENT_STRIPE_BILLING_FIRST_PAYMENT');}
 export function firstRenewalContainerFormat(expected){return runtimeContainerFormat(expected,'PAYMENT_STRIPE_BILLING_FIRST_RENEWAL');}
 export function failedRenewalContainerFormat(expected){return runtimeContainerFormat(expected,'PAYMENT_STRIPE_BILLING_FAILED_RENEWAL');}
-function runtimeContainerFormat(expected,purpose){
- const checks=Object.entries(expected).map(([k,v],i)=>'{{$v'+i+' := false}}{{range .Config.Env}}{{if eq . '+JSON.stringify(k+'='+v)+'}}{{$v'+i+' = true}}{{end}}{{end}}');
- const excluded=[...['PAYMENT_STRIPE_BILLING_FIRST_PAYMENT','PAYMENT_STRIPE_BILLING_FIRST_RENEWAL','PAYMENT_STRIPE_BILLING_FAILED_RENEWAL'].filter(k=>k!==purpose),'PAYMENT_STRIPE_BILLING_ACCEPTANCE','PAYMENT_STAGE4_TEST_RUNTIME','PAYMENT_STRIPE_ACCEPTANCE','PAYMENT_STRIPE_NATIVE_ACCEPTANCE',...['ALLOW_TEST_OPERATIONS','FULL_RUN','OWNED_RUN','REMAINING_ONLY','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT','MANUAL_3DS','MANUAL_REFUND','MANUAL_REFUND_REMAINDER'].map(k=>'PAYMENT_STRIPE_SANDBOX_'+k)];
- const disabled='{{$disabled := true}}{{range .Config.Env}}{{$pair := split . "="}}{{$name := index $pair 0}}{{if or '+excluded.map(k=>'(eq $name '+JSON.stringify(k)+')').join(' ')+'}}{{if and (ne . (print $name "=")) (ne . (print $name "=false"))}}{{$disabled = false}}{{end}}{{end}}{{end}}';
+export function optionalTrialContainerFormat(expected,workerConfig){
+ return runtimeContainerFormat({...expected,SPRING_APPLICATION_JSON:workerConfig},'PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL',true);
+}
+function runtimeContainerFormat(expected,purpose,strict=false){
+ const checks=Object.entries(expected).map(([k,v],i)=>{
+  if(!strict)return '{{$v'+i+' := false}}{{range .Config.Env}}{{if eq . '+JSON.stringify(k+'='+v)+'}}{{$v'+i+' = true}}{{end}}{{end}}';
+  return '{{$seen'+i+' := false}}{{$duplicate'+i+' := false}}{{$equal'+i+' := false}}{{range .Config.Env}}{{if eq (index (split . "=") 0) '+JSON.stringify(k)+
+   '}}{{if $seen'+i+'}}{{$duplicate'+i+' = true}}{{end}}{{$seen'+i+' = true}}{{if eq . '+JSON.stringify(k+'='+v)+'}}{{$equal'+i+' = true}}{{end}}{{end}}{{end}}'+
+   '{{$v'+i+' := and $equal'+i+' (not $duplicate'+i+')}}';
+ });
+ const excluded=[...['PAYMENT_STRIPE_BILLING_FIRST_PAYMENT','PAYMENT_STRIPE_BILLING_FIRST_RENEWAL','PAYMENT_STRIPE_BILLING_FAILED_RENEWAL','PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL'].filter(k=>k!==purpose),'PAYMENT_STRIPE_BILLING_ACCEPTANCE','PAYMENT_STAGE4_TEST_RUNTIME','PAYMENT_STRIPE_ACCEPTANCE','PAYMENT_STRIPE_NATIVE_ACCEPTANCE',...['ALLOW_TEST_OPERATIONS','FULL_RUN','OWNED_RUN','REMAINING_ONLY','FORM_DIAGNOSTIC','MANUAL_FORM_DIAGNOSTIC','ALLOW_PREPARE_ONLY','MANUAL_PAYMENT','MANUAL_3DS','MANUAL_REFUND','MANUAL_REFUND_REMAINDER'].map(k=>'PAYMENT_STRIPE_SANDBOX_'+k)];
+ const forbidden=strict?[purpose+'_FROZEN_TIME',purpose+'_ACCOUNT_ID']:null;
+ const disabled='{{$disabled := true}}{{range .Config.Env}}{{$pair := split . "="}}{{$name := index $pair 0}}{{if or '+excluded.map(k=>'(eq $name '+JSON.stringify(k)+')').join(' ')+'}}{{if and (ne . (print $name "=")) (ne . (print $name "=false"))}}{{$disabled = false}}{{end}}{{end}}'+
+  (forbidden?'{{if or '+forbidden.map(k=>'(eq $name '+JSON.stringify(k)+')').join(' ')+'}}{{$disabled = false}}{{end}}':'')+'{{end}}';
  return CONTAINER_FORMAT.slice(0,-1)+','+EXECUTION_FORMAT+','+BACKEND_HEALTH_FORMAT+',"RuntimeIdentity":'+checks.join('')+disabled+'{{and $disabled '+checks.map((_,i)=>'$v'+i).join(' ')+'}}}';
 }
 export function proveFirstPaymentRuntime(v,kind){if(!same(v.Entrypoint,INITIAL_ENTRYPOINT)||v.Cmd!==null&&!same(v.Cmd,[])||v[kind==='image'?'RuntimeSource':'RuntimeIdentity']!==true)fail();}
 
 export function proveFirstRenewalRuntime(v,kind){if(!same(v.Entrypoint,RENEWAL_ENTRYPOINT)||v.Cmd!==null&&!same(v.Cmd,[])||v[kind==='image'?'RuntimeSource':'RuntimeIdentity']!==true)fail();}
 export function proveFailedRenewalRuntime(v,kind){if(!same(v.Entrypoint,FAILED_ENTRYPOINT)||v.Cmd!==null&&!same(v.Cmd,[])||v[kind==='image'?'RuntimeSource':'RuntimeIdentity']!==true)fail();}
+export function proveOptionalTrialRuntime(v,kind){if(!same(v.Entrypoint,OPTIONAL_TRIAL_ENTRYPOINT)||v.Cmd!==null&&!same(v.Cmd,[])||v[kind==='image'?'RuntimeSource':'RuntimeIdentity']!==true)fail();}

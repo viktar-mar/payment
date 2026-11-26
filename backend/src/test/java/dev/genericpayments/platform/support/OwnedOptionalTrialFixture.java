@@ -1,5 +1,7 @@
 package dev.genericpayments.platform.support;
 
+import com.google.gson.JsonParser;
+import dev.genericpayments.acceptance.runtime.OwnedBillingOptionalTrialRuntime;
 import dev.genericpayments.platform.catalog.domain.PriceId;
 import dev.genericpayments.platform.customers.application.service.CustomerSessionService;
 import dev.genericpayments.platform.customers.domain.CustomerId;
@@ -21,12 +23,16 @@ import org.springframework.boot.flyway.autoconfigure.FlywayMigrationStrategy;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
+import org.springframework.test.context.TestPropertySource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Installs the optional-trial controls only in this fixture's fresh test database. */
 @Import(OwnedOptionalTrialFixture.Schema.class)
+@TestPropertySource(properties="spring.datasource.hikari.connection-init-sql="+OwnedBillingOptionalTrialRuntime.CONNECTION_INIT_SQL)
 public abstract class OwnedOptionalTrialFixture extends StripeBillingClockCustomerFixture {
+    private final long clockCreated = Instant.now().getEpochSecond();
+
     @TestConfiguration(proxyBeanMethods = false)
     static class Schema {
         @Bean
@@ -54,12 +60,26 @@ public abstract class OwnedOptionalTrialFixture extends StripeBillingClockCustom
         return reserveTrialProfile(7, "OPTIONAL_DURING_TRIAL", 2000, true);
     }
 
+    protected Reservation reserveOptionalTrial(UUID run) {
+        return reserveTrialProfile(run,7,"OPTIONAL_DURING_TRIAL",2000,true,"acct_1UPiMpELswAd8tpR");
+    }
+
+    @Override protected String clockJson(ClockOwner owner) {
+        var clock = JsonParser.parseString(super.clockJson(owner)).getAsJsonObject();
+        clock.addProperty("created",clockCreated);
+        clock.addProperty("deletes_after",clockCreated+86_400L);
+        return clock.toString();
+    }
+
     protected Reservation reserveTrialProfile(int days, String policy, int amount, boolean reserveProof) {
         return reserveTrialProfile(days, policy, amount, reserveProof, "acct_1UPiMpELswAd8tpR");
     }
 
     protected Reservation reserveTrialProfile(int days, String policy, int amount, boolean reserveProof, String externalAccount) {
-        var run = UUID.randomUUID();
+        return reserveTrialProfile(UUID.randomUUID(),days,policy,amount,reserveProof,externalAccount);
+    }
+
+    private Reservation reserveTrialProfile(UUID run, int days, String policy, int amount, boolean reserveProof, String externalAccount) {
         TestClock.set(Instant.now());
         jdbc.update("update payment_accounts set account_key='stripe-sandbox-default', external_account_id=? where id=?",
             externalAccount, account.id().value());
