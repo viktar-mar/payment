@@ -110,7 +110,7 @@ final class OwnedOptionalTrialResumeGraph {
             throw new OwnedOptionalTrialResume.Failure(RESPONSE_STRUCTURE);
         }
         requireResponse((paid ? "active" : "paused").equals(remote.getStatus()), RESPONSE_STATUS);
-        requireResponse(remote.getPendingUpdate() == null, RESPONSE_PENDING_UPDATE);
+        verifyPendingResume(remote, latest, paid);
         requireResponse(original.subscription().equals(remote.getId()) && authority.clockReference().equals(remote.getTestClock())
             && latest.equals(remote.getLatestInvoice())
             && method.equals(remote.getDefaultPaymentMethod()) && remote.getDefaultSource() == null
@@ -127,6 +127,32 @@ final class OwnedOptionalTrialResumeGraph {
         boolean resumedPeriod = equal(frozen, item.getCurrentPeriodStart()) && equal(periodEnd(), item.getCurrentPeriodEnd());
         requireResponse(original.item().equals(item.getId()) && Boolean.TRUE.equals(item.getPrice().getActive()), RESPONSE_OWNER);
         requireResponse(paid ? resumedPeriod : trialPeriod || !original.invoice().equals(latest) && resumedPeriod, RESPONSE_PERIOD);
+    }
+
+    private void verifyPendingResume(com.stripe.model.Subscription remote, String latest, boolean paid) {
+        var pending = remote.getPendingUpdate();
+        if (pending == null) return;
+        // Only the interval between the owned resume request and settlement may carry this update.
+        var expiry = pending.getExpiresAt();
+        requireResponse(!paid && !original.invoice().equals(latest) && expiry != null
+            && expiry > frozen && expiry <= frozen + 23 * 60 * 60
+            && (pending.getBillingCycleAnchor() == null || equal(frozen, pending.getBillingCycleAnchor()))
+            && (pending.getTrialEnd() == null || equal(frozen, pending.getTrialEnd()))
+            && !Boolean.TRUE.equals(pending.getTrialFromPlan()) && !Boolean.TRUE.equals(pending.getCancelAtPeriodEnd())
+            && pending.getDiscount() == null && optionalEmpty(pending.getDiscounts())
+            && (pending.getMetadata() == null || pending.getMetadata().isEmpty()), RESPONSE_PENDING_UPDATE);
+        var items = pending.getSubscriptionItems();
+        if (optionalEmpty(items)) return;
+        requireResponse(items.size() == 1 && items.getFirst() != null, RESPONSE_PENDING_UPDATE);
+        var item = items.getFirst();
+        requireResponse(original.item().equals(item.getId()) && !Boolean.TRUE.equals(item.getDeleted())
+            && (item.getSubscription() == null || original.subscription().equals(item.getSubscription()))
+            && (item.getQuantity() == null || equal(1, item.getQuantity()))
+            && (item.getPrice() == null || authority.priceReference().equals(item.getPrice().getId()))
+            && (item.getPlan() == null || authority.priceReference().equals(item.getPlan().getId()))
+            && optionalEmpty(item.getTaxRates()) && optionalEmpty(item.getDiscounts())
+            && (item.getMetadata() == null || item.getMetadata().isEmpty()) && item.getBillingThresholds() == null,
+            RESPONSE_PENDING_UPDATE);
     }
 
     void verifyNoPayment() throws StripeException {

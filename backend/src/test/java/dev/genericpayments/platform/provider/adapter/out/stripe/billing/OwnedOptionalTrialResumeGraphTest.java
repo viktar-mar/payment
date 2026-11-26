@@ -72,18 +72,7 @@ class OwnedOptionalTrialResumeGraphTest {
         "wrong period,PERIOD",
     })
     void dispatchRefusesChangedResponseWithOnlyTheExactCheckpoint(String fault, String checkpoint) {
-        var response = f.remote;
-        response.addProperty("status","paused");
-        response.addProperty("latest_invoice","in_new");
-        response.addProperty("default_payment_method","pm_trial");
-        response.addProperty("trial_start",authority.frozen());
-        response.addProperty("trial_end",frozen);
-        response.add("trial_settings",StripeBillingOwnedSubscriptionFixture.json(
-            "{\"end_behavior\":{\"missing_payment_method\":\"pause\"}}"));
-        authority.metadata().forEach(response.getAsJsonObject("metadata")::addProperty);
-        f.item().addProperty("current_period_start",authority.frozen());
-        f.item().addProperty("current_period_end",frozen);
-        f.price().addProperty("active",true);
+        var response = pausedResumeReply();
         switch (fault) {
             case "missing invoice" -> response.remove("latest_invoice");
             case "old invoice" -> response.addProperty("latest_invoice",original.invoice());
@@ -100,6 +89,69 @@ class OwnedOptionalTrialResumeGraphTest {
         assertThatThrownBy(() -> graph.dispatch("pm_trial","owned-resume-key"))
             .hasMessage("OPTIONAL_TRIAL_RESUME_RESPONSE_" + checkpoint).hasNoCause();
         assertThat(f.f.http.calls).hasSize(1);
+    }
+
+    @Test void dispatchAcceptsOnlyThePendingTransitionOnTheOriginalSubscription() throws Exception {
+        var response = pausedResumeReply();
+        response.add("pending_update",pendingResume());
+        f.f.http.reply(response.toString());
+        var client = f.f.clients.create(f.f.credentials.resolve(f.f.account));
+        var graph = new OwnedOptionalTrialResumeGraph(client,authority,original,frozen,() -> {});
+        assertThat(graph.dispatch("pm_trial","owned-resume-key")).isEqualTo("in_new");
+        assertThat(f.f.http.calls).hasSize(1);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings={"expired","different anchor","foreign item","changed quantity","cancellation","discount","metadata"})
+    void dispatchRefusesAnUnrelatedOrExpiredPendingUpdate(String fault) {
+        var response = pausedResumeReply();
+        var pending = pendingResume();
+        switch (fault) {
+            case "expired" -> pending.addProperty("expires_at",frozen);
+            case "different anchor" -> pending.addProperty("billing_cycle_anchor",frozen+1);
+            case "foreign item", "changed quantity" -> {
+                var item = f.item().deepCopy();
+                if (fault.equals("foreign item")) item.addProperty("id","si_foreign");
+                else item.addProperty("quantity",2);
+                var items = new com.google.gson.JsonArray();
+                items.add(item);
+                pending.add("subscription_items",items);
+            }
+            case "cancellation" -> pending.addProperty("cancel_at_period_end",true);
+            case "discount" -> pending.add("discount",new com.google.gson.JsonObject());
+            case "metadata" -> pending.add("metadata",StripeBillingOwnedSubscriptionFixture.json("{\"unrelated\":\"change\"}"));
+            default -> throw new AssertionError(fault);
+        }
+        response.add("pending_update",pending);
+        f.f.http.reply(response.toString());
+        var client = f.f.clients.create(f.f.credentials.resolve(f.f.account));
+        var graph = new OwnedOptionalTrialResumeGraph(client,authority,original,frozen,() -> {});
+        assertThatThrownBy(() -> graph.dispatch("pm_trial","owned-resume-key"))
+            .hasMessage("OPTIONAL_TRIAL_RESUME_RESPONSE_PENDING_UPDATE").hasNoCause();
+        assertThat(f.f.http.calls).hasSize(1);
+    }
+
+    private com.google.gson.JsonObject pendingResume() {
+        var pending = new com.google.gson.JsonObject();
+        pending.addProperty("expires_at",frozen+23*60*60);
+        pending.addProperty("billing_cycle_anchor",frozen);
+        return pending;
+    }
+
+    private com.google.gson.JsonObject pausedResumeReply() {
+        var response = f.remote;
+        response.addProperty("status","paused");
+        response.addProperty("latest_invoice","in_new");
+        response.addProperty("default_payment_method","pm_trial");
+        response.addProperty("trial_start",authority.frozen());
+        response.addProperty("trial_end",frozen);
+        response.add("trial_settings",StripeBillingOwnedSubscriptionFixture.json(
+            "{\"end_behavior\":{\"missing_payment_method\":\"pause\"}}"));
+        authority.metadata().forEach(response.getAsJsonObject("metadata")::addProperty);
+        f.item().addProperty("current_period_start",authority.frozen());
+        f.item().addProperty("current_period_end",frozen);
+        f.price().addProperty("active",true);
+        return response;
     }
 
     @Test void paidEvidenceKeepsTheSameFrozenPeriodAndCaptureIdentity() throws Exception {

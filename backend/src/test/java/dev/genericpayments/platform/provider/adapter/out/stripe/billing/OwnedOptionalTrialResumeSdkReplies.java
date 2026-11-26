@@ -118,6 +118,12 @@ final class OwnedOptionalTrialResumeSdkReplies {
             remote.addProperty("trial_start", a.frozen());
             remote.addProperty("trial_end", a.trialEnd());
             remote.addProperty("latest_invoice", latest);
+            if (!paid && !original.invoice().equals(latest)) {
+                var pending = new JsonObject();
+                pending.addProperty("expires_at", a.trialEnd() + 23 * 60 * 60);
+                pending.addProperty("billing_cycle_anchor", a.trialEnd());
+                remote.add("pending_update", pending);
+            }
             remote.addProperty("default_payment_method", method);
             remote.add("trial_settings", json("{\"end_behavior\":{\"missing_payment_method\":\"pause\"}}"));
             a.metadata().forEach((key, value) -> remote.getAsJsonObject("metadata").addProperty(key, value));
