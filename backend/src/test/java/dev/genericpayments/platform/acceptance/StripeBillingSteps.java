@@ -799,7 +799,7 @@ public class StripeBillingSteps {
             select id from subscription_events where subscription_id=? and event_type='PAUSED'
             """,UUID.class,created.subscriptionId());
         StripeBillingTrialSqlAssertions.verifyOptionalPause(bean(javax.sql.DataSource.class),
-            optionalTrialProofParameters(),pausedTrialEvent,paused.revision());
+            optionalTrialProofParameters(),account.externalAccountId(),pausedTrialEvent,paused.revision());
     }
 
     private List<Object> optionalTrialProofParameters() {
@@ -947,7 +947,7 @@ public class StripeBillingSteps {
             where subscription_id=? and provider_invoice_reference='in_resume' and settlement='OPEN'
             """,UUID.class,created.subscriptionId());
         StripeBillingTrialSqlAssertions.verifyOptionalResume(bean(javax.sql.DataSource.class),
-            trialResumeProofParameters("PENDING",null),null,null,null);
+            trialResumeProofParameters("PENDING",null),account.externalAccountId(),null,null,null);
     }
 
     @When("the original resumption invoice has verified cash")
@@ -982,7 +982,7 @@ public class StripeBillingSteps {
         assertThat(publishedCash("in_resume", "pi_resume", BillingRecord.Kind.RENEWAL)).isEqualTo(publication);
         assertThat(trialPublication()).isEqualTo(originalTrial);
         StripeBillingTrialSqlAssertions.verifyOptionalResume(bean(javax.sql.DataSource.class),
-            trialResumeProofParameters("PAID","pi_resume"),publication.payment(),publication.cashEvent(),publication.periodEvent());
+            trialResumeProofParameters("PAID","pi_resume"),account.externalAccountId(),publication.payment(),publication.cashEvent(),publication.periodEvent());
     }
 
     @Then("the trial start, pause and paid resumption have exactly one signed callback each")

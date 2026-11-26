@@ -8,7 +8,7 @@ with owned as (
          $12::text invoice_reference, $13::timestamptz trial_start, $14::timestamptz trial_end
 )
 select s.id subscription_id, bill.id billing_record_id, started.id trial_started_event_id,
-       paused.id paused_event_id, s.revision, s.trial_end
+       paused.id paused_event_id, s.revision, s.trial_end, account.external_account_id, trial.item_reference, paused.occurred_at paused_at
 from owned x
 join payment_accounts account on account.id=x.account_id and account.provider='STRIPE'
      and account.account_mode='SANDBOX' and account.account_status='ACTIVE'

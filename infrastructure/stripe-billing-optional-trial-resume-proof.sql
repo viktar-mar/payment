@@ -11,7 +11,8 @@ with owned as (
          $22::text payment_reference, $23::text phase
 ), resumed as (
   select x.*, s.revision, s.billing_status, s.current_period_start, s.current_period_end, s.paid_through,
-         resumed_bill.settlement, resume.status as operation_status, paused.sequence_number as paused_sequence
+         resumed_bill.settlement, resume.status as operation_status, paused.sequence_number as paused_sequence,
+         account.external_account_id, card.setup_reference, card.method_reference, original.item_reference
   from owned x
   join payment_accounts account on account.id=x.account_id and account.provider='STRIPE'
        and account.account_mode='SANDBOX' and account.account_status='ACTIVE'
@@ -109,7 +110,8 @@ with owned as (
         =case when x.phase='PAID' then 4 else 3 end
 )
 select x.subscription_id, x.trial_bill_id, x.resume_bill_id,
-       payment.id payment_id, cash_event.id cash_event_id, period_event.id period_event_id
+       payment.id payment_id, cash_event.id cash_event_id, period_event.id period_event_id,
+       x.external_account_id, x.setup_reference, x.method_reference, x.item_reference, cash_event.occurred_at cash_occurred_at
 from resumed x
 left join payments payment on payment.site_id=x.site_id and payment.payment_account_id=x.account_id
      and payment.customer_id=x.customer_id and payment.subscription_id=x.subscription_id and payment.billing_record_id=x.resume_bill_id

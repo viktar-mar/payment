@@ -19,7 +19,7 @@ import javax.sql.DataSource;
 final class StripeBillingTrialSqlAssertions {
     private StripeBillingTrialSqlAssertions() {}
 
-    static void verifyOptionalResume(DataSource source, List<Object> parameters, UUID payment, UUID cashEvent, UUID periodEvent)
+    static void verifyOptionalResume(DataSource source, List<Object> parameters, String externalAccount, UUID payment, UUID cashEvent, UUID periodEvent)
             throws Exception {
         var sql=Files.readString(Path.of("../infrastructure/stripe-billing-optional-trial-resume-proof.sql"));
         var placeholders=Pattern.compile("\\$[0-9]+");
@@ -35,6 +35,11 @@ final class StripeBillingTrialSqlAssertions {
                 assertThat(rows.getObject("subscription_id")).isEqualTo(parameters.get(6));
                 assertThat(rows.getObject("trial_bill_id")).isEqualTo(parameters.get(8));
                 assertThat(rows.getObject("resume_bill_id")).isEqualTo(parameters.get(20));
+                assertThat(rows.getString("external_account_id")).isEqualTo(externalAccount);
+                assertThat(rows.getString("setup_reference")).isEqualTo("seti_trial");
+                assertThat(rows.getString("method_reference")).isEqualTo("pm_trial");
+                assertThat(rows.getString("item_reference")).isEqualTo("si_billing");
+                assertThat(rows.getTimestamp("cash_occurred_at")).isEqualTo(payment==null?null:parameters.get(18));
                 assertThat(rows.getObject("payment_id")).isEqualTo(payment);
                 assertThat(rows.getObject("cash_event_id")).isEqualTo(cashEvent);
                 assertThat(rows.getObject("period_event_id")).isEqualTo(periodEvent);
@@ -97,7 +102,7 @@ final class StripeBillingTrialSqlAssertions {
         }
     }
 
-    static void verifyOptionalPause(DataSource source, List<Object> owned, UUID pauseEvent, long revision) throws Exception {
+    static void verifyOptionalPause(DataSource source, List<Object> owned, String externalAccount, UUID pauseEvent, long revision) throws Exception {
         var sql=Files.readString(Path.of("../infrastructure/stripe-billing-optional-trial-pause-proof.sql"));
         var placeholders=Pattern.compile("\\$[0-9]+");
         assertThat(placeholders.matcher(sql).results().map(MatchResult::group).toList())
@@ -113,6 +118,9 @@ final class StripeBillingTrialSqlAssertions {
                 assertThat(rows.getObject("billing_record_id")).isEqualTo(owned.get(8));
                 assertThat(rows.getObject("trial_started_event_id")).isEqualTo(owned.get(9));
                 assertThat(rows.getObject("paused_event_id")).isEqualTo(pauseEvent);
+                assertThat(rows.getString("external_account_id")).isEqualTo(externalAccount);
+                assertThat(rows.getString("item_reference")).isEqualTo("si_billing");
+                assertThat(rows.getTimestamp("paused_at")).isAfterOrEqualTo((Timestamp) owned.get(13));
                 assertThat(rows.getLong("revision")).isEqualTo(revision);
                 assertThat(rows.getTimestamp("trial_end")).isEqualTo(owned.get(13));
                 assertThat(rows.next()).isFalse();
