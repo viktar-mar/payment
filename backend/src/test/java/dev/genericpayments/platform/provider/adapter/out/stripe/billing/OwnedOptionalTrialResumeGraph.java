@@ -17,6 +17,7 @@ import java.util.*;
 
 import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.OwnedOptionalTrialCreate.Authority;
 import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.OwnedOptionalTrialCreate.Created;
+import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.OwnedOptionalTrialResume.Stage.*;
 import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingTestClockAdapter.options;
 
 /** Closed, clocked Stripe graph for the single owned optional trial. */
@@ -103,23 +104,29 @@ final class OwnedOptionalTrialResumeGraph {
     }
 
     private void verifySubscription(com.stripe.model.Subscription remote, String method, String latest, boolean paid) {
-        StripeBillingOwnership.requireRemoteStructure(remote, authority.customerReference(), authority.published());
-        require(original.subscription().equals(remote.getId()) && authority.clockReference().equals(remote.getTestClock())
-            && (paid ? "active" : "paused").equals(remote.getStatus()) && latest.equals(remote.getLatestInvoice())
+        try {
+            StripeBillingOwnership.requireRemoteStructure(remote, authority.customerReference(), authority.published());
+        } catch (RuntimeException failure) {
+            throw new OwnedOptionalTrialResume.Failure(RESPONSE_STRUCTURE);
+        }
+        requireResponse((paid ? "active" : "paused").equals(remote.getStatus()), RESPONSE_STATUS);
+        requireResponse(remote.getPendingUpdate() == null, RESPONSE_PENDING_UPDATE);
+        requireResponse(original.subscription().equals(remote.getId()) && authority.clockReference().equals(remote.getTestClock())
+            && latest.equals(remote.getLatestInvoice())
             && method.equals(remote.getDefaultPaymentMethod()) && remote.getDefaultSource() == null
-            && remote.getSchedule() == null && remote.getPendingUpdate() == null && remote.getCancelAt() == null
+            && remote.getSchedule() == null && remote.getCancelAt() == null
             && Boolean.FALSE.equals(remote.getCancelAtPeriodEnd()) && remote.getCanceledAt() == null && remote.getEndedAt() == null
             && (remote.getAutomaticTax() == null || Boolean.FALSE.equals(remote.getAutomaticTax().getEnabled()))
             && optionalEmpty(remote.getDefaultTaxRates()) && equal(authority.frozen(), remote.getTrialStart())
             && equal(frozen, remote.getTrialEnd()) && remote.getMetadata() != null
             && remote.getMetadata().entrySet().containsAll(authority.metadata().entrySet())
             && remote.getTrialSettings() != null && remote.getTrialSettings().getEndBehavior() != null
-            && "pause".equals(remote.getTrialSettings().getEndBehavior().getMissingPaymentMethod()));
+            && "pause".equals(remote.getTrialSettings().getEndBehavior().getMissingPaymentMethod()), RESPONSE_OWNER);
         var item = remote.getItems().getData().getFirst();
         boolean trialPeriod = equal(authority.frozen(), item.getCurrentPeriodStart()) && equal(frozen, item.getCurrentPeriodEnd());
         boolean resumedPeriod = equal(frozen, item.getCurrentPeriodStart()) && equal(periodEnd(), item.getCurrentPeriodEnd());
-        require(original.item().equals(item.getId()) && Boolean.TRUE.equals(item.getPrice().getActive())
-            && (paid ? resumedPeriod : trialPeriod || !original.invoice().equals(latest) && resumedPeriod));
+        requireResponse(original.item().equals(item.getId()) && Boolean.TRUE.equals(item.getPrice().getActive()), RESPONSE_OWNER);
+        requireResponse(paid ? resumedPeriod : trialPeriod || !original.invoice().equals(latest) && resumedPeriod, RESPONSE_PERIOD);
     }
 
     void verifyNoPayment() throws StripeException {
@@ -136,7 +143,8 @@ final class OwnedOptionalTrialResumeGraph {
             .setPaymentBehavior(PAYMENT_BEHAVIOR)
             .setProrationBehavior(SubscriptionResumeParams.ProrationBehavior.NONE).build(), options(key)));
         var invoice = response.getLatestInvoice();
-        require(reference(invoice, "in") && !invoice.equals(original.invoice()));
+        requireResponse(reference(invoice, "in"), RESPONSE_INVOICE_INVALID);
+        requireResponse(!invoice.equals(original.invoice()), RESPONSE_INVOICE_ORIGINAL);
         verifySubscription(response, method, invoice, false);
         return invoice;
     }
@@ -269,6 +277,10 @@ final class OwnedOptionalTrialResumeGraph {
         return result;
     }
     private interface Read<T> { T call() throws StripeException; }
+    private static void requireResponse(boolean valid, OwnedOptionalTrialResume.Stage stage) {
+        if (!valid) throw new OwnedOptionalTrialResume.Failure(stage);
+    }
+
     static void require(boolean valid) {
         if (!valid) throw new IllegalStateException("Owned optional trial resumption unavailable");
     }

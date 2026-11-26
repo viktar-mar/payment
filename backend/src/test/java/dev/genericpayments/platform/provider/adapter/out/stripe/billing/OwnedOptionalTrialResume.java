@@ -38,7 +38,8 @@ final class OwnedOptionalTrialResume {
     enum Stage {
         OBSERVE_CLOCK, OBSERVE_SUBSCRIPTION, OBSERVE_CASH, CLAIM, DISPATCH_CLOCK, DISPATCH_RESPONSE,
         STRIPE_INVALID_REQUEST, STRIPE_BILLING_CYCLE_ANCHOR, STRIPE_PAYMENT_BEHAVIOR, STRIPE_PRORATION_BEHAVIOR,
-        READ_INVOICE, FINISH, RESULT;
+        RESPONSE_INVOICE_INVALID, RESPONSE_INVOICE_ORIGINAL, RESPONSE_STRUCTURE, RESPONSE_STATUS, RESPONSE_OWNER,
+        RESPONSE_PENDING_UPDATE, RESPONSE_PERIOD, RESPONSE_STRIPE, READ_INVOICE, FINISH, RESULT;
 
         String code() { return "OPTIONAL_TRIAL_RESUME_" + name(); }
     }
@@ -46,7 +47,11 @@ final class OwnedOptionalTrialResume {
     record Attempt(SubscriptionOperationResult result, Stage failure) {}
 
     static final class Failure extends IllegalStateException {
-        Failure(Stage stage) { super(stage.code()); }
+        private final Stage stage;
+        Failure(Stage stage) {
+            super(stage.code());
+            this.stage = stage;
+        }
     }
 
     private final JdbcTemplate jdbc;
@@ -161,8 +166,10 @@ final class OwnedOptionalTrialResume {
             }
         } catch (StripeException | RuntimeException failure) {
             if (stepId != null) finishUnknown(claim);
-            if (stage == Stage.DISPATCH_RESPONSE && failure instanceof InvalidRequestException invalid) {
-                stage = rejectedResumeParameter(invalid);
+            if (stage == Stage.DISPATCH_RESPONSE) {
+                if (failure instanceof InvalidRequestException invalid) stage = rejectedResumeParameter(invalid);
+                else if (failure instanceof Failure diagnosed) stage = diagnosed.stage;
+                else if (failure instanceof StripeException) stage = Stage.RESPONSE_STRIPE;
             }
         }
         try {

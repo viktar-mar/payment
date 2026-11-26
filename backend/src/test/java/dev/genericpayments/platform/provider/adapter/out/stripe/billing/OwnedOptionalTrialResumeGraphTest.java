@@ -61,6 +61,47 @@ class OwnedOptionalTrialResumeGraphTest {
         });
     }
 
+    @ParameterizedTest
+    @CsvSource({
+        "missing invoice,INVOICE_INVALID",
+        "old invoice,INVOICE_ORIGINAL",
+        "foreign customer,STRUCTURE",
+        "unexpected status,STATUS",
+        "foreign method,OWNER",
+        "pending update,PENDING_UPDATE",
+        "wrong period,PERIOD",
+    })
+    void dispatchRefusesChangedResponseWithOnlyTheExactCheckpoint(String fault, String checkpoint) {
+        var response = f.remote;
+        response.addProperty("status","paused");
+        response.addProperty("latest_invoice","in_new");
+        response.addProperty("default_payment_method","pm_trial");
+        response.addProperty("trial_start",authority.frozen());
+        response.addProperty("trial_end",frozen);
+        response.add("trial_settings",StripeBillingOwnedSubscriptionFixture.json(
+            "{\"end_behavior\":{\"missing_payment_method\":\"pause\"}}"));
+        authority.metadata().forEach(response.getAsJsonObject("metadata")::addProperty);
+        f.item().addProperty("current_period_start",authority.frozen());
+        f.item().addProperty("current_period_end",frozen);
+        f.price().addProperty("active",true);
+        switch (fault) {
+            case "missing invoice" -> response.remove("latest_invoice");
+            case "old invoice" -> response.addProperty("latest_invoice",original.invoice());
+            case "foreign customer" -> response.addProperty("customer","cus_PRIVATE");
+            case "unexpected status" -> response.addProperty("status","past_due");
+            case "foreign method" -> response.addProperty("default_payment_method","pm_PRIVATE");
+            case "pending update" -> response.add("pending_update",new com.google.gson.JsonObject());
+            case "wrong period" -> f.item().addProperty("current_period_end",frozen+1);
+            default -> throw new AssertionError(fault);
+        }
+        f.f.http.reply(response.toString());
+        var client = f.f.clients.create(f.f.credentials.resolve(f.f.account));
+        var graph = new OwnedOptionalTrialResumeGraph(client,authority,original,frozen,() -> {});
+        assertThatThrownBy(() -> graph.dispatch("pm_trial","owned-resume-key"))
+            .hasMessage("OPTIONAL_TRIAL_RESUME_RESPONSE_" + checkpoint).hasNoCause();
+        assertThat(f.f.http.calls).hasSize(1);
+    }
+
     @Test void paidEvidenceKeepsTheSameFrozenPeriodAndCaptureIdentity() throws Exception {
         queue(false, "");
         var pending = read(false, null);
