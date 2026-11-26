@@ -298,7 +298,7 @@ class OwnedOptionalTrialPublicationIntegrationTest extends OwnedOptionalTrialFix
                 .isInstanceOf(IllegalStateException.class);
             assertThat(http.calls).hasSize(callsAfterFailure);
             assertThat(http.calls.stream().filter(call->call.method().name().equals("POST")
-                &&call.url().getPath().endsWith("/confirm")&&call.url().getPath().contains("/payment_intents/")))
+                &&call.url().getPath().equals("/v1/invoices/in_resume/pay")))
                 .hasSize(confirmationFault.equals("late substituted allocation")?0:1);
             assertThat(jdbc.queryForObject("select status from stripe_billing_owned_optional_trial_payment_confirmations",
                 String.class)).isEqualTo("UNKNOWN");
@@ -341,7 +341,7 @@ class OwnedOptionalTrialPublicationIntegrationTest extends OwnedOptionalTrialFix
         assertThat(http.calls.stream().filter(call->call.method().name().equals("POST")
             &&call.url().getPath().endsWith("/resume"))).hasSize(1);
         assertThat(http.calls.stream().filter(call->call.method().name().equals("POST")
-            &&call.url().getPath().endsWith("/confirm")&&call.url().getPath().contains("/payment_intents/"))).hasSize(1);
+            &&call.url().getPath().equals("/v1/invoices/in_resume/pay"))).hasSize(1);
         int callsAfterPayment=http.calls.size();
         assertThatThrownBy(()->publication.observeResume(billing,a.scope(),prepared.operation(),reserved.operationId(),resume,true))
             .isInstanceOf(IllegalStateException.class);

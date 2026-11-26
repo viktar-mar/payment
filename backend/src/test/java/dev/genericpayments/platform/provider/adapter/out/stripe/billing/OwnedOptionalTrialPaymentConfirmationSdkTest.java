@@ -1,5 +1,6 @@
 package dev.genericpayments.platform.provider.adapter.out.stripe.billing;
 
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.OwnedOptionalTrialResumeGraph.Identity;
 import dev.genericpayments.platform.support.StripeBillingInertSdkFixture;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -12,17 +13,26 @@ import static org.assertj.core.api.Assertions.*;
 class OwnedOptionalTrialPaymentConfirmationSdkTest {
     private final StripeBillingInertSdkFixture f = new StripeBillingInertSdkFixture();
 
-    @Test void confirmsTheOriginalIntentUsingTheSavedCardAndPinnedStripeVersion() throws Exception {
+    @Test void paysOnlyTheAdmittedInvoiceAndReadsItsOriginalIntent() throws Exception {
+        f.http.reply(paidInvoice());
         f.http.reply(succeeded());
-        assertThat(confirm()).isEqualTo("ch_resume");
-        assertThat(f.http.calls).singleElement().satisfies(post -> {
-            assertThat(post.method().name()).isEqualTo("POST");
-            assertThat(post.url().getPath()).isEqualTo("/v1/payment_intents/pi_resume/confirm");
-            assertThat(post.params()).containsExactlyInAnyOrderEntriesOf(Map.of("payment_method", "pm_scoped", "off_session", true));
-            assertThat(post.options().getIdempotencyKey()).isEqualTo("owned-resume:CONFIRM");
-            assertThat(post.options().getMaxNetworkRetries()).isZero();
-            assertThat(post.headers().firstValue("Stripe-Version")).contains("2026-09-30.endive");
-        });
+        assertThat(pay()).isEqualTo("ch_resume");
+        assertThat(f.http.calls).hasSize(2);
+        var post = f.http.calls.getFirst();
+        assertThat(post.method().name()).isEqualTo("POST");
+        assertThat(post.url().getPath()).isEqualTo("/v1/invoices/in_resume/pay");
+        assertThat(post.params()).containsExactlyInAnyOrderEntriesOf(Map.of("payment_method", "pm_scoped", "off_session", true));
+        assertThat(post.options().getIdempotencyKey()).isEqualTo("owned-resume:CONFIRM");
+        assertThat(post.options().getMaxNetworkRetries()).isZero();
+        assertThat(post.options().getConnectTimeout()).isEqualTo(2000);
+        assertThat(post.options().getReadTimeout()).isEqualTo(8000);
+        assertThat(post.headers().firstValue("Stripe-Version")).contains("2026-09-30.endive");
+        var read = f.http.calls.getLast();
+        assertThat(read.method().name()).isEqualTo("GET");
+        assertThat(read.url().getPath()).isEqualTo("/v1/payment_intents/pi_resume");
+        assertThat(read.options().getMaxNetworkRetries()).isZero();
+        assertThat(read.options().getReadTimeout()).isEqualTo(8000);
+        assertThat(read.options().getIdempotencyKey()).isNull();
     }
 
     @ParameterizedTest
@@ -51,10 +61,11 @@ class OwnedOptionalTrialPaymentConfirmationSdkTest {
             case "duplicate amount" -> { /* The duplicate is appended to the raw response below. */ }
             default -> throw new AssertionError(fault);
         }
+        f.http.reply(paidInvoice());
         f.http.reply(fault.equals("duplicate amount") ? body.toString().replace("\"amount\":2000", "\"amount\":2001,\"amount\":2000")
             : body.toString());
-        assertThatThrownBy(this::confirm).isInstanceOf(IllegalStateException.class);
-        assertThat(f.http.calls).hasSize(1);
+        assertThatThrownBy(this::pay).isInstanceOf(IllegalStateException.class);
+        assertThat(f.http.calls).hasSize(2);
     }
 
     @Test void aBadOpenIntentReportsTheReadStageWithoutPostingOrLeakingItsContents() {
@@ -72,9 +83,34 @@ class OwnedOptionalTrialPaymentConfirmationSdkTest {
         });
     }
 
-    private String confirm() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings={"id","customer","currency","status","amount_paid","amount_remaining","test_clock","subscription"})
+    void stopsOnWrongInvoiceReplyWithoutAnotherRequest(String fault) {
+        var invoice = json(paidInvoice());
+        switch (fault) {
+            case "amount_paid" -> invoice.addProperty(fault,1999);
+            case "amount_remaining" -> invoice.addProperty(fault,1);
+            case "subscription" -> invoice.getAsJsonObject("parent").getAsJsonObject("subscription_details")
+                .addProperty("subscription","sub_other");
+            default -> invoice.addProperty(fault,"other");
+        }
+        f.http.reply(invoice.toString());
+        assertThatThrownBy(this::pay).isInstanceOf(IllegalStateException.class);
+        assertThat(f.http.calls).hasSize(1);
+    }
+
+    private String pay() throws Exception {
         var client = f.clients.create(f.credentials.resolve(f.account));
-        return OwnedOptionalTrialPaymentConfirmation.postConfirm(client, "cus_scoped", "pi_resume", "pm_scoped", "owned-resume:CONFIRM");
+        return OwnedOptionalTrialPaymentConfirmation.postPay(client, "cus_scoped", "sub_scoped", "clock_scoped",
+            new Identity("in_resume","inpay_resume","pi_resume"), "pm_scoped", "owned-resume:CONFIRM", () -> {});
+    }
+
+    private static String paidInvoice() {
+        return """
+            {"id":"in_resume","object":"invoice","livemode":false,"status":"paid","customer":"cus_scoped",
+             "test_clock":"clock_scoped","currency":"eur","amount_due":2000,"amount_paid":2000,"amount_remaining":0,
+             "parent":{"type":"subscription_details","subscription_details":{"subscription":"sub_scoped"}}}
+            """;
     }
 
     private static String succeeded() {

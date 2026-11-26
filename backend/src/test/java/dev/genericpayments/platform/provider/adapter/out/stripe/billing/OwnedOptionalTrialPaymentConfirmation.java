@@ -9,7 +9,7 @@ import com.stripe.exception.InvalidRequestException;
 import com.stripe.exception.StripeException;
 import com.stripe.model.PaymentIntent;
 import com.stripe.net.RequestOptions;
-import com.stripe.param.PaymentIntentConfirmParams;
+import com.stripe.param.InvoicePayParams;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.PaymentAccountVerificationPort;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
 import dev.genericpayments.platform.provider.adapter.out.stripe.StripeClientFactory;
@@ -33,7 +33,7 @@ import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.O
 import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.OwnedOptionalTrialResumeGraph.Identity;
 import static dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingTestClockAdapter.options;
 
-/** The first and only confirmation of the immutable original invoice-created PaymentIntent. */
+/** Pays the exact admitted resumption invoice once and confirms the original PaymentIntent settled. */
 final class OwnedOptionalTrialPaymentConfirmation {
     private static final ObjectMapper JSON = new ObjectMapper()
         .enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
@@ -122,7 +122,8 @@ final class OwnedOptionalTrialPaymentConfirmation {
             graph.verifyReadyClock();
             owned.run();
             checkpoint = "OPTIONAL_TRIAL_PAY_RESPONSE";
-            var charge = postConfirm(client, a.customerReference(), candidate.identity().intent(), candidate.method(), candidate.key());
+            var charge = postPay(client, a.customerReference(), original.subscription(), a.clockReference(),
+                candidate.identity(), candidate.method(), candidate.key(), owned);
             checkpoint = "OPTIONAL_TRIAL_PAY_ACK";
             owned.run();
             require(committed("select finish_owned_optional_trial_payment_confirmation(?,?)", claim, charge));
@@ -206,16 +207,26 @@ final class OwnedOptionalTrialPaymentConfirmation {
         return rows.getFirst();
     }
 
-    static String postConfirm(StripeClient client, String customer, String intentId, String method, String key) throws StripeException {
-        var builder = RequestOptions.builder().setIdempotencyKey(key)
-            .setConnectTimeout(2000).setReadTimeout(8000).setMaxNetworkRetries(0);
-        RequestOptions.RequestOptionsBuilder.unsafeSetStripeVersionOverride(builder, StripeBillingTestClockAdapter.API_VERSION);
-        // Invoice-created intents reject error_on_requires_action. Require succeeded in the reply.
-        var parameters = PaymentIntentConfirmParams.builder().setPaymentMethod(method).setOffSession(true).build();
+    static String postPay(StripeClient client, String customer, String subscription, String clock, Identity identity,
+            String method, String key, Runnable current) throws StripeException {
+        var parameters = InvoicePayParams.builder().setPaymentMethod(method).setOffSession(true).build();
+        var request = RequestOptions.builder().setConnectTimeout(2000).setReadTimeout(8000).setMaxNetworkRetries(0);
+        RequestOptions.RequestOptionsBuilder.unsafeSetStripeVersionOverride(request, StripeBillingTestClockAdapter.API_VERSION);
+        var invoice = client.v1().invoices().pay(identity.invoice(), parameters, request.setIdempotencyKey(key).build());
+        require(invoice != null && identity.invoice().equals(invoice.getId()) && "invoice".equals(invoice.getObject())
+            && Boolean.FALSE.equals(invoice.getLivemode()) && customer.equals(invoice.getCustomer())
+            && clock.equals(invoice.getTestClock()) && "eur".equals(invoice.getCurrency()) && "paid".equals(invoice.getStatus())
+            && Long.valueOf(2000).equals(invoice.getAmountDue()) && Long.valueOf(2000).equals(invoice.getAmountPaid())
+            && Long.valueOf(0).equals(invoice.getAmountRemaining()) && invoice.getParent() != null
+            && "subscription_details".equals(invoice.getParent().getType())
+            && invoice.getParent().getSubscriptionDetails() != null
+            && subscription.equals(invoice.getParent().getSubscriptionDetails().getSubscription()));
+        // A paid invoice response alone cannot prove the bound intent settled.
+        current.run();
         try {
-            var response = client.v1().paymentIntents().confirm(intentId, parameters, builder.build());
-            verifyIntent(response, customer, intentId, method, true);
-            return response.getLatestCharge();
+            var intent = client.v1().paymentIntents().retrieve(identity.intent(), request.setIdempotencyKey(null).build());
+            verifyIntent(intent, customer, identity.intent(), method, true);
+            return intent.getLatestCharge();
         } catch (RuntimeException malformedReply) {
             throw unavailable();
         }

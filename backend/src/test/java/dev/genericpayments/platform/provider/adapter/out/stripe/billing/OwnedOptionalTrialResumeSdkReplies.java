@@ -75,10 +75,13 @@ final class OwnedOptionalTrialResumeSdkReplies {
             http.disconnect();
             return;
         }
-        var response = data.paymentIntent(true);
-        if (fault.equals("wrong reply")) response.addProperty("id", "pi_other");
-        if (fault.equals("wrong charge")) response.addProperty("latest_charge", "ch_other");
-        http.reply(response.toString());
+        var paidInvoice = data.invoice(INVOICE, "subscription_cycle", 2000, true, a.trialEnd());
+        if (fault.equals("wrong reply")) paidInvoice.addProperty("id", "in_other");
+        http.reply(paidInvoice.toString());
+        if (fault.equals("wrong reply")) return;
+        var succeededIntent = data.paymentIntent(true);
+        if (fault.equals("wrong charge")) succeededIntent.addProperty("latest_charge", "ch_other");
+        http.reply(succeededIntent.toString());
     }
 
     private static final class Responses {

@@ -6,6 +6,7 @@ import dev.genericpayments.platform.subscriptions.application.model.Subscription
 import dev.genericpayments.platform.subscriptions.application.port.in.QuerySubscriptionsUseCase;
 import dev.genericpayments.platform.subscriptions.domain.AccessDecision;
 import dev.genericpayments.platform.webhooks.application.port.out.CallbackConfigurationPort;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
@@ -85,6 +86,8 @@ class OwnedOptionalTrialAcceptanceIntegrationTest extends OwnedOptionalTrialAdmi
             """, UUID.class);
         assertThat(count("payments")).isZero();
 
+        var paymentKey = jdbc.queryForObject("select provider_operation_key from subscription_operations where id=?",
+            String.class, session.snapshot().resumeOperation()) + ":CONFIRM";
         OwnedOptionalTrialResumeSdkReplies.confirmation(http, a, original, setup, method.reference(), method.method(), "");
         OwnedOptionalTrialResumeSdkReplies.observation(http, a, original, setup, method.reference(), method.method(), true, "");
         session.pay();
@@ -107,7 +110,15 @@ class OwnedOptionalTrialAcceptanceIntegrationTest extends OwnedOptionalTrialAdmi
             .map(call -> call.url().getPath())).containsExactly(
                 "/v1/test_helpers/test_clocks", "/v1/customers", "/v1/subscriptions",
                 "/v1/test_helpers/test_clocks/clock_owned/advance", "/v1/setup_intents", "/v1/subscriptions/sub_owned",
-                "/v1/subscriptions/sub_owned/resume", "/v1/payment_intents/pi_resume/confirm");
+                "/v1/subscriptions/sub_owned/resume", "/v1/invoices/in_resume/pay");
+        var payment = http.calls.stream().filter(call -> call.url().getPath().equals("/v1/invoices/in_resume/pay"))
+            .findFirst().orElseThrow();
+        assertThat(payment.params())
+            .containsExactlyInAnyOrderEntriesOf(Map.of("payment_method", method.method(), "off_session", true));
+        assertThat(payment.options().getIdempotencyKey()).isEqualTo(paymentKey);
+        var paymentRead = http.calls.get(http.calls.indexOf(payment) + 1);
+        assertThat(paymentRead.method().name()).isEqualTo("GET");
+        assertThat(paymentRead.url().getPath()).isEqualTo("/v1/payment_intents/pi_resume");
         int calls = http.calls.size();
         assertThatThrownBy(session::pay).isInstanceOf(IllegalStateException.class);
         assertThatThrownBy(() -> acceptance.open(admissionRequest())).isInstanceOf(IllegalStateException.class);
