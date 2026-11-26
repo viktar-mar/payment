@@ -3,7 +3,25 @@ FROM maven:3.9.11-eclipse-temurin-25 AS build
 WORKDIR /workspace
 COPY pom.xml ./
 RUN mvn -B -ntp dependency:go-offline
-COPY src ./src
+COPY src/main ./src/main
+# Compile only the fixture sources exported below. The ordinary test build still uses all of src/test.
+COPY src/test/java/dev/genericpayments/acceptance/runtime/OwnedBillingOptionalTrialRuntime.java \
+     src/test/java/dev/genericpayments/acceptance/runtime/OwnedBillingOptionalTrialScenario.java \
+     ./src/test/java/dev/genericpayments/acceptance/runtime/
+COPY src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/JdbcOwnedOptionalTrialCreateStore.java \
+     src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/OwnedOptionalTrialAcceptance.java \
+     src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/OwnedOptionalTrialAdmission.java \
+     src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/OwnedOptionalTrialClockAdvance.java \
+     src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/OwnedOptionalTrialCreate.java \
+     src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/OwnedOptionalTrialPaymentConfirmation.java \
+     src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/OwnedOptionalTrialPublication.java \
+     src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/OwnedOptionalTrialResume.java \
+     src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/OwnedOptionalTrialResumeGraph.java \
+     src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/OwnedOptionalTrialSetup.java \
+     ./src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/
+COPY src/test/java/dev/genericpayments/platform/support/OwnedSubscriptionBillingTime.java \
+     ./src/test/java/dev/genericpayments/platform/support/
+COPY src/test/resources/db/owned-optional-trial/ ./src/test/resources/db/owned-optional-trial/
 COPY export-billing-optional-trial-runtime.sh ./
 RUN mvn -B -ntp -DskipTests package \
     && mvn -B -ntp dependency:copy-dependencies -DincludeArtifactIds=spring-boot-test \
