@@ -92,7 +92,7 @@ for(const fault of ['other request','other intent','other secret','live','requir
 }
 
 // Runs the real routing and page callbacks against VM DOM and CDP values only.
-function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'trusted types asset'|'easel query'|'easel delayed'|'other main asset'){
+function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'trusted types asset'|'easel query'|'easel delayed'|'other main asset'|'delayed element ready'|'element load error'|'missing card number'){
   const picked={...permit,setupIntentId:'seti_'+mode.replaceAll(' ',''),
     clientSecret:'seti_'+mode.replaceAll(' ','')+'_secret_fixture'};
   const url='https://api.stripe.com/v1/setup_intents/'+picked.setupIntentId+'/confirm';
@@ -132,6 +132,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
   }
   const button=new TestButton();
   const paymentEvents=new Map<string,(event?:unknown)=>void>();
+  let rendered=false;
   const location={get href(){return path;}};
   const window={
     get top(){return window;},addEventListener:()=>{},
@@ -146,7 +147,13 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
                 pendingPresentation=request(frameOrigin+'/v3/controller-fixture.html','GET',uncommitted,true,'document');
               if(['approved helper','card reload during helper trust'].includes(mode))pendingPresentation=request(url.replace('/confirm','')+'?'+new URLSearchParams({
                 key:picked.publishableKey,client_secret:picked.clientSecret}), 'GET',sibling,false,'fetch');
-              paymentEvents.get('ready')!();paymentEvents.get('change')!({complete:true});
+              const render=()=>{
+                rendered=true;
+                paymentEvents.get('ready')!();paymentEvents.get('change')!({complete:true});
+              };
+              if(mode==='element load error')paymentEvents.get('loaderror')!({error:{message:'synthetic private error'}});
+              else if(mode==='delayed element ready')setImmediate(render);
+              else render();
             }})};
         },
         confirmSetup:async()=>{
@@ -171,7 +178,10 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
   }
   const main={page:()=>page,url:()=>path,isDetached:()=>false,parentFrame:()=>null as unknown,name:()=>''};
   const stripe={page:()=>page,url:()=>frameOrigin+'/fixture',isDetached:()=>false,parentFrame:()=>main,name:()=>'stripe',
-    locator:()=>({fill:async()=>{await pendingPresentation;},isVisible:async()=>false}),
+    locator:(selector?:string)=>({fill:async()=>{
+      if(!rendered || mode==='missing card number'&&selector==='input[name="number"]')throw Error('synthetic field unavailable');
+      await pendingPresentation;
+    },isVisible:async()=>false}),
     waitForURL:async(predicate:(value:URL)=>boolean)=>{assert.equal(predicate(new URL(stripe.url())),true);}};
   const sibling={...stripe,name:()=>'sibling'};
   const foreign={...stripe,name:()=>'foreign',url:()=>'https://other.test/fixture'};
@@ -294,6 +304,24 @@ test('the held document forwards one original charge-free setup POST after one t
   await assert.rejects(f.run(),(error:unknown)=>browserCleanupConfirmed(error) && !String(error).includes(f.picked.clientSecret));
   assert.deepEqual(f.writes,[f.url]);
   assert.equal(f.closed(),1);
+});
+
+test('the isolated document waits for the original Payment Element before typing',async()=>{
+  const f=checkout('delayed element ready');
+  assert.equal(await f.run(),true);
+  assert.deepEqual(f.writes,[f.url]);
+});
+
+for(const [mode,code] of [['element load error','BROWSER_SETUP_ELEMENT_LOAD_ERROR'],['missing card number','BROWSER_CARD_NUMBER']] as const)
+test('setup reports '+mode+' without forwarding a confirmation',async()=>{
+  const f=checkout(mode);
+  await assert.rejects(f.run(),(error:unknown)=>{
+    assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+    assert.equal(browserCleanupConfirmed(error),true);
+    assert.equal(String(error),'Error: billing_BROWSER');
+    return true;
+  });
+  assert.deepEqual(f.writes,[]);
 });
 
 test('an owned Stripe.js child GET can load before the child has a document URL',async()=>{

@@ -310,9 +310,14 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
       window.addEventListener('pagehide',retire,{once:true});
       document.addEventListener('visibilitychange',()=>{if(document.hidden)retire();});
       const enabled=()=>{button.disabled=!current()||!ready||!complete||spent;};
-      payment.on('ready',()=>{ready=true;enabled();});
+      payment.on('ready',()=>{
+        if(retired)return;
+        ready=true;
+        button.dataset.elementState='READY';
+        enabled();
+      });
       payment.on('change',event=>{complete=event.complete;enabled();});
-      payment.on('loaderror',retire);
+      payment.on('loaderror',()=>{button.dataset.elementState='FAILED';retire();});
       payment.mount(host);
       button.addEventListener('click',event=>{
         if(!event.isTrusted || document.activeElement!==button || !current() || !ready || !complete || spent)return;
@@ -324,6 +329,15 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
       });
     },{publishableKey:granted.publishableKey,clientSecret:granted.clientSecret,setupIntentId:granted.setupIntentId,
       expires:limits.deadline,documentUrl:url}));
+    checkpoint='BROWSER_SETUP_ELEMENT_READY';
+    await billingBounded(limits,()=>page.waitForFunction(()=>{
+      const state=document.querySelector<HTMLButtonElement>('#confirm-setup')?.dataset.elementState;
+      return state==='READY' || state==='FAILED';
+    },undefined,{timeout:timeout()}));
+    checkpoint='BROWSER_SETUP_ELEMENT_LOAD_ERROR';
+    need(await billingBounded(limits,()=>page.evaluate(()=>
+      document.querySelector<HTMLButtonElement>('#confirm-setup')?.dataset.elementState==='READY')));
+    checkpoint='BROWSER_SETUP_CARD_FRAME';
     const cardSelector='#payment-element iframe[title="Secure payment input frame"]';
     const ownerFrame=await billingBounded(limits,()=>page.locator('#payment-element')
       .locator('iframe[title="Secure payment input frame"]').elementHandle({timeout:timeout()}));
@@ -342,14 +356,20 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
       need(card());
     };
     await cardCurrent();
-    checkpoint='BROWSER_CARD_FIELDS';
-    for(const [field,value] of [['number','4242424242424242'],['expiry','1230'],['cvc','123']]){
-      await billingBounded(limits,()=>frame.locator(`input[name="${field}"]`).fill(value!,{timeout:timeout()}));
+    for(const [field,value,code] of [
+      ['number','4242424242424242','BROWSER_CARD_NUMBER'],['expiry','1230','BROWSER_CARD_EXPIRY'],['cvc','123','BROWSER_CARD_CVC'],
+    ] as const){
+      checkpoint=code;
+      await billingBounded(limits,()=>frame.locator(`input[name="${field}"]`).fill(value,{timeout:timeout()}));
+      checkpoint='BROWSER_SETUP_CARD_FRAME';
       await cardCurrent();
     }
+    checkpoint='BROWSER_POSTAL_CHECK';
     const postal=frame.locator('input[name="postalCode"]');
-    if(await billingBounded(limits,()=>postal.isVisible()))
+    if(await billingBounded(limits,()=>postal.isVisible())){
+      checkpoint='BROWSER_POSTAL_FILL';
       await billingBounded(limits,()=>postal.fill('10001',{timeout:timeout()}));
+    }
 
     checkpoint='BROWSER_WAIT_READY';
     const button=await billingBounded(limits,()=>page.getByRole('button',{name:'Save test card',exact:true}).elementHandle({timeout:timeout()}));
