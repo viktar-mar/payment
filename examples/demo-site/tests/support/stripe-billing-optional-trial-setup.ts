@@ -30,6 +30,7 @@ function terminalFailure(cleanupConfirmed:boolean,code='BROWSER') {
 }
 const demo='http://127.0.0.1:48000';
 const stripeScript='https://js.stripe.com/endive/stripe.js';
+const stripeEaselScript=/^https:\/\/js\.stripe\.com\/v3\/fingerprinted\/js\/elements-easel-frame-[a-f0-9]{32}\.js$/;
 const usedIntents=new Set<string>();
 const secretPattern=/^(seti_[A-Za-z0-9]{1,250})_secret_[A-Za-z0-9_]+$/;
 const documentBody=`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Save test card</title>
@@ -217,10 +218,11 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         const support=target.hostname==='r.stripe.com'||target.hostname==='merchant-ui-api.stripe.com';
         const preflight=method==='OPTIONS',childNavigation=script && method==='GET' && navigation;
         const confirming=raw===confirmUrl,setupRead=target.origin+target.pathname===intentUrl;
-        const ownScript=script && method==='GET' && raw===stripeScript && request.resourceType()==='script';
-        const allowMain=ownScript || api && confirming && method==='POST';
+        const ownScript=script && method==='GET' && request.resourceType()==='script';
+        const allowMain=()=>api && confirming && method==='POST' ||
+          ownScript && (raw===stripeScript || !active && !exchange.dispatched && stripeEaselScript.test(raw));
         routeCheckpoint='BROWSER_PROVIDER_ROUTE_FRAME';
-        const before=stripeFrames(page,request,childNavigation,allowMain,demo);
+        const before=stripeFrames(page,request,childNavigation,allowMain(),demo);
         need(before && (!navigation || childNavigation));
         redirects.registerRoute(request);
         routeCheckpoint='BROWSER_PROVIDER_HEADERS';
@@ -268,7 +270,7 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         }
         check();
         routeCheckpoint='BROWSER_PROVIDER_ROUTE_FRAME';
-        const current=stripeFrames(page,request,childNavigation,allowMain,demo);
+        const current=stripeFrames(page,request,childNavigation,allowMain(),demo);
         need(current && current.target===before.target && current.frames.size===before.frames.size &&
           [...before.frames].every(([frame,location])=>current.frames.get(frame)===location));
         routeCheckpoint='BROWSER_PROVIDER_FALLBACK';

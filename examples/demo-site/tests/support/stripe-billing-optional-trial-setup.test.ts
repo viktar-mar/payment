@@ -91,17 +91,22 @@ for(const fault of ['other request','other intent','other secret','live','requir
 }
 
 // Runs the real routing and page callbacks against VM DOM and CDP values only.
-function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'){
+function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'easel query'|'easel delayed'|'other main asset'){
   const picked={...permit,setupIntentId:'seti_'+mode.replaceAll(' ',''),
     clientSecret:'seti_'+mode.replaceAll(' ','')+'_secret_fixture'};
   const url='https://api.stripe.com/v1/setup_intents/'+picked.setupIntentId+'/confirm';
-  let path='about:blank',closed=0,nextId=0,trustChecks=0,childLoads=0;
+  const easel='https://js.stripe.com/v3/fingerprinted/js/elements-easel-frame-'+'a'.repeat(32)+'.js';
+  const extraScript=mode==='easel asset'||mode==='easel delayed'?easel:mode==='easel query'?easel+'?mode=synthetic':
+    mode==='other main asset'?easel.replace('elements-easel-frame','unreviewed'):undefined;
+  let path='about:blank',closed=0,nextId=0,trustChecks=0,childLoads=0,extraLoads=0;
   let routeHandler:((route:Route)=>Promise<void>)|undefined;
   const devtools=new Map<string,(event:unknown)=>void|Promise<void>>();
   const listeners=new Map<string,((event?:unknown)=>void)[]>();
   const emit=(name:string,event?:unknown)=>{for(const listener of listeners.get(name)??[])listener(event);};
   const writes:string[]=[];
   const found=Promise.withResolvers<Response>();
+  const assetPaused=Promise.withResolvers<void>(), resumeAsset=Promise.withResolvers<void>();
+  let delayedAsset:Promise<void>|undefined;
   let governingResponse:((r:Response)=>boolean)|undefined;
   const host={isConnected:true};
   const cardOwner={isConnected:true};
@@ -143,6 +148,10 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
             }})};
         },
         confirmSetup:async()=>{
+          if(delayedAsset){
+            resumeAsset.resolve();
+            await delayedAsset;
+          }
           if(mode==='card reload')emit('framenavigated',stripe);
           const frame=mode==='foreign frame'?foreign:mode==='main transport'?main:
             ['sibling confirm','approved helper','card reload during helper trust'].includes(mode)?sibling:stripe;
@@ -174,6 +183,13 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
       await request(target,'GET',main,true,'document');
       path=target;
       await request('https://js.stripe.com/endive/stripe.js','GET',main,false,'script');
+      if(extraScript){
+        const load=request(extraScript,'GET',main,false,'script');
+        if(mode==='easel delayed'){
+          delayedAsset=load;
+          await assetPaused.promise;
+        }else await load;
+      }
     },
     evaluate:async(fn:Function,arg?:unknown)=>evaluate(fn,arg),
     locator:()=>({frameLocator:()=>({locator:()=>stripe.locator()}),locator:()=>({
@@ -230,14 +246,17 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
     await devtools.get('Network.requestWillBeSent')!({requestId:id,frameId,request:wire});
     const original:unknown={
       url:()=>target,method:()=>method,frame:()=>frame,isNavigationRequest:()=>navigation,resourceType:()=>resource,
-      redirectedFrom:()=>null,serviceWorker:()=>null,allHeaders:async()=>method==='POST'?
-        {origin:new URL(frame.url()).origin,'content-type':'application/x-www-form-urlencoded'}:
-        frame===uncommitted && mode==='uncommitted child cookie'?{cookie:'synthetic cookie'}:{},
+      redirectedFrom:()=>null,serviceWorker:()=>null,allHeaders:async()=>{
+        if(mode==='easel delayed'&&target===easel){assetPaused.resolve();await resumeAsset.promise;}
+        return method==='POST'?{origin:new URL(frame.url()).origin,'content-type':'application/x-www-form-urlencoded'}:
+          frame===uncommitted && mode==='uncommitted child cookie'?{cookie:'synthetic cookie'}:{};
+      },
       postData:()=>new URLSearchParams({key:picked.publishableKey,client_secret:picked.clientSecret}).toString(),
       response:()=>result.promise,
     };
     const respond=async()=>{
       if(frame===uncommitted)childLoads++;
+      if(target===extraScript)extraLoads++;
       const redirected=mode==='script redirect' && resource==='script';
       await devtools.get('Fetch.requestPaused')!({requestId:id,networkId:id,frameId,request:wire,responseStatusCode:redirected?302:200});
       if(redirected)return;
@@ -260,7 +279,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
   }
   registerChromiumProtocolFixture(page);
   const browser={newContext:async()=>context} as unknown as Browser;
-  return {browser,picked,writes,url,closed:()=>closed,childLoads:()=>childLoads,run:()=>runOptionalTrialSetupBrowser(browser,picked,
+  return {browser,picked,writes,url,closed:()=>closed,childLoads:()=>childLoads,extraLoads:()=>extraLoads,run:()=>runOptionalTrialSetupBrowser(browser,picked,
     {deadline:Date.now()+2000},()=>false)};
 }
 
@@ -279,6 +298,28 @@ test('an owned Stripe.js child GET can load before the child has a document URL'
   assert.equal(await f.run(),true);
   assert.equal(f.childLoads(),1);
   assert.deepEqual(f.writes,[f.url]);
+});
+
+test('the setup document loads the reviewed fingerprinted Stripe.js entry dependency',async()=>{
+  const f=checkout('easel asset');
+  assert.equal(await f.run(),true);
+  assert.equal(f.extraLoads(),1);
+  assert.deepEqual(f.writes,[f.url]);
+});
+
+test('a paused entry dependency loses main-frame authority at confirmation',async()=>{
+  const f=checkout('easel delayed');
+  await assert.rejects(f.run(),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')==='BROWSER_PROVIDER_ROUTE_FRAME');
+  assert.equal(f.extraLoads(),0);
+  assert.deepEqual(f.writes,[]);
+});
+
+for(const mode of ['easel query','other main asset'] as const)
+test('the setup document refuses an unreviewed main-frame script on '+mode,async()=>{
+  const f=checkout(mode);
+  await assert.rejects(f.run(),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')==='BROWSER_PROVIDER_ROUTE_FRAME');
+  assert.equal(f.extraLoads(),0);
+  assert.deepEqual(f.writes,[]);
 });
 
 for(const [fault,code] of [['cookie','BROWSER_PROVIDER_AUTH'],['foreign parent','BROWSER_PROVIDER_ROUTE_FRAME']] as const)
