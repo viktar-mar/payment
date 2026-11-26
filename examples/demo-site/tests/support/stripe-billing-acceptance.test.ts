@@ -1590,7 +1590,7 @@ for(const [suffix,expected,blocks] of [
  ['batch-six',null,6],
  ['batch-overflow','BROWSER_CHALLENGE_ISSUER_ASSET_LIMIT',6],
  ['batch-repeat','BROWSER_CHALLENGE_ISSUER_ASSET_REPEAT',6],
- ['batch-script','BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT',6],
+ ['batch-script','BROWSER_GUARD_ROUTE_IDENTITY',6],
  ['batch-shared-deadline','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',6],
  ['batch-decoy','BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK',6],
  ['second-late','BROWSER_CHALLENGE_ISSUER_ASSET_DEADLINE',1],

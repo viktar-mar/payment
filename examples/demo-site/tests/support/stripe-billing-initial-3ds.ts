@@ -13,6 +13,10 @@ const issuerOrigin='https://hooks.stripe.com';
 const directIssuerFrame='stripe-challenge-frame';
 const reservedStripeHosts=new Set(['api','hooks','js','m','r','merchant-ui-api']);
 const issuerAssetBlockLimit=6;
+const issuerScriptLimit=6;
+export function isIssuerScriptPath(pathname:string):boolean{
+ return /^\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.js$/.test(pathname);
+}
 export function issuerAssetSuffixMatches(kind:string,pathname:string):boolean{
  if(kind==='image')return /\.(?:png|jpe?g|gif|webp|ico)$/.test(pathname);
  if(kind==='font')return /\.woff2?$/.test(pathname);
@@ -107,6 +111,7 @@ type Options={
  page:Page;limits:BillingLimits;demo:string;owner:()=>{secret:string;key:string};
  winning:()=>Promise<void>;authorizeResponse:(req:Request)=>Promise<void>;check:()=>Promise<void>;
  expectIssuerAssetBlock:(req:Request)=>Promise<void>;
+ authorizeIssuerScript?:(req:Request,documentUrl:string)=>Promise<void>;
  stripeFrames:(req:Request)=>FrameSnapshot|undefined;waitForGesture:WaitForIssuerGesture;
  approvedIssuerOrigin?:string;
 };
@@ -115,7 +120,7 @@ function sameChain(a:FrameSnapshot|undefined,b:FrameSnapshot|undefined){
 }
 
 /** Scoped to one original v2 session. Only Stripe.js sends requests and only the issuer UI completes the challenge. */
-export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
+export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,authorizeIssuerScript,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
  requireValue(approvedIssuerOrigin===undefined||isApprovedIssuerOrigin(approvedIssuerOrigin));
  let retrieve:Request|undefined,authenticate:Request|undefined,admittedAuthenticate:Request|undefined;
  let completed=false,finalRead=false,initialIssuerDispatched=false,boundSource:string|undefined;
@@ -123,6 +128,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
  let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:Promise<void>}|undefined;
  let handoffStarted=false,passiveDeadline:number|undefined;
  const passiveBlocks=new Map<string,Promise<void>>();
+ const issuerScripts=new Map<string,Promise<void>>();
  const passiveFailures=new Map<Request,()=>void>();
  const issuerReady=Promise.withResolvers<void>(),issuerDispatched=Promise.withResolvers<void>(),navigation=new WeakMap<Frame,number>();
  const revision=(frame:Frame)=>navigation.get(frame)??0;
@@ -309,11 +315,28 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     requireValue(url.href===url.origin+url.pathname && !url.pathname.includes('%'));
     report('BROWSER_CHALLENGE_ISSUER_ASSET_KIND');
     const kind=request.resourceType();
+    if(kind==='script'){
+     report('BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT');
+     requireValue(authorizeIssuerScript && binding && isIssuerScriptPath(url.pathname) &&
+      !issuerScripts.has(url.pathname) && issuerScripts.size<issuerScriptLimit);
+     const documentUrl=binding.url;
+     const forwarded=billingBounded(limits,async active=>{
+      await authorizeIssuerScript(request,documentUrl);
+      await check();billingCheck(active);requireIssuerDocument();
+      report('BROWSER_CHALLENGE_ROUTE_FORWARD');
+      await route.continue();
+      const response=await originalResponse(request,active,5000);
+      requireValue(response.status()===200 &&
+       await billingBounded(active,()=>response.finished(),5000)===null && request.failure()===null);
+      await check();billingCheck(active);requireIssuerDocument();
+     },10000);
+     issuerScripts.set(url.pathname,forwarded);
+     return await forwarded;
+    }
     switch(kind){
      case 'image': report('BROWSER_CHALLENGE_ISSUER_ASSET_IMAGE_SUFFIX');break;
      case 'font': report('BROWSER_CHALLENGE_ISSUER_ASSET_FONT_SUFFIX');break;
      case 'stylesheet': report('BROWSER_CHALLENGE_ISSUER_ASSET_STYLESHEET_SUFFIX');break;
-     case 'script': report('BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT');break;
      case 'xhr': report('BROWSER_CHALLENGE_ISSUER_ASSET_XHR');break;
      case 'fetch': report('BROWSER_CHALLENGE_ISSUER_ASSET_FETCH');break;
      default: report('BROWSER_CHALLENGE_ISSUER_ASSET_OTHER');
@@ -418,7 +441,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   };
   handoffStarted=true;
   // Let the route's fixed checkpoint reach the owner on failure, while preventing handoff.
-  await Promise.all(passiveBlocks.values()).catch(()=>billingBounded(limits,()=>new Promise<never>(()=>{}),750));
+  await Promise.all([...passiveBlocks.values(),...issuerScripts.values()]).catch(()=>billingBounded(limits,()=>new Promise<never>(()=>{}),750));
   await validate();await billingBounded(limits,l=>waitForGesture({deadline:l.deadline,signal:l.signal!}),180000);await validate();
   // A pending form navigation can block evaluation in the issuer renderer.
   // Keep the trusted click receipt in the runner, tied to the armed document.

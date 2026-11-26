@@ -12,7 +12,7 @@ const rejectedAssets=new Map([
   contentType:'text/css',body:':root { color: black; }',
  }],
  ['direct reviewed issuer script rejected',{
-  path:'/fixture-private-script.js',kind:'script',checkpoint:'BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT',
+  path:'/fixture-private-script.js',kind:'script',checkpoint:'BROWSER_GUARD_ROUTE_ISSUER_SCRIPT_PARSER',
   contentType:'application/javascript',
   body:"document.querySelector('form').append(document.querySelector('template').content.cloneNode(true))",
  }],
@@ -20,8 +20,11 @@ const rejectedAssets=new Map([
 const stylesheetBlock='direct reviewed issuer passive stylesheet blocked';
 const twoFonts='direct reviewed issuer two passive fonts blocked';
 const sixFonts='direct reviewed issuer six passive fonts blocked';
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,...rejectedAssets.keys()])
-test(rejectedAssets.has(mode)?mode+' before handoff':'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
+const parserScript='one parser-initiated script from the exact issuer document';
+const wrongScriptMime='issuer script with the wrong MIME type is refused';
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,wrongScriptMime,...rejectedAssets.keys()])
+test(rejectedAssets.has(mode)?mode+' before handoff':mode===wrongScriptMime?mode:
+ 'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
  const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
  const retrieve=api+'/v1/payment_intents/pi_fixture?client_secret='+secret+'&key='+key;
@@ -31,13 +34,14 @@ test(rejectedAssets.has(mode)?mode+' before handoff':'an issuer iframe completes
  const blocksPassiveFont=mode==='direct reviewed issuer passive font blocked'||mode===twoFonts||mode===sixFonts;
  const blocksPassiveStylesheet=mode===stylesheetBlock;
  const blocksPassiveAsset=blocksPassiveImage||blocksPassiveFont||blocksPassiveStylesheet;
+ const badMime=mode===wrongScriptMime,loadsScript=mode===parserScript||badMime;
  const rejectedAsset=rejectedAssets.get(mode);
- const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||Boolean(rejectedAsset);
+ const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||loadsScript||Boolean(rejectedAsset);
  const direct=mode==='direct Stripe EMVCo frame'||scopedIssuer;
  const issuerName=direct?'stripe-challenge-frame':'acsFrame';
  const approvedIssuerOrigin=scopedIssuer?'https://reviewed-test-issuer.stripe.com':undefined;
  const issuerOrigin=approvedIssuerOrigin??'https://hooks.stripe.com',issuer=issuerOrigin+'/fixture-issuer',decision=issuer+'/decision';
- const assetPath=issuerOrigin+(rejectedAsset?.path??(blocksPassiveStylesheet?'/fixture-passive.css':
+ const assetPath=issuerOrigin+(rejectedAsset?.path??(loadsScript?'/fixture-required.js':blocksPassiveStylesheet?'/fixture-passive.css':
   blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png'));
  const fontCount=mode===sixFonts?6:mode===twoFonts?2:1;
  const assetUrls=[assetPath,...Array.from({length:fontCount-1},(_,index)=>issuerOrigin+`/fixture-passive-${index+2}.woff2`)];
@@ -64,14 +68,15 @@ test(rejectedAssets.has(mode)?mode+' before handoff':'an issuer iframe completes
  const issuerButton='<button name="decision" value="complete">Complete</button>';
  const revealButton="document.querySelector('form').append(document.querySelector('template').content.cloneNode(true))";
  const issuerBody='<!doctype html><form method="post" action="'+decision+'">'+
-  (blocksPassiveAsset||rejectedAsset?'<template>'+issuerButton+'</template>':issuerButton)+'</form>'+
+  (blocksPassiveAsset||rejectedAsset||loadsScript?'<template>'+issuerButton+'</template>':issuerButton)+'</form>'+
   (blocksPassiveImage?`<img width="1" height="1" alt="" src="${assetPath}" onerror="${revealButton}">`:
    blocksPassiveFont?`<style>${assetUrls.map((url,index)=>`@font-face{font-family:FixturePassive${index};src:url("${url}") format("woff2")}`).join('')}</style>
      <script>Promise.allSettled([${assetUrls.map((_,index)=>`document.fonts.load('16px FixturePassive${index}','X')`).join(',')}])
        .then(results=>{if(results.every(result=>result.status==='rejected')){${revealButton}}})</script>`:
    blocksPassiveStylesheet?`<link rel="stylesheet" href="${assetPath}" onerror="${revealButton}">`:
    rejectedAsset?.kind==='stylesheet'?`<link rel="stylesheet" href="${assetPath}" onload="${revealButton}">`:
-   rejectedAsset?.kind==='script'?`<script src="${assetPath}"></script>`:'');
+   rejectedAsset?.kind==='script'?`<script>const s=document.createElement('script');s.src="${assetPath}";document.head.append(s)</script>`:
+   loadsScript?`<script src="${assetPath}"></script>`:'');
  const responses=new Map<string,NonNullable<Parameters<Route['fulfill']>[0]>>([
   [demo+'/',{contentType:'text/html',body:'<!doctype html><link rel="icon" href="data:,"><iframe name="__privateStripeFrame7" src="'+outer+'"></iframe>'}],
   [outer,{contentType:'text/html',body:direct?'<!doctype html><body><script>'+script+'</script></body>':
@@ -87,6 +92,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':'an issuer iframe completes
   [complete,json({complete:true})],
  ]);
  if(rejectedAsset)responses.set(assetPath,{contentType:rejectedAsset.contentType,body:rejectedAsset.body});
+ if(loadsScript)responses.set(assetPath,{contentType:badMime?'text/html':'application/javascript',body:revealButton});
  const channel=process.env.PAYMENT_TEST_CHROME_CHANNEL==='chrome'?'chrome':'chromium';
  const browser=await chromium.launch({channel,headless:true,timeout:10_000,args:[
   '--site-per-process','--disable-background-networking','--proxy-server=direct://','--host-resolver-rules=MAP * ~NOTFOUND',
@@ -107,6 +113,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':'an issuer iframe completes
   const guard=await guardChallengeRedirects(page,reason=>refusals.push(reason),{demo,backend},undefined,approvedIssuerOrigin);
   const challenge=initial3dsChallenge({page,limits,demo,owner:()=>({key,secret}),winning:async()=>{},check:async()=>{},
    expectIssuerAssetBlock:request=>guard.expectIssuerAssetBlock(request),
+   authorizeIssuerScript:(request,document)=>guard.authorizeIssuerScript(request,document),
    approvedIssuerOrigin,authorizeResponse:async request=>{
     authorized.push(request.url());
     assert.ok(!assetUrls.includes(request.url()));
@@ -185,8 +192,9 @@ test(rejectedAssets.has(mode)?mode+' before handoff':'an issuer iframe completes
    ]);
    assert.equal(attachedIssuerFrame,true);
    assert.equal(refusals[0],rejectedAsset.checkpoint);
-   // The owner retains the first failure. Chromium can also report its abort at the response guard.
-   assert.ok(refusals.length===1||refusals.length===2&&refusals[1]==='BROWSER_GUARD_RESPONSE_NETWORK');
+   // The owner retains the first failure. The route and Chromium can both report the abort.
+   assert.ok(refusals.slice(1).every(code=>code==='BROWSER_GUARD_RESPONSE_NETWORK' ||
+    rejectedAsset.kind==='script' && code==='BROWSER_CHALLENGE_ISSUER_ASSET_SCRIPT'),JSON.stringify(refusals));
    assert.equal(assetErrorRedacted,true);
    assert.equal(passiveRequests.length,1);
    assert.equal(passiveRequests[0]===blocked,true);
@@ -204,6 +212,19 @@ test(rejectedAssets.has(mode)?mode+' before handoff':'an issuer iframe completes
    assert.equal(gestures,0);
    return;
   }
+  if(badMime){
+   attendance=challenge.attend().then(()=>true,()=>false);
+   const [request]=await Promise.all([
+    page.waitForEvent('requestfailed',{predicate:value=>value.url()===assetPath,timeout:8_000}),
+    page.goto(demo+'/',{waitUntil:'domcontentloaded',timeout:7_000}),
+   ]);
+   assert.equal(refusals[0],'BROWSER_GUARD_RESPONSE_ISSUER_SCRIPT');
+   assert.equal(request.existingResponse(),null);
+   assert.equal(await request.frame().locator('form button').count(),0);
+   assert.deepEqual(forwarded,[retrieve,authenticate,issuer,assetPath]);
+   assert.equal(gestures,0);
+   return;
+  }
   await page.goto(demo+'/',{waitUntil:'domcontentloaded',timeout:7_000});
   try{
    const stripeFrame=page.frameLocator('iframe');
@@ -215,7 +236,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':'an issuer iframe completes
   assert.equal(attachedIssuerFrame,true);
   if(mode==='separate issuer process')assert.equal(separateIssuerTarget,true);
   assert.deepEqual(refusals,[]);
-  assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision,complete,retrieve]);
+  assert.deepEqual(forwarded,[retrieve,authenticate,issuer,...(loadsScript?[assetPath]:[]),decision,complete,retrieve]);
   assert.equal(gestures,1);
   if(blocksPassiveAsset){
    assert.deepEqual(passiveRequests.map(asset=>asset.url()).sort(),[...assetUrls].sort());
@@ -236,7 +257,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':'an issuer iframe completes
  }finally{
   stop.abort();
   await browser.close();
-  if(blocksPassiveAsset||rejectedAsset){
+  if(blocksPassiveAsset||rejectedAsset||badMime){
    assert.equal(browser.isConnected(),false);
    if(attendance)assert.equal(await attendance,false);
   }

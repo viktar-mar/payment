@@ -4,7 +4,7 @@ import {guardIframeTargets,type GuardSession} from './stripe-billing-chromium-if
 // @ts-ignore Native Node executes the pinned Chromium identity reader.
 import {chromiumRouteReader,type ChromiumRouteEvidence} from './stripe-billing-chromium-route.ts';
 // @ts-ignore Native Node executes the same issuer-origin validator.
-import {isApprovedIssuerOrigin,issuerAssetSuffixMatches} from './stripe-billing-initial-3ds.ts';
+import {isApprovedIssuerOrigin,isIssuerScriptPath,issuerAssetSuffixMatches} from './stripe-billing-initial-3ds.ts';
 
 const refuse=():never=>{throw Error('billing_BROWSER');};
 // Keep response interception aligned with every original HTTP destination the guarded
@@ -15,6 +15,7 @@ type Header={name:string;value:string};
 type Preflight={origin:string;method:string;names?:string};
 type FrameWait={settle:(matched:boolean)=>void;invalidated:boolean};
 type Entry={url:string;method:string;frameId?:string;allowed:boolean;expectedAssetBlock?:boolean;preflight?:Preflight;
+ issuerParserDocument?:string;allowedIssuerScript?:boolean;
  initiator?:{id:string;entry?:Entry};frameWait?:FrameWait};
 type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
  |'BROWSER_GUARD_RESPONSE_PAIR_NETWORK_ID'|'BROWSER_GUARD_RESPONSE_PAIR_REQUEST_MISSING'|'BROWSER_GUARD_RESPONSE_PAIR_DUPLICATE'
@@ -25,7 +26,13 @@ type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUES
  |'BROWSER_GUARD_ROUTE_IDENTITY'|'BROWSER_GUARD_ROUTE_TARGET'
  |'BROWSER_GUARD_ROUTE_EVENT_MISSING'|'BROWSER_GUARD_ROUTE_EVENT_RETIRED'
  |'BROWSER_GUARD_ROUTE_EVENT_FRAME'|'BROWSER_GUARD_ROUTE_EVENT_URL'|'BROWSER_GUARD_ROUTE_EVENT_METHOD'
- |'BROWSER_GUARD_ROUTE_EVENT_CLAIMED'|'BROWSER_GUARD_ROUTE_EVENT_PREFLIGHT';
+ |'BROWSER_GUARD_ROUTE_EVENT_CLAIMED'|'BROWSER_GUARD_ROUTE_EVENT_PREFLIGHT'
+ |'BROWSER_GUARD_ROUTE_ISSUER_SCRIPT_PARSER'|'BROWSER_GUARD_RESPONSE_ISSUER_SCRIPT';
+function issuerScriptResponse(headers:Header[]|undefined){
+ const types=headers?.filter(header=>header.name.toLowerCase()==='content-type')??[];
+ return types.length===1 && /^(?:text|application)\/javascript(?:\s*;\s*charset=utf-8)?$/i.test(types[0]!.value.trim()) &&
+  !headers?.some(header=>['set-cookie','content-disposition','location'].includes(header.name.toLowerCase()));
+}
 function stripeScript(url:URL){
  return url.protocol==='https:' && !url.port && !url.username && !url.password &&
   (url.hostname==='js.stripe.com'||url.hostname.endsWith('.js.stripe.com'));
@@ -124,6 +131,8 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
    const issuerTraffic=approvedIssuerOrigin&&new URL(event.request.url).origin===approvedIssuerOrigin;
    const preflight=issuerTraffic?undefined:probe(event.request,event.initiator?.type,origins);
    const entry:Entry={frameId:event.frameId,url:event.request.url,method:event.request.method,allowed:false,preflight};
+   if(issuerTraffic && event.type==='Script' && event.initiator?.type==='parser' &&
+      event.initiator.url===event.documentURL)entry.issuerParserDocument=event.documentURL;
    if(!entry.frameId){
     // Chrome may report a frameless preflight before the linked initiating request.
     // Record the exact identifier, but require its frame and the synthetic 204 at the pause.
@@ -242,6 +251,10 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
       if(retired.has(initiator.id) || !entry || requests.get(initiator.id)!==entry || entry.allowed)refuse();
      }
     }else if(!original.allowed){reason='BROWSER_GUARD_RESPONSE_UNCLAIMED';refuse();}
+    if(original.allowedIssuerScript){
+     reason='BROWSER_GUARD_RESPONSE_ISSUER_SCRIPT';
+     if(status!==200 || event.resourceType!=='Script' || !issuerScriptResponse(event.responseHeaders))refuse();
+    }
     reason='BROWSER_GUARD_RESPONSE_PAIR_NETWORK_FRAME_MISSING';
     if(!original.frameId)return refuse();
     reason='BROWSER_GUARD_RESPONSE_PAIR_FRAME';
@@ -285,10 +298,15 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
  const mainId=frameId(frameTree,main,main);
  if(!mainId||routeReader&&routeReader.mainId!==mainId)refuse();
  const routes=new WeakMap<Request,{generation:number;evidence?:ChromiumRouteEvidence|null}>();
- async function claimRoute(request:Request,blockIssuerAsset:boolean){
+ async function claimRoute(request:Request,blockIssuerAsset:boolean,issuerScriptDocument?:string){
   const url=new URL(request.url());
   const fromApprovedIssuer=approvedIssuerOrigin!==undefined && url.origin===approvedIssuerOrigin;
-  if(blockIssuerAsset?
+  if(issuerScriptDocument!==undefined?
+     !routeReader || !fromApprovedIssuer || !routes.has(request) || !URL.canParse(issuerScriptDocument) ||
+      new URL(issuerScriptDocument).origin!==url.origin || request.frame().url()!==issuerScriptDocument ||
+      request.method()!=='GET' || request.isNavigationRequest() || request.resourceType()!=='script' ||
+      url.href!==url.origin+url.pathname || !isIssuerScriptPath(url.pathname):
+    blockIssuerAsset?
      !routes.has(request) || !fromApprovedIssuer || request.method()!=='GET' || request.isNavigationRequest() ||
       !issuerAssetSuffixMatches(request.resourceType(),url.pathname) || url.href!==url.origin+url.pathname || url.pathname.includes('%'):
      fromApprovedIssuer && (request.method()!=='POST'||!request.isNavigationRequest()||request.resourceType()!=='document')){
@@ -327,6 +345,11 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
     if(entry.allowed || entry.expectedAssetBlock)return refuse();
     reason='BROWSER_GUARD_ROUTE_EVENT_PREFLIGHT';
     if(entry.method==='OPTIONS'&&!entry.preflight)return refuse();
+    if(issuerScriptDocument!==undefined){
+     reason='BROWSER_GUARD_ROUTE_ISSUER_SCRIPT_PARSER';
+     if(entry.issuerParserDocument!==issuerScriptDocument || request.frame().url()!==issuerScriptDocument)return refuse();
+     entry.allowedIssuerScript=true;
+    }
     if(blockIssuerAsset)entry.expectedAssetBlock=true;
     else entry.allowed=true;
    }catch{onFailure(reason);return refuse();}
@@ -375,5 +398,6 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   },
   authorize:(request:Request)=>claimRoute(request,false),
   expectIssuerAssetBlock:(request:Request)=>claimRoute(request,true),
+  authorizeIssuerScript:(request:Request,documentUrl:string)=>claimRoute(request,false,documentUrl),
  };
 }

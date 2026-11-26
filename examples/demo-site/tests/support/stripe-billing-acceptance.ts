@@ -414,6 +414,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
   const sca=challenge?initial3dsChallenge({page,limits,demo:binding.endpoints.demo,owner:()=>({secret:firstSecret,key:publishableKey??''}),
    stripeFrames:req=>stripeFrames(page,req,false,false,binding.endpoints.demo),authorizeResponse:req=>redirects!.authorize(req),check:checkManager,waitForGesture:challenge.waitForGesture,
    expectIssuerAssetBlock:req=>redirects!.expectIssuerAssetBlock(req),
+   authorizeIssuerScript:(req,documentUrl)=>redirects!.authorizeIssuerScript(req,documentUrl),
    approvedIssuerOrigin:challenge.approvedIssuerOrigin,
    winning:async()=>{
     const original=requests.get('original-confirm'),response=original?.existingResponse();
