@@ -88,6 +88,30 @@ export function matchingChallengeRequest(binding:ReturnType<typeof issuerBinding
   return msg.messageType==='CReq' && msg.messageVersion===binding.version && msg.threeDSServerTransID===binding.server && msg.acsTransID===binding.acs;
  }catch{return false;}
 }
+// Descriptive only. A decoded result never grants transport or proves authentication.
+function matchingChallengeResult(binding:ReturnType<typeof issuerBinding>|undefined,body:string|null){
+ try{
+  if(!binding||!body||body.length>32768)return false;
+  const fields=new URLSearchParams(body),results=fields.getAll('cres');
+  if(results.length!==1 || [...fields.keys()].some(key=>key!=='cres'&&key!=='threeDSSessionData') ||
+   fields.getAll('threeDSSessionData').length>1 || !/^[A-Za-z0-9_-]+={0,2}$/.test(results[0]!))return false;
+  const encoded=results[0]!;
+  const bytes=Buffer.from(encoded,'base64url');
+  if(bytes.toString('base64url')!==encoded.replace(/=+$/,'') || encoded.endsWith('=')&&encoded.length%4!==0)return false;
+  const text=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
+  const result=object(JSON.parse(text));
+  let depth=0,members=0;
+  for(const [token,key] of text.matchAll(/("(?:[^"\\]|\\.)*")\s*:|"(?:[^"\\]|\\.)*"|[{}\[\]]/gs)){
+   if(key&&depth===1)members++;
+   else if(token==='{'||token==='[')depth++;
+   else if(token==='}'||token===']')depth--;
+  }
+  if(members!==Object.keys(result).length)return false;
+  return result.messageType==='CRes' && result.messageVersion===binding.version &&
+   result.threeDSServerTransID===binding.server && result.acsTransID===binding.acs &&
+   ['Y','N','D'].some(status=>result.transStatus===status);
+ }catch{return false;}
+}
 function unique(fields:URLSearchParams,name:string,expected:string){
  return fields.getAll(name).length===1 && fields.get(name)===expected;
 }
@@ -414,7 +438,9 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     requireValue(headers.origin===new URL(submission.url()).origin);
     const repeat=url.href===submission.url() && typeof data==='string' &&
      data.length<=65536 && createHash('sha256').update(data).digest('hex')===arm?.bodyHash;
-    report(repeat?'BROWSER_CHALLENGE_ISSUER_SUBMISSION_REPEAT':'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP');
+    if(repeat)report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_REPEAT');
+    else if(matchingChallengeResult(binding,data))report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_CRES');
+    else report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP');
     requireValue(false);
    }
    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION');

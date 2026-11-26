@@ -23,9 +23,10 @@ const sixFonts='direct reviewed issuer six passive fonts blocked';
 const parserScript='one parser-initiated script from the exact issuer document';
 const decisionScript='one parser-initiated script from the issuer decision document';
 const secondDecisionPost='a second document POST from the issuer decision';
+const decisionCres='a CRes document POST to the Stripe hooks origin';
 const wrongScriptMime='issuer script with the wrong MIME type is refused';
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,secondDecisionPost,wrongScriptMime,...rejectedAssets.keys()])
-test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost?mode+' is blocked after the original 2xx':mode===wrongScriptMime?mode:
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,secondDecisionPost,decisionCres,wrongScriptMime,...rejectedAssets.keys()])
+test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost||mode===decisionCres?mode+' is blocked after the original 2xx':mode===wrongScriptMime?mode:
  'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
  const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
@@ -38,7 +39,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost?m
  const blocksPassiveAsset=blocksPassiveImage||blocksPassiveFont||blocksPassiveStylesheet;
  const badMime=mode===wrongScriptMime,loadsScript=mode===parserScript||badMime;
  const loadsDecisionScript=mode===decisionScript;
- const submitsSecondDecision=mode===secondDecisionPost;
+ const submitsCres=mode===decisionCres,submitsSecondDecision=mode===secondDecisionPost||submitsCres;
  const rejectedAsset=rejectedAssets.get(mode);
  const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||loadsScript||loadsDecisionScript||submitsSecondDecision||Boolean(rejectedAsset);
  const direct=mode==='direct Stripe EMVCo frame'||scopedIssuer;
@@ -48,11 +49,13 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost?m
  const assetPath=issuerOrigin+(rejectedAsset?.path??(loadsScript?'/fixture-required.js':blocksPassiveStylesheet?'/fixture-passive.css':
   blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png'));
  const decisionAsset=issuerOrigin+'/fixture-decision.js';
- const followup=issuerOrigin+'/fixture-followup';
+ const followup=(submitsCres?'https://hooks.stripe.com':issuerOrigin)+'/fixture-followup';
  const fontCount=mode===sixFonts?6:mode===twoFonts?2:1;
  const assetUrls=[assetPath,...Array.from({length:fontCount-1},(_,index)=>issuerOrigin+`/fixture-passive-${index+2}.woff2`)];
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
+ const cres=Buffer.from(JSON.stringify({messageType:'CRes',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,transStatus:'Y'})).toString('base64url');
+ const followupField=submitsCres?`<input name="cres" value="${cres}">`:'<input name="result" value="fixture">';
  const script=`(async()=>{
   await (await fetch(${JSON.stringify(retrieve)})).json();
   await (await fetch(${JSON.stringify(authenticate)},{method:'POST',body:new URLSearchParams({source:${JSON.stringify(source)},key:${JSON.stringify(key)}})})).json();
@@ -97,7 +100,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost?m
    ares:{messageType:'ARes',transStatus:'C',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,acsURL:issuer}})],
   [issuer,{contentType:'text/html',body:issuerBody}],
   [decision,{contentType:'text/html',body:submitsSecondDecision?
-   `<!doctype html><form method="post" action="${followup}"><input name="result" value="fixture"></form><script>document.forms[0].submit()</script>`:
+   `<!doctype html><form method="post" action="${followup}">${followupField}</form><script>document.forms[0].submit()</script>`:
    loadsDecisionScript?`<!doctype html><script src="${decisionAsset}"></script>`:
    '<!doctype html><script>'+issuerDecision+'</script>'}],
   [complete,json({complete:true})],
@@ -248,7 +251,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost?m
    assert.equal(request.method(),'POST');
    assert.equal(request.isNavigationRequest(),true);
    assert.equal(request.existingResponse(),null);
-   assert.equal(refusals[0],'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP');
+   assert.equal(refusals[0],submitsCres?'BROWSER_CHALLENGE_ISSUER_SUBMISSION_CRES':'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP');
    assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision]);
    assert.deepEqual(authorized,forwarded);
    assert.equal(gestures,1);

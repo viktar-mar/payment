@@ -812,6 +812,15 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    trace.push('issuer witnessed');
    if(fault==='second-issuer-same-form')await wire(actionUrl,issuer,'decision=complete',{},true);
    if(fault==='second-issuer-different-form')await wire(issuerHost+'/test-fixture/finish',issuer,'result=fixture',{},true);
+   if(['second-issuer-cres','second-issuer-foreign-cres','second-issuer-duplicate-cres','second-issuer-bad-padding-cres'].includes(fault)){
+    const wireCres=JSON.stringify({messageType:'CRes',messageVersion:'2.2.0',threeDSServerTransID:id(90),
+     acsTransID:fault==='second-issuer-foreign-cres'?id(92):id(91),transStatus:'Y'});
+    const json=fault==='second-issuer-duplicate-cres'?'{"acs\\u0054ransID":"'+id(92)+'",'+wireCres.slice(1):wireCres;
+    const cres=Buffer.from(json).toString('base64url');
+    const wrongPadding=cres.length%4===3?'==':'=';
+    const result=fault==='second-issuer-bad-padding-cres'?cres+wrongPadding:cres;
+    await wire(issuerHost+'/test-fixture/finish',issuer,'cres='+result,{},true);
+   }
    if(fault==='second-issuer-commit-during-headers')await wire(actionUrl,issuer,'decision=complete',{},true);
    if(fault==='second-issuer-replaced-document'){
     navigate(issuer);
@@ -1531,6 +1540,10 @@ for(const fault of ['none','direct-issuer-valid','late-source-valid','late-issue
 for(const [fault,checkpoint] of [
  ['second-issuer-same-form','BROWSER_CHALLENGE_ISSUER_SUBMISSION_REPEAT'],
  ['second-issuer-different-form','BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
+ ['second-issuer-cres','BROWSER_CHALLENGE_ISSUER_SUBMISSION_CRES'],
+ ['second-issuer-foreign-cres','BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
+ ['second-issuer-duplicate-cres','BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
+ ['second-issuer-bad-padding-cres','BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
  ['second-issuer-replaced-document','BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT'],
  ['second-issuer-commit-during-headers','BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT'],
 ] as const)test('3DS blocks a second issuer document POST after the original 2xx: '+fault,async()=>{
