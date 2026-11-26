@@ -29,8 +29,9 @@ function terminalFailure(cleanupConfirmed:boolean,code='BROWSER') {
   return error;
 }
 const demo='http://127.0.0.1:48000';
-const stripeScript='https://js.stripe.com/endive/stripe.js';
-const stripeEaselScript=/^https:\/\/js\.stripe\.com\/v3\/fingerprinted\/js\/elements-easel-frame-[a-f0-9]{32}\.js$/;
+// Use the same Stripe.js load option as the other isolated payment checks.
+const stripeScript='https://js.stripe.com/endive/stripe.js?advancedFraudSignals=false';
+const stripeSetupDependency=/^https:\/\/js\.stripe\.com\/v3\/fingerprinted\/js\/(?:elements-easel-frame|trusted-types-checker)-[a-f0-9]{32}\.js$/;
 const usedIntents=new Set<string>();
 const secretPattern=/^(seti_[A-Za-z0-9]{1,250})_secret_[A-Za-z0-9_]+$/;
 const documentBody=`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Save test card</title>
@@ -220,7 +221,7 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         const confirming=raw===confirmUrl,setupRead=target.origin+target.pathname===intentUrl;
         const ownScript=script && method==='GET' && request.resourceType()==='script';
         const allowMain=()=>api && confirming && method==='POST' ||
-          ownScript && (raw===stripeScript || !active && !exchange.dispatched && stripeEaselScript.test(raw));
+          ownScript && (raw===stripeScript || !active && !exchange.dispatched && stripeSetupDependency.test(raw));
         routeCheckpoint='BROWSER_PROVIDER_ROUTE_FRAME';
         const before=stripeFrames(page,request,childNavigation,allowMain(),demo);
         need(before && (!navigation || childNavigation));

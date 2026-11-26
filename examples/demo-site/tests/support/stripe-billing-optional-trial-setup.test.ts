@@ -14,6 +14,7 @@ const permit:OptionalTrialSetupPermit = {
 };
 const confirmUrl='https://api.stripe.com/v1/setup_intents/seti_owned/confirm';
 const frameOrigin='https://js.stripe.com';
+const testStripeScript='https://js.stripe.com/endive/stripe.js?advancedFraudSignals=false';
 const redacted=/^Error: billing_OPTIONAL_TRIAL_SETUP_BROWSER$/;
 function fixture(){
   const headers:Record<string,string>={origin:frameOrigin,'content-type':'application/x-www-form-urlencoded'};
@@ -91,12 +92,13 @@ for(const fault of ['other request','other intent','other secret','live','requir
 }
 
 // Runs the real routing and page callbacks against VM DOM and CDP values only.
-function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'easel query'|'easel delayed'|'other main asset'){
+function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'trusted types asset'|'easel query'|'easel delayed'|'other main asset'){
   const picked={...permit,setupIntentId:'seti_'+mode.replaceAll(' ',''),
     clientSecret:'seti_'+mode.replaceAll(' ','')+'_secret_fixture'};
   const url='https://api.stripe.com/v1/setup_intents/'+picked.setupIntentId+'/confirm';
   const easel='https://js.stripe.com/v3/fingerprinted/js/elements-easel-frame-'+'a'.repeat(32)+'.js';
   const extraScript=mode==='easel asset'||mode==='easel delayed'?easel:mode==='easel query'?easel+'?mode=synthetic':
+    mode==='trusted types asset'?easel.replace('elements-easel-frame','trusted-types-checker'):
     mode==='other main asset'?easel.replace('elements-easel-frame','unreviewed'):undefined;
   let path='about:blank',closed=0,nextId=0,trustChecks=0,childLoads=0,extraLoads=0;
   let routeHandler:((route:Route)=>Promise<void>)|undefined;
@@ -182,7 +184,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
     goto:async(target:string)=>{
       await request(target,'GET',main,true,'document');
       path=target;
-      await request('https://js.stripe.com/endive/stripe.js','GET',main,false,'script');
+      await request(testStripeScript,'GET',main,false,'script');
       if(extraScript){
         const load=request(extraScript,'GET',main,false,'script');
         if(mode==='easel delayed'){
@@ -274,6 +276,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
     await routeHandler!({request:()=>original,continue:respond,fallback:respond,abort:async()=>{},
       fulfill:async({body}:{body:string})=>{
         assert.match(target,/^http:\/\/127\.0\.0\.1:\d{4,5}\/owned-trial-setup\//);
+        assert.ok(body.includes(`src="${testStripeScript}"`));
         assert.doesNotMatch(body,/seti_|pk_test_|secret_fixture/);await respond();
       }} as unknown as Route);
   }
@@ -300,8 +303,9 @@ test('an owned Stripe.js child GET can load before the child has a document URL'
   assert.deepEqual(f.writes,[f.url]);
 });
 
-test('the setup document loads the reviewed fingerprinted Stripe.js entry dependency',async()=>{
-  const f=checkout('easel asset');
+for(const mode of ['easel asset','trusted types asset'] as const)
+test('the setup document loads the reviewed fingerprinted Stripe.js entry dependency '+mode,async()=>{
+  const f=checkout(mode);
   assert.equal(await f.run(),true);
   assert.equal(f.extraLoads(),1);
   assert.deepEqual(f.writes,[f.url]);
