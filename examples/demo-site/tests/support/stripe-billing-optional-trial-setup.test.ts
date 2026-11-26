@@ -369,7 +369,7 @@ test('the setup document loads the reviewed fingerprinted Stripe.js entry depend
 
 test('a paused entry dependency loses main-frame authority at confirmation',async()=>{
   const f=checkout('easel delayed');
-  await assert.rejects(f.run(),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')==='BROWSER_PROVIDER_ROUTE_FRAME');
+  await assert.rejects(f.run(),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')==='BROWSER_SETUP_ROUTE_FRAME_CHANGED');
   assert.equal(f.extraLoads(),0);
   assert.deepEqual(f.writes,[]);
 });
@@ -377,12 +377,12 @@ test('a paused entry dependency loses main-frame authority at confirmation',asyn
 for(const mode of ['easel query','other main asset'] as const)
 test('the setup document refuses an unreviewed main-frame script on '+mode,async()=>{
   const f=checkout(mode);
-  await assert.rejects(f.run(),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')==='BROWSER_PROVIDER_ROUTE_FRAME');
+  await assert.rejects(f.run(),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')==='BROWSER_SETUP_ROUTE_FRAME_MAIN_SCRIPT');
   assert.equal(f.extraLoads(),0);
   assert.deepEqual(f.writes,[]);
 });
 
-for(const [fault,code] of [['cookie','BROWSER_PROVIDER_AUTH'],['foreign parent','BROWSER_PROVIDER_ROUTE_FRAME']] as const)
+for(const [fault,code] of [['cookie','BROWSER_PROVIDER_AUTH'],['foreign parent','BROWSER_SETUP_ROUTE_FRAME_CHILD_NAVIGATION']] as const)
 test('an uncommitted Stripe.js child cannot forward a GET with '+fault,async()=>{
   const f=checkout(`uncommitted child ${fault}`);
   await assert.rejects(f.run(),(error:unknown)=>{
@@ -398,7 +398,7 @@ for(const fault of ['untrusted','foreign frame','repeat','close fails','card rel
   const f=checkout(fault);
   await assert.rejects(f.run(),(error:unknown)=>{
     assert.equal(browserCleanupConfirmed(error),fault!=='close fails');
-    const code={untrusted:'BROWSER_CONFIRM_WAIT','foreign frame':'BROWSER_PROVIDER_ROUTE_FRAME',
+    const code={untrusted:'BROWSER_CONFIRM_WAIT','foreign frame':'BROWSER_SETUP_ROUTE_FRAME_CONFIRM',
       repeat:'BROWSER_PROVIDER_ROUTE_PAY','close fails':'BROWSER_CLEANUP','card reload':'BROWSER_PROVIDER_ROUTE_PAY',
       'sibling confirm':'BROWSER_PROVIDER_ROUTE_PAY','card reload during helper trust':'BROWSER_PROVIDER_ROUTE_PAY'}[fault];
     assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);

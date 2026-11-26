@@ -241,7 +241,20 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         const ownScript=script && method==='GET' && request.resourceType()==='script';
         const allowMain=()=>api && confirming && method==='POST' ||
           ownScript && (raw===stripeScript || !active && !exchange.dispatched && stripeSetupDependency.test(raw));
-        routeCheckpoint='BROWSER_PROVIDER_ROUTE_FRAME';
+        routeCheckpoint='BROWSER_SETUP_ROUTE_FRAME_LOOKUP';
+        const routeFrame=request.frame();
+        if(routeFrame===page.mainFrame()){
+          routeCheckpoint=confirming?'BROWSER_SETUP_ROUTE_FRAME_CONFIRM':
+            elementsSession?'BROWSER_SETUP_ROUTE_FRAME_MAIN_SESSION':
+            setupRead?'BROWSER_SETUP_ROUTE_FRAME_MAIN_READ':
+            support?'BROWSER_SETUP_ROUTE_FRAME_MAIN_SUPPORT':
+            script?'BROWSER_SETUP_ROUTE_FRAME_MAIN_SCRIPT':'BROWSER_SETUP_ROUTE_FRAME_ENTRY';
+        }else{
+          const frameUrl=routeFrame.url();
+          routeCheckpoint=childNavigation?'BROWSER_SETUP_ROUTE_FRAME_CHILD_NAVIGATION':
+            !frameUrl || frameUrl==='about:blank'?'BROWSER_SETUP_ROUTE_FRAME_UNCOMMITTED':
+            confirming?'BROWSER_SETUP_ROUTE_FRAME_CONFIRM':'BROWSER_SETUP_ROUTE_FRAME_ENTRY';
+        }
         const before=stripeFrames(page,request,childNavigation,allowMain(),demo);
         need(before && (!navigation || childNavigation));
         redirects.registerRoute(request);
@@ -250,7 +263,7 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         check();
         routeCheckpoint='BROWSER_PROVIDER_AUTH';
         need(unprivileged(headers) && (!headers.authorization || api && !preflight && headers.authorization==='Bearer '+granted.publishableKey));
-        routeCheckpoint='BROWSER_PROVIDER_ROUTE_FRAME';
+        routeCheckpoint='BROWSER_SETUP_ROUTE_FRAME_SOURCE';
         // The initial child GET is bound to its parent and CDP frame before the child has a URL.
         const source=childNavigation?undefined:new URL(request.frame().url()).origin;
         routeCheckpoint='BROWSER_PROVIDER_ROUTE_POLICY';
@@ -289,7 +302,7 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
           await checkClick(request);
         }
         check();
-        routeCheckpoint='BROWSER_PROVIDER_ROUTE_FRAME';
+        routeCheckpoint='BROWSER_SETUP_ROUTE_FRAME_CHANGED';
         const current=stripeFrames(page,request,childNavigation,allowMain(),demo);
         need(current && current.target===before.target && current.frames.size===before.frames.size &&
           [...before.frames].every(([frame,location])=>current.frames.get(frame)===location));
