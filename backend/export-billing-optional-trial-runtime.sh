@@ -51,8 +51,11 @@ OwnedOptionalTrialPublication$Verified.class
 OwnedOptionalTrialPublication$VerifiedLifecycle.class
 OwnedOptionalTrialResume.class
 OwnedOptionalTrialResume$Admission.class
+OwnedOptionalTrialResume$Attempt.class
 OwnedOptionalTrialResume$Configuration.class
+OwnedOptionalTrialResume$Failure.class
 OwnedOptionalTrialResume$Receipt.class
+OwnedOptionalTrialResume$Stage.class
 OwnedOptionalTrialResumeGraph.class
 OwnedOptionalTrialResumeGraph$Identity.class
 OwnedOptionalTrialResumeGraph$Read.class
