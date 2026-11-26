@@ -92,15 +92,18 @@ for(const fault of ['other request','other intent','other secret','live','requir
 }
 
 // Runs the real routing and page callbacks against VM DOM and CDP values only.
-function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'trusted types asset'|'easel query'|'easel bare query'|'easel delayed'|'other main asset'|'delayed element ready'|'element load error'|'missing card number'|'element no session'|'element no response'|'element no ready event'|'unobserved helper read'|'helper without response'|'late helper response',onHelperResponse=()=>{}){
+function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'|'easel asset'|'trusted types asset'|'easel query'|'easel bare query'|'easel delayed'|'other main asset'|'delayed element ready'|'element load error'|'missing card number'|'element no session'|'element no response'|'element no ready event'|'unobserved helper read'|'helper without response'|'late helper response'|'activation dependency'|'activation dependency reload'|'activation dependency query'|'activation alternate fingerprint',onHelperResponse=()=>{}){
   const picked={...permit,setupIntentId:'seti_'+mode.replaceAll(' ',''),
     clientSecret:'seti_'+mode.replaceAll(' ','')+'_secret_fixture'};
   const url='https://api.stripe.com/v1/setup_intents/'+picked.setupIntentId+'/confirm';
   const sessionUrl='https://api.stripe.com/v1/elements/sessions';
   const easel='https://js.stripe.com/v3/fingerprinted/js/elements-easel-frame-'+'a'.repeat(32)+'.js';
-  const extraScript=mode==='easel asset'||mode==='easel delayed'?easel:mode==='easel query'?easel+'?mode=synthetic':mode==='easel bare query'?easel+'?':
+  const activationDependency='https://js.stripe.com/v3/fingerprinted/js/trusted-types-checker-e80b3cae3b1db2e27d3062d4e7b03473.js';
+  const activationAsset=mode==='activation dependency'||mode==='activation dependency reload'?activationDependency:mode==='activation dependency query'?activationDependency+'?fixture=1':
+    mode==='activation alternate fingerprint'?activationDependency.replace('e80b3cae3b1db2e27d3062d4e7b03473','b'.repeat(32)):undefined;
+  const extraScript=activationAsset??(mode==='easel asset'||mode==='easel delayed'?easel:mode==='easel query'?easel+'?mode=synthetic':mode==='easel bare query'?easel+'?':
     mode==='trusted types asset'?easel.replace('elements-easel-frame','trusted-types-checker'):
-    mode==='other main asset'?easel.replace('elements-easel-frame','unreviewed'):undefined;
+    mode==='other main asset'?easel.replace('elements-easel-frame','unreviewed'):undefined);
   let path='about:blank',closed=0,nextId=0,trustChecks=0,childLoads=0,extraLoads=0;
   let routeHandler:((route:Route)=>Promise<void>)|undefined;
   const devtools=new Map<string,(event:unknown)=>void|Promise<void>>();
@@ -165,6 +168,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
             }})};
         },
         confirmSetup:async()=>{
+          if(activationAsset)await request(activationAsset,'GET',main,false,'script');
           if(delayedAsset){
             resumeAsset.resolve();
             await delayedAsset;
@@ -203,7 +207,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
       await request(target,'GET',main,true,'document');
       path=target;
       await request(testStripeScript,'GET',main,false,'script');
-      if(extraScript){
+      if(extraScript && !activationAsset){
         const load=request(extraScript,'GET',main,false,'script');
         if(mode==='easel delayed'){
           delayedAsset=load;
@@ -224,7 +228,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
         const witness=evaluate<()=>boolean>(fn,button);
         return {evaluate:async(reader:(value:()=>boolean)=>boolean)=>{
           const clicked=reader(witness);
-          if(++trustChecks===2 && mode==='card reload during helper trust')emit('framenavigated',stripe);
+          if(++trustChecks===2 && ['card reload during helper trust','activation dependency reload'].includes(mode))emit('framenavigated',stripe);
           return clicked;
         }};
       },
@@ -449,5 +453,27 @@ test('a late helper receipt cannot authorize a confirmation transport',async(t)=
   t.mock.timers.enable({apis:['Date'],now:Date.now()});
   const f=checkout('late helper response',()=>t.mock.timers.setTime(Date.now()+15_001));
   await assert.rejects(f.run(45_000),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')==='BROWSER_PROVIDER_ROUTE_PAY');
+  assert.deepEqual(f.writes,[]);
+});
+
+test('the exact reviewed Stripe checker can load during the trusted confirmation',async()=>{
+  const f=checkout('activation dependency');
+  assert.equal(await f.run(),true);
+  assert.equal(f.extraLoads(),1);
+  assert.deepEqual(f.writes,[f.url]);
+});
+
+for(const mode of ['activation dependency query','activation alternate fingerprint'] as const)
+test('the activated setup still refuses '+mode,async()=>{
+  const f=checkout(mode);
+  await assert.rejects(f.run(),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')==='BROWSER_SETUP_ROUTE_FRAME_MAIN_SCRIPT');
+  assert.equal(f.extraLoads(),0);
+  assert.deepEqual(f.writes,[]);
+});
+
+test('a card reload invalidates the checker request before forwarding',async()=>{
+  const f=checkout('activation dependency reload');
+  await assert.rejects(f.run(),(error:unknown)=>browserDiagnostic(error,'ACCEPTANCE')==='BROWSER_PROVIDER_ROUTE_PAY');
+  assert.equal(f.extraLoads(),0);
   assert.deepEqual(f.writes,[]);
 });

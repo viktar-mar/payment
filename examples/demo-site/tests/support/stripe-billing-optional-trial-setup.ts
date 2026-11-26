@@ -38,6 +38,7 @@ const demo='http://127.0.0.1:48000';
 // Use the same Stripe.js load option as the other isolated payment checks.
 const stripeScript='https://js.stripe.com/endive/stripe.js?advancedFraudSignals=false';
 const stripeSetupDependency=/^https:\/\/js\.stripe\.com\/v3\/fingerprinted\/js\/(?:elements-easel-frame|trusted-types-checker)-[a-f0-9]{32}\.js$/;
+const stripeActivationDependency='https://js.stripe.com/v3/fingerprinted/js/trusted-types-checker-e80b3cae3b1db2e27d3062d4e7b03473.js';
 const elementReadyBudget=30_000;
 const setupReadReceiptBudget=15_000;
 const usedIntents=new Set<string>();
@@ -245,10 +246,11 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         const preflight=method==='OPTIONS',childNavigation=script && method==='GET' && navigation;
         const confirming=raw===confirmUrl,setupRead=target.origin+target.pathname===intentUrl;
         const ownScript=script && method==='GET' && request.resourceType()==='script';
-        const allowMain=()=>api && confirming && method==='POST' ||
-          ownScript && (raw===stripeScript || !active && !exchange.dispatched && stripeSetupDependency.test(raw));
         routeCheckpoint='BROWSER_SETUP_ROUTE_FRAME_LOOKUP';
         const routeFrame=request.frame();
+        const activationDependency=active && routeFrame===page.mainFrame() && ownScript && raw===stripeActivationDependency;
+        const allowMain=()=>api && confirming && method==='POST' || ownScript &&
+          (raw===stripeScript || !exchange.dispatched && (active?activationDependency:stripeSetupDependency.test(raw)));
         if(routeFrame===page.mainFrame()){
           routeCheckpoint=confirming?'BROWSER_SETUP_ROUTE_FRAME_CONFIRM':
             elementsSession?'BROWSER_SETUP_ROUTE_FRAME_MAIN_SESSION':
@@ -283,7 +285,13 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         need(intended==='GET'||intended==='POST');
         if(!script && headers.origin)need(headers.origin===source);
         let readAuthority:(()=>boolean)|undefined;
-        if(script)need(intended==='GET');
+        if(script){
+          need(intended==='GET');
+          if(activationDependency){
+            routeCheckpoint='BROWSER_PROVIDER_ROUTE_PAY';
+            await checkClick(request);
+          }
+        }
         else if(support)need(!navigation && !/^\/(?:v\d+|api)(?:\/|$)/i.test(target.pathname) && !target.pathname.includes('%'));
         else if(api && confirming){
           routeCheckpoint='BROWSER_PROVIDER_ROUTE_PAY';
@@ -309,7 +317,7 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
 
         routeCheckpoint='BROWSER_PROVIDER_ROUTE_GUARD';
         await redirects.authorize(request);
-        if(confirming){
+        if(confirming || activationDependency){
           routeCheckpoint='BROWSER_PROVIDER_ROUTE_PAY';
           await checkClick(request);
         }
