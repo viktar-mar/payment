@@ -67,6 +67,7 @@ Feature: Stripe Billing through the configured application and official SDK
     Then the resumption remains pending without paid access
     When the original resumption invoice has verified cash
     Then that payment restores access once and preserves the original zero trial invoice
+    And the trial start, pause and paid resumption have exactly one signed callback each
 
   Scenario: Verified renewal cash advances the existing subscription
     Given an owned Stripe Billing subscription with 0 trial days

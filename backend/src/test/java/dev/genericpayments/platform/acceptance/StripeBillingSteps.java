@@ -951,6 +951,31 @@ public class StripeBillingSteps {
         assertThat(trialPublication()).isEqualTo(originalTrial);
     }
 
+    @Then("the trial start, pause and paid resumption have exactly one signed callback each")
+    public void trialLifecycleCallbacks() {
+        // This fixture advances its clock by seven days before enqueueing the pause and resumption.
+        deliverCallbacks(Set.of(created.subscriptionId()), bean(Clock.class));
+        var states = jdbc.queryForList("""
+            select e.event_type || ' ' || (o.payload->>'state') || ' ' || (o.payload->>'access_allowed')
+            from subscription_events e
+            join outbox_events o on o.subscription_event_id=e.id and o.id=e.id
+              and o.site_id=e.site_id and o.subscription_id=e.subscription_id and o.payment_account_id=e.payment_account_id
+            join outbox_deliveries d on d.outbox_event_id=o.id and d.attempt_number=1
+            where e.site_id=? and e.subscription_id=? and e.payment_account_id=?
+              and e.event_type in ('TRIAL_STARTED','PAUSED','PERIOD_PAID')
+              and o.callback_type='subscription.updated' and o.status='DELIVERED' and o.attempt_count=1
+              and o.payload->>'event_id'=e.id::text and (o.payload->>'occurred_at')::timestamptz=e.occurred_at
+              and o.payload->'revision'=to_jsonb(e.revision)
+              and o.payload->>'customer_id'=? and o.payload->>'product_id'=?
+              and o.payload->'billing_record_id'=coalesce(to_jsonb(e.billing_record_id),'null'::jsonb)
+              and o.payload->'payment_id'=coalesce(to_jsonb(e.payment_id),'null'::jsonb)
+              and d.delivery_mode='AUTOMATIC' and d.status='SUCCEEDED' and d.http_status=204
+            order by e.sequence_number
+            """, String.class, site.value(), created.subscriptionId(), account.id().value(),
+            customer.id().value().toString(), product.value().toString());
+        assertThat(states).containsExactly("TRIAL_STARTED TRIALING true", "PAUSED PAUSED false", "PERIOD_PAID ACTIVE true");
+    }
+
     private void next(String settlement) {
         start=end;end=end.plusSeconds(30L*86400);TestClock.set(start);authenticate();setPeriod(start,end);
         remote.addProperty("status",settlement.equals("CASH")?"active":"past_due");invoices.add(invoice("renewal","subscription_cycle",start,end,settlement));reconcile();
@@ -1359,11 +1384,12 @@ public class StripeBillingSteps {
         deliverCallbacks(Set.of(created.subscriptionId()));
     }
     private void deliverCallbacks(Set<UUID> subscriptions) {
+        deliverCallbacks(subscriptions,Clock.systemUTC());
+    }
+    private void deliverCallbacks(Set<UUID> subscriptions, Clock deliveryClock) {
         var outbox=bean(OutboxPort.class);var encryption=bean(EncryptedSecretPort.class);var payloads=bean(CallbackPayloadPort.class);
         // Existing in-memory CallbackHttpPort seam, actual signer/canonical bytes/outbox completion.
-        // These delivery scenarios use ordinary initial/change periods, never a future business advance.
-        Clock deliveryClock=Clock.systemUTC();
-        var claims=outbox.claimAutomatic("stripe-billing-callbacks",20,now(),Duration.ofSeconds(30));
+        var claims=outbox.claimAutomatic("stripe-billing-callbacks",20,deliveryClock.instant(),Duration.ofSeconds(30));
         assertThat(claims).hasSize((int)count("outbox_events","site_id=?",site.value()));var delivered=new HashSet<UUID>();
         for(var claim:claims) {
             long before=deliveryClock.instant().getEpochSecond();
@@ -1378,7 +1404,7 @@ public class StripeBillingSteps {
         }
         assertThat(count("outbox_events","site_id=? and status<>'DELIVERED'",site.value())).isZero();
         assertThat(count("outbox_deliveries","outbox_event_id in (select id from outbox_events where site_id=?)",site.value())).isEqualTo(claims.size());
-        assertThat(outbox.claimAutomatic("stripe-billing-callback-replay",20,now(),Duration.ofSeconds(30))).isEmpty();
+        assertThat(outbox.claimAutomatic("stripe-billing-callback-replay",20,deliveryClock.instant(),Duration.ofSeconds(30))).isEmpty();
     }
     private record BillingRefs(String subscription,String item,String price,String product) {}
     private record InvoiceGraph(String suffix,String settlement,JsonObject invoice,JsonObject line,JsonObject allocation,JsonObject intent,JsonObject charge) {}
