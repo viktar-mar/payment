@@ -226,8 +226,11 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         routeCheckpoint='BROWSER_PROVIDER_HEADERS';
         const headers=await request.allHeaders();
         check();
-        const source=new URL(request.frame().url()).origin;
+        routeCheckpoint='BROWSER_PROVIDER_AUTH';
         need(unprivileged(headers) && (!headers.authorization || api && !preflight && headers.authorization==='Bearer '+granted.publishableKey));
+        routeCheckpoint='BROWSER_PROVIDER_ROUTE_FRAME';
+        // The initial child GET is bound to its parent and CDP frame before the child has a URL.
+        const source=childNavigation?undefined:new URL(request.frame().url()).origin;
         routeCheckpoint='BROWSER_PROVIDER_ROUTE_POLICY';
         const intended=preflight?headers['access-control-request-method']:method;
         need(intended==='GET'||intended==='POST');
@@ -237,7 +240,7 @@ export async function runOptionalTrialSetupBrowser(browser:Browser,permit:Option
         else if(support)need(!navigation && !/^\/(?:v\d+|api)(?:\/|$)/i.test(target.pathname) && !target.pathname.includes('%'));
         else if(api && confirming){
           routeCheckpoint='BROWSER_PROVIDER_ROUTE_PAY';
-          need(intended==='POST' && headers.origin===source);
+          need(source!==undefined && intended==='POST' && headers.origin===source);
           await checkClick(request);
           if(preflight)need(!exchange.dispatched);
           else exchange.claim(request,headers,source,true);

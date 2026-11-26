@@ -91,11 +91,11 @@ for(const fault of ['other request','other intent','other secret','live','requir
 }
 
 // Runs the real routing and page callbacks against VM DOM and CDP values only.
-function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'){
+function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repeat'|'card reload'|'sibling confirm'|'main transport'|'approved helper'|'card reload during helper trust'|'script redirect'|'uncommitted child'|'uncommitted child cookie'|'uncommitted child foreign parent'){
   const picked={...permit,setupIntentId:'seti_'+mode.replaceAll(' ',''),
     clientSecret:'seti_'+mode.replaceAll(' ','')+'_secret_fixture'};
   const url='https://api.stripe.com/v1/setup_intents/'+picked.setupIntentId+'/confirm';
-  let path='about:blank',closed=0,nextId=0,trustChecks=0;
+  let path='about:blank',closed=0,nextId=0,trustChecks=0,childLoads=0;
   let routeHandler:((route:Route)=>Promise<void>)|undefined;
   const devtools=new Map<string,(event:unknown)=>void|Promise<void>>();
   const listeners=new Map<string,((event?:unknown)=>void)[]>();
@@ -135,6 +135,8 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
           assert.equal(options.clientSecret,picked.clientSecret);
           return {create:()=>({on:(name:string,fn:(event?:unknown)=>void)=>paymentEvents.set(name,fn),
             mount:()=>{
+              if(mode.startsWith('uncommitted child'))
+                pendingPresentation=request(frameOrigin+'/v3/controller-fixture.html','GET',uncommitted,true,'document');
               if(['approved helper','card reload during helper trust'].includes(mode))pendingPresentation=request(url.replace('/confirm','')+'?'+new URLSearchParams({
                 key:picked.publishableKey,client_secret:picked.clientSecret}), 'GET',sibling,false,'fetch');
               paymentEvents.get('ready')!();paymentEvents.get('change')!({complete:true});
@@ -162,6 +164,8 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
     waitForURL:async(predicate:(value:URL)=>boolean)=>{assert.equal(predicate(new URL(stripe.url())),true);}};
   const sibling={...stripe,name:()=>'sibling'};
   const foreign={...stripe,name:()=>'foreign',url:()=>'https://other.test/fixture'};
+  const uncommitted={...stripe,url:()=>'',name:()=>'',parentFrame:()=>mode==='uncommitted child foreign parent'?foreign:main,
+    frameElement:async()=>({evaluate:async()=> 'new-iframe',contentFrame:async()=>uncommitted,dispose:async()=>{}})};
   const page={
     mainFrame:()=>main,url:()=>path,context:()=>context,on:(name:string,fn:(event?:unknown)=>void)=>{
       listeners.set(name,[...listeners.get(name)??[],fn]);
@@ -209,7 +213,8 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
       return {
         on:(name:string,fn:(event:unknown)=>void)=>devtools.set(name,fn),
         send:async(command:string):Promise<unknown>=>command==='Page.getFrameTree'?{frameTree:{frame:{id:'main',url:path},
-          childFrames:[stripe,sibling,foreign].map(frame=>({frame:{id:frame.name(),url:frame.url(),name:frame.name()}}))}}:undefined,
+          childFrames:[...[stripe,sibling,foreign].map(frame=>({frame:{id:frame.name(),url:frame.url(),name:frame.name()}})),
+            {frame:{id:'new-iframe',url:'',name:'new-iframe'}}]}}:undefined,
       };
     },
     close:async()=>{
@@ -220,17 +225,19 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
     },
   };
   async function request(target:string,method:string,frame:typeof main|typeof stripe,navigation:boolean,resource:string){
-    const id=String(++nextId),frameId=frame===main?'main':frame.name(),wire={url:target,method};
+    const id=String(++nextId),frameId=frame===main?'main':frame===uncommitted?'new-iframe':frame.name(),wire={url:target,method};
     const result=Promise.withResolvers<Response>();
     await devtools.get('Network.requestWillBeSent')!({requestId:id,frameId,request:wire});
     const original:unknown={
       url:()=>target,method:()=>method,frame:()=>frame,isNavigationRequest:()=>navigation,resourceType:()=>resource,
       redirectedFrom:()=>null,serviceWorker:()=>null,allHeaders:async()=>method==='POST'?
-        {origin:new URL(frame.url()).origin,'content-type':'application/x-www-form-urlencoded'}:{},
+        {origin:new URL(frame.url()).origin,'content-type':'application/x-www-form-urlencoded'}:
+        frame===uncommitted && mode==='uncommitted child cookie'?{cookie:'synthetic cookie'}:{},
       postData:()=>new URLSearchParams({key:picked.publishableKey,client_secret:picked.clientSecret}).toString(),
       response:()=>result.promise,
     };
     const respond=async()=>{
+      if(frame===uncommitted)childLoads++;
       const redirected=mode==='script redirect' && resource==='script';
       await devtools.get('Fetch.requestPaused')!({requestId:id,networkId:id,frameId,request:wire,responseStatusCode:redirected?302:200});
       if(redirected)return;
@@ -253,7 +260,7 @@ function checkout(mode:'normal'|'untrusted'|'foreign frame'|'close fails'|'repea
   }
   registerChromiumProtocolFixture(page);
   const browser={newContext:async()=>context} as unknown as Browser;
-  return {browser,picked,writes,url,closed:()=>closed,run:()=>runOptionalTrialSetupBrowser(browser,picked,
+  return {browser,picked,writes,url,closed:()=>closed,childLoads:()=>childLoads,run:()=>runOptionalTrialSetupBrowser(browser,picked,
     {deadline:Date.now()+2000},()=>false)};
 }
 
@@ -265,6 +272,25 @@ test('the held document forwards one original charge-free setup POST after one t
   await assert.rejects(f.run(),(error:unknown)=>browserCleanupConfirmed(error) && !String(error).includes(f.picked.clientSecret));
   assert.deepEqual(f.writes,[f.url]);
   assert.equal(f.closed(),1);
+});
+
+test('an owned Stripe.js child GET can load before the child has a document URL',async()=>{
+  const f=checkout('uncommitted child');
+  assert.equal(await f.run(),true);
+  assert.equal(f.childLoads(),1);
+  assert.deepEqual(f.writes,[f.url]);
+});
+
+for(const [fault,code] of [['cookie','BROWSER_PROVIDER_AUTH'],['foreign parent','BROWSER_PROVIDER_ROUTE_FRAME']] as const)
+test('an uncommitted Stripe.js child cannot forward a GET with '+fault,async()=>{
+  const f=checkout(`uncommitted child ${fault}`);
+  await assert.rejects(f.run(),(error:unknown)=>{
+    assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+    assert.equal(browserCleanupConfirmed(error),true);
+    return true;
+  });
+  assert.equal(f.childLoads(),0);
+  assert.deepEqual(f.writes,[]);
 });
 
 for(const fault of ['untrusted','foreign frame','repeat','close fails','card reload','sibling confirm','card reload during helper trust'] as const)test('isolated setup stops and reports cleanup for '+fault,async()=>{
