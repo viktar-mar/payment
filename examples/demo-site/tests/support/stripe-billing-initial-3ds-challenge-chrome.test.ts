@@ -76,10 +76,12 @@ const externalGzip='a CRes form from one gzip external issuer script';
 const externalHead='a CRes form written by a single external script in the decision head';
 const externalHeadWithData='a CRes form written by an external head script beside inert JSON data';
 const externalWithExecutable='a CRes form written by an external script beside unproved executable code';
-const externalWithCompanionId='a CRes form written by an external script beside a JSON companion with an id';
+const externalHeadWithCompanionId='a CRes form written by an external head script beside identified JSON data';
+const externalWithCompanionId='a CRes form inserted by an external body script beside identified JSON data';
+const externalWithInvalidCompanion='a CRes form written by an external script beside identified invalid JSON';
 const externalNested='a CRes form written by an external script under a nonstructural parent';
 const externalUnknown='a CRes form from an unsupported external DOM builder';
-const externalMismatch='a CRes form from an external script with different expected POST bytes';
+const externalMismatch='a CRes form beside identified JSON data with different expected POST bytes';
 const externalNoReceipt='a CRes form from an external script without a matching receipt';
 const externalInvalidUtf8='a CRes form from an external script with invalid UTF-8';
 const oversizedDecision='a gzip CRes decision that expands past 64 KiB';
@@ -112,13 +114,13 @@ const refusedFollowups=new Map([
  [externalInvalidUtf8,'BROWSER_CHALLENGE_CRES_SCRIPT_READ'],
  [externalNested,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_PARENT'],
  [externalWithExecutable,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION'],
- [externalWithCompanionId,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_ATTRIBUTE_ID'],
+ [externalWithInvalidCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_INVALID'],
  [issuerCresDestination,'BROWSER_CHALLENGE_CRES_DESTINATION'],
  [oversizedDecision,'BROWSER_CHALLENGE_CRES_DECISION_SIZE'],
  [invalidUtf8Decision,'BROWSER_CHALLENGE_CRES_DECISION_UTF8'],
 ]);
 const wrongScriptMime='issuer script with the wrong MIME type is refused';
-for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,namedDecisionCres,literalDecisionCres,insertionDecisionCres,externalLiteral,externalGzip,externalHead,externalHeadWithData,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
+for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,namedDecisionCres,literalDecisionCres,insertionDecisionCres,externalLiteral,externalGzip,externalHead,externalHeadWithData,externalHeadWithCompanionId,externalWithCompanionId,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
 test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?mode+' is blocked after the original 2xx':mode===wrongScriptMime?mode:
  'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
@@ -136,7 +138,8 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const namedForm=mode===namedDecisionCres;
  const literalForm=[literalDecisionCres,insertionDecisionCres,literalBodyMismatch].includes(mode);
  const dynamicForm=mode===dynamicDecisionCres;
- const externalForm=[externalLiteral,externalGzip,externalHead,externalHeadWithData,externalWithExecutable,externalWithCompanionId,
+ const externalForm=[externalLiteral,externalGzip,externalHead,externalHeadWithData,externalWithExecutable,
+  externalHeadWithCompanionId,externalWithCompanionId,externalWithInvalidCompanion,
   externalNested,externalUnknown,externalMismatch,externalNoReceipt,externalInvalidUtf8].includes(mode);
  const submitsCres=Boolean(compressed)||[decisionCres,isolatedDecisionCres,namedDecisionCres,lateDecisionCres,lateDecisionHeaders,uncapturedDecision,
   changedCresAction,changedCresBody,unsupportedCresForm,issuerCresDestination].includes(mode)||literalForm||dynamicForm||externalForm;
@@ -200,7 +203,8 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    loadsScript?`<script src="${assetPath}"></script>`:'');
  const followupTarget=namedForm?` target="${issuerName}"`:'';
  const followupForm=`<form method="post" action="${followup}"${followupTarget}>${followupFields}</form>`;
- const insertForm=mode===insertionDecisionCres?"document.body.insertAdjacentHTML('beforeend', ":'document.write(';
+ const insertForm=mode===insertionDecisionCres||mode===externalWithCompanionId?
+  "document.body.insertAdjacentHTML('beforeend', ":'document.write(';
  const literalSource=`${insertForm}${JSON.stringify(followupForm)});${followupScript};`;
  const inlineDecision=(source:string)=>`<!doctype html><body><script>${source}</script></body>`;
  const dynamicSource=`
@@ -209,10 +213,14 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   result.append(field);document.body.append(result);result.submit();
  `;
  const externalTag='<script src="/fixture-decision.js"></script>';
+ const jsonWithId=(id:string,contents='{"fixture":true}')=>`<script type="application/json" id="${id}">${contents}</script>`;
  const externalDocument=mode===externalHead?`<!doctype html><head>${externalTag}</head><body></body>`:
   mode===externalHeadWithData?`<!doctype html><head><script type="application/json">{"fixture":true}</script>${externalTag}</head><body></body>`:
+  mode===externalHeadWithCompanionId?`<!doctype html><head>${jsonWithId('document')}${jsonWithId('write')}${externalTag}</head><body></body>`:
   mode===externalWithExecutable?`<!doctype html><body><script>void 0;</script>${externalTag}</body>`:
-  mode===externalWithCompanionId?`<!doctype html><body><script type="application/json" id="private-fixture">{"fixture":true}</script>${externalTag}</body>`:
+  mode===externalWithCompanionId?`<!doctype html><body>${jsonWithId('body')}${jsonWithId('forms')}${jsonWithId('submit')}${externalTag}</body>`:
+  mode===externalWithInvalidCompanion?`<!doctype html><body>${jsonWithId('fixture-data','{invalid')}${externalTag}</body>`:
+  mode===externalMismatch?`<!doctype html><body>${jsonWithId('fixture-data')}${externalTag}</body>`:
   mode===externalNested?`<!doctype html><body><div>${externalTag}</div></body>`:
   `<!doctype html><body>${externalTag}</body>`;
  let decisionHtml=submitsSecondDecision?
@@ -454,7 +462,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    if(submitsCres&&mode!==issuerCresDestination)assert.equal(decisionBodyCaptured,mode!==oversizedDecision);
    if(networkFixture)assert.equal(networkFixture.requests(),1);
    if(externalForm&&mode!==externalInvalidUtf8)assert.equal(scriptBodyCaptured,
-    ![externalNoReceipt,externalNested,externalWithExecutable,externalWithCompanionId].includes(mode));
+    ![externalNoReceipt,externalNested,externalWithExecutable,externalWithInvalidCompanion].includes(mode));
    assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision,...(externalForm?[decisionAsset]:[])]);
    assert.deepEqual(authorized,forwarded);
    assert.equal(gestures,1);

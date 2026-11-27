@@ -13,7 +13,7 @@ const write=(markup:string)=>`document.write(${JSON.stringify(markup)});${submit
 const decisionUrl='https://reviewed-test-issuer.stripe.com/fixture/decision';
 const external=(src:string,attributes='',contents='')=>inline(contents,` src="${src}"${attributes}`);
 const externalTag='<script src="/fixture/result.js"></script>';
-const jsonBlock=(contents:string)=>'<script type="application/json">'+contents+'</script>';
+const jsonBlock=(contents:string,attributes='')=>`<script type="application/json"${attributes}>${contents}</script>`;
 
 test('derive the sole canonical external script URL from the paired HTML',()=>{
  for(const html of [
@@ -34,10 +34,10 @@ test('derive the parser location of a sole classic external script in the head',
  ),{scriptUrl:'https://reviewed-test-issuer.stripe.com/result.js',placement:'head'});
 });
 
-for(const placement of ['head','body'] as const)test('derive the '+placement+' script alongside inert JSON data blocks',()=>{
- const before=jsonBlock('{"label":"fixture"}');
- const after=jsonBlock('["document.forms[0].submit()"]');
- const html=`<!doctype html><html><${placement}>${before}${externalTag}${after}</${placement}></html>`;
+for(const placement of ['head','body'] as const)test('derive the '+placement+' script alongside inert JSON data blocks with optional ids',()=>{
+ const before=jsonBlock('{"label":"fixture"}',' id="fixture-data"');
+ const after=jsonBlock('["document.forms[0].submit()"]',' id="fixture-metadata"');
+ const html=`<!doctype html><html><${placement}>${before}${externalTag}${after}${jsonBlock('null')}</${placement}></html>`;
  const reported:string[]=[];
  assert.deepEqual(issuerResultForm(html,undefined,code=>reported.push(code),decisionUrl),{
   scriptUrl:'https://reviewed-test-issuer.stripe.com/fixture/result.js',
@@ -57,6 +57,7 @@ for(const [reason,documents] of Object.entries({
   external('/result.js',' async'),external('/result.js',' defer'),external('/result.js',' nomodule'),
   external('/result.js',' onload="submitForm()"'),external('/result.js',' nonce="private-fixture"'),
   external('/result.js',' integrity="private-fixture"'),external('/result.js',' charset="utf-16"'),
+  external('/result.js',' id="fixture-producer"'),
  ],
  EXTERNAL_TYPE:[external('/result.js',' type="module"'),external('/result.js',' type="application/json"')],
  EXTERNAL_TEXT:[external('/result.js','','ignored code')],
@@ -65,6 +66,7 @@ for(const [reason,documents] of Object.entries({
   external('/result.js')+external('/result.js',' type="application/json"'),
   external('/result.js')+external('/result.js'),
   externalTag+'<script>otherCode()</script>'+external('/different.js')+jsonBlock(''),
+  externalTag+jsonBlock('{}',' id="fixture-data" src="/other.js"'),
  ],
  EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION:[
   externalTag+'<script>otherCode()</script>',
@@ -87,15 +89,22 @@ for(const [reason,documents] of Object.entries({
   externalTag+'<script type="text/ecmascript">otherCode()</script>',
   externalTag+'<script type="application/private-fixture">otherCode()</script>',
  ],
- EXTERNAL_COMPANION_HANDLER:[externalTag+'<script type="application/json" onload="otherCode()">{}</script>'],
- EXTERNAL_COMPANION_ATTRIBUTE_ID:[externalTag+'<script type="application/json" id="private-fixture">{}</script>'],
+ EXTERNAL_COMPANION_HANDLER:[
+  externalTag+jsonBlock('{}',' onload="otherCode()"'),
+  externalTag+jsonBlock('{}',' id="fixture-data" onload="otherCode()"'),
+ ],
  EXTERNAL_COMPANION_ATTRIBUTE_NONCE:[externalTag+'<script type="application/json" nonce="private-fixture">{}</script>'],
  EXTERNAL_COMPANION_ATTRIBUTES:[
   externalTag+'<script type="application/json" data-private-fixture="private-fixture">{}</script>',
   externalTag+'<script type="application/json" id="private-fixture" nonce="private-fixture">{}</script>',
+  externalTag+jsonBlock('{}',' id="fixture-data" data-private-fixture="private-fixture"'),
  ],
- EXTERNAL_COMPANION_JSON_EMPTY:[externalTag+jsonBlock(''),externalTag+jsonBlock(' \t\n\f\r ')],
- EXTERNAL_COMPANION_JSON_INVALID:[externalTag+jsonBlock('{"private-fixture": invalid}')],
+ EXTERNAL_COMPANION_JSON_EMPTY:[
+  externalTag+jsonBlock(''),externalTag+jsonBlock(' \t\n\f\r '),externalTag+jsonBlock('',' id="fixture-data"'),
+ ],
+ EXTERNAL_COMPANION_JSON_INVALID:[
+  externalTag+jsonBlock('{"private-fixture": invalid}'),externalTag+jsonBlock('{"fixture": invalid}',' id="fixture-data"'),
+ ],
  EXTERNAL_PARENT:['<!doctype html><body><div><script src="/result.js"></script></div></body>'],
  EXTERNAL_TAG:['<!doctype html><body><script src="/result.js">'],
  EXTERNAL_LAYOUT_TAG:[external('/result.js').replace('</body>','<template></template></body>')],
@@ -105,7 +114,9 @@ for(const [reason,documents] of Object.entries({
  ],
  EXTERNAL_LAYOUT_TEXT:[external('/result.js').replace('</body>','private fixture</body>')],
  EXTERNAL_LAYOUT_HANDLER:[external('/result.js').replace('<body>','<body onload="privateFixture()">')],
- DUPLICATE_ATTRIBUTE:[external('/result.js',' src="/different.js"')],
+ DUPLICATE_ATTRIBUTE:[
+  external('/result.js',' src="/different.js"'),externalTag+jsonBlock('{}',' id="first" id="second"'),
+ ],
  MISSING_TEMPLATE:['<template>'+external('/result.js')+'</template>'],
  BASE:['<base href="https://foreign.fixture.test">'+external('/result.js')],
  OWNER:[external('/result.js').replace('</body>','<input form="private-fixture"></body>')],
@@ -119,9 +130,9 @@ for(const [reason,documents] of Object.entries({
 
 test('report one fixed reason from the first rejected companion in reverse parsed traversal',()=>{
  const invalid=jsonBlock('{"private-fixture": invalid}');
- const withId='<script type="application/json" id="private-fixture">{}</script>';
+ const withNonce=jsonBlock('{}',' nonce="private-fixture"');
  for(const [companions,reason] of [
-  [invalid+withId,'ATTRIBUTE_ID'],[withId+invalid,'JSON_INVALID'],
+  [invalid+withNonce,'ATTRIBUTE_NONCE'],[withNonce+invalid,'JSON_INVALID'],
  ]){
   const reported:string[]=[];
   assert.equal(issuerResultForm(externalTag+companions+jsonBlock('null'),undefined,code=>reported.push(code),decisionUrl),undefined);
@@ -136,7 +147,7 @@ test('report the first failing check for a companion with several rejected condi
   [malformed,'TAG'],
   [malformed+'</script>','TYPE_IMPORTMAP'],
   [malformed.replace('importmap','application/json')+'</script>','HANDLER'],
-  ['<script type="application/json" id="private-fixture">not valid JSON</script>','ATTRIBUTE_ID'],
+  [jsonBlock('not valid JSON',' nonce="private-fixture"'),'ATTRIBUTE_NONCE'],
  ]){
   const reported:string[]=[];
   assert.equal(issuerResultForm(externalTag+companion,undefined,code=>reported.push(code),decisionUrl),undefined);
