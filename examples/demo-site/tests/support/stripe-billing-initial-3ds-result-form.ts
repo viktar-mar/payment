@@ -2,17 +2,25 @@ import {defaultTreeAdapter,parse,parseFragment,type DefaultTreeAdapterTypes} fro
 
 const htmlNamespace='http://www.w3.org/1999/xhtml';
 const controls=new Set(['button','datalist','fieldset','input','object','output','select','textarea']);
+const classicScriptTypes=new Set(['','text/javascript','application/javascript']);
+const structuralElements=new Set(['html','head','body','title','meta']);
 const attribute=(element:DefaultTreeAdapterTypes.Element,name:string)=>element.attrs.find(attr=>attr.name===name)?.value;
+type LayoutRejection='EXTERNAL_LAYOUT_TAG'|'EXTERNAL_LAYOUT_ATTRIBUTES'|'EXTERNAL_LAYOUT_TEXT'|'EXTERNAL_LAYOUT_HANDLER';
 type FormRejection='DUPLICATE_ATTRIBUTE'|'BASE'|'OWNER'|'MISSING'|'MULTIPLE'|'METHOD'|'TARGET'|'ENCODING'|
  'ACTION'|'CONTROL'|'FIELD'|'DUPLICATE_FIELD'|'REQUIRED_CRES'|'SIZE'|'LITERAL_MARKUP'|
- 'MISSING_INLINE'|'MISSING_INLINE_DOM'|'MISSING_INLINE_MARKUP'|'MISSING_EXTERNAL'|'MISSING_TEMPLATE'|'MISSING_HANDLER'|'MISSING_MIXED';
+ 'MISSING_INLINE'|'MISSING_INLINE_DOM'|'MISSING_INLINE_MARKUP'|'MISSING_EXTERNAL'|'MISSING_TEMPLATE'|'MISSING_HANDLER'|'MISSING_MIXED'|
+ 'EXTERNAL_COUNT'|'EXTERNAL_PARENT'|'EXTERNAL_TAG'|'EXTERNAL_TYPE'|'EXTERNAL_ATTRIBUTES'|'EXTERNAL_TEXT'|'EXTERNAL_URL'|LayoutRejection;
 type FormProof={action:string;body:string};
-type ExternalScript={scriptUrl:string};
+type ScriptPlacement='head'|'body';
+type ExternalScript={scriptUrl:string;placement:ScriptPlacement};
+type ScriptElement={node:Element;text:string;src:string|undefined;classic:boolean};
+type LiteralInsertion={markup:string;method:'write'|'insertAdjacentHTML'};
 type Reporter=(code:string)=>void;
 type Element=DefaultTreeAdapterTypes.Element;
 const htmlWhitespace=(value:string)=>/^[\t\n\f\r ]*$/.test(value);
 const whitespaceNode=(node:DefaultTreeAdapterTypes.Node)=>defaultTreeAdapter.isTextNode(node)&&htmlWhitespace(node.value);
 const hasHandler=(element:Element)=>element.attrs.some(attr=>attr.name.startsWith('on'));
+const supportedScriptAttributes=(element:Element)=>element.attrs.every(attr=>attr.name==='type'||attr.name==='src');
 const createsForm=(source:string)=>/\bcreateElement\s*\(\s*['"]form['"]/.test(source);
 
 export function isIssuerScriptPath(pathname:string):boolean{
@@ -37,17 +45,24 @@ function reportFormRejection(rejection:FormRejection,report:Reporter|undefined):
 }
 
 /** Prove a form from the exact source of the external script in the decision document. */
-export function externalIssuerResultForm(source:Uint8Array,frameName?:string,report?:Reporter):FormProof|undefined{
+export function externalIssuerResultForm(source:Uint8Array,frameName?:string,report?:Reporter,
+ placement:ScriptPlacement='body'):FormProof|undefined{
  if(source.byteLength===0||source.byteLength>65536){report?.('BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED');return;}
  let code:string;
  try{code=new TextDecoder('utf-8',{fatal:true}).decode(source);}
  catch{report?.('BROWSER_CHALLENGE_CRES_SCRIPT_UTF8');return;}
- const markup=literalInsertion(code);
- if(markup===undefined){
+ const insertion=literalInsertion(code);
+ if(!insertion){
   report?.(createsForm(code)?'BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED_DOM':'BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED');
   return;
  }
- const proof=readLiteralFragment(markup,frameName);
+ // A classic parser-blocking script in the head has no body yet. document.write
+ // inserts the form into the parser stream, which opens the body before submit.
+ if(placement==='head'&&insertion.method==='insertAdjacentHTML'){
+  report?.('BROWSER_CHALLENGE_CRES_SCRIPT_HEAD_INSERTION');
+  return;
+ }
+ const proof=readLiteralFragment(insertion.markup,frameName);
  if(typeof proof==='string')return reportFormRejection(proof,report);
  return proof;
 }
@@ -98,20 +113,21 @@ function readForm(document:DefaultTreeAdapterTypes.ParentNode,frameName:string|u
 }
 
 /** Recognize one literal insertion and submission. Parse the string, never run the program. */
-function literalInsertion(source:string):string|undefined{
+function literalInsertion(source:string):LiteralInsertion|undefined{
  const code=source.trim();
- const start=/^(?:document\.write\s*\(\s*|document\.body\.insertAdjacentHTML\s*\(\s*(?:"beforeend"|'beforeend')\s*,\s*)/.exec(code);
+ const start=/^(?:(document\.write)\s*\(\s*|document\.body\.insertAdjacentHTML\s*\(\s*(?:"beforeend"|'beforeend')\s*,\s*)/.exec(code);
  const end=/\)\s*;\s*document\.forms\[0\]\.submit\s*\(\s*\)\s*;?$/.exec(code);
  if(!start||!end||start[0].length>=end.index)return;
+ const method=start[1]?'write':'insertAdjacentHTML';
  const literal=code.slice(start[0].length,end.index).trim();
- if(/^'[^'\\\u0000-\u001f]*'$/u.test(literal))return literal.slice(1,-1);
+ if(/^'[^'\\\u0000-\u001f]*'$/u.test(literal))return {markup:literal.slice(1,-1),method};
  if(!literal.startsWith('"'))return;
- try{const value:unknown=JSON.parse(literal);if(typeof value==='string')return value;}
+ try{const value:unknown=JSON.parse(literal);if(typeof value==='string')return {markup:value,method};}
  catch{/* Expressions and other JavaScript string syntax are outside this subset. */}
 }
 
-function canonicalScriptUrl(src:string,documentUrl:string|undefined):string|undefined{
- if(!documentUrl||!URL.canParse(documentUrl))return;
+function canonicalScriptUrl(src:string,documentUrl:string):string|undefined{
+ if(!URL.canParse(documentUrl))return;
  const document=new URL(documentUrl);
  if(document.protocol!=='https:'||document.href!==documentUrl||document.username||document.password||documentUrl.includes('#'))return;
  let path=src;
@@ -123,47 +139,60 @@ function canonicalScriptUrl(src:string,documentUrl:string|undefined):string|unde
  if(script.origin===document.origin&&script.href===script.origin+script.pathname&&isIssuerScriptPath(script.pathname))return script.href;
 }
 
+function documentElementRejection(element:Element):LayoutRejection|undefined{
+ if(hasHandler(element))return 'EXTERNAL_LAYOUT_HANDLER';
+ if(element.namespaceURI!==htmlNamespace||!structuralElements.has(element.tagName))return 'EXTERNAL_LAYOUT_TAG';
+ if(element.tagName==='meta'){
+  if(element.attrs.length!==1||attribute(element,'charset')?.toLowerCase()!=='utf-8')return 'EXTERNAL_LAYOUT_ATTRIBUTES';
+ }else if(element.attrs.length!==0)return 'EXTERNAL_LAYOUT_ATTRIBUTES';
+}
+
 function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:string|undefined,
  documentUrl:string|undefined):FormProof|ExternalScript|FormRejection{
  const shapes=new Set<FormRejection>();
  const pending:DefaultTreeAdapterTypes.Node[]=[document];
- let script:{text:string;src:string|undefined}|undefined,plain=true;
+ const scripts:ScriptElement[]=[];
+ let layout:LayoutRejection|undefined;
  while(pending.length){
   const node=pending.pop()!;
   if(defaultTreeAdapter.isElementNode(node)){
-   if(hasHandler(node)){shapes.add('MISSING_HANDLER');plain=false;}
-   if(node.namespaceURI!==htmlNamespace)plain=false;
-   else if(node.tagName==='template'){shapes.add('MISSING_TEMPLATE');plain=false;}
-   else if(node.tagName==='script'){
+   if(hasHandler(node))shapes.add('MISSING_HANDLER');
+   if(node.namespaceURI===htmlNamespace&&node.tagName==='template')shapes.add('MISSING_TEMPLATE');
+   if(node.namespaceURI===htmlNamespace&&node.tagName==='script'){
     const type=(attribute(node,'type')??'').replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g,'').toLowerCase();
     const text=node.childNodes.filter(defaultTreeAdapter.isTextNode).map(child=>child.value).join('');
     const src=attribute(node,'src');
-    if(['','text/javascript','application/javascript','module'].includes(type)){
+    const classic=classicScriptTypes.has(type);
+    scripts.push({node,text,src,classic});
+    if(classic||type==='module'){
      if(src!==undefined)shapes.add('MISSING_EXTERNAL');
      else if(createsForm(text))shapes.add('MISSING_INLINE_DOM');
      else if(/\b(?:document\s*\.\s*write(?:ln)?|insertAdjacentHTML|innerHTML)\b/.test(text))shapes.add('MISSING_INLINE_MARKUP');
      else shapes.add('MISSING_INLINE');
     }
-    if(script!==undefined||node.parentNode?.nodeName!=='body'||!node.sourceCodeLocation?.endTag||
-       !['','text/javascript','application/javascript'].includes(type)||node.attrs.some(attr=>attr.name!=='type'&&attr.name!=='src'))plain=false;
-    script={text,src};
-   }else if((node.tagName==='html'||node.tagName==='head'||node.tagName==='body'||node.tagName==='title')&&node.attrs.length===0){
-    // The single producer can only run alongside the structural document elements.
-   }else if(node.tagName==='meta'&&node.attrs.length===1&&attribute(node,'charset')?.toLowerCase()==='utf-8'){
-    // The caller also decodes the paired response as UTF-8.
-   }else plain=false;
+   }else layout??=documentElementRejection(node);
   }else if(defaultTreeAdapter.isTextNode(node)&&!whitespaceNode(node)&&
-           !['script','title'].includes(node.parentNode?.nodeName??''))plain=false;
+           !['script','title'].includes(node.parentNode?.nodeName??''))layout??='EXTERNAL_LAYOUT_TEXT';
   if('childNodes' in node)for(const child of node.childNodes)pending.push(child);
  }
- if(plain&&script){
-  if(script.src===undefined){
-   const markup=literalInsertion(script.text);
-   if(markup!==undefined)return readLiteralFragment(markup,frameName);
-  }else if(htmlWhitespace(script.text)){
-   const scriptUrl=canonicalScriptUrl(script.src,documentUrl);
-   if(scriptUrl)return {scriptUrl};
-  }
+ const external=scripts.find(script=>script.src!==undefined);
+ if(external?.src!==undefined&&documentUrl!==undefined){
+  if(scripts.length!==1)return 'EXTERNAL_COUNT';
+  const placement=external.node.parentNode?.nodeName;
+  if(placement!=='head'&&placement!=='body')return 'EXTERNAL_PARENT';
+  if(!external.node.sourceCodeLocation?.endTag)return 'EXTERNAL_TAG';
+  if(!external.classic)return 'EXTERNAL_TYPE';
+  if(!supportedScriptAttributes(external.node))return 'EXTERNAL_ATTRIBUTES';
+  if(!htmlWhitespace(external.text))return 'EXTERNAL_TEXT';
+  if(layout)return layout;
+  const scriptUrl=canonicalScriptUrl(external.src,documentUrl);
+  return scriptUrl?{scriptUrl,placement}:'EXTERNAL_URL';
+ }
+ const [script]=scripts;
+ if(!layout&&scripts.length===1&&script&&script.src===undefined&&script.classic&&
+    script.node.parentNode?.nodeName==='body'&&script.node.sourceCodeLocation?.endTag&&supportedScriptAttributes(script.node)){
+  const insertion=literalInsertion(script.text);
+  if(insertion)return readLiteralFragment(insertion.markup,frameName);
  }
  return shapes.size>1?'MISSING_MIXED':shapes.values().next().value??'MISSING';
 }

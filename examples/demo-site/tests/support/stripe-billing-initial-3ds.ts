@@ -283,7 +283,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     billingCheck(active);
     if(scriptBody==='BROWSER_CHALLENGE_CRES_DECISION_SIZE')report('BROWSER_CHALLENGE_CRES_SCRIPT_SIZE');
     requireValue(typeof scriptBody!=='string');
-    form=externalIssuerResultForm(scriptBody,frameName,report);
+    form=externalIssuerResultForm(scriptBody,frameName,report,source.placement);
     requireValue(form);
    }else form=source;
    report('BROWSER_CHALLENGE_CRES_FORM_DEADLINE');

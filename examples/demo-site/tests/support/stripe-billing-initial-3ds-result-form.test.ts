@@ -20,29 +20,59 @@ test('derive the sole canonical external script URL from the paired HTML',()=>{
  ]){
   assert.deepEqual(issuerResultForm(html,undefined,undefined,decisionUrl),{
    scriptUrl:'https://reviewed-test-issuer.stripe.com/fixture/result.js',
+   placement:'body',
   });
  }
 });
 
-for(const html of [
- external('/result.js?variant=1'),external('/result.js#fragment'),external('/%72esult.js'),
- external('//reviewed-test-issuer.stripe.com/result.js'),external('https://foreign.fixture.test/result.js'),
- external('../result.js'),external('/fixture/../result.js'),
- external('https://operator@reviewed-test-issuer.stripe.com/result.js'),
- external('/result.js',' async'),external('/result.js',' defer'),external('/result.js',' type="module"'),
- external('/result.js',' nomodule'),external('/result.js',' onload="submitForm()"'),
- external('/result.js',' src="/different.js"'),external('/result.js','','ignored code'),
- external('/result.js')+external('/different.js'),'<template>'+external('/result.js')+'</template>',
- '<base href="https://foreign.fixture.test">'+external('/result.js'),
- '<!doctype html><head><script src="/result.js"></script></head>',
- '<!doctype html><body><script src="/result.js">',
-])test('refuse a nonexclusive or unbound external script reference',()=>{
- assert.equal(issuerResultForm(html,undefined,undefined,decisionUrl),undefined);
+test('derive the parser location of a sole classic external script in the head',()=>{
+ assert.deepEqual(issuerResultForm(
+  '<!doctype html><html><head><meta charset="utf-8"><title>Result</title><script src="/result.js"></script></head><body></body></html>',
+  undefined,undefined,decisionUrl,
+ ),{scriptUrl:'https://reviewed-test-issuer.stripe.com/result.js',placement:'head'});
+});
+
+for(const [reason,documents] of Object.entries({
+ EXTERNAL_URL:[
+  external(''),external('/result.js?variant=1'),external('/result.js#fragment'),external('/%72esult.js'),
+  external('//reviewed-test-issuer.stripe.com/result.js'),external('https://foreign.fixture.test/result.js'),
+  external('../result.js'),external('/fixture/../result.js'),
+  external('https://operator@reviewed-test-issuer.stripe.com/result.js'),
+ ],
+ EXTERNAL_ATTRIBUTES:[
+  external('/result.js',' async'),external('/result.js',' defer'),external('/result.js',' nomodule'),
+  external('/result.js',' onload="submitForm()"'),external('/result.js',' nonce="private-fixture"'),
+  external('/result.js',' integrity="private-fixture"'),external('/result.js',' charset="utf-16"'),
+ ],
+ EXTERNAL_TYPE:[external('/result.js',' type="module"'),external('/result.js',' type="application/json"')],
+ EXTERNAL_TEXT:[external('/result.js','','ignored code')],
+ EXTERNAL_COUNT:[external('/result.js')+external('/different.js'),external('/result.js')+inline('otherCode()')],
+ EXTERNAL_PARENT:['<!doctype html><body><div><script src="/result.js"></script></div></body>'],
+ EXTERNAL_TAG:['<!doctype html><body><script src="/result.js">'],
+ EXTERNAL_LAYOUT_TAG:[external('/result.js').replace('</body>','<template></template></body>')],
+ EXTERNAL_LAYOUT_ATTRIBUTES:[
+  external('/result.js').replace('<body>','<body id="private-fixture">'),
+  '<!doctype html><head><meta http-equiv="Content-Security-Policy" content="script-src \'self\'"><script src="/result.js"></script></head>',
+ ],
+ EXTERNAL_LAYOUT_TEXT:[external('/result.js').replace('</body>','private fixture</body>')],
+ EXTERNAL_LAYOUT_HANDLER:[external('/result.js').replace('<body>','<body onload="privateFixture()">')],
+ DUPLICATE_ATTRIBUTE:[external('/result.js',' src="/different.js"')],
+ MISSING_TEMPLATE:['<template>'+external('/result.js')+'</template>'],
+ BASE:['<base href="https://foreign.fixture.test">'+external('/result.js')],
+ OWNER:[external('/result.js').replace('</body>','<input form="private-fixture"></body>')],
+}))test('refuse an external script reference with the fixed checkpoint '+reason,()=>{
+ for(const html of documents){
+  const reported:string[]=[];
+  assert.equal(issuerResultForm(html,undefined,code=>reported.push(code),decisionUrl),undefined);
+  assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_FORM_'+reason]);
+ }
 });
 
 test('require an exact HTTPS decision URL to derive an external script reference',()=>{
  for(const url of [undefined,'file:///fixture/decision',decisionUrl+'#',' '+decisionUrl]){
-  assert.equal(issuerResultForm(external('/result.js'),undefined,undefined,url),undefined);
+  const reported:string[]=[];
+  assert.equal(issuerResultForm(external('/result.js'),undefined,code=>reported.push(code),url),undefined);
+  assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_FORM_'+(url===undefined?'MISSING_EXTERNAL':'EXTERNAL_URL')]);
  }
 });
 
@@ -51,6 +81,24 @@ test('derive the exact CRes form from a 64 KiB literal external script',()=>{
  assert.deepEqual(externalIssuerResultForm(code,'issuer-frame'),{
   action:'https://hooks.stripe.com/fixture/result?one=1&two=2',
   body:'threeDSSessionData=a%2Bb%0D%0Ac&cres=YQ%3D%3D',
+ });
+});
+
+test('derive the exact CRes form written by a classic external head script',()=>{
+ assert.deepEqual(externalIssuerResultForm(Buffer.from(write(form(session+result))),undefined,undefined,'head'),{
+  action:'https://hooks.stripe.com/fixture/result?one=1&two=2',
+  body:'threeDSSessionData=a%2Bb%0D%0Ac&cres=YQ%3D%3D',
+ });
+});
+
+test('refuse an external head script that requires an existing body',()=>{
+ const code=Buffer.from(`document.body.insertAdjacentHTML('beforeend', '${form()}');${submit}`);
+ const reported:string[]=[];
+ assert.equal(externalIssuerResultForm(code,undefined,value=>reported.push(value),'head'),undefined);
+ assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_SCRIPT_HEAD_INSERTION']);
+ assert.deepEqual(externalIssuerResultForm(code,undefined,undefined,'body'),{
+  action:'https://hooks.stripe.com/fixture/result?one=1&two=2',
+  body:'cres=YQ%3D%3D',
  });
 });
 

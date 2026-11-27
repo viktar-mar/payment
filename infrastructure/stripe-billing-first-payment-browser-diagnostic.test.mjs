@@ -22,6 +22,8 @@ test('CRes form checkpoints cross the acceptance boundary as fixed codes only',(
  for(const code of [prefix,...['PARSE','DEADLINE','DUPLICATE_ATTRIBUTE','BASE','OWNER','MISSING','MULTIPLE',
   'METHOD','TARGET','ENCODING','ACTION','CONTROL','FIELD','DUPLICATE_FIELD','REQUIRED_CRES','SIZE','LITERAL_MARKUP',
   'MISSING_INLINE','MISSING_INLINE_DOM','MISSING_INLINE_MARKUP','MISSING_EXTERNAL','MISSING_TEMPLATE','MISSING_HANDLER','MISSING_MIXED',
+  'EXTERNAL_COUNT','EXTERNAL_PARENT','EXTERNAL_TAG','EXTERNAL_TYPE','EXTERNAL_ATTRIBUTES','EXTERNAL_TEXT','EXTERNAL_URL',
+  'EXTERNAL_LAYOUT_TAG','EXTERNAL_LAYOUT_ATTRIBUTES','EXTERNAL_LAYOUT_TEXT','EXTERNAL_LAYOUT_HANDLER',
  ].map(reason=>prefix+'_'+reason)]){
   const error=privateOrigin.acceptanceBrowserFailure(code);
   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
@@ -29,13 +31,14 @@ test('CRes form checkpoints cross the acceptance boundary as fixed codes only',(
   assert.equal(JSON.stringify(error),'{}');
  }
  for(const raw of [prefix+'_TARGET_private',prefix+'_FIELD_CRES',prefix+'_ACTION https://fixture.test/private',
-  prefix+'_MISSING_INLINE_DOM private fixture script',prefix+'_MISSING_EXTERNAL /private-fixture.js']){
+  prefix+'_MISSING_INLINE_DOM private fixture script',prefix+'_MISSING_EXTERNAL /private-fixture.js',
+  prefix+'_EXTERNAL_URL /private-fixture.js',prefix+'_EXTERNAL_LAYOUT_ATTRIBUTES custom-data']){
   assert.equal(browserDiagnostic(privateOrigin.acceptanceBrowserFailure(raw),'ACCEPTANCE'),null);
  }
 });
 test('CRes external script checkpoints reveal only a fixed reason',()=>{
  const prefix='BROWSER_CHALLENGE_CRES_SCRIPT_';
- for(const suffix of ['RECEIPT','READ','SIZE','UTF8','UNSUPPORTED','UNSUPPORTED_DOM']){
+ for(const suffix of ['RECEIPT','READ','SIZE','UTF8','UNSUPPORTED','UNSUPPORTED_DOM','HEAD_INSERTION']){
   const code=prefix+suffix;
   const error=privateOrigin.acceptanceBrowserFailure(code);
   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
