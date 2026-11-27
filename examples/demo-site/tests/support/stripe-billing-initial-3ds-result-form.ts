@@ -6,11 +6,16 @@ const classicScriptTypes=new Set(['','text/javascript','application/javascript']
 const structuralElements=new Set(['html','head','body','title','meta']);
 const attribute=(element:DefaultTreeAdapterTypes.Element,name:string)=>element.attrs.find(attr=>attr.name===name)?.value;
 type LayoutRejection='EXTERNAL_LAYOUT_TAG'|'EXTERNAL_LAYOUT_ATTRIBUTES'|'EXTERNAL_LAYOUT_TEXT'|'EXTERNAL_LAYOUT_HANDLER';
+type CompanionRejection='EXTERNAL_COMPANION_PARENT'|'EXTERNAL_COMPANION_TAG'|'EXTERNAL_COMPANION_TYPE_MISSING'|
+ 'EXTERNAL_COMPANION_TYPE_JSON_VARIANT'|'EXTERNAL_COMPANION_TYPE_JSON_LD'|'EXTERNAL_COMPANION_TYPE_IMPORTMAP'|
+ 'EXTERNAL_COMPANION_TYPE_SPECULATION_RULES'|'EXTERNAL_COMPANION_TYPE_OTHER'|'EXTERNAL_COMPANION_HANDLER'|
+ 'EXTERNAL_COMPANION_ATTRIBUTE_ID'|'EXTERNAL_COMPANION_ATTRIBUTE_NONCE'|'EXTERNAL_COMPANION_ATTRIBUTES'|
+ 'EXTERNAL_COMPANION_JSON_EMPTY'|'EXTERNAL_COMPANION_JSON_INVALID';
 type FormRejection='DUPLICATE_ATTRIBUTE'|'BASE'|'OWNER'|'MISSING'|'MULTIPLE'|'METHOD'|'TARGET'|'ENCODING'|
  'ACTION'|'CONTROL'|'FIELD'|'DUPLICATE_FIELD'|'REQUIRED_CRES'|'SIZE'|'LITERAL_MARKUP'|
  'MISSING_INLINE'|'MISSING_INLINE_DOM'|'MISSING_INLINE_MARKUP'|'MISSING_EXTERNAL'|'MISSING_TEMPLATE'|'MISSING_HANDLER'|'MISSING_MIXED'|
- 'EXTERNAL_COUNT_MULTIPLE_SOURCES'|'EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION'|'EXTERNAL_COUNT_UNSUPPORTED_COMPANION'|
- 'EXTERNAL_PARENT'|'EXTERNAL_TAG'|'EXTERNAL_TYPE'|'EXTERNAL_ATTRIBUTES'|'EXTERNAL_TEXT'|'EXTERNAL_URL'|LayoutRejection;
+ 'EXTERNAL_COUNT_MULTIPLE_SOURCES'|'EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION'|
+ 'EXTERNAL_PARENT'|'EXTERNAL_TAG'|'EXTERNAL_TYPE'|'EXTERNAL_ATTRIBUTES'|'EXTERNAL_TEXT'|'EXTERNAL_URL'|LayoutRejection|CompanionRejection;
 type FormProof={action:string;body:string};
 type ScriptPlacement='head'|'body';
 type ExternalScript={scriptUrl:string;placement:ScriptPlacement};
@@ -23,6 +28,7 @@ const whitespaceNode=(node:DefaultTreeAdapterTypes.Node)=>defaultTreeAdapter.isT
 const hasHandler=(element:Element)=>element.attrs.some(attr=>attr.name.startsWith('on'));
 const supportedScriptAttributes=(element:Element)=>element.attrs.every(attr=>attr.name==='type'||attr.name==='src');
 const createsForm=(source:string)=>/\bcreateElement\s*\(\s*['"]form['"]/.test(source);
+const normalizedScriptType=(value:string)=>value.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g,'').toLowerCase();
 
 export function isIssuerScriptPath(pathname:string):boolean{
  return /^\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.js$/.test(pathname);
@@ -148,12 +154,30 @@ function documentElementRejection(element:Element):LayoutRejection|undefined{
  }else if(element.attrs.length!==0)return 'EXTERNAL_LAYOUT_ATTRIBUTES';
 }
 
-function inertJsonDataBlock({node,text}:ScriptElement):boolean{
+function companionRejection({node,text}:ScriptElement):CompanionRejection|undefined{
  const placement=node.parentNode?.nodeName,location=node.sourceCodeLocation;
- if((placement!=='head'&&placement!=='body')||!location?.startTag||!location.endTag||
-    node.attrs.length!==1||attribute(node,'type')!=='application/json')return false;
- try{JSON.parse(text);return true;}
- catch{return false;}
+ if(placement!=='head'&&placement!=='body')return 'EXTERNAL_COMPANION_PARENT';
+ if(!location?.startTag||!location.endTag)return 'EXTERNAL_COMPANION_TAG';
+ const type=attribute(node,'type');
+ if(type===undefined)return 'EXTERNAL_COMPANION_TYPE_MISSING';
+ if(type!=='application/json'){
+  switch(normalizedScriptType(type)){
+   case 'application/json':return 'EXTERNAL_COMPANION_TYPE_JSON_VARIANT';
+   case 'application/ld+json':return 'EXTERNAL_COMPANION_TYPE_JSON_LD';
+   case 'importmap':return 'EXTERNAL_COMPANION_TYPE_IMPORTMAP';
+   case 'speculationrules':return 'EXTERNAL_COMPANION_TYPE_SPECULATION_RULES';
+   default:return 'EXTERNAL_COMPANION_TYPE_OTHER';
+  }
+ }
+ if(node.attrs.length!==1){
+  if(hasHandler(node))return 'EXTERNAL_COMPANION_HANDLER';
+  if(node.attrs.length===2&&attribute(node,'id')!==undefined)return 'EXTERNAL_COMPANION_ATTRIBUTE_ID';
+  if(node.attrs.length===2&&attribute(node,'nonce')!==undefined)return 'EXTERNAL_COMPANION_ATTRIBUTE_NONCE';
+  return 'EXTERNAL_COMPANION_ATTRIBUTES';
+ }
+ if(htmlWhitespace(text))return 'EXTERNAL_COMPANION_JSON_EMPTY';
+ try{JSON.parse(text);}
+ catch{return 'EXTERNAL_COMPANION_JSON_INVALID';}
 }
 
 function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:string|undefined,
@@ -169,7 +193,7 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
    if(node.namespaceURI===htmlNamespace&&node.tagName==='template')shapes.add('MISSING_TEMPLATE');
    if(node.namespaceURI===htmlNamespace&&node.tagName==='script'){
     const declaredType=attribute(node,'type');
-    const type=(declaredType??'').replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g,'').toLowerCase();
+    const type=normalizedScriptType(declaredType??'');
     const text=node.childNodes.filter(defaultTreeAdapter.isTextNode).map(child=>child.value).join('');
     const src=attribute(node,'src');
     const classic=classicScriptTypes.has(type);
@@ -192,7 +216,11 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
   const companions=scripts.filter(script=>script!==external);
   if(companions.some(script=>script.src!==undefined))return 'EXTERNAL_COUNT_MULTIPLE_SOURCES';
   if(companions.some(script=>script.recognizedJsType))return 'EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION';
-  if(companions.some(script=>!inertJsonDataBlock(script)))return 'EXTERNAL_COUNT_UNSUPPORTED_COMPANION';
+  // Report the first rejected companion in the reverse parsed traversal above.
+  for(const companion of companions){
+   const rejection=companionRejection(companion);
+   if(rejection)return rejection;
+  }
   const placement=external.node.parentNode?.nodeName;
   if(placement!=='head'&&placement!=='body')return 'EXTERNAL_PARENT';
   if(!external.node.sourceCodeLocation?.endTag)return 'EXTERNAL_TAG';

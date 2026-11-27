@@ -64,27 +64,38 @@ for(const [reason,documents] of Object.entries({
   external('/result.js')+external('/different.js'),
   external('/result.js')+external('/result.js',' type="application/json"'),
   external('/result.js')+external('/result.js'),
+  externalTag+'<script>otherCode()</script>'+external('/different.js')+jsonBlock(''),
  ],
  EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION:[
   externalTag+'<script>otherCode()</script>',
   externalTag+'<script type="module">otherCode()</script>',
   externalTag+'<script type="text/javascript"></script>',
   externalTag+jsonBlock('{}')+'<script>otherCode()</script>',
+  externalTag+'<script>otherCode()</script>'+jsonBlock(''),
  ],
- EXTERNAL_COUNT_UNSUPPORTED_COMPANION:[
-  externalTag+'<script type="text/ecmascript">otherCode()</script>',
-  externalTag+'<script language="fixture">otherCode()</script>',
-  externalTag+jsonBlock('{"fixture": invalid}'),
-  externalTag+'<script type="application/json" id="fixture">{}</script>',
-  externalTag+'<script type="application/json" onload="otherCode()">{}</script>',
+ EXTERNAL_COMPANION_PARENT:[externalTag+'<div>'+jsonBlock('{}')+'</div>'],
+ EXTERNAL_COMPANION_TAG:[externalTag+'<script type="application/json">{}'],
+ EXTERNAL_COMPANION_TYPE_MISSING:[externalTag+'<script language="private-fixture">otherCode()</script>'],
+ EXTERNAL_COMPANION_TYPE_JSON_VARIANT:[
   externalTag+'<script type="application/json ">{}</script>',
   externalTag+'<script type="APPLICATION/JSON">{}</script>',
-  externalTag+'<script type="application/ld+json">{}</script>',
-  externalTag+'<script type="importmap">{}</script>',
-  externalTag+'<script type="speculationrules">{}</script>',
-  externalTag+'<script type="application/json">{}',
-  externalTag+'<div>'+jsonBlock('{}')+'</div>',
  ],
+ EXTERNAL_COMPANION_TYPE_JSON_LD:[externalTag+'<script type="application/ld+json">{}</script>'],
+ EXTERNAL_COMPANION_TYPE_IMPORTMAP:[externalTag+'<script type="importmap">{}</script>'],
+ EXTERNAL_COMPANION_TYPE_SPECULATION_RULES:[externalTag+'<script type="speculationrules">{}</script>'],
+ EXTERNAL_COMPANION_TYPE_OTHER:[
+  externalTag+'<script type="text/ecmascript">otherCode()</script>',
+  externalTag+'<script type="application/private-fixture">otherCode()</script>',
+ ],
+ EXTERNAL_COMPANION_HANDLER:[externalTag+'<script type="application/json" onload="otherCode()">{}</script>'],
+ EXTERNAL_COMPANION_ATTRIBUTE_ID:[externalTag+'<script type="application/json" id="private-fixture">{}</script>'],
+ EXTERNAL_COMPANION_ATTRIBUTE_NONCE:[externalTag+'<script type="application/json" nonce="private-fixture">{}</script>'],
+ EXTERNAL_COMPANION_ATTRIBUTES:[
+  externalTag+'<script type="application/json" data-private-fixture="private-fixture">{}</script>',
+  externalTag+'<script type="application/json" id="private-fixture" nonce="private-fixture">{}</script>',
+ ],
+ EXTERNAL_COMPANION_JSON_EMPTY:[externalTag+jsonBlock(''),externalTag+jsonBlock(' \t\n\f\r ')],
+ EXTERNAL_COMPANION_JSON_INVALID:[externalTag+jsonBlock('{"private-fixture": invalid}')],
  EXTERNAL_PARENT:['<!doctype html><body><div><script src="/result.js"></script></div></body>'],
  EXTERNAL_TAG:['<!doctype html><body><script src="/result.js">'],
  EXTERNAL_LAYOUT_TAG:[external('/result.js').replace('</body>','<template></template></body>')],
@@ -103,6 +114,33 @@ for(const [reason,documents] of Object.entries({
   const reported:string[]=[];
   assert.equal(issuerResultForm(html,undefined,code=>reported.push(code),decisionUrl),undefined);
   assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_FORM_'+reason]);
+ }
+});
+
+test('report one fixed reason from the first rejected companion in reverse parsed traversal',()=>{
+ const invalid=jsonBlock('{"private-fixture": invalid}');
+ const withId='<script type="application/json" id="private-fixture">{}</script>';
+ for(const [companions,reason] of [
+  [invalid+withId,'ATTRIBUTE_ID'],[withId+invalid,'JSON_INVALID'],
+ ]){
+  const reported:string[]=[];
+  assert.equal(issuerResultForm(externalTag+companions+jsonBlock('null'),undefined,code=>reported.push(code),decisionUrl),undefined);
+  assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_'+reason]);
+ }
+});
+
+test('report the first failing check for a companion with several rejected conditions',()=>{
+ const malformed='<script type="importmap" onload="privateFixture()">not valid JSON';
+ for(const [companion,reason] of [
+  ['<div>'+malformed,'PARENT'],
+  [malformed,'TAG'],
+  [malformed+'</script>','TYPE_IMPORTMAP'],
+  [malformed.replace('importmap','application/json')+'</script>','HANDLER'],
+  ['<script type="application/json" id="private-fixture">not valid JSON</script>','ATTRIBUTE_ID'],
+ ]){
+  const reported:string[]=[];
+  assert.equal(issuerResultForm(externalTag+companion,undefined,code=>reported.push(code),decisionUrl),undefined);
+  assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_'+reason]);
  }
 });
 

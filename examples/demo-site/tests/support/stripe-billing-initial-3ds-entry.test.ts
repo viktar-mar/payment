@@ -34,6 +34,18 @@ test('3DS terminal accepts only fixed provisioning diagnostics in the provisioni
  assert.equal(annotations[0]?.description,exact);
  assert.equal(annotations.length,1);
 });
+test('3DS terminal preserves a fixed companion refusal through its worker annotation',async()=>{
+ const code='BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_TYPE_SPECULATION_RULES';
+ const line='owned_initial_3ds_terminal phase=ACK code='+code+' cleanup=UNCONFIRMED';
+ const state={scope:'INITIAL_3DS',status:'CLOSED',phase:'ACK',code,
+  initialAccepted:false,initial3dsAccepted:false,full5bAccepted:false,cleanupConfirmed:false};
+ const annotations:{type:string;description?:string}[]=[];
+ const owner={run:async()=>{throw new Error('private sentinel');},close:async()=>state,resources:()=>state};
+ await assert.rejects(runInitial3dsCase(owner,async()=>assert.fail(),annotations),/billing_NOT_ACCEPTED/);
+ assert.deepEqual(annotations,[{type:'owned-initial-3ds-terminal',description:line}]);
+ assert.equal(challengeTerminalLine(line),line);
+ assert.equal(challengeTerminalLine(line.replace(code,code+'_PRIVATE')),null);
+});
 for(const mode of ['original','copied result','duplicate','foreign project','second attempt']){
  test('new owner failure reaches only its own result: '+mode,async()=>{
   const owner=await createOwnedBillingInitial3ds({

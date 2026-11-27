@@ -76,6 +76,7 @@ const externalGzip='a CRes form from one gzip external issuer script';
 const externalHead='a CRes form written by a single external script in the decision head';
 const externalHeadWithData='a CRes form written by an external head script beside inert JSON data';
 const externalWithExecutable='a CRes form written by an external script beside unproved executable code';
+const externalWithCompanionId='a CRes form written by an external script beside a JSON companion with an id';
 const externalNested='a CRes form written by an external script under a nonstructural parent';
 const externalUnknown='a CRes form from an unsupported external DOM builder';
 const externalMismatch='a CRes form from an external script with different expected POST bytes';
@@ -111,6 +112,7 @@ const refusedFollowups=new Map([
  [externalInvalidUtf8,'BROWSER_CHALLENGE_CRES_SCRIPT_READ'],
  [externalNested,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_PARENT'],
  [externalWithExecutable,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION'],
+ [externalWithCompanionId,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_ATTRIBUTE_ID'],
  [issuerCresDestination,'BROWSER_CHALLENGE_CRES_DESTINATION'],
  [oversizedDecision,'BROWSER_CHALLENGE_CRES_DECISION_SIZE'],
  [invalidUtf8Decision,'BROWSER_CHALLENGE_CRES_DECISION_UTF8'],
@@ -134,7 +136,8 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const namedForm=mode===namedDecisionCres;
  const literalForm=[literalDecisionCres,insertionDecisionCres,literalBodyMismatch].includes(mode);
  const dynamicForm=mode===dynamicDecisionCres;
- const externalForm=[externalLiteral,externalGzip,externalHead,externalHeadWithData,externalWithExecutable,externalNested,externalUnknown,externalMismatch,externalNoReceipt,externalInvalidUtf8].includes(mode);
+ const externalForm=[externalLiteral,externalGzip,externalHead,externalHeadWithData,externalWithExecutable,externalWithCompanionId,
+  externalNested,externalUnknown,externalMismatch,externalNoReceipt,externalInvalidUtf8].includes(mode);
  const submitsCres=Boolean(compressed)||[decisionCres,isolatedDecisionCres,namedDecisionCres,lateDecisionCres,lateDecisionHeaders,uncapturedDecision,
   changedCresAction,changedCresBody,unsupportedCresForm,issuerCresDestination].includes(mode)||literalForm||dynamicForm||externalForm;
  const isolated=mode===isolatedDecisionCres||namedForm||literalForm||dynamicForm||externalForm||compressed||mode===lateDecisionHeaders||mode==='separate issuer process';
@@ -209,6 +212,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const externalDocument=mode===externalHead?`<!doctype html><head>${externalTag}</head><body></body>`:
   mode===externalHeadWithData?`<!doctype html><head><script type="application/json">{"fixture":true}</script>${externalTag}</head><body></body>`:
   mode===externalWithExecutable?`<!doctype html><body><script>void 0;</script>${externalTag}</body>`:
+  mode===externalWithCompanionId?`<!doctype html><body><script type="application/json" id="private-fixture">{"fixture":true}</script>${externalTag}</body>`:
   mode===externalNested?`<!doctype html><body><div>${externalTag}</div></body>`:
   `<!doctype html><body>${externalTag}</body>`;
  let decisionHtml=submitsSecondDecision?
@@ -450,7 +454,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    if(submitsCres&&mode!==issuerCresDestination)assert.equal(decisionBodyCaptured,mode!==oversizedDecision);
    if(networkFixture)assert.equal(networkFixture.requests(),1);
    if(externalForm&&mode!==externalInvalidUtf8)assert.equal(scriptBodyCaptured,
-    mode!==externalNoReceipt&&mode!==externalNested&&mode!==externalWithExecutable);
+    ![externalNoReceipt,externalNested,externalWithExecutable,externalWithCompanionId].includes(mode));
    assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision,...(externalForm?[decisionAsset]:[])]);
    assert.deepEqual(authorized,forwarded);
    assert.equal(gestures,1);
