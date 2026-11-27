@@ -155,6 +155,49 @@ test('report the first failing check for a companion with several rejected condi
  }
 });
 
+for(const [reason,contents] of Object.entries({
+ BOM:[' \t\uFEFF{"private-fixture":true}\n'],
+ HTML_COMMENT:['\t<!-- {"private-fixture":true} -->\n'],
+ HTML_QUOTES:['{&quot;private-fixture&QUOT;:&#034;value&#X022;}', '{&#34;private-fixture&#x22;:true}'],
+ PERCENT:[' %7B%22private-fixture%22%3Atrue%7D\t','{%22private-fixture%22:true}','42%0A'],
+ BASE_SIXTY_FOUR:[' Ing/Ig==\n','\tIng_Ig '],
+ CONTROL:['["private-fixture\u0001"]'],
+ ESCAPE:['["private-fixture\\x12"]','["private-fixture\\u0z00"]'],
+ INCOMPLETE:['{"private-fixture":','"private-fixture'],
+ PROPERTY:['{privateFixture:true}','{"private-fixture":true,}','{&quot;private-fixture&quot;:invalid}'],
+ DELIMITER:['{"private-fixture" true}','{"private-fixture":true "extra":false}','["private-fixture" true]'],
+ NUMBER:['[-]','[1.]','[1e]','[01]'],
+ TRAILING:['{"private-fixture":true} extra','77u/e30='], // The base64 candidate decodes to a BOM followed by JSON.
+ INVALID:[
+  '[\f]','\u00a0%7B%7D','\uFEFF\uFEFF{}','\uFEFF<!-- {} -->','<!-- {}','<!-- "earlier --> end" -->',
+  '&quot;private-fixture&quot; extra','%7B%FF%7D','Ing/Ih==','Iv8i',
+ ],
+}))test('reject malformed companion JSON with the fixed '+reason+' diagnostic',()=>{
+ for(const text of contents){
+  const reported:string[]=[];
+  assert.equal(issuerResultForm(externalTag+jsonBlock(text),undefined,code=>reported.push(code),decisionUrl),undefined);
+  assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_'+reason]);
+ }
+});
+
+test('allow strict companion JSON with literal entity, percent and base64 text in strings',()=>{
+ const html=externalTag+jsonBlock(' \t["&quot;","&#34;","%7B%7D","Ing_Ig","<!-- data -->"]\n');
+ const reported:string[]=[];
+ assert.deepEqual(issuerResultForm(html,undefined,code=>reported.push(code),decisionUrl),{
+  scriptUrl:'https://reviewed-test-issuer.stripe.com/fixture/result.js',placement:'head',
+ });
+ assert.deepEqual(reported,[]);
+});
+
+test('classify invalid companion wrappers only within 64 KiB of parsed UTF-8',()=>{
+ for(const [extra,reason] of [['a','BOM'],['ab','INVALID']]){
+  const text='\uFEFF"'+'é'.repeat(32765)+extra+'"';
+  const reported:string[]=[];
+  assert.equal(issuerResultForm(externalTag+jsonBlock(text),undefined,code=>reported.push(code),decisionUrl),undefined);
+  assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_'+reason]);
+ }
+});
+
 test('require an exact HTTPS decision URL to derive an external script reference',()=>{
  for(const url of [undefined,'file:///fixture/decision',decisionUrl+'#',' '+decisionUrl]){
   const reported:string[]=[];

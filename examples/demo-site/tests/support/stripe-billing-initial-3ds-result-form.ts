@@ -6,11 +6,13 @@ const classicScriptTypes=new Set(['','text/javascript','application/javascript']
 const structuralElements=new Set(['html','head','body','title','meta']);
 const attribute=(element:DefaultTreeAdapterTypes.Element,name:string)=>element.attrs.find(attr=>attr.name===name)?.value;
 type LayoutRejection='EXTERNAL_LAYOUT_TAG'|'EXTERNAL_LAYOUT_ATTRIBUTES'|'EXTERNAL_LAYOUT_TEXT'|'EXTERNAL_LAYOUT_HANDLER';
+type InvalidCompanionJson='INVALID'|'BOM'|'HTML_COMMENT'|'HTML_QUOTES'|'PERCENT'|'BASE_SIXTY_FOUR'|
+ 'CONTROL'|'ESCAPE'|'INCOMPLETE'|'PROPERTY'|'DELIMITER'|'NUMBER'|'TRAILING';
 type CompanionRejection='EXTERNAL_COMPANION_PARENT'|'EXTERNAL_COMPANION_TAG'|'EXTERNAL_COMPANION_TYPE_MISSING'|
  'EXTERNAL_COMPANION_TYPE_JSON_VARIANT'|'EXTERNAL_COMPANION_TYPE_JSON_LD'|'EXTERNAL_COMPANION_TYPE_IMPORTMAP'|
  'EXTERNAL_COMPANION_TYPE_SPECULATION_RULES'|'EXTERNAL_COMPANION_TYPE_OTHER'|'EXTERNAL_COMPANION_HANDLER'|
  'EXTERNAL_COMPANION_ATTRIBUTE_NONCE'|'EXTERNAL_COMPANION_ATTRIBUTES'|
- 'EXTERNAL_COMPANION_JSON_EMPTY'|'EXTERNAL_COMPANION_JSON_INVALID';
+ 'EXTERNAL_COMPANION_JSON_EMPTY'|`EXTERNAL_COMPANION_JSON_${InvalidCompanionJson}`;
 type FormRejection='DUPLICATE_ATTRIBUTE'|'BASE'|'OWNER'|'MISSING'|'MULTIPLE'|'METHOD'|'TARGET'|'ENCODING'|
  'ACTION'|'CONTROL'|'FIELD'|'DUPLICATE_FIELD'|'REQUIRED_CRES'|'SIZE'|'LITERAL_MARKUP'|
  'MISSING_INLINE'|'MISSING_INLINE_DOM'|'MISSING_INLINE_MARKUP'|'MISSING_EXTERNAL'|'MISSING_TEMPLATE'|'MISSING_HANDLER'|'MISSING_MIXED'|
@@ -177,7 +179,58 @@ function companionRejection({node,text}:ScriptElement):CompanionRejection|undefi
  }
  if(htmlWhitespace(text))return 'EXTERNAL_COMPANION_JSON_EMPTY';
  try{JSON.parse(text);}
- catch{return 'EXTERNAL_COMPANION_JSON_INVALID';}
+ catch(error){return `EXTERNAL_COMPANION_JSON_${invalidCompanionJson(text,error)}`;}
+}
+
+function parsesJson(text:string):boolean{
+ try{JSON.parse(text);return true;}
+ catch{return false;}
+}
+
+// Match only fixed V8 message prefixes. Other engine messages stay generic.
+const jsonSyntaxReasons=[
+ [/^Bad control character in string literal in JSON at position /,'CONTROL'],
+ [/^Bad (?:escaped character|Unicode escape) in JSON at position /,'ESCAPE'],
+ [/^(?:Unexpected end of JSON input$|Unterminated string in JSON at position )/,'INCOMPLETE'],
+ [/^Expected (?:property name or '}'|double-quoted property name) in JSON at position /,'PROPERTY'],
+ [/^Expected (?:':' after property name|',' or '}' after property value|',' or '\]' after array element) in JSON at position /,'DELIMITER'],
+ [/^(?:No number after minus sign|Unterminated fractional number|Exponent part is missing a number|Unexpected number) in JSON at position /,'NUMBER'],
+ [/^Unexpected non-whitespace character after JSON at position /,'TRAILING'],
+] as const;
+
+function invalidCompanionJson(text:string,error:unknown):InvalidCompanionJson{
+ if(text.length>65536||Buffer.byteLength(text,'utf8')>65536)return 'INVALID';
+ // These candidates only describe the original failure. Never combine them or
+ // admit a companion based on a transformed parse.
+ const jsonWhitespace=/[ \t\r\n]/;
+ let start=0,end=text.length;
+ while(start<end&&jsonWhitespace.test(text.charAt(start)))start++;
+ while(end>start&&jsonWhitespace.test(text.charAt(end-1)))end--;
+ const value=text.slice(start,end);
+ if(value.startsWith('\uFEFF')&&parsesJson(value.slice(1)))return 'BOM';
+ if(value.startsWith('<!--')&&value.endsWith('-->')){
+  const content=value.slice(4,-3);
+  if(!/<!--|--!?>/.test(content)&&parsesJson(content))return 'HTML_COMMENT';
+ }
+ const unquoted=value.replace(/&(?:quot|QUOT|#0*34|#[xX]0*22);/g,'"');
+ if(unquoted!==value&&parsesJson(unquoted))return 'HTML_QUOTES';
+ if(/%[0-9a-f]{2}/i.test(value)){
+  try{JSON.parse(decodeURIComponent(value));return 'PERCENT';}
+  catch{/* The decoded text must be strict JSON. */}
+ }
+ if(/^[A-Za-z0-9+/_-]+={0,2}$/.test(value)){
+  const bytes=Buffer.from(value,'base64');
+  if(value===bytes.toString('base64')||value===bytes.toString('base64url')){
+   try{
+    JSON.parse(new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes));
+    return 'BASE_SIXTY_FOUR';
+   }catch{/* The decoded bytes must be strict UTF-8 JSON. */}
+  }
+ }
+ if(error instanceof SyntaxError){
+  for(const [prefix,reason] of jsonSyntaxReasons)if(prefix.test(error.message))return reason;
+ }
+ return 'INVALID';
 }
 
 function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:string|undefined,

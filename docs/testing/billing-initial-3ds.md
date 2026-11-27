@@ -40,6 +40,8 @@ The terminal report distinguishes CRes reservation and ordering, the destination
 
 When a companion script fails the inert JSON check, the `BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_` checkpoint identifies its first failed check. The parser checks the parent and explicit tags before checking the declared type, allowed attributes, and JSON content. It reports the first failing companion in reverse parsed document order, after the checks for multiple source references and recognized JavaScript types. Known type and attribute categories have fixed names. The report carries no raw attributes, type strings, script contents, or URLs. The previous `EXTERNAL_COUNT_UNSUPPORTED_COMPANION` code covered all of these checks.
 
+If the original companion text fails `JSON.parse`, the request stays blocked. The diagnostic can recognize JSON after removal of one leading BOM or an enclosing HTML comment, decoding of HTML quote references, percent decoding, or decoding of canonical Base64 text as UTF-8. These checks classify the failure in memory. For other failures the runner reports a recognized syntax category or the generic `JSON_INVALID` checkpoint. The report contains only a fixed code, with no parser error text, positions, field names, or values.
+
 ## What establishes a pass
 
 The original confirmation attempt must retain its winning `REQUIRES_ACTION` receipt. The terminal server records must show one paid invoice and one EUR 20 payment for the bound subscription, with matching journal entries and signed site callbacks. A separate read of the original PaymentIntent and latest captured Charge must show an authenticated 3DS 2.x challenge. Frictionless authentication, a different Charge or a second charge fails the check.

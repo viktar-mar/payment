@@ -78,7 +78,7 @@ const externalHeadWithData='a CRes form written by an external head script besid
 const externalWithExecutable='a CRes form written by an external script beside unproved executable code';
 const externalHeadWithCompanionId='a CRes form written by an external head script beside identified JSON data';
 const externalWithCompanionId='a CRes form inserted by an external body script beside identified JSON data';
-const externalWithInvalidCompanion='a CRes form written by an external script beside identified invalid JSON';
+const externalWithInvalidCompanion='a CRes form written by an external script beside JSON with HTML-escaped quotes';
 const externalNested='a CRes form written by an external script under a nonstructural parent';
 const externalUnknown='a CRes form from an unsupported external DOM builder';
 const externalMismatch='a CRes form beside identified JSON data with different expected POST bytes';
@@ -114,7 +114,7 @@ const refusedFollowups=new Map([
  [externalInvalidUtf8,'BROWSER_CHALLENGE_CRES_SCRIPT_READ'],
  [externalNested,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_PARENT'],
  [externalWithExecutable,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION'],
- [externalWithInvalidCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_INVALID'],
+ [externalWithInvalidCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_HTML_QUOTES'],
  [issuerCresDestination,'BROWSER_CHALLENGE_CRES_DESTINATION'],
  [oversizedDecision,'BROWSER_CHALLENGE_CRES_DECISION_SIZE'],
  [invalidUtf8Decision,'BROWSER_CHALLENGE_CRES_DECISION_UTF8'],
@@ -219,7 +219,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   mode===externalHeadWithCompanionId?`<!doctype html><head>${jsonWithId('document')}${jsonWithId('write')}${externalTag}</head><body></body>`:
   mode===externalWithExecutable?`<!doctype html><body><script>void 0;</script>${externalTag}</body>`:
   mode===externalWithCompanionId?`<!doctype html><body>${jsonWithId('body')}${jsonWithId('forms')}${jsonWithId('submit')}${externalTag}</body>`:
-  mode===externalWithInvalidCompanion?`<!doctype html><body>${jsonWithId('fixture-data','{invalid')}${externalTag}</body>`:
+  mode===externalWithInvalidCompanion?`<!doctype html><body>${jsonWithId('fixture-data','{&quot;fixture&quot;:true}')}${externalTag}</body>`:
   mode===externalMismatch?`<!doctype html><body>${jsonWithId('fixture-data')}${externalTag}</body>`:
   mode===externalNested?`<!doctype html><body><div>${externalTag}</div></body>`:
   `<!doctype html><body>${externalTag}</body>`;
