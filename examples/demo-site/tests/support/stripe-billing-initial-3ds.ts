@@ -1,8 +1,10 @@
 import {createHash,randomUUID} from 'node:crypto';
-import type {Frame,Page,Request,Route} from '@playwright/test';
+import type {Frame,Page,Request,Response,Route} from '@playwright/test';
 import type {BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {RefusedIssuerRelation} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
+// @ts-ignore Native Node executes the same inert parser as Playwright.
+import {issuerResultForm} from './stripe-billing-initial-3ds-result-form.ts';
 
 function requireValue(value:unknown):asserts value {if(!value)throw Error('billing_BROWSER');}
 function object(value:unknown):Record<string,unknown>{
@@ -88,7 +90,7 @@ export function matchingChallengeRequest(binding:ReturnType<typeof issuerBinding
   return msg.messageType==='CReq' && msg.messageVersion===binding.version && msg.threeDSServerTransID===binding.server && msg.acsTransID===binding.acs;
  }catch{return false;}
 }
-// Descriptive only. A decoded result never grants transport or proves authentication.
+// Correlation only. Transport also requires the original form and paused route.
 function matchingChallengeResult(binding:ReturnType<typeof issuerBinding>|undefined,body:string|null){
  try{
   if(!binding||!body||body.length>32768)return false;
@@ -136,6 +138,9 @@ type Options={
  winning:()=>Promise<void>;authorizeResponse:(req:Request)=>Promise<void>;check:()=>Promise<void>;
  expectIssuerAssetBlock:(req:Request)=>Promise<void>;
  authorizeIssuerScript?:(req:Request,document:Request)=>Promise<void>;
+ authorizeIssuerDecision?:(req:Request)=>Promise<void>;
+ takeIssuerDecisionBody?:(req:Request)=>Uint8Array|undefined;
+ authorizeIssuerResult?:(req:Request,document:Request)=>Promise<void>;
  stripeFrames:(req:Request)=>FrameSnapshot|undefined;waitForGesture:WaitForIssuerGesture;
  approvedIssuerOrigin?:string;
 };
@@ -144,11 +149,12 @@ function sameChain(a:FrameSnapshot|undefined,b:FrameSnapshot|undefined){
 }
 
 /** Scoped to one original v2 session. Only Stripe.js sends requests and only the issuer UI completes the challenge. */
-export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,authorizeIssuerScript,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
+export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,authorizeIssuerScript,authorizeIssuerDecision,takeIssuerDecisionBody,authorizeIssuerResult,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
  requireValue(approvedIssuerOrigin===undefined||isApprovedIssuerOrigin(approvedIssuerOrigin));
  let retrieve:Request|undefined,authenticate:Request|undefined,admittedAuthenticate:Request|undefined;
  let completed=false,finalRead=false,initialIssuerDispatched=false,boundSource:string|undefined;
  let issuer:Frame|undefined,issuerRequest:Request|undefined,submission:Request|undefined,binding:ReturnType<typeof issuerBinding>|undefined;
+ let issuerResult:{request:Request;state:'pending'|'forwarded'|'verified'}|undefined;
  let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:Promise<void>}|undefined;
  let handoffStarted=false;
  const issuerAssets=()=>({
@@ -186,23 +192,36 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   }
   return {target,frames};
  }
- function committedIssuerDocument(frame:Frame,request=issuerRequest){
+ function issuerDocumentSnapshot(frame:Frame,request:Request|undefined){
   requireValue(binding && request && frame===issuer);
   const challengeDocument=request===issuerRequest;
   const documentUrl=challengeDocument?binding.url:request.url();
   requireValue((challengeDocument || request===submission) && frame.url()===documentUrl);
-  const html=request.existingResponse();
-  requireValue(html && html.request()===request && html.status()===200 && html.url()===documentUrl && !html.fromServiceWorker());
   const document=stamped(frameChain(frame))!;
   requireValue(revision(frame)===expectedIssuerRevision+(challengeDocument?0:1));
   const parents={target:frame,frames:new Map(document.frames)};parents.frames.delete(frame);sameChain(issuerParent,parents);
   return document;
+ }
+ function committedIssuerDocument(frame:Frame,request=issuerRequest,html=request?.existingResponse()){
+  requireValue(request && html && html.request()===request && html.status()===200 && html.url()===request.url() && !html.fromServiceWorker());
+  return issuerDocumentSnapshot(frame,request);
  }
  async function issuerResponded(active:BillingLimits,maximum=1000){
   const request=submission;
   if(!request)return false;
   const response=await originalResponse(request,active,maximum);
   requireValue(response.status()>=200 && response.status()<300);
+  return true;
+ }
+ async function issuerCompletionReady(){
+  if(!await issuerResponded(limits))return false;
+  if(issuerResult){
+   if(issuerResult.state==='pending')return false;
+   if(issuerResult.state==='forwarded'){
+    requireValue((await originalResponse(issuerResult.request,limits,1000)).status()===200);
+    issuerResult.state='verified';
+   }
+  }
   return true;
  }
  async function originalResponse(request:Request,active:BillingLimits,maximum:number){
@@ -216,6 +235,23 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   const response=await originalResponse(request,limits,1000);requireValue(response.status()===200);
   const bytes=await billingBounded(limits,()=>response.body());requireValue(bytes.length<=65536);
   return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)) as unknown;
+ }
+ async function verifiedIssuerResultForm(request:Request,response:Response){
+  return billingBounded(limits,async active=>{
+   const [type,encoding]=await Promise.all([response.headerValue('content-type'),response.headerValue('content-encoding')]);
+   requireValue(response.status()===200 && type && /^text\/html(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i.test(type.trim()) &&
+    (encoding===null||encoding.trim().toLowerCase()==='identity'));
+   let bytes=takeIssuerDecisionBody?.(request);
+   if(!bytes){
+    const {responseBodySize}=await request.sizes();
+    requireValue(Number.isSafeInteger(responseBodySize)&&responseBodySize>0&&responseBodySize<=65536);
+    billingCheck(active);
+    bytes=await response.body();
+   }
+   requireValue(bytes.length>0&&bytes.length<=65536);
+   billingCheck(active);
+   return issuerResultForm(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
+  },2000);
  }
  // Descriptive only. Capture the refused frame shape, then read only the
  // response to the authenticate POST already admitted by the browser guard.
@@ -266,6 +302,18 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   if(approved)requireValue(target.name()===directIssuerFrame);
   const chain=()=>stamped(api?stripeFrames(request):frameChain(target)),original=chain();
   requireValue(original);
+  const decisionForResult=submission && url.origin===issuerOrigin && navigation &&
+   request.method()==='POST' && request.resourceType()==='document' ? submission : undefined;
+  const observedResultBody=decisionForResult?request.postData():null;
+  if(decisionForResult && matchingChallengeResult(binding,observedResultBody)){
+   report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT');
+   sameChain(original,issuerDocumentSnapshot(target,decisionForResult));
+   report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_CRES');
+   billingCheck(limits);
+   // Reserve before awaiting headers or response bytes so SDK completion sees the pending POST.
+   requireValue(!issuerResult && !completed && !finalRead);
+   issuerResult={request,state:'pending'};
+  }
   report('BROWSER_CHALLENGE_WINNING');
   await winning();
   report('BROWSER_CHALLENGE_OWNER');
@@ -280,14 +328,18 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    report(frameCode);
    sameChain(original,chain());
   };
-  const forwardOriginal=async()=>{
+  let issuerCompletionRoute=false;
+  const requireIssuerResult=()=>requireValue(!issuerResult||issuerResult.state==='verified');
+  const forwardOriginal=async(authorize=()=>authorizeResponse(request))=>{
    report('BROWSER_CHALLENGE_ROUTE_GUARD');
-   await authorizeResponse(request);
+   await authorize();
    await current();
    report('BROWSER_CHALLENGE_ROUTE_FORWARD');
+   if(issuerCompletionRoute)requireIssuerResult();
    billingCheck(limits);
    if(request===authenticate)admittedAuthenticate=request;
    if(request===issuerRequest)initialIssuerDispatched=true;
+   if(request===issuerResult?.request)issuerResult.state='forwarded';
    await route.continue();
   };
   if(api){
@@ -296,9 +348,10 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    const path=url.pathname,isRetrieve=path==='/v1/payment_intents/'+secret.split('_secret_')[0];
    if(method==='OPTIONS'){
     report('BROWSER_CHALLENGE_API_PREFLIGHT');
+    issuerCompletionRoute=path==='/v1/3ds2/challenge_complete';
     requireValue(!headers.authorization && !data && headers['access-control-request-method']===(isRetrieve?'GET':'POST') &&
      (isRetrieve && (!retrieve || arm && !finalRead) || path==='/v1/3ds2/authenticate' && retrieve && !authenticate ||
-      path==='/v1/3ds2/challenge_complete' && await issuerResponded(limits) && !completed));
+      issuerCompletionRoute && await issuerCompletionReady() && !completed));
     await current();await forwardOriginal();return;
    }
    if(!isRetrieve && !boundSource){
@@ -313,14 +366,18 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    report('BROWSER_CHALLENGE_API_ORDER');
    if(kind==='retrieve'){
     if(retrieve){
-     requireValue(await issuerResponded(limits));await current();
+     issuerCompletionRoute=true;
+     requireValue(await issuerCompletionReady());await current();
      report('BROWSER_CHALLENGE_API_ORDER');
+     requireIssuerResult();
      requireValue(!finalRead);finalRead=true;
     }else retrieve=request;
    }else if(kind==='authenticate'){requireValue(!authenticate);authenticate=request;}
    else{
-    requireValue(await issuerResponded(limits));await current();
+    issuerCompletionRoute=true;
+    requireValue(await issuerCompletionReady());await current();
     report('BROWSER_CHALLENGE_API_ORDER');
+    requireIssuerResult();
     requireValue(!completed);completed=true;
    }
   }else{
@@ -431,17 +488,27 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     await forwardOriginal();issuerReady.resolve();return;
    }
    if(submission){
-    // The original form spends the only submission slot. Classify a later,
-    // always-denied POST only against the unchanged target document.
     report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT');
-    sameChain(original,committedIssuerDocument(target,submission));
-    requireValue(headers.origin===new URL(submission.url()).origin);
-    const repeat=url.href===submission.url() && typeof data==='string' &&
+    const decision=submission;
+    const decisionResponse=issuerResult?.request===request ? await originalResponse(decision,limits,1000) : undefined;
+    sameChain(original,committedIssuerDocument(target,decision,decisionResponse));
+    requireValue(headers.origin===new URL(decision.url()).origin);
+    const repeat=url.href===decision.url() && typeof data==='string' &&
      data.length<=65536 && createHash('sha256').update(data).digest('hex')===arm?.bodyHash;
-    if(repeat)report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_REPEAT');
-    else if(matchingChallengeResult(binding,data))report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_CRES');
-    else report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP');
-    requireValue(false);
+    report(repeat?'BROWSER_CHALLENGE_ISSUER_SUBMISSION_REPEAT':'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP');
+    requireValue(!repeat && matchingChallengeResult(binding,data));
+    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_CRES');
+    requireValue(authorizeIssuerResult && decisionResponse && issuerResult?.request===request && data===observedResultBody &&
+     request.serviceWorker()===null && !headers['transfer-encoding']);
+    const form=await verifiedIssuerResultForm(decision,decisionResponse);
+    requireValue(form && form.action===url.href && request.postDataBuffer()?.equals(Buffer.from(form.body)));
+    await current();
+    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT');
+    sameChain(original,committedIssuerDocument(target,decision,decisionResponse));
+    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_CRES');
+    requireValue(!completed && !finalRead);
+    await forwardOriginal(()=>authorizeIssuerResult(request,decision));
+    return;
    }
    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION');
    const armed=arm;
@@ -453,7 +520,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION');
    requireValue(!submission);submission=request;
   }
-  await forwardOriginal();
+  await forwardOriginal(!api && request===submission && authorizeIssuerDecision?()=>authorizeIssuerDecision(request):undefined);
   if(!api)issuerDispatched.resolve();
  }
  async function attend(){

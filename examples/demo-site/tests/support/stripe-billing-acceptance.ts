@@ -415,6 +415,9 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
    stripeFrames:req=>stripeFrames(page,req,false,false,binding.endpoints.demo),authorizeResponse:req=>redirects!.authorize(req),check:checkManager,waitForGesture:challenge.waitForGesture,
    expectIssuerAssetBlock:req=>redirects!.expectIssuerAssetBlock(req),
    authorizeIssuerScript:(req,document)=>redirects!.authorizeIssuerScript(req,document),
+   authorizeIssuerDecision:redirects!.authorizeIssuerDecision,
+   takeIssuerDecisionBody:req=>redirects!.takeIssuerDecisionBody(req),
+   authorizeIssuerResult:(req,document)=>redirects!.authorizeIssuerResult(req,document),
    approvedIssuerOrigin:challenge.approvedIssuerOrigin,
    winning:async()=>{
     const original=requests.get('original-confirm'),response=original?.existingResponse();

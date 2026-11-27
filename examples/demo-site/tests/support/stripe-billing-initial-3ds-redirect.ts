@@ -1,4 +1,5 @@
 import type {CDPSession,Frame,Page,Request} from '@playwright/test';
+import {billingBounded} from '../../../../infrastructure/stripe-billing-limits.mjs';
 // @ts-ignore Native Node executes the same iframe guard source as Playwright.
 import {guardIframeTargets,type GuardSession} from './stripe-billing-chromium-iframe.ts';
 // @ts-ignore Native Node executes the pinned Chromium identity reader.
@@ -15,7 +16,7 @@ type Header={name:string;value:string};
 type Preflight={origin:string;method:string;names?:string};
 type FrameWait={settle:(matched:boolean)=>void;invalidated:boolean};
 type Entry={url:string;method:string;frameId?:string;allowed:boolean;expectedAssetBlock?:boolean;preflight?:Preflight;
- issuerParser?:{url:string;loaderId:string};allowedIssuerScript?:boolean;
+ issuerParser?:{url:string;loaderId:string};allowedIssuerScript?:boolean;allowedIssuerResult?:boolean;issuerDecision?:Request;
  initiator?:{id:string;entry?:Entry};frameWait?:FrameWait};
 type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
  |'BROWSER_GUARD_RESPONSE_PAIR_NETWORK_ID'|'BROWSER_GUARD_RESPONSE_PAIR_REQUEST_MISSING'|'BROWSER_GUARD_RESPONSE_PAIR_DUPLICATE'
@@ -27,11 +28,27 @@ type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUES
  |'BROWSER_GUARD_ROUTE_EVENT_MISSING'|'BROWSER_GUARD_ROUTE_EVENT_RETIRED'
  |'BROWSER_GUARD_ROUTE_EVENT_FRAME'|'BROWSER_GUARD_ROUTE_EVENT_URL'|'BROWSER_GUARD_ROUTE_EVENT_METHOD'
  |'BROWSER_GUARD_ROUTE_EVENT_CLAIMED'|'BROWSER_GUARD_ROUTE_EVENT_PREFLIGHT'
- |'BROWSER_GUARD_ROUTE_ISSUER_SCRIPT_PARSER'|'BROWSER_GUARD_RESPONSE_ISSUER_SCRIPT';
+ |'BROWSER_GUARD_ROUTE_ISSUER_SCRIPT_PARSER'|'BROWSER_GUARD_RESPONSE_ISSUER_SCRIPT'
+ |'BROWSER_GUARD_ROUTE_ISSUER_RESULT_DOCUMENT'|'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'|'BROWSER_GUARD_RESPONSE_ISSUER_DECISION';
 function issuerScriptResponse(headers:Header[]|undefined){
  const types=headers?.filter(header=>header.name.toLowerCase()==='content-type')??[];
  return types.length===1 && /^(?:text|application)\/javascript(?:\s*;\s*charset=utf-8)?$/i.test(types[0]!.value.trim()) &&
   !headers?.some(header=>['set-cookie','content-disposition','location'].includes(header.name.toLowerCase()));
+}
+function issuerResultResponse(headers:Header[]|undefined){
+ const types=headers?.filter(header=>header.name.toLowerCase()==='content-type')??[];
+ return types.length===1 && /^text\/html(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i.test(types[0]!.value.trim()) &&
+  !headers?.some(header=>['set-cookie','content-disposition','location','refresh'].includes(header.name.toLowerCase()));
+}
+function issuerDecisionLength(headers:Header[]|undefined){
+ if(!issuerResultResponse(headers))return;
+ const lengths=headers?.filter(header=>header.name.toLowerCase()==='content-length')??[];
+ const encodings=headers?.filter(header=>header.name.toLowerCase()==='content-encoding')??[];
+ if(lengths.length!==1 || !/^[1-9][0-9]{0,4}$/.test(lengths[0]!.value) ||
+    encodings.length>1 || encodings.length===1&&encodings[0]!.value.trim().toLowerCase()!=='identity' ||
+    headers?.some(header=>header.name.toLowerCase()==='transfer-encoding'))return;
+ const bytes=Number(lengths[0]!.value);
+ if(bytes<=65536)return bytes;
 }
 function stripeScript(url:URL){
  return url.protocol==='https:' && !url.port && !url.username && !url.password &&
@@ -105,6 +122,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
  if(origins.backend===origins.demo)refuse();
  const exactOrigins=[...stripeOrigins,origins.backend,origins.demo,...(approvedIssuerOrigin?[approvedIssuerOrigin]:[])];
  const patterns=exactOrigins.map(origin=>origin+'/*').concat('https://*.js.stripe.com/*');
+ const issuerDecisionBodies=new WeakMap<Request,Buffer>();
  function tracked(raw:string){
   const url=new URL(raw);return exactOrigins.includes(url.origin)||stripeScript(url);
  }
@@ -113,6 +131,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   const waiters=new Map<string,(event:ObservedEvent)=>void>();
   const retired=new Set<string>();
   const pendingPauses=new Map<string,FrameWait>();
+  const readingDecisions=new Map<string,FrameWait>();
   let closed=false;
   function waitForEvent(id:string):Promise<ObservedEvent>{
    if(closed||waiters.has(id)||waiters.size>=24)return Promise.resolve(undefined);
@@ -183,12 +202,20 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   signal?.addEventListener('abort',closeGuard,{once:true});
   if(signal?.aborted){closeGuard();return refuse();}
   session.on('Fetch.requestPaused',async event=>{
+   const networkId=event.networkId,original=networkId?requests.get(networkId):undefined;
+   const repeated=pendingPauses.get(event.requestId);
+   const fetchReadId='fetch:'+event.requestId,networkReadId='network:'+networkId;
+   const decisionRead=()=>readingDecisions.get(fetchReadId)??readingDecisions.get(networkReadId);
+   const activeRead=decisionRead();
+   if(activeRead){
+    invalidateFrameWait(activeRead);
+    if(!closed)onFailure('BROWSER_GUARD_RESPONSE_PAIR_DUPLICATE');
+    return;
+   }
    let reason:RedirectGuardFailure='BROWSER_GUARD_RESPONSE_PAIR_NETWORK_ID';
    let waitingClaim:FrameWait|undefined;
+   let capturedDecision:Request|undefined;
    try{
-    const networkId=event.networkId;
-    const original=networkId?requests.get(networkId):undefined;
-    const repeated=pendingPauses.get(event.requestId);
     if(repeated || original?.frameWait){
      reason='BROWSER_GUARD_RESPONSE_PAIR_DUPLICATE';
      invalidateFrameWait(repeated);
@@ -255,15 +282,50 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
      reason='BROWSER_GUARD_RESPONSE_ISSUER_SCRIPT';
      if(status!==200 || event.resourceType!=='Script' || !issuerScriptResponse(event.responseHeaders))refuse();
     }
+    if(original.allowedIssuerResult){
+     reason='BROWSER_GUARD_RESPONSE_ISSUER_RESULT';
+     if(status!==200 || event.resourceType!=='Document' || !issuerResultResponse(event.responseHeaders))refuse();
+    }
     reason='BROWSER_GUARD_RESPONSE_PAIR_NETWORK_FRAME_MISSING';
     if(!original.frameId)return refuse();
     reason='BROWSER_GUARD_RESPONSE_PAIR_FRAME';
     if(original.frameId!==event.frameId)return refuse();
+    if(original.issuerDecision && status===200 && event.resourceType==='Document'){
+     const size=issuerDecisionLength(event.responseHeaders);
+     if(size!==undefined){
+      // Chromium may retire the old renderer when CRes starts navigating. Read
+      // the measured bytes from this exact response pause before releasing it.
+      reason='BROWSER_GUARD_RESPONSE_ISSUER_DECISION';
+      const claim:FrameWait={settle:()=>{},invalidated:false};
+      original.frameWait=claim;
+      waitingClaim=claim;
+      pendingPauses.set(event.requestId,claim);
+      const value=await billingBounded({deadline:Date.now()+1000,signal},async()=>{
+       if(claim.invalidated)return refuse();
+       readingDecisions.set(fetchReadId,claim);
+       readingDecisions.set(networkReadId,claim);
+       try{return await session.send('Fetch.getResponseBody',{requestId:event.requestId});}
+       finally{
+        readingDecisions.delete(fetchReadId);
+        readingDecisions.delete(networkReadId);
+       }
+      });
+      if(closed || claim.invalidated || requests.get(networkId)!==original ||
+         (value.base64Encoded?value.body.length>Math.ceil(size/3)*4:Buffer.byteLength(value.body,'utf8')!==size))return refuse();
+      const bytes=Buffer.from(value.body,value.base64Encoded?'base64':'utf8');
+      if(bytes.length!==size)return refuse();
+      capturedDecision=original.issuerDecision;
+      issuerDecisionBodies.set(capturedDecision,bytes);
+     }
+    }
     requests.delete(networkId);
     reason='BROWSER_GUARD_RESPONSE_RESUME';
     await session.send('Fetch.continueResponse',{requestId:event.requestId});
    }catch{
-    try{await session.send('Fetch.failRequest',{requestId:event.requestId,errorReason:'BlockedByClient'});}
+    if(capturedDecision)issuerDecisionBodies.delete(capturedDecision);
+    // Fetch.getResponseBody owns the paused request until it settles. On timeout
+    // report failure without resuming it or racing that command with failRequest.
+    try{if(!decisionRead())await session.send('Fetch.failRequest',{requestId:event.requestId,errorReason:'BlockedByClient'});}
     catch{}finally{onFailure(reason);}
    }finally{if(waitingClaim)pendingPauses.delete(event.requestId);}
   });
@@ -298,14 +360,40 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
  const mainId=frameId(frameTree,main,main);
  if(!mainId||routeReader&&routeReader.mainId!==mainId)refuse();
  const routes=new WeakMap<Request,{generation:number;evidence?:ChromiumRouteEvidence|null}>();
- async function claimRoute(request:Request,blockIssuerAsset:boolean,issuerDocument?:Request){
+ const issuerResults=new WeakSet<Request>();
+ type IssuerClaim={kind:'script'|'result';document:Request}|{kind:'decision'};
+ async function claimRoute(request:Request,blockIssuerAsset:boolean,issuerClaim?:IssuerClaim){
   const url=new URL(request.url());
   const fromApprovedIssuer=approvedIssuerOrigin!==undefined && url.origin===approvedIssuerOrigin;
-  const issuerScriptDocument=issuerDocument?.url();
+  const issuerScript=issuerClaim?.kind==='script'?issuerClaim.document:undefined;
+  const issuerScriptDocument=issuerScript?.url();
+  const issuerResult=issuerClaim?.kind==='result'?issuerClaim.document:undefined;
+  const issuerResultDocument=issuerResult?.url();
+  const issuerDecision=issuerClaim?.kind==='decision';
+  if(issuerDecision && (!routeReader || !routes.has(request) || !(fromApprovedIssuer||url.origin==='https://hooks.stripe.com') ||
+     url.href!==request.url() || url.username || url.password || url.hash ||
+     request.method()!=='POST' || !request.isNavigationRequest() || request.resourceType()!=='document' ||
+     request.redirectedFrom() || request.serviceWorker())){
+   onFailure('BROWSER_GUARD_ROUTE_IDENTITY');return refuse();
+  }
+  if(issuerResult && issuerResultDocument!==undefined){
+   const source=URL.canParse(issuerResultDocument)?new URL(issuerResultDocument):undefined;
+   if(!routeReader || !routes.has(request) || url.origin!=='https://hooks.stripe.com' || url.href!==request.url() ||
+      url.username || url.password || url.hash || url.pathname==='/' || !source ||
+      (source.origin!=='https://hooks.stripe.com' && source.origin!==approvedIssuerOrigin) ||
+      source.href!==issuerResultDocument || source.username || source.password || source.hash ||
+      issuerResult===request || issuerResult.frame()!==request.frame() || request.frame().url()!==issuerResultDocument ||
+      issuerResult.method()!=='POST' || !issuerResult.isNavigationRequest() || issuerResult.resourceType()!=='document' ||
+      issuerResult.redirectedFrom() || issuerResult.serviceWorker() ||
+      request.method()!=='POST' || !request.isNavigationRequest() || request.resourceType()!=='document' ||
+      request.redirectedFrom() || request.serviceWorker()){
+    onFailure('BROWSER_GUARD_ROUTE_IDENTITY');return refuse();
+   }
+  }
   if(issuerScriptDocument!==undefined?
      !routeReader || !fromApprovedIssuer || !routes.has(request) || !URL.canParse(issuerScriptDocument) ||
       new URL(issuerScriptDocument).origin!==url.origin || request.frame().url()!==issuerScriptDocument ||
-      issuerDocument!.frame()!==request.frame() || issuerDocument!.method()!=='POST' ||
+      issuerScript!.frame()!==request.frame() || issuerScript!.method()!=='POST' ||
       request.method()!=='GET' || request.isNavigationRequest() || request.resourceType()!=='script' ||
       url.href!==url.origin+url.pathname || !isIssuerScriptPath(url.pathname):
     blockIssuerAsset?
@@ -350,12 +438,25 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
     if(issuerScriptDocument!==undefined){
      reason='BROWSER_GUARD_ROUTE_ISSUER_SCRIPT_PARSER';
      if(entry.issuerParser?.url!==issuerScriptDocument || entry.issuerParser.loaderId!==evidence.documentId ||
-        evidence.documentId!==routeReader.navigationDocument(issuerDocument!) ||
+        evidence.documentId!==routeReader.navigationDocument(issuerScript!) ||
         request.frame().url()!==issuerScriptDocument)return refuse();
      entry.allowedIssuerScript=true;
     }
+    if(issuerResult){
+     reason='BROWSER_GUARD_ROUTE_ISSUER_RESULT_DOCUMENT';
+     // For a document navigation the new Network loader belongs to the
+     // destination. The route captured the currently committed issuer document.
+     const source=routeReader.navigationDocument(issuerResult);
+     if(!source || evidence.documentId!==source || request.frame().url()!==issuerResultDocument ||
+        issuerResults.has(issuerResult))return refuse();
+     issuerResults.add(issuerResult);
+     entry.allowedIssuerResult=true;
+    }
     if(blockIssuerAsset)entry.expectedAssetBlock=true;
-    else entry.allowed=true;
+    else{
+     if(issuerDecision)entry.issuerDecision=request;
+     entry.allowed=true;
+    }
    }catch{onFailure(reason);return refuse();}
    return;
   }
@@ -402,6 +503,13 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   },
   authorize:(request:Request)=>claimRoute(request,false),
   expectIssuerAssetBlock:(request:Request)=>claimRoute(request,true),
-  authorizeIssuerScript:(request:Request,document:Request)=>claimRoute(request,false,document),
+  authorizeIssuerScript:(request:Request,document:Request)=>claimRoute(request,false,{kind:'script',document}),
+  authorizeIssuerDecision:routeReader?(request:Request)=>claimRoute(request,false,{kind:'decision'}):undefined,
+  takeIssuerDecisionBody(request:Request){
+   const body=issuerDecisionBodies.get(request);
+   issuerDecisionBodies.delete(request);
+   return body;
+  },
+  authorizeIssuerResult:(request:Request,document:Request)=>claimRoute(request,false,{kind:'result',document}),
  };
 }

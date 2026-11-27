@@ -166,6 +166,158 @@ for(const during of ['route policy','identity probe'])test('a replacement iframe
  assert.deepEqual(failures,['BROWSER_GUARD_RESPONSE_UNCLAIMED']);
 });
 
+type DecisionBody='exact'|'missing length'|'large'|'encoded'|'short body'|'long body'|'duplicate pause'|'retired'|'timeout'|'abort';
+type IssuerResultPolicy={release?:true;claimFailure?:string;responseFailure?:string;status?:number;type?:string;header?:string;decision?:DecisionBody};
+const issuerResultPolicy:Record<string,IssuerResultPolicy>={
+ 'exact source and response':{release:true},
+ 'same URL with a different source loader':{claimFailure:'BROWSER_GUARD_ROUTE_ISSUER_RESULT_DOCUMENT'},
+ 'retired source while claim waits':{claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
+ 'unregistered request':{claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
+ 'fixture without Chromium identity':{claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
+ 'foreign result origin':{claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
+ 'redirected source document':{claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
+ 'replay with another Network request':{claimFailure:'BROWSER_GUARD_ROUTE_ISSUER_RESULT_DOCUMENT'},
+ 'redirect response':{status:302,responseFailure:'BROWSER_GUARD_RESPONSE_REDIRECT'},
+ 'aborted before response':{responseFailure:'BROWSER_GUARD_RESPONSE_PAIR_REQUEST_MISSING'},
+ 'wrong response frame':{responseFailure:'BROWSER_GUARD_RESPONSE_PAIR_FRAME'},
+ 'wrong response resource':{responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'},
+ 'non-200 response':{status:201,responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'},
+ 'non-HTML response':{type:'application/json',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'},
+ 'ambiguous media type':{header:'Content-Type',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'},
+ 'cookie response':{header:'Set-Cookie',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'},
+ 'location response':{header:'Location',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'},
+ 'refresh response':{header:'Refresh',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'},
+ 'attachment response':{header:'Content-Disposition',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'},
+ 'decision body captured exactly once':{decision:'exact',release:true},
+ 'decision body without announced length':{decision:'missing length',release:true},
+ 'decision body exceeds the byte limit':{decision:'large',release:true},
+ 'encoded decision body is not captured':{decision:'encoded',release:true},
+ 'decision body length does not match':{decision:'short body',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+ 'decision body wire size exceeds the limit':{decision:'long body',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+ 'decision capture invalidated by duplicate':{decision:'duplicate pause',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+ 'decision capture invalidated by retirement':{decision:'retired',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+ 'decision capture times out while Chromium still owns the read':{decision:'timeout',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+ 'decision capture abort suppresses only commands for the active read':{decision:'abort',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+};
+
+for(const [mode,policy] of Object.entries(issuerResultPolicy))test('issuer result claim uses one original decision and guarded response: '+mode,{timeout:4000},async()=>{
+ const approved='https://reviewed-test-issuer.stripe.com',address=approved+'/decision',frameId='issuer';
+ const url=policy.decision?address:(mode==='foreign result origin'?approved:'https://hooks.stripe.com')+'/result',location=origins.demo+'/';
+ const browserSession={},symbol=Symbol('InterceptableRequest'),pending=new Map();
+ const frameDriver=(id:string,parent:unknown,documentId:string)=>({
+  _id:id,_page:undefined as unknown,_currentDocument:{documentId},_isDetached:()=>false,parentFrame:()=>parent,
+ });
+ const main=frameDriver('checkout',null,'checkout-loader'),issuer=frameDriver(frameId,main,'decision-loader');
+ const impl={
+  frameManager:{frame:(id:string)=>[main,issuer].find(node=>node._id===id)},
+  delegate:{_targetId:main._id,_sessions:new Map([[main._id,{_targetId:main._id,_client:browserSession}]]),
+   _networkManager:{_requestIdToRequest:pending}},
+ };
+ main._page=issuer._page=impl;
+ const connection={toImpl:(client:{driver:unknown})=>client.driver};
+ const wrap=(driver:unknown,href:string)=>({_connection:connection,driver,url:()=>href,name:()=>'',isDetached:()=>false});
+ const top=wrap(main,location),frame=wrap(issuer,address);
+ const events=new Map<string,(value:unknown)=>void|Promise<void>>(),commands:string[]=[],failures:string[]=[];
+ const body='<form></form>',reading=Promise.withResolvers<void>(),wireBody=Promise.withResolvers<{body:string;base64Encoded:boolean}>();
+ const session={on:(name:string,callback:(value:unknown)=>void)=>events.set(name,callback),send:async(method:string,args?:{requestId:string})=>{
+  commands.push(method);
+  if(method==='Page.getFrameTree')return {frameTree:{frame:{id:main._id,url:location}}};
+  if(method==='Fetch.getResponseBody'){
+   assert.deepEqual(args,{requestId:'response-result'});
+   reading.resolve();
+   return wireBody.promise;
+  }
+ }};
+ const fixture={mainFrame:()=>top,context:()=>({newCDPSession:async()=>session})};
+ const page=mode==='fixture without Chromium identity'?fixture:{...fixture,_connection:connection,driver:impl};
+ if(page===fixture)registerChromiumProtocolFixture(fixture);
+ const abort=new AbortController();
+ const guard=await guardChallengeRedirects(page as never,code=>failures.push(code),origins,abort.signal,approved);
+ const original=(href:string,documentId:string)=>({frame:()=>issuer,method:()=>'POST',url:()=>href,_documentId:documentId});
+ const shape=(href:string,driver:ReturnType<typeof original>)=>({
+  _connection:connection,driver,frame:()=>frame,url:()=>href,method:()=>'POST',isNavigationRequest:()=>true,
+  resourceType:()=>'document',serviceWorker:()=>null,redirectedFrom:()=>null,
+ });
+ const completed=shape(address,original(address,mode==='same URL with a different source loader'?'retired-loader':'decision-loader'));
+ const decision={...completed,redirectedFrom:()=>mode==='redirected source document'?{}:null} as never;
+ const passive={frameId,loaderId:'destination-loader',type:'Document',request:{url,method:'POST'}};
+ const connect=(networkId:string,register=true)=>{
+  const driver=original(url,'destination-loader');
+  const intercepted={request:driver,session:browserSession,_requestId:networkId,_interceptionId:'fetch-'+networkId,_originalRequestRoute:{}};
+  Object.defineProperty(driver,symbol,{value:intercepted});
+  pending.set(networkId,intercepted);
+  const request=shape(url,driver) as never;
+  if(register)guard.registerRoute(request);
+  return request;
+ };
+ const record=(networkId:string)=>events.get('Network.requestWillBeSent')!({...passive,requestId:networkId});
+ const respond=(networkId:string,requestId='response-'+networkId)=>events.get('Fetch.requestPaused')!({...passive,networkId,requestId,
+  frameId:mode==='wrong response frame'?'foreign':frameId,
+  resourceType:mode==='wrong response resource'?'XHR':'Document',responseStatusCode:policy.status??200,
+  responseHeaders:[{name:'content-type',value:policy.type??'text/html; charset=UTF-8'},
+   ...(policy.decision&&policy.decision!=='missing length'?[{name:'Content-Length',value:String(policy.decision==='large'?65537:body.length)}]:[]),
+   ...(policy.decision==='encoded'?[{name:'Content-Encoding',value:'gzip'}]:[]),
+   ...(policy.header?[{name:policy.header,value:'fixture'}]:[])],
+ });
+ const request=connect('result',mode!=='unregistered request');
+ if(mode!=='retired source while claim waits')record('result');
+ if(policy.decision){
+  assert.ok(guard.authorizeIssuerDecision);
+  await guard.authorizeIssuerDecision(request);
+  const seen=respond('result');
+  const capture=!['missing length','large','encoded'].includes(policy.decision);
+  if(capture){
+   await reading.promise;
+   assert.equal(commands.includes('Fetch.continueResponse'),false);
+   assert.equal(guard.takeIssuerDecisionBody(request),undefined);
+   if(policy.decision==='duplicate pause')await respond('result');
+   if(policy.decision==='retired'){
+    events.get('Network.loadingFailed')!({requestId:'result'});
+    await respond('result','different-response-id');
+   }
+   if(policy.decision==='abort'){
+    abort.abort();
+    await respond('result');
+   }
+   if(policy.decision==='timeout'||policy.decision==='abort')await seen;
+   assert.equal(commands.includes('Fetch.failRequest'),false);
+   const reply=policy.decision==='short body'?body.slice(1):policy.decision==='long body'?body.repeat(8):body;
+   wireBody.resolve({body:Buffer.from(reply).toString('base64'),base64Encoded:true});
+  }
+  await seen;
+  assert.equal(commands.filter(command=>command==='Fetch.getResponseBody').length,capture?1:0);
+  assert.equal(commands.at(-1),policy.decision==='timeout'||policy.decision==='abort'?'Fetch.getResponseBody':
+   policy.release?'Fetch.continueResponse':'Fetch.failRequest');
+  assert.equal(guard.takeIssuerDecisionBody(decision),undefined);
+  assert.equal(guard.takeIssuerDecisionBody(request)?.toString(),policy.decision==='exact'?body:undefined);
+  assert.equal(guard.takeIssuerDecisionBody(request),undefined);
+  assert.deepEqual(failures,[
+   ...(policy.decision==='duplicate pause'||policy.decision==='retired'?['BROWSER_GUARD_RESPONSE_PAIR_DUPLICATE']:[]),
+   ...(policy.responseFailure?[policy.responseFailure]:[]),
+  ]);
+  return;
+ }
+ if(mode==='replay with another Network request')await guard.authorizeIssuerResult(request,decision);
+ const target=mode==='replay with another Network request'?connect('replay'):request;
+ if(target!==request)record('replay');
+ const authorization=guard.authorizeIssuerResult(target,decision);
+ if(mode==='retired source while claim waits'){
+  issuer._currentDocument={documentId:'replacement-loader'};
+  record('result');
+ }
+ if(policy.claimFailure){
+  await assert.rejects(authorization,/^Error: billing_BROWSER$/);
+  assert.deepEqual(failures,[policy.claimFailure]);
+  assert.equal(commands.includes('Fetch.continueResponse'),false);
+  return;
+ }
+ await authorization;
+ if(mode==='aborted before response')abort.abort();
+ await respond('result');
+ assert.equal(commands.at(-1),policy.release?'Fetch.continueResponse':'Fetch.failRequest');
+ assert.deepEqual(failures,policy.responseFailure?[policy.responseFailure]:[]);
+});
+
 for(const [frameId,status,release] of [['checkout-frame',200,true],['wrong-frame',200,false],['checkout-frame',307,false]] as const)
  test('the paused main navigation uses the attached frame identity: '+frameId+' '+status,async()=>{
   const href=origins.demo+'/',events=new Map<string,(e:unknown)=>Promise<void>|void>(),commands:string[]=[];

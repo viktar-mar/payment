@@ -24,9 +24,14 @@ const parserScript='one parser-initiated script from the exact issuer document';
 const decisionScript='one parser-initiated script from the issuer decision document';
 const secondDecisionPost='a second document POST from the issuer decision';
 const decisionCres='a CRes document POST to the Stripe hooks origin';
+const isolatedDecisionCres='a CRes document POST between isolated issuer and hooks targets';
+const lateDecisionCres='a CRes document POST with late issuer response observation';
+const changedCresAction='a CRes form whose action changed after the issuer response';
+const changedCresBody='a CRes form whose session data changed after the issuer response';
+const refusedFollowups=new Set([secondDecisionPost,changedCresAction,changedCresBody]);
 const wrongScriptMime='issuer script with the wrong MIME type is refused';
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,secondDecisionPost,decisionCres,wrongScriptMime,...rejectedAssets.keys()])
-test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost||mode===decisionCres?mode+' is blocked after the original 2xx':mode===wrongScriptMime?mode:
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,lateDecisionCres,wrongScriptMime,...refusedFollowups,...rejectedAssets.keys()])
+test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?mode+' is blocked after the original 2xx':mode===wrongScriptMime?mode:
  'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
  const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
@@ -39,7 +44,9 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost||
  const blocksPassiveAsset=blocksPassiveImage||blocksPassiveFont||blocksPassiveStylesheet;
  const badMime=mode===wrongScriptMime,loadsScript=mode===parserScript||badMime;
  const loadsDecisionScript=mode===decisionScript;
- const submitsCres=mode===decisionCres,submitsSecondDecision=mode===secondDecisionPost||submitsCres;
+ const submitsCres=[decisionCres,isolatedDecisionCres,lateDecisionCres,changedCresAction,changedCresBody].includes(mode);
+ const isolated=mode===isolatedDecisionCres||mode==='separate issuer process';
+ const submitsSecondDecision=mode===secondDecisionPost||submitsCres;
  const rejectedAsset=rejectedAssets.get(mode);
  const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||loadsScript||loadsDecisionScript||submitsSecondDecision||Boolean(rejectedAsset);
  const direct=mode==='direct Stripe EMVCo frame'||scopedIssuer;
@@ -50,18 +57,25 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost||
   blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png'));
  const decisionAsset=issuerOrigin+'/fixture-decision.js';
  const followup=(submitsCres?'https://hooks.stripe.com':issuerOrigin)+'/fixture-followup';
+ const observedFollowup=mode===changedCresAction?followup+'-different':followup;
  const fontCount=mode===sixFonts?6:mode===twoFonts?2:1;
  const assetUrls=[assetPath,...Array.from({length:fontCount-1},(_,index)=>issuerOrigin+`/fixture-passive-${index+2}.woff2`)];
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
  const cres=Buffer.from(JSON.stringify({messageType:'CRes',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,transStatus:'Y'})).toString('base64url');
- const followupField=submitsCres?`<input name="cres" value="${cres}">`:'<input name="result" value="fixture">';
+ const followupFields=submitsCres?`<input type="hidden" name="cres" value="${cres}"><input type="hidden" name="threeDSSessionData" value="fixture&amp;session">`:
+  '<input name="result" value="fixture">';
+ const followupScript=[
+  mode===changedCresAction?'document.forms[0].action='+JSON.stringify(observedFollowup):'',
+  mode===changedCresBody?'document.forms[0].elements.namedItem("threeDSSessionData").value="different"':'',
+  'document.forms[0].submit()',
+ ].filter(Boolean).join(';');
  const script=`(async()=>{
   await (await fetch(${JSON.stringify(retrieve)})).json();
   await (await fetch(${JSON.stringify(authenticate)},{method:'POST',body:new URLSearchParams({source:${JSON.stringify(source)},key:${JSON.stringify(key)}})})).json();
   const frame=document.createElement('iframe');frame.name=${JSON.stringify(issuerName)};document.body.append(frame);
   window.addEventListener('message',async event=>{
-   if(event.source!==frame.contentWindow || event.origin!==${JSON.stringify(issuerOrigin)} || event.data!=='fixture decision')return;
+   if(event.source!==frame.contentWindow || event.origin!==${JSON.stringify(submitsCres?new URL(followup).origin:issuerOrigin)} || event.data!=='fixture decision')return;
    ${loadsDecisionScript?'frame.remove();':''}
    try{
     const reply=await fetch(${JSON.stringify(complete)},{method:'POST',body:new URLSearchParams({source:${JSON.stringify(source)},key:${JSON.stringify(key)}})});
@@ -100,7 +114,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost||
    ares:{messageType:'ARes',transStatus:'C',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,acsURL:issuer}})],
   [issuer,{contentType:'text/html',body:issuerBody}],
   [decision,{contentType:'text/html',body:submitsSecondDecision?
-   `<!doctype html><form method="post" action="${followup}">${followupField}</form><script>document.forms[0].submit()</script>`:
+   `<!doctype html><form method="post" action="${followup}">${followupFields}</form><script>${followupScript}</script>`:
    loadsDecisionScript?`<!doctype html><script src="${decisionAsset}"></script>`:
    '<!doctype html><script>'+issuerDecision+'</script>'}],
   [complete,json({complete:true})],
@@ -108,11 +122,12 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost||
  if(rejectedAsset)responses.set(assetPath,{contentType:rejectedAsset.contentType,body:rejectedAsset.body});
  if(loadsScript)responses.set(assetPath,{contentType:badMime?'text/html':'application/javascript',body:revealButton});
  if(loadsDecisionScript)responses.set(decisionAsset,{contentType:'application/javascript',body:issuerDecision});
- if(submitsSecondDecision)responses.set(followup,{contentType:'text/html',body:'unexpected forwarded form'});
+ if(submitsSecondDecision)responses.set(observedFollowup,{contentType:'text/html',body:submitsCres?
+  '<!doctype html><script>'+issuerDecision+'</script>':'unexpected forwarded form'});
  const channel=process.env.PAYMENT_TEST_CHROME_CHANNEL==='chrome'?'chrome':'chromium';
  const browser=await chromium.launch({channel,headless:true,timeout:10_000,args:[
   '--site-per-process','--disable-background-networking','--proxy-server=direct://','--host-resolver-rules=MAP * ~NOTFOUND',
-  ...(mode==='separate issuer process'?['--isolate-origins='+stripe+','+new URL(issuer).origin]:[]),
+  ...(isolated?['--isolate-origins='+[stripe,issuerOrigin,...(submitsCres?[new URL(followup).origin]:[])].join(',')]:[]),
  ]});
  const stop=new AbortController();
  let attendance:Promise<boolean>|undefined;
@@ -130,6 +145,16 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost||
   const challenge=initial3dsChallenge({page,limits,demo,owner:()=>({key,secret}),winning:async()=>{},check:async()=>{},
    expectIssuerAssetBlock:request=>guard.expectIssuerAssetBlock(request),
    authorizeIssuerScript:(request,document)=>guard.authorizeIssuerScript(request,document),
+   authorizeIssuerDecision:async request=>{
+    authorized.push(request.url());
+    assert.ok(guard.authorizeIssuerDecision);
+    await guard.authorizeIssuerDecision(request);
+   },
+   takeIssuerDecisionBody:request=>guard.takeIssuerDecisionBody(request),
+   authorizeIssuerResult:async(request,document)=>{
+    authorized.push(request.url());
+    await guard.authorizeIssuerResult(request,document);
+   },
    approvedIssuerOrigin,authorizeResponse:async request=>{
     authorized.push(request.url());
     assert.ok(!assetUrls.includes(request.url()));
@@ -141,7 +166,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost||
      assert.deepEqual(passiveAborts,assetUrls.map(()=>'blockedbyclient'));
     }
     gestures++;
-    if(mode==='separate issuer process'&&issuerFrame){
+    if(isolated&&issuerFrame){
      const session=await context.newCDPSession(issuerFrame);
      try{
       const {targetInfo}=await session.send('Target.getTargetInfo');
@@ -169,7 +194,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost||
    try{
     if(challenge.owns(new URL(url))){
      if(mode==='late Playwright response'&&(url===retrieve||url===authenticate))request.existingResponse=()=>null;
-     if(mode==='late issuer response'&&url===decision)request.existingResponse=()=>null;
+     if((mode==='late issuer response'||mode===lateDecisionCres)&&url===decision)request.existingResponse=()=>null;
      const actual=Object.create(route) as Route;
      actual.continue=async()=>{
       assert.ok(response,'passive asset must never reach continuation');
@@ -242,9 +267,9 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost||
    return;
   }
   await page.goto(demo+'/',{waitUntil:'domcontentloaded',timeout:7_000});
-  if(submitsSecondDecision){
+  if(refusedFollowups.has(mode)){
    const [request]=await Promise.all([
-    page.waitForEvent('requestfailed',{predicate:value=>value.url()===followup,timeout:8_000}),
+    page.waitForEvent('requestfailed',{predicate:value=>value.url()===observedFollowup,timeout:8_000}),
     challenge.attend(),
    ]);
    assert.equal(request.frame(),issuerFrame);
@@ -265,10 +290,20 @@ test(rejectedAssets.has(mode)?mode+' before handoff':mode===secondDecisionPost||
   }catch{assert.fail(JSON.stringify({attachedIssuerFrame,separateIssuerTarget,refusals,gestures,forwarded:forwarded.length,
    passiveAborts:passiveAborts.length,passiveFailures:passiveFailures.length}));}
   assert.equal(attachedIssuerFrame,true);
-  if(mode==='separate issuer process')assert.equal(separateIssuerTarget,true);
+  if(isolated)assert.equal(separateIssuerTarget,true);
+  if(mode===isolatedDecisionCres){
+   assert.ok(issuerFrame);
+   const target=await context.newCDPSession(issuerFrame);
+   try{
+    const {targetInfo}=await target.send('Target.getTargetInfo');
+    assert.equal(targetInfo.type,'iframe');
+    assert.equal(targetInfo.url,followup);
+   }finally{await target.detach();}
+  }
   assert.deepEqual(refusals,[]);
   assert.deepEqual(forwarded,[retrieve,authenticate,issuer,...(loadsScript?[assetPath]:[]),decision,
-   ...(loadsDecisionScript?[decisionAsset]:[]),complete,retrieve]);
+   ...(loadsDecisionScript?[decisionAsset]:[]),...(submitsCres?[followup]:[]),complete,retrieve]);
+  if(submitsCres)assert.deepEqual(authorized,forwarded);
   assert.equal(gestures,1);
   if(blocksPassiveAsset){
    assert.deepEqual(passiveRequests.map(asset=>asset.url()).sort(),[...assetUrls].sort());

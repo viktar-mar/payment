@@ -311,6 +311,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    serviceWorker:()=>passive&&fault==='approved-issuer-block-worker'?{}:null,
    sizes:async()=>({responseBodySize:Buffer.byteLength(JSON.stringify(json))}),
    redirectedFrom:()=>null,postData:()=>data,allHeaders:async()=>{
+    if(fault==='second-issuer-cres-race'&&url.endsWith('/finish'))
+     await wire('https://api.stripe.com/v1/3ds2/challenge_complete',stripeFrame,'source=src_fixture',{}).catch(()=>{});
     if(fault==='second-issuer-commit-during-headers' && url===actionUrl && trace.includes('issuer witnessed')){
      issuerDocument=actionUrl;
      navigate(issuer);
@@ -812,7 +814,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    trace.push('issuer witnessed');
    if(fault==='second-issuer-same-form')await wire(actionUrl,issuer,'decision=complete',{},true);
    if(fault==='second-issuer-different-form')await wire(issuerHost+'/test-fixture/finish',issuer,'result=fixture',{},true);
-   if(['second-issuer-cres','second-issuer-foreign-cres','second-issuer-duplicate-cres','second-issuer-bad-padding-cres'].includes(fault)){
+   if(['second-issuer-cres','second-issuer-foreign-cres','second-issuer-duplicate-cres','second-issuer-bad-padding-cres','second-issuer-cres-race'].includes(fault)){
     const wireCres=JSON.stringify({messageType:'CRes',messageVersion:'2.2.0',threeDSServerTransID:id(90),
      acsTransID:fault==='second-issuer-foreign-cres'?id(92):id(91),transStatus:'Y'});
     const json=fault==='second-issuer-duplicate-cres'?'{"acs\\u0054ransID":"'+id(92)+'",'+wireCres.slice(1):wireCres;
@@ -1559,6 +1561,17 @@ for(const [fault,checkpoint] of [
  assert.equal(f.providerSent.filter(url=>url.endsWith('/decision')).length,1);
  assert.equal(f.providerSent.some(url=>url.endsWith('/finish')),false);
  assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+});
+
+test('3DS does not forward SDK completion while the observed CRes awaits validation',async()=>{
+ const f=cancellationPage('second-issuer-cres-race',false,true);
+ await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+3000},async()=>{}),error=>{
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(f.trace.filter(step=>step==='issuer witnessed').length,1);
+ assert.equal(f.providerSent.filter(url=>url.endsWith('/decision')).length,1);
+ assert.equal(f.providerSent.some(url=>url.endsWith('/3ds2/challenge_complete')||url.endsWith('/finish')),false);
 });
 
 for(const [fault,expected,initialSent,expectedGestures] of [

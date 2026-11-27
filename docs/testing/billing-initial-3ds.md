@@ -24,6 +24,8 @@ The browser recognizes two issuer documents. Before handoff it uses the exact co
 
 At most six same-origin, parser-initiated JavaScript GETs with distinct canonical `.js` paths can load per issuer document. The request's Chromium loader must match both the live document and the verified navigation that produced it. Responses require HTTP 200 and an exact JavaScript media type. A redirect, script-initiated request, wrong media type or incomplete load fails the check. Script loads on the original challenge document must finish before operator handoff.
 
+If the issuer submits a CRes, the browser accepts one form POST from the committed issuer decision document to the exact `https://hooks.stripe.com` action in that document's paired HTML response. For responses with a verified identity body length up to 64 KiB, the guard reads those bytes during the Chromium response pause so a frame process swap cannot discard them. The POST must preserve the form fields byte for byte and carry the original 3DS transaction IDs and version. Once observed, this request must receive its own paired HTTP 200 HTML response before SDK completion or the final PaymentIntent read proceeds.
+
 ## What establishes a pass
 
 The original confirmation attempt must retain its winning `REQUIRES_ACTION` receipt. The terminal server records must show one paid invoice and one EUR 20 payment for the bound subscription, with matching journal entries and signed site callbacks. A separate read of the original PaymentIntent and latest captured Charge must show an authenticated 3DS 2.x challenge. Frictionless authentication, a different Charge or a second charge fails the check.
