@@ -237,7 +237,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   const bytes=await billingBounded(limits,()=>response.body());requireValue(bytes.length<=65536);
   return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)) as unknown;
  }
- async function verifiedIssuerResultForm(request:Request,response:Response,report:(code:string)=>void){
+ async function verifiedIssuerResultForm(request:Request,response:Response,frameName:string,report:(code:string)=>void){
   return billingBounded(limits,async active=>{
    // Chromium binds the receipt to the admitted response. It proves bounded
    // decoded bytes before any CRes form is inspected.
@@ -268,9 +268,10 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    requireValue(bytes.length>0&&bytes.length<=65536);
    report('BROWSER_CHALLENGE_CRES_DECISION_UTF8');
    const html=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
-   report('BROWSER_CHALLENGE_CRES_FORM');
-   const form=issuerResultForm(html);
+   report('BROWSER_CHALLENGE_CRES_FORM_PARSE');
+   const form=issuerResultForm(html,frameName,report);
    requireValue(form);
+   report('BROWSER_CHALLENGE_CRES_FORM_DEADLINE');
    return form;
   },2000);
  }
@@ -531,7 +532,8 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     report('BROWSER_CHALLENGE_CRES_REQUEST');
     requireValue(authorizeIssuerResult && decisionResponse && issuerResult?.request===request && data===observedResultBody &&
      request.serviceWorker()===null && !headers['transfer-encoding']);
-    const form=await verifiedIssuerResultForm(decision,decisionResponse,report);
+    const frameName=target.name();
+    const form=await verifiedIssuerResultForm(decision,decisionResponse,frameName,report);
     report('BROWSER_CHALLENGE_CRES_ACTION');
     requireValue(form.action===url.href);
     report('BROWSER_CHALLENGE_CRES_BODY');
@@ -539,6 +541,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     await current();
     report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT');
     sameChain(original,committedIssuerDocument(target,decision,decisionResponse));
+    requireValue(target.name()===frameName);
     report('BROWSER_CHALLENGE_CRES_ORDER');
     requireValue(!completed && !finalRead);
     await forwardOriginal(()=>authorizeIssuerResult(request,decision));

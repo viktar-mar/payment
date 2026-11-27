@@ -66,6 +66,7 @@ const decisionScript='one parser-initiated script from the issuer decision docum
 const secondDecisionPost='a second document POST from the issuer decision';
 const decisionCres='a CRes document POST to the Stripe hooks origin';
 const isolatedDecisionCres='a CRes document POST between isolated issuer and hooks targets';
+const namedDecisionCres='a CRes form targeting the same issuer frame with an implicit empty session value';
 const oversizedDecision='a gzip CRes decision that expands past 64 KiB';
 const invalidUtf8Decision='a gzip CRes decision with invalid UTF-8';
 const compressedDecisions=new Map([
@@ -87,13 +88,13 @@ const refusedFollowups=new Map([
  [secondDecisionPost,'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
  [changedCresAction,'BROWSER_CHALLENGE_CRES_ACTION'],
  [changedCresBody,'BROWSER_CHALLENGE_CRES_BODY'],
- [unsupportedCresForm,'BROWSER_CHALLENGE_CRES_FORM'],
+ [unsupportedCresForm,'BROWSER_CHALLENGE_CRES_FORM_CONTROL'],
  [issuerCresDestination,'BROWSER_CHALLENGE_CRES_DESTINATION'],
  [oversizedDecision,'BROWSER_CHALLENGE_CRES_DECISION_SIZE'],
  [invalidUtf8Decision,'BROWSER_CHALLENGE_CRES_DECISION_UTF8'],
 ]);
 const wrongScriptMime='issuer script with the wrong MIME type is refused';
-for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
+for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,namedDecisionCres,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
 test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?mode+' is blocked after the original 2xx':mode===wrongScriptMime?mode:
  'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
@@ -108,9 +109,10 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const badMime=mode===wrongScriptMime,loadsScript=mode===parserScript||badMime;
  const loadsDecisionScript=mode===decisionScript;
  const compressed=compressedDecisions.get(mode);
- const submitsCres=Boolean(compressed)||[decisionCres,isolatedDecisionCres,lateDecisionCres,lateDecisionHeaders,uncapturedDecision,
+ const namedForm=mode===namedDecisionCres;
+ const submitsCres=Boolean(compressed)||[decisionCres,isolatedDecisionCres,namedDecisionCres,lateDecisionCres,lateDecisionHeaders,uncapturedDecision,
   changedCresAction,changedCresBody,unsupportedCresForm,issuerCresDestination].includes(mode);
- const isolated=mode===isolatedDecisionCres||compressed||mode===lateDecisionHeaders||mode==='separate issuer process';
+ const isolated=mode===isolatedDecisionCres||namedForm||compressed||mode===lateDecisionHeaders||mode==='separate issuer process';
  const submitsSecondDecision=mode===secondDecisionPost||submitsCres;
  const rejectedAsset=rejectedAssets.get(mode);
  const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||loadsScript||loadsDecisionScript||submitsSecondDecision||Boolean(rejectedAsset);
@@ -128,7 +130,8 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
  const cres=Buffer.from(JSON.stringify({messageType:'CRes',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,transStatus:'Y'})).toString('base64url');
- const followupFields=submitsCres?`<input type="${mode===unsupportedCresForm?'text':'hidden'}" name="cres" value="${cres}"><input type="hidden" name="threeDSSessionData" value="fixture&amp;session">`:
+ const sessionValue=namedForm?'':' value="fixture&amp;session"';
+ const followupFields=submitsCres?`<input type="${mode===unsupportedCresForm?'text':'hidden'}" name="cres" value="${cres}"><input type="hidden" name="threeDSSessionData"${sessionValue}>`:
   '<input name="result" value="fixture">';
  const followupScript=[
   mode===changedCresAction?'document.forms[0].action='+JSON.stringify(observedFollowup):'',
@@ -167,8 +170,9 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    rejectedAsset?.kind==='stylesheet'?`<link rel="stylesheet" href="${assetPath}" onload="${revealButton}">`:
    rejectedAsset?.kind==='script'?`<script>const s=document.createElement('script');s.src="${assetPath}";document.head.append(s)</script>`:
    loadsScript?`<script src="${assetPath}"></script>`:'');
+ const followupTarget=namedForm?` target="${issuerName}"`:'';
  let decisionHtml=submitsSecondDecision?
-  `<!doctype html><form method="post" action="${followup}">${followupFields}</form><script>${followupScript}</script>`:
+  `<!doctype html><form method="post" action="${followup}"${followupTarget}>${followupFields}</form><script>${followupScript}</script>`:
   loadsDecisionScript?`<!doctype html><script src="${decisionAsset}"></script>`:
   '<!doctype html><script>'+issuerDecision+'</script>';
  if(compressed)decisionHtml='\uFEFF'+decisionHtml+'<!-- Résultat -->';
@@ -243,6 +247,10 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
     return bytes;
    },
    authorizeIssuerResult:async(request,document)=>{
+    if(namedForm){
+     assert.equal(request.frame(),issuerFrame);
+     assert.deepEqual(request.postDataBuffer(),Buffer.from(`cres=${cres}&threeDSSessionData=`));
+    }
     authorized.push(request.url());
     await guard.authorizeIssuerResult(request,document);
    },
@@ -391,7 +399,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   assert.equal(decisionBodyCaptured,true);
  }
   if(mode===uncapturedDecision)assert.equal(decisionBodyCaptured,false);
-  if(mode===isolatedDecisionCres||compressed||mode===lateDecisionHeaders){
+  if(mode===isolatedDecisionCres||namedForm||compressed||mode===lateDecisionHeaders){
    assert.ok(issuerFrame);
    const target=await context.newCDPSession(issuerFrame);
    try{

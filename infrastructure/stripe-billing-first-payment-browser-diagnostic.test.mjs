@@ -17,6 +17,19 @@ test('bounded wait marker categories carry no payload and remain closed',()=>{
   assert.equal(isBrowserDiagnostic(code+'_PRIVATE'),false);
  }
 });
+test('CRes form checkpoints cross the acceptance boundary as fixed codes only',()=>{
+ const prefix='BROWSER_CHALLENGE_CRES_FORM';
+ for(const code of [prefix,...['PARSE','DEADLINE','DUPLICATE_ATTRIBUTE','BASE','OWNER','MISSING','MULTIPLE',
+  'METHOD','TARGET','ENCODING','ACTION','CONTROL','FIELD','DUPLICATE_FIELD','REQUIRED_CRES','SIZE'].map(reason=>prefix+'_'+reason)]){
+  const error=privateOrigin.acceptanceBrowserFailure(code);
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  assert.equal(JSON.stringify(error),'{}');
+ }
+ for(const raw of [prefix+'_TARGET_private',prefix+'_FIELD_CRES',prefix+'_ACTION https://fixture.test/private']){
+  assert.equal(browserDiagnostic(privateOrigin.acceptanceBrowserFailure(raw),'ACCEPTANCE'),null);
+ }
+});
 test('provider boundaries are finite private provenance without payload',()=>{
  for(const code of [
   'BROWSER_PROVIDER_HEADERS','BROWSER_PROVIDER_CURRENT','BROWSER_PROVIDER_REDIRECT','BROWSER_PROVIDER_USERINFO','BROWSER_PROVIDER_AUTH','BROWSER_PROVIDER_ORIGIN_SCHEME','BROWSER_PROVIDER_ORIGIN_PORT','BROWSER_PROVIDER_ORIGIN_STRIPE_COM','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK','BROWSER_PROVIDER_ORIGIN_OTHER','BROWSER_PROVIDER_NAVIGATION','BROWSER_PROVIDER_STATIC_FRAME','BROWSER_PROVIDER_STATIC_REQUEST','BROWSER_PROVIDER_STATIC_RESPONSE','BROWSER_PROVIDER_FALLBACK',

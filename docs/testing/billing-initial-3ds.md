@@ -26,9 +26,11 @@ At most six same-origin, parser-initiated JavaScript GETs with distinct canonica
 
 If the issuer submits a CRes, the browser accepts one form POST from the committed issuer decision document to the exact `https://hooks.stripe.com` action in that document's paired HTML response. For responses with a verified identity body length up to 64 KiB, the guard reads those bytes during the Chromium response pause so a frame process swap cannot discard them. It uses the MIME type, encoding and size checked at that pause for the captured body. The POST must preserve the form fields byte for byte and carry the original 3DS transaction IDs and version. Once observed, this request must receive its own paired HTTP 200 HTML response before SDK completion or the final PaymentIntent read proceeds.
 
+The form may target its own verified issuer frame by its exact name or use the browser's self target. A present hidden `threeDSSessionData` control with no `value` contributes an empty value in its original position. The hidden `cres` value remains required and nonempty. Ambiguous forms, other frame targets and unsupported controls fail the check.
+
 For a decision encoded with gzip, deflate, Brotli or Zstandard, Chromium continues the original response and counts decoded bytes on the exact request, frame and loader. CRes waits for the completed response and the original body. The guard caps the encoded transfer including headers and the decoded body at 64 KiB each, and checks the decoded count before requesting the body. The Chromium buffer is also capped at 64 KiB per session. Missing or evicted bytes leave CRes blocked.
 
-The terminal report distinguishes CRes reservation and ordering, the destination, original decision response and body checks, form parsing, action equality and exact POST bytes. Each diagnostic is a fixed code. Response headers, HTML, form data and transaction IDs stay out of the terminal report.
+The terminal report distinguishes CRes reservation and ordering, the destination, original decision response and body checks, action equality and exact POST bytes. Form failures get a fixed code for the rejected condition or the deadline after successful parsing. Response headers, HTML, form data and transaction IDs stay out of the terminal report.
 
 ## What establishes a pass
 
