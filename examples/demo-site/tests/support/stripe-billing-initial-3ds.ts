@@ -5,6 +5,7 @@ import type {RefusedIssuerRelation} from '../../../../infrastructure/stripe-bill
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
 // @ts-ignore Native Node executes the same inert parser as Playwright.
 import {issuerResultForm} from './stripe-billing-initial-3ds-result-form.ts';
+import type {IssuerDecisionBody} from './stripe-billing-initial-3ds-decision-body.ts';
 
 function requireValue(value:unknown):asserts value {if(!value)throw Error('billing_BROWSER');}
 function object(value:unknown):Record<string,unknown>{
@@ -139,7 +140,7 @@ type Options={
  expectIssuerAssetBlock:(req:Request)=>Promise<void>;
  authorizeIssuerScript?:(req:Request,document:Request)=>Promise<void>;
  authorizeIssuerDecision?:(req:Request)=>Promise<void>;
- takeIssuerDecisionBody?:(req:Request)=>Uint8Array|undefined;
+ takeIssuerDecisionBody?:(req:Request)=>IssuerDecisionBody|undefined|Promise<IssuerDecisionBody|undefined>;
  authorizeIssuerResult?:(req:Request,document:Request)=>Promise<void>;
  stripeFrames:(req:Request)=>FrameSnapshot|undefined;waitForGesture:WaitForIssuerGesture;
  approvedIssuerOrigin?:string;
@@ -238,10 +239,15 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
  }
  async function verifiedIssuerResultForm(request:Request,response:Response,report:(code:string)=>void){
   return billingBounded(limits,async active=>{
-   // This receipt comes from the exact paired Chromium response pause with
-   // its MIME, identity encoding and byte length already verified.
+   // Chromium binds the receipt to the admitted response. It proves bounded
+   // decoded bytes before any CRes form is inspected.
    report('BROWSER_CHALLENGE_CRES_DECISION_READ');
-   let bytes=takeIssuerDecisionBody?.(request);
+   let bytes=await takeIssuerDecisionBody?.(request);
+   billingCheck(active);
+   if(typeof bytes==='string'){
+    report(bytes);
+    requireValue(false);
+   }
    if(!bytes){
     report('BROWSER_CHALLENGE_CRES_DECISION_HEADERS');
     const [type,encoding]=await Promise.all([response.headerValue('content-type'),response.headerValue('content-encoding')]);

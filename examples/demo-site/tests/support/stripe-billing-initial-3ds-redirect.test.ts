@@ -166,7 +166,7 @@ for(const during of ['route policy','identity probe'])test('a replacement iframe
  assert.deepEqual(failures,['BROWSER_GUARD_RESPONSE_UNCLAIMED']);
 });
 
-type DecisionBody='exact'|'missing length'|'large'|'encoded'|'short body'|'long body'|'duplicate pause'|'retired'|'timeout'|'abort';
+type DecisionBody='exact'|'missing length'|'large'|'encoded'|'encoded alias'|'short body'|'long body'|'duplicate pause'|'retired'|'timeout'|'abort';
 type IssuerResultPolicy={release?:true;claimFailure?:string;responseFailure?:string;status?:number;type?:string;header?:string;decision?:DecisionBody};
 const issuerResultPolicy:Record<string,IssuerResultPolicy>={
  'exact source and response':{release:true},
@@ -192,6 +192,7 @@ const issuerResultPolicy:Record<string,IssuerResultPolicy>={
  'decision body without announced length':{decision:'missing length',release:true},
  'decision body exceeds the byte limit':{decision:'large',release:true},
  'encoded decision body is not captured':{decision:'encoded',release:true},
+ 'compressed decision rejects reuse of the original Network ID at an untracked URL':{decision:'encoded alias',release:true},
  'decision body length does not match':{decision:'short body',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
  'decision body wire size exceeds the limit':{decision:'long body',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
  'decision capture invalidated by duplicate':{decision:'duplicate pause',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
@@ -232,7 +233,7 @@ for(const [mode,policy] of Object.entries(issuerResultPolicy))test('issuer resul
  const page=mode==='fixture without Chromium identity'?fixture:{...fixture,_connection:connection,driver:impl};
  if(page===fixture)registerChromiumProtocolFixture(fixture);
  const abort=new AbortController();
- const guard=await guardChallengeRedirects(page as never,code=>failures.push(code),origins,abort.signal,approved);
+ const guard=await guardChallengeRedirects(page as never,code=>failures.push(code),origins,abort.signal,approved,policy.decision==='encoded alias');
  const original=(href:string,documentId:string)=>({frame:()=>issuer,method:()=>'POST',url:()=>href,_documentId:documentId});
  const shape=(href:string,driver:ReturnType<typeof original>)=>({
   _connection:connection,driver,frame:()=>frame,url:()=>href,method:()=>'POST',isNavigationRequest:()=>true,
@@ -256,7 +257,7 @@ for(const [mode,policy] of Object.entries(issuerResultPolicy))test('issuer resul
   resourceType:mode==='wrong response resource'?'XHR':'Document',responseStatusCode:policy.status??200,
   responseHeaders:[{name:'content-type',value:policy.type??'text/html; charset=UTF-8'},
    ...(policy.decision&&policy.decision!=='missing length'?[{name:'Content-Length',value:String(policy.decision==='large'?65537:body.length)}]:[]),
-   ...(policy.decision==='encoded'?[{name:'Content-Encoding',value:'gzip'}]:[]),
+   ...(policy.decision?.startsWith('encoded')?[{name:'Content-Encoding',value:'gzip'}]:[]),
    ...(policy.header?[{name:policy.header,value:'fixture'}]:[])],
  });
  const request=connect('result',mode!=='unregistered request');
@@ -265,6 +266,14 @@ for(const [mode,policy] of Object.entries(issuerResultPolicy))test('issuer resul
   assert.ok(guard.authorizeIssuerDecision);
   await guard.authorizeIssuerDecision(request);
   const seen=respond('result');
+  if(policy.decision==='encoded alias'){
+   await seen;
+   events.get('Network.requestWillBeSent')!({...passive,requestId:'result',request:{url:'https://untracked.invalid/',method:'POST'}});
+   assert.deepEqual(failures,['BROWSER_GUARD_REQUEST_PAIR']);
+   assert.equal(await guard.takeIssuerDecisionBody(request),'BROWSER_CHALLENGE_CRES_DECISION_READ');
+   assert.equal(commands.includes('Network.getResponseBody'),false);
+   return;
+  }
   const capture=!['missing length','large','encoded'].includes(policy.decision);
   if(capture){
    await reading.promise;

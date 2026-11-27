@@ -6,6 +6,8 @@ import {guardIframeTargets,type GuardSession} from './stripe-billing-chromium-if
 import {chromiumRouteReader,type ChromiumRouteEvidence} from './stripe-billing-chromium-route.ts';
 // @ts-ignore Native Node executes the same issuer-origin validator.
 import {isApprovedIssuerOrigin,isIssuerScriptPath,issuerAssetSuffixMatches} from './stripe-billing-initial-3ds.ts';
+// @ts-ignore Native Node executes the same compressed decision observer.
+import {issuerDecisionBodyLimit,observeCompressedIssuerDecision,type IssuerDecisionBody} from './stripe-billing-initial-3ds-decision-body.ts';
 
 const refuse=():never=>{throw Error('billing_BROWSER');};
 // Keep response interception aligned with every original HTTP destination the guarded
@@ -15,7 +17,7 @@ type Origins={backend:string;demo:string};
 type Header={name:string;value:string};
 type Preflight={origin:string;method:string;names?:string};
 type FrameWait={settle:(matched:boolean)=>void;invalidated:boolean};
-type Entry={url:string;method:string;frameId?:string;allowed:boolean;expectedAssetBlock?:boolean;preflight?:Preflight;
+type Entry={url:string;method:string;frameId?:string;loaderId?:string;allowed:boolean;expectedAssetBlock?:boolean;preflight?:Preflight;
  issuerParser?:{url:string;loaderId:string};allowedIssuerScript?:boolean;allowedIssuerResult?:boolean;issuerDecision?:Request;
  initiator?:{id:string;entry?:Entry};frameWait?:FrameWait};
 type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
@@ -40,15 +42,23 @@ function issuerResultResponse(headers:Header[]|undefined){
  return types.length===1 && /^text\/html(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i.test(types[0]!.value.trim()) &&
   !headers?.some(header=>['set-cookie','content-disposition','location','refresh'].includes(header.name.toLowerCase()));
 }
-function issuerDecisionLength(headers:Header[]|undefined){
+function issuerDecisionPolicy(headers:Header[]|undefined){
  if(!issuerResultResponse(headers))return;
  const lengths=headers?.filter(header=>header.name.toLowerCase()==='content-length')??[];
  const encodings=headers?.filter(header=>header.name.toLowerCase()==='content-encoding')??[];
- if(lengths.length!==1 || !/^[1-9][0-9]{0,4}$/.test(lengths[0]!.value) ||
-    encodings.length>1 || encodings.length===1&&encodings[0]!.value.trim().toLowerCase()!=='identity' ||
-    headers?.some(header=>header.name.toLowerCase()==='transfer-encoding'))return;
- const bytes=Number(lengths[0]!.value);
- if(bytes<=65536)return bytes;
+ const transfers=headers?.filter(header=>header.name.toLowerCase()==='transfer-encoding')??[];
+ if(lengths.length>1||encodings.length>1||transfers.length>1)return;
+ const length=lengths[0]?.value;
+ const size=length===undefined?undefined:Number(length);
+ if(length!==undefined&&(!/^[1-9][0-9]{0,4}$/.test(length)||size!>issuerDecisionBodyLimit))return;
+ const encoding=encodings[0]?.value.trim().toLowerCase()??'identity';
+ if(encoding==='identity'){
+  if(size!==undefined&&!transfers.length)return {kind:'identity' as const,size};
+  return;
+ }
+ if(!['gzip','deflate','br','zstd'].includes(encoding)||
+    transfers.length&&(size!==undefined||transfers[0]!.value.trim().toLowerCase()!=='chunked'))return;
+ return {kind:'compressed' as const,size};
 }
 function stripeScript(url:URL){
  return url.protocol==='https:' && !url.port && !url.username && !url.password &&
@@ -112,7 +122,7 @@ function bindPreflightInitiator(preflight:Entry,entry:Entry):boolean{
 
 /** Playwright routes only the first URL in a redirect chain. Arm a response-stage guard
  * before each SDK request exists and require its passive network event on the exact frame. */
-export async function guardChallengeRedirects(page:Page,onFailure:(reason:RedirectGuardFailure)=>void,origins:Origins,signal?:AbortSignal,approvedIssuerOrigin?:string){
+export async function guardChallengeRedirects(page:Page,onFailure:(reason:RedirectGuardFailure)=>void,origins:Origins,signal?:AbortSignal,approvedIssuerOrigin?:string,captureCompressedDecision=false){
  if(signal?.aborted || approvedIssuerOrigin!==undefined&&!isApprovedIssuerOrigin(approvedIssuerOrigin))return refuse();
  const routeReader=chromiumRouteReader(page);
  for(const fresh of [origins.backend,origins.demo]){
@@ -122,7 +132,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
  if(origins.backend===origins.demo)refuse();
  const exactOrigins=[...stripeOrigins,origins.backend,origins.demo,...(approvedIssuerOrigin?[approvedIssuerOrigin]:[])];
  const patterns=exactOrigins.map(origin=>origin+'/*').concat('https://*.js.stripe.com/*');
- const issuerDecisionBodies=new WeakMap<Request,Buffer>();
+ const issuerDecisionBodies=new WeakMap<Request,Buffer|Promise<IssuerDecisionBody>>();
  function tracked(raw:string){
   const url=new URL(raw);return exactOrigins.includes(url.origin)||stripeScript(url);
  }
@@ -133,6 +143,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   const pendingPauses=new Map<string,FrameWait>();
   const readingDecisions=new Map<string,FrameWait>();
   let closed=false;
+  const compressedDecisions=captureCompressedDecision&&routeReader?observeCompressedIssuerDecision(session,signal):undefined;
   function waitForEvent(id:string):Promise<ObservedEvent>{
    if(closed||waiters.has(id)||waiters.size>=24)return Promise.resolve(undefined);
    return new Promise(resolve=>{
@@ -141,15 +152,18 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
    });
   }
   session.on('Network.requestWillBeSent',event=>{
-   if(closed||!tracked(event.request.url))return;
-   if(event.redirectResponse){retire({requestId:event.requestId});onFailure('BROWSER_GUARD_REQUEST_REDIRECT');return;}
-   if(requests.has(event.requestId)||retired.has(event.requestId)){
+   if(closed)return;
+   const repeatedDecision=compressedDecisions?.has(event.requestId);
+   if(!repeatedDecision&&!tracked(event.request.url))return;
+   if(event.redirectResponse){compressedDecisions?.invalidate(event.requestId);retire(event);onFailure('BROWSER_GUARD_REQUEST_REDIRECT');return;}
+   if(requests.has(event.requestId)||retired.has(event.requestId)||repeatedDecision){
+    compressedDecisions?.invalidate(event.requestId);
     retire({requestId:event.requestId});onFailure('BROWSER_GUARD_REQUEST_PAIR');return;
    }
    if(requests.size>=24){onFailure('BROWSER_GUARD_REQUEST_CAPACITY');return;}
    const issuerTraffic=approvedIssuerOrigin&&new URL(event.request.url).origin===approvedIssuerOrigin;
    const preflight=issuerTraffic?undefined:probe(event.request,event.initiator?.type,origins);
-   const entry:Entry={frameId:event.frameId,url:event.request.url,method:event.request.method,allowed:false,preflight};
+   const entry:Entry={frameId:event.frameId,loaderId:event.loaderId,url:event.request.url,method:event.request.method,allowed:false,preflight};
    if(issuerTraffic && event.type==='Script' && event.initiator?.type==='parser' &&
       event.initiator.url===event.documentURL && event.loaderId)entry.issuerParser={url:event.documentURL,loaderId:event.loaderId};
    if(!entry.frameId){
@@ -192,6 +206,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   function closeGuard(){
    if(closed)return;
    closed=true;
+   compressedDecisions?.close();
    signal?.removeEventListener('abort',closeGuard);
    for(const wait of pendingPauses.values())invalidateFrameWait(wait);
    pendingPauses.clear();retired.clear();
@@ -203,6 +218,10 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   if(signal?.aborted){closeGuard();return refuse();}
   session.on('Fetch.requestPaused',async event=>{
    const networkId=event.networkId,original=networkId?requests.get(networkId):undefined;
+   if(compressedDecisions?.duplicatePause(event.requestId,networkId)){
+    if(!closed)onFailure('BROWSER_GUARD_RESPONSE_PAIR_DUPLICATE');
+    return;
+   }
    const repeated=pendingPauses.get(event.requestId);
    const fetchReadId='fetch:'+event.requestId,networkReadId='network:'+networkId;
    const decisionRead=()=>readingDecisions.get(fetchReadId)??readingDecisions.get(networkReadId);
@@ -215,6 +234,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
    let reason:RedirectGuardFailure='BROWSER_GUARD_RESPONSE_PAIR_NETWORK_ID';
    let waitingClaim:FrameWait|undefined;
    let capturedDecision:Request|undefined;
+   let compressedRelease:(()=>void)|undefined;
    try{
     if(repeated || original?.frameWait){
      reason='BROWSER_GUARD_RESPONSE_PAIR_DUPLICATE';
@@ -291,8 +311,9 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
     reason='BROWSER_GUARD_RESPONSE_PAIR_FRAME';
     if(original.frameId!==event.frameId)return refuse();
     if(original.issuerDecision && status===200 && event.resourceType==='Document'){
-     const size=issuerDecisionLength(event.responseHeaders);
-     if(size!==undefined){
+     const policy=issuerDecisionPolicy(event.responseHeaders);
+     if(policy?.kind==='identity'){
+      const {size}=policy;
       // Chromium may retire the old renderer when CRes starts navigating. Read
       // the measured bytes from this exact response pause before releasing it.
       reason='BROWSER_GUARD_RESPONSE_ISSUER_DECISION';
@@ -316,20 +337,29 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
       if(bytes.length!==size)return refuse();
       capturedDecision=original.issuerDecision;
       issuerDecisionBodies.set(capturedDecision,bytes);
+     }else if(policy?.kind==='compressed'&&compressedDecisions&&original.loaderId){
+      reason='BROWSER_GUARD_RESPONSE_ISSUER_DECISION';
+      const capture=compressedDecisions.observe({id:networkId,fetchId:event.requestId,frameId:original.frameId,
+       loaderId:original.loaderId,url:original.url,encodedLength:policy.size});
+      issuerDecisionBodies.set(original.issuerDecision,capture.body);
+      compressedRelease=capture.released;
      }
     }
     requests.delete(networkId);
     reason='BROWSER_GUARD_RESPONSE_RESUME';
     await session.send('Fetch.continueResponse',{requestId:event.requestId});
+    compressedRelease?.();
    }catch{
     if(capturedDecision)issuerDecisionBodies.delete(capturedDecision);
+    if(compressedRelease&&networkId)compressedDecisions?.invalidate(networkId);
     // Fetch.getResponseBody owns the paused request until it settles. On timeout
     // report failure without resuming it or racing that command with failRequest.
     try{if(!decisionRead())await session.send('Fetch.failRequest',{requestId:event.requestId,errorReason:'BlockedByClient'});}
     catch{}finally{onFailure(reason);}
    }finally{if(waitingClaim)pendingPauses.delete(event.requestId);}
   });
-  await session.send('Network.enable');
+  if(compressedDecisions)await compressedDecisions.enable();
+  else await session.send('Network.enable');
   await session.send('Fetch.enable',{patterns:patterns.map(urlPattern=>({urlPattern,requestStage:'Response' as const}))});
   return {session,requests,waitForEvent};
  }
