@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
-import {mkdtempSync,readFileSync,rmSync} from 'node:fs';
+import {lstatSync,mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
 import {createServer} from 'node:https';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -11,10 +11,12 @@ import {chromium,type Frame,type Request,type Response,type Route} from '@playwr
 import {initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 // @ts-ignore Native Node executes the guarded response source.
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
-// @ts-ignore Native Node executes the same anonymizer as the dedicated worker.
-import {anonymizeIssuerDecisionReplay} from './stripe-billing-initial-3ds-replay-fixture.ts';
+// @ts-ignore Native Node executes the same private writer as the dedicated worker.
+import {prepareIssuerReplayCapture} from './stripe-billing-initial-3ds-replay-capture.ts';
+import type {IssuerReplayCapture} from './stripe-billing-initial-3ds';
+import type {IssuerReplayStatus} from './stripe-billing-initial-3ds-terminal';
 
-type CaptureSource=Parameters<NonNullable<Parameters<typeof initial3dsChallenge>[0]['captureRefusedIssuerFixture']>>[0];
+type CaptureSource=Parameters<IssuerReplayCapture['save']>[0];
 
 async function serveIssuerResponse(url:URL,bytes:Buffer,encoding:string,chunked:boolean,script=false){
  const directory=mkdtempSync(join(tmpdir(),'billing-decision-tls-'));
@@ -89,9 +91,14 @@ const externalWithLabelledCompanion='a CRes form written by an external script b
 const externalWithStrictCompanion='a CRes form written by an external script beside the strict JSON control';
 const externalWithFoldedCompanion='a CRes form written by an external script beside folded Base64 JSON';
 const captureFoldedCompanion='a CRes refusal with opt-in to its anonymized paired fixture';
+const captureMaskedLayout='a CRes refusal with opt-in and an outer language attribute';
+const captureMissingDecision='a CRes refusal with opt-in and no CDP decision receipt';
 const captureMissingReceipt='a CRes refusal with opt-in and no paired fixture receipt';
 const captureAbortFailure='a CRes refusal with opt-in and no confirmed abort for the fixture';
-const fixtureCaptureModes=new Set([captureFoldedCompanion,captureMissingReceipt,captureAbortFailure]);
+const captureOutcomes=new Map<string,IssuerReplayStatus>([
+ [captureFoldedCompanion,'CAPTURED'],[captureMaskedLayout,'STRUCTURAL_ONLY'],[captureMissingDecision,'DECISION_RECEIPT_MISSING'],
+ [captureMissingReceipt,'SCRIPT_RECEIPT_MISSING'],[captureAbortFailure,'ABORT_UNCONFIRMED'],
+]);
 const externalNested='a CRes form written by an external script under a nonstructural parent';
 const externalUnknown='a CRes form from an unsupported external DOM builder';
 const externalMismatch='a CRes form beside identified JSON data with different expected POST bytes';
@@ -132,7 +139,7 @@ const refusedFollowups=new Map([
  [externalWithAssignmentCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_ASSIGN_JSON'],
  [externalWithLabelledCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_SHAPE_AJNSA'],
  [externalWithFoldedCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON'],
- ...[...fixtureCaptureModes].map(mode=>[mode,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON'] as const),
+ ...[...captureOutcomes.keys()].map(mode=>[mode,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON'] as const),
  [issuerCresDestination,'BROWSER_CHALLENGE_CRES_DESTINATION'],
  [oversizedDecision,'BROWSER_CHALLENGE_CRES_DECISION_SIZE'],
  [invalidUtf8Decision,'BROWSER_CHALLENGE_CRES_DECISION_UTF8'],
@@ -156,7 +163,8 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const namedForm=mode===namedDecisionCres;
  const literalForm=[literalDecisionCres,insertionDecisionCres,literalBodyMismatch].includes(mode);
  const dynamicForm=mode===dynamicDecisionCres;
- const captureEnabled=fixtureCaptureModes.has(mode);
+ const captureEnabled=captureOutcomes.has(mode);
+ const missingDecisionReceipt=mode===uncapturedDecision||mode===captureMissingDecision;
  const foldedCompanion=mode===externalWithFoldedCompanion||captureEnabled;
  const companionReplay=mode===externalWithStrictCompanion||foldedCompanion;
  const externalForm=[externalLiteral,externalGzip,externalHead,externalHeadWithData,externalWithExecutable,
@@ -165,7 +173,8 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   externalNested,externalUnknown,externalMismatch,externalNoReceipt,externalInvalidUtf8].includes(mode)||companionReplay;
  const submitsCres=Boolean(compressed)||[decisionCres,isolatedDecisionCres,namedDecisionCres,lateDecisionCres,lateDecisionHeaders,uncapturedDecision,
   changedCresAction,changedCresBody,unsupportedCresForm,issuerCresDestination].includes(mode)||literalForm||dynamicForm||externalForm;
- const isolated=mode===isolatedDecisionCres||namedForm||literalForm||dynamicForm||externalForm||compressed||mode===lateDecisionHeaders||mode==='separate issuer process';
+ const isolated=mode===isolatedDecisionCres||namedForm||literalForm||dynamicForm||
+  (externalForm&&!missingDecisionReceipt)||compressed||mode===lateDecisionHeaders||mode==='separate issuer process';
  const submitsSecondDecision=mode===secondDecisionPost||submitsCres;
  const rejectedAsset=rejectedAssets.get(mode);
  const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||loadsScript||loadsDecisionScript||submitsSecondDecision||Boolean(rejectedAsset);
@@ -255,7 +264,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   mode===externalWithCommentCompanion?`<!doctype html><body>${jsonWithId('fixture-data','<!-- {&quot;fixture&quot;:true} -->')}${externalTag}</body>`:
   mode===externalWithAssignmentCompanion?`<!doctype html><body>${jsonWithId('fixture-data','window.fixture = {"fixture":true};')}${externalTag}</body>`:
   mode===externalWithLabelledCompanion?`<!doctype html><body>${jsonWithId('fixture-data','fixture label: {"fixture":true};')}${externalTag}</body>`:
-  companionReplay?`<!doctype html><body>${jsonWithId('fixture-data',replayCompanion)}${externalTag}</body>`:
+  companionReplay?`<!doctype html>${mode===captureMaskedLayout?'<html lang="en">':''}<body>${jsonWithId('fixture-data',replayCompanion)}${externalTag}</body>`:
   mode===externalMismatch?`<!doctype html><body>${jsonWithId('fixture-data')}${externalTag}</body>`:
   mode===externalNested?`<!doctype html><body><div>${externalTag}</div></body>`:
   `<!doctype html><body>${externalTag}</body>`;
@@ -307,6 +316,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  ]}).catch(async error=>{await networkFixture?.close();throw error;});
  const stop=new AbortController();
  let attendance:Promise<boolean>|undefined;
+ let captureDirectory:string|undefined;
  try{
   const context=await browser.newContext({serviceWorkers:'block',acceptDownloads:false,ignoreHTTPSErrors:Boolean(networkFixture)});
   const page=await context.newPage(),forwarded:string[]=[],refusals:string[]=[];
@@ -316,6 +326,16 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   let lateHeadersObserved=false,decisionBodyCaptured=false,scriptBodyCaptured=false,scriptBodyRequested=false;
   let abortConfirmed=false,captureCalls=0;
   let captureAfterAbort=false,capturedSource:CaptureSource|undefined;
+  const captureStages:IssuerReplayStatus[]=[];
+  let captureWriter:ReturnType<typeof prepareIssuerReplayCapture>,captureFile:string|undefined;
+  if(captureEnabled){
+   captureDirectory=realpathSync(mkdtempSync(join(tmpdir(),'billing-challenge-capture-')));
+   const id='11111111-2222-4333-8444-555555555555',run=join(captureDirectory,id);
+   mkdirSync(run,{mode:0o700});
+   writeFileSync(join(run,'owner.lock'),'synthetic\n',{mode:0o600});
+   captureFile=join(run,'issuer-replay-fixture.private.json');
+   captureWriter=prepareIssuerReplayCapture(id,id,captureDirectory);
+  }
   const captureDone=Promise.withResolvers<void>();
   page.on('response',response=>{
    if(assetUrls.includes(response.url()))passiveResponses.push(response);
@@ -351,7 +371,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    },
    authorizeIssuerDecision:async request=>{
     authorized.push(request.url());
-    if(mode===uncapturedDecision)await guard.authorize(request);
+    if(missingDecisionReceipt)await guard.authorize(request);
     else{
      assert.ok(guard.authorizeIssuerDecision);
      await guard.authorizeIssuerDecision(request);
@@ -375,10 +395,14 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
     authorized.push(request.url());
     await guard.authorizeIssuerResult(request,document);
    },
-   captureRefusedIssuerFixture:captureEnabled?source=>{
-    captureCalls++;
-    captureAfterAbort=abortConfirmed;
-    capturedSource=source;
+   issuerReplay:captureWriter?{
+    save:source=>{
+     captureCalls++;
+     captureAfterAbort=abortConfirmed;
+     capturedSource=source;
+     return captureWriter!(source);
+    },
+    report:stage=>captureStages.push(stage),
    }:undefined,
    approvedIssuerOrigin,authorizeResponse:async request=>{
     authorized.push(request.url());
@@ -518,12 +542,17 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    assert.equal(request.method(),'POST');
    assert.equal(request.isNavigationRequest(),true);
    assert.equal(request.existingResponse(),null);
+   // Chromium can return invalid source as exact bytes or lossy decoded text.
+   assert.equal(refusals[0],mode===externalInvalidUtf8&&scriptBodyCaptured?
+    'BROWSER_CHALLENGE_CRES_SCRIPT_UTF8':refusedFollowups.get(mode));
    if(companionReplay){
     assert.deepEqual(request.postDataBuffer(),replayWire);
     if(captureEnabled)await captureDone.promise;
-    assert.equal(scriptBodyRequested,mode===captureFoldedCompanion||mode===captureMissingReceipt);
-    assert.equal(captureCalls,mode===captureFoldedCompanion?1:0);
-    if(mode===captureFoldedCompanion){
+    const saved=mode===captureFoldedCompanion||mode===captureMaskedLayout;
+    assert.equal(scriptBodyRequested,saved||mode===captureMissingReceipt);
+    assert.equal(captureCalls,saved?1:0);
+    assert.equal(captureStages.at(-1),captureOutcomes.get(mode));
+    if(saved){
      assert.ok(capturedSource);
      assert.equal(captureAfterAbort,true);
      assert.deepEqual(Buffer.from(capturedSource.html),decisionBytes);
@@ -531,17 +560,18 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
      assert.equal(capturedSource.documentUrl,decision);
      assert.equal(capturedSource.scriptUrl,decisionAsset);
      assert.equal(capturedSource.frameName,issuerName);
-     assert.ok(anonymizeIssuerDecisionReplay(capturedSource));
-    }
+     assert.equal(lstatSync(captureFile!).mode&0o777,0o600);
+     const artifact=readFileSync(captureFile!,'utf8');
+     assert.equal(JSON.parse(artifact).status,captureOutcomes.get(mode));
+     assert.doesNotMatch(artifact,/reviewed-test-issuer|stripe-challenge-frame|fixture-decision\.js/);
+    }else if(captureFile)assert.throws(()=>lstatSync(captureFile),{code:'ENOENT'});
    }
-   // Chromium can return invalid source as exact bytes or lossy decoded text.
-   assert.equal(refusals[0],mode===externalInvalidUtf8&&scriptBodyCaptured?
-    'BROWSER_CHALLENGE_CRES_SCRIPT_UTF8':refusedFollowups.get(mode));
-   if(submitsCres&&mode!==issuerCresDestination)assert.equal(decisionBodyCaptured,mode!==oversizedDecision);
+   if(submitsCres&&mode!==issuerCresDestination)assert.equal(decisionBodyCaptured,mode!==oversizedDecision&&!missingDecisionReceipt);
    if(networkFixture)assert.equal(networkFixture.requests(),1);
    if(externalForm&&mode!==externalInvalidUtf8)assert.equal(scriptBodyCaptured,
     ![externalNoReceipt,externalNested,externalWithExecutable,externalWithInvalidCompanion,externalWithCommentCompanion,
-     externalWithAssignmentCompanion,externalWithLabelledCompanion,externalWithFoldedCompanion,captureMissingReceipt,captureAbortFailure].includes(mode));
+     externalWithAssignmentCompanion,externalWithLabelledCompanion,externalWithFoldedCompanion,
+     captureMissingDecision,captureMissingReceipt,captureAbortFailure].includes(mode));
    assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision,...(externalForm?[decisionAsset]:[])]);
    assert.deepEqual(authorized,forwarded);
    assert.equal(gestures,1);
@@ -596,7 +626,9 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   }
  }finally{
   stop.abort();
-  try{await browser.close();}finally{await networkFixture?.close();}
+  try{await browser.close();}finally{
+   try{await networkFixture?.close();}finally{if(captureDirectory)rmSync(captureDirectory,{recursive:true,force:true});}
+  }
   if(blocksPassiveAsset||rejectedAsset||badMime){
    assert.equal(browser.isConnected(),false);
    if(attendance)assert.equal(await attendance,false);

@@ -42,18 +42,36 @@ test('locate the exact external script for evidence while refusing the invalid J
  assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON']);
 });
 
+test('locate a refused folded companion beside ordinary markup or a second inert data block',()=>{
+ const folded=jsonBlock('eyJma\nXh0dXJlIjp0cnVlfQ==',' id="fixture-data"');
+ for(const html of [
+  '<!doctype html><html lang="en"><head>'+externalTag+folded+'</head></html>',
+  '<!doctype html><html><head><script type="application/ld+json">{}</script>'+externalTag+folded+'</head></html>',
+  '<!doctype html><html><head>'+externalTag+folded+'</head><body><div hidden></div></body></html>',
+ ]){
+  const reports:string[]=[],locations:unknown[]=[];
+  assert.equal(issuerResultForm(html,undefined,code=>reports.push(code),decisionUrl,ref=>locations.push(ref)),undefined);
+  assert.deepEqual(reports,['BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON']);
+  assert.deepEqual(locations,[{placement:'head',scriptUrl:'https://reviewed-test-issuer.stripe.com/fixture/result.js'}]);
+  assert.equal(issuerResultForm(html.replace(folded,jsonBlock('{"fixture":true}')),undefined,undefined,decisionUrl),undefined);
+ }
+});
+
 test('offer no evidence locator when the external layout, ownership or source is ambiguous',()=>{
  const companion=jsonBlock('not valid JSON');
  for(const html of [
   externalTag+companion+external('/second.js'),
   externalTag+companion+'<script>anotherProducer()</script>',
+  '<script language="javascript">anotherProducer()</script>'+externalTag+companion,
+  '<script type="importmap">{"imports":{}}</script>'+externalTag+companion,
   external('/fixture/result.js?alternative=1')+companion,
   external('/result.js',' defer')+companion,
-  '<!doctype html><body>'+externalTag+companion+'<div></div></body>',
   '<!doctype html><body><div>'+externalTag+'</div>'+companion+'</body>',
   externalTag+jsonBlock(''),
  ]){
-  assert.equal(issuerResultForm(html,undefined,undefined,decisionUrl,()=>assert.fail('unproved external source')),undefined);
+  const locations:unknown[]=[];
+  assert.equal(issuerResultForm(html,undefined,undefined,decisionUrl,ref=>locations.push(ref)),undefined);
+  assert.deepEqual(locations,[]);
  }
 });
 

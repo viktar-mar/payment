@@ -45,7 +45,7 @@ test('the replay capture is off by default and must name the exact fresh run',()
 test('record only a fixed unsupported disposition once with private mode',t=>{
  const {root,file}=directory(t);
  const capture=prepareIssuerReplayCapture(runId,runId,root)!;
- capture(raw);
+ assert.equal(capture(raw),'UNSUPPORTED');
  const written=readFileSync(file,'utf8');
  assert.deepEqual(JSON.parse(written),{status:'UNSUPPORTED'});
  assert.equal(lstatSync(file).mode&0o777,0o600);
@@ -57,7 +57,7 @@ test('record only a fixed unsupported disposition once with private mode',t=>{
 
 test('write the paired synthetic replay and strict control without original values',t=>{
  const {root,file}=directory(t);
- prepareIssuerReplayCapture(runId,runId,root)!(pairedSource(foldedCompanion));
+ assert.equal(prepareIssuerReplayCapture(runId,runId,root)!(pairedSource(foldedCompanion)),'CAPTURED');
  const record=readFileSync(file,'utf8');
  const {status,fixture}=JSON.parse(record);
  assert.equal(status,'CAPTURED');
@@ -74,7 +74,7 @@ test('write only safe categories for an unsupported multiline companion and form
  const {root,file}=directory(t);
  const script='const privateForm=document.createElement("form");privateForm.submit();';
  const source=pairedSource('first-key = private-canary\nsecond-key = private-canary',script);
- prepareIssuerReplayCapture(runId,runId,root)!(source);
+ assert.equal(prepareIssuerReplayCapture(runId,runId,root)!(source),'STRUCTURAL_ONLY');
  const record=readFileSync(file,'utf8');
  const {status,shape}=JSON.parse(record);
  assert.equal(status,'STRUCTURAL_ONLY');
@@ -103,7 +103,7 @@ test('never follow an output symlink, overwrite an existing artifact or use a di
  const previous=join(root,'previous');
  writeFileSync(previous,'preserved',{mode:0o600});
  symlinkSync(previous,file);
- prepareIssuerReplayCapture(runId,runId,root)!(raw);
+ assert.equal(prepareIssuerReplayCapture(runId,runId,root)!(raw),'STORAGE_FAILED');
  assert.equal(readFileSync(previous,'utf8'),'preserved');
  assert.ok(lstatSync(file).isSymbolicLink());
  rmSync(file);
@@ -123,7 +123,7 @@ test('require the private run directory and a named private owner lock',t=>{
  const {root,run,file}=directory(t);
  const lock=join(run,'owner.lock');
  rmSync(lock);
- prepareIssuerReplayCapture(runId,runId,root)!(raw);
+ assert.equal(prepareIssuerReplayCapture(runId,runId,root)!(raw),'STORAGE_UNVERIFIED');
  assert.throws(()=>lstatSync(file),{code:'ENOENT'});
  const foreign=join(root,'elsewhere');
  writeFileSync(foreign,'foreign',{mode:0o600});

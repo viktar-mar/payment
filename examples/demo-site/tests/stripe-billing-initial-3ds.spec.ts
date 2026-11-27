@@ -4,7 +4,7 @@ import {test} from '@playwright/test';
 import {createOwnedBillingInitial3ds} from '../../../infrastructure/stripe-billing-acceptance.mjs';
 import {snapshotBillingAcceptanceEnvironment} from '../../../infrastructure/stripe-billing-acceptance-options.mjs';
 import {billingRunSettingsAllowed} from './support/stripe-billing-failed-renewal-settings';
-import {runInitial3dsCase} from './support/stripe-billing-initial-3ds-terminal';
+import {recordInitial3dsReplayStatus,runInitial3dsCase,type IssuerReplayStatus} from './support/stripe-billing-initial-3ds-terminal';
 import {loadFailedRenewalStaticOriginMatcher} from './support/stripe-billing-failed-renewal-static-origin-pin';
 import {loadPinnedInitial3dsIssuerOrigin} from './support/stripe-billing-initial-3ds-issuer-pin';
 import {runBillingInitial3dsBrowser} from './support/stripe-billing-acceptance';
@@ -28,15 +28,21 @@ test.beforeAll(async({},info)=>{
     approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_3ds'});
 });
 test('OWNED_INITIAL_3DS',async({browser},info)=>{
-  await runInitial3dsCase(owner,async(port,limits)=>{
-    const runId=port.resources().runId;
-    if(!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(runId))throw Error('billing_BROWSER');
-    const controller=new AbortController(),signal=limits.signal?AbortSignal.any([limits.signal,controller.signal]):controller.signal;
-    const operator=await openProfileOperator({rehearsal:false,mode:'challenge',onAbandon:()=>controller.abort(),
-      handoffPath:join(info.project.outputDir,runId,'operator.html')});
-    try{
-      return await runBillingInitial3dsBrowser(browser,port,{...limits,signal},l=>operator.wait('challenge',l),
-        loadFailedRenewalStaticOriginMatcher(),loadPinnedInitial3dsIssuerOrigin(),captureRefusedIssuerFixture);
-    }finally{controller.abort();await operator.close();}
-  },info.annotations);
+  let replayStatus:IssuerReplayStatus|undefined;
+  const issuerReplay=captureRefusedIssuerFixture?{
+    save:captureRefusedIssuerFixture,report:(status:IssuerReplayStatus)=>{replayStatus=status;},
+  }:undefined;
+  try{
+    await runInitial3dsCase(owner,async(port,limits)=>{
+      const runId=port.resources().runId;
+      if(!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(runId))throw Error('billing_BROWSER');
+      const controller=new AbortController(),signal=limits.signal?AbortSignal.any([limits.signal,controller.signal]):controller.signal;
+      const operator=await openProfileOperator({rehearsal:false,mode:'challenge',onAbandon:()=>controller.abort(),
+        handoffPath:join(info.project.outputDir,runId,'operator.html')});
+      try{
+        return await runBillingInitial3dsBrowser(browser,port,{...limits,signal},l=>operator.wait('challenge',l),
+          loadFailedRenewalStaticOriginMatcher(),loadPinnedInitial3dsIssuerOrigin(),issuerReplay);
+      }finally{controller.abort();await operator.close();}
+    },info.annotations);
+  }finally{recordInitial3dsReplayStatus(info.annotations,replayStatus);}
 });

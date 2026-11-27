@@ -5,7 +5,7 @@ import {fileURLToPath} from 'node:url';
 import type {TestCase,TestResult,FullResult} from '@playwright/test/reporter';
 import {createOwnedBillingInitial3ds} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 // @ts-ignore Offline tests execute the same worker and reporter modules.
-import {challengeTerminalLine,runInitial3dsCase} from './stripe-billing-initial-3ds-terminal.ts';
+import {challengeTerminalLine,recordInitial3dsReplayStatus,runInitial3dsCase} from './stripe-billing-initial-3ds-terminal.ts';
 // @ts-ignore Offline tests execute the same worker and reporter modules.
 import Reporter from './stripe-billing-initial-3ds-reporter.ts';
 
@@ -18,6 +18,18 @@ test('ordinary discovery excludes the challenge and its synthetic checks',async(
  assert.match(isolated,/workers:1,retries:0/);assert.match(isolated,/trace:'off',video:'off',screenshot:'off'/);
  assert.match(entry,/PAYMENT_STRIPE_BILLING_CASE!=='initial_3ds'/);
  assert.ok(entry.indexOf('owner=await createOwnedBillingInitial3ds')<entry.indexOf('async({browser},info)'));
+});
+test('3DS keeps the original refusal when it reports the replay stage',()=>{
+ const checkpoint='BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON';
+ const line='owned_initial_3ds_terminal phase=ACK code='+checkpoint+' cleanup=CONFIRMED';
+ const annotations=[{type:'owned-initial-3ds-terminal',description:line}];
+ recordInitial3dsReplayStatus(annotations,'SCRIPT_RECEIPT_MISSING');
+ const recorded=line+' replay=SCRIPT_RECEIPT_MISSING';
+ assert.deepEqual(annotations,[{type:'owned-initial-3ds-terminal',description:recorded}]);
+ assert.equal(challengeTerminalLine(recorded),recorded);
+ assert.equal(challengeTerminalLine(line+' replay=PRIVATE_CANARY'),null);
+ assert.equal(challengeTerminalLine(recorded+'\n'),null);
+ assert.equal(challengeTerminalLine(line.replace('phase=ACK','phase=LOGIN')+' replay=CAPTURED'),null);
 });
 test('3DS terminal accepts only fixed provisioning diagnostics in the provisioning phase',async()=>{
  const terminal=(phase:string,code:string)=>'owned_initial_3ds_terminal phase='+phase+' code='+code+' cleanup=CONFIRMED';

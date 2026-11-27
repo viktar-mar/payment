@@ -132,6 +132,10 @@ export function challengeApiRequest(url:URL,method:string,data:string|null,key:s
 
 export type WaitForIssuerGesture=(limits:{deadline:number;signal:AbortSignal})=>Promise<void>;
 type RefusedIssuerFixtureSource={html:Uint8Array;script:Uint8Array;documentUrl:string;scriptUrl:string;frameName?:string};
+export type IssuerReplayCapture={
+ save:(source:RefusedIssuerFixtureSource)=>import('./stripe-billing-initial-3ds-replay-capture').IssuerReplayWriteStatus;
+ report:(status:import('./stripe-billing-initial-3ds-terminal').IssuerReplayStatus)=>void;
+};
 interface FrameSnapshot {target:Frame;frames:Map<Frame,string>}
 type Options={
  page:Page;limits:BillingLimits;demo:string;owner:()=>{secret:string;key:string};
@@ -142,7 +146,7 @@ type Options={
  authorizeIssuerDecision?:(req:Request)=>Promise<void>;
  takeIssuerDecisionBody?:(req:Request)=>IssuerDecisionBody|undefined|Promise<IssuerDecisionBody|undefined>;
  authorizeIssuerResult?:(req:Request,document:Request)=>Promise<void>;
- captureRefusedIssuerFixture?:(source:RefusedIssuerFixtureSource)=>void|Promise<void>;
+ issuerReplay?:IssuerReplayCapture;
  stripeFrames:(req:Request)=>FrameSnapshot|undefined;waitForGesture:WaitForIssuerGesture;
  approvedIssuerOrigin?:string;
 };
@@ -151,7 +155,7 @@ function sameChain(a:FrameSnapshot|undefined,b:FrameSnapshot|undefined){
 }
 
 /** Scoped to one original v2 session. Only Stripe.js sends requests and only the issuer UI completes the challenge. */
-export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,authorizeIssuerScript,takeIssuerScriptBody,authorizeIssuerDecision,takeIssuerDecisionBody,authorizeIssuerResult,captureRefusedIssuerFixture:sanitizeRefusedIssuerFixture,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
+export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,authorizeIssuerScript,takeIssuerScriptBody,authorizeIssuerDecision,takeIssuerDecisionBody,authorizeIssuerResult,issuerReplay,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
  requireValue(approvedIssuerOrigin===undefined||isApprovedIssuerOrigin(approvedIssuerOrigin));
  let retrieve:Request|undefined,authenticate:Request|undefined,admittedAuthenticate:Request|undefined;
  let completed=false,finalRead=false,initialIssuerDispatched=false,boundSource:string|undefined;
@@ -277,17 +281,26 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    const html=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
    report('BROWSER_CHALLENGE_CRES_FORM_PARSE');
    const documentUrl=request.url();
-   const locateRefusal=capturedDecision&&sanitizeRefusedIssuerFixture&&takeIssuerScriptBody&&
+   const locateRefusal=capturedDecision&&issuerReplay&&takeIssuerScriptBody&&
     new URL(documentUrl).origin===approvedIssuerOrigin;
    let refusedScriptUrl:string|undefined;
-   const source=issuerResultForm(html,frameName,report,documentUrl,locateRefusal?script=>{refusedScriptUrl=script.scriptUrl;}:undefined);
-   if(!source&&refusedScriptUrl){
-    try{
+   let companionRejected=false;
+   const source=issuerResultForm(html,frameName,code=>{
+    companionRejected=code.startsWith('BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_');
+    report(code);
+   },documentUrl,locateRefusal?script=>{refusedScriptUrl=script.scriptUrl;}:undefined);
+   if(!source&&companionRejected&&issuerReplay){
+    if(!capturedDecision)issuerReplay.report('DECISION_RECEIPT_MISSING');
+    else if(!refusedScriptUrl)issuerReplay.report('SCRIPT_REFERENCE_UNPROVED');
+    else try{
+     issuerReplay.report('SCRIPT_SLOT_UNVERIFIED');
      const script=matchingDecisionScript(refusedScriptUrl);
      requireValue(script);
      // Finish checking the already forwarded asset before the owner records the refusal.
+     issuerReplay.report('SCRIPT_FORWARD_UNCONFIRMED');
      await script.forwarded;
      billingCheck(active);
+     issuerReplay.report('FRAME_UNVERIFIED');
      await check();
      billingCheck(active);
      const result=route.request(),target=original.target;
@@ -296,6 +309,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
       issuerResult?.request===result && issuerResult.state==='pending' && !completed && !finalRead &&
       script.request.frame()===target && matchingDecisionScript(refusedScriptUrl)===script);
      refusedFixture={route,result,decision:request,script:script.request,html:bytes,frameName,deadline:active.deadline};
+     issuerReplay.report('ABORT_NOT_STARTED');
     }catch{/* Keep the parser's original refusal and checkpoint. */}
    }
    requireValue(source);
@@ -319,22 +333,33 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   },2000);
  }
  function captureRefusedIssuerFixture(route:Route,abortRoute:()=>Promise<void>){
-  const fixture=refusedFixture,takeScript=takeIssuerScriptBody,sanitize=sanitizeRefusedIssuerFixture;
-  if(!fixture||fixture.route!==route||fixture.result!==route.request()||!takeScript||!sanitize)return;
+  const fixture=refusedFixture,takeScript=takeIssuerScriptBody,replay=issuerReplay;
+  if(!fixture||fixture.route!==route||fixture.result!==route.request()||!takeScript||!replay)return;
   refusedFixture=undefined;
+  replay.report('ABORT_UNCONFIRMED');
   const blocked=Promise.resolve().then(abortRoute);
   void blocked.catch(()=>{});
   return billingBounded({deadline:fixture.deadline,signal:limits.signal},async active=>{
    // Consume this receipt once the original CRes route has been blocked.
    await blocked;
    billingCheck(active);
+   replay.report('SCRIPT_SLOT_UNVERIFIED');
    const scriptUrl=fixture.script.url();
    if(matchingDecisionScript(scriptUrl)?.request!==fixture.script)return;
-   const script=await takeScript(fixture.script,fixture.decision);
+   replay.report('SCRIPT_RECEIPT_MISSING');
+   const receipt=takeScript(fixture.script,fixture.decision);
+   if(!receipt)return;
+   replay.report('SCRIPT_READ_UNCONFIRMED');
+   const script=await receipt;
    billingCheck(active);
-   if(!(script instanceof Uint8Array)||script.byteLength===0||script.byteLength>65536||
-      matchingDecisionScript(scriptUrl)?.request!==fixture.script)return;
-   await sanitize({html:fixture.html,script,documentUrl:fixture.decision.url(),scriptUrl,frameName:fixture.frameName});
+   if(script==='BROWSER_CHALLENGE_CRES_DECISION_READ')return;
+   if(!(script instanceof Uint8Array)||script.byteLength===0||script.byteLength>65536){
+    replay.report('SCRIPT_SIZE_REJECTED');return;
+   }
+   replay.report('SCRIPT_SLOT_UNVERIFIED');
+   if(matchingDecisionScript(scriptUrl)?.request!==fixture.script)return;
+   replay.report('SANITIZE_FAILED');
+   replay.report(replay.save({html:fixture.html,script,documentUrl:fixture.decision.url(),scriptUrl,frameName:fixture.frameName}));
   },750).catch(()=>{});
  }
  // Descriptive only. Capture the refused frame shape, then read only the

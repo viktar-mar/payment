@@ -162,6 +162,22 @@ test('the shape witness is bounded and requires the paired script URL',()=>{
  assert.equal(describeIssuerDecisionReplay({...variant,scriptUrl:'https://private-unpaired.example.test/script.js'}),undefined);
 });
 
+test('report structural evidence for a paired refusal on a page with additional inert markup',()=>{
+ const source=capture('fixture-hidden-one');
+ const html=Buffer.from(source.html.toString().replace('<html>','<html lang="private-language">')
+  .replace('<head>','<head><script type="application/ld+json">{"fixture":"private-metadata"}</script>')
+  .replace('</body>','<div data-fixture="private-value"></div></body>'));
+ const variant={...source,html};
+ assert.equal(anonymizeIssuerDecisionReplay(variant),undefined);
+ const witness=describeIssuerDecisionReplay(variant);
+ assert.ok(witness);
+ assert.equal(witness.checkpoint,foldCheckpoint);
+ assert.equal(witness.producerPlacement,'head');
+ assert.equal(witness.scriptProof,'PROVEN');
+ assert.equal(witness.layout.filter(node=>node.element==='COMPANION').length,2);
+ assert.doesNotMatch(JSON.stringify(witness),/private-|fixture-hidden-one/);
+});
+
 test('the shape witness retains the grammar checkpoint for a paired non-JSON payload',()=>{
  const source=capture('fixture-hidden-one');
  const opaque=Buffer.from('private-not-json?').toString('base64');

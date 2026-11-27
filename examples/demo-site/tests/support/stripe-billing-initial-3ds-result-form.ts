@@ -170,13 +170,13 @@ function documentElementRejection(element:Element):LayoutRejection|undefined{
  }else if(element.attrs.length!==0)return 'EXTERNAL_LAYOUT_ATTRIBUTES';
 }
 
-function companionStructureRejection({node}:ScriptElement):CompanionRejection|undefined{
+function companionStructureRejection({node}:ScriptElement,allowJsonLd=false):CompanionRejection|undefined{
  const placement=node.parentNode?.nodeName,location=node.sourceCodeLocation;
  if(placement!=='head'&&placement!=='body')return 'EXTERNAL_COMPANION_PARENT';
  if(!location?.startTag||!location.endTag)return 'EXTERNAL_COMPANION_TAG';
  const type=attribute(node,'type');
  if(type===undefined)return 'EXTERNAL_COMPANION_TYPE_MISSING';
- if(type!=='application/json'){
+ if(type!=='application/json'&&!(allowJsonLd&&type==='application/ld+json')){
   switch(normalizedScriptType(type)){
    case 'application/json':return 'EXTERNAL_COMPANION_TYPE_JSON_VARIANT';
    case 'application/ld+json':return 'EXTERNAL_COMPANION_TYPE_JSON_LD';
@@ -458,9 +458,11 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
    if(rejection){
     if(locateRefusedScript&&rejection.startsWith('EXTERNAL_COMPANION_JSON_')&&
        rejection!=='EXTERNAL_COMPANION_JSON_EMPTY'&&rejection!=='EXTERNAL_COMPANION_JSON_FORMAT_LIMIT'&&
-       companions.every(script=>!companionStructureRejection(script))){
+       companions.every(script=>!companionStructureRejection(script,true))){
      try{
-      const reference=externalScriptReference(external,external.src,documentUrl,layout);
+      // Evidence still requires the claimed script's exact network receipt.
+      // The outer markup is relevant to admission, which remains refused here.
+      const reference=externalScriptReference(external,external.src,documentUrl,undefined);
       if(typeof reference!=='string')locateRefusedScript(reference);
      }catch{/* A diagnostic locator cannot change the original refusal. */}
     }
