@@ -138,6 +138,7 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
  const navigate=(frame:unknown)=>{for(const listener of navigationListeners)listener(frame);};
  const waiters = new Set<{predicate:(r:Response)=>boolean;resolve:(r:Response)=>void;reject:(e:Error)=>void}>();
  function publish(request:Request, status:number, json:object|null) {
+  const cresDecision=fault.startsWith('second-issuer-cres-decision-')&&request.url()===actionUrl;
   const earlyInitial=fault.startsWith('early-static')&&request.url()===select;
   const earlySuccessor=fault.startsWith('successor-static-image')&&request.url().endsWith('/client-session');
   const earlyStatic=((declineRetry||sca||trial)&&earlyInitial)||(declineRetry&&earlySuccessor);
@@ -161,8 +162,17 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     if(fault==='initial-session-wire-json')return Buffer.from('private syntax canary');
     if(fault==='initial-session-wire-object')return Buffer.from('null');
    }
+   if(cresDecision){
+    if(fault==='second-issuer-cres-decision-read')throw Error('private CRes body canary');
+    if(fault==='second-issuer-cres-decision-utf8')return Buffer.from([0xff]);
+   }
    return Buffer.from(JSON.stringify(json));
   },headerValue:async(name:string)=>{
+   if(cresDecision){
+    if(fault==='second-issuer-cres-decision-headers')throw Error('private CRes headers canary');
+    if(name==='content-type')return 'text/html';
+    if(name==='content-encoding')return fault==='second-issuer-cres-decision-encoding'?'gzip':null;
+   }
    if(request.url()==='https://api.stripe.com/v1/3ds2/authenticate'&&name==='content-encoding')
     return fault==='challenge-origin-compressed'?'gzip':null;
    if(name==='content-type')return sessionFailure?.contentType??null;
@@ -309,7 +319,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
     fault==='approved-issuer-block-inspector'?'net::ERR_BLOCKED_BY_CLIENT.Inspector':
     fault==='approved-issuer-block-inspector-lookalike'?'net::ERR_BLOCKED_BY_CLIENT.Inspector.unexpected':'net::ERR_BLOCKED_BY_CLIENT'}),
    serviceWorker:()=>passive&&fault==='approved-issuer-block-worker'?{}:null,
-   sizes:async()=>({responseBodySize:Buffer.byteLength(JSON.stringify(json))}),
+   sizes:async()=>({responseBodySize:fault==='second-issuer-cres-decision-size'&&url===actionUrl?
+    65537:Buffer.byteLength(JSON.stringify(json))}),
    redirectedFrom:()=>null,postData:()=>data,allHeaders:async()=>{
     if(fault==='second-issuer-cres-race'&&url.endsWith('/finish'))
      await wire('https://api.stripe.com/v1/3ds2/challenge_complete',stripeFrame,'source=src_fixture',{}).catch(()=>{});
@@ -814,7 +825,8 @@ function cancellationPage(fault = '', declineRetry = false, sca = false, invoice
    trace.push('issuer witnessed');
    if(fault==='second-issuer-same-form')await wire(actionUrl,issuer,'decision=complete',{},true);
    if(fault==='second-issuer-different-form')await wire(issuerHost+'/test-fixture/finish',issuer,'result=fixture',{},true);
-   if(['second-issuer-cres','second-issuer-foreign-cres','second-issuer-duplicate-cres','second-issuer-bad-padding-cres','second-issuer-cres-race'].includes(fault)){
+   if(fault.startsWith('second-issuer-cres-decision-')||
+      ['second-issuer-cres','second-issuer-foreign-cres','second-issuer-duplicate-cres','second-issuer-bad-padding-cres','second-issuer-cres-race'].includes(fault)){
     const wireCres=JSON.stringify({messageType:'CRes',messageVersion:'2.2.0',threeDSServerTransID:id(90),
      acsTransID:fault==='second-issuer-foreign-cres'?id(92):id(91),transStatus:'Y'});
     const json=fault==='second-issuer-duplicate-cres'?'{"acs\\u0054ransID":"'+id(92)+'",'+wireCres.slice(1):wireCres;
@@ -1542,7 +1554,12 @@ for(const fault of ['none','direct-issuer-valid','late-source-valid','late-issue
 for(const [fault,checkpoint] of [
  ['second-issuer-same-form','BROWSER_CHALLENGE_ISSUER_SUBMISSION_REPEAT'],
  ['second-issuer-different-form','BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
- ['second-issuer-cres','BROWSER_CHALLENGE_ISSUER_SUBMISSION_CRES'],
+ ['second-issuer-cres','BROWSER_CHALLENGE_CRES_DECISION_MEDIA'],
+ ['second-issuer-cres-decision-headers','BROWSER_CHALLENGE_CRES_DECISION_HEADERS'],
+ ['second-issuer-cres-decision-encoding','BROWSER_CHALLENGE_CRES_DECISION_ENCODING'],
+ ['second-issuer-cres-decision-size','BROWSER_CHALLENGE_CRES_DECISION_SIZE'],
+ ['second-issuer-cres-decision-read','BROWSER_CHALLENGE_CRES_DECISION_READ'],
+ ['second-issuer-cres-decision-utf8','BROWSER_CHALLENGE_CRES_DECISION_UTF8'],
  ['second-issuer-foreign-cres','BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
  ['second-issuer-duplicate-cres','BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
  ['second-issuer-bad-padding-cres','BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],

@@ -236,21 +236,36 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   const bytes=await billingBounded(limits,()=>response.body());requireValue(bytes.length<=65536);
   return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)) as unknown;
  }
- async function verifiedIssuerResultForm(request:Request,response:Response){
+ async function verifiedIssuerResultForm(request:Request,response:Response,report:(code:string)=>void){
   return billingBounded(limits,async active=>{
-   const [type,encoding]=await Promise.all([response.headerValue('content-type'),response.headerValue('content-encoding')]);
-   requireValue(response.status()===200 && type && /^text\/html(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i.test(type.trim()) &&
-    (encoding===null||encoding.trim().toLowerCase()==='identity'));
+   // This receipt comes from the exact paired Chromium response pause with
+   // its MIME, identity encoding and byte length already verified.
+   report('BROWSER_CHALLENGE_CRES_DECISION_READ');
    let bytes=takeIssuerDecisionBody?.(request);
    if(!bytes){
-    const {responseBodySize}=await request.sizes();
-    requireValue(Number.isSafeInteger(responseBodySize)&&responseBodySize>0&&responseBodySize<=65536);
+    report('BROWSER_CHALLENGE_CRES_DECISION_HEADERS');
+    const [type,encoding]=await Promise.all([response.headerValue('content-type'),response.headerValue('content-encoding')]);
     billingCheck(active);
+    report('BROWSER_CHALLENGE_CRES_DECISION_MEDIA');
+    requireValue(type && /^text\/html(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i.test(type.trim()));
+    report('BROWSER_CHALLENGE_CRES_DECISION_ENCODING');
+    requireValue(encoding===null||encoding.trim().toLowerCase()==='identity');
+    report('BROWSER_CHALLENGE_CRES_DECISION_SIZE');
+    const {responseBodySize}=await request.sizes();
+    billingCheck(active);
+    requireValue(Number.isSafeInteger(responseBodySize)&&responseBodySize>0&&responseBodySize<=65536);
+    report('BROWSER_CHALLENGE_CRES_DECISION_READ');
     bytes=await response.body();
    }
-   requireValue(bytes.length>0&&bytes.length<=65536);
    billingCheck(active);
-   return issuerResultForm(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
+   report('BROWSER_CHALLENGE_CRES_DECISION_SIZE');
+   requireValue(bytes.length>0&&bytes.length<=65536);
+   report('BROWSER_CHALLENGE_CRES_DECISION_UTF8');
+   const html=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
+   report('BROWSER_CHALLENGE_CRES_FORM');
+   const form=issuerResultForm(html);
+   requireValue(form);
+   return form;
   },2000);
  }
  // Descriptive only. Capture the refused frame shape, then read only the
@@ -308,10 +323,13 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   if(decisionForResult && matchingChallengeResult(binding,observedResultBody)){
    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT');
    sameChain(original,issuerDocumentSnapshot(target,decisionForResult));
-   report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_CRES');
+   report('BROWSER_CHALLENGE_CRES_RESERVATION');
    billingCheck(limits);
    // Reserve before awaiting headers or response bytes so SDK completion sees the pending POST.
-   requireValue(!issuerResult && !completed && !finalRead);
+   report('BROWSER_CHALLENGE_CRES_REPLAY');
+   requireValue(!issuerResult);
+   report('BROWSER_CHALLENGE_CRES_ORDER');
+   requireValue(!completed && !finalRead);
    issuerResult={request,state:'pending'};
   }
   report('BROWSER_CHALLENGE_WINNING');
@@ -490,22 +508,32 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    if(submission){
     report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT');
     const decision=submission;
-    const decisionResponse=issuerResult?.request===request ? await originalResponse(decision,limits,1000) : undefined;
+    let decisionResponse:Response|undefined;
+    if(issuerResult?.request===request){
+     report('BROWSER_CHALLENGE_CRES_DECISION_RESPONSE');
+     decisionResponse=await originalResponse(decision,limits,1000);
+     report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT');
+    }
     sameChain(original,committedIssuerDocument(target,decision,decisionResponse));
     requireValue(headers.origin===new URL(decision.url()).origin);
     const repeat=url.href===decision.url() && typeof data==='string' &&
      data.length<=65536 && createHash('sha256').update(data).digest('hex')===arm?.bodyHash;
     report(repeat?'BROWSER_CHALLENGE_ISSUER_SUBMISSION_REPEAT':'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP');
     requireValue(!repeat && matchingChallengeResult(binding,data));
-    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_CRES');
+    report('BROWSER_CHALLENGE_CRES_DESTINATION');
+    requireValue(url.origin===issuerOrigin);
+    report('BROWSER_CHALLENGE_CRES_REQUEST');
     requireValue(authorizeIssuerResult && decisionResponse && issuerResult?.request===request && data===observedResultBody &&
      request.serviceWorker()===null && !headers['transfer-encoding']);
-    const form=await verifiedIssuerResultForm(decision,decisionResponse);
-    requireValue(form && form.action===url.href && request.postDataBuffer()?.equals(Buffer.from(form.body)));
+    const form=await verifiedIssuerResultForm(decision,decisionResponse,report);
+    report('BROWSER_CHALLENGE_CRES_ACTION');
+    requireValue(form.action===url.href);
+    report('BROWSER_CHALLENGE_CRES_BODY');
+    requireValue(request.postDataBuffer()?.equals(Buffer.from(form.body)));
     await current();
     report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT');
     sameChain(original,committedIssuerDocument(target,decision,decisionResponse));
-    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_CRES');
+    report('BROWSER_CHALLENGE_CRES_ORDER');
     requireValue(!completed && !finalRead);
     await forwardOriginal(()=>authorizeIssuerResult(request,decision));
     return;

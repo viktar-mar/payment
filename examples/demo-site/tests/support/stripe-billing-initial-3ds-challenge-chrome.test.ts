@@ -26,11 +26,21 @@ const secondDecisionPost='a second document POST from the issuer decision';
 const decisionCres='a CRes document POST to the Stripe hooks origin';
 const isolatedDecisionCres='a CRes document POST between isolated issuer and hooks targets';
 const lateDecisionCres='a CRes document POST with late issuer response observation';
+const lateDecisionHeaders='a captured CRes decision with unavailable Playwright headers';
+const uncapturedDecision='a CRes document POST using the paired Playwright response';
 const changedCresAction='a CRes form whose action changed after the issuer response';
 const changedCresBody='a CRes form whose session data changed after the issuer response';
-const refusedFollowups=new Set([secondDecisionPost,changedCresAction,changedCresBody]);
+const unsupportedCresForm='a CRes sent from a form with an unproved control';
+const issuerCresDestination='a CRes sent to the issuer origin';
+const refusedFollowups=new Map([
+ [secondDecisionPost,'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
+ [changedCresAction,'BROWSER_CHALLENGE_CRES_ACTION'],
+ [changedCresBody,'BROWSER_CHALLENGE_CRES_BODY'],
+ [unsupportedCresForm,'BROWSER_CHALLENGE_CRES_FORM'],
+ [issuerCresDestination,'BROWSER_CHALLENGE_CRES_DESTINATION'],
+]);
 const wrongScriptMime='issuer script with the wrong MIME type is refused';
-for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,lateDecisionCres,wrongScriptMime,...refusedFollowups,...rejectedAssets.keys()])
+for(const mode of ['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()])
 test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?mode+' is blocked after the original 2xx':mode===wrongScriptMime?mode:
  'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
@@ -44,8 +54,9 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const blocksPassiveAsset=blocksPassiveImage||blocksPassiveFont||blocksPassiveStylesheet;
  const badMime=mode===wrongScriptMime,loadsScript=mode===parserScript||badMime;
  const loadsDecisionScript=mode===decisionScript;
- const submitsCres=[decisionCres,isolatedDecisionCres,lateDecisionCres,changedCresAction,changedCresBody].includes(mode);
- const isolated=mode===isolatedDecisionCres||mode==='separate issuer process';
+ const submitsCres=[decisionCres,isolatedDecisionCres,lateDecisionCres,lateDecisionHeaders,uncapturedDecision,
+  changedCresAction,changedCresBody,unsupportedCresForm,issuerCresDestination].includes(mode);
+ const isolated=mode===isolatedDecisionCres||mode===lateDecisionHeaders||mode==='separate issuer process';
  const submitsSecondDecision=mode===secondDecisionPost||submitsCres;
  const rejectedAsset=rejectedAssets.get(mode);
  const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||loadsScript||loadsDecisionScript||submitsSecondDecision||Boolean(rejectedAsset);
@@ -56,14 +67,14 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const assetPath=issuerOrigin+(rejectedAsset?.path??(loadsScript?'/fixture-required.js':blocksPassiveStylesheet?'/fixture-passive.css':
   blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png'));
  const decisionAsset=issuerOrigin+'/fixture-decision.js';
- const followup=(submitsCres?'https://hooks.stripe.com':issuerOrigin)+'/fixture-followup';
+ const followup=(submitsCres&&mode!==issuerCresDestination?'https://hooks.stripe.com':issuerOrigin)+'/fixture-followup';
  const observedFollowup=mode===changedCresAction?followup+'-different':followup;
  const fontCount=mode===sixFonts?6:mode===twoFonts?2:1;
  const assetUrls=[assetPath,...Array.from({length:fontCount-1},(_,index)=>issuerOrigin+`/fixture-passive-${index+2}.woff2`)];
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
  const cres=Buffer.from(JSON.stringify({messageType:'CRes',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,transStatus:'Y'})).toString('base64url');
- const followupFields=submitsCres?`<input type="hidden" name="cres" value="${cres}"><input type="hidden" name="threeDSSessionData" value="fixture&amp;session">`:
+ const followupFields=submitsCres?`<input type="${mode===unsupportedCresForm?'text':'hidden'}" name="cres" value="${cres}"><input type="hidden" name="threeDSSessionData" value="fixture&amp;session">`:
   '<input name="result" value="fixture">';
  const followupScript=[
   mode===changedCresAction?'document.forms[0].action='+JSON.stringify(observedFollowup):'',
@@ -137,7 +148,14 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   const passiveRequests:Request[]=[],passiveFailures:Request[]=[],passiveResponses:Response[]=[];
   const passiveAborts:(string|undefined)[]=[],authorized:string[]=[];
   page.on('requestfailed',request=>{if(assetUrls.includes(request.url()))passiveFailures.push(request);});
-  page.on('response',response=>{if(assetUrls.includes(response.url()))passiveResponses.push(response);});
+  let lateHeadersObserved=false,decisionBodyCaptured=false;
+  page.on('response',response=>{
+   if(assetUrls.includes(response.url()))passiveResponses.push(response);
+   if(mode===lateDecisionHeaders&&response.url()===decision){
+    lateHeadersObserved=true;
+    response.headerValue=()=>new Promise<never>(()=>{});
+   }
+  });
   const limits={deadline:Date.now()+15_000,signal:stop.signal};
   let assetErrorRedacted=false;
   let issuerFrame:Frame|undefined,attachedIssuerFrame=false,separateIssuerTarget=false,gestures=0;
@@ -147,10 +165,17 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    authorizeIssuerScript:(request,document)=>guard.authorizeIssuerScript(request,document),
    authorizeIssuerDecision:async request=>{
     authorized.push(request.url());
-    assert.ok(guard.authorizeIssuerDecision);
-    await guard.authorizeIssuerDecision(request);
+    if(mode===uncapturedDecision)await guard.authorize(request);
+    else{
+     assert.ok(guard.authorizeIssuerDecision);
+     await guard.authorizeIssuerDecision(request);
+    }
    },
-   takeIssuerDecisionBody:request=>guard.takeIssuerDecisionBody(request),
+   takeIssuerDecisionBody:request=>{
+    const bytes=guard.takeIssuerDecisionBody(request);
+    if(request.url()===decision&&bytes)decisionBodyCaptured=true;
+    return bytes;
+   },
    authorizeIssuerResult:async(request,document)=>{
     authorized.push(request.url());
     await guard.authorizeIssuerResult(request,document);
@@ -276,7 +301,8 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    assert.equal(request.method(),'POST');
    assert.equal(request.isNavigationRequest(),true);
    assert.equal(request.existingResponse(),null);
-   assert.equal(refusals[0],submitsCres?'BROWSER_CHALLENGE_ISSUER_SUBMISSION_CRES':'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP');
+   assert.equal(refusals[0],refusedFollowups.get(mode));
+   if(submitsCres&&mode!==issuerCresDestination)assert.equal(decisionBodyCaptured,true);
    assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision]);
    assert.deepEqual(authorized,forwarded);
    assert.equal(gestures,1);
@@ -291,7 +317,9 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    passiveAborts:passiveAborts.length,passiveFailures:passiveFailures.length}));}
   assert.equal(attachedIssuerFrame,true);
   if(isolated)assert.equal(separateIssuerTarget,true);
-  if(mode===isolatedDecisionCres){
+  if(mode===lateDecisionHeaders)assert.ok(lateHeadersObserved&&decisionBodyCaptured);
+  if(mode===uncapturedDecision)assert.equal(decisionBodyCaptured,false);
+  if(mode===isolatedDecisionCres||mode===lateDecisionHeaders){
    assert.ok(issuerFrame);
    const target=await context.newCDPSession(issuerFrame);
    try{
