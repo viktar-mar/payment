@@ -131,6 +131,7 @@ export function challengeApiRequest(url:URL,method:string,data:string|null,key:s
 }
 
 export type WaitForIssuerGesture=(limits:{deadline:number;signal:AbortSignal})=>Promise<void>;
+type RefusedIssuerFixtureSource={html:Uint8Array;script:Uint8Array;documentUrl:string;scriptUrl:string;frameName?:string};
 interface FrameSnapshot {target:Frame;frames:Map<Frame,string>}
 type Options={
  page:Page;limits:BillingLimits;demo:string;owner:()=>{secret:string;key:string};
@@ -141,6 +142,7 @@ type Options={
  authorizeIssuerDecision?:(req:Request)=>Promise<void>;
  takeIssuerDecisionBody?:(req:Request)=>IssuerDecisionBody|undefined|Promise<IssuerDecisionBody|undefined>;
  authorizeIssuerResult?:(req:Request,document:Request)=>Promise<void>;
+ captureRefusedIssuerFixture?:(source:RefusedIssuerFixtureSource)=>void|Promise<void>;
  stripeFrames:(req:Request)=>FrameSnapshot|undefined;waitForGesture:WaitForIssuerGesture;
  approvedIssuerOrigin?:string;
 };
@@ -149,12 +151,13 @@ function sameChain(a:FrameSnapshot|undefined,b:FrameSnapshot|undefined){
 }
 
 /** Scoped to one original v2 session. Only Stripe.js sends requests and only the issuer UI completes the challenge. */
-export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,authorizeIssuerScript,takeIssuerScriptBody,authorizeIssuerDecision,takeIssuerDecisionBody,authorizeIssuerResult,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
+export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,authorizeIssuerScript,takeIssuerScriptBody,authorizeIssuerDecision,takeIssuerDecisionBody,authorizeIssuerResult,captureRefusedIssuerFixture:sanitizeRefusedIssuerFixture,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
  requireValue(approvedIssuerOrigin===undefined||isApprovedIssuerOrigin(approvedIssuerOrigin));
  let retrieve:Request|undefined,authenticate:Request|undefined,admittedAuthenticate:Request|undefined;
  let completed=false,finalRead=false,initialIssuerDispatched=false,boundSource:string|undefined;
  let issuer:Frame|undefined,issuerRequest:Request|undefined,submission:Request|undefined,binding:ReturnType<typeof issuerBinding>|undefined;
  let issuerResult:{request:Request;state:'pending'|'forwarded'|'verified'}|undefined;
+ let refusedFixture:{route:Route;result:Request;decision:Request;script:Request;html:Uint8Array;frameName:string;deadline:number}|undefined;
  let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:Promise<void>}|undefined;
  let handoffStarted=false;
  const issuerAssets=()=>({
@@ -236,7 +239,11 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   const bytes=await billingBounded(limits,()=>response.body());requireValue(bytes.length<=65536);
   return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)) as unknown;
  }
- async function verifiedIssuerResultForm(request:Request,response:Response,frameName:string,report:(code:string)=>void){
+ function matchingDecisionScript(scriptUrl:string){
+  const script=decisionAssets.scripts.get(new URL(scriptUrl).pathname);
+  if(decisionAssets.scripts.size===1&&script?.request.url()===scriptUrl)return script;
+ }
+ async function verifiedIssuerResultForm(route:Route,original:FrameSnapshot,request:Request,response:Response,frameName:string,report:(code:string)=>void){
   return billingBounded(limits,async active=>{
    // Chromium binds the receipt to the admitted response. It proves bounded
    // decoded bytes before any CRes form is inspected.
@@ -269,13 +276,34 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    report('BROWSER_CHALLENGE_CRES_DECISION_UTF8');
    const html=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
    report('BROWSER_CHALLENGE_CRES_FORM_PARSE');
-   const source=issuerResultForm(html,frameName,report,request.url());
+   const documentUrl=request.url();
+   const locateRefusal=capturedDecision&&sanitizeRefusedIssuerFixture&&takeIssuerScriptBody&&
+    new URL(documentUrl).origin===approvedIssuerOrigin;
+   let refusedScriptUrl:string|undefined;
+   const source=issuerResultForm(html,frameName,report,documentUrl,locateRefusal?script=>{refusedScriptUrl=script.scriptUrl;}:undefined);
+   if(!source&&refusedScriptUrl){
+    try{
+     const script=matchingDecisionScript(refusedScriptUrl);
+     requireValue(script);
+     // Finish checking the already forwarded asset before the owner records the refusal.
+     await script.forwarded;
+     billingCheck(active);
+     await check();
+     billingCheck(active);
+     const result=route.request(),target=original.target;
+     sameChain(original,committedIssuerDocument(target,request,response));
+     requireValue(!refusedFixture && request===submission && target.name()===frameName &&
+      issuerResult?.request===result && issuerResult.state==='pending' && !completed && !finalRead &&
+      script.request.frame()===target && matchingDecisionScript(refusedScriptUrl)===script);
+     refusedFixture={route,result,decision:request,script:script.request,html:bytes,frameName,deadline:active.deadline};
+    }catch{/* Keep the parser's original refusal and checkpoint. */}
+   }
    requireValue(source);
    let form;
    if('scriptUrl' in source){
     report('BROWSER_CHALLENGE_CRES_SCRIPT_RECEIPT');
-    const script=decisionAssets.scripts.get(new URL(source.scriptUrl).pathname);
-    requireValue(capturedDecision&&decisionAssets.scripts.size===1&&script?.request.url()===source.scriptUrl);
+    const script=matchingDecisionScript(source.scriptUrl);
+    requireValue(capturedDecision&&script);
     const pendingBody=takeIssuerScriptBody?.(script.request,request);
     requireValue(pendingBody);
     report('BROWSER_CHALLENGE_CRES_SCRIPT_READ');
@@ -289,6 +317,25 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    report('BROWSER_CHALLENGE_CRES_FORM_DEADLINE');
    return form;
   },2000);
+ }
+ function captureRefusedIssuerFixture(route:Route,abortRoute:()=>Promise<void>){
+  const fixture=refusedFixture,takeScript=takeIssuerScriptBody,sanitize=sanitizeRefusedIssuerFixture;
+  if(!fixture||fixture.route!==route||fixture.result!==route.request()||!takeScript||!sanitize)return;
+  refusedFixture=undefined;
+  const blocked=Promise.resolve().then(abortRoute);
+  void blocked.catch(()=>{});
+  return billingBounded({deadline:fixture.deadline,signal:limits.signal},async active=>{
+   // Consume this receipt once the original CRes route has been blocked.
+   await blocked;
+   billingCheck(active);
+   const scriptUrl=fixture.script.url();
+   if(matchingDecisionScript(scriptUrl)?.request!==fixture.script)return;
+   const script=await takeScript(fixture.script,fixture.decision);
+   billingCheck(active);
+   if(!(script instanceof Uint8Array)||script.byteLength===0||script.byteLength>65536||
+      matchingDecisionScript(scriptUrl)?.request!==fixture.script)return;
+   await sanitize({html:fixture.html,script,documentUrl:fixture.decision.url(),scriptUrl,frameName:fixture.frameName});
+  },750).catch(()=>{});
  }
  // Descriptive only. Capture the refused frame shape, then read only the
  // response to the authenticate POST already admitted by the browser guard.
@@ -548,7 +595,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     requireValue(authorizeIssuerResult && decisionResponse && issuerResult?.request===request && data===observedResultBody &&
      request.serviceWorker()===null && !headers['transfer-encoding']);
     const frameName=target.name();
-    const form=await verifiedIssuerResultForm(decision,decisionResponse,frameName,report);
+    const form=await verifiedIssuerResultForm(route,original,decision,decisionResponse,frameName,report);
     report('BROWSER_CHALLENGE_CRES_ACTION');
     requireValue(form.action===url.href);
     report('BROWSER_CHALLENGE_CRES_BODY');
@@ -636,5 +683,5 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    requireValue(await issuerResponded(l,45000));
   },45000);
  }
- return {owns,forward,attend,refusedIssuerRelation};
+ return {owns,forward,attend,refusedIssuerRelation,captureRefusedIssuerFixture};
 }

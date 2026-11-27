@@ -41,7 +41,10 @@ test('3DS terminal preserves a fixed companion refusal through its worker annota
    'SPACE','TEXT','OTHER'].map(format=>'JSON_FORMAT_'+format),
   ...['DATA_URI','URI','FORM','ASSIGN_JSON','ASSIGNMENT','CALL_JSON','CALL','JS_LITERAL','NUMERIC','BASE_SHAPE',
    'IDENTIFIER','OTHER'].map(shape=>'JSON_TEXT_'+shape),
-  'JSON_TEXT_SHAPE_AJNSA','JSON_TEXT_SHAPE_SBPLC','JSON_TEXT_SHAPE_DDMSU'];
+  'JSON_TEXT_SHAPE_AJNSA','JSON_TEXT_SHAPE_SBPLC','JSON_TEXT_SHAPE_DDMSU','JSON_TEXT_SHAPE_AONLA',
+  ...['FOLD_JSON','FOLD_TEXT','FOLD_BYTES','FOLD_GZIP','FOLD_ZLIB','FOLD_ZSTD','FOLD_BASE','FOLD_DATA_JSON',
+   'FOLD_DATA','FOLD_FORM','LINE_PAIRS','LINE_OP_E','LINE_OP_C','LINE_OP_L','LINE_OP_S','LINE_OP_R','LINE_OP_M']
+   .map(shape=>'JSON_TEXT_'+shape)];
  for(const reason of reasons){
   const code='BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_'+reason;
   const line='owned_initial_3ds_terminal phase=ACK code='+code+' cleanup=UNCONFIRMED';

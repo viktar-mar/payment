@@ -56,6 +56,33 @@ The earlier `JSON_TEXT_OTHER` category now reports `JSON_TEXT_SHAPE_` and five l
 
 The suffix probe tries only the first object opener and the first array opener. It allows one trailing semicolon, with JSON whitespace. The signature describes lexical evidence from the parsed script text. It carries no character values, positions, names, or payload. A strict JSON suffix does not satisfy the original JSON check, and the CRes POST stays blocked.
 
+For text that previously reported `JSON_TEXT_SHAPE_AONLA`, the diagnostic now checks the complete multiline shape within the same 64 KiB budget.
+
+- `JSON_TEXT_FOLD_JSON`, `FOLD_TEXT` and `FOLD_BYTES` mean the compact text round-trips in canonical Base64 or Base64URL after removal of JSON whitespace. The decoded bytes contain strict UTF-8 JSON, other valid UTF-8, or invalid UTF-8, respectively. When the bytes fail the JSON probe, `FOLD_GZIP`, `FOLD_ZLIB` and `FOLD_ZSTD` can report a byte prefix consistent with the corresponding compression format. The probe does not decompress the data. `FOLD_BASE` reports a Base64-like shape without a canonical round trip.
+- `JSON_TEXT_FOLD_DATA` describes a data URI shape with a folded payload. `FOLD_DATA_JSON` additionally confirms that a `;base64` payload decodes from canonical Base64 or Base64URL into strict UTF-8 JSON after compaction.
+- `JSON_TEXT_FOLD_FORM` describes complete form pairs separated by `&`, with folding only between pairs. `JSON_TEXT_LINE_PAIRS` describes at least two nonblank lines of field and value pairs with a consistent separator.
+- `JSON_TEXT_LINE_OP_` describes punctuation in the remaining lines. `E` is an equals sign without a preceding `<`, `>` or `!`. `C` is a comparison mark, including an equals sign immediately after it. `L` is ampersand or vertical bar, `S` is slash, `R` is the remaining operator class, and `M` is a mixture.
+
+These probes describe a failed parse. The report contains only the fixed code. The original JSON check still determines whether the companion can be used to prove CRes.
+
+## Replay the companion rejection offline
+
+The Chrome fixture generates a CRes POST with synthetic transaction IDs and the form encoding described in the [public 3DSecure.io callback example](https://docs.3dsecure.io/3dsv2/challenge_flow.html#receiving-challenge-results). The synthetic decision HTML and paired JavaScript are authored locally. Both cases use the same script, CRes and destination. The strict JSON control reaches the simulated completion response. The folded Base64 companion is refused before the script is read for proof, even though the folded data decodes to that same JSON.
+
+Run the pair from the repository root with a disposable headless Chrome profile and local fixtures.
+
+```sh
+PAYMENT_TEST_CHROME_CHANNEL=chrome node --test --test-name-pattern='strict JSON control|folded Base64 JSON' examples/demo-site/tests/support/stripe-billing-initial-3ds-challenge-chrome.test.ts
+```
+
+## Collect an anonymized issuer replay in one Sandbox run
+
+With an authorized run of the dedicated project and a fresh `PAYMENT_STRIPE_SANDBOX_RUN_ID`, set `PAYMENT_STRIPE_BILLING_3DS_REPLAY_FIXTURE_RUN_ID="$PAYMENT_STRIPE_SANDBOX_RUN_ID"` in that run's environment. Leave the variable unset for ordinary runs. A different run ID fails admission.
+
+After the guard refuses a CRes POST for a malformed JSON companion, it first aborts that exact route. It then has up to 750 ms within the original proof deadline to read the single script receipt paired with the decision HTML it already inspected. Both responses have the existing 64 KiB limits. The reader uses the original Chromium responses with no extra issuer requests. The original failure checkpoint and cleanup checks still apply.
+
+The sole artifact is `test-results/stripe-sandbox/<run-uuid>/issuer-replay-fixture.private.json` at the repository root, written at most once with mode `0600`. `CAPTURED` contains regenerated HTML, JavaScript and a strict JSON control for supported folded JSON and literal form producers. Hosts, paths, form values and transaction IDs in the replay are synthetic. Use local fixtures to replay them. `STRUCTURAL_ONLY` records fixed categories for the paired HTML and script when the format cannot be faithfully regenerated. `UNSUPPORTED` carries only a disposition. An absent file means no diagnostic record was written. Keep this artifact in the private run directory.
+
 ## What establishes a pass
 
 The original confirmation attempt must retain its winning `REQUIRES_ACTION` receipt. The terminal server records must show one paid invoice and one EUR 20 payment for the bound subscription, with matching journal entries and signed site callbacks. A separate read of the original PaymentIntent and latest captured Charge must show an authenticated 3DS 2.x challenge. Frictionless authentication, a different Charge or a second charge fails the check.

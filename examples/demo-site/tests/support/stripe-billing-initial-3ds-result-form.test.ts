@@ -34,6 +34,29 @@ test('derive the parser location of a sole classic external script in the head',
  ),{scriptUrl:'https://reviewed-test-issuer.stripe.com/result.js',placement:'head'});
 });
 
+test('locate the exact external script for evidence while refusing the invalid JSON companion',()=>{
+ const reported:string[]=[],located:unknown[]=[];
+ const html=externalTag+jsonBlock('eyJma\nXh0dXJlIjp0cnVlfQ==',' id="fixture-data"');
+ assert.equal(issuerResultForm(html,undefined,code=>reported.push(code),decisionUrl,value=>located.push(value)),undefined);
+ assert.deepEqual(located,[{scriptUrl:'https://reviewed-test-issuer.stripe.com/fixture/result.js',placement:'head'}]);
+ assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON']);
+});
+
+test('offer no evidence locator when the external layout, ownership or source is ambiguous',()=>{
+ const companion=jsonBlock('not valid JSON');
+ for(const html of [
+  externalTag+companion+external('/second.js'),
+  externalTag+companion+'<script>anotherProducer()</script>',
+  external('/fixture/result.js?alternative=1')+companion,
+  external('/result.js',' defer')+companion,
+  '<!doctype html><body>'+externalTag+companion+'<div></div></body>',
+  '<!doctype html><body><div>'+externalTag+'</div>'+companion+'</body>',
+  externalTag+jsonBlock(''),
+ ]){
+  assert.equal(issuerResultForm(html,undefined,undefined,decisionUrl,()=>assert.fail('unproved external source')),undefined);
+ }
+});
+
 for(const placement of ['head','body'] as const)test('derive the '+placement+' script alongside inert JSON data blocks with optional ids',()=>{
  const before=jsonBlock('{"label":"fixture"}',' id="fixture-data"');
  const after=jsonBlock('["document.forms[0].submit()"]',' id="fixture-metadata"');
@@ -224,11 +247,39 @@ for(const [reason,contents] of Object.entries({
  TEXT_SHAPE_AJNLA:['\tfixture label:\n [true] ;\r\n'],
  TEXT_SHAPE_ABNSU:['fixture label: {}\u00a0;'],
  TEXT_SHAPE_ATNLA:['fixture\nlabel','fixture\r\nlabel'],
+ TEXT_SHAPE_AONLU:['Ing/\n\u00a0Ig=='],
+ TEXT_SHAPE_AOPLA:['fixture %7B\nlabel'],
  TEXT_SHAPE_ATNSU:['fixture café','fixture label\u2028'],
  TEXT_SHAPE_ATNLU:['fixture\u2028label','fixture\u2029label'],
  TEXT_SHAPE_ATNLC:['fixture\u0085label'],
  TEXT_SHAPE_APNSC:['fixture\u200dlabel','fixture\u0001label'],
  TEXT_SHAPE_APNSA:['fixture.'+' '.repeat(65527)+'?'],
+ TEXT_FOLD_JSON:['eyJma\nXh0dXJlIjp0cnVlfQ==','Ing_\r\n\tIg==','Ing/\n Ig==','OD\nA='], // JSON number 80 also matches zlib CMF/FLG.
+ TEXT_FOLD_TEXT:['ZTMw\nPQ==','IO+7\nv3t9IA=='],
+ TEXT_FOLD_BYTES:['Iv8i/\nw==','H4sJ/\nw==','eJ\n0=','KLUv/\nA=='],
+ TEXT_FOLD_GZIP:['H4sI/\nw=='],
+ TEXT_FOLD_ZLIB:['eJ\nw=','eA\nE='],
+ TEXT_FOLD_ZSTD:['KLUv/\nQ=='],
+ TEXT_FOLD_BASE:['Ing/\nIh==','Is+_\nIg=='],
+ TEXT_FOLD_DATA_JSON:['data:application/json;base64,eyJma\nXh0dXJlIjp0cnVlfQ==','DATA:;BASE64,Ing_\r\nIg=='],
+ TEXT_FOLD_DATA:[
+  'data:text/plain,\nprivate-fixture','data:application/json;base64,Ing/\nIh==',
+  'data:application/json;base64,IO+7\nv3t9','data:text/plain,Ing/\nIg==',
+ ],
+ TEXT_FOLD_FORM:['first-key=private&\nother-key=more','first-key=x\r\n &\tother-key='],
+ TEXT_LINE_PAIRS:['first-key = private\r\n\r\n second-key = more','first-key: x=y\nsecond-key: private'],
+ TEXT_LINE_OP_E:[
+  'fixture label =\nrest','first-key == private\nsecond-key = more','first-key: x\nsecond-key = more',
+  'first-key = private\nextra line\nsecond-key = more','first-key = \nsecond-key = more',
+ ],
+ TEXT_LINE_OP_C:['fixture <= private\nlabel','fixture != private\nlabel'],
+ TEXT_LINE_OP_L:['fixture & private\nlabel','fixture | private\nlabel'],
+ TEXT_LINE_OP_S:['fixture / private\nlabel.'],
+ TEXT_LINE_OP_R:['fixture * private\nlabel','fixture ^ private\nlabel'],
+ TEXT_LINE_OP_M:[
+  'fixture != private\nlabel = more','first-key => private\nsecond-key => more','first-key=x\nextra&other-key=more',
+  'first-key=x &\n extra line & other-key=more','first-key=x &\nother-key=more\n&',
+ ],
  FORMAT_LIMIT:['fixture.'+' '.repeat(65528)+'?'],
  FORMAT_OTHER:[')private-fixture','é'],
 }))test('reject malformed companion JSON with the fixed '+reason+' diagnostic',()=>{

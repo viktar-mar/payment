@@ -10,8 +10,12 @@ type BaseSixtyFourEvidence='BASE_SIXTY_FOUR'|'FORMAT_BASE_TEXT'|'FORMAT_BASE_BYT
 type TextStructure='J'|'M'|'B'|'O'|'D'|'T'|'P';
 type TextEncoding='N'|'P'|'E'|'B'|'M';
 type CompanionJsonTextShape=`TEXT_SHAPE_${'A'|'D'|'S'}${TextStructure}${TextEncoding}${'S'|'L'}${'A'|'U'|'C'}`;
+type FoldedCompressionHeader='TEXT_FOLD_GZIP'|'TEXT_FOLD_ZLIB'|'TEXT_FOLD_ZSTD';
+type MultilineCompanionText=`TEXT_FOLD_${'JSON'|'TEXT'|'BYTES'|'BASE'|'DATA_JSON'|'DATA'|'FORM'}`|
+ FoldedCompressionHeader|'TEXT_LINE_PAIRS'|`TEXT_LINE_OP_${'E'|'C'|'L'|'S'|'R'|'M'}`;
 type CompanionJsonText='TEXT_DATA_URI'|'TEXT_URI'|'TEXT_FORM'|'TEXT_ASSIGN_JSON'|'TEXT_ASSIGNMENT'|
- 'TEXT_CALL_JSON'|'TEXT_CALL'|'TEXT_JS_LITERAL'|'TEXT_NUMERIC'|'TEXT_BASE_SHAPE'|'TEXT_IDENTIFIER'|CompanionJsonTextShape;
+ 'TEXT_CALL_JSON'|'TEXT_CALL'|'TEXT_JS_LITERAL'|'TEXT_NUMERIC'|'TEXT_BASE_SHAPE'|'TEXT_IDENTIFIER'|
+ CompanionJsonTextShape|MultilineCompanionText;
 type CompanionJsonShape='FORMAT_BOM'|'FORMAT_COMMENT'|'FORMAT_MARKUP'|'FORMAT_ENTITY'|'FORMAT_PERCENT'|
  'FORMAT_ESCAPE'|'FORMAT_QUOTED'|'FORMAT_OBJECT'|'FORMAT_ARRAY'|'FORMAT_SPACE'|'FORMAT_OTHER'|CompanionJsonText;
 type InvalidCompanionJson='BOM'|'HTML_COMMENT'|'HTML_QUOTES'|'PERCENT'|BaseSixtyFourEvidence|
@@ -32,6 +36,7 @@ type ExternalScript={scriptUrl:string;placement:ScriptPlacement};
 type ScriptElement={node:Element;text:string;src:string|undefined;classic:boolean;recognizedJsType:boolean};
 type LiteralInsertion={markup:string;method:'write'|'insertAdjacentHTML'};
 type Reporter=(code:string)=>void;
+type RefusedScriptLocator=(script:ExternalScript)=>void;
 type Element=DefaultTreeAdapterTypes.Element;
 const htmlWhitespace=(value:string)=>/^[\t\n\f\r ]*$/.test(value);
 const whitespaceNode=(node:DefaultTreeAdapterTypes.Node)=>defaultTreeAdapter.isTextNode(node)&&htmlWhitespace(node.value);
@@ -47,12 +52,13 @@ export function isIssuerScriptPath(pathname:string):boolean{
 /** Derive the wire request or locate its sole external script in the original issuer HTML. */
 export function issuerResultForm(html:string,frameName?:string,report?:Reporter):FormProof|undefined;
 export function issuerResultForm(html:string,frameName:string|undefined,report:Reporter|undefined,
- documentUrl:string|undefined):FormProof|ExternalScript|undefined;
-export function issuerResultForm(html:string,frameName?:string,report?:Reporter,documentUrl?:string):FormProof|ExternalScript|undefined{
+ documentUrl:string|undefined,locateRefusedScript?:RefusedScriptLocator):FormProof|ExternalScript|undefined;
+export function issuerResultForm(html:string,frameName?:string,report?:Reporter,documentUrl?:string,
+ locateRefusedScript?:RefusedScriptLocator):FormProof|ExternalScript|undefined{
  let ambiguous=false;
  const document=parse(html,{sourceCodeLocationInfo:true,onParseError:error=>{if(error.code==='duplicate-attribute')ambiguous=true;}});
  let result:FormProof|ExternalScript|FormRejection=ambiguous?'DUPLICATE_ATTRIBUTE':readForm(document,frameName);
- if(result==='MISSING')result=readLiteralForm(document,frameName,documentUrl);
+ if(result==='MISSING')result=readLiteralForm(document,frameName,documentUrl,locateRefusedScript);
  if(typeof result==='string')return reportFormRejection(result,report);
  return result;
 }
@@ -164,7 +170,7 @@ function documentElementRejection(element:Element):LayoutRejection|undefined{
  }else if(element.attrs.length!==0)return 'EXTERNAL_LAYOUT_ATTRIBUTES';
 }
 
-function companionRejection({node,text}:ScriptElement):CompanionRejection|undefined{
+function companionStructureRejection({node}:ScriptElement):CompanionRejection|undefined{
  const placement=node.parentNode?.nodeName,location=node.sourceCodeLocation;
  if(placement!=='head'&&placement!=='body')return 'EXTERNAL_COMPANION_PARENT';
  if(!location?.startTag||!location.endTag)return 'EXTERNAL_COMPANION_TAG';
@@ -185,9 +191,14 @@ function companionRejection({node,text}:ScriptElement):CompanionRejection|undefi
   if(node.attrs.length===2&&attribute(node,'nonce')!==undefined)return 'EXTERNAL_COMPANION_ATTRIBUTE_NONCE';
   return 'EXTERNAL_COMPANION_ATTRIBUTES';
  }
- if(htmlWhitespace(text))return 'EXTERNAL_COMPANION_JSON_EMPTY';
- try{JSON.parse(text);}
- catch(error){return `EXTERNAL_COMPANION_JSON_${invalidCompanionJson(text,error)}`;}
+}
+
+function companionRejection(script:ScriptElement):CompanionRejection|undefined{
+ const structure=companionStructureRejection(script);
+ if(structure)return structure;
+ if(htmlWhitespace(script.text))return 'EXTERNAL_COMPANION_JSON_EMPTY';
+ try{JSON.parse(script.text);}
+ catch(error){return `EXTERNAL_COMPANION_JSON_${invalidCompanionJson(script.text,error)}`;}
 }
 
 function parsesJson(text:string):boolean{
@@ -206,16 +217,89 @@ const jsonSyntaxReasons=[
  [/^Unexpected non-whitespace character after JSON at position /,'TRAILING'],
 ] as const;
 
-function baseSixtyFourCompanionJson(value:string):BaseSixtyFourEvidence|undefined{
+function canonicalBaseSixtyFour(value:string):Buffer|undefined{
  if(!/^[A-Za-z0-9+/_-]+={0,2}$/.test(value))return;
  const bytes=Buffer.from(value,'base64');
  const standard=bytes.toString('base64');
  const paddedUrlSafe=standard.replace(/\+/g,'-').replace(/\//g,'_');
- if(value!==standard&&value!==paddedUrlSafe&&value!==bytes.toString('base64url'))return;
+ if(value===standard||value===paddedUrlSafe||value===bytes.toString('base64url'))return bytes;
+}
+
+function baseSixtyFourEvidence(bytes:Buffer):BaseSixtyFourEvidence{
  let decoded:string;
  try{decoded=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes);}
  catch{return 'FORMAT_BASE_BYTES';}
  return parsesJson(decoded)?'BASE_SIXTY_FOUR':'FORMAT_BASE_TEXT';
+}
+
+const baseSixtyFourShape=/^[A-Za-z0-9+/_-]+=*$/;
+const formText=/^[A-Za-z0-9_.%~*+-]+=[^&\s]*(?:&[A-Za-z0-9_.%~*+-]+=[^&\s]*)+$/;
+const jsonWhitespace=/[ \t\r\n]/;
+
+function trimJsonWhitespace(text:string):string{
+ let start=0,end=text.length;
+ while(start<end&&jsonWhitespace.test(text.charAt(start)))start++;
+ while(end>start&&jsonWhitespace.test(text.charAt(end-1)))end--;
+ return text.slice(start,end);
+}
+
+function foldedCompressionHeader(bytes:Buffer):FoldedCompressionHeader|undefined{
+ // These fixed prefixes do not prove that the remaining bytes form a complete stream.
+ if(bytes[0]===0x1f&&bytes[1]===0x8b&&bytes[2]===8)return 'TEXT_FOLD_GZIP';
+ if(bytes[0]===0x28&&bytes[1]===0xb5&&bytes[2]===0x2f&&bytes[3]===0xfd)return 'TEXT_FOLD_ZSTD';
+ if(bytes.length>=2){
+  const cmf=bytes.readUInt8(0);
+  if((cmf&0x0f)===8&&(cmf>>4)<=7&&bytes.readUInt16BE(0)%31===0)return 'TEXT_FOLD_ZLIB';
+ }
+}
+
+const foldedBaseOutcomes={
+ FORMAT_BASE_TEXT:'TEXT_FOLD_TEXT',
+ FORMAT_BASE_BYTES:'TEXT_FOLD_BYTES',
+} as const;
+
+function hasMultilinePairs(value:string):boolean{
+ let delimiter:string|undefined,pairs=0;
+ for(const line of value.split(/\r\n?|\n/)){
+  if(/^[ \t]*$/.test(line))continue;
+  const pair=/^[ \t]*[A-Za-z_][A-Za-z0-9_.-]{0,63}[ \t]*([=:])[ \t]*(\S)/.exec(line);
+  if(!pair)return false;
+  const [,separator,firstValue]=pair;
+  if(separator==='='&&(firstValue==='='||firstValue==='>'))return false;
+  if(delimiter!==undefined&&separator!==delimiter)return false;
+  delimiter=separator;
+  pairs++;
+ }
+ return pairs>=2;
+}
+
+const multilineOperatorGroups=[
+ ['E',/(?<![<>!])=/],
+ ['C',/[<>!]/],
+ ['L',/[&|]/],
+ ['S',/\//],
+ ['R',/[*%^~]/],
+] as const;
+
+function multilineCompanionText(value:string):MultilineCompanionText|'TEXT_SHAPE_AONLA'{
+ // This probe runs only for the bounded ASCII multiline operator shape.
+ const compact=value.replace(/[ \t\r\n]/g,'');
+ if(baseSixtyFourShape.test(compact)){
+  const bytes=canonicalBaseSixtyFour(compact);
+  if(!bytes)return 'TEXT_FOLD_BASE';
+  const evidence=baseSixtyFourEvidence(bytes);
+  if(evidence==='BASE_SIXTY_FOUR')return 'TEXT_FOLD_JSON';
+  return foldedCompressionHeader(bytes)??foldedBaseOutcomes[evidence];
+ }
+ const dataEnvelope=/^data:[^,\s]*,/i.exec(value)?.[0];
+ if(dataEnvelope){
+  const bytes=/;base64,$/i.test(dataEnvelope)?canonicalBaseSixtyFour(compact.slice(dataEnvelope.length)):undefined;
+  return bytes&&baseSixtyFourEvidence(bytes)==='BASE_SIXTY_FOUR'?'TEXT_FOLD_DATA_JSON':'TEXT_FOLD_DATA';
+ }
+ if(value.includes('&')&&formText.test(value.split('&').map(trimJsonWhitespace).join('&')))return 'TEXT_FOLD_FORM';
+ if(hasMultilinePairs(value))return 'TEXT_LINE_PAIRS';
+ const [group,other]=multilineOperatorGroups.filter(([,pattern])=>pattern.test(value));
+ return group?`TEXT_LINE_OP_${other?'M':group[0]}`:'TEXT_SHAPE_AONLA';
 }
 
 function companionTextStructure(value:string):TextStructure{
@@ -237,7 +321,7 @@ const companionTextEncodingMarkers=[
  ['B',/\\(?:[bfnrtv0"'\\/]|x[0-9a-fA-F]{2}|u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]{1,6}\}))/],
 ] as const;
 
-function companionJsonTextShape(value:string):CompanionJsonTextShape{
+function companionJsonTextShape(value:string):CompanionJsonTextShape|MultilineCompanionText{
  // The caller already bounded and JSON-whitespace-trimmed the failed text.
  // Each position below is a fixed category, independent of raw values.
  const start=/^[0-9]/.test(value)?'D':/^[+-]/.test(value)?'S':'A';
@@ -247,7 +331,8 @@ function companionJsonTextShape(value:string):CompanionJsonTextShape{
  const lineBreak=value.search(/[\r\n\u0085\u2028\u2029]/);
  const layout=lineBreak>=0&&/[^\p{White_Space}]/u.test(value.slice(lineBreak+1))?'L':'S';
  const charset=/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\p{Cf}]/u.test(value)?'C':/[^\x00-\x7f]/.test(value)?'U':'A';
- return `TEXT_SHAPE_${start}${structure}${encoding}${layout}${charset}`;
+ const shape=`TEXT_SHAPE_${start}${structure}${encoding}${layout}${charset}` as const;
+ return shape==='TEXT_SHAPE_AONLA'?multilineCompanionText(value):shape;
 }
 
 function companionJsonText(value:string):CompanionJsonText{
@@ -267,11 +352,11 @@ function companionJsonText(value:string):CompanionJsonText{
   return close&&parsesJson(argument.slice(0,close.index))?'TEXT_CALL_JSON':'TEXT_CALL';
  }
  // A single pair also looks like an assignment. Require a second pair.
- if(/^[A-Za-z0-9_.%~*+-]+=[^&\s]*(?:&[A-Za-z0-9_.%~*+-]+=[^&\s]*)+$/.test(value))return 'TEXT_FORM';
+ if(formText.test(value))return 'TEXT_FORM';
  if(assignment)return 'TEXT_ASSIGNMENT';
  if(/^(?:undefined|NaN|[+-]?Infinity)$/.test(value)||/^(?:true|false|null)$/i.test(value))return 'TEXT_JS_LITERAL';
  if(/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value))return 'TEXT_NUMERIC';
- if(/[+/=]/.test(value)&&/^[A-Za-z0-9+/_-]+=*$/.test(value))return 'TEXT_BASE_SHAPE';
+ if(/[+/=]/.test(value)&&baseSixtyFourShape.test(value))return 'TEXT_BASE_SHAPE';
  if(member?.length===value.length)return 'TEXT_IDENTIFIER';
  return companionJsonTextShape(value);
 }
@@ -297,11 +382,7 @@ function invalidCompanionJson(text:string,error:unknown):InvalidCompanionJson{
  if(text.length>65536||Buffer.byteLength(text,'utf8')>65536)return 'FORMAT_LIMIT';
  // These candidates only describe the original failure. Never combine them or
  // admit a companion based on a transformed parse.
- const jsonWhitespace=/[ \t\r\n]/;
- let start=0,end=text.length;
- while(start<end&&jsonWhitespace.test(text.charAt(start)))start++;
- while(end>start&&jsonWhitespace.test(text.charAt(end-1)))end--;
- const value=text.slice(start,end);
+ const value=trimJsonWhitespace(text);
  if(value.startsWith('\uFEFF')&&parsesJson(value.slice(1)))return 'BOM';
  if(value.startsWith('<!--')&&value.endsWith('-->')){
   const content=value.slice(4,-3);
@@ -313,7 +394,8 @@ function invalidCompanionJson(text:string,error:unknown):InvalidCompanionJson{
   try{JSON.parse(decodeURIComponent(value));return 'PERCENT';}
   catch{/* The decoded text must be strict JSON. */}
  }
- const baseSixtyFour=baseSixtyFourCompanionJson(value);
+ const bytes=canonicalBaseSixtyFour(value);
+ const baseSixtyFour=bytes&&baseSixtyFourEvidence(bytes);
  if(baseSixtyFour==='BASE_SIXTY_FOUR')return baseSixtyFour;
  if(error instanceof SyntaxError){
   for(const [prefix,reason] of jsonSyntaxReasons)if(prefix.test(error.message))return reason;
@@ -321,8 +403,21 @@ function invalidCompanionJson(text:string,error:unknown):InvalidCompanionJson{
  return baseSixtyFour??companionJsonShape(value);
 }
 
+function externalScriptReference(external:ScriptElement,src:string,documentUrl:string,
+ layout:LayoutRejection|undefined):ExternalScript|FormRejection{
+ const placement=external.node.parentNode?.nodeName;
+ if(placement!=='head'&&placement!=='body')return 'EXTERNAL_PARENT';
+ if(!external.node.sourceCodeLocation?.endTag)return 'EXTERNAL_TAG';
+ if(!external.classic)return 'EXTERNAL_TYPE';
+ if(!supportedScriptAttributes(external.node))return 'EXTERNAL_ATTRIBUTES';
+ if(!htmlWhitespace(external.text))return 'EXTERNAL_TEXT';
+ if(layout)return layout;
+ const scriptUrl=canonicalScriptUrl(src,documentUrl);
+ return scriptUrl?{scriptUrl,placement}:'EXTERNAL_URL';
+}
+
 function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:string|undefined,
- documentUrl:string|undefined):FormProof|ExternalScript|FormRejection{
+ documentUrl:string|undefined,locateRefusedScript?:RefusedScriptLocator):FormProof|ExternalScript|FormRejection{
  const shapes=new Set<FormRejection>();
  const pending:DefaultTreeAdapterTypes.Node[]=[document];
  const scripts:ScriptElement[]=[];
@@ -360,17 +455,19 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
   // Report the first rejected companion in the reverse parsed traversal above.
   for(const companion of companions){
    const rejection=companionRejection(companion);
-   if(rejection)return rejection;
+   if(rejection){
+    if(locateRefusedScript&&rejection.startsWith('EXTERNAL_COMPANION_JSON_')&&
+       rejection!=='EXTERNAL_COMPANION_JSON_EMPTY'&&rejection!=='EXTERNAL_COMPANION_JSON_FORMAT_LIMIT'&&
+       companions.every(script=>!companionStructureRejection(script))){
+     try{
+      const reference=externalScriptReference(external,external.src,documentUrl,layout);
+      if(typeof reference!=='string')locateRefusedScript(reference);
+     }catch{/* A diagnostic locator cannot change the original refusal. */}
+    }
+    return rejection;
+   }
   }
-  const placement=external.node.parentNode?.nodeName;
-  if(placement!=='head'&&placement!=='body')return 'EXTERNAL_PARENT';
-  if(!external.node.sourceCodeLocation?.endTag)return 'EXTERNAL_TAG';
-  if(!external.classic)return 'EXTERNAL_TYPE';
-  if(!supportedScriptAttributes(external.node))return 'EXTERNAL_ATTRIBUTES';
-  if(!htmlWhitespace(external.text))return 'EXTERNAL_TEXT';
-  if(layout)return layout;
-  const scriptUrl=canonicalScriptUrl(external.src,documentUrl);
-  return scriptUrl?{scriptUrl,placement}:'EXTERNAL_URL';
+  return externalScriptReference(external,external.src,documentUrl,layout);
  }
  const [script]=scripts;
  if(!layout&&scripts.length===1&&script&&script.src===undefined&&script.classic&&

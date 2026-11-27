@@ -8,13 +8,16 @@ import {runInitial3dsCase} from './support/stripe-billing-initial-3ds-terminal';
 import {loadFailedRenewalStaticOriginMatcher} from './support/stripe-billing-failed-renewal-static-origin-pin';
 import {loadPinnedInitial3dsIssuerOrigin} from './support/stripe-billing-initial-3ds-issuer-pin';
 import {runBillingInitial3dsBrowser} from './support/stripe-billing-acceptance';
+import {prepareIssuerReplayCapture} from './support/stripe-billing-initial-3ds-replay-capture';
 
 let owner:Awaited<ReturnType<typeof createOwnedBillingInitial3ds>>;
+let captureRefusedIssuerFixture:ReturnType<typeof prepareIssuerReplayCapture>;
 test.beforeAll(async({},info)=>{
   const raw=process.env,env=snapshotBillingAcceptanceEnvironment(raw);
   const reporter=new URL('./support/stripe-billing-initial-3ds-reporter.ts',import.meta.url);
   if(env?.PAYMENT_STRIPE_BILLING_CASE!=='initial_3ds' || info.project.name!=='owned-initial-3ds' ||
       !billingRunSettingsAllowed(info,reporter))throw Error('billing_OPT_IN_REQUIRED');
+  captureRefusedIssuerFixture=prepareIssuerReplayCapture(raw.PAYMENT_STRIPE_BILLING_3DS_REPLAY_FIXTURE_RUN_ID,raw.PAYMENT_STRIPE_SANDBOX_RUN_ID);
   const ports={backend:0,demo:0,receiver:0,postgres:0,mailpitHttp:0,mailpitSmtp:0};
   for(const name of Object.keys(ports) as (keyof typeof ports)[]){
     const value=raw['PAYMENT_STRIPE_SANDBOX_PORT_'+name.toUpperCase()];
@@ -33,7 +36,7 @@ test('OWNED_INITIAL_3DS',async({browser},info)=>{
       handoffPath:join(info.project.outputDir,runId,'operator.html')});
     try{
       return await runBillingInitial3dsBrowser(browser,port,{...limits,signal},l=>operator.wait('challenge',l),
-        loadFailedRenewalStaticOriginMatcher(),loadPinnedInitial3dsIssuerOrigin());
+        loadFailedRenewalStaticOriginMatcher(),loadPinnedInitial3dsIssuerOrigin(),captureRefusedIssuerFixture);
     }finally{controller.abort();await operator.close();}
   },info.annotations);
 });

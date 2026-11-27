@@ -234,8 +234,12 @@ export function runBillingCancellationBrowser(browser:Browser,port:BillingCancel
 export function runBillingDeclineRetryBrowser(browser:Browser,port:BillingDeclineRetryPort,limits:BillingLimits,matchesStaticOrigin?:(origin:string)=>boolean):Promise<true>{
  return runBillingBrowser(browser,port,limits,undefined,port,matchesStaticOrigin);
 }
-export function runBillingInitial3dsBrowser(browser:Browser,port:BillingInitial3dsPort,limits:BillingLimits,waitForGesture:WaitForIssuerGesture,matchesStaticOrigin?:(origin:string)=>boolean,approvedIssuerOrigin?:string):Promise<true>{
- return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,{port,waitForGesture,approvedIssuerOrigin});
+type IssuerReplayCapture=Parameters<typeof initial3dsChallenge>[0]['captureRefusedIssuerFixture'];
+type Initial3dsBrowserOptions={port:BillingInitial3dsPort;waitForGesture:WaitForIssuerGesture;approvedIssuerOrigin?:string;
+ captureRefusedIssuerFixture?:IssuerReplayCapture};
+export function runBillingInitial3dsBrowser(browser:Browser,port:BillingInitial3dsPort,limits:BillingLimits,waitForGesture:WaitForIssuerGesture,matchesStaticOrigin?:(origin:string)=>boolean,approvedIssuerOrigin?:string,
+ captureRefusedIssuerFixture?:IssuerReplayCapture):Promise<true>{
+ return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,{port,waitForGesture,approvedIssuerOrigin,captureRefusedIssuerFixture});
 }
 export function runBillingInvoiceWebhooksBrowser(browser:Browser,port:BillingInvoiceWebhooksPort,limits:BillingLimits,matchesStaticOrigin:(origin:string)=>boolean):Promise<true>{
  return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,undefined,port);
@@ -243,7 +247,7 @@ export function runBillingInvoiceWebhooksBrowser(browser:Browser,port:BillingInv
 export function runBillingRequiredTrialBrowser(browser:Browser,port:BillingRequiredTrialPort,limits:BillingLimits,matchesStaticOrigin?:(origin:string)=>boolean):Promise<true>{
  return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,undefined,undefined,port);
 }
-async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequiredTrialPort,limits:BillingLimits,cancellationPort?:BillingCancellationPort,retryPort?:BillingDeclineRetryPort,matchesStaticOrigin?:(origin:string)=>boolean,challenge?:{port:BillingInitial3dsPort;waitForGesture:WaitForIssuerGesture;approvedIssuerOrigin?:string},invoiceCase?:BillingInvoiceWebhooksPort,trialCase?:BillingRequiredTrialPort):Promise<true>{
+async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequiredTrialPort,limits:BillingLimits,cancellationPort?:BillingCancellationPort,retryPort?:BillingDeclineRetryPort,matchesStaticOrigin?:(origin:string)=>boolean,challenge?:Initial3dsBrowserOptions,invoiceCase?:BillingInvoiceWebhooksPort,trialCase?:BillingRequiredTrialPort):Promise<true>{
  const pinnedCancellation=!!cancellationPort&&typeof matchesStaticOrigin==='function';
  const exactInitialCheckout=!!(retryPort||challenge||pinnedCancellation||trialCase);
  const bound=exactInitialCheckout||!!invoiceCase,guarded=!!(cancellationPort||bound);
@@ -254,11 +258,16 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
  let context:BrowserContext|undefined,abandoned=false,closing:Promise<void>|undefined,failure=false;
  let checkpoint=cancellationPort?'BROWSER_SETUP':'BROWSER',firstFailure:string|undefined,cleanupConfirmed=false;
  let refusedOrigin:{runId:string;expectedSource:string;origin:string;issuerRelation:Promise<RefusedIssuerRelation>}|undefined;
+ let refusedReplay:Promise<void>|undefined;
  const recordFailure=(code=checkpoint)=>{firstFailure??=code;failure=true;};
  const close=(ctx:BrowserContext)=>{closing??=ctx.close();void closing.catch(()=>{});return closing;};
  const opening=browser.newContext({serviceWorkers:'block',acceptDownloads:false});void opening.then(c=>{if(abandoned)return close(c);},()=>{}).catch(()=>{});
  const abort=()=>{
-  abandoned=true;lifecycle.abort();
+  abandoned=true;
+  // The first failure already blocks every route. Keep the existing receipt
+  // reader alive only long enough to finish its bounded, post-abort capture.
+  if(refusedReplay&&!ownerLimits.signal?.aborted)return;
+  lifecycle.abort();
   const current=context;
   if(!current)return;
   if(refusedOrigin)void refusedOrigin.issuerRelation.then(()=>close(current)).catch(()=>{});
@@ -420,6 +429,7 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
    takeIssuerDecisionBody:req=>redirects!.takeIssuerDecisionBody(req),
    authorizeIssuerResult:(req,document)=>redirects!.authorizeIssuerResult(req,document),
    approvedIssuerOrigin:challenge.approvedIssuerOrigin,
+   captureRefusedIssuerFixture:challenge.captureRefusedIssuerFixture,
    winning:async()=>{
     const original=requests.get('original-confirm'),response=original?.existingResponse();
     need(response && response.request()===original && response.status()===200 && !response.fromServiceWorker());
@@ -702,13 +712,18 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
     const dispatch=successor?{beforeDispatch:(_kind:unknown,key:string)=>retryPort!.beforeSuccessorConfirm(key,{subscriptionId,operationId,attemptId})}:port as BillingPort;
     await forwardBillingDispatch(route,dispatch,binding,authority,'confirm',{subscriptionId,operationId,attemptId},limits,confirmation,checkManager,redirects?.authorize,invoiceCase?.releaseOriginalConfirm);
    }catch{
-    const capture=!firstFailure&&origin?sca:undefined;
+    const first=!firstFailure;
+    const capture=first&&origin?sca:undefined;
     recordFailure(routeCheckpoint);
     if(capture&&origin){
      const blocked=route.abort('failed').catch(()=>{});
      refusedOrigin={runId:binding.runId,expectedSource:binding.expectedSource,origin,
       issuerRelation:capture.refusedIssuerRelation(route.request(),ownerLimits)};
      abort();await blocked;return;
+    }
+    if(first&&challenge?.captureRefusedIssuerFixture&&sca){
+     refusedReplay=sca.captureRefusedIssuerFixture(route,()=>route.abort('failed'));
+     if(refusedReplay){await refusedReplay;refusedReplay=undefined;abort();return;}
     }
     abort();await route.abort('failed').catch(()=>{});
    }})();pending.add(work);void work.finally(()=>pending.delete(work));return work;
@@ -1140,6 +1155,8 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
   authority='';
  }catch{recordFailure();}
  finally{
+  await refusedReplay;
+  refusedReplay=undefined;
   abandoned=true;limits.signal?.removeEventListener('abort',abort);lifecycle.abort();
   await refusedOrigin?.issuerRelation;
   if(context)try{
