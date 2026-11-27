@@ -84,6 +84,9 @@ public class StripeBillingSteps {
     private SubscriptionBillingProofStore.Setup pendingRequiredSetup;
     private Subscription siblingTrial;
     private TrialPublication siblingPublication;
+    private SubscriptionBillingProofStore.Setup siblingMethodBeforeReplacement;
+    private List<Map<String,Object>> billsBeforeReplacement;
+    private int beforeMethodReplacement;
     private Subscription.Period requiredTrialPeriod;
     private static final BillingRefs BILLING = new BillingRefs("sub_billing", "si_billing", "price_billing", "prod_billing");
     private static final BillingRefs REQUIRED = new BillingRefs("sub_required", "si_required", "price_required", "prod_required");
@@ -831,49 +834,130 @@ public class StripeBillingSteps {
 
     @When("the customer sets up a card for that Stripe subscription")
     public void setUpTrialCard() {
-        StripeAcceptanceConfiguration.providerTime(end);
-        var intent = json("""
-            {"id":"seti_trial","object":"setup_intent","livemode":false,"customer":"cus_billing",
-             "usage":"off_session","payment_method_types":["card"],"status":"requires_payment_method"}
+        installTrialCard(subscription(),remote,end,"seti_trial","pm_trial",AccessDecision.Reason.PAUSED);
+        reconcileTrialCard(subscription(),remote,invoices);
+        assertThat(http.calls().stream().filter(call -> call.path().equals("/v1/setup_intents"))).hasSize(1);
+    }
+
+    private void reconcileTrialCard(Subscription target, JsonObject providerSubscription, List<InvoiceGraph> billing) {
+        readGraph(providerSubscription,billing);
+        respond("GET","/v1/subscriptions/"+target.providerReference(),providerSubscription);
+        bean(ReconcileSubscriptionUseCase.class).reconcile(new ReconcileSubscriptionUseCase.Command(context(key()),target.id()));
+    }
+
+    private void installTrialCard(Subscription target, JsonObject providerSubscription, Instant providerNow,
+                                  String setupId, String method, AccessDecision.Reason expectedAccess) {
+        int before=http.calls().size();
+        StripeAcceptanceConfiguration.providerTime(providerNow);
+        var intent=json("""
+            {"object":"setup_intent","livemode":false,"customer":"cus_billing","usage":"off_session",
+             "payment_method_types":["card"],"status":"requires_payment_method"}
             """);
+        intent.addProperty("id",setupId);
         identity();
-        http.enqueue("POST", "/v1/setup_intents", 200, call -> {
-            var metadata = new JsonObject();
-            metadata.addProperty("operation_id", call.form().get("metadata[operation_id]"));
-            metadata.addProperty("subscription_id", call.form().get("metadata[subscription_id]"));
-            intent.add("metadata", metadata);
-            intent.addProperty("created", end.getEpochSecond());
+        http.enqueue("POST","/v1/setup_intents",200,call -> {
+            intent.add("metadata",fixtureMetadata(call,List.of("operation_id","subscription_id")));
+            intent.addProperty("created",providerNow.getEpochSecond());
             return intent.toString();
         });
-        trialSetup = bean(SetupSubscriptionMethodUseCase.class).setup(
-            new SetupSubscriptionMethodUseCase.Command(context(key()), created.subscriptionId(), true));
+        trialSetup=bean(SetupSubscriptionMethodUseCase.class).setup(
+            new SetupSubscriptionMethodUseCase.Command(context(key()),target.id(),true));
+        var setupOperation=operation(trialSetup.operationId());
         assertThat(trialSetup.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
-        assertThat(http.calls().stream().filter(call -> call.path().equals("/v1/setup_intents")))
+        assertThat(http.calls().subList(before,http.calls().size()).stream().filter(call -> call.path().equals("/v1/setup_intents")))
             .singleElement().satisfies(call -> {
                 assertThat(call.method()).isEqualTo("POST");
-                assertThat(call.header("Idempotency-Key")).isEqualTo(operation(trialSetup.operationId()).providerOperationKey() + ":SETUP");
-                assertThat(call.form()).containsEntry("customer", "cus_billing").containsEntry("usage", "off_session")
-                    .containsEntry("metadata[subscription_id]", created.subscriptionId().toString());
+                assertThat(call.header("Idempotency-Key")).isEqualTo(setupOperation.providerOperationKey()+":SETUP");
+                assertThat(call.form()).containsEntry("customer","cus_billing").containsEntry("usage","off_session")
+                    .containsEntry("metadata[subscription_id]",target.id().toString())
+                    .containsEntry("metadata[operation_id]",setupOperation.id().toString());
             });
-        assertThat(access().reason()).isEqualTo(AccessDecision.Reason.PAUSED);
+        assertThat(bean(QuerySubscriptionsUseCase.class).get(actor,site,target.id()).access().reason()).isEqualTo(expectedAccess);
         assertThat(cash()).isZero();
 
-        intent.addProperty("status", "succeeded");
-        intent.addProperty("payment_method", "pm_trial");
+        intent.addProperty("status","succeeded");
+        intent.addProperty("payment_method",method);
         identity();
-        respond("GET", "/v1/setup_intents/seti_trial", intent);
-        respond("GET", "/v1/payment_methods/pm_trial", trialPaymentMethod());
+        respond("GET","/v1/setup_intents/"+setupId,intent);
+        respond("GET","/v1/payment_methods/"+method,trialPaymentMethod(method));
         identity();
-        remote.addProperty("default_payment_method", "pm_trial");
-        respond("POST", "/v1/subscriptions/sub_billing", remote);
-        var continued = bean(ContinueOriginalSubscriptionSetupUseCase.class).api(
-            context(key()), created.subscriptionId(), trialSetup.operationId());
+        http.enqueue("POST","/v1/subscriptions/"+target.providerReference(),200,call -> {
+            assertThat(call.header("Idempotency-Key")).isEqualTo(setupOperation.providerOperationKey()+":METHOD");
+            assertThat(call.form()).containsExactlyEntriesOf(Map.of("default_payment_method",method));
+            providerSubscription.addProperty("default_payment_method",call.form().get("default_payment_method"));
+            return providerSubscription.toString();
+        });
+        var continued=bean(ContinueOriginalSubscriptionSetupUseCase.class).api(context(key()),target.id(),trialSetup.operationId());
         assertThat(continued.operationId()).isEqualTo(trialSetup.operationId());
         assertThat(continued.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);
+    }
+
+    private List<Map<String,Object>> trialBills() {
+        return jdbc.queryForList("""
+            select id, subscription_id, provider_invoice_reference, kind, settlement, currency, amount_due_minor
+            from subscription_billing_records where site_id=? order by id
+            """,site.value());
+    }
+
+    @When("the customer adds a separate card to the first trial")
+    public void addSiblingCard() {
+        installTrialCard(subscription(),remote,now(),"seti_sibling","pm_sibling",AccessDecision.Reason.TRIAL);
+        reconcileTrialCard(subscription(),remote,invoices);
+        assertThat(operation(trialSetup.operationId()).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+        siblingTrial=subscription();
+        siblingMethodBeforeReplacement=bean(SubscriptionBillingProofStore.class)
+            .method(account.id(),siblingTrial.id(),"pm_sibling").orElseThrow();
+        assertThat(siblingMethodBeforeReplacement.operation()).isEqualTo(trialSetup.operationId());
+        assertThat(trialPublication()).isEqualTo(siblingPublication);
+    }
+
+    @When("the customer replaces the second trial's card through a new setup")
+    public void replaceSecondTrialCard() {
+        var target=subscription(requiredTrial.subscriptionId());
+        assertThat(target.customerId()).isEqualTo(siblingTrial.customerId());
+        assertThat(target.id()).isNotEqualTo(siblingTrial.id());
+        assertThat(requiredTrialRemote.get("default_payment_method").getAsString()).isEqualTo("pm_required");
+        assertThat(remoteCustomer.getAsJsonObject("invoice_settings").get("default_payment_method").getAsString()).isEqualTo("pm_required");
+        billsBeforeReplacement=trialBills();
+        assertThat(billsBeforeReplacement).hasSize(2);
+        beforeMethodReplacement=http.calls().size();
+        installTrialCard(target,requiredTrialRemote,now(),"seti_replacement","pm_replacement",AccessDecision.Reason.TRIAL);
+        var zero=invoice("requiredtrial","subscription_create",requiredTrialPeriod.start(),requiredTrialPeriod.end(),"ZERO",REQUIRED);
+        reconcileTrialCard(target,requiredTrialRemote,List.of(zero));
+    }
+
+    @Then("the replacement belongs only to that trial and both original zero invoices remain intact")
+    public void verifyReplacementIsolation() {
+        var target=subscription(requiredTrial.subscriptionId());
+        var proofs=bean(SubscriptionBillingProofStore.class);
+        var replaced=proofs.setup(account.id(),trialSetup.operationId()).orElseThrow();
+        assertThat(operation(trialSetup.operationId()).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);
+        assertThat(replaced.reference()).isEqualTo("seti_replacement");
+        assertThat(replaced.method()).isEqualTo("pm_replacement");
+        assertThat(proofs.method(account.id(),target.id(),replaced.method())).contains(replaced);
+        assertThat(proofs.method(account.id(),siblingTrial.id(),replaced.method())).isEmpty();
+
+        assertThat(proofs.method(account.id(),siblingTrial.id(),"pm_sibling")).contains(siblingMethodBeforeReplacement);
+        assertThat(proofs.method(account.id(),target.id(),"pm_sibling")).isEmpty();
+        int beforeSiblingRead=http.calls().size();
         readGraph();
-        respond("GET", "/v1/subscriptions/sub_billing", remote);
-        bean(ReconcileSubscriptionUseCase.class).reconcile(
-            new ReconcileSubscriptionUseCase.Command(context(key()), created.subscriptionId()));
+        var sibling=bean(SubscriptionProviderRegistry.class).forAccount(account).retrieve(
+            new SubscriptionProviderModels.Lookup(account,siblingTrial.id(),siblingTrial.providerReference(),operation(created.operationId()).providerOperationKey()));
+        assertThat(sibling.paymentMethodReady()).isTrue();
+        assertThat(http.calls().subList(beforeSiblingRead,http.calls().size()).stream()
+            .filter(call -> call.path().startsWith("/v1/payment_methods/")).map(StripeHttpFixture.Call::path))
+            .containsExactly("/v1/payment_methods/pm_sibling");
+        var calls=http.calls().subList(beforeMethodReplacement,http.calls().size());
+        assertThat(calls.stream().filter(call -> !call.method().equals("GET")))
+            .extracting(call -> call.method()+" "+call.path())
+            .containsExactly("POST /v1/setup_intents","POST /v1/subscriptions/"+target.providerReference());
+        assertThat(remoteCustomer.getAsJsonObject("invoice_settings").get("default_payment_method").getAsString()).isEqualTo("pm_required");
+        assertThat(subscription()).isEqualTo(siblingTrial);
+        assertThat(trialPublication()).isEqualTo(siblingPublication);
+        assertThat(bean(QuerySubscriptionsUseCase.class).get(actor,site,target.id()).access().reason()).isEqualTo(AccessDecision.Reason.TRIAL);
+        assertThat(trialBills()).isEqualTo(billsBeforeReplacement);
+        assertThat(cash()).isZero();
+        assertThat(count("payment_events","site_id=?",site.value())).isZero();
     }
 
     @Then("the card is saved without resuming the subscription or collecting cash")

@@ -43,6 +43,18 @@ Feature: Stripe Billing through the configured application and official SDK
     Then only the second trial owns the verified card and the sibling trial is unchanged
     And the PostgreSQL proof verifies only the exact required trial and no cash
 
+  @billing-method-replacement-isolation
+  Scenario: Replacing a card on an existing trial preserves the sibling trial and the customer default
+    Given an owned Stripe Billing subscription for a required trial proof run
+    When its original zero Stripe trial invoice is reconciled
+    And the same customer requests a required-method Stripe trial for a second product
+    Then the second trial has only its original setup receipt without cash or access
+    When that exact setup succeeds and its original Stripe zero invoice is reconciled
+    Then only the second trial owns the verified card and the sibling trial is unchanged
+    When the customer adds a separate card to the first trial
+    And the customer replaces the second trial's card through a new setup
+    Then the replacement belongs only to that trial and both original zero invoices remain intact
+
   @billing-required-trial-sweep
   Scenario: Ordinary reconciliation continues the original required trial after the owned setup succeeds
     Given an owned Stripe Billing subscription for a required trial proof run
