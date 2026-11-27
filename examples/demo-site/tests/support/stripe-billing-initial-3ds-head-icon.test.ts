@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {crc32,deflateSync} from 'node:zlib';
 // @ts-ignore Native Node executes the same icon proof as the browser guard.
-import {isLocalIssuerHeadIcon,issuerHeadIconHrefKind} from './stripe-billing-initial-3ds-head-icon.ts';
+import {describeIssuerHeadIconHref,isLocalIssuerHeadIcon,issuerHeadIconHrefKind} from './stripe-billing-initial-3ds-head-icon.ts';
 
 function pngChunk(type:string,bytes:Uint8Array){
  const chunk=Buffer.alloc(12+bytes.length);
@@ -68,6 +68,18 @@ test('admit small canonical PNG and ICO data with either ICO media alias',()=>{
  assert.equal(isLocalIssuerHeadIcon(url(onePixelIco(),png),png),false);
 });
 
+test('ASCII case in the data URL header does not change the raster proof',()=>{
+ const payload=tinyPng().toString('base64');
+ for(const prefix of ['DATA:image/png;base64,','data:IMAGE/PNG;base64,','data:image/png;BaSe64,','DaTa:ImAgE/PnG;BASE64,']){
+  assert.equal(issuerHeadIconHrefKind(prefix+payload,png),'INLINE_PNG');
+  assert.equal(isLocalIssuerHeadIcon(prefix+payload,ico),false);
+  assert.equal(isLocalIssuerHeadIcon(prefix+payload+'=',png),false);
+ }
+ assert.equal(issuerHeadIconHrefKind('DATA:,',png),'EMPTY_DATA');
+ assert.equal(isLocalIssuerHeadIcon('DATA:IMAGE/SVG+XML;BASE64,PHN2Zz4=',png),false);
+ assert.equal(isLocalIssuerHeadIcon('DATA:IMAGE/PNG;charset=utf-8;base64,'+payload,png),false);
+});
+
 test('refuse fake, malformed, oversized or differently encoded raster data',()=>{
  const badCrc=tinyPng();
  badCrc[badCrc.length-1]=badCrc[badCrc.length-1]!^1;
@@ -93,7 +105,7 @@ test('classify network and unsupported icon URLs without returning raw values',(
   assert.equal(issuerHeadIconHrefKind(href,png),'NETWORK_RASTER');
   assert.equal(isLocalIssuerHeadIcon(href,png),false);
  }
- for(const href of ['data:image/svg+xml,<svg/>','data:image/svg+xml,','data:text/html,','DATA:,','data:,x',
+ for(const href of ['data:image/svg+xml,<svg/>','data:image/svg+xml,','data:text/html,','data:,x',
   'data:;base64,PHN2Zz4=','data:image/png,hello','data:image/png;charset=utf-8,']) {
   assert.equal(issuerHeadIconHrefKind(href,png),'UNSUPPORTED_DATA');
   assert.equal(isLocalIssuerHeadIcon(href,png),false);
@@ -102,4 +114,45 @@ test('classify network and unsupported icon URLs without returning raw values',(
   assert.equal(issuerHeadIconHrefKind(href,png),'OTHER');
   assert.equal(isLocalIssuerHeadIcon(href,png),false);
  }
+});
+
+test('name the first failed data URL and raster check without retaining input',()=>{
+ const badCrc=tinyPng();
+ badCrc[badCrc.length-1]=badCrc[badCrc.length-1]!^1;
+ const badPixelFormat=tinyPng().subarray(16,29);
+ badPixelFormat[9]=3;
+ const palettedPng=Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),pngChunk('IHDR',badPixelFormat),
+  tinyPng().subarray(33)]);
+ const oversizedIco=onePixelIco();
+ oversizedIco[6]=65;
+ const inconsistentIco=onePixelIco();
+ inconsistentIco.writeInt32LE(8,22+4);
+ for(const [href,type,dataRejection] of [
+  ['data:'+'A'.repeat(23000),png,'URL_LIMIT'],
+  ['data:image/png;base64',png,'MISSING_COMMA'],
+  ['data:image/png\n;base64,',png,'HEADER_SYNTAX'],
+  ['data:image/svg+xml,',png,'MEDIA_TYPE'],
+  ['data:;,',png,'PARAMETERS'],
+  ['data:image/png;charset=utf-8;base64,',png,'PARAMETERS'],
+  ['data:;base64,TQ==',png,'MEDIA_TYPE_REQUIRED'],
+  ['data:image/png;,TQ==',png,'ENCODING'],
+  ['data:image/png;base64,TQ%3D%3D',png,'BASE64_SYNTAX'],
+  ['data:image/png;base64,TR==',png,'BASE64_CANONICAL'],
+  [url(Buffer.alloc(16385),png),png,'DECODED_LIMIT'],
+  ['data:image/png;base64,TQ==',png,'PNG_HEADER'],
+  [url(tinyPng(65),png),png,'PNG_DIMENSIONS'],
+  [url(palettedPng,png),png,'PNG_PIXEL_FORMAT'],
+  [url(tinyPng().subarray(0,-1),png),png,'PNG_CHUNK_BOUNDARY'],
+  [url(badCrc,png),png,'PNG_CHUNK_CRC'],
+  [url(tinyPng(1,undefined,'sRGB'),png),png,'PNG_CHUNK_TYPE'],
+  [url(Buffer.concat([tinyPng(),Buffer.from('trailing')]),png),png,'PNG_CHUNK_ORDER'],
+  [url(tinyPng(1,deflateSync(Buffer.alloc(7))),png),png,'PNG_IMAGE_DATA'],
+  ['data:image/x-icon;base64,TQ==',ico,'ICO_DIRECTORY'],
+  [url(oversizedIco,ico),ico,'ICO_DIMENSIONS'],
+  [url(inconsistentIco,ico),ico,'ICO_DIB'],
+ ] as const){
+  assert.deepEqual(describeIssuerHeadIconHref(href,type),{kind:'UNSUPPORTED_DATA',dataRejection});
+  assert.equal(isLocalIssuerHeadIcon(href,type),false);
+ }
+ assert.deepEqual(describeIssuerHeadIconHref(url(tinyPng(),png),ico),{kind:'UNSUPPORTED_TYPE'});
 });

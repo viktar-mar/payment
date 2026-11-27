@@ -188,17 +188,21 @@ test('the shape witness distinguishes head elements that share the same coarse l
 
 test('the shape witness reports the icon source category without returning its values',()=>{
  const source=capture('fixture-hidden-one');
- for(const [markup,iconHrefKind] of [
-  ['<link rel="shortcut icon" type="image/x-icon" href="data:image/x-icon;,">','EMPTY_DATA'],
-  ['<link rel="icon" type="image/png">','ABSENT'],
-  ['<link rel="icon" type="image/png" href="https://private-icon.example/fixture.png">','NETWORK_RASTER'],
-  ['<link rel="icon" type="image/png" href="data:text/plain,private-icon">','UNSUPPORTED_DATA'],
+ for(const [markup,iconHrefKind,iconDataRejection] of [
+  ['<link rel="shortcut icon" type="image/x-icon" href="data:image/x-icon;,">','EMPTY_DATA',undefined],
+  ['<link rel="icon" type="image/png">','ABSENT',undefined],
+  ['<link rel="icon" type="image/png" href="https://private-icon.example/fixture.png">','NETWORK_RASTER',undefined],
+  ['<link rel="icon" type="image/png" href="data:text/plain,private-icon">','UNSUPPORTED_DATA','MEDIA_TYPE'],
+  ['<link rel="icon" type="image/png" href="data:image/png;base64,TR==">','UNSUPPORTED_DATA','BASE64_CANONICAL'],
+  ['<link rel="icon" type="image/png" href="data:image/png;base64,TQ==">','UNSUPPORTED_DATA','PNG_HEADER'],
  ] as const){
   const html=Buffer.from(source.html.toString().replace('</head>',markup+'</head>'));
   const witness=describeIssuerDecisionReplay({...source,html});
   assert.ok(witness);
-  assert.equal(witness.layout.find(node=>node.headKind==='LINK_ICON')?.iconHrefKind,iconHrefKind);
-  assert.doesNotMatch(JSON.stringify(witness),/private-|fixture-hidden-one|data:/);
+  const icon=witness.layout.find(node=>node.headKind==='LINK_ICON');
+  assert.equal(icon?.iconHrefKind,iconHrefKind);
+  assert.equal(icon?.iconDataRejection,iconDataRejection);
+  assert.doesNotMatch(JSON.stringify(witness),/private-|fixture-hidden-one|data:|TR==|TQ==/);
  }
 });
 

@@ -2,7 +2,7 @@ import {defaultTreeAdapter as tree,parse,parseFragment,type DefaultTreeAdapterTy
 // @ts-ignore Native Node executes the same form proof as Playwright.
 import {externalIssuerResultForm,issuerResultForm} from './stripe-billing-initial-3ds-result-form.ts';
 // @ts-ignore Native Node executes the same closed icon classification as Playwright.
-import {issuerHeadIconHrefKind,type IssuerHeadIconHrefKind} from './stripe-billing-initial-3ds-head-icon.ts';
+import {describeIssuerHeadIconHref,type IssuerHeadIconDataRejection,type IssuerHeadIconHrefKind} from './stripe-billing-initial-3ds-head-icon.ts';
 
 const limit=65536;
 const foldJson='BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON';
@@ -316,6 +316,7 @@ type LayoutShape={
  source?:'ABSOLUTE'|'ROOT_RELATIVE'|'DOT_RELATIVE'|'RELATIVE';
  headKind?:HeadKind;
  iconHrefKind?:IssuerHeadIconHrefKind;
+ iconDataRejection?:IssuerHeadIconDataRejection;
 };
 
 const scriptMarkers=[
@@ -394,7 +395,11 @@ function shapeFor(node:DefaultTreeAdapterTypes.ChildNode):LayoutShape|undefined{
  const shape:LayoutShape={element,parent,tags,attributes:[...attributes]};
  if(element==='OTHER'&&parent==='HEAD'){
   shape.headKind=headKind(node);
-  if(shape.headKind==='LINK_ICON')shape.iconHrefKind=issuerHeadIconHrefKind(attribute(node,'href'),attribute(node,'type'));
+  if(shape.headKind==='LINK_ICON'){
+   const icon=describeIssuerHeadIconHref(attribute(node,'href'),attribute(node,'type'));
+   shape.iconHrefKind=icon.kind;
+   if(icon.kind==='UNSUPPORTED_DATA')shape.iconDataRejection=icon.dataRejection;
+  }
  }
  if(element==='COMPANION'){
   const contents=node.childNodes.filter(tree.isTextNode).map(child=>child.value).join('');

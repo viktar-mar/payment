@@ -16,6 +16,7 @@ import {prepareIssuerReplayCapture} from './stripe-billing-initial-3ds-replay-ca
 // @ts-ignore Native Node executes the same fixture as the result-form tests.
 import {syntheticIssuerDomForm} from './stripe-billing-initial-3ds-dom-fixture.ts';
 import type {IssuerReplayCapture} from './stripe-billing-initial-3ds';
+import type {IssuerDecisionReplayShape} from './stripe-billing-initial-3ds-replay-fixture';
 import type {IssuerReplayStatus} from './stripe-billing-initial-3ds-terminal';
 
 type CaptureSource=Parameters<IssuerReplayCapture['save']>[0];
@@ -98,14 +99,16 @@ const foldedDomWrongStylesheetReceipt='a folded dynamic CRes form with a differe
 const foldedDomLocalHeadIcon='a folded dynamic CRes form with a local head icon';
 const foldedDomNetworkHeadIcon='a folded dynamic CRes form with a network head icon';
 const foldedDomInlinePngHeadIcon='a folded dynamic CRes form with a raster data head icon';
+const foldedDomMixedCaseHeadIcon='a folded dynamic CRes form with mixed-case data head icon metadata';
 const foldedDomIconAfterHead='a folded dynamic CRes form with a head icon written after the closing tag';
+const captureUnsupportedHeadIcon='a folded dynamic CRes form with an unsupported data head icon and private capture';
 const staticWithScriptStylesheet='a static CRes form with a blocked script-initiated stylesheet';
 const foldedDomExtraScript='a folded dynamic CRes form with an extra script statement';
 const foldedDomWireMismatch='a folded dynamic CRes form with different expected POST bytes';
 const foldedDomLegacyEncoding='a folded dynamic CRes form with legacy document encoding';
 const foldedDomWrongTransaction='a folded dynamic CRes form for a different 3DS transaction';
 const foldedDomCases=new Set([foldedDom,foldedDomHeadStylesheet,foldedDomWrongStylesheetReceipt,
- foldedDomLocalHeadIcon,foldedDomNetworkHeadIcon,foldedDomInlinePngHeadIcon,foldedDomIconAfterHead,
+ foldedDomLocalHeadIcon,foldedDomNetworkHeadIcon,foldedDomInlinePngHeadIcon,foldedDomMixedCaseHeadIcon,foldedDomIconAfterHead,captureUnsupportedHeadIcon,
  foldedDomExtraScript,foldedDomWireMismatch,foldedDomLegacyEncoding,foldedDomWrongTransaction]);
 const captureFoldedCompanion='a CRes refusal with opt-in to its anonymized paired fixture';
 const captureMaskedLayout='a CRes refusal with opt-in and an outer language attribute';
@@ -114,7 +117,7 @@ const captureMissingReceipt='a CRes refusal with opt-in and no paired fixture re
 const captureAbortFailure='a CRes refusal with opt-in and no confirmed abort for the fixture';
 const captureOutcomes=new Map<string,IssuerReplayStatus>([
  [captureFoldedCompanion,'CAPTURED'],[captureMaskedLayout,'STRUCTURAL_ONLY'],[captureMissingDecision,'DECISION_RECEIPT_MISSING'],
- [captureMissingReceipt,'SCRIPT_RECEIPT_MISSING'],[captureAbortFailure,'ABORT_UNCONFIRMED'],
+ [captureMissingReceipt,'SCRIPT_RECEIPT_MISSING'],[captureAbortFailure,'ABORT_UNCONFIRMED'],[captureUnsupportedHeadIcon,'STRUCTURAL_ONLY'],
 ]);
 const externalNested='a CRes form written by an external script under a nonstructural parent';
 const externalUnknown='a CRes form from an unsupported external DOM builder';
@@ -169,7 +172,7 @@ const refusedFollowups=new Map([
  [invalidUtf8Decision,'BROWSER_CHALLENGE_CRES_DECISION_UTF8'],
 ]);
 const wrongScriptMime='issuer script with the wrong MIME type is refused';
-for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,namedDecisionCres,literalDecisionCres,insertionDecisionCres,externalLiteral,externalGzip,externalHead,externalHeadWithData,externalHeadWithCompanionId,externalWithCompanionId,externalWithStrictCompanion,foldedDom,foldedDomHeadStylesheet,foldedDomLocalHeadIcon,foldedDomInlinePngHeadIcon,staticWithScriptStylesheet,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
+for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,namedDecisionCres,literalDecisionCres,insertionDecisionCres,externalLiteral,externalGzip,externalHead,externalHeadWithData,externalHeadWithCompanionId,externalWithCompanionId,externalWithStrictCompanion,foldedDom,foldedDomHeadStylesheet,foldedDomLocalHeadIcon,foldedDomInlinePngHeadIcon,foldedDomMixedCaseHeadIcon,staticWithScriptStylesheet,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
 test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?mode+' is blocked after the original 2xx':mode===wrongScriptMime?mode:
  'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
@@ -189,12 +192,13 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const dynamicForm=mode===dynamicDecisionCres;
  const captureEnabled=captureOutcomes.has(mode);
  const missingDecisionReceipt=mode===uncapturedDecision||mode===captureMissingDecision;
- const foldedCompanion=mode===externalWithFoldedCompanion||captureEnabled;
- const companionReplay=mode===externalWithStrictCompanion||foldedCompanion;
  const hasFoldedDom=foldedDomCases.has(mode);
+ const foldedCompanion=mode===externalWithFoldedCompanion||captureEnabled&&!hasFoldedDom;
+ const companionReplay=mode===externalWithStrictCompanion||foldedCompanion;
  const legacyStylesheet=mode===staticWithScriptStylesheet;
  const hasDecisionStylesheet=mode===foldedDomHeadStylesheet||mode===foldedDomWrongStylesheetReceipt||legacyStylesheet;
- const hasHeadIcon=[foldedDomLocalHeadIcon,foldedDomNetworkHeadIcon,foldedDomInlinePngHeadIcon,foldedDomIconAfterHead].includes(mode);
+ const hasHeadIcon=[foldedDomLocalHeadIcon,foldedDomNetworkHeadIcon,foldedDomInlinePngHeadIcon,foldedDomMixedCaseHeadIcon,
+  foldedDomIconAfterHead,captureUnsupportedHeadIcon].includes(mode);
  const externalForm=[externalLiteral,externalGzip,externalHead,externalHeadWithData,externalWithExecutable,
   externalHeadWithCompanionId,externalWithCompanionId,externalWithInvalidCompanion,externalWithCommentCompanion,
   externalWithAssignmentCompanion,externalWithLabelledCompanion,
@@ -296,7 +300,11 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const replayCompanion=foldedCompanion?
   Buffer.from(companionJson).toString('base64').replace(/^.{5}/,'$&\n'):companionJson;
  const png='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=';
- const decisionIcon=mode===foldedDomInlinePngHeadIcon?`<link rel="icon" href="data:image/png;base64,${png}" type="image/png">`:
+ const pngHref='data:image/png;base64,'+png,mixedCasePngHref='DaTa:ImAgE/PnG;BaSe64,'+png;
+ const unsupportedIconHref='data:image/svg+xml,%3Csvg%20id%3D%22fixture-private-icon%22%2F%3E';
+ const decisionIcon=mode===captureUnsupportedHeadIcon?`<link rel="icon" href="${unsupportedIconHref}" type="image/png">`:
+  mode===foldedDomMixedCaseHeadIcon?`<link rel="icon" href="${mixedCasePngHref}" type="image/png">`:
+  mode===foldedDomInlinePngHeadIcon?`<link rel="icon" href="${pngHref}" type="image/png">`:
   `<link rel="shortcut icon" href="${mode===foldedDomNetworkHeadIcon?'/fixture-head-icon.ico':'data:image/x-icon;,'}" type="image/x-icon">`;
  const decisionHead=hasDecisionStylesheet?`<head><link rel="stylesheet" href="${decisionStylesheetPath}" type="text/css"></head>`:
   mode===foldedDomIconAfterHead?`<head></head>${decisionIcon}`:
@@ -367,6 +375,14 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  try{
   const context=await browser.newContext({serviceWorkers:'block',acceptDownloads:false,ignoreHTTPSErrors:Boolean(networkFixture)});
   const page=await context.newPage(),forwarded:string[]=[],refusals:string[]=[];
+  if(mode===foldedDomMixedCaseHeadIcon){
+   const responses=await page.evaluate(urls=>Promise.all(urls.map(async url=>{
+    const response=await fetch(url);
+    return {type:response.headers.get('content-type'),bytes:[...new Uint8Array(await response.arrayBuffer())]};
+   })),[pngHref,mixedCasePngHref]);
+   const image={type:'image/png',bytes:[...Buffer.from(png,'base64')]};
+   assert.deepEqual(responses,[image,image]);
+  }
   const passiveRequests:Request[]=[],passiveFailures:Request[]=[],passiveResponses:Response[]=[];
   const passiveAborts:(string|undefined)[]=[],authorized:string[]=[];
   page.on('requestfailed',request=>{if(assetUrls.includes(request.url())||isDecisionStylesheet(request.url()))passiveFailures.push(request);});
@@ -626,10 +642,10 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    // Chromium can return invalid source as exact bytes or lossy decoded text.
    assert.equal(refusals[0],mode===externalInvalidUtf8&&scriptBodyCaptured?
     'BROWSER_CHALLENGE_CRES_SCRIPT_UTF8':refusedFollowups.get(mode));
-   if(companionReplay){
-    assert.deepEqual(request.postDataBuffer(),replayWire);
+   if(companionReplay||captureEnabled){
+    if(companionReplay)assert.deepEqual(request.postDataBuffer(),replayWire);
     if(captureEnabled)await captureDone.promise;
-    const saved=mode===captureFoldedCompanion||mode===captureMaskedLayout;
+    const saved=mode===captureFoldedCompanion||mode===captureMaskedLayout||mode===captureUnsupportedHeadIcon;
     assert.equal(scriptBodyRequested,saved||mode===captureMissingReceipt);
     assert.equal(captureCalls,saved?1:0);
     assert.equal(captureStages.at(-1),captureOutcomes.get(mode));
@@ -643,8 +659,16 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
      assert.equal(capturedSource.frameName,issuerName);
      assert.equal(lstatSync(captureFile!).mode&0o777,0o600);
      const artifact=readFileSync(captureFile!,'utf8');
-     assert.equal(JSON.parse(artifact).status,captureOutcomes.get(mode));
+     const report=JSON.parse(artifact) as {status:string;shape?:IssuerDecisionReplayShape};
+     assert.equal(report.status,captureOutcomes.get(mode));
      assert.doesNotMatch(artifact,/reviewed-test-issuer|stripe-challenge-frame|fixture-decision\.js/);
+     if(mode===captureUnsupportedHeadIcon){
+      assert.deepEqual(Object.keys(report).sort(),['shape','status']);
+      const icon=report.shape?.layout.find(node=>node.headKind==='LINK_ICON');
+      assert.equal(icon?.iconHrefKind,'UNSUPPORTED_DATA');
+      assert.equal(icon?.iconDataRejection,'MEDIA_TYPE');
+      assert.doesNotMatch(artifact,/fixture-private-icon|image\/svg\+xml|%3Csvg|data:/i);
+     }
     }else if(captureFile)assert.throws(()=>lstatSync(captureFile),{code:'ENOENT'});
    }
    if(submitsCres&&mode!==issuerCresDestination)assert.equal(decisionBodyCaptured,
