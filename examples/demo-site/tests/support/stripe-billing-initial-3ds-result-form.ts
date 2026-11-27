@@ -1,6 +1,8 @@
 import {defaultTreeAdapter,parse,parseFragment,type DefaultTreeAdapterTypes} from 'parse5';
 // @ts-ignore Native Node executes the same closed syntax proof as Playwright.
 import {proveIssuerDomForm} from './stripe-billing-initial-3ds-dom-form.ts';
+// @ts-ignore Native Node executes the same local icon proof as Playwright.
+import {isLocalIssuerHeadIcon} from './stripe-billing-initial-3ds-head-icon.ts';
 
 const htmlNamespace='http://www.w3.org/1999/xhtml';
 const controls=new Set(['button','datalist','fieldset','input','object','output','select','textarea']);
@@ -195,12 +197,21 @@ function canonicalIssuerAssetUrl(src:string,documentUrl:string,matchesPath:(path
  if(asset.origin===document.origin&&asset.href===asset.origin+asset.pathname&&matchesPath(asset.pathname))return asset.href;
 }
 
-/** A single head link can be accounted for by a separate browser block receipt. */
-function headStylesheetUrl(element:Element,documentUrl:string):string|undefined{
- const parent=element.parentNode,href=attribute(element,'href');
+function plainHeadLink(element:Element){
+ const parent=element.parentNode;
  if(element.namespaceURI!==htmlNamespace||element.tagName!=='link'||parent?.nodeName!=='head'||
-    !element.sourceCodeLocation?.startTag||!parent.sourceCodeLocation?.startTag||
-    element.attrs.length!==3||attribute(element,'rel')!=='stylesheet'||attribute(element,'type')!=='text/css'||!href)return;
+    element.attrs.length!==3)return;
+ const tag=element.sourceCodeLocation?.startTag,head=parent.sourceCodeLocation;
+ if(!tag||!head?.startTag)return;
+ const rel=attribute(element,'rel'),href=attribute(element,'href'),type=attribute(element,'type');
+ // HTML parsing can place a link from after </head> back into the head node.
+ const insideHead=Boolean(head.endTag&&tag.startOffset>=head.startTag.endOffset&&tag.endOffset<=head.endTag.startOffset);
+ if(rel&&href&&type)return {rel,href,type,insideHead};
+}
+
+/** A single head stylesheet needs a separate browser block receipt. */
+function headStylesheetUrl({rel,href,type}:{rel:string;href:string;type:string},documentUrl:string):string|undefined{
+ if(rel!=='stylesheet'||type!=='text/css')return;
  return canonicalIssuerAssetUrl(href,documentUrl,path=>/^\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.css$/.test(path));
 }
 
@@ -501,7 +512,7 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
  const pending:DefaultTreeAdapterTypes.Node[]=[document];
  const scripts:ScriptElement[]=[];
  let layout:LayoutRejection|undefined;
- let blockedStylesheetUrl:string|undefined,foldedLayoutUnproved=false;
+ let blockedStylesheetUrl:string|undefined,provedHeadLink=false,foldedLayoutUnproved=false;
  while(pending.length){
   const node=pending.pop()!;
   if(defaultTreeAdapter.isElementNode(node)){
@@ -526,9 +537,14 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
     const rejection=documentElementRejection(node);
     if(rejection){
      layout??=rejection;
-     const stylesheet=!blockedStylesheetUrl&&documentUrl?headStylesheetUrl(node,documentUrl):undefined;
-     if(stylesheet)blockedStylesheetUrl=stylesheet;
-     else foldedLayoutUnproved=true;
+     const link=!provedHeadLink&&documentUrl?plainHeadLink(node):undefined;
+     const stylesheet=link&&documentUrl?headStylesheetUrl(link,documentUrl):undefined;
+     const localIcon=link?.insideHead&&/^(?:icon|shortcut[\t\n\f\r ]+icon)$/i.test(link.rel)&&
+      isLocalIssuerHeadIcon(link.href,link.type);
+     if(stylesheet||localIcon){
+      provedHeadLink=true;
+      blockedStylesheetUrl=stylesheet;
+     }else foldedLayoutUnproved=true;
     }
    }
   }else if(defaultTreeAdapter.isTextNode(node)&&!whitespaceNode(node)&&

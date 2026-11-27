@@ -30,10 +30,10 @@ async function serveIssuerResponse(url:URL,bytes:Buffer,encoding:string,chunked:
    return createServer({key:readFileSync(key),cert:readFileSync(cert)});
   }finally{rmSync(directory,{recursive:true,force:true});}
  })();
- let requests=0;
+ let requests=0,unexpectedRequests=0;
  server.on('request',(request,response)=>{
   if(request.method!==(script?'GET':'POST')||request.url!==url.pathname||request.headers.host!==url.host||++requests!==1){
-   response.writeHead(404).end();return;
+   unexpectedRequests++;response.writeHead(404).end();return;
   }
   request.resume();
   const length=chunked?{}:{'Content-Length':bytes.length};
@@ -47,7 +47,7 @@ async function serveIssuerResponse(url:URL,bytes:Buffer,encoding:string,chunked:
  });
  const address=server.address();
  assert.ok(address&&typeof address==='object');
- return {port:address.port,requests:()=>requests,close:async()=>{
+ return {port:address.port,requests:()=>requests,unexpectedRequests:()=>unexpectedRequests,close:async()=>{
   await new Promise<void>((resolve,reject)=>{
    server.close(error=>error?reject(error):resolve());
    server.closeAllConnections();
@@ -95,12 +95,17 @@ const externalWithFoldedCompanion='a CRes form written by an external script bes
 const foldedDom='a folded Base64 companion and its dynamic CRes form';
 const foldedDomHeadStylesheet='a folded dynamic CRes form with a blocked head stylesheet';
 const foldedDomWrongStylesheetReceipt='a folded dynamic CRes form with a different head stylesheet receipt';
+const foldedDomLocalHeadIcon='a folded dynamic CRes form with a local head icon';
+const foldedDomNetworkHeadIcon='a folded dynamic CRes form with a network head icon';
+const foldedDomInlinePngHeadIcon='a folded dynamic CRes form with a raster data head icon';
+const foldedDomIconAfterHead='a folded dynamic CRes form with a head icon written after the closing tag';
 const staticWithScriptStylesheet='a static CRes form with a blocked script-initiated stylesheet';
 const foldedDomExtraScript='a folded dynamic CRes form with an extra script statement';
 const foldedDomWireMismatch='a folded dynamic CRes form with different expected POST bytes';
 const foldedDomLegacyEncoding='a folded dynamic CRes form with legacy document encoding';
 const foldedDomWrongTransaction='a folded dynamic CRes form for a different 3DS transaction';
 const foldedDomCases=new Set([foldedDom,foldedDomHeadStylesheet,foldedDomWrongStylesheetReceipt,
+ foldedDomLocalHeadIcon,foldedDomNetworkHeadIcon,foldedDomInlinePngHeadIcon,foldedDomIconAfterHead,
  foldedDomExtraScript,foldedDomWireMismatch,foldedDomLegacyEncoding,foldedDomWrongTransaction]);
 const captureFoldedCompanion='a CRes refusal with opt-in to its anonymized paired fixture';
 const captureMaskedLayout='a CRes refusal with opt-in and an outer language attribute';
@@ -153,6 +158,8 @@ const refusedFollowups=new Map([
  [externalWithFoldedCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON'],
  [foldedDomExtraScript,'BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED_DOM'],
  [foldedDomWrongStylesheetReceipt,'BROWSER_CHALLENGE_CRES_HEAD_STYLESHEET_BLOCK'],
+ [foldedDomNetworkHeadIcon,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON'],
+ [foldedDomIconAfterHead,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON'],
  [foldedDomWireMismatch,'BROWSER_CHALLENGE_CRES_BODY'],
  [foldedDomLegacyEncoding,'BROWSER_CHALLENGE_CRES_BODY'],
  [foldedDomWrongTransaction,'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
@@ -162,7 +169,7 @@ const refusedFollowups=new Map([
  [invalidUtf8Decision,'BROWSER_CHALLENGE_CRES_DECISION_UTF8'],
 ]);
 const wrongScriptMime='issuer script with the wrong MIME type is refused';
-for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,namedDecisionCres,literalDecisionCres,insertionDecisionCres,externalLiteral,externalGzip,externalHead,externalHeadWithData,externalHeadWithCompanionId,externalWithCompanionId,externalWithStrictCompanion,foldedDom,foldedDomHeadStylesheet,staticWithScriptStylesheet,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
+for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,namedDecisionCres,literalDecisionCres,insertionDecisionCres,externalLiteral,externalGzip,externalHead,externalHeadWithData,externalHeadWithCompanionId,externalWithCompanionId,externalWithStrictCompanion,foldedDom,foldedDomHeadStylesheet,foldedDomLocalHeadIcon,foldedDomInlinePngHeadIcon,staticWithScriptStylesheet,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
 test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?mode+' is blocked after the original 2xx':mode===wrongScriptMime?mode:
  'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
@@ -187,6 +194,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const hasFoldedDom=foldedDomCases.has(mode);
  const legacyStylesheet=mode===staticWithScriptStylesheet;
  const hasDecisionStylesheet=mode===foldedDomHeadStylesheet||mode===foldedDomWrongStylesheetReceipt||legacyStylesheet;
+ const hasHeadIcon=[foldedDomLocalHeadIcon,foldedDomNetworkHeadIcon,foldedDomInlinePngHeadIcon,foldedDomIconAfterHead].includes(mode);
  const externalForm=[externalLiteral,externalGzip,externalHead,externalHeadWithData,externalWithExecutable,
   externalHeadWithCompanionId,externalWithCompanionId,externalWithInvalidCompanion,externalWithCommentCompanion,
   externalWithAssignmentCompanion,externalWithLabelledCompanion,
@@ -287,7 +295,12 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const companionJson='{"fixture":true}';
  const replayCompanion=foldedCompanion?
   Buffer.from(companionJson).toString('base64').replace(/^.{5}/,'$&\n'):companionJson;
- const decisionHead=hasDecisionStylesheet?`<head><link rel="stylesheet" href="${decisionStylesheetPath}" type="text/css"></head>`:'';
+ const png='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=';
+ const decisionIcon=mode===foldedDomInlinePngHeadIcon?`<link rel="icon" href="data:image/png;base64,${png}" type="image/png">`:
+  `<link rel="shortcut icon" href="${mode===foldedDomNetworkHeadIcon?'/fixture-head-icon.ico':'data:image/x-icon;,'}" type="image/x-icon">`;
+ const decisionHead=hasDecisionStylesheet?`<head><link rel="stylesheet" href="${decisionStylesheetPath}" type="text/css"></head>`:
+  mode===foldedDomIconAfterHead?`<head></head>${decisionIcon}`:
+  hasHeadIcon?`<head>${decisionIcon}</head>`:'';
  const externalDocument=domFixture?`<!doctype html>${decisionHead}<body>${jsonWithId(domFixture.id,domFixture.folded)}${externalTag}</body>`:
   mode===externalHead?`<!doctype html><head>${externalTag}</head><body></body>`:
   mode===externalHeadWithData?`<!doctype html><head><script type="application/json">{"fixture":true}</script>${externalTag}</head><body></body>`:
@@ -637,10 +650,12 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    if(submitsCres&&mode!==issuerCresDestination)assert.equal(decisionBodyCaptured,
     mode!==oversizedDecision&&mode!==foldedDomWrongTransaction&&!missingDecisionReceipt);
    if(networkFixture)assert.equal(networkFixture.requests(),1);
+   if(hasHeadIcon)assert.equal(networkFixture?.unexpectedRequests(),0);
    if(externalForm&&mode!==externalInvalidUtf8)assert.equal(scriptBodyCaptured,
     ![externalNoReceipt,externalNested,externalWithExecutable,externalWithInvalidCompanion,externalWithCommentCompanion,
      externalWithAssignmentCompanion,externalWithLabelledCompanion,externalWithFoldedCompanion,
-     captureMissingDecision,captureMissingReceipt,captureAbortFailure,foldedDomWrongTransaction,foldedDomWrongStylesheetReceipt].includes(mode));
+     captureMissingDecision,captureMissingReceipt,captureAbortFailure,foldedDomWrongTransaction,
+     foldedDomWrongStylesheetReceipt,foldedDomNetworkHeadIcon,foldedDomIconAfterHead].includes(mode));
    assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision,...(externalForm?[decisionAsset]:[])]);
    assert.deepEqual(authorized,forwarded);
    assertDecisionStylesheetBlocked();
@@ -657,10 +672,11 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   assert.equal(attachedIssuerFrame,true);
   if(isolated)assert.equal(separateIssuerTarget,true);
   if(mode===lateDecisionHeaders)assert.ok(lateHeadersObserved&&decisionBodyCaptured);
- if(networkFixture){
-  assert.equal(networkFixture.requests(),1);
-  assert.equal(decisionBodyCaptured,true);
- }
+  if(networkFixture){
+   assert.equal(networkFixture.requests(),1);
+   assert.equal(decisionBodyCaptured,true);
+  }
+  if(hasHeadIcon)assert.equal(networkFixture?.unexpectedRequests(),0);
   if(externalForm)assert.equal(scriptBodyCaptured,true);
   if(companionReplay)assert.equal(scriptBodyRequested,true);
   if(mode===uncapturedDecision)assert.equal(decisionBodyCaptured,false);

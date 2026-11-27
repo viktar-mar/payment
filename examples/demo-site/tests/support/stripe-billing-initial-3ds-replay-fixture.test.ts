@@ -180,8 +180,25 @@ test('the shape witness distinguishes head elements that share the same coarse l
   assert.equal(witness.checkpoint,foldCheckpoint);
   assert.deepEqual(witness.layout.find(node=>node.element==='OTHER'),{
    element:'OTHER',parent:'HEAD',tags:'OPEN',attributes:['OTHER','TYPE'],headKind,
+   ...(headKind==='LINK_ICON'?{iconHrefKind:'NETWORK_RASTER'}:{}),
   });
   assert.doesNotMatch(JSON.stringify(witness),/private-|fixture-hidden-one/);
+ }
+});
+
+test('the shape witness reports the icon source category without returning its values',()=>{
+ const source=capture('fixture-hidden-one');
+ for(const [markup,iconHrefKind] of [
+  ['<link rel="shortcut icon" type="image/x-icon" href="data:image/x-icon;,">','EMPTY_DATA'],
+  ['<link rel="icon" type="image/png">','ABSENT'],
+  ['<link rel="icon" type="image/png" href="https://private-icon.example/fixture.png">','NETWORK_RASTER'],
+  ['<link rel="icon" type="image/png" href="data:text/plain,private-icon">','UNSUPPORTED_DATA'],
+ ] as const){
+  const html=Buffer.from(source.html.toString().replace('</head>',markup+'</head>'));
+  const witness=describeIssuerDecisionReplay({...source,html});
+  assert.ok(witness);
+  assert.equal(witness.layout.find(node=>node.headKind==='LINK_ICON')?.iconHrefKind,iconHrefKind);
+  assert.doesNotMatch(JSON.stringify(witness),/private-|fixture-hidden-one|data:/);
  }
 });
 

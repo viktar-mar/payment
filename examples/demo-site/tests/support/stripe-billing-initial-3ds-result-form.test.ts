@@ -66,6 +66,41 @@ test('require a blocked same-origin stylesheet receipt for one plain folded-comp
  assert.equal(read(document('',folded,headLink)),undefined);
 });
 
+test('prove a folded form with a single explicit local head icon, without a network receipt',()=>{
+ const destination='https://hooks.stripe.com/fixture/result';
+ const {id,folded,json,script}=syntheticIssuerDomForm(destination,{cres:'YQ=='});
+ const link=(href:string,type='image/x-icon',rel='shortcut icon')=>`<link rel="${rel}" href="${href}" type="${type}">`;
+ const document=(head:string,data=folded,body='')=>`<!doctype html><html><head>${head}</head><body>${body}<script type="application/json" id="${id}">${data}</script><script src="/result.js"></script></body></html>`;
+ const read=(html:string)=>issuerResultForm(html,undefined,undefined,'https://reviewed-test-issuer.stripe.com/fixture/decision');
+ const localIcon=link('data:image/x-icon;,');
+ for(const head of [localIcon,link('data:,','image/png','icon'),link('data:;base64,')]){
+  const result=read(document(head));
+  assert.ok(result&&'scriptUrl' in result&&result.foldedCompanion,head);
+  assert.equal(result.blockedStylesheetUrl,undefined);
+  assert.deepEqual(externalIssuerResultForm(Buffer.from(script),undefined,undefined,result.placement,result.foldedCompanion),
+   {action:destination,body:'cres=YQ%3D%3D'});
+ }
+ assert.equal(read(document(localIcon,json)),undefined);
+ assert.equal(read(document('',folded,localIcon)),undefined);
+ assert.equal(read(document('').replace('</head>','</head>'+localIcon)),undefined);
+ assert.equal(read(document(localIcon).replace('</head>','')),undefined);
+ for(const head of [
+  localIcon+localIcon,
+  localIcon+'<link rel="stylesheet" href="/fixture.css" type="text/css">',
+  localIcon+'<base href="https://private.example/">',
+  localIcon.replace(' rel=',' onload="void 0" rel='),
+  localIcon.replace(' rel=',' sizes="32x32" rel='),
+  localIcon.replace(' rel=',' type="image/png" rel='),
+  localIcon.replace(' href="data:image/x-icon;,"',''),
+  link(''),link('/favicon.ico'),link('/fixture.png','image/png','icon'),
+  link('https://reviewed-test-issuer.stripe.com/favicon.ico'),
+  link('https://foreign.example/fixture.png','image/png','icon'),
+  link('data:image/svg+xml,','image/svg+xml','icon'),
+  link('data:image/png;base64,VGhpcyBpcyBub3QgYW4gaW1hZ2U=','image/png','icon'),
+  link('data:image/png;,','image/x-icon'),link('data:,','image/x-icon','icon preload'),
+ ])assert.equal(read(document(head)),undefined,head);
+});
+
 test('keep its strict layout, base64 and controls even when a folded JSON candidate is present',()=>{
  const destination='https://hooks.stripe.com/fixture/result';
  const {id,folded}=syntheticIssuerDomForm(destination,{cres:'YQ=='});
