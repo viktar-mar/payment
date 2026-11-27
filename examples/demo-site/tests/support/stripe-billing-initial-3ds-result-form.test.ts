@@ -166,8 +166,8 @@ for(const [reason,contents] of Object.entries({
  INCOMPLETE:['{"private-fixture":','"private-fixture','"private-fixture\\'],
  PROPERTY:['{privateFixture:true}','{"private-fixture":true,}','{&quot;private-fixture&quot;:invalid}'],
  DELIMITER:['{"private-fixture" true}','{"private-fixture":true "extra":false}','["private-fixture" true]'],
- NUMBER:['[-]','[1.]','[1e]','[01]'],
- TRAILING:['{"private-fixture":true} extra','77u/e30='], // The base64 candidate decodes to a BOM followed by JSON.
+ NUMBER:['[-]','[1.]','[1e]','[01]','01'],
+ TRAILING:['{"private-fixture":true} extra','77u/e30=','1 fixture'], // The base64 candidate decodes to a BOM followed by JSON.
  FORMAT_BASE_TEXT:['ZTMwPQ==','IO+7v3t9'], // Decodes to Base64 text or whitespace + BOM + JSON, respectively.
  FORMAT_BASE_BYTES:['Iv8i'],
  FORMAT_BOM:['\uFEFF\uFEFF{}','\uFEFF<!-- {} -->'],
@@ -200,12 +200,36 @@ for(const [reason,contents] of Object.entries({
  TEXT_NUMERIC:['+1','+.5','+12.3e-4'],
  TEXT_BASE_SHAPE:['Ing/Ih==','Ing_Ih==','Is+_Ig==','Ing_Ig===','Ing/Ig'],
  TEXT_IDENTIFIER:['hello','privateFixture','window.privateFixture'],
- TEXT_OTHER:[
-  'private fixture','_private fixture','+private fixture','prefix https://example.invalid/fixture',
-  'prefix data:application/json,%7B%7D','data:','data:private-fixture','data:application/json,private fixture',
-  'prefix fixture({})','fixture == {}','fixture => ({})',
-  'prefix a=1&b=2','state\t+=1','fixture.'+' '.repeat(65000)+'?',
+ TEXT_SHAPE_ATNSA:['private fixture','_private fixture','another secret'],
+ TEXT_SHAPE_STNSA:['+private fixture'],
+ TEXT_SHAPE_AONSA:[
+  'prefix https://example.invalid/fixture','data:application/json,private fixture',
+  'prefix a=1&b=2','state\t+=1','fixture < 1',
  ],
+ TEXT_SHAPE_AOPSA:['prefix data:application/json,%7B%7D','private %7b'],
+ TEXT_SHAPE_AOESA:['private &quot;value&quot;','private &#x21;','private &#33;'],
+ TEXT_SHAPE_APBSA:[String.raw`private \u0021`],
+ TEXT_SHAPE_AOMSA:[String.raw`private %7B &quot;value&quot; \u0021`],
+ TEXT_SHAPE_ADNSA:['data:','data:private-fixture','private fixture; another'],
+ TEXT_SHAPE_ABNSA:[
+  'prefix fixture({})','fixture => ({})','fixture label: {about:1}',
+  'fixture label: {};;','fixture label: {} trailing','fixture label: [broken] [true]',
+ ],
+ TEXT_SHAPE_AMNSA:['prefix <fixture attr="value"> {about:1}','prefix </fixture>','prefix <!-- fixture -->'],
+ TEXT_SHAPE_AJNSA:[
+  'fixture label: {"fixture":true};','a different label: {"secret":"sentinel"}',
+  'fixture == {}','prefix <fixture> {"fixture":true}',
+  'prefix [broken] {"fixture":true}','prefix {broken} [true]',
+ ],
+ TEXT_SHAPE_AJNLA:['\tfixture label:\n [true] ;\r\n'],
+ TEXT_SHAPE_ABNSU:['fixture label: {}\u00a0;'],
+ TEXT_SHAPE_ATNLA:['fixture\nlabel','fixture\r\nlabel'],
+ TEXT_SHAPE_ATNSU:['fixture café','fixture label\u2028'],
+ TEXT_SHAPE_ATNLU:['fixture\u2028label','fixture\u2029label'],
+ TEXT_SHAPE_ATNLC:['fixture\u0085label'],
+ TEXT_SHAPE_APNSC:['fixture\u200dlabel','fixture\u0001label'],
+ TEXT_SHAPE_APNSA:['fixture.'+' '.repeat(65527)+'?'],
+ FORMAT_LIMIT:['fixture.'+' '.repeat(65528)+'?'],
  FORMAT_OTHER:[')private-fixture','é'],
 }))test('reject malformed companion JSON with the fixed '+reason+' diagnostic',()=>{
  for(const text of contents){

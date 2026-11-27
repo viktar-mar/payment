@@ -71,6 +71,21 @@ test('CRes external script checkpoints reveal only a fixed reason',()=>{
   assert.equal(browserDiagnostic(privateOrigin.acceptanceBrowserFailure(code+' /private-script.js'),'ACCEPTANCE'),null);
  }
 });
+test('CRes text signatures cross the boundary with five closed positions',()=>{
+ const prefix='BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_SHAPE_';
+ for(const signature of ['ADS','JMBODTP','NPEBM','SL','AUC'].reduce(
+  (prefixes,axis)=>prefixes.flatMap(base=>[...axis].map(letter=>base+letter)),[''])){
+  const code=prefix+signature,error=privateOrigin.acceptanceBrowserFailure(code);
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(JSON.stringify(error),'{}');
+ }
+ for(const invalid of ['XJNSA','AXNSA','AJXSA','AJNXA','AJNSX','AJNS','AJNSAA','AJNSA\n','aj nsa',
+  'AJNSA_PRIVATE','AJNSA private/name?value=fixture','AJNSA\0']){
+  const code=prefix+invalid;
+  assert.equal(privateOrigin.isAcceptanceBrowserDiagnostic(code),false);
+  assert.equal(browserDiagnostic(privateOrigin.acceptanceBrowserFailure(code),'ACCEPTANCE'),null);
+ }
+});
 test('provider boundaries are finite private provenance without payload',()=>{
  for(const code of [
   'BROWSER_PROVIDER_HEADERS','BROWSER_PROVIDER_CURRENT','BROWSER_PROVIDER_REDIRECT','BROWSER_PROVIDER_USERINFO','BROWSER_PROVIDER_AUTH','BROWSER_PROVIDER_ORIGIN_SCHEME','BROWSER_PROVIDER_ORIGIN_PORT','BROWSER_PROVIDER_ORIGIN_STRIPE_COM','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK','BROWSER_PROVIDER_ORIGIN_OTHER','BROWSER_PROVIDER_NAVIGATION','BROWSER_PROVIDER_STATIC_FRAME','BROWSER_PROVIDER_STATIC_REQUEST','BROWSER_PROVIDER_STATIC_RESPONSE','BROWSER_PROVIDER_FALLBACK',

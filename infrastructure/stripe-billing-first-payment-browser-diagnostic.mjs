@@ -183,7 +183,9 @@ codes.add('BROWSER_PROVIDER_STATIC_NAVIGATION_BLOCK');
 codes.add('BROWSER_CARD_INCOMPLETE');
 export const isBrowserDiagnostic=code=>typeof code==='string'&&codes.has(code);
 export const isMethodBrowserDiagnostic=code=>typeof code==='string'&&methodCodes.has(code);
-export const isAcceptanceBrowserDiagnostic=code=>typeof code==='string'&&acceptanceCodes.has(code);
+// Each position has a closed alphabet. No part of the companion text enters the code.
+const companionTextShape=/^BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_SHAPE_[ADS][JMBODTP][NPEBM][SL][AUC]$/;
+export const isAcceptanceBrowserDiagnostic=code=>typeof code==='string'&&(acceptanceCodes.has(code)||companionTextShape.test(code));
 export function acceptanceBrowserFailure(code){
  const error=new Error('billing_BROWSER');
  if(isAcceptanceBrowserDiagnostic(code))metadata.set(error,{phase:'ACCEPTANCE',code,cleanup:false});

@@ -44,6 +44,18 @@ If the original companion text fails `JSON.parse`, the request stays blocked. Th
 
 The `JSON_TEXT_` codes refine the earlier `JSON_FORMAT_TEXT` category. They describe data URI shape with a comma separator, hierarchical URI prefixes, multiple form pairs, assignment or call syntax, unsupported scalar spellings, numeric-looking text, noncanonical Base64-like text, identifiers, or other text. For assignments and calls, a `_JSON` suffix means the entire right-hand side or sole argument parses as strict JSON inside the recognized envelope. The report contains only a fixed code. All probes stay in memory, and the browser obtains proof only when the original companion passes strict JSON parsing.
 
+The earlier `JSON_TEXT_OTHER` category now reports `JSON_TEXT_SHAPE_` and five letters. Read the positions in order.
+
+| Position | Evidence |
+| --- | --- |
+| 1 | `A` begins with an ASCII letter or underscore, `D` with a digit, `S` with a sign. |
+| 2 | `J` has a strict JSON object or array suffix, `M` has a markup-like prefix, `B` has grouping punctuation, `O` has an operator mark, `D` has a separator, `T` consists of letters, marks, numbers, Unicode whitespace, underscores or signs, `P` is the remaining shape. The first matching category wins. |
+| 3 | `N` has no recognized escape marker, `P` has a percent triplet, `E` has an HTML reference shape, `B` has a backslash escape shape, `M` has several kinds. |
+| 4 | `L` has a line break followed by more non-whitespace text, `S` has no such break. Recognized breaks are CR, LF, NEL, and the Unicode line and paragraph separators. |
+| 5 | `C` has a control or format character outside JSON whitespace, `U` has other non-ASCII text, `A` is the remaining ASCII text. The first matching category wins. |
+
+The suffix probe tries only the first object opener and the first array opener. It allows one trailing semicolon, with JSON whitespace. The signature describes lexical evidence from the parsed script text. It carries no character values, positions, names, or payload. A strict JSON suffix does not satisfy the original JSON check, and the CRes POST stays blocked.
+
 ## What establishes a pass
 
 The original confirmation attempt must retain its winning `REQUIRES_ACTION` receipt. The terminal server records must show one paid invoice and one EUR 20 payment for the bound subscription, with matching journal entries and signed site callbacks. A separate read of the original PaymentIntent and latest captured Charge must show an authenticated 3DS 2.x challenge. Frictionless authentication, a different Charge or a second charge fails the check.

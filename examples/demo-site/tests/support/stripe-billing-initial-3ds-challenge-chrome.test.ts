@@ -81,6 +81,7 @@ const externalWithCompanionId='a CRes form inserted by an external body script b
 const externalWithInvalidCompanion='a CRes form written by an external script beside JSON with HTML-escaped quotes';
 const externalWithCommentCompanion='a CRes form written by an external script beside an HTML comment containing escaped JSON';
 const externalWithAssignmentCompanion='a CRes form written by an external script beside a JSON value in assignment syntax';
+const externalWithLabelledCompanion='a CRes form written by an external script beside a labelled JSON suffix';
 const externalNested='a CRes form written by an external script under a nonstructural parent';
 const externalUnknown='a CRes form from an unsupported external DOM builder';
 const externalMismatch='a CRes form beside identified JSON data with different expected POST bytes';
@@ -119,6 +120,7 @@ const refusedFollowups=new Map([
  [externalWithInvalidCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_HTML_QUOTES'],
  [externalWithCommentCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_FORMAT_COMMENT'],
  [externalWithAssignmentCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_ASSIGN_JSON'],
+ [externalWithLabelledCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_SHAPE_AJNSA'],
  [issuerCresDestination,'BROWSER_CHALLENGE_CRES_DESTINATION'],
  [oversizedDecision,'BROWSER_CHALLENGE_CRES_DECISION_SIZE'],
  [invalidUtf8Decision,'BROWSER_CHALLENGE_CRES_DECISION_UTF8'],
@@ -144,7 +146,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const dynamicForm=mode===dynamicDecisionCres;
  const externalForm=[externalLiteral,externalGzip,externalHead,externalHeadWithData,externalWithExecutable,
   externalHeadWithCompanionId,externalWithCompanionId,externalWithInvalidCompanion,externalWithCommentCompanion,
-  externalWithAssignmentCompanion,
+  externalWithAssignmentCompanion,externalWithLabelledCompanion,
   externalNested,externalUnknown,externalMismatch,externalNoReceipt,externalInvalidUtf8].includes(mode);
  const submitsCres=Boolean(compressed)||[decisionCres,isolatedDecisionCres,namedDecisionCres,lateDecisionCres,lateDecisionHeaders,uncapturedDecision,
   changedCresAction,changedCresBody,unsupportedCresForm,issuerCresDestination].includes(mode)||literalForm||dynamicForm||externalForm;
@@ -227,6 +229,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   mode===externalWithInvalidCompanion?`<!doctype html><body>${jsonWithId('fixture-data','{&quot;fixture&quot;:true}')}${externalTag}</body>`:
   mode===externalWithCommentCompanion?`<!doctype html><body>${jsonWithId('fixture-data','<!-- {&quot;fixture&quot;:true} -->')}${externalTag}</body>`:
   mode===externalWithAssignmentCompanion?`<!doctype html><body>${jsonWithId('fixture-data','window.fixture = {"fixture":true};')}${externalTag}</body>`:
+  mode===externalWithLabelledCompanion?`<!doctype html><body>${jsonWithId('fixture-data','fixture label: {"fixture":true};')}${externalTag}</body>`:
   mode===externalMismatch?`<!doctype html><body>${jsonWithId('fixture-data')}${externalTag}</body>`:
   mode===externalNested?`<!doctype html><body><div>${externalTag}</div></body>`:
   `<!doctype html><body>${externalTag}</body>`;
@@ -470,7 +473,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    if(networkFixture)assert.equal(networkFixture.requests(),1);
    if(externalForm&&mode!==externalInvalidUtf8)assert.equal(scriptBodyCaptured,
     ![externalNoReceipt,externalNested,externalWithExecutable,externalWithInvalidCompanion,externalWithCommentCompanion,
-     externalWithAssignmentCompanion].includes(mode));
+     externalWithAssignmentCompanion,externalWithLabelledCompanion].includes(mode));
    assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision,...(externalForm?[decisionAsset]:[])]);
    assert.deepEqual(authorized,forwarded);
    assert.equal(gestures,1);

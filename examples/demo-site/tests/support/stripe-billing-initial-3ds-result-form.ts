@@ -7,8 +7,11 @@ const structuralElements=new Set(['html','head','body','title','meta']);
 const attribute=(element:DefaultTreeAdapterTypes.Element,name:string)=>element.attrs.find(attr=>attr.name===name)?.value;
 type LayoutRejection='EXTERNAL_LAYOUT_TAG'|'EXTERNAL_LAYOUT_ATTRIBUTES'|'EXTERNAL_LAYOUT_TEXT'|'EXTERNAL_LAYOUT_HANDLER';
 type BaseSixtyFourEvidence='BASE_SIXTY_FOUR'|'FORMAT_BASE_TEXT'|'FORMAT_BASE_BYTES';
+type TextStructure='J'|'M'|'B'|'O'|'D'|'T'|'P';
+type TextEncoding='N'|'P'|'E'|'B'|'M';
+type CompanionJsonTextShape=`TEXT_SHAPE_${'A'|'D'|'S'}${TextStructure}${TextEncoding}${'S'|'L'}${'A'|'U'|'C'}`;
 type CompanionJsonText='TEXT_DATA_URI'|'TEXT_URI'|'TEXT_FORM'|'TEXT_ASSIGN_JSON'|'TEXT_ASSIGNMENT'|
- 'TEXT_CALL_JSON'|'TEXT_CALL'|'TEXT_JS_LITERAL'|'TEXT_NUMERIC'|'TEXT_BASE_SHAPE'|'TEXT_IDENTIFIER'|'TEXT_OTHER';
+ 'TEXT_CALL_JSON'|'TEXT_CALL'|'TEXT_JS_LITERAL'|'TEXT_NUMERIC'|'TEXT_BASE_SHAPE'|'TEXT_IDENTIFIER'|CompanionJsonTextShape;
 type CompanionJsonShape='FORMAT_BOM'|'FORMAT_COMMENT'|'FORMAT_MARKUP'|'FORMAT_ENTITY'|'FORMAT_PERCENT'|
  'FORMAT_ESCAPE'|'FORMAT_QUOTED'|'FORMAT_OBJECT'|'FORMAT_ARRAY'|'FORMAT_SPACE'|'FORMAT_OTHER'|CompanionJsonText;
 type InvalidCompanionJson='BOM'|'HTML_COMMENT'|'HTML_QUOTES'|'PERCENT'|BaseSixtyFourEvidence|
@@ -215,6 +218,38 @@ function baseSixtyFourCompanionJson(value:string):BaseSixtyFourEvidence|undefine
  return parsesJson(decoded)?'BASE_SIXTY_FOUR':'FORMAT_BASE_TEXT';
 }
 
+function companionTextStructure(value:string):TextStructure{
+ // Only the first opener of each kind can start a candidate. The entire
+ // suffix must be strict JSON, with at most one final semicolon removed.
+ const end=value.endsWith(';')?-1:undefined;
+ if([value.indexOf('{'),value.indexOf('[')].some(start=>start>=0&&parsesJson(value.slice(start,end))))return 'J';
+ if(/<(?:\/?[A-Za-z]|[!?])/.test(value))return 'M';
+ if(/[()[\]{}]/.test(value))return 'B';
+ if(/[=<>!&|*/%^~]/.test(value))return 'O';
+ if(/[:;,]/.test(value))return 'D';
+ if(/^[\p{L}\p{M}\p{N}\p{White_Space}_+\-]+$/u.test(value))return 'T';
+ return 'P';
+}
+
+const companionTextEncodingMarkers=[
+ ['P',/%[0-9a-f]{2}/i],
+ ['E',/&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);/],
+ ['B',/\\(?:[bfnrtv0"'\\/]|x[0-9a-fA-F]{2}|u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]{1,6}\}))/],
+] as const;
+
+function companionJsonTextShape(value:string):CompanionJsonTextShape{
+ // The caller already bounded and JSON-whitespace-trimmed the failed text.
+ // Each position below is a fixed category, independent of raw values.
+ const start=/^[0-9]/.test(value)?'D':/^[+-]/.test(value)?'S':'A';
+ const structure=companionTextStructure(value);
+ const markers=companionTextEncodingMarkers.filter(([,pattern])=>pattern.test(value));
+ const encoding:TextEncoding=markers.length>1?'M':markers[0]?.[0]??'N';
+ const lineBreak=value.search(/[\r\n\u0085\u2028\u2029]/);
+ const layout=lineBreak>=0&&/[^\p{White_Space}]/u.test(value.slice(lineBreak+1))?'L':'S';
+ const charset=/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\p{Cf}]/u.test(value)?'C':/[^\x00-\x7f]/.test(value)?'U':'A';
+ return `TEXT_SHAPE_${start}${structure}${encoding}${layout}${charset}`;
+}
+
 function companionJsonText(value:string):CompanionJsonText{
  if(/^data:[^,\s]*,\S*$/i.test(value))return 'TEXT_DATA_URI';
  if(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value))return 'TEXT_URI';
@@ -238,7 +273,7 @@ function companionJsonText(value:string):CompanionJsonText{
  if(/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value))return 'TEXT_NUMERIC';
  if(/[+/=]/.test(value)&&/^[A-Za-z0-9+/_-]+=*$/.test(value))return 'TEXT_BASE_SHAPE';
  if(member?.length===value.length)return 'TEXT_IDENTIFIER';
- return 'TEXT_OTHER';
+ return companionJsonTextShape(value);
 }
 
 function companionJsonShape(value:string):CompanionJsonShape{
