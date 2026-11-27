@@ -102,7 +102,7 @@ for(const [reason,documents] of Object.entries({
  EXTERNAL_COMPANION_JSON_EMPTY:[
   externalTag+jsonBlock(''),externalTag+jsonBlock(' \t\n\f\r '),externalTag+jsonBlock('',' id="fixture-data"'),
  ],
- EXTERNAL_COMPANION_JSON_INVALID:[
+ EXTERNAL_COMPANION_JSON_FORMAT_OBJECT:[
   externalTag+jsonBlock('{"private-fixture": invalid}'),externalTag+jsonBlock('{"fixture": invalid}',' id="fixture-data"'),
  ],
  EXTERNAL_PARENT:['<!doctype html><body><div><script src="/result.js"></script></div></body>'],
@@ -132,7 +132,7 @@ test('report one fixed reason from the first rejected companion in reverse parse
  const invalid=jsonBlock('{"private-fixture": invalid}');
  const withNonce=jsonBlock('{}',' nonce="private-fixture"');
  for(const [companions,reason] of [
-  [invalid+withNonce,'ATTRIBUTE_NONCE'],[withNonce+invalid,'JSON_INVALID'],
+  [invalid+withNonce,'ATTRIBUTE_NONCE'],[withNonce+invalid,'JSON_FORMAT_OBJECT'],
  ]){
   const reported:string[]=[];
   assert.equal(issuerResultForm(externalTag+companions+jsonBlock('null'),undefined,code=>reported.push(code),decisionUrl),undefined);
@@ -160,18 +160,28 @@ for(const [reason,contents] of Object.entries({
  HTML_COMMENT:['\t<!-- {"private-fixture":true} -->\n'],
  HTML_QUOTES:['{&quot;private-fixture&QUOT;:&#034;value&#X022;}', '{&#34;private-fixture&#x22;:true}'],
  PERCENT:[' %7B%22private-fixture%22%3Atrue%7D\t','{%22private-fixture%22:true}','42%0A'],
- BASE_SIXTY_FOUR:[' Ing/Ig==\n','\tIng_Ig '],
+ BASE_SIXTY_FOUR:[' Ing/Ig==\n','\tIng_Ig ',' Ing_Ig== ','Ij4-Pj4-Ig=='],
  CONTROL:['["private-fixture\u0001"]'],
  ESCAPE:['["private-fixture\\x12"]','["private-fixture\\u0z00"]'],
- INCOMPLETE:['{"private-fixture":','"private-fixture'],
+ INCOMPLETE:['{"private-fixture":','"private-fixture','"private-fixture\\'],
  PROPERTY:['{privateFixture:true}','{"private-fixture":true,}','{&quot;private-fixture&quot;:invalid}'],
  DELIMITER:['{"private-fixture" true}','{"private-fixture":true "extra":false}','["private-fixture" true]'],
  NUMBER:['[-]','[1.]','[1e]','[01]'],
  TRAILING:['{"private-fixture":true} extra','77u/e30='], // The base64 candidate decodes to a BOM followed by JSON.
- INVALID:[
-  '[\f]','\u00a0%7B%7D','\uFEFF\uFEFF{}','\uFEFF<!-- {} -->','<!-- {}','<!-- "earlier --> end" -->',
-  '&quot;private-fixture&quot; extra','%7B%FF%7D','Ing/Ih==','Iv8i',
- ],
+ FORMAT_BASE_TEXT:['ZTMwPQ==','IO+7v3t9'], // Decodes to Base64 text or whitespace + BOM + JSON, respectively.
+ FORMAT_BASE_BYTES:['Iv8i'],
+ FORMAT_BOM:['\uFEFF\uFEFF{}','\uFEFF<!-- {} -->'],
+ FORMAT_COMMENT:['<!-- {}','<!-- "earlier --> end" -->','/* {} */','// {}'],
+ FORMAT_MARKUP:['<fixture>private-fixture</fixture>'],
+ FORMAT_ENTITY:['&quot;private-fixture&quot; extra','&amp;quot;private-fixture&amp;quot;'],
+ FORMAT_PERCENT:['%7B%FF%7D','%257B%257D'],
+ FORMAT_ESCAPE:[String.raw`\"private-fixture\"`],
+ FORMAT_QUOTED:["'private-fixture'",'`private-fixture`'],
+ FORMAT_OBJECT:['{"private-fixture":invalid}'],
+ FORMAT_ARRAY:['[\f]','[\v]','[privateFixture]'],
+ FORMAT_SPACE:['\u00a0%7B%7D','\t\v{}','\u0001{}'],
+ FORMAT_TEXT:['Ing/Ih==','Ing_Ih==','Is+_Ig==','Ing_Ig===','Ing/Ig','private fixture','_private fixture','+private fixture'],
+ FORMAT_OTHER:[')private-fixture','é'],
 }))test('reject malformed companion JSON with the fixed '+reason+' diagnostic',()=>{
  for(const text of contents){
   const reported:string[]=[];
@@ -190,12 +200,20 @@ test('allow strict companion JSON with literal entity, percent and base64 text i
 });
 
 test('classify invalid companion wrappers only within 64 KiB of parsed UTF-8',()=>{
- for(const [extra,reason] of [['a','BOM'],['ab','INVALID']]){
+ for(const [extra,reason] of [['a','BOM'],['ab','FORMAT_LIMIT']]){
   const text='\uFEFF"'+'é'.repeat(32765)+extra+'"';
   const reported:string[]=[];
   assert.equal(issuerResultForm(externalTag+jsonBlock(text),undefined,code=>reported.push(code),decisionUrl),undefined);
   assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_'+reason]);
  }
+});
+
+test('enforce the companion format budget after parsing replaces HTML NUL characters',()=>{
+ const html=externalTag+jsonBlock('\u0000'.repeat(21846)+'{}');
+ assert.ok(Buffer.byteLength(html,'utf8')<=65536);
+ const reported:string[]=[];
+ assert.equal(issuerResultForm(html,undefined,code=>reported.push(code),decisionUrl),undefined);
+ assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_FORMAT_LIMIT']);
 });
 
 test('require an exact HTTPS decision URL to derive an external script reference',()=>{

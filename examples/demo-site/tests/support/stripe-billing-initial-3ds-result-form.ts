@@ -6,8 +6,11 @@ const classicScriptTypes=new Set(['','text/javascript','application/javascript']
 const structuralElements=new Set(['html','head','body','title','meta']);
 const attribute=(element:DefaultTreeAdapterTypes.Element,name:string)=>element.attrs.find(attr=>attr.name===name)?.value;
 type LayoutRejection='EXTERNAL_LAYOUT_TAG'|'EXTERNAL_LAYOUT_ATTRIBUTES'|'EXTERNAL_LAYOUT_TEXT'|'EXTERNAL_LAYOUT_HANDLER';
-type InvalidCompanionJson='INVALID'|'BOM'|'HTML_COMMENT'|'HTML_QUOTES'|'PERCENT'|'BASE_SIXTY_FOUR'|
- 'CONTROL'|'ESCAPE'|'INCOMPLETE'|'PROPERTY'|'DELIMITER'|'NUMBER'|'TRAILING';
+type BaseSixtyFourEvidence='BASE_SIXTY_FOUR'|'FORMAT_BASE_TEXT'|'FORMAT_BASE_BYTES';
+type CompanionJsonShape='FORMAT_BOM'|'FORMAT_COMMENT'|'FORMAT_MARKUP'|'FORMAT_ENTITY'|'FORMAT_PERCENT'|
+ 'FORMAT_ESCAPE'|'FORMAT_QUOTED'|'FORMAT_OBJECT'|'FORMAT_ARRAY'|'FORMAT_SPACE'|'FORMAT_TEXT'|'FORMAT_OTHER';
+type InvalidCompanionJson='BOM'|'HTML_COMMENT'|'HTML_QUOTES'|'PERCENT'|BaseSixtyFourEvidence|
+ 'CONTROL'|'ESCAPE'|'INCOMPLETE'|'PROPERTY'|'DELIMITER'|'NUMBER'|'TRAILING'|'FORMAT_LIMIT'|CompanionJsonShape;
 type CompanionRejection='EXTERNAL_COMPANION_PARENT'|'EXTERNAL_COMPANION_TAG'|'EXTERNAL_COMPANION_TYPE_MISSING'|
  'EXTERNAL_COMPANION_TYPE_JSON_VARIANT'|'EXTERNAL_COMPANION_TYPE_JSON_LD'|'EXTERNAL_COMPANION_TYPE_IMPORTMAP'|
  'EXTERNAL_COMPANION_TYPE_SPECULATION_RULES'|'EXTERNAL_COMPANION_TYPE_OTHER'|'EXTERNAL_COMPANION_HANDLER'|
@@ -187,7 +190,7 @@ function parsesJson(text:string):boolean{
  catch{return false;}
 }
 
-// Match only fixed V8 message prefixes. Other engine messages stay generic.
+// Match only fixed V8 message prefixes. Unrecognized messages fall back to the observed format.
 const jsonSyntaxReasons=[
  [/^Bad control character in string literal in JSON at position /,'CONTROL'],
  [/^Bad (?:escaped character|Unicode escape) in JSON at position /,'ESCAPE'],
@@ -198,8 +201,37 @@ const jsonSyntaxReasons=[
  [/^Unexpected non-whitespace character after JSON at position /,'TRAILING'],
 ] as const;
 
+function baseSixtyFourCompanionJson(value:string):BaseSixtyFourEvidence|undefined{
+ if(!/^[A-Za-z0-9+/_-]+={0,2}$/.test(value))return;
+ const bytes=Buffer.from(value,'base64');
+ const standard=bytes.toString('base64');
+ const paddedUrlSafe=standard.replace(/\+/g,'-').replace(/\//g,'_');
+ if(value!==standard&&value!==paddedUrlSafe&&value!==bytes.toString('base64url'))return;
+ let decoded:string;
+ try{decoded=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes);}
+ catch{return 'FORMAT_BASE_BYTES';}
+ return parsesJson(decoded)?'BASE_SIXTY_FOUR':'FORMAT_BASE_TEXT';
+}
+
+function companionJsonShape(value:string):CompanionJsonShape{
+ if(value.startsWith('<!--')||value.startsWith('//')||value.startsWith('/*'))return 'FORMAT_COMMENT';
+ switch(value.charAt(0)){
+  case '\uFEFF':return 'FORMAT_BOM';
+  case '<':return 'FORMAT_MARKUP';
+  case '&':return 'FORMAT_ENTITY';
+  case '%':return 'FORMAT_PERCENT';
+  case '\\':return 'FORMAT_ESCAPE';
+  case '"':case "'":case '`':return 'FORMAT_QUOTED';
+  case '{':return 'FORMAT_OBJECT';
+  case '[':return 'FORMAT_ARRAY';
+ }
+ if(/^[\p{White_Space}\p{Cc}]/u.test(value))return 'FORMAT_SPACE';
+ if(/^[A-Za-z0-9_+-]/.test(value))return 'FORMAT_TEXT';
+ return 'FORMAT_OTHER';
+}
+
 function invalidCompanionJson(text:string,error:unknown):InvalidCompanionJson{
- if(text.length>65536||Buffer.byteLength(text,'utf8')>65536)return 'INVALID';
+ if(text.length>65536||Buffer.byteLength(text,'utf8')>65536)return 'FORMAT_LIMIT';
  // These candidates only describe the original failure. Never combine them or
  // admit a companion based on a transformed parse.
  const jsonWhitespace=/[ \t\r\n]/;
@@ -218,19 +250,12 @@ function invalidCompanionJson(text:string,error:unknown):InvalidCompanionJson{
   try{JSON.parse(decodeURIComponent(value));return 'PERCENT';}
   catch{/* The decoded text must be strict JSON. */}
  }
- if(/^[A-Za-z0-9+/_-]+={0,2}$/.test(value)){
-  const bytes=Buffer.from(value,'base64');
-  if(value===bytes.toString('base64')||value===bytes.toString('base64url')){
-   try{
-    JSON.parse(new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes));
-    return 'BASE_SIXTY_FOUR';
-   }catch{/* The decoded bytes must be strict UTF-8 JSON. */}
-  }
- }
+ const baseSixtyFour=baseSixtyFourCompanionJson(value);
+ if(baseSixtyFour==='BASE_SIXTY_FOUR')return baseSixtyFour;
  if(error instanceof SyntaxError){
   for(const [prefix,reason] of jsonSyntaxReasons)if(prefix.test(error.message))return reason;
  }
- return 'INVALID';
+ return baseSixtyFour??companionJsonShape(value);
 }
 
 function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:string|undefined,

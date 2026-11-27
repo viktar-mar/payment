@@ -36,7 +36,9 @@ test('3DS terminal accepts only fixed provisioning diagnostics in the provisioni
 });
 test('3DS terminal preserves a fixed companion refusal through its worker annotation',async()=>{
  const reasons=['TYPE_SPECULATION_RULES','JSON_BOM','JSON_HTML_COMMENT','JSON_HTML_QUOTES','JSON_PERCENT',
-  'JSON_BASE_SIXTY_FOUR','JSON_CONTROL','JSON_ESCAPE','JSON_INCOMPLETE','JSON_PROPERTY','JSON_DELIMITER','JSON_NUMBER','JSON_TRAILING'];
+  'JSON_BASE_SIXTY_FOUR','JSON_CONTROL','JSON_ESCAPE','JSON_INCOMPLETE','JSON_PROPERTY','JSON_DELIMITER','JSON_NUMBER','JSON_TRAILING',
+  ...['LIMIT','BASE_TEXT','BASE_BYTES','BOM','COMMENT','MARKUP','ENTITY','PERCENT','ESCAPE','QUOTED','OBJECT','ARRAY',
+   'SPACE','TEXT','OTHER'].map(format=>'JSON_FORMAT_'+format)];
  for(const reason of reasons){
   const code='BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_'+reason;
   const line='owned_initial_3ds_terminal phase=ACK code='+code+' cleanup=UNCONFIRMED';
