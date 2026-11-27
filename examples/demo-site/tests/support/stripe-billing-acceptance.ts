@@ -234,12 +234,9 @@ export function runBillingCancellationBrowser(browser:Browser,port:BillingCancel
 export function runBillingDeclineRetryBrowser(browser:Browser,port:BillingDeclineRetryPort,limits:BillingLimits,matchesStaticOrigin?:(origin:string)=>boolean):Promise<true>{
  return runBillingBrowser(browser,port,limits,undefined,port,matchesStaticOrigin);
 }
-type IssuerReplayCapture=Parameters<typeof initial3dsChallenge>[0]['issuerReplay'];
-type Initial3dsBrowserOptions={port:BillingInitial3dsPort;waitForGesture:WaitForIssuerGesture;approvedIssuerOrigin?:string;
- issuerReplay?:IssuerReplayCapture};
-export function runBillingInitial3dsBrowser(browser:Browser,port:BillingInitial3dsPort,limits:BillingLimits,waitForGesture:WaitForIssuerGesture,matchesStaticOrigin?:(origin:string)=>boolean,approvedIssuerOrigin?:string,
- issuerReplay?:IssuerReplayCapture):Promise<true>{
- return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,{port,waitForGesture,approvedIssuerOrigin,issuerReplay});
+type Initial3dsBrowserOptions={port:BillingInitial3dsPort;waitForGesture:WaitForIssuerGesture;approvedIssuerOrigin?:string};
+export function runBillingInitial3dsBrowser(browser:Browser,port:BillingInitial3dsPort,limits:BillingLimits,waitForGesture:WaitForIssuerGesture,matchesStaticOrigin?:(origin:string)=>boolean,approvedIssuerOrigin?:string):Promise<true>{
+ return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,{port,waitForGesture,approvedIssuerOrigin});
 }
 export function runBillingInvoiceWebhooksBrowser(browser:Browser,port:BillingInvoiceWebhooksPort,limits:BillingLimits,matchesStaticOrigin:(origin:string)=>boolean):Promise<true>{
  return runBillingBrowser(browser,port,limits,undefined,undefined,matchesStaticOrigin,undefined,port);
@@ -258,15 +255,11 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
  let context:BrowserContext|undefined,abandoned=false,closing:Promise<void>|undefined,failure=false;
  let checkpoint=cancellationPort?'BROWSER_SETUP':'BROWSER',firstFailure:string|undefined,cleanupConfirmed=false;
  let refusedOrigin:{runId:string;expectedSource:string;origin:string;issuerRelation:Promise<RefusedIssuerRelation>}|undefined;
- let refusedReplay:Promise<void>|undefined;
  const recordFailure=(code=checkpoint)=>{firstFailure??=code;failure=true;};
  const close=(ctx:BrowserContext)=>{closing??=ctx.close();void closing.catch(()=>{});return closing;};
  const opening=browser.newContext({serviceWorkers:'block',acceptDownloads:false});void opening.then(c=>{if(abandoned)return close(c);},()=>{}).catch(()=>{});
  const abort=()=>{
   abandoned=true;
-  // The first failure already blocks every route. Keep the existing receipt
-  // reader alive only long enough to finish its bounded, post-abort capture.
-  if(refusedReplay&&!ownerLimits.signal?.aborted)return;
   lifecycle.abort();
   const current=context;
   if(!current)return;
@@ -419,17 +412,14 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
   const winning=Promise.withResolvers<void>();
   const invalidate=(reason:string)=>{recordFailure(reason);abort();};
   if(responseGuard)checkpoint='BROWSER_SETUP';
-  const redirects=responseGuard?await guardChallengeRedirects(page,invalidate,binding.endpoints,limits.signal,challenge?.approvedIssuerOrigin,Boolean(challenge)):undefined;
+  const redirects=responseGuard?await guardChallengeRedirects(page,invalidate,binding.endpoints,limits.signal,challenge?.approvedIssuerOrigin):undefined;
   const sca=challenge?initial3dsChallenge({page,limits,demo:binding.endpoints.demo,owner:()=>({secret:firstSecret,key:publishableKey??''}),
    stripeFrames:req=>stripeFrames(page,req,false,false,binding.endpoints.demo),authorizeResponse:req=>redirects!.authorize(req),check:checkManager,waitForGesture:challenge.waitForGesture,
-   expectIssuerAssetBlock:(req,document)=>redirects!.expectIssuerAssetBlock(req,document),
-   authorizeIssuerScript:(req,document,capture)=>redirects!.authorizeIssuerScript(req,document,capture),
-   takeIssuerScriptBody:(req,document)=>redirects!.takeIssuerScriptBody(req,document),
+   expectIssuerAssetBlock:req=>redirects!.expectIssuerAssetBlock(req),
+   authorizeIssuerScript:(req,document)=>redirects!.authorizeIssuerScript(req,document),
    authorizeIssuerDecision:redirects!.authorizeIssuerDecision,
-   takeIssuerDecisionBody:req=>redirects!.takeIssuerDecisionBody(req),
    authorizeIssuerResult:(req,document)=>redirects!.authorizeIssuerResult(req,document),
    approvedIssuerOrigin:challenge.approvedIssuerOrigin,
-   issuerReplay:challenge.issuerReplay,
    winning:async()=>{
     const original=requests.get('original-confirm'),response=original?.existingResponse();
     need(response && response.request()===original && response.status()===200 && !response.fromServiceWorker());
@@ -720,10 +710,6 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
      refusedOrigin={runId:binding.runId,expectedSource:binding.expectedSource,origin,
       issuerRelation:capture.refusedIssuerRelation(route.request(),ownerLimits)};
      abort();await blocked;return;
-    }
-    if(first&&challenge?.issuerReplay&&sca){
-     refusedReplay=sca.captureRefusedIssuerFixture(route,()=>route.abort('failed'));
-     if(refusedReplay){await refusedReplay;refusedReplay=undefined;abort();return;}
     }
     abort();await route.abort('failed').catch(()=>{});
    }})();pending.add(work);void work.finally(()=>pending.delete(work));return work;
@@ -1155,8 +1141,6 @@ async function runBillingBrowser(browser:Browser,port:BillingPort|BillingRequire
   authority='';
  }catch{recordFailure();}
  finally{
-  await refusedReplay;
-  refusedReplay=undefined;
   abandoned=true;limits.signal?.removeEventListener('abort',abort);lifecycle.abort();
   await refusedOrigin?.issuerRelation;
   if(context)try{

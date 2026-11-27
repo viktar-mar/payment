@@ -56,11 +56,32 @@ for(const selectedCase of ['initial_portal','initial_cancel_withdraw','initial_s
  });
 }
 
-for(const scenario of ['verified','ordinary','provider-denied','local-cash-missing']){
+for(const [scenario,expectedStages] of [
+ ['verified',['sql','callback','provider']],
+ ['ordinary',[]],
+ ['provider-denied',['sql','callback','provider']],
+ ['local-cash-missing',['sql']],
+ ['wrong signed cash event',['sql','callback']],
+ ['wrong signed paid event',['sql','callback']],
+ ['wrong signed amount',['sql','callback']],
+ ['wrong signed currency',['sql','callback']],
+ ['wrong callback digest',['sql','callback']],
+]){
  test('initial 3DS joins its server and provider receipts: '+scenario,async()=>{
   const f=fixture(),events=[];
   const binding={...scope,createKeyHash:'a'.repeat(64),confirmKeyHash:'b'.repeat(64),endpoints:{demo:'http://127.0.0.1:18081'}};
+  const [cash,paid]=f.row.callbacks;
+  f.row.cash_journal_ids=[cash.id];
+  f.row.paid_journal_ids=[paid.id];
+  paid.type=paid.payload.event_type='subscription.updated';
   if(scenario==='local-cash-missing')f.row.proof.cash=false;
+  const wrongEvent=scenario==='wrong signed cash event'?cash:scenario==='wrong signed paid event'?paid:null;
+  if(wrongEvent)wrongEvent.id=wrongEvent.payload.event_id=id(99);
+  if(scenario==='wrong signed amount')cash.payload.amount_minor=1999;
+  if(scenario==='wrong signed currency')cash.payload.currency='USD';
+  f.inspection.events=f.row.callbacks.map(e=>({event_id:e.id,event_type:e.type,count:1,
+   sha256:createHash('sha256').update(canonical(e.payload)).digest('hex')}));
+  if(scenario==='wrong callback digest')f.inspection.events[0].sha256='0'.repeat(64);
   const options={
    configuration:{...scope,selectedCase:scenario==='ordinary'?'initial_success':'initial_3ds'},
    bootstrap:{withDatabaseCredentials:callback=>callback({})},
@@ -71,7 +92,7 @@ for(const scenario of ['verified','ordinary','provider-denied','local-cash-missi
    if(!params)return [];events.push('sql');assert.equal(params.at(-1),true);return [f.row];
   }});},end:async()=>{}});
   const run=()=>api.proveBillingInitial3dsEvidence(options,{deadline:Date.now()+2000},{connect});
-  if(scenario==='verified')assert.equal(await run(),true);else await assert.rejects(run);
-  assert.deepEqual(events,scenario==='ordinary'?[]:scenario==='local-cash-missing'?['sql']:['sql','callback','provider']);
+  if(scenario==='verified')assert.equal(await run(),true);else await assert.rejects(run,{message:'billing_EVIDENCE'});
+  assert.deepEqual(events,expectedStages);
  });
 }

@@ -3,9 +3,6 @@ import type {Frame,Page,Request,Response,Route} from '@playwright/test';
 import type {BillingLimits} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
 import type {RefusedIssuerRelation} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
-// @ts-ignore Native Node executes the same inert parser as Playwright.
-import {externalIssuerResultForm,isIssuerScriptPath,issuerResultForm} from './stripe-billing-initial-3ds-result-form.ts';
-import type {IssuerDecisionBody} from './stripe-billing-initial-3ds-decision-body.ts';
 
 function requireValue(value:unknown):asserts value {if(!value)throw Error('billing_BROWSER');}
 function object(value:unknown):Record<string,unknown>{
@@ -17,7 +14,9 @@ const directIssuerFrame='stripe-challenge-frame';
 const reservedStripeHosts=new Set(['api','hooks','js','m','r','merchant-ui-api']);
 const issuerAssetBlockLimit=6;
 const issuerScriptLimit=6;
-export {isIssuerScriptPath};
+export function isIssuerScriptPath(pathname:string):boolean{
+ return /^\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.js$/.test(pathname);
+}
 export function issuerAssetSuffixMatches(kind:string,pathname:string):boolean{
  if(kind==='image')return /\.(?:png|jpe?g|gif|webp|ico)$/.test(pathname);
  if(kind==='font')return /\.woff2?$/.test(pathname);
@@ -36,6 +35,10 @@ function exactUrl(value:unknown){
  requireValue(typeof value==='string' && value.length<=4096);
  const url=new URL(value);requireValue(url.href===value && !url.username && !url.password && !url.hash && url.pathname!=='/');
  return url;
+}
+export function isStripeChallengeReturn(value:string):boolean{
+ try{return !value.includes('#') && exactUrl(value).origin===issuerOrigin;}
+ catch{return false;}
 }
 export function challengeSource(raw:unknown,secret:string,report?:(code:string)=>void):string{
  report?.('BROWSER_CHALLENGE_SOURCE_WIRE_OBJECT');
@@ -89,13 +92,16 @@ export function matchingChallengeRequest(binding:ReturnType<typeof issuerBinding
   return msg.messageType==='CReq' && msg.messageVersion===binding.version && msg.threeDSServerTransID===binding.server && msg.acsTransID===binding.acs;
  }catch{return false;}
 }
-// Correlation only. Transport also requires the original form and paused route.
-function matchingChallengeResult(binding:ReturnType<typeof issuerBinding>|undefined,body:string|null){
+// Correlation with the owned challenge, never evidence that Stripe authenticated or charged it.
+export function matchingChallengeResult(binding:ReturnType<typeof issuerBinding>|undefined,body:Buffer|null){
  try{
   if(!binding||!body||body.length>32768)return false;
-  const fields=new URLSearchParams(body),results=fields.getAll('cres');
+  const wire=new TextDecoder('utf-8',{fatal:true}).decode(body);
+  const fields=new URLSearchParams(wire),results=fields.getAll('cres'),session=fields.getAll('threeDSSessionData');
+  if(!body.equals(Buffer.from(fields.toString())))return false;
   if(results.length!==1 || [...fields.keys()].some(key=>key!=='cres'&&key!=='threeDSSessionData') ||
-   fields.getAll('threeDSSessionData').length>1 || !/^[A-Za-z0-9_-]+={0,2}$/.test(results[0]!))return false;
+   session.length>1 || /[\x00-\x1f\x7f]/.test((session[0]??'').replace(/\r\n/g,'')) ||
+   !/^[A-Za-z0-9_-]+={0,2}$/.test(results[0]!))return false;
   const encoded=results[0]!;
   const bytes=Buffer.from(encoded,'base64url');
   if(bytes.toString('base64url')!==encoded.replace(/=+$/,'') || encoded.endsWith('=')&&encoded.length%4!==0)return false;
@@ -110,7 +116,8 @@ function matchingChallengeResult(binding:ReturnType<typeof issuerBinding>|undefi
   if(members!==Object.keys(result).length)return false;
   return result.messageType==='CRes' && result.messageVersion===binding.version &&
    result.threeDSServerTransID===binding.server && result.acsTransID===binding.acs &&
-   ['Y','N','D'].some(status=>result.transStatus===status);
+   (result.transStatus==='Y'||result.transStatus==='N') &&
+   (!Object.hasOwn(result,'challengeCompletionInd')||result.challengeCompletionInd==='Y');
  }catch{return false;}
 }
 function unique(fields:URLSearchParams,name:string,expected:string){
@@ -131,22 +138,14 @@ export function challengeApiRequest(url:URL,method:string,data:string|null,key:s
 }
 
 export type WaitForIssuerGesture=(limits:{deadline:number;signal:AbortSignal})=>Promise<void>;
-type RefusedIssuerFixtureSource={html:Uint8Array;script:Uint8Array;documentUrl:string;scriptUrl:string;frameName?:string};
-export type IssuerReplayCapture={
- save:(source:RefusedIssuerFixtureSource)=>import('./stripe-billing-initial-3ds-replay-capture').IssuerReplayWriteStatus;
- report:(status:import('./stripe-billing-initial-3ds-terminal').IssuerReplayStatus)=>void;
-};
 interface FrameSnapshot {target:Frame;frames:Map<Frame,string>}
 type Options={
  page:Page;limits:BillingLimits;demo:string;owner:()=>{secret:string;key:string};
  winning:()=>Promise<void>;authorizeResponse:(req:Request)=>Promise<void>;check:()=>Promise<void>;
- expectIssuerAssetBlock:(req:Request,decisionDocument?:Request)=>Promise<void|boolean>;
- authorizeIssuerScript?:(req:Request,document:Request,capture:boolean)=>Promise<void>;
- takeIssuerScriptBody?:(req:Request,document:Request)=>Promise<IssuerDecisionBody>|undefined;
+ expectIssuerAssetBlock:(req:Request)=>Promise<void|boolean>;
+ authorizeIssuerScript?:(req:Request,document:Request)=>Promise<void>;
  authorizeIssuerDecision?:(req:Request)=>Promise<void>;
- takeIssuerDecisionBody?:(req:Request)=>IssuerDecisionBody|undefined|Promise<IssuerDecisionBody|undefined>;
  authorizeIssuerResult?:(req:Request,document:Request)=>Promise<void>;
- issuerReplay?:IssuerReplayCapture;
  stripeFrames:(req:Request)=>FrameSnapshot|undefined;waitForGesture:WaitForIssuerGesture;
  approvedIssuerOrigin?:string;
 };
@@ -155,18 +154,17 @@ function sameChain(a:FrameSnapshot|undefined,b:FrameSnapshot|undefined){
 }
 
 /** Scoped to one original v2 session. Only Stripe.js sends requests and only the issuer UI completes the challenge. */
-export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,authorizeIssuerScript,takeIssuerScriptBody,authorizeIssuerDecision,takeIssuerDecisionBody,authorizeIssuerResult,issuerReplay,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
+export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,authorizeIssuerScript,authorizeIssuerDecision,authorizeIssuerResult,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
  requireValue(approvedIssuerOrigin===undefined||isApprovedIssuerOrigin(approvedIssuerOrigin));
  let retrieve:Request|undefined,authenticate:Request|undefined,admittedAuthenticate:Request|undefined;
  let completed=false,finalRead=false,initialIssuerDispatched=false,boundSource:string|undefined;
  let issuer:Frame|undefined,issuerRequest:Request|undefined,submission:Request|undefined,binding:ReturnType<typeof issuerBinding>|undefined;
  let issuerResult:{request:Request;state:'pending'|'forwarded'|'verified'}|undefined;
- let refusedFixture:{route:Route;result:Request;decision:Request;script:Request;html:Uint8Array;frameName:string;deadline:number}|undefined;
  let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:Promise<void>}|undefined;
  let handoffStarted=false;
  const issuerAssets=()=>({
-  blocks:new Map<string,{request:Request;document:Request;blocked:Promise<boolean>}>(),
-  scripts:new Map<string,{request:Request;forwarded:Promise<void>}>(),deadline:undefined as number|undefined,
+  blocks:new Map<string,Promise<void>>(),
+  scripts:new Map<string,Promise<void>>(),deadline:undefined as number|undefined,
  });
  const challengeAssets=issuerAssets(),decisionAssets=issuerAssets();
  const passiveFailures=new Map<Request,()=>void>();
@@ -244,136 +242,6 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   const bytes=await billingBounded(limits,()=>response.body());requireValue(bytes.length<=65536);
   return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)) as unknown;
  }
- function matchingDecisionScript(scriptUrl:string){
-  const script=decisionAssets.scripts.get(new URL(scriptUrl).pathname);
-  if(decisionAssets.scripts.size===1&&script?.request.url()===scriptUrl)return script;
- }
- async function verifiedIssuerResultForm(route:Route,original:FrameSnapshot,request:Request,response:Response,frameName:string,report:(code:string)=>void){
-  return billingBounded(limits,async active=>{
-   // Chromium binds the receipt to the admitted response. It proves bounded
-   // decoded bytes before any CRes form is inspected.
-   report('BROWSER_CHALLENGE_CRES_DECISION_READ');
-   let bytes=await takeIssuerDecisionBody?.(request);
-   billingCheck(active);
-   if(typeof bytes==='string'){
-    report(bytes);
-    requireValue(false);
-   }
-   const capturedDecision=bytes!==undefined;
-   if(!bytes){
-    report('BROWSER_CHALLENGE_CRES_DECISION_HEADERS');
-    const [type,encoding]=await Promise.all([response.headerValue('content-type'),response.headerValue('content-encoding')]);
-    billingCheck(active);
-    report('BROWSER_CHALLENGE_CRES_DECISION_MEDIA');
-    requireValue(type && /^text\/html(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i.test(type.trim()));
-    report('BROWSER_CHALLENGE_CRES_DECISION_ENCODING');
-    requireValue(encoding===null||encoding.trim().toLowerCase()==='identity');
-    report('BROWSER_CHALLENGE_CRES_DECISION_SIZE');
-    const {responseBodySize}=await request.sizes();
-    billingCheck(active);
-    requireValue(Number.isSafeInteger(responseBodySize)&&responseBodySize>0&&responseBodySize<=65536);
-    report('BROWSER_CHALLENGE_CRES_DECISION_READ');
-    bytes=await response.body();
-   }
-   billingCheck(active);
-   report('BROWSER_CHALLENGE_CRES_DECISION_SIZE');
-   requireValue(bytes.length>0&&bytes.length<=65536);
-   report('BROWSER_CHALLENGE_CRES_DECISION_UTF8');
-   const html=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
-   report('BROWSER_CHALLENGE_CRES_FORM_PARSE');
-   const documentUrl=request.url();
-   const locateRefusal=capturedDecision&&issuerReplay&&takeIssuerScriptBody&&
-    new URL(documentUrl).origin===approvedIssuerOrigin;
-   let refusedScriptUrl:string|undefined;
-   let companionRejected=false;
-   const source=issuerResultForm(html,frameName,code=>{
-    companionRejected=code.startsWith('BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_');
-    report(code);
-   },documentUrl,locateRefusal?script=>{refusedScriptUrl=script.scriptUrl;}:undefined);
-   if(!source&&companionRejected&&issuerReplay){
-    if(!capturedDecision)issuerReplay.report('DECISION_RECEIPT_MISSING');
-    else if(!refusedScriptUrl)issuerReplay.report('SCRIPT_REFERENCE_UNPROVED');
-    else try{
-     issuerReplay.report('SCRIPT_SLOT_UNVERIFIED');
-     const script=matchingDecisionScript(refusedScriptUrl);
-     requireValue(script);
-     // Finish checking the already forwarded asset before the owner records the refusal.
-     issuerReplay.report('SCRIPT_FORWARD_UNCONFIRMED');
-     await script.forwarded;
-     billingCheck(active);
-     issuerReplay.report('FRAME_UNVERIFIED');
-     await check();
-     billingCheck(active);
-     const result=route.request(),target=original.target;
-     sameChain(original,committedIssuerDocument(target,request,response));
-     requireValue(!refusedFixture && request===submission && target.name()===frameName &&
-      issuerResult?.request===result && issuerResult.state==='pending' && !completed && !finalRead &&
-      script.request.frame()===target && matchingDecisionScript(refusedScriptUrl)===script);
-     refusedFixture={route,result,decision:request,script:script.request,html:bytes,frameName,deadline:active.deadline};
-     issuerReplay.report('ABORT_NOT_STARTED');
-    }catch{/* Keep the parser's original refusal and checkpoint. */}
-   }
-   requireValue(source);
-   let form;
-   if('scriptUrl' in source){
-    report('BROWSER_CHALLENGE_CRES_SCRIPT_RECEIPT');
-    const script=matchingDecisionScript(source.scriptUrl);
-    requireValue(capturedDecision&&script);
-    if(source.blockedStylesheetUrl){
-     report('BROWSER_CHALLENGE_CRES_HEAD_STYLESHEET_BLOCK');
-     const path=new URL(source.blockedStylesheetUrl).pathname,receipt=decisionAssets.blocks.get(path);
-     requireValue(receipt?.document===request&&receipt.request.url()===source.blockedStylesheetUrl&&
-      receipt.request.resourceType()==='stylesheet'&&receipt.request.frame()===original.target);
-     requireValue(await receipt.blocked);
-     await check();billingCheck(active);
-     requireValue(decisionAssets.blocks.get(path)===receipt&&receipt.request.existingResponse()===null);
-     sameChain(original,committedIssuerDocument(original.target,request,response));
-     report('BROWSER_CHALLENGE_CRES_SCRIPT_RECEIPT');
-    }
-    const pendingBody=takeIssuerScriptBody?.(script.request,request);
-    requireValue(pendingBody);
-    report('BROWSER_CHALLENGE_CRES_SCRIPT_READ');
-    const [scriptBody]=await Promise.all([pendingBody,script.forwarded]);
-    billingCheck(active);
-    if(scriptBody==='BROWSER_CHALLENGE_CRES_DECISION_SIZE')report('BROWSER_CHALLENGE_CRES_SCRIPT_SIZE');
-    requireValue(typeof scriptBody!=='string');
-    form=externalIssuerResultForm(scriptBody,frameName,report,source.placement,source.foldedCompanion);
-    requireValue(form);
-   }else form=source;
-   report('BROWSER_CHALLENGE_CRES_FORM_DEADLINE');
-   return form;
-  },2000);
- }
- function captureRefusedIssuerFixture(route:Route,abortRoute:()=>Promise<void>){
-  const fixture=refusedFixture,takeScript=takeIssuerScriptBody,replay=issuerReplay;
-  if(!fixture||fixture.route!==route||fixture.result!==route.request()||!takeScript||!replay)return;
-  refusedFixture=undefined;
-  replay.report('ABORT_UNCONFIRMED');
-  const blocked=Promise.resolve().then(abortRoute);
-  void blocked.catch(()=>{});
-  return billingBounded({deadline:fixture.deadline,signal:limits.signal},async active=>{
-   // Consume this receipt once the original CRes route has been blocked.
-   await blocked;
-   billingCheck(active);
-   replay.report('SCRIPT_SLOT_UNVERIFIED');
-   const scriptUrl=fixture.script.url();
-   if(matchingDecisionScript(scriptUrl)?.request!==fixture.script)return;
-   replay.report('SCRIPT_RECEIPT_MISSING');
-   const receipt=takeScript(fixture.script,fixture.decision);
-   if(!receipt)return;
-   replay.report('SCRIPT_READ_UNCONFIRMED');
-   const script=await receipt;
-   billingCheck(active);
-   if(script==='BROWSER_CHALLENGE_CRES_DECISION_READ')return;
-   if(!(script instanceof Uint8Array)||script.byteLength===0||script.byteLength>65536){
-    replay.report('SCRIPT_SIZE_REJECTED');return;
-   }
-   replay.report('SCRIPT_SLOT_UNVERIFIED');
-   if(matchingDecisionScript(scriptUrl)?.request!==fixture.script)return;
-   replay.report('SANITIZE_FAILED');
-   replay.report(replay.save({html:fixture.html,script,documentUrl:fixture.decision.url(),scriptUrl,frameName:fixture.frameName}));
-  },750).catch(()=>{});
- }
  // Descriptive only. Capture the refused frame shape, then read only the
  // response to the authenticate POST already admitted by the browser guard.
  async function refusedIssuerRelation(request:Request,active:BillingLimits):Promise<RefusedIssuerRelation>{
@@ -425,13 +293,12 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   requireValue(original);
   const decisionForResult=submission && url.origin===issuerOrigin && navigation &&
    request.method()==='POST' && request.resourceType()==='document' ? submission : undefined;
-  const observedResultBody=decisionForResult?request.postData():null;
-  if(decisionForResult && matchingChallengeResult(binding,observedResultBody)){
+  if(decisionForResult){
    report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT');
    sameChain(original,issuerDocumentSnapshot(target,decisionForResult));
    report('BROWSER_CHALLENGE_CRES_RESERVATION');
    billingCheck(limits);
-   // Reserve before awaiting headers or response bytes so SDK completion sees the pending POST.
+   // Reserve before awaiting headers so a malformed result cannot race SDK completion.
    report('BROWSER_CHALLENGE_CRES_REPLAY');
    requireValue(!issuerResult);
    report('BROWSER_CHALLENGE_CRES_ORDER');
@@ -536,7 +403,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
      requireValue(authorizeIssuerScript && binding && isIssuerScriptPath(url.pathname) &&
       !assets.scripts.has(url.pathname) && assets.scripts.size<issuerScriptLimit);
      const forwarded=billingBounded(limits,async active=>{
-      await authorizeIssuerScript(request,documentRequest,decisionDocument);
+      await authorizeIssuerScript(request,documentRequest);
       await check();billingCheck(active);requireIssuerDocument();
       report('BROWSER_CHALLENGE_ROUTE_FORWARD');
       await route.continue();
@@ -547,7 +414,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
       // Stripe.js may retire the issuer after the successfully loaded decision script posts back.
       if(!decisionDocument)requireIssuerDocument();
      },10000);
-     assets.scripts.set(url.pathname,{request,forwarded});
+     assets.scripts.set(url.pathname,forwarded);
      return await forwarded;
     }
     switch(kind){
@@ -574,7 +441,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
      await check();billingCheck(active);
      requireIssuerDocument();
      report('BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK');
-     const stylesheetParserProved=await expectIssuerAssetBlock(request,decisionDocument&&kind==='stylesheet'?documentRequest:undefined);
+     await expectIssuerAssetBlock(request);
      await check();billingCheck(active);
      requireIssuerDocument();
      report('BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK');
@@ -583,9 +450,8 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
      await Promise.all([route.abort('blockedbyclient'),failed.promise]);
      await check();billingCheck(active);
      requireIssuerDocument();
-     return stylesheetParserProved===true;
     },750);
-    assets.blocks.set(url.pathname,{request,document:documentRequest,blocked:block});
+    assets.blocks.set(url.pathname,block);
     try{await block;}finally{passiveFailures.delete(request);}
     return;
    }
@@ -626,22 +492,19 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     const repeat=url.href===decision.url() && typeof data==='string' &&
      data.length<=65536 && createHash('sha256').update(data).digest('hex')===arm?.bodyHash;
     report(repeat?'BROWSER_CHALLENGE_ISSUER_SUBMISSION_REPEAT':'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP');
-    requireValue(!repeat && matchingChallengeResult(binding,data));
+    requireValue(!repeat);
     report('BROWSER_CHALLENGE_CRES_DESTINATION');
-    requireValue(url.origin===issuerOrigin);
+    requireValue(isStripeChallengeReturn(request.url()));
     report('BROWSER_CHALLENGE_CRES_REQUEST');
-    requireValue(authorizeIssuerResult && decisionResponse && issuerResult?.request===request && data===observedResultBody &&
-     request.serviceWorker()===null && !headers['transfer-encoding']);
-    const frameName=target.name();
-    const form=await verifiedIssuerResultForm(route,original,decision,decisionResponse,frameName,report);
-    report('BROWSER_CHALLENGE_CRES_ACTION');
-    requireValue(form.action===url.href);
+    requireValue(authorizeIssuerResult && decisionResponse && issuerResult?.request===request &&
+     request.serviceWorker()===null && !headers['transfer-encoding'] && !headers['content-encoding']);
     report('BROWSER_CHALLENGE_CRES_BODY');
-    requireValue(request.postDataBuffer()?.equals(Buffer.from(form.body)));
+    const resultBody=request.postDataBuffer();
+    requireValue(matchingChallengeResult(binding,resultBody) &&
+     (headers['content-length']===undefined||headers['content-length']===String(resultBody?.length)));
     await current();
     report('BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT');
     sameChain(original,committedIssuerDocument(target,decision,decisionResponse));
-    requireValue(target.name()===frameName);
     report('BROWSER_CHALLENGE_CRES_ORDER');
     requireValue(!completed && !finalRead);
     await forwardOriginal(()=>authorizeIssuerResult(request,decision));
@@ -694,8 +557,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   };
   handoffStarted=true;
   // Let the route's fixed checkpoint reach the owner on failure, while preventing handoff.
-  await Promise.all([...Array.from(challengeAssets.blocks.values(),receipt=>receipt.blocked),
-   ...Array.from(challengeAssets.scripts.values(),script=>script.forwarded)])
+  await Promise.all([...challengeAssets.blocks.values(),...challengeAssets.scripts.values()])
    .catch(()=>billingBounded(limits,()=>new Promise<never>(()=>{}),750));
   await validate();await billingBounded(limits,l=>waitForGesture({deadline:l.deadline,signal:l.signal!}),180000);await validate();
   // A pending form navigation can block evaluation in the issuer renderer.
@@ -722,5 +584,5 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    requireValue(await issuerResponded(l,45000));
   },45000);
  }
- return {owns,forward,attend,refusedIssuerRelation,captureRefusedIssuerFixture};
+ return {owns,forward,attend,refusedIssuerRelation};
 }

@@ -571,28 +571,62 @@ async function cancellationSetup(beforeExecute) {
   await f.adapter.bindOwnedBillingGraph(target,f.limits);
   return {...f,target,subscription};
 }
-for(const variant of ['authenticated','absent','frictionless','attempted','v1','trailing-newline','different-charge','extra-charge']){
+const challengeEvidence={result:'authenticated',authentication_flow:'challenge',version:'2.2.0'};
+for(const [variant,mutate] of [
+ ['authenticated',()=>{}],
+ ['absent',({charge})=>delete charge.payment_method_details.card.three_d_secure],
+ ['frictionless',({evidence})=>evidence.authentication_flow='frictionless'],
+ ['attempted',({evidence})=>evidence.result='attempt_acknowledged'],
+ ['v1',({evidence})=>evidence.version='1.0.2'],
+ ['trailing-newline',({evidence})=>evidence.version='2.2.0\n'],
+ ['different-charge',({charge,charges})=>charges.data=[{...charge,id:'ch_other'}]],
+ ['extra-charge',({charge,charges})=>charges.data.push({...charge,id:'ch_extra'})],
+ ['foreign intent response',({intent})=>intent.id='pi_other'],
+ ['foreign allocation intent',({allocations})=>allocations.data[0].payment.payment_intent='pi_other'],
+ ['foreign charge intent',({charge})=>charge.payment_intent='pi_other'],
+ ['wrong received amount',({intent})=>intent.amount_received=1999],
+ ['wrong intent currency',({intent})=>intent.currency='usd'],
+ ['wrong captured amount',({charge})=>charge.amount_captured=1999],
+ ['wrong charge currency',({charge})=>charge.currency='usd'],
+ ['multiple paid allocations',({allocations})=>allocations.data.push({...allocations.data[0],id:'inpay_extra'})],
+ ['multiple reverse allocations',({f,allocations})=>{
+  const execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,settings)=>{
+   if(args.includes('/v1/invoice_payments')&&args.includes('payment[payment_intent]=pi_original')){
+    return {stdout:JSON.stringify({...allocations,data:[...allocations.data,{...allocations.data[0],id:'inpay_extra'}]}),stderr:''};
+   }
+   return execute(file,args,settings);
+  };
+ }],
+ ['changed latest charge',({f,intent})=>{
+  const execute=f.dependencies.execute;
+  let reads=0;
+  f.dependencies.execute=async(file,args,settings)=>{
+   if(args.includes('/v1/payment_intents/pi_original')&&++reads===2){
+    return {stdout:JSON.stringify({...intent,latest_charge:'ch_other'}),stderr:''};
+   }
+   return execute(file,args,settings);
+  };
+ }],
+]){
  test('initial 3DS requires the authenticated challenge on the single original captured charge: '+variant,async()=>{
   const f=await billingSetup(),target=billingTarget();
   assert.equal(f.adapter.observeOwnedBillingInitial3ds,undefined);
   const config=f.options.configuration;
   config.selectedCase='initial_3ds';config.env.PAYMENT_STRIPE_BILLING_CASE=config.selectedCase;
-  const charge=f.objects['/v1/charges/ch_original'];
-  const evidence={result:variant==='attempted'?'attempt_acknowledged':'authenticated',
-   authentication_flow:variant==='frictionless'?'frictionless':'challenge',
-   version:variant==='v1'?'1.0.2':variant==='trailing-newline'?'2.2.0\n':'2.2.0'};
-  charge.payment_method_details.card=variant==='absent'?{}:{three_d_secure:evidence};
-  f.objects['/v1/charges']={object:'list',has_more:false,data:[variant==='different-charge'?{...charge,id:'ch_other'}:charge]};
-  if(variant==='extra-charge')f.objects['/v1/charges'].data.push({...charge,id:'ch_extra'});
-  f.objects['/v1/invoices'].data=[f.objects['/v1/invoices/in_original']];
+  const charge=f.objects['/v1/charges/ch_original'],evidence={...challengeEvidence};
+  charge.payment_method_details.card={three_d_secure:evidence};
+  const charges=f.objects['/v1/charges']={object:'list',has_more:false,data:[charge]};
+  mutate({f,charge,evidence,charges,intent:f.objects['/v1/payment_intents/pi_original'],allocations:f.objects['/v1/invoice_payments']});
   const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
   f.adapter=await createBillingCliAdapter(f.options,f.dependencies);
   assert.equal(f.adapter.observeOwnedBillingGraph,undefined);
   await f.adapter.validateBinding(f.limits);await start(f);
-  const inspect=()=>f.adapter.observeOwnedBillingInitial3ds(target,f.limits);
-  if(variant==='authenticated')assert.equal(await inspect(),true);else await assert.rejects(inspect);
-  const count=f.calls.length;await assert.rejects(inspect);assert.equal(f.calls.length,count);
-  await stop(f);
+  try{
+   const inspect=()=>f.adapter.observeOwnedBillingInitial3ds(target,f.limits);
+   if(variant==='authenticated')assert.equal(await inspect(),true);else await rejects(inspect(),'BILLING_INITIAL_3DS');
+   const count=f.calls.length;await rejects(inspect(),'BILLING_INITIAL_3DS');assert.equal(f.calls.length,count);
+  }finally{await stop(f);}
  });
 }
 for(const flag of [false,true])test('Billing cancellation accepts the explicit original boundary with period-end flag '+flag+' and proves withdrawal',async()=>{

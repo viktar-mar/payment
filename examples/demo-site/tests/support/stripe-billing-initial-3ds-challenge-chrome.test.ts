@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
-import {lstatSync,mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
+import {mkdtempSync,readFileSync,rmSync} from 'node:fs';
 import {createServer} from 'node:https';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -11,15 +11,8 @@ import {chromium,type Frame,type Request,type Response,type Route} from '@playwr
 import {initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 // @ts-ignore Native Node executes the guarded response source.
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
-// @ts-ignore Native Node executes the same private writer as the dedicated worker.
-import {prepareIssuerReplayCapture} from './stripe-billing-initial-3ds-replay-capture.ts';
 // @ts-ignore Native Node executes the same fixture as the result-form tests.
 import {syntheticIssuerDomForm} from './stripe-billing-initial-3ds-dom-fixture.ts';
-import type {IssuerReplayCapture} from './stripe-billing-initial-3ds';
-import type {IssuerDecisionReplayShape} from './stripe-billing-initial-3ds-replay-fixture';
-import type {IssuerReplayStatus} from './stripe-billing-initial-3ds-terminal';
-
-type CaptureSource=Parameters<IssuerReplayCapture['save']>[0];
 
 async function serveIssuerResponse(url:URL,bytes:Buffer,encoding:string,chunked:boolean,script=false){
  const directory=mkdtempSync(join(tmpdir(),'billing-decision-tls-'));
@@ -72,60 +65,18 @@ const twoFonts='direct reviewed issuer two passive fonts blocked';
 const sixFonts='direct reviewed issuer six passive fonts blocked';
 const parserScript='one parser-initiated script from the exact issuer document';
 const decisionScript='one parser-initiated script from the issuer decision document';
-const secondDecisionPost='a second document POST from the issuer decision';
-const decisionCres='a CRes document POST to the Stripe hooks origin';
-const isolatedDecisionCres='a CRes document POST between isolated issuer and hooks targets';
-const namedDecisionCres='a CRes form targeting the same issuer frame with an implicit empty session value';
-const literalDecisionCres='a CRes form written by one literal inline script';
-const insertionDecisionCres='a CRes form inserted by one literal inline script';
-const dynamicDecisionCres='a CRes form assembled by an unsupported DOM script';
-const literalBodyMismatch='a CRes literal form whose observed wire body differs';
-const externalLiteral='a CRes form from one original external issuer script';
-const externalGzip='a CRes form from one gzip external issuer script';
-const externalHead='a CRes form written by a single external script in the decision head';
-const externalHeadWithData='a CRes form written by an external head script beside inert JSON data';
-const externalWithExecutable='a CRes form written by an external script beside unproved executable code';
-const externalHeadWithCompanionId='a CRes form written by an external head script beside identified JSON data';
-const externalWithCompanionId='a CRes form inserted by an external body script beside identified JSON data';
-const externalWithInvalidCompanion='a CRes form written by an external script beside JSON with HTML-escaped quotes';
-const externalWithCommentCompanion='a CRes form written by an external script beside an HTML comment containing escaped JSON';
-const externalWithAssignmentCompanion='a CRes form written by an external script beside a JSON value in assignment syntax';
-const externalWithLabelledCompanion='a CRes form written by an external script beside a labelled JSON suffix';
-const externalWithStrictCompanion='a CRes form written by an external script beside the strict JSON control';
-const externalWithFoldedCompanion='a CRes form written by an external script beside folded Base64 JSON';
-const foldedDom='a folded Base64 companion and its dynamic CRes form';
-const foldedDomHeadStylesheet='a folded dynamic CRes form with a blocked head stylesheet';
-const foldedDomWrongStylesheetReceipt='a folded dynamic CRes form with a different head stylesheet receipt';
-const foldedDomLocalHeadIcon='a folded dynamic CRes form with a local head icon';
-const foldedDomNetworkHeadIcon='a folded dynamic CRes form with a network head icon';
-const foldedDomInlinePngHeadIcon='a folded dynamic CRes form with a raster data head icon';
-const foldedDomMixedCaseHeadIcon='a folded dynamic CRes form with mixed-case data head icon metadata';
-const foldedDomIconAfterHead='a folded dynamic CRes form with a head icon written after the closing tag';
-const captureUnsupportedHeadIcon='a folded dynamic CRes form with an unsupported data head icon and private capture';
-const staticWithScriptStylesheet='a static CRes form with a blocked script-initiated stylesheet';
-const foldedDomExtraScript='a folded dynamic CRes form with an extra script statement';
-const foldedDomWireMismatch='a folded dynamic CRes form with different expected POST bytes';
-const foldedDomLegacyEncoding='a folded dynamic CRes form with legacy document encoding';
-const foldedDomWrongTransaction='a folded dynamic CRes form for a different 3DS transaction';
-const foldedDomCases=new Set([foldedDom,foldedDomHeadStylesheet,foldedDomWrongStylesheetReceipt,
- foldedDomLocalHeadIcon,foldedDomNetworkHeadIcon,foldedDomInlinePngHeadIcon,foldedDomMixedCaseHeadIcon,foldedDomIconAfterHead,captureUnsupportedHeadIcon,
- foldedDomExtraScript,foldedDomWireMismatch,foldedDomLegacyEncoding,foldedDomWrongTransaction]);
-const captureFoldedCompanion='a CRes refusal with opt-in to its anonymized paired fixture';
-const captureMaskedLayout='a CRes refusal with opt-in and an outer language attribute';
-const captureMissingDecision='a CRes refusal with opt-in and no CDP decision receipt';
-const captureMissingReceipt='a CRes refusal with opt-in and no paired fixture receipt';
-const captureAbortFailure='a CRes refusal with opt-in and no confirmed abort for the fixture';
-const captureOutcomes=new Map<string,IssuerReplayStatus>([
- [captureFoldedCompanion,'CAPTURED'],[captureMaskedLayout,'STRUCTURAL_ONLY'],[captureMissingDecision,'DECISION_RECEIPT_MISSING'],
- [captureMissingReceipt,'SCRIPT_RECEIPT_MISSING'],[captureAbortFailure,'ABORT_UNCONFIRMED'],[captureUnsupportedHeadIcon,'STRUCTURAL_ONLY'],
-]);
-const externalNested='a CRes form written by an external script under a nonstructural parent';
-const externalUnknown='a CRes form from an unsupported external DOM builder';
-const externalMismatch='a CRes form beside identified JSON data with different expected POST bytes';
-const externalNoReceipt='a CRes form from an external script without a matching receipt';
-const externalInvalidUtf8='a CRes form from an external script with invalid UTF-8';
-const oversizedDecision='a gzip CRes decision that expands past 64 KiB';
-const invalidUtf8Decision='a gzip CRes decision with invalid UTF-8';
+const secondDecisionPost='a repeat of the original trusted decision POST';
+const decisionCres='a CRes POST from a committed hooks issuer document';
+const isolatedDecisionCres='a CRes POST between isolated issuer and hooks targets';
+const namedDecisionCres='a CRes form targeting the same issuer frame with an empty session value';
+const dynamicDecisionCres='a CRes form assembled by arbitrary issuer JavaScript';
+const changedCresAction='a CRes form whose action is set by issuer JavaScript';
+const changedCresBody='a CRes form whose optional session data is set by issuer JavaScript';
+const externalFolded='a CRes form assembled from folded data by an external issuer script';
+const parserStylesheet='a dynamic CRes form with a blocked parser-initiated stylesheet';
+const scriptStylesheet='a CRes form with a blocked script-initiated stylesheet';
+const oversizedDecision='a gzip decision that expands past 64 KiB';
+const invalidUtf8Decision='a gzip decision with trailing invalid UTF-8';
 const compressedDecisions=new Map([
  ['a gzip CRes decision between isolated issuer and hooks targets',{encoding:'gzip',compress:gzipSync}],
  ['a chunked Brotli CRes decision with exactly 64 KiB decoded',{encoding:'br',compress:brotliCompressSync,chunked:true,decodedSize:65536}],
@@ -134,46 +85,49 @@ const compressedDecisions=new Map([
  [oversizedDecision,{encoding:'gzip',compress:gzipSync,decodedSize:65537}],
  [invalidUtf8Decision,{encoding:'gzip',compress:gzipSync}],
 ]);
-const lateDecisionCres='a CRes document POST with late issuer response observation';
-const lateDecisionHeaders='a captured CRes decision with unavailable Playwright headers';
-const uncapturedDecision='a CRes document POST using the paired Playwright response';
-const changedCresAction='a CRes form whose action changed after the issuer response';
-const changedCresBody='a CRes form whose session data changed after the issuer response';
-const unsupportedCresForm='a CRes sent from a form with an unproved control';
-const issuerCresDestination='a CRes sent to the issuer origin';
+const lateDecisionCres='a CRes POST with late issuer response observation';
+const unavailableDecisionHeaders='a CRes POST with unavailable Playwright response headers';
+const repeatedCres='a second attempt to forward the same paused CRes POST';
+const cancelledCres='a CRes POST cancelled after CDP authorization';
+const wrongIssuerDestination='a CRes POST to the issuer origin';
+const rootHooksDestination='a CRes POST to the hooks root';
+const unexpectedField='a CRes POST with an unexpected form field';
+const duplicateCres='a CRes POST with a second CRes field';
+const duplicateSession='a CRes POST with a second session data field';
+const legacyEncoding='a CRes POST with invalid UTF-8 form data';
+const wrongAcsId='a CRes POST with the wrong issuer transaction ID';
+const wrongServerId='a CRes POST with the wrong server transaction ID';
+const wrongVersion='a CRes POST with the wrong message version';
+const nonterminalStatus='a CRes POST with a nonterminal status';
+const mismatchedDecision='a CRes POST with the Playwright response of a different request';
+const replacedIssuerDocument='a CRes POST after the issuer document changes its URL';
 const refusedFollowups=new Map([
- [secondDecisionPost,'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
- [changedCresAction,'BROWSER_CHALLENGE_CRES_ACTION'],
- [changedCresBody,'BROWSER_CHALLENGE_CRES_BODY'],
- [unsupportedCresForm,'BROWSER_CHALLENGE_CRES_FORM_CONTROL'],
- [dynamicDecisionCres,'BROWSER_CHALLENGE_CRES_FORM_MISSING_INLINE_DOM'],
- [literalBodyMismatch,'BROWSER_CHALLENGE_CRES_BODY'],
- [externalUnknown,'BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED_DOM'],
- [externalMismatch,'BROWSER_CHALLENGE_CRES_BODY'],
- [externalNoReceipt,'BROWSER_CHALLENGE_CRES_SCRIPT_RECEIPT'],
- [externalInvalidUtf8,'BROWSER_CHALLENGE_CRES_SCRIPT_READ'],
- [externalNested,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_PARENT'],
- [externalWithExecutable,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION'],
- [externalWithInvalidCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_HTML_QUOTES'],
- [externalWithCommentCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_FORMAT_COMMENT'],
- [externalWithAssignmentCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_ASSIGN_JSON'],
- [externalWithLabelledCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_SHAPE_AJNSA'],
- [externalWithFoldedCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON'],
- [foldedDomExtraScript,'BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED_DOM'],
- [foldedDomWrongStylesheetReceipt,'BROWSER_CHALLENGE_CRES_HEAD_STYLESHEET_BLOCK'],
- [foldedDomNetworkHeadIcon,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON'],
- [foldedDomIconAfterHead,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON'],
- [foldedDomWireMismatch,'BROWSER_CHALLENGE_CRES_BODY'],
- [foldedDomLegacyEncoding,'BROWSER_CHALLENGE_CRES_BODY'],
- [foldedDomWrongTransaction,'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
- ...[...captureOutcomes.keys()].map(mode=>[mode,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON'] as const),
- [issuerCresDestination,'BROWSER_CHALLENGE_CRES_DESTINATION'],
- [oversizedDecision,'BROWSER_CHALLENGE_CRES_DECISION_SIZE'],
- [invalidUtf8Decision,'BROWSER_CHALLENGE_CRES_DECISION_UTF8'],
+ [secondDecisionPost,'BROWSER_CHALLENGE_ISSUER_SUBMISSION_REPEAT'],
+ [wrongIssuerDestination,'BROWSER_CHALLENGE_CRES_DESTINATION'],
+ [rootHooksDestination,'BROWSER_CHALLENGE_CRES_DESTINATION'],
+ [cancelledCres,'BROWSER_CHALLENGE_ROUTE_FORWARD'],
+ ...[unexpectedField,duplicateCres,duplicateSession,legacyEncoding,wrongAcsId,wrongServerId,wrongVersion,nonterminalStatus]
+  .map(mode=>[mode,'BROWSER_CHALLENGE_CRES_BODY'] as const),
+ [mismatchedDecision,'BROWSER_CHALLENGE_CRES_DECISION_RESPONSE'],
+ [replacedIssuerDocument,'BROWSER_CHALLENGE_ISSUER_SUBMISSION_DOCUMENT'],
 ]);
 const wrongScriptMime='issuer script with the wrong MIME type is refused';
-for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,namedDecisionCres,literalDecisionCres,insertionDecisionCres,externalLiteral,externalGzip,externalHead,externalHeadWithData,externalHeadWithCompanionId,externalWithCompanionId,externalWithStrictCompanion,foldedDom,foldedDomHeadStylesheet,foldedDomLocalHeadIcon,foldedDomInlinePngHeadIcon,foldedDomMixedCaseHeadIcon,staticWithScriptStylesheet,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
-test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?mode+' is blocked after the original 2xx':mode===wrongScriptMime?mode:
+const unclaimedDecision='an issuer decision response without an authorized request';
+const wrongDecisionMime='an issuer decision response with the wrong MIME type';
+const wrongResultMime='a CRes response with the wrong MIME type';
+const rejectedResponses=new Map([
+ [unclaimedDecision,'BROWSER_GUARD_RESPONSE_UNCLAIMED'],
+ [wrongDecisionMime,'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'],
+ [wrongResultMime,'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'],
+]);
+const cresCases=new Set([decisionCres,isolatedDecisionCres,namedDecisionCres,dynamicDecisionCres,changedCresAction,changedCresBody,
+ externalFolded,parserStylesheet,scriptStylesheet,...compressedDecisions.keys(),lateDecisionCres,unavailableDecisionHeaders,repeatedCres,
+ wrongResultMime,...[...refusedFollowups.keys()].filter(mode=>mode!==secondDecisionPost)]);
+const modes=['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame',
+ 'direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,
+ stylesheetBlock,parserScript,decisionScript,wrongScriptMime,secondDecisionPost,...cresCases,...rejectedAssets.keys(),unclaimedDecision,wrongDecisionMime];
+for(const mode of modes)
+test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)||rejectedResponses.has(mode)?mode+' is blocked':mode===wrongScriptMime?mode:
  'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
  const secret='pi_fixture_secret_fixture',key='pk_test_fixture',source='fingerprint_fixture-v2',api='https://api.stripe.com';
@@ -188,28 +142,15 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const loadsDecisionScript=mode===decisionScript;
  const compressed=compressedDecisions.get(mode);
  const namedForm=mode===namedDecisionCres;
- const literalForm=[literalDecisionCres,insertionDecisionCres,literalBodyMismatch].includes(mode);
  const dynamicForm=mode===dynamicDecisionCres;
- const captureEnabled=captureOutcomes.has(mode);
- const missingDecisionReceipt=mode===uncapturedDecision||mode===captureMissingDecision;
- const hasFoldedDom=foldedDomCases.has(mode);
- const foldedCompanion=mode===externalWithFoldedCompanion||captureEnabled&&!hasFoldedDom;
- const companionReplay=mode===externalWithStrictCompanion||foldedCompanion;
- const legacyStylesheet=mode===staticWithScriptStylesheet;
- const hasDecisionStylesheet=mode===foldedDomHeadStylesheet||mode===foldedDomWrongStylesheetReceipt||legacyStylesheet;
- const hasHeadIcon=[foldedDomLocalHeadIcon,foldedDomNetworkHeadIcon,foldedDomInlinePngHeadIcon,foldedDomMixedCaseHeadIcon,
-  foldedDomIconAfterHead,captureUnsupportedHeadIcon].includes(mode);
- const externalForm=[externalLiteral,externalGzip,externalHead,externalHeadWithData,externalWithExecutable,
-  externalHeadWithCompanionId,externalWithCompanionId,externalWithInvalidCompanion,externalWithCommentCompanion,
-  externalWithAssignmentCompanion,externalWithLabelledCompanion,
-  externalNested,externalUnknown,externalMismatch,externalNoReceipt,externalInvalidUtf8].includes(mode)||companionReplay||hasFoldedDom;
- const submitsCres=Boolean(compressed)||[decisionCres,isolatedDecisionCres,namedDecisionCres,lateDecisionCres,lateDecisionHeaders,uncapturedDecision,
-  changedCresAction,changedCresBody,unsupportedCresForm,issuerCresDestination,staticWithScriptStylesheet].includes(mode)||literalForm||dynamicForm||externalForm;
- const isolated=mode===isolatedDecisionCres||namedForm||literalForm||dynamicForm||
-  (externalForm&&!missingDecisionReceipt)||compressed||mode===lateDecisionHeaders||mode==='separate issuer process';
+ const externalForm=mode===externalFolded||mode===parserStylesheet;
+ const hasDecisionStylesheet=mode===parserStylesheet||mode===scriptStylesheet;
+ const scriptInitiatedStylesheet=mode===scriptStylesheet;
+ const submitsCres=cresCases.has(mode);
+ const isolated=submitsCres&&mode!==decisionCres||mode==='separate issuer process';
  const submitsSecondDecision=mode===secondDecisionPost||submitsCres;
  const rejectedAsset=rejectedAssets.get(mode);
- const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||loadsScript||loadsDecisionScript||submitsSecondDecision||Boolean(rejectedAsset);
+ const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||loadsScript||loadsDecisionScript||submitsSecondDecision&&mode!==decisionCres||Boolean(rejectedAsset)||rejectedResponses.has(mode);
  const direct=mode==='direct Stripe EMVCo frame'||scopedIssuer;
  const issuerName=direct?'stripe-challenge-frame':'acsFrame';
  const approvedIssuerOrigin=scopedIssuer?'https://reviewed-test-issuer.stripe.com':undefined;
@@ -218,33 +159,39 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png'));
  const decisionAsset=issuerOrigin+'/fixture-decision.js';
  const decisionStylesheetPath='/fixture-decision.css',decisionStylesheet=issuerOrigin+decisionStylesheetPath;
- const followup=(submitsCres&&mode!==issuerCresDestination?'https://hooks.stripe.com':issuerOrigin)+'/fixture-followup';
+ const followupOrigin=submitsCres&&mode!==wrongIssuerDestination?'https://hooks.stripe.com':issuerOrigin;
+ const followup=mode===secondDecisionPost?decision:followupOrigin+(mode===rootHooksDestination?'/':'/fixture-followup');
  const observedFollowup=mode===changedCresAction?followup+'-different':followup;
  const fontCount=mode===sixFonts?6:mode===twoFonts?2:1;
  const assetUrls=[assetPath,...Array.from({length:fontCount-1},(_,index)=>issuerOrigin+`/fixture-passive-${index+2}.woff2`)];
  const isDecisionStylesheet=(url:string)=>hasDecisionStylesheet&&url===decisionStylesheet;
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
- // Model the documented callback in the paired cases using synthetic transaction IDs.
- // https://docs.3dsecure.io/3dsv2/challenge_flow.html#receiving-challenge-results
- const resultMessage={messageType:'CRes',messageVersion:'2.2.0',threeDSServerTransID:server,
-  acsTransID:mode===foldedDomWrongTransaction?'11111111-2222-4333-8444-555555555553':acs,transStatus:'Y'};
- const cresBytes=Buffer.from(JSON.stringify(companionReplay?{...resultMessage,challengeCompletionInd:'Y'}:resultMessage));
- const encodedCres=cresBytes.toString('base64url');
- const cres=companionReplay?encodedCres.padEnd(Math.ceil(encodedCres.length/4)*4,'='):encodedCres;
- const replayWire=Buffer.from(`cres=${encodeURIComponent(cres)}&threeDSSessionData=fixture%26session`);
- const domFixture=hasFoldedDom?syntheticIssuerDomForm(followup,{threeDSSessionData:'é + &\nline',cres}):undefined;
- const domAccent=mode===foldedDomLegacyEncoding?'%E9':'%C3%A9';
- const domWire=Buffer.from(`threeDSSessionData=${domAccent}+%2B+%26%0D%0Aline&cres=${encodeURIComponent(cres)}`);
- const sessionValue=namedForm?'':' value="fixture&amp;session"';
- const followupFields=submitsCres?`<input type="${mode===unsupportedCresForm?'text':'hidden'}" name="cres" value="${cres}"><input type="hidden" name="threeDSSessionData"${sessionValue}>`:
-  '<input name="result" value="fixture">';
+ const encodedCres=Buffer.from(JSON.stringify({
+  messageType:'CRes',messageVersion:mode===wrongVersion?'2.1.0':'2.2.0',
+  threeDSServerTransID:mode===wrongServerId?'11111111-2222-4333-8444-555555555553':server,
+  acsTransID:mode===wrongAcsId?'11111111-2222-4333-8444-555555555553':acs,transStatus:mode===nonterminalStatus?'D':'Y',
+ })).toString('base64url');
+ const cres=externalForm?encodedCres.padEnd(Math.ceil(encodedCres.length/4)*4,'='):encodedCres;
+ const cresWire=cres.replace(/=/g,'%3D');
+ const domFixture=externalForm?syntheticIssuerDomForm(followup,{threeDSSessionData:'é + &\nline',cres}):undefined;
+ const hidden=(name:string,value:string)=>`<input type="hidden" name="${name}" value="${value}">`;
+ const followupFields=submitsCres?
+  hidden('cres',cres)+(namedForm?'<input type="hidden" name="threeDSSessionData">':
+   hidden('threeDSSessionData',mode===legacyEncoding?'é':'fixture&amp;session'))+
+  (mode===unexpectedField?hidden('other','fixture'):mode===duplicateCres?hidden('cres',cres):mode===duplicateSession?hidden('threeDSSessionData','again'):''):
+  hidden('decision','complete');
+ const expectedSession=mode===legacyEncoding?'%E9':namedForm?'':mode===changedCresBody?'different':'fixture%26session';
+ const extraField=mode===unexpectedField?'&other=fixture':mode===duplicateCres?'&cres='+cres:mode===duplicateSession?'&threeDSSessionData=again':'';
+ const expectedWire=Buffer.from(externalForm?`threeDSSessionData=%C3%A9+%2B+%26%0D%0Aline&cres=${cresWire}`:
+  dynamicForm?`cres=${cresWire}`:`cres=${cresWire}&threeDSSessionData=${expectedSession}${extraField}`);
  const followupScript=[
   mode===changedCresAction?'document.forms[0].action='+JSON.stringify(observedFollowup):'',
   mode===changedCresBody?'document.forms[0].elements.namedItem("threeDSSessionData").value="different"':'',
+  mode===replacedIssuerDocument?'history.replaceState(null,"","/different-issuer-document")':'',
   'document.forms[0].submit()',
  ].filter(Boolean).join(';');
- const staticSubmit=legacyStylesheet?`
+ const staticSubmit=scriptInitiatedStylesheet?`
   const stylesheet=document.createElement('link');
   stylesheet.rel='stylesheet';stylesheet.type='text/css';stylesheet.href=${JSON.stringify(decisionStylesheetPath)};
   stylesheet.addEventListener('error',()=>document.forms[0].submit(),{once:true});
@@ -284,51 +231,21 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    loadsScript?`<script src="${assetPath}"></script>`:'');
  const followupTarget=namedForm?` target="${issuerName}"`:'';
  const followupForm=`<form method="post" action="${followup}"${followupTarget}>${followupFields}</form>`;
- const insertForm=mode===insertionDecisionCres||mode===externalWithCompanionId?
-  "document.body.insertAdjacentHTML('beforeend', ":'document.write(';
- const literalSource=`${insertForm}${JSON.stringify(followupForm)});${followupScript};`;
- const inlineDecision=(source:string)=>`<!doctype html><body><script>${source}</script></body>`;
  const dynamicSource=`
   const result=document.createElement('form');result.method='post';result.action=${JSON.stringify(followup)};
   const field=document.createElement('input');field.type='hidden';field.name='cres';field.value=${JSON.stringify(cres)};
   result.append(field);document.body.append(result);result.submit();
  `;
- const externalTag='<script src="/fixture-decision.js"></script>';
- const jsonWithId=(id:string,contents='{"fixture":true}')=>`<script type="application/json" id="${id}">${contents}</script>`;
- // The two synthetic decision pages differ only in the inline data block.
- const companionJson='{"fixture":true}';
- const replayCompanion=foldedCompanion?
-  Buffer.from(companionJson).toString('base64').replace(/^.{5}/,'$&\n'):companionJson;
- const png='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=';
- const pngHref='data:image/png;base64,'+png,mixedCasePngHref='DaTa:ImAgE/PnG;BaSe64,'+png;
- const unsupportedIconHref='data:image/svg+xml,%3Csvg%20id%3D%22fixture-private-icon%22%2F%3E';
- const decisionIcon=mode===captureUnsupportedHeadIcon?`<link rel="icon" href="${unsupportedIconHref}" type="image/png">`:
-  mode===foldedDomMixedCaseHeadIcon?`<link rel="icon" href="${mixedCasePngHref}" type="image/png">`:
-  mode===foldedDomInlinePngHeadIcon?`<link rel="icon" href="${pngHref}" type="image/png">`:
-  `<link rel="shortcut icon" href="${mode===foldedDomNetworkHeadIcon?'/fixture-head-icon.ico':'data:image/x-icon;,'}" type="image/x-icon">`;
- const decisionHead=hasDecisionStylesheet?`<head><link rel="stylesheet" href="${decisionStylesheetPath}" type="text/css"></head>`:
-  mode===foldedDomIconAfterHead?`<head></head>${decisionIcon}`:
-  hasHeadIcon?`<head>${decisionIcon}</head>`:'';
- const externalDocument=domFixture?`<!doctype html>${decisionHead}<body>${jsonWithId(domFixture.id,domFixture.folded)}${externalTag}</body>`:
-  mode===externalHead?`<!doctype html><head>${externalTag}</head><body></body>`:
-  mode===externalHeadWithData?`<!doctype html><head><script type="application/json">{"fixture":true}</script>${externalTag}</head><body></body>`:
-  mode===externalHeadWithCompanionId?`<!doctype html><head>${jsonWithId('document')}${jsonWithId('write')}${externalTag}</head><body></body>`:
-  mode===externalWithExecutable?`<!doctype html><body><script>void 0;</script>${externalTag}</body>`:
-  mode===externalWithCompanionId?`<!doctype html><body>${jsonWithId('body')}${jsonWithId('forms')}${jsonWithId('submit')}${externalTag}</body>`:
-  mode===externalWithInvalidCompanion?`<!doctype html><body>${jsonWithId('fixture-data','{&quot;fixture&quot;:true}')}${externalTag}</body>`:
-  mode===externalWithCommentCompanion?`<!doctype html><body>${jsonWithId('fixture-data','<!-- {&quot;fixture&quot;:true} -->')}${externalTag}</body>`:
-  mode===externalWithAssignmentCompanion?`<!doctype html><body>${jsonWithId('fixture-data','window.fixture = {"fixture":true};')}${externalTag}</body>`:
-  mode===externalWithLabelledCompanion?`<!doctype html><body>${jsonWithId('fixture-data','fixture label: {"fixture":true};')}${externalTag}</body>`:
-  companionReplay?`<!doctype html>${mode===captureMaskedLayout?'<html lang="en">':''}<body>${jsonWithId('fixture-data',replayCompanion)}${externalTag}</body>`:
-  mode===externalMismatch?`<!doctype html><body>${jsonWithId('fixture-data')}${externalTag}</body>`:
-  mode===externalNested?`<!doctype html><body><div>${externalTag}</div></body>`:
-  `<!doctype html><body>${externalTag}</body>`;
+ const decisionHead=mode===parserStylesheet?`<head><link rel="stylesheet" href="${decisionStylesheetPath}" type="text/css"></head>`:'';
+ const externalDocument=domFixture?`<!doctype html>${decisionHead}<body><section><script>void 0;</script>
+  <script type="application/json" id="${domFixture.id}">${domFixture.folded}</script><script src="${decisionAsset}"></script></section></body>`:'';
  let decisionHtml=submitsSecondDecision?
   externalForm?externalDocument:
-  literalForm?inlineDecision(literalSource):dynamicForm?inlineDecision(dynamicSource):
+  dynamicForm?`<!doctype html><body><section><script>${dynamicSource}</script></section></body>`:
   `<!doctype html>${followupForm}<script>${staticSubmit}</script>`:
   loadsDecisionScript?`<!doctype html><script src="${decisionAsset}"></script>`:
   '<!doctype html><script>'+issuerDecision+'</script>';
+ if(mode===legacyEncoding)decisionHtml=decisionHtml.replace('<!doctype html>','<!doctype html><meta charset=windows-1252>');
  if(compressed)decisionHtml='\uFEFF'+decisionHtml+'<!-- Résultat -->';
  if(compressed?.decodedSize){
   decisionHtml+='<!--'+'x'.repeat(compressed.decodedSize-Buffer.byteLength(decisionHtml)-7)+'-->';
@@ -346,23 +263,18 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   [authenticate,json({state:'challenge_required',
    ares:{messageType:'ARes',transStatus:'C',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,acsURL:issuer}})],
   [issuer,{contentType:'text/html',body:issuerBody}],
-  [decision,{contentType:hasFoldedDom&&mode!==foldedDomLegacyEncoding?'text/html; charset=utf-8':'text/html',body:decisionHtml}],
+  [decision,{contentType:mode===wrongDecisionMime?'text/plain':mode===legacyEncoding?'text/html':'text/html; charset=utf-8',
+   body:mode===legacyEncoding?Buffer.from(decisionHtml,'latin1'):decisionHtml}],
   [complete,json({complete:true})],
  ]);
  if(rejectedAsset)responses.set(assetPath,{contentType:rejectedAsset.contentType,body:rejectedAsset.body});
  if(loadsScript)responses.set(assetPath,{contentType:badMime?'text/html':'application/javascript',body:revealButton});
  if(loadsDecisionScript||externalForm)responses.set(decisionAsset,{contentType:'application/javascript',body:issuerDecision});
- if(submitsSecondDecision)responses.set(observedFollowup,{contentType:'text/html',body:submitsCres?
-  '<!doctype html><script>'+issuerDecision+'</script>':'unexpected forwarded form'});
+ if(submitsCres)responses.set(observedFollowup,{contentType:mode===wrongResultMime?'text/plain':'text/html',
+  body:'<!doctype html><script>'+issuerDecision+'</script>'});
  const channel=process.env.PAYMENT_TEST_CHROME_CHANNEL==='chrome'?'chrome':'chromium';
- const invalidMarker=literalSource.indexOf('fixture&amp;session');
- const externalBytes=mode===externalInvalidUtf8?Buffer.concat([
-  Buffer.from(literalSource.slice(0,invalidMarker)),Buffer.from([0xf0,0x90,0x80]),
-  Buffer.from(literalSource.slice(invalidMarker+'fixture'.length)),
- ]):Buffer.from(domFixture?domFixture.script+(mode===foldedDomExtraScript?'void 0;':''):mode===externalUnknown?dynamicSource:literalSource);
  const networkUrl=externalForm?decisionAsset:decision;
- const networkFixture=externalForm?await serveIssuerResponse(new URL(networkUrl),
-  mode===externalGzip?gzipSync(externalBytes):externalBytes,mode===externalGzip?'gzip':'identity',mode===externalGzip,true):
+ const networkFixture=domFixture?await serveIssuerResponse(new URL(networkUrl),gzipSync(domFixture.script),'gzip',true,true):
   compressed?await serveIssuerResponse(new URL(networkUrl),compressed.compress(decisionBytes),compressed.encoding,Boolean(compressed.chunked)):undefined;
  const browser=await chromium.launch({channel,headless:true,timeout:10_000,args:[
   '--site-per-process','--disable-background-networking','--proxy-server=direct://',
@@ -371,38 +283,23 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  ]}).catch(async error=>{await networkFixture?.close();throw error;});
  const stop=new AbortController();
  let attendance:Promise<boolean>|undefined;
- let captureDirectory:string|undefined;
  try{
   const context=await browser.newContext({serviceWorkers:'block',acceptDownloads:false,ignoreHTTPSErrors:Boolean(networkFixture)});
   const page=await context.newPage(),forwarded:string[]=[],refusals:string[]=[];
-  if(mode===foldedDomMixedCaseHeadIcon){
-   const responses=await page.evaluate(urls=>Promise.all(urls.map(async url=>{
-    const response=await fetch(url);
-    return {type:response.headers.get('content-type'),bytes:[...new Uint8Array(await response.arrayBuffer())]};
-   })),[pngHref,mixedCasePngHref]);
-   const image={type:'image/png',bytes:[...Buffer.from(png,'base64')]};
-   assert.deepEqual(responses,[image,image]);
-  }
   const passiveRequests:Request[]=[],passiveFailures:Request[]=[],passiveResponses:Response[]=[];
   const passiveAborts:(string|undefined)[]=[],authorized:string[]=[];
   page.on('requestfailed',request=>{if(assetUrls.includes(request.url())||isDecisionStylesheet(request.url()))passiveFailures.push(request);});
-  let lateHeadersObserved=false,decisionBodyCaptured=false,scriptBodyCaptured=false,scriptBodyRequested=false;
-  let abortConfirmed=false,captureCalls=0;
-  let captureAfterAbort=false,capturedSource:CaptureSource|undefined;
-  const captureStages:IssuerReplayStatus[]=[];
-  let captureWriter:ReturnType<typeof prepareIssuerReplayCapture>,captureFile:string|undefined;
-  if(captureEnabled){
-   captureDirectory=realpathSync(mkdtempSync(join(tmpdir(),'billing-challenge-capture-')));
-   const id='11111111-2222-4333-8444-555555555555',run=join(captureDirectory,id);
-   mkdirSync(run,{mode:0o700});
-   writeFileSync(join(run,'owner.lock'),'synthetic\n',{mode:0o600});
-   captureFile=join(run,'issuer-replay-fixture.private.json');
-   captureWriter=prepareIssuerReplayCapture(id,id,captureDirectory);
-  }
-  const captureDone=Promise.withResolvers<void>();
+  let lateHeadersObserved=false,issuerBodyReads=0;
   page.on('response',response=>{
-   if(assetUrls.includes(response.url())||isDecisionStylesheet(response.url()))passiveResponses.push(response);
-   if(mode===lateDecisionHeaders&&response.url()===decision){
+   const url=response.url();
+   if(assetUrls.includes(url)||isDecisionStylesheet(url))passiveResponses.push(response);
+   if(url===issuer||url===decision||url===decisionAsset||url===observedFollowup||loadsScript&&url===assetPath){
+    response.body=async()=>{
+     issuerBodyReads++;
+     assert.fail('the guard must leave issuer response bodies to Chromium');
+    };
+   }
+   if(mode===unavailableDecisionHeaders&&url===decision){
     lateHeadersObserved=true;
     response.headerValue=()=>new Promise<never>(()=>{});
    }
@@ -410,81 +307,33 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   const limits={deadline:Date.now()+15_000,signal:stop.signal};
   let assetErrorRedacted=false;
   let issuerFrame:Frame|undefined,attachedIssuerFrame=false,separateIssuerTarget=false,gestures=0;
-  let claimedStylesheetDocument:Request|undefined,observedDecision:Request|undefined;
-  let stylesheetParserProved=false;
-  const guard=await guardChallengeRedirects(page,reason=>refusals.push(reason),{demo,backend},stop.signal,approvedIssuerOrigin,true);
+  let observedDecision:Request|undefined,observedIssuer:Request|undefined;
+  let replayRefusal:string|undefined;
+  const guard=await guardChallengeRedirects(page,reason=>refusals.push(reason),{demo,backend},stop.signal,approvedIssuerOrigin,false);
   const challenge=initial3dsChallenge({page,limits,demo,owner:()=>({key,secret}),winning:async()=>{},check:async()=>{},
-   expectIssuerAssetBlock:async(request,document)=>{
-    const proof=await guard.expectIssuerAssetBlock(request,document);
-    if(isDecisionStylesheet(request.url())){
-     claimedStylesheetDocument=document;
-     stylesheetParserProved=proof===true;
-    }
-    return proof;
-   },
-   authorizeIssuerScript:async(request,document,capture)=>{
-    await guard.authorizeIssuerScript(request,document,capture);
-    if(externalForm)authorized.push(request.url());
-   },
-   takeIssuerScriptBody:(request,document)=>{
-    scriptBodyRequested=true;
-    assert.equal(guard.takeIssuerScriptBody(request,request),undefined);
-    const receipt=guard.takeIssuerScriptBody(request,document);
-    assert.equal(guard.takeIssuerScriptBody(request,document),undefined);
-    if(mode===externalNoReceipt||mode===captureMissingReceipt)return;
-    return receipt?.then(body=>{
-     if(body instanceof Uint8Array){
-      assert.deepEqual(Buffer.from(body),externalBytes);
-      scriptBodyCaptured=true;
-      if(mode===externalMismatch)return Buffer.from(literalSource.replace('fixture&amp;session','other&amp;session'));
-     }
-     return body;
-    });
+   expectIssuerAssetBlock:request=>guard.expectIssuerAssetBlock(request),
+   authorizeIssuerScript:async(request,document)=>{
+    await guard.authorizeIssuerScript(request,document);
+    authorized.push(request.url());
    },
    authorizeIssuerDecision:async request=>{
     observedDecision=request;
+    if(mode===unclaimedDecision)return;
+    assert.ok(guard.authorizeIssuerDecision);
+    await guard.authorizeIssuerDecision(request);
     authorized.push(request.url());
-    if(missingDecisionReceipt)await guard.authorize(request);
-    else{
-     assert.ok(guard.authorizeIssuerDecision);
-     await guard.authorizeIssuerDecision(request);
-    }
-   },
-   takeIssuerDecisionBody:async request=>{
-    const bytes=await guard.takeIssuerDecisionBody(request);
-    if(request.url()===decision&&bytes instanceof Uint8Array){
-     if(compressed)assert.equal(Buffer.from(bytes).equals(decisionBytes),true);
-     decisionBodyCaptured=true;
-     if(mode===literalBodyMismatch)return Buffer.from(decisionHtml.replace('fixture&amp;session','server&amp;session'));
-     if(mode===foldedDomWrongStylesheetReceipt){
-      return Buffer.from(decisionHtml.replace(decisionStylesheetPath,'/other-fixture-decision.css'));
-     }
-     if(mode===foldedDomWireMismatch&&domFixture){
-      const different=syntheticIssuerDomForm(followup,{threeDSSessionData:'different',cres});
-      return Buffer.from(decisionHtml.replace(domFixture.folded,different.folded));
-     }
-    }
-    return bytes;
    },
    authorizeIssuerResult:async(request,document)=>{
-    if(namedForm){
-     assert.equal(request.frame(),issuerFrame);
-     assert.deepEqual(request.postDataBuffer(),Buffer.from(`cres=${cres}&threeDSSessionData=`));
-    }
-    if(companionReplay)assert.deepEqual(request.postDataBuffer(),replayWire);
-    if(hasFoldedDom)assert.deepEqual(request.postDataBuffer(),domWire);
-    authorized.push(request.url());
+    assert.equal(document,observedDecision);
+    assert.equal(request.frame(),issuerFrame);
+    assert.deepEqual(request.postDataBuffer(),expectedWire);
     await guard.authorizeIssuerResult(request,document);
+    authorized.push(request.url());
+    if(mode===cancelledCres){
+     assert.equal(await attendance,true);
+     stop.abort();
+    }
    },
-   issuerReplay:captureWriter?{
-    save:source=>{
-     captureCalls++;
-     captureAfterAbort=abortConfirmed;
-     capturedSource=source;
-     return captureWriter!(source);
-    },
-    report:stage=>captureStages.push(stage),
-   }:undefined,
    approvedIssuerOrigin,authorizeResponse:async request=>{
     authorized.push(request.url());
     assert.ok(!assetUrls.includes(request.url()));
@@ -516,9 +365,6 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   });
   function assertDecisionStylesheetBlocked(){
    if(!hasDecisionStylesheet)return;
-   assert.ok(observedDecision);
-   assert.equal(claimedStylesheetDocument,observedDecision);
-   assert.equal(stylesheetParserProved,!legacyStylesheet);
    assert.equal(passiveRequests.length,1);
    const [stylesheet]=passiveRequests;
    assert.equal(stylesheet?.url(),decisionStylesheet);
@@ -536,16 +382,19 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    if(!response&&!isPassiveAsset){await route.abort('blockedbyclient');return;}
    guard.registerRoute(request);
    let checkpoint='route refused';
-   let attemptedRoute:Route|undefined;
    try{
     if(challenge.owns(new URL(url))){
      if(mode==='late Playwright response'&&(url===retrieve||url===authenticate))request.existingResponse=()=>null;
      if((mode==='late issuer response'||mode===lateDecisionCres)&&url===decision)request.existingResponse=()=>null;
      const actual=Object.create(route) as Route;
-     attemptedRoute=actual;
+     if(mode===mismatchedDecision&&url===decision)request.existingResponse=()=>observedIssuer!.existingResponse();
      actual.continue=async()=>{
       assert.ok(response,'passive asset must never reach continuation');
       const reply=url===retrieve&&forwarded.includes(complete)?json({status:'succeeded'}):response;
+      if(mode===repeatedCres&&url===observedFollowup&&!replayRefusal){
+       // Retry the original paused request while its committed issuer document is still current.
+       await assert.rejects(challenge.forward(actual,new URL(url),code=>{replayRefusal=code;}),{message:'billing_BROWSER'});
+      }
       forwarded.push(url);
       if(networkFixture&&url===networkUrl){await route.continue();return;}
       await route.fulfill(reply);
@@ -559,6 +408,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
       actual.fulfill=async()=>assert.fail('passive asset must never receive a synthetic response');
      }
      if(url===issuer){
+      observedIssuer=request;
       issuerFrame=request.frame();
       attachedIssuerFrame=issuerFrame.name()===issuerName&&issuerFrame.url()==='about:blank';
      }
@@ -570,20 +420,6 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    }catch(error){
     refusals.push(checkpoint);
     if(isRejectedAsset)assetErrorRedacted=error instanceof Error&&String(error)==='Error: billing_BROWSER'&&JSON.stringify(error)==='{}';
-    if(captureEnabled&&url===followup&&attemptedRoute){
-     const capture=challenge.captureRefusedIssuerFixture(attemptedRoute,async()=>{
-      await route.abort('blockedbyclient');
-      if(mode===captureAbortFailure)throw Error('unconfirmed abort');
-      abortConfirmed=true;
-     });
-     if(capture){
-      await capture;
-      assert.equal(challenge.captureRefusedIssuerFixture(attemptedRoute,()=>assert.fail('capture was used twice')),undefined);
-      captureDone.resolve();
-      return;
-     }
-     captureDone.resolve();
-    }
     await route.abort('blockedbyclient').catch(()=>{});
    }
   });
@@ -629,60 +465,24 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    return;
   }
   await page.goto(demo+'/',{waitUntil:'domcontentloaded',timeout:7_000});
-  if(refusedFollowups.has(mode)){
-   const [request]=await Promise.all([
-    page.waitForEvent('requestfailed',{predicate:value=>value.url()===observedFollowup,timeout:8_000}),
-    challenge.attend(),
-   ]);
+  if(refusedFollowups.has(mode)||rejectedResponses.has(mode)){
+   const checkpoint=refusedFollowups.get(mode)??rejectedResponses.get(mode);
+   const refusedDecision=mode===unclaimedDecision||mode===wrongDecisionMime;
+   const blockedUrl=refusedDecision?decision:observedFollowup;
+   const failed=page.waitForEvent('requestfailed',{predicate:value=>value.url()===blockedUrl,timeout:8_000});
+   attendance=challenge.attend().then(()=>true,()=>false);
+   const [request,attended]=await Promise.all([failed,attendance]);
+   assert.equal(attended,!refusedDecision&&mode!==mismatchedDecision);
    assert.equal(request.frame(),issuerFrame);
    assert.equal(request.method(),'POST');
    assert.equal(request.isNavigationRequest(),true);
    assert.equal(request.existingResponse(),null);
-   if(hasFoldedDom)assert.deepEqual(request.postDataBuffer(),domWire);
-   // Chromium can return invalid source as exact bytes or lossy decoded text.
-   assert.equal(refusals[0],mode===externalInvalidUtf8&&scriptBodyCaptured?
-    'BROWSER_CHALLENGE_CRES_SCRIPT_UTF8':refusedFollowups.get(mode));
-   if(companionReplay||captureEnabled){
-    if(companionReplay)assert.deepEqual(request.postDataBuffer(),replayWire);
-    if(captureEnabled)await captureDone.promise;
-    const saved=mode===captureFoldedCompanion||mode===captureMaskedLayout||mode===captureUnsupportedHeadIcon;
-    assert.equal(scriptBodyRequested,saved||mode===captureMissingReceipt);
-    assert.equal(captureCalls,saved?1:0);
-    assert.equal(captureStages.at(-1),captureOutcomes.get(mode));
-    if(saved){
-     assert.ok(capturedSource);
-     assert.equal(captureAfterAbort,true);
-     assert.deepEqual(Buffer.from(capturedSource.html),decisionBytes);
-     assert.deepEqual(Buffer.from(capturedSource.script),externalBytes);
-     assert.equal(capturedSource.documentUrl,decision);
-     assert.equal(capturedSource.scriptUrl,decisionAsset);
-     assert.equal(capturedSource.frameName,issuerName);
-     assert.equal(lstatSync(captureFile!).mode&0o777,0o600);
-     const artifact=readFileSync(captureFile!,'utf8');
-     const report=JSON.parse(artifact) as {status:string;shape?:IssuerDecisionReplayShape};
-     assert.equal(report.status,captureOutcomes.get(mode));
-     assert.doesNotMatch(artifact,/reviewed-test-issuer|stripe-challenge-frame|fixture-decision\.js/);
-     if(mode===captureUnsupportedHeadIcon){
-      assert.deepEqual(Object.keys(report).sort(),['shape','status']);
-      const icon=report.shape?.layout.find(node=>node.headKind==='LINK_ICON');
-      assert.equal(icon?.iconHrefKind,'UNSUPPORTED_DATA');
-      assert.equal(icon?.iconDataRejection,'MEDIA_TYPE');
-      assert.doesNotMatch(artifact,/fixture-private-icon|image\/svg\+xml|%3Csvg|data:/i);
-     }
-    }else if(captureFile)assert.throws(()=>lstatSync(captureFile),{code:'ENOENT'});
-   }
-   if(submitsCres&&mode!==issuerCresDestination)assert.equal(decisionBodyCaptured,
-    mode!==oversizedDecision&&mode!==foldedDomWrongTransaction&&!missingDecisionReceipt);
-   if(networkFixture)assert.equal(networkFixture.requests(),1);
-   if(hasHeadIcon)assert.equal(networkFixture?.unexpectedRequests(),0);
-   if(externalForm&&mode!==externalInvalidUtf8)assert.equal(scriptBodyCaptured,
-    ![externalNoReceipt,externalNested,externalWithExecutable,externalWithInvalidCompanion,externalWithCommentCompanion,
-     externalWithAssignmentCompanion,externalWithLabelledCompanion,externalWithFoldedCompanion,
-     captureMissingDecision,captureMissingReceipt,captureAbortFailure,foldedDomWrongTransaction,
-     foldedDomWrongStylesheetReceipt,foldedDomNetworkHeadIcon,foldedDomIconAfterHead].includes(mode));
-   assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision,...(externalForm?[decisionAsset]:[])]);
-   assert.deepEqual(authorized,forwarded);
-   assertDecisionStylesheetBlocked();
+   if(submitsCres)assert.deepEqual(request.postDataBuffer(),expectedWire);
+   assert.equal(refusals[0],checkpoint);
+   assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision,...(mode===wrongResultMime?[observedFollowup]:[])]);
+   const expectedAuthorized=mode===unclaimedDecision?forwarded.slice(0,-1):mode===cancelledCres?[...forwarded,observedFollowup]:forwarded;
+   assert.deepEqual(authorized,expectedAuthorized);
+   assert.equal(issuerBodyReads,0);
    assert.equal(gestures,1);
    return;
   }
@@ -695,27 +495,25 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    passiveAborts:passiveAborts.length,passiveFailures:passiveFailures.length}));}
   assert.equal(attachedIssuerFrame,true);
   if(isolated)assert.equal(separateIssuerTarget,true);
-  if(mode===lateDecisionHeaders)assert.ok(lateHeadersObserved&&decisionBodyCaptured);
+  if(mode===unavailableDecisionHeaders)assert.equal(lateHeadersObserved,true);
+  if(mode===repeatedCres)assert.equal(replayRefusal,'BROWSER_CHALLENGE_CRES_REPLAY');
   if(networkFixture){
    assert.equal(networkFixture.requests(),1);
-   assert.equal(decisionBodyCaptured,true);
+   assert.equal(networkFixture.unexpectedRequests(),0);
   }
-  if(hasHeadIcon)assert.equal(networkFixture?.unexpectedRequests(),0);
-  if(externalForm)assert.equal(scriptBodyCaptured,true);
-  if(companionReplay)assert.equal(scriptBodyRequested,true);
-  if(mode===uncapturedDecision)assert.equal(decisionBodyCaptured,false);
-  if(mode===isolatedDecisionCres||namedForm||externalForm||compressed||mode===lateDecisionHeaders){
+  assert.equal(issuerBodyReads,0);
+  if(isolated&&submitsCres){
    assert.ok(issuerFrame);
    const target=await context.newCDPSession(issuerFrame);
    try{
     const {targetInfo}=await target.send('Target.getTargetInfo');
     assert.equal(targetInfo.type,'iframe');
-    assert.equal(targetInfo.url,followup);
+    assert.equal(targetInfo.url,observedFollowup);
    }finally{await target.detach();}
   }
   assert.deepEqual(refusals,[]);
   assert.deepEqual(forwarded,[retrieve,authenticate,issuer,...(loadsScript?[assetPath]:[]),decision,
-   ...(loadsDecisionScript||externalForm?[decisionAsset]:[]),...(submitsCres?[followup]:[]),complete,retrieve]);
+   ...(loadsDecisionScript||externalForm?[decisionAsset]:[]),...(submitsCres?[observedFollowup]:[]),complete,retrieve]);
   if(submitsCres)assert.deepEqual(authorized,forwarded);
   assertDecisionStylesheetBlocked();
   assert.equal(gestures,1);
@@ -737,9 +535,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   }
  }finally{
   stop.abort();
-  try{await browser.close();}finally{
-   try{await networkFixture?.close();}finally{if(captureDirectory)rmSync(captureDirectory,{recursive:true,force:true});}
-  }
+  try{await browser.close();}finally{await networkFixture?.close();}
   if(blocksPassiveAsset||rejectedAsset||badMime){
    assert.equal(browser.isConnected(),false);
    if(attendance)assert.equal(await attendance,false);

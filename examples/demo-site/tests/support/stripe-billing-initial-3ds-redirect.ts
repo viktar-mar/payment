@@ -4,8 +4,8 @@ import {billingBounded} from '../../../../infrastructure/stripe-billing-limits.m
 import {guardIframeTargets,type GuardSession} from './stripe-billing-chromium-iframe.ts';
 // @ts-ignore Native Node executes the pinned Chromium identity reader.
 import {chromiumRouteReader,type ChromiumRouteEvidence} from './stripe-billing-chromium-route.ts';
-// @ts-ignore Native Node executes the same issuer-origin validator.
-import {isApprovedIssuerOrigin,isIssuerScriptPath,issuerAssetSuffixMatches} from './stripe-billing-initial-3ds.ts';
+// @ts-ignore Native Node executes the same issuer URL validators.
+import {isApprovedIssuerOrigin,isIssuerScriptPath,issuerAssetSuffixMatches,isStripeChallengeReturn} from './stripe-billing-initial-3ds.ts';
 // @ts-ignore Native Node executes the same compressed decision observer.
 import {issuerDecisionBodyLimit,observeCompressedIssuerDecision,type IssuerDecisionBody} from './stripe-billing-initial-3ds-decision-body.ts';
 
@@ -38,7 +38,7 @@ function issuerScriptResponse(headers:Header[]|undefined){
  return types.length===1 && /^(?:text|application)\/javascript(?:\s*;\s*charset=utf-8)?$/i.test(types[0]!.value.trim()) &&
   !headers?.some(header=>['set-cookie','content-disposition','location'].includes(header.name.toLowerCase()));
 }
-function issuerResultResponse(headers:Header[]|undefined){
+function issuerDocumentResponse(headers:Header[]|undefined){
  const types=headers?.filter(header=>header.name.toLowerCase()==='content-type')??[];
  return types.length===1 && /^text\/html(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i.test(types[0]!.value.trim()) &&
   !headers?.some(header=>['set-cookie','content-disposition','location','refresh'].includes(header.name.toLowerCase()));
@@ -312,14 +312,16 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
     }
     if(original.allowedIssuerResult){
      reason='BROWSER_GUARD_RESPONSE_ISSUER_RESULT';
-     if(status!==200 || event.resourceType!=='Document' || !issuerResultResponse(event.responseHeaders))refuse();
+     if(status!==200 || event.resourceType!=='Document' || !issuerDocumentResponse(event.responseHeaders))refuse();
     }
     reason='BROWSER_GUARD_RESPONSE_PAIR_NETWORK_FRAME_MISSING';
     if(!original.frameId)return refuse();
     reason='BROWSER_GUARD_RESPONSE_PAIR_FRAME';
     if(original.frameId!==event.frameId)return refuse();
-    if(original.issuerDecision && status===200 && event.resourceType==='Document'&&issuerResultResponse(event.responseHeaders)){
-     const policy=issuerBodyPolicy(event.responseHeaders);
+    if(original.issuerDecision){
+     const valid=status===200 && event.resourceType==='Document' && issuerDocumentResponse(event.responseHeaders);
+     if(!captureIssuerBodies&&!valid){reason='BROWSER_GUARD_RESPONSE_ISSUER_DECISION';return refuse();}
+     const policy=captureIssuerBodies&&valid?issuerBodyPolicy(event.responseHeaders):undefined;
      if(policy?.kind==='identity'&&policy.size!==undefined){
       const size=policy.size;
       // Chromium may retire the old renderer when CRes starts navigating. Read
@@ -445,8 +447,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
   }
   if(issuerResult && issuerResultDocument!==undefined){
    const source=URL.canParse(issuerResultDocument)?new URL(issuerResultDocument):undefined;
-   if(!routeReader || !routes.has(request) || url.origin!=='https://hooks.stripe.com' || url.href!==request.url() ||
-      url.username || url.password || url.hash || url.pathname==='/' || !source ||
+   if(!routeReader || !routes.has(request) || !isStripeChallengeReturn(request.url()) || !source ||
       (source.origin!=='https://hooks.stripe.com' && source.origin!==approvedIssuerOrigin) ||
       source.href!==issuerResultDocument || source.username || source.password || source.hash ||
       issuerResult===request || issuerResult.frame()!==request.frame() || request.frame().url()!==issuerResultDocument ||
@@ -509,11 +510,16 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
         evidence.documentId!==routeReader.navigationDocument(issuerScript!) ||
         request.frame().url()!==issuerScriptDocument)return refuse();
      entry.allowedIssuerScript=true;
-     if(issuerClaim?.kind==='script'&&issuerClaim.capture&&issuerDecisionBodies.has(issuerClaim.document)&&
+     if(captureIssuerBodies&&issuerClaim?.kind==='script'&&issuerClaim.capture&&issuerDecisionBodies.has(issuerClaim.document)&&
         !scriptDocuments.has(issuerClaim.document)){
       scriptDocuments.add(issuerClaim.document);
       entry.issuerScriptProof={request,document:issuerClaim.document};
      }
+    }
+    if(issuerDecision||issuerResult){
+     reason=issuerDecision?'BROWSER_GUARD_ROUTE_IDENTITY':'BROWSER_GUARD_ROUTE_ISSUER_RESULT_DOCUMENT';
+     const destination=routeReader.navigationDocument(request);
+     if(!destination || entry.loaderId!==destination)return refuse();
     }
     if(issuerResult){
      reason='BROWSER_GUARD_ROUTE_ISSUER_RESULT_DOCUMENT';

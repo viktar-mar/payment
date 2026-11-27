@@ -166,15 +166,18 @@ for(const during of ['route policy','identity probe'])test('a replacement iframe
  assert.deepEqual(failures,['BROWSER_GUARD_RESPONSE_UNCLAIMED']);
 });
 
-type DecisionBody='exact'|'missing length'|'large'|'encoded'|'encoded alias'|'short body'|'long body'|'duplicate pause'|'retired'|'timeout'|'abort';
+type DecisionBody='transport'|'transport encoded'|'exact'|'missing length'|'large'|'encoded alias'|'short body'|'long body'|'duplicate pause'|'retired'|'timeout'|'abort';
 type IssuerResultPolicy={release?:true;claimFailure?:string;responseFailure?:string;status?:number;type?:string;header?:string;decision?:DecisionBody};
 const issuerResultPolicy:Record<string,IssuerResultPolicy>={
  'exact source and response':{release:true},
+ 'opaque Stripe result destination':{release:true},
  'same URL with a different source loader':{claimFailure:'BROWSER_GUARD_ROUTE_ISSUER_RESULT_DOCUMENT'},
+ 'different result navigation loader':{claimFailure:'BROWSER_GUARD_ROUTE_ISSUER_RESULT_DOCUMENT'},
  'retired source while claim waits':{claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
  'unregistered request':{claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
  'fixture without Chromium identity':{claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
  'foreign result origin':{claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
+ 'empty result fragment':{claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
  'redirected source document':{claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
  'replay with another Network request':{claimFailure:'BROWSER_GUARD_ROUTE_ISSUER_RESULT_DOCUMENT'},
  'redirect response':{status:302,responseFailure:'BROWSER_GUARD_RESPONSE_REDIRECT'},
@@ -188,10 +191,23 @@ const issuerResultPolicy:Record<string,IssuerResultPolicy>={
  'location response':{header:'Location',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'},
  'refresh response':{header:'Refresh',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'},
  'attachment response':{header:'Content-Disposition',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_RESULT'},
+ 'transport decision allows valid HTML without capturing the document or its parser script':{decision:'transport',release:true},
+ 'transport decision allows compressed HTML without capturing it':{decision:'transport encoded',release:true},
+ 'transport decision refuses a different navigation loader':{decision:'transport',claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
+ 'transport decision refuses a missing navigation loader':{decision:'transport',claimFailure:'BROWSER_GUARD_ROUTE_IDENTITY'},
+ 'transport decision refuses a response on another frame':{decision:'transport',responseFailure:'BROWSER_GUARD_RESPONSE_PAIR_FRAME'},
+ 'transport decision refuses a non-document response':{decision:'transport',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+ 'transport decision refuses a redirect':{decision:'transport',status:302,responseFailure:'BROWSER_GUARD_RESPONSE_REDIRECT'},
+ 'transport decision refuses non-200 HTML':{decision:'transport',status:201,responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+ 'transport decision refuses non-HTML':{decision:'transport',type:'application/json',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+ 'transport decision refuses ambiguous media type':{decision:'transport',header:'Content-Type',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+ 'transport decision refuses cookies':{decision:'transport',header:'sEt-CoOkIe',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+ 'transport decision refuses Location':{decision:'transport',header:'Location',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+ 'transport decision refuses Refresh':{decision:'transport',header:'Refresh',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
+ 'transport decision refuses Content-Disposition':{decision:'transport',header:'Content-Disposition',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
  'decision body captured exactly once':{decision:'exact',release:true},
  'decision body without announced length':{decision:'missing length',release:true},
  'decision body exceeds the byte limit':{decision:'large',release:true},
- 'encoded decision body is not captured':{decision:'encoded',release:true},
  'compressed decision rejects reuse of the original Network ID at an untracked URL':{decision:'encoded alias',release:true},
  'decision body length does not match':{decision:'short body',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
  'decision body wire size exceeds the limit':{decision:'long body',responseFailure:'BROWSER_GUARD_RESPONSE_ISSUER_DECISION'},
@@ -203,7 +219,10 @@ const issuerResultPolicy:Record<string,IssuerResultPolicy>={
 
 for(const [mode,policy] of Object.entries(issuerResultPolicy))test('issuer result claim uses one original decision and guarded response: '+mode,{timeout:4000},async()=>{
  const approved='https://reviewed-test-issuer.stripe.com',address=approved+'/decision',frameId='issuer';
- const url=policy.decision?address:(mode==='foreign result origin'?approved:'https://hooks.stripe.com')+'/result',location=origins.demo+'/';
+ const transportDecision=policy.decision?.startsWith('transport')??false;
+ const resultPath=mode==='opaque Stripe result destination'?'/payment%2fresult/%2B?token=fixture%2b&other=1':
+  mode==='empty result fragment'?'/result#':'/result';
+ const url=policy.decision?address:(mode==='foreign result origin'?approved:'https://hooks.stripe.com')+resultPath,location=origins.demo+'/';
  const browserSession={},symbol=Symbol('InterceptableRequest'),pending=new Map();
  const frameDriver=(id:string,parent:unknown,documentId:string)=>({
   _id:id,_page:undefined as unknown,_currentDocument:{documentId},_isDetached:()=>false,parentFrame:()=>parent,
@@ -233,15 +252,17 @@ for(const [mode,policy] of Object.entries(issuerResultPolicy))test('issuer resul
  const page=mode==='fixture without Chromium identity'?fixture:{...fixture,_connection:connection,driver:impl};
  if(page===fixture)registerChromiumProtocolFixture(fixture);
  const abort=new AbortController();
- const guard=await guardChallengeRedirects(page as never,code=>failures.push(code),origins,abort.signal,approved,policy.decision==='encoded alias');
- const original=(href:string,documentId:string)=>({frame:()=>issuer,method:()=>'POST',url:()=>href,_documentId:documentId});
+ const guard=await guardChallengeRedirects(page as never,code=>failures.push(code),origins,abort.signal,approved,!!policy.decision&&!transportDecision);
+ const original=(href:string,documentId?:string,method='POST')=>({frame:()=>issuer,method:()=>method,url:()=>href,_documentId:documentId});
  const shape=(href:string,driver:ReturnType<typeof original>)=>({
   _connection:connection,driver,frame:()=>frame,url:()=>href,method:()=>'POST',isNavigationRequest:()=>true,
   resourceType:()=>'document',serviceWorker:()=>null,redirectedFrom:()=>null,
  });
  const completed=shape(address,original(address,mode==='same URL with a different source loader'?'retired-loader':'decision-loader'));
  const decision={...completed,redirectedFrom:()=>mode==='redirected source document'?{}:null} as never;
- const passive={frameId,loaderId:'destination-loader',type:'Document',request:{url,method:'POST'}};
+ const loaderId=mode.includes('different navigation loader')||mode==='different result navigation loader'?'foreign-loader':
+  mode.includes('missing navigation loader')?undefined:'destination-loader';
+ const passive={frameId,loaderId,type:'Document',request:{url,method:'POST'}};
  const connect=(networkId:string,register=true)=>{
   const driver=original(url,'destination-loader');
   const intercepted={request:driver,session:browserSession,_requestId:networkId,_interceptionId:'fetch-'+networkId,_originalRequestRoute:{}};
@@ -253,15 +274,60 @@ for(const [mode,policy] of Object.entries(issuerResultPolicy))test('issuer resul
  };
  const record=(networkId:string)=>events.get('Network.requestWillBeSent')!({...passive,requestId:networkId});
  const respond=(networkId:string,requestId='response-'+networkId)=>events.get('Fetch.requestPaused')!({...passive,networkId,requestId,
-  frameId:mode==='wrong response frame'?'foreign':frameId,
-  resourceType:mode==='wrong response resource'?'XHR':'Document',responseStatusCode:policy.status??200,
+  frameId:mode==='wrong response frame'||mode.includes('response on another frame')?'foreign':frameId,
+  resourceType:mode==='wrong response resource'||mode.includes('non-document response')?'XHR':'Document',responseStatusCode:policy.status??200,
   responseHeaders:[{name:'content-type',value:policy.type??'text/html; charset=UTF-8'},
    ...(policy.decision&&policy.decision!=='missing length'?[{name:'Content-Length',value:String(policy.decision==='large'?65537:body.length)}]:[]),
-   ...(policy.decision?.startsWith('encoded')?[{name:'Content-Encoding',value:'gzip'}]:[]),
+   ...(policy.decision==='encoded alias'||policy.decision==='transport encoded'?[{name:'Content-Encoding',value:'gzip'}]:[]),
    ...(policy.header?[{name:policy.header,value:'fixture'}]:[])],
  });
  const request=connect('result',mode!=='unregistered request');
  if(mode!=='retired source while claim waits')record('result');
+ if(transportDecision){
+  assert.ok(guard.authorizeIssuerDecision);
+  const authorization=guard.authorizeIssuerDecision(request);
+  if(policy.claimFailure){
+   await assert.rejects(authorization,/^Error: billing_BROWSER$/);
+   assert.deepEqual(failures,[policy.claimFailure]);
+   assert.equal(commands.includes('Fetch.continueResponse'),false);
+   return;
+  }
+  await authorization;
+  wireBody.resolve({body,base64Encoded:false});
+  await respond('result');
+  assert.equal(commands.at(-1),policy.release?'Fetch.continueResponse':'Fetch.failRequest');
+  const load=(networkId:string,loaderId:string,resourceType:string,href:string)=>{
+   events.get('Network.responseReceived')?.({requestId:networkId,frameId,loaderId,type:resourceType,response:{url:href,status:200}});
+   events.get('Network.dataReceived')?.({requestId:networkId,dataLength:body.length});
+   events.get('Network.loadingFinished')?.({requestId:networkId,encodedDataLength:body.length});
+  };
+  if(policy.release)load('result','destination-loader','Document',address);
+  if(policy.release&&policy.decision==='transport'){
+   issuer._currentDocument={documentId:'destination-loader'};
+   const scriptUrl=approved+'/decision.js',scriptDriver=original(scriptUrl,undefined,'GET');
+   const intercepted={request:scriptDriver,session:browserSession,_requestId:'script',_interceptionId:'fetch-script',_originalRequestRoute:{}};
+   Object.defineProperty(scriptDriver,symbol,{value:intercepted});
+   pending.set('script',intercepted);
+   const script={...shape(scriptUrl,scriptDriver),method:()=>'GET',isNavigationRequest:()=>false,resourceType:()=>'script'} as never;
+   guard.registerRoute(script);
+   const scriptEvent={frameId,loaderId:'destination-loader',type:'Script',documentURL:address,
+    initiator:{type:'parser',url:address},request:{url:scriptUrl,method:'GET'}};
+   events.get('Network.requestWillBeSent')!({...scriptEvent,requestId:'script'});
+   await guard.authorizeIssuerScript(script,request,true);
+   await events.get('Fetch.requestPaused')!({...scriptEvent,networkId:'script',requestId:'response-script',
+    resourceType:'Script',responseStatusCode:200,responseHeaders:[{name:'Content-Type',value:'application/javascript'},
+     {name:'Content-Length',value:String(body.length)}]});
+   assert.equal(commands.at(-1),'Fetch.continueResponse');
+   load('script','destination-loader','Script',scriptUrl);
+   assert.equal(guard.takeIssuerScriptBody(script,request),undefined);
+  }
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(commands.includes('Fetch.getResponseBody'),false);
+  assert.equal(commands.includes('Network.getResponseBody'),false);
+  assert.equal(guard.takeIssuerDecisionBody(request),undefined);
+  assert.deepEqual(failures,policy.responseFailure?[policy.responseFailure]:[]);
+  return;
+ }
  if(policy.decision){
   assert.ok(guard.authorizeIssuerDecision);
   await guard.authorizeIssuerDecision(request);
@@ -274,7 +340,7 @@ for(const [mode,policy] of Object.entries(issuerResultPolicy))test('issuer resul
    assert.equal(commands.includes('Network.getResponseBody'),false);
    return;
   }
-  const capture=!['missing length','large','encoded'].includes(policy.decision);
+  const capture=!['missing length','large'].includes(policy.decision);
   if(capture){
    await reading.promise;
    assert.equal(commands.includes('Fetch.continueResponse'),false);

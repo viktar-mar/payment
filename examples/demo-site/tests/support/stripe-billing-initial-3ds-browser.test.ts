@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type {Frame,Page,Request,Route} from '@playwright/test';
 // @ts-ignore Offline tests execute source.
-import {challengeSource,issuerBinding,isApprovedIssuerOrigin,matchingChallengeRequest,challengeApiRequest,initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
+import {challengeSource,issuerBinding,isApprovedIssuerOrigin,matchingChallengeRequest,matchingChallengeResult,isStripeChallengeReturn,challengeApiRequest,initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 // @ts-ignore Native Node executes the same terminal decoder as the launcher.
 import {challengeTerminalLine} from './stripe-billing-initial-3ds-terminal.ts';
 
@@ -110,6 +110,34 @@ test('issuer navigation is pinned to both transaction IDs and exact ACS URL in t
  for(const changed of [{acsURL:'https://hooks.stripe.com.example.test/x'},{acsURL:'https://user@hooks.stripe.com/x'},{transStatus:'Y'},{messageType:'CRes'}])
   assert.throws(()=>issuerBinding({...result,ares:{...result.ares,...changed}}));
  assert.throws(()=>issuerBinding({...result,state:'succeeded'}));
+});
+test('the original CRes wire form is canonical and bound to both ARes transaction IDs',()=>{
+ const bound=issuerBinding(result);
+ const message={messageType:'CRes',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,transStatus:'Y'};
+ const encode=(text:string)=>Buffer.from(text).toString('base64url');
+ const body=(encoded=encode(JSON.stringify(message)))=>new URLSearchParams({cres:encoded,threeDSSessionData:'fixture&value'}).toString();
+ const matches=(data:string)=>matchingChallengeResult(bound,Buffer.from(data));
+ assert.equal(matches(body()),true);
+ assert.equal(matches(body(encode(JSON.stringify({...message,challengeCompletionInd:'Y',transStatus:'N'})))),true);
+ assert.equal(matches(body().replace('fixture%26value','fixture%0D%0Avalue')),true);
+ for(const [field,value] of [['messageType','CReq'],['messageVersion','2.3.1'],['threeDSServerTransID',acs],['acsTransID',server],
+  ['transStatus','C'],['transStatus','D'],['challengeCompletionInd','N']])
+  assert.equal(matches(body(encode(JSON.stringify({...message,[field!]:value})))),false);
+ const duplicate=JSON.stringify(message).replace('"transStatus"', '"transStatus":"N","transStatus"');
+ for(const wrong of [body(encode(duplicate)),body()+'&cres='+encode(JSON.stringify(message)),body()+'&extra=x',
+  body()+'&threeDSSessionData=',body().replace('fixture%26value','%FF'),body().replace('cres=','cr%65s='),body()+'&',
+  body().replace('fixture%26value','%00'),body().replace('fixture%26value','%0A'),body()+'&'+'a'.repeat(32768)]){
+  assert.equal(matches(wrong),false);
+ }
+});
+test('the result destination stays inside the exact Stripe Hooks origin',()=>{
+ assert.equal(isStripeChallengeReturn('https://hooks.stripe.com/fixture-return?fixture=1'),true);
+ for(const wrong of ['https://hooks.stripe.com/','https://hooks.stripe.com/fixture#','https://api.stripe.com/fixture',
+  'https://sub.hooks.stripe.com/fixture','https://hooks.stripe.com.example.test/fixture',
+  'https://hooks.stripe.com:443/fixture','https://user@hooks.stripe.com/fixture','http://hooks.stripe.com/fixture',
+  'https://hooks.stripe.com/../fixture','https://hooks.stripe.com/'+'a'.repeat(4100)]){
+  assert.equal(isStripeChallengeReturn(wrong),false);
+ }
 });
 test('the SDK can retrieve only the original intent and authenticate only its verified source',()=>{
  const pi='https://api.stripe.com/v1/payment_intents/pi_test123?client_secret='+secret+'&key='+key;

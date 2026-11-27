@@ -3,6 +3,8 @@ import {defaultTreeAdapter,parse,parseFragment,type DefaultTreeAdapterTypes} fro
 import {proveIssuerDomForm} from './stripe-billing-initial-3ds-dom-form.ts';
 // @ts-ignore Native Node executes the same local icon proof as Playwright.
 import {isLocalIssuerHeadIcon} from './stripe-billing-initial-3ds-head-icon.ts';
+// @ts-ignore Native Node executes the historical form proof in isolation.
+import {isIssuerScriptPath} from './stripe-billing-initial-3ds.ts';
 
 const htmlNamespace='http://www.w3.org/1999/xhtml';
 const controls=new Set(['button','datalist','fieldset','input','object','output','select','textarea']);
@@ -49,10 +51,6 @@ const hasHandler=(element:Element)=>element.attrs.some(attr=>attr.name.startsWit
 const supportedScriptAttributes=(element:Element)=>element.attrs.every(attr=>attr.name==='type'||attr.name==='src');
 const createsForm=(source:string)=>/\bcreateElement\s*\(\s*['"]form['"]/.test(source);
 const normalizedScriptType=(value:string)=>value.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g,'').toLowerCase();
-
-export function isIssuerScriptPath(pathname:string):boolean{
- return /^\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.js$/.test(pathname);
-}
 
 /** Derive the wire request or locate its sole external script in the original issuer HTML. */
 export function issuerResultForm(html:string,frameName?:string,report?:Reporter):FormProof|undefined;

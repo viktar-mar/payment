@@ -18,6 +18,9 @@ test('ordinary discovery excludes the challenge and its synthetic checks',async(
  assert.match(isolated,/workers:1,retries:0/);assert.match(isolated,/trace:'off',video:'off',screenshot:'off'/);
  assert.match(entry,/PAYMENT_STRIPE_BILLING_CASE!=='initial_3ds'/);
  assert.ok(entry.indexOf('owner=await createOwnedBillingInitial3ds')<entry.indexOf('async({browser},info)'));
+ assert.doesNotMatch(entry,/prepareIssuerReplayCapture|PAYMENT_STRIPE_BILLING_3DS_REPLAY_FIXTURE_RUN_ID/);
+ const browser=await read('./stripe-billing-acceptance.ts');
+ assert.doesNotMatch(browser,/takeIssuer(?:Decision|Script)Body|captureRefusedIssuerFixture/);
 });
 test('3DS keeps the original refusal when it reports the replay stage',()=>{
  const checkpoint='BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON';

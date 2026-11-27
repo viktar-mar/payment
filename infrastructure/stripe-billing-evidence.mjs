@@ -13,7 +13,7 @@ function originFor(baseline,selectedCase) {
 export const billingCancellationOrigin=baseline=>originFor(baseline,'initial_cancel_withdraw');
 export const billingPortalOrigin=baseline=>originFor(baseline,'initial_portal');
 
-function captureInitialOrigin(selectedCase,result,row,inspection) {
+function initialJournalCallbacks(row) {
  const [cashEventId]=row.cash_journal_ids??[],[paidEventId]=row.paid_journal_ids??[];
  const identity={paymentId:row.payment_id,billingRecordId:row.billing_record_id,cashEventId,paidEventId};
  need(Object.values(identity).every(billingUuid)&&new Set(Object.values(identity)).size===4
@@ -22,6 +22,10 @@ function captureInitialOrigin(selectedCase,result,row,inspection) {
  need(cash?.schema_version===3&&cash.payment_id===identity.paymentId&&cash.billing_record_id===identity.billingRecordId
    &&paid?.schema_version===4&&paid.event_type==='subscription.updated'&&paid.state==='ACTIVE'&&paid.access_allowed===true
    &&paid.billing_record_id===identity.billingRecordId&&paid.payment_id===null);
+ return {identity,paid};
+}
+function captureInitialOrigin(selectedCase,result,row,inspection) {
+ const {identity,paid}=initialJournalCallbacks(row);
  const revision=Number(row.subscription_revision);
  need(row.initial_unscheduled===true&&/^[0-9]+$/.test(String(row.subscription_revision))
    &&Number.isSafeInteger(revision)&&Number.isSafeInteger(paid.revision)&&paid.revision<=revision);
@@ -105,7 +109,8 @@ async function readInitialEvidence({configuration,bootstrap,fixture},limits,depe
   }finally{if(sql)await billingBounded({deadline:Date.now()+5000},()=>sql.end({timeout:0}),5000);}
  },limits)===true);billingCheck(limits);need(result);
  const inspection=await fixture.inspectCallbacks(limits);billingCheck(limits);const baseline=validateBillingEvidence(scope,result,inspection);
- if(['initial_cancel_withdraw','initial_portal'].includes(configuration.selectedCase))
+ if(challengeRequired)initialJournalCallbacks(result);
+ else if(['initial_cancel_withdraw','initial_portal'].includes(configuration.selectedCase))
   captureInitialOrigin(configuration.selectedCase,baseline,result,inspection);
  return baseline;
 }
