@@ -12,6 +12,8 @@ const inline=(code:string,attributes='')=>`<!doctype html><body><script${attribu
 const write=(markup:string)=>`document.write(${JSON.stringify(markup)});${submit}`;
 const decisionUrl='https://reviewed-test-issuer.stripe.com/fixture/decision';
 const external=(src:string,attributes='',contents='')=>inline(contents,` src="${src}"${attributes}`);
+const externalTag='<script src="/fixture/result.js"></script>';
+const jsonBlock=(contents:string)=>'<script type="application/json">'+contents+'</script>';
 
 test('derive the sole canonical external script URL from the paired HTML',()=>{
  for(const html of [
@@ -32,6 +34,18 @@ test('derive the parser location of a sole classic external script in the head',
  ),{scriptUrl:'https://reviewed-test-issuer.stripe.com/result.js',placement:'head'});
 });
 
+for(const placement of ['head','body'] as const)test('derive the '+placement+' script alongside inert JSON data blocks',()=>{
+ const before=jsonBlock('{"label":"fixture"}');
+ const after=jsonBlock('["document.forms[0].submit()"]');
+ const html=`<!doctype html><html><${placement}>${before}${externalTag}${after}</${placement}></html>`;
+ const reported:string[]=[];
+ assert.deepEqual(issuerResultForm(html,undefined,code=>reported.push(code),decisionUrl),{
+  scriptUrl:'https://reviewed-test-issuer.stripe.com/fixture/result.js',
+  placement,
+ });
+ assert.deepEqual(reported,[]);
+});
+
 for(const [reason,documents] of Object.entries({
  EXTERNAL_URL:[
   external(''),external('/result.js?variant=1'),external('/result.js#fragment'),external('/%72esult.js'),
@@ -46,7 +60,31 @@ for(const [reason,documents] of Object.entries({
  ],
  EXTERNAL_TYPE:[external('/result.js',' type="module"'),external('/result.js',' type="application/json"')],
  EXTERNAL_TEXT:[external('/result.js','','ignored code')],
- EXTERNAL_COUNT:[external('/result.js')+external('/different.js'),external('/result.js')+inline('otherCode()')],
+ EXTERNAL_COUNT_MULTIPLE_SOURCES:[
+  external('/result.js')+external('/different.js'),
+  external('/result.js')+external('/result.js',' type="application/json"'),
+  external('/result.js')+external('/result.js'),
+ ],
+ EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION:[
+  externalTag+'<script>otherCode()</script>',
+  externalTag+'<script type="module">otherCode()</script>',
+  externalTag+'<script type="text/javascript"></script>',
+  externalTag+jsonBlock('{}')+'<script>otherCode()</script>',
+ ],
+ EXTERNAL_COUNT_UNSUPPORTED_COMPANION:[
+  externalTag+'<script type="text/ecmascript">otherCode()</script>',
+  externalTag+'<script language="fixture">otherCode()</script>',
+  externalTag+jsonBlock('{"fixture": invalid}'),
+  externalTag+'<script type="application/json" id="fixture">{}</script>',
+  externalTag+'<script type="application/json" onload="otherCode()">{}</script>',
+  externalTag+'<script type="application/json ">{}</script>',
+  externalTag+'<script type="APPLICATION/JSON">{}</script>',
+  externalTag+'<script type="application/ld+json">{}</script>',
+  externalTag+'<script type="importmap">{}</script>',
+  externalTag+'<script type="speculationrules">{}</script>',
+  externalTag+'<script type="application/json">{}',
+  externalTag+'<div>'+jsonBlock('{}')+'</div>',
+ ],
  EXTERNAL_PARENT:['<!doctype html><body><div><script src="/result.js"></script></div></body>'],
  EXTERNAL_TAG:['<!doctype html><body><script src="/result.js">'],
  EXTERNAL_LAYOUT_TAG:[external('/result.js').replace('</body>','<template></template></body>')],

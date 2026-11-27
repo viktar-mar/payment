@@ -9,11 +9,12 @@ type LayoutRejection='EXTERNAL_LAYOUT_TAG'|'EXTERNAL_LAYOUT_ATTRIBUTES'|'EXTERNA
 type FormRejection='DUPLICATE_ATTRIBUTE'|'BASE'|'OWNER'|'MISSING'|'MULTIPLE'|'METHOD'|'TARGET'|'ENCODING'|
  'ACTION'|'CONTROL'|'FIELD'|'DUPLICATE_FIELD'|'REQUIRED_CRES'|'SIZE'|'LITERAL_MARKUP'|
  'MISSING_INLINE'|'MISSING_INLINE_DOM'|'MISSING_INLINE_MARKUP'|'MISSING_EXTERNAL'|'MISSING_TEMPLATE'|'MISSING_HANDLER'|'MISSING_MIXED'|
- 'EXTERNAL_COUNT'|'EXTERNAL_PARENT'|'EXTERNAL_TAG'|'EXTERNAL_TYPE'|'EXTERNAL_ATTRIBUTES'|'EXTERNAL_TEXT'|'EXTERNAL_URL'|LayoutRejection;
+ 'EXTERNAL_COUNT_MULTIPLE_SOURCES'|'EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION'|'EXTERNAL_COUNT_UNSUPPORTED_COMPANION'|
+ 'EXTERNAL_PARENT'|'EXTERNAL_TAG'|'EXTERNAL_TYPE'|'EXTERNAL_ATTRIBUTES'|'EXTERNAL_TEXT'|'EXTERNAL_URL'|LayoutRejection;
 type FormProof={action:string;body:string};
 type ScriptPlacement='head'|'body';
 type ExternalScript={scriptUrl:string;placement:ScriptPlacement};
-type ScriptElement={node:Element;text:string;src:string|undefined;classic:boolean};
+type ScriptElement={node:Element;text:string;src:string|undefined;classic:boolean;recognizedJsType:boolean};
 type LiteralInsertion={markup:string;method:'write'|'insertAdjacentHTML'};
 type Reporter=(code:string)=>void;
 type Element=DefaultTreeAdapterTypes.Element;
@@ -147,6 +148,14 @@ function documentElementRejection(element:Element):LayoutRejection|undefined{
  }else if(element.attrs.length!==0)return 'EXTERNAL_LAYOUT_ATTRIBUTES';
 }
 
+function inertJsonDataBlock({node,text}:ScriptElement):boolean{
+ const placement=node.parentNode?.nodeName,location=node.sourceCodeLocation;
+ if((placement!=='head'&&placement!=='body')||!location?.startTag||!location.endTag||
+    node.attrs.length!==1||attribute(node,'type')!=='application/json')return false;
+ try{JSON.parse(text);return true;}
+ catch{return false;}
+}
+
 function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:string|undefined,
  documentUrl:string|undefined):FormProof|ExternalScript|FormRejection{
  const shapes=new Set<FormRejection>();
@@ -159,12 +168,15 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
    if(hasHandler(node))shapes.add('MISSING_HANDLER');
    if(node.namespaceURI===htmlNamespace&&node.tagName==='template')shapes.add('MISSING_TEMPLATE');
    if(node.namespaceURI===htmlNamespace&&node.tagName==='script'){
-    const type=(attribute(node,'type')??'').replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g,'').toLowerCase();
+    const declaredType=attribute(node,'type');
+    const type=(declaredType??'').replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g,'').toLowerCase();
     const text=node.childNodes.filter(defaultTreeAdapter.isTextNode).map(child=>child.value).join('');
     const src=attribute(node,'src');
     const classic=classicScriptTypes.has(type);
-    scripts.push({node,text,src,classic});
-    if(classic||type==='module'){
+    const executable=classic||type==='module';
+    const recognizedJsType=executable&&(declaredType!==undefined||attribute(node,'language')===undefined);
+    scripts.push({node,text,src,classic,recognizedJsType});
+    if(executable){
      if(src!==undefined)shapes.add('MISSING_EXTERNAL');
      else if(createsForm(text))shapes.add('MISSING_INLINE_DOM');
      else if(/\b(?:document\s*\.\s*write(?:ln)?|insertAdjacentHTML|innerHTML)\b/.test(text))shapes.add('MISSING_INLINE_MARKUP');
@@ -177,7 +189,10 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
  }
  const external=scripts.find(script=>script.src!==undefined);
  if(external?.src!==undefined&&documentUrl!==undefined){
-  if(scripts.length!==1)return 'EXTERNAL_COUNT';
+  const companions=scripts.filter(script=>script!==external);
+  if(companions.some(script=>script.src!==undefined))return 'EXTERNAL_COUNT_MULTIPLE_SOURCES';
+  if(companions.some(script=>script.recognizedJsType))return 'EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION';
+  if(companions.some(script=>!inertJsonDataBlock(script)))return 'EXTERNAL_COUNT_UNSUPPORTED_COMPANION';
   const placement=external.node.parentNode?.nodeName;
   if(placement!=='head'&&placement!=='body')return 'EXTERNAL_PARENT';
   if(!external.node.sourceCodeLocation?.endTag)return 'EXTERNAL_TAG';
