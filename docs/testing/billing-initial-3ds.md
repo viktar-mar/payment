@@ -1,6 +1,6 @@
 # First subscription payment with a 3DS challenge
 
-This isolated case creates one ordinary EUR 20 Sandbox subscription. The first Pay uses Stripe's web test card ending in 3220, which requires successful 3DS2 authentication. After the server confirms the original PaymentIntent, only the browser that received that confirmation can continue the challenge. Stripe does not document a fixed issuer resource set for this test card. [Stripe test cards](https://docs.stripe.com/payments/3d-secure/authentication-flow#test-the-3ds-flow)
+This isolated case creates one ordinary EUR 20 Sandbox subscription. The first Pay uses Stripe's web test card ending in 3220, which requires successful 3DS2 authentication. The browser that received the original confirmation continues it through Stripe.js. [Stripe test cards](https://docs.stripe.com/testing#regulatory-cards)
 
 ## Running the case
 
@@ -12,35 +12,27 @@ pnpm exec playwright test --config=playwright.stripe-billing-initial-3ds.config.
 
 For local runs, `PAYMENT_STRIPE_BILLING_3DS_CLI_PROFILE_RUN_ID` selects an earlier owned profile. The runner copies it into the fresh private directory and verifies that it is bound to the single approved test account. `PAYMENT_STRIPE_BILLING_3DS_SUBNET` optionally selects an unused, aligned `10.0.0.0/8` subnet with a `/28` prefix. Check for overlap with Docker networks and host routes before launch. The runner verifies the created bridge against the selected subnet before starting services.
 
-There is one subscription creation, one confirmation and one SDK challenge. When the issuer's test page is ready, open this run's private `operator.html` in the operator's Chrome profile and use the challenge button once. By default the file is under `examples/demo-site/test-results/<run-uuid>/`. A custom Playwright output directory changes the parent directory. An unexpected issuer address, mismatched transaction, lost acknowledgement or expired browser authority ends the attempt. An unfinished operation cannot be submitted again.
-
-If a refused Stripe.com origin is the first failure after the challenge dispatch receipt, the runner attempts one write to `test-results/stripe-sandbox/<run-uuid>/refused-provider-origin.private.json` from the repository root. The owner-only file contains the canonical origin, run ID, source and fixed checkpoint. Keep the file in the private run directory. The terminal marker reports only the checkpoint, and the blocked request remains blocked if the file cannot be written.
-
-The private `issuerRelation` field records whether the refused form navigation matches the URL and 3DS transaction fields of the original Stripe authentication response. The runner aborts the route before reading that response and stops the read after 750 ms. It reads only an uncompressed response with a measured body size up to 64 KiB. A match is diagnostic evidence only. The request path, query, form data and response body are discarded.
-
-The dedicated entry can resolve the reviewed issuer origin from the owner-only report and checkout-local policy key. The complete report must match its reviewed HMAC, original run and source, and verified transaction-and-frame category. The rule applies to the original POST into the direct Stripe.js challenge iframe and the one trusted form submission on that same issuer origin. Both requests still require their original frame and paired nonredirect responses. If the report or policy key is unavailable, the checkout uses its existing issuer policy.
+There is one subscription creation, one confirmation and one SDK challenge. When the issuer's test page is ready, open this run's private `operator.html` in the operator's Chrome profile and use the challenge button once. By default the file is under `examples/demo-site/test-results/<run-uuid>/`. A custom Playwright output directory changes the parent directory. A lost acknowledgement or expired browser authority ends the attempt. An unfinished operation cannot be submitted again.
 
 ## Browser isolation and the Stripe contract
 
-The application uses Stripe.js `handleNextAction` after the server's original confirmation returns `requires_action`. The acceptance browser runs in a fresh context with service workers and downloads disabled. Its Stripe API requests are scoped to that original test PaymentIntent and the challenge source returned for it. The runner keeps the one-time operator gesture tied to the original frame and checks the first issuer form's action and body through the browser before the click. [Stripe subscription integration](https://docs.stripe.com/payments/finalize-payments-on-the-server?platform=web&type=subscription#handle-any-next-actions-client-side)
+The application uses Stripe.js `handleNextAction` after the original server confirmation returns `requires_action`. The runner persists the one-use challenge dispatch before allowing Stripe.js to proceed. It then uses a unique enabled **Complete** control in an admitted provider document. The runner checks that the same control and checkout still own the gesture immediately before clicking. Stripe.js handles the challenge protocol. [Stripe subscription integration](https://docs.stripe.com/payments/finalize-payments-on-the-server?platform=web&type=subscription#handle-any-next-actions-client-side)
 
-The Chromium guard pairs each admitted request with its original target, frame, and response. It allows the authentication navigation to the exact issuer URL returned by the original ARes and checks both 3DS transaction IDs. It allows one issuer submission from the verified frame after the trusted Complete click. Redirects, unrelated origins, replacement frames, replayed requests, and provider requests carrying cookies or foreign credentials are rejected.
+The browser uses a fresh context with service workers, shared workers and downloads disabled. The original checkout owns local application requests. Popups, WebSockets, unexpected top-level navigations and foreign network destinations end the attempt. For challenge traffic, the runner admits approved HTTPS provider origins, rejects ambient credentials and keeps Stripe API access scoped to the original test PaymentIntent and authentication endpoints. The checkout-local reviewed issuer origin remains optional and is verified using the existing HMAC policy. An independent Chromium response guard blocks HTTP redirects before the next hop. [Stripe.js origin policy](https://docs.stripe.com/security/guide#content-security-policy)
 
-The approved issuer frame has a separate resource budget for each of the two documents. The guard blocks at most six distinct same-origin raster, font or stylesheet GETs per document and requires the browser's corresponding failure events. Same-origin JavaScript requires one of six distinct canonical paths, a parser initiator on the verified document loader, and its paired HTTP 200 JavaScript response. Other resource types and script-initiated loads fail the check.
-
-If Stripe.js receives CRes through a browser form navigation, the guard allows one original form POST from the committed issuer decision document. The destination must be a canonical non-root HTTPS URL on the exact `hooks.stripe.com` origin. Its path and query belong to Stripe. The guard checks that exact request URL in the Chromium receipt. It also checks the cookie-free POST, form encoding and size, a single canonical Base64URL CRes, both original transaction IDs, the protocol version and terminal status `Y` or `N`. An explicit completion indicator must be `Y`. An optional session value can appear once. The response must be the paired HTTP 200 HTML response. A paused result prevents SDK completion and the final intent read until the guard confirms that response.
-
-Chromium renders the Stripe and issuer pages. The acceptance runner does not read their HTML or JavaScript bodies or derive a form from their markup. A valid CRes only correlates the browser traffic to the initial challenge. The application and independent server proof establish settlement. [EMVCo 3DS challenge flow](https://www.emvco.com/dynamic/emv-3-d-secure-whitepaper-v2/challenge-flow/technical-features/) · [Stripe 3DS flow](https://docs.stripe.com/payments/3d-secure/authentication-flow#control-the-3ds-flow)
+The runner does not require an issuer request order, a form navigation, any ARes or CRes fields, or an iframe request and response match. It waits for the original subscription's paid state in the application before recording the browser acknowledgement. The independent server proof below determines whether the payment passed.
 
 ## Offline regression
 
-Run from the repository root with a disposable headless Chrome profile. The fixtures use synthetic transactions and block external DNS. They exercise the live request and response guard across Chromium targets, including dynamically generated issuer markup, foreign destinations, duplicate or malformed result fields, transaction mismatches, and invalid response pairing.
+Run from the repository root with a disposable headless Chrome profile. The contract fixtures use synthetic transactions and disable external network access. They exercise a challenge with auxiliary issuer traffic and no form-navigation receipt, provider isolation, the single-use gesture, and blocked redirects from nested Chromium targets.
 
 ```sh
-PAYMENT_TEST_CHROME_CHANNEL=chrome node --test --test-concurrency=1 examples/demo-site/tests/support/stripe-billing-initial-3ds-{challenge,redirect}-chrome.test.ts
+PAYMENT_TEST_CHROME_CHANNEL=chrome node --test --test-concurrency=1 \
+  examples/demo-site/tests/support/stripe-billing-contract-{api,challenge,redirects}.test.ts \
+  examples/demo-site/tests/support/stripe-billing-acceptance.test.ts
 ```
 
-Earlier issuer replay fixtures remain available for offline regression. The native acceptance entry no longer reads or captures issuer replay pairs.
+Earlier issuer replay fixtures remain available for offline regression.
 
 ## What establishes a pass
 

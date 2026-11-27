@@ -14,8 +14,10 @@ test('ordinary discovery excludes the challenge and its synthetic checks',async(
  const [ordinary,isolated,entry]=await Promise.all([read('../../playwright.config.ts'),read('../../playwright.stripe-billing-initial-3ds.config.ts'),read('../stripe-billing-initial-3ds.spec.ts')]);
  assert.match(ordinary,/testIgnore:[^\]]*"stripe-billing-initial-3ds\.spec\.ts"/);
  assert.match(ordinary,/testIgnore:[^\]]*"\*\*\/support\/stripe-billing-initial-3ds\*\.test\.ts"/);
+ assert.match(ordinary,/testIgnore:[^\]]*"\*\*\/support\/stripe-billing-contract-\*\.test\.ts"/);
  assert.match(isolated,/testMatch:'stripe-billing-initial-3ds\.spec\.ts'/);
  assert.match(isolated,/workers:1,retries:0/);assert.match(isolated,/trace:'off',video:'off',screenshot:'off'/);
+ assert.match(isolated,/launchOptions:\{args:\[\.\.\.billingContractBrowserArgs\]\}/);
  assert.match(entry,/PAYMENT_STRIPE_BILLING_CASE!=='initial_3ds'/);
  assert.ok(entry.indexOf('owner=await createOwnedBillingInitial3ds')<entry.indexOf('async({browser},info)'));
  assert.doesNotMatch(entry,/prepareIssuerReplayCapture|PAYMENT_STRIPE_BILLING_3DS_REPLAY_FIXTURE_RUN_ID/);
