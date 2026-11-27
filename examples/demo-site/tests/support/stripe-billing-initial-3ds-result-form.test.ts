@@ -180,7 +180,32 @@ for(const [reason,contents] of Object.entries({
  FORMAT_OBJECT:['{"private-fixture":invalid}'],
  FORMAT_ARRAY:['[\f]','[\v]','[privateFixture]'],
  FORMAT_SPACE:['\u00a0%7B%7D','\t\v{}','\u0001{}'],
- FORMAT_TEXT:['Ing/Ih==','Ing_Ih==','Is+_Ig==','Ing_Ig===','Ing/Ig','private fixture','_private fixture','+private fixture'],
+ TEXT_DATA_URI:['data:application/json,%7B%7D','\tDaTa:text/plain,private-fixture\n','data:,'],
+ TEXT_URI:['https://example.invalid/private-fixture','scheme+name://example.invalid/fixture'],
+ TEXT_FORM:['fixture=private-value&extra=','a=YQ==&b=private+fixture','\tfixture=%7B%7D&other=1\n'],
+ TEXT_ASSIGN_JSON:[
+  ' state = {"fixture":";"} ;\t','const privateFixture = [true,false,null]',
+  'window . privateFixture = "value"','state="value&other=private"',
+ ],
+ TEXT_ASSIGNMENT:[
+  'fixture=','fixture=private-value','state={fixture:1}','state={};extra()','state={};;',
+  'state=/* fixture */{}','state=\u00a0{}','state= {} \u00a0;','a=1&b=2 trailing',
+ ],
+ TEXT_CALL_JSON:[' fixture({"s":")"}) ;\n','window . privateFixture(42)','fixture(true)'],
+ TEXT_CALL:[
+  'fixture(','fixture()','fixture({}) trailing','fixture({});extra()','fixture({}, {})','fixture({k:1})',
+  'fixture({});;','fixture({})\u00a0','fixture({})\u2028;',
+ ],
+ TEXT_JS_LITERAL:['undefined','NaN','False'],
+ TEXT_NUMERIC:['+1','+.5','+12.3e-4'],
+ TEXT_BASE_SHAPE:['Ing/Ih==','Ing_Ih==','Is+_Ig==','Ing_Ig===','Ing/Ig'],
+ TEXT_IDENTIFIER:['hello','privateFixture','window.privateFixture'],
+ TEXT_OTHER:[
+  'private fixture','_private fixture','+private fixture','prefix https://example.invalid/fixture',
+  'prefix data:application/json,%7B%7D','data:','data:private-fixture','data:application/json,private fixture',
+  'prefix fixture({})','fixture == {}','fixture => ({})',
+  'prefix a=1&b=2','state\t+=1','fixture.'+' '.repeat(65000)+'?',
+ ],
  FORMAT_OTHER:[')private-fixture','é'],
 }))test('reject malformed companion JSON with the fixed '+reason+' diagnostic',()=>{
  for(const text of contents){
@@ -190,8 +215,9 @@ for(const [reason,contents] of Object.entries({
  }
 });
 
-test('allow strict companion JSON with literal entity, percent and base64 text in strings',()=>{
- const html=externalTag+jsonBlock(' \t["&quot;","&#34;","%7B%7D","Ing_Ig","<!-- data -->"]\n');
+test('allow strict companion JSON with encoding and envelope markers inside strings',()=>{
+ const content=['&quot;','&#34;','%7B%7D','Ing_Ig','<!-- data -->','fixture({})','a=1&b=2','data:text/plain,private'];
+ const html=externalTag+jsonBlock(' \t'+JSON.stringify(content)+'\n');
  const reported:string[]=[];
  assert.deepEqual(issuerResultForm(html,undefined,code=>reported.push(code),decisionUrl),{
   scriptUrl:'https://reviewed-test-issuer.stripe.com/fixture/result.js',placement:'head',

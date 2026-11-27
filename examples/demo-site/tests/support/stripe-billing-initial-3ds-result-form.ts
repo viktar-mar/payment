@@ -7,8 +7,10 @@ const structuralElements=new Set(['html','head','body','title','meta']);
 const attribute=(element:DefaultTreeAdapterTypes.Element,name:string)=>element.attrs.find(attr=>attr.name===name)?.value;
 type LayoutRejection='EXTERNAL_LAYOUT_TAG'|'EXTERNAL_LAYOUT_ATTRIBUTES'|'EXTERNAL_LAYOUT_TEXT'|'EXTERNAL_LAYOUT_HANDLER';
 type BaseSixtyFourEvidence='BASE_SIXTY_FOUR'|'FORMAT_BASE_TEXT'|'FORMAT_BASE_BYTES';
+type CompanionJsonText='TEXT_DATA_URI'|'TEXT_URI'|'TEXT_FORM'|'TEXT_ASSIGN_JSON'|'TEXT_ASSIGNMENT'|
+ 'TEXT_CALL_JSON'|'TEXT_CALL'|'TEXT_JS_LITERAL'|'TEXT_NUMERIC'|'TEXT_BASE_SHAPE'|'TEXT_IDENTIFIER'|'TEXT_OTHER';
 type CompanionJsonShape='FORMAT_BOM'|'FORMAT_COMMENT'|'FORMAT_MARKUP'|'FORMAT_ENTITY'|'FORMAT_PERCENT'|
- 'FORMAT_ESCAPE'|'FORMAT_QUOTED'|'FORMAT_OBJECT'|'FORMAT_ARRAY'|'FORMAT_SPACE'|'FORMAT_TEXT'|'FORMAT_OTHER';
+ 'FORMAT_ESCAPE'|'FORMAT_QUOTED'|'FORMAT_OBJECT'|'FORMAT_ARRAY'|'FORMAT_SPACE'|'FORMAT_OTHER'|CompanionJsonText;
 type InvalidCompanionJson='BOM'|'HTML_COMMENT'|'HTML_QUOTES'|'PERCENT'|BaseSixtyFourEvidence|
  'CONTROL'|'ESCAPE'|'INCOMPLETE'|'PROPERTY'|'DELIMITER'|'NUMBER'|'TRAILING'|'FORMAT_LIMIT'|CompanionJsonShape;
 type CompanionRejection='EXTERNAL_COMPANION_PARENT'|'EXTERNAL_COMPANION_TAG'|'EXTERNAL_COMPANION_TYPE_MISSING'|
@@ -213,6 +215,32 @@ function baseSixtyFourCompanionJson(value:string):BaseSixtyFourEvidence|undefine
  return parsesJson(decoded)?'BASE_SIXTY_FOUR':'FORMAT_BASE_TEXT';
 }
 
+function companionJsonText(value:string):CompanionJsonText{
+ if(/^data:[^,\s]*,\S*$/i.test(value))return 'TEXT_DATA_URI';
+ if(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value))return 'TEXT_URI';
+
+ // Recognize an identifier or dotted member, or a declaration with a single name.
+ const member=/^[A-Za-z_$][A-Za-z0-9_$]*(?:[ \t\r\n]*\.[ \t\r\n]*[A-Za-z_$][A-Za-z0-9_$]*)*[ \t\r\n]*/.exec(value)?.[0];
+ const declaration=/^(?:var|let|const)[ \t\r\n]+[A-Za-z_$][A-Za-z0-9_$]*[ \t\r\n]*/.exec(value)?.[0];
+ const assignmentStart=(declaration??member)?.length;
+ const assignment=assignmentStart!==undefined&&/^=(?!=|>)/.test(value.slice(assignmentStart));
+ const end=value.endsWith(';')?-1:undefined;
+ if(assignment&&parsesJson(value.slice(assignmentStart+1,end)))return 'TEXT_ASSIGN_JSON';
+ if(member&&value.charAt(member.length)==='('){
+  const argument=value.slice(member.length+1,end);
+  const close=/\)[ \t\r\n]*$/.exec(argument);
+  return close&&parsesJson(argument.slice(0,close.index))?'TEXT_CALL_JSON':'TEXT_CALL';
+ }
+ // A single pair also looks like an assignment. Require a second pair.
+ if(/^[A-Za-z0-9_.%~*+-]+=[^&\s]*(?:&[A-Za-z0-9_.%~*+-]+=[^&\s]*)+$/.test(value))return 'TEXT_FORM';
+ if(assignment)return 'TEXT_ASSIGNMENT';
+ if(/^(?:undefined|NaN|[+-]?Infinity)$/.test(value)||/^(?:true|false|null)$/i.test(value))return 'TEXT_JS_LITERAL';
+ if(/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value))return 'TEXT_NUMERIC';
+ if(/[+/=]/.test(value)&&/^[A-Za-z0-9+/_-]+=*$/.test(value))return 'TEXT_BASE_SHAPE';
+ if(member?.length===value.length)return 'TEXT_IDENTIFIER';
+ return 'TEXT_OTHER';
+}
+
 function companionJsonShape(value:string):CompanionJsonShape{
  if(value.startsWith('<!--')||value.startsWith('//')||value.startsWith('/*'))return 'FORMAT_COMMENT';
  switch(value.charAt(0)){
@@ -226,7 +254,7 @@ function companionJsonShape(value:string):CompanionJsonShape{
   case '[':return 'FORMAT_ARRAY';
  }
  if(/^[\p{White_Space}\p{Cc}]/u.test(value))return 'FORMAT_SPACE';
- if(/^[A-Za-z0-9_+-]/.test(value))return 'FORMAT_TEXT';
+ if(/^[A-Za-z0-9_+-]/.test(value))return companionJsonText(value);
  return 'FORMAT_OTHER';
 }
 

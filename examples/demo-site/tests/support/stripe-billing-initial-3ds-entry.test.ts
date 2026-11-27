@@ -38,7 +38,9 @@ test('3DS terminal preserves a fixed companion refusal through its worker annota
  const reasons=['TYPE_SPECULATION_RULES','JSON_BOM','JSON_HTML_COMMENT','JSON_HTML_QUOTES','JSON_PERCENT',
   'JSON_BASE_SIXTY_FOUR','JSON_CONTROL','JSON_ESCAPE','JSON_INCOMPLETE','JSON_PROPERTY','JSON_DELIMITER','JSON_NUMBER','JSON_TRAILING',
   ...['LIMIT','BASE_TEXT','BASE_BYTES','BOM','COMMENT','MARKUP','ENTITY','PERCENT','ESCAPE','QUOTED','OBJECT','ARRAY',
-   'SPACE','TEXT','OTHER'].map(format=>'JSON_FORMAT_'+format)];
+   'SPACE','TEXT','OTHER'].map(format=>'JSON_FORMAT_'+format),
+  ...['DATA_URI','URI','FORM','ASSIGN_JSON','ASSIGNMENT','CALL_JSON','CALL','JS_LITERAL','NUMERIC','BASE_SHAPE',
+   'IDENTIFIER','OTHER'].map(shape=>'JSON_TEXT_'+shape)];
  for(const reason of reasons){
   const code='BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_'+reason;
   const line='owned_initial_3ds_terminal phase=ACK code='+code+' cleanup=UNCONFIRMED';
@@ -49,6 +51,8 @@ test('3DS terminal preserves a fixed companion refusal through its worker annota
   await assert.rejects(runInitial3dsCase(owner,async()=>assert.fail(),annotations),/billing_NOT_ACCEPTED/);
   assert.deepEqual(annotations,[{type:'owned-initial-3ds-terminal',description:line}]);
   assert.equal(challengeTerminalLine(line),line);
+  const longestLine=line.replace('phase=ACK','phase=PREFLIGHT');
+  assert.equal(challengeTerminalLine(longestLine),longestLine);
   assert.equal(challengeTerminalLine(line.replace(code,code+'_PRIVATE')),null);
  }
 });
