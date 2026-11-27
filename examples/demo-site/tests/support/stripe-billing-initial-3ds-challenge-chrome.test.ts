@@ -67,6 +67,10 @@ const secondDecisionPost='a second document POST from the issuer decision';
 const decisionCres='a CRes document POST to the Stripe hooks origin';
 const isolatedDecisionCres='a CRes document POST between isolated issuer and hooks targets';
 const namedDecisionCres='a CRes form targeting the same issuer frame with an implicit empty session value';
+const literalDecisionCres='a CRes form written by one literal inline script';
+const insertionDecisionCres='a CRes form inserted by one literal inline script';
+const dynamicDecisionCres='a CRes form assembled by an unsupported DOM script';
+const literalBodyMismatch='a CRes literal form whose observed wire body differs';
 const oversizedDecision='a gzip CRes decision that expands past 64 KiB';
 const invalidUtf8Decision='a gzip CRes decision with invalid UTF-8';
 const compressedDecisions=new Map([
@@ -89,12 +93,14 @@ const refusedFollowups=new Map([
  [changedCresAction,'BROWSER_CHALLENGE_CRES_ACTION'],
  [changedCresBody,'BROWSER_CHALLENGE_CRES_BODY'],
  [unsupportedCresForm,'BROWSER_CHALLENGE_CRES_FORM_CONTROL'],
+ [dynamicDecisionCres,'BROWSER_CHALLENGE_CRES_FORM_MISSING_INLINE_DOM'],
+ [literalBodyMismatch,'BROWSER_CHALLENGE_CRES_BODY'],
  [issuerCresDestination,'BROWSER_CHALLENGE_CRES_DESTINATION'],
  [oversizedDecision,'BROWSER_CHALLENGE_CRES_DECISION_SIZE'],
  [invalidUtf8Decision,'BROWSER_CHALLENGE_CRES_DECISION_UTF8'],
 ]);
 const wrongScriptMime='issuer script with the wrong MIME type is refused';
-for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,namedDecisionCres,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
+for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,namedDecisionCres,literalDecisionCres,insertionDecisionCres,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
 test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?mode+' is blocked after the original 2xx':mode===wrongScriptMime?mode:
  'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
@@ -110,9 +116,11 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const loadsDecisionScript=mode===decisionScript;
  const compressed=compressedDecisions.get(mode);
  const namedForm=mode===namedDecisionCres;
+ const literalForm=[literalDecisionCres,insertionDecisionCres,literalBodyMismatch].includes(mode);
+ const dynamicForm=mode===dynamicDecisionCres;
  const submitsCres=Boolean(compressed)||[decisionCres,isolatedDecisionCres,namedDecisionCres,lateDecisionCres,lateDecisionHeaders,uncapturedDecision,
-  changedCresAction,changedCresBody,unsupportedCresForm,issuerCresDestination].includes(mode);
- const isolated=mode===isolatedDecisionCres||namedForm||compressed||mode===lateDecisionHeaders||mode==='separate issuer process';
+  changedCresAction,changedCresBody,unsupportedCresForm,issuerCresDestination].includes(mode)||literalForm||dynamicForm;
+ const isolated=mode===isolatedDecisionCres||namedForm||literalForm||dynamicForm||compressed||mode===lateDecisionHeaders||mode==='separate issuer process';
  const submitsSecondDecision=mode===secondDecisionPost||submitsCres;
  const rejectedAsset=rejectedAssets.get(mode);
  const scopedIssuer=mode==='direct reviewed issuer origin'||blocksPassiveAsset||loadsScript||loadsDecisionScript||submitsSecondDecision||Boolean(rejectedAsset);
@@ -171,8 +179,17 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    rejectedAsset?.kind==='script'?`<script>const s=document.createElement('script');s.src="${assetPath}";document.head.append(s)</script>`:
    loadsScript?`<script src="${assetPath}"></script>`:'');
  const followupTarget=namedForm?` target="${issuerName}"`:'';
+ const followupForm=`<form method="post" action="${followup}"${followupTarget}>${followupFields}</form>`;
+ const insertForm=mode===insertionDecisionCres?"document.body.insertAdjacentHTML('beforeend', ":'document.write(';
+ const literalDecision=`<!doctype html><body><script>${insertForm}${JSON.stringify(followupForm)});${followupScript};</script></body>`;
+ const dynamicDecision=`<!doctype html><body><script>
+  const result=document.createElement('form');result.method='post';result.action=${JSON.stringify(followup)};
+  const field=document.createElement('input');field.type='hidden';field.name='cres';field.value=${JSON.stringify(cres)};
+  result.append(field);document.body.append(result);result.submit();
+ </script></body>`;
  let decisionHtml=submitsSecondDecision?
-  `<!doctype html><form method="post" action="${followup}"${followupTarget}>${followupFields}</form><script>${followupScript}</script>`:
+  literalForm?literalDecision:dynamicForm?dynamicDecision:
+  `<!doctype html>${followupForm}<script>${followupScript}</script>`:
   loadsDecisionScript?`<!doctype html><script src="${decisionAsset}"></script>`:
   '<!doctype html><script>'+issuerDecision+'</script>';
  if(compressed)decisionHtml='\uFEFF'+decisionHtml+'<!-- Résultat -->';
@@ -243,6 +260,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
     if(request.url()===decision&&bytes instanceof Uint8Array){
      if(compressedFixture)assert.equal(Buffer.from(bytes).equals(decisionBytes),true);
      decisionBodyCaptured=true;
+     if(mode===literalBodyMismatch)return Buffer.from(decisionHtml.replace('fixture&amp;session','server&amp;session'));
     }
     return bytes;
    },

@@ -7,12 +7,60 @@ const action='https://hooks.stripe.com/fixture/result?one=1&amp;two=2';
 const result='<input type="hidden" name="cres" value="YQ==">';
 const session='<input type="hidden" name="threeDSSessionData" value="a+b&#13;c">';
 const form=(fields=result,attributes='')=>'<form method="POST" action="'+action+'" '+attributes+'>'+fields+'</form>';
+const submit='document.forms[0].submit();';
+const inline=(code:string,attributes='')=>`<!doctype html><body><script${attributes}>${code}</script></body>`;
+const write=(markup:string)=>`document.write(${JSON.stringify(markup)});${submit}`;
 
 test('derive the exact CRes action and ordered wire bytes from the issuer form',()=>{
  assert.deepEqual(issuerResultForm('<!doctype html>'+form(session+result,'target="_self"')),{
   action:'https://hooks.stripe.com/fixture/result?one=1&two=2',
   body:'threeDSSessionData=a%2Bb%0D%0Ac&cres=YQ%3D%3D',
  });
+});
+
+for(const code of [write(form(session+result)),`document.body.insertAdjacentHTML('beforeend', '${form(session+result)}'); ${submit}`]){
+ test('derive the ordered CRes form from one literal inline producer',()=>{
+  assert.deepEqual(issuerResultForm(inline(code)),{
+   action:'https://hooks.stripe.com/fixture/result?one=1&two=2',
+   body:'threeDSSessionData=a%2Bb%0D%0Ac&cres=YQ%3D%3D',
+  });
+ });
+}
+
+for(const [reason,html] of [
+ ['MISSING_INLINE_MARKUP',inline(write(form())+'document.body.remove();')],
+ ['MISSING_INLINE_MARKUP',inline(`document.write(${JSON.stringify(form())} + suffix); ${submit}`)],
+ ['MISSING_INLINE_DOM',inline(`const form=document.createElement('form'); ${submit}`)],
+ ['MISSING_EXTERNAL','<!doctype html><script src="/private-fixture.js"></script>'],
+ ['MISSING_TEMPLATE','<!doctype html><template>'+form()+'</template>'],
+ ['MISSING_HANDLER','<!doctype html><body onload="privateFixture()"></body>'],
+ ['MISSING_MIXED',inline(write(form())).replace('</body>','<script src="/private-fixture.js"></script></body>')],
+ ['MISSING',inline(write(form()),' type="application/json"')],
+ ['MISSING',inline(write(form()),' type="\u00a0text/javascript\u00a0"')],
+ ['MISSING_INLINE_MARKUP',inline(write(form()),' type="module"')],
+ ['MISSING_INLINE_MARKUP',inline(write(form()),' nomodule')],
+ ['MISSING_TEMPLATE','<!doctype html><template>'+inline(write(form()))+'</template>'],
+ ['MISSING_INLINE_MARKUP','<!doctype html><head><script>'+write(form())+'</script></head>'],
+ ['MISSING_INLINE_MARKUP','<!doctype html><body><script>'+write(form())],
+ ['MISSING_INLINE_MARKUP',inline(write(form())).replace('</body>','<div>other body content</div></body>')],
+ ['LITERAL_MARKUP',inline(write(form()+form()))],
+ ['LITERAL_MARKUP',inline(write(form('<form>'+result+'</form>')))],
+ ['LITERAL_MARKUP',inline(write(form().slice(0,-7)))],
+ ['LITERAL_MARKUP',inline(write('<body onload="privateFixture()">'+form()))],
+ ['LITERAL_MARKUP',inline(write(form(result,'name="forms"')))],
+ ['LITERAL_MARKUP',inline(write(form(result.replace('type=','id="submit" type='))))],
+ ['LITERAL_MARKUP',inline(write('<div>'+form()+'</div>'))],
+ ['LITERAL_MARKUP',inline(write(form(result+'<script>privateFixture()</script>')).replace('</script>','<\\/script>'))],
+ ['ACTION',inline(write(form().replace('hooks.stripe.com','private.fixture.test')))],
+ ['REQUIRED_CRES',inline(write(form(session)))],
+ ['TARGET',inline(write(form(result,'target="_parent"')))],
+ ['CONTROL',inline(write(form(result.replace('hidden','text'))))],
+ ['DUPLICATE_ATTRIBUTE',inline(write(form(result,'action="https://private.fixture.test"')))],
+ ['METHOD',form().replace('method="POST"','method="get"')+inline(write(form()))],
+] as const)test('dynamic CRes fails closed with '+reason,()=>{
+ const reported:string[]=[];
+ assert.equal(issuerResultForm(html,undefined,code=>reported.push(code)),undefined);
+ assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_FORM_'+reason]);
 });
 
 test('derive the exact wire body for a named current frame and an implicit empty session value',()=>{
@@ -58,7 +106,7 @@ for(const [reason,html] of Object.entries({
  DUPLICATE_ATTRIBUTE:form(result,'action="https://private.fixture.test"'),
  BASE:'<base target="_blank">'+form(),
  OWNER:form()+'<input form="private-fixture">',
- MISSING:'<script>document.write("private fixture")</script>',
+ MISSING:'<!-- no active form -->',
  MULTIPLE:form()+form(),
  METHOD:form().replace('method="POST"','method="get"'),
  TARGET:form(result,'target="private-fixture"'),

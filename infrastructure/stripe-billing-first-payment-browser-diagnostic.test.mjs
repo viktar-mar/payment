@@ -20,13 +20,16 @@ test('bounded wait marker categories carry no payload and remain closed',()=>{
 test('CRes form checkpoints cross the acceptance boundary as fixed codes only',()=>{
  const prefix='BROWSER_CHALLENGE_CRES_FORM';
  for(const code of [prefix,...['PARSE','DEADLINE','DUPLICATE_ATTRIBUTE','BASE','OWNER','MISSING','MULTIPLE',
-  'METHOD','TARGET','ENCODING','ACTION','CONTROL','FIELD','DUPLICATE_FIELD','REQUIRED_CRES','SIZE'].map(reason=>prefix+'_'+reason)]){
+  'METHOD','TARGET','ENCODING','ACTION','CONTROL','FIELD','DUPLICATE_FIELD','REQUIRED_CRES','SIZE','LITERAL_MARKUP',
+  'MISSING_INLINE','MISSING_INLINE_DOM','MISSING_INLINE_MARKUP','MISSING_EXTERNAL','MISSING_TEMPLATE','MISSING_HANDLER','MISSING_MIXED',
+ ].map(reason=>prefix+'_'+reason)]){
   const error=privateOrigin.acceptanceBrowserFailure(code);
   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
   assert.equal(String(error),'Error: billing_BROWSER');
   assert.equal(JSON.stringify(error),'{}');
  }
- for(const raw of [prefix+'_TARGET_private',prefix+'_FIELD_CRES',prefix+'_ACTION https://fixture.test/private']){
+ for(const raw of [prefix+'_TARGET_private',prefix+'_FIELD_CRES',prefix+'_ACTION https://fixture.test/private',
+  prefix+'_MISSING_INLINE_DOM private fixture script',prefix+'_MISSING_EXTERNAL /private-fixture.js']){
   assert.equal(browserDiagnostic(privateOrigin.acceptanceBrowserFailure(raw),'ACCEPTANCE'),null);
  }
 });
