@@ -140,7 +140,7 @@ interface FrameSnapshot {target:Frame;frames:Map<Frame,string>}
 type Options={
  page:Page;limits:BillingLimits;demo:string;owner:()=>{secret:string;key:string};
  winning:()=>Promise<void>;authorizeResponse:(req:Request)=>Promise<void>;check:()=>Promise<void>;
- expectIssuerAssetBlock:(req:Request)=>Promise<void>;
+ expectIssuerAssetBlock:(req:Request,decisionDocument?:Request)=>Promise<void|boolean>;
  authorizeIssuerScript?:(req:Request,document:Request,capture:boolean)=>Promise<void>;
  takeIssuerScriptBody?:(req:Request,document:Request)=>Promise<IssuerDecisionBody>|undefined;
  authorizeIssuerDecision?:(req:Request)=>Promise<void>;
@@ -165,7 +165,8 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
  let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:Promise<void>}|undefined;
  let handoffStarted=false;
  const issuerAssets=()=>({
-  blocks:new Map<string,Promise<void>>(),scripts:new Map<string,{request:Request;forwarded:Promise<void>}>(),deadline:undefined as number|undefined,
+  blocks:new Map<string,{request:Request;document:Request;blocked:Promise<boolean>}>(),
+  scripts:new Map<string,{request:Request;forwarded:Promise<void>}>(),deadline:undefined as number|undefined,
  });
  const challengeAssets=issuerAssets(),decisionAssets=issuerAssets();
  const passiveFailures=new Map<Request,()=>void>();
@@ -318,6 +319,17 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     report('BROWSER_CHALLENGE_CRES_SCRIPT_RECEIPT');
     const script=matchingDecisionScript(source.scriptUrl);
     requireValue(capturedDecision&&script);
+    if(source.blockedStylesheetUrl){
+     report('BROWSER_CHALLENGE_CRES_HEAD_STYLESHEET_BLOCK');
+     const path=new URL(source.blockedStylesheetUrl).pathname,receipt=decisionAssets.blocks.get(path);
+     requireValue(receipt?.document===request&&receipt.request.url()===source.blockedStylesheetUrl&&
+      receipt.request.resourceType()==='stylesheet'&&receipt.request.frame()===original.target);
+     requireValue(await receipt.blocked);
+     await check();billingCheck(active);
+     requireValue(decisionAssets.blocks.get(path)===receipt&&receipt.request.existingResponse()===null);
+     sameChain(original,committedIssuerDocument(original.target,request,response));
+     report('BROWSER_CHALLENGE_CRES_SCRIPT_RECEIPT');
+    }
     const pendingBody=takeIssuerScriptBody?.(script.request,request);
     requireValue(pendingBody);
     report('BROWSER_CHALLENGE_CRES_SCRIPT_READ');
@@ -325,7 +337,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     billingCheck(active);
     if(scriptBody==='BROWSER_CHALLENGE_CRES_DECISION_SIZE')report('BROWSER_CHALLENGE_CRES_SCRIPT_SIZE');
     requireValue(typeof scriptBody!=='string');
-    form=externalIssuerResultForm(scriptBody,frameName,report,source.placement);
+    form=externalIssuerResultForm(scriptBody,frameName,report,source.placement,source.foldedCompanion);
     requireValue(form);
    }else form=source;
    report('BROWSER_CHALLENGE_CRES_FORM_DEADLINE');
@@ -562,7 +574,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
      await check();billingCheck(active);
      requireIssuerDocument();
      report('BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK');
-     await expectIssuerAssetBlock(request);
+     const stylesheetParserProved=await expectIssuerAssetBlock(request,decisionDocument&&kind==='stylesheet'?documentRequest:undefined);
      await check();billingCheck(active);
      requireIssuerDocument();
      report('BROWSER_CHALLENGE_ISSUER_ASSET_BLOCK');
@@ -571,8 +583,9 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
      await Promise.all([route.abort('blockedbyclient'),failed.promise]);
      await check();billingCheck(active);
      requireIssuerDocument();
+     return stylesheetParserProved===true;
     },750);
-    assets.blocks.set(url.pathname,block);
+    assets.blocks.set(url.pathname,{request,document:documentRequest,blocked:block});
     try{await block;}finally{passiveFailures.delete(request);}
     return;
    }
@@ -681,7 +694,8 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   };
   handoffStarted=true;
   // Let the route's fixed checkpoint reach the owner on failure, while preventing handoff.
-  await Promise.all([...challengeAssets.blocks.values(),...[...challengeAssets.scripts.values()].map(script=>script.forwarded)])
+  await Promise.all([...Array.from(challengeAssets.blocks.values(),receipt=>receipt.blocked),
+   ...Array.from(challengeAssets.scripts.values(),script=>script.forwarded)])
    .catch(()=>billingBounded(limits,()=>new Promise<never>(()=>{}),750));
   await validate();await billingBounded(limits,l=>waitForGesture({deadline:l.deadline,signal:l.signal!}),180000);await validate();
   // A pending form navigation can block evaluation in the issuer renderer.

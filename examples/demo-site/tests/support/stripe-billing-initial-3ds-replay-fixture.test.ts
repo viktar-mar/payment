@@ -162,6 +162,43 @@ test('the shape witness is bounded and requires the paired script URL',()=>{
  assert.equal(describeIssuerDecisionReplay({...variant,scriptUrl:'https://private-unpaired.example.test/script.js'}),undefined);
 });
 
+test('the shape witness distinguishes head elements that share the same coarse layout',()=>{
+ const source=capture('fixture-hidden-one');
+ const candidates=[
+  ['<link rel="stylesheet" type="text/css" href="/private-head.css">','LINK_STYLESHEET'],
+  ['<link rel="shortcut icon" type="image/png" href="/private-head.png">','LINK_ICON'],
+  ['<link rel="preload" type="text/javascript" href="/private-head.js" as="script">','LINK_PRELOAD'],
+  ['<link rel="private-rel" type="private-type" href="/private-head">','LINK_OTHER'],
+  ['<link rel="stylesheet preload" type="text/css" href="/private-head.css">','LINK_OTHER'],
+  ['<basefont color="private-color" type="private-type">','BASEFONT'],
+  ['<bgsound loop="1" type="private-type">','BGSOUND'],
+ ] as const;
+ for(const [element,headKind] of candidates){
+  const html=Buffer.from(source.html.toString().replace('</head>',element+'</head>'));
+  const witness=describeIssuerDecisionReplay({...source,html});
+  assert.ok(witness);
+  assert.equal(witness.checkpoint,foldCheckpoint);
+  assert.deepEqual(witness.layout.find(node=>node.element==='OTHER'),{
+   element:'OTHER',parent:'HEAD',tags:'OPEN',attributes:['OTHER','TYPE'],headKind,
+  });
+  assert.doesNotMatch(JSON.stringify(witness),/private-|fixture-hidden-one/);
+ }
+});
+
+test('only a direct head element receives a fixed kind and unsupported tags are generalized',()=>{
+ const source=capture('fixture-hidden-one');
+ const html=Buffer.from(source.html.toString()
+  .replace('</head>','<template type="private-kind"></template></head>')
+  .replace('</body>','<link rel="stylesheet" type="text/css" href="/private-body.css"></body>'));
+ const witness=describeIssuerDecisionReplay({...source,html});
+ assert.ok(witness);
+ assert.deepEqual(witness.layout.filter(node=>node.element==='OTHER'),[
+  {element:'OTHER',parent:'HEAD',tags:'CLOSED',attributes:['TYPE'],headKind:'OTHER'},
+  {element:'OTHER',parent:'BODY',tags:'OPEN',attributes:['OTHER','TYPE']},
+ ]);
+ assert.doesNotMatch(JSON.stringify(witness),/template|private-|fixture-hidden-one/);
+});
+
 test('report structural evidence for a paired refusal on a page with additional inert markup',()=>{
  const source=capture('fixture-hidden-one');
  const html=Buffer.from(source.html.toString().replace('<html>','<html lang="private-language">')

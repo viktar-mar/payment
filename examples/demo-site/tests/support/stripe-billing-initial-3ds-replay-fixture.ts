@@ -307,10 +307,12 @@ export function anonymizeIssuerDecisionReplay(source:CaptureSource):IssuerDecisi
 type LayoutParent='DOCUMENT'|'HTML'|'HEAD'|'BODY'|'OTHER';
 type LayoutElement=Exclude<LayoutParent,'DOCUMENT'>|'DOCTYPE'|'COMMENT'|'META'|'TITLE'|'PRODUCER'|'COMPANION';
 type LayoutAttribute='TYPE'|'SRC'|'ID'|'CHARSET'|'OTHER';
+type HeadKind='LINK_STYLESHEET'|'LINK_ICON'|'LINK_PRELOAD'|'LINK_OTHER'|'BASEFONT'|'BGSOUND'|'OTHER';
 type LayoutShape={
  element:LayoutElement;parent:LayoutParent;tags:'CLOSED'|'OPEN'|'IMPLIED'|'VOID';attributes:LayoutAttribute[];
  companion?:'STRICT_JSON'|'REJECTED_JSON';
  source?:'ABSOLUTE'|'ROOT_RELATIVE'|'DOT_RELATIVE'|'RELATIVE';
+ headKind?:HeadKind;
 };
 
 const scriptMarkers=[
@@ -336,6 +338,24 @@ function layoutParent(name:string|undefined):LayoutParent{
   case 'html':return 'HTML';
   case 'head':return 'HEAD';
   case 'body':return 'BODY';
+  default:return 'OTHER';
+ }
+}
+
+function headKind(node:Element):HeadKind{
+ if(node.namespaceURI!==htmlNamespace)return 'OTHER';
+ switch(node.tagName){
+  case 'basefont':return 'BASEFONT';
+  case 'bgsound':return 'BGSOUND';
+  case 'link':{
+   const rel=attribute(node,'rel')?.toLowerCase().match(/[^\t\n\f\r ]+/g)?.join(' ');
+   switch(rel){
+    case 'stylesheet':return 'LINK_STYLESHEET';
+    case 'icon':case 'shortcut icon':return 'LINK_ICON';
+    case 'preload':return 'LINK_PRELOAD';
+    default:return 'LINK_OTHER';
+   }
+  }
   default:return 'OTHER';
  }
 }
@@ -369,6 +389,7 @@ function shapeFor(node:DefaultTreeAdapterTypes.ChildNode):LayoutShape|undefined{
   }
  }
  const shape:LayoutShape={element,parent,tags,attributes:[...attributes]};
+ if(element==='OTHER'&&parent==='HEAD')shape.headKind=headKind(node);
  if(element==='COMPANION'){
   const contents=node.childNodes.filter(tree.isTextNode).map(child=>child.value).join('');
   try{JSON.parse(contents);shape.companion='STRICT_JSON';}

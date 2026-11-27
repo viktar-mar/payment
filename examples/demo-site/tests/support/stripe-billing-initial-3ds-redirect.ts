@@ -18,7 +18,7 @@ type Header={name:string;value:string};
 type Preflight={origin:string;method:string;names?:string};
 type FrameWait={settle:(matched:boolean)=>void;invalidated:boolean};
 type Entry={url:string;method:string;frameId?:string;loaderId?:string;allowed:boolean;expectedAssetBlock?:boolean;preflight?:Preflight;
- issuerParser?:{url:string;loaderId:string};allowedIssuerScript?:boolean;allowedIssuerResult?:boolean;issuerDecision?:Request;
+ issuerParser?:{type:'Script'|'Stylesheet';url:string;loaderId:string};allowedIssuerScript?:boolean;allowedIssuerResult?:boolean;issuerDecision?:Request;
  issuerScriptProof?:{request:Request;document:Request};cached?:boolean;
  initiator?:{id:string;entry?:Entry};frameWait?:FrameWait};
 type RedirectGuardFailure='BROWSER_GUARD_REQUEST_REDIRECT'|'BROWSER_GUARD_REQUEST_PAIR'|'BROWSER_GUARD_REQUEST_CAPACITY'
@@ -167,8 +167,8 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
    const issuerTraffic=approvedIssuerOrigin&&new URL(event.request.url).origin===approvedIssuerOrigin;
    const preflight=issuerTraffic?undefined:probe(event.request,event.initiator?.type,origins);
    const entry:Entry={frameId:event.frameId,loaderId:event.loaderId,url:event.request.url,method:event.request.method,allowed:false,preflight};
-   if(issuerTraffic && event.type==='Script' && event.initiator?.type==='parser' &&
-      event.initiator.url===event.documentURL && event.loaderId)entry.issuerParser={url:event.documentURL,loaderId:event.loaderId};
+   if(issuerTraffic && (event.type==='Script'||event.type==='Stylesheet') && event.initiator?.type==='parser' &&
+      event.initiator.url===event.documentURL && event.loaderId)entry.issuerParser={type:event.type,url:event.documentURL,loaderId:event.loaderId};
    if(!entry.frameId){
     // Chrome may report a frameless preflight before the linked initiating request.
     // Record the exact identifier, but require its frame and the synthetic 204 at the pause.
@@ -415,7 +415,20 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
  if(!mainId||routeReader&&routeReader.mainId!==mainId)refuse();
  const routes=new WeakMap<Request,{generation:number;evidence?:ChromiumRouteEvidence|null}>();
  const issuerResults=new WeakSet<Request>();
- type IssuerClaim={kind:'script';document:Request;capture:boolean}|{kind:'result';document:Request}|{kind:'decision'};
+ type StylesheetClaim={kind:'stylesheet';document:Request;proved:boolean};
+ type IssuerClaim={kind:'script';document:Request;capture:boolean}|{kind:'result';document:Request}|{kind:'decision'}|StylesheetClaim;
+ function provesDecisionStylesheet(request:Request,url:URL,document:Request,evidence:ChromiumRouteEvidence,entry:Entry):boolean{
+  try{
+   if(!routeReader||!routes.get(document)?.evidence||document===request||document.frame()!==request.frame()||
+      url.href!==request.url()||request.resourceType()!=='stylesheet'||request.redirectedFrom()||request.serviceWorker()||
+      document.method()!=='POST'||!document.isNavigationRequest()||document.resourceType()!=='document'||
+      document.redirectedFrom()||document.serviceWorker())return false;
+   const source=new URL(document.url()),loader=routeReader.navigationDocument(document);
+   return source.origin===url.origin&&source.href===document.url()&&!source.username&&!source.password&&!source.hash&&
+    request.frame().url()===source.href&&!!loader&&loader===evidence.documentId&&entry.issuerParser?.type==='Stylesheet'&&
+    entry.issuerParser.loaderId===loader&&entry.issuerParser.url===source.href;
+  }catch{return false;}
+ }
  async function claimRoute(request:Request,blockIssuerAsset:boolean,issuerClaim?:IssuerClaim){
   const url=new URL(request.url());
   const fromApprovedIssuer=approvedIssuerOrigin!==undefined && url.origin===approvedIssuerOrigin;
@@ -492,7 +505,7 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
     if(entry.method==='OPTIONS'&&!entry.preflight)return refuse();
     if(issuerScriptDocument!==undefined){
      reason='BROWSER_GUARD_ROUTE_ISSUER_SCRIPT_PARSER';
-     if(entry.issuerParser?.url!==issuerScriptDocument || entry.issuerParser.loaderId!==evidence.documentId ||
+     if(entry.issuerParser?.type!=='Script'||entry.issuerParser.url!==issuerScriptDocument || entry.issuerParser.loaderId!==evidence.documentId ||
         evidence.documentId!==routeReader.navigationDocument(issuerScript!) ||
         request.frame().url()!==issuerScriptDocument)return refuse();
      entry.allowedIssuerScript=true;
@@ -512,8 +525,11 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
      issuerResults.add(issuerResult);
      entry.allowedIssuerResult=true;
     }
-    if(blockIssuerAsset)entry.expectedAssetBlock=true;
-    else{
+    if(blockIssuerAsset){
+     entry.expectedAssetBlock=true;
+     // Keep the ordinary block even if the parser cannot bind it to this decision.
+     if(issuerClaim?.kind==='stylesheet')issuerClaim.proved=provesDecisionStylesheet(request,url,issuerClaim.document,evidence,entry);
+    }else{
      if(issuerDecision)entry.issuerDecision=request;
      entry.allowed=true;
     }
@@ -562,7 +578,11 @@ export async function guardChallengeRedirects(page:Page,onFailure:(reason:Redire
    if(!routes.has(request))routes.set(request,{generation:iframeGuard.generation(),evidence:routeReader?.capture(request)});
   },
   authorize:(request:Request)=>claimRoute(request,false),
-  expectIssuerAssetBlock:(request:Request)=>claimRoute(request,true),
+  async expectIssuerAssetBlock(request:Request,document?:Request){
+   const claim:StylesheetClaim|undefined=document?{kind:'stylesheet',document,proved:false}:undefined;
+   await claimRoute(request,true,claim);
+   return claim?.proved;
+  },
   authorizeIssuerScript:(request:Request,document:Request,capture=false)=>claimRoute(request,false,{kind:'script',document,capture}),
   authorizeIssuerDecision:routeReader?(request:Request)=>claimRoute(request,false,{kind:'decision'}):undefined,
   takeIssuerDecisionBody(request:Request){

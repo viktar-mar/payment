@@ -2,6 +2,87 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 // @ts-ignore Native Node executes the same form parser as Playwright.
 import {externalIssuerResultForm,issuerResultForm} from './stripe-billing-initial-3ds-result-form.ts';
+// @ts-ignore Native Node executes the same synthetic companion as Chrome.
+import {syntheticIssuerDomForm} from './stripe-billing-initial-3ds-dom-fixture.ts';
+
+test('prove the folded companion only with its exact dynamic form recipe',()=>{
+ const destination='https://hooks.stripe.com/fixture/result?one=1&two=2';
+ const fields={threeDSSessionData:'é + &\r\nx\n',cres:'YQ=='};
+ const {id,folded,script}=syntheticIssuerDomForm(destination,fields);
+ const wire='threeDSSessionData=%C3%A9+%2B+%26%0D%0Ax%0D%0A&cres=YQ%3D%3D';
+ const html=`<!doctype html><body><script type="application/json" id="${id}">${folded}</script><script src="/result.js"></script></body>`;
+ const source=issuerResultForm(html,undefined,undefined,'https://reviewed-test-issuer.stripe.com/fixture/decision');
+ assert.ok(source&&'scriptUrl' in source&&source.foldedCompanion);
+ assert.equal(source.scriptUrl,'https://reviewed-test-issuer.stripe.com/result.js');
+ assert.deepEqual(externalIssuerResultForm(Buffer.from(script),undefined,undefined,source.placement,source.foldedCompanion),
+  {action:destination,body:wire});
+ assert.equal(externalIssuerResultForm(Buffer.from(script.replace(id,'different-id')),undefined,undefined,source.placement,source.foldedCompanion),undefined);
+ assert.equal(externalIssuerResultForm(Buffer.from("document.write('<form></form>');document.forms[0].submit();"),
+  undefined,undefined,source.placement,source.foldedCompanion),undefined);
+});
+
+test('prove canonical folded Base64 with a byte count that needs no padding',()=>{
+ const destination='https://hooks.stripe.com/fixture/result';
+ const fixtures=['x','xy','xyz'].map(cres=>({...syntheticIssuerDomForm(destination,{cres}),cres}));
+ const fixture=fixtures.find(value=>/^[A-Za-z0-9\n]+$/.test(value.folded));
+ assert.ok(fixture);
+ const html=`<!doctype html><body><script type="application/json" id="${fixture.id}">${fixture.folded}</script><script src="/result.js"></script></body>`;
+ const source=issuerResultForm(html,undefined,undefined,'https://reviewed-test-issuer.stripe.com/fixture/decision');
+ assert.ok(source&&'scriptUrl' in source&&source.foldedCompanion);
+ assert.deepEqual(externalIssuerResultForm(Buffer.from(fixture.script),undefined,undefined,source.placement,source.foldedCompanion),
+  {action:destination,body:'cres='+fixture.cres});
+});
+
+test('require a blocked same-origin stylesheet receipt for one plain folded-companion head link',()=>{
+ const {id,folded,json}=syntheticIssuerDomForm('https://hooks.stripe.com/fixture/result',{cres:'YQ=='});
+ const documentUrl='https://reviewed-test-issuer.stripe.com/fixture/decision';
+ const href='/fixture-decision.css';
+ const headLink=`<link rel="stylesheet" href="${href}" type="text/css">`;
+ const document=(head:string,data=folded,body='')=>`<!doctype html><html><head>${head}</head><body>${body}<script type="application/json" id="${id}">${data}</script><script src="/result.js"></script></body></html>`;
+ const read=(html:string)=>issuerResultForm(html,undefined,undefined,documentUrl);
+ const proof=read(document(headLink));
+ assert.ok(proof&&'scriptUrl' in proof&&proof.foldedCompanion);
+ assert.equal(proof.blockedStylesheetUrl,new URL(href,documentUrl).href);
+ assert.equal(read(document(headLink,json)),undefined);
+ for(const head of [
+  headLink+headLink,
+  headLink+headLink.replace(href,'/other.css'),
+  headLink+'<style type="text/css">body {color:black}</style>',
+  headLink.replace('stylesheet','icon'),
+  headLink.replace('stylesheet','preload'),
+  headLink.replace('stylesheet','alternate stylesheet'),
+  headLink.replace('type="text/css"','type="text/plain"'),
+  headLink.replace('type="text/css"',''),
+  headLink.replace(href,'https://foreign.example/other.css'),
+  headLink.replace(href,'//reviewed-test-issuer.stripe.com/other.css'),
+  headLink.replace(href,href+'?other=1'),
+  headLink.replace(href,href+'#other'),
+  headLink.replace(href,'/fixture/%6Fther.css'),
+  headLink.replace(href,'/fixture/../other.css'),
+  headLink.replace(' rel=',' onload="void 0" rel='),
+  headLink.replace(' rel=',' media="print" rel='),
+  headLink.replace(' rel=',' type="text/css" rel='),
+ ])assert.equal(read(document(head)),undefined,head);
+ assert.equal(read(document('',folded,headLink)),undefined);
+});
+
+test('keep its strict layout, base64 and controls even when a folded JSON candidate is present',()=>{
+ const destination='https://hooks.stripe.com/fixture/result';
+ const {id,folded}=syntheticIssuerDomForm(destination,{cres:'YQ=='});
+ const data=(encoded=folded,identifier=id)=>`<script type="application/json" id="${identifier}">${encoded}</script>`;
+ const producer='<script src="/result.js"></script>';
+ const body=(markup:string)=>'<!doctype html><body>'+markup+'</body>';
+ const fold=(json:string)=>Buffer.from(json).toString('base64').replace(/^.{8}/,'$&\n');
+ for(const html of [
+  body(producer+data()), body(data()+producer+data()), body(data()+producer.replace('/result.js','https://foreign.example/result.js')),
+  body(data(folded,'bad id')+producer), body(data(folded.replace(/\s/g,''))+producer),
+  body(data(fold(JSON.stringify({destination,controls:{cres:'YQ==',unrelated:'sentinel'}})))+producer),
+  body(data(fold(JSON.stringify({destination,controls:{cres:'é'}})))+producer),
+  body(data(fold(JSON.stringify({destination:'http://hooks.stripe.com/fixture/result',controls:{cres:'YQ=='}})))+producer),
+  '<!doctype html><head><link rel="icon" type="image/png" href="/fixture.png"></head><body>'+data()+producer+'</body>',
+  '<!doctype html><head>'+data()+producer+'</head>',
+ ])assert.equal(issuerResultForm(html,undefined,undefined,'https://reviewed-test-issuer.stripe.com/fixture/decision'),undefined);
+});
 
 const action='https://hooks.stripe.com/fixture/result?one=1&amp;two=2';
 const result='<input type="hidden" name="cres" value="YQ==">';

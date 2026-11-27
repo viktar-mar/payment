@@ -66,10 +66,10 @@ test('CRes form checkpoints cross the acceptance boundary as fixed codes only',(
   assert.equal(browserDiagnostic(privateOrigin.acceptanceBrowserFailure(raw),'ACCEPTANCE'),null);
  }
 });
-test('CRes external script checkpoints reveal only a fixed reason',()=>{
- const prefix='BROWSER_CHALLENGE_CRES_SCRIPT_';
- for(const suffix of ['RECEIPT','READ','SIZE','UTF8','UNSUPPORTED','UNSUPPORTED_DOM','HEAD_INSERTION']){
-  const code=prefix+suffix;
+test('CRes script and head stylesheet checkpoints reveal only a fixed reason',()=>{
+ const scriptCodes=['RECEIPT','READ','SIZE','UTF8','UNSUPPORTED','UNSUPPORTED_DOM','HEAD_INSERTION']
+  .map(suffix=>'BROWSER_CHALLENGE_CRES_SCRIPT_'+suffix);
+ for(const code of [...scriptCodes,'BROWSER_CHALLENGE_CRES_HEAD_STYLESHEET_BLOCK']){
   const error=privateOrigin.acceptanceBrowserFailure(code);
   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
   assert.equal(JSON.stringify(error),'{}');

@@ -327,6 +327,63 @@ for(const [mode,policy] of Object.entries(issuerResultPolicy))test('issuer resul
  assert.deepEqual(failures,policy.responseFailure?[policy.responseFailure]:[]);
 });
 
+for(const mode of ['exact source and block','http response','wrong loader','wrong loader http response','wrong source loader',
+ 'non-parser initiator','foreign parser document','wrong parser resource','foreign frame','unregistered decision',
+ 'wrong decision method','no decision proof requested','wrong suffix'])test(
+ 'issuer stylesheet block binds its exact committed decision: '+mode,async()=>{
+ const approved='https://reviewed-test-issuer.stripe.com',address=approved+'/decision';
+ const url=approved+(mode==='wrong suffix'?'/fixture.png':'/fixture.css');
+ const browserSession={},symbol=Symbol('InterceptableRequest'),pending=new Map(),frameId='issuer',loaderId='decision-loader';
+ const main={_id:'checkout',_page:undefined as unknown,_currentDocument:{documentId:'checkout-loader'},_isDetached:()=>false,parentFrame:()=>null};
+ const issuer={_id:frameId,_page:undefined as unknown,_currentDocument:{documentId:loaderId},_isDetached:()=>false,parentFrame:()=>main};
+ const impl={frameManager:{frame:(id:string)=>[main,issuer].find(node=>node._id===id)},
+  delegate:{_targetId:main._id,_sessions:new Map([[main._id,{_targetId:main._id,_client:browserSession}]]),
+  _networkManager:{_requestIdToRequest:pending}}};
+ main._page=issuer._page=impl;
+ const connection={toImpl:(client:{driver:unknown})=>client.driver},location=origins.demo+'/';
+ const wrap=(driver:unknown,href:string)=>({_connection:connection,driver,url:()=>href,name:()=>'',isDetached:()=>false});
+ const top=wrap(main,location),frame=wrap(issuer,address);
+ const events=new Map<string,(value:unknown)=>void|Promise<void>>(),commands:string[]=[],failures:string[]=[];
+ const session={on:(name:string,callback:(value:unknown)=>void)=>events.set(name,callback),send:async(method:string)=>{
+  commands.push(method);
+  if(method==='Page.getFrameTree')return {frameTree:{frame:{id:main._id,url:location}}};
+ }};
+ const page={_connection:connection,driver:impl,mainFrame:()=>top,context:()=>({newCDPSession:async()=>session})};
+ const guard=await guardChallengeRedirects(page as never,code=>failures.push(code),origins,undefined,approved);
+ const connect=(networkId:string,href:string,method:string,documentId?:string,register=true)=>{
+  const driver={frame:()=>issuer,url:()=>href,method:()=>method,_documentId:documentId};
+  const route={request:driver,session:browserSession,_requestId:networkId,_interceptionId:'fetch-'+networkId,_originalRequestRoute:{}};
+  Object.defineProperty(driver,symbol,{value:route});
+  pending.set(networkId,route);
+  const request={_connection:connection,driver,frame:()=>frame,url:()=>href,method:()=>method,isNavigationRequest:()=>!!documentId,
+   resourceType:()=>documentId?'document':'stylesheet',serviceWorker:()=>null,redirectedFrom:()=>null} as never;
+  if(register)guard.registerRoute(request);
+  return request;
+ };
+ const decision=connect('decision',address,mode==='wrong decision method'?'GET':'POST',
+  mode==='wrong source loader'?'retired-loader':loaderId,mode!=='unregistered decision');
+ const stylesheet=connect('stylesheet',url,'GET');
+ const passive={frameId:mode==='foreign frame'?'foreign':frameId,loaderId:mode.startsWith('wrong loader')?'foreign-loader':loaderId,
+  documentURL:address,type:mode==='wrong parser resource'?'Script':'Stylesheet',
+  initiator:{type:mode==='non-parser initiator'?'script':'parser',url:mode==='foreign parser document'?address+'/different':address},
+  request:{url,method:'GET'}};
+ events.get('Network.requestWillBeSent')!({...passive,requestId:'stylesheet'});
+ const generic=mode==='no decision proof requested';
+ const claim=guard.expectIssuerAssetBlock(stylesheet,generic?undefined:decision);
+ if(mode==='foreign frame'||mode==='wrong suffix'){
+  await assert.rejects(claim,/^Error: billing_BROWSER$/);
+  assert.deepEqual(failures,[mode==='foreign frame'?'BROWSER_GUARD_ROUTE_EVENT_FRAME':'BROWSER_GUARD_ROUTE_IDENTITY']);
+  return;
+ }
+ assert.equal(await claim,generic?undefined:mode==='exact source and block'||mode==='http response');
+ const http=mode.endsWith('http response');
+ await events.get('Fetch.requestPaused')!({...passive,networkId:'stylesheet',requestId:'response-stylesheet',
+  ...(http?{responseStatusCode:200}:{responseErrorReason:'BlockedByClient'})});
+ assert.equal(commands.at(-1),'Fetch.failRequest');
+ assert.equal(commands.includes('Fetch.continueResponse'),false);
+ assert.deepEqual(failures,http?['BROWSER_GUARD_RESPONSE_UNCLAIMED']:[]);
+});
+
 for(const [frameId,status,release] of [['checkout-frame',200,true],['wrong-frame',200,false],['checkout-frame',307,false]] as const)
  test('the paused main navigation uses the attached frame identity: '+frameId+' '+status,async()=>{
   const href=origins.demo+'/',events=new Map<string,(e:unknown)=>Promise<void>|void>(),commands:string[]=[];

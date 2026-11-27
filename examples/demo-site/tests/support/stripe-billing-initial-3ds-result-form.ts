@@ -1,4 +1,6 @@
 import {defaultTreeAdapter,parse,parseFragment,type DefaultTreeAdapterTypes} from 'parse5';
+// @ts-ignore Native Node executes the same closed syntax proof as Playwright.
+import {proveIssuerDomForm} from './stripe-billing-initial-3ds-dom-form.ts';
 
 const htmlNamespace='http://www.w3.org/1999/xhtml';
 const controls=new Set(['button','datalist','fieldset','input','object','output','select','textarea']);
@@ -32,7 +34,8 @@ type FormRejection='DUPLICATE_ATTRIBUTE'|'BASE'|'OWNER'|'MISSING'|'MULTIPLE'|'ME
  'EXTERNAL_PARENT'|'EXTERNAL_TAG'|'EXTERNAL_TYPE'|'EXTERNAL_ATTRIBUTES'|'EXTERNAL_TEXT'|'EXTERNAL_URL'|LayoutRejection|CompanionRejection;
 type FormProof={action:string;body:string};
 type ScriptPlacement='head'|'body';
-type ExternalScript={scriptUrl:string;placement:ScriptPlacement};
+type FoldedCompanion=Parameters<typeof proveIssuerDomForm>[1];
+type ExternalScript={scriptUrl:string;placement:ScriptPlacement;foldedCompanion?:FoldedCompanion;blockedStylesheetUrl?:string};
 type ScriptElement={node:Element;text:string;src:string|undefined;classic:boolean;recognizedJsType:boolean};
 type LiteralInsertion={markup:string;method:'write'|'insertAdjacentHTML'};
 type Reporter=(code:string)=>void;
@@ -69,11 +72,26 @@ function reportFormRejection(rejection:FormRejection,report:Reporter|undefined):
 
 /** Prove a form from the exact source of the external script in the decision document. */
 export function externalIssuerResultForm(source:Uint8Array,frameName?:string,report?:Reporter,
- placement:ScriptPlacement='body'):FormProof|undefined{
+ placement:ScriptPlacement='body',foldedCompanion?:FoldedCompanion):FormProof|undefined{
  if(source.byteLength===0||source.byteLength>65536){report?.('BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED');return;}
  let code:string;
  try{code=new TextDecoder('utf-8',{fatal:true}).decode(source);}
  catch{report?.('BROWSER_CHALLENGE_CRES_SCRIPT_UTF8');return;}
+ if(foldedCompanion){
+  // The decoded companion is usable only with its exact DOM producer.
+  // In particular, a literal producer cannot inherit this branch.
+  const proof=placement==='body'?proveIssuerDomForm(code,foldedCompanion):undefined;
+  if(!proof){report?.('BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED_DOM');return;}
+  const action=formAction(proof.action);
+  if(!action)return reportFormRejection('ACTION',report);
+  const fields=new URLSearchParams();
+  for(const [name,value] of proof.fields){
+   const rejection=appendFormField(fields,name,value);
+   if(rejection)return reportFormRejection(rejection,report);
+  }
+  const result=finishForm(action,fields);
+  return typeof result==='string'?reportFormRejection(result,report):result;
+ }
  const insertion=literalInsertion(code);
  if(!insertion){
   report?.(createsForm(code)?'BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED_DOM':'BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED');
@@ -109,18 +127,15 @@ function readForm(document:DefaultTreeAdapterTypes.ParentNode,frameName:string|u
     if(attribute(node,'method')?.toLowerCase()!=='post')return 'METHOD';
     if(target&&target.toLowerCase()!=='_self'&&(target.startsWith('_')||target!==frameName))return 'TARGET';
     if(encoding.toLowerCase()!=='application/x-www-form-urlencoded')return 'ENCODING';
-    if(!destination||!URL.canParse(destination))return 'ACTION';
-    const url=new URL(destination);
-    if(url.origin!=='https://hooks.stripe.com'||url.href!==destination||url.username||url.password||url.href.includes('#')||url.pathname==='/')return 'ACTION';
-    action=destination;
+    const provedAction=formAction(destination);
+    if(!provedAction)return 'ACTION';
+    action=provedAction;
     inside=true;
    }else if(inside&&controls.has(node.tagName)){
     const name=attribute(node,'name'),value=attribute(node,'value');
     if(node.tagName!=='input'||attribute(node,'type')?.toLowerCase()!=='hidden'||attribute(node,'disabled')!==undefined)return 'CONTROL';
-    if(name!=='cres'&&name!=='threeDSSessionData')return 'FIELD';
-    if(fields.has(name))return 'DUPLICATE_FIELD';
-    if(name==='cres'&&!value)return 'REQUIRED_CRES';
-    fields.append(name,(value??'').replace(/\r\n|[\r\n]/g,'\r\n'));
+    const rejection=appendFormField(fields,name,value??'');
+    if(rejection)return rejection;
    }
    if(node.tagName==='datalist'||(node.tagName==='fieldset'&&attribute(node,'disabled')!==undefined))excludesControls=true;
   }
@@ -129,6 +144,24 @@ function readForm(document:DefaultTreeAdapterTypes.ParentNode,frameName:string|u
   }
  }
  if(!action)return 'MISSING';
+ return finishForm(action,fields);
+}
+
+function formAction(destination:string|undefined):string|undefined{
+ if(!destination||!URL.canParse(destination))return;
+ const url=new URL(destination);
+ if(url.origin==='https://hooks.stripe.com'&&url.href===destination&&!url.username&&!url.password&&
+    !url.href.includes('#')&&url.pathname!=='/')return destination;
+}
+
+function appendFormField(fields:URLSearchParams,name:string|undefined,value:string):FormRejection|undefined{
+ if(name!=='cres'&&name!=='threeDSSessionData')return 'FIELD';
+ if(fields.has(name))return 'DUPLICATE_FIELD';
+ if(name==='cres'&&!value)return 'REQUIRED_CRES';
+ fields.append(name,value.replace(/\r\n|[\r\n]/g,'\r\n'));
+}
+
+function finishForm(action:string,fields:URLSearchParams):FormProof|FormRejection{
  if(!fields.has('cres'))return 'REQUIRED_CRES';
  const body=fields.toString();
  if(body.length>32768)return 'SIZE';
@@ -149,7 +182,7 @@ function literalInsertion(source:string):LiteralInsertion|undefined{
  catch{/* Expressions and other JavaScript string syntax are outside this subset. */}
 }
 
-function canonicalScriptUrl(src:string,documentUrl:string):string|undefined{
+function canonicalIssuerAssetUrl(src:string,documentUrl:string,matchesPath:(path:string)=>boolean):string|undefined{
  if(!URL.canParse(documentUrl))return;
  const document=new URL(documentUrl);
  if(document.protocol!=='https:'||document.href!==documentUrl||document.username||document.password||documentUrl.includes('#'))return;
@@ -157,9 +190,18 @@ function canonicalScriptUrl(src:string,documentUrl:string):string|undefined{
  if(src.startsWith(document.origin+'/'))path=src.slice(document.origin.length);
  else if(src.startsWith('./'))path=src.slice(1);
  else if(!src.startsWith('/'))path='/'+src;
- if(!isIssuerScriptPath(path))return;
- const script=new URL(src,document);
- if(script.origin===document.origin&&script.href===script.origin+script.pathname&&isIssuerScriptPath(script.pathname))return script.href;
+ if(!matchesPath(path))return;
+ const asset=new URL(src,document);
+ if(asset.origin===document.origin&&asset.href===asset.origin+asset.pathname&&matchesPath(asset.pathname))return asset.href;
+}
+
+/** A single head link can be accounted for by a separate browser block receipt. */
+function headStylesheetUrl(element:Element,documentUrl:string):string|undefined{
+ const parent=element.parentNode,href=attribute(element,'href');
+ if(element.namespaceURI!==htmlNamespace||element.tagName!=='link'||parent?.nodeName!=='head'||
+    !element.sourceCodeLocation?.startTag||!parent.sourceCodeLocation?.startTag||
+    element.attrs.length!==3||attribute(element,'rel')!=='stylesheet'||attribute(element,'type')!=='text/css'||!href)return;
+ return canonicalIssuerAssetUrl(href,documentUrl,path=>/^\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.css$/.test(path));
 }
 
 function documentElementRejection(element:Element):LayoutRejection|undefined{
@@ -223,6 +265,43 @@ function canonicalBaseSixtyFour(value:string):Buffer|undefined{
  const standard=bytes.toString('base64');
  const paddedUrlSafe=standard.replace(/\+/g,'-').replace(/\//g,'_');
  if(value===standard||value===paddedUrlSafe||value===bytes.toString('base64url'))return bytes;
+}
+
+function jsonRecord(value:unknown):value is Record<string,unknown>{
+ return value!==null&&typeof value==='object'&&!Array.isArray(value);
+}
+
+function foldedIssuerCompanion(companion:ScriptElement,external:ScriptElement):FoldedCompanion|undefined{
+ const id=attribute(companion.node,'id'),dataLocation=companion.node.sourceCodeLocation;
+ const scriptLocation=external.node.sourceCodeLocation;
+ if(!id||!/^[A-Za-z][A-Za-z0-9_-]{0,127}$/.test(id)||!dataLocation||!scriptLocation||
+    companion.node.parentNode!==external.node.parentNode||external.node.parentNode?.nodeName!=='body'||
+    dataLocation.endOffset>scriptLocation.startOffset)return;
+ const text=companion.text;
+ if(text.length>65536||!/[\r\n]/.test(text))return;
+ const compact=text.replace(/[ \t\r\n]/g,'');
+ const bytes=canonicalBaseSixtyFour(compact);
+ // atob uses the standard alphabet and produces byte-valued characters.
+ if(!bytes||compact!==bytes.toString('base64')||bytes.some(byte=>byte>0x7f))return;
+ let parsed:unknown;
+ try{parsed=JSON.parse(bytes.toString('ascii'));}
+ catch{return;}
+ if(!jsonRecord(parsed))return;
+ const entries=Object.entries(parsed);
+ if(entries.length!==2)return;
+ const [actionEntry,fieldsEntry]=typeof entries[0]![1]==='string'?entries:[...entries].reverse();
+ const [actionKey,destination]=actionEntry!,[fieldsKey,controls]=fieldsEntry!;
+ if([actionKey,fieldsKey].some(key=>!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(key)||
+    key==='__proto__'||key==='constructor'||key==='prototype'))return;
+ const action=typeof destination==='string'?formAction(destination):undefined;
+ if(!action||!jsonRecord(controls))return;
+ const fields:[string,string][]=[],wire=new URLSearchParams();
+ for(const [name,value] of Object.entries(controls)){
+  if(typeof value!=='string'||value.includes('\0')||appendFormField(wire,name,value))return;
+  fields.push([name,value]);
+ }
+ if(typeof finishForm(action,wire)==='string')return;
+ return {id,actionKey,fieldsKey,action,fields};
 }
 
 function baseSixtyFourEvidence(bytes:Buffer):BaseSixtyFourEvidence{
@@ -412,7 +491,7 @@ function externalScriptReference(external:ScriptElement,src:string,documentUrl:s
  if(!supportedScriptAttributes(external.node))return 'EXTERNAL_ATTRIBUTES';
  if(!htmlWhitespace(external.text))return 'EXTERNAL_TEXT';
  if(layout)return layout;
- const scriptUrl=canonicalScriptUrl(src,documentUrl);
+ const scriptUrl=canonicalIssuerAssetUrl(src,documentUrl,isIssuerScriptPath);
  return scriptUrl?{scriptUrl,placement}:'EXTERNAL_URL';
 }
 
@@ -422,6 +501,7 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
  const pending:DefaultTreeAdapterTypes.Node[]=[document];
  const scripts:ScriptElement[]=[];
  let layout:LayoutRejection|undefined;
+ let blockedStylesheetUrl:string|undefined,foldedLayoutUnproved=false;
  while(pending.length){
   const node=pending.pop()!;
   if(defaultTreeAdapter.isElementNode(node)){
@@ -442,9 +522,20 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
      else if(/\b(?:document\s*\.\s*write(?:ln)?|insertAdjacentHTML|innerHTML)\b/.test(text))shapes.add('MISSING_INLINE_MARKUP');
      else shapes.add('MISSING_INLINE');
     }
-   }else layout??=documentElementRejection(node);
+   }else{
+    const rejection=documentElementRejection(node);
+    if(rejection){
+     layout??=rejection;
+     const stylesheet=!blockedStylesheetUrl&&documentUrl?headStylesheetUrl(node,documentUrl):undefined;
+     if(stylesheet)blockedStylesheetUrl=stylesheet;
+     else foldedLayoutUnproved=true;
+    }
+   }
   }else if(defaultTreeAdapter.isTextNode(node)&&!whitespaceNode(node)&&
-           !['script','title'].includes(node.parentNode?.nodeName??''))layout??='EXTERNAL_LAYOUT_TEXT';
+           !['script','title'].includes(node.parentNode?.nodeName??'')){
+   layout??='EXTERNAL_LAYOUT_TEXT';
+   foldedLayoutUnproved=true;
+  }
   if('childNodes' in node)for(const child of node.childNodes)pending.push(child);
  }
  const external=scripts.find(script=>script.src!==undefined);
@@ -452,6 +543,14 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
   const companions=scripts.filter(script=>script!==external);
   if(companions.some(script=>script.src!==undefined))return 'EXTERNAL_COUNT_MULTIPLE_SOURCES';
   if(companions.some(script=>script.recognizedJsType))return 'EXTERNAL_COUNT_RECOGNIZED_JS_COMPANION';
+  const onlyCompanion=companions.length===1?companions[0]:undefined;
+  if(!foldedLayoutUnproved&&onlyCompanion&&!companionStructureRejection(onlyCompanion)){
+   const reference=externalScriptReference(external,external.src,documentUrl,undefined);
+   if(typeof reference!=='string'&&reference.placement==='body'){
+    const foldedCompanion=foldedIssuerCompanion(onlyCompanion,external);
+    if(foldedCompanion)return {...reference,foldedCompanion,...(blockedStylesheetUrl?{blockedStylesheetUrl}:{})};
+   }
+  }
   // Report the first rejected companion in the reverse parsed traversal above.
   for(const companion of companions){
    const rejection=companionRejection(companion);

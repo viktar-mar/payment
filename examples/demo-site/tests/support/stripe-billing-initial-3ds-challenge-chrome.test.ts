@@ -13,6 +13,8 @@ import {initial3dsChallenge} from './stripe-billing-initial-3ds.ts';
 import {guardChallengeRedirects} from './stripe-billing-initial-3ds-redirect.ts';
 // @ts-ignore Native Node executes the same private writer as the dedicated worker.
 import {prepareIssuerReplayCapture} from './stripe-billing-initial-3ds-replay-capture.ts';
+// @ts-ignore Native Node executes the same fixture as the result-form tests.
+import {syntheticIssuerDomForm} from './stripe-billing-initial-3ds-dom-fixture.ts';
 import type {IssuerReplayCapture} from './stripe-billing-initial-3ds';
 import type {IssuerReplayStatus} from './stripe-billing-initial-3ds-terminal';
 
@@ -90,6 +92,16 @@ const externalWithAssignmentCompanion='a CRes form written by an external script
 const externalWithLabelledCompanion='a CRes form written by an external script beside a labelled JSON suffix';
 const externalWithStrictCompanion='a CRes form written by an external script beside the strict JSON control';
 const externalWithFoldedCompanion='a CRes form written by an external script beside folded Base64 JSON';
+const foldedDom='a folded Base64 companion and its dynamic CRes form';
+const foldedDomHeadStylesheet='a folded dynamic CRes form with a blocked head stylesheet';
+const foldedDomWrongStylesheetReceipt='a folded dynamic CRes form with a different head stylesheet receipt';
+const staticWithScriptStylesheet='a static CRes form with a blocked script-initiated stylesheet';
+const foldedDomExtraScript='a folded dynamic CRes form with an extra script statement';
+const foldedDomWireMismatch='a folded dynamic CRes form with different expected POST bytes';
+const foldedDomLegacyEncoding='a folded dynamic CRes form with legacy document encoding';
+const foldedDomWrongTransaction='a folded dynamic CRes form for a different 3DS transaction';
+const foldedDomCases=new Set([foldedDom,foldedDomHeadStylesheet,foldedDomWrongStylesheetReceipt,
+ foldedDomExtraScript,foldedDomWireMismatch,foldedDomLegacyEncoding,foldedDomWrongTransaction]);
 const captureFoldedCompanion='a CRes refusal with opt-in to its anonymized paired fixture';
 const captureMaskedLayout='a CRes refusal with opt-in and an outer language attribute';
 const captureMissingDecision='a CRes refusal with opt-in and no CDP decision receipt';
@@ -139,13 +151,18 @@ const refusedFollowups=new Map([
  [externalWithAssignmentCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_ASSIGN_JSON'],
  [externalWithLabelledCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_SHAPE_AJNSA'],
  [externalWithFoldedCompanion,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON'],
+ [foldedDomExtraScript,'BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED_DOM'],
+ [foldedDomWrongStylesheetReceipt,'BROWSER_CHALLENGE_CRES_HEAD_STYLESHEET_BLOCK'],
+ [foldedDomWireMismatch,'BROWSER_CHALLENGE_CRES_BODY'],
+ [foldedDomLegacyEncoding,'BROWSER_CHALLENGE_CRES_BODY'],
+ [foldedDomWrongTransaction,'BROWSER_CHALLENGE_ISSUER_SUBMISSION_FOLLOWUP'],
  ...[...captureOutcomes.keys()].map(mode=>[mode,'BROWSER_CHALLENGE_CRES_FORM_EXTERNAL_COMPANION_JSON_TEXT_FOLD_JSON'] as const),
  [issuerCresDestination,'BROWSER_CHALLENGE_CRES_DESTINATION'],
  [oversizedDecision,'BROWSER_CHALLENGE_CRES_DECISION_SIZE'],
  [invalidUtf8Decision,'BROWSER_CHALLENGE_CRES_DECISION_UTF8'],
 ]);
 const wrongScriptMime='issuer script with the wrong MIME type is refused';
-for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,namedDecisionCres,literalDecisionCres,insertionDecisionCres,externalLiteral,externalGzip,externalHead,externalHeadWithData,externalHeadWithCompanionId,externalWithCompanionId,externalWithStrictCompanion,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
+for(const mode of new Set(['normal observation','late Playwright response','separate issuer process','late issuer response','direct Stripe EMVCo frame','direct reviewed issuer origin','direct reviewed issuer passive image blocked','direct reviewed issuer passive font blocked',twoFonts,sixFonts,stylesheetBlock,parserScript,decisionScript,decisionCres,isolatedDecisionCres,namedDecisionCres,literalDecisionCres,insertionDecisionCres,externalLiteral,externalGzip,externalHead,externalHeadWithData,externalHeadWithCompanionId,externalWithCompanionId,externalWithStrictCompanion,foldedDom,foldedDomHeadStylesheet,staticWithScriptStylesheet,...compressedDecisions.keys(),lateDecisionCres,lateDecisionHeaders,uncapturedDecision,wrongScriptMime,...refusedFollowups.keys(),...rejectedAssets.keys()]))
 test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?mode+' is blocked after the original 2xx':mode===wrongScriptMime?mode:
  'an issuer iframe completes the exact challenge with '+mode, {timeout:35_000},async()=>{
  const demo='http://127.0.0.1:18081',backend='http://127.0.0.1:18080',stripe='https://js.stripe.com';
@@ -167,12 +184,15 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const missingDecisionReceipt=mode===uncapturedDecision||mode===captureMissingDecision;
  const foldedCompanion=mode===externalWithFoldedCompanion||captureEnabled;
  const companionReplay=mode===externalWithStrictCompanion||foldedCompanion;
+ const hasFoldedDom=foldedDomCases.has(mode);
+ const legacyStylesheet=mode===staticWithScriptStylesheet;
+ const hasDecisionStylesheet=mode===foldedDomHeadStylesheet||mode===foldedDomWrongStylesheetReceipt||legacyStylesheet;
  const externalForm=[externalLiteral,externalGzip,externalHead,externalHeadWithData,externalWithExecutable,
   externalHeadWithCompanionId,externalWithCompanionId,externalWithInvalidCompanion,externalWithCommentCompanion,
   externalWithAssignmentCompanion,externalWithLabelledCompanion,
-  externalNested,externalUnknown,externalMismatch,externalNoReceipt,externalInvalidUtf8].includes(mode)||companionReplay;
+  externalNested,externalUnknown,externalMismatch,externalNoReceipt,externalInvalidUtf8].includes(mode)||companionReplay||hasFoldedDom;
  const submitsCres=Boolean(compressed)||[decisionCres,isolatedDecisionCres,namedDecisionCres,lateDecisionCres,lateDecisionHeaders,uncapturedDecision,
-  changedCresAction,changedCresBody,unsupportedCresForm,issuerCresDestination].includes(mode)||literalForm||dynamicForm||externalForm;
+  changedCresAction,changedCresBody,unsupportedCresForm,issuerCresDestination,staticWithScriptStylesheet].includes(mode)||literalForm||dynamicForm||externalForm;
  const isolated=mode===isolatedDecisionCres||namedForm||literalForm||dynamicForm||
   (externalForm&&!missingDecisionReceipt)||compressed||mode===lateDecisionHeaders||mode==='separate issuer process';
  const submitsSecondDecision=mode===secondDecisionPost||submitsCres;
@@ -185,19 +205,25 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const assetPath=issuerOrigin+(rejectedAsset?.path??(loadsScript?'/fixture-required.js':blocksPassiveStylesheet?'/fixture-passive.css':
   blocksPassiveFont?'/fixture-passive.woff2':'/fixture-passive.png'));
  const decisionAsset=issuerOrigin+'/fixture-decision.js';
+ const decisionStylesheetPath='/fixture-decision.css',decisionStylesheet=issuerOrigin+decisionStylesheetPath;
  const followup=(submitsCres&&mode!==issuerCresDestination?'https://hooks.stripe.com':issuerOrigin)+'/fixture-followup';
  const observedFollowup=mode===changedCresAction?followup+'-different':followup;
  const fontCount=mode===sixFonts?6:mode===twoFonts?2:1;
  const assetUrls=[assetPath,...Array.from({length:fontCount-1},(_,index)=>issuerOrigin+`/fixture-passive-${index+2}.woff2`)];
+ const isDecisionStylesheet=(url:string)=>hasDecisionStylesheet&&url===decisionStylesheet;
  const server='11111111-2222-4333-8444-555555555555',acs='11111111-2222-4333-8444-555555555554';
  const creq=Buffer.from(JSON.stringify({messageType:'CReq',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs})).toString('base64url');
  // Model the documented callback in the paired cases using synthetic transaction IDs.
  // https://docs.3dsecure.io/3dsv2/challenge_flow.html#receiving-challenge-results
- const resultMessage={messageType:'CRes',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,transStatus:'Y'};
+ const resultMessage={messageType:'CRes',messageVersion:'2.2.0',threeDSServerTransID:server,
+  acsTransID:mode===foldedDomWrongTransaction?'11111111-2222-4333-8444-555555555553':acs,transStatus:'Y'};
  const cresBytes=Buffer.from(JSON.stringify(companionReplay?{...resultMessage,challengeCompletionInd:'Y'}:resultMessage));
  const encodedCres=cresBytes.toString('base64url');
  const cres=companionReplay?encodedCres.padEnd(Math.ceil(encodedCres.length/4)*4,'='):encodedCres;
  const replayWire=Buffer.from(`cres=${encodeURIComponent(cres)}&threeDSSessionData=fixture%26session`);
+ const domFixture=hasFoldedDom?syntheticIssuerDomForm(followup,{threeDSSessionData:'é + &\nline',cres}):undefined;
+ const domAccent=mode===foldedDomLegacyEncoding?'%E9':'%C3%A9';
+ const domWire=Buffer.from(`threeDSSessionData=${domAccent}+%2B+%26%0D%0Aline&cres=${encodeURIComponent(cres)}`);
  const sessionValue=namedForm?'':' value="fixture&amp;session"';
  const followupFields=submitsCres?`<input type="${mode===unsupportedCresForm?'text':'hidden'}" name="cres" value="${cres}"><input type="hidden" name="threeDSSessionData"${sessionValue}>`:
   '<input name="result" value="fixture">';
@@ -206,6 +232,12 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   mode===changedCresBody?'document.forms[0].elements.namedItem("threeDSSessionData").value="different"':'',
   'document.forms[0].submit()',
  ].filter(Boolean).join(';');
+ const staticSubmit=legacyStylesheet?`
+  const stylesheet=document.createElement('link');
+  stylesheet.rel='stylesheet';stylesheet.type='text/css';stylesheet.href=${JSON.stringify(decisionStylesheetPath)};
+  stylesheet.addEventListener('error',()=>document.forms[0].submit(),{once:true});
+  document.head.append(stylesheet);
+ `:followupScript;
  const script=`(async()=>{
   await (await fetch(${JSON.stringify(retrieve)})).json();
   await (await fetch(${JSON.stringify(authenticate)},{method:'POST',body:new URLSearchParams({source:${JSON.stringify(source)},key:${JSON.stringify(key)}})})).json();
@@ -255,7 +287,9 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const companionJson='{"fixture":true}';
  const replayCompanion=foldedCompanion?
   Buffer.from(companionJson).toString('base64').replace(/^.{5}/,'$&\n'):companionJson;
- const externalDocument=mode===externalHead?`<!doctype html><head>${externalTag}</head><body></body>`:
+ const decisionHead=hasDecisionStylesheet?`<head><link rel="stylesheet" href="${decisionStylesheetPath}" type="text/css"></head>`:'';
+ const externalDocument=domFixture?`<!doctype html>${decisionHead}<body>${jsonWithId(domFixture.id,domFixture.folded)}${externalTag}</body>`:
+  mode===externalHead?`<!doctype html><head>${externalTag}</head><body></body>`:
   mode===externalHeadWithData?`<!doctype html><head><script type="application/json">{"fixture":true}</script>${externalTag}</head><body></body>`:
   mode===externalHeadWithCompanionId?`<!doctype html><head>${jsonWithId('document')}${jsonWithId('write')}${externalTag}</head><body></body>`:
   mode===externalWithExecutable?`<!doctype html><body><script>void 0;</script>${externalTag}</body>`:
@@ -271,7 +305,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  let decisionHtml=submitsSecondDecision?
   externalForm?externalDocument:
   literalForm?inlineDecision(literalSource):dynamicForm?inlineDecision(dynamicSource):
-  `<!doctype html>${followupForm}<script>${followupScript}</script>`:
+  `<!doctype html>${followupForm}<script>${staticSubmit}</script>`:
   loadsDecisionScript?`<!doctype html><script src="${decisionAsset}"></script>`:
   '<!doctype html><script>'+issuerDecision+'</script>';
  if(compressed)decisionHtml='\uFEFF'+decisionHtml+'<!-- Résultat -->';
@@ -291,7 +325,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   [authenticate,json({state:'challenge_required',
    ares:{messageType:'ARes',transStatus:'C',messageVersion:'2.2.0',threeDSServerTransID:server,acsTransID:acs,acsURL:issuer}})],
   [issuer,{contentType:'text/html',body:issuerBody}],
-  [decision,{contentType:'text/html',body:decisionHtml}],
+  [decision,{contentType:hasFoldedDom&&mode!==foldedDomLegacyEncoding?'text/html; charset=utf-8':'text/html',body:decisionHtml}],
   [complete,json({complete:true})],
  ]);
  if(rejectedAsset)responses.set(assetPath,{contentType:rejectedAsset.contentType,body:rejectedAsset.body});
@@ -304,7 +338,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
  const externalBytes=mode===externalInvalidUtf8?Buffer.concat([
   Buffer.from(literalSource.slice(0,invalidMarker)),Buffer.from([0xf0,0x90,0x80]),
   Buffer.from(literalSource.slice(invalidMarker+'fixture'.length)),
- ]):Buffer.from(mode===externalUnknown?dynamicSource:literalSource);
+ ]):Buffer.from(domFixture?domFixture.script+(mode===foldedDomExtraScript?'void 0;':''):mode===externalUnknown?dynamicSource:literalSource);
  const networkUrl=externalForm?decisionAsset:decision;
  const networkFixture=externalForm?await serveIssuerResponse(new URL(networkUrl),
   mode===externalGzip?gzipSync(externalBytes):externalBytes,mode===externalGzip?'gzip':'identity',mode===externalGzip,true):
@@ -322,7 +356,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   const page=await context.newPage(),forwarded:string[]=[],refusals:string[]=[];
   const passiveRequests:Request[]=[],passiveFailures:Request[]=[],passiveResponses:Response[]=[];
   const passiveAborts:(string|undefined)[]=[],authorized:string[]=[];
-  page.on('requestfailed',request=>{if(assetUrls.includes(request.url()))passiveFailures.push(request);});
+  page.on('requestfailed',request=>{if(assetUrls.includes(request.url())||isDecisionStylesheet(request.url()))passiveFailures.push(request);});
   let lateHeadersObserved=false,decisionBodyCaptured=false,scriptBodyCaptured=false,scriptBodyRequested=false;
   let abortConfirmed=false,captureCalls=0;
   let captureAfterAbort=false,capturedSource:CaptureSource|undefined;
@@ -338,7 +372,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   }
   const captureDone=Promise.withResolvers<void>();
   page.on('response',response=>{
-   if(assetUrls.includes(response.url()))passiveResponses.push(response);
+   if(assetUrls.includes(response.url())||isDecisionStylesheet(response.url()))passiveResponses.push(response);
    if(mode===lateDecisionHeaders&&response.url()===decision){
     lateHeadersObserved=true;
     response.headerValue=()=>new Promise<never>(()=>{});
@@ -347,9 +381,18 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   const limits={deadline:Date.now()+15_000,signal:stop.signal};
   let assetErrorRedacted=false;
   let issuerFrame:Frame|undefined,attachedIssuerFrame=false,separateIssuerTarget=false,gestures=0;
+  let claimedStylesheetDocument:Request|undefined,observedDecision:Request|undefined;
+  let stylesheetParserProved=false;
   const guard=await guardChallengeRedirects(page,reason=>refusals.push(reason),{demo,backend},stop.signal,approvedIssuerOrigin,true);
   const challenge=initial3dsChallenge({page,limits,demo,owner:()=>({key,secret}),winning:async()=>{},check:async()=>{},
-   expectIssuerAssetBlock:request=>guard.expectIssuerAssetBlock(request),
+   expectIssuerAssetBlock:async(request,document)=>{
+    const proof=await guard.expectIssuerAssetBlock(request,document);
+    if(isDecisionStylesheet(request.url())){
+     claimedStylesheetDocument=document;
+     stylesheetParserProved=proof===true;
+    }
+    return proof;
+   },
    authorizeIssuerScript:async(request,document,capture)=>{
     await guard.authorizeIssuerScript(request,document,capture);
     if(externalForm)authorized.push(request.url());
@@ -370,6 +413,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
     });
    },
    authorizeIssuerDecision:async request=>{
+    observedDecision=request;
     authorized.push(request.url());
     if(missingDecisionReceipt)await guard.authorize(request);
     else{
@@ -383,6 +427,13 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
      if(compressed)assert.equal(Buffer.from(bytes).equals(decisionBytes),true);
      decisionBodyCaptured=true;
      if(mode===literalBodyMismatch)return Buffer.from(decisionHtml.replace('fixture&amp;session','server&amp;session'));
+     if(mode===foldedDomWrongStylesheetReceipt){
+      return Buffer.from(decisionHtml.replace(decisionStylesheetPath,'/other-fixture-decision.css'));
+     }
+     if(mode===foldedDomWireMismatch&&domFixture){
+      const different=syntheticIssuerDomForm(followup,{threeDSSessionData:'different',cres});
+      return Buffer.from(decisionHtml.replace(domFixture.folded,different.folded));
+     }
     }
     return bytes;
    },
@@ -392,6 +443,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
      assert.deepEqual(request.postDataBuffer(),Buffer.from(`cres=${cres}&threeDSSessionData=`));
     }
     if(companionReplay)assert.deepEqual(request.postDataBuffer(),replayWire);
+    if(hasFoldedDom)assert.deepEqual(request.postDataBuffer(),domWire);
     authorized.push(request.url());
     await guard.authorizeIssuerResult(request,document);
    },
@@ -433,9 +485,24 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
     }
    },
   });
+  function assertDecisionStylesheetBlocked(){
+   if(!hasDecisionStylesheet)return;
+   assert.ok(observedDecision);
+   assert.equal(claimedStylesheetDocument,observedDecision);
+   assert.equal(stylesheetParserProved,!legacyStylesheet);
+   assert.equal(passiveRequests.length,1);
+   const [stylesheet]=passiveRequests;
+   assert.equal(stylesheet?.url(),decisionStylesheet);
+   assert.equal(stylesheet?.resourceType(),'stylesheet');
+   assert.equal(stylesheet?.frame(),issuerFrame);
+   assert.equal(stylesheet?.existingResponse(),null);
+   assert.deepEqual(passiveFailures,passiveRequests);
+   assert.deepEqual(passiveAborts,['blockedbyclient']);
+   assert.deepEqual(passiveResponses,[]);
+  }
   await context.route('**/*',async route=>{
    const request=route.request(),url=request.url(),response=responses.get(url);
-   const isPassiveAsset=blocksPassiveAsset&&assetUrls.includes(url);
+   const isPassiveAsset=blocksPassiveAsset&&assetUrls.includes(url)||isDecisionStylesheet(url);
    const isRejectedAsset=rejectedAsset&&url===assetPath;
    if(!response&&!isPassiveAsset){await route.abort('blockedbyclient');return;}
    guard.registerRoute(request);
@@ -542,6 +609,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
    assert.equal(request.method(),'POST');
    assert.equal(request.isNavigationRequest(),true);
    assert.equal(request.existingResponse(),null);
+   if(hasFoldedDom)assert.deepEqual(request.postDataBuffer(),domWire);
    // Chromium can return invalid source as exact bytes or lossy decoded text.
    assert.equal(refusals[0],mode===externalInvalidUtf8&&scriptBodyCaptured?
     'BROWSER_CHALLENGE_CRES_SCRIPT_UTF8':refusedFollowups.get(mode));
@@ -566,14 +634,16 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
      assert.doesNotMatch(artifact,/reviewed-test-issuer|stripe-challenge-frame|fixture-decision\.js/);
     }else if(captureFile)assert.throws(()=>lstatSync(captureFile),{code:'ENOENT'});
    }
-   if(submitsCres&&mode!==issuerCresDestination)assert.equal(decisionBodyCaptured,mode!==oversizedDecision&&!missingDecisionReceipt);
+   if(submitsCres&&mode!==issuerCresDestination)assert.equal(decisionBodyCaptured,
+    mode!==oversizedDecision&&mode!==foldedDomWrongTransaction&&!missingDecisionReceipt);
    if(networkFixture)assert.equal(networkFixture.requests(),1);
    if(externalForm&&mode!==externalInvalidUtf8)assert.equal(scriptBodyCaptured,
     ![externalNoReceipt,externalNested,externalWithExecutable,externalWithInvalidCompanion,externalWithCommentCompanion,
      externalWithAssignmentCompanion,externalWithLabelledCompanion,externalWithFoldedCompanion,
-     captureMissingDecision,captureMissingReceipt,captureAbortFailure].includes(mode));
+     captureMissingDecision,captureMissingReceipt,captureAbortFailure,foldedDomWrongTransaction,foldedDomWrongStylesheetReceipt].includes(mode));
    assert.deepEqual(forwarded,[retrieve,authenticate,issuer,decision,...(externalForm?[decisionAsset]:[])]);
    assert.deepEqual(authorized,forwarded);
+   assertDecisionStylesheetBlocked();
    assert.equal(gestures,1);
    return;
   }
@@ -607,6 +677,7 @@ test(rejectedAssets.has(mode)?mode+' before handoff':refusedFollowups.has(mode)?
   assert.deepEqual(forwarded,[retrieve,authenticate,issuer,...(loadsScript?[assetPath]:[]),decision,
    ...(loadsDecisionScript||externalForm?[decisionAsset]:[]),...(submitsCres?[followup]:[]),complete,retrieve]);
   if(submitsCres)assert.deepEqual(authorized,forwarded);
+  assertDecisionStylesheetBlocked();
   assert.equal(gestures,1);
   if(blocksPassiveAsset){
    assert.deepEqual(passiveRequests.map(asset=>asset.url()).sort(),[...assetUrls].sort());
