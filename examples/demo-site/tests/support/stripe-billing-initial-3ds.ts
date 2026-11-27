@@ -4,7 +4,7 @@ import type {BillingLimits} from '../../../../infrastructure/stripe-billing-acce
 import type {RefusedIssuerRelation} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
 // @ts-ignore Native Node executes the same inert parser as Playwright.
-import {issuerResultForm} from './stripe-billing-initial-3ds-result-form.ts';
+import {externalIssuerResultForm,isIssuerScriptPath,issuerResultForm} from './stripe-billing-initial-3ds-result-form.ts';
 import type {IssuerDecisionBody} from './stripe-billing-initial-3ds-decision-body.ts';
 
 function requireValue(value:unknown):asserts value {if(!value)throw Error('billing_BROWSER');}
@@ -17,9 +17,7 @@ const directIssuerFrame='stripe-challenge-frame';
 const reservedStripeHosts=new Set(['api','hooks','js','m','r','merchant-ui-api']);
 const issuerAssetBlockLimit=6;
 const issuerScriptLimit=6;
-export function isIssuerScriptPath(pathname:string):boolean{
- return /^\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.js$/.test(pathname);
-}
+export {isIssuerScriptPath};
 export function issuerAssetSuffixMatches(kind:string,pathname:string):boolean{
  if(kind==='image')return /\.(?:png|jpe?g|gif|webp|ico)$/.test(pathname);
  if(kind==='font')return /\.woff2?$/.test(pathname);
@@ -138,7 +136,8 @@ type Options={
  page:Page;limits:BillingLimits;demo:string;owner:()=>{secret:string;key:string};
  winning:()=>Promise<void>;authorizeResponse:(req:Request)=>Promise<void>;check:()=>Promise<void>;
  expectIssuerAssetBlock:(req:Request)=>Promise<void>;
- authorizeIssuerScript?:(req:Request,document:Request)=>Promise<void>;
+ authorizeIssuerScript?:(req:Request,document:Request,capture:boolean)=>Promise<void>;
+ takeIssuerScriptBody?:(req:Request,document:Request)=>Promise<IssuerDecisionBody>|undefined;
  authorizeIssuerDecision?:(req:Request)=>Promise<void>;
  takeIssuerDecisionBody?:(req:Request)=>IssuerDecisionBody|undefined|Promise<IssuerDecisionBody|undefined>;
  authorizeIssuerResult?:(req:Request,document:Request)=>Promise<void>;
@@ -150,7 +149,7 @@ function sameChain(a:FrameSnapshot|undefined,b:FrameSnapshot|undefined){
 }
 
 /** Scoped to one original v2 session. Only Stripe.js sends requests and only the issuer UI completes the challenge. */
-export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,authorizeIssuerScript,authorizeIssuerDecision,takeIssuerDecisionBody,authorizeIssuerResult,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
+export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeResponse,expectIssuerAssetBlock,authorizeIssuerScript,takeIssuerScriptBody,authorizeIssuerDecision,takeIssuerDecisionBody,authorizeIssuerResult,check,stripeFrames,waitForGesture,approvedIssuerOrigin}:Options){
  requireValue(approvedIssuerOrigin===undefined||isApprovedIssuerOrigin(approvedIssuerOrigin));
  let retrieve:Request|undefined,authenticate:Request|undefined,admittedAuthenticate:Request|undefined;
  let completed=false,finalRead=false,initialIssuerDispatched=false,boundSource:string|undefined;
@@ -159,7 +158,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
  let arm:{document:FrameSnapshot;action:string;bodyHash:string;gesture:Promise<void>}|undefined;
  let handoffStarted=false;
  const issuerAssets=()=>({
-  blocks:new Map<string,Promise<void>>(),scripts:new Map<string,Promise<void>>(),deadline:undefined as number|undefined,
+  blocks:new Map<string,Promise<void>>(),scripts:new Map<string,{request:Request;forwarded:Promise<void>}>(),deadline:undefined as number|undefined,
  });
  const challengeAssets=issuerAssets(),decisionAssets=issuerAssets();
  const passiveFailures=new Map<Request,()=>void>();
@@ -248,6 +247,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
     report(bytes);
     requireValue(false);
    }
+   const capturedDecision=bytes!==undefined;
    if(!bytes){
     report('BROWSER_CHALLENGE_CRES_DECISION_HEADERS');
     const [type,encoding]=await Promise.all([response.headerValue('content-type'),response.headerValue('content-encoding')]);
@@ -269,8 +269,23 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
    report('BROWSER_CHALLENGE_CRES_DECISION_UTF8');
    const html=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
    report('BROWSER_CHALLENGE_CRES_FORM_PARSE');
-   const form=issuerResultForm(html,frameName,report);
-   requireValue(form);
+   const source=issuerResultForm(html,frameName,report,request.url());
+   requireValue(source);
+   let form;
+   if('scriptUrl' in source){
+    report('BROWSER_CHALLENGE_CRES_SCRIPT_RECEIPT');
+    const script=decisionAssets.scripts.get(new URL(source.scriptUrl).pathname);
+    requireValue(capturedDecision&&decisionAssets.scripts.size===1&&script?.request.url()===source.scriptUrl);
+    const pendingBody=takeIssuerScriptBody?.(script.request,request);
+    requireValue(pendingBody);
+    report('BROWSER_CHALLENGE_CRES_SCRIPT_READ');
+    const [scriptBody]=await Promise.all([pendingBody,script.forwarded]);
+    billingCheck(active);
+    if(scriptBody==='BROWSER_CHALLENGE_CRES_DECISION_SIZE')report('BROWSER_CHALLENGE_CRES_SCRIPT_SIZE');
+    requireValue(typeof scriptBody!=='string');
+    form=externalIssuerResultForm(scriptBody,frameName,report);
+    requireValue(form);
+   }else form=source;
    report('BROWSER_CHALLENGE_CRES_FORM_DEADLINE');
    return form;
   },2000);
@@ -437,7 +452,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
      requireValue(authorizeIssuerScript && binding && isIssuerScriptPath(url.pathname) &&
       !assets.scripts.has(url.pathname) && assets.scripts.size<issuerScriptLimit);
      const forwarded=billingBounded(limits,async active=>{
-      await authorizeIssuerScript(request,documentRequest);
+      await authorizeIssuerScript(request,documentRequest,decisionDocument);
       await check();billingCheck(active);requireIssuerDocument();
       report('BROWSER_CHALLENGE_ROUTE_FORWARD');
       await route.continue();
@@ -448,7 +463,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
       // Stripe.js may retire the issuer after the successfully loaded decision script posts back.
       if(!decisionDocument)requireIssuerDocument();
      },10000);
-     assets.scripts.set(url.pathname,forwarded);
+     assets.scripts.set(url.pathname,{request,forwarded});
      return await forwarded;
     }
     switch(kind){
@@ -594,7 +609,7 @@ export function initial3dsChallenge({page,limits,demo,owner,winning,authorizeRes
   };
   handoffStarted=true;
   // Let the route's fixed checkpoint reach the owner on failure, while preventing handoff.
-  await Promise.all([...challengeAssets.blocks.values(),...challengeAssets.scripts.values()])
+  await Promise.all([...challengeAssets.blocks.values(),...[...challengeAssets.scripts.values()].map(script=>script.forwarded)])
    .catch(()=>billingBounded(limits,()=>new Promise<never>(()=>{}),750));
   await validate();await billingBounded(limits,l=>waitForGesture({deadline:l.deadline,signal:l.signal!}),180000);await validate();
   // A pending form navigation can block evaluation in the issuer renderer.

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 // @ts-ignore Native Node executes the same form parser as Playwright.
-import {issuerResultForm} from './stripe-billing-initial-3ds-result-form.ts';
+import {externalIssuerResultForm,issuerResultForm} from './stripe-billing-initial-3ds-result-form.ts';
 
 const action='https://hooks.stripe.com/fixture/result?one=1&amp;two=2';
 const result='<input type="hidden" name="cres" value="YQ==">';
@@ -10,6 +10,63 @@ const form=(fields=result,attributes='')=>'<form method="POST" action="'+action+
 const submit='document.forms[0].submit();';
 const inline=(code:string,attributes='')=>`<!doctype html><body><script${attributes}>${code}</script></body>`;
 const write=(markup:string)=>`document.write(${JSON.stringify(markup)});${submit}`;
+const decisionUrl='https://reviewed-test-issuer.stripe.com/fixture/decision';
+const external=(src:string,attributes='',contents='')=>inline(contents,` src="${src}"${attributes}`);
+
+test('derive the sole canonical external script URL from the paired HTML',()=>{
+ for(const html of [
+  external('./result.js'),external('result.js'),external('/fixture/result.js',' type="application/javascript"','\n'),
+  external('https://reviewed-test-issuer.stripe.com/fixture/result.js'),
+ ]){
+  assert.deepEqual(issuerResultForm(html,undefined,undefined,decisionUrl),{
+   scriptUrl:'https://reviewed-test-issuer.stripe.com/fixture/result.js',
+  });
+ }
+});
+
+for(const html of [
+ external('/result.js?variant=1'),external('/result.js#fragment'),external('/%72esult.js'),
+ external('//reviewed-test-issuer.stripe.com/result.js'),external('https://foreign.fixture.test/result.js'),
+ external('../result.js'),external('/fixture/../result.js'),
+ external('https://operator@reviewed-test-issuer.stripe.com/result.js'),
+ external('/result.js',' async'),external('/result.js',' defer'),external('/result.js',' type="module"'),
+ external('/result.js',' nomodule'),external('/result.js',' onload="submitForm()"'),
+ external('/result.js',' src="/different.js"'),external('/result.js','','ignored code'),
+ external('/result.js')+external('/different.js'),'<template>'+external('/result.js')+'</template>',
+ '<base href="https://foreign.fixture.test">'+external('/result.js'),
+ '<!doctype html><head><script src="/result.js"></script></head>',
+ '<!doctype html><body><script src="/result.js">',
+])test('refuse a nonexclusive or unbound external script reference',()=>{
+ assert.equal(issuerResultForm(html,undefined,undefined,decisionUrl),undefined);
+});
+
+test('require an exact HTTPS decision URL to derive an external script reference',()=>{
+ for(const url of [undefined,'file:///fixture/decision',decisionUrl+'#',' '+decisionUrl]){
+  assert.equal(issuerResultForm(external('/result.js'),undefined,undefined,url),undefined);
+ }
+});
+
+test('derive the exact CRes form from a 64 KiB literal external script',()=>{
+ const code=Buffer.from(write(form(session+result,'target="issuer-frame"')).padEnd(65536));
+ assert.deepEqual(externalIssuerResultForm(code,'issuer-frame'),{
+  action:'https://hooks.stripe.com/fixture/result?one=1&two=2',
+  body:'threeDSSessionData=a%2Bb%0D%0Ac&cres=YQ%3D%3D',
+ });
+});
+
+for(const [reason,source] of [
+ ['SCRIPT_UTF8',Buffer.from([0xff])],
+ ['SCRIPT_UNSUPPORTED',Buffer.from(write(form()).padEnd(65537))],
+ ['SCRIPT_UNSUPPORTED',Buffer.from(write(form())+'otherCode()')],
+ ['SCRIPT_UNSUPPORTED',Buffer.from(`document.write(${JSON.stringify(form())}+suffix);${submit}`)],
+ ['SCRIPT_UNSUPPORTED_DOM',Buffer.from(`const form=document.createElement('form');${submit}`)],
+ ['FORM_LITERAL_MARKUP',Buffer.from(write(form()+form()))],
+ ['FORM_ACTION',Buffer.from(write(form().replace('hooks.stripe.com','private.fixture.test')))],
+] as const)test('refuse external script with the fixed checkpoint '+reason,()=>{
+ const reported:string[]=[];
+ assert.equal(externalIssuerResultForm(source,undefined,code=>reported.push(code)),undefined);
+ assert.deepEqual(reported,['BROWSER_CHALLENGE_CRES_'+reason]);
+});
 
 test('derive the exact CRes action and ordered wire bytes from the issuer form',()=>{
  assert.deepEqual(issuerResultForm('<!doctype html>'+form(session+result,'target="_self"')),{

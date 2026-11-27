@@ -7,19 +7,49 @@ type FormRejection='DUPLICATE_ATTRIBUTE'|'BASE'|'OWNER'|'MISSING'|'MULTIPLE'|'ME
  'ACTION'|'CONTROL'|'FIELD'|'DUPLICATE_FIELD'|'REQUIRED_CRES'|'SIZE'|'LITERAL_MARKUP'|
  'MISSING_INLINE'|'MISSING_INLINE_DOM'|'MISSING_INLINE_MARKUP'|'MISSING_EXTERNAL'|'MISSING_TEMPLATE'|'MISSING_HANDLER'|'MISSING_MIXED';
 type FormProof={action:string;body:string};
+type ExternalScript={scriptUrl:string};
+type Reporter=(code:string)=>void;
 type Element=DefaultTreeAdapterTypes.Element;
 const htmlWhitespace=(value:string)=>/^[\t\n\f\r ]*$/.test(value);
 const whitespaceNode=(node:DefaultTreeAdapterTypes.Node)=>defaultTreeAdapter.isTextNode(node)&&htmlWhitespace(node.value);
 const hasHandler=(element:Element)=>element.attrs.some(attr=>attr.name.startsWith('on'));
+const createsForm=(source:string)=>/\bcreateElement\s*\(\s*['"]form['"]/.test(source);
 
-/** Derive the wire request from the original issuer HTML without running it. */
-export function issuerResultForm(html:string,frameName?:string,report?:(code:string)=>void):FormProof|undefined{
+export function isIssuerScriptPath(pathname:string):boolean{
+ return /^\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.js$/.test(pathname);
+}
+
+/** Derive the wire request or locate its sole external script in the original issuer HTML. */
+export function issuerResultForm(html:string,frameName?:string,report?:Reporter):FormProof|undefined;
+export function issuerResultForm(html:string,frameName:string|undefined,report:Reporter|undefined,
+ documentUrl:string|undefined):FormProof|ExternalScript|undefined;
+export function issuerResultForm(html:string,frameName?:string,report?:Reporter,documentUrl?:string):FormProof|ExternalScript|undefined{
  let ambiguous=false;
  const document=parse(html,{sourceCodeLocationInfo:true,onParseError:error=>{if(error.code==='duplicate-attribute')ambiguous=true;}});
- let result=ambiguous?'DUPLICATE_ATTRIBUTE':readForm(document,frameName);
- if(result==='MISSING')result=readLiteralForm(document,frameName);
- if(typeof result==='string'){report?.(`BROWSER_CHALLENGE_CRES_FORM_${result}`);return;}
+ let result:FormProof|ExternalScript|FormRejection=ambiguous?'DUPLICATE_ATTRIBUTE':readForm(document,frameName);
+ if(result==='MISSING')result=readLiteralForm(document,frameName,documentUrl);
+ if(typeof result==='string')return reportFormRejection(result,report);
  return result;
+}
+
+function reportFormRejection(rejection:FormRejection,report:Reporter|undefined):undefined{
+ report?.('BROWSER_CHALLENGE_CRES_FORM_'+rejection);
+}
+
+/** Prove a form from the exact source of the external script in the decision document. */
+export function externalIssuerResultForm(source:Uint8Array,frameName?:string,report?:Reporter):FormProof|undefined{
+ if(source.byteLength===0||source.byteLength>65536){report?.('BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED');return;}
+ let code:string;
+ try{code=new TextDecoder('utf-8',{fatal:true}).decode(source);}
+ catch{report?.('BROWSER_CHALLENGE_CRES_SCRIPT_UTF8');return;}
+ const markup=literalInsertion(code);
+ if(markup===undefined){
+  report?.(createsForm(code)?'BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED_DOM':'BROWSER_CHALLENGE_CRES_SCRIPT_UNSUPPORTED');
+  return;
+ }
+ const proof=readLiteralFragment(markup,frameName);
+ if(typeof proof==='string')return reportFormRejection(proof,report);
+ return proof;
 }
 
 function readForm(document:DefaultTreeAdapterTypes.ParentNode,frameName:string|undefined):FormProof|FormRejection{
@@ -80,10 +110,24 @@ function literalInsertion(source:string):string|undefined{
  catch{/* Expressions and other JavaScript string syntax are outside this subset. */}
 }
 
-function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:string|undefined):FormProof|FormRejection{
+function canonicalScriptUrl(src:string,documentUrl:string|undefined):string|undefined{
+ if(!documentUrl||!URL.canParse(documentUrl))return;
+ const document=new URL(documentUrl);
+ if(document.protocol!=='https:'||document.href!==documentUrl||document.username||document.password||documentUrl.includes('#'))return;
+ let path=src;
+ if(src.startsWith(document.origin+'/'))path=src.slice(document.origin.length);
+ else if(src.startsWith('./'))path=src.slice(1);
+ else if(!src.startsWith('/'))path='/'+src;
+ if(!isIssuerScriptPath(path))return;
+ const script=new URL(src,document);
+ if(script.origin===document.origin&&script.href===script.origin+script.pathname&&isIssuerScriptPath(script.pathname))return script.href;
+}
+
+function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:string|undefined,
+ documentUrl:string|undefined):FormProof|ExternalScript|FormRejection{
  const shapes=new Set<FormRejection>();
  const pending:DefaultTreeAdapterTypes.Node[]=[document];
- let script:string|undefined,plain=true;
+ let script:{text:string;src:string|undefined}|undefined,plain=true;
  while(pending.length){
   const node=pending.pop()!;
   if(defaultTreeAdapter.isElementNode(node)){
@@ -93,15 +137,16 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
    else if(node.tagName==='script'){
     const type=(attribute(node,'type')??'').replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g,'').toLowerCase();
     const text=node.childNodes.filter(defaultTreeAdapter.isTextNode).map(child=>child.value).join('');
+    const src=attribute(node,'src');
     if(['','text/javascript','application/javascript','module'].includes(type)){
-     if(attribute(node,'src')!==undefined)shapes.add('MISSING_EXTERNAL');
-     else if(/\bcreateElement\s*\(\s*['"]form['"]/.test(text))shapes.add('MISSING_INLINE_DOM');
+     if(src!==undefined)shapes.add('MISSING_EXTERNAL');
+     else if(createsForm(text))shapes.add('MISSING_INLINE_DOM');
      else if(/\b(?:document\s*\.\s*write(?:ln)?|insertAdjacentHTML|innerHTML)\b/.test(text))shapes.add('MISSING_INLINE_MARKUP');
      else shapes.add('MISSING_INLINE');
     }
     if(script!==undefined||node.parentNode?.nodeName!=='body'||!node.sourceCodeLocation?.endTag||
-       !['','text/javascript','application/javascript'].includes(type)||node.attrs.some(attr=>attr.name!=='type'))plain=false;
-    script=text;
+       !['','text/javascript','application/javascript'].includes(type)||node.attrs.some(attr=>attr.name!=='type'&&attr.name!=='src'))plain=false;
+    script={text,src};
    }else if((node.tagName==='html'||node.tagName==='head'||node.tagName==='body'||node.tagName==='title')&&node.attrs.length===0){
     // The single producer can only run alongside the structural document elements.
    }else if(node.tagName==='meta'&&node.attrs.length===1&&attribute(node,'charset')?.toLowerCase()==='utf-8'){
@@ -111,9 +156,16 @@ function readLiteralForm(document:DefaultTreeAdapterTypes.Document,frameName:str
            !['script','title'].includes(node.parentNode?.nodeName??''))plain=false;
   if('childNodes' in node)for(const child of node.childNodes)pending.push(child);
  }
- const markup=plain&&script!==undefined?literalInsertion(script):undefined;
- if(markup===undefined)return shapes.size>1?'MISSING_MIXED':shapes.values().next().value??'MISSING';
- return readLiteralFragment(markup,frameName);
+ if(plain&&script){
+  if(script.src===undefined){
+   const markup=literalInsertion(script.text);
+   if(markup!==undefined)return readLiteralFragment(markup,frameName);
+  }else if(htmlWhitespace(script.text)){
+   const scriptUrl=canonicalScriptUrl(script.src,documentUrl);
+   if(scriptUrl)return {scriptUrl};
+  }
+ }
+ return shapes.size>1?'MISSING_MIXED':shapes.values().next().value??'MISSING';
 }
 
 function readLiteralFragment(markup:string,frameName:string|undefined):FormProof|FormRejection{

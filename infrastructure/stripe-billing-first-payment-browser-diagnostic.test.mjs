@@ -33,6 +33,16 @@ test('CRes form checkpoints cross the acceptance boundary as fixed codes only',(
   assert.equal(browserDiagnostic(privateOrigin.acceptanceBrowserFailure(raw),'ACCEPTANCE'),null);
  }
 });
+test('CRes external script checkpoints reveal only a fixed reason',()=>{
+ const prefix='BROWSER_CHALLENGE_CRES_SCRIPT_';
+ for(const suffix of ['RECEIPT','READ','SIZE','UTF8','UNSUPPORTED','UNSUPPORTED_DOM']){
+  const code=prefix+suffix;
+  const error=privateOrigin.acceptanceBrowserFailure(code);
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(JSON.stringify(error),'{}');
+  assert.equal(browserDiagnostic(privateOrigin.acceptanceBrowserFailure(code+' /private-script.js'),'ACCEPTANCE'),null);
+ }
+});
 test('provider boundaries are finite private provenance without payload',()=>{
  for(const code of [
   'BROWSER_PROVIDER_HEADERS','BROWSER_PROVIDER_CURRENT','BROWSER_PROVIDER_REDIRECT','BROWSER_PROVIDER_USERINFO','BROWSER_PROVIDER_AUTH','BROWSER_PROVIDER_ORIGIN_SCHEME','BROWSER_PROVIDER_ORIGIN_PORT','BROWSER_PROVIDER_ORIGIN_STRIPE_COM','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_M','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_R','BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER','BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK','BROWSER_PROVIDER_ORIGIN_OTHER','BROWSER_PROVIDER_NAVIGATION','BROWSER_PROVIDER_STATIC_FRAME','BROWSER_PROVIDER_STATIC_REQUEST','BROWSER_PROVIDER_STATIC_RESPONSE','BROWSER_PROVIDER_FALLBACK',
